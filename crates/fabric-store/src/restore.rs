@@ -465,6 +465,12 @@ fn cat_file_batch(
             on_blob(&oid, &bytes)?;
         }
     })();
+    if outcome.is_err() {
+        // git blocks on a full stdout pipe and the feeder on a full stdin
+        // pipe; closing our end of stdout and killing git frees both.
+        drop(reader);
+        let _ = child.kill();
+    }
     let _ = feeder.join();
     let status = child.wait().map_err(|e| io_err(Path::new("cat-file"), e))?;
     outcome?;
@@ -746,4 +752,56 @@ pub fn verify(
         .collect();
     let skip = |rel: &RelPath| skipped.iter().any(|root| rel.starts_with(root));
     verify_entries(store, &writer, &manifest.files, &skip, mode)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    use super::*;
+
+    /// Blobs enough to fill both pipes between this process and git.
+    const BLOBS: usize = 300;
+
+    #[test]
+    fn a_failing_blob_write_does_not_hang_cat_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_owned();
+        let git = Git::new(&root, 0);
+        git.run(&["init", "-q"]).unwrap();
+        for i in 0..BLOBS {
+            fs::write(root.join(format!("f{i}")), format!("{i:01024}")).unwrap();
+        }
+        git.run(&["add", "-A"]).unwrap();
+        let tree = git.run_text(&["write-tree"]).unwrap();
+        let oids: Vec<String> = parse_tree(&git.run(&["ls-tree", "-r", "-z", &tree]).unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|item| item.oid)
+            .collect();
+        assert_eq!(oids.len(), BLOBS);
+
+        let (done, finished) = mpsc::channel();
+        thread::spawn(move || {
+            let outcome = cat_file_batch(&git, oids, |_, _| {
+                Err(RestoreError::Write(WriteError::Collision {
+                    path: PathBuf::from("f0"),
+                }))
+            });
+            let _ = done.send(outcome);
+        });
+        let outcome = finished
+            .recv_timeout(Duration::from_mins(1))
+            .expect("restore hung on a failed write");
+        assert!(
+            matches!(
+                outcome,
+                Err(RestoreError::Write(WriteError::Collision { .. }))
+            ),
+            "{outcome:?}"
+        );
+    }
 }
