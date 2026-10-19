@@ -55,7 +55,22 @@ Some networks drop or rate-limit UDP. The same `rustls` config runs over a `toki
 
 ### Framing
 
-Every message on a control stream is `u32 length | u8 version | postcard(Message)`. A control frame longer than 1 MiB is a protocol error and closes the connection; a bulk `Chunk` frame is bounded by the chunk size cap of ADR 0004 plus framing, and a chunk whose zstd frame declares, or decompresses to, more than 256 KiB is rejected before allocation. A peer cannot make a node allocate more than one frame's worth of memory per stream. Nothing of unbounded size is ever a control message: ledger records are small by construction, and manifests go over the bulk path as chunks (Blob transfer, below). Every `Message` carries `job_id` and `epoch` (ADR 0003). The first message on a new connection is `Hello { node, fabric_version, clock_ms }` in both directions; a clock difference over 10 seconds is logged and reported.
+Every message on a control stream is `u32 length | u8 version | postcard(Message)`. A control frame longer than 1 MiB is a protocol error and closes the connection; a bulk `Chunk` frame is bounded by the chunk size cap of ADR 0004 plus framing, and a chunk whose zstd frame declares, or decompresses to, more than 256 KiB is rejected before allocation. A peer cannot make a node allocate more than one frame's worth of memory per stream. Nothing of unbounded size is ever a control message: ledger records are small by construction, and manifests go over the bulk path as chunks (Blob transfer, below).
+
+The message type has two shapes, and this is the only place they are defined:
+
+```text
+Message =
+  | Hello { node: NodeId, fabric_version: String, clock_ms: u64 }
+  | Job   { job_id: JobId, epoch: Epoch, body: JobMessage }
+
+JobMessage =
+  | ClaimRequest { expected_head }  | Granted { record } | Rejected { head, lease } | StaleEpoch { yours, current }
+  | Append { record }               | LeaseRenewed { expires_at }
+  | WantSnapshot { snapshot }       | ManifestChunks { len, ids } | WantChunks { ids } | Chunk { id, bytes }
+```
+
+`Hello` is the one connection-level frame: it is the first message in both directions on a new connection and carries no job. A clock difference over 10 seconds is logged and reported. Every other frame is a `Job` envelope, so every per-job message carries `job_id` and `epoch` (ADR 0003) in one place and the fencing check in ADR 0003 reads one field. `LeaseRenewed` is the renewal push of ADR 0003 and `Append` is the record replication of ADR 0002; both are envelopes like the rest.
 
 ### Blob transfer
 
