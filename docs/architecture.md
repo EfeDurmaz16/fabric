@@ -13,7 +13,7 @@ A job is a goal plus the state needed to keep working on it. Where that state is
 | Part | What it holds | Who owns it in code | ADR |
 |---|---|---|---|
 | Job record | Goal, append-only event ledger, versioned manifest, pending decisions, an opaque state directory per harness | `fabric-core` | [0001](adr/0001-job-as-unit-of-work.md), [0002](adr/0002-job-ledger-and-record.md) |
-| Storage | Content-addressed snapshots of the workspace: git refs, index, untracked files, policy-selected ignored files such as `node_modules`, harness state | `fabric-store` | [0004](adr/0004-content-addressed-snapshots.md) |
+| Storage | Content-addressed snapshots of the workspace: git objects and refs in a bundle, the index and the working tree as two snapshot commits, policy-selected ignored files such as `node_modules`, harness state | `fabric-store` | [0004](adr/0004-content-addressed-snapshots.md) |
 | Compute | The node that holds the lease and runs the harness right now. Replaceable at any time. Exactly one live copy. | `fabric-node`, `fabric-net` | [0003](adr/0003-exactly-one-live-copy.md), [0005](adr/0005-transport-and-node-identity.md), [0008](adr/0008-placement-and-triggers.md) |
 | Environment | `EnvSpec`: detected tool versions, setup commands, env var names, cache paths. Materialized on the node that resumes. | `fabric-env` | [0007](adr/0007-environment-spec.md) |
 

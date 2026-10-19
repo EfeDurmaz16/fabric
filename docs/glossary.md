@@ -54,6 +54,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Restore.** Writing a snapshot into a fresh workspace on a node, with path rewrites.
 
+**Snapshot commit.** One of the two git commits a capture makes with a private index: `I` for the index and `W` for the working tree. They carry uncommitted work inside a bundle without touching the user's index or refs.
+
 **Snapshot.** An immutable, content-addressed capture of a workspace and its harness state at one moment.
 
 **Store.** A node's local blob directory plus catalog.

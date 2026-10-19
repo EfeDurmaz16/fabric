@@ -39,16 +39,34 @@ SnapshotManifest {
   created_at:    u64,
   created_by:    NodeId,
   platform:      { os: String, arch: String },
-  git:           { bundle: [ChunkId], head: String, index: [ChunkId] },
-  files:         [Entry],      untracked and policy-selected ignored files, relative to workspace root
-  harness_state: [Entry],      opaque, owned by the harness adapter, relative to a state root
+  git:           Option<GitState>,  None when the workspace is not a git repository
+  files:         [Entry],      ignored files selected by policy, relative to the workspace root; every path when git is None
+  harness_state: [Entry],      opaque, owned by the harness adapter, relative to the adapter's declared state root
   env_spec:      Option<EnvSpecId>,
+}
+GitState {
+  bundle:          [ChunkId],            git bundle, full or incremental
+  bundle_base:     Option<SnapshotId>,   the snapshot whose refs this bundle excludes; None means full
+  refs:            [(String, String)],   every ref name and object id at capture time
+  head:            Branch(String) | Detached(String),
+  index_commit:    String,               commit I: its tree is the index at capture time
+  worktree_commit: String,               commit W: its tree is the working tree at capture time
+  config:          [ChunkId],            .git/config
+  exclude:         Option<[ChunkId]>,    .git/info/exclude
 }
 Entry { rel_path: String, kind: File | Dir | Symlink { target: String }, mode: u32, size: u64, chunks: [ChunkId] }
 ```
 
-- **Git:** `git bundle create - --all` plus `refs/stash`, so every local ref and every unpushed commit travels. The index file travels as bytes so staged and unstaged state survives (T3 drops the split; we keep it). The `.git/objects` directory is not copied; the bundle is the transport for objects.
-- **Untracked files:** everything `git status --porcelain` lists as untracked, by content.
+- **Git, by commits, not by files.** Uncommitted work is the common state of a job in flight, and a bundle carries only what a ref reaches. Capture therefore builds two commits with a private index and never touches the real index, the working tree or the user's refs:
+  - `I`: `git write-tree` on the real index (read only), then `git commit-tree <tree> -p HEAD`. Its tree is the staged state, so staged blobs become reachable.
+  - `W`: with `GIT_INDEX_FILE` pointing at a temporary index, `git read-tree I`, `git add -A`, `git write-tree`, `git commit-tree <tree> -p HEAD -p I`. Its tree is the working tree: modified, deleted, renamed and mode-changed tracked files, symlinks, and untracked files that are not ignored. This is the shape of `git stash -u` (research H5, option R1).
+  - `git update-ref refs/fabric/<job-id>/snap/<ulid> W`, so the objects survive `git gc` on the source.
+  - On an unborn branch, `I` and `W` have no `HEAD` parent and `head` records the branch name.
+- **Bundle:** `git bundle create <tmp> --all --not <tips>`, where `<tips>` are the object ids in the parent snapshot's `refs`, so a later snapshot carries only new objects. The bundle is full (`bundle_base: None`) when there is no parent, when the chain of incremental bundles since the last full one is 16 long, or when `git bundle verify` fails on the incremental one. `--all` includes `refs/fabric/*`, `refs/stash`, tags and remote-tracking refs. Only the newest stash travels; older entries live in the reflog, which is not carried, and `fabric suspend` warns when `git stash list` has more than one entry.
+- **Carried as bytes:** `.git/config` (remotes, upstreams, local settings) and `.git/info/exclude`.
+- **Not carried:** `.git/objects` as files, reflogs, hooks (executable code, installed per node), and submodule repositories. The gitlink commit travels in the tree; the target leaves submodules uninitialized and lists them. A submodule with a dirty working tree or local commits makes capture fail with `GitSubmoduleDirty`. A tree whose `.gitattributes` declares `filter=lfs` makes capture fail with `GitLfsUnsupported`: `git add` would store pointers and the restored working tree would hold pointers where the agent had content.
+- **Refused states:** capture fails with `GitBusy` when `.git/rebase-merge`, `.git/rebase-apply`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD` or `BISECT_LOG` exists, or when the index has conflict entries. These live outside refs and no bundle can carry them; the user finishes or aborts the operation first.
+- **Untracked files** travel inside `W`, so `files` holds only ignored files selected by policy. When `git` is `None`, `files` holds every path under the root and the same secret policy applies.
 - **Ignored files, by policy:** caches in, secrets out. v0 policy, in order: deny any path matching a secret pattern (`.env`, `.env.*`, `*.pem`, `*.key`, `id_*`, `*.p12`, `credentials*`, `.netrc`); allow the cache paths listed in the `EnvSpec` (`node_modules`, `.pnpm-store`, `target`, `.next`, `.venv`, `__pycache__`, `.turbo`); deny all other ignored paths. The policy is a data file in the job, not code, so the user can widen it per job. A denied path is listed in `fabric suspend` output so nothing silently stays behind.
 - **Harness state:** whatever the adapter returns from `capture` (ADR 0006). Hashed and chunked like any other file.
 - **Platform:** recorded so that restore knows whether carried caches are usable (ADR 0007).
@@ -68,7 +86,15 @@ A snapshot exists if and only if its ledger event exists. Chunks or manifests wi
 
 1. Resolve the target workspace root by policy (ADR 0008). The user never types it.
 2. Write everything into `<root>.fabric-restoring/`, verify every chunk hash as it is written, then rename the directory to `<root>`. A crash leaves a `.fabric-restoring` directory that the next restore deletes and starts again.
-3. Restore git: `git init`, `git bundle unbundle`, write the index, check out `head`. Then write untracked and ignored files.
+3. Restore git, in this order. `git bundle unbundle` is not used anywhere: it writes objects but creates no refs, so `HEAD` would stay unborn.
+   1. `git init`. Write `.git/config` and `.git/info/exclude` from their chunks.
+   2. For each bundle in the chain, from the newest full one to this snapshot, oldest first: `git bundle verify`, then `git fetch --update-head-ok <bundle> '+refs/*:refs/*'`.
+   3. Set `HEAD`: `git symbolic-ref HEAD refs/heads/<branch>`, or `git update-ref --no-deref HEAD <sha>` for a detached head.
+   4. `git read-tree <I>`. The index is now the staged state; the working tree is still empty.
+   5. Write the tree of `W` into the root with Fabric's own file writer (`git ls-tree -r -z W` for paths, modes and blob ids, `git cat-file --batch` for bytes). It is the same loop that writes `files`, so modes, symlinks and path rules are enforced in one place, and the index is untouched. Then `git update-index --refresh`, ignoring its exit status, which is nonzero whenever a file differs from the index, which is expected here.
+   6. Only now write `files`.
+
+   After step 5, `git status` on the target equals `git status` on the source: staged is `I` against `HEAD`, unstaged is the disk against `I`, untracked is what `W` has that `I` does not.
 4. Rewrites: the manifest stores relative paths only. Harness state may contain absolute paths pointing at the source workspace root; the adapter's `restore` receives `(source_root, target_root)` and performs its own rewrites (ADR 0006). The core never guesses which bytes are paths.
 5. If `platform` differs from the node or a cache path is missing, mark the environment as needing materialization (ADR 0007).
 
@@ -80,13 +106,16 @@ A node fetches a snapshot by manifest id, then asks the peer for the chunk ids i
 
 ## Alternatives considered
 
-1. **`git bundle` only, as T3 Code does.** Loses ignored files and the index split; 50 MiB cap in T3. Rejected as insufficient; kept as the git component.
-2. **rsync or Syncthing or Mutagen.** All document "exclude `.git` and `node_modules`", which is the opposite of the requirement (landscape section 8.1). No content addressing across snapshots. Rejected.
-3. **iroh-blobs.** BLAKE3-verified streaming, mature. It fixes the transfer format and pulls in iroh's networking. Named in ADR 0005 as the alternative if the own transport fails. Rejected for v0 by the no-vendor-dependency rule.
-4. **Whole-file hashing without chunking.** Simpler. A one-line change to a 20 MB lockfile or a rebuilt `target/` directory would re-send everything. Rejected.
-5. **Fixed-size chunking.** Insertions shift every later chunk. FastCDC exists for this reason. Rejected.
-6. **Filesystem snapshots (APFS, btrfs).** Node-local and not content-addressed across machines. Rejected.
-7. **Rebuild caches on the target instead of carrying them** (Flox, sccache, Turborepo; landscape W7). This is the fallback when platform differs, not the primary path. A `pnpm install` on a cold Mac is minutes; a chunk diff is seconds.
+1. **Full `git bundle --all` on every move, as T3 Code does.** Loses ignored files and the index split, re-sends history on every snapshot (46.5 MB per move for sardis in the research), 50 MiB cap in T3. Rejected; the incremental bundle plus snapshot commits above keeps plain git on both ends and carries only new objects.
+2. **Carry the index file as bytes.** Staged blobs are loose objects no ref reaches, so the bundle leaves them out and the target gets an index that points at missing objects. Rejected; `I` makes them reachable.
+3. **`git diff --binary` patches.** Need the exact base on the target; mode, rename and symlink edge cases; no history for unpushed merges. Rejected.
+4. **Copy `.git` at the file level.** Most faithful (reflogs, hooks, in-progress operations) but unsafe while git runs, and a `.git` shared by many worktrees belongs to many jobs at once. Rejected.
+5. **rsync or Syncthing or Mutagen.** All document "exclude `.git` and `node_modules`", which is the opposite of the requirement (landscape section 8.1). No content addressing across snapshots. Rejected.
+6. **iroh-blobs.** BLAKE3-verified streaming, mature. It fixes the transfer format and pulls in iroh's networking. Named in ADR 0005 as the alternative if the own transport fails. Rejected for v0 by the no-vendor-dependency rule.
+7. **Whole-file hashing without chunking.** Simpler. A one-line change to a 20 MB lockfile or a rebuilt `target/` directory would re-send everything. Rejected.
+8. **Fixed-size chunking.** Insertions shift every later chunk. FastCDC exists for this reason. Rejected.
+9. **Filesystem snapshots (APFS, btrfs).** Node-local and not content-addressed across machines. Rejected.
+10. **Rebuild caches on the target instead of carrying them** (Flox, sccache, Turborepo; landscape W7). This is the fallback when platform differs, not the primary path. A `pnpm install` on a cold Mac is minutes; a chunk diff is seconds.
 
 ## Consequences
 
@@ -95,9 +124,11 @@ A node fetches a snapshot by manifest id, then asks the peer for the chunk ids i
 - Secrets never enter a snapshot unless the user edits the policy for that job, and the suspend output always lists what was excluded.
 - Catalog corruption is recoverable by rescanning `chunks/` and `manifests/` since the files are self-named by hash.
 - Crash tests will re-exec the publisher and `kill -9` it at each step boundary, then assert that `fabric store check` reports either no snapshot or a complete one.
+- A git fidelity test (research H5, experiment E7) captures a scratch repository holding staged, unstaged, untracked, deleted, renamed, mode-changed, symlink and intent-to-add entries, restores it, and compares `git status --porcelain=v2`, `git diff` and `git diff --cached` byte for byte. It also covers a repository with no remote, an unborn branch, and a second snapshot whose bundle is incremental.
 
 ## Open questions
 
+- Intent-to-add, skip-worktree and assume-unchanged are index flags, not tree content, and `git write-tree` may omit or reject intent-to-add entries. E7 decides whether `I` needs a side list of flags or whether v0 refuses those states like `GitBusy`.
 - Chunk size targets are a guess. Measure dedup ratio on a real `node_modules` and `target/` before freezing.
 - Hard links inside `node_modules` (pnpm) restore as copies in v0. Preserving them needs inode tracking; decide after measuring size impact.
 - Extended attributes and macOS quarantine flags: dropped in v0. Revisit if a tool breaks.
