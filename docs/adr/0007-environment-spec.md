@@ -20,10 +20,10 @@ Also: environments contain secrets, and secrets must not travel in snapshots (AD
 
 ```text
 EnvSpec {                        the bytes start with the format version as a varint; it is not a field
-  tools:         [Tool],         detected, informational, used to warn on mismatch
-  setup:         [SetupStep],    commands that make the workspace runnable
-  env_var_names: [String],       names only, never values
-  cache_paths:   [RelPath],      what counts as a cache for snapshot policy and for "is it warm"
+  tools:         [Tool],         detected, informational, used to warn on mismatch; strictly sorted by name
+  setup:         [SetupStep],    commands that make the workspace runnable, in the order they run
+  env_var_names: [EnvVarName],   names only, never values; `[A-Za-z_][A-Za-z0-9_]*`, strictly sorted
+  cache_paths:   [RelPath],      what counts as a cache for snapshot policy and for "is it warm"; strictly sorted
 }
 Tool      { name: String, version: String, source: Detected | Declared }   version is the tool's own exact string (`rustc -vV`, `node --version`, `pnpm --version`), never parsed into parts
 SetupStep { program: ProgramName, args: [String], cwd: Option<RelPath>, when: CachesMissing | Always }   cwd None is the root; ProgramName is a bare name, never a path or an option
@@ -31,7 +31,7 @@ SetupStep { program: ProgramName, args: [String], cwd: Option<RelPath>, when: Ca
 
 `program` is looked up on `PATH` and run with `args` directly, never through a shell. A spec travels with the job and a peer can send one, so there is no string for quoting bugs or a hostile `packageManager` field to hide in. Before the node runs a spec whose id differs from the one it last ran or wrote for that job, it prints the steps and asks, unless the command was given `--yes`.
 
-`EnvSpecId` is the blake3 of the postcard bytes. A job references an `EnvSpec` by id; editing produces a new id and an `EnvSpecChanged` record in the ledger.
+`EnvSpecId` is the blake3 of the postcard bytes. A job references an `EnvSpec` by id; editing produces a new id and an `EnvSpecChanged` record in the ledger. The id is only an identity if the same content has one byte form, so `tools`, `env_var_names` and `cache_paths` are strictly sorted by their key and a spec that is not, from a peer or from a caller, is refused with `EnvSpecError::OutOfOrder { list, index }`; `setup` keeps the order it runs in. An environment variable name is a parsed `EnvVarName` that cannot hold `=`, so a value cannot travel inside a name (second review of PR `feat/core`, 2026-10-19).
 
 ### Detection
 

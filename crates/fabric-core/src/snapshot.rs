@@ -248,19 +248,28 @@ impl From<VersionedError> for ManifestError {
     }
 }
 
-/// Checks that `keys` rise strictly, which also finds a repeated key.
+/// Returns the index of the first key that is not strictly after the one
+/// before it, which also finds a repeated key.
+pub(crate) fn first_out_of_order<K: Ord>(keys: impl Iterator<Item = K>) -> Option<usize> {
+    let mut previous: Option<K> = None;
+    for (index, key) in keys.enumerate() {
+        if previous.as_ref().is_some_and(|p| *p >= key) {
+            return Some(index);
+        }
+        previous = Some(key);
+    }
+    None
+}
+
+/// Checks that `keys` rise strictly.
 fn check_sorted<K: Ord>(
     list: &'static str,
     keys: impl Iterator<Item = K>,
 ) -> Result<(), ManifestError> {
-    let mut previous: Option<K> = None;
-    for (index, key) in keys.enumerate() {
-        if previous.as_ref().is_some_and(|p| *p >= key) {
-            return Err(ManifestError::OutOfOrder { list, index });
-        }
-        previous = Some(key);
+    match first_out_of_order(keys) {
+        Some(index) => Err(ManifestError::OutOfOrder { list, index }),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 fn check_tree(list: &'static str, entries: &[Entry]) -> Result<(), ManifestError> {
