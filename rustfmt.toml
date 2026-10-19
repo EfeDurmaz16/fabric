@@ -1,6 +1,1 @@
 edition = "2024"
-max_width = 100
-
-# imports_granularity = "Crate" and group_imports = "StdExternalCrate" are
-# nightly-only in rustfmt 1.9 (Rust 1.97.1). Stable rustfmt ignores them with a
-# warning, so they stay out until they stabilize.
