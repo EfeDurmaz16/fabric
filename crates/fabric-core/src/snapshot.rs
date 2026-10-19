@@ -8,12 +8,12 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::codec::{self, CodecError};
+use crate::codec::{self, CodecError, VersionedError};
 use crate::harness::HarnessState;
 use crate::id::{ChunkId, EnvSpecId, JobId, NodeId, SnapshotId};
 use crate::path::{AbsPath, RelPath};
 
-/// The manifest format version this crate writes.
+/// The manifest format version this crate writes; the first varint of every encoded manifest.
 pub const MANIFEST_VERSION: u16 = 1;
 
 /// The most bytes a reader decodes as a manifest; a memory bound against a
@@ -56,8 +56,6 @@ pub enum ManifestError {
 /// What one snapshot of a workspace contains.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotManifest {
-    /// Format version of this struct.
-    pub version: u16,
     /// The job the snapshot belongs to.
     pub job_id: JobId,
     /// The absolute workspace path the capture ran in; the target root on every node.
@@ -217,6 +215,15 @@ pub enum GitHead {
     Detached(String),
 }
 
+impl From<VersionedError> for ManifestError {
+    fn from(err: VersionedError) -> Self {
+        match err {
+            VersionedError::UnknownVersion(v) => ManifestError::UnknownVersion(v),
+            VersionedError::Codec(c) => ManifestError::Codec(c),
+        }
+    }
+}
+
 fn check_tree(entries: &[Entry]) -> Result<(), ManifestError> {
     let mut seen = std::collections::HashSet::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
@@ -233,9 +240,6 @@ fn check_tree(entries: &[Entry]) -> Result<(), ManifestError> {
 impl SnapshotManifest {
     /// Checks the manifest's own rules.
     pub fn validate(&self) -> Result<(), ManifestError> {
-        if self.version != MANIFEST_VERSION {
-            return Err(ManifestError::UnknownVersion(self.version));
-        }
         check_tree(&self.files)?;
         check_tree(&self.harness_state.entries)?;
         let mut seen = std::collections::HashSet::with_capacity(self.caches.len());
@@ -245,18 +249,18 @@ impl SnapshotManifest {
         Ok(())
     }
 
-    /// Returns the canonical bytes of a valid manifest.
+    /// Returns the canonical bytes of a valid manifest: the version, then the fields.
     pub fn encode(&self) -> Result<Vec<u8>, ManifestError> {
         self.validate()?;
-        Ok(codec::encode(self)?)
+        Ok(codec::encode_versioned(MANIFEST_VERSION, self)?)
     }
 
-    /// Decodes bytes under the size bound and checks the result.
+    /// Decodes bytes under the size bound, refusing other versions, and checks the result.
     pub fn decode(bytes: &[u8]) -> Result<Self, ManifestError> {
         if bytes.len() > MAX_MANIFEST_LEN {
             return Err(ManifestError::TooLarge { len: bytes.len() });
         }
-        let manifest: SnapshotManifest = codec::decode(bytes)?;
+        let manifest: SnapshotManifest = codec::decode_versioned(bytes, MANIFEST_VERSION)?;
         manifest.validate()?;
         Ok(manifest)
     }

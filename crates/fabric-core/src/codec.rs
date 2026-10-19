@@ -39,6 +39,37 @@ pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError>
     Ok(value)
 }
 
+/// Why versioned bytes were refused.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum VersionedError {
+    /// The leading version is not the one the caller reads.
+    #[error("format version {0} is not supported")]
+    UnknownVersion(u16),
+    /// The version matches but the value does not decode.
+    #[error(transparent)]
+    Codec(#[from] CodecError),
+}
+
+/// Returns `version` as a varint followed by the postcard bytes of `value`.
+pub(crate) fn encode_versioned<T: Serialize>(
+    version: u16,
+    value: &T,
+) -> Result<Vec<u8>, CodecError> {
+    encode(&(version, value))
+}
+
+/// Decodes bytes written by `encode_versioned`, refusing any version but `expected`.
+pub(crate) fn decode_versioned<T: DeserializeOwned>(
+    bytes: &[u8],
+    expected: u16,
+) -> Result<T, VersionedError> {
+    let (version, rest) = postcard::take_from_bytes::<u16>(bytes).map_err(CodecError::from)?;
+    if version != expected {
+        return Err(VersionedError::UnknownVersion(version));
+    }
+    Ok(decode(rest)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,6 +82,17 @@ mod tests {
         assert!(matches!(
             decode::<u32>(&bytes),
             Err(CodecError::TrailingBytes(1))
+        ));
+    }
+
+    #[test]
+    fn versioned_bytes_carry_the_version_first() {
+        let bytes = encode_versioned(3, &"x").unwrap();
+        assert_eq!(bytes[0], 3);
+        assert_eq!(decode_versioned::<String>(&bytes, 3).unwrap(), "x");
+        assert!(matches!(
+            decode_versioned::<String>(&bytes, 4),
+            Err(VersionedError::UnknownVersion(3))
         ));
     }
 }

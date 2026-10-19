@@ -12,7 +12,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::codec::{self, CodecError};
+use crate::codec::{self, CodecError, VersionedError};
 use crate::harness::HarnessKind;
 use crate::id::{EnvSpecId, Epoch, EventId, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use crate::lease::{FenceError, FencingToken, LeaseState};
@@ -20,7 +20,7 @@ use crate::lease::{FenceError, FencingToken, LeaseState};
 /// The record format version this crate writes.
 pub const RECORD_FORMAT_VERSION: u8 = 1;
 
-/// The job manifest format version this crate writes.
+/// The job manifest format version this crate writes; the first varint of every encoded manifest.
 pub const JOB_MANIFEST_VERSION: u16 = 1;
 
 /// Bytes of blake3 digest that end every record on disk.
@@ -429,8 +429,6 @@ pub enum LedgerError {
 /// The derived summary of a ledger that any node can rebuild from it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobManifest {
-    /// Format version of this struct.
-    pub version: u16,
     /// The job.
     pub job_id: JobId,
     /// The goal in the user's words.
@@ -454,18 +452,14 @@ pub struct JobManifest {
 }
 
 impl JobManifest {
-    /// Returns the postcard bytes.
+    /// Returns the bytes to persist: the version, then the fields.
     pub fn encode(&self) -> Result<Vec<u8>, JobManifestError> {
-        Ok(codec::encode(self)?)
+        Ok(codec::encode_versioned(JOB_MANIFEST_VERSION, self)?)
     }
 
     /// Decodes bytes written by `encode`, refusing other versions.
     pub fn decode(bytes: &[u8]) -> Result<Self, JobManifestError> {
-        let manifest: JobManifest = codec::decode(bytes)?;
-        if manifest.version != JOB_MANIFEST_VERSION {
-            return Err(JobManifestError::UnknownVersion(manifest.version));
-        }
-        Ok(manifest)
+        Ok(codec::decode_versioned(bytes, JOB_MANIFEST_VERSION)?)
     }
 }
 
@@ -478,6 +472,15 @@ pub enum JobManifestError {
     /// The bytes do not decode, or the value does not encode.
     #[error("job manifest codec: {0}")]
     Codec(#[from] CodecError),
+}
+
+impl From<VersionedError> for JobManifestError {
+    fn from(err: VersionedError) -> Self {
+        match err {
+            VersionedError::UnknownVersion(v) => JobManifestError::UnknownVersion(v),
+            VersionedError::Codec(c) => JobManifestError::Codec(c),
+        }
+    }
 }
 
 /// Where records live between runs.
@@ -588,7 +591,6 @@ impl Ledger {
             return Err(LedgerError::BadCreated);
         }
         let manifest = JobManifest {
-            version: JOB_MANIFEST_VERSION,
             job_id,
             goal: goal.clone(),
             harness: harness.clone(),

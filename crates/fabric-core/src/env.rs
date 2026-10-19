@@ -6,11 +6,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::codec::{self, CodecError};
+use crate::codec::{self, CodecError, VersionedError};
 use crate::id::EnvSpecId;
 use crate::path::RelPath;
 
-/// The format version this crate writes.
+/// The format version this crate writes; the first varint of every encoded spec.
 pub const ENV_SPEC_VERSION: u16 = 0;
 
 /// Why an environment spec was refused.
@@ -33,8 +33,6 @@ pub enum EnvSpecError {
 /// What a workspace needs before a harness can run in it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvSpec {
-    /// Format version of this struct.
-    pub version: u16,
     /// Tools the workspace was seen with; used to warn, never to fail.
     pub tools: Vec<Tool>,
     /// Commands that make the workspace runnable.
@@ -85,27 +83,33 @@ pub enum RunWhen {
     Always,
 }
 
+impl From<VersionedError> for EnvSpecError {
+    fn from(err: VersionedError) -> Self {
+        match err {
+            VersionedError::UnknownVersion(v) => EnvSpecError::UnknownVersion(v),
+            VersionedError::Codec(c) => EnvSpecError::Codec(c),
+        }
+    }
+}
+
 impl EnvSpec {
     /// Checks the spec's own rules.
     pub fn validate(&self) -> Result<(), EnvSpecError> {
-        if self.version != ENV_SPEC_VERSION {
-            return Err(EnvSpecError::UnknownVersion(self.version));
-        }
         if let Some(index) = self.setup.iter().position(|s| s.argv.is_empty()) {
             return Err(EnvSpecError::EmptyArgv { index });
         }
         Ok(())
     }
 
-    /// Returns the canonical postcard bytes of a valid spec.
+    /// Returns the canonical bytes of a valid spec: the version, then the fields.
     pub fn encode(&self) -> Result<Vec<u8>, EnvSpecError> {
         self.validate()?;
-        Ok(codec::encode(self)?)
+        Ok(codec::encode_versioned(ENV_SPEC_VERSION, self)?)
     }
 
-    /// Decodes and checks a spec.
+    /// Decodes bytes written by `encode`, refusing other versions, and checks the spec.
     pub fn decode(bytes: &[u8]) -> Result<Self, EnvSpecError> {
-        let spec: EnvSpec = codec::decode(bytes)?;
+        let spec: EnvSpec = codec::decode_versioned(bytes, ENV_SPEC_VERSION)?;
         spec.validate()?;
         Ok(spec)
     }
@@ -122,7 +126,6 @@ mod tests {
 
     fn spec() -> EnvSpec {
         EnvSpec {
-            version: ENV_SPEC_VERSION,
             tools: vec![Tool {
                 name: "node".into(),
                 version: "v22.23.2".into(),
@@ -179,8 +182,11 @@ mod tests {
 
     #[test]
     fn unknown_version_is_refused() {
-        let mut s = spec();
-        s.version = 7;
-        assert!(matches!(s.id(), Err(EnvSpecError::UnknownVersion(7))));
+        let mut bytes = spec().encode().unwrap();
+        bytes[0] = 7;
+        assert!(matches!(
+            EnvSpec::decode(&bytes),
+            Err(EnvSpecError::UnknownVersion(7))
+        ));
     }
 }

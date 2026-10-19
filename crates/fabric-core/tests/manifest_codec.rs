@@ -192,7 +192,6 @@ fn manifest() -> impl Strategy<Value = SnapshotManifest> {
                 let mut seen = std::collections::HashSet::new();
                 caches.retain(|c| seen.insert(c.path.clone()));
                 SnapshotManifest {
-                    version: MANIFEST_VERSION,
                     job_id: JobId::from_bytes(job),
                     root,
                     parent: parent.map(SnapshotId::from_bytes),
@@ -223,7 +222,6 @@ proptest! {
 
 fn fixed_manifest() -> Result<SnapshotManifest, PathError> {
     Ok(SnapshotManifest {
-        version: MANIFEST_VERSION,
         job_id: JobId::from_bytes([1; 16]),
         root: AbsPath::parse("/Users/efebarandurmaz/fabric/jobs/x/work")?,
         parent: None,
@@ -335,9 +333,13 @@ fn trailing_bytes_do_not_decode() {
 
 #[test]
 fn unknown_version_and_oversize_are_refused() {
-    let mut m = fixed_manifest().unwrap();
-    m.version = 2;
-    assert!(matches!(m.encode(), Err(ManifestError::UnknownVersion(2))));
+    let mut bytes = fixed_manifest().unwrap().encode().unwrap();
+    assert_eq!(bytes[0], u8::try_from(MANIFEST_VERSION).unwrap());
+    bytes[0] = 2;
+    assert!(matches!(
+        SnapshotManifest::decode(&bytes),
+        Err(ManifestError::UnknownVersion(2))
+    ));
     let big = vec![0u8; fabric_core::snapshot::MAX_MANIFEST_LEN + 1];
     assert!(matches!(
         SnapshotManifest::decode(&big),
