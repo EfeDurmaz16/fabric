@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use fabric_core::env::EnvVarName;
+use fabric_core::env::{EnvVarName, RunWhen};
 use fabric_env::detect::{Detection, detect};
-use fabric_env::materialize::{CacheHealth, MaterializeError, StepReason, plan};
+use fabric_env::materialize::{CacheHealth, MaterializeError, plan};
 use tempfile::TempDir;
 
 type TestResult<T> = Result<T, Box<dyn Error>>;
@@ -81,7 +81,7 @@ fn a_fresh_pnpm_workspace_plans_its_install_and_the_dry_run_changes_nothing() {
     assert_eq!(planned.caches()[0].health, CacheHealth::Missing);
     assert_eq!(planned.steps().len(), 1);
     assert_eq!(planned.steps()[0].index(), 0);
-    assert_eq!(planned.steps()[0].reason(), StepReason::CachesMissing);
+    assert_eq!(planned.steps()[0].step().when, RunWhen::CachesMissing);
     assert_eq!(planned.steps()[0].step().program.as_str(), "pnpm");
     assert_eq!(
         planned.steps()[0].dir(),
@@ -222,7 +222,7 @@ when = "always"
     let planned = plan(dir.path(), &detected).unwrap();
     assert_eq!(planned.steps().len(), 1);
     assert_eq!(planned.steps()[0].index(), 1);
-    assert_eq!(planned.steps()[0].reason(), StepReason::Always);
+    assert_eq!(planned.steps()[0].step().when, RunWhen::Always);
 }
 
 #[test]

@@ -176,21 +176,11 @@ pub struct CacheReport {
     pub health: CacheHealth,
 }
 
-/// Why a step is in the plan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StepReason {
-    /// At least one cache is not healthy.
-    CachesMissing,
-    /// The step runs on every materialize.
-    Always,
-}
-
 /// A step the plan will run, with what the plan resolved for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedStep {
     index: usize,
     step: SetupStep,
-    reason: StepReason,
     dir: PathBuf,
     program: Option<PathBuf>,
 }
@@ -204,11 +194,6 @@ impl PlannedStep {
     /// Returns the step as the spec holds it.
     pub fn step(&self) -> &SetupStep {
         &self.step
-    }
-
-    /// Returns why the step runs.
-    pub fn reason(&self) -> StepReason {
-        self.reason
     }
 
     /// Returns the directory the step runs in, resolved and inside the workspace.
@@ -317,15 +302,12 @@ pub fn plan(root: &Path, detected: &Detection) -> Result<Plan, MaterializeError>
 
     let mut steps = Vec::new();
     for (index, step) in spec.setup.iter().enumerate() {
-        let reason = match step.when {
-            RunWhen::Always => StepReason::Always,
-            RunWhen::CachesMissing if any_unhealthy => StepReason::CachesMissing,
-            RunWhen::CachesMissing => continue,
-        };
+        if step.when == RunWhen::CachesMissing && !any_unhealthy {
+            continue;
+        }
         steps.push(PlannedStep {
             index,
             step: step.clone(),
-            reason,
             dir: step_dir(&root, index, step)?,
             program: find_on_path(env::var_os("PATH").as_deref(), &root, &step.program),
         });
@@ -412,7 +394,7 @@ fn run_step(planned: &PlannedStep, program: &Path) -> Result<(), MaterializeErro
         target: SETUP_LOG_TARGET,
         step = index,
         program = %name,
-        reason = ?planned.reason,
+        when = ?planned.step.when,
         dir = %planned.dir.display(),
         "running setup step"
     );
