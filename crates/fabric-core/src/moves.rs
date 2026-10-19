@@ -38,7 +38,7 @@ pub struct MoveOffer {
 pub enum OfferAnswer {
     /// Already decided; the record was persisted earlier and is sent again as is.
     Decided(Record),
-    /// Import now: persist this `MoveImported`, accept it, then send it.
+    /// Import now: `commit` this `MoveImported`, then send it.
     Import(Record),
     /// The offer does not link to this node's head; the sender pushes the suffix after `head` and offers again.
     Rejected {
@@ -64,7 +64,7 @@ pub enum OfferAnswer {
 pub enum AbortAnswer {
     /// Already decided, either way; the record is sent again as is.
     Decided(Record),
-    /// Abort now: persist this `MoveAborted`, accept it, then send it.
+    /// Abort now: `commit` this `MoveAborted`, then send it.
     Abort(Record),
 }
 
@@ -90,10 +90,10 @@ impl CompleteSnapshot {
     }
 }
 
-/// A steal checked against the rules; print `warning`, then persist and accept `record`.
+/// A steal checked against the rules; print `warning`, then `commit` `record`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StealProposal {
-    /// The `Stolen` record to persist and accept.
+    /// The `Stolen` record to commit.
     pub record: Record,
     /// What the user is told before the record is persisted.
     pub warning: StealWarning,
@@ -203,7 +203,7 @@ impl Ledger {
     /// cause the sender cannot fix by retrying, such as an offer for another
     /// job or for a move whose target is another node, and the caller prints
     /// it. The answer is pure: `Import` and the new record must be persisted
-    /// and accepted by the caller before the reply leaves.
+    /// through `commit` by the caller before the reply leaves.
     pub fn answer_offer(
         &self,
         me: NodeId,
@@ -378,7 +378,7 @@ mod tests {
     use super::*;
     use crate::harness::HarnessKind;
     use crate::id::JobId;
-    use crate::ledger::Author;
+    use crate::ledger::{Author, MemoryStore};
 
     fn node(b: u8) -> NodeId {
         NodeId::from_bytes([b; 32])
@@ -392,11 +392,14 @@ mod tests {
         SnapshotId::of(&[b])
     }
 
+    /// Appends through `commit`; these tests read the ledger, not the store.
     fn append(ledger: &mut Ledger, author: NodeId, kind: EventKind, seq: u8) {
         let record = ledger
             .propose(author, kind, eid(seq), u64::from(seq))
             .unwrap();
-        ledger.accept(record, Author::Node(author)).unwrap();
+        ledger
+            .commit(&mut MemoryStore::default(), record, Author::Node(author))
+            .unwrap();
     }
 
     /// A ledger owned by node 1 with two published snapshots, suspended at the second.
@@ -636,7 +639,11 @@ mod tests {
             .unwrap();
         let mut ledger = ledger;
         ledger
-            .accept(proposal.record, Author::Node(node(2)))
+            .commit(
+                &mut MemoryStore::default(),
+                proposal.record,
+                Author::Node(node(2)),
+            )
             .unwrap();
         let two = Epoch::FIRST.next().unwrap();
         assert!(matches!(

@@ -773,7 +773,7 @@ impl Ledger {
 
     /// Builds a record that `author` wants to append now, checked against the rules.
     ///
-    /// The record is not part of the ledger until `accept` or `commit` takes it.
+    /// The record is not part of the ledger until `commit` has stored it.
     pub fn propose(
         &self,
         author: NodeId,
@@ -806,7 +806,11 @@ impl Ledger {
     }
 
     /// Appends a record after checking it against the current head and lease.
-    pub fn accept(&mut self, record: Record, author: Author) -> Result<&Record, LedgerError> {
+    ///
+    /// Private on purpose: a record that is visible here but not in the
+    /// store could be answered to a peer and then forgotten by a crash.
+    /// `commit` is the one public way to grow a ledger.
+    fn accept(&mut self, record: Record, author: Author) -> Result<&Record, LedgerError> {
         self.check(record.event(), author.sender())?;
         self.apply(&record);
         self.records.push(record);
@@ -814,6 +818,9 @@ impl Ledger {
     }
 
     /// Checks, stores durably, then appends; the order that keeps the file ahead of memory.
+    ///
+    /// A record the store refuses is not appended and the ledger does not
+    /// change, so nothing is ever visible before it is durable.
     pub fn commit<S: LedgerStore>(
         &mut self,
         store: &mut S,
