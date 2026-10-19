@@ -2,7 +2,8 @@
 
 ## Pull request flow
 
-1. Branch from `main` in your own worktree. Nobody commits to `main` directly.
+1. Branch from `main`, or from the branch your work depends on (stacked PR), in
+   your own worktree. Nobody commits to `main` directly.
 2. Commit one logical change at a time.
 3. Run the gates below, push, and open a draft PR. Fill in every section of the template.
 4. Mark the PR ready when CI is green and review findings are resolved.
@@ -24,16 +25,19 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo deny check
 scripts/check-hygiene.sh origin/main
 ```
 
 `scripts/check-hygiene.sh` fails on an em dash or an AI attribution line in any
-tracked file or in any commit message on the branch.
+tracked file or in any commit message on the branch, from any directory in the
+repository. `scripts/test-check-hygiene.sh` proves it fires; CI runs it first.
 
-`cargo deny check` is a CI gate, not a local one: it runs on every PR and once
-a week. Run it locally whenever `Cargo.lock` changes. `deny.toml` holds the
-license, advisory, and source policy. A new dependency must pass it, and the PR
-lists the crate, version, last release date, and license.
+`cargo deny check` needs `cargo install cargo-deny --locked`. CI also runs it
+once a week, so a new advisory against an unchanged `Cargo.lock` still shows
+up. `deny.toml` holds the license, advisory, and source policy. A new
+dependency must pass it, and the PR lists the crate, version, last release
+date, and license.
 
 ## Workspace rules
 
