@@ -23,5 +23,6 @@ mod durable;
 pub mod git;
 pub mod objects;
 pub mod policy;
+pub mod restore;
 pub mod store;
 pub mod writer;
