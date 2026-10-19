@@ -8,10 +8,10 @@ use fabric_core::codec::CodecError;
 use fabric_core::git::{BranchName, GitConfigKey, GitConfigValue, GitOid, RefName};
 use fabric_core::harness::HarnessState;
 use fabric_core::id::{ChunkId, EnvSpecId, JobId, NodeId, SnapshotId};
-use fabric_core::path::{AbsPath, RelPath};
+use fabric_core::path::{AbsPath, PathError, RelPath};
 use fabric_core::snapshot::{
-    CacheClass, CacheEntry, CarryKey, Entry, EntryKind, GitHead, GitState, MANIFEST_VERSION,
-    ManifestError, Platform, SnapshotManifest,
+    CacheClass, CacheEntry, CarryKey, CarryState, Entry, EntryKind, GitHead, GitState,
+    MANIFEST_VERSION, ManifestError, Platform, SnapshotManifest,
 };
 use proptest::prelude::*;
 
@@ -41,37 +41,39 @@ fn entry() -> impl Strategy<Value = Entry> {
     (
         rel_path(),
         prop_oneof![
-            Just(EntryKind::File),
+            (any::<u64>(), proptest::collection::vec(chunk(), 0..3))
+                .prop_map(|(size, chunks)| EntryKind::File { size, chunks }),
             Just(EntryKind::Dir),
             "[a-z/.]{1,12}".prop_map(|target| EntryKind::Symlink { target }),
         ],
-        0u32..0o777,
+        any::<u32>().prop_map(|m| m & 0o777),
         any::<u64>(),
-        any::<u64>(),
-        proptest::collection::vec(chunk(), 0..3),
     )
-        .prop_map(|(rel_path, kind, mode, mtime_ns, size, chunks)| {
-            let chunks = if kind == EntryKind::File {
-                chunks
-            } else {
-                Vec::new()
-            };
-            Entry {
-                rel_path,
-                kind,
-                mode,
-                mtime_ns,
-                size,
-                chunks,
-            }
+        .prop_map(|(rel_path, kind, mode, mtime_ns)| Entry {
+            rel_path,
+            kind,
+            mode,
+            mtime_ns,
         })
 }
 
-fn unique_entries() -> impl Strategy<Value = Vec<Entry>> {
+/// A tree the rules accept: sorted by path, no path below a file or link.
+fn tree() -> impl Strategy<Value = Vec<Entry>> {
     proptest::collection::vec(entry(), 0..6).prop_map(|mut entries| {
-        let mut seen = std::collections::HashSet::new();
-        entries.retain(|e| seen.insert(e.rel_path.clone()));
-        entries
+        entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        entries.dedup_by(|a, b| a.rel_path == b.rel_path);
+        let mut kept: Vec<Entry> = Vec::with_capacity(entries.len());
+        for e in entries {
+            let below_non_dir = kept.iter().any(|k| {
+                !matches!(k.kind, EntryKind::Dir)
+                    && e.rel_path != k.rel_path
+                    && e.rel_path.starts_with(&k.rel_path)
+            });
+            if !below_non_dir {
+                kept.push(e);
+            }
+        }
+        kept
     })
 }
 
@@ -111,17 +113,26 @@ fn cache_entry() -> impl Strategy<Value = CacheEntry> {
             Just(CacheClass::Build),
             Just(CacheClass::ToolCache)
         ],
-        any::<bool>(),
+        prop_oneof![
+            Just(CarryState::Carried),
+            Just(CarryState::Partial),
+            Just(CarryState::NotCarried)
+        ],
         carry_key(),
-        any::<bool>(),
     )
-        .prop_map(|(path, class, carried, key, partial)| CacheEntry {
+        .prop_map(|(path, class, carry, key)| CacheEntry {
             path,
             class,
-            carried,
+            carry,
             key,
-            partial,
         })
+}
+
+/// Sorts `items` by `key` and drops a repeated key, as capture does.
+fn sorted_unique<T, K: Ord>(mut items: Vec<T>, key: impl Fn(&T) -> K) -> Vec<T> {
+    items.sort_by_key(|a| key(a));
+    items.dedup_by(|a, b| key(a) == key(b));
+    items
 }
 
 fn oid() -> impl Strategy<Value = GitOid> {
@@ -183,12 +194,12 @@ fn git_state() -> impl Strategy<Value = GitState> {
             )| GitState {
                 bundle,
                 bundle_base,
-                refs,
+                refs: sorted_unique(refs, |(name, _)| name.clone()),
                 head,
                 index_commit,
                 worktree_commit,
-                worktree_mtimes,
-                config,
+                worktree_mtimes: sorted_unique(worktree_mtimes, |(path, _)| path.clone()),
+                config: sorted_unique(config, |(key, _)| key.clone()),
                 exclude,
             },
         )
@@ -203,27 +214,14 @@ fn manifest() -> impl Strategy<Value = SnapshotManifest> {
         any::<[u8; 32]>(),
         ("(macos|linux)", "(arm64|x86_64)"),
         proptest::option::of(git_state()),
-        unique_entries(),
-        unique_entries(),
+        tree(),
+        tree(),
         proptest::option::of(any::<[u8; 32]>()),
         proptest::collection::vec(cache_entry(), 0..3),
     )
         .prop_map(
-            |(
-                job,
-                root,
-                parent,
-                created_at,
-                by,
-                (os, arch),
-                git,
-                files,
-                harness,
-                env,
-                mut caches,
-            )| {
-                let mut seen = std::collections::HashSet::new();
-                caches.retain(|c| seen.insert(c.path.clone()));
+            |(job, root, parent, created_at, by, (os, arch), git, files, harness, env, caches)| {
+                let caches = sorted_unique(caches, |c| c.path.clone());
                 SnapshotManifest {
                     job_id: JobId::from_bytes(job),
                     root,
@@ -283,63 +281,144 @@ fn fixed_manifest() -> Result<SnapshotManifest, Box<dyn Error>> {
         }),
         files: vec![Entry {
             rel_path: RelPath::parse("node_modules/left-pad/index.js")?,
-            kind: EntryKind::File,
+            kind: EntryKind::File {
+                size: 3,
+                chunks: vec![ChunkId::of(b"abc")],
+            },
             mode: 0o644,
             mtime_ns: 9,
-            size: 3,
-            chunks: vec![ChunkId::of(b"abc")],
         }],
         harness_state: HarnessState {
             entries: vec![Entry {
                 rel_path: RelPath::parse("projects/-x/session.jsonl")?,
-                kind: EntryKind::File,
+                kind: EntryKind::File {
+                    size: 0,
+                    chunks: vec![],
+                },
                 mode: 0o600,
                 mtime_ns: 11,
-                size: 0,
-                chunks: vec![],
             }],
         },
         env_spec: Some(EnvSpecId::of(b"spec")),
         caches: vec![CacheEntry {
             path: RelPath::parse("node_modules")?,
             class: CacheClass::Deps,
-            carried: true,
+            carry: CarryState::Carried,
             key: CarryKey::Node {
                 node_major: "22".into(),
                 package_manager: "npm".into(),
                 pm_major: "10".into(),
                 pnpm_store_path: None,
             },
-            partial: false,
         }],
     })
 }
 
 /// Pins format version 1. A field added, removed or reordered changes this
-/// hash and must come with a version bump.
+/// hash and must come with a version bump once version 1 has shipped; until
+/// then a review correction updates the pin in the same commit.
 #[test]
 fn format_version_one_hash_is_pinned() {
     let id = fixed_manifest().unwrap().id().unwrap().to_string();
     assert_eq!(
         id,
-        "9153450fec8d204a97bfe3d789775a150437b3acf32a49beb7476134bb0d2204"
+        "ae53cc1d8df4107a0e29dc531939ec45b20f5f66f6d391e0f30eb1e36d7c6123"
     );
 }
 
+fn dir(path: &str) -> Result<Entry, PathError> {
+    Ok(Entry {
+        rel_path: RelPath::parse(path)?,
+        kind: EntryKind::Dir,
+        mode: 0o755,
+        mtime_ns: 1,
+    })
+}
+
 #[test]
-fn duplicate_paths_and_chunks_on_dirs_are_refused() {
+fn a_repeated_or_unsorted_path_is_refused() {
     let mut m = fixed_manifest().unwrap();
     m.files.push(m.files[0].clone());
     assert!(matches!(
         m.encode(),
-        Err(ManifestError::DuplicatePath { index: 1 })
+        Err(ManifestError::OutOfOrder {
+            list: "files",
+            index: 1
+        })
     ));
     let mut m = fixed_manifest().unwrap();
-    m.files[0].kind = EntryKind::Dir;
+    m.files = vec![dir("b").unwrap(), dir("a").unwrap()];
     assert!(matches!(
         m.encode(),
-        Err(ManifestError::ChunksOnNonFile { index: 0 })
+        Err(ManifestError::OutOfOrder {
+            list: "files",
+            index: 1
+        })
     ));
+    let mut m = fixed_manifest().unwrap();
+    m.caches.push(m.caches[0].clone());
+    assert!(matches!(
+        m.encode(),
+        Err(ManifestError::OutOfOrder {
+            list: "caches",
+            index: 1
+        })
+    ));
+    let mut m = fixed_manifest().unwrap();
+    let git = m.git.as_mut().unwrap();
+    git.config.push(git.config[0].clone());
+    assert!(matches!(
+        m.encode(),
+        Err(ManifestError::OutOfOrder {
+            list: "config",
+            index: 1
+        })
+    ));
+}
+
+/// ADR 0004: setuid, setgid and sticky bits never travel. A peer manifest
+/// that carries them is refused rather than masked.
+#[test]
+fn a_mode_above_0o777_is_refused() {
+    let mut m = fixed_manifest().unwrap();
+    m.files[0].mode = 0o4755;
+    assert!(matches!(
+        m.encode(),
+        Err(ManifestError::BadMode { index: 0 })
+    ));
+}
+
+/// Defence in depth for the file writer: a tree that puts `a/config` under a
+/// symlink `a` never reaches it, on macOS where there is no `RESOLVE_BENEATH`
+/// included.
+#[test]
+fn an_entry_below_a_file_or_symlink_is_refused() {
+    let mut m = fixed_manifest().unwrap();
+    m.files = vec![
+        Entry {
+            rel_path: RelPath::parse("a").unwrap(),
+            kind: EntryKind::Symlink {
+                target: "../../.git".into(),
+            },
+            mode: 0o777,
+            mtime_ns: 1,
+        },
+        dir("a/config").unwrap(),
+    ];
+    assert!(matches!(
+        m.encode(),
+        Err(ManifestError::UnderNonDir { index: 1 })
+    ));
+    m.files[0].kind = EntryKind::File {
+        size: 0,
+        chunks: vec![],
+    };
+    assert!(matches!(
+        m.encode(),
+        Err(ManifestError::UnderNonDir { index: 1 })
+    ));
+    m.files[0].kind = EntryKind::Dir;
+    assert!(m.encode().is_ok());
 }
 
 /// Returns the fixed manifest's bytes with the one string `good` replaced by `bad`.
