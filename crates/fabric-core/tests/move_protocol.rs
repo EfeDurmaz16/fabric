@@ -367,7 +367,9 @@ impl World {
                 .writers
                 .get(&record.hash())
                 .ok_or("record with no known writer")?;
-            let checked = self.nodes[to].ledger.verify(record.bytes(), writer)?;
+            let checked = self.nodes[to]
+                .ledger
+                .verify(record.bytes(), Author::Node(writer))?;
             self.nodes[to].commit(checked, Author::Node(writer))?;
         }
         assert_eq!(
@@ -465,7 +467,7 @@ impl World {
     /// a steal forked. Any other refusal is a bug in the rules.
     fn deliver_decision(&mut self, from: usize, to: usize, frame: &[u8]) -> Fallible {
         let writer = self.nodes[from].id;
-        let err = match self.nodes[to].ledger.verify(frame, writer) {
+        let err = match self.nodes[to].ledger.verify(frame, Author::Node(writer)) {
             Ok(record) => return self.nodes[to].commit(record, Author::Node(writer)),
             Err(err) => err,
         };
@@ -827,11 +829,14 @@ fn an_owner_that_receives_stolen_through_verify_is_fenced() {
     assert!(
         world.nodes[0]
             .ledger
-            .verify(stolen.bytes(), world.nodes[0].id)
+            .verify(stolen.bytes(), Author::Node(world.nodes[0].id))
             .is_err(),
         "a Stolen record is accepted only from the thief"
     );
-    let checked = world.nodes[0].ledger.verify(stolen.bytes(), thief).unwrap();
+    let checked = world.nodes[0]
+        .ledger
+        .verify(stolen.bytes(), Author::Node(thief))
+        .unwrap();
     world.nodes[0].commit(checked, Author::Node(thief)).unwrap();
     assert!(!world.nodes[0].owns(), "the old owner is fenced");
     assert_eq!(

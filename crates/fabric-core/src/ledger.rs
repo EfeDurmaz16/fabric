@@ -799,10 +799,15 @@ impl Ledger {
         Ok(Record::encode(event)?)
     }
 
-    /// Decodes a frame a peer sent and checks that `from` may append it here.
-    pub fn verify(&self, frame: &[u8], from: NodeId) -> Result<Record, LedgerError> {
+    /// Decodes a frame a peer sent and checks that it may be appended here.
+    ///
+    /// `author` is how the frame arrived, with the same meaning as in
+    /// `commit`: a transport-proved sender who must be the writer, or a
+    /// relayed record that skips the sender rule. The record is not part of
+    /// the ledger until `commit` has stored it.
+    pub fn verify(&self, frame: &[u8], author: Author) -> Result<Record, LedgerError> {
         let record = Record::decode(frame)?;
-        self.check(record.event(), Some(from))?;
+        self.check(record.event(), author.sender())?;
         Ok(record)
     }
 

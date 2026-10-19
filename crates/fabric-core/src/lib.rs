@@ -60,7 +60,7 @@
 //! // The Air first needs the MoveStarted record itself, then decides.
 //! let suffix = on_pro.suffix_after(on_air.head()).expect("same chain");
 //! for record in suffix {
-//!     let checked = on_air.verify(record.bytes(), pro)?;
+//!     let checked = on_air.verify(record.bytes(), Author::Node(pro))?;
 //!     on_air.commit(&mut air_store, checked, Author::Node(pro))?;
 //! }
 //! let complete = Some(CompleteSnapshot::new(snapshot));
@@ -72,9 +72,9 @@
 //!
 //! // The reply reaches the Pro, possibly twice. The first completes the move;
 //! // the second does not link and changes nothing.
-//! let completed = on_pro.verify(decision.bytes(), air)?;
+//! let completed = on_pro.verify(decision.bytes(), Author::Node(air))?;
 //! on_pro.commit(&mut pro_store, completed, Author::Node(air))?;
-//! assert!(on_pro.verify(decision.bytes(), air).is_err());
+//! assert!(on_pro.verify(decision.bytes(), Author::Node(air)).is_err());
 //! assert!(matches!(on_pro.view(pro), LeaseView::Departed { owner, .. } if owner == air));
 //! assert_eq!(on_pro.lease(), on_air.lease());
 //! # Ok(()) }

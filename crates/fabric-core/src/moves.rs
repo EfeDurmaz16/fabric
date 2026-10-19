@@ -663,7 +663,7 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            ledger.verify(relayed.bytes(), node(2)),
+            ledger.verify(relayed.bytes(), Author::Node(node(2))),
             Err(LedgerError::StealByTarget { .. })
         ));
     }
