@@ -22,8 +22,7 @@ use fabric_net::tcp::TcpTlsTransport;
 use fabric_net::tls::Trust;
 use fabric_net::transport::{Connection, Transport, TransportError, TransportKind};
 use fabric_net::wire::{
-    Capability, ChunkBatch, Fault, FaultText, Hello, PROTOCOL_VERSION, RequestBody, ResponseBody,
-    VersionText,
+    ChunkBatch, Fault, FaultText, Hello, PROTOCOL_VERSION, RequestBody, ResponseBody, VersionText,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -49,17 +48,9 @@ struct Node {
 }
 
 impl Node {
-    fn new(kind: TransportKind) -> Result<Self, Box<dyn Error + Send + Sync>> {
+    fn new() -> Result<Self, Box<dyn Error + Send + Sync>> {
         let identity = NodeIdentity::generate()?;
-        let capability: Capability = match kind {
-            TransportKind::Quic => Capability::QUIC.parse()?,
-            TransportKind::TcpTls => Capability::TCP_TLS.parse()?,
-        };
-        let hello = Hello::now(
-            identity.node_id(),
-            VersionText::new("test")?,
-            [capability].into_iter().collect(),
-        );
+        let hello = Hello::now(identity.node_id(), VersionText::new("test")?);
         Ok(Self { identity, hello })
     }
 
@@ -163,7 +154,7 @@ async fn connect(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn paired_nodes_exchange_hello_and_ping() -> TestResult {
     for kind in BOTH {
-        let (a, b) = (Node::new(kind)?, Node::new(kind)?);
+        let (a, b) = (Node::new()?, Node::new()?);
         let server = b.bind(kind, &[a.id()])?;
         let client = a.bind(kind, &[b.id()])?;
         let serving = serve_one(
@@ -183,7 +174,6 @@ async fn paired_nodes_exchange_hello_and_ping() -> TestResult {
         assert_eq!(session.peer(), b.id());
         assert_eq!(session.kind(), kind);
         assert_eq!(session.remote().protocol_version, PROTOCOL_VERSION);
-        assert_eq!(session.remote().capabilities, b.hello.capabilities);
         session.ping(DEADLINE).await?;
         session.ping(DEADLINE).await?;
 
@@ -196,7 +186,7 @@ async fn paired_nodes_exchange_hello_and_ping() -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dial_to_the_wrong_node_id_fails_inside_the_handshake() -> TestResult {
     for kind in BOTH {
-        let (a, b, c) = (Node::new(kind)?, Node::new(kind)?, Node::new(kind)?);
+        let (a, b, c) = (Node::new()?, Node::new()?, Node::new()?);
         let server = b.bind(kind, &[a.id()])?;
         let client = a.bind(kind, &[b.id(), c.id()])?;
         let accepting = {
@@ -229,7 +219,7 @@ async fn a_dial_to_the_wrong_node_id_fails_inside_the_handshake() -> TestResult 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unpaired_dialer_is_refused_at_accept() -> TestResult {
     for kind in BOTH {
-        let (a, b) = (Node::new(kind)?, Node::new(kind)?);
+        let (a, b) = (Node::new()?, Node::new()?);
         let server = b.bind(kind, &[])?;
         let client = a.bind(kind, &[b.id()])?;
         let accepting = {
@@ -260,7 +250,7 @@ async fn an_unpaired_dialer_is_refused_at_accept() -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_oversized_frame_gets_no_answer_and_the_connection_survives() -> TestResult {
     for kind in BOTH {
-        let (a, b) = (Node::new(kind)?, Node::new(kind)?);
+        let (a, b) = (Node::new()?, Node::new()?);
         let server = b.bind(kind, &[a.id()])?;
         let client = a.bind(kind, &[b.id()])?;
         let _serving = serve_one(
@@ -297,7 +287,7 @@ async fn an_oversized_frame_gets_no_answer_and_the_connection_survives() -> Test
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_slow_peer_trips_the_call_deadline() -> TestResult {
     for kind in BOTH {
-        let (a, b) = (Node::new(kind)?, Node::new(kind)?);
+        let (a, b) = (Node::new()?, Node::new()?);
         let server = b.bind(kind, &[a.id()])?;
         let client = a.bind(kind, &[b.id()])?;
         let mut service = FakeService::new();
@@ -333,7 +323,7 @@ async fn a_slow_peer_trips_the_call_deadline() -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hello_naming_another_node_is_refused_by_the_acceptor() -> TestResult {
     for kind in BOTH {
-        let (a, b, c) = (Node::new(kind)?, Node::new(kind)?, Node::new(kind)?);
+        let (a, b, c) = (Node::new()?, Node::new()?, Node::new()?);
         let server = b.bind(kind, &[a.id()])?;
         let client = a.bind(kind, &[b.id()])?;
         let serving = serve_one(
@@ -371,7 +361,7 @@ fn chunk_set(count: usize) -> BTreeMap<ChunkId, Vec<u8>> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_chunk_transfer_resumes_after_the_connection_drops() -> TestResult {
     for kind in BOTH {
-        let (a, b) = (Node::new(kind)?, Node::new(kind)?);
+        let (a, b) = (Node::new()?, Node::new()?);
         let server = b.bind(kind, &[a.id()])?;
         let client = a.bind(kind, &[b.id()])?;
         let chunks = chunk_set(24);
@@ -450,7 +440,7 @@ async fn concurrent_streams_do_not_cross_under_backpressure() -> TestResult {
     const STREAMS: u8 = 3;
     const LEN: usize = 3 << 20;
     for kind in BOTH {
-        let (a, b) = (Node::new(kind)?, Node::new(kind)?);
+        let (a, b) = (Node::new()?, Node::new()?);
         let server = b.bind(kind, &[a.id()])?;
         let client = a.bind(kind, &[b.id()])?;
         let echo = {
@@ -512,17 +502,13 @@ async fn concurrent_streams_do_not_cross_under_backpressure() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn quic_is_dialed_first_and_tcp_is_the_fallback() -> TestResult {
-    let (a, b) = (
-        Node::new(TransportKind::Quic)?,
-        Node::new(TransportKind::Quic)?,
-    );
+    let (a, b) = (Node::new()?, Node::new()?);
     let trust_a: Arc<dyn Trust> = Arc::new(Paired(vec![b.id()]));
     let trust_b: Arc<dyn Trust> = Arc::new(Paired(vec![a.id()]));
     let any: SocketAddr = ([127, 0, 0, 1], 0).into();
     let server = Arc::new(Endpoint::bind(&b.identity, trust_b.clone(), any)?);
     let client =
         Endpoint::bind(&a.identity, trust_a, any)?.with_quic_timeout(Duration::from_millis(500));
-    assert_eq!(client.capabilities().len(), 2);
 
     let accepting = {
         let server = server.clone();

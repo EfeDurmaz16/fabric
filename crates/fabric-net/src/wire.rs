@@ -7,9 +7,7 @@
 //! chunks, and one chunk batch names at most `MAX_CHUNK_BATCH` ids. Every
 //! bound is enforced when bytes are parsed, not after.
 
-use std::collections::BTreeSet;
 use std::fmt;
-use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fabric_core::id::{ChunkId, Epoch, MoveId, NodeId, RecordHash, SnapshotId};
@@ -23,9 +21,6 @@ pub const PROTOCOL_VERSION: u16 = 1;
 
 /// The most chunk ids one `WantChunks` request may name.
 pub const MAX_CHUNK_BATCH: usize = 256;
-
-/// The longest capability name.
-pub const MAX_CAPABILITY_LEN: usize = 32;
 
 /// The longest fabric version string in a `Hello`.
 pub const MAX_VERSION_LEN: usize = 64;
@@ -42,9 +37,6 @@ pub enum WireError {
     /// Bytes follow the encoded value.
     #[error("{0} bytes follow the message")]
     Trailing(usize),
-    /// A capability name is empty, too long, or uses a character outside `[a-z0-9._-]`.
-    #[error("invalid capability name")]
-    Capability,
     /// A chunk batch is empty or names more than `MAX_CHUNK_BATCH` ids.
     #[error("a chunk batch names 1 to {MAX_CHUNK_BATCH} ids, not {0}")]
     BatchSize(usize),
@@ -132,64 +124,6 @@ pub type VersionText = BoundedText<MAX_VERSION_LEN>;
 /// The text a `Fault` carries.
 pub type FaultText = BoundedText<MAX_FAULT_TEXT>;
 
-/// One thing a node can do, named in its `Hello`: `quic`, `tcp-tls`, `mdns`, and names added later.
-///
-/// Names are text, not an enum, so a newer peer's capability decodes on an
-/// older node instead of ending the session.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(transparent)]
-pub struct Capability(String);
-
-impl Capability {
-    /// The QUIC transport.
-    pub const QUIC: &'static str = "quic";
-    /// The TCP with TLS transport.
-    pub const TCP_TLS: &'static str = "tcp-tls";
-    /// mDNS advertisement on the LAN.
-    pub const MDNS: &'static str = "mdns";
-
-    /// Returns the name.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl FromStr for Capability {
-    type Err = WireError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let ok = !s.is_empty()
-            && s.len() <= MAX_CAPABILITY_LEN
-            && s.bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b));
-        if ok {
-            Ok(Self(s.to_owned()))
-        } else {
-            Err(WireError::Capability)
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for Capability {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let text = String::deserialize(deserializer)?;
-        text.parse().map_err(serde::de::Error::custom)
-    }
-}
-
-impl fmt::Debug for Capability {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Capability({})", self.0)
-    }
-}
-
-impl fmt::Display for Capability {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
 /// The first message in both directions on a new connection; it carries no job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
@@ -199,8 +133,6 @@ pub struct Hello {
     pub protocol_version: u16,
     /// The sender's software version, for logs and `fabric doctor`.
     pub fabric_version: VersionText,
-    /// What the sender can do.
-    pub capabilities: BTreeSet<Capability>,
     /// The sender's wall clock in milliseconds since the Unix epoch, to report skew.
     pub clock_ms: u64,
 }
@@ -208,11 +140,7 @@ pub struct Hello {
 impl Hello {
     /// Builds a `Hello` for this protocol version with the clock read now.
     #[must_use]
-    pub fn now(
-        node: NodeId,
-        fabric_version: VersionText,
-        capabilities: BTreeSet<Capability>,
-    ) -> Self {
+    pub fn now(node: NodeId, fabric_version: VersionText) -> Self {
         let clock_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
@@ -220,7 +148,6 @@ impl Hello {
             node,
             protocol_version: PROTOCOL_VERSION,
             fabric_version,
-            capabilities,
             clock_ms,
         }
     }
@@ -450,7 +377,7 @@ impl fmt::Display for Fault {
 mod tests {
     use super::*;
     use fabric_core::id::JobId;
-    use proptest::collection::{btree_set, vec};
+    use proptest::collection::vec;
     use proptest::prelude::*;
 
     fn bytes32<T: Copy + fmt::Debug>(wrap: fn([u8; 32]) -> T) -> impl Strategy<Value = T> {
@@ -465,10 +392,6 @@ mod tests {
         (1..=u64::MAX).prop_filter_map("epoch zero does not exist", Epoch::new)
     }
 
-    fn capability() -> impl Strategy<Value = Capability> {
-        "[a-z0-9._-]{1,32}".prop_filter_map("capability", |s| s.parse().ok())
-    }
-
     fn text<const MAX: usize>() -> impl Strategy<Value = BoundedText<MAX>> {
         "[ -~]{0,256}".prop_map(|s| BoundedText::truncated(&s))
     }
@@ -478,18 +401,14 @@ mod tests {
             bytes32(NodeId::from_bytes),
             any::<u16>(),
             text::<MAX_VERSION_LEN>(),
-            btree_set(capability(), 0..4),
             any::<u64>(),
         )
-            .prop_map(
-                |(node, protocol_version, fabric_version, capabilities, clock_ms)| Hello {
-                    node,
-                    protocol_version,
-                    fabric_version,
-                    capabilities,
-                    clock_ms,
-                },
-            )
+            .prop_map(|(node, protocol_version, fabric_version, clock_ms)| Hello {
+                node,
+                protocol_version,
+                fabric_version,
+                clock_ms,
+            })
     }
 
     fn records() -> impl Strategy<Value = Vec<Vec<u8>>> {
@@ -617,21 +536,6 @@ mod tests {
             ChunkBatch::new(Vec::new()),
             Err(WireError::BatchSize(0))
         ));
-    }
-
-    #[test]
-    fn capability_names_are_lowercase_ascii_and_short() {
-        assert!("quic".parse::<Capability>().is_ok());
-        assert!("tcp-tls".parse::<Capability>().is_ok());
-        assert!("Quic".parse::<Capability>().is_err());
-        assert!(String::new().parse::<Capability>().is_err());
-        assert!(
-            "a".repeat(MAX_CAPABILITY_LEN + 1)
-                .parse::<Capability>()
-                .is_err()
-        );
-        let bytes = encode(&"Bad").unwrap();
-        assert!(decode::<Capability>(&bytes).is_err());
     }
 
     #[test]

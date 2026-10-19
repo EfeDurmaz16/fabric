@@ -6,7 +6,6 @@
 //! the user and to the ledger. Both transports listen on one port number,
 //! so a user pastes one address at pairing.
 
-use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,7 +20,6 @@ use crate::quic::QuicTransport;
 use crate::tcp::TcpTlsTransport;
 use crate::tls::Trust;
 use crate::transport::{Connection, Transport, TransportError};
-use crate::wire::Capability;
 
 /// How long QUIC gets before the dial falls back to TCP with TLS.
 pub const QUIC_TIMEOUT: Duration = Duration::from_secs(3);
@@ -96,20 +94,6 @@ impl Endpoint {
         #[cfg(all(feature = "tcp_tls", not(feature = "quic")))]
         let addr = self.tcp.local_addr();
         addr
-    }
-
-    /// What this endpoint can do, for its `Hello`.
-    #[must_use]
-    pub fn capabilities(&self) -> BTreeSet<Capability> {
-        let names = [
-            #[cfg(feature = "quic")]
-            Capability::QUIC,
-            #[cfg(feature = "tcp_tls")]
-            Capability::TCP_TLS,
-            #[cfg(feature = "mdns")]
-            Capability::MDNS,
-        ];
-        names.iter().filter_map(|n| n.parse().ok()).collect()
     }
 
     /// Dials `peer` at `addr`: QUIC within `quic_timeout`, then TCP with TLS.
