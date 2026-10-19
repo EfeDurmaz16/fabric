@@ -8,7 +8,14 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use fabric_core::id::NodeId;
+
 use crate::identity::NodeIdentity;
+use crate::peers::{PeerBook, Peers};
+
+const A: NodeId = NodeId::from_bytes([1; 32]);
+const B: NodeId = NodeId::from_bytes([2; 32]);
+const C: NodeId = NodeId::from_bytes([3; 32]);
 
 /// The child side: runs the write named by the environment until the checkpoint stops it.
 #[test]
@@ -20,6 +27,10 @@ fn crash_child() {
     match mode.as_str() {
         "identity" => {
             NodeIdentity::load_or_generate(&dir.join("node.key")).unwrap();
+        }
+        "peers" => {
+            let peers = Peers::open(dir.join("peers")).unwrap();
+            peers.update(|book| book.pair(B, None)).unwrap();
         }
         other => panic!("unknown mode {other}"),
     }
@@ -82,5 +93,29 @@ fn a_key_write_killed_at_any_checkpoint_leaves_no_key_or_a_whole_key() {
             restarted.node_id(),
             "{checkpoint}"
         );
+    }
+}
+
+#[test]
+fn a_book_write_killed_at_any_checkpoint_leaves_the_old_or_the_new_book() {
+    for checkpoint in ["peers.after_tmp", "peers.after_rename"] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("peers");
+        Peers::open(&path)
+            .unwrap()
+            .update(|book| book.pair(A, None))
+            .unwrap();
+        run_child_and_kill(temp.path(), "peers", checkpoint);
+
+        let renamed = checkpoint == "peers.after_rename";
+        let book = PeerBook::load(&path).unwrap();
+        assert!(book.is_paired(A), "{checkpoint}: the old pairing is kept");
+        assert_eq!(book.is_paired(B), renamed, "{checkpoint}");
+
+        let peers = Peers::open(&path).unwrap();
+        peers.update(|book| book.pair(C, None)).unwrap();
+        let book = PeerBook::load(&path).unwrap();
+        assert!(book.is_paired(A) && book.is_paired(C), "{checkpoint}");
+        assert_eq!(book.is_paired(B), renamed, "{checkpoint}");
     }
 }

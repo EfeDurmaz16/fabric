@@ -4,6 +4,11 @@
 //! does with an id read from the other machine's screen. The book is the
 //! only input to the accept-side trust decision, it is written whole and
 //! atomically, and its text form is one line per peer so a user can read it.
+//! Two processes share one book file: `fabric node pair` runs by hand while
+//! the daemon serves. Every change therefore reloads the file under an
+//! exclusive lock before it applies, so no writer overwrites another's
+//! pairing, and every trust check reloads the file when it changed, so a
+//! pairing made after the daemon started is honoured at the next handshake.
 //!
 //! Pairing v0 is out of band: `fabric node pair <id>@<host>:<port>` on each
 //! side. A short pairing code, where one side shows six words and the other
@@ -12,15 +17,20 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::SystemTime;
 
 use fabric_core::id::{NodeId, ParseIdError};
 
+use crate::checkpoint;
+use crate::durable::{sync_parent, temp_sibling};
 use crate::tls::Trust;
 
 /// The most addresses kept per peer; the newest address is first.
@@ -248,27 +258,26 @@ impl PeerBook {
         }
     }
 
-    /// Writes the book to `path` whole: a sibling temporary file, synced, then renamed over.
+    /// Writes the book to `path` whole: a temporary file only this call names, synced, renamed over, directory synced.
     pub fn save(&self, path: &Path) -> Result<(), PeerBookError> {
         let io = |source| PeerBookError::Io {
             path: path.to_path_buf(),
             source,
         };
-        let mut name = path
-            .file_name()
-            .map_or_else(Default::default, std::ffi::OsStr::to_os_string);
-        name.push(".tmp");
-        let tmp = path.with_file_name(name);
+        let tmp = temp_sibling(path);
         let written = (|| {
-            let mut file = fs::File::create(&tmp)?;
+            let mut file = File::options().write(true).create_new(true).open(&tmp)?;
             file.write_all(self.to_string().as_bytes())?;
             file.sync_all()?;
+            checkpoint::reached("peers.after_tmp");
             fs::rename(&tmp, path)
         })();
         if written.is_err() {
             let _ = fs::remove_file(&tmp);
         }
-        written.map_err(io)
+        written.map_err(io)?;
+        checkpoint::reached("peers.after_rename");
+        sync_parent(path).map_err(io)
     }
 
     /// Pairs `node`, adding `addr` in front of the addresses already known.
@@ -329,51 +338,200 @@ impl fmt::Display for PeerBook {
     }
 }
 
-/// The peer book behind a lock and a file: every change is saved before it is visible.
+/// What the file system says about the book file; a change here means another writer saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl Stamp {
+    /// Reads the stamp of `path`; `None` when there is no file.
+    fn of(path: &Path) -> io::Result<Option<Self>> {
+        match fs::metadata(path) {
+            Ok(meta) => Ok(Some(Self {
+                len: meta.len(),
+                modified: meta.modified().ok(),
+                #[cfg(unix)]
+                inode: meta.ino(),
+            })),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+/// An advisory lock on the sibling `<book>.lock` file, held until dropped.
+///
+/// The lock lives on a sibling because a save renames a new file over the
+/// book, so a lock on the book file itself would not cover the next writer.
+struct LockFile(File);
+
+impl LockFile {
+    fn open(path: &Path) -> io::Result<File> {
+        let mut name = path
+            .file_name()
+            .map_or_else(Default::default, std::ffi::OsStr::to_os_string);
+        name.push(".lock");
+        File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_file_name(name))
+    }
+
+    fn exclusive(path: &Path) -> io::Result<Self> {
+        let file = Self::open(path)?;
+        file.lock()?;
+        Ok(Self(file))
+    }
+
+    fn shared(path: &Path) -> io::Result<Self> {
+        let file = Self::open(path)?;
+        file.lock_shared()?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for LockFile {
+    fn drop(&mut self) {
+        // Closing the file releases the lock too; unlocking first keeps the
+        // release explicit and independent of descriptor sharing.
+        let _ = self.0.unlock();
+    }
+}
+
+/// The book as last read and the stamp of the file it was read from.
+#[derive(Debug)]
+struct Cached {
+    book: Arc<PeerBook>,
+    stamp: Option<Stamp>,
+}
+
+/// The peer book behind a file that other processes write too.
+///
+/// A change reloads the file under an exclusive lock, applies, saves and
+/// swaps the cache. A read reloads the file under a shared lock when its
+/// stamp changed. The cache lock is held only to swap or clone, never
+/// across file IO, so a handshake's trust check does not wait on a save.
 #[derive(Debug)]
 pub struct Peers {
     path: PathBuf,
-    book: Mutex<PeerBook>,
+    cache: Mutex<Cached>,
+    writer: Mutex<()>,
 }
 
 impl Peers {
-    /// Opens the book at `path`, creating an empty one in memory if the file is missing.
+    /// Opens the book at `path`; a missing file is an empty book.
     pub fn open(path: impl Into<PathBuf>) -> Result<Arc<Self>, PeerBookError> {
         let path = path.into();
-        let book = PeerBook::load(&path)?;
+        let (book, stamp) = read_locked(&path)?;
         Ok(Arc::new(Self {
             path,
-            book: Mutex::new(book),
+            cache: Mutex::new(Cached {
+                book: Arc::new(book),
+                stamp,
+            }),
+            writer: Mutex::new(()),
         }))
     }
 
-    /// Returns a copy of the book.
+    /// Returns a copy of the book as the file holds it now.
     #[must_use]
     pub fn snapshot(&self) -> PeerBook {
-        self.lock().clone()
+        self.refresh();
+        PeerBook::clone(&self.book())
     }
 
-    /// Applies `change` to the book and saves it; the change is kept only if the save succeeds.
+    /// Reloads the file under a lock, applies `change` to that fresh book and saves it.
+    ///
+    /// The change is kept only if the save succeeds. Another process's
+    /// pairing made since the last read is in the book the change sees.
     pub fn update(&self, change: impl FnOnce(&mut PeerBook)) -> Result<(), PeerBookError> {
-        let mut book = self.lock();
-        let mut next = book.clone();
+        let io = |source| PeerBookError::Io {
+            path: self.path.clone(),
+            source,
+        };
+        let _one_writer = lock(&self.writer);
+        let _lock = LockFile::exclusive(&self.path).map_err(io)?;
+        let current = PeerBook::load(&self.path)?;
+        let mut next = current.clone();
         change(&mut next);
-        if next != *book {
+        if next != current {
             next.save(&self.path)?;
-            *book = next;
         }
+        let stamp = Stamp::of(&self.path).map_err(io)?;
+        *lock(&self.cache) = Cached {
+            book: Arc::new(next),
+            stamp,
+        };
         Ok(())
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, PeerBook> {
-        // The book is a plain value; a poisoned lock still holds a whole book.
-        self.book.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Reloads the book if the file changed since it was last read.
+    ///
+    /// A file that cannot be read or parsed leaves the last good book in
+    /// force and is logged; a file that is gone empties the book.
+    fn refresh(&self) {
+        let stamp = match Stamp::of(&self.path) {
+            Ok(stamp) => stamp,
+            Err(err) => {
+                tracing::warn!(path = %self.path.display(), error = %err, "peer book not readable; keeping the last good book");
+                return;
+            }
+        };
+        if lock(&self.cache).stamp == stamp {
+            return;
+        }
+        match read_locked(&self.path) {
+            Ok((book, stamp)) => {
+                *lock(&self.cache) = Cached {
+                    book: Arc::new(book),
+                    stamp,
+                };
+            }
+            Err(err) => {
+                tracing::warn!(path = %self.path.display(), error = %err, "peer book not readable; keeping the last good book");
+            }
+        }
     }
+
+    fn book(&self) -> Arc<PeerBook> {
+        Arc::clone(&lock(&self.cache).book)
+    }
+}
+
+/// Reads the book and its stamp together under a shared lock, so they match.
+fn read_locked(path: &Path) -> Result<(PeerBook, Option<Stamp>), PeerBookError> {
+    let io = |source| PeerBookError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let _lock = match LockFile::shared(path) {
+        Ok(lock) => lock,
+        // No directory means no book and no other writer yet.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok((PeerBook::default(), None));
+        }
+        Err(err) => return Err(io(err)),
+    };
+    let book = PeerBook::load(path)?;
+    let stamp = Stamp::of(path).map_err(io)?;
+    Ok((book, stamp))
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    // The guarded values are whole at every lock boundary.
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Trust for Peers {
     fn is_paired(&self, node: NodeId) -> bool {
-        self.lock().is_paired(node)
+        self.refresh();
+        self.book().is_paired(node)
     }
 }
 
@@ -462,6 +620,31 @@ mod tests {
         let peers = Peers::open(&path).unwrap();
         assert!(peers.update(|b| b.pair(node(1), None)).is_err());
         assert!(!peers.is_paired(node(1)));
+    }
+
+    /// The CLI pairs while the daemon serves: two handles on one file.
+    #[test]
+    fn two_handles_on_one_file_keep_each_others_pairings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers");
+        let daemon = Peers::open(&path).unwrap();
+        let cli = Peers::open(&path).unwrap();
+        daemon.update(|b| b.pair(node(1), None)).unwrap();
+        cli.update(|b| b.pair(node(2), None)).unwrap();
+        daemon
+            .update(|b| b.seen(node(1), "10.0.0.1:7777".parse().unwrap(), 5))
+            .unwrap();
+
+        let on_disk = PeerBook::load(&path).unwrap();
+        assert!(on_disk.is_paired(node(1)) && on_disk.is_paired(node(2)));
+        assert!(
+            daemon.is_paired(node(2)),
+            "the daemon honours the CLI's pairing"
+        );
+        assert_eq!(cli.snapshot().get(node(1)).unwrap().last_seen_ms, Some(5));
+
+        fs::remove_file(&path).unwrap();
+        assert!(!daemon.is_paired(node(1)), "a removed book pairs no one");
     }
 
     proptest! {
