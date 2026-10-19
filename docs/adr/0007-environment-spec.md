@@ -2,6 +2,8 @@
 
 Status: accepted, 2026-10-19
 
+Amended 2026-10-19 after step 1 research. Step 1 of Materialize now reads the per-cache carry key of ADR 0012 instead of the `{ os, arch }` pair alone, and `tools` records the exact strings `fabric doctor` compares (ADR 0008). Nothing else changed.
+
 ## Context
 
 The job's workspace arrives with its caches when the platform matches (ADR 0004). When it does not, or when a cache was excluded, the node must be able to make itself ready without the user typing anything. The standard for describing environments is `devcontainer.json` (about 1.69M monthly npm downloads of `@devcontainers/cli` per the landscape, section 7). But a devcontainer is a container recipe, and v0 runs harnesses directly on two Macs with no container.
@@ -20,7 +22,7 @@ EnvSpec {
   env_var_names: [String],       names only, never values
   cache_paths:   [RelPath],      what counts as a cache for snapshot policy and for "is it warm"
 }
-Tool      { name: String, version: String, source: Detected | Declared }
+Tool      { name: String, version: String, source: Detected | Declared }   version is the tool's own exact string (`rustc -vV`, `node --version`, `pnpm --version`), never parsed into parts
 SetupStep { argv: [String], cwd: RelPath, when: CachesMissing | Always }
 ```
 
@@ -45,7 +47,7 @@ Detection writes the spec and prints it. The user can edit the file. Fabric does
 After restore, `fabric-env` checks, in order:
 
 1. Does the snapshot `platform` equal this node's? If not, every cache path is treated as missing (a Linux `node_modules` is not a macOS one).
-2. For each `cache_path`: does it exist, is it non-empty, and is it absent from the snapshot's `partial_caches` (ADR 0004)? A cache the secret policy punched a hole in counts as missing, however full it looks.
+2. For each cache path in the snapshot's `caches` (ADR 0004): was it carried, does it exist, is it non-empty, is it not `partial`, and does its recorded carry key equal the key this node detects for that ecosystem (ADR 0012)? A cache the secret policy punched a hole in, or one restored under a different pnpm store path or rustc, counts as missing, however full it looks.
 3. If any is missing, run the `setup` steps with `when: CachesMissing` in order, in the workspace, with the node's environment plus the job's env var names resolved from the node's own secret source (v0: the user's shell environment on that node; the step fails with the missing names listed if any is absent). The steps run in the `fabric resume` process, not in the daemon, which is why the user's shell environment is available (ADR 0004, one writer).
 4. `Always` steps run on every resume.
 5. Compare detected tool versions to the spec; a mismatch is a warning in the resume output, not a failure.
