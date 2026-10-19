@@ -95,6 +95,10 @@ pub struct StealProposal {
 }
 
 /// What a steal costs, for the user to read before it happens.
+///
+/// `Display` names the owner and the snapshot; the CLI prints
+/// `last_record_at` as a date next to it, because the core has no clock
+/// and no time zone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StealWarning {
     /// The owner of record being stolen from.
@@ -109,8 +113,9 @@ impl fmt::Display for StealWarning {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "stealing from {} (last record at {} ms); resuming from snapshot {}; any work {} did after that snapshot becomes an orphan on its disk",
-            self.owner, self.last_record_at, self.snapshot, self.owner
+            "stealing the job from {owner}; resuming from snapshot {snapshot}; any work {owner} did after that snapshot becomes an orphan on its disk",
+            owner = self.owner,
+            snapshot = self.snapshot
         )
     }
 }
@@ -527,5 +532,126 @@ mod tests {
             third.record.event().kind,
             EventKind::Stolen { by, from, .. } if by == node(3) && from == node(1)
         ));
+    }
+
+    fn imported(ledger: &mut Ledger, source: NodeId, target: NodeId, move_id: MoveId, seq: u8) {
+        append(
+            ledger,
+            source,
+            EventKind::MoveStarted { move_id, target },
+            seq,
+        );
+        append(
+            ledger,
+            target,
+            EventKind::MoveImported {
+                move_id,
+                from: source,
+            },
+            seq + 1,
+        );
+    }
+
+    #[test]
+    fn view_names_each_side_of_a_move_and_of_the_move_after_it() {
+        let (a, b, c) = (node(1), node(2), node(3));
+        let move_ab = MoveId::from_bytes([1; 16]);
+        let mut ledger = suspended_twice(a);
+        assert!(matches!(ledger.view(a), LeaseView::Owner(token) if token.epoch == Epoch::FIRST));
+        assert!(matches!(ledger.view(b), LeaseView::Replica { owner, .. } if owner == a));
+
+        append(
+            &mut ledger,
+            a,
+            EventKind::MoveStarted {
+                move_id: move_ab,
+                target: b,
+            },
+            5,
+        );
+        assert!(matches!(
+            ledger.view(a),
+            LeaseView::Departing { move_id, target } if move_id == move_ab && target == b
+        ));
+        assert!(matches!(ledger.view(b), LeaseView::Replica { owner, .. } if owner == a));
+
+        append(
+            &mut ledger,
+            b,
+            EventKind::MoveImported {
+                move_id: move_ab,
+                from: a,
+            },
+            6,
+        );
+        let two = Epoch::FIRST.next().unwrap();
+        assert!(matches!(
+            ledger.view(a),
+            LeaseView::Departed { owner, epoch } if owner == b && epoch == two
+        ));
+        assert!(matches!(ledger.view(b), LeaseView::Owner(token) if token.epoch == two));
+        assert!(matches!(ledger.view(c), LeaseView::Replica { owner, .. } if owner == b));
+
+        append(
+            &mut ledger,
+            b,
+            EventKind::SnapshotPublished {
+                snapshot: snap(3),
+                parent: Some(snap(2)),
+            },
+            7,
+        );
+        append(
+            &mut ledger,
+            b,
+            EventKind::Suspended { snapshot: snap(3) },
+            8,
+        );
+        imported(&mut ledger, b, c, MoveId::from_bytes([2; 16]), 9);
+        let three = two.next().unwrap();
+        assert!(matches!(
+            ledger.view(a),
+            LeaseView::Replica { owner, epoch } if owner == c && epoch == three
+        ));
+        assert!(matches!(ledger.view(b), LeaseView::Departed { owner, .. } if owner == c));
+        assert!(matches!(ledger.view(c), LeaseView::Owner(_)));
+    }
+
+    #[test]
+    fn view_after_a_steal_makes_the_old_owner_a_replica() {
+        let ledger = suspended_twice(node(1));
+        let proposal = ledger
+            .steal(
+                node(2),
+                String::new(),
+                Some(CompleteSnapshot::new(snap(2))),
+                eid(9),
+                9,
+            )
+            .unwrap();
+        let mut ledger = ledger;
+        ledger
+            .accept(proposal.record, Author::Node(node(2)))
+            .unwrap();
+        let two = Epoch::FIRST.next().unwrap();
+        assert!(matches!(
+            ledger.view(node(1)),
+            LeaseView::Replica { owner, epoch } if owner == node(2) && epoch == two
+        ));
+        assert!(matches!(ledger.view(node(2)), LeaseView::Owner(token) if token.epoch == two));
+    }
+
+    #[test]
+    fn steal_warning_names_the_owner_and_the_snapshot_in_words() {
+        let warning = StealWarning {
+            owner: node(1),
+            last_record_at: 1_760_000_000_000,
+            snapshot: snap(2),
+        };
+        let text = warning.to_string();
+        assert!(text.contains(&node(1).to_string()));
+        assert!(text.contains(&snap(2).to_string()));
+        assert!(text.contains("orphan"));
+        assert!(!text.contains("1760000000000"));
     }
 }
