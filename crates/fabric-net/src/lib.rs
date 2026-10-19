@@ -26,6 +26,7 @@ pub mod identity;
 mod pipe;
 #[cfg(feature = "quic")]
 pub mod quic;
+pub mod rpc;
 #[cfg(feature = "tcp_tls")]
 pub mod tcp;
 pub mod tls;
