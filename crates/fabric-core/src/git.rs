@@ -93,7 +93,7 @@ impl GitOid {
 
 /// Applies the rules of `git check-ref-format` to a full ref name.
 fn check_ref_format(name: &str) -> bool {
-    if !name.starts_with("refs/") || name == "@" || name.ends_with('.') || name.contains("@{") {
+    if !name.starts_with("refs/") || name.ends_with('.') || name.contains("@{") {
         return false;
     }
     if name

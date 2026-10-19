@@ -2,7 +2,8 @@
 //!
 //! Invariant: an id is a value, never a path, a hostname or a vendor session
 //! id. Every id has one text form that parses back to the same bytes, and
-//! every id serializes as its raw bytes so a ledger record stays small. The
+//! only that form parses: no other letter case and no alias character. Every
+//! id serializes as its raw bytes so a ledger record stays small. The
 //! core makes no id itself: a ULID needs a clock and a random source, and
 //! both live at the edge, which hands the core the bytes.
 
@@ -15,18 +16,18 @@ use ulid::Ulid;
 /// Why a text id did not parse.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ParseIdError {
-    /// The text is not a 26-character Crockford base32 ULID.
-    #[error("not a ULID")]
+    /// The text is not a 26-character uppercase Crockford base32 ULID.
+    #[error("not a ULID in its text form")]
     BadUlid,
     /// The text does not start with the prefix the id kind uses.
     #[error("missing the {0} prefix")]
     BadPrefix(&'static str),
-    /// The text decodes to the wrong number of bytes.
-    #[error("expected {expected} bytes, got {actual}")]
+    /// The text, after the prefix, has the wrong number of characters.
+    #[error("expected {expected} characters, got {actual}")]
     BadLength {
-        /// The byte length the id kind has.
+        /// The character count of the id kind's text form.
         expected: usize,
-        /// The byte length the text decoded to.
+        /// The character count found.
         actual: usize,
     },
     /// A character outside the id's alphabet.
@@ -73,9 +74,13 @@ macro_rules! ulid_id {
             type Err = ParseIdError;
 
             fn from_str(s: &str) -> Result<Self, Self::Err> {
-                Ulid::from_string(s)
-                    .map(|u| Self(u.to_bytes()))
-                    .map_err(|_| ParseIdError::BadUlid)
+                // The ulid crate also reads lowercase; only the uppercase
+                // spelling it writes is the text form.
+                let ulid = Ulid::from_string(s).map_err(|_| ParseIdError::BadUlid)?;
+                if ulid.to_string() != s {
+                    return Err(ParseIdError::BadUlid);
+                }
+                Ok(Self(ulid.to_bytes()))
             }
         }
     };
@@ -161,15 +166,18 @@ hash_id!(
 
 /// The identity of a node: its ed25519 public key.
 ///
-/// The text form is `fab1` followed by the 32 key bytes in lowercase base32
-/// without padding, so an id can be read aloud from one screen and typed on
-/// another.
+/// The text form is `fab1` followed by the 32 key bytes as 52 characters of
+/// lowercase base32 without padding, so an id can be read aloud from one
+/// screen and typed on another.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId([u8; 32]);
 
 impl NodeId {
     /// The text prefix every node id starts with.
     pub const PREFIX: &'static str = "fab1";
+
+    /// Characters after the prefix: 32 bytes in base32 without padding.
+    const TEXT_LEN: usize = 52;
 
     /// Wraps a 32-byte ed25519 public key.
     #[must_use]
@@ -204,12 +212,18 @@ impl FromStr for NodeId {
         let body = s
             .strip_prefix(Self::PREFIX)
             .ok_or(ParseIdError::BadPrefix(Self::PREFIX))?;
+        if body.len() != Self::TEXT_LEN {
+            return Err(ParseIdError::BadLength {
+                expected: Self::TEXT_LEN,
+                actual: body.len(),
+            });
+        }
         let bytes = base32::decode(body)?;
         let bytes: [u8; 32] = bytes
             .try_into()
             .map_err(|v: Vec<u8>| ParseIdError::BadLength {
-                expected: 32,
-                actual: v.len(),
+                expected: Self::TEXT_LEN,
+                actual: v.len() * 8 / 5,
             })?;
         Ok(Self(bytes))
     }
@@ -279,8 +293,8 @@ fn write_hex(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
 fn parse_hex32(s: &str) -> Result<[u8; 32], ParseIdError> {
     if s.len() != 64 {
         return Err(ParseIdError::BadLength {
-            expected: 32,
-            actual: s.len() / 2,
+            expected: 64,
+            actual: s.len(),
         });
     }
     let mut out = [0u8; 32];
@@ -292,11 +306,11 @@ fn parse_hex32(s: &str) -> Result<[u8; 32], ParseIdError> {
     Ok(out)
 }
 
+/// Lowercase hex only: `Display` writes lowercase, and one id has one text.
 fn hex_val(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
         b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
     }
 }
@@ -378,12 +392,12 @@ mod tests {
         assert_eq!(
             "fab1aaaa".parse::<NodeId>(),
             Err(ParseIdError::BadLength {
-                expected: 32,
-                actual: 2
+                expected: 52,
+                actual: 4
             })
         );
         assert_eq!(
-            "fab1AAAA".parse::<NodeId>(),
+            format!("fab1{}", "A".repeat(52)).parse::<NodeId>(),
             Err(ParseIdError::BadChar { index: 0 })
         );
         // The last character of a 52-character body carries four padding
@@ -399,25 +413,34 @@ mod tests {
     }
 
     #[test]
-    fn hash_id_text_form_is_lowercase_hex() {
+    fn hash_id_text_form_is_lowercase_hex_and_nothing_else_parses() {
         let id = SnapshotId::of(b"hello");
         let text = id.to_string();
         assert_eq!(text.len(), 64);
         assert_eq!(text.parse::<SnapshotId>(), Ok(id));
         assert_eq!(
-            "zz".parse::<SnapshotId>(),
+            text.to_uppercase().parse::<SnapshotId>(),
+            Err(ParseIdError::BadChar { index: 0 })
+        );
+        assert_eq!(
+            "zzz".parse::<SnapshotId>(),
             Err(ParseIdError::BadLength {
-                expected: 32,
-                actual: 1
+                expected: 64,
+                actual: 3
             })
         );
     }
 
     #[test]
-    fn ulid_id_rejects_garbage() {
+    fn ulid_id_text_form_is_uppercase_and_nothing_else_parses() {
         assert_eq!("not-a-ulid".parse::<JobId>(), Err(ParseIdError::BadUlid));
         let id = JobId::from_bytes([0x01, 0x92, 0xa3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x7f]);
-        assert_eq!(id.to_string().parse::<JobId>(), Ok(id));
+        let text = id.to_string();
+        assert_eq!(text.parse::<JobId>(), Ok(id));
+        assert_eq!(
+            text.to_lowercase().parse::<JobId>(),
+            Err(ParseIdError::BadUlid)
+        );
     }
 
     #[test]
