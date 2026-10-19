@@ -29,12 +29,12 @@ crates/
   fabric-store     objects, blob store, SQLite catalog, snapshot publish and restore, ignored-file classes
   fabric-net       node identity, Transport trait, QUIC and TCP+TLS, blob transfer, pairing
   fabric-harness   Harness trait, ACP adapter, Claude Code adapter, Codex adapter
-  fabric-env       EnvSpec detection, carry keys, materialization, doctor facts
+  fabric-env       EnvSpec detection, the .fabric/env.toml override file, the secret policy capture applies, materialization, carry keys, doctor facts
   fabric-node      the long-running node process: owner of the store lock, blob server, move target
   fabric-cli       the `fabric` binary: job init, suspend, resume, job move, job steal, status, doctor, orphan export, node pair, node serve
 ```
 
-Only `fabric-core` exists today, and it holds a placeholder. Dependency direction is strictly downward: `fabric-cli` depends on everything, `fabric-core` depends on nothing in the workspace. `fabric-core` defines the `Store`, `Transport` and `Harness` traits; the other crates implement them. Nothing in the core knows about QUIC, SQLite or any agent vendor.
+`fabric-core` and `fabric-env` exist today; in `fabric-env`, carry keys and doctor facts are still to come. Dependency direction is strictly downward: `fabric-cli` depends on everything, `fabric-core` depends on nothing in the workspace. `fabric-core` defines the `Store`, `Transport` and `Harness` traits; the other crates implement them. Nothing in the core knows about QUIC, SQLite or any agent vendor.
 
 ## Data structures first
 
