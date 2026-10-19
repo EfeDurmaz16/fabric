@@ -2,7 +2,7 @@
 
 Status: accepted, 2026-10-19
 
-Amended 2026-10-19 after step 1 research. Step 1 of Materialize now reads the per-cache carry key of ADR 0012 instead of the `{ os, arch }` pair alone, and `tools` records the exact strings `fabric doctor` compares (ADR 0008). Nothing else changed.
+Amended 2026-10-19 after step 1 research. Step 1 of Materialize now reads the per-cache carry key of ADR 0012 instead of the `{ os, arch }` pair alone. The exact strings `fabric doctor` compares (ADR 0008) live in the carry key, not in `tools`, which holds the workspace's own pins as written (corrected in place by the `feat/env` amendment, point 1). Nothing else changed.
 
 Amended 2026-10-19 while writing `fabric-core` (PR `feat/core`): `SetupStep.cwd` is `Option<RelPath>`, where `None` is the workspace root, because a `RelPath` cannot name the root itself (ADR 0004 forbids empty and `.` components). The edited-spec record is `EnvSpecChanged` (ADR 0002), not a free-text `Note`.
 
@@ -12,7 +12,7 @@ Amended 2026-10-19 after the second adversarial review of PR `feat/core`: `progr
 
 Amended 2026-10-19 while writing `fabric-env` (PR `feat/env`). Detection and materialize are corrected in place; what changed and why:
 
-1. `Tool.version` holds a pin as its file wrote it (`22`, `1.97.1`, `>=18`). Detection reads files and never runs a program, so the same files give the same spec on every node; the strings a tool reports about itself (`rustc -vV`, `node --version`) are measured by `fabric doctor` and stored in the carry key (ADR 0008, ADR 0012), which is where an exact comparison is made. Step 5 of materialize, the version warning, therefore belongs to doctor and is not in `fabric-env`.
+1. `Tool.version` holds a pin as its file wrote it (`22`, `1.97.1`, `>=18`). Detection reads files and never runs a program, so the same files give the same spec on every node; the strings a tool reports about itself (`rustc -vV`, `node --version`) are measured by `fabric doctor` and stored in the carry key (ADR 0008, ADR 0012), which is where an exact comparison is made. Step 5 of materialize is therefore informational: doctor prints the pins beside the measured strings and compares neither, because ADR 0008 allows no range parsing and a pin such as `>=18` or `v20` would never equal a measured `v20.11.1`.
 2. The user's edits live in `.fabric/env.toml`, not in an edited copy of the spec (below). The spec is rebuilt from the files and the override file, so "edit the spec" and "detect again" cannot disagree.
 3. `.pnpm-store` is not a detected cache path. ADR 0012 never carries pnpm store files, and a project with the usual global store would see the path missing on every resume and install every time.
 4. `requirements.txt` gives `uv venv --allow-existing` then `uv pip install -r requirements.txt`, not `pip install -r`: a bare `pip install` writes into whichever Python is first on `PATH`, not into the workspace's `.venv`. `uv.lock` gives `uv sync --frozen`, as in ADR 0012. A `pyproject.toml` without `uv.lock` gives nothing, because a sync would write a new lockfile.
@@ -35,7 +35,7 @@ Also: environments contain secrets, and secrets must not travel in snapshots (AD
 
 ```text
 EnvSpec {                        the bytes start with the format version as a varint; it is not a field
-  tools:         [Tool],         detected, informational, used to warn on mismatch; strictly sorted by name
+  tools:         [Tool],         detected or declared pins, informational, printed beside measured versions, never compared; strictly sorted by name
   setup:         [SetupStep],    commands that make the workspace runnable, in the order they run
   env_var_names: [EnvVarName],   names only, never values; `[A-Za-z_][A-Za-z0-9_]*`, strictly sorted
   cache_paths:   [RelPath],      what counts as a cache for snapshot policy and for "is it warm"; strictly sorted
@@ -76,7 +76,7 @@ After restore, `fabric-env` checks, in order:
 2. For each cache path in the detection report: is it a non-empty directory holding the marker its installer writes last? The marker follows the cache's ecosystem, which is the manager detection chose, not the lockfiles on disk: `node_modules` needs `.modules.yaml` for pnpm, `.package-lock.json` for npm, `.yarn-integrity` for Yarn 1, `.yarn-state.yml` for Yarn 2 and later, and nothing for Bun, so a Bun tree next to a leftover `package-lock.json` is whole when it has content. `.venv` needs `pyvenv.cfg`, any other path needs content. A first install killed halfway leaves no marker, so the next resume installs again. `plan` therefore takes the detection report, which is rebuilt from the same files on every node, and not the spec alone.
 3. If any is missing, or the report has no cache paths at all, run the `setup` steps with `when: CachesMissing` in order, in the workspace, with the node's environment plus the job's env var names resolved from the node's own secret source (v0: the user's shell environment on that node; the step fails with the missing names listed if any is absent). The steps run in the `fabric resume` process, not in the daemon, which is why the user's shell environment is available (ADR 0004, one writer). Before any step runs, every planned program must be on `PATH` and every declared variable must be set, or nothing runs and the error lists what is missing. `PATH` entries inside the workspace are skipped, so a restored workspace cannot supply its own installer. Each line a step prints goes to `tracing` under the target `fabric_env::setup`; computing the plan is the dry run and changes nothing.
 4. `Always` steps run on every resume.
-5. Compare the measured tool versions to the spec's pins; a mismatch is a warning in the resume output, not a failure. This is `fabric doctor`'s comparison (amendment 1) and is not in `fabric-env`.
+5. The spec's pins are informational. `fabric doctor` prints each pin beside the string it measured for that tool (`node --version`, `rustc -vV`), so the user sees `22` next to `v26.1.0`, and compares nothing: ADR 0008 compares exact strings only, and a pin such as `>=18` or `v20` is not one, so an equality test would warn on every resume. The measured strings that do decide anything are in the carry key (ADR 0012). Nothing in materialize reads the pins.
 
 If all caches are present, nothing runs and resume is fast. This is the common case for the two-Mac gate.
 

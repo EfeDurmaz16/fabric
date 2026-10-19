@@ -121,7 +121,9 @@ impl<'de> Deserialize<'de> for EnvVarName {
 /// What a workspace needs before a harness can run in it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvSpec {
-    /// Tools the workspace was seen with; used to warn, never to fail. Sorted by name.
+    /// Tools the workspace pins. Informational: printed beside the measured
+    /// versions, never compared for equality and never a reason to fail.
+    /// Sorted by name.
     pub tools: Vec<Tool>,
     /// Commands that make the workspace runnable, in the order they run.
     pub setup: Vec<SetupStep>,
@@ -131,12 +133,12 @@ pub struct EnvSpec {
     pub cache_paths: Vec<RelPath>,
 }
 
-/// One tool and the exact version string it reported.
+/// One tool and the version its workspace pins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tool {
-    /// The tool's name, such as `node` or `rustc`.
+    /// The tool's name as pin files write it, such as `node`, `rust` or `pnpm`.
     pub name: String,
-    /// The tool's own version output, kept whole and never parsed into parts.
+    /// The pin as its file wrote it (`22`, `v20`, `>=18`, `1.97.1`), kept whole and never parsed into parts.
     pub version: String,
     /// Where the entry came from.
     pub source: ToolSource,
