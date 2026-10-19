@@ -54,8 +54,10 @@ GitState {
   config:          [ChunkId],            .git/config
   exclude:         Option<[ChunkId]>,    .git/info/exclude
 }
-Entry { rel_path: String, kind: File | Dir | Symlink { target: String }, mode: u32, size: u64, chunks: [ChunkId] }
+Entry { rel_path: RelPath, kind: File | Dir | Symlink { target: String }, mode: u32, size: u64, chunks: [ChunkId] }
 ```
+
+`RelPath` is a parsed newtype in `fabric-core`, never a bare string. Decoding a manifest rejects, with `ManifestError::BadPath { index, reason }`, any path that is empty, starts with `/`, contains a NUL byte, has an empty, `.` or `..` component, is not NFC-normalized, or has `.fabric` as its first component (reserved for the marker). In `files` and `harness_state` a `.git` component is rejected too; `W` cannot contain one because git refuses it. Two entries with the same path are `ManifestError::DuplicatePath`. A symlink `target` is an unparsed string written verbatim with `symlink(2)`; it is safe because restore never writes through a link (below). `mode` is applied as `mode & 0o777`; setuid, setgid and sticky bits never travel.
 
 - **Git, by commits, not by files.** Uncommitted work is the common state of a job in flight, and a bundle carries only what a ref reaches. Capture therefore builds two commits with a private index and never touches the real index, the working tree or the user's refs:
   - `I`: `git write-tree` on the real index (read only), then `git commit-tree <tree> -p HEAD`. Its tree is the staged state, so staged blobs become reachable.
@@ -108,6 +110,8 @@ Marker { job_id: JobId, snapshot: SnapshotId, state: Clean | Dirty | Restoring {
    4. `git read-tree <I>`. The index is now the staged state; the working tree is still empty.
    5. Write the tree of `W` into the root with Fabric's own file writer (`git ls-tree -r -z W` for paths, modes and blob ids, `git cat-file --batch` for bytes). It is the same loop that writes `files`, so modes, symlinks and path rules are enforced in one place, and the index is untouched. Then `git update-index --refresh`, ignoring its exit status, which is nonzero whenever a file differs from the index, which is expected here.
    6. Only now write `files`.
+
+   The file writer defends the root against the manifest, because the manifest can come from a buggy adapter, a corrupted peer store or a paired node that is itself compromised, and the hash chain of ADR 0002 is not security. Within each of `W`, `files` and `harness_state` it creates directories first, then files, then symlinks last, so no link exists yet when the bytes are written. Every open goes through a directory handle, component by component with `O_NOFOLLOW`, never through a path string joined to the root; `cap-std` is the planned dependency for this and `openat2` with `RESOLVE_BENEATH` is used where the kernel has it. This covers the in-place path too, where links from the previous snapshot already exist. Before writing anything the writer probes the volume for case folding by creating two names that differ only in case under the staging directory; on a case-insensitive volume two entries that collide under case folding are refused with `RestoreError::PathCollision { a, b }` rather than one silently overwriting the other. Each of these rules gets one restore test with a manifest that breaks it.
 
    After step 5, `git status` on the target equals `git status` on the source: staged is `I` against `HEAD`, unstaged is the disk against `I`, untracked is what `W` has that `I` does not.
 5. Rewrites: the manifest stores relative paths only. Harness state may contain absolute paths pointing at the source workspace root; the adapter's `restore` receives `(source_root, target_root)` and performs its own rewrites (ADR 0006). The core never guesses which bytes are paths.
