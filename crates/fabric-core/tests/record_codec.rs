@@ -5,7 +5,7 @@
 use std::num::TryFromIntError;
 
 use fabric_core::harness::HarnessKind;
-use fabric_core::id::{EnvSpecId, Epoch, EventId, MoveId, NodeId, RecordHash, SnapshotId};
+use fabric_core::id::{EnvSpecId, Epoch, EventId, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::ledger::{
     CHECKSUM_LEN, Event, EventKind, HEADER_CHECK_LEN, MAX_RECORD_LEN, Record, RecordError, scan,
 };
@@ -17,10 +17,13 @@ fn node() -> impl Strategy<Value = NodeId> {
 
 fn kind() -> impl Strategy<Value = EventKind> {
     prop_oneof![
-        (".{0,20}", node()).prop_map(|(goal, created_by)| EventKind::Created {
-            goal,
-            harness: HarnessKind::ClaudeCode,
-            created_by
+        (any::<[u8; 16]>(), ".{0,20}", node()).prop_map(|(job, goal, created_by)| {
+            EventKind::Created {
+                job_id: JobId::from_bytes(job),
+                goal,
+                harness: HarnessKind::ClaudeCode,
+                created_by,
+            }
         }),
         (any::<[u8; 16]>(), node()).prop_map(|(m, target)| EventKind::MoveStarted {
             move_id: MoveId::from_bytes(m),

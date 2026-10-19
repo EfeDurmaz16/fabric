@@ -65,6 +65,8 @@ pub struct Event {
 pub enum EventKind {
     /// The job was created; `created_by` owns it at epoch one.
     Created {
+        /// The job this ledger belongs to; every replay checks it.
+        job_id: JobId,
         /// The goal in the user's words.
         goal: String,
         /// The harness the job started under.
@@ -366,6 +368,14 @@ pub enum LedgerError {
     /// A ledger must start with `Created`.
     #[error("ledger has no records")]
     Empty,
+    /// The `Created` record names another job.
+    #[error("ledger is for job {found}, not {expected}")]
+    WrongJob {
+        /// The job the record names.
+        found: JobId,
+        /// The job the caller expected.
+        expected: JobId,
+    },
     /// The first record is not `Created`.
     #[error("first record is {0}, not Created")]
     FirstNotCreated(&'static str),
@@ -579,6 +589,7 @@ pub struct Ledger {
 impl Ledger {
     /// Builds the first record of a new job.
     pub fn created(
+        job_id: JobId,
         goal: String,
         harness: HarnessKind,
         created_by: NodeId,
@@ -591,6 +602,7 @@ impl Ledger {
             epoch: Epoch::FIRST,
             at,
             kind: EventKind::Created {
+                job_id,
                 goal,
                 harness,
                 created_by,
@@ -599,6 +611,10 @@ impl Ledger {
     }
 
     /// Rebuilds a ledger from records this node wrote or accepted earlier.
+    ///
+    /// `job_id` is the job the caller expects, from the directory or the
+    /// message envelope; a chain whose `Created` names another job is
+    /// refused with `WrongJob`.
     pub fn replay(
         job_id: JobId,
         records: impl IntoIterator<Item = Record>,
@@ -621,6 +637,7 @@ impl Ledger {
     fn from_created(job_id: JobId, record: Record) -> Result<Ledger, LedgerError> {
         let event = record.event();
         let EventKind::Created {
+            job_id: found,
             goal,
             harness,
             created_by,
@@ -628,6 +645,12 @@ impl Ledger {
         else {
             return Err(LedgerError::FirstNotCreated(event.kind.name()));
         };
+        if *found != job_id {
+            return Err(LedgerError::WrongJob {
+                found: *found,
+                expected: job_id,
+            });
+        }
         if event.prev.is_some() || event.epoch != Epoch::FIRST {
             return Err(LedgerError::BadCreated);
         }
@@ -958,8 +981,15 @@ mod tests {
     }
 
     fn new_ledger(owner: NodeId) -> Ledger {
-        let created =
-            Ledger::created("goal".into(), HarnessKind::ClaudeCode, owner, eid(), 10).unwrap();
+        let created = Ledger::created(
+            job(),
+            "goal".into(),
+            HarnessKind::ClaudeCode,
+            owner,
+            eid(),
+            10,
+        )
+        .unwrap();
         Ledger::replay(job(), [created]).unwrap()
     }
 
@@ -1044,6 +1074,7 @@ mod tests {
             epoch: Epoch::FIRST,
             at: 1,
             kind: EventKind::Created {
+                job_id: job(),
                 goal: "g".into(),
                 harness: HarnessKind::Codex,
                 created_by: node(1),
@@ -1057,12 +1088,25 @@ mod tests {
     }
 
     #[test]
+    fn replay_under_another_job_id_is_refused() {
+        let ledger = new_ledger(node(1));
+        let other = JobId::from_bytes([4; 16]);
+        let err = Ledger::replay(other, ledger.records().iter().cloned()).unwrap_err();
+        assert!(matches!(
+            err,
+            LedgerError::WrongJob { found, expected } if found == job() && expected == other
+        ));
+        assert_eq!(ledger.job_id(), job());
+    }
+
+    #[test]
     fn a_second_created_is_refused() {
         let mut ledger = new_ledger(node(1));
         let err = append(
             &mut ledger,
             node(1),
             EventKind::Created {
+                job_id: job(),
                 goal: "again".into(),
                 harness: HarnessKind::Codex,
                 created_by: node(1),
@@ -1395,7 +1439,8 @@ mod tests {
     #[test]
     fn commit_persists_before_it_shows_and_persists_nothing_invalid() {
         let mut store = MemoryStore::default();
-        let created = Ledger::created("g".into(), HarnessKind::Codex, node(1), eid(), 1).unwrap();
+        let created =
+            Ledger::created(job(), "g".into(), HarnessKind::Codex, node(1), eid(), 1).unwrap();
         store.append(&created).unwrap();
         let mut ledger = Ledger::open(job(), &store).unwrap();
         let note = ledger
@@ -1437,7 +1482,7 @@ mod tests {
 
     #[test]
     fn scan_refuses_an_unknown_format_version() {
-        let a = Ledger::created("g".into(), HarnessKind::Codex, node(1), eid(), 1).unwrap();
+        let a = Ledger::created(job(), "g".into(), HarnessKind::Codex, node(1), eid(), 1).unwrap();
         let mut frame = a.bytes().to_vec();
         frame[HEADER_CHECK_LEN + 4] = 9;
         let hashed_len = frame.len() - CHECKSUM_LEN;

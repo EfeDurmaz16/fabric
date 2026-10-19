@@ -24,7 +24,7 @@
 //! let now = 1_760_000_000_000;
 //!
 //! // The Pro creates the job and owns it at epoch 1.
-//! let created = Ledger::created("fix the flaky test".into(), HarnessKind::ClaudeCode, pro, EventId::generate(), now)?;
+//! let created = Ledger::created(job, "fix the flaky test".into(), HarnessKind::ClaudeCode, pro, EventId::generate(), now)?;
 //! let mut pro_store = MemoryStore::default();
 //! pro_store.append(&created)?;
 //! let mut on_pro = Ledger::open(job, &pro_store)?;

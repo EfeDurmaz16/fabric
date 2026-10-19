@@ -132,6 +132,7 @@ impl World {
             .map(|i| Ok(NodeId::from_bytes([u8::try_from(i)?; 32])))
             .collect::<Fallible<_>>()?;
         let created = Ledger::created(
+            job,
             "goal".into(),
             HarnessKind::ClaudeCode,
             ids[0],
