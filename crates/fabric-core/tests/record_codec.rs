@@ -349,22 +349,73 @@ fn every_kind() -> Result<Vec<Event>, Box<dyn Error>> {
 }
 
 /// Pins record format version 1: the frame layout and the postcard
-/// discriminants and field order of every `EventKind`. Reordering a variant or
-/// a field changes this hash and must come with `RECORD_FORMAT_VERSION` bumped
-/// once version 1 has shipped.
+/// discriminants and field order of every `EventKind`, one hash per kind so
+/// a failure names the kind that moved. Reordering a variant or a field
+/// changes a hash and must come with `RECORD_FORMAT_VERSION` bumped once
+/// version 1 has shipped.
 #[test]
 fn record_format_version_one_bytes_are_pinned() {
-    let mut all = Vec::new();
-    for event in every_kind().unwrap() {
-        all.extend_from_slice(Record::encode(event).unwrap().bytes());
+    let pinned = [
+        (
+            "Created",
+            "3a2557086107ddbc99fecc40e7cf23c7fde2ede23c3772fe884a7eb61afaae4c",
+        ),
+        (
+            "MoveStarted",
+            "fbe136b96f3e591c5fc3ac6e2c9e831154a99a9ffd121840fca6abe67718ad76",
+        ),
+        (
+            "MoveImported",
+            "a5f7df1fc5a83f9c8f7f2fbcd699e6a2dcf28927bb279b96c65ba9f0c5758558",
+        ),
+        (
+            "MoveAborted",
+            "24c568a9f5fe35d5868628095db4ea62cf65afe18e74c1575b45851a8bf7ea9b",
+        ),
+        (
+            "Stolen",
+            "b8c84ba7a73d01b5578627bd7f1d0e440f8a9d689d423b0ebd7056f0aea6de70",
+        ),
+        (
+            "SnapshotPublished",
+            "42a4dc4add36de0a3e4fe8a43a6203f9645f2fff64ce0037204a5370873c6f70",
+        ),
+        (
+            "Suspended",
+            "8108ea18b103b0c4467abe819f1bf676b66ffff7eddbde35260a53bba8ccd0bf",
+        ),
+        (
+            "Resumed",
+            "b5a53a32accf869d07ae4c05a9b602c38fcc5bf53172c97cbd6e49f528b60622",
+        ),
+        (
+            "EnvSpecChanged",
+            "82808b2959235ee829e7010eb8d6f57da68721e8f1ad82f1bf884463af5e67ff",
+        ),
+        (
+            "DecisionRecorded",
+            "1762dbe004656c1b93e3056ab719b345bef215793499335ce742d6b04892c9fc",
+        ),
+        (
+            "Note",
+            "4fba635d3b9a5835f5620500e90565e78fd7d558ee386928f0320ba359d8e083",
+        ),
+    ];
+    let events = every_kind().unwrap();
+    assert_eq!(events.len(), pinned.len(), "one pin per event kind");
+    for (event, (name, hash)) in events.into_iter().zip(pinned) {
+        assert_eq!(event.kind.name(), name);
+        let record = Record::encode(event).unwrap();
+        assert_eq!(
+            blake3::hash(record.bytes()).to_hex().as_str(),
+            hash,
+            "the bytes of {name} moved: {:02x?}",
+            record.bytes()
+        );
     }
-    assert_eq!(
-        blake3::hash(&all).to_hex().as_str(),
-        "2deac91bdddf422e050831479b0e007a10091acbf162468dd7d2c259c3cb447e"
-    );
 }
 
-/// Pins job manifest format version 1 the same way.
+/// Pins job manifest format version 1 the same way; a failure prints the bytes.
 #[test]
 fn job_manifest_version_one_bytes_are_pinned() {
     let manifest = JobManifest {
@@ -375,7 +426,7 @@ fn job_manifest_version_one_bytes_are_pinned() {
         latest_snapshot: Some(SnapshotId::from_bytes([7; 32])),
         lease: LeaseState::Departing {
             node: NodeId::from_bytes([1; 32]),
-            epoch: Epoch::new(3).unwrap_or(Epoch::FIRST),
+            epoch: Epoch::new(3).unwrap(),
             move_id: MoveId::from_bytes([5; 16]),
             target: NodeId::from_bytes([2; 32]),
         },
@@ -387,7 +438,8 @@ fn job_manifest_version_one_bytes_are_pinned() {
     let bytes = manifest.encode().unwrap();
     assert_eq!(
         blake3::hash(&bytes).to_hex().as_str(),
-        "c6a0d10da670e5658a9aee5bc78703d6e0e94ed26e4d6b07c099f1b861986c85"
+        "c6a0d10da670e5658a9aee5bc78703d6e0e94ed26e4d6b07c099f1b861986c85",
+        "the job manifest bytes moved: {bytes:02x?}"
     );
     assert_eq!(JobManifest::decode(&bytes).unwrap(), manifest);
 }

@@ -593,6 +593,23 @@ mod tests {
             Ok(OfferAnswer::SnapshotIncomplete { snapshot }) if snapshot == snap(2)
         ));
 
+        let mut ahead = suspended_twice(node(1));
+        append(
+            &mut ahead,
+            node(3),
+            EventKind::Stolen {
+                by: node(3),
+                from: node(1),
+                reason: String::new(),
+            },
+            5,
+        );
+        let two = Epoch::FIRST.next().unwrap();
+        assert!(matches!(
+            ahead.answer_offer(node(2), &offer, epoch, complete, eid(9), 9),
+            Ok(OfferAnswer::Stale { yours, current }) if yours == epoch && current == two
+        ));
+
         assert!(matches!(
             on_source.answer_offer(node(2), &offer, epoch, complete, eid(9), 9),
             Ok(OfferAnswer::Import(_))
