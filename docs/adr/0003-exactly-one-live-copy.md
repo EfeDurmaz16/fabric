@@ -4,6 +4,8 @@ Status: accepted, 2026-10-19
 
 Amended 2026-10-19 after step 1 research. The first version of this ADR used a time-based lease: a 60 second expiry, a renewal every 20 seconds, a 30 second skew margin, an arbiter that granted claims, and `fabric resume --force-expired` as the way past a holder that stopped renewing. The research removed the ground under it: there is no always-on node today (two laptops, `2026-10-19-step1-design-input.md`, section 10, A22), a sleeping laptop looks exactly like a dead one, and a lease that expires on a clock is only safe when the store rejects stale writers, which is the fencing this ADR already had. So the expiry is gone. What remains is the cooperative move protocol the research recommends (same file, section 4.8, options L1 and L1a; section 9, D11 and D30; `step1/H5-workspace-mobility.md`, sections 9.1 to 9.4), a manual steal with an epoch bump behind `--force`, and the epoch fence. An always-on witness that could bring expiry back is a later ADR (Open questions). Sections marked "unchanged" kept their text apart from renamed terms.
 
+Amended 2026-10-19 while writing `fabric-core` (PR `feat/core`): `Stolen` names the thief as `by` next to `from`, so the owner after a steal is in the record and not only in the transport (ADR 0002, amendment of the same date). The lease table and the steal section below use the new shape. Nothing else changed.
+
 ## Context
 
 This is the decision that protects the user's work. Everything else can be slow or ugly; this cannot be wrong.
@@ -38,7 +40,7 @@ The lease is derived from the ledger (ADR 0002) and nothing else. The records th
 MoveStarted  { move_id, target }     by the owner, at its epoch:       Owned -> Departing
 MoveImported { move_id, from }       by the target, at epoch + 1:      Departing -> Owned { target, epoch + 1 }
 MoveAborted  { move_id }             by the target, at the owner's epoch: Departing -> Owned { source, epoch }
-Stolen       { from, reason }        by any node, at epoch + 1, behind --force: anything -> Owned { thief, epoch + 1 }
+Stolen       { by, from, reason }    by `by`, at epoch + 1, behind --force:   anything -> Owned { by, epoch + 1 }
 ```
 
 ### The move protocol
@@ -67,7 +69,7 @@ The target's decision is the single commit point of a move and it is written exa
 
 - It refuses unless the local store holds a complete copy of the snapshot named by the latest `Suspended` or `SnapshotPublished` in the local replica; a steal must never resume from nothing.
 - It prints a warning that states the owner's node id, the time of the last record from it, the snapshot it will resume from, and that any work the owner did after that snapshot will become an orphan on the owner's disk.
-- It appends `Stolen { from: owner, reason }` at `epoch + 1` with `prev` set to the local replica head, then a `Note` with the warning text. `reason` is the user's text from `--reason`, or empty.
+- It appends `Stolen { by: thief, from: owner, reason }` at `epoch + 1` with `prev` set to the local replica head, then a `Note` with the warning text. `reason` is the user's text from `--reason`, or empty.
 - It does not launch. `fabric resume` afterwards launches as the owner.
 
 When the stolen-from node next connects, it is offered the `Stolen` record. If the record's `prev` equals its head, it appends it, learns the higher epoch, and is fenced: the supervisor kills the harness, the workspace is marked an orphan workspace and nothing in it is deleted (Orphans, below). If the stolen-from node appended records of its own after the fork point, the chains have forked and the fork rule decides.

@@ -48,11 +48,12 @@ ChunkId      = blake3 hash of an object: a whole file up to 8 MiB, or one FastCD
 
 Event        = { id: ULID, prev: blake3 of previous event, epoch, kind }
 EventKind    = Created | MoveStarted { move_id, target } | MoveImported { move_id, from }
-             | MoveAborted { move_id } | Stolen { from, reason }
-             | SnapshotPublished | Suspended | Resumed | DecisionRecorded | Note
+             | MoveAborted { move_id } | Stolen { by, from, reason }
+             | SnapshotPublished | Suspended | Resumed | EnvSpecChanged | DecisionRecorded | Note
 
-JobManifest  = { version, job_id, goal, harness_kind, env_spec: EnvSpecId,
-                 latest_snapshot: Option<SnapshotId>, lease: LeaseState }
+JobManifest  = { version, job_id, goal, harness, env_spec: Option<EnvSpecId>,
+                 latest_snapshot: Option<SnapshotId>, lease: LeaseState, head, event_count,
+                 created_at, updated_at }
 LeaseState   = Owned { node, epoch } | Departing { node, epoch, move_id, target }
 
 SnapshotManifest = { version, job_id, root: AbsPath, parent: Option<SnapshotId>, created_at, created_by,

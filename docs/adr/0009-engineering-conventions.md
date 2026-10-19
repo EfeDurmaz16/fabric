@@ -11,7 +11,7 @@ Fabric is small, Rust-only, and will be written fast by several people and agent
 ### Language and toolchain
 
 - Rust, edition 2024, toolchain pinned in `rust-toolchain.toml` (1.97.1 today). `unsafe_code = "forbid"` at the workspace level.
-- Minor versions pinned in `Cargo.toml` (`tokio = "1.54"` style). Every new dependency is justified in the PR body with crate, version, last release date and license. Nothing without a release in the last twelve months.
+- Minor versions pinned in `Cargo.toml` (`tokio = "1.54"` style). Every new dependency is justified in the PR body with crate, version, last release date and license. Nothing without a release in the last twelve months. Noted 2026-10-19: `postcard` 1.1.3 was released 2025-07-24, fifteen months before the first code PR, and is kept anyway. Its repository has commits from 2026-09, the 1.x wire format is frozen on purpose, and a frozen codec from a maintained repository is what a ledger that must be readable for years wants. The rule reads the repository, not the crate, when the crate is a stable wire format; `cargo deny` still fails the build on an unmaintained advisory.
 
 ### Code
 
