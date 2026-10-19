@@ -23,6 +23,8 @@ compile_error!(
 pub mod endpoint;
 pub mod frame;
 pub mod identity;
+#[cfg(feature = "mdns")]
+pub mod mdns;
 pub mod peers;
 #[cfg(feature = "tcp_tls")]
 mod pipe;
