@@ -31,7 +31,7 @@ Rule: the repository stays private under this name. Before any public release, b
 
 ### Phone and cloud nodes: later
 
-The product vision includes starting, watching, approving and stopping a job from a phone, and running GPU-bound work on a paired GPU VM. Both are nodes in the model already: a phone is a node that holds a ledger replica and can claim nothing; a GPU VM is a node with a `Capability` placement input. Neither is in v0. The gate is two Macs. A phone client needs a transport that works from a phone (likely TCP+TLS over a tailnet first) and a read-only ledger view; a GPU node needs `EnvSpec.requires` and placement inputs. Each gets an ADR when it starts.
+The product vision includes starting, watching, approving and stopping a job from a phone, and running GPU-bound work on a paired GPU VM. Both are nodes in the model already: a phone is a node that holds a ledger replica and never owns a job; a GPU VM is a node with a `Capability` placement input. Neither is in v0. The gate is two Macs. A phone client needs a transport that works from a phone (likely TCP+TLS over a tailnet first) and a read-only ledger view; a GPU node needs `EnvSpec.requires` and placement inputs. Each gets an ADR when it starts.
 
 ## Alternatives considered
 

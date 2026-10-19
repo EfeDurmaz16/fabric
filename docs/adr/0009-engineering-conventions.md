@@ -24,7 +24,7 @@ Fabric is small, Rust-only, and will be written fast by several people and agent
 
 ### Tests
 
-- Unit tests for pure logic. Property tests (`proptest`) for state machines and codecs: lease transitions, ledger record codec, chunk list equality.
+- Unit tests for pure logic. Property tests (`proptest`) for state machines and codecs: lease and move transitions, ledger record codec, chunk list equality.
 - Integration tests for IO: store publish and restore in a `tempfile` directory, two nodes on loopback.
 - Crash tests for anything that persists: the test re-executes the binary (`assert_cmd`) and sends `SIGKILL` at a named step, then asserts the invariant from the ADR.
 - One test per named failure mode. No duplicate tests. Do not test the compiler.

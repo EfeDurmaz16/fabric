@@ -2,11 +2,13 @@
 
 Status: accepted, 2026-10-19
 
+Amended 2026-10-19 after step 1 research. The per-job message vocabulary follows the move protocol of ADR 0003: the claim and renewal messages are replaced by `MoveRequest`, `MoveOffer`, `MoveStatus`, `MoveDecision`, `MoveUndecided` and `MoveAbort`. The bulk frame bound follows the whole-file objects of ADR 0004 (8 MiB). The preflight of 2026-10-19 (`step1/preflight-2026-10-19.md`) confirmed the two paths this ADR planned: UDP from the Pro to the Air arrives, so QUIC works direct, and TCP arrives, so the fallback works; the Air has a public address and the Pro is behind NAT, so the Pro dials. Tailscale is stopped on both and is not used.
+
 ## Context
 
 Nodes must find each other, prove who they are, and move ledgers and chunks between them. Efe's constraint: no vendor dependency in networking. Tailscale may be present and is a fine network to run over, but Fabric must work on a plain LAN. iroh is a serious Rust option and the research lists it as the reuse candidate (`2026-10-19-competitor-landscape.md`, section 8.1); the same research notes n0 needed four years and 65 pre-releases to reach 1.0, which is the reason to keep it behind a trait rather than in the core.
 
-The traffic is: small control messages (ledger events, lease claims, chunk lists) and bulk chunk transfer, manifests included, that must survive a dropped connection.
+The traffic is: small control messages (ledger events, move offers and decisions, chunk lists) and bulk chunk transfer, manifests included, that must survive a dropped connection.
 
 ## Decision
 
@@ -46,7 +48,7 @@ The core talks to a `Connection` and `Stream` and nothing else. Everything below
 - TLS 1.3 only, Ed25519 only. Both verifiers are custom `rustls` verifiers that ignore names, CAs and validity dates. A certificate is public, so matching its key is not authentication by itself; each verifier also verifies the handshake's `CertificateVerify` signature against that key through `verify_tls13_signature`, which proves the peer holds the private key for the session at hand.
 - The client verifier (`ServerCertVerifier`) accepts only if the certificate's public key equals the `NodeId` it dialed and the key is in `<fabric-data>/peers`.
 - The server verifier (`ClientCertVerifier`) requires a client certificate and accepts only if its public key is in `<fabric-data>/peers`. An unknown key is rejected inside the handshake; no application byte is exchanged. This is the accept-side half of "pairing is trust": listening does not mean accepting.
-- 0-RTT is disabled. Early data is replayable, and the control vocabulary includes claims and appends; nothing in this protocol is worth a replayed claim.
+- 0-RTT is disabled. Early data is replayable, and the control vocabulary includes move offers, decisions and appends; nothing in this protocol is worth a replayed decision.
 - QUIC gives multiplexed streams (control and bulk do not block each other) and migration across address changes (a laptop moving from Wi-Fi to tethering keeps its connection).
 
 ### TCP+TLS fallback
@@ -55,7 +57,7 @@ Some networks drop or rate-limit UDP. The same `rustls` config runs over a `toki
 
 ### Framing
 
-Every message on a control stream is `u32 length | u8 version | postcard(Message)`. A control frame longer than 1 MiB is a protocol error and closes the connection; a bulk `Chunk` frame is bounded by the chunk size cap of ADR 0004 plus framing, and a chunk whose zstd frame declares, or decompresses to, more than 256 KiB is rejected before allocation. A peer cannot make a node allocate more than one frame's worth of memory per stream. Nothing of unbounded size is ever a control message: ledger records are small by construction, and manifests go over the bulk path as chunks (Blob transfer, below).
+Every message on a control stream is `u32 length | u8 version | postcard(Message)`. A control frame longer than 1 MiB is a protocol error and closes the connection; a bulk `Chunk` frame is bounded by the object size cap of ADR 0004 plus framing, and a chunk whose zstd frame declares, or decompresses to, more than 8 MiB is rejected before allocation. A peer cannot make a node allocate more than one frame's worth of memory per stream. Nothing of unbounded size is ever a control message: ledger records are small by construction, and manifests go over the bulk path as chunks (Blob transfer, below).
 
 The message type has two shapes, and this is the only place they are defined:
 
@@ -65,12 +67,13 @@ Message =
   | Job   { job_id: JobId, epoch: Epoch, body: JobMessage }
 
 JobMessage =
-  | ClaimRequest { expected_head }  | Granted { record } | Rejected { head, lease } | StaleEpoch { yours, current }
-  | Append { record }               | LeaseRenewed { expires_at }
-  | WantSnapshot { snapshot }       | ManifestChunks { len, ids } | WantChunks { ids } | Chunk { id, bytes }
+  | Append { record }               | Rejected { head }            | StaleEpoch { yours, current }
+  | MoveRequest                     | MoveOffer { move_id, head, snapshot }
+  | MoveStatus { move_id }          | MoveDecision { record }      | MoveUndecided { move_id } | MoveAbort { move_id }
+  | WantSnapshot { snapshot }       | ManifestChunks { len, ids }  | WantChunks { ids }        | Chunk { id, bytes }
 ```
 
-`Hello` is the one connection-level frame: it is the first message in both directions on a new connection and carries no job. A clock difference over 10 seconds is logged and reported. Every other frame is a `Job` envelope, so every per-job message carries `job_id` and `epoch` (ADR 0003) in one place and the fencing check in ADR 0003 reads one field. `LeaseRenewed` is the renewal push of ADR 0003 and `Append` is the record replication of ADR 0002; both are envelopes like the rest.
+`Hello` is the one connection-level frame: it is the first message in both directions on a new connection and carries no job. A clock difference over 10 seconds is logged and reported. Every other frame is a `Job` envelope, so every per-job message carries `job_id` and `epoch` (ADR 0003) in one place and the fencing check in ADR 0003 reads one field. `Append` is the record replication of ADR 0002. `MoveRequest` is a pull: the sender asks the owner to start a move toward it. `MoveOffer` is sent by the owner after `MoveStarted` is durable; `MoveDecision` carries the target's `MoveImported` or `MoveAborted` record byte for byte; `MoveStatus` asks for it again; `MoveUndecided` is the answer when the target has not decided; `MoveAbort` asks the target to decide against the move. All are envelopes like the rest.
 
 ### Blob transfer
 
@@ -88,6 +91,7 @@ A chunk is never requested by offset; only by id. There is no partial-chunk resu
 - Trust is established only by pairing: `fabric node pair fab1...@192.168.1.20:7777` on one node, and the same with the other id on the other. The id comes from an out-of-band channel (the user reads it off the other screen). Pairing writes the peer's id and last known addresses to `<fabric-data>/peers`.
 - mDNS (`mdns-sd`) is optional and advertises only `_fabric._udp` with the node id in the TXT record. It is used to refresh the address of an already paired node on the LAN. A node seen by mDNS but not paired is listed as "unpaired" and never connected to.
 - Over Tailscale the addresses are stable `100.x` or MagicDNS names. Fabric does not know or care; the user pastes them at pairing.
+- A pair records which side can dial. On the gate the Air has a public address and the Pro is behind NAT, so the Pro dials and the Air listens; every protocol message flows both ways over the one connection, so a push from the Pro and a pull from the Pro both work, and `fabric resume` on the Air against a Pro that is not connected says so and names the push to type on the Pro (ADR 0003, Who supervises the harness).
 
 ### No vendor dependency
 

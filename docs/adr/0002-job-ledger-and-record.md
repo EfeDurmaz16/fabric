@@ -2,6 +2,8 @@
 
 Status: accepted, 2026-10-19
 
+Amended 2026-10-19 after step 1 research. The event kinds and the acceptance rule follow the move protocol of ADR 0003 (`2026-10-19-step1-design-input.md`, section 4.8 and D11): `LeaseClaimed` and `LeaseReleased` are replaced by `MoveStarted`, `MoveImported`, `MoveAborted` and `Stolen`, there is no epoch 0 and no free lease, and the arbiter is gone. Nothing else in this ADR changed.
+
 ## Context
 
 A job must be readable after any crash, on any node, by any future version of Fabric. It must also show what happened, in order, so that a user on a second machine can see why a job is in the state it is in. The T3 Code store is an event-sourced SQLite file with 64 migrations that the research judged unsafe to write from outside (`2026-10-19-t3code-vs-fabric.md`, section 5a). We want the opposite: a format small enough to describe on one page and safe to read with a hex editor.
@@ -10,7 +12,7 @@ A job must be readable after any crash, on any node, by any future version of Fa
 
 ### Identifiers
 
-- `JobId`, `EventId`: ULID (128 bits, 48-bit millisecond timestamp plus 80 random bits, lexicographically sortable). Generated on the node that creates the job or event. No central allocator.
+- `JobId`, `EventId`, `MoveId`: ULID (128 bits, 48-bit millisecond timestamp plus 80 random bits, lexicographically sortable). Generated on the node that creates the job, event or move. No central allocator.
 - `SnapshotId`, `ChunkId`: blake3 hash of the bytes (32 bytes).
 - `NodeId`: ed25519 public key (ADR 0005).
 - `Epoch`: `u64` (ADR 0003).
@@ -29,15 +31,17 @@ u32 length | u8 format_version | postcard(Event) | blake3(prev 3 fields)[0..16]
 Event {
   id:    EventId,
   prev:  Option<[u8; 32]>,   blake3 of the previous record's bytes; None only for Created
-  epoch: Epoch,              the lease epoch under which this event was written; 0 while the lease is Free
+  epoch: Epoch,              the lease epoch under which this event was written; 1 for Created
   at:    u64,                unix milliseconds, informational only, never used for ordering
   kind:  EventKind,
 }
 
 EventKind =
-  | Created { goal: String, harness: HarnessKind, created_by: NodeId }
-  | LeaseClaimed { node: NodeId, expires_at: u64, origin: Granted | Forced }
-  | LeaseReleased
+  | Created { goal: String, harness: HarnessKind, created_by: NodeId }        created_by owns the job at epoch 1
+  | MoveStarted { move_id: MoveId, target: NodeId }                           by the owner, at its epoch
+  | MoveImported { move_id: MoveId, from: NodeId }                            by the target, at epoch + 1
+  | MoveAborted { move_id: MoveId }                                           by the target, at the owner's epoch
+  | Stolen { from: NodeId, reason: String }                                   by the new owner, at epoch + 1, behind --force
   | SnapshotPublished { snapshot: SnapshotId, parent: Option<SnapshotId> }
   | Suspended { snapshot: SnapshotId }
   | Resumed { node: NodeId, snapshot: Option<SnapshotId>, harness: HarnessKind }   None only for the Resumed that `fabric job init` appends
@@ -49,10 +53,10 @@ Rules:
 
 - Append only. No record is ever rewritten.
 - Hash chained. `prev` makes insertion in the middle detectable. This is cheap tamper evidence, not security against a malicious node.
-- Durable before visible. Every append is one `write` of the whole record followed by a full flush of the file: `fsync` on Linux, `fcntl(F_FULLFSYNC)` on macOS, where plain `fsync` leaves the bytes in the drive's write cache (ADR 0004, publish). The first append to a new ledger file is followed by the same flush on `jobs/<job-id>/`, since a new file is durable only once its directory is. A record is not reported to any caller and not sent to any peer before the flush returns. The `LeaseClaimed` an arbiter writes is fsynced before `Granted` leaves the node; otherwise a crash between the two forgets the grant while the claimant proceeds.
-- Checksummed per record. On open, the reader walks forward. A failing record is a torn tail only if it is the last thing in the file: its declared end is at or past end of file, or every byte from its start to end of file is zero. A torn tail is truncated and the records before it are valid. Any other failure is corruption, not a crash: open fails with `LedgerCorrupt { offset }`, the file is not modified and the manifest is not rebuilt. A record in the middle is never dropped to make the rest readable, because the dropped record may be the claim that fences a live copy. `fabric job repair` is a later command; v0 refuses and says where.
-- Owned by one writer. Only the lease holder appends events. The one exception is `LeaseClaimed`, which the arbiter appends on the claimant's behalf (ADR 0003, Claim protocol). Every other node holds a replica: a byte-for-byte copy of the owner's records, in the owner's order.
-- Accepted from a peer only when it links. A replica appends a peer record only if `record.prev` equals the replica's head. Then a `LeaseClaimed` must carry `epoch == current_epoch + 1`, and every other kind must carry `epoch == current_epoch` and come from the node allowed to write at that moment: the holder while the lease is `Held`, and the arbiter (ADR 0003) while it is `Free` or `Released`, when the only kinds it may write are `Note` and `DecisionRecorded`. A `Note` before the first claim and a `DecisionRecorded` after a release are both ordinary records. A record whose `prev` does not match is answered with `Rejected { head }` and the sender fetches the missing suffix; if neither head is a prefix of the other the ledgers have forked and ADR 0003 says which chain wins. A record with any other epoch is answered with `StaleEpoch { yours, current }` and dropped.
+- Durable before visible. Every append is one `write` of the whole record followed by a full flush of the file: `fsync` on Linux, `fcntl(F_FULLFSYNC)` on macOS, where plain `fsync` leaves the bytes in the drive's write cache (ADR 0004, publish). The first append to a new ledger file is followed by the same flush on `jobs/<job-id>/`, since a new file is durable only once its directory is. A record is not reported to any caller and not sent to any peer before the flush returns. The `MoveImported` or `MoveAborted` a target writes is fsynced before `MoveDecision` leaves the node; otherwise a crash between the two forgets the decision while the source acts on it.
+- Checksummed per record. On open, the reader walks forward. A failing record is a torn tail only if it is the last thing in the file: its declared end is at or past end of file, or every byte from its start to end of file is zero. A torn tail is truncated and the records before it are valid. Any other failure is corruption, not a crash: open fails with `LedgerCorrupt { offset }`, the file is not modified and the manifest is not rebuilt. A record in the middle is never dropped to make the rest readable, because the dropped record may be the `MoveImported` or `Stolen` that fences a live copy. `fabric job repair` is a later command; v0 refuses and says where.
+- Owned by one writer at a time. While the lease is `Owned`, only the owner appends, and the kinds it may write are `MoveStarted`, `SnapshotPublished`, `Suspended`, `Resumed`, `DecisionRecorded` and `Note`. While the lease is `Departing`, only the target named by the open `MoveStarted` appends, and the only kinds it may write are `MoveImported` and `MoveAborted` for that `move_id`. `Stolen` is the one record a node writes without being the owner or the target (ADR 0003, The steal). Every other node holds a replica: a byte-for-byte copy of the writer's records, in the writer's order.
+- Accepted from a peer only when it links. A replica appends a peer record only if `record.prev` equals the replica's head. Then `MoveImported` and `Stolen` must carry `epoch == current_epoch + 1`, every other kind must carry `epoch == current_epoch`, and the record must come from the node the previous rule allows to write at that moment. A record whose `prev` does not match is answered with `Rejected { head }` and the sender fetches the missing suffix; if neither head is a prefix of the other the ledgers have forked and ADR 0003 says which chain wins. A record with any other epoch is answered with `StaleEpoch { yours, current }` and dropped.
 - Ordered by file position, not by `at` or by ULID. Clocks are not trusted for ordering.
 
 ### The job manifest
@@ -73,7 +77,7 @@ JobManifest {
 }
 ```
 
-Written to `<fabric-data>/jobs/<job-id>/manifest` by temp, `fsync`, rename, then a full flush of `jobs/<job-id>/`, after the append it summarizes. Every rename into `jobs/<job-id>/` (the manifest, the marker, the harness record and the renewal file of ADR 0003 and ADR 0004) ends with that directory flush, because the rename itself is not durable until its directory is. If the manifest and ledger disagree on open: when the ledger is longer, the manifest was not rewritten after the last append (the normal crash window) and it is rebuilt from the ledger. When the manifest's `event_count` is larger than the ledger's, or its `head` is not a record in the ledger, the node fails closed with `LedgerBehindManifest` and modifies nothing. A shorter ledger never wins over a manifest that remembers a later epoch.
+Written to `<fabric-data>/jobs/<job-id>/manifest` by temp, `fsync`, rename, then a full flush of `jobs/<job-id>/`, after the append it summarizes. Every rename into `jobs/<job-id>/` (the manifest, the marker and the harness record of ADR 0003 and ADR 0004) ends with that directory flush, because the rename itself is not durable until its directory is. If the manifest and ledger disagree on open: when the ledger is longer, the manifest was not rewritten after the last append (the normal crash window) and it is rebuilt from the ledger. When the manifest's `event_count` is larger than the ledger's, or its `head` is not a record in the ledger, the node fails closed with `LedgerBehindManifest` and modifies nothing. A shorter ledger never wins over a manifest that remembers a later epoch.
 
 ### Opaque per-harness state
 
