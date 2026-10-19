@@ -1,10 +1,14 @@
 //! The ledger record frame: round trip for arbitrary events, every cut of
-//! the tail is a torn tail, and every flipped byte before the tail is
-//! corruption with the right offset.
+//! the tail is a torn tail, every flipped byte before the tail is corruption
+//! with the right offset, and the named tail shapes of ADR 0002.
+
+use std::num::TryFromIntError;
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{EnvSpecId, Epoch, EventId, MoveId, NodeId, RecordHash, SnapshotId};
-use fabric_core::ledger::{CHECKSUM_LEN, Event, EventKind, Record, RecordError, scan};
+use fabric_core::ledger::{
+    CHECKSUM_LEN, Event, EventKind, HEADER_CHECK_LEN, MAX_RECORD_LEN, Record, RecordError, scan,
+};
 use proptest::prelude::*;
 
 fn node() -> impl Strategy<Value = NodeId> {
@@ -78,30 +82,90 @@ fn event() -> impl Strategy<Value = Event> {
         })
 }
 
+const HEADER_LEN: usize = 4 + HEADER_CHECK_LEN;
+
+fn note(prev: Option<RecordHash>, text: &str) -> Result<Record, RecordError> {
+    Record::encode(Event {
+        id: EventId::from_bytes([1; 16]),
+        prev,
+        epoch: Epoch::FIRST,
+        at: 1,
+        kind: EventKind::Note { text: text.into() },
+    })
+}
+
+/// Frames `body` (version and payload) with a header and a checksum the
+/// reader accepts, so a test can put any bytes inside a well-formed frame.
+fn frame(body: &[u8]) -> Result<Vec<u8>, TryFromIntError> {
+    let length = u32::try_from(body.len() + CHECKSUM_LEN)?;
+    let mut out = length.to_le_bytes().to_vec();
+    out.extend_from_slice(&blake3::hash(&length.to_le_bytes()).as_bytes()[..HEADER_CHECK_LEN]);
+    out.extend_from_slice(body);
+    let digest = blake3::hash(&out);
+    out.extend_from_slice(&digest.as_bytes()[..CHECKSUM_LEN]);
+    Ok(out)
+}
+
 /// A frame that carries bytes after the event, with a checksum that covers
 /// them, is not a second valid spelling of the event; it is corruption.
 #[test]
 fn bytes_after_the_event_inside_a_frame_are_corruption() {
-    let record = Record::encode(Event {
+    let record = note(None, "n").unwrap();
+    let body_end = record.bytes().len() - CHECKSUM_LEN;
+    let mut body = record.bytes()[HEADER_LEN..body_end].to_vec();
+    body.push(0xee);
+    assert!(matches!(
+        Record::decode(&frame(&body).unwrap()),
+        Err(RecordError::Corrupt { offset: 0 })
+    ));
+}
+
+/// The power-loss shape on APFS and ext4: the file has the record's full
+/// length and the header landed, but the pages after it read back as zero.
+#[test]
+fn a_last_record_with_a_zeroed_body_is_a_torn_tail() {
+    let a = note(None, "a").unwrap();
+    let b = note(Some(a.hash()), "b").unwrap();
+    let mut file = a.bytes().to_vec();
+    file.extend_from_slice(&b.bytes()[..HEADER_LEN]);
+    file.resize(a.bytes().len() + b.bytes().len(), 0);
+    let result = scan(&file).unwrap();
+    assert_eq!(result.records, vec![a.clone()]);
+    assert_eq!(result.torn_tail, Some(a.bytes().len()));
+}
+
+#[test]
+fn an_all_zero_tail_is_a_torn_tail() {
+    let a = note(None, "a").unwrap();
+    let mut file = a.bytes().to_vec();
+    file.extend_from_slice(&[0; 9]);
+    let result = scan(&file).unwrap();
+    assert_eq!(result.records, vec![a.clone()]);
+    assert_eq!(result.torn_tail, Some(a.bytes().len()));
+}
+
+/// A verified header that declares more than the bound is refused before
+/// any allocation, in a file and in a frame from a peer.
+#[test]
+fn a_declared_length_over_the_bound_is_refused() {
+    let length = u32::try_from(MAX_RECORD_LEN - HEADER_LEN + 1).unwrap();
+    let mut file = length.to_le_bytes().to_vec();
+    file.extend_from_slice(&blake3::hash(&length.to_le_bytes()).as_bytes()[..HEADER_CHECK_LEN]);
+    file.push(1);
+    assert!(matches!(
+        scan(&file),
+        Err(RecordError::TooLarge { len }) if len == MAX_RECORD_LEN + 1
+    ));
+    let big = Record::encode(Event {
         id: EventId::from_bytes([1; 16]),
         prev: None,
         epoch: Epoch::FIRST,
         at: 1,
-        kind: EventKind::Note { text: "n".into() },
-    })
-    .unwrap();
-    let bytes = record.bytes();
-    let body_end = bytes.len() - CHECKSUM_LEN;
-    let mut frame = bytes[..body_end].to_vec();
-    frame.push(0xee);
-    let length = u32::try_from(frame.len() - 4 + CHECKSUM_LEN).unwrap();
-    frame[..4].copy_from_slice(&length.to_le_bytes());
-    let digest = blake3::hash(&frame);
-    frame.extend_from_slice(&digest.as_bytes()[..CHECKSUM_LEN]);
-    assert!(matches!(
-        Record::decode(&frame),
-        Err(RecordError::Corrupt { offset: 0 })
-    ));
+        kind: EventKind::Note {
+            text: "x".repeat(MAX_RECORD_LEN),
+        },
+    });
+    assert!(matches!(big, Err(RecordError::TooLarge { .. })));
 }
 
 proptest! {
@@ -135,16 +199,11 @@ proptest! {
         file.extend_from_slice(b.bytes());
         let i = at.index(a.bytes().len());
         file[i] ^= 1 << bit;
-        match scan(&file) {
-            Err(RecordError::Corrupt { offset }) => prop_assert_eq!(offset, 0),
-            Err(RecordError::UnknownVersion { .. }) => prop_assert_eq!(i, 4),
-            Ok(result) => {
-                // A flipped length byte can only make the first frame swallow the
-                // second or run past the end; either way the first record is gone.
-                prop_assert!(i < 4, "a flipped byte at {i} was accepted");
-                prop_assert!(result.records.is_empty());
-            }
-            Err(e) => return Err(TestCaseError::fail(format!("unexpected {e}"))),
-        }
+        // The length bytes included: a damaged length fails the header check
+        // and can never turn the records after it into a torn tail.
+        prop_assert!(
+            matches!(scan(&file), Err(RecordError::Corrupt { offset: 0 })),
+            "a flipped bit at byte {i} was not reported as corruption at offset 0"
+        );
     }
 }

@@ -30,8 +30,20 @@ pub const CHECKSUM_LEN: usize = 16;
 /// peer and the size of the largest control frame (ADR 0005).
 pub const MAX_RECORD_LEN: usize = 1 << 20;
 
+/// Bytes of blake3 digest over the length field that follow it.
+pub const HEADER_CHECK_LEN: usize = 4;
+
 const LENGTH_LEN: usize = 4;
+const HEADER_LEN: usize = LENGTH_LEN + HEADER_CHECK_LEN;
 const VERSION_LEN: usize = 1;
+const MIN_BODY_LEN: usize = VERSION_LEN + CHECKSUM_LEN;
+
+fn header_check(length: u32) -> [u8; HEADER_CHECK_LEN] {
+    let digest = blake3::hash(&length.to_le_bytes());
+    let mut out = [0; HEADER_CHECK_LEN];
+    out.copy_from_slice(&digest.as_bytes()[..HEADER_CHECK_LEN]);
+    out
+}
 
 /// One event in a job's history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,14 +211,23 @@ impl fmt::Debug for Record {
 }
 
 impl Record {
-    /// Frames `event` as `u32 length | u8 version | postcard(event) | checksum`.
+    /// Frames `event` as `u32 length | u32 header_check | u8 version | postcard(event) | checksum`.
+    ///
+    /// `length` counts the bytes after the header. `header_check` is blake3
+    /// of the length field, so a damaged length is corruption and never a
+    /// torn tail. `checksum` is blake3 of everything before it.
     pub fn encode(event: Event) -> Result<Record, RecordError> {
         let payload = codec::encode(&event)?;
         let body_len = VERSION_LEN + payload.len() + CHECKSUM_LEN;
+        let frame_len = HEADER_LEN + body_len;
+        if frame_len > MAX_RECORD_LEN {
+            return Err(RecordError::TooLarge { len: frame_len });
+        }
         let length =
-            u32::try_from(body_len).map_err(|_| RecordError::TooLarge { len: body_len })?;
-        let mut bytes = Vec::with_capacity(LENGTH_LEN + body_len);
+            u32::try_from(body_len).map_err(|_| RecordError::TooLarge { len: frame_len })?;
+        let mut bytes = Vec::with_capacity(frame_len);
         bytes.extend_from_slice(&length.to_le_bytes());
+        bytes.extend_from_slice(&header_check(length));
         bytes.push(RECORD_FORMAT_VERSION);
         bytes.extend_from_slice(&payload);
         let digest = blake3::hash(&bytes);
@@ -242,35 +263,53 @@ impl Record {
     }
 
     /// Reads the record at `offset`; `Ok(None)` means a torn tail by the ADR 0002 rule.
+    ///
+    /// A torn tail is the last thing in the buffer: every byte from `offset`
+    /// is zero, the header is cut short, or the header verifies and the
+    /// declared end lies at or past the end of the buffer. A header that does
+    /// not verify, or a checksum failure before the end, is `Corrupt`.
     fn read_one(buf: &[u8], offset: usize) -> Result<Option<(Record, usize)>, RecordError> {
         let rest = &buf[offset..];
         if rest.iter().all(|&b| b == 0) {
             return Ok(None);
         }
-        let Some(length_bytes) = rest.get(..LENGTH_LEN) else {
+        let Some(header) = rest.get(..HEADER_LEN) else {
             return Ok(None);
         };
+        let (length_bytes, check) = header.split_at(LENGTH_LEN);
         let length = u32::from_le_bytes([
             length_bytes[0],
             length_bytes[1],
             length_bytes[2],
             length_bytes[3],
-        ]) as usize;
-        let Some(frame) = rest.get(..LENGTH_LEN + length) else {
+        ]);
+        if header_check(length) != *check {
+            return Err(RecordError::Corrupt { offset });
+        }
+        let length = length as usize;
+        if length < MIN_BODY_LEN {
+            return Err(RecordError::Corrupt { offset });
+        }
+        if HEADER_LEN + length > MAX_RECORD_LEN {
+            return Err(RecordError::TooLarge {
+                len: HEADER_LEN + length,
+            });
+        }
+        let Some(frame) = rest.get(..HEADER_LEN + length) else {
             return Ok(None);
         };
-        if length < VERSION_LEN + CHECKSUM_LEN {
-            return Err(RecordError::Corrupt { offset });
-        }
         let (hashed, checksum) = frame.split_at(frame.len() - CHECKSUM_LEN);
         if blake3::hash(hashed).as_bytes()[..CHECKSUM_LEN] != *checksum {
+            if frame.len() == rest.len() {
+                return Ok(None);
+            }
             return Err(RecordError::Corrupt { offset });
         }
-        let version = hashed[LENGTH_LEN];
+        let version = hashed[HEADER_LEN];
         if version != RECORD_FORMAT_VERSION {
             return Err(RecordError::UnknownVersion { version });
         }
-        let event: Event = match codec::decode(&hashed[LENGTH_LEN + VERSION_LEN..]) {
+        let event: Event = match codec::decode(&hashed[HEADER_LEN + VERSION_LEN..]) {
             Ok(event) => event,
             Err(CodecError::TrailingBytes(_)) => return Err(RecordError::Corrupt { offset }),
             Err(err) => return Err(RecordError::Codec(err)),
@@ -293,9 +332,11 @@ pub struct Scan {
 /// Walks `bytes` record by record.
 ///
 /// A record that fails is a torn tail only when it is the last thing in the
-/// buffer: its declared end lies at or past the end, or every byte from its
-/// start is zero. Any other failure is `RecordError::Corrupt` with the offset,
-/// and nothing after it is returned.
+/// buffer: its header verifies and its declared end lies at or past the end,
+/// its header is cut short, or every byte from its start is zero. Any other
+/// failure, a damaged length included, is `RecordError::Corrupt` with the
+/// offset, and nothing after it is returned. The caller decides what to do
+/// with a torn tail; `scan` never drops a record that is followed by another.
 pub fn scan(bytes: &[u8]) -> Result<Scan, RecordError> {
     let mut out = Scan::default();
     let mut offset = 0;
@@ -1395,63 +1436,10 @@ mod tests {
     }
 
     #[test]
-    fn scan_truncates_a_torn_tail_and_keeps_the_records_before_it() {
-        let a = Ledger::created("g".into(), HarnessKind::Codex, node(1), eid(), 1).unwrap();
-        let b = Record::encode(Event {
-            id: eid(),
-            prev: Some(a.hash()),
-            epoch: Epoch::FIRST,
-            at: 2,
-            kind: EventKind::Note {
-                text: "note".into(),
-            },
-        })
-        .unwrap();
-        let mut file = a.bytes().to_vec();
-        file.extend_from_slice(b.bytes());
-        let whole = scan(&file).unwrap();
-        assert_eq!(whole.records, vec![a.clone(), b.clone()]);
-        assert_eq!(whole.torn_tail, None);
-
-        let cut = &file[..file.len() - 5];
-        let torn = scan(cut).unwrap();
-        assert_eq!(torn.records, vec![a.clone()]);
-        assert_eq!(torn.torn_tail, Some(a.bytes().len()));
-
-        let mut zeroed = a.bytes().to_vec();
-        zeroed.extend_from_slice(&[0; 9]);
-        let torn = scan(&zeroed).unwrap();
-        assert_eq!(torn.records, vec![a.clone()]);
-        assert_eq!(torn.torn_tail, Some(a.bytes().len()));
-    }
-
-    #[test]
-    fn scan_reports_a_flipped_byte_in_a_middle_record_as_corrupt() {
-        let a = Ledger::created("g".into(), HarnessKind::Codex, node(1), eid(), 1).unwrap();
-        let b = Record::encode(Event {
-            id: eid(),
-            prev: Some(a.hash()),
-            epoch: Epoch::FIRST,
-            at: 2,
-            kind: EventKind::Note {
-                text: "note".into(),
-            },
-        })
-        .unwrap();
-        let mut file = a.bytes().to_vec();
-        file.extend_from_slice(b.bytes());
-        file[10] ^= 0x01;
-        assert!(matches!(
-            scan(&file),
-            Err(RecordError::Corrupt { offset: 0 })
-        ));
-    }
-
-    #[test]
     fn scan_refuses_an_unknown_format_version() {
         let a = Ledger::created("g".into(), HarnessKind::Codex, node(1), eid(), 1).unwrap();
         let mut frame = a.bytes().to_vec();
-        frame[4] = 9;
+        frame[HEADER_CHECK_LEN + 4] = 9;
         let hashed_len = frame.len() - CHECKSUM_LEN;
         let digest = blake3::hash(&frame[..hashed_len]);
         frame[hashed_len..].copy_from_slice(&digest.as_bytes()[..CHECKSUM_LEN]);
