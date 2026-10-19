@@ -174,7 +174,7 @@ pub enum NodeManager {
 
 impl NodeManager {
     /// Every manager.
-    pub const ALL: [NodeManager; 5] = [
+    pub(crate) const ALL: [NodeManager; 5] = [
         NodeManager::Pnpm,
         NodeManager::Npm,
         NodeManager::YarnClassic,
@@ -193,7 +193,7 @@ impl NodeManager {
     }
 
     /// Returns the lockfile names the manager writes.
-    pub fn lockfiles(self) -> &'static [&'static str] {
+    pub(crate) fn lockfiles(self) -> &'static [&'static str] {
         match self {
             NodeManager::Npm => &["package-lock.json"],
             NodeManager::Pnpm => &["pnpm-lock.yaml"],
@@ -207,7 +207,7 @@ impl NodeManager {
     /// A first install killed halfway leaves `node_modules` without them,
     /// which is how materialize tells a finished tree from a torn one. Bun
     /// writes none, so a Bun tree is judged by being non-empty.
-    pub fn install_markers(self) -> &'static [&'static str] {
+    pub(crate) fn install_markers(self) -> &'static [&'static str] {
         match self {
             NodeManager::Npm => &[".package-lock.json"],
             NodeManager::Pnpm => &[".modules.yaml"],
@@ -263,6 +263,21 @@ pub enum Ecosystem {
     Declared,
 }
 
+impl Ecosystem {
+    /// Returns the files one of which a finished install leaves in the cache; empty when content alone proves it.
+    ///
+    /// The markers follow the manager detection chose, not the lockfiles on
+    /// disk: a Bun tree next to a leftover `package-lock.json` needs no
+    /// `.package-lock.json`.
+    pub fn install_markers(self) -> &'static [&'static str] {
+        match self {
+            Ecosystem::Node(manager) => manager.install_markers(),
+            Ecosystem::Python => &["pyvenv.cfg"],
+            Ecosystem::Rust | Ecosystem::Declared => &[],
+        }
+    }
+}
+
 /// One cache path, its class for the snapshot policy, and its ecosystem.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachePath {
@@ -286,20 +301,50 @@ pub struct Pin {
 }
 
 /// Everything detection found in a workspace.
+///
+/// The fields are read-only so that the report stays consistent: the spec's
+/// `cache_paths` are the paths of `caches`, in the same order, and nothing
+/// can change one without the other.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Detection {
-    /// The spec: one pin per tool, the setup steps, the variable names and the cache paths.
-    pub spec: EnvSpec,
-    /// The spec's cache paths with their class and ecosystem, sorted by path.
-    pub caches: Vec<CachePath>,
-    /// Every pin found, in order of precedence; the spec holds the first one per tool.
-    pub pins: Vec<Pin>,
-    /// The package manager and what chose it, when the root has a `package.json` and a lockfile.
-    pub node_manager: Option<ManagerChoice>,
-    /// The devcontainer file, recorded for a later import and not interpreted.
-    pub devcontainer: Option<RelPath>,
-    /// The secret policy, widened by the override file.
-    pub secrets: SecretPolicy,
+    spec: EnvSpec,
+    caches: Vec<CachePath>,
+    pins: Vec<Pin>,
+    node_manager: Option<ManagerChoice>,
+    devcontainer: Option<RelPath>,
+    secrets: SecretPolicy,
+}
+
+impl Detection {
+    /// Returns the spec: one pin per tool, the setup steps, the variable names and the cache paths.
+    pub fn spec(&self) -> &EnvSpec {
+        &self.spec
+    }
+
+    /// Returns the spec's cache paths with their class and ecosystem, sorted by path.
+    pub fn caches(&self) -> &[CachePath] {
+        &self.caches
+    }
+
+    /// Returns every pin found, in order of precedence; the spec holds the first one per tool.
+    pub fn pins(&self) -> &[Pin] {
+        &self.pins
+    }
+
+    /// Returns the package manager and what chose it, when the root has a `package.json` and a lockfile.
+    pub fn node_manager(&self) -> Option<ManagerChoice> {
+        self.node_manager
+    }
+
+    /// Returns the devcontainer file, recorded for a later import and not interpreted.
+    pub fn devcontainer(&self) -> Option<&RelPath> {
+        self.devcontainer.as_ref()
+    }
+
+    /// Returns the secret policy, widened by the override file.
+    pub fn secrets(&self) -> &SecretPolicy {
+        &self.secrets
+    }
 }
 
 /// Detects the environment of the workspace at `root`, applying `.fabric/env.toml` when present.

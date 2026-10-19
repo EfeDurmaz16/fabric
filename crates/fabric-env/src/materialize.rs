@@ -8,10 +8,12 @@
 //! variable missing from this node.
 //!
 //! A cache is healthy when it is a non-empty directory that holds the
-//! marker its installer writes last. `node_modules` needs the marker of a
-//! manager whose lockfile sits next to it, `.venv` needs `pyvenv.cfg`, and
-//! any other cache needs only to be non-empty. A first install killed
-//! halfway leaves a tree without its marker, so the next plan installs again.
+//! marker its installer writes last. The marker comes from the cache's
+//! ecosystem in the detection report, so `node_modules` needs the marker of
+//! the manager detection chose, whatever other lockfiles lie next to it,
+//! `.venv` needs `pyvenv.cfg`, and any other cache needs only to be
+//! non-empty. A first install killed halfway leaves a tree without its
+//! marker, so the next plan installs again.
 //!
 //! The restore that runs before materialize writes a carried cache only when
 //! its carry key matches this node (ADR 0012), so what is on disk is what
@@ -26,12 +28,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 
-use fabric_core::env::{EnvSpec, EnvVarName, RunWhen, SetupStep};
+use fabric_core::env::{EnvVarName, RunWhen, SetupStep};
 use fabric_core::harness::ProgramName;
 use fabric_core::path::RelPath;
 use tracing::Dispatch;
 
-use crate::detect::NodeManager;
+use crate::detect::{CachePath, Detection};
 
 /// The `tracing` target that carries every line a setup step prints.
 pub const SETUP_LOG_TARGET: &str = "fabric_env::setup";
@@ -154,7 +156,7 @@ pub enum CacheHealth {
     /// A directory with content and none of the markers its installer writes last.
     Incomplete {
         /// The markers any one of which would make it healthy.
-        expected: Vec<&'static str>,
+        expected: &'static [&'static str],
     },
 }
 
@@ -274,11 +276,13 @@ impl Plan {
     }
 }
 
-/// Inspects the workspace at `root` against `spec` and returns what materialize would do.
+/// Inspects the workspace at `root` against `detected` and returns what materialize would do.
 ///
 /// This is the dry run: it reads the disk, `PATH` and the presence of the
-/// spec's environment variables, and changes nothing.
-pub fn plan(root: &Path, spec: &EnvSpec) -> Result<Plan, MaterializeError> {
+/// spec's environment variables, and changes nothing. It takes the
+/// detection report rather than the spec alone because the report knows
+/// each cache's ecosystem, which decides the marker that proves it whole.
+pub fn plan(root: &Path, detected: &Detection) -> Result<Plan, MaterializeError> {
     let root = fs::canonicalize(root).map_err(|source| MaterializeError::Root {
         path: root.to_owned(),
         source,
@@ -290,13 +294,14 @@ pub fn plan(root: &Path, spec: &EnvSpec) -> Result<Plan, MaterializeError> {
         });
     }
 
-    let caches = spec
-        .cache_paths
+    let spec = detected.spec();
+    let caches = detected
+        .caches()
         .iter()
-        .map(|path| {
+        .map(|cache| {
             Ok(CacheReport {
-                path: path.clone(),
-                health: inspect(&root, path)?,
+                path: cache.path.clone(),
+                health: inspect(&root, cache)?,
             })
         })
         .collect::<Result<Vec<_>, MaterializeError>>()?;
@@ -332,10 +337,10 @@ pub fn plan(root: &Path, spec: &EnvSpec) -> Result<Plan, MaterializeError> {
     })
 }
 
-fn inspect(root: &Path, path: &RelPath) -> Result<CacheHealth, MaterializeError> {
-    let full = root.join(path.as_str());
+fn inspect(root: &Path, cache: &CachePath) -> Result<CacheHealth, MaterializeError> {
+    let full = root.join(cache.path.as_str());
     let inspect_err = |source| MaterializeError::Inspect {
-        path: path.clone(),
+        path: cache.path.clone(),
         source,
     };
     let meta = match fs::metadata(&full) {
@@ -349,7 +354,7 @@ fn inspect(root: &Path, path: &RelPath) -> Result<CacheHealth, MaterializeError>
     if fs::read_dir(&full).map_err(inspect_err)?.next().is_none() {
         return Ok(CacheHealth::Empty);
     }
-    let expected = markers(&full);
+    let expected = cache.ecosystem.install_markers();
     if expected.is_empty()
         || expected
             .iter()
@@ -358,28 +363,6 @@ fn inspect(root: &Path, path: &RelPath) -> Result<CacheHealth, MaterializeError>
         Ok(CacheHealth::Healthy)
     } else {
         Ok(CacheHealth::Incomplete { expected })
-    }
-}
-
-/// Returns the markers one of which a finished install leaves in `dir`.
-fn markers(dir: &Path) -> Vec<&'static str> {
-    match dir.file_name().and_then(OsStr::to_str) {
-        Some("node_modules") => {
-            let parent = dir.parent().unwrap_or(dir);
-            let mut found = Vec::new();
-            for manager in NodeManager::ALL {
-                let has_lockfile = manager
-                    .lockfiles()
-                    .iter()
-                    .any(|file| parent.join(file).is_file());
-                if has_lockfile {
-                    found.extend(manager.install_markers());
-                }
-            }
-            found
-        }
-        Some(".venv") => vec!["pyvenv.cfg"],
-        _ => Vec::new(),
     }
 }
 

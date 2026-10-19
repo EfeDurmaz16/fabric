@@ -1,6 +1,10 @@
 //! Materialize over real directories: which steps a cache state selects,
 //! what a dry run leaves untouched, what refuses before anything runs, and
 //! how a step's output reaches the log.
+//!
+//! Each test builds its detection report the way a user would, by writing
+//! `.fabric/env.toml` into the workspace and running `detect`, so the plan
+//! sees exactly what resume will see.
 
 use std::error::Error;
 use std::fs;
@@ -9,17 +13,17 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use fabric_core::env::{EnvSpec, EnvVarName, RunWhen, SetupStep};
-use fabric_core::harness::ProgramName;
-use fabric_core::path::RelPath;
-use fabric_env::detect::detect;
+use fabric_core::env::EnvVarName;
+use fabric_env::detect::{Detection, detect};
 use fabric_env::materialize::{CacheHealth, MaterializeError, StepReason, plan};
 use tempfile::TempDir;
 
 type TestResult<T> = Result<T, Box<dyn Error>>;
 
-/// Files to write, as `(path, contents)`.
+/// Files to write, as `(path, contents)`; a path ending in `/` is an empty directory.
 type Files<'a> = &'a [(&'a str, &'a str)];
+
+const PACKAGE_JSON: &str = r#"{"name":"x","version":"1.0.0"}"#;
 
 /// Copies a fixture workspace into a fresh directory, so a test never writes into the source tree.
 fn copy_fixture(name: &str) -> io::Result<TempDir> {
@@ -49,6 +53,10 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
 fn write(root: &Path, files: Files) -> io::Result<()> {
     for (path, text) in files {
         let full = root.join(path);
+        if path.ends_with('/') {
+            fs::create_dir_all(full)?;
+            continue;
+        }
         if let Some(parent) = full.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -57,28 +65,10 @@ fn write(root: &Path, files: Files) -> io::Result<()> {
     Ok(())
 }
 
-fn step(program: &str, args: &[&str], when: RunWhen) -> TestResult<SetupStep> {
-    Ok(SetupStep {
-        program: ProgramName::parse(program)?,
-        args: args.iter().map(|a| (*a).to_owned()).collect(),
-        cwd: None,
-        when,
-    })
-}
-
-fn spec(setup: Vec<SetupStep>, caches: &[&str], env: &[&str]) -> TestResult<EnvSpec> {
-    Ok(EnvSpec {
-        tools: Vec::new(),
-        setup,
-        env_var_names: env
-            .iter()
-            .map(|n| EnvVarName::parse(n))
-            .collect::<Result<_, _>>()?,
-        cache_paths: caches
-            .iter()
-            .map(|p| RelPath::parse(p))
-            .collect::<Result<_, _>>()?,
-    })
+/// Writes `override_toml` as the workspace's `.fabric/env.toml` and detects.
+fn declared(root: &Path, override_toml: &str) -> TestResult<Detection> {
+    write(root, &[(".fabric/env.toml", override_toml)])?;
+    Ok(detect(root)?)
 }
 
 /// A dry run of a fresh checkout plans the install and leaves the tree as it was.
@@ -86,7 +76,7 @@ fn spec(setup: Vec<SetupStep>, caches: &[&str], env: &[&str]) -> TestResult<EnvS
 fn a_fresh_pnpm_workspace_plans_its_install_and_the_dry_run_changes_nothing() {
     let dir = copy_fixture("node-pnpm").unwrap();
     let detected = detect(dir.path()).unwrap();
-    let planned = plan(dir.path(), &detected.spec).unwrap();
+    let planned = plan(dir.path(), &detected).unwrap();
     assert_eq!(planned.caches()[0].health, CacheHealth::Missing);
     assert_eq!(planned.steps().len(), 1);
     assert_eq!(planned.steps()[0].index(), 0);
@@ -111,7 +101,7 @@ fn a_finished_install_runs_nothing() {
     )
     .unwrap();
     let detected = detect(dir.path()).unwrap();
-    let planned = plan(dir.path(), &detected.spec).unwrap();
+    let planned = plan(dir.path(), &detected).unwrap();
     assert_eq!(planned.caches()[0].health, CacheHealth::Healthy);
     assert!(planned.is_noop());
     assert!(planned.execute().is_ok());
@@ -124,81 +114,111 @@ fn a_torn_install_runs_again() {
     let dir = copy_fixture("node-pnpm").unwrap();
     write(dir.path(), &[("node_modules/a/package.json", "{}")]).unwrap();
     let detected = detect(dir.path()).unwrap();
-    let planned = plan(dir.path(), &detected.spec).unwrap();
+    let planned = plan(dir.path(), &detected).unwrap();
     assert_eq!(
         planned.caches()[0].health,
         CacheHealth::Incomplete {
-            expected: vec![".modules.yaml"]
+            expected: &[".modules.yaml"]
         }
     );
     assert_eq!(planned.steps().len(), 1);
 }
 
-/// One row per rule: the marker comes from the lockfile next to
-/// `node_modules`, `.venv` needs `pyvenv.cfg`, other caches need content.
+/// One row per rule: the marker follows the manager detection chose, not
+/// the lockfiles on disk; `.venv` needs `pyvenv.cfg`; other caches need content.
 #[test]
 fn health_follows_the_cache_kind() {
-    let cases: [(Files, &str, CacheHealth); 8] = [
+    let cases: [(Files, CacheHealth); 10] = [
         (
             &[
+                ("package.json", PACKAGE_JSON),
                 ("package-lock.json", ""),
                 ("node_modules/.package-lock.json", "{}"),
             ],
-            "node_modules",
             CacheHealth::Healthy,
         ),
         (
             &[
+                ("package.json", PACKAGE_JSON),
                 ("package-lock.json", ""),
                 ("node_modules/.modules.yaml", ""),
             ],
-            "node_modules",
             CacheHealth::Incomplete {
-                expected: vec![".package-lock.json"],
+                expected: &[".package-lock.json"],
             },
         ),
         (
-            &[("yarn.lock", ""), ("node_modules/.yarn-state.yml", "")],
-            "node_modules",
+            &[
+                ("package.json", PACKAGE_JSON),
+                ("yarn.lock", ""),
+                (".yarnrc.yml", ""),
+                ("node_modules/.yarn-state.yml", ""),
+            ],
             CacheHealth::Healthy,
         ),
         (
-            &[("bun.lock", ""), ("node_modules/a/package.json", "{}")],
-            "node_modules",
+            &[
+                ("package.json", PACKAGE_JSON),
+                ("bun.lock", ""),
+                ("node_modules/a/package.json", "{}"),
+            ],
+            CacheHealth::Healthy,
+        ),
+        // A leftover npm lockfile next to a Bun tree must not demand npm's marker.
+        (
+            &[
+                ("package.json", r#"{"packageManager":"bun@1.2.0"}"#),
+                ("bun.lock", ""),
+                ("package-lock.json", ""),
+                ("node_modules/a/package.json", "{}"),
+            ],
             CacheHealth::Healthy,
         ),
         (
-            &[(".venv/bin/python", "")],
-            ".venv",
+            &[("uv.lock", ""), (".venv/bin/python", "")],
             CacheHealth::Incomplete {
-                expected: vec!["pyvenv.cfg"],
+                expected: &["pyvenv.cfg"],
             },
         ),
-        (&[("target/debug/x", "")], "target", CacheHealth::Healthy),
-        (&[("target", "")], "target", CacheHealth::NotADirectory),
-        (&[], "target", CacheHealth::Missing),
+        (
+            &[("Cargo.toml", ""), ("target/debug/x", "")],
+            CacheHealth::Healthy,
+        ),
+        (
+            &[("Cargo.toml", ""), ("target", "")],
+            CacheHealth::NotADirectory,
+        ),
+        (&[("Cargo.toml", "")], CacheHealth::Missing),
+        (&[("Cargo.toml", ""), ("target/", "")], CacheHealth::Empty),
     ];
-    for (files, cache, health) in cases {
+    for (files, health) in cases {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), files).unwrap();
-        let planned = plan(dir.path(), &spec(Vec::new(), &[cache], &[]).unwrap()).unwrap();
+        let detected = detect(dir.path()).unwrap();
+        let planned = plan(dir.path(), &detected).unwrap();
+        assert_eq!(planned.caches().len(), 1, "{files:?}");
         assert_eq!(planned.caches()[0].health, health, "{files:?}");
     }
-    let dir = tempfile::tempdir().unwrap();
-    fs::create_dir(dir.path().join("target")).unwrap();
-    let planned = plan(dir.path(), &spec(Vec::new(), &["target"], &[]).unwrap()).unwrap();
-    assert_eq!(planned.caches()[0].health, CacheHealth::Empty);
 }
 
 #[test]
 fn an_always_step_runs_on_a_warm_workspace() {
     let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), &[("target/debug/x", "")]).unwrap();
-    let setup = vec![
-        step("cargo", &["fetch"], RunWhen::CachesMissing).unwrap(),
-        step("true", &[], RunWhen::Always).unwrap(),
-    ];
-    let planned = plan(dir.path(), &spec(setup, &["target"], &[]).unwrap()).unwrap();
+    write(dir.path(), &[("Cargo.toml", ""), ("target/debug/x", "")]).unwrap();
+    let detected = declared(
+        dir.path(),
+        r#"
+[[setup]]
+program = "cargo"
+args = ["fetch"]
+
+[[setup]]
+program = "true"
+when = "always"
+"#,
+    )
+    .unwrap();
+    let planned = plan(dir.path(), &detected).unwrap();
     assert_eq!(planned.steps().len(), 1);
     assert_eq!(planned.steps()[0].index(), 1);
     assert_eq!(planned.steps()[0].reason(), StepReason::Always);
@@ -207,12 +227,27 @@ fn an_always_step_runs_on_a_warm_workspace() {
 #[test]
 fn steps_run_in_order_and_stop_at_the_first_failure() {
     let dir = tempfile::tempdir().unwrap();
-    let setup = vec![
-        step("sh", &["-c", "echo one >> log"], RunWhen::CachesMissing).unwrap(),
-        step("false", &[], RunWhen::CachesMissing).unwrap(),
-        step("sh", &["-c", "echo three >> log"], RunWhen::CachesMissing).unwrap(),
-    ];
-    let planned = plan(dir.path(), &spec(setup, &["out"], &[]).unwrap()).unwrap();
+    let detected = declared(
+        dir.path(),
+        r#"
+[[cache]]
+path = "out"
+class = "build"
+
+[[setup]]
+program = "sh"
+args = ["-c", "echo one >> log"]
+
+[[setup]]
+program = "false"
+
+[[setup]]
+program = "sh"
+args = ["-c", "echo three >> log"]
+"#,
+    )
+    .unwrap();
+    let planned = plan(dir.path(), &detected).unwrap();
     match planned.execute() {
         Err(MaterializeError::StepFailed {
             index,
@@ -233,11 +268,23 @@ fn steps_run_in_order_and_stop_at_the_first_failure() {
 #[test]
 fn a_missing_program_or_variable_refuses_before_anything_runs() {
     let dir = tempfile::tempdir().unwrap();
-    let missing_program = vec![
-        step("touch", &["ran"], RunWhen::CachesMissing).unwrap(),
-        step("fabric-test-no-such-program", &[], RunWhen::CachesMissing).unwrap(),
-    ];
-    let planned = plan(dir.path(), &spec(missing_program, &["out"], &[]).unwrap()).unwrap();
+    let detected = declared(
+        dir.path(),
+        r#"
+[[cache]]
+path = "out"
+class = "build"
+
+[[setup]]
+program = "touch"
+args = ["ran"]
+
+[[setup]]
+program = "fabric-test-no-such-program"
+"#,
+    )
+    .unwrap();
+    let planned = plan(dir.path(), &detected).unwrap();
     assert!(planned.steps()[0].program().is_some());
     assert_eq!(planned.steps()[1].program(), None);
     assert!(matches!(
@@ -246,12 +293,24 @@ fn a_missing_program_or_variable_refuses_before_anything_runs() {
     ));
 
     let unset = "FABRIC_TEST_UNSET_VARIABLE_7Q2X";
-    let setup = vec![step("touch", &["ran"], RunWhen::CachesMissing).unwrap()];
-    let planned = plan(
+    let detected = declared(
         dir.path(),
-        &spec(setup, &["out"], &["PATH", unset]).unwrap(),
+        &format!(
+            r#"
+env = ["PATH", "{unset}"]
+
+[[cache]]
+path = "out"
+class = "build"
+
+[[setup]]
+program = "touch"
+args = ["ran"]
+"#
+        ),
     )
     .unwrap();
+    let planned = plan(dir.path(), &detected).unwrap();
     let missing: Vec<&str> = planned
         .missing_env()
         .iter()
@@ -273,17 +332,23 @@ fn a_step_directory_may_not_leave_the_workspace() {
     let outside = tempfile::tempdir().unwrap();
     let dir = tempfile::tempdir().unwrap();
     symlink(outside.path(), dir.path().join("web")).unwrap();
-    let mut install = step("true", &[], RunWhen::Always).unwrap();
-    install.cwd = Some(RelPath::parse("web").unwrap());
+    let detected = declared(
+        dir.path(),
+        "[[setup]]\nprogram = \"true\"\ncwd = \"web\"\nwhen = \"always\"\n",
+    )
+    .unwrap();
     assert!(matches!(
-        plan(dir.path(), &spec(vec![install], &[], &[]).unwrap()),
+        plan(dir.path(), &detected),
         Err(MaterializeError::StepDirOutsideRoot { index: 0 })
     ));
 
     fs::create_dir(dir.path().join("app")).unwrap();
-    let mut inside = step("true", &[], RunWhen::Always).unwrap();
-    inside.cwd = Some(RelPath::parse("app").unwrap());
-    let planned = plan(dir.path(), &spec(vec![inside], &[], &[]).unwrap()).unwrap();
+    let detected = declared(
+        dir.path(),
+        "[[setup]]\nprogram = \"true\"\ncwd = \"app\"\nwhen = \"always\"\n",
+    )
+    .unwrap();
+    let planned = plan(dir.path(), &detected).unwrap();
     let expected: PathBuf = fs::canonicalize(dir.path().join("app")).unwrap();
     assert_eq!(planned.steps()[0].dir(), expected);
 }
@@ -312,15 +377,17 @@ impl Write for Captured {
 #[test]
 fn step_output_reaches_the_callers_log_line_by_line() {
     let dir = tempfile::tempdir().unwrap();
-    let setup = vec![
-        step(
-            "sh",
-            &["-c", "echo first-out; echo first-err >&2; echo second-out"],
-            RunWhen::Always,
-        )
-        .unwrap(),
-    ];
-    let planned = plan(dir.path(), &spec(setup, &[], &[]).unwrap()).unwrap();
+    let detected = declared(
+        dir.path(),
+        r#"
+[[setup]]
+program = "sh"
+args = ["-c", "echo first-out; echo first-err >&2; echo second-out"]
+when = "always"
+"#,
+    )
+    .unwrap();
+    let planned = plan(dir.path(), &detected).unwrap();
     let captured = Captured::default();
     let writer = captured.clone();
     let subscriber = tracing_subscriber::fmt()

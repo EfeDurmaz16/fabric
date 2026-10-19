@@ -36,7 +36,7 @@ fn workspace(files: &[(&str, &str)]) -> io::Result<TempDir> {
 /// Each setup step as one line: the program, then its arguments.
 fn commands(detection: &Detection) -> Vec<String> {
     detection
-        .spec
+        .spec()
         .setup
         .iter()
         .map(|step| {
@@ -70,10 +70,10 @@ const PACKAGE_JSON: &str = r#"{"name":"x","version":"1.0.0"}"#;
 fn a_pnpm_workspace_gives_a_frozen_install_and_node_modules() {
     let found = detect(&fixture("node-pnpm")).unwrap();
     assert_eq!(commands(&found), ["pnpm install --frozen-lockfile"]);
-    assert_eq!(found.spec.setup[0].when, RunWhen::CachesMissing);
-    assert_eq!(found.spec.setup[0].cwd, None);
+    assert_eq!(found.spec().setup[0].when, RunWhen::CachesMissing);
+    assert_eq!(found.spec().setup[0].cwd, None);
     assert_eq!(
-        found.caches,
+        found.caches(),
         [cache(
             "node_modules",
             CacheClass::Deps,
@@ -82,21 +82,21 @@ fn a_pnpm_workspace_gives_a_frozen_install_and_node_modules() {
         .unwrap()]
     );
     assert_eq!(
-        found.node_manager,
+        found.node_manager(),
         Some(ManagerChoice {
             manager: NodeManager::Pnpm,
             because: ManagerSource::PackageManagerField
         })
     );
     assert_eq!(
-        found.spec.tools,
+        found.spec().tools,
         [
             tool("node", "22", ToolSource::Detected),
             tool("pnpm", "11.23.0", ToolSource::Detected)
         ]
     );
-    assert_eq!(found.devcontainer, None);
-    assert!(found.spec.id().is_ok());
+    assert_eq!(found.devcontainer(), None);
+    assert!(found.spec().id().is_ok());
 }
 
 /// A resume must not rewrite `Cargo.lock`; without one there is nothing to keep.
@@ -105,11 +105,11 @@ fn cargo_fetch_is_locked_exactly_when_a_lockfile_exists() {
     let found = detect(&fixture("rust-cargo")).unwrap();
     assert_eq!(commands(&found), ["cargo fetch --locked"]);
     assert_eq!(
-        found.caches,
+        found.caches(),
         [cache("target", CacheClass::Build, Ecosystem::Rust).unwrap()]
     );
     assert_eq!(
-        found.spec.tools,
+        found.spec().tools,
         [tool("rust", "1.97.1", ToolSource::Detected)]
     );
 
@@ -154,14 +154,14 @@ fn each_lockfile_names_its_manager_and_install() {
         let found = detect(dir.path()).unwrap();
         assert_eq!(commands(&found), [command], "{files:?}");
         assert_eq!(
-            found.node_manager,
+            found.node_manager(),
             Some(ManagerChoice {
                 manager,
                 because: ManagerSource::Lockfile
             }),
             "{files:?}"
         );
-        assert_eq!(found.caches[0].ecosystem, Ecosystem::Node(manager));
+        assert_eq!(found.caches()[0].ecosystem, Ecosystem::Node(manager));
     }
 }
 
@@ -178,7 +178,7 @@ fn the_package_manager_field_decides_the_yarn_line() {
     let found = detect(berry.path()).unwrap();
     assert_eq!(commands(&found), ["yarn install --immutable"]);
     assert_eq!(
-        found.spec.tools,
+        found.spec().tools,
         [tool("yarn", "4.5.0", ToolSource::Detected)]
     );
 
@@ -239,9 +239,9 @@ fn a_named_manager_without_its_lockfile_is_refused() {
 fn package_json_without_a_lockfile_has_no_install_and_no_cache() {
     let dir = workspace(&[("package.json", r#"{"packageManager":"pnpm@11.23.0"}"#)]).unwrap();
     let found = detect(dir.path()).unwrap();
-    assert!(found.spec.setup.is_empty());
-    assert!(found.caches.is_empty());
-    assert_eq!(found.node_manager, None);
+    assert!(found.spec().setup.is_empty());
+    assert!(found.caches().is_empty());
+    assert_eq!(found.node_manager(), None);
 }
 
 #[test]
@@ -283,7 +283,7 @@ fn pins_follow_precedence_and_aliases() {
     .unwrap();
     let found = detect(dir.path()).unwrap();
     let pins: Vec<(&str, &str, &str)> = found
-        .pins
+        .pins()
         .iter()
         .map(|p| (p.tool.as_str(), p.version.as_str(), p.file))
         .collect();
@@ -305,7 +305,7 @@ fn pins_follow_precedence_and_aliases() {
         ]
     );
     assert_eq!(
-        found.spec.tools,
+        found.spec().tools,
         [
             tool("go", "1.23.0", ToolSource::Detected),
             tool("node", "24", ToolSource::Detected),
@@ -315,7 +315,7 @@ fn pins_follow_precedence_and_aliases() {
         ]
     );
     assert_eq!(commands(&found), ["go mod download"]);
-    assert!(found.caches.is_empty());
+    assert!(found.caches().is_empty());
 }
 
 #[test]
@@ -324,7 +324,7 @@ fn python_installs_into_the_workspace_venv() {
     let found = detect(locked.path()).unwrap();
     assert_eq!(commands(&found), ["uv sync --frozen"]);
     assert_eq!(
-        found.caches,
+        found.caches(),
         [cache(".venv", CacheClass::Deps, Ecosystem::Python).unwrap()]
     );
 
@@ -347,10 +347,10 @@ fn a_devcontainer_is_recorded_and_not_interpreted() {
     .unwrap();
     let found = detect(dir.path()).unwrap();
     assert_eq!(
-        found.devcontainer,
-        Some(RelPath::parse(".devcontainer/devcontainer.json").unwrap())
+        found.devcontainer(),
+        Some(&RelPath::parse(".devcontainer/devcontainer.json").unwrap())
     );
-    assert!(found.spec.setup.is_empty());
+    assert!(found.spec().setup.is_empty());
 }
 
 /// The fixture has both lockfiles and pins Node in `.nvmrc`; the override
@@ -360,7 +360,7 @@ fn a_devcontainer_is_recorded_and_not_interpreted() {
 fn the_override_file_wins_over_detection() {
     let found = detect(&fixture("override")).unwrap();
     assert_eq!(
-        found.node_manager,
+        found.node_manager(),
         Some(ManagerChoice {
             manager: NodeManager::Pnpm,
             because: ManagerSource::OverrideFile
@@ -370,22 +370,22 @@ fn the_override_file_wins_over_detection() {
         commands(&found),
         ["pnpm install --frozen-lockfile", "pnpm run codegen"]
     );
-    assert_eq!(found.spec.setup[1].when, RunWhen::Always);
+    assert_eq!(found.spec().setup[1].when, RunWhen::Always);
     assert_eq!(
-        found.spec.tools,
+        found.spec().tools,
         [tool("node", "22.23.2", ToolSource::Declared)]
     );
-    assert_eq!(found.pins[0].file, ".fabric/env.toml");
-    assert_eq!(found.pins[1].version, "20");
+    assert_eq!(found.pins()[0].file, ".fabric/env.toml");
+    assert_eq!(found.pins()[1].version, "20");
     let names: Vec<&str> = found
-        .spec
+        .spec()
         .env_var_names
         .iter()
         .map(EnvVarName::as_str)
         .collect();
     assert_eq!(names, ["DATABASE_URL", "OPENAI_API_KEY"]);
     assert_eq!(
-        found.caches,
+        found.caches(),
         [
             cache("dist", CacheClass::Build, Ecosystem::Declared).unwrap(),
             cache(
@@ -398,10 +398,10 @@ fn the_override_file_wins_over_detection() {
     );
     let local_db = RelPath::parse("data/local.sqlite").unwrap();
     assert_eq!(
-        found.secrets.denies(&local_db, Scope::Work),
+        found.secrets().denies(&local_db, Scope::Work),
         Some("*.sqlite")
     );
-    assert!(found.spec.id().is_ok());
+    assert!(found.spec().id().is_ok());
 }
 
 /// The ecosystem decides the carry key; a declared class must not turn a
@@ -419,7 +419,7 @@ fn a_declared_class_keeps_the_detected_ecosystem() {
     .unwrap();
     let found = detect(dir.path()).unwrap();
     assert_eq!(
-        found.caches,
+        found.caches(),
         [cache(
             "node_modules",
             CacheClass::ToolCache,
