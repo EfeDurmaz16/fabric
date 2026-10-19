@@ -8,6 +8,8 @@ Amended 2026-10-19 while writing `fabric-core` (PR `feat/core`): `SetupStep.cwd`
 
 Amended 2026-10-19 after the adversarial review of PR `feat/core`: a setup step is `{ program, args, cwd, when }` rather than `{ argv, cwd, when }`, so the shape matches `HarnessKind::Acp` (ADR 0006). The second review found that this alone did not remove the empty command: `program` was a bare string and `""`, `/tmp/x`, `../bin/x` and `-rf` all decoded. `program` is now `ProgramName`, a parsed type that is non-empty and holds no slash, no NUL and no leading `-`, checked inside `Deserialize`, so "looked up on `PATH`" is true by type. The format version is the first varint of the spec's bytes, not a field of the struct (ADR 0002, review amendment 5).
 
+Amended 2026-10-19 after the second adversarial review of PR `feat/core`: `program` is a `ProgramName` (amendment above, corrected in place), `env_var_names` holds `EnvVarName` values that cannot carry a `=`, and `tools`, `env_var_names` and `cache_paths` are strictly sorted so that one content has one `EnvSpecId`; a spec that breaks either rule is refused on encode and on decode.
+
 ## Context
 
 The job's workspace arrives with its caches when the platform matches (ADR 0004). When it does not, or when a cache was excluded, the node must be able to make itself ready without the user typing anything. The standard for describing environments is `devcontainer.json` (about 1.69M monthly npm downloads of `@devcontainers/cli` per the landscape, section 7). But a devcontainer is a container recipe, and v0 runs harnesses directly on two Macs with no container.

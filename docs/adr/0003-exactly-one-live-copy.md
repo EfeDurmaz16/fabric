@@ -14,6 +14,12 @@ Amended 2026-10-19 after the adversarial review of PR `feat/core`. Five points:
 4. The invariants under Consequences hold on one chain. A steal can fork the chain, and until the fork rule is implemented two nodes on two suffixes can each hold an owner at the same epoch; the fork rule picks one. The model test asserts a single owner across all nodes only in runs without a steal, and in every run asserts that no two owners share an epoch on a common chain.
 5. The thief delivers `Stolen` to the stolen-from owner as its writer; the owner accepts it through the writer rule and is fenced. A `Stolen` record delivered by any other node is refused by the sender rule (ADR 0002, amendment 6).
 
+Amended 2026-10-19 after the second adversarial review of PR `feat/core`. Three points:
+
+1. The target of an open move cannot steal it (`StealByTarget`): it holds the two exits, import and abort, and a steal from it only forked the chain with the move left undecided. A relayed `Stolen` written by the target is refused on every node.
+2. The steal warning carries `owner_stopped_at_snapshot`, true when the chain's last `Suspended` names the latest snapshot and no `Resumed` follows, which is the case this ADR says cannot lose pushed work; and `last_record_at` is the time of the owner's last record, not a target's `MoveAborted`.
+3. `CompleteSnapshot` names the snapshot the caller checked in the store and is not a proof the store makes (amendment 2 above, corrected in place).
+
 ## Context
 
 This is the decision that protects the user's work. Everything else can be slow or ugly; this cannot be wrong.

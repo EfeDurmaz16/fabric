@@ -16,6 +16,12 @@ Amended 2026-10-19 after the adversarial review of PR `feat/core`. Seven correct
 6. An entry below a path that an earlier entry says is a file or a symlink is refused with `ManifestError::UnderNonDir { index }`. The file writer's `O_NOFOLLOW` walk still stands; this is defence in depth that costs one hash set, and macOS has no `openat2` with `RESOLVE_BENEATH`.
 7. Git names are parsed types in `fabric_core::git`, checked inside `Deserialize`: `GitOid` (40 or 64 lowercase hex), `RefName` (under `refs/`, passing the `check-ref-format` rules), `BranchName` and `RemoteName` (no leading `-`, not `HEAD`), `GitConfigValue` (no newline, no NUL, no leading `-`) and `GitConfigKey`, an enum that is exactly the allowlist below and travels as its text. A manifest that names `credential.helper` or `core.fsmonitor` fails to decode, so the allowlist is enforced by the receiving node and not only by the capturing one, and nothing in `GitState` can read as an option on git's command line. The wire bytes of a valid manifest did not change.
 
+Amended 2026-10-19 after the second adversarial review of PR `feat/core`. Three corrections:
+
+1. A `remote.<n>.url` or `remote.<n>.pushurl` whose `scheme://` authority holds userinfo is refused on decode with `ManifestError::SecretInConfig { index }`, so the strip at capture is enforced by the receiving node too; before this a token in a remote URL decoded on every peer.
+2. `Entry.mode` is `Mode`, a type that cannot hold a bit above `0o777`; `BadMode` is gone (point 5 above, corrected in place).
+3. `HarnessState` lives in the snapshot module next to `Entry`. The text below that named `ManifestError::BadPath` now names the `Codec` failure that happens.
+
 ## Context
 
 A move must carry everything the job needs, including what git ignores. The research is explicit that nobody ships this: T3 Code's bundle excludes ignored files and runs no install on arrival; claude-handoff and session-roam carry transcripts only; the one unfilled piece is "same-OS-and-arch carry of the pnpm store or `node_modules` and `target/`, content-addressed and deduplicated, with a rebuild fallback" (`2026-10-19-t3code-vs-fabric.md`, section 2). The first gate requires `node_modules` to arrive.

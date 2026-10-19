@@ -22,6 +22,14 @@ Amended 2026-10-19 after the adversarial review of PR `feat/core`. Eight correct
 7. Two content rules were missing: `SnapshotPublished.parent` must equal the latest published snapshot (`WrongParent`), and a `Resumed` that names a snapshot must name the latest one (`UnknownSnapshot`). A record whose epoch is above the one the rules require is `AheadOfUs`, as the fencing token already distinguishes, instead of `StaleEpoch`.
 8. `Epoch` zero is refused on the wire, not only by `Epoch::new`. The record bytes of every event kind and of the job manifest are pinned by a test, as the snapshot manifest's already were, so a reordered variant or field is a failing test.
 
+Amended 2026-10-19 after the second adversarial review of PR `feat/core`. Five corrections, each pinned by a test, applied in place above and in the rules below:
+
+1. A whole last record whose checksum bytes are present and wrong is corruption, not a torn tail; only a tail whose checksum bytes read back as zero is torn (review amendment 2 above, reversed). Dropping a complete record can drop an acknowledged `MoveImported`.
+2. A decoder refuses non-canonical bytes as well as trailing ones. postcard reads an overlong varint as the same number, so one event had two frame hashes and an `EnvSpec` could have an id that was not blake3 of its bytes. Every decode re-encodes and compares; inside a frame any decode failure is `Corrupt { offset }`.
+3. `MoveStarted` requires the workspace to be suspended in the latest published snapshot, derived from the records (the last `Suspended` names it and no `Resumed` follows), not the head record's kind, so a `Note` after `fabric suspend` does not block a move.
+4. A `move_id` names one move. A `MoveStarted` whose id an earlier move used is refused with `MoveIdReused`; otherwise the target answers every offer for the new move with the old decision.
+5. `Ledger::accept` is private and `commit` is the one way to grow a ledger; a store that refuses the append proves the record is never shown. `verify` takes an `Author`, as `commit` does.
+
 ## Context
 
 A job must be readable after any crash, on any node, by any future version of Fabric. It must also show what happened, in order, so that a user on a second machine can see why a job is in the state it is in. The T3 Code store is an event-sourced SQLite file with 64 migrations that the research judged unsafe to write from outside (`2026-10-19-t3code-vs-fabric.md`, section 5a). We want the opposite: a format small enough to describe on one page and safe to read with a hex editor.
