@@ -13,6 +13,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 
+use fabric_core::git::GitOid;
 use fabric_core::id::SnapshotId;
 use fabric_core::path::{PathError, RelPath};
 use fabric_core::snapshot::{
@@ -164,6 +165,14 @@ pub enum RestoreError {
         /// Bytes the chunks held.
         written: u64,
         /// Bytes the entry records.
+        size: u64,
+    },
+    /// A symlink in the working-tree commit has a target longer than any filesystem allows.
+    #[error("{path}: symlink target is {size} bytes")]
+    SymlinkTooLong {
+        /// The link.
+        path: RelPath,
+        /// The blob's size.
         size: u64,
     },
     /// A bundle in the chain names a base snapshot the store does not have.
@@ -376,10 +385,38 @@ fn verify_entries(
     Ok(verified)
 }
 
+/// The longest symlink target restore accepts; longer ones no filesystem can hold.
+const SYMLINK_TARGET_LIMIT: u64 = 4096;
+
+/// The kind of one `git ls-tree` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeMode {
+    /// A regular file, `100644`.
+    File,
+    /// An executable file, `100755`.
+    Exec,
+    /// A symbolic link, `120000`.
+    Symlink,
+    /// A submodule commit, `160000`.
+    Gitlink,
+}
+
+impl TreeMode {
+    fn parse(text: &str) -> Option<TreeMode> {
+        match text {
+            "100644" => Some(TreeMode::File),
+            "100755" => Some(TreeMode::Exec),
+            "120000" => Some(TreeMode::Symlink),
+            "160000" => Some(TreeMode::Gitlink),
+            _ => None,
+        }
+    }
+}
+
 /// One entry of `git ls-tree -r`.
 struct TreeItem {
-    mode: &'static str,
-    oid: String,
+    mode: TreeMode,
+    oid: GitOid,
     rel: RelPath,
 }
 
@@ -390,15 +427,12 @@ fn parse_tree(bytes: &[u8]) -> Result<Vec<TreeItem>, RestoreError> {
         let bad = || RestoreError::BadTreeOutput { text: text.clone() };
         let (meta, path) = text.split_once('\t').ok_or_else(bad)?;
         let mut fields = meta.split(' ');
-        let mode = match fields.next() {
-            Some("100644") => "100644",
-            Some("100755") => "100755",
-            Some("120000") => "120000",
-            Some("160000") => "160000",
-            _ => return Err(bad()),
-        };
+        let mode = fields.next().and_then(TreeMode::parse).ok_or_else(bad)?;
         let _kind = fields.next().ok_or_else(bad)?;
-        let oid = fields.next().ok_or_else(bad)?.to_owned();
+        let oid = fields
+            .next()
+            .and_then(|o| GitOid::parse(o).ok())
+            .ok_or_else(bad)?;
         let rel = RelPath::parse(path).map_err(|source| RestoreError::BadTreePath {
             path: path.to_owned(),
             source,
@@ -408,12 +442,71 @@ fn parse_tree(bytes: &[u8]) -> Result<Vec<TreeItem>, RestoreError> {
     Ok(items)
 }
 
-/// Streams blobs out of `git cat-file --batch` and hands each to `on_blob`.
+/// One blob header of `git cat-file --batch`.
+struct BlobHeader {
+    oid: GitOid,
+    size: u64,
+}
+
+fn parse_blob_header(header: &str) -> Result<BlobHeader, RestoreError> {
+    let bad = || RestoreError::BadTreeOutput {
+        text: header.trim().to_owned(),
+    };
+    let mut fields = header.split_whitespace();
+    let oid = fields
+        .next()
+        .and_then(|o| GitOid::parse(o).ok())
+        .ok_or_else(bad)?;
+    let kind = fields.next().ok_or_else(bad)?;
+    if kind == "missing" {
+        return Err(bad());
+    }
+    let size: u64 = fields.next().and_then(|s| s.parse().ok()).ok_or_else(bad)?;
+    Ok(BlobHeader { oid, size })
+}
+
+/// Reads one `cat-file --batch` stream and hands each blob to `on_blob` as a
+/// bounded reader, in the order of `expected`, never holding a blob in memory.
+///
+/// Whatever `on_blob` leaves unread is skipped, so the stream stays in step.
+fn read_blob_stream(
+    reader: &mut impl BufRead,
+    expected: &[GitOid],
+    mut on_blob: impl FnMut(usize, u64, &mut dyn Read) -> Result<(), RestoreError>,
+) -> Result<(), RestoreError> {
+    let pipe = Path::new("cat-file");
+    let mut header = String::new();
+    for (index, oid) in expected.iter().enumerate() {
+        header.clear();
+        if reader.read_line(&mut header).map_err(|e| io_err(pipe, e))? == 0 {
+            return Err(RestoreError::BadTreeOutput {
+                text: format!("stream ended before {oid}"),
+            });
+        }
+        let blob = parse_blob_header(&header)?;
+        if blob.oid != *oid {
+            return Err(RestoreError::BadTreeOutput {
+                text: format!("asked for {oid}, got {}", blob.oid),
+            });
+        }
+        let mut body = reader.by_ref().take(blob.size);
+        on_blob(index, blob.size, &mut body)?;
+        io::copy(&mut body, &mut io::sink()).map_err(|e| io_err(pipe, e))?;
+        let mut newline = [0u8; 1];
+        reader
+            .read_exact(&mut newline)
+            .map_err(|e| io_err(pipe, e))?;
+    }
+    Ok(())
+}
+
+/// Streams the blobs `oids` out of `git cat-file --batch`, in that order.
 fn cat_file_batch(
     git: &Git,
-    oids: Vec<String>,
-    mut on_blob: impl FnMut(&str, &[u8]) -> Result<(), RestoreError>,
+    oids: &[GitOid],
+    on_blob: impl FnMut(usize, u64, &mut dyn Read) -> Result<(), RestoreError>,
 ) -> Result<(), RestoreError> {
+    let pipe = Path::new("cat-file");
     let mut child = git.spawn_piped(&["cat-file", "--batch"])?;
     let Some(mut stdin) = child.stdin.take() else {
         return Err(RestoreError::BadTreeOutput {
@@ -425,46 +518,16 @@ fn cat_file_batch(
             text: "cat-file has no stdout".to_owned(),
         });
     };
+    let requests: Vec<String> = oids.iter().map(|o| format!("{o}\n")).collect();
     let feeder = thread::spawn(move || {
-        for oid in oids {
-            if writeln!(stdin, "{oid}").is_err() {
+        for request in requests {
+            if stdin.write_all(request.as_bytes()).is_err() {
                 break;
             }
         }
     });
     let mut reader = BufReader::new(stdout);
-    let outcome = (|| {
-        let mut header = String::new();
-        loop {
-            header.clear();
-            if reader
-                .read_line(&mut header)
-                .map_err(|e| io_err(Path::new("cat-file"), e))?
-                == 0
-            {
-                return Ok(());
-            }
-            let bad = || RestoreError::BadTreeOutput {
-                text: header.trim().to_owned(),
-            };
-            let mut fields = header.split_whitespace();
-            let oid = fields.next().ok_or_else(bad)?.to_owned();
-            let kind = fields.next().ok_or_else(bad)?;
-            if kind == "missing" {
-                return Err(bad());
-            }
-            let size: usize = fields.next().and_then(|s| s.parse().ok()).ok_or_else(bad)?;
-            let mut bytes = vec![0u8; size];
-            reader
-                .read_exact(&mut bytes)
-                .map_err(|e| io_err(Path::new("cat-file"), e))?;
-            let mut newline = [0u8; 1];
-            reader
-                .read_exact(&mut newline)
-                .map_err(|e| io_err(Path::new("cat-file"), e))?;
-            on_blob(&oid, &bytes)?;
-        }
-    })();
+    let outcome = read_blob_stream(&mut reader, oids, on_blob);
     if outcome.is_err() {
         // git blocks on a full stdout pipe and the feeder on a full stdin
         // pipe; closing our end of stdout and killing git frees both.
@@ -472,7 +535,7 @@ fn cat_file_batch(
         let _ = child.kill();
     }
     let _ = feeder.join();
-    let status = child.wait().map_err(|e| io_err(Path::new("cat-file"), e))?;
+    let status = child.wait().map_err(|e| io_err(pipe, e))?;
     outcome?;
     if !status.success() {
         return Err(GitError::Failed {
@@ -596,48 +659,57 @@ fn restore_git(
         .iter()
         .map(|(p, t)| (p, *t))
         .collect();
-    let mut by_oid: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut blob_oids = Vec::new();
-    for (index, item) in items.iter().enumerate() {
-        if item.mode == "160000" {
+    let mut blobs: Vec<&TreeItem> = Vec::with_capacity(items.len());
+    for item in &items {
+        if item.mode == TreeMode::Gitlink {
             writer.mkdir(&item.rel, 0o755)?;
             report.submodules.push(item.rel.clone());
         } else {
-            if !by_oid.contains_key(&item.oid) {
-                blob_oids.push(item.oid.clone());
-            }
-            by_oid.entry(item.oid.clone()).or_default().push(index);
+            blobs.push(item);
         }
     }
-    let mut symlinks: Vec<(usize, String)> = Vec::new();
-    cat_file_batch(&git, blob_oids, |oid, bytes| {
-        let Some(indexes) = by_oid.get(oid) else {
-            return Err(RestoreError::BadTreeOutput {
-                text: oid.to_owned(),
-            });
-        };
-        for &index in indexes {
-            let item = &items[index];
-            match item.mode {
-                "120000" => {
-                    symlinks.push((index, String::from_utf8_lossy(bytes).into_owned()));
+    let oids: Vec<GitOid> = blobs.iter().map(|item| item.oid.clone()).collect();
+    let mut symlinks: Vec<(&TreeItem, String)> = Vec::new();
+    cat_file_batch(&git, &oids, |index, size, body| {
+        let item = blobs[index];
+        let path = Path::new(item.rel.as_str());
+        match item.mode {
+            TreeMode::Symlink => {
+                if size > SYMLINK_TARGET_LIMIT {
+                    return Err(RestoreError::SymlinkTooLong {
+                        path: item.rel.clone(),
+                        size,
+                    });
                 }
-                mode => {
-                    let bits = if mode == "100755" { 0o755 } else { 0o644 };
-                    let mut file = writer.create_file(&item.rel, bits)?;
-                    file.write_all(bytes)
-                        .map_err(|e| io_err(Path::new(item.rel.as_str()), e))?;
-                    drop(file);
-                    if let Some(mtime) = mtimes.get(&item.rel) {
-                        writer.set_mtime(&item.rel, *mtime)?;
-                    }
+                let mut target = String::new();
+                body.read_to_string(&mut target)
+                    .map_err(|e| io_err(path, e))?;
+                symlinks.push((item, target));
+            }
+            TreeMode::File | TreeMode::Exec | TreeMode::Gitlink => {
+                let bits = if item.mode == TreeMode::Exec {
+                    0o755
+                } else {
+                    0o644
+                };
+                let mut file = writer.create_file(&item.rel, bits)?;
+                let written = io::copy(body, &mut file).map_err(|e| io_err(path, e))?;
+                if written != size {
+                    return Err(RestoreError::SizeMismatch {
+                        path: item.rel.clone(),
+                        written,
+                        size,
+                    });
+                }
+                drop(file);
+                if let Some(mtime) = mtimes.get(&item.rel) {
+                    writer.set_mtime(&item.rel, *mtime)?;
                 }
             }
         }
         Ok(())
     })?;
-    for (index, target) in symlinks {
-        let item = &items[index];
+    for (item, target) in symlinks {
         writer.symlink(&item.rel, &target)?;
         if let Some(mtime) = mtimes.get(&item.rel) {
             writer.set_mtime(&item.rel, *mtime)?;
@@ -777,7 +849,7 @@ mod tests {
         }
         git.run(&["add", "-A"]).unwrap();
         let tree = git.run_text(&["write-tree"]).unwrap();
-        let oids: Vec<String> = parse_tree(&git.run(&["ls-tree", "-r", "-z", &tree]).unwrap())
+        let oids: Vec<GitOid> = parse_tree(&git.run(&["ls-tree", "-r", "-z", &tree]).unwrap())
             .unwrap()
             .into_iter()
             .map(|item| item.oid)
@@ -786,7 +858,7 @@ mod tests {
 
         let (done, finished) = mpsc::channel();
         thread::spawn(move || {
-            let outcome = cat_file_batch(&git, oids, |_, _| {
+            let outcome = cat_file_batch(&git, &oids, |_, _, _| {
                 Err(RestoreError::Write(WriteError::Collision {
                     path: PathBuf::from("f0"),
                 }))
