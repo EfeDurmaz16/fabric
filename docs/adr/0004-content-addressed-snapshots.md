@@ -51,11 +51,14 @@ GitState {
   head:            Branch(String) | Detached(String),
   index_commit:    String,               commit I: its tree is the index at capture time
   worktree_commit: String,               commit W: its tree is the working tree at capture time
+  worktree_mtimes: [(RelPath, u64)],     mtime in nanoseconds for every path in W
   config:          [ChunkId],            .git/config
   exclude:         Option<[ChunkId]>,    .git/info/exclude
 }
-Entry { rel_path: RelPath, kind: File | Dir | Symlink { target: String }, mode: u32, size: u64, chunks: [ChunkId] }
+Entry { rel_path: RelPath, kind: File | Dir | Symlink { target: String }, mode: u32, mtime_ns: u64, size: u64, chunks: [ChunkId] }
 ```
+
+`mtime_ns` is read with `lstat` at capture and written back with `utimensat` after the bytes, with `AT_SYMLINK_NOFOLLOW` for links; a directory's mtime is set after its contents. The same applies to every path in `W` through `worktree_mtimes`. This is not cosmetic: Cargo decides fresh or stale from mtimes and paths, not content (research H5, item 3), so a `target/` carried without the source files' original mtimes rebuilds every local crate. pnpm does not care, which is why the first gate would pass without this and a Rust job would not.
 
 `RelPath` is a parsed newtype in `fabric-core`, never a bare string. Decoding a manifest rejects, with `ManifestError::BadPath { index, reason }`, any path that is empty, starts with `/`, contains a NUL byte, has an empty, `.` or `..` component, is not NFC-normalized, or has `.fabric` as its first component (reserved for the marker). In `files` and `harness_state` a `.git` component is rejected too; `W` cannot contain one because git refuses it. Two entries with the same path are `ManifestError::DuplicatePath`. A symlink `target` is an unparsed string written verbatim with `symlink(2)`; it is safe because restore never writes through a link (below). `mode` is applied as `mode & 0o777`; setuid, setgid and sticky bits never travel.
 
@@ -109,7 +112,7 @@ Marker { job_id: JobId, snapshot: SnapshotId, state: Clean | Dirty | Restoring {
    3. Set `HEAD`: `git symbolic-ref HEAD refs/heads/<branch>`, or `git update-ref --no-deref HEAD <sha>` for a detached head.
    4. `git read-tree <I>`. The index is now the staged state; the working tree is still empty.
    5. Write the tree of `W` into the root with Fabric's own file writer (`git ls-tree -r -z W` for paths, modes and blob ids, `git cat-file --batch` for bytes). It is the same loop that writes `files`, so modes, symlinks and path rules are enforced in one place, and the index is untouched. Then `git update-index --refresh`, ignoring its exit status, which is nonzero whenever a file differs from the index, which is expected here.
-   6. Only now write `files`.
+   6. Only now write `files`. Apply `worktree_mtimes` and every `Entry.mtime_ns` as each path is written, so the relative order of source and build output is the one the source machine had.
 
    The file writer defends the root against the manifest, because the manifest can come from a buggy adapter, a corrupted peer store or a paired node that is itself compromised, and the hash chain of ADR 0002 is not security. Within each of `W`, `files` and `harness_state` it creates directories first, then files, then symlinks last, so no link exists yet when the bytes are written. Every open goes through a directory handle, component by component with `O_NOFOLLOW`, never through a path string joined to the root; `cap-std` is the planned dependency for this and `openat2` with `RESOLVE_BENEATH` is used where the kernel has it. This covers the in-place path too, where links from the previous snapshot already exist. Before writing anything the writer probes the volume for case folding by creating two names that differ only in case under the staging directory; on a case-insensitive volume two entries that collide under case folding are refused with `RestoreError::PathCollision { a, b }` rather than one silently overwriting the other. Each of these rules gets one restore test with a manifest that breaks it.
 

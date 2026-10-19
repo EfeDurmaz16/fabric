@@ -53,7 +53,7 @@ LeaseState   = Free | Held { node, epoch, expires_at } | Released { epoch }
 
 SnapshotManifest = { version, job_id, parent: Option<SnapshotId>, created_at,
                      platform: { os, arch }, entries: [Entry], harness_state: [Entry] }
-Entry        = { rel_path, kind: File | Dir | Symlink, mode, chunks: [ChunkId], size }
+Entry        = { rel_path: RelPath, kind: File | Dir | Symlink, mode, mtime_ns, chunks: [ChunkId], size }
 
 EnvSpec      = { version, tools: [{ name, version, source }], setup: [SetupStep],
                  env_var_names: [String], cache_paths: [RelPath] }
