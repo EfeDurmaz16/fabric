@@ -39,7 +39,7 @@ Only `fabric-core` exists today, and it holds a placeholder. Dependency directio
 ```text
 JobId        = ULID
 NodeId       = ed25519 public key (32 bytes)
-Epoch        = u64, starts at 1, increases by exactly 1 on every lease claim
+Epoch        = u64, 0 until the first claim, increases by exactly 1 on every lease claim
 SnapshotId   = blake3 hash of the manifest bytes
 ChunkId      = blake3 hash of the chunk bytes
 

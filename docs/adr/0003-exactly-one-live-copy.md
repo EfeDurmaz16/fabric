@@ -24,6 +24,7 @@ LeaseState =
 ```
 
 - A node may run a harness for a job only while it holds the lease.
+- `Created`, and any event written while the lease is `Free`, carries epoch 0. The first claim is epoch 1.
 - A claim is a request to the arbiter, never a local append. The arbiter appends `LeaseClaimed` with `epoch = previous_epoch + 1` on the claimant's behalf (Claim protocol, below). Epochs never repeat and never go backwards.
 - `suspend` releases the lease: the holder appends `LeaseReleased` at the current epoch. The next claim gets `epoch + 1`.
 - The holder renews before expiry by appending a fresh `LeaseClaimed` at the same epoch with a later `expires_at`. Renewal does not bump the epoch.

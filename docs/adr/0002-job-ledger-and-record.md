@@ -29,7 +29,7 @@ u32 length | u8 format_version | postcard(Event) | blake3(prev 3 fields)[0..16]
 Event {
   id:    EventId,
   prev:  Option<[u8; 32]>,   blake3 of the previous record's bytes; None only for Created
-  epoch: Epoch,              the lease epoch under which this event was written
+  epoch: Epoch,              the lease epoch under which this event was written; 0 while the lease is Free
   at:    u64,                unix milliseconds, informational only, never used for ordering
   kind:  EventKind,
 }
