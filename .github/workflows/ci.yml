@@ -28,6 +28,9 @@ jobs:
           # The commit message check needs the base branch.
           fetch-depth: 0
 
+      - name: Prove the hygiene script fires
+        run: scripts/test-check-hygiene.sh
+
       - name: No em dash or AI attribution in files and commits
         env:
           BASE_REF: ${{ github.base_ref }}
