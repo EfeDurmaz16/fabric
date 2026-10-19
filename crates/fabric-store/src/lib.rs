@@ -17,5 +17,7 @@
 //! stays the commit point (ADR 0002).
 
 pub mod catalog;
+mod checkpoint;
 mod durable;
 pub mod objects;
+pub mod store;
