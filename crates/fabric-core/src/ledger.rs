@@ -555,33 +555,13 @@ pub struct JobManifest {
 
 impl JobManifest {
     /// Returns the bytes to persist: the version, then the fields.
-    pub fn encode(&self) -> Result<Vec<u8>, JobManifestError> {
+    pub fn encode(&self) -> Result<Vec<u8>, VersionedError> {
         Ok(codec::encode_versioned(JOB_MANIFEST_VERSION, self)?)
     }
 
     /// Decodes bytes written by `encode`, refusing other versions.
-    pub fn decode(bytes: &[u8]) -> Result<Self, JobManifestError> {
-        Ok(codec::decode_versioned(bytes, JOB_MANIFEST_VERSION)?)
-    }
-}
-
-/// Why job manifest bytes were refused.
-#[derive(Debug, thiserror::Error)]
-pub enum JobManifestError {
-    /// The bytes carry a version this crate does not know.
-    #[error("job manifest version {0} is not supported")]
-    UnknownVersion(u16),
-    /// The bytes do not decode, or the value does not encode.
-    #[error("job manifest codec: {0}")]
-    Codec(#[from] CodecError),
-}
-
-impl From<VersionedError> for JobManifestError {
-    fn from(err: VersionedError) -> Self {
-        match err {
-            VersionedError::UnknownVersion(v) => JobManifestError::UnknownVersion(v),
-            VersionedError::Codec(c) => JobManifestError::Codec(c),
-        }
+    pub fn decode(bytes: &[u8]) -> Result<Self, VersionedError> {
+        codec::decode_versioned(bytes, JOB_MANIFEST_VERSION)
     }
 }
 
@@ -1752,7 +1732,7 @@ mod tests {
         bytes.push(0);
         assert!(matches!(
             JobManifest::decode(&bytes),
-            Err(JobManifestError::Codec(CodecError::TrailingBytes(1)))
+            Err(VersionedError::Codec(CodecError::TrailingBytes(1)))
         ));
     }
 

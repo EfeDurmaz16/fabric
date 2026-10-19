@@ -24,9 +24,6 @@ pub const ENV_SPEC_VERSION: u16 = 0;
 /// Why an environment spec was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum EnvSpecError {
-    /// The bytes carry a version this crate does not know.
-    #[error("environment spec version {0} is not supported")]
-    UnknownVersion(u16),
     /// A list is not strictly sorted by its key, which also catches a repeated key.
     #[error("{list} entry {index} is not strictly after the one before it")]
     OutOfOrder {
@@ -35,10 +32,16 @@ pub enum EnvSpecError {
         /// Zero-based index of the entry, within its list.
         index: usize,
     },
-    /// The bytes do not decode, or the value does not encode. A bad program
-    /// or variable name on the wire surfaces here too.
+    /// The bytes carry another version or do not decode, or the value does
+    /// not encode. A bad program or variable name on the wire surfaces here too.
     #[error("environment spec codec: {0}")]
-    Codec(#[from] CodecError),
+    Codec(#[from] VersionedError),
+}
+
+impl From<CodecError> for EnvSpecError {
+    fn from(err: CodecError) -> Self {
+        EnvSpecError::Codec(VersionedError::Codec(err))
+    }
 }
 
 /// Why an environment variable name was refused.
@@ -168,15 +171,6 @@ pub enum RunWhen {
     CachesMissing,
     /// On every resume.
     Always,
-}
-
-impl From<VersionedError> for EnvSpecError {
-    fn from(err: VersionedError) -> Self {
-        match err {
-            VersionedError::UnknownVersion(v) => EnvSpecError::UnknownVersion(v),
-            VersionedError::Codec(c) => EnvSpecError::Codec(c),
-        }
-    }
 }
 
 impl EnvSpec {
@@ -336,7 +330,9 @@ mod tests {
         bytes.push(0);
         assert!(matches!(
             EnvSpec::decode(&bytes),
-            Err(EnvSpecError::Codec(CodecError::TrailingBytes(1)))
+            Err(EnvSpecError::Codec(VersionedError::Codec(
+                CodecError::TrailingBytes(1)
+            )))
         ));
     }
 
@@ -349,7 +345,9 @@ mod tests {
         over.extend_from_slice(&bytes[1..]);
         assert!(matches!(
             EnvSpec::decode(&over),
-            Err(EnvSpecError::Codec(CodecError::NonCanonical))
+            Err(EnvSpecError::Codec(VersionedError::Codec(
+                CodecError::NonCanonical
+            )))
         ));
     }
 
@@ -359,7 +357,7 @@ mod tests {
         bytes[0] = 7;
         assert!(matches!(
             EnvSpec::decode(&bytes),
-            Err(EnvSpecError::UnknownVersion(7))
+            Err(EnvSpecError::Codec(VersionedError::UnknownVersion(7)))
         ));
     }
 }

@@ -4,7 +4,7 @@
 
 use std::error::Error;
 
-use fabric_core::codec::CodecError;
+use fabric_core::codec::{CodecError, VersionedError};
 use fabric_core::git::{BranchName, GitConfigKey, GitConfigValue, GitOid, RefName};
 use fabric_core::id::{ChunkId, EnvSpecId, JobId, NodeId, SnapshotId};
 use fabric_core::path::{AbsPath, RelPath};
@@ -269,7 +269,7 @@ proptest! {
         version.extend_from_slice(&bytes[1..]);
         prop_assert!(matches!(
             SnapshotManifest::decode(&version),
-            Err(ManifestError::Codec(CodecError::NonCanonical))
+            Err(ManifestError::Codec(VersionedError::Codec(CodecError::NonCanonical)))
         ));
         // created_at follows the version, the job id, the root and the parent.
         let start = 1
@@ -543,7 +543,9 @@ fn trailing_bytes_do_not_decode() {
     bytes.push(0);
     assert!(matches!(
         SnapshotManifest::decode(&bytes),
-        Err(ManifestError::Codec(CodecError::TrailingBytes(1)))
+        Err(ManifestError::Codec(VersionedError::Codec(
+            CodecError::TrailingBytes(1)
+        )))
     ));
 }
 
@@ -554,7 +556,7 @@ fn unknown_version_and_oversize_are_refused() {
     bytes[0] = 2;
     assert!(matches!(
         SnapshotManifest::decode(&bytes),
-        Err(ManifestError::UnknownVersion(2))
+        Err(ManifestError::Codec(VersionedError::UnknownVersion(2)))
     ));
     let big = vec![0u8; fabric_core::snapshot::MAX_MANIFEST_LEN + 1];
     assert!(matches!(

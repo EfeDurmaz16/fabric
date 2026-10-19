@@ -52,13 +52,13 @@ fn decode_exact<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
     Ok(value)
 }
 
-/// Why versioned bytes were refused.
+/// Why versioned bytes were refused, or a versioned value did not encode.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum VersionedError {
+pub enum VersionedError {
     /// The leading version is not the one the caller reads.
     #[error("format version {0} is not supported")]
     UnknownVersion(u16),
-    /// The version matches but the value does not decode.
+    /// The version matches but the value does not decode, or the value does not encode.
     #[error(transparent)]
     Codec(#[from] CodecError),
 }

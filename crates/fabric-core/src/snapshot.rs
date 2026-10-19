@@ -35,9 +35,6 @@ pub enum ManifestError {
         /// The byte length that was offered.
         len: usize,
     },
-    /// The bytes carry a version this crate does not know.
-    #[error("manifest version {0} is not supported")]
-    UnknownVersion(u16),
     /// A list is not strictly sorted by its key, which also catches a repeated key.
     #[error("{list} entry {index} is not strictly after the one before it")]
     OutOfOrder {
@@ -58,11 +55,18 @@ pub enum ManifestError {
         /// Zero-based index of the entry, within `config`.
         index: usize,
     },
-    /// The bytes do not decode, or the value does not encode. A path that
-    /// breaks the rules of `RelPath` or `AbsPath`, a git name outside its
-    /// rule and a mode bit above the low nine surface here too.
+    /// The bytes carry another version or do not decode, or the value does
+    /// not encode. A path that breaks the rules of `RelPath` or `AbsPath`, a
+    /// git name outside its rule and a mode bit above the low nine surface
+    /// here too.
     #[error("manifest codec: {0}")]
-    Codec(#[from] CodecError),
+    Codec(#[from] VersionedError),
+}
+
+impl From<CodecError> for ManifestError {
+    fn from(err: CodecError) -> Self {
+        ManifestError::Codec(VersionedError::Codec(err))
+    }
 }
 
 /// What one snapshot of a workspace contains.
@@ -291,15 +295,6 @@ pub enum GitHead {
     Branch(BranchName),
     /// A detached commit id.
     Detached(GitOid),
-}
-
-impl From<VersionedError> for ManifestError {
-    fn from(err: VersionedError) -> Self {
-        match err {
-            VersionedError::UnknownVersion(v) => ManifestError::UnknownVersion(v),
-            VersionedError::Codec(c) => ManifestError::Codec(c),
-        }
-    }
 }
 
 /// Returns the index of the first key that is not strictly after the one
