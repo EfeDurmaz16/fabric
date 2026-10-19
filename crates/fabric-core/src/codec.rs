@@ -1,7 +1,8 @@
 //! The one place the crate talks to postcard.
 //!
 //! Invariant: every value this crate persists or sends has exactly one byte
-//! form. `decode` refuses bytes that do not end where the value ends, so a
+//! form. `decode` refuses bytes that do not end where the value ends and
+//! bytes that are not what `encode` writes for the value they decode to, so a
 //! hash of the bytes is a hash of the value and nothing else, and no public
 //! error type names the codec crate.
 
@@ -17,6 +18,9 @@ pub enum CodecError {
     /// Bytes follow the encoded value; a canonical encoding has none.
     #[error("{0} bytes follow the encoded value")]
     TrailingBytes(usize),
+    /// The bytes decode to a value whose canonical encoding is different; an overlong varint, for example.
+    #[error("the bytes are not the canonical encoding of the value they decode to")]
+    NonCanonical,
 }
 
 impl From<postcard::Error> for CodecError {
@@ -30,8 +34,17 @@ pub(crate) fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, CodecE
     Ok(postcard::to_stdvec(value)?)
 }
 
-/// Decodes exactly one value that occupies all of `bytes`.
-pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
+/// Decodes exactly one value that occupies all of `bytes` in its canonical form.
+pub(crate) fn decode<T: Serialize + DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
+    let value = decode_exact(bytes)?;
+    if encode(&value)? != bytes {
+        return Err(CodecError::NonCanonical);
+    }
+    Ok(value)
+}
+
+/// Decodes one value that occupies all of `bytes`, without the canonical check.
+fn decode_exact<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
     let (value, rest) = postcard::take_from_bytes::<T>(bytes)?;
     if !rest.is_empty() {
         return Err(CodecError::TrailingBytes(rest.len()));
@@ -59,7 +72,11 @@ pub(crate) fn encode_versioned<T: Serialize>(
 }
 
 /// Decodes bytes written by `encode_versioned`, refusing any version but `expected`.
-pub(crate) fn decode_versioned<T: DeserializeOwned>(
+///
+/// The version is read first so that bytes of another version are
+/// `UnknownVersion` whatever follows them; then the whole of `bytes`, the
+/// version varint included, must be the canonical encoding.
+pub(crate) fn decode_versioned<T: Serialize + DeserializeOwned>(
     bytes: &[u8],
     expected: u16,
 ) -> Result<T, VersionedError> {
@@ -67,7 +84,11 @@ pub(crate) fn decode_versioned<T: DeserializeOwned>(
     if version != expected {
         return Err(VersionedError::UnknownVersion(version));
     }
-    Ok(decode(rest)?)
+    let value: T = decode_exact(rest)?;
+    if encode_versioned(expected, &value)? != bytes {
+        return Err(VersionedError::Codec(CodecError::NonCanonical));
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -82,6 +103,26 @@ mod tests {
         assert!(matches!(
             decode::<u32>(&bytes),
             Err(CodecError::TrailingBytes(1))
+        ));
+    }
+
+    /// postcard reads `[0x87, 0x00]` as 7, the same value as `[0x07]`; only
+    /// the short form is the value's byte form, in the value and in the
+    /// version prefix alike.
+    #[test]
+    fn an_overlong_varint_is_refused() {
+        assert_eq!(decode::<u32>(&[0x07]).unwrap(), 7);
+        assert!(matches!(
+            decode::<u32>(&[0x87, 0x00]),
+            Err(CodecError::NonCanonical)
+        ));
+        assert!(matches!(
+            decode_versioned::<u32>(&[0x83, 0x00, 0x07], 3),
+            Err(VersionedError::Codec(CodecError::NonCanonical))
+        ));
+        assert!(matches!(
+            decode_versioned::<u32>(&[0x03, 0x87, 0x00], 3),
+            Err(VersionedError::Codec(CodecError::NonCanonical))
         ));
     }
 

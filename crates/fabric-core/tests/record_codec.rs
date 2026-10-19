@@ -114,6 +114,16 @@ fn frame(body: &[u8]) -> Result<Vec<u8>, TryFromIntError> {
     Ok(out)
 }
 
+/// Returns `varint` spelled one byte longer; postcard reads both as one number.
+fn overlong(varint: &[u8]) -> Vec<u8> {
+    let mut out = varint.to_vec();
+    if let Some(last) = out.last_mut() {
+        *last |= 0x80;
+    }
+    out.push(0);
+    out
+}
+
 /// A frame that carries bytes after the event, with a checksum that covers
 /// them, is not a second valid spelling of the event; it is corruption.
 #[test]
@@ -184,6 +194,29 @@ proptest! {
         prop_assert_eq!(back.event(), &e);
         prop_assert_eq!(back.hash(), record.hash());
         prop_assert_eq!(back.hash(), RecordHash::of(record.bytes()));
+    }
+
+    /// The epoch varint spelled one byte longer decodes to the same event
+    /// under a checksum that verifies; it would be a second frame hash for one
+    /// event, so it is refused as corruption.
+    #[test]
+    fn an_overlong_varint_inside_a_frame_is_corruption(e in event()) {
+        let record = Record::encode(e.clone()).unwrap();
+        let body_end = record.bytes().len() - CHECKSUM_LEN;
+        let body = &record.bytes()[HEADER_LEN..body_end];
+        // version | id | prev tag [| prev hash] | epoch | at | kind
+        let epoch_at = 1 + 16 + if e.prev.is_some() { 33 } else { 1 };
+        let epoch = postcard::to_stdvec(&e.epoch).unwrap();
+        let mut patched = body[..epoch_at].to_vec();
+        patched.extend(overlong(&epoch));
+        patched.extend_from_slice(&body[epoch_at + epoch.len()..]);
+        prop_assert!(
+            matches!(
+                Record::decode(&frame(&patched).unwrap()),
+                Err(RecordError::Corrupt { offset: 0 })
+            ),
+            "an overlong epoch varint was not reported as corruption at offset 0"
+        );
     }
 
     #[test]

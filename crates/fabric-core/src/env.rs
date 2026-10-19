@@ -152,6 +152,19 @@ mod tests {
         ));
     }
 
+    /// Version 0 is one byte, `0x00`; `0x80 0x00` reads as the same number
+    /// and would give the spec a second id.
+    #[test]
+    fn an_overlong_version_prefix_is_refused() {
+        let bytes = spec().encode().unwrap();
+        let mut over = vec![0x80, 0x00];
+        over.extend_from_slice(&bytes[1..]);
+        assert!(matches!(
+            EnvSpec::decode(&over),
+            Err(EnvSpecError::Codec(CodecError::NonCanonical))
+        ));
+    }
+
     #[test]
     fn unknown_version_is_refused() {
         let mut bytes = spec().encode().unwrap();

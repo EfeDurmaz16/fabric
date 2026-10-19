@@ -239,6 +239,16 @@ fn manifest() -> impl Strategy<Value = SnapshotManifest> {
         )
 }
 
+/// Returns `varint` spelled one byte longer; postcard reads both as one number.
+fn overlong(varint: &[u8]) -> Vec<u8> {
+    let mut out = varint.to_vec();
+    if let Some(last) = out.last_mut() {
+        *last |= 0x80;
+    }
+    out.push(0);
+    out
+}
+
 proptest! {
     #[test]
     fn encode_decode_round_trips_and_the_hash_is_stable(m in manifest()) {
@@ -248,6 +258,33 @@ proptest! {
         prop_assert_eq!(back.encode().unwrap(), bytes.clone());
         prop_assert_eq!(back.id().unwrap(), SnapshotId::of(&bytes));
         prop_assert_eq!(m.id().unwrap(), back.id().unwrap());
+    }
+
+    /// An overlong varint, in the version prefix or in a field, decodes to
+    /// the same manifest from other bytes; `id()` would then differ from
+    /// blake3 of the bytes, so the bytes are refused.
+    #[test]
+    fn an_overlong_varint_in_a_manifest_does_not_decode(m in manifest()) {
+        let bytes = m.encode().unwrap();
+        let mut version = overlong(&bytes[..1]);
+        version.extend_from_slice(&bytes[1..]);
+        prop_assert!(matches!(
+            SnapshotManifest::decode(&version),
+            Err(ManifestError::Codec(CodecError::NonCanonical))
+        ));
+        // created_at follows the version, the job id, the root and the parent.
+        let start = 1
+            + 16
+            + postcard::to_stdvec(&m.root).unwrap().len()
+            + postcard::to_stdvec(&m.parent).unwrap().len();
+        let created_at = postcard::to_stdvec(&m.created_at).unwrap();
+        let mut field = bytes[..start].to_vec();
+        field.extend(overlong(&created_at));
+        field.extend_from_slice(&bytes[start + created_at.len()..]);
+        prop_assert!(matches!(
+            SnapshotManifest::decode(&field),
+            Err(ManifestError::Codec(_))
+        ));
     }
 }
 

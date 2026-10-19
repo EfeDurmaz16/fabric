@@ -110,7 +110,7 @@ Each snapshot carries a `harness_state` tree (ADR 0004). The core copies it, has
 postcard for the ledger and manifests. It is compact, deterministic and `no_std`, but it is not self-describing, so:
 
 - every record and every manifest carries an explicit `format_version`, as the first thing in its bytes;
-- a decoder refuses bytes after the value, so a value has one byte form and its hash is the hash of that value alone;
+- a decoder refuses bytes after the value and bytes that are not what the encoder writes for the value they decode to (postcard reads an overlong varint as the same number), so a value has one byte form and its hash is the hash of that value alone; inside a record frame such bytes are corruption at that offset;
 - a reader that sees a version it does not know fails with a clear error instead of guessing;
 - field order is append-only within a version; a new version is a new struct.
 

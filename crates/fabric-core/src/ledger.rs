@@ -178,7 +178,8 @@ pub enum RecordError {
         /// The version byte found.
         version: u8,
     },
-    /// A record that is not the tail failed its checksum or framing.
+    /// A record that is not the tail failed its checksum, its framing, or
+    /// the exact decoding of its event.
     #[error("ledger corrupt at byte offset {offset}")]
     Corrupt {
         /// Byte offset of the failing record's length field.
@@ -190,7 +191,7 @@ pub enum RecordError {
         /// The byte length that was offered or asked for.
         len: usize,
     },
-    /// The frame checks out but the event inside does not decode, or an event does not encode.
+    /// An event does not encode.
     #[error("record codec: {0}")]
     Codec(#[from] CodecError),
 }
@@ -311,10 +312,10 @@ impl Record {
         if version != RECORD_FORMAT_VERSION {
             return Err(RecordError::UnknownVersion { version });
         }
-        let event: Event = match codec::decode(&hashed[HEADER_LEN + VERSION_LEN..]) {
-            Ok(event) => event,
-            Err(CodecError::TrailingBytes(_)) => return Err(RecordError::Corrupt { offset }),
-            Err(err) => return Err(RecordError::Codec(err)),
+        // A frame whose checksum verifies but whose payload is not the
+        // canonical encoding of an event was never written by this crate.
+        let Ok(event) = codec::decode::<Event>(&hashed[HEADER_LEN + VERSION_LEN..]) else {
+            return Err(RecordError::Corrupt { offset });
         };
         let bytes = frame.to_vec();
         let hash = RecordHash::of(&bytes);
