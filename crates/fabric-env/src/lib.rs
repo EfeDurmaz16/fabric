@@ -2,13 +2,16 @@
 //!
 //! Detection reads the files a workspace already has, plus the user's
 //! `.fabric/env.toml`, and builds an `EnvSpec`: tool pins, setup steps,
-//! environment variable names and cache paths. The secret policy is the one
-//! list of path patterns that never leave a node; snapshot capture applies
-//! it too.
+//! environment variable names and cache paths. The materializer checks a
+//! restored workspace against that spec and runs setup steps only when a
+//! cache is missing or torn. The secret policy is the one list of path
+//! patterns that never leave a node; snapshot capture applies it too.
 //!
-//! The crate never stores or logs the value of an environment variable and
-//! never copies a credential.
+//! The crate never stores or logs the value of an environment variable,
+//! never copies a credential and never runs a program through a shell. It
+//! targets Unix: the materializer reads execute bits to find a program.
 
 pub mod detect;
+pub mod materialize;
 pub mod overrides;
 pub mod secret;
