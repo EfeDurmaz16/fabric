@@ -15,22 +15,22 @@ Fabric's core must not know any of this. If it does, every vendor release is a c
 Defined in `fabric-core`, implemented per harness in `fabric-harness`.
 
 ```text
-trait Harness {
+trait Harness: Send + Sync {
     fn kind(&self) -> HarnessKind;
 
-    async fn detect(&self, workspace: &Path) -> Result<Option<Detected>, HarnessError>;
+    fn detect(&self, workspace: &Path) -> BoxFuture<'_, Result<Option<Detected>, HarnessError>>;
         Is there a session of this harness for this workspace? Where is its state?
 
-    async fn capture(&self, workspace: &Path, out: &Path) -> Result<Captured, HarnessError>;
+    fn capture(&self, workspace: &Path, out: &Path) -> BoxFuture<'_, Result<Captured, HarnessError>>;
         Ask the running harness to stop at a turn boundary, then copy everything it needs
         to continue into `out`, redacted. Returns what was copied, any paths that are
         absolute, and what was redacted.
 
-    async fn restore(&self, state: &Path, from_root: &Path, to_root: &Path) -> Result<(), HarnessError>;
+    fn restore(&self, state: &Path, from_root: &Path, to_root: &Path) -> BoxFuture<'_, Result<(), HarnessError>>;
         Place the captured state where this harness expects it on this node,
-        rewriting paths from `from_root` to `to_root`.
+        rewriting paths from `from_root` to `to_root` when they differ.
 
-    async fn launch(&self, workspace: &Path, resume: ResumeHint) -> Result<Child, HarnessError>;
+    fn launch(&self, workspace: &Path, resume: ResumeHint) -> BoxFuture<'_, Result<Child, HarnessError>>;
         Start the harness so that it continues the same session.
 }
 
@@ -39,7 +39,7 @@ Captured    = { entries: [Entry], absolute_roots: [PathBuf], redactions: [Redact
 RedactionReport = { rule: String, count: u32 }
 ```
 
-The core calls these four in order during suspend (`detect`, `capture`) and resume (`restore`, `launch`). It stores whatever `capture` produced as the `harness_state` tree of the snapshot (ADR 0004) and never opens it.
+The harness is chosen at runtime from the ledger (`--harness codex` on a job created under Claude Code), so the core holds a `Box<dyn Harness>`. The methods return `BoxFuture`, defined in `fabric-core` (ADR 0005), because native `async fn` in a trait is not dyn compatible on the pinned toolchain and its futures cannot be required to be `Send`. The core calls these four in order during suspend (`detect`, `capture`) and resume (`restore`, `launch`). It stores whatever `capture` produced as the `harness_state` tree of the snapshot (ADR 0004) and never opens it.
 
 ### ACP is the generic path
 

@@ -21,16 +21,20 @@ The traffic is: small control messages (ledger events, lease claims, manifest fe
 Defined in `fabric-core`, implemented in `fabric-net`.
 
 ```text
-trait Transport {
-    async fn connect(&self, peer: NodeId, addrs: &[SocketAddr]) -> Result<Connection, TransportError>;
-    async fn accept(&self) -> Result<(NodeId, Connection), TransportError>;
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+trait Transport: Send + Sync {
+    fn connect(&self, peer: NodeId, addrs: &[SocketAddr]) -> BoxFuture<'_, Result<Box<dyn Connection>, TransportError>>;
+    fn accept(&self) -> BoxFuture<'_, Result<(NodeId, Box<dyn Connection>), TransportError>>;
 }
-trait Connection {
-    async fn open(&self) -> Result<Stream, TransportError>;     bidirectional byte stream
-    async fn next(&self) -> Result<Stream, TransportError>;     peer-opened stream
+trait Connection: Send + Sync {
+    fn open(&self) -> BoxFuture<'_, Result<Stream, TransportError>>;     bidirectional byte stream
+    fn next(&self) -> BoxFuture<'_, Result<Stream, TransportError>>;     peer-opened stream
     fn peer(&self) -> NodeId;
 }
 ```
+
+The transport is chosen at runtime (QUIC, then the TCP fallback), so the core holds a `Box<dyn Transport>` and spawns its futures on tokio. On the pinned toolchain a trait with native `async fn` is not dyn compatible, and return-type notation for `Send` bounds is unstable, so the methods return a boxed `Send` future instead. `BoxFuture` is defined once in `fabric-core` and is the shape of every trait the core dispatches dynamically (`Harness` in ADR 0006 uses the same one). One allocation per call is nothing next to a network round trip.
 
 The core talks to a `Connection` and `Stream` and nothing else. Everything below the trait is replaceable.
 
