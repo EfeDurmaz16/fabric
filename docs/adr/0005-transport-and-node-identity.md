@@ -55,18 +55,18 @@ Some networks drop or rate-limit UDP. The same `rustls` config runs over a `toki
 
 ### Framing
 
-Every message on a control stream is `u32 length | u8 version | postcard(Message)`. A control frame longer than 1 MiB is a protocol error and closes the connection; a bulk `Chunk` frame is bounded by the chunk size cap of ADR 0004 plus framing, and a chunk whose zstd frame declares, or decompresses to, more than 256 KiB is rejected before allocation. A peer cannot make a node allocate more than one frame's worth of memory per stream. Every `Message` carries `job_id` and `epoch` (ADR 0003). The first message on a new connection is `Hello { node, fabric_version, clock_ms }` in both directions; a clock difference over 10 seconds is logged and reported.
+Every message on a control stream is `u32 length | u8 version | postcard(Message)`. A control frame longer than 1 MiB is a protocol error and closes the connection; a bulk `Chunk` frame is bounded by the chunk size cap of ADR 0004 plus framing, and a chunk whose zstd frame declares, or decompresses to, more than 256 KiB is rejected before allocation. A peer cannot make a node allocate more than one frame's worth of memory per stream. Nothing of unbounded size is ever a control message: ledger records are small by construction, and manifests go over the bulk path as chunks (Blob transfer, below). Every `Message` carries `job_id` and `epoch` (ADR 0003). The first message on a new connection is `Hello { node, fabric_version, clock_ms }` in both directions; a clock difference over 10 seconds is logged and reported.
 
 ### Blob transfer
 
 Streams are per request. A fetch is:
 
-1. `WantSnapshot { snapshot }` on a control stream; peer replies with the manifest.
-2. Requester computes the missing chunk set from its catalog and sends `WantChunks { ids: [...] }` in batches of up to 256 ids on a bulk stream.
+1. `WantSnapshot { snapshot }` on a control stream; peer replies `ManifestChunks { len, ids }`, the manifest's byte length and ordered chunk list. The manifest itself never travels on a control stream: a manifest with `node_modules` in it is several megabytes and a control frame is capped at 1 MiB. The id list for a 64 MiB manifest is about 32 KiB, so the reply always fits. A `len` above the 64 MiB manifest cap of ADR 0004 is refused before any chunk is requested.
+2. Requester fetches the manifest chunks exactly as in steps 3 and 4, assembles them, checks that blake3 of the bytes equals `snapshot`, and decodes under the size cap. Only then does it compute the missing chunk set from its catalog and send `WantChunks { ids: [...] }` in batches of up to 256 ids on a bulk stream.
 3. Peer streams `Chunk { id, bytes }` records. Each is verified by blake3 on arrival and written with the publish discipline of ADR 0004.
 4. On any failure the requester recomputes the missing set from its catalog and sends a new batch. Nothing is tracked in memory that is not also in the catalog.
 
-A chunk is never requested by offset; only by id. There is no partial-chunk resume because chunks are small.
+A chunk is never requested by offset; only by id. There is no partial-chunk resume because chunks are small. The only size a peer can declare is `len`, and it is checked against the cap and against the assembled bytes, so a hostile peer cannot make a node allocate more than one frame plus one manifest cap.
 
 ### Pairing first, discovery second
 

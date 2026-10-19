@@ -22,6 +22,8 @@ store/
   tmp/                 staging for in-flight writes, cleared by the lock holder at open
 ```
 
+A manifest is a blob like any file. Its bytes are chunked with the same FastCDC parameters and stored under `chunks/`, and the `snapshots` row records the manifest's byte length and its ordered chunk list next to the `SnapshotId`, which is blake3 of the whole manifest bytes. The file under `manifests/` is the assembled copy that readers decode. This is what lets a manifest cross the network on the bulk path (ADR 0005): a `node_modules` tree has tens of thousands of entries, so a manifest is megabytes, and the control stream carries at most 1 MiB per frame. A reader decodes a manifest only after the assembled bytes hash to the `SnapshotId`, and only up to 64 MiB; a longer manifest is `ManifestError::TooLarge { len }` before any entry is decoded. gc treats a snapshot's manifest chunks as reachable from the snapshot.
+
 ### One writer per data directory
 
 Exactly one process writes `<fabric-data>` at a time. It takes an exclusive `flock` on `<fabric-data>/lock` at open and holds it until exit. While `fabric node serve` runs, it holds the lock, and every CLI command that writes (`suspend`, `resume`, `store gc`, `orphan export`) is sent to it over the Unix socket `<fabric-data>/node.sock`; the CLI prints the node's answer. When no node is running, the CLI takes the lock itself and acts as the node for the duration of the command. A second opener that cannot get the lock fails with `StoreLocked { pid }`; it never waits silently and never proceeds, so a CLI opening the store mid-publish cannot clear the daemon's staged files. `tmp/` is cleared by the lock holder at open and by nobody else.
@@ -83,10 +85,10 @@ Entry { rel_path: RelPath, kind: File | Dir | Symlink { target: String }, mode: 
 
 ### Publish: atomic, crash-safe
 
-1. For each new chunk: write to `tmp/<random>`, `fsync` the file, `rename` to `chunks/ab/cdef...`. Rename on the same filesystem is atomic; a crash leaves either nothing or a complete chunk under its final name. An existing final name means the chunk is already present and the temp file is deleted.
+1. For each new chunk, including the chunks of the manifest itself: write to `tmp/<random>`, `fsync` the file, `rename` to `chunks/ab/cdef...`. Rename on the same filesystem is atomic; a crash leaves either nothing or a complete chunk under its final name. An existing final name means the chunk is already present and the temp file is deleted.
 2. Insert chunk rows into the catalog in one transaction after all renames.
-3. Write the manifest to `tmp/`, `fsync`, rename into `manifests/`.
-4. Insert the snapshot row and `snapshot_chunks` rows in one transaction.
+3. Write the assembled manifest to `tmp/`, `fsync`, rename into `manifests/`.
+4. Insert the snapshot row (id, byte length, manifest chunk list) and `snapshot_chunks` rows in one transaction.
 5. `fsync` the `manifests/` and `chunks/` directories.
 6. Only now append `SnapshotPublished` to the job ledger (ADR 0002).
 
@@ -133,7 +135,7 @@ Restore is idempotent by marker: a second restore of the same snapshot into the 
 
 ### Transfer
 
-A node fetches a snapshot by manifest id, then asks the peer for the chunk ids it does not have, in batches. Each chunk is verified on arrival. A dropped connection resumes from the catalog's view of what is present (ADR 0005).
+A node fetches a snapshot by id: it asks the peer for the manifest's byte length and chunk list, fetches those chunks like any file, assembles the manifest, checks that the bytes hash to the id, decodes it under the size cap, and only then asks for the chunk ids it does not have, in batches. Each chunk is verified on arrival. A dropped connection resumes from the catalog's view of what is present (ADR 0005).
 
 ## Alternatives considered
 
