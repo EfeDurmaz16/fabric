@@ -51,8 +51,12 @@ JobManifest  = { version, job_id, goal, harness_kind, env_spec: EnvSpecId,
                  latest_snapshot: Option<SnapshotId>, lease: LeaseState }
 LeaseState   = Free | Held { node, epoch, expires_at } | Released { epoch }
 
-SnapshotManifest = { version, job_id, parent: Option<SnapshotId>, created_at,
-                     platform: { os, arch }, entries: [Entry], harness_state: [Entry] }
+SnapshotManifest = { version, job_id, parent: Option<SnapshotId>, created_at, created_by,
+                     platform: { os, arch }, git: Option<GitState>, files: [Entry],
+                     harness_state: [Entry], env_spec: Option<EnvSpecId> }
+GitState     = { bundle, bundle_base, refs, head, index_commit, worktree_commit,
+                 worktree_mtimes, config, exclude }
+Marker       = { job_id, snapshot, state: Clean | Dirty | Restoring { target } }
 Entry        = { rel_path: RelPath, kind: File | Dir | Symlink, mode, mtime_ns, chunks: [ChunkId], size }
 
 EnvSpec      = { version, tools: [{ name, version, source }], setup: [{ argv, cwd, when }],
