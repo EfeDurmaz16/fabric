@@ -175,6 +175,20 @@ impl GitConfigValue {
         }
         Ok(Self(text.to_owned()))
     }
+
+    /// Returns true when the value is a `scheme://` URL whose authority holds
+    /// userinfo, which is where a token lives in a remote URL.
+    ///
+    /// The scp-like form `git@host:path` has no scheme and no password slot,
+    /// so it is not userinfo by this rule.
+    #[must_use]
+    pub fn has_userinfo(&self) -> bool {
+        let Some((_, rest)) = self.0.split_once("://") else {
+            return false;
+        };
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        rest[..end].contains('@')
+    }
 }
 
 /// A repository config key that a snapshot may carry; exactly the allowlist of ADR 0004.
@@ -183,9 +197,9 @@ impl GitConfigValue {
 /// key fails to decode.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GitConfigKey {
-    /// `remote.<name>.url`, with any userinfo stripped at capture.
+    /// `remote.<name>.url`; userinfo is stripped at capture and refused on decode.
     RemoteUrl(RemoteName),
-    /// `remote.<name>.pushurl`, with any userinfo stripped at capture.
+    /// `remote.<name>.pushurl`; userinfo is stripped at capture and refused on decode.
     RemotePushUrl(RemoteName),
     /// `remote.<name>.fetch`.
     RemoteFetch(RemoteName),
@@ -206,6 +220,15 @@ pub enum GitConfigKey {
 }
 
 impl GitConfigKey {
+    /// Returns true for the keys whose value is a remote URL, which must carry no userinfo.
+    #[must_use]
+    pub const fn is_remote_url(&self) -> bool {
+        matches!(
+            self,
+            GitConfigKey::RemoteUrl(_) | GitConfigKey::RemotePushUrl(_)
+        )
+    }
+
     /// Parses the text form of a key, refusing every key outside the allowlist.
     pub fn parse(text: &str) -> Result<Self, GitNameError> {
         let denied = || GitNameError::KeyNotAllowed(text.to_owned());
@@ -369,6 +392,33 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn a_url_value_knows_when_it_carries_userinfo() {
+        let with = |v: &str| GitConfigValue::parse(v).unwrap().has_userinfo();
+        assert!(with("https://efe:ghp_secret123@github.com/x/y.git"));
+        assert!(with("https://token@github.com/x/y.git"));
+        assert!(with("ssh://git@github.com/x/y.git"));
+        assert!(!with("https://github.com/x/y.git"));
+        assert!(!with("https://github.com/x/y.git?u=a@b"));
+        assert!(!with("git@github.com:x/y.git"));
+        assert!(!with("/srv/git/y.git"));
+        assert!(
+            GitConfigKey::parse("remote.origin.url")
+                .unwrap()
+                .is_remote_url()
+        );
+        assert!(
+            GitConfigKey::parse("remote.origin.pushurl")
+                .unwrap()
+                .is_remote_url()
+        );
+        assert!(
+            !GitConfigKey::parse("remote.origin.fetch")
+                .unwrap()
+                .is_remote_url()
+        );
     }
 
     #[test]

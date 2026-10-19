@@ -458,9 +458,8 @@ fn an_entry_below_a_file_or_symlink_is_refused() {
     assert!(m.encode().is_ok());
 }
 
-/// Returns the fixed manifest's bytes with the one string `good` replaced by `bad`.
-fn patched(good: &str, bad: &str) -> Result<Vec<u8>, Box<dyn Error>> {
-    let bytes = fixed_manifest()?.encode()?;
+/// Returns `bytes` with the one string `good` replaced by `bad`.
+fn patch(bytes: &[u8], good: &str, bad: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     let good = postcard::to_stdvec(good)?;
     let bad = postcard::to_stdvec(bad)?;
     let pos = bytes
@@ -471,6 +470,11 @@ fn patched(good: &str, bad: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     out.extend_from_slice(&bad);
     out.extend_from_slice(&bytes[pos + good.len()..]);
     Ok(out)
+}
+
+/// Returns the fixed manifest's bytes with the one string `good` replaced by `bad`.
+fn patched(good: &str, bad: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    patch(&fixed_manifest()?.encode()?, good, bad)
 }
 
 #[test]
@@ -495,6 +499,26 @@ fn a_denied_config_key_on_the_wire_does_not_decode() {
     assert!(matches!(
         SnapshotManifest::decode(&bytes),
         Err(ManifestError::Codec(_))
+    ));
+}
+
+/// ADR 0004 strips userinfo from remote URLs at capture. The receiving node
+/// enforces the same line, so a token in `remote.origin.url` never decodes
+/// and is never written into a target's `.git/config`.
+#[test]
+fn a_remote_url_with_userinfo_on_the_wire_does_not_decode() {
+    let bytes = patched("push.default", "remote.origin.url").unwrap();
+    let clean = patch(&bytes, "simple", "https://github.com/x/y.git").unwrap();
+    assert!(SnapshotManifest::decode(&clean).is_ok());
+    let token = patch(
+        &bytes,
+        "simple",
+        "https://efe:ghp_secret123@github.com/x/y.git",
+    )
+    .unwrap();
+    assert!(matches!(
+        SnapshotManifest::decode(&token),
+        Err(ManifestError::SecretInConfig { index: 0 })
     ));
 }
 
