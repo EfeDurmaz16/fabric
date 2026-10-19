@@ -18,15 +18,14 @@ use fabric_core::path::RelPath;
 
 /// Patterns that apply everywhere, inside caches included.
 ///
-/// These are the high-confidence names: a file with one of them inside
-/// `node_modules` is still a secret.
+/// Exact names only. A glob here makes a dependency tree uncarriable:
+/// measured on real `node_modules` trees, `credentials*` matched
+/// `@auth/core/providers/credentials.js`, `@aws-sdk/types/dist-types/credentials.d.ts`
+/// and `google-auth-library/build/src/auth/credentials.js`, and `id_*`
+/// matched the `ssh2` test fixtures. Those globs apply outside caches.
 const EVERYWHERE: &[&str] = &[
     ".env",
-    ".env.*",
     ".envrc",
-    "id_*",
-    "credentials*",
-    ".credentials*",
     ".netrc",
     ".npmrc",
     ".pypirc",
@@ -38,9 +37,14 @@ const EVERYWHERE: &[&str] = &[
 
 /// Patterns that apply outside caches only.
 ///
-/// Many npm packages ship `*.pem` and `*.key` test fixtures, and a cache with
+/// Many npm packages ship `*.pem` and `*.key` test fixtures, source files
+/// named `credentials.js` and `.env.example` samples, and a cache with
 /// holes looks warm and is broken, so inside a cache these do not apply.
 const OUTSIDE_CACHES: &[&str] = &[
+    ".env.*",
+    "id_*",
+    "credentials*",
+    ".credentials*",
     "*.env",
     "*.pem",
     "*.key",
@@ -346,11 +350,7 @@ mod tests {
     fn every_builtin_pattern_denies_its_sample_at_the_top_and_nested() {
         let everywhere = [
             (".env", ".env"),
-            (".env.local", ".env.*"),
             (".envrc", ".envrc"),
-            ("id_ed25519", "id_*"),
-            ("credentials.json", "credentials*"),
-            (".credentials.json", ".credentials*"),
             (".netrc", ".netrc"),
             (".npmrc", ".npmrc"),
             (".pypirc", ".pypirc"),
@@ -360,6 +360,10 @@ mod tests {
             (".gnupg/pubring.kbx", ".gnupg"),
         ];
         let outside_caches = [
+            (".env.local", ".env.*"),
+            ("id_ed25519", "id_*"),
+            ("credentials.json", "credentials*"),
+            (".credentials.json", ".credentials*"),
             ("prod.env", "*.env"),
             ("server.pem", "*.pem"),
             ("server.key", "*.key"),
