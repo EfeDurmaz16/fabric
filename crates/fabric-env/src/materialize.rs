@@ -28,7 +28,9 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use fabric_core::env::{EnvVarName, RunWhen, SetupStep};
 use fabric_core::harness::ProgramName;
@@ -42,6 +44,9 @@ pub const SETUP_LOG_TARGET: &str = "fabric_env::setup";
 
 /// The most bytes of output one log event carries.
 const MAX_LINE: u64 = 64 << 10;
+
+/// How long a step's output may stay open after the step exits before `execute` moves on.
+const OUTPUT_GRACE: Duration = Duration::from_secs(1);
 
 /// Why materialize could not plan or finish.
 #[derive(Debug, thiserror::Error)]
@@ -423,25 +428,43 @@ fn run_step(planned: &PlannedStep, program: &Path) -> Result<(), MaterializeErro
             program: name.clone(),
             source,
         })?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
     // Lines are logged from reader threads, which do not inherit the
     // caller's scoped subscriber; hand it to them.
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
-    let status = thread::scope(|scope| {
-        if let Some(out) = stdout {
-            spawn_reader(scope, out, "stdout", index, name, &dispatch);
-        }
-        if let Some(err) = stderr {
-            spawn_reader(scope, err, "stderr", index, name, &dispatch);
-        }
-        child.wait()
-    })
-    .map_err(|source| MaterializeError::Wait {
+    let (done, finished) = mpsc::channel();
+    let mut open = 0;
+    if let Some(out) = child.stdout.take() {
+        open += spawn_reader(out, "stdout", index, name, &dispatch, done.clone());
+    }
+    if let Some(err) = child.stderr.take() {
+        open += spawn_reader(err, "stderr", index, name, &dispatch, done.clone());
+    }
+    drop(done);
+    let status = child.wait().map_err(|source| MaterializeError::Wait {
         index,
         program: name.clone(),
         source,
     })?;
+    // A pipe reaches EOF only when every process holding it has exited. A
+    // step that started a daemon leaves it open, so the readers get a
+    // bounded grace after the step itself exits and then keep running on
+    // their own; whatever they read later still reaches the log.
+    let deadline = Instant::now() + OUTPUT_GRACE;
+    while open > 0 {
+        match finished.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(()) => open -= 1,
+            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {
+                tracing::warn!(
+                    target: SETUP_LOG_TARGET,
+                    step = index,
+                    program = %name,
+                    "setup step exited but its output is still open: a process it started is still running"
+                );
+                break;
+            }
+        }
+    }
     if !status.success() {
         return Err(MaterializeError::StepFailed {
             index,
@@ -453,23 +476,31 @@ fn run_step(planned: &PlannedStep, program: &Path) -> Result<(), MaterializeErro
     Ok(())
 }
 
-/// Starts a thread that forwards `pipe` to the log.
+/// Starts a thread that forwards `pipe` to the log and reports on `done` at EOF; returns how many threads started.
 ///
 /// If the thread cannot start, the pipe is dropped with the closure, so the
 /// program's writes to it fail instead of filling a pipe nobody reads.
-fn spawn_reader<'scope, 'env: 'scope>(
-    scope: &'scope thread::Scope<'scope, 'env>,
-    pipe: impl Read + Send + 'scope,
+fn spawn_reader(
+    pipe: impl Read + Send + 'static,
     stream: &'static str,
     index: usize,
-    program: &'env ProgramName,
-    dispatch: &'env Dispatch,
-) {
-    let spawned = thread::Builder::new().spawn_scoped(scope, move || {
-        forward(pipe, stream, index, program, dispatch);
+    program: &ProgramName,
+    dispatch: &Dispatch,
+    done: Sender<()>,
+) -> usize {
+    let owned = program.clone();
+    let dispatch = dispatch.clone();
+    let spawned = thread::Builder::new().spawn(move || {
+        forward(pipe, stream, index, &owned, &dispatch);
+        // The receiver is gone once run_step has moved on; nothing is owed then.
+        done.send(()).ok();
     });
-    if let Err(err) = spawned {
-        tracing::warn!(target: SETUP_LOG_TARGET, step = index, program = %program, stream, error = %err, "could not start a reader; this output is dropped");
+    match spawned {
+        Ok(_) => 1,
+        Err(err) => {
+            tracing::warn!(target: SETUP_LOG_TARGET, step = index, program = %program, stream, error = %err, "could not start a reader; this output is dropped");
+            0
+        }
     }
 }
 

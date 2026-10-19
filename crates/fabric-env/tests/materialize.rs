@@ -12,6 +12,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use fabric_core::env::EnvVarName;
 use fabric_env::detect::{Detection, detect};
@@ -437,4 +438,30 @@ fn a_report_without_caches_runs_its_steps_on_every_resume() {
     assert_eq!(planned.steps().len(), 1);
     planned.execute().unwrap();
     assert!(dir.path().join("ran").exists());
+}
+
+/// A pipe closes only when every holder exits. A step that leaves a
+/// process behind, as daemon-starting postinstall scripts do, must not hold
+/// the resume until that process ends.
+#[test]
+fn a_step_that_leaves_a_process_behind_does_not_hold_the_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let detected = declared(
+        dir.path(),
+        r#"
+[[setup]]
+program = "sh"
+args = ["-c", "sleep 4 & echo started"]
+when = "always"
+"#,
+    )
+    .unwrap();
+    let planned = plan(dir.path(), &detected).unwrap();
+    let started = Instant::now();
+    planned.execute().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
 }
