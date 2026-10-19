@@ -26,3 +26,6 @@ pub mod policy;
 pub mod restore;
 pub mod store;
 pub mod writer;
+
+#[cfg(test)]
+mod crash_tests;
