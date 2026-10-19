@@ -56,7 +56,8 @@ SnapshotManifest = { version, job_id, parent: Option<SnapshotId>, created_at, cr
                      harness_state: [Entry], env_spec: Option<EnvSpecId> }
 GitState     = { bundle, bundle_base, refs, head, index_commit, worktree_commit,
                  worktree_mtimes, config, exclude }
-Marker       = { job_id, snapshot, state: Clean | Dirty | Restoring { target } }
+Marker       = { root, job_id, base: Option<SnapshotId>, state: Clean | Dirty | Restoring { target } }
+               node-local, at <fabric-data>/jobs/<job-id>/marker, never inside the workspace
 Entry        = { rel_path: RelPath, kind: File | Dir | Symlink, mode, mtime_ns, chunks: [ChunkId], size }
 
 EnvSpec      = { version, tools: [{ name, version, source }], setup: [{ argv, cwd, when }],

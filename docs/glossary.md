@@ -42,6 +42,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Manifest.** A versioned description of a job (job manifest) or of a snapshot (snapshot manifest). Manifests are the only files whose format Fabric promises to keep readable across versions.
 
+**Marker.** The node-local record under a job's directory that names a workspace root and says whether every managed byte in it is published (`Clean`), a harness has run since (`Dirty`), or a restore is in flight (`Restoring`). The guard on the only path where Fabric removes files. Never stored inside the workspace.
+
 **Materialize.** Run the EnvSpec setup steps on a node so that the job can run there.
 
 **Node.** A machine running the Fabric node process. Identified by an ed25519 public key.
