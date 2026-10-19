@@ -54,7 +54,7 @@ Agents whose state directory is unknown to Fabric cannot be captured and the ada
 
 These two get dedicated adapters because the first gate is Claude Code and the second harness is Codex, and because both have known native resume paths that ACP wraps:
 
-- Claude Code: state lives under the user's Claude projects directory keyed by workspace path; `restore` rewrites that key to the new root; `launch` uses native resume. Reuse of claude-handoff 0.3.0's exporter and redaction rules will be evaluated rather than rewritten (landscape section 8.1).
+- Claude Code: state lives under the user's Claude projects directory keyed by workspace path; `restore` places it under the same key because the root is identical on every node (ADR 0008), and `launch` uses native resume. Reuse of claude-handoff 0.3.0's exporter and redaction rules will be evaluated rather than rewritten (landscape section 8.1).
 - Codex: rollout files plus `thread/resume` over app-server, or the `codex-acp` adapter if it proves equal. Decide by testing both on the real gate.
 
 Each adapter is a module in `fabric-harness` behind a cargo feature. The core compiles with no adapter enabled.
@@ -68,6 +68,12 @@ For the Claude Code adapter the contract is concrete, because the research shows
 - Never included: `.credentials.json`, anything derived from the Keychain, `~/.claude.json` as a whole (it holds `oauthAccount`, `machineID`, `remoteControlMachineId`, `userID`), `sessions/`, `session-env/`, `shell-snapshots/`, `jobs/`, `daemon/`, `backups/`, `cache/`, `telemetry/`, `stats-cache.json`. Each node signs in once through Anthropic's own flow; carrying credentials would also breach the terms the research cites.
 - Redacted in the transcript and sidecars, following claude-handoff 0.3.0's rules: secret patterns, `.env` values that appear in tool results, the account email and the organization UUID in `session_context` and `credential_org` attachments.
 - A secret inside a signed `thinking` block cannot be edited without breaking the block (next section). The adapter then drops that whole block, which the API accepts, and counts it in the report.
+
+### Path rewrites: none by default, never inside a signature
+
+`restore(state, from_root, to_root)` with `from_root == to_root` performs no rewrite at all, and in v0 that is the only case the Claude Code adapter accepts (ADR 0008). The reason is a fact about the state, not caution: Claude Code thinking blocks carry an encrypted `signature`, and a modified block is rejected with a 400 on the next tool turn (research H1, item 2). A blanket rewrite of the transcript breaks the resumed session at its first tool call, which is exactly the first gate.
+
+When roots differ, which no v0 path allows for Claude Code, the adapter rewrites only the project directory key, `cwd` fields and sidecar references, following claude-handoff's placeholder rules at path-component boundaries, and never a `thinking` block or any field under a signature. The property test for this is stated now so that it exists before the code: for arbitrary roots, a rewritten transcript leaves every signed block byte-identical.
 
 ### Cross-harness resume is an experiment, not a promise
 
@@ -85,7 +91,7 @@ For the Claude Code adapter the contract is concrete, because the research shows
 - Adding a harness is one module and one feature flag. No core change.
 - A vendor changing its state layout breaks one adapter's tests, not the system.
 - `detect` returning `None` is a normal answer and the CLI explains it ("no Claude Code session found for this workspace").
-- Adapter tests are integration tests against the real CLI when installed, skipped with a clear message when it is not. Unit tests cover path rewriting with property tests over arbitrary roots.
+- Adapter tests are integration tests against the real CLI when installed, skipped with a clear message when it is not. Unit tests cover path rewriting with property tests over arbitrary roots, including the byte-identical signed block property above.
 
 ## Open questions
 

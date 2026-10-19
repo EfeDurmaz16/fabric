@@ -42,7 +42,7 @@ Fabric is a library and a CLI. It is not an MCP server and not a hub with a web 
 
 ## Consequences
 
-- Everything in the core is addressed by job id, snapshot id, chunk id or node id. No host paths in any persisted structure except inside opaque harness state, which the adapter rewrites on restore.
+- Everything in the core is addressed by job id, snapshot id, chunk id or node id. No host paths in any persisted structure except inside opaque harness state, which the adapter owns on restore.
 - Moving a job is: suspend here, resume there. Both verbs are first class and both are idempotent.
 - The schema for "what a harness needs to continue" is not designed up front. Each adapter declares it and the core stores it as bytes (ADR 0006).
 - A job can outlive every machine it has run on, as long as one node still holds its ledger and latest snapshot.

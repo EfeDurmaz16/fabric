@@ -56,7 +56,7 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Release.** The act of the lease holder giving up the lease at suspend time.
 
-**Restore.** Writing a snapshot into a fresh workspace on a node, or in place into a workspace whose marker says it holds only published bytes, with path rewrites.
+**Restore.** Writing a snapshot into a fresh workspace on a node, or in place into a workspace whose marker says it holds only published bytes. No path rewrites when the roots are equal, which is the v0 rule.
 
 **Snapshot commit.** One of the two git commits a capture makes with a private index: `I` for the index and `W` for the working tree. They carry uncommitted work inside a bundle without touching the user's index or refs.
 

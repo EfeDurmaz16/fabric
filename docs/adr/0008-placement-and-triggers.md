@@ -19,7 +19,9 @@ Still, the user must never type a folder or a machine name unless they want to. 
 3. Tie: the node where the command is being run.
 4. No node awake except the local one: the local one.
 
-The workspace path on the chosen node is `<fabric-data>/workspaces/<job-id>/` by default, or a per-node root the user configured once. The user never types it per job.
+The workspace path on the chosen node is `<fabric-data>/workspaces/<job-id>/`, where `<fabric-data>` defaults to `$HOME/.fabric`. The user never types it per job.
+
+The root is deliberately identical on every node with the same home path. The research is unambiguous that absolute paths are everywhere (pnpm `storeDir`, Cargo fingerprints, venv shebangs, Claude Code's session key and transcript) and that the cheapest correct answer is to never move the path (H5 item 2 and option P1; H1 option A). So v0 rule: a restore where the source root and the target root differ is refused by the Claude Code adapter with `RootMismatch { from, to }` before anything is written, and the message names both roots. A per-node root override exists only for the non-Claude adapters, and setting it is the user opting out of the guarantee. The two-Mac gate has the same username on both machines and never hits the refusal.
 
 That is the whole policy. No CPU, memory, battery or cost inputs in v0. Each would be a `PlacementInput` behind one trait, added when a real job needs it.
 
@@ -51,4 +53,5 @@ The watcher is the feature the research calls the strongest surviving claim (W2)
 ## Open questions
 
 - Should `resume` without `--on` ever pick a remote node, or should it always mean "here" and `fabric move` mean "there"? Leaning toward `resume` means here and `--on` means there, which makes the rule even smaller. Decide in the CLI stage.
+- Cross-home roots (macOS `/Users/x` to Linux `/home/x`): the candidate from the research is a root outside home such as `/opt/fabric/jobs/<job-id>/`, created once per node. Decide when a Linux node exists.
 - Time budget for a sleep-triggered suspend on macOS: the system gives little. Measure how long a snapshot of a real workspace takes before promising anything.
