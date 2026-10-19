@@ -6,11 +6,13 @@
 //! that is hashed: two manifests with the same fields have the same
 //! `SnapshotId` on every node and in every version of this crate that writes
 //! format version 1. A tree never places an entry below a file or a symlink,
-//! and no mode bit above the low nine travels.
+//! and no mode bit above the low nine is representable.
 
 use std::collections::HashSet;
 
-use serde::{Deserialize, Serialize};
+use std::fmt;
+
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::codec::{self, CodecError, VersionedError};
 use crate::git::{BranchName, GitConfigKey, GitConfigValue, GitOid, RefName};
@@ -45,12 +47,6 @@ pub enum ManifestError {
         /// Zero-based index of the entry, within its list.
         index: usize,
     },
-    /// An entry carries a mode bit above the low nine.
-    #[error("entry {index} has mode bits above 0o777")]
-    BadMode {
-        /// Zero-based index of the entry, within its tree.
-        index: usize,
-    },
     /// An entry lies below a path that an earlier entry says is a file or a symlink.
     #[error("entry {index} lies below a file or symlink entry")]
     UnderNonDir {
@@ -64,7 +60,8 @@ pub enum ManifestError {
         index: usize,
     },
     /// The bytes do not decode, or the value does not encode. A path that
-    /// breaks the rules of `RelPath` or `AbsPath` surfaces here too.
+    /// breaks the rules of `RelPath` or `AbsPath`, a git name outside its
+    /// rule and a mode bit above the low nine surface here too.
     #[error("manifest codec: {0}")]
     Codec(#[from] CodecError),
 }
@@ -112,10 +109,50 @@ pub struct Entry {
     pub rel_path: RelPath,
     /// What kind of entry it is, with the bytes when it is a file.
     pub kind: EntryKind,
-    /// Permission bits; only the low nine exist, `validate` refuses the rest.
-    pub mode: u32,
+    /// Permission bits; only the low nine exist.
+    pub mode: Mode,
     /// Modification time in nanoseconds since the Unix epoch.
     pub mtime_ns: u64,
+}
+
+/// The permission bits of a tree entry: the low nine and nothing else.
+///
+/// setuid, setgid and sticky never travel (ADR 0004). Capture masks them
+/// before it publishes, and a manifest that carries one does not decode:
+/// `Deserialize` goes through `Mode::new`. On the wire a mode is a varint,
+/// the same bytes as the `u32` it replaced.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct Mode(u16);
+
+impl Mode {
+    /// Wraps permission bits; `None` when a bit above `0o777` is set.
+    #[must_use]
+    pub const fn new(bits: u16) -> Option<Mode> {
+        if bits & !0o777 != 0 {
+            None
+        } else {
+            Some(Mode(bits))
+        }
+    }
+
+    /// Returns the bits.
+    #[must_use]
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+}
+
+impl fmt::Debug for Mode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Mode(0o{:03o})", self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Mode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bits = u16::deserialize(deserializer)?;
+        Mode::new(bits).ok_or_else(|| serde::de::Error::custom("mode bits above 0o777"))
+    }
 }
 
 /// The kind of a tree entry.
@@ -283,9 +320,6 @@ fn check_tree(list: &'static str, entries: &[Entry]) -> Result<(), ManifestError
     check_sorted(list, entries.iter().map(|e| &e.rel_path))?;
     let mut non_dirs = HashSet::new();
     for (index, entry) in entries.iter().enumerate() {
-        if entry.mode & !0o777 != 0 {
-            return Err(ManifestError::BadMode { index });
-        }
         let path = entry.rel_path.as_str();
         let under_non_dir = path
             .match_indices('/')

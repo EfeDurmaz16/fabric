@@ -8,10 +8,10 @@ use fabric_core::codec::CodecError;
 use fabric_core::git::{BranchName, GitConfigKey, GitConfigValue, GitOid, RefName};
 use fabric_core::harness::HarnessState;
 use fabric_core::id::{ChunkId, EnvSpecId, JobId, NodeId, SnapshotId};
-use fabric_core::path::{AbsPath, PathError, RelPath};
+use fabric_core::path::{AbsPath, RelPath};
 use fabric_core::snapshot::{
     CacheClass, CacheEntry, CarryKey, CarryState, Entry, EntryKind, GitHead, GitState,
-    MANIFEST_VERSION, ManifestError, Platform, SnapshotManifest,
+    MANIFEST_VERSION, ManifestError, Mode, Platform, SnapshotManifest,
 };
 use proptest::prelude::*;
 
@@ -46,7 +46,7 @@ fn entry() -> impl Strategy<Value = Entry> {
             Just(EntryKind::Dir),
             "[a-z/.]{1,12}".prop_map(|target| EntryKind::Symlink { target }),
         ],
-        any::<u32>().prop_map(|m| m & 0o777),
+        (0u16..=0o777).prop_filter_map("mode", Mode::new),
         any::<u64>(),
     )
         .prop_map(|(rel_path, kind, mode, mtime_ns)| Entry {
@@ -288,6 +288,10 @@ proptest! {
     }
 }
 
+fn mode(bits: u16) -> Result<Mode, Box<dyn Error>> {
+    Mode::new(bits).ok_or_else(|| format!("mode 0o{bits:o} has bits above 0o777").into())
+}
+
 fn fixed_manifest() -> Result<SnapshotManifest, Box<dyn Error>> {
     Ok(SnapshotManifest {
         job_id: JobId::from_bytes([1; 16]),
@@ -322,7 +326,7 @@ fn fixed_manifest() -> Result<SnapshotManifest, Box<dyn Error>> {
                 size: 3,
                 chunks: vec![ChunkId::of(b"abc")],
             },
-            mode: 0o644,
+            mode: mode(0o644)?,
             mtime_ns: 9,
         }],
         harness_state: HarnessState {
@@ -332,7 +336,7 @@ fn fixed_manifest() -> Result<SnapshotManifest, Box<dyn Error>> {
                     size: 0,
                     chunks: vec![],
                 },
-                mode: 0o600,
+                mode: mode(0o600)?,
                 mtime_ns: 11,
             }],
         },
@@ -363,11 +367,11 @@ fn format_version_one_hash_is_pinned() {
     );
 }
 
-fn dir(path: &str) -> Result<Entry, PathError> {
+fn dir(path: &str) -> Result<Entry, Box<dyn Error>> {
     Ok(Entry {
         rel_path: RelPath::parse(path)?,
         kind: EntryKind::Dir,
-        mode: 0o755,
+        mode: mode(0o755)?,
         mtime_ns: 1,
     })
 }
@@ -413,15 +417,27 @@ fn a_repeated_or_unsorted_path_is_refused() {
     ));
 }
 
-/// ADR 0004: setuid, setgid and sticky bits never travel. A peer manifest
-/// that carries them is refused rather than masked.
+/// ADR 0004: setuid, setgid and sticky bits never travel. `Mode` cannot hold
+/// them, so the only place they can appear is on the wire, where the
+/// manifest does not decode rather than being masked.
 #[test]
-fn a_mode_above_0o777_is_refused() {
-    let mut m = fixed_manifest().unwrap();
-    m.files[0].mode = 0o4755;
+fn a_mode_above_0o777_on_the_wire_does_not_decode() {
+    assert_eq!(Mode::new(0o4755), None);
+    let bytes = fixed_manifest().unwrap().encode().unwrap();
+    // The first file's mode 0o644 (varint a4 03) followed by its mtime 9.
+    let good = [0xa4, 0x03, 0x09];
+    let positions: Vec<usize> = bytes
+        .windows(good.len())
+        .enumerate()
+        .filter_map(|(i, w)| (w == good).then_some(i))
+        .collect();
+    assert_eq!(positions.len(), 1, "the mode bytes must be unambiguous");
+    let mut patched = bytes.clone();
+    // 0o4755 as a varint: ed 13.
+    patched.splice(positions[0]..positions[0] + 2, [0xed, 0x13]);
     assert!(matches!(
-        m.encode(),
-        Err(ManifestError::BadMode { index: 0 })
+        SnapshotManifest::decode(&patched),
+        Err(ManifestError::Codec(_))
     ));
 }
 
@@ -437,7 +453,7 @@ fn an_entry_below_a_file_or_symlink_is_refused() {
             kind: EntryKind::Symlink {
                 target: "../../.git".into(),
             },
-            mode: 0o777,
+            mode: mode(0o777).unwrap(),
             mtime_ns: 1,
         },
         dir("a/config").unwrap(),
