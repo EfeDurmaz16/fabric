@@ -28,6 +28,8 @@ pub mod session;
 pub mod acp;
 #[cfg(feature = "claude")]
 pub mod claude;
+#[cfg(feature = "codex")]
+pub mod codex;
 
 pub use error::HarnessError;
 pub use harness::{Harness, Installed, Io, Launch, Running};
