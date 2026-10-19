@@ -135,7 +135,7 @@ Quorum (three or more nodes, or a small witness) is a later ADR. The epoch and f
 ## Consequences
 
 - The lease state machine is small enough to property test exhaustively. Arbitrary interleavings of claim request, grant, lost reply, retry, renew, release, expire, crash, message loss and forced claim must keep three invariants: for any epoch the job's chain holds at most one `LeaseClaimed`; the chain never has two `Held` states naming different nodes without a `LeaseReleased` or a higher-epoch claim between them; the epoch never decreases. The only divergence between two nodes' views is the one a forced claim creates, and it resolves by the fork rule. The same test drives the fork rule with the named interleavings: a forced claim against a holder that later self-reclaims at the same epoch, two forced claims at the same epoch, and a forced claim against a holder that cycles to a higher epoch; in every run both nodes compute the same winner, exactly one harness survives, and every snapshot on the losing suffix is pinned.
-- Every network message type has an `epoch` field. There is no "control" channel without one.
+- Every per-job network message carries an `epoch` in its envelope (ADR 0005). The only frame without one is `Hello`, which names no job.
 - The orphan path is a real feature with a real command, not an error message.
 - Users will sometimes be told "no" (stale epoch, lease held). The message must say which node holds the lease and when it expires.
 

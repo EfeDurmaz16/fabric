@@ -6,7 +6,7 @@ Status: accepted, 2026-10-19
 
 Nodes must find each other, prove who they are, and move ledgers and chunks between them. Efe's constraint: no vendor dependency in networking. Tailscale may be present and is a fine network to run over, but Fabric must work on a plain LAN. iroh is a serious Rust option and the research lists it as the reuse candidate (`2026-10-19-competitor-landscape.md`, section 8.1); the same research notes n0 needed four years and 65 pre-releases to reach 1.0, which is the reason to keep it behind a trait rather than in the core.
 
-The traffic is: small control messages (ledger events, lease claims, manifest fetches) and bulk chunk transfer that must survive a dropped connection.
+The traffic is: small control messages (ledger events, lease claims, chunk lists) and bulk chunk transfer, manifests included, that must survive a dropped connection.
 
 ## Decision
 

@@ -40,7 +40,7 @@ EventKind =
   | LeaseReleased
   | SnapshotPublished { snapshot: SnapshotId, parent: Option<SnapshotId> }
   | Suspended { snapshot: SnapshotId }
-  | Resumed { node: NodeId, snapshot: SnapshotId, harness: HarnessKind }
+  | Resumed { node: NodeId, snapshot: Option<SnapshotId>, harness: HarnessKind }   None only for the Resumed that `fabric job init` appends
   | DecisionRecorded { text: String }
   | Note { text: String }
 ```
