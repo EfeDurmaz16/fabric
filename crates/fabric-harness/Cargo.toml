@@ -31,6 +31,14 @@ zstd = { version = "0.14", optional = true }
 proptest = { version = "1.12", default-features = false, features = ["std"] }
 tempfile = "3.27"
 
+# A fake ACP agent the integration tests start as a subprocess. It is a test
+# fixture, built only so `CARGO_BIN_EXE_fake-acp-agent` exists for the tests.
+[[bin]]
+name = "fake-acp-agent"
+path = "fixtures/fake_acp_agent/main.rs"
+test = false
+doc = false
+bench = false
 
 [lints]
 workspace = true

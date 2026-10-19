@@ -69,6 +69,9 @@ pub struct Running {
     pub session: Option<SessionId>,
     /// The child process; its pipes are set when `Io::Piped` was asked for.
     pub child: Child,
+    /// The protocol client, when the harness was started under `Io::Rpc`.
+    #[cfg(feature = "acp")]
+    pub acp: Option<crate::acp::client::AcpClient>,
 }
 
 impl std::fmt::Debug for Running {
@@ -92,6 +95,8 @@ impl Running {
             spawned_at_ms: crate::process::now_ms(),
             session,
             child,
+            #[cfg(feature = "acp")]
+            acp: None,
         }
     }
 }

@@ -149,6 +149,10 @@ pub enum HarnessError {
         /// The agent program.
         program: String,
     },
+    /// The Agent Client Protocol exchange failed.
+    #[cfg(feature = "acp")]
+    #[error("acp: {0}")]
+    Acp(#[from] crate::acp::client::AcpError),
 }
 
 impl HarnessError {
