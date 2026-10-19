@@ -9,3 +9,24 @@ rust-version = "1.97"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+missing_docs = "warn"
+
+# clippy::all stays at its defaults: setting it to warn would demote
+# clippy::correctness from deny to warn.
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Pedantic lints turned off on purpose:
+# - must_use_candidate fires on nearly every pure function. Put #[must_use]
+#   where ignoring the value is a bug.
+# - missing_errors_doc asks for an "# Errors" section on every fallible
+#   function. The thiserror enums already document each failure.
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+# Restriction lints that back the project rules. clippy.toml allows unwrap,
+# expect and panic inside tests.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "warn"
