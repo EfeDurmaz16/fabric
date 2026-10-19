@@ -140,9 +140,16 @@ struct Pattern {
 }
 
 impl Pattern {
+    /// Parses a pattern; gitignore syntax the in-process matcher does not
+    /// model (negation, comments, escapes and classes) is refused, so a
+    /// pattern can never mean one thing to git and another to the policy.
     fn parse(text: &str) -> Option<Pattern> {
         let text = text.strip_prefix("**/").unwrap_or(text);
-        if text.is_empty() || text.starts_with('/') || text.split('/').any(str::is_empty) {
+        if text.is_empty()
+            || text.starts_with(['/', '!', '#'])
+            || text.contains(['\\', '[', ']'])
+            || text.split('/').any(str::is_empty)
+        {
             return None;
         }
         Some(Pattern {
@@ -465,5 +472,9 @@ mod tests {
         assert!(p.gitignore_lines().contains("*.bak\n"));
         assert!(p.add_exclude("/abs").is_err());
         assert!(p.add_exclude("a//b").is_err());
+        assert!(p.add_exclude("!.env").is_err());
+        assert!(p.add_exclude("#x").is_err());
+        assert!(p.add_exclude("a[0-9]").is_err());
+        assert!(p.add_secret_pattern("\\!x").is_err());
     }
 }

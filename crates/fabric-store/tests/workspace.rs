@@ -20,7 +20,7 @@ use fabric_store::capture::{
 };
 use fabric_store::git::Git;
 use fabric_store::objects::ChunkParams;
-use fabric_store::policy::{IgnorePolicy, SECRET_PATTERNS};
+use fabric_store::policy::{IgnorePolicy, PolicyError, SECRET_PATTERNS};
 use fabric_store::restore::{
     Durability, RestoreError, RestoreReport, RestoreRequest, RestoreState, Verify, restore,
     restore_state, verify,
@@ -403,6 +403,98 @@ fn every_secret_pattern_keeps_its_file_out_of_the_manifest() {
     assert_eq!(manifest.caches.len(), 1);
     assert_eq!(manifest.caches[0].carry, CarryState::Partial);
     assert_eq!(report.denied.len(), SECRET_PATTERNS.len() * 2 + 1);
+}
+
+fn worktree_paths(
+    root: &Path,
+    manifest: &fabric_core::snapshot::SnapshotManifest,
+) -> Fallible<Vec<String>> {
+    let w = manifest
+        .git
+        .as_ref()
+        .ok_or("no git state")?
+        .worktree_commit
+        .clone();
+    Ok(
+        git_text(root, &["ls-tree", "-r", "--name-only", w.as_str()])?
+            .lines()
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+#[test]
+fn a_gitignore_negation_cannot_put_a_secret_into_the_worktree_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    make_repo(&root).unwrap();
+    fs::write(
+        root.join(".gitignore"),
+        "*.log\nnode_modules/\n*.local\n!.env.local\n",
+    )
+    .unwrap();
+    fs::write(root.join(".env.local"), "TOKEN=1\n").unwrap();
+    fs::create_dir(root.join("keys")).unwrap();
+    fs::write(root.join("keys/server.pem"), "pem\n").unwrap();
+    fs::write(root.join(".fabricignore"), "keys\n").unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let mut policy = IgnorePolicy::default();
+    policy.load_fabricignore(&root).unwrap();
+    let Captured { manifest, report } = capture(&store, &request(&root, &policy, None)).unwrap();
+
+    let mut denied = report.denied_untracked.clone();
+    denied.sort();
+    assert_eq!(
+        denied,
+        vec![
+            RelPath::parse(".env").unwrap(),
+            RelPath::parse(".env.local").unwrap(),
+            RelPath::parse("keys/server.pem").unwrap(),
+        ]
+    );
+    let paths = worktree_paths(&root, &manifest).unwrap();
+    assert!(paths.contains(&".gitignore".to_owned()));
+    assert!(paths.contains(&"new.txt".to_owned()));
+    for secret in [".env", ".env.local", "keys/server.pem"] {
+        assert!(
+            !paths.contains(&secret.to_owned()),
+            "{secret} in W: {paths:?}"
+        );
+    }
+    assert!(matches!(
+        policy.add_exclude("!.env"),
+        Err(PolicyError::BadPattern { .. })
+    ));
+}
+
+#[test]
+fn an_untracked_nested_repository_is_left_behind_and_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    make_repo(&root).unwrap();
+    let nested = root.join("nested");
+    fs::create_dir(&nested).unwrap();
+    fs::write(nested.join("inner.txt"), "inner\n").unwrap();
+    git(&nested).run(&["init", "-q"]).unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, report } = capture(&store, &request(&root, &policy, None)).unwrap();
+    assert_eq!(report.nested_repositories, vec!["nested".to_owned()]);
+    assert_eq!(
+        report.denied_untracked,
+        vec![RelPath::parse(".env").unwrap()]
+    );
+    let paths = worktree_paths(&root, &manifest).unwrap();
+    assert!(!paths.iter().any(|p| p.starts_with("nested")), "{paths:?}");
+
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    assert!(!target.join("nested").exists());
+    assert_eq!(
+        fs::read_to_string(target.join("new.txt")).unwrap(),
+        "untracked\n"
+    );
 }
 
 fn hostile_repo(root: &Path, outside: &Path) -> Fallible {

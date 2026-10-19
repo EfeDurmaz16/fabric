@@ -160,13 +160,21 @@ impl Git {
         Ok(self.output(args, &[])?.status.success())
     }
 
-    /// Runs git with `input` on stdin and returns stdout, failing on a nonzero status.
-    pub fn run_stdin(&self, args: &[&str], input: &[u8]) -> Result<Vec<u8>, GitError> {
+    /// Runs git with `input` on stdin and extra environment, and returns stdout, failing on a nonzero status.
+    pub fn run_stdin_env(
+        &self,
+        args: &[&str],
+        env: &[(&str, &OsStr)],
+        input: &[u8],
+    ) -> Result<Vec<u8>, GitError> {
         let mut cmd = self.command();
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
         let mut child = cmd.spawn().map_err(|source| GitError::Spawn { source })?;
         if let Some(mut stdin) = child.stdin.take() {
             // A closed pipe means git stopped reading, which the status reports.

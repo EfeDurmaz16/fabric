@@ -16,7 +16,7 @@ use std::thread;
 use std::time::Duration;
 
 use fabric_core::git::{BranchName, GitConfigKey, GitConfigValue, GitOid, RefName};
-use fabric_core::id::{EnvSpecId, JobId, NodeId, SnapshotId};
+use fabric_core::id::{ChunkId, EnvSpecId, JobId, NodeId, SnapshotId};
 use fabric_core::path::{AbsPath, PathError, RelPath};
 use fabric_core::snapshot::{
     CacheClass, CacheEntry, CarryKey, CarryState, Entry, EntryKind, GitHead, GitState,
@@ -109,13 +109,13 @@ pub struct CaptureReport {
     pub denied: Vec<RelPath>,
     /// Ignored paths excluded by `.fabricignore`.
     pub excluded: Vec<RelPath>,
-    /// Untracked paths kept out of the working-tree commit by the secret patterns.
+    /// Untracked paths removed from the working-tree commit by the secret patterns or the excludes.
     pub denied_untracked: Vec<RelPath>,
     /// Tracked paths that match a secret pattern; they travel in the bundle.
     pub tracked_secrets: Vec<RelPath>,
     /// Symlinks whose target is absolute or climbs above the root.
     pub escaping_symlinks: Vec<RelPath>,
-    /// Nested repositories left behind.
+    /// Nested repositories left behind, tracked submodules aside.
     pub nested_repositories: Vec<String>,
     /// Config keys whose remote URL lost its userinfo.
     pub stripped_userinfo: Vec<String>,
@@ -495,6 +495,16 @@ impl Capturer<'_> {
         Ok((entries, cache_entries))
     }
 
+    /// Stores a file capture made, removes it and counts it in the report.
+    fn store_scratch_file(&mut self, path: &Path) -> Result<Vec<ChunkId>, CaptureError> {
+        let stored = self.store.objects().put_file(path)?;
+        let _ = fs::remove_file(path);
+        self.report.new_objects += stored.new_objects;
+        self.report.new_bytes += stored.new_bytes;
+        self.report.bytes += stored.size;
+        Ok(stored.chunks)
+    }
+
     /// Captures a directory whole: every path, in order, no policy.
     fn tree_entries(&mut self, base: &Path) -> Result<Vec<Entry>, CaptureError> {
         let mut nested = Vec::new();
@@ -581,14 +591,21 @@ impl GitCapture<'_> {
         Ok(())
     }
 
-    /// Lists untracked, not ignored paths.
-    fn untracked(&self) -> Result<Vec<RelPath>, CaptureError> {
+    /// Lists untracked, not ignored paths; an untracked nested repository is reported, not listed.
+    fn untracked(&self, report: &mut CaptureReport) -> Result<Vec<RelPath>, CaptureError> {
         let out = self
             .git
             .run(&["ls-files", "--others", "--exclude-standard", "-z"])?;
-        Git::records(&out)
-            .map(|r| rel_path(Git::text("untracked path", r)?))
-            .collect()
+        let mut paths = Vec::new();
+        for record in Git::records(&out) {
+            let text = Git::text("untracked path", record)?;
+            if let Some(dir) = text.strip_suffix('/') {
+                report.nested_repositories.push(dir.to_owned());
+                continue;
+            }
+            paths.push(rel_path(text)?);
+        }
+        Ok(paths)
     }
 
     /// Lists tracked paths.
@@ -684,13 +701,22 @@ impl GitCapture<'_> {
     }
 
     /// Builds commit `W` from a private index seeded with `I`'s tree.
+    ///
+    /// `git add -A` runs with the policy's patterns as the lowest-precedence
+    /// excludes, which keeps most secrets out of the user's object store. A
+    /// negation in the repository's own ignore files can override that, so
+    /// the private index is then listed and every path that is not tracked
+    /// and that `leave_out` names is removed before the tree is written. The
+    /// removed paths are returned.
     fn worktree_commit(
         &self,
         index_tree: &str,
         head: Option<&GitOid>,
         index_commit: &GitOid,
         excludes: &str,
-    ) -> Result<GitOid, CaptureError> {
+        tracked: &BTreeSet<RelPath>,
+        leave_out: &dyn Fn(&RelPath) -> bool,
+    ) -> Result<(GitOid, Vec<RelPath>), CaptureError> {
         let index = durable::temp_path(&self.scratch);
         let exclude_file = durable::temp_path(&self.scratch);
         fs::write(&exclude_file, excludes).map_err(|e| io_err(&exclude_file, e))?;
@@ -700,8 +726,29 @@ impl GitCapture<'_> {
             let excludes_flag = format!("core.excludesFile={}", exclude_file.display());
             self.git
                 .run_env(&["-c", &excludes_flag, "add", "-A", "--"], &env)?;
+            let mut removed = Vec::new();
+            let listing = self.git.run_env(&["ls-files", "-z"], &env)?;
+            for record in Git::records(&listing) {
+                let rel = rel_path(Git::text("index path", record)?)?;
+                if !tracked.contains(&rel) && leave_out(&rel) {
+                    removed.push(rel);
+                }
+            }
+            if !removed.is_empty() {
+                let mut input = Vec::new();
+                for rel in &removed {
+                    input.extend_from_slice(rel.as_str().as_bytes());
+                    input.push(0);
+                }
+                self.git.run_stdin_env(
+                    &["update-index", "--force-remove", "-z", "--stdin"],
+                    &env,
+                    &input,
+                )?;
+            }
             let tree = self.git.run_text_env(&["write-tree"], &env)?;
-            self.commit_tree(&tree, head, Some(index_commit), "fabric worktree")
+            let commit = self.commit_tree(&tree, head, Some(index_commit), "fabric worktree")?;
+            Ok((commit, removed))
         })();
         let _ = fs::remove_file(&index);
         let _ = fs::remove_file(&exclude_file);
@@ -1005,7 +1052,7 @@ fn capture_git(
 ) -> Result<GitState, CaptureError> {
     let req = capturer.req;
     let policy = req.policy;
-    let untracked = gc.untracked()?;
+    let untracked = gc.untracked(&mut capturer.report)?;
     let mut too_large = Vec::new();
     for rel in &untracked {
         if policy.denies_anywhere(rel) {
@@ -1021,20 +1068,45 @@ fn capture_git(
     if !too_large.is_empty() && !req.allow_large_untracked {
         return Err(CaptureError::UntrackedTooLarge { paths: too_large });
     }
-    for rel in gc.tracked()? {
-        if policy.denies_anywhere(&rel) {
-            capturer.report.tracked_secrets.push(rel);
+    let tracked: BTreeSet<RelPath> = gc.tracked()?.into_iter().collect();
+    for rel in &tracked {
+        if policy.denies_anywhere(rel) {
+            capturer.report.tracked_secrets.push(rel.clone());
         }
     }
+    let nested: Vec<RelPath> = capturer
+        .report
+        .nested_repositories
+        .iter()
+        .map(|dir| rel_path(dir))
+        .collect::<Result<_, _>>()?;
 
     let head_commit = gc.head_commit()?;
     let (index_commit, index_tree) = gc.index_commit(head_commit.as_ref())?;
-    let worktree_commit = gc.worktree_commit(
+    let under_nested = |rel: &RelPath| nested.iter().any(|root| rel.starts_with(root));
+    // A nested repository without a commit makes `add -A` fail, so every
+    // nested root is excluded up front as well as removed afterwards.
+    let mut excludes = policy.gitignore_lines();
+    for root in &nested {
+        excludes.push('/');
+        excludes.push_str(root.as_str());
+        excludes.push_str("/\n");
+    }
+    let (worktree_commit, removed) = gc.worktree_commit(
         &index_tree,
         head_commit.as_ref(),
         &index_commit,
-        &policy.gitignore_lines(),
+        &excludes,
+        &tracked,
+        &|rel| policy.denies_anywhere(rel) || under_nested(rel),
     )?;
+    let denied = &mut capturer.report.denied_untracked;
+    for rel in removed {
+        if !under_nested(&rel) && !denied.contains(&rel) {
+            denied.push(rel);
+        }
+    }
+    denied.sort();
     let snap_ref = format!("{}{}", gc.snap_prefix(), worktree_commit.as_str());
     gc.git
         .run(&["update-ref", &snap_ref, worktree_commit.as_str()])?;
@@ -1052,22 +1124,8 @@ fn capture_git(
     };
     let (bundle_path, kind) = gc.bundle(&tips, chain_full)?;
     let (bundle, bundle_base) = match (bundle_path, kind) {
-        (Some(path), BundleKind::Incremental) => {
-            let stored = capturer.store.objects().put_file(&path)?;
-            let _ = fs::remove_file(&path);
-            capturer.report.new_objects += stored.new_objects;
-            capturer.report.new_bytes += stored.new_bytes;
-            capturer.report.bytes += stored.size;
-            (stored.chunks, parent_id)
-        }
-        (Some(path), _) => {
-            let stored = capturer.store.objects().put_file(&path)?;
-            let _ = fs::remove_file(&path);
-            capturer.report.new_objects += stored.new_objects;
-            capturer.report.new_bytes += stored.new_bytes;
-            capturer.report.bytes += stored.size;
-            (stored.chunks, None)
-        }
+        (Some(path), BundleKind::Incremental) => (capturer.store_scratch_file(&path)?, parent_id),
+        (Some(path), _) => (capturer.store_scratch_file(&path)?, None),
         (None, _) => (Vec::new(), parent_id),
     };
     capturer.report.bundle = kind;
