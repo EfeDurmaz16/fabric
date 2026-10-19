@@ -1,6 +1,7 @@
 //! Materialize over real directories: which steps a cache state selects,
-//! what a dry run leaves untouched, what refuses before anything runs, and
-//! how a step's output reaches the log.
+//! what a dry run leaves untouched and what refuses before anything runs.
+//! How a step's output reaches the log is in `step_output.rs`, alone in
+//! its own process.
 //!
 //! Each test builds its detection report the way a user would, by writing
 //! `.fabric/env.toml` into the workspace and running `detect`, so the plan
@@ -8,10 +9,9 @@
 
 use std::error::Error;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use fabric_core::env::{EnvVarName, RunWhen};
@@ -354,61 +354,30 @@ fn a_step_directory_may_not_leave_the_workspace() {
     assert_eq!(planned.steps()[0].dir(), expected);
 }
 
-/// A buffer the log writes into, shared with the test.
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
-
-impl Write for Captured {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut bytes = self
-            .0
-            .lock()
-            .map_err(|_| io::Error::other("log buffer poisoned"))?;
-        bytes.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Output is logged from reader threads, which would drop it if they did
-/// not carry the caller's subscriber.
+/// A pipe closes only when every holder exits. A step that leaves a
+/// process behind, as daemon-starting postinstall scripts do, must not hold
+/// the resume until that process ends.
 #[test]
-fn step_output_reaches_the_callers_log_line_by_line() {
+fn a_step_that_leaves_a_process_behind_does_not_hold_the_resume() {
     let dir = tempfile::tempdir().unwrap();
     let detected = declared(
         dir.path(),
         r#"
 [[setup]]
 program = "sh"
-args = ["-c", "echo first-out; echo first-err >&2; echo second-out"]
+args = ["-c", "sleep 4 & echo started"]
 when = "always"
 "#,
     )
     .unwrap();
     let planned = plan(dir.path(), &detected).unwrap();
-    let captured = Captured::default();
-    let writer = captured.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || writer.clone())
-        .with_ansi(false)
-        .without_time()
-        .finish();
-    tracing::subscriber::with_default(subscriber, || planned.execute()).unwrap();
-    let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
-    let lines: Vec<&str> = log
-        .lines()
-        .filter(|line| line.contains("fabric_env::setup") && line.contains("stream="))
-        .collect();
-    assert_eq!(lines.len(), 3, "{log}");
-    let first_out = lines.iter().position(|l| l.contains("first-out")).unwrap();
-    let second_out = lines.iter().position(|l| l.contains("second-out")).unwrap();
-    assert!(first_out < second_out);
-    assert!(lines[first_out].contains("stream=\"stdout\""));
-    let err = lines.iter().find(|l| l.contains("first-err")).unwrap();
-    assert!(err.contains("stream=\"stderr\""));
+    let started = Instant::now();
+    planned.execute().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 /// With no cache path nothing proves the workspace warm, so the steps run:
@@ -438,30 +407,4 @@ fn a_report_without_caches_runs_its_steps_on_every_resume() {
     assert_eq!(planned.steps().len(), 1);
     planned.execute().unwrap();
     assert!(dir.path().join("ran").exists());
-}
-
-/// A pipe closes only when every holder exits. A step that leaves a
-/// process behind, as daemon-starting postinstall scripts do, must not hold
-/// the resume until that process ends.
-#[test]
-fn a_step_that_leaves_a_process_behind_does_not_hold_the_resume() {
-    let dir = tempfile::tempdir().unwrap();
-    let detected = declared(
-        dir.path(),
-        r#"
-[[setup]]
-program = "sh"
-args = ["-c", "sleep 4 & echo started"]
-when = "always"
-"#,
-    )
-    .unwrap();
-    let planned = plan(dir.path(), &detected).unwrap();
-    let started = Instant::now();
-    planned.execute().unwrap();
-    assert!(
-        started.elapsed() < Duration::from_secs(3),
-        "{:?}",
-        started.elapsed()
-    );
 }
