@@ -46,7 +46,7 @@ The property test in Consequences is written against this protocol: with one arb
 
 Every message between nodes about a job carries the sender's epoch. Every write (ledger append, blob push, manifest update) carries it too. A node that knows a higher epoch for that job refuses the message with `StaleEpoch { yours, current }`. There is no override flag.
 
-A harness launched at epoch N is killed by the node if the node learns of epoch N+1. The node checks the epoch before every write it performs on the harness's behalf.
+Fencing covers the writes Fabric performs: ledger appends, blob pushes, manifest updates, renewals. The harness writes to its workspace directly, and Fabric performs no write on its behalf. The only control over the harness is the kill: a harness launched at epoch N is killed by the node when the node learns of epoch N+1, and until the node learns it (which, for a sleeping node, is when it wakes) the harness keeps editing. Everything it wrote after the last published snapshot is preserved by the orphan path below, never by fencing.
 
 ### Expiry and clock skew
 
