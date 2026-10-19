@@ -11,7 +11,7 @@ Design only. There is no working code.
 | What | State |
 |---|---|
 | Architecture page and glossary | Written: [docs/architecture.md](docs/architecture.md), [docs/glossary.md](docs/glossary.md) |
-| ADRs 0001 to 0010 | Written, see below |
+| ADRs 0001 to 0012 | Written, see below; amended 2026-10-19 after the step 1 research |
 | `crates/fabric-core` | A cargo template with an `add` function. It will be replaced in the core stage. |
 | Every other crate in the layout | Does not exist yet |
 | CI | Not configured yet |
@@ -20,7 +20,7 @@ Nothing here suspends or resumes anything. Do not install it.
 
 ## First gate
 
-One job, adopted with `fabric job init` from a checkout where Claude Code is already running on a MacBook Pro, suspended, resumed on a MacBook Air over the network at the same path, `node_modules` included, safe under `kill -9` at every step. Two nodes, same OS and architecture, manual suspend and resume. When that passes, the next stages are the Codex adapter, the ACP adapter, and the sleep watcher.
+One job, adopted with `fabric job init` from a checkout where Claude Code is already running on a MacBook Pro, pushed to a MacBook Air with `fabric job move --to`, resumed there at the same absolute path, dependencies included when their carry key matches and rebuilt when it does not, safe under `kill -9` at every step. Two nodes, same user and home, same OS and architecture, different tool versions, explicit commands only. When that passes, the next stages are the Codex adapter, the ACP adapter, and the sleep watcher.
 
 ## Decisions
 
@@ -36,6 +36,8 @@ One job, adopted with `fabric job init` from a checkout where Claude Code is alr
 | [0008](docs/adr/0008-placement-and-triggers.md) | Placement and triggers |
 | [0009](docs/adr/0009-engineering-conventions.md) | Engineering conventions |
 | [0010](docs/adr/0010-name-and-scope-boundaries.md) | Name and scope boundaries |
+| [0011](docs/adr/0011-path-identity.md) | Path identity |
+| [0012](docs/adr/0012-dependency-carry.md) | Dependency carry |
 
 Start with the architecture page, then read the ADRs in order. ADR 0003 deserves the most attention; it is the one that protects the user's work. The research notes the ADRs cite are private and live outside this repository; the architecture page says what they are.
 
