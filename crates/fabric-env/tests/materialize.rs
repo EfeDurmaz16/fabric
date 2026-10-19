@@ -409,3 +409,32 @@ when = "always"
     let err = lines.iter().find(|l| l.contains("first-err")).unwrap();
     assert!(err.contains("stream=\"stderr\""));
 }
+
+/// With no cache path nothing proves the workspace warm, so the steps run:
+/// detection's `go mod download`, whose cache is outside the workspace, and
+/// a `[[setup]]` declared without a `[[cache]]`.
+#[test]
+fn a_report_without_caches_runs_its_steps_on_every_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        &[("go.mod", "module example.com/x\n\ngo 1.22.0\n")],
+    )
+    .unwrap();
+    let detected = detect(dir.path()).unwrap();
+    let planned = plan(dir.path(), &detected).unwrap();
+    assert!(planned.caches().is_empty());
+    assert_eq!(planned.steps().len(), 1);
+    assert_eq!(planned.steps()[0].step().program.as_str(), "go");
+
+    let dir = tempfile::tempdir().unwrap();
+    let detected = declared(
+        dir.path(),
+        "[[setup]]\nprogram = \"touch\"\nargs = [\"ran\"]\n",
+    )
+    .unwrap();
+    let planned = plan(dir.path(), &detected).unwrap();
+    assert_eq!(planned.steps().len(), 1);
+    planned.execute().unwrap();
+    assert!(dir.path().join("ran").exists());
+}

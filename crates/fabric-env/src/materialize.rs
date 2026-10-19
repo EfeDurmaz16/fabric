@@ -13,7 +13,9 @@
 //! the manager detection chose, whatever other lockfiles lie next to it,
 //! `.venv` needs `pyvenv.cfg`, and any other cache needs only to be
 //! non-empty. A first install killed halfway leaves a tree without its
-//! marker, so the next plan installs again.
+//! marker, so the next plan installs again. A report with no cache paths
+//! has nothing that proves warmth, so its `CachesMissing` steps run on
+//! every resume; declaring a `[[cache]]` is how a user makes them skip.
 //!
 //! The restore that runs before materialize writes a carried cache only when
 //! its carry key matches this node (ADR 0012), so what is on disk is what
@@ -305,7 +307,8 @@ pub fn plan(root: &Path, detected: &Detection) -> Result<Plan, MaterializeError>
             })
         })
         .collect::<Result<Vec<_>, MaterializeError>>()?;
-    let any_unhealthy = caches.iter().any(|c| c.health != CacheHealth::Healthy);
+    let any_unhealthy =
+        caches.is_empty() || caches.iter().any(|c| c.health != CacheHealth::Healthy);
 
     let mut steps = Vec::new();
     for (index, step) in spec.setup.iter().enumerate() {

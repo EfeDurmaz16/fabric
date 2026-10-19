@@ -18,6 +18,7 @@
 //! [[cache]]                        # added to the detected cache paths; when one
 //! path = ".output"                 # is missing on resume the setup steps run, so
 //! class = "build"                  # name what they rebuild; deps, build or tool-cache
+//!                                  # with no cache path at all the steps run every resume
 //!
 //! [[setup]]                        # any setup entry replaces every detected step
 //! program = "pnpm"
