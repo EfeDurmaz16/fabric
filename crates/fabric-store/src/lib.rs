@@ -20,4 +20,5 @@ pub mod catalog;
 mod checkpoint;
 mod durable;
 pub mod objects;
+pub mod policy;
 pub mod store;
