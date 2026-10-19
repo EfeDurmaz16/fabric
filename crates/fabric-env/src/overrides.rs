@@ -2,10 +2,11 @@
 //! job's environment on top of what detection finds.
 //!
 //! Invariant: the file names things and never carries a value. An
-//! environment variable is a parsed name, a setup argument shaped like a
-//! credential is refused, and no error from this module quotes text from
-//! the file: errors carry key paths, indexes and line numbers only, so a
-//! value the user wrote by mistake does not reach a terminal or a log.
+//! environment variable is a parsed name, a setup argument or tool pin
+//! shaped like a credential is refused, and no error from this module
+//! quotes text from the file: errors carry key paths, indexes and line
+//! numbers only, so a value the user wrote by mistake does not reach a
+//! terminal or a log.
 //!
 //! ```toml
 //! package_manager = "pnpm"         # npm, pnpm, yarn or bun; decides between lockfiles
@@ -33,7 +34,7 @@ use fabric_core::path::{PathError, RelPath};
 use fabric_core::snapshot::CacheClass;
 use toml::{Table, Value};
 
-use crate::detect::PackageManagerName;
+use crate::detect::{PackageManagerName, PinError, check_pin};
 use crate::secret::{self, Pattern, PatternError};
 
 /// Why the override file was refused.
@@ -126,6 +127,15 @@ pub enum OverrideError {
     DuplicateCache {
         /// The repeated path.
         path: RelPath,
+    },
+    /// A tool pin that is not a short printable version, or that is shaped like a credential.
+    #[error("`{key}` is not a version pin")]
+    Pin {
+        /// The dotted path of the key.
+        key: String,
+        /// What is wrong with it.
+        #[source]
+        reason: PinError,
     },
 }
 
@@ -261,7 +271,9 @@ fn tools(value: &Value) -> Result<Vec<(String, String)>, OverrideError> {
     table(value, "tools")?
         .iter()
         .map(|(tool, version)| {
-            let version = string(version, &format!("tools.{tool}"))?;
+            let key = format!("tools.{tool}");
+            let version = string(version, &key)?;
+            check_pin(version).map_err(|reason| OverrideError::Pin { key, reason })?;
             Ok((tool.clone(), version.to_owned()))
         })
         .collect()

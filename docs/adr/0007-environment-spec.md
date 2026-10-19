@@ -21,6 +21,7 @@ Amended 2026-10-19 while writing `fabric-env` (PR `feat/env`). Detection and mat
 7. "Is it warm" is the installer's own marker. Restore writes a carried cache only when its key matches and it is not partial (ADR 0012), so materialize inspects the disk instead of re-reading the snapshot's `caches`.
 8. Env var names come only from `env` in `.fabric/env.toml`. Scanning `.env.example` and source code for names is not built; a scan that guesses would put names in the spec that the user never chose.
 9. A spec with no cache paths runs its `CachesMissing` steps on every resume. "Is any cache missing" is vacuously false over an empty list, and under that reading `go mod download` (whose cache lives outside the workspace) and any `[[setup]]` declared without a `[[cache]]` would never run. Nothing in an empty list proves the workspace warm, so the steps run; a user who wants them skipped declares the path they rebuild as a `[[cache]]`.
+10. Detection reads regular files only. A symbolic link in its fixed list is refused with the file named, because `.nvmrc -> .env` would read a secret into the spec and `.nvmrc -> ../../.nvmrc` would give two nodes two specs from one workspace (found by the review of PR `feat/env`). Every pin, detected or declared, must be at most 64 printable ASCII characters and not shaped like a credential, the same guard setup arguments get, since pins travel in the spec too.
 
 ## Context
 
@@ -49,7 +50,7 @@ SetupStep { program: ProgramName, args: [String], cwd: Option<RelPath>, when: Ca
 
 ### Detection
 
-`fabric job init` (and `fabric suspend` when no spec exists) detects from the files at the workspace root. It reads a fixed list of files, never one the secret policy denies, never an environment variable, and runs no program.
+`fabric job init` (and `fabric suspend` when no spec exists) detects from the files at the workspace root. It reads a fixed list of regular files, follows no link, never reads a file the secret policy denies or an environment variable, and runs no program.
 
 - `package.json` plus a lockfile: the manager is `package_manager` in `.fabric/env.toml`, else `packageManager` in `package.json`, else the only lockfile (`pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`, `bun.lock`, `bun.lockb`). Setup is its frozen install with `when: CachesMissing`: `pnpm install --frozen-lockfile`, `npm ci`, `yarn install --frozen-lockfile` for Yarn 1, `yarn install --immutable` for Yarn 2 and later (from `packageManager`, else `.yarnrc.yml`), `bun install --frozen-lockfile`. Cache path `node_modules`. No lockfile: no step and no cache path.
 - `Cargo.toml`: setup `cargo fetch`, plus `--locked` when `Cargo.lock` exists; cache path `target`.

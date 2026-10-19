@@ -1,10 +1,14 @@
 //! Detection of an `EnvSpec` from the files a workspace already has (ADR 0007).
 //!
 //! Invariant: detection reads a fixed list of files at the workspace root
-//! and nothing else. It never opens a file the secret policy denies, never
-//! reads an environment variable and never runs a program, so the same
-//! files give the same spec on every node, and the spec it returns has
-//! passed `EnvSpec::validate`.
+//! and nothing else. It reads regular files only: a symbolic link in that
+//! list is refused, because a link can point at a file the secret policy
+//! denies or at one outside the workspace, and either would break the next
+//! rule. It never opens a file the secret policy denies, never reads an
+//! environment variable and never runs a program, so the same files give
+//! the same spec on every node, and the spec it returns has passed
+//! `EnvSpec::validate`. Every pin it keeps is short, printable and not
+//! shaped like a credential, because the spec travels to other nodes.
 //!
 //! What it reads, and what each file gives:
 //!
@@ -30,13 +34,50 @@ use fabric_core::snapshot::CacheClass;
 use toml::Table;
 
 use crate::overrides::{EnvOverride, OverrideError, line_and_column};
-use crate::secret::SecretPolicy;
+use crate::secret::{self, SecretPolicy};
 
 /// Where the override file lives, relative to the workspace root.
 pub const OVERRIDE_FILE: &str = ".fabric/env.toml";
 
 /// The largest file detection reads; a bigger one is refused rather than loaded.
 const MAX_FILE_LEN: u64 = 4 << 20;
+
+/// The most characters a version pin may have.
+pub const MAX_PIN_LEN: usize = 64;
+
+/// Why a version pin was refused; the pin itself is never quoted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PinError {
+    /// The pin has no characters.
+    #[error("version pin is empty")]
+    Empty,
+    /// The pin is longer than `MAX_PIN_LEN` characters.
+    #[error("version pin is longer than {MAX_PIN_LEN} characters")]
+    TooLong,
+    /// A character outside printable ASCII, space included.
+    #[error("version pin has a character outside printable ASCII")]
+    BadChar,
+    /// The pin is shaped like a token, key or password URL.
+    #[error("version pin looks like a credential; the spec travels to other nodes")]
+    Credential,
+}
+
+/// Checks that `version` is a pin and not a value that must stay on this node.
+pub(crate) fn check_pin(version: &str) -> Result<(), PinError> {
+    if version.is_empty() {
+        return Err(PinError::Empty);
+    }
+    if version.len() > MAX_PIN_LEN {
+        return Err(PinError::TooLong);
+    }
+    if !version.bytes().all(|b| (b' '..=b'~').contains(&b)) {
+        return Err(PinError::BadChar);
+    }
+    if secret::looks_like_credential(version) {
+        return Err(PinError::Credential);
+    }
+    Ok(())
+}
 
 /// Why a workspace's environment could not be detected.
 #[derive(Debug, thiserror::Error)]
@@ -49,6 +90,25 @@ pub enum DetectError {
         /// The IO error.
         #[source]
         source: io::Error,
+    },
+    /// A file in the fixed list is a symbolic link or another non-regular file.
+    #[error(
+        "`{file}` is not a regular file; detection does not follow links, replace it with the file itself"
+    )]
+    NotARegularFile {
+        /// The file, relative to the root.
+        file: &'static str,
+    },
+    /// A version pin in a detected file was refused.
+    #[error("the `{tool}` pin in `{file}` was refused")]
+    Pin {
+        /// The file, relative to the root.
+        file: &'static str,
+        /// The tool the pin is for.
+        tool: String,
+        /// What is wrong with it.
+        #[source]
+        reason: PinError,
     },
     /// A file is larger than detection reads.
     #[error("`{file}` is larger than {MAX_FILE_LEN} bytes")]
@@ -446,21 +506,27 @@ fn collect_pins(
     pins.extend(go_mod_pin(root)?);
     if let Some(package) = package {
         if let Some((name, version)) = &package.manager {
-            pins.push(Pin {
-                tool: name.as_str().to_owned(),
-                version: version.clone(),
-                file: "package.json",
-            });
+            pins.push(pin(name.as_str(), version, "package.json")?);
         }
         if let Some(engine) = &package.engines_node {
-            pins.push(Pin {
-                tool: "node".to_owned(),
-                version: engine.clone(),
-                file: "package.json",
-            });
+            pins.push(pin("node", engine, "package.json")?);
         }
     }
     Ok(pins)
+}
+
+/// Builds a detected pin after checking its version.
+fn pin(tool: &str, version: &str, file: &'static str) -> Result<Pin, DetectError> {
+    check_pin(version).map_err(|reason| DetectError::Pin {
+        file,
+        tool: tool.to_owned(),
+        reason,
+    })?;
+    Ok(Pin {
+        tool: tool.to_owned(),
+        version: version.to_owned(),
+        file,
+    })
 }
 
 fn detect_rust(
@@ -660,7 +726,7 @@ fn mise_pins(root: &Path) -> Result<Vec<Pin>, DetectError> {
     let Some(tools) = table.get("tools").and_then(toml::Value::as_table) else {
         return Ok(Vec::new());
     };
-    Ok(tools
+    tools
         .iter()
         .filter_map(|(tool, value)| {
             let version = match value {
@@ -669,13 +735,9 @@ fn mise_pins(root: &Path) -> Result<Vec<Pin>, DetectError> {
                 toml::Value::Table(t) => t.get("version").and_then(toml::Value::as_str),
                 _ => None,
             }?;
-            Some(Pin {
-                tool: canonical_tool(tool),
-                version: version.to_owned(),
-                file: "mise.toml",
-            })
+            Some(pin(&canonical_tool(tool), version, "mise.toml"))
         })
-        .collect())
+        .collect()
 }
 
 /// Reads `.tool-versions`: `<tool> <version> [<fallback>...]` per line, `#` starts a comment.
@@ -683,20 +745,15 @@ fn tool_versions_pins(root: &Path) -> Result<Vec<Pin>, DetectError> {
     let Some(text) = read_text(root, ".tool-versions")? else {
         return Ok(Vec::new());
     };
-    Ok(text
-        .lines()
+    text.lines()
         .filter_map(|line| {
             let line = line.split_once('#').map_or(line, |(before, _)| before);
             let mut words = line.split_whitespace();
             let tool = words.next()?;
             let version = words.next()?;
-            Some(Pin {
-                tool: canonical_tool(tool),
-                version: version.to_owned(),
-                file: ".tool-versions",
-            })
+            Some(pin(&canonical_tool(tool), version, ".tool-versions"))
         })
-        .collect())
+        .collect()
 }
 
 /// Reads `toolchain.channel` from `rust-toolchain.toml`.
@@ -704,15 +761,12 @@ fn rust_toolchain_pin(root: &Path) -> Result<Option<Pin>, DetectError> {
     let Some(table) = read_toml(root, "rust-toolchain.toml")? else {
         return Ok(None);
     };
-    Ok(table
+    table
         .get("toolchain")
         .and_then(|t| t.get("channel"))
         .and_then(toml::Value::as_str)
-        .map(|channel| Pin {
-            tool: "rust".to_owned(),
-            version: channel.to_owned(),
-            file: "rust-toolchain.toml",
-        }))
+        .map(|channel| pin("rust", channel, "rust-toolchain.toml"))
+        .transpose()
 }
 
 /// Reads the first line that is not empty and not a `#` comment.
@@ -720,15 +774,11 @@ fn first_line_pin(root: &Path, file: &'static str, tool: &str) -> Result<Option<
     let Some(text) = read_text(root, file)? else {
         return Ok(None);
     };
-    Ok(text
-        .lines()
+    text.lines()
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|version| Pin {
-            tool: tool.to_owned(),
-            version: version.to_owned(),
-            file,
-        }))
+        .map(|version| pin(tool, version, file))
+        .transpose()
 }
 
 /// Reads the `go` directive of `go.mod`.
@@ -736,16 +786,14 @@ fn go_mod_pin(root: &Path) -> Result<Option<Pin>, DetectError> {
     let Some(text) = read_text(root, "go.mod")? else {
         return Ok(None);
     };
-    Ok(text.lines().find_map(
-        |line| match line.split_whitespace().collect::<Vec<_>>().as_slice() {
-            ["go", version, ..] => Some(Pin {
-                tool: "go".to_owned(),
-                version: (*version).to_owned(),
-                file: "go.mod",
-            }),
-            _ => None,
-        },
-    ))
+    text.lines()
+        .find_map(
+            |line| match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+                ["go", version, ..] => Some(pin("go", version, "go.mod")),
+                _ => None,
+            },
+        )
+        .transpose()
 }
 
 fn canonical_tool(name: &str) -> String {
@@ -771,23 +819,33 @@ fn rel(path: &'static str) -> Result<RelPath, DetectError> {
     RelPath::parse(path).map_err(|_| DetectError::BuiltIn { name: path })
 }
 
-/// Returns whether `file` exists under `root`; an error other than "not found" is an error.
+/// Returns whether something named `file` exists under `root`, a link included; an error other than "not found" is an error.
+///
+/// A link counts as present because the snapshot carries it as a link, so
+/// every node answers the same; what it points at is never read here.
 fn exists(root: &Path, file: &'static str) -> Result<bool, DetectError> {
-    match fs::metadata(root.join(file)) {
+    match fs::symlink_metadata(root.join(file)) {
         Ok(_) => Ok(true),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(source) => Err(DetectError::Read { file, source }),
     }
 }
 
-/// Reads `file` under `root` as UTF-8, or `None` when it does not exist.
+/// Reads the regular file `file` under `root` as UTF-8, or `None` when nothing is there.
+///
+/// A link is refused rather than followed: `.nvmrc -> .env` would put a
+/// secret into the spec, and `.nvmrc -> ../../.nvmrc` would give two
+/// nodes two specs from one workspace.
 fn read_text(root: &Path, file: &'static str) -> Result<Option<String>, DetectError> {
     let read_err = |source| DetectError::Read { file, source };
-    let handle = match fs::File::open(root.join(file)) {
-        Ok(handle) => handle,
+    let full = root.join(file);
+    match fs::symlink_metadata(&full) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Err(DetectError::NotARegularFile { file }),
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(read_err(err)),
-    };
+    }
+    let handle = fs::File::open(&full).map_err(read_err)?;
     let mut bytes = Vec::new();
     handle
         .take(MAX_FILE_LEN + 1)
@@ -809,4 +867,36 @@ fn read_toml(root: &Path, file: &'static str) -> Result<Option<Table>, DetectErr
         let (line, column) = line_and_column(&text, err.span().map_or(0, |span| span.start));
         DetectError::Toml { file, line, column }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One sample per refusal, and the pin shapes real files hold pass.
+    #[test]
+    fn a_pin_is_short_printable_and_not_a_credential() {
+        for ok in [
+            "22",
+            "v20",
+            ">=18 <21",
+            "^18 || ^20",
+            "1.97.1",
+            "lts/*",
+            "3.12",
+        ] {
+            assert_eq!(check_pin(ok), Ok(()), "{ok}");
+        }
+        assert_eq!(check_pin(""), Err(PinError::Empty));
+        assert_eq!(
+            check_pin(&"1".repeat(MAX_PIN_LEN + 1)),
+            Err(PinError::TooLong)
+        );
+        assert_eq!(check_pin("22\u{7}"), Err(PinError::BadChar));
+        assert_eq!(check_pin("2\u{e9}"), Err(PinError::BadChar));
+        assert_eq!(
+            check_pin("https://u:p@registry.example.com/x"),
+            Err(PinError::Credential)
+        );
+    }
 }

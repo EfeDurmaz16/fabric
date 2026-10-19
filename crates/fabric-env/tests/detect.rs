@@ -3,14 +3,17 @@
 
 use std::fs;
 use std::io;
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
 use fabric_core::env::{EnvVarName, RunWhen, Tool, ToolSource};
 use fabric_core::path::{PathError, RelPath};
 use fabric_core::snapshot::CacheClass;
 use fabric_env::detect::{
-    CachePath, DetectError, Detection, Ecosystem, ManagerChoice, ManagerSource, NodeManager, detect,
+    CachePath, DetectError, Detection, Ecosystem, ManagerChoice, ManagerSource, NodeManager,
+    PinError, detect,
 };
+use fabric_env::overrides::OverrideError;
 use fabric_env::secret::Scope;
 use tempfile::TempDir;
 
@@ -433,4 +436,43 @@ fn a_declared_class_keeps_the_detected_ecosystem() {
 fn a_broken_override_file_stops_detection() {
     let dir = workspace(&[(".fabric/env.toml", "env = [\"A=b\"]\n")]).unwrap();
     assert!(matches!(detect(dir.path()), Err(DetectError::Override(_))));
+}
+
+/// Detection follows no link: `.nvmrc -> .env` would read the secret file
+/// and put its first line into the spec as the Node version.
+#[test]
+fn a_linked_pin_file_is_refused_without_reading_it() {
+    let secret = "sk-proj-abcdefghijklmnopqrstuvwxyz";
+    let dir = workspace(&[(".env", &format!("OPENAI_API_KEY={secret}\n"))]).unwrap();
+    symlink(dir.path().join(".env"), dir.path().join(".nvmrc")).unwrap();
+    match detect(dir.path()) {
+        Err(DetectError::NotARegularFile { file }) => assert_eq!(file, ".nvmrc"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A pin travels in the spec like a setup argument does, so the same
+/// credential guard applies, from a detected file and from the override file.
+#[test]
+fn a_credential_shaped_pin_is_refused_without_echoing_it() {
+    let token = format!("ghp_{}", "q7".repeat(18));
+    let detected = workspace(&[(".nvmrc", &token)]).unwrap();
+    match detect(detected.path()) {
+        Err(err @ DetectError::Pin { file, reason, .. }) => {
+            assert_eq!((file, reason), (".nvmrc", PinError::Credential));
+            assert!(!format!("{err} {err:?}").contains(&token));
+        }
+        other => panic!("{other:?}"),
+    }
+    let declared = workspace(&[(
+        ".fabric/env.toml",
+        &format!("[tools]\nnode = \"{token}\"\n"),
+    )])
+    .unwrap();
+    match detect(declared.path()) {
+        Err(err @ DetectError::Override(OverrideError::Pin { .. })) => {
+            assert!(!format!("{err} {err:?}").contains(&token));
+        }
+        other => panic!("{other:?}"),
+    }
 }
