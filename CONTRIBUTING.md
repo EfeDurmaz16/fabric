@@ -24,7 +24,11 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+scripts/check-hygiene.sh origin/main
 ```
+
+`scripts/check-hygiene.sh` fails on an em dash or an AI attribution line in any
+tracked file or in any commit message on the branch.
 
 `cargo deny check` runs on every PR and once a week. `deny.toml` holds the
 license, advisory, and source policy. A new dependency must pass it, and the PR

@@ -17,6 +17,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  hygiene:
+    name: hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The commit message check needs the base branch.
+          fetch-depth: 0
+
+      - name: No em dash or AI attribution in files and commits
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ -n "$BASE_REF" ]; then
+            scripts/check-hygiene.sh "origin/$BASE_REF"
+          else
+            scripts/check-hygiene.sh
+          fi
+
   check:
     name: check (${{ matrix.os }})
     strategy:
