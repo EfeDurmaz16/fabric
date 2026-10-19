@@ -391,6 +391,14 @@ impl Catalog {
         Ok(())
     }
 
+    /// Returns true when the catalog has a row for the chunk.
+    pub fn has_chunk(&self, id: ChunkId) -> Result<bool, CatalogError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT 1 FROM chunks WHERE id = ?1")?;
+        Ok(stmt.exists([id.to_bytes()])?)
+    }
+
     /// Returns every chunk id the catalog has a row for.
     pub fn chunk_ids(&self) -> Result<HashSet<ChunkId>, CatalogError> {
         let mut stmt = self.conn.prepare("SELECT id FROM chunks")?;

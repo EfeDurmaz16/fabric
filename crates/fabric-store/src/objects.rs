@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::time::SystemTime;
 
 use fabric_core::id::ChunkId;
@@ -161,8 +161,17 @@ impl ObjectStore {
         }
     }
 
+    /// Creates `objects/`, all 256 shard directories and `tmp/`, and flushes `objects/`.
+    ///
+    /// No shard is ever created on the publish path, so the only directory
+    /// entries publish has to flush are the ones inside the shards.
     pub(crate) fn create_dirs(&self) -> Result<(), ObjectError> {
         fs::create_dir_all(&self.objects_dir).map_err(|e| io_err(&self.objects_dir, e))?;
+        for shard in 0..=u8::MAX {
+            let dir = self.objects_dir.join(format!("{shard:02x}"));
+            fs::create_dir_all(&dir).map_err(|e| io_err(&dir, e))?;
+        }
+        durable::fsync_dir(&self.objects_dir).map_err(|e| io_err(&self.objects_dir, e))?;
         fs::create_dir_all(&self.tmp_dir).map_err(|e| io_err(&self.tmp_dir, e))
     }
 
@@ -209,14 +218,9 @@ impl ObjectStore {
         }
         let compressed =
             zstd::bulk::compress(bytes, self.params.zstd_level).map_err(|e| io_err(&path, e))?;
-        let shard_dir = path.parent().unwrap_or(&self.objects_dir);
-        fs::create_dir_all(shard_dir).map_err(|e| io_err(shard_dir, e))?;
         let published = durable::publish_noclobber(&self.tmp_dir, &path, &compressed)
             .map_err(|e| io_err(&path, e))?;
-        let shard = u8::from_str_radix(&id.to_string()[..2], 16).unwrap_or(0);
-        if let Ok(mut dirty) = self.dirty_shards.lock() {
-            dirty.insert(shard);
-        }
+        self.mark_dirty(id);
         Ok(StoredChunk {
             id,
             len: bytes.len() as u64,
@@ -307,12 +311,28 @@ impl ObjectStore {
         Ok(bytes)
     }
 
-    /// Flushes every shard directory an object landed in since the last call.
+    /// Records that the shard holding `id` has an entry the next `flush_shards` must flush.
+    ///
+    /// `put` calls it for an object it wrote. Publish also calls it for an
+    /// object that was already on disk but has no catalog row yet: that
+    /// file may have been linked by a process that was killed before its
+    /// flush, and only a catalog row proves a shard was flushed after it.
+    pub(crate) fn mark_dirty(&self, id: ChunkId) {
+        let shard = id.to_bytes()[0];
+        self.dirty_shards
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(shard);
+    }
+
+    /// Flushes every shard directory marked dirty since the last call.
     pub(crate) fn flush_shards(&self) -> Result<(), ObjectError> {
-        let shards: Vec<u8> = match self.dirty_shards.lock() {
-            Ok(mut dirty) => dirty.drain().collect(),
-            Err(poisoned) => poisoned.into_inner().drain().collect(),
-        };
+        let shards: Vec<u8> = self
+            .dirty_shards
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain()
+            .collect();
         for shard in shards {
             let dir = self.objects_dir.join(format!("{shard:02x}"));
             durable::fsync_dir(&dir).map_err(|e| io_err(&dir, e))?;

@@ -255,6 +255,11 @@ impl Store {
                 }
                 Err(e) => return Err(e.into()),
             };
+            if !self.catalog.has_chunk(chunk)? {
+                // On disk but never published: its directory entry may still
+                // be unflushed from a process that died before its publish.
+                self.objects.mark_dirty(chunk);
+            }
             data.push(ChunkRef {
                 id: chunk,
                 stored_len,

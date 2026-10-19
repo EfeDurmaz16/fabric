@@ -9,7 +9,10 @@
 //! which flushes the whole device cache once for every file written before
 //! it (ADR 0004, Publish). A full flush per object measured 4 ms per file on
 //! APFS, which is minutes for a `node_modules`; one per shard directory is
-//! at most 256 per publish.
+//! at most 256 per publish. A shard is flushed when an object was linked
+//! into it in this process, and also when publish names an object that has
+//! no catalog row yet, because only a committed row proves that an earlier
+//! process flushed the shard after linking the file.
 
 use std::fs::{self, File};
 use std::io::{self, Write};
