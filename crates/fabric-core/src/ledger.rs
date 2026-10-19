@@ -12,6 +12,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::codec::{self, CodecError};
 use crate::harness::HarnessKind;
 use crate::id::{EnvSpecId, Epoch, EventId, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use crate::lease::{FenceError, FencingToken, LeaseState};
@@ -24,6 +25,10 @@ pub const JOB_MANIFEST_VERSION: u16 = 1;
 
 /// Bytes of blake3 digest that end every record on disk.
 pub const CHECKSUM_LEN: usize = 16;
+
+/// The most bytes one record may occupy; a memory bound against a hostile
+/// peer and the size of the largest control frame (ADR 0005).
+pub const MAX_RECORD_LEN: usize = 1 << 20;
 
 const LENGTH_LEN: usize = 4;
 const VERSION_LEN: usize = 1;
@@ -165,9 +170,15 @@ pub enum RecordError {
         /// Byte offset of the failing record's length field.
         offset: usize,
     },
+    /// The record is longer than `MAX_RECORD_LEN`.
+    #[error("record is {len} bytes, above the {MAX_RECORD_LEN} byte bound")]
+    TooLarge {
+        /// The byte length that was offered or asked for.
+        len: usize,
+    },
     /// The frame checks out but the event inside does not decode, or an event does not encode.
     #[error("record codec: {0}")]
-    Codec(#[from] postcard::Error),
+    Codec(#[from] CodecError),
 }
 
 /// One event with the exact bytes it occupies on disk and their hash.
@@ -190,9 +201,10 @@ impl fmt::Debug for Record {
 impl Record {
     /// Frames `event` as `u32 length | u8 version | postcard(event) | checksum`.
     pub fn encode(event: Event) -> Result<Record, RecordError> {
-        let payload = postcard::to_stdvec(&event)?;
+        let payload = codec::encode(&event)?;
         let body_len = VERSION_LEN + payload.len() + CHECKSUM_LEN;
-        let length = u32::try_from(body_len).map_err(|_| postcard::Error::SerializeBufferFull)?;
+        let length =
+            u32::try_from(body_len).map_err(|_| RecordError::TooLarge { len: body_len })?;
         let mut bytes = Vec::with_capacity(LENGTH_LEN + body_len);
         bytes.extend_from_slice(&length.to_le_bytes());
         bytes.push(RECORD_FORMAT_VERSION);
@@ -258,7 +270,11 @@ impl Record {
         if version != RECORD_FORMAT_VERSION {
             return Err(RecordError::UnknownVersion { version });
         }
-        let event: Event = postcard::from_bytes(&hashed[LENGTH_LEN + VERSION_LEN..])?;
+        let event: Event = match codec::decode(&hashed[LENGTH_LEN + VERSION_LEN..]) {
+            Ok(event) => event,
+            Err(CodecError::TrailingBytes(_)) => return Err(RecordError::Corrupt { offset }),
+            Err(err) => return Err(RecordError::Codec(err)),
+        };
         let bytes = frame.to_vec();
         let hash = RecordHash::of(&bytes);
         Ok(Some((Record { event, bytes, hash }, frame.len())))
@@ -439,13 +455,13 @@ pub struct JobManifest {
 
 impl JobManifest {
     /// Returns the postcard bytes.
-    pub fn encode(&self) -> Result<Vec<u8>, postcard::Error> {
-        postcard::to_stdvec(self)
+    pub fn encode(&self) -> Result<Vec<u8>, JobManifestError> {
+        Ok(codec::encode(self)?)
     }
 
     /// Decodes bytes written by `encode`, refusing other versions.
     pub fn decode(bytes: &[u8]) -> Result<Self, JobManifestError> {
-        let manifest: JobManifest = postcard::from_bytes(bytes)?;
+        let manifest: JobManifest = codec::decode(bytes)?;
         if manifest.version != JOB_MANIFEST_VERSION {
             return Err(JobManifestError::UnknownVersion(manifest.version));
         }
@@ -459,9 +475,9 @@ pub enum JobManifestError {
     /// The bytes carry a version this crate does not know.
     #[error("job manifest version {0} is not supported")]
     UnknownVersion(u16),
-    /// The bytes do not decode.
+    /// The bytes do not decode, or the value does not encode.
     #[error("job manifest codec: {0}")]
-    Codec(#[from] postcard::Error),
+    Codec(#[from] CodecError),
 }
 
 /// Where records live between runs.
@@ -1320,6 +1336,17 @@ mod tests {
         assert_eq!(rebuilt.manifest(), ledger.manifest());
         let bytes = ledger.manifest().encode().unwrap();
         assert_eq!(&JobManifest::decode(&bytes).unwrap(), ledger.manifest());
+    }
+
+    #[test]
+    fn job_manifest_with_trailing_bytes_is_refused() {
+        let ledger = new_ledger(node(1));
+        let mut bytes = ledger.manifest().encode().unwrap();
+        bytes.push(0);
+        assert!(matches!(
+            JobManifest::decode(&bytes),
+            Err(JobManifestError::Codec(CodecError::TrailingBytes(1)))
+        ));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{EnvSpecId, Epoch, EventId, MoveId, NodeId, RecordHash, SnapshotId};
-use fabric_core::ledger::{Event, EventKind, Record, RecordError, scan};
+use fabric_core::ledger::{CHECKSUM_LEN, Event, EventKind, Record, RecordError, scan};
 use proptest::prelude::*;
 
 fn node() -> impl Strategy<Value = NodeId> {
@@ -76,6 +76,32 @@ fn event() -> impl Strategy<Value = Event> {
             at,
             kind,
         })
+}
+
+/// A frame that carries bytes after the event, with a checksum that covers
+/// them, is not a second valid spelling of the event; it is corruption.
+#[test]
+fn bytes_after_the_event_inside_a_frame_are_corruption() {
+    let record = Record::encode(Event {
+        id: EventId::from_bytes([1; 16]),
+        prev: None,
+        epoch: Epoch::FIRST,
+        at: 1,
+        kind: EventKind::Note { text: "n".into() },
+    })
+    .unwrap();
+    let bytes = record.bytes();
+    let body_end = bytes.len() - CHECKSUM_LEN;
+    let mut frame = bytes[..body_end].to_vec();
+    frame.push(0xee);
+    let length = u32::try_from(frame.len() - 4 + CHECKSUM_LEN).unwrap();
+    frame[..4].copy_from_slice(&length.to_le_bytes());
+    let digest = blake3::hash(&frame);
+    frame.extend_from_slice(&digest.as_bytes()[..CHECKSUM_LEN]);
+    assert!(matches!(
+        Record::decode(&frame),
+        Err(RecordError::Corrupt { offset: 0 })
+    ));
 }
 
 proptest! {

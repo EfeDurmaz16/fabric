@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::codec::{self, CodecError};
 use crate::harness::HarnessState;
 use crate::id::{ChunkId, EnvSpecId, JobId, NodeId, SnapshotId};
 use crate::path::{AbsPath, RelPath};
@@ -49,7 +50,7 @@ pub enum ManifestError {
     /// The bytes do not decode, or the value does not encode. A path that
     /// breaks the rules of `RelPath` or `AbsPath` surfaces here too.
     #[error("manifest codec: {0}")]
-    Codec(#[from] postcard::Error),
+    Codec(#[from] CodecError),
 }
 
 /// What one snapshot of a workspace contains.
@@ -247,7 +248,7 @@ impl SnapshotManifest {
     /// Returns the canonical bytes of a valid manifest.
     pub fn encode(&self) -> Result<Vec<u8>, ManifestError> {
         self.validate()?;
-        Ok(postcard::to_stdvec(self)?)
+        Ok(codec::encode(self)?)
     }
 
     /// Decodes bytes under the size bound and checks the result.
@@ -255,7 +256,7 @@ impl SnapshotManifest {
         if bytes.len() > MAX_MANIFEST_LEN {
             return Err(ManifestError::TooLarge { len: bytes.len() });
         }
-        let manifest: SnapshotManifest = postcard::from_bytes(bytes)?;
+        let manifest: SnapshotManifest = codec::decode(bytes)?;
         manifest.validate()?;
         Ok(manifest)
     }

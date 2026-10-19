@@ -69,6 +69,7 @@
 //! # Ok(()) }
 //! ```
 
+pub mod codec;
 pub mod env;
 pub mod harness;
 pub mod id;

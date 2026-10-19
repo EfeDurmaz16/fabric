@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::codec::{self, CodecError};
 use crate::id::EnvSpecId;
 use crate::path::RelPath;
 
@@ -26,7 +27,7 @@ pub enum EnvSpecError {
     },
     /// The bytes do not decode, or the value does not encode.
     #[error("environment spec codec: {0}")]
-    Codec(#[from] postcard::Error),
+    Codec(#[from] CodecError),
 }
 
 /// What a workspace needs before a harness can run in it.
@@ -99,12 +100,12 @@ impl EnvSpec {
     /// Returns the canonical postcard bytes of a valid spec.
     pub fn encode(&self) -> Result<Vec<u8>, EnvSpecError> {
         self.validate()?;
-        Ok(postcard::to_stdvec(self)?)
+        Ok(codec::encode(self)?)
     }
 
     /// Decodes and checks a spec.
     pub fn decode(bytes: &[u8]) -> Result<Self, EnvSpecError> {
-        let spec: EnvSpec = postcard::from_bytes(bytes)?;
+        let spec: EnvSpec = codec::decode(bytes)?;
         spec.validate()?;
         Ok(spec)
     }
@@ -163,6 +164,16 @@ mod tests {
         assert!(matches!(
             s.encode(),
             Err(EnvSpecError::EmptyArgv { index: 1 })
+        ));
+    }
+
+    #[test]
+    fn trailing_bytes_are_refused() {
+        let mut bytes = spec().encode().unwrap();
+        bytes.push(0);
+        assert!(matches!(
+            EnvSpec::decode(&bytes),
+            Err(EnvSpecError::Codec(CodecError::TrailingBytes(1)))
         ));
     }
 

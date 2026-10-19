@@ -2,6 +2,7 @@
 //! pinned hash, so a change to the wire format is a failing test, not a
 //! surprise on the other machine.
 
+use fabric_core::codec::CodecError;
 use fabric_core::harness::HarnessState;
 use fabric_core::id::{ChunkId, EnvSpecId, JobId, NodeId, SnapshotId};
 use fabric_core::path::{AbsPath, PathError, RelPath};
@@ -319,6 +320,16 @@ fn a_bad_path_on_the_wire_does_not_decode() {
     assert!(matches!(
         SnapshotManifest::decode(&patched),
         Err(ManifestError::Codec(_))
+    ));
+}
+
+#[test]
+fn trailing_bytes_do_not_decode() {
+    let mut bytes = fixed_manifest().unwrap().encode().unwrap();
+    bytes.push(0);
+    assert!(matches!(
+        SnapshotManifest::decode(&bytes),
+        Err(ManifestError::Codec(CodecError::TrailingBytes(1)))
     ));
 }
 
