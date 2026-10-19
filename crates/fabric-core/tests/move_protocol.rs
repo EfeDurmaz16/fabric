@@ -6,10 +6,11 @@
 //! imports, the reply is lost, the source retries, and both must converge on
 //! the one `MoveImported` without the source ever being runnable.
 
+use std::collections::HashMap;
 use std::error::Error;
 
 use fabric_core::harness::HarnessKind;
-use fabric_core::id::{Epoch, EventId, JobId, MoveId, NodeId, SnapshotId};
+use fabric_core::id::{Epoch, EventId, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::{FenceError, FencingToken, LeaseState};
 use fabric_core::ledger::{
     Author, EventKind, Ledger, LedgerError, LedgerStore, MemoryStore, Record,
@@ -123,6 +124,8 @@ struct World {
     snapshots: u8,
     at: u64,
     steals: u32,
+    /// The node that wrote each record, so a sync can deliver writer-direct.
+    writers: HashMap<RecordHash, NodeId>,
 }
 
 impl World {
@@ -146,12 +149,15 @@ impl World {
             let ledger = Ledger::open(job, &store)?;
             nodes.push(Node { id, ledger, store });
         }
+        let mut writers = HashMap::new();
+        writers.insert(created.hash(), ids[0]);
         Ok(World {
             nodes,
             mail: Vec::new(),
             snapshots: 0,
             at: 1,
             steals: 0,
+            writers,
         })
     }
 
@@ -167,11 +173,18 @@ impl World {
             .ok_or_else(|| format!("unknown node {id}").into())
     }
 
+    /// Commits a record `node` wrote itself and remembers it as the writer.
+    fn commit_own(&mut self, node: usize, record: Record) -> Fallible {
+        let me = self.nodes[node].id;
+        self.writers.insert(record.hash(), me);
+        self.nodes[node].commit(record, Author::Node(me))
+    }
+
     fn append_local(&mut self, node: usize, kind: EventKind) -> Fallible {
         let at = self.tick();
         let n = &mut self.nodes[node];
         let record = n.ledger.propose(n.id, kind, EventId::generate(), at)?;
-        n.commit(record, Author::Node(n.id))
+        self.commit_own(node, record)
     }
 
     fn apply(&mut self, op: &Op) -> Fallible {
@@ -282,7 +295,7 @@ impl World {
             at,
         ) {
             Ok(record) => {
-                self.nodes[src].commit(record, Author::Node(me))?;
+                self.commit_own(src, record)?;
                 assert!(!self.nodes[src].owns(), "source runnable after MoveStarted");
                 self.send_offer(src, dst);
                 Ok(())
@@ -314,7 +327,7 @@ impl World {
                 .answer_abort(me, move_id, EventId::generate(), at)
             {
                 Ok(AbortAnswer::Abort(record)) => {
-                    self.nodes[node].commit(record, Author::Node(me))?;
+                    self.commit_own(node, record)?;
                 }
                 Ok(AbortAnswer::Decided(_)) | Err(LedgerError::UnknownMove(_)) => {}
                 Err(e) => return Err(format!("unexpected abort error: {e}").into()),
@@ -336,16 +349,22 @@ impl World {
         }
     }
 
-    /// `to` fetches the suffix it lacks from `from`; a fork leaves both as they are.
+    /// `to` fetches the suffix it lacks from `from`, and each record is
+    /// delivered as if its writer sent it, so the writer rule is exercised
+    /// on every replicated record. A fork leaves both as they are.
     fn sync(&mut self, from: usize, to: usize) -> Fallible {
         let head = self.nodes[to].ledger.head();
         let Some(suffix) = self.nodes[from].ledger.suffix_after(head) else {
             return Ok(());
         };
         let suffix = suffix.to_vec();
-        let node = &mut self.nodes[to];
         for record in suffix {
-            node.commit(record, Author::OwnFile)?;
+            let writer = *self
+                .writers
+                .get(&record.hash())
+                .ok_or("record with no known writer")?;
+            let checked = self.nodes[to].ledger.verify(record.bytes(), writer)?;
+            self.nodes[to].commit(checked, Author::Node(writer))?;
         }
         assert_eq!(
             self.nodes[to].ledger.lease(),
@@ -372,7 +391,7 @@ impl World {
                     .answer_abort(me, move_id, EventId::generate(), at)
                 {
                     Ok(AbortAnswer::Abort(record)) => {
-                        self.nodes[to].commit(record.clone(), Author::Node(me))?;
+                        self.commit_own(to, record.clone())?;
                         self.reply(to, from, &record);
                     }
                     Ok(AbortAnswer::Decided(record)) => self.reply(to, from, &record),
@@ -425,7 +444,7 @@ impl World {
         }
         match answer {
             OfferAnswer::Import(record) => {
-                self.nodes[to].commit(record.clone(), Author::Node(me))?;
+                self.commit_own(to, record.clone())?;
                 self.reply(to, from, &record);
             }
             OfferAnswer::Decided(record) => self.reply(to, from, &record),
@@ -479,7 +498,7 @@ impl World {
             Ok(proposal) => {
                 assert!(force && snapshot_complete);
                 assert_ne!(before.holder(), me);
-                self.nodes[thief].commit(proposal.record, Author::Node(me))?;
+                self.commit_own(thief, proposal.record)?;
                 self.steals += 1;
                 let after = self.nodes[thief].ledger.lease();
                 let next = before.epoch().next().ok_or("epoch exhausted")?;

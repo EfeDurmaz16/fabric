@@ -353,13 +353,29 @@ pub fn scan(bytes: &[u8]) -> Result<Scan, RecordError> {
     Ok(out)
 }
 
-/// Who wrote a record, as far as the accepting node can tell.
+/// How a record reached this node, which decides how much the ledger can check.
+///
+/// Every record is checked against the chain: it must link to the head,
+/// carry the epoch the rules require, and name a writer, snapshot and move
+/// the chain allows. `Node` adds the sender rule: the transport-proved
+/// sender must be that writer. `Relayed` cannot add it, because records
+/// carry no signature yet (ADR 0002, Open questions), so a relayed suffix
+/// is trusted as far as the paired peer that sent it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Author {
-    /// A peer whose identity the transport proved.
+    /// A peer whose identity the transport proved and who must be the writer.
     Node(NodeId),
-    /// This node's own ledger file, whose writer rules were checked when it was written.
-    OwnFile,
+    /// A record fetched from a paired peer that may not be its writer; the sender rule is skipped.
+    Relayed,
+}
+
+impl Author {
+    const fn sender(self) -> Option<NodeId> {
+        match self {
+            Author::Node(node) => Some(node),
+            Author::Relayed => None,
+        }
+    }
 }
 
 /// Why a record was refused by the ledger rules.
@@ -623,7 +639,9 @@ impl Ledger {
         let first = records.next().ok_or(LedgerError::Empty)?;
         let mut ledger = Ledger::from_created(job_id, first)?;
         for record in records {
-            ledger.accept(record, Author::OwnFile)?;
+            ledger.check(record.event(), None)?;
+            ledger.apply(&record);
+            ledger.records.push(record);
         }
         Ok(ledger)
     }
@@ -754,20 +772,20 @@ impl Ledger {
             at,
             kind,
         };
-        self.check(&event, Author::Node(author))?;
+        self.check(&event, Some(author))?;
         Ok(Record::encode(event)?)
     }
 
     /// Decodes a frame a peer sent and checks that `from` may append it here.
     pub fn verify(&self, frame: &[u8], from: NodeId) -> Result<Record, LedgerError> {
         let record = Record::decode(frame)?;
-        self.check(record.event(), Author::Node(from))?;
+        self.check(record.event(), Some(from))?;
         Ok(record)
     }
 
     /// Appends a record after checking it against the current head and lease.
     pub fn accept(&mut self, record: Record, author: Author) -> Result<&Record, LedgerError> {
-        self.check(record.event(), author)?;
+        self.check(record.event(), author.sender())?;
         self.apply(&record);
         self.records.push(record);
         Ok(&self.records[self.records.len() - 1])
@@ -780,12 +798,12 @@ impl Ledger {
         record: Record,
         author: Author,
     ) -> Result<&Record, StoreError<S::Error>> {
-        self.check(record.event(), author)?;
+        self.check(record.event(), author.sender())?;
         store.append(&record).map_err(StoreError::Store)?;
         Ok(self.accept(record, author)?)
     }
 
-    fn check(&self, event: &Event, author: Author) -> Result<(), LedgerError> {
+    fn check(&self, event: &Event, sender: Option<NodeId>) -> Result<(), LedgerError> {
         if matches!(event.kind, EventKind::Created { .. }) {
             return Err(LedgerError::CreatedTwice);
         }
@@ -807,7 +825,7 @@ impl Ledger {
             });
         }
         let writer = self.writer_for(&event.kind)?;
-        if let Author::Node(node) = author
+        if let Some(node) = sender
             && node != writer
         {
             return Err(LedgerError::NotAuthor { expected: writer });
@@ -1129,7 +1147,7 @@ mod tests {
             kind: EventKind::Note { text: "b".into() },
         })
         .unwrap();
-        let err = ledger.accept(unlinked, Author::OwnFile).unwrap_err();
+        let err = ledger.accept(unlinked, Author::Relayed).unwrap_err();
         assert!(matches!(err, LedgerError::PrevMismatch { head } if head == ledger.head()));
     }
 
@@ -1145,7 +1163,7 @@ mod tests {
             kind: EventKind::Note { text: "b".into() },
         })
         .unwrap();
-        let err = ledger.accept(ahead, Author::OwnFile).unwrap_err();
+        let err = ledger.accept(ahead, Author::Relayed).unwrap_err();
         assert!(matches!(
             err,
             LedgerError::StaleEpoch { yours, current } if yours == two && current == Epoch::FIRST
@@ -1228,6 +1246,42 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, LedgerError::NotAuthor { expected } if expected == node(2)));
+    }
+
+    #[test]
+    fn a_relayed_record_skips_only_the_sender_rule() {
+        let move_id = MoveId::from_bytes([5; 16]);
+        let on_target = departing_ledger(node(1), node(2), move_id);
+        let mut replica = on_target.clone();
+        let imported = on_target
+            .propose(
+                node(2),
+                EventKind::MoveImported {
+                    move_id,
+                    from: node(1),
+                },
+                eid(),
+                30,
+            )
+            .unwrap();
+        let err = replica
+            .accept(imported.clone(), Author::Node(node(3)))
+            .unwrap_err();
+        assert!(matches!(err, LedgerError::NotAuthor { expected } if expected == node(2)));
+        replica.accept(imported, Author::Relayed).unwrap();
+        assert_eq!(replica.lease().holder(), node(2));
+        let unlinked = Record::encode(Event {
+            id: eid(),
+            prev: None,
+            epoch: replica.lease().epoch(),
+            at: 31,
+            kind: EventKind::Note { text: "x".into() },
+        })
+        .unwrap();
+        assert!(matches!(
+            replica.accept(unlinked, Author::Relayed),
+            Err(LedgerError::PrevMismatch { .. })
+        ));
     }
 
     #[test]

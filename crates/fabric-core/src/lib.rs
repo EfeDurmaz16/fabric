@@ -37,9 +37,11 @@
 //! let suspended = on_pro.propose(pro, EventKind::Suspended { snapshot }, EventId::generate(), now)?;
 //! on_pro.commit(&mut pro_store, suspended, Author::Node(pro))?;
 //!
-//! // The Air holds a replica: every record so far, byte for byte.
+//! // The Air got the Created record when the job was made and verifies every
+//! // later record against the node the lease names as its writer.
 //! let mut air_store = MemoryStore::default();
-//! let mut on_air = Ledger::replay(job, on_pro.records().iter().cloned())?;
+//! air_store.append(&created)?;
+//! let mut on_air = Ledger::open(job, &air_store)?;
 //!
 //! // Step 3: the Pro commits to departing. From here it is not runnable.
 //! let started = on_pro.start_move(pro, air, MoveId::generate(), EventId::generate(), now)?;
