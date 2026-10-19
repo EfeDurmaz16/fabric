@@ -229,14 +229,11 @@ fn a_named_manager_without_its_lockfile_is_refused() {
     ])
     .unwrap();
     match detect(dir.path()) {
-        Err(DetectError::LockfileMissing {
-            manager,
-            because,
-            found,
-        }) => {
-            assert_eq!(manager, NodeManager::Pnpm);
-            assert_eq!(because, ManagerSource::PackageManagerField);
-            assert_eq!(found, ["package-lock.json"]);
+        Err(err @ DetectError::LockfileMissing { .. }) => {
+            assert_eq!(
+                err.to_string(),
+                "pnpm was chosen by `packageManager` in package.json but only package-lock.json exist; add its lockfile or set `package_manager` in .fabric/env.toml"
+            );
         }
         other => panic!("{other:?}"),
     }

@@ -23,6 +23,7 @@
 //! | `.fabric/env.toml` | the user's overrides, which win over everything above |
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
@@ -149,7 +150,8 @@ pub enum DetectError {
     BadPackageManagerField,
     /// More than one lockfile and nothing that says which manager owns the tree.
     #[error(
-        "found {lockfiles:?}; set `packageManager` in package.json or `package_manager` in {OVERRIDE_FILE}"
+        "found {}; set `packageManager` in package.json or `package_manager` in {OVERRIDE_FILE}",
+        lockfiles.join(", ")
     )]
     AmbiguousLockfiles {
         /// The lockfiles found at the root.
@@ -157,7 +159,8 @@ pub enum DetectError {
     },
     /// The chosen manager's lockfile is absent while another manager's is present.
     #[error(
-        "{manager:?} was chosen by {because:?} but only {found:?} exist; add its lockfile or set `package_manager` in {OVERRIDE_FILE}"
+        "{manager} was chosen by {because} but only {} exist; add its lockfile or set `package_manager` in {OVERRIDE_FILE}",
+        found.join(", ")
     )]
     LockfileMissing {
         /// The manager that was chosen.
@@ -232,6 +235,18 @@ pub enum NodeManager {
     Bun,
 }
 
+impl fmt::Display for NodeManager {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            NodeManager::Npm => "npm",
+            NodeManager::Pnpm => "pnpm",
+            NodeManager::YarnClassic => "yarn (classic)",
+            NodeManager::YarnBerry => "yarn (berry)",
+            NodeManager::Bun => "bun",
+        })
+    }
+}
+
 impl NodeManager {
     /// Every manager.
     pub(crate) const ALL: [NodeManager; 5] = [
@@ -299,6 +314,16 @@ pub enum ManagerSource {
     PackageManagerField,
     /// The only lockfile at the root.
     Lockfile,
+}
+
+impl fmt::Display for ManagerSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            ManagerSource::OverrideFile => "`package_manager` in .fabric/env.toml",
+            ManagerSource::PackageManagerField => "`packageManager` in package.json",
+            ManagerSource::Lockfile => "the only lockfile",
+        })
+    }
 }
 
 /// The package manager detection chose, and why.
