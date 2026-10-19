@@ -303,9 +303,10 @@ impl Ledger {
     /// Builds the `Stolen` record for `thief`.
     ///
     /// The `--force` gate is the CLI's (ADR 0003); the core refuses a steal
-    /// by the owner itself, which includes a departing source, and a steal
-    /// when `complete` is not the latest published snapshot: a steal never
-    /// resumes from nothing.
+    /// by the owner itself, which includes a departing source, a steal by
+    /// the target of the open move, which must import or abort instead, and
+    /// a steal when `complete` is not the latest published snapshot: a steal
+    /// never resumes from nothing.
     pub fn steal(
         &self,
         thief: NodeId,
@@ -317,6 +318,13 @@ impl Ledger {
         let owner = self.lease().holder();
         if thief == owner {
             return Err(LedgerError::StealBySelf);
+        }
+        if let LeaseState::Departing {
+            move_id, target, ..
+        } = self.lease()
+            && target == thief
+        {
+            return Err(LedgerError::StealByTarget { move_id });
         }
         let snapshot = self
             .manifest()
@@ -543,6 +551,44 @@ mod tests {
         assert!(matches!(
             third.record.event().kind,
             EventKind::Stolen { by, from, .. } if by == node(3) && from == node(1)
+        ));
+    }
+
+    /// The target holds the two legitimate exits of an open move; a steal by
+    /// it would leave the move undecided and the source asking forever.
+    #[test]
+    fn the_target_of_an_open_move_decides_it_and_cannot_steal() {
+        let move_id = MoveId::from_bytes([7; 16]);
+        let mut ledger = suspended_twice(node(1));
+        append(
+            &mut ledger,
+            node(1),
+            EventKind::MoveStarted {
+                move_id,
+                target: node(2),
+            },
+            5,
+        );
+        let latest = Some(CompleteSnapshot::new(snap(2)));
+        assert!(matches!(
+            ledger.steal(node(2), String::new(), latest, eid(9), 9),
+            Err(LedgerError::StealByTarget { move_id: m }) if m == move_id
+        ));
+        let relayed = Record::encode(crate::ledger::Event {
+            id: eid(9),
+            prev: Some(ledger.head()),
+            epoch: Epoch::FIRST.next().unwrap(),
+            at: 9,
+            kind: EventKind::Stolen {
+                by: node(2),
+                from: node(1),
+                reason: String::new(),
+            },
+        })
+        .unwrap();
+        assert!(matches!(
+            ledger.verify(relayed.bytes(), node(2)),
+            Err(LedgerError::StealByTarget { .. })
         ));
     }
 

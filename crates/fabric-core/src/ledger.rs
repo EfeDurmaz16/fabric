@@ -480,6 +480,12 @@ pub enum LedgerError {
     /// A steal by the owner itself, which a departing source still is.
     #[error("the owner cannot steal its own job")]
     StealBySelf,
+    /// A steal by the target of the open move, which holds the two exits already: import or abort.
+    #[error("the target of move {move_id} decides it; import or abort instead of stealing")]
+    StealByTarget {
+        /// The open move.
+        move_id: MoveId,
+    },
     /// A move started while the workspace is not suspended in the latest
     /// published snapshot: no `Suspended` names it, or a `Resumed` came after.
     #[error("job must be suspended in its latest snapshot before it moves")]
@@ -927,7 +933,12 @@ impl Ledger {
                     }
                     Ok(target)
                 }
-                EventKind::Stolen { by, from, .. } => steal_writer(node, *by, *from),
+                EventKind::Stolen { by, from, .. } => {
+                    if *by == target {
+                        return Err(LedgerError::StealByTarget { move_id });
+                    }
+                    steal_writer(node, *by, *from)
+                }
                 EventKind::Created { .. } => Err(LedgerError::CreatedTwice),
                 _ => Err(LedgerError::Departing { move_id, target }),
             },

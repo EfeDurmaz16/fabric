@@ -523,6 +523,9 @@ impl World {
                 assert_eq!(proposal.warning.owner, before.holder());
             }
             Err(LedgerError::StealBySelf) => assert_eq!(before.holder(), me),
+            Err(LedgerError::StealByTarget { .. }) => {
+                assert!(matches!(before, LeaseState::Departing { target, .. } if target == me));
+            }
             Err(LedgerError::StealWithoutSnapshot) => {
                 let none = self.nodes[thief]
                     .ledger
