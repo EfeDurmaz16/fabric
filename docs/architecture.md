@@ -132,3 +132,7 @@ If B dies between steps 4 and 8, B holds the lease with epoch 2 and the job is n
 ## How to read the ADRs
 
 Read them in number order. 0001 and 0002 define the data. 0003 is the one that protects the user's work and is worth the most review time. 0004 and 0005 are the storage and network mechanics. 0006 and 0007 are the adapters. 0008 is deliberately thin. 0009 is how we work. 0010 is what Fabric is not.
+
+### Evidence paths
+
+The ADRs cite research notes by file name: `2026-10-19-competitor-landscape.md`, `2026-10-19-t3code-vs-fabric.md`, `2026-10-19-step1-adversarial-review.md`, and `step1/H1` to `H6`. These are private working notes outside this repository, kept under `~/Documents/fabric-research/` on the owner's machines. They are not vendored, because they quote third-party sources at length and name people. A citation in an ADR is a pointer for the owner and a label for everyone else: the ADR text itself must carry enough of the fact for the decision to be judged without the note. Where it does not, that is a defect in the ADR.

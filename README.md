@@ -37,7 +37,7 @@ One job, adopted with `fabric job init` from a checkout where Claude Code is alr
 | [0009](docs/adr/0009-engineering-conventions.md) | Engineering conventions |
 | [0010](docs/adr/0010-name-and-scope-boundaries.md) | Name and scope boundaries |
 
-Start with the architecture page, then read the ADRs in order. ADR 0003 deserves the most attention; it is the one that protects the user's work.
+Start with the architecture page, then read the ADRs in order. ADR 0003 deserves the most attention; it is the one that protects the user's work. The research notes the ADRs cite are private and live outside this repository; the architecture page says what they are.
 
 ## Building
 
