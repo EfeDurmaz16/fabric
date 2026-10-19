@@ -264,35 +264,11 @@ args = ["-c", "echo three >> log"]
     assert_eq!(fs::read_to_string(dir.path().join("log")).unwrap(), "one\n");
 }
 
-/// A plan that cannot finish does not start: the first step would
-/// otherwise run before the missing program or variable is found.
+/// A plan that cannot finish does not start, and one error names every
+/// missing program and variable, so the user fixes them in one round.
 #[test]
-fn a_missing_program_or_variable_refuses_before_anything_runs() {
+fn missing_programs_and_variables_refuse_before_anything_runs_and_are_all_named() {
     let dir = tempfile::tempdir().unwrap();
-    let detected = declared(
-        dir.path(),
-        r#"
-[[cache]]
-path = "out"
-class = "build"
-
-[[setup]]
-program = "touch"
-args = ["ran"]
-
-[[setup]]
-program = "fabric-test-no-such-program"
-"#,
-    )
-    .unwrap();
-    let planned = plan(dir.path(), &detected).unwrap();
-    assert!(planned.steps()[0].program().is_some());
-    assert_eq!(planned.steps()[1].program(), None);
-    assert!(matches!(
-        planned.execute(),
-        Err(MaterializeError::ProgramNotFound { index: 1, .. })
-    ));
-
     let unset = "FABRIC_TEST_UNSET_VARIABLE_7Q2X";
     let detected = declared(
         dir.path(),
@@ -307,21 +283,45 @@ class = "build"
 [[setup]]
 program = "touch"
 args = ["ran"]
+
+[[setup]]
+program = "fabric-test-no-such-program"
+
+[[setup]]
+program = "fabric-test-no-such-program-either"
 "#
         ),
     )
     .unwrap();
     let planned = plan(dir.path(), &detected).unwrap();
+    assert!(planned.steps()[0].program().is_some());
+    assert_eq!(planned.steps()[1].program(), None);
     let missing: Vec<&str> = planned
         .missing_env()
         .iter()
         .map(EnvVarName::as_str)
         .collect();
     assert_eq!(missing, [unset]);
-    match planned.execute() {
-        Err(MaterializeError::MissingEnvVars { names }) => {
-            assert_eq!(names.len(), 1);
-            assert_eq!(names[0].as_str(), unset);
+    let err = planned.execute().unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("fabric-test-no-such-program-either"),
+        "{text}"
+    );
+    assert!(text.contains(unset), "{text}");
+    match err {
+        MaterializeError::CannotRun { programs, env } => {
+            let programs: Vec<(usize, &str)> =
+                programs.iter().map(|(i, p)| (*i, p.as_str())).collect();
+            assert_eq!(
+                programs,
+                [
+                    (1, "fabric-test-no-such-program"),
+                    (2, "fabric-test-no-such-program-either")
+                ]
+            );
+            assert_eq!(env.len(), 1);
+            assert_eq!(env[0].as_str(), unset);
         }
         other => panic!("{other:?}"),
     }

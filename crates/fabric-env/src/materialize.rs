@@ -90,22 +90,16 @@ pub enum MaterializeError {
         /// Zero-based index of the step in the spec.
         index: usize,
     },
-    /// Declared environment variables are not set on this node; nothing ran.
+    /// Programs are missing from `PATH` or declared variables are unset on this node; nothing ran.
     #[error(
-        "set these environment variables on this node first: {}",
-        names_list(names)
+        "nothing ran; fix all of this on this node first: {}",
+        cannot_run_list(programs, env)
     )]
-    MissingEnvVars {
-        /// The names that are missing.
-        names: Vec<EnvVarName>,
-    },
-    /// A step's program is not on this node's `PATH`; nothing ran.
-    #[error("`{program}` of setup step {index} is not on PATH on this node; install it first")]
-    ProgramNotFound {
-        /// Zero-based index of the step in the spec.
-        index: usize,
-        /// The program.
-        program: ProgramName,
+    CannotRun {
+        /// Every planned program that is not on `PATH`, with its step index.
+        programs: Vec<(usize, ProgramName)>,
+        /// Every declared variable that is not set.
+        env: Vec<EnvVarName>,
     },
     /// A step's program did not start.
     #[error("setup step {index} (`{program}`) did not start")]
@@ -141,12 +135,13 @@ pub enum MaterializeError {
     },
 }
 
-fn names_list(names: &[EnvVarName]) -> String {
-    names
+fn cannot_run_list(programs: &[(usize, ProgramName)], env: &[EnvVarName]) -> String {
+    let mut parts: Vec<String> = programs
         .iter()
-        .map(EnvVarName::as_str)
-        .collect::<Vec<_>>()
-        .join(", ")
+        .map(|(index, program)| format!("install `{program}` (setup step {index})"))
+        .collect();
+    parts.extend(env.iter().map(|name| format!("set {name}")));
+    parts.join("; ")
 }
 
 /// What materialize found at one cache path.
@@ -239,30 +234,29 @@ impl Plan {
     /// Runs the planned steps in order, streaming their output to `tracing`.
     ///
     /// Refuses before running anything when a planned program is missing or
-    /// a declared variable is unset. Stops at the first step that fails.
-    pub fn execute(&self) -> Result<(), MaterializeError> {
+    /// a declared variable is unset, with one error that lists all of them.
+    /// Stops at the first step that fails. Takes the plan by value: what it
+    /// read from the disk is stale once a step has run.
+    pub fn execute(self) -> Result<(), MaterializeError> {
         if self.steps.is_empty() {
             return Ok(());
         }
-        if !self.missing_env.is_empty() {
-            return Err(MaterializeError::MissingEnvVars {
-                names: self.missing_env.clone(),
+        let missing: Vec<(usize, ProgramName)> = self
+            .steps
+            .iter()
+            .filter(|planned| planned.program.is_none())
+            .map(|planned| (planned.index, planned.step.program.clone()))
+            .collect();
+        if !missing.is_empty() || !self.missing_env.is_empty() {
+            return Err(MaterializeError::CannotRun {
+                programs: missing,
+                env: self.missing_env,
             });
         }
-        let mut resolved = Vec::with_capacity(self.steps.len());
         for planned in &self.steps {
-            let program =
-                planned
-                    .program
-                    .as_deref()
-                    .ok_or_else(|| MaterializeError::ProgramNotFound {
-                        index: planned.index,
-                        program: planned.step.program.clone(),
-                    })?;
-            resolved.push((planned, program));
-        }
-        for (planned, program) in resolved {
-            run_step(planned, program)?;
+            if let Some(program) = planned.program.as_deref() {
+                run_step(planned, program)?;
+            }
         }
         Ok(())
     }
