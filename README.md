@@ -6,13 +6,14 @@ Private repository. Working name; see [ADR 0010](docs/adr/0010-name-and-scope-bo
 
 ## Status, honestly
 
-Core types only. Nothing suspends or resumes yet.
+Core types and the store. Nothing suspends or resumes yet.
 
 | What | State |
 |---|---|
 | Architecture page and glossary | Written: [docs/architecture.md](docs/architecture.md), [docs/glossary.md](docs/glossary.md) |
 | ADRs 0001 to 0012 | Written, see below; amended 2026-10-19 after the step 1 research |
 | `crates/fabric-core` | Ids, paths, the job ledger with its record codec, the lease and the cooperative move protocol, snapshot manifests and the environment spec. Pure: no IO, no clock, no socket. Property-tested against the ADR 0003 invariants. |
+| `crates/fabric-store` | Content-addressed objects (blake3, zstd, FastCDC above 8 MiB), the SQLite catalog with refcounts and a graced gc, workspace capture (git state as two private commits and a bundle, ignored files by class, secrets denied) and restore into an empty directory through a staging rename. Crash-tested with `SIGKILL` at every publish and restore checkpoint. No network, no ledger, no CLI. |
 | Every other crate in the layout | Does not exist yet |
 | CI | fmt, clippy, test, doc, `cargo deny` and the hygiene script on macOS and Ubuntu |
 
