@@ -38,14 +38,15 @@ lists the crate, version, last release date, and license.
 ## Workspace rules
 
 Every crate sets `[lints] workspace = true`. The root `Cargo.toml` holds the
-lint policy, and `clippy.toml` holds its test exceptions.
+lint policy, and `clippy.toml` holds its test exceptions and disallowed methods.
 
 - `unwrap`, `expect`, `panic!`, `println!` and `eprintln!` fail clippy outside
   tests. Inside a `#[cfg(test)]` module every function may use them. In
   `tests/` files only `#[test]` functions may; a helper there returns `Result`
   and writes nothing.
-- `todo!`, `unimplemented!`, `unreachable!`, `dbg!` and `std::process::exit`
-  fail clippy everywhere.
+- `todo!`, `unimplemented!`, `unreachable!` and `dbg!` fail clippy everywhere.
+- `std::process::exit` fails clippy everywhere, `main` included. Return
+  `std::process::ExitCode` from `main` so destructors run.
 - Every `#[allow]` and `#[expect]` carries a `reason = "..."`.
 - `missing_docs` also covers integration test files. Start each one with a `//!`
   line that says what it proves.

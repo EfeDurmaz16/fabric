@@ -35,7 +35,9 @@ unimplemented = "deny"
 dbg_macro = "deny"
 print_stdout = "deny"
 print_stderr = "deny"
-exit = "deny"
+# std::process::exit is a disallowed method in clippy.toml. clippy::exit alone
+# exempts main, the one place a binary would call it.
+disallowed_methods = "deny"
 # Every #[allow] and #[expect] names its reason, so a suppression cannot
 # switch a rule off silently.
 allow_attributes_without_reason = "deny"
