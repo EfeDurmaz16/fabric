@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::codec::{self, CodecError, VersionedError};
+use crate::harness::ProgramName;
 use crate::id::EnvSpecId;
 use crate::path::RelPath;
 
@@ -61,7 +62,7 @@ pub enum ToolSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetupStep {
     /// The program to run, looked up on `PATH`, never through a shell.
-    pub program: String,
+    pub program: ProgramName,
     /// Its arguments, passed as they are.
     pub args: Vec<String>,
     /// The directory to run in, relative to the root; `None` is the root itself.
@@ -117,7 +118,7 @@ mod tests {
                 source: ToolSource::Detected,
             }],
             setup: vec![SetupStep {
-                program: "npm".into(),
+                program: ProgramName::parse("npm").unwrap(),
                 args: vec!["ci".into()],
                 cwd: None,
                 when: RunWhen::CachesMissing,

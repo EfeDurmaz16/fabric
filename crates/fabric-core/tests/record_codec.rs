@@ -2,9 +2,10 @@
 //! the tail is a torn tail, every flipped byte before the tail is corruption
 //! with the right offset, and the named tail shapes of ADR 0002.
 
+use std::error::Error;
 use std::num::TryFromIntError;
 
-use fabric_core::harness::HarnessKind;
+use fabric_core::harness::{HarnessKind, ProgramName};
 use fabric_core::id::{EnvSpecId, Epoch, EventId, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::LeaseState;
 use fabric_core::ledger::{
@@ -55,7 +56,7 @@ fn kind() -> impl Strategy<Value = EventKind> {
         (
             node(),
             proptest::option::of(any::<[u8; 32]>()),
-            "[a-z]{1,8}"
+            "[a-z]{1,8}".prop_filter_map("valid program name", |s| ProgramName::parse(&s).ok())
         )
             .prop_map(|(n, s, program)| EventKind::Resumed {
                 node: n,
@@ -283,7 +284,7 @@ proptest! {
 }
 
 /// One event of every kind with fixed ids, encoded in declaration order.
-fn every_kind() -> Vec<Event> {
+fn every_kind() -> Result<Vec<Event>, Box<dyn Error>> {
     let n = |b: u8| NodeId::from_bytes([b; 32]);
     let s = |b: u8| SnapshotId::from_bytes([b; 32]);
     let m = MoveId::from_bytes([5; 16]);
@@ -317,7 +318,7 @@ fn every_kind() -> Vec<Event> {
             node: n(3),
             snapshot: Some(s(7)),
             harness: HarnessKind::Acp {
-                program: "opencode".into(),
+                program: ProgramName::parse("opencode")?,
                 args: vec!["acp".into()],
             },
         },
@@ -331,15 +332,18 @@ fn every_kind() -> Vec<Event> {
             text: "note".into(),
         },
     ];
+    let epoch = Epoch::new(3).ok_or("epoch 3 exists")?;
     kinds
         .into_iter()
         .enumerate()
-        .map(|(i, kind)| Event {
-            id: EventId::from_bytes([u8::try_from(i).unwrap_or(0); 16]),
-            prev: Some(RecordHash::from_bytes([2; 32])),
-            epoch: Epoch::new(3).unwrap_or(Epoch::FIRST),
-            at: 4,
-            kind,
+        .map(|(i, kind)| {
+            Ok(Event {
+                id: EventId::from_bytes([u8::try_from(i)?; 16]),
+                prev: Some(RecordHash::from_bytes([2; 32])),
+                epoch,
+                at: 4,
+                kind,
+            })
         })
         .collect()
 }
@@ -351,7 +355,7 @@ fn every_kind() -> Vec<Event> {
 #[test]
 fn record_format_version_one_bytes_are_pinned() {
     let mut all = Vec::new();
-    for event in every_kind() {
+    for event in every_kind().unwrap() {
         all.extend_from_slice(Record::encode(event).unwrap().bytes());
     }
     assert_eq!(

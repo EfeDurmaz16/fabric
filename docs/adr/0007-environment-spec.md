@@ -6,7 +6,7 @@ Amended 2026-10-19 after step 1 research. Step 1 of Materialize now reads the pe
 
 Amended 2026-10-19 while writing `fabric-core` (PR `feat/core`): `SetupStep.cwd` is `Option<RelPath>`, where `None` is the workspace root, because a `RelPath` cannot name the root itself (ADR 0004 forbids empty and `.` components). The edited-spec record is `EnvSpecChanged` (ADR 0002), not a free-text `Note`.
 
-Amended 2026-10-19 after the adversarial review of PR `feat/core`: a setup step is `{ program, args, cwd, when }` rather than `{ argv, cwd, when }`, so there is no empty command to refuse and the shape matches `HarnessKind::Acp` (ADR 0006). The format version is the first varint of the spec's bytes, not a field of the struct (ADR 0002, review amendment 5).
+Amended 2026-10-19 after the adversarial review of PR `feat/core`: a setup step is `{ program, args, cwd, when }` rather than `{ argv, cwd, when }`, so the shape matches `HarnessKind::Acp` (ADR 0006). The second review found that this alone did not remove the empty command: `program` was a bare string and `""`, `/tmp/x`, `../bin/x` and `-rf` all decoded. `program` is now `ProgramName`, a parsed type that is non-empty and holds no slash, no NUL and no leading `-`, checked inside `Deserialize`, so "looked up on `PATH`" is true by type. The format version is the first varint of the spec's bytes, not a field of the struct (ADR 0002, review amendment 5).
 
 ## Context
 
@@ -26,7 +26,7 @@ EnvSpec {                        the bytes start with the format version as a va
   cache_paths:   [RelPath],      what counts as a cache for snapshot policy and for "is it warm"
 }
 Tool      { name: String, version: String, source: Detected | Declared }   version is the tool's own exact string (`rustc -vV`, `node --version`, `pnpm --version`), never parsed into parts
-SetupStep { program: String, args: [String], cwd: Option<RelPath>, when: CachesMissing | Always }   cwd None is the root
+SetupStep { program: ProgramName, args: [String], cwd: Option<RelPath>, when: CachesMissing | Always }   cwd None is the root; ProgramName is a bare name, never a path or an option
 ```
 
 `program` is looked up on `PATH` and run with `args` directly, never through a shell. A spec travels with the job and a peer can send one, so there is no string for quoting bugs or a hostile `packageManager` field to hide in. Before the node runs a spec whose id differs from the one it last ran or wrote for that job, it prints the steps and asks, unless the command was given `--yes`.
