@@ -3,7 +3,9 @@
 //! Invariant: the private key lives in one file that only its owner can
 //! read, it is written once and never overwritten, and it leaves this module
 //! only as the PKCS#8 bytes the TLS layer signs with. The node id is the
-//! public key, so two machines never share an id.
+//! public key, so two machines never share an id. A crash while the key is
+//! being written leaves no key or a whole key, never a torn one, and the
+//! next start works either way.
 
 use std::fmt;
 use std::fs;
@@ -15,6 +17,9 @@ use std::path::{Path, PathBuf};
 use fabric_core::id::NodeId;
 use rcgen::{KeyPair, PKCS_ED25519};
 use rustls::pki_types::PrivatePkcs8KeyDer;
+
+use crate::checkpoint;
+use crate::durable::{sync_parent, temp_sibling};
 
 /// Why a node key could not be made, read or written.
 #[derive(Debug, thiserror::Error)]
@@ -99,8 +104,9 @@ impl NodeIdentity {
 
     /// Reads the key at `path`, or makes one and writes it there if none exists.
     ///
-    /// Two processes that race here end with the same key: the first write
-    /// wins and the second reads it.
+    /// Two processes that race here end with the same key: each writes its
+    /// own temporary file, the first hard link to `path` wins, and the other
+    /// reads the winner.
     pub fn load_or_generate(path: &Path) -> Result<Self, IdentityError> {
         match Self::load(path) {
             Err(IdentityError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {}
@@ -120,16 +126,18 @@ impl NodeIdentity {
 
     /// Writes the key to `path` with mode 0600, refusing to replace an existing file.
     ///
-    /// The bytes go to a sibling temporary file first and are synced; the
-    /// final name is then taken with a hard link, which fails if the file
-    /// exists, so a crash leaves either no key or a whole key.
+    /// The bytes go to a temporary file that only this call names and are
+    /// synced; the final name is then taken with a hard link, which fails
+    /// if the file exists; the directory is synced last. A crash can leave
+    /// a stray `node.key.<pid>.<clock>.<n>.tmp` behind: it names no node,
+    /// no start reads it, and it can be deleted.
     pub fn save(&self, path: &Path) -> Result<(), IdentityError> {
         let io = |source| IdentityError::Io {
             path: path.to_path_buf(),
             source,
         };
         let der = self.pkcs8_der();
-        let tmp = temp_path(path);
+        let tmp = temp_sibling(path);
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -140,9 +148,12 @@ impl NodeIdentity {
             file.sync_all()?;
             Ok::<(), io::Error>(())
         })();
+        checkpoint::reached("identity.after_tmp");
         let linked = written.and_then(|()| fs::hard_link(&tmp, path));
+        checkpoint::reached("identity.after_link");
         let _ = fs::remove_file(&tmp);
-        linked.map_err(io)
+        linked.map_err(io)?;
+        sync_parent(path).map_err(io)
     }
 
     /// Returns the node id: the public key.
@@ -173,14 +184,6 @@ impl NodeIdentity {
     }
 }
 
-fn temp_path(path: &Path) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .map_or_else(Default::default, std::ffi::OsStr::to_os_string);
-    name.push(".tmp");
-    path.with_file_name(name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,7 +200,33 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert!(!temp_path(&path).exists());
+        assert!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .all(|entry| entry.unwrap().file_name() == "node.key"),
+            "no temporary file is left behind"
+        );
+    }
+
+    #[test]
+    fn racing_writers_end_with_the_same_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.key");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let ids: Vec<NodeId> = (0..8)
+            .map(|_| {
+                let (path, barrier) = (path.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    NodeIdentity::load_or_generate(&path).unwrap().node_id()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert!(ids.iter().all(|id| *id == ids[0]));
+        assert_eq!(NodeIdentity::load(&path).unwrap().node_id(), ids[0]);
     }
 
     #[test]

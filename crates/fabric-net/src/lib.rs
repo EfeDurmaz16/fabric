@@ -12,6 +12,10 @@
 //! nodes that can reach each other's address can work, over a LAN, a public
 //! address or a tailnet alike; `docs/net.md` says how to run each.
 
+mod checkpoint;
+#[cfg(test)]
+mod crash_tests;
+mod durable;
 pub mod endpoint;
 pub mod frame;
 pub mod identity;
