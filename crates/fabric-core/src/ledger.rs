@@ -458,7 +458,7 @@ pub enum LedgerError {
     /// A move toward the owner itself.
     #[error("cannot move a job to its owner")]
     MoveToSelf,
-    /// A steal by the owner itself.
+    /// A steal by the owner itself, which a departing source still is.
     #[error("the owner cannot steal its own job")]
     StealBySelf,
     /// A move started while the head is not `Suspended`.
@@ -473,11 +473,8 @@ pub enum LedgerError {
     /// `Resumed` without a snapshot after one exists.
     #[error("Resumed must name a snapshot once one is published")]
     ResumedWithoutSnapshot,
-    /// A steal without `--force`.
-    #[error("steal needs --force")]
-    StealNeedsForce,
-    /// A steal from a node whose store lacks the latest snapshot.
-    #[error("steal refused: the latest snapshot is not complete in the local store")]
+    /// A steal from a node whose store does not hold the latest snapshot whole.
+    #[error("steal refused: the latest published snapshot is not complete in the local store")]
     StealWithoutSnapshot,
     /// This node is not the target the open move names.
     #[error("this node is not the target of move {move_id}")]

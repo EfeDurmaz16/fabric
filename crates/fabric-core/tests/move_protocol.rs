@@ -15,7 +15,7 @@ use fabric_core::lease::{FenceError, FencingToken, LeaseState};
 use fabric_core::ledger::{
     Author, EventKind, Ledger, LedgerError, LedgerStore, MemoryStore, Record,
 };
-use fabric_core::moves::{AbortAnswer, MoveOffer, OfferAnswer};
+use fabric_core::moves::{AbortAnswer, CompleteSnapshot, MoveOffer, OfferAnswer};
 use proptest::prelude::*;
 
 const NODES: usize = 3;
@@ -59,7 +59,6 @@ enum Op {
     },
     Steal {
         thief: usize,
-        force: bool,
         snapshot_complete: bool,
     },
 }
@@ -245,9 +244,8 @@ impl World {
             }
             Op::Steal {
                 thief,
-                force,
                 snapshot_complete,
-            } => self.steal(thief % NODES, force, snapshot_complete),
+            } => self.steal(thief % NODES, snapshot_complete),
         }
     }
 
@@ -428,11 +426,12 @@ impl World {
         let me = self.nodes[to].id;
         let current = self.nodes[to].ledger.lease().epoch();
         let at = self.tick();
+        let complete = snapshot_complete.then_some(CompleteSnapshot::new(offer.snapshot));
         let answer = self.nodes[to].ledger.answer_offer(
             me,
             &offer,
             epoch,
-            snapshot_complete,
+            complete,
             EventId::generate(),
             at,
         );
@@ -481,22 +480,25 @@ impl World {
         Ok(())
     }
 
-    fn steal(&mut self, thief: usize, force: bool, snapshot_complete: bool) -> Fallible {
+    /// `snapshot_complete` models a store that holds the latest snapshot whole.
+    fn steal(&mut self, thief: usize, snapshot_complete: bool) -> Fallible {
         let me = self.nodes[thief].id;
         let before = self.nodes[thief].ledger.lease();
         let head = self.nodes[thief].ledger.head();
+        let complete = self.nodes[thief]
+            .ledger
+            .manifest()
+            .latest_snapshot
+            .filter(|_| snapshot_complete)
+            .map(CompleteSnapshot::new);
         let at = self.tick();
-        let result = self.nodes[thief].ledger.steal(
-            me,
-            force,
-            "test".into(),
-            snapshot_complete,
-            EventId::generate(),
-            at,
-        );
+        let result =
+            self.nodes[thief]
+                .ledger
+                .steal(me, "test".into(), complete, EventId::generate(), at);
         match result {
             Ok(proposal) => {
-                assert!(force && snapshot_complete);
+                assert!(snapshot_complete);
                 assert_ne!(before.holder(), me);
                 self.commit_own(thief, proposal.record)?;
                 self.steals += 1;
@@ -512,7 +514,6 @@ impl World {
                 assert_eq!(proposal.warning.owner, before.holder());
             }
             Err(LedgerError::StealBySelf) => assert_eq!(before.holder(), me),
-            Err(LedgerError::StealNeedsForce) => assert!(!force),
             Err(LedgerError::StealWithoutSnapshot) => {
                 let none = self.nodes[thief]
                     .ledger
@@ -652,8 +653,8 @@ fn op_strategy(allow_steal: bool) -> BoxedStrategy<Op> {
     if allow_steal {
         prop_oneof![
             8 => base,
-            1 => (n, any::<bool>(), any::<bool>()).prop_map(|(thief, force, snapshot_complete)| {
-                Op::Steal { thief, force, snapshot_complete }
+            1 => (n, any::<bool>()).prop_map(|(thief, snapshot_complete)| {
+                Op::Steal { thief, snapshot_complete }
             }),
         ]
         .boxed()

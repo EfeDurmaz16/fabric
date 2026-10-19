@@ -15,7 +15,7 @@
 //! use fabric_core::harness::HarnessKind;
 //! use fabric_core::id::{EventId, JobId, MoveId, NodeId, SnapshotId};
 //! use fabric_core::ledger::{Author, EventKind, Ledger, LedgerStore, MemoryStore};
-//! use fabric_core::moves::{LeaseView, OfferAnswer};
+//! use fabric_core::moves::{CompleteSnapshot, LeaseView, OfferAnswer};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let job = JobId::generate();
@@ -55,7 +55,8 @@
 //!     let checked = on_air.verify(record.bytes(), pro)?;
 //!     on_air.commit(&mut air_store, checked, Author::Node(pro))?;
 //! }
-//! let decision = match on_air.answer_offer(air, &offer, on_pro.lease().epoch(), true, EventId::generate(), now) {
+//! let complete = Some(CompleteSnapshot::new(snapshot));
+//! let decision = match on_air.answer_offer(air, &offer, on_pro.lease().epoch(), complete, EventId::generate(), now) {
 //!     OfferAnswer::Import(record) => on_air.commit(&mut air_store, record, Author::Node(air))?.clone(),
 //!     other => panic!("expected an import, got {other:?}"),
 //! };

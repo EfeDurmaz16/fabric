@@ -56,12 +56,34 @@ pub enum AbortAnswer {
     Abort(Record),
 }
 
-/// A steal checked against the rules; persist and accept `record`, then print `warning`.
+/// The store's word that every chunk of one snapshot is present locally.
+///
+/// Only a store that has checked its catalog should make one. The move
+/// protocol and the steal compare the named snapshot with the one the ledger
+/// requires, so a caller cannot check one snapshot and vouch for another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompleteSnapshot(SnapshotId);
+
+impl CompleteSnapshot {
+    /// Names a snapshot the store verified as complete.
+    #[must_use]
+    pub const fn new(snapshot: SnapshotId) -> Self {
+        Self(snapshot)
+    }
+
+    /// Returns the snapshot.
+    #[must_use]
+    pub const fn id(self) -> SnapshotId {
+        self.0
+    }
+}
+
+/// A steal checked against the rules; print `warning`, then persist and accept `record`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StealProposal {
     /// The `Stolen` record to persist and accept.
     pub record: Record,
-    /// What the user must be told before the steal takes effect.
+    /// What the user is told before the record is persisted.
     pub warning: StealWarning,
 }
 
@@ -157,17 +179,17 @@ impl Ledger {
 
     /// Decides an offer by the three rules of ADR 0003, in order.
     ///
-    /// `offered_epoch` is the epoch in the message envelope and
-    /// `snapshot_complete` says whether the local store holds every chunk of
-    /// `offer.snapshot`. The answer is pure: `Import` and the new record must
-    /// be persisted and accepted by the caller before the reply leaves.
+    /// `offered_epoch` is the epoch in the message envelope and `complete`
+    /// is the store's word on which snapshot it holds whole, if any. The
+    /// answer is pure: `Import` and the new record must be persisted and
+    /// accepted by the caller before the reply leaves.
     #[must_use]
     pub fn answer_offer(
         &self,
         me: NodeId,
         offer: &MoveOffer,
         offered_epoch: Epoch,
-        snapshot_complete: bool,
+        complete: Option<CompleteSnapshot>,
         id: EventId,
         at: u64,
     ) -> OfferAnswer {
@@ -195,7 +217,7 @@ impl Ledger {
             && move_id == offer.move_id
             && target == me
             && self.manifest().latest_snapshot == Some(offer.snapshot);
-        if !links || !snapshot_complete {
+        if !links || complete.map(CompleteSnapshot::id) != Some(offer.snapshot) {
             return OfferAnswer::Rejected { head: self.head() };
         }
         match self.propose(
@@ -243,16 +265,17 @@ impl Ledger {
         }
     }
 
-    /// Builds the `Stolen` record for `thief`, behind `force`.
+    /// Builds the `Stolen` record for `thief`.
     ///
-    /// Refused without `force`, by the owner itself, and when the local store
-    /// does not hold the latest snapshot: a steal never resumes from nothing.
+    /// The `--force` gate is the CLI's (ADR 0003); the core refuses a steal
+    /// by the owner itself, which includes a departing source, and a steal
+    /// when `complete` is not the latest published snapshot: a steal never
+    /// resumes from nothing.
     pub fn steal(
         &self,
         thief: NodeId,
-        force: bool,
         reason: String,
-        snapshot_complete: bool,
+        complete: Option<CompleteSnapshot>,
         id: EventId,
         at: u64,
     ) -> Result<StealProposal, LedgerError> {
@@ -260,13 +283,10 @@ impl Ledger {
         if thief == owner {
             return Err(LedgerError::StealBySelf);
         }
-        if !force {
-            return Err(LedgerError::StealNeedsForce);
-        }
         let snapshot = self
             .manifest()
             .latest_snapshot
-            .filter(|_| snapshot_complete)
+            .filter(|latest| complete.map(CompleteSnapshot::id) == Some(*latest))
             .ok_or(LedgerError::StealWithoutSnapshot)?;
         let record = self.propose(
             thief,
@@ -319,5 +339,123 @@ impl Ledger {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::HarnessKind;
+    use crate::id::JobId;
+    use crate::ledger::Author;
+
+    fn node(b: u8) -> NodeId {
+        NodeId::from_bytes([b; 32])
+    }
+
+    fn eid(b: u8) -> EventId {
+        EventId::from_bytes([b; 16])
+    }
+
+    fn snap(b: u8) -> SnapshotId {
+        SnapshotId::of(&[b])
+    }
+
+    fn append(ledger: &mut Ledger, author: NodeId, kind: EventKind, seq: u8) {
+        let record = ledger
+            .propose(author, kind, eid(seq), u64::from(seq))
+            .unwrap();
+        ledger.accept(record, Author::Node(author)).unwrap();
+    }
+
+    /// A ledger owned by node 1 with two published snapshots, suspended at the second.
+    fn suspended_twice(owner: NodeId) -> Ledger {
+        let created = Ledger::created(
+            JobId::from_bytes([3; 16]),
+            "goal".into(),
+            HarnessKind::ClaudeCode,
+            owner,
+            eid(1),
+            1,
+        )
+        .unwrap();
+        let mut ledger = Ledger::replay(JobId::from_bytes([3; 16]), [created]).unwrap();
+        append(
+            &mut ledger,
+            owner,
+            EventKind::SnapshotPublished {
+                snapshot: snap(1),
+                parent: None,
+            },
+            2,
+        );
+        append(
+            &mut ledger,
+            owner,
+            EventKind::SnapshotPublished {
+                snapshot: snap(2),
+                parent: Some(snap(1)),
+            },
+            3,
+        );
+        append(
+            &mut ledger,
+            owner,
+            EventKind::Suspended { snapshot: snap(2) },
+            4,
+        );
+        ledger
+    }
+
+    #[test]
+    fn steal_needs_the_witness_for_the_latest_snapshot() {
+        let ledger = suspended_twice(node(1));
+        let older = Some(CompleteSnapshot::new(snap(1)));
+        assert!(matches!(
+            ledger.steal(node(2), String::new(), older, eid(9), 9),
+            Err(LedgerError::StealWithoutSnapshot)
+        ));
+        assert!(matches!(
+            ledger.steal(node(2), String::new(), None, eid(9), 9),
+            Err(LedgerError::StealWithoutSnapshot)
+        ));
+        let latest = Some(CompleteSnapshot::new(snap(2)));
+        let proposal = ledger
+            .steal(node(2), "pro asleep".into(), latest, eid(9), 9)
+            .unwrap();
+        assert_eq!(proposal.warning.snapshot, snap(2));
+        assert_eq!(proposal.warning.owner, node(1));
+        assert_eq!(proposal.warning.last_record_at, 4);
+    }
+
+    /// ADR 0003, Recovery: while a move is open the source is still the owner
+    /// of record, so it cannot steal from itself. With two nodes a vanished
+    /// target leaves the job frozen until the target answers or a third node
+    /// steals; the alternative is recorded in ADR 0003's open questions.
+    #[test]
+    fn a_departing_source_cannot_steal_its_own_frozen_move() {
+        let mut ledger = suspended_twice(node(1));
+        append(
+            &mut ledger,
+            node(1),
+            EventKind::MoveStarted {
+                move_id: MoveId::from_bytes([7; 16]),
+                target: node(2),
+            },
+            5,
+        );
+        let latest = Some(CompleteSnapshot::new(snap(2)));
+        assert!(matches!(
+            ledger.steal(node(1), String::new(), latest, eid(9), 9),
+            Err(LedgerError::StealBySelf)
+        ));
+        assert!(ledger.runnable_by(node(1)).is_none());
+        let third = ledger
+            .steal(node(3), String::new(), latest, eid(9), 9)
+            .unwrap();
+        assert!(matches!(
+            third.record.event().kind,
+            EventKind::Stolen { by, from, .. } if by == node(3) && from == node(1)
+        ));
     }
 }
