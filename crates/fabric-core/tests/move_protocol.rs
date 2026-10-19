@@ -434,7 +434,7 @@ impl World {
             complete,
             EventId::generate(),
             at,
-        );
+        )?;
         if epoch < current && self.nodes[to].ledger.decision_for(offer.move_id).is_none() {
             assert!(
                 matches!(answer, OfferAnswer::Stale { .. }),
@@ -447,7 +447,8 @@ impl World {
                 self.reply(to, from, &record);
             }
             OfferAnswer::Decided(record) => self.reply(to, from, &record),
-            OfferAnswer::Rejected { .. } => {
+            OfferAnswer::Rejected { .. } | OfferAnswer::SnapshotIncomplete { .. } => {
+                // The source pushes what the target lacks and offers again.
                 let still_open = self.nodes[from].departing_toward().map(|(m, _)| m);
                 if still_open == Some(offer.move_id) {
                     self.sync(from, to)?;

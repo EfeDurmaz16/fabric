@@ -11,13 +11,15 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::id::{Epoch, EventId, MoveId, NodeId, RecordHash, SnapshotId};
+use crate::id::{Epoch, EventId, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use crate::lease::{FencingToken, LeaseState};
 use crate::ledger::{EventKind, Ledger, LedgerError, Record};
 
 /// What the owner sends after `MoveStarted` is durable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MoveOffer {
+    /// The job the move is for; an offer for another job is refused.
+    pub job_id: JobId,
     /// The move.
     pub move_id: MoveId,
     /// The owner's head, which is the `MoveStarted` record.
@@ -33,12 +35,17 @@ pub enum OfferAnswer {
     Decided(Record),
     /// Import now: persist this `MoveImported`, accept it, then send it.
     Import(Record),
-    /// The offer does not link to this node's head; the sender fetches the suffix and offers again.
+    /// The offer does not link to this node's head; the sender pushes the suffix after `head` and offers again.
     Rejected {
         /// This node's head.
         head: RecordHash,
     },
-    /// The offer carries an older epoch than this node knows.
+    /// The offer links but the named snapshot is not whole in this node's store; the sender pushes it and offers again.
+    SnapshotIncomplete {
+        /// The snapshot the sender must push.
+        snapshot: SnapshotId,
+    },
+    /// The offer carries an older epoch than this node knows; the sender fetches first.
     Stale {
         /// The offer's epoch.
         yours: Epoch,
@@ -158,6 +165,7 @@ impl Ledger {
     pub fn offer(&self, me: NodeId) -> Option<MoveOffer> {
         match self.lease() {
             LeaseState::Departing { node, move_id, .. } if node == me => Some(MoveOffer {
+                job_id: self.job_id(),
                 move_id,
                 head: self.head(),
                 snapshot: self.manifest().latest_snapshot?,
@@ -180,10 +188,12 @@ impl Ledger {
     /// Decides an offer by the three rules of ADR 0003, in order.
     ///
     /// `offered_epoch` is the epoch in the message envelope and `complete`
-    /// is the store's word on which snapshot it holds whole, if any. The
-    /// answer is pure: `Import` and the new record must be persisted and
-    /// accepted by the caller before the reply leaves.
-    #[must_use]
+    /// is the store's word on which snapshot it holds whole, if any. Every
+    /// `Ok` answer is a protocol step the sender can act on; an `Err` is a
+    /// cause the sender cannot fix by retrying, such as an offer for another
+    /// job or for a move whose target is another node, and the caller prints
+    /// it. The answer is pure: `Import` and the new record must be persisted
+    /// and accepted by the caller before the reply leaves.
     pub fn answer_offer(
         &self,
         me: NodeId,
@@ -192,16 +202,22 @@ impl Ledger {
         complete: Option<CompleteSnapshot>,
         id: EventId,
         at: u64,
-    ) -> OfferAnswer {
+    ) -> Result<OfferAnswer, LedgerError> {
+        if offer.job_id != self.job_id() {
+            return Err(LedgerError::WrongJob {
+                found: offer.job_id,
+                expected: self.job_id(),
+            });
+        }
         if let Some(record) = self.decision_for(offer.move_id) {
-            return OfferAnswer::Decided(record.clone());
+            return Ok(OfferAnswer::Decided(record.clone()));
         }
         let current = self.lease().epoch();
         if offered_epoch < current {
-            return OfferAnswer::Stale {
+            return Ok(OfferAnswer::Stale {
                 yours: offered_epoch,
                 current,
-            };
+            });
         }
         let LeaseState::Departing {
             node,
@@ -210,17 +226,24 @@ impl Ledger {
             ..
         } = self.lease()
         else {
-            return OfferAnswer::Rejected { head: self.head() };
+            return Ok(OfferAnswer::Rejected { head: self.head() });
         };
         let links = offer.head == self.head()
             && offered_epoch == current
             && move_id == offer.move_id
-            && target == me
             && self.manifest().latest_snapshot == Some(offer.snapshot);
-        if !links || complete.map(CompleteSnapshot::id) != Some(offer.snapshot) {
-            return OfferAnswer::Rejected { head: self.head() };
+        if !links {
+            return Ok(OfferAnswer::Rejected { head: self.head() });
         }
-        match self.propose(
+        if target != me {
+            return Err(LedgerError::NotTarget { move_id });
+        }
+        if complete.map(CompleteSnapshot::id) != Some(offer.snapshot) {
+            return Ok(OfferAnswer::SnapshotIncomplete {
+                snapshot: offer.snapshot,
+            });
+        }
+        let record = self.propose(
             me,
             EventKind::MoveImported {
                 move_id,
@@ -228,10 +251,8 @@ impl Ledger {
             },
             id,
             at,
-        ) {
-            Ok(record) => OfferAnswer::Import(record),
-            Err(_) => OfferAnswer::Rejected { head: self.head() },
-        }
+        )?;
+        Ok(OfferAnswer::Import(record))
     }
 
     /// Decides an abort request for `move_id` on the target.
@@ -426,6 +447,55 @@ mod tests {
         assert_eq!(proposal.warning.snapshot, snap(2));
         assert_eq!(proposal.warning.owner, node(1));
         assert_eq!(proposal.warning.last_record_at, 4);
+    }
+
+    #[test]
+    fn answer_offer_names_each_refusal() {
+        let move_id = MoveId::from_bytes([7; 16]);
+        let mut on_source = suspended_twice(node(1));
+        append(
+            &mut on_source,
+            node(1),
+            EventKind::MoveStarted {
+                move_id,
+                target: node(2),
+            },
+            5,
+        );
+        let offer = on_source.offer(node(1)).unwrap();
+        let epoch = on_source.lease().epoch();
+        let complete = Some(CompleteSnapshot::new(snap(2)));
+
+        let foreign = MoveOffer {
+            job_id: JobId::from_bytes([8; 16]),
+            ..offer
+        };
+        assert!(matches!(
+            on_source.answer_offer(node(2), &foreign, epoch, complete, eid(9), 9),
+            Err(LedgerError::WrongJob { .. })
+        ));
+
+        let behind = suspended_twice(node(1));
+        assert!(matches!(
+            behind.answer_offer(node(2), &offer, epoch, complete, eid(9), 9),
+            Ok(OfferAnswer::Rejected { head }) if head == behind.head()
+        ));
+
+        assert!(matches!(
+            on_source.answer_offer(node(3), &offer, epoch, complete, eid(9), 9),
+            Err(LedgerError::NotTarget { move_id: m }) if m == move_id
+        ));
+
+        let older = Some(CompleteSnapshot::new(snap(1)));
+        assert!(matches!(
+            on_source.answer_offer(node(2), &offer, epoch, older, eid(9), 9),
+            Ok(OfferAnswer::SnapshotIncomplete { snapshot }) if snapshot == snap(2)
+        ));
+
+        assert!(matches!(
+            on_source.answer_offer(node(2), &offer, epoch, complete, eid(9), 9),
+            Ok(OfferAnswer::Import(_))
+        ));
     }
 
     /// ADR 0003, Recovery: while a move is open the source is still the owner

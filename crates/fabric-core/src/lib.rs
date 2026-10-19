@@ -56,7 +56,7 @@
 //!     on_air.commit(&mut air_store, checked, Author::Node(pro))?;
 //! }
 //! let complete = Some(CompleteSnapshot::new(snapshot));
-//! let decision = match on_air.answer_offer(air, &offer, on_pro.lease().epoch(), complete, EventId::generate(), now) {
+//! let decision = match on_air.answer_offer(air, &offer, on_pro.lease().epoch(), complete, EventId::generate(), now)? {
 //!     OfferAnswer::Import(record) => on_air.commit(&mut air_store, record, Author::Node(air))?.clone(),
 //!     other => panic!("expected an import, got {other:?}"),
 //! };
