@@ -664,13 +664,24 @@ fn choose_node_manager(
     package: &PackageJson,
     declared: Option<PackageManagerName>,
 ) -> Result<Option<ManagerChoice>, DetectError> {
+    // Ambiguity is decided on the managers that own a present lockfile, not
+    // on the file names: Bun's `bun.lock` next to its older `bun.lockb` is
+    // one manager, not two.
     let mut lockfiles = Vec::new();
+    let mut owners = Vec::new();
     for manager in NodeManager::ALL {
         for &file in manager.lockfiles() {
             if !lockfiles.contains(&file) && exists(root, file)? {
                 lockfiles.push(file);
+                if !owners.contains(&manager.name()) {
+                    owners.push(manager.name());
+                }
             }
         }
+    }
+    if lockfiles.is_empty() {
+        tracing::warn!("package.json has no lockfile; node_modules travels as the user's files");
+        return Ok(None);
     }
     let berry = match package.yarn_major {
         Some(major) => major >= 2,
@@ -683,39 +694,25 @@ fn choose_node_manager(
         PackageManagerName::Yarn => NodeManager::YarnClassic,
         PackageManagerName::Bun => NodeManager::Bun,
     };
-    let chosen = if let Some(name) = declared {
-        Some((resolve(name), ManagerSource::OverrideFile))
+    let (name, because) = if let Some(name) = declared {
+        (name, ManagerSource::OverrideFile)
     } else if let Some((name, _)) = &package.manager {
-        Some((resolve(*name), ManagerSource::PackageManagerField))
+        (*name, ManagerSource::PackageManagerField)
     } else {
-        match lockfiles.as_slice() {
-            [] => None,
-            [only] => NodeManager::ALL
-                .into_iter()
-                .find(|m| m.lockfiles().contains(only))
-                .map(|m| (resolve(m.name()), ManagerSource::Lockfile)),
+        match owners.as_slice() {
+            [only] => (*only, ManagerSource::Lockfile),
             _ => return Err(DetectError::AmbiguousLockfiles { lockfiles }),
         }
     };
-    let Some((manager, because)) = chosen else {
-        tracing::warn!("package.json has no lockfile; node_modules travels as the user's files");
-        return Ok(None);
-    };
-    if manager.lockfiles().iter().any(|f| lockfiles.contains(f)) {
-        return Ok(Some(ManagerChoice { manager, because }));
+    let manager = resolve(name);
+    if !owners.contains(&name) {
+        return Err(DetectError::LockfileMissing {
+            manager,
+            because,
+            found: lockfiles,
+        });
     }
-    if lockfiles.is_empty() {
-        tracing::warn!(
-            manager = manager.name().as_str(),
-            "package.json has no lockfile; node_modules travels as the user's files"
-        );
-        return Ok(None);
-    }
-    Err(DetectError::LockfileMissing {
-        manager,
-        because,
-        found: lockfiles,
-    })
+    Ok(Some(ManagerChoice { manager, because }))
 }
 
 /// Reads `[tools]` from `mise.toml`: a string, the first string of an array, or a table's `version`.

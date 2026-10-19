@@ -122,7 +122,7 @@ fn cargo_fetch_is_locked_exactly_when_a_lockfile_exists() {
 
 #[test]
 fn each_lockfile_names_its_manager_and_install() {
-    let cases: [(&[&str], NodeManager, &str); 6] = [
+    let cases: [(&[&str], NodeManager, &str); 7] = [
         (
             &["pnpm-lock.yaml"],
             NodeManager::Pnpm,
@@ -146,6 +146,12 @@ fn each_lockfile_names_its_manager_and_install() {
         ),
         (
             &["bun.lockb"],
+            NodeManager::Bun,
+            "bun install --frozen-lockfile",
+        ),
+        // The text lockfile next to the binary one it replaced is one manager, not two.
+        (
+            &["bun.lock", "bun.lockb"],
             NodeManager::Bun,
             "bun install --frozen-lockfile",
         ),
