@@ -68,16 +68,19 @@ pub enum AbortAnswer {
     Abort(Record),
 }
 
-/// The store's word that every chunk of one snapshot is present locally.
+/// The snapshot the caller checked is whole in the local store.
 ///
-/// Only a store that has checked its catalog should make one. The move
-/// protocol and the steal compare the named snapshot with the one the ledger
-/// requires, so a caller cannot check one snapshot and vouch for another.
+/// The core cannot see the store, so this proves nothing about
+/// completeness by itself; what it adds is the name. The move protocol and
+/// the steal compare it with the one snapshot the rules require, so a caller
+/// that checked an older snapshot cannot vouch for the latest one by
+/// passing a flag. The check itself belongs to the store crate, which is
+/// the only place that can make it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompleteSnapshot(SnapshotId);
 
 impl CompleteSnapshot {
-    /// Names a snapshot the store verified as complete.
+    /// Names the snapshot the caller checked.
     #[must_use]
     pub const fn new(snapshot: SnapshotId) -> Self {
         Self(snapshot)
