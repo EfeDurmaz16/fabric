@@ -22,6 +22,8 @@ compile_error!(
 
 pub mod frame;
 pub mod identity;
+#[cfg(feature = "quic")]
+pub mod quic;
 pub mod tls;
 pub mod transport;
 
