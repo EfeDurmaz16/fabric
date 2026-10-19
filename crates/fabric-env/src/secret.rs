@@ -14,8 +14,6 @@
 //! `.aws` denies `config/.aws/credentials` and `.docker/config.json` denies
 //! `home/.docker/config.json`. A matching directory denies everything under it.
 
-use std::fmt;
-
 use fabric_core::path::RelPath;
 
 /// Patterns that apply everywhere, inside caches included.
@@ -87,7 +85,7 @@ pub enum PatternError {
 }
 
 /// A checked secret pattern a job adds to the built-in list.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pattern(String);
 
 impl Pattern {
@@ -121,18 +119,6 @@ impl Pattern {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-}
-
-impl fmt::Debug for Pattern {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Pattern({:?})", self.0)
-    }
-}
-
-impl fmt::Display for Pattern {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
     }
 }
 
