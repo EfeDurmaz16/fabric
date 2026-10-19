@@ -46,6 +46,10 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Node id.** The ed25519 public key of a node. Also the TLS identity pinned on every connection.
 
+**Orphan snapshot.** A snapshot that is not on its job's chain, made by `fabric orphan export` from an orphan workspace and pinned in the store so gc keeps it.
+
+**Orphan workspace.** A workspace left on a node that lost the lease before it suspended. Kept in place forever until the user exports or removes it.
+
 **Pairing.** Telling one node the id and address of another, out of band. Pairing is how trust is established. Discovery is never trust.
 
 **Placement.** Choosing which node resumes a job.
@@ -58,13 +62,15 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Snapshot.** An immutable, content-addressed capture of a workspace and its harness state at one moment.
 
-**Store.** A node's local blob directory plus catalog.
+**Store.** A node's local blob directory plus catalog. Written by one process at a time, under the data directory lock.
 
 **Suspend.** Stop the harness cleanly, publish a snapshot, release the lease.
 
 **Transport.** The trait that connects two nodes by id and gives them byte streams. QUIC first, TCP+TLS as fallback.
 
 **Trigger.** Whatever starts a suspend or a move. Manual in v0.
+
+**Unreferenced chunk.** A chunk or manifest that no live snapshot reaches. Invisible to readers; the only thing `fabric store gc` removes.
 
 **Warm cache.** A node already holds most chunks of a job's latest snapshot, so a resume there moves little data.
 

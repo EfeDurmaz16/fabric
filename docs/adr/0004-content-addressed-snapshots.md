@@ -18,9 +18,13 @@ Each node has one store at `<fabric-data>/store/`:
 store/
   chunks/ab/cdef...    one file per chunk, zstd-compressed, named by blake3 of the uncompressed bytes
   manifests/<hash>     snapshot manifests, postcard, named by blake3 of their bytes
-  catalog.sqlite       rusqlite (bundled); tables: chunks, snapshots, snapshot_chunks, jobs
-  tmp/                 staging for in-flight writes, cleared on open
+  catalog.sqlite       rusqlite (bundled); tables: chunks, snapshots, snapshot_chunks, jobs, pins
+  tmp/                 staging for in-flight writes, cleared by the lock holder at open
 ```
+
+### One writer per data directory
+
+Exactly one process writes `<fabric-data>` at a time. It takes an exclusive `flock` on `<fabric-data>/lock` at open and holds it until exit. While `fabric node serve` runs, it holds the lock, and every CLI command that writes (`suspend`, `resume`, `store gc`, `orphan export`) is sent to it over the Unix socket `<fabric-data>/node.sock`; the CLI prints the node's answer. When no node is running, the CLI takes the lock itself and acts as the node for the duration of the command. A second opener that cannot get the lock fails with `StoreLocked { pid }`; it never waits silently and never proceeds, so a CLI opening the store mid-publish cannot clear the daemon's staged files. `tmp/` is cleared by the lock holder at open and by nobody else.
 
 ### Chunking and hashing
 
@@ -86,7 +90,11 @@ Entry { rel_path: RelPath, kind: File | Dir | Symlink { target: String }, mode: 
 5. `fsync` the `manifests/` and `chunks/` directories.
 6. Only now append `SnapshotPublished` to the job ledger (ADR 0002).
 
-A snapshot exists if and only if its ledger event exists. Chunks or manifests without a ledger event are orphans and are removed by `fabric store gc`, never on open and never automatically.
+The ledger event is the single commit point. A snapshot is live on a node if a ledger event on that node references it or a row in `pins` names it. Chunks and manifests that no live snapshot reaches are unreferenced: invisible to every reader, and removed only by `fabric store gc`.
+
+`pins` holds snapshot ids that must survive gc although no ledger event names them. `fabric orphan export` (ADR 0003) writes one for the snapshot it produces, because the node that exports is fenced and cannot append to the chain. `fabric status` lists pinned snapshots as orphan snapshots. A later `fabric orphan restore <snapshot> --into <dir>` materializes one into a directory the user names; recovery is the one place a path is typed.
+
+`fabric store gc` runs inside the lock holder and is serialized with publish and fetch by an in-process guard: gc refuses to start while a publish or fetch is in flight (`GcBusy`), and a publish or fetch refuses to start during gc. It computes the reachable set from every job ledger on the node plus every row in `pins`, and removes only chunks and manifests outside that set. It never runs on open and never automatically.
 
 ### Restore: path-relative, never over unpublished work
 
