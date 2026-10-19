@@ -55,7 +55,7 @@ SnapshotManifest = { version, job_id, parent: Option<SnapshotId>, created_at,
                      platform: { os, arch }, entries: [Entry], harness_state: [Entry] }
 Entry        = { rel_path: RelPath, kind: File | Dir | Symlink, mode, mtime_ns, chunks: [ChunkId], size }
 
-EnvSpec      = { version, tools: [{ name, version, source }], setup: [SetupStep],
+EnvSpec      = { version, tools: [{ name, version, source }], setup: [{ argv, cwd, when }],
                  env_var_names: [String], cache_paths: [RelPath] }
 ```
 

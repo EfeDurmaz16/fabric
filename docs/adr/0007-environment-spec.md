@@ -21,8 +21,10 @@ EnvSpec {
   cache_paths:   [RelPath],      what counts as a cache for snapshot policy and for "is it warm"
 }
 Tool      { name: String, version: String, source: Detected | Declared }
-SetupStep { run: String, cwd: RelPath, when: CachesMissing | Always }
+SetupStep { argv: [String], cwd: RelPath, when: CachesMissing | Always }
 ```
+
+`argv` is executed directly, never through a shell. A spec travels with the job and a peer can send one, so there is no string for quoting bugs or a hostile `packageManager` field to hide in. Before the node runs a spec whose id differs from the one it last ran or wrote for that job, it prints the steps and asks, unless the command was given `--yes`.
 
 `EnvSpecId` is the blake3 of the postcard bytes. A job references an `EnvSpec` by id; editing produces a new id and a `Note` in the ledger.
 
@@ -30,7 +32,7 @@ SetupStep { run: String, cwd: RelPath, when: CachesMissing | Always }
 
 `fabric job init` (and `fabric suspend` when no spec exists) detects from the workspace:
 
-- `package.json` plus a lockfile: tool `node` (from `.nvmrc`, `.node-version` or `engines`), package manager from `packageManager` or the lockfile name; setup `pnpm install --frozen-lockfile` (or npm, yarn, bun equivalents) with `when: CachesMissing`; cache paths `node_modules`, `.pnpm-store`.
+- `package.json` plus a lockfile: tool `node` (from `.nvmrc`, `.node-version` or `engines`), package manager from `packageManager` or the lockfile name; setup `["pnpm", "install", "--frozen-lockfile"]` (or the npm, yarn, bun equivalents) with `when: CachesMissing`; cache paths `node_modules`, `.pnpm-store`.
 - `Cargo.toml`: tool `rust` from `rust-toolchain.toml`; setup `cargo fetch` with `when: CachesMissing`; cache path `target`.
 - `pyproject.toml` or `requirements.txt`: tool `python`; setup `uv sync` or `pip install -r`; cache `.venv`.
 - `go.mod`: tool `go`; setup `go mod download`; no cache path in the workspace.
