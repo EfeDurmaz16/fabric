@@ -407,9 +407,17 @@ pub enum LedgerError {
         /// The hash a record must carry as `prev` to be accepted now.
         head: RecordHash,
     },
-    /// The record carries an epoch the rules do not allow at this point.
+    /// The record's epoch is below the one the rules require at this point.
     #[error("stale epoch {yours}, current is {current}")]
     StaleEpoch {
+        /// The record's epoch.
+        yours: Epoch,
+        /// The epoch the ledger holds.
+        current: Epoch,
+    },
+    /// The record's epoch is above the one the rules require; this node must fetch first.
+    #[error("epoch {yours} is ahead of this node's {current}")]
+    AheadOfUs {
         /// The record's epoch.
         yours: Epoch,
         /// The epoch the ledger holds.
@@ -464,11 +472,17 @@ pub enum LedgerError {
     /// A move started while the head is not `Suspended`.
     #[error("job must be suspended before it moves")]
     NotSuspended,
-    /// A record names a snapshot the ledger has not published.
+    /// A record names a snapshot other than the latest the ledger published.
     #[error("snapshot {snapshot} is not the latest published snapshot")]
     UnknownSnapshot {
         /// The snapshot named.
         snapshot: SnapshotId,
+    },
+    /// A published snapshot does not follow the latest one.
+    #[error("snapshot parent must be the latest published snapshot, {expected:?}")]
+    WrongParent {
+        /// The parent the record had to name.
+        expected: Option<SnapshotId>,
     },
     /// `Resumed` without a snapshot after one exists.
     #[error("Resumed must name a snapshot once one is published")]
@@ -815,8 +829,14 @@ impl Ledger {
         } else {
             current
         };
-        if event.epoch != expected {
+        if event.epoch < expected {
             return Err(LedgerError::StaleEpoch {
+                yours: event.epoch,
+                current,
+            });
+        }
+        if event.epoch > expected {
+            return Err(LedgerError::AheadOfUs {
                 yours: event.epoch,
                 current,
             });
@@ -895,27 +915,38 @@ impl Ledger {
                 }
                 Ok(())
             }
-            EventKind::Suspended { snapshot } => {
-                if self.manifest.latest_snapshot != Some(*snapshot) {
-                    return Err(LedgerError::UnknownSnapshot {
-                        snapshot: *snapshot,
+            EventKind::SnapshotPublished { parent, .. } => {
+                if *parent != self.manifest.latest_snapshot {
+                    return Err(LedgerError::WrongParent {
+                        expected: self.manifest.latest_snapshot,
                     });
                 }
                 Ok(())
             }
+            EventKind::Suspended { snapshot } => self.check_latest(*snapshot),
             EventKind::Resumed { node, snapshot, .. } => {
                 if *node != self.manifest.lease.holder() {
                     return Err(LedgerError::NotOwner {
                         owner: self.manifest.lease.holder(),
                     });
                 }
-                if snapshot.is_none() && self.manifest.latest_snapshot.is_some() {
-                    return Err(LedgerError::ResumedWithoutSnapshot);
+                match snapshot {
+                    Some(snapshot) => self.check_latest(*snapshot),
+                    None if self.manifest.latest_snapshot.is_some() => {
+                        Err(LedgerError::ResumedWithoutSnapshot)
+                    }
+                    None => Ok(()),
                 }
-                Ok(())
             }
             _ => Ok(()),
         }
+    }
+
+    fn check_latest(&self, snapshot: SnapshotId) -> Result<(), LedgerError> {
+        if self.manifest.latest_snapshot != Some(snapshot) {
+            return Err(LedgerError::UnknownSnapshot { snapshot });
+        }
+        Ok(())
     }
 
     fn apply(&mut self, record: &Record) {
@@ -1149,21 +1180,42 @@ mod tests {
     }
 
     #[test]
-    fn a_record_with_the_wrong_epoch_is_stale() {
+    fn a_record_with_the_wrong_epoch_is_stale_or_ahead() {
         let mut ledger = new_ledger(node(1));
         let two = Epoch::FIRST.next().unwrap();
-        let ahead = Record::encode(Event {
-            id: eid(),
-            prev: Some(ledger.head()),
-            epoch: two,
-            at: 1,
-            kind: EventKind::Note { text: "b".into() },
-        })
-        .unwrap();
-        let err = ledger.accept(ahead, Author::Relayed).unwrap_err();
+        let note_at = |ledger: &Ledger, epoch| {
+            Record::encode(Event {
+                id: eid(),
+                prev: Some(ledger.head()),
+                epoch,
+                at: 1,
+                kind: EventKind::Note { text: "b".into() },
+            })
+            .unwrap()
+        };
+        let err = ledger
+            .accept(note_at(&ledger, two), Author::Relayed)
+            .unwrap_err();
         assert!(matches!(
             err,
-            LedgerError::StaleEpoch { yours, current } if yours == two && current == Epoch::FIRST
+            LedgerError::AheadOfUs { yours, current } if yours == two && current == Epoch::FIRST
+        ));
+        append(
+            &mut ledger,
+            node(2),
+            EventKind::Stolen {
+                by: node(2),
+                from: node(1),
+                reason: String::new(),
+            },
+        )
+        .unwrap();
+        let err = ledger
+            .accept(note_at(&ledger, Epoch::FIRST), Author::Relayed)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            LedgerError::StaleEpoch { yours, current } if yours == Epoch::FIRST && current == two
         ));
     }
 
@@ -1406,6 +1458,31 @@ mod tests {
     }
 
     #[test]
+    fn a_published_snapshot_must_follow_the_latest_one() {
+        let mut ledger = suspended_ledger(node(1));
+        let err = append(
+            &mut ledger,
+            node(1),
+            EventKind::SnapshotPublished {
+                snapshot: snap(2),
+                parent: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, LedgerError::WrongParent { expected } if expected == Some(snap(1))));
+        append(
+            &mut ledger,
+            node(1),
+            EventKind::SnapshotPublished {
+                snapshot: snap(2),
+                parent: Some(snap(1)),
+            },
+        )
+        .unwrap();
+        assert_eq!(ledger.manifest().latest_snapshot, Some(snap(2)));
+    }
+
+    #[test]
     fn resumed_needs_the_owner_and_a_snapshot_once_one_exists() {
         let mut ledger = new_ledger(node(1));
         let err = append(
@@ -1442,6 +1519,17 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, LedgerError::ResumedWithoutSnapshot));
+        let err = append(
+            &mut ledger,
+            node(1),
+            EventKind::Resumed {
+                node: node(1),
+                snapshot: Some(snap(9)),
+                harness: HarnessKind::ClaudeCode,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, LedgerError::UnknownSnapshot { snapshot } if snapshot == snap(9)));
     }
 
     #[test]
