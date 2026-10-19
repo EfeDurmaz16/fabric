@@ -26,6 +26,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Harness adapter.** The Fabric code that knows how to detect, capture, restore and launch one harness.
 
+**Harness record.** The file under a job's directory that names the running harness process (pid, process group, start time, or the harness's own session id), its epoch and its supervisor. What a restarted supervisor reads to find the process.
+
 **Harness state directory.** The files a harness needs to continue a conversation. Fabric treats it as opaque bytes owned by the adapter.
 
 **Job.** The unit of development work. A goal plus a ledger plus snapshots plus an EnvSpec plus a lease.
@@ -63,6 +65,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 **Snapshot.** An immutable, content-addressed capture of a workspace and its harness state at one moment.
 
 **Store.** A node's local blob directory plus catalog. Written by one process at a time, under the data directory lock.
+
+**Supervisor.** The process that renews a job's lease while its harness runs and kills the harness when a higher epoch is learned. Always the holder of the data directory lock: the node process, or else the `fabric resume` command that launched the harness, which stays resident until the harness exits.
 
 **Suspend.** Stop the harness cleanly, publish a snapshot, release the lease.
 

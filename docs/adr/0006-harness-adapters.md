@@ -20,33 +20,45 @@ trait Harness: Send + Sync {
 
     fn detect(&self, workspace: &Path) -> BoxFuture<'_, Result<Option<Detected>, HarnessError>>;
         Is there a session of this harness for this workspace? Where is its state?
+        Is it running right now, and as what kind of process?
+
+    fn stop(&self, running: &RunningHarness, deadline: Duration) -> BoxFuture<'_, Result<(), HarnessError>>;
+        Ask the harness to finish its current turn and exit within the deadline.
+        Spawned and External: the harness's graceful signal or command, then wait on the pid.
+        Daemon: the harness's own stop command. StopTimedOut when the deadline passes.
 
     fn capture(&self, workspace: &Path, out: &Path) -> BoxFuture<'_, Result<Captured, HarnessError>>;
-        Ask the running harness to stop at a turn boundary, then copy everything it needs
-        to continue into `out`, redacted. Returns what was copied, any paths that are
-        absolute, and what was redacted.
+        Copy everything a stopped harness needs to continue into `out`, redacted.
+        Returns what was copied, any paths that are absolute, and what was redacted.
+        The core calls it only after `stop` returned or `detect` reported nothing running.
 
     fn restore(&self, state: &Path, from_root: &Path, to_root: &Path) -> BoxFuture<'_, Result<(), HarnessError>>;
         Place the captured state where this harness expects it on this node,
         rewriting paths from `from_root` to `to_root` when they differ.
+        Refuses with HarnessStateDiverged when state already on disk would be lost (below).
 
-    fn launch(&self, workspace: &Path, resume: ResumeHint) -> BoxFuture<'_, Result<Child, HarnessError>>;
-        Start the harness so that it continues the same session.
+    fn launch(&self, workspace: &Path, resume: ResumeHint, env: &[(String, String)]) -> BoxFuture<'_, Result<RunningHarness, HarnessError>>;
+        Start the harness so that it continues the same session, in a new process group,
+        with exactly this environment, and return the handle the supervisor records.
 }
 
-HarnessKind = ClaudeCode | Codex | Acp { command: String }
-Captured    = { entries: [Entry], absolute_roots: [PathBuf], redactions: [RedactionReport] }
+HarnessKind     = ClaudeCode | Codex | Acp { command: String }
+Detected        = { state_root: PathBuf, session_id: Option<String>, running: Option<RunningHarness> }
+Captured        = { entries: [Entry], absolute_roots: [PathBuf], redactions: [RedactionReport] }
 RedactionReport = { rule: String, count: u32 }
 ```
 
-The harness is chosen at runtime from the ledger (`--harness codex` on a job created under Claude Code), so the core holds a `Box<dyn Harness>`. The methods return `BoxFuture`, defined in `fabric-core` (ADR 0005), because native `async fn` in a trait is not dyn compatible on the pinned toolchain and its futures cannot be required to be `Send`. The core calls these four in order during suspend (`detect`, `capture`) and resume (`restore`, `launch`). It stores whatever `capture` produced as the `harness_state` tree of the snapshot (ADR 0004) and never opens it.
+`RunningHarness` is the core-owned handle defined in ADR 0003 (`Spawned`, `External` or `Daemon`); no tokio or std process type crosses the trait. Killing is not an adapter method: for `Spawned` and `External` the supervisor sends `killpg` itself, so fencing never depends on adapter code, and for `Daemon` it repeats `stop` with a zero deadline until `detect` reports nothing running. `stop` and `capture` are separate because they fail differently: a harness that will not stop in time is a reason to abort suspend and leave the job live, while a copy that fails is a reason to retry the copy.
+
+The harness is chosen at runtime from the ledger (`--harness codex` on a job created under Claude Code), so the core holds a `Box<dyn Harness>`. The methods return `BoxFuture`, defined in `fabric-core` (ADR 0005), because native `async fn` in a trait is not dyn compatible on the pinned toolchain and its futures cannot be required to be `Send`. The core calls them in this order: suspend is `detect`, `stop`, `capture`; resume is `restore`, `launch`; fencing a `Daemon` is `stop`. It stores whatever `capture` produced as the `harness_state` tree of the snapshot (ADR 0004) and never opens it. The process that calls `launch` is the `fabric resume` CLI, which passes its own environment filtered to the names the `EnvSpec` lists plus the variables the harness needs to find its login and its terminal (`HOME`, `PATH`, `TERM`, `SHELL`, `LANG`), so a daemon's environment never leaks into a harness and a secret outside the spec never does either.
 
 ### ACP is the generic path
 
 Any agent that speaks ACP and reports `loadSession: true` gets the `Acp` adapter for free:
 
-- `capture`: send `session/cancel` if a prompt is in flight, record the ACP `sessionId`, and copy the agent's state directory as declared in the Fabric job config for that agent.
-- `launch`: start the agent command, `initialize`, `session/load` with the recorded id and the new `cwd`.
+- `stop`: send `session/cancel` if a prompt is in flight, then end the agent process.
+- `capture`: record the ACP `sessionId` and copy the agent's state directory as declared in the Fabric job config for that agent.
+- `launch`: start the agent command, `initialize`, `session/load` with the recorded id and the new `cwd`, and return `Spawned` with its pid, process group and start time.
 
 Agents whose state directory is unknown to Fabric cannot be captured and the adapter says so at `detect` time.
 
@@ -54,7 +66,7 @@ Agents whose state directory is unknown to Fabric cannot be captured and the ada
 
 These two get dedicated adapters because the first gate is Claude Code and the second harness is Codex, and because both have known native resume paths that ACP wraps:
 
-- Claude Code: state lives under the user's Claude projects directory keyed by workspace path; `restore` places it under the same key because the root is identical on every node (ADR 0008), and `launch` uses native resume. Reuse of claude-handoff 0.3.0's exporter and redaction rules will be evaluated rather than rewritten (landscape section 8.1).
+- Claude Code: state lives under the user's Claude projects directory keyed by workspace path; `restore` places it under the same key because the root is identical on every node (ADR 0008), and `launch` runs a foreground `claude --resume` in the user's terminal and returns `Spawned`. It never uses `claude --bg`, whose own supervisor restarts a killed session and would defeat the fencing kill (ADR 0003). `stop` on a foreground session is the graceful exit the research names (H1, section 11.3). Reuse of claude-handoff 0.3.0's exporter and redaction rules will be evaluated rather than rewritten (landscape section 8.1).
 - Codex: rollout files plus `thread/resume` over app-server, or the `codex-acp` adapter if it proves equal. Decide by testing both on the real gate.
 
 Each adapter is a module in `fabric-harness` behind a cargo feature. The core compiles with no adapter enabled.
