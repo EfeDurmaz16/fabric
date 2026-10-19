@@ -6,8 +6,10 @@ use std::num::TryFromIntError;
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{EnvSpecId, Epoch, EventId, JobId, MoveId, NodeId, RecordHash, SnapshotId};
+use fabric_core::lease::LeaseState;
 use fabric_core::ledger::{
-    CHECKSUM_LEN, Event, EventKind, HEADER_CHECK_LEN, MAX_RECORD_LEN, Record, RecordError, scan,
+    CHECKSUM_LEN, Event, EventKind, HEADER_CHECK_LEN, JobManifest, MAX_RECORD_LEN, Record,
+    RecordError, scan,
 };
 use proptest::prelude::*;
 
@@ -212,4 +214,110 @@ proptest! {
             "a flipped bit at byte {i} was not reported as corruption at offset 0"
         );
     }
+}
+
+/// One event of every kind with fixed ids, encoded in declaration order.
+fn every_kind() -> Vec<Event> {
+    let n = |b: u8| NodeId::from_bytes([b; 32]);
+    let s = |b: u8| SnapshotId::from_bytes([b; 32]);
+    let m = MoveId::from_bytes([5; 16]);
+    let kinds = vec![
+        EventKind::Created {
+            job_id: JobId::from_bytes([1; 16]),
+            goal: "goal".into(),
+            harness: HarnessKind::ClaudeCode,
+            created_by: n(1),
+        },
+        EventKind::MoveStarted {
+            move_id: m,
+            target: n(2),
+        },
+        EventKind::MoveImported {
+            move_id: m,
+            from: n(1),
+        },
+        EventKind::MoveAborted { move_id: m },
+        EventKind::Stolen {
+            by: n(3),
+            from: n(2),
+            reason: "asleep".into(),
+        },
+        EventKind::SnapshotPublished {
+            snapshot: s(7),
+            parent: Some(s(6)),
+        },
+        EventKind::Suspended { snapshot: s(7) },
+        EventKind::Resumed {
+            node: n(3),
+            snapshot: Some(s(7)),
+            harness: HarnessKind::Acp {
+                program: "opencode".into(),
+                args: vec!["acp".into()],
+            },
+        },
+        EventKind::EnvSpecChanged {
+            env_spec: EnvSpecId::from_bytes([8; 32]),
+        },
+        EventKind::DecisionRecorded {
+            text: "keep".into(),
+        },
+        EventKind::Note {
+            text: "note".into(),
+        },
+    ];
+    kinds
+        .into_iter()
+        .enumerate()
+        .map(|(i, kind)| Event {
+            id: EventId::from_bytes([u8::try_from(i).unwrap_or(0); 16]),
+            prev: Some(RecordHash::from_bytes([2; 32])),
+            epoch: Epoch::new(3).unwrap_or(Epoch::FIRST),
+            at: 4,
+            kind,
+        })
+        .collect()
+}
+
+/// Pins record format version 1: the frame layout and the postcard
+/// discriminants and field order of every `EventKind`. Reordering a variant or
+/// a field changes this hash and must come with `RECORD_FORMAT_VERSION` bumped
+/// once version 1 has shipped.
+#[test]
+fn record_format_version_one_bytes_are_pinned() {
+    let mut all = Vec::new();
+    for event in every_kind() {
+        all.extend_from_slice(Record::encode(event).unwrap().bytes());
+    }
+    assert_eq!(
+        blake3::hash(&all).to_hex().as_str(),
+        "2deac91bdddf422e050831479b0e007a10091acbf162468dd7d2c259c3cb447e"
+    );
+}
+
+/// Pins job manifest format version 1 the same way.
+#[test]
+fn job_manifest_version_one_bytes_are_pinned() {
+    let manifest = JobManifest {
+        job_id: JobId::from_bytes([1; 16]),
+        goal: "goal".into(),
+        harness: HarnessKind::Codex,
+        env_spec: Some(EnvSpecId::from_bytes([8; 32])),
+        latest_snapshot: Some(SnapshotId::from_bytes([7; 32])),
+        lease: LeaseState::Departing {
+            node: NodeId::from_bytes([1; 32]),
+            epoch: Epoch::new(3).unwrap_or(Epoch::FIRST),
+            move_id: MoveId::from_bytes([5; 16]),
+            target: NodeId::from_bytes([2; 32]),
+        },
+        head: RecordHash::from_bytes([2; 32]),
+        event_count: 9,
+        created_at: 4,
+        updated_at: 5,
+    };
+    let bytes = manifest.encode().unwrap();
+    assert_eq!(
+        blake3::hash(&bytes).to_hex().as_str(),
+        "c6a0d10da670e5658a9aee5bc78703d6e0e94ed26e4d6b07c099f1b861986c85"
+    );
+    assert_eq!(JobManifest::decode(&bytes).unwrap(), manifest);
 }
