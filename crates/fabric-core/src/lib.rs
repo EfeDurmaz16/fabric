@@ -1,3 +1,6 @@
+//! Core library for Fabric.
+
+/// Returns the sum of `left` and `right`.
 pub fn add(left: u64, right: u64) -> u64 {
     left + right
 }
