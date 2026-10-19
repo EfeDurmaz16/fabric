@@ -20,6 +20,7 @@ compile_error!(
     "fabric-net needs at least one transport: enable the `quic` or the `tcp_tls` feature"
 );
 
+pub mod endpoint;
 pub mod frame;
 pub mod identity;
 pub mod peers;
