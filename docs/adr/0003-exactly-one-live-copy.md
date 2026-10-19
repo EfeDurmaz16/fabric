@@ -94,7 +94,8 @@ where `expires_at` is the latest value the claimant has seen for the current epo
 If node A held the lease at epoch 1, went to sleep without suspending, and node B claims epoch 2 after expiry, then:
 
 - B resumes from the latest snapshot B can fetch. If A never published one, B resumes from the previous snapshot and the ledger says so with a `Note`.
-- Work A did after its last snapshot is not lost. It is on A's disk. When A wakes it learns epoch 2, is fenced, and the node stops A's harness. A's unpublished workspace is kept in place and reported as an orphan: `fabric status` lists it, `fabric orphan export` turns it into a snapshot that is not the job's head and pins it in the store so `store gc` keeps it (ADR 0004). Nothing is deleted automatically. Ever.
+- Work A did after its last snapshot is not lost. It is on A's disk. When A wakes it learns epoch 2, is fenced, and the supervisor stops A's harness. A's unpublished workspace is kept in place and reported as an orphan: `fabric status` lists it, `fabric orphan export` turns it into a snapshot that is not the job's head and pins it in the store so `store gc` keeps it (ADR 0004). Nothing is deleted automatically. Ever.
+- The same holds for what the harness wrote outside the workspace. A fenced Claude Code harness also wrote its transcript under the user's Claude projects directory, and a later `resume` of the job on A would place the job's newer transcript over it. `fabric orphan export` therefore calls the adapter's `capture` as well and stores the result as the orphan snapshot's `harness_state`, and an adapter's `restore` refuses with `HarnessStateDiverged` rather than overwrite state that is not already contained in what arrives (ADR 0006). The message names `fabric orphan export`.
 
 ### Two-node limitation, stated plainly
 

@@ -81,6 +81,10 @@ For the Claude Code adapter the contract is concrete, because the research shows
 - Redacted in the transcript and sidecars, following claude-handoff 0.3.0's rules: secret patterns, `.env` values that appear in tool results, the account email and the organization UUID in `session_context` and `credential_org` attachments.
 - A secret inside a signed `thinking` block cannot be edited without breaking the block (next section). The adapter then drops that whole block, which the API accepts, and counts it in the report.
 
+### State outside the root is protected like the root
+
+The workspace marker (ADR 0004) keeps a restore from writing over unpublished work in the root. Harness state lives outside the root, so the adapter must give the same guarantee itself. Before `restore` overwrites a file it owns on this node, it compares the bytes on disk with the incoming bytes: equal, or a byte prefix of the incoming file, is allowed, because nothing on disk is lost; anything else is `HarnessStateDiverged { path }` and nothing is written. This is the rule cmux uses for Claude transcripts (research H1, section 9) and it fits because transcripts only grow. The case it catches is the old holder of a fenced job: its transcript continued past the fork while the job's transcript continued elsewhere. The way out is `fabric orphan export`, which captures the divergent state into an orphan snapshot (ADR 0003); after that the files on disk may be replaced.
+
 ### Path rewrites: none by default, never inside a signature
 
 `restore(state, from_root, to_root)` with `from_root == to_root` performs no rewrite at all, and in v0 that is the only case the Claude Code adapter accepts (ADR 0008). The reason is a fact about the state, not caution: Claude Code thinking blocks carry an encrypted `signature`, and a modified block is rejected with a 400 on the next tool turn (research H1, item 2). A blanket rewrite of the transcript breaks the resumed session at its first tool call, which is exactly the first gate.
