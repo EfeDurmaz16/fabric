@@ -12,12 +12,9 @@ use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use ed25519_dalek::SigningKey;
-use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey};
 use fabric_core::id::NodeId;
+use rcgen::{KeyPair, PKCS_ED25519};
 use rustls::pki_types::PrivatePkcs8KeyDer;
-
-use crate::tls::provider;
 
 /// Why a node key could not be made, read or written.
 #[derive(Debug, thiserror::Error)]
@@ -45,17 +42,17 @@ pub enum IdentityError {
         /// The key file.
         path: PathBuf,
     },
-    /// The system random source failed, so no key could be made.
-    #[error("the system random source failed")]
-    Random,
-    /// The key could not be encoded as PKCS#8.
-    #[error("the key could not be encoded as PKCS#8")]
-    Encode,
+    /// No key could be generated.
+    #[error("key generation: {0}")]
+    Generate(#[source] rcgen::Error),
+    /// The key's public half is not the 32 bytes of an ed25519 key.
+    #[error("the key is not ed25519")]
+    NotEd25519,
 }
 
 /// This node's ed25519 keypair and the id derived from it.
 pub struct NodeIdentity {
-    key: SigningKey,
+    key: KeyPair,
     id: NodeId,
 }
 
@@ -70,12 +67,8 @@ impl fmt::Debug for NodeIdentity {
 impl NodeIdentity {
     /// Makes a new keypair from the system random source.
     pub fn generate() -> Result<Self, IdentityError> {
-        let mut seed = [0u8; 32];
-        provider()
-            .secure_random
-            .fill(&mut seed)
-            .map_err(|_| IdentityError::Random)?;
-        Ok(Self::from_key(SigningKey::from_bytes(&seed)))
+        let key = KeyPair::generate_for(&PKCS_ED25519).map_err(IdentityError::Generate)?;
+        Self::from_key(key)
     }
 
     /// Reads the key at `path`, refusing a file other users can read.
@@ -95,10 +88,13 @@ impl NodeIdentity {
                 });
             }
         }
-        let key = SigningKey::from_pkcs8_der(&bytes).map_err(|_| IdentityError::Malformed {
-            path: path.to_path_buf(),
+        let der = PrivatePkcs8KeyDer::from(bytes);
+        let key = KeyPair::from_pkcs8_der_and_sign_algo(&der, &PKCS_ED25519).map_err(|_| {
+            IdentityError::Malformed {
+                path: path.to_path_buf(),
+            }
         })?;
-        Ok(Self::from_key(key))
+        Self::from_key(key)
     }
 
     /// Reads the key at `path`, or makes one and writes it there if none exists.
@@ -132,7 +128,7 @@ impl NodeIdentity {
             path: path.to_path_buf(),
             source,
         };
-        let der = self.pkcs8_der()?;
+        let der = self.pkcs8_der();
         let tmp = temp_path(path);
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -156,14 +152,24 @@ impl NodeIdentity {
     }
 
     /// Returns the private key as PKCS#8 for the TLS layer.
-    pub(crate) fn pkcs8_der(&self) -> Result<PrivatePkcs8KeyDer<'static>, IdentityError> {
-        let document = self.key.to_pkcs8_der().map_err(|_| IdentityError::Encode)?;
-        Ok(PrivatePkcs8KeyDer::from(document.as_bytes().to_vec()))
+    pub(crate) fn pkcs8_der(&self) -> PrivatePkcs8KeyDer<'static> {
+        PrivatePkcs8KeyDer::from(self.key.serialize_der())
     }
 
-    fn from_key(key: SigningKey) -> Self {
-        let id = NodeId::from_bytes(key.verifying_key().to_bytes());
-        Self { key, id }
+    /// Returns the keypair for the certificate builder.
+    pub(crate) fn key_pair(&self) -> &KeyPair {
+        &self.key
+    }
+
+    fn from_key(key: KeyPair) -> Result<Self, IdentityError> {
+        let public: [u8; 32] = key
+            .public_key_raw()
+            .try_into()
+            .map_err(|_| IdentityError::NotEd25519)?;
+        Ok(Self {
+            key,
+            id: NodeId::from_bytes(public),
+        })
     }
 }
 

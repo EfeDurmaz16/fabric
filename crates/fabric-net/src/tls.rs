@@ -24,7 +24,7 @@ use rustls::{
     CertificateError, DigitallySignedStruct, DistinguishedName, OtherError, SignatureScheme,
 };
 
-use crate::identity::{IdentityError, NodeIdentity};
+use crate::identity::NodeIdentity;
 
 /// The DER prefix of an ed25519 `SubjectPublicKeyInfo`; the 32 key bytes follow it.
 pub const ED25519_SPKI_PREFIX: [u8; 12] = [
@@ -66,9 +66,6 @@ pub enum TlsError {
     /// The self-signed certificate could not be made.
     #[error("certificate generation: {0}")]
     Certificate(#[source] rcgen::Error),
-    /// The node key could not be used.
-    #[error(transparent)]
-    Identity(#[from] IdentityError),
 }
 
 /// The accept-side trust decision: is this node one we paired with?
@@ -125,9 +122,6 @@ pub(crate) struct Credentials {
 impl Credentials {
     /// Makes a self-signed certificate whose key is the node key.
     pub(crate) fn new(identity: &NodeIdentity) -> Result<Self, TlsError> {
-        let pkcs8 = identity.pkcs8_der()?;
-        let key_pair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&pkcs8, &rcgen::PKCS_ED25519)
-            .map_err(TlsError::Certificate)?;
         let mut params =
             rcgen::CertificateParams::new(Vec::<String>::new()).map_err(TlsError::Certificate)?;
         params.distinguished_name = rcgen::DistinguishedName::new();
@@ -135,11 +129,11 @@ impl Credentials {
             .distinguished_name
             .push(rcgen::DnType::CommonName, identity.node_id().to_string());
         let cert = params
-            .self_signed(&key_pair)
+            .self_signed(identity.key_pair())
             .map_err(TlsError::Certificate)?;
         Ok(Self {
             cert: cert.der().clone(),
-            key: PrivateKeyDer::Pkcs8(pkcs8),
+            key: PrivateKeyDer::Pkcs8(identity.pkcs8_der()),
         })
     }
 
