@@ -27,7 +27,7 @@ LeaseState =
 - `Created`, and any event written while the lease is `Free`, carries epoch 0. The first claim is epoch 1.
 - A claim is a request to the arbiter, never a local append. The arbiter appends `LeaseClaimed` with `epoch = previous_epoch + 1` on the claimant's behalf (Claim protocol, below). Epochs never repeat and never go backwards.
 - `suspend` releases the lease: the holder appends `LeaseReleased` at the current epoch. The next claim gets `epoch + 1`.
-- The holder renews before expiry by appending a fresh `LeaseClaimed` at the same epoch with a later `expires_at`. Renewal does not bump the epoch.
+- The holder renews before expiry by writing `<fabric-data>/jobs/<job-id>/renewal`, a small postcard file `{ epoch, node, expires_at }` written by temp, `fsync`, rename. Renewal is not a ledger event and does not bump the epoch. `Held.expires_at` is the later of the claim record's `expires_at` and the renewal file's, when the file names the same epoch and node; a file naming any other epoch is ignored. The holder pushes each renewal to paired peers as `LeaseRenewed { epoch, expires_at }`, best effort; a peer stores it in its own renewal file under the same rule.
 
 ### Claim protocol
 
@@ -56,7 +56,7 @@ A lease is considered expired by a claimant only when:
 now_claimant > expires_at + skew_margin
 ```
 
-with `skew_margin` fixed at 30 seconds in v0, and a lease length of 60 seconds with renewal every 20 seconds. Clocks are used only for this one comparison. A node whose clock is more than `skew_margin` off from its peer will see its claims refused and must say so to the user rather than retry. (The node process compares its clock with the peer's at connection time and reports a warning if they differ by more than 10 seconds.)
+where `expires_at` is the latest value the claimant has seen for the current epoch, from the claim record or a pushed renewal, `skew_margin` is fixed at 30 seconds in v0, the lease length is 60 seconds and renewal runs every 20 seconds. A claimant that has lost contact with the holder sees only the last renewal that reached it, so a sleeping holder looks expired to its peer about 60 seconds after its last successful push, and a reachable holder never does. `--force-expired` prints the local `expires_at`, the time of the last message from the holder and the holder's node id, so the user can judge. Clocks are used only for this one comparison. A node whose clock is more than `skew_margin` off from its peer will see its claims refused and must say so to the user rather than retry. (The node process compares its clock with the peer's at connection time and reports a warning if they differ by more than 10 seconds.)
 
 ### What a claim after expiry means
 
@@ -90,7 +90,7 @@ Quorum (three or more nodes, or a small witness) is a later ADR. The epoch and f
 
 ## Consequences
 
-- The lease state machine is small enough to property test exhaustively: arbitrary interleavings of claim, renew, release, expire and crash must never produce two `Held` states at the same epoch and must never decrease the epoch.
+- The lease state machine is small enough to property test exhaustively. Arbitrary interleavings of claim request, grant, lost reply, retry, renew, release, expire, crash, message loss and forced claim must keep three invariants: for any epoch the job's chain holds at most one `LeaseClaimed`; the chain never has two `Held` states naming different nodes without a `LeaseReleased` or a higher-epoch claim between them; the epoch never decreases. The only divergence between two nodes' views is the one a forced claim creates, and it resolves by the fork rule.
 - Every network message type has an `epoch` field. There is no "control" channel without one.
 - The orphan path is a real feature with a real command, not an error message.
 - Users will sometimes be told "no" (stale epoch, lease held). The message must say which node holds the lease and when it expires.
@@ -98,5 +98,5 @@ Quorum (three or more nodes, or a small witness) is a later ADR. The epoch and f
 ## Open questions
 
 - Lease length and skew margin are guesses. Measure on the real two-Mac setup and adjust once.
-- Should renewal be a ledger event or a separate small file? Events are durable but grow the ledger by one record every 20 seconds while running. Decide in the core stage after measuring; a renewal file that is not part of the chain is acceptable because the chain only needs the claim.
+- The renewal file is not part of the hash chain, so a renewal cannot be proven after the fact. That is accepted because v0 never acts on expiry without the user; revisit if automatic failover arrives.
 - Witness design for quorum: a third Mac, a tiny VPS, or a phone? Later.
