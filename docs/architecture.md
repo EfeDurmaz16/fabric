@@ -29,7 +29,7 @@ crates/
   fabric-harness   Harness trait, ACP adapter, Claude Code adapter, Codex adapter
   fabric-env       EnvSpec detection and materialization
   fabric-node      the long-running node process: lease holder, blob server, placement
-  fabric-cli       the `fabric` binary: suspend, resume, status, node pair, node serve
+  fabric-cli       the `fabric` binary: job init, suspend, resume, status, orphan export, node pair, node serve
 ```
 
 Only `fabric-core` exists today, and it holds a placeholder. Dependency direction is strictly downward: `fabric-cli` depends on everything, `fabric-core` depends on nothing in the workspace. `fabric-core` defines the `Store`, `Transport` and `Harness` traits; the other crates implement them. Nothing in the core knows about QUIC, SQLite or any agent vendor.
@@ -51,7 +51,7 @@ JobManifest  = { version, job_id, goal, harness_kind, env_spec: EnvSpecId,
                  latest_snapshot: Option<SnapshotId>, lease: LeaseState }
 LeaseState   = Free | Held { node, epoch, expires_at } | Released { epoch }
 
-SnapshotManifest = { version, job_id, parent: Option<SnapshotId>, created_at, created_by,
+SnapshotManifest = { version, job_id, root: AbsPath, parent: Option<SnapshotId>, created_at, created_by,
                      platform: { os, arch }, git: Option<GitState>, files: [Entry],
                      harness_state: [Entry], env_spec: Option<EnvSpecId>, partial_caches: [RelPath] }
 GitState     = { bundle, bundle_base, refs, head, index_commit, worktree_commit,
@@ -65,7 +65,7 @@ EnvSpec      = { version, tools: [{ name, version, source }], setup: [{ argv, cw
                  env_var_names: [String], cache_paths: [RelPath] }
 ```
 
-Every id is either content-derived (hashes) or time-sortable and collision-free (ULIDs). Nothing is a host path. Nothing is a vendor session id.
+Every id is either content-derived (hashes) or time-sortable and collision-free (ULIDs). The one host path is `SnapshotManifest.root`, the directory the job was captured in, which is also where every node restores it (ADR 0008). Nothing is a vendor session id.
 
 ## Data flow: suspend on one node, resume on another
 
@@ -76,6 +76,8 @@ sequenceDiagram
     participant U as User
     participant A as Node A (Pro)
     participant B as Node B (Air)
+    U->>A: fabric job init (in the checkout, Claude Code already running)
+    A->>A: append Created, LeaseClaimed epoch 1, Resumed
     U->>A: fabric suspend job
     A->>A: capture harness state
     A->>A: publish snapshot
@@ -96,6 +98,7 @@ sequenceDiagram
 
 Step by step, with the failure each step must survive:
 
+0. `fabric job init` on A, inside the checkout where Claude Code is already running. It records the directory as the job's root in the node-local marker, finds the Claude session with the adapter's `detect`, appends `Created` and the first claim (epoch 1), and writes the first `EnvSpec`. Nothing is moved and nothing is stopped (ADR 0001). A crash here leaves at most a job directory with no `Created` record, which the next `init` replaces.
 1. `fabric suspend <job>` on A. The harness adapter asks the agent to stop at a turn boundary and reports its state directory. If the agent cannot stop cleanly, suspend fails and nothing is written. The job stays live on A.
 2. A publishes a snapshot in the order ADR 0004 fixes: new chunks to `tmp/`, `fsync`, rename into `chunks/`; chunk rows; the manifest by the same temp and rename; the snapshot rows; directory `fsync`; and only then the `SnapshotPublished` ledger event, which is the single commit point. A crash anywhere before the event leaves unreferenced chunks, or an unreferenced manifest with catalog rows, all invisible until an event names them and all removable by `fabric store gc`. A crash after the event leaves a complete snapshot.
 3. After `SnapshotPublished`, A appends `Suspended`, then `LeaseReleased { epoch: 1 }`, then writes the marker `Clean`. Each append is a checksummed, fsynced record. A torn tail is truncated on open; any other damage fails closed (ADR 0002). A `kill -9` between any two of these steps is not a special case: the marker was written as `Suspending` with the ledger head before capture began, so the next command on the job sees how far suspend got and finishes it without a second capture (ADR 0004, Suspend).

@@ -33,6 +33,20 @@ The user never answers "which folder, which machine, which settings, which envir
 
 Fabric is a library and a CLI. It is not an MCP server and not a hub with a web UI (ADR 0010).
 
+### How a job starts
+
+A job is born where the work already is. `fabric job init [--goal <text>]`, run inside a directory, adopts that directory as the job's workspace:
+
+1. It refuses if the directory is inside another job's root, is a linked git worktree (ADR 0004, `GitLinkedWorktree`), or is already named by a marker for another job.
+2. It records the directory's absolute path as the job's root in the node-local marker (ADR 0004), with state `Dirty` and no base: the directory holds work that no snapshot has yet, which is the truth.
+3. It runs each harness adapter's `detect` (ADR 0006). A session found for this directory becomes the job's harness; a running one is recorded as `External` in the harness record (ADR 0003) and is supervised from then on by the node process if one runs. Nothing is stopped and nothing is moved: the user keeps working in the terminal they already have. `suspend` runs `detect` again, so a session started after init is found then.
+4. It appends `Created { goal, harness, created_by }` at epoch 0, claims the lease for this node (epoch 1, a local grant, because the creator is the arbiter) and appends `Resumed`. The job is live here. Without a node process nothing renews that lease, which is harmless until the first snapshot exists, because a peer has nothing to resume; `fabric suspend` produces the first snapshot and releases the lease in one step.
+5. It detects and writes the first `EnvSpec` (ADR 0007) and prints it.
+
+The directory is not moved, cloned or symlinked. Moving it breaks the harness's own key for the session, since Claude Code keys sessions by the real path (research H1, section 1), and a symlink breaks it the same way. The first snapshot records the path as `SnapshotManifest.root` (ADR 0004), and every later restore on every node uses that path (ADR 0008). This is why the first gate, a job started under Claude Code in an ordinary checkout, needs no step the user would notice beyond `fabric job init`.
+
+`fabric job init --new [--goal <text>]` is the other way in: it creates an empty `<fabric-data>/workspaces/<job-id>/`, which becomes the root, and runs the same steps there. Both forms are step 0 of the data flow on the architecture page.
+
 ## Alternatives considered
 
 1. **A session mover.** Move a Claude Code session from one host to another and stop there. This is what cmux 0.65 and claude-handoff 0.3.0 already do for Claude only (landscape section 7, W1). It binds the unit of work to one vendor's session format, so `--harness codex` is impossible. Rejected as the core model; kept as one adapter inside it.
@@ -42,7 +56,7 @@ Fabric is a library and a CLI. It is not an MCP server and not a hub with a web 
 
 ## Consequences
 
-- Everything in the core is addressed by job id, snapshot id, chunk id or node id. No host paths in any persisted structure except inside opaque harness state, which the adapter owns on restore.
+- Everything in the core is addressed by job id, snapshot id, chunk id or node id. One host path is persisted on purpose: `SnapshotManifest.root`, the directory the job was captured in and is restored to (ADR 0004, ADR 0008). Host paths inside opaque harness state are the adapter's to own on restore. There are no others.
 - Moving a job is: suspend here, resume there. Both verbs are first class and both are idempotent.
 - The schema for "what a harness needs to continue" is not designed up front. Each adapter declares it and the core stores it as bytes (ADR 0006).
 - A job can outlive every machine it has run on, as long as one node still holds its ledger and latest snapshot.

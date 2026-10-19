@@ -43,6 +43,7 @@ The split of work between the two processes is fixed. The lock holder does every
 SnapshotManifest {
   version:       u16,
   job_id:        JobId,
+  root:          AbsPath,      the absolute workspace path the capture ran in; the target root on every node (ADR 0008)
   parent:        Option<SnapshotId>,
   created_at:    u64,
   created_by:    NodeId,
@@ -170,7 +171,7 @@ Nothing Fabric owns lives under the root. A marker inside the root would be swep
    The file writer defends the root against the manifest, because the manifest can come from a buggy adapter, a corrupted peer store or a paired node that is itself compromised, and the hash chain of ADR 0002 is not security. Within each of `W`, `files` and `harness_state` it creates directories first, then files, then symlinks last, so no link exists yet when the bytes are written. Every open goes through a directory handle, component by component with `O_NOFOLLOW`, never through a path string joined to the root; `cap-std` is the planned dependency for this and `openat2` with `RESOLVE_BENEATH` is used where the kernel has it. This covers the in-place path too, where links from the previous snapshot already exist. Before writing anything the writer probes the volume for case folding by creating two names that differ only in case under the staging directory; on a case-insensitive volume two entries that collide under case folding are refused with `RestoreError::PathCollision { a, b }` rather than one silently overwriting the other. Each of these rules gets one restore test with a manifest that breaks it.
 
    After step 5, `git status` on the target equals `git status` on the source: staged is `I` against `HEAD`, unstaged is the disk against `I`, untracked is what `W` has that `I` does not.
-5. Rewrites: the manifest stores relative paths only. Harness state may contain absolute paths pointing at the source workspace root; the adapter's `restore` receives `(source_root, target_root)` and performs its own rewrites, which in v0 means none because the roots are equal (ADR 0006, ADR 0008). The core never guesses which bytes are paths.
+5. Rewrites: every entry path is relative; the one absolute path in the manifest is `root`. Harness state may contain absolute paths pointing at the source workspace root; the adapter's `restore` receives `(manifest.root, target_root)` and performs its own rewrites, which in v0 means none because the target root is `manifest.root` (ADR 0006, ADR 0008). The core never guesses which bytes are paths.
 6. If `platform` differs from the node or a cache path is missing, mark the environment as needing materialization (ADR 0007).
 
 Restore is idempotent by marker: a second restore of the same snapshot into the same root is a no-op, and a crashed in-place restore continues where it stopped.

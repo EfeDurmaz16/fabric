@@ -20,7 +20,7 @@ Nothing here suspends or resumes anything. Do not install it.
 
 ## First gate
 
-One job, started under Claude Code on a MacBook Pro, suspended, resumed on a MacBook Air over the network, `node_modules` included, safe under `kill -9` at every step. Two nodes, same OS and architecture, manual suspend and resume. When that passes, the next stages are the Codex adapter, the ACP adapter, and the sleep watcher.
+One job, adopted with `fabric job init` from a checkout where Claude Code is already running on a MacBook Pro, suspended, resumed on a MacBook Air over the network at the same path, `node_modules` included, safe under `kill -9` at every step. Two nodes, same OS and architecture, manual suspend and resume. When that passes, the next stages are the Codex adapter, the ACP adapter, and the sleep watcher.
 
 ## Decisions
 

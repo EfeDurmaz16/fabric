@@ -87,7 +87,7 @@ The workspace marker (ADR 0004) keeps a restore from writing over unpublished wo
 
 ### Path rewrites: none by default, never inside a signature
 
-`restore(state, from_root, to_root)` with `from_root == to_root` performs no rewrite at all, and in v0 that is the only case the Claude Code adapter accepts (ADR 0008). The reason is a fact about the state, not caution: Claude Code thinking blocks carry an encrypted `signature`, and a modified block is rejected with a 400 on the next tool turn (research H1, item 2). A blanket rewrite of the transcript breaks the resumed session at its first tool call, which is exactly the first gate.
+`restore(state, from_root, to_root)` receives `SnapshotManifest.root` as `from_root` (ADR 0004); `Captured.absolute_roots` is what the adapter reports at capture and the core checks it against that field. With `from_root == to_root` it performs no rewrite at all, and in v0 that is the only case the Claude Code adapter accepts (ADR 0008). The reason is a fact about the state, not caution: Claude Code thinking blocks carry an encrypted `signature`, and a modified block is rejected with a 400 on the next tool turn (research H1, item 2). A blanket rewrite of the transcript breaks the resumed session at its first tool call, which is exactly the first gate.
 
 When roots differ, which no v0 path allows for Claude Code, the adapter rewrites only the project directory key, `cwd` fields and sidecar references, following claude-handoff's placeholder rules at path-component boundaries, and never a `thinking` block or any field under a signature. The property test for this is stated now so that it exists before the code: for arbitrary roots, a rewritten transcript leaves every signed block byte-identical.
 

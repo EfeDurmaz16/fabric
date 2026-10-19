@@ -32,6 +32,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Job.** The unit of development work. A goal plus a ledger plus snapshots plus an EnvSpec plus a lease.
 
+**Job init.** `fabric job init`: adopting the current directory, in place, as a job's workspace, or creating a fresh one with `--new`. The only way a job starts.
+
 **Job record.** The ledger and the manifest together.
 
 **Ledger.** The append-only, hash-chained log of a job's events.
@@ -61,6 +63,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 **Release.** The act of the lease holder giving up the lease at suspend time.
 
 **Restore.** Writing a snapshot into a fresh workspace on a node, or in place into a workspace whose marker says it holds only published bytes. No path rewrites when the roots are equal, which is the v0 rule.
+
+**Root.** The absolute path of a job's workspace. Recorded in every snapshot manifest and used as the target path on every node, so nothing inside the workspace or the harness state needs rewriting.
 
 **Snapshot commit.** One of the two git commits a capture makes with a private index: `I` for the index and `W` for the working tree. They carry uncommitted work inside a bundle without touching the user's index or refs.
 
