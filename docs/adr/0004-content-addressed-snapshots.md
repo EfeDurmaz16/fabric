@@ -79,7 +79,7 @@ Entry { rel_path: RelPath, kind: File | Dir | Symlink { target: String }, mode: 
 - **Ignored files, by policy:** caches in, secrets out. v0 policy, in order: deny any path with a basename or a component matching a secret pattern; allow the cache paths listed in the `EnvSpec` (`node_modules`, `.pnpm-store`, `target`, `.next`, `.venv`, `__pycache__`, `.turbo`); deny all other ignored paths. The v0 secret patterns: `.env`, `.env.*`, `*.env`, `.envrc`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.tfstate`, `*.tfstate.*`, `id_*`, `credentials*`, `.credentials*`, `.netrc`, `.npmrc`, `.pypirc`, `.git-credentials`, `.aws`, `.ssh`, `.gnupg`, `.docker/config.json`. Matching against components as well as the basename is what makes `config/.aws/credentials` and `.ssh/id_ed25519` both denied. The policy is a data file in the job, not code, so the user can widen it per job. A denied path is listed in `fabric suspend` output so nothing silently stays behind.
 - **Secrets and `W`:** the same patterns apply to the working-tree commit. An untracked `.env` the user forgot to ignore would otherwise travel inside `W`, so capture runs `git add -A` with `-c core.excludesFile=<tmp>` holding the patterns, and lists what that excluded. A secret already committed to git is in `HEAD` and travels in the bundle; Fabric warns when a tracked path matches a pattern and does not rewrite history.
 - **Harness state:** whatever the adapter returns from `capture` (ADR 0006). Hashed and chunked like any other file.
-- **Platform:** recorded so that restore knows whether carried caches are usable (ADR 0007).
+- **Platform:** recorded so that restore knows whether carried caches are usable (ADR 0007). `{ os, arch }` is a v0 approximation that holds only for same-user, same-layout machines: native Node addons also depend on the Node ABI, and pnpm refuses a tree whose recorded `storeDir` or `nodeLinker` differs (research H5, item 2). Equal on the two gate Macs, so it is accepted now and listed below.
 
 ### Publish: atomic, crash-safe
 
@@ -160,6 +160,7 @@ A node fetches a snapshot by manifest id, then asks the peer for the chunk ids i
 ## Open questions
 
 - Intent-to-add, skip-worktree and assume-unchanged are index flags, not tree content, and `git write-tree` may omit or reject intent-to-add entries. E7 decides whether `I` needs a side list of flags or whether v0 refuses those states like `GitBusy`.
+- The platform key needs the Node major version (or `node_modules/.modules.yaml`'s `storeDir` and `nodeLinker`) and the toolchain hash before a third machine joins. Add them when the first mismatch is observed, not before.
 - Chunk size targets are a guess. Measure dedup ratio on a real `node_modules` and `target/` before freezing.
 - Hard links inside `node_modules` (pnpm) restore as copies in v0. Preserving them needs inode tracking; decide after measuring size impact.
 - Extended attributes and macOS quarantine flags: dropped in v0. Revisit if a tool breaks.
