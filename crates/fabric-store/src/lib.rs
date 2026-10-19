@@ -16,5 +16,6 @@
 //! capture and records the snapshot in the ledger afterwards, so the ledger
 //! stays the commit point (ADR 0002).
 
+pub mod catalog;
 mod durable;
 pub mod objects;
