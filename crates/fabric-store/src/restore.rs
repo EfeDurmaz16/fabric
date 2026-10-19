@@ -48,7 +48,7 @@ pub enum Verify {
 pub enum Durability {
     /// A killed process: the kernel finishes the writes it was given.
     ProcessCrash,
-    /// A power loss: every file's pages reach the drive before the rename, and the rename's directory flush empties the drive cache.
+    /// A power loss: every file restore writes, and the index, refs, packs and config git writes, reach the drive before the rename, and the rename's directory flush empties the drive cache.
     PowerLoss,
 }
 
@@ -75,7 +75,7 @@ pub struct RestoreReport {
     pub files: u64,
     /// Their bytes.
     pub bytes: u64,
-    /// Files re-read and found equal to the store.
+    /// Files and links re-read and found equal to the store or to the working-tree commit.
     pub verified: u64,
     /// Cache rows whose bytes were not written.
     pub skipped_caches: Vec<RelPath>,
@@ -345,20 +345,8 @@ fn verify_entries(
         .iter()
         .filter(|e| matches!(e.kind, EntryKind::File { .. }) && !skip(&e.rel_path))
         .collect();
-    let chosen: Vec<&Entry> = match mode {
-        Verify::None => Vec::new(),
-        Verify::All => files,
-        Verify::Sample(n) => {
-            if n == 0 || files.is_empty() {
-                Vec::new()
-            } else {
-                let step = (files.len() / n).max(1);
-                files.iter().step_by(step).copied().collect()
-            }
-        }
-    };
     let mut verified = 0;
-    for entry in chosen {
+    for entry in sample(&files, mode) {
         let EntryKind::File { chunks, .. } = &entry.kind else {
             continue;
         };
@@ -548,17 +536,33 @@ fn cat_file_batch(
     Ok(())
 }
 
+/// The staging directory a restore writes into, with its writer and the crash it must survive.
+#[derive(Clone, Copy)]
+struct StagingTarget<'a> {
+    staging: &'a Path,
+    writer: &'a TreeWriter,
+    durability: Durability,
+}
+
 /// Restores the repository: objects, refs, `HEAD`, the index and the working tree.
 fn restore_git(
     store: &Store,
     snapshot: SnapshotId,
     manifest: &SnapshotManifest,
     git_state: &GitState,
-    staging: &Path,
-    writer: &TreeWriter,
+    target: &StagingTarget<'_>,
     report: &mut RestoreReport,
 ) -> Result<Git, RestoreError> {
-    let git = Git::new(staging, manifest.created_at);
+    let StagingTarget {
+        staging,
+        writer,
+        durability,
+    } = *target;
+    let power_loss = durability == Durability::PowerLoss;
+    let mut git = Git::new(staging, manifest.created_at);
+    if power_loss {
+        git = git.with_full_fsync();
+    }
     git.run(&["init", "-q"])?;
     let scratch = git.git_path("fabric-tmp")?;
     fs::create_dir_all(&scratch).map_err(|e| io_err(&scratch, e))?;
@@ -567,11 +571,14 @@ fn restore_git(
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
         }
-        let mut bytes = Vec::new();
+        let mut file = fs::File::create(&path).map_err(|e| io_err(&path, e))?;
         for chunk in chunks {
-            bytes.extend_from_slice(&store.objects().read(*chunk)?);
+            file.write_all(&store.objects().read(*chunk)?)
+                .map_err(|e| io_err(&path, e))?;
         }
-        fs::write(&path, bytes).map_err(|e| io_err(&path, e))?;
+        if power_loss {
+            rustix::fs::fsync(&file).map_err(|e| io_err(&path, e.into()))?;
+        }
     }
 
     // The chain of bundles, oldest first.
@@ -701,6 +708,9 @@ fn restore_git(
                         size,
                     });
                 }
+                if power_loss {
+                    rustix::fs::fsync(&file).map_err(|e| io_err(path, e.into()))?;
+                }
                 drop(file);
                 if let Some(mtime) = mtimes.get(&item.rel) {
                     writer.set_mtime(&item.rel, *mtime)?;
@@ -722,6 +732,113 @@ fn restore_git(
     let _ = git.output(&["update-index", "--refresh"], &[])?;
     let _ = fs::remove_dir_all(&scratch);
     Ok(git)
+}
+
+/// Picks about `n` of `items`, spread over the list, or all or none.
+fn sample<'a, T>(items: &[&'a T], mode: Verify) -> Vec<&'a T> {
+    match mode {
+        Verify::None => Vec::new(),
+        Verify::All => items.to_vec(),
+        Verify::Sample(n) => {
+            if n == 0 || items.is_empty() {
+                Vec::new()
+            } else {
+                let step = (items.len() / n).max(1);
+                items.iter().step_by(step).copied().collect()
+            }
+        }
+    }
+}
+
+/// Re-reads the working tree against commit `W` and returns how many entries matched.
+///
+/// Files are hashed by `git hash-object --no-filters` and compared with the
+/// tree's blob ids; links are compared with their blobs' bytes.
+fn verify_worktree(
+    git: &Git,
+    worktree: &GitOid,
+    writer: &TreeWriter,
+    mode: Verify,
+) -> Result<u64, RestoreError> {
+    let listing = git.run(&["ls-tree", "-r", "-z", worktree.as_str()])?;
+    let items = parse_tree(&listing)?;
+    let blobs: Vec<&TreeItem> = items
+        .iter()
+        .filter(|item| item.mode != TreeMode::Gitlink)
+        .collect();
+    let chosen = sample(&blobs, mode);
+    let mismatch = |item: &TreeItem| RestoreError::VerifyFailed {
+        path: item.rel.clone(),
+    };
+    let mut verified = 0;
+    let mut by_path: Vec<&TreeItem> = Vec::new();
+    let mut links: Vec<&TreeItem> = Vec::new();
+    for item in chosen {
+        match item.mode {
+            TreeMode::Symlink => links.push(item),
+            TreeMode::File | TreeMode::Exec => {
+                // A missing or replaced file is a verify failure, not a git error.
+                let file = writer.open_file(&item.rel).map_err(|_| mismatch(item))?;
+                if item.rel.as_str().contains('\n') {
+                    // hash-object reads one path per line, so this one is hashed by content.
+                    let mut bytes = Vec::new();
+                    (&file)
+                        .read_to_end(&mut bytes)
+                        .map_err(|_| mismatch(item))?;
+                    let out = git.run_stdin_env(
+                        &["hash-object", "--no-filters", "--stdin"],
+                        &[],
+                        &bytes,
+                    )?;
+                    if String::from_utf8_lossy(&out).trim() != item.oid.as_str() {
+                        return Err(mismatch(item));
+                    }
+                    verified += 1;
+                } else {
+                    by_path.push(item);
+                }
+            }
+            TreeMode::Gitlink => {}
+        }
+    }
+    if !by_path.is_empty() {
+        let mut input = String::new();
+        for item in &by_path {
+            input.push_str(item.rel.as_str());
+            input.push('\n');
+        }
+        let out = git.run_stdin_env(
+            &["hash-object", "--no-filters", "--stdin-paths"],
+            &[],
+            input.as_bytes(),
+        )?;
+        let text = String::from_utf8_lossy(&out);
+        let mut hashes = text.lines();
+        for item in &by_path {
+            if hashes.next() != Some(item.oid.as_str()) {
+                return Err(mismatch(item));
+            }
+            verified += 1;
+        }
+    }
+    if !links.is_empty() {
+        let oids: Vec<GitOid> = links.iter().map(|item| item.oid.clone()).collect();
+        cat_file_batch(git, &oids, |index, size, body| {
+            let item = links[index];
+            if size > SYMLINK_TARGET_LIMIT {
+                return Err(mismatch(item));
+            }
+            let mut target = String::new();
+            body.read_to_string(&mut target)
+                .map_err(|_| mismatch(item))?;
+            if writer.read_link(&item.rel).map_err(|_| mismatch(item))? != target {
+                return Err(mismatch(item));
+            }
+            verified += 1;
+            Ok(())
+        })?;
+    }
+    Ok(verified)
 }
 
 /// Says whether `dir` already holds the harness state of `manifest`.
@@ -793,8 +910,11 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
             req.snapshot,
             &manifest,
             state,
-            &staging,
-            &writer,
+            &StagingTarget {
+                staging: &staging,
+                writer: &writer,
+                durability: req.durability,
+            },
             &mut report,
         )?),
         None => None,
@@ -819,6 +939,9 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
     report.skipped_caches.clone_from(&skipped);
     checkpoint::reached("restore.after_files");
     report.verified += verify_entries(store, &writer, &manifest.files, &skip, req.verify)?;
+    if let (Some(git), Some(state)) = (&git, &manifest.git) {
+        report.verified += verify_worktree(git, &state.worktree_commit, &writer, req.verify)?;
+    }
 
     match (req.harness_state, harness_done) {
         (Some(_), Some(verified)) => report.verified += verified,
@@ -859,11 +982,11 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
     Ok(report)
 }
 
-/// Re-reads the `files` of a snapshot under `root` and returns how many matched.
+/// Re-reads the `files` and the working tree of a snapshot under `root` and returns how many matched.
 ///
 /// This is how a caller tells a complete tree from one that was cut short
 /// after the rename by a power loss; a half restore before the rename shows
-/// as `RestoreState::HalfRestored` instead.
+/// as `RestoreState::HalfRestored` instead. The harness state is not covered.
 pub fn verify(
     store: &Store,
     snapshot: SnapshotId,
@@ -880,7 +1003,12 @@ pub fn verify(
         .map(|c| c.path.clone())
         .collect();
     let skip = |rel: &RelPath| skipped.iter().any(|root| rel.starts_with(root));
-    verify_entries(store, &writer, &manifest.files, &skip, mode)
+    let mut verified = verify_entries(store, &writer, &manifest.files, &skip, mode)?;
+    if let Some(state) = &manifest.git {
+        let git = Git::new(root, manifest.created_at);
+        verified += verify_worktree(&git, &state.worktree_commit, &writer, mode)?;
+    }
+    Ok(verified)
 }
 
 #[cfg(test)]

@@ -62,11 +62,15 @@ pub enum GitError {
     Name(#[from] GitNameError),
 }
 
+/// The `-c` settings that make git flush every file it writes to the device.
+const FSYNC_FLAGS: &[&str] = &["core.fsync=all", "core.fsyncMethod=fsync"];
+
 /// A git runner bound to one repository.
 #[derive(Debug, Clone)]
 pub struct Git {
     repo: PathBuf,
     date: String,
+    full_fsync: bool,
 }
 
 impl Git {
@@ -76,7 +80,15 @@ impl Git {
         Git {
             repo: repo.to_owned(),
             date: format!("{} +0000", created_at_ms / 1000),
+            full_fsync: false,
         }
+    }
+
+    /// Makes every git command flush the index, refs, packs and config it writes, for a power-loss-safe restore.
+    #[must_use]
+    pub fn with_full_fsync(mut self) -> Git {
+        self.full_fsync = true;
+        self
     }
 
     /// The repository the runner is bound to.
@@ -89,6 +101,11 @@ impl Git {
         let mut cmd = Command::new("git");
         for flag in CONFIG_FLAGS {
             cmd.arg("-c").arg(flag);
+        }
+        if self.full_fsync {
+            for flag in FSYNC_FLAGS {
+                cmd.arg("-c").arg(flag);
+            }
         }
         cmd.current_dir(&self.repo)
             .env("GIT_CONFIG_NOSYSTEM", "1")

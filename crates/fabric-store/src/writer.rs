@@ -175,6 +175,17 @@ impl TreeWriter {
             .map_err(|e| map(e, Path::new(rel.as_str())))
     }
 
+    /// Reads the target of the symlink at `rel` without following it.
+    pub fn read_link(&self, rel: &RelPath) -> Result<String, WriteError> {
+        let (parent, name) = self.parent_of(rel, false)?;
+        let path = Path::new(rel.as_str());
+        let target = fs::readlinkat(&parent, name, Vec::new()).map_err(|e| map(e, path))?;
+        String::from_utf8(target.into_bytes()).map_err(|e| WriteError::Io {
+            path: path.to_owned(),
+            source: io::Error::new(io::ErrorKind::InvalidData, e),
+        })
+    }
+
     /// Opens an existing regular file for reading without following a link at its name.
     pub fn open_file(&self, rel: &RelPath) -> Result<File, WriteError> {
         let (parent, name) = self.parent_of(rel, false)?;

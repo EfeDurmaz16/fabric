@@ -237,9 +237,21 @@ fn git_state_survives_capture_and_restore() {
 
     let snapshot = store.publish(&manifest).unwrap();
     let target = dir.path().join("restored");
-    let restored = restore_into(&store, snapshot, &target).unwrap();
+    let restored = restore(
+        &store,
+        &RestoreRequest {
+            snapshot,
+            target: &target,
+            harness_state: None,
+            verify: Verify::All,
+            durability: Durability::PowerLoss,
+            carry: &|_| true,
+        },
+    )
+    .unwrap();
     assert_eq!(restored.files, 3);
-    assert_eq!(restored.verified, 3);
+    // Three ignored files plus the nine entries of W.
+    assert_eq!(restored.verified, 12);
     assert_eq!(restore_state(&target).unwrap(), RestoreState::Present);
 
     assert_eq!(git_difference(&root, &target).unwrap(), None);
@@ -282,6 +294,36 @@ fn git_state_survives_capture_and_restore() {
         "untracked\n"
     );
     assert!(store.check(CheckDepth::Hashes).unwrap().is_clean());
+}
+
+#[test]
+fn verify_sees_a_tampered_file_and_link_in_the_working_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    make_repo(&root).unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+
+    assert_eq!(
+        verify(&store, snapshot, &target, Verify::All, &|_| true).unwrap(),
+        12
+    );
+    fs::write(target.join("new.txt"), "cut short").unwrap();
+    assert!(matches!(
+        verify(&store, snapshot, &target, Verify::All, &|_| true),
+        Err(RestoreError::VerifyFailed { path }) if path.as_str() == "new.txt"
+    ));
+    fs::write(target.join("new.txt"), "untracked\n").unwrap();
+    fs::remove_file(target.join("newlink")).unwrap();
+    symlink("a", target.join("newlink")).unwrap();
+    assert!(matches!(
+        verify(&store, snapshot, &target, Verify::All, &|_| true),
+        Err(RestoreError::VerifyFailed { path }) if path.as_str() == "newlink"
+    ));
 }
 
 #[test]
