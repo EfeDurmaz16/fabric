@@ -39,9 +39,11 @@ The core talks to a `Connection` and `Stream` and nothing else. Everything below
 `quinn` 0.11 over `rustls` 0.23.
 
 - Each node generates a self-signed certificate with `rcgen` from its ed25519 key, so the certificate's public key is the node id.
-- The client verifier ignores names and CAs and checks exactly one thing: the certificate's public key equals the `NodeId` it dialed. The server requires a client certificate and checks the same.
-- Wrong key: connection refused before any application byte.
-- QUIC gives multiplexed streams (control and bulk do not block each other), 0-RTT reconnect, and migration across address changes (a laptop moving from Wi-Fi to tethering keeps its connection).
+- TLS 1.3 only, Ed25519 only. Both verifiers are custom `rustls` verifiers that ignore names, CAs and validity dates. A certificate is public, so matching its key is not authentication by itself; each verifier also verifies the handshake's `CertificateVerify` signature against that key through `verify_tls13_signature`, which proves the peer holds the private key for the session at hand.
+- The client verifier (`ServerCertVerifier`) accepts only if the certificate's public key equals the `NodeId` it dialed and the key is in `<fabric-data>/peers`.
+- The server verifier (`ClientCertVerifier`) requires a client certificate and accepts only if its public key is in `<fabric-data>/peers`. An unknown key is rejected inside the handshake; no application byte is exchanged. This is the accept-side half of "pairing is trust": listening does not mean accepting.
+- 0-RTT is disabled. Early data is replayable, and the control vocabulary includes claims and appends; nothing in this protocol is worth a replayed claim.
+- QUIC gives multiplexed streams (control and bulk do not block each other) and migration across address changes (a laptop moving from Wi-Fi to tethering keeps its connection).
 
 ### TCP+TLS fallback
 
@@ -49,7 +51,7 @@ Some networks drop or rate-limit UDP. The same `rustls` config runs over a `toki
 
 ### Framing
 
-Every message on a control stream is `u32 length | u8 version | postcard(Message)`. Every `Message` carries `job_id` and `epoch` (ADR 0003). The first message on a new connection is `Hello { node, fabric_version, clock_ms }` in both directions; a clock difference over 10 seconds is logged and reported.
+Every message on a control stream is `u32 length | u8 version | postcard(Message)`. A control frame longer than 1 MiB is a protocol error and closes the connection; a bulk `Chunk` frame is bounded by the chunk size cap of ADR 0004 plus framing, and a chunk whose zstd frame declares, or decompresses to, more than 256 KiB is rejected before allocation. A peer cannot make a node allocate more than one frame's worth of memory per stream. Every `Message` carries `job_id` and `epoch` (ADR 0003). The first message on a new connection is `Hello { node, fabric_version, clock_ms }` in both directions; a clock difference over 10 seconds is logged and reported.
 
 ### Blob transfer
 
@@ -86,7 +88,7 @@ Fabric runs with no account, no relay, no coordination server. Two nodes that ca
 - One keypair per node, one line to pair. No PKI, no accounts.
 - The only network-level trust decision in the system is "is this key one I paired with". Everything else is fenced by epoch at the job level.
 - Dependencies in `fabric-net`: `quinn`, `rustls`, `rcgen`, `ed25519-dalek`, `tokio`, `postcard`, `mdns-sd`. All had releases in the last three months as of 2026-10-19.
-- Integration tests run two nodes in one process on loopback with real QUIC and real TLS, and one test forces the TCP fallback by binding a UDP socket the server cannot use.
+- Integration tests run two nodes in one process on loopback with real QUIC and real TLS, and one test forces the TCP fallback by binding a UDP socket the server cannot use. Two more are named here because they guard the trust rule: an unpaired key is refused at accept with no application byte exchanged, and a dialer presenting a paired node's certificate without its private key fails the handshake.
 
 ## Open questions
 
