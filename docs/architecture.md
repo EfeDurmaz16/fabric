@@ -17,7 +17,7 @@ A job is a goal plus the state needed to keep working on it. Where that state is
 | Job record | Goal, append-only event ledger, versioned manifest, pending decisions, an opaque state directory per harness | `fabric-core` | [0001](adr/0001-job-as-unit-of-work.md), [0002](adr/0002-job-ledger-and-record.md) |
 | Storage | Content-addressed snapshots of the workspace: git objects and refs in a bundle, the index and the working tree as two snapshot commits, ignored files by class (deps, build, tool caches and precious files carried, secrets never), harness state | `fabric-store` | [0004](adr/0004-content-addressed-snapshots.md), [0011](adr/0011-path-identity.md) |
 | Compute | The node that owns the job and runs the harness right now. Replaceable by an explicit move. Exactly one live copy. | `fabric-node`, `fabric-net` | [0003](adr/0003-exactly-one-live-copy.md), [0005](adr/0005-transport-and-node-identity.md), [0008](adr/0008-placement-and-triggers.md) |
-| Environment | `EnvSpec`: detected tool versions, setup commands, env var names, cache paths. Caches arrive when their carry key matches; otherwise the node materializes. | `fabric-env` | [0007](adr/0007-environment-spec.md), [0012](adr/0012-dependency-carry.md) |
+| Environment | `EnvSpec`: tool pins as the workspace files write them, setup commands, env var names, cache paths. Caches arrive when their carry key matches; otherwise the node materializes. | `fabric-env` | [0007](adr/0007-environment-spec.md), [0012](adr/0012-dependency-carry.md) |
 
 Harnesses (Claude Code, Codex, anything that speaks the Agent Client Protocol) are adapters on top of these four. The core never reads a harness's files; it moves them as opaque bytes. See [0006](adr/0006-harness-adapters.md).
 
