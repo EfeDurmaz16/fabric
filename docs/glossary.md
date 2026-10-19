@@ -1,0 +1,67 @@
+# Glossary
+
+Terms used in the architecture page and the ADRs. One meaning each. If a word is not here, it has its ordinary English meaning.
+
+**ACP** (Agent Client Protocol). A JSON-RPC protocol for driving coding agents. Fabric uses it as the generic harness path. Methods Fabric cares about: `session/new`, `session/load`, `session/prompt`, `session/cancel`.
+
+**Blob.** Bytes stored by hash. Chunks and manifests are both blobs.
+
+**Catalog.** The SQLite database in a store that maps snapshot ids to manifests and chunk ids to on-disk files, and records which chunks each snapshot references.
+
+**Chunk.** A content-defined piece of a file produced by FastCDC, compressed with zstd and named by its blake3 hash.
+
+**Claim.** The act of a node taking the lease of a job at a new epoch.
+
+**Epoch.** A counter on a job's lease. It increases by one on every claim. Any message or write carrying an older epoch than the current one is stale and is refused.
+
+**EnvSpec.** The environment specification of a job: tool versions, setup steps, env var names and cache paths. It describes how to make a node able to run the job. It never contains secret values.
+
+**Event.** One append-only record in a job's ledger. Events are never edited or deleted.
+
+**Fencing.** Refusing work from a stale epoch. The mechanism that keeps exactly one live copy.
+
+**Harness.** The agent program that does the work: Claude Code, Codex, or any ACP agent.
+
+**Harness adapter.** The Fabric code that knows how to detect, capture, restore and launch one harness.
+
+**Harness state directory.** The files a harness needs to continue a conversation. Fabric treats it as opaque bytes owned by the adapter.
+
+**Job.** The unit of development work. A goal plus a ledger plus snapshots plus an EnvSpec plus a lease.
+
+**Job record.** The ledger and the manifest together.
+
+**Ledger.** The append-only, hash-chained log of a job's events.
+
+**Lease.** The right to run a job. At most one node holds it at a time. It has an epoch and an expiry time.
+
+**Live copy.** A workspace plus running harness for a job. There must be at most one.
+
+**Manifest.** A versioned description of a job (job manifest) or of a snapshot (snapshot manifest). Manifests are the only files whose format Fabric promises to keep readable across versions.
+
+**Materialize.** Run the EnvSpec setup steps on a node so that the job can run there.
+
+**Node.** A machine running the Fabric node process. Identified by an ed25519 public key.
+
+**Node id.** The ed25519 public key of a node. Also the TLS identity pinned on every connection.
+
+**Pairing.** Telling one node the id and address of another, out of band. Pairing is how trust is established. Discovery is never trust.
+
+**Placement.** Choosing which node resumes a job.
+
+**Release.** The act of the lease holder giving up the lease at suspend time.
+
+**Restore.** Writing a snapshot into a fresh workspace on a node, with path rewrites.
+
+**Snapshot.** An immutable, content-addressed capture of a workspace and its harness state at one moment.
+
+**Store.** A node's local blob directory plus catalog.
+
+**Suspend.** Stop the harness cleanly, publish a snapshot, release the lease.
+
+**Transport.** The trait that connects two nodes by id and gives them byte streams. QUIC first, TCP+TLS as fallback.
+
+**Trigger.** Whatever starts a suspend or a move. Manual in v0.
+
+**Warm cache.** A node already holds most chunks of a job's latest snapshot, so a resume there moves little data.
+
+**Workspace.** The checkout directory a harness works in. A snapshot captures it. A restore recreates it.
