@@ -1601,8 +1601,58 @@ mod tests {
         ));
     }
 
+    /// A store whose every append fails, so the test can watch what `commit`
+    /// does with a record the disk did not take.
+    struct RefusingStore;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("disk full")]
+    struct DiskFull;
+
+    impl LedgerStore for RefusingStore {
+        type Error = DiskFull;
+
+        fn append(&mut self, _: &Record) -> Result<(), DiskFull> {
+            Err(DiskFull)
+        }
+
+        fn records(&self) -> Result<Vec<Record>, DiskFull> {
+            Err(DiskFull)
+        }
+    }
+
+    /// ADR 0002, durable before visible: a record the store refused is not in
+    /// the ledger, so the lease and the head a peer would be answered with are
+    /// the ones on disk.
     #[test]
-    fn commit_persists_before_it_shows_and_persists_nothing_invalid() {
+    fn commit_shows_nothing_the_store_refused() {
+        let mut ledger = suspended_ledger(node(1));
+        let head = ledger.head();
+        let lease = ledger.lease();
+        let count = ledger.records().len();
+        let started = ledger
+            .propose(
+                node(1),
+                EventKind::MoveStarted {
+                    move_id: mid(1),
+                    target: node(2),
+                },
+                eid(),
+                30,
+            )
+            .unwrap();
+        let err = ledger
+            .commit(&mut RefusingStore, started, Author::Node(node(1)))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Store(DiskFull)));
+        assert_eq!(ledger.head(), head);
+        assert_eq!(ledger.lease(), lease);
+        assert_eq!(ledger.records().len(), count);
+        assert!(ledger.runnable_by(node(1)).is_some());
+    }
+
+    #[test]
+    fn commit_persists_nothing_invalid() {
         let mut store = MemoryStore::default();
         let created =
             Ledger::created(job(), "g".into(), HarnessKind::Codex, node(1), eid(), 1).unwrap();
