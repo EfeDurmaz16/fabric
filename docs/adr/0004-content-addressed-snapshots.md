@@ -6,6 +6,16 @@ Amended 2026-10-19 after step 1 research. Six things changed, each marked in pla
 
 Amended 2026-10-19 while writing `fabric-core` (PR `feat/core`). Two notes on the manifest codec. First, `ManifestError::BadPath { index, reason }` is not what a bad path on the wire produces: `RelPath` and `AbsPath` check their rules inside `Deserialize`, and postcard carries no custom error text, so a wire manifest with a bad path fails as `ManifestError::Codec` and never exists as a value. The index and reason belong to capture, where `RelPath::parse` names the offending path before anything is published; that is where the user can act. Second, `ManifestError::ChunksOnNonFile { index }` is added: a `Dir` or `Symlink` entry with a chunk list is refused, since the file writer would have no rule for it.
 
+Amended 2026-10-19 after the adversarial review of PR `feat/core`. Seven corrections to the manifest, each pinned by a test:
+
+1. The `.git` rule is case-insensitive. APFS and casefolded ext4 fold `.Git` and `.GIT` onto `.git`, so a manifest entry under either would have written into the real `.git` on the owner's Macs. The letters g, i and t have no case-fold sources outside ASCII, so an ASCII-case-insensitive compare is the whole rule.
+2. `Entry` is `{ rel_path, kind: File { size, chunks } | Dir | Symlink { target }, mode, mtime_ns }`: the bytes belong to the file variant, so a directory with chunks or a size cannot be written, and `ChunksOnNonFile` is gone with the state it refused.
+3. `CacheEntry.carry` is `Carried | Partial | NotCarried` in place of the two bools `carried` and `partial`, whose fourth combination meant nothing.
+4. Every list in a manifest is strictly sorted by its key: `files`, `harness_state` and `caches` by path, `refs` by name, `worktree_mtimes` by path, `config` by key. The canonical encoding is only canonical if the same tree has one order; a strict sort also finds a repeated key, so `ManifestError::OutOfOrder { list, index }` replaces `DuplicatePath`.
+5. A mode bit above the low nine is refused on the wire with `ManifestError::BadMode { index }`, not masked; capture masks before publishing, and a manifest from a peer that carries setuid is a manifest to refuse, not to clean.
+6. An entry below a path that an earlier entry says is a file or a symlink is refused with `ManifestError::UnderNonDir { index }`. The file writer's `O_NOFOLLOW` walk still stands; this is defence in depth that costs one hash set, and macOS has no `openat2` with `RESOLVE_BENEATH`.
+7. Git names are parsed types in `fabric_core::git`, checked inside `Deserialize`: `GitOid` (40 or 64 lowercase hex), `RefName` (under `refs/`, passing the `check-ref-format` rules), `BranchName` and `RemoteName` (no leading `-`, not `HEAD`), `GitConfigValue` (no newline, no NUL, no leading `-`) and `GitConfigKey`, an enum that is exactly the allowlist below and travels as its text. A manifest that names `credential.helper` or `core.fsmonitor` fails to decode, so the allowlist is enforced by the receiving node and not only by the capturing one, and nothing in `GitState` can read as an option on git's command line. The wire bytes of a valid manifest did not change.
+
 ## Context
 
 A move must carry everything the job needs, including what git ignores. The research is explicit that nobody ships this: T3 Code's bundle excludes ignored files and runs no install on arrival; claude-handoff and session-roam carry transcripts only; the one unfilled piece is "same-OS-and-arch carry of the pnpm store or `node_modules` and `target/`, content-addressed and deduplicated, with a rebuild fallback" (`2026-10-19-t3code-vs-fabric.md`, section 2). The first gate requires `node_modules` to arrive.
@@ -65,27 +75,28 @@ SnapshotManifest {
 CacheEntry {
   path:    RelPath,            the cache path, relative to the root
   class:   Deps | Build | ToolCache,
-  carried: bool,               false when ADR 0012 said the target cannot use it, or the user excluded it
+  carry:   Carried | Partial | NotCarried,   Partial: the secret policy denied something under it and materialize treats it as missing; NotCarried: ADR 0012 said the target cannot use it, or the user excluded it
   key:     CarryKey,           the exact strings the source measured (ADR 0012); the target compares before trusting the bytes
-  partial: bool,               true when the secret policy denied something under it; materialize treats it as missing
 }
 GitState {
   bundle:          [ChunkId],            git bundle, full or incremental
   bundle_base:     Option<SnapshotId>,   the snapshot whose refs this bundle excludes; None means full
-  refs:            [(String, String)],   every ref name and object id at capture time
-  head:            Branch(String) | Detached(String),
-  index_commit:    String,               commit I: its tree is the index at capture time
-  worktree_commit: String,               commit W: its tree is the working tree at capture time
-  worktree_mtimes: [(RelPath, u64)],     mtime in nanoseconds for every path in W
-  config:          [(String, String)],   allowlisted projection of the repository config (below), never the file
+  refs:            [(RefName, GitOid)],  every ref name and object id at capture time, sorted by name
+  head:            Branch(BranchName) | Detached(GitOid),
+  index_commit:    GitOid,               commit I: its tree is the index at capture time
+  worktree_commit: GitOid,               commit W: its tree is the working tree at capture time
+  worktree_mtimes: [(RelPath, u64)],     mtime in nanoseconds for every path in W, sorted by path
+  config:          [(GitConfigKey, GitConfigValue)],   allowlisted projection of the repository config (below), never the file, sorted by key
   exclude:         Option<[ChunkId]>,    .git/info/exclude
 }
-Entry { rel_path: RelPath, kind: File | Dir | Symlink { target: String }, mode: u32, mtime_ns: u64, size: u64, chunks: [ChunkId] }
+Entry { rel_path: RelPath, kind: File { size: u64, chunks: [ChunkId] } | Dir | Symlink { target: String }, mode: u32, mtime_ns: u64 }
 ```
+
+Every list is strictly sorted by its key (paths and ref names by their bytes), and the version is the first varint of the bytes, not a field. The git name types are defined in `fabric_core::git` (review amendment 7).
 
 `mtime_ns` is read with `lstat` at capture and written back with `utimensat` after the bytes, with `AT_SYMLINK_NOFOLLOW` for links; a directory's mtime is set after its contents. The same applies to every path in `W` through `worktree_mtimes`. This is not cosmetic: Cargo decides fresh or stale from mtimes and paths, not content (research H5, item 3), so a `target/` carried without the source files' original mtimes rebuilds every local crate. pnpm does not care, which is why the first gate would pass without this and a Rust job would not.
 
-`RelPath` is a parsed newtype in `fabric-core`, never a bare string. Decoding a manifest rejects, with `ManifestError::BadPath { index, reason }`, any path that is empty, starts with `/`, contains a NUL byte, has an empty, `.` or `..` component, or is not NFC-normalized. A `.git` component is rejected everywhere, including in the paths `git ls-tree` reports for `W`: `git add` refuses such a path, but a tree object inside a bundle from a compromised peer can hold one, and the file writer would otherwise write into the target's `.git`. Two entries with the same path are `ManifestError::DuplicatePath`. The same rules run at capture, before anything is published: a name that is not NFC is refused with `CaptureError::NonNfcPath { path }` naming the file, because APFS preserves NFD names made by older tools and a manifest the capturing node itself could not restore must never be published; the failure belongs at suspend, where the user can rename the file, not at resume on the other machine. A symlink `target` is an unparsed string written verbatim with `symlink(2)`; it is safe because restore never writes through a link (below). It is still written, and the harness will follow it later, so capture and restore both list every symlink whose target is absolute or escapes the root in their output, next to the denied paths. `mode` is applied as `mode & 0o777`; setuid, setgid and sticky bits never travel.
+`RelPath` is a parsed newtype in `fabric-core`, never a bare string. Decoding a manifest rejects, with `ManifestError::BadPath { index, reason }`, any path that is empty, starts with `/`, contains a NUL byte, has an empty, `.` or `..` component, or is not NFC-normalized. A `.git` component is rejected everywhere, including in the paths `git ls-tree` reports for `W`: `git add` refuses such a path, but a tree object inside a bundle from a compromised peer can hold one, and the file writer would otherwise write into the target's `.git`. Two entries with the same path, or two out of order, are `ManifestError::OutOfOrder`. A `.git` component is refused in any letter case, because the owner's volumes fold case. The same rules run at capture, before anything is published: a name that is not NFC is refused with `CaptureError::NonNfcPath { path }` naming the file, because APFS preserves NFD names made by older tools and a manifest the capturing node itself could not restore must never be published; the failure belongs at suspend, where the user can rename the file, not at resume on the other machine. A symlink `target` is an unparsed string written verbatim with `symlink(2)`; it is safe because restore never writes through a link (below). It is still written, and the harness will follow it later, so capture and restore both list every symlink whose target is absolute or escapes the root in their output, next to the denied paths. `mode` is masked to `mode & 0o777` at capture; setuid, setgid and sticky bits never travel, and a manifest that carries one is refused on decode (`ManifestError::BadMode`).
 
 - **Git, by commits, not by files.** Uncommitted work is the common state of a job in flight, and a bundle carries only what a ref reaches. Capture therefore builds two commits with private indexes and never touches the real index, the working tree or the user's refs. Amended 2026-10-19: the research confirms this is the one design that keeps the staged versus unstaged split, which T3 Code, cmux and ccbeam all drop (design input, D4 and section 2.1); the index is carried as `I`, never as the index file, because staged blobs are loose objects no ref reaches.
   - `I`: copy the index file (`git rev-parse --git-path index`) to a temporary file, then `git write-tree` with `GIT_INDEX_FILE` pointing at the copy, then `git commit-tree <tree> -p HEAD`. Its tree is the staged state, so staged blobs become reachable. `write-tree` on the real index is not read only: it rewrites the cache-tree extension under `index.lock`, and it dies when another git process holds that lock, which the harness's own git commands often do. The copy is attempted a few times while `index.lock` exists, then capture fails with `GitBusy`.

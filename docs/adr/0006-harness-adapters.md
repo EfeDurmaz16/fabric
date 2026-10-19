@@ -44,7 +44,7 @@ trait Harness: Send + Sync {
         with exactly this environment, and return the handle the supervisor records.
 }
 
-HarnessKind     = ClaudeCode | Codex | Acp { command: String }
+HarnessKind     = ClaudeCode | Codex | Acp { program: String, args: [String] }   the program is looked up on PATH, never run through a shell (review amendment, 2026-10-19)
 Detected        = { state_root: PathBuf, session_id: Option<String>, running: Option<RunningHarness> }
 Captured        = { entries: [Entry], absolute_roots: [PathBuf], redactions: [RedactionReport] }
 RedactionReport = { rule: String, count: u32 }

@@ -6,8 +6,13 @@
 //! a database or any agent vendor. Everything above it is an adapter that
 //! feeds it bytes and persists what it returns.
 //!
-//! The one invariant the whole crate serves: a job has exactly one live copy.
-//! The ledger refuses any record that would give it two.
+//! The one invariant the whole crate serves: on any one chain a job has
+//! exactly one live copy, and the ledger refuses any record that would give
+//! it two. A steal is the one record that can fork a chain, so until the
+//! fork rule of ADR 0003 lands in a later crate, two nodes that took
+//! different chains can each hold an owner at the same epoch; the fork rule
+//! picks one and the other becomes an orphan. Without a `Stolen` record the
+//! invariant holds across every node, and the model test proves it.
 //!
 //! # A move between two nodes
 //!

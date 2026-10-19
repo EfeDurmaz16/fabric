@@ -5,7 +5,12 @@
 //! `move_id` and answers every later question with that same record, and the
 //! epoch rises by exactly one on `MoveImported` and on `Stolen` and never
 //! otherwise. A lost reply, a repeated offer or a repeated receipt changes
-//! nothing, which is what makes two runnable copies impossible.
+//! nothing, which is what makes two runnable copies on one chain impossible.
+//! A steal can fork the chain: the thief and an owner that kept writing hold
+//! two suffixes, and the fork rule of ADR 0003, which a later PR implements,
+//! decides which one survives. A departing source is still the owner of
+//! record and cannot steal from itself, so a move whose target vanishes
+//! stays frozen until the target answers or a third node steals (ADR 0003).
 
 use std::fmt;
 

@@ -6,6 +6,8 @@ Amended 2026-10-19 after step 1 research. Step 1 of Materialize now reads the pe
 
 Amended 2026-10-19 while writing `fabric-core` (PR `feat/core`): `SetupStep.cwd` is `Option<RelPath>`, where `None` is the workspace root, because a `RelPath` cannot name the root itself (ADR 0004 forbids empty and `.` components). The edited-spec record is `EnvSpecChanged` (ADR 0002), not a free-text `Note`.
 
+Amended 2026-10-19 after the adversarial review of PR `feat/core`: a setup step is `{ program, args, cwd, when }` rather than `{ argv, cwd, when }`, so there is no empty command to refuse and the shape matches `HarnessKind::Acp` (ADR 0006). The format version is the first varint of the spec's bytes, not a field of the struct (ADR 0002, review amendment 5).
+
 ## Context
 
 The job's workspace arrives with its caches when the platform matches (ADR 0004). When it does not, or when a cache was excluded, the node must be able to make itself ready without the user typing anything. The standard for describing environments is `devcontainer.json` (about 1.69M monthly npm downloads of `@devcontainers/cli` per the landscape, section 7). But a devcontainer is a container recipe, and v0 runs harnesses directly on two Macs with no container.
@@ -17,18 +19,17 @@ Also: environments contain secrets, and secrets must not travel in snapshots (AD
 ### `EnvSpec` v0
 
 ```text
-EnvSpec {
-  version:       u16,
+EnvSpec {                        the bytes start with the format version as a varint; it is not a field
   tools:         [Tool],         detected, informational, used to warn on mismatch
   setup:         [SetupStep],    commands that make the workspace runnable
   env_var_names: [String],       names only, never values
   cache_paths:   [RelPath],      what counts as a cache for snapshot policy and for "is it warm"
 }
 Tool      { name: String, version: String, source: Detected | Declared }   version is the tool's own exact string (`rustc -vV`, `node --version`, `pnpm --version`), never parsed into parts
-SetupStep { argv: [String], cwd: Option<RelPath>, when: CachesMissing | Always }   cwd None is the root
+SetupStep { program: String, args: [String], cwd: Option<RelPath>, when: CachesMissing | Always }   cwd None is the root
 ```
 
-`argv` is executed directly, never through a shell. A spec travels with the job and a peer can send one, so there is no string for quoting bugs or a hostile `packageManager` field to hide in. Before the node runs a spec whose id differs from the one it last ran or wrote for that job, it prints the steps and asks, unless the command was given `--yes`.
+`program` is looked up on `PATH` and run with `args` directly, never through a shell. A spec travels with the job and a peer can send one, so there is no string for quoting bugs or a hostile `packageManager` field to hide in. Before the node runs a spec whose id differs from the one it last ran or wrote for that job, it prints the steps and asks, unless the command was given `--yes`.
 
 `EnvSpecId` is the blake3 of the postcard bytes. A job references an `EnvSpec` by id; editing produces a new id and an `EnvSpecChanged` record in the ledger.
 
