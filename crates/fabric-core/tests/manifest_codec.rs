@@ -6,12 +6,11 @@ use std::error::Error;
 
 use fabric_core::codec::CodecError;
 use fabric_core::git::{BranchName, GitConfigKey, GitConfigValue, GitOid, RefName};
-use fabric_core::harness::HarnessState;
 use fabric_core::id::{ChunkId, EnvSpecId, JobId, NodeId, SnapshotId};
 use fabric_core::path::{AbsPath, RelPath};
 use fabric_core::snapshot::{
     CacheClass, CacheEntry, CarryKey, CarryState, Entry, EntryKind, GitHead, GitState,
-    MANIFEST_VERSION, ManifestError, Mode, Platform, SnapshotManifest,
+    HarnessState, MANIFEST_VERSION, ManifestError, Mode, Platform, SnapshotManifest,
 };
 use proptest::prelude::*;
 

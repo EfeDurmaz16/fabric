@@ -16,7 +16,6 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::codec::{self, CodecError, VersionedError};
 use crate::git::{BranchName, GitConfigKey, GitConfigValue, GitOid, RefName};
-use crate::harness::HarnessState;
 use crate::id::{ChunkId, EnvSpecId, JobId, NodeId, SnapshotId};
 use crate::path::{AbsPath, RelPath};
 
@@ -153,6 +152,17 @@ impl<'de> Deserialize<'de> for Mode {
         let bits = u16::deserialize(deserializer)?;
         Mode::new(bits).ok_or_else(|| serde::de::Error::custom("mode bits above 0o777"))
     }
+}
+
+/// What an adapter's `capture` produced, as paths and hashes only.
+///
+/// Paths are relative to the state root the adapter declared. The bytes live
+/// in the store under their chunk ids; this type never holds them, and the
+/// core never reads what is inside (ADR 0006).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct HarnessState {
+    /// The captured files, directories and links.
+    pub entries: Vec<Entry>,
 }
 
 /// The kind of a tree entry.

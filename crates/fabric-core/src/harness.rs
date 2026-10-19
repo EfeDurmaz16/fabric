@@ -1,16 +1,15 @@
-//! The kinds of harness and the shape of their carried state.
+//! The kinds of harness.
 //!
-//! Invariant: the core never looks inside harness state. It knows which kind
-//! of adapter owns it and the list of relative paths and hashes that make it
-//! up, nothing more. A program the core names is a bare name for a `PATH`
-//! lookup, so what a peer sends can never be a path or an option.
+//! Invariant: the core knows which kind of adapter drives a job and how to
+//! start it, nothing more; the state an adapter carries is a tree of paths
+//! and hashes in `crate::snapshot::HarnessState` that the core never reads.
+//! A program the core names is a bare name for a `PATH` lookup, so what a
+//! peer sends can never be a path or an option.
 
 use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize};
-
-use crate::snapshot::Entry;
 
 /// Why a program name was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -121,16 +120,6 @@ impl fmt::Display for HarnessKind {
             }
         }
     }
-}
-
-/// What an adapter's `capture` produced, as paths and hashes only.
-///
-/// Paths are relative to the state root the adapter declared. The bytes live
-/// in the store under their chunk ids; this type never holds them.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct HarnessState {
-    /// The captured files, directories and links.
-    pub entries: Vec<Entry>,
 }
 
 #[cfg(test)]
