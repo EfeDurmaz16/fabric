@@ -2,7 +2,6 @@
 //! TCP: the hello exchange, the trust rule at both ends, the frame cap on a
 //! live stream, the call deadline, chunk resume after a dropped connection,
 //! stream isolation under backpressure, and the QUIC first dial.
-#![cfg(all(feature = "quic", feature = "tcp_tls"))]
 
 use std::collections::BTreeMap;
 use std::error::Error;

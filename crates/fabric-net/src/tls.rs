@@ -35,7 +35,6 @@ pub const ED25519_SPKI_PREFIX: [u8; 12] = [
 pub const ALPN: &[u8] = b"fabric/1";
 
 /// The server name a QUIC client dials; the verifier never reads it, but TLS needs one.
-#[cfg(feature = "quic")]
 pub(crate) const SERVER_NAME: &str = "fabric";
 
 /// Why a certificate or a TLS configuration was refused.
@@ -321,11 +320,9 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "tcp_tls")]
     #[derive(Debug)]
     struct Paired(Vec<NodeId>);
 
-    #[cfg(feature = "tcp_tls")]
     impl Trust for Paired {
         fn is_paired(&self, node: NodeId) -> bool {
             self.0.contains(&node)
@@ -336,7 +333,6 @@ mod tests {
     /// paired node's certificate but another private key cannot complete
     /// the handshake, because the signature over the handshake is checked
     /// against the key the certificate names.
-    #[cfg(feature = "tcp_tls")]
     #[tokio::test]
     async fn a_paired_certificate_without_its_key_fails_the_handshake() {
         use tokio::io::AsyncWriteExt;

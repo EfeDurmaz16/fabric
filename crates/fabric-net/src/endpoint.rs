@@ -1,4 +1,4 @@
-//! One node's endpoint: every enabled transport on one port, QUIC first.
+//! One node's endpoint: both transports on one port, QUIC first.
 //!
 //! Invariant: a dial tries QUIC first and falls back to TCP with TLS only
 //! when QUIC did not complete within `quic_timeout`; the fallback is
@@ -14,9 +14,7 @@ use fabric_core::id::NodeId;
 
 use crate::identity::NodeIdentity;
 use crate::peers::HostPort;
-#[cfg(feature = "quic")]
 use crate::quic::QuicTransport;
-#[cfg(feature = "tcp_tls")]
 use crate::tcp::TcpTlsTransport;
 use crate::tls::Trust;
 use crate::transport::{Connection, Transport, TransportError};
@@ -36,15 +34,13 @@ pub struct Dialed {
 #[derive(Debug)]
 pub struct Endpoint {
     node: NodeId,
-    #[cfg(feature = "quic")]
     quic: QuicTransport,
-    #[cfg(feature = "tcp_tls")]
     tcp: TcpTlsTransport,
     quic_timeout: Duration,
 }
 
 impl Endpoint {
-    /// Binds every enabled transport at `addr`; with port 0 the first transport picks the port and the rest follow.
+    /// Binds both transports at `addr`; with port 0 QUIC picks the port and TCP follows.
     ///
     /// Call it inside a tokio runtime.
     pub fn bind(
@@ -52,23 +48,11 @@ impl Endpoint {
         trust: Arc<dyn Trust>,
         addr: SocketAddr,
     ) -> Result<Self, TransportError> {
-        #[cfg(all(feature = "quic", feature = "tcp_tls"))]
-        let quic_trust = Arc::clone(&trust);
-        #[cfg(all(feature = "quic", not(feature = "tcp_tls")))]
-        let quic_trust = trust;
-        #[cfg(feature = "quic")]
-        let quic = QuicTransport::bind(identity, quic_trust, addr)?;
-        #[cfg(feature = "tcp_tls")]
-        let tcp = {
-            #[cfg(feature = "quic")]
-            let addr = quic.local_addr()?;
-            TcpTlsTransport::bind(identity, trust, addr)?
-        };
+        let quic = QuicTransport::bind(identity, Arc::clone(&trust), addr)?;
+        let tcp = TcpTlsTransport::bind(identity, trust, quic.local_addr()?)?;
         Ok(Self {
             node: identity.node_id(),
-            #[cfg(feature = "quic")]
             quic,
-            #[cfg(feature = "tcp_tls")]
             tcp,
             quic_timeout: QUIC_TIMEOUT,
         })
@@ -87,19 +71,14 @@ impl Endpoint {
         self.node
     }
 
-    /// The address every transport listens on.
+    /// The address both transports listen on.
     pub fn local_addr(&self) -> Result<SocketAddr, TransportError> {
-        #[cfg(feature = "quic")]
-        let addr = self.quic.local_addr();
-        #[cfg(all(feature = "tcp_tls", not(feature = "quic")))]
-        let addr = self.tcp.local_addr();
-        addr
+        self.quic.local_addr()
     }
 
     /// Dials `peer` at `addr`: QUIC within `quic_timeout`, then TCP with TLS.
     pub async fn dial(&self, peer: NodeId, addr: SocketAddr) -> Result<Dialed, TransportError> {
-        #[cfg(feature = "quic")]
-        let quic_failure = {
+        let quic_failure =
             match tokio::time::timeout(self.quic_timeout, self.quic.connect(peer, addr)).await {
                 Ok(Ok(connection)) => {
                     return Ok(Dialed {
@@ -110,24 +89,14 @@ impl Endpoint {
                 Ok(Err(TransportError::Tls(err))) => return Err(TransportError::Tls(err)),
                 Ok(Err(err)) => err,
                 Err(_) => TransportError::Timeout(self.quic_timeout),
-            }
-        };
-        #[cfg(not(feature = "quic"))]
-        let quic_failure = TransportError::Config("quic is not built in".to_owned());
-        #[cfg(feature = "tcp_tls")]
-        {
-            let reason = format!("quic: {quic_failure}");
-            tracing::info!(%peer, %addr, %reason, "falling back to tcp+tls");
-            let connection = self.tcp.connect(peer, addr).await?;
-            Ok(Dialed {
-                connection,
-                fallback_reason: Some(reason),
-            })
-        }
-        #[cfg(not(feature = "tcp_tls"))]
-        {
-            Err(quic_failure)
-        }
+            };
+        let reason = format!("quic: {quic_failure}");
+        tracing::info!(%peer, %addr, %reason, "falling back to tcp+tls");
+        let connection = self.tcp.connect(peer, addr).await?;
+        Ok(Dialed {
+            connection,
+            fallback_reason: Some(reason),
+        })
     }
 
     /// Dials `peer` at the first of `addrs` that answers, resolving names as needed.
@@ -163,22 +132,11 @@ impl Endpoint {
         Err(last)
     }
 
-    /// Waits for the next connection from a paired peer on any transport.
+    /// Waits for the next connection from a paired peer on either transport.
     pub async fn accept(&self) -> Result<Box<dyn Connection>, TransportError> {
-        #[cfg(all(feature = "quic", feature = "tcp_tls"))]
-        {
-            tokio::select! {
-                quic = self.quic.accept() => quic,
-                tcp = self.tcp.accept() => tcp,
-            }
-        }
-        #[cfg(all(feature = "quic", not(feature = "tcp_tls")))]
-        {
-            self.quic.accept().await
-        }
-        #[cfg(all(feature = "tcp_tls", not(feature = "quic")))]
-        {
-            self.tcp.accept().await
+        tokio::select! {
+            quic = self.quic.accept() => quic,
+            tcp = self.tcp.accept() => tcp,
         }
     }
 }

@@ -12,23 +12,13 @@
 //! nodes that can reach each other's address can work, over a LAN, a public
 //! address or a tailnet alike; `docs/net.md` says how to run each.
 
-#[cfg(not(any(feature = "quic", feature = "tcp_tls")))]
-compile_error!(
-    "fabric-net needs at least one transport: enable the `quic` or the `tcp_tls` feature"
-);
-
 pub mod endpoint;
 pub mod frame;
 pub mod identity;
-#[cfg(feature = "mdns")]
-pub mod mdns;
 pub mod peers;
-#[cfg(feature = "tcp_tls")]
 mod pipe;
-#[cfg(feature = "quic")]
 pub mod quic;
 pub mod rpc;
-#[cfg(feature = "tcp_tls")]
 pub mod tcp;
 pub mod tls;
 pub mod transport;

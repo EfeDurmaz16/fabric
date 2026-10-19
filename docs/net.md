@@ -74,10 +74,9 @@ Pro is behind NAT; UDP and TCP both arrive from the Pro at the Air.
   MagicDNS name instead. Nothing in Fabric changes; the pinned handshake runs
   inside the tailnet's encryption. Fabric does not depend on Tailscale and
   does not read its state.
-- On a LAN: pair with the LAN address. With the `mdns` feature a node
-  advertises `_fabric._udp` with its id in the TXT record, and a browser
-  reports nodes it sees. A seen node that is paired gets its address
-  refreshed; one that is not is listed as unpaired and never dialed.
+- On a LAN: pair with the LAN address. mDNS discovery, which ADR 0005
+  allows only to refresh the address of a node that is already paired, is
+  not built yet.
 - Two nodes behind symmetric NAT with no tailnet cannot reach each other.
   v0 says so instead of pretending; iroh is the first thing to try if the
   gate fails for network reasons (ADR 0005, alternative 1).
@@ -97,4 +96,5 @@ has property tests and random bytes never panic a decoder.
 ## Not in this phase
 
 Key rotation (a compromised key means re-pair), a pairing code, mutual
-pairing over the connection, a hub or relay, and NAT traversal.
+pairing over the connection, mDNS address refresh on a LAN, a hub or
+relay, and NAT traversal.
