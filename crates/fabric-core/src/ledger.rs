@@ -484,6 +484,12 @@ pub enum LedgerError {
     /// published snapshot: no `Suspended` names it, or a `Resumed` came after.
     #[error("job must be suspended in its latest snapshot before it moves")]
     NotSuspended,
+    /// A move started under a move id an earlier move on this chain used.
+    #[error("move id {move_id} was already used on this chain")]
+    MoveIdReused {
+        /// The id the record names.
+        move_id: MoveId,
+    },
     /// A record names a snapshot other than the latest the ledger published.
     #[error("snapshot {snapshot} is not the latest published snapshot")]
     UnknownSnapshot {
@@ -930,7 +936,7 @@ impl Ledger {
 
     fn check_content(&self, kind: &EventKind) -> Result<(), LedgerError> {
         match kind {
-            EventKind::MoveStarted { .. } => {
+            EventKind::MoveStarted { move_id, .. } => {
                 // The workspace is in the latest published snapshot and no
                 // harness runs: the last Suspended names that snapshot and no
                 // Resumed came after it. Notes and decisions in between do
@@ -939,6 +945,12 @@ impl Ledger {
                     && self.suspended_at == self.manifest.latest_snapshot;
                 if !in_latest {
                     return Err(LedgerError::NotSuspended);
+                }
+                // One decision per move id is only true if a move id names
+                // one move: a target answers every question about a move id
+                // with the first decision it holds for it.
+                if self.names_move(*move_id) {
+                    return Err(LedgerError::MoveIdReused { move_id: *move_id });
                 }
                 Ok(())
             }
@@ -967,6 +979,16 @@ impl Ledger {
             }
             _ => Ok(()),
         }
+    }
+
+    /// Returns true when any record on the chain already names `move_id`.
+    fn names_move(&self, move_id: MoveId) -> bool {
+        self.records.iter().any(|r| match &r.event().kind {
+            EventKind::MoveStarted { move_id: m, .. }
+            | EventKind::MoveImported { move_id: m, .. }
+            | EventKind::MoveAborted { move_id: m } => *m == move_id,
+            _ => false,
+        })
     }
 
     fn check_latest(&self, snapshot: SnapshotId) -> Result<(), LedgerError> {
@@ -1337,6 +1359,50 @@ mod tests {
         )
         .unwrap();
         start(&mut republished).unwrap();
+    }
+
+    /// Reused, the target would answer every offer and abort for the new
+    /// move with the old decision record, which never links on the source;
+    /// the move would be frozen until a third node stole.
+    #[test]
+    fn a_move_id_is_used_once_per_chain() {
+        let move_id = mid(1);
+        let mut ledger = departing_ledger(node(1), node(2), move_id);
+        append(&mut ledger, node(2), EventKind::MoveAborted { move_id }).unwrap();
+        append(
+            &mut ledger,
+            node(1),
+            EventKind::SnapshotPublished {
+                snapshot: snap(2),
+                parent: Some(snap(1)),
+            },
+        )
+        .unwrap();
+        append(
+            &mut ledger,
+            node(1),
+            EventKind::Suspended { snapshot: snap(2) },
+        )
+        .unwrap();
+        let err = append(
+            &mut ledger,
+            node(1),
+            EventKind::MoveStarted {
+                move_id,
+                target: node(2),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, LedgerError::MoveIdReused { move_id: m } if m == move_id));
+        append(
+            &mut ledger,
+            node(1),
+            EventKind::MoveStarted {
+                move_id: mid(2),
+                target: node(2),
+            },
+        )
+        .unwrap();
     }
 
     #[test]

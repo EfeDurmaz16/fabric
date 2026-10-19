@@ -185,7 +185,10 @@ impl Ledger {
         }
     }
 
-    /// Returns the decision record this node wrote or accepted for `move_id`, if any.
+    /// Returns the decision record on this chain for `move_id`, if any.
+    ///
+    /// There is at most one: the ledger refuses a `MoveStarted` whose id an
+    /// earlier move used, and `Departing` has one exit per move.
     #[must_use]
     pub fn decision_for(&self, move_id: MoveId) -> Option<&Record> {
         self.records().iter().find(|r| match &r.event().kind {
