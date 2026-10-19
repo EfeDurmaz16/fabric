@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use fabric_core::BoxFuture;
 use fabric_core::id::{ChunkId, NodeId};
-use fabric_net::BoxFuture;
 use fabric_net::endpoint::Endpoint;
 use fabric_net::frame::{FRAME_VERSION, MAX_CONTROL_FRAME};
 use fabric_net::identity::NodeIdentity;

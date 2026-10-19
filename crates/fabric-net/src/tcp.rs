@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use fabric_core::BoxFuture;
 use fabric_core::id::NodeId;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
@@ -28,7 +29,6 @@ use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 
-use crate::BoxFuture;
 use crate::identity::NodeIdentity;
 use crate::pipe::{PipeReader, PipeWriter, pipe};
 use crate::tls::{Credentials, TlsError, Trust, peer_of};

@@ -13,10 +13,10 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use fabric_core::BoxFuture;
 use fabric_core::id::NodeId;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::BoxFuture;
 use crate::tls::TlsError;
 
 /// Which wire carries a connection.

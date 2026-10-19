@@ -90,3 +90,11 @@ pub mod ledger;
 pub mod moves;
 pub mod path;
 pub mod snapshot;
+
+/// A boxed, `Send` future: the return type of every trait the core
+/// dispatches through `Box<dyn Trait>` (ADR 0005).
+///
+/// Native `async fn` in a trait is not dyn compatible on the pinned
+/// toolchain and cannot require `Send`, so dynamically dispatched traits
+/// return this alias instead.
+pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;

@@ -12,9 +12,6 @@
 //! nodes that can reach each other's address can work, over a LAN, a public
 //! address or a tailnet alike; `docs/net.md` says how to run each.
 
-use std::future::Future;
-use std::pin::Pin;
-
 #[cfg(not(any(feature = "quic", feature = "tcp_tls")))]
 compile_error!(
     "fabric-net needs at least one transport: enable the `quic` or the `tcp_tls` feature"
@@ -36,6 +33,3 @@ pub mod tcp;
 pub mod tls;
 pub mod transport;
 pub mod wire;
-
-/// A boxed `Send` future, the return shape of every trait this crate dispatches dynamically.
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;

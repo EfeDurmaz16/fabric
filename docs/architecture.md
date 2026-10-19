@@ -34,7 +34,7 @@ crates/
   fabric-cli       the `fabric` binary: job init, suspend, resume, job move, job steal, status, doctor, orphan export, node pair, node serve
 ```
 
-Only `fabric-core` and `fabric-net` exist today. Dependency direction is strictly downward: `fabric-cli` depends on everything, `fabric-core` depends on nothing in the workspace. `fabric-core` defines the `Store` and `Harness` traits; `fabric-net` defines `Transport`, because its byte streams are tokio types the core does not depend on, and the node crate holds it as a `Box<dyn Transport>`. Nothing in the core knows about QUIC, SQLite or any agent vendor.
+Only `fabric-core` and `fabric-net` exist today. Dependency direction is strictly downward: `fabric-cli` depends on everything, `fabric-core` depends on nothing in the workspace. `fabric-core` defines the `Store` and `Harness` traits; `fabric-net` defines `Transport`, because its byte streams are tokio types the core does not depend on, and the node crate holds it as a `Box<dyn Transport>`; `BoxFuture`, the return type of every dynamically dispatched trait, is defined once in `fabric-core`. Nothing in the core knows about QUIC, SQLite or any agent vendor.
 
 ## Data structures first
 

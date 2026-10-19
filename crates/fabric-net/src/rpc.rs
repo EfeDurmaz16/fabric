@@ -12,11 +12,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use fabric_core::BoxFuture;
 use fabric_core::id::{ChunkId, NodeId};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
-use crate::BoxFuture;
 use crate::frame::{FrameError, MAX_BULK_FRAME, MAX_CONTROL_FRAME, read_frame, write_frame};
 use crate::transport::{Connection, Stream, TransportError, TransportKind};
 use crate::wire::{

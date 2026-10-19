@@ -9,12 +9,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use fabric_core::BoxFuture;
 use fabric_core::id::NodeId;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{IdleTimeout, VarInt};
 use rustls::pki_types::CertificateDer;
 
-use crate::BoxFuture;
 use crate::identity::NodeIdentity;
 use crate::tls::{Credentials, SERVER_NAME, TlsError, Trust, peer_of};
 use crate::transport::{Connection, Stream, Transport, TransportError, TransportKind};
