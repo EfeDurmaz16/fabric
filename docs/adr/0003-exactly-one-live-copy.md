@@ -75,7 +75,17 @@ With two nodes and no quorum, a network partition where both nodes are awake and
 - never claims after expiry automatically. Expiry-based claims require the user to run `fabric resume --force-expired`, and the command prints what it is about to do and what will be orphaned.
 - the normal path is suspend then resume, where the release is explicit and the claim is granted by the previous holder, which is the arbiter.
 
-`--force-expired` is the one append a non-arbiter may make: the claimant appends `LeaseClaimed { epoch: current + 1 }` with `prev` set to its replica head, then a `Note` saying the claim was forced and against which `expires_at`. It is therefore the only way two ledgers can fork. When the old holder reconnects it is offered the forced record. If the record's `prev` equals the old holder's head, it appends it and is fenced. If not, the old holder appended at the old epoch while it was unreachable and the chains have forked. The chain that contains the higher epoch claim is the job's chain. The losing node moves its records after the fork point to `ledger.forked-<hex of fork head>` beside the ledger, lists every snapshot those records published as an orphan snapshot, then appends the winning suffix. Nothing is deleted.
+`--force-expired` is the one append a non-arbiter may make: the claimant appends `LeaseClaimed { epoch: current + 1, origin: Forced }` with `prev` set to its replica head, then a `Note` saying the claim was forced and against which `expires_at`. A claim the arbiter appends carries `origin: Granted`. A forced claim is therefore the only way two ledgers can fork. When the old holder reconnects it is offered the forced record. If the record's `prev` equals the old holder's head, it appends it and is fenced. If not, the old holder appended at the old epoch while it was unreachable and the chains have forked.
+
+**Fork rule.** Both nodes compute the winner from the two suffixes alone, with no message and no clock, and arrive at the same answer. Compare the highest `LeaseClaimed` in each suffix:
+
+1. The higher epoch wins.
+2. At equal epoch, `Granted` beats `Forced`. The arbiter's grant was legitimate at the time; the forced claim was a guess that the arbiter was dead.
+3. If both are `Forced`, the lower `NodeId`, compared as bytes, wins.
+
+Two suffixes cannot both hold a `Granted` claim at the same epoch, because only the arbiter grants and the arbiter is one node. The order is total, so there is never a tie. The losing node stops its harness (the kill of Fencing, above), moves its records after the fork point to `ledger.forked-<hex of fork head>` beside the ledger, lists every snapshot those records published as an orphan snapshot and pins it (ADR 0004), marks its workspace as an orphan workspace, then appends the winning suffix. Nothing is deleted.
+
+The case that motivated rule 2: A holds epoch 1 and is partitioned. B runs `--force-expired` and gets `Forced` epoch 2. Meanwhile the user on A suspends, which appends `LeaseReleased { 1 }`, and then resumes on A, where A as arbiter grants itself `Granted` epoch 2. Both chains now hold a claim at epoch 2 and both harnesses run. On reconnection rule 2 picks A; B kills its harness and B's work since the fork is an orphan snapshot. If A had cycled twice and reached epoch 3, rule 1 picks A for the same reason. The user is told which side lost and where its work is, in both cases.
 
 Quorum (three or more nodes, or a small witness) is a later ADR. The epoch and fencing design does not change when quorum arrives; only the claim rule does.
 
@@ -93,7 +103,7 @@ Quorum (three or more nodes, or a small witness) is a later ADR. The epoch and f
 
 ## Consequences
 
-- The lease state machine is small enough to property test exhaustively. Arbitrary interleavings of claim request, grant, lost reply, retry, renew, release, expire, crash, message loss and forced claim must keep three invariants: for any epoch the job's chain holds at most one `LeaseClaimed`; the chain never has two `Held` states naming different nodes without a `LeaseReleased` or a higher-epoch claim between them; the epoch never decreases. The only divergence between two nodes' views is the one a forced claim creates, and it resolves by the fork rule.
+- The lease state machine is small enough to property test exhaustively. Arbitrary interleavings of claim request, grant, lost reply, retry, renew, release, expire, crash, message loss and forced claim must keep three invariants: for any epoch the job's chain holds at most one `LeaseClaimed`; the chain never has two `Held` states naming different nodes without a `LeaseReleased` or a higher-epoch claim between them; the epoch never decreases. The only divergence between two nodes' views is the one a forced claim creates, and it resolves by the fork rule. The same test drives the fork rule with the named interleavings: a forced claim against a holder that later self-reclaims at the same epoch, two forced claims at the same epoch, and a forced claim against a holder that cycles to a higher epoch; in every run both nodes compute the same winner, exactly one harness survives, and every snapshot on the losing suffix is pinned.
 - Every network message type has an `epoch` field. There is no "control" channel without one.
 - The orphan path is a real feature with a real command, not an error message.
 - Users will sometimes be told "no" (stale epoch, lease held). The message must say which node holds the lease and when it expires.

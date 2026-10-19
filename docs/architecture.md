@@ -44,8 +44,8 @@ SnapshotId   = blake3 hash of the manifest bytes
 ChunkId      = blake3 hash of the chunk bytes
 
 Event        = { id: ULID, prev: blake3 of previous event, epoch, kind }
-EventKind    = Created | LeaseClaimed | LeaseReleased | SnapshotPublished
-             | Suspended | Resumed | DecisionRecorded | Note
+EventKind    = Created | LeaseClaimed { node, expires_at, origin: Granted | Forced } | LeaseReleased
+             | SnapshotPublished | Suspended | Resumed | DecisionRecorded | Note
 
 JobManifest  = { version, job_id, goal, harness_kind, env_spec: EnvSpecId,
                  latest_snapshot: Option<SnapshotId>, lease: LeaseState }

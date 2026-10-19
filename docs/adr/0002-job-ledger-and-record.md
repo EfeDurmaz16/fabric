@@ -36,7 +36,7 @@ Event {
 
 EventKind =
   | Created { goal: String, harness: HarnessKind, created_by: NodeId }
-  | LeaseClaimed { node: NodeId, expires_at: u64 }
+  | LeaseClaimed { node: NodeId, expires_at: u64, origin: Granted | Forced }
   | LeaseReleased
   | SnapshotPublished { snapshot: SnapshotId, parent: Option<SnapshotId> }
   | Suspended { snapshot: SnapshotId }
