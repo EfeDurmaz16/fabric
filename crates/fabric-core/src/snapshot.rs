@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::codec::{self, CodecError, VersionedError};
+use crate::git::{BranchName, GitConfigKey, GitConfigValue, GitOid, RefName};
 use crate::harness::HarnessState;
 use crate::id::{ChunkId, EnvSpecId, JobId, NodeId, SnapshotId};
 use crate::path::{AbsPath, RelPath};
@@ -184,6 +185,10 @@ pub enum CarryKey {
 }
 
 /// Git state carried by commits and refs, never by `.git` files.
+///
+/// Every name in it is a parsed type from `crate::git`, so a manifest from a
+/// peer cannot hold a config key outside the allowlist, a ref name git would
+/// refuse, or a value that reads as an option on a command line.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitState {
     /// The objects of the git bundle, full or incremental.
@@ -191,17 +196,17 @@ pub struct GitState {
     /// The snapshot whose refs this bundle excludes; `None` means full.
     pub bundle_base: Option<SnapshotId>,
     /// Every ref name and object id at capture time.
-    pub refs: Vec<(String, String)>,
+    pub refs: Vec<(RefName, GitOid)>,
     /// What `HEAD` pointed at.
     pub head: GitHead,
     /// Commit `I`: its tree is the index at capture time.
-    pub index_commit: String,
+    pub index_commit: GitOid,
     /// Commit `W`: its tree is the working tree at capture time.
-    pub worktree_commit: String,
+    pub worktree_commit: GitOid,
     /// Modification time in nanoseconds for every path in `W`.
     pub worktree_mtimes: Vec<(RelPath, u64)>,
     /// The allowlisted projection of the repository config, never the file.
-    pub config: Vec<(String, String)>,
+    pub config: Vec<(GitConfigKey, GitConfigValue)>,
     /// The objects of `.git/info/exclude`, if present.
     pub exclude: Option<Vec<ChunkId>>,
 }
@@ -210,9 +215,9 @@ pub struct GitState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GitHead {
     /// A branch name, possibly unborn.
-    Branch(String),
+    Branch(BranchName),
     /// A detached commit id.
-    Detached(String),
+    Detached(GitOid),
 }
 
 impl From<VersionedError> for ManifestError {

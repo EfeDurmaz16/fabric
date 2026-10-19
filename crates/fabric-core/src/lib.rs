@@ -74,6 +74,7 @@
 
 pub mod codec;
 pub mod env;
+pub mod git;
 pub mod harness;
 pub mod id;
 pub mod lease;

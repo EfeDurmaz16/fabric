@@ -2,10 +2,13 @@
 //! pinned hash, so a change to the wire format is a failing test, not a
 //! surprise on the other machine.
 
+use std::error::Error;
+
 use fabric_core::codec::CodecError;
+use fabric_core::git::{BranchName, GitConfigKey, GitConfigValue, GitOid, RefName};
 use fabric_core::harness::HarnessState;
 use fabric_core::id::{ChunkId, EnvSpecId, JobId, NodeId, SnapshotId};
-use fabric_core::path::{AbsPath, PathError, RelPath};
+use fabric_core::path::{AbsPath, RelPath};
 use fabric_core::snapshot::{
     CacheClass, CacheEntry, CarryKey, Entry, EntryKind, GitHead, GitState, MANIFEST_VERSION,
     ManifestError, Platform, SnapshotManifest,
@@ -121,19 +124,49 @@ fn cache_entry() -> impl Strategy<Value = CacheEntry> {
         })
 }
 
+fn oid() -> impl Strategy<Value = GitOid> {
+    "[0-9a-f]{40}".prop_filter_map("valid oid", |s| GitOid::parse(&s).ok())
+}
+
+fn ref_name() -> impl Strategy<Value = RefName> {
+    "refs/[a-z]{1,4}(/[a-z0-9]{1,4}){0,2}".prop_filter_map("valid ref", |s| RefName::parse(&s).ok())
+}
+
+fn config_entry() -> impl Strategy<Value = (GitConfigKey, GitConfigValue)> {
+    (
+        prop_oneof![
+            "remote\\.[a-z]{1,5}\\.(url|pushurl|fetch)",
+            "branch\\.[a-z]{1,5}\\.(remote|merge|rebase)",
+            Just("push.default".to_owned()),
+            Just("core.ignorecase".to_owned()),
+            Just("core.autocrlf".to_owned()),
+            Just("core.symlinks".to_owned()),
+        ],
+        "[a-z:/.+*]{0,10}",
+    )
+        .prop_filter_map("valid config entry", |(k, v)| {
+            Some((
+                GitConfigKey::parse(&k).ok()?,
+                GitConfigValue::parse(&v).ok()?,
+            ))
+        })
+}
+
 fn git_state() -> impl Strategy<Value = GitState> {
     (
         proptest::collection::vec(chunk(), 1..3),
         proptest::option::of(any::<[u8; 32]>().prop_map(SnapshotId::from_bytes)),
-        proptest::collection::vec(("refs/[a-z/]{1,10}", "[0-9a-f]{40}"), 0..3),
+        proptest::collection::vec((ref_name(), oid()), 0..3),
         prop_oneof![
-            "[a-z-]{1,8}".prop_map(GitHead::Branch),
-            "[0-9a-f]{40}".prop_map(GitHead::Detached)
+            "[a-z-]{1,8}"
+                .prop_filter_map("valid branch", |s| BranchName::parse(&s).ok())
+                .prop_map(GitHead::Branch),
+            oid().prop_map(GitHead::Detached)
         ],
-        "[0-9a-f]{40}",
-        "[0-9a-f]{40}",
+        oid(),
+        oid(),
         proptest::collection::vec((rel_path(), any::<u64>()), 0..3),
-        proptest::collection::vec(("[a-z.]{1,10}", "[a-z:/.]{0,10}"), 0..3),
+        proptest::collection::vec(config_entry(), 0..3),
         proptest::option::of(proptest::collection::vec(chunk(), 1..2)),
     )
         .prop_map(
@@ -220,7 +253,7 @@ proptest! {
     }
 }
 
-fn fixed_manifest() -> Result<SnapshotManifest, PathError> {
+fn fixed_manifest() -> Result<SnapshotManifest, Box<dyn Error>> {
     Ok(SnapshotManifest {
         job_id: JobId::from_bytes([1; 16]),
         root: AbsPath::parse("/Users/efebarandurmaz/fabric/jobs/x/work")?,
@@ -234,12 +267,18 @@ fn fixed_manifest() -> Result<SnapshotManifest, PathError> {
         git: Some(GitState {
             bundle: vec![ChunkId::of(b"bundle")],
             bundle_base: None,
-            refs: vec![("refs/heads/main".into(), "a".repeat(40))],
-            head: GitHead::Branch("main".into()),
-            index_commit: "b".repeat(40),
-            worktree_commit: "c".repeat(40),
+            refs: vec![(
+                RefName::parse("refs/heads/main")?,
+                GitOid::parse(&"a".repeat(40))?,
+            )],
+            head: GitHead::Branch(BranchName::parse("main")?),
+            index_commit: GitOid::parse(&"b".repeat(40))?,
+            worktree_commit: GitOid::parse(&"c".repeat(40))?,
             worktree_mtimes: vec![(RelPath::parse("src/lib.rs")?, 7)],
-            config: vec![("push.default".into(), "simple".into())],
+            config: vec![(
+                GitConfigKey::parse("push.default")?,
+                GitConfigValue::parse("simple")?,
+            )],
             exclude: None,
         }),
         files: vec![Entry {
@@ -303,20 +342,42 @@ fn duplicate_paths_and_chunks_on_dirs_are_refused() {
     ));
 }
 
-#[test]
-fn a_bad_path_on_the_wire_does_not_decode() {
-    let bytes = fixed_manifest().unwrap().encode().unwrap();
-    let good = postcard::to_stdvec("node_modules/left-pad/index.js").unwrap();
-    let bad = postcard::to_stdvec("node_modules/../index.js").unwrap();
+/// Returns the fixed manifest's bytes with the one string `good` replaced by `bad`.
+fn patched(good: &str, bad: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    let bytes = fixed_manifest()?.encode()?;
+    let good = postcard::to_stdvec(good)?;
+    let bad = postcard::to_stdvec(bad)?;
     let pos = bytes
         .windows(good.len())
         .position(|w| w == good)
-        .expect("path is in the bytes");
-    let mut patched = bytes[..pos].to_vec();
-    patched.extend_from_slice(&bad);
-    patched.extend_from_slice(&bytes[pos + good.len()..]);
+        .ok_or("string is not in the bytes")?;
+    let mut out = bytes[..pos].to_vec();
+    out.extend_from_slice(&bad);
+    out.extend_from_slice(&bytes[pos + good.len()..]);
+    Ok(out)
+}
+
+#[test]
+fn a_bad_path_on_the_wire_does_not_decode() {
+    let bytes = patched("node_modules/left-pad/index.js", "node_modules/../index.js").unwrap();
     assert!(matches!(
-        SnapshotManifest::decode(&patched),
+        SnapshotManifest::decode(&bytes),
+        Err(ManifestError::Codec(_))
+    ));
+}
+
+/// The config projection is an allowlist on both ends: a peer manifest that
+/// names `credential.helper` never exists as a value on the receiving node.
+#[test]
+fn a_denied_config_key_on_the_wire_does_not_decode() {
+    let bytes = patched("push.default", "credential.helper").unwrap();
+    assert!(matches!(
+        SnapshotManifest::decode(&bytes),
+        Err(ManifestError::Codec(_))
+    ));
+    let bytes = patched("refs/heads/main", "refs/heads/a..b").unwrap();
+    assert!(matches!(
+        SnapshotManifest::decode(&bytes),
         Err(ManifestError::Codec(_))
     ));
 }
