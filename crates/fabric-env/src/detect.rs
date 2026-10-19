@@ -170,6 +170,16 @@ pub enum DetectError {
         /// The lockfiles that do exist.
         found: Vec<&'static str>,
     },
+    /// A declared cache path lies inside, or contains, a cache detection found.
+    #[error(
+        "declared cache `{declared}` nests with detected cache `{detected}`; a cache may not contain another"
+    )]
+    NestedCache {
+        /// The declared path.
+        declared: RelPath,
+        /// The detected path it nests with.
+        detected: RelPath,
+    },
     /// `.fabric/env.toml` was refused; the source says where and why.
     #[error("{OVERRIDE_FILE} was refused")]
     Override(#[from] OverrideError),
@@ -464,17 +474,27 @@ pub fn detect(root: &Path) -> Result<Detection, DetectError> {
     }
 
     for declared in &overrides.caches {
-        match caches.iter_mut().find(|c| c.path == declared.path) {
+        if let Some(found) = caches.iter_mut().find(|c| c.path == declared.path) {
             // The ecosystem stays: it decides the carry key, and a declared
             // class must not let a `node_modules` travel to a node with
             // another Node major.
-            Some(found) => found.class = declared.class,
-            None => caches.push(CachePath {
-                path: declared.path.clone(),
-                class: declared.class,
-                ecosystem: Ecosystem::Declared,
-            }),
+            found.class = declared.class;
+            continue;
         }
+        if let Some(found) = caches.iter().find(|c| {
+            c.ecosystem != Ecosystem::Declared
+                && (declared.path.starts_with(&c.path) || c.path.starts_with(&declared.path))
+        }) {
+            return Err(DetectError::NestedCache {
+                declared: declared.path.clone(),
+                detected: found.path.clone(),
+            });
+        }
+        caches.push(CachePath {
+            path: declared.path.clone(),
+            class: declared.class,
+            ecosystem: Ecosystem::Declared,
+        });
     }
     caches.sort_by(|a, b| a.path.cmp(&b.path));
 

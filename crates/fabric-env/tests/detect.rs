@@ -458,6 +458,28 @@ fn a_declared_class_keeps_the_detected_ecosystem() {
     );
 }
 
+/// `node_modules/.cache` is inside a cache detection owns; declaring it
+/// would give one tree two carry rules.
+#[test]
+fn a_declared_cache_inside_a_detected_one_is_refused() {
+    let dir = workspace(&[
+        ("package.json", PACKAGE_JSON),
+        ("package-lock.json", ""),
+        (
+            ".fabric/env.toml",
+            "[[cache]]\npath = \"node_modules/.cache\"\nclass = \"build\"\n",
+        ),
+    ])
+    .unwrap();
+    match detect(dir.path()) {
+        Err(DetectError::NestedCache { declared, detected }) => {
+            assert_eq!(declared.as_str(), "node_modules/.cache");
+            assert_eq!(detected.as_str(), "node_modules");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 #[test]
 fn a_broken_override_file_stops_detection() {
     let dir = workspace(&[(".fabric/env.toml", "env = [\"A=b\"]\n")]).unwrap();

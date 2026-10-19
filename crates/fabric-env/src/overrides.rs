@@ -37,6 +37,10 @@ use toml::{Table, Value};
 use crate::detect::{PackageManagerName, PinError, check_pin};
 use crate::secret::{self, Pattern, PatternError};
 
+/// The directory that holds Fabric's own files in a workspace; never a cache.
+const FABRIC_DIR: &str = ".fabric";
+const FABRIC_DIR_PREFIX: &str = ".fabric/";
+
 /// Why the override file was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum OverrideError {
@@ -127,6 +131,20 @@ pub enum OverrideError {
     DuplicateCache {
         /// The repeated path.
         path: RelPath,
+    },
+    /// A `cache` entry under `.fabric`, which holds Fabric's own files and is never a cache.
+    #[error("`{key}` is under `.fabric`, which is never a cache")]
+    ReservedCache {
+        /// The dotted path of the key.
+        key: String,
+    },
+    /// A `cache` entry that lies inside, or contains, another declared cache.
+    #[error("cache path `{path}` nests with `{other}`; a cache may not contain another")]
+    NestedCache {
+        /// The path declared later.
+        path: RelPath,
+        /// The path it nests with.
+        other: RelPath,
     },
     /// A `[tools]` entry whose key has no characters.
     #[error("`tools` has an entry with an empty name")]
@@ -317,6 +335,21 @@ fn caches(value: &Value) -> Result<Vec<DeclaredCache>, OverrideError> {
         };
         if caches.iter().any(|c| c.path == path) {
             return Err(OverrideError::DuplicateCache { path });
+        }
+        // A cache gets narrowed secret patterns and is dropped on a carry
+        // mismatch, so a path that holds Fabric's own files or the user's
+        // work must not become one by accident.
+        if path.as_str() == FABRIC_DIR || path.as_str().starts_with(FABRIC_DIR_PREFIX) {
+            return Err(OverrideError::ReservedCache { key: path_key });
+        }
+        if let Some(other) = caches
+            .iter()
+            .find(|c| path.starts_with(&c.path) || c.path.starts_with(&path))
+        {
+            return Err(OverrideError::NestedCache {
+                path,
+                other: other.path.clone(),
+            });
         }
         caches.push(DeclaredCache { path, class });
     }
@@ -543,6 +576,33 @@ when = "always"
             EnvOverride::parse(text),
             Err(OverrideError::DuplicateCache { .. })
         ));
+    }
+
+    /// A cache is dropped on a carry mismatch and gets narrowed secret
+    /// patterns, so Fabric's own directory and a path that nests with
+    /// another cache are refused; a sibling is fine.
+    #[test]
+    fn a_cache_under_fabric_or_nested_in_another_cache_is_refused() {
+        for path in [".fabric", ".fabric/jobs"] {
+            let text = format!("[[cache]]\npath = \"{path}\"\nclass = \"build\"");
+            match EnvOverride::parse(&text) {
+                Err(OverrideError::ReservedCache { key }) => assert_eq!(key, "cache[0].path"),
+                other => panic!("{path}: {other:?}"),
+            }
+        }
+        for (first, second) in [("out", "out/cache"), ("out/cache", "out")] {
+            let text = format!(
+                "[[cache]]\npath = \"{first}\"\nclass = \"build\"\n[[cache]]\npath = \"{second}\"\nclass = \"build\""
+            );
+            match EnvOverride::parse(&text) {
+                Err(OverrideError::NestedCache { path, other }) => {
+                    assert_eq!((path.as_str(), other.as_str()), (second, first));
+                }
+                other => panic!("{first} {second}: {other:?}"),
+            }
+        }
+        let siblings = "[[cache]]\npath = \"out\"\nclass = \"build\"\n[[cache]]\npath = \"outer\"\nclass = \"build\"";
+        assert_eq!(EnvOverride::parse(siblings).unwrap().caches.len(), 2);
     }
 
     #[test]
