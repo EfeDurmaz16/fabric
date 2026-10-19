@@ -755,6 +755,11 @@ impl Ledger {
         self.manifest.head
     }
 
+    /// Returns the snapshot the owner suspended in, if no `Resumed` followed.
+    pub(crate) fn suspended_at(&self) -> Option<SnapshotId> {
+        self.suspended_at
+    }
+
     /// Returns every record in order.
     #[must_use]
     pub fn records(&self) -> &[Record] {

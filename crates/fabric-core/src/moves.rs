@@ -101,27 +101,44 @@ pub struct StealProposal {
 
 /// What a steal costs, for the user to read before it happens.
 ///
-/// `Display` names the owner and the snapshot; the CLI prints
-/// `last_record_at` as a date next to it, because the core has no clock
-/// and no time zone.
+/// `Display` names the owner, the snapshot and whether work can be lost;
+/// the CLI prints `last_record_at` as a date next to it, because the core
+/// has no clock and no time zone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StealWarning {
     /// The owner of record being stolen from.
     pub owner: NodeId,
-    /// The `at` of the last record this node holds, in Unix milliseconds.
+    /// The `at` of the last record the owner wrote that this node holds, in Unix milliseconds.
     pub last_record_at: u64,
     /// The snapshot the thief will resume from.
     pub snapshot: SnapshotId,
+    /// True when the chain says the owner stopped its harness in `snapshot`
+    /// and has not resumed since, so the steal loses no work the owner
+    /// pushed (ADR 0003, The steal). False for every other steal, which can.
+    pub owner_stopped_at_snapshot: bool,
 }
 
 impl fmt::Display for StealWarning {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "stealing the job from {owner}; resuming from snapshot {snapshot}; any work {owner} did after that snapshot becomes an orphan on its disk",
+            "stealing the job from {owner}; resuming from snapshot {snapshot}; ",
             owner = self.owner,
             snapshot = self.snapshot
-        )
+        )?;
+        if self.owner_stopped_at_snapshot {
+            write!(
+                f,
+                "{owner} stopped in that snapshot and has not resumed since, so no work is lost unless it resumed without reaching this node",
+                owner = self.owner
+            )
+        } else {
+            write!(
+                f,
+                "any work {owner} did after that snapshot becomes an orphan on its disk",
+                owner = self.owner
+            )
+        }
     }
 }
 
@@ -341,12 +358,22 @@ impl Ledger {
             id,
             at,
         )?;
+        // Every record after the owner took the job is the owner's except a
+        // target's MoveAborted, which hands the job back without being its
+        // word.
+        let last_record_at = self
+            .records()
+            .iter()
+            .rev()
+            .find(|r| !matches!(r.event().kind, EventKind::MoveAborted { .. }))
+            .map_or(self.manifest().updated_at, |r| r.event().at);
         Ok(StealProposal {
             record,
             warning: StealWarning {
                 owner,
-                last_record_at: self.manifest().updated_at,
+                last_record_at,
                 snapshot,
+                owner_stopped_at_snapshot: self.suspended_at() == Some(snapshot),
             },
         })
     }
@@ -472,6 +499,55 @@ mod tests {
         assert_eq!(proposal.warning.snapshot, snap(2));
         assert_eq!(proposal.warning.owner, node(1));
         assert_eq!(proposal.warning.last_record_at, 4);
+        assert!(proposal.warning.owner_stopped_at_snapshot);
+    }
+
+    /// ADR 0003: a steal from a suspended head cannot lose pushed work; a
+    /// steal after the owner resumed can. The time named is the owner's last
+    /// record, not a target's abort.
+    #[test]
+    fn steal_warning_says_whether_work_can_be_lost_and_when_the_owner_last_wrote() {
+        let latest = Some(CompleteSnapshot::new(snap(2)));
+        let mut resumed = suspended_twice(node(1));
+        append(
+            &mut resumed,
+            node(1),
+            EventKind::Resumed {
+                node: node(1),
+                snapshot: Some(snap(2)),
+                harness: HarnessKind::ClaudeCode,
+            },
+            5,
+        );
+        let proposal = resumed
+            .steal(node(2), String::new(), latest, eid(9), 9)
+            .unwrap();
+        assert!(!proposal.warning.owner_stopped_at_snapshot);
+        assert_eq!(proposal.warning.last_record_at, 5);
+
+        let mut aborted = suspended_twice(node(1));
+        append(
+            &mut aborted,
+            node(1),
+            EventKind::MoveStarted {
+                move_id: MoveId::from_bytes([7; 16]),
+                target: node(2),
+            },
+            5,
+        );
+        append(
+            &mut aborted,
+            node(2),
+            EventKind::MoveAborted {
+                move_id: MoveId::from_bytes([7; 16]),
+            },
+            6,
+        );
+        let proposal = aborted
+            .steal(node(3), String::new(), latest, eid(9), 9)
+            .unwrap();
+        assert_eq!(proposal.warning.last_record_at, 5);
+        assert!(proposal.warning.owner_stopped_at_snapshot);
     }
 
     #[test]
@@ -705,15 +781,20 @@ mod tests {
 
     #[test]
     fn steal_warning_names_the_owner_and_the_snapshot_in_words() {
-        let warning = StealWarning {
+        let mut warning = StealWarning {
             owner: node(1),
             last_record_at: 1_760_000_000_000,
             snapshot: snap(2),
+            owner_stopped_at_snapshot: false,
         };
         let text = warning.to_string();
         assert!(text.contains(&node(1).to_string()));
         assert!(text.contains(&snap(2).to_string()));
         assert!(text.contains("orphan"));
         assert!(!text.contains("1760000000000"));
+        warning.owner_stopped_at_snapshot = true;
+        let text = warning.to_string();
+        assert!(text.contains("no work is lost"));
+        assert!(!text.contains("orphan"));
     }
 }
