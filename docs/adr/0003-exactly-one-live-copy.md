@@ -58,7 +58,26 @@ Replication never changes who may append. A replica is a copy; the acceptance ru
 
 Every message between nodes about a job carries the sender's epoch. Every write (ledger append, blob push, manifest update) carries it too. A node that knows a higher epoch for that job refuses the message with `StaleEpoch { yours, current }`. There is no override flag.
 
-Fencing covers the writes Fabric performs: ledger appends, blob pushes, manifest updates, renewals. The harness writes to its workspace directly, and Fabric performs no write on its behalf. The only control over the harness is the kill: a harness launched at epoch N is killed by the node when the node learns of epoch N+1, and until the node learns it (which, for a sleeping node, is when it wakes) the harness keeps editing. Everything it wrote after the last published snapshot is preserved by the orphan path below, never by fencing.
+Fencing covers the writes Fabric performs: ledger appends, blob pushes, manifest updates, renewals. The harness writes to its workspace directly, and Fabric performs no write on its behalf. The only control over the harness is the kill: a harness launched at epoch N is killed by its supervisor (below) when the supervisor learns of epoch N+1, and until it learns it (which, for a sleeping node, is when it wakes) the harness keeps editing. Everything it wrote after the last published snapshot is preserved by the orphan path below, never by fencing.
+
+### Who supervises the harness
+
+The kill needs a process that is alive to perform it, and the lease needs a process that renews it. That process is the supervisor, and it is always the holder of the data directory lock (ADR 0004): `fabric node serve` when it runs, otherwise the `fabric resume` command itself, which then holds the lock until the harness exits instead of for the duration of a short command. There is no third case. `resume` refuses with `NoSupervisor` when it can neither reach a running node over the socket nor take the lock, and it never launches a harness and exits.
+
+The harness process is spawned by the CLI, never by the daemon, because an interactive harness such as Claude Code needs the user's terminal and the user's shell environment, and a daemon has neither. The CLI spawns it in a new process group, makes that group the terminal's foreground group, and waits for it. Before the harness starts, the CLI registers it with the supervisor, which writes `<fabric-data>/jobs/<job-id>/harness` by temp, `fsync`, rename:
+
+```text
+HarnessRecord { epoch: Epoch, supervisor_pid: u32, running: RunningHarness }
+
+RunningHarness =
+  | Spawned  { pid: u32, pgid: u32, started_at: u64 }   started by a Fabric process on this node
+  | External { pid: u32, pgid: u32, started_at: u64 }   started by the user, adopted by `fabric job init` (ADR 0001)
+  | Daemon   { session_id: String }                     owned by the harness's own supervisor; has no pid Fabric may kill
+```
+
+`started_at` is the kernel's start time of the process, so a pid reused after the harness exited is never killed. The supervisor's duties are three. It renews the lease every 20 seconds while the recorded process is alive, and stops renewing when it exits: a lease with no harness behind it is allowed to expire, and `fabric suspend` is what releases it. It kills on fencing: on learning a higher epoch for the job, from a peer message or from its own ledger, it sends `killpg(SIGKILL)` to the recorded group; for `Daemon` it calls the adapter's `stop` (ADR 0006) until `detect` reports nothing running, because a session under the harness's own supervisor is restarted after a plain kill (research, step1 adversarial review, C6). For that reason the Claude Code adapter launches a foreground `claude` in v0, never `claude --bg`. And it rewrites the record when the harness exits.
+
+The record is also how a supervisor that died comes back. Every command that opens the store reads `harness` first. If `supervisor_pid` is dead and the recorded process is alive, the command re-adopts it as the new supervisor when the lease is still `Held` by this node at the recorded epoch, and kills it otherwise. Between the supervisor dying and the next Fabric command on that node, an unsupervised harness is in the same position as a harness on a sleeping node: nobody renews, a peer may force a claim after expiry, and whatever it writes is preserved by the orphan path. Running `fabric node serve` shrinks that window to the daemon's restart time, and the record is what lets the restarted daemon find the process. `fabric status` prints the record and whether its supervisor is alive.
 
 ### Expiry and clock skew
 
