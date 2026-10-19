@@ -30,6 +30,7 @@ pub mod quic;
 pub mod tcp;
 pub mod tls;
 pub mod transport;
+pub mod wire;
 
 /// A boxed `Send` future, the return shape of every trait this crate dispatches dynamically.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
