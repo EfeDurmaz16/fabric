@@ -22,6 +22,7 @@ compile_error!(
 
 pub mod frame;
 pub mod identity;
+pub mod peers;
 #[cfg(feature = "tcp_tls")]
 mod pipe;
 #[cfg(feature = "quic")]
