@@ -13,8 +13,8 @@
 //! env = ["DATABASE_URL"]           # names only, resolved on each node
 //! secret_patterns = ["*.sqlite"]   # added to the built-in secret list
 //!
-//! [tools]                          # a declared pin replaces a detected one
-//! node = "22"
+//! [tools]                          # a declared pin replaces a detected one;
+//! node = "22"                      # nodejs reads as node and golang as go, as in .tool-versions
 //!
 //! [[cache]]                        # added to the detected cache paths; when one
 //! path = ".output"                 # is missing on resume the setup steps run, so
@@ -128,6 +128,9 @@ pub enum OverrideError {
         /// The repeated path.
         path: RelPath,
     },
+    /// A `[tools]` entry whose key has no characters.
+    #[error("`tools` has an entry with an empty name")]
+    EmptyToolName,
     /// A tool pin that is not a short printable version, or that is shaped like a credential.
     #[error("`{key}` is not a version pin")]
     Pin {
@@ -271,6 +274,9 @@ fn tools(value: &Value) -> Result<Vec<(String, String)>, OverrideError> {
     table(value, "tools")?
         .iter()
         .map(|(tool, version)| {
+            if tool.is_empty() {
+                return Err(OverrideError::EmptyToolName);
+            }
             let key = format!("tools.{tool}");
             let version = string(version, &key)?;
             check_pin(version).map_err(|reason| OverrideError::Pin { key, reason })?;

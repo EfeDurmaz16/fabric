@@ -379,7 +379,9 @@ fn the_override_file_wins_over_detection() {
         [tool("node", "22.23.2", ToolSource::Declared)]
     );
     assert_eq!(found.pins()[0].file, ".fabric/env.toml");
+    assert_eq!(found.pins()[0].source, ToolSource::Declared);
     assert_eq!(found.pins()[1].version, "20");
+    assert_eq!(found.pins()[1].source, ToolSource::Detected);
     let names: Vec<&str> = found
         .spec()
         .env_var_names
@@ -405,6 +407,27 @@ fn the_override_file_wins_over_detection() {
         Some("*.sqlite")
     );
     assert!(found.spec().id().is_ok());
+}
+
+/// A declared pin under an alias still replaces the detected one, so the
+/// spec never holds both `node` and `nodejs`; an empty tool name is refused.
+#[test]
+fn a_declared_pin_under_an_alias_replaces_the_detected_one() {
+    let dir = workspace(&[
+        (".nvmrc", "20\n"),
+        (".fabric/env.toml", "[tools]\nnodejs = \"22\"\n"),
+    ])
+    .unwrap();
+    let found = detect(dir.path()).unwrap();
+    assert_eq!(
+        found.spec().tools,
+        [tool("node", "22", ToolSource::Declared)]
+    );
+    let dir = workspace(&[(".fabric/env.toml", "[tools]\n\"\" = \"22\"\n")]).unwrap();
+    assert!(matches!(
+        detect(dir.path()),
+        Err(DetectError::Override(OverrideError::EmptyToolName))
+    ));
 }
 
 /// The ecosystem decides the carry key; a declared class must not turn a

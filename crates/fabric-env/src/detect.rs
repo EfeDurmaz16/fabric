@@ -352,12 +352,14 @@ pub struct CachePath {
 /// A version pin found in one file, kept as written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pin {
-    /// The tool, with `nodejs` read as `node` and `golang` as `go`.
+    /// The tool, with `nodejs` read as `node` and `golang` as `go`, from every file including the override one.
     pub tool: String,
     /// The version text as the file wrote it.
     pub version: String,
     /// The file it came from, relative to the root.
     pub file: &'static str,
+    /// Whether the user declared it in the override file or detection found it.
+    pub source: ToolSource,
 }
 
 /// Everything detection found in a workspace.
@@ -488,9 +490,10 @@ fn collect_pins(
         .tools
         .iter()
         .map(|(tool, version)| Pin {
-            tool: tool.clone(),
+            tool: canonical_tool(tool),
             version: version.clone(),
             file: OVERRIDE_FILE,
+            source: ToolSource::Declared,
         })
         .collect();
     pins.extend(mise_pins(root)?);
@@ -526,6 +529,7 @@ fn pin(tool: &str, version: &str, file: &'static str) -> Result<Pin, DetectError
         tool: tool.to_owned(),
         version: version.to_owned(),
         file,
+        source: ToolSource::Detected,
     })
 }
 
@@ -586,7 +590,7 @@ fn find_devcontainer(root: &Path) -> Result<Option<RelPath>, DetectError> {
     Ok(None)
 }
 
-/// Takes the first pin per tool and marks the ones from the override file as declared.
+/// Takes the first pin per tool, which is the declared one when the override file has it.
 fn chosen_tools(pins: &[Pin]) -> Vec<Tool> {
     let mut chosen: BTreeMap<&str, &Pin> = BTreeMap::new();
     for pin in pins {
@@ -597,11 +601,7 @@ fn chosen_tools(pins: &[Pin]) -> Vec<Tool> {
         .map(|pin| Tool {
             name: pin.tool.clone(),
             version: pin.version.clone(),
-            source: if pin.file == OVERRIDE_FILE {
-                ToolSource::Declared
-            } else {
-                ToolSource::Detected
-            },
+            source: pin.source,
         })
         .collect()
 }
