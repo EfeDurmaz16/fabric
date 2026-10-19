@@ -1,6 +1,7 @@
-//! Capture hands the secret exclude file to `git add -A`. This proves git
+//! Capture hands the secret pathspecs to `git add -A`. This proves git
 //! keeps out exactly the paths `SecretPolicy::denies` denies, with
-//! `core.ignorecase` on and off, so the two matchers cannot drift apart.
+//! `core.ignorecase` on and off and with a `.gitignore` in the repository
+//! that negates built-in patterns, so the two matchers cannot drift apart.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -18,6 +19,7 @@ use fabric_env::secret::{Pattern, Scope, SecretPolicy};
 const PATHS: &[&str] = &[
     ".env",
     ".env.local",
+    ".env.example",
     ".envrc",
     "id_ed25519",
     "credentials.json",
@@ -72,10 +74,14 @@ fn git(dir: &Path, args: &[&str]) -> io::Result<String> {
     String::from_utf8(output.stdout).map_err(io::Error::other)
 }
 
-/// Creates the tree, runs `git add -A` with the exclude file, and returns what git staged.
+/// A `.gitignore` of the kind repositories carry: it ignores every `.env*`
+/// and then puts two of them back. The negations win over an exclude
+/// file; they must not win over the pathspecs.
+const GITIGNORE: &str = ".env*\n!.env.local\n!.env.example\n!server.pem\n";
+
+/// Creates the tree, runs `git add -A` with the pathspecs, and returns what git staged.
 fn staged_with(policy: &SecretPolicy, ignorecase: &str) -> io::Result<BTreeSet<String>> {
     let repo = tempfile::tempdir()?;
-    let scratch = tempfile::tempdir()?;
     for path in PATHS {
         let full = repo.path().join(path);
         if let Some(parent) = full.parent() {
@@ -83,15 +89,13 @@ fn staged_with(policy: &SecretPolicy, ignorecase: &str) -> io::Result<BTreeSet<S
         }
         fs::write(full, "x")?;
     }
-    let exclude = scratch.path().join("exclude");
-    fs::write(&exclude, policy.exclude_file())?;
-    let exclude_arg = format!("core.excludesFile={}", exclude.display());
+    fs::write(repo.path().join(".gitignore"), GITIGNORE)?;
     let ignorecase_arg = format!("core.ignorecase={ignorecase}");
+    let mut args = vec!["-c", &ignorecase_arg, "add", "-A", "--"];
+    let pathspecs = policy.git_pathspecs();
+    args.extend(pathspecs.iter().map(String::as_str));
     git(repo.path(), &["init", "-q"])?;
-    git(
-        repo.path(),
-        &["-c", &exclude_arg, "-c", &ignorecase_arg, "add", "-A"],
-    )?;
+    git(repo.path(), &args)?;
     Ok(git(repo.path(), &["ls-files"])?
         .lines()
         .map(str::to_owned)
@@ -115,5 +119,6 @@ fn git_keeps_out_exactly_what_the_policy_denies() {
             );
         }
         assert!(staged.contains("src/main.rs"));
+        assert!(staged.contains(".gitignore"));
     }
 }

@@ -166,38 +166,29 @@ impl SecretPolicy {
             .find(|pattern| path_matches(pattern, &names))
     }
 
-    /// Returns a gitignore file that excludes what `denies` denies in `Scope::Work`.
+    /// Returns the pathspecs capture passes to `git add -A` so git never stages what `denies` denies in `Scope::Work`.
     ///
-    /// Capture passes it as `core.excludesFile` to `git add -A`, so an
-    /// untracked secret never enters the working-tree commit. Letters are
-    /// written as `[eE]` classes so the file ignores case whatever
-    /// `core.ignorecase` says, and a pattern with a slash is prefixed with
-    /// `**/` so it matches at any depth, as `denies` does.
+    /// Each pattern becomes two `:(exclude,glob,icase)` pathspecs: the path
+    /// itself at any depth, and everything under it. A pathspec limits the
+    /// paths `git add` considers at all, so it wins over a `!pattern`
+    /// negation in the repository's own `.gitignore`. An exclude file given
+    /// as `core.excludesFile` would not: that source has the lowest
+    /// precedence of git's ignore files, and `!.env.local` in a `.gitignore`
+    /// would put the secret back.
     #[must_use]
-    pub fn exclude_file(&self) -> String {
-        let mut out = String::new();
-        let patterns = EVERYWHERE
+    pub fn git_pathspecs(&self) -> Vec<String> {
+        EVERYWHERE
             .iter()
             .chain(OUTSIDE_CACHES)
             .copied()
-            .chain(self.added.iter().map(Pattern::as_str));
-        for pattern in patterns {
-            if pattern.contains('/') {
-                out.push_str("**/");
-            }
-            for c in pattern.chars() {
-                if c.is_ascii_alphabetic() {
-                    out.push('[');
-                    out.push(c.to_ascii_lowercase());
-                    out.push(c.to_ascii_uppercase());
-                    out.push(']');
-                } else {
-                    out.push(c);
-                }
-            }
-            out.push('\n');
-        }
-        out
+            .chain(self.added.iter().map(Pattern::as_str))
+            .flat_map(|pattern| {
+                [
+                    format!(":(exclude,glob,icase)**/{pattern}"),
+                    format!(":(exclude,glob,icase)**/{pattern}/**"),
+                ]
+            })
+            .collect()
     }
 }
 
@@ -504,26 +495,6 @@ mod tests {
         assert!(glob_matches(b"id_*", b"id_"));
         assert!(!glob_matches(b"*.key", b"monkey"));
         assert!(!glob_matches(b"*.env", b".envrc"));
-    }
-
-    #[test]
-    fn the_exclude_file_ignores_case_and_matches_at_any_depth() {
-        let mut policy = SecretPolicy::default();
-        policy.widen(Pattern::parse("secrets/*.db").unwrap());
-        let file = policy.exclude_file();
-        let lines: Vec<&str> = file.lines().collect();
-        assert_eq!(lines[0], ".[eE][nN][vV]");
-        assert!(lines.contains(&"*.[pP][eE][mM]"));
-        assert!(
-            lines.contains(
-                &"**/.[dD][oO][cC][kK][eE][rR]/[cC][oO][nN][fF][iI][gG].[jJ][sS][oO][nN]"
-            )
-        );
-        assert_eq!(
-            lines.last(),
-            Some(&"**/[sS][eE][cC][rR][eE][tT][sS]/*.[dD][bB]")
-        );
-        assert_eq!(lines.len(), 23);
     }
 
     #[test]
