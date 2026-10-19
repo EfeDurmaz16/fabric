@@ -9,7 +9,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize};
-use unicode_normalization::{UnicodeNormalization, is_nfc};
+use unicode_normalization::is_nfc;
 
 /// Why a path was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -32,7 +32,7 @@ pub enum PathError {
     /// A `.` or `..` component.
     #[error("path has a `.` or `..` component")]
     DotComponent,
-    /// A `.git` component, which restore must never write into.
+    /// A `.git` component in any letter case, which restore must never write into.
     #[error("path has a `.git` component")]
     GitComponent,
     /// The path is not in Unicode normalization form C.
@@ -48,7 +48,9 @@ fn check_components(path: &str) -> Result<(), PathError> {
         match component {
             "" => return Err(PathError::EmptyComponent),
             "." | ".." => return Err(PathError::DotComponent),
-            ".git" => return Err(PathError::GitComponent),
+            // APFS and casefolded ext4 fold `.Git` onto `.git`; g, i and t
+            // have no case-fold sources outside ASCII, so this is the whole set.
+            c if c.eq_ignore_ascii_case(".git") => return Err(PathError::GitComponent),
             _ => {}
         }
     }
@@ -80,11 +82,6 @@ impl RelPath {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-
-    /// Returns the components between the slashes, in order.
-    pub fn components(&self) -> impl Iterator<Item = &str> {
-        self.0.split('/')
     }
 
     /// Returns true when `self` is `prefix` or lies below it.
@@ -189,12 +186,6 @@ impl<'de> Deserialize<'de> for AbsPath {
     }
 }
 
-/// Returns `text` in normalization form C, the form every path must use.
-#[must_use]
-pub fn nfc(text: &str) -> String {
-    text.nfc().collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +204,12 @@ mod tests {
             RelPath::parse("a/.git/config"),
             Err(PathError::GitComponent)
         );
+        assert_eq!(
+            RelPath::parse(".Git/hooks/pre-commit"),
+            Err(PathError::GitComponent)
+        );
+        assert_eq!(RelPath::parse(".GIT"), Err(PathError::GitComponent));
+        assert!(RelPath::parse(".gitignore").is_ok());
         assert_eq!(RelPath::parse("caf\u{65}\u{301}"), Err(PathError::NotNfc));
         assert!(RelPath::parse("caf\u{e9}").is_ok());
     }
