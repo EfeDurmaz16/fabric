@@ -34,7 +34,7 @@ crates/
   fabric-cli       the `fabric` binary: job init, suspend, resume, job move, job steal, status, doctor, orphan export, node pair, node serve
 ```
 
-Only `fabric-core` exists today, and it holds a placeholder. Dependency direction is strictly downward: `fabric-cli` depends on everything, `fabric-core` depends on nothing in the workspace. `fabric-core` defines the `Store`, `Transport` and `Harness` traits; the other crates implement them. Nothing in the core knows about QUIC, SQLite or any agent vendor.
+`fabric-core` and `fabric-harness` exist today. Dependency direction is strictly downward: `fabric-cli` depends on everything, `fabric-core` depends on nothing in the workspace. `fabric-core` defines the `Store` and `Transport` traits and the `BoxFuture` every dynamically dispatched trait returns; the other crates implement them. The `Harness` trait lives in `fabric-harness` for now, because its launch handle owns a child process and the core stays pure; it moves down when ADR 0003's `RunningHarness` lands (ADR 0006, "What the first implementation shipped"). Nothing in the core knows about QUIC, SQLite or any agent vendor.
 
 ## Data structures first
 
