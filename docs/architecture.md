@@ -56,7 +56,8 @@ SnapshotManifest = { version, job_id, parent: Option<SnapshotId>, created_at, cr
                      harness_state: [Entry], env_spec: Option<EnvSpecId> }
 GitState     = { bundle, bundle_base, refs, head, index_commit, worktree_commit,
                  worktree_mtimes, config, exclude }
-Marker       = { root, job_id, base: Option<SnapshotId>, state: Clean | Dirty | Restoring { targets } }
+Marker       = { root, job_id, base: Option<SnapshotId>,
+                 state: Clean | Dirty | Suspending { epoch, head } | Restoring { targets } }
                node-local, at <fabric-data>/jobs/<job-id>/marker, never inside the workspace
 Entry        = { rel_path: RelPath, kind: File | Dir | Symlink, mode, mtime_ns, chunks: [ChunkId], size }
 
@@ -97,7 +98,7 @@ Step by step, with the failure each step must survive:
 
 1. `fabric suspend <job>` on A. The harness adapter asks the agent to stop at a turn boundary and reports its state directory. If the agent cannot stop cleanly, suspend fails and nothing is written. The job stays live on A.
 2. A publishes a snapshot in the order ADR 0004 fixes: new chunks to `tmp/`, `fsync`, rename into `chunks/`; chunk rows; the manifest by the same temp and rename; the snapshot rows; directory `fsync`; and only then the `SnapshotPublished` ledger event, which is the single commit point. A crash anywhere before the event leaves unreferenced chunks, or an unreferenced manifest with catalog rows, all invisible until an event names them and all removable by `fabric store gc`. A crash after the event leaves a complete snapshot.
-3. After `SnapshotPublished`, A appends `Suspended`, then `LeaseReleased { epoch: 1 }`. Each append is a checksummed, fsynced record. A torn tail is truncated on open; any other damage fails closed (ADR 0002).
+3. After `SnapshotPublished`, A appends `Suspended`, then `LeaseReleased { epoch: 1 }`, then writes the marker `Clean`. Each append is a checksummed, fsynced record. A torn tail is truncated on open; any other damage fails closed (ADR 0002). A `kill -9` between any two of these steps is not a special case: the marker was written as `Suspending` with the ledger head before capture began, so the next command on the job sees how far suspend got and finishes it without a second capture (ADR 0004, Suspend).
 4. `fabric resume <job>` on B. B fetches A's ledger head. If the lease is `Held`, B refuses and says which node holds it and until when. If it is `Released`, B sends `ClaimRequest { expected_head }` to A, the arbiter. A checks that the head matches and the lease is released, appends `LeaseClaimed { node: B, epoch: 2 }`, `fsync`s, and replies `Granted` with the record. B appends that record to its replica. From then on A refuses any write, blob push or ledger append carrying epoch 1. If `Granted` is lost, B sends the same request again and gets the same record back. If A is unreachable there is no claim; `fabric resume --force-expired` is the user's explicit way past that (ADR 0003).
 5. B fetches the manifest and only the chunks it lacks. Transfer is resumable: B asks per chunk id; a dropped connection restarts at the next missing chunk.
 6. B restores into a path chosen by policy, never by the user. If that path already holds a workspace, its marker decides: the same snapshot means skip, a cleanly suspended older snapshot means update in place, anything else means refuse and point at `fabric orphan export`. A fresh restore writes into a temp directory and renames at the end, so a crash leaves no half workspace. The root is the same absolute path on both nodes (ADR 0008), so nothing inside harness state is rewritten; Claude Code's signed thinking blocks would not survive it (ADR 0006).

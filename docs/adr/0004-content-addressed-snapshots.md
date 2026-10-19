@@ -100,6 +100,27 @@ The ledger event is the single commit point. A snapshot is live on a node if a l
 
 `pins` holds snapshot ids that must survive gc although no ledger event names them. `fabric orphan export` (ADR 0003) writes one for the snapshot it produces, because the node that exports is fenced and cannot append to the chain. `fabric status` lists pinned snapshots as orphan snapshots. A later `fabric orphan restore <snapshot> --into <dir>` materializes one into a directory the user names; recovery is the one place a path is typed.
 
+### Suspend: a resumable sequence
+
+Suspend is several durable steps, and a `kill -9` can land between any two of them. The steps are ordered so that the marker and the ledger head together say exactly how far it got, and every command on the job finishes an interrupted suspend before doing its own work.
+
+1. Read the harness record (ADR 0003). If the harness is running, call `stop` with the deadline. If it does not stop, suspend fails here, writes nothing, and the job stays live.
+2. Write the marker as `Suspending { epoch, head }` with the current epoch and ledger head. From this point nothing relaunches a harness in this root: `resume` on a `Suspending` marker finishes the suspend first and then claims as usual.
+3. Capture and publish. The `SnapshotPublished { S }` append is the snapshot's commit point.
+4. Append `Suspended { S }`.
+5. Append `LeaseReleased`.
+6. Write the marker as `Clean` with `base: S`.
+7. Push the records and the snapshot to paired peers (ADR 0003, Replication) and print the result.
+
+Finishing an interrupted suspend reads the marker and the ledger. If the epoch in the ledger is higher than `Suspending.epoch`, this node was fenced in the meantime; the sequence stops, the root is an orphan workspace, and `fabric orphan export` is the way out. Otherwise the head decides, and the harness is known to be stopped because step 1 ran before the marker was written and nothing relaunches under `Suspending`:
+
+- head equals `Suspending.head`: the crash was before the publish. Continue at step 3.
+- head is `SnapshotPublished { S }` whose `prev` chain reaches `Suspending.head`: continue at step 4 with that `S`. No second capture, so no duplicate snapshot and no chance to publish edits that were never made.
+- head is `Suspended { S }`: continue at step 5.
+- head is `LeaseReleased`: continue at step 6 with the `S` the preceding `Suspended` names.
+
+A snapshot published while the marker was `Dirty`, by a command other than suspend, never confuses this: the sequence only ever looks at records after the head it recorded. The SIGKILL matrix for suspend has one row per boundary above, and each asserts that a rerun ends with the same `S` in `Suspended`, a released lease and a `Clean` marker at `S`.
+
 `fabric store gc` runs inside the lock holder and is serialized with publish and fetch by an in-process guard: gc refuses to start while a publish or fetch is in flight (`GcBusy`), and a publish or fetch refuses to start during gc. It computes the reachable set from every job ledger on the node plus every row in `pins`, and removes only chunks and manifests outside that set. It never runs on open and never automatically.
 
 ### Restore: path-relative, never over unpublished work
@@ -111,9 +132,11 @@ Marker {
   root:   AbsPath,              the workspace directory this marker describes, on this node
   job_id: JobId,
   base:   Option<SnapshotId>,   the last snapshot the root was brought to; None for a root adopted by `fabric job init` before its first snapshot
-  state:  Clean | Dirty | Restoring { targets: [SnapshotId] },   every target this in-flight restore has aimed at, newest last
+  state:  Clean | Dirty | Suspending { epoch: Epoch, head: [u8; 32] } | Restoring { targets: [SnapshotId] },
 }
 ```
+
+`Restoring.targets` is every target the in-flight restore has aimed at, newest last. `Suspending.head` is the ledger head when the harness was stopped; it is what lets an interrupted suspend tell what it already did.
 
 Nothing Fabric owns lives under the root. A marker inside the root would be swept into `W` by `git add -A`, appear in the user's `git status` where the agent can commit it, and be refused by the path rules on the next restore. The marker names the root it describes instead, and `root` is the one host path in a node-local structure; it never enters a snapshot.
 

@@ -122,7 +122,7 @@ Quorum (three or more nodes, or a small witness) is a later ADR. The epoch and f
 
 ### Idempotency
 
-`suspend` and `resume` are safe to run twice. A second `suspend` on an already released job is a no-op that prints the state. A second `resume` on the node that already holds the lease does not restore again: the workspace marker (ADR 0004) shows the snapshot is already there, with or without edits since, and only the harness is relaunched if it is not running.
+`suspend` and `resume` are safe to run twice. A second `suspend` on an already released job is a no-op that prints the state. A `suspend` interrupted anywhere after the harness stopped is a sequence the next command finishes, keyed on the marker and the ledger head (ADR 0004, Suspend); it never captures twice and never relaunches in between. A second `resume` on the node that already holds the lease does not restore again: the workspace marker (ADR 0004) shows the snapshot is already there, with or without edits since, and only the harness is relaunched if it is not running.
 
 ## Alternatives considered
 
