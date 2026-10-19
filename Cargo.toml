@@ -25,7 +25,8 @@ must_use_candidate = "allow"
 missing_errors_doc = "allow"
 # Restriction lints that back the project rules. clippy.toml allows unwrap,
 # expect, panic and print inside tests. A local `cargo clippy` without
-# `-D warnings` reports the same errors as CI.
+# `-D warnings` reports these as errors, as CI does; pedantic findings show
+# as warnings locally and fail CI under `-D warnings`.
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
