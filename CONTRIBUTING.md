@@ -37,7 +37,8 @@ repository. `scripts/test-check-hygiene.sh` proves it fires; CI runs it first.
 once a week, so a new advisory against an unchanged `Cargo.lock` still shows
 up. `deny.toml` holds the license, advisory, and source policy. A new
 dependency must pass it, and the PR lists the crate, version, last release
-date, and license.
+date, and license. Dependabot opens a weekly PR for a stale action pin or
+crate; it goes through the same gates.
 
 ## Workspace rules
 
