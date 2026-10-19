@@ -45,6 +45,15 @@ Two per-node ledgers can disagree only if two nodes append. So only one node may
 
 The property test in Consequences is written against this protocol: with one arbiter and lossy messages, no interleaving of request, grant, lost reply and retry produces two `LeaseClaimed` records at one epoch.
 
+### Replication
+
+A claim needs the claimant to hold the arbiter's head, and a resume needs the latest snapshot. Neither can be fetched from a node that is asleep, so both are pushed while the holder is awake:
+
+- The node that appends a record pushes it to every paired peer as `Append { record }` (ADR 0005), best effort, right after the `fsync`. A peer applies the acceptance rule of ADR 0002. A peer that was unreachable fetches the missing suffix on its next connection.
+- `fabric suspend` pushes the new snapshot (manifest chunks, then file chunks) to every paired peer it can reach, and does so before it prints success. A peer that cannot be reached is a warning in the output, by name, not a failure: suspend is complete locally, and the user is told that the other machine does not yet hold the snapshot. `fabric status` shows, per paired peer, the last record the peer acknowledged and whether the latest snapshot is complete there, so the user can see replication lag before closing the lid.
+
+Replication never changes who may append. A replica is a copy; the acceptance rule keeps it one.
+
 ### Fencing
 
 Every message between nodes about a job carries the sender's epoch. Every write (ledger append, blob push, manifest update) carries it too. A node that knows a higher epoch for that job refuses the message with `StaleEpoch { yours, current }`. There is no override flag.
@@ -74,6 +83,8 @@ With two nodes and no quorum, a network partition where both nodes are awake and
 
 - never claims after expiry automatically. Expiry-based claims require the user to run `fabric resume --force-expired`, and the command prints what it is about to do and what will be orphaned.
 - the normal path is suspend then resume, where the release is explicit and the claim is granted by the previous holder, which is the arbiter.
+
+The most common sleep case has no expiry at all: the holder suspended cleanly, appended `LeaseReleased`, pushed the record and the snapshot, and closed the lid. It is now the arbiter and unreachable, and nothing is held. A claim against an unreachable arbiter whose lease is `Released` is allowed without a flag, under two conditions checked on the claimant: its replica head is that `LeaseReleased` record, and the snapshot the matching `Suspended` names is complete in its local store. Then the claimant appends `LeaseClaimed { epoch: current + 1, origin: Forced }` and a `Note` saying the arbiter was unreachable, and prints both. If either condition fails it refuses with `ArbiterUnreachable { node }` and says that the node holds the latest records or snapshot; `--force-expired` does not apply, because nothing is expired. This is safe for live copies, since a released lease has no harness behind it, and it cannot resume stale work, since the claimant holds the head and the snapshot it names. It can still fork if the arbiter wakes, resumes locally without hearing of the claim, and grants itself the same epoch; the fork rule below decides that, and rule 2 favors the arbiter.
 
 `--force-expired` is the one append a non-arbiter may make: the claimant appends `LeaseClaimed { epoch: current + 1, origin: Forced }` with `prev` set to its replica head, then a `Note` saying the claim was forced and against which `expires_at`. A claim the arbiter appends carries `origin: Granted`. A forced claim is therefore the only way two ledgers can fork. When the old holder reconnects it is offered the forced record. If the record's `prev` equals the old holder's head, it appends it and is fenced. If not, the old holder appended at the old epoch while it was unreachable and the chains have forked.
 
