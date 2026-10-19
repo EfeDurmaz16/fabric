@@ -23,7 +23,8 @@ trait Harness {
 
     async fn capture(&self, workspace: &Path, out: &Path) -> Result<Captured, HarnessError>;
         Ask the running harness to stop at a turn boundary, then copy everything it needs
-        to continue into `out`. Returns what was copied and any paths that are absolute.
+        to continue into `out`, redacted. Returns what was copied, any paths that are
+        absolute, and what was redacted.
 
     async fn restore(&self, state: &Path, from_root: &Path, to_root: &Path) -> Result<(), HarnessError>;
         Place the captured state where this harness expects it on this node,
@@ -34,6 +35,8 @@ trait Harness {
 }
 
 HarnessKind = ClaudeCode | Codex | Acp { command: String }
+Captured    = { entries: [Entry], absolute_roots: [PathBuf], redactions: [RedactionReport] }
+RedactionReport = { rule: String, count: u32 }
 ```
 
 The core calls these four in order during suspend (`detect`, `capture`) and resume (`restore`, `launch`). It stores whatever `capture` produced as the `harness_state` tree of the snapshot (ADR 0004) and never opens it.
@@ -58,7 +61,13 @@ Each adapter is a module in `fabric-harness` behind a cargo feature. The core co
 
 ### Harness state is opaque to the core
 
-The core sees `harness_state` as a list of relative paths and chunk ids. The only thing the core does with it is hash, store, transfer and hand it back to the adapter. The core never redacts, never parses JSONL, never rewrites paths. If an adapter needs to strip account identifiers it does so in `capture`.
+The core sees `harness_state` as a list of relative paths and chunk ids. The only thing the core does with it is hash, store, transfer and hand it back to the adapter. The core never redacts, never parses JSONL, never rewrites paths. Redaction is therefore part of the `Harness` contract, not an option: `capture` returns a `RedactionReport` per rule applied, and the suspend output prints the counts next to the excluded workspace paths (ADR 0004).
+
+For the Claude Code adapter the contract is concrete, because the research shows what the state carries (H1, sections on the config directory and on identity):
+
+- Never included: `.credentials.json`, anything derived from the Keychain, `~/.claude.json` as a whole (it holds `oauthAccount`, `machineID`, `remoteControlMachineId`, `userID`), `sessions/`, `session-env/`, `shell-snapshots/`, `jobs/`, `daemon/`, `backups/`, `cache/`, `telemetry/`, `stats-cache.json`. Each node signs in once through Anthropic's own flow; carrying credentials would also breach the terms the research cites.
+- Redacted in the transcript and sidecars, following claude-handoff 0.3.0's rules: secret patterns, `.env` values that appear in tool results, the account email and the organization UUID in `session_context` and `credential_org` attachments.
+- A secret inside a signed `thinking` block cannot be edited without breaking the block (next section). The adapter then drops that whole block, which the API accepts, and counts it in the report.
 
 ### Cross-harness resume is an experiment, not a promise
 
