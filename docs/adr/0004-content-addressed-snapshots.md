@@ -89,12 +89,14 @@ Entry { rel_path: RelPath, kind: File | Dir | Symlink { target: String }, mode: 
 
 ### Publish: atomic, crash-safe
 
-1. For each new chunk, including the chunks of the manifest itself: write to `tmp/<random>`, `fsync` the file, `rename` to `chunks/ab/cdef...`. Rename on the same filesystem is atomic; a crash leaves either nothing or a complete chunk under its final name. An existing final name means the chunk is already present and the temp file is deleted.
+1. For each new chunk, including the chunks of the manifest itself: write to `tmp/<random>`, `fsync` the file, `rename` to `chunks/ab/cdef...`, and remember the `chunks/ab/` directory it landed in. Rename on the same filesystem is atomic; a crash leaves either nothing or a complete chunk under its final name. An existing final name means the chunk is already present and the temp file is deleted.
 2. Insert chunk rows into the catalog in one transaction after all renames.
 3. Write the assembled manifest to `tmp/`, `fsync`, rename into `manifests/`.
 4. Insert the snapshot row (id, byte length, manifest chunk list) and `snapshot_chunks` rows in one transaction.
-5. `fsync` the `manifests/` and `chunks/` directories.
-6. Only now append `SnapshotPublished` to the job ledger (ADR 0002).
+5. `fsync` every `chunks/ab/` directory remembered in step 1, then `manifests/`. A rename is durable only once its parent directory is, so the parent of each renamed file is the directory that gets the call; `chunks/` itself gains nothing from it.
+6. Only now append `SnapshotPublished` to the job ledger (ADR 0002), with the full flush described there.
+
+**What this survives.** A process kill at any point, always: the kernel finishes the writes that were issued, and the ordering above means the ledger never names a snapshot whose chunks were not renamed first. Power loss or a kernel panic, only with full flushes: on macOS `fsync` does not flush the drive's write cache, so every commit point (the ledger append, and the directory `fsync` after each rename under `chunks/`, `manifests/` and `jobs/<job-id>/`) issues `fcntl(F_FULLFSYNC)` instead, the call SQLite makes under its `fullfsync` pragma. Without it a ledger that names a snapshot could outlive a chunk file that was still in the cache, which is a published snapshot that cannot be restored. Linux `fsync` already covers the device cache. The catalog runs with `synchronous=FULL` and `fullfsync=ON` for the same reason.
 
 The ledger event is the single commit point. A snapshot is live on a node if a ledger event on that node references it or a row in `pins` names it. Chunks and manifests that no live snapshot reaches are unreferenced: invisible to every reader, and removed only by `fabric store gc`.
 
