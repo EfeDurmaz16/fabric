@@ -82,11 +82,26 @@ Entry { rel_path: String, kind: File | Dir | Symlink { target: String }, mode: u
 
 A snapshot exists if and only if its ledger event exists. Chunks or manifests without a ledger event are orphans and are removed by `fabric store gc`, never on open and never automatically.
 
-### Restore: path-relative with rewrites
+### Restore: path-relative, never over unpublished work
+
+Every workspace Fabric creates carries a marker at `<root>/.fabric/restored`:
+
+```text
+Marker { job_id: JobId, snapshot: SnapshotId, state: Clean | Dirty | Restoring { target: SnapshotId } }
+```
+
+`Clean` means every byte under the root that Fabric manages is in `snapshot`. `restore` writes `Clean` when it finishes; `launch` flips it to `Dirty` before the harness starts; `suspend` writes `Clean { snapshot: <just published> }` after the ledger event. The marker is written by temp, `fsync`, rename.
 
 1. Resolve the target workspace root by policy (ADR 0008). The user never types it.
-2. Write everything into `<root>.fabric-restoring/`, verify every chunk hash as it is written, then rename the directory to `<root>`. A crash leaves a `.fabric-restoring` directory that the next restore deletes and starts again.
-3. Restore git, in this order. `git bundle unbundle` is not used anywhere: it writes objects but creates no refs, so `HEAD` would stay unborn.
+2. If `<root>` does not exist: write everything into `<root>.fabric-restoring/`, verify every chunk hash as it is written, write the marker as `Clean` last, `fsync`, then rename the directory to `<root>`. The rename is only ever onto a path that does not exist, so it cannot fail on a non-empty target. A crash leaves a `.fabric-restoring` directory that the next restore removes and starts again; it never held anything that was not in the store.
+3. If `<root>` exists, the marker decides. Nothing is ever written into a root whose marker does not allow it.
+   - No marker: refuse with `WorkspaceOccupied { root }`. The user moves the directory or runs `fabric orphan export` on it.
+   - `Dirty { snapshot }`: a harness ran here and nothing was published since. If `snapshot` is the target and this node holds the lease at the current epoch (a resume after a crash), skip restore and relaunch; the edits are kept. Otherwise refuse with `WorkspaceOccupied` and name `fabric orphan export`.
+   - `Clean { snapshot }` equal to the target: skip restore and relaunch.
+   - `Clean { snapshot }` older than the target, or `Restoring`: update in place. Write `Restoring { target }`, then bring the root to the target: fetch the bundles the root has not seen, set `HEAD`, `git read-tree <I>`, write every path of `W` and `files` whose on-disk bytes do not already hash to the expected blob or chunks, remove paths that the marker's snapshot had and the target does not, then write `Clean { target }`. Paths that neither snapshot lists, such as a denied `.env`, are left alone. A `Restoring` root holds no unpublished work by construction, so continuing after a crash, even toward a different target, is safe. This path is what makes bouncing between two Macs cheap: `node_modules` stays and only the diff is written.
+
+   The only files Fabric ever removes are in a root whose marker says every managed byte is in a published snapshot.
+4. Restore git, in this order. `git bundle unbundle` is not used anywhere: it writes objects but creates no refs, so `HEAD` would stay unborn.
    1. `git init`. Write `.git/config` and `.git/info/exclude` from their chunks.
    2. For each bundle in the chain, from the newest full one to this snapshot, oldest first: `git bundle verify`, then `git fetch --update-head-ok <bundle> '+refs/*:refs/*'`.
    3. Set `HEAD`: `git symbolic-ref HEAD refs/heads/<branch>`, or `git update-ref --no-deref HEAD <sha>` for a detached head.
@@ -95,10 +110,10 @@ A snapshot exists if and only if its ledger event exists. Chunks or manifests wi
    6. Only now write `files`.
 
    After step 5, `git status` on the target equals `git status` on the source: staged is `I` against `HEAD`, unstaged is the disk against `I`, untracked is what `W` has that `I` does not.
-4. Rewrites: the manifest stores relative paths only. Harness state may contain absolute paths pointing at the source workspace root; the adapter's `restore` receives `(source_root, target_root)` and performs its own rewrites (ADR 0006). The core never guesses which bytes are paths.
-5. If `platform` differs from the node or a cache path is missing, mark the environment as needing materialization (ADR 0007).
+5. Rewrites: the manifest stores relative paths only. Harness state may contain absolute paths pointing at the source workspace root; the adapter's `restore` receives `(source_root, target_root)` and performs its own rewrites (ADR 0006). The core never guesses which bytes are paths.
+6. If `platform` differs from the node or a cache path is missing, mark the environment as needing materialization (ADR 0007).
 
-Restore is idempotent: running it again over an existing identical workspace writes nothing.
+Restore is idempotent by marker: a second restore of the same snapshot into the same root is a no-op, and a crashed in-place restore continues where it stopped.
 
 ### Transfer
 
