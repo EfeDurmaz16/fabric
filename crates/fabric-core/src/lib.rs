@@ -6,6 +6,9 @@
 //! a database or any agent vendor. Everything above it is an adapter that
 //! feeds it bytes and persists what it returns.
 
+pub mod env;
+pub mod harness;
 pub mod id;
 pub mod lease;
 pub mod path;
+pub mod snapshot;
