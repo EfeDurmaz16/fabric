@@ -58,7 +58,7 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Pairing.** Telling one node the id and address of another, out of band. Pairing is how trust is established. Discovery is never trust.
 
-**Placement.** Choosing which node resumes a job.
+**Placement.** Choosing which node resumes a job and at which path. In v0 the node is the one where `resume` is typed and the path is the recorded root.
 
 **Release.** The act of the lease holder giving up the lease at suspend time.
 

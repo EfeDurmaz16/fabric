@@ -114,7 +114,7 @@ If B dies between steps 4 and 8, B holds the lease with epoch 2 and the job is n
 
 - One job, two nodes, both Efe's own Macs, same OS and CPU architecture.
 - Claude Code first, Codex second, ACP as the generic path.
-- Explicit `suspend` then `resume`. No automatic triggers.
+- Explicit `suspend` then `resume`, each on the machine where it is typed. No automatic triggers, no remote placement.
 - `node_modules` and similar caches carried in the snapshot when platform matches.
 - Own QUIC transport with node keys. Tailscale is a network Fabric can run over, not a dependency.
 - Rust only. Library crates plus one CLI binary. Not an MCP server.
