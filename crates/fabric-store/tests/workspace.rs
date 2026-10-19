@@ -240,7 +240,7 @@ fn git_state_survives_capture_and_restore() {
     let restored = restore_into(&store, snapshot, &target).unwrap();
     assert_eq!(restored.files, 3);
     assert_eq!(restored.verified, 3);
-    assert_eq!(restore_state(&target), RestoreState::Present);
+    assert_eq!(restore_state(&target).unwrap(), RestoreState::Present);
 
     assert_eq!(git_difference(&root, &target).unwrap(), None);
     assert_eq!(
@@ -545,7 +545,7 @@ fn a_hostile_manifest_cannot_write_through_a_link_or_over_a_file() {
     );
     assert!(fs::read_dir(&outside).unwrap().next().is_none());
     assert!(matches!(
-        restore_state(&target),
+        restore_state(&target).unwrap(),
         RestoreState::HalfRestored { .. }
     ));
     assert!(!target.exists());
@@ -564,7 +564,7 @@ fn a_hostile_manifest_cannot_write_through_a_link_or_over_a_file() {
     fs::write(occupied.join("mine"), "do not touch").unwrap();
     let err = restore_into(&store, id, &occupied).unwrap_err();
     assert!(matches!(err, RestoreError::TargetNotEmpty { .. }), "{err}");
-    assert_eq!(restore_state(&occupied), RestoreState::Present);
+    assert_eq!(restore_state(&occupied).unwrap(), RestoreState::Present);
     assert_eq!(fs::read_dir(&occupied).unwrap().count(), 1);
 }
 
@@ -681,7 +681,8 @@ fn plain_tree(root: &Path, state: &Path) -> Fallible {
     set_mtime(&root.join("a/b/deep.txt"), 1_500_000_000, 999)?;
     set_mtime(&root.join("a/b"), 1_500_000_001, 1)?;
     set_mtime(&root.join("empty"), 1_500_000_002, 2)?;
-    fs::create_dir_all(state.join("sessions"))?;
+    fs::create_dir_all(state.join("sessions/s1"))?;
+    fs::write(state.join("sessions/s1/tool.txt"), "tool\n")?;
     fs::write(state.join("sessions/s1.jsonl"), "{}\n")?;
     Ok(())
 }
@@ -698,8 +699,8 @@ fn a_plain_directory_and_harness_state_round_trip_exactly() {
     let mut req = request(&root, &policy, None);
     req.harness_state = Some(&state);
     let Captured { manifest, report } = capture(&store, &req).unwrap();
-    assert_eq!(report.files, 4);
-    assert_eq!(manifest.harness_state.entries.len(), 2);
+    assert_eq!(report.files, 5);
+    assert_eq!(manifest.harness_state.entries.len(), 4);
     let snapshot = store.publish(&manifest).unwrap();
 
     let target = dir.path().join("restored");
@@ -716,7 +717,7 @@ fn a_plain_directory_and_harness_state_round_trip_exactly() {
         },
     )
     .unwrap();
-    assert_eq!(report.files, 4);
+    assert_eq!(report.files, 5);
     assert_eq!(report.verified, 2);
     assert_eq!(listing(&target).unwrap(), listing(&root).unwrap());
     assert_eq!(listing(&state_target).unwrap(), listing(&state).unwrap());
@@ -767,15 +768,15 @@ fn a_cache_the_target_cannot_use_is_skipped_and_named() {
 fn restore_state_tells_absent_from_half_restored_and_present() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("t");
-    assert_eq!(restore_state(&target), RestoreState::Absent);
+    assert_eq!(restore_state(&target).unwrap(), RestoreState::Absent);
     fs::create_dir(&target).unwrap();
-    assert_eq!(restore_state(&target), RestoreState::Absent);
+    assert_eq!(restore_state(&target).unwrap(), RestoreState::Absent);
     fs::create_dir(dir.path().join("t.fabric-restoring")).unwrap();
     assert!(matches!(
-        restore_state(&target),
+        restore_state(&target).unwrap(),
         RestoreState::HalfRestored { .. }
     ));
     fs::remove_dir(dir.path().join("t.fabric-restoring")).unwrap();
     fs::write(target.join("x"), "x").unwrap();
-    assert_eq!(restore_state(&target), RestoreState::Present);
+    assert_eq!(restore_state(&target).unwrap(), RestoreState::Present);
 }

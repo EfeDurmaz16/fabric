@@ -47,6 +47,10 @@ fn make_workspace(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
             format!("module.exports = {i};\n"),
         )?;
     }
+    let state = root.with_file_name("hstate");
+    fs::create_dir_all(state.join("sessions/abc"))?;
+    fs::write(state.join("sessions/abc/tool.txt"), "tool output\n")?;
+    fs::write(state.join("sessions/abc.jsonl"), "{}\n")?;
     Ok(())
 }
 
@@ -65,7 +69,7 @@ fn capture_and_publish(
             parent: None,
             policy: &policy,
             carry_keys: &UnmeasuredKeys,
-            harness_state: None,
+            harness_state: Some(&root.with_file_name("hstate")),
             env_spec: None,
             max_file_size: None,
             allow_large_untracked: false,
@@ -96,7 +100,7 @@ fn crash_child() {
                 &RestoreRequest {
                     snapshot,
                     target: &dir.join("target"),
-                    harness_state: None,
+                    harness_state: Some(&dir.join("state")),
                     verify: Verify::None,
                     durability: Durability::ProcessCrash,
                     carry: &|_| true,
@@ -184,6 +188,7 @@ fn restore_killed_at_any_checkpoint_is_detectable_and_finishes_on_rerun() {
         "restore.after_git",
         "restore.after_first_file",
         "restore.after_files",
+        "restore.after_harness_rename",
         "restore.before_rename",
         "restore.after_rename",
     ] {
@@ -197,11 +202,21 @@ fn restore_killed_at_any_checkpoint_is_detectable_and_finishes_on_rerun() {
         run_child_and_kill(dir, "restore", checkpoint, Some(snapshot));
 
         let target = dir.join("target");
+        let state = dir.join("state");
         let store = Store::open(&dir.join("store")).unwrap();
         let carry = |_: &fabric_core::snapshot::CacheEntry| true;
+        let harness_renamed = matches!(
+            checkpoint,
+            "restore.after_harness_rename" | "restore.before_rename" | "restore.after_rename"
+        );
+        assert_eq!(
+            restore_state(&state).unwrap() == RestoreState::Present,
+            harness_renamed,
+            "{checkpoint}"
+        );
         if checkpoint == "restore.after_rename" {
             assert_eq!(
-                restore_state(&target),
+                restore_state(&target).unwrap(),
                 RestoreState::Present,
                 "{checkpoint}"
             );
@@ -210,7 +225,10 @@ fn restore_killed_at_any_checkpoint_is_detectable_and_finishes_on_rerun() {
             continue;
         }
         assert!(
-            matches!(restore_state(&target), RestoreState::HalfRestored { .. }),
+            matches!(
+                restore_state(&target).unwrap(),
+                RestoreState::HalfRestored { .. }
+            ),
             "{checkpoint}: {:?}",
             restore_state(&target)
         );
@@ -220,7 +238,7 @@ fn restore_killed_at_any_checkpoint_is_detectable_and_finishes_on_rerun() {
             &RestoreRequest {
                 snapshot,
                 target: &target,
-                harness_state: None,
+                harness_state: Some(&state),
                 verify: Verify::All,
                 durability: Durability::ProcessCrash,
                 carry: &carry,
@@ -229,8 +247,13 @@ fn restore_killed_at_any_checkpoint_is_detectable_and_finishes_on_rerun() {
         .unwrap();
         assert!(report.verified > 0, "{checkpoint}");
         assert_eq!(
-            restore_state(&target),
+            restore_state(&target).unwrap(),
             RestoreState::Present,
+            "{checkpoint}"
+        );
+        assert_eq!(
+            fs::read_to_string(state.join("sessions/abc/tool.txt")).unwrap(),
+            "tool output\n",
             "{checkpoint}"
         );
         let git = Git::new(&target, CREATED_AT);

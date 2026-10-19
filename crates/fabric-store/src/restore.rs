@@ -8,6 +8,7 @@
 //! outlives its process is the sign of a restore that did not finish.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -209,22 +210,21 @@ fn staging_path(target: &Path) -> Result<PathBuf, RestoreError> {
 }
 
 /// Says whether `target` is absent, half restored or present.
-#[must_use]
-pub fn restore_state(target: &Path) -> RestoreState {
+pub fn restore_state(target: &Path) -> Result<RestoreState, RestoreError> {
     if let Ok(staging) = staging_path(target)
         && staging.exists()
     {
-        return RestoreState::HalfRestored { staging };
+        return Ok(RestoreState::HalfRestored { staging });
     }
     match fs::read_dir(target) {
-        Ok(mut entries) => {
-            if entries.next().is_some() {
-                RestoreState::Present
-            } else {
-                RestoreState::Absent
-            }
-        }
-        Err(_) => RestoreState::Absent,
+        Ok(mut entries) => Ok(if entries.next().is_some() {
+            RestoreState::Present
+        } else {
+            RestoreState::Absent
+        }),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(RestoreState::Absent),
+        Err(e) if e.kind() == io::ErrorKind::NotADirectory => Ok(RestoreState::Present),
+        Err(e) => Err(io_err(target, e)),
     }
 }
 
@@ -724,13 +724,65 @@ fn restore_git(
     Ok(git)
 }
 
+/// Says whether `dir` already holds the harness state of `manifest`.
+///
+/// A restore renames the harness state into place before the workspace, so
+/// a kill between the two renames leaves a complete harness directory next
+/// to a half-restored workspace. The rerun re-reads every file against the
+/// store and checks every directory and link; a directory that holds
+/// anything else is foreign and is refused.
+fn harness_state_complete(
+    store: &Store,
+    entries: &[Entry],
+    dir: &Path,
+) -> Result<Option<u64>, RestoreError> {
+    let occupied = RestoreError::TargetNotEmpty {
+        path: dir.to_owned(),
+    };
+    match restore_state(dir)? {
+        RestoreState::Absent | RestoreState::HalfRestored { .. } => return Ok(None),
+        RestoreState::Present => {}
+    }
+    if entries.is_empty() {
+        return Err(occupied);
+    }
+    for entry in entries {
+        let full = dir.join(entry.rel_path.as_str());
+        let Ok(meta) = fs::symlink_metadata(&full) else {
+            return Err(occupied);
+        };
+        let same = match &entry.kind {
+            EntryKind::Dir => meta.is_dir(),
+            EntryKind::Symlink { target } => {
+                fs::read_link(&full).is_ok_and(|t| t.as_os_str() == OsStr::new(target))
+            }
+            EntryKind::File { .. } => meta.is_file(),
+        };
+        if !same {
+            return Err(occupied);
+        }
+    }
+    let writer = TreeWriter::open(dir)?;
+    match verify_entries(store, &writer, entries, &|_| false, Verify::All) {
+        Ok(verified) => Ok(Some(verified)),
+        Err(RestoreError::VerifyFailed { .. }) => Err(occupied),
+        Err(e) => Err(e),
+    }
+}
+
 /// Materializes a snapshot into `req.target`.
+///
+/// The rename of the workspace staging directory is the commit point. The
+/// harness state is written and renamed just before it, and a rerun after a
+/// kill between the two renames finds the harness state complete and
+/// finishes the workspace.
 pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport, RestoreError> {
     let manifest = store.manifest(req.snapshot)?;
     check_target_empty(req.target)?;
-    if let Some(dir) = req.harness_state {
-        check_target_empty(dir)?;
-    }
+    let harness_done = match req.harness_state {
+        Some(dir) => harness_state_complete(store, &manifest.harness_state.entries, dir)?,
+        None => None,
+    };
     let staging = fresh_staging(req.target)?;
     let writer = TreeWriter::open(&staging)?;
     let mut report = RestoreReport::default();
@@ -768,26 +820,31 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
     checkpoint::reached("restore.after_files");
     report.verified += verify_entries(store, &writer, &manifest.files, &skip, req.verify)?;
 
-    if let Some(dir) = req.harness_state {
-        let hs_staging = fresh_staging(dir)?;
-        let hs_writer = TreeWriter::open(&hs_staging)?;
-        let keep_all = |_: &RelPath| false;
-        write_entries(
-            store,
-            &hs_writer,
-            &manifest.harness_state.entries,
-            &keep_all,
-            req.durability,
-            &mut report,
-        )?;
-        report.verified += verify_entries(
-            store,
-            &hs_writer,
-            &manifest.harness_state.entries,
-            &keep_all,
-            req.verify,
-        )?;
-        move_into_place(&hs_staging, dir)?;
+    match (req.harness_state, harness_done) {
+        (Some(_), Some(verified)) => report.verified += verified,
+        (Some(dir), None) => {
+            let hs_staging = fresh_staging(dir)?;
+            let hs_writer = TreeWriter::open(&hs_staging)?;
+            let keep_all = |_: &RelPath| false;
+            write_entries(
+                store,
+                &hs_writer,
+                &manifest.harness_state.entries,
+                &keep_all,
+                req.durability,
+                &mut report,
+            )?;
+            report.verified += verify_entries(
+                store,
+                &hs_writer,
+                &manifest.harness_state.entries,
+                &keep_all,
+                req.verify,
+            )?;
+            move_into_place(&hs_staging, dir)?;
+            checkpoint::reached("restore.after_harness_rename");
+        }
+        (None, _) => {}
     }
 
     if let (Some(git), Some(state)) = (&git, &manifest.git) {
