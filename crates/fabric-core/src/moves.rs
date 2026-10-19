@@ -156,9 +156,10 @@ pub enum LeaseView {
 impl Ledger {
     /// Builds the `MoveStarted` that commits `me` to a move toward `target`.
     ///
-    /// Requires the head to be `Suspended`: the workspace is in a published
-    /// snapshot and the harness is stopped. From the moment the record is
-    /// durable, `me` is not runnable.
+    /// Requires the workspace to be suspended in the latest published
+    /// snapshot: the last `Suspended` names it and no `Resumed` followed.
+    /// Notes written after the suspend do not block the move. From the
+    /// moment the record is durable, `me` is not runnable.
     pub fn start_move(
         &self,
         me: NodeId,

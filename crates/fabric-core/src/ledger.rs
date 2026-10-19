@@ -480,8 +480,9 @@ pub enum LedgerError {
     /// A steal by the owner itself, which a departing source still is.
     #[error("the owner cannot steal its own job")]
     StealBySelf,
-    /// A move started while the head is not `Suspended`.
-    #[error("job must be suspended before it moves")]
+    /// A move started while the workspace is not suspended in the latest
+    /// published snapshot: no `Suspended` names it, or a `Resumed` came after.
+    #[error("job must be suspended in its latest snapshot before it moves")]
     NotSuspended,
     /// A record names a snapshot other than the latest the ledger published.
     #[error("snapshot {snapshot} is not the latest published snapshot")]
@@ -622,6 +623,8 @@ pub enum StoreError<E: std::error::Error + 'static> {
 pub struct Ledger {
     records: Vec<Record>,
     manifest: JobManifest,
+    /// The snapshot the last `Suspended` named, until a `Resumed` follows it.
+    suspended_at: Option<SnapshotId>,
 }
 
 impl Ledger {
@@ -712,6 +715,7 @@ impl Ledger {
         Ok(Ledger {
             records: vec![record],
             manifest,
+            suspended_at: None,
         })
     }
 
@@ -927,8 +931,13 @@ impl Ledger {
     fn check_content(&self, kind: &EventKind) -> Result<(), LedgerError> {
         match kind {
             EventKind::MoveStarted { .. } => {
-                let head_kind = &self.records[self.records.len() - 1].event().kind;
-                if !matches!(head_kind, EventKind::Suspended { .. }) {
+                // The workspace is in the latest published snapshot and no
+                // harness runs: the last Suspended names that snapshot and no
+                // Resumed came after it. Notes and decisions in between do
+                // not change that.
+                let in_latest = self.suspended_at.is_some()
+                    && self.suspended_at == self.manifest.latest_snapshot;
+                if !in_latest {
                     return Err(LedgerError::NotSuspended);
                 }
                 Ok(())
@@ -1000,10 +1009,13 @@ impl Ledger {
                 };
             }
             EventKind::SnapshotPublished { snapshot, .. } => m.latest_snapshot = Some(*snapshot),
-            EventKind::Resumed { harness, .. } => m.harness = harness.clone(),
+            EventKind::Suspended { snapshot } => self.suspended_at = Some(*snapshot),
+            EventKind::Resumed { harness, .. } => {
+                m.harness = harness.clone();
+                self.suspended_at = None;
+            }
             EventKind::EnvSpecChanged { env_spec } => m.env_spec = Some(*env_spec),
             EventKind::Created { .. }
-            | EventKind::Suspended { .. }
             | EventKind::DecisionRecorded { .. }
             | EventKind::Note { .. } => {}
         }
@@ -1254,26 +1266,87 @@ mod tests {
         assert!(matches!(err, LedgerError::NotAuthor { expected } if expected == node(1)));
     }
 
+    /// The suspended state is derived, not read off the head: a note after
+    /// `Suspended` leaves the workspace where it is, a `Resumed` or a newer
+    /// snapshot does not.
     #[test]
-    fn move_needs_a_suspended_head_and_another_node() {
-        let mut ledger = new_ledger(node(1));
+    fn move_needs_the_workspace_suspended_in_the_latest_snapshot() {
         let move_id = mid(1);
-        let err = append(
-            &mut ledger,
+        let start = |ledger: &mut Ledger| {
+            append(
+                ledger,
+                node(1),
+                EventKind::MoveStarted {
+                    move_id,
+                    target: node(2),
+                },
+            )
+        };
+        let mut never_suspended = new_ledger(node(1));
+        assert!(matches!(
+            start(&mut never_suspended),
+            Err(LedgerError::NotSuspended)
+        ));
+
+        let mut noted = suspended_ledger(node(1));
+        append(
+            &mut noted,
             node(1),
-            EventKind::MoveStarted {
-                move_id,
-                target: node(2),
+            EventKind::Note {
+                text: "pushed".into(),
             },
         )
-        .unwrap_err();
-        assert!(matches!(err, LedgerError::NotSuspended));
+        .unwrap();
+        start(&mut noted).unwrap();
+        assert!(matches!(noted.lease(), LeaseState::Departing { .. }));
+
+        let mut resumed = suspended_ledger(node(1));
+        append(
+            &mut resumed,
+            node(1),
+            EventKind::Resumed {
+                node: node(1),
+                snapshot: Some(snap(1)),
+                harness: HarnessKind::ClaudeCode,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            start(&mut resumed),
+            Err(LedgerError::NotSuspended)
+        ));
+
+        let mut republished = suspended_ledger(node(1));
+        append(
+            &mut republished,
+            node(1),
+            EventKind::SnapshotPublished {
+                snapshot: snap(2),
+                parent: Some(snap(1)),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            start(&mut republished),
+            Err(LedgerError::NotSuspended)
+        ));
+        append(
+            &mut republished,
+            node(1),
+            EventKind::Suspended { snapshot: snap(2) },
+        )
+        .unwrap();
+        start(&mut republished).unwrap();
+    }
+
+    #[test]
+    fn move_needs_another_node() {
         let mut ledger = suspended_ledger(node(1));
         let err = append(
             &mut ledger,
             node(1),
             EventKind::MoveStarted {
-                move_id,
+                move_id: mid(1),
                 target: node(1),
             },
         )
