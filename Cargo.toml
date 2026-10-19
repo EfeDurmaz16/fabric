@@ -24,10 +24,17 @@ pedantic = { level = "warn", priority = -1 }
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 # Restriction lints that back the project rules. clippy.toml allows unwrap,
-# expect and panic inside tests.
+# expect, panic and print inside tests.
 unwrap_used = "warn"
 expect_used = "warn"
 panic = "deny"
+unreachable = "deny"
 todo = "deny"
 unimplemented = "deny"
 dbg_macro = "warn"
+print_stdout = "deny"
+print_stderr = "deny"
+exit = "deny"
+# Every #[allow] and #[expect] names its reason, so a suppression cannot
+# switch a rule off silently.
+allow_attributes_without_reason = "deny"

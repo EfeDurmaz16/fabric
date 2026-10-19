@@ -1,4 +1,6 @@
-# A failed unwrap, expect or panic inside a test is the test failing.
+# A failed unwrap, expect or panic inside a test is the test failing, and a
+# test may print to explain a failure.
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
+allow-print-in-tests = true
