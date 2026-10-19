@@ -268,9 +268,11 @@ impl Record {
     /// Reads the record at `offset`; `Ok(None)` means a torn tail by the ADR 0002 rule.
     ///
     /// A torn tail is the last thing in the buffer: every byte from `offset`
-    /// is zero, the header is cut short, or the header verifies and the
-    /// declared end lies at or past the end of the buffer. A header that does
-    /// not verify, or a checksum failure before the end, is `Corrupt`.
+    /// is zero, the header is cut short, the header verifies and the declared
+    /// end lies past the end of the buffer, or the declared end is the end of
+    /// the buffer and the checksum bytes read back as zero. A header that
+    /// does not verify, a checksum failure before the end, and a last record
+    /// whose checksum is present and wrong are `Corrupt`.
     fn read_one(buf: &[u8], offset: usize) -> Result<Option<(Record, usize)>, RecordError> {
         let rest = &buf[offset..];
         if rest.iter().all(|&b| b == 0) {
@@ -303,7 +305,13 @@ impl Record {
         };
         let (hashed, checksum) = frame.split_at(frame.len() - CHECKSUM_LEN);
         if blake3::hash(hashed).as_bytes()[..CHECKSUM_LEN] != *checksum {
-            if frame.len() == rest.len() {
+            // A record is acknowledged only once its whole frame is durable,
+            // so checksum bytes that read back as zero at the end of the
+            // buffer belong to a write that stopped early. Checksum bytes that
+            // are present and wrong belong to a record that was complete, and
+            // dropping it could drop an acknowledged decision.
+            let checksum_never_landed = checksum.iter().all(|&b| b == 0);
+            if frame.len() == rest.len() && checksum_never_landed {
                 return Ok(None);
             }
             return Err(RecordError::Corrupt { offset });
@@ -335,11 +343,13 @@ pub struct Scan {
 /// Walks `bytes` record by record.
 ///
 /// A record that fails is a torn tail only when it is the last thing in the
-/// buffer: its header verifies and its declared end lies at or past the end,
-/// its header is cut short, or every byte from its start is zero. Any other
-/// failure, a damaged length included, is `RecordError::Corrupt` with the
-/// offset, and nothing after it is returned. The caller decides what to do
-/// with a torn tail; `scan` never drops a record that is followed by another.
+/// buffer and its checksum never landed: its header verifies and its declared
+/// end lies past the end, its header is cut short, every byte from its start
+/// is zero, or the frame is whole and its checksum bytes are zero. Any other
+/// failure, a damaged length and a wrong checksum on a whole last record
+/// included, is `RecordError::Corrupt` with the offset, and nothing after it
+/// is returned. The caller decides what to do with a torn tail; `scan` never
+/// drops a record that is followed by another or that was ever complete.
 pub fn scan(bytes: &[u8]) -> Result<Scan, RecordError> {
     let mut out = Scan::default();
     let mut offset = 0;

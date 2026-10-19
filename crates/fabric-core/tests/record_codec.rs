@@ -152,6 +152,39 @@ fn a_last_record_with_a_zeroed_body_is_a_torn_tail() {
     assert_eq!(result.torn_tail, Some(a.bytes().len()));
 }
 
+/// The write stopped after the body and before the checksum: the frame has
+/// its full length, the body is intact, the checksum bytes are zero. The
+/// record was never complete, so it was never acknowledged; dropping it loses
+/// nothing.
+#[test]
+fn a_last_record_whose_checksum_never_landed_is_a_torn_tail() {
+    let a = note(None, "a").unwrap();
+    let b = note(Some(a.hash()), "b").unwrap();
+    let mut file = a.bytes().to_vec();
+    file.extend_from_slice(&b.bytes()[..b.bytes().len() - CHECKSUM_LEN]);
+    file.resize(a.bytes().len() + b.bytes().len(), 0);
+    let result = scan(&file).unwrap();
+    assert_eq!(result.records, vec![a.clone()]);
+    assert_eq!(result.torn_tail, Some(a.bytes().len()));
+}
+
+/// Bit rot, not a torn write: the last record is whole, its checksum bytes
+/// are present, and one body bit is flipped. It was complete once, so it may
+/// have been acknowledged to a peer; the file fails closed instead of losing
+/// it to a truncation.
+#[test]
+fn a_last_record_with_a_flipped_body_bit_is_corrupt() {
+    let a = note(None, "a").unwrap();
+    let b = note(Some(a.hash()), "b").unwrap();
+    let mut file = a.bytes().to_vec();
+    file.extend_from_slice(b.bytes());
+    file[a.bytes().len() + HEADER_LEN + 12] ^= 1;
+    assert!(matches!(
+        scan(&file),
+        Err(RecordError::Corrupt { offset }) if offset == a.bytes().len()
+    ));
+}
+
 #[test]
 fn an_all_zero_tail_is_a_torn_tail() {
     let a = note(None, "a").unwrap();
