@@ -89,6 +89,12 @@ pub enum OverrideError {
         #[source]
         reason: EnvVarNameError,
     },
+    /// An entry of `env` repeats an earlier one.
+    #[error("`env[{index}]` repeats an earlier name")]
+    DuplicateEnv {
+        /// Zero-based index of the repeat.
+        index: usize,
+    },
     /// A path that is not a relative workspace path.
     #[error("`{key}` is not a relative path inside the workspace")]
     Path {
@@ -174,7 +180,7 @@ pub struct DeclaredCache {
 pub struct EnvOverride {
     /// The package manager to use when the workspace alone does not decide.
     pub package_manager: Option<PackageManagerName>,
-    /// Names of environment variables the job needs, sorted, without repeats.
+    /// Names of environment variables the job needs, sorted; a repeat is refused.
     pub env_var_names: Vec<EnvVarName>,
     /// Patterns added to the built-in secret list.
     pub secret_patterns: Vec<Pattern>,
@@ -272,8 +278,15 @@ fn env_names(value: &Value) -> Result<Vec<EnvVarName>, OverrideError> {
             EnvVarName::parse(text).map_err(|reason| OverrideError::EnvVarName { index, reason })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    // Refused like every other repeat in this file, rather than folded away.
+    let mut seen: Vec<&EnvVarName> = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        if seen.contains(&name) {
+            return Err(OverrideError::DuplicateEnv { index });
+        }
+        seen.push(name);
+    }
     names.sort();
-    names.dedup();
     Ok(names)
 }
 
@@ -430,7 +443,7 @@ mod tests {
         let parsed = EnvOverride::parse(
             r#"
 package_manager = "pnpm"
-env = ["OPENAI_API_KEY", "DATABASE_URL", "DATABASE_URL"]
+env = ["OPENAI_API_KEY", "DATABASE_URL"]
 secret_patterns = ["*.sqlite"]
 
 [tools]
@@ -518,6 +531,14 @@ when = "always"
         assert!(matches!(
             EnvOverride::parse("env = [\"A\", \"B=c\"]"),
             Err(OverrideError::EnvVarName { index: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn a_repeated_env_name_is_refused() {
+        assert!(matches!(
+            EnvOverride::parse("env = [\"A\", \"B\", \"A\"]"),
+            Err(OverrideError::DuplicateEnv { index: 2 })
         ));
     }
 

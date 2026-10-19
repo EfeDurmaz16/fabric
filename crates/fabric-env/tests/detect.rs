@@ -486,6 +486,16 @@ fn a_broken_override_file_stops_detection() {
     assert!(matches!(detect(dir.path()), Err(DetectError::Override(_))));
 }
 
+/// A `package_manager` with nothing to apply to is a mistake, not a no-op.
+#[test]
+fn a_package_manager_without_a_package_json_is_refused() {
+    let dir = workspace(&[(".fabric/env.toml", "package_manager = \"pnpm\"\n")]).unwrap();
+    assert!(matches!(
+        detect(dir.path()),
+        Err(DetectError::PackageManagerWithoutPackageJson)
+    ));
+}
+
 /// Detection follows no link: `.nvmrc -> .env` would read the secret file
 /// and put its first line into the spec as the Node version.
 #[test]

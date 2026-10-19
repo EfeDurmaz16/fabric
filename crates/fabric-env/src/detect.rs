@@ -180,6 +180,9 @@ pub enum DetectError {
         /// The detected path it nests with.
         detected: RelPath,
     },
+    /// `package_manager` is set in `.fabric/env.toml` but the root has no `package.json` for it to apply to.
+    #[error("`package_manager` is set in {OVERRIDE_FILE} but there is no package.json at the root")]
+    PackageManagerWithoutPackageJson,
     /// `.fabric/env.toml` was refused; the source says where and why.
     #[error("{OVERRIDE_FILE} was refused")]
     Override(#[from] OverrideError),
@@ -455,9 +458,10 @@ pub fn detect(root: &Path) -> Result<Detection, DetectError> {
 
     let mut setup = Vec::new();
     let mut caches = Vec::new();
-    let node_manager = match &package {
-        Some(package) => choose_node_manager(root, package, overrides.package_manager)?,
-        None => None,
+    let node_manager = match (&package, overrides.package_manager) {
+        (Some(package), declared) => choose_node_manager(root, package, declared)?,
+        (None, Some(_)) => return Err(DetectError::PackageManagerWithoutPackageJson),
+        (None, None) => None,
     };
     if let Some(choice) = node_manager {
         setup.push(choice.manager.install_step()?);
