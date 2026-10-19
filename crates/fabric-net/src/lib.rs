@@ -20,8 +20,10 @@ compile_error!(
     "fabric-net needs at least one transport: enable the `quic` or the `tcp_tls` feature"
 );
 
+pub mod frame;
 pub mod identity;
 pub mod tls;
+pub mod transport;
 
 /// A boxed `Send` future, the return shape of every trait this crate dispatches dynamically.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
