@@ -514,6 +514,9 @@ impl Capturer<'_> {
         for item in &found {
             entries.push(self.entry_for(base, item)?);
         }
+        // The walk lists a directory's children before its siblings, which
+        // puts `abc/tool.txt` before `abc.jsonl`; the manifest sorts by bytes.
+        entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
         Ok(entries)
     }
 }
