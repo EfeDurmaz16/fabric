@@ -53,7 +53,7 @@ LeaseState   = Free | Held { node, epoch, expires_at } | Released { epoch }
 
 SnapshotManifest = { version, job_id, parent: Option<SnapshotId>, created_at, created_by,
                      platform: { os, arch }, git: Option<GitState>, files: [Entry],
-                     harness_state: [Entry], env_spec: Option<EnvSpecId> }
+                     harness_state: [Entry], env_spec: Option<EnvSpecId>, partial_caches: [RelPath] }
 GitState     = { bundle, bundle_base, refs, head, index_commit, worktree_commit,
                  worktree_mtimes, config, exclude }
 Marker       = { root, job_id, base: Option<SnapshotId>,

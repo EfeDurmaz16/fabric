@@ -45,7 +45,7 @@ Detection writes the spec and prints it. The user can edit the file. Fabric does
 After restore, `fabric-env` checks, in order:
 
 1. Does the snapshot `platform` equal this node's? If not, every cache path is treated as missing (a Linux `node_modules` is not a macOS one).
-2. For each `cache_path`: does it exist and is it non-empty?
+2. For each `cache_path`: does it exist, is it non-empty, and is it absent from the snapshot's `partial_caches` (ADR 0004)? A cache the secret policy punched a hole in counts as missing, however full it looks.
 3. If any is missing, run the `setup` steps with `when: CachesMissing` in order, in the workspace, with the node's environment plus the job's env var names resolved from the node's own secret source (v0: the user's shell environment on that node; the step fails with the missing names listed if any is absent). The steps run in the `fabric resume` process, not in the daemon, which is why the user's shell environment is available (ADR 0004, one writer).
 4. `Always` steps run on every resume.
 5. Compare detected tool versions to the spec; a mismatch is a warning in the resume output, not a failure.
