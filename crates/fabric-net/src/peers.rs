@@ -64,38 +64,90 @@ pub enum PeerBookError {
     Spec,
 }
 
-/// A host and port as the user pasted it: an IP address or a name resolved at dial time.
+/// A DNS name as the user pasted it: 1 to 253 bytes of letters, digits, dots and dashes.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct HostPort {
-    /// The host: an IPv4 or IPv6 address, or a DNS name such as a tailnet name.
-    pub host: String,
-    /// The port.
-    pub port: u16,
+pub struct DnsName(String);
+
+impl DnsName {
+    /// Returns the name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for DnsName {
+    type Err = PeerBookError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let ok = !s.is_empty()
+            && s.len() <= 253
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+        if ok {
+            Ok(Self(s.to_owned()))
+        } else {
+            Err(PeerBookError::Parse {
+                line: 1,
+                reason: format!("{s:?} is not a DNS name"),
+            })
+        }
+    }
+}
+
+impl fmt::Display for DnsName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Where a peer listens: an address, or a name resolved at dial time.
+///
+/// A parsed value is valid by construction: an address is a `SocketAddr`,
+/// scope id included, and a name is a `DnsName`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HostPort {
+    /// An IPv4 or IPv6 address with its port.
+    Addr(SocketAddr),
+    /// A DNS name, such as a tailnet name, with its port.
+    Name(DnsName, u16),
 }
 
 impl HostPort {
-    /// Returns the address directly when the host is an IP literal.
+    /// Returns the address when no name has to be resolved.
     #[must_use]
     pub fn socket_addr(&self) -> Option<SocketAddr> {
-        self.to_string().parse().ok()
+        match self {
+            HostPort::Addr(addr) => Some(*addr),
+            HostPort::Name(..) => None,
+        }
+    }
+
+    /// Returns the port.
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        match self {
+            HostPort::Addr(addr) => addr.port(),
+            HostPort::Name(_, port) => *port,
+        }
     }
 }
 
 impl From<SocketAddr> for HostPort {
-    fn from(addr: SocketAddr) -> Self {
-        Self {
-            host: addr.ip().to_string(),
-            port: addr.port(),
+    /// Keeps the scope id of an IPv6 address and drops its flow info, which has no text form.
+    fn from(mut addr: SocketAddr) -> Self {
+        if let SocketAddr::V6(v6) = &mut addr {
+            v6.set_flowinfo(0);
         }
+        Self::Addr(addr)
     }
 }
 
 impl fmt::Display for HostPort {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.host.contains(':') {
-            write!(f, "[{}]:{}", self.host, self.port)
-        } else {
-            write!(f, "{}:{}", self.host, self.port)
+        match self {
+            HostPort::Addr(addr) => write!(f, "{addr}"),
+            HostPort::Name(name, port) => write!(f, "{name}:{port}"),
         }
     }
 }
@@ -104,27 +156,16 @@ impl FromStr for HostPort {
     type Err = PeerBookError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Ok(addr) = s.parse::<SocketAddr>() {
+            return Ok(Self::Addr(addr));
+        }
         let bad = || PeerBookError::Parse {
             line: 1,
             reason: format!("{s:?} is not <host>:<port>"),
         };
-        if let Ok(addr) = s.parse::<SocketAddr>() {
-            return Ok(addr.into());
-        }
         let (host, port) = s.rsplit_once(':').ok_or_else(bad)?;
         let port: u16 = port.parse().map_err(|_| bad())?;
-        let host_ok = !host.is_empty()
-            && host.len() <= 253
-            && host
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
-        if !host_ok {
-            return Err(bad());
-        }
-        Ok(Self {
-            host: host.to_owned(),
-            port,
-        })
+        Ok(Self::Name(host.parse()?, port))
     }
 }
 
@@ -553,10 +594,22 @@ mod tests {
             Some("192.168.1.20:7777".parse().unwrap())
         );
         let spec: PeerSpec = format!("{id}@air.tail1234.ts.net:7777").parse().unwrap();
-        assert_eq!(spec.addr.host, "air.tail1234.ts.net");
+        assert!(
+            matches!(&spec.addr, HostPort::Name(name, 7777) if name.as_str() == "air.tail1234.ts.net")
+        );
         assert_eq!(spec.addr.socket_addr(), None);
         let spec: PeerSpec = format!("{id}@[fd7a::1]:7777").parse().unwrap();
         assert_eq!(spec.addr.to_string(), "[fd7a::1]:7777");
+        let spec: PeerSpec = format!("{id}@[fe80::1%5]:7777").parse().unwrap();
+        assert_eq!(
+            spec.addr.to_string(),
+            "[fe80::1%5]:7777",
+            "the scope id is kept"
+        );
+        assert!(matches!(
+            format!("{id}@bad host:7777").parse::<PeerSpec>(),
+            Err(PeerBookError::Parse { .. })
+        ));
         assert!(matches!(
             format!("{id}@no-port").parse::<PeerSpec>(),
             Err(PeerBookError::Parse { .. })

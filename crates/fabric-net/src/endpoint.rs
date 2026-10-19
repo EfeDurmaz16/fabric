@@ -107,16 +107,18 @@ impl Endpoint {
     ) -> Result<Dialed, TransportError> {
         let mut last = TransportError::NoAddress(peer);
         for host in addrs {
-            let resolved: Vec<SocketAddr> = match host.socket_addr() {
-                Some(addr) => vec![addr],
-                None => match tokio::net::lookup_host(host.to_string()).await {
-                    Ok(iter) => iter.collect(),
-                    Err(err) => {
-                        tracing::debug!(%host, error = %err, "name did not resolve");
-                        last = TransportError::Io(err);
-                        continue;
+            let resolved: Vec<SocketAddr> = match host {
+                HostPort::Addr(addr) => vec![*addr],
+                HostPort::Name(name, port) => {
+                    match tokio::net::lookup_host((name.as_str(), *port)).await {
+                        Ok(iter) => iter.collect(),
+                        Err(err) => {
+                            tracing::debug!(%host, error = %err, "name did not resolve");
+                            last = TransportError::Io(err);
+                            continue;
+                        }
                     }
-                },
+                }
             };
             for addr in resolved {
                 match self.dial(peer, addr).await {
