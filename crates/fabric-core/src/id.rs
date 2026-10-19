@@ -7,7 +7,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use ulid::Ulid;
 
 /// Why a text id did not parse.
@@ -229,8 +229,17 @@ impl FromStr for NodeId {
 ///
 /// It starts at one when the job is created and grows by exactly one on each
 /// `MoveImported` and `Stolen` record. It never repeats and never goes back.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// Zero does not exist, on the wire included: `Deserialize` goes through
+/// `Epoch::new`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Epoch(u64);
+
+impl<'de> Deserialize<'de> for Epoch {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let n = u64::deserialize(deserializer)?;
+        Epoch::new(n).ok_or_else(|| serde::de::Error::custom("epoch zero does not exist"))
+    }
+}
 
 impl Epoch {
     /// The epoch of the `Created` record.
@@ -345,6 +354,13 @@ mod base32 {
                 out.push(((buffer >> bits) & 0xff) as u8);
             }
         }
+        // The bits left over after the last whole byte must be zero, or two
+        // texts would decode to one value.
+        if bits > 0 && buffer & ((1 << bits) - 1) != 0 {
+            return Err(ParseIdError::BadChar {
+                index: text.len() - 1,
+            });
+        }
         Ok(out)
     }
 }
@@ -380,6 +396,16 @@ mod tests {
             "fab1AAAA".parse::<NodeId>(),
             Err(ParseIdError::BadChar { index: 0 })
         );
+        // The last character of a 52-character body carries four padding
+        // bits; only the spelling with those bits zero is the id's text form.
+        let text = NodeId::from_bytes([0xab; 32]).to_string();
+        let mut other = text.clone();
+        other.pop();
+        other.push('r');
+        assert_eq!(
+            other.parse::<NodeId>(),
+            Err(ParseIdError::BadChar { index: 51 })
+        );
     }
 
     #[test]
@@ -410,6 +436,10 @@ mod tests {
         assert_eq!(Epoch::new(1), Some(Epoch::FIRST));
         assert_eq!(Epoch::FIRST.next(), Some(Epoch(2)));
         assert_eq!(Epoch(u64::MAX).next(), None);
+        let zero = postcard::to_stdvec(&0u64).unwrap();
+        assert!(postcard::from_bytes::<Epoch>(&zero).is_err());
+        let one = postcard::to_stdvec(&1u64).unwrap();
+        assert_eq!(postcard::from_bytes::<Epoch>(&one).unwrap(), Epoch::FIRST);
     }
 
     #[test]
