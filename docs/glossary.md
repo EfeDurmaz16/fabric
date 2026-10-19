@@ -4,13 +4,15 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **ACP** (Agent Client Protocol). A JSON-RPC protocol for driving coding agents. Fabric uses it as the generic harness path. Methods Fabric cares about: `session/new`, `session/load`, `session/prompt`, `session/cancel`.
 
+**Arbiter.** The one node allowed to append a claim for a job: the node that wrote the latest `LeaseClaimed` or `LeaseReleased`, or the creator before any claim.
+
 **Blob.** Bytes stored by hash. Chunks and manifests are both blobs.
 
 **Catalog.** The SQLite database in a store that maps snapshot ids to manifests and chunk ids to on-disk files, and records which chunks each snapshot references.
 
 **Chunk.** A content-defined piece of a file produced by FastCDC, compressed with zstd and named by its blake3 hash.
 
-**Claim.** The act of a node taking the lease of a job at a new epoch.
+**Claim.** A request to the arbiter for a job's lease at the next epoch. The arbiter appends the `LeaseClaimed` record and the claimant copies it.
 
 **Epoch.** A counter on a job's lease. It increases by one on every claim. Any message or write carrying an older epoch than the current one is stale and is refused.
 

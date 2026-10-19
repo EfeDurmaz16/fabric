@@ -50,7 +50,8 @@ Rules:
 - Append only. No record is ever rewritten.
 - Hash chained. `prev` makes insertion in the middle detectable. This is cheap tamper evidence, not security against a malicious node.
 - Checksummed per record. On open, the reader walks forward; the first record whose checksum fails, or whose length runs past end of file, is a torn tail from a crash and is truncated. Everything before it is valid.
-- Fenced by epoch. A node accepts an event from a peer only if `event.epoch >= current_epoch` (ADR 0003).
+- Owned by one writer. Only the lease holder appends events. The one exception is `LeaseClaimed`, which the arbiter appends on the claimant's behalf (ADR 0003, Claim protocol). Every other node holds a replica: a byte-for-byte copy of the owner's records, in the owner's order.
+- Accepted from a peer only when it links. A replica appends a peer record only if `record.prev` equals the replica's head. Then a `LeaseClaimed` must carry `epoch == current_epoch + 1`, and every other kind must carry `epoch == current_epoch` and come from the node the manifest records as holder. A record whose `prev` does not match is answered with `Rejected { head }` and the sender fetches the missing suffix; if neither head is a prefix of the other the ledgers have forked and ADR 0003 says which chain wins. A record with any other epoch is answered with `StaleEpoch { yours, current }` and dropped.
 - Ordered by file position, not by `at` or by ULID. Clocks are not trusted for ordering.
 
 ### The job manifest

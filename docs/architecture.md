@@ -77,8 +77,10 @@ sequenceDiagram
     A->>A: release lease epoch 1
     U->>B: fabric resume job
     B->>A: fetch ledger head
-    B->>A: claim lease epoch 2
-    A-->>B: granted, epoch 1 fenced
+    B->>A: ClaimRequest (expected head)
+    A->>A: append LeaseClaimed epoch 2, fsync
+    A-->>B: Granted (the record)
+    B->>B: append the record
     B->>A: fetch missing chunks
     B->>B: restore workspace
     B->>B: materialize env if needed
@@ -91,13 +93,13 @@ Step by step, with the failure each step must survive:
 1. `fabric suspend <job>` on A. The harness adapter asks the agent to stop at a turn boundary and reports its state directory. If the agent cannot stop cleanly, suspend fails and nothing is written. The job stays live on A.
 2. A publishes a snapshot: chunk every file, write new chunks to a temp directory, `fsync`, rename into the store, insert the catalog rows in one SQLite transaction, write the manifest last. A crash before the manifest exists leaves orphan chunks and no snapshot. A crash after leaves a complete snapshot. There is no third state.
 3. A appends `SnapshotPublished` and `Suspended`, then `LeaseReleased { epoch: 1 }`. Each append is a checksummed record. A torn tail is truncated on open.
-4. `fabric resume <job>` on B. B reads A's ledger head. If the lease is `Held` and not expired, B refuses and says so. If it is `Released` or expired past the skew margin, B appends `LeaseClaimed { node: B, epoch: 2 }` and sends it to A. From then on A refuses any write, blob push or ledger append carrying epoch 1.
+4. `fabric resume <job>` on B. B fetches A's ledger head. If the lease is `Held`, B refuses and says which node holds it and until when. If it is `Released`, B sends `ClaimRequest { expected_head }` to A, the arbiter. A checks that the head matches and the lease is released, appends `LeaseClaimed { node: B, epoch: 2 }`, `fsync`s, and replies `Granted` with the record. B appends that record to its replica. From then on A refuses any write, blob push or ledger append carrying epoch 1. If `Granted` is lost, B sends the same request again and gets the same record back. If A is unreachable there is no claim; `fabric resume --force-expired` is the user's explicit way past that (ADR 0003).
 5. B fetches the manifest and only the chunks it lacks. Transfer is resumable: B asks per chunk id; a dropped connection restarts at the next missing chunk.
 6. B restores into a path chosen by policy, never by the user. Paths inside harness state that pointed at A's absolute workspace root are rewritten to B's. The restore writes into a temp directory and renames at the end, so a crash leaves no half workspace.
 7. If the snapshot's `platform` matches B and the cache paths restored, nothing runs. Otherwise `fabric-env` runs the `EnvSpec` setup steps (for example `pnpm install`).
 8. The harness adapter launches the agent against the restored state and appends `Resumed`.
 
-If B dies between steps 4 and 8, B holds the lease with epoch 2 and the job is not lost: the snapshot is still on A, the ledger says B claimed. Running `fabric resume` again on B replays steps 5 to 8 (all idempotent). Running it on A after the lease expires claims epoch 3. The old epoch-2 claim can never write again.
+If B dies between steps 4 and 8, B holds the lease with epoch 2 and the job is not lost: the snapshot is still on A, the ledger says B claimed. Running `fabric resume` again on B replays steps 5 to 8 (all idempotent). Nothing claims epoch 3 by itself: resuming on A instead needs `fabric resume --force-expired` after B's lease has expired, and the command prints what B may have left behind. Once epoch 3 exists, the epoch-2 claim can never write again.
 
 ## In scope now
 
