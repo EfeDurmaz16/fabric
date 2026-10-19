@@ -2,7 +2,9 @@
 //!
 //! Invariant: an id is a value, never a path, a hostname or a vendor session
 //! id. Every id has one text form that parses back to the same bytes, and
-//! every id serializes as its raw bytes so a ledger record stays small.
+//! every id serializes as its raw bytes so a ledger record stays small. The
+//! core makes no id itself: a ULID needs a clock and a random source, and
+//! both live at the edge, which hands the core the bytes.
 
 use std::fmt;
 use std::str::FromStr;
@@ -42,12 +44,6 @@ macro_rules! ulid_id {
         pub struct $name([u8; 16]);
 
         impl $name {
-            /// Makes a fresh id from the clock and the process random source.
-            #[must_use]
-            pub fn generate() -> Self {
-                Self(Ulid::generate().to_bytes())
-            }
-
             /// Wraps the 16 raw bytes of a ULID.
             #[must_use]
             pub const fn from_bytes(bytes: [u8; 16]) -> Self {
@@ -58,12 +54,6 @@ macro_rules! ulid_id {
             #[must_use]
             pub const fn to_bytes(self) -> [u8; 16] {
                 self.0
-            }
-
-            /// Returns the millisecond timestamp embedded in the id.
-            #[must_use]
-            pub const fn timestamp_ms(self) -> u64 {
-                Ulid::from_bytes(self.0).timestamp_ms()
             }
         }
 
@@ -426,7 +416,7 @@ mod tests {
     #[test]
     fn ulid_id_rejects_garbage() {
         assert_eq!("not-a-ulid".parse::<JobId>(), Err(ParseIdError::BadUlid));
-        let id = JobId::generate();
+        let id = JobId::from_bytes([0x01, 0x92, 0xa3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x7f]);
         assert_eq!(id.to_string().parse::<JobId>(), Ok(id));
     }
 

@@ -18,13 +18,16 @@
 //! use fabric_core::moves::{CompleteSnapshot, LeaseView, OfferAnswer};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let job = JobId::generate();
+//! // Ids are made at the edge; the core takes their bytes.
+//! let job = JobId::from_bytes([7; 16]);
+//! let mut next = 0u8;
+//! let mut event_id = || { next += 1; EventId::from_bytes([next; 16]) };
 //! let pro = NodeId::from_bytes([1; 32]);
 //! let air = NodeId::from_bytes([2; 32]);
 //! let now = 1_760_000_000_000;
 //!
 //! // The Pro creates the job and owns it at epoch 1.
-//! let created = Ledger::created(job, "fix the flaky test".into(), HarnessKind::ClaudeCode, pro, EventId::generate(), now)?;
+//! let created = Ledger::created(job, "fix the flaky test".into(), HarnessKind::ClaudeCode, pro, event_id(), now)?;
 //! let mut pro_store = MemoryStore::default();
 //! pro_store.append(&created)?;
 //! let mut on_pro = Ledger::open(job, &pro_store)?;
@@ -32,9 +35,9 @@
 //!
 //! // Suspend: publish a snapshot, then record the suspend.
 //! let snapshot = SnapshotId::of(b"manifest bytes");
-//! let published = on_pro.propose(pro, EventKind::SnapshotPublished { snapshot, parent: None }, EventId::generate(), now)?;
+//! let published = on_pro.propose(pro, EventKind::SnapshotPublished { snapshot, parent: None }, event_id(), now)?;
 //! on_pro.commit(&mut pro_store, published, Author::Node(pro))?;
-//! let suspended = on_pro.propose(pro, EventKind::Suspended { snapshot }, EventId::generate(), now)?;
+//! let suspended = on_pro.propose(pro, EventKind::Suspended { snapshot }, event_id(), now)?;
 //! on_pro.commit(&mut pro_store, suspended, Author::Node(pro))?;
 //!
 //! // The Air got the Created record when the job was made and verifies every
@@ -44,7 +47,7 @@
 //! let mut on_air = Ledger::open(job, &air_store)?;
 //!
 //! // Step 3: the Pro commits to departing. From here it is not runnable.
-//! let started = on_pro.start_move(pro, air, MoveId::generate(), EventId::generate(), now)?;
+//! let started = on_pro.start_move(pro, air, MoveId::from_bytes([9; 16]), event_id(), now)?;
 //! on_pro.commit(&mut pro_store, started, Author::Node(pro))?;
 //! assert!(on_pro.runnable_by(pro).is_none());
 //! let offer = on_pro.offer(pro).expect("departing source has an offer");
@@ -56,7 +59,7 @@
 //!     on_air.commit(&mut air_store, checked, Author::Node(pro))?;
 //! }
 //! let complete = Some(CompleteSnapshot::new(snapshot));
-//! let decision = match on_air.answer_offer(air, &offer, on_pro.lease().epoch(), complete, EventId::generate(), now)? {
+//! let decision = match on_air.answer_offer(air, &offer, on_pro.lease().epoch(), complete, event_id(), now)? {
 //!     OfferAnswer::Import(record) => on_air.commit(&mut air_store, record, Author::Node(air))?.clone(),
 //!     other => panic!("expected an import, got {other:?}"),
 //! };

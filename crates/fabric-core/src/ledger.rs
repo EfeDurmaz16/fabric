@@ -1007,6 +1007,8 @@ fn steal_writer(owner: NodeId, by: NodeId, from: NodeId) -> Result<NodeId, Ledge
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
     use crate::id::EnvSpecId;
 
@@ -1015,7 +1017,15 @@ mod tests {
     }
 
     fn eid() -> EventId {
-        EventId::generate()
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let mut bytes = [0; 16];
+        bytes[8..].copy_from_slice(&n.to_be_bytes());
+        EventId::from_bytes(bytes)
+    }
+
+    fn mid(b: u8) -> MoveId {
+        MoveId::from_bytes([b; 16])
     }
 
     fn job() -> JobId {
@@ -1229,7 +1239,7 @@ mod tests {
     #[test]
     fn move_needs_a_suspended_head_and_another_node() {
         let mut ledger = new_ledger(node(1));
-        let move_id = MoveId::generate();
+        let move_id = mid(1);
         let err = append(
             &mut ledger,
             node(1),
@@ -1255,7 +1265,7 @@ mod tests {
 
     #[test]
     fn departing_accepts_only_the_targets_decision_for_the_open_move() {
-        let move_id = MoveId::generate();
+        let move_id = mid(1);
         let mut ledger = departing_ledger(node(1), node(2), move_id);
         assert!(!ledger.lease().runnable_by(node(1)));
         assert!(!ledger.lease().runnable_by(node(2)));
@@ -1263,7 +1273,7 @@ mod tests {
         let err = append(&mut ledger, node(1), EventKind::Note { text: "x".into() }).unwrap_err();
         assert!(matches!(err, LedgerError::Departing { target, .. } if target == node(2)));
 
-        let other = MoveId::generate();
+        let other = mid(2);
         let err = append(
             &mut ledger,
             node(2),
@@ -1335,7 +1345,7 @@ mod tests {
 
     #[test]
     fn import_hands_the_job_to_the_target_at_the_next_epoch() {
-        let move_id = MoveId::generate();
+        let move_id = mid(1);
         let mut ledger = departing_ledger(node(1), node(2), move_id);
         append(
             &mut ledger,
@@ -1357,7 +1367,7 @@ mod tests {
 
     #[test]
     fn abort_returns_the_job_to_the_source_at_the_same_epoch() {
-        let move_id = MoveId::generate();
+        let move_id = mid(1);
         let mut ledger = departing_ledger(node(1), node(2), move_id);
         append(&mut ledger, node(2), EventKind::MoveAborted { move_id }).unwrap();
         assert_eq!(
@@ -1375,9 +1385,7 @@ mod tests {
         let err = append(
             &mut ledger,
             node(2),
-            EventKind::MoveAborted {
-                move_id: MoveId::generate(),
-            },
+            EventKind::MoveAborted { move_id: mid(1) },
         )
         .unwrap_err();
         assert!(matches!(err, LedgerError::NoOpenMove));
@@ -1429,7 +1437,7 @@ mod tests {
 
     #[test]
     fn stolen_while_departing_is_written_by_the_thief() {
-        let move_id = MoveId::generate();
+        let move_id = mid(1);
         let mut ledger = departing_ledger(node(1), node(2), move_id);
         append(
             &mut ledger,
@@ -1547,7 +1555,7 @@ mod tests {
 
     #[test]
     fn replay_rebuilds_the_same_manifest() {
-        let move_id = MoveId::generate();
+        let move_id = mid(1);
         let mut ledger = departing_ledger(node(1), node(2), move_id);
         append(
             &mut ledger,

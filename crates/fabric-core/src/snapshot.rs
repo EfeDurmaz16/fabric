@@ -25,9 +25,6 @@ pub const MANIFEST_VERSION: u16 = 1;
 /// hostile peer, not a cap on snapshots.
 pub const MAX_MANIFEST_LEN: usize = 64 << 20;
 
-/// Files at or below this size are one object; larger files are chunked.
-pub const WHOLE_FILE_LIMIT: u64 = 8 << 20;
-
 /// Why a manifest was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {

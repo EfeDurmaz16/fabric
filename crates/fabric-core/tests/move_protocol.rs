@@ -138,7 +138,7 @@ impl World {
             "goal".into(),
             HarnessKind::ClaudeCode,
             ids[0],
-            EventId::generate(),
+            EventId::from_bytes([0; 16]),
             1,
         )?;
         let mut nodes = Vec::with_capacity(NODES);
@@ -165,6 +165,14 @@ impl World {
         self.at
     }
 
+    /// A fresh id from the world's counter; the edge would use a ULID.
+    fn next_id(&mut self) -> [u8; 16] {
+        let n = self.tick();
+        let mut bytes = [0; 16];
+        bytes[8..].copy_from_slice(&n.to_be_bytes());
+        bytes
+    }
+
     fn index_of(&self, id: NodeId) -> Fallible<usize> {
         self.nodes
             .iter()
@@ -181,8 +189,9 @@ impl World {
 
     fn append_local(&mut self, node: usize, kind: EventKind) -> Fallible {
         let at = self.tick();
+        let id = EventId::from_bytes(self.next_id());
         let n = &mut self.nodes[node];
-        let record = n.ledger.propose(n.id, kind, EventId::generate(), at)?;
+        let record = n.ledger.propose(n.id, kind, id, at)?;
         self.commit_own(node, record)
     }
 
@@ -285,13 +294,12 @@ impl World {
         let me = self.nodes[src].id;
         let target = self.nodes[dst].id;
         let at = self.tick();
-        match self.nodes[src].ledger.start_move(
-            me,
-            target,
-            MoveId::generate(),
-            EventId::generate(),
-            at,
-        ) {
+        let move_id = MoveId::from_bytes(self.next_id());
+        let id = EventId::from_bytes(self.next_id());
+        match self.nodes[src]
+            .ledger
+            .start_move(me, target, move_id, id, at)
+        {
             Ok(record) => {
                 self.commit_own(src, record)?;
                 assert!(!self.nodes[src].owns(), "source runnable after MoveStarted");
@@ -320,10 +328,8 @@ impl World {
             && target == me
         {
             let at = self.tick();
-            match self.nodes[node]
-                .ledger
-                .answer_abort(me, move_id, EventId::generate(), at)
-            {
+            let id = EventId::from_bytes(self.next_id());
+            match self.nodes[node].ledger.answer_abort(me, move_id, id, at) {
                 Ok(AbortAnswer::Abort(record)) => {
                     self.commit_own(node, record)?;
                 }
@@ -384,10 +390,8 @@ impl World {
             Msg::Abort { from, to, move_id } => {
                 let me = self.nodes[to].id;
                 let at = self.tick();
-                match self.nodes[to]
-                    .ledger
-                    .answer_abort(me, move_id, EventId::generate(), at)
-                {
+                let id = EventId::from_bytes(self.next_id());
+                match self.nodes[to].ledger.answer_abort(me, move_id, id, at) {
                     Ok(AbortAnswer::Abort(record)) => {
                         self.commit_own(to, record.clone())?;
                         self.reply(to, from, &record);
@@ -426,15 +430,11 @@ impl World {
         let me = self.nodes[to].id;
         let current = self.nodes[to].ledger.lease().epoch();
         let at = self.tick();
+        let id = EventId::from_bytes(self.next_id());
         let complete = snapshot_complete.then_some(CompleteSnapshot::new(offer.snapshot));
-        let answer = self.nodes[to].ledger.answer_offer(
-            me,
-            &offer,
-            epoch,
-            complete,
-            EventId::generate(),
-            at,
-        )?;
+        let answer = self.nodes[to]
+            .ledger
+            .answer_offer(me, &offer, epoch, complete, id, at)?;
         if epoch < current && self.nodes[to].ledger.decision_for(offer.move_id).is_none() {
             assert!(
                 matches!(answer, OfferAnswer::Stale { .. }),
@@ -493,10 +493,10 @@ impl World {
             .filter(|_| snapshot_complete)
             .map(CompleteSnapshot::new);
         let at = self.tick();
-        let result =
-            self.nodes[thief]
-                .ledger
-                .steal(me, "test".into(), complete, EventId::generate(), at);
+        let id = EventId::from_bytes(self.next_id());
+        let result = self.nodes[thief]
+            .ledger
+            .steal(me, "test".into(), complete, id, at);
         match result {
             Ok(proposal) => {
                 assert!(snapshot_complete);
