@@ -10,7 +10,7 @@ publish = false
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
-missing_docs = "warn"
+missing_docs = "deny"
 
 # clippy::all stays at its defaults: setting it to warn would demote
 # clippy::correctness from deny to warn.
@@ -24,14 +24,15 @@ pedantic = { level = "warn", priority = -1 }
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 # Restriction lints that back the project rules. clippy.toml allows unwrap,
-# expect, panic and print inside tests.
-unwrap_used = "warn"
-expect_used = "warn"
+# expect, panic and print inside tests. A local `cargo clippy` without
+# `-D warnings` reports the same errors as CI.
+unwrap_used = "deny"
+expect_used = "deny"
 panic = "deny"
 unreachable = "deny"
 todo = "deny"
 unimplemented = "deny"
-dbg_macro = "warn"
+dbg_macro = "deny"
 print_stdout = "deny"
 print_stderr = "deny"
 exit = "deny"
