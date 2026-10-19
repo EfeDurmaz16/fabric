@@ -55,10 +55,13 @@ fn kind() -> impl Strategy<Value = EventKind> {
             proptest::option::of(any::<[u8; 32]>()),
             "[a-z]{1,8}"
         )
-            .prop_map(|(n, s, cmd)| EventKind::Resumed {
+            .prop_map(|(n, s, program)| EventKind::Resumed {
                 node: n,
                 snapshot: s.map(SnapshotId::from_bytes),
-                harness: HarnessKind::Acp { command: cmd }
+                harness: HarnessKind::Acp {
+                    program,
+                    args: vec!["acp".into()],
+                },
             }),
         any::<[u8; 32]>().prop_map(|e| EventKind::EnvSpecChanged {
             env_spec: EnvSpecId::from_bytes(e)

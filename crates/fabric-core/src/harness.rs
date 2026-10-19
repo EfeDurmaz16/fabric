@@ -17,10 +17,12 @@ pub enum HarnessKind {
     ClaudeCode,
     /// Codex through `codex exec resume`.
     Codex,
-    /// Any agent that speaks the Agent Client Protocol, started by `command`.
+    /// Any agent that speaks the Agent Client Protocol, started as `program` with `args`.
     Acp {
-        /// The command that starts the agent.
-        command: String,
+        /// The program that starts the agent, looked up on `PATH`, never through a shell.
+        program: String,
+        /// Its arguments, passed as they are.
+        args: Vec<String>,
     },
 }
 
@@ -29,7 +31,13 @@ impl fmt::Display for HarnessKind {
         match self {
             HarnessKind::ClaudeCode => f.write_str("claude-code"),
             HarnessKind::Codex => f.write_str("codex"),
-            HarnessKind::Acp { command } => write!(f, "acp:{command}"),
+            HarnessKind::Acp { program, args } => {
+                write!(f, "acp:{program}")?;
+                for arg in args {
+                    write!(f, " {arg}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -54,10 +62,11 @@ mod tests {
         assert_eq!(HarnessKind::Codex.to_string(), "codex");
         assert_eq!(
             HarnessKind::Acp {
-                command: "opencode".into()
+                program: "opencode".into(),
+                args: vec!["acp".into()],
             }
             .to_string(),
-            "acp:opencode"
+            "acp:opencode acp"
         );
     }
 }

@@ -1,8 +1,8 @@
 //! The environment spec, version 0 (ADR 0007).
 //!
-//! Invariant: a spec names things and never holds a secret value. Setup
-//! commands are argument vectors, never shell strings. The spec's identity is
-//! the hash of its canonical bytes, so an edit is a new spec.
+//! Invariant: a spec names things and never holds a secret value. A setup
+//! command is a program and its arguments, never a shell string. The spec's
+//! identity is the hash of its canonical bytes, so an edit is a new spec.
 
 use serde::{Deserialize, Serialize};
 
@@ -19,12 +19,6 @@ pub enum EnvSpecError {
     /// The bytes carry a version this crate does not know.
     #[error("environment spec version {0} is not supported")]
     UnknownVersion(u16),
-    /// A setup step has no command.
-    #[error("setup step {index} has an empty argv")]
-    EmptyArgv {
-        /// Zero-based index of the step.
-        index: usize,
-    },
     /// The bytes do not decode, or the value does not encode.
     #[error("environment spec codec: {0}")]
     Codec(#[from] CodecError),
@@ -66,8 +60,10 @@ pub enum ToolSource {
 /// One command that materialize runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetupStep {
-    /// The program and its arguments, run directly without a shell.
-    pub argv: Vec<String>,
+    /// The program to run, looked up on `PATH`, never through a shell.
+    pub program: String,
+    /// Its arguments, passed as they are.
+    pub args: Vec<String>,
     /// The directory to run in, relative to the root; `None` is the root itself.
     pub cwd: Option<RelPath>,
     /// When the step runs.
@@ -93,25 +89,14 @@ impl From<VersionedError> for EnvSpecError {
 }
 
 impl EnvSpec {
-    /// Checks the spec's own rules.
-    pub fn validate(&self) -> Result<(), EnvSpecError> {
-        if let Some(index) = self.setup.iter().position(|s| s.argv.is_empty()) {
-            return Err(EnvSpecError::EmptyArgv { index });
-        }
-        Ok(())
-    }
-
-    /// Returns the canonical bytes of a valid spec: the version, then the fields.
+    /// Returns the canonical bytes of the spec: the version, then the fields.
     pub fn encode(&self) -> Result<Vec<u8>, EnvSpecError> {
-        self.validate()?;
         Ok(codec::encode_versioned(ENV_SPEC_VERSION, self)?)
     }
 
-    /// Decodes bytes written by `encode`, refusing other versions, and checks the spec.
+    /// Decodes bytes written by `encode`, refusing other versions.
     pub fn decode(bytes: &[u8]) -> Result<Self, EnvSpecError> {
-        let spec: EnvSpec = codec::decode_versioned(bytes, ENV_SPEC_VERSION)?;
-        spec.validate()?;
-        Ok(spec)
+        Ok(codec::decode_versioned(bytes, ENV_SPEC_VERSION)?)
     }
 
     /// Returns the spec's identity: blake3 of its canonical bytes.
@@ -132,7 +117,8 @@ mod tests {
                 source: ToolSource::Detected,
             }],
             setup: vec![SetupStep {
-                argv: vec!["npm".into(), "ci".into()],
+                program: "npm".into(),
+                args: vec!["ci".into()],
                 cwd: None,
                 when: RunWhen::CachesMissing,
             }],
@@ -154,20 +140,6 @@ mod tests {
     fn decode_round_trips() {
         let bytes = spec().encode().unwrap();
         assert_eq!(EnvSpec::decode(&bytes).unwrap(), spec());
-    }
-
-    #[test]
-    fn empty_argv_is_refused() {
-        let mut s = spec();
-        s.setup.push(SetupStep {
-            argv: vec![],
-            cwd: None,
-            when: RunWhen::Always,
-        });
-        assert!(matches!(
-            s.encode(),
-            Err(EnvSpecError::EmptyArgv { index: 1 })
-        ));
     }
 
     #[test]
