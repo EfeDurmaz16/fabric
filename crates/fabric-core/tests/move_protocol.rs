@@ -460,11 +460,15 @@ impl World {
         Ok(())
     }
 
+    /// A decision is accepted when it links; the only refusal the protocol
+    /// allows is `PrevMismatch`, for a receipt already applied or a chain that
+    /// a steal forked. Any other refusal is a bug in the rules.
     fn deliver_decision(&mut self, from: usize, to: usize, frame: &[u8]) -> Fallible {
         let writer = self.nodes[from].id;
-        if let Ok(record) = self.nodes[to].ledger.verify(frame, writer) {
-            return self.nodes[to].commit(record, Author::Node(writer));
-        }
+        let err = match self.nodes[to].ledger.verify(frame, writer) {
+            Ok(record) => return self.nodes[to].commit(record, Author::Node(writer)),
+            Err(err) => err,
+        };
         let decoded = Record::decode(frame)?;
         let move_id = match &decoded.event().kind {
             EventKind::MoveImported { move_id, .. } | EventKind::MoveAborted { move_id } => {
@@ -476,7 +480,11 @@ impl World {
         let forked = self.steals > 0;
         assert!(
             already || forked,
-            "a fresh decision on a common chain was refused"
+            "a fresh decision on a common chain was refused: {err}"
+        );
+        assert!(
+            matches!(err, LedgerError::PrevMismatch { .. }),
+            "a duplicate or forked decision was refused for another reason: {err}"
         );
         Ok(())
     }
@@ -782,4 +790,54 @@ fn abort_after_import_returns_the_import() {
     assert!(world.nodes[0].ledger.decision_for(imported).is_some());
     world.check_invariants(false).unwrap();
     world.settle().unwrap();
+}
+
+/// ADR 0003, The steal: the stolen-from owner is offered the `Stolen` record,
+/// accepts it through the writer rule because the thief wrote it, learns the
+/// higher epoch and is fenced; its old token is stale everywhere.
+#[test]
+fn an_owner_that_receives_stolen_through_verify_is_fenced() {
+    let mut world = run(
+        &[
+            Op::Suspend { node: 0 },
+            Op::Sync { from: 0, to: 1 },
+            Op::Steal {
+                thief: 1,
+                snapshot_complete: true,
+            },
+        ],
+        true,
+    )
+    .unwrap();
+    assert!(
+        world.nodes[0].owns(),
+        "the owner has not heard of the steal"
+    );
+    assert!(world.nodes[1].owns(), "the thief owns at epoch 2");
+    let old_token = world.nodes[0]
+        .ledger
+        .runnable_by(world.nodes[0].id)
+        .unwrap();
+    let stolen = world.nodes[1].ledger.records().last().unwrap().clone();
+    assert!(matches!(stolen.event().kind, EventKind::Stolen { .. }));
+    let thief = world.nodes[1].id;
+    assert!(
+        world.nodes[0]
+            .ledger
+            .verify(stolen.bytes(), world.nodes[0].id)
+            .is_err(),
+        "a Stolen record is accepted only from the thief"
+    );
+    let checked = world.nodes[0].ledger.verify(stolen.bytes(), thief).unwrap();
+    world.nodes[0].commit(checked, Author::Node(thief)).unwrap();
+    assert!(!world.nodes[0].owns(), "the old owner is fenced");
+    assert_eq!(
+        world.nodes[0].ledger.fence(old_token),
+        Err(FenceError::StaleEpoch {
+            yours: Epoch::FIRST,
+            current: Epoch::FIRST.next().unwrap()
+        })
+    );
+    assert_eq!(world.nodes[0].ledger.lease(), world.nodes[1].ledger.lease());
+    world.check_invariants(true).unwrap();
 }
