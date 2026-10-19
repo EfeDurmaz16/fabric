@@ -365,19 +365,22 @@ fn step_dir(root: &Path, index: usize, step: &SetupStep) -> Result<PathBuf, Mate
     Ok(dir)
 }
 
-/// Finds `program` in the entries of `PATH` that lie outside the workspace.
+/// Finds `program` in the entries of `PATH` that resolve outside the workspace.
 ///
 /// A restored workspace must not supply its own `pnpm`, so relative entries
 /// such as `.` and absolute ones under `root`, such as a
-/// `node_modules/.bin` a shell hook added, are skipped.
+/// `node_modules/.bin` a shell hook added, are skipped, and so is a
+/// candidate that is a link back into the workspace from an outside
+/// directory, such as `~/.local/bin/pnpm -> <root>/node_modules/.bin/pnpm`.
 fn find_on_path(path: Option<&OsStr>, root: &Path, program: &ProgramName) -> Option<PathBuf> {
     env::split_paths(path?)
         .filter(|dir| dir.is_absolute())
         .filter(|dir| !fs::canonicalize(dir).is_ok_and(|dir| dir.starts_with(root)))
         .map(|dir| dir.join(program.as_str()))
         .find(|candidate| {
-            fs::metadata(candidate)
-                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            fs::canonicalize(candidate).is_ok_and(|resolved| !resolved.starts_with(root))
+                && fs::metadata(candidate)
+                    .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
         })
 }
 
@@ -526,7 +529,8 @@ mod tests {
     }
 
     /// A restored workspace that ships its own `pnpm` must not have it run,
-    /// whether `PATH` names the workspace by a relative or an absolute entry.
+    /// whether `PATH` names the workspace by a relative entry, an absolute
+    /// one, or an outside directory whose `pnpm` is a link back into it.
     #[test]
     fn a_program_inside_the_workspace_is_never_found() {
         let root = tempfile::tempdir().unwrap();
@@ -537,9 +541,20 @@ mod tests {
         executable(&root.join("pnpm"));
         executable(&elsewhere.join("bin/pnpm"));
         fs::write(elsewhere.join("bin/cargo"), "not executable").unwrap();
+        fs::create_dir(elsewhere.join("links")).unwrap();
+        std::os::unix::fs::symlink(
+            root.join("node_modules/.bin/pnpm"),
+            elsewhere.join("links/pnpm"),
+        )
+        .unwrap();
         let pnpm = ProgramName::parse("pnpm").unwrap();
 
-        let inside = env::join_paths([root.join("node_modules/.bin"), PathBuf::from(".")]).unwrap();
+        let inside = env::join_paths([
+            root.join("node_modules/.bin"),
+            PathBuf::from("."),
+            elsewhere.join("links"),
+        ])
+        .unwrap();
         assert_eq!(find_on_path(Some(&inside), &root, &pnpm), None);
 
         let both =
