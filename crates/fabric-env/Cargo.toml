@@ -1,0 +1,15 @@
+[package]
+name = "fabric-env"
+version = "0.1.0"
+description = "Environment of a Fabric job: EnvSpec detection, the override file, the secret policy and materialization"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+fabric-core = { path = "../fabric-core" }
+thiserror = "2.0"
+
+[lints]
+workspace = true
