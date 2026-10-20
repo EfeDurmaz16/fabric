@@ -8,14 +8,18 @@
 //! a slow answer never holds up another.
 
 use std::collections::BTreeSet;
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use fabric_core::BoxFuture;
 use fabric_core::id::{ChunkId, NodeId};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::time::timeout;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::time::{Instant, Sleep, timeout};
 
 use crate::frame::{FrameError, MAX_BULK_FRAME, MAX_CONTROL_FRAME, read_frame, write_frame};
 use crate::transport::{Connection, Stream, TransportError, TransportKind};
@@ -98,6 +102,9 @@ pub enum RpcError {
     /// The peer understood the request and could not serve it.
     #[error("the peer could not serve the request: {0}")]
     Fault(Fault),
+    /// An earlier error ended this chunk stream; ask for `missing` in a new request.
+    #[error("the chunk stream already failed; ask for the missing chunks again")]
+    Interrupted,
 }
 
 /// What a node does with the requests a peer sends; `Hello` and `WantChunks` never reach it.
@@ -355,9 +362,10 @@ impl Session {
 
     /// Asks for a batch of chunks; each one arrives through the returned stream, verified.
     ///
-    /// `idle` bounds the wait for each chunk, not the whole batch. On any
-    /// error the caller keeps what arrived, asks `ChunkStream::missing` what
-    /// did not, and sends a new batch, on this session or a new one.
+    /// `idle` bounds the time without any byte arriving, not the time for a
+    /// chunk or the batch, so a slow link that keeps moving is never cut. On
+    /// any error the caller keeps what arrived, asks `ChunkStream::missing`
+    /// what did not, and sends a new batch, on this session or a new one.
     pub async fn want_chunks(
         &self,
         batch: ChunkBatch,
@@ -373,12 +381,7 @@ impl Session {
         let recv = timeout(idle, send_request(self.connection.as_ref(), &request))
             .await
             .map_err(|_| RpcError::Deadline(idle))??;
-        Ok(ChunkStream {
-            recv,
-            id,
-            wanted,
-            idle,
-        })
+        Ok(ChunkStream::new(recv, id, wanted, idle))
     }
 
     /// Answers the peer's requests with `service` until the connection ends.
@@ -396,12 +399,66 @@ impl Session {
     }
 }
 
+/// A reader that fails with `TimedOut` once `idle` passes with no byte arriving.
+struct IdleReader {
+    inner: Box<dyn AsyncRead + Send + Unpin>,
+    limit: Duration,
+    timer: Pin<Box<Sleep>>,
+}
+
+impl IdleReader {
+    fn new(inner: Box<dyn AsyncRead + Send + Unpin>, limit: Duration) -> Self {
+        Self {
+            inner,
+            limit,
+            timer: Box::pin(tokio::time::sleep(limit)),
+        }
+    }
+}
+
+impl AsyncRead for IdleReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                if buf.filled().len() > before {
+                    let next = Instant::now() + self.limit;
+                    self.timer.as_mut().reset(next);
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => match self.timer.as_mut().poll(cx) {
+                Poll::Ready(()) => Poll::Ready(Err(io::ErrorKind::TimedOut.into())),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+}
+
+/// Where a chunk stream is: reading, done, or ended by an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Progress {
+    Open,
+    Done,
+    Broken,
+}
+
 /// The chunks of one `WantChunks` request as they arrive.
+///
+/// The first error ends the stream: it may have stopped inside a frame, so
+/// every later `next` returns `Interrupted` instead of reading payload
+/// bytes as a frame header.
 pub struct ChunkStream {
-    recv: Box<dyn AsyncRead + Send + Unpin>,
+    recv: IdleReader,
     id: RequestId,
     wanted: BTreeSet<ChunkId>,
     idle: Duration,
+    progress: Progress,
 }
 
 impl std::fmt::Debug for ChunkStream {
@@ -409,19 +466,50 @@ impl std::fmt::Debug for ChunkStream {
         f.debug_struct("ChunkStream")
             .field("request", &self.id)
             .field("missing", &self.wanted.len())
+            .field("progress", &self.progress)
             .finish_non_exhaustive()
     }
 }
 
 impl ChunkStream {
+    fn new(
+        recv: Box<dyn AsyncRead + Send + Unpin>,
+        id: RequestId,
+        wanted: BTreeSet<ChunkId>,
+        idle: Duration,
+    ) -> Self {
+        Self {
+            recv: IdleReader::new(recv, idle),
+            id,
+            wanted,
+            idle,
+            progress: Progress::Open,
+        }
+    }
+
     /// Returns the next verified chunk, or `None` once the peer sent every asked chunk.
     pub async fn next(&mut self) -> Result<Option<(ChunkId, Vec<u8>)>, RpcError> {
-        let body = timeout(
-            self.idle,
-            read_response(self.recv.as_mut(), self.id, MAX_BULK_FRAME),
-        )
-        .await
-        .map_err(|_| RpcError::Deadline(self.idle))??;
+        match self.progress {
+            Progress::Open => {}
+            Progress::Done => return Ok(None),
+            Progress::Broken => return Err(RpcError::Interrupted),
+        }
+        let next = self.read_one().await;
+        self.progress = match &next {
+            Ok(Some(_)) => Progress::Open,
+            Ok(None) => Progress::Done,
+            Err(_) => Progress::Broken,
+        };
+        next
+    }
+
+    async fn read_one(&mut self) -> Result<Option<(ChunkId, Vec<u8>)>, RpcError> {
+        let body = match read_response(&mut self.recv, self.id, MAX_BULK_FRAME).await {
+            Err(RpcError::Frame(FrameError::Io(err))) if err.kind() == io::ErrorKind::TimedOut => {
+                return Err(RpcError::Deadline(self.idle));
+            }
+            other => other?,
+        };
         match body {
             ResponseBody::Chunk { id, bytes } => {
                 if !self.wanted.remove(&id) {
@@ -515,4 +603,80 @@ async fn handle(peer: NodeId, stream: Stream, service: &dyn Service) -> Result<(
     }
     send.shutdown().await.map_err(FrameError::Io)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const IDLE: Duration = Duration::from_millis(150);
+
+    fn frame(body: ResponseBody) -> Vec<u8> {
+        let payload = encode(&Response {
+            id: RequestId(1),
+            body,
+        })
+        .unwrap();
+        let mut bytes = u32::try_from(payload.len() + 1)
+            .unwrap()
+            .to_le_bytes()
+            .to_vec();
+        bytes.push(crate::frame::FRAME_VERSION);
+        bytes.extend_from_slice(&payload);
+        bytes
+    }
+
+    fn stream_over(recv: tokio::io::DuplexStream, ids: &[ChunkId]) -> ChunkStream {
+        ChunkStream::new(
+            Box::new(recv),
+            RequestId(1),
+            ids.iter().copied().collect(),
+            IDLE,
+        )
+    }
+
+    /// `idle` is the time without a byte, so a chunk that takes many idle
+    /// periods to arrive over a slow but moving link is not cut.
+    #[tokio::test]
+    async fn a_slow_chunk_that_keeps_moving_arrives() {
+        let bytes = vec![7u8; 256 << 10];
+        let id = ChunkId::of(&bytes);
+        let (mut send, recv) = tokio::io::duplex(1 << 20);
+        let mut stream = stream_over(recv, &[id]);
+        let wire = [
+            frame(ResponseBody::Chunk {
+                id,
+                bytes: bytes.clone(),
+            }),
+            frame(ResponseBody::ChunksDone),
+        ]
+        .concat();
+        tokio::spawn(async move {
+            for piece in wire.chunks(wire.len() / 16) {
+                tokio::time::sleep(IDLE / 3).await;
+                send.write_all(piece).await.unwrap();
+            }
+        });
+        let started = Instant::now();
+        assert_eq!(stream.next().await.unwrap(), Some((id, bytes)));
+        assert!(started.elapsed() > IDLE * 4, "the link was not slow");
+        assert!(stream.next().await.unwrap().is_none());
+    }
+
+    /// A stream that failed inside a frame never reads again.
+    #[tokio::test]
+    async fn a_stalled_stream_fails_once_and_then_stays_failed() {
+        let id = ChunkId::of(b"x");
+        let (mut send, recv) = tokio::io::duplex(1 << 10);
+        let mut stream = stream_over(recv, &[id]);
+        let whole = frame(ResponseBody::Chunk {
+            id,
+            bytes: b"x".to_vec(),
+        });
+        send.write_all(&whole[..3]).await.unwrap();
+        assert!(matches!(stream.next().await, Err(RpcError::Deadline(d)) if d == IDLE));
+        send.write_all(&whole[3..]).await.unwrap();
+        assert!(matches!(stream.next().await, Err(RpcError::Interrupted)));
+        assert_eq!(stream.missing().collect::<Vec<_>>(), [id]);
+    }
 }
