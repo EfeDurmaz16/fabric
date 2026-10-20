@@ -142,18 +142,25 @@ pub struct Hello {
 
 impl Hello {
     /// Builds a `Hello` for this protocol version with the clock read now.
+    ///
+    /// A session reads the clock again when it sends the hello, so a hello
+    /// built once and reused reports the clock of the moment it is sent.
     #[must_use]
     pub fn now(node: NodeId, fabric_version: VersionText) -> Self {
-        let clock_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
         Self {
             node,
             protocol_version: PROTOCOL_VERSION,
             fabric_version,
-            clock_ms,
+            clock_ms: wall_clock_ms(),
         }
     }
+}
+
+/// This node's wall clock in milliseconds since the Unix epoch; zero before 1970.
+pub(crate) fn wall_clock_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// The number of a request within one session; the response repeats it.

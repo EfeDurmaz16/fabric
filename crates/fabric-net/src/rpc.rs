@@ -33,6 +33,7 @@ use crate::transport::{Connection, Stream, TransportError, TransportKind};
 use crate::wire::{
     ChunkBatch, Fault, FaultText, Hello, JobRequest, JobResponse, ManifestChunks, PROTOCOL_VERSION,
     Request, RequestBody, RequestId, Response, ResponseBody, WireError, decode, encode,
+    wall_clock_ms,
 };
 
 /// A clock difference between two nodes above this is logged at `Hello`.
@@ -138,6 +139,7 @@ pub struct Session {
     connection: Arc<dyn Connection>,
     local: Hello,
     remote: Hello,
+    clock_skew_ms: i64,
     next_id: AtomicU64,
 }
 
@@ -204,12 +206,18 @@ async fn read_response(
 
 impl Session {
     /// Runs the dialer's half of the handshake: sends `local`, expects the peer's `Hello`.
+    ///
+    /// `local`'s clock is read again as it is sent.
     pub async fn connect(
         connection: Box<dyn Connection>,
         local: Hello,
         deadline: Duration,
     ) -> Result<Session, RpcError> {
         let connection: Arc<dyn Connection> = Arc::from(connection);
+        let local = Hello {
+            clock_ms: wall_clock_ms(),
+            ..local
+        };
         let request = Request {
             id: RequestId(0),
             budget_ms: budget(deadline),
@@ -218,18 +226,20 @@ impl Session {
         let exchange = async {
             let mut recv = send_request(connection.as_ref(), &request).await?;
             match read_response(recv.as_mut(), RequestId(0), MAX_CONTROL_FRAME).await? {
-                ResponseBody::Hello(remote) => Ok(remote),
+                ResponseBody::Hello(remote) => Ok((remote, wall_clock_ms())),
                 ResponseBody::Fault(fault) => Err(RpcError::Fault(fault)),
                 other => Err(unexpected("hello", &other)),
             }
         };
-        let remote = timeout(deadline, exchange)
+        let (remote, received_ms) = timeout(deadline, exchange)
             .await
             .map_err(|_| RpcError::Deadline(deadline))??;
-        Self::finish(connection, local, remote)
+        Self::finish(connection, local, remote, received_ms)
     }
 
     /// Runs the acceptor's half of the handshake: expects the peer's `Hello` first, answers with `local`.
+    ///
+    /// `local`'s clock is read again as it is sent.
     pub async fn accept(
         connection: Box<dyn Connection>,
         local: Hello,
@@ -240,6 +250,11 @@ impl Session {
             let (mut send, mut recv) = connection.next().await?.split();
             let bytes = read_frame(&mut recv, MAX_CONTROL_FRAME).await?;
             let request: Request = decode(&bytes)?;
+            let received_ms = wall_clock_ms();
+            let local = Hello {
+                clock_ms: received_ms,
+                ..local
+            };
             let (body, remote) = match request.body {
                 RequestBody::Hello(remote) => (ResponseBody::Hello(local.clone()), Some(remote)),
                 _ => (
@@ -251,18 +266,21 @@ impl Session {
             };
             reply(send.as_mut(), request.id, body, MAX_CONTROL_FRAME).await?;
             send.shutdown().await.map_err(FrameError::Io)?;
-            remote.ok_or(RpcError::NotAHello)
+            let remote = remote.ok_or(RpcError::NotAHello)?;
+            Ok::<_, RpcError>((local, remote, received_ms))
         };
-        let remote = timeout(deadline, exchange)
+        let (local, remote, received_ms) = timeout(deadline, exchange)
             .await
             .map_err(|_| RpcError::Deadline(deadline))??;
-        Self::finish(connection, local, remote)
+        Self::finish(connection, local, remote, received_ms)
     }
 
+    /// Checks the peer's `Hello` against the handshake; the skew is its clock against ours when it arrived.
     fn finish(
         connection: Arc<dyn Connection>,
         local: Hello,
         remote: Hello,
+        received_ms: u64,
     ) -> Result<Session, RpcError> {
         let proved = connection.peer();
         if remote.node != proved {
@@ -279,15 +297,17 @@ impl Session {
                 theirs: remote.protocol_version,
             });
         }
+        let theirs = i64::try_from(remote.clock_ms).unwrap_or(i64::MAX);
+        let ours = i64::try_from(received_ms).unwrap_or(i64::MAX);
         let session = Session {
             connection,
             local,
             remote,
+            clock_skew_ms: theirs.saturating_sub(ours),
             next_id: AtomicU64::new(1),
         };
-        let skew = session.clock_skew_ms();
-        if skew.unsigned_abs() > CLOCK_SKEW_WARN_MS {
-            tracing::warn!(peer = %session.peer(), skew_ms = skew, "peer clock differs");
+        if session.clock_skew_ms.unsigned_abs() > CLOCK_SKEW_WARN_MS {
+            tracing::warn!(peer = %session.peer(), skew_ms = session.clock_skew_ms, "peer clock differs");
         }
         tracing::info!(peer = %session.peer(), kind = %session.kind(), "session open");
         Ok(session)
@@ -323,12 +343,10 @@ impl Session {
         self.connection.remote_addr()
     }
 
-    /// The peer's clock minus this node's, in milliseconds, as read at `Hello`.
+    /// The peer's clock when it sent its `Hello` minus this node's clock when it arrived, in milliseconds.
     #[must_use]
     pub fn clock_skew_ms(&self) -> i64 {
-        let remote = i64::try_from(self.remote.clock_ms).unwrap_or(i64::MAX);
-        let local = i64::try_from(self.local.clock_ms).unwrap_or(i64::MAX);
-        remote.saturating_sub(local)
+        self.clock_skew_ms
     }
 
     /// The connection under the session, for bulk streams outside the request vocabulary.

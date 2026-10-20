@@ -196,6 +196,38 @@ async fn paired_nodes_exchange_hello_and_ping() -> TestResult {
     Ok(())
 }
 
+/// A daemon builds its hello once and reuses it; the clock goes out fresh,
+/// so a node up for an hour does not report an hour of skew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reused_hello_reports_the_clock_at_sending() -> TestResult {
+    let (a, b) = (Node::new()?, Node::new()?);
+    let server = b.bind(TransportKind::Quic, &[a.id()])?;
+    let client = a.bind(TransportKind::Quic, &[b.id()])?;
+    let an_hour_ago = |hello: &Hello| Hello {
+        clock_ms: hello.clock_ms - 3_600_000,
+        ..hello.clone()
+    };
+    let _serving = serve_one(
+        server.clone(),
+        an_hour_ago(&b.hello),
+        Arc::new(FakeService::new()),
+        None,
+    );
+    let session = connect(
+        client.as_ref(),
+        b.id(),
+        server.local_addr()?,
+        an_hour_ago(&a.hello),
+    )
+    .await?;
+    assert!(
+        session.clock_skew_ms().abs() < 5_000,
+        "skew {} ms",
+        session.clock_skew_ms()
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dial_to_the_wrong_node_id_fails_inside_the_handshake() -> TestResult {
     for kind in BOTH {
