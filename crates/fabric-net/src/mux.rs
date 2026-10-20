@@ -408,27 +408,16 @@ async fn pump_local(shared: Arc<Shared>, source: PipeReader, inbound: PipeWriter
         }
         id
     };
-    send_rest(&shared, id, source, stop_rx, &credit).await;
-}
-
-/// Sends a peer-opened stream's answers; its id and slot were registered when it arrived.
-async fn pump_peer(
-    shared: Arc<Shared>,
-    id: u32,
-    source: PipeReader,
-    stop: oneshot::Receiver<()>,
-    credit: Arc<Semaphore>,
-) {
-    send_rest(&shared, id, source, stop, &credit).await;
+    send_rest(shared, id, source, stop_rx, credit).await;
 }
 
 /// Frames what the stream's writer writes, within the stream's credit, until it finishes, the peer resets it, or the connection ends.
 async fn send_rest(
-    shared: &Shared,
+    shared: Arc<Shared>,
     id: u32,
     source: PipeReader,
     mut stop: oneshot::Receiver<()>,
-    credit: &Semaphore,
+    credit: Arc<Semaphore>,
 ) {
     loop {
         let taken = tokio::select! {
@@ -682,7 +671,7 @@ fn accept_stream(
             },
         );
     }
-    tokio::spawn(pump_peer(
+    tokio::spawn(send_rest(
         Arc::clone(shared),
         id,
         outbound_reader,
