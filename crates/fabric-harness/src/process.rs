@@ -25,15 +25,14 @@ use fabric_core::env::EnvVarName;
 use tokio::process::{Child, Command};
 
 use crate::error::HarnessError;
-use crate::harness::Io;
+use crate::harness::{Installed, Io};
 
 /// How long a version probe may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Looks `name` up on the given `PATH` value, as a shell would.
 #[must_use]
-pub(crate) fn find_on_path(name: &str, path_var: Option<&OsStr>) -> Option<PathBuf> {
-    let path_var = path_var?;
+pub(crate) fn find_on_path(name: &str, path_var: &OsStr) -> Option<PathBuf> {
     std::env::split_paths(path_var)
         .map(|dir| dir.join(name))
         .find(|candidate| is_executable(candidate))
@@ -64,6 +63,21 @@ pub(crate) async fn probe(binary: &Path, args: &[&str]) -> Result<String, Harnes
             source,
         })?;
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Asks `binary` for its version; `None` when there is no binary. A
+/// binary that answers with no version in its output is still installed,
+/// with `version` set to `None`.
+pub(crate) async fn detect(binary: Option<PathBuf>) -> Result<Option<Installed>, HarnessError> {
+    let Some(path) = binary else {
+        return Ok(None);
+    };
+    let raw = probe(&path, &["--version"]).await?;
+    Ok(Some(Installed {
+        version: version_token(&raw).map(str::to_owned),
+        raw,
+        path,
+    }))
 }
 
 /// Returns the first token of `output` that looks like `digits.digits...`.
@@ -327,10 +341,10 @@ mod tests {
         let plain = dir.path().join("tool");
         std::fs::write(&plain, "#!/bin/sh\n").unwrap();
         let var = std::env::join_paths([dir.path()]).unwrap();
-        assert_eq!(find_on_path("tool", Some(&var)), None);
+        assert_eq!(find_on_path("tool", &var), None);
         std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(find_on_path("tool", Some(&var)), Some(plain));
-        assert_eq!(find_on_path("tool", None), None);
+        assert_eq!(find_on_path("tool", &var), Some(plain));
+        assert_eq!(find_on_path("tool", OsStr::new("")), None);
     }
 
     #[tokio::test]

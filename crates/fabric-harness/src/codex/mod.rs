@@ -77,7 +77,7 @@ pub struct Codex {
     home: PathBuf,
     store: PathBuf,
     binary: Option<PathBuf>,
-    path_var: Option<OsString>,
+    path_var: OsString,
     overrides: Option<CodexOverrides>,
 }
 
@@ -177,14 +177,15 @@ fn toml_quoted_key(root: &Path) -> Result<String, HarnessError> {
 }
 
 impl Codex {
-    /// An adapter whose state lives under `home/.codex`.
+    /// An adapter whose state lives under `home/.codex`, finding `codex`
+    /// on the `PATH` value `path_var`.
     #[must_use]
-    pub fn new(home: PathBuf) -> Self {
+    pub fn new(home: PathBuf, path_var: OsString) -> Self {
         Codex {
             store: home.join(".codex"),
             home,
             binary: None,
-            path_var: std::env::var_os("PATH"),
+            path_var,
             overrides: None,
         }
     }
@@ -209,13 +210,6 @@ impl Codex {
         self
     }
 
-    /// Looks `codex` up on this `PATH` value instead of the process's.
-    #[must_use]
-    pub fn with_path_var(mut self, path_var: OsString) -> Self {
-        self.path_var = Some(path_var);
-        self
-    }
-
     /// Settings passed as `-c` overrides on every run; a cold resume does
     /// not restore them (H2, experiment E3).
     #[must_use]
@@ -228,10 +222,8 @@ impl Codex {
         if let Some(binary) = &self.binary {
             return Ok(binary.clone());
         }
-        process::find_on_path(PROGRAM, self.path_var.as_deref()).ok_or_else(|| {
-            HarnessError::NotInstalled {
-                program: PROGRAM.to_owned(),
-            }
+        process::find_on_path(PROGRAM, &self.path_var).ok_or_else(|| HarnessError::NotInstalled {
+            program: PROGRAM.to_owned(),
         })
     }
 
@@ -529,22 +521,7 @@ impl Codex {
     }
 
     async fn detect_impl(&self) -> Result<Option<Installed>, HarnessError> {
-        let path = match self.binary() {
-            Ok(path) => path,
-            Err(HarnessError::NotInstalled { .. }) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        let raw = process::probe(&path, &["--version"]).await?;
-        let version =
-            process::version_token(&raw).ok_or_else(|| HarnessError::UnexpectedVersionOutput {
-                program: PROGRAM.to_owned(),
-                output: raw.clone(),
-            })?;
-        Ok(Some(Installed {
-            path,
-            version: Some(version.to_owned()),
-            raw,
-        }))
+        process::detect(self.binary().ok()).await
     }
 
     /// The argument list for `launch`, without the binary.
@@ -657,12 +634,13 @@ mod tests {
 
     #[test]
     fn args_follow_the_cli_surface_and_quote_the_root() {
-        let adapter = Codex::new(PathBuf::from("/h")).with_overrides(CodexOverrides {
-            sandbox: overrides::SandboxMode::WorkspaceWrite,
-            approval: overrides::ApprovalPolicy::OnRequest,
-            model: Some(crate::harness::ModelName::parse("o3").unwrap()),
-            effort: Some(overrides::Effort::High),
-        });
+        let adapter =
+            Codex::new(PathBuf::from("/h"), OsString::new()).with_overrides(CodexOverrides {
+                sandbox: overrides::SandboxMode::WorkspaceWrite,
+                approval: overrides::ApprovalPolicy::OnRequest,
+                model: Some(crate::harness::ModelName::parse("o3").unwrap()),
+                effort: Some(overrides::Effort::High),
+            });
         let root = Path::new("/h/fabric/jobs/j/work");
         let session = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
         let resume = Launch::Resume {

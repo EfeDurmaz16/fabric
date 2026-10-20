@@ -199,7 +199,7 @@ impl Drop for Held {
 /// The adapter for `home`, finding the fake `claude` kept under it.
 fn node(home: &Path) -> ClaudeCode {
     let (_, path_var) = fake_claude(home);
-    ClaudeCode::new(home.to_path_buf()).with_path_var(path_var)
+    ClaudeCode::new(home.to_path_buf(), path_var)
 }
 
 fn session() -> SessionId {
@@ -803,12 +803,10 @@ async fn launch_resumes_in_the_workspace_with_exactly_the_given_env() {
     std::fs::create_dir_all(&work).unwrap();
     let (_script, bin_dir) = fake_claude(&home);
     let log = home.join("log.txt");
-    let adapter = ClaudeCode::new(home.clone())
-        .with_path_var(bin_dir.clone())
-        .with_flags(LaunchFlags {
-            permission_mode: Some(PermissionMode::AcceptEdits),
-            ..LaunchFlags::default()
-        });
+    let adapter = ClaudeCode::new(home.clone(), bin_dir.clone()).with_flags(LaunchFlags {
+        permission_mode: Some(PermissionMode::AcceptEdits),
+        ..LaunchFlags::default()
+    });
 
     let installed = adapter.detect().await.unwrap().unwrap();
     assert_eq!(installed.version.as_deref(), Some("2.1.294"));

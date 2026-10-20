@@ -63,7 +63,7 @@ pub struct ClaudeCode {
     config_dir: PathBuf,
     config_json: PathBuf,
     binary: Option<PathBuf>,
-    path_var: Option<OsString>,
+    path_var: OsString,
     flags: LaunchFlags,
 }
 
@@ -87,15 +87,17 @@ struct SessionRecord {
 }
 
 impl ClaudeCode {
-    /// An adapter whose state lives under `home/.claude` and `home/.claude.json`.
+    /// An adapter whose state lives under `home/.claude` and
+    /// `home/.claude.json`, finding `claude` on the `PATH` value `path_var`
+    /// (the CLI passes the one it launches with, never this process's own).
     #[must_use]
-    pub fn new(home: PathBuf) -> Self {
+    pub fn new(home: PathBuf, path_var: OsString) -> Self {
         ClaudeCode {
             config_dir: home.join(".claude"),
             config_json: home.join(".claude.json"),
             home,
             binary: None,
-            path_var: std::env::var_os("PATH"),
+            path_var,
             flags: LaunchFlags::default(),
         }
     }
@@ -104,13 +106,6 @@ impl ClaudeCode {
     #[must_use]
     pub fn with_binary(mut self, binary: PathBuf) -> Self {
         self.binary = Some(binary);
-        self
-    }
-
-    /// Looks `claude` up on this `PATH` value instead of the process's.
-    #[must_use]
-    pub fn with_path_var(mut self, path_var: OsString) -> Self {
-        self.path_var = Some(path_var);
         self
     }
 
@@ -125,10 +120,8 @@ impl ClaudeCode {
         if let Some(binary) = &self.binary {
             return Ok(binary.clone());
         }
-        process::find_on_path(PROGRAM, self.path_var.as_deref()).ok_or_else(|| {
-            HarnessError::NotInstalled {
-                program: PROGRAM.to_owned(),
-            }
+        process::find_on_path(PROGRAM, &self.path_var).ok_or_else(|| HarnessError::NotInstalled {
+            program: PROGRAM.to_owned(),
         })
     }
 
@@ -587,22 +580,7 @@ impl ClaudeCode {
     }
 
     async fn detect_impl(&self) -> Result<Option<Installed>, HarnessError> {
-        let path = match self.binary() {
-            Ok(path) => path,
-            Err(HarnessError::NotInstalled { .. }) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        let raw = process::probe(&path, &["--version"]).await?;
-        let version =
-            process::version_token(&raw).ok_or_else(|| HarnessError::UnexpectedVersionOutput {
-                program: PROGRAM.to_owned(),
-                output: raw.clone(),
-            })?;
-        Ok(Some(Installed {
-            path,
-            version: Some(version.to_owned()),
-            raw,
-        }))
+        process::detect(self.binary().ok()).await
     }
 
     /// The argument list for `launch`, without the binary. `session` is
@@ -751,10 +729,11 @@ mod tests {
 
     #[test]
     fn args_follow_the_cli_surface() {
-        let adapter = ClaudeCode::new(PathBuf::from("/h")).with_flags(LaunchFlags {
-            permission_mode: Some(flags::PermissionMode::AcceptEdits),
-            ..LaunchFlags::default()
-        });
+        let adapter =
+            ClaudeCode::new(PathBuf::from("/h"), OsString::new()).with_flags(LaunchFlags {
+                permission_mode: Some(flags::PermissionMode::AcceptEdits),
+                ..LaunchFlags::default()
+            });
         let session = SessionId::parse("9c9796f0-2682-4546-a963-d314b3ad543f").unwrap();
         let resume = Launch::Resume {
             session: session.clone(),

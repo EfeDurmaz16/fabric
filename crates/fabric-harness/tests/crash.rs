@@ -36,7 +36,7 @@ fn session() -> SessionId {
 /// The adapter for `home`, finding the fake `claude` kept under it.
 fn node(home: &Path) -> ClaudeCode {
     let (_, path_var) = fake_claude(home);
-    ClaudeCode::new(home.to_path_buf()).with_path_var(path_var)
+    ClaudeCode::new(home.to_path_buf(), path_var)
 }
 
 /// Moves `.claude` to `aside` and leaves a node where Claude is installed

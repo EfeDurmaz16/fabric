@@ -21,14 +21,6 @@ pub enum HarnessError {
         /// The program name that was looked up.
         program: String,
     },
-    /// The binary ran but its version output had no version in it.
-    #[error("{program} --version printed something unexpected: {output:?}")]
-    UnexpectedVersionOutput {
-        /// The program that was run.
-        program: String,
-        /// What it printed, trimmed.
-        output: String,
-    },
     /// The workspace path is not absolute or does not exist as a directory.
     #[error("workspace {path} is not an existing absolute directory")]
     BadWorkspace {

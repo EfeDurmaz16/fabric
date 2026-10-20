@@ -54,7 +54,7 @@ pub struct AcpHarness {
     home: PathBuf,
     state_dir: Option<PathBuf>,
     policy: PermissionPolicy,
-    path_var: Option<OsString>,
+    path_var: OsString,
 }
 
 /// An ACP agent this node started, with the client that owns its pipes.
@@ -79,17 +79,18 @@ impl std::fmt::Debug for AcpRunning {
 }
 
 impl AcpHarness {
-    /// An adapter for `program args...` under `home`, with no state
-    /// directory declared and the deny permission policy.
+    /// An adapter for `program args...` under `home`, finding the program
+    /// on the `PATH` value `path_var`, with no state directory declared and
+    /// the deny permission policy.
     #[must_use]
-    pub fn new(program: ProgramName, args: Vec<String>, home: PathBuf) -> Self {
+    pub fn new(program: ProgramName, args: Vec<String>, home: PathBuf, path_var: OsString) -> Self {
         AcpHarness {
             program,
             args,
             home,
             state_dir: None,
             policy: PermissionPolicy::Deny,
-            path_var: std::env::var_os("PATH"),
+            path_var,
         }
     }
 
@@ -113,15 +114,8 @@ impl AcpHarness {
         self
     }
 
-    /// Looks the agent up on this `PATH` value instead of the process's.
-    #[must_use]
-    pub fn with_path_var(mut self, path_var: OsString) -> Self {
-        self.path_var = Some(path_var);
-        self
-    }
-
     fn binary(&self) -> Result<PathBuf, HarnessError> {
-        process::find_on_path(self.program.as_str(), self.path_var.as_deref()).ok_or_else(|| {
+        process::find_on_path(self.program.as_str(), &self.path_var).ok_or_else(|| {
             HarnessError::NotInstalled {
                 program: self.program.to_string(),
             }
@@ -290,16 +284,7 @@ impl AcpHarness {
     }
 
     async fn detect_impl(&self) -> Result<Option<Installed>, HarnessError> {
-        let Some(path) = process::find_on_path(self.program.as_str(), self.path_var.as_deref())
-        else {
-            return Ok(None);
-        };
-        let raw = process::probe(&path, &["--version"]).await?;
-        Ok(Some(Installed {
-            version: process::version_token(&raw).map(str::to_owned),
-            raw,
-            path,
-        }))
+        process::detect(self.binary().ok()).await
     }
 
     /// Starts the agent, completes the handshake, continues or creates the
