@@ -2,7 +2,7 @@
 
 Status: accepted, 2026-10-19
 
-Amended 2026-10-20 after the first implementation (`crates/fabric-harness`, branch `feat/harness`) and its reviews: the trait section and the record of what shipped are superseded by [ADR 0013](0013-harness-trait-as-built.md), and two statements of fact are corrected in place.
+Amended 2026-10-20 after the first implementation (`crates/fabric-harness`, branch `feat/harness`) and its reviews: the trait section is superseded by [ADR 0013](0013-harness-trait-as-built.md), and four statements of fact are corrected in place.
 
 Amended 2026-10-19 after step 1 research. The section on the two first adapters now records the exact surfaces the research settled on (`2026-10-19-step1-design-input.md`, sections 1.1, 1.2, 5.3, 5.4 and decisions D13 to D17, D20, D21, D26 to D28; `step1/H1-claude-code.md`, sections 1, 6, 10 and 11; `step1/H2-codex.md`, sections 7, 9, 10 and 13; `step1/H6-environment-and-triggers.md`, section 2.4): Claude through its CLI, Codex through `codex exec resume` first and the app-server only behind a capability probe, no per-job config directories, overlays passed as flags, trust pre-seeded on the target, the harness's own tombstone written during capture, and the credential and licence rules. The trait did not change. References to the root rule now point at ADR 0011.
 
@@ -16,7 +16,7 @@ Fabric's core must not know any of this. If it does, every vendor release is a c
 
 ### The `Harness` trait
 
-Superseded on 2026-10-20 by [ADR 0013](0013-harness-trait-as-built.md), which records the trait as built: where it lives, its five methods, the manifest, and the restore rule. Three parts of the original text still hold.
+Superseded on 2026-10-20 by [ADR 0013](0013-harness-trait-as-built.md), which records the trait as built: where it lives, its six methods, the manifest, and the restore rule. Three parts of the original text still hold.
 
 - `HarnessKind = ClaudeCode | Codex | Acp { program: ProgramName, args: [String] }`. The program is a bare name (no slash, no NUL, no leading `-`, not empty) looked up on `PATH`, never run through a shell (review amendments, 2026-10-19).
 - The harness is chosen at runtime from the ledger (`--harness codex` on a job created under Claude Code), so the core holds a `Box<dyn Harness>`, and the methods return `BoxFuture`, defined in `fabric-core` (ADR 0005), because native `async fn` in a trait is not dyn compatible on the pinned toolchain. The core stores what `capture` produced as the `harness_state` tree of the snapshot (ADR 0004) and never opens it.
@@ -94,10 +94,6 @@ When roots differ, which no v0 path allows for Claude Code, the adapter rewrites
 
 `fabric resume <job> --harness codex` on a job captured under Claude Code cannot load Claude's native state into Codex. What it can do is produce a neutral brief (goal, recent decisions from the ledger, `git log` and `git status` of the restored workspace, the last user turn if the source adapter exposes it) and start the new harness with that brief as its first prompt. This is the same text-handoff shape T3 Code uses and it loses tool state and approvals. It is listed as a later experiment. Fabric does not claim it works until a measured test says how much is lost.
 
-### What the first implementation shipped (2026-10-20)
-
-Superseded by [ADR 0013](0013-harness-trait-as-built.md), which records the code as built, what was verified against the installed binaries and what still needs a live run.
-
 ## Alternatives considered
 
 1. **Drive agents through their SDKs** (Claude Agent SDK, Codex app-server as a hosted service). Both carry terms that restrict third-party hosting and login use (landscape section 8.1). Fabric runs the user's own CLI under the user's own login on the user's own machines, which is the path the research reads as allowed. SDK coupling is also the fastest way to a core release per vendor release. Rejected for the core; an adapter may use an SDK internally if its terms allow.
@@ -109,8 +105,8 @@ Superseded by [ADR 0013](0013-harness-trait-as-built.md), which records the code
 
 - Adding a harness is one module and one feature flag. No core change.
 - A vendor changing its state layout breaks one adapter's tests, not the system.
-- `detect` returning `None` is a normal answer and the CLI explains it ("no Claude Code session found for this workspace").
-- Adapter tests are integration tests against the real CLI when installed, skipped with a clear message when it is not. Property tests cover redaction over arbitrary JSON, including the byte-identical signed block property above; path rewriting has none because no rewrite exists in this phase (ADR 0011).
+- `detect` returning `None` is a normal answer and the CLI explains it ("no Claude Code session found for this workspace"). Corrected 2026-10-20: `detect` only says whether the binary is installed; finding a session is `latest_session` (ADR 0013).
+- Adapter tests are integration tests against the real CLI when installed, skipped with a clear message when it is not. Corrected 2026-10-20: every adapter test runs against fixtures and fake binaries; the real CLIs are exercised on the two-Mac gate (ADR 0013). Property tests cover redaction over arbitrary JSON, including the byte-identical signed block property above; path rewriting has none because no rewrite exists in this phase (ADR 0011).
 
 ## Open questions
 
