@@ -458,9 +458,8 @@ fn list_tree(base: &Path) -> Result<Listing, CaptureError> {
 }
 
 /// Counts of what the policy did under one cache root.
-#[derive(Default)]
 struct CacheSeen {
-    class: Option<CacheClass>,
+    class: CacheClass,
     carried: u64,
     denied: u64,
     excluded: u64,
@@ -524,37 +523,40 @@ impl Capturer<'_> {
             seen: HashMap::new(),
         };
         for item in found {
-            let classification = policy.classify(&item.rel, &mut markers);
+            let class = policy.classify(&item.rel, &mut markers);
             if item.kind == FoundKind::Dir {
                 // A directory travels on its own when the walker listed it
                 // and nothing denies it, so an empty directory is not lost.
-                if classification.class.carried() {
+                if class.carried() {
                     emitted_dirs.insert(item.rel.clone());
                     entries.push(self.entry_for(base, &item)?);
                 }
                 continue;
             }
-            let seen = classification.cache_root.as_ref().map(|(root, class)| {
-                let seen = caches.entry(root.clone()).or_default();
-                seen.class = Some(*class);
-                seen
+            let seen = class.cache_root().map(|root| {
+                caches.entry(root.path.clone()).or_insert(CacheSeen {
+                    class: root.class,
+                    carried: 0,
+                    denied: 0,
+                    excluded: 0,
+                })
             });
-            match classification.class {
-                Class::Secret => {
+            match class {
+                Class::Secret { .. } => {
                     if let Some(seen) = seen {
                         seen.denied += 1;
                     }
                     self.report.denied.push(item.rel);
                     continue;
                 }
-                Class::Excluded => {
+                Class::Excluded { .. } => {
                     if let Some(seen) = seen {
                         seen.excluded += 1;
                     }
                     self.report.excluded.push(item.rel);
                     continue;
                 }
-                Class::Deps | Class::Build | Class::ToolCache | Class::Precious => {
+                Class::Cache(_) | Class::Precious => {
                     if let Some(seen) = seen {
                         seen.carried += 1;
                     }
@@ -582,7 +584,6 @@ impl Capturer<'_> {
         entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
         let mut cache_entries = Vec::new();
         for (path, seen) in caches {
-            let Some(class) = seen.class else { continue };
             let carry = if seen.carried == 0 {
                 CarryState::NotCarried
             } else if seen.denied > 0 || seen.excluded > 0 {
@@ -591,9 +592,9 @@ impl Capturer<'_> {
                 CarryState::Carried
             };
             cache_entries.push(CacheEntry {
-                key: self.req.carry_keys.key(class, &path),
+                key: self.req.carry_keys.key(seen.class, &path),
                 path,
-                class,
+                class: seen.class,
                 carry,
             });
         }

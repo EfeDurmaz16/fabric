@@ -166,19 +166,30 @@ pub enum PolicyError {
     },
 }
 
-/// The class a path gets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A cache directory and the class of everything under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheRoot {
+    /// The directory, relative to the workspace root.
+    pub path: RelPath,
+    /// Its class.
+    pub class: CacheClass,
+}
+
+/// The class a path gets, with the cache directory it lies under when there is one.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Class {
     /// Matches a secret pattern; never carried.
-    Secret,
+    Secret {
+        /// The cache directory the path lies under.
+        under: Option<CacheRoot>,
+    },
     /// Matches a pattern in `.fabricignore`; not carried for this job.
-    Excluded,
-    /// Below a dependency directory.
-    Deps,
-    /// Below a build output directory.
-    Build,
-    /// Below a tool cache.
-    ToolCache,
+    Excluded {
+        /// The cache directory the path lies under.
+        under: Option<CacheRoot>,
+    },
+    /// Below a dependency, build output or tool cache directory; carried.
+    Cache(CacheRoot),
     /// Ignored by git and nobody's cache: the user's work.
     Precious,
 }
@@ -186,18 +197,19 @@ pub enum Class {
 impl Class {
     /// True when bytes of this class travel in a snapshot.
     #[must_use]
-    pub const fn carried(self) -> bool {
-        !matches!(self, Class::Secret | Class::Excluded)
+    pub const fn carried(&self) -> bool {
+        !matches!(self, Class::Secret { .. } | Class::Excluded { .. })
     }
-}
 
-/// What the policy says about one path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Classification {
-    /// The class.
-    pub class: Class,
-    /// The cache directory the path lies under, when it does.
-    pub cache_root: Option<(RelPath, CacheClass)>,
+    /// The cache directory the path lies under, whatever its class.
+    #[must_use]
+    pub const fn cache_root(&self) -> Option<&CacheRoot> {
+        match self {
+            Class::Secret { under } | Class::Excluded { under } => under.as_ref(),
+            Class::Cache(root) => Some(root),
+            Class::Precious => None,
+        }
+    }
 }
 
 /// A glob over one or more path components; `*` and `?` never cross a slash.
@@ -365,7 +377,7 @@ impl IgnorePolicy {
     }
 
     /// Classifies one ignored path; `markers` says which tool files sit where.
-    pub fn classify(&self, path: &RelPath, markers: &mut dyn Markers) -> Classification {
+    pub fn classify(&self, path: &RelPath, markers: &mut dyn Markers) -> Class {
         let comps: Vec<&str> = path.as_str().split('/').collect();
         let cache = (0..comps.len()).find_map(|i| {
             self.cache_class_at(&comps, i, markers)
@@ -374,7 +386,7 @@ impl IgnorePolicy {
         let cache_root = cache.and_then(|(i, class)| {
             RelPath::parse(&comps[..=i].join("/"))
                 .ok()
-                .map(|root| (root, class))
+                .map(|path| CacheRoot { path, class })
         });
         let secret = (0..comps.len()).any(|j| {
             let narrow = cache.is_some_and(|(i, _)| j > i);
@@ -385,19 +397,13 @@ impl IgnorePolicy {
             };
             list.iter().any(|p| p.matches_at(&comps, j))
         });
-        let class = if secret {
-            Class::Secret
+        if secret {
+            Class::Secret { under: cache_root }
         } else if (0..comps.len()).any(|j| self.excludes.iter().any(|p| p.matches_at(&comps, j))) {
-            Class::Excluded
+            Class::Excluded { under: cache_root }
         } else {
-            match cache {
-                Some((_, CacheClass::Deps)) => Class::Deps,
-                Some((_, CacheClass::Build)) => Class::Build,
-                Some((_, CacheClass::ToolCache)) => Class::ToolCache,
-                None => Class::Precious,
-            }
-        };
-        Classification { class, cache_root }
+            cache_root.map_or(Class::Precious, Class::Cache)
+        }
     }
 
     /// Returns the full secret list and the excludes as gitignore lines, for `core.excludesFile`.
@@ -439,8 +445,19 @@ mod tests {
         RelPath::parse(s).unwrap()
     }
 
+    fn cache(path: &str, class: CacheClass) -> Class {
+        Class::Cache(CacheRoot {
+            path: rel(path),
+            class,
+        })
+    }
+
+    fn is_secret(class: &Class) -> bool {
+        matches!(class, Class::Secret { .. })
+    }
+
     /// Classifies in a workspace whose only tool files are `pkg/a/Cargo.toml` and `web/package.json`.
-    fn classify(p: &IgnorePolicy, path: &str) -> Classification {
+    fn classify(p: &IgnorePolicy, path: &str) -> Class {
         let mut markers = |dir: &str, name: &str| {
             matches!(
                 (dir, name),
@@ -474,7 +491,7 @@ mod tests {
             "Credentials.json",
             "home/.SSH/config",
         ] {
-            assert_eq!(classify(&p, path).class, Class::Secret, "{path}");
+            assert!(is_secret(&classify(&p, path)), "{path}");
             assert!(p.denies_anywhere(&rel(path)), "{path}");
         }
     }
@@ -482,29 +499,36 @@ mod tests {
     #[test]
     fn classes_in_order() {
         let p = IgnorePolicy::default();
-        assert_eq!(classify(&p, ".env").class, Class::Secret);
-        assert_eq!(classify(&p, "config/.aws/credentials").class, Class::Secret);
-        assert_eq!(classify(&p, ".docker/config.json").class, Class::Secret);
+        for secret in [
+            ".env",
+            "config/.aws/credentials",
+            ".docker/config.json",
+            "home/.docker/config.json",
+        ] {
+            assert!(is_secret(&classify(&p, secret)), "{secret}");
+        }
+        assert_eq!(classify(&p, "home/.docker/other.json"), Class::Precious);
         assert_eq!(
-            classify(&p, "home/.docker/config.json").class,
-            Class::Secret
+            classify(&p, "node_modules/x/index.js"),
+            cache("node_modules", CacheClass::Deps)
         );
         assert_eq!(
-            classify(&p, "home/.docker/other.json").class,
-            Class::Precious
+            classify(&p, "pkg/a/target/debug/x"),
+            cache("pkg/a/target", CacheClass::Build)
         );
-        assert_eq!(classify(&p, "node_modules/x/index.js").class, Class::Deps);
-        assert_eq!(classify(&p, "pkg/a/target/debug/x").class, Class::Build);
         assert_eq!(
-            classify(&p, "src/__pycache__/m.pyc").class,
-            Class::ToolCache
+            classify(&p, "src/__pycache__/m.pyc"),
+            cache("src/__pycache__", CacheClass::ToolCache)
         );
-        assert_eq!(classify(&p, "web/out/index.html").class, Class::Build);
-        assert_eq!(classify(&p, "web/OUT/index.html").class, Class::Build);
         assert_eq!(
-            classify(&p, "docs/assessment/notes.md").class,
-            Class::Precious
+            classify(&p, "web/out/index.html"),
+            cache("web/out", CacheClass::Build)
         );
+        assert_eq!(
+            classify(&p, "web/OUT/index.html"),
+            cache("web/OUT", CacheClass::Build)
+        );
+        assert_eq!(classify(&p, "docs/assessment/notes.md"), Class::Precious);
     }
 
     #[test]
@@ -517,36 +541,33 @@ mod tests {
             "data/.cache/model.bin",
             "vendor/blob.bin",
         ] {
-            let found = classify(&p, path);
-            assert_eq!(found.class, Class::Precious, "{path}");
-            assert_eq!(found.cache_root, None, "{path}");
+            assert_eq!(classify(&p, path), Class::Precious, "{path}");
         }
-        assert_eq!(
-            classify(&p, "pkg/a/target/debug/x").cache_root,
-            Some((rel("pkg/a/target"), CacheClass::Build))
-        );
         let mut widened = p.clone();
         widened.add_cache_dir(CacheClass::Build, "out");
         assert_eq!(
-            classify(&widened, "experiments/out/result.csv").class,
-            Class::Build
+            classify(&widened, "experiments/out/result.csv"),
+            cache("experiments/out", CacheClass::Build)
         );
     }
 
     #[test]
     fn narrow_list_under_a_cache_and_full_list_under_precious() {
         let p = IgnorePolicy::default();
-        let under_cache = classify(&p, "node_modules/pkg/test/fixtures/cert.pem");
-        assert_eq!(under_cache.class, Class::Deps);
         assert_eq!(
-            under_cache.cache_root,
-            Some((rel("node_modules"), CacheClass::Deps))
+            classify(&p, "node_modules/pkg/test/fixtures/cert.pem"),
+            cache("node_modules", CacheClass::Deps)
         );
-        assert_eq!(classify(&p, "node_modules/pkg/.env").class, Class::Secret);
-        assert_eq!(classify(&p, "data/cert.pem").class, Class::Secret);
+        assert!(is_secret(&classify(&p, "node_modules/pkg/.env")));
+        assert!(is_secret(&classify(&p, "data/cert.pem")));
         assert_eq!(
-            classify(&p, "pkg/node_modules/x/.npmrc").cache_root,
-            Some((rel("pkg/node_modules"), CacheClass::Deps))
+            classify(&p, "pkg/node_modules/x/.npmrc"),
+            Class::Secret {
+                under: Some(CacheRoot {
+                    path: rel("pkg/node_modules"),
+                    class: CacheClass::Deps,
+                }),
+            }
         );
     }
 
@@ -560,11 +581,14 @@ mod tests {
         .unwrap();
         let mut p = IgnorePolicy::default();
         assert_eq!(p.load_fabricignore(dir.path()).unwrap(), 2);
-        assert_eq!(classify(&p, "experiments/out/a.csv").class, Class::Excluded);
-        assert_eq!(classify(&p, "x/notes.bak").class, Class::Excluded);
-        assert_eq!(classify(&p, "x/notes.txt").class, Class::Precious);
+        assert_eq!(
+            classify(&p, "experiments/out/a.csv"),
+            Class::Excluded { under: None }
+        );
+        assert_eq!(classify(&p, "x/notes.bak"), Class::Excluded { under: None });
+        assert_eq!(classify(&p, "x/notes.txt"), Class::Precious);
         p.add_secret_pattern("*.secret").unwrap();
-        assert_eq!(classify(&p, "node_modules/a/b.secret").class, Class::Secret);
+        assert!(is_secret(&classify(&p, "node_modules/a/b.secret")));
         assert!(p.gitignore_lines().contains("**/.docker/config.json\n"));
         assert!(p.gitignore_lines().contains("*.bak\n"));
         assert!(p.add_exclude("/abs").is_err());
