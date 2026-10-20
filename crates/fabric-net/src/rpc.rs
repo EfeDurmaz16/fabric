@@ -461,10 +461,16 @@ impl Session {
         Ok(ChunkStream::new(recv, id, wanted, idle))
     }
 
-    /// Answers the peer's requests with `service` until the connection ends.
-    pub async fn serve(&self, service: Arc<dyn Service>) -> Result<(), RpcError> {
+    /// Answers the peer's requests with `service` until the connection ends, and returns why it ended.
+    ///
+    /// It never ends otherwise. A connection either side closed comes back
+    /// as `RpcError::Transport(TransportError::Closed(_))`.
+    pub async fn serve(&self, service: Arc<dyn Service>) -> RpcError {
         loop {
-            let stream = self.connection.next().await?;
+            let stream = match self.connection.next().await {
+                Ok(stream) => stream,
+                Err(err) => return err.into(),
+            };
             let peer = self.peer();
             let service = service.clone();
             tokio::spawn(async move {

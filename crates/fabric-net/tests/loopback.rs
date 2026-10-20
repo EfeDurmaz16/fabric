@@ -152,9 +152,9 @@ fn serve_one(
         let connection = Arc::from(transport.accept().await?);
         let session = Session::accept(connection, local, version, DEADLINE).await?;
         match stop {
-            None => session.serve(service).await,
+            None => Err(session.serve(service).await),
             Some(mut stop) => tokio::select! {
-                served = session.serve(service) => served,
+                ended = session.serve(service) => Err(ended),
                 _ = stop.recv() => {
                     session.close();
                     Ok(())
