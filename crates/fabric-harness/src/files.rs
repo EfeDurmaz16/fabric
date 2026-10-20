@@ -116,7 +116,8 @@ fn copy_file(src: &Path, dst: &Path) -> Result<u64, HarnessError> {
 
 /// Redacts a JSON-text file line by line while copying it. Paths are not
 /// mapped at capture; a line that is not JSON (a line cut by a crash) is
-/// kept as it is after a plain-text redaction pass.
+/// kept as it is after a plain-text redaction pass, and a line that is not
+/// UTF-8 (cut inside a multi-byte character) after the same pass on bytes.
 fn stage_json_text(
     src: &Path,
     dst: &Path,
@@ -128,29 +129,38 @@ fn stage_json_text(
     let input = fs::File::open(src).map_err(|e| HarnessError::io("read", src, e))?;
     let mut out = Vec::new();
     let mut reader = BufReader::new(input);
-    let mut line = String::new();
+    let mut line = Vec::new();
     let mut number = 0usize;
     loop {
         line.clear();
         let n = reader
-            .read_line(&mut line)
+            .read_until(b'\n', &mut line)
             .map_err(|e| HarnessError::io("read", src, e))?;
         if n == 0 {
             break;
         }
         number += 1;
-        let (body, newline) = match line.strip_suffix('\n') {
-            Some(b) => (b, "\n"),
-            None => (line.as_str(), ""),
+        let (body, newline): (&[u8], &[u8]) = match line.strip_suffix(b"\n") {
+            Some(b) => (b, b"\n"),
+            None => (&line, b""),
+        };
+        let Ok(body) = std::str::from_utf8(body) else {
+            warn!(path = %src.display(), line = number, "line is not UTF-8; kept as bytes");
+            let bytes = redactor
+                .apply_bytes(body, counts)
+                .unwrap_or_else(|| body.to_vec());
+            out.extend_from_slice(&bytes);
+            out.extend_from_slice(newline);
+            continue;
         };
         if body.trim().is_empty() {
-            out.extend_from_slice(line.as_bytes());
+            out.extend_from_slice(&line);
             continue;
         }
         match jsontext::transform(body, &PathMap::default(), Some(redactor)) {
             Ok(outcome) => {
                 out.extend_from_slice(outcome.text.as_deref().unwrap_or(body).as_bytes());
-                out.extend_from_slice(newline.as_bytes());
+                out.extend_from_slice(newline);
                 for (rule, n) in outcome.redactions {
                     *counts.entry(rule).or_insert(0) += n;
                 }
@@ -165,7 +175,7 @@ fn stage_json_text(
                     .apply(body, counts)
                     .unwrap_or_else(|| body.to_owned());
                 out.extend_from_slice(text.as_bytes());
-                out.extend_from_slice(newline.as_bytes());
+                out.extend_from_slice(newline);
             }
             Err(TransformError::SecretInUndroppableSignedBlock) => {
                 return Err(HarnessError::SecretInSignedBlock {
@@ -279,6 +289,32 @@ pub fn rewrite_json_text(path: &Path, map: &PathMap) -> Result<Vec<u8>, HarnessE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_cut_inside_a_two_byte_character_does_not_stop_capture() {
+        // `kill -9` cut "café" after the first byte of `é`; Claude then
+        // appended a whole line after the cut.
+        let dir = tempfile::tempdir().unwrap();
+        let secret = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab";
+        let src = dir.path().join("t.jsonl");
+        let mut bytes = b"{\"a\":\"ok\"}\n{\"a\":\"caf\xC3".to_vec();
+        bytes.extend_from_slice(format!(" {secret}\n{{\"a\":\"{secret}\"}}\n").as_bytes());
+        fs::write(&src, bytes).unwrap();
+        let out = dir.path().join("out");
+        stage(
+            &[Source {
+                abs: src,
+                rel: RelPath::parse("home/t.jsonl").unwrap(),
+                rewrite: Rewrite::JsonText,
+            }],
+            &out,
+            &mut RedactionCounts::new(),
+        )
+        .unwrap();
+        let mut expected = b"{\"a\":\"ok\"}\n{\"a\":\"caf\xC3 [REDACTED:github-token]\n".to_vec();
+        expected.extend_from_slice(b"{\"a\":\"[REDACTED:github-token]\"}\n");
+        assert_eq!(fs::read(out.join("home/t.jsonl")).unwrap(), expected);
+    }
 
     #[test]
     fn stage_counts_a_dropped_signed_block() {

@@ -4,12 +4,14 @@
 //! path component run, never inside a longer name, so `/Users/x` is mapped
 //! in `/Users/x/oss` and left alone in `/Users/x-old`. Rules are applied
 //! longest first, so a root under a home is mapped before the home is. A
-//! redaction rule never leaves part of a match behind.
+//! redaction rule never leaves part of a match behind, and a text that is
+//! not UTF-8 is matched as bytes with the same rules.
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use regex::Regex;
+use regex::bytes::Regex as BytesRegex;
 
 /// An ordered set of `from -> to` path rules.
 #[derive(Debug, Clone, Default)]
@@ -104,7 +106,13 @@ pub type RedactionCounts = BTreeMap<&'static str, u32>;
 
 /// Secret-shaped text that must never leave the machine it was typed on.
 pub struct Redactor {
-    rules: Vec<(&'static str, Regex)>,
+    rules: Vec<Rule>,
+}
+
+struct Rule {
+    name: &'static str,
+    text: Regex,
+    bytes: BytesRegex,
 }
 
 const PATTERNS: &[(&str, &str)] = &[
@@ -130,9 +138,17 @@ const PATTERNS: &[(&str, &str)] = &[
 static STANDARD: LazyLock<Redactor> = LazyLock::new(|| Redactor {
     rules: PATTERNS
         .iter()
-        .filter_map(|(name, pattern)| Regex::new(pattern).ok().map(|re| (*name, re)))
+        .filter_map(|(name, pattern)| {
+            let text = Regex::new(pattern).ok()?;
+            let bytes = BytesRegex::new(pattern).ok()?;
+            Some(Rule { name, text, bytes })
+        })
         .collect(),
 });
+
+fn count(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
 
 impl Redactor {
     /// The standard rule set.
@@ -144,7 +160,13 @@ impl Redactor {
     /// Returns true when any rule matches somewhere in `text`.
     #[must_use]
     pub fn matches(&self, text: &str) -> bool {
-        self.rules.iter().any(|(_, re)| re.is_match(text))
+        self.rules.iter().any(|rule| rule.text.is_match(text))
+    }
+
+    /// Returns true when any rule matches somewhere in `bytes`.
+    #[must_use]
+    pub fn matches_bytes(&self, bytes: &[u8]) -> bool {
+        self.rules.iter().any(|rule| rule.bytes.is_match(bytes))
     }
 
     /// Replaces every match with `[REDACTED:<rule>]`, counting per rule;
@@ -152,16 +174,37 @@ impl Redactor {
     #[must_use]
     pub fn apply(&self, text: &str, counts: &mut RedactionCounts) -> Option<String> {
         let mut current: Option<String> = None;
-        for (name, re) in &self.rules {
+        for rule in &self.rules {
             let input = current.as_deref().unwrap_or(text);
-            let n = re.find_iter(input).count();
+            let n = rule.text.find_iter(input).count();
             if n == 0 {
                 continue;
             }
-            let replaced = re
-                .replace_all(input, format!("[REDACTED:{name}]").as_str())
+            let replaced = rule
+                .text
+                .replace_all(input, format!("[REDACTED:{}]", rule.name).as_str())
                 .into_owned();
-            *counts.entry(name).or_insert(0) += u32::try_from(n).unwrap_or(u32::MAX);
+            *counts.entry(rule.name).or_insert(0) += count(n);
+            current = Some(replaced);
+        }
+        current
+    }
+
+    /// `apply` for bytes that are not UTF-8; bytes outside a match are kept.
+    #[must_use]
+    pub fn apply_bytes(&self, bytes: &[u8], counts: &mut RedactionCounts) -> Option<Vec<u8>> {
+        let mut current: Option<Vec<u8>> = None;
+        for rule in &self.rules {
+            let input = current.as_deref().unwrap_or(bytes);
+            let n = rule.bytes.find_iter(input).count();
+            if n == 0 {
+                continue;
+            }
+            let replaced = rule
+                .bytes
+                .replace_all(input, format!("[REDACTED:{}]", rule.name).as_bytes())
+                .into_owned();
+            *counts.entry(rule.name).or_insert(0) += count(n);
             current = Some(replaced);
         }
         current
