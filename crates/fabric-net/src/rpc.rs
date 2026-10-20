@@ -160,6 +160,14 @@ pub enum RpcError {
         /// The move the answer names.
         got: MoveId,
     },
+    /// The peer's answer to an offer names another snapshot to push than the one offered.
+    #[error("offered snapshot {offered}, the peer asked for snapshot {got}")]
+    WrongSnapshot {
+        /// The snapshot the offer named.
+        offered: SnapshotId,
+        /// The snapshot the answer names.
+        got: SnapshotId,
+    },
     /// An earlier error ended this chunk stream; ask for `missing` in a new request.
     #[error("the chunk stream already failed; ask for the missing chunks again")]
     Interrupted,
@@ -282,6 +290,19 @@ fn check_move(asked: MoveId, fenced: &Fenced<MoveState>) -> Result<(), RpcError>
             Err(RpcError::WrongMove {
                 asked,
                 got: move_id,
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Accepts an offer's answer only if an incomplete-snapshot answer names the snapshot offered.
+fn check_offered(offered: SnapshotId, fenced: &Fenced<Offered>) -> Result<(), RpcError> {
+    match *fenced {
+        Fenced::Answer(Offered::SnapshotIncomplete { snapshot }) if snapshot != offered => {
+            Err(RpcError::WrongSnapshot {
+                offered,
+                got: snapshot,
             })
         }
         _ => Ok(()),
@@ -584,8 +605,12 @@ impl Session {
             job_id: offer.job_id,
             epoch,
         };
-        self.job(token, JobRequest::MoveOffer(offer.into()), deadline)
-            .await
+        let offered = offer.snapshot;
+        let answer = self
+            .job(token, JobRequest::MoveOffer(offer.into()), deadline)
+            .await?;
+        check_offered(offered, &answer)?;
+        Ok(answer)
     }
 
     /// Asks the target for its decision on `move_id` again under `token`, waiting at most `deadline`.
@@ -1057,6 +1082,18 @@ mod tests {
         assert!(matches!(
             check_move(asked, &undecided(other)),
             Err(RpcError::WrongMove { asked: a, got }) if a == asked && got == other
+        ));
+    }
+
+    /// An incomplete-snapshot answer for another snapshot is not an answer to the offer sent.
+    #[test]
+    fn an_offer_answer_for_another_snapshot_is_refused() {
+        let [offered, other] = [1, 2].map(|n| SnapshotId::from_bytes([n; 32]));
+        let incomplete = |snapshot| Fenced::Answer(Offered::SnapshotIncomplete { snapshot });
+        assert!(check_offered(offered, &incomplete(offered)).is_ok());
+        assert!(matches!(
+            check_offered(offered, &incomplete(other)),
+            Err(RpcError::WrongSnapshot { offered: o, got }) if o == offered && got == other
         ));
     }
 
