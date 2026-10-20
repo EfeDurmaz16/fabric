@@ -210,12 +210,9 @@ pub enum CaptureError {
     /// A git command failed.
     #[error(transparent)]
     Git(#[from] GitError),
-    /// The store refused.
+    /// The store, or an object in it, refused.
     #[error(transparent)]
     Store(#[from] StoreError),
-    /// An object could not be written.
-    #[error(transparent)]
-    Object(#[from] ObjectError),
     /// The manifest does not validate.
     #[error(transparent)]
     Manifest(#[from] ManifestError),
@@ -308,6 +305,13 @@ pub enum CaptureError {
         /// The job it belongs to.
         job: JobId,
     },
+}
+
+/// An object error always arrives as `StoreError::Object`, so a caller matches one shape.
+impl From<ObjectError> for CaptureError {
+    fn from(error: ObjectError) -> Self {
+        CaptureError::Store(StoreError::Object(error))
+    }
 }
 
 fn io_err(path: &Path, source: io::Error) -> CaptureError {

@@ -113,7 +113,7 @@ pub enum RestoreError {
         #[source]
         source: io::Error,
     },
-    /// The store refused.
+    /// The store, or an object in it, refused.
     #[error(transparent)]
     Store(#[from] StoreError),
     /// A git command failed.
@@ -122,9 +122,6 @@ pub enum RestoreError {
     /// The tree writer refused a path.
     #[error(transparent)]
     Write(#[from] WriteError),
-    /// An object could not be read.
-    #[error(transparent)]
-    Object(#[from] ObjectError),
     /// The target is not an absolute path with a parent directory.
     #[error("{path} is not an absolute path with a parent")]
     BadTarget {
@@ -192,6 +189,13 @@ pub enum RestoreError {
         /// The missing base.
         base: SnapshotId,
     },
+}
+
+/// An object error always arrives as `StoreError::Object`, so a caller matches one shape.
+impl From<ObjectError> for RestoreError {
+    fn from(error: ObjectError) -> Self {
+        RestoreError::Store(StoreError::Object(error))
+    }
 }
 
 fn io_err(path: &Path, source: io::Error) -> RestoreError {
