@@ -10,7 +10,7 @@
 use std::error::Error;
 use std::fs;
 use std::io;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -114,7 +114,7 @@ fn a_finished_install_runs_nothing() {
     write(
         dir.path(),
         &[
-            ("node_modules/.modules.yaml", "storeDir: x\n"),
+            ("node_modules/.fabric-installed", ""),
             ("node_modules/a/package.json", "{}"),
         ],
     )
@@ -126,82 +126,61 @@ fn a_finished_install_runs_nothing() {
     assert!(planned.ready().unwrap().execute(&lock).is_ok());
 }
 
-/// An install killed halfway leaves packages without the marker the
-/// manager writes as it finishes; the next plan installs again.
+/// npm, pnpm and Yarn 1 write their own marker before the root package's
+/// lifecycle scripts run, so an install whose `postinstall` fails leaves
+/// the marker over a tree that is not whole. Only the sentinel, written
+/// after the step exits 0, makes the next plan skip the install.
 #[test]
-fn a_torn_install_runs_again() {
-    let dir = copy_fixture("node-pnpm").unwrap();
+fn an_installer_marker_left_by_a_failed_install_is_not_proof() {
+    let dir = tempfile::tempdir().unwrap();
     let lock = take_lock(dir.path()).unwrap();
-    write(dir.path(), &[("node_modules/a/package.json", "{}")]).unwrap();
-    let detected = detect(dir.path(), None).unwrap();
-    let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
-    assert_eq!(
-        planned.caches()[0].health,
-        CacheHealth::Incomplete {
-            expected: &[".modules.yaml"]
-        }
-    );
-    assert_eq!(planned.steps().len(), 1);
+    write(
+        dir.path(),
+        &[("package.json", PACKAGE_JSON), ("package-lock.json", "")],
+    )
+    .unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let npm = bin.path().join("npm");
+    fs::write(
+        &npm,
+        "#!/bin/sh\nmkdir -p node_modules/a && echo {} > node_modules/.package-lock.json && [ -e postinstall-ok ]\n",
+    )
+    .unwrap();
+    fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).unwrap();
+    let node = NodeEnv::new(Some(bin.path().as_os_str().to_owned()), Vec::new());
+    let resume = || plan(&detect(dir.path(), None).unwrap(), &lock, &node).unwrap();
+
+    assert!(matches!(
+        resume().ready().unwrap().execute(&lock),
+        Err(MaterializeError::StepFailed { .. })
+    ));
+    assert!(dir.path().join("node_modules/.package-lock.json").is_file());
+    let after_failure = resume();
+    assert_eq!(after_failure.caches()[0].health, CacheHealth::Incomplete);
+    assert_eq!(after_failure.steps().len(), 1);
+
+    write(dir.path(), &[("postinstall-ok", "")]).unwrap();
+    after_failure.ready().unwrap().execute(&lock).unwrap();
+    assert!(resume().is_noop());
 }
 
-/// One row per rule: the marker follows the manager detection chose, not
-/// the lockfiles on disk; a cache a step fills and whose installer writes
-/// no marker needs the sentinel; a cache no step fills needs content.
+/// One row per rule: a cache a step fills needs the sentinel, whatever
+/// else its installer left there; a cache no step fills needs content.
 #[test]
 fn health_follows_the_cache_kind() {
-    let sentinel = &[SENTINEL][..];
-    let cases: [(Files, CacheHealth); 13] = [
+    let cases: [(Files, CacheHealth); 9] = [
         (
             &[
                 ("package.json", PACKAGE_JSON),
                 ("package-lock.json", ""),
-                ("node_modules/.package-lock.json", "{}"),
-            ],
-            CacheHealth::Healthy,
-        ),
-        (
-            &[
-                ("package.json", PACKAGE_JSON),
-                ("package-lock.json", ""),
-                ("node_modules/.modules.yaml", ""),
-            ],
-            CacheHealth::Incomplete {
-                expected: &[".package-lock.json"],
-            },
-        ),
-        (
-            &[
-                ("package.json", PACKAGE_JSON),
-                ("yarn.lock", ""),
-                (".yarnrc.yml", "nodeLinker: node-modules\n"),
-                ("node_modules/.yarn-state.yml", ""),
-            ],
-            CacheHealth::Healthy,
-        ),
-        // Bun writes no marker, so content alone could be a torn tree.
-        (
-            &[
-                ("package.json", PACKAGE_JSON),
-                ("bun.lock", ""),
                 ("node_modules/a/package.json", "{}"),
             ],
-            CacheHealth::Incomplete { expected: sentinel },
+            CacheHealth::Incomplete,
         ),
         (
             &[
                 ("package.json", PACKAGE_JSON),
                 ("bun.lock", ""),
-                ("node_modules/a/package.json", "{}"),
-                ("node_modules/.fabric-installed", ""),
-            ],
-            CacheHealth::Healthy,
-        ),
-        // A leftover npm lockfile next to a Bun tree must not demand npm's marker.
-        (
-            &[
-                ("package.json", r#"{"packageManager":"bun@1.2.0"}"#),
-                ("bun.lock", ""),
-                ("package-lock.json", ""),
                 ("node_modules/a/package.json", "{}"),
                 ("node_modules/.fabric-installed", ""),
             ],
@@ -213,7 +192,7 @@ fn health_follows_the_cache_kind() {
                 ("requirements.txt", ""),
                 (".venv/pyvenv.cfg", "home = /x\n"),
             ],
-            CacheHealth::Incomplete { expected: sentinel },
+            CacheHealth::Incomplete,
         ),
         (
             &[
@@ -254,28 +233,21 @@ fn health_follows_the_cache_kind() {
     }
 }
 
-/// A declared cache keyed `node` holds a build's output, never npm's
-/// marker: without a declared step only content counts, and with one the
-/// sentinel does.
+/// A declared cache keyed `node` holds a build's output: without a
+/// declared step only content counts, and with one the sentinel does.
 #[test]
 fn a_declared_node_cache_is_proven_by_content_or_its_sentinel() {
     let warm_npm = [
         ("package.json", PACKAGE_JSON),
         ("package-lock.json", ""),
-        ("node_modules/.package-lock.json", "{}"),
+        ("node_modules/.fabric-installed", ""),
         (".output/index.js", ""),
     ];
     let cache = "[[cache]]\npath = \".output\"\nclass = \"build\"\necosystem = \"node\"\n";
     let with_step = format!("{cache}[[setup]]\nprogram = \"true\"\n");
     let cases: [(&str, Option<&str>, CacheHealth); 3] = [
         (cache, None, CacheHealth::Healthy),
-        (
-            &with_step,
-            None,
-            CacheHealth::Incomplete {
-                expected: &[SENTINEL],
-            },
-        ),
+        (&with_step, None, CacheHealth::Incomplete),
         (
             &with_step,
             Some(".output/.fabric-installed"),
@@ -300,10 +272,9 @@ fn a_declared_node_cache_is_proven_by_content_or_its_sentinel() {
     }
 }
 
-/// Declared steps that fill a declared cache in an npm workspace leave its
-/// sentinel behind, so the next resume runs nothing: before, the cache was
-/// asked for npm's marker, stayed torn forever, and a declared `npm ci`
-/// deleted a healthy carried `node_modules` on every resume.
+/// Declared steps that fill a declared cache in an npm workspace leave the
+/// sentinel in every cache they fill, so the next resume runs nothing and
+/// a declared `npm ci` never deletes the `node_modules` it made.
 #[test]
 fn declared_steps_over_a_declared_node_cache_run_once() {
     let dir = tempfile::tempdir().unwrap();
@@ -322,7 +293,7 @@ class = "build"
 
 [[setup]]
 program = "sh"
-args = ["-c", "mkdir -p node_modules && echo {} > node_modules/.package-lock.json"]
+args = ["-c", "mkdir -p node_modules/a && echo {} > node_modules/a/package.json"]
 
 [[setup]]
 program = "sh"
@@ -409,12 +380,7 @@ when = "always"
         &NodeEnv::current(),
     )
     .unwrap();
-    assert_eq!(
-        after.caches()[0].health,
-        CacheHealth::Incomplete {
-            expected: &[SENTINEL]
-        }
-    );
+    assert_eq!(after.caches()[0].health, CacheHealth::Incomplete);
 }
 
 #[test]
@@ -647,7 +613,7 @@ fn a_missing_target_does_not_reinstall_a_whole_node_modules() {
         &[
             ("package.json", PACKAGE_JSON),
             ("package-lock.json", ""),
-            ("node_modules/.package-lock.json", "{}"),
+            ("node_modules/.fabric-installed", ""),
             ("Cargo.toml", ""),
         ],
     )
@@ -662,9 +628,9 @@ fn a_missing_target_does_not_reinstall_a_whole_node_modules() {
     assert_eq!(programs, ["cargo"]);
 }
 
-/// Point 14's rule holds for declared steps too: no declared step fills a
-/// detected `target`, so its absence must not rerun a declared `npm ci`
-/// over a healthy carried `node_modules`. A torn `node_modules` still does.
+/// A declared step does not fill a detected `target`, so a missing
+/// `target` never reruns a declared `npm ci` over a healthy
+/// `node_modules`. A torn `node_modules` still does.
 #[test]
 fn a_missing_target_does_not_run_a_declared_install() {
     let dir = tempfile::tempdir().unwrap();
@@ -675,7 +641,7 @@ fn a_missing_target_does_not_run_a_declared_install() {
             ("package.json", PACKAGE_JSON),
             ("package-lock.json", ""),
             ("node_modules/a/package.json", "{}"),
-            ("node_modules/.package-lock.json", "{}"),
+            ("node_modules/.fabric-installed", ""),
             ("Cargo.toml", ""),
         ],
     )
@@ -689,7 +655,7 @@ fn a_missing_target_does_not_run_a_declared_install() {
     .unwrap();
     assert!(planned.is_noop(), "{:?}", planned.steps());
 
-    fs::remove_file(dir.path().join("node_modules/.package-lock.json")).unwrap();
+    fs::remove_file(dir.path().join("node_modules").join(SENTINEL)).unwrap();
     let planned = plan(
         &declared(dir.path(), override_toml).unwrap(),
         &lock,

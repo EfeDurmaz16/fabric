@@ -124,12 +124,7 @@ args = ["-c", "mkdir -p out && echo x > out/f && kill -9 $PPID"]
     assert!(dir.path().join("out/f").is_file());
     assert!(!dir.path().join("out").join(SENTINEL).exists());
     let next = next_plan(dir.path()).unwrap();
-    assert_eq!(
-        next.caches()[0].health,
-        CacheHealth::Incomplete {
-            expected: &[SENTINEL]
-        }
-    );
+    assert_eq!(next.caches()[0].health, CacheHealth::Incomplete);
     assert_eq!(next.steps().len(), 1);
 }
 
@@ -169,9 +164,7 @@ when = "always"
     assert!(!dir.path().join("out").join(SENTINEL).exists());
     assert_eq!(
         next_plan(dir.path()).unwrap().caches()[0].health,
-        CacheHealth::Incomplete {
-            expected: &[SENTINEL]
-        }
+        CacheHealth::Incomplete
     );
 }
 
@@ -228,11 +221,6 @@ args = ["-c", "touch started; while [ ! -e release ]; do sleep 0.02; done; mkdir
     fs::write(dir.path().join("release"), "").unwrap();
     let next = next_plan(dir.path()).unwrap();
     assert!(dir.path().join("out/f").is_file());
-    assert_eq!(
-        next.caches()[0].health,
-        CacheHealth::Incomplete {
-            expected: &[SENTINEL]
-        }
-    );
+    assert_eq!(next.caches()[0].health, CacheHealth::Incomplete);
     assert_eq!(next.steps().len(), 1);
 }

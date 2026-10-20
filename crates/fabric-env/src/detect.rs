@@ -191,7 +191,7 @@ pub enum DetectError {
     /// Yarn 2 or later installs with Plug'n'Play here, which writes no `node_modules`.
     ///
     /// The `.yarnrc.yml` value is never quoted. A Plug'n'Play install leaves
-    /// no tree whose marker proves it whole, and its `.yarn/unplugged`
+    /// no `node_modules` for the detected cache to find, and its `.yarn/unplugged`
     /// holds native builds for one Node ABI with no carry key, so it is
     /// refused rather than reinstalled on every resume.
     #[error(
@@ -276,21 +276,6 @@ impl NodeManager {
         }
     }
 
-    /// Returns the files the manager writes inside `node_modules` as an install finishes.
-    ///
-    /// A first install killed halfway leaves `node_modules` without them,
-    /// which is how materialize tells a finished tree from a torn one. Bun
-    /// writes none, so a Bun tree is judged by materialize's own sentinel.
-    pub(crate) fn install_markers(self) -> &'static [&'static str] {
-        match self {
-            NodeManager::Npm => &[".package-lock.json"],
-            NodeManager::Pnpm => &[".modules.yaml"],
-            NodeManager::YarnClassic => &[".yarn-integrity"],
-            NodeManager::YarnBerry => &[".yarn-state.yml"],
-            NodeManager::Bun => &[],
-        }
-    }
-
     /// Returns the frozen-lockfile install step, which never rewrites the lockfile.
     fn install_step(self) -> Result<SetupStep, DetectError> {
         let args: &[&str] = match self {
@@ -359,27 +344,14 @@ pub enum CacheOrigin {
 /// How materialize tells a finished cache from a torn one, and which setup steps fill the cache.
 ///
 /// Detection decides this once per cache, so materialize never works out
-/// again which step fills which cache. Only the `node_modules` detection
-/// found gets installer markers: a declared cache keyed `Node` holds a
-/// build's output, which the installer never writes a marker into.
+/// again which step fills which cache. No installer's own file is proof:
+/// npm writes `node_modules/.package-lock.json`, pnpm `.modules.yaml` and
+/// Yarn 1 `.yarn-integrity` before the root package's lifecycle scripts
+/// run, so a failed or interrupted `postinstall` leaves the marker over a
+/// tree that is not whole. Only a step that exited 0 proves its cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Completion {
-    /// One of these files, which the installer itself writes as it finishes.
-    ///
-    /// The markers follow the manager detection chose, not the lockfiles on
-    /// disk: a Bun tree next to a leftover `package-lock.json` needs no
-    /// `.package-lock.json`.
-    Marker {
-        /// The marker files; any one of them proves the cache whole.
-        files: &'static [&'static str],
-        /// The setup steps that run the installer, by index in the spec.
-        filled_by: Vec<usize>,
-    },
     /// The sentinel materialize writes once the steps that fill the cache have exited 0.
-    ///
-    /// For a cache whose installer writes no marker: Bun's `node_modules`,
-    /// `.venv` (whose `pyvenv.cfg` is written before any package, so it
-    /// proves nothing) and a declared cache that a setup step fills.
     Sentinel {
         /// The setup steps that fill the cache, by index in the spec.
         filled_by: Vec<usize>,
@@ -392,7 +364,7 @@ impl Completion {
     /// Returns the setup steps that fill the cache, by index in the spec; empty for `Content`.
     pub fn filled_by(&self) -> &[usize] {
         match self {
-            Completion::Marker { filled_by, .. } | Completion::Sentinel { filled_by } => filled_by,
+            Completion::Sentinel { filled_by } => filled_by,
             Completion::Content => &[],
         }
     }
@@ -501,8 +473,6 @@ struct FoundCache {
     class: CacheClass,
     ecosystem: Ecosystem,
     origin: CacheOrigin,
-    /// The installer's markers; only the `node_modules` detection found has any.
-    markers: &'static [&'static str],
 }
 
 impl FoundCache {
@@ -514,12 +484,7 @@ impl FoundCache {
             .filter(|(_, scope)| scope.fills(&self))
             .map(|(index, _)| index)
             .collect();
-        let completion = if !self.markers.is_empty() {
-            Completion::Marker {
-                files: self.markers,
-                filled_by,
-            }
-        } else if filled_by.is_empty() {
+        let completion = if filled_by.is_empty() {
             Completion::Content
         } else {
             Completion::Sentinel { filled_by }
@@ -655,7 +620,6 @@ pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, Dete
             class: CacheClass::Deps,
             ecosystem: Ecosystem::Node(choice.manager),
             origin: CacheOrigin::Detected,
-            markers: choice.manager.install_markers(),
         });
     }
     detect_rust(root, &mut setup, &mut caches)?;
@@ -750,7 +714,6 @@ fn merge_declared_caches(
             class: declared.class,
             ecosystem,
             origin: CacheOrigin::Declared,
-            markers: &[],
         });
     }
     Ok(())
@@ -894,7 +857,6 @@ fn detect_rust(
         class: CacheClass::Build,
         ecosystem: Ecosystem::Rust,
         origin: CacheOrigin::Detected,
-        markers: &[],
     });
     Ok(())
 }
@@ -924,7 +886,6 @@ fn detect_python(
         class: CacheClass::Deps,
         ecosystem: Ecosystem::Python,
         origin: CacheOrigin::Detected,
-        markers: &[],
     });
     Ok(())
 }

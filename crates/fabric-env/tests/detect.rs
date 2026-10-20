@@ -93,10 +93,7 @@ fn a_pnpm_workspace_gives_a_frozen_install_and_node_modules() {
             "node_modules",
             CacheClass::Deps,
             Ecosystem::Node(NodeManager::Pnpm),
-            Completion::Marker {
-                files: &[".modules.yaml"],
-                filled_by: vec![0]
-            }
+            Completion::Sentinel { filled_by: vec![0] }
         )
         .unwrap()]
     );
@@ -480,8 +477,7 @@ fn the_override_file_wins_over_detection() {
                 "node_modules",
                 CacheClass::Deps,
                 Ecosystem::Node(NodeManager::Pnpm),
-                Completion::Marker {
-                    files: &[".modules.yaml"],
+                Completion::Sentinel {
                     filled_by: vec![0, 1]
                 }
             )
@@ -542,10 +538,7 @@ fn a_declared_class_keeps_the_detected_ecosystem() {
                 "node_modules",
                 CacheClass::ToolCache,
                 Ecosystem::Node(NodeManager::Npm),
-                Completion::Marker {
-                    files: &[".package-lock.json"],
-                    filled_by: vec![0]
-                }
+                Completion::Sentinel { filled_by: vec![0] }
             )
             .unwrap()],
             "{declared}"

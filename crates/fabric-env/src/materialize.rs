@@ -3,8 +3,9 @@
 //! Invariant: `plan` only reads. It never runs a program and never writes a
 //! byte, so a dry run is `plan` and nothing more. What it reads from the
 //! node's environment comes in through `NodeEnv`: `PATH`, and whether each
-//! declared variable is set, never a value. `Plan::ready` turns a plan into steps that can run, and refuses when the
-//! plan shows that one cannot: a program missing from `PATH` or a declared
+//! declared variable is set, never a value. `Plan::ready` turns a plan
+//! into steps that can run, and refuses when the plan shows that one
+//! cannot: a program missing from `PATH` or a declared
 //! environment variable missing from this node. `Ready::execute` runs
 //! exactly those steps, with the program paths and directories the plan
 //! resolved. Neither value can be copied, so one plan runs at most once.
@@ -17,18 +18,20 @@
 //! the workspace runs when any cache is not whole or the report has none.
 //!
 //! A cache is healthy when it is a non-empty directory that holds proof
-//! that whatever filled it finished. For the `node_modules` detection found
-//! under npm, pnpm or Yarn that is the marker the installer itself writes
-//! as it finishes, chosen by the manager detection recorded, whatever other
-//! lockfiles lie next to it. For a cache a setup step fills and whose
-//! installer writes no such marker (Bun, `.venv`, a declared cache) it is
-//! `SENTINEL`, which materialize removes before the first step that fills
-//! the cache and writes after the last one exits 0. A cache no step fills
-//! needs only to be non-empty. An install that fails or is killed halfway
+//! that whatever filled it finished. For a cache a setup step fills, the
+//! detected `node_modules` included, that proof is `SENTINEL`, which
+//! materialize removes before the first step that fills the cache and
+//! writes after the last one exits 0. An installer's own file is never
+//! proof: npm, pnpm and Yarn 1 write theirs before the root package's
+//! lifecycle scripts run, so a `postinstall` that fails or is interrupted
+//! leaves it over a tree that is not whole. A cache no step fills needs
+//! only to be non-empty. An install that fails or is killed halfway
 //! leaves no proof, so the next plan fills the cache again. A report with
 //! no cache paths has nothing that proves warmth, so its `CachesMissing`
 //! steps run on every resume; declaring a `[[cache]]` is how a user makes
-//! them skip.
+//! them skip. A `node_modules` the user installed by hand has no sentinel,
+//! so the first resume after it installs once more; that is the price of
+//! never trusting a tree no step was seen to finish.
 //!
 //! The restore that runs before materialize writes a carried cache only when
 //! its carry key matches this node (ADR 0012), so what is on disk is what
@@ -249,11 +252,8 @@ pub enum CacheHealth {
     NotADirectory,
     /// An empty directory.
     Empty,
-    /// A directory with content and none of the files that prove its filling finished.
-    Incomplete {
-        /// The files any one of which would make it healthy: installer markers or `SENTINEL`.
-        expected: &'static [&'static str],
-    },
+    /// A directory with content and no `SENTINEL`, so the steps that fill it may not have finished.
+    Incomplete,
 }
 
 /// One cache path and its health.
@@ -536,9 +536,9 @@ impl Ready {
 /// the presence of the spec's environment variables, and changes nothing. `lock` proves no
 /// installer from an earlier resume is still writing the tree. It takes the
 /// detection report rather than the spec alone because the report knows
-/// each cache's ecosystem, which decides the marker that proves it whole,
-/// and the root it was built from, so a report cannot be checked against
-/// another tree.
+/// which steps fill each cache, which decides whether the cache needs
+/// `SENTINEL`, and the root it was built from, so a report cannot be
+/// checked against another tree.
 pub fn plan(
     detected: &Detection,
     lock: &TreeLock,
@@ -667,18 +667,15 @@ fn inspect(root: &Path, cache: &CachePath) -> Result<CacheHealth, MaterializeErr
     if fs::read_dir(&full).map_err(inspect_err)?.next().is_none() {
         return Ok(CacheHealth::Empty);
     }
-    let expected: &'static [&'static str] = match &cache.completion {
-        Completion::Content => return Ok(CacheHealth::Healthy),
-        Completion::Marker { files, .. } => files,
-        Completion::Sentinel { .. } => &[SENTINEL],
-    };
-    if expected
-        .iter()
-        .any(|m| fs::symlink_metadata(full.join(m)).is_ok_and(|meta| meta.is_file()))
-    {
-        Ok(CacheHealth::Healthy)
-    } else {
-        Ok(CacheHealth::Incomplete { expected })
+    match &cache.completion {
+        Completion::Content => Ok(CacheHealth::Healthy),
+        Completion::Sentinel { .. } => {
+            if fs::symlink_metadata(full.join(SENTINEL)).is_ok_and(|meta| meta.is_file()) {
+                Ok(CacheHealth::Healthy)
+            } else {
+                Ok(CacheHealth::Incomplete)
+            }
+        }
     }
 }
 
