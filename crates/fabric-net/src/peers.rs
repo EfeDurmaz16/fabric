@@ -214,7 +214,7 @@ impl PeerEntry {
         self.node
     }
 
-    /// Where it was last reachable, newest first; empty for a peer that only dials in.
+    /// Where it was last reachable, newest first; empty when no address is known, and silent on which side dials (ADR 0013).
     #[must_use]
     pub fn addrs(&self) -> &[HostPort] {
         &self.addrs
