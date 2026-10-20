@@ -577,15 +577,11 @@ fn cat_file_batch(
 ) -> Result<(), RestoreError> {
     let pipe = Path::new("cat-file");
     let mut child = git.spawn_piped(&["cat-file", "--batch"])?;
-    let Some(mut stdin) = child.stdin.take() else {
-        return Err(RestoreError::BadTreeOutput {
-            text: "cat-file has no stdin".to_owned(),
-        });
-    };
-    let Some(stdout) = child.stdout.take() else {
-        return Err(RestoreError::BadTreeOutput {
-            text: "cat-file has no stdout".to_owned(),
-        });
+    let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        let source = io::Error::other("cat-file started without its stdin or stdout pipe");
+        return Err(GitError::Spawn { source }.into());
     };
     let requests: Vec<String> = oids.iter().map(|o| format!("{o}\n")).collect();
     let feeder = thread::spawn(move || {
