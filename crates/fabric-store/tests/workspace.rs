@@ -807,6 +807,21 @@ fn unmerged_index_entries_are_refused() {
 }
 
 #[test]
+fn a_repository_git_cannot_read_is_an_error_not_a_plain_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    let config = root.join(".git/config");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str("[broken\n");
+    fs::write(&config, text).unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    assert!(matches!(err, CaptureError::Git(_)), "{err}");
+}
+
+#[test]
 fn a_shallow_clone_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = dir.path().join("upstream");

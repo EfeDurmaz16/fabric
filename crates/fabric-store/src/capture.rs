@@ -1712,7 +1712,20 @@ fn detect_git<'a>(
     let git = Git::new(req.root).with_date(req.created_at);
     let out = git.output(&["rev-parse", "--show-toplevel"], &[])?;
     if !out.status.success() {
-        return Ok(None);
+        // Only "not a repository" makes the root a plain directory. Any
+        // other failure, such as `safe.directory` refusing a repository
+        // another user owns or a config git cannot parse, is surfaced:
+        // capturing the root as plain files would drop its git state.
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+        if stderr.contains("not a git repository") {
+            return Ok(None);
+        }
+        return Err(GitError::Failed {
+            command: "rev-parse --show-toplevel".to_owned(),
+            code: out.status.code(),
+            stderr,
+        }
+        .into());
     }
     let toplevel = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
     let same = match (fs::canonicalize(&toplevel), fs::canonicalize(req.root)) {
