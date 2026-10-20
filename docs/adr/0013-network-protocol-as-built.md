@@ -122,7 +122,7 @@ The connection's reader waits on nothing but the wire. The frames it sends itsel
 
 Each direction of a stream has its own credit, as each QUIC stream has its own window. A sender starts with 1 MiB and spends it on `Data`; the receiver buffers exactly that much and returns credit each time its reader has taken 256 KiB. The connection's reader never waits on one stream, so a stream nobody reads stops only its own sender, and a caller may read its streams one after the other on either wire. A peer that sends past its credit, or grants more than a buffer holds, ends the connection.
 
-As on QUIC, a side that has written nothing for 10 s sends `KeepAlive`, and a side that has read no byte for 30 s ends the connection, so a peer that slept or changed networks does not leave a half-open connection. The writer flushes TLS whenever its queue runs empty, so a stream's last bytes never wait in the TLS buffer for a frame that does not come.
+As on QUIC, a side that has written nothing for 10 s sends `KeepAlive`, and a side that has read no byte for 30 s ends the connection, so a peer that slept or changed networks does not leave a half-open connection. A side whose wire has taken no byte for 30 s while it had frames to send ends the connection too, so a peer that keeps talking but never reads cannot hold every stream waiting on a full wire. The writer flushes TLS whenever its queue runs empty, so a stream's last bytes never wait in the TLS buffer for a frame that does not come.
 
 ### Versions
 

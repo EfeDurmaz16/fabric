@@ -41,7 +41,10 @@
 //! fails. As on QUIC, a side that has written nothing for `KEEP_ALIVE`
 //! sends a `KeepAlive` frame, and a side that has read nothing for
 //! `IDLE_TIMEOUT` ends the connection, so a peer that slept or changed
-//! networks does not leave a half-open connection behind.
+//! networks does not leave a half-open connection behind. A side whose
+//! wire has taken no byte for `IDLE_TIMEOUT` while it had bytes to send
+//! ends the connection too, so a peer that talks but never reads cannot
+//! hold every stream's pump, and its slot, waiting on a full wire.
 
 use std::collections::HashMap;
 use std::future::poll_fn;
@@ -55,7 +58,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::AbortHandle;
 
-use crate::idle::IdleReader;
+use crate::idle::{IdleReader, StallWriter};
 use crate::pipe::{Drained, PipeReader, PipeWriter, Refused, Report, pipe};
 use crate::transport::{
     Connection, IDLE_TIMEOUT, KEEP_ALIVE, Stream, TransportError, TransportKind,
@@ -309,7 +312,12 @@ impl Mux {
             peer_slots: Arc::new(Semaphore::new(MAX_STREAMS)),
             ended: watch::Sender::new(false),
         });
-        let writer = tokio::spawn(write_loop(write_half, control_rx, out_rx));
+        let writer = tokio::spawn(write_loop(
+            write_half,
+            Arc::downgrade(&shared),
+            control_rx,
+            out_rx,
+        ));
         let reader = tokio::spawn(read_loop(
             read_half,
             Arc::clone(&shared),
@@ -525,11 +533,34 @@ async fn reset_dropped(shared: &Shared, id: u32) {
     }
 }
 
+/// Sends queued frames, control first, until both queues close; ends the
+/// connection when the wire fails or takes no byte for `IDLE_TIMEOUT`.
+///
+/// It holds the shared state only weakly, so the queues still close when
+/// the handle, the reader and every stream are gone.
 async fn write_loop(
-    mut wire: tokio::io::WriteHalf<impl AsyncWrite>,
+    wire: tokio::io::WriteHalf<impl AsyncWrite>,
+    shared: Weak<Shared>,
+    control: mpsc::Receiver<Outgoing>,
+    out: mpsc::Receiver<Outgoing>,
+) {
+    let mut wire = StallWriter::new(wire, IDLE_TIMEOUT);
+    if let Err(err) = send_queued(&mut wire, control, out).await {
+        tracing::debug!(error = %err, "tcp mux write ended");
+        if let Some(shared) = shared.upgrade() {
+            shared.fail_all();
+        }
+        return;
+    }
+    let _ = wire.shutdown().await;
+}
+
+/// Writes queued frames until both queues close, with a keep-alive whenever nothing was queued for `KEEP_ALIVE`.
+async fn send_queued(
+    wire: &mut (impl AsyncWrite + Unpin),
     mut control: mpsc::Receiver<Outgoing>,
     mut out: mpsc::Receiver<Outgoing>,
-) {
+) -> io::Result<()> {
     loop {
         let queued = match control.try_recv() {
             Ok(frame) => Some(frame),
@@ -542,10 +573,7 @@ async fn write_loop(
             // only as the socket has room; with nothing queued, push
             // them out before waiting, or a stream's last bytes sit
             // there until the next frame.
-            if let Err(err) = wire.flush().await {
-                tracing::debug!(error = %err, "tcp mux flush ended");
-                return;
-            }
+            wire.flush().await?;
             let next = tokio::time::timeout(KEEP_ALIVE, async {
                 tokio::select! {
                     biased;
@@ -556,24 +584,19 @@ async fn write_loop(
             match next.await {
                 Ok(Some(frame)) => frame,
                 // Both queues live in the shared state and close together.
-                Ok(None) => break,
+                Ok(None) => return Ok(()),
                 Err(_) => Outgoing::bare(0, FrameKind::KeepAlive),
             }
         };
-        let Ok(len) = u32::try_from(frame.payload.len()) else {
-            return;
-        };
+        let len = u32::try_from(frame.payload.len())
+            .map_err(|_| invalid(format!("mux payload of {} bytes", frame.payload.len())))?;
         let mut bytes = Vec::with_capacity(HEADER_LEN + frame.payload.len());
         bytes.extend_from_slice(&frame.id.to_le_bytes());
         bytes.push(frame.kind.byte());
         bytes.extend_from_slice(&len.to_le_bytes());
         bytes.extend_from_slice(&frame.payload);
-        if let Err(err) = wire.write_all(&bytes).await {
-            tracing::debug!(error = %err, "tcp mux write ended");
-            return;
-        }
+        wire.write_all(&bytes).await?;
     }
-    let _ = wire.shutdown().await;
 }
 
 async fn read_loop(
@@ -585,6 +608,7 @@ async fn read_loop(
     writer: AbortHandle,
 ) {
     let mut wire = IdleReader::new(wire, IDLE_TIMEOUT);
+    let mut ended = shared.ended.subscribe();
     tokio::select! {
         ended = demux(&mut wire, &shared, &alive, &incoming) => {
             if let Err(err) = ended {
@@ -593,6 +617,8 @@ async fn read_loop(
             shared.fail_all();
             writer.abort();
         }
+        // The writer ended the connection; stop reading the wire.
+        _ = ended.wait_for(|ended| *ended) => {}
         // The handle and every stream are gone: stop reading and let the
         // writer flush what is queued, then shut the connection down.
         _ = gone => {}
@@ -1108,6 +1134,35 @@ mod tests {
             waited >= IDLE_TIMEOUT && waited < IDLE_TIMEOUT + Duration::from_secs(1),
             "{waited:?}"
         );
+    }
+
+    /// A peer that keeps sending keep-alives but never reads leaves this
+    /// side's wire full: after `IDLE_TIMEOUT` with no byte taken the
+    /// connection ends, instead of every stream's pump waiting on it.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_never_reads_ends_the_connection_after_the_idle_timeout() {
+        let (ours, mut theirs) = tokio::io::duplex(64 << 10);
+        let mux = Mux::spawn(ours, Side::Acceptor, node(), ADDR);
+        let talking = tokio::spawn(async move {
+            let mut keep_alive = 0u32.to_le_bytes().to_vec();
+            keep_alive.push(FrameKind::KeepAlive.byte());
+            keep_alive.extend_from_slice(&0u32.to_le_bytes());
+            while theirs.write_all(&keep_alive).await.is_ok() {
+                tokio::time::sleep(KEEP_ALIVE).await;
+            }
+        });
+        let mut stream = mux.open().await.unwrap();
+        stream.write_all(&vec![0u8; STREAM_BUFFER]).await.unwrap();
+        let started = tokio::time::Instant::now();
+        let ended = tokio::time::timeout(IDLE_TIMEOUT * 3, mux.next()).await;
+        assert!(matches!(ended, Ok(Err(_))), "the connection must end");
+        let waited = started.elapsed();
+        assert!(
+            waited >= IDLE_TIMEOUT && waited < IDLE_TIMEOUT + KEEP_ALIVE,
+            "{waited:?}"
+        );
+        assert!(stream.write_all(b"more").await.is_err());
+        talking.abort();
     }
 
     /// Two live sides that have nothing to say keep their connection.
