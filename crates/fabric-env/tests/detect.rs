@@ -404,8 +404,8 @@ fn python_installs_into_the_workspace_venv() {
     assert_eq!(
         commands(&detect(requirements.path(), &[]).unwrap()),
         [
-            "uv venv --allow-existing",
-            "uv pip install -r requirements.txt"
+            "uv venv --allow-existing .venv",
+            "uv pip install --python .venv -r requirements.txt"
         ]
     );
 }

@@ -23,7 +23,7 @@
 //! | `package.json` with a lockfile | the package manager's install step, `node_modules` as a cache |
 //! | `.yarnrc.yml`, for Yarn 2 and later | `nodeLinker`, which must be `node-modules` |
 //! | `Cargo.toml` | `cargo fetch`, with `--locked` when `Cargo.lock` exists; `target` as a cache |
-//! | `uv.lock`, else `requirements.txt` | `uv sync --frozen`, or a `uv` venv and `uv pip install -r`; `.venv` as a cache |
+//! | `uv.lock`, else `requirements.txt` | `uv sync --frozen`, or a `uv` venv and `uv pip install --python .venv -r`; `.venv` as a cache |
 //! | `go.mod` | `go mod download`; no cache inside the workspace |
 //! | `mise.toml`, `.tool-versions`, `rust-toolchain.toml`, `.node-version`, `.nvmrc`, `.python-version`, `go.mod`, `package.json` | tool pins, in that order of precedence |
 //! | `.devcontainer/devcontainer.json`, `.devcontainer.json` | recorded, not interpreted |
@@ -880,10 +880,23 @@ fn detect_python(
         setup.push((step("uv", &["sync", "--frozen"])?, fills()));
     } else if exists(root, "requirements.txt")? {
         // A bare `pip install` would write into whichever Python is first
-        // on PATH; uv puts the packages in the workspace's own `.venv`.
-        setup.push((step("uv", &["venv", "--allow-existing"])?, fills()));
+        // on PATH. Both steps name `.venv`: without `--python`, `uv pip
+        // install` prefers an activated `VIRTUAL_ENV` or `CONDA_PREFIX`
+        // inherited from the shell that runs resume over the workspace's
+        // own `.venv`, and would fill that one instead.
+        setup.push((step("uv", &["venv", "--allow-existing", ".venv"])?, fills()));
         setup.push((
-            step("uv", &["pip", "install", "-r", "requirements.txt"])?,
+            step(
+                "uv",
+                &[
+                    "pip",
+                    "install",
+                    "--python",
+                    ".venv",
+                    "-r",
+                    "requirements.txt",
+                ],
+            )?,
             fills(),
         ));
     } else {
