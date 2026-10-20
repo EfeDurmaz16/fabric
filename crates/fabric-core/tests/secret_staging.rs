@@ -89,8 +89,11 @@ const CREATED: &[&str] = &[
     "src/identity.rs",
 ];
 
+/// Runs git with no configuration but the repository's own, so a
+/// developer's global excludes file cannot hide a path from `W`.
 fn git(dir: &Path, index: &Path, args: &[&str], stdin: Option<&[u8]>) -> io::Result<Vec<u8>> {
     let mut child = Command::new("git")
+        .args(["-c", "core.excludesFile=/dev/null"])
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
