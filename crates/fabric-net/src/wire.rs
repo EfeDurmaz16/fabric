@@ -340,18 +340,37 @@ impl Serialize for RecordPage {
     }
 }
 
-impl<'de> Deserialize<'de> for RecordPage {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let mut records = Vec::<RecordBytes>::deserialize(deserializer)?.into_iter();
-        let first = records
-            .next()
+/// Builds a page one record at a time as the records decode, so a page
+/// past its cost is refused at the first record over, before the rest of
+/// the frame is turned into records.
+struct PageVisitor;
+
+impl<'de> serde::de::Visitor<'de> for PageVisitor {
+    type Value = RecordPage;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "1 or more records costing at most {MAX_RECORD_PAGE} bytes"
+        )
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<RecordPage, A::Error> {
+        let first = seq
+            .next_element::<RecordBytes>()?
             .ok_or_else(|| serde::de::Error::custom(WireError::EmptyPage))?;
-        let mut page = Self::new(first);
-        for record in records {
+        let mut page = RecordPage::new(first);
+        while let Some(record) = seq.next_element::<RecordBytes>()? {
             page.push(record)
                 .map_err(|_| serde::de::Error::custom(WireError::PageFull))?;
         }
         Ok(page)
+    }
+}
+
+impl<'de> Deserialize<'de> for RecordPage {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_seq(PageVisitor)
     }
 }
 
