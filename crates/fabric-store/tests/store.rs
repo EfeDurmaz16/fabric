@@ -90,6 +90,51 @@ fn publish_is_idempotent_and_the_manifest_reads_back() {
     assert!(store.check(CheckDepth::Hashes).unwrap().is_clean());
 }
 
+/// Reads one object as stored and decompresses it, as a peer receiving it would.
+fn as_received(store: &Store, id: ChunkId) -> Fallible<Vec<u8>> {
+    let frame = store.objects().read_stored(id)?;
+    Ok(zstd::bulk::decompress(&frame, 8 << 20)?)
+}
+
+#[test]
+fn a_snapshot_rebuilds_in_another_store_from_its_stored_objects_alone() {
+    let from_dir = tempfile::tempdir().unwrap();
+    let to_dir = tempfile::tempdir().unwrap();
+    let mut from = Store::create(from_dir.path(), params().unwrap()).unwrap();
+    let mut to = Store::create(to_dir.path(), params().unwrap()).unwrap();
+    let m = manifest(
+        vec![
+            file_entry(&from, "a.txt", b"alpha").unwrap(),
+            file_entry(&from, "big.bin", &vec![7u8; 10_000]).unwrap(),
+        ],
+        4,
+    )
+    .unwrap();
+    let id = from.publish(&m).unwrap();
+
+    let (len, manifest_ids) = from.manifest_chunks(id).unwrap();
+    let mut bytes = Vec::new();
+    for chunk in manifest_ids {
+        let part = as_received(&from, chunk).unwrap();
+        to.objects().put(&part).unwrap();
+        bytes.extend_from_slice(&part);
+    }
+    assert_eq!(bytes.len() as u64, len);
+    assert_eq!(SnapshotId::of(&bytes), id);
+    let decoded = SnapshotManifest::decode(&bytes).unwrap();
+    for chunk in Store::data_chunks(&decoded) {
+        to.objects()
+            .put(&as_received(&from, chunk).unwrap())
+            .unwrap();
+    }
+    assert_eq!(to.publish(&decoded).unwrap(), id);
+    assert!(to.check(CheckDepth::Hashes).unwrap().is_clean());
+    assert!(matches!(
+        from.objects().read_stored(ChunkId::of(b"never written")),
+        Err(ObjectError::Missing { .. })
+    ));
+}
+
 #[test]
 fn publish_refuses_a_manifest_that_names_a_missing_object() {
     let dir = tempfile::tempdir().unwrap();

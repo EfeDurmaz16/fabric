@@ -389,6 +389,30 @@ impl ObjectStore {
         Ok(bytes)
     }
 
+    /// Returns an object's file as stored, one zstd frame, without decompressing it.
+    ///
+    /// This is what a peer receives for a chunk (ADR 0013, Chunks travel as
+    /// stored); the receiver decompresses and checks the hash. A file larger
+    /// than zstd's worst case for `MAX_OBJECT_LEN` is `Corrupt`, so a damaged
+    /// store never makes this node read or send more than one bulk frame.
+    pub fn read_stored(&self, id: ChunkId) -> Result<Vec<u8>, ObjectError> {
+        let path = self.object_path(id);
+        let bound = zstd::zstd_safe::compress_bound(MAX_OBJECT_LEN as usize) as u64;
+        match fs::metadata(&path) {
+            Ok(meta) if meta.len() > bound => return Err(ObjectError::Corrupt { id }),
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(ObjectError::Missing { id });
+            }
+            Err(e) => return Err(io_err(&path, e)),
+        }
+        match fs::read(&path) {
+            Ok(bytes) => Ok(bytes),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(ObjectError::Missing { id }),
+            Err(e) => Err(io_err(&path, e)),
+        }
+    }
+
     /// True when this process linked the object since the last `flush_shards`.
     ///
     /// Such an object holds the bytes `put` hashed, and its shard is already

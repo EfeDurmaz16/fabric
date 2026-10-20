@@ -218,7 +218,11 @@ impl Store {
     }
 
     /// Every object a manifest reaches, in list order, bundle and exclude first.
-    fn data_chunks(manifest: &SnapshotManifest) -> Vec<ChunkId> {
+    ///
+    /// A node that fetches a snapshot from a peer asks for exactly these,
+    /// then publishes the manifest; publish refuses while one is missing.
+    #[must_use]
+    pub fn data_chunks(manifest: &SnapshotManifest) -> Vec<ChunkId> {
         let mut ids = Vec::new();
         if let Some(git) = &manifest.git {
             ids.extend(git.bundle.iter().copied());
@@ -347,6 +351,21 @@ impl Store {
             return Err(StoreError::ManifestMismatch(id));
         }
         Ok(SnapshotManifest::decode(&bytes)?)
+    }
+
+    /// Returns the byte length of a snapshot's manifest and the objects that hold it, in order.
+    ///
+    /// A peer fetches these objects, joins them and checks that the bytes
+    /// hash to the snapshot id before it decodes anything (ADR 0013).
+    pub fn manifest_chunks(&self, id: SnapshotId) -> Result<(u64, Vec<ChunkId>), StoreError> {
+        let row = self.snapshot(id)?;
+        let ids = self
+            .catalog
+            .snapshot_chunks(id, Role::Manifest)?
+            .into_iter()
+            .map(|chunk| chunk.id)
+            .collect();
+        Ok((row.manifest_len, ids))
     }
 
     /// Drops a snapshot from the catalog; its objects wait for gc.
