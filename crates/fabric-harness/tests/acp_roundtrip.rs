@@ -1,5 +1,6 @@
 //! The ACP client against a fake agent process, and the ACP adapter's
-//! capture, restore and launch round trip through two fake homes.
+//! capture, restore and launch round trip onto a node with the same home
+//! and workspace path but none of the agent's state.
 
 #![allow(
     clippy::unwrap_used,
@@ -156,22 +157,19 @@ async fn allow_once_policy_picks_the_allow_option() {
 }
 
 async fn round_trip(load: &str, resume: &str) -> Result<(PathBuf, Value), HarnessError> {
-    let home_a = tempfile::tempdir().unwrap();
-    let home_b = tempfile::tempdir().unwrap();
-    let work_a = home_a.path().join("fabric/jobs/j1/work");
-    let work_b = home_b.path().join("elsewhere/work");
+    // The other node has the same home and workspace path (ADR 0011) and
+    // none of the agent's state.
+    let home = tempfile::tempdir().unwrap();
+    let work_a = home.path().join("fabric/jobs/j1/work");
+    let work_b = work_a.clone();
     std::fs::create_dir_all(&work_a).unwrap();
-    std::fs::create_dir_all(&work_b).unwrap();
     let env_a = env(
-        &home_a.path().join(".fake-agent/sessions"),
+        &home.path().join(".fake-agent/sessions"),
         &[("FAKE_LOAD", load), ("FAKE_RESUME", resume)],
     );
-    let env_b = env(
-        &home_b.path().join(".fake-agent/sessions"),
-        &[("FAKE_LOAD", load), ("FAKE_RESUME", resume)],
-    );
+    let env_b = env_a.clone();
 
-    let a = adapter(home_a.path(), PermissionPolicy::Deny);
+    let a = adapter(home.path(), PermissionPolicy::Deny);
     let running = a
         .launch(
             &work_a,
@@ -202,10 +200,15 @@ async fn round_trip(load: &str, resume: &str) -> Result<(PathBuf, Value), Harnes
             .starts_with("home/.fake-agent/sessions/")
     );
 
-    let b = adapter(home_b.path(), PermissionPolicy::Deny);
+    std::fs::rename(
+        home.path().join(".fake-agent"),
+        home.path().join(".fake-agent-departed"),
+    )
+    .unwrap();
+    let b = adapter(home.path(), PermissionPolicy::Deny);
     let restored = b.restore(&work_b, out.path()).await?;
     assert_eq!(restored.placed.len(), 1);
-    assert!(restored.placed[0].starts_with(home_b.path()));
+    assert!(restored.placed[0].starts_with(home.path().join(".fake-agent/sessions")));
 
     let running = b
         .launch(
@@ -233,12 +236,12 @@ async fn round_trip(load: &str, resume: &str) -> Result<(PathBuf, Value), Harnes
     assert!(saw_echo, "the prompt sent on resume was not echoed");
     let mut running = running;
     running.child.kill().await.ok();
-    let recorded = state(home_b.path(), &session);
+    let recorded = state(home.path(), &session);
     Ok((work_b.canonicalize().unwrap(), recorded))
 }
 
 #[tokio::test]
-async fn captured_session_continues_in_a_new_home_through_session_load() {
+async fn captured_session_continues_on_another_node_through_session_load() {
     let (work_b, recorded) = round_trip("1", "0").await.unwrap();
     assert_eq!(recorded["loaded_from"][0].as_str(), work_b.to_str());
     assert_eq!(recorded["prompts"][0]["text"], "start");

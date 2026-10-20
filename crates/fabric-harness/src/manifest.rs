@@ -61,7 +61,7 @@ pub struct Carried {
     pub size: u64,
 }
 
-/// What restore does to a file's bytes.
+/// How capture treated a file's bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Rewrite {
     /// Bytes are placed as they are.
@@ -70,7 +70,7 @@ pub enum Rewrite {
     /// placed as captured.
     Text,
     /// JSON text, one document or one per line: strings outside signed
-    /// blocks have the old root, home and project key mapped to the new.
+    /// blocks were redacted at capture; placed as captured.
     JsonText,
 }
 

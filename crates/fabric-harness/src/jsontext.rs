@@ -1,15 +1,15 @@
-//! Rewriting JSON text without touching signed blocks.
+//! Redacting JSON text without touching signed blocks.
 //!
 //! Invariant: an object that has a `signature` key is copied byte for byte,
 //! or dropped whole when it is an array element that holds a secret; it is
-//! never edited. Every other string value is decoded, redacted, mapped and
+//! never edited. Every other string value is decoded, redacted and
 //! re-encoded, and the result is valid JSON whenever the input was. The
-//! scanner reads the text once and never builds a tree, so a 100 MB
-//! transcript costs one pass.
+//! scanner reads one JSON text once and never builds a tree; a transcript
+//! is fed to it one line at a time.
 
 use std::ops::Range;
 
-use crate::rewrite::{PathMap, RedactionCounts, Redactor};
+use crate::redact::{RedactionCounts, Redactor};
 
 /// Why a text could not be transformed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -66,11 +66,6 @@ struct Frame {
     expect: Expect,
 }
 
-struct StringToken {
-    span: Range<usize>,
-    is_key: bool,
-}
-
 struct SignedBlock {
     span: Range<usize>,
     in_array: bool,
@@ -78,7 +73,7 @@ struct SignedBlock {
 
 #[derive(Default)]
 struct Scan {
-    strings: Vec<StringToken>,
+    strings: Vec<Range<usize>>,
     signed: Vec<SignedBlock>,
 }
 
@@ -196,23 +191,16 @@ impl Scanner<'_> {
 
     fn string(&mut self, at: usize) -> Result<usize, TransformError> {
         let end = scan_string(self.text.as_bytes(), at)?;
-        let is_key = match self.stack.last_mut() {
+        match self.stack.last_mut() {
             Some(frame) if matches!(frame.expect, Expect::FirstKey | Expect::Key) => {
                 frame.expect = Expect::Colon;
                 if &self.text[at..end] == "\"signature\"" {
                     frame.signed = true;
                 }
-                true
             }
-            _ => {
-                self.begin_value(at)?;
-                false
-            }
-        };
-        self.out.strings.push(StringToken {
-            span: at..end,
-            is_key,
-        });
+            _ => self.begin_value(at)?,
+        }
+        self.out.strings.push(at..end);
         Ok(end)
     }
 
@@ -334,13 +322,9 @@ fn element_removal(text: &str, span: &Range<usize>) -> Range<usize> {
     span.clone()
 }
 
-/// Redacts and path-maps every string outside signed blocks of one JSON
-/// text, dropping a signed array element that holds a secret.
-pub fn transform(
-    text: &str,
-    map: &PathMap,
-    redactor: Option<&Redactor>,
-) -> Result<Outcome, TransformError> {
+/// Redacts every string outside signed blocks of one JSON text, dropping
+/// a signed array element that holds a secret.
+pub fn transform(text: &str, redactor: &Redactor) -> Result<Outcome, TransformError> {
     let scan = scan(text)?;
     let mut outcome = Outcome::default();
     let mut edits: Vec<(Range<usize>, String)> = Vec::new();
@@ -348,7 +332,7 @@ pub fn transform(
     let mut dropped = Vec::new();
     for block in &scan.signed {
         let raw = &text[block.span.clone()];
-        if redactor.is_some_and(|r| r.matches(raw)) {
+        if redactor.matches(raw) {
             if !block.in_array {
                 return Err(TransformError::SecretInUndroppableSignedBlock);
             }
@@ -366,32 +350,19 @@ pub fn transform(
             .any(|b| b.span.start <= span.start && span.end <= b.span.end)
     };
 
-    for token in &scan.strings {
-        if token.is_key || inside_signed(&token.span) {
+    for span in &scan.strings {
+        if inside_signed(span) {
             continue;
         }
-        let raw = &text[token.span.clone()];
+        let raw = &text[span.clone()];
         let Ok(decoded) = serde_json::from_str::<String>(raw) else {
-            return Err(TransformError::NotJson {
-                offset: token.span.start,
-            });
+            return Err(TransformError::NotJson { offset: span.start });
         };
-        let mut current: Option<String> = None;
-        if let Some(r) = redactor
-            && let Some(redacted) = r.apply(&decoded, &mut outcome.redactions)
-        {
-            current = Some(redacted);
-        }
-        if let Some(mapped) = map.apply(current.as_deref().unwrap_or(&decoded)) {
-            current = Some(mapped);
-        }
-        if let Some(new) = current {
+        if let Some(new) = redactor.apply(&decoded, &mut outcome.redactions) {
             let Ok(encoded) = serde_json::to_string(&new) else {
-                return Err(TransformError::NotJson {
-                    offset: token.span.start,
-                });
+                return Err(TransformError::NotJson { offset: span.start });
             };
-            edits.push((token.span.clone(), encoded));
+            edits.push((span.clone(), encoded));
         }
     }
 
@@ -422,110 +393,100 @@ pub fn transform(
 mod tests {
     use super::*;
 
-    fn map(from: &str, to: &str) -> PathMap {
-        PathMap::new([(from.to_owned(), to.to_owned())])
+    const GITHUB: &str = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab";
+    const ANTHROPIC: &str = "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456";
+
+    fn redact(text: &str) -> Result<Outcome, TransformError> {
+        transform(text, Redactor::standard())
     }
 
     #[test]
-    fn maps_strings_outside_signed_blocks_and_keeps_signed_bytes() {
-        let line = r#"{"cwd":"/Users/x/w","message":{"content":[{"type":"thinking","thinking":"look at /Users/x/w/a.rs","signature":"abc"},{"type":"text","text":"edit /Users/x/w/a.rs"}]}}"#;
-        let out = transform(line, &map("/Users/x/w", "/Users/y/w"), None).unwrap();
-        let text = out.text.unwrap();
-        assert!(text.contains(r#""cwd":"/Users/y/w""#));
-        assert!(text.contains(r#""text":"edit /Users/y/w/a.rs""#));
-        assert!(text.contains(
-            r#"{"type":"thinking","thinking":"look at /Users/x/w/a.rs","signature":"abc"}"#
-        ));
+    fn redacts_strings_outside_signed_blocks_and_keeps_signed_bytes() {
+        let line = format!(
+            r#"{{"cwd":"/w","message":{{"content":[{{"type":"thinking","thinking":"plan","signature":"abc"}},{{"type":"text","text":"token {GITHUB}"}}]}}}}"#
+        );
+        let text = redact(&line).unwrap().text.unwrap();
+        assert!(text.contains(r#""text":"token [REDACTED:github-token]""#));
+        assert!(text.contains(r#"{"type":"thinking","thinking":"plan","signature":"abc"}"#));
         serde_json::from_str::<serde_json::Value>(&text).unwrap();
     }
 
     #[test]
     fn unchanged_text_is_reported_as_unchanged() {
         let line = r#"{"a":"b","n":1.5e3,"t":true,"z":null,"arr":[]}"#;
-        let out = transform(line, &map("/nope", "/x"), Some(Redactor::standard())).unwrap();
-        assert_eq!(out.text, None);
+        assert_eq!(redact(line).unwrap().text, None);
     }
 
     #[test]
-    fn keys_are_never_rewritten() {
-        let line = r#"{"/Users/x":"/Users/x"}"#;
-        let out = transform(line, &map("/Users/x", "/Users/y"), None).unwrap();
-        assert_eq!(out.text.unwrap(), r#"{"/Users/x":"/Users/y"}"#);
+    fn keys_are_redacted_like_values() {
+        let line = format!(r#"{{"{GITHUB}":"{GITHUB}"}}"#);
+        assert_eq!(
+            redact(&line).unwrap().text.unwrap(),
+            r#"{"[REDACTED:github-token]":"[REDACTED:github-token]"}"#
+        );
     }
 
     #[test]
-    fn escaped_paths_are_decoded_before_matching() {
-        let line = r#"{"p":"\/Users\/x\/w"}"#;
-        let out = transform(line, &map("/Users/x/w", "/Users/y/w"), None).unwrap();
-        assert_eq!(out.text.unwrap(), r#"{"p":"/Users/y/w"}"#);
+    fn escaped_strings_are_decoded_before_matching() {
+        let line = r#"{"p":"ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab"}"#;
+        assert_eq!(
+            redact(line).unwrap().text.unwrap(),
+            r#"{"p":"[REDACTED:github-token]"}"#
+        );
     }
 
     #[test]
     fn signed_element_with_a_secret_is_dropped_whole() {
-        let secret = "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456";
         let line = format!(
-            r#"{{"content":[{{"type":"text","text":"a"}},{{"type":"thinking","thinking":"{secret}","signature":"s"}},{{"type":"text","text":"b"}}]}}"#
+            r#"{{"content":[{{"type":"text","text":"a"}},{{"type":"thinking","thinking":"{ANTHROPIC}","signature":"s"}},{{"type":"text","text":"b"}}]}}"#
         );
-        let out = transform(&line, &PathMap::default(), Some(Redactor::standard())).unwrap();
+        let out = redact(&line).unwrap();
         assert_eq!(out.dropped_signed_blocks, 1);
-        let text = out.text.unwrap();
         assert_eq!(
-            text,
+            out.text.unwrap(),
             r#"{"content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}"#
         );
 
         let last = format!(
-            r#"{{"content":[{{"type":"text","text":"a"}},{{"thinking":"{secret}","signature":"s"}}]}}"#
+            r#"{{"content":[{{"type":"text","text":"a"}},{{"thinking":"{ANTHROPIC}","signature":"s"}}]}}"#
         );
-        let out = transform(&last, &PathMap::default(), Some(Redactor::standard())).unwrap();
         assert_eq!(
-            out.text.unwrap(),
+            redact(&last).unwrap().text.unwrap(),
             r#"{"content":[{"type":"text","text":"a"}]}"#
         );
 
+        let only = format!(r#"{{"content":[{{"thinking":"{ANTHROPIC}","signature":"s"}}]}}"#);
+        assert_eq!(redact(&only).unwrap().text.unwrap(), r#"{"content":[]}"#);
+    }
+
+    #[test]
+    fn neighbouring_signed_elements_with_secrets_are_all_dropped() {
         let adjacent = format!(
-            r#"[{{"thinking":"{secret}","signature":"a"}},{{"thinking":"{secret}","signature":"b"}}]"#
+            r#"[{{"thinking":"{ANTHROPIC}","signature":"a"}},{{"thinking":"{GITHUB}","signature":"b"}}]"#
         );
-        let out = transform(&adjacent, &PathMap::default(), Some(Redactor::standard())).unwrap();
+        let out = redact(&adjacent).unwrap();
         assert_eq!(out.dropped_signed_blocks, 2);
         assert_eq!(out.text.unwrap(), "[]");
         let trailing_run = format!(
-            r#"[1, {{"thinking":"{secret}","signature":"a"}}, {{"thinking":"{secret}","signature":"b"}}]"#
+            r#"[1, {{"thinking":"{ANTHROPIC}","signature":"a"}}, {{"thinking":"{GITHUB}","signature":"b"}}]"#
         );
-        let out = transform(
-            &trailing_run,
-            &PathMap::default(),
-            Some(Redactor::standard()),
-        )
-        .unwrap();
-        assert_eq!(out.text.unwrap(), "[1]");
-
-        let only = format!(r#"{{"content":[{{"thinking":"{secret}","signature":"s"}}]}}"#);
-        let out = transform(&only, &PathMap::default(), Some(Redactor::standard())).unwrap();
-        assert_eq!(out.text.unwrap(), r#"{"content":[]}"#);
+        assert_eq!(redact(&trailing_run).unwrap().text.unwrap(), "[1]");
     }
 
     #[test]
     fn secret_in_a_signed_object_value_is_refused() {
-        let secret = "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456";
-        let line = format!(r#"{{"block":{{"thinking":"{secret}","signature":"s"}}}}"#);
+        let line = format!(r#"{{"block":{{"thinking":"{ANTHROPIC}","signature":"s"}}}}"#);
         assert_eq!(
-            transform(&line, &PathMap::default(), Some(Redactor::standard())),
+            redact(&line),
             Err(TransformError::SecretInUndroppableSignedBlock)
         );
     }
 
     #[test]
     fn truncated_and_trailing_text_are_not_json() {
-        assert!(matches!(
-            transform(r#"{"a":"b"#, &PathMap::default(), None),
-            Err(TransformError::NotJson { .. })
-        ));
-        assert!(matches!(
-            transform(r#"{"a":"b"} {"c":1}"#, &PathMap::default(), None),
-            Err(TransformError::NotJson { .. })
-        ));
         for bad in [
+            r#"{"a":"b"#,
+            r#"{"a":"b"} {"c":1}"#,
             r#"{"a" "b"}"#,
             r#"{"a":1,}"#,
             "[1,]",
@@ -537,10 +498,7 @@ mod tests {
             "   ",
         ] {
             assert!(
-                matches!(
-                    transform(bad, &PathMap::default(), None),
-                    Err(TransformError::NotJson { .. })
-                ),
+                matches!(redact(bad), Err(TransformError::NotJson { .. })),
                 "{bad:?} must be refused"
             );
         }
@@ -550,13 +508,10 @@ mod tests {
             r#"{"a":[]}"#,
             r#"[{},[],""]"#,
             r#"{"a":{"b":null}}"#,
+            r#""just a string""#,
+            "42",
         ] {
-            assert!(
-                transform(good, &PathMap::default(), None).is_ok(),
-                "{good:?} must be accepted"
-            );
+            assert!(redact(good).is_ok(), "{good:?} must be accepted");
         }
-        assert!(transform(r#""just a string""#, &PathMap::default(), None).is_ok());
-        assert!(transform("42", &PathMap::default(), None).is_ok());
     }
 }

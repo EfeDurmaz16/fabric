@@ -247,82 +247,82 @@ async fn a_symlink_in_session_state_refuses_the_capture() {
     assert!(!out.path().join("manifest.json").exists());
 }
 
+/// Moves this node's Claude state aside, as if the job ran on another
+/// node with the same home path.
+fn set_aside(home: &Path, name: &str) {
+    std::fs::rename(home.join(".claude"), home.join(name)).unwrap();
+}
+
 #[tokio::test]
-async fn restore_into_another_root_rewrites_paths_but_not_signed_blocks() {
+async fn restore_under_another_root_or_home_is_refused_before_any_write() {
     let src = build_source("fabric/jobs/j1/work");
-    let home_a = src.home.path().canonicalize().unwrap();
+    let home = src.home.path().canonicalize().unwrap();
     let out = tempfile::tempdir().unwrap();
-    ClaudeCode::new(home_a.clone())
+    ClaudeCode::new(home.clone())
         .capture(&src.work, &session(), out.path())
         .await
         .unwrap();
+    set_aside(&home, ".claude-pro");
 
-    let home_b_dir = tempfile::tempdir().unwrap();
-    let home_b = home_b_dir.path().canonicalize().unwrap();
-    let work_b = home_b.join("other/place");
-    std::fs::create_dir_all(&work_b).unwrap();
-    let adapter_b = ClaudeCode::new(home_b.clone());
-    let restored = adapter_b.restore(&work_b, out.path()).await.unwrap();
-    assert_eq!(restored.rules.len(), 3, "{:?}", restored.rules);
+    let other_root = home.join("other/place");
+    std::fs::create_dir_all(&other_root).unwrap();
+    let err = ClaudeCode::new(home.clone())
+        .restore(&other_root, out.path())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HarnessError::RootMismatch { .. }), "{err}");
 
-    let old_key = slug(&src.work).unwrap();
-    let new_key = slug(&work_b).unwrap();
-    let project = home_b.join(".claude/projects").join(&new_key);
-    assert!(project.join(format!("{SID}.jsonl")).is_file());
-    assert!(!home_b.join(".claude/projects").join(&old_key).exists());
-    let text = std::fs::read_to_string(project.join(format!("{SID}.jsonl"))).unwrap();
-    let root_a = src.work.to_string_lossy();
-    let root_b = work_b.to_string_lossy();
-    assert!(text.contains(&format!("\"cwd\":\"{root_b}\"")));
-    assert!(text.contains(&format!("\"file_path\":\"{root_b}/src/lib.rs\"")));
-    assert!(text.contains(&format!(
-        "{}/.claude/projects/{new_key}/{SID}/tool-results/1.txt",
-        home_b.display()
-    )));
-    assert!(
-        text.contains(&signed_block(&root_a)),
-        "signed block must keep the old path"
-    );
-    assert_eq!(
-        text.matches(root_a.as_ref()).count(),
-        1,
-        "only the signed block keeps the old root"
-    );
-    assert!(text.ends_with("cut by a cra"));
+    let other_home_dir = tempfile::tempdir().unwrap();
+    let other_home = other_home_dir.path().canonicalize().unwrap();
+    let err = ClaudeCode::new(other_home.clone())
+        .restore(&src.work, out.path())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HarnessError::HomeMismatch { .. }), "{err}");
+    assert!(!home.join(".claude").exists(), "nothing was placed");
+    assert!(!other_home.join(".claude").exists(), "nothing was placed");
+}
 
-    let meta = std::fs::read_to_string(project.join(format!("{SID}/subagents/agent-1.meta.json")))
+#[tokio::test]
+async fn restore_on_a_fresh_node_places_the_staged_bytes_unchanged() {
+    let src = build_source("fabric/jobs/j1/work");
+    let home = src.home.path().canonicalize().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let adapter = ClaudeCode::new(home.clone());
+    let manifest = adapter
+        .capture(&src.work, &session(), out.path())
+        .await
         .unwrap();
-    assert_eq!(meta, format!("{{\"worktreePath\":\"{root_b}\"}}"));
-    let other = std::fs::read_to_string(home_b.join(format!(
-        ".claude/projects/-other-key/{SID}/workflows/run.json"
-    )))
-    .unwrap();
-    assert_eq!(other, format!("{{\"scriptPath\":\"{root_b}/x.ts\"}}"));
-    let results =
-        std::fs::read_to_string(project.join(format!("{SID}/tool-results/1.txt"))).unwrap();
-    assert!(
-        results.contains(root_a.as_ref()),
-        "plain text sidecars are not rewritten"
-    );
-    assert!(
-        !work_b.join(".claude").exists(),
-        "workspace files are the workspace snapshot's to carry"
-    );
-    assert!(!home_b.join(".claude/.credentials.json").exists());
+    set_aside(&home, ".claude-pro");
 
-    // A second restore of the same bytes is a no-op; a grown transcript is
-    // accepted; a diverged one is refused before anything is written.
-    adapter_b.restore(&work_b, out.path()).await.unwrap();
-    let transcript = project.join(format!("{SID}.jsonl"));
-    let grown = format!("{text}sh\"}}\n{{\"type\":\"user\",\"cwd\":\"{root_b}\"}}\n");
+    let restored = adapter.restore(&src.work, out.path()).await.unwrap();
+    assert_eq!(restored.placed.len(), manifest.files.len());
+    for file in &manifest.files {
+        let rest = file.rel_path.as_str().strip_prefix("home/").unwrap();
+        assert_eq!(
+            std::fs::read(home.join(rest)).unwrap(),
+            std::fs::read(out.path().join(file.rel_path.as_str())).unwrap(),
+            "{rest} is placed byte for byte"
+        );
+    }
+    assert!(!home.join(".claude/.credentials.json").exists());
+
+    // The same bytes again change nothing; a grown transcript is kept.
+    let transcript = home
+        .join(".claude/projects")
+        .join(slug(&src.work).unwrap())
+        .join(format!("{SID}.jsonl"));
+    adapter.restore(&src.work, out.path()).await.unwrap();
+    let text = std::fs::read_to_string(&transcript).unwrap();
+    let grown = format!("{text}sh\"}}\n{{\"type\":\"user\"}}\n");
     std::fs::write(&transcript, &grown).unwrap();
-    let err = adapter_b.restore(&work_b, out.path()).await.unwrap_err();
+    let err = adapter.restore(&src.work, out.path()).await.unwrap_err();
     assert!(matches!(err, HarnessError::StateDiverged { .. }), "{err}");
     assert_eq!(std::fs::read_to_string(&transcript).unwrap(), grown);
 }
 
 #[tokio::test]
-async fn restore_into_the_same_root_rewrites_nothing() {
+async fn restore_over_this_nodes_own_unredacted_copy_is_refused() {
     let src = build_source("fabric/jobs/j1/work");
     let home = src.home.path().canonicalize().unwrap();
     let out = tempfile::tempdir().unwrap();
@@ -342,10 +342,9 @@ async fn restore_into_the_same_root_rewrites_nothing() {
     let err = adapter.restore(&src.work, out.path()).await.unwrap_err();
     assert!(matches!(err, HarnessError::StateDiverged { .. }), "{err}");
     assert_eq!(std::fs::read(&transcript).unwrap(), before);
-    // Remove the original: the redacted copy lands under the same key, unmapped.
+    // Remove the original: the redacted copy lands under the same key.
     std::fs::remove_file(&transcript).unwrap();
-    let restored = adapter.restore(&src.work, out.path()).await.unwrap();
-    assert!(restored.rules.is_empty());
+    adapter.restore(&src.work, out.path()).await.unwrap();
     let staged = std::fs::read(
         out.path()
             .join(format!("home/.claude/projects/{key}/{SID}.jsonl")),

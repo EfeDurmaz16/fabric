@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use fabric_core::harness::HarnessKind;
+use fabric_core::path::AbsPath;
 
 use crate::session::SessionId;
 
@@ -32,6 +33,26 @@ pub enum HarnessError {
     BadWorkspace {
         /// The path that was given.
         path: PathBuf,
+    },
+    /// A manifest captured under one workspace path is restored under another (ADR 0011).
+    #[error(
+        "state was captured for workspace {from}, not {to}; the root must be the same path on every node"
+    )]
+    RootMismatch {
+        /// The workspace path at capture.
+        from: AbsPath,
+        /// The workspace path given to restore.
+        to: AbsPath,
+    },
+    /// A manifest captured under one home directory is restored under another (ADR 0011).
+    #[error(
+        "state was captured under home {from}, not {to}; the home must be the same path on every node"
+    )]
+    HomeMismatch {
+        /// The home at capture.
+        from: AbsPath,
+        /// The home of the restoring adapter.
+        to: AbsPath,
     },
     /// A file operation failed.
     #[error("{op} {path}: {source}")]

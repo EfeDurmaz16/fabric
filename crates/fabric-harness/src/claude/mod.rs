@@ -9,10 +9,9 @@
 //! the workspace snapshot's to carry (ADR 0004), never this adapter's.
 //! Credentials, the global `~/.claude.json`, the process registry and the
 //! supervisor state never travel (see `denylist`), and a symlink in
-//! session state fails the capture instead of being followed. On
-//! restore the project key and every path-bearing string outside a signed
-//! block are mapped to the new workspace and home; signed blocks are never
-//! edited (ADR 0006). Login is never copied and no per-job config
+//! session state fails the capture instead of being followed. Restore
+//! accepts only the workspace path and home the state was captured under
+//! (ADR 0011), so nothing is rewritten and the project key is the same. Login is never copied and no per-job config
 //! directory is set: `CLAUDE_CONFIG_DIR` keys the login (ADR 0006, D15).
 //!
 //! Surfaces used, checked against `claude --help` of 2.1.294 on
@@ -36,7 +35,7 @@ use crate::files::{self, Source};
 use crate::harness::{self, Harness, Installed, Io, Launch, Restored, Running};
 use crate::manifest::{HOME_PREFIX, MANIFEST_FORMAT, Redaction, Rewrite, StateManifest};
 use crate::process;
-use crate::rewrite::{PathMap, RedactionCounts};
+use crate::redact::RedactionCounts;
 use crate::session::SessionId;
 
 /// The program name on `PATH`.
@@ -355,55 +354,24 @@ impl ClaudeCode {
                 restoring: HarnessKind::ClaudeCode,
             });
         }
-        let old_root = PathBuf::from(manifest.root.as_str());
-        let old_home = PathBuf::from(manifest.home.as_str());
-        let old_key = Self::key_of(&old_root)?;
-        let new_key = Self::key_of(&root)?;
-        let new_home_text = harness::abs_path(&self.home)?;
-        let new_root_text = harness::abs_path(&root)?;
-        let map = PathMap::new([
-            (
-                manifest.root.as_str().to_owned(),
-                new_root_text.as_str().to_owned(),
-            ),
-            (
-                manifest.home.as_str().to_owned(),
-                new_home_text.as_str().to_owned(),
-            ),
-            (old_key.clone(), new_key.clone()),
-        ]);
-        let old_key_prefix = format!(".claude/projects/{old_key}/");
+        harness::same_place(&manifest, &root, &self.home)?;
         let mut placed = Vec::new();
         for file in &manifest.files {
             let src = state.join(file.rel_path.as_str());
             let text = file.rel_path.as_str();
             let dest = if let Some(rest) = text.strip_prefix("home/") {
-                let rest = match rest.strip_prefix(&old_key_prefix) {
-                    Some(tail) => format!(".claude/projects/{new_key}/{tail}"),
-                    None => rest.to_owned(),
-                };
                 self.home.join(rest)
             } else if let Some(rest) = text.strip_prefix("workspace/") {
                 root.join(rest)
             } else {
                 continue;
             };
-            let bytes = match file.rewrite {
-                Rewrite::JsonText => files::rewrite_json_text(&src, &map)?,
-                Rewrite::None | Rewrite::Text => {
-                    std::fs::read(&src).map_err(|e| HarnessError::io("read", &src, e))?
-                }
-            };
+            let bytes = std::fs::read(&src).map_err(|e| HarnessError::io("read", &src, e))?;
             files::place(&dest, &bytes)?;
             placed.push(dest);
         }
-        let _ = old_home;
-        info!(session = %manifest.session, files = placed.len(), rules = map.rules().len(), "claude: restored");
-        Ok(Restored {
-            manifest,
-            placed,
-            rules: map.rules().to_vec(),
-        })
+        info!(session = %manifest.session, files = placed.len(), "claude: restored");
+        Ok(Restored { manifest, placed })
     }
 
     async fn detect_impl(&self) -> Result<Option<Installed>, HarnessError> {

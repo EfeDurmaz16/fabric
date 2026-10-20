@@ -1,7 +1,8 @@
-//! Property tests for the JSON text transform (ADR 0006: for arbitrary
-//! roots, a rewritten transcript leaves every signed block byte-identical;
-//! a signed block that holds a secret is dropped whole and nothing else
-//! changes) and for the path map's boundary rule.
+//! Property tests for the JSON redaction (ADR 0006): a signed block that
+//! holds no secret stays byte-identical, one that holds a secret is dropped
+//! whole however many of its neighbours are dropped too, no secret
+//! survives outside the kept blocks, the output is JSON, and redacting the
+//! output again changes nothing.
 
 #![allow(
     clippy::unwrap_used,
@@ -9,32 +10,18 @@
     reason = "a failed unwrap inside a test is the test failing"
 )]
 use fabric_harness::jsontext::transform;
-use fabric_harness::rewrite::{PathMap, Redactor};
+use fabric_harness::redact::Redactor;
 use proptest::prelude::*;
 use serde_json::{Map, Value, json};
 
-const OLD_ROOT: &str = "/Users/alpha/fabric/jobs/j1/work";
-const NEW_ROOT: &str = "/Users/beta/elsewhere/work";
-const OLD_HOME: &str = "/Users/alpha";
-const NEW_HOME: &str = "/Users/beta";
 const SECRET: &str = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab";
-
-fn map() -> PathMap {
-    PathMap::new([
-        (OLD_ROOT.to_owned(), NEW_ROOT.to_owned()),
-        (OLD_HOME.to_owned(), NEW_HOME.to_owned()),
-    ])
-}
 
 fn text_strategy() -> impl Strategy<Value = String> {
     prop_oneof![
-        Just(OLD_ROOT.to_owned()),
-        Just(format!("{OLD_ROOT}/src/lib.rs")),
-        Just(format!("cd {OLD_ROOT} && cargo test")),
-        Just(format!("{OLD_HOME}/.claude/projects/x/s.jsonl")),
-        Just(format!("{OLD_ROOT}-old/keep")),
-        Just(format!("{OLD_HOME}2/keep")),
+        Just("/Users/alpha/fabric/jobs/j1/work/src/lib.rs".to_owned()),
+        Just("cd /Users/alpha/w && cargo test".to_owned()),
         Just("plain text with \"quotes\" and \\ and \n newlines".to_owned()),
+        Just("caf\u{e9} \u{1F600}".to_owned()),
         "[a-zA-Z0-9 /._-]{0,24}",
         "\\PC{0,8}",
     ]
@@ -141,36 +128,9 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
     #[test]
-    fn signed_blocks_are_byte_identical_and_the_rest_is_mapped(value in value_strategy()) {
-        let text = serde_json::to_string(&value).unwrap();
-        let outcome = transform(&text, &map(), None).unwrap();
-        let after = outcome.text.clone().unwrap_or_else(|| text.clone());
-        let parsed: Value = serde_json::from_str(&after).expect("output is JSON");
-
-        let mut spans = Vec::new();
-        signed_spans(&value, &mut spans);
-        for span in &spans {
-            prop_assert!(after.contains(span.as_str()), "signed block changed: {span}");
-        }
-
-        let mut before_strings = Vec::new();
-        strings_outside_signed(&value, &mut before_strings);
-        let mut after_strings = Vec::new();
-        strings_outside_signed(&parsed, &mut after_strings);
-        prop_assert_eq!(before_strings.len(), after_strings.len());
-        for (before, after) in before_strings.iter().zip(&after_strings) {
-            let expected = map().apply(before).unwrap_or_else(|| before.clone());
-            prop_assert_eq!(after, &expected);
-        }
-
-        let again = transform(&after, &map(), None).unwrap();
-        prop_assert!(again.text.is_none(), "transform is idempotent");
-    }
-
-    #[test]
     fn redaction_drops_only_the_signed_blocks_that_hold_a_secret(value in value_with_secrets_strategy()) {
         let text = serde_json::to_string(&value).unwrap();
-        let outcome = transform(&text, &PathMap::default(), Some(Redactor::standard())).unwrap();
+        let outcome = transform(&text, Redactor::standard()).unwrap();
         let after = outcome.text.clone().unwrap_or_else(|| text.clone());
         let parsed: Value = serde_json::from_str(&after).expect("output is JSON");
         prop_assert!(!after.contains(SECRET), "a secret survived: {after}");
@@ -193,29 +153,18 @@ proptest! {
             let expected = before.replace(SECRET, "[REDACTED:github-token]");
             prop_assert_eq!(after, &expected);
         }
+
+        let again = transform(&after, Redactor::standard()).unwrap();
+        prop_assert!(again.text.is_none(), "redaction is idempotent");
     }
 
     #[test]
-    fn an_empty_map_never_changes_valid_json(value in value_strategy()) {
+    fn json_without_a_secret_is_never_changed(value in value_strategy()) {
         let text = serde_json::to_string(&value).unwrap();
-        let outcome = transform(&text, &PathMap::default(), None).unwrap();
+        let outcome = transform(&text, Redactor::standard()).unwrap();
         prop_assert!(outcome.text.is_none());
         let pretty = serde_json::to_string_pretty(&value).unwrap();
-        let outcome = transform(&pretty, &PathMap::default(), None).unwrap();
+        let outcome = transform(&pretty, Redactor::standard()).unwrap();
         prop_assert!(outcome.text.is_none());
-    }
-
-    #[test]
-    fn path_map_is_idempotent_and_respects_boundaries(text in text_strategy(), suffix in "[a-zA-Z0-9._-]{1,4}") {
-        let m = map();
-        let once = m.apply(&text).unwrap_or_else(|| text.clone());
-        prop_assert!(m.apply(&once).is_none());
-        // Glued to the root, the root rule must not fire; the home rule still
-        // does, because the home is followed by a `/`.
-        let glued = format!("{OLD_ROOT}{suffix}");
-        prop_assert_eq!(
-            m.apply(&glued),
-            Some(format!("{NEW_HOME}/fabric/jobs/j1/work{suffix}"))
-        );
     }
 }

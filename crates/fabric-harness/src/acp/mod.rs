@@ -21,7 +21,7 @@ use crate::files::{self, Source};
 use crate::harness::{self, Harness, Installed, Io, Launch, Restored, Running};
 use crate::manifest::{HOME_PREFIX, MANIFEST_FORMAT, Redaction, Rewrite, StateManifest};
 use crate::process;
-use crate::rewrite::RedactionCounts;
+use crate::redact::RedactionCounts;
 use crate::session::SessionId;
 
 use self::client::{AcpClient, PermissionPolicy};
@@ -148,7 +148,7 @@ impl AcpHarness {
     }
 
     fn restore_impl(&self, workspace: &Path, state: &Path) -> Result<Restored, HarnessError> {
-        harness::physical_workspace(workspace)?;
+        let root = harness::physical_workspace(workspace)?;
         let manifest = StateManifest::read(state)?;
         if manifest.kind != self.kind() {
             return Err(HarnessError::WrongHarness {
@@ -156,6 +156,7 @@ impl AcpHarness {
                 restoring: self.kind(),
             });
         }
+        harness::same_place(&manifest, &root, &self.home)?;
         let mut placed = Vec::new();
         for file in &manifest.files {
             let Some(rest) = file.rel_path.as_str().strip_prefix("home/") else {
@@ -167,11 +168,7 @@ impl AcpHarness {
             files::place(&dest, &bytes)?;
             placed.push(dest);
         }
-        Ok(Restored {
-            manifest,
-            placed,
-            rules: Vec::new(),
-        })
+        Ok(Restored { manifest, placed })
     }
 
     async fn detect_impl(&self) -> Result<Option<Installed>, HarnessError> {

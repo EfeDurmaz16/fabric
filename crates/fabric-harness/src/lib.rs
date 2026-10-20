@@ -8,7 +8,8 @@
 //!
 //! The invariant this crate protects: a captured state tree never holds a
 //! credential, a restore never destroys state that is already on disk, and
-//! a path rewrite never touches a signed block.
+//! a restore happens only under the workspace path and home the state was
+//! captured under (ADR 0011), so nothing is rewritten.
 //!
 //! The crate is organised around one trait, [`Harness`], and three
 //! adapters behind cargo features: [`acp`], [`claude`] and [`codex`].
@@ -21,7 +22,7 @@ pub mod harness;
 pub mod jsontext;
 pub mod manifest;
 pub mod process;
-pub mod rewrite;
+pub mod redact;
 pub mod session;
 
 #[cfg(feature = "acp")]

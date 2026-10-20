@@ -108,8 +108,6 @@ pub struct Restored {
     pub manifest: StateManifest,
     /// Every file that was placed, in order.
     pub placed: Vec<PathBuf>,
-    /// The path rules that were applied, `from -> to`; empty when roots and homes matched.
-    pub rules: Vec<(String, String)>,
 }
 
 /// An agent that can be captured, restored and started (ADR 0006).
@@ -176,4 +174,29 @@ pub(crate) fn abs_path(path: &Path) -> Result<AbsPath, HarnessError> {
         path: path.to_path_buf(),
         reason: e.to_string(),
     })
+}
+
+/// Refuses a restore whose manifest was captured under another workspace
+/// path or home: under ADR 0011 the target root is the captured root, and
+/// the harness keys its state to those exact strings.
+pub(crate) fn same_place(
+    manifest: &StateManifest,
+    root: &Path,
+    home: &Path,
+) -> Result<(), HarnessError> {
+    let root = abs_path(root)?;
+    if manifest.root != root {
+        return Err(HarnessError::RootMismatch {
+            from: manifest.root.clone(),
+            to: root,
+        });
+    }
+    let home = abs_path(home)?;
+    if manifest.home != home {
+        return Err(HarnessError::HomeMismatch {
+            from: manifest.home.clone(),
+            to: home,
+        });
+    }
+    Ok(())
 }

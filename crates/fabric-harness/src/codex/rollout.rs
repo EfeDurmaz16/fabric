@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::error::HarnessError;
-use crate::rewrite::Redactor;
+use crate::redact::Redactor;
 
 /// One rollout file as found on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]

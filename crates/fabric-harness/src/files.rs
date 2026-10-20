@@ -18,7 +18,7 @@ use crate::denylist;
 use crate::error::HarnessError;
 use crate::jsontext::{self, TransformError};
 use crate::manifest::{Carried, Rewrite};
-use crate::rewrite::{PathMap, RedactionCounts, Redactor};
+use crate::redact::{RedactionCounts, Redactor};
 
 /// The redaction rule name under which dropped signed blocks are counted.
 pub const SIGNED_BLOCK_DROPPED: &str = "signed-block-dropped";
@@ -188,7 +188,7 @@ fn stage_json_text(
             out.extend_from_slice(&line);
             continue;
         }
-        match jsontext::transform(body, &PathMap::default(), Some(redactor)) {
+        match jsontext::transform(body, redactor) {
             Ok(outcome) => {
                 out.extend_from_slice(outcome.text.as_deref().unwrap_or(body).as_bytes());
                 out.extend_from_slice(newline);
@@ -299,53 +299,6 @@ pub fn place(dest: &Path, bytes: &[u8]) -> Result<(), HarnessError> {
         Err(e) => return Err(HarnessError::io("read", dest, e)),
     }
     write_atomic(dest, bytes)
-}
-
-/// Applies `map` to a staged JSON-text file and returns the bytes to place.
-pub fn rewrite_json_text(path: &Path, map: &PathMap) -> Result<Vec<u8>, HarnessError> {
-    let bytes = fs::read(path).map_err(|e| HarnessError::io("read", path, e))?;
-    if map.is_empty() {
-        return Ok(bytes);
-    }
-    let text = String::from_utf8(bytes).map_err(|e| HarnessError::Malformed {
-        what: "json text",
-        path: path.to_path_buf(),
-        reason: e.to_string(),
-    })?;
-    let mut out = String::with_capacity(text.len());
-    for (index, line) in text.split_inclusive('\n').enumerate() {
-        let (body, newline) = match line.strip_suffix('\n') {
-            Some(b) => (b, "\n"),
-            None => (line, ""),
-        };
-        if body.trim().is_empty() {
-            out.push_str(line);
-            continue;
-        }
-        match jsontext::transform(body, map, None) {
-            Ok(outcome) => {
-                out.push_str(outcome.text.as_deref().unwrap_or(body));
-                out.push_str(newline);
-            }
-            Err(TransformError::NotJson { .. }) => {
-                // A whole-file JSON document has newlines inside values of
-                // no line; fall back to transforming the whole text once.
-                if index == 0 && text.contains('\n') {
-                    if let Ok(outcome) = jsontext::transform(&text, map, None) {
-                        return Ok(outcome.text.unwrap_or(text).into_bytes());
-                    }
-                    warn!(path = %path.display(), "file is not JSON; placed without rewrite");
-                    return Ok(text.into_bytes());
-                }
-                warn!(path = %path.display(), line = index + 1, "line is not JSON; mapped as text");
-                out.push_str(&map.apply(line).unwrap_or_else(|| line.to_owned()));
-            }
-            Err(TransformError::SecretInUndroppableSignedBlock) => {
-                out.push_str(line);
-            }
-        }
-    }
-    Ok(out.into_bytes())
 }
 
 #[cfg(test)]
@@ -484,23 +437,5 @@ mod tests {
         assert_eq!(staged.matches("[REDACTED:github-token]").count(), 2);
         assert_eq!(counts.get("github-token"), Some(&2));
         assert!(staged.ends_with("\"cut\":\"[REDACTED:github-token]"));
-    }
-
-    #[test]
-    fn rewrite_json_text_handles_lines_and_whole_documents() {
-        let dir = tempfile::tempdir().unwrap();
-        let map = PathMap::new([("/old".to_owned(), "/new".to_owned())]);
-        let lines = dir.path().join("l.jsonl");
-        fs::write(&lines, "{\"cwd\":\"/old\"}\n{\"cwd\":\"/old/x\"}\n").unwrap();
-        assert_eq!(
-            rewrite_json_text(&lines, &map).unwrap(),
-            b"{\"cwd\":\"/new\"}\n{\"cwd\":\"/new/x\"}\n"
-        );
-        let doc = dir.path().join("d.json");
-        fs::write(&doc, "{\n  \"path\": \"/old/y\"\n}\n").unwrap();
-        assert_eq!(
-            rewrite_json_text(&doc, &map).unwrap(),
-            b"{\n  \"path\": \"/new/y\"\n}\n"
-        );
     }
 }

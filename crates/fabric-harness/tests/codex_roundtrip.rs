@@ -1,6 +1,7 @@
 //! Codex adapter: a paginated lineage with a compressed prefix is captured
-//! under the writer lock, restored into another home under
-//! `sessions/fabric/<thread>/`, and a fake `codex` is launched there.
+//! under the writer lock, restored onto a node with the same home and
+//! workspace path but no Codex state, under `sessions/fabric/<thread>/`,
+//! and a fake `codex` is launched there.
 
 #![allow(
     clippy::unwrap_used,
@@ -212,15 +213,15 @@ async fn a_rollout_with_a_secret_is_refused_not_carried() {
 async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_there() {
     let src = build_source();
     let out = tempfile::tempdir().unwrap();
-    Codex::new(src.home.path().canonicalize().unwrap())
+    let home_b = src.home.path().canonicalize().unwrap();
+    Codex::new(home_b.clone())
         .capture(&src.work, &thread(), out.path())
         .await
         .unwrap();
-
-    let home_b_dir = tempfile::tempdir().unwrap();
-    let home_b = home_b_dir.path().canonicalize().unwrap();
-    let work_b = home_b.join("jobs/j1/work");
-    std::fs::create_dir_all(&work_b).unwrap();
+    // The other node has the same home and workspace path (ADR 0011) and
+    // no Codex state.
+    std::fs::rename(home_b.join(".codex"), home_b.join(".codex-departed")).unwrap();
+    let work_b = src.work.clone();
     let bin = fake_codex(&home_b);
     let adapter = Codex::new(home_b.clone())
         .with_path_var(bin.clone())

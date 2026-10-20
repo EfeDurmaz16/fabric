@@ -36,7 +36,7 @@ use crate::files::{self, Source};
 use crate::harness::{self, Harness, Installed, Io, Launch, Restored, Running};
 use crate::manifest::{HOME_PREFIX, MANIFEST_FORMAT, Redaction, Rewrite, StateManifest};
 use crate::process;
-use crate::rewrite::RedactionCounts;
+use crate::redact::RedactionCounts;
 use crate::session::SessionId;
 
 use self::rollout::RolloutFile;
@@ -336,7 +336,7 @@ impl Codex {
     }
 
     fn restore_impl(&self, workspace: &Path, state: &Path) -> Result<Restored, HarnessError> {
-        harness::physical_workspace(workspace)?;
+        let root = harness::physical_workspace(workspace)?;
         let manifest = StateManifest::read(state)?;
         if manifest.kind != HarnessKind::Codex {
             return Err(HarnessError::WrongHarness {
@@ -344,6 +344,7 @@ impl Codex {
                 restoring: HarnessKind::Codex,
             });
         }
+        harness::same_place(&manifest, &root, &self.home)?;
         let target_dir = self
             .store
             .join("sessions")
@@ -361,11 +362,7 @@ impl Codex {
             placed.push(dest);
         }
         info!(session = %manifest.session, files = placed.len(), "codex: restored");
-        Ok(Restored {
-            manifest,
-            placed,
-            rules: Vec::new(),
-        })
+        Ok(Restored { manifest, placed })
     }
 
     async fn detect_impl(&self) -> Result<Option<Installed>, HarnessError> {
