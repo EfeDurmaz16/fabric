@@ -1,8 +1,10 @@
 //! Length-prefixed frames (ADR 0005).
 //!
-//! Invariant: a reader allocates for a frame only after its declared length
-//! passed the cap the reader chose, so a peer cannot make this node hold
-//! more than one frame per stream in memory. A frame is
+//! Invariant: a reader accepts a frame only if its declared length passed
+//! the cap the reader chose, and grows the frame's buffer only as its bytes
+//! arrive. A peer cannot make this node hold more than one frame per stream,
+//! and a header alone, four bytes that declare 8 MiB, costs this node no
+//! more than `INITIAL_CAPACITY`. A frame is
 //! `u32 length | u8 version | payload`, little endian, with `length`
 //! counting the version byte and the payload.
 
@@ -23,6 +25,9 @@ pub const MAX_CHUNK_BYTES: usize = 8 << 20;
 pub const MAX_BULK_FRAME: usize = MAX_CHUNK_BYTES + 1024;
 
 const LENGTH_LEN: usize = 4;
+
+/// The buffer a reader starts a frame with; it grows as the frame's bytes arrive.
+const INITIAL_CAPACITY: usize = 64 << 10;
 
 /// Why a frame could not be read or written.
 #[derive(Debug, thiserror::Error)]
@@ -103,14 +108,16 @@ pub async fn read_frame<R: AsyncRead + Unpin + ?Sized>(
     if len == 0 {
         return Err(FrameError::TooShort(length));
     }
-    let mut body = vec![0u8; len];
-    reader.read_exact(&mut body).await.map_err(|err| {
-        if err.kind() == io::ErrorKind::UnexpectedEof {
-            FrameError::Truncated
-        } else {
-            FrameError::Io(err)
-        }
-    })?;
+    let mut body = Vec::with_capacity(len.min(INITIAL_CAPACITY));
+    let declared = u64::from(length);
+    let read = reader
+        .take(declared)
+        .read_to_end(&mut body)
+        .await
+        .map_err(FrameError::Io)?;
+    if read < len {
+        return Err(FrameError::Truncated);
+    }
     let version = body[0];
     if version != FRAME_VERSION {
         return Err(FrameError::BadVersion(version));
