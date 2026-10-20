@@ -83,11 +83,8 @@ pub struct CaptureRequest<'a> {
 }
 
 /// What kind of bundle the capture produced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BundleKind {
-    /// The root is not a repository.
-    #[default]
-    NoGit,
     /// Every object the refs reach.
     Full,
     /// Only objects the parent's refs did not reach.
@@ -158,8 +155,8 @@ pub struct CaptureReport {
     pub stripped_userinfo: Vec<String>,
     /// Repeated config keys where only the last value travels.
     pub repeated_config: Vec<String>,
-    /// The bundle shape.
-    pub bundle: BundleKind,
+    /// The bundle shape; none when the root is not a repository.
+    pub bundle: Option<BundleKind>,
 }
 
 /// A manifest ready to publish, with the report.
@@ -543,6 +540,24 @@ impl Capturer<'_> {
         Ok(stored.chunks)
     }
 
+    /// Stores a bundle, records its kind, and returns its chunks with the base it excludes.
+    fn store_bundle(
+        &mut self,
+        built: BuiltBundle,
+        parent: Option<SnapshotId>,
+    ) -> Result<(Vec<ChunkId>, Option<SnapshotId>), CaptureError> {
+        let (stored, kind) = match built {
+            BuiltBundle::Full(file) => ((self.store_scratch_file(file)?, None), BundleKind::Full),
+            BuiltBundle::Incremental(file) => (
+                (self.store_scratch_file(file)?, parent),
+                BundleKind::Incremental,
+            ),
+            BuiltBundle::Empty => ((Vec::new(), parent), BundleKind::Empty),
+        };
+        self.report.bundle = Some(kind);
+        Ok(stored)
+    }
+
     /// Captures the harness state directory: every path but those the secret list names.
     ///
     /// The adapter's state is not a workspace, so the excludes and cache
@@ -581,6 +596,16 @@ impl Markers for DirMarkers<'_> {
             .entry((dir.to_owned(), name.to_owned()))
             .or_insert_with(|| fs::symlink_metadata(root.join(dir).join(name)).is_ok())
     }
+}
+
+/// A bundle capture made, with the file that holds it.
+enum BuiltBundle {
+    /// Every object the refs reach.
+    Full(TempFile),
+    /// Only objects the parent's refs did not reach.
+    Incremental(TempFile),
+    /// The parent's refs already reached every object.
+    Empty,
 }
 
 /// The git half of a capture.
@@ -862,12 +887,8 @@ impl GitCapture<'_> {
         ))
     }
 
-    /// Creates the bundle and returns its path with its kind, or no path for an empty one.
-    fn bundle(
-        &self,
-        tips: &[GitOid],
-        chain_full: bool,
-    ) -> Result<(Option<TempFile>, BundleKind), CaptureError> {
+    /// Creates the bundle; an empty one has no file.
+    fn bundle(&self, tips: &[GitOid], chain_full: bool) -> Result<BuiltBundle, CaptureError> {
         let path = TempFile::in_dir(&self.scratch);
         let path_text = path.path().to_string_lossy().into_owned();
         let incremental = !tips.is_empty() && !chain_full;
@@ -888,18 +909,18 @@ impl GitCapture<'_> {
                 args.extend(existing);
                 let out = self.git.output(&args, &[])?;
                 if out.status.success() && self.git.succeeds(&["bundle", "verify", &path_text])? {
-                    return Ok((Some(path), BundleKind::Incremental));
+                    return Ok(BuiltBundle::Incremental(path));
                 }
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 if stderr.contains("empty bundle") {
-                    return Ok((None, BundleKind::Empty));
+                    return Ok(BuiltBundle::Empty);
                 }
                 tracing::warn!(stderr = %stderr.trim(), "incremental bundle failed; making a full one");
             }
         }
         self.git.run(&["bundle", "create", &path_text, "--all"])?;
         self.git.run(&["bundle", "verify", &path_text])?;
-        Ok((Some(path), BundleKind::Full))
+        Ok(BuiltBundle::Full(path))
     }
 
     fn delete_older_snap_refs(&self, current: &GitOid) -> Result<(), CaptureError> {
@@ -1180,13 +1201,7 @@ fn capture_git(
         },
         None => (Vec::new(), true, None),
     };
-    let (bundle_path, kind) = gc.bundle(&tips, chain_full)?;
-    let (bundle, bundle_base) = match (bundle_path, kind) {
-        (Some(file), BundleKind::Incremental) => (capturer.store_scratch_file(file)?, parent_id),
-        (Some(file), _) => (capturer.store_scratch_file(file)?, None),
-        (None, _) => (Vec::new(), parent_id),
-    };
-    capturer.report.bundle = kind;
+    let (bundle, bundle_base) = capturer.store_bundle(gc.bundle(&tips, chain_full)?, parent_id)?;
     gc.delete_older_snap_refs(&worktree_commit)?;
 
     let refs = gc.refs()?;

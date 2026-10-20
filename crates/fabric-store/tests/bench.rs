@@ -124,7 +124,7 @@ struct Measured {
     published_in: Duration,
     files: u64,
     bytes: u64,
-    bundle: BundleKind,
+    bundle: Option<BundleKind>,
     new_objects: u64,
     new_bytes: u64,
     manifest_len: usize,

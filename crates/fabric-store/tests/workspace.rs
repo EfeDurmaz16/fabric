@@ -198,7 +198,7 @@ fn git_state_survives_capture_and_restore() {
     let policy = IgnorePolicy::default();
     let Captured { manifest, report } = capture(&store, &request(&root, &policy, None)).unwrap();
 
-    assert_eq!(report.bundle, BundleKind::Full);
+    assert_eq!(report.bundle, Some(BundleKind::Full));
     assert_eq!(report.denied, Vec::<RelPath>::new());
     assert_eq!(
         report.denied_untracked,
@@ -341,7 +341,7 @@ fn a_second_snapshot_carries_only_new_objects_and_restores_through_the_chain() {
     git(&root).run(&["commit", "-q", "-m", "two"]).unwrap();
     fs::write(root.join("build.log"), "precious ignored, changed\n").unwrap();
     let second = capture(&store, &request(&root, &policy, Some(s1))).unwrap();
-    assert_eq!(second.report.bundle, BundleKind::Incremental);
+    assert_eq!(second.report.bundle, Some(BundleKind::Incremental));
     assert_eq!(second.manifest.git.as_ref().unwrap().bundle_base, Some(s1));
     assert_eq!(second.manifest.parent, Some(s1));
     // The new bundle, the changed log and nothing from node_modules.
@@ -353,7 +353,7 @@ fn a_second_snapshot_carries_only_new_objects_and_restores_through_the_chain() {
     let s2 = store.publish(&second.manifest).unwrap();
 
     let third = capture(&store, &request(&root, &policy, Some(s2))).unwrap();
-    assert_eq!(third.report.bundle, BundleKind::Empty);
+    assert_eq!(third.report.bundle, Some(BundleKind::Empty));
     assert!(third.manifest.git.as_ref().unwrap().bundle.is_empty());
     let s3 = store.publish(&third.manifest).unwrap();
 
@@ -426,7 +426,7 @@ fn every_secret_pattern_keeps_its_file_out_of_the_manifest() {
     policy.load_fabricignore(&root).unwrap();
     let Captured { manifest, report } = capture(&store, &request(&root, &policy, None)).unwrap();
     assert!(manifest.git.is_none());
-    assert_eq!(report.bundle, BundleKind::NoGit);
+    assert_eq!(report.bundle, None);
 
     let files: Vec<&str> = manifest.files.iter().map(|e| e.rel_path.as_str()).collect();
     for base in ["", "precious/"] {
