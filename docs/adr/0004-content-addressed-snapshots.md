@@ -125,7 +125,7 @@ Every list is strictly sorted by its key (paths and ref names by their bytes), a
   | Class | How a path gets it | Carried |
   |---|---|---|
   | Secrets | basename or any component matches a secret pattern (below) | Never. Hard denylist, not policy. |
-  | Deps | the path is a dependency directory the `EnvSpec` names (`node_modules`, `.pnpm-store`, `.venv`, `vendor`) | When ADR 0012 says the target can use it; else left behind, listed, and rebuilt by the `EnvSpec` |
+  | Deps | the path is a dependency directory the `EnvSpec` names (`node_modules`, `.venv`, `vendor`; never `.pnpm-store`, ADR 0007 amendment 3) | When ADR 0012 says the target can use it; else left behind, listed, and rebuilt by the `EnvSpec` |
   | Build | a build output directory the `EnvSpec` names (`target`, `dist`, `build`, `out`, `.next`, `.turbo`) | Same rule as Deps |
   | Tool cache | a known cache name (`__pycache__`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`, `.cache`) | Same rule as Deps; dropping it costs only time |
   | Precious | everything else that git ignores | Always. It is the user's work and nothing else can recreate it. |
