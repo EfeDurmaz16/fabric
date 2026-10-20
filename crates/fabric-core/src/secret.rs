@@ -27,6 +27,7 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::credential::looks_like_credential;
 use crate::env::OVERRIDE_FILE;
 use crate::path::RelPath;
 
@@ -58,6 +59,12 @@ pub enum SecretPatternError {
     /// pattern comes from: the override file or a peer's spec.
     #[error("secret pattern matches {OVERRIDE_FILE}, which detection must be able to read")]
     DeniesOverrideFile,
+    /// The pattern is shaped like a credential, such as a token pasted in by mistake.
+    ///
+    /// Patterns travel in the job's spec to other nodes, so a token here
+    /// would leave the node the way the policy exists to prevent.
+    #[error("secret pattern is shaped like a credential; patterns travel in the spec")]
+    Credential,
     /// Encoded bytes hold an ASCII capital, which no stored pattern has.
     #[error("secret pattern has an ASCII capital at index {index}; stored patterns are lowercase")]
     NotLowercase {
@@ -70,7 +77,8 @@ pub enum SecretPatternError {
 ///
 /// Refused: `\`, `[`, `]`, `?`, `!`, `#`, whitespace and NUL, because
 /// gitignore gives them meanings the matcher does not; empty, `.`, `..`
-/// and `**` components; and any pattern that denies `OVERRIDE_FILE`.
+/// and `**` components; any pattern that denies `OVERRIDE_FILE`; and
+/// any pattern shaped like a credential, since patterns travel in the spec.
 /// Checked once, at the boundary, including inside `Deserialize`.
 ///
 /// Matching ignores ASCII case, so the stored form is ASCII lowercase:
@@ -100,6 +108,10 @@ impl SecretPattern {
                 "**" => return Err(SecretPatternError::DoubleStar),
                 _ => {}
             }
+        }
+        // Checked before folding: some shapes, such as `AKIA`, are capitals.
+        if looks_like_credential(text) {
+            return Err(SecretPatternError::Credential);
         }
         let pattern = Self(text.to_ascii_lowercase());
         if pattern_matches(&pattern, OVERRIDE_FILE) {
@@ -594,6 +606,22 @@ mod tests {
 
     /// The built-in list obeys the rules a job's patterns are held to, so
     /// one matcher serves both.
+    /// A token pasted into `secret_patterns` would travel in the spec, so
+    /// it is refused before it is folded and stored, from a file or a peer.
+    #[test]
+    fn a_credential_shaped_pattern_is_refused() {
+        let github = format!("ghp_{}", "a1".repeat(18));
+        for text in [github.as_str(), "AKIAIOSFODNN7EXAMPLE"] {
+            assert_eq!(
+                SecretPattern::parse(text),
+                Err(SecretPatternError::Credential),
+                "{text}"
+            );
+        }
+        let bytes = postcard::to_stdvec(&github).unwrap();
+        assert!(postcard::from_bytes::<SecretPattern>(&bytes).is_err());
+    }
+
     #[test]
     fn every_builtin_is_a_valid_pattern() {
         for builtin in EVERYWHERE.iter().chain(OUTSIDE_CACHES) {
