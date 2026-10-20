@@ -5,7 +5,8 @@
 //! under `$CODEX_HOME/sessions/fabric/<thread_id>/`, a folder Codex's
 //! file-name scan accepts. Nothing is rewritten: Codex retargets the
 //! thread to the directory it is resumed from (H2, experiments E2, E3b),
-//! and a paginated prefix is referenced by byte offset. `auth.json`, the
+//! and a paginated prefix is referenced by byte offset. Because the bytes
+//! travel verbatim, a rollout that holds a secret is refused. `auth.json`, the
 //! `SQLite` files, the locks and `config.toml` never travel. `CODEX_HOME` is
 //! never set per job because the keyring entry is derived from it (ADR
 //! 0006, D15); trust for the new path is passed as a `-c` override on
@@ -282,6 +283,7 @@ impl Codex {
         let chain = self.lineage(session)?;
         let mut sources = Vec::with_capacity(chain.len());
         for file in &chain {
+            rollout::refuse_secrets(file)?;
             let rel = file
                 .path
                 .strip_prefix(&self.store)

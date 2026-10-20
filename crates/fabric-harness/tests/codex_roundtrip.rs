@@ -184,6 +184,31 @@ async fn an_active_writer_blocks_capture() {
 }
 
 #[tokio::test]
+async fn a_rollout_with_a_secret_is_refused_not_carried() {
+    let src = build_source();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&src.head)
+        .unwrap();
+    file.write_all(
+        b"{\"type\":\"response_item\",\"payload\":{\"text\":\"token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab\"}}\n",
+    )
+    .unwrap();
+    drop(file);
+    let adapter = Codex::new(src.home.path().canonicalize().unwrap());
+    let out = tempfile::tempdir().unwrap();
+    let err = adapter
+        .capture(&src.work, &thread(), out.path())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, HarnessError::SecretInState { line: 3, .. }),
+        "{err}"
+    );
+    assert!(!out.path().join("manifest.json").exists());
+}
+
+#[tokio::test]
 async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_there() {
     let src = build_source();
     let out = tempfile::tempdir().unwrap();

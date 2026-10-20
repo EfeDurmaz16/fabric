@@ -127,6 +127,14 @@ pub enum HarnessError {
         /// The harness asked to restore it.
         restoring: HarnessKind,
     },
+    /// A file carried byte for byte holds a secret-shaped string.
+    #[error("{path} line {line} holds a secret; it cannot be carried byte for byte")]
+    SecretInState {
+        /// The file concerned.
+        path: PathBuf,
+        /// One-based line number.
+        line: usize,
+    },
     /// A secret matched inside a signed block that is not an array element, so it cannot be dropped.
     #[error("{path} line {line}: a secret sits inside a signed block that cannot be dropped")]
     SecretInSignedBlock {

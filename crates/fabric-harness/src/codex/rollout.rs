@@ -8,6 +8,8 @@
 //! paginated thread owns only its suffix; the prefix lives in the rollout
 //! named by `session_meta.history_base.thread_id`, which is a rollout id,
 //! and must travel byte for byte because the reference is a byte offset.
+//! Because the bytes travel verbatim, a rollout that holds a secret-shaped
+//! string is refused rather than carried.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -15,6 +17,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::error::HarnessError;
+use crate::rewrite::Redactor;
 
 /// One rollout file as found on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,22 +159,24 @@ pub struct Meta {
     pub history_base: Option<String>,
 }
 
-/// Reads and parses the first line of a plain or compressed rollout.
-pub fn read_meta(file: &RolloutFile) -> Result<Meta, HarnessError> {
+fn open_lines(file: &RolloutFile) -> Result<Box<dyn BufRead>, HarnessError> {
     let handle =
         std::fs::File::open(&file.path).map_err(|e| HarnessError::io("read", &file.path, e))?;
-    let mut line = String::new();
     if file.compressed {
         let decoder = zstd::stream::read::Decoder::new(handle)
             .map_err(|e| HarnessError::io("read", &file.path, e))?;
-        BufReader::new(decoder)
-            .read_line(&mut line)
-            .map_err(|e| HarnessError::io("read", &file.path, e))?;
+        Ok(Box::new(BufReader::new(decoder)))
     } else {
-        BufReader::new(handle)
-            .read_line(&mut line)
-            .map_err(|e| HarnessError::io("read", &file.path, e))?;
+        Ok(Box::new(BufReader::new(handle)))
     }
+}
+
+/// Reads and parses the first line of a plain or compressed rollout.
+pub fn read_meta(file: &RolloutFile) -> Result<Meta, HarnessError> {
+    let mut line = String::new();
+    open_lines(file)?
+        .read_line(&mut line)
+        .map_err(|e| HarnessError::io("read", &file.path, e))?;
     let parsed: FirstLine =
         serde_json::from_str(line.trim_end()).map_err(|e| HarnessError::Malformed {
             what: "rollout line",
@@ -189,6 +194,30 @@ pub fn read_meta(file: &RolloutFile) -> Result<Meta, HarnessError> {
         cwd: parsed.payload.cwd,
         history_base: parsed.payload.history_base.map(|h| h.thread_id),
     })
+}
+
+/// Refuses a rollout, plain or compressed, that holds a secret-shaped string.
+pub(crate) fn refuse_secrets(file: &RolloutFile) -> Result<(), HarnessError> {
+    let mut lines = open_lines(file)?;
+    let mut line = Vec::new();
+    let mut number = 0usize;
+    loop {
+        line.clear();
+        if lines
+            .read_until(b'\n', &mut line)
+            .map_err(|e| HarnessError::io("read", &file.path, e))?
+            == 0
+        {
+            return Ok(());
+        }
+        number += 1;
+        if Redactor::standard().matches_bytes(&line) {
+            return Err(HarnessError::SecretInState {
+                path: file.path.clone(),
+                line: number,
+            });
+        }
+    }
 }
 
 #[cfg(test)]
