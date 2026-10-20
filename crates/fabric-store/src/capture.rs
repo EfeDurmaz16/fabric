@@ -907,20 +907,32 @@ impl GitCapture<'_> {
                 reason: BusyReason::Conflicts,
             });
         }
-        let status = self
-            .git
-            .run(&["status", "--porcelain=v2", "-z", "--untracked-files=no"])?;
-        for record in Git::records(&status) {
+        // `--ignore-submodules=none` overrides a `submodule.<name>.ignore`
+        // in the config or in .gitmodules, which would hide the local work.
+        let status = self.git.run(&[
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=no",
+            "--ignore-submodules=none",
+        ])?;
+        let mut records = Git::records(&status);
+        while let Some(record) = records.next() {
             let text = Git::text("status record", record)?;
-            let mut fields = text.split(' ');
-            if fields.next() != Some("1") {
-                continue;
-            }
-            let _xy = fields.next();
-            let sub = fields.next().unwrap_or("");
+            // The path is the last field and, under -z, may hold spaces. A
+            // rename record has one more field and is followed by a record
+            // that holds the old path.
+            let fields = match text.split(' ').next() {
+                Some("1") => 9,
+                Some("2") => {
+                    records.next();
+                    10
+                }
+                _ => continue,
+            };
+            let sub = text.split(' ').nth(2).unwrap_or("");
             if sub.starts_with('S') && sub[1..].chars().any(|c| c != '.') {
-                // The path is the ninth field and, under -z, may hold spaces.
-                let path = rel_path(text.splitn(9, ' ').nth(8).unwrap_or(""))?;
+                let path = rel_path(text.splitn(fields, ' ').last().unwrap_or(""))?;
                 return Err(CaptureError::GitSubmoduleDirty { path });
             }
         }

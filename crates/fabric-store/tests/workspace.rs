@@ -1305,30 +1305,66 @@ fn a_fifo_or_socket_is_left_behind_and_named() {
     );
 }
 
-#[test]
-fn a_submodule_with_local_changes_is_refused_by_its_whole_path() {
-    let dir = tempfile::tempdir().unwrap();
-    let upstream = dir.path().join("upstream");
-    fs::create_dir(&upstream).unwrap();
-    fs::write(upstream.join("lib.rs"), "one\n").unwrap();
+/// Makes a repository at `<dir>/work` with a committed submodule at `my lib`.
+fn repo_with_submodule(dir: &Path) -> Fallible<PathBuf> {
+    let upstream = dir.join("upstream");
+    fs::create_dir(&upstream)?;
+    fs::write(upstream.join("lib.rs"), "one\n")?;
     let u = git(&upstream);
-    u.run(&["init", "-q", "-b", "main"]).unwrap();
-    u.run(&["add", "-A"]).unwrap();
-    u.run(&["commit", "-q", "-m", "lib"]).unwrap();
-
-    let root = dir.path().join("work");
-    fs::create_dir(&root).unwrap();
+    u.run(&["init", "-q", "-b", "main"])?;
+    u.run(&["add", "-A"])?;
+    u.run(&["commit", "-q", "-m", "lib"])?;
+    let root = dir.join("work");
+    fs::create_dir(&root)?;
     let g = git(&root);
-    g.run(&["init", "-q", "-b", "main"]).unwrap();
+    g.run(&["init", "-q", "-b", "main"])?;
     g.run(&[
         "submodule",
         "add",
         "-q",
-        upstream.to_str().unwrap(),
+        upstream.to_str().ok_or("path")?,
         "my lib",
-    ])
-    .unwrap();
-    g.run(&["commit", "-q", "-m", "with a submodule"]).unwrap();
+    ])?;
+    g.run(&["commit", "-q", "-m", "with a submodule"])?;
+    Ok(root)
+}
+
+#[test]
+fn a_submodule_the_config_ignores_is_still_refused_when_dirty() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = repo_with_submodule(dir.path()).unwrap();
+    git(&root)
+        .run(&["config", "submodule.my lib.ignore", "all"])
+        .unwrap();
+    fs::write(root.join("my lib/lib.rs"), "changed\n").unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    assert!(
+        matches!(&err, CaptureError::GitSubmoduleDirty { path } if path.as_str() == "my lib"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_renamed_dirty_submodule_is_refused_by_its_new_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = repo_with_submodule(dir.path()).unwrap();
+    git(&root).run(&["mv", "my lib", "your lib"]).unwrap();
+    fs::write(root.join("your lib/lib.rs"), "changed\n").unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    assert!(
+        matches!(&err, CaptureError::GitSubmoduleDirty { path } if path.as_str() == "your lib"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_submodule_with_local_changes_is_refused_by_its_whole_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = repo_with_submodule(dir.path()).unwrap();
     fs::write(root.join("my lib/lib.rs"), "changed\n").unwrap();
 
     let store = store_in(dir.path()).unwrap();
