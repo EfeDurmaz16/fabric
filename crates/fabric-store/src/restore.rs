@@ -380,6 +380,8 @@ fn write_entries(
                     size: *size,
                 });
             }
+            // The mtime goes on before the flush, so the flush carries it too.
+            writer.set_mtime(&entry.rel_path, entry.mtime_ns)?;
             if durability == Durability::PowerLoss {
                 // Plain fsync(2); the parent directory's F_FULLFSYNC after the
                 // rename flushes the device cache once for all of them.
@@ -387,7 +389,6 @@ fn write_entries(
                     .map_err(|e| io_err(Path::new(entry.rel_path.as_str()), e.into()))?;
             }
             drop(file);
-            writer.set_mtime(&entry.rel_path, entry.mtime_ns)?;
             report.files += 1;
             report.bytes += written;
             if report.files == 1 {
@@ -790,13 +791,13 @@ fn restore_git(
                         size,
                     });
                 }
+                if let Some(mtime) = mtimes.get(&item.rel) {
+                    writer.set_mtime(&item.rel, *mtime)?;
+                }
                 if power_loss {
                     rustix::fs::fsync(&file).map_err(|e| io_err(path, e.into()))?;
                 }
                 drop(file);
-                if let Some(mtime) = mtimes.get(&item.rel) {
-                    writer.set_mtime(&item.rel, *mtime)?;
-                }
             }
         }
         Ok(())
