@@ -321,11 +321,11 @@ args = ["-c", "mkdir -p .output && echo x > .output/index.js"]
     assert!(again.is_noop());
 }
 
-/// The sentinel is written only after the steps that fill a cache exit 0,
-/// and removed before they start, so a failed or killed run of a step,
-/// even over a cache that was whole, leaves the cache to be filled again.
+/// The steps that fill a cache leave the sentinel once they exit 0, so the
+/// next plan finds the cache whole and runs nothing. That the sentinel is
+/// removed before a step starts is `crash.rs`'s to show.
 #[test]
-fn the_sentinel_marks_a_cache_whole_only_after_its_steps_succeed() {
+fn the_sentinel_marks_a_cache_whole_once_its_steps_succeed() {
     let dir = tempfile::tempdir().unwrap();
     let lock = take_lock(dir.path()).unwrap();
     let fill = r#"
@@ -353,34 +353,6 @@ args = ["-c", "mkdir -p out && echo x > out/f"]
     .unwrap();
     assert_eq!(again.caches()[0].health, CacheHealth::Healthy);
     assert!(again.is_noop());
-
-    let torn = r#"
-[[cache]]
-path = "out"
-class = "build"
-
-[[setup]]
-program = "sh"
-args = ["-c", "echo y > out/f; exit 3"]
-when = "always"
-"#;
-    let detected = declared(dir.path(), torn).unwrap();
-    assert!(matches!(
-        plan(&detected, &lock, &NodeEnv::current())
-            .unwrap()
-            .ready()
-            .unwrap()
-            .execute(&lock),
-        Err(MaterializeError::StepFailed { .. })
-    ));
-    assert!(!dir.path().join("out").join(SENTINEL).exists());
-    let after = plan(
-        &detect(dir.path(), &[]).unwrap(),
-        &lock,
-        &NodeEnv::current(),
-    )
-    .unwrap();
-    assert_eq!(after.caches()[0].health, CacheHealth::Incomplete);
 }
 
 #[test]
