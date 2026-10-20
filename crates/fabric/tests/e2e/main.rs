@@ -6,8 +6,10 @@
 //! two ledgers agree on the epoch, the departed copy refuses to run, and the
 //! owner resumes the job with its workspace and its harness session whole.
 //! One more test runs a Claude job on one node beside a running `claude`,
-//! and `terminal` runs a Codex job under a pseudo-terminal.
+//! `terminal` runs a Codex job under a pseudo-terminal, and `headless`
+//! runs Claude and Codex turns without one.
 
+mod headless;
 mod terminal;
 mod world;
 

@@ -79,25 +79,98 @@ impl Env {
 
     /// Puts a fake `claude` first on the `PATH`: it answers `--version` as
     /// the gate's Claude does and otherwise writes its arguments, one per
-    /// line, to `fake_claude_args` and exits.
+    /// line, to `claude-args` and its environment to `claude-env` under the
+    /// home. With `-p` it also appends the prompt to the session's
+    /// transcript under `~/.claude/projects/<slug>/`, as Claude does, and
+    /// prints the one result object `claude -p --output-format json` prints.
     pub fn install_fake_claude(&self) -> Fallible {
-        let claude = self.root.join("bin").join("claude");
-        fs::write(
-            &claude,
+        self.install(
+            "claude",
             "#!/bin/sh\n\
              if [ \"$1\" = --version ]; then echo '2.1.294 (Claude Code)'; exit 0; fi\n\
-             printf '%s\\n' \"$@\" > \"$HOME/claude-args\"\n",
-        )?;
-        fs::set_permissions(&claude, fs::Permissions::from_mode(0o755))?;
+             printf '%s\\n' \"$@\" > \"$HOME/claude-args\"\n\
+             env > \"$HOME/claude-env\"\n\
+             headless=; session=; prompt=\n\
+             while [ $# -gt 0 ]; do\n\
+               case \"$1\" in\n\
+                 -p) headless=1 ;;\n\
+                 --session-id|--resume) session=\"$2\"; shift ;;\n\
+                 --) prompt=\"$2\"; shift ;;\n\
+               esac\n\
+               shift\n\
+             done\n\
+             [ -n \"$headless\" ] || exit 0\n\
+             dir=\"$HOME/.claude/projects/$(pwd -P | sed 's/[^A-Za-z0-9]/-/g')\"\n\
+             mkdir -p \"$dir\"\n\
+             printf '{\"type\":\"user\",\"sessionId\":\"%s\",\"message\":{\"role\":\"user\",\"content\":\"%s\"}}\\n' \"$session\" \"$prompt\" >> \"$dir/$session.jsonl\"\n\
+             printf '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"claude did: %s\",\"session_id\":\"%s\"}\\n' \"$prompt\" \"$session\"\n",
+        )
+    }
+
+    /// The thread the fake `codex` starts.
+    pub const CODEX_THREAD: &str = "019f233e-bb33-7342-85fa-f2d33b14368a";
+
+    /// Puts a fake `codex` first on the `PATH`: it answers `--version` as
+    /// the gate's Codex does and otherwise writes its arguments, one per
+    /// line, to `codex-args` and its environment to `codex-env` under the
+    /// home. Under `exec` it appends the prompt to the thread's rollout
+    /// under `~/.codex/sessions/`, starting `CODEX_THREAD`, or the thread
+    /// `exec resume` names, and prints the events `codex exec --json`
+    /// prints for one turn.
+    pub fn install_fake_codex(&self) -> Fallible {
+        self.install(
+            "codex",
+            &format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = --version ]; then echo 'codex-cli 0.155.1'; exit 0; fi\n\
+                 printf '%s\\n' \"$@\" > \"$HOME/codex-args\"\n\
+                 env > \"$HOME/codex-env\"\n\
+                 [ \"$1\" = exec ] || exit 0\n\
+                 thread={thread}\n\
+                 if [ \"$2\" = resume ]; then thread=\"$3\"; fi\n\
+                 prompt=\n\
+                 while [ $# -gt 0 ]; do if [ \"$1\" = -- ]; then prompt=\"$2\"; fi; shift; done\n\
+                 dir=\"$HOME/.codex/sessions/2026/10/21\"\n\
+                 mkdir -p \"$dir\"\n\
+                 file=\"$dir/rollout-2026-10-21T10-00-00-$thread.jsonl\"\n\
+                 [ -f \"$file\" ] || printf '{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"%s\",\"cwd\":\"%s\"}}}}\\n' \"$thread\" \"$(pwd -P)\" > \"$file\"\n\
+                 printf '{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"%s\"}}]}}}}\\n' \"$prompt\" >> \"$file\"\n\
+                 printf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread\"\n\
+                 echo '{{\"type\":\"turn.started\"}}'\n\
+                 printf '{{\"type\":\"item.completed\",\"item\":{{\"id\":\"item_0\",\"type\":\"agent_message\",\"text\":\"codex did: %s\"}}}}\\n' \"$prompt\"\n\
+                 echo '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"cached_input_tokens\":0,\"output_tokens\":1}}}}'\n",
+                thread = Self::CODEX_THREAD
+            ),
+        )
+    }
+
+    /// Writes an executable `name` into the test's `bin`, first on the `PATH`.
+    fn install(&self, name: &str, script: &str) -> Fallible {
+        let path = self.root.join("bin").join(name);
+        fs::write(&path, script)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
         Ok(())
+    }
+
+    /// What a fake harness wrote to `<name>-args`, one argument per line.
+    pub fn fake_args(&self, name: &str) -> Fallible<Vec<String>> {
+        Ok(fs::read_to_string(self.home.join(format!("{name}-args")))?
+            .lines()
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// The names of the variables a fake harness found in its environment.
+    pub fn fake_env_names(&self, name: &str) -> Fallible<Vec<String>> {
+        Ok(fs::read_to_string(self.home.join(format!("{name}-env")))?
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(name, _)| name.to_owned()))
+            .collect())
     }
 
     /// The arguments the fake `claude` was last launched with.
     pub fn fake_claude_args(&self) -> Fallible<Vec<String>> {
-        Ok(fs::read_to_string(self.home.join("claude-args"))?
-            .lines()
-            .map(str::to_owned)
-            .collect())
+        self.fake_args("claude")
     }
 
     /// The fake agent's file for its first session.
@@ -482,7 +555,13 @@ impl Node {
 
     /// Runs a CLI command that must succeed and returns what it printed.
     pub fn ok(&self, args: &[&str]) -> Fallible<String> {
-        let output = self.run(args)?;
+        self.ok_with(args, &[])
+    }
+
+    /// Runs a CLI command with `vars` added to its environment that must
+    /// succeed, and returns what it printed.
+    pub fn ok_with(&self, args: &[&str], vars: &[(&str, &Path)]) -> Fallible<String> {
+        let output = finish(self.spawn_with(args, vars)?, COMMAND_TIMEOUT)?;
         let text = text(&output);
         if output.status.success() {
             Ok(text)
