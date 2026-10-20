@@ -32,11 +32,15 @@ struct Pair {
     b: Node,
 }
 
-/// Starts two paired nodes, arming `fault_a` on the first and `fault_b` on the second.
+/// Starts two paired nodes, arming `fault_a` on the first and `fault_b` on
+/// the second. They report the Node versions the gate Macs had, 22 on the
+/// first and 26 on the second, so every move crosses Node majors.
 fn setup(wire: Wire, fault_a: Option<&str>, fault_b: Option<&str>) -> Fallible<Pair> {
     let env = Env::new()?;
     let mut a = Node::new(&env, "a", wire)?;
     let mut b = Node::new(&env, "b", wire)?;
+    a.fake_node("v22.23.2", "127")?;
+    b.fake_node("v26.0.0", "147")?;
     a.start(fault_a)?;
     b.start(fault_b)?;
     pair(&a, &b)?;
@@ -105,10 +109,17 @@ fn assert_one_owner(
 
 /// The owner resumes the job: the harness state must travel (the shared
 /// home's copy is removed first, as on a second machine), the workspace
-/// matches what was left, and the session takes one more turn.
-fn assert_continues(p: &Pair, owner: &Node, job: &str, work: &Work, turns: &[&str]) -> Fallible {
+/// matches what was left, and the session takes one more turn. Returns what
+/// the resume printed.
+fn assert_continues(
+    p: &Pair,
+    owner: &Node,
+    job: &str,
+    work: &Work,
+    turns: &[&str],
+) -> Fallible<String> {
     fs::remove_file(p.env.session_file())?;
-    owner.ok(&["job", "resume", job, "--prompt", "next"])?;
+    let resumed = owner.ok(&["job", "resume", job, "--prompt", "next"])?;
     let now = read_work(&p.env, job)?;
     assert_eq!(
         now.status, work.status,
@@ -116,27 +127,90 @@ fn assert_continues(p: &Pair, owner: &Node, job: &str, work: &Work, turns: &[&st
     );
     assert_eq!(now.readme, work.readme, "the unstaged edit");
     assert_eq!(now.precious, work.precious, "the ignored precious file");
+    assert_eq!(
+        now.deps, work.deps,
+        "the node_modules no lockfile can rebuild"
+    );
+    assert_eq!(now.build, work.build, "the build output");
     let mut expected: Vec<String> = turns.iter().map(|t| (*t).to_owned()).collect();
     expected.push("next".to_owned());
     assert_eq!(p.env.prompts()?, expected, "the harness session continued");
-    Ok(())
+    Ok(resumed)
 }
+
+/// The count of `class` in a restore summary line, such as 5 for `tracked: 5 files`.
+fn restored_files(summary: &str, class: &str) -> Fallible<u64> {
+    let after = summary
+        .split_once(&format!("{class}: "))
+        .ok_or_else(|| format!("no {class} count in: {summary}"))?
+        .1;
+    let count = after
+        .split_once(' ')
+        .ok_or_else(|| format!("no number after {class}: {summary}"))?
+        .0;
+    Ok(count.parse()?)
+}
+
+/// What the move must decide for the fixture's ignored paths between the
+/// two nodes, with Node 22 on one and 26 on the other.
+const DECISIONS: [&str; 3] = [
+    "leave   .env  (it matches a secret pattern",
+    "carry   dist  (same os and arch",
+    "carry   node_modules  (no lockfile or setup step makes it again",
+];
 
 fn move_and_resume(wire: Wire) -> Fallible {
     let p = setup(wire, None, None)?;
     let (job, work) = job_with_work(&p)?;
     let doctor = p.a.ok(&["doctor", "--peer", &p.b.id, "--job", &job])?;
     assert!(doctor.contains("ok      home"), "{doctor}");
+    assert!(doctor.contains("no snapshot yet"), "{doctor}");
     p.a.ok(&["job", "approve", &job, "--note", "the plan reads right"])?;
     let suspended = p.a.ok(&["job", "suspend", &job])?;
     assert!(
         suspended.contains("copied the ledger and the snapshot"),
         "{suspended}"
     );
+    assert!(
+        suspended.contains("left behind (secret pattern): .env"),
+        "{suspended}"
+    );
+    assert!(
+        p.a.ok(&["job", "status", &job])?
+            .contains("session: captured in snapshot"),
+        "the fake agent's session is in the snapshot"
+    );
 
-    p.a.ok(&["job", "move", &job, "--to", &p.b.id])?;
+    // Gate findings F6 and F7: the Node majors differ, and the hand-made
+    // node_modules and the dist/ still travel; doctor and move say so.
+    let doctor = p.a.ok(&["doctor", "--peer", &p.b.id, "--job", &job])?;
+    assert!(doctor.contains("rebuild node.version"), "{doctor}");
+    let moved = p.a.ok(&["job", "move", &job, "--to", &p.b.id])?;
+    for decision in DECISIONS {
+        assert!(doctor.contains(decision), "doctor: {decision}:\n{doctor}");
+        assert!(moved.contains(decision), "move: {decision}:\n{moved}");
+    }
+    assert!(!moved.contains("no harness session captured"), "{moved}");
     assert_one_owner(&p.b, &p.a, &job, 2, "departed")?;
-    assert_continues(&p, &p.b, &job, &work, &["one"])?;
+    let resumed = assert_continues(&p, &p.b, &job, &work, &["one"])?;
+    for decision in DECISIONS {
+        assert!(resumed.contains(decision), "resume: {decision}:\n{resumed}");
+    }
+    assert!(
+        !p.env.work(&job).join(".env").exists(),
+        "the secret travelled"
+    );
+    // Gate finding F8: the summary counts every file restore wrote: the
+    // four committed files and the staged one, the untracked notes, and the
+    // precious file, the node_modules file and the dist file.
+    let summary = resumed
+        .lines()
+        .find(|line| line.starts_with("restored snapshot"))
+        .ok_or_else(|| format!("no restore summary in:\n{resumed}"))?;
+    assert_eq!(restored_files(summary, "tracked")?, 5, "{summary}");
+    assert_eq!(restored_files(summary, "untracked")?, 1, "{summary}");
+    assert_eq!(restored_files(summary, "ignored")?, 3, "{summary}");
+    assert!(restored_files(summary, "harness state")? > 0, "{summary}");
 
     // The way back is a pull typed on the other node, which suspends the
     // job there and so captures the session from that node's home.
@@ -148,6 +222,22 @@ fn move_and_resume(wire: Wire) -> Fallible {
     let log = p.b.ok(&["job", "log", &job])?;
     assert!(log.contains("DecisionRecorded: approved: the plan reads right"));
     assert_eq!(log.matches("MoveImported").count(), 2, "{log}");
+    Ok(())
+}
+
+/// Gate finding F9: a job whose harness never ran has no session to
+/// capture. Status and move say so before the job leaves, so nobody expects
+/// the conversation to continue on the target.
+#[test]
+fn e2e_a_job_with_no_session_says_so_before_it_moves() -> Fallible {
+    let p = setup(Wire::Quic, None, None)?;
+    let job = new_job(&p.env, &p.a, AGENT)?;
+    p.a.ok(&["job", "suspend", &job])?;
+    let line = "no harness session captured; the conversation will not continue on the target";
+    let status = p.a.ok(&["job", "status", &job])?;
+    assert!(status.contains(&format!("session: {line}")), "{status}");
+    let moved = p.a.ok(&["job", "move", &job, "--to", &p.b.id])?;
+    assert!(moved.contains(line), "{moved}");
     Ok(())
 }
 
@@ -201,7 +291,8 @@ fn source_killed_before_departing(wire: Wire, point: &str) -> Fallible {
     assert_eq!((lease.owner.as_str(), lease.epoch), (p.a.id.as_str(), 1));
     p.a.ok(&["job", "move", &job, "--to", &p.b.id])?;
     assert_one_owner(&p.b, &p.a, &job, 2, "departed")?;
-    assert_continues(&p, &p.b, &job, &work, &["one"])
+    assert_continues(&p, &p.b, &job, &work, &["one"])?;
+    Ok(())
 }
 
 #[test]
@@ -287,7 +378,8 @@ fn e2e_a_run_during_the_transfer_stops_the_move() -> Fallible {
     assert_eq!(p.a.lease(&job)?.view, "owner");
     p.a.ok(&["job", "move", &job, "--to", &p.b.id])?;
     assert_one_owner(&p.b, &p.a, &job, 2, "departed")?;
-    assert_continues(&p, &p.b, &job, &work, &["one", "two"])
+    assert_continues(&p, &p.b, &job, &work, &["one", "two"])?;
+    Ok(())
 }
 
 #[test]
@@ -361,7 +453,8 @@ fn e2e_a_hand_edit_after_a_suspend_moves_with_the_job() -> Fallible {
     assert!(moved.contains("capturing it again"), "{moved}");
     assert_one_owner(&p.b, &p.a, &job, 2, "departed")?;
     edited.clone_into(&mut work.readme);
-    assert_continues(&p, &p.b, &job, &work, &["one"])
+    assert_continues(&p, &p.b, &job, &work, &["one"])?;
+    Ok(())
 }
 
 #[test]
@@ -385,7 +478,8 @@ fn e2e_a_steal_needs_force_and_fences_the_sleeping_owner() -> Fallible {
     // On waking, the stolen-from node learns the steal from its peer.
     p.a.start(None)?;
     assert_one_owner(&p.b, &p.a, &job, 2, "replica")?;
-    assert_continues(&p, &p.b, &job, &work, &["one"])
+    assert_continues(&p, &p.b, &job, &work, &["one"])?;
+    Ok(())
 }
 
 /// A move stops the harness that runs on its source, whichever way it is

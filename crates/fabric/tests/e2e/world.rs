@@ -4,7 +4,10 @@
 //! the test names. The harness is the fake ACP agent, which keeps one JSON
 //! file per session under the home, so its state travels the way a real
 //! harness's does. The repository fixture needs git and nothing else: no
-//! pnpm and no native Node module, which the gate's second Mac lacks.
+//! pnpm and no native Node module, which the gate's second Mac lacks. Its
+//! `package.json` has no lockfile, as the gate fixture of 2026-10-21 had,
+//! and each node may put its own programs first on its `PATH`, so the two
+//! nodes can report different Node majors from one machine.
 
 use std::error::Error;
 use std::ffi::OsString;
@@ -117,12 +120,17 @@ impl Env {
             .collect())
     }
 
+    /// A command for the node whose state directory is `state`: its own
+    /// `bin` comes first on the `PATH`, then the programs both nodes share.
     fn command(&self, program: &str, state: &Path) -> Command {
+        let mut dirs = vec![state.join("bin")];
+        dirs.extend(std::env::split_paths(&self.path));
+        let path = std::env::join_paths(dirs).unwrap_or_else(|_| self.path.clone());
         let mut command = Command::new(program);
         command
             .env_clear()
             .env("HOME", &self.home)
-            .env("PATH", &self.path)
+            .env("PATH", path)
             .env("FABRIC_HOME", state)
             .env("FAKE_STATE_DIR", self.home.join(".fake-agent"))
             .stdin(Stdio::null());
@@ -163,7 +171,16 @@ fn make_repo(repo: &Path) -> Fallible {
     fs::create_dir_all(repo.join("src"))?;
     fs::write(repo.join("README.md"), "hello\n")?;
     fs::write(repo.join("src/greet.txt"), "hello, world\n")?;
-    fs::write(repo.join(".gitignore"), "scratch/\n")?;
+    // No lockfile: nothing can install `node_modules` again, so it is the
+    // user's files (gate finding F6).
+    fs::write(
+        repo.join("package.json"),
+        "{\"name\": \"fixture\", \"version\": \"1.0.0\"}\n",
+    )?;
+    fs::write(
+        repo.join(".gitignore"),
+        "scratch/\nnode_modules/\ndist/\n.env\n",
+    )?;
     git(repo, &["init", "-q", "-b", "main"])?;
     git(repo, &["add", "-A"])?;
     git(repo, &["commit", "-q", "-m", "first"])
@@ -306,7 +323,7 @@ impl Node {
     /// A node that has not started yet.
     pub fn new(env: &Arc<Env>, name: &'static str, wire: Wire) -> Fallible<Self> {
         let state = env.root.join(name);
-        fs::create_dir_all(&state)?;
+        fs::create_dir_all(state.join("bin"))?;
         fs::write(
             state.join("harness.toml"),
             "[acp.fabric-fake-agent]\nstate_dir = \".fake-agent\"\n",
@@ -325,6 +342,24 @@ impl Node {
     /// Its state directory, the `FABRIC_HOME` its commands run with.
     pub fn state(&self) -> &Path {
         &self.state
+    }
+
+    /// Puts a fake `node` first on this node's `PATH`, reporting `version`
+    /// for `--version` and `abi` for `-p process.versions.modules`, as the
+    /// probes doctor and the carry keys run ask. It runs no JavaScript.
+    pub fn fake_node(&self, version: &str, abi: &str) -> Fallible {
+        let node = self.state.join("bin").join("node");
+        fs::write(
+            &node,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = --version ]; then echo {version}; exit 0; fi\n\
+                 if [ \"$1\" = -p ]; then echo {abi}; exit 0; fi\n\
+                 exit 1\n"
+            ),
+        )?;
+        fs::set_permissions(&node, fs::Permissions::from_mode(0o755))?;
+        Ok(())
     }
 
     /// The address it listens on.
@@ -612,8 +647,9 @@ pub fn pair(a: &Node, b: &Node) -> Fallible {
 }
 
 /// The work a job holds after one turn: a staged file, an unstaged edit,
-/// an untracked file and an ignored precious file, each of which a move
-/// must carry exactly.
+/// an untracked file, an ignored precious file, a hand-made `node_modules`
+/// with no lockfile and a build output, each of which a move must carry
+/// exactly, and a `.env` it must never carry.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Work {
     /// `git status --porcelain=v1` in the root.
@@ -622,6 +658,10 @@ pub struct Work {
     pub readme: String,
     /// The ignored file that is nobody's cache.
     pub precious: String,
+    /// A file of the `node_modules` no lockfile describes.
+    pub deps: String,
+    /// A file of the ignored `dist/` beside `package.json`.
+    pub build: String,
 }
 
 /// Leaves work of every kind in the job's root.
@@ -633,6 +673,14 @@ pub fn edit(env: &Env, job: &str) -> Fallible<Work> {
     fs::write(work.join("notes.txt"), "untracked\n")?;
     fs::create_dir_all(work.join("scratch"))?;
     fs::write(work.join("scratch/plan.md"), "ignored but precious\n")?;
+    fs::create_dir_all(work.join("node_modules/leftpad"))?;
+    fs::write(
+        work.join("node_modules/leftpad/index.js"),
+        "module.exports = (s, n) => s.padStart(n);\n",
+    )?;
+    fs::create_dir_all(work.join("dist"))?;
+    fs::write(work.join("dist/out.js"), "console.log('built');\n")?;
+    fs::write(work.join(".env"), "TOKEN=never-moves\n")?;
     read_work(env, job)
 }
 
@@ -650,5 +698,7 @@ pub fn read_work(env: &Env, job: &str) -> Fallible<Work> {
         status: String::from_utf8(output.stdout)?,
         readme: fs::read_to_string(work.join("README.md"))?,
         precious: fs::read_to_string(work.join("scratch/plan.md"))?,
+        deps: fs::read_to_string(work.join("node_modules/leftpad/index.js"))?,
+        build: fs::read_to_string(work.join("dist/out.js"))?,
     })
 }
