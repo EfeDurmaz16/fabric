@@ -964,6 +964,12 @@ async fn a_settings_overlay_with_a_literal_token_refuses_the_launch() {
     };
     let err = adapter.launch(&work, resume(), &[]).await.unwrap_err();
     assert!(matches!(err, HarnessError::SecretInOverlay { .. }), "{err}");
+    std::fs::write(&overlay, r#"{"env":{"X":"A=1\nDB_PASSWORD=hunter22xyz"}}"#).unwrap();
+    let err = adapter.launch(&work, resume(), &[]).await.unwrap_err();
+    assert!(
+        matches!(err, HarnessError::SecretInOverlay { .. }),
+        "an escaped newline hides nothing: {err}"
+    );
     std::fs::write(&overlay, "{\"env\":{\"GH\":\"${GH_TOKEN}\"}}").unwrap();
     let log = home.join("log.txt");
     let env = [(

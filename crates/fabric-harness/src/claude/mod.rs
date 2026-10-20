@@ -46,6 +46,7 @@ use crate::departure::Records;
 use crate::error::HarnessError;
 use crate::files::{self, Carry, Source};
 use crate::harness::{Harness, Installed, Launch, Restored, Running};
+use crate::jsontext;
 use crate::manifest::{HOME_PREFIX, Mutability, StateManifest, under_home};
 use crate::pipeline::{self, Capturer, Destination};
 use crate::process;
@@ -599,10 +600,11 @@ impl ClaudeCode {
 }
 
 /// Refuses an overlay file (settings, MCP configuration) that holds a
-/// literal secret: ADR 0006 allows only `${VAR}` references there.
+/// literal secret: ADR 0006 allows only `${VAR}` references there. The
+/// overlay is JSON, so its strings are matched decoded too.
 fn refuse_secret_overlay(path: &Path) -> Result<(), HarnessError> {
     let bytes = std::fs::read(path).map_err(|e| HarnessError::io("read", path, e))?;
-    if Redactor::standard()?.matches_bytes(&bytes) {
+    if jsontext::holds_secret(&bytes, Redactor::standard()?) {
         return Err(HarnessError::SecretInOverlay {
             path: path.to_path_buf(),
         });
