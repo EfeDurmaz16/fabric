@@ -165,6 +165,12 @@ pub enum OverrideError {
         /// What is wrong with it.
         reason: PinError,
     },
+    /// A `[tools]` key that names the same tool as an earlier one, such as `nodejs` next to `node`.
+    #[error("`tools[{index}]` names a tool an earlier entry already pins")]
+    DuplicateTool {
+        /// Zero-based index of the later entry in `[tools]`, in key order.
+        index: usize,
+    },
     /// A `[tools]` value that is not a version pin; the pin itself is never quoted.
     #[error("the version of `tools[{index}]` {reason}")]
     Pin {
@@ -287,7 +293,7 @@ fn env_names(value: &Value) -> Result<Vec<EnvVarName>, OverrideError> {
             EnvVarName::parse(text).map_err(|reason| OverrideError::EnvVarName { index, reason })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    // Refused like every other repeat in this file, rather than folded away.
+    // A repeat is refused, as in every list of this file, so no entry is dropped unseen.
     let mut seen: Vec<&EnvVarName> = Vec::new();
     for (index, name) in names.iter().enumerate() {
         if seen.contains(&name) {
@@ -309,19 +315,29 @@ fn patterns(value: &Value) -> Result<Vec<Pattern>, OverrideError> {
         .collect()
 }
 
+/// Parses `[tools]`, reading each name through its alias; two keys for one tool are refused.
 fn tools(value: &Value) -> Result<BTreeMap<ToolName, ToolVersion>, OverrideError> {
-    table(value, "tools")?
-        .iter()
-        .enumerate()
-        .map(|(index, (tool, version))| {
-            let tool = ToolName::parse(tool)
-                .map_err(|reason| OverrideError::ToolName { index, reason })?;
-            let version = string(version, &format!("tools[{index}]"))?;
-            let version = ToolVersion::parse(version)
-                .map_err(|reason| OverrideError::Pin { index, reason })?;
-            Ok((tool, version))
-        })
-        .collect()
+    let mut tools = BTreeMap::new();
+    for (index, (tool, version)) in table(value, "tools")?.iter().enumerate() {
+        let tool = ToolName::parse(canonical_tool(tool))
+            .map_err(|reason| OverrideError::ToolName { index, reason })?;
+        let version = string(version, &format!("tools[{index}]"))?;
+        let version =
+            ToolVersion::parse(version).map_err(|reason| OverrideError::Pin { index, reason })?;
+        if tools.insert(tool, version).is_some() {
+            return Err(OverrideError::DuplicateTool { index });
+        }
+    }
+    Ok(tools)
+}
+
+/// Reads `nodejs` as `node` and `golang` as `go`, as asdf and mise do, in every file that names tools.
+pub(crate) fn canonical_tool(name: &str) -> &str {
+    match name {
+        "nodejs" => "node",
+        "golang" => "go",
+        other => other,
+    }
 }
 
 fn rel_path(value: &Value, key: &str) -> Result<RelPath, OverrideError> {
@@ -537,6 +553,15 @@ when = "always"
         assert!(matches!(
             EnvOverride::parse("env = [\"A\", \"B=c\"]"),
             Err(OverrideError::EnvVarName { index: 1, .. })
+        ));
+    }
+
+    /// `nodejs` reads as `node`, so pinning both would drop one pin unseen.
+    #[test]
+    fn a_tool_pinned_twice_under_an_alias_is_refused() {
+        assert!(matches!(
+            EnvOverride::parse("[tools]\nnode = \"22\"\nnodejs = \"20\"\n"),
+            Err(OverrideError::DuplicateTool { index: 1 })
         ));
     }
 

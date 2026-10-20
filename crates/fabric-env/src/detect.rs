@@ -37,7 +37,7 @@ use fabric_core::path::RelPath;
 use fabric_core::snapshot::CacheClass;
 use toml::Table;
 
-use crate::overrides::{EnvOverride, OverrideError, line_and_column};
+use crate::overrides::{EnvOverride, OverrideError, canonical_tool, line_and_column};
 use crate::secret::{Scope, SecretPolicy};
 
 /// Where the override file lives, relative to the workspace root.
@@ -842,15 +842,6 @@ fn go_mod_pin(root: &Path) -> Result<Option<Pin>, DetectError> {
             },
         )
         .transpose()
-}
-
-/// Reads `nodejs` as `node` and `golang` as `go`, as asdf and mise do.
-fn canonical_tool(name: &str) -> &str {
-    match name {
-        "nodejs" => "node",
-        "golang" => "go",
-        other => other,
-    }
 }
 
 fn step(program: &'static str, args: &[&str]) -> Result<SetupStep, DetectError> {
