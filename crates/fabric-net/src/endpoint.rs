@@ -2,8 +2,8 @@
 //!
 //! Invariant: a dial tries QUIC first and falls back to TCP with TLS only
 //! when QUIC did not complete within `quic_timeout`; the fallback is
-//! reported with QUIC's failure, never silent, so a slow path is visible to
-//! the user and to the ledger. Both transports listen on one port number,
+//! reported with QUIC's failure in `Dialed::quic_failure`, never silent, so
+//! the caller can show the slow path. Both transports listen on one port number,
 //! so a user pastes one address at pairing. A forged handshake ends a dial
 //! at once; any other refusal, such as another node at a stale address,
 //! moves on to the next address.

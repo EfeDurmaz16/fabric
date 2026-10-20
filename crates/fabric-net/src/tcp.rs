@@ -2,8 +2,8 @@
 //!
 //! Invariant: the same pinned verifiers as QUIC decide the handshake, so a
 //! peer that QUIC would refuse is refused here too, and a connection
-//! surfaces only after that handshake. The ledger records which transport
-//! served a resume, so this slower path is visible.
+//! surfaces only after that handshake. Every connection reports
+//! `TransportKind::TcpTls`, so a caller can tell this slower path from QUIC.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
