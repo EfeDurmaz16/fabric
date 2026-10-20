@@ -5,7 +5,9 @@
 //! `markers`, never through a shell, so the supervisor can fence the whole
 //! group (ADR 0003), no variable of the calling process leaks into it, and
 //! no Claude Code or Codex session this process runs under claims it as a
-//! child. A question about running processes fails closed:
+//! child. A version probe runs with this process's environment minus the
+//! same markers, so even that one short call is no child of a host
+//! session. A question about running processes fails closed:
 //! when `pgrep` or `ps` cannot answer, the caller is told so, never "none".
 //! `ps`, `pgrep` and `kill` are run from their system paths, never looked
 //! up on this process's `PATH`, so a planted `ps` cannot report a live
@@ -81,11 +83,29 @@ fn is_executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// Runs `binary args...` and returns trimmed stdout, within `PROBE_TIMEOUT`.
-pub(crate) async fn probe(binary: &Path, args: &[&str]) -> Result<String, HarnessError> {
+/// This process's environment, as far as its names and values are text
+/// a launch env can hold.
+fn own_env() -> Vec<(EnvVarName, String)> {
+    std::env::vars_os()
+        .filter_map(|(name, value)| {
+            let name = EnvVarName::parse(name.to_str()?).ok()?;
+            Some((name, value.into_string().ok()?))
+        })
+        .collect()
+}
+
+/// Runs `binary args...` with `env` minus its parent-session markers and
+/// returns trimmed stdout, within `PROBE_TIMEOUT`.
+async fn probe(
+    binary: &Path,
+    args: &[&str],
+    env: &[(EnvVarName, String)],
+) -> Result<String, HarnessError> {
     let program = binary.display().to_string();
     let run = Command::new(binary)
         .args(args)
+        .env_clear()
+        .envs(markers::child_env(env))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -111,7 +131,7 @@ pub(crate) async fn detect(binary: Option<PathBuf>) -> Result<Option<Installed>,
     let Some(path) = binary else {
         return Ok(None);
     };
-    let raw = probe(&path, &["--version"]).await?;
+    let raw = probe(&path, &["--version"], &own_env()).await?;
     Ok(Some(Installed {
         version: version_token(&raw).map(str::to_owned),
         raw,
@@ -432,6 +452,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_version_probe_does_not_pass_parent_session_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("tool");
+        std::fs::write(&binary, "#!/bin/sh\n/usr/bin/env\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env: Vec<(EnvVarName, String)> = [("CLAUDECODE", "1"), ("FABRIC_PROBE_KEPT", "1")]
+            .into_iter()
+            .map(|(name, value)| (EnvVarName::parse(name).unwrap(), value.to_owned()))
+            .collect();
+        let seen = probe(&binary, &[], &env).await.unwrap();
+        assert!(seen.contains("FABRIC_PROBE_KEPT=1"), "{seen}");
+        assert!(!seen.contains("CLAUDECODE"), "{seen}");
     }
 
     #[tokio::test]
