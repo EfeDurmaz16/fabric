@@ -272,6 +272,50 @@ mod tests {
         }
     }
 
+    /// Pairs everyone until its second refresh, the one after the handshake.
+    #[derive(Debug, Default)]
+    struct UnpairedDuringHandshake(std::sync::atomic::AtomicUsize);
+
+    impl Trust for UnpairedDuringHandshake {
+        fn is_paired(&self, _node: NodeId) -> bool {
+            self.0.load(std::sync::atomic::Ordering::SeqCst) < 2
+        }
+
+        fn refresh(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A node unpaired while its handshake runs finishes the handshake but
+    /// never reaches the queue that `accept` reads.
+    #[tokio::test]
+    async fn a_peer_unpaired_during_its_handshake_is_not_queued() {
+        let (tx, mut rx) = mpsc::channel(QUEUE);
+        let handshakes = Handshakes {
+            tx,
+            slots: Arc::new(Semaphore::new(MAX_HANDSHAKES)),
+            sources: Arc::default(),
+            trust: Arc::new(UnpairedDuringHandshake::default()),
+        };
+        let remote: SocketAddr = ([198, 51, 100, 2], 40_000).into();
+        let (ours, _theirs) = tokio::io::duplex(1 << 10);
+        let (finished, handshake_done) = oneshot::channel();
+        let handshake = async move {
+            let connection: Box<dyn Connection> = Box::new(crate::mux::Mux::spawn(
+                ours,
+                crate::mux::Side::Acceptor,
+                NodeId::from_bytes([7; 32]),
+                remote,
+            ));
+            let _ = finished.send(());
+            Ok(connection)
+        };
+        assert!(handshakes.run(remote, handshake).await);
+        handshake_done.await.unwrap();
+        let queued = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(queued.is_err(), "an unpaired peer reached the queue");
+    }
+
     /// One IPv6 host owns a /64, so addresses in one /64 count as one
     /// source, and an IPv4 address counts the same mapped into IPv6.
     #[test]
