@@ -17,6 +17,9 @@
 //! When the registry cannot answer (it is missing, a record does not
 //! parse, or the installed Claude is older than the version it was read
 //! on), any running `claude` refuses them instead.
+//! The config file is `~/.claude.json`, or `~/.claude/.config.json` when
+//! that exists, as Claude 2.1.294 chooses it (`Tt` in its bundle; a
+//! temporary home with both files read trust from the second).
 //! Login is never copied and no per-job config directory is set:
 //! `CLAUDE_CONFIG_DIR` keys the login (ADR 0006, D15). This adapter reads
 //! and writes `~/.claude` and `~/.claude.json` only, so `check_env`
@@ -327,11 +330,13 @@ impl ClaudeCode {
     {
         Self::check_env(env)?;
         let root = pipeline::physical_workspace(workspace)?;
+        let config_dir = self.config_dir.clone();
         let config_json = self.config_json.clone();
-        let (key, found) = pipeline::blocking(move || {
+        let (config, key, found) = pipeline::blocking(move || {
+            let config = trust::global_config(&config_dir, config_json);
             let key = trust::project_key(&root)?;
-            let found = trust::read(&config_json, &root, &key)?;
-            Ok((key, found))
+            let found = trust::read(&config, &root, &key)?;
+            Ok((config, key, found))
         })
         .await?;
         let key_path = pipeline::fs_path(&key).to_path_buf();
@@ -344,8 +349,8 @@ impl ClaudeCode {
             Some(by) => TrustOutcome::Inherited { by, reason },
             None => TrustOutcome::LeftToClaude { reason },
         };
-        let config_json = self.config_json.clone();
-        if let Some(reason) = pipeline::blocking(move || trust::unwritable(&config_json)).await? {
+        let checked = config.clone();
+        if let Some(reason) = pipeline::blocking(move || trust::unwritable(&checked)).await? {
             return Ok(left(reason));
         }
         if let Some(pids) = LivePids::of(running().await?) {
@@ -356,8 +361,7 @@ impl ClaudeCode {
             );
             return Ok(left(LeftReason::ClaudeRunning { pids }));
         }
-        let config_json = self.config_json.clone();
-        let changed = pipeline::blocking(move || trust::preseed_file(&config_json, &key)).await?;
+        let changed = pipeline::blocking(move || trust::preseed_file(&config, &key)).await?;
         Ok(if changed {
             TrustOutcome::Written { key: key_path }
         } else {
@@ -1089,6 +1093,24 @@ mod tests {
             before,
             "Claude would not read a key written here"
         );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_config_file_is_the_one_read_and_written() {
+        let fixture = TrustFixture::new(Some(&|_: &Path| r#"{"projects":{}}"#.to_owned()));
+        let legacy = fixture.home.join(".claude").join(".config.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, r#"{"projects":{}}"#).unwrap();
+        let before = fixture.config_bytes();
+        let (outcome, _) = fixture.preseed(Vec::new()).await;
+        assert_eq!(outcome.unwrap(), written(&fixture.work));
+        let value: Value = serde_json::from_slice(&std::fs::read(&legacy).unwrap()).unwrap();
+        assert_eq!(
+            value["projects"][fixture.work.to_str().unwrap()][trust::TRUST_KEY],
+            Value::Bool(true),
+            "Claude reads ~/.claude/.config.json when it exists"
+        );
+        assert_eq!(fixture.config_bytes(), before);
     }
 
     #[tokio::test]

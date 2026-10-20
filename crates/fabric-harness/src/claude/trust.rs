@@ -1,4 +1,5 @@
-//! Workspace trust in `~/.claude.json`.
+//! Workspace trust in Claude's config file, `~/.claude.json`, or
+//! `~/.claude/.config.json` when that exists (`global_config`).
 //!
 //! Invariant: the file is read before anything else, and written only
 //! when the key Claude reads for the workspace is not already `true` and
@@ -142,6 +143,13 @@ fn malformed(config_json: &Path, reason: String) -> HarnessError {
         path: config_json.to_path_buf(),
         reason,
     }
+}
+
+/// The config file Claude reads and writes: the legacy
+/// `<config_dir>/.config.json` when it exists, otherwise `default`.
+pub(crate) fn global_config(config_dir: &Path, default: PathBuf) -> PathBuf {
+    let legacy = config_dir.join(".config.json");
+    if legacy.exists() { legacy } else { default }
 }
 
 /// Reads and parses the config file; the top level must be an object.
