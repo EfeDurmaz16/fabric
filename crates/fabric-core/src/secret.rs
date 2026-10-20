@@ -1,5 +1,5 @@
-//! The secret policy, shared by snapshot capture and the environment spec
-//! (ADR 0004, Ignored files by class; ADR 0007, Secrets).
+//! The secret policy: which paths never leave a node (ADR 0004, Ignored
+//! files by class; ADR 0007, Secrets).
 //!
 //! Invariant: a path that matches a secret pattern never leaves the node,
 //! and the pattern list can grow per job but never shrink. The built-in
@@ -23,8 +23,121 @@
 //! pattern is staged with consent or the capture stops; it is never left
 //! at its index version, which restore would write back over the user's edit.
 
-use fabric_core::env::SecretPattern;
-use fabric_core::path::RelPath;
+use std::fmt;
+
+use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::env::OVERRIDE_FILE;
+use crate::path::RelPath;
+
+/// Why a secret pattern was refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SecretPatternError {
+    /// The pattern has no characters.
+    #[error("secret pattern is empty")]
+    Empty,
+    /// A leading, trailing or doubled slash.
+    #[error("secret pattern has an empty component")]
+    EmptyComponent,
+    /// A `.` or `..` component, which no path holds.
+    #[error("secret pattern has a `.` or `..` component")]
+    DotComponent,
+    /// A `**` component; a pattern already matches at any depth.
+    #[error("secret pattern has a `**` component; a pattern already matches at any depth")]
+    DoubleStar,
+    /// A character with a meaning in gitignore that the matcher does not share.
+    #[error("secret pattern has an unsupported character at index {index}")]
+    BadChar {
+        /// Zero-based byte index of the character.
+        index: usize,
+    },
+    /// The pattern denies the override file, which detection reads through the job's patterns.
+    ///
+    /// Such a pattern, `*.toml`, `env.toml` or `.fabric`, would drop every
+    /// override from the next detection on, so it is refused wherever a
+    /// pattern comes from: the override file or a peer's spec.
+    #[error("secret pattern matches {OVERRIDE_FILE}, which detection must be able to read")]
+    DeniesOverrideFile,
+    /// Encoded bytes hold an ASCII capital, which no stored pattern has.
+    #[error("secret pattern has an ASCII capital at index {index}; stored patterns are lowercase")]
+    NotLowercase {
+        /// Zero-based byte index of the capital.
+        index: usize,
+    },
+}
+
+/// A secret pattern a job adds to the built-in list: path components separated by `/`, where `*` matches any run of characters.
+///
+/// Refused: `\`, `[`, `]`, `?`, `!`, `#`, whitespace and NUL, because
+/// gitignore gives them meanings the matcher does not; empty, `.`, `..`
+/// and `**` components; and any pattern that denies `OVERRIDE_FILE`.
+/// Checked once, at the boundary, including inside `Deserialize`.
+///
+/// Matching ignores ASCII case, so the stored form is ASCII lowercase:
+/// `parse` folds `*.DB` to `*.db`, and decoding refuses a capital. One
+/// rule then has one value, and equality, ordering and the spec's id agree
+/// with what the matcher does.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct SecretPattern(String);
+
+impl SecretPattern {
+    /// Checks `text` against the pattern rules and wraps it, folded to ASCII lowercase.
+    pub fn parse(text: &str) -> Result<Self, SecretPatternError> {
+        if text.is_empty() {
+            return Err(SecretPatternError::Empty);
+        }
+        let bad = text.char_indices().find(|&(_, c)| {
+            matches!(c, '\\' | '[' | ']' | '?' | '!' | '#' | '\0') || c.is_whitespace()
+        });
+        if let Some((index, _)) = bad {
+            return Err(SecretPatternError::BadChar { index });
+        }
+        for component in text.split('/') {
+            match component {
+                "" => return Err(SecretPatternError::EmptyComponent),
+                "." | ".." => return Err(SecretPatternError::DotComponent),
+                "**" => return Err(SecretPatternError::DoubleStar),
+                _ => {}
+            }
+        }
+        let pattern = Self(text.to_ascii_lowercase());
+        if pattern_matches(&pattern, OVERRIDE_FILE) {
+            return Err(SecretPatternError::DeniesOverrideFile);
+        }
+        Ok(pattern)
+    }
+
+    /// Returns the pattern text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SecretPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Debug for SecretPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SecretPattern({:?})", self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretPattern {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        if let Some(index) = text.bytes().position(|b| b.is_ascii_uppercase()) {
+            return Err(serde::de::Error::custom(SecretPatternError::NotLowercase {
+                index,
+            }));
+        }
+        Self::parse(&text).map_err(serde::de::Error::custom)
+    }
+}
 
 /// Patterns that apply everywhere, inside caches included.
 ///
@@ -200,21 +313,12 @@ pub struct Staging {
 }
 
 impl Staging {
-    /// Returns the untracked paths the policy keeps out of `W`; capture lists them in its output.
-    pub fn left_out(&self) -> &[Denied] {
-        &self.left_out
-    }
-
-    /// Returns the tracked paths that match a secret pattern and changed in the working tree.
-    pub fn tracked_secrets(&self) -> &[Denied] {
-        &self.tracked
-    }
-
-    /// Returns what capture stages, or refuses when a tracked secret changed without consent.
+    /// Returns what capture stages and what it keeps out, or refuses when a tracked secret changed without consent.
     ///
-    /// Capture passes each path to `git add -A` as a `:(literal)` pathspec,
-    /// so git applies no pattern of its own.
-    pub fn paths(self, consent: TrackedSecrets) -> Result<Stage, TrackedSecretChanged> {
+    /// Capture passes each staged path to `git add -A` as a `:(literal)`
+    /// pathspec, so git applies no pattern of its own, and lists the
+    /// paths kept out in its output.
+    pub fn paths(self, consent: TrackedSecrets) -> Result<Staged, TrackedSecretChanged> {
         let mut paths = match consent {
             TrackedSecrets::Refuse if !self.tracked.is_empty() => {
                 return Err(TrackedSecretChanged {
@@ -228,14 +332,27 @@ impl Staging {
                 paths.into_iter()
             }
         };
-        Ok(match paths.next() {
+        let stage = match paths.next() {
             None => Stage::Nothing,
             Some(first) => Stage::Paths {
                 first,
                 rest: paths.collect(),
             },
+        };
+        Ok(Staged {
+            stage,
+            left_out: self.left_out,
         })
     }
+}
+
+/// The result of sorting a capture's changes: what git stages and the untracked paths the policy kept out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Staged {
+    /// What capture hands `git add`.
+    pub stage: Stage,
+    /// The untracked paths the policy denied, each with its pattern; capture lists them so nothing stays behind silently.
+    pub left_out: Vec<Denied>,
 }
 
 /// What capture hands `git add`: nothing, or at least one literal path.
@@ -285,7 +402,7 @@ fn changed_list(changed: &[Denied]) -> String {
 }
 
 /// Returns true when a job's `pattern` denies `path`, a relative path whose components are separated by `/`.
-pub(crate) fn pattern_matches(pattern: &SecretPattern, path: &str) -> bool {
+fn pattern_matches(pattern: &SecretPattern, path: &str) -> bool {
     let names: Vec<&str> = path.split('/').collect();
     path_matches(pattern.as_str(), &names, &[])
 }
@@ -482,6 +599,91 @@ mod tests {
         for builtin in EVERYWHERE.iter().chain(OUTSIDE_CACHES) {
             assert!(SecretPattern::parse(builtin).is_ok(), "{builtin}");
         }
+    }
+
+    #[test]
+    fn a_secret_pattern_that_gitignore_would_read_differently_is_refused() {
+        assert_eq!(SecretPattern::parse(""), Err(SecretPatternError::Empty));
+        assert_eq!(
+            SecretPattern::parse("/x"),
+            Err(SecretPatternError::EmptyComponent)
+        );
+        assert_eq!(
+            SecretPattern::parse("x/"),
+            Err(SecretPatternError::EmptyComponent)
+        );
+        assert_eq!(
+            SecretPattern::parse("a/../b"),
+            Err(SecretPatternError::DotComponent)
+        );
+        assert_eq!(
+            SecretPattern::parse("**/x"),
+            Err(SecretPatternError::DoubleStar)
+        );
+        assert_eq!(
+            SecretPattern::parse("!x"),
+            Err(SecretPatternError::BadChar { index: 0 })
+        );
+        assert_eq!(
+            SecretPattern::parse("#x"),
+            Err(SecretPatternError::BadChar { index: 0 })
+        );
+        assert_eq!(
+            SecretPattern::parse("x?"),
+            Err(SecretPatternError::BadChar { index: 1 })
+        );
+        assert_eq!(
+            SecretPattern::parse("[ab]"),
+            Err(SecretPatternError::BadChar { index: 0 })
+        );
+        assert_eq!(
+            SecretPattern::parse("a b"),
+            Err(SecretPatternError::BadChar { index: 1 })
+        );
+        assert_eq!(
+            SecretPattern::parse("x\\"),
+            Err(SecretPatternError::BadChar { index: 1 })
+        );
+    }
+
+    #[test]
+    fn a_bad_secret_pattern_does_not_decode() {
+        let bytes = postcard::to_stdvec("**/x").unwrap();
+        assert!(postcard::from_bytes::<SecretPattern>(&bytes).is_err());
+    }
+
+    /// Two spellings of one rule are one value, so a list of them dedupes
+    /// and sorts by what the matcher does; a peer cannot send the other
+    /// spelling and give the same rule a second spec id.
+    #[test]
+    fn a_pattern_has_one_value_whatever_its_ascii_case() {
+        let upper = SecretPattern::parse("Data/*.DB").unwrap();
+        assert_eq!(upper, SecretPattern::parse("data/*.db").unwrap());
+        assert_eq!(upper.as_str(), "data/*.db");
+        let bytes = postcard::to_stdvec("data/*.DB").unwrap();
+        assert!(postcard::from_bytes::<SecretPattern>(&bytes).is_err());
+        let bytes = postcard::to_stdvec(&upper).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<SecretPattern>(&bytes).unwrap(),
+            upper
+        );
+    }
+
+    /// Detection reads the override file through the job's patterns, so a
+    /// pattern that denies it would drop every override from then on; one
+    /// from a peer's spec does not decode.
+    #[test]
+    fn a_pattern_that_denies_the_override_file_is_refused() {
+        for pattern in ["*.toml", "env.toml", ".fabric", "*", ".FABRIC/ENV.TOML"] {
+            assert_eq!(
+                SecretPattern::parse(pattern),
+                Err(SecretPatternError::DeniesOverrideFile),
+                "{pattern}"
+            );
+        }
+        assert!(SecretPattern::parse("*.sqlite").is_ok());
+        let bytes = postcard::to_stdvec("*.toml").unwrap();
+        assert!(postcard::from_bytes::<SecretPattern>(&bytes).is_err());
     }
 
     /// The plain recursive definition of the glob: `*` is any run, every other byte matches itself ignoring ASCII case.

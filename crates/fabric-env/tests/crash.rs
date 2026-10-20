@@ -5,7 +5,9 @@
 //! The child is this test binary started again with `FABRIC_CRASH_ROOT`
 //! set: each test runs its child half when the variable is set and its
 //! parent half otherwise. The steps are `sh` scripts, so the kill lands at
-//! a point the script names rather than at a guess of the clock.
+//! a point the script names rather than at a guess of the clock. Parent
+//! and child take the tree's lock in one lock directory, as two resumes on
+//! one node do.
 
 use std::env;
 use std::error::Error;
@@ -18,22 +20,32 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fabric_env::detect::detect;
-use fabric_env::materialize::{CacheHealth, MaterializeError, Plan, SENTINEL, plan};
+use fabric_env::materialize::{
+    CacheHealth, MaterializeError, NodeEnv, Plan, SENTINEL, TreeLock, plan,
+};
 
 const ROOT_VAR: &str = "FABRIC_CRASH_ROOT";
+
+/// The lock directory of the node both halves play, as Fabric's state would hold it.
+fn locks() -> std::path::PathBuf {
+    Path::new(env!("CARGO_TARGET_TMPDIR")).join("crash-locks")
+}
 
 /// How long the parent waits for a process the test started to reach a point or exit.
 const PATIENCE: Duration = Duration::from_secs(20);
 
 type TestResult<T> = Result<T, Box<dyn Error>>;
 
-/// Runs the child half when this process is the child: detect, plan and execute over the parent's workspace.
+/// Runs the child half when this process is the child: lock, detect, plan and execute over the parent's workspace.
 fn run_child() -> TestResult<bool> {
     let Some(root) = env::var_os(ROOT_VAR) else {
         return Ok(false);
     };
-    let detected = detect(Path::new(&root), None)?;
-    plan(&detected)?.ready()?.execute()?;
+    let lock = TreeLock::acquire(&locks(), Path::new(&root))?;
+    let detected = detect(Path::new(&root), &[])?;
+    plan(&detected, &lock, &NodeEnv::current())?
+        .ready()?
+        .execute(&lock)?;
     Ok(true)
 }
 
@@ -57,14 +69,15 @@ fn declare(root: &Path, override_toml: &str) -> io::Result<()> {
 /// Plans the workspace again, as the next resume would, once no step from an earlier resume holds the lock.
 fn next_plan(root: &Path) -> TestResult<Plan> {
     let started = Instant::now();
-    loop {
-        match plan(&detect(root, None)?) {
-            Err(MaterializeError::InstallerRunning) if started.elapsed() < PATIENCE => {
+    let lock = loop {
+        match TreeLock::acquire(&locks(), root) {
+            Err(MaterializeError::TreeBusy { .. }) if started.elapsed() < PATIENCE => {
                 thread::sleep(Duration::from_millis(20));
             }
-            other => return Ok(other?),
+            other => break other?,
         }
-    }
+    };
+    Ok(plan(&detect(root, &[])?, &lock, &NodeEnv::current())?)
 }
 
 /// Waits until `path` exists.
@@ -111,12 +124,7 @@ args = ["-c", "mkdir -p out && echo x > out/f && kill -9 $PPID"]
     assert!(dir.path().join("out/f").is_file());
     assert!(!dir.path().join("out").join(SENTINEL).exists());
     let next = next_plan(dir.path()).unwrap();
-    assert_eq!(
-        next.caches()[0].health,
-        CacheHealth::Incomplete {
-            expected: &[SENTINEL]
-        }
-    );
+    assert_eq!(next.caches()[0].health, CacheHealth::Incomplete);
     assert_eq!(next.steps().len(), 1);
 }
 
@@ -156,15 +164,16 @@ when = "always"
     assert!(!dir.path().join("out").join(SENTINEL).exists());
     assert_eq!(
         next_plan(dir.path()).unwrap().caches()[0].health,
-        CacheHealth::Incomplete {
-            expected: &[SENTINEL]
-        }
+        CacheHealth::Incomplete
     );
 }
 
 /// After a `kill -9` of resume the installer it started keeps running. The
-/// next resume refuses while it runs, instead of starting a second
-/// installer on the same tree, and proceeds once it has exited.
+/// next resume refuses to take the tree while it runs, instead of
+/// restoring over it or starting a second installer, and proceeds once it
+/// has exited. Nothing the workspace does lifts the refusal: the lock is
+/// not in the tree, so `rm -rf .fabric`, as `git clean -xfd` does, and a
+/// restore that writes the tree again leave it held.
 #[test]
 fn a_step_orphaned_by_a_killed_resume_blocks_the_next_one_until_it_exits() {
     if run_child().unwrap() {
@@ -193,20 +202,25 @@ args = ["-c", "touch started; while [ ! -e release ]; do sleep 0.02; done; mkdir
     child.kill().unwrap();
     assert_eq!(child.wait().unwrap().signal(), Some(9));
 
-    let detected = detect(dir.path(), None).unwrap();
-    assert!(matches!(
-        plan(&detected),
-        Err(MaterializeError::InstallerRunning)
-    ));
+    let refused = || {
+        matches!(
+            TreeLock::acquire(&locks(), dir.path()),
+            Err(MaterializeError::TreeBusy { .. })
+        )
+    };
+    assert!(refused());
+    fs::remove_dir_all(dir.path().join(".fabric")).unwrap();
+    assert!(refused());
+    declare(
+        dir.path(),
+        "[[cache]]\npath = \"out\"\nclass = \"build\"\n\n[[setup]]\nprogram = \"true\"\n",
+    )
+    .unwrap();
+    assert!(refused());
 
     fs::write(dir.path().join("release"), "").unwrap();
     let next = next_plan(dir.path()).unwrap();
     assert!(dir.path().join("out/f").is_file());
-    assert_eq!(
-        next.caches()[0].health,
-        CacheHealth::Incomplete {
-            expected: &[SENTINEL]
-        }
-    );
+    assert_eq!(next.caches()[0].health, CacheHealth::Incomplete);
     assert_eq!(next.steps().len(), 1);
 }

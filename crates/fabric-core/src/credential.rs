@@ -190,10 +190,10 @@ mod tests {
         }
     }
 
-    /// One positive and one near miss per fixed-prefix shape added after
-    /// the review: Stripe, Google, Hugging Face, `PyPI` and GitLab trigger tokens.
+    /// One positive and one near miss per fixed-prefix shape: Stripe,
+    /// Google, Hugging Face, `PyPI` and GitLab trigger tokens.
     #[test]
-    fn later_token_shapes_are_recognized_and_their_near_misses_are_not() {
+    fn fixed_prefix_token_shapes_are_recognized_and_their_near_misses_are_not() {
         let body = "a1B2".repeat(13);
         let cases = [
             (

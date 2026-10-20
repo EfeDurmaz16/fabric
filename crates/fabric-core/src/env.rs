@@ -17,10 +17,14 @@ use crate::credential::looks_like_credential;
 use crate::harness::ProgramName;
 use crate::id::EnvSpecId;
 use crate::path::RelPath;
+use crate::secret::SecretPattern;
 use crate::snapshot::first_out_of_order;
 
 /// The format version this crate writes; the first varint of every encoded spec.
 pub const ENV_SPEC_VERSION: u16 = 0;
+
+/// Where a workspace's override file lives, relative to its root (ADR 0007).
+pub const OVERRIDE_FILE: &str = ".fabric/env.toml";
 
 /// Why an environment spec was refused.
 #[derive(Debug, thiserror::Error)]
@@ -139,15 +143,25 @@ pub enum PinError {
     Credential,
 }
 
-/// Checks the rules a tool name and a version pin share; `space` says whether a space is allowed.
-fn check_pin_text(text: &str, space: bool) -> Result<(), PinError> {
+/// Whether pin text may hold a space: a version range may, a tool name may not.
+#[derive(Clone, Copy)]
+enum Spaces {
+    Allowed,
+    Refused,
+}
+
+/// Checks the rules a tool name and a version pin share.
+fn check_pin_text(text: &str, spaces: Spaces) -> Result<(), PinError> {
     if text.is_empty() {
         return Err(PinError::Empty);
     }
     if text.len() > MAX_PIN_LEN {
         return Err(PinError::TooLong);
     }
-    let first = if space { b' ' } else { b'!' };
+    let first = match spaces {
+        Spaces::Allowed => b' ',
+        Spaces::Refused => b'!',
+    };
     if !text.bytes().all(|b| (first..=b'~').contains(&b)) {
         return Err(PinError::BadChar);
     }
@@ -170,7 +184,7 @@ pub struct ToolName(String);
 impl ToolName {
     /// Checks `text` against the rules and wraps it.
     pub fn parse(text: &str) -> Result<Self, PinError> {
-        check_pin_text(text, false)?;
+        check_pin_text(text, Spaces::Refused)?;
         Ok(Self(text.to_owned()))
     }
 
@@ -193,7 +207,7 @@ pub struct ToolVersion(String);
 impl ToolVersion {
     /// Checks `text` against the rules and wraps it.
     pub fn parse(text: &str) -> Result<Self, PinError> {
-        check_pin_text(text, true)?;
+        check_pin_text(text, Spaces::Allowed)?;
         Ok(Self(text.to_owned()))
     }
 
@@ -238,82 +252,53 @@ macro_rules! pin_text_impls {
 pin_text_impls!(ToolName);
 pin_text_impls!(ToolVersion);
 
-/// Why a secret pattern was refused.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum SecretPatternError {
-    /// The pattern has no characters.
-    #[error("secret pattern is empty")]
-    Empty,
-    /// A leading, trailing or doubled slash.
-    #[error("secret pattern has an empty component")]
-    EmptyComponent,
-    /// A `.` or `..` component, which no path holds.
-    #[error("secret pattern has a `.` or `..` component")]
-    DotComponent,
-    /// A `**` component; a pattern already matches at any depth.
-    #[error("secret pattern has a `**` component; a pattern already matches at any depth")]
-    DoubleStar,
-    /// A character with a meaning in gitignore that the matcher does not share.
-    #[error("secret pattern has an unsupported character at index {index}")]
-    BadChar {
-        /// Zero-based byte index of the character.
-        index: usize,
-    },
+/// Why a setup argument was refused; the argument itself is never quoted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SetupArgError {
+    /// A control character, such as a terminal escape, a newline or NUL.
+    #[error("has a control character")]
+    Control,
+    /// The text is shaped like a token, a key or a URL with a password.
+    #[error("looks like a credential; pass it as an `env` name and let the program read it")]
+    Credential,
 }
 
-/// A secret pattern a job adds to the built-in list: path components separated by `/`, where `*` matches any run of characters.
+/// One argument of a setup step: any text with no control character that is not shaped like a credential.
 ///
-/// Refused: `\`, `[`, `]`, `?`, `!`, `#`, whitespace and NUL, because
-/// gitignore gives them meanings the matcher does not, and empty, `.`, `..`
-/// and `**` components. Checked once, at the boundary, including inside
-/// `Deserialize`. The matcher itself is `fabric_env::secret`.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+/// The spec travels to other nodes, and a node prints a peer's steps
+/// before it runs them (ADR 0007), so an argument can carry neither a
+/// token nor a terminal escape. Checked once, at the boundary, including
+/// inside `Deserialize`. The empty argument is allowed; programs take it.
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
-pub struct SecretPattern(String);
+pub struct SetupArg(String);
 
-impl SecretPattern {
-    /// Checks `text` against the pattern rules and wraps it.
-    pub fn parse(text: &str) -> Result<Self, SecretPatternError> {
-        if text.is_empty() {
-            return Err(SecretPatternError::Empty);
+impl SetupArg {
+    /// Checks `text` against the rules and wraps it.
+    pub fn parse(text: &str) -> Result<Self, SetupArgError> {
+        if text.chars().any(char::is_control) {
+            return Err(SetupArgError::Control);
         }
-        let bad = text.char_indices().find(|&(_, c)| {
-            matches!(c, '\\' | '[' | ']' | '?' | '!' | '#' | '\0') || c.is_whitespace()
-        });
-        if let Some((index, _)) = bad {
-            return Err(SecretPatternError::BadChar { index });
-        }
-        for component in text.split('/') {
-            match component {
-                "" => return Err(SecretPatternError::EmptyComponent),
-                "." | ".." => return Err(SecretPatternError::DotComponent),
-                "**" => return Err(SecretPatternError::DoubleStar),
-                _ => {}
-            }
+        if looks_like_credential(text) {
+            return Err(SetupArgError::Credential);
         }
         Ok(Self(text.to_owned()))
     }
 
-    /// Returns the pattern text.
+    /// Returns the argument.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-impl fmt::Display for SecretPattern {
+impl fmt::Debug for SetupArg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        write!(f, "SetupArg({:?})", self.0)
     }
 }
 
-impl fmt::Debug for SecretPattern {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SecretPattern({:?})", self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for SecretPattern {
+impl<'de> Deserialize<'de> for SetupArg {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
         Self::parse(&text).map_err(serde::de::Error::custom)
@@ -365,7 +350,7 @@ pub struct SetupStep {
     /// The program to run, looked up on `PATH`, never through a shell.
     pub program: ProgramName,
     /// Its arguments, passed as they are.
-    pub args: Vec<String>,
+    pub args: Vec<SetupArg>,
     /// The directory to run in, relative to the root; `None` is the root itself.
     pub cwd: Option<RelPath>,
     /// When the step runs.
@@ -375,9 +360,10 @@ pub struct SetupStep {
 /// When a setup step runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunWhen {
-    /// When a cache path is missing, empty, partial or keyed to another
-    /// node, and on every resume when the spec has no cache paths, since
-    /// nothing then proves the workspace warm.
+    /// When a cache the detection report says this step fills is missing,
+    /// empty or lacks its completion proof; a step that fills no workspace
+    /// cache runs when any cache is not whole or the report has none
+    /// (ADR 0007, step 4 of Materialize).
     CachesMissing,
     /// On every resume.
     Always,
@@ -445,7 +431,7 @@ mod tests {
             }],
             setup: vec![SetupStep {
                 program: ProgramName::parse("npm").unwrap(),
-                args: vec!["ci".into()],
+                args: vec![SetupArg::parse("ci").unwrap()],
                 cwd: None,
                 when: RunWhen::CachesMissing,
             }],
@@ -536,55 +522,20 @@ mod tests {
         }
     }
 
+    /// A peer's step cannot carry a token or a terminal escape to the prompt that prints it.
     #[test]
-    fn a_secret_pattern_that_gitignore_would_read_differently_is_refused() {
-        assert_eq!(SecretPattern::parse(""), Err(SecretPatternError::Empty));
-        assert_eq!(
-            SecretPattern::parse("/x"),
-            Err(SecretPatternError::EmptyComponent)
-        );
-        assert_eq!(
-            SecretPattern::parse("x/"),
-            Err(SecretPatternError::EmptyComponent)
-        );
-        assert_eq!(
-            SecretPattern::parse("a/../b"),
-            Err(SecretPatternError::DotComponent)
-        );
-        assert_eq!(
-            SecretPattern::parse("**/x"),
-            Err(SecretPatternError::DoubleStar)
-        );
-        assert_eq!(
-            SecretPattern::parse("!x"),
-            Err(SecretPatternError::BadChar { index: 0 })
-        );
-        assert_eq!(
-            SecretPattern::parse("#x"),
-            Err(SecretPatternError::BadChar { index: 0 })
-        );
-        assert_eq!(
-            SecretPattern::parse("x?"),
-            Err(SecretPatternError::BadChar { index: 1 })
-        );
-        assert_eq!(
-            SecretPattern::parse("[ab]"),
-            Err(SecretPatternError::BadChar { index: 0 })
-        );
-        assert_eq!(
-            SecretPattern::parse("a b"),
-            Err(SecretPatternError::BadChar { index: 1 })
-        );
-        assert_eq!(
-            SecretPattern::parse("x\\"),
-            Err(SecretPatternError::BadChar { index: 1 })
-        );
-    }
-
-    #[test]
-    fn a_bad_secret_pattern_does_not_decode() {
-        let bytes = postcard::to_stdvec("**/x").unwrap();
-        assert!(postcard::from_bytes::<SecretPattern>(&bytes).is_err());
+    fn a_setup_arg_is_printable_and_not_a_credential() {
+        for ok in ["", "--frozen-lockfile", "-c", "echo x > out/f", "caf\u{e9}"] {
+            assert!(SetupArg::parse(ok).is_ok(), "{ok:?}");
+        }
+        assert_eq!(SetupArg::parse("\u{1b}[2Jci"), Err(SetupArgError::Control));
+        assert_eq!(SetupArg::parse("a\nb"), Err(SetupArgError::Control));
+        let token = format!("--token=ghp_{}", "q7".repeat(18));
+        assert_eq!(SetupArg::parse(&token), Err(SetupArgError::Credential));
+        for bad in ["\u{1b}[31mci", token.as_str()] {
+            let bytes = postcard::to_stdvec(bad).unwrap();
+            assert!(postcard::from_bytes::<SetupArg>(&bytes).is_err(), "{bad:?}");
+        }
     }
 
     /// Two specs with the same content in another order would have two ids.

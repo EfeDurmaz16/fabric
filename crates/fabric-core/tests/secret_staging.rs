@@ -11,15 +11,15 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use fabric_core::env::{SecretPattern, SecretPatternError};
 use fabric_core::path::RelPath;
-use fabric_env::secret::{
-    Scope, SecretPolicy, Stage, TrackedSecretChanged, TrackedSecrets, Tracking,
+use fabric_core::secret::{
+    Denied, Scope, SecretPattern, SecretPatternError, SecretPolicy, Stage, Staged,
+    TrackedSecretChanged, TrackedSecrets, Tracking,
 };
 
-/// Committed before the working tree changes. The first five are the
-/// failure from the review: source and template files whose names an
-/// over-broad pattern matched, so their edits never reached `W`.
+/// Committed before the working tree changes. The first five are source
+/// and template files whose names an over-broad pattern would match; their
+/// edits must reach `W`.
 const COMMITTED: &[(&str, &str)] = &[
     (".env.example", "A=\n"),
     ("src/id_test.go", "package src\n"),
@@ -89,8 +89,11 @@ const CREATED: &[&str] = &[
     "src/identity.rs",
 ];
 
+/// Runs git with no configuration but the repository's own, so a
+/// developer's global excludes file cannot hide a path from `W`.
 fn git(dir: &Path, index: &Path, args: &[&str], stdin: Option<&[u8]>) -> io::Result<Vec<u8>> {
     let mut child = Command::new("git")
+        .args(["-c", "core.excludesFile=/dev/null"])
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -164,13 +167,16 @@ fn repo() -> io::Result<Repo> {
     Ok(Repo { dir, index })
 }
 
+/// What `capture_w` returns: the tree of `W` as path to contents, and the paths the policy kept out.
+type Captured = (BTreeMap<String, String>, Vec<Denied>);
+
 /// Plays capture's part: lists the changes against `I`, sorts them, stages
-/// the literal paths into a temporary index and returns the tree as path to contents.
+/// the literal paths into a temporary index and returns the tree with the paths left out.
 fn capture_w(
     repo: &Repo,
     policy: &SecretPolicy,
     consent: TrackedSecrets,
-) -> io::Result<Result<BTreeMap<String, String>, TrackedSecretChanged>> {
+) -> io::Result<Result<Captured, TrackedSecretChanged>> {
     let root = repo.dir.path();
     let temp = root.join(".git/fabric-capture-index");
     fs::copy(&repo.index, &temp)?;
@@ -194,8 +200,8 @@ fn capture_w(
                 .into_iter()
                 .map(|path| (path, Tracking::Untracked)),
         );
-    let stage = match policy.staging(changes).paths(consent) {
-        Ok(stage) => stage,
+    let Staged { stage, left_out } = match policy.staging(changes).paths(consent) {
+        Ok(staged) => staged,
         Err(refused) => return Ok(Err(refused)),
     };
     if let Stage::Paths { first, rest } = &stage {
@@ -229,7 +235,7 @@ fn capture_w(
             String::from_utf8(blob).map_err(io::Error::other)?,
         );
     }
-    Ok(Ok(files))
+    Ok(Ok((files, left_out)))
 }
 
 fn policy() -> Result<SecretPolicy, SecretPatternError> {
@@ -260,14 +266,33 @@ fn a_changed_tracked_secret_refuses_the_capture_and_names_it() {
 }
 
 /// With consent every tracked change reaches `W` as the working tree has
-/// it, deletions included, and no untracked path the policy denies does.
+/// it, deletions included, and no untracked path the policy denies does;
+/// each one kept out is listed with the pattern that denied it.
 #[test]
 fn w_holds_every_tracked_change_and_no_untracked_secret() {
     let repo = repo().unwrap();
     let policy = policy().unwrap();
-    let w = capture_w(&repo, &policy, TrackedSecrets::Carry)
+    let (w, left_out) = capture_w(&repo, &policy, TrackedSecrets::Carry)
         .unwrap()
         .unwrap();
+    for denied in &left_out {
+        assert_eq!(
+            policy.denies(&denied.path, Scope::Work),
+            Some(denied.pattern.as_str()),
+            "{}",
+            denied.path
+        );
+        assert!(!w.contains_key(denied.path.as_str()), "{}", denied.path);
+    }
+    let listed: Vec<&str> = left_out.iter().map(|d| d.path.as_str()).collect();
+    for out in [
+        ".env.local",
+        "server.pem",
+        "data/local.sqlite",
+        "id_ed25519",
+    ] {
+        assert!(listed.contains(&out), "{out}");
+    }
     for (path, edit) in EDITS {
         assert_eq!(w.get(*path).map(String::as_str), *edit, "{path}");
     }

@@ -15,39 +15,43 @@
 //! env = ["DATABASE_URL"]           # names only, resolved on each node
 //! secret_patterns = ["*.sqlite"]   # added to the built-in secret list
 //!
-//! [tools]                          # a declared pin replaces a detected one;
-//! node = "22"                      # nodejs reads as node and golang as go, as in .tool-versions
+//! [tools]                          # a declared pin replaces a detected one
+//! node = "22"                      # nodejs reads as node, golang as go
 //!
-//! [[cache]]                        # added to the detected cache paths; when one
-//! path = ".output"                 # is missing on resume the setup steps run, so
-//! class = "build"                  # name what they rebuild; deps, build or tool-cache
-//! ecosystem = "node"               # optional: node, rust, python or other; picks the
-//!                                  # carry key; the single detected ecosystem when absent
-//!                                  # with no cache path at all the steps run every resume
+//! [[cache]]                        # added to the detected cache paths
+//! path = ".output"
+//! class = "build"                  # deps, build or tool-cache
+//! ecosystem = "node"               # optional: node, rust, python or other
 //!
-//! [[setup]]                        # any setup entry replaces every detected step
+//! [[setup]]                        # replaces every detected step
 //! program = "pnpm"
 //! args = ["install", "--frozen-lockfile"]
 //! cwd = "web"                      # optional; the root when absent
 //! when = "caches-missing"          # or "always"; caches-missing when absent
 //! ```
+//!
+//! `ecosystem` picks the cache's carry key. Without it, a declared cache
+//! takes the one ecosystem detection found, or `other` when it found none.
+//!
+//! A missing declared cache runs the steps that fill it. A declared step
+//! counts as filling every cache except a detected `target`, so every
+//! declared step runs. A detected install fills only its own cache and
+//! does not run, so declare the step that builds the cache. A detected
+//! step that fills no cache in the workspace, such as `go mod download`,
+//! runs whenever any cache is not whole. With no cache path at all, the
+//! `caches-missing` steps run on every resume.
 
 use std::collections::BTreeMap;
 
-use fabric_core::credential::looks_like_credential;
 use fabric_core::env::{
-    EnvVarName, EnvVarNameError, PinError, RunWhen, SecretPattern, SecretPatternError, SetupStep,
-    ToolName, ToolVersion,
+    EnvVarName, EnvVarNameError, PinError, RunWhen, SetupArg, SetupArgError, SetupStep, ToolName,
+    ToolVersion,
 };
 use fabric_core::harness::{ProgramName, ProgramNameError};
 use fabric_core::path::{PathError, RelPath};
+use fabric_core::secret::{SecretPattern, SecretPatternError};
 use fabric_core::snapshot::CacheClass;
 use toml::{Table, Value};
-
-use crate::secret::pattern_matches;
-
-/// Where the override file lives, relative to the workspace root.
-pub const OVERRIDE_FILE: &str = ".fabric/env.toml";
 
 /// The directory that holds Fabric's own files in a workspace; never a cache.
 const FABRIC_DIR: &str = ".fabric";
@@ -139,26 +143,15 @@ pub enum OverrideError {
         /// Zero-based index of the repeat.
         index: usize,
     },
-    /// An entry of `secret_patterns` that denies the override file itself.
-    ///
-    /// Detection reads the override file through the job's patterns, so
-    /// such a pattern would drop every override from the next detection on.
-    #[error(
-        "`secret_patterns[{index}]` matches {OVERRIDE_FILE}, which detection must be able to read"
-    )]
-    PatternDeniesOverrideFile {
-        /// Zero-based index in `secret_patterns`.
-        index: usize,
-    },
-    /// A setup argument shaped like a credential; the spec travels to other nodes.
-    #[error(
-        "`setup[{step}].args[{arg}]` looks like a credential; pass it as an `env` name and let the program read it"
-    )]
-    CredentialInArgs {
+    /// A setup argument that is not a `SetupArg`; the argument itself is never quoted.
+    #[error("`setup[{step}].args[{arg}]` {reason}")]
+    Arg {
         /// Zero-based index in `setup`.
         step: usize,
         /// Zero-based index in that step's `args`.
         arg: usize,
+        /// What is wrong with it.
+        reason: SetupArgError,
     },
     /// Two `cache` entries name the same path, ignoring ASCII case.
     #[error("`cache[{index}].path` repeats an earlier cache path")]
@@ -393,13 +386,7 @@ fn patterns(value: &Value) -> Result<Vec<SecretPattern>, OverrideError> {
     for (index, text) in strings(value, "secret_patterns")?.into_iter().enumerate() {
         let pattern = SecretPattern::parse(text)
             .map_err(|reason| OverrideError::Pattern { index, reason })?;
-        if pattern_matches(&pattern, OVERRIDE_FILE) {
-            return Err(OverrideError::PatternDeniesOverrideFile { index });
-        }
-        if patterns
-            .iter()
-            .any(|p| p.as_str().eq_ignore_ascii_case(pattern.as_str()))
-        {
+        if patterns.contains(&pattern) {
             return Err(OverrideError::DuplicatePattern { index });
         }
         patterns.push(pattern);
@@ -525,9 +512,17 @@ fn steps(value: &Value) -> Result<Vec<SetupStep>, OverrideError> {
             Some(args) => strings(args, &format!("{at}.args"))?,
             None => Vec::new(),
         };
-        if let Some(arg) = args.iter().position(|a| looks_like_credential(a)) {
-            return Err(OverrideError::CredentialInArgs { step: index, arg });
-        }
+        let args = args
+            .into_iter()
+            .enumerate()
+            .map(|(arg, text)| {
+                SetupArg::parse(text).map_err(|reason| OverrideError::Arg {
+                    step: index,
+                    arg,
+                    reason,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let cwd = match entry.get("cwd") {
             Some(cwd) => Some(rel_path(cwd, &format!("{at}.cwd"))?),
             None => None,
@@ -550,7 +545,7 @@ fn steps(value: &Value) -> Result<Vec<SetupStep>, OverrideError> {
         };
         steps.push(SetupStep {
             program,
-            args: args.into_iter().map(str::to_owned).collect(),
+            args,
             cwd,
             when,
         });
@@ -647,7 +642,14 @@ when = "always"
         assert_eq!(setup[0].cwd, Some(RelPath::parse("web").unwrap()));
         assert_eq!(setup[0].when, RunWhen::CachesMissing);
         assert_eq!(setup[1].when, RunWhen::Always);
-        assert_eq!(setup[1].args, ["run", "codegen"]);
+        assert_eq!(
+            setup[1]
+                .args
+                .iter()
+                .map(SetupArg::as_str)
+                .collect::<Vec<_>>(),
+            ["run", "codegen"]
+        );
     }
 
     /// `setup = []` declares that nothing runs, which differs from no
@@ -675,6 +677,8 @@ when = "always"
             format!("[[cache]]\npath = \"/{secret}\"\nclass = \"deps\""),
             format!("[[cache]]\npath = \"x\"\nclass = \"{secret}\""),
             format!("tools = {{ node = [\"{secret}\"] }}"),
+            format!("[tools]\nnode = \"{secret}\""),
+            format!("[tools]\n\"{secret}\" = \"1\""),
             format!("env = [\"{secret}"),
             format!("\"{secret}\" = 1"),
             format!("[[cache]]\npath = \"x\"\nclass = \"deps\"\n\"{secret}\" = 1"),
@@ -715,6 +719,14 @@ when = "always"
                 reason: PinError::Credential
             })
         ));
+        let text = format!("[tools]\nzeta = \"1\"\n{token} = \"1\"\n");
+        assert!(matches!(
+            EnvOverride::parse(&text),
+            Err(OverrideError::ToolName {
+                index: 1,
+                reason: PinError::Credential
+            })
+        ));
     }
 
     #[test]
@@ -750,7 +762,11 @@ when = "always"
         );
         assert!(matches!(
             EnvOverride::parse(&text),
-            Err(OverrideError::CredentialInArgs { step: 1, arg: 1 })
+            Err(OverrideError::Arg {
+                step: 1,
+                arg: 1,
+                reason: SetupArgError::Credential
+            })
         ));
     }
 
@@ -832,20 +848,16 @@ when = "always"
         assert_eq!(EnvOverride::parse(siblings).unwrap().caches.len(), 2);
     }
 
-    /// Detection reads the override file through the job's patterns, so a
-    /// pattern that denies it would drop every override from then on.
+    /// The parse-time rule of `SecretPattern` reaches the user with the entry's index.
     #[test]
     fn a_pattern_that_denies_the_override_file_is_refused() {
-        for pattern in ["*.toml", "env.toml", ".fabric", "*", ".FABRIC/ENV.TOML"] {
-            let text = format!("secret_patterns = [\"*.sqlite\", \"{pattern}\"]");
-            assert!(
-                matches!(
-                    EnvOverride::parse(&text),
-                    Err(OverrideError::PatternDeniesOverrideFile { index: 1 })
-                ),
-                "{pattern}"
-            );
-        }
+        assert!(matches!(
+            EnvOverride::parse("secret_patterns = [\"*.sqlite\", \"*.toml\"]"),
+            Err(OverrideError::Pattern {
+                index: 1,
+                reason: SecretPatternError::DeniesOverrideFile
+            })
+        ));
     }
 
     #[test]

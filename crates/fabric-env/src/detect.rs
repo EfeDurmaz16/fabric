@@ -21,6 +21,7 @@
 //! | File | Gives |
 //! |---|---|
 //! | `package.json` with a lockfile | the package manager's install step, `node_modules` as a cache |
+//! | `.yarnrc.yml`, for Yarn 2 and later | `nodeLinker`, which must be `node-modules` |
 //! | `Cargo.toml` | `cargo fetch`, with `--locked` when `Cargo.lock` exists; `target` as a cache |
 //! | `uv.lock`, else `requirements.txt` | `uv sync --frozen`, or a `uv` venv and `uv pip install -r`; `.venv` as a cache |
 //! | `go.mod` | `go mod download`; no cache inside the workspace |
@@ -36,7 +37,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use fabric_core::env::{
-    EnvSpec, EnvSpecError, RunWhen, SecretPattern, SetupStep, Tool, ToolName, ToolSource,
+    EnvSpec, EnvSpecError, OVERRIDE_FILE, RunWhen, SetupArg, SetupStep, Tool, ToolName, ToolSource,
     ToolVersion,
 };
 use fabric_core::harness::ProgramName;
@@ -45,10 +46,26 @@ use fabric_core::snapshot::CacheClass;
 use toml::Table;
 
 use crate::overrides::{
-    DeclaredCache, DeclaredEcosystem, EnvOverride, OVERRIDE_FILE, OverrideError,
-    PackageManagerName, canonical_tool, line_and_column,
+    DeclaredCache, DeclaredEcosystem, EnvOverride, OverrideError, PackageManagerName,
+    canonical_tool, line_and_column,
 };
-use crate::secret::{Scope, SecretPolicy};
+use fabric_core::secret::{Scope, SecretPattern, SecretPolicy};
+
+/// Every file detection opens, relative to the root. `Reader` refuses any
+/// other name, so a new reader must add its file here, where a test checks
+/// that no built-in secret pattern denies it.
+const READ_FILES: &[&str] = &[
+    OVERRIDE_FILE,
+    "package.json",
+    "mise.toml",
+    ".tool-versions",
+    "rust-toolchain.toml",
+    ".node-version",
+    ".nvmrc",
+    ".python-version",
+    "go.mod",
+    ".yarnrc.yml",
+];
 
 /// The largest file detection reads; a bigger one is refused rather than loaded.
 const MAX_FILE_LEN: u64 = 4 << 20;
@@ -171,6 +188,16 @@ pub enum DetectError {
         /// Zero-based index of the entry in `[[cache]]`.
         index: usize,
     },
+    /// Yarn 2 or later installs with Plug'n'Play here, which writes no `node_modules`.
+    ///
+    /// The `.yarnrc.yml` value is never quoted. A Plug'n'Play install leaves
+    /// no `node_modules` for the detected cache to find, and its `.yarn/unplugged`
+    /// holds native builds for one Node ABI with no carry key, so it is
+    /// refused rather than reinstalled on every resume.
+    #[error(
+        "Yarn 2 or later installs with Plug'n'Play here, which writes no node_modules for Fabric to check or carry; set `nodeLinker: node-modules` in .yarnrc.yml"
+    )]
+    YarnPlugAndPlay,
     /// `package_manager` is set in `.fabric/env.toml` but the root has no `package.json` for it to apply to.
     #[error("`package_manager` is set in {OVERRIDE_FILE} but there is no package.json at the root")]
     PackageManagerWithoutPackageJson,
@@ -249,21 +276,6 @@ impl NodeManager {
         }
     }
 
-    /// Returns the files the manager writes inside `node_modules` as an install finishes.
-    ///
-    /// A first install killed halfway leaves `node_modules` without them,
-    /// which is how materialize tells a finished tree from a torn one. Bun
-    /// writes none, so a Bun tree is judged by materialize's own sentinel.
-    pub(crate) fn install_markers(self) -> &'static [&'static str] {
-        match self {
-            NodeManager::Npm => &[".package-lock.json"],
-            NodeManager::Pnpm => &[".modules.yaml"],
-            NodeManager::YarnClassic => &[".yarn-integrity"],
-            NodeManager::YarnBerry => &[".yarn-state.yml"],
-            NodeManager::Bun => &[],
-        }
-    }
-
     /// Returns the frozen-lockfile install step, which never rewrites the lockfile.
     fn install_step(self) -> Result<SetupStep, DetectError> {
         let args: &[&str] = match self {
@@ -332,29 +344,16 @@ pub enum CacheOrigin {
 /// How materialize tells a finished cache from a torn one, and which setup steps fill the cache.
 ///
 /// Detection decides this once per cache, so materialize never works out
-/// again which step fills which cache. Only the `node_modules` detection
-/// found gets installer markers: a declared cache keyed `Node` holds a
-/// build's output, which the installer never writes a marker into.
+/// again which step fills which cache. No installer's own file is proof:
+/// npm writes `node_modules/.package-lock.json`, pnpm `.modules.yaml` and
+/// Yarn 1 `.yarn-integrity` before the root package's lifecycle scripts
+/// run, so a failed or interrupted `postinstall` leaves the marker over a
+/// tree that is not whole. Only a step that exited 0 proves its cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Completion {
-    /// One of these files, which the installer itself writes as it finishes.
-    ///
-    /// The markers follow the manager detection chose, not the lockfiles on
-    /// disk: a Bun tree next to a leftover `package-lock.json` needs no
-    /// `.package-lock.json`.
-    Marker {
-        /// The marker files; any one of them proves the cache whole.
-        files: &'static [&'static str],
-        /// The setup steps that run the installer, by index in the spec.
-        filled_by: Vec<usize>,
-    },
     /// The sentinel materialize writes once the steps that fill the cache have exited 0.
-    ///
-    /// For a cache whose installer writes no marker: Bun's `node_modules`,
-    /// `.venv` (whose `pyvenv.cfg` is written before any package, so it
-    /// proves nothing) and a declared cache that a setup step fills.
     Sentinel {
-        /// The setup steps that fill the cache, by index in the spec; never empty.
+        /// The setup steps that fill the cache, by index in the spec.
         filled_by: Vec<usize>,
     },
     /// Content alone: no setup step fills the cache, so no step can leave it torn.
@@ -365,7 +364,7 @@ impl Completion {
     /// Returns the setup steps that fill the cache, by index in the spec; empty for `Content`.
     pub fn filled_by(&self) -> &[usize] {
         match self {
-            Completion::Marker { filled_by, .. } | Completion::Sentinel { filled_by } => filled_by,
+            Completion::Sentinel { filled_by } => filled_by,
             Completion::Content => &[],
         }
     }
@@ -474,8 +473,6 @@ struct FoundCache {
     class: CacheClass,
     ecosystem: Ecosystem,
     origin: CacheOrigin,
-    /// The installer's markers; only the `node_modules` detection found has any.
-    markers: &'static [&'static str],
 }
 
 impl FoundCache {
@@ -487,12 +484,7 @@ impl FoundCache {
             .filter(|(_, scope)| scope.fills(&self))
             .map(|(index, _)| index)
             .collect();
-        let completion = if !self.markers.is_empty() {
-            Completion::Marker {
-                files: self.markers,
-                filled_by,
-            }
-        } else if filled_by.is_empty() {
+        let completion = if filled_by.is_empty() {
             Completion::Content
         } else {
             Completion::Sentinel { filled_by }
@@ -529,12 +521,12 @@ pub struct Pin {
 pub struct Detection {
     root: PathBuf,
     spec: EnvSpec,
+    /// One gate per step of `spec.setup`, in the same order; built with it in `detect` and never changed.
     step_gates: Vec<StepGate>,
     caches: Vec<CachePath>,
     pins: Vec<Pin>,
     node_manager: Option<ManagerChoice>,
     devcontainer: Option<RelPath>,
-    secrets: SecretPolicy,
 }
 
 impl Detection {
@@ -548,9 +540,9 @@ impl Detection {
         &self.spec
     }
 
-    /// Returns which caches decide whether each setup step runs, one per step of the spec and in the same order.
-    pub fn step_gates(&self) -> &[StepGate] {
-        &self.step_gates
+    /// Returns each setup step of the spec, in order, with the caches that decide whether it runs.
+    pub fn steps(&self) -> impl Iterator<Item = (&SetupStep, &StepGate)> {
+        self.spec.setup.iter().zip(&self.step_gates)
     }
 
     /// Returns the spec's cache paths with their class, ecosystem and completion, sorted by path.
@@ -572,35 +564,26 @@ impl Detection {
     pub fn devcontainer(&self) -> Option<&RelPath> {
         self.devcontainer.as_ref()
     }
-
-    /// Returns the secret policy, widened by the override file.
-    pub fn secrets(&self) -> &SecretPolicy {
-        &self.secrets
-    }
 }
 
 /// Detects the environment of the workspace at `root`, applying `.fabric/env.toml` when present.
 ///
-/// `previous` is the job's last spec, or `None` for a job that has none
-/// yet. Every secret pattern it holds stays in force and in the new spec,
+/// `recorded` is the `secret_patterns` of the job's last spec, empty for a
+/// job that has none yet. Every one stays in force and in the new spec,
 /// even when the override file no longer lists it: a job's secret list
 /// only grows, and the override file is a file in the working tree that
-/// the agent can rewrite.
-pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, DetectError> {
+/// the agent can rewrite. The capture policy is built from the returned
+/// spec with `SecretPolicy::from_patterns` (ADR 0004).
+pub fn detect(root: &Path, recorded: &[SecretPattern]) -> Result<Detection, DetectError> {
     let root = fs::canonicalize(root).map_err(|source| DetectError::Root { source })?;
     let root = root.as_path();
-    let recorded = SecretPolicy::from_patterns(
-        previous.map_or(&[][..], |spec| spec.secret_patterns.as_slice()),
-    );
-    let first = Reader {
-        root,
-        secrets: &recorded,
-    };
-    let overrides = match first.text(OVERRIDE_FILE)? {
+    // No pattern can deny the override file: `SecretPattern` refuses one
+    // that would (`DeniesOverrideFile`), and a test checks the built-ins.
+    let overrides = match read_text(root, OVERRIDE_FILE)? {
         Some(text) => EnvOverride::parse(&text)?,
         None => EnvOverride::default(),
     };
-    let secret_patterns = job_secret_patterns(previous, &overrides.secret_patterns);
+    let secret_patterns = job_secret_patterns(recorded, &overrides.secret_patterns);
     let secrets = SecretPolicy::from_patterns(&secret_patterns);
     let reader = Reader {
         root,
@@ -612,7 +595,7 @@ pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, Dete
     let mut setup = Vec::new();
     let mut caches = Vec::new();
     let node_manager = match (&package, overrides.package_manager) {
-        (Some(package), declared) => choose_node_manager(root, package, declared)?,
+        (Some(package), declared) => choose_node_manager(&reader, package, declared)?,
         (None, Some(_)) => return Err(DetectError::PackageManagerWithoutPackageJson),
         (None, None) => None,
     };
@@ -627,7 +610,6 @@ pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, Dete
             class: CacheClass::Deps,
             ecosystem: Ecosystem::Node(choice.manager),
             origin: CacheOrigin::Detected,
-            markers: choice.manager.install_markers(),
         });
     }
     detect_rust(root, &mut setup, &mut caches)?;
@@ -673,7 +655,6 @@ pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, Dete
         pins,
         node_manager,
         devcontainer: find_devcontainer(root)?,
-        secrets,
     })
 }
 
@@ -722,7 +703,6 @@ fn merge_declared_caches(
             class: declared.class,
             ecosystem,
             origin: CacheOrigin::Declared,
-            markers: &[],
         });
     }
     Ok(())
@@ -730,10 +710,9 @@ fn merge_declared_caches(
 
 /// Returns the job's secret patterns: every one its previous spec held, plus the override file's, sorted.
 fn job_secret_patterns(
-    previous: Option<&EnvSpec>,
+    recorded: &[SecretPattern],
     declared: &[SecretPattern],
 ) -> Vec<SecretPattern> {
-    let recorded = previous.map_or(&[][..], |spec| spec.secret_patterns.as_slice());
     let dropped = recorded.iter().filter(|p| !declared.contains(p)).count();
     if dropped > 0 {
         tracing::warn!(
@@ -786,25 +765,54 @@ fn collect_pins(
     }
     pins.extend(go_mod_pin(reader)?);
     if let Some(package) = package {
-        let mut entry = 0;
         if let Some((name, version)) = &package.manager {
-            pins.extend(pin(name.as_str(), version, "package.json", entry));
-            entry += 1;
+            pins.extend(pin(
+                name.as_str(),
+                version,
+                "package.json",
+                PinAt::Key("packageManager"),
+            ));
         }
         if let Some(engine) = &package.engines_node {
-            pins.extend(pin("node", engine, "package.json", entry));
+            pins.extend(pin(
+                "node",
+                engine,
+                "package.json",
+                PinAt::Key("engines.node"),
+            ));
         }
     }
     Ok(pins)
 }
 
+/// Where in its file a detected pin sits, so a warning can point at it without quoting it.
+#[derive(Debug, Clone, Copy)]
+enum PinAt {
+    /// A fixed key, such as `engines.node`.
+    Key(&'static str),
+    /// The zero-based index of the entry under `[tools]`, counting every entry.
+    ToolsEntry(usize),
+    /// The one-based line number.
+    Line(usize),
+}
+
+impl fmt::Display for PinAt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PinAt::Key(key) => write!(f, "`{key}`"),
+            PinAt::ToolsEntry(index) => write!(f, "[tools] entry {index}"),
+            PinAt::Line(line) => write!(f, "line {line}"),
+        }
+    }
+}
+
 /// Builds a detected pin, reading its tool name through its alias, or drops it when the name or the version breaks the pin rules.
 ///
-/// `entry` is the pin's zero-based index among the pins `file` gives. The
-/// warning names the file, the entry and the rule, never the text, so a
-/// token in a pin file does not reach the log. Dropping is as leak-safe as
-/// refusing: a dropped pin never enters the spec.
-fn pin(tool: &str, version: &str, file: &'static str, entry: usize) -> Option<Pin> {
+/// The warning names the file, where in it the pin sits and the rule,
+/// never the text, so a token in a pin file does not reach the log.
+/// Dropping is as leak-safe as refusing: a dropped pin never enters the
+/// spec.
+fn pin(tool: &str, version: &str, file: &'static str, at: PinAt) -> Option<Pin> {
     let parsed = ToolName::parse(canonical_tool(tool))
         .map_err(|reason| ("tool name", reason))
         .and_then(|tool| {
@@ -822,7 +830,7 @@ fn pin(tool: &str, version: &str, file: &'static str, entry: usize) -> Option<Pi
         Err((part, reason)) => {
             tracing::warn!(
                 file,
-                entry,
+                %at,
                 part,
                 %reason,
                 "pin dropped; pins are informational, so detection goes on without it"
@@ -857,7 +865,6 @@ fn detect_rust(
         class: CacheClass::Build,
         ecosystem: Ecosystem::Rust,
         origin: CacheOrigin::Detected,
-        markers: &[],
     });
     Ok(())
 }
@@ -887,7 +894,6 @@ fn detect_python(
         class: CacheClass::Deps,
         ecosystem: Ecosystem::Python,
         origin: CacheOrigin::Detected,
-        markers: &[],
     });
     Ok(())
 }
@@ -972,10 +978,11 @@ fn read_package_json(reader: &Reader<'_>) -> Result<Option<PackageJson>, DetectE
 /// can rebuild `node_modules`, so it is not a cache and travels as the
 /// user's own files.
 fn choose_node_manager(
-    root: &Path,
+    reader: &Reader<'_>,
     package: &PackageJson,
     declared: Option<PackageManagerName>,
 ) -> Result<Option<ManagerChoice>, DetectError> {
+    let root = reader.root;
     // Ambiguity is decided on the managers that own a present lockfile, not
     // on the file names: Bun's `bun.lock` next to its older `bun.lockb` is
     // one manager, not two.
@@ -1024,7 +1031,28 @@ fn choose_node_manager(
             found: lockfiles,
         });
     }
+    if manager == NodeManager::YarnBerry
+        && yarn_node_linker(reader)?.as_deref() != Some("node-modules")
+    {
+        return Err(DetectError::YarnPlugAndPlay);
+    }
     Ok(Some(ManagerChoice { manager, because }))
+}
+
+/// Returns the top-level `nodeLinker` of `.yarnrc.yml` without quotes, or `None` when the file or the key is absent.
+///
+/// Only the one key is read, line by line: `nodeLinker: <value>` at the
+/// start of a line, the value plain or quoted and optionally followed by a
+/// comment. Absent means Yarn's default, Plug'n'Play.
+fn yarn_node_linker(reader: &Reader<'_>) -> Result<Option<String>, DetectError> {
+    let Some(text) = reader.text(".yarnrc.yml")? else {
+        return Ok(None);
+    };
+    Ok(text.lines().find_map(|line| {
+        let value = line.strip_prefix("nodeLinker:")?;
+        let value = value.split_once(" #").map_or(value, |(before, _)| before);
+        Some(value.trim().trim_matches(['"', '\'']).to_owned())
+    }))
 }
 
 /// Reads `[tools]` from `mise.toml`: a string, the first string of an array, or a table's `version`.
@@ -1037,20 +1065,25 @@ fn mise_pins(reader: &Reader<'_>) -> Result<Vec<Pin>, DetectError> {
     };
     Ok(tools
         .iter()
-        .filter_map(|(tool, value)| match value {
-            toml::Value::String(v) => Some((tool, v.as_str())),
-            toml::Value::Array(items) => items
-                .first()
-                .and_then(toml::Value::as_str)
-                .map(|v| (tool, v)),
-            toml::Value::Table(t) => t
-                .get("version")
-                .and_then(toml::Value::as_str)
-                .map(|v| (tool, v)),
-            _ => None,
-        })
         .enumerate()
-        .filter_map(|(entry, (tool, version))| pin(tool, version, "mise.toml", entry))
+        .filter_map(|(entry, (tool, value))| {
+            let at = PinAt::ToolsEntry(entry);
+            let version = match value {
+                toml::Value::String(v) => Some(v.as_str()),
+                toml::Value::Array(items) => items.first().and_then(toml::Value::as_str),
+                toml::Value::Table(t) => t.get("version").and_then(toml::Value::as_str),
+                _ => None,
+            };
+            let Some(version) = version else {
+                tracing::warn!(
+                    file = "mise.toml",
+                    %at,
+                    "pin dropped: detection reads a string, an array whose first item is a string, or a table with a string `version`"
+                );
+                return None;
+            };
+            pin(tool, version, "mise.toml", at)
+        })
         .collect())
 }
 
@@ -1061,13 +1094,13 @@ fn tool_versions_pins(reader: &Reader<'_>) -> Result<Vec<Pin>, DetectError> {
     };
     Ok(text
         .lines()
-        .filter_map(|line| {
+        .enumerate()
+        .filter_map(|(index, line)| {
             let line = line.split_once('#').map_or(line, |(before, _)| before);
             let mut words = line.split_whitespace();
-            Some((words.next()?, words.next()?))
+            let (tool, version) = (words.next()?, words.next()?);
+            pin(tool, version, ".tool-versions", PinAt::Line(index + 1))
         })
-        .enumerate()
-        .filter_map(|(entry, (tool, version))| pin(tool, version, ".tool-versions", entry))
         .collect())
 }
 
@@ -1080,7 +1113,14 @@ fn rust_toolchain_pin(reader: &Reader<'_>) -> Result<Option<Pin>, DetectError> {
         .get("toolchain")
         .and_then(|t| t.get("channel"))
         .and_then(toml::Value::as_str)
-        .and_then(|channel| pin("rust", channel, "rust-toolchain.toml", 0)))
+        .and_then(|channel| {
+            pin(
+                "rust",
+                channel,
+                "rust-toolchain.toml",
+                PinAt::Key("toolchain.channel"),
+            )
+        }))
 }
 
 /// Reads the first line that is not empty and not a `#` comment.
@@ -1095,8 +1135,9 @@ fn first_line_pin(
     Ok(text
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .and_then(|version| pin(tool, version, file, 0)))
+        .enumerate()
+        .find(|(_, line)| !line.is_empty() && !line.starts_with('#'))
+        .and_then(|(index, version)| pin(tool, version, file, PinAt::Line(index + 1))))
 }
 
 /// Reads the `go` directive of `go.mod`.
@@ -1112,15 +1153,19 @@ fn go_mod_pin(reader: &Reader<'_>) -> Result<Option<Pin>, DetectError> {
                 _ => None,
             },
         )
-        .and_then(|version| pin("go", version, "go.mod", 0)))
+        .and_then(|version| pin("go", version, "go.mod", PinAt::Key("go"))))
 }
 
-fn step(program: &'static str, args: &[&str]) -> Result<SetupStep, DetectError> {
+fn step(program: &'static str, args: &[&'static str]) -> Result<SetupStep, DetectError> {
     let program =
         ProgramName::parse(program).map_err(|_| DetectError::BuiltIn { name: program })?;
+    let args = args
+        .iter()
+        .map(|&arg| SetupArg::parse(arg).map_err(|_| DetectError::BuiltIn { name: arg }))
+        .collect::<Result<_, _>>()?;
     Ok(SetupStep {
         program,
-        args: args.iter().map(|&a| a.to_owned()).collect(),
+        args,
         cwd: None,
         when: RunWhen::CachesMissing,
     })
@@ -1228,7 +1273,12 @@ struct Reader<'a> {
 
 impl Reader<'_> {
     /// Reads `file` as text, or `None` when it is absent or the secret policy denies it.
+    ///
+    /// Refuses a name missing from `READ_FILES` as a bug in this module.
     fn text(&self, file: &'static str) -> Result<Option<String>, DetectError> {
+        if !READ_FILES.contains(&file) {
+            return Err(DetectError::BuiltIn { name: file });
+        }
         if let Some(pattern) = self.secrets.denies(&rel(file)?, Scope::Work) {
             tracing::warn!(
                 file,
@@ -1254,26 +1304,81 @@ impl Reader<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+
+    /// A buffer the log writes into, shared with the test.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut bytes = self
+                .0
+                .lock()
+                .map_err(|_| io::Error::other("log buffer poisoned"))?;
+            bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A dropped pin's warning is the user's only pointer to it, so it
+    /// names the place as the file numbers it: blank and comment lines
+    /// count, and so does a `[tools]` entry whose value detection cannot read.
+    #[test]
+    fn a_dropped_pin_is_named_by_its_place_in_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("mise.toml"),
+            "[tools]\nnode = 22\npython = \"3.12\"\nruby = \"\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".tool-versions"),
+            "# pins\n\nnode 22\nruby \u{1b}[31m3\n",
+        )
+        .unwrap();
+        let secrets = SecretPolicy::default();
+        let reader = Reader {
+            root,
+            secrets: &secrets,
+        };
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let (mise, tool_versions) = tracing::subscriber::with_default(subscriber, || {
+            (
+                mise_pins(&reader).unwrap(),
+                tool_versions_pins(&reader).unwrap(),
+            )
+        });
+        assert_eq!(mise.len(), 1);
+        assert_eq!(tool_versions.len(), 1);
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 3, "{log}");
+        assert!(lines[0].contains("[tools] entry 0"), "{log}");
+        assert!(lines[1].contains("[tools] entry 2"), "{log}");
+        assert!(lines[2].contains("line 4"), "{log}");
+    }
 
     /// Detection never opens a denied file; for the built-in list that holds
     /// because no file it reads matches a built-in pattern, and a job
     /// pattern that names one makes `Reader` skip it.
     #[test]
     fn no_file_detection_reads_is_a_builtin_secret() {
-        let files = [
-            OVERRIDE_FILE,
-            "package.json",
-            "mise.toml",
-            ".tool-versions",
-            "rust-toolchain.toml",
-            ".node-version",
-            ".nvmrc",
-            ".python-version",
-            "go.mod",
-        ];
         let policy = SecretPolicy::default();
-        for file in files {
+        for &file in READ_FILES {
             assert_eq!(
                 policy.denies(&RelPath::parse(file).unwrap(), Scope::Work),
                 None,
