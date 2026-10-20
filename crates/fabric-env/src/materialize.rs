@@ -60,7 +60,7 @@ use fabric_core::harness::ProgramName;
 use fabric_core::path::RelPath;
 use tracing::Dispatch;
 
-use crate::detect::{CachePath, Completion, Detection, StepScope};
+use crate::detect::{CachePath, Completion, Detection, StepGate};
 
 /// The file materialize writes in a cache once the steps that fill it have exited 0.
 ///
@@ -387,7 +387,7 @@ pub fn plan(detected: &Detection) -> Result<Plan, MaterializeError> {
         .map(|cache| {
             Ok(CacheReport {
                 path: cache.path.clone(),
-                health: inspect(&root, cache, detected.completion(cache))?,
+                health: inspect(&root, cache)?,
             })
         })
         .collect::<Result<Vec<_>, MaterializeError>>()?;
@@ -400,10 +400,10 @@ pub fn plan(detected: &Detection) -> Result<Plan, MaterializeError> {
     };
 
     let mut steps = Vec::new();
-    for (index, (step, scope)) in spec.setup.iter().zip(detected.step_scopes()).enumerate() {
-        let needed = match scope {
-            StepScope::Fills(path) | StepScope::Warms(path) => unhealthy(path),
-            StepScope::Outside | StepScope::Declared => any_unhealthy,
+    for (index, (step, gate)) in spec.setup.iter().zip(detected.step_gates()).enumerate() {
+        let needed = match gate {
+            StepGate::Caches(paths) => paths.iter().any(unhealthy),
+            StepGate::AnyCache => any_unhealthy,
         };
         if step.when == RunWhen::CachesMissing && !needed {
             continue;
@@ -435,18 +435,11 @@ pub fn plan(detected: &Detection) -> Result<Plan, MaterializeError> {
 
 /// Gives each sentinel cache to the planned steps that fill it: the first clears it, the last writes it.
 fn assign_sentinels(detected: &Detection, steps: &mut [PlannedStep]) {
-    let scopes = detected.step_scopes();
     for cache in detected.caches() {
-        if detected.completion(cache) != Completion::Sentinel {
+        let Completion::Sentinel { filled_by } = &cache.completion else {
             continue;
-        }
-        // Completion is Sentinel only for a cache some step fills, and for
-        // such a cache a declared step always counts as filling it.
-        let fills = |planned: &PlannedStep| match scopes.get(planned.index) {
-            Some(StepScope::Fills(path)) => path == &cache.path,
-            Some(StepScope::Declared) => true,
-            Some(StepScope::Warms(_) | StepScope::Outside) | None => false,
         };
+        let fills = |planned: &PlannedStep| filled_by.contains(&planned.index);
         if let Some(first) = steps.iter().position(fills) {
             steps[first].sentinels.clear.push(cache.path.clone());
         }
@@ -456,11 +449,7 @@ fn assign_sentinels(detected: &Detection, steps: &mut [PlannedStep]) {
     }
 }
 
-fn inspect(
-    root: &Path,
-    cache: &CachePath,
-    completion: Completion,
-) -> Result<CacheHealth, MaterializeError> {
+fn inspect(root: &Path, cache: &CachePath) -> Result<CacheHealth, MaterializeError> {
     let full = root.join(cache.path.as_str());
     let inspect_err = |source| MaterializeError::Inspect {
         path: cache.path.clone(),
@@ -477,10 +466,10 @@ fn inspect(
     if fs::read_dir(&full).map_err(inspect_err)?.next().is_none() {
         return Ok(CacheHealth::Empty);
     }
-    let expected: &'static [&'static str] = match completion {
+    let expected: &'static [&'static str] = match &cache.completion {
         Completion::Content => return Ok(CacheHealth::Healthy),
-        Completion::Marker(markers) => markers,
-        Completion::Sentinel => &[SENTINEL],
+        Completion::Marker { files, .. } => files,
+        Completion::Sentinel { .. } => &[SENTINEL],
     };
     if expected
         .iter()

@@ -10,8 +10,8 @@ use fabric_core::env::{EnvVarName, PinError, RunWhen, Tool, ToolName, ToolSource
 use fabric_core::path::{PathError, RelPath};
 use fabric_core::snapshot::CacheClass;
 use fabric_env::detect::{
-    CacheOrigin, CachePath, DetectError, Detection, Ecosystem, ManagerChoice, ManagerSource,
-    NodeManager, detect,
+    CacheOrigin, CachePath, Completion, DetectError, Detection, Ecosystem, ManagerChoice,
+    ManagerSource, NodeManager, detect,
 };
 use fabric_env::overrides::OverrideError;
 use fabric_env::secret::Scope;
@@ -59,12 +59,18 @@ fn tool(name: &str, version: &str, source: ToolSource) -> Result<Tool, PinError>
     })
 }
 
-fn cache(path: &str, class: CacheClass, ecosystem: Ecosystem) -> Result<CachePath, PathError> {
+fn cache(
+    path: &str,
+    class: CacheClass,
+    ecosystem: Ecosystem,
+    completion: Completion,
+) -> Result<CachePath, PathError> {
     Ok(CachePath {
         path: RelPath::parse(path)?,
         class,
         ecosystem,
         origin: CacheOrigin::Detected,
+        completion,
     })
 }
 
@@ -84,7 +90,11 @@ fn a_pnpm_workspace_gives_a_frozen_install_and_node_modules() {
         [cache(
             "node_modules",
             CacheClass::Deps,
-            Ecosystem::Node(NodeManager::Pnpm)
+            Ecosystem::Node(NodeManager::Pnpm),
+            Completion::Marker {
+                files: &[".modules.yaml"],
+                filled_by: vec![0]
+            }
         )
         .unwrap()]
     );
@@ -113,7 +123,13 @@ fn cargo_fetch_is_locked_exactly_when_a_lockfile_exists() {
     assert_eq!(commands(&found), ["cargo fetch --locked"]);
     assert_eq!(
         found.caches(),
-        [cache("target", CacheClass::Build, Ecosystem::Rust).unwrap()]
+        [cache(
+            "target",
+            CacheClass::Build,
+            Ecosystem::Rust,
+            Completion::Content
+        )
+        .unwrap()]
     );
     assert_eq!(
         found.spec().tools,
@@ -341,7 +357,13 @@ fn python_installs_into_the_workspace_venv() {
     assert_eq!(commands(&found), ["uv sync --frozen"]);
     assert_eq!(
         found.caches(),
-        [cache(".venv", CacheClass::Deps, Ecosystem::Python).unwrap()]
+        [cache(
+            ".venv",
+            CacheClass::Deps,
+            Ecosystem::Python,
+            Completion::Sentinel { filled_by: vec![0] }
+        )
+        .unwrap()]
     );
 
     let requirements = workspace(&[("requirements.txt", "requests==2.32.3\n")]).unwrap();
@@ -410,14 +432,21 @@ fn the_override_file_wins_over_detection() {
                 ..cache(
                     "dist",
                     CacheClass::Build,
-                    Ecosystem::Node(NodeManager::Pnpm)
+                    Ecosystem::Node(NodeManager::Pnpm),
+                    Completion::Sentinel {
+                        filled_by: vec![0, 1]
+                    }
                 )
                 .unwrap()
             },
             cache(
                 "node_modules",
                 CacheClass::Deps,
-                Ecosystem::Node(NodeManager::Pnpm)
+                Ecosystem::Node(NodeManager::Pnpm),
+                Completion::Marker {
+                    files: &[".modules.yaml"],
+                    filled_by: vec![0, 1]
+                }
             )
             .unwrap(),
         ]
@@ -475,7 +504,11 @@ fn a_declared_class_keeps_the_detected_ecosystem() {
             [cache(
                 "node_modules",
                 CacheClass::ToolCache,
-                Ecosystem::Node(NodeManager::Npm)
+                Ecosystem::Node(NodeManager::Npm),
+                Completion::Marker {
+                    files: &[".package-lock.json"],
+                    filled_by: vec![0]
+                }
             )
             .unwrap()],
             "{declared}"

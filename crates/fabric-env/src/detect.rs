@@ -343,33 +343,49 @@ pub enum CacheOrigin {
     Declared,
 }
 
-impl Ecosystem {
-    /// Returns the files one of which the installer itself writes as it finishes; empty when it writes none.
+/// How materialize tells a finished cache from a torn one, and which setup steps fill the cache.
+///
+/// Detection decides this once per cache, so materialize never works out
+/// again which step fills which cache. Only the `node_modules` detection
+/// found gets installer markers: a declared cache keyed `Node` holds a
+/// build's output, which the installer never writes a marker into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Completion {
+    /// One of these files, which the installer itself writes as it finishes.
     ///
     /// The markers follow the manager detection chose, not the lockfiles on
     /// disk: a Bun tree next to a leftover `package-lock.json` needs no
-    /// `.package-lock.json`. `.venv` has none: `pyvenv.cfg` is the first
-    /// file `uv venv` writes, before any package, so it proves nothing.
-    pub fn install_markers(self) -> &'static [&'static str] {
-        match self {
-            Ecosystem::Node(manager) => manager.install_markers(),
-            Ecosystem::Rust | Ecosystem::Python | Ecosystem::Other => &[],
-        }
-    }
-}
-
-/// How materialize tells a finished cache from a torn one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Completion {
-    /// One of these files, which the installer itself writes as it finishes.
-    Marker(&'static [&'static str]),
+    /// `.package-lock.json`.
+    Marker {
+        /// The marker files; any one of them proves the cache whole.
+        files: &'static [&'static str],
+        /// The setup steps that run the installer, by index in the spec.
+        filled_by: Vec<usize>,
+    },
     /// The sentinel materialize writes once the steps that fill the cache have exited 0.
-    Sentinel,
+    ///
+    /// For a cache whose installer writes no marker: Bun's `node_modules`,
+    /// `.venv` (whose `pyvenv.cfg` is written before any package, so it
+    /// proves nothing) and a declared cache that a setup step fills.
+    Sentinel {
+        /// The setup steps that fill the cache, by index in the spec; never empty.
+        filled_by: Vec<usize>,
+    },
     /// Content alone: no setup step fills the cache, so no step can leave it torn.
     Content,
 }
 
-/// One cache path, its class for the snapshot policy, and its ecosystem.
+impl Completion {
+    /// Returns the setup steps that fill the cache, by index in the spec; empty for `Content`.
+    pub fn filled_by(&self) -> &[usize] {
+        match self {
+            Completion::Marker { filled_by, .. } | Completion::Sentinel { filled_by } => filled_by,
+            Completion::Content => &[],
+        }
+    }
+}
+
+/// One cache path, its class for the snapshot policy, its ecosystem, and how materialize proves it whole.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachePath {
     /// The path, relative to the root.
@@ -380,6 +396,8 @@ pub struct CachePath {
     pub ecosystem: Ecosystem,
     /// Whether detection found it or the user declared it.
     pub origin: CacheOrigin,
+    /// How materialize proves it whole, and which steps fill it.
+    pub completion: Completion,
 }
 
 impl CachePath {
@@ -397,22 +415,96 @@ impl CachePath {
     }
 }
 
-/// What a setup step fills, which decides when a `CachesMissing` step runs.
+/// Which caches decide whether a `CachesMissing` step runs.
 ///
 /// This lives in the detection report, not in the spec: the report is
 /// rebuilt from the same files on every node, and linking a step to its
 /// cache in the spec would change the spec format for something every
 /// node can derive.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StepScope {
-    /// Fills this cache in the workspace; runs when that cache is not whole.
+pub enum StepGate {
+    /// Runs when one of these caches is not whole.
+    Caches(Vec<RelPath>),
+    /// Runs when any cache is not whole, or when the report has none.
+    AnyCache,
+}
+
+/// What a setup step fills, as detection knows it before the caches are final.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StepScope {
+    /// Fills this cache in the workspace.
     Fills(RelPath),
-    /// Fills a per-node cache outside the workspace that a build turns into this cache; runs when this cache is not whole.
+    /// Fills a per-node cache outside the workspace that a build turns into this cache.
     Warms(RelPath),
-    /// Fills a per-node cache outside the workspace and nothing in it; runs when any cache is not whole, or when there is none.
+    /// Fills a per-node cache outside the workspace and nothing in it.
     Outside,
-    /// Declared by the user, who did not say what it fills; runs when any cache is not whole, or when there is none.
+    /// Declared by the user, who did not say what it fills.
     Declared,
+}
+
+impl StepScope {
+    /// Returns true when the step fills `cache`.
+    ///
+    /// A declared step stands in for the detected steps and does not say
+    /// what it fills, so it counts as filling every cache but a detected
+    /// `target`, which a build makes and setup never does.
+    fn fills(&self, cache: &FoundCache) -> bool {
+        match self {
+            StepScope::Fills(path) => path == &cache.path,
+            StepScope::Declared => {
+                !(cache.origin == CacheOrigin::Detected && cache.ecosystem == Ecosystem::Rust)
+            }
+            StepScope::Warms(_) | StepScope::Outside => false,
+        }
+    }
+
+    /// Returns the caches whose health decides whether the step runs.
+    fn gate(&self) -> StepGate {
+        match self {
+            StepScope::Fills(path) | StepScope::Warms(path) => StepGate::Caches(vec![path.clone()]),
+            StepScope::Outside | StepScope::Declared => StepGate::AnyCache,
+        }
+    }
+}
+
+/// A cache path before the setup steps are final: what `CachePath` holds but its completion.
+#[derive(Debug, Clone)]
+struct FoundCache {
+    path: RelPath,
+    class: CacheClass,
+    ecosystem: Ecosystem,
+    origin: CacheOrigin,
+    /// The installer's markers; only the `node_modules` detection found has any.
+    markers: &'static [&'static str],
+}
+
+impl FoundCache {
+    /// Gives the cache its completion, now that the steps that fill it are known.
+    fn finish(self, scopes: &[StepScope]) -> CachePath {
+        let filled_by: Vec<usize> = scopes
+            .iter()
+            .enumerate()
+            .filter(|(_, scope)| scope.fills(&self))
+            .map(|(index, _)| index)
+            .collect();
+        let completion = if !self.markers.is_empty() {
+            Completion::Marker {
+                files: self.markers,
+                filled_by,
+            }
+        } else if filled_by.is_empty() {
+            Completion::Content
+        } else {
+            Completion::Sentinel { filled_by }
+        };
+        CachePath {
+            path: self.path,
+            class: self.class,
+            ecosystem: self.ecosystem,
+            origin: self.origin,
+            completion,
+        }
+    }
 }
 
 /// A version pin found in one file, kept as written.
@@ -437,7 +529,7 @@ pub struct Pin {
 pub struct Detection {
     root: PathBuf,
     spec: EnvSpec,
-    step_scopes: Vec<StepScope>,
+    step_gates: Vec<StepGate>,
     caches: Vec<CachePath>,
     pins: Vec<Pin>,
     node_manager: Option<ManagerChoice>,
@@ -456,38 +548,12 @@ impl Detection {
         &self.spec
     }
 
-    /// Returns what each setup step fills, one per step of the spec and in the same order.
-    pub fn step_scopes(&self) -> &[StepScope] {
-        &self.step_scopes
+    /// Returns which caches decide whether each setup step runs, one per step of the spec and in the same order.
+    pub fn step_gates(&self) -> &[StepGate] {
+        &self.step_gates
     }
 
-    /// Returns how materialize proves `cache` whole.
-    ///
-    /// The installer's own marker when its ecosystem has one. Otherwise the
-    /// sentinel when a setup step fills the cache: a detected step that
-    /// fills that path, or a step the user declared, which stands in for
-    /// the detected steps and does not say what it fills. A detected
-    /// `target` is made by a build, never by setup, so no declared step
-    /// counts as filling it. Otherwise content alone.
-    pub fn completion(&self, cache: &CachePath) -> Completion {
-        let markers = cache.ecosystem.install_markers();
-        if !markers.is_empty() {
-            return Completion::Marker(markers);
-        }
-        let built = cache.origin == CacheOrigin::Detected && cache.ecosystem == Ecosystem::Rust;
-        let filled = self.step_scopes.iter().any(|scope| match scope {
-            StepScope::Fills(path) => path == &cache.path,
-            StepScope::Declared => !built,
-            StepScope::Warms(_) | StepScope::Outside => false,
-        });
-        if filled {
-            Completion::Sentinel
-        } else {
-            Completion::Content
-        }
-    }
-
-    /// Returns the spec's cache paths with their class and ecosystem, sorted by path.
+    /// Returns the spec's cache paths with their class, ecosystem and completion, sorted by path.
     pub fn caches(&self) -> &[CachePath] {
         &self.caches
     }
@@ -554,11 +620,12 @@ pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, Dete
             choice.manager.install_step()?,
             StepScope::Fills(node_modules.clone()),
         ));
-        caches.push(CachePath {
+        caches.push(FoundCache {
             path: node_modules,
             class: CacheClass::Deps,
             ecosystem: Ecosystem::Node(choice.manager),
             origin: CacheOrigin::Detected,
+            markers: choice.manager.install_markers(),
         });
     }
     detect_rust(root, &mut setup, &mut caches)?;
@@ -577,6 +644,11 @@ pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, Dete
             .collect();
     }
     let (setup, step_scopes): (Vec<SetupStep>, Vec<StepScope>) = setup.into_iter().unzip();
+    let caches: Vec<CachePath> = caches
+        .into_iter()
+        .map(|cache| cache.finish(&step_scopes))
+        .collect();
+    let step_gates = step_scopes.iter().map(StepScope::gate).collect();
 
     let spec = EnvSpec {
         tools: chosen_tools(&pins),
@@ -590,7 +662,7 @@ pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, Dete
     Ok(Detection {
         root: root.to_owned(),
         spec,
-        step_scopes,
+        step_gates,
         caches,
         pins,
         node_manager,
@@ -601,7 +673,7 @@ pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, Dete
 
 /// Adds the declared caches to the detected ones, giving each the ecosystem that makes it.
 fn merge_declared_caches(
-    caches: &mut Vec<CachePath>,
+    caches: &mut Vec<FoundCache>,
     declared_caches: &[DeclaredCache],
     node_manager: Option<ManagerChoice>,
 ) -> Result<(), DetectError> {
@@ -639,11 +711,12 @@ fn merge_declared_caches(
             (None, [only]) => *only,
             (None, _) => return Err(DetectError::AmbiguousCacheEcosystem { index }),
         };
-        caches.push(CachePath {
+        caches.push(FoundCache {
             path: declared.path.clone(),
             class: declared.class,
             ecosystem,
             origin: CacheOrigin::Declared,
+            markers: &[],
         });
     }
     Ok(())
@@ -751,7 +824,7 @@ fn pin(tool: &str, version: &str, file: &'static str, entry: usize) -> Result<Pi
 fn detect_rust(
     root: &Path,
     setup: &mut Vec<(SetupStep, StepScope)>,
-    caches: &mut Vec<CachePath>,
+    caches: &mut Vec<FoundCache>,
 ) -> Result<(), DetectError> {
     if !exists(root, "Cargo.toml")? {
         return Ok(());
@@ -768,11 +841,12 @@ fn detect_rust(
     // build makes from it: while `target` is whole the fetch has nothing
     // to add, and a resume on a warm workspace runs no command.
     setup.push((step("cargo", args)?, StepScope::Warms(target.clone())));
-    caches.push(CachePath {
+    caches.push(FoundCache {
         path: target,
         class: CacheClass::Build,
         ecosystem: Ecosystem::Rust,
         origin: CacheOrigin::Detected,
+        markers: &[],
     });
     Ok(())
 }
@@ -780,7 +854,7 @@ fn detect_rust(
 fn detect_python(
     root: &Path,
     setup: &mut Vec<(SetupStep, StepScope)>,
-    caches: &mut Vec<CachePath>,
+    caches: &mut Vec<FoundCache>,
 ) -> Result<(), DetectError> {
     let venv = rel(".venv")?;
     let fills = || StepScope::Fills(venv.clone());
@@ -797,11 +871,12 @@ fn detect_python(
     } else {
         return Ok(());
     }
-    caches.push(CachePath {
+    caches.push(FoundCache {
         path: venv,
         class: CacheClass::Deps,
         ecosystem: Ecosystem::Python,
         origin: CacheOrigin::Detected,
+        markers: &[],
     });
     Ok(())
 }

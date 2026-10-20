@@ -236,6 +236,95 @@ fn health_follows_the_cache_kind() {
     }
 }
 
+/// A declared cache keyed `node` holds a build's output, never npm's
+/// marker: without a declared step only content counts, and with one the
+/// sentinel does.
+#[test]
+fn a_declared_node_cache_is_proven_by_content_or_its_sentinel() {
+    let warm_npm = [
+        ("package.json", PACKAGE_JSON),
+        ("package-lock.json", ""),
+        ("node_modules/.package-lock.json", "{}"),
+        (".output/index.js", ""),
+    ];
+    let cache = "[[cache]]\npath = \".output\"\nclass = \"build\"\necosystem = \"node\"\n";
+    let with_step = format!("{cache}[[setup]]\nprogram = \"true\"\n");
+    let cases: [(&str, Option<&str>, CacheHealth); 3] = [
+        (cache, None, CacheHealth::Healthy),
+        (
+            &with_step,
+            None,
+            CacheHealth::Incomplete {
+                expected: &[SENTINEL],
+            },
+        ),
+        (
+            &with_step,
+            Some(".output/.fabric-installed"),
+            CacheHealth::Healthy,
+        ),
+    ];
+    for (override_toml, sentinel, health) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), &warm_npm).unwrap();
+        if let Some(sentinel) = sentinel {
+            write(dir.path(), &[(sentinel, "")]).unwrap();
+        }
+        let detected = declared(dir.path(), override_toml).unwrap();
+        let planned = plan(&detected).unwrap();
+        let output = planned
+            .caches()
+            .iter()
+            .find(|c| c.path.as_str() == ".output")
+            .unwrap();
+        assert_eq!(output.health, health, "{override_toml} {sentinel:?}");
+    }
+}
+
+/// Declared steps that fill a declared cache in an npm workspace leave its
+/// sentinel behind, so the next resume runs nothing: before, the cache was
+/// asked for npm's marker, stayed torn forever, and a declared `npm ci`
+/// deleted a healthy carried `node_modules` on every resume.
+#[test]
+fn declared_steps_over_a_declared_node_cache_run_once() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        &[("package.json", PACKAGE_JSON), ("package-lock.json", "")],
+    )
+    .unwrap();
+    let detected = declared(
+        dir.path(),
+        r#"
+[[cache]]
+path = ".output"
+class = "build"
+
+[[setup]]
+program = "sh"
+args = ["-c", "mkdir -p node_modules && echo {} > node_modules/.package-lock.json"]
+
+[[setup]]
+program = "sh"
+args = ["-c", "mkdir -p .output && echo x > .output/index.js"]
+"#,
+    )
+    .unwrap();
+    let first = plan(&detected).unwrap();
+    assert_eq!(first.steps().len(), 2);
+    first.ready().unwrap().execute().unwrap();
+    let again = plan(&detect(dir.path(), None).unwrap()).unwrap();
+    assert!(
+        again
+            .caches()
+            .iter()
+            .all(|c| c.health == CacheHealth::Healthy),
+        "{:?}",
+        again.caches()
+    );
+    assert!(again.is_noop());
+}
+
 /// The sentinel is written only after the steps that fill a cache exit 0,
 /// and removed before they start, so a failed or killed run of a step,
 /// even over a cache that was whole, leaves the cache to be filled again.
