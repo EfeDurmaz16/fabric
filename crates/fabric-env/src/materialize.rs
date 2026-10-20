@@ -490,7 +490,7 @@ impl TreeLock {
         }
         let name = blake3::hash(root.as_os_str().as_bytes()).to_hex();
         let path = locks.join(format!("{name}.lock"));
-        let lock_err = |source| MaterializeError::Lock {
+        let open_err = |source| MaterializeError::Lock {
             lock: path.clone(),
             source,
         };
@@ -503,7 +503,7 @@ impl TreeLock {
             Ok(meta) if !meta.is_file() => return Err(not_regular()),
             Ok(_) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => return Err(lock_err(source)),
+            Err(source) => return Err(open_err(source)),
         }
         let file = fs::OpenOptions::new()
             .read(true)
@@ -511,9 +511,9 @@ impl TreeLock {
             .create(true)
             .truncate(false)
             .open(&path)
-            .map_err(lock_err)?;
-        let opened = file.metadata().map_err(lock_err)?;
-        let entry = fs::symlink_metadata(&path).map_err(lock_err)?;
+            .map_err(open_err)?;
+        let opened = file.metadata().map_err(open_err)?;
+        let entry = fs::symlink_metadata(&path).map_err(open_err)?;
         if !entry.is_file() || entry.dev() != opened.dev() || entry.ino() != opened.ino() {
             return Err(not_regular());
         }
