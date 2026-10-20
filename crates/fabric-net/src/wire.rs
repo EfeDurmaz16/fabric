@@ -2,7 +2,10 @@
 //!
 //! Invariant: every per-job message carries the fencing token, job id and
 //! epoch, in one place, the envelope, so a receiver runs the ADR 0003 check
-//! before it reads the body. Nothing of unbounded size is a control
+//! before it reads the body. On the wire the answers to all per-job
+//! messages share one flat `JobResponse`; above it each request has its own
+//! answer type inside `Fenced`, so an answer of a kind the request does not
+//! take is refused when it is parsed, not left to every caller. Nothing of unbounded size is a control
 //! message: a record is at most `MAX_RECORD_LEN` bytes and records travel
 //! in pages of at most `MAX_RECORD_PAGE` bytes, manifests travel as
 //! chunks listed by at most `MAX_MANIFEST_CHUNKS` ids, and one chunk batch
@@ -595,6 +598,253 @@ pub enum JobResponse {
     },
 }
 
+impl JobResponse {
+    /// The variant's name, for an error about an answer of the wrong kind.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            JobResponse::Records(_) => "records",
+            JobResponse::Accepted { .. } => "accepted",
+            JobResponse::Rejected { .. } => "rejected",
+            JobResponse::StaleEpoch { .. } => "stale epoch",
+            JobResponse::AheadOfUs { .. } => "ahead of us",
+            JobResponse::MoveStarted { .. } => "move started",
+            JobResponse::MoveDecision { .. } => "move decision",
+            JobResponse::MoveUndecided { .. } => "move undecided",
+            JobResponse::SnapshotIncomplete { .. } => "snapshot incomplete",
+        }
+    }
+}
+
+/// The answer to a per-job message, or the receiver's verdict that the sender's epoch is not its own (ADR 0003).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fenced<T> {
+    /// The receiver is at the sender's epoch and answered.
+    Answer(T),
+    /// The sender's epoch is older than the receiver's; the sender fetches first.
+    StaleEpoch {
+        /// The sender's epoch.
+        yours: Epoch,
+        /// The receiver's epoch.
+        current: Epoch,
+    },
+    /// The sender's epoch is newer than the receiver's; the receiver must fetch first.
+    AheadOfUs {
+        /// The sender's epoch.
+        yours: Epoch,
+        /// The receiver's epoch.
+        current: Epoch,
+    },
+}
+
+/// The answer to `Append`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Appended {
+    /// The records linked; `head` is now the receiver's head.
+    Accepted {
+        /// The receiver's head.
+        head: RecordHash,
+    },
+    /// The records do not link to the receiver's head; the sender pulls after `head` or pushes the suffix.
+    Rejected {
+        /// The receiver's head.
+        head: RecordHash,
+    },
+}
+
+/// The answer to `MoveRequest`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveRequested {
+    /// The owner started a move toward the sender.
+    Started {
+        /// The move.
+        move_id: MoveId,
+    },
+    /// The owner did not start a move; `head` is its head.
+    Rejected {
+        /// The owner's head.
+        head: RecordHash,
+    },
+}
+
+/// The answer to `MoveOffer`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Offered {
+    /// The target decided: a `MoveImported` or `MoveAborted` record, byte for byte.
+    Decided {
+        /// The record bytes.
+        record: RecordBytes,
+    },
+    /// The offer does not link to the target's head.
+    Rejected {
+        /// The target's head.
+        head: RecordHash,
+    },
+    /// The offer links but the snapshot is not whole on the target; the sender pushes it and offers again.
+    SnapshotIncomplete {
+        /// The snapshot to push.
+        snapshot: SnapshotId,
+    },
+}
+
+/// The answer to `MoveStatus`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveState {
+    /// The target decided: a `MoveImported` or `MoveAborted` record, byte for byte.
+    Decided {
+        /// The record bytes.
+        record: RecordBytes,
+    },
+    /// The target has not decided.
+    Undecided {
+        /// The move.
+        move_id: MoveId,
+    },
+}
+
+/// One request's answer type and how it sits in the flat `JobResponse`.
+pub(crate) trait JobAnswer: Sized {
+    /// What the request expects, for an error about an answer of another kind.
+    const KIND: &'static str;
+    /// Puts the answer on the wire.
+    fn into_response(self) -> JobResponse;
+    /// Reads the answer off the wire, or hands back a response of another kind.
+    fn from_response(response: JobResponse) -> Result<Self, JobResponse>;
+}
+
+impl JobAnswer for Pulled {
+    const KIND: &'static str = "records";
+
+    fn into_response(self) -> JobResponse {
+        JobResponse::Records(self)
+    }
+
+    fn from_response(response: JobResponse) -> Result<Self, JobResponse> {
+        match response {
+            JobResponse::Records(pulled) => Ok(pulled),
+            other => Err(other),
+        }
+    }
+}
+
+impl JobAnswer for Appended {
+    const KIND: &'static str = "accepted or rejected";
+
+    fn into_response(self) -> JobResponse {
+        match self {
+            Appended::Accepted { head } => JobResponse::Accepted { head },
+            Appended::Rejected { head } => JobResponse::Rejected { head },
+        }
+    }
+
+    fn from_response(response: JobResponse) -> Result<Self, JobResponse> {
+        match response {
+            JobResponse::Accepted { head } => Ok(Appended::Accepted { head }),
+            JobResponse::Rejected { head } => Ok(Appended::Rejected { head }),
+            other => Err(other),
+        }
+    }
+}
+
+impl JobAnswer for MoveRequested {
+    const KIND: &'static str = "move started or rejected";
+
+    fn into_response(self) -> JobResponse {
+        match self {
+            MoveRequested::Started { move_id } => JobResponse::MoveStarted { move_id },
+            MoveRequested::Rejected { head } => JobResponse::Rejected { head },
+        }
+    }
+
+    fn from_response(response: JobResponse) -> Result<Self, JobResponse> {
+        match response {
+            JobResponse::MoveStarted { move_id } => Ok(MoveRequested::Started { move_id }),
+            JobResponse::Rejected { head } => Ok(MoveRequested::Rejected { head }),
+            other => Err(other),
+        }
+    }
+}
+
+impl JobAnswer for Offered {
+    const KIND: &'static str = "move decision, rejected or snapshot incomplete";
+
+    fn into_response(self) -> JobResponse {
+        match self {
+            Offered::Decided { record } => JobResponse::MoveDecision { record },
+            Offered::Rejected { head } => JobResponse::Rejected { head },
+            Offered::SnapshotIncomplete { snapshot } => {
+                JobResponse::SnapshotIncomplete { snapshot }
+            }
+        }
+    }
+
+    fn from_response(response: JobResponse) -> Result<Self, JobResponse> {
+        match response {
+            JobResponse::MoveDecision { record } => Ok(Offered::Decided { record }),
+            JobResponse::Rejected { head } => Ok(Offered::Rejected { head }),
+            JobResponse::SnapshotIncomplete { snapshot } => {
+                Ok(Offered::SnapshotIncomplete { snapshot })
+            }
+            other => Err(other),
+        }
+    }
+}
+
+impl JobAnswer for MoveState {
+    const KIND: &'static str = "move decision or undecided";
+
+    fn into_response(self) -> JobResponse {
+        match self {
+            MoveState::Decided { record } => JobResponse::MoveDecision { record },
+            MoveState::Undecided { move_id } => JobResponse::MoveUndecided { move_id },
+        }
+    }
+
+    fn from_response(response: JobResponse) -> Result<Self, JobResponse> {
+        match response {
+            JobResponse::MoveDecision { record } => Ok(MoveState::Decided { record }),
+            JobResponse::MoveUndecided { move_id } => Ok(MoveState::Undecided { move_id }),
+            other => Err(other),
+        }
+    }
+}
+
+/// The answer to `MoveAbort`: the target's decision record.
+impl JobAnswer for RecordBytes {
+    const KIND: &'static str = "move decision";
+
+    fn into_response(self) -> JobResponse {
+        JobResponse::MoveDecision { record: self }
+    }
+
+    fn from_response(response: JobResponse) -> Result<Self, JobResponse> {
+        match response {
+            JobResponse::MoveDecision { record } => Ok(record),
+            other => Err(other),
+        }
+    }
+}
+
+/// An epoch verdict answers any per-job request, so it reads back whatever the request.
+impl<T: JobAnswer> JobAnswer for Fenced<T> {
+    const KIND: &'static str = T::KIND;
+
+    fn into_response(self) -> JobResponse {
+        match self {
+            Fenced::Answer(answer) => answer.into_response(),
+            Fenced::StaleEpoch { yours, current } => JobResponse::StaleEpoch { yours, current },
+            Fenced::AheadOfUs { yours, current } => JobResponse::AheadOfUs { yours, current },
+        }
+    }
+
+    fn from_response(response: JobResponse) -> Result<Self, JobResponse> {
+        match response {
+            JobResponse::StaleEpoch { yours, current } => Ok(Fenced::StaleEpoch { yours, current }),
+            JobResponse::AheadOfUs { yours, current } => Ok(Fenced::AheadOfUs { yours, current }),
+            other => T::from_response(other).map(Fenced::Answer),
+        }
+    }
+}
+
 /// Why a request could not be served.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Fault {
@@ -949,6 +1199,75 @@ mod tests {
         };
         // The frame counts its version byte too.
         assert!(encode(&answer).unwrap().len() < MAX_CONTROL_FRAME);
+    }
+
+    /// Every answer kind a request takes reads back as itself, an epoch
+    /// verdict reads back for any request, and every other kind is refused.
+    #[test]
+    fn a_job_answer_of_a_kind_the_request_does_not_take_is_refused() {
+        /// Whether a request whose answer is `T` takes the response.
+        type Accepts = fn(&JobResponse) -> bool;
+        fn accepts<T: JobAnswer>(response: &JobResponse) -> bool {
+            Fenced::<T>::from_response(response.clone()).is_ok()
+        }
+        let head = RecordHash::from_bytes([1; 32]);
+        let record = RecordBytes::new(vec![1]).unwrap();
+        let move_id = MoveId::from_bytes([2; 16]);
+        let epoch = Epoch::new(1).unwrap();
+        let page = page_of(vec![record.clone()]);
+        let all = [
+            JobResponse::Records(Pulled::More(page)),
+            JobResponse::Accepted { head },
+            JobResponse::Rejected { head },
+            JobResponse::MoveStarted { move_id },
+            JobResponse::MoveDecision { record },
+            JobResponse::MoveUndecided { move_id },
+            JobResponse::SnapshotIncomplete {
+                snapshot: SnapshotId::from_bytes([3; 32]),
+            },
+            JobResponse::StaleEpoch {
+                yours: epoch,
+                current: epoch,
+            },
+            JobResponse::AheadOfUs {
+                yours: epoch,
+                current: epoch,
+            },
+        ];
+        let takes: [(&str, Accepts, &[&str]); 6] = [
+            ("pull", accepts::<Pulled>, &["records"]),
+            ("append", accepts::<Appended>, &["accepted", "rejected"]),
+            (
+                "move request",
+                accepts::<MoveRequested>,
+                &["move started", "rejected"],
+            ),
+            (
+                "offer",
+                accepts::<Offered>,
+                &["move decision", "rejected", "snapshot incomplete"],
+            ),
+            (
+                "move status",
+                accepts::<MoveState>,
+                &["move decision", "move undecided"],
+            ),
+            ("move abort", accepts::<RecordBytes>, &["move decision"]),
+        ];
+        for (request, accepts, kinds) in takes {
+            for response in &all {
+                let fenced = matches!(
+                    response,
+                    JobResponse::StaleEpoch { .. } | JobResponse::AheadOfUs { .. }
+                );
+                assert_eq!(
+                    accepts(response),
+                    fenced || kinds.contains(&response.kind()),
+                    "{request} and {}",
+                    response.kind()
+                );
+            }
+        }
     }
 
     #[test]

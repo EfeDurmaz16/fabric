@@ -12,20 +12,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use fabric_core::BoxFuture;
-use fabric_core::id::{ChunkId, Epoch, JobId, NodeId, SnapshotId};
+use fabric_core::id::{ChunkId, Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::FencingToken;
+use fabric_core::moves::MoveOffer;
 use fabric_net::endpoint::Endpoint;
 use fabric_net::frame::{FRAME_VERSION, MAX_CONTROL_FRAME};
 use fabric_net::identity::NodeIdentity;
 use fabric_net::peers::Peers;
 use fabric_net::quic::QuicTransport;
-use fabric_net::rpc::{RpcError, Service, Session};
+use fabric_net::rpc::{JobFuture, RpcError, Service, Session};
 use fabric_net::tcp::TcpTlsTransport;
 use fabric_net::tls::{TlsError, Trust};
 use fabric_net::transport::{Connection, Transport, TransportError, TransportKind};
 use fabric_net::wire::{
-    ChunkBatch, Fault, FaultText, JobRequest, JobResponse, ManifestChunks, PROTOCOL_VERSION,
-    VersionText,
+    Appended, ChunkBatch, Fault, FaultText, ManifestChunks, MoveRequested, MoveState, Offered,
+    PROTOCOL_VERSION, Pulled, RecordBytes, RecordPage, VersionText,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -105,18 +106,38 @@ impl FakeService {
     }
 }
 
+/// A per-job answer these tests never ask for.
+fn not_here<T>() -> JobFuture<'static, T> {
+    Box::pin(async { Err(Fault::Internal(FaultText::truncated("not in this test"))) })
+}
+
 impl Service for FakeService {
-    fn job(
-        &self,
-        _peer: NodeId,
-        _token: FencingToken,
-        _request: JobRequest,
-    ) -> BoxFuture<'_, Result<JobResponse, Fault>> {
+    fn pull(&self, _: NodeId, _: FencingToken, _: RecordHash) -> JobFuture<'_, Pulled> {
+        not_here()
+    }
+
+    fn append(&self, _: NodeId, _: FencingToken, _: RecordPage) -> JobFuture<'_, Appended> {
+        not_here()
+    }
+
+    fn move_request(&self, _: NodeId, _: FencingToken) -> JobFuture<'_, MoveRequested> {
         Box::pin(async move {
             tokio::time::sleep(self.job_delay).await;
             self.jobs_done.fetch_add(1, Ordering::SeqCst);
             Err(Fault::Internal(FaultText::truncated("not in this test")))
         })
+    }
+
+    fn offer(&self, _: NodeId, _: FencingToken, _: MoveOffer) -> JobFuture<'_, Offered> {
+        not_here()
+    }
+
+    fn move_status(&self, _: NodeId, _: FencingToken, _: MoveId) -> JobFuture<'_, MoveState> {
+        not_here()
+    }
+
+    fn move_abort(&self, _: NodeId, _: FencingToken, _: MoveId) -> JobFuture<'_, RecordBytes> {
+        not_here()
     }
 
     fn manifest(
@@ -464,7 +485,7 @@ async fn a_job_request_past_its_budget_still_runs_to_its_end() -> TestResult {
     };
     let deadline = Duration::from_millis(100);
     let err = session
-        .job(token, JobRequest::MoveRequest, deadline)
+        .move_request(token, deadline)
         .await
         .err()
         .ok_or("the call must fail")?;

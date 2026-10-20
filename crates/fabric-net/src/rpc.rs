@@ -10,11 +10,13 @@
 //! request and asks it again every `TRUST_RECHECK`, and closes the
 //! connection once the peer is unpaired, however long the connection lives.
 //!
-//! The wire types `RequestBody` and `ResponseBody` are built and matched
-//! here only. A caller asks through one typed method per request, and a
-//! `Service` answers through one typed method per request, so neither can
-//! pair a request with an answer of the wrong kind. `Hello` and `Ping`
-//! belong to this layer and never reach a service.
+//! The wire types `RequestBody`, `ResponseBody` and `JobResponse` are built
+//! and matched here only. A caller asks through one typed method per
+//! request, per-job requests included, and a `Service` answers through one
+//! typed method per request, each with its own answer type, so neither can
+//! pair a request with an answer of the wrong kind: a service cannot build
+//! one, and a caller refuses one as `RpcError::UnexpectedResponse`. `Hello`
+//! and `Ping` belong to this layer and never reach a service.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -23,8 +25,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fabric_core::BoxFuture;
-use fabric_core::id::{ChunkId, NodeId, SnapshotId};
+use fabric_core::id::{ChunkId, Epoch, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::FencingToken;
+use fabric_core::moves::MoveOffer;
 use fabric_core::snapshot::MAX_CHUNK_LEN;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
@@ -35,9 +38,10 @@ use crate::idle::IdleReader;
 use crate::tls::Trust;
 use crate::transport::{Connection, Stream, TransportError, TransportKind};
 use crate::wire::{
-    ChunkBatch, Fault, FaultText, Hello, JobRequest, JobResponse, ManifestChunks, PROTOCOL_VERSION,
-    Request, RequestBody, RequestId, Response, ResponseBody, VersionText, WireError, decode,
-    encode, wall_clock_ms,
+    Appended, ChunkBatch, Fault, FaultText, Fenced, Hello, JobAnswer, JobRequest, JobResponse,
+    ManifestChunks, MoveRequested, MoveState, Offered, PROTOCOL_VERSION, Pulled, RecordBytes,
+    RecordPage, Request, RequestBody, RequestId, Response, ResponseBody, VersionText, WireError,
+    decode, encode, wall_clock_ms,
 };
 
 /// A clock difference between two nodes above this is logged at `Hello`.
@@ -132,20 +136,45 @@ pub enum RpcError {
     Unpaired(NodeId),
 }
 
+/// A per-job answer from a service, or why it could not serve.
+pub type JobFuture<'a, T> = BoxFuture<'a, Result<Fenced<T>, Fault>>;
+
 /// What a node serves to its peers: per-job messages, manifests and chunks.
+///
+/// Every per-job method answers a message from `peer` sent under the
+/// fencing `token`, and runs the ADR 0003 epoch check before it reads the
+/// rest. A per-job message can write ledger records, so its future always
+/// runs to its end, even after the caller's budget ran out and the caller
+/// was told `Fault::Deadline`. The caller then treats the outcome as
+/// unknown and asks again, with `MoveStatus` for a move.
 pub trait Service: Send + Sync {
-    /// Answers one per-job message from `peer`, sent under the fencing `token`.
-    ///
-    /// A job message can write ledger records, so the future always runs
-    /// to its end, even after the caller's budget ran out and the caller
-    /// was told `Fault::Deadline`. The caller then treats the outcome as
-    /// unknown and asks again, with `MoveStatus` for a move.
-    fn job(
+    /// Answers `Pull`: the records after `after`, one page at a time.
+    fn pull(&self, peer: NodeId, token: FencingToken, after: RecordHash) -> JobFuture<'_, Pulled>;
+    /// Answers `Append`: links `records` to this node's ledger, or says where its head is.
+    fn append(
         &self,
         peer: NodeId,
         token: FencingToken,
-        request: JobRequest,
-    ) -> BoxFuture<'_, Result<JobResponse, Fault>>;
+        records: RecordPage,
+    ) -> JobFuture<'_, Appended>;
+    /// Answers `MoveRequest`: starts a move of the job toward `peer`, or says why not.
+    fn move_request(&self, peer: NodeId, token: FencingToken) -> JobFuture<'_, MoveRequested>;
+    /// Answers `MoveOffer`: `offer` names the job the token names.
+    fn offer(&self, peer: NodeId, token: FencingToken, offer: MoveOffer) -> JobFuture<'_, Offered>;
+    /// Answers `MoveStatus`: this node's decision on `move_id`, if it made one.
+    fn move_status(
+        &self,
+        peer: NodeId,
+        token: FencingToken,
+        move_id: MoveId,
+    ) -> JobFuture<'_, MoveState>;
+    /// Answers `MoveAbort`: decides against `move_id` unless already decided, and returns the decision record.
+    fn move_abort(
+        &self,
+        peer: NodeId,
+        token: FencingToken,
+        move_id: MoveId,
+    ) -> JobFuture<'_, RecordBytes>;
     /// Returns the length and chunk list of `snapshot`'s manifest for `peer`.
     fn manifest(
         &self,
@@ -425,21 +454,95 @@ impl Session {
         }
     }
 
-    /// Sends one per-job message under the fencing `token` and waits at most `deadline` for the answer.
-    pub async fn job(
+    /// Sends one per-job message and reads the answer as the kind the request takes.
+    async fn job<T: JobAnswer>(
         &self,
         token: FencingToken,
         request: JobRequest,
         deadline: Duration,
-    ) -> Result<JobResponse, RpcError> {
+    ) -> Result<Fenced<T>, RpcError> {
         let body = RequestBody::Job {
             token,
             body: request,
         };
         match self.call(body, deadline).await? {
-            ResponseBody::Job(response) => Ok(response),
-            other => Err(unexpected("job", &other)),
+            ResponseBody::Job(response) => {
+                Fenced::from_response(response).map_err(|other| RpcError::UnexpectedResponse {
+                    expected: T::KIND,
+                    got: other.kind(),
+                })
+            }
+            other => Err(unexpected(T::KIND, &other)),
         }
+    }
+
+    /// Asks for the records after `after` under `token`, waiting at most `deadline`.
+    pub async fn pull(
+        &self,
+        token: FencingToken,
+        after: RecordHash,
+        deadline: Duration,
+    ) -> Result<Fenced<Pulled>, RpcError> {
+        self.job(token, JobRequest::Pull { after }, deadline).await
+    }
+
+    /// Replicates one page of records under `token`, waiting at most `deadline`.
+    pub async fn append(
+        &self,
+        token: FencingToken,
+        records: RecordPage,
+        deadline: Duration,
+    ) -> Result<Fenced<Appended>, RpcError> {
+        self.job(token, JobRequest::Append { records }, deadline)
+            .await
+    }
+
+    /// Asks the owner to start a move toward this node under `token`, waiting at most `deadline`.
+    pub async fn move_request(
+        &self,
+        token: FencingToken,
+        deadline: Duration,
+    ) -> Result<Fenced<MoveRequested>, RpcError> {
+        self.job(token, JobRequest::MoveRequest, deadline).await
+    }
+
+    /// Sends the owner's `offer` at `epoch`, waiting at most `deadline`.
+    ///
+    /// The token is built from the offer's job, so the two cannot name different jobs.
+    pub async fn offer(
+        &self,
+        epoch: Epoch,
+        offer: MoveOffer,
+        deadline: Duration,
+    ) -> Result<Fenced<Offered>, RpcError> {
+        let token = FencingToken {
+            job_id: offer.job_id,
+            epoch,
+        };
+        self.job(token, JobRequest::MoveOffer(offer.into()), deadline)
+            .await
+    }
+
+    /// Asks the target for its decision on `move_id` again under `token`, waiting at most `deadline`.
+    pub async fn move_status(
+        &self,
+        token: FencingToken,
+        move_id: MoveId,
+        deadline: Duration,
+    ) -> Result<Fenced<MoveState>, RpcError> {
+        self.job(token, JobRequest::MoveStatus { move_id }, deadline)
+            .await
+    }
+
+    /// Asks the target to decide against `move_id` under `token`, waiting at most `deadline`; returns its decision record.
+    pub async fn move_abort(
+        &self,
+        token: FencingToken,
+        move_id: MoveId,
+        deadline: Duration,
+    ) -> Result<Fenced<RecordBytes>, RpcError> {
+        self.job(token, JobRequest::MoveAbort { move_id }, deadline)
+            .await
     }
 
     /// Asks for the length and chunk list of `snapshot`'s manifest, waiting at most `deadline`.
@@ -719,7 +822,8 @@ async fn handle(peer: NodeId, stream: Stream, service: Arc<dyn Service>) -> Resu
         RequestBody::Job { token, body } => {
             // Only the answer races the budget; the work is never dropped halfway.
             let service = Arc::clone(&service);
-            let work = tokio::spawn(async move { service.job(peer, token, body).await });
+            let work =
+                tokio::spawn(async move { answer_job(service.as_ref(), peer, token, body).await });
             match timeout(budget, work).await {
                 Ok(Ok(answer)) => answer.map_or_else(ResponseBody::Fault, ResponseBody::Job),
                 Ok(Err(_)) => ResponseBody::Fault(Fault::Internal(FaultText::truncated(
@@ -741,6 +845,34 @@ async fn handle(peer: NodeId, stream: Stream, service: Arc<dyn Service>) -> Resu
     reply(send.as_mut(), id, body, MAX_CONTROL_FRAME).await?;
     send.shutdown().await.map_err(FrameError::Io)?;
     Ok(())
+}
+
+/// Hands one per-job message to the service method for its kind and puts the answer on the wire.
+async fn answer_job(
+    service: &dyn Service,
+    peer: NodeId,
+    token: FencingToken,
+    request: JobRequest,
+) -> Result<JobResponse, Fault> {
+    Ok(match request {
+        JobRequest::Pull { after } => service.pull(peer, token, after).await?.into_response(),
+        JobRequest::Append { records } => {
+            service.append(peer, token, records).await?.into_response()
+        }
+        JobRequest::MoveRequest => service.move_request(peer, token).await?.into_response(),
+        JobRequest::MoveOffer(offer) => service
+            .offer(peer, token, offer.for_job(token.job_id))
+            .await?
+            .into_response(),
+        JobRequest::MoveStatus { move_id } => service
+            .move_status(peer, token, move_id)
+            .await?
+            .into_response(),
+        JobRequest::MoveAbort { move_id } => service
+            .move_abort(peer, token, move_id)
+            .await?
+            .into_response(),
+    })
 }
 
 /// Streams the chunks of one batch, each found within `budget`, then `ChunksDone`; the first fault ends the run.
@@ -968,14 +1100,33 @@ mod tests {
     /// A service that serves nothing; the sessions here only ping.
     struct Nothing;
 
+    fn no_job<T>() -> JobFuture<'static, T> {
+        Box::pin(async { Err(Fault::UnknownJob) })
+    }
+
     impl Service for Nothing {
-        fn job(
-            &self,
-            _peer: NodeId,
-            _token: FencingToken,
-            _request: JobRequest,
-        ) -> BoxFuture<'_, Result<JobResponse, Fault>> {
-            Box::pin(async { Err(Fault::UnknownJob) })
+        fn pull(&self, _: NodeId, _: FencingToken, _: RecordHash) -> JobFuture<'_, Pulled> {
+            no_job()
+        }
+
+        fn append(&self, _: NodeId, _: FencingToken, _: RecordPage) -> JobFuture<'_, Appended> {
+            no_job()
+        }
+
+        fn move_request(&self, _: NodeId, _: FencingToken) -> JobFuture<'_, MoveRequested> {
+            no_job()
+        }
+
+        fn offer(&self, _: NodeId, _: FencingToken, _: MoveOffer) -> JobFuture<'_, Offered> {
+            no_job()
+        }
+
+        fn move_status(&self, _: NodeId, _: FencingToken, _: MoveId) -> JobFuture<'_, MoveState> {
+            no_job()
+        }
+
+        fn move_abort(&self, _: NodeId, _: FencingToken, _: MoveId) -> JobFuture<'_, RecordBytes> {
+            no_job()
         }
 
         fn manifest(
