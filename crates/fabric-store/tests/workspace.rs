@@ -1227,6 +1227,25 @@ fn a_restore_whose_bundle_base_is_gone_names_it() {
     );
 }
 
+#[test]
+fn names_git_would_unquote_or_trim_verify_after_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    fs::write(root.join("\"q"), "quoted\n").unwrap();
+    fs::write(root.join("x\r"), "carriage return\n").unwrap();
+    let g = git(&root);
+    g.run(&["add", "-A"]).unwrap();
+    g.run(&["commit", "-q", "-m", "odd names"]).unwrap();
+    fs::write(root.join("Icon\r"), "").unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let report = restore_into(&store, snapshot, &dir.path().join("restored")).unwrap();
+    assert_eq!(report.verified, 4);
+}
+
 /// Captures a branch named `before`, replaces it with `after` and restores the incremental snapshot.
 fn rename_branch_across_an_incremental_link(before: &str, after: &str) -> Fallible {
     let dir = tempfile::tempdir()?;

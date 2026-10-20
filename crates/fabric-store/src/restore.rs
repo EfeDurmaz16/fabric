@@ -786,6 +786,29 @@ fn sample<'a, T>(items: &[&'a T], mode: Verify) -> Vec<&'a T> {
     }
 }
 
+/// The most path bytes one `hash-object` command line carries, well under every `ARG_MAX`.
+const ARG_BYTES: usize = 128 << 10;
+
+/// Splits `items` into runs whose paths together stay under `ARG_BYTES`.
+fn path_batches<'a, 'b>(items: &'b [&'a TreeItem]) -> Vec<&'b [&'a TreeItem]> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0;
+    for (index, item) in items.iter().enumerate() {
+        let len = item.rel.as_str().len() + 1;
+        if index > start && bytes + len > ARG_BYTES {
+            batches.push(&items[start..index]);
+            start = index;
+            bytes = 0;
+        }
+        bytes += len;
+    }
+    if start < items.len() {
+        batches.push(&items[start..]);
+    }
+    batches
+}
+
 /// Re-reads the working tree against commit `W` and returns how many entries matched.
 ///
 /// Files are hashed by `git hash-object --no-filters` and compared with the
@@ -814,43 +837,21 @@ fn verify_worktree(
             TreeMode::Symlink => links.push(item),
             TreeMode::File | TreeMode::Exec => {
                 // A missing or replaced file is a verify failure, not a git error.
-                let file = writer.open_file(&item.rel).map_err(|_| mismatch(item))?;
-                if item.rel.as_str().contains('\n') {
-                    // hash-object reads one path per line, so this one is hashed by content.
-                    let mut bytes = Vec::new();
-                    (&file)
-                        .read_to_end(&mut bytes)
-                        .map_err(|_| mismatch(item))?;
-                    let out = git.run_stdin_env(
-                        &["hash-object", "--no-filters", "--stdin"],
-                        &[],
-                        &bytes,
-                    )?;
-                    if String::from_utf8_lossy(&out).trim() != item.oid.as_str() {
-                        return Err(mismatch(item));
-                    }
-                    verified += 1;
-                } else {
-                    by_path.push(item);
-                }
+                writer.open_file(&item.rel).map_err(|_| mismatch(item))?;
+                by_path.push(item);
             }
             TreeMode::Gitlink => {}
         }
     }
-    if !by_path.is_empty() {
-        let mut input = String::new();
-        for item in &by_path {
-            input.push_str(item.rel.as_str());
-            input.push('\n');
-        }
-        let out = git.run_stdin_env(
-            &["hash-object", "--no-filters", "--stdin-paths"],
-            &[],
-            input.as_bytes(),
-        )?;
+    // Paths go as arguments: `--stdin-paths` would C-unquote a name that
+    // starts with '"' and drop a trailing '\r', as in macOS's `Icon\r`.
+    for batch in path_batches(&by_path) {
+        let mut args = vec!["hash-object", "--no-filters", "--"];
+        args.extend(batch.iter().map(|item| item.rel.as_str()));
+        let out = git.run(&args)?;
         let text = String::from_utf8_lossy(&out);
         let mut hashes = text.lines();
-        for item in &by_path {
+        for item in batch {
             if hashes.next() != Some(item.oid.as_str()) {
                 return Err(mismatch(item));
             }
