@@ -144,7 +144,6 @@ impl CheckReport {
 /// A store that this process holds open.
 #[derive(Debug)]
 pub struct Store {
-    root: PathBuf,
     objects: ObjectStore,
     catalog: Catalog,
     _lock: File,
@@ -177,7 +176,6 @@ impl Store {
         objects.create_dirs()?;
         let catalog = Catalog::create(&catalog_path, &params)?;
         Ok(Store {
-            root: root.to_owned(),
             objects,
             catalog,
             _lock: lock,
@@ -201,26 +199,10 @@ impl Store {
             tracing::info!(removed, "cleared staged files left by an earlier process");
         }
         Ok(Store {
-            root: root.to_owned(),
             objects,
             catalog,
             _lock: lock,
         })
-    }
-
-    /// Opens the store in `root`, creating it with `params` when it is not one yet.
-    pub fn open_or_create(root: &Path, params: ChunkParams) -> Result<Store, StoreError> {
-        if root.join("catalog.sqlite").is_file() {
-            Store::open(root)
-        } else {
-            Store::create(root, params)
-        }
-    }
-
-    /// Returns the store's root directory.
-    #[must_use]
-    pub fn root(&self) -> &Path {
-        &self.root
     }
 
     /// Returns the object files, for writing and reading content.

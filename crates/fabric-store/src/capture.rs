@@ -26,7 +26,7 @@ use fabric_core::snapshot::{
 use crate::durable;
 use crate::git::{Git, GitError};
 use crate::objects::ObjectError;
-use crate::policy::{Class, IgnorePolicy, PolicyError};
+use crate::policy::{Class, IgnorePolicy};
 use crate::store::{Store, StoreError};
 
 /// An untracked, not ignored file above this many bytes stops capture unless the caller allows it.
@@ -158,9 +158,6 @@ pub enum CaptureError {
     /// The manifest does not validate.
     #[error(transparent)]
     Manifest(#[from] ManifestError),
-    /// The policy could not be built.
-    #[error(transparent)]
-    Policy(#[from] PolicyError),
     /// The root is not an absolute path to a directory.
     #[error("{path} is not an absolute directory path")]
     BadRoot {
@@ -762,23 +759,17 @@ impl GitCapture<'_> {
         format!("refs/fabric/{}/snap/", self.job_id)
     }
 
-    /// Lists refs with their ids, leaving out older snapshot refs of this job.
-    fn refs(&self, current: &GitOid) -> Result<Vec<(RefName, GitOid)>, CaptureError> {
+    /// Lists refs with their ids; older snapshot refs of this job are already deleted.
+    fn refs(&self) -> Result<Vec<(RefName, GitOid)>, CaptureError> {
         let out = self
             .git
             .run_text(&["for-each-ref", "--format=%(refname) %(objectname)"])?;
-        let prefix = self.snap_prefix();
         let mut refs = Vec::new();
         for line in out.lines() {
             let (name, oid) = line.split_once(' ').ok_or_else(|| GitError::Parse {
                 what: "ref line",
                 text: line.to_owned(),
             })?;
-            if let Some(rest) = name.strip_prefix(&prefix)
-                && rest != current.as_str()
-            {
-                continue;
-            }
             refs.push((
                 RefName::parse(name).map_err(GitError::from)?,
                 GitOid::parse(oid).map_err(GitError::from)?,
@@ -1134,7 +1125,7 @@ fn capture_git(
     capturer.report.bundle = kind;
     gc.delete_older_snap_refs(&worktree_commit)?;
 
-    let refs = gc.refs(&worktree_commit)?;
+    let refs = gc.refs()?;
     let head = gc.head()?;
     let worktree_mtimes = gc.worktree_mtimes(&worktree_commit, &mut capturer.report)?;
     let config = gc.config(&mut capturer.report)?;

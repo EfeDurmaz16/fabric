@@ -91,12 +91,6 @@ impl Git {
         self
     }
 
-    /// The repository the runner is bound to.
-    #[must_use]
-    pub fn repo(&self) -> &Path {
-        &self.repo
-    }
-
     fn command(&self) -> Command {
         let mut cmd = Command::new("git");
         for flag in CONFIG_FLAGS {
