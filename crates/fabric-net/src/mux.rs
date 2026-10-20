@@ -361,7 +361,25 @@ async fn write_loop(
     mut wire: tokio::io::WriteHalf<impl AsyncWrite>,
     mut out: mpsc::Receiver<Outgoing>,
 ) {
-    while let Some(frame) = out.recv().await {
+    loop {
+        let frame = match out.try_recv() {
+            Ok(frame) => frame,
+            Err(mpsc::error::TryRecvError::Empty) => {
+                // TLS takes written bytes into its own buffer and sends them
+                // only as the socket has room; with nothing queued, push
+                // them out before waiting, or a stream's last bytes sit
+                // there until the next frame.
+                if let Err(err) = wire.flush().await {
+                    tracing::debug!(error = %err, "tcp mux flush ended");
+                    return;
+                }
+                match out.recv().await {
+                    Some(frame) => frame,
+                    None => break,
+                }
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
+        };
         let Ok(len) = u32::try_from(frame.payload.len()) else {
             return;
         };
@@ -676,6 +694,26 @@ mod tests {
             read.unwrap().unwrap_err().kind(),
             io::ErrorKind::ConnectionAborted
         );
+    }
+
+    /// TLS holds written bytes until it is flushed, as `BufWriter` does
+    /// here; a stream's last frames must still reach the peer when nothing
+    /// else is queued behind them.
+    #[tokio::test]
+    async fn the_writer_flushes_the_wire_when_its_queue_runs_empty() {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let dialer = Mux::spawn(tokio::io::BufWriter::new(a), Side::Dialer, node(), ADDR);
+        let acceptor = Mux::spawn(b, Side::Acceptor, node(), ADDR);
+        let mut stream = dialer.open().await.unwrap();
+        stream.write_all(b"ask").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut arrived = tokio::time::timeout(Duration::from_secs(1), acceptor.next())
+            .await
+            .expect("the frames stayed in the wire's buffer")
+            .unwrap();
+        let mut bytes = Vec::new();
+        arrived.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"ask");
     }
 
     /// Ids reach the wire in the order streams first write, whatever order they were opened in.
