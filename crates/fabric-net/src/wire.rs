@@ -5,7 +5,8 @@
 //! before it reads the body. Nothing of unbounded size is a control
 //! message: a record is at most `MAX_RECORD_LEN` bytes and records travel
 //! in pages of at most `MAX_RECORD_PAGE` bytes, manifests travel as
-//! chunks, and one chunk batch names at most `MAX_CHUNK_BATCH` ids. Every
+//! chunks listed by at most `MAX_MANIFEST_CHUNKS` ids, and one chunk batch
+//! names at most `MAX_CHUNK_BATCH` ids. Every
 //! bound is enforced when bytes are parsed, not after, so the largest
 //! message fits the control frame of the `frame` module.
 
@@ -25,6 +26,13 @@ pub const PROTOCOL_VERSION: u16 = 1;
 
 /// The most chunk ids one `WantChunks` request may name.
 pub const MAX_CHUNK_BATCH: usize = 256;
+
+/// The bytes one chunk id takes on the wire: its 32 raw bytes, no prefix.
+const CHUNK_ID_LEN: usize = 32;
+
+/// The most chunks a manifest may list: as many ids as fit one control frame beside the envelope.
+pub const MAX_MANIFEST_CHUNKS: usize =
+    (crate::frame::MAX_CONTROL_FRAME - crate::frame::ENVELOPE_ALLOWANCE) / CHUNK_ID_LEN;
 
 /// The longest fabric version string in a `Hello`.
 pub const MAX_VERSION_LEN: usize = 64;
@@ -72,6 +80,9 @@ pub enum WireError {
     /// A manifest is empty or longer than a reader decodes.
     #[error("a manifest is 1 to {MAX_MANIFEST_LEN} bytes, not {0}")]
     ManifestSize(u64),
+    /// A manifest lists more chunks than one control frame holds.
+    #[error("a manifest lists at most {MAX_MANIFEST_CHUNKS} chunks, not {0}")]
+    ManifestTooManyChunks(usize),
     /// A manifest's chunk count cannot make its length.
     #[error("a manifest of {len} bytes cannot be {count} chunks")]
     ManifestChunkCount {
@@ -425,7 +436,8 @@ pub struct Response {
 /// The length is 1 to `MAX_MANIFEST_LEN` bytes, checked on decode before
 /// any chunk is fetched, so a peer cannot make this node assemble more than
 /// one manifest cap. The chunk count fits the length: each chunk holds at
-/// least one byte and at most `MAX_CHUNK_LEN`.
+/// least one byte and at most `MAX_CHUNK_LEN`. The list holds at most
+/// `MAX_MANIFEST_CHUNKS` ids, so the answer fits one control frame.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ManifestChunks {
     len: u64,
@@ -438,6 +450,9 @@ impl ManifestChunks {
         let max = u64::try_from(MAX_MANIFEST_LEN).unwrap_or(u64::MAX);
         if len == 0 || len > max {
             return Err(WireError::ManifestSize(len));
+        }
+        if ids.len() > MAX_MANIFEST_CHUNKS {
+            return Err(WireError::ManifestTooManyChunks(ids.len()));
         }
         let fewest = len.div_ceil(u64::try_from(MAX_CHUNK_LEN).unwrap_or(u64::MAX));
         let count = u64::try_from(ids.len()).unwrap_or(u64::MAX);
@@ -884,6 +899,31 @@ mod tests {
             let bytes = encode(&Unchecked { len, ids }).unwrap();
             assert!(decode::<ManifestChunks>(&bytes).is_err(), "{why}");
         }
+    }
+
+    /// The longest chunk list a manifest may have fits the control frame in
+    /// its answer, so the server never fails to write it; one id more is
+    /// refused when the answer is built.
+    #[test]
+    fn the_longest_manifest_chunk_list_fits_the_control_frame() {
+        use crate::frame::MAX_CONTROL_FRAME;
+
+        assert_eq!(encode(&ChunkId::of(b"x")).unwrap().len(), CHUNK_ID_LEN);
+        let ids: Vec<ChunkId> = (0..=MAX_MANIFEST_CHUNKS)
+            .map(|n| ChunkId::of(&n.to_le_bytes()))
+            .collect();
+        let len = u64::try_from(MAX_MANIFEST_LEN).unwrap();
+        assert!(matches!(
+            ManifestChunks::new(len, ids.clone()),
+            Err(WireError::ManifestTooManyChunks(n)) if n == MAX_MANIFEST_CHUNKS + 1
+        ));
+        let longest = ManifestChunks::new(len, ids[..MAX_MANIFEST_CHUNKS].to_vec()).unwrap();
+        let answer = Response {
+            id: RequestId(u64::MAX),
+            body: ResponseBody::ManifestChunks(longest),
+        };
+        // The frame counts its version byte too.
+        assert!(encode(&answer).unwrap().len() < MAX_CONTROL_FRAME);
     }
 
     #[test]

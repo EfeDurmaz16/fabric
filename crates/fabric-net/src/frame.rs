@@ -16,9 +16,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// The frame format version this crate writes.
 pub const FRAME_VERSION: u8 = 1;
 
-/// Room in a control frame for everything around a page of records: the
-/// version byte, the request or response envelope and the page's count.
-const ENVELOPE_ALLOWANCE: usize = 1024;
+/// Room in a control frame for everything around its one long list, a page
+/// of records or a manifest's chunk ids: the version byte, the request or
+/// response envelope and the list's count.
+pub(crate) const ENVELOPE_ALLOWANCE: usize = 1024;
 
 /// The most bytes a control frame may carry: a page of ledger records, move messages, chunk id lists.
 ///
