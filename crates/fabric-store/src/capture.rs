@@ -205,10 +205,10 @@ pub enum CaptureError {
         /// The submodule path.
         path: String,
     },
-    /// A `.gitattributes` declares an LFS filter; the working-tree commit would hold pointers.
-    #[error("{path} declares filter=lfs, which capture does not support")]
+    /// A path has the LFS filter; the working-tree commit would hold pointers.
+    #[error("{path} has filter=lfs, which capture does not support")]
     GitLfsUnsupported {
-        /// The attributes file.
+        /// The first path git says the filter applies to.
         path: String,
     },
     /// Untracked files above the limit would enter the user's object store.
@@ -604,19 +604,23 @@ impl GitCapture<'_> {
                 return Err(CaptureError::GitSubmoduleDirty { path });
             }
         }
-        let attributes =
+        // git resolves the attributes itself, from every .gitattributes,
+        // tracked or not, and from .git/info/attributes.
+        let paths = self.git.run(&[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])?;
+        let attrs =
             self.git
-                .run(&["ls-files", "-z", "--", ".gitattributes", "*/.gitattributes"])?;
-        for record in Git::records(&attributes) {
-            let path = Git::text("attributes path", record)?;
-            let full = self.root.join(path);
-            let text = fs::read_to_string(&full).unwrap_or_default();
-            if text
-                .lines()
-                .any(|l| l.split_whitespace().any(|w| w == "filter=lfs"))
-            {
+                .run_stdin_env(&["check-attr", "-z", "--stdin", "filter"], &[], &paths)?;
+        let fields: Vec<&[u8]> = attrs.split(|b| *b == 0).collect();
+        for triple in fields.chunks_exact(3) {
+            if triple[2] == b"lfs" {
                 return Err(CaptureError::GitLfsUnsupported {
-                    path: path.to_owned(),
+                    path: String::from_utf8_lossy(triple[0]).into_owned(),
                 });
             }
         }

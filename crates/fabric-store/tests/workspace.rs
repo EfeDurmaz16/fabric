@@ -686,6 +686,16 @@ fn busy_repositories_and_linked_worktrees_are_refused() {
         matches!(err, CaptureError::NotRepositoryRoot { .. }),
         "{err}"
     );
+
+    // An LFS filter set only in .git/info/attributes, on an untracked file.
+    let info = git(&root).git_path("info/attributes").unwrap();
+    fs::write(&info, "*.bin filter=lfs\n").unwrap();
+    fs::write(root.join("blob.bin"), "large\n").unwrap();
+    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    assert!(
+        matches!(&err, CaptureError::GitLfsUnsupported { path } if path == "blob.bin"),
+        "{err}"
+    );
 }
 
 type Listing = BTreeMap<String, (String, u32, i64, i64)>;
