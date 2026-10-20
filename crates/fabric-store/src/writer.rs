@@ -209,6 +209,14 @@ impl TreeWriter {
         .map_err(|e| map(e, Path::new(rel.as_str())))
     }
 
+    /// Says whether a directory, not a link to one, is at `rel`.
+    pub fn is_dir(&self, rel: &RelPath) -> Result<bool, WriteError> {
+        let (parent, name) = self.parent_of(rel, false)?;
+        let stat = fs::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|e| map(e, Path::new(rel.as_str())))?;
+        Ok(FileType::from_raw_mode(stat.st_mode).is_dir())
+    }
+
     /// Reads the target of the symlink at `rel` without following it.
     pub fn read_link(&self, rel: &RelPath) -> Result<String, WriteError> {
         let (parent, name) = self.parent_of(rel, false)?;

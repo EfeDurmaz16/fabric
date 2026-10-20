@@ -443,7 +443,11 @@ fn sync_dirs(root: &Path) -> Result<(), RestoreError> {
     rustix::fs::fsync(&fd).map_err(|e| io_err(root, e.into()))
 }
 
-/// Re-reads written files against the store and returns how many matched.
+/// Re-reads written entries against the store and returns how many matched.
+///
+/// A file is compared byte for byte, a link by its target, and a directory
+/// must be a directory, so a removed empty directory or a replaced link
+/// fails like a changed file.
 fn verify_entries(
     store: &Store,
     writer: &TreeWriter,
@@ -451,19 +455,30 @@ fn verify_entries(
     skip: &dyn Fn(&RelPath) -> bool,
     mode: Verify,
 ) -> Result<u64, RestoreError> {
-    let files: Vec<&Entry> = entries
-        .iter()
-        .filter(|e| matches!(e.kind, EntryKind::File { .. }) && !skip(&e.rel_path))
-        .collect();
+    let kept: Vec<&Entry> = entries.iter().filter(|e| !skip(&e.rel_path)).collect();
     let mut verified = 0;
-    for entry in sample(&files, mode) {
-        let EntryKind::File { chunks, .. } = &entry.kind else {
-            continue;
-        };
-        let mut file = writer.open_file(&entry.rel_path)?;
+    for entry in sample(&kept, mode) {
         let mismatch = || RestoreError::VerifyFailed {
             path: entry.rel_path.clone(),
         };
+        let chunks = match &entry.kind {
+            EntryKind::File { chunks, .. } => chunks,
+            EntryKind::Dir => {
+                if !writer.is_dir(&entry.rel_path).map_err(|_| mismatch())? {
+                    return Err(mismatch());
+                }
+                verified += 1;
+                continue;
+            }
+            EntryKind::Symlink { target } => {
+                if writer.read_link(&entry.rel_path).map_err(|_| mismatch())? != *target {
+                    return Err(mismatch());
+                }
+                verified += 1;
+                continue;
+            }
+        };
+        let mut file = writer.open_file(&entry.rel_path).map_err(|_| mismatch())?;
         let mut buf = Vec::new();
         for chunk in chunks {
             let expected = store.objects().read(*chunk)?;

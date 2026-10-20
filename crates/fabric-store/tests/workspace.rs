@@ -248,8 +248,8 @@ fn git_state_survives_capture_and_restore() {
     )
     .unwrap();
     assert_eq!(restored.files, 3);
-    // Three ignored files plus the nine entries of W.
-    assert_eq!(restored.verified, 12);
+    // Three ignored files, their two directories and the nine entries of W.
+    assert_eq!(restored.verified, 14);
     assert_eq!(restore_state(&target).unwrap(), RestoreState::Present);
 
     assert_eq!(git_difference(&root, &target).unwrap(), None);
@@ -335,7 +335,7 @@ fn verify_sees_a_tampered_file_and_link_in_the_working_tree() {
 
     assert_eq!(
         verify(&store, snapshot, &target, Verify::All, &|_| true).unwrap(),
-        12
+        14
     );
     fs::write(target.join("new.txt"), "cut short").unwrap();
     assert!(matches!(
@@ -967,10 +967,25 @@ fn a_plain_directory_and_harness_state_round_trip_exactly() {
     assert_eq!(report.verified, 2);
     assert_eq!(listing(&target).unwrap(), listing(&root).unwrap());
     assert_eq!(listing(&state_target).unwrap(), listing(&state).unwrap());
+    // Three directories, two files and a link.
     assert_eq!(
         verify(&store, snapshot, &target, Verify::All, &|_| true).unwrap(),
-        2
+        6
     );
+    fs::remove_dir(target.join("empty")).unwrap();
+    assert!(matches!(
+        verify(&store, snapshot, &target, Verify::All, &|_| true),
+        Err(RestoreError::VerifyFailed { path }) if path.as_str() == "empty"
+    ));
+    fs::create_dir(target.join("empty")).unwrap();
+    fs::remove_file(target.join("alias")).unwrap();
+    symlink("run.sh", target.join("alias")).unwrap();
+    assert!(matches!(
+        verify(&store, snapshot, &target, Verify::All, &|_| true),
+        Err(RestoreError::VerifyFailed { path }) if path.as_str() == "alias"
+    ));
+    fs::remove_file(target.join("alias")).unwrap();
+    symlink("a/b/deep.txt", target.join("alias")).unwrap();
     fs::write(target.join("a/b/deep.txt"), "tampered\n").unwrap();
     assert!(matches!(
         verify(&store, snapshot, &target, Verify::All, &|_| true),
