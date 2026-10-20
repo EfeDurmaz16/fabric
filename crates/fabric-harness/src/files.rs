@@ -18,6 +18,9 @@ use crate::jsontext::{self, TransformError};
 use crate::manifest::{Carried, Rewrite};
 use crate::rewrite::{PathMap, RedactionCounts, Redactor};
 
+/// The redaction rule name under which dropped signed blocks are counted.
+pub const SIGNED_BLOCK_DROPPED: &str = "signed-block-dropped";
+
 /// One file an adapter wants to carry.
 #[derive(Debug, Clone)]
 pub struct Source {
@@ -151,6 +154,10 @@ fn stage_json_text(
                 for (rule, n) in outcome.redactions {
                     *counts.entry(rule).or_insert(0) += n;
                 }
+                if outcome.dropped_signed_blocks > 0 {
+                    *counts.entry(SIGNED_BLOCK_DROPPED).or_insert(0) +=
+                        outcome.dropped_signed_blocks;
+                }
             }
             Err(TransformError::NotJson { .. }) => {
                 warn!(path = %src.display(), line = number, "line is not JSON; kept as text");
@@ -272,6 +279,31 @@ pub fn rewrite_json_text(path: &Path, map: &PathMap) -> Result<Vec<u8>, HarnessE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_counts_a_dropped_signed_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab";
+        let src = dir.path().join("t.jsonl");
+        fs::write(
+            &src,
+            format!("{{\"content\":[{{\"type\":\"text\",\"text\":\"a\"}},{{\"thinking\":\"{secret}\",\"signature\":\"s\"}}]}}\n"),
+        )
+        .unwrap();
+        let mut counts = RedactionCounts::new();
+        stage(
+            &[Source {
+                abs: src,
+                rel: RelPath::parse("home/t.jsonl").unwrap(),
+                rewrite: Rewrite::JsonText,
+            }],
+            &dir.path().join("out"),
+            &mut counts,
+        )
+        .unwrap();
+        assert_eq!(counts.get(SIGNED_BLOCK_DROPPED), Some(&1));
+        assert!(!counts.contains_key("github-token"));
+    }
 
     #[test]
     fn place_accepts_equal_and_prefix_and_refuses_divergence() {
