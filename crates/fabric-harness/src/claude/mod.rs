@@ -790,10 +790,19 @@ mod tests {
         /// Runs `preseed_trust` with `running` as the process answer;
         /// returns the outcome and whether processes were asked about.
         async fn preseed(&self, running: Vec<u32>) -> (Result<TrustOutcome, HarnessError>, bool) {
+            self.preseed_at(&self.work, running).await
+        }
+
+        /// `preseed` with the workspace given as `workspace`.
+        async fn preseed_at(
+            &self,
+            workspace: &Path,
+            running: Vec<u32>,
+        ) -> (Result<TrustOutcome, HarnessError>, bool) {
             let asked = Cell::new(false);
             let outcome = self
                 .adapter
-                .preseed_trust_with(&self.work, || {
+                .preseed_trust_with(workspace, || {
                     asked.set(true);
                     async move { Ok(running) }
                 })
@@ -830,6 +839,22 @@ mod tests {
             "a trusted workspace must not depend on running processes"
         );
         assert_eq!(fixture.config_bytes(), before);
+    }
+
+    #[tokio::test]
+    async fn a_workspace_reached_through_a_symlink_is_trusted_by_its_physical_ancestor() {
+        let fixture = TrustFixture::new(Some(&|work: &Path| trusting(work.parent().unwrap())));
+        let link = fixture.home.join("link");
+        std::os::unix::fs::symlink(&fixture.work, &link).unwrap();
+        let (outcome, asked) = fixture.preseed_at(&link, Vec::new()).await;
+        assert_eq!(
+            outcome.unwrap(),
+            TrustOutcome::AlreadyTrusted {
+                by: fixture.work.parent().unwrap().to_path_buf()
+            },
+            "Claude keys trust by the real path, so the link's own parent must not count"
+        );
+        assert!(!asked);
     }
 
     #[tokio::test]
