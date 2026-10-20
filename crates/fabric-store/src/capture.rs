@@ -1089,24 +1089,41 @@ impl GitCapture<'_> {
         let index = self.git.git_path("index")?;
         let lock = index.with_extension("lock");
         let copy = TempFile::in_dir(&self.scratch);
+        // The copy counts only if no lock appeared and the index was not
+        // replaced while it was read: git writes `index.lock` and renames it
+        // over the index, so a copy taken in between holds the old state.
+        let stamp = |path: &Path| match fs::metadata(path) {
+            Ok(meta) => Ok(Some((
+                meta.dev(),
+                meta.ino(),
+                meta.len(),
+                meta.mtime(),
+                meta.mtime_nsec(),
+            ))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io_err(path, e)),
+        };
         let mut tries = 0;
         loop {
-            if lock.exists() {
-                tries += 1;
-                if tries > 10 {
-                    return Err(CaptureError::GitBusy {
-                        reason: BusyReason::IndexLocked,
-                    });
+            if !lock.exists() {
+                let before = stamp(&index)?;
+                match fs::copy(&index, copy.path()) {
+                    Ok(_) => {}
+                    // No index yet: write-tree on a missing index file writes the empty tree.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(io_err(&index, e)),
                 }
-                thread::sleep(Duration::from_millis(200));
-                continue;
+                if !lock.exists() && stamp(&index)? == before {
+                    break;
+                }
             }
-            match fs::copy(&index, copy.path()) {
-                Ok(_) => break,
-                // No index yet: write-tree on a missing index file writes the empty tree.
-                Err(e) if e.kind() == io::ErrorKind::NotFound => break,
-                Err(e) => return Err(io_err(&index, e)),
+            tries += 1;
+            if tries > 10 {
+                return Err(CaptureError::GitBusy {
+                    reason: BusyReason::IndexLocked,
+                });
             }
+            thread::sleep(Duration::from_millis(200));
         }
         let env: [(&str, &OsStr); 1] = [("GIT_INDEX_FILE", copy.path().as_os_str())];
         let tree = self.git.run_text_env(&["write-tree"], &env)?;
