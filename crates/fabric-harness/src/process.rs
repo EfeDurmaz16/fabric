@@ -9,7 +9,12 @@
 //! when `pgrep` or `ps` cannot answer, the caller is told so, never "none".
 //! `ps`, `pgrep` and `kill` are run from their system paths, never looked
 //! up on this process's `PATH`, so a planted `ps` cannot report a live
-//! writer as gone.
+//! writer as gone. A question about running processes includes the
+//! processes this one runs under: BSD `pgrep` on macOS leaves out its own
+//! ancestors unless given `-a` (pgrep(1)), and when Fabric runs from a
+//! Claude Code session the host `claude` is one of them. procps `pgrep` on
+//! Linux includes ancestors already, and there `-a` changes the output, so
+//! the flag is passed on macOS only.
 
 #![cfg_attr(
     not(all(feature = "acp", feature = "claude", feature = "codex")),
@@ -42,6 +47,12 @@ const PS: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 const PGREP: &[&str] = &["/usr/bin/pgrep", "/bin/pgrep"];
 /// Where macOS and Linux keep `kill`.
 const KILL: &[&str] = &["/bin/kill", "/usr/bin/kill"];
+/// The `pgrep` flag that keeps the caller's ancestors in the answer.
+#[cfg(target_os = "macos")]
+const PGREP_WITH_ANCESTORS: &[&str] = &["-a"];
+/// procps `pgrep` keeps ancestors without a flag.
+#[cfg(not(target_os = "macos"))]
+const PGREP_WITH_ANCESTORS: &[&str] = &[];
 
 /// The first of `candidates` that is an executable file.
 fn system_tool(
@@ -267,6 +278,7 @@ pub(crate) fn now_ms() -> u64 {
 
 async fn pgrep(args: &[&OsStr]) -> Result<Vec<u32>, HarnessError> {
     let output = Command::new(system_tool("pgrep", PGREP)?)
+        .args(PGREP_WITH_ANCESTORS)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -386,6 +398,40 @@ mod tests {
         std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(find_on_path("tool", &var), Some(plain));
         assert_eq!(find_on_path("tool", OsStr::new("")), None);
+    }
+
+    /// The role a run of `running_pids_sees_a_claude_this_process_runs_under` plays.
+    const ANCESTOR_ROLE: &str = "FABRIC_TEST_ANCESTOR_ROLE";
+
+    #[tokio::test]
+    async fn running_pids_sees_a_claude_this_process_runs_under() {
+        let test = "process::tests::running_pids_sees_a_claude_this_process_runs_under";
+        let run = |binary: &Path, role: &str| {
+            let status = std::process::Command::new(binary)
+                .args(["--exact", test, "--test-threads=1"])
+                .env(ANCESTOR_ROLE, role)
+                .stdout(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "the {role} run failed");
+        };
+        match std::env::var(ANCESTOR_ROLE).ok().as_deref() {
+            None => {
+                let dir = tempfile::tempdir().unwrap();
+                let claude = dir.path().join("claude");
+                std::fs::copy(std::env::current_exe().unwrap(), &claude).unwrap();
+                run(&claude, "parent");
+            }
+            Some("parent") => run(&std::env::current_exe().unwrap(), "child"),
+            Some(_) => {
+                let parent = std::os::unix::process::parent_id();
+                let pids = running_pids("claude", None).await.unwrap();
+                assert!(
+                    pids.contains(&parent),
+                    "the claude this process runs under ({parent}) is missing from {pids:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
