@@ -1,5 +1,6 @@
 //! The files a node keeps about its own copy of a job: the workspace
-//! marker, the harness record and the session the job continues.
+//! marker, the harness record, the session the job continues, and the
+//! fork record that freezes the job.
 //!
 //! Invariant: none of these travel and none of them decide ownership; the
 //! ledger does. The marker says what the workspace at the root holds, so a
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fabric_core::harness::HarnessKind;
-use fabric_core::id::{Epoch, RecordHash, SnapshotId};
+use fabric_core::id::{Epoch, NodeId, RecordHash, SnapshotId};
 use rustix::process::{Pid, Signal};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -114,6 +115,21 @@ pub struct HarnessRecord {
     pub pid: NonZeroU32,
     /// The kernel's start time of the process, as `ps` prints it.
     pub started: String,
+}
+
+/// A peer's ledger for the job that does not continue this node's, at an
+/// epoch at least as high as this node's.
+///
+/// Its presence freezes the job on this node: the fork rule of ADR 0003 is
+/// not built, so the node fails closed and never runs the job again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkRecord {
+    /// The peer whose ledger forked from this one.
+    pub peer: NodeId,
+    /// The highest epoch in the peer's ledger.
+    pub epoch: Epoch,
+    /// The peer's head when the fork was found.
+    pub head: RecordHash,
 }
 
 /// The harness session a job continues on this node.

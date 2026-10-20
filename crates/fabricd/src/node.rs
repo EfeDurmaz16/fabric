@@ -10,7 +10,7 @@
 //! (ADR 0013), and every session both calls and serves, so either node can
 //! ask the other for chunks over the connection one of them dialed.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::net::SocketAddr;
@@ -73,7 +73,8 @@ pub struct Node {
     sessions: Mutex<HashMap<NodeId, Arc<Session>>>,
     pub(crate) harness_config: HarnessConfig,
     control: Mutex<Option<UnixListener>>,
-    recovered: tokio::sync::watch::Sender<bool>,
+    pub(crate) recovered: tokio::sync::watch::Sender<bool>,
+    pub(crate) catching_up: Mutex<BTreeSet<NodeId>>,
     _lock: File,
 }
 
@@ -86,7 +87,7 @@ impl std::fmt::Debug for Node {
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -145,6 +146,7 @@ impl Node {
             harness_config,
             control: Mutex::new(Some(control)),
             recovered: tokio::sync::watch::Sender::new(false),
+            catching_up: Mutex::new(BTreeSet::new()),
             _lock: lock_file,
         });
         tracing::info!(node = %node.id, addr = ?node.local_addr().ok(), "node started");
@@ -235,10 +237,13 @@ impl Node {
         }
     }
 
-    /// Keeps `session` for calls to its peer and serves the peer's requests on it until it ends.
+    /// Keeps `session` for calls to its peer, serves the peer's requests on
+    /// it until it ends, and catches up with the peer, which may have
+    /// written records while the two were apart.
     fn register(self: &Arc<Self>, session: Arc<Session>) {
         let peer = session.peer();
         lock(&self.sessions).insert(peer, Arc::clone(&session));
+        self.spawn_catch_up(peer);
         let node = Arc::clone(self);
         tokio::spawn(async move {
             let service: Arc<dyn Service> = node.clone();
@@ -335,50 +340,12 @@ impl Node {
         )?)
     }
 
-    /// Settles every job after a restart: learns what the paired peers wrote
-    /// while this node was away, fences stray harnesses, moves departed copies
-    /// aside and asks the target of an open move for its decision.
-    async fn recover(self: Arc<Self>) {
-        let ids: Vec<JobId> = self.jobs.lock().await.keys().copied().collect();
-        for id in ids {
-            let mut out = Out::default();
-            self.catch_up(id, &mut out).await;
-            if let Err(e) = self.settle_job(id, &mut out).await {
-                tracing::warn!(job = %id, error = %e, "recovery left the job as it was");
-            }
-            if let Err(e) = self.resolve_departing(id, &mut out).await {
-                tracing::info!(job = %id, error = %e, "the open move stays open");
-            }
-            for line in out.lines {
-                tracing::info!(job = %id, "{line}");
-            }
-        }
-        self.recovered.send_replace(true);
-    }
-
     /// Waits until the start-up recovery has run, so no job command acts on
     /// a ledger that has not yet learned what the peers wrote while this
     /// node was away.
     pub(crate) async fn recovered(&self) {
         let mut done = self.recovered.subscribe();
         let _ = done.wait_for(|done| *done).await;
-    }
-
-    /// Fetches what each paired peer holds after this node's head, so a node
-    /// that slept learns a steal or a decision made while it was away (ADR 0003).
-    async fn catch_up(self: &Arc<Self>, id: JobId, out: &mut Out) {
-        let peers: Vec<NodeId> = self
-            .peers
-            .snapshot()
-            .iter()
-            .filter(|entry| !entry.addrs().is_empty())
-            .map(fabric_net::peers::PeerEntry::node)
-            .collect();
-        for peer in peers {
-            if let Err(e) = self.pull_records(id, peer).await {
-                out.say(format!("did not catch up with {peer}: {e}"));
-            }
-        }
     }
 }
 

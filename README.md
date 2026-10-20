@@ -90,7 +90,7 @@ On the gate as measured, the Macs run different Claude Code versions, which doct
 - No phone or cloud client, and no third node.
 - Same user and home on both nodes; nothing rewrites paths (ADR 0011).
 - `fabric job init`, which adopts a checkout in place, is not built; `job new` clones the repository into `~/fabric/jobs/<id>/work`.
-- No `fabric orphan export` and no fork rule: an orphan workspace is reported and left in place, and a ledger that forked after a steal stops catching up and says so in the log.
+- No `fabric orphan export` and no fork rule: an orphan workspace is reported and left in place, and a node whose ledger forked after a steal freezes the job, stops its harness and says in `fabric job status` which node to continue on.
 - The node must run: every job command talks to it, and it supervises the harnesses it launched.
 - A network change can cut the two Macs apart (gate finding F3). The Pro moved from one subnet to another between two days of the gate and could no longer reach the Air's address. The side that dials must be the side that can reach the other: pair with an address it reaches today, and run `fabric node add` again with the new address when it changes. Nothing finds a peer that moved. Tailscale as an optional underlay, so the address stays the same across networks, is a follow-up.
 

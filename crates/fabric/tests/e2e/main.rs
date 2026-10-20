@@ -13,7 +13,8 @@ use std::fs;
 use std::time::Duration;
 
 use world::{
-    Env, Fallible, Node, OtherClaude, Wire, Work, edit, finish, pair, read_work, text, wait_for,
+    Env, Fallible, Node, OtherClaude, Wire, Work, alive, edit, finish, pair, read_work, text,
+    wait_for,
 };
 
 const AGENT: &str = "acp:fabric-fake-agent";
@@ -358,6 +359,57 @@ fn e2e_a_steal_needs_force_and_fences_the_sleeping_owner() -> Fallible {
     p.a.start(None)?;
     assert_one_owner(&p.b, &p.a, &job, 2, "replica")?;
     assert_continues(&p, &p.b, &job, &work, &["one"])
+}
+
+/// The owner suspended, then resumed and runs the job while another node
+/// steals it, so the two ledgers fork. The thief pushes its steal over the
+/// session the owner keeps open; the owner finds that the chains do not
+/// join at a higher epoch, freezes the job, stops its harness and refuses
+/// to run it again. Its workspace stays at the root as an orphan, which on
+/// this shared disk is also the thief's root, so the thief's ownership is
+/// asserted from its ledger.
+#[test]
+fn e2e_a_steal_after_a_resume_freezes_the_owner_and_stops_its_harness() -> Fallible {
+    let p = setup(Wire::TcpTls, None, None)?;
+    let (job, _) = job_with_work(&p)?;
+    p.a.ok(&["job", "suspend", &job])?;
+    let (running, pid) = p.a.run_lingering(&job)?;
+    p.b.ok(&["job", "steal", &job, "--force"])?;
+    let output = finish(running, GIVE_UP)?;
+    assert!(!output.status.success(), "{}", text(&output));
+    assert!(!alive(pid), "the owner's harness outlived the steal");
+    assert_eq!(p.a.lease(&job)?.view, "frozen");
+    let refusal = p.a.fails(&["job", "run", &job])?;
+    assert!(refusal.contains("is frozen on this node"), "{refusal}");
+    let thief = p.b.lease(&job)?;
+    assert_eq!(
+        (thief.owner.as_str(), thief.epoch, thief.view.as_str()),
+        (p.b.id.as_str(), 2, "owner")
+    );
+    Ok(())
+}
+
+/// As above, with the owner's daemon up but out of reach when the steal
+/// happens, as a laptop on another network: nothing tells it, so its
+/// harness keeps running until the next `run` catches up with the thief,
+/// finds the fork, stops the harness and refuses.
+#[test]
+fn e2e_an_owner_that_stayed_up_through_a_steal_refuses_to_run() -> Fallible {
+    let mut p = setup(Wire::TcpTls, None, None)?;
+    let (job, _) = job_with_work(&p)?;
+    p.a.ok(&["job", "suspend", &job])?;
+    let (running, pid) = p.a.run_lingering(&job)?;
+    p.b.kill()?;
+    p.b.start(None)?;
+    let stolen = p.b.ok(&["job", "steal", &job, "--force"])?;
+    assert!(stolen.contains("has not seen the steal"), "{stolen}");
+    assert!(alive(pid), "nothing could have told the owner yet");
+    let refusal = p.a.fails(&["job", "run", &job])?;
+    assert!(refusal.contains("is frozen on this node"), "{refusal}");
+    let output = finish(running, GIVE_UP)?;
+    assert!(!output.status.success(), "{}", text(&output));
+    assert!(!alive(pid), "the owner's harness outlived the fork");
+    Ok(())
 }
 
 /// Gate finding F1: a user keeps Claude Code open, so a `claude` process

@@ -72,6 +72,30 @@ pub enum NodeError {
         /// The node that decides it.
         target: NodeId,
     },
+    /// A peer's ledger forked from this node's at an epoch at least as high, so the job is frozen here.
+    #[error(
+        "job {job} is frozen on this node: {peer} holds a ledger for it at epoch {epoch} that does not continue this node's, so it was stolen while this node still ran it. This copy never runs again and its workspace stays where it is; run `fabric job resume {job}` on {peer} to continue there"
+    )]
+    Forked {
+        /// The job.
+        job: JobId,
+        /// The peer whose ledger forked.
+        peer: NodeId,
+        /// The highest epoch in the peer's ledger.
+        epoch: Epoch,
+    },
+    /// A peer's ledger forked from this node's at a lower epoch; the peer is the side that stops.
+    #[error(
+        "{peer}'s ledger for job {job} forked from this node's at epoch {epoch}, behind this node's; it stops running the job when it learns this node's records"
+    )]
+    ForkBehind {
+        /// The job.
+        job: JobId,
+        /// The peer whose ledger forked.
+        peer: NodeId,
+        /// The highest epoch in the peer's ledger.
+        epoch: Epoch,
+    },
     /// The job ran on this node while a move copied it, so the copy is out of date.
     #[error(
         "job {job} ran on this node while {target} copied it, so nothing moved; run `fabric job move {job} --to {target}` again once it has stopped"

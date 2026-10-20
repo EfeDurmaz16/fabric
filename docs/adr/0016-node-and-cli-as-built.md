@@ -64,13 +64,21 @@ The pull (`fabric job resume <job>` on a node that does not own the job) fetches
 
 Three protocol details the earlier ADRs left open:
 
-- A node that holds none of a job's records sends `Pull { after: None }` and gets the chain from `Created`. An `after` the answering chain does not hold is answered `NotInChain { head }`: the asker stops when its own chain holds that head, because the peer is only behind, and otherwise reports that the chains forked, since the fork rule of ADR 0003 is not built.
+- A node that holds none of a job's records sends `Pull { after: None }` and gets the chain from `Created`. An `after` the answering chain does not hold is answered `NotInChain { head }`: the asker stops when its own chain holds that head, because the peer is only behind, and otherwise the chains forked and the node acts as Forks, below, says.
 - A record a peer sends is checked first as the peer's own. If the ledger says another node wrote it, it is accepted as relayed (ADR 0002, amendment 6), except when the writer is this node: a node writes its own records and never learns one from a peer.
 - A per-job request whose epoch is behind this node's is answered `StaleEpoch`, except `Pull`, which is a read from a node catching up.
 
-### Recovery
+### Recovery and catching up
 
-At start the node pulls each job's records from every paired peer it can dial, settles each job (kills a harness whose epoch is over, moves a clean departed or stolen-from copy aside), and asks the target of any open move for its decision. Job commands wait until this has run, so a node that slept through a steal never launches the stolen job. Node commands and doctor do not wait.
+A node catches up with its paired peers at start, whenever a session with a peer begins, and before a `run` or a `resume` of a job it owns. Catching up pulls each job's records from each peer the node can call, one with a pasted address or one that holds a session open with it, then settles the job: it kills a harness whose epoch is over and moves a clean departed or stolen-from copy aside.
+
+At start each peer is caught up on a task of its own, so the pass takes about one dial however many peers there are, and a peer that does not answer costs one failed dial for the whole pass rather than one per job (about 13 s with QUIC then TCP). The target of an open move is then asked for its decision, unless it did not answer. Commands that change a job wait until this pass has run; `job ls`, `status` and `log` answer from local state at once, never dial, and say so while the pass still runs. Node commands and doctor do not wait.
+
+Before a launch each reachable peer gets three seconds; one that does not answer is named and the run goes ahead on this node's ledger. So a node that slept through a steal does not launch the stolen job when it restarted, or when it can reach the thief at the next run. A node that stays up while the thief is out of reach, as a laptop on another network, keeps its harness running until the two meet: at that check, when either side opens a session, or at the next start. The Fencing section of ADR 0003 already accepts that a harness edits until its node learns the epoch.
+
+### Forks
+
+The fork rule of ADR 0003 is not built, so a node fails closed instead. When a peer's ledger for a job does not continue its own and the peer's ledger reached an epoch at least as high, the node writes `jobs/<job-id>/forked` with the peer, that epoch and the peer's head. It finds this when a pull is answered `NotInChain` with a head its own chain lacks, after which it reads the peer's whole chain for the epoch, or when a page a peer pushes at an epoch at least as high does not link to its head. From then on the job is frozen on that node: `run`, `resume`, `suspend`, `move`, `approve`, `reject` and a peer's move request refuse it, the recorded harness is stopped, the workspace stays where it is as an orphan, and `status` names the peer to continue on. When the peer's epoch is lower, the peer is the side that freezes when it learns this node's records, and this node carries on. Nothing lifts a freeze; the fork rule will. The peer's epoch is read from its records as they arrive, so a paired peer that lies can freeze a job here but cannot make this node run one.
 
 ### Doctor
 
@@ -118,6 +126,6 @@ Capture measures carry keys with `fabric-env` detection: a cache detection does 
 
 - Should a node that cannot reach the target of its open move offer the user `fabric job move --abort`, which ADR 0003 describes and this build does not have?
 - `fabric orphan export` (ADR 0003) is not built; an orphan workspace is reported and left in place.
-- The fork rule of ADR 0003 is not built: a ledger that forked after a steal fails to catch up and the node logs it.
+- The fork rule of ADR 0003 is not built: a node whose ledger forked after a steal, at an epoch no higher than the peer's, freezes the job (Forks, above) until the rule exists.
 - The store applies its own secret list, not `fabric_core::secret` (ADR 0004, integration note of 2026-10-20).
 - How do two nodes find each other after a network change? On the gate (finding F3, 2026-10-20) the Pro moved to another subnet overnight and the Air's address was unreachable from it. Today the user re-pairs with `fabric node add` and a new address. Candidates: Tailscale as an optional underlay whose addresses survive the change, or the reachable side dialing a rendezvous. Decide after the first move on the gate.

@@ -6,11 +6,13 @@
 //! one decision per move it is the target of, makes it durable before the
 //! answer leaves, and answers every later question about that move with the
 //! same record, byte for byte. A pull is a read and is answered whatever
-//! the asker's epoch, because the asker is catching up. Manifests and
+//! the asker's epoch, because the asker is catching up. A pushed page that
+//! does not continue this node's chain, from a peer at an epoch at least as
+//! high, freezes the job here before the refusal is answered. Manifests and
 //! chunks are named by their hashes and served to any paired peer.
 
 use fabric_core::BoxFuture;
-use fabric_core::id::{ChunkId, JobId, MoveId, NodeId, RecordHash, SnapshotId};
+use fabric_core::id::{ChunkId, Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::FencingToken;
 use fabric_core::ledger::{Author, LedgerError};
 use fabric_core::moves::{AbortAnswer, CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
@@ -26,6 +28,7 @@ use crate::clock;
 use crate::error::NodeError;
 use crate::facts::NodeFacts;
 use crate::faults::{self, Action, Point};
+use crate::local::ForkRecord;
 use crate::node::{Node, Out};
 use crate::transfer::{fetch_snapshot, is_complete, with_store};
 
@@ -225,6 +228,11 @@ impl Node {
             match self.accept_record(id, peer, bytes.as_bytes()).await {
                 Ok(_) => {}
                 Err(NodeError::Ledger(LedgerError::PrevMismatch { head })) => {
+                    // The sender holds records this node lacks after a
+                    // record this node replaced with its own: the chains
+                    // forked. The epoch check above passed, so the
+                    // sender's epoch is at least this node's.
+                    self.freeze_on_push(id, peer, token.epoch, &records).await?;
                     return Ok(Fenced::Answer(Appended::Rejected { head }));
                 }
                 Err(e) => return Err(bad(&e)),
@@ -246,6 +254,36 @@ impl Node {
             self.fetch_from(peer, snapshot).await?;
         }
         Ok(Fenced::Answer(Appended::Accepted { head }))
+    }
+
+    /// Freezes the job after a pushed page that does not continue this
+    /// node's chain, from a peer at an epoch at least as high (ADR 0016, Forks).
+    async fn freeze_on_push(
+        &self,
+        id: JobId,
+        peer: NodeId,
+        epoch: Epoch,
+        records: &RecordPage,
+    ) -> Result<(), Fault> {
+        let Some(last) = records.records().last() else {
+            return Ok(());
+        };
+        let mut out = Out::default();
+        self.freeze(
+            id,
+            &ForkRecord {
+                peer,
+                epoch,
+                head: RecordHash::of(last.as_bytes()),
+            },
+            &mut out,
+        )
+        .await
+        .map_err(|e| internal(&e))?;
+        for line in out.lines {
+            tracing::warn!(job = %id, "{line}");
+        }
+        Ok(())
     }
 
     /// Fetches `snapshot` from `peer` over the session the peer opened, unless it is here whole.

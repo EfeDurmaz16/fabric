@@ -170,6 +170,12 @@ impl JobDir {
         self.dir.join("session")
     }
 
+    /// The fork record that freezes the job on this node.
+    #[must_use]
+    pub fn forked(&self) -> PathBuf {
+        self.dir.join("forked")
+    }
+
     /// Where harness state is captured into and restored from.
     #[must_use]
     pub fn harness_state(&self) -> PathBuf {

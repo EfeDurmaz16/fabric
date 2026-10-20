@@ -274,7 +274,8 @@ impl Node {
         self.state.join("fault-reached")
     }
 
-    /// Starts the daemon, with `fault` armed when given, and waits until it answers.
+    /// Starts the daemon, with `fault` armed when given, and waits until it
+    /// answers and has caught up with its peers.
     pub fn start(&mut self, fault: Option<&str>) -> Fallible {
         if self.daemon.is_some() {
             return Err(format!("{} already runs", self.name).into());
@@ -310,13 +311,20 @@ impl Node {
                     .next()
                     .ok_or("node id printed nothing")?
                     .clone_into(&mut self.id);
-                return Ok(());
+                break;
             }
             if started.elapsed() > START_TIMEOUT {
                 return Err(format!("{} did not start:\n{}", self.name, self.log()).into());
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+        while self.ok(&["job", "ls"])?.contains("still catching up") {
+            if started.elapsed() > START_TIMEOUT {
+                return Err(format!("{} did not recover:\n{}", self.name, self.log()).into());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Ok(())
     }
 
     /// Kills the daemon with `SIGKILL` and reaps it.
@@ -335,13 +343,47 @@ impl Node {
 
     /// Starts a CLI command in the background.
     pub fn spawn(&self, args: &[&str]) -> Fallible<Child> {
+        self.spawn_with(args, &[])
+    }
+
+    /// Starts a CLI command in the background with `vars` added to its environment.
+    pub fn spawn_with(&self, args: &[&str], vars: &[(&str, &Path)]) -> Fallible<Child> {
         Ok(self
             .env
             .command(env!("CARGO_BIN_EXE_fabric"), &self.state)
             .args(args)
+            .envs(vars.iter().copied())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?)
+    }
+
+    /// Runs the job here under a fake agent that stays alive after its
+    /// turn, as a long session does, and returns the CLI that waits on it
+    /// and the agent's pid once the node records it as running.
+    pub fn run_lingering(&self, job: &str) -> Fallible<(Child, i32)> {
+        let pid_file = self.state.join("harness.pid");
+        let _ = fs::remove_file(&pid_file);
+        let linger = Path::new("1");
+        let running = self.spawn_with(
+            &["job", "run", job, "--prompt", "two"],
+            &[("FAKE_LINGER", linger), ("FAKE_PID_FILE", &pid_file)],
+        )?;
+        let started = Instant::now();
+        loop {
+            if self
+                .ok(&["job", "status", job])?
+                .contains("harness: running as pid")
+            {
+                break;
+            }
+            if started.elapsed() > FAULT_TIMEOUT {
+                return Err("the lingering harness never registered".into());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let pid = fs::read_to_string(&pid_file)?.trim().parse()?;
+        Ok((running, pid))
     }
 
     /// Runs a CLI command to its end.
@@ -452,6 +494,12 @@ pub fn finish(child: Child, timeout: Duration) -> Fallible<Output> {
     let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
     let output = waited.recv()??;
     Err(format!("a command ran past {timeout:?}:\n{}", text(&output)).into())
+}
+
+/// True while a process with `pid` exists.
+pub fn alive(pid: i32) -> bool {
+    rustix::process::Pid::from_raw(pid)
+        .is_some_and(|pid| rustix::process::test_kill_process(pid).is_ok())
 }
 
 /// Waits until `path` exists.

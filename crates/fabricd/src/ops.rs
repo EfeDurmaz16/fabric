@@ -77,14 +77,25 @@ impl Node {
         request: Request,
         out: &mut Out,
     ) -> Result<Option<RunPlan>, NodeError> {
-        if !matches!(
+        // Reads answer from local state at once; a command that changes a
+        // job waits until start-up recovery has learned what the peers wrote.
+        let reads = matches!(
+            request,
+            Request::JobList | Request::JobStatus { .. } | Request::JobLog { .. }
+        );
+        let node_only = matches!(
             request,
             Request::NodeId
                 | Request::NodeAdd { .. }
                 | Request::NodeList
                 | Request::NodePing { .. }
                 | Request::Doctor { .. }
-        ) {
+        );
+        if reads && !self.is_recovered() {
+            out.say(
+                "this node is still catching up with its peers after a restart; what follows may not show what they wrote",
+            );
+        } else if !reads && !node_only {
             self.recovered().await;
         }
         match request {
@@ -105,6 +116,7 @@ impl Node {
             Request::JobLog { job } => self.job_log(job, out).await?,
             Request::JobRun { job, harness } => {
                 self.resolve_departing(job, out).await?;
+                self.check_peers(job, out).await;
                 return Ok(Some(self.job_run(job, harness, out).await?));
             }
             Request::JobResume {
@@ -289,13 +301,18 @@ impl Node {
 
     async fn job_list(&self, out: &mut Out) {
         let jobs: Vec<_> = self.jobs.lock().await.values().cloned().collect();
+        let jobs_listed = jobs.len() + self.broken_jobs().len();
         for job in jobs {
             let job = job.lock().await;
             let manifest = job.ledger().manifest();
+            let word = match job.forked() {
+                Ok(Some(_)) => "frozen",
+                Ok(None) => view_word(&job.view(self.id)),
+                Err(_) => "unreadable",
+            };
             out.say(format!(
-                "{} {} epoch {} {}",
+                "{} {word} epoch {} {}",
                 job.id(),
-                view_word(&job.view(self.id)),
                 manifest.lease.epoch(),
                 manifest.goal
             ));
@@ -303,7 +320,7 @@ impl Node {
         for (id, error) in self.broken_jobs() {
             out.say(format!("{id} closed: {error}"));
         }
-        if out.lines.is_empty() {
+        if jobs_listed == 0 {
             out.say("no jobs; make one with `fabric job new --repo <path> --goal <text>`");
         }
     }
@@ -318,7 +335,6 @@ impl Node {
     }
 
     async fn job_status(self: &Arc<Self>, id: JobId, out: &mut Out) -> Result<(), NodeError> {
-        self.resolve_departing(id, out).await?;
         let job = self.job(id).await?;
         let job = job.lock().await;
         let manifest = job.ledger().manifest();
@@ -331,15 +347,20 @@ impl Node {
             if owner == self.id { " (this node)" } else { "" },
             manifest.lease.epoch()
         ));
-        out.say(match job.view(self.id) {
-            LeaseView::Owner(_) => "this node: owner".to_owned(),
-            LeaseView::Departing { move_id, target } => format!(
+        let forked = job.forked()?;
+        out.say(match (job.view(self.id), &forked) {
+            (_, Some(fork)) => format!(
+                "this node: frozen; {}'s ledger at epoch {} does not continue this node's, so the job was stolen while this node ran it. This copy never runs again; run `fabric job resume {id}` on {} to continue there",
+                fork.peer, fork.epoch, fork.peer
+            ),
+            (LeaseView::Owner(_), None) => "this node: owner".to_owned(),
+            (LeaseView::Departing { move_id, target }, None) => format!(
                 "this node: departing to {target} under move {move_id}; frozen until {target} answers. Run `fabric job move {id} --to {target}` to ask again, or `fabric job steal {id} --force` on another node"
             ),
-            LeaseView::Departed { owner, epoch } => format!(
+            (LeaseView::Departed { owner, epoch }, None) => format!(
                 "this node: departed; {owner} owns the job at epoch {epoch} and this copy never runs"
             ),
-            LeaseView::Replica { owner, .. } => {
+            (LeaseView::Replica { owner, .. }, None) => {
                 format!("this node: replica; run `fabric job resume {id}` to pull it from {owner}")
             }
         });
@@ -348,7 +369,7 @@ impl Node {
             (Some(s), Some(_)) => format!("snapshot: {s} (suspended in it)"),
             (Some(s), None) => format!("snapshot: {s} (resumed since)"),
         });
-        let owner_here = matches!(job.view(self.id), LeaseView::Owner(_));
+        let owner_here = matches!(job.view(self.id), LeaseView::Owner(_)) && forked.is_none();
         out.say(match job.marker()? {
             None => "workspace: none on this node".to_owned(),
             Some(marker) if !owner_here => format!(
@@ -1125,10 +1146,15 @@ impl Node {
     }
 
     /// Kills a harness this node no longer owns and moves a departed copy out of the root.
+    ///
+    /// A frozen job has no owner here: its harness is stopped and its
+    /// workspace stays where it is, since it may hold work the job lacks.
     pub(crate) async fn settle(&self, job: &mut Job, out: &mut Out) -> Result<(), NodeError> {
         let view = job.view(self.id);
+        let forked = job.forked()?.is_some();
         if let Some(record) = job.harness_record()? {
-            let owned = matches!(view, LeaseView::Owner(token) if token.epoch == record.epoch);
+            let owned =
+                !forked && matches!(view, LeaseView::Owner(token) if token.epoch == record.epoch);
             if !owned {
                 if record.liveness().await != Liveness::Gone {
                     out.say(format!(
@@ -1139,6 +1165,9 @@ impl Node {
                 }
                 local::remove(&job.dir().harness())?;
             }
+        }
+        if forked {
+            return Ok(());
         }
         // A copy that matches a published snapshot holds nothing the job
         // lacks, so it leaves the root; a copy with changes since the last
@@ -1187,6 +1216,9 @@ impl Node {
         out: &mut Out,
     ) -> Result<RunPlan, NodeError> {
         self.resolve_departing(id, out).await?;
+        if self.job(id).await.is_ok() {
+            self.check_peers(id, out).await;
+        }
         let holder = match self.job(id).await {
             Err(_) => Some(on.ok_or(NodeError::UnknownJob(id))?),
             Ok(job) => match job.lock().await.view(self.id) {
@@ -1346,12 +1378,7 @@ impl Node {
                     if behind {
                         return Ok(());
                     }
-                    return Err(NodeError::Peer {
-                        peer: holder,
-                        reason: format!(
-                            "its ledger forked from this one (its head is {head}); the chains cannot be joined"
-                        ),
-                    });
+                    return Err(Box::pin(self.forked_from(id, holder, head)).await);
                 }
                 other => {
                     return Err(NodeError::Peer {
@@ -1702,6 +1729,13 @@ impl Node {
 /// The owner's fencing token, or the refusal that says who owns the job.
 fn owner_token(job: &Job, me: NodeId) -> Result<FencingToken, NodeError> {
     let id = job.id();
+    if let Some(fork) = job.forked()? {
+        return Err(NodeError::Forked {
+            job: id,
+            peer: fork.peer,
+            epoch: fork.epoch,
+        });
+    }
     match job.view(me) {
         LeaseView::Owner(token) => Ok(token),
         LeaseView::Departing { move_id, target } => Err(NodeError::Departing {

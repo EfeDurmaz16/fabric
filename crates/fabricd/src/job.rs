@@ -16,7 +16,7 @@ use fabric_core::moves::LeaseView;
 use crate::clock;
 use crate::error::NodeError;
 use crate::ledger_file::{self, LedgerFile};
-use crate::local::{self, HarnessRecord, Marker, MarkerState, SessionRecord};
+use crate::local::{self, ForkRecord, HarnessRecord, Marker, MarkerState, SessionRecord};
 use crate::paths::JobDir;
 
 /// A job's ledger and files on this node.
@@ -185,6 +185,20 @@ impl Job {
     /// The session the job continues on this node, if known.
     pub fn session(&self) -> Result<Option<SessionRecord>, NodeError> {
         Ok(local::read(&self.dir.session())?)
+    }
+
+    /// The fork record that freezes the job here, if a peer's ledger forked from this one.
+    pub fn forked(&self) -> Result<Option<ForkRecord>, NodeError> {
+        Ok(local::read(&self.dir.forked())?)
+    }
+
+    /// Freezes the job here; a job already frozen keeps the first record.
+    pub fn freeze(&self, fork: &ForkRecord) -> Result<bool, NodeError> {
+        if self.forked()?.is_some() {
+            return Ok(false);
+        }
+        local::write(&self.dir.forked(), fork)?;
+        Ok(true)
     }
 
     /// Settles a marker a crash left behind once the ledger says how the
