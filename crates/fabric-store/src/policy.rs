@@ -148,13 +148,19 @@ pub enum PolicyError {
         #[source]
         source: io::Error,
     },
-    /// A pattern is empty, absolute, or has an empty component.
+    /// A pattern in `.fabricignore` is empty, absolute, or uses syntax the matcher does not model.
     #[error("{path}:{line}: pattern {text:?} is not valid")]
     BadPattern {
-        /// The file the pattern came from, or the policy itself.
+        /// The file the pattern came from.
         path: PathBuf,
         /// The one-based line.
         line: usize,
+        /// The pattern text.
+        text: String,
+    },
+    /// A pattern a caller added is empty, absolute, or uses syntax the matcher does not model.
+    #[error("pattern {text:?} is not valid")]
+    BadPolicyPattern {
         /// The pattern text.
         text: String,
     },
@@ -299,9 +305,7 @@ impl IgnorePolicy {
 
     /// Widens the secret list, in both the full and the narrow form.
     pub fn add_secret_pattern(&mut self, text: &str) -> Result<(), PolicyError> {
-        let pattern = Pattern::parse(text).ok_or_else(|| PolicyError::BadPattern {
-            path: PathBuf::from("<policy>"),
-            line: 0,
+        let pattern = Pattern::parse(text).ok_or_else(|| PolicyError::BadPolicyPattern {
             text: text.to_owned(),
         })?;
         self.cache_secrets.push(pattern.clone());
@@ -311,9 +315,7 @@ impl IgnorePolicy {
 
     /// Adds a pattern whose matches are not carried for this job.
     pub fn add_exclude(&mut self, text: &str) -> Result<(), PolicyError> {
-        let pattern = Pattern::parse(text).ok_or_else(|| PolicyError::BadPattern {
-            path: PathBuf::from("<policy>"),
-            line: 0,
+        let pattern = Pattern::parse(text).ok_or_else(|| PolicyError::BadPolicyPattern {
             text: text.to_owned(),
         })?;
         self.excludes.push(pattern);

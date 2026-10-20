@@ -515,7 +515,7 @@ fn a_gitignore_negation_cannot_put_a_secret_into_the_worktree_commit() {
     }
     assert!(matches!(
         policy.add_exclude("!.env"),
-        Err(PolicyError::BadPattern { .. })
+        Err(PolicyError::BadPolicyPattern { .. })
     ));
 }
 
