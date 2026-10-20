@@ -7,7 +7,7 @@
 //! never content.
 
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -15,6 +15,9 @@ use std::time::SystemTime;
 
 use fabric_core::id::ChunkId;
 use fastcdc::v2020::{AVERAGE_MAX, AVERAGE_MIN, FastCDC, MAXIMUM_MAX, MINIMUM_MIN, StreamCDC};
+
+use rustix::fs::{Mode, OFlags};
+use rustix::io::Errno;
 
 use crate::durable::{self, Published};
 
@@ -64,6 +67,21 @@ fn io_err(path: &Path, source: io::Error) -> ObjectError {
         path: path.to_owned(),
         source,
     }
+}
+
+/// Opens `path` for reading when it is a regular file, and returns `None` for anything else.
+///
+/// The open does not follow a symlink in the last component and does not
+/// wait on a FIFO, and the type is read from the open descriptor, so what
+/// the caller reads is the file that was checked.
+pub(crate) fn open_regular(path: &Path) -> io::Result<Option<File>> {
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let file = match rustix::fs::open(path, flags, Mode::empty()) {
+        Ok(fd) => File::from(fd),
+        Err(Errno::LOOP) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(file.metadata()?.is_file().then_some(file))
 }
 
 /// The largest object a store writes: the bulk frame bound of ADR 0005.
@@ -320,7 +338,7 @@ impl ObjectStore {
     ///
     /// A symlink, FIFO, socket or device at `path` is refused, not followed or read.
     pub fn put_file(&self, path: &Path) -> Result<StoredFile, ObjectError> {
-        let file = durable::open_regular(path)
+        let file = open_regular(path)
             .map_err(|e| io_err(path, e))?
             .ok_or_else(|| ObjectError::NotRegular {
                 path: path.to_owned(),

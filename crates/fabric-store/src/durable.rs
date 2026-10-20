@@ -21,9 +21,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rustix::fs::{Mode, OFlags};
-use rustix::io::Errno;
-
 /// Flushes a directory so that renames and links inside it are durable.
 pub(crate) fn fsync_dir(path: &Path) -> io::Result<()> {
     let dir = File::open(path)?;
@@ -40,21 +37,6 @@ pub(crate) fn full_fsync(file: &File) -> io::Result<()> {
     {
         file.sync_all()
     }
-}
-
-/// Opens `path` for reading when it is a regular file, and returns `None` for anything else.
-///
-/// The open does not follow a symlink in the last component and does not
-/// wait on a FIFO, and the type is read from the open descriptor, so what
-/// the caller reads is the file that was checked.
-pub(crate) fn open_regular(path: &Path) -> io::Result<Option<File>> {
-    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    let file = match rustix::fs::open(path, flags, Mode::empty()) {
-        Ok(fd) => File::from(fd),
-        Err(Errno::LOOP) => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    Ok(file.metadata()?.is_file().then_some(file))
 }
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);

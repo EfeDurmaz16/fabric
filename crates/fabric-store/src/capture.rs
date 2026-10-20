@@ -30,9 +30,9 @@ use fabric_core::snapshot::{
     HarnessState, ManifestError, Mode, Platform, SnapshotManifest,
 };
 
-use crate::durable::{self, TempFile};
+use crate::durable::TempFile;
 use crate::git::{Git, GitError};
-use crate::objects::{ObjectError, StoredFile};
+use crate::objects::{ObjectError, StoredFile, open_regular};
 use crate::policy::{Class, IgnorePolicy, Markers};
 use crate::store::{Store, StoreError};
 
@@ -410,7 +410,7 @@ fn open_listed(full: &Path, found: &Found) -> Result<File, CaptureError> {
     let changed = || CaptureError::WorkspaceChanged {
         path: found.rel.clone(),
     };
-    let file = match durable::open_regular(full) {
+    let file = match open_regular(full) {
         Ok(Some(file)) => file,
         Ok(None) => return Err(changed()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(changed()),
