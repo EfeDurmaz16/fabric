@@ -10,7 +10,7 @@ Amended 2026-10-19 after the adversarial review of PR `feat/core`: a setup step 
 
 Amended 2026-10-19 after the second adversarial review of PR `feat/core`: `program` is a `ProgramName` (amendment above, corrected in place), `env_var_names` holds `EnvVarName` values that cannot carry a `=`, and `tools`, `env_var_names` and `cache_paths` are strictly sorted so that one content has one `EnvSpecId`; a spec that breaks either rule is refused on encode and on decode.
 
-Amended 2026-10-19 while writing `fabric-env` (PR `feat/env`). Detection and materialize are corrected in place; what changed and why:
+Amended 2026-10-19 while writing `fabric-env` (PR `feat/env`), and again on 2026-10-20 after the second review of that PR (points 11 to 15). Detection and materialize are corrected in place; what changed and why:
 
 1. `Tool.version` holds a pin as its file wrote it (`22`, `1.97.1`, `>=18`). Detection reads files and never runs a program, so the same files give the same spec on every node; the strings a tool reports about itself (`rustc -vV`, `node --version`) are measured by `fabric doctor` and stored in the carry key (ADR 0008, ADR 0012), which is where an exact comparison is made. Step 5 of materialize is therefore informational: doctor prints the pins beside the measured strings and compares neither, because ADR 0008 allows no range parsing and a pin such as `>=18` or `v20` would never equal a measured `v20.11.1`.
 2. The user's edits live in `.fabric/env.toml`, not in an edited copy of the spec (below). The spec is rebuilt from the files and the override file, so "edit the spec" and "detect again" cannot disagree.
