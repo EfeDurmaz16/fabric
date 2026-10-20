@@ -35,7 +35,7 @@ pub enum Outcome {
 
 impl fmt::Display for Outcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+        f.pad(match self {
             Outcome::Equal => "ok",
             Outcome::Fallback => "rebuild",
             Outcome::Warn => "warn",
@@ -215,7 +215,7 @@ pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row
     rows.push(clock_row(ctx));
     rows.push(Row {
         fact: "network",
-        here: None,
+        here: Some("dialed".to_owned()),
         peer: ctx.wire.clone(),
         outcome: Outcome::Equal,
         forceable: true,
@@ -320,7 +320,7 @@ fn clock_row(ctx: &Context<'_>) -> Row {
         .is_some_and(|skew| skew.abs() > CLOCK_SKEW_LIMIT_MS);
     Row {
         fact: "clock",
-        here: None,
+        here: Some("the reference".to_owned()),
         peer: ctx.clock_skew_ms.map(|ms| format!("{ms} ms from here")),
         outcome: if over { Outcome::Warn } else { Outcome::Equal },
         forceable: true,
