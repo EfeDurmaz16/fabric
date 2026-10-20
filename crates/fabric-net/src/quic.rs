@@ -3,7 +3,9 @@
 //! Invariant: a connection surfaces from `accept` or `connect` only after
 //! quinn completed the TLS 1.3 handshake under the pinned verifiers, and the
 //! node id it reports is read from the certificate that handshake checked.
-//! 0-RTT is never enabled, so no application byte is replayable.
+//! 0-RTT is never enabled, so no application byte is replayable. Incoming
+//! handshakes run in the background (the `accept` module), so a peer that
+//! stalls one does not hold up the next.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -15,6 +17,7 @@ use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{IdleTimeout, VarInt};
 use rustls::pki_types::CertificateDer;
 
+use crate::accept::{Handshakes, Inbox};
 use crate::identity::NodeIdentity;
 use crate::tls::{Credentials, Refusal, SERVER_NAME, TlsError, Trust, peer_of};
 use crate::transport::{Connection, Stream, Transport, TransportError, TransportKind};
@@ -30,6 +33,7 @@ pub struct QuicTransport {
     endpoint: quinn::Endpoint,
     credentials: Arc<Credentials>,
     transport: Arc<quinn::TransportConfig>,
+    inbox: Inbox,
 }
 
 impl std::fmt::Debug for QuicTransport {
@@ -51,16 +55,20 @@ impl QuicTransport {
     ) -> Result<Self, TransportError> {
         let credentials = Arc::new(Credentials::new(identity)?);
         let transport = Arc::new(transport_config()?);
-        let rustls_config = credentials.server_config(trust)?;
+        let rustls_config = credentials.server_config(Arc::clone(&trust))?;
         let quic_config = QuicServerConfig::try_from(rustls_config)
             .map_err(|err| TransportError::Config(err.to_string()))?;
         let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
         server.transport_config(transport.clone());
         let endpoint = quinn::Endpoint::server(server, addr)?;
+        let inbox = Inbox::spawn(trust, |handshakes| {
+            accept_loop(endpoint.clone(), handshakes)
+        });
         Ok(Self {
             endpoint,
             credentials,
             transport,
+            inbox,
         })
     }
 
@@ -99,32 +107,30 @@ impl QuicTransport {
             peer,
         }))
     }
+}
 
-    async fn next_connection(&self) -> Result<Box<dyn Connection>, TransportError> {
-        loop {
-            let incoming = self
-                .endpoint
-                .accept()
-                .await
-                .ok_or(TransportError::EndpointClosed)?;
-            let remote = incoming.remote_address();
-            match incoming.await {
-                Ok(connection) => match identity_of(&connection) {
-                    Ok(peer) => {
-                        return Ok(Box::new(QuicConnection {
-                            inner: connection,
-                            peer,
-                        }));
-                    }
-                    Err(err) => {
-                        tracing::warn!(%remote, error = %err, "quic peer without a node certificate");
-                        connection.close(VarInt::from_u32(1), b"no node certificate");
-                    }
-                },
+/// Hands every incoming connection to `handshakes` until the endpoint closes.
+async fn accept_loop(endpoint: quinn::Endpoint, handshakes: Handshakes) {
+    while let Some(incoming) = endpoint.accept().await {
+        let remote = incoming.remote_address();
+        let handshake = async move {
+            let connection = incoming.await.map_err(|err| TransportError::Handshake {
+                addr: remote,
+                reason: err.to_string(),
+            })?;
+            match identity_of(&connection) {
+                Ok(peer) => Ok(Box::new(QuicConnection {
+                    inner: connection,
+                    peer,
+                }) as Box<dyn Connection>),
                 Err(err) => {
-                    tracing::debug!(%remote, error = %err, "quic handshake refused");
+                    connection.close(VarInt::from_u32(1), b"no node certificate");
+                    Err(err.into())
                 }
             }
+        };
+        if !handshakes.run(remote, handshake).await {
+            return;
         }
     }
 }
@@ -167,7 +173,7 @@ impl Transport for QuicTransport {
     }
 
     fn accept(&self) -> BoxFuture<'_, Result<Box<dyn Connection>, TransportError>> {
-        Box::pin(self.next_connection())
+        Box::pin(self.inbox.next())
     }
 }
 

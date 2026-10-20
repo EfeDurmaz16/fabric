@@ -135,6 +135,10 @@ impl Endpoint {
     }
 
     /// Waits for the next connection from a paired peer on either transport.
+    ///
+    /// Both transports finish handshakes in the background and only queue
+    /// finished connections, so the transport that loses the race keeps
+    /// its connection for the next call.
     pub async fn accept(&self) -> Result<Box<dyn Connection>, TransportError> {
         tokio::select! {
             quic = self.quic.accept() => quic,

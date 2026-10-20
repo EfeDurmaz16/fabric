@@ -29,6 +29,7 @@ use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 
+use crate::accept::{Handshakes, Inbox};
 use crate::identity::NodeIdentity;
 use crate::pipe::{PipeReader, PipeWriter, pipe};
 use crate::tls::{Credentials, Refusal, TlsError, Trust, peer_of};
@@ -40,9 +41,6 @@ pub const MAX_MUX_PAYLOAD: usize = 64 << 10;
 /// How many bytes one logical stream buffers in each direction before the writer waits.
 pub const STREAM_BUFFER: usize = 1 << 20;
 
-/// How long an accepted connection may take to finish its TLS handshake.
-pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// How long a dial may take by default, TCP connect and TLS handshake together.
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -53,16 +51,16 @@ const OUT_QUEUE: usize = 64;
 
 /// A TCP listener that dials and accepts under one node identity.
 pub struct TcpTlsTransport {
-    listener: TcpListener,
-    acceptor: TlsAcceptor,
+    local_addr: SocketAddr,
     credentials: Arc<Credentials>,
     dial_timeout: Duration,
+    inbox: Inbox,
 }
 
 impl std::fmt::Debug for TcpTlsTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TcpTlsTransport")
-            .field("local_addr", &self.listener.local_addr().ok())
+            .field("local_addr", &self.local_addr)
             .finish_non_exhaustive()
     }
 }
@@ -77,15 +75,19 @@ impl TcpTlsTransport {
         addr: SocketAddr,
     ) -> Result<Self, TransportError> {
         let credentials = Arc::new(Credentials::new(identity)?);
-        let acceptor = TlsAcceptor::from(Arc::new(credentials.server_config(trust)?));
+        let acceptor = TlsAcceptor::from(Arc::new(credentials.server_config(Arc::clone(&trust))?));
         let std_listener = std::net::TcpListener::bind(addr)?;
         std_listener.set_nonblocking(true)?;
         let listener = TcpListener::from_std(std_listener)?;
+        let local_addr = listener.local_addr()?;
+        let inbox = Inbox::spawn(trust, |handshakes| {
+            accept_loop(listener, acceptor, handshakes)
+        });
         Ok(Self {
-            listener,
-            acceptor,
+            local_addr,
             credentials,
             dial_timeout: DIAL_TIMEOUT,
+            inbox,
         })
     }
 
@@ -142,35 +144,38 @@ impl TcpTlsTransport {
             addr,
         )))
     }
+}
 
-    async fn next_connection(&self) -> Result<Box<dyn Connection>, TransportError> {
-        loop {
-            let (tcp, remote) = self.listener.accept().await?;
-            if let Err(err) = tcp.set_nodelay(true) {
-                tracing::debug!(%remote, error = %err, "tcp nodelay refused");
+/// How long the accept loop waits after the listener fails, for example out of file descriptors.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Hands every accepted socket to `handshakes` until the transport is dropped.
+async fn accept_loop(listener: TcpListener, acceptor: TlsAcceptor, handshakes: Handshakes) {
+    loop {
+        let (tcp, remote) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                tracing::warn!(error = %err, "tcp accept failed");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+                continue;
             }
-            let accepted = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.acceptor.accept(tcp)).await;
-            match accepted {
-                Ok(Ok(tls)) => match peer_of(tls.get_ref().1.peer_certificates()) {
-                    Ok(peer) => {
-                        return Ok(Box::new(Mux::spawn(
-                            TlsStream::Server(tls),
-                            Side::Acceptor,
-                            peer,
-                            remote,
-                        )));
-                    }
-                    Err(err) => {
-                        tracing::warn!(%remote, error = %err, "tcp peer without a node certificate");
-                    }
-                },
-                Ok(Err(err)) => {
-                    tracing::debug!(%remote, error = %err, "tcp handshake refused");
-                }
-                Err(_) => {
-                    tracing::debug!(%remote, "tcp handshake timed out");
-                }
-            }
+        };
+        if let Err(err) = tcp.set_nodelay(true) {
+            tracing::debug!(%remote, error = %err, "tcp nodelay refused");
+        }
+        let acceptor = acceptor.clone();
+        let handshake = async move {
+            let tls = acceptor.accept(tcp).await?;
+            let peer = peer_of(tls.get_ref().1.peer_certificates())?;
+            Ok(Box::new(Mux::spawn(
+                TlsStream::Server(tls),
+                Side::Acceptor,
+                peer,
+                remote,
+            )) as Box<dyn Connection>)
+        };
+        if !handshakes.run(remote, handshake).await {
+            return;
         }
     }
 }
@@ -181,7 +186,7 @@ impl Transport for TcpTlsTransport {
     }
 
     fn local_addr(&self) -> Result<SocketAddr, TransportError> {
-        Ok(self.listener.local_addr()?)
+        Ok(self.local_addr)
     }
 
     fn connect(
@@ -193,7 +198,7 @@ impl Transport for TcpTlsTransport {
     }
 
     fn accept(&self) -> BoxFuture<'_, Result<Box<dyn Connection>, TransportError>> {
-        Box::pin(self.next_connection())
+        Box::pin(self.inbox.next())
     }
 }
 

@@ -216,6 +216,25 @@ async fn a_dial_to_the_wrong_node_id_fails_inside_the_handshake() -> TestResult 
     Ok(())
 }
 
+/// Any host that reaches the port can open a TCP connection and send
+/// nothing. That stalled handshake must not hold up a paired peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_silent_socket_does_not_hold_up_a_paired_dialer() -> TestResult {
+    let (a, b) = (Node::new()?, Node::new()?);
+    let server = b.bind(TransportKind::TcpTls, &[a.id()])?;
+    let client = a.bind(TransportKind::TcpTls, &[b.id()])?;
+    let _silent = tokio::net::TcpStream::connect(server.local_addr()?).await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (dialed, accepted) = tokio::join!(
+        client.connect(b.id(), server.local_addr()?),
+        tokio::time::timeout(Duration::from_secs(1), server.accept()),
+    );
+    dialed?;
+    assert_eq!(accepted??.peer(), a.id());
+    Ok(())
+}
+
 /// A refusal is final: the endpoint does not retry the wrong node over TCP.
 /// The server has no TCP listener, so a fallback would end in a refused
 /// TCP connection instead of the QUIC refusal.
@@ -225,10 +244,6 @@ async fn a_refused_dial_does_not_fall_back_to_tcp() -> TestResult {
     let quic_only = b.bind(TransportKind::Quic, &[a.id()])?;
     let trust: Arc<dyn Trust> = Arc::new(Paired(vec![b.id(), c.id()]));
     let client = Endpoint::bind(&a.identity, trust, ([127, 0, 0, 1], 0).into())?;
-    let _accepting = {
-        let quic_only = quic_only.clone();
-        tokio::spawn(async move { quic_only.accept().await })
-    };
     let err = client
         .dial(c.id(), quic_only.local_addr()?)
         .await
