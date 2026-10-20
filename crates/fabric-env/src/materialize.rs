@@ -62,6 +62,17 @@
 //! tree the first one is still writing. A process a step leaves behind
 //! with that input still open, such as a daemon that did not redirect it,
 //! holds the lock too, and resumes refuse until it exits.
+//!
+//! The reverse gap is open: a process the step starts with its own
+//! standard input does not hold the lock. npm runs dependency install
+//! scripts, such as a `node-gyp` build, with piped input, so if the
+//! installer alone is killed (the OOM killer, a force quit) while such a
+//! build still writes, the lock is released and the next resume can start
+//! `npm ci`, which deletes `node_modules` under it. Closing this needs the
+//! step's process group recorded next to the lock and checked by
+//! `acquire`, and asking whether a group is alive takes a system call that
+//! the standard library does not wrap and this crate's `forbid(unsafe_code)`
+//! rules out calling directly; ADR 0007 records the gap.
 
 use std::env;
 use std::ffi::{OsStr, OsString};
