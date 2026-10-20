@@ -14,7 +14,7 @@ use fabric_core::git::GitConfigKey;
 use fabric_core::id::{JobId, NodeId, SnapshotId};
 use fabric_core::path::RelPath;
 use fabric_core::snapshot::{
-    CacheClass, CacheEntry, CarryKey, CarryState, Entry, EntryKind, GitHead, Mode,
+    CacheClass, CacheEntry, CarryKey, CarryState, Entry, EntryKind, GitHead, ManifestError, Mode,
 };
 use fabric_store::capture::{
     BundleKind, BusyReason, CaptureError, CaptureRequest, Captured, IndexFlag, MAX_BUNDLE_CHAIN,
@@ -638,12 +638,12 @@ fn a_hostile_manifest_cannot_write_through_a_link_or_over_a_file() {
     ));
     assert!(!target.exists());
 
+    // A path in both trees is refused before it can publish.
     let mut over_file = manifest.clone();
     over_file.files = vec![entry("tracked.txt")];
-    let id = store.publish(&over_file).unwrap();
-    let err = restore_into(&store, id, &dir.path().join("t2")).unwrap_err();
+    let err = store.publish(&over_file).unwrap_err();
     assert!(
-        matches!(err, RestoreError::Write(WriteError::Collision { .. })),
+        matches!(&err, StoreError::Manifest(ManifestError::InBothTrees { path }) if path.as_str() == "tracked.txt"),
         "{err}"
     );
 
