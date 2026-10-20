@@ -17,6 +17,22 @@
 //! Claude Code session the host `claude` is one of them. procps `pgrep` on
 //! Linux includes ancestors already, and there `-a` changes the output, so
 //! the flag is passed on macOS only.
+//!
+//! A harness wired to the user's terminal never runs before its process
+//! group owns that terminal. A process in a group the terminal does not
+//! have in the foreground is stopped by `SIGTTOU` when it sets the
+//! terminal's modes and by `SIGTTIN` when it reads it, and the `SIGCONT`
+//! that lets it go on interrupts the call it was in: Codex 0.155.1 exited
+//! with "Interrupted system call" this way (gate finding F5). A process
+//! cannot be given the terminal between its fork and its exec without
+//! unsafe code, so when the standard input it inherits is a terminal, the
+//! harness starts behind a trampoline: `/bin/sh` stops itself with
+//! `SIGSTOP` and only then execs the harness, whose path and arguments
+//! reach it as positional parameters, never inside the script text.
+//! `spawn` returns once the trampoline has stopped, as `waitid` reports it,
+//! and the caller gives the group the terminal before `Running::release`
+//! continues it. The `SIGCONT` reaches the shell before its exec, so the
+//! harness itself never sees one.
 
 #![cfg_attr(
     not(all(feature = "acp", feature = "claude", feature = "codex")),
@@ -27,6 +43,7 @@
 )]
 
 use std::ffi::OsStr;
+use std::io::IsTerminal;
 use std::num::NonZeroU32;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -42,6 +59,18 @@ use crate::markers;
 
 /// How long a version probe may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The shell that holds a terminal harness before its exec.
+const TRAMPOLINE: &str = "/bin/sh";
+/// What the trampoline runs: stop, and once continued, become the harness.
+/// The harness's path and arguments are its positional parameters.
+const TRAMPOLINE_SCRIPT: &str = "kill -STOP $$ && exec \"$@\"";
+/// The trampoline's `$0`, which `ps` shows while it waits.
+const TRAMPOLINE_NAME: &str = "fabric-hold";
+/// How long the trampoline may take to stop itself.
+const HOLD_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often `spawn` asks whether the trampoline has stopped.
+const HOLD_POLL: Duration = Duration::from_millis(2);
 
 /// Where macOS and Linux keep `ps`.
 const PS: &[&str] = &["/bin/ps", "/usr/bin/ps"];
@@ -168,7 +197,8 @@ pub(crate) fn version_token(output: &str) -> Option<&str> {
 /// How a spawned process's stdio is wired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Wiring {
-    /// The user's terminal: stdin, stdout and stderr are inherited.
+    /// The user's terminal: stdin, stdout and stderr are inherited. When
+    /// stdin is a terminal, the process starts held (`spawn`).
     Terminal,
     /// Headless: no stdin, stdout and stderr captured.
     Piped,
@@ -185,17 +215,43 @@ impl From<&Launch> for Wiring {
     }
 }
 
+/// A process `spawn` started, in a process group it leads.
+pub(crate) struct Spawned {
+    /// The child.
+    pub(crate) child: Child,
+    /// Its pid, which is also its process group id.
+    pub(crate) pid: NonZeroU32,
+    /// True when it is the trampoline, stopped before its exec.
+    pub(crate) held: bool,
+}
+
 /// Starts `binary args...` in `cwd`, in a new process group, with `env`
 /// minus its parent-session markers, and the stdio `wiring` asks for.
-/// Returns the child and its pid.
-pub(crate) fn spawn(
+///
+/// With `Wiring::Terminal` and a terminal on this process's stdin, the
+/// process starts held: the trampoline runs in its place and this returns
+/// once it has stopped, so nothing of the harness has run yet. A
+/// trampoline that exits instead, or does not stop within `HOLD_TIMEOUT`,
+/// fails the spawn and its group is killed.
+pub(crate) async fn spawn(
     binary: &Path,
     args: &[String],
     cwd: &Path,
     env: &[(EnvVarName, String)],
     wiring: Wiring,
-) -> Result<(Child, NonZeroU32), HarnessError> {
-    let mut command = Command::new(binary);
+) -> Result<Spawned, HarnessError> {
+    let held = wiring == Wiring::Terminal && std::io::stdin().is_terminal();
+    let mut command = if held {
+        let mut trampoline = Command::new(TRAMPOLINE);
+        trampoline
+            .arg("-c")
+            .arg(TRAMPOLINE_SCRIPT)
+            .arg(TRAMPOLINE_NAME)
+            .arg(binary);
+        trampoline
+    } else {
+        Command::new(binary)
+    };
     command
         .args(args)
         .current_dir(cwd)
@@ -232,7 +288,63 @@ pub(crate) fn spawn(
         .id()
         .and_then(NonZeroU32::new)
         .ok_or_else(|| spawn_error(std::io::Error::other("the process had no pid after spawn")))?;
-    Ok((child, pid))
+    if held {
+        let guard = GroupGuard::new(pid);
+        wait_stopped(pid).await.map_err(spawn_error)?;
+        guard.disarm();
+    }
+    Ok(Spawned { child, pid, held })
+}
+
+/// Waits until the trampoline `pid` has stopped itself. It leaves the
+/// stop, and an exit, waitable (`WNOWAIT`): tokio reaps the child later
+/// and never asks for stops.
+async fn wait_stopped(pid: NonZeroU32) -> std::io::Result<()> {
+    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+    let raw = i32::try_from(pid.get()).map_err(std::io::Error::other)?;
+    let child = Pid::from_raw(raw).ok_or_else(|| std::io::Error::other("pid 0"))?;
+    let options = WaitIdOptions::STOPPED
+        | WaitIdOptions::EXITED
+        | WaitIdOptions::NOWAIT
+        | WaitIdOptions::NOHANG;
+    let deadline = tokio::time::Instant::now() + HOLD_TIMEOUT;
+    loop {
+        // The status holds raw pointers and is not `Send`, so it is read
+        // to plain values before the next await.
+        let ended = match waitid(WaitId::Pid(child), options)? {
+            Some(status) if status.stopped() => return Ok(()),
+            Some(status) => Some((status.exit_status(), status.terminating_signal())),
+            None => None,
+        };
+        if let Some((code, signal)) = ended {
+            return Err(std::io::Error::other(format!(
+                "the terminal hold ended before the harness started (exit status {code:?}, signal {signal:?})"
+            )));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("the terminal hold did not stop within {HOLD_TIMEOUT:?}"),
+            ));
+        }
+        tokio::time::sleep(HOLD_POLL).await;
+    }
+}
+
+/// Continues the process group `pgid`, as `Running::release` does for a held harness.
+pub(crate) fn continue_group(pgid: NonZeroU32) -> Result<(), HarnessError> {
+    use rustix::process::{Pid, Signal, kill_process_group};
+    let group = i32::try_from(pgid.get())
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| HarnessError::ProcessQuery {
+            program: "kill",
+            reason: format!("{pgid} is not a process group id"),
+        })?;
+    kill_process_group(group, Signal::CONT).map_err(|e| HarnessError::ProcessQuery {
+        program: "kill",
+        reason: format!("SIGCONT to group {pgid}: {e}"),
+    })
 }
 
 /// Sends `SIGKILL` to the process group `pgid` through `kill(1)`; the

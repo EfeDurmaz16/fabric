@@ -9,7 +9,9 @@
 //! neither (ADR 0003, Who supervises the harness): it materializes the
 //! environment, launches the harness in its own process group, tells the
 //! daemon, which records `Resumed` under the planned epoch or refuses, and
-//! waits for the harness to exit.
+//! waits for the harness to exit. An interactive harness launched from a
+//! terminal is held before its exec until the daemon has recorded it and
+//! its group owns the terminal (`terminal`).
 //!
 //! The exit code says what happened without parsing text (ADR 0016, Exit
 //! codes): 0 for success, the harness's own code when it exits, 128 plus
@@ -40,6 +42,8 @@ use fabricd::control::{
 use fabricd::harnesses::{HarnessConfig, HarnessEnv, acp_adapter, parse_harness};
 use fabricd::node::{Node, NodeConfig};
 use fabricd::paths::{STATE_DIR_ENV, StateDir};
+
+mod terminal;
 
 /// Move a development job between your machines and harnesses.
 #[derive(Debug, Parser)]
@@ -479,7 +483,7 @@ async fn launch(
         HarnessConfig::load(&state.harness_config())?,
     )?;
     let first = prompt.or_else(|| resume.is_none().then(|| plan.goal.clone()));
-    let (mut running, interactive) = match &plan.harness {
+    let mut running = match &plan.harness {
         HarnessKind::ClaudeCode => {
             let claude = ClaudeCode::new(harness_env.home.clone(), harness_env.path_var.clone());
             let trust = claude.preseed_trust(&plan.root, &env).await?;
@@ -488,7 +492,7 @@ async fn launch(
                 resume,
                 prompt: first,
             };
-            (claude.launch(&plan.root, launch, &env).await?, true)
+            claude.launch(&plan.root, launch, &env).await?
         }
         HarnessKind::Codex => {
             let codex = Codex::new(harness_env.home.clone(), harness_env.path_var.clone());
@@ -496,7 +500,7 @@ async fn launch(
                 resume,
                 prompt: first,
             };
-            (codex.launch(&plan.root, launch, &env).await?, true)
+            codex.launch(&plan.root, launch, &env).await?
         }
         HarnessKind::Acp { program, args } => {
             let agent = acp_adapter(program, args, &harness_env)?;
@@ -504,7 +508,7 @@ async fn launch(
                 resume,
                 prompt: first.unwrap_or_else(|| "Continue.".to_owned()),
             };
-            (agent.launch(&plan.root, launch, &env).await?, false)
+            agent.launch(&plan.root, launch, &env).await?
         }
     };
     let pid = running.pid();
@@ -546,10 +550,18 @@ async fn launch(
             bail!("the node could not record the launch, so the harness was stopped: {e}");
         }
     }
-    if interactive {
-        give_terminal(&running);
+    // A held harness has not run yet: it gets the terminal first, then starts.
+    let handed = if running.is_held() {
+        terminal::hand_over(pid)
+    } else {
+        None
+    };
+    if let Err(e) = running.release() {
+        kill_group(&running);
+        return Err(e.into());
     }
     let status = running.child_mut().wait().await?;
+    drop(handed);
     exited(&socket, plan, pid, status).await
 }
 
@@ -690,27 +702,6 @@ fn environment() -> Vec<(EnvVarName, String)> {
             Some((name, value.into_string().ok()?))
         })
         .collect()
-}
-
-/// Makes the harness's process group the terminal's foreground group, so it can read the keyboard.
-///
-/// The harness starts in a group of its own, so the node can kill exactly
-/// it on fencing; without this, its first read of the terminal would stop
-/// it. The shell takes the terminal back when this command exits.
-fn give_terminal(running: &Running) {
-    let stdin = std::io::stdin();
-    if !rustix::termios::isatty(&stdin) {
-        return;
-    }
-    let Some(group) = pid_of(running) else {
-        return;
-    };
-    if let Err(e) = rustix::termios::tcsetpgrp(&stdin, group) {
-        tracing::warn!(error = %e, "the harness could not take the terminal");
-        return;
-    }
-    // A read before the hand-over stopped it; let it go on.
-    let _ = rustix::process::kill_process_group(group, rustix::process::Signal::CONT);
 }
 
 fn kill_group(running: &Running) {

@@ -692,7 +692,7 @@ impl ClaudeCode {
         SessionId::from_uuid(uuid::Uuid::new_v4())
     }
 
-    fn launch_impl(
+    async fn launch_impl(
         &self,
         workspace: &Path,
         launch: &Launch,
@@ -705,10 +705,10 @@ impl ClaudeCode {
             refuse_secret_overlay(Path::new(overlay.as_str()))?;
         }
         let (session, args) = self.args_for(launch, Self::fresh_session);
-        let (child, pid) =
-            process::spawn(&binary, &args, pipeline::fs_path(&root), env, launch.into())?;
-        info!(%session, %pid, "claude: launched");
-        Ok(Running::new(pid, Some(session), child))
+        let spawned =
+            process::spawn(&binary, &args, pipeline::fs_path(&root), env, launch.into()).await?;
+        info!(%session, pid = %spawned.pid, held = spawned.held, "claude: launched");
+        Ok(Running::new(Some(session), spawned))
     }
 }
 
@@ -768,7 +768,7 @@ impl Harness for ClaudeCode {
         launch: Launch,
         env: &'a [(EnvVarName, String)],
     ) -> BoxFuture<'a, Result<Running, HarnessError>> {
-        Box::pin(async move { self.launch_impl(workspace, &launch, env) })
+        Box::pin(async move { self.launch_impl(workspace, &launch, env).await })
     }
 }
 

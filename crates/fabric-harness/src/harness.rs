@@ -127,10 +127,16 @@ impl Launch {
 /// A harness process this node started, in a process group of its own.
 /// Only this crate builds one, from a child it spawned, so the pid is
 /// real and is also the process group id.
+///
+/// A `Launch::Interactive` run whose standard input is a terminal starts
+/// held: a trampoline, stopped before it execs the harness, so the harness
+/// never touches the terminal before its group owns it. The caller makes
+/// the group the terminal's foreground group, then calls `release`.
 pub struct Running {
     pid: NonZeroU32,
     session: Option<SessionId>,
     child: Child,
+    held: bool,
 }
 
 impl std::fmt::Debug for Running {
@@ -138,6 +144,7 @@ impl std::fmt::Debug for Running {
         f.debug_struct("Running")
             .field("pid", &self.pid)
             .field("session", &self.session)
+            .field("held", &self.held)
             .finish_non_exhaustive()
     }
 }
@@ -145,12 +152,31 @@ impl std::fmt::Debug for Running {
 impl Running {
     /// Wraps a child that `process::spawn` started in a new process group.
     #[cfg(any(feature = "acp", feature = "claude", feature = "codex"))]
-    pub(crate) fn new(pid: NonZeroU32, session: Option<SessionId>, child: Child) -> Self {
+    pub(crate) fn new(session: Option<SessionId>, spawned: crate::process::Spawned) -> Self {
         Running {
-            pid,
+            pid: spawned.pid,
             session,
-            child,
+            child: spawned.child,
+            held: spawned.held,
         }
+    }
+
+    /// True while the harness waits, stopped before its exec, for its
+    /// process group to be given the terminal.
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        self.held
+    }
+
+    /// Lets a held harness start by continuing its process group; the
+    /// trampoline then execs the harness. Call it once the group is the
+    /// terminal's foreground group. A harness that is not held is left alone.
+    pub fn release(&mut self) -> Result<(), HarnessError> {
+        if self.held {
+            crate::process::continue_group(self.pid)?;
+            self.held = false;
+        }
+        Ok(())
     }
 
     /// The process id, which is also the id of the process group the

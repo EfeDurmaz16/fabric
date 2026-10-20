@@ -636,7 +636,7 @@ impl Codex {
         Ok(args)
     }
 
-    fn launch_impl(
+    async fn launch_impl(
         &self,
         workspace: &Path,
         launch: &Launch,
@@ -647,10 +647,10 @@ impl Codex {
         let binary = self.binary()?;
         let args = self.args_for(&root, launch)?;
         let session = launch.resume().cloned();
-        let (child, pid) =
-            process::spawn(&binary, &args, pipeline::fs_path(&root), env, launch.into())?;
-        info!(?session, %pid, "codex: launched");
-        Ok(Running::new(pid, session, child))
+        let spawned =
+            process::spawn(&binary, &args, pipeline::fs_path(&root), env, launch.into()).await?;
+        info!(?session, pid = %spawned.pid, held = spawned.held, "codex: launched");
+        Ok(Running::new(session, spawned))
     }
 }
 
@@ -699,7 +699,7 @@ impl Harness for Codex {
         launch: Launch,
         env: &'a [(EnvVarName, String)],
     ) -> BoxFuture<'a, Result<Running, HarnessError>> {
-        Box::pin(async move { self.launch_impl(workspace, &launch, env) })
+        Box::pin(async move { self.launch_impl(workspace, &launch, env).await })
     }
 }
 
