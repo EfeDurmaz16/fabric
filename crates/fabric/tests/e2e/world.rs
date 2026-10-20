@@ -117,7 +117,8 @@ impl Env {
             .collect())
     }
 
-    fn command(&self, program: &str, state: &Path) -> Command {
+    /// A command for `program` with the environment every process of the test runs with.
+    pub fn command(&self, program: &str, state: &Path) -> Command {
         let mut command = Command::new(program);
         command
             .env_clear()
