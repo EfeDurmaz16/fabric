@@ -27,6 +27,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use fabric_core::env::{
@@ -1027,30 +1028,80 @@ fn rel(path: &'static str) -> Result<RelPath, DetectError> {
 /// Returns whether something named `file` exists under `root`, a link included; an error other than "not found" is an error.
 ///
 /// A link counts as present because the snapshot carries it as a link, so
-/// every node answers the same; what it points at is never read here.
+/// every node answers the same; what it points at is never read here. A
+/// directory on the way that is a link, such as `.devcontainer -> ..`,
+/// means `file` is not in the workspace, so it counts as absent.
 fn exists(root: &Path, file: &'static str) -> Result<bool, DetectError> {
-    match fs::symlink_metadata(root.join(file)) {
+    let Some(full) = inside(root, file)? else {
+        return Ok(false);
+    };
+    match fs::symlink_metadata(full) {
         Ok(_) => Ok(true),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(source) => Err(DetectError::Read { file, source }),
     }
 }
 
+/// Returns `root/file` when every directory on the way is a real directory, or `None` when one is missing or a link.
+fn inside(root: &Path, file: &'static str) -> Result<Option<PathBuf>, DetectError> {
+    let mut full = root.to_path_buf();
+    let mut components = file.split('/').peekable();
+    while let Some(component) = components.next() {
+        full.push(component);
+        if components.peek().is_none() {
+            break;
+        }
+        match fs::symlink_metadata(&full) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Ok(None),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(DetectError::Read { file, source }),
+        }
+    }
+    Ok(Some(full))
+}
+
 /// Reads the regular file `file` under `root` as UTF-8, or `None` when nothing is there.
 ///
-/// A link is refused rather than followed: `.nvmrc -> .env` would put a
-/// secret into the spec, and `.nvmrc -> ../../.nvmrc` would give two
-/// nodes two specs from one workspace.
+/// No component may be a link: `.nvmrc -> .env` would put a secret into
+/// the spec, `.nvmrc -> ../../.nvmrc` would give two nodes two specs from
+/// one workspace, and `.fabric -> ../other/.fabric` would read another
+/// workspace's override file. The file is opened by path and then checked
+/// on the open handle: it must be the same regular file the link check
+/// saw, by device and inode, and the directories on the way must still be
+/// real ones. That closes the window between the check and the open
+/// without `O_NOFOLLOW`, which std does not name and which would cover the
+/// last component only.
 fn read_text(root: &Path, file: &'static str) -> Result<Option<String>, DetectError> {
     let read_err = |source| DetectError::Read { file, source };
+    let not_regular = || DetectError::NotARegularFile { file };
+    let mut parents = file.split('/').collect::<Vec<_>>();
+    parents.pop();
+    let mut dir = root.to_path_buf();
+    for parent in &parents {
+        dir.push(parent);
+        match fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Err(not_regular()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(read_err(err)),
+        }
+    }
     let full = root.join(file);
-    match fs::symlink_metadata(&full) {
-        Ok(meta) if meta.is_file() => {}
-        Ok(_) => return Err(DetectError::NotARegularFile { file }),
+    let seen = match fs::symlink_metadata(&full) {
+        Ok(meta) if meta.is_file() => meta,
+        Ok(_) => return Err(not_regular()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(read_err(err)),
-    }
+    };
     let handle = fs::File::open(&full).map_err(read_err)?;
+    let opened = handle.metadata().map_err(read_err)?;
+    if !opened.is_file() || opened.dev() != seen.dev() || opened.ino() != seen.ino() {
+        return Err(not_regular());
+    }
+    if inside(root, file)?.is_none() {
+        return Err(not_regular());
+    }
     let mut bytes = Vec::new();
     handle
         .take(MAX_FILE_LEN + 1)

@@ -537,6 +537,23 @@ fn a_linked_pin_file_is_refused_without_reading_it() {
     }
 }
 
+/// A link anywhere on the way is refused, not only in the last component:
+/// `.fabric -> ../other/.fabric` would read another workspace's setup steps.
+#[test]
+fn a_linked_override_directory_is_refused() {
+    let other = workspace(&[(
+        ".fabric/env.toml",
+        "[[setup]]\nprogram = \"sh\"\nargs = [\"-c\", \"echo other\"]\n",
+    )])
+    .unwrap();
+    let dir = workspace(&[]).unwrap();
+    symlink(other.path().join(".fabric"), dir.path().join(".fabric")).unwrap();
+    match detect(dir.path(), None) {
+        Err(DetectError::NotARegularFile { file }) => assert_eq!(file, ".fabric/env.toml"),
+        other => panic!("{other:?}"),
+    }
+}
+
 /// A pin travels in the spec like a setup argument does, so the same
 /// credential guard applies, from a detected file and from the override file.
 #[test]
