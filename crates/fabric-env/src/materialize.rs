@@ -190,7 +190,7 @@ fn cannot_run_list(programs: &[(usize, ProgramName)], env: &[EnvVarName]) -> Str
 /// What materialize found at one cache path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheHealth {
-    /// A non-empty directory with its installer's marker, when it has one.
+    /// A non-empty directory with the proof its completion needs, when it needs one.
     Healthy,
     /// Nothing at the path.
     Missing,
@@ -198,9 +198,9 @@ pub enum CacheHealth {
     NotADirectory,
     /// An empty directory.
     Empty,
-    /// A directory with content and none of the markers its installer writes last.
+    /// A directory with content and none of the files that prove its filling finished.
     Incomplete {
-        /// The markers any one of which would make it healthy.
+        /// The files any one of which would make it healthy: installer markers or `SENTINEL`.
         expected: &'static [&'static str],
     },
 }

@@ -109,7 +109,7 @@ fn a_finished_install_runs_nothing() {
 }
 
 /// An install killed halfway leaves packages without the marker the
-/// manager writes last; the next plan installs again.
+/// manager writes as it finishes; the next plan installs again.
 #[test]
 fn a_torn_install_runs_again() {
     let dir = copy_fixture("node-pnpm").unwrap();
