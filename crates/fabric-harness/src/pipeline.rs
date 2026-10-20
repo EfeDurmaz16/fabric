@@ -244,7 +244,7 @@ pub(crate) fn confirm_departure(
 
 /// Refuses `dest` when it, or any directory between `home` and it, is a
 /// symlink. `home` itself may be one; what the adapter owns starts below it.
-fn refuse_symlinks(home: &Path, dest: &Path) -> Result<(), HarnessError> {
+pub(crate) fn refuse_symlinks(home: &Path, dest: &Path) -> Result<(), HarnessError> {
     let below = dest
         .strip_prefix(home)
         .map_err(|_| HarnessError::NotUnderHome {

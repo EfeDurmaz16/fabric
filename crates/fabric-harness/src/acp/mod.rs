@@ -198,6 +198,10 @@ impl AcpHarness {
     ) -> Result<StateManifest, HarnessError> {
         self.refuse_secret_args()?;
         let (dir, rel_parts) = self.state_rel()?;
+        // The walk refuses symlinks below the directory but follows the
+        // directory itself, so a linked state root or a linked directory
+        // above it would carry files from outside the home.
+        pipeline::refuse_symlinks(self.home_dir(), &dir)?;
         let mut sources = Vec::new();
         for file in pipeline::walk(&dir)? {
             let file_parts = pipeline::rel_components(&file)?;

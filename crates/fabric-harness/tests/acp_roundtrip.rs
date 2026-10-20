@@ -502,6 +502,25 @@ async fn a_secret_in_the_launch_arguments_refuses_the_capture() {
     assert!(!out.path().join("manifest.json").exists());
 }
 
+#[tokio::test]
+async fn a_symlinked_state_directory_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(elsewhere.path().join("fake-9.json"), "{}\n").unwrap();
+    std::fs::create_dir_all(home.path().join(".fake-agent")).unwrap();
+    let state_dir = home.path().join(".fake-agent/sessions");
+    std::os::unix::fs::symlink(elsewhere.path(), &state_dir).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let err = adapter(home.path(), PermissionPolicy::Deny)
+        .capture(&work, &SessionId::parse("fake-9").unwrap(), out.path())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HarnessError::SymlinkInState { .. }), "{err}");
+    assert!(!out.path().join("manifest.json").exists());
+}
+
 /// Writes session `fake-9` with `escaped` as the JSON text of a prompt and
 /// asserts that capture refuses it at that line.
 async fn assert_state_refused(escaped: &str) {
