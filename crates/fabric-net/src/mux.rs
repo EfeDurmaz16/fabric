@@ -49,10 +49,44 @@ pub const STREAM_BUFFER: usize = 1 << 20;
 pub const MAX_STREAMS: usize = 100;
 
 const HEADER_LEN: usize = 9;
-const KIND_DATA: u8 = 0;
-const KIND_FIN: u8 = 1;
-const KIND_RESET: u8 = 2;
 const OUT_QUEUE: usize = 64;
+
+/// What one multiplexer frame does to its stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FrameKind {
+    /// Carries the stream's next bytes.
+    Data,
+    /// Ends the sender's direction of the stream.
+    Fin,
+    /// The sender's reader is gone; stop sending on the stream.
+    Reset,
+}
+
+impl FrameKind {
+    fn byte(self) -> u8 {
+        match self {
+            FrameKind::Data => 0,
+            FrameKind::Fin => 1,
+            FrameKind::Reset => 2,
+        }
+    }
+}
+
+impl TryFrom<u8> for FrameKind {
+    type Error = io::Error;
+
+    fn try_from(byte: u8) -> Result<Self, Self::Error> {
+        match byte {
+            0 => Ok(FrameKind::Data),
+            1 => Ok(FrameKind::Fin),
+            2 => Ok(FrameKind::Reset),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("mux frame kind {other} is unknown"),
+            )),
+        }
+    }
+}
 
 /// Which end of the connection this side is; it fixes which stream ids it opens.
 #[derive(Debug, Clone, Copy)]
@@ -78,12 +112,12 @@ impl Side {
 
 struct Outgoing {
     id: u32,
-    kind: u8,
+    kind: FrameKind,
     payload: Vec<u8>,
 }
 
 impl Outgoing {
-    fn bare(id: u32, kind: u8) -> Self {
+    fn bare(id: u32, kind: FrameKind) -> Self {
         Self {
             id,
             kind,
@@ -306,11 +340,11 @@ async fn pump_local(shared: Arc<Shared>, source: PipeReader, inbound: PipeWriter
         // Queued under the id lock, so ids reach the wire in rising order.
         let only_fin = first.is_empty();
         let frame = if only_fin {
-            Outgoing::bare(id, KIND_FIN)
+            Outgoing::bare(id, FrameKind::Fin)
         } else {
             Outgoing {
                 id,
-                kind: KIND_DATA,
+                kind: FrameKind::Data,
                 payload: first,
             }
         };
@@ -339,12 +373,12 @@ async fn send_rest(shared: &Shared, id: u32, source: PipeReader, mut stop: onesh
             // The slot goes before the Fin, so a peer that saw the Fin
             // never counts this stream against the cap.
             shared.streams().outbound.remove(&id);
-            let _ = shared.out.send(Outgoing::bare(id, KIND_FIN)).await;
+            let _ = shared.out.send(Outgoing::bare(id, FrameKind::Fin)).await;
             return;
         }
         let frame = Outgoing {
             id,
-            kind: KIND_DATA,
+            kind: FrameKind::Data,
             payload: taken,
         };
         tokio::select! {
@@ -385,7 +419,7 @@ async fn write_loop(
         };
         let mut bytes = Vec::with_capacity(HEADER_LEN + frame.payload.len());
         bytes.extend_from_slice(&frame.id.to_le_bytes());
-        bytes.push(frame.kind);
+        bytes.push(frame.kind.byte());
         bytes.extend_from_slice(&len.to_le_bytes());
         bytes.extend_from_slice(&frame.payload);
         if let Err(err) = wire.write_all(&bytes).await {
@@ -428,7 +462,7 @@ async fn demux(
         let mut header = [0u8; HEADER_LEN];
         wire.read_exact(&mut header).await?;
         let id = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-        let kind = header[4];
+        let kind = FrameKind::try_from(header[4])?;
         let len = u32::from_le_bytes([header[5], header[6], header[7], header[8]]) as usize;
         if len > MAX_MUX_PAYLOAD {
             return Err(io::Error::new(
@@ -439,11 +473,11 @@ async fn demux(
         let mut payload = vec![0u8; len];
         wire.read_exact(&mut payload).await?;
         match kind {
-            KIND_DATA | KIND_FIN => {
+            FrameKind::Data | FrameKind::Fin => {
                 if !shared.side.opens(id) && id > shared.streams().peer_high {
                     accept_stream(shared, id, alive, incoming).await;
                 }
-                if kind == KIND_FIN {
+                if kind == FrameKind::Fin {
                     let finished = shared.streams().inbound.remove(&id);
                     if let Some(stream) = finished {
                         stream.finish();
@@ -452,14 +486,8 @@ async fn demux(
                     deliver(shared, id, &payload).await;
                 }
             }
-            KIND_RESET => {
+            FrameKind::Reset => {
                 shared.streams().outbound.remove(&id);
-            }
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("mux frame kind {other} is unknown"),
-                ));
             }
         }
     }
@@ -478,7 +506,7 @@ async fn accept_stream(
         alive.upgrade(),
     ) else {
         tracing::debug!(id, "refusing a peer stream over the cap");
-        let _ = shared.out.send(Outgoing::bare(id, KIND_RESET)).await;
+        let _ = shared.out.send(Outgoing::bare(id, FrameKind::Reset)).await;
         return;
     };
     let slot = Arc::new(Slot {
@@ -527,7 +555,7 @@ async fn deliver(shared: &Shared, id: u32, payload: &[u8]) {
 /// Forgets the inbound half of `id` and tells the peer to stop sending on it.
 async fn reset(shared: &Shared, id: u32) {
     shared.streams().inbound.remove(&id);
-    let _ = shared.out.send(Outgoing::bare(id, KIND_RESET)).await;
+    let _ = shared.out.send(Outgoing::bare(id, FrameKind::Reset)).await;
 }
 
 impl Connection for Mux {
@@ -579,15 +607,15 @@ mod tests {
     struct RawPeer(DuplexStream);
 
     impl RawPeer {
-        async fn send(&mut self, id: u32, kind: u8, payload: &[u8]) {
+        async fn send(&mut self, id: u32, kind: FrameKind, payload: &[u8]) {
             let mut bytes = id.to_le_bytes().to_vec();
-            bytes.push(kind);
+            bytes.push(kind.byte());
             bytes.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
             bytes.extend_from_slice(payload);
             self.0.write_all(&bytes).await.unwrap();
         }
 
-        async fn recv(&mut self) -> (u32, u8, Vec<u8>) {
+        async fn recv(&mut self) -> (u32, FrameKind, Vec<u8>) {
             let mut header = [0u8; HEADER_LEN];
             self.0.read_exact(&mut header).await.unwrap();
             let len = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
@@ -595,7 +623,7 @@ mod tests {
             self.0.read_exact(&mut payload).await.unwrap();
             (
                 u32::from_le_bytes(header[..4].try_into().unwrap()),
-                header[4],
+                FrameKind::try_from(header[4]).unwrap(),
                 payload,
             )
         }
@@ -621,18 +649,21 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_stream_never_comes_back_and_its_peer_is_reset_once() {
         let (mux, mut raw) = acceptor_and_raw();
-        raw.send(1, KIND_DATA, b"request").await;
+        raw.send(1, FrameKind::Data, b"request").await;
         let stream = mux.next().await.unwrap();
         drop(stream);
         for _ in 0..3 {
-            raw.send(1, KIND_DATA, b"more").await;
+            raw.send(1, FrameKind::Data, b"more").await;
         }
         assert!(nothing_from_next(&mux).await, "a closed id came back");
         let mut answers = vec![raw.recv().await, raw.recv().await];
         answers.sort_unstable();
         assert_eq!(
             answers,
-            [(1, KIND_FIN, Vec::new()), (1, KIND_RESET, Vec::new())],
+            [
+                (1, FrameKind::Fin, Vec::new()),
+                (1, FrameKind::Reset, Vec::new())
+            ],
             "the dropped writer finishes and the dropped reader resets"
         );
         assert!(
@@ -651,7 +682,7 @@ mod tests {
             .map(|n| 2 * n + 1)
             .collect();
         for id in &ids {
-            raw.send(*id, KIND_DATA, b"x").await;
+            raw.send(*id, FrameKind::Data, b"x").await;
         }
         let mut held = Vec::new();
         for _ in 0..MAX_STREAMS {
@@ -659,7 +690,7 @@ mod tests {
         }
         assert!(nothing_from_next(&mux).await);
         let over = *ids.last().unwrap();
-        assert_eq!(raw.recv().await, (over, KIND_RESET, Vec::new()));
+        assert_eq!(raw.recv().await, (over, FrameKind::Reset, Vec::new()));
     }
 
     /// A reset from the peer stops this side's writer instead of letting it send into nothing.
@@ -669,8 +700,8 @@ mod tests {
         let mut stream = mux.open().await.unwrap();
         stream.write_all(b"first").await.unwrap();
         let (id, kind, _) = raw.recv().await;
-        assert_eq!(kind, KIND_DATA);
-        raw.send(id, KIND_RESET, &[]).await;
+        assert_eq!(kind, FrameKind::Data);
+        raw.send(id, FrameKind::Reset, &[]).await;
         let chunk = vec![0u8; 64 << 10];
         let mut failed = None;
         for _ in 0..64 {
