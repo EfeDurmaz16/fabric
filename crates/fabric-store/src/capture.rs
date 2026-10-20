@@ -123,6 +123,24 @@ impl std::fmt::Display for BusyReason {
     }
 }
 
+/// A ref or `HEAD` that moved while capture made the bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MovedRef {
+    /// `HEAD`.
+    Head,
+    /// A ref under `refs/`.
+    Ref(RefName),
+}
+
+impl std::fmt::Display for MovedRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MovedRef::Head => f.write_str("HEAD"),
+            MovedRef::Ref(name) => f.write_str(name.as_str()),
+        }
+    }
+}
+
 /// What capture saw, next to the manifest.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CaptureReport {
@@ -248,13 +266,13 @@ pub enum CaptureError {
     #[error("submodule {path} has local changes")]
     GitSubmoduleDirty {
         /// The submodule path.
-        path: String,
+        path: RelPath,
     },
     /// A path has the LFS filter; the working-tree commit would hold pointers.
     #[error("{path} has filter=lfs, which capture does not support")]
     GitLfsUnsupported {
         /// The first path git says the filter applies to.
-        path: String,
+        path: RelPath,
     },
     /// Untracked files above the limit would enter the user's object store.
     #[error(
@@ -277,10 +295,10 @@ pub enum CaptureError {
         path: RelPath,
     },
     /// A ref or `HEAD` moved while the bundle was made; capture again.
-    #[error("{name} moved while capture ran; capture again")]
+    #[error("{moved} moved while capture ran; capture again")]
     RefsMoved {
         /// The ref that moved, or `HEAD`.
-        name: String,
+        moved: MovedRef,
     },
     /// The parent snapshot belongs to another job.
     #[error("parent snapshot {parent} belongs to job {job}")]
@@ -697,6 +715,22 @@ struct RefView {
     head: GitHead,
 }
 
+impl RefView {
+    /// Names what differs in `later`: `HEAD` first, then the first ref by name.
+    fn moved_in(&self, later: &RefView) -> Option<MovedRef> {
+        if self.head != later.head {
+            return Some(MovedRef::Head);
+        }
+        self.refs
+            .iter()
+            .chain(&later.refs)
+            .filter(|r| !self.refs.contains(r) || !later.refs.contains(r))
+            .map(|(name, _)| name)
+            .min()
+            .map(|name| MovedRef::Ref(name.clone()))
+    }
+}
+
 /// The bundle capture tries to make.
 enum BundlePlan {
     /// Every object the refs reach.
@@ -858,7 +892,7 @@ impl GitCapture<'_> {
             let sub = fields.next().unwrap_or("");
             if sub.starts_with('S') && sub[1..].chars().any(|c| c != '.') {
                 // The path is the ninth field and, under -z, may hold spaces.
-                let path = text.splitn(9, ' ').nth(8).unwrap_or("").to_owned();
+                let path = rel_path(text.splitn(9, ' ').nth(8).unwrap_or(""))?;
                 return Err(CaptureError::GitSubmoduleDirty { path });
             }
         }
@@ -879,8 +913,9 @@ impl GitCapture<'_> {
         let fields: Vec<&[u8]> = attrs.split(|b| *b == 0).collect();
         for triple in fields.chunks_exact(3) {
             if triple[2] == b"lfs" {
+                let text = Git::text("lfs path", triple[0])?;
                 return Err(CaptureError::GitLfsUnsupported {
-                    path: String::from_utf8_lossy(triple[0]).into_owned(),
+                    path: rel_path(text)?,
                 });
             }
         }
@@ -1151,10 +1186,8 @@ impl GitCapture<'_> {
     fn bundle_with_refs(&self, plan: &BundlePlan) -> Result<(BuiltBundle, RefView), CaptureError> {
         let view = self.ref_view()?;
         let built = self.bundle(plan)?;
-        if self.ref_view()? != view {
-            return Err(CaptureError::RefsMoved {
-                name: "a ref or HEAD".to_owned(),
-            });
+        if let Some(moved) = view.moved_in(&self.ref_view()?) {
+            return Err(CaptureError::RefsMoved { moved });
         }
         self.confirm_bundle(&built, &view, plan.tips())?;
         Ok((built, view))
@@ -1184,37 +1217,56 @@ impl GitCapture<'_> {
             }
             BuiltBundle::Empty { .. } => BTreeMap::new(),
         };
-        let mut wanted: Vec<(String, &GitOid)> = view
+        let moved = |moved: &MovedRef| CaptureError::RefsMoved {
+            moved: moved.clone(),
+        };
+        let mut wanted: Vec<(MovedRef, &GitOid)> = view
             .refs
             .iter()
-            .map(|(name, oid)| (name.as_str().to_owned(), oid))
+            .map(|(name, oid)| (MovedRef::Ref(name.clone()), oid))
             .collect();
         if let GitHead::Detached(oid) = &view.head {
-            wanted.push(("HEAD".to_owned(), oid));
+            wanted.push((MovedRef::Head, oid));
         }
         let mut left_out = Vec::new();
         for (name, oid) in &wanted {
-            match listed.get(name) {
+            match listed.get(&name.to_string()) {
                 Some(seen) if seen == oid.as_str() => {}
-                Some(_) => return Err(CaptureError::RefsMoved { name: name.clone() }),
-                None if matches!(built, BuiltBundle::Full(_)) => {
-                    return Err(CaptureError::RefsMoved { name: name.clone() });
-                }
+                Some(_) => return Err(moved(name)),
+                None if matches!(built, BuiltBundle::Full(_)) => return Err(moved(name)),
                 None => left_out.push((name, *oid)),
             }
         }
         for name in listed.keys() {
-            if name != "HEAD" && !wanted.iter().any(|(n, _)| n == name) {
-                return Err(CaptureError::RefsMoved { name: name.clone() });
+            if name != "HEAD" && !wanted.iter().any(|(n, _)| n.to_string() == *name) {
+                let name = RefName::parse(name).map_err(GitError::from)?;
+                return Err(moved(&MovedRef::Ref(name)));
             }
         }
-        if left_out.is_empty() {
-            return Ok(());
+        if self.reaches_beyond(left_out.iter().map(|(_, oid)| *oid), tips)? {
+            // Name the ref; this is the failure path, so one git run per ref is fine.
+            for (name, oid) in &left_out {
+                if self.reaches_beyond([*oid], tips)? {
+                    return Err(moved(name));
+                }
+            }
         }
+        Ok(())
+    }
+
+    /// True when `from` reaches a commit that no tip in `tips` reaches.
+    fn reaches_beyond<'o>(
+        &self,
+        from: impl IntoIterator<Item = &'o GitOid>,
+        tips: &[GitOid],
+    ) -> Result<bool, CaptureError> {
         let mut input = String::new();
-        for (_, oid) in &left_out {
+        for oid in from {
             input.push_str(oid.as_str());
             input.push('\n');
+        }
+        if input.is_empty() {
+            return Ok(false);
         }
         for tip in tips {
             input.push('^');
@@ -1224,15 +1276,7 @@ impl GitCapture<'_> {
         let out = self
             .git
             .run_stdin_env(&["rev-list", "--stdin", "-n1"], &[], input.as_bytes())?;
-        let unreached = String::from_utf8_lossy(&out).trim().to_owned();
-        if unreached.is_empty() {
-            return Ok(());
-        }
-        let name = left_out
-            .iter()
-            .find(|(_, oid)| oid.as_str() == unreached)
-            .map_or(unreached.clone(), |(name, _)| (*name).clone());
-        Err(CaptureError::RefsMoved { name })
+        Ok(!out.trim_ascii().is_empty())
     }
 
     fn delete_older_snap_refs(&self, current: &GitOid) -> Result<(), CaptureError> {
@@ -1684,7 +1728,7 @@ mod tests {
         let moved = gc.ref_view().unwrap();
         assert!(matches!(
             gc.confirm_bundle(&full, &moved, &[]),
-            Err(CaptureError::RefsMoved { name }) if name == "refs/heads/main"
+            Err(CaptureError::RefsMoved { moved: MovedRef::Ref(name) }) if name.as_str() == "refs/heads/main"
         ));
 
         let tips: Vec<GitOid> = moved.refs.iter().map(|(_, oid)| oid.clone()).collect();
@@ -1703,7 +1747,7 @@ mod tests {
         let grown = gc.ref_view().unwrap();
         assert!(matches!(
             gc.confirm_bundle(&incremental, &grown, &tips),
-            Err(CaptureError::RefsMoved { name }) if name == "refs/heads/side"
+            Err(CaptureError::RefsMoved { moved: MovedRef::Ref(name) }) if name.as_str() == "refs/heads/side"
         ));
     }
 

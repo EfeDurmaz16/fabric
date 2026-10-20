@@ -744,7 +744,7 @@ fn busy_repositories_and_linked_worktrees_are_refused() {
     fs::write(root.join("blob.bin"), "large\n").unwrap();
     let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
     assert!(
-        matches!(&err, CaptureError::GitLfsUnsupported { path } if path == "blob.bin"),
+        matches!(&err, CaptureError::GitLfsUnsupported { path } if path.as_str() == "blob.bin"),
         "{err}"
     );
 }
@@ -1174,7 +1174,7 @@ fn a_submodule_with_local_changes_is_refused_by_its_whole_path() {
     let policy = IgnorePolicy::default();
     let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
     assert!(
-        matches!(&err, CaptureError::GitSubmoduleDirty { path } if path == "my lib"),
+        matches!(&err, CaptureError::GitSubmoduleDirty { path } if path.as_str() == "my lib"),
         "{err}"
     );
 }
