@@ -20,7 +20,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fabric_env::detect::detect;
-use fabric_env::materialize::{CacheHealth, MaterializeError, Plan, SENTINEL, TreeLock, plan};
+use fabric_env::materialize::{
+    CacheHealth, MaterializeError, NodeEnv, Plan, SENTINEL, TreeLock, plan,
+};
 
 const ROOT_VAR: &str = "FABRIC_CRASH_ROOT";
 
@@ -41,7 +43,9 @@ fn run_child() -> TestResult<bool> {
     };
     let lock = TreeLock::acquire(&locks(), Path::new(&root))?;
     let detected = detect(Path::new(&root), None)?;
-    plan(&detected, &lock)?.ready()?.execute(&lock)?;
+    plan(&detected, &lock, &NodeEnv::current())?
+        .ready()?
+        .execute(&lock)?;
     Ok(true)
 }
 
@@ -73,7 +77,7 @@ fn next_plan(root: &Path) -> TestResult<Plan> {
             other => break other?,
         }
     };
-    Ok(plan(&detect(root, None)?, &lock)?)
+    Ok(plan(&detect(root, None)?, &lock, &NodeEnv::current())?)
 }
 
 /// Waits until `path` exists.

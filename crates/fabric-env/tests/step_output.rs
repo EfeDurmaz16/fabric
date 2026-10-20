@@ -13,7 +13,7 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 use fabric_env::detect::detect;
-use fabric_env::materialize::{TreeLock, plan};
+use fabric_env::materialize::{NodeEnv, TreeLock, plan};
 
 /// A buffer the log writes into, shared with the test.
 #[derive(Clone, Default)]
@@ -53,7 +53,7 @@ when = "always"
     let locks = tempfile::tempdir().unwrap();
     let lock = TreeLock::acquire(locks.path(), dir.path()).unwrap();
     let detected = detect(dir.path(), None).unwrap();
-    let planned = plan(&detected, &lock).unwrap();
+    let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
     let captured = Captured::default();
     let writer = captured.clone();
     let subscriber = tracing_subscriber::fmt()

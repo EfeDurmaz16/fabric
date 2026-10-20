@@ -1,7 +1,9 @@
 //! Materialize: make a restored workspace runnable on this node (ADR 0007).
 //!
 //! Invariant: `plan` only reads. It never runs a program and never writes a
-//! byte, so a dry run is `plan` and nothing more. `Plan::ready` turns a plan into steps that can run, and refuses when the
+//! byte, so a dry run is `plan` and nothing more. What it reads from the
+//! node's environment comes in through `NodeEnv`: `PATH`, and whether each
+//! declared variable is set, never a value. `Plan::ready` turns a plan into steps that can run, and refuses when the
 //! plan shows that one cannot: a program missing from `PATH` or a declared
 //! environment variable missing from this node. `Ready::execute` runs
 //! exactly those steps, with the program paths and directories the plan
@@ -59,7 +61,7 @@
 //! holds the lock too, and resumes refuse until it exits.
 
 use std::env;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, TryLockError};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -382,6 +384,51 @@ struct ReadyStep {
     sentinels: Sentinels,
 }
 
+/// What `plan` reads from this node's environment: `PATH`, and whether each declared variable is set.
+///
+/// It decides only what `plan` checks. A step runs with the environment
+/// of the process that calls `execute`, as ADR 0007 says.
+#[derive(Debug, Clone)]
+pub struct NodeEnv {
+    path: Option<OsString>,
+    vars: Vars,
+}
+
+/// Where `NodeEnv` looks up whether a variable is set.
+#[derive(Debug, Clone)]
+enum Vars {
+    /// This process's environment, read when `plan` asks.
+    Process,
+    /// Exactly these names, as the caller resolved them.
+    Listed(Vec<EnvVarName>),
+}
+
+impl NodeEnv {
+    /// Returns this process's environment: its `PATH` now, and its variables when `plan` checks them.
+    pub fn current() -> Self {
+        Self {
+            path: env::var_os("PATH"),
+            vars: Vars::Process,
+        }
+    }
+
+    /// Returns an environment with this `PATH` in which exactly the names in `set` are set.
+    pub fn new(path: Option<OsString>, set: Vec<EnvVarName>) -> Self {
+        Self {
+            path,
+            vars: Vars::Listed(set),
+        }
+    }
+
+    /// Returns true when `name` is set; its value is never kept.
+    fn is_set(&self, name: &EnvVarName) -> bool {
+        match &self.vars {
+            Vars::Process => env::var_os(name.as_str()).is_some(),
+            Vars::Listed(set) => set.contains(name),
+        }
+    }
+}
+
 /// The lock that keeps one installer per workspace tree, held in this node's Fabric state.
 ///
 /// Dropping it releases the lock, unless a setup step still holds the
@@ -485,14 +532,18 @@ impl Ready {
 
 /// Inspects the workspace `detected` describes and returns what materialize would do.
 ///
-/// This is the dry run: it reads the disk, `PATH` and the presence of the
-/// spec's environment variables, and changes nothing. `lock` proves no
+/// This is the dry run: it reads the disk, and from `node` the `PATH` and
+/// the presence of the spec's environment variables, and changes nothing. `lock` proves no
 /// installer from an earlier resume is still writing the tree. It takes the
 /// detection report rather than the spec alone because the report knows
 /// each cache's ecosystem, which decides the marker that proves it whole,
 /// and the root it was built from, so a report cannot be checked against
 /// another tree.
-pub fn plan(detected: &Detection, lock: &TreeLock) -> Result<Plan, MaterializeError> {
+pub fn plan(
+    detected: &Detection,
+    lock: &TreeLock,
+    node: &NodeEnv,
+) -> Result<Plan, MaterializeError> {
     let root = detected.root().to_owned();
     lock.covers(&root)?;
     match fs::metadata(&root) {
@@ -538,7 +589,7 @@ pub fn plan(detected: &Detection, lock: &TreeLock) -> Result<Plan, MaterializeEr
             index,
             step: step.clone(),
             dir: step_dir(&root, index, step)?,
-            program: find_on_path(env::var_os("PATH").as_deref(), &root, &step.program),
+            program: find_on_path(node.path.as_deref(), &root, &step.program),
             sentinels: Sentinels::default(),
         });
     }
@@ -547,7 +598,7 @@ pub fn plan(detected: &Detection, lock: &TreeLock) -> Result<Plan, MaterializeEr
     let missing_env = spec
         .env_var_names
         .iter()
-        .filter(|name| env::var_os(name.as_str()).is_none())
+        .filter(|name| !node.is_set(name))
         .cloned()
         .collect();
 
