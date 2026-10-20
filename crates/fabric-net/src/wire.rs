@@ -77,6 +77,9 @@ pub enum WireError {
     /// The records do not fit one page of `MAX_RECORD_PAGE`.
     #[error("the records do not fit a page of {MAX_RECORD_PAGE} bytes")]
     PageFull,
+    /// A page holds no record.
+    #[error("a page holds at least one record")]
+    EmptyPage,
     /// A manifest is empty or longer than a reader decodes.
     #[error("a manifest is 1 to {MAX_MANIFEST_LEN} bytes, not {0}")]
     ManifestSize(u64),
@@ -281,17 +284,29 @@ impl<'de> Deserialize<'de> for RecordBytes {
     }
 }
 
-/// Records in chain order that fit one control frame: their cost is at most `MAX_RECORD_PAGE`.
+/// One or more records in chain order that fit one control frame: their cost is at most `MAX_RECORD_PAGE`.
 ///
-/// A sender fills a page with `push` until it refuses, sends it, and goes
-/// on with a new page, so a long ledger crosses the wire in pieces.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// A sender starts a page with its first record, fills it with `push`
+/// until it refuses, sends it, and goes on with a new page, so a long
+/// ledger crosses the wire in pieces. A page is never empty, so an
+/// `Append` always carries a record and a `Pulled::More` always has a last
+/// record to pull after.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordPage {
     records: Vec<RecordBytes>,
     cost: usize,
 }
 
 impl RecordPage {
+    /// Starts a page with `first`; any one record fits a page.
+    #[must_use]
+    pub fn new(first: RecordBytes) -> Self {
+        Self {
+            cost: first.cost(),
+            records: vec![first],
+        }
+    }
+
     /// Adds `record` at the end, or hands it back when the page has no room for it.
     pub fn push(&mut self, record: RecordBytes) -> Result<(), RecordBytes> {
         let cost = self.cost + record.cost();
@@ -324,13 +339,28 @@ impl Serialize for RecordPage {
 
 impl<'de> Deserialize<'de> for RecordPage {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let mut page = Self::default();
-        for record in Vec::<RecordBytes>::deserialize(deserializer)? {
+        let mut records = Vec::<RecordBytes>::deserialize(deserializer)?.into_iter();
+        let first = records
+            .next()
+            .ok_or_else(|| serde::de::Error::custom(WireError::EmptyPage))?;
+        let mut page = Self::new(first);
+        for record in records {
             page.push(record)
                 .map_err(|_| serde::de::Error::custom(WireError::PageFull))?;
         }
         Ok(page)
     }
+}
+
+/// The answer to `Pull`: the records after the asked one, a page at a time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Pulled {
+    /// No record follows the asked one.
+    UpToDate,
+    /// The last records; none follow this page.
+    Last(RecordPage),
+    /// A page with more records after it; the sender pulls again after its last record.
+    More(RecordPage),
 }
 
 /// What a request asks for.
@@ -359,7 +389,7 @@ pub enum RequestBody {
 /// A per-job message (ADR 0003 and ADR 0005).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobRequest {
-    /// Asks for the records after `after`; answered with one page of `Records`.
+    /// Asks for the records after `after`; answered with `Records`.
     Pull {
         /// The receiver's head, or the record it last saw.
         after: RecordHash,
@@ -517,13 +547,8 @@ pub enum ResponseBody {
 /// The answer to a per-job message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobResponse {
-    /// The first page of records after the asked head, in chain order.
-    Records {
-        /// The records.
-        records: RecordPage,
-        /// More records follow the page; the sender pulls again after its last record.
-        more: bool,
-    },
+    /// The records after the asked one, in chain order, or none.
+    Records(Pulled),
     /// The records linked; `head` is now the receiver's head.
     Accepted {
         /// The receiver's head.
@@ -642,13 +667,7 @@ mod tests {
     }
 
     fn records() -> impl Strategy<Value = RecordPage> {
-        vec(record(), 0..4).prop_map(|records| {
-            let mut page = RecordPage::default();
-            for record in records {
-                page.push(record).unwrap();
-            }
-            page
-        })
+        vec(record(), 1..4).prop_map(page_of)
     }
 
     fn job_request() -> impl Strategy<Value = JobRequest> {
@@ -696,8 +715,9 @@ mod tests {
 
     fn job_response() -> impl Strategy<Value = JobResponse> {
         prop_oneof![
-            (records(), any::<bool>())
-                .prop_map(|(records, more)| JobResponse::Records { records, more }),
+            Just(JobResponse::Records(Pulled::UpToDate)),
+            records().prop_map(|page| JobResponse::Records(Pulled::Last(page))),
+            records().prop_map(|page| JobResponse::Records(Pulled::More(page))),
             bytes32(RecordHash::from_bytes).prop_map(|head| JobResponse::Accepted { head }),
             bytes32(RecordHash::from_bytes).prop_map(|head| JobResponse::Rejected { head }),
             (epoch(), epoch())
@@ -804,7 +824,8 @@ mod tests {
     }
 
     fn page_of(records: Vec<RecordBytes>) -> RecordPage {
-        let mut page = RecordPage::default();
+        let mut records = records.into_iter();
+        let mut page = RecordPage::new(records.next().unwrap());
         for record in records {
             page.push(record).unwrap();
         }
@@ -844,10 +865,7 @@ mod tests {
             };
             let answer = Response {
                 id: RequestId(u64::MAX),
-                body: ResponseBody::Job(JobResponse::Records {
-                    records: page,
-                    more: true,
-                }),
+                body: ResponseBody::Job(JobResponse::Records(Pulled::More(page))),
             };
             for bytes in [encode(&append).unwrap(), encode(&answer).unwrap()] {
                 // The frame counts its version byte too.
@@ -872,6 +890,13 @@ mod tests {
         assert_eq!(page.push(one_more.clone()), Err(one_more));
         let over: Vec<Vec<u8>> = vec![vec![1; MAX_RECORD_LEN], vec![2]];
         assert!(decode::<RecordPage>(&encode(&over).unwrap()).is_err());
+    }
+
+    /// An empty page does not decode, so an `Append` of nothing or a
+    /// `More` page with no last record to pull after cannot arrive.
+    #[test]
+    fn an_empty_page_does_not_decode() {
+        assert!(decode::<RecordPage>(&encode(&Vec::<Vec<u8>>::new()).unwrap()).is_err());
     }
 
     /// A manifest above the cap a reader decodes, or a chunk list that
