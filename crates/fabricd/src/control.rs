@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, JobId, NodeId};
+use fabric_harness::SessionId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -66,8 +67,6 @@ pub enum Request {
     JobRun {
         /// The job.
         job: JobId,
-        /// A harness to use instead of the job's.
-        harness: Option<HarnessKind>,
     },
     /// Pulls the job if another node owns it, restores it if needed, and returns what to launch.
     JobResume {
@@ -93,7 +92,7 @@ pub enum Request {
         /// The harness that runs.
         harness: HarnessKind,
         /// The session it continues or created, when known.
-        session: Option<String>,
+        session: Option<SessionId>,
     },
     /// The harness exited.
     HarnessExited {
@@ -161,7 +160,7 @@ pub struct RunPlan {
     /// The harness to launch.
     pub harness: HarnessKind,
     /// The session to continue; a new one when `None`.
-    pub session: Option<String>,
+    pub session: Option<SessionId>,
     /// The job's goal, the first message of a new session.
     pub goal: String,
 }

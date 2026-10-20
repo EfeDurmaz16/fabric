@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, NodeId, RecordHash, SnapshotId};
+use fabric_harness::SessionId;
 use rustix::process::{Pid, Signal};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -138,7 +139,7 @@ pub struct SessionRecord {
     /// The harness that owns the session.
     pub harness: HarnessKind,
     /// The session id the harness minted.
-    pub session: String,
+    pub session: SessionId,
 }
 
 /// Reads a node-local file, or `None` when it does not exist.

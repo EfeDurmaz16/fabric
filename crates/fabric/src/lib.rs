@@ -25,7 +25,7 @@ use fabric_core::id::{JobId, NodeId};
 use fabric_env::materialize::{NodeEnv, TreeLock};
 use fabric_harness::claude::{ClaudeCode, LeftReason, TrustOutcome};
 use fabric_harness::codex::Codex;
-use fabric_harness::{Harness, Launch, Running, SessionId};
+use fabric_harness::{Harness, Launch, Running};
 use fabric_net::endpoint::DialOrder;
 use fabricd::control::{self, Request, Response, RunPlan};
 use fabricd::harnesses::{HarnessConfig, HarnessEnv, acp_adapter, parse_harness};
@@ -357,7 +357,7 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
                 None,
             )
         }
-        JobCommand::Run { job, prompt } => (Request::JobRun { job, harness: None }, prompt),
+        JobCommand::Run { job, prompt } => (Request::JobRun { job }, prompt),
         JobCommand::Suspend { job } => (
             Request::JobSuspend {
                 job,
@@ -429,12 +429,7 @@ async fn launch(
     materialize(state, &plan.root)?;
     let socket = state.socket();
     let env = environment();
-    let resume = plan
-        .session
-        .as_deref()
-        .map(SessionId::parse)
-        .transpose()
-        .context("the recorded session id")?;
+    let resume = plan.session.clone();
     let harness_env = HarnessEnv::new(
         home,
         path_var(),
@@ -477,7 +472,7 @@ async fn launch(
             epoch: plan.epoch,
             pid,
             harness: plan.harness.clone(),
-            session: running.session().map(ToString::to_string),
+            session: running.session().cloned(),
         },
     )
     .await;

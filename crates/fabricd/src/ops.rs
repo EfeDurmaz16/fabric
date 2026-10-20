@@ -114,10 +114,10 @@ impl Node {
             Request::JobList => self.job_list(out).await,
             Request::JobStatus { job } => self.job_status(job, out).await?,
             Request::JobLog { job } => self.job_log(job, out).await?,
-            Request::JobRun { job, harness } => {
+            Request::JobRun { job } => {
                 self.resolve_departing(job, out).await?;
                 self.check_peers(job, out).await;
-                return Ok(Some(self.job_run(job, harness, out).await?));
+                return Ok(Some(self.job_run(job, out).await?));
             }
             Request::JobResume {
                 job,
@@ -416,12 +416,7 @@ impl Node {
         Ok(())
     }
 
-    async fn job_run(
-        self: &Arc<Self>,
-        id: JobId,
-        harness: Option<HarnessKind>,
-        out: &mut Out,
-    ) -> Result<RunPlan, NodeError> {
+    async fn job_run(self: &Arc<Self>, id: JobId, out: &mut Out) -> Result<RunPlan, NodeError> {
         let job = self.job(id).await?;
         let job = job.lock().await;
         let token = owner_token(&job, self.id)?;
@@ -451,7 +446,7 @@ impl Node {
                 pid: record.pid.get(),
             });
         }
-        plan(&job, token.epoch, marker.root, harness, out)
+        plan(&job, token.epoch, marker.root, None, out)
     }
 
     /// Records the harness the CLI launched and appends `Resumed`, or refuses.
@@ -466,7 +461,7 @@ impl Node {
         epoch: Epoch,
         pid: NonZeroU32,
         harness: HarnessKind,
-        session: Option<String>,
+        session: Option<SessionId>,
         out: &mut Out,
     ) -> Result<(), NodeError> {
         let job = self.job(id).await?;
@@ -682,10 +677,7 @@ impl Node {
         let state_dir = job.dir().harness_state();
         let mut harness_state = None;
         if let Some(record) = job.session()? {
-            let session = SessionId::parse(&record.session).map_err(|e| NodeError::Peer {
-                peer: self.id,
-                reason: format!("the recorded session id is not valid: {e}"),
-            })?;
+            let session = record.session;
             let harness = adapter(&record.harness, &self.harness_env(path_var)?)?;
             job.clear_harness_state()?;
             std::fs::create_dir_all(&state_dir).map_err(|e| NodeError::io(&state_dir, e))?;
@@ -1562,7 +1554,7 @@ impl Node {
             &job.dir().session(),
             &SessionRecord {
                 harness: state.kind().clone(),
-                session: state.session().as_str().to_owned(),
+                session: state.session().clone(),
             },
         )?;
         out.say(format!(
