@@ -1355,7 +1355,7 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
     if let Some(state) = &manifest.git {
         refuse_overlap(&manifest.files, &state.worktree_mtimes)?;
     }
-    manifest.validate()?;
+    crate::store::encode_manifest(&manifest)?;
     Ok(Captured {
         manifest,
         report: capturer.report,

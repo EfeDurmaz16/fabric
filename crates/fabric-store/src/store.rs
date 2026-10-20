@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use fabric_core::id::{ChunkId, SnapshotId};
-use fabric_core::snapshot::{EntryKind, ManifestError, SnapshotManifest};
+use fabric_core::snapshot::{EntryKind, MAX_MANIFEST_LEN, ManifestError, SnapshotManifest};
 
 use crate::catalog::{Catalog, CatalogError, ChunkRef, Role, SnapshotRow};
 use crate::checkpoint;
@@ -95,6 +95,15 @@ fn io_err(path: &Path, source: io::Error) -> StoreError {
         path: path.to_owned(),
         source,
     }
+}
+
+/// Encodes a manifest, refusing one longer than `MAX_MANIFEST_LEN`, which no reader decodes.
+pub(crate) fn encode_manifest(manifest: &SnapshotManifest) -> Result<Vec<u8>, ManifestError> {
+    let bytes = manifest.encode()?;
+    if bytes.len() > MAX_MANIFEST_LEN {
+        return Err(ManifestError::TooLarge { len: bytes.len() });
+    }
+    Ok(bytes)
 }
 
 /// What one gc pass removed.
@@ -243,9 +252,11 @@ impl Store {
     /// Every object the manifest names must already be in the store. The
     /// manifest's own bytes become objects too, the shard directories are
     /// flushed, and only then does the catalog get the rows. Publishing a
-    /// manifest the store already has returns its id and changes nothing.
+    /// manifest the store already has returns its id and changes nothing. A
+    /// manifest above `MAX_MANIFEST_LEN` is refused, since it could never be
+    /// read back.
     pub fn publish(&mut self, manifest: &SnapshotManifest) -> Result<SnapshotId, StoreError> {
-        let bytes = manifest.encode()?;
+        let bytes = encode_manifest(manifest)?;
         let id = SnapshotId::of(&bytes);
         if self.catalog.snapshot(id)?.is_some() {
             return Ok(id);
@@ -339,7 +350,11 @@ impl Store {
     /// Assembles, verifies and decodes the manifest of a snapshot.
     pub fn manifest(&self, id: SnapshotId) -> Result<SnapshotManifest, StoreError> {
         let row = self.snapshot(id)?;
-        let mut bytes = Vec::with_capacity(usize::try_from(row.manifest_len).unwrap_or(0));
+        let len = usize::try_from(row.manifest_len).unwrap_or(usize::MAX);
+        if len > MAX_MANIFEST_LEN {
+            return Err(ManifestError::TooLarge { len }.into());
+        }
+        let mut bytes = Vec::with_capacity(len);
         for chunk in self.catalog.snapshot_chunks(id, Role::Manifest)? {
             bytes.extend_from_slice(&self.objects.read(chunk.id)?);
         }

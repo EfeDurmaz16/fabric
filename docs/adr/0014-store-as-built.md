@@ -41,15 +41,16 @@ store/
 
 `Store::publish` makes a manifest a published snapshot. The caller appends `SnapshotPublished` to the ledger afterwards, so the ledger stays the commit point (ADR 0002).
 
-1. Refuse a `bundle_base` the catalog does not have (`MissingBundleBase`).
-2. Every object the manifest names must be on disk (`MissingChunk` otherwise). An object that has no catalog row, and that this process did not link since its last flush, may come from a process that died before its flush; after a power loss its name can survive without its bytes. Publish re-reads and verifies such an object. A corrupt one is removed and publish fails with `CorruptUnpublished`, so the next capture writes it again. A good one has its shard directory marked for the flush.
-3. Write the manifest's bytes as objects. The same rule as step 2 applies to them.
-4. Flush every marked shard directory with `F_FULLFSYNC` (`fsync` on Linux). A flush that fails keeps its shards marked.
-5. One transaction inserts the snapshot row, the new chunk rows and every reference.
+1. Refuse a manifest whose encoding is above `MAX_MANIFEST_LEN`, 64 MiB, with `ManifestError::TooLarge`; every reader, this store's included, refuses to decode it. Capture checks the same bound, so the user hears it while the workspace is still there. Reading a manifest checks the catalog's recorded length against the bound before it allocates.
+2. Refuse a `bundle_base` the catalog does not have (`MissingBundleBase`).
+3. Every object the manifest names must be on disk (`MissingChunk` otherwise). An object that has no catalog row, and that this process did not link since its last flush, may come from a process that died before its flush; after a power loss its name can survive without its bytes. Publish re-reads and verifies such an object. A corrupt one is removed and publish fails with `CorruptUnpublished`, so the next capture writes it again. A good one has its shard directory marked for the flush.
+4. Write the manifest's bytes as objects. The same rule as step 3 applies to them.
+5. Flush every marked shard directory with `F_FULLFSYNC` (`fsync` on Linux). A flush that fails keeps its shards marked.
+6. One transaction inserts the snapshot row, the new chunk rows and every reference.
 
 Each object gets a plain `fsync` when it is written, and the shard directories get the one full flush. This is the split git's `core.fsyncMethod=batch` makes. With `F_FULLFSYNC` per object the bench captured 5,022 files in 20.7 s, 4 ms per file; with the split it took 1.8 s when the crate was written. Publishing a manifest the store already has returns its id and changes nothing.
 
-What this survives: a kill at every step, which the crash test proves by killing after the objects, after the flush, before the commit and after it; in every case `check` finds no row naming a missing object and a rerun ends in a clean store. A power loss after step 5, because every object a row names was flushed, or verified and flushed, before the row.
+What this survives: a kill at every step, which the crash test proves by killing after the objects, after the flush, before the commit and after it; in every case `check` finds no row naming a missing object and a rerun ends in a clean store. A power loss after step 6, because every object a row names was flushed, or verified and flushed, before the row.
 
 ### gc
 
@@ -111,5 +112,6 @@ A lost or corrupt catalog cannot be rebuilt from `objects/` alone. The order of 
 - A branch replaced by a directory of branches of the same name, or the reverse, across an incremental link restores. Tests: `a_branch_that_becomes_a_directory_of_branches_restores`, `a_directory_of_branches_that_becomes_a_branch_restores`.
 - A read-only directory that holds files restores, and a restore killed after the modes were applied finishes on rerun. Tests: `a_read_only_directory_that_holds_files_round_trips`; the restore crash matrix has read-only directories in the workspace and the harness state.
 - A `.env` saved with `git stash -u` is named in `stashed_secrets`. Test: `a_secret_saved_in_the_stash_is_named`.
+- A manifest above the decode bound is refused at capture and at publish instead of publishing a snapshot no node can read. Test: `publish_refuses_a_manifest_no_reader_would_decode`.
 - A lost catalog loses every snapshot whose manifest is above the whole-file limit until a peer sends it again.
 - `fabric orphan export` must pin the whole bundle chain of the snapshot it exports, not only the snapshot.

@@ -11,7 +11,8 @@ use fabric_core::git::GitOid;
 use fabric_core::id::{ChunkId, JobId, NodeId, SnapshotId};
 use fabric_core::path::{AbsPath, RelPath};
 use fabric_core::snapshot::{
-    Entry, EntryKind, GitHead, GitState, HarnessState, Mode, Platform, SnapshotManifest,
+    Entry, EntryKind, GitHead, GitState, HarnessState, MAX_MANIFEST_LEN, ManifestError, Mode,
+    Platform, SnapshotManifest,
 };
 use fabric_store::catalog::CatalogError;
 use fabric_store::objects::{ChunkParams, ObjectError};
@@ -117,6 +118,23 @@ fn publish_refuses_a_manifest_that_names_a_missing_object() {
         store.manifest(SnapshotId::of(b"x")),
         Err(StoreError::UnknownSnapshot(_))
     ));
+}
+
+#[test]
+fn publish_refuses_a_manifest_no_reader_would_decode() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::create(dir.path(), params().unwrap()).unwrap();
+    let mut entry = file_entry(&store, "a", b"a").unwrap();
+    // Each chunk id encodes as its 32 bytes.
+    let count = MAX_MANIFEST_LEN / 32 + 1;
+    let chunks = chunks_of(&entry).unwrap().repeat(count);
+    entry.kind = EntryKind::File { size: 1, chunks };
+    let m = manifest(vec![entry], 4).unwrap();
+    assert!(matches!(
+        store.publish(&m),
+        Err(StoreError::Manifest(ManifestError::TooLarge { .. }))
+    ));
+    assert!(store.snapshots().unwrap().is_empty());
 }
 
 #[test]
