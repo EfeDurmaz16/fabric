@@ -1078,6 +1078,29 @@ fn a_cache_the_target_cannot_use_is_skipped_and_named() {
 }
 
 #[test]
+fn a_partial_cache_is_skipped_even_when_the_target_could_use_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("plain");
+    fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+    fs::write(root.join("node_modules/pkg/index.js"), "x\n").unwrap();
+    fs::write(root.join("node_modules/pkg/.env"), "leak\n").unwrap();
+    fs::write(root.join("keep.txt"), "keep\n").unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    assert_eq!(manifest.caches[0].carry, CarryState::Partial);
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    let report = restore_into(&store, snapshot, &target).unwrap();
+    assert_eq!(
+        report.skipped_caches,
+        vec![RelPath::parse("node_modules").unwrap()]
+    );
+    assert!(!target.join("node_modules").exists());
+    assert!(target.join("keep.txt").exists());
+}
+
+#[test]
 fn restore_state_tells_absent_from_half_restored_and_present() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("t");

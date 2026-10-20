@@ -1002,7 +1002,11 @@ fn harness_state_complete(
     }
 }
 
-/// The cache paths whose bytes are not written: rows not carried and rows `carry` turns down.
+/// The cache paths whose bytes are not written: rows not wholly carried and rows `carry` turns down.
+///
+/// A `Partial` cache had a secret or an excluded path left out; written, it
+/// would look whole to the tool that reads it, so it is treated as missing
+/// whatever `carry` says.
 fn skipped_caches(
     manifest: &SnapshotManifest,
     carry: &dyn Fn(&CacheEntry) -> bool,
@@ -1010,7 +1014,7 @@ fn skipped_caches(
     manifest
         .caches
         .iter()
-        .filter(|c| c.carry == CarryState::NotCarried || !carry(c))
+        .filter(|c| c.carry != CarryState::Carried || !carry(c))
         .map(|c| c.path.clone())
         .collect()
 }
