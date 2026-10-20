@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
-use std::fs;
+use std::fs::{self, File};
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -27,7 +27,7 @@ use fabric_core::snapshot::{
     HarnessState, ManifestError, Mode, Platform, SnapshotManifest,
 };
 
-use crate::durable::TempFile;
+use crate::durable::{self, TempFile};
 use crate::git::{Git, GitError};
 use crate::objects::ObjectError;
 use crate::policy::{Class, IgnorePolicy, Markers};
@@ -149,6 +149,10 @@ pub struct CaptureReport {
     pub tracked_secrets: Vec<RelPath>,
     /// Symlinks whose target is absolute or climbs above the root.
     pub escaping_symlinks: Vec<RelPath>,
+    /// FIFOs, sockets and devices in the workspace, left behind.
+    pub special_files: Vec<RelPath>,
+    /// FIFOs, sockets and devices in the harness state directory, left behind.
+    pub special_harness: Vec<RelPath>,
     /// Nested repositories left behind, tracked submodules aside.
     pub nested_repositories: Vec<String>,
     /// Config keys whose remote URL lost its userinfo.
@@ -255,7 +259,7 @@ pub enum CaptureError {
         /// The offending paths.
         paths: Vec<RelPath>,
     },
-    /// A path the working-tree commit lists vanished before it was measured.
+    /// A path vanished or was replaced between its listing and its read; capture again.
     #[error("{path} changed while capture ran")]
     WorkspaceChanged {
         /// The path.
@@ -344,23 +348,75 @@ pub(crate) fn symlink_escapes(rel: &RelPath, target: &str) -> bool {
     false
 }
 
-/// One directory, file or symlink found on disk.
+/// What a listed path is; a FIFO, socket or device is never listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FoundKind {
+    Dir,
+    File,
+    Symlink,
+}
+
+/// One directory, regular file or symlink found on disk.
 struct Found {
     rel: RelPath,
+    kind: FoundKind,
     meta: fs::Metadata,
+}
+
+impl Found {
+    /// Wraps a listed path, or returns `None` for a FIFO, socket or device.
+    fn new(rel: RelPath, meta: fs::Metadata) -> Option<Found> {
+        let file_type = meta.file_type();
+        let kind = if file_type.is_dir() {
+            FoundKind::Dir
+        } else if file_type.is_symlink() {
+            FoundKind::Symlink
+        } else if file_type.is_file() {
+            FoundKind::File
+        } else {
+            return None;
+        };
+        Some(Found { rel, kind, meta })
+    }
+}
+
+/// Opens a listed regular file, refusing it unless it is still the inode the listing saw.
+///
+/// A path swapped for a link, a FIFO or another file after the listing
+/// fails here, so the bytes stored under a name are the bytes of the file
+/// the secret patterns judged by that name.
+fn open_listed(full: &Path, found: &Found) -> Result<File, CaptureError> {
+    let changed = || CaptureError::WorkspaceChanged {
+        path: found.rel.clone(),
+    };
+    let file = match durable::open_regular(full) {
+        Ok(Some(file)) => file,
+        Ok(None) => return Err(changed()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(changed()),
+        Err(e) => return Err(io_err(full, e)),
+    };
+    let meta = file.metadata().map_err(|e| io_err(full, e))?;
+    if meta.dev() != found.meta.dev() || meta.ino() != found.meta.ino() {
+        return Err(changed());
+    }
+    Ok(file)
+}
+
+/// What `list_tree` found.
+#[derive(Default)]
+struct Listing {
+    found: Vec<Found>,
+    nested: Vec<String>,
+    special: Vec<RelPath>,
 }
 
 /// Lists a directory tree, sorted by path, never following symlinks.
 ///
 /// A directory named `.git` in any letter case is a nested repository: it
-/// is skipped and its path is appended to `nested`.
-fn list_tree(base: &Path, nested: &mut Vec<String>) -> Result<Vec<Found>, CaptureError> {
-    fn walk(
-        base: &Path,
-        prefix: &str,
-        out: &mut Vec<Found>,
-        nested: &mut Vec<String>,
-    ) -> Result<(), CaptureError> {
+/// is skipped and its path is listed in `nested`. A FIFO, socket or device
+/// is skipped and listed in `special`.
+fn list_tree(base: &Path) -> Result<Listing, CaptureError> {
+    fn walk(base: &Path, prefix: &str, out: &mut Listing) -> Result<(), CaptureError> {
         let dir = base.join(prefix);
         let mut names: Vec<_> = fs::read_dir(&dir)
             .map_err(|e| io_err(&dir, e))?
@@ -382,20 +438,25 @@ fn list_tree(base: &Path, nested: &mut Vec<String>) -> Result<Vec<Found>, Captur
             let full = base.join(&text);
             let meta = fs::symlink_metadata(&full).map_err(|e| io_err(&full, e))?;
             if meta.is_dir() && name.eq_ignore_ascii_case(".git") {
-                nested.push(text);
+                out.nested.push(text);
                 continue;
             }
             let rel = rel_path(&text)?;
-            let is_dir = meta.is_dir();
-            out.push(Found { rel, meta });
-            if is_dir {
-                walk(base, &text, out, nested)?;
+            match Found::new(rel.clone(), meta) {
+                Some(found) => {
+                    let is_dir = found.kind == FoundKind::Dir;
+                    out.found.push(found);
+                    if is_dir {
+                        walk(base, &text, out)?;
+                    }
+                }
+                None => out.special.push(rel),
             }
         }
         Ok(())
     }
-    let mut out = Vec::new();
-    walk(base, "", &mut out, nested)?;
+    let mut out = Listing::default();
+    walk(base, "", &mut out)?;
     Ok(out)
 }
 
@@ -419,24 +480,27 @@ impl Capturer<'_> {
     fn entry_for(&mut self, base: &Path, found: &Found) -> Result<Entry, CaptureError> {
         let meta = &found.meta;
         let full = base.join(found.rel.as_str());
-        let kind = if meta.file_type().is_symlink() {
-            let target = utf8_link(&full, &found.rel)?;
-            if symlink_escapes(&found.rel, &target) {
-                self.report.escaping_symlinks.push(found.rel.clone());
+        let kind = match found.kind {
+            FoundKind::Symlink => {
+                let target = utf8_link(&full, &found.rel)?;
+                if symlink_escapes(&found.rel, &target) {
+                    self.report.escaping_symlinks.push(found.rel.clone());
+                }
+                self.report.files += 1;
+                EntryKind::Symlink { target }
             }
-            self.report.files += 1;
-            EntryKind::Symlink { target }
-        } else if meta.is_dir() {
-            EntryKind::Dir
-        } else {
-            let stored = self.store.objects().put_file(&full)?;
-            self.report.files += 1;
-            self.report.bytes += stored.size;
-            self.report.new_objects += stored.new_objects;
-            self.report.new_bytes += stored.new_bytes;
-            EntryKind::File {
-                size: stored.size,
-                chunks: stored.chunks,
+            FoundKind::Dir => EntryKind::Dir,
+            FoundKind::File => {
+                let file = open_listed(&full, found)?;
+                let stored = self.store.objects().put_reader(file, &full)?;
+                self.report.files += 1;
+                self.report.bytes += stored.size;
+                self.report.new_objects += stored.new_objects;
+                self.report.new_bytes += stored.new_bytes;
+                EntryKind::File {
+                    size: stored.size,
+                    chunks: stored.chunks,
+                }
             }
         };
         Ok(Entry {
@@ -464,7 +528,7 @@ impl Capturer<'_> {
         };
         for item in found {
             let classification = policy.classify(&item.rel, &mut markers);
-            if item.meta.is_dir() {
+            if item.kind == FoundKind::Dir {
                 // A directory travels on its own when the walker listed it
                 // and nothing denies it, so an empty directory is not lost.
                 if classification.class.carried() {
@@ -573,11 +637,11 @@ impl Capturer<'_> {
     /// classes do not apply, but a secret never travels from here either:
     /// Claude Code keeps `.credentials.json` in its state directory on Linux.
     fn harness_entries(&mut self, base: &Path) -> Result<Vec<Entry>, CaptureError> {
-        let mut nested = Vec::new();
-        let found = list_tree(base, &mut nested)?;
-        self.report.nested_repositories.extend(nested);
-        let mut entries = Vec::with_capacity(found.len());
-        for item in &found {
+        let listing = list_tree(base)?;
+        self.report.nested_repositories.extend(listing.nested);
+        self.report.special_harness.extend(listing.special);
+        let mut entries = Vec::with_capacity(listing.found.len());
+        for item in &listing.found {
             if self.req.policy.is_secret(&item.rel) {
                 self.report.denied_harness.push(item.rel.clone());
                 continue;
@@ -802,7 +866,10 @@ impl GitCapture<'_> {
             let rel = rel_path(text)?;
             let full = self.root.join(rel.as_str());
             let meta = fs::symlink_metadata(&full).map_err(|e| io_err(&full, e))?;
-            found.push(Found { rel, meta });
+            match Found::new(rel.clone(), meta) {
+                Some(item) => found.push(item),
+                None => report.special_files.push(rel),
+            }
         }
         Ok(found)
     }
@@ -1223,10 +1290,10 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
         let state = capture_git(&mut capturer, &gc, parent_manifest.as_ref())?;
         (Some(state), gc.ignored(&mut capturer.report)?)
     } else {
-        let mut nested = Vec::new();
-        let found = list_tree(req.root, &mut nested)?;
-        capturer.report.nested_repositories.extend(nested);
-        (None, found)
+        let listing = list_tree(req.root)?;
+        capturer.report.nested_repositories.extend(listing.nested);
+        capturer.report.special_files.extend(listing.special);
+        (None, listing.found)
     };
     let (files, caches) = capturer.classify_and_store(req.root, found)?;
     let harness_state = match req.harness_state {
@@ -1452,6 +1519,29 @@ mod tests {
         assert!(symlink_escapes(&rel("d/a"), "../../x"));
         assert!(!symlink_escapes(&rel("d/a"), "b/../c"));
         assert!(!symlink_escapes(&rel("a"), "./b"));
+    }
+
+    #[test]
+    fn a_file_replaced_after_its_listing_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        let key = dir.path().join("id_ed25519");
+        fs::write(&path, "notes").unwrap();
+        fs::write(&key, "secret").unwrap();
+        let found = Found::new(rel("notes.txt"), fs::symlink_metadata(&path).unwrap()).unwrap();
+        // The listed inode stays alive beside it, so no new file can reuse its number.
+        fs::rename(&path, dir.path().join("kept")).unwrap();
+        std::os::unix::fs::symlink(&key, &path).unwrap();
+        assert!(matches!(
+            open_listed(&path, &found),
+            Err(CaptureError::WorkspaceChanged { .. })
+        ));
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, "another file").unwrap();
+        assert!(matches!(
+            open_listed(&path, &found),
+            Err(CaptureError::WorkspaceChanged { .. })
+        ));
     }
 
     /// A ref that moves after the bundle is made is refused, full or incremental.

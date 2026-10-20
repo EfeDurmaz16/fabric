@@ -932,3 +932,46 @@ fn a_file_only_the_global_ignore_names_restores() {
     assert!(output.status.success(), "{stdout}");
     assert!(stdout.contains("1 passed"), "{stdout}");
 }
+
+#[test]
+fn a_fifo_or_socket_is_left_behind_and_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("plain");
+    let state = dir.path().join("state");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    fs::write(root.join("keep.txt"), "keep\n").unwrap();
+    let _socket = std::os::unix::net::UnixListener::bind(root.join("dev.sock")).unwrap();
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(state.join("pipe"))
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let (done, finished) = std::sync::mpsc::channel();
+    let base = dir.path().to_owned();
+    std::thread::spawn(move || {
+        let store = store_in(&base).unwrap();
+        let policy = IgnorePolicy::default();
+        let mut req = request(&root, &policy, None);
+        req.harness_state = Some(&state);
+        let _ = done.send(capture(&store, &req).map_err(|e| e.to_string()));
+    });
+    let Captured { manifest, report } = finished
+        .recv_timeout(Duration::from_mins(1))
+        .expect("capture hung on a FIFO")
+        .unwrap();
+    let files: Vec<&str> = manifest.files.iter().map(|e| e.rel_path.as_str()).collect();
+    assert_eq!(files, vec!["keep.txt"]);
+    assert!(manifest.harness_state.entries.is_empty());
+    assert_eq!(
+        report.special_files,
+        vec![RelPath::parse("dev.sock").unwrap()]
+    );
+    assert_eq!(
+        report.special_harness,
+        vec![RelPath::parse("pipe").unwrap()]
+    );
+}
