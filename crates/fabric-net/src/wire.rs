@@ -12,7 +12,7 @@
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fabric_core::id::{ChunkId, Epoch, MoveId, NodeId, RecordHash, SnapshotId};
+use fabric_core::id::{ChunkId, Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::FencingToken;
 use fabric_core::ledger::MAX_RECORD_LEN;
 use fabric_core::moves::MoveOffer;
@@ -363,7 +363,7 @@ pub enum JobRequest {
     /// Asks the owner to start a move toward the sender; answered with `MoveStarted` or `Rejected`.
     MoveRequest,
     /// The owner's offer after `MoveStarted` is durable; answered with `MoveDecision`, `Rejected`, `SnapshotIncomplete` or an epoch answer.
-    MoveOffer(MoveOffer),
+    MoveOffer(OfferBody),
     /// Asks the target for its decision again; answered with `MoveDecision` or `MoveUndecided`.
     MoveStatus {
         /// The move.
@@ -374,6 +374,43 @@ pub enum JobRequest {
         /// The move.
         move_id: MoveId,
     },
+}
+
+/// A `MoveOffer` without its job id, which the request's fencing token carries.
+///
+/// The job id has one home on the wire, so a message cannot name one job in
+/// its token and another in its offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfferBody {
+    /// The move.
+    pub move_id: MoveId,
+    /// The owner's head, which is the `MoveStarted` record.
+    pub head: RecordHash,
+    /// The snapshot the target must hold completely before it imports.
+    pub snapshot: SnapshotId,
+}
+
+impl OfferBody {
+    /// The full offer for `job_id`, the job the request's token names.
+    #[must_use]
+    pub fn for_job(self, job_id: JobId) -> MoveOffer {
+        MoveOffer {
+            job_id,
+            move_id: self.move_id,
+            head: self.head,
+            snapshot: self.snapshot,
+        }
+    }
+}
+
+impl From<MoveOffer> for OfferBody {
+    fn from(offer: MoveOffer) -> Self {
+        Self {
+            move_id: offer.move_id,
+            head: offer.head,
+            snapshot: offer.snapshot,
+        }
+    }
 }
 
 /// One response: the request number it answers and the body.
@@ -553,7 +590,6 @@ impl fmt::Display for Fault {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fabric_core::id::JobId;
     use proptest::collection::vec;
     use proptest::prelude::*;
 
@@ -608,14 +644,12 @@ mod tests {
             records().prop_map(|records| JobRequest::Append { records }),
             Just(JobRequest::MoveRequest),
             (
-                bytes16(JobId::from_bytes),
                 bytes16(MoveId::from_bytes),
                 bytes32(RecordHash::from_bytes),
                 bytes32(SnapshotId::from_bytes),
             )
-                .prop_map(|(job_id, move_id, head, snapshot)| JobRequest::MoveOffer(
-                    MoveOffer {
-                        job_id,
+                .prop_map(|(move_id, head, snapshot)| JobRequest::MoveOffer(
+                    OfferBody {
                         move_id,
                         head,
                         snapshot,
