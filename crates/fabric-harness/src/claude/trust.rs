@@ -5,7 +5,9 @@
 //! process runs, because Claude rewrites the file itself and keeps its own
 //! backups (ADR 0006, Trust on the target). A write is read, modify, write
 //! to a temporary file and rename that keeps the file's mode, and only the
-//! one key `projects["<root>"].hasTrustDialogAccepted` changes. A missing
+//! one key `projects["<root>"].hasTrustDialogAccepted` changes. A file
+//! that is a symlink is read through and never written, because the rename
+//! would replace the link. A missing
 //! file is not created: it means Claude never ran on this node, so there
 //! is no login to trust a workspace for either.
 //!
@@ -68,6 +70,12 @@ pub enum LeftReason {
     ClaudeRunning {
         /// The running processes.
         pids: LivePids,
+    },
+    /// The config file is a symlink, as a dotfile manager makes it, and a
+    /// rename over it would turn the link into a plain file.
+    ConfigIsSymlink {
+        /// The link.
+        path: PathBuf,
     },
 }
 
@@ -165,6 +173,20 @@ pub(crate) fn trusted_by(
         .into_iter()
         .find(|dir| trusts(dir))
         .map(Path::to_path_buf))
+}
+
+/// Why the config file at `config_json` must not be written whoever
+/// runs, if anything: a symlink is read through but never written
+/// through, as Claude's own writer refuses to.
+pub(crate) fn unwritable(config_json: &Path) -> Result<Option<LeftReason>, HarnessError> {
+    let meta = std::fs::symlink_metadata(config_json)
+        .map_err(|e| HarnessError::io(IoOp::Read, config_json, e))?;
+    Ok(meta
+        .file_type()
+        .is_symlink()
+        .then(|| LeftReason::ConfigIsSymlink {
+            path: config_json.to_path_buf(),
+        }))
 }
 
 /// Sets the trust key for `root` in the config file at `config_json`.

@@ -250,8 +250,9 @@ impl ClaudeCode {
     /// when the workspace root or an ancestor Claude inherits from is
     /// trusted, nothing is written and no process is looked at. Otherwise
     /// the key `projects["<root>"].hasTrustDialogAccepted` is written while
-    /// no `claude` runs; while one runs, the file is left to Claude and the
-    /// outcome names the processes, so the caller can warn and launch.
+    /// no `claude` runs; while one runs, or when the file is a symlink, the
+    /// file is left to Claude and the outcome says why, so the caller can
+    /// warn and launch.
     pub async fn preseed_trust(&self, workspace: &Path) -> Result<TrustOutcome, HarnessError> {
         self.preseed_trust_with(workspace, || self.running_claude())
             .await
@@ -275,6 +276,10 @@ impl ClaudeCode {
             pipeline::blocking(move || trust::trusted_by(&config_json, &read_root)).await?;
         if let Some(by) = trusted {
             return Ok(TrustOutcome::AlreadyTrusted { by });
+        }
+        let config_json = self.config_json.clone();
+        if let Some(reason) = pipeline::blocking(move || trust::unwritable(&config_json)).await? {
+            return Ok(TrustOutcome::LeftToClaude { reason });
         }
         if let Some(pids) = LivePids::of(running().await?) {
             debug!(
@@ -875,6 +880,34 @@ mod tests {
         );
         assert!(!asked);
         assert_eq!(fixture.config_bytes(), before);
+    }
+
+    #[tokio::test]
+    async fn a_symlinked_config_is_never_written_through() {
+        let fixture = TrustFixture::new(None);
+        let dotfiles = fixture.home.join("dotfiles");
+        std::fs::create_dir(&dotfiles).unwrap();
+        let target = dotfiles.join("claude.json");
+        std::fs::write(&target, r#"{"projects":{}}"#).unwrap();
+        std::os::unix::fs::symlink(&target, fixture.config()).unwrap();
+        let (outcome, asked) = fixture.preseed(Vec::new()).await;
+        assert_eq!(
+            outcome.unwrap(),
+            TrustOutcome::LeftToClaude {
+                reason: LeftReason::ConfigIsSymlink {
+                    path: fixture.config()
+                }
+            }
+        );
+        assert!(!asked);
+        assert!(
+            std::fs::symlink_metadata(fixture.config())
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the user's link must survive"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), br#"{"projects":{}}"#);
     }
 
     #[tokio::test]
