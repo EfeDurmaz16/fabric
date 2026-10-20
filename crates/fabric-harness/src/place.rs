@@ -135,7 +135,7 @@ fn redacted_view_prefix(
         &mut RedactionCounts::new(),
     );
     match produced {
-        Ok(()) => Ok((!check.diverged).then_some(check.seen)),
+        Ok(_) => Ok((!check.diverged).then_some(check.seen)),
         Err(HarnessError::SecretInSignedBlock { .. }) => Ok(None),
         Err(e) => Err(e),
     }

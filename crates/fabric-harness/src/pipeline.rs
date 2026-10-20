@@ -172,18 +172,18 @@ pub(crate) fn capture(
     mut counts: RedactionCounts,
     out: &Path,
 ) -> Result<StateManifest, HarnessError> {
-    let carried = stage::stage(sources, out, &mut counts)?;
+    let staged = stage::stage(sources, out, &mut counts)?;
     let manifest = StateManifest::new(
         capturer.kind,
         capturer.session.clone(),
         capturer.root.clone(),
         capturer.home.clone(),
         capturer.version,
-        carried,
+        staged.carried,
         &counts,
     )?;
     if let Some(records) = capturer.departure {
-        records.write_pending(sources, manifest.digest()?)?;
+        records.write_pending(&staged.replaceable, manifest.digest()?)?;
         crashpoint("capture-after-departure", 0);
     }
     manifest.write(out)?;

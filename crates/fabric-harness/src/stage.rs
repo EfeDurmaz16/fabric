@@ -25,7 +25,7 @@ use crate::denylist;
 use crate::durable::{self, Hashing, Written};
 use crate::error::{HarnessError, IoOp};
 use crate::jsontext::{self, TransformError};
-use crate::manifest::{Carried, Content, MANIFEST_FILE, Mutability};
+use crate::manifest::{Carried, Content, Digest, MANIFEST_FILE, Mutability};
 use crate::redact::{RedactionCounts, Redactor};
 
 /// The redaction rule name under which dropped signed blocks are counted.
@@ -88,6 +88,24 @@ fn split_newline(line: &[u8]) -> (&[u8], &'static [u8]) {
     }
 }
 
+/// A reader that hashes every byte it hands out, so the digest names
+/// exactly the bytes a transfer read and no later state of the file.
+struct HashingRead<R> {
+    inner: R,
+    hasher: blake3::Hasher,
+}
+
+impl<R: io::Read> io::Read for HashingRead<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+}
+
+/// The source of one transfer.
+type Input = BufReader<HashingRead<File>>;
+
 /// What the JSON transform made of one text.
 enum Parsed {
     /// Valid JSON with nothing to redact.
@@ -122,11 +140,7 @@ impl Transfer<'_> {
             .map_err(|e| HarnessError::io(IoOp::Write, self.src, e))
     }
 
-    fn next_line(
-        &self,
-        reader: &mut BufReader<File>,
-        line: &mut Vec<u8>,
-    ) -> Result<bool, HarnessError> {
+    fn next_line(&self, reader: &mut Input, line: &mut Vec<u8>) -> Result<bool, HarnessError> {
         line.clear();
         let n = reader
             .read_until(b'\n', line)
@@ -134,15 +148,12 @@ impl Transfer<'_> {
         Ok(n > 0)
     }
 
-    fn opaque(&mut self, reader: &mut BufReader<File>) -> Result<(), HarnessError> {
+    fn opaque(&mut self, reader: &mut Input) -> Result<(), HarnessError> {
         io::copy(reader, self.out).map_err(|e| HarnessError::io(IoOp::Write, self.src, e))?;
         Ok(())
     }
 
-    fn opaque_refusing_secrets(
-        &mut self,
-        reader: &mut BufReader<File>,
-    ) -> Result<(), HarnessError> {
+    fn opaque_refusing_secrets(&mut self, reader: &mut Input) -> Result<(), HarnessError> {
         let mut line = Vec::new();
         let mut number = 0usize;
         while self.next_line(reader, &mut line)? {
@@ -200,7 +211,7 @@ impl Transfer<'_> {
         }
     }
 
-    fn text(&mut self, reader: &mut BufReader<File>) -> Result<(), HarnessError> {
+    fn text(&mut self, reader: &mut Input) -> Result<(), HarnessError> {
         let mut line = Vec::new();
         while self.next_line(reader, &mut line)? {
             self.text_line(&line)?;
@@ -228,7 +239,7 @@ impl Transfer<'_> {
         }
     }
 
-    fn json_lines(&mut self, reader: &mut BufReader<File>) -> Result<(), HarnessError> {
+    fn json_lines(&mut self, reader: &mut Input) -> Result<(), HarnessError> {
         let mut line = Vec::new();
         let mut number = 0usize;
         while self.next_line(reader, &mut line)? {
@@ -259,7 +270,7 @@ impl Transfer<'_> {
         Ok(())
     }
 
-    fn json_document(&mut self, reader: &mut BufReader<File>) -> Result<(), HarnessError> {
+    fn json_document(&mut self, reader: &mut Input) -> Result<(), HarnessError> {
         let mut bytes = Vec::new();
         io::Read::read_to_end(reader, &mut bytes).map_err(|e| self.read_err(e))?;
         if let Ok(text) = std::str::from_utf8(&bytes) {
@@ -277,18 +288,21 @@ impl Transfer<'_> {
 }
 
 /// Copies `src` into `out` under the rules of `carry`, redacting with
-/// `redactor`. Every kind but a JSON document streams line by line;
-/// documents are the small sidecars (`settings.json`, `*.meta.json`),
-/// never a transcript.
+/// `redactor`, and returns the digest of the bytes it read from `src`.
+/// Every kind but a JSON document streams line by line; documents are the
+/// small sidecars (`settings.json`, `*.meta.json`), never a transcript.
 pub(crate) fn transfer(
     src: &Path,
     out: &mut dyn Write,
     carry: Carry,
     redactor: &Redactor,
     counts: &mut RedactionCounts,
-) -> Result<(), HarnessError> {
+) -> Result<Digest, HarnessError> {
     let input = File::open(src).map_err(|e| HarnessError::io(IoOp::Read, src, e))?;
-    let mut reader = BufReader::new(input);
+    let mut reader = BufReader::new(HashingRead {
+        inner: input,
+        hasher: blake3::Hasher::new(),
+    });
     let mut step = Transfer {
         src,
         out,
@@ -302,7 +316,11 @@ pub(crate) fn transfer(
         Carry::Text => step.text(&mut reader),
         Carry::JsonLines => step.json_lines(&mut reader),
         Carry::JsonDocument => step.json_document(&mut reader),
-    }
+    }?;
+    // Every kind reads to the end; draining is a guard, so the digest
+    // always covers the whole file as this one open saw it.
+    io::copy(&mut reader, &mut io::sink()).map_err(|e| HarnessError::io(IoOp::Read, src, e))?;
+    Ok(Digest::from_hash(reader.into_inner().hasher.finalize()))
 }
 
 fn fold_counts(counts: &mut RedactionCounts, outcome: &jsontext::Outcome) {
@@ -326,15 +344,26 @@ fn clear_manifest(out: &Path) -> Result<(), HarnessError> {
     }
 }
 
+/// What staging produced.
+#[derive(Debug)]
+pub(crate) struct Staged {
+    /// The carried entries, sorted by tree path.
+    pub carried: Vec<Carried>,
+    /// Each rewritable source on this node and the digest of the bytes
+    /// staging read from it, from the same read that staged it.
+    pub replaceable: Vec<(PathBuf, Digest)>,
+}
+
 /// Stages `sources` under `out`, checking the denylist and redacting as
-/// each file's `Carry` says. Returns the carried entries sorted by path and
-/// adds to the redaction counts. An earlier manifest in `out` is removed
-/// first; the caller writes the new one last.
+/// each file's `Carry` says. Returns the carried entries sorted by path,
+/// with the digests of the rewritable sources as read, and adds to the
+/// redaction counts. An earlier manifest in `out` is removed first; the
+/// caller writes the new one last.
 pub(crate) fn stage(
     sources: &[Source],
     out: &Path,
     counts: &mut RedactionCounts,
-) -> Result<Vec<Carried>, HarnessError> {
+) -> Result<Staged, HarnessError> {
     let mut sorted: Vec<&Source> = sources.iter().collect();
     sorted.sort_by(|a, b| a.rel.cmp(&b.rel));
     if let Some(pair) = sorted.windows(2).find(|pair| pair[0].rel == pair[1].rel) {
@@ -353,11 +382,19 @@ pub(crate) fn stage(
     let redactor = Redactor::standard()?;
     clear_manifest(out)?;
     let mut carried = Vec::with_capacity(sorted.len());
+    let mut replaceable = Vec::new();
     for (index, source) in sorted.into_iter().enumerate() {
         let dst = out.join(source.rel.as_str());
+        let mut read = None;
         let written = durable::write_atomic_with(&dst, |w| {
-            transfer(&source.abs, w, source.carry, redactor, counts)
+            read = Some(transfer(&source.abs, w, source.carry, redactor, counts)?);
+            Ok(())
         })?;
+        if source.mutability == Mutability::Replaceable
+            && let Some(read) = read
+        {
+            replaceable.push((source.abs.clone(), read));
+        }
         carried.push(Carried {
             rel_path: source.rel.clone(),
             content: source.carry.content(),
@@ -367,7 +404,10 @@ pub(crate) fn stage(
         });
         crashpoint("stage-after-file", index);
     }
-    Ok(carried)
+    Ok(Staged {
+        carried,
+        replaceable,
+    })
 }
 
 /// The length and digest of the file at `path`.
@@ -419,8 +459,8 @@ mod tests {
         fs::write(&src, bytes).unwrap();
         let out = dir.join("out");
         let sources = vec![source(src, &format!("home/{name}"), carry)];
-        let carried = stage(&sources, &out, &mut RedactionCounts::new()).unwrap();
-        (out.join(format!("home/{name}")), carried)
+        let staged = stage(&sources, &out, &mut RedactionCounts::new()).unwrap();
+        (out.join(format!("home/{name}")), staged.carried)
     }
 
     fn mode(path: &Path) -> u32 {
@@ -481,7 +521,8 @@ mod tests {
             &out,
             &mut counts,
         )
-        .unwrap();
+        .unwrap()
+        .carried;
         let staged = fs::read_to_string(out.join("home/t.jsonl")).unwrap();
         assert!(!staged.contains(GITHUB));
         assert_eq!(counts.get("github-token"), Some(&2));
