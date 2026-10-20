@@ -6,7 +6,7 @@ Private repository. Working name; see [ADR 0010](docs/adr/0010-name-and-scope-bo
 
 ## Status, honestly
 
-Core types, the store and the network layer. Nothing suspends or resumes yet.
+Core types, the store, the network layer, the harness adapters and the environment crate. Nothing suspends or resumes yet.
 
 | What | State |
 |---|---|
@@ -16,6 +16,7 @@ Core types, the store and the network layer. Nothing suspends or resumes yet.
 | `crates/fabric-store` | Content-addressed objects (blake3, zstd, FastCDC above 8 MiB), the SQLite catalog with refcounts and a graced gc, workspace capture (git state as two private commits and a bundle, ignored files by class, secrets denied) and restore into an empty directory through a staging rename. Crash-tested with `SIGKILL` at every publish and restore checkpoint. No network, no ledger, no CLI. |
 | `crates/fabric-net` | Node key, pinned TLS with no CA, QUIC and TCP+TLS transports on one port behind one endpoint, framed and typed RPC with deadlines, paged ledger records and verified zstd chunk transfer, the peer book. Tested with two nodes in one process on both wires. See [docs/net.md](docs/net.md). |
 | `crates/fabric-harness` | The `Harness` trait and three adapters: Claude Code, Codex and any Agent Client Protocol agent. Captures a session into a redacted state tree with a manifest, restores it all or nothing under the same workspace path and home, never over state that would lose bytes, launches the harness in a new process group with typed flags. A hard-coded denylist keeps credentials and host state out of the tree. Crash-tested at every staged and placed file. |
+| `crates/fabric-env` | `EnvSpec` detection from the files a workspace already has and from `.fabric/env.toml`, the secret policy that snapshot capture applies, and the materializer that runs setup steps only when a cache is missing or torn, with a dry run. Tested against fixture workspaces and real `git`. |
 | Every other crate in the layout | Does not exist yet |
 | CI | fmt, clippy, test, doc, `cargo deny` and the hygiene script on macOS and Ubuntu |
 

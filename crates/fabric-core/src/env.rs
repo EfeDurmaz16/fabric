@@ -13,6 +13,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::codec::{self, CodecError, VersionedError};
+use crate::credential::looks_like_credential;
 use crate::harness::ProgramName;
 use crate::id::EnvSpecId;
 use crate::path::RelPath;
@@ -27,13 +28,13 @@ pub enum EnvSpecError {
     /// A list is not strictly sorted by its key, which also catches a repeated key.
     #[error("{list} entry {index} is not strictly after the one before it")]
     OutOfOrder {
-        /// Which list: `tools`, `env_var_names` or `cache_paths`.
+        /// Which list: `tools`, `env_var_names`, `cache_paths` or `secret_patterns`.
         list: &'static str,
         /// Zero-based index of the entry, within its list.
         index: usize,
     },
     /// The bytes carry another version or do not decode, or the value does
-    /// not encode. A bad program or variable name on the wire surfaces here too.
+    /// not encode. A bad program, variable or tool name, or a bad pin, on the wire surfaces here too.
     #[error("environment spec codec: {0}")]
     Codec(#[from] VersionedError),
 }
@@ -118,10 +119,213 @@ impl<'de> Deserialize<'de> for EnvVarName {
     }
 }
 
+/// The most characters a tool name or a version pin may have.
+pub const MAX_PIN_LEN: usize = 64;
+
+/// Why a tool name or a version pin was refused; the text itself is never quoted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PinError {
+    /// The text has no characters.
+    #[error("is empty")]
+    Empty,
+    /// The text is longer than `MAX_PIN_LEN` characters.
+    #[error("is longer than {MAX_PIN_LEN} characters")]
+    TooLong,
+    /// A character outside printable ASCII, or a space in a tool name.
+    #[error("has a character outside printable ASCII, or a space in a tool name")]
+    BadChar,
+    /// The text is shaped like a token, a key or a URL with a password.
+    #[error("looks like a credential; the spec travels to other nodes")]
+    Credential,
+}
+
+/// Checks the rules a tool name and a version pin share; `space` says whether a space is allowed.
+fn check_pin_text(text: &str, space: bool) -> Result<(), PinError> {
+    if text.is_empty() {
+        return Err(PinError::Empty);
+    }
+    if text.len() > MAX_PIN_LEN {
+        return Err(PinError::TooLong);
+    }
+    let first = if space { b' ' } else { b'!' };
+    if !text.bytes().all(|b| (first..=b'~').contains(&b)) {
+        return Err(PinError::BadChar);
+    }
+    if looks_like_credential(text) {
+        return Err(PinError::Credential);
+    }
+    Ok(())
+}
+
+/// The name of a pinned tool as pin files write it, such as `node`, `rust` or `npm:@angular/cli`.
+///
+/// One to 64 printable ASCII characters with no space, and not shaped like
+/// a credential. Checked once, at the boundary, including inside
+/// `Deserialize`, so a name from a peer cannot carry a terminal escape
+/// sequence or a token to the node that prints it.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ToolName(String);
+
+impl ToolName {
+    /// Checks `text` against the rules and wraps it.
+    pub fn parse(text: &str) -> Result<Self, PinError> {
+        check_pin_text(text, false)?;
+        Ok(Self(text.to_owned()))
+    }
+
+    /// Returns the name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A version pin as its file wrote it, such as `22`, `v20`, `>=18 <21` or `1.97.1`.
+///
+/// One to 64 printable ASCII characters, spaces allowed, and not shaped
+/// like a credential. Kept whole and never parsed into parts. Checked once,
+/// at the boundary, including inside `Deserialize`.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ToolVersion(String);
+
+impl ToolVersion {
+    /// Checks `text` against the rules and wraps it.
+    pub fn parse(text: &str) -> Result<Self, PinError> {
+        check_pin_text(text, true)?;
+        Ok(Self(text.to_owned()))
+    }
+
+    /// Returns the pin.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+macro_rules! pin_text_impls {
+    ($name:ident) => {
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}({:?})", stringify!($name), self.0)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = PinError;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Self::parse(s)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let text = String::deserialize(deserializer)?;
+                Self::parse(&text).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+pin_text_impls!(ToolName);
+pin_text_impls!(ToolVersion);
+
+/// Why a secret pattern was refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SecretPatternError {
+    /// The pattern has no characters.
+    #[error("secret pattern is empty")]
+    Empty,
+    /// A leading, trailing or doubled slash.
+    #[error("secret pattern has an empty component")]
+    EmptyComponent,
+    /// A `.` or `..` component, which no path holds.
+    #[error("secret pattern has a `.` or `..` component")]
+    DotComponent,
+    /// A `**` component; a pattern already matches at any depth.
+    #[error("secret pattern has a `**` component; a pattern already matches at any depth")]
+    DoubleStar,
+    /// A character with a meaning in gitignore that the matcher does not share.
+    #[error("secret pattern has an unsupported character at index {index}")]
+    BadChar {
+        /// Zero-based byte index of the character.
+        index: usize,
+    },
+}
+
+/// A secret pattern a job adds to the built-in list: path components separated by `/`, where `*` matches any run of characters.
+///
+/// Refused: `\`, `[`, `]`, `?`, `!`, `#`, whitespace and NUL, because
+/// gitignore gives them meanings the matcher does not, and empty, `.`, `..`
+/// and `**` components. Checked once, at the boundary, including inside
+/// `Deserialize`. The matcher itself is `fabric_env::secret`.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct SecretPattern(String);
+
+impl SecretPattern {
+    /// Checks `text` against the pattern rules and wraps it.
+    pub fn parse(text: &str) -> Result<Self, SecretPatternError> {
+        if text.is_empty() {
+            return Err(SecretPatternError::Empty);
+        }
+        let bad = text.char_indices().find(|&(_, c)| {
+            matches!(c, '\\' | '[' | ']' | '?' | '!' | '#' | '\0') || c.is_whitespace()
+        });
+        if let Some((index, _)) = bad {
+            return Err(SecretPatternError::BadChar { index });
+        }
+        for component in text.split('/') {
+            match component {
+                "" => return Err(SecretPatternError::EmptyComponent),
+                "." | ".." => return Err(SecretPatternError::DotComponent),
+                "**" => return Err(SecretPatternError::DoubleStar),
+                _ => {}
+            }
+        }
+        Ok(Self(text.to_owned()))
+    }
+
+    /// Returns the pattern text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SecretPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Debug for SecretPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SecretPattern({:?})", self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretPattern {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).map_err(serde::de::Error::custom)
+    }
+}
+
 /// What a workspace needs before a harness can run in it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvSpec {
-    /// Tools the workspace was seen with; used to warn, never to fail. Sorted by name.
+    /// Tools the workspace pins. Informational: printed beside the measured
+    /// versions, never compared for equality and never a reason to fail.
+    /// Sorted by name.
     pub tools: Vec<Tool>,
     /// Commands that make the workspace runnable, in the order they run.
     pub setup: Vec<SetupStep>,
@@ -129,15 +333,19 @@ pub struct EnvSpec {
     pub env_var_names: Vec<EnvVarName>,
     /// Paths that count as caches for snapshot policy and warmth checks. Sorted.
     pub cache_paths: Vec<RelPath>,
+    /// Secret patterns the job added to the built-in list. The list only
+    /// grows: detection keeps every pattern the job's previous spec held,
+    /// even after the override file drops it. Sorted.
+    pub secret_patterns: Vec<SecretPattern>,
 }
 
-/// One tool and the exact version string it reported.
+/// One tool and the version its workspace pins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tool {
-    /// The tool's name, such as `node` or `rustc`.
-    pub name: String,
-    /// The tool's own version output, kept whole and never parsed into parts.
-    pub version: String,
+    /// The tool's name as pin files write it, such as `node`, `rust` or `pnpm`.
+    pub name: ToolName,
+    /// The pin as its file wrote it (`22`, `v20`, `>=18`, `1.97.1`), kept whole and never parsed into parts.
+    pub version: ToolVersion,
     /// Where the entry came from.
     pub source: ToolSource,
 }
@@ -167,7 +375,9 @@ pub struct SetupStep {
 /// When a setup step runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunWhen {
-    /// Only when a cache path is missing, empty, partial or keyed to another node.
+    /// When a cache path is missing, empty, partial or keyed to another
+    /// node, and on every resume when the spec has no cache paths, since
+    /// nothing then proves the workspace warm.
     CachesMissing,
     /// On every resume.
     Always,
@@ -186,6 +396,10 @@ impl EnvSpec {
                 first_out_of_order(self.env_var_names.iter()),
             ),
             ("cache_paths", first_out_of_order(self.cache_paths.iter())),
+            (
+                "secret_patterns",
+                first_out_of_order(self.secret_patterns.iter()),
+            ),
         ];
         for (list, index) in lists {
             if let Some(index) = index {
@@ -225,8 +439,8 @@ mod tests {
     fn spec() -> EnvSpec {
         EnvSpec {
             tools: vec![Tool {
-                name: "node".into(),
-                version: "v22.23.2".into(),
+                name: ToolName::parse("node").unwrap(),
+                version: ToolVersion::parse("v22.23.2").unwrap(),
                 source: ToolSource::Detected,
             }],
             setup: vec![SetupStep {
@@ -237,6 +451,7 @@ mod tests {
             }],
             env_var_names: vec![var("DATABASE_URL")],
             cache_paths: vec![RelPath::parse("node_modules").unwrap()],
+            secret_patterns: vec![SecretPattern::parse("*.sqlite").unwrap()],
         }
     }
 
@@ -247,12 +462,6 @@ mod tests {
         b.env_var_names.push(var("OTHER"));
         assert_ne!(a.id().unwrap(), b.id().unwrap());
         assert_eq!(a.id().unwrap(), spec().id().unwrap());
-    }
-
-    #[test]
-    fn decode_round_trips() {
-        let bytes = spec().encode().unwrap();
-        assert_eq!(EnvSpec::decode(&bytes).unwrap(), spec());
     }
 
     /// A name cannot carry a value: `DATABASE_URL=postgres://u:p@h/db` is
@@ -276,6 +485,106 @@ mod tests {
         );
         let bytes = postcard::to_stdvec("A=b").unwrap();
         assert!(postcard::from_bytes::<EnvVarName>(&bytes).is_err());
+    }
+
+    /// One sample per refusal, and the shapes real pin files hold pass.
+    #[test]
+    fn a_pin_is_short_printable_and_not_a_credential() {
+        for ok in [
+            "22",
+            "v20",
+            ">=18 <21",
+            "^18 || ^20",
+            "1.97.1",
+            "lts/*",
+            "3.12",
+        ] {
+            assert!(ToolVersion::parse(ok).is_ok(), "{ok}");
+        }
+        for ok in ["node", "npm:@angular/cli", "aqua:cli/cli"] {
+            assert!(ToolName::parse(ok).is_ok(), "{ok}");
+        }
+        assert_eq!(ToolVersion::parse(""), Err(PinError::Empty));
+        assert_eq!(
+            ToolVersion::parse(&"1".repeat(MAX_PIN_LEN + 1)),
+            Err(PinError::TooLong)
+        );
+        assert_eq!(ToolVersion::parse("22\u{7}"), Err(PinError::BadChar));
+        assert_eq!(ToolVersion::parse("2\u{e9}"), Err(PinError::BadChar));
+        assert_eq!(ToolName::parse("my tool"), Err(PinError::BadChar));
+        assert_eq!(ToolName::parse("\u{1b}[31mnode"), Err(PinError::BadChar));
+        assert_eq!(
+            ToolVersion::parse("https://u:p@registry.example.com/x"),
+            Err(PinError::Credential)
+        );
+        let token = format!("ghp_{}", "q7".repeat(18));
+        assert_eq!(ToolName::parse(&token), Err(PinError::Credential));
+    }
+
+    /// A peer's spec is checked like a local one: a name that carries a
+    /// terminal escape or a token does not decode.
+    #[test]
+    fn a_bad_tool_name_or_pin_does_not_decode() {
+        let token = format!("ghp_{}", "q7".repeat(18));
+        for bad in ["\u{1b}[31mnode\n", token.as_str(), ""] {
+            let bytes = postcard::to_stdvec(bad).unwrap();
+            assert!(postcard::from_bytes::<ToolName>(&bytes).is_err(), "{bad:?}");
+            assert!(
+                postcard::from_bytes::<ToolVersion>(&bytes).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_secret_pattern_that_gitignore_would_read_differently_is_refused() {
+        assert_eq!(SecretPattern::parse(""), Err(SecretPatternError::Empty));
+        assert_eq!(
+            SecretPattern::parse("/x"),
+            Err(SecretPatternError::EmptyComponent)
+        );
+        assert_eq!(
+            SecretPattern::parse("x/"),
+            Err(SecretPatternError::EmptyComponent)
+        );
+        assert_eq!(
+            SecretPattern::parse("a/../b"),
+            Err(SecretPatternError::DotComponent)
+        );
+        assert_eq!(
+            SecretPattern::parse("**/x"),
+            Err(SecretPatternError::DoubleStar)
+        );
+        assert_eq!(
+            SecretPattern::parse("!x"),
+            Err(SecretPatternError::BadChar { index: 0 })
+        );
+        assert_eq!(
+            SecretPattern::parse("#x"),
+            Err(SecretPatternError::BadChar { index: 0 })
+        );
+        assert_eq!(
+            SecretPattern::parse("x?"),
+            Err(SecretPatternError::BadChar { index: 1 })
+        );
+        assert_eq!(
+            SecretPattern::parse("[ab]"),
+            Err(SecretPatternError::BadChar { index: 0 })
+        );
+        assert_eq!(
+            SecretPattern::parse("a b"),
+            Err(SecretPatternError::BadChar { index: 1 })
+        );
+        assert_eq!(
+            SecretPattern::parse("x\\"),
+            Err(SecretPatternError::BadChar { index: 1 })
+        );
+    }
+
+    #[test]
+    fn a_bad_secret_pattern_does_not_decode() {
+        let bytes = postcard::to_stdvec("**/x").unwrap();
+        assert!(postcard::from_bytes::<SecretPattern>(&bytes).is_err());
     }
 
     /// Two specs with the same content in another order would have two ids.

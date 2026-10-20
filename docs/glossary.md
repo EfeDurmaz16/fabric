@@ -18,7 +18,7 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Doctor.** `fabric doctor`: the preflight that compares exact strings (user, home, tool versions, logins as yes or no, clock offset, synced folders) between two nodes and refuses a move on a mismatch the table marks as refuse.
 
-**EnvSpec.** The environment specification of a job: tool versions, setup steps, env var names and cache paths. It describes how to make a node able to run the job. It never contains secret values.
+**EnvSpec.** The environment specification of a job: tool pins, setup steps, env var names, cache paths and the secret patterns the job added. It describes how to make a node able to run the job. It never contains secret values.
 
 **Event.** One append-only record in a job's ledger. Events are never edited or deleted.
 

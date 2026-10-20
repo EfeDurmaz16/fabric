@@ -1,0 +1,23 @@
+[package]
+name = "fabric-env"
+version = "0.1.0"
+description = "Environment of a Fabric job: EnvSpec detection, the override file, the secret policy and materialization"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+fabric-core = { path = "../fabric-core" }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+thiserror = "2.0"
+toml = { version = "1.1", default-features = false, features = ["std", "parse", "serde", "preserve_order"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+proptest = { version = "1.12", default-features = false, features = ["std"] }
+tempfile = "3.27"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+
+[lints]
+workspace = true

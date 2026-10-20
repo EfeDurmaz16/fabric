@@ -50,7 +50,7 @@ All four cargo commands must pass locally before every push, and their summary l
 ### Decisions
 
 - Any choice that a future reader would ask "why" about gets an ADR: Context, Decision, Alternatives considered (with evidence paths), Consequences, Open questions.
-- ADRs are numbered, never renumbered, and superseded by a new ADR rather than edited, except to fix errors of fact.
+- ADRs are numbered and never renumbered. Until the first release, an ADR may be amended in place: the change gets a dated amendment note under the status line that says what changed, why, and which PR or review found it, and the body is corrected to match. After the first release an ADR is superseded by a new ADR rather than edited, except to fix errors of fact. Amended 2026-10-20 after the review of PR `feat/env`, which found that ADRs 0004 and 0007 were already being amended this way while the rule said otherwise.
 
 ## Alternatives considered
 

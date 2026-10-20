@@ -1,0 +1,20 @@
+//! The environment of a Fabric job (ADR 0007, ADR 0012).
+//!
+//! Detection reads the files a workspace already has, plus the user's
+//! `.fabric/env.toml`, and builds an `EnvSpec`: tool pins, setup steps,
+//! environment variable names and cache paths. The materializer checks a
+//! restored workspace against that spec and runs setup steps only when a
+//! cache is missing or torn. The secret policy is the one list of path
+//! patterns that never leave a node; snapshot capture applies it too.
+//!
+//! The crate never reads, stores or logs the value of an environment
+//! variable, never copies a credential and never runs a program through a
+//! shell. What a setup step prints is another matter: each line goes to
+//! the log as the step printed it, so a declared `sh -c` step or an
+//! installer that echoes a token puts that token in the log. It targets
+//! Unix: the materializer reads execute bits to find a program.
+
+pub mod detect;
+pub mod materialize;
+pub mod overrides;
+pub mod secret;
