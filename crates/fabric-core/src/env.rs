@@ -360,9 +360,10 @@ pub struct SetupStep {
 /// When a setup step runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunWhen {
-    /// When a cache path is missing, empty, partial or keyed to another
-    /// node, and on every resume when the spec has no cache paths, since
-    /// nothing then proves the workspace warm.
+    /// When a cache the detection report says this step fills is missing,
+    /// empty or lacks its completion proof; a step that fills no workspace
+    /// cache runs when any cache is not whole or the report has none
+    /// (ADR 0007, step 3 of Materialize).
     CachesMissing,
     /// On every resume.
     Always,
