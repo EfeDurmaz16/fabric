@@ -152,6 +152,25 @@ pub enum Request {
         /// The `PATH` of the user's shell.
         path_var: OsString,
     },
+    /// The harness named the session it runs after it started, as `codex
+    /// exec` names a new thread; the daemon records it for the harness it
+    /// recorded.
+    HarnessSession(NamedSession),
+}
+
+/// A session a running harness named, for `Request::HarnessSession`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamedSession {
+    /// The job.
+    pub job: JobId,
+    /// The epoch the plan was made under.
+    pub epoch: Epoch,
+    /// The harness process, as registered.
+    pub pid: NonZeroU32,
+    /// The harness that runs.
+    pub harness: HarnessKind,
+    /// The session it named.
+    pub session: SessionId,
 }
 
 /// A user's decision on a job's work (ADR 0016, Decisions as ledger events).

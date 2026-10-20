@@ -137,6 +137,18 @@ pub enum NodeError {
         /// The pid the CLI named.
         pid: std::num::NonZeroU32,
     },
+    /// A session was named for a harness this node no longer records.
+    #[error(
+        "job {job}: pid {pid} is not the harness this node records, because a suspend, a move or a fence stopped it, so its session {session} is not recorded"
+    )]
+    HarnessNotRecorded {
+        /// The job.
+        job: JobId,
+        /// The pid the CLI named.
+        pid: std::num::NonZeroU32,
+        /// The session it named.
+        session: fabric_harness::SessionId,
+    },
     /// The workspace at the root was left by an earlier tenure of this node.
     #[error(
         "job {job}: the workspace at {root} was left at epoch {epoch}, before this node's tenure, and may differ from the job's latest snapshot; run `fabric job resume {job}`, which sets it aside and restores the latest snapshot"
@@ -300,7 +312,8 @@ impl NodeError {
             | NodeError::NoWorkspace(_)
             | NodeError::StaleWorkspace { .. }
             | NodeError::NoSnapshot(_)
-            | NodeError::HarnessGone { .. } => Refusal::JobState,
+            | NodeError::HarnessGone { .. }
+            | NodeError::HarnessNotRecorded { .. } => Refusal::JobState,
             _ => Refusal::Failed,
         }
     }

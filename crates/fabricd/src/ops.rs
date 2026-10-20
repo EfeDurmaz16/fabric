@@ -34,7 +34,7 @@ use fabric_store::restore::{
 };
 
 use crate::clock;
-use crate::control::{Decision, Request, RunPlan};
+use crate::control::{Decision, NamedSession, Request, RunPlan};
 use crate::doctor::{self, Context, Target};
 use crate::error::NodeError;
 use crate::facts::{MeasuredKeys, NodeFacts, key_difference};
@@ -142,6 +142,7 @@ impl Node {
                     .await?;
             }
             Request::HarnessExited { job, pid } => self.harness_exited(job, pid).await?,
+            Request::HarnessSession(named) => self.harness_session(named, out).await?,
             Request::JobSuspend { job, path_var } => {
                 self.resolve_departing(job, out).await?;
                 self.suspend(job, &path_var, out).await?;
@@ -531,6 +532,55 @@ impl Node {
         out.say(format!(
             "Resumed recorded at epoch {epoch}; {harness} runs as pid {pid}"
         ));
+        Ok(())
+    }
+
+    /// Records the session a harness named after it started, for the
+    /// harness this node recorded: a headless Codex run names a new thread
+    /// only once it runs, and a capture without the session would leave the
+    /// thread behind.
+    ///
+    /// It refuses a stale epoch and a pid that is not the recorded
+    /// harness's. A suspend, a move or a fence that stopped the harness
+    /// removed its record and captured without the session, so a session
+    /// recorded later would name one the snapshot does not hold.
+    pub(crate) async fn harness_session(
+        &self,
+        named: NamedSession,
+        out: &mut Out,
+    ) -> Result<(), NodeError> {
+        let NamedSession {
+            job: id,
+            epoch,
+            pid,
+            harness,
+            session,
+        } = named;
+        let job = self.job(id).await?;
+        let job = job.lock().await;
+        let token = owner_token(&job, self.id)?;
+        if token.epoch != epoch {
+            return Err(FenceError::StaleEpoch {
+                yours: epoch,
+                current: token.epoch,
+            }
+            .into());
+        }
+        if job.harness_record()?.is_none_or(|record| record.pid != pid) {
+            return Err(NodeError::HarnessNotRecorded {
+                job: id,
+                pid,
+                session,
+            });
+        }
+        local::write(
+            &job.dir().session(),
+            &SessionRecord {
+                harness: harness.clone(),
+                session: session.clone(),
+            },
+        )?;
+        out.say(format!("recorded {harness} session {session}"));
         Ok(())
     }
 
@@ -2320,6 +2370,67 @@ pub(crate) mod tests {
             job.session().unwrap().is_none(),
             "the stale session would be continued"
         );
+    }
+
+    /// A headless Codex run names its thread only once it runs. The node
+    /// records that session for the harness it recorded and for no other
+    /// pid, and not once that harness was stopped, because the suspend or
+    /// fence that stopped it captured without the session.
+    #[tokio::test]
+    async fn a_session_named_after_the_start_is_recorded_only_for_the_recorded_harness() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let out = &mut Out::default();
+        node.suspend(id, &path, out).await.unwrap();
+        node.job_run(id, out).await.unwrap();
+        let mut harness = sleeper();
+        register(&node, id, pid(&harness)).await.unwrap();
+        let thread = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
+        let name = |pid| {
+            let (node, thread) = (Arc::clone(&node), thread.clone());
+            async move {
+                node.harness_session(
+                    NamedSession {
+                        job: id,
+                        epoch: Epoch::FIRST,
+                        pid,
+                        harness: HarnessKind::Codex,
+                        session: thread,
+                    },
+                    &mut Out::default(),
+                )
+                .await
+            }
+        };
+
+        let other = NonZeroU32::new(pid(&harness).get() + 1).unwrap();
+        assert!(matches!(
+            name(other).await,
+            Err(NodeError::HarnessNotRecorded { .. })
+        ));
+        let recorded = || async {
+            let job = node.job(id).await.unwrap();
+            let job = job.lock().await;
+            job.session().unwrap()
+        };
+        assert_eq!(recorded().await, None);
+        name(pid(&harness)).await.unwrap();
+        assert_eq!(
+            recorded().await,
+            Some(SessionRecord {
+                harness: HarnessKind::Codex,
+                session: thread.clone(),
+            })
+        );
+
+        harness.kill().unwrap();
+        harness.wait().unwrap();
+        node.harness_exited(id, pid(&harness)).await.unwrap();
+        assert!(matches!(
+            name(pid(&harness)).await,
+            Err(NodeError::HarnessNotRecorded { .. })
+        ));
     }
 
     /// Two moves typed at once toward different nodes: the second finds the
