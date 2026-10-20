@@ -48,7 +48,7 @@ pub enum Verify {
 pub enum Durability {
     /// A killed process: the kernel finishes the writes it was given.
     ProcessCrash,
-    /// A power loss: every file restore writes, and the index, refs, packs and config git writes, reach the drive before the rename, and the rename's directory flush empties the drive cache.
+    /// A power loss: every file restore writes, every directory of the staging tree, and the index, refs, packs and config git writes, reach the drive before the rename, and the rename's directory flush empties the drive cache.
     PowerLoss,
 }
 
@@ -406,13 +406,41 @@ fn write_entries(
             report.files += 1;
         }
     }
+    let sync = durability == Durability::PowerLoss;
     for entry in kept.iter().rev() {
         if matches!(entry.kind, EntryKind::Dir) {
-            writer.set_dir_mode(&entry.rel_path, entry.mode)?;
-            writer.set_mtime(&entry.rel_path, entry.mtime_ns)?;
+            writer.finish_dir(&entry.rel_path, entry.mode, entry.mtime_ns, sync)?;
         }
     }
     Ok(())
+}
+
+/// Flushes every directory under `root`, and `root` itself, deepest first, without following links.
+///
+/// The files are flushed as they are written, but a file's flush does not
+/// make its name durable: the directory that holds it must be flushed too,
+/// before the rename that publishes the tree. A directory this cannot open
+/// is one `write_entries` gave a recorded mode without read permission, and
+/// it flushed that one already, children first.
+fn sync_dirs(root: &Path) -> Result<(), RestoreError> {
+    use rustix::fs::{Mode as RawBits, OFlags};
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let fd = match rustix::fs::open(root, flags, RawBits::empty()) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::ACCESS) => return Ok(()),
+        Err(e) => return Err(io_err(root, e.into())),
+    };
+    for entry in fs::read_dir(root).map_err(|e| io_err(root, e))? {
+        let entry = entry.map_err(|e| io_err(root, e))?;
+        if entry
+            .file_type()
+            .map_err(|e| io_err(&entry.path(), e))?
+            .is_dir()
+        {
+            sync_dirs(&entry.path())?;
+        }
+    }
+    rustix::fs::fsync(&fd).map_err(|e| io_err(root, e.into()))
 }
 
 /// Re-reads written files against the store and returns how many matched.
@@ -1095,6 +1123,9 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
                 &keep_all,
                 req.verify,
             )?;
+            if req.durability == Durability::PowerLoss {
+                sync_dirs(&hs_staging)?;
+            }
             move_into_place(&hs_staging, dir)?;
             checkpoint::reached("restore.after_harness_rename");
         }
@@ -1112,6 +1143,9 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
             }
             git.run(&["config", "--local", &key.to_string(), value.as_str()])?;
         }
+    }
+    if req.durability == Durability::PowerLoss {
+        sync_dirs(&staging)?;
     }
     checkpoint::reached("restore.before_rename");
     move_into_place(&staging, req.target)?;
