@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-use fabric_core::git::{BranchName, GitConfigKey, GitConfigValue, GitOid, RefName};
+use fabric_core::git::{
+    BranchName, GitConfigKey, GitConfigValue, GitOid, RefName, credential_range,
+};
 use fabric_core::id::{ChunkId, EnvSpecId, JobId, NodeId, SnapshotId};
 use fabric_core::path::{AbsPath, PathError, RelPath};
 use fabric_core::snapshot::{
@@ -994,12 +996,10 @@ impl GitCapture<'_> {
     }
 }
 
-/// Removes `user[:password]@` from a `scheme://` URL's authority.
+/// Removes the part of a remote URL that can hold a credential (`fabric_core::git::credential_range`).
 fn strip_userinfo(url: &str) -> Option<String> {
-    let (scheme, rest) = url.split_once("://")?;
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let at = rest[..end].rfind('@')?;
-    Some(format!("{scheme}://{}", &rest[at + 1..]))
+    let range = credential_range(url)?;
+    Some(format!("{}{}", &url[..range.start], &url[range.end..]))
 }
 
 /// Captures the workspace described by `req` into `store` and returns the manifest.
@@ -1249,9 +1249,10 @@ mod tests {
             strip_userinfo("https://user:tok@example.com/x.git").as_deref(),
             Some("https://example.com/x.git")
         );
+        assert_eq!(strip_userinfo("ssh://git@github.com/x/y"), None);
         assert_eq!(
-            strip_userinfo("ssh://git@github.com/x/y").as_deref(),
-            Some("ssh://github.com/x/y")
+            strip_userinfo("ssh://git:pw@github.com/x/y").as_deref(),
+            Some("ssh://git@github.com/x/y")
         );
         assert_eq!(strip_userinfo("https://example.com/a@b"), None);
         assert_eq!(strip_userinfo("git@github.com:x/y.git"), None);

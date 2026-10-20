@@ -177,17 +177,35 @@ impl GitConfigValue {
     }
 
     /// Returns true when the value is a `scheme://` URL whose authority holds
-    /// userinfo, which is where a token lives in a remote URL.
-    ///
-    /// The scp-like form `git@host:path` has no scheme and no password slot,
-    /// so it is not userinfo by this rule.
+    /// a credential, by the rule of `credential_range`.
     #[must_use]
     pub fn has_userinfo(&self) -> bool {
-        let Some((_, rest)) = self.0.split_once("://") else {
-            return false;
-        };
-        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        rest[..end].contains('@')
+        credential_range(&self.0).is_some()
+    }
+}
+
+/// Returns the bytes of a remote URL that can hold a credential, for removal.
+///
+/// For `http`, `https` and every other scheme that is the whole `user[:password]@`
+/// of the authority, because a token can sit in either slot. For `ssh`,
+/// `git+ssh` and `ssh+git` it is only the `:password` part: the user name is
+/// how the server picks the account (`ssh://git@github.com/...`), not a
+/// secret, and dropping it makes push fail on the target. The scp-like form
+/// `git@host:path` has no scheme and no password slot, so it has none.
+#[must_use]
+pub fn credential_range(url: &str) -> Option<std::ops::Range<usize>> {
+    let (scheme, rest) = url.split_once("://")?;
+    let start = scheme.len() + 3;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let at = rest[..end].rfind('@')?;
+    let ssh = ["ssh", "git+ssh", "ssh+git"]
+        .iter()
+        .any(|s| scheme.eq_ignore_ascii_case(s));
+    if ssh {
+        let colon = rest[..at].find(':')?;
+        Some(start + colon..start + at)
+    } else {
+        Some(start..start + at + 1)
     }
 }
 
@@ -399,7 +417,9 @@ mod tests {
         let with = |v: &str| GitConfigValue::parse(v).unwrap().has_userinfo();
         assert!(with("https://efe:ghp_secret123@github.com/x/y.git"));
         assert!(with("https://token@github.com/x/y.git"));
-        assert!(with("ssh://git@github.com/x/y.git"));
+        assert!(!with("ssh://git@github.com/x/y.git"));
+        assert!(with("ssh://git:hunter2@github.com/x/y.git"));
+        assert!(with("git+ssh://git:hunter2@github.com/x/y.git"));
         assert!(!with("https://github.com/x/y.git"));
         assert!(!with("https://github.com/x/y.git?u=a@b"));
         assert!(!with("git@github.com:x/y.git"));
