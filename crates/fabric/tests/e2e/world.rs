@@ -409,10 +409,12 @@ pub fn wait_for(path: &Path, what: &str) -> Fallible {
     Ok(())
 }
 
-/// Pairs two started nodes both ways.
+/// Pairs two started nodes the way the gate Macs pair: `a`, behind a NAT,
+/// knows where `b` listens; `b` trusts `a` and has no address to dial it, so
+/// every connection in the test is one `a` opened.
 pub fn pair(a: &Node, b: &Node) -> Fallible {
     a.ok(&["node", "add", &b.id, &b.addr()])?;
-    b.ok(&["node", "add", &a.id, &a.addr()])?;
+    b.ok(&["node", "add", &a.id])?;
     Ok(())
 }
 
