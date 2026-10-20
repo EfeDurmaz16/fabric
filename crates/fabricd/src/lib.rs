@@ -11,7 +11,10 @@
 //! anything acts on it, so a `kill -9` at any point leaves state the next
 //! command finishes or refuses with the command that resolves it.
 
+pub mod doctor;
 mod durable;
+pub mod facts;
+pub mod harnesses;
 pub mod ledger_file;
 pub mod local;
 pub mod paths;
