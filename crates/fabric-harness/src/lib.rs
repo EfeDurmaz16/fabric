@@ -1,4 +1,4 @@
-//! Harness adapters (ADR 0006).
+//! Harness adapters (ADR 0006, ADR 0013).
 //!
 //! A harness is the agent that does the work: Claude Code, Codex, or any
 //! agent that speaks the Agent Client Protocol. Each one keeps its session
@@ -13,7 +13,9 @@
 //! for byte, is refused when a secret shape is found in it. A restore
 //! writes only under the captured workspace path and home (ADR 0011), only
 //! where the adapter captures from, and only when no file already on disk
-//! would lose bytes; until every file passes, nothing is written.
+//! would lose bytes that did not leave with the job: a file the harness
+//! rewrites in place is replaced only when this node left it untouched.
+//! Until every file passes, nothing is written.
 //!
 //! The crate is organised around one trait, [`Harness`], and three
 //! adapters behind cargo features: [`acp`], [`claude`] and [`codex`].
