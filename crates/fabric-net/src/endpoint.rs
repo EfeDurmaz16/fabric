@@ -19,7 +19,7 @@ use crate::peers::HostPort;
 use crate::quic::QuicTransport;
 use crate::tcp::TcpTlsTransport;
 use crate::tls::{TlsError, Trust};
-use crate::transport::{Connection, Transport, TransportError};
+use crate::transport::{Connection, DIAL_TIMEOUT, Transport, TransportError};
 
 /// How long QUIC gets before the dial falls back to TCP with TLS.
 pub const QUIC_TIMEOUT: Duration = Duration::from_secs(3);
@@ -140,6 +140,10 @@ impl Endpoint {
 
     /// Dials `peer` at the first of `addrs` that answers, resolving names as needed.
     ///
+    /// A name lookup gets `DIAL_TIMEOUT`, as a dial does, so a resolver
+    /// that does not answer, such as a tailnet name while Tailscale is
+    /// down, costs one bounded wait before the next address is tried.
+    ///
     /// An address where another node answers, which a stale address can
     /// do after DHCP gave it away, is skipped like one that does not
     /// answer. A handshake signed with a key the certificate does not name
@@ -154,11 +158,17 @@ impl Endpoint {
             let resolved: Vec<SocketAddr> = match host {
                 HostPort::Addr(addr) => vec![*addr],
                 HostPort::Name(name, port) => {
-                    match tokio::net::lookup_host((name.as_str(), *port)).await {
-                        Ok(iter) => iter.collect(),
-                        Err(err) => {
+                    let lookup = tokio::net::lookup_host((name.as_str(), *port));
+                    match tokio::time::timeout(DIAL_TIMEOUT, lookup).await {
+                        Ok(Ok(iter)) => iter.collect(),
+                        Ok(Err(err)) => {
                             tracing::debug!(%host, error = %err, "name did not resolve");
                             last = TransportError::Io(err);
+                            continue;
+                        }
+                        Err(_) => {
+                            tracing::debug!(%host, "name lookup timed out");
+                            last = TransportError::Timeout(DIAL_TIMEOUT);
                             continue;
                         }
                     }
