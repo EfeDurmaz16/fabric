@@ -713,6 +713,12 @@ fn clear_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
 /// which is all the sentinel says. Anything else there, a link included,
 /// is removed and the sentinel created in its place, so a link is never
 /// followed.
+///
+/// Nothing is synced. The sentinel proves completion across a `kill -9`,
+/// where the kernel keeps every write, but not across a power loss or a
+/// kernel panic: APFS and ext4 may then keep the sentinel's entry and lose
+/// files the installer wrote before it. Power loss is out of scope for
+/// this proof (ADR 0007, step 2 of Materialize).
 fn write_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
     let sentinel_err = |source| MaterializeError::Sentinel {
         path: path.clone(),
