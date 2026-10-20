@@ -219,7 +219,7 @@ pub enum CacheHealth {
     Healthy,
     /// Nothing at the path.
     Missing,
-    /// Something other than a directory at the path.
+    /// Something other than a real directory at the path or on the way to it, a link included.
     NotADirectory,
     /// An empty directory.
     Empty,
@@ -482,20 +482,44 @@ fn assign_sentinels(detected: &Detection, steps: &mut [PlannedStep]) {
     }
 }
 
+/// What lies at a cache path, read without following a link in any component.
+enum Found {
+    /// Nothing at the path or on the way to it.
+    Missing,
+    /// A link, or something other than a directory, at the path or on the way to it.
+    NotADirectory,
+    /// A real directory, reached through real directories.
+    Dir(PathBuf),
+}
+
+/// Walks `path` under `root` component by component, so a linked parent such as `web -> /elsewhere` is never followed.
+///
+/// A cache reached through a link is not inside the workspace: judging it,
+/// or writing its sentinel, would read or write somewhere else.
+fn find_dir(root: &Path, path: &RelPath) -> io::Result<Found> {
+    let mut full = root.to_path_buf();
+    for component in path.as_str().split('/') {
+        full.push(component);
+        match fs::symlink_metadata(&full) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Ok(Found::NotADirectory),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Found::Missing),
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(Found::Dir(full))
+}
+
 fn inspect(root: &Path, cache: &CachePath) -> Result<CacheHealth, MaterializeError> {
-    let full = root.join(cache.path.as_str());
     let inspect_err = |source| MaterializeError::Inspect {
         path: cache.path.clone(),
         source,
     };
-    let meta = match fs::metadata(&full) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(CacheHealth::Missing),
-        Err(err) => return Err(inspect_err(err)),
+    let full = match find_dir(root, &cache.path).map_err(inspect_err)? {
+        Found::Missing => return Ok(CacheHealth::Missing),
+        Found::NotADirectory => return Ok(CacheHealth::NotADirectory),
+        Found::Dir(full) => full,
     };
-    if !meta.is_dir() {
-        return Ok(CacheHealth::NotADirectory);
-    }
     if fs::read_dir(&full).map_err(inspect_err)?.next().is_none() {
         return Ok(CacheHealth::Empty);
     }
@@ -577,36 +601,37 @@ fn try_lock(file: &fs::File) -> Result<(), MaterializeError> {
     }
 }
 
-/// Removes the sentinel of the cache at `path`; nothing there is fine.
+/// Removes the sentinel of the cache at `path`; nothing there, or a cache reached through a link, is left alone.
+///
+/// A linked cache is never judged healthy, so a sentinel beyond the link
+/// proves nothing here and is not this workspace's to remove.
 fn clear_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
-    match fs::remove_file(root.join(path.as_str()).join(SENTINEL)) {
-        Err(err)
-            if err.kind() != io::ErrorKind::NotFound
-                && err.kind() != io::ErrorKind::NotADirectory =>
-        {
-            Err(MaterializeError::Sentinel {
-                path: path.clone(),
-                source: err,
-            })
-        }
+    let sentinel_err = |source| MaterializeError::Sentinel {
+        path: path.clone(),
+        source,
+    };
+    let Found::Dir(dir) = find_dir(root, path).map_err(sentinel_err)? else {
+        return Ok(());
+    };
+    match fs::remove_file(dir.join(SENTINEL)) {
+        Err(err) if err.kind() != io::ErrorKind::NotFound => Err(sentinel_err(err)),
         _ => Ok(()),
     }
 }
 
-/// Writes the sentinel of the cache at `path` when the steps left a real directory there.
+/// Writes the sentinel of the cache at `path` when the steps left a real directory there, reached through real directories.
 ///
-/// A cache the steps did not create, or one that is a link, gets no
-/// sentinel: the next plan sees it missing or torn and fills it again,
-/// which costs time and never writes outside the workspace.
+/// A cache the steps did not create, or one that is or lies under a link,
+/// gets no sentinel: the next plan sees it missing or not a directory and
+/// fills it again, which costs time and never writes outside the workspace.
 fn write_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
-    let dir = root.join(path.as_str());
-    if !fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_dir()) {
-        tracing::warn!(target: SETUP_LOG_TARGET, cache = %path, "the setup steps left no directory at this cache path; it will be filled again on the next resume");
-        return Ok(());
-    }
     let sentinel_err = |source| MaterializeError::Sentinel {
         path: path.clone(),
         source,
+    };
+    let Found::Dir(dir) = find_dir(root, path).map_err(sentinel_err)? else {
+        tracing::warn!(target: SETUP_LOG_TARGET, cache = %path, "the setup steps left no real directory at this cache path; it will be filled again on the next resume");
+        return Ok(());
     };
     let mut file = fs::OpenOptions::new()
         .write(true)

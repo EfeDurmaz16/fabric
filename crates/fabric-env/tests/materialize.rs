@@ -630,3 +630,42 @@ fn a_missing_target_does_not_run_a_declared_install() {
     let planned = plan(&declared(dir.path(), override_toml).unwrap()).unwrap();
     assert_eq!(planned.steps().len(), 1);
 }
+
+/// A cache under a linked directory lies outside the workspace: it is never
+/// judged healthy, and its sentinel is neither written nor removed there.
+#[test]
+fn a_cache_under_a_linked_directory_gets_no_sentinel() {
+    let outside = tempfile::tempdir().unwrap();
+    write(outside.path(), &[("out/x", ""), ("kept/x", "")]).unwrap();
+    write(outside.path(), &[("kept/.fabric-installed", "")]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    symlink(outside.path(), dir.path().join("web")).unwrap();
+    let detected = declared(
+        dir.path(),
+        r#"
+[[cache]]
+path = "web/out"
+class = "build"
+
+[[cache]]
+path = "web/kept"
+class = "build"
+
+[[setup]]
+program = "true"
+"#,
+    )
+    .unwrap();
+    let planned = plan(&detected).unwrap();
+    assert!(
+        planned
+            .caches()
+            .iter()
+            .all(|c| c.health == CacheHealth::NotADirectory),
+        "{:?}",
+        planned.caches()
+    );
+    planned.ready().unwrap().execute().unwrap();
+    assert!(!outside.path().join("out").join(SENTINEL).exists());
+    assert!(outside.path().join("kept").join(SENTINEL).exists());
+}
