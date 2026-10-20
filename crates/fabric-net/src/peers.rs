@@ -365,7 +365,11 @@ impl PeerBook {
     }
 
     /// Writes the book to `path` whole: a temporary file only this call names, synced, renamed over, directory synced.
-    pub fn save(&self, path: &Path) -> Result<(), PeerBookError> {
+    ///
+    /// Private on purpose: it takes no lock, so only `Peers::update`, which
+    /// reloads the file under the lock first, may call it. A public save of
+    /// a stale book would undo another process's unpair.
+    fn save(&self, path: &Path) -> Result<(), PeerBookError> {
         let io = |source| PeerBookError::Io {
             path: path.to_path_buf(),
             source,
