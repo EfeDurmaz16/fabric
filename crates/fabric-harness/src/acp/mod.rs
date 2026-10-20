@@ -158,8 +158,20 @@ impl AcpHarness {
 
     /// Where this node records the session's files at capture. An ACP
     /// agent's state is opaque, so every file is treated as rewritable.
+    /// The records are keyed by the whole harness kind, program and
+    /// arguments, so two agents started through one program, such as
+    /// `node`, never share a record for a session id they both use.
     fn departure(&self, session: &SessionId) -> Records {
-        Records::of(self.home_dir(), &format!("acp-{}", self.program), session)
+        let mut kind = blake3::Hasher::new();
+        for part in
+            std::iter::once(self.program.as_str()).chain(self.args.iter().map(String::as_str))
+        {
+            kind.update(&(part.len() as u64).to_le_bytes());
+            kind.update(part.as_bytes());
+        }
+        let kind = kind.finalize().to_hex();
+        let label = format!("acp-{}-{}", self.program, &kind[..16]);
+        Records::of(self.home_dir(), &label, session)
     }
 
     fn capture_sync(
@@ -431,5 +443,32 @@ impl Harness for AcpHarness {
         env: &'a [(EnvVarName, String)],
     ) -> BoxFuture<'a, Result<Running, HarnessError>> {
         Box::pin(self.launch_impl(workspace, launch, env))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn adapter(args: &[&str]) -> AcpHarness {
+        AcpHarness::new(
+            ProgramName::parse("node").unwrap(),
+            args.iter().map(|a| (*a).to_owned()).collect(),
+            AbsPath::parse("/h").unwrap(),
+            OsString::new(),
+        )
+    }
+
+    #[test]
+    fn departure_records_are_keyed_by_program_and_arguments() {
+        let session = SessionId::parse("s1").unwrap();
+        let a = adapter(&["agent-a.js"]).departure(&session);
+        assert_eq!(a, adapter(&["agent-a.js"]).departure(&session));
+        assert_ne!(a, adapter(&["agent-b.js"]).departure(&session));
+        assert_ne!(
+            adapter(&["a", "b"]).departure(&session),
+            adapter(&["ab"]).departure(&session),
+            "argument boundaries count"
+        );
     }
 }
