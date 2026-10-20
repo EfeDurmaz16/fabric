@@ -153,11 +153,14 @@ pub trait Connection: Send + Sync {
     fn open(&self) -> BoxFuture<'_, Result<Stream, TransportError>>;
     /// Waits for the next stream the peer opened.
     fn next(&self) -> BoxFuture<'_, Result<Stream, TransportError>>;
-    /// Closes the connection; every stream on it fails from now on.
+    /// Closes the connection at once; every stream on it fails from now on.
     ///
-    /// Bytes written but not yet read by the peer are discarded, on QUIC
-    /// at once. Dropping the last handle closes the same way. The side that
-    /// asked for the data closes; the side that served it waits for that.
+    /// Bytes written but not yet read by the peer are discarded. Dropping
+    /// the handle instead keeps the connection open, on both wires, while
+    /// any stream on it is alive, and closes it when the last one goes. On
+    /// QUIC that close can still discard bytes the peer has not
+    /// acknowledged, so the side that asked for the data closes, and the
+    /// side that served it waits for that.
     fn close(&self);
 }
 

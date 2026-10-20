@@ -2,8 +2,10 @@
 //!
 //! Invariant: a writer that outruns the reader waits instead of growing
 //! memory; dropping the writer gives the reader a clean end of stream after
-//! the bytes already written; dropping the reader makes every later write
-//! fail with `BrokenPipe`, so a stream nobody reads cannot fill the heap.
+//! the bytes already written, and aborting it gives the reader an error
+//! instead, so a stream cut off by a lost connection never reads as one that
+//! ended; dropping the reader makes every later write fail with
+//! `BrokenPipe`, so a stream nobody reads cannot fill the heap.
 
 use std::collections::VecDeque;
 use std::io;
@@ -17,6 +19,7 @@ struct State {
     buf: VecDeque<u8>,
     capacity: usize,
     writer_gone: bool,
+    aborted: bool,
     reader_gone: bool,
     read_waker: Option<Waker>,
     write_waker: Option<Waker>,
@@ -34,6 +37,7 @@ pub(crate) fn pipe(capacity: usize) -> (PipeWriter, PipeReader) {
         buf: VecDeque::new(),
         capacity,
         writer_gone: false,
+        aborted: false,
         reader_gone: false,
         read_waker: None,
         write_waker: None,
@@ -49,6 +53,33 @@ fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn lost() -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionAborted, "the connection was lost")
+}
+
+impl PipeReader {
+    /// Takes up to `max` buffered bytes, waiting for some; an empty result is the end of the stream.
+    pub(crate) fn poll_take(&self, cx: &mut Context<'_>, max: usize) -> Poll<io::Result<Vec<u8>>> {
+        let mut state = lock(&self.0);
+        if state.aborted {
+            return Poll::Ready(Err(lost()));
+        }
+        if state.buf.is_empty() {
+            if state.writer_gone {
+                return Poll::Ready(Ok(Vec::new()));
+            }
+            state.read_waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        let n = max.min(state.buf.len());
+        let taken: Vec<u8> = state.buf.drain(..n).collect();
+        if let Some(waker) = state.write_waker.take() {
+            waker.wake();
+        }
+        Poll::Ready(Ok(taken))
+    }
+}
+
 impl AsyncRead for PipeReader {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -56,6 +87,9 @@ impl AsyncRead for PipeReader {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let mut state = lock(&self.0);
+        if state.aborted {
+            return Poll::Ready(Err(lost()));
+        }
         if state.buf.is_empty() {
             if state.writer_gone {
                 return Poll::Ready(Ok(()));
@@ -82,6 +116,18 @@ impl Drop for PipeReader {
         state.reader_gone = true;
         state.buf.clear();
         if let Some(waker) = state.write_waker.take() {
+            waker.wake();
+        }
+    }
+}
+
+impl PipeWriter {
+    /// Ends the pipe with an error: the reader's next read fails, buffered bytes or not.
+    pub(crate) fn abort(self) {
+        let mut state = lock(&self.0);
+        state.aborted = true;
+        state.buf.clear();
+        if let Some(waker) = state.read_waker.take() {
             waker.wake();
         }
     }
@@ -172,6 +218,18 @@ mod tests {
         assert_eq!(
             w.write_all(b"z").await.unwrap_err().kind(),
             io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[tokio::test]
+    async fn an_aborted_pipe_fails_the_reader_instead_of_ending_it() {
+        let (mut w, mut r) = pipe(16);
+        w.write_all(b"xy").await.unwrap();
+        w.abort();
+        let mut out = Vec::new();
+        assert_eq!(
+            r.read_to_end(&mut out).await.unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted
         );
     }
 }

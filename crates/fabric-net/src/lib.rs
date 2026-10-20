@@ -20,6 +20,7 @@ mod durable;
 pub mod endpoint;
 pub mod frame;
 pub mod identity;
+pub mod mux;
 pub mod peers;
 mod pipe;
 pub mod quic;

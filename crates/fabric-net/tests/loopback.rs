@@ -568,6 +568,47 @@ async fn a_dial_to_a_black_hole_ends_within_the_dial_timeout() -> TestResult {
     Ok(())
 }
 
+/// A server that drops its connection handle while it still answers on a
+/// stream delivers the answer on both wires: the stream keeps the
+/// connection open, as a QUIC stream does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_connection_handle_keeps_its_live_streams() -> TestResult {
+    for kind in BOTH {
+        let (a, b) = (Node::new()?, Node::new()?);
+        let server = b.bind(kind, &[a.id()])?;
+        let client = a.bind(kind, &[b.id()])?;
+        let serving = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let connection = server.accept().await?;
+                let mut stream = connection.next().await?;
+                let mut request = [0u8; 4];
+                stream.read_exact(&mut request).await?;
+                drop(connection);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                stream.write_all(b"answer").await?;
+                stream.shutdown().await?;
+                // The asker finishes once it has the answer; the stream,
+                // the last thing holding the connection, goes after that.
+                let mut rest = Vec::new();
+                stream.read_to_end(&mut rest).await?;
+                Ok::<(), Box<dyn Error + Send + Sync>>(())
+            })
+        };
+
+        let connection = client.connect(b.id(), server.local_addr()?).await?;
+        let (mut send, mut recv) = connection.open().await?.split();
+        send.write_all(b"ask?").await?;
+        let mut answer = Vec::new();
+        tokio::time::timeout(DEADLINE, recv.read_to_end(&mut answer)).await??;
+        assert_eq!(answer, b"answer", "{kind}");
+        send.shutdown().await?;
+        serving.await??;
+        connection.close();
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn quic_is_dialed_first_and_tcp_is_the_fallback() -> TestResult {
     let (a, b) = (Node::new()?, Node::new()?);
