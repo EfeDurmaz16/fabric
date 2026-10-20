@@ -286,7 +286,7 @@ pub(crate) fn same_place(
 /// Refuses an overlay file (settings, MCP configuration) that holds a
 /// literal secret: ADR 0006 allows only `${VAR}` references there.
 #[cfg_attr(
-    not(any(feature = "claude", feature = "codex")),
+    not(feature = "claude"),
     allow(dead_code, reason = "used by the Claude adapter")
 )]
 pub(crate) fn refuse_secret_overlay(path: &Path) -> Result<(), HarnessError> {
