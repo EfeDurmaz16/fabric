@@ -577,7 +577,7 @@ pub fn plan(
     };
 
     let mut steps = Vec::new();
-    for (index, (step, gate)) in spec.setup.iter().zip(detected.step_gates()).enumerate() {
+    for (index, (step, gate)) in detected.steps().enumerate() {
         let needed = match gate {
             StepGate::Caches(paths) => paths.iter().any(unhealthy),
             StepGate::AnyCache => any_unhealthy,

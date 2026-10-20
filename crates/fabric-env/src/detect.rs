@@ -354,7 +354,7 @@ pub enum Completion {
     /// `.venv` (whose `pyvenv.cfg` is written before any package, so it
     /// proves nothing) and a declared cache that a setup step fills.
     Sentinel {
-        /// The setup steps that fill the cache, by index in the spec; never empty.
+        /// The setup steps that fill the cache, by index in the spec.
         filled_by: Vec<usize>,
     },
     /// Content alone: no setup step fills the cache, so no step can leave it torn.
@@ -529,6 +529,7 @@ pub struct Pin {
 pub struct Detection {
     root: PathBuf,
     spec: EnvSpec,
+    /// One gate per step of `spec.setup`, in the same order; built with it in `detect` and never changed.
     step_gates: Vec<StepGate>,
     caches: Vec<CachePath>,
     pins: Vec<Pin>,
@@ -548,9 +549,9 @@ impl Detection {
         &self.spec
     }
 
-    /// Returns which caches decide whether each setup step runs, one per step of the spec and in the same order.
-    pub fn step_gates(&self) -> &[StepGate] {
-        &self.step_gates
+    /// Returns each setup step of the spec, in order, with the caches that decide whether it runs.
+    pub fn steps(&self) -> impl Iterator<Item = (&SetupStep, &StepGate)> {
+        self.spec.setup.iter().zip(&self.step_gates)
     }
 
     /// Returns the spec's cache paths with their class, ecosystem and completion, sorted by path.
