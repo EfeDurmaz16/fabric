@@ -38,11 +38,12 @@
 use std::collections::BTreeMap;
 
 use fabric_core::env::{
-    EnvVarName, EnvVarNameError, PinError, RunWhen, SecretPattern, SecretPatternError, SetupArg,
-    SetupArgError, SetupStep, ToolName, ToolVersion,
+    EnvVarName, EnvVarNameError, PinError, RunWhen, SetupArg, SetupArgError, SetupStep, ToolName,
+    ToolVersion,
 };
 use fabric_core::harness::{ProgramName, ProgramNameError};
 use fabric_core::path::{PathError, RelPath};
+use fabric_core::secret::{SecretPattern, SecretPatternError};
 use fabric_core::snapshot::CacheClass;
 use toml::{Table, Value};
 

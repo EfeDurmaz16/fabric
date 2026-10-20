@@ -37,8 +37,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use fabric_core::env::{
-    EnvSpec, EnvSpecError, OVERRIDE_FILE, RunWhen, SecretPattern, SetupArg, SetupStep, Tool,
-    ToolName, ToolSource, ToolVersion,
+    EnvSpec, EnvSpecError, OVERRIDE_FILE, RunWhen, SetupArg, SetupStep, Tool, ToolName, ToolSource,
+    ToolVersion,
 };
 use fabric_core::harness::ProgramName;
 use fabric_core::path::RelPath;
@@ -49,7 +49,7 @@ use crate::overrides::{
     DeclaredCache, DeclaredEcosystem, EnvOverride, OverrideError, PackageManagerName,
     canonical_tool, line_and_column,
 };
-use fabric_core::secret::{Scope, SecretPolicy};
+use fabric_core::secret::{Scope, SecretPattern, SecretPolicy};
 
 /// Every file detection opens, relative to the root. `Reader` refuses any
 /// other name, so a new reader must add its file here, where a test checks

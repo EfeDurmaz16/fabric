@@ -17,7 +17,7 @@ use crate::credential::looks_like_credential;
 use crate::harness::ProgramName;
 use crate::id::EnvSpecId;
 use crate::path::RelPath;
-use crate::secret::pattern_matches;
+use crate::secret::SecretPattern;
 use crate::snapshot::first_out_of_order;
 
 /// The format version this crate writes; the first varint of every encoded spec.
@@ -251,100 +251,6 @@ macro_rules! pin_text_impls {
 
 pin_text_impls!(ToolName);
 pin_text_impls!(ToolVersion);
-
-/// Why a secret pattern was refused.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum SecretPatternError {
-    /// The pattern has no characters.
-    #[error("secret pattern is empty")]
-    Empty,
-    /// A leading, trailing or doubled slash.
-    #[error("secret pattern has an empty component")]
-    EmptyComponent,
-    /// A `.` or `..` component, which no path holds.
-    #[error("secret pattern has a `.` or `..` component")]
-    DotComponent,
-    /// A `**` component; a pattern already matches at any depth.
-    #[error("secret pattern has a `**` component; a pattern already matches at any depth")]
-    DoubleStar,
-    /// A character with a meaning in gitignore that the matcher does not share.
-    #[error("secret pattern has an unsupported character at index {index}")]
-    BadChar {
-        /// Zero-based byte index of the character.
-        index: usize,
-    },
-    /// The pattern denies the override file, which detection reads through the job's patterns.
-    ///
-    /// Such a pattern, `*.toml`, `env.toml` or `.fabric`, would drop every
-    /// override from the next detection on, so it is refused wherever a
-    /// pattern comes from: the override file or a peer's spec.
-    #[error("secret pattern matches {OVERRIDE_FILE}, which detection must be able to read")]
-    DeniesOverrideFile,
-}
-
-/// A secret pattern a job adds to the built-in list: path components separated by `/`, where `*` matches any run of characters.
-///
-/// Refused: `\`, `[`, `]`, `?`, `!`, `#`, whitespace and NUL, because
-/// gitignore gives them meanings the matcher does not; empty, `.`, `..`
-/// and `**` components; and any pattern that denies `OVERRIDE_FILE`.
-/// Checked once, at the boundary, including inside `Deserialize`. The
-/// matcher itself is `fabric_core::secret`.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(transparent)]
-pub struct SecretPattern(String);
-
-impl SecretPattern {
-    /// Checks `text` against the pattern rules and wraps it.
-    pub fn parse(text: &str) -> Result<Self, SecretPatternError> {
-        if text.is_empty() {
-            return Err(SecretPatternError::Empty);
-        }
-        let bad = text.char_indices().find(|&(_, c)| {
-            matches!(c, '\\' | '[' | ']' | '?' | '!' | '#' | '\0') || c.is_whitespace()
-        });
-        if let Some((index, _)) = bad {
-            return Err(SecretPatternError::BadChar { index });
-        }
-        for component in text.split('/') {
-            match component {
-                "" => return Err(SecretPatternError::EmptyComponent),
-                "." | ".." => return Err(SecretPatternError::DotComponent),
-                "**" => return Err(SecretPatternError::DoubleStar),
-                _ => {}
-            }
-        }
-        let pattern = Self(text.to_owned());
-        if pattern_matches(&pattern, OVERRIDE_FILE) {
-            return Err(SecretPatternError::DeniesOverrideFile);
-        }
-        Ok(pattern)
-    }
-
-    /// Returns the pattern text.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for SecretPattern {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl fmt::Debug for SecretPattern {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SecretPattern({:?})", self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for SecretPattern {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let text = String::deserialize(deserializer)?;
-        Self::parse(&text).map_err(serde::de::Error::custom)
-    }
-}
 
 /// Why a setup argument was refused; the argument itself is never quoted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -629,76 +535,6 @@ mod tests {
             let bytes = postcard::to_stdvec(bad).unwrap();
             assert!(postcard::from_bytes::<SetupArg>(&bytes).is_err(), "{bad:?}");
         }
-    }
-
-    #[test]
-    fn a_secret_pattern_that_gitignore_would_read_differently_is_refused() {
-        assert_eq!(SecretPattern::parse(""), Err(SecretPatternError::Empty));
-        assert_eq!(
-            SecretPattern::parse("/x"),
-            Err(SecretPatternError::EmptyComponent)
-        );
-        assert_eq!(
-            SecretPattern::parse("x/"),
-            Err(SecretPatternError::EmptyComponent)
-        );
-        assert_eq!(
-            SecretPattern::parse("a/../b"),
-            Err(SecretPatternError::DotComponent)
-        );
-        assert_eq!(
-            SecretPattern::parse("**/x"),
-            Err(SecretPatternError::DoubleStar)
-        );
-        assert_eq!(
-            SecretPattern::parse("!x"),
-            Err(SecretPatternError::BadChar { index: 0 })
-        );
-        assert_eq!(
-            SecretPattern::parse("#x"),
-            Err(SecretPatternError::BadChar { index: 0 })
-        );
-        assert_eq!(
-            SecretPattern::parse("x?"),
-            Err(SecretPatternError::BadChar { index: 1 })
-        );
-        assert_eq!(
-            SecretPattern::parse("[ab]"),
-            Err(SecretPatternError::BadChar { index: 0 })
-        );
-        assert_eq!(
-            SecretPattern::parse("a b"),
-            Err(SecretPatternError::BadChar { index: 1 })
-        );
-        assert_eq!(
-            SecretPattern::parse("x\\"),
-            Err(SecretPatternError::BadChar { index: 1 })
-        );
-    }
-
-    #[test]
-    fn a_bad_secret_pattern_does_not_decode() {
-        let bytes = postcard::to_stdvec("**/x").unwrap();
-        assert!(postcard::from_bytes::<SecretPattern>(&bytes).is_err());
-    }
-
-    /// Detection reads the override file through the job's patterns, so a
-    /// pattern that denies it would drop every override from then on; a
-    /// peer's spec that holds one does not decode.
-    #[test]
-    fn a_pattern_that_denies_the_override_file_is_refused() {
-        for pattern in ["*.toml", "env.toml", ".fabric", "*", ".FABRIC/ENV.TOML"] {
-            assert_eq!(
-                SecretPattern::parse(pattern),
-                Err(SecretPatternError::DeniesOverrideFile),
-                "{pattern}"
-            );
-        }
-        assert!(SecretPattern::parse("*.sqlite").is_ok());
-        let mut s = spec();
-        s.secret_patterns = vec![SecretPattern(String::from("*.toml"))];
-        let bytes = codec::encode_versioned(ENV_SPEC_VERSION, &s).unwrap();
-        assert!(EnvSpec::decode(&bytes).is_err());
     }
 
     /// Two specs with the same content in another order would have two ids.

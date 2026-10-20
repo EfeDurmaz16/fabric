@@ -11,10 +11,10 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use fabric_core::env::{SecretPattern, SecretPatternError};
 use fabric_core::path::RelPath;
 use fabric_core::secret::{
-    Denied, Scope, SecretPolicy, Stage, Staged, TrackedSecretChanged, TrackedSecrets, Tracking,
+    Denied, Scope, SecretPattern, SecretPatternError, SecretPolicy, Stage, Staged,
+    TrackedSecretChanged, TrackedSecrets, Tracking,
 };
 
 /// Committed before the working tree changes. The first five are the

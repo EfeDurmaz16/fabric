@@ -4,11 +4,11 @@
 use std::collections::BTreeMap;
 
 use fabric_core::env::{
-    EnvSpec, EnvVarName, RunWhen, SecretPattern, SetupArg, SetupStep, Tool, ToolName, ToolSource,
-    ToolVersion,
+    EnvSpec, EnvVarName, RunWhen, SetupArg, SetupStep, Tool, ToolName, ToolSource, ToolVersion,
 };
 use fabric_core::harness::ProgramName;
 use fabric_core::path::RelPath;
+use fabric_core::secret::SecretPattern;
 use proptest::prelude::*;
 
 fn rel_path() -> impl Strategy<Value = RelPath> {
