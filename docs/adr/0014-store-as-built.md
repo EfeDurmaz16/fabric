@@ -115,3 +115,8 @@ A lost or corrupt catalog cannot be rebuilt from `objects/` alone. The order of 
 - A manifest above the decode bound is refused at capture and at publish instead of publishing a snapshot no node can read. Test: `publish_refuses_a_manifest_no_reader_would_decode`.
 - A lost catalog loses every snapshot whose manifest is above the whole-file limit until a peer sends it again.
 - `fabric orphan export` must pin the whole bundle chain of the snapshot it exports, not only the snapshot.
+
+## Open questions
+
+- APFS `clonefile` for restore. Objects are compressed, so a clone would need raw objects on the same volume. Measure whether per-file writes of a 100,000-file `node_modules` are slow enough to pay for a second object format.
+- gc between a capture and its publish is ruled out by the lock holder running them as one step, not by the types. It fails closed with `MissingChunk`. A capture that holds `&mut Store` until it publishes would make the borrow checker enforce it; decide when the daemon (PR #8) settles how it calls capture.
