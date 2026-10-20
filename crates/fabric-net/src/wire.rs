@@ -140,22 +140,6 @@ pub struct Hello {
     pub clock_ms: u64,
 }
 
-impl Hello {
-    /// Builds a `Hello` for this protocol version with the clock read now.
-    ///
-    /// A session reads the clock again when it sends the hello, so a hello
-    /// built once and reused reports the clock of the moment it is sent.
-    #[must_use]
-    pub fn now(node: NodeId, fabric_version: VersionText) -> Self {
-        Self {
-            node,
-            protocol_version: PROTOCOL_VERSION,
-            fabric_version,
-            clock_ms: wall_clock_ms(),
-        }
-    }
-}
-
 /// This node's wall clock in milliseconds since the Unix epoch; zero before 1970.
 pub(crate) fn wall_clock_ms() -> u64 {
     SystemTime::now()

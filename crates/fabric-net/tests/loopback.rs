@@ -23,7 +23,7 @@ use fabric_net::tcp::TcpTlsTransport;
 use fabric_net::tls::{TlsError, Trust};
 use fabric_net::transport::{Connection, Transport, TransportError, TransportKind};
 use fabric_net::wire::{
-    ChunkBatch, Fault, FaultText, Hello, JobRequest, JobResponse, ManifestChunks, PROTOCOL_VERSION,
+    ChunkBatch, Fault, FaultText, JobRequest, JobResponse, ManifestChunks, PROTOCOL_VERSION,
     VersionText,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -46,14 +46,15 @@ impl Trust for Paired {
 
 struct Node {
     identity: NodeIdentity,
-    hello: Hello,
+    version: VersionText,
 }
 
 impl Node {
     fn new() -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let identity = NodeIdentity::generate()?;
-        let hello = Hello::now(identity.node_id(), VersionText::new("test")?);
-        Ok(Self { identity, hello })
+        Ok(Self {
+            identity: NodeIdentity::generate()?,
+            version: VersionText::new("test")?,
+        })
     }
 
     fn id(&self) -> NodeId {
@@ -142,13 +143,14 @@ impl Service for FakeService {
 /// Accepts one connection, runs the acceptor's hello and serves until the connection ends or `stop` fires.
 fn serve_one(
     transport: Arc<dyn Transport>,
-    hello: Hello,
+    local: NodeId,
+    version: VersionText,
     service: Arc<FakeService>,
     stop: Option<mpsc::Receiver<()>>,
 ) -> JoinHandle<Result<(), RpcError>> {
     tokio::spawn(async move {
-        let connection = transport.accept().await?;
-        let session = Session::accept(connection, hello, DEADLINE).await?;
+        let connection = Arc::from(transport.accept().await?);
+        let session = Session::accept(connection, local, version, DEADLINE).await?;
         match stop {
             None => session.serve(service).await,
             Some(mut stop) => tokio::select! {
@@ -166,10 +168,11 @@ async fn connect(
     transport: &dyn Transport,
     peer: NodeId,
     addr: SocketAddr,
-    hello: Hello,
+    local: NodeId,
+    version: VersionText,
 ) -> Result<Session, RpcError> {
-    let connection = transport.connect(peer, addr).await?;
-    Session::connect(connection, hello, DEADLINE).await
+    let connection = Arc::from(transport.connect(peer, addr).await?);
+    Session::connect(connection, local, version, DEADLINE).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -180,7 +183,8 @@ async fn paired_nodes_exchange_hello_and_ping() -> TestResult {
         let client = a.bind(kind, &[b.id()])?;
         let serving = serve_one(
             server.clone(),
-            b.hello.clone(),
+            b.id(),
+            b.version.clone(),
             Arc::new(FakeService::new()),
             None,
         );
@@ -189,7 +193,8 @@ async fn paired_nodes_exchange_hello_and_ping() -> TestResult {
             client.as_ref(),
             b.id(),
             server.local_addr()?,
-            a.hello.clone(),
+            a.id(),
+            a.version.clone(),
         )
         .await?;
         assert_eq!(session.peer(), b.id());
@@ -201,38 +206,6 @@ async fn paired_nodes_exchange_hello_and_ping() -> TestResult {
         session.close();
         assert!(serving.await?.is_err(), "serve ends with the connection");
     }
-    Ok(())
-}
-
-/// A daemon builds its hello once and reuses it; the clock goes out fresh,
-/// so a node up for an hour does not report an hour of skew.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_reused_hello_reports_the_clock_at_sending() -> TestResult {
-    let (a, b) = (Node::new()?, Node::new()?);
-    let server = b.bind(TransportKind::Quic, &[a.id()])?;
-    let client = a.bind(TransportKind::Quic, &[b.id()])?;
-    let an_hour_ago = |hello: &Hello| Hello {
-        clock_ms: hello.clock_ms - 3_600_000,
-        ..hello.clone()
-    };
-    let _serving = serve_one(
-        server.clone(),
-        an_hour_ago(&b.hello),
-        Arc::new(FakeService::new()),
-        None,
-    );
-    let session = connect(
-        client.as_ref(),
-        b.id(),
-        server.local_addr()?,
-        an_hour_ago(&a.hello),
-    )
-    .await?;
-    assert!(
-        session.clock_skew_ms().abs() < 5_000,
-        "skew {} ms",
-        session.clock_skew_ms()
-    );
     Ok(())
 }
 
@@ -328,9 +301,14 @@ async fn an_unpaired_dialer_is_refused_at_accept() -> TestResult {
             Err(_) => true,
             // TLS lets a client send before the server's verdict; the first
             // byte in either direction then fails.
-            Ok(connection) => Session::connect(connection, a.hello.clone(), Duration::from_secs(2))
-                .await
-                .is_err(),
+            Ok(connection) => Session::connect(
+                Arc::from(connection),
+                a.id(),
+                a.version.clone(),
+                Duration::from_secs(2),
+            )
+            .await
+            .is_err(),
         };
         assert!(no_session, "{kind}: an unpaired dialer must get no session");
         assert!(
@@ -349,19 +327,17 @@ async fn an_oversized_frame_gets_no_answer_and_the_connection_survives() -> Test
         let client = a.bind(kind, &[b.id()])?;
         let _serving = serve_one(
             server.clone(),
-            b.hello.clone(),
+            b.id(),
+            b.version.clone(),
             Arc::new(FakeService::new()),
             None,
         );
-        let session = connect(
-            client.as_ref(),
-            b.id(),
-            server.local_addr()?,
-            a.hello.clone(),
-        )
-        .await?;
+        let connection: Arc<dyn Connection> =
+            Arc::from(client.connect(b.id(), server.local_addr()?).await?);
+        let session =
+            Session::connect(connection.clone(), a.id(), a.version.clone(), DEADLINE).await?;
 
-        let mut stream = session.connection().open().await?;
+        let mut stream = connection.open().await?;
         let declared = u32::try_from(MAX_CONTROL_FRAME + 1)?;
         stream.write_all(&declared.to_le_bytes()).await?;
         stream.write_all(&[FRAME_VERSION; 64]).await?;
@@ -386,12 +362,19 @@ async fn a_slow_peer_trips_the_call_deadline() -> TestResult {
         let client = a.bind(kind, &[b.id()])?;
         let mut service = FakeService::new();
         service.manifest_delay = Duration::from_secs(3);
-        let _serving = serve_one(server.clone(), b.hello.clone(), Arc::new(service), None);
+        let _serving = serve_one(
+            server.clone(),
+            b.id(),
+            b.version.clone(),
+            Arc::new(service),
+            None,
+        );
         let session = connect(
             client.as_ref(),
             b.id(),
             server.local_addr()?,
-            a.hello.clone(),
+            a.id(),
+            a.version.clone(),
         )
         .await?;
 
@@ -425,12 +408,19 @@ async fn a_job_request_past_its_budget_still_runs_to_its_end() -> TestResult {
     let mut service = FakeService::new();
     service.job_delay = Duration::from_millis(400);
     let service = Arc::new(service);
-    let _serving = serve_one(server.clone(), b.hello.clone(), service.clone(), None);
+    let _serving = serve_one(
+        server.clone(),
+        b.id(),
+        b.version.clone(),
+        service.clone(),
+        None,
+    );
     let session = connect(
         client.as_ref(),
         b.id(),
         server.local_addr()?,
-        a.hello.clone(),
+        a.id(),
+        a.version.clone(),
     )
     .await?;
 
@@ -461,15 +451,14 @@ async fn a_hello_naming_another_node_is_refused_by_the_acceptor() -> TestResult 
         let client = a.bind(kind, &[b.id()])?;
         let serving = serve_one(
             server.clone(),
-            b.hello.clone(),
+            b.id(),
+            b.version.clone(),
             Arc::new(FakeService::new()),
             None,
         );
 
-        let mut lying = a.hello.clone();
-        lying.node = c.id();
-        let connection = client.connect(b.id(), server.local_addr()?).await?;
-        let _ = Session::connect(connection, lying, DEADLINE).await;
+        let connection = Arc::from(client.connect(b.id(), server.local_addr()?).await?);
+        let _ = Session::connect(connection, c.id(), a.version.clone(), DEADLINE).await;
         let err = serving.await?.err().ok_or("the acceptor must refuse")?;
         assert!(
             matches!(err, RpcError::HelloMismatch { proved, claimed } if proved == a.id() && claimed == c.id()),
@@ -506,7 +495,8 @@ async fn a_chunk_transfer_resumes_after_the_connection_drops() -> TestResult {
         first.drop_on_call = Some((7, stop_tx));
         let first_serving = serve_one(
             server.clone(),
-            b.hello.clone(),
+            b.id(),
+            b.version.clone(),
             Arc::new(first),
             Some(stop_rx),
         );
@@ -515,7 +505,8 @@ async fn a_chunk_transfer_resumes_after_the_connection_drops() -> TestResult {
             client.as_ref(),
             b.id(),
             server.local_addr()?,
-            a.hello.clone(),
+            a.id(),
+            a.version.clone(),
         )
         .await?;
         let mut stream = session
@@ -543,12 +534,19 @@ async fn a_chunk_transfer_resumes_after_the_connection_drops() -> TestResult {
 
         let mut second = FakeService::new();
         second.chunks = chunks.clone();
-        let _second_serving = serve_one(server.clone(), b.hello.clone(), Arc::new(second), None);
+        let _second_serving = serve_one(
+            server.clone(),
+            b.id(),
+            b.version.clone(),
+            Arc::new(second),
+            None,
+        );
         let session = connect(
             client.as_ref(),
             b.id(),
             server.local_addr()?,
-            a.hello.clone(),
+            a.id(),
+            a.version.clone(),
         )
         .await?;
         let mut stream = session

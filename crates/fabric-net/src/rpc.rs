@@ -30,8 +30,8 @@ use crate::idle::IdleReader;
 use crate::transport::{Connection, Stream, TransportError, TransportKind};
 use crate::wire::{
     ChunkBatch, Fault, FaultText, Hello, JobRequest, JobResponse, ManifestChunks, PROTOCOL_VERSION,
-    Request, RequestBody, RequestId, Response, ResponseBody, WireError, decode, encode,
-    wall_clock_ms,
+    Request, RequestBody, RequestId, Response, ResponseBody, VersionText, WireError, decode,
+    encode, wall_clock_ms,
 };
 
 /// A clock difference between two nodes above this is logged at `Hello`.
@@ -211,20 +211,27 @@ async fn read_response(
     Ok(response.body)
 }
 
+/// This node's `Hello` for this protocol version, with the clock read now.
+fn hello(local: NodeId, fabric_version: VersionText) -> Hello {
+    Hello {
+        node: local,
+        protocol_version: PROTOCOL_VERSION,
+        fabric_version,
+        clock_ms: wall_clock_ms(),
+    }
+}
+
 impl Session {
-    /// Runs the dialer's half of the handshake: sends `local`, expects the peer's `Hello`.
+    /// Runs the dialer's half of the handshake: sends this node's `Hello`, expects the peer's.
     ///
-    /// `local`'s clock is read again as it is sent.
+    /// `local` is this node's id; the hello's clock is read as it is sent.
     pub async fn connect(
-        connection: Box<dyn Connection>,
-        local: Hello,
+        connection: Arc<dyn Connection>,
+        local: NodeId,
+        fabric_version: VersionText,
         deadline: Duration,
     ) -> Result<Session, RpcError> {
-        let connection: Arc<dyn Connection> = Arc::from(connection);
-        let local = Hello {
-            clock_ms: wall_clock_ms(),
-            ..local
-        };
+        let local = hello(local, fabric_version);
         let request = Request {
             id: RequestId(0),
             budget_ms: budget(deadline),
@@ -244,24 +251,21 @@ impl Session {
         Self::finish(connection, local, remote, received_ms)
     }
 
-    /// Runs the acceptor's half of the handshake: expects the peer's `Hello` first, answers with `local`.
+    /// Runs the acceptor's half of the handshake: expects the peer's `Hello` first, answers with this node's.
     ///
-    /// `local`'s clock is read again as it is sent.
+    /// `local` is this node's id; the hello's clock is read as it is sent.
     pub async fn accept(
-        connection: Box<dyn Connection>,
-        local: Hello,
+        connection: Arc<dyn Connection>,
+        local: NodeId,
+        fabric_version: VersionText,
         deadline: Duration,
     ) -> Result<Session, RpcError> {
-        let connection: Arc<dyn Connection> = Arc::from(connection);
         let exchange = async {
             let (mut send, mut recv) = connection.next().await?.split();
             let bytes = read_frame(&mut recv, MAX_CONTROL_FRAME).await?;
             let request: Request = decode(&bytes)?;
-            let received_ms = wall_clock_ms();
-            let local = Hello {
-                clock_ms: received_ms,
-                ..local
-            };
+            let local = hello(local, fabric_version);
+            let received_ms = local.clock_ms;
             let (body, remote) = match request.body {
                 RequestBody::Hello(remote) => (ResponseBody::Hello(local.clone()), Some(remote)),
                 _ => (
@@ -354,12 +358,6 @@ impl Session {
     #[must_use]
     pub fn clock_skew_ms(&self) -> i64 {
         self.clock_skew_ms
-    }
-
-    /// The connection under the session, for bulk streams outside the request vocabulary.
-    #[must_use]
-    pub fn connection(&self) -> &dyn Connection {
-        self.connection.as_ref()
     }
 
     /// Closes the connection under the session.
