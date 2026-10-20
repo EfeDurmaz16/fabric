@@ -536,8 +536,16 @@ struct TreeItem {
 fn parse_tree(bytes: &[u8]) -> Result<Vec<TreeItem>, RestoreError> {
     let mut items = Vec::new();
     for record in Git::records(bytes) {
-        let text = String::from_utf8_lossy(record).into_owned();
-        let bad = || RestoreError::BadTreeOutput { text: text.clone() };
+        // A name that is not UTF-8 is refused, not rewritten: a lossy
+        // decode would write, and verify, a file under another name.
+        let Ok(text) = std::str::from_utf8(record) else {
+            return Err(RestoreError::BadTreeOutput {
+                text: String::from_utf8_lossy(record).into_owned(),
+            });
+        };
+        let bad = || RestoreError::BadTreeOutput {
+            text: text.to_owned(),
+        };
         let (meta, path) = text.split_once('\t').ok_or_else(bad)?;
         let mut fields = meta.split(' ');
         let mode = fields.next().and_then(TreeMode::parse).ok_or_else(bad)?;
@@ -1222,6 +1230,20 @@ mod tests {
 
     /// Blobs enough to fill both pipes between this process and git.
     const BLOBS: usize = 300;
+
+    #[test]
+    fn a_tree_name_that_is_not_utf8_is_refused_not_rewritten() {
+        let oid = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+        let mut listing = format!("100644 blob {oid}\tok.txt").into_bytes();
+        listing.push(0);
+        assert_eq!(parse_tree(&listing).unwrap().len(), 1);
+        listing.extend_from_slice(format!("100644 blob {oid}\tbad").as_bytes());
+        listing.extend_from_slice(&[0xff, 0xfe, 0]);
+        assert!(matches!(
+            parse_tree(&listing),
+            Err(RestoreError::BadTreeOutput { .. })
+        ));
+    }
 
     #[test]
     fn a_failing_blob_write_does_not_hang_cat_file() {
