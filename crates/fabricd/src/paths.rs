@@ -3,8 +3,9 @@
 //! Invariant: everything the node writes is under its state directory,
 //! except a job root. A job root is `$HOME/fabric/jobs/<job-id>/work`, the
 //! same string on every node with the same home (ADR 0011, P1), and a
-//! restore lands at the root the snapshot recorded whenever that root is
-//! under this node's home. Only a snapshot captured under another home
+//! restore lands at the root the snapshot recorded only when that root is
+//! exactly this job's root under this node's home. The recorded root comes
+//! from a peer, so any other root, under another home or anywhere else,
 //! restores into the state directory's fallback root, and the choice is
 //! printed with its reason. A root is never inside a folder a sync service
 //! rewrites.
@@ -200,9 +201,9 @@ pub fn job_root(home: &Path, job: JobId) -> PathBuf {
 /// Where a snapshot restores on this node, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RootChoice {
-    /// The root the snapshot recorded, which is under this node's home.
+    /// The root the snapshot recorded, which is this job's root under this node's home.
     Same(PathBuf),
-    /// The state directory's root, because the snapshot was captured under another home.
+    /// The state directory's root, because the snapshot recorded another root.
     Fallback {
         /// Where the workspace goes on this node.
         root: PathBuf,
@@ -231,7 +232,7 @@ impl fmt::Display for RootChoice {
             ),
             RootChoice::Fallback { root, captured } => write!(
                 f,
-                "root {}: the source root {} is under another home, so the job lands in the state directory and a harness keyed to the path cannot continue there",
+                "root {}: the source root {} is not this job's root under this node's home, so the job lands in the state directory and a harness keyed to the path cannot continue there",
                 root.display(),
                 captured.display()
             ),
@@ -239,10 +240,10 @@ impl fmt::Display for RootChoice {
     }
 }
 
-/// Picks the restore root for a snapshot captured at `captured` (ADR 0011).
+/// Picks the restore root for a snapshot of `id` captured at `captured` (ADR 0011).
 #[must_use]
-pub fn restore_root(captured: &Path, home: &Path, job: &JobDir) -> RootChoice {
-    if captured.starts_with(home) {
+pub fn restore_root(captured: &Path, home: &Path, id: JobId, job: &JobDir) -> RootChoice {
+    if captured == job_root(home, id) {
         RootChoice::Same(captured.to_owned())
     } else {
         RootChoice::Fallback {
@@ -306,7 +307,7 @@ mod tests {
         let job = StateDir::resolve(None, home).unwrap().job(JOB);
         let captured = job_root(home, JOB);
         assert_eq!(
-            restore_root(&captured, home, &job),
+            restore_root(&captured, home, JOB, &job),
             RootChoice::Same(captured)
         );
     }
@@ -317,9 +318,22 @@ mod tests {
             .unwrap()
             .job(JOB);
         let captured = job_root(Path::new("/Users/x"), JOB);
-        let choice = restore_root(&captured, Path::new("/home/x"), &job);
+        let choice = restore_root(&captured, Path::new("/home/x"), JOB, &job);
         assert_eq!(choice.root(), job.fallback_root());
         assert!(matches!(choice, RootChoice::Fallback { .. }));
+    }
+
+    #[test]
+    fn a_root_under_this_home_that_is_not_the_jobs_root_restores_under_the_state_directory() {
+        let home = Path::new("/Users/x");
+        let job = StateDir::resolve(None, home).unwrap().job(JOB);
+        for captured in [
+            home.join(".ssh"),
+            job_root(home, JobId::from_bytes([2; 16])),
+        ] {
+            let choice = restore_root(&captured, home, JOB, &job);
+            assert_eq!(choice.root(), job.fallback_root(), "{}", captured.display());
+        }
     }
 
     #[test]

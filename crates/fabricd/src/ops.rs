@@ -1448,7 +1448,12 @@ impl Node {
         }
         let snapshot = job.latest().ok_or(NodeError::NoSnapshot(id))?;
         let manifest = with_store(&self.store, move |store| Ok(store.manifest(snapshot)?)).await?;
-        let choice = restore_root(Path::new(manifest.root.as_str()), &self.cfg.home, job.dir());
+        let choice = restore_root(
+            Path::new(manifest.root.as_str()),
+            &self.cfg.home,
+            id,
+            job.dir(),
+        );
         out.say(choice.to_string());
         let root = choice.root().to_owned();
         check_root(
