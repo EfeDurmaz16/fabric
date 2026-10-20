@@ -614,7 +614,7 @@ impl Node {
             harness_state = Some(state_dir);
         }
         let facts = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
-        let detection = fabric_env::detect::detect(root, None).ok();
+        let detection = fabric_env::detect::detect(root, &[]).ok();
         let keys = MeasuredKeys::new(facts, detection.as_ref());
         let root = root.to_owned();
         let job_id = job.id();

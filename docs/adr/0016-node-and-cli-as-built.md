@@ -18,6 +18,7 @@ The core, the store, the network layer, the harness adapters and the environment
 <state>/
   daemon.lock   node.key   peers   harness.toml (optional)   fabric.sock
   store/        the store of ADR 0014
+  locks/        one tree lock per workspace root, so one installer runs per tree (ADR 0007)
   jobs/<job-id>/
     ledger      append-only records (ADR 0002)
     manifest    the derived job manifest
@@ -37,7 +38,9 @@ The control socket is `<state>/fabric.sock`. One connection carries one request 
 
 ### Who does what
 
-The CLI never touches the store or a ledger. It sends a request, prints the lines the node answers with, and for `run` and `resume` does what only it can: it runs the setup steps of ADR 0007 in the user's environment, launches the harness in its own process group with the user's environment, gives the terminal to that group when the harness is interactive, and registers it. The node appends `Resumed` only if it still owns the job at the epoch the plan was made under; otherwise the CLI kills the group at once. When the harness exits, the CLI tells the node.
+The CLI never touches the store or a ledger. It sends a request, prints the lines the node answers with, and for `run` and `resume` does what only it can: it runs the setup steps of ADR 0007 in the user's environment under the tree lock in `<state>/locks`, held from the plan to the last step, launches the harness in its own process group with the user's environment, gives the terminal to that group when the harness is interactive, and registers it. The node appends `Resumed` only if it still owns the job at the epoch the plan was made under; otherwise the CLI kills the group at once. When the harness exits, the CLI tells the node.
+
+ADR 0007 has the caller take the tree lock before restore writes the tree. Here the node restores and the CLI materializes, so the lock is taken after the restore. The restore writes only into an empty directory it renames into place (ADR 0014), so it never writes over a tree that an installer from an earlier `resume` still holds; that `resume`'s lock makes the next one refuse with the lock's path.
 
 Interactive launches give the terminal to the harness with `tcsetpgrp`. The CLI never takes it back; the shell does when the command exits, as it does for any job.
 

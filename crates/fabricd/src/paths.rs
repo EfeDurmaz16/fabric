@@ -118,6 +118,12 @@ impl StateDir {
     pub fn harness_config(&self) -> PathBuf {
         self.root.join("harness.toml")
     }
+
+    /// The directory of the per-workspace locks that keep one installer per tree (ADR 0007).
+    #[must_use]
+    pub fn tree_locks(&self) -> PathBuf {
+        self.root.join("locks")
+    }
 }
 
 /// The files one node keeps for one job, all node-local.

@@ -19,9 +19,10 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use fabric_core::env::EnvVarName;
+use fabric_core::env::{EnvVarName, SetupArg};
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{JobId, NodeId};
+use fabric_env::materialize::{NodeEnv, TreeLock};
 use fabric_harness::claude::ClaudeCode;
 use fabric_harness::codex::Codex;
 use fabric_harness::{Harness, Launch, Running, SessionId};
@@ -425,7 +426,7 @@ async fn launch(
     plan: &RunPlan,
     prompt: Option<String>,
 ) -> Result<ExitCode> {
-    materialize(&plan.root)?;
+    materialize(state, &plan.root)?;
     let socket = state.socket();
     let env = environment();
     let resume = plan
@@ -507,9 +508,14 @@ async fn launch(
 }
 
 /// Runs the setup steps a restored workspace needs on this node (ADR 0007), printing each.
-fn materialize(root: &Path) -> Result<()> {
-    let detected = fabric_env::detect::detect(root, None)?;
-    let plan = fabric_env::materialize::plan(&detected)?;
+///
+/// The tree lock is held from the plan to the last step, so a second
+/// `run` or `resume` of the same workspace refuses while an installer from
+/// this one still writes the tree.
+fn materialize(state: &StateDir, root: &Path) -> Result<()> {
+    let lock = TreeLock::acquire(&state.tree_locks(), root)?;
+    let detected = fabric_env::detect::detect(root, &[])?;
+    let plan = fabric_env::materialize::plan(&detected, &lock, &NodeEnv::current())?;
     if plan.is_noop() {
         return Ok(());
     }
@@ -519,10 +525,11 @@ fn materialize(root: &Path) -> Result<()> {
     }
     for step in plan.steps() {
         let step = step.step();
-        writeln!(stdout, "setup: {} {}", step.program, step.args.join(" "))?;
+        let args: Vec<&str> = step.args.iter().map(SetupArg::as_str).collect();
+        writeln!(stdout, "setup: {} {}", step.program, args.join(" "))?;
     }
     drop(stdout);
-    plan.ready()?.execute()?;
+    plan.ready()?.execute(&lock)?;
     Ok(())
 }
 
