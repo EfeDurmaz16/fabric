@@ -1719,6 +1719,15 @@ impl Node {
         let (owner, complete) = {
             let job = self.job(id).await?;
             let job = job.lock().await;
+            // A frozen chain pushed at a higher epoch would freeze the job
+            // on the real owner too, for good.
+            if let Some(fork) = job.forked()? {
+                return Err(NodeError::Forked {
+                    job: id,
+                    peer: fork.peer,
+                    epoch: fork.epoch,
+                });
+            }
             let latest = job.latest().ok_or(NodeError::NoSnapshot(id))?;
             let complete = is_complete(&self.store, latest)
                 .await?
@@ -2353,6 +2362,39 @@ pub(crate) mod tests {
             .find(|line| line.starts_with("workspace: "))
             .unwrap();
         assert!(line.contains("waits for its decision"), "{line}");
+    }
+
+    /// A node frozen after a fork must not steal on its forked chain: the
+    /// steal would reach the real owner at a higher epoch and freeze the
+    /// job there as well, for good.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_frozen_node_refuses_to_steal() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        a.suspend(id, &path, &mut Out::default()).await.unwrap();
+        b.pull_records(id, a.id).await.unwrap();
+        b.ensure_latest(id, a.id).await.unwrap();
+        b.freeze(
+            id,
+            &crate::local::ForkRecord {
+                peer: a.id,
+                epoch: Epoch::FIRST,
+                head: fabric_core::id::RecordHash::of(b"a head"),
+            },
+            &mut Out::default(),
+        )
+        .await
+        .unwrap();
+        let refused = b
+            .job_steal(id, String::new(), true, &mut Out::default())
+            .await;
+        assert!(
+            matches!(refused, Err(NodeError::Forked { .. })),
+            "{refused:?}"
+        );
     }
 
     #[test]
