@@ -80,7 +80,7 @@ const OUT_QUEUE: usize = 64;
 const CONTROL_QUEUE: usize = 4 * MAX_STREAMS;
 
 /// What one multiplexer frame does to its stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FrameKind {
     /// Carries the stream's next bytes.
     Data,
@@ -829,16 +829,13 @@ mod tests {
             raw.send(1, FrameKind::Data, b"more").await;
         }
         assert!(nothing_from_next(&mux).await, "a closed id came back");
-        let mut answers = vec![raw.recv().await, raw.recv().await];
-        answers.sort_unstable();
-        assert_eq!(
-            answers,
-            [
-                (1, FrameKind::Fin, Vec::new()),
-                (1, FrameKind::Reset, Vec::new())
-            ],
-            "the dropped writer finishes and the dropped reader resets"
-        );
+        let answers = [raw.recv().await, raw.recv().await];
+        for kind in [FrameKind::Fin, FrameKind::Reset] {
+            assert!(
+                answers.contains(&(1, kind, Vec::new())),
+                "the dropped writer finishes and the dropped reader resets: {answers:?}"
+            );
+        }
         assert!(
             tokio::time::timeout(Duration::from_millis(200), raw.recv())
                 .await

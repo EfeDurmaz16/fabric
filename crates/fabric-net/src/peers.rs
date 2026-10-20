@@ -152,15 +152,6 @@ impl HostPort {
             HostPort::Name(..) => None,
         }
     }
-
-    /// Returns the port.
-    #[must_use]
-    pub fn port(&self) -> u16 {
-        match self {
-            HostPort::Addr(addr) => addr.port(),
-            HostPort::Name(_, port) => *port,
-        }
-    }
 }
 
 impl From<SocketAddr> for HostPort {
