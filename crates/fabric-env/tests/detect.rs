@@ -534,3 +534,34 @@ fn a_credential_shaped_pin_is_refused_without_echoing_it() {
         other => panic!("{other:?}"),
     }
 }
+
+/// A declared path may hold the user's own files by mistake, so the full
+/// secret list applies under it; the narrowed list stays for the caches an
+/// ecosystem rule found.
+#[test]
+fn a_declared_cache_keeps_the_full_secret_list() {
+    let dir = workspace(&[
+        ("package.json", PACKAGE_JSON),
+        ("package-lock.json", ""),
+        (
+            ".fabric/env.toml",
+            "[[cache]]\npath = \"web\"\nclass = \"build\"\n",
+        ),
+    ])
+    .unwrap();
+    let found = detect(dir.path()).unwrap();
+    let scope_of = |path: &str| {
+        found
+            .caches()
+            .iter()
+            .find(|c| c.path.as_str() == path)
+            .map(CachePath::secret_scope)
+            .unwrap()
+    };
+    let leaked = RelPath::parse("web/.env.local").unwrap();
+    assert_eq!(
+        found.secrets().denies(&leaked, scope_of("web")),
+        Some(".env.*")
+    );
+    assert_eq!(scope_of("node_modules"), Scope::Cache);
+}

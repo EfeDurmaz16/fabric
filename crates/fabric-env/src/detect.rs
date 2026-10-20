@@ -35,7 +35,7 @@ use fabric_core::snapshot::CacheClass;
 use toml::Table;
 
 use crate::overrides::{EnvOverride, OverrideError, line_and_column};
-use crate::secret::{self, SecretPolicy};
+use crate::secret::{self, Scope, SecretPolicy};
 
 /// Where the override file lives, relative to the workspace root.
 pub const OVERRIDE_FILE: &str = ".fabric/env.toml";
@@ -385,6 +385,21 @@ pub struct CachePath {
     pub class: CacheClass,
     /// The ecosystem whose carry key applies to it.
     pub ecosystem: Ecosystem,
+}
+
+impl CachePath {
+    /// Returns the secret scope capture applies under this path.
+    ///
+    /// Only a cache an ecosystem rule found gets the narrowed list: the
+    /// measurement that justified it was made on `node_modules` trees, and
+    /// a path the user declared can be a mistake that holds the user's own
+    /// `.env.local` or keys, such as `web` written for `web/node_modules`.
+    pub fn secret_scope(&self) -> Scope {
+        match self.ecosystem {
+            Ecosystem::Declared => Scope::Work,
+            Ecosystem::Node(_) | Ecosystem::Rust | Ecosystem::Python => Scope::Cache,
+        }
+    }
 }
 
 /// A version pin found in one file, kept as written.

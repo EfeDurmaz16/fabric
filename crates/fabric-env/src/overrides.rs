@@ -349,9 +349,8 @@ fn caches(value: &Value) -> Result<Vec<DeclaredCache>, OverrideError> {
         if caches.iter().any(|c| c.path == path) {
             return Err(OverrideError::DuplicateCache { path });
         }
-        // A cache gets narrowed secret patterns and is dropped on a carry
-        // mismatch, so a path that holds Fabric's own files or the user's
-        // work must not become one by accident.
+        // A cache is dropped on a carry mismatch, so a path that holds
+        // Fabric's own files or the user's work must not become one by accident.
         if path.as_str() == FABRIC_DIR || path.as_str().starts_with(FABRIC_DIR_PREFIX) {
             return Err(OverrideError::ReservedCache { key: path_key });
         }
@@ -599,9 +598,8 @@ when = "always"
         ));
     }
 
-    /// A cache is dropped on a carry mismatch and gets narrowed secret
-    /// patterns, so Fabric's own directory and a path that nests with
-    /// another cache are refused; a sibling is fine.
+    /// A cache is dropped on a carry mismatch, so Fabric's own directory
+    /// and a path that nests with another cache are refused; a sibling is fine.
     #[test]
     fn a_cache_under_fabric_or_nested_in_another_cache_is_refused() {
         for path in [".fabric", ".fabric/jobs"] {
