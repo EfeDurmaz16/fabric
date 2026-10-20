@@ -290,14 +290,18 @@ impl ClaudeCode {
         process::installed_version(self.binary().ok(), PROGRAM).await
     }
 
-    /// Makes sure Claude will not stop at its trust dialog in `workspace`,
-    /// where Fabric can do so safely. `~/.claude.json` is read first, and
-    /// when the workspace root or an ancestor Claude inherits from is
-    /// trusted, nothing is written and no process is looked at. Otherwise
-    /// the key `projects["<root>"].hasTrustDialogAccepted` is written while
-    /// no `claude` runs; while one runs, or when the file is a symlink or
-    /// missing, the file is left to Claude and the outcome says why, so the caller can
-    /// warn and launch. `env` is the environment the caller will launch
+    /// Makes sure Claude trusts `workspace`, where Fabric can do so
+    /// safely: skips its dialog and applies the workspace's project
+    /// settings. The key is the one Claude reads for project settings,
+    /// the main checkout of the git repository that holds the workspace,
+    /// or the workspace outside a repository (`trust::project_key`).
+    /// `~/.claude.json` is read first, and when that key is already
+    /// `true`, nothing is written and no process is looked at. Otherwise
+    /// `projects["<key>"].hasTrustDialogAccepted` is written while no
+    /// `claude` runs; while one runs, or when the file is a symlink or
+    /// missing, the file is left to Claude and the outcome says why and
+    /// whether a trusted ancestor still skips the dialog, so the caller
+    /// can warn and launch. `env` is the environment the caller will launch
     /// with; one that moves Claude's config is refused before anything is
     /// read, because the key would land in a file Claude does not open.
     pub async fn preseed_trust(
@@ -324,36 +328,40 @@ impl ClaudeCode {
         Self::check_env(env)?;
         let root = pipeline::physical_workspace(workspace)?;
         let config_json = self.config_json.clone();
-        let read_root = root.clone();
-        let trusted =
-            pipeline::blocking(move || trust::trusted_by(&config_json, &read_root)).await?;
-        if let Some(by) = trusted {
-            return Ok(TrustOutcome::AlreadyTrusted { by });
-        }
+        let (key, found) = pipeline::blocking(move || {
+            let key = trust::project_key(&root)?;
+            let found = trust::read(&config_json, &root, &key)?;
+            Ok((key, found))
+        })
+        .await?;
+        let key_path = pipeline::fs_path(&key).to_path_buf();
+        let inherited = match found {
+            trust::Found::Exact => return Ok(TrustOutcome::AlreadyTrusted { key: key_path }),
+            trust::Found::Ancestor(by) => Some(by),
+            trust::Found::Nothing => None,
+        };
+        let left = |reason| match inherited.clone() {
+            Some(by) => TrustOutcome::Inherited { by, reason },
+            None => TrustOutcome::LeftToClaude { reason },
+        };
         let config_json = self.config_json.clone();
         if let Some(reason) = pipeline::blocking(move || trust::unwritable(&config_json)).await? {
-            return Ok(TrustOutcome::LeftToClaude { reason });
+            return Ok(left(reason));
         }
         if let Some(pids) = LivePids::of(running().await?) {
             debug!(
                 ?pids,
-                root = root.as_str(),
-                "claude: workspace not trusted and claude is running; left to Claude"
+                key = key.as_str(),
+                "claude: trust key not set and claude is running; left to Claude"
             );
-            return Ok(TrustOutcome::LeftToClaude {
-                reason: LeftReason::ClaudeRunning { pids },
-            });
+            return Ok(left(LeftReason::ClaudeRunning { pids }));
         }
         let config_json = self.config_json.clone();
-        let write_root = root.clone();
-        let changed =
-            pipeline::blocking(move || trust::preseed_file(&config_json, &write_root)).await?;
+        let changed = pipeline::blocking(move || trust::preseed_file(&config_json, &key)).await?;
         Ok(if changed {
-            TrustOutcome::Written
+            TrustOutcome::Written { key: key_path }
         } else {
-            TrustOutcome::AlreadyTrusted {
-                by: pipeline::fs_path(&root).to_path_buf(),
-            }
+            TrustOutcome::AlreadyTrusted { key: key_path }
         })
     }
 
@@ -852,41 +860,60 @@ mod tests {
         .to_string()
     }
 
-    fn trust_of(fixture: &TrustFixture) -> Value {
+    fn trust_at(fixture: &TrustFixture, key: &Path) -> Value {
         let value: Value = serde_json::from_slice(&fixture.config_bytes().unwrap()).unwrap();
-        value["projects"][fixture.work.to_str().unwrap()][trust::TRUST_KEY].clone()
+        value["projects"][key.to_str().unwrap()][trust::TRUST_KEY].clone()
+    }
+
+    fn trust_of(fixture: &TrustFixture) -> Value {
+        trust_at(fixture, &fixture.work)
+    }
+
+    fn written(key: &Path) -> TrustOutcome {
+        TrustOutcome::Written {
+            key: key.to_path_buf(),
+        }
     }
 
     #[tokio::test]
-    async fn a_trusted_ancestor_writes_nothing_and_asks_about_no_process() {
+    async fn a_trusted_ancestor_alone_is_inherited_and_left_to_a_running_claude() {
         let fixture = TrustFixture::new(Some(&|work: &Path| trusting(work.parent().unwrap())));
         let before = fixture.config_bytes();
         let (outcome, asked) = fixture.preseed(vec![4242]).await;
         assert_eq!(
             outcome.unwrap(),
-            TrustOutcome::AlreadyTrusted {
-                by: fixture.work.parent().unwrap().to_path_buf()
-            }
+            TrustOutcome::Inherited {
+                by: fixture.work.parent().unwrap().to_path_buf(),
+                reason: LeftReason::ClaudeRunning {
+                    pids: LivePids::of(vec![4242]).unwrap()
+                }
+            },
+            "Claude skips its dialog there but drops the project settings"
         );
-        assert!(
-            !asked,
-            "a trusted workspace must not depend on running processes"
-        );
+        assert!(asked);
         assert_eq!(fixture.config_bytes(), before);
     }
 
     #[tokio::test]
-    async fn a_workspace_reached_through_a_symlink_is_trusted_by_its_physical_ancestor() {
+    async fn a_trusted_ancestor_alone_gets_the_exact_key_while_no_claude_runs() {
         let fixture = TrustFixture::new(Some(&|work: &Path| trusting(work.parent().unwrap())));
+        let (outcome, asked) = fixture.preseed(Vec::new()).await;
+        assert_eq!(outcome.unwrap(), written(&fixture.work));
+        assert!(asked);
+        assert_eq!(trust_of(&fixture), Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn a_workspace_reached_through_a_symlink_is_keyed_by_its_physical_path() {
+        let fixture = TrustFixture::new(Some(&|work: &Path| trusting(work)));
         let link = fixture.home.join("link");
         std::os::unix::fs::symlink(&fixture.work, &link).unwrap();
         let (outcome, asked) = fixture.preseed_at(&link, Vec::new()).await;
         assert_eq!(
             outcome.unwrap(),
             TrustOutcome::AlreadyTrusted {
-                by: fixture.work.parent().unwrap().to_path_buf()
-            },
-            "Claude keys trust by the real path, so the link's own parent must not count"
+                key: fixture.work.clone()
+            }
         );
         assert!(!asked);
     }
@@ -899,7 +926,7 @@ mod tests {
         assert_eq!(
             outcome.unwrap(),
             TrustOutcome::AlreadyTrusted {
-                by: fixture.work.clone()
+                key: fixture.work.clone()
             }
         );
         assert!(!asked);
@@ -913,16 +940,60 @@ mod tests {
             trusting(work.parent().unwrap())
         }));
         let (outcome, asked) = fixture.preseed(Vec::new()).await;
-        assert_eq!(outcome.unwrap(), TrustOutcome::Written);
+        assert_eq!(outcome.unwrap(), written(&fixture.work));
         assert!(asked);
         assert_eq!(trust_of(&fixture), Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn a_workspace_below_its_git_root_is_keyed_by_the_root() {
+        let fixture = TrustFixture::new(Some(&|work: &Path| {
+            std::fs::create_dir(work.parent().unwrap().join(".git")).unwrap();
+            trusting(work)
+        }));
+        let repo = fixture.work.parent().unwrap().to_path_buf();
+        let (outcome, asked) = fixture.preseed(Vec::new()).await;
+        assert_eq!(
+            outcome.unwrap(),
+            written(&repo),
+            "Claude reads project settings trust at the repository root, not the subdirectory"
+        );
+        assert!(asked);
+        assert_eq!(trust_at(&fixture, &repo), Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn a_linked_worktree_is_keyed_by_its_main_checkout() {
+        let fixture = TrustFixture::new(Some(&|work: &Path| {
+            let main = work.parent().unwrap().parent().unwrap().join("main");
+            let gitdir = main.join(".git").join("worktrees").join("work");
+            std::fs::create_dir_all(&gitdir).unwrap();
+            std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+            std::fs::write(
+                gitdir.join("gitdir"),
+                format!("{}\n", work.join(".git").display()),
+            )
+            .unwrap();
+            std::fs::write(work.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+            trusting(&main)
+        }));
+        let main = fixture.home.join("main");
+        let before = fixture.config_bytes();
+        let (outcome, asked) = fixture.preseed(vec![4242]).await;
+        assert_eq!(
+            outcome.unwrap(),
+            TrustOutcome::AlreadyTrusted { key: main },
+            "Claude reads a worktree's trust at its main checkout"
+        );
+        assert!(!asked);
+        assert_eq!(fixture.config_bytes(), before);
     }
 
     #[tokio::test]
     async fn an_untrusted_workspace_is_written_while_no_claude_runs() {
         let fixture = TrustFixture::new(Some(&|_: &Path| r#"{"projects":{}}"#.to_owned()));
         let (outcome, asked) = fixture.preseed(Vec::new()).await;
-        assert_eq!(outcome.unwrap(), TrustOutcome::Written);
+        assert_eq!(outcome.unwrap(), written(&fixture.work));
         assert!(asked);
         assert_eq!(trust_of(&fixture), Value::Bool(true));
     }
