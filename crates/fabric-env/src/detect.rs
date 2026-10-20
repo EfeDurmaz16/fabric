@@ -266,7 +266,7 @@ impl NodeManager {
     ///
     /// A first install killed halfway leaves `node_modules` without them,
     /// which is how materialize tells a finished tree from a torn one. Bun
-    /// writes none, so a Bun tree is judged by being non-empty.
+    /// writes none, so a Bun tree is judged by materialize's own sentinel.
     pub(crate) fn install_markers(self) -> &'static [&'static str] {
         match self {
             NodeManager::Npm => &[".package-lock.json"],
@@ -343,18 +343,29 @@ pub enum CacheOrigin {
 }
 
 impl Ecosystem {
-    /// Returns the files one of which a finished install leaves in the cache; empty when content alone proves it.
+    /// Returns the files one of which the installer itself writes as it finishes; empty when it writes none.
     ///
     /// The markers follow the manager detection chose, not the lockfiles on
     /// disk: a Bun tree next to a leftover `package-lock.json` needs no
-    /// `.package-lock.json`.
+    /// `.package-lock.json`. `.venv` has none: `pyvenv.cfg` is the first
+    /// file `uv venv` writes, before any package, so it proves nothing.
     pub fn install_markers(self) -> &'static [&'static str] {
         match self {
             Ecosystem::Node(manager) => manager.install_markers(),
-            Ecosystem::Python => &["pyvenv.cfg"],
-            Ecosystem::Rust | Ecosystem::Other => &[],
+            Ecosystem::Rust | Ecosystem::Python | Ecosystem::Other => &[],
         }
     }
+}
+
+/// How materialize tells a finished cache from a torn one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Completion {
+    /// One of these files, which the installer itself writes as it finishes.
+    Marker(&'static [&'static str]),
+    /// The sentinel materialize writes once the steps that fill the cache have exited 0.
+    Sentinel,
+    /// Content alone: no setup step fills the cache, so no step can leave it torn.
+    Content,
 }
 
 /// One cache path, its class for the snapshot policy, and its ecosystem.
@@ -447,6 +458,32 @@ impl Detection {
     /// Returns what each setup step fills, one per step of the spec and in the same order.
     pub fn step_scopes(&self) -> &[StepScope] {
         &self.step_scopes
+    }
+
+    /// Returns how materialize proves `cache` whole.
+    ///
+    /// The installer's own marker when its ecosystem has one. Otherwise the
+    /// sentinel when a setup step fills the cache: a detected step that
+    /// fills that path, or a step the user declared, which stands in for
+    /// the detected steps and does not say what it fills. A detected
+    /// `target` is made by a build, never by setup, so no declared step
+    /// counts as filling it. Otherwise content alone.
+    pub fn completion(&self, cache: &CachePath) -> Completion {
+        let markers = cache.ecosystem.install_markers();
+        if !markers.is_empty() {
+            return Completion::Marker(markers);
+        }
+        let built = cache.origin == CacheOrigin::Detected && cache.ecosystem == Ecosystem::Rust;
+        let filled = self.step_scopes.iter().any(|scope| match scope {
+            StepScope::Fills(path) => path == &cache.path,
+            StepScope::Declared => !built,
+            StepScope::Warms(_) | StepScope::Outside => false,
+        });
+        if filled {
+            Completion::Sentinel
+        } else {
+            Completion::Content
+        }
     }
 
     /// Returns the spec's cache paths with their class and ecosystem, sorted by path.

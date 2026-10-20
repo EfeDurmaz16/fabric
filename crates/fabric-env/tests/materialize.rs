@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use fabric_core::env::{EnvVarName, RunWhen};
 use fabric_env::detect::{Detection, detect};
-use fabric_env::materialize::{CacheHealth, MaterializeError, plan};
+use fabric_env::materialize::{CacheHealth, MaterializeError, SENTINEL, plan};
 use tempfile::TempDir;
 
 type TestResult<T> = Result<T, Box<dyn Error>>;
@@ -126,10 +126,12 @@ fn a_torn_install_runs_again() {
 }
 
 /// One row per rule: the marker follows the manager detection chose, not
-/// the lockfiles on disk; `.venv` needs `pyvenv.cfg`; other caches need content.
+/// the lockfiles on disk; a cache a step fills and whose installer writes
+/// no marker needs the sentinel; a cache no step fills needs content.
 #[test]
 fn health_follows_the_cache_kind() {
-    let cases: [(Files, CacheHealth); 10] = [
+    let sentinel = &[SENTINEL][..];
+    let cases: [(Files, CacheHealth); 13] = [
         (
             &[
                 ("package.json", PACKAGE_JSON),
@@ -157,11 +159,21 @@ fn health_follows_the_cache_kind() {
             ],
             CacheHealth::Healthy,
         ),
+        // Bun writes no marker, so content alone could be a torn tree.
         (
             &[
                 ("package.json", PACKAGE_JSON),
                 ("bun.lock", ""),
                 ("node_modules/a/package.json", "{}"),
+            ],
+            CacheHealth::Incomplete { expected: sentinel },
+        ),
+        (
+            &[
+                ("package.json", PACKAGE_JSON),
+                ("bun.lock", ""),
+                ("node_modules/a/package.json", "{}"),
+                ("node_modules/.fabric-installed", ""),
             ],
             CacheHealth::Healthy,
         ),
@@ -172,14 +184,25 @@ fn health_follows_the_cache_kind() {
                 ("bun.lock", ""),
                 ("package-lock.json", ""),
                 ("node_modules/a/package.json", "{}"),
+                ("node_modules/.fabric-installed", ""),
             ],
             CacheHealth::Healthy,
         ),
+        // `uv venv` writes pyvenv.cfg before any package, so it proves nothing.
         (
-            &[("uv.lock", ""), (".venv/bin/python", "")],
-            CacheHealth::Incomplete {
-                expected: &["pyvenv.cfg"],
-            },
+            &[
+                ("requirements.txt", ""),
+                (".venv/pyvenv.cfg", "home = /x\n"),
+            ],
+            CacheHealth::Incomplete { expected: sentinel },
+        ),
+        (
+            &[
+                ("uv.lock", ""),
+                (".venv/pyvenv.cfg", ""),
+                (".venv/.fabric-installed", ""),
+            ],
+            CacheHealth::Healthy,
         ),
         (
             &[("Cargo.toml", ""), ("target/debug/x", "")],
@@ -191,6 +214,17 @@ fn health_follows_the_cache_kind() {
         ),
         (&[("Cargo.toml", "")], CacheHealth::Missing),
         (&[("Cargo.toml", ""), ("target/", "")], CacheHealth::Empty),
+        // A declared cache that no step fills is whole when it has content.
+        (
+            &[
+                (
+                    ".fabric/env.toml",
+                    "setup = []\n[[cache]]\npath = \"out\"\nclass = \"build\"\n",
+                ),
+                ("out/x", ""),
+            ],
+            CacheHealth::Healthy,
+        ),
     ];
     for (files, health) in cases {
         let dir = tempfile::tempdir().unwrap();
@@ -200,6 +234,53 @@ fn health_follows_the_cache_kind() {
         assert_eq!(planned.caches().len(), 1, "{files:?}");
         assert_eq!(planned.caches()[0].health, health, "{files:?}");
     }
+}
+
+/// The sentinel is written only after the steps that fill a cache exit 0,
+/// and removed before they start, so a failed or killed run of a step,
+/// even over a cache that was whole, leaves the cache to be filled again.
+#[test]
+fn the_sentinel_marks_a_cache_whole_only_after_its_steps_succeed() {
+    let dir = tempfile::tempdir().unwrap();
+    let fill = r#"
+[[cache]]
+path = "out"
+class = "build"
+
+[[setup]]
+program = "sh"
+args = ["-c", "mkdir -p out && echo x > out/f"]
+"#;
+    let detected = declared(dir.path(), fill).unwrap();
+    plan(&detected).unwrap().ready().unwrap().execute().unwrap();
+    assert!(dir.path().join("out").join(SENTINEL).is_file());
+    let again = plan(&detect(dir.path(), None).unwrap()).unwrap();
+    assert_eq!(again.caches()[0].health, CacheHealth::Healthy);
+    assert!(again.is_noop());
+
+    let torn = r#"
+[[cache]]
+path = "out"
+class = "build"
+
+[[setup]]
+program = "sh"
+args = ["-c", "echo y > out/f; exit 3"]
+when = "always"
+"#;
+    let detected = declared(dir.path(), torn).unwrap();
+    assert!(matches!(
+        plan(&detected).unwrap().ready().unwrap().execute(),
+        Err(MaterializeError::StepFailed { .. })
+    ));
+    assert!(!dir.path().join("out").join(SENTINEL).exists());
+    let after = plan(&detect(dir.path(), None).unwrap()).unwrap();
+    assert_eq!(
+        after.caches()[0].health,
+        CacheHealth::Incomplete {
+            expected: &[SENTINEL]
+        }
+    );
 }
 
 #[test]

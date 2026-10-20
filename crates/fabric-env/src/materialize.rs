@@ -15,13 +15,16 @@
 //! cache is outside the workspace, or that the user declared, runs when
 //! any cache is not whole or the report has none.
 //!
-//! A cache is healthy when it is a non-empty directory that holds the
-//! marker its installer writes last. The marker comes from the cache's
-//! ecosystem in the detection report, so `node_modules` needs the marker of
-//! the manager detection chose, whatever other lockfiles lie next to it,
-//! `.venv` needs `pyvenv.cfg`, and any other cache needs only to be
-//! non-empty. A first install killed halfway leaves a tree without its
-//! marker, so the next plan installs again. A report with no cache paths
+//! A cache is healthy when it is a non-empty directory that holds proof
+//! that whatever filled it finished. For npm, pnpm and Yarn that is the
+//! marker the installer itself writes as it finishes, chosen by the manager
+//! detection recorded, whatever other lockfiles lie next to it. For a cache
+//! a setup step fills and whose installer writes no such marker (Bun,
+//! `.venv`, a declared cache) it is `SENTINEL`, which materialize removes
+//! before the first step that fills the cache and writes after the last
+//! one exits 0. A cache no step fills needs only to be non-empty. An
+//! install that fails or is killed halfway leaves no proof, so the next
+//! plan fills the cache again. A report with no cache paths
 //! has nothing that proves warmth, so its `CachesMissing` steps run on
 //! every resume; declaring a `[[cache]]` is how a user makes them skip.
 //!
@@ -32,7 +35,7 @@
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -45,7 +48,18 @@ use fabric_core::harness::ProgramName;
 use fabric_core::path::RelPath;
 use tracing::Dispatch;
 
-use crate::detect::{CachePath, Detection, StepScope};
+use crate::detect::{CachePath, Completion, Detection, StepScope};
+
+/// The file materialize writes in a cache once the steps that fill it have exited 0.
+///
+/// It is removed before the first of those steps starts and written after
+/// the last one succeeds, so a step that fails or is killed leaves the
+/// cache without it and the next plan fills the cache again.
+pub const SENTINEL: &str = ".fabric-installed";
+
+/// What the sentinel file holds; only its presence is read.
+const SENTINEL_TEXT: &[u8] =
+    b"Written by Fabric after the setup steps that fill this cache exited 0.\n";
 
 /// The `tracing` target that carries every line a setup step prints.
 pub const SETUP_LOG_TARGET: &str = "fabric_env::setup";
@@ -131,6 +145,15 @@ pub enum MaterializeError {
         #[source]
         source: io::Error,
     },
+    /// The sentinel of a cache could not be removed before a step or written after it.
+    #[error("could not update the completion sentinel of cache `{path}`")]
+    Sentinel {
+        /// The cache path.
+        path: RelPath,
+        /// The IO error.
+        #[source]
+        source: io::Error,
+    },
     /// A step exited unsuccessfully; the steps after it did not run.
     #[error("setup step {index} (`{program}`) failed: {status}")]
     StepFailed {
@@ -186,6 +209,14 @@ pub struct PlannedStep {
     step: SetupStep,
     dir: PathBuf,
     program: Option<PathBuf>,
+    sentinels: Sentinels,
+}
+
+/// The caches whose sentinel a step removes before it runs and writes after it succeeds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Sentinels {
+    clear: Vec<RelPath>,
+    write: Vec<RelPath>,
 }
 
 impl PlannedStep {
@@ -216,6 +247,7 @@ impl PlannedStep {
 /// one way to run it is `Plan::ready`, which consumes it.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Plan {
+    root: PathBuf,
     caches: Vec<CacheReport>,
     steps: Vec<PlannedStep>,
     missing_env: Vec<EnvVarName>,
@@ -247,7 +279,10 @@ impl Plan {
     /// A plan with no steps is ready whatever this node lacks, since nothing will run.
     pub fn ready(self) -> Result<Ready, MaterializeError> {
         if self.steps.is_empty() {
-            return Ok(Ready { steps: Vec::new() });
+            return Ok(Ready {
+                root: self.root,
+                steps: Vec::new(),
+            });
         }
         let mut steps = Vec::with_capacity(self.steps.len());
         let mut missing = Vec::new();
@@ -258,6 +293,7 @@ impl Plan {
                     step: planned.step,
                     dir: planned.dir,
                     program,
+                    sentinels: planned.sentinels,
                 }),
                 None => missing.push((planned.index, planned.step.program)),
             }
@@ -268,7 +304,10 @@ impl Plan {
                 env: self.missing_env,
             });
         }
-        Ok(Ready { steps })
+        Ok(Ready {
+            root: self.root,
+            steps,
+        })
     }
 }
 
@@ -279,11 +318,13 @@ struct ReadyStep {
     step: SetupStep,
     dir: PathBuf,
     program: PathBuf,
+    sentinels: Sentinels,
 }
 
 /// Steps that passed every check `Plan::ready` makes; running them consumes this value.
 #[derive(Debug)]
 pub struct Ready {
+    root: PathBuf,
     steps: Vec<ReadyStep>,
 }
 
@@ -294,7 +335,13 @@ impl Ready {
     /// step has run, so a second run needs a new plan.
     pub fn execute(self) -> Result<(), MaterializeError> {
         for step in &self.steps {
+            for path in &step.sentinels.clear {
+                clear_sentinel(&self.root, path)?;
+            }
             run_step(step)?;
+            for path in &step.sentinels.write {
+                write_sentinel(&self.root, path)?;
+            }
         }
         Ok(())
     }
@@ -328,7 +375,7 @@ pub fn plan(detected: &Detection) -> Result<Plan, MaterializeError> {
         .map(|cache| {
             Ok(CacheReport {
                 path: cache.path.clone(),
-                health: inspect(&root, cache)?,
+                health: inspect(&root, cache, detected.completion(cache))?,
             })
         })
         .collect::<Result<Vec<_>, MaterializeError>>()?;
@@ -354,8 +401,10 @@ pub fn plan(detected: &Detection) -> Result<Plan, MaterializeError> {
             step: step.clone(),
             dir: step_dir(&root, index, step)?,
             program: find_on_path(env::var_os("PATH").as_deref(), &root, &step.program),
+            sentinels: Sentinels::default(),
         });
     }
+    assign_sentinels(detected, &mut steps);
 
     let missing_env = spec
         .env_var_names
@@ -365,13 +414,41 @@ pub fn plan(detected: &Detection) -> Result<Plan, MaterializeError> {
         .collect();
 
     Ok(Plan {
+        root,
         caches,
         steps,
         missing_env,
     })
 }
 
-fn inspect(root: &Path, cache: &CachePath) -> Result<CacheHealth, MaterializeError> {
+/// Gives each sentinel cache to the planned steps that fill it: the first clears it, the last writes it.
+fn assign_sentinels(detected: &Detection, steps: &mut [PlannedStep]) {
+    let scopes = detected.step_scopes();
+    for cache in detected.caches() {
+        if detected.completion(cache) != Completion::Sentinel {
+            continue;
+        }
+        // Completion is Sentinel only for a cache some step fills, and for
+        // such a cache a declared step always counts as filling it.
+        let fills = |planned: &PlannedStep| match scopes.get(planned.index) {
+            Some(StepScope::Fills(path)) => path == &cache.path,
+            Some(StepScope::Declared) => true,
+            Some(StepScope::Warms(_) | StepScope::Outside) | None => false,
+        };
+        if let Some(first) = steps.iter().position(fills) {
+            steps[first].sentinels.clear.push(cache.path.clone());
+        }
+        if let Some(last) = steps.iter().rposition(fills) {
+            steps[last].sentinels.write.push(cache.path.clone());
+        }
+    }
+}
+
+fn inspect(
+    root: &Path,
+    cache: &CachePath,
+    completion: Completion,
+) -> Result<CacheHealth, MaterializeError> {
     let full = root.join(cache.path.as_str());
     let inspect_err = |source| MaterializeError::Inspect {
         path: cache.path.clone(),
@@ -388,16 +465,58 @@ fn inspect(root: &Path, cache: &CachePath) -> Result<CacheHealth, MaterializeErr
     if fs::read_dir(&full).map_err(inspect_err)?.next().is_none() {
         return Ok(CacheHealth::Empty);
     }
-    let expected = cache.ecosystem.install_markers();
-    if expected.is_empty()
-        || expected
-            .iter()
-            .any(|m| fs::symlink_metadata(full.join(m)).is_ok())
+    let expected: &'static [&'static str] = match completion {
+        Completion::Content => return Ok(CacheHealth::Healthy),
+        Completion::Marker(markers) => markers,
+        Completion::Sentinel => &[SENTINEL],
+    };
+    if expected
+        .iter()
+        .any(|m| fs::symlink_metadata(full.join(m)).is_ok_and(|meta| meta.is_file()))
     {
         Ok(CacheHealth::Healthy)
     } else {
         Ok(CacheHealth::Incomplete { expected })
     }
+}
+
+/// Removes the sentinel of the cache at `path`; nothing there is fine.
+fn clear_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
+    match fs::remove_file(root.join(path.as_str()).join(SENTINEL)) {
+        Err(err)
+            if err.kind() != io::ErrorKind::NotFound
+                && err.kind() != io::ErrorKind::NotADirectory =>
+        {
+            Err(MaterializeError::Sentinel {
+                path: path.clone(),
+                source: err,
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Writes the sentinel of the cache at `path` when the steps left a real directory there.
+///
+/// A cache the steps did not create, or one that is a link, gets no
+/// sentinel: the next plan sees it missing or torn and fills it again,
+/// which costs time and never writes outside the workspace.
+fn write_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
+    let dir = root.join(path.as_str());
+    if !fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_dir()) {
+        tracing::warn!(target: SETUP_LOG_TARGET, cache = %path, "the setup steps left no directory at this cache path; it will be filled again on the next resume");
+        return Ok(());
+    }
+    let sentinel_err = |source| MaterializeError::Sentinel {
+        path: path.clone(),
+        source,
+    };
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dir.join(SENTINEL))
+        .map_err(sentinel_err)?;
+    file.write_all(SENTINEL_TEXT).map_err(sentinel_err)
 }
 
 fn step_dir(root: &Path, index: usize, step: &SetupStep) -> Result<PathBuf, MaterializeError> {
