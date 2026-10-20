@@ -1,7 +1,7 @@
 //! One node's endpoint: both transports on one port, QUIC first.
 //!
-//! Invariant: a dial tries QUIC first and falls back to TCP with TLS only
-//! when QUIC did not complete within `quic_timeout`; the fallback is
+//! Invariant: by default a dial tries QUIC first and falls back to TCP with
+//! TLS only when QUIC did not complete within `quic_timeout`; the fallback is
 //! reported with QUIC's failure, never silent, so a slow path is visible to
 //! the user and to the ledger. Both transports listen on one port number,
 //! so a user pastes one address at pairing. A forged handshake ends a dial
@@ -27,6 +27,21 @@ pub const QUIC_TIMEOUT: Duration = Duration::from_secs(3);
 /// How many ports a bind to port 0 tries before it reports the TCP port taken.
 pub const EPHEMERAL_TRIES: usize = 8;
 
+/// Which wires a dial tries, and in which order.
+///
+/// Both wires always listen; this only shapes the dialing side, so two
+/// nodes with different orders still reach each other on a wire they share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DialOrder {
+    /// QUIC within the QUIC timeout, then TCP with TLS.
+    #[default]
+    QuicThenTcp,
+    /// QUIC only, for a network known to pass UDP.
+    QuicOnly,
+    /// TCP with TLS only, for a network that drops UDP.
+    TcpOnly,
+}
+
 /// A connection and, when QUIC was not used, why.
 ///
 /// `connection.kind()` says which wire served the dial.
@@ -44,6 +59,7 @@ pub struct Endpoint {
     quic: QuicTransport,
     tcp: TcpTlsTransport,
     quic_timeout: Duration,
+    order: DialOrder,
 }
 
 impl Endpoint {
@@ -67,6 +83,7 @@ impl Endpoint {
                         quic,
                         tcp,
                         quic_timeout: QUIC_TIMEOUT,
+                        order: DialOrder::default(),
                     });
                 }
                 Err(TransportError::Io(err))
@@ -86,6 +103,13 @@ impl Endpoint {
         self
     }
 
+    /// Sets which wires a dial tries.
+    #[must_use]
+    pub fn with_dial_order(mut self, order: DialOrder) -> Self {
+        self.order = order;
+        self
+    }
+
     /// This node's id.
     #[must_use]
     pub fn node_id(&self) -> NodeId {
@@ -97,8 +121,28 @@ impl Endpoint {
         self.quic.local_addr()
     }
 
-    /// Dials `peer` at `addr`: QUIC within `quic_timeout`, then TCP with TLS.
+    /// Dials `peer` at `addr` on the wires the dial order names: QUIC
+    /// within `quic_timeout`, then TCP with TLS, by default.
     pub async fn dial(&self, peer: NodeId, addr: SocketAddr) -> Result<Dialed, TransportError> {
+        match self.order {
+            DialOrder::QuicThenTcp => {}
+            DialOrder::QuicOnly => {
+                let connection =
+                    tokio::time::timeout(self.quic_timeout, self.quic.connect(peer, addr))
+                        .await
+                        .map_err(|_| TransportError::Timeout(self.quic_timeout))??;
+                return Ok(Dialed {
+                    connection,
+                    quic_failure: None,
+                });
+            }
+            DialOrder::TcpOnly => {
+                return Ok(Dialed {
+                    connection: self.tcp.connect(peer, addr).await?,
+                    quic_failure: None,
+                });
+            }
+        }
         let quic_failure =
             match tokio::time::timeout(self.quic_timeout, self.quic.connect(peer, addr)).await {
                 Ok(Ok(connection)) => {

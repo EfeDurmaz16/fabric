@@ -14,7 +14,7 @@ use std::time::Duration;
 use fabric_core::BoxFuture;
 use fabric_core::id::{ChunkId, Epoch, JobId, NodeId, SnapshotId};
 use fabric_core::lease::FencingToken;
-use fabric_net::endpoint::Endpoint;
+use fabric_net::endpoint::{DialOrder, Endpoint};
 use fabric_net::frame::{FRAME_VERSION, MAX_CONTROL_FRAME};
 use fabric_net::identity::NodeIdentity;
 use fabric_net::peers::Peers;
@@ -857,5 +857,29 @@ async fn quic_is_dialed_first_and_tcp_is_the_fallback() -> TestResult {
         "the fallback must say how QUIC failed"
     );
     assert_eq!(accepting.await??.kind(), TransportKind::TcpTls);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dial_order_names_the_one_wire_a_dial_uses() -> TestResult {
+    let (a, b) = (Node::new()?, Node::new()?);
+    let trust_a: Arc<dyn Trust> = Arc::new(Paired(vec![b.id()]));
+    let trust_b: Arc<dyn Trust> = Arc::new(Paired(vec![a.id()]));
+    let any: SocketAddr = ([127, 0, 0, 1], 0).into();
+    let server = Arc::new(Endpoint::bind(&b.identity, &trust_b, any)?);
+    for (order, kind) in [
+        (DialOrder::TcpOnly, TransportKind::TcpTls),
+        (DialOrder::QuicOnly, TransportKind::Quic),
+    ] {
+        let client = Endpoint::bind(&a.identity, &trust_a, any)?.with_dial_order(order);
+        let accepting = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await })
+        };
+        let dialed = client.dial(b.id(), server.local_addr()?).await?;
+        assert_eq!(dialed.connection.kind(), kind, "{order:?}");
+        assert!(dialed.quic_failure.is_none());
+        assert_eq!(accepting.await??.kind(), kind);
+    }
     Ok(())
 }
