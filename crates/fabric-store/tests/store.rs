@@ -165,14 +165,19 @@ fn publish_refuses_a_bundle_base_the_store_does_not_have() {
 }
 
 #[test]
-fn one_process_holds_a_store_and_a_foreign_schema_is_refused() {
+fn a_second_open_of_a_held_store_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::create(dir.path(), params().unwrap()).unwrap();
+    let _store = Store::create(dir.path(), params().unwrap()).unwrap();
     assert!(matches!(
         Store::open(dir.path()),
         Err(StoreError::Locked { .. })
     ));
-    drop(store);
+}
+
+#[test]
+fn creating_a_store_over_one_is_refused_and_its_params_survive() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Store::create(dir.path(), params().unwrap()).unwrap());
     assert!(matches!(
         Store::create(dir.path(), params().unwrap()),
         Err(StoreError::AlreadyAStore { .. })
@@ -180,14 +185,21 @@ fn one_process_holds_a_store_and_a_foreign_schema_is_refused() {
     assert!(!dir.path().join("catalog.sqlite.tmp").exists());
     let reopened = Store::open(dir.path()).unwrap();
     assert_eq!(*reopened.objects().params(), params().unwrap());
-    drop(reopened);
+}
 
-    let other = tempfile::tempdir().unwrap();
+#[test]
+fn opening_a_directory_that_is_not_a_store_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
     assert!(matches!(
-        Store::open(other.path()),
+        Store::open(dir.path()),
         Err(StoreError::NotAStore { .. })
     ));
+}
 
+#[test]
+fn a_catalog_with_a_foreign_schema_version_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Store::create(dir.path(), params().unwrap()).unwrap());
     let conn = rusqlite::Connection::open(dir.path().join("catalog.sqlite")).unwrap();
     conn.execute("UPDATE schema_version SET version = 99", [])
         .unwrap();

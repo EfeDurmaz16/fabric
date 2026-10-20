@@ -18,18 +18,6 @@ fn small_params() -> Result<ChunkParams, ObjectError> {
     ChunkParams::new(4096, 64, 256, 1024, 3)
 }
 
-fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
-    let mut state = seed | 1;
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state.to_le_bytes()[3]
-        })
-        .collect()
-}
-
 #[test]
 fn an_object_is_written_once_and_read_back_verified() {
     let dir = tempfile::tempdir().unwrap();
@@ -94,7 +82,7 @@ fn a_large_file_is_chunked_the_same_from_disk_and_from_memory() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::create(dir.path(), small_params().unwrap()).unwrap();
     let objects = store.objects();
-    let bytes = pseudo_random(20_000, 42);
+    let bytes = common::pseudo_random(20_000, 42);
     let file = dir.path().join("big.bin");
     fs::write(&file, &bytes).unwrap();
     let from_disk = objects.put_file(&file).unwrap();
@@ -127,7 +115,8 @@ fn chunking_round_trips_and_is_deterministic() {
         cases: 48,
         ..Config::default()
     });
-    let strategy = (0usize..12_000, any::<u64>()).prop_map(|(len, seed)| pseudo_random(len, seed));
+    let strategy =
+        (0usize..12_000, any::<u64>()).prop_map(|(len, seed)| common::pseudo_random(len, seed));
     runner
         .run(&strategy, |bytes| {
             let fail = |e: ObjectError| TestCaseError::fail(e.to_string());

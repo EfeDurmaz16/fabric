@@ -653,17 +653,44 @@ fn the_large_untracked_guard_names_the_file() {
     assert!(capture(&store, &allowed).is_ok());
 }
 
-#[test]
-fn busy_repositories_and_linked_worktrees_are_refused() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("work");
-    make_repo(&root).unwrap();
-    let store = store_in(dir.path()).unwrap();
-    let policy = IgnorePolicy::default();
+/// A repository with every kind of change, a store and the default policy.
+struct BusyFixture {
+    dir: tempfile::TempDir,
+    root: PathBuf,
+    store: Store,
+    policy: IgnorePolicy,
+}
 
-    let merge_head = git(&root).git_path("MERGE_HEAD").unwrap();
+impl BusyFixture {
+    fn new() -> Fallible<BusyFixture> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("work");
+        make_repo(&root)?;
+        let store = store_in(dir.path())?;
+        Ok(BusyFixture {
+            dir,
+            root,
+            store,
+            policy: IgnorePolicy::default(),
+        })
+    }
+
+    /// Captures at `root` and returns the refusal, or `None` when capture succeeds.
+    fn capture_at(&self, root: &Path) -> Option<CaptureError> {
+        capture(&self.store, &request(root, &self.policy, None)).err()
+    }
+
+    fn capture_err(&self) -> Option<CaptureError> {
+        self.capture_at(&self.root)
+    }
+}
+
+#[test]
+fn a_merge_in_progress_is_refused() {
+    let fixture = BusyFixture::new().unwrap();
+    let merge_head = git(&fixture.root).git_path("MERGE_HEAD").unwrap();
     fs::write(&merge_head, "0000000000000000000000000000000000000000\n").unwrap();
-    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    let err = fixture.capture_err().unwrap();
     assert!(
         matches!(
             err,
@@ -673,28 +700,37 @@ fn busy_repositories_and_linked_worktrees_are_refused() {
         ),
         "{err}"
     );
-    fs::remove_file(&merge_head).unwrap();
+}
 
-    let linked = dir.path().join("linked");
-    git(&root)
+#[test]
+fn a_linked_worktree_is_refused() {
+    let fixture = BusyFixture::new().unwrap();
+    let linked = fixture.dir.path().join("linked");
+    git(&fixture.root)
         .run(&["worktree", "add", "-q", linked.to_str().unwrap(), "feature"])
         .unwrap();
-    let err = capture(&store, &request(&linked, &policy, None)).unwrap_err();
+    let err = fixture.capture_at(&linked).unwrap();
     assert!(
         matches!(err, CaptureError::GitLinkedWorktree { .. }),
         "{err}"
     );
+}
 
-    let sub = root.join("d");
-    let err = capture(&store, &request(&sub, &policy, None)).unwrap_err();
+#[test]
+fn a_root_below_the_top_level_is_refused() {
+    let fixture = BusyFixture::new().unwrap();
+    let err = fixture.capture_at(&fixture.root.join("d")).unwrap();
     assert!(
         matches!(err, CaptureError::NotRepositoryRoot { .. }),
         "{err}"
     );
+}
 
-    let rebase = git(&root).git_path("rebase-merge").unwrap();
-    fs::create_dir(&rebase).unwrap();
-    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+#[test]
+fn a_rebase_in_progress_is_refused() {
+    let fixture = BusyFixture::new().unwrap();
+    fs::create_dir(git(&fixture.root).git_path("rebase-merge").unwrap()).unwrap();
+    let err = fixture.capture_err().unwrap();
     assert!(
         matches!(
             err,
@@ -704,11 +740,13 @@ fn busy_repositories_and_linked_worktrees_are_refused() {
         ),
         "{err}"
     );
-    fs::remove_dir(&rebase).unwrap();
+}
 
-    let lock = git(&root).git_path("index.lock").unwrap();
-    fs::write(&lock, "").unwrap();
-    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+#[test]
+fn a_held_index_lock_is_refused() {
+    let fixture = BusyFixture::new().unwrap();
+    fs::write(git(&fixture.root).git_path("index.lock").unwrap(), "").unwrap();
+    let err = fixture.capture_err().unwrap();
     assert!(
         matches!(
             err,
@@ -718,15 +756,18 @@ fn busy_repositories_and_linked_worktrees_are_refused() {
         ),
         "{err}"
     );
-    fs::remove_file(&lock).unwrap();
+}
 
+#[test]
+fn unmerged_index_entries_are_refused() {
+    let fixture = BusyFixture::new().unwrap();
     // A stash applied over a conflicting commit leaves unmerged entries and no MERGE_HEAD.
-    let g = git(&root);
+    let g = git(&fixture.root);
     g.run(&["stash", "push", "-q"]).unwrap();
-    fs::write(root.join("a"), "a committed\n").unwrap();
+    fs::write(fixture.root.join("a"), "a committed\n").unwrap();
     g.run(&["commit", "-q", "-am", "conflicting"]).unwrap();
     assert!(!g.succeeds(&["stash", "apply", "-q"]).unwrap());
-    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    let err = fixture.capture_err().unwrap();
     assert!(
         matches!(
             err,
@@ -736,13 +777,16 @@ fn busy_repositories_and_linked_worktrees_are_refused() {
         ),
         "{err}"
     );
-    g.run(&["reset", "-q", "--hard"]).unwrap();
+}
 
-    // An LFS filter set only in .git/info/attributes, on an untracked file.
-    let info = git(&root).git_path("info/attributes").unwrap();
+#[test]
+fn an_lfs_filter_on_an_untracked_file_is_refused() {
+    let fixture = BusyFixture::new().unwrap();
+    // Set only in .git/info/attributes.
+    let info = git(&fixture.root).git_path("info/attributes").unwrap();
     fs::write(&info, "*.bin filter=lfs\n").unwrap();
-    fs::write(root.join("blob.bin"), "large\n").unwrap();
-    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    fs::write(fixture.root.join("blob.bin"), "large\n").unwrap();
+    let err = fixture.capture_err().unwrap();
     assert!(
         matches!(&err, CaptureError::GitLfsUnsupported { path } if path.as_str() == "blob.bin"),
         "{err}"
