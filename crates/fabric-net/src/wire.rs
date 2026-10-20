@@ -40,6 +40,9 @@ pub enum WireError {
     /// A chunk batch is empty or names more than `MAX_CHUNK_BATCH` ids.
     #[error("a chunk batch names 1 to {MAX_CHUNK_BATCH} ids, not {0}")]
     BatchSize(usize),
+    /// A chunk batch names one id twice.
+    #[error("a chunk batch names {0} twice")]
+    DuplicateChunk(ChunkId),
     /// A text field exceeds its cap.
     #[error("text of {len} bytes exceeds the cap of {max}")]
     TextTooLong {
@@ -174,16 +177,23 @@ pub struct Request {
     pub body: RequestBody,
 }
 
-/// A list of 1 to `MAX_CHUNK_BATCH` chunk ids.
+/// A list of 1 to `MAX_CHUNK_BATCH` distinct chunk ids.
+///
+/// Each id is asked once, so the receiver can treat a second copy of a
+/// chunk as a protocol error and the missing set stays exact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct ChunkBatch(Vec<ChunkId>);
 
 impl ChunkBatch {
-    /// Wraps `ids` if the count is within bounds.
+    /// Wraps `ids` if the count is within bounds and no id repeats.
     pub fn new(ids: Vec<ChunkId>) -> Result<Self, WireError> {
         if ids.is_empty() || ids.len() > MAX_CHUNK_BATCH {
             return Err(WireError::BatchSize(ids.len()));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        if let Some(twice) = ids.iter().find(|id| !seen.insert(**id)) {
+            return Err(WireError::DuplicateChunk(*twice));
         }
         Ok(Self(ids))
     }
@@ -453,8 +463,9 @@ mod tests {
             ),
             bytes32(SnapshotId::from_bytes)
                 .prop_map(|snapshot| RequestBody::WantSnapshot { snapshot }),
-            vec(bytes32(ChunkId::from_bytes), 1..=MAX_CHUNK_BATCH)
-                .prop_filter_map("batch", |ids| ChunkBatch::new(ids).ok())
+            proptest::collection::btree_set(bytes32(ChunkId::from_bytes), 1..=MAX_CHUNK_BATCH)
+                .prop_filter_map("batch", |ids| ChunkBatch::new(ids.into_iter().collect())
+                    .ok())
                 .prop_map(RequestBody::WantChunks),
         ]
     }
@@ -524,8 +535,20 @@ mod tests {
     }
 
     #[test]
+    fn a_chunk_batch_naming_an_id_twice_does_not_decode() {
+        let (x, y) = (ChunkId::of(b"x"), ChunkId::of(b"y"));
+        assert!(matches!(
+            ChunkBatch::new(vec![x, y, x]),
+            Err(WireError::DuplicateChunk(id)) if id == x
+        ));
+        assert!(decode::<ChunkBatch>(&encode(&vec![x, x]).unwrap()).is_err());
+    }
+
+    #[test]
     fn a_chunk_batch_beyond_the_cap_does_not_decode() {
-        let ids = vec![ChunkId::of(b"x"); MAX_CHUNK_BATCH + 1];
+        let ids: Vec<ChunkId> = (0..=MAX_CHUNK_BATCH)
+            .map(|n| ChunkId::of(&n.to_le_bytes()))
+            .collect();
         assert!(matches!(
             ChunkBatch::new(ids.clone()),
             Err(WireError::BatchSize(257))
