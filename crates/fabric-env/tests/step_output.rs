@@ -52,7 +52,7 @@ when = "always"
     .unwrap();
     let locks = tempfile::tempdir().unwrap();
     let lock = TreeLock::acquire(locks.path(), dir.path()).unwrap();
-    let detected = detect(dir.path(), None).unwrap();
+    let detected = detect(dir.path(), &[]).unwrap();
     let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
     let captured = Captured::default();
     let writer = captured.clone();

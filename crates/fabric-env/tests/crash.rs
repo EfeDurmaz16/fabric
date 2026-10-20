@@ -42,7 +42,7 @@ fn run_child() -> TestResult<bool> {
         return Ok(false);
     };
     let lock = TreeLock::acquire(&locks(), Path::new(&root))?;
-    let detected = detect(Path::new(&root), None)?;
+    let detected = detect(Path::new(&root), &[])?;
     plan(&detected, &lock, &NodeEnv::current())?
         .ready()?
         .execute(&lock)?;
@@ -77,7 +77,7 @@ fn next_plan(root: &Path) -> TestResult<Plan> {
             other => break other?,
         }
     };
-    Ok(plan(&detect(root, None)?, &lock, &NodeEnv::current())?)
+    Ok(plan(&detect(root, &[])?, &lock, &NodeEnv::current())?)
 }
 
 /// Waits until `path` exists.

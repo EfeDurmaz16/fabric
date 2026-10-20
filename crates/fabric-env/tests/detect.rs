@@ -10,7 +10,7 @@ use fabric_core::env::{
     EnvVarName, PinError, RunWhen, SetupArg, Tool, ToolName, ToolSource, ToolVersion,
 };
 use fabric_core::path::{PathError, RelPath};
-use fabric_core::secret::Scope;
+use fabric_core::secret::{Scope, SecretPolicy};
 use fabric_core::snapshot::CacheClass;
 use fabric_env::detect::{
     CacheOrigin, CachePath, Completion, DetectError, Detection, Ecosystem, ManagerChoice,
@@ -83,7 +83,7 @@ type Files<'a> = &'a [(&'a str, &'a str)];
 
 #[test]
 fn a_pnpm_workspace_gives_a_frozen_install_and_node_modules() {
-    let found = detect(&fixture("node-pnpm"), None).unwrap();
+    let found = detect(&fixture("node-pnpm"), &[]).unwrap();
     assert_eq!(commands(&found), ["pnpm install --frozen-lockfile"]);
     assert_eq!(found.spec().setup[0].when, RunWhen::CachesMissing);
     assert_eq!(found.spec().setup[0].cwd, None);
@@ -118,7 +118,7 @@ fn a_pnpm_workspace_gives_a_frozen_install_and_node_modules() {
 /// A resume must not rewrite `Cargo.lock`; without one there is nothing to keep.
 #[test]
 fn cargo_fetch_is_locked_exactly_when_a_lockfile_exists() {
-    let found = detect(&fixture("rust-cargo"), None).unwrap();
+    let found = detect(&fixture("rust-cargo"), &[]).unwrap();
     assert_eq!(commands(&found), ["cargo fetch --locked"]);
     assert_eq!(
         found.caches(),
@@ -137,7 +137,7 @@ fn cargo_fetch_is_locked_exactly_when_a_lockfile_exists() {
 
     let library = workspace(&[("Cargo.toml", "[package]\nname = \"x\"\n")]).unwrap();
     assert_eq!(
-        commands(&detect(library.path(), None).unwrap()),
+        commands(&detect(library.path(), &[]).unwrap()),
         ["cargo fetch"]
     );
 }
@@ -185,7 +185,7 @@ fn each_lockfile_names_its_manager_and_install() {
             _ => (f, ""),
         }));
         let dir = workspace(&all).unwrap();
-        let found = detect(dir.path(), None).unwrap();
+        let found = detect(dir.path(), &[]).unwrap();
         assert_eq!(commands(&found), [command], "{files:?}");
         assert_eq!(
             found.node_manager(),
@@ -210,7 +210,7 @@ fn the_package_manager_field_decides_the_yarn_line() {
         (".yarnrc.yml", "nodeLinker: node-modules\n"),
     ])
     .unwrap();
-    let found = detect(berry.path(), None).unwrap();
+    let found = detect(berry.path(), &[]).unwrap();
     assert_eq!(commands(&found), ["yarn install --immutable"]);
     assert_eq!(
         found.spec().tools,
@@ -224,7 +224,7 @@ fn the_package_manager_field_decides_the_yarn_line() {
     ])
     .unwrap();
     assert_eq!(
-        commands(&detect(classic.path(), None).unwrap()),
+        commands(&detect(classic.path(), &[]).unwrap()),
         ["yarn install --frozen-lockfile"]
     );
 }
@@ -251,7 +251,7 @@ fn yarn_berry_needs_the_node_modules_linker() {
             (".yarnrc.yml", yarnrc),
         ])
         .unwrap();
-        let found = detect(dir.path(), None);
+        let found = detect(dir.path(), &[]);
         assert_eq!(
             matches!(found, Err(DetectError::YarnPlugAndPlay)),
             refused,
@@ -268,7 +268,7 @@ fn two_lockfiles_with_nothing_to_decide_are_refused() {
         ("package-lock.json", ""),
     ])
     .unwrap();
-    match detect(dir.path(), None) {
+    match detect(dir.path(), &[]) {
         Err(DetectError::AmbiguousLockfiles { lockfiles }) => {
             assert_eq!(lockfiles, ["pnpm-lock.yaml", "package-lock.json"]);
         }
@@ -285,7 +285,7 @@ fn a_named_manager_without_its_lockfile_is_refused() {
         ("package-lock.json", ""),
     ])
     .unwrap();
-    match detect(dir.path(), None) {
+    match detect(dir.path(), &[]) {
         Err(err @ DetectError::LockfileMissing { .. }) => {
             assert_eq!(
                 err.to_string(),
@@ -301,7 +301,7 @@ fn a_named_manager_without_its_lockfile_is_refused() {
 #[test]
 fn package_json_without_a_lockfile_has_no_install_and_no_cache() {
     let dir = workspace(&[("package.json", r#"{"packageManager":"pnpm@11.23.0"}"#)]).unwrap();
-    let found = detect(dir.path(), None).unwrap();
+    let found = detect(dir.path(), &[]).unwrap();
     assert!(found.spec().setup.is_empty());
     assert!(found.caches().is_empty());
     assert_eq!(found.node_manager(), None);
@@ -318,7 +318,7 @@ fn a_malformed_package_manager_field_is_refused() {
         let dir = workspace(&[("package.json", text), ("pnpm-lock.yaml", "")]).unwrap();
         assert!(
             matches!(
-                detect(dir.path(), None),
+                detect(dir.path(), &[]),
                 Err(DetectError::BadPackageManagerField)
             ),
             "{text}"
@@ -347,7 +347,7 @@ fn pins_follow_precedence_and_aliases() {
         ("package.json", r#"{"engines":{"node":">=18"}}"#),
     ])
     .unwrap();
-    let found = detect(dir.path(), None).unwrap();
+    let found = detect(dir.path(), &[]).unwrap();
     let pins: Vec<(&str, &str, &str)> = found
         .pins()
         .iter()
@@ -387,7 +387,7 @@ fn pins_follow_precedence_and_aliases() {
 #[test]
 fn python_installs_into_the_workspace_venv() {
     let locked = workspace(&[("uv.lock", ""), ("requirements.txt", "")]).unwrap();
-    let found = detect(locked.path(), None).unwrap();
+    let found = detect(locked.path(), &[]).unwrap();
     assert_eq!(commands(&found), ["uv sync --frozen"]);
     assert_eq!(
         found.caches(),
@@ -402,7 +402,7 @@ fn python_installs_into_the_workspace_venv() {
 
     let requirements = workspace(&[("requirements.txt", "requests==2.32.3\n")]).unwrap();
     assert_eq!(
-        commands(&detect(requirements.path(), None).unwrap()),
+        commands(&detect(requirements.path(), &[]).unwrap()),
         [
             "uv venv --allow-existing",
             "uv pip install -r requirements.txt"
@@ -417,7 +417,7 @@ fn a_devcontainer_is_recorded_and_not_interpreted() {
         r#"{"image":"x","postCreateCommand":"npm install"}"#,
     )])
     .unwrap();
-    let found = detect(dir.path(), None).unwrap();
+    let found = detect(dir.path(), &[]).unwrap();
     assert_eq!(
         found.devcontainer(),
         Some(&RelPath::parse(".devcontainer/devcontainer.json").unwrap())
@@ -430,7 +430,7 @@ fn a_devcontainer_is_recorded_and_not_interpreted() {
 /// cache, two variable names and a secret pattern.
 #[test]
 fn the_override_file_wins_over_detection() {
-    let found = detect(&fixture("override"), None).unwrap();
+    let found = detect(&fixture("override"), &[]).unwrap();
     assert_eq!(
         found.node_manager(),
         Some(ManagerChoice {
@@ -486,7 +486,7 @@ fn the_override_file_wins_over_detection() {
     );
     let local_db = RelPath::parse("data/local.sqlite").unwrap();
     assert_eq!(
-        found.secrets().denies(&local_db, Scope::Work),
+        SecretPolicy::from_patterns(&found.spec().secret_patterns).denies(&local_db, Scope::Work),
         Some("*.sqlite")
     );
     assert!(found.spec().id().is_ok());
@@ -501,14 +501,14 @@ fn a_declared_pin_under_an_alias_replaces_the_detected_one() {
         (".fabric/env.toml", "[tools]\nnodejs = \"22\"\n"),
     ])
     .unwrap();
-    let found = detect(dir.path(), None).unwrap();
+    let found = detect(dir.path(), &[]).unwrap();
     assert_eq!(
         found.spec().tools,
         [tool("node", "22", ToolSource::Declared).unwrap()]
     );
     let dir = workspace(&[(".fabric/env.toml", "[tools]\n\"\" = \"22\"\n")]).unwrap();
     assert!(matches!(
-        detect(dir.path(), None),
+        detect(dir.path(), &[]),
         Err(DetectError::Override(OverrideError::ToolName {
             index: 0,
             reason: PinError::Empty
@@ -531,7 +531,7 @@ fn a_declared_class_keeps_the_detected_ecosystem() {
             ),
         ])
         .unwrap();
-        let found = detect(dir.path(), None).unwrap();
+        let found = detect(dir.path(), &[]).unwrap();
         assert_eq!(
             found.caches(),
             [cache(
@@ -559,7 +559,7 @@ fn a_declared_cache_inside_a_detected_one_is_refused() {
         ),
     ])
     .unwrap();
-    match detect(dir.path(), None) {
+    match detect(dir.path(), &[]) {
         Err(DetectError::NestedCache { index, detected }) => {
             assert_eq!(index, 0);
             assert_eq!(detected.as_str(), "node_modules");
@@ -572,7 +572,7 @@ fn a_declared_cache_inside_a_detected_one_is_refused() {
 fn a_broken_override_file_stops_detection() {
     let dir = workspace(&[(".fabric/env.toml", "env = [\"A=b\"]\n")]).unwrap();
     assert!(matches!(
-        detect(dir.path(), None),
+        detect(dir.path(), &[]),
         Err(DetectError::Override(_))
     ));
 }
@@ -582,7 +582,7 @@ fn a_broken_override_file_stops_detection() {
 fn a_package_manager_without_a_package_json_is_refused() {
     let dir = workspace(&[(".fabric/env.toml", "package_manager = \"pnpm\"\n")]).unwrap();
     assert!(matches!(
-        detect(dir.path(), None),
+        detect(dir.path(), &[]),
         Err(DetectError::PackageManagerWithoutPackageJson)
     ));
 }
@@ -594,7 +594,7 @@ fn a_linked_pin_file_is_refused_without_reading_it() {
     let secret = "sk-proj-abcdefghijklmnopqrstuvwxyz";
     let dir = workspace(&[(".env", &format!("OPENAI_API_KEY={secret}\n"))]).unwrap();
     symlink(dir.path().join(".env"), dir.path().join(".nvmrc")).unwrap();
-    match detect(dir.path(), None) {
+    match detect(dir.path(), &[]) {
         Err(DetectError::NotARegularFile { file }) => assert_eq!(file, ".nvmrc"),
         other => panic!("{other:?}"),
     }
@@ -611,7 +611,7 @@ fn a_linked_override_directory_is_refused() {
     .unwrap();
     let dir = workspace(&[]).unwrap();
     symlink(other.path().join(".fabric"), dir.path().join(".fabric")).unwrap();
-    match detect(dir.path(), None) {
+    match detect(dir.path(), &[]) {
         Err(DetectError::NotARegularFile { file }) => assert_eq!(file, ".fabric/env.toml"),
         other => panic!("{other:?}"),
     }
@@ -650,7 +650,7 @@ fn a_detected_pin_that_breaks_the_rules_is_dropped() {
     ];
     for (file, text, rule) in cases {
         let dir = workspace(&[(file, &text), (".python-version", "3.12\n")]).unwrap();
-        let found = detect(dir.path(), None).unwrap();
+        let found = detect(dir.path(), &[]).unwrap();
         assert!(
             found.pins().iter().all(|pin| pin.file != file),
             "{file} {rule:?}"
@@ -679,7 +679,7 @@ fn a_declared_cache_keeps_the_full_secret_list() {
         ),
     ])
     .unwrap();
-    let found = detect(dir.path(), None).unwrap();
+    let found = detect(dir.path(), &[]).unwrap();
     let scope_of = |path: &str| {
         found
             .caches()
@@ -690,7 +690,7 @@ fn a_declared_cache_keeps_the_full_secret_list() {
     };
     let leaked = RelPath::parse("web/.env.local").unwrap();
     assert_eq!(
-        found.secrets().denies(&leaked, scope_of("web")),
+        SecretPolicy::from_patterns(&found.spec().secret_patterns).denies(&leaked, scope_of("web")),
         Some(".env.*")
     );
     assert_eq!(scope_of("node_modules"), Scope::Cache);
@@ -702,12 +702,12 @@ fn a_declared_cache_keeps_the_full_secret_list() {
 #[test]
 fn removing_a_pattern_from_the_override_file_does_not_shrink_the_policy() {
     let dir = workspace(&[(".fabric/env.toml", "secret_patterns = [\"*.sqlite\"]\n")]).unwrap();
-    let first = detect(dir.path(), None).unwrap();
+    let first = detect(dir.path(), &[]).unwrap();
     fs::write(dir.path().join(".fabric/env.toml"), "").unwrap();
-    let second = detect(dir.path(), Some(first.spec())).unwrap();
+    let second = detect(dir.path(), &first.spec().secret_patterns).unwrap();
     let local_db = RelPath::parse("data/local.sqlite").unwrap();
     assert_eq!(
-        second.secrets().denies(&local_db, Scope::Work),
+        SecretPolicy::from_patterns(&second.spec().secret_patterns).denies(&local_db, Scope::Work),
         Some("*.sqlite")
     );
     assert_eq!(second.spec().secret_patterns, first.spec().secret_patterns);
@@ -718,8 +718,8 @@ fn removing_a_pattern_from_the_override_file_does_not_shrink_the_policy() {
 /// files must give the same spec, override file included.
 #[test]
 fn detecting_with_the_previous_spec_gives_the_same_spec() {
-    let found = detect(&fixture("override"), None).unwrap();
-    let again = detect(&fixture("override"), Some(found.spec())).unwrap();
+    let found = detect(&fixture("override"), &[]).unwrap();
+    let again = detect(&fixture("override"), &found.spec().secret_patterns).unwrap();
     assert_eq!(again.spec(), found.spec());
     assert_eq!(again.spec().id().unwrap(), found.spec().id().unwrap());
     assert!(!found.spec().secret_patterns.is_empty());
@@ -760,7 +760,7 @@ fn a_declared_cache_takes_the_carry_key_of_the_ecosystem_that_makes_it() {
         let mut all = files.to_vec();
         all.push((".fabric/env.toml", &override_toml));
         let dir = workspace(&all).unwrap();
-        let found = detect(dir.path(), None);
+        let found = detect(dir.path(), &[]);
         match (expected, found) {
             (Ok(ecosystem), Ok(found)) => {
                 let declared = found
@@ -791,7 +791,7 @@ fn a_declared_ecosystem_cannot_override_a_detected_one() {
     ])
     .unwrap();
     assert!(matches!(
-        detect(dir.path(), None),
+        detect(dir.path(), &[]),
         Err(DetectError::CacheEcosystemConflict { index: 0 })
     ));
 }
@@ -805,7 +805,7 @@ fn a_file_the_job_denies_is_not_read() {
         (".fabric/env.toml", "secret_patterns = [\"mise.toml\"]\n"),
     ])
     .unwrap();
-    let found = detect(dir.path(), None).unwrap();
+    let found = detect(dir.path(), &[]).unwrap();
     assert!(found.pins().is_empty());
     assert!(found.spec().tools.is_empty());
 }

@@ -85,7 +85,7 @@ fn dry_run(detected: &Detection) -> TestResult<Plan> {
 /// Writes `override_toml` as the workspace's `.fabric/env.toml` and detects.
 fn declared(root: &Path, override_toml: &str) -> TestResult<Detection> {
     write(root, &[(".fabric/env.toml", override_toml)])?;
-    Ok(detect(root, None)?)
+    Ok(detect(root, &[])?)
 }
 
 /// A dry run of a fresh checkout plans the install and leaves the tree as it was.
@@ -93,7 +93,7 @@ fn declared(root: &Path, override_toml: &str) -> TestResult<Detection> {
 fn a_fresh_pnpm_workspace_plans_its_install_and_the_dry_run_changes_nothing() {
     let dir = copy_fixture("node-pnpm").unwrap();
     let lock = take_lock(dir.path()).unwrap();
-    let detected = detect(dir.path(), None).unwrap();
+    let detected = detect(dir.path(), &[]).unwrap();
     let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
     assert_eq!(planned.caches()[0].health, CacheHealth::Missing);
     assert_eq!(planned.steps().len(), 1);
@@ -119,7 +119,7 @@ fn a_finished_install_runs_nothing() {
         ],
     )
     .unwrap();
-    let detected = detect(dir.path(), None).unwrap();
+    let detected = detect(dir.path(), &[]).unwrap();
     let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
     assert_eq!(planned.caches()[0].health, CacheHealth::Healthy);
     assert!(planned.is_noop());
@@ -148,7 +148,7 @@ fn an_installer_marker_left_by_a_failed_install_is_not_proof() {
     .unwrap();
     fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).unwrap();
     let node = NodeEnv::new(Some(bin.path().as_os_str().to_owned()), Vec::new());
-    let resume = || plan(&detect(dir.path(), None).unwrap(), &lock, &node).unwrap();
+    let resume = || plan(&detect(dir.path(), &[]).unwrap(), &lock, &node).unwrap();
 
     assert!(matches!(
         resume().ready().unwrap().execute(&lock),
@@ -227,7 +227,7 @@ fn health_follows_the_cache_kind() {
     for (files, health) in cases {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), files).unwrap();
-        let planned = dry_run(&detect(dir.path(), None).unwrap()).unwrap();
+        let planned = dry_run(&detect(dir.path(), &[]).unwrap()).unwrap();
         assert_eq!(planned.caches().len(), 1, "{files:?}");
         assert_eq!(planned.caches()[0].health, health, "{files:?}");
     }
@@ -305,7 +305,7 @@ args = ["-c", "mkdir -p .output && echo x > .output/index.js"]
     assert_eq!(first.steps().len(), 2);
     first.ready().unwrap().execute(&lock).unwrap();
     let again = plan(
-        &detect(dir.path(), None).unwrap(),
+        &detect(dir.path(), &[]).unwrap(),
         &lock,
         &NodeEnv::current(),
     )
@@ -346,7 +346,7 @@ args = ["-c", "mkdir -p out && echo x > out/f"]
         .unwrap();
     assert!(dir.path().join("out").join(SENTINEL).is_file());
     let again = plan(
-        &detect(dir.path(), None).unwrap(),
+        &detect(dir.path(), &[]).unwrap(),
         &lock,
         &NodeEnv::current(),
     )
@@ -375,7 +375,7 @@ when = "always"
     ));
     assert!(!dir.path().join("out").join(SENTINEL).exists());
     let after = plan(
-        &detect(dir.path(), None).unwrap(),
+        &detect(dir.path(), &[]).unwrap(),
         &lock,
         &NodeEnv::current(),
     )
@@ -582,7 +582,7 @@ fn a_report_without_caches_runs_its_steps_on_every_resume() {
         &[("go.mod", "module example.com/x\n\ngo 1.22.0\n")],
     )
     .unwrap();
-    let detected = detect(dir.path(), None).unwrap();
+    let detected = detect(dir.path(), &[]).unwrap();
     let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
     assert!(planned.caches().is_empty());
     assert_eq!(planned.steps().len(), 1);
@@ -618,7 +618,7 @@ fn a_missing_target_does_not_reinstall_a_whole_node_modules() {
         ],
     )
     .unwrap();
-    let detected = detect(dir.path(), None).unwrap();
+    let detected = detect(dir.path(), &[]).unwrap();
     let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
     let programs: Vec<&str> = planned
         .steps()
@@ -784,7 +784,7 @@ args = ["-c", "mkdir -p out built && echo x > out/f && echo x > built/f && touch
         "outside"
     );
     let again = plan(
-        &detect(dir.path(), None).unwrap(),
+        &detect(dir.path(), &[]).unwrap(),
         &lock,
         &NodeEnv::current(),
     )

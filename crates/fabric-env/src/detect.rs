@@ -527,7 +527,6 @@ pub struct Detection {
     pins: Vec<Pin>,
     node_manager: Option<ManagerChoice>,
     devcontainer: Option<RelPath>,
-    secrets: SecretPolicy,
 }
 
 impl Detection {
@@ -565,35 +564,26 @@ impl Detection {
     pub fn devcontainer(&self) -> Option<&RelPath> {
         self.devcontainer.as_ref()
     }
-
-    /// Returns the secret policy, widened by the override file.
-    pub fn secrets(&self) -> &SecretPolicy {
-        &self.secrets
-    }
 }
 
 /// Detects the environment of the workspace at `root`, applying `.fabric/env.toml` when present.
 ///
-/// `previous` is the job's last spec, or `None` for a job that has none
-/// yet. Every secret pattern it holds stays in force and in the new spec,
+/// `recorded` is the `secret_patterns` of the job's last spec, empty for a
+/// job that has none yet. Every one stays in force and in the new spec,
 /// even when the override file no longer lists it: a job's secret list
 /// only grows, and the override file is a file in the working tree that
-/// the agent can rewrite.
-pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, DetectError> {
+/// the agent can rewrite. The capture policy is built from the returned
+/// spec with `SecretPolicy::from_patterns` (ADR 0004).
+pub fn detect(root: &Path, recorded: &[SecretPattern]) -> Result<Detection, DetectError> {
     let root = fs::canonicalize(root).map_err(|source| DetectError::Root { source })?;
     let root = root.as_path();
-    let recorded = SecretPolicy::from_patterns(
-        previous.map_or(&[][..], |spec| spec.secret_patterns.as_slice()),
-    );
-    let first = Reader {
-        root,
-        secrets: &recorded,
-    };
-    let overrides = match first.text(OVERRIDE_FILE)? {
+    // No pattern can deny the override file: `SecretPattern` refuses one
+    // that would (`DeniesOverrideFile`), and a test checks the built-ins.
+    let overrides = match read_text(root, OVERRIDE_FILE)? {
         Some(text) => EnvOverride::parse(&text)?,
         None => EnvOverride::default(),
     };
-    let secret_patterns = job_secret_patterns(previous, &overrides.secret_patterns);
+    let secret_patterns = job_secret_patterns(recorded, &overrides.secret_patterns);
     let secrets = SecretPolicy::from_patterns(&secret_patterns);
     let reader = Reader {
         root,
@@ -665,7 +655,6 @@ pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, Dete
         pins,
         node_manager,
         devcontainer: find_devcontainer(root)?,
-        secrets,
     })
 }
 
@@ -721,10 +710,9 @@ fn merge_declared_caches(
 
 /// Returns the job's secret patterns: every one its previous spec held, plus the override file's, sorted.
 fn job_secret_patterns(
-    previous: Option<&EnvSpec>,
+    recorded: &[SecretPattern],
     declared: &[SecretPattern],
 ) -> Vec<SecretPattern> {
-    let recorded = previous.map_or(&[][..], |spec| spec.secret_patterns.as_slice());
     let dropped = recorded.iter().filter(|p| !declared.contains(p)).count();
     if dropped > 0 {
         tracing::warn!(
