@@ -22,7 +22,7 @@ The core, the store, the network layer, the harness adapters and the environment
   jobs/<job-id>/
     ledger      append-only records (ADR 0002)
     manifest    the derived job manifest
-    marker      what the workspace at the root holds (ADR 0004)
+    marker      what the workspace at the root holds, and the epoch it was written at (ADR 0004)
     harness     the harness this node launched: pid, kernel start time, epoch
     session     the harness session the job continues here
     harness-state/   capture output and restore input for the adapter
@@ -71,7 +71,9 @@ A harness that exits with a code from 80 to 85 cannot be told from a refusal by 
 
 A restore lands at the root the snapshot recorded only when that root is exactly `~/fabric/jobs/<job-id>/work` under this node's home, because the root arrives from a peer and any other path, such as `~/.ssh`, is a bug or a hostile peer. When it is not, the job lands under `<state>/jobs/<job-id>/work`, and the CLI prints why. The adapters of ADR 0015 still refuse a different root or home, so only a harness without path-keyed state can continue there; doctor refuses the move before it gets this far.
 
-ADR 0003 kept a departed copy at the root as a warm cache and left open whether it should move. It moves. When a node learns that the job departed, or was stolen from it, and its marker says the workspace is clean at a published snapshot, the workspace is renamed to `departed/<epoch>` beside the root and kept. Nothing in it is missing from the job, a user who types `claude` in the old directory finds nothing there, and two nodes that share a disk, as the end-to-end test does, never meet at the root. A workspace with changes made after its last snapshot stays where it is, and `status` names it an orphan; nothing deletes it. The in-place restore of ADR 0004, which updated a departed copy, is therefore not needed and not built: every restore is the fresh restore of ADR 0014.
+ADR 0003 kept a departed copy at the root as a warm cache and left open whether it should move. It moves. When a node learns that the job departed, or was stolen from it, and its marker says the workspace is clean at a published snapshot, the workspace is renamed to `departed/<epoch>` beside the root and kept. Nothing in it is missing from the job, a user who types `claude` in the old directory finds nothing there, and two nodes that share a disk, as the end-to-end test does, never meet at the root. A workspace with changes made after its last snapshot stays where it is, and `status` names it an orphan; nothing deletes it.
+
+A node can lose a job while its marker says live, keep that orphan, and own the job again later at a higher epoch, by a pull, a push toward it or a steal. So the marker records the epoch this node held the job at when it wrote it. A restore reuses the workspace at the root only when its marker was written at the current epoch, or holds, or was restoring, exactly the latest snapshot. Any other workspace is renamed to `orphan/<epoch>` beside the root, `<epoch>` being the marker's, with `.1`, `.2` and on added when that name is taken; a harness still recorded from that tenure is stopped first, the session record it continued is forgotten, a line names where it went, and the latest snapshot is restored fresh. Every fresh restore forgets the session record, so the job continues the session the snapshot carries or starts a new one. `run` refuses such a workspace and names `resume`, and `suspend` does not capture it. The in-place restore of ADR 0004, which updated a departed copy, is therefore not needed and not built: every restore is the fresh restore of ADR 0014.
 
 ### The move as built
 

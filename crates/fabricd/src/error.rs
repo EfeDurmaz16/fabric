@@ -123,6 +123,18 @@ pub enum NodeError {
         /// The pid the CLI named.
         pid: std::num::NonZeroU32,
     },
+    /// The workspace at the root was left by an earlier tenure of this node.
+    #[error(
+        "job {job}: the workspace at {root} was left at epoch {epoch}, before this node's tenure, and may differ from the job's latest snapshot; run `fabric job resume {job}`, which sets it aside and restores the latest snapshot"
+    )]
+    StaleWorkspace {
+        /// The job.
+        job: JobId,
+        /// The root.
+        root: PathBuf,
+        /// The epoch its marker was written at.
+        epoch: Epoch,
+    },
     /// The job has no workspace on this node.
     #[error("job {0} has no workspace on this node; run `fabric job resume {0}`")]
     NoWorkspace(JobId),
@@ -271,6 +283,7 @@ impl NodeError {
             | NodeError::RanDuringMove { .. }
             | NodeError::WorkspaceOccupied { .. }
             | NodeError::NoWorkspace(_)
+            | NodeError::StaleWorkspace { .. }
             | NodeError::NoSnapshot(_)
             | NodeError::HarnessGone { .. } => Refusal::JobState,
             _ => Refusal::Failed,

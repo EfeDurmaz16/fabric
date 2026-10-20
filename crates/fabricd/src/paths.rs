@@ -211,6 +211,14 @@ pub fn departed_copy(root: &Path, epoch: Epoch) -> Option<PathBuf> {
     )
 }
 
+/// Where a restore sets aside a workspace an earlier tenure left at
+/// `root`, written at `epoch`: `<root parent>/orphan/<epoch>`, beside the
+/// root. Kept, never deleted. `None` for a root with no parent.
+#[must_use]
+pub fn orphan_copy(root: &Path, epoch: Epoch) -> Option<PathBuf> {
+    Some(root.parent()?.join("orphan").join(epoch.get().to_string()))
+}
+
 /// Where a snapshot restores on this node, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RootChoice {

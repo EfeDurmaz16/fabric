@@ -95,13 +95,40 @@ pub enum MarkerState {
     },
 }
 
-/// The workspace marker: where the root is and what it holds (ADR 0004).
+/// The workspace marker: where the root is, what it holds, and the tenure
+/// that wrote it (ADR 0004).
+///
+/// A node can lose a job while its marker says `Live`, keep that workspace
+/// as an orphan, and own the job again later at a higher epoch. The epoch
+/// tells that orphan apart from a workspace of the current tenure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Marker {
     /// The workspace root on this node.
     pub root: PathBuf,
     /// What it holds.
     pub state: MarkerState,
+    /// The epoch at which this node held the job when it wrote the marker.
+    pub epoch: Epoch,
+}
+
+impl Marker {
+    /// Whether the workspace belongs to this node's tenure at `epoch`.
+    ///
+    /// It does when the marker was written at that epoch, or when it holds,
+    /// or was restoring, exactly `latest`, which any tenure starts from.
+    /// Anything else was left by an earlier tenure and may hold changes the
+    /// job does not have, or lack changes it does.
+    #[must_use]
+    pub fn is_current(&self, epoch: Epoch, latest: Option<SnapshotId>) -> bool {
+        match self.state {
+            MarkerState::Clean { snapshot } | MarkerState::Restoring { snapshot }
+                if Some(snapshot) == latest =>
+            {
+                true
+            }
+            _ => self.epoch == epoch,
+        }
+    }
 }
 
 /// A harness this node launched for a job, as the supervisor records it (ADR 0003).

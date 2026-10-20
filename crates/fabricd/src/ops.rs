@@ -283,6 +283,7 @@ impl Node {
         job.set_marker(&Marker {
             root: root.clone(),
             state: MarkerState::Live,
+            epoch: Epoch::FIRST,
         })?;
         self.jobs
             .lock()
@@ -423,6 +424,13 @@ impl Node {
         let job = job.lock().await;
         let token = owner_token(&job, self.id)?;
         let marker = job.reconcile_marker()?.ok_or(NodeError::NoWorkspace(id))?;
+        if !marker.is_current(token.epoch, job.latest()) {
+            return Err(NodeError::StaleWorkspace {
+                job: id,
+                root: marker.root,
+                epoch: marker.epoch,
+            });
+        }
         match marker.state {
             MarkerState::Live | MarkerState::Clean { .. } => {}
             MarkerState::Suspending { .. } => {
@@ -521,6 +529,7 @@ impl Node {
             job.set_marker(&Marker {
                 root: marker.root,
                 state: MarkerState::Live,
+                epoch,
             })?;
         }
         out.say(format!(
@@ -569,10 +578,18 @@ impl Node {
         out: &mut Out,
     ) -> Result<SnapshotId, NodeError> {
         let id = job.id();
-        owner_token(job, self.id)?;
+        let epoch = owner_token(job, self.id)?.epoch;
         let Some(marker) = job.reconcile_marker()? else {
             return job.suspended_in().ok_or(NodeError::NoWorkspace(id));
         };
+        if !marker.is_current(epoch, job.latest()) {
+            out.say(format!(
+                "the workspace at {} was left at epoch {}, before this node's tenure, so it is not captured; `fabric job resume {id}` sets it aside",
+                marker.root.display(),
+                marker.epoch
+            ));
+            return job.suspended_in().ok_or(NodeError::NoWorkspace(id));
+        }
         if let (MarkerState::Clean { snapshot }, Some(suspended)) =
             (&marker.state, job.suspended_in())
             && *snapshot == suspended
@@ -610,6 +627,7 @@ impl Node {
                 state: MarkerState::Suspending {
                     head: job.ledger().head(),
                 },
+                epoch,
             })?;
             let snapshot = self.capture(job, &marker.root, path_var, out).await?;
             faults::hit(Point::AfterSnapshotPublish).await;
@@ -627,6 +645,7 @@ impl Node {
         job.set_marker(&Marker {
             root: marker.root,
             state: MarkerState::Clean { snapshot },
+            epoch,
         })?;
         out.say(format!(
             "suspended in snapshot {snapshot}; this node keeps the lease at epoch {}",
@@ -941,12 +960,17 @@ impl Node {
     ) -> Result<Option<MoveOffer>, NodeError> {
         let job = self.job(id).await?;
         let mut job = job.lock().await;
-        if let LeaseView::Owner(_) = job.view(self.id) {
+        if let LeaseView::Owner(token) = job.view(self.id) {
             let suspended = job.suspended_in();
+            // A workspace an earlier tenure left is not the job's and is
+            // not what was copied; settle leaves it where it is.
             let unchanged = suspended.is_some()
-                && job.marker()?.is_none_or(|marker| {
-                    matches!(marker.state, MarkerState::Clean { snapshot } if Some(snapshot) == suspended)
-                });
+                && job
+                    .marker()?
+                    .filter(|marker| marker.is_current(token.epoch, job.latest()))
+                    .is_none_or(|marker| {
+                        matches!(marker.state, MarkerState::Clean { snapshot } if Some(snapshot) == suspended)
+                    });
             if !unchanged {
                 return Err(NodeError::RanDuringMove {
                     job: id,
@@ -1245,7 +1269,9 @@ impl Node {
         let job = self.job(id).await?;
         let mut job = job.lock().await;
         let token = owner_token(&job, self.id)?;
-        let root = self.restore_if_needed(&mut job, path_var, out).await?;
+        let root = self
+            .restore_if_needed(&mut job, token.epoch, path_var, out)
+            .await?;
         if let Some(record) = job.harness_record()?
             && record.liveness().await != Liveness::Gone
         {
@@ -1458,19 +1484,32 @@ impl Node {
         }
     }
 
-    /// Restores the latest snapshot at the root unless the workspace is already there.
+    /// Restores the latest snapshot at the root unless the workspace of this
+    /// tenure, at `epoch`, is already there.
+    ///
+    /// A workspace an earlier tenure left is set aside first, with the
+    /// session record it continued, so the job never continues from a tree
+    /// or a session older than its latest snapshot.
     async fn restore_if_needed(
         &self,
         job: &mut Job,
+        epoch: Epoch,
         path_var: &OsString,
         out: &mut Out,
     ) -> Result<PathBuf, NodeError> {
         let id = job.id();
-        let marker = job.reconcile_marker()?;
+        let marker = match job.reconcile_marker()? {
+            Some(marker) if !marker.is_current(epoch, job.latest()) => {
+                self.set_orphan_aside(job, &marker, epoch, out).await?;
+                None
+            }
+            marker => marker,
+        };
         match &marker {
             Some(Marker {
                 root,
                 state: MarkerState::Live | MarkerState::Clean { .. },
+                ..
             }) => {
                 out.say(format!("workspace already at {}", root.display()));
                 return Ok(root.clone());
@@ -1512,10 +1551,12 @@ impl Node {
                 return Err(NodeError::WorkspaceOccupied { root });
             }
             job.clear_harness_state()?;
+            local::remove(&job.dir().session())?;
         }
         job.set_marker(&Marker {
             root: root.clone(),
             state: MarkerState::Restoring { snapshot },
+            epoch,
         })?;
         if let Some(parent) = root.parent() {
             crate::durable::create_dir(parent).map_err(|e| NodeError::io(parent, e))?;
@@ -1523,32 +1564,16 @@ impl Node {
         let has_harness_state = !manifest.harness_state.entries.is_empty();
         let state_dir = job.dir().harness_state();
         if !(resuming && state == RestoreState::Present) {
-            let facts =
-                NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
-            report_caches(&manifest.caches, &facts, out);
-            let target = root.clone();
             let harness_dir = has_harness_state.then(|| state_dir.clone());
-            let report = with_store(&self.store, move |store| {
-                let carry = |entry: &fabric_core::snapshot::CacheEntry| {
-                    entry.key.matches(&facts.key_like(&entry.key))
-                };
-                Ok(restore(
-                    store,
-                    &RestoreRequest {
-                        snapshot,
-                        target: &target,
-                        harness_state: harness_dir.as_deref(),
-                        verify: Verify::Sample(32),
-                        durability: Durability::PowerLoss,
-                        carry: &carry,
-                    },
-                )?)
-            })
+            self.write_snapshot(
+                snapshot,
+                &manifest.caches,
+                &root,
+                harness_dir,
+                path_var,
+                out,
+            )
             .await?;
-            out.say(format!(
-                "restored snapshot {snapshot}: {} files, {} bytes",
-                report.files, report.bytes
-            ));
         }
         if has_harness_state {
             self.restore_harness(job, &root, path_var, out).await?;
@@ -1556,8 +1581,74 @@ impl Node {
         job.set_marker(&Marker {
             root: root.clone(),
             state: MarkerState::Clean { snapshot },
+            epoch,
         })?;
         Ok(root)
+    }
+
+    /// Writes `snapshot` into the empty `root`, carrying each cache whose key matches this node's.
+    async fn write_snapshot(
+        &self,
+        snapshot: SnapshotId,
+        caches: &[fabric_core::snapshot::CacheEntry],
+        root: &Path,
+        harness_dir: Option<PathBuf>,
+        path_var: &OsString,
+        out: &mut Out,
+    ) -> Result<(), NodeError> {
+        let facts = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
+        report_caches(caches, &facts, out);
+        let target = root.to_owned();
+        let report = with_store(&self.store, move |store| {
+            let carry = |entry: &fabric_core::snapshot::CacheEntry| {
+                entry.key.matches(&facts.key_like(&entry.key))
+            };
+            Ok(restore(
+                store,
+                &RestoreRequest {
+                    snapshot,
+                    target: &target,
+                    harness_state: harness_dir.as_deref(),
+                    verify: Verify::Sample(32),
+                    durability: Durability::PowerLoss,
+                    carry: &carry,
+                },
+            )?)
+        })
+        .await?;
+        out.say(format!(
+            "restored snapshot {snapshot}: {} files, {} bytes",
+            report.files, report.bytes
+        ));
+        Ok(())
+    }
+
+    /// Moves a workspace an earlier tenure left out of the root, next to it
+    /// under `orphan/<epoch>`, and forgets it and the session it continued.
+    ///
+    /// Nothing is deleted. A harness still recorded from that tenure is
+    /// stopped first, so nothing writes to the tree while it moves.
+    async fn set_orphan_aside(
+        &self,
+        job: &mut Job,
+        marker: &Marker,
+        epoch: Epoch,
+        out: &mut Out,
+    ) -> Result<(), NodeError> {
+        self.settle(job, out).await?;
+        let base = paths::orphan_copy(&marker.root, marker.epoch)
+            .ok_or_else(|| no_parent(&marker.root))?;
+        let dest = unused(&base);
+        if move_aside(&marker.root, &dest)? {
+            out.say(format!(
+                "the workspace at {} was left at epoch {}, before this node's tenure at epoch {epoch}, and may differ from the job's latest snapshot; it moved to {}, kept, never run",
+                marker.root.display(),
+                marker.epoch,
+                dest.display()
+            ));
+        }
+        local::remove(&job.dir().session())?;
+        job.clear_marker()
     }
 
     /// Places the captured harness state where its harness expects it and records the session.
@@ -1787,6 +1878,7 @@ fn plan(
     job.set_marker(&Marker {
         root: root.clone(),
         state: MarkerState::Live,
+        epoch,
     })?;
     let harness = harness.unwrap_or_else(|| job.harness().clone());
     let session = match job.session()? {
@@ -1834,6 +1926,19 @@ fn report_caches(caches: &[fabric_core::snapshot::CacheEntry], facts: &NodeFacts
 
 fn no_parent(root: &Path) -> NodeError {
     NodeError::io(root, std::io::Error::other("a root needs a parent"))
+}
+
+/// `base`, or the first of `base.1`, `base.2` and on that does not exist yet.
+fn unused(base: &Path) -> PathBuf {
+    let mut candidate = base.to_owned();
+    let mut n = 0_u32;
+    while candidate.symlink_metadata().is_ok() {
+        n += 1;
+        let mut name = base.as_os_str().to_owned();
+        name.push(format!(".{n}"));
+        candidate = PathBuf::from(name);
+    }
+    candidate
 }
 
 /// Renames the workspace at `root` to `dest` durably; false when there is no workspace at `root`.
@@ -2044,6 +2149,84 @@ mod tests {
             &mut Out::default(),
         )
         .await
+    }
+
+    /// Serves `a` and `b` and pairs them, each with the other's address.
+    async fn paired(a: &Arc<Node>, b: &Arc<Node>) {
+        for (node, peer) in [(a, b), (b, a)] {
+            tokio::spawn(Arc::clone(node).run());
+            let addr = peer.local_addr().unwrap().to_string();
+            node.node_add(peer.id, Some(&addr), &mut Out::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    /// A node runs the job, so its marker says live, and a peer that has
+    /// caught up with that, with no fork, steals it. The thief works and
+    /// suspends; the job comes back. The workspace the first node left is
+    /// not the job's: the restore must set it aside and bring the thief's
+    /// snapshot and session state, not continue the stale tree.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_job_that_comes_back_sets_the_stale_workspace_aside() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let out = &mut Out::default();
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &path, out).await.unwrap();
+        a.job_run(id, out).await.unwrap();
+        let harness = sleeper();
+        register(&a, id, pid(&harness)).await.unwrap();
+        let reaper = std::thread::spawn(move || {
+            let mut harness = harness;
+            harness.wait()
+        });
+        let stale_root = paths::job_root(&a.cfg.home, id);
+        std::fs::write(stale_root.join("README.md"), "a's stale edit\n").unwrap();
+        local::write(
+            &a.cfg.state.job(id).session(),
+            &SessionRecord {
+                harness: HarnessKind::Codex,
+                session: SessionId::parse("stale-session").unwrap(),
+            },
+        )
+        .unwrap();
+
+        b.pull_records(id, a.id).await.unwrap();
+        b.ensure_latest(id, a.id).await.unwrap();
+        b.job_steal(id, "a sleeps".to_owned(), true, out)
+            .await
+            .unwrap();
+        reaper.join().unwrap().unwrap();
+        let thief_root = {
+            let job = b.job(id).await.unwrap();
+            let mut job = job.lock().await;
+            b.restore_if_needed(&mut job, Epoch::new(2).unwrap(), &path, out)
+                .await
+                .unwrap()
+        };
+        std::fs::write(thief_root.join("thief.txt"), "b's work\n").unwrap();
+        b.suspend(id, &path, out).await.unwrap();
+
+        a.pull(id, b.id, out).await.unwrap();
+        let job = a.job(id).await.unwrap();
+        let mut job = job.lock().await;
+        let epoch = owner_token(&job, a.id).unwrap().epoch;
+        let root = a
+            .restore_if_needed(&mut job, epoch, &path, out)
+            .await
+            .unwrap();
+        let read = |path: PathBuf| std::fs::read_to_string(path).unwrap();
+        assert_eq!(read(root.join("thief.txt")), "b's work\n");
+        assert_eq!(read(root.join("README.md")), "hello\n");
+        let orphan = paths::orphan_copy(&stale_root, Epoch::FIRST).unwrap();
+        assert_eq!(read(orphan.join("README.md")), "a's stale edit\n");
+        assert!(
+            job.session().unwrap().is_none(),
+            "the stale session would be continued"
+        );
     }
 
     #[test]

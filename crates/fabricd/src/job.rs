@@ -213,6 +213,7 @@ impl Job {
             let clean = Marker {
                 root: marker.root,
                 state: MarkerState::Clean { snapshot },
+                epoch: marker.epoch,
             };
             self.set_marker(&clean)?;
             return Ok(Some(clean));
