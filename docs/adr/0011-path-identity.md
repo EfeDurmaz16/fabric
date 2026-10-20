@@ -2,6 +2,8 @@
 
 Status: accepted, 2026-10-19
 
+2026-10-20: [ADR 0016](0016-node-and-cli-as-built.md) records that `fabric job new` makes the root of rule 2, and that rule 4's refusal of `/tmp` is not enforced.
+
 Written 2026-10-19 after step 1 research (`2026-10-19-step1-design-input.md`, section 4.1 and D1; `step1/H5-workspace-mobility.md`, section 2; `step1/H1-claude-code.md`, sections 1 and 11.1; `step1/preflight-2026-10-19.md`). It takes over the root rule that ADR 0008 held and gives it the evidence it rested on.
 
 ## Context

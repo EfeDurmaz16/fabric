@@ -2,6 +2,8 @@
 
 Status: accepted, 2026-10-19
 
+2026-10-20: [ADR 0016](0016-node-and-cli-as-built.md) records `fabric doctor` as built, with the rows that warn where this table refuses and why.
+
 Amended 2026-10-19 after step 1 research. The root rule moved to ADR 0011. This ADR now states the one placement command of this phase, `fabric job move <job> --to <node>`, the pull form of it, the rule that every automatic choice prints its reason, and the preflight `fabric doctor` runs before any move (`2026-10-19-step1-design-input.md`, sections 8.0 and 9, D18 and D19; `step1/preflight-2026-10-19.md`). Triggers stay out of this phase.
 
 ## Context

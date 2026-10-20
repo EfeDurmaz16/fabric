@@ -2,6 +2,8 @@
 
 Status: accepted, 2026-10-19
 
+2026-10-20: in this phase a job starts with `fabric job new`, which clones a repository into `~/fabric/jobs/<job-id>/work`; `fabric job init` is not built. [ADR 0016](0016-node-and-cli-as-built.md) records the node and the CLI as built.
+
 Amended 2026-10-19 after step 1 research. Two sentences changed to match ADR 0003 (no arbiter, `Created` makes the creator the owner at epoch 1) and ADR 0011 (`--new` roots live at `~/fabric/jobs/<job-id>/work`). Nothing else changed.
 
 ## Context
