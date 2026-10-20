@@ -38,7 +38,33 @@ use crate::tls::Trust;
 /// The most addresses kept per peer; the newest address is first.
 pub const MAX_ADDRS: usize = 8;
 
-/// Why the peer book or a peer spec could not be read.
+/// Why a pasted spec, an address or one line of the book does not parse.
+#[derive(Debug, thiserror::Error)]
+pub enum SpecError {
+    /// The node id did not parse.
+    #[error("node id: {0}")]
+    NodeId(#[from] ParseIdError),
+    /// The host is neither an address nor a DNS name.
+    #[error("{0:?} is not a DNS name")]
+    DnsName(String),
+    /// The text is not `<host>:<port>`.
+    #[error("{0:?} is not <host>:<port>")]
+    HostPort(String),
+    /// A spec names no address.
+    #[error("a peer spec is <node-id>@<host>:<port>")]
+    Spec,
+    /// A book line lacks a field, has one too many, or has one of the wrong kind.
+    #[error("a book line is <node-id> <addresses> <last-seen>: {0}")]
+    Fields(&'static str),
+    /// A book line lists more than `MAX_ADDRS` addresses.
+    #[error("{0} addresses, more than the {MAX_ADDRS} kept")]
+    TooManyAddrs(usize),
+    /// A book line lists one address twice.
+    #[error("{0} is listed twice")]
+    DuplicateAddr(HostPort),
+}
+
+/// Why the peer book could not be read or written.
 #[derive(Debug, thiserror::Error)]
 pub enum PeerBookError {
     /// The book file could not be read or written.
@@ -50,20 +76,25 @@ pub enum PeerBookError {
         #[source]
         source: io::Error,
     },
-    /// A line of the book, or a pasted spec, does not parse.
-    #[error("line {line}: {reason}")]
-    Parse {
-        /// The one-based line number, or 1 for a pasted spec.
+    /// A line of the book does not parse.
+    #[error("line {line}: {source}")]
+    Line {
+        /// The one-based line number.
         line: usize,
         /// What was wrong.
-        reason: String,
+        #[source]
+        source: SpecError,
     },
-    /// The node id did not parse.
-    #[error("node id: {0}")]
-    NodeId(#[from] ParseIdError),
-    /// A spec names no address.
-    #[error("a peer spec is <node-id>@<host>:<port>")]
-    Spec,
+    /// A node is listed on two lines.
+    #[error("line {line}: {node} is already on line {first}")]
+    DuplicateNode {
+        /// The one-based line number of the second listing.
+        line: usize,
+        /// The line that listed it first.
+        first: usize,
+        /// The node.
+        node: NodeId,
+    },
 }
 
 /// A DNS name as the user pasted it: 1 to 253 bytes of letters, digits, dots and dashes.
@@ -79,7 +110,7 @@ impl DnsName {
 }
 
 impl FromStr for DnsName {
-    type Err = PeerBookError;
+    type Err = SpecError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let ok = !s.is_empty()
@@ -89,10 +120,7 @@ impl FromStr for DnsName {
         if ok {
             Ok(Self(s.to_owned()))
         } else {
-            Err(PeerBookError::Parse {
-                line: 1,
-                reason: format!("{s:?} is not a DNS name"),
-            })
+            Err(SpecError::DnsName(s.to_owned()))
         }
     }
 }
@@ -155,16 +183,13 @@ impl fmt::Display for HostPort {
 }
 
 impl FromStr for HostPort {
-    type Err = PeerBookError;
+    type Err = SpecError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if let Ok(addr) = s.parse::<SocketAddr>() {
             return Ok(Self::Addr(addr));
         }
-        let bad = || PeerBookError::Parse {
-            line: 1,
-            reason: format!("{s:?} is not <host>:<port>"),
-        };
+        let bad = || SpecError::HostPort(s.to_owned());
         let (host, port) = s.rsplit_once(':').ok_or_else(bad)?;
         let port: u16 = port.parse().map_err(|_| bad())?;
         Ok(Self::Name(host.parse()?, port))
@@ -172,14 +197,34 @@ impl FromStr for HostPort {
 }
 
 /// What the book knows about one peer.
+///
+/// It holds at most `MAX_ADDRS` distinct addresses, newest first, so a dial
+/// tries a bounded list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerEntry {
+    node: NodeId,
+    addrs: Vec<HostPort>,
+    last_seen_ms: Option<u64>,
+}
+
+impl PeerEntry {
     /// The peer's node id.
-    pub node: NodeId,
+    #[must_use]
+    pub fn node(&self) -> NodeId {
+        self.node
+    }
+
     /// Where it was last reachable, newest first; empty for a peer that only dials in.
-    pub addrs: Vec<HostPort>,
+    #[must_use]
+    pub fn addrs(&self) -> &[HostPort] {
+        &self.addrs
+    }
+
     /// When a connection with it last completed, in milliseconds since the Unix epoch.
-    pub last_seen_ms: Option<u64>,
+    #[must_use]
+    pub fn last_seen_ms(&self) -> Option<u64> {
+        self.last_seen_ms
+    }
 }
 
 impl fmt::Display for PeerEntry {
@@ -203,16 +248,17 @@ impl fmt::Display for PeerEntry {
 }
 
 impl FromStr for PeerEntry {
-    type Err = PeerBookError;
+    type Err = SpecError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut fields = s.split_ascii_whitespace();
-        let bad = |reason: &str| PeerBookError::Parse {
-            line: 1,
-            reason: reason.to_owned(),
-        };
-        let node: NodeId = fields.next().ok_or_else(|| bad("empty line"))?.parse()?;
-        let addrs = fields.next().ok_or_else(|| bad("missing addresses"))?;
+        let node: NodeId = fields
+            .next()
+            .ok_or(SpecError::Fields("the line is empty"))?
+            .parse()?;
+        let addrs = fields
+            .next()
+            .ok_or(SpecError::Fields("the addresses are missing"))?;
         let addrs = if addrs == "-" {
             Vec::new()
         } else {
@@ -221,12 +267,26 @@ impl FromStr for PeerEntry {
                 .map(str::parse)
                 .collect::<Result<Vec<HostPort>, _>>()?
         };
-        let last_seen_ms = match fields.next().ok_or_else(|| bad("missing last seen"))? {
+        if addrs.len() > MAX_ADDRS {
+            return Err(SpecError::TooManyAddrs(addrs.len()));
+        }
+        for (i, addr) in addrs.iter().enumerate() {
+            if addrs[..i].contains(addr) {
+                return Err(SpecError::DuplicateAddr(addr.clone()));
+            }
+        }
+        let last_seen_ms = match fields
+            .next()
+            .ok_or(SpecError::Fields("the last seen time is missing"))?
+        {
             "-" => None,
-            ms => Some(ms.parse().map_err(|_| bad("last seen is not a number"))?),
+            ms => Some(
+                ms.parse()
+                    .map_err(|_| SpecError::Fields("the last seen time is not a number"))?,
+            ),
         };
         if fields.next().is_some() {
-            return Err(bad("extra fields"));
+            return Err(SpecError::Fields("a field follows the last seen time"));
         }
         Ok(Self {
             node,
@@ -246,10 +306,10 @@ pub struct PeerSpec {
 }
 
 impl FromStr for PeerSpec {
-    type Err = PeerBookError;
+    type Err = SpecError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (node, addr) = s.split_once('@').ok_or(PeerBookError::Spec)?;
+        let (node, addr) = s.split_once('@').ok_or(SpecError::Spec)?;
         Ok(Self {
             node: node.parse()?,
             addr: addr.parse()?,
@@ -270,20 +330,26 @@ pub struct PeerBook {
 }
 
 impl PeerBook {
-    /// Parses the text form: one `PeerEntry` per line.
+    /// Parses the text form: one `PeerEntry` per line, each node on one line only.
     pub fn parse(text: &str) -> Result<Self, PeerBookError> {
         let mut peers = BTreeMap::new();
+        let mut first_line = BTreeMap::new();
         for (index, line) in text.lines().enumerate() {
+            let line_no = index + 1;
             if line.trim().is_empty() {
                 continue;
             }
-            let entry: PeerEntry = line.parse().map_err(|err| match err {
-                PeerBookError::Parse { reason, .. } => PeerBookError::Parse {
-                    line: index + 1,
-                    reason,
-                },
-                other => other,
+            let entry: PeerEntry = line.parse().map_err(|source| PeerBookError::Line {
+                line: line_no,
+                source,
             })?;
+            if let Some(first) = first_line.insert(entry.node, line_no) {
+                return Err(PeerBookError::DuplicateNode {
+                    line: line_no,
+                    first,
+                    node: entry.node,
+                });
+            }
             peers.insert(entry.node, entry);
         }
         Ok(Self { peers })
@@ -627,16 +693,16 @@ mod tests {
         );
         assert!(matches!(
             format!("{id}@bad host:7777").parse::<PeerSpec>(),
-            Err(PeerBookError::Parse { .. })
+            Err(SpecError::DnsName(_))
         ));
         assert!(matches!(
             format!("{id}@no-port").parse::<PeerSpec>(),
-            Err(PeerBookError::Parse { .. })
+            Err(SpecError::HostPort(_))
         ));
-        assert!(matches!("x".parse::<PeerSpec>(), Err(PeerBookError::Spec)));
+        assert!(matches!("x".parse::<PeerSpec>(), Err(SpecError::Spec)));
         assert!(matches!(
             "fab1xyz@1.2.3.4:5".parse::<PeerSpec>(),
-            Err(PeerBookError::NodeId(_))
+            Err(SpecError::NodeId(_))
         ));
     }
 
@@ -658,20 +724,54 @@ mod tests {
         let reloaded = PeerBook::load(&path).unwrap();
         assert_eq!(reloaded, peers.snapshot());
         let entry = reloaded.get(node(2)).unwrap();
-        assert_eq!(entry.addrs[0].to_string(), "10.0.0.9:7777");
-        assert_eq!(entry.addrs.len(), 2);
-        assert_eq!(entry.last_seen_ms, Some(1_760_000_000_000));
-        assert!(reloaded.get(node(3)).unwrap().addrs.is_empty());
+        assert_eq!(entry.addrs()[0].to_string(), "10.0.0.9:7777");
+        assert_eq!(entry.addrs().len(), 2);
+        assert_eq!(entry.last_seen_ms(), Some(1_760_000_000_000));
+        assert!(reloaded.get(node(3)).unwrap().addrs().is_empty());
 
         let text = format!("{reloaded}\nnot a peer\n");
         assert!(matches!(
             PeerBook::parse(&text),
-            Err(PeerBookError::NodeId(_))
+            Err(PeerBookError::Line {
+                line: 4,
+                source: SpecError::NodeId(_)
+            })
         ));
-        let text = format!("{} extra\n", node(5));
+        let text = format!("{} - - extra\n", node(5));
         assert!(matches!(
             PeerBook::parse(&text),
-            Err(PeerBookError::Parse { line: 1, .. })
+            Err(PeerBookError::Line {
+                line: 1,
+                source: SpecError::Fields(_)
+            })
+        ));
+    }
+
+    /// A hand-edited book holds the same bounds as one the code wrote: at
+    /// most `MAX_ADDRS` distinct addresses per peer, and one line per peer.
+    #[test]
+    fn a_book_line_past_its_bounds_is_refused() {
+        let addrs: Vec<String> = (0..=MAX_ADDRS).map(|i| format!("10.0.0.{i}:1")).collect();
+        let text = format!("{} {} -", node(1), addrs.join(","));
+        assert!(matches!(
+            PeerBook::parse(&text),
+            Err(PeerBookError::Line {
+                line: 1,
+                source: SpecError::TooManyAddrs(9)
+            })
+        ));
+        let text = format!("{} 10.0.0.1:1,10.0.0.1:1 -", node(1));
+        assert!(matches!(
+            PeerBook::parse(&text),
+            Err(PeerBookError::Line {
+                source: SpecError::DuplicateAddr(_),
+                ..
+            })
+        ));
+        let text = format!("{0} - -\n{1} - -\n{0} 10.0.0.1:1 -\n", node(1), node(2));
+        assert!(matches!(
+            PeerBook::parse(&text),
+            Err(PeerBookError::DuplicateNode { line: 3, first: 1, node: n }) if n == node(1)
         ));
     }
 
@@ -764,7 +864,7 @@ mod tests {
         #[test]
         fn entries_round_trip_as_text(
             bytes in any::<[u8; 32]>(),
-            addrs in proptest::collection::vec(any::<SocketAddr>(), 0..3),
+            addrs in proptest::collection::btree_set(any::<SocketAddr>(), 0..3),
             seen in proptest::option::of(any::<u64>()),
         ) {
             let entry = PeerEntry {
