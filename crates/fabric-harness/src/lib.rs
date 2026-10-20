@@ -41,7 +41,7 @@ pub mod claude;
 #[cfg(feature = "codex")]
 pub mod codex;
 
-pub use error::{BadRule, HarnessError};
+pub use error::{BadRule, HarnessError, Input};
 pub use harness::{
     Harness, Installed, Launch, MAX_MODEL_NAME_LEN, ModelName, ModelNameError, Restored, Running,
 };

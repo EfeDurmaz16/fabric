@@ -35,7 +35,7 @@ use tracing::warn;
 
 use crate::denylist;
 use crate::departure::Departure;
-use crate::error::HarnessError;
+use crate::error::{HarnessError, Input};
 use crate::jsontext::{self, TransformError};
 use crate::manifest::{Carried, Content, Digest, MANIFEST_FILE, Mutability};
 use crate::redact::{RedactionCounts, Redactor};
@@ -172,7 +172,7 @@ pub(crate) fn walk(dir: &Path) -> Result<Vec<PathBuf>, HarnessError> {
 pub(crate) fn rel_path(parts: &[&str]) -> Result<RelPath, HarnessError> {
     let joined = parts.join("/");
     RelPath::parse(&joined).map_err(|e| HarnessError::Malformed {
-        what: "state path",
+        what: Input::StatePath,
         path: PathBuf::from(&joined),
         reason: e.to_string(),
     })
@@ -185,10 +185,8 @@ pub(crate) fn rel_components(rel: &Path) -> Result<Vec<String>, HarnessError> {
             c.as_os_str()
                 .to_str()
                 .map(str::to_owned)
-                .ok_or_else(|| HarnessError::Malformed {
-                    what: "state path",
+                .ok_or_else(|| HarnessError::NotUtf8 {
                     path: rel.to_path_buf(),
-                    reason: "not UTF-8".to_owned(),
                 })
         })
         .collect()

@@ -49,7 +49,7 @@ use fabric_core::harness::HarnessKind;
 use fabric_core::path::AbsPath;
 use tracing::{info, warn};
 
-use crate::error::HarnessError;
+use crate::error::{HarnessError, Input};
 use crate::files::{self, Carry, Relation, Source};
 use crate::harness::{Harness, Installed, Launch, Restored, Running};
 use crate::manifest::{Content, HOME_PREFIX, Mutability, StateManifest};
@@ -161,7 +161,7 @@ fn toml_quoted_key(root: &AbsPath) -> Result<String, HarnessError> {
     let text = root.as_str();
     if text.chars().any(char::is_control) {
         return Err(HarnessError::Malformed {
-            what: "workspace path",
+            what: Input::WorkspacePath,
             path: PathBuf::from(text),
             reason: "holds a control character".to_owned(),
         });

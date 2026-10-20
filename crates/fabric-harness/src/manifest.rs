@@ -16,7 +16,7 @@ use fabric_core::harness::HarnessKind;
 use fabric_core::path::{AbsPath, RelPath};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::error::HarnessError;
+use crate::error::{HarnessError, Input};
 use crate::session::SessionId;
 
 /// The file name of the manifest inside a captured state tree.
@@ -363,7 +363,7 @@ impl StateManifest {
     #[cfg(any(feature = "acp", feature = "claude", feature = "codex"))]
     pub(crate) fn digest(&self) -> Result<Digest, HarnessError> {
         let bytes = serde_json::to_vec(self).map_err(|e| HarnessError::Malformed {
-            what: "manifest",
+            what: Input::Manifest,
             path: std::path::PathBuf::from(MANIFEST_FILE),
             reason: e.to_string(),
         })?;
@@ -374,7 +374,7 @@ impl StateManifest {
     pub fn write(&self, out: &Path) -> Result<(), HarnessError> {
         let path = out.join(MANIFEST_FILE);
         let bytes = serde_json::to_vec_pretty(self).map_err(|e| HarnessError::Malformed {
-            what: "manifest",
+            what: Input::Manifest,
             path: path.clone(),
             reason: e.to_string(),
         })?;
@@ -386,7 +386,7 @@ impl StateManifest {
         let path = state.join(MANIFEST_FILE);
         let bytes = std::fs::read(&path).map_err(|e| HarnessError::io("read", &path, e))?;
         serde_json::from_slice(&bytes).map_err(|e| HarnessError::Malformed {
-            what: "manifest",
+            what: Input::Manifest,
             path,
             reason: e.to_string(),
         })

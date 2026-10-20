@@ -221,11 +221,11 @@ pub enum HarnessError {
         /// Its process ids.
         pids: Vec<u32>,
     },
-    /// A captured manifest or a vendor file did not parse.
+    /// A captured manifest, a record of this crate or a vendor file did not parse.
     #[error("{what} at {path} does not parse: {reason}")]
     Malformed {
-        /// What was being parsed: `manifest`, `rollout line`, `config json`, `state path`, `workspace path`.
-        what: &'static str,
+        /// What was being parsed.
+        what: Input,
         /// The file concerned.
         path: PathBuf,
         /// The parser's message.
@@ -283,6 +283,37 @@ pub enum HarnessError {
     #[cfg(feature = "acp")]
     #[error("acp: {0}")]
     Acp(#[from] crate::acp::client::AcpError),
+}
+
+/// The kind of input that did not parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Input {
+    /// A state manifest.
+    Manifest,
+    /// A departure record under `~/.fabric/harness/departed/`.
+    DepartureRecord,
+    /// The first line of a Codex rollout.
+    RolloutLine,
+    /// Claude's `~/.claude.json`.
+    ConfigJson,
+    /// A path inside a state tree.
+    StatePath,
+    /// A workspace path that a manifest or a harness setting cannot hold.
+    WorkspacePath,
+}
+
+impl std::fmt::Display for Input {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Input::Manifest => "manifest",
+            Input::DepartureRecord => "departure record",
+            Input::RolloutLine => "rollout line",
+            Input::ConfigJson => "config json",
+            Input::StatePath => "state path",
+            Input::WorkspacePath => "workspace path",
+        })
+    }
 }
 
 impl HarnessError {

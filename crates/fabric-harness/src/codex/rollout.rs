@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::error::HarnessError;
+use crate::error::{HarnessError, Input};
 use crate::jsontext;
 use crate::redact::Redactor;
 use crate::session::SessionId;
@@ -182,7 +182,7 @@ pub fn read_meta(file: &RolloutFile) -> Result<Meta, HarnessError> {
         .read_line(&mut line)
         .map_err(|e| HarnessError::io("read", &file.path, e))?;
     let malformed = |reason: String| HarnessError::Malformed {
-        what: "rollout line",
+        what: Input::RolloutLine,
         path: file.path.clone(),
         reason,
     };

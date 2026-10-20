@@ -571,13 +571,8 @@ impl ClaudeCode {
         args
     }
 
-    fn fresh_session() -> Result<SessionId, HarnessError> {
-        let text = uuid::Uuid::new_v4().to_string();
-        SessionId::parse(&text).map_err(|e| HarnessError::Malformed {
-            what: "session id",
-            path: PathBuf::from(text),
-            reason: e.to_string(),
-        })
+    fn fresh_session() -> SessionId {
+        SessionId::from_uuid(uuid::Uuid::new_v4())
     }
 
     fn launch_impl(
@@ -593,7 +588,7 @@ impl ClaudeCode {
         }
         let session = match launch.resume() {
             Some(session) => session.clone(),
-            None => Self::fresh_session()?,
+            None => Self::fresh_session(),
         };
         let args = self.args_for(&session, launch);
         let (child, pid) =
@@ -734,7 +729,7 @@ mod tests {
                 "--not-a-flag"
             ]
         );
-        let fresh = ClaudeCode::fresh_session().unwrap();
+        let fresh = ClaudeCode::fresh_session();
         let new = Launch::Interactive {
             resume: None,
             prompt: Some("hi".to_owned()),

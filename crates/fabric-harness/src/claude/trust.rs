@@ -15,7 +15,7 @@ use std::path::Path;
 use fabric_core::path::AbsPath;
 use serde_json::{Map, Value};
 
-use crate::error::HarnessError;
+use crate::error::{HarnessError, Input};
 use crate::files;
 
 /// The key Claude reads to skip the trust dialog.
@@ -26,13 +26,13 @@ pub(crate) const TRUST_KEY: &str = "hasTrustDialogAccepted";
 pub(crate) fn preseed_file(config_json: &Path, root: &AbsPath) -> Result<bool, HarnessError> {
     let bytes = std::fs::read(config_json).map_err(|e| HarnessError::io("read", config_json, e))?;
     let mut value: Value = serde_json::from_slice(&bytes).map_err(|e| HarnessError::Malformed {
-        what: "config json",
+        what: Input::ConfigJson,
         path: config_json.to_path_buf(),
         reason: e.to_string(),
     })?;
     let Some(top) = value.as_object_mut() else {
         return Err(HarnessError::Malformed {
-            what: "config json",
+            what: Input::ConfigJson,
             path: config_json.to_path_buf(),
             reason: "top level is not an object".to_owned(),
         });
@@ -43,7 +43,7 @@ pub(crate) fn preseed_file(config_json: &Path, root: &AbsPath) -> Result<bool, H
         .or_insert_with(|| Value::Object(Map::new()));
     let Some(projects) = projects.as_object_mut() else {
         return Err(HarnessError::Malformed {
-            what: "config json",
+            what: Input::ConfigJson,
             path: config_json.to_path_buf(),
             reason: "projects is not an object".to_owned(),
         });
@@ -53,7 +53,7 @@ pub(crate) fn preseed_file(config_json: &Path, root: &AbsPath) -> Result<bool, H
         .or_insert_with(|| Value::Object(Map::new()));
     let Some(entry) = entry.as_object_mut() else {
         return Err(HarnessError::Malformed {
-            what: "config json",
+            what: Input::ConfigJson,
             path: config_json.to_path_buf(),
             reason: format!("projects[{root_key:?}] is not an object"),
         });
@@ -63,7 +63,7 @@ pub(crate) fn preseed_file(config_json: &Path, root: &AbsPath) -> Result<bool, H
     }
     entry.insert(TRUST_KEY.to_owned(), Value::Bool(true));
     let mut out = serde_json::to_vec_pretty(&value).map_err(|e| HarnessError::Malformed {
-        what: "config json",
+        what: Input::ConfigJson,
         path: config_json.to_path_buf(),
         reason: e.to_string(),
     })?;

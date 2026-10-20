@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::HarnessError;
+use crate::error::{HarnessError, Input};
 use crate::files::{self, Source};
 use crate::manifest::{Digest, Mutability};
 use crate::session::SessionId;
@@ -84,7 +84,7 @@ impl Records {
             files,
         };
         let bytes = serde_json::to_vec_pretty(&record).map_err(|e| HarnessError::Malformed {
-            what: "departure record",
+            what: Input::DepartureRecord,
             path: self.pending.clone(),
             reason: e.to_string(),
         })?;
@@ -129,7 +129,7 @@ fn read(path: &Path) -> Result<Option<Departure>, HarnessError> {
         Err(e) => return Err(HarnessError::io("read", path, e)),
     };
     let malformed = |reason: String| HarnessError::Malformed {
-        what: "departure record",
+        what: Input::DepartureRecord,
         path: path.to_path_buf(),
         reason,
     };

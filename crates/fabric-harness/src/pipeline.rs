@@ -21,7 +21,7 @@ use fabric_core::path::AbsPath;
 
 use crate::denylist;
 use crate::departure::{Departure, Records};
-use crate::error::HarnessError;
+use crate::error::{HarnessError, Input};
 use crate::files::{self, Placement, Source};
 use crate::harness::Restored;
 use crate::manifest::{Carried, Content, Mutability, StateManifest};
@@ -47,7 +47,7 @@ pub(crate) fn physical_workspace(workspace: &Path) -> Result<AbsPath, HarnessErr
         path: physical.clone(),
     })?;
     AbsPath::parse(text).map_err(|e| HarnessError::Malformed {
-        what: "workspace path",
+        what: Input::WorkspacePath,
         path: physical.clone(),
         reason: e.to_string(),
     })
