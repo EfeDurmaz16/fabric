@@ -250,8 +250,8 @@ impl ClaudeCode {
     /// when the workspace root or an ancestor Claude inherits from is
     /// trusted, nothing is written and no process is looked at. Otherwise
     /// the key `projects["<root>"].hasTrustDialogAccepted` is written while
-    /// no `claude` runs; while one runs, or when the file is a symlink, the
-    /// file is left to Claude and the outcome says why, so the caller can
+    /// no `claude` runs; while one runs, or when the file is a symlink or
+    /// missing, the file is left to Claude and the outcome says why, so the caller can
     /// warn and launch.
     pub async fn preseed_trust(&self, workspace: &Path) -> Result<TrustOutcome, HarnessError> {
         self.preseed_trust_with(workspace, || self.running_claude())
@@ -927,13 +927,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_missing_config_is_an_error_and_is_not_created() {
+    async fn a_missing_config_is_left_to_claude_and_not_created() {
         let fixture = TrustFixture::new(None);
         let (outcome, asked) = fixture.preseed(Vec::new()).await;
-        assert!(matches!(
-            outcome,
-            Err(HarnessError::Io { op: IoOp::Read, .. })
-        ));
+        assert_eq!(
+            outcome.unwrap(),
+            TrustOutcome::LeftToClaude {
+                reason: LeftReason::NoConfig {
+                    path: fixture.config()
+                }
+            }
+        );
         assert!(!asked);
         assert!(!fixture.config().exists());
     }

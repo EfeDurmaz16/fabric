@@ -8,8 +8,10 @@
 //! one key `projects["<root>"].hasTrustDialogAccepted` changes. A file
 //! that is a symlink is read through and never written, because the rename
 //! would replace the link. A missing
-//! file is not created: it means Claude never ran on this node, so there
-//! is no login to trust a workspace for either.
+//! file is not created and is not an error: Claude writes its first-run
+//! state there, whose shape Fabric does not own, and a node logged in
+//! with `ANTHROPIC_API_KEY` alone may never have run Claude. The outcome
+//! is then left to Claude, which creates the file and asks.
 //!
 //! Which directories count is Claude's own rule, read from the 2.1.294
 //! bundle on 2026-10-20 and seen on the owner's machine the same day (a
@@ -71,6 +73,12 @@ pub enum LeftReason {
         /// The running processes.
         pids: LivePids,
     },
+    /// There is no config file yet, because Claude never ran on this node
+    /// under this config directory.
+    NoConfig {
+        /// The file that is missing.
+        path: PathBuf,
+    },
     /// The config file is a symlink, as a dotfile manager makes it, and a
     /// rename over it would turn the link into a plain file.
     ConfigIsSymlink {
@@ -115,8 +123,13 @@ fn malformed(config_json: &Path, reason: String) -> HarnessError {
 fn read(config_json: &Path) -> Result<Value, HarnessError> {
     let bytes =
         std::fs::read(config_json).map_err(|e| HarnessError::io(IoOp::Read, config_json, e))?;
+    parse(config_json, &bytes)
+}
+
+/// Parses the bytes of the config file; the top level must be an object.
+fn parse(config_json: &Path, bytes: &[u8]) -> Result<Value, HarnessError> {
     let value: Value =
-        serde_json::from_slice(&bytes).map_err(|e| malformed(config_json, e.to_string()))?;
+        serde_json::from_slice(bytes).map_err(|e| malformed(config_json, e.to_string()))?;
     if !value.is_object() {
         return Err(malformed(
             config_json,
@@ -147,12 +160,18 @@ fn inherits_from(root: &Path) -> Vec<&Path> {
 }
 
 /// The nearest directory whose entry in the config file at `config_json`
-/// trusts `root`, read without writing anything.
+/// trusts `root`, read without writing anything; none when there is no
+/// config file.
 pub(crate) fn trusted_by(
     config_json: &Path,
     root: &AbsPath,
 ) -> Result<Option<PathBuf>, HarnessError> {
-    let value = read(config_json)?;
+    let bytes = match std::fs::read(config_json) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(HarnessError::io(IoOp::Read, config_json, e)),
+    };
+    let value = parse(config_json, &bytes)?;
     let projects = match value.get("projects") {
         None => return Ok(None),
         Some(Value::Object(projects)) => projects,
@@ -176,11 +195,19 @@ pub(crate) fn trusted_by(
 }
 
 /// Why the config file at `config_json` must not be written whoever
-/// runs, if anything: a symlink is read through but never written
-/// through, as Claude's own writer refuses to.
+/// runs, if anything: a missing file is not created, and a symlink is
+/// read through but never written through, as Claude's own writer
+/// refuses to.
 pub(crate) fn unwritable(config_json: &Path) -> Result<Option<LeftReason>, HarnessError> {
-    let meta = std::fs::symlink_metadata(config_json)
-        .map_err(|e| HarnessError::io(IoOp::Read, config_json, e))?;
+    let meta = match std::fs::symlink_metadata(config_json) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Some(LeftReason::NoConfig {
+                path: config_json.to_path_buf(),
+            }));
+        }
+        Err(e) => return Err(HarnessError::io(IoOp::Read, config_json, e)),
+    };
     Ok(meta
         .file_type()
         .is_symlink()
