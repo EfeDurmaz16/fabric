@@ -65,6 +65,34 @@ struct WriterLock {
     _thread: File,
 }
 
+/// A TOML quoted key for `root`, so `projects."<root>".trust_level` names
+/// exactly this path.
+fn toml_quoted_key(root: &Path) -> Result<String, HarnessError> {
+    let text = root.to_str().ok_or_else(|| HarnessError::Malformed {
+        what: "workspace path",
+        path: root.to_path_buf(),
+        reason: "not UTF-8".to_owned(),
+    })?;
+    if text.chars().any(char::is_control) {
+        return Err(HarnessError::Malformed {
+            what: "workspace path",
+            path: root.to_path_buf(),
+            reason: "holds a control character".to_owned(),
+        });
+    }
+    let mut key = String::with_capacity(text.len() + 2);
+    key.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => key.push_str("\\\""),
+            '\\' => key.push_str("\\\\"),
+            other => key.push(other),
+        }
+    }
+    key.push('"');
+    Ok(key)
+}
+
 impl Codex {
     /// An adapter whose state lives under `home/.codex`.
     #[must_use]
@@ -382,8 +410,8 @@ impl Codex {
         }
         args.push("-c".to_owned());
         args.push(format!(
-            "projects.\"{}\".trust_level=trusted",
-            root.to_string_lossy()
+            "projects.{}.trust_level=trusted",
+            toml_quoted_key(root)?
         ));
         for value in &self.overrides {
             args.push("-c".to_owned());
@@ -466,7 +494,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn args_follow_the_cli_surface() {
+    fn args_follow_the_cli_surface_and_quote_the_root() {
         let adapter = Codex::new(PathBuf::from("/h"))
             .with_overrides(vec!["sandbox_mode=\"workspace-write\"".to_owned()]);
         let root = Path::new("/h/fabric/jobs/j/work");
@@ -509,5 +537,23 @@ mod tests {
                 "--dangerously-bypass-approvals-and-sandbox"
             ]
         );
+        let quoted = Path::new("/h/say \"hi\"\\there");
+        let args = adapter
+            .args_for(
+                quoted,
+                &Launch::New {
+                    prompt: "go".to_owned(),
+                },
+                Io::Terminal,
+            )
+            .unwrap();
+        assert_eq!(
+            args[1],
+            "projects.\"/h/say \\\"hi\\\"\\\\there\".trust_level=trusted"
+        );
+        assert!(matches!(
+            toml_quoted_key(Path::new("/h/new\nline")),
+            Err(HarnessError::Malformed { .. })
+        ));
     }
 }
