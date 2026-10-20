@@ -12,7 +12,8 @@
 //! at most 256 per publish. A shard is flushed when an object was linked
 //! into it in this process, and also when publish names an object that has
 //! no catalog row yet, because only a committed row proves that an earlier
-//! process flushed the shard after linking the file.
+//! process flushed the shard after linking the file. Publish re-reads such
+//! an object first, since a power loss can keep its name and lose its bytes.
 
 use std::fs::{self, File};
 use std::io::{self, Write};

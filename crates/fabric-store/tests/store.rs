@@ -311,3 +311,32 @@ fn check_sees_a_wrong_refcount_and_a_broken_chain() {
     assert_eq!(report.broken_chains, vec![(id, ghost)]);
     assert!(!report.is_clean());
 }
+
+#[test]
+fn a_corrupt_object_left_without_a_row_is_removed_not_published() {
+    let dir = tempfile::tempdir().unwrap();
+    let m;
+    let data;
+    {
+        let store = Store::create(dir.path(), params()).unwrap();
+        let entry = file_entry(&store, "a.txt", b"left by a killed publish").unwrap();
+        data = chunks_of(&entry).unwrap()[0];
+        m = manifest(vec![entry], 7).unwrap();
+        store.objects().put_bytes(&m.encode().unwrap()).unwrap();
+    }
+    let manifest_chunk = ChunkId::of(&m.encode().unwrap());
+    let mut store = Store::open(dir.path()).unwrap();
+    for chunk in [data, manifest_chunk] {
+        let path = store.objects().object_path(chunk);
+        let good = fs::read(&path).unwrap();
+        fs::write(&path, b"lost in a power cut").unwrap();
+        assert!(matches!(
+            store.publish(&m),
+            Err(StoreError::CorruptUnpublished { chunk: c }) if c == chunk
+        ));
+        assert!(!path.exists());
+        fs::write(&path, good).unwrap();
+    }
+    let id = store.publish(&m).unwrap();
+    assert_eq!(store.manifest(id).unwrap(), m);
+}

@@ -58,6 +58,12 @@ pub enum StoreError {
         /// The object the manifest names.
         chunk: ChunkId,
     },
+    /// An object found on disk without a catalog row was corrupt and has been removed; capture again.
+    #[error("object {chunk} had no catalog row and was corrupt; it was removed, capture again")]
+    CorruptUnpublished {
+        /// The object that was removed.
+        chunk: ChunkId,
+    },
     /// No snapshot with the id is in the catalog.
     #[error("snapshot {0} is not in the store")]
     UnknownSnapshot(SnapshotId),
@@ -264,11 +270,7 @@ impl Store {
                 }
                 Err(e) => return Err(e.into()),
             };
-            if !self.catalog.has_chunk(chunk)? {
-                // On disk but never published: its directory entry may still
-                // be unflushed from a process that died before its publish.
-                self.objects.mark_dirty(chunk);
-            }
+            self.adopt_unpublished(chunk)?;
             data.push(ChunkRef {
                 id: chunk,
                 stored_len,
@@ -277,6 +279,7 @@ impl Store {
         let stored = self.objects.put_bytes(&bytes)?;
         let mut manifest_refs = Vec::with_capacity(stored.chunks.len());
         for chunk in stored.chunks {
+            self.adopt_unpublished(chunk)?;
             manifest_refs.push(ChunkRef {
                 id: chunk,
                 stored_len: self.objects.stored_len(chunk)?,
@@ -300,6 +303,31 @@ impl Store {
         checkpoint::reached("publish.after_commit");
         tracing::info!(snapshot = %id, objects = data.len(), "published");
         Ok(id)
+    }
+
+    /// Makes an object on disk safe for a catalog row to name.
+    ///
+    /// An object with a row, or one this process linked since the last
+    /// flush, needs nothing. Any other was linked by a process that may
+    /// have died before its flush, and after a power loss its name can be
+    /// durable while its bytes are not: its bytes are verified, a corrupt
+    /// file is removed so the next capture writes it again, and its shard is
+    /// marked for the flush that comes before the row.
+    fn adopt_unpublished(&self, chunk: ChunkId) -> Result<(), StoreError> {
+        if self.objects.is_fresh(chunk) || self.catalog.has_chunk(chunk)? {
+            return Ok(());
+        }
+        match self.objects.read(chunk) {
+            Ok(_) => {}
+            Err(ObjectError::Corrupt { id }) => {
+                self.objects.remove(id)?;
+                return Err(StoreError::CorruptUnpublished { chunk: id });
+            }
+            Err(ObjectError::Missing { id }) => return Err(StoreError::MissingChunk { chunk: id }),
+            Err(e) => return Err(e.into()),
+        }
+        self.objects.mark_dirty(chunk);
+        Ok(())
     }
 
     /// Returns the catalog row of a snapshot.

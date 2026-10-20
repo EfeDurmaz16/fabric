@@ -155,6 +155,8 @@ pub struct ObjectStore {
     tmp_dir: PathBuf,
     params: ChunkParams,
     dirty_shards: Mutex<HashSet<u8>>,
+    /// Objects this process linked since the last `flush_shards`; their bytes are the ones it hashed.
+    fresh: Mutex<HashSet<ChunkId>>,
 }
 
 impl ObjectStore {
@@ -164,6 +166,7 @@ impl ObjectStore {
             tmp_dir: store_root.join("tmp"),
             params,
             dirty_shards: Mutex::new(HashSet::new()),
+            fresh: Mutex::new(HashSet::new()),
         }
     }
 
@@ -231,6 +234,12 @@ impl ObjectStore {
             zstd::bulk::compress(bytes, self.params.zstd_level).map_err(|e| io_err(&path, e))?;
         let published = durable::publish_noclobber(&self.tmp_dir, &path, &compressed)
             .map_err(|e| io_err(&path, e))?;
+        if published == Published::New {
+            self.fresh
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(id);
+        }
         self.mark_dirty(id);
         Ok(StoredChunk {
             id,
@@ -343,6 +352,18 @@ impl ObjectStore {
         Ok(bytes)
     }
 
+    /// True when this process linked the object since the last `flush_shards`.
+    ///
+    /// Such an object holds the bytes `put` hashed, and its shard is already
+    /// marked. Any other object without a catalog row may have been linked
+    /// by a process that died before its flush.
+    pub(crate) fn is_fresh(&self, id: ChunkId) -> bool {
+        self.fresh
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&id)
+    }
+
     /// Records that the shard holding `id` has an entry the next `flush_shards` must flush.
     ///
     /// `put` calls it for an object it wrote. Publish also calls it for an
@@ -350,11 +371,7 @@ impl ObjectStore {
     /// file may have been linked by a process that was killed before its
     /// flush, and only a catalog row proves a shard was flushed after it.
     pub(crate) fn mark_dirty(&self, id: ChunkId) {
-        let shard = id.to_bytes()[0];
-        self.dirty_shards
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(shard);
+        self.mark_dirty_shard(id.to_bytes()[0]);
     }
 
     /// Flushes every shard directory marked dirty since the last call.
@@ -365,11 +382,28 @@ impl ObjectStore {
             .unwrap_or_else(PoisonError::into_inner)
             .drain()
             .collect();
-        for shard in shards {
+        for (index, shard) in shards.iter().enumerate() {
             let dir = self.objects_dir.join(format!("{shard:02x}"));
-            durable::fsync_dir(&dir).map_err(|e| io_err(&dir, e))?;
+            if let Err(e) = durable::fsync_dir(&dir) {
+                // These shards stay owed a flush, and their objects stay fresh.
+                for owed in &shards[index..] {
+                    self.mark_dirty_shard(*owed);
+                }
+                return Err(io_err(&dir, e));
+            }
         }
+        self.fresh
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         Ok(())
+    }
+
+    fn mark_dirty_shard(&self, shard: u8) {
+        self.dirty_shards
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(shard);
     }
 
     /// Removes an object file; a missing file is not an error.
