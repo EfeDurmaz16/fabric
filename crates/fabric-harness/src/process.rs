@@ -255,7 +255,9 @@ pub(crate) async fn running_pids(
     Ok(pids)
 }
 
-/// True when a process with this id exists, asked of `ps`.
+/// True when a process with this id exists, asked of `ps`. `ps` exits 0
+/// and prints the pid for a live process, and exits 1 with no output for
+/// none; any other answer is an error, never "dead".
 pub(crate) async fn pid_alive(pid: u32) -> Result<bool, HarnessError> {
     let output = Command::new("ps")
         .arg("-o")
@@ -264,16 +266,28 @@ pub(crate) async fn pid_alive(pid: u32) -> Result<bool, HarnessError> {
         .arg(pid.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .output()
         .await
         .map_err(|source| HarnessError::Spawn {
             program: "ps".to_owned(),
             source,
         })?;
-    Ok(String::from_utf8_lossy(&output.stdout)
+    let listed = String::from_utf8_lossy(&output.stdout)
         .lines()
-        .any(|line| line.trim().parse::<u32>() == Ok(pid)))
+        .any(|line| line.trim().parse::<u32>() == Ok(pid));
+    let silent = output.stdout.trim_ascii().is_empty() && output.stderr.trim_ascii().is_empty();
+    match output.status.code() {
+        Some(0) if listed => Ok(true),
+        Some(1) if silent => Ok(false),
+        code => Err(HarnessError::Spawn {
+            program: "ps".to_owned(),
+            source: std::io::Error::other(format!(
+                "ps -p {pid} exited with {code:?}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+        }),
+    }
 }
 
 #[cfg(test)]
