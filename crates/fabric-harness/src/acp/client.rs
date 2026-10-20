@@ -13,7 +13,9 @@
 //! the agent as one whole line written by a single writer task, so a
 //! caller that drops a request mid-way cannot leave half a line on the
 //! agent's stdin, and a dropped request leaves no waiter behind. A line
-//! from the agent longer than `MAX_LINE` closes the connection.
+//! from the agent longer than `MAX_LINE` closes the connection, and so
+//! does an agent that stops reading its stdin while `OUTGOING_BUFFER`
+//! lines wait for it.
 //!
 //! Field names follow `schema/v1/schema.json` of
 //! `agentclientprotocol/agent-client-protocol` at schema v1.26.0
@@ -44,6 +46,10 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(45);
 /// The longest line read from the agent, in bytes.
 pub const MAX_LINE: usize = 16 * 1024 * 1024;
 
+/// How many lines may wait for the writer before the agent is taken to
+/// have stopped reading its stdin and the connection is closed.
+pub const OUTGOING_BUFFER: usize = 1024;
+
 /// How many `session/update` notifications wait for `next_update` before
 /// newer ones are dropped and counted.
 pub const UPDATE_BUFFER: usize = 1024;
@@ -68,6 +74,10 @@ pub enum AcpError {
     /// The agent closed its stdout.
     #[error("agent closed the connection")]
     Closed,
+    /// `OUTGOING_BUFFER` lines already waited for an agent that is not
+    /// reading its stdin.
+    #[error("the agent stopped reading: {OUTGOING_BUFFER} lines wait unwritten")]
+    Saturated,
     /// A handshake request got no answer within `HANDSHAKE_TIMEOUT`.
     #[error("{method} got no answer within {HANDSHAKE_TIMEOUT:?}")]
     Timeout {
@@ -165,7 +175,7 @@ impl PermissionPolicy {
 
 type Waiter = oneshot::Sender<Result<Value, AcpError>>;
 type Pending = Arc<Mutex<Option<HashMap<u64, Waiter>>>>;
-type Outgoing = mpsc::UnboundedSender<String>;
+type Outgoing = mpsc::Sender<String>;
 
 struct Inner {
     outgoing: Outgoing,
@@ -216,7 +226,10 @@ struct RpcErrorBody {
 fn write_line(outgoing: &Outgoing, value: &Value) -> Result<(), AcpError> {
     let mut text = serde_json::to_string(value).map_err(|e| AcpError::Protocol(e.to_string()))?;
     text.push('\n');
-    outgoing.send(text).map_err(|_| AcpError::Closed)
+    outgoing.try_send(text).map_err(|e| match e {
+        mpsc::error::TrySendError::Full(_) => AcpError::Saturated,
+        mpsc::error::TrySendError::Closed(_) => AcpError::Closed,
+    })
 }
 
 /// Writes queued lines to the agent until every sender is gone or a write
@@ -224,11 +237,7 @@ fn write_line(outgoing: &Outgoing, value: &Value) -> Result<(), AcpError> {
 /// waiting request: its line, or a later one, never reached the agent, and
 /// an agent that keeps its stdout open would otherwise leave a request
 /// with no deadline, such as a prompt, waiting forever.
-async fn write_loop(
-    mut stdin: ChildStdin,
-    mut lines: mpsc::UnboundedReceiver<String>,
-    pending: Pending,
-) {
+async fn write_loop(mut stdin: ChildStdin, mut lines: mpsc::Receiver<String>, pending: Pending) {
     while let Some(line) = lines.recv().await {
         let written = async {
             stdin.write_all(line.as_bytes()).await?;
@@ -380,8 +389,8 @@ async fn read_loop(
                         "error": { "code": -32601, "message": format!("method not supported by this client: {method}") }
                     })
                 };
-                if write_line(&outgoing, &response).is_err() {
-                    warn!("acp: writer closed; stopping");
+                if let Err(e) = write_line(&outgoing, &response) {
+                    warn!(error = %e, "acp: cannot answer the agent; closing");
                     break;
                 }
             }
@@ -423,7 +432,7 @@ impl AcpClient {
     /// Takes over the agent's pipes and starts reading.
     #[must_use]
     pub fn attach(stdin: ChildStdin, stdout: ChildStdout, policy: PermissionPolicy) -> Self {
-        let (outgoing, lines) = mpsc::unbounded_channel();
+        let (outgoing, lines) = mpsc::channel(OUTGOING_BUFFER);
         let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
         tokio::spawn(write_loop(stdin, lines, Arc::clone(&pending)));
         let (sink, rx, dropped_updates) = UpdateSink::new(UPDATE_BUFFER);
@@ -680,6 +689,29 @@ mod tests {
         let answer = tokio::time::timeout(Duration::from_secs(10), client.prompt(&session, "hi"))
             .await
             .expect("the prompt must fail, not wait for an answer that cannot come");
+        assert!(answer.is_err());
+        child.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_stops_reading_is_disconnected_not_buffered() {
+        // The agent floods permission requests and never reads an answer.
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"session/request_permission","params":{"options":[]}}"#;
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("while :; do echo '{request}'; done"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let client = AcpClient::attach(stdin, stdout, PermissionPolicy::Deny);
+        let session = SessionId::parse("s1").unwrap();
+        let answer = tokio::time::timeout(Duration::from_secs(20), client.prompt(&session, "hi"))
+            .await
+            .expect("the prompt must fail once the queue is full");
         assert!(answer.is_err());
         child.kill().await.unwrap();
     }
