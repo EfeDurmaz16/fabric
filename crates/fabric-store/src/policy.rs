@@ -5,7 +5,8 @@
 //! can be widened per job but never narrowed. Under a dependency, build or
 //! tool-cache directory only the high-confidence patterns apply, so a
 //! `node_modules` is carried whole or left behind, never with holes it does
-//! not know about.
+//! not know about. Names are compared with ASCII case folded, as APFS and
+//! git on a Mac compare them, so `Server.PEM` is as secret as `server.pem`.
 
 use std::fs;
 use std::io;
@@ -177,14 +178,14 @@ impl Pattern {
     }
 }
 
-/// Matches `text` against a glob with `*` and `?`.
+/// Matches `text` against a glob with `*` and `?`, folding ASCII case.
 fn glob(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     let (mut pi, mut ti) = (0, 0);
     let mut star: Option<(usize, usize)> = None;
     while ti < t.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+        if pi < p.len() && (p[pi] == '?' || p[pi].eq_ignore_ascii_case(&t[ti])) {
             pi += 1;
             ti += 1;
         } else if pi < p.len() && p[pi] == '*' {
@@ -389,6 +390,21 @@ mod tests {
         assert!(glob("a?c", "abc"));
         assert!(!glob("a?c", "ac"));
         assert!(glob("*", ""));
+    }
+
+    #[test]
+    fn secret_names_match_in_any_case() {
+        let p = IgnorePolicy::default();
+        for path in [
+            "secrets/Server.PEM",
+            "secrets/.ENV",
+            "ID_RSA",
+            "Credentials.json",
+            "home/.SSH/config",
+        ] {
+            assert_eq!(p.classify(&rel(path)).class, Class::Secret, "{path}");
+            assert!(p.denies_anywhere(&rel(path)), "{path}");
+        }
     }
 
     #[test]
