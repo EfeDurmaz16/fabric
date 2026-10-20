@@ -15,25 +15,31 @@
 //! env = ["DATABASE_URL"]           # names only, resolved on each node
 //! secret_patterns = ["*.sqlite"]   # added to the built-in secret list
 //!
-//! [tools]                          # a declared pin replaces a detected one;
-//! node = "22"                      # nodejs reads as node and golang as go, as in .tool-versions
+//! [tools]                          # a declared pin replaces a detected one
+//! node = "22"                      # nodejs reads as node, golang as go
 //!
-//! [[cache]]                        # added to the detected cache paths; when one is
-//! path = ".output"                 # missing on resume, declared [[setup]] steps run,
-//! class = "build"                  # as does a detected step with no cache of its own
-//!                                  # (go mod download); a detected install does not,
-//!                                  # so declare the step that builds it;
-//!                                  # class is deps, build or tool-cache
-//! ecosystem = "node"               # optional: node, rust, python or other; picks the
-//!                                  # carry key; the single detected ecosystem when absent
-//!                                  # with no cache path at all the steps run every resume
+//! [[cache]]                        # added to the detected cache paths
+//! path = ".output"
+//! class = "build"                  # deps, build or tool-cache
+//! ecosystem = "node"               # optional: node, rust, python or other
 //!
-//! [[setup]]                        # any setup entry replaces every detected step
+//! [[setup]]                        # replaces every detected step
 //! program = "pnpm"
 //! args = ["install", "--frozen-lockfile"]
 //! cwd = "web"                      # optional; the root when absent
 //! when = "caches-missing"          # or "always"; caches-missing when absent
 //! ```
+//!
+//! `ecosystem` picks the cache's carry key. Without it, a declared cache
+//! takes the one ecosystem detection found, or `other` when it found none.
+//!
+//! A missing declared cache runs the steps that fill it. A declared step
+//! counts as filling every cache except a detected `target`, so every
+//! declared step runs. A detected install fills only its own cache and
+//! does not run, so declare the step that builds the cache. A detected
+//! step that fills no cache in the workspace, such as `go mod download`,
+//! runs whenever any cache is not whole. With no cache path at all, the
+//! `caches-missing` steps run on every resume.
 
 use std::collections::BTreeMap;
 
