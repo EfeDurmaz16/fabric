@@ -51,13 +51,48 @@ pub enum TrustOutcome {
     },
     /// The trust key was written for the workspace root.
     Written,
-    /// Nothing trusts the workspace and these `claude` processes run, so
-    /// the file was left alone: an interactive Claude shows its own trust
-    /// dialog, and a headless one runs without the workspace's settings.
+    /// Nothing trusts the workspace and the file was left alone, for
+    /// `reason`: an interactive Claude shows its own trust dialog, and a
+    /// headless one runs without the workspace's settings. The caller
+    /// tells the user; this crate does not.
     LeftToClaude {
-        /// The running `claude` processes, never empty.
-        pids: Vec<u32>,
+        /// Why the key was not written.
+        reason: LeftReason,
     },
+}
+
+/// Why `ClaudeCode::preseed_trust` left an untrusted workspace to Claude.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeftReason {
+    /// These `claude` processes run, and Claude rewrites the file itself.
+    ClaudeRunning {
+        /// The running processes.
+        pids: LivePids,
+    },
+}
+
+/// Process ids of running processes; never empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LivePids {
+    first: u32,
+    rest: Vec<u32>,
+}
+
+impl LivePids {
+    /// The ids in `pids`, or `None` when there are none.
+    pub(crate) fn of(pids: Vec<u32>) -> Option<Self> {
+        let mut pids = pids.into_iter();
+        let first = pids.next()?;
+        Some(LivePids {
+            first,
+            rest: pids.collect(),
+        })
+    }
+
+    /// Every id, in the order they were found.
+    pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        std::iter::once(self.first).chain(self.rest.iter().copied())
+    }
 }
 
 fn malformed(config_json: &Path, reason: String) -> HarnessError {

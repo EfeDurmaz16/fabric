@@ -40,7 +40,7 @@ use fabric_core::env::EnvVarName;
 use fabric_core::harness::HarnessKind;
 use fabric_core::path::AbsPath;
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::departure::Records;
 use crate::error::{HarnessError, IoOp};
@@ -54,7 +54,7 @@ use crate::session::SessionId;
 use crate::stage::{Carry, Source};
 
 use self::flags::LaunchFlags;
-pub use self::trust::TrustOutcome;
+pub use self::trust::{LeftReason, LivePids, TrustOutcome};
 
 /// The program name on `PATH`.
 pub const PROGRAM: &str = "claude";
@@ -276,14 +276,15 @@ impl ClaudeCode {
         if let Some(by) = trusted {
             return Ok(TrustOutcome::AlreadyTrusted { by });
         }
-        let pids = running().await?;
-        if !pids.is_empty() {
-            warn!(
+        if let Some(pids) = LivePids::of(running().await?) {
+            debug!(
                 ?pids,
                 root = root.as_str(),
-                "claude: workspace not trusted and claude is running; Claude will ask"
+                "claude: workspace not trusted and claude is running; left to Claude"
             );
-            return Ok(TrustOutcome::LeftToClaude { pids });
+            return Ok(TrustOutcome::LeftToClaude {
+                reason: LeftReason::ClaudeRunning { pids },
+            });
         }
         let config_json = self.config_json.clone();
         let write_root = root.clone();
@@ -839,7 +840,11 @@ mod tests {
         let (outcome, asked) = fixture.preseed(vec![4242]).await;
         assert_eq!(
             outcome.unwrap(),
-            TrustOutcome::LeftToClaude { pids: vec![4242] }
+            TrustOutcome::LeftToClaude {
+                reason: LeftReason::ClaudeRunning {
+                    pids: LivePids::of(vec![4242]).unwrap()
+                }
+            }
         );
         assert!(asked);
         assert_eq!(
