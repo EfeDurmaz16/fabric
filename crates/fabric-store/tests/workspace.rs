@@ -37,7 +37,7 @@ const NODE: NodeId = NodeId::from_bytes([2; 32]);
 const T0: u64 = 1_760_000_000_000;
 
 fn git(root: &Path) -> Git {
-    Git::new(root, T0)
+    Git::new(root).with_date(T0)
 }
 
 fn set_mtime(path: &Path, secs: u64, nanos: u32) -> Fallible {

@@ -559,7 +559,7 @@ fn restore_git(
         durability,
     } = *target;
     let power_loss = durability == Durability::PowerLoss;
-    let mut git = Git::new(staging, manifest.created_at);
+    let mut git = Git::new(staging).with_date(manifest.created_at);
     if power_loss {
         git = git.with_full_fsync();
     }
@@ -1002,7 +1002,7 @@ pub fn verify(
     let skip = |rel: &RelPath| skipped.iter().any(|root| rel.starts_with(root));
     let mut verified = verify_entries(store, &writer, &manifest.files, &skip, mode)?;
     if let Some(state) = &manifest.git {
-        let git = Git::new(root, manifest.created_at);
+        let git = Git::new(root);
         verified += verify_worktree(&git, &state.worktree_commit, &writer, mode)?;
     }
     Ok(verified)
@@ -1024,7 +1024,7 @@ mod tests {
     fn a_failing_blob_write_does_not_hang_cat_file() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_owned();
-        let git = Git::new(&root, 0);
+        let git = Git::new(&root);
         git.run(&["init", "-q"]).unwrap();
         for i in 0..BLOBS {
             fs::write(root.join(format!("f{i}")), format!("{i:01024}")).unwrap();

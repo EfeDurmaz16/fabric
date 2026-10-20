@@ -76,19 +76,26 @@ const FSYNC_FLAGS: &[&str] = &["core.fsync=all", "core.fsyncMethod=fsync"];
 #[derive(Debug, Clone)]
 pub struct Git {
     repo: PathBuf,
-    date: String,
+    date: Option<String>,
     full_fsync: bool,
 }
 
 impl Git {
-    /// Binds to the repository at `repo`; snapshot commits get `created_at_ms` as their date.
+    /// Binds to the repository at `repo`.
     #[must_use]
-    pub fn new(repo: &Path, created_at_ms: u64) -> Git {
+    pub fn new(repo: &Path) -> Git {
         Git {
             repo: repo.to_owned(),
-            date: format!("{} +0000", created_at_ms / 1000),
+            date: None,
             full_fsync: false,
         }
+    }
+
+    /// Gives every commit and reflog entry git writes the date `unix_ms`; without it git reads the clock.
+    #[must_use]
+    pub fn with_date(mut self, unix_ms: u64) -> Git {
+        self.date = Some(format!("{} +0000", unix_ms / 1000));
+        self
     }
 
     /// Makes every git command flush the index, refs, packs and config it writes, for a power-loss-safe restore.
@@ -122,11 +129,13 @@ impl Git {
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env("GIT_AUTHOR_NAME", "fabric")
             .env("GIT_AUTHOR_EMAIL", "fabric@localhost")
-            .env("GIT_AUTHOR_DATE", &self.date)
             .env("GIT_COMMITTER_NAME", "fabric")
             .env("GIT_COMMITTER_EMAIL", "fabric@localhost")
-            .env("GIT_COMMITTER_DATE", &self.date)
             .stdin(Stdio::null());
+        if let Some(date) = &self.date {
+            cmd.env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date);
+        }
         cmd
     }
 
@@ -263,7 +272,7 @@ mod tests {
         let Ok(dir) = std::env::var("FABRIC_GIT_ENV_CHILD") else {
             return;
         };
-        let git = Git::new(Path::new(&dir), 0);
+        let git = Git::new(Path::new(&dir));
         let out = git
             .output(&["config", "--get", "fabric.injected"], &[])
             .unwrap();
@@ -282,7 +291,7 @@ mod tests {
     #[test]
     fn inherited_git_variables_do_not_reach_git() {
         let dir = tempfile::tempdir().unwrap();
-        Git::new(dir.path(), 0).run(&["init", "-q"]).unwrap();
+        Git::new(dir.path()).run(&["init", "-q"]).unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "git::tests::inherited_git_variables_child"])
             .env("FABRIC_GIT_ENV_CHILD", dir.path())
@@ -304,7 +313,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let name = "p".repeat(200);
         fs::write(dir.path().join(&name), "x").unwrap();
-        let git = Git::new(dir.path(), 0);
+        let git = Git::new(dir.path());
         git.run(&["init", "-q"]).unwrap();
         let lines = 20_000;
         let input = format!("{name}\n").repeat(lines);

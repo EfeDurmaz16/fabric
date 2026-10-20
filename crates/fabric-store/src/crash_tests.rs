@@ -29,7 +29,7 @@ fn make_workspace(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(root.join("node_modules/pkg"))?;
     fs::write(root.join("src/main.rs"), "fn main() {}\n")?;
     fs::write(root.join(".gitignore"), "*.log\nnode_modules/\n")?;
-    let git = Git::new(root, CREATED_AT);
+    let git = Git::new(root).with_date(CREATED_AT);
     git.run(&["init", "-q", "-b", "main"])?;
     git.run(&["add", "-A"])?;
     git.run(&["commit", "-q", "-m", "one"])?;
@@ -278,11 +278,11 @@ fn restore_killed_at_any_checkpoint_is_detectable_and_finishes_on_rerun() {
             "tool output\n",
             "{checkpoint}"
         );
-        let git = Git::new(&target, CREATED_AT);
+        let git = Git::new(&target);
         let status = git
             .run_text(&["status", "--porcelain=v2", "--untracked-files=all"])
             .unwrap();
-        let source = Git::new(&dir.join("work"), CREATED_AT)
+        let source = Git::new(&dir.join("work"))
             .run_text(&["status", "--porcelain=v2", "--untracked-files=all"])
             .unwrap();
         assert_eq!(status, source, "{checkpoint}");

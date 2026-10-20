@@ -43,7 +43,7 @@ fn build_workspace(root: &Path) -> Fallible {
         )?;
     }
     fs::write(root.join(".gitignore"), "node_modules/\ndist/\ndata/\n")?;
-    let git = Git::new(root, 1_760_000_000_000);
+    let git = Git::new(root).with_date(1_760_000_000_000);
     git.run(&["init", "-q", "-b", "main"])?;
     git.run(&["add", "-A"])?;
     git.run(&["commit", "-q", "-m", "one"])?;
@@ -78,7 +78,7 @@ fn build_workspace(root: &Path) -> Fallible {
 }
 
 fn mutate_workspace(root: &Path) -> Fallible {
-    let git = Git::new(root, 1_760_000_060_000);
+    let git = Git::new(root).with_date(1_760_000_060_000);
     for i in 0..10 {
         fs::write(
             root.join(format!("src/mod{i}.rs")),

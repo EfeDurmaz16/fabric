@@ -1351,7 +1351,7 @@ fn detect_git<'a>(
     req: &CaptureRequest<'a>,
     scratch: &Path,
 ) -> Result<Option<GitCapture<'a>>, CaptureError> {
-    let git = Git::new(req.root, req.created_at);
+    let git = Git::new(req.root).with_date(req.created_at);
     let out = git.output(&["rev-parse", "--show-toplevel"], &[])?;
     if !out.status.success() {
         return Ok(None);
@@ -1549,7 +1549,7 @@ mod tests {
         let root = dir.path().join("work");
         fs::create_dir(&root).unwrap();
         let gc = GitCapture {
-            git: Git::new(&root, 1_760_000_000_000),
+            git: Git::new(&root).with_date(1_760_000_000_000),
             root: &root,
             job_id: JobId::from_bytes([1; 16]),
             scratch: dir.path().to_owned(),
