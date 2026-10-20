@@ -42,6 +42,7 @@ fn transcript(root: &str, home: &str) -> String {
     format!(
         concat!(
             "{{\"type\":\"user\",\"cwd\":\"{root}\",\"sessionId\":\"{sid}\",\"message\":{{\"role\":\"user\",\"content\":\"fix the test in {root}/tests\"}}}}\n",
+            "{{\"type\":\"file-history-snapshot\",\"messageId\":\"m1\",\"snapshot\":{{\"messageId\":\"m1\",\"trackedFileBackups\":{{\"src/lib.rs\":{{\"backupFileName\":\"abc@v1\",\"version\":1,\"backupTime\":\"t\"}},\"{root}/.env\":{{\"backupFileName\":\"def@v1\",\"version\":1,\"backupTime\":\"t\"}}}},\"timestamp\":\"t\"}},\"isSnapshotUpdate\":false}}\n",
             "{{\"type\":\"assistant\",\"cwd\":\"{root}\",\"message\":{{\"content\":[{signed},{{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{{\"file_path\":\"{root}/src/lib.rs\"}}}}]}}}}\n",
             "{{\"type\":\"user\",\"cwd\":\"{root}\",\"toolUseResult\":\"output spilled to {home}/.claude/projects/{key}/{sid}/tool-results/1.txt; token {secret}\"}}\n",
             "{{\"type\":\"assistant\",\"cwd\":\"{root}\",\"message\":{{\"content\":[{{\"type\":\"thinking\",\"thinking\":\"the token is {secret}\",\"signature\":\"AbCd\"}},{{\"type\":\"text\",\"text\":\"noted\"}}]}}}}\n",
@@ -114,6 +115,19 @@ fn build_source(work_rel: &str) -> Fixture {
         format!("GITHUB_TOKEN={GITHUB}\n"),
     )
     .unwrap();
+    // Claude's backup of the workspace's `.env`, named by hash: the
+    // snapshot record in the transcript says what it is a copy of.
+    std::fs::write(
+        claude.join("file-history").join(SID).join("def@v1"),
+        "DATABASE_URL=postgres://admin:hunter2@db.internal/prod\n",
+    )
+    .unwrap();
+    // A backup no record names.
+    std::fs::write(
+        claude.join("file-history").join(SID).join("0ff@v3"),
+        "unknown\n",
+    )
+    .unwrap();
     std::fs::create_dir_all(claude.join("tasks/session-9c9796f0")).unwrap();
     std::fs::write(
         claude.join("tasks/session-9c9796f0/1.json"),
@@ -167,6 +181,28 @@ fn transcript_under(home: &Path, work: &Path) -> PathBuf {
         .join(format!("{SID}.jsonl"))
 }
 
+/// The text sidecars of a capture into `out`: secrets redacted line by line.
+fn assert_sidecars_redacted(out: &Path, key: &str) {
+    let results = std::fs::read_to_string(out.join(format!(
+        "home/.claude/projects/{key}/{SID}/tool-results/1.txt"
+    )))
+    .unwrap();
+    assert!(!results.contains(SECRET));
+    assert!(results.contains("[REDACTED:anthropic-key]"));
+    let key_results = std::fs::read_to_string(out.join(format!(
+        "home/.claude/projects/{key}/{SID}/tool-results/2.txt"
+    )))
+    .unwrap();
+    assert_eq!(
+        key_results,
+        "cat ~/.ssh/id_ed25519\n[REDACTED:private-key-block]\ndone\n"
+    );
+    let history =
+        std::fs::read_to_string(out.join(format!("home/.claude/file-history/{SID}/abc@v1")))
+            .unwrap();
+    assert_eq!(history, "GITHUB_TOKEN=[REDACTED:github-token]\n");
+}
+
 #[tokio::test]
 async fn capture_carries_session_state_only_and_redacts() {
     let src = build_source("fabric/jobs/j1/work");
@@ -193,6 +229,12 @@ async fn capture_carries_session_state_only_and_redacts() {
         )
     );
     assert!(paths.contains(&format!("home/.claude/file-history/{SID}/abc@v1").as_str()));
+    assert!(
+        !paths
+            .iter()
+            .any(|p| p.ends_with("def@v1") || p.ends_with("0ff@v3")),
+        "a backup of .env and an unnamed backup stay behind: {paths:?}"
+    );
     assert!(paths.contains(&"home/.claude/tasks/session-9c9796f0/1.json"));
     for denied in [
         ".credentials.json",
@@ -219,11 +261,13 @@ async fn capture_carries_session_state_only_and_redacts() {
         rules,
         vec![
             ("anthropic-key", 2),
+            ("file-backup-not-in-transcript", 1),
+            ("file-backup-of-denied-file", 1),
             ("github-token", 1),
             ("private-key-block", 1),
             ("signed-block-dropped", 1)
         ],
-        "one match in the transcript, one in the text sidecar, one in file history, a key over three lines, one block dropped"
+        "one match in the transcript, one in the text sidecar, two backups left behind, one in file history, a key over three lines, one block dropped"
     );
     let staged_path = out
         .path()
@@ -237,26 +281,7 @@ async fn capture_carries_session_state_only_and_redacts() {
     assert!(staged.contains(&signed_block(&src.work.to_string_lossy())));
     assert!(staged.contains(r#"[{"type":"text","text":"noted"}]"#));
     assert_eq!(mode(&staged_path), 0o600);
-    let results = std::fs::read_to_string(out.path().join(format!(
-        "home/.claude/projects/{key}/{SID}/tool-results/1.txt"
-    )))
-    .unwrap();
-    assert!(!results.contains(SECRET));
-    assert!(results.contains("[REDACTED:anthropic-key]"));
-    let key_results = std::fs::read_to_string(out.path().join(format!(
-        "home/.claude/projects/{key}/{SID}/tool-results/2.txt"
-    )))
-    .unwrap();
-    assert_eq!(
-        key_results,
-        "cat ~/.ssh/id_ed25519\n[REDACTED:private-key-block]\ndone\n"
-    );
-    let history = std::fs::read_to_string(
-        out.path()
-            .join(format!("home/.claude/file-history/{SID}/abc@v1")),
-    )
-    .unwrap();
-    assert_eq!(history, "GITHUB_TOKEN=[REDACTED:github-token]\n");
+    assert_sidecars_redacted(out.path(), &key);
     for file in &manifest.files {
         let bytes = std::fs::read(out.path().join(file.rel_path.as_str())).unwrap();
         assert_eq!(file.size, bytes.len() as u64);

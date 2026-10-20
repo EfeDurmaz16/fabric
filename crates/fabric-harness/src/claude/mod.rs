@@ -24,6 +24,7 @@
 //! `~/.claude/sessions/<pid>.json` (`pid`, `sessionId`) was read on the
 //! owner's machine on 2026-10-20.
 
+pub(crate) mod history;
 pub mod slug;
 pub(crate) mod trust;
 
@@ -291,7 +292,43 @@ impl ClaudeCode {
         }
     }
 
-    fn sources_for(&self, root: &Path, session: &SessionId) -> Result<Vec<Source>, HarnessError> {
+    /// Adds the backups under `file-history/<sid>/` that the transcripts
+    /// already in `sources` name for a file the denylist allows.
+    fn add_file_history(
+        &self,
+        sources: &mut Vec<Source>,
+        session: &SessionId,
+        counts: &mut RedactionCounts,
+    ) -> Result<(), HarnessError> {
+        let dir = self.config_dir.join("file-history").join(session.as_str());
+        match Self::kind_at(&dir)? {
+            Some(kind) if kind.is_symlink() => {
+                return Err(HarnessError::SymlinkInState { path: dir });
+            }
+            Some(kind) if kind.is_dir() => {}
+            _ => return Ok(()),
+        }
+        let transcripts: Vec<&Path> = sources
+            .iter()
+            .filter(|s| s.carry == Carry::JsonLines)
+            .map(|s| s.abs.as_path())
+            .collect();
+        let backups = history::Backups::read(&transcripts)?;
+        for file in files::walk(&dir)? {
+            let name = file.to_string_lossy();
+            if backups.admit(&name, counts) {
+                self.add_file(sources, &dir.join(&file))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn sources_for(
+        &self,
+        root: &Path,
+        session: &SessionId,
+        counts: &mut RedactionCounts,
+    ) -> Result<Vec<Source>, HarnessError> {
         let mut sources = Vec::new();
         let projects = self.config_dir.join("projects");
         let mut found_transcript = false;
@@ -335,10 +372,7 @@ impl ClaudeCode {
         }
         let key = Self::key_of(root)?;
         self.add_tree(&mut sources, &projects.join(&key).join("memory"))?;
-        self.add_tree(
-            &mut sources,
-            &self.config_dir.join("file-history").join(session.as_str()),
-        )?;
+        self.add_file_history(&mut sources, session, counts)?;
         let prefix8: String = session.as_str().chars().take(8).collect();
         self.add_tree(
             &mut sources,
@@ -361,8 +395,8 @@ impl ClaudeCode {
         out: &Path,
         version: Option<String>,
     ) -> Result<StateManifest, HarnessError> {
-        let sources = self.sources_for(root, session)?;
         let mut counts = RedactionCounts::new();
+        let sources = self.sources_for(root, session, &mut counts)?;
         let carried = files::stage(&sources, out, &mut counts)?;
         let manifest = StateManifest {
             format: MANIFEST_FORMAT,
