@@ -9,6 +9,7 @@
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
@@ -74,6 +75,29 @@ impl Env {
     /// The job's root, the same path on both nodes.
     pub fn work(&self, job: &str) -> PathBuf {
         self.home.join("fabric").join("jobs").join(job).join("work")
+    }
+
+    /// Puts a fake `claude` first on the `PATH`: it answers `--version` as
+    /// the gate's Claude does and otherwise writes its arguments, one per
+    /// line, to `fake_claude_args` and exits.
+    pub fn install_fake_claude(&self) -> Fallible {
+        let claude = self.root.join("bin").join("claude");
+        fs::write(
+            &claude,
+            "#!/bin/sh\n\
+             if [ \"$1\" = --version ]; then echo '2.1.294 (Claude Code)'; exit 0; fi\n\
+             printf '%s\\n' \"$@\" > \"$HOME/claude-args\"\n",
+        )?;
+        fs::set_permissions(&claude, fs::Permissions::from_mode(0o755))?;
+        Ok(())
+    }
+
+    /// The arguments the fake `claude` was last launched with.
+    pub fn fake_claude_args(&self) -> Fallible<Vec<String>> {
+        Ok(fs::read_to_string(self.home.join("claude-args"))?
+            .lines()
+            .map(str::to_owned)
+            .collect())
     }
 
     /// The fake agent's file for its first session.
@@ -143,6 +167,39 @@ fn make_repo(repo: &Path) -> Fallible {
     git(repo, &["init", "-q", "-b", "main"])?;
     git(repo, &["add", "-A"])?;
     git(repo, &["commit", "-q", "-m", "first"])
+}
+
+/// A process named `claude` that is not the job's, as the Claude Code a
+/// user keeps open: a copy of `sleep` under that name, killed when dropped.
+pub struct OtherClaude(Child);
+
+impl OtherClaude {
+    /// Starts it under the test's directory.
+    pub fn start(env: &Env) -> Fallible<Self> {
+        let dir = env.root.join("other");
+        fs::create_dir_all(&dir)?;
+        let claude = dir.join("claude");
+        fs::copy("/bin/sleep", &claude)?;
+        let child = Command::new(&claude)
+            .arg("600")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        Ok(Self(child))
+    }
+
+    /// Its process id.
+    pub fn pid(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for OtherClaude {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// Which wire a node dials.

@@ -5,13 +5,16 @@
 //! duplicated answer, and after recovery exactly one node owns the job, the
 //! two ledgers agree on the epoch, the departed copy refuses to run, and the
 //! owner resumes the job with its workspace and its harness session whole.
+//! One more test runs a Claude job on one node beside a running `claude`.
 
 mod world;
 
 use std::fs;
 use std::time::Duration;
 
-use world::{Env, Fallible, Node, Wire, Work, edit, finish, pair, read_work, text, wait_for};
+use world::{
+    Env, Fallible, Node, OtherClaude, Wire, Work, edit, finish, pair, read_work, text, wait_for,
+};
 
 const AGENT: &str = "acp:fabric-fake-agent";
 const WIRES: [Wire; 2] = [Wire::Quic, Wire::TcpTls];
@@ -36,26 +39,30 @@ fn setup(wire: Wire, fault_a: Option<&str>, fault_b: Option<&str>) -> Fallible<P
     Ok(Pair { env, a, b })
 }
 
-/// Makes the job on `a`, runs its first turn and leaves work of every kind in its root.
-fn job_with_work(p: &Pair) -> Fallible<(String, Work)> {
-    let made = p.a.ok(&[
+/// Makes a job from the fixture repository on `node` under `harness` and returns its id.
+fn new_job(env: &Env, node: &Node, harness: &str) -> Fallible<String> {
+    let made = node.ok(&[
         "job",
         "new",
         "--repo",
-        p.env
-            .repo
+        env.repo
             .to_str()
             .ok_or("the repository path is not UTF-8")?,
         "--goal",
         "make the greeting louder",
         "--harness",
-        AGENT,
+        harness,
     ])?;
-    let job = made
+    Ok(made
         .lines()
         .next()
         .ok_or("job new printed nothing")?
-        .to_owned();
+        .to_owned())
+}
+
+/// Makes the job on `a`, runs its first turn and leaves work of every kind in its root.
+fn job_with_work(p: &Pair) -> Fallible<(String, Work)> {
+    let job = new_job(&p.env, &p.a, AGENT)?;
     p.a.ok(&["job", "run", &job, "--prompt", "one"])?;
     let work = edit(&p.env, &job)?;
     Ok((job, work))
@@ -330,4 +337,47 @@ fn e2e_a_steal_needs_force_and_fences_the_sleeping_owner() -> Fallible {
     p.a.start(None)?;
     assert_one_owner(&p.b, &p.a, &job, 2, "replica")?;
     assert_continues(&p, &p.b, &job, &work, &["one"])
+}
+
+/// Gate finding F1: a user keeps Claude Code open, so a `claude` process
+/// runs when a Claude job starts. The trust pre-seed must then leave
+/// `~/.claude.json` to that Claude, say so in one line, and launch; it used
+/// to refuse the run. The process the pre-seed's `pgrep` probe finds is a
+/// real one named `claude`, so the test holds on a machine with no Claude.
+#[test]
+fn e2e_a_claude_job_launches_and_warns_while_another_claude_runs() -> Fallible {
+    let env = Env::new()?;
+    env.install_fake_claude()?;
+    let config = env.home.join(".claude.json");
+    let untrusted = "{\"projects\":{}}\n";
+    fs::write(&config, untrusted)?;
+    let mut a = Node::new(&env, "a", Wire::TcpTls)?;
+    a.start(None)?;
+    let job = new_job(&env, &a, "claude")?;
+    let other = OtherClaude::start(&env)?;
+    let ran = a.ok(&["job", "run", &job, "--prompt", "one"])?;
+    let warning = ran
+        .lines()
+        .find(|line| line.starts_with("warning: Fabric did not trust"))
+        .ok_or_else(|| format!("no trust warning in:\n{ran}"))?;
+    let pids = warning
+        .split_once("claude runs as pid ")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(pids, _)| pids)
+        .ok_or_else(|| format!("the warning names no running claude: {warning}"))?;
+    assert!(
+        pids.split(", ").any(|pid| pid == other.pid().to_string()),
+        "{warning}"
+    );
+    let launched = env.fake_claude_args()?;
+    assert!(
+        launched.iter().any(|arg| arg == "--session-id") && launched.iter().any(|arg| arg == "one"),
+        "{launched:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&config)?,
+        untrusted,
+        "the config was written while claude ran"
+    );
+    Ok(())
 }
