@@ -256,7 +256,7 @@ async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_the
     assert_eq!(
         seen,
         format!(
-            "cwd={}\narg=exec\narg=resume\narg={THREAD}\narg=--json\narg=-c\narg=projects.\"{}\".trust_level=trusted\narg=-c\narg=sandbox_mode=\"workspace-write\"\narg=reply with the secret word\n",
+            "cwd={}\narg=exec\narg=resume\narg={THREAD}\narg=--json\narg=-c\narg=projects.\"{}\".trust_level=trusted\narg=-c\narg=sandbox_mode=\"workspace-write\"\narg=--\narg=reply with the secret word\n",
             work_b.display(),
             work_b.display()
         )

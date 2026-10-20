@@ -14,7 +14,8 @@
 //! Surfaces used, checked against `codex --help`, `codex resume --help`
 //! and `codex exec resume --help` of 0.155.1 on 2026-10-19: `codex resume
 //! <id> [PROMPT]` for the terminal and `codex exec resume <id> [PROMPT]`
-//! for a headless run, both with `-c key=value` overrides. The app-server
+//! for a headless run, both with `-c key=value` overrides. The prompt is
+//! passed after `--`, which clap reads as the end of options. The app-server
 //! JSON-RPC surface is not used (ADR 0006, D14).
 
 pub mod rollout;
@@ -389,7 +390,10 @@ impl Codex {
             args.push(value.clone());
         }
         match prompt {
-            Some(prompt) => args.push(prompt),
+            Some(prompt) => {
+                args.push("--".to_owned());
+                args.push(prompt);
+            }
             None if headless => {
                 return Err(HarnessError::HeadlessNeedsPrompt {
                     program: PROGRAM.to_owned(),
@@ -488,7 +492,7 @@ mod tests {
         ));
         let headless = Launch::Resume {
             session,
-            prompt: Some("reply with the secret word".to_owned()),
+            prompt: Some("--dangerously-bypass-approvals-and-sandbox".to_owned()),
         };
         assert_eq!(
             adapter.args_for(root, &headless, Io::Piped).unwrap(),
@@ -501,7 +505,8 @@ mod tests {
                 "projects.\"/h/fabric/jobs/j/work\".trust_level=trusted",
                 "-c",
                 "sandbox_mode=\"workspace-write\"",
-                "reply with the secret word"
+                "--",
+                "--dangerously-bypass-approvals-and-sandbox"
             ]
         );
     }
