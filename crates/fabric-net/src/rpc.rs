@@ -145,6 +145,14 @@ pub enum RpcError {
         /// The receiver epoch the verdict names.
         current: Epoch,
     },
+    /// The peer's move status names another move than the one asked about.
+    #[error("asked about move {asked}, the peer answered for move {got}")]
+    WrongMove {
+        /// The move asked about.
+        asked: MoveId,
+        /// The move the answer names.
+        got: MoveId,
+    },
     /// An earlier error ended this chunk stream; ask for `missing` in a new request.
     #[error("the chunk stream already failed; ask for the missing chunks again")]
     Interrupted,
@@ -257,6 +265,19 @@ fn check_verdict<T>(sent: Epoch, fenced: &Fenced<T>) -> Result<(), RpcError> {
             yours,
             current,
         })
+    }
+}
+
+/// Accepts a move status only if an undecided answer names the move asked about.
+fn check_move(asked: MoveId, fenced: &Fenced<MoveState>) -> Result<(), RpcError> {
+    match *fenced {
+        Fenced::Answer(MoveState::Undecided { move_id }) if move_id != asked => {
+            Err(RpcError::WrongMove {
+                asked,
+                got: move_id,
+            })
+        }
+        _ => Ok(()),
     }
 }
 
@@ -567,8 +588,11 @@ impl Session {
         move_id: MoveId,
         deadline: Duration,
     ) -> Result<Fenced<MoveState>, RpcError> {
-        self.job(token, JobRequest::MoveStatus { move_id }, deadline)
-            .await
+        let state = self
+            .job(token, JobRequest::MoveStatus { move_id }, deadline)
+            .await?;
+        check_move(move_id, &state)?;
+        Ok(state)
     }
 
     /// Asks the target to decide against `move_id` under `token`, waiting at most `deadline`; returns its decision record.
@@ -1014,6 +1038,18 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    /// An undecided status for another move is not an answer about the move asked.
+    #[test]
+    fn a_move_status_for_another_move_is_refused() {
+        let [asked, other] = [1, 2].map(|n| MoveId::from_bytes([n; 16]));
+        let undecided = |move_id| Fenced::Answer(MoveState::Undecided { move_id });
+        assert!(check_move(asked, &undecided(asked)).is_ok());
+        assert!(matches!(
+            check_move(asked, &undecided(other)),
+            Err(RpcError::WrongMove { asked: a, got }) if a == asked && got == other
+        ));
     }
 
     fn frame(body: ResponseBody) -> Vec<u8> {
