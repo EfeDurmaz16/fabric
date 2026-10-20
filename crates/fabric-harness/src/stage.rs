@@ -370,9 +370,16 @@ pub(crate) fn stage(
 ) -> Result<Staged, HarnessError> {
     let mut sorted: Vec<&Source> = sources.iter().collect();
     sorted.sort_by(|a, b| a.rel.cmp(&b.rel));
-    if let Some(pair) = sorted.windows(2).find(|pair| pair[0].rel == pair[1].rel) {
+    // Two tree paths that differ only in letter case are one file on APFS
+    // and casefolded ext4, here or on the node that restores them.
+    let mut folded: Vec<String> = sorted
+        .iter()
+        .map(|s| s.rel.as_str().to_lowercase())
+        .collect();
+    folded.sort();
+    if let Some(pair) = folded.windows(2).find(|pair| pair[0] == pair[1]) {
         return Err(HarnessError::DuplicateTreePath {
-            path: pair[0].rel.as_str().to_owned(),
+            path: pair[0].clone(),
         });
     }
     for source in &sorted {
@@ -544,7 +551,21 @@ mod tests {
         fs::write(&a, b"a").unwrap();
         fs::write(&b, b"b").unwrap();
         let sources = vec![
-            source(a, "home/x", Carry::Opaque),
+            source(a.clone(), "home/x", Carry::Opaque),
+            source(b.clone(), "home/x", Carry::Opaque),
+        ];
+        let err = stage(
+            &sources,
+            &dir.path().join("out"),
+            &mut RedactionCounts::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, HarnessError::DuplicateTreePath { .. }),
+            "{err}"
+        );
+        let sources = vec![
+            source(a, "home/X", Carry::Opaque),
             source(b, "home/x", Carry::Opaque),
         ];
         let err = stage(

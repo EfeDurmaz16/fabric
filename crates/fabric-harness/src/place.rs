@@ -218,11 +218,17 @@ pub(crate) fn place_all(
     placements: &[Placement],
     unchanged: Unchanged<'_>,
 ) -> Result<Vec<PathBuf>, HarnessError> {
-    let mut dests: Vec<&Path> = placements.iter().map(|p| p.dest.as_path()).collect();
+    // APFS and casefolded ext4 open `A/x` and `a/x` as one file, so two
+    // destinations that differ only in letter case would overwrite each
+    // other; they are refused whatever this file system does.
+    let mut dests: Vec<String> = placements
+        .iter()
+        .map(|p| p.dest.to_string_lossy().to_lowercase())
+        .collect();
     dests.sort();
     if let Some(pair) = dests.windows(2).find(|pair| pair[0] == pair[1]) {
         return Err(HarnessError::DuplicateTreePath {
-            path: pair[0].display().to_string(),
+            path: pair[0].clone(),
         });
     }
     let steps = placements
@@ -286,6 +292,26 @@ mod tests {
 
     fn mode(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn destinations_that_differ_only_in_case_are_refused_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let upper = dir.path().join("out/Memory.md");
+        let lower = dir.path().join("out/memory.md");
+        let err = place_all(
+            &[
+                placement(dir.path(), "a", &upper, b"a", Content::Opaque),
+                placement(dir.path(), "b", &lower, b"b", Content::Opaque),
+            ],
+            &never_left,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, HarnessError::DuplicateTreePath { .. }),
+            "{err}"
+        );
+        assert!(!dir.path().join("out").exists());
     }
 
     #[test]
