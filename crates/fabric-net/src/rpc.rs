@@ -128,6 +128,16 @@ pub enum RpcError {
     /// The peer understood the request and could not serve it.
     #[error("the peer could not serve the request: {0}")]
     Fault(Fault),
+    /// The peer's epoch verdict does not fit the epoch sent: it names another sender epoch, or a current epoch on the wrong side of it.
+    #[error("the peer's epoch verdict says {yours} and {current} for epoch {sent}")]
+    BadVerdict {
+        /// The epoch this side sent in its token.
+        sent: Epoch,
+        /// The sender epoch the verdict names.
+        yours: Epoch,
+        /// The receiver epoch the verdict names.
+        current: Epoch,
+    },
     /// An earlier error ended this chunk stream; ask for `missing` in a new request.
     #[error("the chunk stream already failed; ask for the missing chunks again")]
     Interrupted,
@@ -221,6 +231,26 @@ fn unexpected(expected: &'static str, got: &ResponseBody) -> RpcError {
     RpcError::UnexpectedResponse {
         expected,
         got: kind_of(got),
+    }
+}
+
+/// Refuses an epoch verdict that contradicts the epoch sent: it must name
+/// that epoch as the sender's, a stale one a newer current epoch, and an
+/// ahead-of-us one an older current epoch.
+fn check_verdict<T>(sent: Epoch, fenced: &Fenced<T>) -> Result<(), RpcError> {
+    let (yours, current, fits) = match *fenced {
+        Fenced::Answer(_) => return Ok(()),
+        Fenced::StaleEpoch { yours, current } => (yours, current, current > sent),
+        Fenced::AheadOfUs { yours, current } => (yours, current, current < sent),
+    };
+    if yours == sent && fits {
+        Ok(())
+    } else {
+        Err(RpcError::BadVerdict {
+            sent,
+            yours,
+            current,
+        })
     }
 }
 
@@ -472,10 +502,14 @@ impl Session {
         };
         match self.call(body, deadline).await? {
             ResponseBody::Job(response) => {
-                Fenced::from_response(response).map_err(|other| RpcError::UnexpectedResponse {
-                    expected: T::KIND,
-                    got: other.kind(),
-                })
+                let fenced = Fenced::from_response(response).map_err(|other| {
+                    RpcError::UnexpectedResponse {
+                        expected: T::KIND,
+                        got: other.kind(),
+                    }
+                })?;
+                check_verdict(token.epoch, &fenced)?;
+                Ok(fenced)
             }
             other => Err(unexpected(T::KIND, &other)),
         }
@@ -915,6 +949,29 @@ mod tests {
     use super::*;
 
     const IDLE: Duration = Duration::from_millis(150);
+
+    /// A verdict that names another sender epoch, or puts the current epoch on the wrong side, is not trusted.
+    #[test]
+    fn an_epoch_verdict_that_contradicts_the_sent_epoch_is_refused() {
+        let [one, two, three] = [1, 2, 3].map(|n| Epoch::new(n).unwrap());
+        let stale = |yours, current| Fenced::<Pulled>::StaleEpoch { yours, current };
+        let ahead = |yours, current| Fenced::<Pulled>::AheadOfUs { yours, current };
+        assert!(check_verdict(two, &stale(two, three)).is_ok());
+        assert!(check_verdict(two, &ahead(two, one)).is_ok());
+        for bad in [
+            stale(one, three),
+            stale(two, two),
+            stale(two, one),
+            ahead(three, one),
+            ahead(two, two),
+            ahead(two, three),
+        ] {
+            assert!(
+                matches!(check_verdict(two, &bad), Err(RpcError::BadVerdict { .. })),
+                "{bad:?}"
+            );
+        }
+    }
 
     fn frame(body: ResponseBody) -> Vec<u8> {
         let payload = encode(&Response {
