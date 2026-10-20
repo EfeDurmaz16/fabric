@@ -98,12 +98,18 @@ pub enum BundleKind {
 pub enum IndexFlag {
     /// `git add -N`: `write-tree` leaves the entry out, so restore would make the file plain untracked.
     IntentToAdd,
+    /// Skip-worktree, which sparse checkout sets: `add -A` leaves the path alone, so `W` would hold a file the work tree does not.
+    SkipWorktree,
+    /// `git update-index --assume-unchanged`: `add -A` skips the file, so `W` would hold the index's copy, not the bytes on disk.
+    AssumeUnchanged,
 }
 
 impl std::fmt::Display for IndexFlag {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             IndexFlag::IntentToAdd => "intent-to-add (git add -N)",
+            IndexFlag::SkipWorktree => "skip-worktree (sparse checkout)",
+            IndexFlag::AssumeUnchanged => "assume-unchanged",
         })
     }
 }
@@ -928,6 +934,22 @@ impl GitCapture<'_> {
         if !self.git.run(&["ls-files", "-u", "-z"])?.is_empty() {
             return Err(CaptureError::GitBusy {
                 reason: BusyReason::Conflicts,
+            });
+        }
+        // `ls-files -v` tags a skip-worktree entry `S` and an
+        // assume-unchanged one in lower case.
+        let entries = self.git.run(&["ls-files", "-v", "-z"])?;
+        for record in Git::records(&entries) {
+            let text = Git::text("index entry", record)?;
+            let (tag, path) = text.split_once(' ').unwrap_or((text, ""));
+            let flag = match tag {
+                "S" | "s" => IndexFlag::SkipWorktree,
+                "h" => IndexFlag::AssumeUnchanged,
+                _ => continue,
+            };
+            return Err(CaptureError::GitIndexFlag {
+                path: rel_path(path)?,
+                flag,
             });
         }
         // `--ignore-submodules=none` overrides a `submodule.<name>.ignore`

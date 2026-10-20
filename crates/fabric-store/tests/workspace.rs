@@ -826,6 +826,53 @@ fn an_intent_to_add_entry_is_refused() {
 }
 
 #[test]
+fn a_sparse_checkout_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    make_repo(&root).unwrap();
+    let g = git(&root);
+    g.run(&["stash", "push", "-q", "--include-untracked"])
+        .unwrap();
+    g.run(&["sparse-checkout", "set", "--no-cone", "/a", "/d/"])
+        .unwrap();
+    assert!(!root.join("exec.sh").exists());
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            CaptureError::GitIndexFlag {
+                flag: IndexFlag::SkipWorktree,
+                ..
+            }
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_assume_unchanged_entry_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    make_repo(&root).unwrap();
+    git(&root)
+        .run(&["update-index", "--assume-unchanged", "d/b"])
+        .unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            CaptureError::GitIndexFlag { path, flag: IndexFlag::AssumeUnchanged }
+                if path.as_str() == "d/b"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
 fn an_lfs_filter_on_an_untracked_file_is_refused() {
     let fixture = BusyFixture::new().unwrap();
     // Set only in .git/info/attributes.
