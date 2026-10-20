@@ -87,13 +87,55 @@ const TOKEN_SHAPES: &[TokenShape] = &[
         min_len: 16,
         allowed: upper_alnum,
     },
+    TokenShape {
+        prefix: "sk_live_",
+        min_len: 24,
+        allowed: alnum,
+    },
+    TokenShape {
+        prefix: "sk_test_",
+        min_len: 24,
+        allowed: alnum,
+    },
+    TokenShape {
+        prefix: "rk_live_",
+        min_len: 24,
+        allowed: alnum,
+    },
+    TokenShape {
+        prefix: "rk_test_",
+        min_len: 24,
+        allowed: alnum,
+    },
+    TokenShape {
+        prefix: "AIza",
+        min_len: 35,
+        allowed: alnum_dash_underscore,
+    },
+    TokenShape {
+        prefix: "hf_",
+        min_len: 34,
+        allowed: alnum,
+    },
+    TokenShape {
+        prefix: "pypi-",
+        min_len: 50,
+        allowed: alnum_dash_underscore,
+    },
+    TokenShape {
+        prefix: "glptt-",
+        min_len: 20,
+        allowed: alnum_dash_underscore,
+    },
 ];
 
 /// Returns true when `text` holds something shaped like a credential value.
 ///
-/// Checks the shapes that are certain: GitHub, GitLab, npm and Slack
-/// tokens, `OpenAI` and Anthropic style API keys, AWS access key ids, a PEM
-/// block header and a URL with a password before the host. It is a guard on
+/// Checks the shapes that are certain: GitHub, GitLab (personal and
+/// pipeline trigger), npm, Slack, Hugging Face and `PyPI` tokens, `OpenAI`
+/// and Anthropic style API keys, Stripe secret and restricted keys, Google
+/// API keys, AWS access key ids, a PEM block header and a URL with a
+/// password before the host. It is a guard on
 /// text that will travel, such as setup arguments, not a scanner for files.
 #[must_use]
 pub fn looks_like_credential(text: &str) -> bool {
@@ -145,6 +187,33 @@ mod tests {
             "--index-url=https://u:p@h/x",
         ] {
             assert!(looks_like_credential(text), "{text}");
+        }
+    }
+
+    /// One positive and one near miss per fixed-prefix shape added after
+    /// the review: Stripe, Google, Hugging Face, `PyPI` and GitLab trigger tokens.
+    #[test]
+    fn later_token_shapes_are_recognized_and_their_near_misses_are_not() {
+        let body = "a1B2".repeat(13);
+        let cases = [
+            (
+                format!("--api-key=sk_live_{}", &body[..24]),
+                "sk_live_short",
+            ),
+            (format!("sk_test_{}", &body[..24]), "sk_test_"),
+            (format!("rk_live_{}", &body[..24]), "rk_live_x1"),
+            (
+                format!("rk_test_{}", &body[..24]),
+                "work_test_abcdefghijklmnopqrstuvwxyz",
+            ),
+            (format!("AIza{}", &body[..35]), "AIzaShort"),
+            (format!("hf_{}", &body[..34]), "hf_hub_download"),
+            (format!("pypi-{}", &body[..50]), "pypi-simple-index"),
+            (format!("glptt-{}", &body[..20]), "glptt-x"),
+        ];
+        for (token, near_miss) in cases {
+            assert!(looks_like_credential(&token), "{token}");
+            assert!(!looks_like_credential(near_miss), "{near_miss}");
         }
     }
 
