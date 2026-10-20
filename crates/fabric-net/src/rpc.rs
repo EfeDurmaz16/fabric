@@ -35,7 +35,7 @@ use tokio::time::timeout;
 
 use crate::accept::refresh;
 use crate::frame::{FrameError, MAX_BULK_FRAME, MAX_CONTROL_FRAME, read_frame, write_frame};
-use crate::idle::IdleReader;
+use crate::idle::{IdleReader, StallWriter};
 use crate::tls::Trust;
 use crate::transport::{Connection, Stream, TransportError, TransportKind};
 use crate::wire::{
@@ -57,6 +57,13 @@ pub const TRUST_RECHECK: Duration = Duration::from_secs(5);
 /// 35 KiB/s, and a peer that sends part of a frame and stops gives its
 /// stream back.
 pub const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a reply may wait with no byte taken by the peer before its stream is dropped.
+///
+/// Only time spent waiting on flow control counts, not the time the
+/// service takes, so a peer that asks and then stops reading gives its
+/// stream, and a chunk batch its slot, back.
+pub const REPLY_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The most per-job requests one serving session runs at once, counting work that outlived its caller's budget.
 pub const MAX_JOB_WORK: usize = 16;
@@ -890,7 +897,8 @@ async fn handle(
     service: Arc<dyn Service>,
     limits: &Limits,
 ) -> Result<(), RpcError> {
-    let (mut send, mut recv) = stream.split();
+    let (send, mut recv) = stream.split();
+    let mut send = StallWriter::new(send, REPLY_STALL_TIMEOUT);
     let bytes = timeout(
         REQUEST_READ_TIMEOUT,
         read_frame(&mut recv, MAX_CONTROL_FRAME),
@@ -940,7 +948,7 @@ async fn handle(
         RequestBody::WantChunks(batch) => {
             let Ok(Ok(_run)) = timeout(budget, limits.chunk_runs.acquire()).await else {
                 reply(
-                    send.as_mut(),
+                    &mut send,
                     id,
                     ResponseBody::Fault(Fault::Deadline),
                     MAX_CONTROL_FRAME,
@@ -949,12 +957,12 @@ async fn handle(
                 send.shutdown().await.map_err(FrameError::Io)?;
                 return Ok(());
             };
-            send_chunks(peer, id, batch, budget, send.as_mut(), service.as_ref()).await?;
+            send_chunks(peer, id, batch, budget, &mut send, service.as_ref()).await?;
             send.shutdown().await.map_err(FrameError::Io)?;
             return Ok(());
         }
     };
-    reply(send.as_mut(), id, body, MAX_CONTROL_FRAME).await?;
+    reply(&mut send, id, body, MAX_CONTROL_FRAME).await?;
     send.shutdown().await.map_err(FrameError::Io)?;
     Ok(())
 }
@@ -1244,10 +1252,11 @@ mod tests {
         }
     }
 
-    /// A service that serves nothing; with `hang` set, a pull or a chunk never ends.
+    /// A service that serves nothing; with `hang` set, a pull or a chunk never ends; with `chunk_len` set, every chunk is that many bytes.
     #[derive(Default)]
     struct Nothing {
         hang: bool,
+        chunk_len: usize,
         /// How many pulls and chunks were asked for.
         started: std::sync::atomic::AtomicUsize,
     }
@@ -1311,6 +1320,9 @@ mod tests {
         }
 
         fn chunk(&self, _peer: NodeId, id: ChunkId) -> BoxFuture<'_, Result<Vec<u8>, Fault>> {
+            if self.chunk_len > 0 {
+                return self.start(Ok(vec![0; self.chunk_len]));
+            }
             self.start(Err(Fault::UnknownChunk(id)))
         }
     }
@@ -1423,6 +1435,31 @@ mod tests {
         let mut over = held.pop().unwrap();
         assert!(matches!(over.next().await, Err(RpcError::Deadline(_))));
         assert_eq!(service.started.load(Ordering::SeqCst), MAX_CHUNK_RUNS);
+    }
+
+    /// A peer that asks for chunks and stops reading them loses those
+    /// batches after `REPLY_STALL_TIMEOUT`, so they give their slots back
+    /// instead of holding them as long as keep-alives hold the connection.
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_the_peer_stops_reading_gives_its_slot_back() {
+        let service = Arc::new(Nothing {
+            chunk_len: 4 << 20,
+            ..Nothing::default()
+        });
+        let (session, _serving) = serving_pair(paired(), Arc::clone(&service)).await;
+        let mut unread = Vec::new();
+        for n in 0..MAX_CHUNK_RUNS {
+            let batch = ChunkBatch::new(vec![ChunkId::of(&n.to_le_bytes())]).unwrap();
+            unread.push(session.want_chunks(batch, IDLE).await.unwrap());
+        }
+        tokio::time::sleep(REPLY_STALL_TIMEOUT + IDLE).await;
+        let batch = ChunkBatch::new(vec![ChunkId::of(b"next")]).unwrap();
+        let mut next = session.want_chunks(batch, IDLE).await.unwrap();
+        assert!(
+            matches!(next.next().await, Err(RpcError::ChunkMismatch { .. })),
+            "the batch was not served"
+        );
+        assert_eq!(service.started.load(Ordering::SeqCst), MAX_CHUNK_RUNS + 1);
     }
 
     /// A stream that failed inside a frame never reads again.
