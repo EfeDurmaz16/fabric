@@ -18,6 +18,9 @@ use fabric_harness::claude::ClaudeCode;
 use fabric_harness::claude::slug::slug;
 use fabric_harness::{Harness, SessionId, StateManifest};
 
+mod common;
+use common::fake_claude;
+
 const SID: &str = "7a1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
 const ROLE: &str = "FABRIC_CRASH_ROLE";
 const HOME: &str = "FABRIC_CRASH_HOME";
@@ -30,12 +33,26 @@ fn session() -> SessionId {
     SessionId::parse(SID).unwrap()
 }
 
+/// The adapter for `home`, finding the fake `claude` kept under it.
+fn node(home: &Path) -> ClaudeCode {
+    let (_, path_var) = fake_claude(home);
+    ClaudeCode::new(home.to_path_buf()).with_path_var(path_var)
+}
+
+/// Moves `.claude` to `aside` and leaves a node where Claude is installed
+/// and idle: an empty session registry and no session state.
+fn fresh_node(home: &Path, aside: &Path) {
+    std::fs::rename(home.join(".claude"), aside).unwrap();
+    std::fs::create_dir_all(home.join(".claude/sessions")).unwrap();
+}
+
 /// A home with one large transcript and several sidecars, big enough that
 /// a capture or restore takes well over a second in a debug build.
 fn build_home(home: &Path) -> PathBuf {
     let work = home.join("fabric/jobs/j1/work");
     std::fs::create_dir_all(&work).unwrap();
     let root = work.to_string_lossy().into_owned();
+    std::fs::create_dir_all(home.join(".claude/sessions")).unwrap();
     let project = home.join(".claude/projects").join(slug(&work).unwrap());
     std::fs::create_dir_all(project.join(format!("{SID}/tool-results"))).unwrap();
     let mut transcript = String::new();
@@ -116,7 +133,7 @@ fn crash_child() {
         .enable_all()
         .build()
         .unwrap();
-    let adapter = ClaudeCode::new(home);
+    let adapter = node(&home);
     runtime.block_on(async {
         match role.as_str() {
             "capture" => {
@@ -151,10 +168,8 @@ async fn a_capture_killed_part_way_leaves_no_tree_a_fresh_node_would_accept_by_m
         }
         // A fresh node: same home and workspace path, no Claude state.
         let source_state = home.join(".claude-source");
-        std::fs::rename(home.join(".claude"), &source_state).unwrap();
-        let restore = ClaudeCode::new(home.clone())
-            .restore(&work, out.path())
-            .await;
+        fresh_node(&home, &source_state);
+        let restore = node(&home).restore(&work, out.path()).await;
         if out.path().join("manifest.json").exists() {
             // The manifest is the last write; everything it lists is whole.
             restore.unwrap();
@@ -164,12 +179,13 @@ async fn a_capture_killed_part_way_leaves_no_tree_a_fresh_node_would_accept_by_m
             finished += 1;
         } else {
             assert!(restore.is_err(), "no manifest, so nothing to restore");
-            assert!(!home.join(".claude").exists());
+            assert!(!home.join(".claude/projects").exists());
+            std::fs::remove_dir_all(home.join(".claude")).unwrap();
         }
         std::fs::rename(&source_state, home.join(".claude")).unwrap();
         // Capturing again into a fresh directory is unaffected by what was left.
         let again = tempfile::tempdir().unwrap();
-        ClaudeCode::new(home.clone())
+        node(&home)
             .capture(&work, &session(), again.path())
             .await
             .unwrap();
@@ -190,16 +206,16 @@ async fn a_restore_killed_part_way_places_only_whole_files_and_converges() {
     let source = source_dir.path().canonicalize().unwrap();
     let work = build_home(&source);
     let out = tempfile::tempdir().unwrap();
-    ClaudeCode::new(source.clone())
+    node(&source)
         .capture(&work, &session(), out.path())
         .await
         .unwrap();
 
     // A fresh node: same home and workspace path, no Claude state.
-    std::fs::rename(source.join(".claude"), source.join(".claude-source")).unwrap();
+    fresh_node(&source, &source.join(".claude-source"));
     let target = source.clone();
     let target_work = work.clone();
-    let adapter = ClaudeCode::new(target.clone());
+    let adapter = node(&target);
     let mut killed_mid_way = 0;
     for delay_ms in [5, 30, 120, 400, 1200] {
         if run_child(

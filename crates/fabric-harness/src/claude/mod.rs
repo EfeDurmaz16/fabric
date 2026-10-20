@@ -14,6 +14,9 @@
 //! anything is written. A capture or restore is refused while a `claude`
 //! process registered for the same session is alive, because
 //! `files::place_all` cannot protect a file that is being appended to.
+//! When the registry cannot answer (it is missing, a record does not
+//! parse, or the installed Claude is older than the version it was read
+//! on), any running `claude` refuses them instead.
 //! Login is never copied and no per-job config directory is set:
 //! `CLAUDE_CONFIG_DIR` keys the login (ADR 0006, D15).
 //!
@@ -58,6 +61,18 @@ pub struct ClaudeCode {
     binary: Option<PathBuf>,
     path_var: Option<OsString>,
     flags: Vec<String>,
+}
+
+/// The Claude version whose `~/.claude/sessions/<pid>.json` records this
+/// adapter was checked against.
+const REGISTRY_READ_ON: &[u32] = &[2, 1, 294];
+
+/// What the session registry says about a session.
+enum Registry {
+    /// These live processes registered the session; empty when none did.
+    Answered(Vec<u32>),
+    /// The registry cannot be trusted to answer, for this reason.
+    CannotAnswer(&'static str),
 }
 
 #[derive(Deserialize)]
@@ -169,12 +184,42 @@ impl ClaudeCode {
         process::running_pids(PROGRAM, binary.as_deref()).await
     }
 
-    /// Process ids registered in `~/.claude/sessions/` for `session` that are alive.
-    async fn session_writers(&self, session: &SessionId) -> Result<Vec<u32>, HarnessError> {
+    /// Process ids that may be writing `session` on this node. The session
+    /// registry answers when it exists, every record in it parses and the
+    /// installed Claude is at least the version the registry was read on.
+    /// Otherwise the answer is every `claude` process on the node, so a
+    /// registry this adapter cannot read never reads as "no writer".
+    async fn session_writers(
+        &self,
+        session: &SessionId,
+        version: Option<&str>,
+    ) -> Result<Vec<u32>, HarnessError> {
+        match self.registered_writers(session, version).await? {
+            Registry::Answered(pids) => Ok(pids),
+            Registry::CannotAnswer(reason) => {
+                warn!(%session, reason, "claude: the session registry cannot answer; any running claude blocks");
+                self.running_claude().await
+            }
+        }
+    }
+
+    /// Live process ids that `~/.claude/sessions/` registers for `session`.
+    async fn registered_writers(
+        &self,
+        session: &SessionId,
+        version: Option<&str>,
+    ) -> Result<Registry, HarnessError> {
+        if !version.is_some_and(|v| process::version_at_least(v, REGISTRY_READ_ON)) {
+            return Ok(Registry::CannotAnswer(
+                "the claude version is unknown or older than the registry this adapter reads",
+            ));
+        }
         let dir = self.config_dir.join("sessions");
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Registry::CannotAnswer("there is no session registry"));
+            }
             Err(e) => return Err(HarnessError::io("walk", &dir, e)),
         };
         let mut pids = Vec::new();
@@ -184,16 +229,29 @@ impl ClaudeCode {
                 continue;
             }
             let Ok(bytes) = std::fs::read(&path) else {
-                continue;
+                return Ok(Registry::CannotAnswer("a registry record cannot be read"));
             };
             let Ok(record) = serde_json::from_slice::<SessionRecord>(&bytes) else {
-                continue;
+                return Ok(Registry::CannotAnswer("a registry record does not parse"));
             };
             if record.session_id == session.as_str() && process::pid_alive(record.pid).await? {
                 pids.push(record.pid);
             }
         }
-        Ok(pids)
+        Ok(Registry::Answered(pids))
+    }
+
+    /// The installed version, or `None` when it cannot be learned; a
+    /// failed probe is logged, never fatal.
+    async fn installed_version(&self) -> Option<String> {
+        match self.detect_impl().await {
+            Ok(Some(installed)) => installed.version,
+            Ok(None) => None,
+            Err(e) => {
+                warn!(error = %e, "claude: version probe failed");
+                None
+            }
+        }
     }
 
     /// Sets `projects["<root>"].hasTrustDialogAccepted` in `~/.claude.json`
@@ -427,21 +485,14 @@ impl ClaudeCode {
         out: &Path,
     ) -> Result<StateManifest, HarnessError> {
         let root = harness::physical_workspace(workspace)?;
-        let pids = self.session_writers(session).await?;
+        let version = self.installed_version().await;
+        let pids = self.session_writers(session, version.as_deref()).await?;
         if !pids.is_empty() {
             return Err(HarnessError::HarnessRunning {
                 program: PROGRAM.to_owned(),
                 pids,
             });
         }
-        let version = match self.detect_impl().await {
-            Ok(Some(installed)) => installed.version,
-            Ok(None) => None,
-            Err(e) => {
-                warn!(error = %e, "claude: version probe failed; manifest records none");
-                None
-            }
-        };
         let adapter = self.clone();
         let session = session.clone();
         let out = out.to_path_buf();
@@ -454,7 +505,6 @@ impl ClaudeCode {
         state: &Path,
         manifest: StateManifest,
     ) -> Result<Restored, HarnessError> {
-        harness::same_place(&manifest, root, &self.home)?;
         let root_key = Self::key_of(root)?;
         let mut placements = Vec::with_capacity(manifest.files.len());
         for file in &manifest.files {
@@ -494,7 +544,11 @@ impl ClaudeCode {
                 restoring: HarnessKind::ClaudeCode,
             });
         }
-        let pids = self.session_writers(&manifest.session).await?;
+        harness::same_place(&manifest, &root, &self.home)?;
+        let version = self.installed_version().await;
+        let pids = self
+            .session_writers(&manifest.session, version.as_deref())
+            .await?;
         if !pids.is_empty() {
             return Err(HarnessError::HarnessRunning {
                 program: PROGRAM.to_owned(),

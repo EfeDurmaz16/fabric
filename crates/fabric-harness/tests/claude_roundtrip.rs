@@ -9,8 +9,8 @@
     clippy::expect_used,
     reason = "a failed unwrap inside a test is the test failing"
 )]
-use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 use fabric_core::env::EnvVarName;
@@ -19,6 +19,9 @@ use fabric_harness::claude::ClaudeCode;
 use fabric_harness::claude::slug::slug;
 use fabric_harness::manifest::{Carried, Content, Digest};
 use fabric_harness::{Harness, HarnessError, Io, Launch, SessionId};
+
+mod common;
+use common::fake_claude;
 
 const SID: &str = "9c9796f0-2682-4546-a963-d314b3ad543f";
 const SECRET: &str = "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456";
@@ -137,7 +140,11 @@ fn build_source(work_rel: &str) -> Fixture {
     // Never carried.
     std::fs::write(claude.join(".credentials.json"), "{\"token\":\"x\"}").unwrap();
     std::fs::create_dir_all(claude.join("sessions")).unwrap();
-    std::fs::write(claude.join("sessions/123.json"), "{}").unwrap();
+    std::fs::write(
+        claude.join("sessions/123.json"),
+        "{\"pid\":123,\"sessionId\":\"another-session\",\"cwd\":\"/elsewhere\"}",
+    )
+    .unwrap();
     std::fs::write(home_path.join(".claude.json"), "{\"oauthAccount\":{}}").unwrap();
     // Inside the workspace: the workspace snapshot's business, not this
     // adapter's. The `.git` file under `.claude/worktrees/` is what
@@ -158,17 +165,41 @@ fn build_source(work_rel: &str) -> Fixture {
     Fixture { home, work }
 }
 
-fn fake_claude(dir: &Path) -> (PathBuf, OsString) {
-    let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let script = bin.join("claude");
-    std::fs::write(
-        &script,
-        "#!/bin/sh\n{ echo \"cwd=$(pwd -P)\"; for a in \"$@\"; do echo \"arg=$a\"; done; echo \"home=$HOME\"; echo \"leak=${CARGO_MANIFEST_DIR:-unset}\"; } > \"$FAKE_LOG\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    (script, bin.into_os_string())
+/// A running fake `claude`, killed with its process group on drop.
+struct Held {
+    child: std::process::Child,
+}
+
+impl Held {
+    /// Starts `script hold` in a process group of its own.
+    fn start(script: &Path) -> Self {
+        let child = std::process::Command::new(script)
+            .arg("hold")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        Held { child }
+    }
+
+    /// The process id.
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", self.child.id())])
+            .status();
+        let _ = self.child.wait();
+    }
+}
+
+/// The adapter for `home`, finding the fake `claude` kept under it.
+fn node(home: &Path) -> ClaudeCode {
+    let (_, path_var) = fake_claude(home);
+    ClaudeCode::new(home.to_path_buf()).with_path_var(path_var)
 }
 
 fn session() -> SessionId {
@@ -207,7 +238,7 @@ fn assert_sidecars_redacted(out: &Path, key: &str) {
 async fn capture_carries_session_state_only_and_redacts() {
     let src = build_source("fabric/jobs/j1/work");
     let home = src.home.path().canonicalize().unwrap();
-    let adapter = ClaudeCode::new(home.clone()).with_path_var(OsString::new());
+    let adapter = node(&home);
     let out = tempfile::tempdir().unwrap();
     let manifest = adapter
         .capture(&src.work, &session(), out.path())
@@ -251,7 +282,7 @@ async fn capture_carries_session_state_only_and_redacts() {
             "{denied} was carried: {paths:?}"
         );
     }
-    assert_eq!(manifest.harness_version, None);
+    assert_eq!(manifest.harness_version.as_deref(), Some("2.1.294"));
     let rules: Vec<(&str, u32)> = manifest
         .redactions
         .iter()
@@ -293,14 +324,17 @@ async fn capture_carries_session_state_only_and_redacts() {
 }
 
 /// Moves this node's Claude state aside, as if the job ran on another
-/// node with the same home path; returns where it went.
+/// node with the same home path, where Claude is installed and idle: its
+/// session registry exists and is empty. Returns where the state went.
 fn set_aside(home: &Path, name: &str) -> PathBuf {
     let aside = home.join(name);
     std::fs::rename(home.join(".claude"), &aside).unwrap();
+    std::fs::create_dir_all(home.join(".claude/sessions")).unwrap();
     aside
 }
 
 fn bring_back(home: &Path, aside: &Path) {
+    std::fs::remove_dir_all(home.join(".claude")).unwrap();
     std::fs::rename(aside, home.join(".claude")).unwrap();
 }
 
@@ -329,7 +363,7 @@ async fn restore_under_another_root_or_home_is_refused_before_any_write() {
     let src = build_source("fabric/jobs/j1/work");
     let home = src.home.path().canonicalize().unwrap();
     let out = tempfile::tempdir().unwrap();
-    ClaudeCode::new(home.clone())
+    node(&home)
         .capture(&src.work, &session(), out.path())
         .await
         .unwrap();
@@ -337,7 +371,7 @@ async fn restore_under_another_root_or_home_is_refused_before_any_write() {
 
     let other_root = home.join("other/place");
     std::fs::create_dir_all(&other_root).unwrap();
-    let err = ClaudeCode::new(home.clone())
+    let err = node(&home)
         .restore(&other_root, out.path())
         .await
         .unwrap_err();
@@ -345,13 +379,19 @@ async fn restore_under_another_root_or_home_is_refused_before_any_write() {
 
     let other_home_dir = tempfile::tempdir().unwrap();
     let other_home = other_home_dir.path().canonicalize().unwrap();
-    let err = ClaudeCode::new(other_home.clone())
+    let err = node(&other_home)
         .restore(&src.work, out.path())
         .await
         .unwrap_err();
     assert!(matches!(err, HarnessError::HomeMismatch { .. }), "{err}");
-    assert!(!home.join(".claude").exists(), "nothing was placed");
-    assert!(!other_home.join(".claude").exists(), "nothing was placed");
+    assert!(
+        !home.join(".claude/projects").exists(),
+        "nothing was placed"
+    );
+    assert!(
+        !other_home.join(".claude/projects").exists(),
+        "nothing was placed"
+    );
 }
 
 #[tokio::test]
@@ -359,7 +399,7 @@ async fn restore_on_a_fresh_node_places_the_staged_bytes_and_protects_what_is_th
     let src = build_source("fabric/jobs/j1/work");
     let home = src.home.path().canonicalize().unwrap();
     let out = tempfile::tempdir().unwrap();
-    let adapter = ClaudeCode::new(home.clone());
+    let adapter = node(&home);
     let manifest = adapter
         .capture(&src.work, &session(), out.path())
         .await
@@ -379,7 +419,7 @@ async fn restore_on_a_fresh_node_places_the_staged_bytes_and_protects_what_is_th
         assert_eq!(mode(&placed), 0o600);
     }
     assert!(!home.join(".claude/.credentials.json").exists());
-    assert!(!home.join(".claude/sessions").exists());
+    assert!(!home.join(".claude/sessions/123.json").exists());
 
     // The same bytes again change nothing; a grown transcript is kept.
     let transcript = transcript_under(&home, &src.work);
@@ -414,7 +454,7 @@ async fn a_manifest_naming_a_file_outside_session_state_is_refused() {
     let src = build_source("w");
     let home = src.home.path().canonicalize().unwrap();
     let out = tempfile::tempdir().unwrap();
-    let adapter = ClaudeCode::new(home.clone());
+    let adapter = node(&home);
     let manifest = adapter
         .capture(&src.work, &session(), out.path())
         .await
@@ -446,7 +486,10 @@ async fn a_manifest_naming_a_file_outside_session_state_is_refused() {
             assert!(matches!(err, HarnessError::UnexpectedFile { .. }), "{err}");
         }
         assert!(!home.join(rel.strip_prefix("home/").unwrap()).exists());
-        assert!(!home.join(".claude").exists(), "nothing was placed");
+        assert!(
+            !home.join(".claude/projects").exists(),
+            "nothing was placed"
+        );
     }
     manifest.write(out.path()).unwrap();
     adapter.restore(&src.work, out.path()).await.unwrap();
@@ -459,7 +502,7 @@ async fn a_job_that_leaves_and_comes_back_keeps_the_original_and_gains_the_new_t
     // the way out and grew on the Air.
     let src = build_source("fabric/jobs/j1/work");
     let home = src.home.path().canonicalize().unwrap();
-    let adapter = ClaudeCode::new(home.clone());
+    let adapter = node(&home);
     let transcript = transcript_under(&home, &src.work);
     let original = std::fs::read(&transcript).unwrap();
     let out_1 = tempfile::tempdir().unwrap();
@@ -526,7 +569,7 @@ async fn a_symlink_in_session_state_refuses_the_capture() {
         .join(format!("{SID}/tool-results/link.txt"));
     std::os::unix::fs::symlink(&outside, &results).unwrap();
     let out = tempfile::tempdir().unwrap();
-    let err = ClaudeCode::new(home.clone())
+    let err = node(&home)
         .capture(&src.work, &session(), out.path())
         .await
         .unwrap_err();
@@ -536,7 +579,7 @@ async fn a_symlink_in_session_state_refuses_the_capture() {
     let real = home.join("real.jsonl");
     std::fs::rename(&transcript, &real).unwrap();
     std::os::unix::fs::symlink(&real, &transcript).unwrap();
-    let err = ClaudeCode::new(home.clone())
+    let err = node(&home)
         .capture(&src.work, &session(), out.path())
         .await
         .unwrap_err();
@@ -548,7 +591,7 @@ async fn a_symlink_in_session_state_refuses_the_capture() {
 async fn a_live_session_blocks_capture_and_restore() {
     let src = build_source("w");
     let home = src.home.path().canonicalize().unwrap();
-    let adapter = ClaudeCode::new(home.clone());
+    let adapter = node(&home);
     let out = tempfile::tempdir().unwrap();
     adapter
         .capture(&src.work, &session(), out.path())
@@ -587,11 +630,65 @@ async fn a_live_session_blocks_capture_and_restore() {
 }
 
 #[tokio::test]
+async fn a_registry_record_that_does_not_parse_lets_any_running_claude_block() {
+    // A registry written by another Claude version: the adapter cannot tell
+    // which session the record is for, so every running claude counts.
+    let src = build_source("w");
+    let home = src.home.path().canonicalize().unwrap();
+    let (script, _) = fake_claude(&home);
+    std::fs::write(
+        home.join(".claude/sessions/999.json"),
+        "{\"processId\":999,\"session\":\"x\"}",
+    )
+    .unwrap();
+    let held = Held::start(&script);
+    let out = tempfile::tempdir().unwrap();
+    let err = node(&home)
+        .capture(&src.work, &session(), out.path())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, HarnessError::HarnessRunning { ref pids, .. } if pids.contains(&held.pid())),
+        "{err}"
+    );
+    assert!(!out.path().join("manifest.json").exists());
+}
+
+#[tokio::test]
+async fn a_missing_registry_lets_any_running_claude_block() {
+    // An older Claude keeps no registry; a running one may be resuming
+    // the very session a restore would replace.
+    let src = build_source("w");
+    let home = src.home.path().canonicalize().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    node(&home)
+        .capture(&src.work, &session(), out.path())
+        .await
+        .unwrap();
+    set_aside(&home, ".claude-pro");
+    std::fs::remove_dir_all(home.join(".claude/sessions")).unwrap();
+    let (script, _) = fake_claude(&home);
+    let held = Held::start(&script);
+    let err = node(&home)
+        .restore(&src.work, out.path())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, HarnessError::HarnessRunning { ref pids, .. } if pids.contains(&held.pid())),
+        "{err}"
+    );
+    assert!(
+        !home.join(".claude/projects").exists(),
+        "nothing was placed"
+    );
+}
+
+#[tokio::test]
 async fn a_truncated_staged_file_is_refused_before_anything_is_placed() {
     let src = build_source("w");
     let home = src.home.path().canonicalize().unwrap();
     let out = tempfile::tempdir().unwrap();
-    ClaudeCode::new(home.clone())
+    node(&home)
         .capture(&src.work, &session(), out.path())
         .await
         .unwrap();
@@ -602,12 +699,15 @@ async fn a_truncated_staged_file_is_refused_before_anything_is_placed() {
     let bytes = std::fs::read(&staged).unwrap();
     std::fs::write(&staged, &bytes[..bytes.len() / 2]).unwrap();
     set_aside(&home, ".claude-pro");
-    let err = ClaudeCode::new(home.clone())
+    let err = node(&home)
         .restore(&src.work, out.path())
         .await
         .unwrap_err();
     assert!(matches!(err, HarnessError::StateCorrupt { .. }), "{err}");
-    assert!(!home.join(".claude").exists(), "nothing was placed");
+    assert!(
+        !home.join(".claude/projects").exists(),
+        "nothing was placed"
+    );
 }
 
 #[tokio::test]
@@ -625,11 +725,8 @@ async fn launch_resumes_in_the_workspace_with_exactly_the_given_env() {
             "acceptEdits".to_owned(),
         ]);
 
-    let installed = adapter.detect().await;
-    assert!(
-        matches!(installed, Err(HarnessError::UnexpectedVersionOutput { .. })),
-        "{installed:?}"
-    );
+    let installed = adapter.detect().await.unwrap().unwrap();
+    assert_eq!(installed.version.as_deref(), Some("2.1.294"));
 
     // CARGO_MANIFEST_DIR is set in this test process by cargo; the launch
     // env does not list it, so the fake must see it unset.
@@ -702,7 +799,7 @@ async fn launch_resumes_in_the_workspace_with_exactly_the_given_env() {
 async fn missing_session_and_latest_session_are_reported() {
     let src = build_source("w");
     let home = src.home.path().canonicalize().unwrap();
-    let adapter = ClaudeCode::new(home);
+    let adapter = node(&home);
     assert_eq!(adapter.latest_session(&src.work).unwrap(), Some(session()));
     let out = tempfile::tempdir().unwrap();
     let missing = SessionId::parse("00000000-0000-0000-0000-000000000000").unwrap();
