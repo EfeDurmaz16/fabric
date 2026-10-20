@@ -441,6 +441,9 @@ impl Codex {
         version: Option<String>,
     ) -> Result<StateManifest, HarnessError> {
         let home_parts = self.codex_home_parts()?;
+        // Listing rollouts and taking the lock start at the store and would
+        // follow it, or a directory above it, if it were a link.
+        pipeline::refuse_symlinks(self.home_dir(), &self.store)?;
         let lock = self.hold_writer_lock(session)?;
         let chain = self.lineage(session)?;
         let mut sources = Vec::with_capacity(chain.len());
@@ -565,6 +568,7 @@ impl Codex {
             }
         }
         let chain = lineage_in(&staged, &session, state)?;
+        pipeline::refuse_symlinks(self.home_dir(), &self.store)?;
         let lock = self.hold_writer_lock(&session)?;
         let existing = self.all_rollouts()?;
         let fallback_dir = self
