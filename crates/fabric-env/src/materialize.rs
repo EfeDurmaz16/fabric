@@ -1,14 +1,13 @@
 //! Materialize: make a restored workspace runnable on this node (ADR 0007).
 //!
-//! Invariant: `plan` only reads. It never runs a program and never writes
-//! a byte, so a dry run is `plan` and nothing more; the one thing it does
+//! Invariant: `plan` only reads. It never runs a program and never writes a
+//! byte, so a dry run is `plan` and nothing more; the one thing it does
 //! besides reading is try the lock below, which it releases at once.
-//! `Plan::ready` turns a
-//! plan into steps that can run, and refuses when the plan shows that one
-//! cannot: a program missing from `PATH` or a declared environment variable
-//! missing from this node. `Ready::execute` runs exactly those steps, with
-//! the program paths and directories the plan resolved. Neither value can
-//! be copied, so one plan runs at most once.
+//! `Plan::ready` turns a plan into steps that can run, and refuses when the
+//! plan shows that one cannot: a program missing from `PATH` or a declared
+//! environment variable missing from this node. `Ready::execute` runs
+//! exactly those steps, with the program paths and directories the plan
+//! resolved. Neither value can be copied, so one plan runs at most once.
 //!
 //! A `CachesMissing` step runs when what it fills is not whole: a detected
 //! install runs when its own cache is not, and a declared step when one of
@@ -104,6 +103,9 @@ pub enum MaterializeError {
         "a setup step from an earlier resume is still running in this workspace; wait for it to exit or stop the process that holds `{LOCK_FILE}` open"
     )]
     InstallerRunning,
+    /// `.fabric` or the lock file in it is a link or not what it should be: a directory and a regular file.
+    #[error("`{LOCK_FILE}` or its directory is a link or not a regular file; remove it")]
+    LockNotRegular,
     /// The lock file could not be opened, created or locked.
     #[error("could not take the lock `{LOCK_FILE}`")]
     Lock {
@@ -544,32 +546,28 @@ fn inspect(root: &Path, cache: &CachePath) -> Result<CacheHealth, MaterializeErr
 /// Opens the file read-only and writes nothing; the lock it takes ends
 /// when the file closes at the end of this call.
 fn check_unlocked(root: &Path) -> Result<(), MaterializeError> {
-    let lock_err = |source| MaterializeError::Lock { source };
-    let file = match fs::File::open(root.join(LOCK_FILE)) {
-        Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(lock_err(err)),
-    };
-    try_lock(&file)
+    let path = root.join(LOCK_FILE);
+    if !lock_dir_exists(&path)? {
+        return Ok(());
+    }
+    match open_existing_lock(&path)? {
+        Some(file) => try_lock(&file),
+        None => Ok(()),
+    }
 }
 
 /// Opens `LOCK_FILE`, creating it and `.fabric` when absent, and locks it.
 ///
-/// Neither `.fabric` nor the file may be a link: the file is created with
-/// `create_new`, which never follows one, and an existing file must be the
-/// regular file the link check saw, by device and inode.
+/// Neither `.fabric` nor the file may be a link or anything but what it
+/// should be: a FIFO would block the open, and a link would put the lock,
+/// or a new file, outside the workspace. The file is created with
+/// `create_new`, which never follows a link.
 fn take_lock(root: &Path) -> Result<fs::File, MaterializeError> {
     let lock_err = |source| MaterializeError::Lock { source };
-    let not_regular = || lock_err(io::Error::from(io::ErrorKind::InvalidInput));
     let path = root.join(LOCK_FILE);
-    let dir = path.parent().ok_or_else(not_regular)?;
-    match fs::symlink_metadata(dir) {
-        Ok(meta) if meta.is_dir() => {}
-        Ok(_) => return Err(not_regular()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(dir).map_err(lock_err)?;
-        }
-        Err(err) => return Err(lock_err(err)),
+    if !lock_dir_exists(&path)? {
+        let dir = path.parent().ok_or(MaterializeError::LockNotRegular)?;
+        fs::create_dir(dir).map_err(lock_err)?;
     }
     let file = match fs::OpenOptions::new()
         .read(true)
@@ -579,18 +577,43 @@ fn take_lock(root: &Path) -> Result<fs::File, MaterializeError> {
     {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            let seen = fs::symlink_metadata(&path).map_err(lock_err)?;
-            let file = fs::File::open(&path).map_err(lock_err)?;
-            let opened = file.metadata().map_err(lock_err)?;
-            if !seen.is_file() || opened.dev() != seen.dev() || opened.ino() != seen.ino() {
-                return Err(not_regular());
-            }
-            file
+            open_existing_lock(&path)?.ok_or(MaterializeError::LockNotRegular)?
         }
         Err(err) => return Err(lock_err(err)),
     };
     try_lock(&file)?;
     Ok(file)
+}
+
+/// Returns whether the directory that holds the lock file exists; it must be a real directory when it does.
+fn lock_dir_exists(path: &Path) -> Result<bool, MaterializeError> {
+    let dir = path.parent().ok_or(MaterializeError::LockNotRegular)?;
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.is_dir() => Ok(true),
+        Ok(_) => Err(MaterializeError::LockNotRegular),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(MaterializeError::Lock { source }),
+    }
+}
+
+/// Opens the lock file read-only when it exists, after checking it is a regular file and before trusting the handle.
+///
+/// The check before the open keeps a FIFO from blocking it; the device
+/// and inode check after it catches a swap between the two.
+fn open_existing_lock(path: &Path) -> Result<Option<fs::File>, MaterializeError> {
+    let lock_err = |source| MaterializeError::Lock { source };
+    let seen = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => meta,
+        Ok(_) => return Err(MaterializeError::LockNotRegular),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(lock_err(err)),
+    };
+    let file = fs::File::open(path).map_err(lock_err)?;
+    let opened = file.metadata().map_err(lock_err)?;
+    if !opened.is_file() || opened.dev() != seen.dev() || opened.ino() != seen.ino() {
+        return Err(MaterializeError::LockNotRegular);
+    }
+    Ok(Some(file))
 }
 
 /// Takes the exclusive lock on `file` without waiting.

@@ -669,3 +669,26 @@ program = "true"
     assert!(!outside.path().join("out").join(SENTINEL).exists());
     assert!(outside.path().join("kept").join(SENTINEL).exists());
 }
+
+/// A lock file that is a link would put the lock, or a new file, outside
+/// the workspace, so plan and execute refuse it before opening it.
+#[test]
+fn a_linked_lock_file_is_refused() {
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("lock"), "").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let detected = declared(
+        dir.path(),
+        "[[setup]]\nprogram = \"true\"\nwhen = \"always\"\n",
+    )
+    .unwrap();
+    symlink(
+        outside.path().join("lock"),
+        dir.path().join(".fabric/materialize.lock"),
+    )
+    .unwrap();
+    assert!(matches!(
+        plan(&detected),
+        Err(MaterializeError::LockNotRegular)
+    ));
+}
