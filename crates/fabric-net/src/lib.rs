@@ -1,5 +1,6 @@
-//! The network layer of Fabric (ADR 0005): node identity, pinned TLS, two
-//! transports, framing, typed RPC and the peer book.
+//! The network layer of Fabric (ADR 0005, as built in ADR 0013): node
+//! identity, pinned TLS, two transports, framing, typed RPC and the peer
+//! book.
 //!
 //! Invariant: an application byte is read from or written to a peer only
 //! after a TLS 1.3 handshake in which the peer proved it holds the private
@@ -21,7 +22,7 @@ pub mod endpoint;
 pub mod frame;
 pub mod identity;
 mod idle;
-pub mod mux;
+mod mux;
 pub mod peers;
 mod pipe;
 pub mod quic;

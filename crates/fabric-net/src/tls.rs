@@ -32,7 +32,7 @@ use rustls::{
 use crate::identity::NodeIdentity;
 
 /// The DER prefix of an ed25519 `SubjectPublicKeyInfo`; the 32 key bytes follow it.
-pub const ED25519_SPKI_PREFIX: [u8; 12] = [
+pub(crate) const ED25519_SPKI_PREFIX: [u8; 12] = [
     0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
 ];
 
@@ -99,7 +99,7 @@ pub(crate) fn provider() -> Arc<CryptoProvider> {
 }
 
 /// Reads the node id out of a certificate: its ed25519 public key.
-pub fn node_id_of(cert: &CertificateDer<'_>) -> Result<NodeId, TlsError> {
+pub(crate) fn node_id_of(cert: &CertificateDer<'_>) -> Result<NodeId, TlsError> {
     let cert = webpki::EndEntityCert::try_from(cert).map_err(|_| TlsError::BadCertificate)?;
     let spki = cert.subject_public_key_info();
     let (prefix, key) = spki

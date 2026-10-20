@@ -68,7 +68,7 @@ pub enum FrameError {
 }
 
 /// Writes one frame, refusing a payload that would exceed `max`.
-pub async fn write_frame<W: AsyncWrite + Unpin + ?Sized>(
+pub(crate) async fn write_frame<W: AsyncWrite + Unpin + ?Sized>(
     writer: &mut W,
     payload: &[u8],
     max: usize,
@@ -87,7 +87,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin + ?Sized>(
 }
 
 /// Reads one frame's payload, refusing a declared length above `max` before allocating.
-pub async fn read_frame<R: AsyncRead + Unpin + ?Sized>(
+pub(crate) async fn read_frame<R: AsyncRead + Unpin + ?Sized>(
     reader: &mut R,
     max: usize,
 ) -> Result<Vec<u8>, FrameError> {

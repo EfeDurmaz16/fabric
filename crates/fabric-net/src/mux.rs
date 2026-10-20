@@ -51,13 +51,13 @@ use crate::quic::{IDLE_TIMEOUT, KEEP_ALIVE};
 use crate::transport::{Connection, Stream, TransportError, TransportKind};
 
 /// The most payload bytes in one multiplexer frame.
-pub const MAX_MUX_PAYLOAD: usize = 64 << 10;
+pub(crate) const MAX_MUX_PAYLOAD: usize = 64 << 10;
 
 /// The credit each direction of a stream starts with, and the bytes its receiver buffers.
-pub const STREAM_BUFFER: usize = 1 << 20;
+pub(crate) const STREAM_BUFFER: usize = 1 << 20;
 
 /// The most streams either side may hold open on one connection, quinn's default.
-pub const MAX_STREAMS: usize = 100;
+pub(crate) const MAX_STREAMS: usize = 100;
 
 /// A receiver hands credit back once its reader took this many bytes.
 const CREDIT_STEP: usize = STREAM_BUFFER / 4;
