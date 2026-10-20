@@ -1194,6 +1194,41 @@ fn a_restore_whose_bundle_base_is_gone_names_it() {
     );
 }
 
+/// Captures a branch named `before`, replaces it with `after` and restores the incremental snapshot.
+fn rename_branch_across_an_incremental_link(before: &str, after: &str) -> Fallible {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("work");
+    one_commit_repo(&root)?;
+    let g = git(&root);
+    g.run(&["branch", before])?;
+    let mut store = store_in(dir.path())?;
+    let policy = IgnorePolicy::default();
+    let first = capture(&store, &request(&root, &policy, None))?;
+    let s1 = store.publish(&first.manifest)?;
+
+    g.run(&["branch", "-D", before])?;
+    g.run(&["commit", "-q", "--allow-empty", "-m", "two"])?;
+    g.run(&["branch", after])?;
+    let second = capture(&store, &request(&root, &policy, Some(s1)))?;
+    assert_eq!(second.report.bundle, Some(BundleKind::Incremental));
+    let s2 = store.publish(&second.manifest)?;
+
+    let target = dir.path().join("restored");
+    restore_into(&store, s2, &target)?;
+    assert_eq!(git_difference(&root, &target)?, None);
+    Ok(())
+}
+
+#[test]
+fn a_branch_that_becomes_a_directory_of_branches_restores() {
+    rename_branch_across_an_incremental_link("feature", "feature/x").unwrap();
+}
+
+#[test]
+fn a_directory_of_branches_that_becomes_a_branch_restores() {
+    rename_branch_across_an_incremental_link("feature/x", "feature").unwrap();
+}
+
 #[test]
 fn a_config_value_the_projection_refuses_is_named() {
     let dir = tempfile::tempdir().unwrap();

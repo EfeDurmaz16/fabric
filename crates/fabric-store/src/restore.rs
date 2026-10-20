@@ -83,7 +83,7 @@ pub struct RestoreReport {
     pub submodules: Vec<RelPath>,
     /// Symlinks written whose target is absolute or climbs above the root.
     pub escaping_symlinks: Vec<RelPath>,
-    /// Bundles fetched into the repository.
+    /// Bundles unpacked into the repository.
     pub bundles_fetched: u32,
 }
 
@@ -544,6 +544,87 @@ struct StagingTarget<'a> {
     durability: Durability,
 }
 
+/// Unpacks every bundle of the chain that ends at `manifest`, oldest first, into `git`'s repository.
+///
+/// Unbundling indexes each pack and writes no refs, so the refs an older
+/// link lists can never collide with the ones `set_refs` writes.
+fn unbundle_chain(
+    store: &Store,
+    snapshot: SnapshotId,
+    manifest: &SnapshotManifest,
+    git: &Git,
+    report: &mut RestoreReport,
+) -> Result<(), RestoreError> {
+    // The chain of bundles, oldest first.
+    let mut chain = vec![manifest.clone()];
+    loop {
+        let base = chain
+            .last()
+            .and_then(|m| m.git.as_ref())
+            .and_then(|g| g.bundle_base);
+        let Some(base) = base else { break };
+        match store.manifest(base) {
+            Ok(m) => chain.push(m),
+            Err(StoreError::UnknownSnapshot(_)) => {
+                return Err(RestoreError::BundleChainBroken { snapshot, base });
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    chain.reverse();
+    for link in &chain {
+        let Some(state) = &link.git else { continue };
+        if state.bundle.is_empty() {
+            continue;
+        }
+        let bundle = TempFile::in_dir(store.objects().tmp_dir());
+        let path = bundle.path();
+        {
+            let mut file = fs::File::create(path).map_err(|e| io_err(path, e))?;
+            for chunk in &state.bundle {
+                file.write_all(&store.objects().read(*chunk)?)
+                    .map_err(|e| io_err(path, e))?;
+            }
+        }
+        let path_text = path.to_string_lossy().into_owned();
+        git.run(&["bundle", "verify", &path_text])?;
+        git.run(&["bundle", "unbundle", &path_text])?;
+        report.bundles_fetched += 1;
+    }
+    Ok(())
+}
+
+/// Sets every ref and `HEAD` exactly as `git_state` records them.
+fn set_refs(git: &Git, git_state: &GitState) -> Result<(), RestoreError> {
+    for (name, oid) in &git_state.refs {
+        if name.as_str() == "refs/stash" {
+            // `git stash list` prints the reflog message, so the entry gets
+            // the stash commit's own subject back.
+            let subject = git.run_text(&["log", "-1", "--format=%s", oid.as_str()])?;
+            git.run(&[
+                "update-ref",
+                "--create-reflog",
+                "-m",
+                &subject,
+                "refs/stash",
+                oid.as_str(),
+            ])?;
+        } else {
+            git.run(&["update-ref", name.as_str(), oid.as_str()])?;
+        }
+    }
+    match &git_state.head {
+        GitHead::Branch(branch) => {
+            let full = format!("refs/heads/{branch}");
+            git.run(&["symbolic-ref", "HEAD", &full])?;
+        }
+        GitHead::Detached(oid) => {
+            git.run(&["update-ref", "--no-deref", "HEAD", oid.as_str()])?;
+        }
+    }
+    Ok(())
+}
+
 /// Restores the repository: objects, refs, `HEAD`, the index and the working tree.
 fn restore_git(
     store: &Store,
@@ -579,82 +660,8 @@ fn restore_git(
         }
     }
 
-    // The chain of bundles, oldest first.
-    let mut chain = vec![manifest.clone()];
-    loop {
-        let base = chain
-            .last()
-            .and_then(|m| m.git.as_ref())
-            .and_then(|g| g.bundle_base);
-        let Some(base) = base else { break };
-        match store.manifest(base) {
-            Ok(m) => chain.push(m),
-            Err(StoreError::UnknownSnapshot(_)) => {
-                return Err(RestoreError::BundleChainBroken { snapshot, base });
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-    chain.reverse();
-    for link in &chain {
-        let Some(state) = &link.git else { continue };
-        if state.bundle.is_empty() {
-            continue;
-        }
-        let bundle = TempFile::in_dir(store.objects().tmp_dir());
-        let path = bundle.path();
-        {
-            let mut file = fs::File::create(path).map_err(|e| io_err(path, e))?;
-            for chunk in &state.bundle {
-                file.write_all(&store.objects().read(*chunk)?)
-                    .map_err(|e| io_err(path, e))?;
-            }
-        }
-        let path_text = path.to_string_lossy().into_owned();
-        git.run(&["bundle", "verify", &path_text])?;
-        git.run(&[
-            "fetch",
-            "-q",
-            "--update-head-ok",
-            &path_text,
-            "+refs/*:refs/*",
-        ])?;
-        report.bundles_fetched += 1;
-    }
-
-    let existing = git.run_text(&["for-each-ref", "--format=%(refname)"])?;
-    for name in existing.lines() {
-        if !git_state.refs.iter().any(|(r, _)| r.as_str() == name) {
-            git.run(&["update-ref", "-d", name])?;
-        }
-    }
-    for (name, oid) in &git_state.refs {
-        if name.as_str() == "refs/stash" {
-            // `git stash list` prints the reflog message, so the entry gets
-            // the stash commit's own subject back.
-            let subject = git.run_text(&["log", "-1", "--format=%s", oid.as_str()])?;
-            let _ = git.output(&["update-ref", "-d", "refs/stash"], &[])?;
-            git.run(&[
-                "update-ref",
-                "--create-reflog",
-                "-m",
-                &subject,
-                "refs/stash",
-                oid.as_str(),
-            ])?;
-        } else {
-            git.run(&["update-ref", name.as_str(), oid.as_str()])?;
-        }
-    }
-    match &git_state.head {
-        GitHead::Branch(branch) => {
-            let full = format!("refs/heads/{branch}");
-            git.run(&["symbolic-ref", "HEAD", &full])?;
-        }
-        GitHead::Detached(oid) => {
-            git.run(&["update-ref", "--no-deref", "HEAD", oid.as_str()])?;
-        }
-    }
+    unbundle_chain(store, snapshot, manifest, &git, report)?;
+    set_refs(&git, git_state)?;
     git.run(&["read-tree", git_state.index_commit.as_str()])?;
 
     let listing = git.run(&["ls-tree", "-r", "-z", git_state.worktree_commit.as_str()])?;
