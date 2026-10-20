@@ -330,6 +330,10 @@ fn e2e_a_duplicated_import_answer_changes_nothing() -> Fallible {
         let p = setup(wire, Some("after_import_receipt:dup"), None)?;
         let (job, work) = job_with_work(&p)?;
         p.a.ok(&["job", "move", &job, "--to", &p.b.id])?;
+        assert!(
+            p.a.log().contains("fault point reached"),
+            "the fault did not fire"
+        );
         assert_one_owner(&p.b, &p.a, &job, 2, "departed")?;
         let log = p.a.ok(&["job", "log", &job])?;
         assert_eq!(log.matches("MoveImported").count(), 1, "{log}");
@@ -360,6 +364,89 @@ fn e2e_a_steal_needs_force_and_fences_the_sleeping_owner() -> Fallible {
     p.a.start(None)?;
     assert_one_owner(&p.b, &p.a, &job, 2, "replica")?;
     assert_continues(&p, &p.b, &job, &work, &["one"])
+}
+
+/// A move stops the harness that runs on its source, whichever way it is
+/// typed: a push from the node that runs it, and a pull from the other
+/// node. Each stopped harness exits by its signal, and its last turn is in
+/// the snapshot the job moves with.
+#[test]
+fn e2e_a_move_stops_the_harness_running_on_its_source() -> Fallible {
+    let p = setup(Wire::TcpTls, None, None)?;
+    let (job, work) = job_with_work(&p)?;
+    let (running, pid) = p.a.run_lingering(&job)?;
+    p.a.ok(&["job", "move", &job, "--to", &p.b.id])?;
+    let output = finish(running, GIVE_UP)?;
+    assert_eq!(output.status.code(), Some(128 + 15), "{}", text(&output));
+    assert!(!alive(pid), "the pushed job's harness still runs");
+    assert_one_owner(&p.b, &p.a, &job, 2, "departed")?;
+    assert_continues(&p, &p.b, &job, &work, &["one", "two"])?;
+
+    let (running, pid) = p.b.run_lingering(&job)?;
+    p.a.ok(&["job", "resume", &job, "--prompt", "back"])?;
+    let output = finish(running, GIVE_UP)?;
+    assert_eq!(output.status.code(), Some(128 + 15), "{}", text(&output));
+    assert!(
+        !alive(pid),
+        "the pulled job's harness still runs on its holder"
+    );
+    assert_one_owner(&p.a, &p.b, &job, 3, "departed")?;
+    assert_eq!(p.env.prompts()?, ["one", "two", "next", "two", "back"]);
+    Ok(())
+}
+
+/// Moves the job to `b` so that a pull typed on `a` brings it back.
+fn job_on_b(p: &Pair) -> Fallible<(String, Work)> {
+    let (job, work) = job_with_work(p)?;
+    p.a.ok(&["job", "move", &job, "--to", &p.b.id])?;
+    Ok((job, work))
+}
+
+/// A pull broken on the holder after it wrote `MoveStarted` toward the
+/// puller: the holder is frozen, not runnable, and the pull typed again
+/// converges on one owner.
+#[test]
+fn e2e_holder_killed_after_departing_write_in_a_pull() -> Fallible {
+    let mut p = setup(Wire::TcpTls, None, Some("after_departing_write"))?;
+    let (job, work) = job_on_b(&p)?;
+    let pulling = p.a.spawn(&["job", "resume", &job, "--prompt", "back"])?;
+    wait_for(&p.b.signal(), "the fault point")?;
+    p.b.kill()?;
+    let output = finish(pulling, GIVE_UP)?;
+    assert!(!output.status.success(), "{}", text(&output));
+    p.b.start(None)?;
+    assert_eq!(p.b.lease(&job)?.view, "departing");
+    let refusal = p.b.fails(&["job", "run", &job])?;
+    assert!(refusal.contains("departing"), "{refusal}");
+    fs::remove_file(p.env.session_file())?;
+    p.a.ok(&["job", "resume", &job, "--prompt", "back"])?;
+    assert_one_owner(&p.a, &p.b, &job, 3, "departed")?;
+    assert_eq!(read_work(&p.env, &job)?, work);
+    assert_eq!(p.env.prompts()?, ["one", "back"]);
+    Ok(())
+}
+
+/// A pull broken on the puller after it learned the holder's `MoveStarted`
+/// and before it imported: nothing owns the job but the holder's open
+/// move, and the pull typed again imports it.
+#[test]
+fn e2e_puller_killed_before_import() -> Fallible {
+    let mut p = setup(Wire::TcpTls, Some("before_import"), None)?;
+    let (job, work) = job_on_b(&p)?;
+    let pulling = p.a.spawn(&["job", "resume", &job, "--prompt", "back"])?;
+    wait_for(&p.a.signal(), "the fault point")?;
+    p.a.kill()?;
+    let output = finish(pulling, GIVE_UP)?;
+    assert!(!output.status.success(), "{}", text(&output));
+    p.a.start(None)?;
+    assert_eq!(p.b.lease(&job)?.view, "departing");
+    assert_ne!(p.a.lease(&job)?.view, "owner");
+    fs::remove_file(p.env.session_file())?;
+    p.a.ok(&["job", "resume", &job, "--prompt", "back"])?;
+    assert_one_owner(&p.a, &p.b, &job, 3, "departed")?;
+    assert_eq!(read_work(&p.env, &job)?, work);
+    assert_eq!(p.env.prompts()?, ["one", "back"]);
+    Ok(())
 }
 
 /// The owner suspended, then resumed and runs the job while another node

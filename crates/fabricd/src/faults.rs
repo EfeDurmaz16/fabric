@@ -28,6 +28,8 @@ pub enum Point {
     AfterDepartingWrite,
     /// The target stored some of a snapshot's chunks and not all.
     MidTransfer,
+    /// A pulling node holds the owner's `MoveStarted` toward it and has not imported yet.
+    BeforeImport,
     /// The target made `MoveImported` durable and did not answer yet; on the
     /// source, the answer just arrived.
     AfterImportReceipt,
@@ -36,11 +38,12 @@ pub enum Point {
 impl Point {
     /// Every point, for parsing.
     #[cfg(feature = "faults")]
-    const ALL: [Point; 5] = [
+    const ALL: [Point; 6] = [
         Point::AfterQuiesce,
         Point::AfterSnapshotPublish,
         Point::AfterDepartingWrite,
         Point::MidTransfer,
+        Point::BeforeImport,
         Point::AfterImportReceipt,
     ];
 
@@ -50,6 +53,7 @@ impl Point {
             Point::AfterSnapshotPublish => "after_snapshot_publish",
             Point::AfterDepartingWrite => "after_departing_write",
             Point::MidTransfer => "mid_transfer",
+            Point::BeforeImport => "before_import",
             Point::AfterImportReceipt => "after_import_receipt",
         }
     }

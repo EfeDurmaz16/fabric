@@ -125,7 +125,7 @@ Capture measures carry keys with `fabric-env` detection: a cache detection does 
 
 ### Fault points
 
-`fabricd` has a `faults` feature, on only in the end-to-end test's build. With it, `FABRIC_FAULT=<point>[:<action>]` arms one of `after_quiesce`, `after_snapshot_publish`, `after_departing_write`, `mid_transfer` and `after_import_receipt`, with `crash` (stop, write the signal file, wait for `SIGKILL`), `stall` (two seconds), `hold` (until the test removes the signal file), `drop` or `dup`. A point fires once per daemon process. The value is read once at start, and one that names an unknown point or action stops the node there. Without the feature the functions are empty and nothing reads the environment.
+`fabricd` has a `faults` feature, on only in the end-to-end test's build. With it, `FABRIC_FAULT=<point>[:<action>]` arms one of `after_quiesce`, `after_snapshot_publish`, `after_departing_write` (on the source of a push, or on the holder answering a pull), `mid_transfer`, `before_import` (on a pulling node that holds the `MoveStarted` toward it) and `after_import_receipt`, with `crash` (stop, write the signal file, wait for `SIGKILL`), `stall` (two seconds), `hold` (until the test removes the signal file), `drop` or `dup`. A point fires once per daemon process. The value is read once at start, and one that names an unknown point or action stops the node there. Without the feature the functions are empty and nothing reads the environment.
 
 ## Alternatives considered
 
@@ -139,7 +139,7 @@ Capture measures carry keys with `fabric-env` detection: a cache detection does 
 
 - The first gate can be run by hand: build on the Pro, copy the binary to the Air, `fabric serve` on both, pair, `job new`, `run`, `move --to`, `resume`. The README's quickstart is that sequence.
 - `fabric job move` and a pulling `fabric job resume` suspend the harness on the source: a pull from a node where the harness runs stops it there.
-- Tests: the ledger file's torn tail, damaged middle record, manifest ahead of the ledger and a writer killed with `SIGKILL` mid-append; a reused pid; the doctor table row by row; the root rules; carry key comparisons; and the end-to-end test, which runs two daemons over loopback on QUIC and on TCP+TLS, moves a job and back, breaks the move at each fault point with `SIGKILL` of either daemon or a dropped or duplicated answer, and asserts after recovery that both ledgers name one owner at one epoch, the departed copy refuses to run, and the owner resumes the workspace and the harness session whole.
+- Tests: the ledger file's torn tail, damaged middle record, manifest ahead of the ledger and a writer killed with `SIGKILL` mid-append; a reused pid; the doctor table row by row; the root rules; carry key comparisons; and the end-to-end test, which runs two daemons over loopback on QUIC and on TCP+TLS, moves a job and back, breaks the push at each fault point and the pull on the holder after its `MoveStarted` and on the puller before its import, with `SIGKILL` of either daemon or a dropped or duplicated answer, and asserts after recovery that both ledgers name one owner at one epoch, the departed copy refuses to run, and the owner resumes the workspace and the harness session whole. With a fake agent that stays alive after its turn it asserts that a push, a pull and a steal stop the harness on the node that loses the job, that a run during a move's transfer stops the move, and that a node whose ledger forked freezes the job, whether the steal reached it at once or at its next run.
 
 ## Open questions
 

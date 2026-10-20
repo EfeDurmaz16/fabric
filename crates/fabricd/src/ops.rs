@@ -1305,6 +1305,7 @@ impl Node {
         out.say(format!("{holder} started move {move_id} toward this node"));
         self.pull_records(id, holder).await?;
         self.ensure_latest(id, holder).await?;
+        faults::hit(Point::BeforeImport).await;
         {
             let job = self.job(id).await?;
             let mut job = job.lock().await;
