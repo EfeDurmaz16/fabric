@@ -5,7 +5,9 @@
 //! `session/prompt`, `session/cancel`, `session/update`), answers every
 //! agent request so the agent never blocks, and grants a permission only
 //! when the policy the caller chose says so, never more than it says. Deny
-//! is the default. At most `UPDATE_BUFFER` `session/update` notifications
+//! is the default. Once a turn is cancelled, every permission request for
+//! its session is answered `cancelled` until the next prompt, as the
+//! schema asks of `session/cancel`, so no tool runs after a cancel. At most `UPDATE_BUFFER` `session/update` notifications
 //! wait for `next_update`; newer ones are dropped and counted in
 //! `dropped_updates`, so the reader never waits on a caller who is not
 //! draining updates. A handshake request has a
@@ -21,7 +23,7 @@
 //! `agentclientprotocol/agent-client-protocol` at schema v1.26.0
 //! (2026-10-16), read on 2026-10-19.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -176,10 +178,13 @@ impl PermissionPolicy {
 type Waiter = oneshot::Sender<Result<Value, AcpError>>;
 type Pending = Arc<Mutex<Option<HashMap<u64, Waiter>>>>;
 type Outgoing = mpsc::Sender<String>;
+/// The sessions whose turn was cancelled and has not been prompted since.
+type Cancelled = Arc<Mutex<HashSet<String>>>;
 
 struct Inner {
     outgoing: Outgoing,
     pending: Pending,
+    cancelled: Cancelled,
     next_id: AtomicU64,
     updates: tokio::sync::Mutex<mpsc::Receiver<SessionUpdate>>,
     dropped_updates: Arc<AtomicU64>,
@@ -332,10 +337,30 @@ impl UpdateSink {
     }
 }
 
+/// The answer to a `session/request_permission` with `params`: cancelled
+/// for a session whose turn was cancelled, else what `policy` picks.
+fn permission_answer(policy: PermissionPolicy, cancelled: &Cancelled, params: &Value) -> Value {
+    let session = params.get("sessionId").and_then(Value::as_str);
+    // A poisoned set cannot say the session is live; answer cancelled.
+    let is_cancelled = cancelled
+        .lock()
+        .map_or(true, |set| session.is_some_and(|s| set.contains(s)));
+    if is_cancelled {
+        return json!({ "outcome": { "outcome": "cancelled" } });
+    }
+    let options = params
+        .get("options")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    policy.choose(&options)
+}
+
 async fn read_loop(
     stdout: ChildStdout,
     outgoing: Outgoing,
     pending: Pending,
+    cancelled: Cancelled,
     updates: UpdateSink,
     policy: PermissionPolicy,
 ) {
@@ -374,13 +399,8 @@ async fn read_loop(
         match (message.id, message.method) {
             (Some(id), Some(method)) => {
                 let response = if method == "session/request_permission" {
-                    let options = message
-                        .params
-                        .get("options")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    json!({ "jsonrpc": "2.0", "id": id, "result": policy.choose(&options) })
+                    let answer = permission_answer(policy, &cancelled, &message.params);
+                    json!({ "jsonrpc": "2.0", "id": id, "result": answer })
                 } else {
                     debug!(%method, "acp: agent request not supported; answering method not found");
                     json!({
@@ -434,12 +454,14 @@ impl AcpClient {
     pub fn attach(stdin: ChildStdin, stdout: ChildStdout, policy: PermissionPolicy) -> Self {
         let (outgoing, lines) = mpsc::channel(OUTGOING_BUFFER);
         let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
+        let cancelled: Cancelled = Arc::new(Mutex::new(HashSet::new()));
         tokio::spawn(write_loop(stdin, lines, Arc::clone(&pending)));
         let (sink, rx, dropped_updates) = UpdateSink::new(UPDATE_BUFFER);
         let reader = tokio::spawn(read_loop(
             stdout,
             outgoing.clone(),
             Arc::clone(&pending),
+            Arc::clone(&cancelled),
             sink,
             policy,
         ));
@@ -447,6 +469,7 @@ impl AcpClient {
             inner: Arc::new(Inner {
                 outgoing,
                 pending,
+                cancelled,
                 next_id: AtomicU64::new(1),
                 updates: tokio::sync::Mutex::new(rx),
                 dropped_updates,
@@ -567,8 +590,14 @@ impl AcpClient {
         Ok(())
     }
 
-    /// Sends one text prompt and waits for the turn to end.
+    /// Sends one text prompt and waits for the turn to end. A new turn
+    /// lifts an earlier cancel of the session.
     pub async fn prompt(&self, session: &SessionId, text: &str) -> Result<StopReason, AcpError> {
+        self.inner
+            .cancelled
+            .lock()
+            .map_err(|_| AcpError::Protocol("cancelled set poisoned".to_owned()))?
+            .remove(session.as_str());
         let result = self
             .request(
                 "session/prompt",
@@ -587,8 +616,14 @@ impl AcpClient {
         Ok(StopReason::parse(reason))
     }
 
-    /// Queues `session/cancel`.
+    /// Queues `session/cancel`. From now until the next `prompt` of the
+    /// session, its permission requests are answered `cancelled`.
     pub fn cancel(&self, session: &SessionId) -> Result<(), AcpError> {
+        self.inner
+            .cancelled
+            .lock()
+            .map_err(|_| AcpError::Protocol("cancelled set poisoned".to_owned()))?
+            .insert(session.as_str().to_owned());
         self.notify("session/cancel", &json!({ "sessionId": session.as_str() }))
     }
 
@@ -641,6 +676,36 @@ mod tests {
         assert_eq!(
             PermissionPolicy::AllowOnce.choose(&no_reject),
             json!({ "outcome": { "outcome": "cancelled" } })
+        );
+    }
+
+    #[test]
+    fn a_cancelled_session_gets_no_permission_until_its_next_prompt() {
+        let cancelled: Cancelled = Arc::new(Mutex::new(HashSet::new()));
+        let params = json!({
+            "sessionId": "s1",
+            "options": [{ "optionId": "a", "name": "Allow", "kind": "allow_once" }]
+        });
+        let allowed = json!({ "outcome": { "outcome": "selected", "optionId": "a" } });
+        let refused = json!({ "outcome": { "outcome": "cancelled" } });
+        assert_eq!(
+            permission_answer(PermissionPolicy::AllowOnce, &cancelled, &params),
+            allowed
+        );
+        cancelled.lock().unwrap().insert("s1".to_owned());
+        assert_eq!(
+            permission_answer(PermissionPolicy::AllowOnce, &cancelled, &params),
+            refused
+        );
+        let other = json!({ "sessionId": "s2", "options": params["options"].clone() });
+        assert_eq!(
+            permission_answer(PermissionPolicy::AllowOnce, &cancelled, &other),
+            allowed
+        );
+        cancelled.lock().unwrap().remove("s1");
+        assert_eq!(
+            permission_answer(PermissionPolicy::AllowOnce, &cancelled, &params),
+            allowed
         );
     }
 
