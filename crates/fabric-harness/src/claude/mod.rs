@@ -13,7 +13,7 @@
 //! capture takes one from; any other path in a manifest is refused before
 //! anything is written. A capture or restore is refused while a `claude`
 //! process registered for the same session is alive, because
-//! `files::place_all` cannot protect a file that is being appended to.
+//! `place::place_all` cannot protect a file that is being appended to.
 //! When the registry cannot answer (it is missing, a record does not
 //! parse, or the installed Claude is older than the version it was read
 //! on), any running `claude` refuses them instead.
@@ -44,7 +44,6 @@ use tracing::{info, warn};
 
 use crate::departure::Records;
 use crate::error::{HarnessError, IoOp};
-use crate::files::{self, Carry, Source};
 use crate::harness::{Harness, Installed, Launch, Restored, Running};
 use crate::jsontext;
 use crate::manifest::{HOME_PREFIX, Mutability, StateManifest, under_home};
@@ -52,6 +51,7 @@ use crate::pipeline::{self, Capturer, Destination};
 use crate::process;
 use crate::redact::{RedactionCounts, Redactor};
 use crate::session::SessionId;
+use crate::stage::{Carry, Source};
 
 use self::flags::LaunchFlags;
 
@@ -282,7 +282,7 @@ impl ClaudeCode {
                 path: dir.to_path_buf(),
             }),
             Some(kind) if kind.is_dir() => {
-                for file in files::walk(dir)? {
+                for file in pipeline::walk(dir)? {
                     self.add_file(sources, &dir.join(&file))?;
                 }
                 Ok(())
@@ -307,12 +307,12 @@ impl ClaudeCode {
                     path: abs.to_path_buf(),
                     home: self.home_dir().to_path_buf(),
                 })?;
-        let parts = files::rel_components(rel_to_home)?;
+        let parts = pipeline::rel_components(rel_to_home)?;
         let mut all: Vec<&str> = vec![HOME_PREFIX];
         all.extend(parts.iter().map(String::as_str));
         let rest: Vec<&str> = parts.iter().map(String::as_str).collect();
         sources.push(Source {
-            rel: files::rel_path(&all)?,
+            rel: pipeline::rel_path(&all)?,
             carry: Self::carry_for(abs),
             mutability: Self::mutability_for(&rest),
             abs: abs.to_path_buf(),
@@ -383,7 +383,7 @@ impl ClaudeCode {
             .map(|s| s.abs.as_path())
             .collect();
         let backups = history::Backups::read(&transcripts)?;
-        for file in files::walk(&dir)? {
+        for file in pipeline::walk(&dir)? {
             let name = file.to_string_lossy();
             if backups.admit(&name, counts) {
                 self.add_file(sources, &dir.join(&file))?;

@@ -26,10 +26,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::durable;
 use crate::error::{HarnessError, Input, IoOp};
-use crate::files::{self, Source};
 use crate::manifest::{Digest, Mutability};
 use crate::session::SessionId;
+use crate::stage::{self, Source};
 
 /// The record format this crate writes.
 const FORMAT: u16 = 1;
@@ -74,7 +75,7 @@ impl Records {
         let mut files = BTreeMap::new();
         for source in sources {
             if source.mutability == Mutability::Replaceable {
-                let digest = files::digest_file(&source.abs)?.digest;
+                let digest = stage::digest_file(&source.abs)?.digest;
                 files.insert(utf8(&source.abs)?.to_owned(), digest);
             }
         }
@@ -88,7 +89,7 @@ impl Records {
             path: self.pending.clone(),
             reason: e.to_string(),
         })?;
-        files::write_atomic(&self.pending, &bytes)
+        durable::write_atomic(&self.pending, &bytes)
     }
 
     /// Makes the pending record of the capture whose manifest has digest
@@ -98,7 +99,7 @@ impl Records {
     /// one, and is refused, leaving both records as they were.
     pub(crate) fn confirm(&self, session: &SessionId, capture: Digest) -> Result<(), HarnessError> {
         if read(&self.pending)?.is_some_and(|p| p.capture == Some(capture)) {
-            return files::rename_durable(&self.pending, &self.active);
+            return durable::rename_durable(&self.pending, &self.active);
         }
         if read(&self.active)?.is_some_and(|a| a.capture == Some(capture)) {
             return Ok(());
@@ -149,14 +150,14 @@ impl Departure {
         let Some(recorded) = self.files.get(utf8(dest)?) else {
             return Ok(false);
         };
-        Ok(files::digest_file(dest)?.digest == *recorded)
+        Ok(stage::digest_file(dest)?.digest == *recorded)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::files::Carry;
+    use crate::stage::Carry;
     use fabric_core::path::RelPath;
 
     fn digest(text: &str) -> Digest {

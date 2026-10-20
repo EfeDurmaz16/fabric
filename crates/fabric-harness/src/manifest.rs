@@ -299,7 +299,7 @@ impl StateManifest {
             if under_home(&path).is_none() {
                 return Err(ManifestError::NotUnderHome { index, path });
             }
-            if path.split('/').any(crate::files::is_temp_name) {
+            if path.split('/').any(crate::durable::is_temp_name) {
                 return Err(ManifestError::TemporaryFile { index, path });
             }
             if previous.is_some_and(|p| p >= &file.rel_path) {
@@ -378,7 +378,7 @@ impl StateManifest {
             path: path.clone(),
             reason: e.to_string(),
         })?;
-        crate::files::write_atomic(&path, &bytes)
+        crate::durable::write_atomic(&path, &bytes)
     }
 
     /// Reads the manifest under `state`, checking its rules.

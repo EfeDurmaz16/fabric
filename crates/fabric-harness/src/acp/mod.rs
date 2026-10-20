@@ -29,13 +29,13 @@ use tracing::{info, warn};
 
 use crate::departure::Records;
 use crate::error::HarnessError;
-use crate::files::{self, Carry, Source};
 use crate::harness::{Harness, Installed, Launch, Restored, Running};
 use crate::manifest::{Content, HOME_PREFIX, Mutability, StateManifest, under_home};
 use crate::pipeline::{self, Capturer, Destination};
 use crate::process::{self, Wiring};
 use crate::redact::RedactionCounts;
 use crate::session::SessionId;
+use crate::stage::{Carry, Source};
 
 use self::client::{AcpClient, AcpError, PermissionPolicy, StopReason};
 
@@ -141,7 +141,7 @@ impl AcpHarness {
                 path: dir.clone(),
                 home: self.home_dir().to_path_buf(),
             })?;
-        Ok((dir.clone(), files::rel_components(rel)?))
+        Ok((dir.clone(), pipeline::rel_components(rel)?))
     }
 
     /// Where this node records the session's files at capture. An ACP
@@ -159,8 +159,8 @@ impl AcpHarness {
     ) -> Result<StateManifest, HarnessError> {
         let (dir, rel_parts) = self.state_rel()?;
         let mut sources = Vec::new();
-        for file in files::walk(&dir)? {
-            let file_parts = files::rel_components(&file)?;
+        for file in pipeline::walk(&dir)? {
+            let file_parts = pipeline::rel_components(&file)?;
             if !file_parts.iter().any(|part| names_session(part, session)) {
                 continue;
             }
@@ -169,7 +169,7 @@ impl AcpHarness {
             parts.extend(file_parts.iter().map(String::as_str));
             sources.push(Source {
                 abs: dir.join(&file),
-                rel: files::rel_path(&parts)?,
+                rel: pipeline::rel_path(&parts)?,
                 carry: Carry::OpaqueRefuseSecrets,
                 mutability: Mutability::Replaceable,
             });

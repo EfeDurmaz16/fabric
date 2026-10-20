@@ -14,19 +14,32 @@
 //! files, all or nothing. An adapter supplies only what differs: its
 //! sources, and where a tree path lands on this node.
 
+#![cfg_attr(
+    not(all(feature = "acp", feature = "claude", feature = "codex")),
+    allow(
+        dead_code,
+        reason = "parts serve only some adapters; the default build checks all"
+    )
+)]
+
 use std::path::{Path, PathBuf};
+
+use fabric_core::path::RelPath;
+use tracing::warn;
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::path::AbsPath;
 
+use crate::crashpoint::crashpoint;
 use crate::denylist;
 use crate::departure::{Departure, Records};
 use crate::error::{HarnessError, Input, IoOp};
-use crate::files::{self, Placement, Source};
 use crate::harness::Restored;
 use crate::manifest::{Carried, Content, Mutability, StateManifest};
+use crate::place::{self, Placement};
 use crate::redact::RedactionCounts;
 use crate::session::SessionId;
+use crate::stage::{self, Source};
 
 /// Checks that `workspace` is an absolute directory and returns its
 /// physical path, parsed once: the manifest, the Claude project key, the
@@ -56,6 +69,70 @@ pub(crate) fn physical_workspace(workspace: &Path) -> Result<AbsPath, HarnessErr
 /// The home or workspace path as a file system path.
 pub(crate) fn fs_path(path: &AbsPath) -> &Path {
     Path::new(path.as_str())
+}
+
+/// Lists the regular files under `dir`, relative paths in sorted order.
+/// A symlink is an error: a harness state tree has none, and following one
+/// would carry or overwrite something outside the tree.
+pub(crate) fn walk(dir: &Path) -> Result<Vec<PathBuf>, HarnessError> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let entries = std::fs::read_dir(&d).map_err(|e| HarnessError::io(IoOp::Walk, &d, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| HarnessError::io(IoOp::Walk, &d, e))?;
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .map_err(|e| HarnessError::io(IoOp::Walk, &path, e))?;
+            if kind.is_symlink() {
+                return Err(HarnessError::SymlinkInState { path });
+            }
+            if kind.is_dir() {
+                stack.push(path);
+            } else if kind.is_file() {
+                if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(crate::durable::is_temp_name)
+                {
+                    warn!(path = %path.display(), "skipping a temporary file left by a killed run");
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(dir)
+                    .map(Path::to_path_buf)
+                    .unwrap_or(path);
+                out.push(rel);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Joins path components into a `RelPath`, refusing names the tree rules forbid.
+pub(crate) fn rel_path(parts: &[&str]) -> Result<RelPath, HarnessError> {
+    let joined = parts.join("/");
+    RelPath::parse(&joined).map_err(|e| HarnessError::Malformed {
+        what: Input::StatePath,
+        path: PathBuf::from(&joined),
+        reason: e.to_string(),
+    })
+}
+
+/// Converts a file system path relative to some root into tree components.
+pub(crate) fn rel_components(rel: &Path) -> Result<Vec<String>, HarnessError> {
+    rel.components()
+        .map(|c| {
+            c.as_os_str()
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| HarnessError::NotUtf8 {
+                    path: rel.to_path_buf(),
+                })
+        })
+        .collect()
 }
 
 /// Runs a blocking capture or restore body off the async runtime.
@@ -95,7 +172,7 @@ pub(crate) fn capture(
     mut counts: RedactionCounts,
     out: &Path,
 ) -> Result<StateManifest, HarnessError> {
-    let carried = files::stage(sources, out, &mut counts)?;
+    let carried = stage::stage(sources, out, &mut counts)?;
     let manifest = StateManifest::new(
         capturer.kind,
         capturer.session.clone(),
@@ -107,7 +184,7 @@ pub(crate) fn capture(
     )?;
     if let Some(records) = capturer.departure {
         records.write_pending(sources, manifest.digest()?)?;
-        files::crashpoint("capture-after-departure", 0);
+        crashpoint("capture-after-departure", 0);
     }
     manifest.write(out)?;
     Ok(manifest)
@@ -243,11 +320,29 @@ where
             mutability: dest.mutability,
         });
     }
-    files::verify(state, manifest.files())?;
+    stage::verify(state, manifest.files())?;
     let departure = match departure {
         Some(records) => records.active()?,
         None => Departure::default(),
     };
-    let placed = files::place_all(&placements, &departure)?;
+    let placed = place::place_all(&placements, &|dest| departure.unchanged(dest))?;
     Ok(Restored { manifest, placed })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn walk_skips_temp_files_and_refuses_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), b"a").unwrap();
+        std::fs::write(dir.path().join(".a.fabric-tmp-1-0"), b"partial").unwrap();
+        assert_eq!(walk(dir.path()).unwrap(), vec![PathBuf::from("a")]);
+        std::os::unix::fs::symlink(dir.path().join("a"), dir.path().join("link")).unwrap();
+        assert!(matches!(
+            walk(dir.path()),
+            Err(HarnessError::SymlinkInState { .. })
+        ));
+    }
 }

@@ -50,13 +50,14 @@ use fabric_core::path::AbsPath;
 use tracing::{info, warn};
 
 use crate::error::{HarnessError, Input, IoOp};
-use crate::files::{self, Carry, Relation, Source};
 use crate::harness::{Harness, Installed, Launch, Restored, Running};
 use crate::manifest::{Content, HOME_PREFIX, Mutability, StateManifest};
 use crate::pipeline::{self, Capturer, Destination};
+use crate::place::{self, Relation};
 use crate::process;
 use crate::redact::RedactionCounts;
 use crate::session::SessionId;
+use crate::stage::{Carry, Source};
 
 use self::overrides::CodexOverrides;
 use self::rollout::{RolloutFile, RolloutName};
@@ -196,10 +197,10 @@ fn resolve(
             longest = Some(file);
             continue;
         };
-        longest = Some(match files::compare(&kept.path, &file.path)? {
+        longest = Some(match place::compare(&kept.path, &file.path)? {
             Relation::Missing | Relation::Equal => kept,
             Relation::ExistingIsPrefix => file,
-            Relation::Diverged => match files::compare(&file.path, &kept.path)? {
+            Relation::Diverged => match place::compare(&file.path, &kept.path)? {
                 Relation::ExistingIsPrefix => kept,
                 Relation::Missing | Relation::Equal | Relation::Diverged => {
                     return Err(HarnessError::LineageAmbiguous {
@@ -316,7 +317,7 @@ impl Codex {
                     path: self.store.clone(),
                     home: self.home_dir().to_path_buf(),
                 })?;
-        files::rel_components(rel)
+        pipeline::rel_components(rel)
     }
 
     /// Every rollout file in the store, duplicates included.
@@ -412,13 +413,13 @@ impl Codex {
                         path: file.path.clone(),
                         home: self.store.clone(),
                     })?;
-            let parts = files::rel_components(rel)?;
+            let parts = pipeline::rel_components(rel)?;
             let mut all: Vec<&str> = vec![HOME_PREFIX];
             all.extend(home_parts.iter().map(String::as_str));
             all.extend(parts.iter().map(String::as_str));
             sources.push(Source {
                 abs: file.path.clone(),
-                rel: files::rel_path(&all)?,
+                rel: pipeline::rel_path(&all)?,
                 carry: Carry::Opaque,
                 mutability: Mutability::AppendOnly,
             });

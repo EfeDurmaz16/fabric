@@ -15,8 +15,8 @@ use std::path::Path;
 use fabric_core::path::AbsPath;
 use serde_json::{Map, Value};
 
+use crate::durable;
 use crate::error::{HarnessError, Input, IoOp};
-use crate::files;
 
 /// The key Claude reads to skip the trust dialog.
 pub(crate) const TRUST_KEY: &str = "hasTrustDialogAccepted";
@@ -69,7 +69,7 @@ pub(crate) fn preseed_file(config_json: &Path, root: &AbsPath) -> Result<bool, H
         reason: e.to_string(),
     })?;
     out.push(b'\n');
-    files::write_atomic(config_json, &out)?;
+    durable::write_atomic(config_json, &out)?;
     Ok(true)
 }
 
