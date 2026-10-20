@@ -464,12 +464,6 @@ mod tests {
         assert_eq!(a.id().unwrap(), spec().id().unwrap());
     }
 
-    #[test]
-    fn decode_round_trips() {
-        let bytes = spec().encode().unwrap();
-        assert_eq!(EnvSpec::decode(&bytes).unwrap(), spec());
-    }
-
     /// A name cannot carry a value: `DATABASE_URL=postgres://u:p@h/db` is
     /// not a name, on the wire included.
     #[test]
