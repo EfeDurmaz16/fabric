@@ -1,10 +1,16 @@
 //! How Fabric runs git (ADR 0004, How Fabric runs git).
 //!
-//! Invariant: every git process this crate starts runs with the repository
-//! config, the user's global config and the system config unable to inject a
-//! command into it, with no prompt and no network, and with a fixed author.
-//! Nothing the manifest carries and nothing in the workspace can steer a git
-//! command that Fabric runs.
+//! Invariant: every git process this crate starts runs with no prompt, no
+//! network, no hooks, no fsmonitor and a fixed author, with the user's
+//! global and system config unread, with no `GIT_*` variable inherited from
+//! whoever started Fabric, and in the C locale so its messages can be
+//! matched. Nothing the manifest carries can steer a git command: a restored
+//! repository's config holds only the allowlisted keys.
+//!
+//! The source repository's own config is the user's and is honored there.
+//! Its clean and smudge filters run during `git add -A` and `git status` on
+//! capture, as they do for every other git command the user runs, and a
+//! repository that needs them (git-crypt) depends on that.
 
 use std::ffi::OsStr;
 use std::io::{self, Write};
@@ -102,7 +108,14 @@ impl Git {
                 cmd.arg("-c").arg(flag);
             }
         }
+        for (key, _) in std::env::vars_os() {
+            if key.as_encoded_bytes().starts_with(b"GIT_") {
+                cmd.env_remove(key);
+            }
+        }
         cmd.current_dir(&self.repo)
+            .env("LC_ALL", "C")
+            .env("LANGUAGE", "C")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -113,9 +126,6 @@ impl Git {
             .env("GIT_COMMITTER_NAME", "fabric")
             .env("GIT_COMMITTER_EMAIL", "fabric@localhost")
             .env("GIT_COMMITTER_DATE", &self.date)
-            .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
             .stdin(Stdio::null());
         cmd
     }
@@ -246,6 +256,48 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// The child half: git must not see what the parent put in the environment.
+    #[test]
+    fn inherited_git_variables_child() {
+        let Ok(dir) = std::env::var("FABRIC_GIT_ENV_CHILD") else {
+            return;
+        };
+        let git = Git::new(Path::new(&dir), 0);
+        let out = git
+            .output(&["config", "--get", "fabric.injected"], &[])
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "git saw {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert_eq!(
+            git.run_text(&["rev-parse", "--is-inside-work-tree"])
+                .unwrap(),
+            "true"
+        );
+    }
+
+    #[test]
+    fn inherited_git_variables_do_not_reach_git() {
+        let dir = tempfile::tempdir().unwrap();
+        Git::new(dir.path(), 0).run(&["init", "-q"]).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "git::tests::inherited_git_variables_child"])
+            .env("FABRIC_GIT_ENV_CHILD", dir.path())
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "fabric.injected")
+            .env("GIT_CONFIG_VALUE_0", "yes")
+            .env("GIT_DIR", "/nonexistent")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
 
     #[test]
     fn input_and_output_larger_than_a_pipe_do_not_hang() {
