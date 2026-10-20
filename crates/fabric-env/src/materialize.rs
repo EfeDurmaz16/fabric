@@ -18,17 +18,18 @@
 //! the workspace runs when any cache is not whole or the report has none.
 //!
 //! A cache is healthy when it is a non-empty directory that holds proof
-//! that whatever filled it finished. For npm, pnpm and Yarn that is the
-//! marker the installer itself writes as it finishes, chosen by the manager
-//! detection recorded, whatever other lockfiles lie next to it. For a cache
-//! a setup step fills and whose installer writes no such marker (Bun,
-//! `.venv`, a declared cache) it is `SENTINEL`, which materialize removes
-//! before the first step that fills the cache and writes after the last
-//! one exits 0. A cache no step fills needs only to be non-empty. An
-//! install that fails or is killed halfway leaves no proof, so the next
-//! plan fills the cache again. A report with no cache paths
-//! has nothing that proves warmth, so its `CachesMissing` steps run on
-//! every resume; declaring a `[[cache]]` is how a user makes them skip.
+//! that whatever filled it finished. For the `node_modules` detection found
+//! under npm, pnpm or Yarn that is the marker the installer itself writes
+//! as it finishes, chosen by the manager detection recorded, whatever other
+//! lockfiles lie next to it. For a cache a setup step fills and whose
+//! installer writes no such marker (Bun, `.venv`, a declared cache) it is
+//! `SENTINEL`, which materialize removes before the first step that fills
+//! the cache and writes after the last one exits 0. A cache no step fills
+//! needs only to be non-empty. An install that fails or is killed halfway
+//! leaves no proof, so the next plan fills the cache again. A report with
+//! no cache paths has nothing that proves warmth, so its `CachesMissing`
+//! steps run on every resume; declaring a `[[cache]]` is how a user makes
+//! them skip.
 //!
 //! The restore that runs before materialize writes a carried cache only when
 //! its carry key matches this node (ADR 0012), so what is on disk is what
