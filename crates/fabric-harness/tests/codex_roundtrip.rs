@@ -237,6 +237,40 @@ async fn a_rollout_with_a_secret_is_refused_not_carried() {
     assert!(!out.path().join("manifest.json").exists());
 }
 
+/// Appends a turn whose JSON text is `escaped` to the head rollout and
+/// asserts that capture refuses it at that line.
+async fn assert_refused_with_turn(escaped: &str) {
+    let src = build_source();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&src.head)
+        .unwrap();
+    file.write_all(turn(escaped).as_bytes()).unwrap();
+    drop(file);
+    let adapter = Codex::new(src.home.path().canonicalize().unwrap(), OsString::new());
+    let out = tempfile::tempdir().unwrap();
+    let err = adapter
+        .capture(&src.work, &thread(), out.path())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, HarnessError::SecretInState { line: 3, .. }),
+        "{escaped}: {err}"
+    );
+    assert!(!out.path().join("manifest.json").exists());
+}
+
+#[tokio::test]
+async fn an_env_line_after_an_escaped_newline_is_refused() {
+    // `cat .env` output as a rollout stores it: `\n` between the lines.
+    assert_refused_with_turn(r"NODE_ENV=dev\nDB_PASSWORD=hunter22xyz\nPORT=1").await;
+}
+
+#[tokio::test]
+async fn a_value_in_escaped_quotes_is_refused() {
+    assert_refused_with_turn(r#"export DB_PASSWORD=\"hunter22xyz\""#).await;
+}
+
 #[tokio::test]
 async fn a_workspace_whose_name_holds_sk_inside_a_word_is_captured() {
     // `disk-usage` holds `sk-`; the rollout's `cwd` and its first message

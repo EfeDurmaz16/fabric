@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::error::HarnessError;
+use crate::jsontext;
 use crate::redact::Redactor;
 use crate::session::SessionId;
 
@@ -206,7 +207,8 @@ pub fn read_meta(file: &RolloutFile) -> Result<Meta, HarnessError> {
     })
 }
 
-/// Refuses a rollout, plain or compressed, that holds a secret-shaped string.
+/// Refuses a rollout, plain or compressed, that holds a secret-shaped
+/// string, raw or inside a decoded JSON string.
 pub(crate) fn refuse_secrets(file: &RolloutFile) -> Result<(), HarnessError> {
     let redactor = Redactor::standard()?;
     let mut lines = open_lines(file)?;
@@ -222,7 +224,7 @@ pub(crate) fn refuse_secrets(file: &RolloutFile) -> Result<(), HarnessError> {
             return Ok(());
         }
         number += 1;
-        if redactor.matches_bytes(&line) {
+        if jsontext::holds_secret(&line, redactor) {
             return Err(HarnessError::SecretInState {
                 path: file.path.clone(),
                 line: number,

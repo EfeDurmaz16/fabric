@@ -381,6 +381,41 @@ async fn a_secret_in_the_state_directory_refuses_the_capture() {
     assert!(!out.path().join("manifest.json").exists());
 }
 
+/// Writes session `fake-9` with `escaped` as the JSON text of a prompt and
+/// asserts that capture refuses it at that line.
+async fn assert_state_refused(escaped: &str) {
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let state_dir = home.path().join(".fake-agent/sessions");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::write(
+        state_dir.join("fake-9.json"),
+        format!("{{\n  \"prompts\": [{{\"text\": \"{escaped}\"}}]\n}}\n"),
+    )
+    .unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let err = adapter(home.path(), PermissionPolicy::Deny)
+        .capture(&work, &SessionId::parse("fake-9").unwrap(), out.path())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, HarnessError::SecretInState { line: 2, .. }),
+        "{escaped}: {err}"
+    );
+    assert!(!out.path().join("manifest.json").exists());
+}
+
+#[tokio::test]
+async fn an_env_line_after_an_escaped_newline_in_state_is_refused() {
+    assert_state_refused(r"NODE_ENV=dev\nSTRIPE_SECRET_KEY=abcd1234efgh").await;
+}
+
+#[tokio::test]
+async fn a_value_in_escaped_quotes_in_state_is_refused() {
+    assert_state_refused(r#"export DB_PASSWORD=\"hunter22xyz\""#).await;
+}
+
 #[tokio::test]
 async fn only_files_named_for_the_session_are_captured() {
     let home = tempfile::tempdir().unwrap();

@@ -374,6 +374,41 @@ fn element_removal(text: &str, span: &Range<usize>) -> Range<usize> {
     span.clone()
 }
 
+/// The raw text of every JSON string literal in `text`, quotes included,
+/// read left to right. On a JSON line this is every key and every string
+/// value; on other text it is whatever sits between pairs of quotes.
+fn string_literals(text: &str) -> impl Iterator<Item = &str> {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        let start = at + bytes.get(at..)?.iter().position(|b| *b == b'"')?;
+        let end = scan_string(bytes, start).ok()?;
+        at = end;
+        text.get(start..end)
+    })
+}
+
+/// True when a JSON string literal holds a secret once its escapes are
+/// decoded. A literal that does not decode holds nothing here; the raw
+/// match covers it.
+fn literal_holds_secret(raw: &str, redactor: &Redactor) -> bool {
+    serde_json::from_str::<String>(raw).is_ok_and(|decoded| redactor.matches(&decoded))
+}
+
+/// True when `bytes` hold a secret shape, as they are or inside a JSON
+/// string once its escapes are decoded. Inside a JSON string a newline is
+/// `\n` and a quote is `\"`, which hide an env line or a quoted value from
+/// a match on the raw bytes, so every string literal is decoded and
+/// matched too, keys included. Bytes that are not UTF-8 are read with
+/// replacement characters for the decoded pass.
+pub(crate) fn holds_secret(bytes: &[u8], redactor: &Redactor) -> bool {
+    if redactor.matches_bytes(bytes) {
+        return true;
+    }
+    let text = String::from_utf8_lossy(bytes);
+    string_literals(&text).any(|raw| literal_holds_secret(raw, redactor))
+}
+
 /// Redacts every string outside signed blocks of one JSON text, dropping
 /// a signed array element that holds a secret.
 pub fn transform(text: &str, redactor: &Redactor) -> Result<Outcome, TransformError> {

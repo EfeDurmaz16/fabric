@@ -61,7 +61,8 @@ pub(crate) struct Source {
 pub(crate) enum Carry {
     /// Copied byte for byte; the adapter scanned it for secrets another way.
     Opaque,
-    /// Copied byte for byte; capture is refused when a line matches a secret shape.
+    /// Copied byte for byte; capture is refused when a line holds a secret
+    /// shape, raw or inside a decoded JSON string.
     OpaqueRefuseSecrets,
     /// Plain text, redacted line by line.
     Text,
@@ -376,7 +377,7 @@ impl Transfer<'_> {
         let mut number = 0usize;
         while self.next_line(reader, &mut line)? {
             number += 1;
-            if self.redactor.matches_bytes(&line) {
+            if jsontext::holds_secret(&line, self.redactor) {
                 return Err(HarnessError::SecretInState {
                     path: self.src.to_path_buf(),
                     line: number,
