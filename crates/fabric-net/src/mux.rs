@@ -12,7 +12,9 @@
 //! `Data` carries bytes, `Fin` ends one direction, and `Reset` tells the
 //! peer this side's reader is gone, so the peer's writer fails with
 //! `BrokenPipe` instead of sending into nothing, as QUIC's `STOP_SENDING`
-//! does. The peer may hold at most `MAX_STREAMS` streams open, as quinn
+//! does. The `Reset` goes out as soon as the reader is dropped, not when the
+//! peer next sends: a peer out of credit sends nothing more, and would
+//! otherwise wait for credit forever while both sides hold the stream's slot. The peer may hold at most `MAX_STREAMS` streams open, as quinn
 //! allows by default; a stream above that is refused at once with a `Reset`
 //! and a `Fin`, so both its directions end, and this side waits in `open`
 //! instead of going over the peer's limit. A frame payload above
@@ -54,7 +56,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::AbortHandle;
 
 use crate::idle::IdleReader;
-use crate::pipe::{Drained, PipeReader, PipeWriter, Refused, pipe};
+use crate::pipe::{Drained, PipeReader, PipeWriter, Refused, Report, pipe};
 use crate::transport::{
     Connection, IDLE_TIMEOUT, KEEP_ALIVE, Stream, TransportError, TransportKind,
 };
@@ -384,7 +386,6 @@ async fn pump_local(shared: Arc<Shared>, source: PipeReader, inbound: PipeWriter
             }
         }
         *next = id.checked_add(2);
-        tokio::spawn(grant_credit(Arc::clone(&shared), id, drained));
         // Queued under the id lock, so ids reach the wire in rising order.
         let only_fin = first.is_empty();
         let frame = if only_fin {
@@ -396,7 +397,13 @@ async fn pump_local(shared: Arc<Shared>, source: PipeReader, inbound: PipeWriter
                 payload: first,
             }
         };
-        if shared.out.send(frame).await.is_err() || only_fin {
+        if shared.out.send(frame).await.is_err() {
+            return;
+        }
+        // Started after the first frame is queued, so a `Reset` for this
+        // stream never reaches the peer before the stream itself does.
+        tokio::spawn(grant_credit(Arc::clone(&shared), id, drained));
+        if only_fin {
             return;
         }
         id
@@ -473,9 +480,16 @@ async fn send_rest(
     }
 }
 
-/// Hands the peer credit for `id` each time the stream's reader takes `CREDIT_STEP` bytes, until the peer's direction ends.
+/// Hands the peer credit for `id` each time the stream's reader takes
+/// `CREDIT_STEP` bytes, until the peer's direction ends; resets the stream
+/// as soon as its reader is dropped.
 async fn grant_credit(shared: Arc<Shared>, id: u32, drained: Drained) {
-    while let Some(taken) = poll_fn(|cx| drained.poll_report(cx, CREDIT_STEP)).await {
+    loop {
+        let taken = match poll_fn(|cx| drained.poll_report(cx, CREDIT_STEP)).await {
+            Report::Took(taken) => taken,
+            Report::Ended => return,
+            Report::ReaderGone => return reset_dropped(&shared, id).await,
+        };
         // At most STREAM_BUFFER, so it fits a u32.
         let Ok(taken) = u32::try_from(taken) else {
             return;
@@ -488,6 +502,23 @@ async fn grant_credit(shared: Arc<Shared>, id: u32, drained: Drained) {
         if shared.out.send(frame).await.is_err() {
             return;
         }
+    }
+}
+
+/// Resets `id` after its reader was dropped, unless the connection's reader already did.
+async fn reset_dropped(shared: &Shared, id: u32) {
+    let Some(gone) = shared.streams().inbound.remove(&id) else {
+        return;
+    };
+    let reset = Outgoing::bare(id, FrameKind::Reset);
+    // The same order as a `Fin` in `send_rest`: the side that opened the
+    // stream frees its slot only after the peer can see the stream close.
+    if shared.side.opens(id) {
+        let _ = shared.out.send(reset).await;
+        drop(gone);
+    } else {
+        drop(gone);
+        let _ = shared.out.send(reset).await;
     }
 }
 
@@ -671,11 +702,11 @@ fn accept_stream(
 /// Puts a `Data` payload in its stream's buffer without waiting.
 ///
 /// Returns false when the stream's reader is gone, so the caller resets
-/// it once; a closed stream, ours or the peer's, has no entry and its
-/// frames are dropped. A payload the buffer cannot hold means the peer
-/// sent past its credit, and ends the connection.
+/// it; a closed stream, ours or the peer's, has no entry and its frames
+/// are dropped. A payload the buffer cannot hold means the peer sent past
+/// its credit, and ends the connection.
 fn deliver(shared: &Shared, id: u32, payload: &[u8]) -> io::Result<bool> {
-    let mut streams = shared.streams();
+    let streams = shared.streams();
     let Some(stream) = streams.inbound.get(&id) else {
         return Ok(true);
     };
@@ -684,10 +715,7 @@ fn deliver(shared: &Shared, id: u32, payload: &[u8]) -> io::Result<bool> {
         Err(Refused::Full) => Err(invalid(format!(
             "the peer sent past its credit on stream {id}"
         ))),
-        Err(Refused::ReaderGone) => {
-            streams.inbound.remove(&id);
-            Ok(false)
-        }
+        Err(Refused::ReaderGone) => Ok(false),
     }
 }
 
@@ -712,9 +740,19 @@ fn credit(shared: &Shared, id: u32, payload: &[u8]) -> io::Result<()> {
 }
 
 /// Forgets the inbound half of `id` and tells the peer to stop sending on it.
+///
+/// Only the call that removes the entry queues the `Reset`, so the peer
+/// gets one even when `reset_dropped` races this. The entry, and with it
+/// the stream's slot, is dropped after the frame is queued, so the next
+/// stream this side opens reaches the peer behind the `Reset`; the peer's
+/// next stream cannot arrive before this returns, since the reader runs it.
 fn reset(shared: &Shared, id: u32) -> io::Result<()> {
-    shared.streams().inbound.remove(&id);
-    queue_control(shared, id, FrameKind::Reset)
+    let Some(gone) = shared.streams().inbound.remove(&id) else {
+        return Ok(());
+    };
+    queue_control(shared, id, FrameKind::Reset)?;
+    drop(gone);
+    Ok(())
 }
 
 /// Queues one of the reader's own frames without waiting.
@@ -958,6 +996,42 @@ mod tests {
             }
         }
         assert_eq!(failed, Some(io::ErrorKind::BrokenPipe));
+    }
+
+    /// A reader dropped while the peer is out of credit resets the stream at
+    /// once: the peer's writer fails instead of waiting for credit forever,
+    /// the stream's slot comes back, and the connection can still end.
+    #[tokio::test]
+    async fn dropping_a_reader_resets_a_peer_that_is_out_of_credit() {
+        let (a, b) = tokio::io::duplex(4 << 20);
+        let dialer = Mux::spawn(a, Side::Dialer, node(), ADDR);
+        let acceptor = Mux::spawn(b, Side::Acceptor, node(), ADDR);
+        let mut asking = dialer.open().await.unwrap();
+        asking.write_all(b"ask").await.unwrap();
+        let mut answering = acceptor.next().await.unwrap();
+        let writer =
+            tokio::spawn(async move { answering.write_all(&vec![0u8; 3 * STREAM_BUFFER]).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!writer.is_finished(), "the peer never ran out of credit");
+
+        drop(asking);
+        let written = tokio::time::timeout(Duration::from_secs(1), writer)
+            .await
+            .expect("the peer's writer waited for credit forever")
+            .unwrap();
+        assert_eq!(written.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+
+        let mut held = Vec::new();
+        for _ in 0..MAX_STREAMS {
+            let opened = tokio::time::timeout(Duration::from_secs(1), dialer.open()).await;
+            held.push(opened.expect("the dropped stream kept its slot").unwrap());
+        }
+        drop((held, dialer));
+        let ended = tokio::time::timeout(Duration::from_secs(2), async {
+            while acceptor.next().await.is_ok() {}
+        })
+        .await;
+        assert!(ended.is_ok(), "the connection outlived its handle");
     }
 
     /// A peer that sends more than the credit it was given ends the

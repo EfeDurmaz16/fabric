@@ -7,7 +7,9 @@
 //! ended; dropping the reader makes every later write fail with
 //! `BrokenPipe`, so a stream nobody reads cannot fill the heap. A `push`
 //! puts all its bytes in or none, and `Drained` counts what the reader took,
-//! which is the credit the multiplexer hands back to the peer.
+//! which is the credit the multiplexer hands back to the peer, and reports
+//! the reader's drop at once, so the multiplexer can stop the peer's sender
+//! without waiting for it to send again.
 
 use std::collections::VecDeque;
 use std::io;
@@ -158,20 +160,33 @@ pub(crate) enum Refused {
     ReaderGone,
 }
 
+/// What `Drained` saw the reader of one pipe do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Report {
+    /// The reader took this many bytes since the last report.
+    Took(usize),
+    /// The writer finished or aborted, so no more bytes will come.
+    Ended,
+    /// The reader was dropped while the writer was still open.
+    ReaderGone,
+}
+
 /// Counts the bytes the reader of one pipe takes.
 pub(crate) struct Drained(Arc<Mutex<State>>);
 
 impl Drained {
     /// Waits until the reader took at least `at_least` bytes since the last
-    /// report and returns that count; `None` once the writer ended or the
-    /// reader is gone, when no more bytes will come.
-    pub(crate) fn poll_report(&self, cx: &mut Context<'_>, at_least: usize) -> Poll<Option<usize>> {
+    /// report, the writer ended, or the reader is gone, and says which.
+    pub(crate) fn poll_report(&self, cx: &mut Context<'_>, at_least: usize) -> Poll<Report> {
         let mut state = lock(&self.0);
-        if state.reader_gone || state.writer != Writer::Open {
-            return Poll::Ready(None);
+        if state.writer != Writer::Open {
+            return Poll::Ready(Report::Ended);
+        }
+        if state.reader_gone {
+            return Poll::Ready(Report::ReaderGone);
         }
         if state.taken >= at_least {
-            return Poll::Ready(Some(std::mem::take(&mut state.taken)));
+            return Poll::Ready(Report::Took(std::mem::take(&mut state.taken)));
         }
         state.drained_waker = Some(cx.waker().clone());
         Poll::Pending

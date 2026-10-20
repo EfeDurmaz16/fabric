@@ -112,7 +112,7 @@ Each frame is `u32 stream id | u8 kind | u32 length | payload`, little endian. A
 
 - `Data` carries up to 64 KiB of a stream's bytes.
 - `Fin` ends one direction.
-- `Reset` says this side's reader is gone, so the peer stops sending and its writer fails, as QUIC's `STOP_SENDING` does.
+- `Reset` says this side's reader is gone, so the peer stops sending and its writer fails, as QUIC's `STOP_SENDING` does. It goes out when the reader is dropped, not when the peer next sends, because a peer out of credit sends nothing more and would wait for credit forever.
 - `Credit` hands the peer more credit on one stream, a `u32` byte count.
 - `KeepAlive` names no stream and says the sender is alive.
 
