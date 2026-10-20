@@ -6,7 +6,7 @@ Private repository. Working name; see [ADR 0010](docs/adr/0010-name-and-scope-bo
 
 ## Status, honestly
 
-A job can move between two of your Macs by hand: made from a repository, run under a harness, suspended, moved, resumed on the other Mac with its uncommitted work and its harness session, and moved back, safe under `kill -9` of either node at every step the end-to-end test names. Nothing has run on the real two-Mac gate yet; the test runs two nodes on one machine. Only the fake ACP agent has gone through a full move; Claude Code and Codex are wired the same way and still need their live run (ADR 0015).
+A job can move between two of your Macs by hand: made from a repository, run under a harness, suspended, moved, resumed on the other Mac with its uncommitted work and its harness session, and moved back, safe under `kill -9` of either node at every step the end-to-end test names. The first run on the real two Macs, on 2026-10-20, stopped at `fabric job run` while Claude Code was open (gate finding F1, fixed since); no move has run between them yet, and the test runs two nodes on one machine. Only the fake ACP agent has gone through a full move; Claude Code and Codex are wired the same way and still need their live run (ADR 0015).
 
 | What | State |
 |---|---|
@@ -58,6 +58,14 @@ fabric job new --repo ~/oss/some-repo --goal "fix the flaky test"   # prints the
 fabric job run <job>        # Claude Code in this terminal, at ~/fabric/jobs/<job>/work
 ```
 
+You do not need to close Claude Code first, and you can type the command inside a Claude Code session. The harness starts without the markers of the session it was typed in (`CLAUDECODE`, `CLAUDE_CODE_*` and the rest ADR 0015 lists), so it is a session of its own and saves its transcript, which `resume` needs.
+
+Before it starts Claude, `run` makes sure Claude trusts the job's folder, and says where that trust came from:
+
+- Nothing printed: Claude already trusted the folder, through the key Claude reads for project settings (the repository's main checkout, or the folder).
+- `trusted <path>`: Fabric wrote that key into `~/.claude.json`.
+- `warning: Fabric did not trust <path> (<reason>); ...`: Fabric left `~/.claude.json` alone, because another `claude` runs and rewrites that file itself, or because the file is missing or a symlink. The harness starts anyway. If no trusted parent folder covers the job, Claude shows its own trust dialog; accept it once. If one does, the warning says which, and Claude skips the dialog but ignores the folder's project settings (permission rules, `.mcp.json` servers, hooks) until the key is set. To have Fabric set it, run the job again while no other `claude` runs.
+
 Exit the harness, then move the job:
 
 ```sh
@@ -73,7 +81,7 @@ fabric job resume <job>     # restores at the same path, runs setup steps, conti
 
 To bring it back, on the Pro, `fabric job resume <job>` pulls it from the Air. `fabric job status <job>` and `fabric job log <job>` say where the job is and why on either Mac. `FABRIC_LOG=debug` shows what a node does.
 
-On the gate as measured, the Macs run different Claude Code versions, which doctor refuses for a Claude job; `fabric job move ... --force` (and `fabric job resume ... --force` for a pull) waives that row and prints it. Close every `claude` on the Air before a resume there: its session registry is too old to tell which sessions run (ADR 0015).
+On the gate as measured, the Macs run different Claude Code versions, which doctor refuses for a Claude job; `fabric job move ... --force` (and `fabric job resume ... --force` for a pull) waives that row and prints it. Close every `claude` on the Air before a resume there: restoring a Claude session refuses while any `claude` runs on a Claude older than 2.1.294, because its session registry is too old to tell which sessions run (ADR 0015). This is about the session state the resume writes, not trust, and the Pro, on 2.1.294, has no such rule.
 
 ## Known limits
 
@@ -84,6 +92,7 @@ On the gate as measured, the Macs run different Claude Code versions, which doct
 - `fabric job init`, which adopts a checkout in place, is not built; `job new` clones the repository into `~/fabric/jobs/<id>/work`.
 - No `fabric orphan export` and no fork rule: an orphan workspace is reported and left in place, and a ledger that forked after a steal stops catching up and says so in the log.
 - The node must run: every job command talks to it, and it supervises the harnesses it launched.
+- A network change can cut the two Macs apart (gate finding F3). The Pro moved from one subnet to another between two days of the gate and could no longer reach the Air's address. The side that dials must be the side that can reach the other: pair with an address it reaches today, and run `fabric node add` again with the new address when it changes. Nothing finds a peer that moved. Tailscale as an optional underlay, so the address stays the same across networks, is a follow-up.
 
 ## Decisions
 
