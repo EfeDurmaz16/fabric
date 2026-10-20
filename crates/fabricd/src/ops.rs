@@ -489,7 +489,7 @@ impl Node {
                 pid: record.pid.get(),
             });
         }
-        if !local::leads_group(pid) {
+        if !local::leads_group(pid).await {
             return Err(NodeError::HarnessGone { pid });
         }
         let started = local::process_started(pid)

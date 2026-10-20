@@ -257,9 +257,29 @@ fn leader_pid(pid: NonZeroU32) -> Option<Pid> {
     Pid::from_raw(i32::try_from(pid.get()).ok()?).filter(|pid| pid.as_raw_nonzero().get() > 1)
 }
 
-/// True when `pid` runs and leads its own process group, as a launched harness does.
-pub fn leads_group(pid: NonZeroU32) -> bool {
-    leader_pid(pid).is_some_and(|pid| rustix::process::getpgid(Some(pid)) == Ok(pid))
+/// True when `pid` leads its own process group, as a launched harness does.
+///
+/// A harness that already exited and that the CLI, its parent, has not
+/// reaped yet counts: a headless harness can finish its turn before the
+/// CLI registers it, and its group may still hold what it started.
+/// `getpgid` does not answer for such a process; `ps` does.
+pub async fn leads_group(pid: NonZeroU32) -> bool {
+    let Some(leader) = leader_pid(pid) else {
+        return false;
+    };
+    let Ok(output) = tokio::process::Command::new("ps")
+        .args(["-o", "pgid=", "-p", &pid.to_string()])
+        .env("LC_ALL", "C")
+        .output()
+        .await
+    else {
+        return false;
+    };
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<i32>()
+            == Ok(leader.as_raw_nonzero().get())
 }
 
 impl HarnessRecord {
@@ -380,6 +400,40 @@ mod tests {
         record.stop(Duration::from_secs(5)).await.unwrap();
         reaper.await.unwrap().unwrap();
         assert_eq!(record.liveness().await, Liveness::Gone);
+    }
+
+    /// A headless harness can finish its turn and exit before the CLI,
+    /// which has not reaped it yet, registers it; it still leads its group.
+    #[tokio::test]
+    async fn an_exited_leader_its_parent_has_not_reaped_still_leads_its_group() {
+        use std::os::unix::process::CommandExt;
+        let mut leader = std::process::Command::new("true")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = NonZeroU32::new(leader.id()).unwrap();
+        while process_started(pid).await.is_some()
+            && !std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap()
+                .stdout
+                .starts_with(b"Z")
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(leads_group(pid).await);
+        leader.wait().unwrap();
+        let mut member = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        assert!(
+            !leads_group(NonZeroU32::new(member.id()).unwrap()).await,
+            "a process in the test's group leads no group"
+        );
+        member.kill().unwrap();
+        member.wait().unwrap();
     }
 
     /// A harness that started a background process and exited: the record
