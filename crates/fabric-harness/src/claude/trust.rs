@@ -180,7 +180,7 @@ fn is_git_root(dir: &Path) -> bool {
 
 /// `path` with `.` and `..` resolved by text, as Node's `path.resolve`
 /// does for an absolute path.
-fn lexical(path: &Path) -> PathBuf {
+pub(super) fn lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for part in path.components() {
         match part {

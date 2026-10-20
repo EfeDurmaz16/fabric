@@ -476,6 +476,7 @@ impl ClaudeCode {
     fn add_file_history(
         &self,
         sources: &mut Vec<Source>,
+        root: &AbsPath,
         session: &SessionId,
         counts: &mut RedactionCounts,
     ) -> Result<(), HarnessError> {
@@ -492,7 +493,8 @@ impl ClaudeCode {
             .filter(|s| s.carry == Carry::JsonLines)
             .map(|s| s.abs.as_path())
             .collect();
-        let backups = history::Backups::read(&transcripts)?;
+        let backups =
+            history::Backups::read(&transcripts, self.home_dir(), pipeline::fs_path(root))?;
         for file in pipeline::walk(&dir)? {
             let name = file.to_string_lossy();
             if backups.admit(&name, counts) {
@@ -551,7 +553,7 @@ impl ClaudeCode {
         }
         let key = Self::key_of(root)?;
         self.add_tree(&mut sources, &projects.join(&key).join("memory"))?;
-        self.add_file_history(&mut sources, session, counts)?;
+        self.add_file_history(&mut sources, root, session, counts)?;
         let prefix8: String = session.as_str().chars().take(8).collect();
         self.add_tree(
             &mut sources,

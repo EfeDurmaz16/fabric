@@ -8,7 +8,9 @@
 //! the path it tracks. A backup of `.env`, a key file or any other denied
 //! name stays behind, and so does a backup no record names, because nothing
 //! says what it holds. Each one left behind is counted in the redaction
-//! report.
+//! report. A path is checked as recorded and again as the tree path it
+//! would have under `home/`, so the host-state rules that only read the
+//! `home/` form see `~/.claude/history.jsonl` however Claude spelled it.
 //!
 //! Record shape, read from the owner's transcripts on 2026-10-20 (key
 //! names only): `{"type":"file-history-snapshot","snapshot":
@@ -18,14 +20,17 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use tracing::warn;
 
 use crate::denylist;
 use crate::error::{HarnessError, IoOp};
+use crate::manifest::HOME_PREFIX;
 use crate::redact::RedactionCounts;
+
+use super::trust::lexical;
 
 /// The count name for a backup left behind because its original is denied.
 pub(crate) const DENIED_BACKUP: &str = "file-backup-of-denied-file";
@@ -63,17 +68,30 @@ enum Origin {
 
 /// The backups the transcripts name, each with whether its original may
 /// travel.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Backups {
     origins: BTreeMap<String, Origin>,
+    /// The home the tree paths are under.
+    home: PathBuf,
+    /// The workspace a relative recorded path is relative to.
+    workspace: PathBuf,
 }
 
 impl Backups {
-    /// Reads the `file-history-snapshot` records of every transcript.
-    /// A line that does not parse is skipped: a cut last line names no
-    /// backup, and a backup it would have named is then left behind.
-    pub(crate) fn read(transcripts: &[&Path]) -> Result<Self, HarnessError> {
-        let mut backups = Backups::default();
+    /// Reads the `file-history-snapshot` records of every transcript of a
+    /// session in `workspace` under `home`. A line that does not parse is
+    /// skipped: a cut last line names no backup, and a backup it would
+    /// have named is then left behind.
+    pub(crate) fn read(
+        transcripts: &[&Path],
+        home: &Path,
+        workspace: &Path,
+    ) -> Result<Self, HarnessError> {
+        let mut backups = Backups {
+            origins: BTreeMap::new(),
+            home: home.to_path_buf(),
+            workspace: workspace.to_path_buf(),
+        };
         for path in transcripts {
             let file = File::open(path).map_err(|e| HarnessError::io(IoOp::Read, path, e))?;
             let mut reader = BufReader::new(file);
@@ -111,7 +129,7 @@ impl Backups {
             let Some(backup) = tracked.backup else {
                 continue;
             };
-            let origin = if denylist::check(&original).is_some() {
+            let origin = if self.denied(&original) {
                 Origin::Denied
             } else {
                 Origin::Allowed
@@ -121,6 +139,26 @@ impl Backups {
                 *entry = Origin::Denied;
             }
         }
+    }
+
+    /// True when the denylist refuses `original` as recorded or as the
+    /// tree path it resolves to: under `home/` when it is under the home,
+    /// as an absolute path otherwise. A path that is not UTF-8 after
+    /// resolving is refused, since nothing can check it.
+    fn denied(&self, original: &str) -> bool {
+        if denylist::check(original).is_some() {
+            return true;
+        }
+        let full = match original.strip_prefix("~/") {
+            Some(rest) => self.home.join(rest),
+            None => self.workspace.join(original),
+        };
+        let full = lexical(&full);
+        let tree = match full.strip_prefix(&self.home) {
+            Ok(rest) => rest.to_str().map(|rest| format!("{HOME_PREFIX}/{rest}")),
+            Err(_) => full.to_str().map(str::to_owned),
+        };
+        tree.is_none_or(|tree| denylist::check(&tree).is_some())
     }
 
     /// True when the backup named `name` may travel; counts it under the
@@ -161,7 +199,8 @@ mod tests {
         text.push_str(&record("/w/.env.example", "ddd@v1"));
         text.push_str("{\"type\":\"file-history-snapshot\",\"snapshot\":{\"trackedFi");
         std::fs::write(&transcript, text).unwrap();
-        let backups = Backups::read(&[transcript.as_path()]).unwrap();
+        let backups =
+            Backups::read(&[transcript.as_path()], Path::new("/h"), Path::new("/w")).unwrap();
         let mut counts = RedactionCounts::new();
         assert!(backups.admit("aaa@v1", &mut counts));
         assert!(backups.admit("ddd@v1", &mut counts));
@@ -182,7 +221,34 @@ mod tests {
             record("a.txt", "aaa@v1")
         );
         std::fs::write(&transcript, text).unwrap();
-        let backups = Backups::read(&[transcript.as_path()]).unwrap();
+        let backups =
+            Backups::read(&[transcript.as_path()], Path::new("/h"), Path::new("/w")).unwrap();
         assert!(!backups.admit("aaa@v1", &mut RedactionCounts::new()));
+    }
+
+    #[test]
+    fn host_state_is_denied_however_the_record_spells_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("t.jsonl");
+        let text = [
+            record("/h/.claude/history.jsonl", "aaa@v1"),
+            record("../.codex/config.toml", "bbb@v1"),
+            record("~/.claude/stats-cache.json", "ccc@v1"),
+            record("/h/w/./../.claude/sessions/1.json", "ddd@v1"),
+            record("src/history.jsonl", "eee@v1"),
+            record("/h/w/notes/config.toml", "fff@v1"),
+        ]
+        .concat();
+        std::fs::write(&transcript, text).unwrap();
+        let backups =
+            Backups::read(&[transcript.as_path()], Path::new("/h"), Path::new("/h/w")).unwrap();
+        let mut counts = RedactionCounts::new();
+        for denied in ["aaa@v1", "bbb@v1", "ccc@v1", "ddd@v1"] {
+            assert!(!backups.admit(denied, &mut counts), "{denied}");
+        }
+        for allowed in ["eee@v1", "fff@v1"] {
+            assert!(backups.admit(allowed, &mut counts), "{allowed}");
+        }
+        assert_eq!(counts.get(DENIED_BACKUP), Some(&4));
     }
 }
