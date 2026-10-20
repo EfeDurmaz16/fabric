@@ -3,8 +3,14 @@
 //! Invariant: the client speaks only the baseline of ACP schema v1
 //! (`initialize`, `session/new`, `session/load`, `session/resume`,
 //! `session/prompt`, `session/cancel`, `session/update`), answers every
-//! agent request so the agent never blocks, and grants a permission only
-//! when the policy the caller chose says so. Deny is the default.
+//! agent request so the agent never blocks, never drops a `session/update`,
+//! and grants a permission only when the policy the caller chose says so,
+//! never more than it says. Deny is the default. A handshake request has a
+//! deadline, so a hung agent cannot hang `launch`. Every message reaches
+//! the agent as one whole line written by a single writer task, so a
+//! caller that drops a request mid-way cannot leave half a line on the
+//! agent's stdin, and a dropped request leaves no waiter behind. A line
+//! from the agent longer than `MAX_LINE` closes the connection.
 //!
 //! Field names follow `schema/v1/schema.json` of
 //! `agentclientprotocol/agent-client-protocol` at schema v1.26.0
@@ -13,10 +19,11 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -26,6 +33,12 @@ use crate::session::SessionId;
 
 /// The protocol version this client speaks.
 pub const PROTOCOL_VERSION: u16 = 1;
+
+/// How long `initialize` and the session handshake may take.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// The longest line read from the agent, in bytes.
+pub const MAX_LINE: usize = 16 * 1024 * 1024;
 
 /// Why an ACP exchange failed.
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +60,12 @@ pub enum AcpError {
     /// The agent closed its stdout.
     #[error("agent closed the connection")]
     Closed,
+    /// A handshake request got no answer within `HANDSHAKE_TIMEOUT`.
+    #[error("{method} got no answer within {HANDSHAKE_TIMEOUT:?}")]
+    Timeout {
+        /// The request that timed out.
+        method: &'static str,
+    },
     /// The agent answered `initialize` with a version this client does not speak.
     #[error("agent speaks protocol version {agent}, this client speaks {PROTOCOL_VERSION}")]
     Version {
@@ -102,7 +121,7 @@ impl StopReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionUpdate {
     /// The session the update is for.
-    pub session: String,
+    pub session: SessionId,
     /// The `update` object as the agent sent it.
     pub update: Value,
 }
@@ -113,7 +132,8 @@ pub enum PermissionPolicy {
     /// Pick a reject option; cancel when the agent offers none.
     #[default]
     Deny,
-    /// Pick an `allow_once` option, else `allow_always`, else reject.
+    /// Pick an `allow_once` option; when the agent offers none, reject.
+    /// A permanent grant is never picked by this policy.
     AllowOnce,
 }
 
@@ -125,12 +145,10 @@ impl PermissionPolicy {
                 .find(|o| o.get("kind").and_then(Value::as_str) == Some(kind))
                 .and_then(|o| o.get("optionId").cloned())
         };
+        let reject = || find("reject_once").or_else(|| find("reject_always"));
         let picked = match self {
-            PermissionPolicy::AllowOnce => find("allow_once")
-                .or_else(|| find("allow_always"))
-                .or_else(|| find("reject_once"))
-                .or_else(|| find("reject_always")),
-            PermissionPolicy::Deny => find("reject_once").or_else(|| find("reject_always")),
+            PermissionPolicy::AllowOnce => find("allow_once").or_else(reject),
+            PermissionPolicy::Deny => reject(),
         };
         match picked {
             Some(option_id) => {
@@ -143,13 +161,13 @@ impl PermissionPolicy {
 
 type Waiter = oneshot::Sender<Result<Value, AcpError>>;
 type Pending = Arc<Mutex<Option<HashMap<u64, Waiter>>>>;
-type SharedStdin = Arc<tokio::sync::Mutex<ChildStdin>>;
+type Outgoing = mpsc::UnboundedSender<String>;
 
 struct Inner {
-    stdin: SharedStdin,
+    outgoing: Outgoing,
     pending: Pending,
     next_id: AtomicU64,
-    updates: tokio::sync::Mutex<mpsc::Receiver<SessionUpdate>>,
+    updates: tokio::sync::Mutex<mpsc::UnboundedReceiver<SessionUpdate>>,
     capabilities: Mutex<Option<AgentCapabilities>>,
     reader: JoinHandle<()>,
 }
@@ -172,9 +190,6 @@ impl std::fmt::Debug for AcpClient {
     }
 }
 
-/// How many updates may queue before new ones are dropped with a warning.
-const UPDATE_QUEUE: usize = 1024;
-
 #[derive(Deserialize)]
 struct Incoming {
     id: Option<Value>,
@@ -193,13 +208,38 @@ struct RpcErrorBody {
     message: String,
 }
 
-async fn write_line(stdin: &SharedStdin, value: &Value) -> Result<(), AcpError> {
+/// Queues one message for the writer task as a whole line.
+fn write_line(outgoing: &Outgoing, value: &Value) -> Result<(), AcpError> {
     let mut text = serde_json::to_string(value).map_err(|e| AcpError::Protocol(e.to_string()))?;
     text.push('\n');
-    let mut guard = stdin.lock().await;
-    guard.write_all(text.as_bytes()).await?;
-    guard.flush().await?;
-    Ok(())
+    outgoing.send(text).map_err(|_| AcpError::Closed)
+}
+
+/// Writes queued lines to the agent until every sender is gone or a write
+/// fails; then the agent's stdin is closed.
+async fn write_loop(mut stdin: ChildStdin, mut lines: mpsc::UnboundedReceiver<String>) {
+    while let Some(line) = lines.recv().await {
+        let written = async {
+            stdin.write_all(line.as_bytes()).await?;
+            stdin.flush().await
+        };
+        if let Err(e) = written.await {
+            warn!(error = %e, "acp: write failed");
+            break;
+        }
+    }
+}
+
+/// Removes a request's waiter when the request is dropped before its answer.
+struct WaiterGuard<'a> {
+    pending: &'a Pending,
+    id: u64,
+}
+
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        take_waiter(self.pending, self.id);
+    }
 }
 
 fn fail_pending(pending: &Pending) {
@@ -219,27 +259,52 @@ fn take_waiter(pending: &Pending, id: u64) -> Option<Waiter> {
         .and_then(|mut guard| guard.as_mut().and_then(|map| map.remove(&id)))
 }
 
+fn parse_update(params: &Value) -> Option<SessionUpdate> {
+    let raw = params.get("sessionId").and_then(Value::as_str)?;
+    let session = match SessionId::parse(raw) {
+        Ok(session) => session,
+        Err(e) => {
+            warn!(session = raw, error = %e, "acp: update names an invalid session; dropped");
+            return None;
+        }
+    };
+    let update = params.get("update").cloned().unwrap_or(Value::Null);
+    Some(SessionUpdate { session, update })
+}
+
 async fn read_loop(
     stdout: ChildStdout,
-    stdin: SharedStdin,
+    outgoing: Outgoing,
     pending: Pending,
-    updates: mpsc::Sender<SessionUpdate>,
+    updates: mpsc::UnboundedSender<SessionUpdate>,
     policy: PermissionPolicy,
 ) {
-    let mut lines = BufReader::new(stdout).lines();
+    let mut reader = BufReader::new(stdout);
+    let mut line = Vec::new();
     loop {
-        let line = match lines.next_line().await {
-            Ok(Some(line)) => line,
-            Ok(None) => break,
+        line.clear();
+        let limit = u64::try_from(MAX_LINE)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        match (&mut reader).take(limit).read_until(b'\n', &mut line).await {
+            Ok(0) => break,
+            Ok(_) if line.len() > MAX_LINE => {
+                warn!(
+                    limit = MAX_LINE,
+                    "acp: line from the agent is too long; closing"
+                );
+                break;
+            }
+            Ok(_) => {}
             Err(e) => {
                 warn!(error = %e, "acp: read failed");
                 break;
             }
-        };
-        if line.trim().is_empty() {
+        }
+        if line.trim_ascii().is_empty() {
             continue;
         }
-        let message: Incoming = match serde_json::from_str(&line) {
+        let message: Incoming = match serde_json::from_slice(line.trim_ascii()) {
             Ok(m) => m,
             Err(e) => {
                 warn!(error = %e, "acp: line is not JSON-RPC; ignored");
@@ -264,8 +329,8 @@ async fn read_loop(
                         "error": { "code": -32601, "message": format!("method not supported by this client: {method}") }
                     })
                 };
-                if let Err(e) = write_line(&stdin, &response).await {
-                    warn!(error = %e, "acp: write failed");
+                if write_line(&outgoing, &response).is_err() {
+                    warn!("acp: writer closed; stopping");
                     break;
                 }
             }
@@ -290,15 +355,10 @@ async fn read_loop(
             }
             (None, Some(method)) => {
                 if method == "session/update" {
-                    let session = message
-                        .params
-                        .get("sessionId")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned();
-                    let update = message.params.get("update").cloned().unwrap_or(Value::Null);
-                    if updates.try_send(SessionUpdate { session, update }).is_err() {
-                        warn!("acp: update queue full or closed; update dropped");
+                    if let Some(update) = parse_update(&message.params)
+                        && updates.send(update).is_err()
+                    {
+                        debug!("acp: update receiver dropped");
                     }
                 } else {
                     debug!(%method, "acp: notification ignored");
@@ -314,19 +374,20 @@ impl AcpClient {
     /// Takes over the agent's pipes and starts reading.
     #[must_use]
     pub fn attach(stdin: ChildStdin, stdout: ChildStdout, policy: PermissionPolicy) -> Self {
-        let stdin: SharedStdin = Arc::new(tokio::sync::Mutex::new(stdin));
+        let (outgoing, lines) = mpsc::unbounded_channel();
+        tokio::spawn(write_loop(stdin, lines));
         let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
-        let (tx, rx) = mpsc::channel(UPDATE_QUEUE);
+        let (tx, rx) = mpsc::unbounded_channel();
         let reader = tokio::spawn(read_loop(
             stdout,
-            Arc::clone(&stdin),
+            outgoing.clone(),
             Arc::clone(&pending),
             tx,
             policy,
         ));
         AcpClient {
             inner: Arc::new(Inner {
-                stdin,
+                outgoing,
                 pending,
                 next_id: AtomicU64::new(1),
                 updates: tokio::sync::Mutex::new(rx),
@@ -352,23 +413,31 @@ impl AcpClient {
                 None => return Err(AcpError::Closed),
             }
         }
+        let _guard = WaiterGuard {
+            pending: &self.inner.pending,
+            id,
+        };
         let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        if let Err(e) = write_line(&self.inner.stdin, &message).await {
-            take_waiter(&self.inner.pending, id);
-            return Err(e);
-        }
+        write_line(&self.inner.outgoing, &message)?;
         rx.await.map_err(|_| AcpError::Closed)?
     }
 
-    async fn notify(&self, method: &str, params: Value) -> Result<(), AcpError> {
+    /// A request that must be answered within `HANDSHAKE_TIMEOUT`.
+    async fn handshake(&self, method: &'static str, params: Value) -> Result<Value, AcpError> {
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, self.request(method, params))
+            .await
+            .map_err(|_| AcpError::Timeout { method })?
+    }
+
+    fn notify(&self, method: &str, params: &Value) -> Result<(), AcpError> {
         let message = json!({ "jsonrpc": "2.0", "method": method, "params": params });
-        write_line(&self.inner.stdin, &message).await
+        write_line(&self.inner.outgoing, &message)
     }
 
     /// Sends `initialize` and records what the agent can do.
     pub async fn initialize(&self) -> Result<AgentCapabilities, AcpError> {
         let result = self
-            .request(
+            .handshake(
                 "initialize",
                 json!({
                     "protocolVersion": PROTOCOL_VERSION,
@@ -425,7 +494,7 @@ impl AcpClient {
     /// Sends `session/new` for `cwd` and returns the new session id.
     pub async fn new_session(&self, cwd: &str) -> Result<SessionId, AcpError> {
         let result = self
-            .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
+            .handshake("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
             .await?;
         let id = result
             .get("sessionId")
@@ -436,7 +505,7 @@ impl AcpClient {
 
     /// Sends `session/load`; the agent replays history as updates.
     pub async fn load_session(&self, session: &SessionId, cwd: &str) -> Result<(), AcpError> {
-        self.request(
+        self.handshake(
             "session/load",
             json!({ "sessionId": session.as_str(), "cwd": cwd, "mcpServers": [] }),
         )
@@ -446,7 +515,7 @@ impl AcpClient {
 
     /// Sends `session/resume`; no replay.
     pub async fn resume_session(&self, session: &SessionId, cwd: &str) -> Result<(), AcpError> {
-        self.request(
+        self.handshake(
             "session/resume",
             json!({ "sessionId": session.as_str(), "cwd": cwd, "mcpServers": [] }),
         )
@@ -474,10 +543,9 @@ impl AcpClient {
         Ok(StopReason::parse(reason))
     }
 
-    /// Sends `session/cancel`.
-    pub async fn cancel(&self, session: &SessionId) -> Result<(), AcpError> {
-        self.notify("session/cancel", json!({ "sessionId": session.as_str() }))
-            .await
+    /// Queues `session/cancel`.
+    pub fn cancel(&self, session: &SessionId) -> Result<(), AcpError> {
+        self.notify("session/cancel", &json!({ "sessionId": session.as_str() }))
     }
 
     /// Waits for the next `session/update`; `None` once the agent has closed.
@@ -491,7 +559,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deny_policy_never_picks_an_allow_option() {
+    fn policies_never_grant_more_than_they_say() {
         let options = vec![
             json!({ "optionId": "a", "name": "Allow", "kind": "allow_once" }),
             json!({ "optionId": "r", "name": "Reject", "kind": "reject_once" }),
@@ -504,9 +572,22 @@ mod tests {
             PermissionPolicy::AllowOnce.choose(&options),
             json!({ "outcome": { "outcome": "selected", "optionId": "a" } })
         );
-        let only_allow = vec![json!({ "optionId": "a", "name": "Allow", "kind": "allow_always" })];
+        let only_always = vec![
+            json!({ "optionId": "A", "name": "Always", "kind": "allow_always" }),
+            json!({ "optionId": "r", "name": "Reject", "kind": "reject_once" }),
+        ];
         assert_eq!(
-            PermissionPolicy::Deny.choose(&only_allow),
+            PermissionPolicy::AllowOnce.choose(&only_always),
+            json!({ "outcome": { "outcome": "selected", "optionId": "r" } }),
+            "once never becomes always"
+        );
+        let no_reject = vec![json!({ "optionId": "A", "name": "Always", "kind": "allow_always" })];
+        assert_eq!(
+            PermissionPolicy::Deny.choose(&no_reject),
+            json!({ "outcome": { "outcome": "cancelled" } })
+        );
+        assert_eq!(
+            PermissionPolicy::AllowOnce.choose(&no_reject),
             json!({ "outcome": { "outcome": "cancelled" } })
         );
     }
@@ -519,5 +600,13 @@ mod tests {
             StopReason::parse("new_thing"),
             StopReason::Other("new_thing".to_owned())
         );
+    }
+
+    #[test]
+    fn an_update_with_a_bad_session_id_is_dropped() {
+        assert!(parse_update(&json!({ "sessionId": "../x", "update": {} })).is_none());
+        assert!(parse_update(&json!({ "update": {} })).is_none());
+        let update = parse_update(&json!({ "sessionId": "s1", "update": { "k": 1 } })).unwrap();
+        assert_eq!(update.session.as_str(), "s1");
     }
 }

@@ -99,7 +99,7 @@ async fn client_runs_a_turn_and_denies_permission_by_default() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(update.session, session.as_str());
+    assert_eq!(update.session, session);
     assert_eq!(update.update["content"]["text"], "echo: first");
 
     let reason = tokio::time::timeout(TIMEOUT, client.prompt(&session, "second"))
@@ -107,7 +107,7 @@ async fn client_runs_a_turn_and_denies_permission_by_default() {
         .unwrap()
         .unwrap();
     assert_eq!(reason, StopReason::EndTurn);
-    client.cancel(&session).await.unwrap();
+    client.cancel(&session).unwrap();
     drop(client);
     let mut running = running;
     running.child.kill().await.ok();
