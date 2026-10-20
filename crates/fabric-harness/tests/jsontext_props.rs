@@ -1,8 +1,9 @@
 //! Property tests for the JSON redaction (ADR 0006): a signed block that
 //! holds no secret stays byte-identical, one that holds a secret is dropped
-//! whole however many of its neighbours are dropped too, no secret
-//! survives outside the kept blocks, the output is JSON, and redacting the
-//! output again changes nothing.
+//! whole however many of its neighbours are dropped too and whatever
+//! signed blocks it holds itself, no secret survives outside the kept
+//! blocks, the output is JSON, and redacting the output again changes
+//! nothing.
 
 #![allow(
     clippy::unwrap_used,
@@ -45,6 +46,21 @@ fn signed_block_maybe_secret() -> impl Strategy<Value = Value> {
     })
 }
 
+/// A signed block that holds an array of signed blocks, each of which may
+/// hold a secret.
+fn nested_signed_block() -> impl Strategy<Value = Value> {
+    (
+        signed_block_maybe_secret(),
+        prop::collection::vec(signed_block_maybe_secret(), 0..3),
+    )
+        .prop_map(|(mut outer, inner)| {
+            if let Value::Object(map) = &mut outer {
+                map.insert("items".to_owned(), Value::Array(inner));
+            }
+            outer
+        })
+}
+
 fn value_with_secrets_strategy() -> impl Strategy<Value = Value> {
     let leaf = prop_oneof![
         text_strategy().prop_map(Value::String),
@@ -55,7 +71,11 @@ fn value_with_secrets_strategy() -> impl Strategy<Value = Value> {
     leaf.prop_recursive(4, 48, 6, |inner| {
         prop_oneof![
             prop::collection::vec(
-                prop_oneof![inner.clone(), signed_block_maybe_secret()],
+                prop_oneof![
+                    inner.clone(),
+                    signed_block_maybe_secret(),
+                    nested_signed_block()
+                ],
                 0..5
             )
             .prop_map(Value::Array),
@@ -97,10 +117,20 @@ fn value_strategy() -> impl Strategy<Value = Value> {
     })
 }
 
+/// The rule `jsontext` documents: a thinking block with a signature, or a
+/// redacted thinking block.
+fn is_signed(map: &Map<String, Value>) -> bool {
+    match map.get("type").and_then(Value::as_str) {
+        Some("thinking") => map.contains_key("signature"),
+        Some("redacted_thinking") => true,
+        _ => false,
+    }
+}
+
 fn signed_spans(value: &Value, out: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
-            if map.contains_key("signature") {
+            if is_signed(map) {
                 out.push(serde_json::to_string(value).unwrap());
             } else {
                 map.values().for_each(|v| signed_spans(v, out));
@@ -114,7 +144,7 @@ fn signed_spans(value: &Value, out: &mut Vec<String>) {
 fn strings_outside_signed(value: &Value, out: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
-            if !map.contains_key("signature") {
+            if !is_signed(map) {
                 map.values().for_each(|v| strings_outside_signed(v, out));
             }
         }

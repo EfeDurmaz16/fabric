@@ -1019,7 +1019,7 @@ mod tests {
     fn stage_counts_a_dropped_signed_block() {
         let dir = tempfile::tempdir().unwrap();
         let line = format!(
-            "{{\"content\":[{{\"type\":\"text\",\"text\":\"a\"}},{{\"thinking\":\"{GITHUB}\",\"signature\":\"s\"}}]}}\n"
+            "{{\"content\":[{{\"type\":\"text\",\"text\":\"a\"}},{{\"type\":\"thinking\",\"thinking\":\"{GITHUB}\",\"signature\":\"s\"}}]}}\n"
         );
         let src = dir.path().join("t.jsonl");
         fs::write(&src, line).unwrap();

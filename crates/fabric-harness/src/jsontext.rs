@@ -1,11 +1,16 @@
 //! Redacting JSON text without touching signed blocks.
 //!
-//! Invariant: an object that has a `signature` key is copied byte for byte,
-//! or dropped whole when it is an array element that holds a secret; it is
-//! never edited. Every other string value is decoded, redacted and
-//! re-encoded, and the result is valid JSON whenever the input was. The
-//! scanner reads one JSON text once and never builds a tree; a transcript
-//! is fed to it one line at a time.
+//! Invariant: a signed block is copied byte for byte, or dropped whole when
+//! it is an array element that holds a secret; it is never edited. A signed
+//! block is a Claude content block whose signature the API checks: an
+//! object whose `type` is `thinking` and that has a `signature` key, or an
+//! object whose `type` is `redacted_thinking`. Any other object with a
+//! `signature` key (a webhook payload, a JWS in a tool result) is ordinary
+//! JSON. A signed block nested in another is covered by the outer one.
+//! Every other string value is decoded, redacted and re-encoded, and the
+//! result is valid JSON whenever the input was. The scanner reads one JSON
+//! text once and never builds a tree; a transcript is fed to it one line at
+//! a time.
 
 use std::ops::Range;
 
@@ -59,11 +64,35 @@ enum Expect {
     CommaOrEnd,
 }
 
+/// The `type` of an object, as far as signing is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockType {
+    /// Any other type, or none.
+    Other,
+    /// `"type": "thinking"`.
+    Thinking,
+    /// `"type": "redacted_thinking"`.
+    RedactedThinking,
+}
+
 struct Frame {
     kind: Container,
     start: usize,
-    signed: bool,
+    has_signature: bool,
+    block: BlockType,
+    /// True between a `"type"` key and its value.
+    awaiting_type: bool,
     expect: Expect,
+}
+
+impl Frame {
+    fn is_signed(&self) -> bool {
+        match self.block {
+            BlockType::Thinking => self.has_signature,
+            BlockType::RedactedThinking => true,
+            BlockType::Other => false,
+        }
+    }
 }
 
 struct SignedBlock {
@@ -152,7 +181,9 @@ impl Scanner<'_> {
         self.stack.push(Frame {
             kind,
             start: at,
-            signed: false,
+            has_signature: false,
+            block: BlockType::Other,
+            awaiting_type: false,
             expect,
         });
         Ok(())
@@ -176,7 +207,7 @@ impl Scanner<'_> {
         if frame.kind != closes || !may_close {
             return not_json(at);
         }
-        if frame.signed {
+        if frame.is_signed() {
             let in_array = self
                 .stack
                 .last()
@@ -191,14 +222,33 @@ impl Scanner<'_> {
 
     fn string(&mut self, at: usize) -> Result<usize, TransformError> {
         let end = scan_string(self.text.as_bytes(), at)?;
+        let raw = &self.text[at..end];
         match self.stack.last_mut() {
             Some(frame) if matches!(frame.expect, Expect::FirstKey | Expect::Key) => {
                 frame.expect = Expect::Colon;
-                if &self.text[at..end] == "\"signature\"" {
-                    frame.signed = true;
+                frame.awaiting_type = raw == "\"type\"";
+                if raw == "\"signature\"" {
+                    frame.has_signature = true;
                 }
             }
-            _ => self.begin_value(at)?,
+            _ => {
+                self.begin_value(at)?;
+                if let Some(frame) = self.stack.last_mut()
+                    && frame.kind == Container::Object
+                    && frame.awaiting_type
+                {
+                    frame.block = match serde_json::from_str::<String>(raw).as_deref() {
+                        Ok("thinking") => BlockType::Thinking,
+                        Ok("redacted_thinking") => BlockType::RedactedThinking,
+                        _ => BlockType::Other,
+                    };
+                }
+            }
+        }
+        if let Some(frame) = self.stack.last_mut()
+            && frame.expect != Expect::Colon
+        {
+            frame.awaiting_type = false;
         }
         self.out.strings.push(at..end);
         Ok(end)
@@ -278,7 +328,9 @@ fn scan(text: &str) -> Result<Scan, TransformError> {
 /// True when only whitespace and one comma separate `end` from `start`,
 /// which makes two array elements neighbours.
 fn only_a_comma_between(text: &str, end: usize, start: usize) -> bool {
-    let between = &text[end..start];
+    let Some(between) = text.get(end..start) else {
+        return false;
+    };
     between.matches(',').count() == 1
         && between
             .chars()
@@ -329,16 +381,27 @@ pub fn transform(text: &str, redactor: &Redactor) -> Result<Outcome, TransformEr
     let mut outcome = Outcome::default();
     let mut edits: Vec<(Range<usize>, String)> = Vec::new();
 
-    let mut dropped = Vec::new();
-    for block in &scan.signed {
-        let raw = &text[block.span.clone()];
-        if redactor.matches(raw) {
-            if !block.in_array {
-                return Err(TransformError::SecretInUndroppableSignedBlock);
-            }
-            dropped.push(block.span.clone());
-            outcome.dropped_signed_blocks += 1;
+    // A signed block nested in another one that is dropped goes with it,
+    // so only the outermost blocks that hold a secret are considered.
+    let mut holding: Vec<&SignedBlock> = scan
+        .signed
+        .iter()
+        .filter(|block| redactor.matches(&text[block.span.clone()]))
+        .collect();
+    holding.sort_by_key(|block| (block.span.start, std::cmp::Reverse(block.span.end)));
+    let mut dropped: Vec<Range<usize>> = Vec::new();
+    for block in holding {
+        if dropped
+            .last()
+            .is_some_and(|outer| block.span.end <= outer.end)
+        {
+            continue;
         }
+        if !block.in_array {
+            return Err(TransformError::SecretInUndroppableSignedBlock);
+        }
+        dropped.push(block.span.clone());
+        outcome.dropped_signed_blocks += 1;
     }
     for run in merge_neighbours(text, dropped) {
         edits.push((element_removal(text, &run), String::new()));
@@ -448,34 +511,38 @@ mod tests {
         );
 
         let last = format!(
-            r#"{{"content":[{{"type":"text","text":"a"}},{{"thinking":"{ANTHROPIC}","signature":"s"}}]}}"#
+            r#"{{"content":[{{"type":"text","text":"a"}},{{"type":"thinking","thinking":"{ANTHROPIC}","signature":"s"}}]}}"#
         );
         assert_eq!(
             redact(&last).unwrap().text.unwrap(),
             r#"{"content":[{"type":"text","text":"a"}]}"#
         );
 
-        let only = format!(r#"{{"content":[{{"thinking":"{ANTHROPIC}","signature":"s"}}]}}"#);
+        let only = format!(
+            r#"{{"content":[{{"type":"thinking","thinking":"{ANTHROPIC}","signature":"s"}}]}}"#
+        );
         assert_eq!(redact(&only).unwrap().text.unwrap(), r#"{"content":[]}"#);
     }
 
     #[test]
     fn neighbouring_signed_elements_with_secrets_are_all_dropped() {
         let adjacent = format!(
-            r#"[{{"thinking":"{ANTHROPIC}","signature":"a"}},{{"thinking":"{GITHUB}","signature":"b"}}]"#
+            r#"[{{"type":"thinking","thinking":"{ANTHROPIC}","signature":"a"}},{{"type":"thinking","thinking":"{GITHUB}","signature":"b"}}]"#
         );
         let out = redact(&adjacent).unwrap();
         assert_eq!(out.dropped_signed_blocks, 2);
         assert_eq!(out.text.unwrap(), "[]");
         let trailing_run = format!(
-            r#"[1, {{"thinking":"{ANTHROPIC}","signature":"a"}}, {{"thinking":"{GITHUB}","signature":"b"}}]"#
+            r#"[1, {{"type":"thinking","thinking":"{ANTHROPIC}","signature":"a"}}, {{"type":"thinking","thinking":"{GITHUB}","signature":"b"}}]"#
         );
         assert_eq!(redact(&trailing_run).unwrap().text.unwrap(), "[1]");
     }
 
     #[test]
     fn secret_in_a_signed_object_value_is_refused() {
-        let line = format!(r#"{{"block":{{"thinking":"{ANTHROPIC}","signature":"s"}}}}"#);
+        let line = format!(
+            r#"{{"block":{{"type":"thinking","thinking":"{ANTHROPIC}","signature":"s"}}}}"#
+        );
         assert_eq!(
             redact(&line),
             Err(TransformError::SecretInUndroppableSignedBlock)
@@ -513,5 +580,32 @@ mod tests {
         ] {
             assert!(redact(good).is_ok(), "{good:?} must be accepted");
         }
+    }
+
+    #[test]
+    fn an_object_with_a_signature_key_that_is_not_a_thinking_block_is_redacted() {
+        let line = format!(
+            r#"[{{"signature":"a","items":[{{"signature":"b","t":"{GITHUB}"}}]}},{{"payload":{{"signature":"c","k":"{GITHUB}"}}}}]"#
+        );
+        let out = redact(&line).unwrap();
+        assert_eq!(out.dropped_signed_blocks, 0);
+        assert_eq!(
+            out.text.unwrap(),
+            r#"[{"signature":"a","items":[{"signature":"b","t":"[REDACTED:github-token]"}]},{"payload":{"signature":"c","k":"[REDACTED:github-token]"}}]"#
+        );
+    }
+
+    #[test]
+    fn a_signed_block_nested_in_a_dropped_one_goes_with_it() {
+        let inner = format!(r#"{{"type":"thinking","thinking":"{GITHUB}","signature":"b"}}"#);
+        let line = format!(
+            r#"{{"content":[{{"type":"text","text":"a"}},{{"type":"thinking","thinking":"x","signature":"a","items":[{inner},{inner}]}},{{"type":"redacted_thinking","data":"{GITHUB}"}}]}}"#
+        );
+        let out = redact(&line).unwrap();
+        assert_eq!(out.dropped_signed_blocks, 2);
+        assert_eq!(
+            out.text.unwrap(),
+            r#"{"content":[{"type":"text","text":"a"}]}"#
+        );
     }
 }
