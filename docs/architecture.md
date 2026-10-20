@@ -27,14 +27,14 @@ Harnesses (Claude Code, Codex, anything that speaks the Agent Client Protocol) a
 crates/
   fabric-core      job, ledger, manifest, lease and move state machine, trait definitions
   fabric-store     objects, blob store, SQLite catalog, snapshot publish and restore, ignored-file classes
-  fabric-net       node identity, Transport trait, QUIC and TCP+TLS, blob transfer, pairing
+  fabric-net       node identity, Endpoint and the per-wire Transport trait, QUIC and TCP+TLS, blob transfer, pairing
   fabric-harness   Harness trait, ACP adapter, Claude Code adapter, Codex adapter
   fabric-env       EnvSpec detection, carry keys, materialization, doctor facts
   fabric-node      the long-running node process: owner of the store lock, blob server, move target
   fabric-cli       the `fabric` binary: job init, suspend, resume, job move, job steal, status, doctor, orphan export, node pair, node serve
 ```
 
-Only `fabric-core` and `fabric-net` exist today. Dependency direction is strictly downward: `fabric-cli` depends on everything, `fabric-core` depends on nothing in the workspace. `fabric-core` defines the `Store` and `Harness` traits; `fabric-net` defines `Transport`, because its byte streams are tokio types the core does not depend on, and the node crate holds it as a `Box<dyn Transport>`; `BoxFuture`, the return type of every dynamically dispatched trait, is defined once in `fabric-core`. Nothing in the core knows about QUIC, SQLite or any agent vendor.
+Only `fabric-core` and `fabric-net` exist today. Dependency direction is strictly downward: `fabric-cli` depends on everything, `fabric-core` depends on nothing in the workspace. Today `fabric-core` defines one trait, `LedgerStore`, and `BoxFuture`, the return type of every dynamically dispatched trait, defined once. The `Store` and `Harness` traits are planned there. `fabric-net` defines `Transport`, the interface of one wire, because its byte streams are tokio types the core does not depend on; the node crate will hold an `Endpoint`, which binds both wires on one port and is the place an iroh endpoint would replace (ADR 0013). Nothing in the core knows about QUIC, SQLite or any agent vendor.
 
 ## Data structures first
 
