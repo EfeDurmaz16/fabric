@@ -122,8 +122,8 @@ impl SecretPolicy {
             .or_else(|| {
                 self.added
                     .iter()
+                    .find(|pattern| pattern_matches(pattern, path.as_str()))
                     .map(SecretPattern::as_str)
-                    .find(|pattern| path_matches(pattern, &names, &[]))
             })
     }
 
@@ -245,6 +245,12 @@ fn changed_list(changed: &[Denied]) -> String {
         .map(|denied| format!("{} ({})", denied.path, denied.pattern))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Returns true when a job's `pattern` denies `path`, a relative path whose components are separated by `/`.
+pub(crate) fn pattern_matches(pattern: &SecretPattern, path: &str) -> bool {
+    let names: Vec<&str> = path.split('/').collect();
+    path_matches(pattern.as_str(), &names, &[])
 }
 
 /// Returns true when the components of `pattern` match a run of `names`, the components of a path.

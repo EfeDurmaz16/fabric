@@ -727,6 +727,17 @@ fn removing_a_pattern_from_the_override_file_does_not_shrink_the_policy() {
     assert_eq!(second.spec().secret_patterns.len(), 1);
 }
 
+/// Detection runs again on every resume with the job's last spec; the same
+/// files must give the same spec, override file included.
+#[test]
+fn detecting_with_the_previous_spec_gives_the_same_spec() {
+    let found = detect(&fixture("override"), None).unwrap();
+    let again = detect(&fixture("override"), Some(found.spec())).unwrap();
+    assert_eq!(again.spec(), found.spec());
+    assert_eq!(again.spec().id().unwrap(), found.spec().id().unwrap());
+    assert!(!found.spec().secret_patterns.is_empty());
+}
+
 /// ADR 0012 gives a build output the key of the ecosystem that made it, so
 /// a declared cache takes the one ecosystem detection found, the one it
 /// names, or `other` when nothing was found; it never guesses between two.

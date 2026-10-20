@@ -45,13 +45,10 @@ use fabric_core::snapshot::CacheClass;
 use toml::Table;
 
 use crate::overrides::{
-    DeclaredCache, DeclaredEcosystem, EnvOverride, OverrideError, PackageManagerName,
-    canonical_tool, line_and_column,
+    DeclaredCache, DeclaredEcosystem, EnvOverride, OVERRIDE_FILE, OverrideError,
+    PackageManagerName, canonical_tool, line_and_column,
 };
 use crate::secret::{Scope, SecretPolicy};
-
-/// Where the override file lives, relative to the workspace root.
-pub const OVERRIDE_FILE: &str = ".fabric/env.toml";
 
 /// The largest file detection reads; a bigger one is refused rather than loaded.
 const MAX_FILE_LEN: u64 = 4 << 20;

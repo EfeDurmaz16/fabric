@@ -44,6 +44,11 @@ use fabric_core::path::{PathError, RelPath};
 use fabric_core::snapshot::CacheClass;
 use toml::{Table, Value};
 
+use crate::secret::pattern_matches;
+
+/// Where the override file lives, relative to the workspace root.
+pub const OVERRIDE_FILE: &str = ".fabric/env.toml";
+
 /// The directory that holds Fabric's own files in a workspace; never a cache.
 const FABRIC_DIR: &str = ".fabric";
 const FABRIC_DIR_PREFIX: &str = ".fabric/";
@@ -128,6 +133,17 @@ pub enum OverrideError {
         /// What is wrong with it.
         #[source]
         reason: SecretPatternError,
+    },
+    /// An entry of `secret_patterns` that denies the override file itself.
+    ///
+    /// Detection reads the override file through the job's patterns, so
+    /// such a pattern would drop every override from the next detection on.
+    #[error(
+        "`secret_patterns[{index}]` matches {OVERRIDE_FILE}, which detection must be able to read"
+    )]
+    PatternDeniesOverrideFile {
+        /// Zero-based index in `secret_patterns`.
+        index: usize,
     },
     /// A setup argument shaped like a credential; the spec travels to other nodes.
     #[error(
@@ -372,7 +388,12 @@ fn patterns(value: &Value) -> Result<Vec<SecretPattern>, OverrideError> {
         .into_iter()
         .enumerate()
         .map(|(index, text)| {
-            SecretPattern::parse(text).map_err(|reason| OverrideError::Pattern { index, reason })
+            let pattern = SecretPattern::parse(text)
+                .map_err(|reason| OverrideError::Pattern { index, reason })?;
+            if pattern_matches(&pattern, OVERRIDE_FILE) {
+                return Err(OverrideError::PatternDeniesOverrideFile { index });
+            }
+            Ok(pattern)
         })
         .collect()
 }
@@ -767,6 +788,22 @@ when = "always"
         }
         let siblings = "[[cache]]\npath = \"out\"\nclass = \"build\"\n[[cache]]\npath = \"outer\"\nclass = \"build\"";
         assert_eq!(EnvOverride::parse(siblings).unwrap().caches.len(), 2);
+    }
+
+    /// Detection reads the override file through the job's patterns, so a
+    /// pattern that denies it would drop every override from then on.
+    #[test]
+    fn a_pattern_that_denies_the_override_file_is_refused() {
+        for pattern in ["*.toml", "env.toml", ".fabric", "*", ".FABRIC/ENV.TOML"] {
+            let text = format!("secret_patterns = [\"*.sqlite\", \"{pattern}\"]");
+            assert!(
+                matches!(
+                    EnvOverride::parse(&text),
+                    Err(OverrideError::PatternDeniesOverrideFile { index: 1 })
+                ),
+                "{pattern}"
+            );
+        }
     }
 
     #[test]
