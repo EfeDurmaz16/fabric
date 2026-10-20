@@ -368,6 +368,10 @@ impl Session {
     }
 
     /// Sends one request and waits at most `deadline` for its answer.
+    ///
+    /// The peer stops work when the budget it was given runs out and says
+    /// so with `Fault::Deadline`. That is the same outcome as this side's
+    /// timer firing first, so both are `RpcError::Deadline`.
     async fn call(&self, body: RequestBody, deadline: Duration) -> Result<ResponseBody, RpcError> {
         let id = self.next_request_id();
         let request = Request {
@@ -378,6 +382,7 @@ impl Session {
         let exchange = async {
             let mut recv = send_request(self.connection.as_ref(), &request).await?;
             match read_response(recv.as_mut(), id, MAX_CONTROL_FRAME).await? {
+                ResponseBody::Fault(Fault::Deadline) => Err(RpcError::Deadline(deadline)),
                 ResponseBody::Fault(fault) => Err(RpcError::Fault(fault)),
                 body => Ok(body),
             }
