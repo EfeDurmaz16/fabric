@@ -13,7 +13,9 @@ The key signs a self-signed certificate. The certificate is only the carrier:
 a client accepts a server only if the certificate's key equals the id it
 dialed, a server accepts a client only if the certificate's key is in the
 peer book, and both check the handshake signature against that key itself.
-No CA, no name, no date. TLS 1.3 only, ed25519 only, 0-RTT off.
+No CA, no name, no date. TLS 1.3 only, ed25519 only, 0-RTT off, session
+resumption off: a resumed handshake would skip the pairing check, so every
+handshake is a full one.
 
 ## Pairing
 

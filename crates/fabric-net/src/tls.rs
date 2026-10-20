@@ -7,6 +7,11 @@
 //! certificate is only the carrier of the key: the signature over the
 //! handshake is checked against the expected key itself, so a copied
 //! certificate without its private key fails.
+//!
+//! Session resumption is off on both sides. A resumed TLS 1.3 handshake
+//! restores the peer's certificate from the earlier session and never asks
+//! the verifier again, so a node unpaired since then would keep access.
+//! Every handshake is a full one and runs the pairing check.
 
 use std::fmt;
 use std::sync::{Arc, OnceLock};
@@ -189,12 +194,15 @@ fn server_builder(
 
 fn finish_client(mut config: rustls::ClientConfig) -> rustls::ClientConfig {
     config.alpn_protocols = vec![ALPN.to_vec()];
+    config.resumption = rustls::client::Resumption::disabled();
     config
 }
 
 fn finish_server(mut config: rustls::ServerConfig) -> rustls::ServerConfig {
     config.alpn_protocols = vec![ALPN.to_vec()];
     config.max_early_data_size = 0;
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
     config
 }
 
@@ -493,6 +501,50 @@ mod tests {
             is_bad_signature(&outcome.client),
             "the dialer must refuse the forged server: {:?}",
             outcome.client
+        );
+    }
+
+    /// A trust set the test changes between handshakes, as an unpair does.
+    #[derive(Debug, Default)]
+    struct Switch(std::sync::Mutex<Vec<NodeId>>);
+
+    impl Trust for Switch {
+        fn is_paired(&self, node: NodeId) -> bool {
+            self.0.lock().unwrap().contains(&node)
+        }
+    }
+
+    /// rustls resumes TLS 1.3 sessions by default and a resumed handshake
+    /// skips the client verifier. A node unpaired after its first connection
+    /// must be refused on its next one, even when it dials with the same
+    /// client configuration that holds the earlier session.
+    #[tokio::test]
+    async fn an_unpaired_node_is_refused_on_reconnect_with_the_same_config() {
+        let server = NodeIdentity::generate().unwrap();
+        let client = NodeIdentity::generate().unwrap();
+        let trust = Arc::new(Switch::default());
+        trust.0.lock().unwrap().push(client.node_id());
+        let server_config = Arc::new(
+            Credentials::new(&server)
+                .unwrap()
+                .server_config(trust.clone())
+                .unwrap(),
+        );
+        let client_config = Arc::new(
+            Credentials::new(&client)
+                .unwrap()
+                .client_config(server.node_id())
+                .unwrap(),
+        );
+
+        let first = handshake(server_config.clone(), client_config.clone()).await;
+        assert!(first.server.is_ok() && first.client.is_ok());
+
+        trust.0.lock().unwrap().clear();
+        let second = handshake(server_config, client_config).await;
+        assert!(
+            second.server.is_err(),
+            "an unpaired node must not resume its way back in"
         );
     }
 
