@@ -180,8 +180,12 @@ pub enum DetectError {
     /// The spec built from the workspace broke one of its own rules.
     #[error("detected environment spec is invalid")]
     Spec(#[from] EnvSpecError),
-    /// A program or path name built into this module failed its own type's rules; a bug here.
-    #[error("built-in name `{name}` is not valid")]
+    /// A program or path name built into this module failed its own type's rules.
+    ///
+    /// Nothing in the workspace causes it, so a caller can treat it as a
+    /// bug report against this crate. Every built-in name is parsed by the
+    /// detection tests, which cover each rule that uses one.
+    #[error("built-in name `{name}` is not valid; this is a bug in fabric-env")]
     BuiltIn {
         /// The name.
         name: &'static str,
