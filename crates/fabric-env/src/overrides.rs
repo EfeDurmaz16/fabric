@@ -134,6 +134,12 @@ pub enum OverrideError {
         #[source]
         reason: SecretPatternError,
     },
+    /// An entry of `secret_patterns` that repeats an earlier one, ignoring ASCII case as matching does.
+    #[error("`secret_patterns[{index}]` repeats an earlier pattern")]
+    DuplicatePattern {
+        /// Zero-based index of the repeat.
+        index: usize,
+    },
     /// An entry of `secret_patterns` that denies the override file itself.
     ///
     /// Detection reads the override file through the job's patterns, so
@@ -384,18 +390,22 @@ fn env_names(value: &Value) -> Result<Vec<EnvVarName>, OverrideError> {
 }
 
 fn patterns(value: &Value) -> Result<Vec<SecretPattern>, OverrideError> {
-    strings(value, "secret_patterns")?
-        .into_iter()
-        .enumerate()
-        .map(|(index, text)| {
-            let pattern = SecretPattern::parse(text)
-                .map_err(|reason| OverrideError::Pattern { index, reason })?;
-            if pattern_matches(&pattern, OVERRIDE_FILE) {
-                return Err(OverrideError::PatternDeniesOverrideFile { index });
-            }
-            Ok(pattern)
-        })
-        .collect()
+    let mut patterns: Vec<SecretPattern> = Vec::new();
+    for (index, text) in strings(value, "secret_patterns")?.into_iter().enumerate() {
+        let pattern = SecretPattern::parse(text)
+            .map_err(|reason| OverrideError::Pattern { index, reason })?;
+        if pattern_matches(&pattern, OVERRIDE_FILE) {
+            return Err(OverrideError::PatternDeniesOverrideFile { index });
+        }
+        if patterns
+            .iter()
+            .any(|p| p.as_str().eq_ignore_ascii_case(pattern.as_str()))
+        {
+            return Err(OverrideError::DuplicatePattern { index });
+        }
+        patterns.push(pattern);
+    }
+    Ok(patterns)
 }
 
 /// Parses `[tools]`, reading each name through its alias; two keys for one tool are refused.
@@ -713,6 +723,23 @@ when = "always"
             EnvOverride::parse("env = [\"A\", \"B\", \"A\"]"),
             Err(OverrideError::DuplicateEnv { index: 2 })
         ));
+    }
+
+    /// Matching ignores ASCII case, so `*.DB` repeats `*.db`.
+    #[test]
+    fn a_repeated_secret_pattern_is_refused() {
+        for text in [
+            "secret_patterns = [\"*.db\", \"*.sqlite\", \"*.db\"]",
+            "secret_patterns = [\"*.db\", \"*.sqlite\", \"*.DB\"]",
+        ] {
+            assert!(
+                matches!(
+                    EnvOverride::parse(text),
+                    Err(OverrideError::DuplicatePattern { index: 2 })
+                ),
+                "{text}"
+            );
+        }
     }
 
     #[test]
