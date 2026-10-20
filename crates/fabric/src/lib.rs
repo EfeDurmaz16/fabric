@@ -29,7 +29,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use fabric_core::env::{EnvVarName, SetupArg};
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{JobId, NodeId};
-use fabric_env::materialize::{CacheHealth, NodeEnv, TreeLock};
+use fabric_env::materialize::{CacheHealth, MaterializeError, NodeEnv, TreeLock};
 use fabric_harness::claude::{ClaudeCode, LeftReason, TrustOutcome};
 use fabric_harness::codex::Codex;
 use fabric_harness::{Harness, Launch, Running};
@@ -600,7 +600,15 @@ async fn exited(
 /// refuses with the lock's path from the setup steps until the first
 /// harness is recorded, and the node's own check refuses it after that.
 fn materialize(state: &StateDir, root: &Path) -> Result<TreeLock> {
-    let lock = TreeLock::acquire(&state.tree_locks(), root)?;
+    let lock = TreeLock::acquire(&state.tree_locks(), root).map_err(|e| match e {
+        // Another run or resume of this workspace is starting its harness:
+        // the same state as a harness that runs, so the same exit code.
+        MaterializeError::TreeBusy { .. } => anyhow::Error::new(Refused {
+            refusal: Refusal::JobState,
+            message: e.to_string(),
+        }),
+        e => e.into(),
+    })?;
     let detected = fabric_env::detect::detect(root, &[])?;
     let plan = fabric_env::materialize::plan(&detected, &lock, &NodeEnv::current())?;
     if plan.is_noop() {
