@@ -67,6 +67,9 @@ pub enum FrameError {
 }
 
 /// Writes one frame, refusing a payload that would exceed `max`.
+///
+/// The header and the payload are written one after the other, so a chunk's
+/// payload is never copied into a second buffer while it waits on flow control.
 pub(crate) async fn write_frame<W: AsyncWrite + Unpin + ?Sized>(
     writer: &mut W,
     payload: &[u8],
@@ -77,11 +80,11 @@ pub(crate) async fn write_frame<W: AsyncWrite + Unpin + ?Sized>(
         return Err(FrameError::TooLarge { len, max });
     }
     let length = u32::try_from(len).map_err(|_| FrameError::TooLarge { len, max })?;
-    let mut frame = Vec::with_capacity(LENGTH_LEN + len);
-    frame.extend_from_slice(&length.to_le_bytes());
-    frame.push(FRAME_VERSION);
-    frame.extend_from_slice(payload);
-    writer.write_all(&frame).await.map_err(FrameError::Io)?;
+    let mut header = [0u8; LENGTH_LEN + 1];
+    header[..LENGTH_LEN].copy_from_slice(&length.to_le_bytes());
+    header[LENGTH_LEN] = FRAME_VERSION;
+    writer.write_all(&header).await.map_err(FrameError::Io)?;
+    writer.write_all(payload).await.map_err(FrameError::Io)?;
     writer.flush().await.map_err(FrameError::Io)
 }
 
