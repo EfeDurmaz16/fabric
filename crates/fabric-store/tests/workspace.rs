@@ -16,7 +16,7 @@ use fabric_core::snapshot::{
     CacheClass, CacheEntry, CarryKey, CarryState, Entry, EntryKind, GitHead, Mode,
 };
 use fabric_store::capture::{
-    BundleKind, CaptureError, CaptureRequest, Captured, UnmeasuredKeys, capture,
+    BundleKind, BusyReason, CaptureError, CaptureRequest, Captured, UnmeasuredKeys, capture,
 };
 use fabric_store::git::Git;
 use fabric_store::objects::ChunkParams;
@@ -665,7 +665,12 @@ fn busy_repositories_and_linked_worktrees_are_refused() {
     fs::write(&merge_head, "0000000000000000000000000000000000000000\n").unwrap();
     let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
     assert!(
-        matches!(&err, CaptureError::GitBusy { reason } if reason.contains("MERGE_HEAD")),
+        matches!(
+            err,
+            CaptureError::GitBusy {
+                reason: BusyReason::Merge
+            }
+        ),
         "{err}"
     );
     fs::remove_file(&merge_head).unwrap();

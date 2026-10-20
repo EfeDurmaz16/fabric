@@ -96,6 +96,39 @@ pub enum BundleKind {
     Empty,
 }
 
+/// Why a repository cannot be captured right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusyReason {
+    /// A rebase is in progress.
+    Rebase,
+    /// A merge is in progress.
+    Merge,
+    /// A cherry-pick is in progress.
+    CherryPick,
+    /// A revert is in progress.
+    Revert,
+    /// A bisect is in progress.
+    Bisect,
+    /// Another git process holds `index.lock`.
+    IndexLocked,
+    /// The index has unresolved conflict entries.
+    Conflicts,
+}
+
+impl std::fmt::Display for BusyReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            BusyReason::Rebase => "a rebase is in progress",
+            BusyReason::Merge => "a merge is in progress",
+            BusyReason::CherryPick => "a cherry-pick is in progress",
+            BusyReason::Revert => "a revert is in progress",
+            BusyReason::Bisect => "a bisect is in progress",
+            BusyReason::IndexLocked => "index.lock exists",
+            BusyReason::Conflicts => "the index has conflict entries",
+        })
+    }
+}
+
 /// What capture saw, next to the manifest.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CaptureReport {
@@ -189,7 +222,7 @@ pub enum CaptureError {
     #[error("git is busy: {reason}")]
     GitBusy {
         /// What was found.
-        reason: String,
+        reason: BusyReason,
     },
     /// The root is a linked worktree, which shares refs with other jobs.
     #[error("{root} is a linked worktree of {common_dir}; use a primary clone")]
@@ -569,23 +602,21 @@ impl GitCapture<'_> {
                 common_dir: common_dir.unwrap_or_default(),
             });
         }
-        for marker in [
-            "rebase-merge",
-            "rebase-apply",
-            "MERGE_HEAD",
-            "CHERRY_PICK_HEAD",
-            "REVERT_HEAD",
-            "BISECT_LOG",
+        for (marker, reason) in [
+            ("rebase-merge", BusyReason::Rebase),
+            ("rebase-apply", BusyReason::Rebase),
+            ("MERGE_HEAD", BusyReason::Merge),
+            ("CHERRY_PICK_HEAD", BusyReason::CherryPick),
+            ("REVERT_HEAD", BusyReason::Revert),
+            ("BISECT_LOG", BusyReason::Bisect),
         ] {
             if self.git.git_path(marker)?.exists() {
-                return Err(CaptureError::GitBusy {
-                    reason: format!("{marker} exists"),
-                });
+                return Err(CaptureError::GitBusy { reason });
             }
         }
         if !self.git.run(&["ls-files", "-u", "-z"])?.is_empty() {
             return Err(CaptureError::GitBusy {
-                reason: "the index has conflict entries".to_owned(),
+                reason: BusyReason::Conflicts,
             });
         }
         let status = self
@@ -698,7 +729,7 @@ impl GitCapture<'_> {
                 tries += 1;
                 if tries > 10 {
                     return Err(CaptureError::GitBusy {
-                        reason: "index.lock exists".to_owned(),
+                        reason: BusyReason::IndexLocked,
                     });
                 }
                 thread::sleep(Duration::from_millis(200));
