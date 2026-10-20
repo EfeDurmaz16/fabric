@@ -328,6 +328,21 @@ async fn pgrep(args: &[&OsStr]) -> Result<Vec<u32>, HarnessError> {
     }
 }
 
+/// `text` as an extended regular expression that matches only itself:
+/// `pgrep` reads its operand as a pattern, and a path may hold `[`, `(`
+/// or `.`.
+fn ere_literal(text: &OsStr) -> std::ffi::OsString {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let mut out = Vec::with_capacity(text.len());
+    for &byte in text.as_bytes() {
+        if b"\\.[]()*+?{}|^$".contains(&byte) {
+            out.push(b'\\');
+        }
+        out.push(byte);
+    }
+    std::ffi::OsString::from_vec(out)
+}
+
 /// Process ids of running processes named exactly `name`, plus those whose
 /// command line names `binary` (an npm-installed harness runs as `node`
 /// with the script path on its command line).
@@ -338,7 +353,8 @@ pub(crate) async fn running_pids(
     let mut pids = pgrep(&[OsStr::new("-x"), OsStr::new(name)]).await?;
     if let Some(binary) = binary {
         let physical = std::fs::canonicalize(binary).unwrap_or_else(|_| binary.to_path_buf());
-        pids.extend(pgrep(&[OsStr::new("-f"), physical.as_os_str()]).await?);
+        let pattern = ere_literal(physical.as_os_str());
+        pids.extend(pgrep(&[OsStr::new("-f"), &pattern]).await?);
     }
     let own = std::process::id();
     pids.retain(|pid| *pid != own);
@@ -493,6 +509,34 @@ mod tests {
         let seen = probe(&binary, &[], &env).await.unwrap();
         assert!(seen.contains("FABRIC_PROBE_KEPT=1"), "{seen}");
         assert!(!seen.contains("CLAUDECODE"), "{seen}");
+    }
+
+    #[test]
+    fn ere_literal_escapes_every_metacharacter() {
+        assert_eq!(
+            ere_literal(OsStr::new("/a.b/[x](y)*+?{1}|^$\\")),
+            OsStr::new("/a\\.b/\\[x\\]\\(y\\)\\*\\+\\?\\{1\\}\\|\\^\\$\\\\")
+        );
+    }
+
+    #[tokio::test]
+    async fn running_pids_finds_a_script_whose_path_holds_regex_characters() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("lib[1](x)");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = std::fs::canonicalize(&bin).unwrap().join("claude.js");
+        std::fs::write(&script, "").unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30; :")
+            .arg(&script)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let pids = running_pids("fabric-no-such-name", Some(&script)).await;
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(pids.unwrap().contains(&pid), "the writer was missed");
     }
 
     #[tokio::test]
