@@ -31,6 +31,18 @@
 //! The restore that runs before materialize writes a carried cache only when
 //! its carry key matches this node (ADR 0012), so what is on disk is what
 //! this node can use, and materialize trusts the disk.
+//!
+//! Trust: setup runs code that comes with the snapshot. `npm ci` and
+//! `pnpm install` run the root package's lifecycle scripts and
+//! `.pnpmfile.cjs`, `uv sync` builds source distributions, and a declared
+//! step can be `sh -c ...`. A restored workspace is therefore trusted as
+//! far as the peer that signed its snapshot, and the `PATH` filter below
+//! only keeps the workspace from replacing the installer binary itself.
+//! The prompt before a spec this node has not run is the CLI's (ADR 0007).
+//! A step is not tied to the `fabric resume` process: after a `kill -9`
+//! of resume the installer keeps running, and until the guard ADR 0007
+//! names in its open questions lands, a second resume can start a second
+//! installer on the same tree.
 
 use std::env;
 use std::ffi::OsStr;
@@ -536,7 +548,7 @@ fn step_dir(root: &Path, index: usize, step: &SetupStep) -> Result<PathBuf, Mate
 
 /// Finds `program` in the entries of `PATH` that resolve outside the workspace.
 ///
-/// A restored workspace must not supply its own `pnpm`, so relative entries
+/// A restored workspace must not replace the installer binary, so relative entries
 /// such as `.` and absolute ones under `root`, such as a
 /// `node_modules/.bin` a shell hook added, are skipped, and so is a
 /// candidate that is a link back into the workspace from an outside
