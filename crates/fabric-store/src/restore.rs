@@ -247,9 +247,37 @@ fn check_target_empty(target: &Path) -> Result<(), RestoreError> {
     }
 }
 
+/// Gives the owner write and search permission on `dir` and every directory below it.
+///
+/// A restore that was killed after it applied the recorded modes leaves
+/// read-only directories with files in them, which no unlink can empty.
+/// Links are never followed.
+pub(crate) fn open_up(dir: &Path) -> Result<(), RestoreError> {
+    use rustix::fs::{Mode as RawBits, OFlags};
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let fd = rustix::fs::open(dir, flags, RawBits::empty()).map_err(|e| io_err(dir, e.into()))?;
+    let stat = rustix::fs::fstat(&fd).map_err(|e| io_err(dir, e.into()))?;
+    let bits = RawBits::from_raw_mode(stat.st_mode) | RawBits::RWXU;
+    rustix::fs::fchmod(&fd, bits).map_err(|e| io_err(dir, e.into()))?;
+    for entry in fs::read_dir(dir).map_err(|e| io_err(dir, e))? {
+        let entry = entry.map_err(|e| io_err(dir, e))?;
+        if entry
+            .file_type()
+            .map_err(|e| io_err(&entry.path(), e))?
+            .is_dir()
+        {
+            open_up(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 /// Makes a fresh staging directory for `target`, removing a stale one.
 fn fresh_staging(target: &Path) -> Result<PathBuf, RestoreError> {
     let staging = staging_path(target)?;
+    if fs::symlink_metadata(&staging).is_ok_and(|meta| meta.is_dir()) {
+        open_up(&staging)?;
+    }
     match fs::remove_dir_all(&staging) {
         Ok(()) => tracing::info!(path = %staging.display(), "removed a half-finished restore"),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -268,7 +296,10 @@ fn move_into_place(staging: &Path, target: &Path) -> Result<(), RestoreError> {
     Ok(())
 }
 
-/// Writes a list of entries: directories, then files, then symlinks, then directory mtimes.
+/// Writes a list of entries: directories, then files, then symlinks, then directory modes and mtimes.
+///
+/// Directories are created owner-only and get their recorded mode last,
+/// deepest first, so a directory captured read-only can still be filled.
 fn write_entries(
     store: &Store,
     writer: &TreeWriter,
@@ -280,7 +311,7 @@ fn write_entries(
     let kept: Vec<&Entry> = entries.iter().filter(|e| !skip(&e.rel_path)).collect();
     for entry in &kept {
         if matches!(entry.kind, EntryKind::Dir) {
-            writer.mkdir(&entry.rel_path, entry.mode)?;
+            writer.mkdir(&entry.rel_path, Mode::from_masked(0o700))?;
         }
     }
     for entry in &kept {
@@ -327,6 +358,7 @@ fn write_entries(
     }
     for entry in kept.iter().rev() {
         if matches!(entry.kind, EntryKind::Dir) {
+            writer.set_dir_mode(&entry.rel_path, entry.mode)?;
             writer.set_mtime(&entry.rel_path, entry.mtime_ns)?;
         }
     }

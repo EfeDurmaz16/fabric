@@ -144,6 +144,14 @@ impl TreeWriter {
         Ok(())
     }
 
+    /// Sets the mode of the directory at `rel` without following a link at its name.
+    pub fn set_dir_mode(&self, rel: &RelPath, bits: EntryMode) -> Result<(), WriteError> {
+        let (parent, name) = self.parent_of(rel, false)?;
+        let path = Path::new(rel.as_str());
+        let dir = fs::openat(&parent, name, DIR_FLAGS, Mode::empty()).map_err(|e| map(e, path))?;
+        fs::fchmod(&dir, mode(bits)).map_err(|e| map(e, path))
+    }
+
     /// Creates a new file with `bits` and returns it open for writing.
     pub fn create_file(&self, rel: &RelPath, bits: EntryMode) -> Result<File, WriteError> {
         let (parent, name) = self.parent_of(rel, true)?;

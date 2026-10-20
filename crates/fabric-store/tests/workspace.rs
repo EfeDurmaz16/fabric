@@ -889,6 +889,39 @@ fn a_plain_directory_and_harness_state_round_trip_exactly() {
     ));
 }
 
+/// Gives the owner write permission on every directory under `dir`, so the temp directory can be removed.
+fn make_writable(dir: &Path) -> Fallible {
+    let meta = fs::symlink_metadata(dir)?;
+    if meta.is_dir() {
+        fs::set_permissions(dir, fs::Permissions::from_mode(meta.mode() | 0o700))?;
+        for entry in fs::read_dir(dir)? {
+            make_writable(&entry?.path())?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_read_only_directory_that_holds_files_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("plain");
+    fs::create_dir_all(root.join("ro/sub")).unwrap();
+    fs::write(root.join("ro/sub/f.txt"), "f\n").unwrap();
+    fs::set_permissions(root.join("ro/sub"), fs::Permissions::from_mode(0o555)).unwrap();
+    fs::set_permissions(root.join("ro"), fs::Permissions::from_mode(0o555)).unwrap();
+
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    let outcome = restore_into(&store, snapshot, &target);
+    let same = outcome.is_ok() && listing(&target).unwrap() == listing(&root).unwrap();
+    make_writable(dir.path()).unwrap();
+    outcome.unwrap();
+    assert!(same);
+}
+
 #[test]
 fn a_cache_the_target_cannot_use_is_skipped_and_named() {
     let dir = tempfile::tempdir().unwrap();

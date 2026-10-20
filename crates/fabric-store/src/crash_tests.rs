@@ -3,6 +3,7 @@
 //! parent then asserts what ADR 0004 promises about the store and the target.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -22,6 +23,25 @@ use crate::store::{CheckDepth, Store};
 const JOB: JobId = JobId::from_bytes([7; 16]);
 const NODE: NodeId = NodeId::from_bytes([1; 32]);
 const CREATED_AT: u64 = 1_760_000_000_000;
+
+/// A temp directory whose read-only directories are opened up so that it can be removed.
+struct Scratch(tempfile::TempDir);
+
+impl Scratch {
+    fn new() -> Scratch {
+        Scratch(tempfile::tempdir().unwrap())
+    }
+
+    fn path(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = crate::restore::open_up(self.0.path());
+    }
+}
 
 /// Makes a repository with staged, unstaged, untracked, ignored and cache files.
 fn make_workspace(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -51,6 +71,10 @@ fn make_workspace(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(state.join("sessions/abc"))?;
     fs::write(state.join("sessions/abc/tool.txt"), "tool output\n")?;
     fs::write(state.join("sessions/abc.jsonl"), "{}\n")?;
+    // A killed restore leaves these read-only and full in its staging directory.
+    for dir in [root.join("node_modules/pkg"), state.join("sessions/abc")] {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555))?;
+    }
     Ok(())
 }
 
@@ -156,7 +180,7 @@ fn run_child_and_kill(dir: &Path, mode: &str, checkpoint: &str, snapshot: Option
 
 #[test]
 fn create_killed_before_the_catalog_rename_leaves_a_store_create_can_finish() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = Scratch::new();
     let dir = temp.path();
     run_child_and_kill(dir, "create", "create.before_rename", None);
 
@@ -181,7 +205,7 @@ fn publish_killed_at_any_checkpoint_never_leaves_a_dangling_row() {
         "publish.before_commit",
         "publish.after_commit",
     ] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = Scratch::new();
         let dir = temp.path();
         make_workspace(&dir.join("work")).unwrap();
         drop(Store::create(&dir.join("store"), ChunkParams::DEFAULT).unwrap());
@@ -214,7 +238,7 @@ fn restore_killed_at_any_checkpoint_is_detectable_and_finishes_on_rerun() {
         "restore.before_rename",
         "restore.after_rename",
     ] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = Scratch::new();
         let dir = temp.path();
         make_workspace(&dir.join("work")).unwrap();
         let snapshot = {
