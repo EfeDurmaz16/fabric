@@ -269,7 +269,8 @@ impl NodeManager {
     /// Returns the lockfile names the manager writes.
     pub(crate) fn lockfiles(self) -> &'static [&'static str] {
         match self {
-            NodeManager::Npm => &["package-lock.json"],
+            // `npm ci` installs from either; npm reads the shrinkwrap when both exist.
+            NodeManager::Npm => &["npm-shrinkwrap.json", "package-lock.json"],
             NodeManager::Pnpm => &["pnpm-lock.yaml"],
             NodeManager::YarnClassic | NodeManager::YarnBerry => &["yarn.lock"],
             NodeManager::Bun => &["bun.lock", "bun.lockb"],

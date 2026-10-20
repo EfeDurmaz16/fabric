@@ -144,13 +144,19 @@ fn cargo_fetch_is_locked_exactly_when_a_lockfile_exists() {
 
 #[test]
 fn each_lockfile_names_its_manager_and_install() {
-    let cases: [(&[&str], NodeManager, &str); 7] = [
+    let cases: [(&[&str], NodeManager, &str); 9] = [
         (
             &["pnpm-lock.yaml"],
             NodeManager::Pnpm,
             "pnpm install --frozen-lockfile",
         ),
         (&["package-lock.json"], NodeManager::Npm, "npm ci"),
+        (&["npm-shrinkwrap.json"], NodeManager::Npm, "npm ci"),
+        (
+            &["npm-shrinkwrap.json", "package-lock.json"],
+            NodeManager::Npm,
+            "npm ci",
+        ),
         (
             &["yarn.lock"],
             NodeManager::YarnClassic,
