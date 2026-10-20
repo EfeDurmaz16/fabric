@@ -35,7 +35,7 @@ use tracing::warn;
 
 use crate::denylist;
 use crate::departure::Departure;
-use crate::error::{HarnessError, Input};
+use crate::error::{HarnessError, Input, IoOp};
 use crate::jsontext::{self, TransformError};
 use crate::manifest::{Carried, Content, Digest, MANIFEST_FILE, Mutability};
 use crate::redact::{RedactionCounts, Redactor};
@@ -140,13 +140,13 @@ pub(crate) fn walk(dir: &Path) -> Result<Vec<PathBuf>, HarnessError> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let entries = fs::read_dir(&d).map_err(|e| HarnessError::io("walk", &d, e))?;
+        let entries = fs::read_dir(&d).map_err(|e| HarnessError::io(IoOp::Walk, &d, e))?;
         for entry in entries {
-            let entry = entry.map_err(|e| HarnessError::io("walk", &d, e))?;
+            let entry = entry.map_err(|e| HarnessError::io(IoOp::Walk, &d, e))?;
             let path = entry.path();
             let kind = entry
                 .file_type()
-                .map_err(|e| HarnessError::io("walk", &path, e))?;
+                .map_err(|e| HarnessError::io(IoOp::Walk, &path, e))?;
             if kind.is_symlink() {
                 return Err(HarnessError::SymlinkInState { path });
             }
@@ -259,7 +259,7 @@ fn open_temp(tmp: &Path) -> io::Result<File> {
 fn fsync_dir(dir: &Path) -> Result<(), HarnessError> {
     File::open(dir)
         .and_then(|d| d.sync_all())
-        .map_err(|e| HarnessError::io("fsync", dir, e))
+        .map_err(|e| HarnessError::io(IoOp::Fsync, dir, e))
 }
 
 /// Moves `tmp` over `dest`, giving it the mode of the file it replaces, and
@@ -268,12 +268,12 @@ fn commit(tmp: &Path, dest: &Path) -> Result<(), HarnessError> {
     match fs::metadata(dest) {
         Ok(meta) => {
             fs::set_permissions(tmp, meta.permissions())
-                .map_err(|e| HarnessError::io("write", tmp, e))?;
+                .map_err(|e| HarnessError::io(IoOp::Write, tmp, e))?;
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(HarnessError::io("read", dest, e)),
+        Err(e) => return Err(HarnessError::io(IoOp::Read, dest, e)),
     }
-    fs::rename(tmp, dest).map_err(|e| HarnessError::io("rename", dest, e))?;
+    fs::rename(tmp, dest).map_err(|e| HarnessError::io(IoOp::Rename, dest, e))?;
     fsync_dir(dest.parent().unwrap_or(Path::new(".")))
 }
 
@@ -293,14 +293,14 @@ fn create_dirs_durable(dir: &Path) -> Result<(), HarnessError> {
                     None => break,
                 }
             }
-            Err(e) => return Err(HarnessError::io("create dir", at, e)),
+            Err(e) => return Err(HarnessError::io(IoOp::CreateDir, at, e)),
         }
     }
     for new in missing.into_iter().rev() {
         match fs::create_dir(new) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(HarnessError::io("create dir", new, e)),
+            Err(e) => return Err(HarnessError::io(IoOp::CreateDir, new, e)),
         }
         fsync_dir(new.parent().unwrap_or(Path::new(".")))?;
     }
@@ -309,7 +309,7 @@ fn create_dirs_durable(dir: &Path) -> Result<(), HarnessError> {
 
 /// Renames `from` over `to` in the same directory and makes the rename durable.
 pub(crate) fn rename_durable(from: &Path, to: &Path) -> Result<(), HarnessError> {
-    fs::rename(from, to).map_err(|e| HarnessError::io("rename", to, e))?;
+    fs::rename(from, to).map_err(|e| HarnessError::io(IoOp::Rename, to, e))?;
     fsync_dir(to.parent().unwrap_or(Path::new(".")))
 }
 
@@ -324,15 +324,15 @@ where
     create_dirs_durable(path.parent().unwrap_or(Path::new(".")))?;
     let tmp = temp_path(path);
     let result = (|| {
-        let file = open_temp(&tmp).map_err(|e| HarnessError::io("write", &tmp, e))?;
+        let file = open_temp(&tmp).map_err(|e| HarnessError::io(IoOp::Write, &tmp, e))?;
         let mut writer = BufWriter::new(Hashing::new(file));
         produce(&mut writer)?;
         let hashing = writer
             .into_inner()
-            .map_err(|e| HarnessError::io("write", &tmp, e.into_error()))?;
+            .map_err(|e| HarnessError::io(IoOp::Write, &tmp, e.into_error()))?;
         let (file, written) = hashing.finish();
         file.sync_all()
-            .map_err(|e| HarnessError::io("write", &tmp, e))?;
+            .map_err(|e| HarnessError::io(IoOp::Write, &tmp, e))?;
         commit(&tmp, path)?;
         Ok(written)
     })();
@@ -346,7 +346,7 @@ where
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), HarnessError> {
     write_atomic_with(path, |w| {
         w.write_all(bytes)
-            .map_err(|e| HarnessError::io("write", path, e))
+            .map_err(|e| HarnessError::io(IoOp::Write, path, e))
     })
     .map(|_| ())
 }
@@ -383,13 +383,13 @@ struct Transfer<'a> {
 
 impl Transfer<'_> {
     fn read_err(&self, e: io::Error) -> HarnessError {
-        HarnessError::io("read", self.src, e)
+        HarnessError::io(IoOp::Read, self.src, e)
     }
 
     fn emit(&mut self, bytes: &[u8]) -> Result<(), HarnessError> {
         self.out
             .write_all(bytes)
-            .map_err(|e| HarnessError::io("write", self.src, e))
+            .map_err(|e| HarnessError::io(IoOp::Write, self.src, e))
     }
 
     fn next_line(
@@ -405,7 +405,7 @@ impl Transfer<'_> {
     }
 
     fn opaque(&mut self, reader: &mut BufReader<File>) -> Result<(), HarnessError> {
-        io::copy(reader, self.out).map_err(|e| HarnessError::io("write", self.src, e))?;
+        io::copy(reader, self.out).map_err(|e| HarnessError::io(IoOp::Write, self.src, e))?;
         Ok(())
     }
 
@@ -557,7 +557,7 @@ fn transfer(
     redactor: &Redactor,
     counts: &mut RedactionCounts,
 ) -> Result<(), HarnessError> {
-    let input = File::open(src).map_err(|e| HarnessError::io("read", src, e))?;
+    let input = File::open(src).map_err(|e| HarnessError::io(IoOp::Read, src, e))?;
     let mut reader = BufReader::new(input);
     let mut step = Transfer {
         src,
@@ -592,7 +592,7 @@ fn clear_manifest(out: &Path) -> Result<(), HarnessError> {
     match fs::remove_file(&path) {
         Ok(()) => fsync_dir(out),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(HarnessError::io("remove", &path, e)),
+        Err(e) => Err(HarnessError::io(IoOp::Remove, &path, e)),
     }
 }
 
@@ -642,9 +642,9 @@ pub(crate) fn stage(
 
 /// The length and digest of the file at `path`.
 pub(crate) fn digest_file(path: &Path) -> Result<Written, HarnessError> {
-    let mut reader = File::open(path).map_err(|e| HarnessError::io("read", path, e))?;
+    let mut reader = File::open(path).map_err(|e| HarnessError::io(IoOp::Read, path, e))?;
     let mut sink = Hashing::new(io::sink());
-    io::copy(&mut reader, &mut sink).map_err(|e| HarnessError::io("read", path, e))?;
+    io::copy(&mut reader, &mut sink).map_err(|e| HarnessError::io(IoOp::Read, path, e))?;
     Ok(sink.finish().1)
 }
 
@@ -685,18 +685,18 @@ pub(crate) fn compare(existing: &Path, incoming: &Path) -> Result<Relation, Harn
     let a = match File::open(existing) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Relation::Missing),
-        Err(e) => return Err(HarnessError::io("read", existing, e)),
+        Err(e) => return Err(HarnessError::io(IoOp::Read, existing, e)),
     };
-    let b = File::open(incoming).map_err(|e| HarnessError::io("read", incoming, e))?;
+    let b = File::open(incoming).map_err(|e| HarnessError::io(IoOp::Read, incoming, e))?;
     let mut ra = BufReader::with_capacity(COMPARE_BUFFER, a);
     let mut rb = BufReader::with_capacity(COMPARE_BUFFER, b);
     loop {
         let ba = ra
             .fill_buf()
-            .map_err(|e| HarnessError::io("read", existing, e))?;
+            .map_err(|e| HarnessError::io(IoOp::Read, existing, e))?;
         let bb = rb
             .fill_buf()
-            .map_err(|e| HarnessError::io("read", incoming, e))?;
+            .map_err(|e| HarnessError::io(IoOp::Read, incoming, e))?;
         if ba.is_empty() {
             return Ok(if bb.is_empty() {
                 Relation::Equal
@@ -754,7 +754,7 @@ fn redacted_view_prefix(
     incoming: &Path,
     content: Content,
 ) -> Result<Option<u64>, HarnessError> {
-    let reader = File::open(incoming).map_err(|e| HarnessError::io("read", incoming, e))?;
+    let reader = File::open(incoming).map_err(|e| HarnessError::io(IoOp::Read, incoming, e))?;
     let mut check = PrefixCheck {
         incoming: BufReader::with_capacity(COMPARE_BUFFER, reader),
         buffer: Vec::new(),
@@ -810,7 +810,7 @@ fn plan(placement: &Placement, departure: &Departure) -> Result<Step, HarnessErr
     }
     if placement.content != Content::Opaque {
         let staged_len = fs::metadata(&placement.staged)
-            .map_err(|e| HarnessError::io("read", &placement.staged, e))?
+            .map_err(|e| HarnessError::io(IoOp::Read, &placement.staged, e))?
             .len();
         match redacted_view_prefix(&placement.dest, &placement.staged, placement.content)? {
             Some(view_len) if view_len == staged_len => return Ok(Step::Keep),
@@ -827,12 +827,12 @@ fn plan(placement: &Placement, departure: &Departure) -> Result<Step, HarnessErr
 }
 
 fn copy_into(path: &Path, out: &mut dyn Write, skip: u64) -> Result<(), HarnessError> {
-    let mut reader = File::open(path).map_err(|e| HarnessError::io("read", path, e))?;
+    let mut reader = File::open(path).map_err(|e| HarnessError::io(IoOp::Read, path, e))?;
     if skip > 0 {
         io::Seek::seek(&mut reader, io::SeekFrom::Start(skip))
-            .map_err(|e| HarnessError::io("read", path, e))?;
+            .map_err(|e| HarnessError::io(IoOp::Read, path, e))?;
     }
-    io::copy(&mut reader, out).map_err(|e| HarnessError::io("write", path, e))?;
+    io::copy(&mut reader, out).map_err(|e| HarnessError::io(IoOp::Write, path, e))?;
     Ok(())
 }
 

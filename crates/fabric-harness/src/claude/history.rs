@@ -24,7 +24,7 @@ use serde::Deserialize;
 use tracing::warn;
 
 use crate::denylist;
-use crate::error::HarnessError;
+use crate::error::{HarnessError, IoOp};
 use crate::redact::RedactionCounts;
 
 /// The count name for a backup left behind because its original is denied.
@@ -75,14 +75,14 @@ impl Backups {
     pub(crate) fn read(transcripts: &[&Path]) -> Result<Self, HarnessError> {
         let mut backups = Backups::default();
         for path in transcripts {
-            let file = File::open(path).map_err(|e| HarnessError::io("read", path, e))?;
+            let file = File::open(path).map_err(|e| HarnessError::io(IoOp::Read, path, e))?;
             let mut reader = BufReader::new(file);
             let mut line = Vec::new();
             loop {
                 line.clear();
                 let n = reader
                     .read_until(b'\n', &mut line)
-                    .map_err(|e| HarnessError::io("read", path, e))?;
+                    .map_err(|e| HarnessError::io(IoOp::Read, path, e))?;
                 if n == 0 {
                     break;
                 }

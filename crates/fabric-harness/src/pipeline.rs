@@ -21,7 +21,7 @@ use fabric_core::path::AbsPath;
 
 use crate::denylist;
 use crate::departure::{Departure, Records};
-use crate::error::{HarnessError, Input};
+use crate::error::{HarnessError, Input, IoOp};
 use crate::files::{self, Placement, Source};
 use crate::harness::Restored;
 use crate::manifest::{Carried, Content, Mutability, StateManifest};
@@ -39,7 +39,7 @@ pub(crate) fn physical_workspace(workspace: &Path) -> Result<AbsPath, HarnessErr
         return Err(bad());
     }
     let physical = std::fs::canonicalize(workspace)
-        .map_err(|e| HarnessError::io("canonicalize", workspace, e))?;
+        .map_err(|e| HarnessError::io(IoOp::Canonicalize, workspace, e))?;
     if !physical.is_dir() {
         return Err(bad());
     }
@@ -183,7 +183,7 @@ fn refuse_symlinks(home: &Path, dest: &Path) -> Result<(), HarnessError> {
             }
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(HarnessError::io("read", &at, e)),
+            Err(e) => return Err(HarnessError::io(IoOp::Read, &at, e)),
         }
     }
     Ok(())

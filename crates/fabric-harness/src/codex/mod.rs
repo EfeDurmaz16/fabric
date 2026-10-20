@@ -49,7 +49,7 @@ use fabric_core::harness::HarnessKind;
 use fabric_core::path::AbsPath;
 use tracing::{info, warn};
 
-use crate::error::{HarnessError, Input};
+use crate::error::{HarnessError, Input, IoOp};
 use crate::files::{self, Carry, Relation, Source};
 use crate::harness::{Harness, Installed, Launch, Restored, Running};
 use crate::manifest::{Content, HOME_PREFIX, Mutability, StateManifest};
@@ -122,7 +122,7 @@ fn try_lock_for(path: &Path, wait: Duration) -> Result<Option<File>, HarnessErro
         .read(true)
         .write(true)
         .open(path)
-        .map_err(|e| HarnessError::io("write", path, e))?;
+        .map_err(|e| HarnessError::io(IoOp::Write, path, e))?;
     let deadline = std::time::Instant::now() + wait;
     loop {
         match file.try_lock() {
@@ -135,17 +135,17 @@ fn try_lock_for(path: &Path, wait: Duration) -> Result<Option<File>, HarnessErro
                 // sleeping here parks no runtime worker.
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Err(TryLockError::Error(e)) => return Err(HarnessError::io("lock", path, e)),
+            Err(TryLockError::Error(e)) => return Err(HarnessError::io(IoOp::Lock, path, e)),
         }
     }
 }
 
 fn lock_coordination(dir: &Path) -> Result<File, HarnessError> {
-    std::fs::create_dir_all(dir).map_err(|e| HarnessError::io("create dir", dir, e))?;
+    std::fs::create_dir_all(dir).map_err(|e| HarnessError::io(IoOp::CreateDir, dir, e))?;
     let path = dir.join(COORDINATION_LOCK);
     try_lock_for(&path, COORDINATION_WAIT)?.ok_or_else(|| {
         HarnessError::io(
-            "lock",
+            IoOp::Lock,
             path,
             std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,

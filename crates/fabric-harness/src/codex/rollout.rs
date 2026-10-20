@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::error::{HarnessError, Input};
+use crate::error::{HarnessError, Input, IoOp};
 use crate::jsontext;
 use crate::redact::Redactor;
 use crate::session::SessionId;
@@ -94,14 +94,14 @@ pub fn list(root: &Path) -> Result<Vec<RolloutFile>, HarnessError> {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(HarnessError::io("walk", &dir, e)),
+            Err(e) => return Err(HarnessError::io(IoOp::Walk, &dir, e)),
         };
         for entry in entries {
-            let entry = entry.map_err(|e| HarnessError::io("walk", &dir, e))?;
+            let entry = entry.map_err(|e| HarnessError::io(IoOp::Walk, &dir, e))?;
             let path = entry.path();
             let kind = entry
                 .file_type()
-                .map_err(|e| HarnessError::io("walk", &path, e))?;
+                .map_err(|e| HarnessError::io(IoOp::Walk, &path, e))?;
             if kind.is_dir() {
                 stack.push(path);
                 continue;
@@ -165,10 +165,10 @@ pub struct Meta {
 
 fn open_lines(file: &RolloutFile) -> Result<Box<dyn BufRead>, HarnessError> {
     let handle =
-        std::fs::File::open(&file.path).map_err(|e| HarnessError::io("read", &file.path, e))?;
+        std::fs::File::open(&file.path).map_err(|e| HarnessError::io(IoOp::Read, &file.path, e))?;
     if file.name.compressed {
         let decoder = zstd::stream::read::Decoder::new(handle)
-            .map_err(|e| HarnessError::io("read", &file.path, e))?;
+            .map_err(|e| HarnessError::io(IoOp::Read, &file.path, e))?;
         Ok(Box::new(BufReader::new(decoder)))
     } else {
         Ok(Box::new(BufReader::new(handle)))
@@ -180,7 +180,7 @@ pub fn read_meta(file: &RolloutFile) -> Result<Meta, HarnessError> {
     let mut line = String::new();
     open_lines(file)?
         .read_line(&mut line)
-        .map_err(|e| HarnessError::io("read", &file.path, e))?;
+        .map_err(|e| HarnessError::io(IoOp::Read, &file.path, e))?;
     let malformed = |reason: String| HarnessError::Malformed {
         what: Input::RolloutLine,
         path: file.path.clone(),
@@ -218,7 +218,7 @@ pub(crate) fn refuse_secrets(file: &RolloutFile) -> Result<(), HarnessError> {
         line.clear();
         if lines
             .read_until(b'\n', &mut line)
-            .map_err(|e| HarnessError::io("read", &file.path, e))?
+            .map_err(|e| HarnessError::io(IoOp::Read, &file.path, e))?
             == 0
         {
             return Ok(());

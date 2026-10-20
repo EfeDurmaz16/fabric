@@ -15,7 +15,7 @@ use std::path::Path;
 use fabric_core::path::AbsPath;
 use serde_json::{Map, Value};
 
-use crate::error::{HarnessError, Input};
+use crate::error::{HarnessError, Input, IoOp};
 use crate::files;
 
 /// The key Claude reads to skip the trust dialog.
@@ -24,7 +24,8 @@ pub(crate) const TRUST_KEY: &str = "hasTrustDialogAccepted";
 /// Sets the trust key for `root` in the config file at `config_json`.
 /// Returns true when the file changed.
 pub(crate) fn preseed_file(config_json: &Path, root: &AbsPath) -> Result<bool, HarnessError> {
-    let bytes = std::fs::read(config_json).map_err(|e| HarnessError::io("read", config_json, e))?;
+    let bytes =
+        std::fs::read(config_json).map_err(|e| HarnessError::io(IoOp::Read, config_json, e))?;
     let mut value: Value = serde_json::from_slice(&bytes).map_err(|e| HarnessError::Malformed {
         what: Input::ConfigJson,
         path: config_json.to_path_buf(),
@@ -110,7 +111,7 @@ mod tests {
         let config = dir.path().join(".claude.json");
         assert!(matches!(
             preseed_file(&config, &AbsPath::parse("/w").unwrap()),
-            Err(HarnessError::Io { op: "read", .. })
+            Err(HarnessError::Io { op: IoOp::Read, .. })
         ));
         assert!(!config.exists());
     }

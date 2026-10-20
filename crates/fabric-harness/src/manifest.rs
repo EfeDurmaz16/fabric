@@ -16,7 +16,7 @@ use fabric_core::harness::HarnessKind;
 use fabric_core::path::{AbsPath, RelPath};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::error::{HarnessError, Input};
+use crate::error::{HarnessError, Input, IoOp};
 use crate::session::SessionId;
 
 /// The file name of the manifest inside a captured state tree.
@@ -384,7 +384,7 @@ impl StateManifest {
     /// Reads the manifest under `state`, checking its rules.
     pub fn read(state: &Path) -> Result<Self, HarnessError> {
         let path = state.join(MANIFEST_FILE);
-        let bytes = std::fs::read(&path).map_err(|e| HarnessError::io("read", &path, e))?;
+        let bytes = std::fs::read(&path).map_err(|e| HarnessError::io(IoOp::Read, &path, e))?;
         serde_json::from_slice(&bytes).map_err(|e| HarnessError::Malformed {
             what: Input::Manifest,
             path,

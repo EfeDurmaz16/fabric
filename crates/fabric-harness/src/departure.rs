@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{HarnessError, Input};
+use crate::error::{HarnessError, Input, IoOp};
 use crate::files::{self, Source};
 use crate::manifest::{Digest, Mutability};
 use crate::session::SessionId;
@@ -126,7 +126,7 @@ fn read(path: &Path) -> Result<Option<Departure>, HarnessError> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(HarnessError::io("read", path, e)),
+        Err(e) => return Err(HarnessError::io(IoOp::Read, path, e)),
     };
     let malformed = |reason: String| HarnessError::Malformed {
         what: Input::DepartureRecord,

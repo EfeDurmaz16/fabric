@@ -43,7 +43,7 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::departure::Records;
-use crate::error::HarnessError;
+use crate::error::{HarnessError, IoOp};
 use crate::files::{self, Carry, Source};
 use crate::harness::{Harness, Installed, Launch, Restored, Running};
 use crate::jsontext;
@@ -148,11 +148,11 @@ impl ClaudeCode {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(HarnessError::io("walk", &dir, e)),
+            Err(e) => return Err(HarnessError::io(IoOp::Walk, &dir, e)),
         };
         let mut newest: Option<(std::time::SystemTime, SessionId)> = None;
         for entry in entries {
-            let entry = entry.map_err(|e| HarnessError::io("walk", &dir, e))?;
+            let entry = entry.map_err(|e| HarnessError::io(IoOp::Walk, &dir, e))?;
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
@@ -166,7 +166,7 @@ impl ClaudeCode {
             let modified = entry
                 .metadata()
                 .and_then(|m| m.modified())
-                .map_err(|e| HarnessError::io("read", &path, e))?;
+                .map_err(|e| HarnessError::io(IoOp::Read, &path, e))?;
             if newest.as_ref().is_none_or(|(t, _)| modified > *t) {
                 newest = Some((modified, session));
             }
@@ -217,11 +217,13 @@ impl ClaudeCode {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Registry::CannotAnswer("there is no session registry"));
             }
-            Err(e) => return Err(HarnessError::io("walk", &dir, e)),
+            Err(e) => return Err(HarnessError::io(IoOp::Walk, &dir, e)),
         };
         let mut pids = Vec::new();
         for entry in entries {
-            let path = entry.map_err(|e| HarnessError::io("walk", &dir, e))?.path();
+            let path = entry
+                .map_err(|e| HarnessError::io(IoOp::Walk, &dir, e))?
+                .path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
@@ -270,7 +272,7 @@ impl ClaudeCode {
         match std::fs::symlink_metadata(path) {
             Ok(meta) => Ok(Some(meta.file_type())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(HarnessError::io("read", path, e)),
+            Err(e) => Err(HarnessError::io(IoOp::Read, path, e)),
         }
     }
 
@@ -402,16 +404,16 @@ impl ClaudeCode {
         let entries = match std::fs::read_dir(&projects) {
             Ok(entries) => Some(entries),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(HarnessError::io("walk", &projects, e)),
+            Err(e) => return Err(HarnessError::io(IoOp::Walk, &projects, e)),
         };
         if let Some(entries) = entries {
             let mut keys = Vec::new();
             for entry in entries {
-                let entry = entry.map_err(|e| HarnessError::io("walk", &projects, e))?;
+                let entry = entry.map_err(|e| HarnessError::io(IoOp::Walk, &projects, e))?;
                 let path = entry.path();
                 let kind = entry
                     .file_type()
-                    .map_err(|e| HarnessError::io("walk", &path, e))?;
+                    .map_err(|e| HarnessError::io(IoOp::Walk, &path, e))?;
                 if kind.is_dir() {
                     keys.push(path);
                 } else if kind.is_symlink()
@@ -603,7 +605,7 @@ impl ClaudeCode {
 /// literal secret: ADR 0006 allows only `${VAR}` references there. The
 /// overlay is JSON, so its strings are matched decoded too.
 fn refuse_secret_overlay(path: &Path) -> Result<(), HarnessError> {
-    let bytes = std::fs::read(path).map_err(|e| HarnessError::io("read", path, e))?;
+    let bytes = std::fs::read(path).map_err(|e| HarnessError::io(IoOp::Read, path, e))?;
     if jsontext::holds_secret(&bytes, Redactor::standard()?) {
         return Err(HarnessError::SecretInOverlay {
             path: path.to_path_buf(),

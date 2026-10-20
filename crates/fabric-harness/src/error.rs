@@ -102,8 +102,8 @@ pub enum HarnessError {
     /// A file operation failed.
     #[error("{op} {path}: {source}")]
     Io {
-        /// What was being done: `read`, `write`, `create dir`, `walk`, `rename`, `fsync`, `lock`, `canonicalize`.
-        op: &'static str,
+        /// What was being done.
+        op: IoOp,
         /// The path concerned.
         path: PathBuf,
         /// The underlying error.
@@ -285,6 +285,46 @@ pub enum HarnessError {
     Acp(#[from] crate::acp::client::AcpError),
 }
 
+/// The file operation that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IoOp {
+    /// Reading a file or its metadata.
+    Read,
+    /// Writing a file or setting its mode.
+    Write,
+    /// Creating a directory.
+    CreateDir,
+    /// Listing a directory.
+    Walk,
+    /// Renaming a file into place.
+    Rename,
+    /// Flushing a file or directory to disk.
+    Fsync,
+    /// Taking a file lock.
+    Lock,
+    /// Resolving a path to its physical form.
+    Canonicalize,
+    /// Removing a file.
+    Remove,
+}
+
+impl std::fmt::Display for IoOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            IoOp::Read => "read",
+            IoOp::Write => "write",
+            IoOp::CreateDir => "create dir",
+            IoOp::Walk => "walk",
+            IoOp::Rename => "rename",
+            IoOp::Fsync => "fsync",
+            IoOp::Lock => "lock",
+            IoOp::Canonicalize => "canonicalize",
+            IoOp::Remove => "remove",
+        })
+    }
+}
+
 /// The kind of input that did not parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -318,7 +358,7 @@ impl std::fmt::Display for Input {
 
 impl HarnessError {
     /// Wraps an IO error with the operation and the path it concerned.
-    pub(crate) fn io(op: &'static str, path: impl Into<PathBuf>, source: std::io::Error) -> Self {
+    pub(crate) fn io(op: IoOp, path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         HarnessError::Io {
             op,
             path: path.into(),
