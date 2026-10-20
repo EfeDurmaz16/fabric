@@ -12,20 +12,22 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use fabric_core::BoxFuture;
-use fabric_core::id::{ChunkId, Epoch, JobId, NodeId, SnapshotId};
+use fabric_core::id::{ChunkId, Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::FencingToken;
+use fabric_core::moves::MoveOffer;
 use fabric_net::endpoint::{DialOrder, Endpoint};
 use fabric_net::frame::{FRAME_VERSION, MAX_CONTROL_FRAME};
 use fabric_net::identity::NodeIdentity;
 use fabric_net::peers::Peers;
 use fabric_net::quic::QuicTransport;
-use fabric_net::rpc::{RpcError, Service, Session};
+use fabric_net::rpc::{JobFuture, RpcError, Service, Session};
 use fabric_net::tcp::TcpTlsTransport;
 use fabric_net::tls::{TlsError, Trust};
 use fabric_net::transport::{Connection, Transport, TransportError, TransportKind};
 use fabric_net::wire::{
-    ChunkBatch, FactName, FactValue, Facts, Fault, FaultText, JobRequest, JobResponse,
-    ManifestChunks, PROTOCOL_VERSION, VersionText,
+    Appended, ChunkBatch, FactName, FactValue, Facts, Fault, FaultText, ManifestChunks,
+    MoveRequested, MoveState, Offered, PROTOCOL_VERSION, Pulled, RecordBytes, RecordPage,
+    VersionText,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -105,18 +107,38 @@ impl FakeService {
     }
 }
 
+/// A per-job answer these tests never ask for.
+fn not_here<T>() -> JobFuture<'static, T> {
+    Box::pin(async { Err(Fault::Internal(FaultText::truncated("not in this test"))) })
+}
+
 impl Service for FakeService {
-    fn job(
-        &self,
-        _peer: NodeId,
-        _token: FencingToken,
-        _request: JobRequest,
-    ) -> BoxFuture<'_, Result<JobResponse, Fault>> {
+    fn pull(&self, _: NodeId, _: FencingToken, _: Option<RecordHash>) -> JobFuture<'_, Pulled> {
+        not_here()
+    }
+
+    fn append(&self, _: NodeId, _: FencingToken, _: RecordPage) -> JobFuture<'_, Appended> {
+        not_here()
+    }
+
+    fn move_request(&self, _: NodeId, _: FencingToken) -> JobFuture<'_, MoveRequested> {
         Box::pin(async move {
             tokio::time::sleep(self.job_delay).await;
             self.jobs_done.fetch_add(1, Ordering::SeqCst);
             Err(Fault::Internal(FaultText::truncated("not in this test")))
         })
+    }
+
+    fn offer(&self, _: NodeId, _: FencingToken, _: MoveOffer) -> JobFuture<'_, Offered> {
+        not_here()
+    }
+
+    fn move_status(&self, _: NodeId, _: FencingToken, _: MoveId) -> JobFuture<'_, MoveState> {
+        not_here()
+    }
+
+    fn move_abort(&self, _: NodeId, _: FencingToken, _: MoveId) -> JobFuture<'_, RecordBytes> {
+        not_here()
     }
 
     fn manifest(
@@ -167,12 +189,14 @@ fn serve_one(
     stop: Option<mpsc::Receiver<()>>,
 ) -> JoinHandle<Result<(), RpcError>> {
     tokio::spawn(async move {
-        let connection = Arc::from(transport.accept().await?);
+        let connection: Arc<dyn Connection> = Arc::from(transport.accept().await?);
+        // The transport let the peer in, so the session serves it under the same pairing.
+        let trust: Arc<dyn Trust> = Arc::new(Paired(vec![connection.peer()]));
         let session = Session::accept(connection, local, version, DEADLINE).await?;
         match stop {
-            None => Err(session.serve(service).await),
+            None => Err(session.serve(service, trust).await),
             Some(mut stop) => tokio::select! {
-                ended = session.serve(service) => Err(ended),
+                ended = session.serve(service, trust) => Err(ended),
                 _ = stop.recv() => {
                     session.close();
                     Ok(())
@@ -473,7 +497,7 @@ async fn a_job_request_past_its_budget_still_runs_to_its_end() -> TestResult {
     };
     let deadline = Duration::from_millis(100);
     let err = session
-        .job(token, JobRequest::MoveRequest, deadline)
+        .move_request(token, deadline)
         .await
         .err()
         .ok_or("the call must fail")?;
@@ -559,7 +583,7 @@ async fn a_chunk_transfer_resumes_after_the_connection_drops() -> TestResult {
         let interrupted = loop {
             match stream.next().await {
                 Ok(Some(chunk)) => {
-                    let (id, _, bytes) = chunk.into_parts();
+                    let (id, bytes) = chunk.into_bytes();
                     got.insert(id, bytes);
                 }
                 Ok(None) => break None,
@@ -598,7 +622,7 @@ async fn a_chunk_transfer_resumes_after_the_connection_drops() -> TestResult {
             .await?;
         let mut resumed = 0;
         while let Some(chunk) = stream.next().await? {
-            let (id, _, bytes) = chunk.into_parts();
+            let (id, bytes) = chunk.into_bytes();
             assert!(
                 got.insert(id, bytes).is_none(),
                 "{kind}: a chunk arrived twice"
@@ -635,7 +659,7 @@ async fn concurrent_streams_do_not_cross_under_backpressure() -> TestResult {
                 for task in tasks {
                     let copied = task
                         .await
-                        .map_err(|e| TransportError::Closed(e.to_string()))??;
+                        .map_err(|e| TransportError::Closed(Box::new(e)))??;
                     assert_eq!(usize::try_from(copied).ok(), Some(LEN));
                 }
                 // Dropping the connection now would discard echoed bytes the
@@ -731,31 +755,37 @@ async fn a_stream_read_later_does_not_hold_up_the_one_read_now() -> TestResult {
     Ok(())
 }
 
-/// An address that drops SYNs, such as a stale LAN address after the laptop
-/// changed networks, costs the dial timeout and not the operating system's
-/// connect timeout of a minute or more. 10.255.255.1 is routed nowhere on a
-/// typical host; where it is refused at once instead, the dial still ends
-/// within the budget.
+/// A peer that never finishes the handshake, such as a stale address that
+/// now swallows packets, costs the dial timeout on either wire, not the
+/// operating system's connect timeout or quinn's idle timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_dial_to_a_black_hole_ends_within_the_dial_timeout() -> TestResult {
+async fn a_dial_whose_handshake_never_finishes_ends_at_the_dial_timeout() -> TestResult {
     let (a, b) = (Node::new()?, Node::new()?);
     let trust: Arc<dyn Trust> = Arc::new(Paired(vec![b.id()]));
+    let any: SocketAddr = ([127, 0, 0, 1], 0).into();
     let budget = Duration::from_millis(300);
-    let client = TcpTlsTransport::bind(&a.identity, trust, ([127, 0, 0, 1], 0).into())?
-        .with_dial_timeout(budget);
-    let started = std::time::Instant::now();
-    let dialed = client
-        .connect(b.id(), ([10, 255, 255, 1], 7777).into())
-        .await;
-    assert!(
-        matches!(
-            dialed,
-            Err(TransportError::Timeout(d)) if d == budget
-        ) || matches!(dialed, Err(TransportError::Io(_))),
-        "{:?}",
-        dialed.err()
-    );
-    assert!(started.elapsed() < Duration::from_secs(2));
+    // UDP that reads every datagram and answers none.
+    let silent_udp = std::net::UdpSocket::bind(any)?;
+    // TCP that completes the connect and never speaks TLS.
+    let silent_tcp = tokio::net::TcpListener::bind(any).await?;
+    let quic: Arc<dyn Transport> =
+        Arc::new(QuicTransport::bind(&a.identity, trust.clone(), any)?.with_dial_timeout(budget));
+    let tcp: Arc<dyn Transport> =
+        Arc::new(TcpTlsTransport::bind(&a.identity, trust, any)?.with_dial_timeout(budget));
+    for (transport, addr) in [
+        (quic, silent_udp.local_addr()?),
+        (tcp, silent_tcp.local_addr()?),
+    ] {
+        let started = std::time::Instant::now();
+        let dialed = transport.connect(b.id(), addr).await;
+        assert!(
+            matches!(dialed, Err(TransportError::Timeout(d)) if d == budget),
+            "{}: {:?}",
+            transport.kind(),
+            dialed.err()
+        );
+        assert!(started.elapsed() < budget + Duration::from_secs(1));
+    }
     Ok(())
 }
 
@@ -822,7 +852,7 @@ async fn another_node_at_a_stale_address_does_not_end_the_dial() -> TestResult {
             &[stale.local_addr()?.into(), current.local_addr()?.into()],
         )
         .await?;
-    assert_eq!(dialed.connection.peer(), b.id());
+    assert_eq!(dialed.connection().peer(), b.id());
     assert_eq!(accepting.await??.peer(), a.id());
     Ok(())
 }
@@ -842,8 +872,8 @@ async fn quic_is_dialed_first_and_tcp_is_the_fallback() -> TestResult {
         tokio::spawn(async move { server.accept().await })
     };
     let dialed = client.dial(b.id(), server.local_addr()?).await?;
-    assert_eq!(dialed.connection.kind(), TransportKind::Quic);
-    assert!(dialed.quic_failure.is_none());
+    assert_eq!(dialed.connection().kind(), TransportKind::Quic);
+    assert!(dialed.quic_failure().is_none());
     assert_eq!(accepting.await??.kind(), TransportKind::Quic);
 
     // A port where UDP is a black hole and only TCP answers. The port TCP
@@ -862,9 +892,9 @@ async fn quic_is_dialed_first_and_tcp_is_the_fallback() -> TestResult {
         tokio::spawn(async move { tcp_only.accept().await })
     };
     let dialed = client.dial_any(b.id(), &[tcp_only_addr.into()]).await?;
-    assert_eq!(dialed.connection.kind(), TransportKind::TcpTls);
+    assert_eq!(dialed.connection().kind(), TransportKind::TcpTls);
     assert!(
-        matches!(dialed.quic_failure, Some(TransportError::Timeout(_))),
+        matches!(dialed.quic_failure(), Some(TransportError::Timeout(_))),
         "the fallback must say how QUIC failed"
     );
     assert_eq!(accepting.await??.kind(), TransportKind::TcpTls);
@@ -888,8 +918,8 @@ async fn a_dial_order_names_the_one_wire_a_dial_uses() -> TestResult {
             tokio::spawn(async move { server.accept().await })
         };
         let dialed = client.dial(b.id(), server.local_addr()?).await?;
-        assert_eq!(dialed.connection.kind(), kind, "{order:?}");
-        assert!(dialed.quic_failure.is_none());
+        assert_eq!(dialed.connection().kind(), kind, "{order:?}");
+        assert!(dialed.quic_failure().is_none());
         assert_eq!(accepting.await??.kind(), kind);
     }
     Ok(())

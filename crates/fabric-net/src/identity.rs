@@ -5,11 +5,12 @@
 //! only as the PKCS#8 bytes the TLS layer signs with. The node id is the
 //! public key, so two machines never share an id. A crash while the key is
 //! being written leaves no key or a whole key, never a torn one, and the
-//! next start works either way.
+//! next start works either way. It can also leave a temporary copy of the
+//! key beside it, mode 0600 like the key, which `save` describes.
 
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -77,15 +78,18 @@ impl NodeIdentity {
     }
 
     /// Reads the key at `path`, refusing a file other users can read.
+    ///
+    /// The mode is checked on the handle the key is read from, so it is the
+    /// mode of the file read, even if the path changes in between.
     pub fn load(path: &Path) -> Result<Self, IdentityError> {
         let io = |source| IdentityError::Io {
             path: path.to_path_buf(),
             source,
         };
-        let bytes = fs::read(path).map_err(io)?;
+        let mut file = fs::File::open(path).map_err(io)?;
         #[cfg(unix)]
         {
-            let mode = fs::metadata(path).map_err(io)?.permissions().mode() & 0o777;
+            let mode = file.metadata().map_err(io)?.permissions().mode() & 0o777;
             if mode & 0o077 != 0 {
                 return Err(IdentityError::Permissions {
                     path: path.to_path_buf(),
@@ -93,6 +97,8 @@ impl NodeIdentity {
                 });
             }
         }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(io)?;
         let der = PrivatePkcs8KeyDer::from(bytes);
         let key = KeyPair::from_pkcs8_der_and_sign_algo(&der, &PKCS_ED25519).map_err(|_| {
             IdentityError::Malformed {
@@ -129,8 +135,10 @@ impl NodeIdentity {
     /// The bytes go to a temporary file that only this call names and are
     /// synced; the final name is then taken with a hard link, which fails
     /// if the file exists; the directory is synced last. A crash can leave
-    /// a stray `node.key.<pid>.<clock>.<n>.tmp` behind: it names no node,
-    /// no start reads it, and it can be deleted.
+    /// a stray `node.key.<pid>.<clock>.<n>.tmp` behind. It holds a copy of
+    /// the secret key, mode 0600 like the key itself, and no start reads
+    /// it; delete it, as the key would be deleted, before the key is
+    /// replaced or the directory leaves this machine.
     pub fn save(&self, path: &Path) -> Result<(), IdentityError> {
         let io = |source| IdentityError::Io {
             path: path.to_path_buf(),

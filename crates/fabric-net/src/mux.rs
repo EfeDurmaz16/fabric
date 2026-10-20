@@ -12,11 +12,21 @@
 //! `Data` carries bytes, `Fin` ends one direction, and `Reset` tells the
 //! peer this side's reader is gone, so the peer's writer fails with
 //! `BrokenPipe` instead of sending into nothing, as QUIC's `STOP_SENDING`
-//! does. The peer may hold at most `MAX_STREAMS` streams open, as quinn
-//! allows by default; a stream above that is reset at once, and this side
-//! waits in `open` instead of going over the peer's limit. A frame payload
-//! above `MAX_MUX_PAYLOAD` ends the connection. So a peer can make this node
-//! hold at most `MAX_STREAMS` stream buffers and one frame.
+//! does. The `Reset` goes out as soon as the reader is dropped, not when the
+//! peer next sends: a peer out of credit sends nothing more, and would
+//! otherwise wait for credit forever while both sides hold the stream's slot. The peer may hold at most `MAX_STREAMS` streams open, as quinn
+//! allows by default; a stream above that is refused at once with a `Reset`
+//! and a `Fin`, so both its directions end, and this side waits in `open`
+//! instead of going over the peer's limit. A frame payload above
+//! `MAX_MUX_PAYLOAD` ends the connection. So a peer can make this node hold
+//! at most `MAX_STREAMS` stream buffers and one frame.
+//!
+//! The connection's reader never waits on anything but the wire. The frames
+//! it sends itself, a `Reset` or a refusal, go through a control queue that
+//! the writer drains before the data queue, and it queues them without
+//! waiting: a full control queue means the peer makes this side reset
+//! streams while it reads nothing, and ends the connection. So two peers
+//! whose writers both wait on a full wire still read, and both drain.
 //!
 //! Each direction of a stream has its own credit, as each QUIC stream has
 //! its own window. A sender starts with `STREAM_BUFFER` bytes of credit and
@@ -46,9 +56,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::AbortHandle;
 
 use crate::idle::IdleReader;
-use crate::pipe::{Drained, PipeReader, PipeWriter, Refused, pipe};
-use crate::quic::{IDLE_TIMEOUT, KEEP_ALIVE};
-use crate::transport::{Connection, Stream, TransportError, TransportKind};
+use crate::pipe::{Drained, PipeReader, PipeWriter, Refused, Report, pipe};
+use crate::transport::{
+    Connection, IDLE_TIMEOUT, KEEP_ALIVE, Stream, TransportError, TransportKind,
+};
 
 /// The most payload bytes in one multiplexer frame.
 pub(crate) const MAX_MUX_PAYLOAD: usize = 64 << 10;
@@ -66,8 +77,12 @@ const HEADER_LEN: usize = 9;
 const CREDIT_LEN: usize = 4;
 const OUT_QUEUE: usize = 64;
 
+/// The frames the reader may queue before the writer sends one: a reset per
+/// stream the peer holds open, and the two frames of each refusal, with room.
+const CONTROL_QUEUE: usize = 4 * MAX_STREAMS;
+
 /// What one multiplexer frame does to its stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FrameKind {
     /// Carries the stream's next bytes.
     Data,
@@ -220,6 +235,8 @@ struct Streams {
 struct Shared {
     side: Side,
     out: mpsc::Sender<Outgoing>,
+    /// The reader's own frames; the writer sends them before any in `out`.
+    control: mpsc::Sender<Outgoing>,
     streams: Mutex<Streams>,
     /// The next id this side opens; held while a stream queues its first frame.
     next_id: tokio::sync::Mutex<Option<u32>>,
@@ -253,7 +270,10 @@ impl Shared {
 }
 
 fn closed() -> TransportError {
-    TransportError::Closed("tcp connection ended".to_owned())
+    TransportError::Closed(Box::new(io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        "tcp connection ended",
+    )))
 }
 
 /// One multiplexed connection over a byte stream.
@@ -274,6 +294,7 @@ impl Mux {
     {
         let (read_half, write_half) = tokio::io::split(io);
         let (out, out_rx) = mpsc::channel::<Outgoing>(OUT_QUEUE);
+        let (control, control_rx) = mpsc::channel::<Outgoing>(CONTROL_QUEUE);
         // Every waiting stream holds a slot, so the queue never fills.
         let (incoming_tx, incoming_rx) = mpsc::channel::<Stream>(MAX_STREAMS);
         let (alive_tx, alive_rx) = oneshot::channel();
@@ -281,13 +302,14 @@ impl Mux {
         let shared = Arc::new(Shared {
             side,
             out,
+            control,
             streams: Mutex::default(),
             next_id: tokio::sync::Mutex::new(Some(side.first_id())),
             local_slots: Arc::new(Semaphore::new(MAX_STREAMS)),
             peer_slots: Arc::new(Semaphore::new(MAX_STREAMS)),
             ended: watch::Sender::new(false),
         });
-        let writer = tokio::spawn(write_loop(write_half, out_rx));
+        let writer = tokio::spawn(write_loop(write_half, control_rx, out_rx));
         let reader = tokio::spawn(read_loop(
             read_half,
             Arc::clone(&shared),
@@ -367,7 +389,6 @@ async fn pump_local(shared: Arc<Shared>, source: PipeReader, inbound: PipeWriter
             }
         }
         *next = id.checked_add(2);
-        tokio::spawn(grant_credit(Arc::clone(&shared), id, drained));
         // Queued under the id lock, so ids reach the wire in rising order.
         let only_fin = first.is_empty();
         let frame = if only_fin {
@@ -379,32 +400,27 @@ async fn pump_local(shared: Arc<Shared>, source: PipeReader, inbound: PipeWriter
                 payload: first,
             }
         };
-        if shared.out.send(frame).await.is_err() || only_fin {
+        if shared.out.send(frame).await.is_err() {
+            return;
+        }
+        // Started after the first frame is queued, so a `Reset` for this
+        // stream never reaches the peer before the stream itself does.
+        tokio::spawn(grant_credit(Arc::clone(&shared), id, drained));
+        if only_fin {
             return;
         }
         id
     };
-    send_rest(&shared, id, source, stop_rx, &credit).await;
-}
-
-/// Sends a peer-opened stream's answers; its id and slot were registered when it arrived.
-async fn pump_peer(
-    shared: Arc<Shared>,
-    id: u32,
-    source: PipeReader,
-    stop: oneshot::Receiver<()>,
-    credit: Arc<Semaphore>,
-) {
-    send_rest(&shared, id, source, stop, &credit).await;
+    send_rest(shared, id, source, stop_rx, credit).await;
 }
 
 /// Frames what the stream's writer writes, within the stream's credit, until it finishes, the peer resets it, or the connection ends.
 async fn send_rest(
-    shared: &Shared,
+    shared: Arc<Shared>,
     id: u32,
     source: PipeReader,
     mut stop: oneshot::Receiver<()>,
-    credit: &Semaphore,
+    credit: Arc<Semaphore>,
 ) {
     loop {
         let taken = tokio::select! {
@@ -413,10 +429,20 @@ async fn send_rest(
             taken = poll_fn(|cx| source.poll_take(cx, MAX_MUX_PAYLOAD)) => taken.unwrap_or_default(),
         };
         if taken.is_empty() {
-            // The slot goes before the Fin, so a peer that saw the Fin
-            // never counts this stream against the cap.
-            shared.streams().outbound.remove(&id);
-            let _ = shared.out.send(Outgoing::bare(id, FrameKind::Fin)).await;
+            let finished = shared.streams().outbound.remove(&id);
+            let fin = Outgoing::bare(id, FrameKind::Fin);
+            if shared.side.opens(id) {
+                // The next `open` may take this slot once it is free, so the
+                // Fin is queued first: the peer sees this stream end before
+                // the next one starts, and never counts one over its cap.
+                let _ = shared.out.send(fin).await;
+                drop(finished);
+            } else {
+                // The peer opens its next stream once it sees the Fin, so
+                // the slot here is free before the Fin is queued.
+                drop(finished);
+                let _ = shared.out.send(fin).await;
+            }
             return;
         }
         // At most MAX_MUX_PAYLOAD, so it fits a u32.
@@ -446,9 +472,16 @@ async fn send_rest(
     }
 }
 
-/// Hands the peer credit for `id` each time the stream's reader takes `CREDIT_STEP` bytes, until the peer's direction ends.
+/// Hands the peer credit for `id` each time the stream's reader takes
+/// `CREDIT_STEP` bytes, until the peer's direction ends; resets the stream
+/// as soon as its reader is dropped.
 async fn grant_credit(shared: Arc<Shared>, id: u32, drained: Drained) {
-    while let Some(taken) = poll_fn(|cx| drained.poll_report(cx, CREDIT_STEP)).await {
+    loop {
+        let taken = match poll_fn(|cx| drained.poll_report(cx, CREDIT_STEP)).await {
+            Report::Took(taken) => taken,
+            Report::Ended => return,
+            Report::ReaderGone => return reset_dropped(&shared, id).await,
+        };
         // At most STREAM_BUFFER, so it fits a u32.
         let Ok(taken) = u32::try_from(taken) else {
             return;
@@ -464,29 +497,57 @@ async fn grant_credit(shared: Arc<Shared>, id: u32, drained: Drained) {
     }
 }
 
+/// Resets `id` after its reader was dropped, unless the connection's reader already did.
+async fn reset_dropped(shared: &Shared, id: u32) {
+    let Some(gone) = shared.streams().inbound.remove(&id) else {
+        return;
+    };
+    let reset = Outgoing::bare(id, FrameKind::Reset);
+    // The same order as a `Fin` in `send_rest`: the side that opened the
+    // stream frees its slot only after the peer can see the stream close.
+    if shared.side.opens(id) {
+        let _ = shared.out.send(reset).await;
+        drop(gone);
+    } else {
+        drop(gone);
+        let _ = shared.out.send(reset).await;
+    }
+}
+
 async fn write_loop(
     mut wire: tokio::io::WriteHalf<impl AsyncWrite>,
+    mut control: mpsc::Receiver<Outgoing>,
     mut out: mpsc::Receiver<Outgoing>,
 ) {
     loop {
-        let frame = match out.try_recv() {
-            Ok(frame) => frame,
-            Err(mpsc::error::TryRecvError::Empty) => {
-                // TLS takes written bytes into its own buffer and sends them
-                // only as the socket has room; with nothing queued, push
-                // them out before waiting, or a stream's last bytes sit
-                // there until the next frame.
-                if let Err(err) = wire.flush().await {
-                    tracing::debug!(error = %err, "tcp mux flush ended");
-                    return;
-                }
-                match tokio::time::timeout(KEEP_ALIVE, out.recv()).await {
-                    Ok(Some(frame)) => frame,
-                    Ok(None) => break,
-                    Err(_) => Outgoing::bare(0, FrameKind::KeepAlive),
-                }
+        let queued = match control.try_recv() {
+            Ok(frame) => Some(frame),
+            Err(_) => out.try_recv().ok(),
+        };
+        let frame = if let Some(frame) = queued {
+            frame
+        } else {
+            // TLS takes written bytes into its own buffer and sends them
+            // only as the socket has room; with nothing queued, push
+            // them out before waiting, or a stream's last bytes sit
+            // there until the next frame.
+            if let Err(err) = wire.flush().await {
+                tracing::debug!(error = %err, "tcp mux flush ended");
+                return;
             }
-            Err(mpsc::error::TryRecvError::Disconnected) => break,
+            let next = tokio::time::timeout(KEEP_ALIVE, async {
+                tokio::select! {
+                    biased;
+                    Some(frame) = control.recv() => Some(frame),
+                    frame = out.recv() => frame,
+                }
+            });
+            match next.await {
+                Ok(Some(frame)) => frame,
+                // Both queues live in the shared state and close together.
+                Ok(None) => break,
+                Err(_) => Outgoing::bare(0, FrameKind::KeepAlive),
+            }
         };
         let Ok(len) = u32::try_from(frame.payload.len()) else {
             return;
@@ -549,7 +610,7 @@ async fn demux(
         match kind {
             FrameKind::Data | FrameKind::Fin => {
                 if !shared.side.opens(id) && id > shared.streams().peer_high {
-                    accept_stream(shared, id, alive, incoming).await;
+                    accept_stream(shared, id, alive, incoming)?;
                 }
                 if kind == FrameKind::Fin {
                     let finished = shared.streams().inbound.remove(&id);
@@ -557,7 +618,7 @@ async fn demux(
                         stream.finish();
                     }
                 } else if !deliver(shared, id, &payload)? {
-                    reset(shared, id).await;
+                    reset(shared, id)?;
                 }
             }
             FrameKind::Reset => {
@@ -569,21 +630,22 @@ async fn demux(
     }
 }
 
-/// Opens the stream the peer just started, or resets it when the peer is at the cap or nobody accepts.
-async fn accept_stream(
+/// Opens the stream the peer just started, or refuses it when the peer is at the cap or nobody accepts.
+fn accept_stream(
     shared: &Arc<Shared>,
     id: u32,
     alive: &Weak<Alive>,
     incoming: &mpsc::Sender<Stream>,
-) {
+) -> io::Result<()> {
     shared.streams().peer_high = id;
     let (Ok(permit), Some(alive)) = (
         Arc::clone(&shared.peer_slots).try_acquire_owned(),
         alive.upgrade(),
     ) else {
         tracing::debug!(id, "refusing a peer stream over the cap");
-        let _ = shared.out.send(Outgoing::bare(id, FrameKind::Reset)).await;
-        return;
+        // Both directions end: the peer's writer fails and its reader sees the end.
+        queue_control(shared, id, FrameKind::Reset)?;
+        return queue_control(shared, id, FrameKind::Fin);
     };
     let slot = Arc::new(Slot {
         _permit: permit,
@@ -612,7 +674,7 @@ async fn accept_stream(
             },
         );
     }
-    tokio::spawn(pump_peer(
+    tokio::spawn(send_rest(
         Arc::clone(shared),
         id,
         outbound_reader,
@@ -624,18 +686,19 @@ async fn accept_stream(
         .is_err()
     {
         // The handle is gone, so nobody will take this stream.
-        reset(shared, id).await;
+        reset(shared, id)?;
     }
+    Ok(())
 }
 
 /// Puts a `Data` payload in its stream's buffer without waiting.
 ///
 /// Returns false when the stream's reader is gone, so the caller resets
-/// it once; a closed stream, ours or the peer's, has no entry and its
-/// frames are dropped. A payload the buffer cannot hold means the peer
-/// sent past its credit, and ends the connection.
+/// it; a closed stream, ours or the peer's, has no entry and its frames
+/// are dropped. A payload the buffer cannot hold means the peer sent past
+/// its credit, and ends the connection.
 fn deliver(shared: &Shared, id: u32, payload: &[u8]) -> io::Result<bool> {
-    let mut streams = shared.streams();
+    let streams = shared.streams();
     let Some(stream) = streams.inbound.get(&id) else {
         return Ok(true);
     };
@@ -644,10 +707,7 @@ fn deliver(shared: &Shared, id: u32, payload: &[u8]) -> io::Result<bool> {
         Err(Refused::Full) => Err(invalid(format!(
             "the peer sent past its credit on stream {id}"
         ))),
-        Err(Refused::ReaderGone) => {
-            streams.inbound.remove(&id);
-            Ok(false)
-        }
+        Err(Refused::ReaderGone) => Ok(false),
     }
 }
 
@@ -672,9 +732,33 @@ fn credit(shared: &Shared, id: u32, payload: &[u8]) -> io::Result<()> {
 }
 
 /// Forgets the inbound half of `id` and tells the peer to stop sending on it.
-async fn reset(shared: &Shared, id: u32) {
-    shared.streams().inbound.remove(&id);
-    let _ = shared.out.send(Outgoing::bare(id, FrameKind::Reset)).await;
+///
+/// Only the call that removes the entry queues the `Reset`, so the peer
+/// gets one even when `reset_dropped` races this. The entry, and with it
+/// the stream's slot, is dropped after the frame is queued, so the next
+/// stream this side opens reaches the peer behind the `Reset`; the peer's
+/// next stream cannot arrive before this returns, since the reader runs it.
+fn reset(shared: &Shared, id: u32) -> io::Result<()> {
+    let Some(gone) = shared.streams().inbound.remove(&id) else {
+        return Ok(());
+    };
+    queue_control(shared, id, FrameKind::Reset)?;
+    drop(gone);
+    Ok(())
+}
+
+/// Queues one of the reader's own frames without waiting.
+///
+/// A full control queue means the peer makes this side answer while it
+/// reads nothing, and ends the connection. A closed one means the writer
+/// is gone, and the connection is ending anyway.
+fn queue_control(shared: &Shared, id: u32, kind: FrameKind) -> io::Result<()> {
+    match shared.control.try_send(Outgoing::bare(id, kind)) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => Err(invalid(
+            "the peer reads nothing while this side resets its streams".to_owned(),
+        )),
+    }
 }
 
 impl Connection for Mux {
@@ -775,16 +859,13 @@ mod tests {
             raw.send(1, FrameKind::Data, b"more").await;
         }
         assert!(nothing_from_next(&mux).await, "a closed id came back");
-        let mut answers = vec![raw.recv().await, raw.recv().await];
-        answers.sort_unstable();
-        assert_eq!(
-            answers,
-            [
-                (1, FrameKind::Fin, Vec::new()),
-                (1, FrameKind::Reset, Vec::new())
-            ],
-            "the dropped writer finishes and the dropped reader resets"
-        );
+        let answers = [raw.recv().await, raw.recv().await];
+        for kind in [FrameKind::Fin, FrameKind::Reset] {
+            assert!(
+                answers.contains(&(1, kind, Vec::new())),
+                "the dropped writer finishes and the dropped reader resets: {answers:?}"
+            );
+        }
         assert!(
             tokio::time::timeout(Duration::from_millis(200), raw.recv())
                 .await
@@ -793,9 +874,11 @@ mod tests {
         );
     }
 
-    /// A peer that opens more than `MAX_STREAMS` streams has the extra ones reset.
+    /// A peer that opens more than `MAX_STREAMS` streams has the extra ones
+    /// refused in both directions: reset, and finished, so the peer's reader
+    /// does not wait for an answer that never comes.
     #[tokio::test]
-    async fn a_peer_stream_over_the_cap_is_reset() {
+    async fn a_peer_stream_over_the_cap_is_refused_both_ways() {
         let (mux, mut raw) = acceptor_and_raw();
         let ids: Vec<u32> = (0..=u32::try_from(MAX_STREAMS).unwrap())
             .map(|n| 2 * n + 1)
@@ -810,6 +893,81 @@ mod tests {
         assert!(nothing_from_next(&mux).await);
         let over = *ids.last().unwrap();
         assert_eq!(raw.recv().await, (over, FrameKind::Reset, Vec::new()));
+        assert_eq!(raw.recv().await, (over, FrameKind::Fin, Vec::new()));
+    }
+
+    /// At the peer's cap, `open` waits for a stream to end instead of going
+    /// over the cap, and the stream it then opens is served, not refused.
+    #[tokio::test]
+    async fn an_open_at_the_cap_waits_for_a_stream_to_end_and_is_served() {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let dialer = Arc::new(Mux::spawn(a, Side::Dialer, node(), ADDR));
+        let acceptor = Mux::spawn(b, Side::Acceptor, node(), ADDR);
+        let mut opened = Vec::new();
+        for _ in 0..MAX_STREAMS {
+            let mut stream = dialer.open().await.unwrap();
+            stream.write_all(b"x").await.unwrap();
+            opened.push(stream);
+        }
+        let mut accepted = Vec::new();
+        for _ in 0..MAX_STREAMS {
+            accepted.push(acceptor.next().await.unwrap());
+        }
+        let waiting = {
+            let dialer = Arc::clone(&dialer);
+            tokio::spawn(async move {
+                let mut stream = dialer.open().await.unwrap();
+                stream.write_all(b"late").await.unwrap();
+                stream.shutdown().await.unwrap();
+                stream
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "open went over the peer's cap");
+
+        let mut first = opened.remove(0);
+        first.shutdown().await.unwrap();
+        drop((first, accepted.remove(0)));
+        let mut late = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("open never got the freed slot")
+            .unwrap();
+        let mut arrived = acceptor.next().await.unwrap();
+        let mut bytes = Vec::new();
+        arrived.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"late");
+        drop(arrived);
+        let mut answer = Vec::new();
+        late.read_to_end(&mut answer).await.unwrap();
+        assert!(answer.is_empty());
+    }
+
+    /// The reader never waits on the writer: with the writer stuck behind a
+    /// peer that reads nothing, a stream this side must reset does not stop
+    /// the reader, and the peer's next stream still arrives.
+    #[tokio::test]
+    async fn a_reset_while_the_writer_is_stuck_does_not_stop_the_reader() {
+        let (ours, theirs) = tokio::io::duplex(64 << 10);
+        let mux = Mux::spawn(ours, Side::Acceptor, node(), ADDR);
+        let mut raw = RawPeer(theirs);
+        raw.send(1, FrameKind::Data, b"request").await;
+        drop(mux.next().await.unwrap());
+        for _ in 0..8 {
+            let mut stream = mux.open().await.unwrap();
+            tokio::spawn(async move {
+                stream.write_all(&vec![0u8; STREAM_BUFFER]).await.unwrap();
+                std::future::pending::<()>().await;
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        raw.send(1, FrameKind::Data, b"more").await;
+        raw.send(3, FrameKind::Data, b"next").await;
+        let next = tokio::time::timeout(Duration::from_secs(1), mux.next()).await;
+        assert!(
+            matches!(next, Ok(Ok(_))),
+            "the reader stopped behind the writer"
+        );
     }
 
     /// A reset from the peer stops this side's writer instead of letting it send into nothing.
@@ -830,6 +988,42 @@ mod tests {
             }
         }
         assert_eq!(failed, Some(io::ErrorKind::BrokenPipe));
+    }
+
+    /// A reader dropped while the peer is out of credit resets the stream at
+    /// once: the peer's writer fails instead of waiting for credit forever,
+    /// the stream's slot comes back, and the connection can still end.
+    #[tokio::test]
+    async fn dropping_a_reader_resets_a_peer_that_is_out_of_credit() {
+        let (a, b) = tokio::io::duplex(4 << 20);
+        let dialer = Mux::spawn(a, Side::Dialer, node(), ADDR);
+        let acceptor = Mux::spawn(b, Side::Acceptor, node(), ADDR);
+        let mut asking = dialer.open().await.unwrap();
+        asking.write_all(b"ask").await.unwrap();
+        let mut answering = acceptor.next().await.unwrap();
+        let writer =
+            tokio::spawn(async move { answering.write_all(&vec![0u8; 3 * STREAM_BUFFER]).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!writer.is_finished(), "the peer never ran out of credit");
+
+        drop(asking);
+        let written = tokio::time::timeout(Duration::from_secs(1), writer)
+            .await
+            .expect("the peer's writer waited for credit forever")
+            .unwrap();
+        assert_eq!(written.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+
+        let mut held = Vec::new();
+        for _ in 0..MAX_STREAMS {
+            let opened = tokio::time::timeout(Duration::from_secs(1), dialer.open()).await;
+            held.push(opened.expect("the dropped stream kept its slot").unwrap());
+        }
+        drop((held, dialer));
+        let ended = tokio::time::timeout(Duration::from_secs(2), async {
+            while acceptor.next().await.is_ok() {}
+        })
+        .await;
+        assert!(ended.is_ok(), "the connection outlived its handle");
     }
 
     /// A peer that sends more than the credit it was given ends the

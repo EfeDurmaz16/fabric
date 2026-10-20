@@ -2,8 +2,8 @@
 //!
 //! Invariant: by default a dial tries QUIC first and falls back to TCP with
 //! TLS only when QUIC did not complete within `quic_timeout`; the fallback is
-//! reported with QUIC's failure, never silent, so a slow path is visible to
-//! the user and to the ledger. Both transports listen on one port number,
+//! reported with QUIC's failure in `Dialed::quic_failure`, never silent, so
+//! the caller can show the slow path. Both transports listen on one port number,
 //! so a user pastes one address at pairing. A forged handshake ends a dial
 //! at once; any other refusal, such as another node at a stale address,
 //! moves on to the next address.
@@ -19,7 +19,7 @@ use crate::peers::HostPort;
 use crate::quic::QuicTransport;
 use crate::tcp::TcpTlsTransport;
 use crate::tls::{TlsError, Trust};
-use crate::transport::{Connection, Transport, TransportError};
+use crate::transport::{Connection, DIAL_TIMEOUT, Transport, TransportError};
 
 /// How long QUIC gets before the dial falls back to TCP with TLS.
 pub const QUIC_TIMEOUT: Duration = Duration::from_secs(3);
@@ -44,12 +44,32 @@ pub enum DialOrder {
 
 /// A connection and, when QUIC was not used, why.
 ///
-/// `connection.kind()` says which wire served the dial.
+/// Only `Endpoint::dial` builds one, so `quic_failure` is set exactly when
+/// the dial fell back from QUIC to TCP with TLS. Under `DialOrder::TcpOnly`
+/// the connection is TCP with TLS and `quic_failure` is `None`.
 pub struct Dialed {
+    connection: Box<dyn Connection>,
+    quic_failure: Option<TransportError>,
+}
+
+impl Dialed {
     /// The connection.
-    pub connection: Box<dyn Connection>,
+    #[must_use]
+    pub fn connection(&self) -> &dyn Connection {
+        self.connection.as_ref()
+    }
+
+    /// Hands over the connection.
+    #[must_use]
+    pub fn into_connection(self) -> Box<dyn Connection> {
+        self.connection
+    }
+
     /// How QUIC failed before the dial fell back to TCP with TLS; `None` when QUIC served it.
-    pub quic_failure: Option<TransportError>,
+    #[must_use]
+    pub fn quic_failure(&self) -> Option<&TransportError> {
+        self.quic_failure.as_ref()
+    }
 }
 
 /// The transports of one node bound to one port.
@@ -165,6 +185,10 @@ impl Endpoint {
 
     /// Dials `peer` at the first of `addrs` that answers, resolving names as needed.
     ///
+    /// A name lookup gets `DIAL_TIMEOUT`, as a dial does, so a resolver
+    /// that does not answer, such as a tailnet name while Tailscale is
+    /// down, costs one bounded wait before the next address is tried.
+    ///
     /// An address where another node answers, which a stale address can
     /// do after DHCP gave it away, is skipped like one that does not
     /// answer. A handshake signed with a key the certificate does not name
@@ -179,11 +203,17 @@ impl Endpoint {
             let resolved: Vec<SocketAddr> = match host {
                 HostPort::Addr(addr) => vec![*addr],
                 HostPort::Name(name, port) => {
-                    match tokio::net::lookup_host((name.as_str(), *port)).await {
-                        Ok(iter) => iter.collect(),
-                        Err(err) => {
+                    let lookup = tokio::net::lookup_host((name.as_str(), *port));
+                    match tokio::time::timeout(DIAL_TIMEOUT, lookup).await {
+                        Ok(Ok(iter)) => iter.collect(),
+                        Ok(Err(err)) => {
                             tracing::debug!(%host, error = %err, "name did not resolve");
                             last = TransportError::Io(err);
+                            continue;
+                        }
+                        Err(_) => {
+                            tracing::debug!(%host, "name lookup timed out");
+                            last = TransportError::Timeout(DIAL_TIMEOUT);
                             continue;
                         }
                     }

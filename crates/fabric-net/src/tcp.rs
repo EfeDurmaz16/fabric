@@ -2,9 +2,10 @@
 //!
 //! Invariant: the same pinned verifiers as QUIC decide the handshake, so a
 //! peer that QUIC would refuse is refused here too, and a connection
-//! surfaces only after that handshake. The ledger records which transport
-//! served a resume, so this slower path is visible.
+//! surfaces only after that handshake. Every connection reports
+//! `TransportKind::TcpTls`, so a caller can tell this slower path from QUIC.
 
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,10 +20,7 @@ use crate::accept::{Handshakes, Inbox};
 use crate::identity::NodeIdentity;
 use crate::mux::{Mux, Side};
 use crate::tls::{Credentials, Refusal, TlsError, Trust, peer_of};
-use crate::transport::{Connection, Transport, TransportError, TransportKind};
-
-/// How long a dial may take by default, TCP connect and TLS handshake together.
-pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+use crate::transport::{Connection, DIAL_TIMEOUT, Transport, TransportError, TransportKind};
 
 /// A TCP listener that dials and accepts under one node identity.
 pub struct TcpTlsTransport {
@@ -90,20 +88,21 @@ impl TcpTlsTransport {
         peer: NodeId,
         addr: SocketAddr,
     ) -> Result<Box<dyn Connection>, TransportError> {
-        let handshake = |err: &dyn std::fmt::Display| TransportError::Handshake {
-            addr,
-            reason: err.to_string(),
-        };
         let tcp = TcpStream::connect(addr).await?;
         tcp.set_nodelay(true)?;
         let refusal = Arc::new(Refusal::default());
         let connector =
             TlsConnector::from(Arc::new(self.credentials.client_config(peer, &refusal)?));
         let name = ServerName::IpAddress(addr.ip().into());
-        let tls = connector
-            .connect(name, tcp)
-            .await
-            .map_err(|err| refusal.take().map_or_else(|| handshake(&err), Into::into))?;
+        let tls = connector.connect(name, tcp).await.map_err(|err| {
+            refusal.take().map_or_else(
+                || TransportError::Handshake {
+                    addr,
+                    source: Box::new(err),
+                },
+                Into::into,
+            )
+        })?;
         let actual = peer_of(tls.get_ref().1.peer_certificates())?;
         if actual != peer {
             return Err(TlsError::PeerMismatch {
@@ -150,9 +149,10 @@ async fn accept_loop(listener: TcpListener, acceptor: TlsAcceptor, handshakes: H
             let mut first = [0u8; 1];
             match tokio::time::timeout(FIRST_BYTE_TIMEOUT, tcp.peek(&mut first)).await {
                 Ok(Ok(0)) => {
-                    return Err(TransportError::Closed(
-                        "closed before its handshake".to_owned(),
-                    ));
+                    return Err(TransportError::Closed(Box::new(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "closed before its handshake",
+                    ))));
                 }
                 Ok(Ok(_)) => {}
                 Ok(Err(err)) => return Err(err.into()),

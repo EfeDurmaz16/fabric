@@ -26,6 +26,10 @@ pub const MANIFEST_VERSION: u16 = 1;
 /// hostile peer, not a cap on snapshots.
 pub const MAX_MANIFEST_LEN: usize = 64 << 20;
 
+/// The most bytes one chunk or whole-file object holds (ADR 0004): the bound
+/// the store cuts to and the network checks an arriving chunk against.
+pub const MAX_CHUNK_LEN: usize = 8 << 20;
+
 /// Why a manifest was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {

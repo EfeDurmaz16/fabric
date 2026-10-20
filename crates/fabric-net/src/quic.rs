@@ -21,19 +21,17 @@ use rustls::pki_types::CertificateDer;
 use crate::accept::{Handshakes, Inbox};
 use crate::identity::NodeIdentity;
 use crate::tls::{Credentials, Refusal, SERVER_NAME, TlsError, Trust, peer_of};
-use crate::transport::{Connection, Stream, Transport, TransportError, TransportKind};
-
-/// A connection with no traffic for this long is closed.
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// How often an idle connection sends a keep-alive, so NAT bindings stay open.
-pub const KEEP_ALIVE: Duration = Duration::from_secs(10);
+use crate::transport::{
+    Connection, DIAL_TIMEOUT, IDLE_TIMEOUT, KEEP_ALIVE, Stream, Transport, TransportError,
+    TransportKind,
+};
 
 /// A QUIC endpoint that dials and accepts under one node identity.
 pub struct QuicTransport {
     endpoint: quinn::Endpoint,
     credentials: Arc<Credentials>,
     transport: Arc<quinn::TransportConfig>,
+    dial_timeout: Duration,
     inbox: Inbox,
 }
 
@@ -58,7 +56,7 @@ impl QuicTransport {
         let transport = Arc::new(transport_config()?);
         let rustls_config = credentials.server_config(Arc::clone(&trust))?;
         let quic_config = QuicServerConfig::try_from(rustls_config)
-            .map_err(|err| TransportError::Config(err.to_string()))?;
+            .map_err(|err| TransportError::Config(Box::new(err)))?;
         let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
         server.transport_config(transport.clone());
         let endpoint = quinn::Endpoint::server(server, addr)?;
@@ -69,11 +67,31 @@ impl QuicTransport {
             endpoint,
             credentials,
             transport,
+            dial_timeout: DIAL_TIMEOUT,
             inbox,
         })
     }
 
+    /// Sets how long a dial may take, handshake included.
+    #[must_use]
+    pub fn with_dial_timeout(mut self, timeout: Duration) -> Self {
+        self.dial_timeout = timeout;
+        self
+    }
+
+    /// Dials within the dial timeout: an address where nothing answers
+    /// costs that long, not quinn's idle timeout.
     async fn dial(
+        &self,
+        peer: NodeId,
+        addr: SocketAddr,
+    ) -> Result<Box<dyn Connection>, TransportError> {
+        tokio::time::timeout(self.dial_timeout, self.handshake(peer, addr))
+            .await
+            .map_err(|_| TransportError::Timeout(self.dial_timeout))?
+    }
+
+    async fn handshake(
         &self,
         peer: NodeId,
         addr: SocketAddr,
@@ -81,19 +99,26 @@ impl QuicTransport {
         let refusal = Arc::new(Refusal::default());
         let rustls_config = self.credentials.client_config(peer, &refusal)?;
         let quic_config = QuicClientConfig::try_from(rustls_config)
-            .map_err(|err| TransportError::Config(err.to_string()))?;
+            .map_err(|err| TransportError::Config(Box::new(err)))?;
         let mut client = quinn::ClientConfig::new(Arc::new(quic_config));
         client.transport_config(self.transport.clone());
-        let handshake = |err: &dyn std::fmt::Display| TransportError::Handshake {
-            addr,
-            reason: err.to_string(),
-        };
         let connection = self
             .endpoint
             .connect_with(client, addr, SERVER_NAME)
-            .map_err(|err| handshake(&err))?
+            .map_err(|err| TransportError::Handshake {
+                addr,
+                source: Box::new(err),
+            })?
             .await
-            .map_err(|err| refusal.take().map_or_else(|| handshake(&err), Into::into))?;
+            .map_err(|err| {
+                refusal.take().map_or_else(
+                    || TransportError::Handshake {
+                        addr,
+                        source: Box::new(err),
+                    },
+                    Into::into,
+                )
+            })?;
         let actual = identity_of(&connection)?;
         if actual != peer {
             connection.close(VarInt::from_u32(1), b"peer mismatch");
@@ -127,7 +152,7 @@ async fn accept_loop(endpoint: quinn::Endpoint, handshakes: Handshakes) {
         let handshake = async move {
             let connection = incoming.await.map_err(|err| TransportError::Handshake {
                 addr: remote,
-                reason: err.to_string(),
+                source: Box::new(err),
             })?;
             match identity_of(&connection) {
                 Ok(peer) => Ok(Box::new(QuicConnection {
@@ -148,8 +173,8 @@ async fn accept_loop(endpoint: quinn::Endpoint, handshakes: Handshakes) {
 
 fn transport_config() -> Result<quinn::TransportConfig, TransportError> {
     let mut config = quinn::TransportConfig::default();
-    let idle = IdleTimeout::try_from(IDLE_TIMEOUT)
-        .map_err(|err| TransportError::Config(err.to_string()))?;
+    let idle =
+        IdleTimeout::try_from(IDLE_TIMEOUT).map_err(|err| TransportError::Config(Box::new(err)))?;
     config.max_idle_timeout(Some(idle));
     config.keep_alive_interval(Some(KEEP_ALIVE));
     Ok(config)
@@ -162,8 +187,8 @@ fn identity_of(connection: &quinn::Connection) -> Result<NodeId, TlsError> {
     peer_of(certs.as_deref().map(Vec::as_slice))
 }
 
-fn closed(err: &quinn::ConnectionError) -> TransportError {
-    TransportError::Closed(err.to_string())
+fn closed(err: quinn::ConnectionError) -> TransportError {
+    TransportError::Closed(Box::new(err))
 }
 
 impl Transport for QuicTransport {
@@ -208,14 +233,14 @@ impl Connection for QuicConnection {
 
     fn open(&self) -> BoxFuture<'_, Result<Stream, TransportError>> {
         Box::pin(async {
-            let (send, recv) = self.inner.open_bi().await.map_err(|e| closed(&e))?;
+            let (send, recv) = self.inner.open_bi().await.map_err(closed)?;
             Ok(Stream::new(send, recv))
         })
     }
 
     fn next(&self) -> BoxFuture<'_, Result<Stream, TransportError>> {
         Box::pin(async {
-            let (send, recv) = self.inner.accept_bi().await.map_err(|e| closed(&e))?;
+            let (send, recv) = self.inner.accept_bi().await.map_err(closed)?;
             Ok(Stream::new(send, recv))
         })
     }

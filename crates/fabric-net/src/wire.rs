@@ -2,10 +2,14 @@
 //!
 //! Invariant: every per-job message carries the fencing token, job id and
 //! epoch, in one place, the envelope, so a receiver runs the ADR 0003 check
-//! before it reads the body. Nothing of unbounded size is a control
+//! before it reads the body. On the wire the answers to all per-job
+//! messages share one flat `JobResponse`; above it each request has its own
+//! answer type inside `Fenced`, so an answer of a kind the request does not
+//! take is refused when it is parsed, not left to every caller. Nothing of unbounded size is a control
 //! message: a record is at most `MAX_RECORD_LEN` bytes and records travel
 //! in pages of at most `MAX_RECORD_PAGE` bytes, manifests travel as
-//! chunks, and one chunk batch names at most `MAX_CHUNK_BATCH` ids. Every
+//! chunks listed by at most `MAX_MANIFEST_CHUNKS` ids, and one chunk batch
+//! names at most `MAX_CHUNK_BATCH` ids. Every
 //! bound is enforced when bytes are parsed, not after, so the largest
 //! message fits the control frame of the `frame` module.
 
@@ -16,17 +20,22 @@ use fabric_core::id::{ChunkId, Epoch, JobId, MoveId, NodeId, RecordHash, Snapsho
 use fabric_core::lease::FencingToken;
 use fabric_core::ledger::MAX_RECORD_LEN;
 use fabric_core::moves::MoveOffer;
-use fabric_core::snapshot::MAX_MANIFEST_LEN;
+use fabric_core::snapshot::{MAX_CHUNK_LEN, MAX_MANIFEST_LEN};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
-
-use crate::frame::MAX_CHUNK_BYTES;
 
 /// The protocol version both sides must speak; a mismatch ends the session at `Hello`.
 pub const PROTOCOL_VERSION: u16 = 2;
 
 /// The most chunk ids one `WantChunks` request may name.
 pub const MAX_CHUNK_BATCH: usize = 256;
+
+/// The bytes one chunk id takes on the wire: its 32 raw bytes, no prefix.
+const CHUNK_ID_LEN: usize = 32;
+
+/// The most chunks a manifest may list: as many ids as fit one control frame beside the envelope.
+pub const MAX_MANIFEST_CHUNKS: usize =
+    (crate::frame::MAX_CONTROL_FRAME - crate::frame::ENVELOPE_ALLOWANCE) / CHUNK_ID_LEN;
 
 /// The longest fabric version string in a `Hello`.
 pub const MAX_VERSION_LEN: usize = 64;
@@ -80,6 +89,9 @@ pub enum WireError {
     /// The records do not fit one page of `MAX_RECORD_PAGE`.
     #[error("the records do not fit a page of {MAX_RECORD_PAGE} bytes")]
     PageFull,
+    /// A page holds no record.
+    #[error("a page holds at least one record")]
+    EmptyPage,
     /// A manifest is empty or longer than a reader decodes.
     #[error("a manifest is 1 to {MAX_MANIFEST_LEN} bytes, not {0}")]
     ManifestSize(u64),
@@ -89,6 +101,9 @@ pub enum WireError {
     /// A fact list is not strictly sorted by name.
     #[error("fact {0} is out of order or repeated")]
     FactOrder(String),
+    /// A manifest lists more chunks than one control frame holds.
+    #[error("a manifest lists at most {MAX_MANIFEST_CHUNKS} chunks, not {0}")]
+    ManifestTooManyChunks(usize),
     /// A manifest's chunk count cannot make its length.
     #[error("a manifest of {len} bytes cannot be {count} chunks")]
     ManifestChunkCount {
@@ -100,12 +115,12 @@ pub enum WireError {
 }
 
 /// Encodes a message as postcard bytes.
-pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, WireError> {
+pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, WireError> {
     postcard::to_stdvec(value).map_err(WireError::Malformed)
 }
 
 /// Decodes exactly one message that occupies all of `bytes`.
-pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, WireError> {
+pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, WireError> {
     let (value, rest) = postcard::take_from_bytes::<T>(bytes).map_err(WireError::Malformed)?;
     if !rest.is_empty() {
         return Err(WireError::Trailing(rest.len()));
@@ -338,17 +353,29 @@ impl<'de> Deserialize<'de> for RecordBytes {
     }
 }
 
-/// Records in chain order that fit one control frame: their cost is at most `MAX_RECORD_PAGE`.
+/// One or more records in chain order that fit one control frame: their cost is at most `MAX_RECORD_PAGE`.
 ///
-/// A sender fills a page with `push` until it refuses, sends it, and goes
-/// on with a new page, so a long ledger crosses the wire in pieces.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// A sender starts a page with its first record, fills it with `push`
+/// until it refuses, sends it, and goes on with a new page, so a long
+/// ledger crosses the wire in pieces. A page is never empty, so an
+/// `Append` always carries a record and a `Pulled::More` always has a last
+/// record to pull after.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordPage {
     records: Vec<RecordBytes>,
     cost: usize,
 }
 
 impl RecordPage {
+    /// Starts a page with `first`; any one record fits a page.
+    #[must_use]
+    pub fn new(first: RecordBytes) -> Self {
+        Self {
+            cost: first.cost(),
+            records: vec![first],
+        }
+    }
+
     /// Adds `record` at the end, or hands it back when the page has no room for it.
     pub fn push(&mut self, record: RecordBytes) -> Result<(), RecordBytes> {
         let cost = self.cost + record.cost();
@@ -381,13 +408,33 @@ impl Serialize for RecordPage {
 
 impl<'de> Deserialize<'de> for RecordPage {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let mut page = Self::default();
-        for record in Vec::<RecordBytes>::deserialize(deserializer)? {
+        let mut records = Vec::<RecordBytes>::deserialize(deserializer)?.into_iter();
+        let first = records
+            .next()
+            .ok_or_else(|| serde::de::Error::custom(WireError::EmptyPage))?;
+        let mut page = Self::new(first);
+        for record in records {
             page.push(record)
                 .map_err(|_| serde::de::Error::custom(WireError::PageFull))?;
         }
         Ok(page)
     }
+}
+
+/// The answer to `Pull`: the records after the asked one, a page at a time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Pulled {
+    /// No record follows the asked one.
+    UpToDate,
+    /// The last records; none follow this page.
+    Last(RecordPage),
+    /// A page with more records after it; the sender pulls again after its last record.
+    More(RecordPage),
+    /// The asked record is not in the receiver's chain, so the two ledgers forked; the sender runs the ADR 0003 fork rule.
+    NotInChain {
+        /// The receiver's head.
+        head: RecordHash,
+    },
 }
 
 /// What a request asks for.
@@ -418,10 +465,10 @@ pub enum RequestBody {
 /// A per-job message (ADR 0003 and ADR 0005).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobRequest {
-    /// Asks for the records after `after`; answered with one page of `Records`.
+    /// Asks for the records after `after`; answered with `Records`.
     Pull {
-        /// The receiver's head, or the record it last saw.
-        after: RecordHash,
+        /// The sender's head, or the record it last saw; `None` asks from the job's first record, `Created`.
+        after: Option<RecordHash>,
     },
     /// Replicates one page of records, each as its exact ledger bytes; answered with `Accepted`, `Rejected` or an epoch answer.
     Append {
@@ -495,7 +542,8 @@ pub struct Response {
 /// The length is 1 to `MAX_MANIFEST_LEN` bytes, checked on decode before
 /// any chunk is fetched, so a peer cannot make this node assemble more than
 /// one manifest cap. The chunk count fits the length: each chunk holds at
-/// least one byte and at most `MAX_CHUNK_BYTES`.
+/// least one byte and at most `MAX_CHUNK_LEN`. The list holds at most
+/// `MAX_MANIFEST_CHUNKS` ids, so the answer fits one control frame.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ManifestChunks {
     len: u64,
@@ -509,7 +557,10 @@ impl ManifestChunks {
         if len == 0 || len > max {
             return Err(WireError::ManifestSize(len));
         }
-        let fewest = len.div_ceil(u64::try_from(MAX_CHUNK_BYTES).unwrap_or(u64::MAX));
+        if ids.len() > MAX_MANIFEST_CHUNKS {
+            return Err(WireError::ManifestTooManyChunks(ids.len()));
+        }
+        let fewest = len.div_ceil(u64::try_from(MAX_CHUNK_LEN).unwrap_or(u64::MAX));
         let count = u64::try_from(ids.len()).unwrap_or(u64::MAX);
         if count < fewest || count > len {
             return Err(WireError::ManifestChunkCount {
@@ -574,13 +625,8 @@ pub enum ResponseBody {
 /// The answer to a per-job message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobResponse {
-    /// The first page of records after the asked head, in chain order.
-    Records {
-        /// The records.
-        records: RecordPage,
-        /// More records follow the page; the sender pulls again after its last record.
-        more: bool,
-    },
+    /// The records after the asked one, in chain order, or none.
+    Records(Pulled),
     /// The records linked; `head` is now the receiver's head.
     Accepted {
         /// The receiver's head.
@@ -625,6 +671,253 @@ pub enum JobResponse {
         /// The snapshot to push.
         snapshot: SnapshotId,
     },
+}
+
+impl JobResponse {
+    /// The variant's name, for an error about an answer of the wrong kind.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            JobResponse::Records(_) => "records",
+            JobResponse::Accepted { .. } => "accepted",
+            JobResponse::Rejected { .. } => "rejected",
+            JobResponse::StaleEpoch { .. } => "stale epoch",
+            JobResponse::AheadOfUs { .. } => "ahead of us",
+            JobResponse::MoveStarted { .. } => "move started",
+            JobResponse::MoveDecision { .. } => "move decision",
+            JobResponse::MoveUndecided { .. } => "move undecided",
+            JobResponse::SnapshotIncomplete { .. } => "snapshot incomplete",
+        }
+    }
+}
+
+/// The answer to a per-job message, or the receiver's verdict that the sender's epoch is not its own (ADR 0003).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fenced<T> {
+    /// The receiver is at the sender's epoch and answered.
+    Answer(T),
+    /// The sender's epoch is older than the receiver's; the sender fetches first.
+    StaleEpoch {
+        /// The sender's epoch.
+        yours: Epoch,
+        /// The receiver's epoch.
+        current: Epoch,
+    },
+    /// The sender's epoch is newer than the receiver's; the receiver must fetch first.
+    AheadOfUs {
+        /// The sender's epoch.
+        yours: Epoch,
+        /// The receiver's epoch.
+        current: Epoch,
+    },
+}
+
+/// The answer to `Append`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Appended {
+    /// The records linked; `head` is now the receiver's head.
+    Accepted {
+        /// The receiver's head.
+        head: RecordHash,
+    },
+    /// The records do not link to the receiver's head; the sender pulls after `head` or pushes the suffix.
+    Rejected {
+        /// The receiver's head.
+        head: RecordHash,
+    },
+}
+
+/// The answer to `MoveRequest`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveRequested {
+    /// The owner started a move toward the sender.
+    Started {
+        /// The move.
+        move_id: MoveId,
+    },
+    /// The owner did not start a move; `head` is its head.
+    Rejected {
+        /// The owner's head.
+        head: RecordHash,
+    },
+}
+
+/// The answer to `MoveOffer`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Offered {
+    /// The target decided: a `MoveImported` or `MoveAborted` record, byte for byte.
+    Decided {
+        /// The record bytes.
+        record: RecordBytes,
+    },
+    /// The offer does not link to the target's head.
+    Rejected {
+        /// The target's head.
+        head: RecordHash,
+    },
+    /// The offer links but the snapshot is not whole on the target; the sender pushes it and offers again.
+    SnapshotIncomplete {
+        /// The snapshot to push.
+        snapshot: SnapshotId,
+    },
+}
+
+/// The answer to `MoveStatus`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveState {
+    /// The target decided: a `MoveImported` or `MoveAborted` record, byte for byte.
+    Decided {
+        /// The record bytes.
+        record: RecordBytes,
+    },
+    /// The target has not decided.
+    Undecided {
+        /// The move.
+        move_id: MoveId,
+    },
+}
+
+/// One request's answer type and how it sits in the flat `JobResponse`.
+pub(crate) trait JobAnswer: Sized {
+    /// What the request expects, for an error about an answer of another kind.
+    const KIND: &'static str;
+    /// Puts the answer on the wire.
+    fn into_response(self) -> JobResponse;
+    /// Reads the answer off the wire, or hands back a response of another kind.
+    fn from_response(response: JobResponse) -> Result<Self, JobResponse>;
+}
+
+impl JobAnswer for Pulled {
+    const KIND: &'static str = "records";
+
+    fn into_response(self) -> JobResponse {
+        JobResponse::Records(self)
+    }
+
+    fn from_response(response: JobResponse) -> Result<Self, JobResponse> {
+        match response {
+            JobResponse::Records(pulled) => Ok(pulled),
+            other => Err(other),
+        }
+    }
+}
+
+impl JobAnswer for Appended {
+    const KIND: &'static str = "accepted or rejected";
+
+    fn into_response(self) -> JobResponse {
+        match self {
+            Appended::Accepted { head } => JobResponse::Accepted { head },
+            Appended::Rejected { head } => JobResponse::Rejected { head },
+        }
+    }
+
+    fn from_response(response: JobResponse) -> Result<Self, JobResponse> {
+        match response {
+            JobResponse::Accepted { head } => Ok(Appended::Accepted { head }),
+            JobResponse::Rejected { head } => Ok(Appended::Rejected { head }),
+            other => Err(other),
+        }
+    }
+}
+
+impl JobAnswer for MoveRequested {
+    const KIND: &'static str = "move started or rejected";
+
+    fn into_response(self) -> JobResponse {
+        match self {
+            MoveRequested::Started { move_id } => JobResponse::MoveStarted { move_id },
+            MoveRequested::Rejected { head } => JobResponse::Rejected { head },
+        }
+    }
+
+    fn from_response(response: JobResponse) -> Result<Self, JobResponse> {
+        match response {
+            JobResponse::MoveStarted { move_id } => Ok(MoveRequested::Started { move_id }),
+            JobResponse::Rejected { head } => Ok(MoveRequested::Rejected { head }),
+            other => Err(other),
+        }
+    }
+}
+
+impl JobAnswer for Offered {
+    const KIND: &'static str = "move decision, rejected or snapshot incomplete";
+
+    fn into_response(self) -> JobResponse {
+        match self {
+            Offered::Decided { record } => JobResponse::MoveDecision { record },
+            Offered::Rejected { head } => JobResponse::Rejected { head },
+            Offered::SnapshotIncomplete { snapshot } => {
+                JobResponse::SnapshotIncomplete { snapshot }
+            }
+        }
+    }
+
+    fn from_response(response: JobResponse) -> Result<Self, JobResponse> {
+        match response {
+            JobResponse::MoveDecision { record } => Ok(Offered::Decided { record }),
+            JobResponse::Rejected { head } => Ok(Offered::Rejected { head }),
+            JobResponse::SnapshotIncomplete { snapshot } => {
+                Ok(Offered::SnapshotIncomplete { snapshot })
+            }
+            other => Err(other),
+        }
+    }
+}
+
+impl JobAnswer for MoveState {
+    const KIND: &'static str = "move decision or undecided";
+
+    fn into_response(self) -> JobResponse {
+        match self {
+            MoveState::Decided { record } => JobResponse::MoveDecision { record },
+            MoveState::Undecided { move_id } => JobResponse::MoveUndecided { move_id },
+        }
+    }
+
+    fn from_response(response: JobResponse) -> Result<Self, JobResponse> {
+        match response {
+            JobResponse::MoveDecision { record } => Ok(MoveState::Decided { record }),
+            JobResponse::MoveUndecided { move_id } => Ok(MoveState::Undecided { move_id }),
+            other => Err(other),
+        }
+    }
+}
+
+/// The answer to `MoveAbort`: the target's decision record.
+impl JobAnswer for RecordBytes {
+    const KIND: &'static str = "move decision";
+
+    fn into_response(self) -> JobResponse {
+        JobResponse::MoveDecision { record: self }
+    }
+
+    fn from_response(response: JobResponse) -> Result<Self, JobResponse> {
+        match response {
+            JobResponse::MoveDecision { record } => Ok(record),
+            other => Err(other),
+        }
+    }
+}
+
+/// An epoch verdict answers any per-job request, so it reads back whatever the request.
+impl<T: JobAnswer> JobAnswer for Fenced<T> {
+    const KIND: &'static str = T::KIND;
+
+    fn into_response(self) -> JobResponse {
+        match self {
+            Fenced::Answer(answer) => answer.into_response(),
+            Fenced::StaleEpoch { yours, current } => JobResponse::StaleEpoch { yours, current },
+            Fenced::AheadOfUs { yours, current } => JobResponse::AheadOfUs { yours, current },
+        }
+    }
+
+    fn from_response(response: JobResponse) -> Result<Self, JobResponse> {
+        match response {
+            JobResponse::StaleEpoch { yours, current } => Ok(Fenced::StaleEpoch { yours, current }),
+            JobResponse::AheadOfUs { yours, current } => Ok(Fenced::AheadOfUs { yours, current }),
+            other => T::from_response(other).map(Fenced::Answer),
+        }
+    }
 }
 
 /// Why a request could not be served.
@@ -699,18 +992,13 @@ mod tests {
     }
 
     fn records() -> impl Strategy<Value = RecordPage> {
-        vec(record(), 0..4).prop_map(|records| {
-            let mut page = RecordPage::default();
-            for record in records {
-                page.push(record).unwrap();
-            }
-            page
-        })
+        vec(record(), 1..4).prop_map(page_of)
     }
 
     fn job_request() -> impl Strategy<Value = JobRequest> {
         prop_oneof![
-            bytes32(RecordHash::from_bytes).prop_map(|after| JobRequest::Pull { after }),
+            proptest::option::of(bytes32(RecordHash::from_bytes))
+                .prop_map(|after| JobRequest::Pull { after }),
             records().prop_map(|records| JobRequest::Append { records }),
             Just(JobRequest::MoveRequest),
             (
@@ -770,8 +1058,11 @@ mod tests {
 
     fn job_response() -> impl Strategy<Value = JobResponse> {
         prop_oneof![
-            (records(), any::<bool>())
-                .prop_map(|(records, more)| JobResponse::Records { records, more }),
+            Just(JobResponse::Records(Pulled::UpToDate)),
+            records().prop_map(|page| JobResponse::Records(Pulled::Last(page))),
+            records().prop_map(|page| JobResponse::Records(Pulled::More(page))),
+            bytes32(RecordHash::from_bytes)
+                .prop_map(|head| JobResponse::Records(Pulled::NotInChain { head })),
             bytes32(RecordHash::from_bytes).prop_map(|head| JobResponse::Accepted { head }),
             bytes32(RecordHash::from_bytes).prop_map(|head| JobResponse::Rejected { head }),
             (epoch(), epoch())
@@ -879,7 +1170,8 @@ mod tests {
     }
 
     fn page_of(records: Vec<RecordBytes>) -> RecordPage {
-        let mut page = RecordPage::default();
+        let mut records = records.into_iter();
+        let mut page = RecordPage::new(records.next().unwrap());
         for record in records {
             page.push(record).unwrap();
         }
@@ -919,10 +1211,7 @@ mod tests {
             };
             let answer = Response {
                 id: RequestId(u64::MAX),
-                body: ResponseBody::Job(JobResponse::Records {
-                    records: page,
-                    more: true,
-                }),
+                body: ResponseBody::Job(JobResponse::Records(Pulled::More(page))),
             };
             for bytes in [encode(&append).unwrap(), encode(&answer).unwrap()] {
                 // The frame counts its version byte too.
@@ -949,12 +1238,19 @@ mod tests {
         assert!(decode::<RecordPage>(&encode(&over).unwrap()).is_err());
     }
 
+    /// An empty page does not decode, so an `Append` of nothing or a
+    /// `More` page with no last record to pull after cannot arrive.
+    #[test]
+    fn an_empty_page_does_not_decode() {
+        assert!(decode::<RecordPage>(&encode(&Vec::<Vec<u8>>::new()).unwrap()).is_err());
+    }
+
     /// A manifest above the cap a reader decodes, or a chunk list that
     /// cannot make the stated length, is refused before any chunk is fetched.
     #[test]
     fn a_manifest_outside_its_bounds_does_not_decode() {
         let max = u64::try_from(MAX_MANIFEST_LEN).unwrap();
-        let per_chunk = u64::try_from(MAX_CHUNK_BYTES).unwrap();
+        let per_chunk = u64::try_from(MAX_CHUNK_LEN).unwrap();
         let ids =
             |n: u64| -> Vec<ChunkId> { (0..n).map(|i| ChunkId::of(&i.to_le_bytes())).collect() };
         let whole = max / per_chunk;
@@ -998,6 +1294,101 @@ mod tests {
         let facts = decode::<Facts>(&encode(&ok).unwrap()).unwrap();
         assert_eq!(facts.get("node.version"), Some("v22"));
         assert_eq!(facts.get("pnpm.version"), None);
+    }
+
+    /// The longest chunk list a manifest may have fits the control frame in
+    /// its answer, so the server never fails to write it; one id more is
+    /// refused when the answer is built.
+    #[test]
+    fn the_longest_manifest_chunk_list_fits_the_control_frame() {
+        use crate::frame::MAX_CONTROL_FRAME;
+
+        assert_eq!(encode(&ChunkId::of(b"x")).unwrap().len(), CHUNK_ID_LEN);
+        let ids: Vec<ChunkId> = (0..=MAX_MANIFEST_CHUNKS)
+            .map(|n| ChunkId::of(&n.to_le_bytes()))
+            .collect();
+        let len = u64::try_from(MAX_MANIFEST_LEN).unwrap();
+        assert!(matches!(
+            ManifestChunks::new(len, ids.clone()),
+            Err(WireError::ManifestTooManyChunks(n)) if n == MAX_MANIFEST_CHUNKS + 1
+        ));
+        let longest = ManifestChunks::new(len, ids[..MAX_MANIFEST_CHUNKS].to_vec()).unwrap();
+        let answer = Response {
+            id: RequestId(u64::MAX),
+            body: ResponseBody::ManifestChunks(longest),
+        };
+        // The frame counts its version byte too.
+        assert!(encode(&answer).unwrap().len() < MAX_CONTROL_FRAME);
+    }
+
+    /// Every answer kind a request takes reads back as itself, an epoch
+    /// verdict reads back for any request, and every other kind is refused.
+    #[test]
+    fn a_job_answer_of_a_kind_the_request_does_not_take_is_refused() {
+        /// Whether a request whose answer is `T` takes the response.
+        type Accepts = fn(&JobResponse) -> bool;
+        fn accepts<T: JobAnswer>(response: &JobResponse) -> bool {
+            Fenced::<T>::from_response(response.clone()).is_ok()
+        }
+        let head = RecordHash::from_bytes([1; 32]);
+        let record = RecordBytes::new(vec![1]).unwrap();
+        let move_id = MoveId::from_bytes([2; 16]);
+        let epoch = Epoch::new(1).unwrap();
+        let page = page_of(vec![record.clone()]);
+        let all = [
+            JobResponse::Records(Pulled::More(page)),
+            JobResponse::Records(Pulled::NotInChain { head }),
+            JobResponse::Accepted { head },
+            JobResponse::Rejected { head },
+            JobResponse::MoveStarted { move_id },
+            JobResponse::MoveDecision { record },
+            JobResponse::MoveUndecided { move_id },
+            JobResponse::SnapshotIncomplete {
+                snapshot: SnapshotId::from_bytes([3; 32]),
+            },
+            JobResponse::StaleEpoch {
+                yours: epoch,
+                current: epoch,
+            },
+            JobResponse::AheadOfUs {
+                yours: epoch,
+                current: epoch,
+            },
+        ];
+        let takes: [(&str, Accepts, &[&str]); 6] = [
+            ("pull", accepts::<Pulled>, &["records"]),
+            ("append", accepts::<Appended>, &["accepted", "rejected"]),
+            (
+                "move request",
+                accepts::<MoveRequested>,
+                &["move started", "rejected"],
+            ),
+            (
+                "offer",
+                accepts::<Offered>,
+                &["move decision", "rejected", "snapshot incomplete"],
+            ),
+            (
+                "move status",
+                accepts::<MoveState>,
+                &["move decision", "move undecided"],
+            ),
+            ("move abort", accepts::<RecordBytes>, &["move decision"]),
+        ];
+        for (request, accepts, kinds) in takes {
+            for response in &all {
+                let fenced = matches!(
+                    response,
+                    JobResponse::StaleEpoch { .. } | JobResponse::AheadOfUs { .. }
+                );
+                assert_eq!(
+                    accepts(response),
+                    fenced || kinds.contains(&response.kind()),
+                    "{request} and {}",
+                    response.kind()
+                );
+            }
+        }
     }
 
     #[test]

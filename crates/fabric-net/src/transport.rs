@@ -19,6 +19,15 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::tls::TlsError;
 
+/// A connection that has read nothing for this long is closed, on either wire.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often an idle connection sends a keep-alive on either wire, so NAT bindings stay open.
+pub const KEEP_ALIVE: Duration = Duration::from_secs(10);
+
+/// How long a dial may take by default on either wire, connect and handshake together.
+pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Which wire carries a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransportKind {
@@ -50,22 +59,23 @@ pub enum TransportError {
     #[error(transparent)]
     Tls(#[from] TlsError),
     /// The handshake with `addr` did not complete.
-    #[error("handshake with {addr} failed: {reason}")]
+    #[error("handshake with {addr} failed: {source}")]
     Handshake {
         /// The address dialed.
         addr: SocketAddr,
         /// What the wire reported.
-        reason: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
-    /// The connection is closed; the reason is what the wire reported.
+    /// The connection is closed; the source is what the wire reported.
     #[error("connection closed: {0}")]
-    Closed(String),
+    Closed(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// The local endpoint is closed, so nothing can be accepted.
     #[error("the endpoint is closed")]
     EndpointClosed,
     /// The wire's configuration was refused.
     #[error("transport configuration: {0}")]
-    Config(String),
+    Config(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// An operation did not complete within its limit.
     #[error("timed out after {0:?}")]
     Timeout(Duration),
@@ -171,6 +181,9 @@ pub trait Transport: Send + Sync {
     /// The local address this transport is bound to.
     fn local_addr(&self) -> Result<SocketAddr, TransportError>;
     /// Dials `addr` and accepts the connection only if the peer proves it is `peer`.
+    ///
+    /// Each wire bounds the dial with its own dial timeout, `DIAL_TIMEOUT`
+    /// unless set, and fails with `TransportError::Timeout` past it.
     fn connect(
         &self,
         peer: NodeId,

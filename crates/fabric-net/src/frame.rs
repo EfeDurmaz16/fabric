@@ -10,14 +10,19 @@
 
 use std::io;
 
+use fabric_core::snapshot::MAX_CHUNK_LEN;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// The frame format version this crate writes.
+/// The version of the frame layout after the length prefix, which this crate writes.
+///
+/// It cannot version the length prefix: a reader parses the length before
+/// it sees this byte, so a new length format needs a new ALPN.
 pub const FRAME_VERSION: u8 = 1;
 
-/// Room in a control frame for everything around a page of records: the
-/// version byte, the request or response envelope and the page's count.
-const ENVELOPE_ALLOWANCE: usize = 1024;
+/// Room in a frame for everything around its one long field, a page of
+/// records, a manifest's chunk ids or a stored chunk: the version byte, the
+/// request or response envelope and the field's length.
+pub(crate) const ENVELOPE_ALLOWANCE: usize = 1024;
 
 /// The most bytes a control frame may carry: a page of ledger records, move messages, chunk id lists.
 ///
@@ -25,14 +30,11 @@ const ENVELOPE_ALLOWANCE: usize = 1024;
 /// is as long as the ledger allows, always fits with its envelope.
 pub const MAX_CONTROL_FRAME: usize = crate::wire::MAX_RECORD_PAGE + ENVELOPE_ALLOWANCE;
 
-/// The most bytes one chunk may hold (ADR 0004: whole-file objects up to 8 MiB).
-pub const MAX_CHUNK_BYTES: usize = 8 << 20;
-
-/// The most bytes one stored chunk may take: zstd's worst case for `MAX_CHUNK_BYTES`.
-pub const MAX_STORED_CHUNK: usize = MAX_CHUNK_BYTES + (MAX_CHUNK_BYTES >> 8);
+/// The most bytes one stored chunk may take: zstd's worst case for `MAX_CHUNK_LEN`.
+pub const MAX_STORED_CHUNK: usize = MAX_CHUNK_LEN + (MAX_CHUNK_LEN >> 8);
 
 /// The most bytes a bulk frame may carry: one stored chunk plus its envelope.
-pub const MAX_BULK_FRAME: usize = MAX_STORED_CHUNK + 1024;
+pub const MAX_BULK_FRAME: usize = MAX_STORED_CHUNK + ENVELOPE_ALLOWANCE;
 
 const LENGTH_LEN: usize = 4;
 
@@ -68,6 +70,9 @@ pub enum FrameError {
 }
 
 /// Writes one frame, refusing a payload that would exceed `max`.
+///
+/// The header and the payload are written one after the other, so a chunk's
+/// payload is never copied into a second buffer while it waits on flow control.
 pub(crate) async fn write_frame<W: AsyncWrite + Unpin + ?Sized>(
     writer: &mut W,
     payload: &[u8],
@@ -78,11 +83,11 @@ pub(crate) async fn write_frame<W: AsyncWrite + Unpin + ?Sized>(
         return Err(FrameError::TooLarge { len, max });
     }
     let length = u32::try_from(len).map_err(|_| FrameError::TooLarge { len, max })?;
-    let mut frame = Vec::with_capacity(LENGTH_LEN + len);
-    frame.extend_from_slice(&length.to_le_bytes());
-    frame.push(FRAME_VERSION);
-    frame.extend_from_slice(payload);
-    writer.write_all(&frame).await.map_err(FrameError::Io)?;
+    let mut header = [0u8; LENGTH_LEN + 1];
+    header[..LENGTH_LEN].copy_from_slice(&length.to_le_bytes());
+    header[LENGTH_LEN] = FRAME_VERSION;
+    writer.write_all(&header).await.map_err(FrameError::Io)?;
+    writer.write_all(payload).await.map_err(FrameError::Io)?;
     writer.flush().await.map_err(FrameError::Io)
 }
 
@@ -191,7 +196,7 @@ mod tests {
     #[test]
     fn the_stored_chunk_bound_is_zstds_worst_case() {
         assert_eq!(
-            zstd::zstd_safe::compress_bound(MAX_CHUNK_BYTES),
+            zstd::zstd_safe::compress_bound(MAX_CHUNK_LEN),
             MAX_STORED_CHUNK
         );
     }
