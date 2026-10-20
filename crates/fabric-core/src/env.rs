@@ -143,15 +143,25 @@ pub enum PinError {
     Credential,
 }
 
-/// Checks the rules a tool name and a version pin share; `space` says whether a space is allowed.
-fn check_pin_text(text: &str, space: bool) -> Result<(), PinError> {
+/// Whether pin text may hold a space: a version range may, a tool name may not.
+#[derive(Clone, Copy)]
+enum Spaces {
+    Allowed,
+    Refused,
+}
+
+/// Checks the rules a tool name and a version pin share.
+fn check_pin_text(text: &str, spaces: Spaces) -> Result<(), PinError> {
     if text.is_empty() {
         return Err(PinError::Empty);
     }
     if text.len() > MAX_PIN_LEN {
         return Err(PinError::TooLong);
     }
-    let first = if space { b' ' } else { b'!' };
+    let first = match spaces {
+        Spaces::Allowed => b' ',
+        Spaces::Refused => b'!',
+    };
     if !text.bytes().all(|b| (first..=b'~').contains(&b)) {
         return Err(PinError::BadChar);
     }
@@ -174,7 +184,7 @@ pub struct ToolName(String);
 impl ToolName {
     /// Checks `text` against the rules and wraps it.
     pub fn parse(text: &str) -> Result<Self, PinError> {
-        check_pin_text(text, false)?;
+        check_pin_text(text, Spaces::Refused)?;
         Ok(Self(text.to_owned()))
     }
 
@@ -197,7 +207,7 @@ pub struct ToolVersion(String);
 impl ToolVersion {
     /// Checks `text` against the rules and wraps it.
     pub fn parse(text: &str) -> Result<Self, PinError> {
-        check_pin_text(text, true)?;
+        check_pin_text(text, Spaces::Allowed)?;
         Ok(Self(text.to_owned()))
     }
 
