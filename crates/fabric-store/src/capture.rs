@@ -76,8 +76,6 @@ pub struct CaptureRequest<'a> {
     pub harness_state: Option<&'a Path>,
     /// The environment spec the job had.
     pub env_spec: Option<EnvSpecId>,
-    /// A per-file size above which capture fails naming the file.
-    pub max_file_size: Option<u64>,
     /// Let untracked files above `LARGE_UNTRACKED_LIMIT` enter the working-tree commit.
     pub allow_large_untracked: bool,
 }
@@ -249,16 +247,6 @@ pub enum CaptureError {
         /// The offending paths.
         paths: Vec<RelPath>,
     },
-    /// A file is above the caller's size cap.
-    #[error("{path} is {size} bytes, above the cap of {cap}")]
-    FileTooLarge {
-        /// The file.
-        path: RelPath,
-        /// Its size.
-        size: u64,
-        /// The cap.
-        cap: u64,
-    },
     /// A path the working-tree commit lists vanished before it was measured.
     #[error("{path} changed while capture ran")]
     WorkspaceChanged {
@@ -411,15 +399,6 @@ impl Capturer<'_> {
         } else if meta.is_dir() {
             EntryKind::Dir
         } else {
-            if let Some(cap) = self.req.max_file_size
-                && meta.len() > cap
-            {
-                return Err(CaptureError::FileTooLarge {
-                    path: found.rel.clone(),
-                    size: meta.len(),
-                    cap,
-                });
-            }
             let stored = self.store.objects().put_file(&full)?;
             self.report.files += 1;
             self.report.bytes += stored.size;

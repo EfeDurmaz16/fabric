@@ -71,7 +71,6 @@ fn capture_and_publish(
             carry_keys: &UnmeasuredKeys,
             harness_state: Some(&root.with_file_name("hstate")),
             env_spec: None,
-            max_file_size: None,
             allow_large_untracked: false,
         },
     )?;

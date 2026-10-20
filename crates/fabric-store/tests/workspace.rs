@@ -72,7 +72,6 @@ fn request<'a>(
         carry_keys: &UnmeasuredKeys,
         harness_state: None,
         env_spec: None,
-        max_file_size: None,
         allow_large_untracked: false,
     }
 }
@@ -621,21 +620,12 @@ fn a_hostile_manifest_cannot_write_through_a_link_or_over_a_file() {
 }
 
 #[test]
-fn the_size_cap_and_the_large_untracked_guard_name_the_file() {
+fn the_large_untracked_guard_names_the_file() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("work");
     make_repo(&root).unwrap();
     let store = store_in(dir.path()).unwrap();
     let policy = IgnorePolicy::default();
-
-    let mut capped = request(&root, &policy, None);
-    capped.max_file_size = Some(10);
-    let err = capture(&store, &capped).unwrap_err();
-    assert!(
-        matches!(&err, CaptureError::FileTooLarge { path, cap: 10, .. }
-            if path.as_str() == "build.log" || path.as_str().starts_with("node_modules/")),
-        "{err}"
-    );
 
     let huge = root.join("huge.bin");
     File::create(&huge)

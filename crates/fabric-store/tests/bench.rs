@@ -145,7 +145,6 @@ fn snapshot(store: &mut Store, root: &Path, parent: Option<SnapshotId>) -> Falli
             carry_keys: &UnmeasuredKeys,
             harness_state: None,
             env_spec: None,
-            max_file_size: None,
             allow_large_untracked: false,
         },
     )?;
