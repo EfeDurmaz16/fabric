@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use fabric_core::env::{EnvVarName, RunWhen};
 use fabric_env::detect::{Detection, detect};
-use fabric_env::materialize::{CacheHealth, MaterializeError, SENTINEL, plan};
+use fabric_env::materialize::{CacheHealth, MaterializeError, SENTINEL, TreeLock, plan};
 use tempfile::TempDir;
 
 type TestResult<T> = Result<T, Box<dyn Error>>;
@@ -66,6 +66,14 @@ fn write(root: &Path, files: Files) -> io::Result<()> {
     Ok(())
 }
 
+/// Takes the tree's lock in this test binary's own lock directory, as resume does before restore.
+fn take_lock(root: &Path) -> TestResult<TreeLock> {
+    Ok(TreeLock::acquire(
+        &Path::new(env!("CARGO_TARGET_TMPDIR")).join("locks"),
+        root,
+    )?)
+}
+
 /// Writes `override_toml` as the workspace's `.fabric/env.toml` and detects.
 fn declared(root: &Path, override_toml: &str) -> TestResult<Detection> {
     write(root, &[(".fabric/env.toml", override_toml)])?;
@@ -76,8 +84,9 @@ fn declared(root: &Path, override_toml: &str) -> TestResult<Detection> {
 #[test]
 fn a_fresh_pnpm_workspace_plans_its_install_and_the_dry_run_changes_nothing() {
     let dir = copy_fixture("node-pnpm").unwrap();
+    let lock = take_lock(dir.path()).unwrap();
     let detected = detect(dir.path(), None).unwrap();
-    let planned = plan(&detected).unwrap();
+    let planned = plan(&detected, &lock).unwrap();
     assert_eq!(planned.caches()[0].health, CacheHealth::Missing);
     assert_eq!(planned.steps().len(), 1);
     assert_eq!(planned.steps()[0].index(), 0);
@@ -93,6 +102,7 @@ fn a_fresh_pnpm_workspace_plans_its_install_and_the_dry_run_changes_nothing() {
 #[test]
 fn a_finished_install_runs_nothing() {
     let dir = copy_fixture("node-pnpm").unwrap();
+    let lock = take_lock(dir.path()).unwrap();
     write(
         dir.path(),
         &[
@@ -102,10 +112,10 @@ fn a_finished_install_runs_nothing() {
     )
     .unwrap();
     let detected = detect(dir.path(), None).unwrap();
-    let planned = plan(&detected).unwrap();
+    let planned = plan(&detected, &lock).unwrap();
     assert_eq!(planned.caches()[0].health, CacheHealth::Healthy);
     assert!(planned.is_noop());
-    assert!(planned.ready().unwrap().execute().is_ok());
+    assert!(planned.ready().unwrap().execute(&lock).is_ok());
 }
 
 /// An install killed halfway leaves packages without the marker the
@@ -113,9 +123,10 @@ fn a_finished_install_runs_nothing() {
 #[test]
 fn a_torn_install_runs_again() {
     let dir = copy_fixture("node-pnpm").unwrap();
+    let lock = take_lock(dir.path()).unwrap();
     write(dir.path(), &[("node_modules/a/package.json", "{}")]).unwrap();
     let detected = detect(dir.path(), None).unwrap();
-    let planned = plan(&detected).unwrap();
+    let planned = plan(&detected, &lock).unwrap();
     assert_eq!(
         planned.caches()[0].health,
         CacheHealth::Incomplete {
@@ -230,7 +241,7 @@ fn health_follows_the_cache_kind() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), files).unwrap();
         let detected = detect(dir.path(), None).unwrap();
-        let planned = plan(&detected).unwrap();
+        let planned = plan(&detected, &take_lock(dir.path()).unwrap()).unwrap();
         assert_eq!(planned.caches().len(), 1, "{files:?}");
         assert_eq!(planned.caches()[0].health, health, "{files:?}");
     }
@@ -266,12 +277,13 @@ fn a_declared_node_cache_is_proven_by_content_or_its_sentinel() {
     ];
     for (override_toml, sentinel, health) in cases {
         let dir = tempfile::tempdir().unwrap();
+        let lock = take_lock(dir.path()).unwrap();
         write(dir.path(), &warm_npm).unwrap();
         if let Some(sentinel) = sentinel {
             write(dir.path(), &[(sentinel, "")]).unwrap();
         }
         let detected = declared(dir.path(), override_toml).unwrap();
-        let planned = plan(&detected).unwrap();
+        let planned = plan(&detected, &lock).unwrap();
         let output = planned
             .caches()
             .iter()
@@ -288,6 +300,7 @@ fn a_declared_node_cache_is_proven_by_content_or_its_sentinel() {
 #[test]
 fn declared_steps_over_a_declared_node_cache_run_once() {
     let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
     write(
         dir.path(),
         &[("package.json", PACKAGE_JSON), ("package-lock.json", "")],
@@ -310,10 +323,10 @@ args = ["-c", "mkdir -p .output && echo x > .output/index.js"]
 "#,
     )
     .unwrap();
-    let first = plan(&detected).unwrap();
+    let first = plan(&detected, &lock).unwrap();
     assert_eq!(first.steps().len(), 2);
-    first.ready().unwrap().execute().unwrap();
-    let again = plan(&detect(dir.path(), None).unwrap()).unwrap();
+    first.ready().unwrap().execute(&lock).unwrap();
+    let again = plan(&detect(dir.path(), None).unwrap(), &lock).unwrap();
     assert!(
         again
             .caches()
@@ -331,6 +344,7 @@ args = ["-c", "mkdir -p .output && echo x > .output/index.js"]
 #[test]
 fn the_sentinel_marks_a_cache_whole_only_after_its_steps_succeed() {
     let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
     let fill = r#"
 [[cache]]
 path = "out"
@@ -341,9 +355,14 @@ program = "sh"
 args = ["-c", "mkdir -p out && echo x > out/f"]
 "#;
     let detected = declared(dir.path(), fill).unwrap();
-    plan(&detected).unwrap().ready().unwrap().execute().unwrap();
+    plan(&detected, &lock)
+        .unwrap()
+        .ready()
+        .unwrap()
+        .execute(&lock)
+        .unwrap();
     assert!(dir.path().join("out").join(SENTINEL).is_file());
-    let again = plan(&detect(dir.path(), None).unwrap()).unwrap();
+    let again = plan(&detect(dir.path(), None).unwrap(), &lock).unwrap();
     assert_eq!(again.caches()[0].health, CacheHealth::Healthy);
     assert!(again.is_noop());
 
@@ -359,11 +378,15 @@ when = "always"
 "#;
     let detected = declared(dir.path(), torn).unwrap();
     assert!(matches!(
-        plan(&detected).unwrap().ready().unwrap().execute(),
+        plan(&detected, &lock)
+            .unwrap()
+            .ready()
+            .unwrap()
+            .execute(&lock),
         Err(MaterializeError::StepFailed { .. })
     ));
     assert!(!dir.path().join("out").join(SENTINEL).exists());
-    let after = plan(&detect(dir.path(), None).unwrap()).unwrap();
+    let after = plan(&detect(dir.path(), None).unwrap(), &lock).unwrap();
     assert_eq!(
         after.caches()[0].health,
         CacheHealth::Incomplete {
@@ -375,6 +398,7 @@ when = "always"
 #[test]
 fn an_always_step_runs_on_a_warm_workspace() {
     let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
     write(dir.path(), &[("Cargo.toml", ""), ("target/debug/x", "")]).unwrap();
     let detected = declared(
         dir.path(),
@@ -389,7 +413,7 @@ when = "always"
 "#,
     )
     .unwrap();
-    let planned = plan(&detected).unwrap();
+    let planned = plan(&detected, &lock).unwrap();
     assert_eq!(planned.steps().len(), 1);
     assert_eq!(planned.steps()[0].index(), 1);
     assert_eq!(planned.steps()[0].step().when, RunWhen::Always);
@@ -398,6 +422,7 @@ when = "always"
 #[test]
 fn steps_run_in_order_and_stop_at_the_first_failure() {
     let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
     let detected = declared(
         dir.path(),
         r#"
@@ -418,8 +443,8 @@ args = ["-c", "echo three >> log"]
 "#,
     )
     .unwrap();
-    let planned = plan(&detected).unwrap();
-    match planned.ready().unwrap().execute() {
+    let planned = plan(&detected, &lock).unwrap();
+    match planned.ready().unwrap().execute(&lock) {
         Err(MaterializeError::StepFailed {
             index,
             program,
@@ -439,6 +464,7 @@ args = ["-c", "echo three >> log"]
 #[test]
 fn missing_programs_and_variables_refuse_before_anything_runs_and_are_all_named() {
     let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
     let unset = "FABRIC_TEST_UNSET_VARIABLE_7Q2X";
     let detected = declared(
         dir.path(),
@@ -463,7 +489,7 @@ program = "fabric-test-no-such-program-either"
         ),
     )
     .unwrap();
-    let planned = plan(&detected).unwrap();
+    let planned = plan(&detected, &lock).unwrap();
     assert!(planned.steps()[0].program().is_some());
     assert_eq!(planned.steps()[1].program(), None);
     let missing: Vec<&str> = planned
@@ -502,6 +528,7 @@ program = "fabric-test-no-such-program-either"
 fn a_step_directory_may_not_leave_the_workspace() {
     let outside = tempfile::tempdir().unwrap();
     let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
     symlink(outside.path(), dir.path().join("web")).unwrap();
     let detected = declared(
         dir.path(),
@@ -509,7 +536,7 @@ fn a_step_directory_may_not_leave_the_workspace() {
     )
     .unwrap();
     assert!(matches!(
-        plan(&detected),
+        plan(&detected, &lock),
         Err(MaterializeError::StepDirOutsideRoot { index: 0 })
     ));
 
@@ -519,7 +546,7 @@ fn a_step_directory_may_not_leave_the_workspace() {
         "[[setup]]\nprogram = \"true\"\ncwd = \"app\"\nwhen = \"always\"\n",
     )
     .unwrap();
-    let planned = plan(&detected).unwrap();
+    let planned = plan(&detected, &lock).unwrap();
     let expected: PathBuf = fs::canonicalize(dir.path().join("app")).unwrap();
     assert_eq!(planned.steps()[0].dir(), expected);
 }
@@ -530,6 +557,7 @@ fn a_step_directory_may_not_leave_the_workspace() {
 #[test]
 fn a_step_that_leaves_a_process_behind_does_not_hold_the_resume() {
     let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
     let detected = declared(
         dir.path(),
         r#"
@@ -540,9 +568,9 @@ when = "always"
 "#,
     )
     .unwrap();
-    let planned = plan(&detected).unwrap();
+    let planned = plan(&detected, &lock).unwrap();
     let started = Instant::now();
-    planned.ready().unwrap().execute().unwrap();
+    planned.ready().unwrap().execute(&lock).unwrap();
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "{:?}",
@@ -556,26 +584,28 @@ when = "always"
 #[test]
 fn a_report_without_caches_runs_its_steps_on_every_resume() {
     let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
     write(
         dir.path(),
         &[("go.mod", "module example.com/x\n\ngo 1.22.0\n")],
     )
     .unwrap();
     let detected = detect(dir.path(), None).unwrap();
-    let planned = plan(&detected).unwrap();
+    let planned = plan(&detected, &lock).unwrap();
     assert!(planned.caches().is_empty());
     assert_eq!(planned.steps().len(), 1);
     assert_eq!(planned.steps()[0].step().program.as_str(), "go");
 
     let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
     let detected = declared(
         dir.path(),
         "[[setup]]\nprogram = \"touch\"\nargs = [\"ran\"]\n",
     )
     .unwrap();
-    let planned = plan(&detected).unwrap();
+    let planned = plan(&detected, &lock).unwrap();
     assert_eq!(planned.steps().len(), 1);
-    planned.ready().unwrap().execute().unwrap();
+    planned.ready().unwrap().execute(&lock).unwrap();
     assert!(dir.path().join("ran").exists());
 }
 
@@ -585,6 +615,7 @@ fn a_report_without_caches_runs_its_steps_on_every_resume() {
 #[test]
 fn a_missing_target_does_not_reinstall_a_whole_node_modules() {
     let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
     write(
         dir.path(),
         &[
@@ -596,7 +627,7 @@ fn a_missing_target_does_not_reinstall_a_whole_node_modules() {
     )
     .unwrap();
     let detected = detect(dir.path(), None).unwrap();
-    let planned = plan(&detected).unwrap();
+    let planned = plan(&detected, &lock).unwrap();
     let programs: Vec<&str> = planned
         .steps()
         .iter()
@@ -611,6 +642,7 @@ fn a_missing_target_does_not_reinstall_a_whole_node_modules() {
 #[test]
 fn a_missing_target_does_not_run_a_declared_install() {
     let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
     write(
         dir.path(),
         &[
@@ -623,11 +655,11 @@ fn a_missing_target_does_not_run_a_declared_install() {
     )
     .unwrap();
     let override_toml = "[[setup]]\nprogram = \"npm\"\nargs = [\"ci\"]\n";
-    let planned = plan(&declared(dir.path(), override_toml).unwrap()).unwrap();
+    let planned = plan(&declared(dir.path(), override_toml).unwrap(), &lock).unwrap();
     assert!(planned.is_noop(), "{:?}", planned.steps());
 
     fs::remove_file(dir.path().join("node_modules/.package-lock.json")).unwrap();
-    let planned = plan(&declared(dir.path(), override_toml).unwrap()).unwrap();
+    let planned = plan(&declared(dir.path(), override_toml).unwrap(), &lock).unwrap();
     assert_eq!(planned.steps().len(), 1);
 }
 
@@ -639,6 +671,7 @@ fn a_cache_under_a_linked_directory_gets_no_sentinel() {
     write(outside.path(), &[("out/x", ""), ("kept/x", "")]).unwrap();
     write(outside.path(), &[("kept/.fabric-installed", "")]).unwrap();
     let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
     symlink(outside.path(), dir.path().join("web")).unwrap();
     let detected = declared(
         dir.path(),
@@ -656,7 +689,7 @@ program = "true"
 "#,
     )
     .unwrap();
-    let planned = plan(&detected).unwrap();
+    let planned = plan(&detected, &lock).unwrap();
     assert!(
         planned
             .caches()
@@ -665,30 +698,41 @@ program = "true"
         "{:?}",
         planned.caches()
     );
-    planned.ready().unwrap().execute().unwrap();
+    planned.ready().unwrap().execute(&lock).unwrap();
     assert!(!outside.path().join("out").join(SENTINEL).exists());
     assert!(outside.path().join("kept").join(SENTINEL).exists());
 }
 
-/// A lock file that is a link would put the lock, or a new file, outside
-/// the workspace, so plan and execute refuse it before opening it.
+/// A lock directory inside the workspace is one the workspace can delete,
+/// which is the failure the lock exists to prevent.
 #[test]
-fn a_linked_lock_file_is_refused() {
-    let outside = tempfile::tempdir().unwrap();
-    fs::write(outside.path().join("lock"), "").unwrap();
+fn a_lock_directory_inside_the_workspace_is_refused() {
     let dir = tempfile::tempdir().unwrap();
+    assert!(matches!(
+        TreeLock::acquire(&dir.path().join(".fabric/locks"), dir.path()),
+        Err(MaterializeError::LocksInsideWorkspace { .. })
+    ));
+}
+
+/// A lock proves nothing about a tree it was not taken for.
+#[test]
+fn a_lock_for_another_tree_does_not_plan_or_run_this_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
     let detected = declared(
         dir.path(),
         "[[setup]]\nprogram = \"true\"\nwhen = \"always\"\n",
     )
     .unwrap();
-    symlink(
-        outside.path().join("lock"),
-        dir.path().join(".fabric/materialize.lock"),
-    )
-    .unwrap();
+    let wrong = take_lock(other.path()).unwrap();
     assert!(matches!(
-        plan(&detected),
-        Err(MaterializeError::LockNotRegular)
+        plan(&detected, &wrong),
+        Err(MaterializeError::WrongTree { .. })
+    ));
+    let lock = take_lock(dir.path()).unwrap();
+    let ready = plan(&detected, &lock).unwrap().ready().unwrap();
+    assert!(matches!(
+        ready.execute(&wrong),
+        Err(MaterializeError::WrongTree { .. })
     ));
 }
