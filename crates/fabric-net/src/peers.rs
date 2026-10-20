@@ -499,15 +499,19 @@ struct Cached {
 /// The peer book behind a file that other processes write too.
 ///
 /// A change reloads the file under an exclusive lock, applies, saves and
-/// swaps the cache. `refresh` re-reads the file without a lock, since a
-/// save renames a whole file into place, and parses it only when its bytes
-/// differ from the cached ones. `is_paired` reads only the cache, and the
-/// cache lock is held only to swap or clone, never across file IO, so a
-/// handshake's trust check never waits on a save.
+/// swaps the cache. `refresh` re-reads the file without the file lock,
+/// since a save renames a whole file into place, and parses it only when
+/// its bytes differ from the cached ones. Every read of the file that ends
+/// in a cache swap, in `refresh` or in a change, holds `swapping` from the
+/// read to the swap, so two of them never interleave and a slow one never
+/// puts an older book over a newer one. `is_paired` reads only the cache,
+/// and the cache lock is held only to swap or clone, never across file IO,
+/// so a handshake's trust check never waits on a save.
 #[derive(Debug)]
 pub struct Peers {
     path: PathBuf,
     cache: Mutex<Cached>,
+    swapping: Mutex<()>,
 }
 
 impl Peers {
@@ -525,6 +529,7 @@ impl Peers {
                 book: Arc::new(book),
                 bytes: Some(bytes),
             }),
+            swapping: Mutex::new(()),
         }))
     }
 
@@ -545,6 +550,7 @@ impl Peers {
             source,
         };
         let _lock = LockFile::exclusive(&self.path).map_err(io)?;
+        let _swapping = lock(&self.swapping);
         let mut bytes = read_bytes(&self.path).map_err(io)?;
         let current = PeerBook::parse_bytes(&self.path, &bytes)?;
         let mut next = current.clone();
@@ -569,6 +575,7 @@ impl Peers {
     /// at most the nodes its first lines name, and the next refresh reads
     /// the finished edit.
     fn reload(&self) {
+        let _swapping = lock(&self.swapping);
         let bytes = match read_bytes(&self.path) {
             Ok(bytes) => bytes,
             Err(err) => {
