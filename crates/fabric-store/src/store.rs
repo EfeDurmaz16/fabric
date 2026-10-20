@@ -9,7 +9,8 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 use fabric_core::id::{ChunkId, SnapshotId};
 use fabric_core::snapshot::{EntryKind, MAX_MANIFEST_LEN, ManifestError, SnapshotManifest};
@@ -163,15 +164,31 @@ pub struct Store {
     _lock: File,
 }
 
+/// How long a busy store lock is retried before it counts as held.
+const LOCK_PATIENCE: Duration = Duration::from_secs(1);
+
+/// Takes the store's lock, or fails with `Locked` when another process holds it.
+///
+/// A child that another thread of this process forks shares the lock's
+/// open file until it execs, so a lock this process just released can look
+/// held for that instant; a busy lock is retried for `LOCK_PATIENCE`.
 fn take_lock(root: &Path) -> Result<File, StoreError> {
     let path = root.join("lock");
     let file = File::create(&path).map_err(|e| io_err(&path, e))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(fs::TryLockError::WouldBlock) => Err(StoreError::Locked {
-            path: root.to_owned(),
-        }),
-        Err(fs::TryLockError::Error(e)) => Err(io_err(&path, e)),
+    let started = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(fs::TryLockError::WouldBlock) if started.elapsed() < LOCK_PATIENCE => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(StoreError::Locked {
+                    path: root.to_owned(),
+                });
+            }
+            Err(fs::TryLockError::Error(e)) => return Err(io_err(&path, e)),
+        }
     }
 }
 

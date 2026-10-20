@@ -28,7 +28,7 @@ store/
 
 ### One writer
 
-`Store::open` and `Store::create` take an exclusive `flock` on `<store>/lock` and fail with `StoreError::Locked { path }` when another process holds it. They never wait. The data-directory lock, the node socket and the split of work between the node and the CLI in ADR 0004 are the job crate's; it opens the store under its own lock, so the two never race.
+`Store::open` and `Store::create` take an exclusive `flock` on `<store>/lock` and fail with `StoreError::Locked { path }` when another process holds it. They wait at most one second: a child that another thread forks shares the lock's open file until it execs, so a lock this process has just released can look held for that instant. The parallel test suite hit this when a test reopened its store. The data-directory lock, the node socket and the split of work between the node and the CLI in ADR 0004 are the job crate's; it opens the store under its own lock, so the two never race.
 
 ### Objects
 
