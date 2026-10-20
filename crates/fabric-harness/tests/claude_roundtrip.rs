@@ -865,7 +865,7 @@ async fn a_truncated_staged_file_is_refused_before_anything_is_placed() {
 }
 
 #[tokio::test]
-async fn launch_resumes_in_the_workspace_with_exactly_the_given_env() {
+async fn launch_resumes_in_the_workspace_with_only_the_given_env() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().canonicalize().unwrap();
     let work = home.join("w");
