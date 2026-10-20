@@ -753,6 +753,111 @@ mod tests {
         assert!(matches!(stream.next().await, Err(RpcError::Deadline(d)) if d == IDLE));
     }
 
+    /// A chunk is kept only once its bytes hash to the id it came under;
+    /// one that does not is refused and stays missing.
+    #[tokio::test]
+    async fn a_chunk_whose_bytes_do_not_hash_to_its_id_is_refused() {
+        let id = ChunkId::of(b"x");
+        let (mut send, recv) = tokio::io::duplex(1 << 10);
+        let mut stream = stream_over(recv, &[id]);
+        send.write_all(&frame(ResponseBody::Chunk {
+            id,
+            bytes: b"y".to_vec(),
+        }))
+        .await
+        .unwrap();
+        assert!(
+            matches!(stream.next().await, Err(RpcError::ChunkMismatch { id: bad }) if bad == id)
+        );
+        assert_eq!(stream.missing().collect::<Vec<_>>(), [id]);
+    }
+
+    /// The missing set stays exact: a chunk nobody asked for, or one that
+    /// already arrived, is a protocol error and not a second copy.
+    #[tokio::test]
+    async fn a_chunk_not_asked_for_or_sent_twice_is_refused() {
+        let (x, y) = (ChunkId::of(b"x"), ChunkId::of(b"y"));
+        let (mut send, recv) = tokio::io::duplex(1 << 10);
+        let mut stream = stream_over(recv, &[x]);
+        send.write_all(&frame(ResponseBody::Chunk {
+            id: y,
+            bytes: b"y".to_vec(),
+        }))
+        .await
+        .unwrap();
+        assert!(matches!(stream.next().await, Err(RpcError::UnrequestedChunk { id }) if id == y));
+
+        let (mut send, recv) = tokio::io::duplex(1 << 10);
+        let mut stream = stream_over(recv, &[x]);
+        let once = frame(ResponseBody::Chunk {
+            id: x,
+            bytes: b"x".to_vec(),
+        });
+        send.write_all(&[once.clone(), once].concat())
+            .await
+            .unwrap();
+        assert_eq!(stream.next().await.unwrap(), Some((x, b"x".to_vec())));
+        assert!(matches!(stream.next().await, Err(RpcError::UnrequestedChunk { id }) if id == x));
+    }
+
+    /// A peer that says it is done while asked chunks never came is not done.
+    #[tokio::test]
+    async fn done_with_chunks_still_missing_is_incomplete() {
+        let (x, y) = (ChunkId::of(b"x"), ChunkId::of(b"y"));
+        let (mut send, recv) = tokio::io::duplex(1 << 10);
+        let mut stream = stream_over(recv, &[x, y]);
+        let wire = [
+            frame(ResponseBody::Chunk {
+                id: x,
+                bytes: b"x".to_vec(),
+            }),
+            frame(ResponseBody::ChunksDone),
+        ]
+        .concat();
+        send.write_all(&wire).await.unwrap();
+        assert!(stream.next().await.unwrap().is_some());
+        assert!(matches!(
+            stream.next().await,
+            Err(RpcError::Incomplete { missing: 1 })
+        ));
+        assert_eq!(stream.missing().collect::<Vec<_>>(), [y]);
+    }
+
+    /// Two nodes on different protocol versions refuse each other at the
+    /// hello instead of misreading each other's requests.
+    #[tokio::test]
+    async fn a_hello_from_another_protocol_version_is_refused() {
+        use crate::mux::{Mux, Side};
+
+        let node = NodeId::from_bytes([3; 32]);
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let dialer = Mux::spawn(a, Side::Dialer, node, addr);
+        let acceptor: Arc<dyn Connection> = Arc::new(Mux::spawn(b, Side::Acceptor, node, addr));
+        let accepting = tokio::spawn(Session::accept(
+            acceptor,
+            node,
+            VersionText::truncated("this"),
+            IDLE * 10,
+        ));
+        let newer = Request {
+            id: RequestId(0),
+            budget_ms: 1_000,
+            body: RequestBody::Hello(Hello {
+                node,
+                protocol_version: PROTOCOL_VERSION + 1,
+                fabric_version: VersionText::truncated("next"),
+                clock_ms: wall_clock_ms(),
+            }),
+        };
+        let _answer = send_request(&dialer, &newer).await.unwrap();
+        assert!(matches!(
+            accepting.await.unwrap(),
+            Err(RpcError::ProtocolVersion { ours: PROTOCOL_VERSION, theirs })
+                if theirs == PROTOCOL_VERSION + 1
+        ));
+    }
+
     /// A stream that failed inside a frame never reads again.
     #[tokio::test]
     async fn a_stalled_stream_fails_once_and_then_stays_failed() {
