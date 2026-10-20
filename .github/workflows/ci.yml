@@ -68,6 +68,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # Each adapter is a cargo feature; each one alone and none at all
+      # must build clean, not only the default set.
+      - name: Clippy per feature
+        run: |
+          for features in "" acp claude codex; do
+            cargo clippy -p fabric-harness --all-targets --locked --no-default-features --features "$features" -- -D warnings
+          done
+
       - name: Test
         run: cargo test --workspace --locked
 

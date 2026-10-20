@@ -42,6 +42,23 @@ path = "fixtures/fake_acp_agent/main.rs"
 test = false
 doc = false
 bench = false
+required-features = ["acp"]
+
+[[test]]
+name = "acp_roundtrip"
+required-features = ["acp"]
+
+[[test]]
+name = "claude_roundtrip"
+required-features = ["claude"]
+
+[[test]]
+name = "codex_roundtrip"
+required-features = ["codex"]
+
+[[test]]
+name = "crash"
+required-features = ["claude"]
 
 [lints]
 workspace = true
