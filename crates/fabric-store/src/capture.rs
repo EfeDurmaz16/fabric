@@ -261,6 +261,12 @@ pub enum CaptureError {
         /// The path.
         path: RelPath,
     },
+    /// A path is both in the ignored listing and in the working-tree commit, so the snapshot could not be restored.
+    #[error("{path} is both ignored and in the working-tree commit")]
+    IgnoredAndInWorktree {
+        /// The path.
+        path: RelPath,
+    },
     /// The parent snapshot belongs to another job.
     #[error("parent snapshot {parent} belongs to job {job}")]
     ParentJobMismatch {
@@ -611,9 +617,59 @@ struct GitCapture<'a> {
     root: &'a Path,
     job_id: JobId,
     scratch: PathBuf,
+    /// The user's own exclude rules, which every listing and `W` start from.
+    user_excludes: String,
+    /// A file holding `user_excludes`, passed to every listing as `core.excludesFile`.
+    listing_excludes: TempFile,
+}
+
+/// Reads the exclude file git would use for this repository under the sandbox of `crate::git`.
+///
+/// That is `core.excludesFile` from the repository's own config, or else
+/// `$XDG_CONFIG_HOME/git/ignore`, or else `$HOME/.config/git/ignore`; git
+/// reads the default even when the global config is not read. A missing
+/// file is no rules.
+fn user_excludes(git: &Git, root: &Path) -> Result<String, CaptureError> {
+    let configured = git.output(&["config", "--path", "--get", "core.excludesFile"], &[])?;
+    let path = if configured.status.success() {
+        let text = String::from_utf8_lossy(&configured.stdout)
+            .trim()
+            .to_owned();
+        Some(root.join(text))
+    } else {
+        let xdg = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        let home = std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(|h| PathBuf::from(h).join(".config"));
+        xdg.or(home).map(|dir| dir.join("git").join("ignore"))
+    };
+    let Some(path) = path else {
+        return Ok(String::new());
+    };
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let mut text = String::from_utf8_lossy(&bytes).into_owned();
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            Ok(text)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(io_err(&path, e)),
+    }
 }
 
 impl GitCapture<'_> {
+    /// The `-c` value that makes a listing read the same user exclude rules as `W`.
+    fn excludes_flag(&self) -> String {
+        format!(
+            "core.excludesFile={}",
+            self.listing_excludes.path().display()
+        )
+    }
+
     fn refuse_bad_states(&self) -> Result<(), CaptureError> {
         let git_dir = fs::canonicalize(self.git.git_path(".")?).ok();
         let common = self.git.run_text(&["rev-parse", "--git-common-dir"])?;
@@ -660,6 +716,8 @@ impl GitCapture<'_> {
         // git resolves the attributes itself, from every .gitattributes,
         // tracked or not, and from .git/info/attributes.
         let paths = self.git.run(&[
+            "-c",
+            &self.excludes_flag(),
             "ls-files",
             "-z",
             "--cached",
@@ -682,9 +740,14 @@ impl GitCapture<'_> {
 
     /// Lists untracked, not ignored paths; an untracked nested repository is reported, not listed.
     fn untracked(&self, report: &mut CaptureReport) -> Result<Vec<RelPath>, CaptureError> {
-        let out = self
-            .git
-            .run(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+        let out = self.git.run(&[
+            "-c",
+            &self.excludes_flag(),
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])?;
         let mut paths = Vec::new();
         for record in Git::records(&out) {
             let text = Git::text("untracked path", record)?;
@@ -708,6 +771,8 @@ impl GitCapture<'_> {
     /// Lists ignored paths with their metadata; a nested repository is reported, not listed.
     fn ignored(&self, report: &mut CaptureReport) -> Result<Vec<Found>, CaptureError> {
         let listing = self.git.run(&[
+            "-c",
+            &self.excludes_flag(),
             "ls-files",
             "--others",
             "--ignored",
@@ -790,8 +855,11 @@ impl GitCapture<'_> {
 
     /// Builds commit `W` from a private index seeded with `I`'s tree.
     ///
-    /// `git add -A` runs with the policy's patterns as the lowest-precedence
-    /// excludes, which keeps most secrets out of the user's object store. A
+    /// `git add -A` runs with the user's exclude rules followed by the
+    /// policy's patterns as the lowest-precedence excludes, which keeps most
+    /// secrets out of the user's object store. The policy adds only positive
+    /// patterns after the user's rules, so a path the ignored listing names
+    /// is never in `W`. A
     /// negation in the repository's own ignore files can override that, so
     /// the private index is then listed and every path that is not tracked
     /// and that `leave_out` names is removed before the tree is written. The
@@ -807,7 +875,8 @@ impl GitCapture<'_> {
     ) -> Result<(GitOid, Vec<RelPath>), CaptureError> {
         let index = TempFile::in_dir(&self.scratch);
         let exclude_file = TempFile::in_dir(&self.scratch);
-        fs::write(exclude_file.path(), excludes).map_err(|e| io_err(exclude_file.path(), e))?;
+        let all = format!("{}{excludes}", self.user_excludes);
+        fs::write(exclude_file.path(), all).map_err(|e| io_err(exclude_file.path(), e))?;
         let env: [(&str, &OsStr); 1] = [("GIT_INDEX_FILE", index.path().as_os_str())];
         {
             self.git.run_env(&["read-tree", index_tree], &env)?;
@@ -1069,11 +1138,32 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
         env_spec: req.env_spec,
         caches,
     };
+    if let Some(state) = &manifest.git {
+        refuse_overlap(&manifest.files, &state.worktree_mtimes)?;
+    }
     manifest.validate()?;
     Ok(Captured {
         manifest,
         report: capturer.report,
     })
+}
+
+/// Refuses a capture whose ignored files and working-tree commit share a path.
+///
+/// Restore checks out `W` and then writes `files` with exclusive creates, so
+/// a shared path would make a snapshot that publishes and never restores.
+fn refuse_overlap(files: &[Entry], worktree: &[(RelPath, u64)]) -> Result<(), CaptureError> {
+    for entry in files {
+        if worktree
+            .binary_search_by(|(path, _)| path.cmp(&entry.rel_path))
+            .is_ok()
+        {
+            return Err(CaptureError::IgnoredAndInWorktree {
+                path: entry.rel_path.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Returns a git capture when the root is the top level of a repository.
@@ -1097,11 +1187,17 @@ fn detect_git<'a>(
             toplevel,
         });
     }
+    let user_excludes = user_excludes(&git, req.root)?;
+    let listing_excludes = TempFile::in_dir(scratch);
+    fs::write(listing_excludes.path(), &user_excludes)
+        .map_err(|e| io_err(listing_excludes.path(), e))?;
     Ok(Some(GitCapture {
         git,
         root: req.root,
         job_id: req.job_id,
         scratch: scratch.to_owned(),
+        user_excludes,
+        listing_excludes,
     }))
 }
 

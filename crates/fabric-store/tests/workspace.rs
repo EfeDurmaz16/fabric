@@ -881,3 +881,54 @@ fn restore_state_tells_absent_from_half_restored_and_present() {
     fs::write(target.join("x"), "x").unwrap();
     assert_eq!(restore_state(&target).unwrap(), RestoreState::Present);
 }
+
+/// The child half: runs with `XDG_CONFIG_HOME` pointing at a git ignore file of its own.
+#[test]
+fn a_file_only_the_global_ignore_names_child() {
+    let Ok(dir) = std::env::var("FABRIC_GLOBAL_IGNORE_CHILD") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let root = dir.join("work");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("a"), "a\n").unwrap();
+    let g = git(&root);
+    g.run(&["init", "-q", "-b", "main"]).unwrap();
+    g.run(&["add", "-A"]).unwrap();
+    g.run(&["commit", "-q", "-m", "one"]).unwrap();
+    fs::create_dir(root.join(".claude")).unwrap();
+    fs::write(root.join(".claude/settings.local.json"), "{}\n").unwrap();
+
+    let mut store = store_in(&dir).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let files: Vec<&str> = manifest.files.iter().map(|e| e.rel_path.as_str()).collect();
+    assert!(files.contains(&".claude/settings.local.json"), "{files:?}");
+    let in_w = worktree_paths(&root, &manifest).unwrap();
+    assert_eq!(in_w, vec!["a".to_owned()]);
+
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    assert_eq!(
+        fs::read_to_string(target.join(".claude/settings.local.json")).unwrap(),
+        "{}\n"
+    );
+}
+
+#[test]
+fn a_file_only_the_global_ignore_names_restores() {
+    let dir = tempfile::tempdir().unwrap();
+    let xdg = dir.path().join("xdg");
+    fs::create_dir_all(xdg.join("git")).unwrap();
+    fs::write(xdg.join("git/ignore"), "**/.claude/settings.local.json\n").unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "a_file_only_the_global_ignore_names_child"])
+        .env("FABRIC_GLOBAL_IGNORE_CHILD", dir.path())
+        .env("XDG_CONFIG_HOME", &xdg)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("1 passed"), "{stdout}");
+}
