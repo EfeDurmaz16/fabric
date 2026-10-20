@@ -21,7 +21,7 @@ use fabric_harness::manifest::StateManifest;
 use fabric_harness::{Harness, HarnessError, Launch, SessionId};
 
 mod common;
-use common::{fake_claude, project_key};
+use common::{abs, fake_claude, project_key};
 
 const SID: &str = "9c9796f0-2682-4546-a963-d314b3ad543f";
 const SECRET: &str = "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456";
@@ -199,7 +199,7 @@ impl Drop for Held {
 /// The adapter for `home`, finding the fake `claude` kept under it.
 fn node(home: &Path) -> ClaudeCode {
     let (_, path_var) = fake_claude(home);
-    ClaudeCode::new(home.to_path_buf(), path_var)
+    ClaudeCode::new(abs(home), path_var)
 }
 
 fn session() -> SessionId {
@@ -838,7 +838,7 @@ async fn launch_resumes_in_the_workspace_with_exactly_the_given_env() {
     std::fs::create_dir_all(&work).unwrap();
     let (_script, bin_dir) = fake_claude(&home);
     let log = home.join("log.txt");
-    let adapter = ClaudeCode::new(home.clone(), bin_dir.clone()).with_flags(LaunchFlags {
+    let adapter = ClaudeCode::new(abs(&home), bin_dir.clone()).with_flags(LaunchFlags {
         permission_mode: Some(PermissionMode::AcceptEdits),
         ..LaunchFlags::default()
     });

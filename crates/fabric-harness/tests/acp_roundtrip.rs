@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use fabric_core::env::EnvVarName;
 use fabric_core::harness::ProgramName;
+use fabric_core::path::AbsPath;
 use fabric_harness::acp::AcpHarness;
 use fabric_harness::acp::client::{PermissionPolicy, StopReason};
 use fabric_harness::{Harness, HarnessError, Launch, SessionId};
@@ -20,6 +21,10 @@ use serde_json::Value;
 
 const AGENT: &str = env!("CARGO_BIN_EXE_fake-acp-agent");
 const TIMEOUT: Duration = Duration::from_secs(20);
+
+fn abs(path: &Path) -> AbsPath {
+    AbsPath::parse(path.to_str().unwrap()).unwrap()
+}
 
 fn agent_dir() -> OsString {
     Path::new(AGENT)
@@ -54,8 +59,8 @@ fn env(state_dir: &Path, extra: &[(&str, &str)]) -> Vec<(EnvVarName, String)> {
 }
 
 fn adapter(home: &Path, policy: PermissionPolicy) -> AcpHarness {
-    AcpHarness::new(program(), vec![], home.to_path_buf(), agent_dir())
-        .with_state_dir(home.join(".fake-agent/sessions"))
+    AcpHarness::new(program(), vec![], abs(home), agent_dir())
+        .with_state_dir(&abs(&home.join(".fake-agent/sessions")))
         .unwrap()
         .with_policy(policy)
 }
@@ -457,7 +462,7 @@ async fn capture_without_a_declared_state_dir_is_refused() {
     let home = tempfile::tempdir().unwrap();
     let work = home.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
-    let adapter = AcpHarness::new(program(), vec![], home.path().to_path_buf(), agent_dir());
+    let adapter = AcpHarness::new(program(), vec![], abs(home.path()), agent_dir());
     let out = tempfile::tempdir().unwrap();
     let err = adapter
         .capture(&work, &SessionId::parse("fake-1").unwrap(), out.path())
@@ -467,8 +472,8 @@ async fn capture_without_a_declared_state_dir_is_refused() {
         matches!(err, HarnessError::StateDirNotDeclared { .. }),
         "{err}"
     );
-    let err = AcpHarness::new(program(), vec![], home.path().to_path_buf(), agent_dir())
-        .with_state_dir(PathBuf::from("/elsewhere"))
+    let err = AcpHarness::new(program(), vec![], abs(home.path()), agent_dir())
+        .with_state_dir(&AbsPath::parse("/elsewhere").unwrap())
         .unwrap_err();
     assert!(matches!(err, HarnessError::NotUnderHome { .. }), "{err}");
 }

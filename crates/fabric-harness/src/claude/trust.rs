@@ -12,6 +12,7 @@
 
 use std::path::Path;
 
+use fabric_core::path::AbsPath;
 use serde_json::{Map, Value};
 
 use crate::error::HarnessError;
@@ -22,7 +23,7 @@ pub(crate) const TRUST_KEY: &str = "hasTrustDialogAccepted";
 
 /// Sets the trust key for `root` in the config file at `config_json`.
 /// Returns true when the file changed.
-pub(crate) fn preseed_file(config_json: &Path, root: &Path) -> Result<bool, HarnessError> {
+pub(crate) fn preseed_file(config_json: &Path, root: &AbsPath) -> Result<bool, HarnessError> {
     let bytes = std::fs::read(config_json).map_err(|e| HarnessError::io("read", config_json, e))?;
     let mut value: Value = serde_json::from_slice(&bytes).map_err(|e| HarnessError::Malformed {
         what: "config json",
@@ -36,11 +37,7 @@ pub(crate) fn preseed_file(config_json: &Path, root: &Path) -> Result<bool, Harn
             reason: "top level is not an object".to_owned(),
         });
     };
-    let root_key = root.to_str().ok_or_else(|| HarnessError::Malformed {
-        what: "workspace path",
-        path: root.to_path_buf(),
-        reason: "not UTF-8".to_owned(),
-    })?;
+    let root_key = root.as_str();
     let projects = top
         .entry("projects")
         .or_insert_with(|| Value::Object(Map::new()));
@@ -91,7 +88,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(preseed_file(&config, Path::new("/w")).unwrap());
+        assert!(preseed_file(&config, &AbsPath::parse("/w").unwrap()).unwrap());
         assert_eq!(
             std::fs::metadata(&config).unwrap().permissions().mode() & 0o777,
             0o600,
@@ -104,7 +101,7 @@ mod tests {
             serde_json::json!([])
         );
         assert_eq!(value["oauthAccount"]["emailAddress"], "x");
-        assert!(!preseed_file(&config, Path::new("/w")).unwrap());
+        assert!(!preseed_file(&config, &AbsPath::parse("/w").unwrap()).unwrap());
     }
 
     #[test]
@@ -112,7 +109,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join(".claude.json");
         assert!(matches!(
-            preseed_file(&config, Path::new("/w")),
+            preseed_file(&config, &AbsPath::parse("/w").unwrap()),
             Err(HarnessError::Io { op: "read", .. })
         ));
         assert!(!config.exists());

@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use fabric_core::path::AbsPath;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -534,9 +535,12 @@ impl AcpClient {
     }
 
     /// Sends `session/new` for `cwd` and returns the new session id.
-    pub async fn new_session(&self, cwd: &str) -> Result<SessionId, AcpError> {
+    pub async fn new_session(&self, cwd: &AbsPath) -> Result<SessionId, AcpError> {
         let result = self
-            .handshake("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
+            .handshake(
+                "session/new",
+                json!({ "cwd": cwd.as_str(), "mcpServers": [] }),
+            )
             .await?;
         let id = result
             .get("sessionId")
@@ -546,20 +550,20 @@ impl AcpClient {
     }
 
     /// Sends `session/load`; the agent replays history as updates.
-    pub async fn load_session(&self, session: &SessionId, cwd: &str) -> Result<(), AcpError> {
+    pub async fn load_session(&self, session: &SessionId, cwd: &AbsPath) -> Result<(), AcpError> {
         self.handshake(
             "session/load",
-            json!({ "sessionId": session.as_str(), "cwd": cwd, "mcpServers": [] }),
+            json!({ "sessionId": session.as_str(), "cwd": cwd.as_str(), "mcpServers": [] }),
         )
         .await?;
         Ok(())
     }
 
     /// Sends `session/resume`; no replay.
-    pub async fn resume_session(&self, session: &SessionId, cwd: &str) -> Result<(), AcpError> {
+    pub async fn resume_session(&self, session: &SessionId, cwd: &AbsPath) -> Result<(), AcpError> {
         self.handshake(
             "session/resume",
-            json!({ "sessionId": session.as_str(), "cwd": cwd, "mcpServers": [] }),
+            json!({ "sessionId": session.as_str(), "cwd": cwd.as_str(), "mcpServers": [] }),
         )
         .await?;
         Ok(())

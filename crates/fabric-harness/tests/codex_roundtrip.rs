@@ -16,6 +16,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use fabric_core::env::EnvVarName;
+use fabric_core::path::AbsPath;
 use fabric_harness::codex::Codex;
 use fabric_harness::codex::overrides::{ApprovalPolicy, CodexOverrides, SandboxMode};
 use fabric_harness::manifest::StateManifest;
@@ -116,6 +117,10 @@ fn fake_codex(dir: &Path) -> OsString {
     bin.into_os_string()
 }
 
+fn abs(path: &Path) -> AbsPath {
+    AbsPath::parse(path.to_str().unwrap()).unwrap()
+}
+
 fn thread() -> SessionId {
     SessionId::parse(THREAD).unwrap()
 }
@@ -128,7 +133,7 @@ fn lock_dir(home: &Path) -> PathBuf {
 async fn capture_follows_the_lineage_and_carries_nothing_else() {
     let src = build_source();
     let home = src.home.path().canonicalize().unwrap();
-    let adapter = Codex::new(home.clone(), OsString::new());
+    let adapter = Codex::new(abs(&home), OsString::new());
     assert_eq!(adapter.latest_session(&src.work).unwrap(), Some(thread()));
 
     let out = tempfile::tempdir().unwrap();
@@ -170,7 +175,10 @@ async fn capture_follows_the_lineage_and_carries_nothing_else() {
 async fn a_missing_prefix_breaks_the_lineage() {
     let src = build_source();
     std::fs::remove_file(&src.prefix).unwrap();
-    let adapter = Codex::new(src.home.path().canonicalize().unwrap(), OsString::new());
+    let adapter = Codex::new(
+        abs(&src.home.path().canonicalize().unwrap()),
+        OsString::new(),
+    );
     let out = tempfile::tempdir().unwrap();
     let err = adapter
         .capture(&src.work, &thread(), out.path())
@@ -191,7 +199,7 @@ async fn an_active_writer_blocks_capture_and_restore() {
     std::fs::create_dir_all(&locks).unwrap();
     let holder = std::fs::File::create(locks.join(format!("{THREAD}.lock"))).unwrap();
     holder.lock().unwrap();
-    let adapter = Codex::new(home, OsString::new());
+    let adapter = Codex::new(abs(&home), OsString::new());
     let out = tempfile::tempdir().unwrap();
     let err = adapter
         .capture(&src.work, &thread(), out.path())
@@ -224,7 +232,10 @@ async fn a_rollout_with_a_secret_is_refused_not_carried() {
     file.write_all(turn("token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab").as_bytes())
         .unwrap();
     drop(file);
-    let adapter = Codex::new(src.home.path().canonicalize().unwrap(), OsString::new());
+    let adapter = Codex::new(
+        abs(&src.home.path().canonicalize().unwrap()),
+        OsString::new(),
+    );
     let out = tempfile::tempdir().unwrap();
     let err = adapter
         .capture(&src.work, &thread(), out.path())
@@ -247,7 +258,10 @@ async fn assert_refused_with_turn(escaped: &str) {
         .unwrap();
     file.write_all(turn(escaped).as_bytes()).unwrap();
     drop(file);
-    let adapter = Codex::new(src.home.path().canonicalize().unwrap(), OsString::new());
+    let adapter = Codex::new(
+        abs(&src.home.path().canonicalize().unwrap()),
+        OsString::new(),
+    );
     let out = tempfile::tempdir().unwrap();
     let err = adapter
         .capture(&src.work, &thread(), out.path())
@@ -276,7 +290,10 @@ async fn a_workspace_whose_name_holds_sk_inside_a_word_is_captured() {
     // `disk-usage` holds `sk-`; the rollout's `cwd` and its first message
     // name the path, and neither is a key.
     let src = build_source_at("oss/disk-usage-analyzer-service");
-    let adapter = Codex::new(src.home.path().canonicalize().unwrap(), OsString::new());
+    let adapter = Codex::new(
+        abs(&src.home.path().canonicalize().unwrap()),
+        OsString::new(),
+    );
     let out = tempfile::tempdir().unwrap();
     let manifest = adapter
         .capture(&src.work, &thread(), out.path())
@@ -290,7 +307,7 @@ async fn a_workspace_whose_name_holds_sk_inside_a_word_is_captured() {
 async fn two_files_for_one_rollout_resolve_by_prefix_or_are_refused() {
     let src = build_source();
     let home = src.home.path().canonicalize().unwrap();
-    let adapter = Codex::new(home.clone(), OsString::new());
+    let adapter = Codex::new(abs(&home), OsString::new());
     let copy_dir = home.join(".codex/sessions/fabric").join(THREAD);
     std::fs::create_dir_all(&copy_dir).unwrap();
     let copy = copy_dir.join(HEAD_NAME);
@@ -348,14 +365,14 @@ async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_the
     let src = build_source();
     let home = src.home.path().canonicalize().unwrap();
     let out = tempfile::tempdir().unwrap();
-    let manifest = Codex::new(home.clone(), OsString::new())
+    let manifest = Codex::new(abs(&home), OsString::new())
         .capture(&src.work, &thread(), out.path())
         .await
         .unwrap();
     set_aside(&home, ".codex-pro");
 
     let bin = fake_codex(&home);
-    let adapter = Codex::new(home.clone(), bin.clone()).with_overrides(CodexOverrides {
+    let adapter = Codex::new(abs(&home), bin.clone()).with_overrides(CodexOverrides {
         sandbox: SandboxMode::WorkspaceWrite,
         approval: ApprovalPolicy::Never,
         model: None,
@@ -436,7 +453,7 @@ async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_the
 async fn a_thread_that_comes_back_lands_over_its_original_file() {
     let src = build_source();
     let home = src.home.path().canonicalize().unwrap();
-    let adapter = Codex::new(home.clone(), OsString::new());
+    let adapter = Codex::new(abs(&home), OsString::new());
     let out_1 = tempfile::tempdir().unwrap();
     adapter
         .capture(&src.work, &thread(), out_1.path())
@@ -483,13 +500,13 @@ async fn a_thread_that_comes_back_lands_over_its_original_file() {
 
 #[test]
 fn the_codex_home_must_be_under_the_home() {
-    let err = Codex::new(PathBuf::from("/h"), OsString::new())
-        .with_codex_home(PathBuf::from("/elsewhere/.codex"))
+    let err = Codex::new(AbsPath::parse("/h").unwrap(), OsString::new())
+        .with_codex_home(&AbsPath::parse("/elsewhere/.codex").unwrap())
         .unwrap_err();
     assert!(matches!(err, HarnessError::NotUnderHome { .. }), "{err}");
     assert!(
-        Codex::new(PathBuf::from("/h"), OsString::new())
-            .with_codex_home(PathBuf::from("/h/custom"))
+        Codex::new(AbsPath::parse("/h").unwrap(), OsString::new())
+            .with_codex_home(&AbsPath::parse("/h/custom").unwrap())
             .is_ok()
     );
 }

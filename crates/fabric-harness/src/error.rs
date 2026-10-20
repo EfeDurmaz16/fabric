@@ -27,6 +27,12 @@ pub enum HarnessError {
         /// The path that was given.
         path: PathBuf,
     },
+    /// A path this crate must record or compare as text is not UTF-8.
+    #[error("{path} is not UTF-8")]
+    NotUtf8 {
+        /// The path concerned.
+        path: PathBuf,
+    },
     /// A directory an adapter was configured with is not under the home it serves.
     #[error("{path} is not under home {home}")]
     NotUnderHome {

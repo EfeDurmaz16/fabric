@@ -26,35 +26,34 @@ use crate::manifest::{Carried, Content, Mutability, StateManifest};
 use crate::redact::RedactionCounts;
 use crate::session::SessionId;
 
-/// Checks that `workspace` is an absolute directory and returns its physical path.
-pub(crate) fn physical_workspace(workspace: &Path) -> Result<PathBuf, HarnessError> {
+/// Checks that `workspace` is an absolute directory and returns its
+/// physical path, parsed once: the manifest, the Claude project key, the
+/// Codex trust key and the ACP `cwd` all use this one value.
+pub(crate) fn physical_workspace(workspace: &Path) -> Result<AbsPath, HarnessError> {
+    let bad = || HarnessError::BadWorkspace {
+        path: workspace.to_path_buf(),
+    };
     if !workspace.is_absolute() {
-        return Err(HarnessError::BadWorkspace {
-            path: workspace.to_path_buf(),
-        });
+        return Err(bad());
     }
     let physical = std::fs::canonicalize(workspace)
         .map_err(|e| HarnessError::io("canonicalize", workspace, e))?;
     if !physical.is_dir() {
-        return Err(HarnessError::BadWorkspace {
-            path: workspace.to_path_buf(),
-        });
+        return Err(bad());
     }
-    Ok(physical)
-}
-
-/// Converts a physical path into the `AbsPath` a manifest records.
-pub(crate) fn abs_path(path: &Path) -> Result<AbsPath, HarnessError> {
-    let text = path.to_str().ok_or_else(|| HarnessError::Malformed {
-        what: "absolute path",
-        path: path.to_path_buf(),
-        reason: "not UTF-8".to_owned(),
+    let text = physical.to_str().ok_or_else(|| HarnessError::NotUtf8 {
+        path: physical.clone(),
     })?;
     AbsPath::parse(text).map_err(|e| HarnessError::Malformed {
-        what: "absolute path",
-        path: path.to_path_buf(),
+        what: "workspace path",
+        path: physical.clone(),
         reason: e.to_string(),
     })
+}
+
+/// The home or workspace path as a file system path.
+pub(crate) fn fs_path(path: &AbsPath) -> &Path {
+    Path::new(path.as_str())
 }
 
 /// Runs a blocking capture or restore body off the async runtime.
@@ -75,9 +74,9 @@ pub(crate) struct Capturer<'a> {
     /// The session captured.
     pub session: &'a SessionId,
     /// The physical workspace path.
-    pub root: &'a Path,
+    pub root: &'a AbsPath,
     /// The home the adapter serves.
-    pub home: &'a Path,
+    pub home: &'a AbsPath,
     /// The installed version, when known.
     pub version: Option<String>,
     /// Where this node records its rewritable files; `None` for an adapter
@@ -93,14 +92,12 @@ pub(crate) fn capture(
     mut counts: RedactionCounts,
     out: &Path,
 ) -> Result<StateManifest, HarnessError> {
-    let root = abs_path(capturer.root)?;
-    let home = abs_path(capturer.home)?;
     let carried = files::stage(sources, out, &mut counts)?;
     let manifest = StateManifest::new(
         capturer.kind,
         capturer.session.clone(),
-        root,
-        home,
+        capturer.root.clone(),
+        capturer.home.clone(),
         capturer.version,
         carried,
         &counts,
@@ -119,8 +116,8 @@ pub(crate) fn capture(
 pub(crate) fn open(
     state: &Path,
     kind: &HarnessKind,
-    root: &Path,
-    home: &Path,
+    root: &AbsPath,
+    home: &AbsPath,
 ) -> Result<StateManifest, HarnessError> {
     let manifest = StateManifest::read(state)?;
     if manifest.kind() != kind {
@@ -129,18 +126,16 @@ pub(crate) fn open(
             restoring: kind.clone(),
         });
     }
-    let root = abs_path(root)?;
-    if *manifest.root() != root {
+    if manifest.root() != root {
         return Err(HarnessError::RootMismatch {
             from: manifest.root().clone(),
-            to: root,
+            to: root.clone(),
         });
     }
-    let home = abs_path(home)?;
-    if *manifest.home() != home {
+    if manifest.home() != home {
         return Err(HarnessError::HomeMismatch {
             from: manifest.home().clone(),
-            to: home,
+            to: home.clone(),
         });
     }
     Ok(manifest)

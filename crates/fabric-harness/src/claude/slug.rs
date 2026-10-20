@@ -11,7 +11,7 @@
 //! hash whose function the docs do not name, so such a path is refused
 //! rather than guessed.
 
-use std::path::Path;
+use fabric_core::path::AbsPath;
 
 /// The longest key this module will compute.
 pub const MAX_SLUG_LEN: usize = 200;
@@ -19,9 +19,6 @@ pub const MAX_SLUG_LEN: usize = 200;
 /// Why a key could not be computed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SlugError {
-    /// The path is not UTF-8.
-    #[error("workspace path is not UTF-8")]
-    NotUtf8,
     /// The key would be longer than `MAX_SLUG_LEN`, where Claude appends an undocumented hash.
     #[error(
         "project key would be {len} characters, above {MAX_SLUG_LEN}; the hash suffix rule is not known"
@@ -33,9 +30,9 @@ pub enum SlugError {
 }
 
 /// Computes the project directory key of a physical workspace path.
-pub fn slug(path: &Path) -> Result<String, SlugError> {
-    let text = path.to_str().ok_or(SlugError::NotUtf8)?;
-    let key: String = text
+pub fn slug(path: &AbsPath) -> Result<String, SlugError> {
+    let key: String = path
+        .as_str()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
@@ -49,31 +46,29 @@ pub fn slug(path: &Path) -> Result<String, SlugError> {
 mod tests {
     use super::*;
 
+    fn abs(path: &str) -> AbsPath {
+        AbsPath::parse(path).unwrap()
+    }
+
     #[test]
     fn matches_the_observed_store() {
         assert_eq!(
-            slug(Path::new("/Users/efebarandurmaz/Desktop/compass")).unwrap(),
+            slug(&abs("/Users/efebarandurmaz/Desktop/compass")).unwrap(),
             "-Users-efebarandurmaz-Desktop-compass"
         );
         assert_eq!(
-            slug(Path::new("/Users/x/apps/workspace/.data/y")).unwrap(),
+            slug(&abs("/Users/x/apps/workspace/.data/y")).unwrap(),
             "-Users-x-apps-workspace--data-y"
         );
-        assert_eq!(
-            slug(Path::new("/private/tmp/a_b")).unwrap(),
-            "-private-tmp-a-b"
-        );
-        assert_eq!(
-            slug(Path::new("/Users/x/caf\u{e9}")).unwrap(),
-            "-Users-x-caf-"
-        );
+        assert_eq!(slug(&abs("/private/tmp/a_b")).unwrap(), "-private-tmp-a-b");
+        assert_eq!(slug(&abs("/Users/x/caf\u{e9}")).unwrap(), "-Users-x-caf-");
     }
 
     #[test]
     fn refuses_a_key_claude_would_hash() {
         let long = format!("/{}", "a".repeat(MAX_SLUG_LEN));
         assert_eq!(
-            slug(Path::new(&long)),
+            slug(&abs(&long)),
             Err(SlugError::TooLong {
                 len: MAX_SLUG_LEN + 1
             })

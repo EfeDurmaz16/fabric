@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use fabric_core::BoxFuture;
 use fabric_core::env::EnvVarName;
 use fabric_core::harness::{HarnessKind, ProgramName};
+use fabric_core::path::AbsPath;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -51,7 +52,7 @@ fn names_session(part: &str, session: &SessionId) -> bool {
 pub struct AcpHarness {
     program: ProgramName,
     args: Vec<String>,
-    home: PathBuf,
+    home: AbsPath,
     state_dir: Option<PathBuf>,
     policy: PermissionPolicy,
     path_var: OsString,
@@ -83,7 +84,7 @@ impl AcpHarness {
     /// on the `PATH` value `path_var`, with no state directory declared and
     /// the deny permission policy.
     #[must_use]
-    pub fn new(program: ProgramName, args: Vec<String>, home: PathBuf, path_var: OsString) -> Self {
+    pub fn new(program: ProgramName, args: Vec<String>, home: AbsPath, path_var: OsString) -> Self {
         AcpHarness {
             program,
             args,
@@ -96,15 +97,20 @@ impl AcpHarness {
 
     /// Declares where the agent keeps its sessions; refused when `dir` is
     /// not under the home.
-    pub fn with_state_dir(mut self, dir: PathBuf) -> Result<Self, HarnessError> {
-        if dir.strip_prefix(&self.home).is_err() {
+    pub fn with_state_dir(mut self, dir: &AbsPath) -> Result<Self, HarnessError> {
+        let dir = pipeline::fs_path(dir).to_path_buf();
+        if dir.strip_prefix(self.home_dir()).is_err() {
             return Err(HarnessError::NotUnderHome {
                 path: dir,
-                home: self.home.clone(),
+                home: self.home_dir().to_path_buf(),
             });
         }
         self.state_dir = Some(dir);
         Ok(self)
+    }
+
+    fn home_dir(&self) -> &Path {
+        pipeline::fs_path(&self.home)
     }
 
     /// Sets how `session/request_permission` is answered.
@@ -130,10 +136,10 @@ impl AcpHarness {
                 program: self.program.to_string(),
             })?;
         let rel = dir
-            .strip_prefix(&self.home)
+            .strip_prefix(self.home_dir())
             .map_err(|_| HarnessError::NotUnderHome {
                 path: dir.clone(),
-                home: self.home.clone(),
+                home: self.home_dir().to_path_buf(),
             })?;
         Ok((dir.clone(), files::rel_components(rel)?))
     }
@@ -141,12 +147,12 @@ impl AcpHarness {
     /// Where this node records the session's files at capture. An ACP
     /// agent's state is opaque, so every file is treated as rewritable.
     fn departure_path(&self, session: &SessionId) -> PathBuf {
-        departure::record_path(&self.home, &format!("acp-{}", self.program), session)
+        departure::record_path(self.home_dir(), &format!("acp-{}", self.program), session)
     }
 
     fn capture_sync(
         &self,
-        root: &Path,
+        root: &AbsPath,
         session: &SessionId,
         out: &Path,
         version: Option<String>,
@@ -230,7 +236,7 @@ impl AcpHarness {
         let restored = pipeline::restore(manifest, state, Some(&record), |rel, _| {
             let rest = under_home(rel).filter(|_| Self::restorable(rel, &state_parts, &session));
             Ok(rest.map(|rest| Destination {
-                path: self.home.join(rest),
+                path: self.home_dir().join(rest),
                 content: Content::Opaque,
                 mutability: Mutability::Replaceable,
             }))
@@ -263,7 +269,13 @@ impl AcpHarness {
     ) -> Result<AcpRunning, HarnessError> {
         let root = pipeline::physical_workspace(workspace)?;
         let binary = self.binary()?;
-        let (mut child, pid) = process::spawn(&binary, &self.args, &root, env, Wiring::Rpc)?;
+        let (mut child, pid) = process::spawn(
+            &binary,
+            &self.args,
+            pipeline::fs_path(&root),
+            env,
+            Wiring::Rpc,
+        )?;
         // Until the session is open, an error or a dropped future kills the
         // agent's group, so no agent is left running without a handle.
         let guard = process::GroupGuard::new(pid);
@@ -293,22 +305,21 @@ impl AcpHarness {
     async fn open_session(
         &self,
         client: &AcpClient,
-        root: &Path,
+        cwd: &AbsPath,
         resume: Option<SessionId>,
     ) -> Result<SessionId, HarnessError> {
         let capabilities = client.initialize().await?;
-        let cwd = root.to_string_lossy().into_owned();
         match resume {
             None => {
-                let session = client.new_session(&cwd).await?;
+                let session = client.new_session(cwd).await?;
                 info!(%session, agent = %self.program, "acp: new session");
                 Ok(session)
             }
             Some(session) => {
                 if capabilities.resume {
-                    client.resume_session(&session, &cwd).await?;
+                    client.resume_session(&session, cwd).await?;
                 } else if capabilities.load_session {
-                    client.load_session(&session, &cwd).await?;
+                    client.load_session(&session, cwd).await?;
                 } else {
                     return Err(HarnessError::LoadNotSupported {
                         program: self.program.to_string(),

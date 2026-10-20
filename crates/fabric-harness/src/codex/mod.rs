@@ -42,6 +42,7 @@ use std::time::Duration;
 use fabric_core::BoxFuture;
 use fabric_core::env::EnvVarName;
 use fabric_core::harness::HarnessKind;
+use fabric_core::path::AbsPath;
 use tracing::{info, warn};
 
 use crate::error::HarnessError;
@@ -73,7 +74,7 @@ const COORDINATION_WAIT: Duration = Duration::from_secs(2);
 /// The Codex adapter for one `CODEX_HOME` under one home directory.
 #[derive(Debug, Clone)]
 pub struct Codex {
-    home: PathBuf,
+    home: AbsPath,
     store: PathBuf,
     binary: Option<PathBuf>,
     path_var: OsString,
@@ -149,16 +150,12 @@ fn lock_coordination(dir: &Path) -> Result<File, HarnessError> {
 
 /// A TOML quoted key for `root`, so `projects."<root>".trust_level` names
 /// exactly this path.
-fn toml_quoted_key(root: &Path) -> Result<String, HarnessError> {
-    let text = root.to_str().ok_or_else(|| HarnessError::Malformed {
-        what: "workspace path",
-        path: root.to_path_buf(),
-        reason: "not UTF-8".to_owned(),
-    })?;
+fn toml_quoted_key(root: &AbsPath) -> Result<String, HarnessError> {
+    let text = root.as_str();
     if text.chars().any(char::is_control) {
         return Err(HarnessError::Malformed {
             what: "workspace path",
-            path: root.to_path_buf(),
+            path: PathBuf::from(text),
             reason: "holds a control character".to_owned(),
         });
     }
@@ -179,9 +176,9 @@ impl Codex {
     /// An adapter whose state lives under `home/.codex`, finding `codex`
     /// on the `PATH` value `path_var`.
     #[must_use]
-    pub fn new(home: PathBuf, path_var: OsString) -> Self {
+    pub fn new(home: AbsPath, path_var: OsString) -> Self {
         Codex {
-            store: home.join(".codex"),
+            store: pipeline::fs_path(&home).join(".codex"),
             home,
             binary: None,
             path_var,
@@ -191,15 +188,20 @@ impl Codex {
 
     /// Reads Codex's state from `dir` instead of `home/.codex`; refused
     /// when `dir` is not under the home.
-    pub fn with_codex_home(mut self, dir: PathBuf) -> Result<Self, HarnessError> {
-        if dir.strip_prefix(&self.home).is_err() {
+    pub fn with_codex_home(mut self, dir: &AbsPath) -> Result<Self, HarnessError> {
+        let dir = pipeline::fs_path(dir).to_path_buf();
+        if dir.strip_prefix(self.home_dir()).is_err() {
             return Err(HarnessError::NotUnderHome {
                 path: dir,
-                home: self.home.clone(),
+                home: self.home_dir().to_path_buf(),
             });
         }
         self.store = dir;
         Ok(self)
+    }
+
+    fn home_dir(&self) -> &Path {
+        pipeline::fs_path(&self.home)
     }
 
     /// Uses this binary instead of looking `codex` up on `PATH`.
@@ -227,13 +229,13 @@ impl Codex {
     }
 
     fn codex_home_parts(&self) -> Result<Vec<String>, HarnessError> {
-        let rel = self
-            .store
-            .strip_prefix(&self.home)
-            .map_err(|_| HarnessError::NotUnderHome {
-                path: self.store.clone(),
-                home: self.home.clone(),
-            })?;
+        let rel =
+            self.store
+                .strip_prefix(self.home_dir())
+                .map_err(|_| HarnessError::NotUnderHome {
+                    path: self.store.clone(),
+                    home: self.home_dir().to_path_buf(),
+                })?;
         files::rel_components(rel)
     }
 
@@ -276,7 +278,6 @@ impl Codex {
     /// The newest thread whose rollout records the workspace as its `cwd`.
     pub fn latest_session(&self, workspace: &Path) -> Result<Option<SessionId>, HarnessError> {
         let root = pipeline::physical_workspace(workspace)?;
-        let root_text = root.to_string_lossy();
         for file in rollout::list(&self.store.join("sessions"))? {
             let meta = match rollout::read_meta(&file) {
                 Ok(meta) => meta,
@@ -285,7 +286,7 @@ impl Codex {
                     continue;
                 }
             };
-            if meta.cwd.as_deref() == Some(root_text.as_ref()) {
+            if meta.cwd.as_deref() == Some(root.as_str()) {
                 return Ok(Some(file.name.thread_id));
             }
         }
@@ -349,7 +350,7 @@ impl Codex {
 
     fn capture_sync(
         &self,
-        root: &Path,
+        root: &AbsPath,
         session: &SessionId,
         out: &Path,
         version: Option<String>,
@@ -505,7 +506,7 @@ impl Codex {
     /// The argument list for `launch`, without the binary.
     pub(crate) fn args_for(
         &self,
-        root: &Path,
+        root: &AbsPath,
         launch: &Launch,
     ) -> Result<Vec<String>, HarnessError> {
         let mut args = Vec::new();
@@ -545,7 +546,8 @@ impl Codex {
         let binary = self.binary()?;
         let args = self.args_for(&root, launch)?;
         let session = launch.resume().cloned();
-        let (child, pid) = process::spawn(&binary, &args, &root, env, launch.into())?;
+        let (child, pid) =
+            process::spawn(&binary, &args, pipeline::fs_path(&root), env, launch.into())?;
         info!(?session, %pid, "codex: launched");
         Ok(Running::new(pid, session, child))
     }
@@ -593,14 +595,15 @@ mod tests {
 
     #[test]
     fn args_follow_the_cli_surface_and_quote_the_root() {
-        let adapter =
-            Codex::new(PathBuf::from("/h"), OsString::new()).with_overrides(CodexOverrides {
+        let adapter = Codex::new(AbsPath::parse("/h").unwrap(), OsString::new()).with_overrides(
+            CodexOverrides {
                 sandbox: overrides::SandboxMode::WorkspaceWrite,
                 approval: overrides::ApprovalPolicy::OnRequest,
                 model: Some(crate::harness::ModelName::parse("o3").unwrap()),
                 effort: Some(overrides::Effort::High),
-            });
-        let root = Path::new("/h/fabric/jobs/j/work");
+            },
+        );
+        let root = &AbsPath::parse("/h/fabric/jobs/j/work").unwrap();
         let session = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
         let resume = Launch::Interactive {
             resume: Some(session.clone()),
@@ -648,7 +651,7 @@ mod tests {
                 "--dangerously-bypass-approvals-and-sandbox"
             ]
         );
-        let quoted = Path::new("/h/say \"hi\"\\there");
+        let quoted = &AbsPath::parse("/h/say \"hi\"\\there").unwrap();
         let args = adapter
             .args_for(
                 quoted,
@@ -663,7 +666,7 @@ mod tests {
             "projects.\"/h/say \\\"hi\\\"\\\\there\".trust_level=trusted"
         );
         assert!(matches!(
-            toml_quoted_key(Path::new("/h/new\nline")),
+            toml_quoted_key(&AbsPath::parse("/h/new\nline").unwrap()),
             Err(HarnessError::Malformed { .. })
         ));
     }

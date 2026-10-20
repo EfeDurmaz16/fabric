@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 use fabric_core::BoxFuture;
 use fabric_core::env::EnvVarName;
 use fabric_core::harness::HarnessKind;
+use fabric_core::path::AbsPath;
 use serde::Deserialize;
 use tracing::{info, warn};
 
@@ -59,7 +60,7 @@ pub const PROGRAM: &str = "claude";
 /// The Claude Code adapter for one home directory.
 #[derive(Debug, Clone)]
 pub struct ClaudeCode {
-    home: PathBuf,
+    home: AbsPath,
     config_dir: PathBuf,
     config_json: PathBuf,
     binary: Option<PathBuf>,
@@ -91,10 +92,11 @@ impl ClaudeCode {
     /// `home/.claude.json`, finding `claude` on the `PATH` value `path_var`
     /// (the CLI passes the one it launches with, never this process's own).
     #[must_use]
-    pub fn new(home: PathBuf, path_var: OsString) -> Self {
+    pub fn new(home: AbsPath, path_var: OsString) -> Self {
+        let dir = pipeline::fs_path(&home);
         ClaudeCode {
-            config_dir: home.join(".claude"),
-            config_json: home.join(".claude.json"),
+            config_dir: dir.join(".claude"),
+            config_json: dir.join(".claude.json"),
             home,
             binary: None,
             path_var,
@@ -125,16 +127,15 @@ impl ClaudeCode {
         })
     }
 
-    fn key_of(root: &Path) -> Result<String, HarnessError> {
+    fn home_dir(&self) -> &Path {
+        pipeline::fs_path(&self.home)
+    }
+
+    fn key_of(root: &AbsPath) -> Result<String, HarnessError> {
         slug::slug(root).map_err(|e| match e {
             slug::SlugError::TooLong { len } => HarnessError::ProjectKeyTooLong {
-                path: root.to_path_buf(),
+                path: PathBuf::from(root.as_str()),
                 len,
-            },
-            slug::SlugError::NotUtf8 => HarnessError::Malformed {
-                what: "workspace path",
-                path: root.to_path_buf(),
-                reason: e.to_string(),
             },
         })
     }
@@ -297,12 +298,12 @@ impl ClaudeCode {
             Some(kind) if kind.is_file() => {}
             _ => return Ok(false),
         }
-        let rel_to_home = abs
-            .strip_prefix(&self.home)
-            .map_err(|_| HarnessError::NotUnderHome {
-                path: abs.to_path_buf(),
-                home: self.home.clone(),
-            })?;
+        let rel_to_home =
+            abs.strip_prefix(self.home_dir())
+                .map_err(|_| HarnessError::NotUnderHome {
+                    path: abs.to_path_buf(),
+                    home: self.home_dir().to_path_buf(),
+                })?;
         let parts = files::rel_components(rel_to_home)?;
         let mut all: Vec<&str> = vec![HOME_PREFIX];
         all.extend(parts.iter().map(String::as_str));
@@ -332,7 +333,7 @@ impl ClaudeCode {
 
     /// Where this node records the session's rewritable files at capture.
     fn departure_path(&self, session: &SessionId) -> PathBuf {
-        departure::record_path(&self.home, PROGRAM, session)
+        departure::record_path(self.home_dir(), PROGRAM, session)
     }
 
     /// True when a tree path names a file this adapter captures for
@@ -390,7 +391,7 @@ impl ClaudeCode {
 
     fn sources_for(
         &self,
-        root: &Path,
+        root: &AbsPath,
         session: &SessionId,
         counts: &mut RedactionCounts,
     ) -> Result<Vec<Source>, HarnessError> {
@@ -455,7 +456,7 @@ impl ClaudeCode {
 
     fn capture_sync(
         &self,
-        root: &Path,
+        root: &AbsPath,
         session: &SessionId,
         out: &Path,
         version: Option<String>,
@@ -503,7 +504,7 @@ impl ClaudeCode {
         let rest = under_home(rel).filter(|_| Self::restorable(rel, session, root_key))?;
         let parts: Vec<&str> = rest.split('/').collect();
         Some(Destination {
-            path: self.home.join(rest),
+            path: self.home_dir().join(rest),
             content: Self::carry_for(Path::new(rest)).content(),
             mutability: Self::mutability_for(&parts),
         })
@@ -511,7 +512,7 @@ impl ClaudeCode {
 
     fn restore_sync(
         &self,
-        root: &Path,
+        root: &AbsPath,
         state: &Path,
         manifest: StateManifest,
     ) -> Result<Restored, HarnessError> {
@@ -595,7 +596,8 @@ impl ClaudeCode {
             None => Self::fresh_session()?,
         };
         let args = self.args_for(&session, launch);
-        let (child, pid) = process::spawn(&binary, &args, &root, env, launch.into())?;
+        let (child, pid) =
+            process::spawn(&binary, &args, pipeline::fs_path(&root), env, launch.into())?;
         info!(%session, %pid, "claude: launched");
         Ok(Running::new(pid, Some(session), child))
     }
@@ -683,11 +685,12 @@ mod tests {
 
     #[test]
     fn args_follow_the_cli_surface() {
-        let adapter =
-            ClaudeCode::new(PathBuf::from("/h"), OsString::new()).with_flags(LaunchFlags {
+        let adapter = ClaudeCode::new(AbsPath::parse("/h").unwrap(), OsString::new()).with_flags(
+            LaunchFlags {
                 permission_mode: Some(flags::PermissionMode::AcceptEdits),
                 ..LaunchFlags::default()
-            });
+            },
+        );
         let session = SessionId::parse("9c9796f0-2682-4546-a963-d314b3ad543f").unwrap();
         let resume = Launch::Interactive {
             resume: Some(session.clone()),

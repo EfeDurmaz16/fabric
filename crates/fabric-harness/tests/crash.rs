@@ -24,7 +24,7 @@ use fabric_harness::manifest::StateManifest;
 use fabric_harness::{Harness, SessionId};
 
 mod common;
-use common::{fake_claude, project_key};
+use common::{abs, fake_claude, project_key};
 
 const SID: &str = "7a1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
 const THREAD: &str = "019f233e-bb33-7342-85fa-f2d33b14368a";
@@ -45,7 +45,7 @@ fn session() -> SessionId {
 /// The adapter for `home`, finding the fake `claude` kept under it.
 fn node(home: &Path) -> ClaudeCode {
     let (_, path_var) = fake_claude(home);
-    ClaudeCode::new(home.to_path_buf(), path_var)
+    ClaudeCode::new(abs(home), path_var)
 }
 
 /// Moves `.claude` to `aside` and leaves a node where Claude is installed
@@ -163,7 +163,7 @@ fn crash_child() {
                 node(&home).restore(&work, &out).await.unwrap();
             }
             "codex-restore" => {
-                Codex::new(home, OsString::new())
+                Codex::new(abs(&home), OsString::new())
                     .restore(&work, &out)
                     .await
                     .unwrap();
@@ -308,7 +308,7 @@ async fn a_codex_restore_aborted_mid_way_frees_the_writer_lock_and_converges() {
     let work = build_codex_home(&home);
     let thread = SessionId::parse(THREAD).unwrap();
     let out = tempfile::tempdir().unwrap();
-    let adapter = Codex::new(home.clone(), OsString::new());
+    let adapter = Codex::new(abs(&home), OsString::new());
     adapter.capture(&work, &thread, out.path()).await.unwrap();
     let source = regular_files(&home.join(".codex/sessions"));
     std::fs::rename(home.join(".codex"), home.join(".codex-source")).unwrap();
