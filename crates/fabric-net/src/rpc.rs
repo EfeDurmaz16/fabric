@@ -522,12 +522,17 @@ impl ChunkStream {
     }
 
     /// Returns the next verified chunk, or `None` once the peer sent every asked chunk.
+    ///
+    /// Cancelling the call ends the stream, as an error does: it may have
+    /// stopped inside a frame, so the next call returns `Interrupted`.
     pub async fn next(&mut self) -> Result<Option<(ChunkId, Vec<u8>)>, RpcError> {
         match self.progress {
             Progress::Open => {}
             Progress::Done => return Ok(None),
             Progress::Broken => return Err(RpcError::Interrupted),
         }
+        // Broken until a whole frame is read, so a cancelled call leaves it broken.
+        self.progress = Progress::Broken;
         let next = self.read_one().await;
         self.progress = match &next {
             Ok(Some(_)) => Progress::Open,
@@ -704,6 +709,25 @@ mod tests {
         assert_eq!(stream.next().await.unwrap(), Some((id, bytes)));
         assert!(started.elapsed() > IDLE * 4, "the link was not slow");
         assert!(stream.next().await.unwrap().is_none());
+    }
+
+    /// A call cancelled inside a frame, by the caller's own timeout or
+    /// `select!`, ends the stream too: the rest of the frame is never read
+    /// as a header.
+    #[tokio::test]
+    async fn a_call_cancelled_inside_a_frame_ends_the_stream() {
+        let id = ChunkId::of(b"x");
+        let (mut send, recv) = tokio::io::duplex(1 << 10);
+        let mut stream = stream_over(recv, &[id]);
+        let whole = frame(ResponseBody::Chunk {
+            id,
+            bytes: b"x".to_vec(),
+        });
+        send.write_all(&whole[..3]).await.unwrap();
+        let cancelled = tokio::time::timeout(IDLE / 5, stream.next()).await;
+        assert!(cancelled.is_err(), "the call must still be waiting");
+        send.write_all(&whole[3..]).await.unwrap();
+        assert!(matches!(stream.next().await, Err(RpcError::Interrupted)));
     }
 
     /// A stream that failed inside a frame never reads again.
