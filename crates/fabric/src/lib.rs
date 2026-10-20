@@ -62,8 +62,8 @@ enum Command {
         /// The node to compare with.
         #[arg(long)]
         peer: Option<NodeId>,
-        /// The job a move would carry.
-        #[arg(long)]
+        /// The job a move would carry; only with --peer.
+        #[arg(long, requires = "peer")]
         job: Option<JobId>,
     },
 }
