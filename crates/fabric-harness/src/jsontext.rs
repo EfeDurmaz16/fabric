@@ -287,6 +287,32 @@ fn scan(text: &str) -> Result<Scan, TransformError> {
     .run()
 }
 
+/// True when only whitespace and one comma separate `end` from `start`,
+/// which makes two array elements neighbours.
+fn only_a_comma_between(text: &str, end: usize, start: usize) -> bool {
+    let between = &text[end..start];
+    between.matches(',').count() == 1
+        && between
+            .chars()
+            .all(|c| c == ',' || matches!(c, ' ' | '\t' | '\n' | '\r'))
+}
+
+/// Joins runs of neighbouring dropped elements into one span each, so a
+/// run is removed with one comma, whichever side it is on.
+fn merge_neighbours(text: &str, mut spans: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    spans.sort_by_key(|span| span.start);
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(spans.len());
+    for span in spans {
+        match merged.last_mut() {
+            Some(last) if only_a_comma_between(text, last.end, span.start) => {
+                last.end = span.end;
+            }
+            _ => merged.push(span),
+        }
+    }
+    merged
+}
+
 /// The byte range to remove so that the array element at `span` disappears
 /// and the array stays valid.
 fn element_removal(text: &str, span: &Range<usize>) -> Range<usize> {
@@ -319,15 +345,19 @@ pub fn transform(
     let mut outcome = Outcome::default();
     let mut edits: Vec<(Range<usize>, String)> = Vec::new();
 
+    let mut dropped = Vec::new();
     for block in &scan.signed {
         let raw = &text[block.span.clone()];
         if redactor.is_some_and(|r| r.matches(raw)) {
             if !block.in_array {
                 return Err(TransformError::SecretInUndroppableSignedBlock);
             }
-            edits.push((element_removal(text, &block.span), String::new()));
+            dropped.push(block.span.clone());
             outcome.dropped_signed_blocks += 1;
         }
+    }
+    for run in merge_neighbours(text, dropped) {
+        edits.push((element_removal(text, &run), String::new()));
     }
 
     let inside_signed = |span: &Range<usize>| {
@@ -373,8 +403,11 @@ pub fn transform(
     let mut cursor = 0;
     for (span, replacement) in edits {
         if span.start < cursor {
-            // An edit inside a dropped block; the drop already covers it.
-            continue;
+            // Edits never overlap: a removal holds no string, and strings
+            // inside signed blocks are not edited. An overlap means the scan
+            // is wrong, so the text is refused rather than half edited; the
+            // caller then redacts it as plain text.
+            return Err(TransformError::NotJson { offset: span.start });
         }
         out.push_str(&text[cursor..span.start]);
         out.push_str(&replacement);
@@ -449,6 +482,23 @@ mod tests {
             out.text.unwrap(),
             r#"{"content":[{"type":"text","text":"a"}]}"#
         );
+
+        let adjacent = format!(
+            r#"[{{"thinking":"{secret}","signature":"a"}},{{"thinking":"{secret}","signature":"b"}}]"#
+        );
+        let out = transform(&adjacent, &PathMap::default(), Some(Redactor::standard())).unwrap();
+        assert_eq!(out.dropped_signed_blocks, 2);
+        assert_eq!(out.text.unwrap(), "[]");
+        let trailing_run = format!(
+            r#"[1, {{"thinking":"{secret}","signature":"a"}}, {{"thinking":"{secret}","signature":"b"}}]"#
+        );
+        let out = transform(
+            &trailing_run,
+            &PathMap::default(),
+            Some(Redactor::standard()),
+        )
+        .unwrap();
+        assert_eq!(out.text.unwrap(), "[1]");
 
         let only = format!(r#"{{"content":[{{"thinking":"{secret}","signature":"s"}}]}}"#);
         let out = transform(&only, &PathMap::default(), Some(Redactor::standard())).unwrap();
