@@ -1,7 +1,9 @@
 //! Materialize: make a restored workspace runnable on this node (ADR 0007).
 //!
 //! Invariant: `plan` only reads. It never runs a program and never writes
-//! a byte, so a dry run is `plan` and nothing more. `Plan::ready` turns a
+//! a byte, so a dry run is `plan` and nothing more; the one thing it does
+//! besides reading is try the lock below, which it releases at once.
+//! `Plan::ready` turns a
 //! plan into steps that can run, and refuses when the plan shows that one
 //! cannot: a program missing from `PATH` or a declared environment variable
 //! missing from this node. `Ready::execute` runs exactly those steps, with
@@ -39,16 +41,24 @@
 //! far as the peer that signed its snapshot, and the `PATH` filter below
 //! only keeps the workspace from replacing the installer binary itself.
 //! The prompt before a spec this node has not run is the CLI's (ADR 0007).
-//! A step is not tied to the `fabric resume` process: after a `kill -9`
-//! of resume the installer keeps running, and until the guard ADR 0007
-//! names in its open questions lands, a second resume can start a second
-//! installer on the same tree.
+//!
+//! One installer per tree: a step is not tied to the `fabric resume`
+//! process, so after a `kill -9` of resume the installer keeps running.
+//! `execute` locks `LOCK_FILE` with `flock` and hands that same open file
+//! to every step as its standard input, an empty file that reads as end
+//! of input. The lock belongs to the open file, which the installer and
+//! the processes that inherit its input share, so it outlives a killed
+//! resume and ends when the last of them exits. `plan` and `execute`
+//! refuse while anyone holds it, so a second resume never starts a second
+//! installer on a tree the first one is still writing. A process a step
+//! leaves behind with that input still open, such as a daemon that did
+//! not redirect it, holds the lock too, and resumes refuse until it exits.
 
 use std::env;
 use std::ffi::OsStr;
-use std::fs;
+use std::fs::{self, TryLockError};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -73,6 +83,9 @@ pub const SENTINEL: &str = ".fabric-installed";
 const SENTINEL_TEXT: &[u8] =
     b"Written by Fabric after the setup steps that fill this cache exited 0.\n";
 
+/// The file, relative to the root, that a running setup step holds locked as its standard input.
+pub const LOCK_FILE: &str = ".fabric/materialize.lock";
+
 /// The `tracing` target that carries every line a setup step prints.
 pub const SETUP_LOG_TARGET: &str = "fabric_env::setup";
 
@@ -85,6 +98,18 @@ const OUTPUT_GRACE: Duration = Duration::from_secs(1);
 /// Why materialize could not plan or finish.
 #[derive(Debug, thiserror::Error)]
 pub enum MaterializeError {
+    /// A setup step started by an earlier resume still holds the lock; nothing was planned or run.
+    #[error(
+        "a setup step from an earlier resume is still running in this workspace; wait for it to exit or stop the process that holds `{LOCK_FILE}` open"
+    )]
+    InstallerRunning,
+    /// The lock file could not be opened, created or locked.
+    #[error("could not take the lock `{LOCK_FILE}`")]
+    Lock {
+        /// The IO error.
+        #[source]
+        source: io::Error,
+    },
     /// The workspace root the detection report names is no longer a directory.
     #[error("workspace root `{}` is not readable", path.display())]
     Root {
@@ -345,12 +370,19 @@ impl Ready {
     ///
     /// Takes the value: what the plan read from the disk is stale once a
     /// step has run, so a second run needs a new plan.
+    ///
+    /// Before the first step it takes `LOCK_FILE`, creating it when absent,
+    /// and refuses with `InstallerRunning` when an earlier step still holds it.
     pub fn execute(self) -> Result<(), MaterializeError> {
+        if self.steps.is_empty() {
+            return Ok(());
+        }
+        let lock = take_lock(&self.root)?;
         for step in &self.steps {
             for path in &step.sentinels.clear {
                 clear_sentinel(&self.root, path)?;
             }
-            run_step(step)?;
+            run_step(step, &lock)?;
             for path in &step.sentinels.write {
                 write_sentinel(&self.root, path)?;
             }
@@ -379,6 +411,7 @@ pub fn plan(detected: &Detection) -> Result<Plan, MaterializeError> {
         }
         Err(source) => return Err(MaterializeError::Root { path: root, source }),
     }
+    check_unlocked(&root)?;
 
     let spec = detected.spec();
     let caches = detected
@@ -481,6 +514,69 @@ fn inspect(root: &Path, cache: &CachePath) -> Result<CacheHealth, MaterializeErr
     }
 }
 
+/// Refuses while a setup step holds the lock; no lock file means none ever ran here.
+///
+/// Opens the file read-only and writes nothing; the lock it takes ends
+/// when the file closes at the end of this call.
+fn check_unlocked(root: &Path) -> Result<(), MaterializeError> {
+    let lock_err = |source| MaterializeError::Lock { source };
+    let file = match fs::File::open(root.join(LOCK_FILE)) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(lock_err(err)),
+    };
+    try_lock(&file)
+}
+
+/// Opens `LOCK_FILE`, creating it and `.fabric` when absent, and locks it.
+///
+/// Neither `.fabric` nor the file may be a link: the file is created with
+/// `create_new`, which never follows one, and an existing file must be the
+/// regular file the link check saw, by device and inode.
+fn take_lock(root: &Path) -> Result<fs::File, MaterializeError> {
+    let lock_err = |source| MaterializeError::Lock { source };
+    let not_regular = || lock_err(io::Error::from(io::ErrorKind::InvalidInput));
+    let path = root.join(LOCK_FILE);
+    let dir = path.parent().ok_or_else(not_regular)?;
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Err(not_regular()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(dir).map_err(lock_err)?;
+        }
+        Err(err) => return Err(lock_err(err)),
+    }
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            let seen = fs::symlink_metadata(&path).map_err(lock_err)?;
+            let file = fs::File::open(&path).map_err(lock_err)?;
+            let opened = file.metadata().map_err(lock_err)?;
+            if !seen.is_file() || opened.dev() != seen.dev() || opened.ino() != seen.ino() {
+                return Err(not_regular());
+            }
+            file
+        }
+        Err(err) => return Err(lock_err(err)),
+    };
+    try_lock(&file)?;
+    Ok(file)
+}
+
+/// Takes the exclusive lock on `file` without waiting.
+fn try_lock(file: &fs::File) -> Result<(), MaterializeError> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(TryLockError::WouldBlock) => Err(MaterializeError::InstallerRunning),
+        Err(TryLockError::Error(source)) => Err(MaterializeError::Lock { source }),
+    }
+}
+
 /// Removes the sentinel of the cache at `path`; nothing there is fine.
 fn clear_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
     match fs::remove_file(root.join(path.as_str()).join(SENTINEL)) {
@@ -554,10 +650,18 @@ fn find_on_path(path: Option<&OsStr>, root: &Path, program: &ProgramName) -> Opt
         })
 }
 
-fn run_step(planned: &ReadyStep) -> Result<(), MaterializeError> {
+fn run_step(planned: &ReadyStep, lock: &fs::File) -> Result<(), MaterializeError> {
     let index = planned.index;
     let name = &planned.step.program;
     let program = &planned.program;
+    let spawn_err = |source| MaterializeError::Spawn {
+        index,
+        program: name.clone(),
+        source,
+    };
+    // The step inherits the locked file itself, not a copy of the lock, so
+    // the lock lasts as long as the step does, whatever happens to resume.
+    let stdin = lock.try_clone().map_err(spawn_err)?;
     tracing::info!(
         target: SETUP_LOG_TARGET,
         step = index,
@@ -569,15 +673,11 @@ fn run_step(planned: &ReadyStep) -> Result<(), MaterializeError> {
     let mut child = Command::new(program)
         .args(&planned.step.args)
         .current_dir(&planned.dir)
-        .stdin(Stdio::null())
+        .stdin(Stdio::from(stdin))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|source| MaterializeError::Spawn {
-            index,
-            program: name.clone(),
-            source,
-        })?;
+        .map_err(spawn_err)?;
     // Lines are logged from reader threads, which do not inherit the
     // caller's scoped subscriber; hand it to them.
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
