@@ -29,6 +29,7 @@ mod error;
 mod harness;
 pub(crate) mod jsontext;
 pub mod manifest;
+pub(crate) mod markers;
 #[cfg(any(feature = "acp", feature = "claude", feature = "codex"))]
 pub(crate) mod pipeline;
 pub(crate) mod place;

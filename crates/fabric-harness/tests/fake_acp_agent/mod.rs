@@ -6,7 +6,8 @@
 //! capabilities through environment variables:
 //! `FAKE_LOAD=0` drops `loadSession`, `FAKE_RESUME=1` advertises
 //! `session/resume`, `FAKE_ASK_PERMISSION=1` asks for permission on every
-//! prompt, `FAKE_PID_FILE` names a file it writes its pid to, and
+//! prompt, `FAKE_PID_FILE` names a file it writes its pid to,
+//! `FAKE_ENV_FILE` names a file it writes the names of its environment to, and
 //! `FAKE_LINGER=1` keeps it alive after its stdin closes, as a hung agent
 //! would.
 
@@ -238,6 +239,12 @@ fn run() -> std::io::Result<()> {
 pub fn serve() -> std::io::Result<()> {
     if let Some(path) = std::env::var_os("FAKE_PID_FILE") {
         std::fs::write(path, std::process::id().to_string())?;
+    }
+    if let Some(path) = std::env::var_os("FAKE_ENV_FILE") {
+        let names: Vec<String> = std::env::vars_os()
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        std::fs::write(path, names.join("\n"))?;
     }
     let result = run();
     if env_flag("FAKE_LINGER", false) {

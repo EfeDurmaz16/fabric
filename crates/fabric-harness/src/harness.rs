@@ -226,7 +226,9 @@ pub trait Harness: Send + Sync {
         state: &'a Path,
     ) -> BoxFuture<'a, Result<Restored, HarnessError>>;
 
-    /// Starts the harness in `workspace` with exactly `env`.
+    /// Starts the harness in `workspace` with `env`, minus the markers of
+    /// any Claude Code or Codex session this process runs under, so the
+    /// harness never acts as that session's child (ADR 0006).
     fn launch<'a>(
         &'a self,
         workspace: &'a Path,

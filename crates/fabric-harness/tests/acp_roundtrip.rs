@@ -240,6 +240,55 @@ async fn the_trait_launch_is_headless_and_owns_the_turn() {
     assert_eq!(recorded["prompts"][0]["text"], "headless");
 }
 
+#[tokio::test]
+async fn a_launched_agent_does_not_inherit_parent_session_markers() {
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let state_dir = home.path().join(".fake-agent/sessions");
+    let env_file = home.path().join("env.txt");
+    let env_file_text = env_file.to_string_lossy().into_owned();
+    let adapter = adapter(home.path(), PermissionPolicy::Deny);
+    let parent = [
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "ANTHROPIC_BASE_URL",
+        "CODEX_THREAD_ID",
+    ];
+    let mut extra: Vec<(&str, &str)> = vec![
+        ("FAKE_ENV_FILE", env_file_text.as_str()),
+        ("ANTHROPIC_API_KEY", "user-key"),
+    ];
+    extra.extend(parent.iter().map(|name| (*name, "1")));
+    let mut running = adapter
+        .launch(
+            &work,
+            Launch::Headless {
+                resume: None,
+                prompt: "headless".to_owned(),
+            },
+            &env(&state_dir, &extra),
+        )
+        .await
+        .unwrap();
+    let status = tokio::time::timeout(TIMEOUT, running.child_mut().wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success());
+    let seen = std::fs::read_to_string(&env_file).unwrap();
+    let names: Vec<&str> = seen.lines().collect();
+    assert!(names.contains(&"ANTHROPIC_API_KEY"), "{names:?}");
+    assert!(names.contains(&AGENT_ROLE), "{names:?}");
+    for name in parent {
+        assert!(
+            !names.contains(&name),
+            "{name} belongs to the parent session: {names:?}"
+        );
+    }
+}
+
 async fn round_trip(load: &str, resume: &str) -> Result<(PathBuf, Value), HarnessError> {
     let home = tempfile::tempdir().unwrap();
     let work = home.path().join("fabric/jobs/j1/work");

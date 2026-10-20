@@ -1,9 +1,11 @@
 //! Finding, probing and starting harness binaries.
 //!
-//! Invariant: a harness starts in its own process group with exactly the
-//! environment the caller passed, never through a shell, so the supervisor
-//! can fence the whole group (ADR 0003) and no variable of the calling
-//! process leaks into it. A question about running processes fails closed:
+//! Invariant: a harness starts in its own process group with the
+//! environment the caller passed minus the parent-session markers of
+//! `markers`, never through a shell, so the supervisor can fence the whole
+//! group (ADR 0003), no variable of the calling process leaks into it, and
+//! no Claude Code or Codex session this process runs under claims it as a
+//! child. A question about running processes fails closed:
 //! when `pgrep` or `ps` cannot answer, the caller is told so, never "none".
 //! `ps`, `pgrep` and `kill` are run from their system paths, never looked
 //! up on this process's `PATH`, so a planted `ps` cannot report a live
@@ -29,6 +31,7 @@ use tokio::process::{Child, Command};
 
 use crate::error::HarnessError;
 use crate::harness::{Installed, Launch};
+use crate::markers;
 
 /// How long a version probe may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -151,8 +154,9 @@ impl From<&Launch> for Wiring {
     }
 }
 
-/// Starts `binary args...` in `cwd`, in a new process group, with exactly
-/// `env`, and the stdio `wiring` asks for. Returns the child and its pid.
+/// Starts `binary args...` in `cwd`, in a new process group, with `env`
+/// minus its parent-session markers, and the stdio `wiring` asks for.
+/// Returns the child and its pid.
 pub(crate) fn spawn(
     binary: &Path,
     args: &[String],
@@ -165,7 +169,7 @@ pub(crate) fn spawn(
         .args(args)
         .current_dir(cwd)
         .env_clear()
-        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .envs(markers::child_env(env))
         .process_group(0)
         .kill_on_drop(false);
     match wiring {

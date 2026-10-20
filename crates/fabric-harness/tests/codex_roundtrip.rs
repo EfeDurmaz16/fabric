@@ -110,8 +110,9 @@ const LOCKING_VERSION: &str = "0.155.1";
 
 /// Writes a fake `codex` under `dir/bin` that reports `version`, stays
 /// alive when its first argument is `hold`, and otherwise logs its working
-/// directory and arguments to `$FAKE_LOG`; returns the script and a `PATH`
-/// value that finds it.
+/// directory and arguments to `$FAKE_LOG` and, when `$FAKE_ENV_LOG` is
+/// set, the names of its environment there; returns the script and a
+/// `PATH` value that finds it.
 fn fake_codex_reporting(dir: &Path, version: &str) -> (PathBuf, OsString) {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -119,7 +120,7 @@ fn fake_codex_reporting(dir: &Path, version: &str) -> (PathBuf, OsString) {
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"codex-cli {version}\"; exit 0 ;;\n  hold) sleep 60; exit 0 ;;\nesac\n{{ echo \"cwd=$(pwd -P)\"; for a in \"$@\"; do echo \"arg=$a\"; done; }} > \"$FAKE_LOG\"\n"
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"codex-cli {version}\"; exit 0 ;;\n  hold) sleep 60; exit 0 ;;\nesac\n{{ echo \"cwd=$(pwd -P)\"; for a in \"$@\"; do echo \"arg=$a\"; done; }} > \"$FAKE_LOG\"\n[ -z \"$FAKE_ENV_LOG\" ] || /usr/bin/env | cut -d= -f1 > \"$FAKE_ENV_LOG\"\n"
         ),
     )
     .unwrap();
@@ -617,4 +618,72 @@ fn the_codex_home_must_be_under_the_home() {
             .with_codex_home(&AbsPath::parse("/h/custom").unwrap())
             .is_ok()
     );
+}
+
+#[tokio::test]
+async fn a_launch_from_inside_a_codex_tool_call_leaves_the_parent_markers_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().canonicalize().unwrap();
+    let work = home.join("w");
+    std::fs::create_dir_all(&work).unwrap();
+    let env_log = home.join("env.txt");
+    let adapter = node(&home);
+    let kept = [
+        (
+            "FAKE_LOG",
+            home.join("log.txt").to_string_lossy().into_owned(),
+        ),
+        ("FAKE_ENV_LOG", env_log.to_string_lossy().into_owned()),
+        ("OPENAI_API_KEY", "user-key".to_owned()),
+        (
+            "CODEX_HOME",
+            home.join(".codex").to_string_lossy().into_owned(),
+        ),
+        ("CODEX_SANDBOX", "seatbelt".to_owned()),
+        ("CODEX_NETWORK_PROXY_ACTIVE", "1".to_owned()),
+        ("HTTPS_PROXY", "http://127.0.0.1:9".to_owned()),
+    ];
+    let parent = [
+        "CODEX_THREAD_ID",
+        "CODEX_TOOL_CALL_ID",
+        "CODEX_SESSION_ID",
+        "CODEX_VERSION",
+        "CODEX_PERMISSION_PROFILE",
+        "CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS",
+    ];
+    let env: Vec<(EnvVarName, String)> = kept
+        .iter()
+        .map(|(name, value)| (EnvVarName::parse(name).unwrap(), value.clone()))
+        .chain(
+            parent
+                .iter()
+                .map(|name| (EnvVarName::parse(name).unwrap(), "1".to_owned())),
+        )
+        .collect();
+    let mut running = adapter
+        .launch(
+            &work,
+            Launch::Headless {
+                resume: Some(thread()),
+                prompt: "go".to_owned(),
+            },
+            &env,
+        )
+        .await
+        .unwrap();
+    assert!(running.child_mut().wait().await.unwrap().success());
+    let seen = std::fs::read_to_string(&env_log).unwrap();
+    let names: Vec<&str> = seen.lines().collect();
+    for (name, _) in &kept {
+        assert!(
+            names.contains(name),
+            "{name} is the user's own or a confinement the child shares: {names:?}"
+        );
+    }
+    for name in parent {
+        assert!(
+            !names.contains(&name),
+            "{name} names the parent thread: {names:?}"
+        );
+    }
 }

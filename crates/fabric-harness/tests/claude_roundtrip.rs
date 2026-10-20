@@ -950,6 +950,77 @@ async fn launch_resumes_in_the_workspace_with_exactly_the_given_env() {
     assert!(seen.contains("arg=--\narg=hello\n"), "{seen}");
 }
 
+/// Names of the variables a fake harness logged as `env:NAME=value`.
+fn env_names(log: &str) -> Vec<&str> {
+    log.lines()
+        .filter_map(|line| line.strip_prefix("env:"))
+        .filter_map(|pair| pair.split_once('=').map(|(name, _)| name))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_launch_from_inside_a_claude_session_leaves_the_parent_markers_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().canonicalize().unwrap();
+    let work = home.join("w");
+    std::fs::create_dir_all(&work).unwrap();
+    let log = home.join("log.txt");
+    let adapter = node(&home);
+    let (_, bin_dir) = fake_claude(&home);
+    let user = [
+        (
+            "PATH",
+            format!("{}:/usr/bin:/bin", bin_dir.to_string_lossy()),
+        ),
+        ("FAKE_LOG", log.to_string_lossy().into_owned()),
+        ("ANTHROPIC_API_KEY", "user-key".to_owned()),
+        ("HTTPS_PROXY", "http://proxy.invalid:3128".to_owned()),
+    ];
+    let parent = [
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_PID",
+        "CLAUDE_EFFORT",
+        "CLAUDE_AGENT_SDK_VERSION",
+        "CLAUDE_PREVIEW_CLASSIFIER_FLOOR",
+        "ANTHROPIC_BASE_URL",
+    ];
+    let env: Vec<(EnvVarName, String)> = user
+        .iter()
+        .map(|(name, value)| (EnvVarName::parse(name).unwrap(), value.clone()))
+        .chain(
+            parent
+                .iter()
+                .map(|name| (EnvVarName::parse(name).unwrap(), "1".to_owned())),
+        )
+        .collect();
+    let mut running = adapter
+        .launch(
+            &work,
+            Launch::Headless {
+                resume: Some(session()),
+                prompt: "go".to_owned(),
+            },
+            &env,
+        )
+        .await
+        .unwrap();
+    assert!(running.child_mut().wait().await.unwrap().success());
+    let seen = std::fs::read_to_string(&log).unwrap();
+    let names = env_names(&seen);
+    for (name, _) in &user {
+        assert!(names.contains(name), "{name} is the user's own: {names:?}");
+    }
+    for name in parent {
+        assert!(
+            !names.contains(&name),
+            "{name} belongs to the parent session: {names:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_settings_overlay_with_a_literal_token_refuses_the_launch() {
     let dir = tempfile::tempdir().unwrap();
