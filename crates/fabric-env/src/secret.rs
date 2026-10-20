@@ -13,6 +13,12 @@
 //! components equal a run of the path's components, anywhere in the path, so
 //! `.aws` denies `config/.aws/credentials` and `.docker/config.json` denies
 //! `home/.docker/config.json`. A matching directory denies everything under it.
+//!
+//! Capture never hands git a pattern. It lists the paths that changed,
+//! sorts them with `SecretPolicy::staging` and stages literal paths, so git
+//! and this matcher cannot disagree, and a tracked file that matches a
+//! pattern is staged with consent or the capture stops; it is never left
+//! at its index version, which restore would write back over the user's edit.
 
 use fabric_core::path::RelPath;
 
@@ -156,30 +162,124 @@ impl SecretPolicy {
             .find(|pattern| path_matches(pattern, &names))
     }
 
-    /// Returns the pathspecs capture passes to `git add -A` so git never stages what `denies` denies in `Scope::Work`.
+    /// Sorts the paths git reports as changed into what capture stages, what it leaves out, and what needs consent.
     ///
-    /// Each pattern becomes two `:(exclude,glob,icase)` pathspecs: the path
-    /// itself at any depth, and everything under it. A pathspec limits the
-    /// paths `git add` considers at all, so it wins over a `!pattern`
-    /// negation in the repository's own `.gitignore`. An exclude file given
-    /// as `core.excludesFile` would not: that source has the lowest
-    /// precedence of git's ignore files, and `!.env.local` in a `.gitignore`
-    /// would put the secret back.
+    /// `changes` is every path that differs between the index `I` capture
+    /// starts from and the working tree: tracked paths the working tree
+    /// modified or deleted, and untracked paths that are not ignored. An
+    /// untracked path the policy denies is left out of `W`. A tracked path
+    /// the policy denies is never left out silently, because leaving it out
+    /// would put the `I` version in `W` and restore would revert the user's
+    /// edit or bring back a file the user deleted; it waits for consent
+    /// instead. Every other path is staged.
     #[must_use]
-    pub fn git_pathspecs(&self) -> Vec<String> {
-        EVERYWHERE
-            .iter()
-            .chain(OUTSIDE_CACHES)
-            .copied()
-            .chain(self.added.iter().map(Pattern::as_str))
-            .flat_map(|pattern| {
-                [
-                    format!(":(exclude,glob,icase)**/{pattern}"),
-                    format!(":(exclude,glob,icase)**/{pattern}/**"),
-                ]
-            })
-            .collect()
+    pub fn staging(&self, changes: impl IntoIterator<Item = (RelPath, Tracking)>) -> Staging {
+        let mut staging = Staging::default();
+        for (path, tracking) in changes {
+            match (self.denies(&path, Scope::Work), tracking) {
+                (None, _) => staging.stage.push(path),
+                (Some(pattern), Tracking::Untracked) => staging.left_out.push(Denied {
+                    pattern: pattern.to_owned(),
+                    path,
+                }),
+                (Some(pattern), Tracking::Tracked) => staging.tracked.push(Denied {
+                    pattern: pattern.to_owned(),
+                    path,
+                }),
+            }
+        }
+        staging
     }
+}
+
+/// Whether git tracks a changed path in the index capture starts from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tracking {
+    /// The path is in the index `I` and the working tree modified, deleted or replaced it.
+    Tracked,
+    /// The path is not in `I` and not ignored, so `git add -A` would add it.
+    Untracked,
+}
+
+/// A path the secret policy denied, with the pattern that denied it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Denied {
+    /// The path, relative to the workspace root.
+    pub path: RelPath,
+    /// The pattern that denied it.
+    pub pattern: String,
+}
+
+/// What capture stages into the working-tree commit `W`.
+///
+/// The paths to hand git come only from `Staging::paths`, which refuses
+/// while a tracked path that matches a secret pattern has changed and the
+/// user has not agreed to carry the change.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Staging {
+    stage: Vec<RelPath>,
+    left_out: Vec<Denied>,
+    tracked: Vec<Denied>,
+}
+
+impl Staging {
+    /// Returns the untracked paths the policy keeps out of `W`; capture lists them in its output.
+    pub fn left_out(&self) -> &[Denied] {
+        &self.left_out
+    }
+
+    /// Returns the tracked paths that match a secret pattern and changed in the working tree.
+    pub fn tracked_secrets(&self) -> &[Denied] {
+        &self.tracked
+    }
+
+    /// Returns the paths capture stages, or refuses when a tracked secret changed without consent.
+    ///
+    /// Capture passes each path to `git add -A` as a `:(literal)` pathspec,
+    /// so git applies no pattern of its own. An empty list means there is
+    /// nothing to stage: `git add -A` with no pathspec at all stages
+    /// everything, so capture must not run it then.
+    pub fn paths(self, consent: TrackedSecrets) -> Result<Vec<RelPath>, TrackedSecretChanged> {
+        match consent {
+            TrackedSecrets::Refuse if !self.tracked.is_empty() => Err(TrackedSecretChanged {
+                changed: self.tracked,
+            }),
+            TrackedSecrets::Refuse => Ok(self.stage),
+            TrackedSecrets::Carry => {
+                let mut paths = self.stage;
+                paths.extend(self.tracked.into_iter().map(|denied| denied.path));
+                Ok(paths)
+            }
+        }
+    }
+}
+
+/// Whether the user agreed that changes to tracked files matching a secret pattern may travel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackedSecrets {
+    /// Refuse the capture and name the files; the default.
+    Refuse,
+    /// Stage the changes like any other tracked change.
+    Carry,
+}
+
+/// Tracked files that match a secret pattern changed, and the user has not agreed to carry them.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "tracked files that match a secret pattern changed: {}; commit or revert them, or agree to carry the change",
+    changed_list(changed)
+)]
+pub struct TrackedSecretChanged {
+    /// Each changed path and the pattern it matches.
+    pub changed: Vec<Denied>,
+}
+
+fn changed_list(changed: &[Denied]) -> String {
+    changed
+        .iter()
+        .map(|denied| format!("{} ({})", denied.path, denied.pattern))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Returns true when the components of `pattern` match a run of `names`, the components of a path.
