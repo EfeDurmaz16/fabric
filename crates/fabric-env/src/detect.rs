@@ -434,7 +434,10 @@ pub fn detect(root: &Path) -> Result<Detection, DetectError> {
     }
 
     for declared in &overrides.caches {
-        if let Some(found) = caches.iter_mut().find(|c| c.path == declared.path) {
+        if let Some(found) = caches
+            .iter_mut()
+            .find(|c| c.path.eq_ignore_ascii_case(&declared.path))
+        {
             // The ecosystem stays: it decides the carry key, and a declared
             // class must not let a `node_modules` travel to a node with
             // another Node major.
@@ -443,7 +446,8 @@ pub fn detect(root: &Path) -> Result<Detection, DetectError> {
         }
         if let Some(found) = caches.iter().find(|c| {
             c.ecosystem != Ecosystem::Declared
-                && (declared.path.starts_with(&c.path) || c.path.starts_with(&declared.path))
+                && (declared.path.starts_with_ignore_ascii_case(&c.path)
+                    || c.path.starts_with_ignore_ascii_case(&declared.path))
         }) {
             return Err(DetectError::NestedCache {
                 declared: declared.path.clone(),

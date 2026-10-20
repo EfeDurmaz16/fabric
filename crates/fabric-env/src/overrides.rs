@@ -408,18 +408,23 @@ fn caches(value: &Value) -> Result<Vec<DeclaredCache>, OverrideError> {
                 });
             }
         };
-        if caches.iter().any(|c| c.path == path) {
+        if caches.iter().any(|c| c.path.eq_ignore_ascii_case(&path)) {
             return Err(OverrideError::DuplicateCache { path });
         }
         // A cache is dropped on a carry mismatch, so a path that holds
         // Fabric's own files or the user's work must not become one by accident.
-        if path.as_str() == FABRIC_DIR || path.as_str().starts_with(FABRIC_DIR_PREFIX) {
+        if path.as_str().eq_ignore_ascii_case(FABRIC_DIR)
+            || path
+                .as_str()
+                .get(..FABRIC_DIR_PREFIX.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(FABRIC_DIR_PREFIX))
+        {
             return Err(OverrideError::ReservedCache { key: path_key });
         }
-        if let Some(other) = caches
-            .iter()
-            .find(|c| path.starts_with(&c.path) || c.path.starts_with(&path))
-        {
+        if let Some(other) = caches.iter().find(|c| {
+            path.starts_with_ignore_ascii_case(&c.path)
+                || c.path.starts_with_ignore_ascii_case(&path)
+        }) {
             return Err(OverrideError::NestedCache {
                 path,
                 other: other.path.clone(),
@@ -660,26 +665,33 @@ when = "always"
 
     #[test]
     fn a_cache_path_declared_twice_is_refused() {
-        let text =
-            "[[cache]]\npath = \"a\"\nclass = \"deps\"\n[[cache]]\npath = \"a\"\nclass = \"build\"";
-        assert!(matches!(
-            EnvOverride::parse(text),
-            Err(OverrideError::DuplicateCache { .. })
-        ));
+        for second in ["a", "A"] {
+            let text = format!(
+                "[[cache]]\npath = \"a\"\nclass = \"deps\"\n[[cache]]\npath = \"{second}\"\nclass = \"build\""
+            );
+            assert!(matches!(
+                EnvOverride::parse(&text),
+                Err(OverrideError::DuplicateCache { .. })
+            ));
+        }
     }
 
     /// A cache is dropped on a carry mismatch, so Fabric's own directory
     /// and a path that nests with another cache are refused; a sibling is fine.
     #[test]
     fn a_cache_under_fabric_or_nested_in_another_cache_is_refused() {
-        for path in [".fabric", ".fabric/jobs"] {
+        for path in [".fabric", ".fabric/jobs", ".FABRIC", ".Fabric/jobs"] {
             let text = format!("[[cache]]\npath = \"{path}\"\nclass = \"build\"");
             match EnvOverride::parse(&text) {
                 Err(OverrideError::ReservedCache { key }) => assert_eq!(key, "cache[0].path"),
                 other => panic!("{path}: {other:?}"),
             }
         }
-        for (first, second) in [("out", "out/cache"), ("out/cache", "out")] {
+        for (first, second) in [
+            ("out", "out/cache"),
+            ("out/cache", "out"),
+            ("Out", "out/cache"),
+        ] {
             let text = format!(
                 "[[cache]]\npath = \"{first}\"\nclass = \"build\"\n[[cache]]\npath = \"{second}\"\nclass = \"build\""
             );

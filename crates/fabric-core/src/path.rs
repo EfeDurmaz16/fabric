@@ -93,6 +93,25 @@ impl RelPath {
                 .strip_prefix(prefix.0.as_str())
                 .is_some_and(|rest| rest.starts_with('/'))
     }
+
+    /// Returns true when `self` is `prefix` or lies below it on a volume that folds ASCII case.
+    ///
+    /// The owner's APFS volumes fold case, so `.FABRIC/x` is under `.fabric`
+    /// and `Node_Modules` is `node_modules` there; a guard that compares
+    /// bytes would let one directory pass as two.
+    #[must_use]
+    pub fn starts_with_ignore_ascii_case(&self, prefix: &RelPath) -> bool {
+        let (path, prefix) = (self.0.as_bytes(), prefix.0.as_bytes());
+        path.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+            && matches!(path.get(prefix.len()), None | Some(b'/'))
+    }
+
+    /// Returns true when the two paths name one entry on a volume that folds ASCII case.
+    #[must_use]
+    pub fn eq_ignore_ascii_case(&self, other: &RelPath) -> bool {
+        self.0.eq_ignore_ascii_case(&other.0)
+    }
 }
 
 impl fmt::Display for RelPath {
@@ -212,6 +231,17 @@ mod tests {
         assert!(RelPath::parse(".gitignore").is_ok());
         assert_eq!(RelPath::parse("caf\u{65}\u{301}"), Err(PathError::NotNfc));
         assert!(RelPath::parse("caf\u{e9}").is_ok());
+    }
+
+    #[test]
+    fn folded_comparisons_ignore_ascii_case_and_respect_components() {
+        let p = |text: &str| RelPath::parse(text).unwrap();
+        assert!(p(".FABRIC/jobs").starts_with_ignore_ascii_case(&p(".fabric")));
+        assert!(p("Node_Modules").starts_with_ignore_ascii_case(&p("node_modules")));
+        assert!(!p("node_modules2").starts_with_ignore_ascii_case(&p("node_modules")));
+        assert!(!p("node").starts_with_ignore_ascii_case(&p("node_modules")));
+        assert!(p("Node_Modules").eq_ignore_ascii_case(&p("node_modules")));
+        assert!(!p("node_modules/a").eq_ignore_ascii_case(&p("node_modules")));
     }
 
     #[test]

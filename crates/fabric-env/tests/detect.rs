@@ -436,28 +436,32 @@ fn a_declared_pin_under_an_alias_replaces_the_detected_one() {
 }
 
 /// The ecosystem decides the carry key; a declared class must not turn a
-/// `node_modules` into something that travels to a node with another Node.
+/// `node_modules` into something that travels to a node with another Node,
+/// and on a case-folding volume `Node_Modules` is that same directory.
 #[test]
 fn a_declared_class_keeps_the_detected_ecosystem() {
-    let dir = workspace(&[
-        ("package.json", PACKAGE_JSON),
-        ("package-lock.json", ""),
-        (
-            ".fabric/env.toml",
-            "[[cache]]\npath = \"node_modules\"\nclass = \"tool-cache\"\n",
-        ),
-    ])
-    .unwrap();
-    let found = detect(dir.path()).unwrap();
-    assert_eq!(
-        found.caches(),
-        [cache(
-            "node_modules",
-            CacheClass::ToolCache,
-            Ecosystem::Node(NodeManager::Npm)
-        )
-        .unwrap()]
-    );
+    for declared in ["node_modules", "Node_Modules"] {
+        let dir = workspace(&[
+            ("package.json", PACKAGE_JSON),
+            ("package-lock.json", ""),
+            (
+                ".fabric/env.toml",
+                &format!("[[cache]]\npath = \"{declared}\"\nclass = \"tool-cache\"\n"),
+            ),
+        ])
+        .unwrap();
+        let found = detect(dir.path()).unwrap();
+        assert_eq!(
+            found.caches(),
+            [cache(
+                "node_modules",
+                CacheClass::ToolCache,
+                Ecosystem::Node(NodeManager::Npm)
+            )
+            .unwrap()],
+            "{declared}"
+        );
+    }
 }
 
 /// `node_modules/.cache` is inside a cache detection owns; declaring it
