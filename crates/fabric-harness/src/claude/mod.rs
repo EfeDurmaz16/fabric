@@ -148,9 +148,9 @@ impl ClaudeCode {
 
     /// Refuses a launch environment in which Claude would keep its state
     /// or login somewhere else than this adapter reads and writes: one
-    /// that sets any variable in `MOVES_CONFIG`, whatever its value. The
-    /// CLI runs it on the environment it will launch with before it
-    /// pre-seeds trust or captures, which take no environment.
+    /// that sets any variable in `MOVES_CONFIG`, whatever its value.
+    /// `launch` and `preseed_trust` run it on the environment they are
+    /// given; the CLI runs it before it captures, which takes none.
     pub fn check_env(env: &[(EnvVarName, String)]) -> Result<(), HarnessError> {
         let set = MOVES_CONFIG
             .iter()
@@ -297,9 +297,15 @@ impl ClaudeCode {
     /// the key `projects["<root>"].hasTrustDialogAccepted` is written while
     /// no `claude` runs; while one runs, or when the file is a symlink or
     /// missing, the file is left to Claude and the outcome says why, so the caller can
-    /// warn and launch.
-    pub async fn preseed_trust(&self, workspace: &Path) -> Result<TrustOutcome, HarnessError> {
-        self.preseed_trust_with(workspace, || self.running_claude())
+    /// warn and launch. `env` is the environment the caller will launch
+    /// with; one that moves Claude's config is refused before anything is
+    /// read, because the key would land in a file Claude does not open.
+    pub async fn preseed_trust(
+        &self,
+        workspace: &Path,
+        env: &[(EnvVarName, String)],
+    ) -> Result<TrustOutcome, HarnessError> {
+        self.preseed_trust_with(workspace, env, || self.running_claude())
             .await
     }
 
@@ -308,12 +314,14 @@ impl ClaudeCode {
     async fn preseed_trust_with<F, Fut>(
         &self,
         workspace: &Path,
+        env: &[(EnvVarName, String)],
         running: F,
     ) -> Result<TrustOutcome, HarnessError>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Vec<u32>, HarnessError>>,
     {
+        Self::check_env(env)?;
         let root = pipeline::physical_workspace(workspace)?;
         let config_json = self.config_json.clone();
         let read_root = root.clone();
@@ -815,10 +823,20 @@ mod tests {
             workspace: &Path,
             running: Vec<u32>,
         ) -> (Result<TrustOutcome, HarnessError>, bool) {
+            self.preseed_with(workspace, &[], running).await
+        }
+
+        /// `preseed_at` with the launch environment `env`.
+        async fn preseed_with(
+            &self,
+            workspace: &Path,
+            env: &[(EnvVarName, String)],
+            running: Vec<u32>,
+        ) -> (Result<TrustOutcome, HarnessError>, bool) {
             let asked = Cell::new(false);
             let outcome = self
                 .adapter
-                .preseed_trust_with(workspace, || {
+                .preseed_trust_with(workspace, env, || {
                     asked.set(true);
                     async move { Ok(running) }
                 })
@@ -979,6 +997,27 @@ mod tests {
             "the user's link must survive"
         );
         assert_eq!(std::fs::read(&target).unwrap(), br#"{"projects":{}}"#);
+    }
+
+    #[tokio::test]
+    async fn a_launch_env_that_moves_the_config_is_refused_before_trust_is_read() {
+        let fixture = TrustFixture::new(Some(&|_: &Path| r#"{"projects":{}}"#.to_owned()));
+        let before = fixture.config_bytes();
+        let env = [(
+            EnvVarName::parse("CLAUDE_CONFIG_DIR").unwrap(),
+            fixture.home.join(".claude").to_string_lossy().into_owned(),
+        )];
+        let (outcome, asked) = fixture.preseed_with(&fixture.work, &env, Vec::new()).await;
+        assert!(
+            matches!(outcome, Err(HarnessError::ConfigMoved { .. })),
+            "{outcome:?}"
+        );
+        assert!(!asked);
+        assert_eq!(
+            fixture.config_bytes(),
+            before,
+            "Claude would not read a key written here"
+        );
     }
 
     #[tokio::test]
