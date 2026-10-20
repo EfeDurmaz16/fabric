@@ -32,7 +32,7 @@ use fabric_core::snapshot::{
 
 use crate::durable::TempFile;
 use crate::git::{Git, GitError};
-use crate::objects::{ObjectError, StoredFile, open_regular};
+use crate::objects::{ObjectError, StoredFile};
 use crate::policy::{Class, IgnorePolicy, Markers};
 use crate::store::{Store, StoreError};
 
@@ -366,15 +366,46 @@ fn rel_path(text: &str) -> Result<RelPath, CaptureError> {
     })
 }
 
-/// Reads a symlink's target, refusing one that is not UTF-8 instead of rewriting it.
-fn utf8_link(full: &Path, rel: &RelPath) -> Result<String, CaptureError> {
-    fs::read_link(full)
-        .map_err(|e| io_err(full, e))?
-        .into_os_string()
-        .into_string()
-        .map_err(|_| CaptureError::NotUtf8 {
-            path: rel.as_str().to_owned(),
-        })
+/// Opens the directory that holds `rel` under `base` and returns it with the last name of `rel`.
+///
+/// `base` itself may be a link, as a harness state directory often is; no
+/// component below it is followed. A component that is a link or not a
+/// directory any more gives `None`: the tree changed after it was listed,
+/// and a path-based open would have read through the link.
+fn parent_below<'a>(
+    base: &Path,
+    rel: &'a RelPath,
+) -> io::Result<Option<(rustix::fd::OwnedFd, &'a str)>> {
+    use rustix::fs::{Mode as RawBits, OFlags};
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let mut dir = rustix::fs::open(base, flags, RawBits::empty())?;
+    let mut parts: Vec<&str> = rel.as_str().split('/').collect();
+    let name = parts.pop().unwrap_or_default();
+    for part in parts {
+        dir = match rustix::fs::openat(&dir, part, flags | OFlags::NOFOLLOW, RawBits::empty()) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+    }
+    Ok(Some((dir, name)))
+}
+
+/// Reads the target of the link at `rel` under `base`, refusing one that is not UTF-8 instead of rewriting it.
+fn utf8_link(base: &Path, rel: &RelPath) -> Result<String, CaptureError> {
+    let full = base.join(rel.as_str());
+    let changed = || CaptureError::WorkspaceChanged { path: rel.clone() };
+    let Some((dir, name)) = parent_below(base, rel).map_err(|e| io_err(&full, e))? else {
+        return Err(changed());
+    };
+    let target = match rustix::fs::readlinkat(&dir, name, Vec::new()) {
+        Ok(target) => target,
+        Err(rustix::io::Errno::NOENT | rustix::io::Errno::INVAL) => return Err(changed()),
+        Err(e) => return Err(io_err(&full, e.into())),
+    };
+    String::from_utf8(target.into_bytes()).map_err(|_| CaptureError::NotUtf8 {
+        path: rel.as_str().to_owned(),
+    })
 }
 
 /// Returns the mtime of `meta` in nanoseconds since the epoch.
@@ -441,22 +472,32 @@ impl Found {
     }
 }
 
-/// Opens a listed regular file, refusing it unless it is still the inode the listing saw.
+/// Opens a listed regular file under `base`, refusing it unless it is still the inode the listing saw.
 ///
 /// A path swapped for a link, a FIFO or another file after the listing
-/// fails here, so the bytes stored under a name are the bytes of the file
-/// the secret patterns judged by that name.
-fn open_listed(full: &Path, found: &Found) -> Result<File, CaptureError> {
+/// fails here, and so does a path whose directory was swapped for a link:
+/// the open walks down from `base` through directory handles and follows
+/// no link, so the bytes stored under a name are the bytes of the file the
+/// secret patterns judged by that name.
+fn open_listed(base: &Path, found: &Found) -> Result<File, CaptureError> {
+    use rustix::fs::{Mode as RawBits, OFlags};
+    let full = base.join(found.rel.as_str());
     let changed = || CaptureError::WorkspaceChanged {
         path: found.rel.clone(),
     };
-    let file = match open_regular(full) {
-        Ok(Some(file)) => file,
-        Ok(None) => return Err(changed()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(changed()),
-        Err(e) => return Err(io_err(full, e)),
+    let Some((dir, name)) = parent_below(base, &found.rel).map_err(|e| io_err(&full, e))? else {
+        return Err(changed());
     };
-    let meta = file.metadata().map_err(|e| io_err(full, e))?;
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let file = match rustix::fs::openat(&dir, name, flags, RawBits::empty()) {
+        Ok(fd) => File::from(fd),
+        Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOENT) => return Err(changed()),
+        Err(e) => return Err(io_err(&full, e.into())),
+    };
+    let meta = file.metadata().map_err(|e| io_err(&full, e))?;
+    if !meta.is_file() {
+        return Err(changed());
+    }
     if meta.dev() != found.meta.dev() || meta.ino() != found.meta.ino() {
         return Err(changed());
     }
@@ -468,10 +509,11 @@ fn open_listed(full: &Path, found: &Found) -> Result<File, CaptureError> {
 /// Only the inode is checked before the read, so the size and mtime of the
 /// open file are compared with the listing after it: a write during the
 /// read would otherwise store a torn file under the name.
-fn store_listed(store: &Store, full: &Path, found: &Found) -> Result<StoredFile, CaptureError> {
-    let file = open_listed(full, found)?;
-    let stored = store.objects().put_reader(&file, full)?;
-    let after = file.metadata().map_err(|e| io_err(full, e))?;
+fn store_listed(store: &Store, base: &Path, found: &Found) -> Result<StoredFile, CaptureError> {
+    let full = base.join(found.rel.as_str());
+    let file = open_listed(base, found)?;
+    let stored = store.objects().put_reader(&file, &full)?;
+    let after = file.metadata().map_err(|e| io_err(&full, e))?;
     if stored.size != found.meta.len()
         || after.len() != found.meta.len()
         || (after.mtime(), after.mtime_nsec()) != (found.meta.mtime(), found.meta.mtime_nsec())
@@ -563,10 +605,9 @@ impl Capturer<'_> {
     /// Turns a found path into an entry, writing its bytes into the store.
     fn entry_for(&mut self, base: &Path, found: &Found) -> Result<Entry, CaptureError> {
         let meta = &found.meta;
-        let full = base.join(found.rel.as_str());
         let kind = match found.kind {
             FoundKind::Symlink => {
-                let target = utf8_link(&full, &found.rel)?;
+                let target = utf8_link(base, &found.rel)?;
                 if symlink_escapes(&found.rel, &target) {
                     self.report.escaping_symlinks.push(found.rel.clone());
                 }
@@ -575,7 +616,7 @@ impl Capturer<'_> {
             }
             FoundKind::Dir => EntryKind::Dir,
             FoundKind::File => {
-                let stored = store_listed(self.store, &full, found)?;
+                let stored = store_listed(self.store, base, found)?;
                 self.report.files += 1;
                 self.report.bytes += stored.size;
                 self.report.new_objects += stored.new_objects;
@@ -1421,7 +1462,7 @@ impl GitCapture<'_> {
                 Err(e) => return Err(io_err(&full, e)),
             };
             if meta.file_type().is_symlink() {
-                let target = utf8_link(&full, &rel)?;
+                let target = utf8_link(self.root, &rel)?;
                 if symlink_escapes(&rel, &target) {
                     report.escaping_symlinks.push(rel.clone());
                 }
@@ -1789,13 +1830,36 @@ mod tests {
         fs::rename(&path, dir.path().join("kept")).unwrap();
         std::os::unix::fs::symlink(&key, &path).unwrap();
         assert!(matches!(
-            open_listed(&path, &found),
+            open_listed(dir.path(), &found),
             Err(CaptureError::WorkspaceChanged { .. })
         ));
         fs::remove_file(&path).unwrap();
         fs::write(&path, "another file").unwrap();
         assert!(matches!(
-            open_listed(&path, &found),
+            open_listed(dir.path(), &found),
+            Err(CaptureError::WorkspaceChanged { .. })
+        ));
+    }
+
+    /// A listing that walked through a directory swapped for a link saw the
+    /// outside file's own inode, so only the walk from the base catches it.
+    #[test]
+    fn a_directory_replaced_by_a_link_is_not_read_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("work");
+        let outside = dir.path().join("home");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("notes.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("sub")).unwrap();
+        let listed = fs::symlink_metadata(outside.join("notes.txt")).unwrap();
+        let found = Found::new(rel("sub/notes.txt"), listed).unwrap();
+        assert!(matches!(
+            open_listed(&base, &found),
+            Err(CaptureError::WorkspaceChanged { .. })
+        ));
+        assert!(matches!(
+            utf8_link(&base, &rel("sub/notes.txt")),
             Err(CaptureError::WorkspaceChanged { .. })
         ));
     }
@@ -1809,7 +1873,7 @@ mod tests {
         let found = Found::new(rel("notes.txt"), fs::symlink_metadata(&path).unwrap()).unwrap();
         fs::write(&path, "notes, rewritten").unwrap();
         assert!(matches!(
-            store_listed(&store, &path, &found),
+            store_listed(&store, dir.path(), &found),
             Err(CaptureError::WorkspaceChanged { .. })
         ));
     }
