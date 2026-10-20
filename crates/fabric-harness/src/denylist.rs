@@ -63,7 +63,6 @@ const SECRET_NAMES: &[&str] = &[
     "id_rsa",
     "id_ecdsa",
     "id_ed25519",
-    ".coordination.lock",
 ];
 
 /// Component suffixes that mark a key or a store of one.
@@ -130,6 +129,7 @@ const CODEX_HOST_DIRS: &[&str] = &[
 
 /// File names under `~/.codex` that are host state or hold a token.
 const CODEX_HOST_FILES: &[&str] = &[
+    ".coordination.lock",
     "environments.toml",
     "config.toml",
     "installation_id",
@@ -214,6 +214,7 @@ mod tests {
             "home/.codex/thread_history_1.sqlite-wal",
             "home/.codex/thread-writer-locks/t.lock",
             "home/.codex/.coordination.lock",
+            "home/.codex/thread-writer-locks/.coordination.lock",
             "home/.codex/shell_snapshots/a.sh",
             "home/.codex/environments.toml",
             "home/.codex/config.toml",
@@ -244,6 +245,7 @@ mod tests {
             "home/.codex/archived_sessions/rollout-2026-10-19T10-00-00-abc.jsonl.zst",
             "home/.claude/settings.local.json",
             "home/w/.env.example",
+            "home/.fake-agent/sessions/.coordination.lock",
         ] {
             assert_eq!(check(path), None, "{path} should be allowed");
         }
