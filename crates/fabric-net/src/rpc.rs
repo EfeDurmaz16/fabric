@@ -14,21 +14,19 @@
 //! belong to this layer and never reach a service.
 
 use std::collections::BTreeSet;
-use std::future::Future;
 use std::io;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use fabric_core::BoxFuture;
 use fabric_core::id::{ChunkId, NodeId, SnapshotId};
 use fabric_core::lease::FencingToken;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::time::{Instant, Sleep, timeout};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::time::timeout;
 
 use crate::frame::{FrameError, MAX_BULK_FRAME, MAX_CONTROL_FRAME, read_frame, write_frame};
+use crate::idle::IdleReader;
 use crate::transport::{Connection, Stream, TransportError, TransportKind};
 use crate::wire::{
     ChunkBatch, Fault, FaultText, Hello, JobRequest, JobResponse, ManifestChunks, PROTOCOL_VERSION,
@@ -471,47 +469,6 @@ impl Session {
     }
 }
 
-/// A reader that fails with `TimedOut` once `idle` passes with no byte arriving.
-struct IdleReader {
-    inner: Box<dyn AsyncRead + Send + Unpin>,
-    limit: Duration,
-    timer: Pin<Box<Sleep>>,
-}
-
-impl IdleReader {
-    fn new(inner: Box<dyn AsyncRead + Send + Unpin>, limit: Duration) -> Self {
-        Self {
-            inner,
-            limit,
-            timer: Box::pin(tokio::time::sleep(limit)),
-        }
-    }
-}
-
-impl AsyncRead for IdleReader {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let before = buf.filled().len();
-        match Pin::new(&mut self.inner).poll_read(cx, buf) {
-            Poll::Ready(Ok(())) => {
-                if buf.filled().len() > before {
-                    let next = Instant::now() + self.limit;
-                    self.timer.as_mut().reset(next);
-                }
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-            Poll::Pending => match self.timer.as_mut().poll(cx) {
-                Poll::Ready(()) => Poll::Ready(Err(io::ErrorKind::TimedOut.into())),
-                Poll::Pending => Poll::Pending,
-            },
-        }
-    }
-}
-
 /// Where a chunk stream is: reading, done, or ended by an error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Progress {
@@ -526,7 +483,7 @@ enum Progress {
 /// every later `next` returns `Interrupted` instead of reading payload
 /// bytes as a frame header.
 pub struct ChunkStream {
-    recv: IdleReader,
+    recv: IdleReader<Box<dyn AsyncRead + Send + Unpin>>,
     id: RequestId,
     wanted: BTreeSet<ChunkId>,
     idle: Duration,
@@ -730,7 +687,7 @@ mod tests {
                 send.write_all(piece).await.unwrap();
             }
         });
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         assert_eq!(stream.next().await.unwrap(), Some((id, bytes)));
         assert!(started.elapsed() > IDLE * 4, "the link was not slow");
         assert!(stream.next().await.unwrap().is_none());
