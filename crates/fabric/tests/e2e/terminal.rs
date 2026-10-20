@@ -135,19 +135,26 @@ fn run_in_terminal(env: &Env, node: &Node, args: &[&str], input: &[u8]) -> Falli
     )?;
     let result = env.root.join("terminal-result");
     let test = "terminal::e2e_a_terminal_harness_owns_the_terminal_before_it_starts";
-    let mut leader = env.command(&std::env::current_exe()?.to_string_lossy(), node.state());
-    leader
-        .args(["--exact", test, "--test-threads=1", "--nocapture"])
-        .env(ROLE, "leader")
-        .env(ARGS, args.join("\n"))
-        .env(RESULT, &result)
-        .stdin(Stdio::from(slave.try_clone()?))
-        .stdout(Stdio::from(slave.try_clone()?))
-        .stderr(Stdio::from(slave));
-    let leader = leader.spawn()?;
+    // The command owns copies of the slave until it is dropped, and Linux
+    // does not revoke a pseudo-terminal when its session leader exits, so
+    // it is dropped as soon as the leader runs; otherwise the master never
+    // reads the end of the terminal.
+    let leader = {
+        let mut leader = env.command(&std::env::current_exe()?.to_string_lossy(), node.state());
+        leader
+            .args(["--exact", test, "--test-threads=1", "--nocapture"])
+            .env(ROLE, "leader")
+            .env(ARGS, args.join("\n"))
+            .env(RESULT, &result)
+            .stdin(Stdio::from(slave.try_clone()?))
+            .stdout(Stdio::from(slave.try_clone()?))
+            .stderr(Stdio::from(slave));
+        leader.spawn()?
+    };
     rustix::io::write(&master, input)?;
     let mut reader = fs::File::from(master);
-    let screen = std::thread::spawn(move || {
+    let (screen_done, screen) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut screen = Vec::new();
         let mut buf = [0u8; 4096];
         // The slave's last close ends the read with EOF or EIO.
@@ -157,7 +164,7 @@ fn run_in_terminal(env: &Env, node: &Node, args: &[&str], input: &[u8]) -> Falli
             }
             screen.extend_from_slice(&buf[..n]);
         }
-        String::from_utf8_lossy(&screen).into_owned()
+        let _ = screen_done.send(String::from_utf8_lossy(&screen).into_owned());
     });
     let finished = finish(leader, RUN_TIMEOUT)?;
     let recorded = fs::read_to_string(&result).map_err(|e| {
@@ -167,7 +174,10 @@ fn run_in_terminal(env: &Env, node: &Node, args: &[&str], input: &[u8]) -> Falli
             node.log()
         )
     })?;
-    let screen = screen.join().map_err(|_| "the terminal reader panicked")?;
+    // The screen is only for messages; a terminal that stays open must not hang the test.
+    let screen = screen
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap_or_else(|_| "(the terminal did not close)".to_owned());
     let mut values = recorded
         .lines()
         .filter_map(|line| line.split_once(' ').map(|(_, value)| value.parse::<i32>()));
