@@ -53,6 +53,9 @@ pub enum ManifestError {
         /// Zero-based index of the entry, within its tree.
         index: usize,
     },
+    /// The git state mixes SHA-1 and SHA-256 object ids, which no one repository can hold.
+    #[error("git state mixes SHA-1 and SHA-256 object ids")]
+    MixedObjectFormat,
     /// A remote URL in the config projection carries userinfo, which is where a token lives.
     #[error("config entry {index} is a remote URL with userinfo")]
     SecretInConfig {
@@ -269,7 +272,8 @@ pub enum CarryKey {
 /// Every name in it is a parsed type from `crate::git`, so a manifest from a
 /// peer cannot hold a config key outside the allowlist, a ref name git would
 /// refuse, or a value that reads as an option on a command line; `validate`
-/// adds that a remote URL carries no userinfo.
+/// adds that a remote URL carries no userinfo and that every object id has
+/// the same width, one object format for the whole repository.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitState {
     /// The objects of the git bundle, full or incremental.
@@ -356,6 +360,20 @@ impl SnapshotManifest {
                 git.worktree_mtimes.iter().map(|(p, _)| p),
             )?;
             check_sorted("config", git.config.iter().map(|(key, _)| key))?;
+            // SHA-1 and SHA-256 repositories do not interoperate, so a state
+            // that mixes the two widths cannot be restored into any one repository.
+            let sha256 = git.index_commit.is_sha256();
+            let detached = match &git.head {
+                GitHead::Detached(oid) => Some(oid),
+                GitHead::Branch(_) => None,
+            };
+            let mixed = std::iter::once(&git.worktree_commit)
+                .chain(detached)
+                .chain(git.refs.iter().map(|(_, oid)| oid))
+                .any(|oid| oid.is_sha256() != sha256);
+            if mixed {
+                return Err(ManifestError::MixedObjectFormat);
+            }
             // ADR 0004 strips userinfo at capture; the receiving node holds
             // the same line, or a token in remote.origin.url would be written
             // into every target's .git/config.
