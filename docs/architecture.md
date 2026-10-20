@@ -34,7 +34,7 @@ crates/
   fabric-cli       the `fabric` binary: job init, suspend, resume, job move, job steal, status, doctor, orphan export, node pair, node serve
 ```
 
-`fabric-core` and `fabric-env` exist today; in `fabric-env`, carry keys and doctor facts are still to come. Dependency direction is strictly downward: `fabric-cli` depends on everything, `fabric-core` depends on nothing in the workspace. `fabric-core` defines the `Store`, `Transport` and `Harness` traits; the other crates implement them. Nothing in the core knows about QUIC, SQLite or any agent vendor.
+`fabric-core` and `fabric-env` exist today; in `fabric-env`, carry keys and doctor facts are still to come. Dependency direction is strictly downward: `fabric-cli` depends on everything, `fabric-core` depends on nothing in the workspace. `fabric-core` defines the `LedgerStore` trait today; the `Store`, `Transport` and `Harness` traits will live there too, and the other crates will implement them. Nothing in the core knows about QUIC, SQLite or any agent vendor.
 
 ## Data structures first
 
