@@ -637,15 +637,14 @@ impl Capturer<'_> {
     fn store_bundle(
         &mut self,
         built: BuiltBundle,
-        parent: Option<SnapshotId>,
     ) -> Result<(Vec<ChunkId>, Option<SnapshotId>), CaptureError> {
         let (stored, kind) = match built {
             BuiltBundle::Full(file) => ((self.store_scratch_file(file)?, None), BundleKind::Full),
-            BuiltBundle::Incremental(file) => (
-                (self.store_scratch_file(file)?, parent),
+            BuiltBundle::Incremental { file, base } => (
+                (self.store_scratch_file(file)?, Some(base)),
                 BundleKind::Incremental,
             ),
-            BuiltBundle::Empty => ((Vec::new(), parent), BundleKind::Empty),
+            BuiltBundle::Empty { base } => ((Vec::new(), Some(base)), BundleKind::Empty),
         };
         self.report.bundle = Some(kind);
         Ok(stored)
@@ -698,14 +697,66 @@ struct RefView {
     head: GitHead,
 }
 
+/// The bundle capture tries to make.
+enum BundlePlan {
+    /// Every object the refs reach.
+    Full,
+    /// Only objects that `tips`, the refs of the snapshot `base`, do not reach.
+    Incremental {
+        /// The snapshot whose bundles carry the excluded objects.
+        base: SnapshotId,
+        /// The object ids in `base`'s refs; never empty.
+        tips: Vec<GitOid>,
+    },
+}
+
+impl BundlePlan {
+    /// Plans the bundle after `parent`: incremental unless there is no parent
+    /// with refs or its chain is already `MAX_BUNDLE_CHAIN` long.
+    fn after(
+        store: &Store,
+        parent: Option<(SnapshotId, &SnapshotManifest)>,
+    ) -> Result<BundlePlan, CaptureError> {
+        let Some((base, manifest)) = parent else {
+            return Ok(BundlePlan::Full);
+        };
+        let Some(git) = &manifest.git else {
+            return Ok(BundlePlan::Full);
+        };
+        if git.refs.is_empty() || chain_depth(store, manifest)? >= MAX_BUNDLE_CHAIN {
+            return Ok(BundlePlan::Full);
+        }
+        Ok(BundlePlan::Incremental {
+            base,
+            tips: git.refs.iter().map(|(_, oid)| oid.clone()).collect(),
+        })
+    }
+
+    /// The parent's tips an incremental bundle leaves out; none for a full one.
+    fn tips(&self) -> &[GitOid] {
+        match self {
+            BundlePlan::Full => &[],
+            BundlePlan::Incremental { tips, .. } => tips,
+        }
+    }
+}
+
 /// A bundle capture made, with the file that holds it.
 enum BuiltBundle {
     /// Every object the refs reach.
     Full(TempFile),
-    /// Only objects the parent's refs did not reach.
-    Incremental(TempFile),
-    /// The parent's refs already reached every object.
-    Empty,
+    /// Only objects the refs of `base` did not reach.
+    Incremental {
+        /// The bundle.
+        file: TempFile,
+        /// The snapshot whose refs the bundle excludes.
+        base: SnapshotId,
+    },
+    /// The refs of `base` already reached every object.
+    Empty {
+        /// The snapshot whose refs reach every object.
+        base: SnapshotId,
+    },
 }
 
 /// The git half of a capture.
@@ -1060,12 +1111,12 @@ impl GitCapture<'_> {
         ))
     }
 
-    /// Creates the bundle; an empty one has no file.
-    fn bundle(&self, tips: &[GitOid], chain_full: bool) -> Result<BuiltBundle, CaptureError> {
+    /// Creates the bundle `plan` asks for, or a full one when an incremental one cannot be made; an empty one has no file.
+    fn bundle(&self, plan: &BundlePlan) -> Result<BuiltBundle, CaptureError> {
         let path = TempFile::in_dir(&self.scratch);
         let path_text = path.path().to_string_lossy().into_owned();
-        let incremental = !tips.is_empty() && !chain_full;
-        if incremental {
+        if let BundlePlan::Incremental { base, tips } = plan {
+            let base = *base;
             let mut args = vec!["bundle", "create", &path_text, "--all", "--not"];
             let mut existing = Vec::new();
             for tip in tips {
@@ -1082,11 +1133,11 @@ impl GitCapture<'_> {
                 args.extend(existing);
                 let out = self.git.output(&args, &[])?;
                 if out.status.success() && self.git.succeeds(&["bundle", "verify", &path_text])? {
-                    return Ok(BuiltBundle::Incremental(path));
+                    return Ok(BuiltBundle::Incremental { file: path, base });
                 }
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 if stderr.contains("empty bundle") {
-                    return Ok(BuiltBundle::Empty);
+                    return Ok(BuiltBundle::Empty { base });
                 }
                 tracing::warn!(stderr = %stderr.trim(), "incremental bundle failed; making a full one");
             }
@@ -1097,19 +1148,15 @@ impl GitCapture<'_> {
     }
 
     /// Makes the bundle and returns it with the refs and `HEAD` it is proven to hold.
-    fn bundle_with_refs(
-        &self,
-        tips: &[GitOid],
-        chain_full: bool,
-    ) -> Result<(BuiltBundle, RefView), CaptureError> {
+    fn bundle_with_refs(&self, plan: &BundlePlan) -> Result<(BuiltBundle, RefView), CaptureError> {
         let view = self.ref_view()?;
-        let built = self.bundle(tips, chain_full)?;
+        let built = self.bundle(plan)?;
         if self.ref_view()? != view {
             return Err(CaptureError::RefsMoved {
                 name: "a ref or HEAD".to_owned(),
             });
         }
-        self.confirm_bundle(&built, &view, tips)?;
+        self.confirm_bundle(&built, &view, plan.tips())?;
         Ok((built, view))
     }
 
@@ -1127,7 +1174,7 @@ impl GitCapture<'_> {
         tips: &[GitOid],
     ) -> Result<(), CaptureError> {
         let listed: BTreeMap<String, String> = match built {
-            BuiltBundle::Full(file) | BuiltBundle::Incremental(file) => {
+            BuiltBundle::Full(file) | BuiltBundle::Incremental { file, .. } => {
                 let path = file.path().to_string_lossy().into_owned();
                 let out = self.git.run_text(&["bundle", "list-heads", &path])?;
                 out.lines()
@@ -1135,7 +1182,7 @@ impl GitCapture<'_> {
                     .map(|(oid, name)| (name.to_owned(), oid.to_owned()))
                     .collect()
             }
-            BuiltBundle::Empty => BTreeMap::new(),
+            BuiltBundle::Empty { .. } => BTreeMap::new(),
         };
         let mut wanted: Vec<(String, &GitOid)> = view
             .refs
@@ -1330,7 +1377,7 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
                     job: manifest.job_id,
                 });
             }
-            Some(manifest)
+            Some((parent, manifest))
         }
         None => None,
     };
@@ -1341,7 +1388,10 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
     };
     let (git_state, found) = if let Some(gc) = detect_git(req, store.objects().tmp_dir())? {
         gc.refuse_bad_states()?;
-        let state = capture_git(&mut capturer, &gc, parent_manifest.as_ref())?;
+        let parent = parent_manifest
+            .as_ref()
+            .map(|(id, manifest)| (*id, manifest));
+        let state = capture_git(&mut capturer, &gc, parent)?;
         (Some(state), gc.ignored(&mut capturer.report)?)
     } else {
         let listing = list_tree(req.root)?;
@@ -1452,7 +1502,7 @@ fn chain_depth(store: &Store, manifest: &SnapshotManifest) -> Result<u32, Captur
 fn capture_git(
     capturer: &mut Capturer<'_>,
     gc: &GitCapture<'_>,
-    parent: Option<&SnapshotManifest>,
+    parent: Option<(SnapshotId, &SnapshotManifest)>,
 ) -> Result<GitState, CaptureError> {
     let req = capturer.req;
     let policy = req.policy;
@@ -1513,20 +1563,10 @@ fn capture_git(
     gc.git
         .run(&["update-ref", &snap_ref, worktree_commit.as_str()])?;
 
-    let (tips, chain_full, parent_id): (Vec<GitOid>, bool, Option<SnapshotId>) = match parent {
-        Some(manifest) => match &manifest.git {
-            Some(parent_git) => (
-                parent_git.refs.iter().map(|(_, oid)| oid.clone()).collect(),
-                chain_depth(capturer.store, manifest)? >= MAX_BUNDLE_CHAIN,
-                req.parent,
-            ),
-            None => (Vec::new(), true, None),
-        },
-        None => (Vec::new(), true, None),
-    };
+    let plan = BundlePlan::after(capturer.store, parent)?;
     gc.delete_older_snap_refs(&worktree_commit)?;
-    let (built, view) = gc.bundle_with_refs(&tips, chain_full)?;
-    let (bundle, bundle_base) = capturer.store_bundle(built, parent_id)?;
+    let (built, view) = gc.bundle_with_refs(&plan)?;
+    let (bundle, bundle_base) = capturer.store_bundle(built)?;
     let RefView { refs, head } = view;
     if let Some((_, stash)) = refs.iter().find(|(name, _)| name.as_str() == "refs/stash") {
         capturer.report.stashed_secrets =
@@ -1637,7 +1677,7 @@ mod tests {
         gc.git.run(&["init", "-q", "-b", "main"]).unwrap();
         commit("one");
         let view = gc.ref_view().unwrap();
-        let full = gc.bundle(&[], true).unwrap();
+        let full = gc.bundle(&BundlePlan::Full).unwrap();
         assert!(gc.confirm_bundle(&full, &view, &[]).is_ok());
 
         commit("two");
@@ -1650,8 +1690,12 @@ mod tests {
         let tips: Vec<GitOid> = moved.refs.iter().map(|(_, oid)| oid.clone()).collect();
         commit("three");
         let view = gc.ref_view().unwrap();
-        let incremental = gc.bundle(&tips, false).unwrap();
-        assert!(matches!(incremental, BuiltBundle::Incremental(_)));
+        let plan = BundlePlan::Incremental {
+            base: SnapshotId::of(b"parent"),
+            tips: tips.clone(),
+        };
+        let incremental = gc.bundle(&plan).unwrap();
+        assert!(matches!(incremental, BuiltBundle::Incremental { .. }));
         assert!(gc.confirm_bundle(&incremental, &view, &tips).is_ok());
         gc.git.run(&["checkout", "-q", "-b", "side"]).unwrap();
         commit("four");
