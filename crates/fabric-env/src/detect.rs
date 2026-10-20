@@ -729,6 +729,9 @@ fn merge_declared_caches(
 }
 
 /// Returns the job's secret patterns: every one its previous spec held, plus the override file's, sorted.
+///
+/// Matching ignores ASCII case, so a declared `*.DB` next to a recorded
+/// `*.db` is the same pattern and only the recorded one is kept.
 fn job_secret_patterns(
     previous: Option<&EnvSpec>,
     declared: &[SecretPattern],
@@ -741,10 +744,16 @@ fn job_secret_patterns(
             "secret patterns this job recorded are missing from {OVERRIDE_FILE}; they stay in force"
         );
     }
-    let mut secret_patterns: Vec<SecretPattern> =
-        recorded.iter().chain(declared).cloned().collect();
+    let mut secret_patterns: Vec<SecretPattern> = Vec::new();
+    for pattern in recorded.iter().chain(declared) {
+        if !secret_patterns
+            .iter()
+            .any(|kept| kept.as_str().eq_ignore_ascii_case(pattern.as_str()))
+        {
+            secret_patterns.push(pattern.clone());
+        }
+    }
     secret_patterns.sort();
-    secret_patterns.dedup();
     secret_patterns
 }
 
@@ -1259,6 +1268,23 @@ impl Reader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One pattern in two cases is one pattern to the matcher, so the spec holds it once.
+    #[test]
+    fn a_pattern_recorded_and_declared_in_another_case_is_kept_once() {
+        let pattern = |text| SecretPattern::parse(text).unwrap();
+        let previous = EnvSpec {
+            tools: Vec::new(),
+            setup: Vec::new(),
+            env_var_names: Vec::new(),
+            cache_paths: Vec::new(),
+            secret_patterns: vec![pattern("*.db")],
+        };
+        assert_eq!(
+            job_secret_patterns(Some(&previous), &[pattern("*.DB"), pattern("*.sqlite")]),
+            [pattern("*.db"), pattern("*.sqlite")]
+        );
+    }
 
     /// Detection never opens a denied file; for the built-in list that holds
     /// because no file it reads matches a built-in pattern, and a job
