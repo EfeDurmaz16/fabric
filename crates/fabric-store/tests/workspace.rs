@@ -16,7 +16,8 @@ use fabric_core::snapshot::{
     CacheClass, CacheEntry, CarryKey, CarryState, Entry, EntryKind, GitHead, Mode,
 };
 use fabric_store::capture::{
-    BundleKind, BusyReason, CaptureError, CaptureRequest, Captured, UnmeasuredKeys, capture,
+    BundleKind, BusyReason, CaptureError, CaptureRequest, Captured, MAX_BUNDLE_CHAIN,
+    UnmeasuredKeys, capture,
 };
 use fabric_store::git::Git;
 use fabric_store::objects::ChunkParams;
@@ -679,6 +680,52 @@ fn busy_repositories_and_linked_worktrees_are_refused() {
         "{err}"
     );
 
+    let rebase = git(&root).git_path("rebase-merge").unwrap();
+    fs::create_dir(&rebase).unwrap();
+    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            CaptureError::GitBusy {
+                reason: BusyReason::Rebase
+            }
+        ),
+        "{err}"
+    );
+    fs::remove_dir(&rebase).unwrap();
+
+    let lock = git(&root).git_path("index.lock").unwrap();
+    fs::write(&lock, "").unwrap();
+    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            CaptureError::GitBusy {
+                reason: BusyReason::IndexLocked
+            }
+        ),
+        "{err}"
+    );
+    fs::remove_file(&lock).unwrap();
+
+    // A stash applied over a conflicting commit leaves unmerged entries and no MERGE_HEAD.
+    let g = git(&root);
+    g.run(&["stash", "push", "-q"]).unwrap();
+    fs::write(root.join("a"), "a committed\n").unwrap();
+    g.run(&["commit", "-q", "-am", "conflicting"]).unwrap();
+    assert!(!g.succeeds(&["stash", "apply", "-q"]).unwrap());
+    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            CaptureError::GitBusy {
+                reason: BusyReason::Conflicts
+            }
+        ),
+        "{err}"
+    );
+    g.run(&["reset", "-q", "--hard"]).unwrap();
+
     // An LFS filter set only in .git/info/attributes, on an untracked file.
     let info = git(&root).git_path("info/attributes").unwrap();
     fs::write(&info, "*.bin filter=lfs\n").unwrap();
@@ -1004,6 +1051,133 @@ fn a_submodule_with_local_changes_is_refused_by_its_whole_path() {
     let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
     assert!(
         matches!(&err, CaptureError::GitSubmoduleDirty { path } if path == "my lib"),
+        "{err}"
+    );
+}
+
+/// Commits one small change and captures it after `parent`.
+fn commit_and_capture(
+    store: &mut Store,
+    root: &Path,
+    step: u32,
+    parent: Option<SnapshotId>,
+) -> Fallible<(SnapshotId, Captured)> {
+    fs::write(root.join("step"), format!("{step}\n"))?;
+    let g = git(root);
+    g.run(&["add", "step"])?;
+    g.run(&["commit", "-q", "-m", &format!("step {step}")])?;
+    let policy = IgnorePolicy::default();
+    let captured = capture(store, &request(root, &policy, parent))?;
+    let id = store.publish(&captured.manifest)?;
+    Ok((id, captured))
+}
+
+fn one_commit_repo(root: &Path) -> Fallible {
+    fs::create_dir(root)?;
+    fs::write(root.join("a"), "a\n")?;
+    let g = git(root);
+    g.run(&["init", "-q", "-b", "main"])?;
+    g.run(&["add", "-A"])?;
+    g.run(&["commit", "-q", "-m", "one"])?;
+    Ok(())
+}
+
+#[test]
+fn the_bundle_after_the_longest_allowed_chain_is_full() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let mut parent = None;
+    for step in 0..=MAX_BUNDLE_CHAIN + 1 {
+        let (id, captured) = commit_and_capture(&mut store, &root, step, parent).unwrap();
+        let state = captured.manifest.git.as_ref().unwrap();
+        let expected = if step == 0 || step == MAX_BUNDLE_CHAIN + 1 {
+            BundleKind::Full
+        } else {
+            BundleKind::Incremental
+        };
+        assert_eq!(captured.report.bundle, Some(expected), "step {step}");
+        assert_eq!(
+            state.bundle_base.is_none(),
+            expected == BundleKind::Full,
+            "step {step}"
+        );
+        parent = Some(id);
+    }
+}
+
+#[test]
+fn a_parent_tip_gone_from_the_repository_makes_a_full_bundle() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let (first, _) = commit_and_capture(&mut store, &root, 0, None).unwrap();
+
+    // Rewrite history so that no ref reaches the parent's tips, then prune them.
+    let g = git(&root);
+    g.run(&["checkout", "-q", "--orphan", "fresh"]).unwrap();
+    g.run(&["commit", "-q", "-m", "rewritten"]).unwrap();
+    g.run(&["branch", "-q", "-D", "main"]).unwrap();
+    g.run(&["branch", "-q", "-m", "main"]).unwrap();
+    let snap_refs = g
+        .run_text(&["for-each-ref", "--format=%(refname)", "refs/fabric/"])
+        .unwrap();
+    for name in snap_refs.lines() {
+        g.run(&["update-ref", "-d", name]).unwrap();
+    }
+    g.run(&["reflog", "expire", "--expire=now", "--all"])
+        .unwrap();
+    g.run(&["gc", "-q", "--prune=now"]).unwrap();
+
+    let (second, captured) = commit_and_capture(&mut store, &root, 1, Some(first)).unwrap();
+    assert_eq!(captured.report.bundle, Some(BundleKind::Full));
+    assert_eq!(captured.manifest.git.as_ref().unwrap().bundle_base, None);
+    let target = dir.path().join("restored");
+    let report = restore_into(&store, second, &target).unwrap();
+    assert_eq!(report.bundles_fetched, 1);
+    assert_eq!(git_difference(&root, &target).unwrap(), None);
+}
+
+#[test]
+fn a_parent_from_another_job_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let (first, _) = commit_and_capture(&mut store, &root, 0, None).unwrap();
+    let policy = IgnorePolicy::default();
+    let mut other = request(&root, &policy, Some(first));
+    other.job_id = JobId::from_bytes([6; 16]);
+    let err = capture(&store, &other).unwrap_err();
+    assert!(
+        matches!(err, CaptureError::ParentJobMismatch { parent, job } if parent == first && job == JOB),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_restore_whose_bundle_base_is_gone_names_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let (first, _) = commit_and_capture(&mut store, &root, 0, None).unwrap();
+    let (second, _) = commit_and_capture(&mut store, &root, 1, Some(first)).unwrap();
+    drop(store);
+
+    let conn = rusqlite::Connection::open(dir.path().join("store/catalog.sqlite")).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    conn.execute("DELETE FROM snapshots WHERE id = ?1", [first.to_bytes()])
+        .unwrap();
+    drop(conn);
+
+    let store = Store::open(&dir.path().join("store")).unwrap();
+    let err = restore_into(&store, second, &dir.path().join("restored")).unwrap_err();
+    assert!(
+        matches!(err, RestoreError::BundleChainBroken { snapshot, base }
+            if snapshot == second && base == first),
         "{err}"
     );
 }
