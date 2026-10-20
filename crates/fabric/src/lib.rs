@@ -29,7 +29,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use fabric_core::env::{EnvVarName, SetupArg};
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{JobId, NodeId};
-use fabric_env::materialize::{NodeEnv, TreeLock};
+use fabric_env::materialize::{CacheHealth, NodeEnv, TreeLock};
 use fabric_harness::claude::{ClaudeCode, LeftReason, TrustOutcome};
 use fabric_harness::codex::Codex;
 use fabric_harness::{Harness, Launch, Running};
@@ -608,7 +608,12 @@ fn materialize(state: &StateDir, root: &Path) -> Result<TreeLock> {
     }
     let mut stdout = std::io::stdout().lock();
     for cache in plan.caches() {
-        writeln!(stdout, "cache {}: {:?}", cache.path, cache.health)?;
+        writeln!(
+            stdout,
+            "cache {}: {}",
+            cache.path,
+            health_words(&cache.health)
+        )?;
     }
     for step in plan.steps() {
         let step = step.step();
@@ -618,6 +623,17 @@ fn materialize(state: &StateDir, root: &Path) -> Result<TreeLock> {
     drop(stdout);
     plan.ready()?.execute(&lock)?;
     Ok(lock)
+}
+
+/// A cache's state before the setup steps run, in words.
+fn health_words(health: &CacheHealth) -> &'static str {
+    match health {
+        CacheHealth::Healthy => "present and complete",
+        CacheHealth::Missing => "missing",
+        CacheHealth::NotADirectory => "not a directory",
+        CacheHealth::Empty => "empty",
+        CacheHealth::Incomplete => "left unfinished by an earlier install",
+    }
 }
 
 /// Says where Claude's trust in `root` came from: nothing when its key

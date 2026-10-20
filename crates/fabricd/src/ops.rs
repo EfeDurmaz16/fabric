@@ -295,7 +295,8 @@ impl Node {
             repo.display()
         ));
         out.say(format!(
-            "harness {harness}; this node owns the job at epoch 1"
+            "harness {harness}; this node owns the job at epoch {}",
+            Epoch::FIRST
         ));
         Ok(())
     }
@@ -1020,11 +1021,14 @@ impl Node {
                             session.offer(epoch, offer, MOVE_DEADLINE).await
                         })
                         .await;
-                    if let Ok(Fenced::Answer(Offered::Decided { record })) = answer {
-                        self.apply_decision(id, to, record.as_bytes(), out).await?;
-                        return Ok(());
-                    }
-                    last_error = format!("{to} has not decided: {answer:?}");
+                    last_error = match answer {
+                        Ok(Fenced::Answer(Offered::Decided { record })) => {
+                            self.apply_decision(id, to, record.as_bytes(), out).await?;
+                            return Ok(());
+                        }
+                        Ok(answer) => format!("{to} has not decided: {}", offered_words(&answer)),
+                        Err(e) => format!("{to} has not decided: {e}"),
+                    };
                 }
                 Ok(Asked::Offer(Fenced::Answer(
                     Offered::SnapshotIncomplete { .. } | Offered::Rejected { .. },
@@ -1283,11 +1287,20 @@ impl Node {
                 session.move_request(token, MOVE_DEADLINE).await
             })
             .await?;
-        let Fenced::Answer(MoveRequested::Started { move_id }) = answer else {
-            return Err(NodeError::Peer {
-                peer: holder,
-                reason: format!("it did not start a move: {answer:?}"),
-            });
+        let move_id = match answer {
+            Fenced::Answer(MoveRequested::Started { move_id }) => move_id,
+            Fenced::Answer(MoveRequested::Rejected { head }) => {
+                return Err(NodeError::Peer {
+                    peer: holder,
+                    reason: format!("it did not start a move; its head is {head}"),
+                });
+            }
+            fenced => {
+                return Err(NodeError::Peer {
+                    peer: holder,
+                    reason: format!("it did not start a move: {}", fenced_words(&fenced)),
+                });
+            }
         };
         out.say(format!("{holder} started move {move_id} toward this node"));
         self.pull_records(id, holder).await?;
@@ -1317,10 +1330,26 @@ impl Node {
             match answer {
                 OfferAnswer::Import(record) => job.commit(record, Author::Node(self.id))?,
                 OfferAnswer::Decided(_) => {}
-                other => {
+                OfferAnswer::Rejected { head } => {
                     return Err(NodeError::Peer {
                         peer: holder,
-                        reason: format!("the move does not link here: {other:?}"),
+                        reason: format!(
+                            "its move does not link to this node's head {head}; run the resume again"
+                        ),
+                    });
+                }
+                OfferAnswer::SnapshotIncomplete { snapshot } => {
+                    return Err(NodeError::Peer {
+                        peer: holder,
+                        reason: format!(
+                            "snapshot {snapshot} did not arrive whole; run the resume again"
+                        ),
+                    });
+                }
+                OfferAnswer::Stale { current, .. } => {
+                    return Err(NodeError::Peer {
+                        peer: holder,
+                        reason: format!("the move is at an epoch behind {current}"),
                     });
                 }
             }
@@ -1373,10 +1402,10 @@ impl Node {
                     }
                     return Err(Box::pin(self.forked_from(id, holder, head)).await);
                 }
-                other => {
+                fenced => {
                     return Err(NodeError::Peer {
                         peer: holder,
-                        reason: format!("unexpected answer to a pull: {other:?}"),
+                        reason: format!("it did not answer the pull: {}", fenced_words(&fenced)),
                     });
                 }
             };
@@ -1593,8 +1622,9 @@ impl Node {
                 clock::now_ms(),
             )?;
             let warning = format!(
-                "{}; the owner's last record is from {} ms since 1970",
-                proposal.warning, proposal.warning.last_record_at
+                "{}; the owner's last record is {}",
+                proposal.warning,
+                age(clock::now_ms().saturating_sub(proposal.warning.last_record_at))
             );
             if !force {
                 return Err(NodeError::StealNeedsForce(format!(
@@ -1842,6 +1872,44 @@ async fn synced_folders(home: &Path, path_var: &OsString) -> SyncedFolders {
     SyncedFolders { desktop, documents }
 }
 
+/// A fenced answer that is not an answer, in words.
+fn fenced_words<T>(answer: &Fenced<T>) -> String {
+    match answer {
+        Fenced::Answer(_) => "it answered".to_owned(),
+        Fenced::StaleEpoch { current, .. } => {
+            format!("it knows epoch {current}, newer than this node's")
+        }
+        Fenced::AheadOfUs { current, .. } => {
+            format!("it is at epoch {current}, behind this node's, and must catch up first")
+        }
+    }
+}
+
+/// A target's answer to an offer that is not a decision, in words.
+fn offered_words(answer: &Fenced<Offered>) -> String {
+    match answer {
+        Fenced::Answer(Offered::Decided { .. }) => "it decided".to_owned(),
+        Fenced::Answer(Offered::Rejected { head }) => {
+            format!("the offer does not link to its head {head}")
+        }
+        Fenced::Answer(Offered::SnapshotIncomplete { snapshot }) => {
+            format!("it does not hold snapshot {snapshot} whole")
+        }
+        fenced => fenced_words(fenced),
+    }
+}
+
+/// How long ago something happened, `ms` milliseconds back, in the largest whole unit.
+fn age(ms: u64) -> String {
+    let minutes = ms / 60_000;
+    match minutes {
+        0 => "less than a minute old".to_owned(),
+        1..60 => format!("{minutes} min old"),
+        60..2880 => format!("{} h old", minutes / 60),
+        _ => format!("{} days old", minutes / 1440),
+    }
+}
+
 fn view_word(view: &LeaseView) -> &'static str {
     match view {
         LeaseView::Owner(_) => "owner",
@@ -1973,6 +2041,14 @@ mod tests {
             &mut Out::default(),
         )
         .await
+    }
+
+    #[test]
+    fn an_age_reads_in_the_largest_whole_unit() {
+        assert_eq!(age(59_000), "less than a minute old");
+        assert_eq!(age(3 * 60_000), "3 min old");
+        assert_eq!(age(3 * 3_600_000), "3 h old");
+        assert_eq!(age(3 * 86_400_000), "3 days old");
     }
 
     #[tokio::test]
