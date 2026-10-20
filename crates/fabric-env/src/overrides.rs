@@ -18,9 +18,12 @@
 //! [tools]                          # a declared pin replaces a detected one;
 //! node = "22"                      # nodejs reads as node and golang as go, as in .tool-versions
 //!
-//! [[cache]]                        # added to the detected cache paths; when one
-//! path = ".output"                 # is missing on resume the setup steps run, so
-//! class = "build"                  # name what they rebuild; deps, build or tool-cache
+//! [[cache]]                        # added to the detected cache paths; when one is
+//! path = ".output"                 # missing on resume, declared [[setup]] steps run,
+//! class = "build"                  # as does a detected step with no cache of its own
+//!                                  # (go mod download); a detected install does not,
+//!                                  # so declare the step that builds it;
+//!                                  # class is deps, build or tool-cache
 //! ecosystem = "node"               # optional: node, rust, python or other; picks the
 //!                                  # carry key; the single detected ecosystem when absent
 //!                                  # with no cache path at all the steps run every resume
