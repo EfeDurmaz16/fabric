@@ -239,12 +239,29 @@ fn path_var() -> OsString {
     std::env::var_os("PATH").unwrap_or_default()
 }
 
-fn print_lines(lines: &[String]) -> Result<()> {
-    let mut stdout = std::io::stdout().lock();
-    for line in lines {
-        writeln!(stdout, "{line}")?;
+/// Where `fabric` prints its own lines: standard output, or standard
+/// error for a headless run, whose standard output carries only the
+/// harness's answer and the line naming the session, for a script to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Notes {
+    Stdout,
+    Stderr,
+}
+
+impl Notes {
+    fn print<T: fmt::Display>(self, lines: &[T]) -> Result<()> {
+        match self {
+            Notes::Stdout => {
+                let mut out = std::io::stdout().lock();
+                lines.iter().try_for_each(|line| writeln!(out, "{line}"))?;
+            }
+            Notes::Stderr => {
+                let mut out = std::io::stderr().lock();
+                lines.iter().try_for_each(|line| writeln!(out, "{line}"))?;
+            }
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// A refusal the daemon answered, kept typed so `main` can pick the exit code.
@@ -274,14 +291,14 @@ fn exit_code(error: &anyhow::Error) -> ExitCode {
 }
 
 /// Sends a request and prints what the daemon printed; a refusal becomes an error.
-async fn ask(socket: &Path, request: Request) -> Result<Option<RunPlan>> {
+async fn ask(socket: &Path, request: Request, notes: Notes) -> Result<Option<RunPlan>> {
     match control::call(socket, &request).await? {
         Response::Done { lines } => {
-            print_lines(&lines)?;
+            notes.print(&lines)?;
             Ok(None)
         }
         Response::Run { lines, plan } => {
-            print_lines(&lines)?;
+            notes.print(&lines)?;
             Ok(Some(plan))
         }
         Response::Failed {
@@ -289,7 +306,7 @@ async fn ask(socket: &Path, request: Request) -> Result<Option<RunPlan>> {
             error,
             refusal,
         } => {
-            print_lines(&lines)?;
+            notes.print(&lines)?;
             Err(Refused {
                 refusal,
                 message: error,
@@ -345,7 +362,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 NodeCommand::Ls => Request::NodeList,
                 NodeCommand::Ping { node } => Request::NodePing { node },
             };
-            ask(&socket, request).await?;
+            ask(&socket, request, Notes::Stdout).await?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Doctor { peer, job } => {
@@ -356,6 +373,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     job,
                     path_var: path_var(),
                 },
+                Notes::Stdout,
             )
             .await?;
             Ok(ExitCode::SUCCESS)
@@ -474,7 +492,7 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
             Mode::Interactive(None),
         ),
     };
-    let Some(plan) = ask(&socket, request).await? else {
+    let Some(plan) = ask(&socket, request, mode.notes()).await? else {
         return Ok(ExitCode::SUCCESS);
     };
     launch(state, home, &plan, mode).await
@@ -497,33 +515,53 @@ impl Mode {
             (true, None) => bail!("--headless needs --prompt"),
         }
     }
+
+    /// Where `fabric`'s own lines go in this mode.
+    fn notes(&self) -> Notes {
+        match self {
+            Mode::Interactive(_) => Notes::Stdout,
+            Mode::Headless(_) => Notes::Stderr,
+        }
+    }
 }
 
 /// How long the output of a headless harness that exited is still read,
-/// for a process it started that holds its standard output open.
+/// in all, for a process it started that holds its standard output open.
 const DRAIN: Duration = Duration::from_secs(2);
+
+/// Reads one line a headless harness printed into a report; true when it named a new session.
+type ReadLine = fn(&mut TurnReport, &str) -> bool;
 
 /// Runs the plan's setup steps, launches the harness, registers it, and waits for it.
 async fn launch(state: &StateDir, home: &Path, plan: &RunPlan, mode: Mode) -> Result<ExitCode> {
-    let tree = materialize(state, &plan.root)?;
+    let notes = mode.notes();
+    let read_line: Option<ReadLine> = match (&mode, &plan.harness) {
+        (Mode::Headless(_), HarnessKind::ClaudeCode) => Some(ClaudeCode::read_headless_line),
+        (Mode::Headless(_), HarnessKind::Codex) => Some(Codex::read_headless_line),
+        // The protocol client holds an ACP agent's output.
+        _ => None,
+    };
+    // Caught before the harness starts, so none is lost in between.
+    let forward = read_line.map(|_| Forward::new()).transpose()?;
+    let tree = materialize(state, &plan.root, notes)?;
     let socket = state.socket();
     let headless = matches!(mode, Mode::Headless(_));
-    let mut running = start(state, home, plan, mode).await?;
+    let mut running = start(state, home, plan, mode, notes).await?;
     let pid = running.pid();
-    let registered = register(&socket, plan, &running).await;
+    let registered = register(&socket, plan, &running, notes).await;
     drop(tree);
     if let Err(e) = registered {
         kill_group(&running);
         return Err(e);
     }
-    let read_line: Option<fn(&mut TurnReport, &str) -> bool> = match plan.harness {
-        HarnessKind::ClaudeCode => Some(ClaudeCode::read_headless_line),
-        HarnessKind::Codex => Some(Codex::read_headless_line),
-        // The protocol client holds an ACP agent's output.
-        HarnessKind::Acp { .. } => None,
-    };
-    if let (true, Some(read_line)) = (headless, read_line) {
-        let (report, status) = headless_turn(&socket, plan, &mut running, read_line).await?;
+    if let (Some(read_line), Some(forward)) = (read_line, forward) {
+        let turn = Turn {
+            socket: &socket,
+            plan,
+            notes,
+            read_line,
+        };
+        let (report, status) = turn.run(&mut running, forward).await?;
         print_turn(plan, &report)?;
         return exited(&socket, plan, pid, status).await;
     }
@@ -553,7 +591,13 @@ async fn launch(state: &StateDir, home: &Path, plan: &RunPlan, mode: Mode) -> Re
 
 /// Launches the plan's harness in `mode`; held when it is interactive and
 /// standard input is a terminal.
-async fn start(state: &StateDir, home: &Path, plan: &RunPlan, mode: Mode) -> Result<Running> {
+async fn start(
+    state: &StateDir,
+    home: &Path,
+    plan: &RunPlan,
+    mode: Mode,
+    notes: Notes,
+) -> Result<Running> {
     let env = environment();
     let resume = plan.session.clone();
     let harness_env = HarnessEnv::new(
@@ -572,7 +616,7 @@ async fn start(state: &StateDir, home: &Path, plan: &RunPlan, mode: Mode) -> Res
         HarnessKind::ClaudeCode => {
             let claude = ClaudeCode::new(harness_env.home.clone(), harness_env.path_var.clone());
             let trust = claude.preseed_trust(&plan.root, &env).await?;
-            report_trust(&plan.root, &trust)?;
+            report_trust(&plan.root, &trust, notes)?;
             claude.launch(&plan.root, launch, &env).await?
         }
         HarnessKind::Codex => {
@@ -593,7 +637,7 @@ async fn start(state: &StateDir, home: &Path, plan: &RunPlan, mode: Mode) -> Res
 /// Tells the node the harness started, so it records it and appends
 /// `Resumed`, and prints what it answered. The caller kills the harness's
 /// group on an error.
-async fn register(socket: &Path, plan: &RunPlan, running: &Running) -> Result<()> {
+async fn register(socket: &Path, plan: &RunPlan, running: &Running, notes: Notes) -> Result<()> {
     let registered = control::call(
         socket,
         &Request::HarnessStarted {
@@ -606,13 +650,13 @@ async fn register(socket: &Path, plan: &RunPlan, running: &Running) -> Result<()
     )
     .await;
     match registered {
-        Ok(Response::Done { lines }) => print_lines(&lines),
+        Ok(Response::Done { lines }) => notes.print(&lines),
         Ok(Response::Failed {
             lines,
             error,
             refusal,
         }) => {
-            print_lines(&lines)?;
+            notes.print(&lines)?;
             Err(Refused {
                 refusal,
                 message: format!(
@@ -626,98 +670,181 @@ async fn register(socket: &Path, plan: &RunPlan, running: &Running) -> Result<()
     }
 }
 
-/// Reads a headless turn to its end: the harness's standard error goes to
-/// this command's, its standard output is read line by line into a
-/// report, and a session it names that the node does not hold yet is
-/// recorded at once, so a suspend during the turn captures it.
-async fn headless_turn(
-    socket: &Path,
-    plan: &RunPlan,
-    running: &mut Running,
-    read_line: fn(&mut TurnReport, &str) -> bool,
-) -> Result<(TurnReport, std::process::ExitStatus)> {
-    let pid = running.pid();
-    let child = running.child_mut();
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("the headless harness has no standard output"))?;
-    if let Some(mut stderr) = child.stderr.take() {
-        tokio::spawn(async move {
-            let _ = tokio::io::copy(&mut stderr, &mut tokio::io::stderr()).await;
-        });
-    }
-    let mut report = TurnReport {
-        session: running.session().cloned(),
-        ..TurnReport::default()
-    };
-    let mut lines = BufReader::new(stdout).lines();
-    let mut status = None;
-    loop {
-        let line = if status.is_some() {
-            match tokio::time::timeout(DRAIN, lines.next_line()).await {
-                Ok(line) => line?,
-                Err(_) => break,
-            }
-        } else {
-            tokio::select! {
-                line = lines.next_line() => line?,
-                exit = running.child_mut().wait() => {
-                    status = Some(exit?);
-                    continue;
-                }
-            }
-        };
-        let Some(line) = line else {
-            break;
-        };
-        if read_line(&mut report, &line)
-            && let Some(session) = report.session.clone()
-        {
-            record_session(socket, plan, pid, session).await?;
-        }
-    }
-    let status = match status {
-        Some(status) => status,
-        None => running.child_mut().wait().await?,
-    };
-    Ok((report, status))
+/// The signals a headless run passes on to its harness, which runs in a
+/// process group of its own and would not get them: Ctrl-C, the hang-up
+/// of a closed terminal or SSH session, and a termination of `fabric`.
+/// Without this, `fabric` would die of them and leave the turn running
+/// with nobody to read its answer or record its end.
+struct Forward {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
 }
 
-/// Asks the node to record `session` for the harness `pid`; a refusal is a
-/// warning, because the turn runs on either way.
-async fn record_session(
-    socket: &Path,
-    plan: &RunPlan,
+impl Forward {
+    fn new() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+            hangup: signal(SignalKind::hangup())?,
+        })
+    }
+
+    /// Waits for the next of them and returns it, to send on.
+    async fn next(&mut self) -> rustix::process::Signal {
+        use rustix::process::Signal;
+        tokio::select! {
+            _ = self.interrupt.recv() => Signal::INT,
+            _ = self.terminate.recv() => Signal::TERM,
+            _ = self.hangup.recv() => Signal::HUP,
+        }
+    }
+}
+
+/// A headless turn being read: where to tell the node about a session,
+/// and how to read the harness's output.
+struct Turn<'a> {
+    socket: &'a Path,
+    plan: &'a RunPlan,
+    notes: Notes,
+    read_line: ReadLine,
+}
+
+impl Turn<'_> {
+    /// Reads the turn to its end. The harness's standard error goes to this
+    /// command's; its standard output is read line by line into a report.
+    /// A session it names that the node does not hold yet goes to a
+    /// recorder task at once, so a suspend during the turn captures it,
+    /// while this loop keeps reaping the harness, which a suspend waits
+    /// for. A signal `fabric` gets is passed on to the harness's group.
+    async fn run(
+        &self,
+        running: &mut Running,
+        mut forward: Forward,
+    ) -> Result<(TurnReport, std::process::ExitStatus)> {
+        let pid = running.pid();
+        let child = running.child_mut();
+        let Some(stdout) = child.stdout.take() else {
+            kill_group(running);
+            bail!("the headless harness has no standard output, so it was stopped");
+        };
+        if let Some(mut stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut stderr, &mut tokio::io::stderr()).await;
+            });
+        }
+        let (sessions, named) = tokio::sync::mpsc::unbounded_channel();
+        let recorder = tokio::spawn(record_sessions(
+            self.socket.to_path_buf(),
+            self.plan.clone(),
+            pid,
+            named,
+            self.notes,
+        ));
+        let mut report = TurnReport {
+            session: running.session().cloned(),
+            ..TurnReport::default()
+        };
+        let mut lines = BufReader::new(stdout).split(b'\n');
+        let mut status = None;
+        let mut drained_by = None;
+        loop {
+            let read = if let Some(deadline) = drained_by {
+                match tokio::time::timeout_at(deadline, lines.next_segment()).await {
+                    Ok(read) => read,
+                    Err(_) => break,
+                }
+            } else {
+                tokio::select! {
+                    read = lines.next_segment() => read,
+                    exit = running.child_mut().wait() => {
+                        status = Some(exit?);
+                        drained_by = Some(tokio::time::Instant::now() + DRAIN);
+                        continue;
+                    }
+                    signal = forward.next() => {
+                        send_to_group(pid, signal);
+                        continue;
+                    }
+                }
+            };
+            let line = match read {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!(error = %e, "the harness's output could not be read to its end");
+                    break;
+                }
+            };
+            if (self.read_line)(&mut report, &String::from_utf8_lossy(&line))
+                && let Some(session) = report.session.clone()
+            {
+                // The receiver lives until this loop ends.
+                let _ = sessions.send(session);
+            }
+        }
+        drop(sessions);
+        let status = match status {
+            Some(status) => status,
+            None => running.child_mut().wait().await?,
+        };
+        if let Err(e) = recorder.await {
+            tracing::warn!(error = %e, "the session recorder ended early");
+        }
+        Ok((report, status))
+    }
+}
+
+/// Sends `signal` to the process group `pgid`, which is gone if it has exited.
+fn send_to_group(pgid: std::num::NonZeroU32, signal: rustix::process::Signal) {
+    let group = i32::try_from(pgid.get())
+        .ok()
+        .and_then(rustix::process::Pid::from_raw);
+    if let Some(group) = group
+        && let Err(e) = rustix::process::kill_process_group(group, signal)
+        && e != rustix::io::Errno::SRCH
+    {
+        tracing::warn!(error = %e, ?signal, "the signal could not be passed on to the harness");
+    }
+}
+
+/// Asks the node to record each session the harness names, in order, for
+/// the harness `pid`. A refusal is a warning, because the turn runs on.
+async fn record_sessions(
+    socket: PathBuf,
+    plan: RunPlan,
     pid: std::num::NonZeroU32,
-    session: SessionId,
-) -> Result<()> {
-    let request = Request::HarnessSession(NamedSession {
-        job: plan.job,
-        epoch: plan.epoch,
-        pid,
-        harness: plan.harness.clone(),
-        session: session.clone(),
-    });
-    let missed = match control::call(socket, &request).await {
-        Ok(Response::Done { lines }) => {
-            print_lines(&lines)?;
-            return Ok(());
-        }
-        Ok(Response::Failed { lines, error, .. }) => {
-            print_lines(&lines)?;
-            error
-        }
-        Ok(Response::Run { .. }) => "it answered with a run plan".to_owned(),
-        Err(e) => e.to_string(),
-    };
-    writeln!(
-        std::io::stderr(),
-        "warning: the node did not record {} session {session} ({missed}); a suspend of job {} does not carry it",
-        plan.harness,
-        plan.job
-    )?;
-    Ok(())
+    mut named: tokio::sync::mpsc::UnboundedReceiver<SessionId>,
+    notes: Notes,
+) {
+    while let Some(session) = named.recv().await {
+        let request = Request::HarnessSession(NamedSession {
+            job: plan.job,
+            epoch: plan.epoch,
+            pid,
+            harness: plan.harness.clone(),
+            session: session.clone(),
+        });
+        let missed = match control::call(&socket, &request).await {
+            Ok(Response::Done { lines }) => {
+                let _ = notes.print(&lines);
+                continue;
+            }
+            Ok(Response::Failed { lines, error, .. }) => {
+                let _ = notes.print(&lines);
+                error
+            }
+            Ok(Response::Run { .. }) => "it answered with a run plan".to_owned(),
+            Err(e) => e.to_string(),
+        };
+        let _ = writeln!(
+            std::io::stderr(),
+            "warning: the node did not record {} session {session} ({missed}); a suspend of job {} does not carry it",
+            plan.harness,
+            plan.job
+        );
+    }
 }
 
 /// Prints what a headless turn reported: the answer on standard output,
@@ -793,7 +920,7 @@ async fn exited(
 /// registration, so a second `run` or `resume` of the same workspace
 /// refuses with the lock's path from the setup steps until the first
 /// harness is recorded, and the node's own check refuses it after that.
-fn materialize(state: &StateDir, root: &Path) -> Result<TreeLock> {
+fn materialize(state: &StateDir, root: &Path, notes: Notes) -> Result<TreeLock> {
     let lock = TreeLock::acquire(&state.tree_locks(), root).map_err(|e| match e {
         // Another run or resume of this workspace is starting its harness:
         // the same state as a harness that runs, so the same exit code.
@@ -808,21 +935,20 @@ fn materialize(state: &StateDir, root: &Path) -> Result<TreeLock> {
     if plan.is_noop() {
         return Ok(lock);
     }
-    let mut stdout = std::io::stdout().lock();
+    let mut lines = Vec::new();
     for cache in plan.caches() {
-        writeln!(
-            stdout,
+        lines.push(format!(
             "cache {}: {}",
             cache.path,
             health_words(&cache.health)
-        )?;
+        ));
     }
     for step in plan.steps() {
         let step = step.step();
         let args: Vec<&str> = step.args.iter().map(SetupArg::as_str).collect();
-        writeln!(stdout, "setup: {} {}", step.program, args.join(" "))?;
+        lines.push(format!("setup: {} {}", step.program, args.join(" ")));
     }
-    drop(stdout);
+    notes.print(&lines)?;
     plan.ready()?.execute(&lock)?;
     Ok(lock)
 }
@@ -842,11 +968,11 @@ fn health_words(health: &CacheHealth) -> &'static str {
 /// was already set, the key when Fabric wrote it, and a one-line warning
 /// when Fabric left it alone, because then Claude either asks in its own
 /// dialog or skips it and ignores the workspace's project settings.
-fn report_trust(root: &Path, outcome: &TrustOutcome) -> Result<()> {
+fn report_trust(root: &Path, outcome: &TrustOutcome, notes: Notes) -> Result<()> {
     match outcome {
         TrustOutcome::AlreadyTrusted { .. } => {}
         TrustOutcome::Written { key } => {
-            writeln!(std::io::stdout(), "trusted {}", key.display())?;
+            notes.print(&[format!("trusted {}", key.display())])?;
         }
         TrustOutcome::Inherited { by, reason } => writeln!(
             std::io::stderr(),
