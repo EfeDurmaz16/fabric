@@ -29,12 +29,31 @@ pub const EPHEMERAL_TRIES: usize = 8;
 
 /// A connection and, when QUIC was not used, why.
 ///
-/// `connection.kind()` says which wire served the dial.
+/// Only `Endpoint::dial` builds one, so `quic_failure` is set exactly when
+/// `connection().kind()` is TCP with TLS.
 pub struct Dialed {
+    connection: Box<dyn Connection>,
+    quic_failure: Option<TransportError>,
+}
+
+impl Dialed {
     /// The connection.
-    pub connection: Box<dyn Connection>,
+    #[must_use]
+    pub fn connection(&self) -> &dyn Connection {
+        self.connection.as_ref()
+    }
+
+    /// Hands over the connection.
+    #[must_use]
+    pub fn into_connection(self) -> Box<dyn Connection> {
+        self.connection
+    }
+
     /// How QUIC failed before the dial fell back to TCP with TLS; `None` when QUIC served it.
-    pub quic_failure: Option<TransportError>,
+    #[must_use]
+    pub fn quic_failure(&self) -> Option<&TransportError> {
+        self.quic_failure.as_ref()
+    }
 }
 
 /// The transports of one node bound to one port.

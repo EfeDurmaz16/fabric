@@ -840,7 +840,7 @@ async fn another_node_at_a_stale_address_does_not_end_the_dial() -> TestResult {
             &[stale.local_addr()?.into(), current.local_addr()?.into()],
         )
         .await?;
-    assert_eq!(dialed.connection.peer(), b.id());
+    assert_eq!(dialed.connection().peer(), b.id());
     assert_eq!(accepting.await??.peer(), a.id());
     Ok(())
 }
@@ -860,8 +860,8 @@ async fn quic_is_dialed_first_and_tcp_is_the_fallback() -> TestResult {
         tokio::spawn(async move { server.accept().await })
     };
     let dialed = client.dial(b.id(), server.local_addr()?).await?;
-    assert_eq!(dialed.connection.kind(), TransportKind::Quic);
-    assert!(dialed.quic_failure.is_none());
+    assert_eq!(dialed.connection().kind(), TransportKind::Quic);
+    assert!(dialed.quic_failure().is_none());
     assert_eq!(accepting.await??.kind(), TransportKind::Quic);
 
     // A port where UDP is a black hole and only TCP answers. The port TCP
@@ -880,9 +880,9 @@ async fn quic_is_dialed_first_and_tcp_is_the_fallback() -> TestResult {
         tokio::spawn(async move { tcp_only.accept().await })
     };
     let dialed = client.dial_any(b.id(), &[tcp_only_addr.into()]).await?;
-    assert_eq!(dialed.connection.kind(), TransportKind::TcpTls);
+    assert_eq!(dialed.connection().kind(), TransportKind::TcpTls);
     assert!(
-        matches!(dialed.quic_failure, Some(TransportError::Timeout(_))),
+        matches!(dialed.quic_failure(), Some(TransportError::Timeout(_))),
         "the fallback must say how QUIC failed"
     );
     assert_eq!(accepting.await??.kind(), TransportKind::TcpTls);
