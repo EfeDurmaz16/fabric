@@ -37,7 +37,7 @@ use crate::denylist;
 use crate::departure::Departure;
 use crate::error::HarnessError;
 use crate::jsontext::{self, TransformError};
-use crate::manifest::{Carried, Content, Digest, Mutability};
+use crate::manifest::{Carried, Content, Digest, MANIFEST_FILE, Mutability};
 use crate::redact::{RedactionCounts, Redactor};
 
 /// The redaction rule name under which dropped signed blocks are counted.
@@ -529,9 +529,22 @@ fn fold_counts(counts: &mut RedactionCounts, outcome: &jsontext::Outcome) {
     }
 }
 
+/// Removes an earlier capture's manifest from `out` and makes the removal
+/// durable, so a capture killed part way through a directory it reuses
+/// never leaves an old manifest naming files it has partly overwritten.
+fn clear_manifest(out: &Path) -> Result<(), HarnessError> {
+    let path = out.join(MANIFEST_FILE);
+    match fs::remove_file(&path) {
+        Ok(()) => fsync_dir(out),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(HarnessError::io("remove", &path, e)),
+    }
+}
+
 /// Stages `sources` under `out`, checking the denylist and redacting as
 /// each file's `Carry` says. Returns the carried entries sorted by path and
-/// adds to the redaction counts.
+/// adds to the redaction counts. An earlier manifest in `out` is removed
+/// first; the caller writes the new one last.
 pub(crate) fn stage(
     sources: &[Source],
     out: &Path,
@@ -553,6 +566,7 @@ pub(crate) fn stage(
         }
     }
     let redactor = Redactor::standard()?;
+    clear_manifest(out)?;
     let mut carried = Vec::with_capacity(sorted.len());
     for source in sorted {
         let dst = out.join(source.rel.as_str());

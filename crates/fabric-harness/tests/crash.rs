@@ -201,6 +201,64 @@ async fn a_capture_killed_part_way_leaves_no_tree_a_fresh_node_would_accept_by_m
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_capture_killed_in_a_reused_directory_leaves_no_stale_manifest() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = home_dir.path().canonicalize().unwrap();
+    let work = build_home(&home);
+    let transcript = home
+        .join(".claude/projects")
+        .join(slug(&work).unwrap())
+        .join(format!("{SID}.jsonl"));
+    // A short transcript, which sorts first and is staged at once, and the
+    // large sidecars after it: most kills land after the transcript was
+    // replaced and before the new manifest.
+    let text = std::fs::read_to_string(&transcript).unwrap();
+    let short: String = text.split_inclusive('\n').take(10).collect();
+    std::fs::write(&transcript, short).unwrap();
+    let mut killed_mid_way = 0;
+    for delay_ms in [5, 30, 120, 250, 400, 600, 900, 1200] {
+        let out = tempfile::tempdir().unwrap();
+        node(&home)
+            .capture(&work, &session(), out.path())
+            .await
+            .unwrap();
+        // The session grows, so the next capture stages different bytes
+        // into the same directory.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"{\"type\":\"user\",\"n\":-1}\n").unwrap();
+        drop(file);
+        if run_child(
+            "capture",
+            &home,
+            &work,
+            out.path(),
+            Duration::from_millis(delay_ms),
+        ) {
+            killed_mid_way += 1;
+        }
+        if out.path().join("manifest.json").exists() {
+            let manifest = StateManifest::read(out.path()).unwrap();
+            for file in &manifest.files {
+                let bytes = std::fs::read(out.path().join(file.rel_path.as_str())).unwrap();
+                assert_eq!(
+                    file.blake3.to_string(),
+                    blake3::hash(&bytes).to_hex().as_str(),
+                    "{} does not match the manifest left in the directory",
+                    file.rel_path.as_str()
+                );
+            }
+        }
+    }
+    assert!(
+        killed_mid_way > 0,
+        "no child was still running when killed; the fixture is too small"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restore_killed_part_way_places_only_whole_files_and_converges() {
     let source_dir = tempfile::tempdir().unwrap();
     let source = source_dir.path().canonicalize().unwrap();
