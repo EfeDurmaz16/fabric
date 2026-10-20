@@ -134,7 +134,7 @@ Three numbers version the protocol, each for one layer:
 
 ### Which side dials is not recorded yet
 
-ADR 0005 says a pair records which side can dial. The peer book does not record it yet: it keeps the addresses a peer was reached at, newest first, and an empty list means only that no address is known. `PeerBook::seen` adds the address an accepted connection came from, which for the Pro behind NAT is not an address the Air can dial. The node crate is the first code that decides whether to dial, so it records the direction; until then nothing reads the list as a dial rule.
+ADR 0005 says a pair records which side can dial. The peer book does not record it yet: it keeps the addresses the user pasted at pairing, newest first, and an empty list means only that no address is known. `PeerBook::seen` records only when a connection completed, never its remote address: an accepted connection comes from the dialer's ephemeral port, or from a NAT, and eight of those would push the pasted address out of the list. The node crate is the first code that decides whether to dial, so it records the direction and the addresses it dialed; until then nothing reads the list as a dial rule.
 
 ### Trust details the code added
 
@@ -165,5 +165,5 @@ ADR 0005 says a pair records which side can dial. The peer book does not record 
 
 ## Open questions
 
-- How the peer book records which side dials: a flag per peer, or `seen` keeping only addresses this node dialed. Decide with the node crate.
+- How the peer book records which side dials, and the addresses this node dialed: a flag per peer, a list of dialed addresses kept apart from the pasted ones, or both. Decide with the node crate.
 - Should the node crate own the `Service` implementation, or should the store answer `manifest` and `chunk` directly? Decide with the node crate.

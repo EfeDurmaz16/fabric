@@ -407,10 +407,13 @@ impl PeerBook {
         self.peers.remove(&node).is_some()
     }
 
-    /// Records that a connection with `node` completed at `addr`; ignored for an unpaired node.
-    pub fn seen(&mut self, node: NodeId, addr: SocketAddr, now_ms: u64) {
+    /// Records that a connection with `node` completed at `now_ms`; ignored for an unpaired node.
+    ///
+    /// It records no address: an accepted connection's remote address is
+    /// the dialer's ephemeral port, or a NAT's, and in the list it would
+    /// push out the address the user pasted.
+    pub fn seen(&mut self, node: NodeId, now_ms: u64) {
         if let Some(entry) = self.peers.get_mut(&node) {
-            promote(&mut entry.addrs, addr.into());
             entry.last_seen_ms = Some(now_ms);
         }
     }
@@ -683,7 +686,10 @@ mod tests {
             .update(|b| b.pair(node(2), Some("10.0.0.2:7777".parse().unwrap())))
             .unwrap();
         peers
-            .update(|b| b.seen(node(2), "10.0.0.9:7777".parse().unwrap(), 1_760_000_000_000))
+            .update(|b| b.pair(node(2), Some("10.0.0.9:7777".parse().unwrap())))
+            .unwrap();
+        peers
+            .update(|b| b.seen(node(2), 1_760_000_000_000))
             .unwrap();
         peers.update(|b| b.pair(node(3), None)).unwrap();
         assert!(peers.is_paired(node(2)));
@@ -746,7 +752,7 @@ mod tests {
     #[test]
     fn an_unpaired_node_is_not_recorded_as_seen() {
         let mut book = PeerBook::default();
-        book.seen(node(7), "10.0.0.7:1".parse().unwrap(), 5);
+        book.seen(node(7), 5);
         assert!(!book.is_paired(node(7)));
         book.pair(node(7), None);
         assert!(book.unpair(node(7)));
@@ -771,9 +777,7 @@ mod tests {
         let cli = Peers::open(&path).unwrap();
         daemon.update(|b| b.pair(node(1), None)).unwrap();
         cli.update(|b| b.pair(node(2), None)).unwrap();
-        daemon
-            .update(|b| b.seen(node(1), "10.0.0.1:7777".parse().unwrap(), 5))
-            .unwrap();
+        daemon.update(|b| b.seen(node(1), 5)).unwrap();
 
         let on_disk = PeerBook::load(&path).unwrap();
         assert!(on_disk.is_paired(node(1)) && on_disk.is_paired(node(2)));
@@ -802,9 +806,7 @@ mod tests {
             b.unpair(node(1));
         })
         .unwrap();
-        daemon
-            .update(|b| b.seen(node(1), "10.0.0.1:7777".parse().unwrap(), 5))
-            .unwrap();
+        daemon.update(|b| b.seen(node(1), 5)).unwrap();
         assert!(!PeerBook::load(&path).unwrap().is_paired(node(1)));
         assert!(!daemon.is_paired(node(1)));
     }
