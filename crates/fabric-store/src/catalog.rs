@@ -3,8 +3,10 @@
 //! Invariant: a `snapshot_chunks` row is written only after the object it
 //! names is durable on disk, in one transaction with its snapshot row, and
 //! `chunks.refcount` equals the number of `snapshot_chunks` rows that name
-//! the chunk. `SQLite` is the authority for what is published; an object file
-//! with no row is invisible to readers and belongs to gc.
+//! the chunk. A snapshot's `bundle_base` always names a row, because publish
+//! refuses a base it does not have and forget refuses a base a later
+//! snapshot still needs. `SQLite` is the authority for what is published; an
+//! object file with no row is invisible to readers and belongs to gc.
 
 use std::collections::HashSet;
 use std::fs;
@@ -443,6 +445,31 @@ impl Catalog {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Returns true when some snapshot's bundle excludes the refs of `id`.
+    pub fn is_bundle_base(&self, id: SnapshotId) -> Result<bool, CatalogError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT 1 FROM snapshots WHERE bundle_base = ?1")?;
+        Ok(stmt.exists([id.to_bytes()])?)
+    }
+
+    /// Returns every snapshot whose bundle base has no row, with that base.
+    pub fn broken_chains(&self) -> Result<Vec<(SnapshotId, SnapshotId)>, CatalogError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, bundle_base FROM snapshots
+             WHERE bundle_base IS NOT NULL
+               AND bundle_base NOT IN (SELECT id FROM snapshots)
+             ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                SnapshotId::from_bytes(r.get(0)?),
+                SnapshotId::from_bytes(r.get(1)?),
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Returns true when the catalog has a row for the chunk.

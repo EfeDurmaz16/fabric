@@ -70,6 +70,18 @@ pub enum StoreError {
         /// The store root.
         path: PathBuf,
     },
+    /// A manifest's bundle excludes the refs of a snapshot the store does not have.
+    #[error("bundle base {base} is not in the store")]
+    MissingBundleBase {
+        /// The base the manifest names.
+        base: SnapshotId,
+    },
+    /// A later snapshot's bundle still needs the snapshot's refs.
+    #[error("snapshot {base} is the bundle base of a later snapshot")]
+    BaseInUse {
+        /// The snapshot that cannot be forgotten yet.
+        base: SnapshotId,
+    },
 }
 
 fn io_err(path: &Path, source: io::Error) -> StoreError {
@@ -114,13 +126,18 @@ pub struct CheckReport {
     pub corrupt: Vec<(SnapshotId, ChunkId)>,
     /// Chunks whose refcount disagrees with the rows that name them.
     pub refcount_mismatches: Vec<ChunkId>,
+    /// Snapshots whose bundle base is not in the catalog, with that base.
+    pub broken_chains: Vec<(SnapshotId, SnapshotId)>,
 }
 
 impl CheckReport {
-    /// True when every snapshot is complete and the counts agree.
+    /// True when every snapshot is complete, every chain is whole and the counts agree.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.missing.is_empty() && self.corrupt.is_empty() && self.refcount_mismatches.is_empty()
+        self.missing.is_empty()
+            && self.corrupt.is_empty()
+            && self.refcount_mismatches.is_empty()
+            && self.broken_chains.is_empty()
     }
 }
 
@@ -251,6 +268,11 @@ impl Store {
         if self.catalog.snapshot(id)?.is_some() {
             return Ok(id);
         }
+        if let Some(base) = manifest.git.as_ref().and_then(|g| g.bundle_base)
+            && self.catalog.snapshot(base)?.is_none()
+        {
+            return Err(StoreError::MissingBundleBase { base });
+        }
         let mut data = Vec::new();
         for chunk in Self::data_chunks(manifest) {
             let stored_len = match self.objects.stored_len(chunk) {
@@ -319,7 +341,13 @@ impl Store {
     }
 
     /// Drops a snapshot from the catalog; its objects wait for gc.
+    ///
+    /// A snapshot whose refs a later bundle excludes is refused: every
+    /// restore of that later snapshot would need this one's bundle.
     pub fn forget(&mut self, id: SnapshotId) -> Result<(), StoreError> {
+        if self.catalog.is_bundle_base(id)? {
+            return Err(StoreError::BaseInUse { base: id });
+        }
         if self.catalog.forget_snapshot(id)? {
             Ok(())
         } else {
@@ -363,10 +391,11 @@ impl Store {
         Ok(report)
     }
 
-    /// Checks that every snapshot's objects are on disk, and with `Hashes` that they verify.
+    /// Checks that every snapshot's objects are on disk, with `Hashes` that they verify, and that chains and counts agree.
     pub fn check(&self, depth: CheckDepth) -> Result<CheckReport, StoreError> {
         let mut report = CheckReport {
             refcount_mismatches: self.catalog.refcount_mismatches()?,
+            broken_chains: self.catalog.broken_chains()?,
             ..CheckReport::default()
         };
         let mut seen_ok: HashSet<ChunkId> = HashSet::new();

@@ -1043,7 +1043,7 @@ fn chain_depth(store: &Store, manifest: &SnapshotManifest) -> Result<u32, Captur
         if depth >= MAX_BUNDLE_CHAIN {
             break;
         }
-        base = store.manifest(id)?.git.as_ref().and_then(|g| g.bundle_base);
+        base = store.snapshot(id)?.bundle_base;
     }
     Ok(depth)
 }

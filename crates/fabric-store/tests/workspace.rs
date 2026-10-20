@@ -25,7 +25,7 @@ use fabric_store::restore::{
     Durability, RestoreError, RestoreReport, RestoreRequest, RestoreState, Verify, restore,
     restore_state, verify,
 };
-use fabric_store::store::{CheckDepth, Store};
+use fabric_store::store::{CheckDepth, Store, StoreError};
 use fabric_store::writer::WriteError;
 
 type Fallible<T = ()> = Result<T, Box<dyn Error>>;
@@ -373,9 +373,12 @@ fn a_second_snapshot_carries_only_new_objects_and_restores_through_the_chain() {
         "precious ignored, changed\n"
     );
 
+    // s2's bundle excludes s1's refs, so s1 must outlive it.
+    assert!(matches!(store.forget(s1), Err(StoreError::BaseInUse { base }) if base == s1));
+    assert!(store.check(CheckDepth::Presence).unwrap().is_clean());
+    store.forget(s3).unwrap();
+    store.forget(s2).unwrap();
     store.forget(s1).unwrap();
-    let broken = restore_into(&store, s3, &dir.path().join("broken"));
-    assert!(matches!(broken, Err(RestoreError::BundleChainBroken { base, .. }) if base == s1));
 }
 
 fn sample_for(pattern: &str) -> String {

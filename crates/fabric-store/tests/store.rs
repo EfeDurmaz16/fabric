@@ -1,15 +1,18 @@
 //! Proves the catalog rules: publish is idempotent and never names a missing
-//! object, one process holds a store at a time, gc removes nothing before its
-//! grace and removes the row before the file, and `check` sees a missing or
-//! corrupt object.
+//! object or bundle base, one process holds a store at a time, gc removes
+//! nothing before its grace and removes the row before the file, and `check`
+//! sees a missing or corrupt object, a wrong refcount and a broken chain.
 
 use std::error::Error;
 use std::fs;
 use std::time::{Duration, SystemTime};
 
+use fabric_core::git::GitOid;
 use fabric_core::id::{ChunkId, JobId, NodeId, SnapshotId};
 use fabric_core::path::{AbsPath, RelPath};
-use fabric_core::snapshot::{Entry, EntryKind, HarnessState, Mode, Platform, SnapshotManifest};
+use fabric_core::snapshot::{
+    Entry, EntryKind, GitHead, GitState, HarnessState, Mode, Platform, SnapshotManifest,
+};
 use fabric_store::catalog::CatalogError;
 use fabric_store::objects::ChunkParams;
 use fabric_store::store::{CheckDepth, Store, StoreError};
@@ -120,6 +123,31 @@ fn publish_refuses_a_manifest_that_names_a_missing_object() {
         store.manifest(SnapshotId::of(b"x")),
         Err(StoreError::UnknownSnapshot(_))
     ));
+}
+
+#[test]
+fn publish_refuses_a_bundle_base_the_store_does_not_have() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::create(dir.path(), params()).unwrap();
+    let ghost = SnapshotId::of(b"never published");
+    let oid = GitOid::parse(&"0".repeat(40)).unwrap();
+    let mut m = manifest(vec![file_entry(&store, "a", b"a").unwrap()], 3).unwrap();
+    m.git = Some(GitState {
+        bundle: Vec::new(),
+        bundle_base: Some(ghost),
+        refs: Vec::new(),
+        head: GitHead::Branch("main".parse().unwrap()),
+        index_commit: oid.clone(),
+        worktree_commit: oid,
+        worktree_mtimes: Vec::new(),
+        config: Vec::new(),
+        exclude: None,
+    });
+    assert!(matches!(
+        store.publish(&m),
+        Err(StoreError::MissingBundleBase { base }) if base == ghost
+    ));
+    assert!(store.catalog().snapshots().unwrap().is_empty());
 }
 
 #[test]
@@ -250,4 +278,36 @@ fn check_sees_a_missing_object_and_a_corrupt_one() {
     let report = store.check(CheckDepth::Hashes).unwrap();
     assert!(report.is_clean());
     assert!(report.refcount_mismatches.is_empty());
+}
+
+#[test]
+fn check_sees_a_wrong_refcount_and_a_broken_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::create(dir.path(), params()).unwrap();
+    let entry = file_entry(&store, "f", b"counted").unwrap();
+    let id = store
+        .publish(&manifest(vec![entry.clone()], 1).unwrap())
+        .unwrap();
+    let chunk = chunks_of(&entry).unwrap()[0];
+    drop(store);
+
+    let ghost = SnapshotId::of(b"gone");
+    let conn = rusqlite::Connection::open(dir.path().join("catalog.sqlite")).unwrap();
+    conn.execute(
+        "UPDATE chunks SET refcount = 7 WHERE id = ?1",
+        [chunk.to_bytes()],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE snapshots SET bundle_base = ?1 WHERE id = ?2",
+        rusqlite::params![ghost.to_bytes(), id.to_bytes()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = Store::open(dir.path()).unwrap();
+    let report = store.check(CheckDepth::Presence).unwrap();
+    assert_eq!(report.refcount_mismatches, vec![chunk]);
+    assert_eq!(report.broken_chains, vec![(id, ghost)]);
+    assert!(!report.is_clean());
 }
