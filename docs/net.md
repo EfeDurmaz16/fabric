@@ -38,15 +38,26 @@ needs a key exchange that this phase does not have.
 ## Wires
 
 Both transports listen on one port. A dial tries QUIC for `QUIC_TIMEOUT`
-(3 s), then TCP with TLS. The fallback is reported with its reason and the
-ledger will record which wire served a resume, so a slow path is visible.
+(3 s), then TCP with TLS, which gets 10 s for the connect and the handshake
+together. The fallback is reported with its reason and the ledger will
+record which wire served a resume, so a slow path is visible. A dial that
+reached the wrong node, or a forgery, fails at once and tries nothing else.
+
+Each transport accepts in the background: every handshake runs in its own
+task with a 10 s limit, at most 32 at once, so a host that opens the port
+and stays silent does not hold up a paired peer.
 
 - QUIC (`quinn` 0.11 over `rustls` 0.23): multiplexed streams, migration
   across address changes, keep-alive every 10 s, idle timeout 30 s.
 - TCP with TLS (`tokio-rustls`): the same verifiers over a TCP stream with a
-  small multiplexer (`u32 stream id | u8 kind | u32 length | payload`). One
-  stream that nobody reads holds up the others once its 1 MiB buffer is
-  full; the protocol reads every stream it opens.
+  small multiplexer (`u32 stream id | u8 kind | u32 length | payload`, kinds
+  data, fin and reset). A dropped stream resets the peer's writer, a peer
+  may hold 100 streams open, and a connection lives while its handle or a
+  stream does, as on QUIC. One stream that nobody reads holds up the
+  others once its 1 MiB buffer is full; the protocol reads every stream it
+  opens.
+
+ADR 0013 records the trait, the message set and the multiplexer as built.
 
 ## Framing and messages
 
@@ -59,9 +70,13 @@ Every request runs on its own stream and carries a request number and the
 milliseconds the caller still allows. The caller's deadline fires whatever
 the peer does. The vocabulary is in `wire.rs`: `Hello`, `Ping`, per-job
 messages under a fencing token (job id and epoch), `WantSnapshot`,
-`WantChunks`. A chunk is requested by id, never by offset; after a dropped
+`WantChunks`. A caller asks through one typed method per request and a
+service answers through one, so a request never gets an answer of the wrong
+kind. A chunk is requested by id, never by offset; after a dropped
 connection the receiver asks again for what its store does not hold, and a
-chunk is trusted only after its bytes hash to its id.
+chunk is trusted only after its bytes hash to its id. A chunk transfer is
+cut only when no byte arrives for its idle limit, so a slow link that keeps
+moving finishes.
 
 ## On the gate network
 
@@ -86,14 +101,25 @@ Pro is behind NAT; UDP and TCP both arrive from the Pro at the Air.
 ## What the tests prove
 
 Two nodes in one process on loopback, on real QUIC and real TLS over TCP:
-the hello exchange, a dial to the wrong id failing inside the handshake, an
-unpaired dialer never surfacing at accept, a paired certificate without its
-key failing, an oversized frame getting no answer while the connection
-survives, a slow peer tripping the deadline, a chunk transfer resuming after
-a dropped connection with only the missing chunks travelling again, three
-concurrent 3 MiB echo streams under backpressure not crossing, and QUIC
-dialed first with TCP as the fallback when UDP is a black hole. The codec
-has property tests and random bytes never panic a decoder.
+the hello exchange, a dial to the wrong id failing inside the handshake
+without a fallback, an unpaired dialer never surfacing at accept, an
+oversized frame getting no answer while the connection survives, a slow
+peer tripping the deadline, a chunk transfer resuming after a dropped
+connection with only the missing chunks travelling again, three concurrent
+3 MiB echo streams under backpressure not crossing, a dropped connection
+handle keeping its live streams, a silent socket not holding up a paired
+dialer, a black-holed address costing the dial timeout and no more, a
+reused hello reporting no false clock skew, and QUIC dialed first with TCP
+as the fallback when UDP is a black hole.
+
+In-memory handshakes prove that a certificate without its key fails on
+either side and that an unpaired node cannot resume its way back in. The
+multiplexer's own tests drive it with a hand-written peer: a dropped stream
+never comes back, a stream over the cap is reset, a reset stops the writer,
+and streams written out of open order all arrive. Crash tests kill a child
+process while it writes the node key or the peer book and find no key or a
+whole one, the old book or the new one. The codec has property tests and
+random bytes never panic a decoder.
 
 ## Not in this phase
 
