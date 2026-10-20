@@ -160,6 +160,8 @@ pub struct CaptureReport {
     pub stripped_userinfo: Vec<GitConfigKey>,
     /// Repeated config keys where only the last value travels.
     pub repeated_config: Vec<GitConfigKey>,
+    /// Allowlisted config keys left behind because their value starts with `-` or holds a newline.
+    pub dropped_config: Vec<GitConfigKey>,
     /// The bundle shape; none when the root is not a repository.
     pub bundle: Option<BundleKind>,
 }
@@ -1241,6 +1243,7 @@ impl GitCapture<'_> {
                 report.stripped_userinfo.push(key.clone());
             }
             let Ok(value) = GitConfigValue::parse(&value) else {
+                report.dropped_config.push(key);
                 continue;
             };
             if config.insert(key.clone(), value).is_some() {

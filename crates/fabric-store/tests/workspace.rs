@@ -1188,3 +1188,27 @@ fn a_restore_whose_bundle_base_is_gone_names_it() {
         "{err}"
     );
 }
+
+#[test]
+fn a_config_value_the_projection_refuses_is_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    let config = git(&root).git_path("config").unwrap();
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str("[remote \"odd\"]\n\turl = -oProxyCommand=x\n");
+    fs::write(&config, text).unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, report } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let key = GitConfigKey::parse("remote.odd.url").unwrap();
+    assert_eq!(report.dropped_config, vec![key.clone()]);
+    assert!(
+        !manifest
+            .git
+            .unwrap()
+            .config
+            .iter()
+            .any(|(carried, _)| *carried == key)
+    );
+}
