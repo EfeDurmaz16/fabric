@@ -813,6 +813,24 @@ fn a_secret_in_the_harness_state_is_left_behind_and_named() {
 }
 
 #[test]
+fn a_git_file_in_a_plain_directory_is_left_behind_and_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("plain");
+    fs::create_dir_all(root.join("checkout")).unwrap();
+    fs::write(root.join("checkout/.git"), "gitdir: ../../elsewhere\n").unwrap();
+    fs::write(root.join("checkout/x.txt"), "x\n").unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, report } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let files: Vec<&str> = manifest.files.iter().map(|e| e.rel_path.as_str()).collect();
+    assert_eq!(files, vec!["checkout", "checkout/x.txt"]);
+    assert_eq!(
+        report.nested_repositories,
+        vec![RelPath::parse("checkout").unwrap()]
+    );
+}
+
+#[test]
 fn a_link_target_that_is_not_utf8_is_refused_not_rewritten() {
     use std::os::unix::ffi::OsStrExt;
     let dir = tempfile::tempdir().unwrap();

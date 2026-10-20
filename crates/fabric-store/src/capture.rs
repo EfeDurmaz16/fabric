@@ -408,9 +408,10 @@ struct Listing {
 
 /// Lists a directory tree, sorted by path, never following symlinks.
 ///
-/// A directory named `.git` in any letter case is skipped, and the
-/// directory holding it is listed in `nested`; one at the base itself is
-/// the repository the base is, not content. A FIFO, socket or device is
+/// A `.git` in any letter case, whether a directory or the file a linked
+/// worktree or submodule checkout has, is skipped, and the directory
+/// holding it is listed in `nested`; one at the base itself is the
+/// repository the base is, not content. A FIFO, socket or device is
 /// skipped and listed in `special`.
 fn list_tree(base: &Path) -> Result<Listing, CaptureError> {
     fn walk(base: &Path, prefix: &str, out: &mut Listing) -> Result<(), CaptureError> {
@@ -434,7 +435,7 @@ fn list_tree(base: &Path) -> Result<Listing, CaptureError> {
             };
             let full = base.join(&text);
             let meta = fs::symlink_metadata(&full).map_err(|e| io_err(&full, e))?;
-            if meta.is_dir() && name.eq_ignore_ascii_case(".git") {
+            if name.eq_ignore_ascii_case(".git") {
                 if !prefix.is_empty() {
                     out.nested.push(rel_path(prefix)?);
                 }
