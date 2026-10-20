@@ -83,21 +83,21 @@ pub struct LedgerFile {
 }
 
 impl LedgerFile {
-    /// Creates an empty ledger at `path`; the file must not exist.
-    pub fn create(path: &Path) -> Result<Self, LedgerFileError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|source| io_err(path, source))?;
-        Ok(Self {
-            path: path.to_owned(),
-            file,
-            len: 0,
-            records: Vec::new(),
-            poisoned: false,
-        })
+    /// Creates the ledger at `path` holding `first`; the file must not exist.
+    ///
+    /// The record is written to a sibling, flushed and renamed into place,
+    /// so a failed write or a crash leaves no ledger rather than an empty
+    /// one that would refuse the job forever after.
+    pub fn create(path: &Path, first: &Record) -> Result<Self, LedgerFileError> {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {
+                return Err(io_err(path, io::Error::from(io::ErrorKind::AlreadyExists)));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io_err(path, source)),
+        }
+        durable::write_atomic(path, first.bytes()).map_err(|source| io_err(path, source))?;
+        Self::open(path)
     }
 
     /// Opens the ledger at `path`, truncating a torn tail and refusing any other damage.
@@ -151,15 +151,10 @@ impl LedgerStore for LedgerFile {
         if self.poisoned {
             return Err(LedgerFileError::Poisoned(self.path.clone()));
         }
-        let first = self.len == 0;
         let written = self
             .file
             .write_all(record.bytes())
-            .and_then(|()| durable::full_sync(&self.file))
-            .and_then(|()| match (first, self.path.parent()) {
-                (true, Some(dir)) => durable::sync_dir(dir),
-                _ => Ok(()),
-            });
+            .and_then(|()| durable::full_sync(&self.file));
         if let Err(source) = written {
             // Bytes that reached the file without being acknowledged would
             // sit in the middle of the chain after the next append.
@@ -242,8 +237,8 @@ mod tests {
         EventId::from_bytes(bytes)
     }
 
-    /// A ledger with `Created` and `notes` notes, committed through `file`.
-    fn write_chain(file: &mut LedgerFile, notes: u64) -> Ledger {
+    /// A ledger at `path` with `Created` and `notes` notes.
+    fn write_chain(path: &Path, notes: u64) -> (LedgerFile, Ledger) {
         let created = Ledger::created(
             JOB,
             "goal".into(),
@@ -253,8 +248,8 @@ mod tests {
             1,
         )
         .unwrap();
-        file.append(&created).unwrap();
-        let mut ledger = Ledger::open(JOB, &*file).unwrap();
+        let mut file = LedgerFile::create(path, &created).unwrap();
+        let mut ledger = Ledger::open(JOB, &file).unwrap();
         for n in 1..=notes {
             let note = ledger
                 .propose(
@@ -266,17 +261,16 @@ mod tests {
                     n,
                 )
                 .unwrap();
-            ledger.commit(file, note, Author::Node(NODE)).unwrap();
+            ledger.commit(&mut file, note, Author::Node(NODE)).unwrap();
         }
-        ledger
+        (file, ledger)
     }
 
     #[test]
     fn a_torn_tail_is_cut_and_every_record_before_it_stays() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger");
-        let mut file = LedgerFile::create(&path).unwrap();
-        let ledger = write_chain(&mut file, 3);
+        let (_, ledger) = write_chain(&path, 3);
         let whole = fs::read(&path).unwrap();
         let last = ledger.records().last().unwrap().bytes().len();
         fs::write(&path, &whole[..whole.len() - last / 2]).unwrap();
@@ -291,8 +285,7 @@ mod tests {
     fn a_damaged_middle_record_fails_closed_and_the_file_is_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger");
-        let mut file = LedgerFile::create(&path).unwrap();
-        let ledger = write_chain(&mut file, 3);
+        let (_, ledger) = write_chain(&path, 3);
         let mut bytes = fs::read(&path).unwrap();
         let second = ledger.records()[0].bytes().len() + 12;
         bytes[second] ^= 0xff;
@@ -310,8 +303,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger");
         let manifest = dir.path().join("manifest");
-        let mut file = LedgerFile::create(&path).unwrap();
-        let ledger = write_chain(&mut file, 2);
+        let (_, ledger) = write_chain(&path, 2);
         write_manifest(&manifest, &ledger).unwrap();
         check_manifest(&manifest, &ledger).unwrap();
 
@@ -337,8 +329,7 @@ mod tests {
             return;
         };
         let dir = PathBuf::from(dir);
-        let mut file = LedgerFile::create(&dir.join("ledger")).unwrap();
-        let mut ledger = write_chain(&mut file, 0);
+        let (mut file, mut ledger) = write_chain(&dir.join("ledger"), 0);
         for n in 1.. {
             let note = ledger
                 .propose(

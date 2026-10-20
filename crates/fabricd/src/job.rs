@@ -29,15 +29,25 @@ pub struct Job {
 }
 
 impl Job {
-    /// Creates a job from its first record, which must be `Created`.
-    pub fn create(dir: JobDir, created: &Record) -> Result<Self, NodeError> {
+    /// Creates job `id` from its first record, which must be its `Created`.
+    ///
+    /// The record is checked before anything is written, and the ledger
+    /// appears whole or not at all, so a refused or failed create leaves
+    /// nothing that would stop the job being learned later.
+    pub fn create(id: JobId, dir: JobDir, created: &Record) -> Result<Self, NodeError> {
         let EventKind::Created { job_id, .. } = created.event().kind else {
             return Err(LedgerError::FirstNotCreated(created.event().kind.name()).into());
         };
+        if job_id != id {
+            return Err(LedgerError::WrongJob {
+                found: job_id,
+                expected: id,
+            }
+            .into());
+        }
         let ledger = Ledger::replay(job_id, [created.clone()])?;
         crate::durable::create_dir(dir.dir()).map_err(|e| NodeError::io(dir.dir(), e))?;
-        let mut file = LedgerFile::create(&dir.ledger())?;
-        fabric_core::ledger::LedgerStore::append(&mut file, created)?;
+        let file = LedgerFile::create(&dir.ledger(), created)?;
         ledger_file::write_manifest(&dir.manifest(), &ledger)?;
         Ok(Self {
             id: job_id,
@@ -204,5 +214,41 @@ impl Job {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(NodeError::io(dir, e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fabric_core::harness::HarnessKind;
+    use fabric_core::id::EventId;
+
+    use super::*;
+    use crate::paths::StateDir;
+
+    #[test]
+    fn a_created_record_for_another_job_leaves_no_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::resolve(Some(dir.path().as_os_str()), dir.path()).unwrap();
+        let (asked, other) = (JobId::from_bytes([1; 16]), JobId::from_bytes([2; 16]));
+        let created = Ledger::created(
+            other,
+            "goal".into(),
+            HarnessKind::Codex,
+            NodeId::from_bytes([3; 32]),
+            EventId::from_bytes([4; 16]),
+            1,
+        )
+        .unwrap();
+        let refused = Job::create(asked, state.job(asked), &created);
+        assert!(
+            matches!(
+                refused,
+                Err(NodeError::Ledger(LedgerError::WrongJob { .. }))
+            ),
+            "{refused:?}"
+        );
+        assert!(!state.job(asked).dir().exists());
+        Job::create(other, state.job(other), &created).unwrap();
+        Job::open(other, state.job(other)).unwrap();
     }
 }

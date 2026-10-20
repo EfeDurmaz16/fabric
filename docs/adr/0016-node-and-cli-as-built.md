@@ -34,7 +34,7 @@ The control socket is `<state>/fabric.sock`. One connection carries one request 
 
 ### The ledger file
 
-`LedgerFile` implements `LedgerStore` as ADR 0002 specifies: one `write` of the whole record, `F_FULLFSYNC` on macOS and `fsync` elsewhere, the directory flushed after the first record. A failed append is cut off again; if that fails too, the file refuses further appends until the node restarts. Open truncates a torn tail and fails closed on any other damage, leaving the file byte for byte as it was. A manifest that remembers more records than the ledger holds fails closed with `BehindManifest`. ADR 0002 chose a file over SQLite; this build keeps that choice.
+`LedgerFile` implements `LedgerStore` as ADR 0002 specifies: one `write` of the whole record, `F_FULLFSYNC` on macOS and `fsync` elsewhere, the first record written to a sibling, flushed and renamed into place with the directory flushed, so a failed first write leaves no ledger rather than an empty one, and a `Created` for another job is refused before any file is made. A failed append is cut off again; if that fails too, the file refuses further appends until the node restarts. Open truncates a torn tail and fails closed on any other damage, leaving the file byte for byte as it was. A manifest that remembers more records than the ledger holds fails closed with `BehindManifest`. ADR 0002 chose a file over SQLite; this build keeps that choice.
 
 ### Who does what
 

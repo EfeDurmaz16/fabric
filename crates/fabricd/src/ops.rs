@@ -266,7 +266,7 @@ impl Node {
             clock::now_ms(),
         )
         .map_err(fabric_core::ledger::LedgerError::from)?;
-        let job = Job::create(self.cfg.state.job(id), &created)?;
+        let job = Job::create(id, self.cfg.state.job(id), &created)?;
         job.set_marker(&Marker {
             root: root.clone(),
             state: MarkerState::Live,
@@ -1384,14 +1384,7 @@ impl Node {
         }
         let record = fabric_core::ledger::Record::decode(bytes)
             .map_err(fabric_core::ledger::LedgerError::from)?;
-        let job = Job::create(self.cfg.state.job(id), &record)?;
-        if job.id() != id {
-            return Err(fabric_core::ledger::LedgerError::WrongJob {
-                found: job.id(),
-                expected: id,
-            }
-            .into());
-        }
+        let job = Job::create(id, self.cfg.state.job(id), &record)?;
         jobs.insert(id, Arc::new(tokio::sync::Mutex::new(job)));
         Ok(true)
     }
