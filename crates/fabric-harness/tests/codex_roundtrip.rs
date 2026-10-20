@@ -53,9 +53,13 @@ struct Fixture {
 }
 
 fn build_source() -> Fixture {
+    build_source_at("fabric/jobs/j1/work")
+}
+
+fn build_source_at(work_rel: &str) -> Fixture {
     let home = tempfile::tempdir().unwrap();
     let home_path = home.path().canonicalize().unwrap();
-    let work = home_path.join("fabric/jobs/j1/work");
+    let work = home_path.join(work_rel);
     std::fs::create_dir_all(&work).unwrap();
     let codex = home_path.join(".codex");
     let day = codex.join("sessions/2026/10/19");
@@ -233,6 +237,21 @@ async fn a_rollout_with_a_secret_is_refused_not_carried() {
         "{err}"
     );
     assert!(!out.path().join("manifest.json").exists());
+}
+
+#[tokio::test]
+async fn a_workspace_whose_name_holds_sk_inside_a_word_is_captured() {
+    // `disk-usage` holds `sk-`; the rollout's `cwd` and its first message
+    // name the path, and neither is a key.
+    let src = build_source_at("oss/disk-usage-analyzer-service");
+    let adapter = Codex::new(src.home.path().canonicalize().unwrap());
+    let out = tempfile::tempdir().unwrap();
+    let manifest = adapter
+        .capture(&src.work, &thread(), out.path())
+        .await
+        .unwrap();
+    assert_eq!(manifest.files.len(), 2);
+    assert!(manifest.redactions.is_empty());
 }
 
 #[tokio::test]

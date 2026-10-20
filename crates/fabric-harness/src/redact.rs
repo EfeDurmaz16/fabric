@@ -22,35 +22,126 @@ struct Rule {
     name: &'static str,
     text: Regex,
     bytes: BytesRegex,
+    accept: fn(&[u8]) -> bool,
 }
 
-const PATTERNS: &[(&str, &str)] = &[
-    ("anthropic-key", r"sk-ant-[A-Za-z0-9_\-]{20,}"),
-    ("openai-key", r"sk-(?:proj-|svcacct-)?[A-Za-z0-9_\-]{20,}"),
-    ("github-token", r"gh[pousr]_[A-Za-z0-9]{36,}"),
-    ("github-pat", r"github_pat_[A-Za-z0-9_]{22,}"),
-    ("aws-access-key", r"AKIA[0-9A-Z]{16}"),
-    ("slack-token", r"xox[abprs]-[A-Za-z0-9\-]{10,}"),
-    ("google-api-key", r"AIza[0-9A-Za-z_\-]{35}"),
-    ("stripe-key", r"[sr]k_(?:live|test)_[A-Za-z0-9]{16,}"),
-    (
-        "jwt",
-        r"eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}",
-    ),
-    (
-        "private-key-block",
-        r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
-    ),
-    ("bearer-token", r"(?i)\bbearer\s+[A-Za-z0-9._\-]{20,}"),
+/// One rule as written: a name, a pattern, and a check every match must
+/// also pass before it counts as a secret.
+struct Pattern {
+    name: &'static str,
+    regex: &'static str,
+    accept: fn(&[u8]) -> bool,
+}
+
+/// `(?-u:\b)` is an ASCII word boundary. Every key shape starts on one, so
+/// a prefix such as `sk-` inside an ordinary word (`disk-usage`,
+/// `task-list`) never starts a match, and the text and byte forms of a rule
+/// agree on where a word ends.
+const PATTERNS: &[Pattern] = &[
+    Pattern {
+        name: "anthropic-key",
+        regex: r"(?-u:\b)sk-ant-[A-Za-z0-9_\-]{20,}",
+        accept: any,
+    },
+    Pattern {
+        name: "openai-key",
+        regex: r"(?-u:\b)sk-(?:proj|svcacct|admin)-[A-Za-z0-9_\-]{32,}|(?-u:\b)sk-[A-Za-z0-9]{32,}",
+        accept: mixed_case,
+    },
+    Pattern {
+        name: "github-token",
+        regex: r"(?-u:\b)gh[pousr]_[A-Za-z0-9]{36,}",
+        accept: any,
+    },
+    Pattern {
+        name: "github-pat",
+        regex: r"(?-u:\b)github_pat_[A-Za-z0-9_]{22,}",
+        accept: any,
+    },
+    Pattern {
+        name: "aws-access-key",
+        regex: r"(?-u:\b)AKIA[0-9A-Z]{16}(?-u:\b)",
+        accept: any,
+    },
+    Pattern {
+        name: "slack-token",
+        regex: r"(?-u:\b)xox[abprs]-[A-Za-z0-9\-]{10,}",
+        accept: any,
+    },
+    Pattern {
+        name: "google-api-key",
+        regex: r"(?-u:\b)AIza[0-9A-Za-z_\-]{35}",
+        accept: any,
+    },
+    Pattern {
+        name: "stripe-key",
+        regex: r"(?-u:\b)[sr]k_(?:live|test)_[A-Za-z0-9]{16,}|(?-u:\b)whsec_[A-Za-z0-9+/=]{24,}",
+        accept: any,
+    },
+    Pattern {
+        name: "jwt",
+        regex: r"(?-u:\b)eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}",
+        accept: any,
+    },
+    Pattern {
+        name: "private-key-block",
+        regex: r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+        accept: any,
+    },
+    Pattern {
+        name: "authorization-header",
+        regex: r"(?i)(?-u:\b)authorization:[ \t]*(?:bearer|basic|token)[ \t]+[A-Za-z0-9._~+/\-]{8,}=*",
+        accept: any,
+    },
+    Pattern {
+        name: "bearer-token",
+        regex: r"(?i)(?-u:\b)bearer[ \t]+[A-Za-z0-9._~+/\-]{20,}=*",
+        accept: bearer_value_is_token,
+    },
 ];
+
+fn any(_: &[u8]) -> bool {
+    true
+}
+
+/// True for a random-looking key: it has an upper-case letter and a lower-case
+/// letter or a digit. A kebab-case name has no upper-case letter.
+fn mixed_case(token: &[u8]) -> bool {
+    token.iter().any(u8::is_ascii_uppercase)
+        && token
+            .iter()
+            .any(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// True when the word after `bearer` looks like a token, not prose: it has
+/// both letter cases, or a digit and either an upper-case letter or only hex
+/// characters. `bearer authentication-mechanism-v2` is prose.
+fn bearer_value_is_token(matched: &[u8]) -> bool {
+    let value = matched
+        .iter()
+        .position(u8::is_ascii_whitespace)
+        .map_or(matched, |at| matched[at..].trim_ascii_start());
+    let upper = value.iter().any(u8::is_ascii_uppercase);
+    let lower = value.iter().any(u8::is_ascii_lowercase);
+    let digit = value.iter().any(u8::is_ascii_digit);
+    let hex = value
+        .iter()
+        .all(|b| b.is_ascii_hexdigit() || matches!(b, b'-' | b'='));
+    (upper && lower) || (digit && (upper || hex))
+}
 
 static STANDARD: LazyLock<Redactor> = LazyLock::new(|| Redactor {
     rules: PATTERNS
         .iter()
-        .filter_map(|(name, pattern)| {
-            let text = Regex::new(pattern).ok()?;
-            let bytes = BytesRegex::new(pattern).ok()?;
-            Some(Rule { name, text, bytes })
+        .filter_map(|pattern| {
+            let text = Regex::new(pattern.regex).ok()?;
+            let bytes = BytesRegex::new(pattern.regex).ok()?;
+            Some(Rule {
+                name: pattern.name,
+                text,
+                bytes,
+                accept: pattern.accept,
+            })
         })
         .collect(),
 });
@@ -69,13 +160,21 @@ impl Redactor {
     /// Returns true when any rule matches somewhere in `text`.
     #[must_use]
     pub fn matches(&self, text: &str) -> bool {
-        self.rules.iter().any(|rule| rule.text.is_match(text))
+        self.rules.iter().any(|rule| {
+            rule.text
+                .find_iter(text)
+                .any(|m| (rule.accept)(m.as_str().as_bytes()))
+        })
     }
 
     /// Returns true when any rule matches somewhere in `bytes`.
     #[must_use]
     pub fn matches_bytes(&self, bytes: &[u8]) -> bool {
-        self.rules.iter().any(|rule| rule.bytes.is_match(bytes))
+        self.rules.iter().any(|rule| {
+            rule.bytes
+                .find_iter(bytes)
+                .any(|m| (rule.accept)(m.as_bytes()))
+        })
     }
 
     /// Replaces every match with `[REDACTED:<rule>]`, counting per rule;
@@ -85,16 +184,22 @@ impl Redactor {
         let mut current: Option<String> = None;
         for rule in &self.rules {
             let input = current.as_deref().unwrap_or(text);
-            let n = rule.text.find_iter(input).count();
+            let marker = format!("[REDACTED:{}]", rule.name);
+            let mut n = 0usize;
+            let replaced = rule.text.replace_all(input, |caps: &regex::Captures<'_>| {
+                let found = caps.get(0).map_or("", |m| m.as_str());
+                if (rule.accept)(found.as_bytes()) {
+                    n += 1;
+                    marker.clone()
+                } else {
+                    found.to_owned()
+                }
+            });
             if n == 0 {
                 continue;
             }
-            let replaced = rule
-                .text
-                .replace_all(input, format!("[REDACTED:{}]", rule.name).as_str())
-                .into_owned();
             *counts.entry(rule.name).or_insert(0) += count(n);
-            current = Some(replaced);
+            current = Some(replaced.into_owned());
         }
         current
     }
@@ -105,16 +210,24 @@ impl Redactor {
         let mut current: Option<Vec<u8>> = None;
         for rule in &self.rules {
             let input = current.as_deref().unwrap_or(bytes);
-            let n = rule.bytes.find_iter(input).count();
+            let marker = format!("[REDACTED:{}]", rule.name).into_bytes();
+            let mut n = 0usize;
+            let replaced = rule
+                .bytes
+                .replace_all(input, |caps: &regex::bytes::Captures<'_>| {
+                    let found = caps.get(0).map_or(&b""[..], |m| m.as_bytes());
+                    if (rule.accept)(found) {
+                        n += 1;
+                        marker.clone()
+                    } else {
+                        found.to_vec()
+                    }
+                });
             if n == 0 {
                 continue;
             }
-            let replaced = rule
-                .bytes
-                .replace_all(input, format!("[REDACTED:{}]", rule.name).as_bytes())
-                .into_owned();
             *counts.entry(rule.name).or_insert(0) += count(n);
-            current = Some(replaced);
+            current = Some(replaced.into_owned());
         }
         current
     }
@@ -142,7 +255,8 @@ mod tests {
         assert_eq!(counts.get("anthropic-key"), Some(&1));
         assert_eq!(counts.get("github-token"), Some(&1));
         assert!(r.apply("nothing secret", &mut counts).is_none());
-        assert!(r.matches("Bearer abcdefghijklmnopqrstuvwxyz"));
+        assert!(r.matches("Bearer abcdefghijklmnopqrstuvwxyzABC"));
+        assert!(r.matches("Authorization: Bearer abcdefghij"));
         assert!(r.matches("-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----"));
     }
 
@@ -157,5 +271,41 @@ mod tests {
         assert_eq!(counts.get("github-token"), Some(&1));
         input.truncate(5);
         assert!(r.apply_bytes(&input, &mut counts).is_none());
+    }
+
+    #[test]
+    fn ordinary_words_and_paths_are_not_secrets() {
+        let r = Redactor::standard();
+        for text in [
+            "/Users/efe/oss/disk-usage-analyzer-service/src/main.rs",
+            "task-list-item-checkbox-wrapper-component-with-a-long-name",
+            "risk-assessment-framework-v2-with-many-more-words-after-it",
+            "flask-authentication-demo-app-and-another-long-suffix-here",
+            "desk-booking-service-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789",
+            "the bearer authentication-mechanism-v2 is documented",
+            "pass the bearer tokenvalueplaceholdertext to the server",
+            "task_live_ABCDEFGHIJKLMNOPQRSTUV and mask_test_ABCDEFGHIJKLMNOP",
+        ] {
+            assert!(!r.matches(text), "{text} must not match");
+            assert!(
+                !r.matches_bytes(text.as_bytes()),
+                "{text} must not match as bytes"
+            );
+            assert!(r.apply(text, &mut RedactionCounts::new()).is_none());
+        }
+    }
+
+    #[test]
+    fn real_key_shapes_still_match() {
+        let r = Redactor::standard();
+        for text in [
+            "OPENAI_API_KEY=sk-proj-Ab3dEfGhIjKlMnOpQrStUvWxYz0123456789abcd",
+            "key sk-Ab3dEfGhIjKlMnOpQrStUvWxYz0123456789abcdEFGH",
+            "STRIPE_KEY=sk_live_ABCDEFGHIJKLMNOP1234",
+            "secret whsec_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345",
+            "curl -H 'Authorization: Bearer 4f9c2a7e1b3d5f6a8c0e2b4d6f8a0c2e'",
+        ] {
+            assert!(r.matches(text), "{text} must match");
+        }
     }
 }
