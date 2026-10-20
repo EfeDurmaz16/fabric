@@ -35,7 +35,9 @@ pub enum NodeError {
     #[error("the control socket {0} is too long for a Unix socket; use a shorter FABRIC_HOME")]
     SocketPathTooLong(PathBuf),
     /// No job with this id is known on this node.
-    #[error("job {0} is not known on this node; name the node that holds it with --on")]
+    #[error(
+        "job {0} is not known on this node; run `fabric job resume {0} --on <node>` to pull it from the node that holds it"
+    )]
     UnknownJob(JobId),
     /// The job is owned by another node.
     #[error(
