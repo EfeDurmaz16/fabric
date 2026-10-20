@@ -458,11 +458,25 @@ impl StepScope {
         }
     }
 
-    /// Returns the caches whose health decides whether the step runs.
-    fn gate(&self) -> StepGate {
-        match self {
-            StepScope::Fills(path) | StepScope::Warms(path) => StepGate::Caches(vec![path.clone()]),
-            StepScope::Outside | StepScope::Declared => StepGate::AnyCache,
+    /// Returns the caches whose health decides whether the step at `index` runs.
+    ///
+    /// The caches the step fills, so a declared `npm ci` never runs because
+    /// a `target` is missing; for `cargo fetch`, the `target` a build makes
+    /// from what it fetches. A step that fills no cache in the workspace,
+    /// such as `go mod download`, waits on every cache.
+    fn gate(&self, index: usize, caches: &[CachePath]) -> StepGate {
+        if let StepScope::Warms(path) = self {
+            return StepGate::Caches(vec![path.clone()]);
+        }
+        let filled: Vec<RelPath> = caches
+            .iter()
+            .filter(|cache| cache.completion.filled_by().contains(&index))
+            .map(|cache| cache.path.clone())
+            .collect();
+        if filled.is_empty() {
+            StepGate::AnyCache
+        } else {
+            StepGate::Caches(filled)
         }
     }
 }
@@ -648,7 +662,11 @@ pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, Dete
         .into_iter()
         .map(|cache| cache.finish(&step_scopes))
         .collect();
-    let step_gates = step_scopes.iter().map(StepScope::gate).collect();
+    let step_gates = step_scopes
+        .iter()
+        .enumerate()
+        .map(|(index, scope)| scope.gate(index, &caches))
+        .collect();
 
     let spec = EnvSpec {
         tools: chosen_tools(&pins),

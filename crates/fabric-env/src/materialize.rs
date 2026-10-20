@@ -9,11 +9,11 @@
 //! be copied, so one plan runs at most once.
 //!
 //! A `CachesMissing` step runs when what it fills is not whole: a detected
-//! install runs when its own cache is not, so a missing `target` never
-//! reinstalls a whole `node_modules`; `cargo fetch` runs when `target`,
-//! which a build makes from what it fetches, is not; and a step whose
-//! cache is outside the workspace, or that the user declared, runs when
-//! any cache is not whole or the report has none.
+//! install runs when its own cache is not, and a declared step when one of
+//! the caches it fills is not, so a missing `target` never reinstalls a
+//! whole `node_modules`; `cargo fetch` runs when `target`, which a build
+//! makes from what it fetches, is not; and a step that fills no cache in
+//! the workspace runs when any cache is not whole or the report has none.
 //!
 //! A cache is healthy when it is a non-empty directory that holds proof
 //! that whatever filled it finished. For npm, pnpm and Yarn that is the

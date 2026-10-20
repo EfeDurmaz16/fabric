@@ -604,3 +604,29 @@ fn a_missing_target_does_not_reinstall_a_whole_node_modules() {
         .collect();
     assert_eq!(programs, ["cargo"]);
 }
+
+/// Point 14's rule holds for declared steps too: no declared step fills a
+/// detected `target`, so its absence must not rerun a declared `npm ci`
+/// over a healthy carried `node_modules`. A torn `node_modules` still does.
+#[test]
+fn a_missing_target_does_not_run_a_declared_install() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        &[
+            ("package.json", PACKAGE_JSON),
+            ("package-lock.json", ""),
+            ("node_modules/a/package.json", "{}"),
+            ("node_modules/.package-lock.json", "{}"),
+            ("Cargo.toml", ""),
+        ],
+    )
+    .unwrap();
+    let override_toml = "[[setup]]\nprogram = \"npm\"\nargs = [\"ci\"]\n";
+    let planned = plan(&declared(dir.path(), override_toml).unwrap()).unwrap();
+    assert!(planned.is_noop(), "{:?}", planned.steps());
+
+    fs::remove_file(dir.path().join("node_modules/.package-lock.json")).unwrap();
+    let planned = plan(&declared(dir.path(), override_toml).unwrap()).unwrap();
+    assert_eq!(planned.steps().len(), 1);
+}
