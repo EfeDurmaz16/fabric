@@ -58,7 +58,7 @@ A refusal crosses the control socket with its kind next to its text, so the CLI 
 | 80 | No daemon answers on the control socket |
 | 81 | Not the owner: another node owns the job, this node does not know it, or the plan's epoch is over |
 | 82 | Frozen: a move this node started waits for its target, or the job is frozen after a fork |
-| 83 | A peer could not be reached |
+| 83 | A peer could not be reached, or gave no answer in time |
 | 84 | Refused without `--force`: the preflight, or a steal's dry run |
 | 85 | The job's state stops the command: a suspend or restore to finish, a harness that runs, no snapshot, a run during a move |
 | 1 | Any other failure; 2 is a usage error from the argument parser |

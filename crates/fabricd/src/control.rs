@@ -204,7 +204,7 @@ pub enum Refusal {
     NotOwner,
     /// A move this node started is open, or the job is frozen after a fork.
     Frozen,
-    /// A peer could not be reached.
+    /// A peer could not be reached, or gave no answer in time.
     Unreachable,
     /// The preflight refused, or a steal was asked without `--force`.
     NeedsForce,

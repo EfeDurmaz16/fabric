@@ -867,10 +867,7 @@ impl Node {
                     reason: e.to_string(),
                 })
             }
-            Err(e) => Err(NodeError::Peer {
-                peer,
-                reason: e.to_string(),
-            }),
+            Err(e) => Err(answer_error(peer, &e)),
         }
     }
 
@@ -1875,6 +1872,22 @@ impl Node {
     }
 }
 
+/// What a call that reached `peer` and failed means: a peer that gave no
+/// answer in time was not reached, as far as the user can tell, and
+/// anything else is the peer's answer.
+fn answer_error(peer: NodeId, err: &fabric_net::rpc::RpcError) -> NodeError {
+    match err {
+        fabric_net::rpc::RpcError::Deadline(_) => NodeError::Unreachable {
+            peer,
+            reason: err.to_string(),
+        },
+        _ => NodeError::Peer {
+            peer,
+            reason: err.to_string(),
+        },
+    }
+}
+
 /// The owner's fencing token, or the refusal that says who owns the job.
 fn owner_token(job: &Job, me: NodeId) -> Result<FencingToken, NodeError> {
     let id = job.id();
@@ -2288,6 +2301,16 @@ pub(crate) mod tests {
             matches!(refused, Err(NodeError::Departing { target, .. }) if target == first),
             "{refused:?}"
         );
+    }
+
+    #[test]
+    fn a_peer_that_answers_too_late_counts_as_unreachable() {
+        let peer = NodeId::from_bytes([7; 32]);
+        let late = answer_error(
+            peer,
+            &fabric_net::rpc::RpcError::Deadline(Duration::from_secs(15)),
+        );
+        assert_eq!(late.refusal(), crate::control::Refusal::Unreachable);
     }
 
     #[test]
