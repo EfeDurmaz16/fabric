@@ -425,11 +425,17 @@ impl Node {
         plan(&job, token.epoch, marker.root, harness, out)
     }
 
-    async fn harness_started(
+    /// Records the harness the CLI launched and appends `Resumed`, or refuses.
+    ///
+    /// It fails closed: a stale epoch, a harness already recorded and alive,
+    /// and a process whose start time cannot be read are all refused, and
+    /// the CLI then kills the group it launched. The record is written
+    /// before `Resumed`, so no harness the ledger says runs is unsupervised.
+    pub(crate) async fn harness_started(
         &self,
         id: JobId,
         epoch: Epoch,
-        pid: u32,
+        pid: NonZeroU32,
         harness: HarnessKind,
         session: Option<String>,
         out: &mut Out,
@@ -444,6 +450,26 @@ impl Node {
             }
             .into());
         }
+        if let Some(record) = job.harness_record()?
+            && record.pid != pid
+            && record.is_alive().await
+        {
+            return Err(NodeError::AlreadyRunningHarness {
+                job: id,
+                pid: record.pid.get(),
+            });
+        }
+        let started = local::process_started(pid)
+            .await
+            .ok_or(NodeError::HarnessGone { pid })?;
+        local::write(
+            &job.dir().harness(),
+            &HarnessRecord {
+                epoch,
+                pid,
+                started,
+            },
+        )?;
         let snapshot = job.latest();
         job.append(
             self.id,
@@ -459,18 +485,6 @@ impl Node {
                 &SessionRecord {
                     harness: harness.clone(),
                     session,
-                },
-            )?;
-        }
-        if let Some(pid) = NonZeroU32::new(pid)
-            && let Some(started) = local::process_started(pid).await
-        {
-            local::write(
-                &job.dir().harness(),
-                &HarnessRecord {
-                    epoch,
-                    pid,
-                    started,
                 },
             )?;
         }
@@ -1827,5 +1841,138 @@ fn describe(kind: &EventKind) -> String {
         EventKind::EnvSpecChanged { env_spec } => format!("EnvSpecChanged {env_spec}"),
         EventKind::DecisionRecorded { text } => format!("DecisionRecorded: {text}"),
         EventKind::Note { text } => format!("Note: {text}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    use fabric_net::endpoint::DialOrder;
+
+    use super::*;
+    use crate::node::NodeConfig;
+    use crate::paths::StateDir;
+
+    /// A node in a fresh directory under `/tmp`, which keeps the socket path short.
+    fn node() -> (tempfile::TempDir, Arc<Node>) {
+        let dir = tempfile::Builder::new()
+            .prefix("fops")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let node = Node::start(NodeConfig {
+            state: StateDir::resolve(Some(root.join("state").as_os_str()), &home).unwrap(),
+            home,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            dial: DialOrder::TcpOnly,
+            path_var: std::env::var_os("PATH").unwrap_or_default(),
+            cargo_home: None,
+        })
+        .unwrap();
+        (dir, node)
+    }
+
+    /// A job made from a one-commit repository, owned by `node` at epoch 1.
+    async fn job(dir: &Path, node: &Arc<Node>) -> JobId {
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["add", "-A"],
+            &[
+                "-c",
+                "user.name=f",
+                "-c",
+                "user.email=f@x",
+                "commit",
+                "-qm",
+                "1",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .stdout(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let mut out = Out::default();
+        node.job_new(&repo, "goal".to_owned(), HarnessKind::Codex, &mut out)
+            .await
+            .unwrap();
+        out.lines[0].parse().unwrap()
+    }
+
+    fn sleeper() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    }
+
+    fn pid(child: &std::process::Child) -> NonZeroU32 {
+        NonZeroU32::new(child.id()).unwrap()
+    }
+
+    async fn register(node: &Arc<Node>, id: JobId, pid: NonZeroU32) -> Result<(), NodeError> {
+        node.harness_started(
+            id,
+            Epoch::FIRST,
+            pid,
+            HarnessKind::Codex,
+            None,
+            &mut Out::default(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_second_harness_is_refused_while_the_recorded_one_runs() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let (mut first, mut second) = (sleeper(), sleeper());
+        register(&node, id, pid(&first)).await.unwrap();
+        let refused = register(&node, id, pid(&second)).await;
+        assert!(
+            matches!(refused, Err(NodeError::AlreadyRunningHarness { pid: p, .. }) if p == first.id()),
+            "{refused:?}"
+        );
+        for child in [&mut first, &mut second] {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_harness_whose_start_time_cannot_be_read_is_refused() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let mut gone = sleeper();
+        let pid = pid(&gone);
+        gone.kill().unwrap();
+        gone.wait().unwrap();
+        let refused = register(&node, id, pid).await;
+        assert!(
+            matches!(refused, Err(NodeError::HarnessGone { .. })),
+            "{refused:?}"
+        );
+        let job = node.job(id).await.unwrap();
+        let job = job.lock().await;
+        assert!(job.harness_record().unwrap().is_none());
+        assert!(
+            !job.ledger()
+                .records()
+                .iter()
+                .any(|r| matches!(r.event().kind, EventKind::Resumed { .. })),
+            "Resumed was appended for a harness nobody supervises"
+        );
     }
 }

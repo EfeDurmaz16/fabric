@@ -9,6 +9,7 @@
 //! choice reaches the user with its reason (ADR 0008).
 
 use std::ffi::OsString;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use fabric_core::harness::HarnessKind;
@@ -88,7 +89,7 @@ pub enum Request {
         /// The epoch the plan was made under.
         epoch: Epoch,
         /// The harness process, which leads its own group.
-        pid: u32,
+        pid: NonZeroU32,
         /// The harness that runs.
         harness: HarnessKind,
         /// The session it continues or created, when known.

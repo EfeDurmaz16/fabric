@@ -90,6 +90,14 @@ pub enum NodeError {
         /// Its pid.
         pid: u32,
     },
+    /// The launched harness is not running, or its start time could not be read.
+    #[error(
+        "the harness pid {pid} is not running or its start time cannot be read, so it is not recorded"
+    )]
+    HarnessGone {
+        /// The pid the CLI named.
+        pid: std::num::NonZeroU32,
+    },
     /// The job has no workspace on this node.
     #[error("job {0} has no workspace on this node; run `fabric job resume {0}`")]
     NoWorkspace(JobId),

@@ -469,7 +469,7 @@ async fn launch(
             (agent.launch(&plan.root, launch, &env).await?, false)
         }
     };
-    let pid = running.pid().get();
+    let pid = running.pid();
     let registered = control::call(
         &socket,
         &Request::HarnessStarted {
@@ -500,7 +500,14 @@ async fn launch(
         give_terminal(&running);
     }
     let status = running.child_mut().wait().await?;
-    let _ = control::call(&socket, &Request::HarnessExited { job: plan.job, pid }).await;
+    let _ = control::call(
+        &socket,
+        &Request::HarnessExited {
+            job: plan.job,
+            pid: pid.get(),
+        },
+    )
+    .await;
     Ok(match status.code() {
         Some(0) => ExitCode::SUCCESS,
         Some(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
