@@ -6,7 +6,9 @@
 //! `u32` little-endian length and that many postcard bytes, the length
 //! checked against `MAX_CONTROL_MESSAGE` before anything is allocated. The daemon answers every request, refusals
 //! included, with the lines it printed on the way, so every automatic
-//! choice reaches the user with its reason (ADR 0008).
+//! choice reaches the user with its reason (ADR 0008). A refusal carries
+//! its kind next to its text, so the CLI picks its exit code from the kind
+//! and never parses the text.
 
 use std::ffi::OsString;
 use std::num::NonZeroU32;
@@ -184,9 +186,47 @@ pub enum Response {
     Failed {
         /// What happened before the failure.
         lines: Vec<String>,
-        /// Why it stopped.
+        /// Why it stopped, in words.
         error: String,
+        /// What kind of refusal it is.
+        refusal: Refusal,
     },
+}
+
+/// The kind of a refusal or failure, which decides the CLI's exit code (ADR 0016, Exit codes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Refusal {
+    /// Another node owns the job, or this node does not know it.
+    NotOwner,
+    /// A move this node started is open, or the job is frozen after a fork.
+    Frozen,
+    /// A peer could not be reached.
+    Unreachable,
+    /// The preflight refused, or a steal was asked without `--force`.
+    NeedsForce,
+    /// The job is not in a state the command acts on: a suspend or a
+    /// restore did not finish, a harness runs, or there is no snapshot.
+    JobState,
+    /// Anything else: a file, the store, a harness adapter, a peer's answer.
+    Failed,
+}
+
+/// The exit code of a command that found no daemon to answer it.
+pub const NO_DAEMON_EXIT: u8 = 80;
+
+impl Refusal {
+    /// The exit code the CLI ends with for this refusal.
+    #[must_use]
+    pub fn exit_code(self) -> u8 {
+        match self {
+            Refusal::NotOwner => 81,
+            Refusal::Frozen => 82,
+            Refusal::Unreachable => 83,
+            Refusal::NeedsForce => 84,
+            Refusal::JobState => 85,
+            Refusal::Failed => 1,
+        }
+    }
 }
 
 /// Why the CLI could not talk to the daemon.

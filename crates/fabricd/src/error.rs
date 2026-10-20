@@ -10,6 +10,7 @@ use fabric_core::id::{Epoch, JobId, MoveId, NodeId, SnapshotId};
 use fabric_core::lease::FenceError;
 use fabric_core::ledger::{LedgerError, StoreError as LedgerStoreError};
 
+use crate::control::Refusal;
 use crate::harnesses::HarnessConfigError;
 use crate::ledger_file::LedgerFileError;
 use crate::local::LocalError;
@@ -149,6 +150,14 @@ pub enum NodeError {
     /// The peer is not paired, or has no address to dial.
     #[error("{0} is not paired with an address; run `fabric node add {0} <host:port>`")]
     UnknownPeer(NodeId),
+    /// A `host:port` the user typed does not parse.
+    #[error("{text} is not host:port: {reason}")]
+    BadAddress {
+        /// What the user typed.
+        text: String,
+        /// Why it does not parse.
+        reason: String,
+    },
     /// The peer could not be reached.
     #[error("{peer} is unreachable: {reason}")]
     Unreachable {
@@ -166,7 +175,9 @@ pub enum NodeError {
         reason: String,
     },
     /// The preflight found rows that stop the move.
-    #[error("the preflight refused the move: {0}; pass --force to waive what can be waived")]
+    #[error(
+        "the preflight refused the move: {0}; `fabric job move` and `fabric job resume` take --force to waive what can be waived"
+    )]
     Preflight(String),
     /// A steal without `--force`.
     #[error("{0}")]
@@ -244,6 +255,28 @@ impl From<LedgerStoreError<LedgerFileError>> for NodeError {
 }
 
 impl NodeError {
+    /// The kind of refusal this is, for the CLI's exit code.
+    #[must_use]
+    pub fn refusal(&self) -> Refusal {
+        match self {
+            NodeError::NotOwner { .. }
+            | NodeError::Departed { .. }
+            | NodeError::UnknownJob(_)
+            | NodeError::Fence(_) => Refusal::NotOwner,
+            NodeError::Departing { .. } | NodeError::Forked { .. } => Refusal::Frozen,
+            NodeError::Unreachable { .. } | NodeError::UnknownPeer(_) => Refusal::Unreachable,
+            NodeError::Preflight(_) | NodeError::StealNeedsForce(_) => Refusal::NeedsForce,
+            NodeError::Unfinished { .. }
+            | NodeError::AlreadyRunningHarness { .. }
+            | NodeError::RanDuringMove { .. }
+            | NodeError::WorkspaceOccupied { .. }
+            | NodeError::NoWorkspace(_)
+            | NodeError::NoSnapshot(_)
+            | NodeError::HarnessGone { .. } => Refusal::JobState,
+            _ => Refusal::Failed,
+        }
+    }
+
     /// A filesystem error at `path`.
     pub(crate) fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         NodeError::Io {

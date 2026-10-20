@@ -175,10 +175,11 @@ impl Node {
     ) -> Result<(), NodeError> {
         let addr: Option<HostPort> = addr
             .map(|text| {
-                text.parse().map_err(|e| NodeError::Peer {
-                    peer: node,
-                    reason: format!("{text} is not host:port: {e}"),
-                })
+                text.parse()
+                    .map_err(|e: fabric_net::peers::SpecError| NodeError::BadAddress {
+                        text: text.to_owned(),
+                        reason: e.to_string(),
+                    })
             })
             .transpose()?;
         let peers = Arc::clone(&self.peers);

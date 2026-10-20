@@ -217,6 +217,7 @@ impl Node {
             Err(e) => Response::Failed {
                 lines: out.lines,
                 error: e.to_string(),
+                refusal: e.refusal(),
             },
         }
     }

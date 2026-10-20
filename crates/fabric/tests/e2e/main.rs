@@ -344,8 +344,9 @@ fn e2e_a_steal_needs_force_and_fences_the_sleeping_owner() -> Fallible {
     let (job, work) = job_with_work(&p)?;
     p.a.ok(&["job", "suspend", &job])?;
     p.a.kill()?;
-    let refused = p.b.fails(&["job", "steal", &job])?;
-    assert!(refused.contains("--force"), "{refused}");
+    let refused = p.b.run(&["job", "steal", &job])?;
+    assert_eq!(refused.status.code(), Some(84), "{}", text(&refused));
+    assert!(text(&refused).contains("--force"), "{}", text(&refused));
     let stolen = p.b.ok(&[
         "job",
         "steal",
@@ -376,11 +377,21 @@ fn e2e_a_steal_after_a_resume_freezes_the_owner_and_stops_its_harness() -> Falli
     let (running, pid) = p.a.run_lingering(&job)?;
     p.b.ok(&["job", "steal", &job, "--force"])?;
     let output = finish(running, GIVE_UP)?;
-    assert!(!output.status.success(), "{}", text(&output));
+    assert_eq!(output.status.code(), Some(128 + 15), "{}", text(&output));
+    assert!(
+        text(&output).contains("stopped by signal 15"),
+        "{}",
+        text(&output)
+    );
     assert!(!alive(pid), "the owner's harness outlived the steal");
     assert_eq!(p.a.lease(&job)?.view, "frozen");
-    let refusal = p.a.fails(&["job", "run", &job])?;
-    assert!(refusal.contains("is frozen on this node"), "{refusal}");
+    let refusal = p.a.run(&["job", "run", &job])?;
+    assert_eq!(refusal.status.code(), Some(82), "{}", text(&refusal));
+    assert!(
+        text(&refusal).contains("is frozen on this node"),
+        "{}",
+        text(&refusal)
+    );
     let thief = p.b.lease(&job)?;
     assert_eq!(
         (thief.owner.as_str(), thief.epoch, thief.view.as_str()),

@@ -46,6 +46,25 @@ The harness gets the user's environment minus the parent-session markers ADR 001
 
 Interactive launches give the terminal to the harness with `tcsetpgrp`. The CLI never takes it back; the shell does when the command exits, as it does for any job.
 
+### Exit codes
+
+A refusal crosses the control socket with its kind next to its text, so the CLI picks its exit code from the kind and never parses the text. Scripts and the triggers of ADR 0008 read these:
+
+| Code | Meaning |
+|---|---|
+| 0 | Done; for `run` and `resume`, the harness exited with 0 |
+| the harness's code | The harness exited with that code |
+| 128 + signal | The harness was stopped by that signal, as when the node fences it; a line names the signal and the status command |
+| 80 | No daemon answers on the control socket |
+| 81 | Not the owner: another node owns the job, this node does not know it, or the plan's epoch is over |
+| 82 | Frozen: a move this node started waits for its target, or the job is frozen after a fork |
+| 83 | A peer could not be reached |
+| 84 | Refused without `--force`: the preflight, or a steal's dry run |
+| 85 | The job's state stops the command: a suspend or restore to finish, a harness that runs, no snapshot, a run during a move |
+| 1 | Any other failure; 2 is a usage error from the argument parser |
+
+A harness that exits with a code from 80 to 85 cannot be told from a refusal by the code alone; none of the supported harnesses does.
+
 ### Job roots and departed copies
 
 `fabric job new --repo <path>` clones the repository into `~/fabric/jobs/<job-id>/work` (ADR 0011, rule 2). `fabric job init`, which adopts a checkout in place, is not built; ADR 0001's statement that `init` is the only way a job starts is superseded by `new` for this phase.

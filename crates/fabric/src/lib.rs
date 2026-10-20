@@ -10,10 +10,17 @@
 //! environment, launches the harness in its own process group, tells the
 //! daemon, which records `Resumed` under the planned epoch or refuses, and
 //! waits for the harness to exit.
+//!
+//! The exit code says what happened without parsing text (ADR 0016, Exit
+//! codes): 0 for success, the harness's own code when it exits, 128 plus
+//! the signal when it was stopped by one, 80 to 85 for a refusal of a kind
+//! the daemon names, and 1 for any other failure.
 
 use std::ffi::OsString;
+use std::fmt;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -27,7 +34,7 @@ use fabric_harness::claude::{ClaudeCode, LeftReason, TrustOutcome};
 use fabric_harness::codex::Codex;
 use fabric_harness::{Harness, Launch, Running};
 use fabric_net::endpoint::DialOrder;
-use fabricd::control::{self, Request, Response, RunPlan};
+use fabricd::control::{self, ControlError, NO_DAEMON_EXIT, Refusal, Request, Response, RunPlan};
 use fabricd::harnesses::{HarnessConfig, HarnessEnv, acp_adapter, parse_harness};
 use fabricd::node::{Node, NodeConfig};
 use fabricd::paths::{STATE_DIR_ENV, StateDir};
@@ -226,6 +233,32 @@ fn print_lines(lines: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// A refusal the daemon answered, kept typed so `main` can pick the exit code.
+#[derive(Debug)]
+struct Refused {
+    refusal: Refusal,
+    message: String,
+}
+
+impl fmt::Display for Refused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// The exit code for an error that ended a command.
+fn exit_code(error: &anyhow::Error) -> ExitCode {
+    if let Some(refused) = error.downcast_ref::<Refused>() {
+        return ExitCode::from(refused.refusal.exit_code());
+    }
+    if let Some(ControlError::NoDaemon { .. }) = error.downcast_ref::<ControlError>() {
+        return ExitCode::from(NO_DAEMON_EXIT);
+    }
+    ExitCode::FAILURE
+}
+
 /// Sends a request and prints what the daemon printed; a refusal becomes an error.
 async fn ask(socket: &Path, request: Request) -> Result<Option<RunPlan>> {
     match control::call(socket, &request).await? {
@@ -237,9 +270,17 @@ async fn ask(socket: &Path, request: Request) -> Result<Option<RunPlan>> {
             print_lines(&lines)?;
             Ok(Some(plan))
         }
-        Response::Failed { lines, error } => {
+        Response::Failed {
+            lines,
+            error,
+            refusal,
+        } => {
             print_lines(&lines)?;
-            bail!(error)
+            Err(Refused {
+                refusal,
+                message: error,
+            }
+            .into())
         }
     }
 }
@@ -272,7 +313,7 @@ pub fn main() -> ExitCode {
         Ok(code) => code,
         Err(e) => {
             let _ = writeln!(std::io::stderr(), "error: {e:#}");
-            ExitCode::FAILURE
+            exit_code(&e)
         }
     }
 }
@@ -478,9 +519,15 @@ async fn launch(
     .await;
     match registered {
         Ok(Response::Done { lines }) => print_lines(&lines)?,
-        Ok(Response::Failed { error, .. }) => {
+        Ok(Response::Failed { error, refusal, .. }) => {
             kill_group(&running);
-            bail!("the node refused the launch, so the harness was stopped: {error}");
+            return Err(Refused {
+                refusal,
+                message: format!(
+                    "the node refused the launch, so the harness was stopped: {error}"
+                ),
+            }
+            .into());
         }
         Ok(Response::Run { .. }) => {
             kill_group(&running);
@@ -495,14 +542,48 @@ async fn launch(
         give_terminal(&running);
     }
     let status = running.child_mut().wait().await?;
-    let _ = control::call(
-        &socket,
+    exited(&socket, plan, pid, status).await
+}
+
+/// Tells the node the harness exited and picks the exit code: the harness's
+/// own, or 128 plus the signal that stopped it, with a line saying why.
+async fn exited(
+    socket: &Path,
+    plan: &RunPlan,
+    pid: std::num::NonZeroU32,
+    status: std::process::ExitStatus,
+) -> Result<ExitCode> {
+    let told = control::call(
+        socket,
         &Request::HarnessExited {
             job: plan.job,
             pid: pid.get(),
         },
     )
     .await;
+    let missed = match told {
+        Ok(Response::Done { .. }) => None,
+        Ok(Response::Failed { error, .. }) => Some(error),
+        Ok(Response::Run { .. }) => Some("it answered with a run plan".to_owned()),
+        Err(e) => Some(e.to_string()),
+    };
+    if let Some(reason) = missed {
+        writeln!(
+            std::io::stderr(),
+            "warning: the node did not record that the harness exited ({reason}); `fabric job status {}` shows what it holds",
+            plan.job
+        )?;
+    }
+    if let Some(signal) = status.signal() {
+        writeln!(
+            std::io::stderr(),
+            "the harness was stopped by signal {signal}; the node stops it when the job is suspended, moves away or is stolen. Run `fabric job status {}` to see why",
+            plan.job
+        )?;
+        return Ok(ExitCode::from(
+            u8::try_from(128 + signal).unwrap_or(u8::MAX),
+        ));
+    }
     Ok(match status.code() {
         Some(0) => ExitCode::SUCCESS,
         Some(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
