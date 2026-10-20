@@ -922,6 +922,53 @@ fn a_read_only_directory_that_holds_files_round_trips() {
     assert!(same);
 }
 
+/// Captures `plain_tree` with its harness state and publishes it.
+fn plain_snapshot(dir: &Path) -> Fallible<(Store, SnapshotId)> {
+    let root = dir.join("plain");
+    let state = dir.join("state");
+    plain_tree(&root, &state)?;
+    let mut store = store_in(dir)?;
+    let policy = IgnorePolicy::default();
+    let mut req = request(&root, &policy, None);
+    req.harness_state = Some(&state);
+    let Captured { manifest, .. } = capture(&store, &req)?;
+    let snapshot = store.publish(&manifest)?;
+    Ok((store, snapshot))
+}
+
+fn restore_with_state(
+    store: &Store,
+    snapshot: SnapshotId,
+    target: &Path,
+    state: &Path,
+) -> Result<RestoreReport, RestoreError> {
+    restore(
+        store,
+        &RestoreRequest {
+            snapshot,
+            target,
+            harness_state: Some(state),
+            verify: Verify::All,
+            durability: Durability::ProcessCrash,
+            carry: &|_| true,
+        },
+    )
+}
+
+#[test]
+fn a_harness_directory_with_foreign_files_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, snapshot) = plain_snapshot(dir.path()).unwrap();
+    let state = dir.path().join("state-restored");
+    restore_with_state(&store, snapshot, &dir.path().join("first"), &state).unwrap();
+    fs::write(state.join("other-session.jsonl"), "{}\n").unwrap();
+    let err = restore_with_state(&store, snapshot, &dir.path().join("second"), &state).unwrap_err();
+    assert!(
+        matches!(&err, RestoreError::TargetNotEmpty { path } if *path == state),
+        "{err}"
+    );
+}
+
 #[test]
 fn a_cache_the_target_cannot_use_is_skipped_and_named() {
     let dir = tempfile::tempdir().unwrap();

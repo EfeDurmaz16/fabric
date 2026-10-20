@@ -7,7 +7,7 @@
 //! leaves either no target or a complete one: a staging directory that
 //! outlives its process is the sign of a restore that did not finish.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -878,13 +878,40 @@ fn verify_worktree(
     Ok(verified)
 }
 
+/// Adds every path under `base/prefix` to `out`, relative to `base`, without following links.
+///
+/// A name that is not UTF-8 is added with its bad bytes replaced, so it
+/// matches no manifest path.
+fn paths_under(base: &Path, prefix: &str, out: &mut BTreeSet<String>) -> Result<(), RestoreError> {
+    let dir = base.join(prefix);
+    for entry in fs::read_dir(&dir).map_err(|e| io_err(&dir, e))? {
+        let entry = entry.map_err(|e| io_err(&dir, e))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let rel = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if entry
+            .file_type()
+            .map_err(|e| io_err(&entry.path(), e))?
+            .is_dir()
+        {
+            paths_under(base, &rel, out)?;
+        }
+        out.insert(rel);
+    }
+    Ok(())
+}
+
 /// Says whether `dir` already holds the harness state of `manifest`.
 ///
 /// A restore renames the harness state into place before the workspace, so
 /// a kill between the two renames leaves a complete harness directory next
-/// to a half-restored workspace. The rerun re-reads every file against the
-/// store and checks every directory and link; a directory that holds
-/// anything else is foreign and is refused.
+/// to a half-restored workspace. The rerun checks that the directory holds
+/// exactly the manifest's paths, re-reads every file against the store and
+/// checks every directory and link; a directory that holds anything else
+/// is foreign and is refused.
 fn harness_state_complete(
     store: &Store,
     entries: &[Entry],
@@ -897,7 +924,13 @@ fn harness_state_complete(
         RestoreState::Absent | RestoreState::HalfRestored { .. } => return Ok(None),
         RestoreState::Present => {}
     }
-    if entries.is_empty() {
+    let mut found = BTreeSet::new();
+    paths_under(dir, "", &mut found)?;
+    let expected: BTreeSet<String> = entries
+        .iter()
+        .map(|e| e.rel_path.as_str().to_owned())
+        .collect();
+    if entries.is_empty() || found != expected {
         return Err(occupied);
     }
     for entry in entries {
