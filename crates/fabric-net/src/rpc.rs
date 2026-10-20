@@ -569,6 +569,8 @@ impl ChunkStream {
                     })
                 }
             }
+            // The peer's budget ran out finding a chunk: the same outcome as `call` reports.
+            ResponseBody::Fault(Fault::Deadline) => Err(RpcError::Deadline(self.idle)),
             ResponseBody::Fault(fault) => Err(RpcError::Fault(fault)),
             other => Err(unexpected("chunk", &other)),
         }
@@ -728,6 +730,19 @@ mod tests {
         assert!(cancelled.is_err(), "the call must still be waiting");
         send.write_all(&whole[3..]).await.unwrap();
         assert!(matches!(stream.next().await, Err(RpcError::Interrupted)));
+    }
+
+    /// A peer whose budget ran out while it looked for a chunk reports a
+    /// deadline, which the caller sees as from any other call.
+    #[tokio::test]
+    async fn a_peer_deadline_on_a_chunk_is_the_callers_deadline() {
+        let id = ChunkId::of(b"x");
+        let (mut send, recv) = tokio::io::duplex(1 << 10);
+        let mut stream = stream_over(recv, &[id]);
+        send.write_all(&frame(ResponseBody::Fault(Fault::Deadline)))
+            .await
+            .unwrap();
+        assert!(matches!(stream.next().await, Err(RpcError::Deadline(d)) if d == IDLE));
     }
 
     /// A stream that failed inside a frame never reads again.
