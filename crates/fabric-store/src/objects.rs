@@ -388,16 +388,30 @@ impl ObjectStore {
     }
 
     /// Reads and verifies one object.
+    ///
+    /// No frame of `MAX_OBJECT_LEN` bytes compresses to more than zstd's
+    /// compression bound for that length, so a longer file is corrupt and is
+    /// refused before it is loaded: a grown file never decides the size of
+    /// the buffer.
     pub fn read(&self, id: ChunkId) -> Result<Vec<u8>, ObjectError> {
         let path = self.object_path(id);
-        let compressed = match fs::read(&path) {
-            Ok(bytes) => bytes,
+        let bound = MAX_OBJECT_LEN as usize;
+        let stored_bound = zstd::zstd_safe::compress_bound(bound) as u64;
+        let file = match open_regular(&path) {
+            Ok(Some(file)) => file,
+            Ok(None) => return Err(ObjectError::Corrupt { id }),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return Err(ObjectError::Missing { id });
             }
             Err(e) => return Err(io_err(&path, e)),
         };
-        let bound = MAX_OBJECT_LEN as usize;
+        let mut compressed = Vec::new();
+        file.take(stored_bound + 1)
+            .read_to_end(&mut compressed)
+            .map_err(|e| io_err(&path, e))?;
+        if compressed.len() as u64 > stored_bound {
+            return Err(ObjectError::Corrupt { id });
+        }
         let capacity = match zstd::zstd_safe::get_frame_content_size(&compressed) {
             Ok(Some(n)) if usize::try_from(n).is_ok_and(|n| n <= bound) => {
                 usize::try_from(n).unwrap_or(bound)
