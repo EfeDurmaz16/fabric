@@ -154,6 +154,10 @@ pub struct CheckReport {
     pub refcount_mismatches: Vec<ChunkId>,
     /// Snapshots whose bundle base is not in the catalog, with that base.
     pub broken_chains: Vec<(SnapshotId, SnapshotId)>,
+    /// Snapshots whose objects are whole but whose manifest does not assemble
+    /// to its id and recorded length, does not decode, or names other data
+    /// objects than the catalog rows; checked at `Hashes` depth only.
+    pub bad_manifests: Vec<SnapshotId>,
 }
 
 impl CheckReport {
@@ -164,6 +168,7 @@ impl CheckReport {
             && self.corrupt.is_empty()
             && self.refcount_mismatches.is_empty()
             && self.broken_chains.is_empty()
+            && self.bad_manifests.is_empty()
     }
 }
 
@@ -493,6 +498,7 @@ impl Store {
         let mut seen_ok: HashSet<ChunkId> = HashSet::new();
         for row in self.catalog.snapshots()? {
             report.snapshots += 1;
+            let damaged = report.missing.len() + report.corrupt.len();
             for role in [Role::Manifest, Role::Data] {
                 for chunk in self.catalog.snapshot_chunks(row.id, role)? {
                     if seen_ok.contains(&chunk.id) {
@@ -512,7 +518,27 @@ impl Store {
                     }
                 }
             }
+            let whole = report.missing.len() + report.corrupt.len() == damaged;
+            if depth == CheckDepth::Hashes && whole && !self.manifest_agrees(row.id)? {
+                report.bad_manifests.push(row.id);
+            }
         }
         Ok(report)
+    }
+
+    /// Says whether a snapshot's manifest assembles, decodes and names the data rows the catalog holds.
+    fn manifest_agrees(&self, id: SnapshotId) -> Result<bool, StoreError> {
+        let manifest = match self.manifest(id) {
+            Ok(manifest) => manifest,
+            Err(StoreError::ManifestMismatch(_) | StoreError::Manifest(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let rows: Vec<ChunkId> = self
+            .catalog
+            .snapshot_chunks(id, Role::Data)?
+            .iter()
+            .map(|chunk| chunk.id)
+            .collect();
+        Ok(rows == Self::data_chunks(&manifest))
     }
 }

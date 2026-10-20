@@ -357,6 +357,59 @@ fn check_sees_a_wrong_refcount_and_a_broken_chain() {
 }
 
 #[test]
+fn check_at_hash_depth_sees_a_manifest_that_does_not_assemble() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::create(dir.path(), params().unwrap()).unwrap();
+    let entry = file_entry(&store, "f", b"listed").unwrap();
+    let id = store.publish(&manifest(vec![entry], 1).unwrap()).unwrap();
+    assert!(store.check(CheckDepth::Hashes).unwrap().is_clean());
+    drop(store);
+
+    let conn = rusqlite::Connection::open(dir.path().join("catalog.sqlite")).unwrap();
+    conn.execute(
+        "UPDATE snapshots SET manifest_len = manifest_len + 1 WHERE id = ?1",
+        [id.to_bytes()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = Store::open(dir.path()).unwrap();
+    assert!(matches!(
+        store.manifest(id),
+        Err(StoreError::ManifestMismatch(_))
+    ));
+    let report = store.check(CheckDepth::Hashes).unwrap();
+    assert_eq!(report.bad_manifests, vec![id]);
+    assert!(report.missing.is_empty() && report.corrupt.is_empty());
+    assert!(!report.is_clean());
+}
+
+#[test]
+fn check_at_hash_depth_sees_data_rows_the_manifest_does_not_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::create(dir.path(), params().unwrap()).unwrap();
+    let entry = file_entry(&store, "f", b"named").unwrap();
+    let other = file_entry(&store, "g", b"other").unwrap();
+    let id = store.publish(&manifest(vec![entry], 1).unwrap()).unwrap();
+    store
+        .publish(&manifest(vec![other.clone()], 2).unwrap())
+        .unwrap();
+    drop(store);
+
+    let conn = rusqlite::Connection::open(dir.path().join("catalog.sqlite")).unwrap();
+    conn.execute(
+        "UPDATE snapshot_chunks SET chunk_id = ?1 WHERE snapshot_id = ?2 AND role = 1",
+        rusqlite::params![chunks_of(&other).unwrap()[0].to_bytes(), id.to_bytes()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = Store::open(dir.path()).unwrap();
+    let report = store.check(CheckDepth::Hashes).unwrap();
+    assert!(report.bad_manifests.contains(&id));
+}
+
+#[test]
 fn a_corrupt_object_left_without_a_row_is_removed_not_published() {
     let dir = tempfile::tempdir().unwrap();
     let m;
