@@ -541,11 +541,12 @@ async fn launch(state: &StateDir, home: &Path, plan: &RunPlan, mode: Mode) -> Re
         // The protocol client holds an ACP agent's output.
         _ => None,
     };
-    // Caught before the harness starts, so none is lost in between.
-    let forward = read_line.map(|_| Forward::new()).transpose()?;
     let tree = materialize(state, &plan.root, notes)?;
     let socket = state.socket();
     let headless = matches!(mode, Mode::Headless(_));
+    // Caught from just before the harness starts, so none is lost in
+    // between; a signal during the setup steps still ends the command.
+    let forward = read_line.map(|_| Forward::new()).transpose()?;
     let mut running = start(state, home, plan, mode, notes).await?;
     let pid = running.pid();
     let registered = register(&socket, plan, &running, notes).await;
@@ -561,9 +562,23 @@ async fn launch(state: &StateDir, home: &Path, plan: &RunPlan, mode: Mode) -> Re
             notes,
             read_line,
         };
-        let (report, status) = turn.run(&mut running, forward).await?;
-        print_turn(plan, &report)?;
-        return exited(&socket, plan, pid, status).await;
+        let (report, status, mut forward) = turn.run(&mut running, forward).await?;
+        // The node hears of the exit even when the answer cannot be printed,
+        // as after the hang-up of the terminal that would have shown it.
+        let printed = print_turn(plan, &report);
+        let code = tokio::select! {
+            code = exited(&socket, plan, pid, status, forward.passed > 0) => code?,
+            signal = forward.next() => {
+                writeln!(
+                    std::io::stderr(),
+                    "interrupted while the node recorded the end of the turn; `fabric job status {}` shows what it holds",
+                    plan.job
+                )?;
+                return Ok(signal_exit(signal.as_raw()));
+            }
+        };
+        printed?;
+        return Ok(code);
     }
     // A held harness has not run yet: it gets the terminal first, then starts.
     let handed = if running.is_held() {
@@ -577,16 +592,20 @@ async fn launch(state: &StateDir, home: &Path, plan: &RunPlan, mode: Mode) -> Re
     }
     let status = running.child_mut().wait().await?;
     drop(handed);
-    if headless {
+    let printed = if headless {
         print_turn(
             plan,
             &TurnReport {
                 session: running.session().cloned(),
                 ..TurnReport::default()
             },
-        )?;
-    }
-    exited(&socket, plan, pid, status).await
+        )
+    } else {
+        Ok(())
+    };
+    let code = exited(&socket, plan, pid, status, false).await?;
+    printed?;
+    Ok(code)
 }
 
 /// Launches the plan's harness in `mode`; held when it is interactive and
@@ -679,6 +698,8 @@ struct Forward {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
     hangup: tokio::signal::unix::Signal,
+    /// How many signals were passed on.
+    passed: u32,
 }
 
 impl Forward {
@@ -688,6 +709,7 @@ impl Forward {
             interrupt: signal(SignalKind::interrupt())?,
             terminate: signal(SignalKind::terminate())?,
             hangup: signal(SignalKind::hangup())?,
+            passed: 0,
         })
     }
 
@@ -695,11 +717,29 @@ impl Forward {
     async fn next(&mut self) -> rustix::process::Signal {
         use rustix::process::Signal;
         tokio::select! {
-            _ = self.interrupt.recv() => Signal::INT,
-            _ = self.terminate.recv() => Signal::TERM,
-            _ = self.hangup.recv() => Signal::HUP,
+            Some(()) = self.interrupt.recv() => Signal::INT,
+            Some(()) = self.terminate.recv() => Signal::TERM,
+            Some(()) = self.hangup.recv() => Signal::HUP,
+            else => std::future::pending().await,
         }
     }
+
+    /// Passes `signal` on to the harness's group `pgid`; from the second
+    /// signal on, kills the group, so a harness that ignores the first
+    /// cannot keep the command from ending.
+    fn pass_on(&mut self, pgid: std::num::NonZeroU32, signal: rustix::process::Signal) {
+        self.passed += 1;
+        if self.passed > 1 {
+            send_to_group(pgid, rustix::process::Signal::KILL);
+        } else {
+            send_to_group(pgid, signal);
+        }
+    }
+}
+
+/// The exit code of a command ended by the signal `number`.
+fn signal_exit(number: i32) -> ExitCode {
+    ExitCode::from(u8::try_from(128 + number).unwrap_or(u8::MAX))
 }
 
 /// A headless turn being read: where to tell the node about a session,
@@ -717,12 +757,16 @@ impl Turn<'_> {
     /// A session it names that the node does not hold yet goes to a
     /// recorder task at once, so a suspend during the turn captures it,
     /// while this loop keeps reaping the harness, which a suspend waits
-    /// for. A signal `fabric` gets is passed on to the harness's group.
+    /// for. A signal `fabric` gets is passed on to the harness's group
+    /// until the harness is reaped, and one that comes while the node
+    /// records the last session gives up waiting for it. Returns the
+    /// signals, which the caller keeps watching while it tells the node
+    /// the harness exited.
     async fn run(
         &self,
         running: &mut Running,
         mut forward: Forward,
-    ) -> Result<(TurnReport, std::process::ExitStatus)> {
+    ) -> Result<(TurnReport, std::process::ExitStatus, Forward)> {
         let pid = running.pid();
         let child = running.child_mut();
         let Some(stdout) = child.stdout.take() else {
@@ -764,7 +808,7 @@ impl Turn<'_> {
                         continue;
                     }
                     signal = forward.next() => {
-                        send_to_group(pid, signal);
+                        forward.pass_on(pid, signal);
                         continue;
                     }
                 }
@@ -785,14 +829,33 @@ impl Turn<'_> {
             }
         }
         drop(sessions);
+        // The harness closed its output and may still run.
         let status = match status {
             Some(status) => status,
-            None => running.child_mut().wait().await?,
+            None => loop {
+                tokio::select! {
+                    exit = running.child_mut().wait() => break exit?,
+                    signal = forward.next() => forward.pass_on(pid, signal),
+                }
+            },
         };
-        if let Err(e) = recorder.await {
-            tracing::warn!(error = %e, "the session recorder ended early");
+        let mut recorder = recorder;
+        tokio::select! {
+            ended = &mut recorder => {
+                if let Err(e) = ended {
+                    tracing::warn!(error = %e, "the session recorder ended early");
+                }
+            }
+            _ = forward.next() => {
+                recorder.abort();
+                writeln!(
+                    std::io::stderr(),
+                    "warning: interrupted while the node recorded the session; `fabric job status {}` shows what it holds",
+                    self.plan.job
+                )?;
+            }
         }
-        Ok((report, status))
+        Ok((report, status, forward))
     }
 }
 
@@ -875,12 +938,14 @@ fn print_turn(plan: &RunPlan, report: &TurnReport) -> Result<()> {
 }
 
 /// Tells the node the harness exited and picks the exit code: the harness's
-/// own, or 128 plus the signal that stopped it, with a line saying why.
+/// own, or 128 plus the signal that stopped it, with a line saying why;
+/// `passed_on` says fabric passed a signal of its own on to the harness.
 async fn exited(
     socket: &Path,
     plan: &RunPlan,
     pid: std::num::NonZeroU32,
     status: std::process::ExitStatus,
+    passed_on: bool,
 ) -> Result<ExitCode> {
     let told = control::call(socket, &Request::HarnessExited { job: plan.job, pid }).await;
     let missed = match told {
@@ -897,14 +962,19 @@ async fn exited(
         )?;
     }
     if let Some(signal) = status.signal() {
-        writeln!(
-            std::io::stderr(),
-            "the harness was stopped by signal {signal}; the node stops it when the job is suspended, moves away or is stolen. Run `fabric job status {}` to see why",
-            plan.job
-        )?;
-        return Ok(ExitCode::from(
-            u8::try_from(128 + signal).unwrap_or(u8::MAX),
-        ));
+        if passed_on {
+            writeln!(
+                std::io::stderr(),
+                "the harness ended on signal {signal}, after fabric passed a signal on to it"
+            )?;
+        } else {
+            writeln!(
+                std::io::stderr(),
+                "the harness was stopped by signal {signal}; the node stops it when the job is suspended, moves away or is stolen. Run `fabric job status {}` to see why",
+                plan.job
+            )?;
+        }
+        return Ok(signal_exit(signal));
     }
     Ok(match status.code() {
         Some(0) => ExitCode::SUCCESS,
