@@ -654,6 +654,11 @@ fn clear_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
 /// A cache the steps did not create, or one that is or lies under a link,
 /// gets no sentinel: the next plan sees it missing or not a directory and
 /// fills it again, which costs time and never writes outside the workspace.
+/// A regular file the steps left at the sentinel's name, such as one
+/// unpacked from an archive of a whole cache, is kept: the steps exited 0,
+/// which is all the sentinel says. Anything else there, a link included,
+/// is removed and the sentinel created in its place, so a link is never
+/// followed.
 fn write_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
     let sentinel_err = |source| MaterializeError::Sentinel {
         path: path.clone(),
@@ -663,11 +668,27 @@ fn write_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
         tracing::warn!(target: SETUP_LOG_TARGET, cache = %path, "the setup steps left no real directory at this cache path; it will be filled again on the next resume");
         return Ok(());
     };
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(dir.join(SENTINEL))
-        .map_err(sentinel_err)?;
+    let sentinel = dir.join(SENTINEL);
+    let create = || {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&sentinel)
+    };
+    let mut file = match create() {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            if fs::symlink_metadata(&sentinel)
+                .map_err(sentinel_err)?
+                .is_file()
+            {
+                return Ok(());
+            }
+            fs::remove_file(&sentinel).map_err(sentinel_err)?;
+            create().map_err(sentinel_err)?
+        }
+        Err(err) => return Err(sentinel_err(err)),
+    };
     file.write_all(SENTINEL_TEXT).map_err(sentinel_err)
 }
 

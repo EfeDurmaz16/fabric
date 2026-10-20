@@ -736,3 +736,48 @@ fn a_lock_for_another_tree_does_not_plan_or_run_this_one() {
         Err(MaterializeError::WrongTree { .. })
     ));
 }
+
+/// A step that leaves the sentinel itself, as one that unpacks an archive
+/// of a whole cache does, succeeds; a link it leaves there is replaced by
+/// a real sentinel and never followed.
+#[test]
+fn a_sentinel_the_steps_left_is_kept_and_a_link_there_is_replaced() {
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("target"), "outside").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
+    let link = format!(
+        "ln -s {} built/{SENTINEL}",
+        outside.path().join("target").display()
+    );
+    let override_toml = format!(
+        r#"
+[[cache]]
+path = "out"
+class = "build"
+
+[[cache]]
+path = "built"
+class = "build"
+
+[[setup]]
+program = "sh"
+args = ["-c", "mkdir -p out built && echo x > out/f && echo x > built/f && touch out/{SENTINEL} && {link}"]
+"#
+    );
+    let detected = declared(dir.path(), &override_toml).unwrap();
+    plan(&detected, &lock)
+        .unwrap()
+        .ready()
+        .unwrap()
+        .execute(&lock)
+        .unwrap();
+    let built = fs::symlink_metadata(dir.path().join("built").join(SENTINEL)).unwrap();
+    assert!(built.is_file());
+    assert_eq!(
+        fs::read_to_string(outside.path().join("target")).unwrap(),
+        "outside"
+    );
+    let again = plan(&detect(dir.path(), None).unwrap(), &lock).unwrap();
+    assert!(again.is_noop(), "{:?}", again.caches());
+}
