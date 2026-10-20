@@ -35,11 +35,12 @@ use fabric_store::restore::{
     restore_state,
 };
 
+use crate::carry::{self, PathDecision};
 use crate::clock;
 use crate::control::{Decision, Request, RunPlan};
 use crate::doctor::{self, Context, Target};
 use crate::error::NodeError;
-use crate::facts::{MeasuredKeys, NodeFacts, key_difference};
+use crate::facts::{MeasuredKeys, NodeFacts};
 use crate::faults::{self, Action, Point};
 use crate::harnesses::adapter;
 use crate::job::Job;
@@ -943,20 +944,44 @@ impl Node {
                 });
             }
         }
-        self.preflight(
-            to,
-            Some((&harness, &root)),
-            Target::Peer,
-            path_var,
-            force,
-            out,
-        )
-        .await?;
+        let theirs = self
+            .preflight(
+                to,
+                Some((&harness, &root)),
+                Target::Peer,
+                path_var,
+                force,
+                out,
+            )
+            .await?;
 
-        if matches!(view, LeaseView::Owner(_)) {
+        let owner = matches!(view, LeaseView::Owner(_));
+        let snapshot = if owner {
             let job = self.job(id).await?;
             let mut job = job.lock().await;
-            self.suspend_locked(&mut job, path_var, out).await?;
+            Some(self.suspend_locked(&mut job, path_var, out).await?)
+        } else {
+            let job = self.job(id).await?;
+            let job = job.lock().await;
+            job.latest()
+        };
+        if let Some(snapshot) = snapshot {
+            let manifest =
+                with_store(&self.store, move |store| Ok(store.manifest(snapshot)?)).await?;
+            let decisions = carry::decide_all(&manifest, &theirs);
+            if !decisions.is_empty() {
+                out.say(format!(
+                    "what {to} does with each ignored path of snapshot {snapshot}:"
+                ));
+            }
+            for decision in &decisions {
+                out.say(decision.to_string());
+            }
+            // Once MoveStarted is written, a refusal could only freeze the
+            // job here; a move asked again after it goes on.
+            if owner {
+                refuse_carry(&decisions, force, out)?;
+            }
         }
         self.push_records(id, to).await?;
         out.say(format!("{to} holds the ledger and the snapshot"));
@@ -1635,7 +1660,8 @@ impl Node {
         Ok(root)
     }
 
-    /// Writes `snapshot` into the empty `root`, carrying each cache whose key matches this node's.
+    /// Writes `snapshot` into the empty `root`, writing each cache the
+    /// carry decision says this node writes, and says what it wrote.
     async fn write_snapshot(
         &self,
         snapshot: SnapshotId,
@@ -1646,13 +1672,24 @@ impl Node {
         out: &mut Out,
     ) -> Result<(), NodeError> {
         let facts = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
-        report_caches(&manifest.caches, &facts, out);
+        let decisions = carry::decide_all(manifest, &facts);
+        if !decisions.is_empty() {
+            out.say(format!(
+                "what this node does with each ignored path of snapshot {snapshot}:"
+            ));
+        }
+        for decision in &decisions {
+            out.say(restore_line(decision));
+        }
+        let writes: std::collections::BTreeSet<fabric_core::path::RelPath> = decisions
+            .into_iter()
+            .filter(|d| d.decision.writes())
+            .map(|d| d.path)
+            .collect();
         let has_git = manifest.git.is_some();
         let target = root.to_owned();
         let report = with_store(&self.store, move |store| {
-            let carry = |entry: &fabric_core::snapshot::CacheEntry| {
-                entry.key.matches(&facts.key_like(&entry.key))
-            };
+            let carry = |entry: &fabric_core::snapshot::CacheEntry| writes.contains(&entry.path);
             Ok(restore(
                 store,
                 &RestoreRequest {
@@ -1824,29 +1861,52 @@ impl Node {
             }
             return Ok(());
         };
-        let (harness, root) = match job {
+        let (harness, root, latest) = match job {
             Some(id) => {
                 let job = self.job(id).await?;
                 let job = job.lock().await;
                 let root = job
                     .marker()?
                     .map_or_else(|| paths::job_root(&self.cfg.home, id), |m| m.root);
-                (Some(job.harness().clone()), Some(root))
+                (Some(job.harness().clone()), Some(root), job.latest())
             }
-            None => (None, None),
+            None => (None, None, None),
         };
-        self.preflight(
-            peer,
-            harness.as_ref().zip(root.as_deref()),
-            Target::Peer,
-            path_var,
-            false,
-            out,
-        )
-        .await
+        let (rows, theirs) = self
+            .compare(
+                peer,
+                harness.as_ref().zip(root.as_deref()),
+                Target::Peer,
+                path_var,
+            )
+            .await?;
+        for row in &rows {
+            out.say(row.to_string());
+        }
+        let mut decisions = Vec::new();
+        match (job, latest) {
+            (Some(_), Some(snapshot)) => {
+                let manifest =
+                    with_store(&self.store, move |store| Ok(store.manifest(snapshot)?)).await?;
+                decisions = carry::decide_all(&manifest, &theirs);
+                out.say(format!(
+                    "what {peer} would do with each ignored path of snapshot {snapshot}; a move decides again on the snapshot it takes:"
+                ));
+                for decision in &decisions {
+                    out.say(decision.to_string());
+                }
+            }
+            (Some(_), None) => out.say(
+                "no snapshot yet; a move decides each ignored path once it has suspended the job",
+            ),
+            (None, _) => {}
+        }
+        refuse_rows(&rows, false)?;
+        refuse_carry(&decisions, false, out)
     }
 
-    /// Compares this node's facts with `peer`'s and stops on a refusal `force` does not waive.
+    /// Compares this node's facts with `peer`'s, prints the rows, stops on
+    /// a refusal `force` does not waive, and returns the peer's facts.
     async fn preflight(
         self: &Arc<Self>,
         peer: NodeId,
@@ -1855,7 +1915,23 @@ impl Node {
         path_var: &OsString,
         force: bool,
         out: &mut Out,
-    ) -> Result<(), NodeError> {
+    ) -> Result<NodeFacts, NodeError> {
+        let (rows, theirs) = self.compare(peer, job, target, path_var).await?;
+        for row in &rows {
+            out.say(row.to_string());
+        }
+        refuse_rows(&rows, force)?;
+        Ok(theirs)
+    }
+
+    /// Measures this node, asks `peer` for its facts, and compares them row by row.
+    async fn compare(
+        self: &Arc<Self>,
+        peer: NodeId,
+        job: Option<(&HarnessKind, &Path)>,
+        target: Target,
+        path_var: &OsString,
+    ) -> Result<(Vec<doctor::Row>, NodeFacts), NodeError> {
         let here = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
         let session = self.dial(peer).await?;
         let theirs =
@@ -1878,17 +1954,43 @@ impl Node {
                 wire: Some(session.kind().to_string()),
             },
         );
-        for row in &rows {
-            out.say(row.to_string());
-        }
-        let blocking = doctor::blocking(&rows, force);
-        if blocking.is_empty() {
-            Ok(())
-        } else {
-            let facts: Vec<&str> = blocking.iter().map(|r| r.fact).collect();
-            Err(NodeError::Preflight(facts.join(", ")))
-        }
+        Ok((rows, theirs))
     }
+}
+
+/// Stops on a row `force` does not waive.
+fn refuse_rows(rows: &[doctor::Row], force: bool) -> Result<(), NodeError> {
+    let blocking = doctor::blocking(rows, force);
+    if blocking.is_empty() {
+        Ok(())
+    } else {
+        let facts: Vec<&str> = blocking.iter().map(|r| r.fact).collect();
+        Err(NodeError::Preflight(facts.join(", ")))
+    }
+}
+
+/// Stops on a path the target can neither use nor make again, unless
+/// `force`, which carries it as it is (gate finding F6).
+fn refuse_carry(decisions: &[PathDecision], force: bool, out: &mut Out) -> Result<(), NodeError> {
+    let refused: Vec<String> = decisions
+        .iter()
+        .filter(|d| d.decision.refuses())
+        .map(|d| d.path.to_string())
+        .collect();
+    if refused.is_empty() {
+        return Ok(());
+    }
+    if force {
+        out.say(format!(
+            "--force: {} travels as it is, and the target writes it",
+            refused.join(", ")
+        ));
+        return Ok(());
+    }
+    Err(NodeError::Preflight(format!(
+        "the target can neither use nor rebuild {}",
+        refused.join(", ")
+    )))
 }
 
 /// What a call that reached `peer` and failed means: a peer that gave no
@@ -1983,19 +2085,13 @@ fn plan(
     })
 }
 
-/// Says, one line per cache, whether its bytes are written here or rebuilt, and why (ADR 0008).
-fn report_caches(caches: &[fabric_core::snapshot::CacheEntry], facts: &NodeFacts, out: &mut Out) {
-    for cache in caches {
-        let mine = facts.key_like(&cache.key);
-        if cache.key.matches(&mine) && cache.carry == fabric_core::snapshot::CarryState::Carried {
-            out.say(format!("{}: carried, the keys match", cache.path));
-        } else {
-            out.say(format!(
-                "{}: rebuilt here, {}",
-                cache.path,
-                key_difference(&cache.key, &mine)
-            ));
-        }
+/// One decision as resume prints it: a refused path is written anyway,
+/// because it arrived through `--force` or a pull and leaving it out would lose it.
+fn restore_line(decision: &PathDecision) -> String {
+    if decision.decision.refuses() {
+        format!("{decision}; written anyway, since nothing here can make it again")
+    } else {
+        decision.to_string()
     }
 }
 
@@ -2442,6 +2538,29 @@ pub(crate) mod tests {
         assert!(
             matches!(refused, Err(NodeError::Forked { .. })),
             "{refused:?}"
+        );
+    }
+
+    /// A path the target can neither use nor rebuild stops a move that is
+    /// not forced, by name; a forced one goes on and says what it carries.
+    #[test]
+    fn a_refused_path_stops_the_move_unless_forced() {
+        let refused = PathDecision {
+            path: fabric_core::path::RelPath::parse("node_modules").unwrap(),
+            decision: carry::CarryDecision::Refuse {
+                reason: "pnpm is not installed on the target".to_owned(),
+            },
+        };
+        let mut out = Out { lines: Vec::new() };
+        let err = refuse_carry(std::slice::from_ref(&refused), false, &mut out).unwrap_err();
+        assert!(
+            matches!(&err, NodeError::Preflight(text) if text.contains("node_modules")),
+            "{err}"
+        );
+        refuse_carry(&[refused], true, &mut out).unwrap();
+        assert_eq!(
+            out.lines,
+            ["--force: node_modules travels as it is, and the target writes it"]
         );
     }
 

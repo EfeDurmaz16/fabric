@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use fabric_core::env::SetupStep;
 use fabric_core::path::{AbsPath, RelPath};
-use fabric_core::snapshot::{CacheClass, CarryKey, Remake};
+use fabric_core::snapshot::{CacheClass, CarryKey, Platform, Remake};
 use fabric_env::detect::{CacheOrigin, Completion, Detection, Ecosystem, NodeManager};
 use fabric_net::wire::{FactName, FactValue, Facts, MAX_FACT_VALUE};
 use fabric_store::capture::CarryKeys;
@@ -282,6 +282,17 @@ pub fn find_on_path(program: &str, path_var: &OsString) -> Option<PathBuf> {
         })
 }
 
+/// What a node knows about one program a setup step runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Program<'a> {
+    /// Not a program the node measures, such as a declared `make`.
+    Unmeasured,
+    /// Measured and not installed.
+    Missing,
+    /// Installed; the version it reports.
+    Installed(&'a str),
+}
+
 /// The `tool` of the `Other` key whose version is the node's `{os}-{arch}`.
 pub const PLATFORM_TOOL: &str = "platform";
 
@@ -350,6 +361,33 @@ impl NodeFacts {
             tool: NODE_ABI_TOOL.to_owned(),
             version: self.get(name::NODE_ABI)?.to_owned(),
         })
+    }
+
+    /// This node's operating system and architecture, named as a snapshot names them.
+    #[must_use]
+    pub fn platform(&self) -> Platform {
+        Platform {
+            os: self.get(name::OS).unwrap_or_default().to_owned(),
+            arch: self.get(name::ARCH).unwrap_or_default().to_owned(),
+        }
+    }
+
+    /// What this node knows about `program`.
+    #[must_use]
+    pub fn program(&self, program: &str) -> Program<'_> {
+        let fact = match program {
+            "node" => name::NODE,
+            "npm" => name::NPM,
+            "pnpm" => name::PNPM,
+            "yarn" => name::YARN,
+            "bun" => name::BUN,
+            // rustup installs cargo beside rustc.
+            "rustc" | "cargo" => name::RUSTC,
+            "python3" => name::PYTHON,
+            "uv" => name::UV,
+            _ => return Program::Unmeasured,
+        };
+        self.get(fact).map_or(Program::Missing, Program::Installed)
     }
 
     /// The key this node measures for the ecosystem `source` names (ADR 0012).

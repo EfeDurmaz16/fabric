@@ -170,7 +170,7 @@ pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row
             here,
             peer,
             Outcome::Fallback,
-            "a pnpm node_modules is not carried; the lockfile install runs (ADR 0012)",
+            "a pnpm node_modules is rebuilt only where the same pnpm major runs; the carry lines say what happens to each path, ADR 0012",
         ));
     }
     let mut node = row(
@@ -186,7 +186,7 @@ pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row
     );
     if node.outcome != Outcome::Equal && node_majors.0 != node_majors.1 {
         node.outcome = Outcome::Fallback;
-        "node_modules is not carried across Node majors; the lockfile install runs (ADR 0012)"
+        "a node_modules with a lockfile is rebuilt, one without travels as it is; the carry lines say which, ADR 0012"
             .clone_into(&mut node.note);
     }
     rows.push(node);
@@ -195,7 +195,7 @@ pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row
         here,
         peer,
         Outcome::Fallback,
-        "native addons built for one ABI do not load under another",
+        "native addons built for one ABI do not load under another; the carry lines name a tree that holds one",
     ));
     for fact in [name::RUSTC, name::CARGO_HOME] {
         rows.push(row(
@@ -203,7 +203,7 @@ pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row
             here,
             peer,
             Outcome::Fallback,
-            "target/ is not carried; cargo rebuilds (ADR 0012)",
+            "target/ is left for the next cargo build to make again (ADR 0012)",
         ));
     }
     for fact in [name::MACOS, name::MACOS_SDK] {
