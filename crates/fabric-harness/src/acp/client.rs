@@ -3,9 +3,12 @@
 //! Invariant: the client speaks only the baseline of ACP schema v1
 //! (`initialize`, `session/new`, `session/load`, `session/resume`,
 //! `session/prompt`, `session/cancel`, `session/update`), answers every
-//! agent request so the agent never blocks, never drops a `session/update`,
-//! and grants a permission only when the policy the caller chose says so,
-//! never more than it says. Deny is the default. A handshake request has a
+//! agent request so the agent never blocks, and grants a permission only
+//! when the policy the caller chose says so, never more than it says. Deny
+//! is the default. At most `UPDATE_BUFFER` `session/update` notifications
+//! wait for `next_update`; newer ones are dropped and counted in
+//! `dropped_updates`, so the reader never waits on a caller who is not
+//! draining updates. A handshake request has a
 //! deadline, so a hung agent cannot hang `launch`. Every message reaches
 //! the agent as one whole line written by a single writer task, so a
 //! caller that drops a request mid-way cannot leave half a line on the
