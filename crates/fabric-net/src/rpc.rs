@@ -677,10 +677,16 @@ impl VerifiedChunk {
         &self.stored
     }
 
-    /// Returns the id, the zstd frame and the bytes.
+    /// Returns the id and the zstd frame, which a store keeps as is.
     #[must_use]
-    pub fn into_parts(self) -> (ChunkId, Vec<u8>, Vec<u8>) {
-        (self.id, self.stored, self.bytes)
+    pub fn into_stored(self) -> (ChunkId, Vec<u8>) {
+        (self.id, self.stored)
+    }
+
+    /// Returns the id and the decompressed bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> (ChunkId, Vec<u8>) {
+        (self.id, self.bytes)
     }
 }
 

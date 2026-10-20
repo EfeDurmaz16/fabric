@@ -571,7 +571,7 @@ async fn a_chunk_transfer_resumes_after_the_connection_drops() -> TestResult {
         let interrupted = loop {
             match stream.next().await {
                 Ok(Some(chunk)) => {
-                    let (id, _, bytes) = chunk.into_parts();
+                    let (id, bytes) = chunk.into_bytes();
                     got.insert(id, bytes);
                 }
                 Ok(None) => break None,
@@ -610,7 +610,7 @@ async fn a_chunk_transfer_resumes_after_the_connection_drops() -> TestResult {
             .await?;
         let mut resumed = 0;
         while let Some(chunk) = stream.next().await? {
-            let (id, _, bytes) = chunk.into_parts();
+            let (id, bytes) = chunk.into_bytes();
             assert!(
                 got.insert(id, bytes).is_none(),
                 "{kind}: a chunk arrived twice"
