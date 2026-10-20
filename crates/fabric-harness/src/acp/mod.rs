@@ -3,7 +3,8 @@
 //! Invariant: any agent that speaks ACP and advertises `session/load` or
 //! `session/resume` can be continued in a new workspace by its session id
 //! alone; Fabric carries, from the agent's declared state directory, only
-//! the files whose path names the session, as opaque bytes it never
+//! the files whose path has a component that is the session id or the id
+//! plus an extension, as opaque bytes it never
 //! parses, and refuses a file that holds a secret-shaped string. An agent
 //! whose state directory is not declared cannot be captured or restored,
 //! and the adapter says so instead of guessing. Restore accepts only the
@@ -38,6 +39,14 @@ use crate::redact::RedactionCounts;
 use crate::session::SessionId;
 
 use self::client::{AcpClient, AcpError, PermissionPolicy, StopReason};
+
+/// True when a path component is the session's own: the id itself (a
+/// directory) or the id followed by an extension (`<sid>.json`). Session
+/// `s1` does not own `s10.json` or `xs1y`.
+fn names_session(part: &str, session: &SessionId) -> bool {
+    part.strip_prefix(session.as_str())
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
 
 /// An ACP agent started as `program args...`.
 #[derive(Debug, Clone)]
@@ -154,10 +163,7 @@ impl AcpHarness {
         let mut sources = Vec::new();
         for file in files::walk(&dir)? {
             let file_parts = files::rel_components(&file)?;
-            if !file_parts
-                .iter()
-                .any(|part| part.contains(session.as_str()))
-            {
+            if !file_parts.iter().any(|part| names_session(part, session)) {
                 continue;
             }
             let mut parts: Vec<&str> = vec![HOME_PREFIX];
@@ -236,7 +242,7 @@ impl AcpHarness {
                 return false;
             }
         }
-        parts.any(|part| part.contains(session.as_str()))
+        parts.any(|part| names_session(part, session))
     }
 
     fn restore_sync(

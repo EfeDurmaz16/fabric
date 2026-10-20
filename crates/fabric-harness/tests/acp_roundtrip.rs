@@ -400,6 +400,38 @@ async fn a_secret_in_the_state_directory_refuses_the_capture() {
 }
 
 #[tokio::test]
+async fn only_files_named_for_the_session_are_captured() {
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let state_dir = home.path().join(".fake-agent/sessions");
+    for name in [
+        "s1.json",
+        "s10.json",
+        "xs1y/a.json",
+        "s1/turns.jsonl",
+        "s1-backup/b.json",
+    ] {
+        let path = state_dir.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{}\n").unwrap();
+    }
+    let out = tempfile::tempdir().unwrap();
+    let manifest = adapter(home.path(), PermissionPolicy::Deny)
+        .capture(&work, &SessionId::parse("s1").unwrap(), out.path())
+        .await
+        .unwrap();
+    let paths: Vec<&str> = manifest.files.iter().map(|f| f.rel_path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec![
+            "home/.fake-agent/sessions/s1.json",
+            "home/.fake-agent/sessions/s1/turns.jsonl"
+        ]
+    );
+}
+
+#[tokio::test]
 async fn capture_without_a_declared_state_dir_is_refused() {
     let home = tempfile::tempdir().unwrap();
     let work = home.path().join("work");
