@@ -28,7 +28,10 @@
 //!
 //! The connection lives while its handle or any of its streams does, as a
 //! QUIC connection does; `close` ends it at once and every stream on it
-//! fails.
+//! fails. As on QUIC, a side that has written nothing for `KEEP_ALIVE`
+//! sends a `KeepAlive` frame, and a side that has read nothing for
+//! `IDLE_TIMEOUT` ends the connection, so a peer that slept or changed
+//! networks does not leave a half-open connection behind.
 
 use std::collections::HashMap;
 use std::future::poll_fn;
@@ -42,7 +45,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::AbortHandle;
 
+use crate::idle::IdleReader;
 use crate::pipe::{Drained, PipeReader, PipeWriter, Refused, pipe};
+use crate::quic::{IDLE_TIMEOUT, KEEP_ALIVE};
 use crate::transport::{Connection, Stream, TransportError, TransportKind};
 
 /// The most payload bytes in one multiplexer frame.
@@ -72,6 +77,8 @@ enum FrameKind {
     Reset,
     /// Gives the receiver of this frame more credit on the stream: a `u32` byte count.
     Credit,
+    /// Says the sender is alive; it names no stream.
+    KeepAlive,
 }
 
 impl FrameKind {
@@ -81,6 +88,7 @@ impl FrameKind {
             FrameKind::Fin => 1,
             FrameKind::Reset => 2,
             FrameKind::Credit => 3,
+            FrameKind::KeepAlive => 4,
         }
     }
 }
@@ -94,6 +102,7 @@ impl TryFrom<u8> for FrameKind {
             1 => Ok(FrameKind::Fin),
             2 => Ok(FrameKind::Reset),
             3 => Ok(FrameKind::Credit),
+            4 => Ok(FrameKind::KeepAlive),
             other => Err(invalid(format!("mux frame kind {other} is unknown"))),
         }
     }
@@ -471,9 +480,10 @@ async fn write_loop(
                     tracing::debug!(error = %err, "tcp mux flush ended");
                     return;
                 }
-                match out.recv().await {
-                    Some(frame) => frame,
-                    None => break,
+                match tokio::time::timeout(KEEP_ALIVE, out.recv()).await {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => break,
+                    Err(_) => Outgoing::bare(0, FrameKind::KeepAlive),
                 }
             }
             Err(mpsc::error::TryRecvError::Disconnected) => break,
@@ -495,13 +505,14 @@ async fn write_loop(
 }
 
 async fn read_loop(
-    mut wire: tokio::io::ReadHalf<impl AsyncRead>,
+    wire: tokio::io::ReadHalf<impl AsyncRead>,
     shared: Arc<Shared>,
     alive: Weak<Alive>,
     gone: oneshot::Receiver<()>,
     incoming: mpsc::Sender<Stream>,
     writer: AbortHandle,
 ) {
+    let mut wire = IdleReader::new(wire, IDLE_TIMEOUT);
     tokio::select! {
         ended = demux(&mut wire, &shared, &alive, &incoming) => {
             if let Err(err) = ended {
@@ -553,6 +564,7 @@ async fn demux(
                 shared.streams().outbound.remove(&id);
             }
             FrameKind::Credit => credit(shared, id, &payload)?,
+            FrameKind::KeepAlive => {}
         }
     }
 }
@@ -838,6 +850,36 @@ mod tests {
             unread.read(&mut byte).await.unwrap_err().kind(),
             io::ErrorKind::ConnectionAborted
         );
+    }
+
+    /// A peer that sends nothing, not even a keep-alive, is gone: the
+    /// connection ends after `IDLE_TIMEOUT` instead of staying half open.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_peer_ends_the_connection_after_the_idle_timeout() {
+        let (mux, _raw) = acceptor_and_raw();
+        let started = tokio::time::Instant::now();
+        assert!(mux.next().await.is_err());
+        let waited = started.elapsed();
+        assert!(
+            waited >= IDLE_TIMEOUT && waited < IDLE_TIMEOUT + Duration::from_secs(1),
+            "{waited:?}"
+        );
+    }
+
+    /// Two live sides that have nothing to say keep their connection.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_connection_stays_up_on_keep_alives() {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let dialer = Mux::spawn(a, Side::Dialer, node(), ADDR);
+        let acceptor = Mux::spawn(b, Side::Acceptor, node(), ADDR);
+        tokio::time::sleep(IDLE_TIMEOUT * 3).await;
+        let mut stream = dialer.open().await.unwrap();
+        stream.write_all(b"still here").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut arrived = acceptor.next().await.unwrap();
+        let mut bytes = Vec::new();
+        arrived.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"still here");
     }
 
     /// A stream opened but not yet written has no id; it still fails when the connection ends.
