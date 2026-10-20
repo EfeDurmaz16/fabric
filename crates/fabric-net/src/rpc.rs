@@ -30,6 +30,7 @@ use fabric_core::lease::FencingToken;
 use fabric_core::moves::MoveOffer;
 use fabric_core::snapshot::MAX_CHUNK_LEN;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 use crate::accept::refresh;
@@ -56,6 +57,12 @@ pub const TRUST_RECHECK: Duration = Duration::from_secs(5);
 /// 35 KiB/s, and a peer that sends part of a frame and stops gives its
 /// stream back.
 pub const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The most per-job requests one serving session runs at once, counting work that outlived its caller's budget.
+pub const MAX_JOB_WORK: usize = 16;
+
+/// The most chunk batches one serving session sends at once; each holds up to one chunk frame while it waits on flow control.
+pub const MAX_CHUNK_RUNS: usize = 4;
 
 /// Why a call failed.
 #[derive(Debug, thiserror::Error)]
@@ -623,6 +630,7 @@ impl Session {
     /// `RpcError::Unpaired`; requests in flight then fail with it.
     pub async fn serve(&self, service: Arc<dyn Service>, trust: Arc<dyn Trust>) -> RpcError {
         let peer = self.peer();
+        let limits = Limits::new();
         let requests = async {
             loop {
                 let stream = match self.connection.next().await {
@@ -633,8 +641,9 @@ impl Session {
                     return RpcError::Unpaired(peer);
                 }
                 let service = service.clone();
+                let limits = limits.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle(peer, stream, service).await {
+                    if let Err(err) = handle(peer, stream, service, &limits).await {
                         tracing::debug!(%peer, error = %err, "request ended early");
                     }
                 });
@@ -833,7 +842,30 @@ async fn reply(
     Ok(())
 }
 
-async fn handle(peer: NodeId, stream: Stream, service: Arc<dyn Service>) -> Result<(), RpcError> {
+/// What one serving session may run at once, so a paired peer's requests cannot grow its work or memory without bound.
+#[derive(Clone)]
+struct Limits {
+    /// Held by each per-job request's work until the work ends, budget or not.
+    job_work: Arc<Semaphore>,
+    /// Held by each chunk batch while it is sent.
+    chunk_runs: Arc<Semaphore>,
+}
+
+impl Limits {
+    fn new() -> Self {
+        Self {
+            job_work: Arc::new(Semaphore::new(MAX_JOB_WORK)),
+            chunk_runs: Arc::new(Semaphore::new(MAX_CHUNK_RUNS)),
+        }
+    }
+}
+
+async fn handle(
+    peer: NodeId,
+    stream: Stream,
+    service: Arc<dyn Service>,
+    limits: &Limits,
+) -> Result<(), RpcError> {
     let (mut send, mut recv) = stream.split();
     let bytes = timeout(
         REQUEST_READ_TIMEOUT,
@@ -850,15 +882,30 @@ async fn handle(peer: NodeId, stream: Stream, service: Arc<dyn Service>) -> Resu
         ))),
         RequestBody::Ping => ResponseBody::Pong,
         RequestBody::Job { token, body } => {
-            // Only the answer races the budget; the work is never dropped halfway.
+            // Only the answer races the budget; the work is never dropped
+            // halfway. The work holds its permit to its end, so work left
+            // behind by a spent budget still counts against the cap.
             let service = Arc::clone(&service);
-            let work =
-                tokio::spawn(async move { answer_job(service.as_ref(), peer, token, body).await });
+            let job_work = Arc::clone(&limits.job_work);
+            let work = async move {
+                let Ok(permit) = job_work.acquire_owned().await else {
+                    return Err(Fault::Internal(FaultText::truncated(
+                        "the session takes no more job requests",
+                    )));
+                };
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    answer_job(service.as_ref(), peer, token, body).await
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Fault::Internal(FaultText::truncated(
+                        "the job request failed",
+                    )))
+                })
+            };
             match timeout(budget, work).await {
-                Ok(Ok(answer)) => answer.map_or_else(ResponseBody::Fault, ResponseBody::Job),
-                Ok(Err(_)) => ResponseBody::Fault(Fault::Internal(FaultText::truncated(
-                    "the job request failed",
-                ))),
+                Ok(answer) => answer.map_or_else(ResponseBody::Fault, ResponseBody::Job),
                 Err(_) => ResponseBody::Fault(Fault::Deadline),
             }
         }
@@ -867,6 +914,17 @@ async fn handle(peer: NodeId, stream: Stream, service: Arc<dyn Service>) -> Resu
             .unwrap_or(Err(Fault::Deadline))
             .map_or_else(ResponseBody::Fault, ResponseBody::ManifestChunks),
         RequestBody::WantChunks(batch) => {
+            let Ok(Ok(_run)) = timeout(budget, limits.chunk_runs.acquire()).await else {
+                reply(
+                    send.as_mut(),
+                    id,
+                    ResponseBody::Fault(Fault::Deadline),
+                    MAX_CONTROL_FRAME,
+                )
+                .await?;
+                send.shutdown().await.map_err(FrameError::Io)?;
+                return Ok(());
+            };
             send_chunks(peer, id, batch, budget, send.as_mut(), service.as_ref()).await?;
             send.shutdown().await.map_err(FrameError::Io)?;
             return Ok(());
@@ -1150,8 +1208,34 @@ mod tests {
         }
     }
 
-    /// A service that serves nothing; the sessions here only ping.
-    struct Nothing;
+    /// A service that serves nothing; with `hang` set, a pull or a chunk never ends.
+    #[derive(Default)]
+    struct Nothing {
+        hang: bool,
+        /// How many pulls and chunks were asked for.
+        started: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Nothing {
+        fn hanging() -> Arc<Self> {
+            Arc::new(Self {
+                hang: true,
+                ..Self::default()
+            })
+        }
+
+        fn start<T: Send + 'static>(
+            &self,
+            answer: Result<T, Fault>,
+        ) -> BoxFuture<'_, Result<T, Fault>> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            if self.hang {
+                Box::pin(std::future::pending())
+            } else {
+                Box::pin(async move { answer })
+            }
+        }
+    }
 
     fn no_job<T>() -> JobFuture<'static, T> {
         Box::pin(async { Err(Fault::UnknownJob) })
@@ -1159,7 +1243,7 @@ mod tests {
 
     impl Service for Nothing {
         fn pull(&self, _: NodeId, _: FencingToken, _: Option<RecordHash>) -> JobFuture<'_, Pulled> {
-            no_job()
+            self.start(Err(Fault::UnknownJob))
         }
 
         fn append(&self, _: NodeId, _: FencingToken, _: RecordPage) -> JobFuture<'_, Appended> {
@@ -1191,12 +1275,19 @@ mod tests {
         }
 
         fn chunk(&self, _peer: NodeId, id: ChunkId) -> BoxFuture<'_, Result<Vec<u8>, Fault>> {
-            Box::pin(async move { Err(Fault::UnknownChunk(id)) })
+            self.start(Err(Fault::UnknownChunk(id)))
         }
     }
 
-    /// A dialer's session and an acceptor's session that serves under `trust`, over the multiplexer in memory.
-    async fn serving_pair(trust: Arc<Revocable>) -> (Session, tokio::task::JoinHandle<RpcError>) {
+    fn paired() -> Arc<Revocable> {
+        Arc::new(Revocable(true.into()))
+    }
+
+    /// A dialer's session and an acceptor's session that serves `service` under `trust`, over the multiplexer in memory.
+    async fn serving_pair(
+        trust: Arc<Revocable>,
+        service: Arc<Nothing>,
+    ) -> (Session, tokio::task::JoinHandle<RpcError>) {
         use crate::mux::{Mux, Side};
 
         let (dialer_id, acceptor_id) = (NodeId::from_bytes([1; 32]), NodeId::from_bytes([2; 32]));
@@ -1211,7 +1302,7 @@ mod tests {
             Session::accept(acceptor, acceptor_id, version, IDLE * 10),
         );
         let accepted = acceptor_session.unwrap();
-        let serving = tokio::spawn(async move { accepted.serve(Arc::new(Nothing), trust).await });
+        let serving = tokio::spawn(async move { accepted.serve(service, trust).await });
         (dialer_session.unwrap(), serving)
     }
 
@@ -1220,7 +1311,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_idle_connection_ends_once_its_peer_is_unpaired() {
         let trust = Arc::new(Revocable(true.into()));
-        let (session, serving) = serving_pair(Arc::clone(&trust)).await;
+        let (session, serving) = serving_pair(Arc::clone(&trust), Arc::default()).await;
         session.ping(IDLE * 10).await.unwrap();
         trust.0.store(false, Ordering::SeqCst);
         let unpaired = tokio::time::Instant::now();
@@ -1234,7 +1325,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_request_after_an_unpair_is_not_served() {
         let trust = Arc::new(Revocable(true.into()));
-        let (session, serving) = serving_pair(Arc::clone(&trust)).await;
+        let (session, serving) = serving_pair(Arc::clone(&trust), Arc::default()).await;
         trust.0.store(false, Ordering::SeqCst);
         let started = tokio::time::Instant::now();
         assert!(session.ping(IDLE * 10).await.is_err());
@@ -1247,7 +1338,7 @@ mod tests {
     /// its task for as long as keep-alives hold the connection.
     #[tokio::test(start_paused = true)]
     async fn a_request_that_stops_halfway_loses_its_stream() {
-        let (session, _serving) = serving_pair(Arc::new(Revocable(true.into()))).await;
+        let (session, _serving) = serving_pair(paired(), Arc::default()).await;
         let mut stream = session.connection.open().await.unwrap();
         stream.write_all(&[64, 0, 0]).await.unwrap();
         let started = tokio::time::Instant::now();
@@ -1260,6 +1351,42 @@ mod tests {
         assert!(ended.is_ok(), "the server kept the stream");
         assert!(answer.is_empty());
         assert!(started.elapsed() >= REQUEST_READ_TIMEOUT);
+    }
+
+    /// Work a per-job request leaves behind when its budget runs out still
+    /// counts against the session's cap, so a peer cannot pile up ledger
+    /// work by sending requests whose budget is spent at once.
+    #[tokio::test(start_paused = true)]
+    async fn job_work_past_its_budget_is_bounded_per_session() {
+        let service = Nothing::hanging();
+        let (session, _serving) = serving_pair(paired(), Arc::clone(&service)).await;
+        let token = FencingToken {
+            job_id: fabric_core::id::JobId::from_bytes([1; 16]),
+            epoch: Epoch::FIRST,
+        };
+        for _ in 0..2 * MAX_JOB_WORK {
+            let pulled = session.pull(token, None, Duration::from_millis(1)).await;
+            assert!(matches!(pulled, Err(RpcError::Deadline(_))), "{pulled:?}");
+        }
+        tokio::time::sleep(IDLE).await;
+        assert_eq!(service.started.load(Ordering::SeqCst), MAX_JOB_WORK);
+    }
+
+    /// A peer that asks for chunks and reads none holds at most
+    /// `MAX_CHUNK_RUNS` batches in flight; the next one waits its budget and
+    /// is told so, instead of pinning another chunk's memory.
+    #[tokio::test(start_paused = true)]
+    async fn chunk_batches_in_flight_are_bounded_per_session() {
+        let service = Nothing::hanging();
+        let (session, _serving) = serving_pair(paired(), Arc::clone(&service)).await;
+        let mut held = Vec::new();
+        for n in 0..=MAX_CHUNK_RUNS {
+            let batch = ChunkBatch::new(vec![ChunkId::of(&n.to_le_bytes())]).unwrap();
+            held.push(session.want_chunks(batch, IDLE).await.unwrap());
+        }
+        let mut over = held.pop().unwrap();
+        assert!(matches!(over.next().await, Err(RpcError::Deadline(_))));
+        assert_eq!(service.started.load(Ordering::SeqCst), MAX_CHUNK_RUNS);
     }
 
     /// A stream that failed inside a frame never reads again.
