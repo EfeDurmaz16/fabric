@@ -765,25 +765,54 @@ fn collect_pins(
     }
     pins.extend(go_mod_pin(reader)?);
     if let Some(package) = package {
-        let mut entry = 0;
         if let Some((name, version)) = &package.manager {
-            pins.extend(pin(name.as_str(), version, "package.json", entry));
-            entry += 1;
+            pins.extend(pin(
+                name.as_str(),
+                version,
+                "package.json",
+                PinAt::Key("packageManager"),
+            ));
         }
         if let Some(engine) = &package.engines_node {
-            pins.extend(pin("node", engine, "package.json", entry));
+            pins.extend(pin(
+                "node",
+                engine,
+                "package.json",
+                PinAt::Key("engines.node"),
+            ));
         }
     }
     Ok(pins)
 }
 
+/// Where in its file a detected pin sits, so a warning can point at it without quoting it.
+#[derive(Debug, Clone, Copy)]
+enum PinAt {
+    /// A fixed key, such as `engines.node`.
+    Key(&'static str),
+    /// The zero-based index of the entry under `[tools]`, counting every entry.
+    ToolsEntry(usize),
+    /// The one-based line number.
+    Line(usize),
+}
+
+impl fmt::Display for PinAt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PinAt::Key(key) => write!(f, "`{key}`"),
+            PinAt::ToolsEntry(index) => write!(f, "[tools] entry {index}"),
+            PinAt::Line(line) => write!(f, "line {line}"),
+        }
+    }
+}
+
 /// Builds a detected pin, reading its tool name through its alias, or drops it when the name or the version breaks the pin rules.
 ///
-/// `entry` is the pin's zero-based index among the pins `file` gives. The
-/// warning names the file, the entry and the rule, never the text, so a
-/// token in a pin file does not reach the log. Dropping is as leak-safe as
-/// refusing: a dropped pin never enters the spec.
-fn pin(tool: &str, version: &str, file: &'static str, entry: usize) -> Option<Pin> {
+/// The warning names the file, where in it the pin sits and the rule,
+/// never the text, so a token in a pin file does not reach the log.
+/// Dropping is as leak-safe as refusing: a dropped pin never enters the
+/// spec.
+fn pin(tool: &str, version: &str, file: &'static str, at: PinAt) -> Option<Pin> {
     let parsed = ToolName::parse(canonical_tool(tool))
         .map_err(|reason| ("tool name", reason))
         .and_then(|tool| {
@@ -801,7 +830,7 @@ fn pin(tool: &str, version: &str, file: &'static str, entry: usize) -> Option<Pi
         Err((part, reason)) => {
             tracing::warn!(
                 file,
-                entry,
+                %at,
                 part,
                 %reason,
                 "pin dropped; pins are informational, so detection goes on without it"
@@ -1036,20 +1065,25 @@ fn mise_pins(reader: &Reader<'_>) -> Result<Vec<Pin>, DetectError> {
     };
     Ok(tools
         .iter()
-        .filter_map(|(tool, value)| match value {
-            toml::Value::String(v) => Some((tool, v.as_str())),
-            toml::Value::Array(items) => items
-                .first()
-                .and_then(toml::Value::as_str)
-                .map(|v| (tool, v)),
-            toml::Value::Table(t) => t
-                .get("version")
-                .and_then(toml::Value::as_str)
-                .map(|v| (tool, v)),
-            _ => None,
-        })
         .enumerate()
-        .filter_map(|(entry, (tool, version))| pin(tool, version, "mise.toml", entry))
+        .filter_map(|(entry, (tool, value))| {
+            let at = PinAt::ToolsEntry(entry);
+            let version = match value {
+                toml::Value::String(v) => Some(v.as_str()),
+                toml::Value::Array(items) => items.first().and_then(toml::Value::as_str),
+                toml::Value::Table(t) => t.get("version").and_then(toml::Value::as_str),
+                _ => None,
+            };
+            let Some(version) = version else {
+                tracing::warn!(
+                    file = "mise.toml",
+                    %at,
+                    "pin dropped: detection reads a string, an array whose first item is a string, or a table with a string `version`"
+                );
+                return None;
+            };
+            pin(tool, version, "mise.toml", at)
+        })
         .collect())
 }
 
@@ -1060,13 +1094,13 @@ fn tool_versions_pins(reader: &Reader<'_>) -> Result<Vec<Pin>, DetectError> {
     };
     Ok(text
         .lines()
-        .filter_map(|line| {
+        .enumerate()
+        .filter_map(|(index, line)| {
             let line = line.split_once('#').map_or(line, |(before, _)| before);
             let mut words = line.split_whitespace();
-            Some((words.next()?, words.next()?))
+            let (tool, version) = (words.next()?, words.next()?);
+            pin(tool, version, ".tool-versions", PinAt::Line(index + 1))
         })
-        .enumerate()
-        .filter_map(|(entry, (tool, version))| pin(tool, version, ".tool-versions", entry))
         .collect())
 }
 
@@ -1079,7 +1113,14 @@ fn rust_toolchain_pin(reader: &Reader<'_>) -> Result<Option<Pin>, DetectError> {
         .get("toolchain")
         .and_then(|t| t.get("channel"))
         .and_then(toml::Value::as_str)
-        .and_then(|channel| pin("rust", channel, "rust-toolchain.toml", 0)))
+        .and_then(|channel| {
+            pin(
+                "rust",
+                channel,
+                "rust-toolchain.toml",
+                PinAt::Key("toolchain.channel"),
+            )
+        }))
 }
 
 /// Reads the first line that is not empty and not a `#` comment.
@@ -1094,8 +1135,9 @@ fn first_line_pin(
     Ok(text
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .and_then(|version| pin(tool, version, file, 0)))
+        .enumerate()
+        .find(|(_, line)| !line.is_empty() && !line.starts_with('#'))
+        .and_then(|(index, version)| pin(tool, version, file, PinAt::Line(index + 1))))
 }
 
 /// Reads the `go` directive of `go.mod`.
@@ -1111,7 +1153,7 @@ fn go_mod_pin(reader: &Reader<'_>) -> Result<Option<Pin>, DetectError> {
                 _ => None,
             },
         )
-        .and_then(|version| pin("go", version, "go.mod", 0)))
+        .and_then(|version| pin("go", version, "go.mod", PinAt::Key("go"))))
 }
 
 fn step(program: &'static str, args: &[&'static str]) -> Result<SetupStep, DetectError> {
@@ -1262,7 +1304,73 @@ impl Reader<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+
+    /// A buffer the log writes into, shared with the test.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut bytes = self
+                .0
+                .lock()
+                .map_err(|_| io::Error::other("log buffer poisoned"))?;
+            bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A dropped pin's warning is the user's only pointer to it, so it
+    /// names the place as the file numbers it: blank and comment lines
+    /// count, and so does a `[tools]` entry whose value detection cannot read.
+    #[test]
+    fn a_dropped_pin_is_named_by_its_place_in_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("mise.toml"),
+            "[tools]\nnode = 22\npython = \"3.12\"\nruby = \"\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".tool-versions"),
+            "# pins\n\nnode 22\nruby \u{1b}[31m3\n",
+        )
+        .unwrap();
+        let secrets = SecretPolicy::default();
+        let reader = Reader {
+            root,
+            secrets: &secrets,
+        };
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let (mise, tool_versions) = tracing::subscriber::with_default(subscriber, || {
+            (
+                mise_pins(&reader).unwrap(),
+                tool_versions_pins(&reader).unwrap(),
+            )
+        });
+        assert_eq!(mise.len(), 1);
+        assert_eq!(tool_versions.len(), 1);
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 3, "{log}");
+        assert!(lines[0].contains("[tools] entry 0"), "{log}");
+        assert!(lines[1].contains("[tools] entry 2"), "{log}");
+        assert!(lines[2].contains("line 4"), "{log}");
+    }
 
     /// Detection never opens a denied file; for the built-in list that holds
     /// because no file it reads matches a built-in pattern, and a job
