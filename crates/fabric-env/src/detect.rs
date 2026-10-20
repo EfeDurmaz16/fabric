@@ -146,7 +146,7 @@ pub enum DetectError {
     },
     /// The chosen manager's lockfile is absent while another manager's is present.
     #[error(
-        "{manager} was chosen by {because} but only {} exist; add its lockfile or set `package_manager` in {OVERRIDE_FILE}",
+        "{manager} was chosen by {because}, but the lockfiles found are: {}; add its lockfile or set `package_manager` in {OVERRIDE_FILE}",
         found.join(", ")
     )]
     LockfileMissing {
