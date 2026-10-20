@@ -208,7 +208,6 @@ pub trait Service: Send + Sync {
 /// An authenticated connection after the `Hello` exchange.
 pub struct Session {
     connection: Arc<dyn Connection>,
-    local: Hello,
     remote: Hello,
     clock_skew_ms: i64,
     next_id: AtomicU64,
@@ -319,7 +318,7 @@ impl Session {
         let request = Request {
             id: RequestId(0),
             budget_ms: budget(deadline),
-            body: RequestBody::Hello(local.clone()),
+            body: RequestBody::Hello(local),
         };
         let exchange = async {
             let mut recv = send_request(connection.as_ref(), &request).await?;
@@ -332,7 +331,7 @@ impl Session {
         let (remote, received_ms) = timeout(deadline, exchange)
             .await
             .map_err(|_| RpcError::Deadline(deadline))??;
-        Self::finish(connection, local, remote, received_ms)
+        Self::finish(connection, remote, received_ms)
     }
 
     /// Runs the acceptor's half of the handshake: expects the peer's `Hello` first, answers with this node's.
@@ -351,7 +350,7 @@ impl Session {
             let local = hello(local, fabric_version);
             let received_ms = local.clock_ms;
             let (body, remote) = match request.body {
-                RequestBody::Hello(remote) => (ResponseBody::Hello(local.clone()), Some(remote)),
+                RequestBody::Hello(remote) => (ResponseBody::Hello(local), Some(remote)),
                 _ => (
                     ResponseBody::Fault(Fault::BadRequest(FaultText::truncated(
                         "the first request must be a hello",
@@ -362,18 +361,17 @@ impl Session {
             reply(send.as_mut(), request.id, body, MAX_CONTROL_FRAME).await?;
             send.shutdown().await.map_err(FrameError::Io)?;
             let remote = remote.ok_or(RpcError::NotAHello)?;
-            Ok::<_, RpcError>((local, remote, received_ms))
+            Ok::<_, RpcError>((remote, received_ms))
         };
-        let (local, remote, received_ms) = timeout(deadline, exchange)
+        let (remote, received_ms) = timeout(deadline, exchange)
             .await
             .map_err(|_| RpcError::Deadline(deadline))??;
-        Self::finish(connection, local, remote, received_ms)
+        Self::finish(connection, remote, received_ms)
     }
 
     /// Checks the peer's `Hello` against the handshake; the skew is its clock against ours when it arrived.
     fn finish(
         connection: Arc<dyn Connection>,
-        local: Hello,
         remote: Hello,
         received_ms: u64,
     ) -> Result<Session, RpcError> {
@@ -396,7 +394,6 @@ impl Session {
         let ours = i64::try_from(received_ms).unwrap_or(i64::MAX);
         let session = Session {
             connection,
-            local,
             remote,
             clock_skew_ms: theirs.saturating_sub(ours),
             next_id: AtomicU64::new(1),
@@ -418,12 +415,6 @@ impl Session {
     #[must_use]
     pub fn remote(&self) -> &Hello {
         &self.remote
-    }
-
-    /// This node's `Hello` as sent.
-    #[must_use]
-    pub fn local(&self) -> &Hello {
-        &self.local
     }
 
     /// The wire under the session.
@@ -708,12 +699,6 @@ impl VerifiedChunk {
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
-    }
-
-    /// The zstd frame as it arrived, which a store can keep as is.
-    #[must_use]
-    pub fn stored(&self) -> &[u8] {
-        &self.stored
     }
 
     /// Returns the id and the zstd frame, which a store keeps as is.
