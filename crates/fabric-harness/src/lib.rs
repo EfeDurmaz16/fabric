@@ -18,19 +18,17 @@
 //! The crate is organised around one trait, [`Harness`], and three
 //! adapters behind cargo features: [`acp`], [`claude`] and [`codex`].
 //! [`manifest::StateManifest`] is the file that travels between the two.
-//! [`jsontext`] and [`redact`] are public because the property test in
-//! `tests/jsontext_props.rs` states the signed-block rule against them.
 
 pub mod denylist;
 pub(crate) mod departure;
-pub mod error;
+mod error;
 pub(crate) mod files;
-pub mod harness;
-pub mod jsontext;
+mod harness;
+pub(crate) mod jsontext;
 pub mod manifest;
 pub(crate) mod process;
-pub mod redact;
-pub mod session;
+pub(crate) mod redact;
+mod session;
 
 #[cfg(feature = "acp")]
 pub mod acp;
@@ -39,7 +37,9 @@ pub mod claude;
 #[cfg(feature = "codex")]
 pub mod codex;
 
-pub use error::HarnessError;
-pub use harness::{Harness, Installed, Io, Launch, Restored, Running};
-pub use manifest::StateManifest;
-pub use session::SessionId;
+pub use error::{BadRule, HarnessError};
+pub use harness::{
+    Harness, Installed, Io, Launch, MAX_MODEL_NAME_LEN, ModelName, ModelNameError, Restored,
+    Running,
+};
+pub use session::{MAX_SESSION_ID_LEN, SessionId, SessionIdError};

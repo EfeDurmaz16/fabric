@@ -5,15 +5,11 @@
 //! blocks, the output is JSON, and redacting the output again changes
 //! nothing.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "a failed unwrap inside a test is the test failing"
-)]
-use fabric_harness::jsontext::transform;
-use fabric_harness::redact::Redactor;
 use proptest::prelude::*;
 use serde_json::{Map, Value, json};
+
+use super::transform;
+use crate::redact::Redactor;
 
 const SECRET: &str = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab";
 

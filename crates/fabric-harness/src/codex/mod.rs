@@ -32,7 +32,7 @@
 //! app-server JSON-RPC surface is not used (ADR 0006, D14).
 
 pub mod overrides;
-pub mod rollout;
+pub(crate) mod rollout;
 
 use std::ffi::OsString;
 use std::fs::{File, TryLockError};
@@ -304,7 +304,7 @@ impl Codex {
     }
 
     /// The rollout lineage of `session`, newest suffix first.
-    pub fn lineage(&self, session: &SessionId) -> Result<Vec<RolloutFile>, HarnessError> {
+    pub(crate) fn lineage(&self, session: &SessionId) -> Result<Vec<RolloutFile>, HarnessError> {
         let all = self.all_rollouts(session)?;
         let not_found = || HarnessError::SessionNotFound {
             kind: HarnessKind::Codex,

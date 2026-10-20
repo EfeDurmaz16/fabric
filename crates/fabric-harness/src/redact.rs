@@ -10,6 +10,8 @@ use std::sync::LazyLock;
 use regex::Regex;
 use regex::bytes::Regex as BytesRegex;
 
+use crate::error::BadRule;
+
 /// Per-rule match counts.
 pub type RedactionCounts = BTreeMap<&'static str, u32>;
 
@@ -145,16 +147,6 @@ fn bearer_value_is_token(matched: &[u8]) -> bool {
         .iter()
         .all(|b| b.is_ascii_hexdigit() || matches!(b, b'-' | b'='));
     (upper && lower) || (digit && (upper || hex))
-}
-
-/// A standard rule whose pattern does not compile.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("redaction rule {rule} does not compile: {reason}")]
-pub struct BadRule {
-    /// The rule's name.
-    pub rule: &'static str,
-    /// What the regex compiler said.
-    pub reason: String,
 }
 
 /// Compiles every standard rule; one rule that does not compile fails the

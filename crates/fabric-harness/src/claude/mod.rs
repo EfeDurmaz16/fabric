@@ -29,7 +29,7 @@
 
 pub mod flags;
 pub(crate) mod history;
-pub mod slug;
+pub(crate) mod slug;
 pub(crate) mod trust;
 
 use std::ffi::OsString;

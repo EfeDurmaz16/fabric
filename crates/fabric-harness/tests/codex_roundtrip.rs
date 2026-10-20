@@ -132,12 +132,6 @@ async fn capture_follows_the_lineage_and_carries_nothing_else() {
     let adapter = Codex::new(home.clone()).with_path_var(OsString::new());
     assert_eq!(adapter.latest_session(&src.work).unwrap(), Some(thread()));
 
-    let chain = adapter.lineage(&thread()).unwrap();
-    assert_eq!(chain.len(), 2);
-    assert_eq!(chain[0].path, src.head);
-    assert_eq!(chain[1].path, src.prefix);
-    assert!(chain[1].name.compressed);
-
     let out = tempfile::tempdir().unwrap();
     let manifest = adapter
         .capture(&src.work, &thread(), out.path())
@@ -266,10 +260,22 @@ async fn two_files_for_one_rollout_resolve_by_prefix_or_are_refused() {
     let mut longer = std::fs::read_to_string(&src.head).unwrap();
     longer.push_str(&turn("more"));
     std::fs::write(&copy, &longer).unwrap();
-    let chain = adapter.lineage(&thread()).unwrap();
-    assert_eq!(chain[0].path, copy, "the longer file wins over its prefix");
+    let out = tempfile::tempdir().unwrap();
+    let manifest = adapter
+        .capture(&src.work, &thread(), out.path())
+        .await
+        .unwrap();
+    let head = format!("home/.codex/sessions/fabric/{THREAD}/{HEAD_NAME}");
+    assert!(
+        manifest.files.iter().any(|f| f.rel_path.as_str() == head),
+        "the longer file wins over its prefix"
+    );
     std::fs::write(&copy, session_meta(THREAD, "/other", Some(PREFIX))).unwrap();
-    let err = adapter.lineage(&thread()).unwrap_err();
+    let out = tempfile::tempdir().unwrap();
+    let err = adapter
+        .capture(&src.work, &thread(), out.path())
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, HarnessError::LineageAmbiguous { ref paths, .. } if paths.len() == 2),
         "{err}"
@@ -333,8 +339,14 @@ async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_the
     assert!(target.join(HEAD_NAME).is_file());
     assert!(target.join(PREFIX_NAME).is_file());
     assert!(!home.join(".codex/auth.json").exists());
+    let again = tempfile::tempdir().unwrap();
     assert_eq!(
-        adapter.lineage(&thread()).unwrap().len(),
+        adapter
+            .capture(&src.work, &thread(), again.path())
+            .await
+            .unwrap()
+            .files
+            .len(),
         2,
         "the restored lineage resolves on the target"
     );
@@ -426,8 +438,6 @@ async fn a_thread_that_comes_back_lands_over_its_original_file() {
             .unwrap()
             .ends_with(&turn("done on the air"))
     );
-    let chain = adapter.lineage(&thread()).unwrap();
-    assert_eq!(chain[0].path, src.head);
 }
 
 #[test]

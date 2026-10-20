@@ -2,6 +2,8 @@
 //! the session registry was read on, stays alive when its first argument
 //! is `hold` (so the running-process check sees it), and otherwise writes
 //! its working directory, arguments and environment to `$FAKE_LOG`.
+//! `project_key` states Claude's project directory rule independently of
+//! the adapter's own.
 
 use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
@@ -26,4 +28,14 @@ pub fn fake_claude(dir: &Path) -> (PathBuf, OsString) {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     (script, bin.into_os_string())
+}
+
+/// The directory Claude files a workspace's sessions under: every
+/// character outside ASCII letters and digits becomes `-`.
+pub fn project_key(workspace: &Path) -> String {
+    workspace
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }

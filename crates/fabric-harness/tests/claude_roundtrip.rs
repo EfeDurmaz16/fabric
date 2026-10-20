@@ -17,12 +17,11 @@ use fabric_core::env::EnvVarName;
 use fabric_core::path::{AbsPath, RelPath};
 use fabric_harness::claude::ClaudeCode;
 use fabric_harness::claude::flags::{LaunchFlags, PermissionMode};
-use fabric_harness::claude::slug::slug;
 use fabric_harness::manifest::{Carried, Content, Digest, Mutability};
 use fabric_harness::{Harness, HarnessError, Io, Launch, SessionId};
 
 mod common;
-use common::fake_claude;
+use common::{fake_claude, project_key};
 
 const SID: &str = "9c9796f0-2682-4546-a963-d314b3ad543f";
 const SECRET: &str = "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456";
@@ -41,7 +40,7 @@ fn signed_block(path: &str) -> String {
 }
 
 fn transcript(root: &str, home: &str) -> String {
-    let key = slug(Path::new(root)).unwrap();
+    let key = project_key(Path::new(root));
     let signed = signed_block(root);
     format!(
         concat!(
@@ -72,7 +71,7 @@ fn build_source(work_rel: &str) -> Fixture {
     std::fs::create_dir_all(&work).unwrap();
     let root = work.to_string_lossy().into_owned();
     let home_text = home_path.to_string_lossy().into_owned();
-    let key = slug(&work).unwrap();
+    let key = project_key(&work);
     let claude = home_path.join(".claude");
     let project = claude.join("projects").join(&key);
     std::fs::create_dir_all(project.join(format!("{SID}/subagents"))).unwrap();
@@ -209,7 +208,7 @@ fn session() -> SessionId {
 
 fn transcript_under(home: &Path, work: &Path) -> PathBuf {
     home.join(".claude/projects")
-        .join(slug(work).unwrap())
+        .join(project_key(work))
         .join(format!("{SID}.jsonl"))
 }
 
@@ -247,7 +246,7 @@ async fn capture_carries_session_state_only_and_redacts() {
         .unwrap();
 
     let paths: Vec<&str> = manifest.files.iter().map(|f| f.rel_path.as_str()).collect();
-    let key = slug(&src.work).unwrap();
+    let key = project_key(&src.work);
     assert!(paths.contains(&format!("home/.claude/projects/{key}/{SID}.jsonl").as_str()));
     assert!(
         paths.contains(
@@ -574,7 +573,7 @@ async fn a_job_that_leaves_and_comes_back_keeps_the_original_and_gains_the_new_t
     let staged = |out: &Path| {
         std::fs::read(out.join(format!(
             "home/.claude/projects/{}/{SID}.jsonl",
-            slug(&src.work).unwrap()
+            project_key(&src.work)
         )))
         .unwrap()
     };
@@ -585,7 +584,7 @@ async fn a_job_that_leaves_and_comes_back_keeps_the_original_and_gains_the_new_t
 fn rewritable_files(home: &Path, work: &Path) -> (PathBuf, PathBuf) {
     (
         home.join(".claude/projects")
-            .join(slug(work).unwrap())
+            .join(project_key(work))
             .join("memory/MEMORY.md"),
         home.join(".claude/tasks/session-9c9796f0/1.json"),
     )
@@ -640,7 +639,7 @@ async fn a_symlink_in_session_state_refuses_the_capture() {
     std::fs::write(&outside, "aws_secret_access_key=supersecret\n").unwrap();
     let results = home
         .join(".claude/projects")
-        .join(slug(&src.work).unwrap())
+        .join(project_key(&src.work))
         .join(format!("{SID}/tool-results/link.txt"));
     std::os::unix::fs::symlink(&outside, &results).unwrap();
     let out = tempfile::tempdir().unwrap();
@@ -767,7 +766,7 @@ async fn a_truncated_staged_file_is_refused_before_anything_is_placed() {
         .capture(&src.work, &session(), out.path())
         .await
         .unwrap();
-    let key = slug(&src.work).unwrap();
+    let key = project_key(&src.work);
     let staged = out
         .path()
         .join(format!("home/.claude/projects/{key}/{SID}.jsonl"));

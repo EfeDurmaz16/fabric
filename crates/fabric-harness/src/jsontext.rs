@@ -453,6 +453,9 @@ pub fn transform(text: &str, redactor: &Redactor) -> Result<Outcome, TransformEr
 }
 
 #[cfg(test)]
+mod props;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

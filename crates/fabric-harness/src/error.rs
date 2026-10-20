@@ -254,7 +254,7 @@ pub enum HarnessError {
     },
     /// A standard redaction rule does not compile, so nothing is captured.
     #[error(transparent)]
-    BadRedactionRule(#[from] crate::redact::BadRule),
+    BadRedactionRule(#[from] BadRule),
     /// The Agent Client Protocol exchange failed.
     #[cfg(feature = "acp")]
     #[error("acp: {0}")]
@@ -270,4 +270,14 @@ impl HarnessError {
             source,
         }
     }
+}
+
+/// A standard rule whose pattern does not compile.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("redaction rule {rule} does not compile: {reason}")]
+pub struct BadRule {
+    /// The rule's name.
+    pub rule: &'static str,
+    /// What the regex compiler said.
+    pub reason: String,
 }

@@ -15,11 +15,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fabric_harness::claude::ClaudeCode;
-use fabric_harness::claude::slug::slug;
-use fabric_harness::{Harness, SessionId, StateManifest};
+use fabric_harness::manifest::StateManifest;
+use fabric_harness::{Harness, SessionId};
 
 mod common;
-use common::fake_claude;
+use common::{fake_claude, project_key};
 
 const SID: &str = "7a1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
 const ROLE: &str = "FABRIC_CRASH_ROLE";
@@ -53,7 +53,7 @@ fn build_home(home: &Path) -> PathBuf {
     std::fs::create_dir_all(&work).unwrap();
     let root = work.to_string_lossy().into_owned();
     std::fs::create_dir_all(home.join(".claude/sessions")).unwrap();
-    let project = home.join(".claude/projects").join(slug(&work).unwrap());
+    let project = home.join(".claude/projects").join(project_key(&work));
     std::fs::create_dir_all(project.join(format!("{SID}/tool-results"))).unwrap();
     let mut transcript = String::new();
     for i in 0..LINES {
@@ -207,7 +207,7 @@ async fn a_capture_killed_in_a_reused_directory_leaves_no_stale_manifest() {
     let work = build_home(&home);
     let transcript = home
         .join(".claude/projects")
-        .join(slug(&work).unwrap())
+        .join(project_key(&work))
         .join(format!("{SID}.jsonl"));
     // A short transcript, which sorts first and is staged at once, and the
     // large sidecars after it: most kills land after the transcript was
