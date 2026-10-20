@@ -63,9 +63,12 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// The shell that holds a terminal harness before its exec.
 const TRAMPOLINE: &str = "/bin/sh";
 /// What the trampoline runs: stop, and once continued, become the harness.
-/// The harness's path and arguments are its positional parameters.
-const TRAMPOLINE_SCRIPT: &str = "kill -STOP $$ && exec \"$@\"";
-/// The trampoline's `$0`, which `ps` shows while it waits.
+/// The harness's path and arguments are its positional parameters. bash,
+/// which is `/bin/sh` on macOS, imports exported functions from the
+/// environment, and a function named `kill` would run in place of the
+/// builtin; `unset` is a special builtin no function can shadow.
+const TRAMPOLINE_SCRIPT: &str = "unset -f kill && kill -STOP $$ && exec \"$@\"";
+/// The trampoline's `$0`, which `ps -o args` shows while it waits.
 const TRAMPOLINE_NAME: &str = "fabric-hold";
 /// How long the trampoline may take to stop itself.
 const HOLD_TIMEOUT: Duration = Duration::from_secs(10);
@@ -279,8 +282,13 @@ pub(crate) async fn spawn(
                 .stderr(Stdio::inherit());
         }
     }
+    let program = if held {
+        format!("{TRAMPOLINE} holding {}", binary.display())
+    } else {
+        binary.display().to_string()
+    };
     let spawn_error = |source| HarnessError::Spawn {
-        program: binary.display().to_string(),
+        program: program.clone(),
         source,
     };
     let child = command.spawn().map_err(spawn_error)?;
