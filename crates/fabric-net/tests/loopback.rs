@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use fabric_core::BoxFuture;
-use fabric_core::id::{ChunkId, NodeId, SnapshotId};
+use fabric_core::id::{ChunkId, Epoch, JobId, NodeId, SnapshotId};
 use fabric_core::lease::FencingToken;
 use fabric_net::endpoint::Endpoint;
 use fabric_net::frame::{FRAME_VERSION, MAX_CONTROL_FRAME};
@@ -77,6 +77,8 @@ impl Node {
 struct FakeService {
     chunks: BTreeMap<ChunkId, Vec<u8>>,
     manifest_delay: Duration,
+    job_delay: Duration,
+    jobs_done: AtomicUsize,
     drop_on_call: Option<(usize, mpsc::Sender<()>)>,
     calls: AtomicUsize,
 }
@@ -86,6 +88,8 @@ impl FakeService {
         Self {
             chunks: BTreeMap::new(),
             manifest_delay: Duration::ZERO,
+            job_delay: Duration::ZERO,
+            jobs_done: AtomicUsize::new(0),
             drop_on_call: None,
             calls: AtomicUsize::new(0),
         }
@@ -99,7 +103,11 @@ impl Service for FakeService {
         _token: FencingToken,
         _request: JobRequest,
     ) -> BoxFuture<'_, Result<JobResponse, Fault>> {
-        Box::pin(async { Err(Fault::Internal(FaultText::truncated("not in this test"))) })
+        Box::pin(async move {
+            tokio::time::sleep(self.job_delay).await;
+            self.jobs_done.fetch_add(1, Ordering::SeqCst);
+            Err(Fault::Internal(FaultText::truncated("not in this test")))
+        })
     }
 
     fn manifest(
@@ -403,6 +411,45 @@ async fn a_slow_peer_trips_the_call_deadline() -> TestResult {
             "{kind}: the deadline must fire on the caller"
         );
     }
+    Ok(())
+}
+
+/// A job message can write ledger records. When the caller's budget runs
+/// out first, the caller hears a deadline and the work still runs to its
+/// end, so no record is written halfway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_request_past_its_budget_still_runs_to_its_end() -> TestResult {
+    let (a, b) = (Node::new()?, Node::new()?);
+    let server = b.bind(TransportKind::Quic, &[a.id()])?;
+    let client = a.bind(TransportKind::Quic, &[b.id()])?;
+    let mut service = FakeService::new();
+    service.job_delay = Duration::from_millis(400);
+    let service = Arc::new(service);
+    let _serving = serve_one(server.clone(), b.hello.clone(), service.clone(), None);
+    let session = connect(
+        client.as_ref(),
+        b.id(),
+        server.local_addr()?,
+        a.hello.clone(),
+    )
+    .await?;
+
+    let token = FencingToken {
+        job_id: JobId::from_bytes([1; 16]),
+        epoch: Epoch::new(1).ok_or("epoch one exists")?,
+    };
+    let deadline = Duration::from_millis(100);
+    let err = session
+        .job(token, JobRequest::MoveRequest, deadline)
+        .await
+        .err()
+        .ok_or("the call must fail")?;
+    assert!(
+        matches!(err, RpcError::Deadline(d) if d == deadline),
+        "{err}"
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(service.jobs_done.load(Ordering::SeqCst), 1);
     Ok(())
 }
 

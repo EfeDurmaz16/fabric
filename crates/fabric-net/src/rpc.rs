@@ -116,6 +116,11 @@ pub enum RpcError {
 /// What a node serves to its peers: per-job messages, manifests and chunks.
 pub trait Service: Send + Sync {
     /// Answers one per-job message from `peer`, sent under the fencing `token`.
+    ///
+    /// A job message can write ledger records, so the future always runs
+    /// to its end, even after the caller's budget ran out and the caller
+    /// was told `Fault::Deadline`. The caller then treats the outcome as
+    /// unknown and asks again, with `MoveStatus` for a move.
     fn job(
         &self,
         peer: NodeId,
@@ -461,7 +466,7 @@ impl Session {
             let peer = self.peer();
             let service = service.clone();
             tokio::spawn(async move {
-                if let Err(err) = handle(peer, stream, service.as_ref()).await {
+                if let Err(err) = handle(peer, stream, service).await {
                     tracing::debug!(%peer, error = %err, "request ended early");
                 }
             });
@@ -581,7 +586,7 @@ async fn reply(
     Ok(())
 }
 
-async fn handle(peer: NodeId, stream: Stream, service: &dyn Service) -> Result<(), RpcError> {
+async fn handle(peer: NodeId, stream: Stream, service: Arc<dyn Service>) -> Result<(), RpcError> {
     let (mut send, mut recv) = stream.split();
     let bytes = read_frame(&mut recv, MAX_CONTROL_FRAME).await?;
     let request: Request = decode(&bytes)?;
@@ -592,16 +597,24 @@ async fn handle(peer: NodeId, stream: Stream, service: &dyn Service) -> Result<(
             "hello after the handshake",
         ))),
         RequestBody::Ping => ResponseBody::Pong,
-        RequestBody::Job { token, body } => timeout(budget, service.job(peer, token, body))
-            .await
-            .unwrap_or(Err(Fault::Deadline))
-            .map_or_else(ResponseBody::Fault, ResponseBody::Job),
+        RequestBody::Job { token, body } => {
+            // Only the answer races the budget; the work is never dropped halfway.
+            let service = Arc::clone(&service);
+            let work = tokio::spawn(async move { service.job(peer, token, body).await });
+            match timeout(budget, work).await {
+                Ok(Ok(answer)) => answer.map_or_else(ResponseBody::Fault, ResponseBody::Job),
+                Ok(Err(_)) => ResponseBody::Fault(Fault::Internal(FaultText::truncated(
+                    "the job request failed",
+                ))),
+                Err(_) => ResponseBody::Fault(Fault::Deadline),
+            }
+        }
         RequestBody::WantSnapshot { snapshot } => timeout(budget, service.manifest(peer, snapshot))
             .await
             .unwrap_or(Err(Fault::Deadline))
             .map_or_else(ResponseBody::Fault, ResponseBody::ManifestChunks),
         RequestBody::WantChunks(batch) => {
-            send_chunks(peer, id, batch, budget, send.as_mut(), service).await?;
+            send_chunks(peer, id, batch, budget, send.as_mut(), service.as_ref()).await?;
             send.shutdown().await.map_err(FrameError::Io)?;
             return Ok(());
         }
