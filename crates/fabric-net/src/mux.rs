@@ -415,6 +415,12 @@ async fn pump_local(shared: Arc<Shared>, source: PipeReader, inbound: PipeWriter
 }
 
 /// Frames what the stream's writer writes, within the stream's credit, until it finishes, the peer resets it, or the connection ends.
+///
+/// A writer that aborts, as one dropped in the middle of a write does,
+/// ends the stream at once, even while the pump waits for credit the peer
+/// may never send: the bytes not yet sent are dropped and the Fin goes
+/// out, so the stream's slot comes back and the peer reads a stream that
+/// stops short, which a framed reader sees as a cut-off frame.
 async fn send_rest(
     shared: Arc<Shared>,
     id: u32,
@@ -429,21 +435,7 @@ async fn send_rest(
             taken = poll_fn(|cx| source.poll_take(cx, MAX_MUX_PAYLOAD)) => taken.unwrap_or_default(),
         };
         if taken.is_empty() {
-            let finished = shared.streams().outbound.remove(&id);
-            let fin = Outgoing::bare(id, FrameKind::Fin);
-            if shared.side.opens(id) {
-                // The next `open` may take this slot once it is free, so the
-                // Fin is queued first: the peer sees this stream end before
-                // the next one starts, and never counts one over its cap.
-                let _ = shared.out.send(fin).await;
-                drop(finished);
-            } else {
-                // The peer opens its next stream once it sees the Fin, so
-                // the slot here is free before the Fin is queued.
-                drop(finished);
-                let _ = shared.out.send(fin).await;
-            }
-            return;
+            return end_outbound(&shared, id).await;
         }
         // At most MAX_MUX_PAYLOAD, so it fits a u32.
         let Ok(len) = u32::try_from(taken.len()) else {
@@ -452,6 +444,7 @@ async fn send_rest(
         tokio::select! {
             biased;
             _ = &mut stop => return,
+            () = poll_fn(|cx| source.poll_aborted(cx)) => return end_outbound(&shared, id).await,
             spent = credit.acquire_many(len) => match spent {
                 Ok(spent) => spent.forget(),
                 Err(_) => return,
@@ -469,6 +462,24 @@ async fn send_rest(
                 return;
             },
         }
+    }
+}
+
+/// Ends this side's direction of `id`: frees its outbound half and queues its Fin.
+async fn end_outbound(shared: &Shared, id: u32) {
+    let finished = shared.streams().outbound.remove(&id);
+    let fin = Outgoing::bare(id, FrameKind::Fin);
+    if shared.side.opens(id) {
+        // The next `open` may take this slot once it is free, so the
+        // Fin is queued first: the peer sees this stream end before
+        // the next one starts, and never counts one over its cap.
+        let _ = shared.out.send(fin).await;
+        drop(finished);
+    } else {
+        // The peer opens its next stream once it sees the Fin, so
+        // the slot here is free before the Fin is queued.
+        drop(finished);
+        let _ = shared.out.send(fin).await;
     }
 }
 
@@ -1024,6 +1035,45 @@ mod tests {
         })
         .await;
         assert!(ended.is_ok(), "the connection outlived its handle");
+    }
+
+    /// A writer dropped while its write waits for credit, as a reply that
+    /// stalled past its limit is, ends its stream at once though the peer
+    /// never hands credit back: the stream's outbound half and slot are
+    /// freed, and the peer reads only what was sent, then the end.
+    #[tokio::test]
+    async fn a_writer_dropped_mid_write_ends_its_stream_without_credit() {
+        let (a, b) = tokio::io::duplex(4 << 20);
+        let dialer = Mux::spawn(a, Side::Dialer, node(), ADDR);
+        let acceptor = Mux::spawn(b, Side::Acceptor, node(), ADDR);
+        let mut asking = dialer.open().await.unwrap();
+        asking.write_all(b"ask").await.unwrap();
+        asking.shutdown().await.unwrap();
+        let mut answering = acceptor.next().await.unwrap();
+        let mut ask = Vec::new();
+        answering.read_to_end(&mut ask).await.unwrap();
+        let stalled = tokio::time::timeout(
+            Duration::from_millis(200),
+            answering.write_all(&vec![0u8; 3 * STREAM_BUFFER]),
+        )
+        .await;
+        assert!(stalled.is_err(), "the peer never ran out of credit");
+        drop(answering);
+
+        let freed = tokio::time::timeout(Duration::from_secs(1), async {
+            while !acceptor.shared.streams().outbound.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(freed.is_ok(), "the stream waited for credit forever");
+        let mut answer = Vec::new();
+        asking.read_to_end(&mut answer).await.unwrap();
+        assert_eq!(
+            answer.len(),
+            STREAM_BUFFER,
+            "bytes past the credit were sent"
+        );
     }
 
     /// A peer that sends more than the credit it was given ends the
