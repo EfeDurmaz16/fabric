@@ -182,12 +182,6 @@ impl JobDir {
         self.dir.join("harness-state")
     }
 
-    /// Where the workspace goes once the job departed at `epoch`; kept, never deleted.
-    #[must_use]
-    pub fn departed(&self, epoch: Epoch) -> PathBuf {
-        self.dir.join("departed").join(epoch.get().to_string())
-    }
-
     /// The root used when a snapshot was captured under another home.
     #[must_use]
     pub fn fallback_root(&self) -> PathBuf {
@@ -202,6 +196,19 @@ pub fn job_root(home: &Path, job: JobId) -> PathBuf {
         .join("jobs")
         .join(job.to_string())
         .join("work")
+}
+
+/// Where a departed copy of the workspace at `root` goes once another node
+/// owns the job at `epoch`: `<root parent>/departed/<epoch>`, beside the
+/// root so the rename never crosses a filesystem. Kept, never deleted.
+/// `None` for a root with no parent.
+#[must_use]
+pub fn departed_copy(root: &Path, epoch: Epoch) -> Option<PathBuf> {
+    Some(
+        root.parent()?
+            .join("departed")
+            .join(epoch.get().to_string()),
+    )
 }
 
 /// Where a snapshot restores on this node, and why.

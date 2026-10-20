@@ -1173,18 +1173,9 @@ impl Node {
             && let Some(marker) = job.reconcile_marker()?
             && matches!(marker.state, MarkerState::Clean { .. })
         {
-            let dest = departed_path(&marker.root, epoch)?;
-            if marker.root.exists() {
-                let parent = dest
-                    .parent()
-                    .ok_or_else(|| NodeError::io(&dest, std::io::Error::other("no parent")))?;
-                crate::durable::create_dir(parent).map_err(|e| NodeError::io(parent, e))?;
-                std::fs::rename(&marker.root, &dest).map_err(|e| NodeError::io(&marker.root, e))?;
-                crate::durable::sync_dir(parent).map_err(|e| NodeError::io(parent, e))?;
-                if let Some(root_parent) = marker.root.parent() {
-                    crate::durable::sync_dir(root_parent)
-                        .map_err(|e| NodeError::io(root_parent, e))?;
-                }
+            let dest =
+                paths::departed_copy(&marker.root, epoch).ok_or_else(|| no_parent(&marker.root))?;
+            if move_aside(&marker.root, &dest)? {
                 out.say(format!(
                     "this node's copy moved out of the root to {}; it is kept, never run",
                     dest.display()
@@ -1841,12 +1832,23 @@ fn report_caches(caches: &[fabric_core::snapshot::CacheEntry], facts: &NodeFacts
     }
 }
 
-/// Where a departed copy goes: beside the root, so the rename never crosses a filesystem.
-fn departed_path(root: &Path, epoch: Epoch) -> Result<PathBuf, NodeError> {
-    let parent = root
-        .parent()
-        .ok_or_else(|| NodeError::io(root, std::io::Error::other("a root needs a parent")))?;
-    Ok(parent.join("departed").join(epoch.get().to_string()))
+fn no_parent(root: &Path) -> NodeError {
+    NodeError::io(root, std::io::Error::other("a root needs a parent"))
+}
+
+/// Renames the workspace at `root` to `dest` durably; false when there is no workspace at `root`.
+fn move_aside(root: &Path, dest: &Path) -> Result<bool, NodeError> {
+    if !root.exists() {
+        return Ok(false);
+    }
+    let parent = dest.parent().ok_or_else(|| no_parent(dest))?;
+    crate::durable::create_dir(parent).map_err(|e| NodeError::io(parent, e))?;
+    std::fs::rename(root, dest).map_err(|e| NodeError::io(root, e))?;
+    crate::durable::sync_dir(parent).map_err(|e| NodeError::io(parent, e))?;
+    if let Some(root_parent) = root.parent() {
+        crate::durable::sync_dir(root_parent).map_err(|e| NodeError::io(root_parent, e))?;
+    }
+    Ok(true)
 }
 
 /// Reads which folders iCloud Drive syncs on this node; off everywhere `defaults` does not exist.
