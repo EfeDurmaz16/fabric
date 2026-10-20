@@ -64,9 +64,11 @@ impl AsyncRead for PipeReader {
             return Poll::Pending;
         }
         let n = buf.remaining().min(state.buf.len());
-        for byte in state.buf.drain(..n) {
-            buf.put_slice(&[byte]);
-        }
+        let (front, back) = state.buf.as_slices();
+        let from_front = n.min(front.len());
+        buf.put_slice(&front[..from_front]);
+        buf.put_slice(&back[..n - from_front]);
+        state.buf.drain(..n);
         if let Some(waker) = state.write_waker.take() {
             waker.wake();
         }
