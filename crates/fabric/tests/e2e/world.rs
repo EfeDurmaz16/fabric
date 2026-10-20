@@ -116,7 +116,12 @@ impl Env {
     /// home. Under `exec` it appends the prompt to the thread's rollout
     /// under `~/.codex/sessions/`, starting `CODEX_THREAD`, or the thread
     /// `exec resume` names, and prints the events `codex exec --json`
-    /// prints for one turn.
+    /// prints for one turn. After `thread.started` it waits up to five
+    /// seconds for the node's session record of the job and writes `yes`
+    /// or `no` to `codex-saw-session`, so a test can tell the thread was
+    /// recorded while the turn ran. With `FAKE_CODEX_WAIT` set it then
+    /// touches `codex-waiting` and runs until a `SIGINT`, which it writes
+    /// to `codex-signal` before it exits with 130.
     pub fn install_fake_codex(&self) -> Fallible {
         self.install(
             "codex",
@@ -136,6 +141,15 @@ impl Env {
                  [ -f \"$file\" ] || printf '{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"%s\",\"cwd\":\"%s\"}}}}\\n' \"$thread\" \"$(pwd -P)\" > \"$file\"\n\
                  printf '{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"%s\"}}]}}}}\\n' \"$prompt\" >> \"$file\"\n\
                  printf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread\"\n\
+                 record=\"$FABRIC_HOME/jobs/$(basename \"$(dirname \"$(pwd -P)\")\")/session\"\n\
+                 tries=0\n\
+                 while [ ! -f \"$record\" ] && [ $tries -lt 100 ]; do sleep 0.05; tries=$((tries + 1)); done\n\
+                 if [ -f \"$record\" ]; then echo yes > \"$HOME/codex-saw-session\"; else echo no > \"$HOME/codex-saw-session\"; fi\n\
+                 if [ -n \"$FAKE_CODEX_WAIT\" ]; then\n\
+                   trap 'echo interrupted > \"$HOME/codex-signal\"; exit 130' INT\n\
+                   touch \"$HOME/codex-waiting\"\n\
+                   while :; do sleep 0.1; done\n\
+                 fi\n\
                  echo '{{\"type\":\"turn.started\"}}'\n\
                  printf '{{\"type\":\"item.completed\",\"item\":{{\"id\":\"item_0\",\"type\":\"agent_message\",\"text\":\"codex did: %s\"}}}}\\n' \"$prompt\"\n\
                  echo '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"cached_input_tokens\":0,\"output_tokens\":1}}}}'\n",
@@ -555,13 +569,7 @@ impl Node {
 
     /// Runs a CLI command that must succeed and returns what it printed.
     pub fn ok(&self, args: &[&str]) -> Fallible<String> {
-        self.ok_with(args, &[])
-    }
-
-    /// Runs a CLI command with `vars` added to its environment that must
-    /// succeed, and returns what it printed.
-    pub fn ok_with(&self, args: &[&str], vars: &[(&str, &Path)]) -> Fallible<String> {
-        let output = finish(self.spawn_with(args, vars)?, COMMAND_TIMEOUT)?;
+        let output = self.run(args)?;
         let text = text(&output);
         if output.status.success() {
             Ok(text)
