@@ -3,15 +3,18 @@
 //! Invariant: every per-job message carries the fencing token, job id and
 //! epoch, in one place, the envelope, so a receiver runs the ADR 0003 check
 //! before it reads the body. Nothing of unbounded size is a control
-//! message: ledger records are capped by the ledger, manifests travel as
+//! message: a record is at most `MAX_RECORD_LEN` bytes and records travel
+//! in pages of at most `MAX_RECORD_PAGE` bytes, manifests travel as
 //! chunks, and one chunk batch names at most `MAX_CHUNK_BATCH` ids. Every
-//! bound is enforced when bytes are parsed, not after.
+//! bound is enforced when bytes are parsed, not after, so the largest
+//! message fits the control frame of the `frame` module.
 
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fabric_core::id::{ChunkId, Epoch, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::FencingToken;
+use fabric_core::ledger::MAX_RECORD_LEN;
 use fabric_core::moves::MoveOffer;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -27,6 +30,14 @@ pub const MAX_VERSION_LEN: usize = 64;
 
 /// The longest text a `Fault` may carry.
 pub const MAX_FAULT_TEXT: usize = 256;
+
+/// The most bytes the length prefix of one record takes on the wire: a
+/// varint of a length up to `MAX_RECORD_LEN`.
+const RECORD_PREFIX: usize = 3;
+
+/// The most a page of records may cost, counting each record as its length
+/// plus `RECORD_PREFIX`: one record of the largest size, or many small ones.
+pub const MAX_RECORD_PAGE: usize = MAX_RECORD_LEN + RECORD_PREFIX;
 
 /// Why bytes were not a message, or a value was not valid on the wire.
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +62,12 @@ pub enum WireError {
         /// The cap in force.
         max: usize,
     },
+    /// A record is empty or longer than `MAX_RECORD_LEN`.
+    #[error("a record is 1 to {MAX_RECORD_LEN} bytes, not {0}")]
+    RecordSize(usize),
+    /// The records do not fit one page of `MAX_RECORD_PAGE`.
+    #[error("the records do not fit a page of {MAX_RECORD_PAGE} bytes")]
+    PageFull,
 }
 
 /// Encodes a message as postcard bytes.
@@ -203,6 +220,96 @@ impl<'de> Deserialize<'de> for ChunkBatch {
     }
 }
 
+/// The exact bytes of one ledger record: 1 to `MAX_RECORD_LEN` bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct RecordBytes(Vec<u8>);
+
+impl RecordBytes {
+    /// Wraps `bytes` if their length is within the ledger's bound.
+    pub fn new(bytes: Vec<u8>) -> Result<Self, WireError> {
+        if bytes.is_empty() || bytes.len() > MAX_RECORD_LEN {
+            return Err(WireError::RecordSize(bytes.len()));
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Returns the bytes, consuming the wrapper.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    /// What the record counts against a page.
+    fn cost(&self) -> usize {
+        self.0.len() + RECORD_PREFIX
+    }
+}
+
+impl<'de> Deserialize<'de> for RecordBytes {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(Vec::<u8>::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Records in chain order that fit one control frame: their cost is at most `MAX_RECORD_PAGE`.
+///
+/// A sender fills a page with `push` until it refuses, sends it, and goes
+/// on with a new page, so a long ledger crosses the wire in pieces.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordPage {
+    records: Vec<RecordBytes>,
+    cost: usize,
+}
+
+impl RecordPage {
+    /// Adds `record` at the end, or hands it back when the page has no room for it.
+    pub fn push(&mut self, record: RecordBytes) -> Result<(), RecordBytes> {
+        let cost = self.cost + record.cost();
+        if cost > MAX_RECORD_PAGE {
+            return Err(record);
+        }
+        self.records.push(record);
+        self.cost = cost;
+        Ok(())
+    }
+
+    /// Returns the records in chain order.
+    #[must_use]
+    pub fn records(&self) -> &[RecordBytes] {
+        &self.records
+    }
+
+    /// Returns the records in chain order, consuming the page.
+    #[must_use]
+    pub fn into_records(self) -> Vec<RecordBytes> {
+        self.records
+    }
+}
+
+impl Serialize for RecordPage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.records.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RecordPage {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut page = Self::default();
+        for record in Vec::<RecordBytes>::deserialize(deserializer)? {
+            page.push(record)
+                .map_err(|_| serde::de::Error::custom(WireError::PageFull))?;
+        }
+        Ok(page)
+    }
+}
+
 /// What a request asks for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RequestBody {
@@ -229,15 +336,15 @@ pub enum RequestBody {
 /// A per-job message (ADR 0003 and ADR 0005).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobRequest {
-    /// Asks for the records after `after`; answered with `Records`.
+    /// Asks for the records after `after`; answered with one page of `Records`.
     Pull {
         /// The receiver's head, or the record it last saw.
         after: RecordHash,
     },
-    /// Replicates records, each as its exact ledger bytes; answered with `Accepted`, `Rejected` or an epoch answer.
+    /// Replicates one page of records, each as its exact ledger bytes; answered with `Accepted`, `Rejected` or an epoch answer.
     Append {
         /// The records in chain order.
-        records: Vec<Vec<u8>>,
+        records: RecordPage,
     },
     /// Asks the owner to start a move toward the sender; answered with `MoveStarted` or `Rejected`.
     MoveRequest,
@@ -300,8 +407,13 @@ pub enum ResponseBody {
 /// The answer to a per-job message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobResponse {
-    /// The records after the asked head, in chain order.
-    Records(Vec<Vec<u8>>),
+    /// The first page of records after the asked head, in chain order.
+    Records {
+        /// The records.
+        records: RecordPage,
+        /// More records follow the page; the sender pulls again after its last record.
+        more: bool,
+    },
     /// The records linked; `head` is now the receiver's head.
     Accepted {
         /// The receiver's head.
@@ -334,7 +446,7 @@ pub enum JobResponse {
     /// The target's decision, byte for byte: a `MoveImported` or `MoveAborted` record.
     MoveDecision {
         /// The record bytes.
-        record: Vec<u8>,
+        record: RecordBytes,
     },
     /// The target has not decided.
     MoveUndecided {
@@ -416,8 +528,18 @@ mod tests {
             })
     }
 
-    fn records() -> impl Strategy<Value = Vec<Vec<u8>>> {
-        vec(vec(any::<u8>(), 0..64), 0..4)
+    fn record() -> impl Strategy<Value = RecordBytes> {
+        vec(any::<u8>(), 1..64).prop_map(|bytes| RecordBytes::new(bytes).unwrap())
+    }
+
+    fn records() -> impl Strategy<Value = RecordPage> {
+        vec(record(), 0..4).prop_map(|records| {
+            let mut page = RecordPage::default();
+            for record in records {
+                page.push(record).unwrap();
+            }
+            page
+        })
     }
 
     fn job_request() -> impl Strategy<Value = JobRequest> {
@@ -467,7 +589,8 @@ mod tests {
 
     fn job_response() -> impl Strategy<Value = JobResponse> {
         prop_oneof![
-            records().prop_map(JobResponse::Records),
+            (records(), any::<bool>())
+                .prop_map(|(records, more)| JobResponse::Records { records, more }),
             bytes32(RecordHash::from_bytes).prop_map(|head| JobResponse::Accepted { head }),
             bytes32(RecordHash::from_bytes).prop_map(|head| JobResponse::Rejected { head }),
             (epoch(), epoch())
@@ -475,7 +598,7 @@ mod tests {
             (epoch(), epoch())
                 .prop_map(|(yours, current)| JobResponse::AheadOfUs { yours, current }),
             bytes16(MoveId::from_bytes).prop_map(|move_id| JobResponse::MoveStarted { move_id }),
-            vec(any::<u8>(), 0..64).prop_map(|record| JobResponse::MoveDecision { record }),
+            record().prop_map(|record| JobResponse::MoveDecision { record }),
             bytes16(MoveId::from_bytes).prop_map(|move_id| JobResponse::MoveUndecided { move_id }),
             bytes32(SnapshotId::from_bytes)
                 .prop_map(|snapshot| JobResponse::SnapshotIncomplete { snapshot }),
@@ -565,6 +688,77 @@ mod tests {
         let cut = FaultText::truncated(&multibyte);
         assert_eq!(cut.as_str().len(), MAX_FAULT_TEXT - 1);
         assert_eq!(cut.as_str().chars().count(), (MAX_FAULT_TEXT - 1) / 3);
+    }
+
+    fn page_of(records: Vec<RecordBytes>) -> RecordPage {
+        let mut page = RecordPage::default();
+        for record in records {
+            page.push(record).unwrap();
+        }
+        page
+    }
+
+    /// The largest page, as one record of the ledger's largest size or as
+    /// many small records, fits the control frame in an `Append` request and
+    /// in a `Records` answer.
+    #[test]
+    fn a_full_page_of_records_fits_the_control_frame() {
+        use crate::frame::MAX_CONTROL_FRAME;
+
+        let largest = RecordBytes::new(vec![7; MAX_RECORD_LEN]).unwrap();
+        assert_eq!(
+            encode(&largest).unwrap().len(),
+            largest.cost(),
+            "the length prefix of the largest record is RECORD_PREFIX bytes"
+        );
+        let small = (0..MAX_RECORD_PAGE / (1 + RECORD_PREFIX))
+            .map(|_| RecordBytes::new(vec![7]).unwrap())
+            .collect();
+        for page in [page_of(vec![largest]), page_of(small)] {
+            let token = FencingToken {
+                job_id: JobId::from_bytes([u8::MAX; 16]),
+                epoch: Epoch::new(u64::MAX).unwrap(),
+            };
+            let append = Request {
+                id: RequestId(u64::MAX),
+                budget_ms: u32::MAX,
+                body: RequestBody::Job {
+                    token,
+                    body: JobRequest::Append {
+                        records: page.clone(),
+                    },
+                },
+            };
+            let answer = Response {
+                id: RequestId(u64::MAX),
+                body: ResponseBody::Job(JobResponse::Records {
+                    records: page,
+                    more: true,
+                }),
+            };
+            for bytes in [encode(&append).unwrap(), encode(&answer).unwrap()] {
+                // The frame counts its version byte too.
+                assert!(bytes.len() < MAX_CONTROL_FRAME, "{} bytes", bytes.len());
+            }
+        }
+    }
+
+    /// A record above the ledger's bound, or a page above its budget, does
+    /// not decode, and a full page refuses one more record.
+    #[test]
+    fn records_and_pages_are_bounded_on_decode() {
+        assert!(matches!(
+            RecordBytes::new(vec![0; MAX_RECORD_LEN + 1]),
+            Err(WireError::RecordSize(_))
+        ));
+        assert!(decode::<RecordBytes>(&encode(&vec![0u8; MAX_RECORD_LEN + 1]).unwrap()).is_err());
+        assert!(decode::<RecordBytes>(&encode(&Vec::<u8>::new()).unwrap()).is_err());
+
+        let mut page = page_of(vec![RecordBytes::new(vec![1; MAX_RECORD_LEN]).unwrap()]);
+        let one_more = RecordBytes::new(vec![2]).unwrap();
+        assert_eq!(page.push(one_more.clone()), Err(one_more));
+        let over: Vec<Vec<u8>> = vec![vec![1; MAX_RECORD_LEN], vec![2]];
+        assert!(decode::<RecordPage>(&encode(&over).unwrap()).is_err());
     }
 
     #[test]

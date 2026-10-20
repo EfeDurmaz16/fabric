@@ -15,8 +15,15 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// The frame format version this crate writes.
 pub const FRAME_VERSION: u8 = 1;
 
-/// The most bytes a control frame may carry: ledger records, move messages, chunk id lists.
-pub const MAX_CONTROL_FRAME: usize = 1 << 20;
+/// Room in a control frame for everything around a page of records: the
+/// version byte, the request or response envelope and the page's count.
+const ENVELOPE_ALLOWANCE: usize = 1024;
+
+/// The most bytes a control frame may carry: a page of ledger records, move messages, chunk id lists.
+///
+/// It is derived from the record page so that the largest record, which
+/// is as long as the ledger allows, always fits with its envelope.
+pub const MAX_CONTROL_FRAME: usize = crate::wire::MAX_RECORD_PAGE + ENVELOPE_ALLOWANCE;
 
 /// The most bytes one chunk may hold (ADR 0004: whole-file objects up to 8 MiB).
 pub const MAX_CHUNK_BYTES: usize = 8 << 20;
