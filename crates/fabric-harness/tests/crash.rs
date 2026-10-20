@@ -1,8 +1,10 @@
 //! Crash tests: a capture or a restore runs in a child process that the
-//! `crashpoints` feature aborts at a named step, after the Nth file it
-//! stages or places. After the abort nothing half written may pass for
-//! state: no manifest is left that a fresh node would accept, every placed
-//! file is whole, and running the same operation again converges. A
+//! `crashpoints` feature kills with `SIGKILL` at a named step, after the
+//! Nth file it stages or places, or after it records a pending departure.
+//! After the kill nothing half written may pass for state: no manifest is
+//! left that a fresh node would accept, every placed file is whole, a
+//! departure that never left moves nothing forward, and running the same
+//! operation again converges. A
 //! process that dies between a rename and the directory fsync loses
 //! nothing, because the page cache outlives it, so that window needs a
 //! power cut, not a kill, and is not tested here.
@@ -137,7 +139,7 @@ fn build_codex_home(home: &Path) -> PathBuf {
 }
 
 /// Runs `role` in a child process with `crashpoint` set; returns true when
-/// the child aborted (SIGABRT), which only the crash point does.
+/// the child died of `SIGKILL`, which only the crash point sends.
 fn run_child(role: &str, home: &Path, work: &Path, out: &Path, crashpoint: &str) -> bool {
     let exe = std::env::current_exe().unwrap();
     let status = std::process::Command::new(exe)
@@ -151,7 +153,7 @@ fn run_child(role: &str, home: &Path, work: &Path, out: &Path, crashpoint: &str)
         .stderr(std::process::Stdio::null())
         .status()
         .unwrap();
-    status.signal() == Some(6)
+    status.signal() == Some(9)
 }
 
 /// The child's body; a no-op unless the parent set the role.
@@ -224,7 +226,7 @@ fn staged_by_destination(home: &Path, out: &Path) -> BTreeMap<PathBuf, Vec<u8>> 
 }
 
 #[tokio::test]
-async fn a_capture_aborted_after_any_staged_file_leaves_no_manifest() {
+async fn a_capture_killed_after_any_staged_file_leaves_no_manifest() {
     let home_dir = tempfile::tempdir().unwrap();
     let home = home_dir.path().canonicalize().unwrap();
     let work = build_home(&home);
@@ -266,7 +268,7 @@ async fn a_capture_aborted_after_any_staged_file_leaves_no_manifest() {
 }
 
 #[tokio::test]
-async fn a_restore_aborted_after_any_placed_file_leaves_whole_files_and_converges() {
+async fn a_restore_killed_after_any_placed_file_leaves_whole_files_and_converges() {
     let home_dir = tempfile::tempdir().unwrap();
     let home = home_dir.path().canonicalize().unwrap();
     let work = build_home(&home);
@@ -285,16 +287,16 @@ async fn a_restore_aborted_after_any_placed_file_leaves_whole_files_and_converge
         }
         let point = format!("place-after-file:{index}");
         assert!(run_child("restore", &home, &work, out.path(), &point));
-        let after_abort: BTreeMap<PathBuf, Vec<u8>> = regular_files(&projects)
+        let after_kill: BTreeMap<PathBuf, Vec<u8>> = regular_files(&projects)
             .into_iter()
             .filter(|(p, _)| !is_temp(p))
             .collect();
         assert_eq!(
-            after_abort.len(),
+            after_kill.len(),
             index + 1,
             "after {point} exactly the files up to it are placed"
         );
-        for (path, bytes) in &after_abort {
+        for (path, bytes) in &after_kill {
             assert_eq!(
                 staged.get(path),
                 Some(bytes),
@@ -355,7 +357,7 @@ async fn a_capture_killed_before_its_publish_leaves_memory_edited_since_alone() 
 }
 
 #[tokio::test]
-async fn a_codex_restore_aborted_mid_way_frees_the_writer_lock_and_converges() {
+async fn a_codex_restore_killed_mid_way_frees_the_writer_lock_and_converges() {
     let home_dir = tempfile::tempdir().unwrap();
     let home = home_dir.path().canonicalize().unwrap();
     let work = build_codex_home(&home);
@@ -380,7 +382,7 @@ async fn a_codex_restore_aborted_mid_way_frees_the_writer_lock_and_converges() {
         .count();
     assert_eq!(placed, 1, "only the first rollout was placed");
 
-    // The aborted process held Codex's thread lock; its death released it.
+    // The killed process held Codex's thread lock; its death released it.
     let restored = adapter.restore(&work, out.path()).await.unwrap();
     assert_eq!(restored.placed.len(), 2);
     for path in &restored.placed {
