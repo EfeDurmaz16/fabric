@@ -25,7 +25,19 @@
 //! host's messaging and identity names, `ANTHROPIC_BASE_URL`, `BAGGAGE`,
 //! `MCP_CONNECTION_NONBLOCKING`, `MCP_SERVER_CONNECTION_BATCH_SIZE` and
 //! feature switches such as `CLAUDE_CODE_SIMPLE` and
-//! `CLAUDE_CODE_DISABLE_CRON`. The Codex names were read from
+//! `CLAUDE_CODE_DISABLE_CRON`. The same bundle reads more host-owned
+//! names at startup to decide what kind of session it is (`Gws`):
+//! `CLAUDE_CODE_REMOTE_SESSION_ID` and `CLAUDE_CODE_CONTAINER_ID` make it
+//! a remote or container session, `CLAUDE_CODE_HOST_SCHEDULED_RUN`, the
+//! cowork, skill and Chrome names describe the host's run, and
+//! `CLAUDE_CODE_REMOTE_TOOLS_HOST_ALLOWS_UNATTENDED` is a host's grant
+//! that Claude unsets once read. Its list of names a settings file may
+//! not set, because a host owns them (`ae`), adds the host worktree,
+//! cowork, session origin, artifact, SDK and Chrome pairing names,
+//! `CLAUDE_CODE_TOOL_USE_ID`, and `CLAUDE_CODE_SANDBOXED`, which makes
+//! Claude skip its trust check. `CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH`
+//! tells Claude a host refreshes its login (`su`, the host auth set).
+//! The Codex names were read from
 //! openai/codex at `e4568a3`: `CODEX_THREAD_ID` and `CODEX_TOOL_CALL_ID`
 //! (`codex-rs/protocol/src/shell_environment.rs`), `CODEX_SESSION_ID`,
 //! `CODEX_VERSION`, `CODEX_PERMISSION_PROFILE` and
@@ -36,7 +48,8 @@
 //! - Always left out: the names that only a host sets, which say whose
 //!   child a process is. `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, the
 //!   session, attendance, host session, messaging, `EXECPATH` and invoked
-//!   skills names under `CLAUDE_CODE_`, `CLAUDE_PID`, `CLAUDE_EFFORT`,
+//!   skills names under `CLAUDE_CODE_`, the host-owned names listed
+//!   above, `CLAUDE_PID`, `CLAUDE_EFFORT`,
 //!   `AI_AGENT`, every `CLAUDE_AGENT_SDK_*` and `CLAUDE_PREVIEW_*`, and the
 //!   Codex names above, which name the parent thread and tool call; Codex
 //!   reads none of them at startup and sets them again for its own
@@ -110,6 +123,30 @@ const ALWAYS: &[Name] = &[
     Name::Is("CLAUDE_CODE_MESSAGING_TOKEN"),
     Name::Is("CLAUDE_CODE_EXECPATH"),
     Name::Is("CLAUDE_CODE_INVOKED_SKILLS"),
+    Name::Is("CLAUDE_CODE_REMOTE_SESSION_ID"),
+    Name::Is("CLAUDE_CODE_CONTAINER_ID"),
+    Name::Is("CLAUDE_CODE_HOST_SCHEDULED_RUN"),
+    Name::Is("CLAUDE_CODE_REMOTE_TOOLS_HOST_ALLOWS_UNATTENDED"),
+    Name::Is("CLAUDE_CODE_COWORK_FRAME_ARTIFACTS"),
+    Name::Is("CLAUDE_CODE_DESKTOP_SKILL_SWITCHES"),
+    Name::Is("CLAUDE_CODE_HOST_SKILL_CATALOG"),
+    Name::Is("CLAUDE_CHROME_TAB_GROUP_KEY"),
+    Name::Is("CLAUDE_CHROME_PAIRED_DEVICE_ID"),
+    Name::Is("CLAUDE_CODE_SANDBOXED"),
+    Name::Is("CLAUDE_CODE_TOOL_USE_ID"),
+    Name::Is("CLAUDE_CODE_HOST_WORKTREE"),
+    Name::Is("CLAUDE_CODE_HOST_WORKTREE_FENCE"),
+    Name::Is("CLAUDE_CODE_IS_COWORK"),
+    Name::Is("CLAUDE_CODE_SESSION_ORIGIN"),
+    Name::Is("CLAUDE_CODE_CCR_SURFACE"),
+    Name::Is("CLAUDE_CODE_ARTIFACT_SHARE"),
+    Name::Is("CLAUDE_CODE_ARTIFACT_VERSIONS"),
+    Name::Is("CLAUDE_CODE_MCP_APPS_HOST"),
+    Name::Is("CLAUDE_CODE_HOST_PROMPT_SUPERSEDES_RECORD"),
+    Name::Is("CLAUDE_CODE_REMOTE_TOOLS_PIN_STORED_LOGIN"),
+    Name::Is("CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH"),
+    Name::Is("CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH"),
+    Name::Is("CLAUDE_CODE_SDK_READS_SESSION_STATE"),
     Name::Is("CLAUDE_PID"),
     Name::Is("CLAUDE_EFFORT"),
     Name::Is("AI_AGENT"),
@@ -253,6 +290,30 @@ mod tests {
         "CLAUDE_CODE_MESSAGING_TOKEN",
         "CLAUDE_CODE_EXECPATH",
         "CLAUDE_CODE_INVOKED_SKILLS",
+        "CLAUDE_CODE_REMOTE_SESSION_ID",
+        "CLAUDE_CODE_CONTAINER_ID",
+        "CLAUDE_CODE_HOST_SCHEDULED_RUN",
+        "CLAUDE_CODE_REMOTE_TOOLS_HOST_ALLOWS_UNATTENDED",
+        "CLAUDE_CODE_COWORK_FRAME_ARTIFACTS",
+        "CLAUDE_CODE_DESKTOP_SKILL_SWITCHES",
+        "CLAUDE_CODE_HOST_SKILL_CATALOG",
+        "CLAUDE_CHROME_TAB_GROUP_KEY",
+        "CLAUDE_CHROME_PAIRED_DEVICE_ID",
+        "CLAUDE_CODE_SANDBOXED",
+        "CLAUDE_CODE_TOOL_USE_ID",
+        "CLAUDE_CODE_HOST_WORKTREE",
+        "CLAUDE_CODE_HOST_WORKTREE_FENCE",
+        "CLAUDE_CODE_IS_COWORK",
+        "CLAUDE_CODE_SESSION_ORIGIN",
+        "CLAUDE_CODE_CCR_SURFACE",
+        "CLAUDE_CODE_ARTIFACT_SHARE",
+        "CLAUDE_CODE_ARTIFACT_VERSIONS",
+        "CLAUDE_CODE_MCP_APPS_HOST",
+        "CLAUDE_CODE_HOST_PROMPT_SUPERSEDES_RECORD",
+        "CLAUDE_CODE_REMOTE_TOOLS_PIN_STORED_LOGIN",
+        "CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH",
+        "CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH",
+        "CLAUDE_CODE_SDK_READS_SESSION_STATE",
         "CLAUDE_PID",
         "CLAUDE_EFFORT",
         "AI_AGENT",
