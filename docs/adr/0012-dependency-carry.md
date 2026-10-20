@@ -4,6 +4,8 @@ Status: accepted, 2026-10-19
 
 Written 2026-10-19 after step 1 research (`2026-10-19-step1-design-input.md`, sections 4.4, 4.5 and 8.0, D6, D7 and D23, assumptions A10 to A12 and A27; `step1/H5-workspace-mobility.md`, sections 1, 5 and 6; `step1/preflight-2026-10-19.md`).
 
+Amended 2026-10-20 after the review of PR `feat/env`: a cache the user declares in `.fabric/env.toml` gets a carry key by rule, not by the store's guess. The row for build outputs says they take the key of the ecosystem that produced them, so `[[cache]]` takes an optional `ecosystem` (`node`, `rust`, `python` or `other`). Without it, the declared cache takes the one ecosystem detection found; with none found it is `other`; with two found detection stops and asks for the key. `node` needs a detected package manager, because the `Node` key names one. `other` is carried when the platform matches (the `Other` row below): the user declared it and nothing measures its toolchain, and a wrong carry costs a rebuild of an output, never lost work, because a declared cache is never a precious path.
+
 ## Context
 
 Dependencies and build outputs dominate the bytes of a move and their freshness is bound to strings outside the files. The research measured the sizes and found the couplings:
@@ -41,6 +43,7 @@ Each `CacheEntry` in a snapshot (ADR 0004) carries the `CarryKey` the source mea
 | Python, `.venv` | `python_version` equal and `python_home` exists on the target at the same path | Not carried; `uv sync --frozen` or `pip install -r` from the lockfile | Absolute shebangs and `home` |
 | Go | Nothing in the workspace is carried | `go mod download` from the per-node module cache | `GOMODCACHE` is outside the workspace and content-checked |
 | Build outputs the `EnvSpec` names (`dist`, `.next`, `build`, `out`, `.turbo`) | Same key as the ecosystem that produced them | Dropped; the next build recreates them | Some outputs embed absolute paths or machine state; the measured cost of dropping them is a build, never lost work |
+| A declared cache with `ecosystem = "other"`, or declared where no ecosystem was detected | Same OS and arch | Dropped; whatever made it makes it again | Nothing measures its toolchain; the user declared it a cache, so dropping or carrying it costs time, not work |
 | Precious ignored files | Always (ADR 0004, Ignored files by class) | | They are not caches |
 
 A mismatch never fails a move. It switches that entry to the install path and prints one line saying which key differed, with both values. The move is slower and still correct.

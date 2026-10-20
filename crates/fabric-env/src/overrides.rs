@@ -19,6 +19,8 @@
 //! [[cache]]                        # added to the detected cache paths; when one
 //! path = ".output"                 # is missing on resume the setup steps run, so
 //! class = "build"                  # name what they rebuild; deps, build or tool-cache
+//! ecosystem = "node"               # optional: node, rust, python or other; picks the
+//!                                  # carry key; the single detected ecosystem when absent
 //!                                  # with no cache path at all the steps run every resume
 //!
 //! [[setup]]                        # any setup entry replaces every detected step
@@ -222,6 +224,21 @@ pub(crate) struct DeclaredCache {
     pub path: RelPath,
     /// Its class for the snapshot policy.
     pub class: CacheClass,
+    /// The ecosystem that produces it, which picks its carry key; `None` lets detection choose.
+    pub ecosystem: Option<DeclaredEcosystem>,
+}
+
+/// The ecosystem a `[[cache]]` entry names in `ecosystem`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeclaredEcosystem {
+    /// Made by the detected JavaScript package manager's toolchain.
+    Node,
+    /// Made by Cargo.
+    Rust,
+    /// Made by the workspace's Python.
+    Python,
+    /// Made by nothing an ecosystem rule knows; carried when the platform matches.
+    Other,
 }
 
 /// The parsed override file.
@@ -392,7 +409,7 @@ fn caches(value: &Value) -> Result<Vec<DeclaredCache>, OverrideError> {
     {
         let at = format!("cache[{index}]");
         let entry = table(item, &at)?;
-        reject_unknown(entry, &at, &["path", "class"])?;
+        reject_unknown(entry, &at, &["path", "class", "ecosystem"])?;
         let path_key = format!("{at}.path");
         let path = rel_path(required(entry, "path", &path_key)?, &path_key)?;
         let class_key = format!("{at}.class");
@@ -405,6 +422,24 @@ fn caches(value: &Value) -> Result<Vec<DeclaredCache>, OverrideError> {
                     key: class_key,
                     expected: "deps, build, tool-cache",
                 });
+            }
+        };
+        let ecosystem = match entry.get("ecosystem") {
+            None => None,
+            Some(value) => {
+                let key = format!("{at}.ecosystem");
+                Some(match string(value, &key)? {
+                    "node" => DeclaredEcosystem::Node,
+                    "rust" => DeclaredEcosystem::Rust,
+                    "python" => DeclaredEcosystem::Python,
+                    "other" => DeclaredEcosystem::Other,
+                    _ => {
+                        return Err(OverrideError::UnknownValue {
+                            key,
+                            expected: "node, rust, python, other",
+                        });
+                    }
+                })
             }
         };
         if caches.iter().any(|c| c.path.eq_ignore_ascii_case(&path)) {
@@ -429,7 +464,11 @@ fn caches(value: &Value) -> Result<Vec<DeclaredCache>, OverrideError> {
                 other: other.path.clone(),
             });
         }
-        caches.push(DeclaredCache { path, class });
+        caches.push(DeclaredCache {
+            path,
+            class,
+            ecosystem,
+        });
     }
     Ok(caches)
 }
@@ -518,6 +557,7 @@ node = "22"
 [[cache]]
 path = ".output"
 class = "build"
+ecosystem = "node"
 
 [[setup]]
 program = "pnpm"
@@ -549,7 +589,8 @@ when = "always"
             parsed.caches,
             [DeclaredCache {
                 path: RelPath::parse(".output").unwrap(),
-                class: CacheClass::Build
+                class: CacheClass::Build,
+                ecosystem: Some(DeclaredEcosystem::Node),
             }]
         );
         let setup = parsed.setup.unwrap();

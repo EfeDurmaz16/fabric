@@ -10,7 +10,8 @@ use fabric_core::env::{EnvVarName, PinError, RunWhen, Tool, ToolName, ToolSource
 use fabric_core::path::{PathError, RelPath};
 use fabric_core::snapshot::CacheClass;
 use fabric_env::detect::{
-    CachePath, DetectError, Detection, Ecosystem, ManagerChoice, ManagerSource, NodeManager, detect,
+    CacheOrigin, CachePath, DetectError, Detection, Ecosystem, ManagerChoice, ManagerSource,
+    NodeManager, detect,
 };
 use fabric_env::overrides::OverrideError;
 use fabric_env::secret::Scope;
@@ -63,10 +64,14 @@ fn cache(path: &str, class: CacheClass, ecosystem: Ecosystem) -> Result<CachePat
         path: RelPath::parse(path)?,
         class,
         ecosystem,
+        origin: CacheOrigin::Detected,
     })
 }
 
 const PACKAGE_JSON: &str = r#"{"name":"x","version":"1.0.0"}"#;
+
+/// Files to write, as `(path, contents)`.
+type Files<'a> = &'a [(&'a str, &'a str)];
 
 #[test]
 fn a_pnpm_workspace_gives_a_frozen_install_and_node_modules() {
@@ -400,7 +405,15 @@ fn the_override_file_wins_over_detection() {
     assert_eq!(
         found.caches(),
         [
-            cache("dist", CacheClass::Build, Ecosystem::Declared).unwrap(),
+            CachePath {
+                origin: CacheOrigin::Declared,
+                ..cache(
+                    "dist",
+                    CacheClass::Build,
+                    Ecosystem::Node(NodeManager::Pnpm)
+                )
+                .unwrap()
+            },
             cache(
                 "node_modules",
                 CacheClass::Deps,
@@ -649,4 +662,75 @@ fn removing_a_pattern_from_the_override_file_does_not_shrink_the_policy() {
     );
     assert_eq!(second.spec().secret_patterns, first.spec().secret_patterns);
     assert_eq!(second.spec().secret_patterns.len(), 1);
+}
+
+/// ADR 0012 gives a build output the key of the ecosystem that made it, so
+/// a declared cache takes the one ecosystem detection found, the one it
+/// names, or `other` when nothing was found; it never guesses between two.
+#[test]
+fn a_declared_cache_takes_the_carry_key_of_the_ecosystem_that_makes_it() {
+    let node_and_rust: Files = &[
+        ("package.json", PACKAGE_JSON),
+        ("package-lock.json", ""),
+        ("Cargo.toml", ""),
+    ];
+    let cases: [(Files, &str, Result<Ecosystem, &str>); 6] = [
+        (
+            &[("package.json", PACKAGE_JSON), ("package-lock.json", "")],
+            "",
+            Ok(Ecosystem::Node(NodeManager::Npm)),
+        ),
+        (&[], "", Ok(Ecosystem::Other)),
+        (node_and_rust, "", Err("ambiguous")),
+        (node_and_rust, "ecosystem = \"rust\"\n", Ok(Ecosystem::Rust)),
+        (
+            &[("Cargo.toml", "")],
+            "ecosystem = \"node\"\n",
+            Err("not detected"),
+        ),
+        (
+            &[("Cargo.toml", "")],
+            "ecosystem = \"other\"\n",
+            Ok(Ecosystem::Other),
+        ),
+    ];
+    for (files, extra, expected) in cases {
+        let override_toml = format!("[[cache]]\npath = \".next\"\nclass = \"build\"\n{extra}");
+        let mut all = files.to_vec();
+        all.push((".fabric/env.toml", &override_toml));
+        let dir = workspace(&all).unwrap();
+        let found = detect(dir.path(), None);
+        match (expected, found) {
+            (Ok(ecosystem), Ok(found)) => {
+                let declared = found
+                    .caches()
+                    .iter()
+                    .find(|c| c.path.as_str() == ".next")
+                    .unwrap();
+                assert_eq!(declared.ecosystem, ecosystem, "{files:?} {extra}");
+                assert_eq!(declared.origin, CacheOrigin::Declared);
+            }
+            (Err("ambiguous"), Err(DetectError::AmbiguousCacheEcosystem { index: 0 }))
+            | (Err("not detected"), Err(DetectError::CacheEcosystemNotDetected { index: 0 })) => {}
+            (expected, found) => panic!("{files:?} {extra}: expected {expected:?}, got {found:?}"),
+        }
+    }
+}
+
+/// Naming another ecosystem for a path detection owns would give one tree two carry rules.
+#[test]
+fn a_declared_ecosystem_cannot_override_a_detected_one() {
+    let dir = workspace(&[
+        ("package.json", PACKAGE_JSON),
+        ("package-lock.json", ""),
+        (
+            ".fabric/env.toml",
+            "[[cache]]\npath = \"node_modules\"\nclass = \"deps\"\necosystem = \"other\"\n",
+        ),
+    ])
+    .unwrap();
+    assert!(matches!(
+        detect(dir.path(), None),
+        Err(DetectError::CacheEcosystemConflict { index: 0 })
+    ));
 }

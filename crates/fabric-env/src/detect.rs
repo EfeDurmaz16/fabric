@@ -39,7 +39,8 @@ use fabric_core::snapshot::CacheClass;
 use toml::Table;
 
 use crate::overrides::{
-    EnvOverride, OverrideError, PackageManagerName, canonical_tool, line_and_column,
+    DeclaredCache, DeclaredEcosystem, EnvOverride, OverrideError, PackageManagerName,
+    canonical_tool, line_and_column,
 };
 use crate::secret::{Scope, SecretPolicy};
 
@@ -157,6 +158,28 @@ pub enum DetectError {
         declared: RelPath,
         /// The detected path it nests with.
         detected: RelPath,
+    },
+    /// A `[[cache]]` entry without `ecosystem` in a workspace where more than one ecosystem was detected.
+    #[error(
+        "`cache[{index}]` could be made by more than one detected ecosystem; set its `ecosystem` to node, rust, python or other"
+    )]
+    AmbiguousCacheEcosystem {
+        /// Zero-based index of the entry in `[[cache]]`.
+        index: usize,
+    },
+    /// A `[[cache]]` entry names `ecosystem = "node"` and no package manager was detected.
+    #[error(
+        "`cache[{index}].ecosystem` is node, but no package manager was detected to measure its carry key"
+    )]
+    CacheEcosystemNotDetected {
+        /// Zero-based index of the entry in `[[cache]]`.
+        index: usize,
+    },
+    /// A `[[cache]]` entry for a detected path names another ecosystem than detection found.
+    #[error("`cache[{index}].ecosystem` differs from the ecosystem detection found for that path")]
+    CacheEcosystemConflict {
+        /// Zero-based index of the entry in `[[cache]]`.
+        index: usize,
     },
     /// `package_manager` is set in `.fabric/env.toml` but the root has no `package.json` for it to apply to.
     #[error("`package_manager` is set in {OVERRIDE_FILE} but there is no package.json at the root")]
@@ -290,16 +313,25 @@ pub struct ManagerChoice {
     pub because: ManagerSource,
 }
 
-/// The ecosystem a cache path belongs to; it decides which carry key the store measures (ADR 0012).
+/// The ecosystem that produces a cache path; it decides which carry key the store measures (ADR 0012).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ecosystem {
-    /// A JavaScript dependency tree installed by this manager.
+    /// Made with this JavaScript package manager and its Node: the `Node` key.
     Node(NodeManager),
-    /// Cargo build output.
+    /// Made by Cargo: the `Rust` key.
     Rust,
-    /// A Python virtual environment.
+    /// Made with the workspace's Python: the `Python` key.
     Python,
-    /// A path the user declared; no ecosystem rule applies.
+    /// Made by nothing an ecosystem rule knows, as the user declared: carried when the platform matches.
+    Other,
+}
+
+/// Whether an ecosystem rule found a cache path or the user declared it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheOrigin {
+    /// Found by a detection rule: `node_modules`, `target` or `.venv`.
+    Detected,
+    /// Declared in `.fabric/env.toml` and not also detected.
     Declared,
 }
 
@@ -313,7 +345,7 @@ impl Ecosystem {
         match self {
             Ecosystem::Node(manager) => manager.install_markers(),
             Ecosystem::Python => &["pyvenv.cfg"],
-            Ecosystem::Rust | Ecosystem::Declared => &[],
+            Ecosystem::Rust | Ecosystem::Other => &[],
         }
     }
 }
@@ -327,6 +359,8 @@ pub struct CachePath {
     pub class: CacheClass,
     /// The ecosystem whose carry key applies to it.
     pub ecosystem: Ecosystem,
+    /// Whether detection found it or the user declared it.
+    pub origin: CacheOrigin,
 }
 
 impl CachePath {
@@ -337,9 +371,9 @@ impl CachePath {
     /// a path the user declared can be a mistake that holds the user's own
     /// `.env.local` or keys, such as `web` written for `web/node_modules`.
     pub fn secret_scope(&self) -> Scope {
-        match self.ecosystem {
-            Ecosystem::Declared => Scope::Work,
-            Ecosystem::Node(_) | Ecosystem::Rust | Ecosystem::Python => Scope::Cache,
+        match self.origin {
+            CacheOrigin::Declared => Scope::Work,
+            CacheOrigin::Detected => Scope::Cache,
         }
     }
 }
@@ -432,6 +466,7 @@ pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, Dete
             path: rel("node_modules")?,
             class: CacheClass::Deps,
             ecosystem: Ecosystem::Node(choice.manager),
+            origin: CacheOrigin::Detected,
         });
     }
     detect_rust(root, &mut setup, &mut caches)?;
@@ -440,57 +475,14 @@ pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, Dete
         setup.push(step("go", &["mod", "download"])?);
     }
 
-    for declared in &overrides.caches {
-        if let Some(found) = caches
-            .iter_mut()
-            .find(|c| c.path.eq_ignore_ascii_case(&declared.path))
-        {
-            // The ecosystem stays: it decides the carry key, and a declared
-            // class must not let a `node_modules` travel to a node with
-            // another Node major.
-            found.class = declared.class;
-            continue;
-        }
-        if let Some(found) = caches.iter().find(|c| {
-            c.ecosystem != Ecosystem::Declared
-                && (declared.path.starts_with_ignore_ascii_case(&c.path)
-                    || c.path.starts_with_ignore_ascii_case(&declared.path))
-        }) {
-            return Err(DetectError::NestedCache {
-                declared: declared.path.clone(),
-                detected: found.path.clone(),
-            });
-        }
-        caches.push(CachePath {
-            path: declared.path.clone(),
-            class: declared.class,
-            ecosystem: Ecosystem::Declared,
-        });
-    }
+    merge_declared_caches(&mut caches, &overrides.caches, node_manager)?;
     caches.sort_by(|a, b| a.path.cmp(&b.path));
 
     if let Some(declared) = &overrides.setup {
         setup.clone_from(declared);
     }
 
-    let recorded = previous.map_or(&[][..], |spec| spec.secret_patterns.as_slice());
-    let dropped = recorded
-        .iter()
-        .filter(|p| !overrides.secret_patterns.contains(p))
-        .count();
-    if dropped > 0 {
-        tracing::warn!(
-            dropped,
-            "secret patterns this job recorded are missing from {OVERRIDE_FILE}; they stay in force"
-        );
-    }
-    let mut secret_patterns: Vec<SecretPattern> = recorded
-        .iter()
-        .chain(&overrides.secret_patterns)
-        .cloned()
-        .collect();
-    secret_patterns.sort();
-    secret_patterns.dedup();
+    let secret_patterns = job_secret_patterns(previous, &overrides.secret_patterns);
     let mut secrets = SecretPolicy::default();
     for pattern in &secret_patterns {
         secrets.widen(pattern.clone());
@@ -513,6 +505,86 @@ pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, Dete
         devcontainer: find_devcontainer(root)?,
         secrets,
     })
+}
+
+/// Adds the declared caches to the detected ones, giving each the ecosystem that makes it.
+fn merge_declared_caches(
+    caches: &mut Vec<CachePath>,
+    declared_caches: &[DeclaredCache],
+    node_manager: Option<ManagerChoice>,
+) -> Result<(), DetectError> {
+    let detected_ecosystems: Vec<Ecosystem> = caches.iter().map(|c| c.ecosystem).collect();
+    for (index, declared) in declared_caches.iter().enumerate() {
+        if let Some(found) = caches
+            .iter_mut()
+            .find(|c| c.path.eq_ignore_ascii_case(&declared.path))
+        {
+            // The ecosystem stays: it decides the carry key, and a declared
+            // class must not let a `node_modules` travel to a node with
+            // another Node major.
+            if declared.ecosystem.is_some_and(|named| {
+                resolve_ecosystem(named, node_manager) != Some(found.ecosystem)
+            }) {
+                return Err(DetectError::CacheEcosystemConflict { index });
+            }
+            found.class = declared.class;
+            continue;
+        }
+        if let Some(found) = caches.iter().find(|c| {
+            c.origin == CacheOrigin::Detected
+                && (declared.path.starts_with_ignore_ascii_case(&c.path)
+                    || c.path.starts_with_ignore_ascii_case(&declared.path))
+        }) {
+            return Err(DetectError::NestedCache {
+                declared: declared.path.clone(),
+                detected: found.path.clone(),
+            });
+        }
+        let ecosystem = match (declared.ecosystem, detected_ecosystems.as_slice()) {
+            (Some(named), _) => resolve_ecosystem(named, node_manager)
+                .ok_or(DetectError::CacheEcosystemNotDetected { index })?,
+            (None, []) => Ecosystem::Other,
+            (None, [only]) => *only,
+            (None, _) => return Err(DetectError::AmbiguousCacheEcosystem { index }),
+        };
+        caches.push(CachePath {
+            path: declared.path.clone(),
+            class: declared.class,
+            ecosystem,
+            origin: CacheOrigin::Declared,
+        });
+    }
+    Ok(())
+}
+
+/// Returns the job's secret patterns: every one its previous spec held, plus the override file's, sorted.
+fn job_secret_patterns(
+    previous: Option<&EnvSpec>,
+    declared: &[SecretPattern],
+) -> Vec<SecretPattern> {
+    let recorded = previous.map_or(&[][..], |spec| spec.secret_patterns.as_slice());
+    let dropped = recorded.iter().filter(|p| !declared.contains(p)).count();
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            "secret patterns this job recorded are missing from {OVERRIDE_FILE}; they stay in force"
+        );
+    }
+    let mut secret_patterns: Vec<SecretPattern> =
+        recorded.iter().chain(declared).cloned().collect();
+    secret_patterns.sort();
+    secret_patterns.dedup();
+    secret_patterns
+}
+
+/// Returns the ecosystem a `[[cache]]` entry names, or `None` for `node` when no package manager was detected.
+fn resolve_ecosystem(named: DeclaredEcosystem, node: Option<ManagerChoice>) -> Option<Ecosystem> {
+    match named {
+        DeclaredEcosystem::Node => node.map(|choice| Ecosystem::Node(choice.manager)),
+        DeclaredEcosystem::Rust => Some(Ecosystem::Rust),
+        DeclaredEcosystem::Python => Some(Ecosystem::Python),
+        DeclaredEcosystem::Other => Some(Ecosystem::Other),
+    }
 }
 
 /// Collects every pin, highest precedence first.
@@ -595,6 +667,7 @@ fn detect_rust(
         path: rel("target")?,
         class: CacheClass::Build,
         ecosystem: Ecosystem::Rust,
+        origin: CacheOrigin::Detected,
     });
     Ok(())
 }
@@ -618,6 +691,7 @@ fn detect_python(
         path: rel(".venv")?,
         class: CacheClass::Deps,
         ecosystem: Ecosystem::Python,
+        origin: CacheOrigin::Detected,
     });
     Ok(())
 }
