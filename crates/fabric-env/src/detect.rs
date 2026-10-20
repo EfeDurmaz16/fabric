@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use fabric_core::env::{
     EnvSpec, EnvSpecError, PinError, RunWhen, SecretPattern, SetupStep, Tool, ToolName, ToolSource,
@@ -53,6 +53,13 @@ const MAX_FILE_LEN: u64 = 4 << 20;
 /// Why a workspace's environment could not be detected.
 #[derive(Debug, thiserror::Error)]
 pub enum DetectError {
+    /// The workspace root does not resolve.
+    #[error("the workspace root does not resolve")]
+    Root {
+        /// The IO error.
+        #[source]
+        source: io::Error,
+    },
     /// A file exists and could not be read.
     #[error("could not read `{file}`")]
     Read {
@@ -398,6 +405,7 @@ pub struct Pin {
 /// can change one without the other.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Detection {
+    root: PathBuf,
     spec: EnvSpec,
     caches: Vec<CachePath>,
     pins: Vec<Pin>,
@@ -407,6 +415,11 @@ pub struct Detection {
 }
 
 impl Detection {
+    /// Returns the workspace root the report describes, resolved when detection ran.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Returns the spec: one pin per tool, the setup steps, the variable names and the cache paths.
     pub fn spec(&self) -> &EnvSpec {
         &self.spec
@@ -446,6 +459,8 @@ impl Detection {
 /// only grows, and the override file is a file in the working tree that
 /// the agent can rewrite.
 pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, DetectError> {
+    let root = fs::canonicalize(root).map_err(|source| DetectError::Root { source })?;
+    let root = root.as_path();
     let overrides = match read_text(root, OVERRIDE_FILE)? {
         Some(text) => EnvOverride::parse(&text)?,
         None => EnvOverride::default(),
@@ -498,6 +513,7 @@ pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, Dete
     spec.validate()?;
 
     Ok(Detection {
+        root: root.to_owned(),
         spec,
         caches,
         pins,

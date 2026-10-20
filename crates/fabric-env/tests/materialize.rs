@@ -77,7 +77,7 @@ fn declared(root: &Path, override_toml: &str) -> TestResult<Detection> {
 fn a_fresh_pnpm_workspace_plans_its_install_and_the_dry_run_changes_nothing() {
     let dir = copy_fixture("node-pnpm").unwrap();
     let detected = detect(dir.path(), None).unwrap();
-    let planned = plan(dir.path(), &detected).unwrap();
+    let planned = plan(&detected).unwrap();
     assert_eq!(planned.caches()[0].health, CacheHealth::Missing);
     assert_eq!(planned.steps().len(), 1);
     assert_eq!(planned.steps()[0].index(), 0);
@@ -102,10 +102,10 @@ fn a_finished_install_runs_nothing() {
     )
     .unwrap();
     let detected = detect(dir.path(), None).unwrap();
-    let planned = plan(dir.path(), &detected).unwrap();
+    let planned = plan(&detected).unwrap();
     assert_eq!(planned.caches()[0].health, CacheHealth::Healthy);
     assert!(planned.is_noop());
-    assert!(planned.execute().is_ok());
+    assert!(planned.ready().unwrap().execute().is_ok());
 }
 
 /// An install killed halfway leaves packages without the marker the
@@ -115,7 +115,7 @@ fn a_torn_install_runs_again() {
     let dir = copy_fixture("node-pnpm").unwrap();
     write(dir.path(), &[("node_modules/a/package.json", "{}")]).unwrap();
     let detected = detect(dir.path(), None).unwrap();
-    let planned = plan(dir.path(), &detected).unwrap();
+    let planned = plan(&detected).unwrap();
     assert_eq!(
         planned.caches()[0].health,
         CacheHealth::Incomplete {
@@ -196,7 +196,7 @@ fn health_follows_the_cache_kind() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), files).unwrap();
         let detected = detect(dir.path(), None).unwrap();
-        let planned = plan(dir.path(), &detected).unwrap();
+        let planned = plan(&detected).unwrap();
         assert_eq!(planned.caches().len(), 1, "{files:?}");
         assert_eq!(planned.caches()[0].health, health, "{files:?}");
     }
@@ -219,7 +219,7 @@ when = "always"
 "#,
     )
     .unwrap();
-    let planned = plan(dir.path(), &detected).unwrap();
+    let planned = plan(&detected).unwrap();
     assert_eq!(planned.steps().len(), 1);
     assert_eq!(planned.steps()[0].index(), 1);
     assert_eq!(planned.steps()[0].step().when, RunWhen::Always);
@@ -248,8 +248,8 @@ args = ["-c", "echo three >> log"]
 "#,
     )
     .unwrap();
-    let planned = plan(dir.path(), &detected).unwrap();
-    match planned.execute() {
+    let planned = plan(&detected).unwrap();
+    match planned.ready().unwrap().execute() {
         Err(MaterializeError::StepFailed {
             index,
             program,
@@ -293,7 +293,7 @@ program = "fabric-test-no-such-program-either"
         ),
     )
     .unwrap();
-    let planned = plan(dir.path(), &detected).unwrap();
+    let planned = plan(&detected).unwrap();
     assert!(planned.steps()[0].program().is_some());
     assert_eq!(planned.steps()[1].program(), None);
     let missing: Vec<&str> = planned
@@ -302,7 +302,7 @@ program = "fabric-test-no-such-program-either"
         .map(EnvVarName::as_str)
         .collect();
     assert_eq!(missing, [unset]);
-    let err = planned.execute().unwrap_err();
+    let err = planned.ready().unwrap_err();
     let text = err.to_string();
     assert!(
         text.contains("fabric-test-no-such-program-either"),
@@ -339,7 +339,7 @@ fn a_step_directory_may_not_leave_the_workspace() {
     )
     .unwrap();
     assert!(matches!(
-        plan(dir.path(), &detected),
+        plan(&detected),
         Err(MaterializeError::StepDirOutsideRoot { index: 0 })
     ));
 
@@ -349,7 +349,7 @@ fn a_step_directory_may_not_leave_the_workspace() {
         "[[setup]]\nprogram = \"true\"\ncwd = \"app\"\nwhen = \"always\"\n",
     )
     .unwrap();
-    let planned = plan(dir.path(), &detected).unwrap();
+    let planned = plan(&detected).unwrap();
     let expected: PathBuf = fs::canonicalize(dir.path().join("app")).unwrap();
     assert_eq!(planned.steps()[0].dir(), expected);
 }
@@ -370,9 +370,9 @@ when = "always"
 "#,
     )
     .unwrap();
-    let planned = plan(dir.path(), &detected).unwrap();
+    let planned = plan(&detected).unwrap();
     let started = Instant::now();
-    planned.execute().unwrap();
+    planned.ready().unwrap().execute().unwrap();
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "{:?}",
@@ -392,7 +392,7 @@ fn a_report_without_caches_runs_its_steps_on_every_resume() {
     )
     .unwrap();
     let detected = detect(dir.path(), None).unwrap();
-    let planned = plan(dir.path(), &detected).unwrap();
+    let planned = plan(&detected).unwrap();
     assert!(planned.caches().is_empty());
     assert_eq!(planned.steps().len(), 1);
     assert_eq!(planned.steps()[0].step().program.as_str(), "go");
@@ -403,8 +403,8 @@ fn a_report_without_caches_runs_its_steps_on_every_resume() {
         "[[setup]]\nprogram = \"touch\"\nargs = [\"ran\"]\n",
     )
     .unwrap();
-    let planned = plan(dir.path(), &detected).unwrap();
+    let planned = plan(&detected).unwrap();
     assert_eq!(planned.steps().len(), 1);
-    planned.execute().unwrap();
+    planned.ready().unwrap().execute().unwrap();
     assert!(dir.path().join("ran").exists());
 }

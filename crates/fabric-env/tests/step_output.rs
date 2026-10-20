@@ -51,7 +51,7 @@ when = "always"
     )
     .unwrap();
     let detected = detect(dir.path(), None).unwrap();
-    let planned = plan(dir.path(), &detected).unwrap();
+    let planned = plan(&detected).unwrap();
     let captured = Captured::default();
     let writer = captured.clone();
     let subscriber = tracing_subscriber::fmt()
@@ -59,7 +59,8 @@ when = "always"
         .with_ansi(false)
         .without_time()
         .finish();
-    tracing::subscriber::with_default(subscriber, || planned.execute()).unwrap();
+    let ready = planned.ready().unwrap();
+    tracing::subscriber::with_default(subscriber, || ready.execute()).unwrap();
     let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
     let lines: Vec<&str> = log
         .lines()

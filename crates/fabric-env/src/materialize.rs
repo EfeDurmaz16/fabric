@@ -1,11 +1,12 @@
 //! Materialize: make a restored workspace runnable on this node (ADR 0007).
 //!
 //! Invariant: `plan` only reads. It never runs a program and never writes
-//! a byte, so a dry run is `plan` and nothing more. `Plan::execute` runs
-//! exactly the steps the plan lists, with the program paths and directories
-//! the plan resolved, and runs none of them when the plan already shows that
-//! one cannot run: a program missing from `PATH` or a declared environment
-//! variable missing from this node.
+//! a byte, so a dry run is `plan` and nothing more. `Plan::ready` turns a
+//! plan into steps that can run, and refuses when the plan shows that one
+//! cannot: a program missing from `PATH` or a declared environment variable
+//! missing from this node. `Ready::execute` runs exactly those steps, with
+//! the program paths and directories the plan resolved. Neither value can
+//! be copied, so one plan runs at most once.
 //!
 //! A cache is healthy when it is a non-empty directory that holds the
 //! marker its installer writes last. The marker comes from the cache's
@@ -51,10 +52,10 @@ const OUTPUT_GRACE: Duration = Duration::from_secs(1);
 /// Why materialize could not plan or finish.
 #[derive(Debug, thiserror::Error)]
 pub enum MaterializeError {
-    /// The workspace root does not resolve to a directory.
+    /// The workspace root the detection report names is no longer a directory.
     #[error("workspace root `{}` is not readable", path.display())]
     Root {
-        /// The root as given.
+        /// The root the detection report names.
         path: PathBuf,
         /// The IO error.
         #[source]
@@ -171,7 +172,7 @@ pub struct CacheReport {
     pub health: CacheHealth,
 }
 
-/// A step the plan will run, with what the plan resolved for it.
+/// A step the plan would run, with what the plan resolved for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedStep {
     index: usize,
@@ -203,7 +204,10 @@ impl PlannedStep {
 }
 
 /// What materialize found and what it would run; computing it changes nothing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// A plan is a report. It runs nothing itself and cannot be copied: the
+/// one way to run it is `Plan::ready`, which consumes it.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Plan {
     caches: Vec<CacheReport>,
     steps: Vec<PlannedStep>,
@@ -226,58 +230,88 @@ impl Plan {
         &self.missing_env
     }
 
-    /// Returns true when executing the plan would run nothing.
+    /// Returns true when running the plan would run nothing.
     pub fn is_noop(&self) -> bool {
         self.steps.is_empty()
     }
 
-    /// Runs the planned steps in order, streaming their output to `tracing`.
+    /// Turns the plan into steps that can run, or refuses with every missing program and variable named.
     ///
-    /// Refuses before running anything when a planned program is missing or
-    /// a declared variable is unset, with one error that lists all of them.
-    /// Stops at the first step that fails. Takes the plan by value: what it
-    /// read from the disk is stale once a step has run.
-    pub fn execute(self) -> Result<(), MaterializeError> {
+    /// A plan with no steps is ready whatever this node lacks, since nothing will run.
+    pub fn ready(self) -> Result<Ready, MaterializeError> {
         if self.steps.is_empty() {
-            return Ok(());
+            return Ok(Ready { steps: Vec::new() });
         }
-        let missing: Vec<(usize, ProgramName)> = self
-            .steps
-            .iter()
-            .filter(|planned| planned.program.is_none())
-            .map(|planned| (planned.index, planned.step.program.clone()))
-            .collect();
+        let mut steps = Vec::with_capacity(self.steps.len());
+        let mut missing = Vec::new();
+        for planned in self.steps {
+            match planned.program {
+                Some(program) => steps.push(ReadyStep {
+                    index: planned.index,
+                    step: planned.step,
+                    dir: planned.dir,
+                    program,
+                }),
+                None => missing.push((planned.index, planned.step.program)),
+            }
+        }
         if !missing.is_empty() || !self.missing_env.is_empty() {
             return Err(MaterializeError::CannotRun {
                 programs: missing,
                 env: self.missing_env,
             });
         }
-        for planned in &self.steps {
-            if let Some(program) = planned.program.as_deref() {
-                run_step(planned, program)?;
-            }
+        Ok(Ready { steps })
+    }
+}
+
+/// A step whose program was found, so it can run.
+#[derive(Debug)]
+struct ReadyStep {
+    index: usize,
+    step: SetupStep,
+    dir: PathBuf,
+    program: PathBuf,
+}
+
+/// Steps that passed every check `Plan::ready` makes; running them consumes this value.
+#[derive(Debug)]
+pub struct Ready {
+    steps: Vec<ReadyStep>,
+}
+
+impl Ready {
+    /// Runs the steps in order, streaming their output to `tracing`, and stops at the first that fails.
+    ///
+    /// Takes the value: what the plan read from the disk is stale once a
+    /// step has run, so a second run needs a new plan.
+    pub fn execute(self) -> Result<(), MaterializeError> {
+        for step in &self.steps {
+            run_step(step)?;
         }
         Ok(())
     }
 }
 
-/// Inspects the workspace at `root` against `detected` and returns what materialize would do.
+/// Inspects the workspace `detected` describes and returns what materialize would do.
 ///
 /// This is the dry run: it reads the disk, `PATH` and the presence of the
 /// spec's environment variables, and changes nothing. It takes the
 /// detection report rather than the spec alone because the report knows
-/// each cache's ecosystem, which decides the marker that proves it whole.
-pub fn plan(root: &Path, detected: &Detection) -> Result<Plan, MaterializeError> {
-    let root = fs::canonicalize(root).map_err(|source| MaterializeError::Root {
-        path: root.to_owned(),
-        source,
-    })?;
-    if !root.is_dir() {
-        return Err(MaterializeError::Root {
-            path: root,
-            source: io::Error::from(io::ErrorKind::NotADirectory),
-        });
+/// each cache's ecosystem, which decides the marker that proves it whole,
+/// and the root it was built from, so a report cannot be checked against
+/// another tree.
+pub fn plan(detected: &Detection) -> Result<Plan, MaterializeError> {
+    let root = detected.root().to_owned();
+    match fs::metadata(&root) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return Err(MaterializeError::Root {
+                path: root,
+                source: io::Error::from(io::ErrorKind::NotADirectory),
+            });
+        }
+        Err(source) => return Err(MaterializeError::Root { path: root, source }),
     }
 
     let spec = detected.spec();
@@ -384,9 +418,10 @@ fn find_on_path(path: Option<&OsStr>, root: &Path, program: &ProgramName) -> Opt
         })
 }
 
-fn run_step(planned: &PlannedStep, program: &Path) -> Result<(), MaterializeError> {
+fn run_step(planned: &ReadyStep) -> Result<(), MaterializeError> {
     let index = planned.index;
     let name = &planned.step.program;
+    let program = &planned.program;
     tracing::info!(
         target: SETUP_LOG_TARGET,
         step = index,
