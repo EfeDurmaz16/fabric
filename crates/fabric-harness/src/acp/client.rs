@@ -220,8 +220,15 @@ fn write_line(outgoing: &Outgoing, value: &Value) -> Result<(), AcpError> {
 }
 
 /// Writes queued lines to the agent until every sender is gone or a write
-/// fails; then the agent's stdin is closed.
-async fn write_loop(mut stdin: ChildStdin, mut lines: mpsc::UnboundedReceiver<String>) {
+/// fails; then the agent's stdin is closed. A failed write fails every
+/// waiting request: its line, or a later one, never reached the agent, and
+/// an agent that keeps its stdout open would otherwise leave a request
+/// with no deadline, such as a prompt, waiting forever.
+async fn write_loop(
+    mut stdin: ChildStdin,
+    mut lines: mpsc::UnboundedReceiver<String>,
+    pending: Pending,
+) {
     while let Some(line) = lines.recv().await {
         let written = async {
             stdin.write_all(line.as_bytes()).await?;
@@ -229,6 +236,8 @@ async fn write_loop(mut stdin: ChildStdin, mut lines: mpsc::UnboundedReceiver<St
         };
         if let Err(e) = written.await {
             warn!(error = %e, "acp: write failed");
+            lines.close();
+            fail_pending(&pending);
             break;
         }
     }
@@ -415,8 +424,8 @@ impl AcpClient {
     #[must_use]
     pub fn attach(stdin: ChildStdin, stdout: ChildStdout, policy: PermissionPolicy) -> Self {
         let (outgoing, lines) = mpsc::unbounded_channel();
-        tokio::spawn(write_loop(stdin, lines));
         let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
+        tokio::spawn(write_loop(stdin, lines, Arc::clone(&pending)));
         let (sink, rx, dropped_updates) = UpdateSink::new(UPDATE_BUFFER);
         let reader = tokio::spawn(read_loop(
             stdout,
@@ -650,6 +659,29 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap().update, json!(0));
         assert_eq!(rx.try_recv().unwrap().update, json!(1));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_fails_a_waiting_prompt() {
+        // The agent closes its stdin but keeps its stdout open.
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec 0<&-; sleep 30")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let client = AcpClient::attach(stdin, stdout, PermissionPolicy::Deny);
+        let session = SessionId::parse("s1").unwrap();
+        let answer = tokio::time::timeout(Duration::from_secs(10), client.prompt(&session, "hi"))
+            .await
+            .expect("the prompt must fail, not wait for an answer that cannot come");
+        assert!(answer.is_err());
+        child.kill().await.unwrap();
     }
 
     #[test]
