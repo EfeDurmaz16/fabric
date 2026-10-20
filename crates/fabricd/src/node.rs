@@ -192,6 +192,21 @@ impl Node {
     }
 
     async fn serve_control(self: Arc<Self>, mut stream: tokio::net::UnixStream) {
+        let me = rustix::process::geteuid().as_raw();
+        match stream.peer_cred() {
+            Ok(peer) if peer.uid() == me => {}
+            Ok(peer) => {
+                tracing::warn!(
+                    uid = peer.uid(),
+                    "refused a control connection from another user"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "refused a control connection whose user is unknown");
+                return;
+            }
+        }
         let request = match control::read_request(&mut stream).await {
             Ok(request) => request,
             Err(e) => {

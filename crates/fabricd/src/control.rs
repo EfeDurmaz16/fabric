@@ -2,7 +2,10 @@
 //!
 //! Invariant: the socket lives in the state directory, which only its owner
 //! can enter (mode 0700), so a request on it comes from the user who runs
-//! the daemon. One connection carries one request and one response, each a
+//! the daemon. Neither side trusts that alone: the daemon refuses a peer
+//! whose user id is not its own, and the CLI refuses a state directory or a
+//! socket that another user owns or that others can enter, because the run
+//! plan it reads there decides what it launches. One connection carries one request and one response, each a
 //! `u32` little-endian length and that many postcard bytes, the length
 //! checked against `MAX_CONTROL_MESSAGE` before anything is allocated. The daemon answers every request, refusals
 //! included, with the lines it printed on the way, so every automatic
@@ -12,6 +15,7 @@
 
 use std::ffi::OsString;
 use std::num::NonZeroU32;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use fabric_core::harness::HarnessKind;
@@ -241,6 +245,14 @@ pub enum ControlError {
         #[source]
         source: std::io::Error,
     },
+    /// The state directory or the socket is not this user's alone.
+    #[error("{path} {reason}, so its answers are not trusted; it must be yours and mode 0700")]
+    Untrusted {
+        /// The directory or socket.
+        path: PathBuf,
+        /// What is wrong with it.
+        reason: String,
+    },
     /// The exchange failed midway.
     #[error("control socket: {0}")]
     Io(#[from] std::io::Error),
@@ -290,8 +302,45 @@ async fn read_message(stream: &mut UnixStream) -> Result<Vec<u8>, ControlError> 
     Ok(payload)
 }
 
+/// Refuses `path` unless this user owns it and, for a directory, no one else may enter it.
+fn check_private(path: &Path) -> Result<(), ControlError> {
+    let untrusted = |reason: String| ControlError::Untrusted {
+        path: path.to_owned(),
+        reason,
+    };
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(ControlError::Io(e)),
+    };
+    let me = rustix::process::geteuid().as_raw();
+    if meta.uid() != me {
+        return Err(untrusted(format!(
+            "belongs to user {}, not to you ({me})",
+            meta.uid()
+        )));
+    }
+    if meta.file_type().is_symlink() {
+        return Err(untrusted("is a symlink".to_owned()));
+    }
+    if meta.is_dir() && meta.mode() & 0o077 != 0 {
+        return Err(untrusted(format!(
+            "has mode {:o}, which lets others in",
+            meta.mode() & 0o777
+        )));
+    }
+    Ok(())
+}
+
 /// Sends one request to the daemon at `socket` and waits for its answer.
+///
+/// The socket's directory and the socket must be this user's alone; a
+/// missing one is the daemon not running, which the connect reports.
 pub async fn call(socket: &Path, request: &Request) -> Result<Response, ControlError> {
+    if let Some(dir) = socket.parent() {
+        check_private(dir)?;
+    }
+    check_private(socket)?;
     let mut stream =
         UnixStream::connect(socket)
             .await
@@ -314,4 +363,23 @@ pub(crate) async fn write_response(
     response: &Response,
 ) -> Result<(), ControlError> {
     write_message(stream, &encode(response)?).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn a_state_directory_others_can_enter_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            check_private(dir.path()),
+            Err(ControlError::Untrusted { .. })
+        ));
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        check_private(dir.path()).unwrap();
+    }
 }
