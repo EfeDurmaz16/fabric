@@ -27,7 +27,7 @@ pub struct Installed {
     /// The version it reported, such as `2.1.294`; `None` when the binary
     /// answered `--version` with no version in it.
     pub version: Option<String>,
-    /// The whole first line of its version output.
+    /// Its whole `--version` output, trimmed.
     pub raw: String,
 }
 
@@ -99,7 +99,9 @@ pub enum Launch {
 pub enum Io {
     /// The user's terminal: stdin, stdout and stderr are inherited.
     Terminal,
-    /// Headless: no stdin, stdout and stderr captured on the handle.
+    /// Headless: no stdin, stdout and stderr captured on the handle. An
+    /// ACP agent speaks its protocol on these pipes, so for it the
+    /// protocol client owns them and they are not on the handle.
     Piped,
 }
 
@@ -153,7 +155,9 @@ impl Running {
         self.session.as_ref()
     }
 
-    /// The child process; its pipes are set when `Io::Piped` was asked for.
+    /// The child process. Its stdout and stderr are set when `Io::Piped`
+    /// was asked for, except for an ACP agent, whose pipes the protocol
+    /// client holds (`AcpHarness::launch_acp` returns that client).
     pub fn child_mut(&mut self) -> &mut Child {
         &mut self.child
     }
@@ -169,6 +173,12 @@ pub struct Restored {
 }
 
 /// An agent that can be captured, restored and started (ADR 0006).
+///
+/// `capture` and `restore` copy files on a blocking thread. Dropping their
+/// future (a timeout, a Ctrl-C) does not stop that copy, so a caller must
+/// await them to completion and must not `launch` the same session until
+/// they have returned: a restore still renaming files over a transcript
+/// would race the harness that appends to it.
 pub trait Harness: Send + Sync {
     /// Which harness this is.
     fn kind(&self) -> HarnessKind;
