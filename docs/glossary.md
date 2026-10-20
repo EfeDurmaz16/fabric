@@ -34,7 +34,13 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Job.** The unit of development work. A goal plus a ledger plus snapshots plus an EnvSpec plus a lease.
 
-**Job init.** `fabric job init`: adopting the current directory, in place, as a job's workspace, or creating a fresh one with `--new`. The only way a job starts.
+**Job init.** `fabric job init`: adopting the current directory, in place, as a job's workspace. Planned; not built (ADR 0016).
+
+**Job new.** `fabric job new --repo <path>`: making a job whose root is a clone of the repository at `~/fabric/jobs/<job-id>/work`. How a job starts in this phase.
+
+**Departed copy.** The workspace a node held for a job that has since moved to another node. It never runs again; when it holds nothing the job lacks, it is renamed out of the root to `departed/<epoch>` beside it and kept (ADR 0016).
+
+**Node.** One `fabric serve` process and its state directory: the store, the ledgers, the peer book and the control socket the CLI talks to.
 
 **Job record.** The ledger and the manifest together.
 

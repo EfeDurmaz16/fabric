@@ -1,6 +1,6 @@
 # Fabric architecture
 
-Status: design only. No code behind this page yet. See the [README](../README.md) for what exists.
+Status: built through the first gate's commands, not yet run on the two Macs. See the [README](../README.md) for what exists. Where the code departs from this page, [ADR 0016](adr/0016-node-and-cli-as-built.md) says so: a job starts with `fabric job new` (a clone under `~/fabric/jobs/<id>/work`) because `job init` is not built, the node runs as `fabric serve`, and a departed copy leaves the root.
 
 Amended 2026-10-19 after step 1 research. The lease lost its clock and gained a move protocol (ADR 0003), the root is the same absolute path on every node (ADR 0011), caches carry under per-ecosystem keys (ADR 0012), and the move onto the second machine is an explicit push (ADR 0008). The research files are listed under Evidence paths.
 
@@ -16,12 +16,12 @@ A job is a goal plus the state needed to keep working on it. Where that state is
 |---|---|---|---|
 | Job record | Goal, append-only event ledger, versioned manifest, pending decisions, an opaque state directory per harness | `fabric-core` | [0001](adr/0001-job-as-unit-of-work.md), [0002](adr/0002-job-ledger-and-record.md) |
 | Storage | Content-addressed snapshots of the workspace: git objects and refs in a bundle, the index and the working tree as two snapshot commits, ignored files by class (deps, build, tool caches and precious files carried, secrets never), harness state | `fabric-store` | [0004](adr/0004-content-addressed-snapshots.md), [0011](adr/0011-path-identity.md) |
-| Compute | The node that owns the job and runs the harness right now. Replaceable by an explicit move. Exactly one live copy. | `fabric-node`, `fabric-net` | [0003](adr/0003-exactly-one-live-copy.md), [0005](adr/0005-transport-and-node-identity.md), [0008](adr/0008-placement-and-triggers.md), [0013](adr/0013-network-protocol-as-built.md) |
+| Compute | The node that owns the job and runs the harness right now. Replaceable by an explicit move. Exactly one live copy. | `fabricd`, `fabric-net` | [0003](adr/0003-exactly-one-live-copy.md), [0005](adr/0005-transport-and-node-identity.md), [0008](adr/0008-placement-and-triggers.md), [0013](adr/0013-network-protocol-as-built.md), [0016](adr/0016-node-and-cli-as-built.md) |
 | Environment | `EnvSpec`: tool pins as the workspace files write them, setup commands, env var names, cache paths, the job's added secret patterns. Caches arrive when their carry key matches; otherwise the node materializes. | `fabric-env` | [0007](adr/0007-environment-spec.md), [0012](adr/0012-dependency-carry.md) |
 
 Harnesses (Claude Code, Codex, anything that speaks the Agent Client Protocol) are adapters on top of these four. The core never reads a harness's files; it moves them as opaque bytes. See [0006](adr/0006-harness-adapters.md).
 
-## Crate layout (planned)
+## Crate layout
 
 ```text
 crates/
@@ -29,12 +29,12 @@ crates/
   fabric-store     objects, blob store, SQLite catalog, snapshot publish and restore, ignored-file classes
   fabric-net       node identity, Endpoint and the per-wire Transport trait, QUIC and TCP+TLS, blob transfer, pairing
   fabric-harness   Harness trait, ACP adapter, Claude Code adapter, Codex adapter
-  fabric-env       EnvSpec detection, the .fabric/env.toml override file, the secret policy capture applies, materialization, carry keys, doctor facts
-  fabric-node      the long-running node process: owner of the store lock, blob server, move target
-  fabric-cli       the `fabric` binary: job init, suspend, resume, job move, job steal, status, doctor, orphan export, node pair, node serve
+  fabric-env       EnvSpec detection, the .fabric/env.toml override file, the secret policy, materialization
+  fabricd          the node: state directory lock, ledger files, store owner, peer service, move protocol, doctor facts and carry keys, control socket
+  fabric           the `fabric` binary: serve, node, job new, run, suspend, resume, move, steal, status, log, approve, reject, doctor
 ```
 
-`fabric-core`, `fabric-store`, `fabric-net`, `fabric-harness` and `fabric-env` exist today; in `fabric-env`, carry keys and doctor facts are still to come. Dependency direction is strictly downward: `fabric-cli` depends on everything, `fabric-core` depends on nothing in the workspace. Today `fabric-core` defines one trait, `LedgerStore`, and `BoxFuture`, the return type of every dynamically dispatched trait, defined once. `fabric-net` defines `Transport`, the interface of one wire, because its byte streams are tokio types the core does not depend on; the node crate will hold an `Endpoint`, which binds both wires on one port and is the place an iroh endpoint would replace (ADR 0013). The `Harness` trait lives in `fabric-harness` for now, because its launch handle owns a child process and the core stays pure (ADR 0015). Nothing in the core knows about QUIC, SQLite or any agent vendor.
+Every crate above exists. Carry keys and doctor facts live in `fabricd`, which measures them, rather than in `fabric-env` (ADR 0016). Dependency direction is strictly downward: `fabric` depends on everything, `fabric-core` depends on nothing in the workspace. Today `fabric-core` defines one trait, `LedgerStore`, and `BoxFuture`, the return type of every dynamically dispatched trait, defined once. `fabric-net` defines `Transport`, the interface of one wire, because its byte streams are tokio types the core does not depend on; `fabricd` holds an `Endpoint`, which binds both wires on one port and is the place an iroh endpoint would replace (ADR 0013). The `Harness` trait lives in `fabric-harness` for now, because its launch handle owns a child process and the core stays pure (ADR 0015). Nothing in the core knows about QUIC, SQLite or any agent vendor.
 
 ## Data structures first
 
@@ -140,7 +140,7 @@ If B dies between steps 7 and 9, B owns epoch 2 and the job is not lost: the sna
 
 ## How to read the ADRs
 
-Read them in number order. 0001 and 0002 define the data. 0003 is the one that protects the user's work and is worth the most review time. 0004 and 0005 are the storage and network mechanics. 0006 and 0007 are the adapters. 0008 is the explicit move and the preflight. 0009 is how we work. 0010 is what Fabric is not. 0011 and 0012 are the two decisions the preflight measurements forced: the root path and which caches travel. 0013 records the network protocol as the code built it and supersedes parts of 0005. 0014 records the store as built and supersedes the parts of 0004 it names. 0015 records the harness trait as built and supersedes the trait section of 0006.
+Read them in number order. 0001 and 0002 define the data. 0003 is the one that protects the user's work and is worth the most review time. 0004 and 0005 are the storage and network mechanics. 0006 and 0007 are the adapters. 0008 is the explicit move and the preflight. 0009 is how we work. 0010 is what Fabric is not. 0011 and 0012 are the two decisions the preflight measurements forced: the root path and which caches travel. 0013 records the network protocol as the code built it and supersedes parts of 0005. 0014 records the store as built and supersedes the parts of 0004 it names. 0015 records the harness trait as built and supersedes the trait section of 0006. 0016 records the node and the CLI as built and says where they depart from 0001, 0003, 0004, 0008 and 0011.
 
 ### Evidence paths
 
