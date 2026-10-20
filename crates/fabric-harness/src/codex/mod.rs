@@ -16,7 +16,15 @@
 //! back never forks silently. `auth.json`, the `SQLite` files, the locks and
 //! `config.toml` never travel. `CODEX_HOME` is never set per job because
 //! the keyring entry is derived from it (ADR 0006, D15); trust for the new
-//! path is passed as a `-c` override on every run.
+//! path is passed as a `-c` override on every run. `check_env` refuses a
+//! launch environment under which Codex would use another directory than
+//! the store, because Codex would then write the thread and look for its
+//! login there while capture reads the store, and could carry a stale
+//! copy of the same thread. Codex treats an empty `CODEX_HOME` as unset,
+//! canonicalizes a set one, and keys its keyring entry by the canonical
+//! path (`codex-rs/utils/home-dir/src/lib.rs` and
+//! `codex-rs/login/src/auth/storage.rs` at `e4568a3`), so a value that
+//! names the store under another spelling is accepted.
 //!
 //! The lock protocol follows `codex-rs/rollout/src/writer_lock.rs` at
 //! `e4568a3`: `thread-writer-locks/.coordination.lock` is held only while
@@ -78,6 +86,9 @@ const LOCK_READ_ON: &[u32] = &[0, 155, 1];
 /// How long a lock attempt waits for Codex's coordination lock, which
 /// Codex holds only across an open and a `try_lock`.
 const COORDINATION_WAIT: Duration = Duration::from_secs(2);
+
+/// The variable that names Codex's home directory.
+const HOME_VAR: &str = "CODEX_HOME";
 
 /// The Codex adapter for one `CODEX_HOME` under one home directory.
 #[derive(Debug, Clone)]
@@ -283,6 +294,35 @@ impl Codex {
 
     fn home_dir(&self) -> &Path {
         pipeline::fs_path(&self.home)
+    }
+
+    /// Refuses a launch environment under which Codex would keep its
+    /// sessions and login in another directory than the store: a
+    /// non-empty `CODEX_HOME` naming another directory, or none while the
+    /// store is not `<home>/.codex`. `launch` runs it first.
+    pub fn check_env(&self, env: &[(EnvVarName, String)]) -> Result<(), HarnessError> {
+        let dir = env
+            .iter()
+            .find(|(name, value)| name.as_str() == HOME_VAR && !value.is_empty())
+            .map_or_else(
+                || self.home_dir().join(".codex"),
+                |(_, value)| PathBuf::from(value),
+            );
+        let same = match (
+            std::fs::canonicalize(&dir),
+            std::fs::canonicalize(&self.store),
+        ) {
+            (Ok(dir), Ok(store)) => dir == store,
+            _ => dir == self.store,
+        };
+        if same {
+            Ok(())
+        } else {
+            Err(HarnessError::CodexHomeMismatch {
+                dir,
+                store: self.store.clone(),
+            })
+        }
     }
 
     /// Uses this binary instead of looking `codex` up on `PATH`.
@@ -602,6 +642,7 @@ impl Codex {
         launch: &Launch,
         env: &[(EnvVarName, String)],
     ) -> Result<Running, HarnessError> {
+        self.check_env(env)?;
         let root = pipeline::physical_workspace(workspace)?;
         let binary = self.binary()?;
         let args = self.args_for(&root, launch)?;

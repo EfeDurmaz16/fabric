@@ -280,6 +280,17 @@ pub enum HarnessError {
         /// What the variable moves, in words.
         moves: &'static str,
     },
+    /// The launch environment makes Codex keep its sessions and login in
+    /// another directory than the store the adapter reads.
+    #[error(
+        "the launch environment makes codex keep its sessions and login under {dir}, but Fabric reads {store}; launch with CODEX_HOME set to {store}"
+    )]
+    CodexHomeMismatch {
+        /// The directory Codex would use.
+        dir: PathBuf,
+        /// The store the adapter reads.
+        store: PathBuf,
+    },
     /// A settings or MCP overlay holds a literal secret instead of a reference.
     #[error("{path} holds a literal secret; use a ${{VAR}} reference in an overlay")]
     SecretInOverlay {

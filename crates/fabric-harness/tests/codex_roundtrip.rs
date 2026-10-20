@@ -687,3 +687,38 @@ async fn a_launch_from_inside_a_codex_tool_call_leaves_the_parent_markers_out() 
         );
     }
 }
+
+#[tokio::test]
+async fn a_launch_env_whose_codex_home_is_not_the_store_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().canonicalize().unwrap();
+    let work = home.join("w");
+    let elsewhere = home.join("other-codex");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let log = home.join("log.txt");
+    let env: Vec<(EnvVarName, String)> = [
+        ("FAKE_LOG", log.to_string_lossy().into_owned()),
+        ("CODEX_HOME", elsewhere.to_string_lossy().into_owned()),
+    ]
+    .into_iter()
+    .map(|(name, value)| (EnvVarName::parse(name).unwrap(), value))
+    .collect();
+    let err = node(&home)
+        .launch(
+            &work,
+            Launch::Headless {
+                resume: Some(thread()),
+                prompt: "go".to_owned(),
+            },
+            &env,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, HarnessError::CodexHomeMismatch { dir, store }
+            if *dir == elsewhere && *store == home.join(".codex")),
+        "{err}"
+    );
+    assert!(!log.exists(), "codex must not start");
+}
