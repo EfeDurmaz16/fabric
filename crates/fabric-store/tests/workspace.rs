@@ -807,6 +807,28 @@ fn unmerged_index_entries_are_refused() {
 }
 
 #[test]
+fn a_shallow_clone_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = dir.path().join("upstream");
+    fs::create_dir(&upstream).unwrap();
+    let u = git(&upstream);
+    u.run(&["init", "-q", "-b", "main"]).unwrap();
+    for message in ["one", "two"] {
+        u.run(&["commit", "-q", "--allow-empty", "-m", message])
+            .unwrap();
+    }
+    let url = format!("file://{}", upstream.display());
+    git(dir.path())
+        .run(&["clone", "-q", "--depth", "1", &url, "work"])
+        .unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let root = dir.path().join("work");
+    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    assert!(matches!(err, CaptureError::GitShallow), "{err}");
+}
+
+#[test]
 fn an_intent_to_add_entry_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("work");

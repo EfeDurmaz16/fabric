@@ -295,6 +295,9 @@ pub enum CaptureError {
         /// The submodule path.
         path: RelPath,
     },
+    /// The repository is a shallow clone; the bundle cannot carry the boundary `.git/shallow` records.
+    #[error("the repository is a shallow clone; run git fetch --unshallow and capture again")]
+    GitShallow,
     /// An index entry carries a flag the snapshot cannot reproduce; clear it and capture again.
     #[error("{path} is marked {flag} in the index, which a snapshot cannot carry")]
     GitIndexFlag {
@@ -1003,6 +1006,15 @@ impl GitCapture<'_> {
             if self.git.git_path(marker)?.exists() {
                 return Err(CaptureError::GitBusy { reason });
             }
+        }
+        // A shallow clone's boundary commits name parents it does not
+        // have; restored without `.git/shallow`, the repository fails fsck.
+        if self
+            .git
+            .run_text(&["rev-parse", "--is-shallow-repository"])?
+            == "true"
+        {
+            return Err(CaptureError::GitShallow);
         }
         if !self.git.run(&["ls-files", "-u", "-z"])?.is_empty() {
             return Err(CaptureError::GitBusy {
