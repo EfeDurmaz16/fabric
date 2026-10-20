@@ -54,6 +54,7 @@ use crate::session::SessionId;
 use crate::stage::{Carry, Source};
 
 use self::flags::LaunchFlags;
+pub use self::trust::TrustOutcome;
 
 /// The program name on `PATH`.
 pub const PROGRAM: &str = "claude";
@@ -244,19 +245,57 @@ impl ClaudeCode {
         process::installed_version(self.binary().ok(), PROGRAM).await
     }
 
-    /// Sets `projects["<root>"].hasTrustDialogAccepted` in `~/.claude.json`
-    /// while no `claude` process runs. Returns true when the file changed.
-    pub async fn preseed_trust(&self, workspace: &Path) -> Result<bool, HarnessError> {
+    /// Makes sure Claude will not stop at its trust dialog in `workspace`,
+    /// where Fabric can do so safely. `~/.claude.json` is read first, and
+    /// when the workspace root or an ancestor Claude inherits from is
+    /// trusted, nothing is written and no process is looked at. Otherwise
+    /// the key `projects["<root>"].hasTrustDialogAccepted` is written while
+    /// no `claude` runs; while one runs, the file is left to Claude and the
+    /// outcome names the processes, so the caller can warn and launch.
+    pub async fn preseed_trust(&self, workspace: &Path) -> Result<TrustOutcome, HarnessError> {
+        self.preseed_trust_with(workspace, || self.running_claude())
+            .await
+    }
+
+    /// `preseed_trust` with the question "which `claude` processes run?"
+    /// answered by `running`.
+    async fn preseed_trust_with<F, Fut>(
+        &self,
+        workspace: &Path,
+        running: F,
+    ) -> Result<TrustOutcome, HarnessError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Vec<u32>, HarnessError>>,
+    {
         let root = pipeline::physical_workspace(workspace)?;
-        let pids = self.running_claude().await?;
+        let config_json = self.config_json.clone();
+        let read_root = root.clone();
+        let trusted =
+            pipeline::blocking(move || trust::trusted_by(&config_json, &read_root)).await?;
+        if let Some(by) = trusted {
+            return Ok(TrustOutcome::AlreadyTrusted { by });
+        }
+        let pids = running().await?;
         if !pids.is_empty() {
-            return Err(HarnessError::HarnessRunning {
-                program: PROGRAM.to_owned(),
-                pids,
-            });
+            warn!(
+                ?pids,
+                root = root.as_str(),
+                "claude: workspace not trusted and claude is running; Claude will ask"
+            );
+            return Ok(TrustOutcome::LeftToClaude { pids });
         }
         let config_json = self.config_json.clone();
-        pipeline::blocking(move || trust::preseed_file(&config_json, &root)).await
+        let write_root = root.clone();
+        let changed =
+            pipeline::blocking(move || trust::preseed_file(&config_json, &write_root)).await?;
+        Ok(if changed {
+            TrustOutcome::Written
+        } else {
+            TrustOutcome::AlreadyTrusted {
+                by: pipeline::fs_path(&root).to_path_buf(),
+            }
+        })
     }
 
     fn carry_for(path: &Path) -> Carry {
@@ -663,7 +702,175 @@ impl Harness for ClaudeCode {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
+    use serde_json::Value;
+
     use super::*;
+
+    /// A temporary home with `.claude.json` holding `config` (none when
+    /// `None`) and a workspace directory `<home>/a/work`, both physical.
+    struct TrustFixture {
+        _dir: tempfile::TempDir,
+        home: PathBuf,
+        work: PathBuf,
+        adapter: ClaudeCode,
+    }
+
+    impl TrustFixture {
+        fn new(config: Option<&dyn Fn(&Path) -> String>) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let home = std::fs::canonicalize(dir.path()).unwrap();
+            let work = home.join("a").join("work");
+            std::fs::create_dir_all(&work).unwrap();
+            if let Some(config) = config {
+                std::fs::write(home.join(".claude.json"), config(&work)).unwrap();
+            }
+            let adapter = ClaudeCode::new(
+                AbsPath::parse(home.to_str().unwrap()).unwrap(),
+                OsString::new(),
+            );
+            TrustFixture {
+                _dir: dir,
+                home,
+                work,
+                adapter,
+            }
+        }
+
+        fn config(&self) -> PathBuf {
+            self.home.join(".claude.json")
+        }
+
+        fn config_bytes(&self) -> Option<Vec<u8>> {
+            std::fs::read(self.config()).ok()
+        }
+
+        /// Runs `preseed_trust` with `running` as the process answer;
+        /// returns the outcome and whether processes were asked about.
+        async fn preseed(&self, running: Vec<u32>) -> (Result<TrustOutcome, HarnessError>, bool) {
+            let asked = Cell::new(false);
+            let outcome = self
+                .adapter
+                .preseed_trust_with(&self.work, || {
+                    asked.set(true);
+                    async move { Ok(running) }
+                })
+                .await;
+            (outcome, asked.get())
+        }
+    }
+
+    fn trusting(dir: &Path) -> String {
+        serde_json::json!({
+            "projects": { dir.to_str().unwrap(): { "hasTrustDialogAccepted": true } }
+        })
+        .to_string()
+    }
+
+    fn trust_of(fixture: &TrustFixture) -> Value {
+        let value: Value = serde_json::from_slice(&fixture.config_bytes().unwrap()).unwrap();
+        value["projects"][fixture.work.to_str().unwrap()][trust::TRUST_KEY].clone()
+    }
+
+    #[tokio::test]
+    async fn a_trusted_ancestor_writes_nothing_and_asks_about_no_process() {
+        let fixture = TrustFixture::new(Some(&|work: &Path| trusting(work.parent().unwrap())));
+        let before = fixture.config_bytes();
+        let (outcome, asked) = fixture.preseed(vec![4242]).await;
+        assert_eq!(
+            outcome.unwrap(),
+            TrustOutcome::AlreadyTrusted {
+                by: fixture.work.parent().unwrap().to_path_buf()
+            }
+        );
+        assert!(
+            !asked,
+            "a trusted workspace must not depend on running processes"
+        );
+        assert_eq!(fixture.config_bytes(), before);
+    }
+
+    #[tokio::test]
+    async fn a_trusted_workspace_root_writes_nothing() {
+        let fixture = TrustFixture::new(Some(&|work: &Path| trusting(work)));
+        let before = fixture.config_bytes();
+        let (outcome, asked) = fixture.preseed(vec![4242]).await;
+        assert_eq!(
+            outcome.unwrap(),
+            TrustOutcome::AlreadyTrusted {
+                by: fixture.work.clone()
+            }
+        );
+        assert!(!asked);
+        assert_eq!(fixture.config_bytes(), before);
+    }
+
+    #[tokio::test]
+    async fn a_trusted_directory_above_the_git_root_does_not_count() {
+        let fixture = TrustFixture::new(Some(&|work: &Path| {
+            std::fs::create_dir(work.join(".git")).unwrap();
+            trusting(work.parent().unwrap())
+        }));
+        let (outcome, asked) = fixture.preseed(Vec::new()).await;
+        assert_eq!(outcome.unwrap(), TrustOutcome::Written);
+        assert!(asked);
+        assert_eq!(trust_of(&fixture), Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_workspace_is_written_while_no_claude_runs() {
+        let fixture = TrustFixture::new(Some(&|_: &Path| r#"{"projects":{}}"#.to_owned()));
+        let (outcome, asked) = fixture.preseed(Vec::new()).await;
+        assert_eq!(outcome.unwrap(), TrustOutcome::Written);
+        assert!(asked);
+        assert_eq!(trust_of(&fixture), Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_workspace_is_left_to_a_running_claude() {
+        let fixture = TrustFixture::new(Some(&|_: &Path| r#"{"projects":{}}"#.to_owned()));
+        let before = fixture.config_bytes();
+        let (outcome, asked) = fixture.preseed(vec![4242]).await;
+        assert_eq!(
+            outcome.unwrap(),
+            TrustOutcome::LeftToClaude { pids: vec![4242] }
+        );
+        assert!(asked);
+        assert_eq!(
+            fixture.config_bytes(),
+            before,
+            "Claude owns the file while it runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_config_is_an_error_and_stays_as_it_was() {
+        let fixture = TrustFixture::new(Some(&|_: &Path| r#"{"projects":"#.to_owned()));
+        let before = fixture.config_bytes();
+        let (outcome, asked) = fixture.preseed(Vec::new()).await;
+        assert!(matches!(
+            outcome,
+            Err(HarnessError::Malformed {
+                what: crate::error::Input::ConfigJson,
+                ..
+            })
+        ));
+        assert!(!asked);
+        assert_eq!(fixture.config_bytes(), before);
+    }
+
+    #[tokio::test]
+    async fn a_missing_config_is_an_error_and_is_not_created() {
+        let fixture = TrustFixture::new(None);
+        let (outcome, asked) = fixture.preseed(Vec::new()).await;
+        assert!(matches!(
+            outcome,
+            Err(HarnessError::Io { op: IoOp::Read, .. })
+        ));
+        assert!(!asked);
+        assert!(!fixture.config().exists());
+    }
 
     #[test]
     fn restore_accepts_only_the_places_capture_reads() {
