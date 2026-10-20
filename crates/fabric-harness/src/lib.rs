@@ -1,4 +1,4 @@
-//! Harness adapters (ADR 0006, ADR 0013).
+//! Harness adapters (ADR 0006, ADR 0015).
 //!
 //! A harness is the agent that does the work: Claude Code, Codex, or any
 //! agent that speaks the Agent Client Protocol. Each one keeps its session

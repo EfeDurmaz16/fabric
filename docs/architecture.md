@@ -34,7 +34,7 @@ crates/
   fabric-cli       the `fabric` binary: job init, suspend, resume, job move, job steal, status, doctor, orphan export, node pair, node serve
 ```
 
-`fabric-core` and `fabric-harness` exist today. Dependency direction is strictly downward: `fabric-cli` depends on everything, `fabric-core` depends on nothing in the workspace. Today `fabric-core` defines the ids, paths, the job ledger and its record codec, the lease and move protocol, snapshot manifests, the environment spec and the `BoxFuture` every dynamically dispatched trait returns. The `Store` and `Transport` traits do not exist yet; they will be defined in the core when `fabric-store` and `fabric-net` land. The `Harness` trait lives in `fabric-harness` for now, because its launch handle owns a child process and the core stays pure; it moves down when ADR 0003's `RunningHarness` lands (ADR 0013). Nothing in the core knows about QUIC, SQLite or any agent vendor.
+`fabric-core` and `fabric-harness` exist today. Dependency direction is strictly downward: `fabric-cli` depends on everything, `fabric-core` depends on nothing in the workspace. Today `fabric-core` defines the ids, paths, the job ledger and its record codec, the lease and move protocol, snapshot manifests, the environment spec and the `BoxFuture` every dynamically dispatched trait returns. The `Store` and `Transport` traits do not exist yet; they will be defined in the core when `fabric-store` and `fabric-net` land. The `Harness` trait lives in `fabric-harness` for now, because its launch handle owns a child process and the core stays pure; it moves down when ADR 0003's `RunningHarness` lands (ADR 0015). Nothing in the core knows about QUIC, SQLite or any agent vendor.
 
 ## Data structures first
 
@@ -140,7 +140,7 @@ If B dies between steps 7 and 9, B owns epoch 2 and the job is not lost: the sna
 
 ## How to read the ADRs
 
-Read them in number order. 0001 and 0002 define the data. 0003 is the one that protects the user's work and is worth the most review time. 0004 and 0005 are the storage and network mechanics. 0006 and 0007 are the adapters. 0008 is the explicit move and the preflight. 0009 is how we work. 0010 is what Fabric is not. 0011 and 0012 are the two decisions the preflight measurements forced: the root path and which caches travel. 0013 records the harness trait as built, which supersedes the trait section of 0006.
+Read them in number order. 0001 and 0002 define the data. 0003 is the one that protects the user's work and is worth the most review time. 0004 and 0005 are the storage and network mechanics. 0006 and 0007 are the adapters. 0008 is the explicit move and the preflight. 0009 is how we work. 0010 is what Fabric is not. 0011 and 0012 are the two decisions the preflight measurements forced: the root path and which caches travel. 0015 records the harness trait as built, which supersedes the trait section of 0006.
 
 ### Evidence paths
 

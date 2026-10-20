@@ -1,4 +1,4 @@
-# ADR 0013: Harness trait as built
+# ADR 0015: Harness trait as built
 
 Status: accepted, 2026-10-20
 
