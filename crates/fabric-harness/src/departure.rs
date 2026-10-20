@@ -32,6 +32,10 @@ use crate::manifest::Digest;
 use crate::session::SessionId;
 use crate::stage;
 
+/// The directory under the home where Fabric keeps its own harness state,
+/// which no adapter may capture or restore into.
+pub(crate) const FABRIC_DIR: &str = ".fabric";
+
 /// The record format this crate writes.
 const FORMAT: u16 = 1;
 
@@ -58,7 +62,7 @@ pub(crate) struct Records {
 impl Records {
     /// The records of `session` for the harness `label` under `home`.
     pub(crate) fn of(home: &Path, label: &str, session: &SessionId) -> Self {
-        let dir = home.join(".fabric/harness/departed").join(label);
+        let dir = home.join(FABRIC_DIR).join("harness/departed").join(label);
         Records {
             active: dir.join(format!("{session}.json")),
             pending: dir.join(format!("{session}.pending.json")),

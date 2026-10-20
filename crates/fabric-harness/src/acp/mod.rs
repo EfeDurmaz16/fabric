@@ -27,7 +27,7 @@ use fabric_core::path::AbsPath;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::departure::Records;
+use crate::departure::{FABRIC_DIR, Records};
 use crate::error::HarnessError;
 use crate::harness::{Harness, Installed, Launch, Restored, Running};
 use crate::manifest::{Content, HOME_PREFIX, Mutability, StateManifest, under_home};
@@ -96,13 +96,25 @@ impl AcpHarness {
     }
 
     /// Declares where the agent keeps its sessions; refused when `dir` is
-    /// not under the home.
+    /// not under the home, or when it is the home or lies under
+    /// `~/.fabric`, in any letter case: either way capture would walk
+    /// Fabric's own departure records, which never travel.
     pub fn with_state_dir(mut self, dir: &AbsPath) -> Result<Self, HarnessError> {
         let dir = pipeline::fs_path(dir).to_path_buf();
-        if dir.strip_prefix(self.home_dir()).is_err() {
+        let Ok(rel) = dir.strip_prefix(self.home_dir()) else {
             return Err(HarnessError::NotUnderHome {
                 path: dir,
                 home: self.home_dir().to_path_buf(),
+            });
+        };
+        let holds_fabric = rel
+            .components()
+            .next()
+            .is_none_or(|first| first.as_os_str().eq_ignore_ascii_case(FABRIC_DIR));
+        if holds_fabric {
+            return Err(HarnessError::StateDirHoldsFabric {
+                path: dir,
+                fabric: self.home_dir().join(FABRIC_DIR),
             });
         }
         self.state_dir = Some(dir);

@@ -578,3 +578,36 @@ async fn capture_without_a_declared_state_dir_is_refused() {
     .unwrap_err();
     assert!(matches!(err, HarnessError::NotUnderHome { .. }), "{err}");
 }
+
+#[test]
+fn a_state_dir_that_overlaps_fabric_state_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+    for dir in [
+        home.path().to_path_buf(),
+        home.path().join(".fabric"),
+        home.path().join(".fabric/harness/departed"),
+        home.path().join(".Fabric/x"),
+    ] {
+        let err = AcpHarness::new(
+            program(),
+            agent_args(),
+            abs(home.path()),
+            agent_dir(home.path()),
+        )
+        .with_state_dir(&abs(&dir))
+        .unwrap_err();
+        assert!(
+            matches!(err, HarnessError::StateDirHoldsFabric { .. }),
+            "{}: {err}",
+            dir.display()
+        );
+    }
+    AcpHarness::new(
+        program(),
+        agent_args(),
+        abs(home.path()),
+        agent_dir(home.path()),
+    )
+    .with_state_dir(&abs(&home.path().join(".fabric-agent/sessions")))
+    .unwrap();
+}

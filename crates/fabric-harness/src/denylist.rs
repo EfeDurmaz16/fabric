@@ -34,6 +34,8 @@ pub enum DenyRule {
     CodexHostStateDirectory,
     /// A file under `~/.codex` that is host state or holds a token.
     CodexHostStateFile,
+    /// Fabric's own node-local state under `~/.fabric`.
+    FabricState,
 }
 
 impl fmt::Display for DenyRule {
@@ -47,6 +49,7 @@ impl fmt::Display for DenyRule {
             DenyRule::ClaudeHostStateFile => "claude host state file",
             DenyRule::CodexHostStateDirectory => "codex host state directory",
             DenyRule::CodexHostStateFile => "codex host state file",
+            DenyRule::FabricState => "fabric node state",
         })
     }
 }
@@ -171,6 +174,9 @@ pub(crate) fn check(rel_path: &str) -> Option<DenyRule> {
         return Some(DenyRule::CredentialDirectory);
     }
     if components.first() == Some(&HOME_PREFIX) {
+        if components.get(1) == Some(&".fabric") {
+            return Some(DenyRule::FabricState);
+        }
         match (components.get(1), components.get(2)) {
             (Some(&".claude"), Some(third)) => {
                 let is_dir = components.len() > 3;
@@ -239,6 +245,7 @@ mod tests {
             "home/w/.env.local",
             "home/w/config/server.pem",
             "home/w/.claude/.env.production",
+            "home/.fabric/harness/departed/acp-x/s1.json",
         ] {
             assert!(check(path).is_some(), "{path} should be denied");
         }

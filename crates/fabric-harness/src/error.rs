@@ -267,6 +267,15 @@ pub enum HarnessError {
         /// The agent program.
         program: String,
     },
+    /// An ACP state directory is Fabric's own state directory, lies inside
+    /// it, or holds it.
+    #[error("{path} overlaps Fabric's own state at {fabric}; an agent's state directory must not")]
+    StateDirHoldsFabric {
+        /// The declared state directory.
+        path: PathBuf,
+        /// Fabric's state directory under the home.
+        fabric: PathBuf,
+    },
     /// The launch environment sets a variable that makes the harness keep
     /// its state or login somewhere other than the adapter reads and writes.
     #[error(
