@@ -756,6 +756,22 @@ fn a_secret_in_the_harness_state_is_left_behind_and_named() {
     );
 }
 
+#[test]
+fn a_link_target_that_is_not_utf8_is_refused_not_rewritten() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("plain");
+    fs::create_dir_all(&root).unwrap();
+    symlink(std::ffi::OsStr::from_bytes(b"bad\xff"), root.join("link")).unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    assert!(
+        matches!(&err, CaptureError::NotUtf8 { path } if path == "link"),
+        "{err}"
+    );
+}
+
 fn plain_tree(root: &Path, state: &Path) -> Fallible {
     fs::create_dir_all(root.join("a/b"))?;
     fs::create_dir_all(root.join("empty"))?;

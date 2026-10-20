@@ -205,6 +205,12 @@ pub enum CaptureError {
         #[source]
         source: PathError,
     },
+    /// A file name or a symlink target is not UTF-8, which a manifest cannot hold; rename or relink it.
+    #[error("{path:?}: the name or the link target is not UTF-8")]
+    NotUtf8 {
+        /// The path, with bytes that are not UTF-8 replaced for display.
+        path: String,
+    },
     /// The root lies inside a repository whose top level is elsewhere.
     #[error("{root} is inside the repository at {toplevel}; the job root must be the top level")]
     NotRepositoryRoot {
@@ -286,6 +292,17 @@ pub(crate) fn mode_of(raw: u32) -> Mode {
     u16::try_from(raw & 0o777).ok().and_then(Mode::new).unwrap()
 }
 
+/// Reads a symlink's target, refusing one that is not UTF-8 instead of rewriting it.
+fn utf8_link(full: &Path, rel: &RelPath) -> Result<String, CaptureError> {
+    fs::read_link(full)
+        .map_err(|e| io_err(full, e))?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| CaptureError::NotUtf8 {
+            path: rel.as_str().to_owned(),
+        })
+}
+
 fn mtime_ns(meta: &fs::Metadata) -> u64 {
     let secs = u64::try_from(meta.mtime()).unwrap_or(0);
     let nanos = u64::try_from(meta.mtime_nsec()).unwrap_or(0);
@@ -339,9 +356,8 @@ fn list_tree(base: &Path, nested: &mut Vec<String>) -> Result<Vec<Found>, Captur
         names.sort();
         for name in names {
             let Some(name) = name.to_str().map(str::to_owned) else {
-                return Err(CaptureError::BadPath {
-                    path: name.to_string_lossy().into_owned(),
-                    source: PathError::NotNfc,
+                return Err(CaptureError::NotUtf8 {
+                    path: dir.join(&name).to_string_lossy().into_owned(),
                 });
             };
             let text = if prefix.is_empty() {
@@ -390,8 +406,7 @@ impl Capturer<'_> {
         let meta = &found.meta;
         let full = base.join(found.rel.as_str());
         let kind = if meta.file_type().is_symlink() {
-            let target = fs::read_link(&full).map_err(|e| io_err(&full, e))?;
-            let target = target.to_string_lossy().into_owned();
+            let target = utf8_link(&full, &found.rel)?;
             if symlink_escapes(&found.rel, &target) {
                 self.report.escaping_symlinks.push(found.rel.clone());
             }
@@ -937,8 +952,8 @@ impl GitCapture<'_> {
                 Err(e) => return Err(io_err(&full, e)),
             };
             if meta.file_type().is_symlink() {
-                let target = fs::read_link(&full).map_err(|e| io_err(&full, e))?;
-                if symlink_escapes(&rel, &target.to_string_lossy()) {
+                let target = utf8_link(&full, &rel)?;
+                if symlink_escapes(&rel, &target) {
                     report.escaping_symlinks.push(rel.clone());
                 }
             }
