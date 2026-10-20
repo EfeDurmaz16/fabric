@@ -22,11 +22,12 @@
 //!
 //! Surfaces used, checked against `claude --help` of 2.1.294 on
 //! 2026-10-19: `--resume <id>`, `--session-id <uuid>`, `-p` with
-//! `--output-format json`, and pass-through flags such as `--settings`,
-//! `--mcp-config` and `--permission-mode`. The session registry
+//! `--output-format json`, and the typed flags of `flags::LaunchFlags`.
+//! An overlay file that holds a literal secret refuses the launch. The session registry
 //! `~/.claude/sessions/<pid>.json` (`pid`, `sessionId`) was read on the
 //! owner's machine on 2026-10-20.
 
+pub mod flags;
 pub(crate) mod history;
 pub mod slug;
 pub(crate) mod trust;
@@ -52,6 +53,8 @@ use crate::process;
 use crate::redact::RedactionCounts;
 use crate::session::SessionId;
 
+use self::flags::LaunchFlags;
+
 /// The program name on `PATH`.
 pub const PROGRAM: &str = "claude";
 
@@ -63,7 +66,7 @@ pub struct ClaudeCode {
     config_json: PathBuf,
     binary: Option<PathBuf>,
     path_var: Option<OsString>,
-    flags: Vec<String>,
+    flags: LaunchFlags,
 }
 
 /// The Claude version whose `~/.claude/sessions/<pid>.json` records this
@@ -95,7 +98,7 @@ impl ClaudeCode {
             home,
             binary: None,
             path_var: std::env::var_os("PATH"),
-            flags: Vec::new(),
+            flags: LaunchFlags::default(),
         }
     }
 
@@ -113,11 +116,9 @@ impl ClaudeCode {
         self
     }
 
-    /// Flags passed on every launch, such as `--settings <file>`,
-    /// `--mcp-config <file>` or `--permission-mode acceptEdits`; resume
-    /// restores none of them (ADR 0006).
+    /// Flags passed on every launch; resume restores none of them (ADR 0006).
     #[must_use]
-    pub fn with_flags(mut self, flags: Vec<String>) -> Self {
+    pub fn with_flags(mut self, flags: LaunchFlags) -> Self {
         self.flags = flags;
         self
     }
@@ -641,7 +642,7 @@ impl ClaudeCode {
                 prompt.clone()
             }
         };
-        args.extend(self.flags.iter().cloned());
+        args.extend(self.flags.args());
         match prompt {
             Some(prompt) => {
                 args.push("--".to_owned());
@@ -675,6 +676,9 @@ impl ClaudeCode {
     ) -> Result<Running, HarnessError> {
         let root = harness::physical_workspace(workspace)?;
         let binary = self.binary()?;
+        for overlay in self.flags.overlays() {
+            harness::refuse_secret_overlay(Path::new(overlay.as_str()))?;
+        }
         let session = match launch {
             Launch::New { .. } => Self::fresh_session()?,
             Launch::Resume { session, .. } => session.clone(),
@@ -757,10 +761,10 @@ mod tests {
 
     #[test]
     fn args_follow_the_cli_surface() {
-        let adapter = ClaudeCode::new(PathBuf::from("/h")).with_flags(vec![
-            "--permission-mode".to_owned(),
-            "acceptEdits".to_owned(),
-        ]);
+        let adapter = ClaudeCode::new(PathBuf::from("/h")).with_flags(LaunchFlags {
+            permission_mode: Some(flags::PermissionMode::AcceptEdits),
+            ..LaunchFlags::default()
+        });
         let session = SessionId::parse("9c9796f0-2682-4546-a963-d314b3ad543f").unwrap();
         let resume = Launch::Resume {
             session: session.clone(),

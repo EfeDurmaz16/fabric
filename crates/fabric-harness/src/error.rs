@@ -246,6 +246,12 @@ pub enum HarnessError {
         /// The agent program.
         program: String,
     },
+    /// A settings or MCP overlay holds a literal secret instead of a reference.
+    #[error("{path} holds a literal secret; use a ${{VAR}} reference in an overlay")]
+    SecretInOverlay {
+        /// The overlay file.
+        path: PathBuf,
+    },
     /// A standard redaction rule does not compile, so nothing is captured.
     #[error(transparent)]
     BadRedactionRule(#[from] crate::redact::BadRule),

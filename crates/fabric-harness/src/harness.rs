@@ -31,6 +31,52 @@ pub struct Installed {
     pub raw: String,
 }
 
+/// The most characters a model name may have.
+pub const MAX_MODEL_NAME_LEN: usize = 128;
+
+/// Why a model name was refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ModelNameError {
+    /// The name is empty or longer than `MAX_MODEL_NAME_LEN`.
+    #[error("model name must have 1 to {MAX_MODEL_NAME_LEN} characters")]
+    Length,
+    /// A character outside `[A-Za-z0-9._:/@[]-]`, or a leading `-`.
+    #[error("model name has an invalid character at index {index}")]
+    BadChar {
+        /// Zero-based index of the offending character.
+        index: usize,
+    },
+}
+
+/// A model name passed to a harness, such as `opus` or `o3`: safe on a
+/// command line and inside a quoted TOML string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModelName(String);
+
+impl ModelName {
+    /// Checks `text` against the rules and wraps it.
+    pub fn parse(text: &str) -> Result<Self, ModelNameError> {
+        if text.is_empty() || text.chars().count() > MAX_MODEL_NAME_LEN {
+            return Err(ModelNameError::Length);
+        }
+        let bad = text.char_indices().find(|(i, c)| {
+            !(c.is_ascii_alphanumeric()
+                || matches!(c, '.' | '_' | ':' | '/' | '@' | '[' | ']' | '-'))
+                || (*i == 0 && *c == '-')
+        });
+        if let Some((index, _)) = bad {
+            return Err(ModelNameError::BadChar { index });
+        }
+        Ok(ModelName(text.to_owned()))
+    }
+
+    /// The name as given.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// How to start a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Launch {
@@ -227,6 +273,22 @@ pub(crate) fn same_place(
     Ok(())
 }
 
+/// Refuses an overlay file (settings, MCP configuration) that holds a
+/// literal secret: ADR 0006 allows only `${VAR}` references there.
+#[cfg_attr(
+    not(any(feature = "claude", feature = "codex")),
+    allow(dead_code, reason = "used by the Claude adapter")
+)]
+pub(crate) fn refuse_secret_overlay(path: &Path) -> Result<(), HarnessError> {
+    let bytes = std::fs::read(path).map_err(|e| HarnessError::io("read", path, e))?;
+    if crate::redact::Redactor::standard()?.matches_bytes(&bytes) {
+        return Err(HarnessError::SecretInOverlay {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
 /// Runs a blocking capture or restore body off the async runtime.
 #[cfg_attr(
     not(any(feature = "acp", feature = "claude", feature = "codex")),
@@ -240,4 +302,25 @@ where
     tokio::task::spawn_blocking(body)
         .await
         .map_err(|source| HarnessError::BlockingTask { source })?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_names_are_plain_tokens() {
+        for good in [
+            "opus",
+            "o3",
+            "claude-opus-4-1[1m]",
+            "gpt-5.1-codex",
+            "us.anthropic.x:0",
+        ] {
+            assert!(ModelName::parse(good).is_ok(), "{good}");
+        }
+        for bad in ["", "-p", "a b", "a\"b", "a\\b", "a=b", "x\n"] {
+            assert!(ModelName::parse(bad).is_err(), "{bad:?}");
+        }
+    }
 }

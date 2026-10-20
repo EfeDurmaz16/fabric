@@ -14,8 +14,9 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 use fabric_core::env::EnvVarName;
-use fabric_core::path::RelPath;
+use fabric_core::path::{AbsPath, RelPath};
 use fabric_harness::claude::ClaudeCode;
+use fabric_harness::claude::flags::{LaunchFlags, PermissionMode};
 use fabric_harness::claude::slug::slug;
 use fabric_harness::manifest::{Carried, Content, Digest, Mutability};
 use fabric_harness::{Harness, HarnessError, Io, Launch, SessionId};
@@ -794,10 +795,10 @@ async fn launch_resumes_in_the_workspace_with_exactly_the_given_env() {
     let log = home.join("log.txt");
     let adapter = ClaudeCode::new(home.clone())
         .with_path_var(bin_dir.clone())
-        .with_flags(vec![
-            "--permission-mode".to_owned(),
-            "acceptEdits".to_owned(),
-        ]);
+        .with_flags(LaunchFlags {
+            permission_mode: Some(PermissionMode::AcceptEdits),
+            ..LaunchFlags::default()
+        });
 
     let installed = adapter.detect().await.unwrap().unwrap();
     assert_eq!(installed.version.as_deref(), Some("2.1.294"));
@@ -867,6 +868,45 @@ async fn launch_resumes_in_the_workspace_with_exactly_the_given_env() {
         "{seen}"
     );
     assert!(seen.contains("arg=--\narg=hello\n"), "{seen}");
+}
+
+#[tokio::test]
+async fn a_settings_overlay_with_a_literal_token_refuses_the_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().canonicalize().unwrap();
+    let work = home.join("w");
+    std::fs::create_dir_all(&work).unwrap();
+    let overlay = home.join("overlay.json");
+    std::fs::write(&overlay, format!("{{\"env\":{{\"GH\":\"{GITHUB}\"}}}}")).unwrap();
+    let adapter = node(&home).with_flags(LaunchFlags {
+        settings: Some(AbsPath::parse(overlay.to_str().unwrap()).unwrap()),
+        ..LaunchFlags::default()
+    });
+    let resume = || Launch::Resume {
+        session: session(),
+        prompt: Some("go".to_owned()),
+    };
+    let err = adapter
+        .launch(&work, resume(), Io::Piped, &[])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HarnessError::SecretInOverlay { .. }), "{err}");
+    std::fs::write(&overlay, "{\"env\":{\"GH\":\"${GH_TOKEN}\"}}").unwrap();
+    let log = home.join("log.txt");
+    let env = [(
+        EnvVarName::parse("FAKE_LOG").unwrap(),
+        log.to_string_lossy().into_owned(),
+    )];
+    let mut running = adapter
+        .launch(&work, resume(), Io::Piped, &env)
+        .await
+        .unwrap();
+    running.child_mut().wait().await.unwrap();
+    let seen = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        seen.contains(&format!("arg=--settings\narg={}\n", overlay.display())),
+        "{seen}"
+    );
 }
 
 #[tokio::test]
