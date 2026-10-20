@@ -7,9 +7,11 @@
 //! writes the manifest last. Restore refuses a manifest of another harness
 //! kind, workspace path or home (ADR 0011); then, for every entry, a path
 //! on the denylist, a path the adapter never captures, and a content kind
-//! or mutability other than the adapter's own rule for that path; then any
-//! staged file whose digest does not match. Only after all of that does it
-//! place files, all or nothing. An adapter supplies only what differs: its
+//! or mutability other than the adapter's own rule for that path, and a
+//! destination that is a symlink or lies below one under the home, since a
+//! rename or a new directory there would write through it; then any staged
+//! file whose digest does not match. Only after all of that does it place
+//! files, all or nothing. An adapter supplies only what differs: its
 //! sources, and where a tree path lands on this node.
 
 use std::path::{Path, PathBuf};
@@ -163,6 +165,30 @@ pub(crate) fn confirm_departure(
     }
 }
 
+/// Refuses `dest` when it, or any directory between `home` and it, is a
+/// symlink. `home` itself may be one; what the adapter owns starts below it.
+fn refuse_symlinks(home: &Path, dest: &Path) -> Result<(), HarnessError> {
+    let below = dest
+        .strip_prefix(home)
+        .map_err(|_| HarnessError::NotUnderHome {
+            path: dest.to_path_buf(),
+            home: home.to_path_buf(),
+        })?;
+    let mut at = home.to_path_buf();
+    for part in below.components() {
+        at.push(part);
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(HarnessError::SymlinkInState { path: at });
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(HarnessError::io("read", &at, e)),
+        }
+    }
+    Ok(())
+}
+
 /// Where a tree path lands on this node and how the adapter treats it.
 pub(crate) struct Destination {
     /// The file on this node.
@@ -187,6 +213,7 @@ pub(crate) fn restore<F>(
 where
     F: FnMut(&str, &Carried) -> Result<Option<Destination>, HarnessError>,
 {
+    let home = fs_path(manifest.home()).to_path_buf();
     let mut placements = Vec::with_capacity(manifest.files().len());
     for file in manifest.files() {
         let rel = file.rel_path.as_str();
@@ -208,6 +235,7 @@ where
                 path: rel.to_owned(),
             });
         }
+        refuse_symlinks(&home, &dest.path)?;
         placements.push(Placement {
             staged: state.join(rel),
             dest: dest.path,

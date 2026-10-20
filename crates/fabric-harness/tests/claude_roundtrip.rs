@@ -712,6 +712,36 @@ async fn a_symlink_in_session_state_refuses_the_capture() {
 }
 
 #[tokio::test]
+async fn a_symlink_on_the_way_to_a_destination_refuses_the_restore() {
+    // The target node keeps its project memory in the workspace through a
+    // link; restore must not write MEMORY.md through it.
+    let src = build_source("w");
+    let home = src.home.path().canonicalize().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let adapter = node(&home);
+    adapter
+        .capture(&src.work, &session(), out.path())
+        .await
+        .unwrap();
+    set_aside(&home, ".claude-pro");
+    let linked = src.work.join("docs/memory");
+    std::fs::create_dir_all(&linked).unwrap();
+    let project = home.join(".claude/projects").join(project_key(&src.work));
+    std::fs::create_dir_all(&project).unwrap();
+    std::os::unix::fs::symlink(&linked, project.join("memory")).unwrap();
+    let err = adapter.restore(&src.work, out.path()).await.unwrap_err();
+    assert!(
+        matches!(err, HarnessError::SymlinkInState { ref path } if path == &project.join("memory")),
+        "{err}"
+    );
+    assert!(!linked.join("MEMORY.md").exists());
+    assert!(
+        !project.join(format!("{SID}.jsonl")).exists(),
+        "nothing was placed"
+    );
+}
+
+#[tokio::test]
 async fn a_live_session_blocks_capture_and_restore() {
     let src = build_source("w");
     let home = src.home.path().canonicalize().unwrap();
