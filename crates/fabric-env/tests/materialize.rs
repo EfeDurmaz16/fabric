@@ -706,6 +706,29 @@ args = ["web/out/ran"]
     ));
 }
 
+/// The sentinel's name is Fabric's; a directory there must not stop every
+/// resume at the removal before the step.
+#[test]
+fn a_directory_at_the_sentinel_name_is_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
+    write(
+        dir.path(),
+        &[("out/x", ""), ("out/.fabric-installed/inner", "")],
+    )
+    .unwrap();
+    let detected = declared(
+        dir.path(),
+        "[[cache]]\npath = \"out\"\nclass = \"build\"\n\n[[setup]]\nprogram = \"true\"\n",
+    )
+    .unwrap();
+    let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
+    assert_eq!(planned.caches()[0].health, CacheHealth::Incomplete);
+    planned.ready().unwrap().execute(&lock).unwrap();
+    let sentinel = fs::symlink_metadata(dir.path().join("out").join(SENTINEL)).unwrap();
+    assert!(sentinel.is_file());
+}
+
 /// A lock file that is a link would lock whatever it names, such as a
 /// workspace file a restore can replace with a new inode, and a second
 /// resume would then take a second lock.

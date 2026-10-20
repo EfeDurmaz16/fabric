@@ -750,9 +750,24 @@ fn clear_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
     let Found::Dir(dir) = find_dir(root, path).map_err(sentinel_err)? else {
         return Ok(());
     };
-    match fs::remove_file(dir.join(SENTINEL)) {
-        Err(err) if err.kind() != io::ErrorKind::NotFound => Err(sentinel_err(err)),
-        _ => Ok(()),
+    remove_entry(&dir.join(SENTINEL)).map_err(sentinel_err)
+}
+
+/// Removes whatever is at `path` without following a link: a directory with all it holds, anything else as a file.
+///
+/// The sentinel's name inside a cache is Fabric's, so a directory there,
+/// such as one an archive unpacked, would otherwise make every resume fail
+/// on the same `remove_file`. `remove_dir_all` does not follow links inside
+/// the directory.
+fn remove_entry(path: &Path) -> io::Result<()> {
+    let removed = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(err) => Err(err),
+    };
+    match removed {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
 }
 
@@ -764,9 +779,9 @@ fn clear_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
 /// filled cache that is a link before any step runs.
 /// A regular file the steps left at the sentinel's name, such as one
 /// unpacked from an archive of a whole cache, is kept: the steps exited 0,
-/// which is all the sentinel says. Anything else there, a link included,
-/// is removed and the sentinel created in its place, so a link is never
-/// followed.
+/// which is all the sentinel says. Anything else there, a link or a
+/// directory included, is removed and the sentinel created in its place,
+/// so a link is never followed.
 ///
 /// Nothing is synced. The sentinel proves completion across a `kill -9`,
 /// where the kernel keeps every write, but not across a power loss or a
@@ -798,7 +813,7 @@ fn write_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
             {
                 return Ok(());
             }
-            fs::remove_file(&sentinel).map_err(sentinel_err)?;
+            remove_entry(&sentinel).map_err(sentinel_err)?;
             create().map_err(sentinel_err)?
         }
         Err(err) => return Err(sentinel_err(err)),
