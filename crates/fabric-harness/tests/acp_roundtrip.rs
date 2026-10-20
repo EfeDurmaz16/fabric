@@ -320,6 +320,59 @@ async fn resume_capability_is_preferred_and_its_absence_is_an_error() {
     );
 }
 
+fn alive(pid: &str) -> bool {
+    std::process::Command::new("ps")
+        .args(["-o", "pid=", "-p", pid])
+        .output()
+        .is_ok_and(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+}
+
+#[tokio::test]
+async fn a_launch_whose_handshake_fails_leaves_no_agent_running() {
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let pid_file = home.path().join("agent.pid");
+    let pid_text = pid_file.to_string_lossy().into_owned();
+    let env = env(
+        &home.path().join(".fake-agent/sessions"),
+        &[
+            ("FAKE_LOAD", "0"),
+            ("FAKE_RESUME", "0"),
+            ("FAKE_LINGER", "1"),
+            ("FAKE_PID_FILE", &pid_text),
+        ],
+    );
+    let err = adapter(home.path(), PermissionPolicy::Deny)
+        .launch_acp(
+            &work,
+            Launch::Resume {
+                session: SessionId::parse("fake-1").unwrap(),
+                prompt: None,
+            },
+            &env,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, HarnessError::LoadNotSupported { .. }),
+        "{err}"
+    );
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while alive(&pid) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let leaked = alive(&pid);
+    if leaked {
+        // Do not leave the lingering agent behind when the test fails.
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", pid.as_str()])
+            .status();
+    }
+    assert!(!leaked, "agent {pid} was still running");
+}
+
 #[tokio::test]
 async fn a_secret_in_the_state_directory_refuses_the_capture() {
     let home = tempfile::tempdir().unwrap();

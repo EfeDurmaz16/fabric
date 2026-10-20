@@ -5,7 +5,9 @@
 //! capabilities through environment variables:
 //! `FAKE_LOAD=0` drops `loadSession`, `FAKE_RESUME=1` advertises
 //! `session/resume`, `FAKE_ASK_PERMISSION=1` asks for permission on every
-//! prompt.
+//! prompt, `FAKE_PID_FILE` names a file it writes its pid to, and
+//! `FAKE_LINGER=1` keeps it alive after its stdin closes, as a hung agent
+//! would.
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -231,7 +233,18 @@ fn run() -> std::io::Result<()> {
 }
 
 fn main() -> std::process::ExitCode {
-    match run() {
+    if let Some(path) = std::env::var_os("FAKE_PID_FILE")
+        && std::fs::write(path, std::process::id().to_string()).is_err()
+    {
+        return std::process::ExitCode::FAILURE;
+    }
+    let result = run();
+    if env_flag("FAKE_LINGER", false) {
+        loop {
+            std::thread::sleep(std::time::Duration::from_mins(1));
+        }
+    }
+    match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(_) => std::process::ExitCode::FAILURE,
     }

@@ -11,7 +11,8 @@
 //! the declared state directory whose path names the session. The adapter
 //! cannot tell whether a generic agent is writing a session while it
 //! restores one; the caller owns that guard, through the handle
-//! `launch_acp` returned.
+//! `launch_acp` returned. A launch whose handshake fails kills the agent's
+//! process group before it returns, so no agent runs without a handle.
 
 pub mod client;
 
@@ -305,6 +306,9 @@ impl AcpHarness {
         let root = harness::physical_workspace(workspace)?;
         let binary = self.binary()?;
         let (mut child, pid) = process::spawn(&binary, &self.args, &root, env, Wiring::Rpc)?;
+        // Until the session is open, an error or a dropped future kills the
+        // agent's group, so no agent is left running without a handle.
+        let guard = process::GroupGuard::new(pid);
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             return Err(HarnessError::Spawn {
                 program: self.program.to_string(),
@@ -313,6 +317,7 @@ impl AcpHarness {
         };
         let client = AcpClient::attach(stdin, stdout, self.policy);
         let (session, prompt) = self.open_session(&client, &root, launch).await?;
+        guard.disarm();
         let turn = prompt.map(|prompt| {
             let client = client.clone();
             let session = session.clone();

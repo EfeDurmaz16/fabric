@@ -149,6 +149,59 @@ pub(crate) fn spawn(
     Ok((child, pid))
 }
 
+/// Sends `SIGKILL` to the process group `pgid` through `kill(1)`; the
+/// crate forbids unsafe code, so it does not call `killpg` itself.
+pub(crate) fn kill_group(pgid: NonZeroU32) -> Result<(), HarnessError> {
+    let status = std::process::Command::new("kill")
+        .arg("-KILL")
+        .arg("--")
+        .arg(format!("-{pgid}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|source| HarnessError::Spawn {
+            program: "kill".to_owned(),
+            source,
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(HarnessError::Spawn {
+            program: "kill".to_owned(),
+            source: std::io::Error::other(format!("kill -KILL -{pgid} exited with {status}")),
+        })
+    }
+}
+
+/// Kills the process group of a child this crate spawned when dropped,
+/// unless it was disarmed first. Tokio reaps the dropped child.
+pub(crate) struct GroupGuard {
+    pgid: Option<NonZeroU32>,
+}
+
+impl GroupGuard {
+    /// Arms the guard for the group `pgid`.
+    pub(crate) fn new(pgid: NonZeroU32) -> Self {
+        GroupGuard { pgid: Some(pgid) }
+    }
+
+    /// Leaves the group running.
+    pub(crate) fn disarm(mut self) {
+        self.pgid = None;
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.pgid
+            && let Err(e) = kill_group(pgid)
+        {
+            tracing::warn!(%pgid, error = %e, "could not kill the process group of a failed launch");
+        }
+    }
+}
+
 /// Unix milliseconds now; informational.
 #[must_use]
 pub(crate) fn now_ms() -> u64 {
