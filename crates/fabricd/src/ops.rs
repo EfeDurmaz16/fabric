@@ -601,7 +601,7 @@ impl Node {
                 peer: self.id,
                 reason: format!("the recorded session id is not valid: {e}"),
             })?;
-            let harness = adapter(&record.harness, &self.harness_env(path_var))?;
+            let harness = adapter(&record.harness, &self.harness_env(path_var)?)?;
             job.clear_harness_state()?;
             std::fs::create_dir_all(&state_dir).map_err(|e| NodeError::io(&state_dir, e))?;
             let manifest = harness.capture(root, &session, &state_dir).await?;
@@ -1444,7 +1444,7 @@ impl Node {
     ) -> Result<(), NodeError> {
         let state_dir = job.dir().harness_state();
         let state = StateManifest::read(&state_dir)?;
-        let harness = adapter(state.kind(), &self.harness_env(path_var))?;
+        let harness = adapter(state.kind(), &self.harness_env(path_var)?)?;
         harness.restore(root, &state_dir).await?;
         local::write(
             &job.dir().session(),

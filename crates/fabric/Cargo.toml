@@ -37,7 +37,7 @@ tempfile = "3.27"
 # name so the end-to-end test can launch it as a harness.
 [[bin]]
 name = "fabric-fake-agent"
-path = "../fabric-harness/fixtures/fake_acp_agent/main.rs"
+path = "fixtures/fake_agent.rs"
 test = false
 doc = false
 bench = false

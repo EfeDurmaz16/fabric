@@ -326,12 +326,12 @@ impl Node {
     }
 
     /// The adapters' environment for a request made with `path_var`.
-    pub(crate) fn harness_env(&self, path_var: &OsString) -> HarnessEnv {
-        HarnessEnv {
-            home: self.cfg.home.clone(),
-            path_var: path_var.clone(),
-            config: self.harness_config.clone(),
-        }
+    pub(crate) fn harness_env(&self, path_var: &OsString) -> Result<HarnessEnv, NodeError> {
+        Ok(HarnessEnv::new(
+            &self.cfg.home,
+            path_var.clone(),
+            self.harness_config.clone(),
+        )?)
     }
 
     /// Settles every job after a restart: learns what the paired peers wrote

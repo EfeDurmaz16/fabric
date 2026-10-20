@@ -42,6 +42,8 @@ The CLI never touches the store or a ledger. It sends a request, prints the line
 
 ADR 0007 has the caller take the tree lock before restore writes the tree. Here the node restores and the CLI materializes, so the lock is taken after the restore. The restore writes only into an empty directory it renames into place (ADR 0014), so it never writes over a tree that an installer from an earlier `resume` still holds; that `resume`'s lock makes the next one refuse with the lock's path.
 
+The harness gets the user's environment minus the parent-session markers ADR 0015 lists, so a `fabric job run` typed inside a Claude Code session starts a session of its own. Before a Claude launch the CLI pre-seeds trust (ADR 0006, amended for gate finding F1) and never fails on the outcome: it prints nothing when Claude's key for the workspace was already set, `trusted <key>` when it wrote the key, and a one-line warning when it left the file alone, such as while another `claude` runs.
+
 Interactive launches give the terminal to the harness with `tcsetpgrp`. The CLI never takes it back; the shell does when the command exits, as it does for any job.
 
 ### Job roots and departed copies

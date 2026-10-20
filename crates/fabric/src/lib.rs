@@ -23,7 +23,7 @@ use fabric_core::env::{EnvVarName, SetupArg};
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{JobId, NodeId};
 use fabric_env::materialize::{NodeEnv, TreeLock};
-use fabric_harness::claude::ClaudeCode;
+use fabric_harness::claude::{ClaudeCode, LeftReason, TrustOutcome};
 use fabric_harness::codex::Codex;
 use fabric_harness::{Harness, Launch, Running, SessionId};
 use fabric_net::endpoint::DialOrder;
@@ -435,16 +435,17 @@ async fn launch(
         .map(SessionId::parse)
         .transpose()
         .context("the recorded session id")?;
-    let harness_env = HarnessEnv {
-        home: home.to_owned(),
-        path_var: path_var(),
-        config: HarnessConfig::load(&state.harness_config())?,
-    };
+    let harness_env = HarnessEnv::new(
+        home,
+        path_var(),
+        HarnessConfig::load(&state.harness_config())?,
+    )?;
     let first = prompt.or_else(|| resume.is_none().then(|| plan.goal.clone()));
     let (mut running, interactive) = match &plan.harness {
         HarnessKind::ClaudeCode => {
-            let claude = ClaudeCode::new(home.to_owned(), harness_env.path_var.clone());
-            claude.preseed_trust(&plan.root).await?;
+            let claude = ClaudeCode::new(harness_env.home.clone(), harness_env.path_var.clone());
+            let trust = claude.preseed_trust(&plan.root, &env).await?;
+            report_trust(&plan.root, &trust)?;
             let launch = Launch::Interactive {
                 resume,
                 prompt: first,
@@ -452,7 +453,7 @@ async fn launch(
             (claude.launch(&plan.root, launch, &env).await?, true)
         }
         HarnessKind::Codex => {
-            let codex = Codex::new(home.to_owned(), harness_env.path_var.clone());
+            let codex = Codex::new(harness_env.home.clone(), harness_env.path_var.clone());
             let launch = Launch::Interactive {
                 resume,
                 prompt: first,
@@ -533,6 +534,44 @@ fn materialize(state: &StateDir, root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Says where Claude's trust in `root` came from: nothing when its key
+/// was already set, the key when Fabric wrote it, and a one-line warning
+/// when Fabric left it alone, because then Claude either asks in its own
+/// dialog or skips it and ignores the workspace's project settings.
+fn report_trust(root: &Path, outcome: &TrustOutcome) -> Result<()> {
+    match outcome {
+        TrustOutcome::AlreadyTrusted { .. } => {}
+        TrustOutcome::Written { key } => {
+            writeln!(std::io::stdout(), "trusted {}", key.display())?;
+        }
+        TrustOutcome::Inherited { by, reason } => writeln!(
+            std::io::stderr(),
+            "warning: Fabric did not trust {} ({}); Claude trusts it through {}, so it skips its trust dialog and ignores the workspace's project settings",
+            root.display(),
+            left_reason(reason),
+            by.display()
+        )?,
+        TrustOutcome::LeftToClaude { reason } => writeln!(
+            std::io::stderr(),
+            "warning: Fabric did not trust {} ({}); Claude asks in its own trust dialog",
+            root.display(),
+            left_reason(reason)
+        )?,
+    }
+    Ok(())
+}
+
+fn left_reason(reason: &LeftReason) -> String {
+    match reason {
+        LeftReason::ClaudeRunning { pids } => {
+            let pids: Vec<String> = pids.iter().map(|pid| pid.to_string()).collect();
+            format!("claude runs as pid {}", pids.join(", "))
+        }
+        LeftReason::NoConfig { path } => format!("{} does not exist yet", path.display()),
+        LeftReason::ConfigIsSymlink { path } => format!("{} is a symlink", path.display()),
+    }
+}
+
 /// The user's environment as the harness gets it: every variable with a valid name and a UTF-8 value.
 fn environment() -> Vec<(EnvVarName, String)> {
     std::env::vars_os()
@@ -571,5 +610,5 @@ fn kill_group(running: &Running) {
 }
 
 fn pid_of(running: &Running) -> Option<rustix::process::Pid> {
-    rustix::process::Pid::from_raw(i32::try_from(running.pgid().get()).ok()?)
+    rustix::process::Pid::from_raw(i32::try_from(running.pid().get()).ok()?)
 }

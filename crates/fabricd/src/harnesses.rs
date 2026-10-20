@@ -13,6 +13,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use fabric_core::harness::{HarnessKind, ProgramName};
+use fabric_core::path::{AbsPath, PathError};
 use fabric_harness::Harness;
 use fabric_harness::acp::AcpHarness;
 use fabric_harness::claude::ClaudeCode;
@@ -48,6 +49,27 @@ pub enum HarnessConfigError {
     /// The adapter refused its configuration.
     #[error(transparent)]
     Adapter(#[from] fabric_harness::HarnessError),
+    /// The home or an ACP state directory is not UTF-8.
+    #[error("{0} is not UTF-8")]
+    NotUtf8(PathBuf),
+    /// The home or an ACP state directory is not an absolute path without `.` or `..`.
+    #[error("{path}: {reason}")]
+    Path {
+        /// The path.
+        path: PathBuf,
+        /// What is wrong with it.
+        reason: PathError,
+    },
+}
+
+fn abs_path(path: &Path) -> Result<AbsPath, HarnessConfigError> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| HarnessConfigError::NotUtf8(path.to_owned()))?;
+    AbsPath::parse(text).map_err(|reason| HarnessConfigError::Path {
+        path: path.to_owned(),
+        reason,
+    })
 }
 
 /// Parses the harness names the CLI takes: `claude`, `codex`, or `acp:<program> [args...]`.
@@ -117,11 +139,26 @@ impl HarnessConfig {
 #[derive(Debug, Clone)]
 pub struct HarnessEnv {
     /// The user's home directory.
-    pub home: PathBuf,
+    pub home: AbsPath,
     /// The `PATH` to look programs up on.
     pub path_var: OsString,
     /// The node's harness configuration.
     pub config: HarnessConfig,
+}
+
+impl HarnessEnv {
+    /// Builds the environment for `home`, which must be an absolute UTF-8 path.
+    pub fn new(
+        home: &Path,
+        path_var: OsString,
+        config: HarnessConfig,
+    ) -> Result<Self, HarnessConfigError> {
+        Ok(Self {
+            home: abs_path(home)?,
+            path_var,
+            config,
+        })
+    }
 }
 
 /// Builds the adapter for `kind` on this node.
@@ -151,7 +188,10 @@ pub fn acp_adapter(
         env.path_var.clone(),
     );
     match env.config.acp.get(program.as_str()) {
-        Some(config) => Ok(adapter.with_state_dir(env.home.join(&config.state_dir))?),
+        Some(config) => {
+            let dir = abs_path(&Path::new(env.home.as_str()).join(&config.state_dir))?;
+            Ok(adapter.with_state_dir(&dir)?)
+        }
         None => Ok(adapter),
     }
 }
