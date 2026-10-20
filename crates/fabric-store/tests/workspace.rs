@@ -1666,6 +1666,31 @@ fn the_target_keeps_the_filesystem_settings_git_init_probed() {
 }
 
 #[test]
+fn a_remote_url_with_a_query_token_is_left_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    git(&root)
+        .run(&[
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/x.git?access_token=sekrit",
+        ])
+        .unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, report } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let key = GitConfigKey::parse("remote.origin.url").unwrap();
+    assert_eq!(report.dropped_config, vec![key]);
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    let config = fs::read_to_string(target.join(".git/config")).unwrap();
+    assert!(!config.contains("sekrit"), "{config}");
+}
+
+#[test]
 fn a_config_value_the_projection_refuses_is_named() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("work");

@@ -204,7 +204,7 @@ pub struct CaptureReport {
     pub stripped_userinfo: Vec<GitConfigKey>,
     /// Repeated config keys where only the last value travels.
     pub repeated_config: Vec<GitConfigKey>,
-    /// Allowlisted config keys left behind because their value starts with `-` or holds a newline.
+    /// Allowlisted config keys left behind because `GitConfigValue` refuses the value, or because it is a remote URL with a query or fragment, where a token can travel.
     pub dropped_config: Vec<GitConfigKey>,
     /// The bundle shape; none when the root is not a repository.
     pub bundle: Option<BundleKind>,
@@ -1489,6 +1489,12 @@ impl GitCapture<'_> {
                 report.dropped_config.push(key);
                 continue;
             };
+            // Only a query or fragment is left after the strip; the
+            // receiving node would refuse the manifest that carried it.
+            if key.is_remote_url() && value.has_credential() {
+                report.dropped_config.push(key);
+                continue;
+            }
             if config.insert(key.clone(), value).is_some() {
                 report.repeated_config.push(key.clone());
             }
