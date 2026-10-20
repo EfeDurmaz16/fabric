@@ -268,6 +268,9 @@ fn e2e_target_killed_after_import_receipt() -> Fallible {
         let refusal = p.a.fails(&["job", "run", &job])?;
         assert!(refusal.contains("departing"), "{refusal}");
         p.b.start(None)?;
+        // The move typed again learns the decision and reports it done.
+        let again = p.a.ok(&["job", "move", &job, "--to", &p.b.id])?;
+        assert!(again.contains("already owns the job at epoch 2"), "{again}");
         assert_one_owner(&p.b, &p.a, &job, 2, "departed")?;
         assert_continues(&p, &p.b, &job, &work, &["one"])?;
     }

@@ -789,6 +789,12 @@ impl Node {
                     target,
                 });
             }
+            // A move asked again after its answer was lost: the target's
+            // decision arrived while resolving, and the move is done.
+            LeaseView::Departed { owner, epoch } if owner == to => {
+                out.say(format!("{to} already owns the job at epoch {epoch}"));
+                return Ok(());
+            }
             LeaseView::Departed { owner, epoch } => {
                 return Err(NodeError::Departed {
                     job: id,
