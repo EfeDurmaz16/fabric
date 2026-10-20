@@ -100,7 +100,10 @@ fn own_env() -> Vec<(EnvVarName, String)> {
 }
 
 /// Runs `binary args...` with `env` minus its parent-session markers and
-/// returns trimmed stdout, within `PROBE_TIMEOUT`.
+/// returns trimmed stdout, within `PROBE_TIMEOUT`. A run that exits with
+/// a failure is an error, whatever it printed: a wrapper that prints a
+/// version and then fails to start is not a working install, and its
+/// version must not be trusted.
 async fn probe(
     binary: &Path,
     args: &[&str],
@@ -126,6 +129,16 @@ async fn probe(
             program: program.clone(),
             source,
         })?;
+    if !output.status.success() {
+        return Err(HarnessError::Spawn {
+            program,
+            source: std::io::Error::other(format!(
+                "{} exited with {}",
+                args.join(" "),
+                output.status
+            )),
+        });
+    }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
@@ -509,6 +522,17 @@ mod tests {
         let seen = probe(&binary, &[], &env).await.unwrap();
         assert!(seen.contains("FABRIC_PROBE_KEPT=1"), "{seen}");
         assert!(!seen.contains("CLAUDECODE"), "{seen}");
+    }
+
+    #[tokio::test]
+    async fn a_version_probe_that_exits_with_a_failure_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("tool");
+        std::fs::write(&binary, "#!/bin/sh\necho 'tool 1.2.3'\nexit 1\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = detect(Some(binary.clone())).await.unwrap_err();
+        assert!(matches!(err, HarnessError::Spawn { .. }), "{err}");
+        assert_eq!(installed_version(Some(binary), "tool").await, None);
     }
 
     #[test]
