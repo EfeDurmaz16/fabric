@@ -180,7 +180,7 @@ pub enum OverrideError {
     /// A `[tools]` key that is not a tool name; the name itself is never quoted.
     #[error("the name of `tools[{index}]` {reason}")]
     ToolName {
-        /// Zero-based index of the entry in `[tools]`, in key order.
+        /// Zero-based index of the entry in `[tools]`, in file order.
         index: usize,
         /// What is wrong with it.
         reason: PinError,
@@ -188,13 +188,13 @@ pub enum OverrideError {
     /// A `[tools]` key that names the same tool as an earlier one, such as `nodejs` next to `node`.
     #[error("`tools[{index}]` names a tool an earlier entry already pins")]
     DuplicateTool {
-        /// Zero-based index of the later entry in `[tools]`, in key order.
+        /// Zero-based index of the later entry in `[tools]`, in file order.
         index: usize,
     },
     /// A `[tools]` value that is not a version pin; the pin itself is never quoted.
     #[error("the version of `tools[{index}]` {reason}")]
     Pin {
-        /// Zero-based index of the entry in `[tools]`, in key order.
+        /// Zero-based index of the entry in `[tools]`, in file order.
         index: usize,
         /// What is wrong with it.
         reason: PinError,
@@ -689,6 +689,21 @@ when = "always"
         assert!(matches!(
             EnvOverride::parse("[tools]\nnode = \"22\"\nnodejs = \"20\"\n"),
             Err(OverrideError::DuplicateTool { index: 1 })
+        ));
+    }
+
+    /// The index is the user's only pointer to a refused entry, since the
+    /// text is never quoted, so it counts entries in the order the file has them.
+    #[test]
+    fn a_tools_entry_is_named_by_its_place_in_the_file() {
+        let token = format!("ghp_{}", "x".repeat(36));
+        let text = format!("[tools]\nzeta = \"1\"\nalpha = \"{token}\"\n");
+        assert!(matches!(
+            EnvOverride::parse(&text),
+            Err(OverrideError::Pin {
+                index: 1,
+                reason: PinError::Credential
+            })
         ));
     }
 
