@@ -82,6 +82,12 @@ parsed_string!(
 );
 
 impl GitOid {
+    /// Returns true for a 64-character SHA-256 id, false for a 40-character SHA-1 id.
+    #[must_use]
+    pub fn is_sha256(&self) -> bool {
+        self.0.len() == 64
+    }
+
     /// Checks `text` against the rule and wraps it.
     pub fn parse(text: &str) -> Result<Self, GitNameError> {
         let hex = text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));

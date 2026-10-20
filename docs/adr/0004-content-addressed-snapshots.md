@@ -22,9 +22,10 @@ Amended 2026-10-19 after the second adversarial review of PR `feat/core`. Three 
 2. `Entry.mode` is `Mode`, a type that cannot hold a bit above `0o777`; `BadMode` is gone (point 5 above, corrected in place).
 3. `HarnessState` lives in the snapshot module next to `Entry`. The text below that named `ManifestError::BadPath` now names the `Codec` failure that happens.
 
-Amended 2026-10-21 after the Codex review of PR `feat/core`:
+Amended 2026-10-21 after the Codex review of PR `feat/core`. Two corrections, each pinned by a test:
 
 1. `GitConfigValue` also refuses git's remote helper form `<transport>::<address>` (a letter, then letters, digits, `+`, `-` and `.`, then `::`). That form makes the user's next `git fetch` or `git push` run `git remote-<transport>`, so a peer could pick the program; `ext::<command>` runs the command itself wherever `protocol.ext.allow` permits it. The rule holds for every key, since `branch.<n>.remote` may hold a URL too. Capture leaves such a value behind like any other invalid value, and a manifest that carries one fails to decode.
+2. Every object id in `GitState` (each ref, a detached `HEAD`, `index_commit` and `worktree_commit`) has the same width, or the manifest is refused with `ManifestError::MixedObjectFormat`. SHA-1 and SHA-256 repositories do not interoperate, so a mixed state cannot be restored into any one repository. Restore can read the object format from the width of `index_commit`; the wire bytes of a valid manifest did not change.
 
 ## Context
 
