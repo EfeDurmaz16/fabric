@@ -267,20 +267,18 @@ pub enum HarnessError {
         /// The agent program.
         program: String,
     },
-    /// The launch environment points a harness at another config directory
-    /// than the one the adapter reads and writes.
+    /// The launch environment sets a variable that makes the harness keep
+    /// its state or login somewhere other than the adapter reads and writes.
     #[error(
-        "{program} would keep its state under {dir}, but Fabric reads and writes {expected}; unset {var} or set it to {expected}"
+        "the launch environment sets {var}, which moves {moves} of {program} away from where Fabric reads them; unset {var}"
     )]
-    ConfigDirUnsupported {
+    ConfigMoved {
         /// The harness program.
         program: String,
-        /// The variable that names the directory.
+        /// The variable the launch environment sets.
         var: &'static str,
-        /// The directory the launch environment names.
-        dir: PathBuf,
-        /// The directory the adapter uses.
-        expected: PathBuf,
+        /// What the variable moves, in words.
+        moves: &'static str,
     },
     /// A settings or MCP overlay holds a literal secret instead of a reference.
     #[error("{path} holds a literal secret; use a ${{VAR}} reference in an overlay")]

@@ -18,12 +18,18 @@
 //! parse, or the installed Claude is older than the version it was read
 //! on), any running `claude` refuses them instead.
 //! Login is never copied and no per-job config directory is set:
-//! `CLAUDE_CONFIG_DIR` keys the login (ADR 0006, D15). Claude keeps its
-//! config file, projects store and login under `$CLAUDE_CONFIG_DIR` when
-//! it is set (`.claude.json` included, read from the 2.1.294 bundle),
-//! while this adapter reads and writes `~/.claude` and `~/.claude.json`,
-//! so `check_env` refuses an environment that sets it to anything else,
-//! and `launch` runs that check first.
+//! `CLAUDE_CONFIG_DIR` keys the login (ADR 0006, D15). This adapter reads
+//! and writes `~/.claude` and `~/.claude.json` only, so `check_env`
+//! refuses a launch environment that sets any variable in
+//! `MOVES_CONFIG`, whatever its value, and `launch` runs that check
+//! first. Read from the 2.1.294 bundle on 2026-10-20: any
+//! `CLAUDE_CONFIG_DIR` moves the config file to
+//! `$CLAUDE_CONFIG_DIR/.claude.json`, even when it names `~/.claude`,
+//! and renames the Keychain item to `Claude Code-credentials-<hash>`; an
+//! empty one moves the projects store to a relative path;
+//! `CLAUDE_SECURESTORAGE_CONFIG_DIR` renames the Keychain item; and
+//! `CLAUDE_CODE_CUSTOM_OAUTH_URL` moves the config file to
+//! `.claude-custom-oauth.json` and the login with it.
 //!
 //! Surfaces used, checked against `claude --help` of 2.1.294 on
 //! 2026-10-19: `--resume <id>`, `--session-id <uuid>`, `-p` with
@@ -64,8 +70,20 @@ pub use self::trust::{LeftReason, LivePids, TrustOutcome};
 /// The program name on `PATH`.
 pub const PROGRAM: &str = "claude";
 
-/// The variable that moves Claude's config directory.
-const CONFIG_DIR_VAR: &str = "CLAUDE_CONFIG_DIR";
+/// Variables that make Claude keep its config file, projects store or
+/// login somewhere other than `~/.claude.json` and `~/.claude`, with what
+/// each moves. Any value counts, the empty string included.
+const MOVES_CONFIG: &[(&str, &str)] = &[
+    (
+        "CLAUDE_CONFIG_DIR",
+        "the config file, the projects store and the login",
+    ),
+    ("CLAUDE_SECURESTORAGE_CONFIG_DIR", "the login"),
+    (
+        "CLAUDE_CODE_CUSTOM_OAUTH_URL",
+        "the config file and the login",
+    ),
+];
 
 /// The Claude Code adapter for one home directory.
 #[derive(Debug, Clone)]
@@ -129,23 +147,21 @@ impl ClaudeCode {
     }
 
     /// Refuses a launch environment in which Claude would keep its state
-    /// somewhere else than this adapter reads and writes: one that sets
-    /// `CLAUDE_CONFIG_DIR` to any directory but `<home>/.claude`. The CLI
-    /// runs it on the environment it will launch with before it pre-seeds
-    /// trust or captures, which take no environment.
-    pub fn check_env(&self, env: &[(EnvVarName, String)]) -> Result<(), HarnessError> {
-        let set = env
+    /// or login somewhere else than this adapter reads and writes: one
+    /// that sets any variable in `MOVES_CONFIG`, whatever its value. The
+    /// CLI runs it on the environment it will launch with before it
+    /// pre-seeds trust or captures, which take no environment.
+    pub fn check_env(env: &[(EnvVarName, String)]) -> Result<(), HarnessError> {
+        let set = MOVES_CONFIG
             .iter()
-            .find(|(name, _)| name.as_str() == CONFIG_DIR_VAR)
-            .map(|(_, value)| PathBuf::from(value));
+            .find(|(var, _)| env.iter().any(|(name, _)| name.as_str() == *var));
         match set {
-            Some(dir) if dir != self.config_dir => Err(HarnessError::ConfigDirUnsupported {
+            Some(&(var, moves)) => Err(HarnessError::ConfigMoved {
                 program: PROGRAM.to_owned(),
-                var: CONFIG_DIR_VAR,
-                dir,
-                expected: self.config_dir.clone(),
+                var,
+                moves,
             }),
-            _ => Ok(()),
+            None => Ok(()),
         }
     }
 
@@ -662,7 +678,7 @@ impl ClaudeCode {
         launch: &Launch,
         env: &[(EnvVarName, String)],
     ) -> Result<Running, HarnessError> {
-        self.check_env(env)?;
+        Self::check_env(env)?;
         let root = pipeline::physical_workspace(workspace)?;
         let binary = self.binary()?;
         for overlay in self.flags.overlays() {

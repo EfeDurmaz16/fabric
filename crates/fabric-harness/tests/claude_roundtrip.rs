@@ -1025,45 +1025,55 @@ async fn a_launch_from_inside_a_claude_session_leaves_the_parent_markers_out() {
 }
 
 #[tokio::test]
-async fn a_launch_env_that_moves_the_config_dir_is_refused() {
+async fn a_launch_env_that_moves_the_config_or_login_is_refused_whatever_the_value() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().canonicalize().unwrap();
     let work = home.join("w");
     std::fs::create_dir_all(&work).unwrap();
     let log = home.join("log.txt");
     let (_, bin_dir) = fake_claude(&home);
-    let elsewhere = home.join(".config/claude");
-    let env: Vec<(EnvVarName, String)> = [
-        (
-            "PATH",
-            format!("{}:/usr/bin:/bin", bin_dir.to_string_lossy()),
-        ),
-        ("FAKE_LOG", log.to_string_lossy().into_owned()),
+    let default_dir = home.join(".claude").to_string_lossy().into_owned();
+    for (var, value) in [
+        ("CLAUDE_CONFIG_DIR", default_dir.clone()),
+        ("CLAUDE_CONFIG_DIR", String::new()),
         (
             "CLAUDE_CONFIG_DIR",
-            elsewhere.to_string_lossy().into_owned(),
+            home.join(".config/claude").to_string_lossy().into_owned(),
         ),
-    ]
-    .into_iter()
-    .map(|(name, value)| (EnvVarName::parse(name).unwrap(), value))
-    .collect();
-    let err = node(&home)
-        .launch(
-            &work,
-            Launch::Headless {
-                resume: Some(session()),
-                prompt: "go".to_owned(),
-            },
-            &env,
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(&err, HarnessError::ConfigDirUnsupported { dir, expected, .. }
-            if *dir == elsewhere && *expected == home.join(".claude")),
-        "{err}"
-    );
-    assert!(!log.exists(), "claude must not start");
+        ("CLAUDE_SECURESTORAGE_CONFIG_DIR", default_dir.clone()),
+        (
+            "CLAUDE_CODE_CUSTOM_OAUTH_URL",
+            "https://claude.example".to_owned(),
+        ),
+    ] {
+        let env: Vec<(EnvVarName, String)> = [
+            (
+                "PATH",
+                format!("{}:/usr/bin:/bin", bin_dir.to_string_lossy()),
+            ),
+            ("FAKE_LOG", log.to_string_lossy().into_owned()),
+            (var, value.clone()),
+        ]
+        .into_iter()
+        .map(|(name, value)| (EnvVarName::parse(name).unwrap(), value))
+        .collect();
+        let err = node(&home)
+            .launch(
+                &work,
+                Launch::Headless {
+                    resume: Some(session()),
+                    prompt: "go".to_owned(),
+                },
+                &env,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HarnessError::ConfigMoved { var: refused, .. } if *refused == var),
+            "{var}={value:?}: {err}"
+        );
+        assert!(!log.exists(), "{var}={value:?}: claude must not start");
+    }
 }
 
 #[tokio::test]
