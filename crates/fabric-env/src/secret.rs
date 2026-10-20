@@ -484,11 +484,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn star_backtracks_across_repeated_text() {
-        assert!(glob_matches(b"*.tfstate.*", b"a.tfstate.tfstate.bak"));
-        assert!(glob_matches(b"*.env", b".env"));
-        assert!(!glob_matches(b"*.key", b"monkey"));
-        assert!(!glob_matches(b"*.env", b".envrc"));
+    /// The plain recursive definition of the glob: `*` is any run, every other byte matches itself ignoring ASCII case.
+    fn reference(glob: &[u8], name: &[u8]) -> bool {
+        match glob.split_first() {
+            None => name.is_empty(),
+            Some((b'*', rest)) => (0..=name.len()).any(|skip| reference(rest, &name[skip..])),
+            Some((g, rest)) => name
+                .split_first()
+                .is_some_and(|(n, name)| g.eq_ignore_ascii_case(n) && reference(rest, name)),
+        }
+    }
+
+    proptest::proptest! {
+        /// The backtracking matcher agrees with the recursive definition on
+        /// short globs over a small alphabet, where repeated text and
+        /// several stars make backtracking matter.
+        #[test]
+        fn the_matcher_agrees_with_the_definition(
+            glob in "[ab.*]{0,8}",
+            name in "[abAB.]{0,10}",
+        ) {
+            proptest::prop_assert_eq!(
+                glob_matches(glob.as_bytes(), name.as_bytes()),
+                reference(glob.as_bytes(), name.as_bytes())
+            );
+        }
     }
 }

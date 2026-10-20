@@ -142,6 +142,7 @@ name = "fabric-env"
 version = "0.1.0"
 dependencies = [
  "fabric-core",
+ "proptest",
  "serde_json",
  "tempfile",
  "thiserror",
