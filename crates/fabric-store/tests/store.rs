@@ -66,6 +66,7 @@ fn manifest(files: Vec<Entry>, created_at: u64) -> Fallible<SnapshotManifest> {
         harness_state: HarnessState::default(),
         env_spec: None,
         caches: Vec::new(),
+        left_behind: Vec::new(),
     })
 }
 

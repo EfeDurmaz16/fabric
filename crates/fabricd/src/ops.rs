@@ -20,6 +20,7 @@ use fabric_core::id::{Epoch, JobId, NodeId, SnapshotId};
 use fabric_core::lease::{FenceError, FencingToken};
 use fabric_core::ledger::{Author, EventKind, Ledger};
 use fabric_core::moves::{CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
+use fabric_core::snapshot::LeaveReason;
 use fabric_harness::manifest::{MANIFEST_FILE, StateManifest};
 use fabric_harness::{HarnessError, SessionId};
 use fabric_net::peers::HostPort;
@@ -727,7 +728,7 @@ impl Node {
         let job_id = job.id();
         let me = self.id;
         let parent = job.latest();
-        let (snapshot, report) = with_store(&self.store, move |store| {
+        let captured = with_store(&self.store, move |store| {
             let mut policy = IgnorePolicy::default();
             policy.load_fabricignore(&root)?;
             let captured = capture(
@@ -746,15 +747,34 @@ impl Node {
                 },
             )?;
             let snapshot = store.publish(&captured.manifest)?;
-            Ok((snapshot, captured.report))
+            let has_git = captured.manifest.git.is_some();
+            Ok((
+                snapshot,
+                captured.report,
+                has_git,
+                captured.manifest.left_behind,
+            ))
         })
         .await?;
-        out.say(format!(
-            "snapshot {snapshot}: {} files, {} bytes, {} new objects",
-            report.files, report.bytes, report.new_objects
-        ));
-        for path in report.denied.iter().chain(&report.denied_untracked) {
-            out.say(format!("left behind (secret pattern): {path}"));
+        let (snapshot, report, has_git, left_behind) = captured;
+        // `files` counts what is outside git; the bundle carries the rest,
+        // tracked and untracked, and its bytes are in `bytes`.
+        out.say(if has_git {
+            format!(
+                "snapshot {snapshot}: {} ignored and harness files and a git bundle of the tracked and untracked work, {} bytes, {} new objects",
+                report.files, report.bytes, report.new_objects
+            )
+        } else {
+            format!(
+                "snapshot {snapshot}: {} files, {} bytes, {} new objects",
+                report.files, report.bytes, report.new_objects
+            )
+        });
+        for left in &left_behind {
+            out.say(match left.reason {
+                LeaveReason::Secret => format!("left behind (secret pattern): {}", left.path),
+                LeaveReason::Excluded => format!("left behind (.fabricignore): {}", left.path),
+            });
         }
         Ok(snapshot)
     }

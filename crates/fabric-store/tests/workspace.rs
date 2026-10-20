@@ -14,7 +14,8 @@ use fabric_core::git::GitConfigKey;
 use fabric_core::id::{JobId, NodeId, SnapshotId};
 use fabric_core::path::RelPath;
 use fabric_core::snapshot::{
-    CacheClass, CacheEntry, CarryKey, CarryState, Entry, EntryKind, GitHead, Mode,
+    CacheClass, CacheEntry, CarryKey, CarryState, Entry, EntryKind, GitHead, LeaveReason,
+    LeftBehind, Mode, Remake,
 };
 use fabric_store::capture::{
     BundleKind, BusyReason, CaptureError, CaptureRequest, Captured, MAX_BUNDLE_CHAIN,
@@ -230,6 +231,8 @@ fn git_state_survives_capture_and_restore() {
             class: CacheClass::Deps,
             carry: CarryState::Carried,
             key: CarryKey::Unmeasured,
+            remake: Remake::Nothing,
+            native_files: 0,
         }]
     );
 
@@ -247,7 +250,6 @@ fn git_state_survives_capture_and_restore() {
         },
     )
     .unwrap();
-    assert_eq!(restored.files, 3);
     // Three ignored files plus the nine entries of W.
     assert_eq!(restored.verified, 12);
     assert_eq!(restore_state(&target).unwrap(), RestoreState::Present);
@@ -415,6 +417,11 @@ fn secret_fixture(root: &Path) -> Fallible {
     fs::create_dir_all(root.join("node_modules/pkg"))?;
     fs::write(root.join("node_modules/pkg/cert.pem"), "fixture")?;
     fs::write(root.join("node_modules/pkg/.env"), "leak")?;
+    fs::create_dir_all(root.join("node_modules/pkg/build/Release"))?;
+    fs::write(
+        root.join("node_modules/pkg/build/Release/pkg.node"),
+        "addon",
+    )?;
     fs::write(root.join(".fabricignore"), "scratch\n")?;
     fs::create_dir_all(root.join("scratch"))?;
     fs::write(root.join("scratch/out.bin"), "excluded")?;
@@ -460,7 +467,24 @@ fn every_secret_pattern_keeps_its_file_out_of_the_manifest() {
     assert!(files.contains(&".fabricignore"));
     assert_eq!(manifest.caches.len(), 1);
     assert_eq!(manifest.caches[0].carry, CarryState::Partial);
+    assert_eq!(manifest.caches[0].native_files, 1);
     assert_eq!(report.denied.len(), SECRET_PATTERNS.len() * 2 + 1);
+    // The manifest names every path that stayed behind, so the target can
+    // say what it will not find: each secret, and the exclusion.
+    let mut expected: Vec<LeftBehind> = report
+        .denied
+        .iter()
+        .map(|path| LeftBehind {
+            path: path.clone(),
+            reason: LeaveReason::Secret,
+        })
+        .chain([LeftBehind {
+            path: RelPath::parse("scratch/out.bin").unwrap(),
+            reason: LeaveReason::Excluded,
+        }])
+        .collect();
+    expected.sort_by(|a, b| a.path.cmp(&b.path));
+    assert_eq!(manifest.left_behind, expected);
 }
 
 fn worktree_paths(

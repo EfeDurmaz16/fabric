@@ -15,12 +15,17 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::codec::{self, CodecError, VersionedError};
+use crate::env::SetupStep;
 use crate::git::{BranchName, GitConfigKey, GitConfigValue, GitOid, RefName};
 use crate::id::{ChunkId, EnvSpecId, JobId, NodeId, SnapshotId};
 use crate::path::{AbsPath, RelPath};
 
 /// The manifest format version this crate writes; the first varint of every encoded manifest.
-pub const MANIFEST_VERSION: u16 = 1;
+///
+/// Version 2 added what a target needs to decide each cache path on its
+/// own (`CacheEntry::remake` and `CacheEntry::native_files`) and the list
+/// of paths that stayed on the capturing node (`left_behind`).
+pub const MANIFEST_VERSION: u16 = 2;
 
 /// The most bytes a reader decodes as a manifest; a memory bound against a
 /// hostile peer, not a cap on snapshots.
@@ -42,7 +47,7 @@ pub enum ManifestError {
     /// A list is not strictly sorted by its key, which also catches a repeated key.
     #[error("{list} entry {index} is not strictly after the one before it")]
     OutOfOrder {
-        /// Which list: `files`, `harness_state`, `caches`, `refs`, `worktree_mtimes` or `config`.
+        /// Which list: `files`, `harness_state`, `caches`, `left_behind`, `refs`, `worktree_mtimes` or `config`.
         list: &'static str,
         /// Zero-based index of the entry, within its list.
         index: usize,
@@ -51,6 +56,12 @@ pub enum ManifestError {
     #[error("entry {index} lies below a file or symlink entry")]
     UnderNonDir {
         /// Zero-based index of the entry, within its tree.
+        index: usize,
+    },
+    /// A cache row says setup steps make it again but names none.
+    #[error("caches entry {index} names an empty list of setup steps")]
+    EmptyRemake {
+        /// Zero-based index of the entry, within `caches`.
         index: usize,
     },
     /// A remote URL in the config projection carries a credential (`credential_range`), which is where a token lives.
@@ -98,6 +109,10 @@ pub struct SnapshotManifest {
     pub env_spec: Option<EnvSpecId>,
     /// One row per dependency, build or tool-cache path the policy saw; sorted by path.
     pub caches: Vec<CacheEntry>,
+    /// Every ignored or untracked path whose bytes stayed on the capturing
+    /// node, with the reason; sorted by path. Names only, never bytes, so a
+    /// target can say what it will not find.
+    pub left_behind: Vec<LeftBehind>,
 }
 
 /// The operating system and architecture of a node.
@@ -209,6 +224,47 @@ pub struct CacheEntry {
     pub carry: CarryState,
     /// The exact strings the source measured; the target compares before trusting the bytes.
     pub key: CarryKey,
+    /// What makes the path again on a node that does not write the bytes,
+    /// as the capturing node's detection saw it (ADR 0012).
+    pub remake: Remake,
+    /// How many native addon files (`*.node`) lie under the path. Such a
+    /// file loads only under the Node ABI it was built for, so a tree that
+    /// holds one is not pure JavaScript.
+    pub native_files: u64,
+}
+
+/// What makes a cache path again on a node that does not write its bytes (ADR 0012).
+///
+/// The capturing node records it, because only that node ran detection
+/// over the workspace the bytes came from; the target reads it to tell a
+/// path it can rebuild from one it would lose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Remake {
+    /// These setup steps of the job's spec fill the path from a lockfile; never empty.
+    Setup(Vec<SetupStep>),
+    /// The next build or tool run makes it again; no setup step does.
+    NextBuild,
+    /// Nothing does: a dependency tree with no lockfile, or a cache the
+    /// user declared that no setup step fills. It is the user's own files.
+    Nothing,
+}
+
+/// A path whose bytes stayed on the capturing node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeftBehind {
+    /// The path, relative to the root.
+    pub path: RelPath,
+    /// Why it stayed.
+    pub reason: LeaveReason,
+}
+
+/// Why a path's bytes stayed on the capturing node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LeaveReason {
+    /// It matches a secret pattern; secrets never travel (ADR 0004).
+    Secret,
+    /// It matches a pattern in `.fabricignore`.
+    Excluded,
 }
 
 /// How much of a cache path travels with the snapshot.
@@ -372,6 +428,12 @@ impl SnapshotManifest {
         check_tree("files", &self.files)?;
         check_tree("harness_state", &self.harness_state.entries)?;
         check_sorted("caches", self.caches.iter().map(|c| &c.path))?;
+        for (index, cache) in self.caches.iter().enumerate() {
+            if matches!(&cache.remake, Remake::Setup(steps) if steps.is_empty()) {
+                return Err(ManifestError::EmptyRemake { index });
+            }
+        }
+        check_sorted("left_behind", self.left_behind.iter().map(|l| &l.path))?;
         if let Some(git) = &self.git {
             check_sorted("refs", git.refs.iter().map(|(name, _)| name))?;
             check_sorted(

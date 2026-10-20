@@ -5,9 +5,11 @@
 //! whole, and a fact that could not be measured is absent, never empty or
 //! guessed. A login is measured by exit code alone and recorded as `yes` or
 //! `no`; no account name is ever read. A carry key is built only from
-//! measured facts, and a cache whose ecosystem or facts are unknown gets
-//! `CarryKey::Unmeasured`, which never matches, so it is rebuilt rather than
-//! trusted.
+//! measured facts, and a cache whose facts are unknown gets
+//! `CarryKey::Unmeasured`, which never matches. What makes a cache again is
+//! recorded beside its key, and a cache detection found no lockfile or step
+//! for is `Remake::Nothing`: the user's own files, which the carry decision
+//! never leaves out (`crate::carry`).
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -15,9 +17,10 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use fabric_core::env::SetupStep;
 use fabric_core::path::{AbsPath, RelPath};
-use fabric_core::snapshot::{CacheClass, CarryKey};
-use fabric_env::detect::{Detection, Ecosystem, NodeManager};
+use fabric_core::snapshot::{CacheClass, CarryKey, Remake};
+use fabric_env::detect::{CacheOrigin, Completion, Detection, Ecosystem, NodeManager};
 use fabric_net::wire::{FactName, FactValue, Facts, MAX_FACT_VALUE};
 use fabric_store::capture::CarryKeys;
 
@@ -62,6 +65,8 @@ pub mod name {
     pub const PYTHON: &str = "python.version";
     /// `sys.base_prefix` of `python3`.
     pub const PYTHON_HOME: &str = "python.home";
+    /// `uv --version`, the installer a Python setup step runs.
+    pub const UV: &str = "uv.version";
     /// `claude --version`.
     pub const CLAUDE: &str = "claude.version";
     /// `claude auth status`, exit code only.
@@ -102,7 +107,7 @@ impl NodeFacts {
 
     /// Measures this node, looking programs up on `path_var`.
     pub async fn measure(home: &Path, path_var: &OsString, cargo_home: Option<PathBuf>) -> Self {
-        // Each probe is boxed, so the joined future holds 19 pointers, not 19 child processes.
+        // Each probe is boxed, so the joined future holds 20 pointers, not 20 child processes.
         let run = |program: &'static str, args: &'static [&'static str], probe: Probe| {
             let path_var = path_var.clone();
             let home = home.to_owned();
@@ -122,6 +127,7 @@ impl NodeFacts {
             rustc,
             python,
             python_home,
+            uv,
             claude,
             claude_login,
             codex,
@@ -146,6 +152,7 @@ impl NodeFacts {
                 &["-c", "import sys; print(sys.base_prefix)"],
                 Probe::Output
             ),
+            run("uv", &["--version"], Probe::Output),
             run("claude", &["--version"], Probe::Output),
             run("claude", &["auth", "status"], Probe::ExitCode),
             run("codex", &["--version"], Probe::Output),
@@ -182,17 +189,11 @@ impl NodeFacts {
         put(name::YARN, yarn);
         put(name::BUN, bun);
         put(name::RUSTC, rustc);
-        put(
-            name::CARGO_HOME,
-            Some(
-                cargo_home
-                    .unwrap_or_else(|| home.join(".cargo"))
-                    .display()
-                    .to_string(),
-            ),
-        );
+        let cargo_home = cargo_home.unwrap_or_else(|| home.join(".cargo"));
+        put(name::CARGO_HOME, Some(cargo_home.display().to_string()));
         put(name::PYTHON, python);
         put(name::PYTHON_HOME, python_home);
+        put(name::UV, uv);
         put(name::CLAUDE, claude);
         put(name::CLAUDE_LOGIN, claude_login);
         put(name::CODEX, codex);
@@ -281,6 +282,12 @@ pub fn find_on_path(program: &str, path_var: &OsString) -> Option<PathBuf> {
         })
 }
 
+/// The `tool` of the `Other` key whose version is the node's `{os}-{arch}`.
+pub const PLATFORM_TOOL: &str = "platform";
+
+/// The `tool` of the `Other` key whose version is the node's native addon ABI.
+pub const NODE_ABI_TOOL: &str = "node.abi";
+
 /// The major version in a version string: `v22.23.2` gives `22`, `11.23.0` gives `11`.
 #[must_use]
 pub fn major(version: &str) -> Option<String> {
@@ -331,8 +338,17 @@ impl NodeFacts {
 
     fn platform_key(&self) -> Option<CarryKey> {
         Some(CarryKey::Other {
-            tool: "platform".to_owned(),
+            tool: PLATFORM_TOOL.to_owned(),
             version: format!("{}-{}", self.get(name::OS)?, self.get(name::ARCH)?),
+        })
+    }
+
+    /// The ABI native Node addons are built for here: the key of a
+    /// `node_modules` no lockfile describes, which no package manager names.
+    fn node_abi_key(&self) -> Option<CarryKey> {
+        Some(CarryKey::Other {
+            tool: NODE_ABI_TOOL.to_owned(),
+            version: self.get(name::NODE_ABI)?.to_owned(),
         })
     }
 
@@ -349,19 +365,20 @@ impl NodeFacts {
             } => self.node_key(package_manager),
             CarryKey::Rust { .. } => self.rust_key(),
             CarryKey::Python { .. } => self.python_key(),
-            CarryKey::Other { tool, .. } if tool == "platform" => self.platform_key(),
+            CarryKey::Other { tool, .. } if tool == PLATFORM_TOOL => self.platform_key(),
+            CarryKey::Other { tool, .. } if tool == NODE_ABI_TOOL => self.node_abi_key(),
             CarryKey::Other { .. } | CarryKey::Unmeasured => None,
         };
         key.unwrap_or(CarryKey::Unmeasured)
     }
 }
 
-/// Says which field of two carry keys differs, for the one line a skipped cache prints.
+/// Says which field of two carry keys differs, in the words a decision line prints.
 #[must_use]
 pub fn key_difference(source: &CarryKey, target: &CarryKey) -> String {
     match (source, target) {
         (CarryKey::Unmeasured, _) => "the source measured no key".to_owned(),
-        (_, CarryKey::Unmeasured) => "this node lacks a tool the key needs".to_owned(),
+        (_, CarryKey::Unmeasured) => "the target lacks a tool the key needs".to_owned(),
         (
             CarryKey::Node {
                 node_major: source_node,
@@ -377,56 +394,135 @@ pub fn key_difference(source: &CarryKey, target: &CarryKey) -> String {
             },
         ) => {
             if source_node != target_node {
-                format!("node major {source_node} on the source, {target_node} here")
+                format!("node major {source_node} on the source, {target_node} on the target")
             } else if source_pm != target_pm {
-                format!("{manager} major {source_pm} on the source, {target_pm} here")
+                format!("{manager} major {source_pm} on the source, {target_pm} on the target")
             } else if source_store != target_store {
-                format!("pnpm store {source_store:?} on the source, {target_store:?} here")
+                format!("pnpm store {source_store:?} on the source, {target_store:?} on the target")
             } else {
                 "keys are equal".to_owned()
             }
         }
         (CarryKey::Rust { cargo_home: a, .. }, CarryKey::Rust { cargo_home: b, .. }) if a != b => {
-            format!("CARGO_HOME {a} on the source, {b} here")
+            format!("CARGO_HOME {a} on the source, {b} on the target")
         }
-        (CarryKey::Rust { .. }, CarryKey::Rust { .. }) => "rustc -vV differs".to_owned(),
+        (CarryKey::Rust { .. }, CarryKey::Rust { .. }) if source != target => {
+            "rustc -vV differs".to_owned()
+        }
+        (
+            CarryKey::Python {
+                python_version: a,
+                python_home: home_a,
+            },
+            CarryKey::Python {
+                python_version: b,
+                python_home: home_b,
+            },
+        ) if source != target => {
+            format!("{a} at {home_a} on the source, {b} at {home_b} on the target")
+        }
+        (
+            CarryKey::Other { tool, version: a },
+            CarryKey::Other {
+                tool: target_tool,
+                version: b,
+            },
+        ) if tool == target_tool && a != b => {
+            let what = if tool == PLATFORM_TOOL {
+                String::new()
+            } else {
+                format!("{tool} ")
+            };
+            format!("{what}{a} on the source, {b} on the target")
+        }
         _ if source == target => "keys are equal".to_owned(),
         _ => "the keys differ".to_owned(),
     }
 }
 
-/// Carry keys for a capture: detection says each cache's ecosystem, the facts give the strings.
+/// What a capture records per cache: detection says each cache's
+/// ecosystem and what fills it, the facts give the strings.
 pub struct MeasuredKeys {
     facts: NodeFacts,
-    ecosystems: BTreeMap<RelPath, Ecosystem>,
+    detected: BTreeMap<RelPath, (Ecosystem, Remake)>,
 }
 
 impl MeasuredKeys {
     /// Keys for the workspace `detection` describes, measured as `facts`.
     #[must_use]
     pub fn new(facts: NodeFacts, detection: Option<&Detection>) -> Self {
-        let ecosystems = detection
+        let detected = detection
             .map(|d| {
                 d.caches()
                     .iter()
-                    .map(|cache| (cache.path.clone(), cache.ecosystem))
+                    .map(|cache| {
+                        let remake = match &cache.completion {
+                            Completion::Sentinel { filled_by } => {
+                                let steps: Vec<SetupStep> = filled_by
+                                    .iter()
+                                    .filter_map(|index| d.spec().setup.get(*index).cloned())
+                                    .collect();
+                                if steps.is_empty() {
+                                    Remake::Nothing
+                                } else {
+                                    Remake::Setup(steps)
+                                }
+                            }
+                            // A declared cache no step fills holds whatever
+                            // the user put there (ADR 0012, 2026-10-20).
+                            Completion::Content => match cache.origin {
+                                CacheOrigin::Declared => Remake::Nothing,
+                                CacheOrigin::Detected => Remake::NextBuild,
+                            },
+                        };
+                        (cache.path.clone(), (cache.ecosystem, remake))
+                    })
                     .collect()
             })
             .unwrap_or_default();
-        Self { facts, ecosystems }
+        Self { facts, detected }
+    }
+
+    /// The key of a cache the store's classes found and detection did not:
+    /// a `node_modules` without a lockfile keys on the addon ABI, a `.venv`
+    /// on the interpreter, and anything else on the platform.
+    fn undetected_key(&self, class: CacheClass, path: &RelPath) -> Option<CarryKey> {
+        let name = path.as_str().rsplit('/').next().unwrap_or_default();
+        match class {
+            CacheClass::Deps if name.eq_ignore_ascii_case("node_modules") => {
+                self.facts.node_abi_key()
+            }
+            CacheClass::Deps if name.eq_ignore_ascii_case(".venv") => self.facts.python_key(),
+            CacheClass::Deps | CacheClass::Build | CacheClass::ToolCache => {
+                self.facts.platform_key()
+            }
+        }
     }
 }
 
 impl CarryKeys for MeasuredKeys {
-    fn key(&self, _class: CacheClass, path: &RelPath) -> CarryKey {
-        let key = match self.ecosystems.get(path) {
-            Some(Ecosystem::Node(manager)) => self.facts.node_key(manager_name(*manager)),
+    fn key(&self, class: CacheClass, path: &RelPath) -> CarryKey {
+        let key = match self.detected.get(path).map(|(ecosystem, _)| *ecosystem) {
+            Some(Ecosystem::Node(manager)) => self.facts.node_key(manager_name(manager)),
             Some(Ecosystem::Rust) => self.facts.rust_key(),
             Some(Ecosystem::Python) => self.facts.python_key(),
             Some(Ecosystem::Other) => self.facts.platform_key(),
-            None => None,
+            None => self.undetected_key(class, path),
         };
         key.unwrap_or(CarryKey::Unmeasured)
+    }
+
+    /// A cache detection does not know is made again by nothing when it
+    /// is a dependency tree, which then has no lockfile, and by the next
+    /// build or tool run otherwise.
+    fn remake(&self, class: CacheClass, path: &RelPath) -> Remake {
+        match self.detected.get(path) {
+            Some((_, remake)) => remake.clone(),
+            None => match class {
+                CacheClass::Deps => Remake::Nothing,
+                CacheClass::Build | CacheClass::ToolCache => Remake::NextBuild,
+            },
+        }
     }
 }
 
@@ -463,7 +559,7 @@ mod tests {
         assert!(!source.matches(&target));
         assert_eq!(
             key_difference(&source, &target),
-            "node major 22 on the source, 26 here"
+            "node major 22 on the source, 26 on the target"
         );
     }
 
@@ -475,11 +571,62 @@ mod tests {
         assert!(!source.matches(&air.key_like(&source)));
     }
 
+    /// A `node_modules` detection does not know has no lockfile, so
+    /// nothing makes it again: the key is the addon ABI, read only for a
+    /// warning, and the remake is `Nothing`, which the carry decision
+    /// always carries (gate finding F6).
     #[test]
-    fn a_cache_detection_does_not_know_is_never_carried() {
+    fn a_dependency_tree_detection_does_not_know_is_the_users_files() {
+        let facts = NodeFacts::from_pairs([(name::NODE_ABI, "127"), (name::OS, "macos")]);
+        let keys = MeasuredKeys::new(facts, None);
+        let node_modules = RelPath::parse("node_modules").unwrap();
+        assert_eq!(
+            keys.key(CacheClass::Deps, &node_modules),
+            CarryKey::Other {
+                tool: NODE_ABI_TOOL.to_owned(),
+                version: "127".to_owned()
+            }
+        );
+        assert_eq!(
+            keys.remake(CacheClass::Deps, &node_modules),
+            Remake::Nothing
+        );
+    }
+
+    /// Build output detection does not know, such as `dist`, keys on the
+    /// platform and the next build makes it again (gate finding F7).
+    #[test]
+    fn build_output_detection_does_not_know_keys_on_the_platform() {
         let keys = MeasuredKeys::new(pro(), None);
-        let key = keys.key(CacheClass::Deps, &RelPath::parse("node_modules").unwrap());
-        assert_eq!(key, CarryKey::Unmeasured);
+        let dist = RelPath::parse("dist").unwrap();
+        assert_eq!(
+            keys.key(CacheClass::Build, &dist),
+            CarryKey::Other {
+                tool: PLATFORM_TOOL.to_owned(),
+                version: "macos-aarch64".to_owned()
+            }
+        );
+        assert_eq!(keys.remake(CacheClass::Build, &dist), Remake::NextBuild);
+    }
+
+    /// A tree with a lockfile records the install step that fills it.
+    #[test]
+    fn a_detected_tree_records_the_step_that_fills_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("package-lock.json"), "{}").unwrap();
+        let detection = fabric_env::detect::detect(dir.path(), &[]).unwrap();
+        let keys = MeasuredKeys::new(pro(), Some(&detection));
+        let node_modules = RelPath::parse("node_modules").unwrap();
+        let Remake::Setup(steps) = keys.remake(CacheClass::Deps, &node_modules) else {
+            panic!("no setup step recorded");
+        };
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].program.to_string(), "npm");
+        assert!(matches!(
+            keys.key(CacheClass::Deps, &node_modules),
+            CarryKey::Node { .. }
+        ));
     }
 
     #[test]
