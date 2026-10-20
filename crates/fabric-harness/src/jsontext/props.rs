@@ -3,7 +3,8 @@
 //! whole however many of its neighbours are dropped too and whatever
 //! signed blocks it holds itself, no secret survives outside the kept
 //! blocks, the output is JSON, and redacting the output again changes
-//! nothing.
+//! nothing. The secrets include shapes that JSON escapes (a quoted value,
+//! an env line after a newline), so a check on raw bytes cannot pass.
 
 use proptest::prelude::*;
 use serde_json::{Map, Value, json};
@@ -11,7 +12,21 @@ use serde_json::{Map, Value, json};
 use super::transform;
 use crate::redact::Redactor;
 
-const SECRET: &str = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab";
+/// Secret shapes: a token, a quoted assignment and an env line after a
+/// newline, the last two hidden by JSON escapes in the raw text.
+const SECRETS: &[&str] = &[
+    "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab",
+    "DB_PASSWORD=\"hunter22xyz\"",
+    "NODE_ENV=dev\nAPI_KEY=abcd1234efgh",
+];
+
+fn secret_strategy() -> impl Strategy<Value = &'static str> {
+    prop::sample::select(SECRETS)
+}
+
+fn redactor() -> &'static Redactor {
+    Redactor::standard().unwrap()
+}
 
 fn text_strategy() -> impl Strategy<Value = String> {
     prop_oneof![
@@ -32,14 +47,20 @@ fn signed_block() -> impl Strategy<Value = Value> {
 
 /// A signed block that holds a secret one time in four.
 fn signed_block_maybe_secret() -> impl Strategy<Value = Value> {
-    (text_strategy(), "[A-Za-z0-9+/=]{4,16}", 0..4u8).prop_map(|(thinking, signature, roll)| {
-        let thinking = if roll == 0 {
-            format!("{thinking} token {SECRET}")
-        } else {
-            thinking
-        };
-        json!({ "type": "thinking", "thinking": thinking, "signature": signature })
-    })
+    (
+        text_strategy(),
+        "[A-Za-z0-9+/=]{4,16}",
+        0..4u8,
+        secret_strategy(),
+    )
+        .prop_map(|(thinking, signature, roll, secret)| {
+            let thinking = if roll == 0 {
+                format!("{thinking} token {secret}")
+            } else {
+                thinking
+            };
+            json!({ "type": "thinking", "thinking": thinking, "signature": signature })
+        })
 }
 
 /// A signed block that holds an array of signed blocks, each of which may
@@ -60,7 +81,7 @@ fn nested_signed_block() -> impl Strategy<Value = Value> {
 fn value_with_secrets_strategy() -> impl Strategy<Value = Value> {
     let leaf = prop_oneof![
         text_strategy().prop_map(Value::String),
-        Just(Value::String(format!("key {SECRET} here"))),
+        secret_strategy().prop_map(|secret| Value::String(format!("key {secret} here"))),
         any::<i64>().prop_map(|n| json!(n)),
         Just(Value::Null),
     ];
@@ -123,11 +144,11 @@ fn is_signed(map: &Map<String, Value>) -> bool {
     }
 }
 
-fn signed_spans(value: &Value, out: &mut Vec<String>) {
+fn signed_spans(value: &Value, out: &mut Vec<Value>) {
     match value {
         Value::Object(map) => {
             if is_signed(map) {
-                out.push(serde_json::to_string(value).unwrap());
+                out.push(value.clone());
             } else {
                 map.values().for_each(|v| signed_spans(v, out));
             }
@@ -135,6 +156,27 @@ fn signed_spans(value: &Value, out: &mut Vec<String>) {
         Value::Array(items) => items.iter().for_each(|v| signed_spans(v, out)),
         _ => {}
     }
+}
+
+/// Every string in `value`, keys included.
+fn all_strings(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, v) in map {
+                out.push(key.clone());
+                all_strings(v, out);
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|v| all_strings(v, out)),
+        Value::String(s) => out.push(s.clone()),
+        _ => {}
+    }
+}
+
+fn holds_secret(value: &Value) -> bool {
+    let mut strings = Vec::new();
+    all_strings(value, &mut strings);
+    strings.iter().any(|s| redactor().matches(s))
 }
 
 fn strings_outside_signed(value: &Value, out: &mut Vec<String>) {
@@ -156,18 +198,19 @@ proptest! {
     #[test]
     fn redaction_drops_only_the_signed_blocks_that_hold_a_secret(value in value_with_secrets_strategy()) {
         let text = serde_json::to_string(&value).unwrap();
-        let outcome = transform(&text, Redactor::standard().unwrap()).unwrap();
+        let outcome = transform(&text, redactor()).unwrap();
         let after = outcome.text.clone().unwrap_or_else(|| text.clone());
         let parsed: Value = serde_json::from_str(&after).expect("output is JSON");
-        prop_assert!(!after.contains(SECRET), "a secret survived: {after}");
+        prop_assert!(!holds_secret(&parsed), "a secret survived: {after}");
 
         let mut spans = Vec::new();
         signed_spans(&value, &mut spans);
-        let (with_secret, clean): (Vec<&String>, Vec<&String>) =
-            spans.iter().partition(|span| span.contains(SECRET));
+        let (with_secret, clean): (Vec<&Value>, Vec<&Value>) =
+            spans.iter().partition(|span| holds_secret(span));
         prop_assert_eq!(outcome.dropped_signed_blocks as usize, with_secret.len());
         for span in clean {
-            prop_assert!(after.contains(span.as_str()), "signed block changed: {span}");
+            let raw = serde_json::to_string(span).unwrap();
+            prop_assert!(after.contains(raw.as_str()), "signed block changed: {raw}");
         }
 
         let mut before_strings = Vec::new();
@@ -176,21 +219,24 @@ proptest! {
         strings_outside_signed(&parsed, &mut after_strings);
         prop_assert_eq!(before_strings.len(), after_strings.len());
         for (before, after) in before_strings.iter().zip(&after_strings) {
-            let expected = before.replace(SECRET, "[REDACTED:github-token]");
+            let mut counts = crate::redact::RedactionCounts::new();
+            let expected = redactor()
+                .apply(before, &mut counts)
+                .unwrap_or_else(|| before.clone());
             prop_assert_eq!(after, &expected);
         }
 
-        let again = transform(&after, Redactor::standard().unwrap()).unwrap();
+        let again = transform(&after, redactor()).unwrap();
         prop_assert!(again.text.is_none(), "redaction is idempotent");
     }
 
     #[test]
     fn json_without_a_secret_is_never_changed(value in value_strategy()) {
         let text = serde_json::to_string(&value).unwrap();
-        let outcome = transform(&text, Redactor::standard().unwrap()).unwrap();
+        let outcome = transform(&text, redactor()).unwrap();
         prop_assert!(outcome.text.is_none());
         let pretty = serde_json::to_string_pretty(&value).unwrap();
-        let outcome = transform(&pretty, Redactor::standard().unwrap()).unwrap();
+        let outcome = transform(&pretty, redactor()).unwrap();
         prop_assert!(outcome.text.is_none());
     }
 }

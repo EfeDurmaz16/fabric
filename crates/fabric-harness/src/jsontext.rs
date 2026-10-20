@@ -416,12 +416,24 @@ pub fn transform(text: &str, redactor: &Redactor) -> Result<Outcome, TransformEr
     let mut outcome = Outcome::default();
     let mut edits: Vec<(Range<usize>, String)> = Vec::new();
 
+    // A block holds a secret when its raw text matches or when one of its
+    // strings does once decoded: an escaped newline or quote hides an env
+    // line or a quoted value from the raw match. Strings are recorded in
+    // order and never overlap, so those inside a span are one run.
+    let holds_secret = |span: &Range<usize>| {
+        let first = scan.strings.partition_point(|s| s.start < span.start);
+        redactor.matches(&text[span.clone()])
+            || scan.strings[first..]
+                .iter()
+                .take_while(|s| s.end <= span.end)
+                .any(|s| literal_holds_secret(&text[s.clone()], redactor))
+    };
     // A signed block nested in another one that is dropped goes with it,
     // so only the outermost blocks that hold a secret are considered.
     let mut holding: Vec<&SignedBlock> = scan
         .signed
         .iter()
-        .filter(|block| redactor.matches(&text[block.span.clone()]))
+        .filter(|block| holds_secret(&block.span))
         .collect();
     holding.sort_by_key(|block| (block.span.start, std::cmp::Reverse(block.span.end)));
     let mut dropped: Vec<Range<usize>> = Vec::new();
@@ -574,6 +586,24 @@ mod tests {
             r#"[1, {{"type":"thinking","thinking":"{ANTHROPIC}","signature":"a"}}, {{"type":"thinking","thinking":"{GITHUB}","signature":"b"}}]"#
         );
         assert_eq!(redact(&trailing_run).unwrap().text.unwrap(), "[1]");
+    }
+
+    #[test]
+    fn a_signed_block_whose_secret_hides_behind_an_escape_is_dropped() {
+        for thinking in [
+            r#"the .env has DB_PASSWORD=\"s3cretpass99\" and more"#,
+            r"NODE_ENV=dev\nAPI_KEY=abcd1234efgh",
+        ] {
+            let line = format!(
+                r#"{{"content":[{{"type":"thinking","thinking":"{thinking}","signature":"s"}},{{"type":"text","text":"a"}}]}}"#
+            );
+            let out = redact(&line).unwrap();
+            assert_eq!(out.dropped_signed_blocks, 1, "{thinking}");
+            assert_eq!(
+                out.text.unwrap(),
+                r#"{"content":[{"type":"text","text":"a"}]}"#
+            );
+        }
     }
 
     #[test]
