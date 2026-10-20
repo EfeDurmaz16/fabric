@@ -18,7 +18,7 @@ use fabric_core::harness::HarnessKind;
 use fabric_core::path::AbsPath;
 
 use crate::denylist;
-use crate::departure::Departure;
+use crate::departure::{Departure, Records};
 use crate::error::HarnessError;
 use crate::files::{self, Placement, Source};
 use crate::harness::Restored;
@@ -81,11 +81,12 @@ pub(crate) struct Capturer<'a> {
     pub version: Option<String>,
     /// Where this node records its rewritable files; `None` for an adapter
     /// whose files only grow.
-    pub departure: Option<&'a Path>,
+    pub departure: Option<&'a Records>,
 }
 
-/// Stages `sources` into `out`, records the departure of the rewritable
-/// ones and writes the manifest last, so a tree with a manifest is whole.
+/// Stages `sources` into `out`, records the rewritable ones as a pending
+/// departure and writes the manifest last, so a tree with a manifest is
+/// whole and its pending record exists.
 pub(crate) fn capture(
     capturer: Capturer<'_>,
     sources: &[Source],
@@ -102,8 +103,9 @@ pub(crate) fn capture(
         carried,
         &counts,
     )?;
-    if let Some(record) = capturer.departure {
-        Departure::of(sources)?.write(record)?;
+    if let Some(records) = capturer.departure {
+        records.write_pending(sources, manifest.digest()?)?;
+        files::crashpoint("capture-after-departure", 0);
     }
     manifest.write(out)?;
     Ok(manifest)
@@ -141,6 +143,26 @@ pub(crate) fn open(
     Ok(manifest)
 }
 
+/// Confirms that the capture which produced `manifest` left this node, so
+/// restore may replace the rewritable files it recorded. `records` is
+/// `None` for an adapter that keeps none.
+pub(crate) fn confirm_departure(
+    manifest: &StateManifest,
+    kind: &HarnessKind,
+    records: Option<&Records>,
+) -> Result<(), HarnessError> {
+    if manifest.kind() != kind {
+        return Err(HarnessError::WrongHarness {
+            captured: manifest.kind().clone(),
+            restoring: kind.clone(),
+        });
+    }
+    match records {
+        Some(records) => records.confirm(manifest.session(), manifest.digest()?),
+        None => Ok(()),
+    }
+}
+
 /// Where a tree path lands on this node and how the adapter treats it.
 pub(crate) struct Destination {
     /// The file on this node.
@@ -154,12 +176,12 @@ pub(crate) struct Destination {
 /// Places the files of `manifest`, staged under `state`, where
 /// `destination` says. `destination` answers `None` for a path the adapter
 /// never captures. Nothing is written until every entry has passed every
-/// check; `departure` is the record that says which rewritable files this
-/// node left untouched.
+/// check; `departure` holds the confirmed record that says which
+/// rewritable files this node left untouched.
 pub(crate) fn restore<F>(
     manifest: StateManifest,
     state: &Path,
-    departure: Option<&Path>,
+    departure: Option<&Records>,
     mut destination: F,
 ) -> Result<Restored, HarnessError>
 where
@@ -195,7 +217,7 @@ where
     }
     files::verify(state, manifest.files())?;
     let departure = match departure {
-        Some(record) => Departure::read(record)?,
+        Some(records) => records.active()?,
         None => Departure::default(),
     };
     let placed = files::place_all(&placements, &departure)?;

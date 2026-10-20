@@ -358,6 +358,18 @@ impl StateManifest {
         &self.redactions
     }
 
+    /// The `BLAKE3` digest of the manifest's JSON form, which names one
+    /// capture: equal manifests, read back or kept in memory, share it.
+    #[cfg(any(feature = "acp", feature = "claude", feature = "codex"))]
+    pub(crate) fn digest(&self) -> Result<Digest, HarnessError> {
+        let bytes = serde_json::to_vec(self).map_err(|e| HarnessError::Malformed {
+            what: "manifest",
+            path: std::path::PathBuf::from(MANIFEST_FILE),
+            reason: e.to_string(),
+        })?;
+        Ok(Digest::from_hash(blake3::hash(&bytes)))
+    }
+
     /// Writes the manifest as `MANIFEST_FILE` under `out`.
     pub fn write(&self, out: &Path) -> Result<(), HarnessError> {
         let path = out.join(MANIFEST_FILE);

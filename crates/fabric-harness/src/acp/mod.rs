@@ -27,7 +27,7 @@ use fabric_core::path::AbsPath;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::departure;
+use crate::departure::Records;
 use crate::error::HarnessError;
 use crate::files::{self, Carry, Source};
 use crate::harness::{Harness, Installed, Launch, Restored, Running};
@@ -146,8 +146,8 @@ impl AcpHarness {
 
     /// Where this node records the session's files at capture. An ACP
     /// agent's state is opaque, so every file is treated as rewritable.
-    fn departure_path(&self, session: &SessionId) -> PathBuf {
-        departure::record_path(self.home_dir(), &format!("acp-{}", self.program), session)
+    fn departure(&self, session: &SessionId) -> Records {
+        Records::of(self.home_dir(), &format!("acp-{}", self.program), session)
     }
 
     fn capture_sync(
@@ -181,14 +181,14 @@ impl AcpHarness {
                 searched: dir,
             });
         }
-        let record = self.departure_path(session);
+        let records = self.departure(session);
         let capturer = Capturer {
             kind: self.kind(),
             session,
             root,
             home: &self.home,
             version,
-            departure: Some(&record),
+            departure: Some(&records),
         };
         let manifest = pipeline::capture(capturer, &sources, RedactionCounts::new(), out)?;
         info!(%session, agent = %self.program, files = manifest.files().len(), "acp: captured");
@@ -232,8 +232,8 @@ impl AcpHarness {
     ) -> Result<Restored, HarnessError> {
         let (_, state_parts) = self.state_rel()?;
         let session = manifest.session().clone();
-        let record = self.departure_path(&session);
-        let restored = pipeline::restore(manifest, state, Some(&record), |rel, _| {
+        let records = self.departure(&session);
+        let restored = pipeline::restore(manifest, state, Some(&records), |rel, _| {
             let rest = under_home(rel).filter(|_| Self::restorable(rel, &state_parts, &session));
             Ok(rest.map(|rest| Destination {
                 path: self.home_dir().join(rest),
@@ -390,6 +390,18 @@ impl Harness for AcpHarness {
         out: &'a Path,
     ) -> BoxFuture<'a, Result<StateManifest, HarnessError>> {
         Box::pin(self.capture_impl(workspace, session, out))
+    }
+
+    fn confirm_departure<'a>(
+        &'a self,
+        manifest: &'a StateManifest,
+    ) -> BoxFuture<'a, Result<(), HarnessError>> {
+        let records = self.departure(manifest.session());
+        let manifest = manifest.clone();
+        let kind = self.kind();
+        Box::pin(pipeline::blocking(move || {
+            pipeline::confirm_departure(&manifest, &kind, Some(&records))
+        }))
     }
 
     fn restore<'a>(

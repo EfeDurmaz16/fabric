@@ -3,11 +3,15 @@
 //! Invariant: restore replaces a file that the harness rewrites in place
 //! (`Mutability::Replaceable`) with an incoming copy that does not extend
 //! it only when the file on disk still has the digest this node recorded
-//! the last time it captured that file. The bytes such a replace drops
-//! therefore already left with the job, and a file edited here after the
-//! job left is never overwritten. The record lives under
-//! `~/.fabric/harness/departed/`, never travels, and is written before
-//! the manifest, so a capture whose manifest exists always has its record.
+//! for a capture that is known to have left. A record is written in two
+//! steps. Capture writes it as pending, keyed by the digest of the
+//! manifest it produced, and restore ignores a pending record. The core
+//! confirms it once the snapshot that holds the capture is published, and
+//! only then does it become the record restore reads. A capture whose
+//! publish failed, or a process killed between capture and publish, so
+//! never moves the record forward, and a file edited here after the last
+//! published capture is never overwritten. Records live under
+//! `~/.fabric/harness/departed/` and never travel.
 
 #![cfg_attr(
     not(all(feature = "acp", feature = "claude", feature = "codex")),
@@ -30,32 +34,43 @@ use crate::session::SessionId;
 /// The record format this crate writes.
 const FORMAT: u16 = 1;
 
-/// The digests of a session's rewritable files on this node at capture.
+/// The digests of a session's rewritable files on this node at one capture.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Departure {
     format: u16,
+    /// The digest of the manifest of the capture this record belongs to;
+    /// `None` only for the empty record of a node that never captured.
+    capture: Option<Digest>,
     /// Absolute path on this node, and the digest of its bytes at capture.
     files: BTreeMap<String, Digest>,
 }
 
-/// Where the record of `session` for the harness `label` lives under `home`.
-pub(crate) fn record_path(home: &Path, label: &str, session: &SessionId) -> PathBuf {
-    home.join(".fabric/harness/departed")
-        .join(label)
-        .join(format!("{session}.json"))
+/// Where the records of one session of one harness live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Records {
+    /// The record restore reads: the last capture known to have left.
+    active: PathBuf,
+    /// The record of the last capture, until the core confirms it.
+    pending: PathBuf,
 }
 
-fn utf8(path: &Path) -> Result<&str, HarnessError> {
-    path.to_str().ok_or_else(|| HarnessError::Malformed {
-        what: "departure path",
-        path: path.to_path_buf(),
-        reason: "not UTF-8".to_owned(),
-    })
-}
+impl Records {
+    /// The records of `session` for the harness `label` under `home`.
+    pub(crate) fn of(home: &Path, label: &str, session: &SessionId) -> Self {
+        let dir = home.join(".fabric/harness/departed").join(label);
+        Records {
+            active: dir.join(format!("{session}.json")),
+            pending: dir.join(format!("{session}.pending.json")),
+        }
+    }
 
-impl Departure {
-    /// Digests the local bytes of every source that is `Replaceable`.
-    pub(crate) fn of(sources: &[Source]) -> Result<Self, HarnessError> {
+    /// Records the rewritable `sources` of the capture whose manifest has
+    /// digest `capture`, as pending; it replaces any earlier pending record.
+    pub(crate) fn write_pending(
+        &self,
+        sources: &[Source],
+        capture: Digest,
+    ) -> Result<(), HarnessError> {
         let mut files = BTreeMap::new();
         for source in sources {
             if source.mutability == Mutability::Replaceable {
@@ -63,48 +78,73 @@ impl Departure {
                 files.insert(utf8(&source.abs)?.to_owned(), digest);
             }
         }
-        Ok(Departure {
+        let record = Departure {
             format: FORMAT,
+            capture: Some(capture),
             files,
+        };
+        let bytes = serde_json::to_vec_pretty(&record).map_err(|e| HarnessError::Malformed {
+            what: "departure record",
+            path: self.pending.clone(),
+            reason: e.to_string(),
+        })?;
+        files::write_atomic(&self.pending, &bytes)
+    }
+
+    /// Makes the pending record of the capture whose manifest has digest
+    /// `capture` the one restore reads. Confirming the capture that is
+    /// already active again changes nothing. A capture that is neither
+    /// pending nor active was not made here or was replaced by a later
+    /// one, and is refused, leaving both records as they were.
+    pub(crate) fn confirm(&self, session: &SessionId, capture: Digest) -> Result<(), HarnessError> {
+        if read(&self.pending)?.is_some_and(|p| p.capture == Some(capture)) {
+            return files::rename_durable(&self.pending, &self.active);
+        }
+        if read(&self.active)?.is_some_and(|a| a.capture == Some(capture)) {
+            return Ok(());
+        }
+        Err(HarnessError::DepartureNotPending {
+            session: session.clone(),
         })
     }
 
-    /// Writes the record at `path` through a temporary file and a rename.
-    pub(crate) fn write(&self, path: &Path) -> Result<(), HarnessError> {
-        let bytes = serde_json::to_vec_pretty(self).map_err(|e| HarnessError::Malformed {
-            what: "departure record",
-            path: path.to_path_buf(),
-            reason: e.to_string(),
-        })?;
-        files::write_atomic(path, &bytes)
+    /// The record restore reads; an empty one when no capture of the
+    /// session has been confirmed on this node.
+    pub(crate) fn active(&self) -> Result<Departure, HarnessError> {
+        Ok(read(&self.active)?.unwrap_or_default())
     }
+}
 
-    /// Reads the record at `path`; an empty record when there is none,
-    /// because this node never captured the session.
-    pub(crate) fn read(path: &Path) -> Result<Self, HarnessError> {
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Departure::default()),
-            Err(e) => return Err(HarnessError::io("read", path, e)),
-        };
-        let record: Departure =
-            serde_json::from_slice(&bytes).map_err(|e| HarnessError::Malformed {
-                what: "departure record",
-                path: path.to_path_buf(),
-                reason: e.to_string(),
-            })?;
-        if record.format != FORMAT {
-            return Err(HarnessError::Malformed {
-                what: "departure record",
-                path: path.to_path_buf(),
-                reason: format!("format {} is not {FORMAT}", record.format),
-            });
-        }
-        Ok(record)
+fn utf8(path: &Path) -> Result<&str, HarnessError> {
+    path.to_str().ok_or_else(|| HarnessError::NotUtf8 {
+        path: path.to_path_buf(),
+    })
+}
+
+/// Reads the record at `path`; `None` when there is none.
+fn read(path: &Path) -> Result<Option<Departure>, HarnessError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(HarnessError::io("read", path, e)),
+    };
+    let malformed = |reason: String| HarnessError::Malformed {
+        what: "departure record",
+        path: path.to_path_buf(),
+        reason,
+    };
+    let record: Departure = serde_json::from_slice(&bytes).map_err(|e| malformed(e.to_string()))?;
+    if record.format != FORMAT {
+        return Err(malformed(format!(
+            "format {} is not {FORMAT}",
+            record.format
+        )));
     }
+    Ok(Some(record))
+}
 
-    /// True when `dest` holds exactly the bytes this node recorded for it
-    /// at its last capture.
+impl Departure {
+    /// True when `dest` holds exactly the bytes this record has for it.
     pub(crate) fn unchanged(&self, dest: &Path) -> Result<bool, HarnessError> {
         let Some(recorded) = self.files.get(utf8(dest)?) else {
             return Ok(false);
@@ -119,14 +159,17 @@ mod tests {
     use crate::files::Carry;
     use fabric_core::path::RelPath;
 
-    #[test]
-    fn a_file_edited_after_capture_is_not_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
-        let memory = dir.path().join("MEMORY.md");
-        let transcript = dir.path().join("t.jsonl");
+    fn digest(text: &str) -> Digest {
+        Digest::from_hash(blake3::hash(text.as_bytes()))
+    }
+
+    /// A rewritable memory file and an append-only transcript under `dir`.
+    fn sources(dir: &Path) -> (PathBuf, Vec<Source>) {
+        let memory = dir.join("MEMORY.md");
+        let transcript = dir.join("t.jsonl");
         std::fs::write(&memory, "# memory\n").unwrap();
         std::fs::write(&transcript, "{}\n").unwrap();
-        let sources = [
+        let sources = vec![
             Source {
                 abs: memory.clone(),
                 rel: RelPath::parse("home/MEMORY.md").unwrap(),
@@ -134,22 +177,56 @@ mod tests {
                 mutability: Mutability::Replaceable,
             },
             Source {
-                abs: transcript.clone(),
+                abs: transcript,
                 rel: RelPath::parse("home/t.jsonl").unwrap(),
                 carry: Carry::JsonLines,
                 mutability: Mutability::AppendOnly,
             },
         ];
-        let path = dir.path().join("departed/claude/s1.json");
-        assert_eq!(Departure::read(&path).unwrap(), Departure::default());
-        Departure::of(&sources).unwrap().write(&path).unwrap();
-        let record = Departure::read(&path).unwrap();
-        assert!(record.unchanged(&memory).unwrap());
+        (memory, sources)
+    }
+
+    #[test]
+    fn a_pending_record_counts_only_once_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (memory, sources) = sources(dir.path());
+        let session = SessionId::parse("s1").unwrap();
+        let records = Records::of(dir.path(), "claude", &session);
+        records.write_pending(&sources, digest("m1")).unwrap();
+        assert!(!records.active().unwrap().unchanged(&memory).unwrap());
+
+        records.confirm(&session, digest("m1")).unwrap();
+        let active = records.active().unwrap();
+        assert!(active.unchanged(&memory).unwrap());
         assert!(
-            !record.unchanged(&transcript).unwrap(),
+            !active.unchanged(&dir.path().join("t.jsonl")).unwrap(),
             "only rewritable files are recorded"
         );
+        records.confirm(&session, digest("m1")).unwrap();
         std::fs::write(&memory, "# memory\nedited here\n").unwrap();
-        assert!(!record.unchanged(&memory).unwrap());
+        assert!(!active.unchanged(&memory).unwrap());
+    }
+
+    #[test]
+    fn a_capture_replaced_by_a_later_one_cannot_be_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (memory, sources) = sources(dir.path());
+        let session = SessionId::parse("s1").unwrap();
+        let records = Records::of(dir.path(), "claude", &session);
+        records.write_pending(&sources, digest("m1")).unwrap();
+        records.confirm(&session, digest("m1")).unwrap();
+        std::fs::write(&memory, "# memory\nsecond\n").unwrap();
+        records.write_pending(&sources, digest("m2")).unwrap();
+        std::fs::write(&memory, "# memory\nthird\n").unwrap();
+        records.write_pending(&sources, digest("m3")).unwrap();
+        assert!(matches!(
+            records.confirm(&session, digest("m2")),
+            Err(HarnessError::DepartureNotPending { .. })
+        ));
+        std::fs::write(&memory, "# memory\n").unwrap();
+        assert!(
+            records.active().unwrap().unchanged(&memory).unwrap(),
+            "the refused confirm left the active record alone"
+        );
     }
 }

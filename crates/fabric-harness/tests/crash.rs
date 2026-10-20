@@ -302,6 +302,49 @@ async fn a_restore_aborted_after_any_placed_file_leaves_whole_files_and_converge
 }
 
 #[tokio::test]
+async fn a_capture_killed_before_its_publish_leaves_memory_edited_since_alone() {
+    // Snapshot 1 left and was confirmed. MEMORY.md was then edited here,
+    // and a second capture died after recording it, before any publish.
+    // A restore of snapshot 1 must not take the edit for bytes that left.
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = home_dir.path().canonicalize().unwrap();
+    let work = build_home(&home);
+    let memory = home
+        .join(".claude/projects")
+        .join(project_key(&work))
+        .join("memory/MEMORY.md");
+    std::fs::create_dir_all(memory.parent().unwrap()).unwrap();
+    std::fs::write(&memory, "# memory\n").unwrap();
+    let out_1 = tempfile::tempdir().unwrap();
+    let sent = node(&home)
+        .capture(&work, &session(), out_1.path())
+        .await
+        .unwrap();
+    node(&home).confirm_departure(&sent).await.unwrap();
+
+    std::fs::write(&memory, "# memory\nedited after the job left\n").unwrap();
+    let out_2 = tempfile::tempdir().unwrap();
+    assert!(run_child(
+        "capture",
+        &home,
+        &work,
+        out_2.path(),
+        "capture-after-departure:0"
+    ));
+    assert!(!out_2.path().join("manifest.json").exists());
+
+    let err = node(&home).restore(&work, out_1.path()).await.unwrap_err();
+    assert!(
+        matches!(err, fabric_harness::HarnessError::StateDiverged { ref path } if path == &memory),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&memory).unwrap(),
+        "# memory\nedited after the job left\n"
+    );
+}
+
+#[tokio::test]
 async fn a_codex_restore_aborted_mid_way_frees_the_writer_lock_and_converges() {
     let home_dir = tempfile::tempdir().unwrap();
     let home = home_dir.path().canonicalize().unwrap();

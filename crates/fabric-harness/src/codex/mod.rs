@@ -571,6 +571,19 @@ impl Harness for Codex {
         Box::pin(self.capture_impl(workspace, session, out))
     }
 
+    /// A rollout only grows, so Codex keeps no departure record and this
+    /// only checks that the manifest is a Codex one.
+    fn confirm_departure<'a>(
+        &'a self,
+        manifest: &'a StateManifest,
+    ) -> BoxFuture<'a, Result<(), HarnessError>> {
+        Box::pin(std::future::ready(pipeline::confirm_departure(
+            manifest,
+            &HarnessKind::Codex,
+            None,
+        )))
+    }
+
     fn restore<'a>(
         &'a self,
         workspace: &'a Path,

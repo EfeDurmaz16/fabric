@@ -98,14 +98,14 @@ impl Carry {
 /// crash tests turn on, so they can stop a capture or restore at an exact
 /// step instead of after a guessed delay.
 #[cfg(feature = "crashpoints")]
-fn crashpoint(step: &str, index: usize) {
+pub(crate) fn crashpoint(step: &str, index: usize) {
     if std::env::var("FABRIC_CRASHPOINT").is_ok_and(|named| named == format!("{step}:{index}")) {
         std::process::abort();
     }
 }
 
 #[cfg(not(feature = "crashpoints"))]
-fn crashpoint(_step: &str, _index: usize) {}
+pub(crate) fn crashpoint(_step: &str, _index: usize) {}
 
 const TEMP_MARK: &str = ".fabric-tmp-";
 const COMPARE_BUFFER: usize = 64 * 1024;
@@ -272,6 +272,12 @@ fn commit(tmp: &Path, dest: &Path) -> Result<(), HarnessError> {
     }
     fs::rename(tmp, dest).map_err(|e| HarnessError::io("rename", dest, e))?;
     fsync_dir(dest.parent().unwrap_or(Path::new(".")))
+}
+
+/// Renames `from` over `to` in the same directory and makes the rename durable.
+pub(crate) fn rename_durable(from: &Path, to: &Path) -> Result<(), HarnessError> {
+    fs::rename(from, to).map_err(|e| HarnessError::io("rename", to, e))?;
+    fsync_dir(to.parent().unwrap_or(Path::new(".")))
 }
 
 /// Writes a file through a temporary sibling and a rename, letting

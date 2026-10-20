@@ -565,10 +565,11 @@ async fn a_job_that_leaves_and_comes_back_keeps_the_original_and_gains_the_new_t
     let transcript = transcript_under(&home, &src.work);
     let original = std::fs::read(&transcript).unwrap();
     let out_1 = tempfile::tempdir().unwrap();
-    adapter
+    let sent = adapter
         .capture(&src.work, &session(), out_1.path())
         .await
         .unwrap();
+    adapter.confirm_departure(&sent).await.unwrap();
     let pro = set_aside(&home, ".claude-pro");
 
     adapter.restore(&src.work, out_1.path()).await.unwrap();
@@ -584,10 +585,11 @@ async fn a_job_that_leaves_and_comes_back_keeps_the_original_and_gains_the_new_t
     std::fs::write(&memory, "# memory\nlearned on the air\n").unwrap();
     std::fs::write(&task, "{\"subject\":\"t\",\"status\":\"done\"}").unwrap();
     let out_2 = tempfile::tempdir().unwrap();
-    adapter
+    let back = adapter
         .capture(&src.work, &session(), out_2.path())
         .await
         .unwrap();
+    adapter.confirm_departure(&back).await.unwrap();
     set_aside(&home, ".claude-air");
     bring_back(&home, &pro);
 
@@ -642,19 +644,21 @@ async fn a_rewritten_file_edited_here_after_the_job_left_is_not_replaced() {
     let home = src.home.path().canonicalize().unwrap();
     let adapter = node(&home);
     let out_1 = tempfile::tempdir().unwrap();
-    adapter
+    let sent = adapter
         .capture(&src.work, &session(), out_1.path())
         .await
         .unwrap();
+    adapter.confirm_departure(&sent).await.unwrap();
     let pro = set_aside(&home, ".claude-pro");
     adapter.restore(&src.work, out_1.path()).await.unwrap();
     let (memory, _) = rewritable_files(&home, &src.work);
     std::fs::write(&memory, "# memory\nfrom the air\n").unwrap();
     let out_2 = tempfile::tempdir().unwrap();
-    adapter
+    let back = adapter
         .capture(&src.work, &session(), out_2.path())
         .await
         .unwrap();
+    adapter.confirm_departure(&back).await.unwrap();
     set_aside(&home, ".claude-air");
     bring_back(&home, &pro);
     // Someone used the Pro's copy after the job left.

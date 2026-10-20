@@ -42,7 +42,7 @@ use fabric_core::path::AbsPath;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use crate::departure;
+use crate::departure::Records;
 use crate::error::HarnessError;
 use crate::files::{self, Carry, Source};
 use crate::harness::{Harness, Installed, Launch, Restored, Running};
@@ -332,8 +332,8 @@ impl ClaudeCode {
     }
 
     /// Where this node records the session's rewritable files at capture.
-    fn departure_path(&self, session: &SessionId) -> PathBuf {
-        departure::record_path(self.home_dir(), PROGRAM, session)
+    fn departure(&self, session: &SessionId) -> Records {
+        Records::of(self.home_dir(), PROGRAM, session)
     }
 
     /// True when a tree path names a file this adapter captures for
@@ -463,14 +463,14 @@ impl ClaudeCode {
     ) -> Result<StateManifest, HarnessError> {
         let mut counts = RedactionCounts::new();
         let sources = self.sources_for(root, session, &mut counts)?;
-        let record = self.departure_path(session);
+        let records = self.departure(session);
         let capturer = Capturer {
             kind: HarnessKind::ClaudeCode,
             session,
             root,
             home: &self.home,
             version,
-            departure: Some(&record),
+            departure: Some(&records),
         };
         let manifest = pipeline::capture(capturer, &sources, counts, out)?;
         info!(%session, files = manifest.files().len(), "claude: captured");
@@ -518,8 +518,8 @@ impl ClaudeCode {
     ) -> Result<Restored, HarnessError> {
         let root_key = Self::key_of(root)?;
         let session = manifest.session().clone();
-        let record = self.departure_path(&session);
-        let restored = pipeline::restore(manifest, state, Some(&record), |rel, _| {
+        let records = self.departure(&session);
+        let restored = pipeline::restore(manifest, state, Some(&records), |rel, _| {
             Ok(self.destination(rel, &session, &root_key))
         })?;
         info!(%session, files = restored.placed.len(), "claude: restored");
@@ -631,6 +631,17 @@ impl Harness for ClaudeCode {
         out: &'a Path,
     ) -> BoxFuture<'a, Result<StateManifest, HarnessError>> {
         Box::pin(self.capture_impl(workspace, session, out))
+    }
+
+    fn confirm_departure<'a>(
+        &'a self,
+        manifest: &'a StateManifest,
+    ) -> BoxFuture<'a, Result<(), HarnessError>> {
+        let records = self.departure(manifest.session());
+        let manifest = manifest.clone();
+        Box::pin(pipeline::blocking(move || {
+            pipeline::confirm_departure(&manifest, &HarnessKind::ClaudeCode, Some(&records))
+        }))
     }
 
     fn restore<'a>(

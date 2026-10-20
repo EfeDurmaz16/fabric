@@ -90,6 +90,15 @@ pub enum HarnessError {
         /// The tree path from the manifest.
         path: String,
     },
+    /// A departure was confirmed for a capture this node did not make, or
+    /// one a later capture of the same session replaced.
+    #[error(
+        "no capture of session {session} with this manifest waits on this node; nothing was confirmed"
+    )]
+    DepartureNotPending {
+        /// The session concerned.
+        session: SessionId,
+    },
     /// A file operation failed.
     #[error("{op} {path}: {source}")]
     Io {

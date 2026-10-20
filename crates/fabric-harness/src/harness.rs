@@ -211,6 +211,16 @@ pub trait Harness: Send + Sync {
         out: &'a Path,
     ) -> BoxFuture<'a, Result<StateManifest, HarnessError>>;
 
+    /// Records that the capture which produced `manifest` has left this
+    /// node. The core calls it once the snapshot that holds the capture is
+    /// published. Until then restore treats this node's rewritable files
+    /// as never having left, so a failed publish followed by a restore of
+    /// an older snapshot cannot overwrite them. Confirming twice is a no-op.
+    fn confirm_departure<'a>(
+        &'a self,
+        manifest: &'a StateManifest,
+    ) -> BoxFuture<'a, Result<(), HarnessError>>;
+
     /// Places a captured state tree where this harness expects it on this
     /// node. Refuses a workspace or home other than the ones captured
     /// (ADR 0011), any file outside the places the adapter itself
