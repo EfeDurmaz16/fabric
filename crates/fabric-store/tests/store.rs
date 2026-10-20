@@ -86,7 +86,7 @@ fn publish_is_idempotent_and_the_manifest_reads_back() {
     assert_eq!(row.job_id, JOB);
     assert_eq!(row.created_at, 1);
     assert_eq!(row.manifest_len, m.encode().unwrap().len() as u64);
-    assert_eq!(store.catalog().snapshots().unwrap().len(), 1);
+    assert_eq!(store.snapshots().unwrap().len(), 1);
     assert!(store.check(CheckDepth::Hashes).unwrap().is_clean());
 }
 
@@ -112,7 +112,7 @@ fn publish_refuses_a_manifest_that_names_a_missing_object() {
         store.publish(&m),
         Err(StoreError::MissingChunk { chunk }) if chunk == ghost
     ));
-    assert!(store.catalog().snapshots().unwrap().is_empty());
+    assert!(store.snapshots().unwrap().is_empty());
     assert!(matches!(
         store.manifest(SnapshotId::of(b"x")),
         Err(StoreError::UnknownSnapshot(_))
@@ -141,7 +141,7 @@ fn publish_refuses_a_bundle_base_the_store_does_not_have() {
         store.publish(&m),
         Err(StoreError::MissingBundleBase { base }) if base == ghost
     ));
-    assert!(store.catalog().snapshots().unwrap().is_empty());
+    assert!(store.snapshots().unwrap().is_empty());
 }
 
 #[test]
@@ -206,7 +206,7 @@ fn gc_keeps_shared_objects_and_removes_the_rest_after_the_grace() {
     let first = store.gc(t0, grace).unwrap();
     assert!(first.marked >= 2, "{first:?}");
     assert_eq!(first.removed_chunks, 0);
-    assert!(store.objects().contains(a_chunks[0]));
+    assert!(store.objects().object_path(a_chunks[0]).exists());
 
     let second = store.gc(t0 + grace / 2, grace).unwrap();
     assert_eq!(second.removed_chunks, 0);
@@ -214,15 +214,8 @@ fn gc_keeps_shared_objects_and_removes_the_rest_after_the_grace() {
     let third = store.gc(t0 + grace, grace).unwrap();
     assert_eq!(third.removed_chunks, first.marked);
     assert!(third.removed_bytes > 0);
-    assert!(!store.objects().contains(a_chunks[0]));
-    assert!(store.objects().contains(shared_chunks[0]));
-    assert!(
-        store
-            .catalog()
-            .chunk_ids()
-            .unwrap()
-            .contains(&shared_chunks[0])
-    );
+    assert!(!store.objects().object_path(a_chunks[0]).exists());
+    assert!(store.objects().object_path(shared_chunks[0]).exists());
     assert!(store.manifest(b).is_ok());
     assert!(store.check(CheckDepth::Hashes).unwrap().is_clean());
 }
@@ -239,11 +232,11 @@ fn gc_sweeps_orphan_objects_and_staged_files_only_after_the_grace() {
         .unwrap();
     assert_eq!(patient.removed_tmp, 1);
     assert_eq!(patient.removed_orphans, 0);
-    assert!(store.objects().contains(orphan.id));
+    assert!(store.objects().object_path(orphan.id).exists());
 
     let eager = store.gc(SystemTime::now(), Duration::ZERO).unwrap();
     assert_eq!(eager.removed_orphans, 1);
-    assert!(!store.objects().contains(orphan.id));
+    assert!(!store.objects().object_path(orphan.id).exists());
 }
 
 #[test]

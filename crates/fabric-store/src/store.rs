@@ -217,12 +217,6 @@ impl Store {
         &self.objects
     }
 
-    /// Returns the catalog, for reading rows.
-    #[must_use]
-    pub fn catalog(&self) -> &Catalog {
-        &self.catalog
-    }
-
     /// Every object a manifest reaches, in list order, bundle and exclude first.
     fn data_chunks(manifest: &SnapshotManifest) -> Vec<ChunkId> {
         let mut ids = Vec::new();
@@ -328,6 +322,11 @@ impl Store {
         }
         self.objects.mark_dirty(chunk);
         Ok(())
+    }
+
+    /// Returns the catalog row of every snapshot, oldest first.
+    pub fn snapshots(&self) -> Result<Vec<SnapshotRow>, StoreError> {
+        Ok(self.catalog.snapshots()?)
     }
 
     /// Returns the catalog row of a snapshot.

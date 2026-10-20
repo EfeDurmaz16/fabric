@@ -28,7 +28,7 @@ pub const SCHEMA_VERSION: i64 = 1;
 pub enum CatalogError {
     /// `SQLite` reported an error.
     #[error("catalog: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(SqliteError),
     /// The catalog was written by another schema version.
     #[error("catalog schema version {found}, this crate reads {expected}")]
     SchemaVersion {
@@ -55,6 +55,17 @@ pub enum CatalogError {
         #[source]
         source: io::Error,
     },
+}
+
+/// An error `SQLite` reported, kept opaque so the `SQLite` binding is not part of this crate's API.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct SqliteError(rusqlite::Error);
+
+impl From<rusqlite::Error> for CatalogError {
+    fn from(e: rusqlite::Error) -> Self {
+        CatalogError::Sqlite(SqliteError(e))
+    }
 }
 
 const SCHEMA: &str = "
@@ -118,7 +129,7 @@ pub(crate) struct ChunkRef {
 }
 
 /// The open catalog.
-pub struct Catalog {
+pub(crate) struct Catalog {
     conn: Connection,
 }
 
@@ -244,7 +255,7 @@ impl Catalog {
     }
 
     /// Returns the chunking parameters recorded at creation.
-    pub fn params(&self) -> Result<ChunkParams, CatalogError> {
+    pub(crate) fn params(&self) -> Result<ChunkParams, CatalogError> {
         ChunkParams::new(
             self.setting("whole_file_limit")?,
             self.setting("min_size")?,
@@ -271,7 +282,7 @@ impl Catalog {
         "id, job_id, parent, bundle_base, created_at, manifest_len";
 
     /// Returns one snapshot row, if the catalog has it.
-    pub fn snapshot(&self, id: SnapshotId) -> Result<Option<SnapshotRow>, CatalogError> {
+    pub(crate) fn snapshot(&self, id: SnapshotId) -> Result<Option<SnapshotRow>, CatalogError> {
         let sql = format!(
             "SELECT {} FROM snapshots WHERE id = ?1",
             Self::SNAPSHOT_COLUMNS
@@ -283,7 +294,7 @@ impl Catalog {
     }
 
     /// Returns every snapshot, oldest first.
-    pub fn snapshots(&self) -> Result<Vec<SnapshotRow>, CatalogError> {
+    pub(crate) fn snapshots(&self) -> Result<Vec<SnapshotRow>, CatalogError> {
         let sql = format!(
             "SELECT {} FROM snapshots ORDER BY created_at, id",
             Self::SNAPSHOT_COLUMNS
@@ -446,7 +457,7 @@ impl Catalog {
     }
 
     /// Returns true when some snapshot's bundle excludes the refs of `id`.
-    pub fn is_bundle_base(&self, id: SnapshotId) -> Result<bool, CatalogError> {
+    pub(crate) fn is_bundle_base(&self, id: SnapshotId) -> Result<bool, CatalogError> {
         let mut stmt = self
             .conn
             .prepare_cached("SELECT 1 FROM snapshots WHERE bundle_base = ?1")?;
@@ -454,7 +465,7 @@ impl Catalog {
     }
 
     /// Returns every snapshot whose bundle base has no row, with that base.
-    pub fn broken_chains(&self) -> Result<Vec<(SnapshotId, SnapshotId)>, CatalogError> {
+    pub(crate) fn broken_chains(&self) -> Result<Vec<(SnapshotId, SnapshotId)>, CatalogError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, bundle_base FROM snapshots
              WHERE bundle_base IS NOT NULL
@@ -471,7 +482,7 @@ impl Catalog {
     }
 
     /// Returns true when the catalog has a row for the chunk.
-    pub fn has_chunk(&self, id: ChunkId) -> Result<bool, CatalogError> {
+    pub(crate) fn has_chunk(&self, id: ChunkId) -> Result<bool, CatalogError> {
         let mut stmt = self
             .conn
             .prepare_cached("SELECT 1 FROM chunks WHERE id = ?1")?;
@@ -479,14 +490,14 @@ impl Catalog {
     }
 
     /// Returns every chunk id the catalog has a row for.
-    pub fn chunk_ids(&self) -> Result<HashSet<ChunkId>, CatalogError> {
+    pub(crate) fn chunk_ids(&self) -> Result<HashSet<ChunkId>, CatalogError> {
         let mut stmt = self.conn.prepare("SELECT id FROM chunks")?;
         let rows = stmt.query_map([], |r| Ok(ChunkId::from_bytes(r.get(0)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Returns the chunks whose stored refcount differs from the count of rows naming them.
-    pub fn refcount_mismatches(&self) -> Result<Vec<ChunkId>, CatalogError> {
+    pub(crate) fn refcount_mismatches(&self) -> Result<Vec<ChunkId>, CatalogError> {
         let mut stmt = self.conn.prepare(
             "SELECT c.id FROM chunks c
              WHERE c.refcount != (SELECT COUNT(*) FROM snapshot_chunks sc WHERE sc.chunk_id = c.id)",

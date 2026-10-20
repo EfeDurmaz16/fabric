@@ -69,7 +69,7 @@ fn map(errno: Errno, path: &Path) -> WriteError {
 
 /// A writer bound to one root directory.
 #[derive(Debug)]
-pub struct TreeWriter {
+pub(crate) struct TreeWriter {
     root: OwnedFd,
 }
 

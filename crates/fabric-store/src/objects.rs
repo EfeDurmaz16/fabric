@@ -245,12 +245,6 @@ impl ObjectStore {
         self.objects_dir.join(&hex[..2]).join(hex)
     }
 
-    /// Returns true when an object file with `id` exists; it does not verify it.
-    #[must_use]
-    pub fn contains(&self, id: ChunkId) -> bool {
-        self.object_path(id).is_file()
-    }
-
     /// Returns the on-disk length of the object, or `Missing`.
     pub fn stored_len(&self, id: ChunkId) -> Result<u64, ObjectError> {
         let path = self.object_path(id);

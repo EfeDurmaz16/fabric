@@ -42,7 +42,7 @@ fn an_object_is_written_once_and_read_back_verified() {
     assert_eq!(second.id, first.id);
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
     assert_eq!(objects.read(first.id).unwrap(), b"hello");
-    assert!(objects.contains(first.id));
+    assert!(objects.object_path(first.id).exists());
     assert_eq!(fs::read_dir(dir.path().join("tmp")).unwrap().count(), 0);
 }
 

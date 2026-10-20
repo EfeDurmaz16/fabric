@@ -63,7 +63,7 @@ pub const CACHE_SECRET_PATTERNS: &[&str] = &[
 
 /// A directory name that holds a cache, and the files that make it one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CacheDir {
+pub(crate) struct CacheDir {
     /// The directory name.
     pub name: &'static str,
     /// The class of everything under it.
@@ -88,7 +88,7 @@ const NODE: &[&str] = &["package.json"];
 const PYTHON_OR_NODE: &[&str] = &["package.json", "pyproject.toml", "setup.py"];
 
 /// The cache directories every policy starts with.
-pub const CACHE_DIRS: &[CacheDir] = &[
+pub(crate) const CACHE_DIRS: &[CacheDir] = &[
     cache_dir("node_modules", CacheClass::Deps, &[]),
     cache_dir(".pnpm-store", CacheClass::Deps, &[]),
     cache_dir(".venv", CacheClass::Deps, &[]),
@@ -283,10 +283,18 @@ fn glob(pattern: &str, text: &str) -> bool {
 /// The policy for one capture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IgnorePolicy {
-    cache_dirs: Vec<(String, CacheClass, &'static [&'static str])>,
+    cache_dirs: Vec<CacheRule>,
     secrets: Vec<Pattern>,
     cache_secrets: Vec<Pattern>,
     excludes: Vec<Pattern>,
+}
+
+/// A directory name the policy treats as a cache, with the files that make it one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CacheRule {
+    name: String,
+    class: CacheClass,
+    markers: &'static [&'static str],
 }
 
 fn patterns(list: &[&str]) -> Vec<Pattern> {
@@ -298,7 +306,11 @@ impl Default for IgnorePolicy {
         IgnorePolicy {
             cache_dirs: CACHE_DIRS
                 .iter()
-                .map(|d| (d.name.to_owned(), d.class, d.markers))
+                .map(|d| CacheRule {
+                    name: d.name.to_owned(),
+                    class: d.class,
+                    markers: d.markers,
+                })
                 .collect(),
             secrets: patterns(SECRET_PATTERNS),
             cache_secrets: patterns(CACHE_SECRET_PATTERNS),
@@ -311,8 +323,12 @@ impl IgnorePolicy {
     /// Makes every directory named `name` a cache of `class`, with no marker needed.
     pub fn add_cache_dir(&mut self, class: CacheClass, name: &str) {
         self.cache_dirs
-            .retain(|(n, _, _)| !n.eq_ignore_ascii_case(name));
-        self.cache_dirs.push((name.to_owned(), class, &[]));
+            .retain(|rule| !rule.name.eq_ignore_ascii_case(name));
+        self.cache_dirs.push(CacheRule {
+            name: name.to_owned(),
+            class,
+            markers: &[],
+        });
     }
 
     /// Widens the secret list, in both the full and the narrow form.
@@ -368,12 +384,13 @@ impl IgnorePolicy {
         i: usize,
         markers: &mut dyn Markers,
     ) -> Option<CacheClass> {
-        let (_, class, needs) = self
+        let rule = self
             .cache_dirs
             .iter()
-            .find(|(name, _, _)| name.eq_ignore_ascii_case(comps[i]))?;
+            .find(|rule| rule.name.eq_ignore_ascii_case(comps[i]))?;
         let parent = comps[..i].join("/");
-        (needs.is_empty() || needs.iter().any(|m| markers.has(&parent, m))).then_some(*class)
+        (rule.markers.is_empty() || rule.markers.iter().any(|m| markers.has(&parent, m)))
+            .then_some(rule.class)
     }
 
     /// Classifies one ignored path; `markers` says which tool files sit where.
