@@ -179,7 +179,7 @@ impl GitConfigValue {
     /// Returns true when the value is a `scheme://` URL whose authority holds
     /// a credential, by the rule of `credential_range`.
     #[must_use]
-    pub fn has_userinfo(&self) -> bool {
+    pub fn has_credential(&self) -> bool {
         credential_range(&self.0).is_some()
     }
 }
@@ -215,9 +215,9 @@ pub fn credential_range(url: &str) -> Option<std::ops::Range<usize>> {
 /// key fails to decode.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GitConfigKey {
-    /// `remote.<name>.url`; userinfo is stripped at capture and refused on decode.
+    /// `remote.<name>.url`; a credential in it is stripped at capture and refused on decode.
     RemoteUrl(RemoteName),
-    /// `remote.<name>.pushurl`; userinfo is stripped at capture and refused on decode.
+    /// `remote.<name>.pushurl`; a credential in it is stripped at capture and refused on decode.
     RemotePushUrl(RemoteName),
     /// `remote.<name>.fetch`.
     RemoteFetch(RemoteName),
@@ -238,7 +238,7 @@ pub enum GitConfigKey {
 }
 
 impl GitConfigKey {
-    /// Returns true for the keys whose value is a remote URL, which must carry no userinfo.
+    /// Returns true for the keys whose value is a remote URL, which must carry no credential.
     #[must_use]
     pub const fn is_remote_url(&self) -> bool {
         matches!(
@@ -413,8 +413,8 @@ mod tests {
     }
 
     #[test]
-    fn a_url_value_knows_when_it_carries_userinfo() {
-        let with = |v: &str| GitConfigValue::parse(v).unwrap().has_userinfo();
+    fn a_url_value_knows_when_it_carries_a_credential() {
+        let with = |v: &str| GitConfigValue::parse(v).unwrap().has_credential();
         assert!(with("https://efe:ghp_secret123@github.com/x/y.git"));
         assert!(with("https://token@github.com/x/y.git"));
         assert!(!with("ssh://git@github.com/x/y.git"));

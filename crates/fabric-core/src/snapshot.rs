@@ -49,8 +49,8 @@ pub enum ManifestError {
         /// Zero-based index of the entry, within its tree.
         index: usize,
     },
-    /// A remote URL in the config projection carries userinfo, which is where a token lives.
-    #[error("config entry {index} is a remote URL with userinfo")]
+    /// A remote URL in the config projection carries a credential (`credential_range`), which is where a token lives.
+    #[error("config entry {index} is a remote URL with a credential")]
     SecretInConfig {
         /// Zero-based index of the entry, within `config`.
         index: usize,
@@ -281,7 +281,7 @@ impl CarryKey {
 /// Every name in it is a parsed type from `crate::git`, so a manifest from a
 /// peer cannot hold a config key outside the allowlist, a ref name git would
 /// refuse, or a value that reads as an option on a command line; `validate`
-/// adds that a remote URL carries no userinfo.
+/// adds that a remote URL carries no credential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitState {
     /// The objects of the git bundle, full or incremental.
@@ -368,11 +368,11 @@ impl SnapshotManifest {
                 git.worktree_mtimes.iter().map(|(p, _)| p),
             )?;
             check_sorted("config", git.config.iter().map(|(key, _)| key))?;
-            // ADR 0004 strips userinfo at capture; the receiving node holds
+            // ADR 0004 strips credentials at capture; the receiving node holds
             // the same line, or a token in remote.origin.url would be written
             // into every target's .git/config.
             for (index, (key, value)) in git.config.iter().enumerate() {
-                if key.is_remote_url() && value.has_userinfo() {
+                if key.is_remote_url() && value.has_credential() {
                     return Err(ManifestError::SecretInConfig { index });
                 }
             }
