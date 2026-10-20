@@ -585,7 +585,9 @@ impl Detection {
 pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, DetectError> {
     let root = fs::canonicalize(root).map_err(|source| DetectError::Root { source })?;
     let root = root.as_path();
-    let recorded = policy(previous.map_or(&[][..], |spec| spec.secret_patterns.as_slice()));
+    let recorded = SecretPolicy::from_patterns(
+        previous.map_or(&[][..], |spec| spec.secret_patterns.as_slice()),
+    );
     let first = Reader {
         root,
         secrets: &recorded,
@@ -595,7 +597,7 @@ pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, Dete
         None => EnvOverride::default(),
     };
     let secret_patterns = job_secret_patterns(previous, &overrides.secret_patterns);
-    let secrets = policy(&secret_patterns);
+    let secrets = SecretPolicy::from_patterns(&secret_patterns);
     let reader = Reader {
         root,
         secrets: &secrets,
@@ -720,15 +722,6 @@ fn merge_declared_caches(
         });
     }
     Ok(())
-}
-
-/// Returns the built-in policy widened by `patterns`.
-fn policy(patterns: &[SecretPattern]) -> SecretPolicy {
-    let mut policy = SecretPolicy::default();
-    for pattern in patterns {
-        policy.widen(pattern.clone());
-    }
-    policy
 }
 
 /// Returns the job's secret patterns: every one its previous spec held, plus the override file's, sorted.

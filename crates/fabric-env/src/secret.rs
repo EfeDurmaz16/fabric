@@ -99,6 +99,18 @@ pub struct SecretPolicy {
 }
 
 impl SecretPolicy {
+    /// Returns the built-in policy widened by `patterns`, such as the `secret_patterns` of a job's `EnvSpec`.
+    ///
+    /// This is how a node applies a job's list to a capture, whichever node
+    /// recorded it.
+    pub fn from_patterns(patterns: &[SecretPattern]) -> Self {
+        let mut policy = Self::default();
+        for pattern in patterns {
+            policy.widen(pattern.clone());
+        }
+        policy
+    }
+
     /// Adds a pattern that applies in every scope. Adding one twice changes nothing.
     pub fn widen(&mut self, pattern: SecretPattern) {
         if !self.added.contains(&pattern) {
