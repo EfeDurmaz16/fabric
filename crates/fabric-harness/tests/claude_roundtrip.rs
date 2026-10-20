@@ -14,10 +14,10 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 use fabric_core::env::EnvVarName;
-use fabric_core::path::{AbsPath, RelPath};
+use fabric_core::path::AbsPath;
 use fabric_harness::claude::ClaudeCode;
 use fabric_harness::claude::flags::{LaunchFlags, PermissionMode};
-use fabric_harness::manifest::{Carried, Content, Digest, Mutability};
+use fabric_harness::manifest::StateManifest;
 use fabric_harness::{Harness, HarnessError, Io, Launch, SessionId};
 
 mod common;
@@ -245,7 +245,11 @@ async fn capture_carries_session_state_only_and_redacts() {
         .await
         .unwrap();
 
-    let paths: Vec<&str> = manifest.files.iter().map(|f| f.rel_path.as_str()).collect();
+    let paths: Vec<&str> = manifest
+        .files()
+        .iter()
+        .map(|f| f.rel_path.as_str())
+        .collect();
     let key = project_key(&src.work);
     assert!(paths.contains(&format!("home/.claude/projects/{key}/{SID}.jsonl").as_str()));
     assert!(
@@ -282,11 +286,11 @@ async fn capture_carries_session_state_only_and_redacts() {
             "{denied} was carried: {paths:?}"
         );
     }
-    assert_eq!(manifest.harness_version.as_deref(), Some("2.1.294"));
+    assert_eq!(manifest.harness_version(), Some("2.1.294"));
     let rules: Vec<(&str, u32)> = manifest
-        .redactions
+        .redactions()
         .iter()
-        .map(|r| (r.rule.as_str(), r.count))
+        .map(|r| (r.rule(), r.count()))
         .collect();
     assert_eq!(
         rules,
@@ -313,7 +317,7 @@ async fn capture_carries_session_state_only_and_redacts() {
     assert!(staged.contains(r#"[{"type":"text","text":"noted"}]"#));
     assert_eq!(mode(&staged_path), 0o600);
     assert_sidecars_redacted(out.path(), &key);
-    for file in &manifest.files {
+    for file in manifest.files() {
         let bytes = std::fs::read(out.path().join(file.rel_path.as_str())).unwrap();
         assert_eq!(file.size, bytes.len() as u64);
         assert_eq!(
@@ -419,8 +423,8 @@ async fn restore_on_a_fresh_node_places_the_staged_bytes_and_protects_what_is_th
     set_aside(&home, ".claude-pro");
 
     let restored = adapter.restore(&src.work, out.path()).await.unwrap();
-    assert_eq!(restored.placed.len(), manifest.files.len());
-    for file in &manifest.files {
+    assert_eq!(restored.placed.len(), manifest.files().len());
+    for file in manifest.files() {
         let rest = file.rel_path.as_str().strip_prefix("home/").unwrap();
         let placed = home.join(rest);
         assert_eq!(
@@ -446,7 +450,7 @@ async fn restore_on_a_fresh_node_places_the_staged_bytes_and_protects_what_is_th
     // A divergence in the last file of the manifest stops the restore
     // before the first file is written.
     std::fs::write(&transcript, &text).unwrap();
-    let last = manifest.files.last().unwrap();
+    let last = manifest.files().last().unwrap();
     let last_placed = home.join(last.rel_path.as_str().strip_prefix("home/").unwrap());
     std::fs::write(&last_placed, "edited here\n").unwrap();
     std::fs::remove_file(&transcript).unwrap();
@@ -459,6 +463,22 @@ async fn restore_on_a_fresh_node_places_the_staged_bytes_and_protects_what_is_th
         !transcript.exists(),
         "nothing before the divergent file was placed"
     );
+}
+
+/// Writes `manifest` under `out` with one more entry, for `body` at `rel`,
+/// as someone who forged the tree would.
+fn forge(out: &Path, manifest: &StateManifest, rel: &str, body: &[u8]) {
+    let mut value = serde_json::to_value(manifest).unwrap();
+    let files = value["files"].as_array_mut().unwrap();
+    files.push(serde_json::json!({
+        "rel_path": rel,
+        "content": "Opaque",
+        "mutability": "Replaceable",
+        "size": body.len(),
+        "blake3": blake3::hash(body).to_hex().to_string(),
+    }));
+    files.sort_by(|a, b| a["rel_path"].as_str().cmp(&b["rel_path"].as_str()));
+    std::fs::write(out.join("manifest.json"), value.to_string()).unwrap();
 }
 
 #[tokio::test]
@@ -482,16 +502,7 @@ async fn a_manifest_naming_a_file_outside_session_state_is_refused() {
         let staged = out.path().join(rel);
         std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
         std::fs::write(&staged, body).unwrap();
-        let mut forged = manifest.clone();
-        forged.files.push(Carried {
-            rel_path: RelPath::parse(rel).unwrap(),
-            content: Content::Opaque,
-            mutability: Mutability::Replaceable,
-            size: body.len() as u64,
-            blake3: Digest::from_hash(blake3::hash(body)),
-        });
-        forged.files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-        forged.write(out.path()).unwrap();
+        forge(out.path(), &manifest, rel, body);
         let err = adapter.restore(&src.work, out.path()).await.unwrap_err();
         if expect_denied {
             assert!(matches!(err, HarnessError::Denied { .. }), "{err}");

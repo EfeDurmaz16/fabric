@@ -252,6 +252,9 @@ pub enum HarnessError {
         /// The overlay file.
         path: PathBuf,
     },
+    /// A manifest breaks the rules of `manifest`.
+    #[error("manifest: {0}")]
+    BadManifest(#[from] crate::manifest::ManifestError),
     /// A standard redaction rule does not compile, so nothing is captured.
     #[error(transparent)]
     BadRedactionRule(#[from] BadRule),

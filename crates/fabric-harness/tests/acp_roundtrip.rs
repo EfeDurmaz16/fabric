@@ -244,9 +244,9 @@ async fn round_trip(load: &str, resume: &str) -> Result<(PathBuf, Value), Harnes
     .unwrap();
     let out = tempfile::tempdir().unwrap();
     let manifest = adapter.capture(&work, &session, out.path()).await?;
-    assert_eq!(manifest.files.len(), 1);
+    assert_eq!(manifest.files().len(), 1);
     assert_eq!(
-        manifest.files[0].rel_path.as_str(),
+        manifest.files()[0].rel_path.as_str(),
         format!("home/.fake-agent/sessions/{session}.json")
     );
 
@@ -421,7 +421,11 @@ async fn only_files_named_for_the_session_are_captured() {
         .capture(&work, &SessionId::parse("s1").unwrap(), out.path())
         .await
         .unwrap();
-    let paths: Vec<&str> = manifest.files.iter().map(|f| f.rel_path.as_str()).collect();
+    let paths: Vec<&str> = manifest
+        .files()
+        .iter()
+        .map(|f| f.rel_path.as_str())
+        .collect();
     assert_eq!(
         paths,
         vec![

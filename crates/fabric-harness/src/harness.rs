@@ -267,16 +267,16 @@ pub(crate) fn same_place(
     home: &Path,
 ) -> Result<(), HarnessError> {
     let root = abs_path(root)?;
-    if manifest.root != root {
+    if *manifest.root() != root {
         return Err(HarnessError::RootMismatch {
-            from: manifest.root.clone(),
+            from: manifest.root().clone(),
             to: root,
         });
     }
     let home = abs_path(home)?;
-    if manifest.home != home {
+    if *manifest.home() != home {
         return Err(HarnessError::HomeMismatch {
-            from: manifest.home.clone(),
+            from: manifest.home().clone(),
             to: home,
         });
     }

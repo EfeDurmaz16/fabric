@@ -46,9 +46,7 @@ use crate::departure::{self, Departure};
 use crate::error::HarnessError;
 use crate::files::{self, Carry, Placement, Source};
 use crate::harness::{self, Harness, Installed, Io, Launch, Restored, Running};
-use crate::manifest::{
-    HOME_PREFIX, MANIFEST_FORMAT, Mutability, Redaction, StateManifest, under_home,
-};
+use crate::manifest::{HOME_PREFIX, Mutability, StateManifest, under_home};
 use crate::process;
 use crate::redact::RedactionCounts;
 use crate::session::SessionId;
@@ -482,25 +480,17 @@ impl ClaudeCode {
         let sources = self.sources_for(root, session, &mut counts)?;
         let carried = files::stage(&sources, out, &mut counts)?;
         Departure::of(&sources)?.write(&self.departure_path(session))?;
-        let manifest = StateManifest {
-            format: MANIFEST_FORMAT,
-            kind: HarnessKind::ClaudeCode,
-            session: session.clone(),
-            root: harness::abs_path(root)?,
-            home: harness::abs_path(&self.home)?,
-            harness_version: version,
-            captured_at_ms: process::now_ms(),
-            files: carried,
-            redactions: counts
-                .into_iter()
-                .map(|(rule, count)| Redaction {
-                    rule: rule.to_owned(),
-                    count,
-                })
-                .collect(),
-        };
+        let manifest = StateManifest::new(
+            HarnessKind::ClaudeCode,
+            session.clone(),
+            harness::abs_path(root)?,
+            harness::abs_path(&self.home)?,
+            version,
+            carried,
+            &counts,
+        )?;
         manifest.write(out)?;
-        info!(%session, files = manifest.files.len(), "claude: captured");
+        info!(%session, files = manifest.files().len(), "claude: captured");
         Ok(manifest)
     }
 
@@ -532,8 +522,8 @@ impl ClaudeCode {
         manifest: StateManifest,
     ) -> Result<Restored, HarnessError> {
         let root_key = Self::key_of(root)?;
-        let mut placements = Vec::with_capacity(manifest.files.len());
-        for file in &manifest.files {
+        let mut placements = Vec::with_capacity(manifest.files().len());
+        for file in manifest.files() {
             let rel = file.rel_path.as_str();
             if let Some(rule) = denylist::check(rel) {
                 return Err(HarnessError::Denied {
@@ -542,7 +532,7 @@ impl ClaudeCode {
                 });
             }
             let rest =
-                under_home(rel).filter(|_| Self::restorable(rel, &manifest.session, &root_key));
+                under_home(rel).filter(|_| Self::restorable(rel, manifest.session(), &root_key));
             let Some(rest) = rest else {
                 return Err(HarnessError::UnexpectedFile {
                     kind: HarnessKind::ClaudeCode,
@@ -564,26 +554,26 @@ impl ClaudeCode {
                 mutability: file.mutability,
             });
         }
-        files::verify(state, &manifest.files)?;
-        let departure = Departure::read(&self.departure_path(&manifest.session))?;
+        files::verify(state, manifest.files())?;
+        let departure = Departure::read(&self.departure_path(manifest.session()))?;
         let placed = files::place_all(&placements, &departure)?;
-        info!(session = %manifest.session, files = placed.len(), "claude: restored");
+        info!(session = %manifest.session(), files = placed.len(), "claude: restored");
         Ok(Restored { manifest, placed })
     }
 
     async fn restore_impl(&self, workspace: &Path, state: &Path) -> Result<Restored, HarnessError> {
         let root = harness::physical_workspace(workspace)?;
         let manifest = StateManifest::read(state)?;
-        if manifest.kind != HarnessKind::ClaudeCode {
+        if *manifest.kind() != HarnessKind::ClaudeCode {
             return Err(HarnessError::WrongHarness {
-                captured: manifest.kind.clone(),
+                captured: manifest.kind().clone(),
                 restoring: HarnessKind::ClaudeCode,
             });
         }
         harness::same_place(&manifest, &root, &self.home)?;
         let version = self.installed_version().await;
         let pids = self
-            .session_writers(&manifest.session, version.as_deref())
+            .session_writers(manifest.session(), version.as_deref())
             .await?;
         if !pids.is_empty() {
             return Err(HarnessError::HarnessRunning {

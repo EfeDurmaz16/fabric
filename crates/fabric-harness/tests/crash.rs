@@ -174,7 +174,7 @@ async fn a_capture_killed_part_way_leaves_no_tree_a_fresh_node_would_accept_by_m
             // The manifest is the last write; everything it lists is whole.
             restore.unwrap();
             let manifest = StateManifest::read(out.path()).unwrap();
-            assert_eq!(manifest.files.len(), SIDECARS + 1);
+            assert_eq!(manifest.files().len(), SIDECARS + 1);
             std::fs::remove_dir_all(home.join(".claude")).unwrap();
             finished += 1;
         } else {
@@ -241,7 +241,7 @@ async fn a_capture_killed_in_a_reused_directory_leaves_no_stale_manifest() {
         }
         if out.path().join("manifest.json").exists() {
             let manifest = StateManifest::read(out.path()).unwrap();
-            for file in &manifest.files {
+            for file in manifest.files() {
                 let bytes = std::fs::read(out.path().join(file.rel_path.as_str())).unwrap();
                 assert_eq!(
                     file.blake3.to_string(),
@@ -316,9 +316,9 @@ async fn a_restore_killed_part_way_places_only_whole_files_and_converges() {
         .unwrap();
     assert!(
         manifest
-            .files
+            .files()
             .iter()
             .all(|f| !f.rel_path.as_str().contains(".fabric-tmp-"))
     );
-    assert_eq!(manifest.files.len(), SIDECARS + 1);
+    assert_eq!(manifest.files().len(), SIDECARS + 1);
 }

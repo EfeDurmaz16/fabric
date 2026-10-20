@@ -17,6 +17,7 @@ use fabric_core::path::{AbsPath, RelPath};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::HarnessError;
+use crate::redact::RedactionCounts;
 use crate::session::SessionId;
 
 /// The file name of the manifest inside a captured state tree.
@@ -35,27 +36,90 @@ pub fn under_home(rel: &str) -> Option<&str> {
     rel.strip_prefix(HOME_PREFIX)?.strip_prefix('/')
 }
 
-/// What one capture produced.
+/// What one capture produced. Its fields are private: a manifest is
+/// built by `StateManifest::new` or read from a file, and both check the
+/// rules of this module, so an invalid one cannot be passed around.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Unchecked")]
 pub struct StateManifest {
-    /// The manifest format version.
-    pub format: u16,
-    /// The harness that captured the state.
-    pub kind: HarnessKind,
-    /// The session the state belongs to.
-    pub session: SessionId,
-    /// The physical workspace path at capture.
-    pub root: AbsPath,
-    /// The home directory at capture.
-    pub home: AbsPath,
-    /// The harness version at capture, when the binary was found.
-    pub harness_version: Option<String>,
-    /// Unix milliseconds at capture; informational.
-    pub captured_at_ms: u64,
-    /// Every file in the tree except this manifest; sorted by path.
-    pub files: Vec<Carried>,
-    /// How many matches each redaction rule removed, over the whole tree.
-    pub redactions: Vec<Redaction>,
+    format: u16,
+    kind: HarnessKind,
+    session: SessionId,
+    root: AbsPath,
+    home: AbsPath,
+    harness_version: Option<String>,
+    captured_at_ms: u64,
+    files: Vec<Carried>,
+    redactions: Vec<Redaction>,
+}
+
+/// A manifest as read, before its rules are checked.
+#[derive(Deserialize)]
+struct Unchecked {
+    format: u16,
+    kind: HarnessKind,
+    session: SessionId,
+    root: AbsPath,
+    home: AbsPath,
+    harness_version: Option<String>,
+    captured_at_ms: u64,
+    files: Vec<Carried>,
+    redactions: Vec<Redaction>,
+}
+
+impl TryFrom<Unchecked> for StateManifest {
+    type Error = ManifestError;
+
+    fn try_from(raw: Unchecked) -> Result<Self, ManifestError> {
+        let manifest = StateManifest {
+            format: raw.format,
+            kind: raw.kind,
+            session: raw.session,
+            root: raw.root,
+            home: raw.home,
+            harness_version: raw.harness_version,
+            captured_at_ms: raw.captured_at_ms,
+            files: raw.files,
+            redactions: raw.redactions,
+        };
+        manifest.check()?;
+        Ok(manifest)
+    }
+}
+
+/// Why a manifest breaks the rules of this module.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ManifestError {
+    /// The format is not the one this crate writes.
+    #[error("format {found} is not {MANIFEST_FORMAT}")]
+    Format {
+        /// The format found.
+        found: u16,
+    },
+    /// A file is not under `home/`.
+    #[error("file {index} ({path}) is not under {HOME_PREFIX}/")]
+    NotUnderHome {
+        /// Its position in the list.
+        index: usize,
+        /// Its tree path.
+        path: String,
+    },
+    /// A file is a temporary file of this crate.
+    #[error("file {index} ({path}) is a temporary file of this crate")]
+    TemporaryFile {
+        /// Its position in the list.
+        index: usize,
+        /// Its tree path.
+        path: String,
+    },
+    /// A file is not strictly after the one before it.
+    #[error("file {index} ({path}) is not strictly after the one before it")]
+    NotSorted {
+        /// Its position in the list.
+        index: usize,
+        /// Its tree path.
+        path: String,
+    },
 }
 
 /// One file of the state tree.
@@ -100,6 +164,11 @@ pub enum Mutability {
     Replaceable,
 }
 
+/// Text that is not a 64-character hex digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("not a 64-character hex BLAKE3 digest")]
+pub struct DigestError;
+
 /// A `BLAKE3` digest, written as 64 hex characters.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Digest([u8; 32]);
@@ -112,8 +181,8 @@ impl Digest {
     }
 
     /// Parses the 64-character hex form.
-    pub fn parse(text: &str) -> Result<Self, String> {
-        let hash = blake3::Hash::from_hex(text).map_err(|e| e.to_string())?;
+    pub fn parse(text: &str) -> Result<Self, DigestError> {
+        let hash = blake3::Hash::from_hex(text).map_err(|_| DigestError)?;
         Ok(Self::from_hash(hash))
     }
 }
@@ -146,53 +215,156 @@ impl<'de> Deserialize<'de> for Digest {
 /// How many matches one redaction rule removed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Redaction {
-    /// The rule name.
-    pub rule: String,
+    rule: RuleName,
+    count: u32,
+}
+
+impl Redaction {
+    /// The rule name, such as `github-token` or `signed-block-dropped`.
+    #[must_use]
+    pub fn rule(&self) -> &str {
+        self.rule.0.as_str()
+    }
+
     /// The match count.
-    pub count: u32,
+    #[must_use]
+    pub fn count(&self) -> u32 {
+        self.count
+    }
+}
+
+/// A redaction rule name: lower-case ASCII letters, digits and `-`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+struct RuleName(String);
+
+impl TryFrom<String> for RuleName {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<Self, String> {
+        let ok = !text.is_empty()
+            && text
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if ok {
+            Ok(RuleName(text))
+        } else {
+            Err(format!("{text:?} is not a redaction rule name"))
+        }
+    }
 }
 
 impl StateManifest {
-    /// Checks the manifest's own rules.
-    pub fn validate(&self, path: &Path) -> Result<(), HarnessError> {
-        let malformed = |reason: String| HarnessError::Malformed {
-            what: "manifest",
-            path: path.to_path_buf(),
-            reason,
+    /// Builds the manifest of one capture, sorting `files` by path and
+    /// checking the rules of this module.
+    #[cfg_attr(
+        not(any(feature = "acp", feature = "claude", feature = "codex")),
+        allow(dead_code, reason = "used by the adapters; none is enabled")
+    )]
+    pub(crate) fn new(
+        kind: HarnessKind,
+        session: SessionId,
+        root: AbsPath,
+        home: AbsPath,
+        harness_version: Option<String>,
+        mut files: Vec<Carried>,
+        counts: &RedactionCounts,
+    ) -> Result<Self, ManifestError> {
+        files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        let redactions = counts
+            .iter()
+            .map(|(rule, count)| Redaction {
+                rule: RuleName((*rule).to_owned()),
+                count: *count,
+            })
+            .collect();
+        let manifest = StateManifest {
+            format: MANIFEST_FORMAT,
+            kind,
+            session,
+            root,
+            home,
+            harness_version,
+            captured_at_ms: crate::process::now_ms(),
+            files,
+            redactions,
         };
+        manifest.check()?;
+        Ok(manifest)
+    }
+
+    fn check(&self) -> Result<(), ManifestError> {
         if self.format != MANIFEST_FORMAT {
-            return Err(malformed(format!(
-                "format {} is not {MANIFEST_FORMAT}",
-                self.format
-            )));
+            return Err(ManifestError::Format { found: self.format });
         }
         let mut previous: Option<&RelPath> = None;
         for (index, file) in self.files.iter().enumerate() {
-            let text = file.rel_path.as_str();
-            if under_home(text).is_none() {
-                return Err(malformed(format!(
-                    "file {index} ({text}) is not under {HOME_PREFIX}/"
-                )));
+            let path = file.rel_path.as_str().to_owned();
+            if under_home(&path).is_none() {
+                return Err(ManifestError::NotUnderHome { index, path });
             }
-            if text.split('/').any(crate::files::is_temp_name) {
-                return Err(malformed(format!(
-                    "file {index} ({text}) is a temporary file of this crate"
-                )));
+            if path.split('/').any(crate::files::is_temp_name) {
+                return Err(ManifestError::TemporaryFile { index, path });
             }
             if previous.is_some_and(|p| p >= &file.rel_path) {
-                return Err(malformed(format!(
-                    "file {index} ({text}) is not strictly after the one before it"
-                )));
+                return Err(ManifestError::NotSorted { index, path });
             }
             previous = Some(&file.rel_path);
         }
         Ok(())
     }
 
+    /// The harness that captured the state.
+    #[must_use]
+    pub fn kind(&self) -> &HarnessKind {
+        &self.kind
+    }
+
+    /// The session the state belongs to.
+    #[must_use]
+    pub fn session(&self) -> &SessionId {
+        &self.session
+    }
+
+    /// The physical workspace path at capture.
+    #[must_use]
+    pub fn root(&self) -> &AbsPath {
+        &self.root
+    }
+
+    /// The home directory at capture.
+    #[must_use]
+    pub fn home(&self) -> &AbsPath {
+        &self.home
+    }
+
+    /// The harness version at capture, when the binary was found.
+    #[must_use]
+    pub fn harness_version(&self) -> Option<&str> {
+        self.harness_version.as_deref()
+    }
+
+    /// Unix milliseconds at capture; informational.
+    #[must_use]
+    pub fn captured_at_ms(&self) -> u64 {
+        self.captured_at_ms
+    }
+
+    /// Every file in the tree except this manifest, sorted by path.
+    #[must_use]
+    pub fn files(&self) -> &[Carried] {
+        &self.files
+    }
+
+    /// How many matches each redaction rule removed, over the whole tree.
+    #[must_use]
+    pub fn redactions(&self) -> &[Redaction] {
+        &self.redactions
+    }
+
     /// Writes the manifest as `MANIFEST_FILE` under `out`.
     pub fn write(&self, out: &Path) -> Result<(), HarnessError> {
         let path = out.join(MANIFEST_FILE);
-        self.validate(&path)?;
         let bytes = serde_json::to_vec_pretty(self).map_err(|e| HarnessError::Malformed {
             what: "manifest",
             path: path.clone(),
@@ -201,18 +373,15 @@ impl StateManifest {
         crate::files::write_atomic(&path, &bytes)
     }
 
-    /// Reads and checks the manifest under `state`.
+    /// Reads the manifest under `state`, checking its rules.
     pub fn read(state: &Path) -> Result<Self, HarnessError> {
         let path = state.join(MANIFEST_FILE);
         let bytes = std::fs::read(&path).map_err(|e| HarnessError::io("read", &path, e))?;
-        let manifest: StateManifest =
-            serde_json::from_slice(&bytes).map_err(|e| HarnessError::Malformed {
-                what: "manifest",
-                path: path.clone(),
-                reason: e.to_string(),
-            })?;
-        manifest.validate(&path)?;
-        Ok(manifest)
+        serde_json::from_slice(&bytes).map_err(|e| HarnessError::Malformed {
+            what: "manifest",
+            path,
+            reason: e.to_string(),
+        })
     }
 }
 
@@ -220,18 +389,18 @@ impl StateManifest {
 mod tests {
     use super::*;
 
-    fn manifest(files: Vec<Carried>) -> StateManifest {
-        StateManifest {
-            format: MANIFEST_FORMAT,
-            kind: HarnessKind::ClaudeCode,
-            session: SessionId::parse("s1").unwrap(),
-            root: AbsPath::parse("/w").unwrap(),
-            home: AbsPath::parse("/h").unwrap(),
-            harness_version: None,
-            captured_at_ms: 0,
+    fn manifest(files: Vec<Carried>) -> Result<StateManifest, ManifestError> {
+        let mut counts = RedactionCounts::new();
+        counts.insert("github-token", 2);
+        StateManifest::new(
+            HarnessKind::ClaudeCode,
+            SessionId::parse("s1").unwrap(),
+            AbsPath::parse("/w").unwrap(),
+            AbsPath::parse("/h").unwrap(),
+            None,
             files,
-            redactions: vec![],
-        }
+            &counts,
+        )
     }
 
     fn carried(path: &str) -> Carried {
@@ -246,47 +415,50 @@ mod tests {
 
     #[test]
     fn files_must_be_sorted_and_under_home() {
-        let path = Path::new("m");
-        assert!(
-            manifest(vec![carried("home/a"), carried("home/b")])
-                .validate(path)
-                .is_ok()
-        );
-        assert!(
-            manifest(vec![carried("home/b"), carried("home/a")])
-                .validate(path)
-                .is_err()
-        );
-        assert!(
-            manifest(vec![carried("home/a"), carried("home/a")])
-                .validate(path)
-                .is_err()
-        );
-        assert!(
-            manifest(vec![carried("homework/a")])
-                .validate(path)
-                .is_err()
-        );
-        assert!(
-            manifest(vec![carried("workspace/a")])
-                .validate(path)
-                .is_err()
-        );
-        assert!(
-            manifest(vec![carried("home/.a.fabric-tmp-1-2")])
-                .validate(path)
-                .is_err()
-        );
+        let ok = manifest(vec![carried("home/b"), carried("home/a")]).unwrap();
+        let paths: Vec<&str> = ok.files().iter().map(|f| f.rel_path.as_str()).collect();
+        assert_eq!(paths, vec!["home/a", "home/b"], "new sorts the files");
+        assert!(matches!(
+            manifest(vec![carried("home/a"), carried("home/a")]),
+            Err(ManifestError::NotSorted { index: 1, .. })
+        ));
+        for outside in ["homework/a", "workspace/a"] {
+            assert!(matches!(
+                manifest(vec![carried(outside)]),
+                Err(ManifestError::NotUnderHome { .. })
+            ));
+        }
+        assert!(matches!(
+            manifest(vec![carried("home/.a.fabric-tmp-1-2")]),
+            Err(ManifestError::TemporaryFile { .. })
+        ));
     }
 
     #[test]
     fn round_trips_through_the_file_and_digests_are_hex() {
         let dir = tempfile::tempdir().unwrap();
-        let m = manifest(vec![carried("home/.claude/projects/-w/s1.jsonl")]);
+        let m = manifest(vec![carried("home/.claude/projects/-w/s1.jsonl")]).unwrap();
         m.write(dir.path()).unwrap();
         assert_eq!(StateManifest::read(dir.path()).unwrap(), m);
         let text = std::fs::read_to_string(dir.path().join(MANIFEST_FILE)).unwrap();
         assert!(text.contains(&blake3::hash(b"").to_hex().to_string()));
         assert!(serde_json::from_str::<Digest>("\"zz\"").is_err());
+    }
+
+    #[test]
+    fn a_manifest_file_that_breaks_the_rules_is_refused_on_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = manifest(vec![carried("home/a"), carried("home/b")]).unwrap();
+        let mut value = serde_json::to_value(&m).unwrap();
+        value["files"].as_array_mut().unwrap().reverse();
+        std::fs::write(dir.path().join(MANIFEST_FILE), value.to_string()).unwrap();
+        assert!(matches!(
+            StateManifest::read(dir.path()),
+            Err(HarnessError::Malformed { .. })
+        ));
+        let mut value = serde_json::to_value(&m).unwrap();
+        value["redactions"][0]["rule"] = "Not A Rule".into();
+        std::fs::write(dir.path().join(MANIFEST_FILE), value.to_string()).unwrap();
+        assert!(StateManifest::read(dir.path()).is_err());
     }
 }

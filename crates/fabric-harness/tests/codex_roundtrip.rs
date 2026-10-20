@@ -16,10 +16,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use fabric_core::env::EnvVarName;
-use fabric_core::path::RelPath;
 use fabric_harness::codex::Codex;
 use fabric_harness::codex::overrides::{ApprovalPolicy, CodexOverrides, SandboxMode};
-use fabric_harness::manifest::{Carried, Content, Digest, Mutability};
+use fabric_harness::manifest::StateManifest;
 use fabric_harness::{Harness, HarnessError, Io, Launch, SessionId};
 
 const THREAD: &str = "019f233e-bb33-7342-85fa-f2d33b14368a";
@@ -137,7 +136,11 @@ async fn capture_follows_the_lineage_and_carries_nothing_else() {
         .capture(&src.work, &thread(), out.path())
         .await
         .unwrap();
-    let paths: Vec<&str> = manifest.files.iter().map(|f| f.rel_path.as_str()).collect();
+    let paths: Vec<&str> = manifest
+        .files()
+        .iter()
+        .map(|f| f.rel_path.as_str())
+        .collect();
     assert_eq!(
         paths,
         vec![
@@ -150,7 +153,7 @@ async fn capture_follows_the_lineage_and_carries_nothing_else() {
         std::fs::read(&src.head).unwrap(),
         "rollout bytes travel verbatim"
     );
-    assert!(manifest.redactions.is_empty());
+    assert!(manifest.redactions().is_empty());
     let locks = lock_dir(&home);
     assert!(
         locks.join(".coordination.lock").is_file(),
@@ -245,8 +248,8 @@ async fn a_workspace_whose_name_holds_sk_inside_a_word_is_captured() {
         .capture(&src.work, &thread(), out.path())
         .await
         .unwrap();
-    assert_eq!(manifest.files.len(), 2);
-    assert!(manifest.redactions.is_empty());
+    assert_eq!(manifest.files().len(), 2);
+    assert!(manifest.redactions().is_empty());
 }
 
 #[tokio::test]
@@ -267,7 +270,7 @@ async fn two_files_for_one_rollout_resolve_by_prefix_or_are_refused() {
         .unwrap();
     let head = format!("home/.codex/sessions/fabric/{THREAD}/{HEAD_NAME}");
     assert!(
-        manifest.files.iter().any(|f| f.rel_path.as_str() == head),
+        manifest.files().iter().any(|f| f.rel_path.as_str() == head),
         "the longer file wins over its prefix"
     );
     std::fs::write(&copy, session_meta(THREAD, "/other", Some(PREFIX))).unwrap();
@@ -280,6 +283,22 @@ async fn two_files_for_one_rollout_resolve_by_prefix_or_are_refused() {
         matches!(err, HarnessError::LineageAmbiguous { ref paths, .. } if paths.len() == 2),
         "{err}"
     );
+}
+
+/// Writes `manifest` under `out` with one more entry, for `body` at `rel`,
+/// as someone who forged the tree would.
+fn forge(out: &Path, manifest: &StateManifest, rel: &str, body: &[u8]) {
+    let mut value = serde_json::to_value(manifest).unwrap();
+    let files = value["files"].as_array_mut().unwrap();
+    files.push(serde_json::json!({
+        "rel_path": rel,
+        "content": "Opaque",
+        "mutability": "Replaceable",
+        "size": body.len(),
+        "blake3": blake3::hash(body).to_hex().to_string(),
+    }));
+    files.sort_by(|a, b| a["rel_path"].as_str().cmp(&b["rel_path"].as_str()));
+    std::fs::write(out.join("manifest.json"), value.to_string()).unwrap();
 }
 
 /// Moves this node's Codex state aside, as if the job ran on another node
@@ -318,16 +337,7 @@ async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_the
     let staged = out.path().join(rel);
     std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
     std::fs::write(&staged, b"payload").unwrap();
-    let mut forged = manifest.clone();
-    forged.files.push(Carried {
-        rel_path: RelPath::parse(rel).unwrap(),
-        content: Content::Opaque,
-        mutability: Mutability::Replaceable,
-        size: 7,
-        blake3: Digest::from_hash(blake3::hash(b"payload")),
-    });
-    forged.files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-    forged.write(out.path()).unwrap();
+    forge(out.path(), &manifest, rel, b"payload");
     let err = adapter.restore(&src.work, out.path()).await.unwrap_err();
     assert!(matches!(err, HarnessError::UnexpectedFile { .. }), "{err}");
     assert!(!home.join(".codex/sessions").exists());
@@ -345,7 +355,7 @@ async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_the
             .capture(&src.work, &thread(), again.path())
             .await
             .unwrap()
-            .files
+            .files()
             .len(),
         2,
         "the restored lineage resolves on the target"
