@@ -17,7 +17,6 @@ use fabric_core::path::{AbsPath, RelPath};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::HarnessError;
-use crate::redact::RedactionCounts;
 use crate::session::SessionId;
 
 /// The file name of the manifest inside a captured state tree.
@@ -257,10 +256,7 @@ impl TryFrom<String> for RuleName {
 impl StateManifest {
     /// Builds the manifest of one capture, sorting `files` by path and
     /// checking the rules of this module.
-    #[cfg_attr(
-        not(any(feature = "acp", feature = "claude", feature = "codex")),
-        allow(dead_code, reason = "used by the adapters; none is enabled")
-    )]
+    #[cfg(any(test, feature = "acp", feature = "claude", feature = "codex"))]
     pub(crate) fn new(
         kind: HarnessKind,
         session: SessionId,
@@ -268,7 +264,7 @@ impl StateManifest {
         home: AbsPath,
         harness_version: Option<String>,
         mut files: Vec<Carried>,
-        counts: &RedactionCounts,
+        counts: &crate::redact::RedactionCounts,
     ) -> Result<Self, ManifestError> {
         files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
         let redactions = counts
@@ -390,7 +386,7 @@ mod tests {
     use super::*;
 
     fn manifest(files: Vec<Carried>) -> Result<StateManifest, ManifestError> {
-        let mut counts = RedactionCounts::new();
+        let mut counts = crate::redact::RedactionCounts::new();
         counts.insert("github-token", 2);
         StateManifest::new(
             HarnessKind::ClaudeCode,

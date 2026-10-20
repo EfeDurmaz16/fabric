@@ -73,7 +73,8 @@ pub(crate) enum Carry {
 }
 
 impl Carry {
-    fn content(self) -> Content {
+    /// The content kind the manifest records for this treatment.
+    pub(crate) fn content(self) -> Content {
         match self {
             Carry::Opaque | Carry::OpaqueRefuseSecrets => Content::Opaque,
             Carry::Text => Content::Text,

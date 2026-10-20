@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use fabric_core::BoxFuture;
 use fabric_core::env::EnvVarName;
 use fabric_core::harness::HarnessKind;
-use fabric_core::path::AbsPath;
 use tokio::process::Child;
 
 use crate::error::HarnessError;
@@ -145,10 +144,7 @@ impl std::fmt::Debug for Running {
 
 impl Running {
     /// Wraps a child that `process::spawn` started in a new process group.
-    #[cfg_attr(
-        not(any(feature = "acp", feature = "claude", feature = "codex")),
-        allow(dead_code, reason = "used by the adapters; none is enabled")
-    )]
+    #[cfg(any(feature = "acp", feature = "claude", feature = "codex"))]
     pub(crate) fn new(pid: NonZeroU32, session: Option<SessionId>, child: Child) -> Self {
         Running {
             pid,
@@ -232,105 +228,6 @@ pub trait Harness: Send + Sync {
         launch: Launch,
         env: &'a [(EnvVarName, String)],
     ) -> BoxFuture<'a, Result<Running, HarnessError>>;
-}
-
-/// Checks that `workspace` is an absolute directory and returns its physical path.
-#[cfg_attr(
-    not(any(feature = "acp", feature = "claude", feature = "codex")),
-    allow(dead_code, reason = "used by the adapters; none is enabled")
-)]
-pub(crate) fn physical_workspace(workspace: &Path) -> Result<PathBuf, HarnessError> {
-    if !workspace.is_absolute() {
-        return Err(HarnessError::BadWorkspace {
-            path: workspace.to_path_buf(),
-        });
-    }
-    let physical = std::fs::canonicalize(workspace)
-        .map_err(|e| HarnessError::io("canonicalize", workspace, e))?;
-    if !physical.is_dir() {
-        return Err(HarnessError::BadWorkspace {
-            path: workspace.to_path_buf(),
-        });
-    }
-    Ok(physical)
-}
-
-/// Converts a physical path into the `AbsPath` a manifest records.
-#[cfg_attr(
-    not(any(feature = "acp", feature = "claude", feature = "codex")),
-    allow(dead_code, reason = "used by the adapters; none is enabled")
-)]
-pub(crate) fn abs_path(path: &Path) -> Result<AbsPath, HarnessError> {
-    let text = path.to_str().ok_or_else(|| HarnessError::Malformed {
-        what: "absolute path",
-        path: path.to_path_buf(),
-        reason: "not UTF-8".to_owned(),
-    })?;
-    AbsPath::parse(text).map_err(|e| HarnessError::Malformed {
-        what: "absolute path",
-        path: path.to_path_buf(),
-        reason: e.to_string(),
-    })
-}
-
-/// Refuses a restore whose manifest was captured under another workspace
-/// path or home: under ADR 0011 the target root is the captured root, and
-/// the harness keys its state to those exact strings.
-#[cfg_attr(
-    not(any(feature = "acp", feature = "claude", feature = "codex")),
-    allow(dead_code, reason = "used by the adapters; none is enabled")
-)]
-pub(crate) fn same_place(
-    manifest: &StateManifest,
-    root: &Path,
-    home: &Path,
-) -> Result<(), HarnessError> {
-    let root = abs_path(root)?;
-    if *manifest.root() != root {
-        return Err(HarnessError::RootMismatch {
-            from: manifest.root().clone(),
-            to: root,
-        });
-    }
-    let home = abs_path(home)?;
-    if *manifest.home() != home {
-        return Err(HarnessError::HomeMismatch {
-            from: manifest.home().clone(),
-            to: home,
-        });
-    }
-    Ok(())
-}
-
-/// Refuses an overlay file (settings, MCP configuration) that holds a
-/// literal secret: ADR 0006 allows only `${VAR}` references there.
-#[cfg_attr(
-    not(feature = "claude"),
-    allow(dead_code, reason = "used by the Claude adapter")
-)]
-pub(crate) fn refuse_secret_overlay(path: &Path) -> Result<(), HarnessError> {
-    let bytes = std::fs::read(path).map_err(|e| HarnessError::io("read", path, e))?;
-    if crate::redact::Redactor::standard()?.matches_bytes(&bytes) {
-        return Err(HarnessError::SecretInOverlay {
-            path: path.to_path_buf(),
-        });
-    }
-    Ok(())
-}
-
-/// Runs a blocking capture or restore body off the async runtime.
-#[cfg_attr(
-    not(any(feature = "acp", feature = "claude", feature = "codex")),
-    allow(dead_code, reason = "used by the adapters; none is enabled")
-)]
-pub(crate) async fn blocking<T, F>(body: F) -> Result<T, HarnessError>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T, HarnessError> + Send + 'static,
-{
-    tokio::task::spawn_blocking(body)
-        .await
-        .map_err(|source| HarnessError::BlockingTask { source })?
 }
 
 #[cfg(test)]

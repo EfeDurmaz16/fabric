@@ -28,6 +28,8 @@ pub(crate) mod files;
 mod harness;
 pub(crate) mod jsontext;
 pub mod manifest;
+#[cfg(any(feature = "acp", feature = "claude", feature = "codex"))]
+pub(crate) mod pipeline;
 pub(crate) mod process;
 pub(crate) mod redact;
 mod session;

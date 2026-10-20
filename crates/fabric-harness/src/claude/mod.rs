@@ -41,14 +41,14 @@ use fabric_core::harness::HarnessKind;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use crate::denylist;
-use crate::departure::{self, Departure};
+use crate::departure;
 use crate::error::HarnessError;
-use crate::files::{self, Carry, Placement, Source};
-use crate::harness::{self, Harness, Installed, Launch, Restored, Running};
+use crate::files::{self, Carry, Source};
+use crate::harness::{Harness, Installed, Launch, Restored, Running};
 use crate::manifest::{HOME_PREFIX, Mutability, StateManifest, under_home};
+use crate::pipeline::{self, Capturer, Destination};
 use crate::process;
-use crate::redact::RedactionCounts;
+use crate::redact::{RedactionCounts, Redactor};
 use crate::session::SessionId;
 
 use self::flags::LaunchFlags;
@@ -141,7 +141,7 @@ impl ClaudeCode {
 
     /// The newest session whose transcript sits under the workspace's project key.
     pub fn latest_session(&self, workspace: &Path) -> Result<Option<SessionId>, HarnessError> {
-        let root = harness::physical_workspace(workspace)?;
+        let root = pipeline::physical_workspace(workspace)?;
         let dir = self.config_dir.join("projects").join(Self::key_of(&root)?);
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -236,23 +236,14 @@ impl ClaudeCode {
         Ok(Registry::Answered(pids))
     }
 
-    /// The installed version, or `None` when it cannot be learned; a
-    /// failed probe is logged, never fatal.
     async fn installed_version(&self) -> Option<String> {
-        match self.detect_impl().await {
-            Ok(Some(installed)) => installed.version,
-            Ok(None) => None,
-            Err(e) => {
-                warn!(error = %e, "claude: version probe failed");
-                None
-            }
-        }
+        process::installed_version(self.binary().ok(), PROGRAM).await
     }
 
     /// Sets `projects["<root>"].hasTrustDialogAccepted` in `~/.claude.json`
     /// while no `claude` process runs. Returns true when the file changed.
     pub async fn preseed_trust(&self, workspace: &Path) -> Result<bool, HarnessError> {
-        let root = harness::physical_workspace(workspace)?;
+        let root = pipeline::physical_workspace(workspace)?;
         let pids = self.running_claude().await?;
         if !pids.is_empty() {
             return Err(HarnessError::HarnessRunning {
@@ -261,7 +252,7 @@ impl ClaudeCode {
             });
         }
         let config_json = self.config_json.clone();
-        harness::blocking(move || trust::preseed_file(&config_json, &root)).await
+        pipeline::blocking(move || trust::preseed_file(&config_json, &root)).await
     }
 
     fn carry_for(path: &Path) -> Carry {
@@ -471,18 +462,16 @@ impl ClaudeCode {
     ) -> Result<StateManifest, HarnessError> {
         let mut counts = RedactionCounts::new();
         let sources = self.sources_for(root, session, &mut counts)?;
-        let carried = files::stage(&sources, out, &mut counts)?;
-        Departure::of(&sources)?.write(&self.departure_path(session))?;
-        let manifest = StateManifest::new(
-            HarnessKind::ClaudeCode,
-            session.clone(),
-            harness::abs_path(root)?,
-            harness::abs_path(&self.home)?,
+        let record = self.departure_path(session);
+        let capturer = Capturer {
+            kind: HarnessKind::ClaudeCode,
+            session,
+            root,
+            home: &self.home,
             version,
-            carried,
-            &counts,
-        )?;
-        manifest.write(out)?;
+            departure: Some(&record),
+        };
+        let manifest = pipeline::capture(capturer, &sources, counts, out)?;
         info!(%session, files = manifest.files().len(), "claude: captured");
         Ok(manifest)
     }
@@ -493,7 +482,7 @@ impl ClaudeCode {
         session: &SessionId,
         out: &Path,
     ) -> Result<StateManifest, HarnessError> {
-        let root = harness::physical_workspace(workspace)?;
+        let root = pipeline::physical_workspace(workspace)?;
         let version = self.installed_version().await;
         let pids = self.session_writers(session, version.as_deref()).await?;
         if !pids.is_empty() {
@@ -505,7 +494,19 @@ impl ClaudeCode {
         let adapter = self.clone();
         let session = session.clone();
         let out = out.to_path_buf();
-        harness::blocking(move || adapter.capture_sync(&root, &session, &out, version)).await
+        pipeline::blocking(move || adapter.capture_sync(&root, &session, &out, version)).await
+    }
+
+    /// Where a tree path of `session` lands under the home, and how
+    /// capture treats it; `None` for a path capture never takes.
+    fn destination(&self, rel: &str, session: &SessionId, root_key: &str) -> Option<Destination> {
+        let rest = under_home(rel).filter(|_| Self::restorable(rel, session, root_key))?;
+        let parts: Vec<&str> = rest.split('/').collect();
+        Some(Destination {
+            path: self.home.join(rest),
+            content: Self::carry_for(Path::new(rest)).content(),
+            mutability: Self::mutability_for(&parts),
+        })
     }
 
     fn restore_sync(
@@ -515,55 +516,18 @@ impl ClaudeCode {
         manifest: StateManifest,
     ) -> Result<Restored, HarnessError> {
         let root_key = Self::key_of(root)?;
-        let mut placements = Vec::with_capacity(manifest.files().len());
-        for file in manifest.files() {
-            let rel = file.rel_path.as_str();
-            if let Some(rule) = denylist::check(rel) {
-                return Err(HarnessError::Denied {
-                    path: rel.to_owned(),
-                    rule,
-                });
-            }
-            let rest =
-                under_home(rel).filter(|_| Self::restorable(rel, manifest.session(), &root_key));
-            let Some(rest) = rest else {
-                return Err(HarnessError::UnexpectedFile {
-                    kind: HarnessKind::ClaudeCode,
-                    path: rel.to_owned(),
-                });
-            };
-            let parts: Vec<&str> = rest.split('/').collect();
-            if file.mutability != Self::mutability_for(&parts) {
-                return Err(HarnessError::Malformed {
-                    what: "manifest",
-                    path: state.join(rel),
-                    reason: format!("{rel} is not {:?}", file.mutability),
-                });
-            }
-            placements.push(Placement {
-                staged: state.join(rel),
-                dest: self.home.join(rest),
-                content: file.content,
-                mutability: file.mutability,
-            });
-        }
-        files::verify(state, manifest.files())?;
-        let departure = Departure::read(&self.departure_path(manifest.session()))?;
-        let placed = files::place_all(&placements, &departure)?;
-        info!(session = %manifest.session(), files = placed.len(), "claude: restored");
-        Ok(Restored { manifest, placed })
+        let session = manifest.session().clone();
+        let record = self.departure_path(&session);
+        let restored = pipeline::restore(manifest, state, Some(&record), |rel, _| {
+            Ok(self.destination(rel, &session, &root_key))
+        })?;
+        info!(%session, files = restored.placed.len(), "claude: restored");
+        Ok(restored)
     }
 
     async fn restore_impl(&self, workspace: &Path, state: &Path) -> Result<Restored, HarnessError> {
-        let root = harness::physical_workspace(workspace)?;
-        let manifest = StateManifest::read(state)?;
-        if *manifest.kind() != HarnessKind::ClaudeCode {
-            return Err(HarnessError::WrongHarness {
-                captured: manifest.kind().clone(),
-                restoring: HarnessKind::ClaudeCode,
-            });
-        }
-        harness::same_place(&manifest, &root, &self.home)?;
+        let root = pipeline::physical_workspace(workspace)?;
+        let manifest = pipeline::open(state, &HarnessKind::ClaudeCode, &root, &self.home)?;
         let version = self.installed_version().await;
         let pids = self
             .session_writers(manifest.session(), version.as_deref())
@@ -576,7 +540,7 @@ impl ClaudeCode {
         }
         let adapter = self.clone();
         let state = state.to_path_buf();
-        harness::blocking(move || adapter.restore_sync(&root, &state, manifest)).await
+        pipeline::blocking(move || adapter.restore_sync(&root, &state, manifest)).await
     }
 
     async fn detect_impl(&self) -> Result<Option<Installed>, HarnessError> {
@@ -621,10 +585,10 @@ impl ClaudeCode {
         launch: &Launch,
         env: &[(EnvVarName, String)],
     ) -> Result<Running, HarnessError> {
-        let root = harness::physical_workspace(workspace)?;
+        let root = pipeline::physical_workspace(workspace)?;
         let binary = self.binary()?;
         for overlay in self.flags.overlays() {
-            harness::refuse_secret_overlay(Path::new(overlay.as_str()))?;
+            refuse_secret_overlay(Path::new(overlay.as_str()))?;
         }
         let session = match launch.resume() {
             Some(session) => session.clone(),
@@ -635,6 +599,18 @@ impl ClaudeCode {
         info!(%session, %pid, "claude: launched");
         Ok(Running::new(pid, Some(session), child))
     }
+}
+
+/// Refuses an overlay file (settings, MCP configuration) that holds a
+/// literal secret: ADR 0006 allows only `${VAR}` references there.
+fn refuse_secret_overlay(path: &Path) -> Result<(), HarnessError> {
+    let bytes = std::fs::read(path).map_err(|e| HarnessError::io("read", path, e))?;
+    if Redactor::standard()?.matches_bytes(&bytes) {
+        return Err(HarnessError::SecretInOverlay {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 impl Harness for ClaudeCode {

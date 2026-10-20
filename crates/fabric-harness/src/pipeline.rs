@@ -1,0 +1,208 @@
+//! The capture and restore steps every adapter shares.
+//!
+//! Invariant: every adapter captures and restores through these functions,
+//! so the rules that keep secrets home and local bytes safe are written
+//! once. Capture stages the sources (denylist, then redaction or refusal),
+//! builds the manifest, records the departure of the rewritable files and
+//! writes the manifest last. Restore refuses a manifest of another harness
+//! kind, workspace path or home (ADR 0011); then, for every entry, a path
+//! on the denylist, a path the adapter never captures, and a content kind
+//! or mutability other than the adapter's own rule for that path; then any
+//! staged file whose digest does not match. Only after all of that does it
+//! place files, all or nothing. An adapter supplies only what differs: its
+//! sources, and where a tree path lands on this node.
+
+use std::path::{Path, PathBuf};
+
+use fabric_core::harness::HarnessKind;
+use fabric_core::path::AbsPath;
+
+use crate::denylist;
+use crate::departure::Departure;
+use crate::error::HarnessError;
+use crate::files::{self, Placement, Source};
+use crate::harness::Restored;
+use crate::manifest::{Carried, Content, Mutability, StateManifest};
+use crate::redact::RedactionCounts;
+use crate::session::SessionId;
+
+/// Checks that `workspace` is an absolute directory and returns its physical path.
+pub(crate) fn physical_workspace(workspace: &Path) -> Result<PathBuf, HarnessError> {
+    if !workspace.is_absolute() {
+        return Err(HarnessError::BadWorkspace {
+            path: workspace.to_path_buf(),
+        });
+    }
+    let physical = std::fs::canonicalize(workspace)
+        .map_err(|e| HarnessError::io("canonicalize", workspace, e))?;
+    if !physical.is_dir() {
+        return Err(HarnessError::BadWorkspace {
+            path: workspace.to_path_buf(),
+        });
+    }
+    Ok(physical)
+}
+
+/// Converts a physical path into the `AbsPath` a manifest records.
+pub(crate) fn abs_path(path: &Path) -> Result<AbsPath, HarnessError> {
+    let text = path.to_str().ok_or_else(|| HarnessError::Malformed {
+        what: "absolute path",
+        path: path.to_path_buf(),
+        reason: "not UTF-8".to_owned(),
+    })?;
+    AbsPath::parse(text).map_err(|e| HarnessError::Malformed {
+        what: "absolute path",
+        path: path.to_path_buf(),
+        reason: e.to_string(),
+    })
+}
+
+/// Runs a blocking capture or restore body off the async runtime.
+pub(crate) async fn blocking<T, F>(body: F) -> Result<T, HarnessError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, HarnessError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(body)
+        .await
+        .map_err(|source| HarnessError::BlockingTask { source })?
+}
+
+/// Who captures: the values every manifest records.
+pub(crate) struct Capturer<'a> {
+    /// The harness that captures.
+    pub kind: HarnessKind,
+    /// The session captured.
+    pub session: &'a SessionId,
+    /// The physical workspace path.
+    pub root: &'a Path,
+    /// The home the adapter serves.
+    pub home: &'a Path,
+    /// The installed version, when known.
+    pub version: Option<String>,
+    /// Where this node records its rewritable files; `None` for an adapter
+    /// whose files only grow.
+    pub departure: Option<&'a Path>,
+}
+
+/// Stages `sources` into `out`, records the departure of the rewritable
+/// ones and writes the manifest last, so a tree with a manifest is whole.
+pub(crate) fn capture(
+    capturer: Capturer<'_>,
+    sources: &[Source],
+    mut counts: RedactionCounts,
+    out: &Path,
+) -> Result<StateManifest, HarnessError> {
+    let root = abs_path(capturer.root)?;
+    let home = abs_path(capturer.home)?;
+    let carried = files::stage(sources, out, &mut counts)?;
+    let manifest = StateManifest::new(
+        capturer.kind,
+        capturer.session.clone(),
+        root,
+        home,
+        capturer.version,
+        carried,
+        &counts,
+    )?;
+    if let Some(record) = capturer.departure {
+        Departure::of(sources)?.write(record)?;
+    }
+    manifest.write(out)?;
+    Ok(manifest)
+}
+
+/// Reads the manifest under `state` and refuses one captured by another
+/// kind of harness, under another workspace path or under another home:
+/// under ADR 0011 the target is the captured place, and the harness keys
+/// its state to those exact strings.
+pub(crate) fn open(
+    state: &Path,
+    kind: &HarnessKind,
+    root: &Path,
+    home: &Path,
+) -> Result<StateManifest, HarnessError> {
+    let manifest = StateManifest::read(state)?;
+    if manifest.kind() != kind {
+        return Err(HarnessError::WrongHarness {
+            captured: manifest.kind().clone(),
+            restoring: kind.clone(),
+        });
+    }
+    let root = abs_path(root)?;
+    if *manifest.root() != root {
+        return Err(HarnessError::RootMismatch {
+            from: manifest.root().clone(),
+            to: root,
+        });
+    }
+    let home = abs_path(home)?;
+    if *manifest.home() != home {
+        return Err(HarnessError::HomeMismatch {
+            from: manifest.home().clone(),
+            to: home,
+        });
+    }
+    Ok(manifest)
+}
+
+/// Where a tree path lands on this node and how the adapter treats it.
+pub(crate) struct Destination {
+    /// The file on this node.
+    pub path: PathBuf,
+    /// The content kind the adapter captures that path as.
+    pub content: Content,
+    /// How the harness changes that file.
+    pub mutability: Mutability,
+}
+
+/// Places the files of `manifest`, staged under `state`, where
+/// `destination` says. `destination` answers `None` for a path the adapter
+/// never captures. Nothing is written until every entry has passed every
+/// check; `departure` is the record that says which rewritable files this
+/// node left untouched.
+pub(crate) fn restore<F>(
+    manifest: StateManifest,
+    state: &Path,
+    departure: Option<&Path>,
+    mut destination: F,
+) -> Result<Restored, HarnessError>
+where
+    F: FnMut(&str, &Carried) -> Result<Option<Destination>, HarnessError>,
+{
+    let mut placements = Vec::with_capacity(manifest.files().len());
+    for file in manifest.files() {
+        let rel = file.rel_path.as_str();
+        if let Some(rule) = denylist::check(rel) {
+            return Err(HarnessError::Denied {
+                path: rel.to_owned(),
+                rule,
+            });
+        }
+        let Some(dest) = destination(rel, file)? else {
+            return Err(HarnessError::UnexpectedFile {
+                kind: manifest.kind().clone(),
+                path: rel.to_owned(),
+            });
+        };
+        if dest.content != file.content || dest.mutability != file.mutability {
+            return Err(HarnessError::EntryMismatch {
+                kind: manifest.kind().clone(),
+                path: rel.to_owned(),
+            });
+        }
+        placements.push(Placement {
+            staged: state.join(rel),
+            dest: dest.path,
+            content: dest.content,
+            mutability: dest.mutability,
+        });
+    }
+    files::verify(state, manifest.files())?;
+    let departure = match departure {
+        Some(record) => Departure::read(record)?,
+        None => Departure::default(),
+    };
+    let placed = files::place_all(&placements, &departure)?;
+    Ok(Restored { manifest, placed })
+}

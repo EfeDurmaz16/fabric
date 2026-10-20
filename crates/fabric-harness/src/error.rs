@@ -73,6 +73,17 @@ pub enum HarnessError {
         /// The tree path from the manifest.
         path: String,
     },
+    /// A manifest entry has another content kind or mutability than the
+    /// adapter's own rule for its path.
+    #[error(
+        "refusing to restore {path}: the manifest treats it otherwise than the {kind} adapter does"
+    )]
+    EntryMismatch {
+        /// The harness restoring.
+        kind: HarnessKind,
+        /// The tree path from the manifest.
+        path: String,
+    },
     /// A file operation failed.
     #[error("{op} {path}: {source}")]
     Io {

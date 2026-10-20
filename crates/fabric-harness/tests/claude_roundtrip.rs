@@ -520,6 +520,41 @@ async fn a_manifest_naming_a_file_outside_session_state_is_refused() {
 }
 
 #[tokio::test]
+async fn a_manifest_that_relabels_a_transcript_as_rewritable_is_refused() {
+    // A transcript only grows; a manifest that calls it rewritable would
+    // let restore replace local bytes outright.
+    let src = build_source("w");
+    let home = src.home.path().canonicalize().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let adapter = node(&home);
+    let manifest = adapter
+        .capture(&src.work, &session(), out.path())
+        .await
+        .unwrap();
+    let transcript = format!(
+        "home/.claude/projects/{}/{SID}.jsonl",
+        project_key(&src.work)
+    );
+    let mut value = serde_json::to_value(&manifest).unwrap();
+    for file in value["files"].as_array_mut().unwrap() {
+        if file["rel_path"] == transcript.as_str() {
+            file["mutability"] = "Replaceable".into();
+        }
+    }
+    std::fs::write(out.path().join("manifest.json"), value.to_string()).unwrap();
+    set_aside(&home, ".claude-pro");
+    let err = adapter.restore(&src.work, out.path()).await.unwrap_err();
+    assert!(
+        matches!(err, HarnessError::EntryMismatch { ref path, .. } if *path == transcript),
+        "{err}"
+    );
+    assert!(
+        !home.join(".claude/projects").exists(),
+        "nothing was placed"
+    );
+}
+
+#[tokio::test]
 async fn a_job_that_leaves_and_comes_back_keeps_the_original_and_gains_the_new_turns() {
     // Pro to Air to Pro, same home and root on both. The Pro still holds
     // the unredacted transcript; the copy that comes back was redacted on

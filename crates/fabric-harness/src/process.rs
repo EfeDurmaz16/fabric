@@ -80,6 +80,18 @@ pub(crate) async fn detect(binary: Option<PathBuf>) -> Result<Option<Installed>,
     }))
 }
 
+/// The version `binary` reports, or `None` when there is no binary or the
+/// probe fails; a failed probe is logged, never fatal.
+pub(crate) async fn installed_version(binary: Option<PathBuf>, program: &str) -> Option<String> {
+    match detect(binary).await {
+        Ok(installed) => installed.and_then(|i| i.version),
+        Err(e) => {
+            tracing::warn!(program, error = %e, "version probe failed");
+            None
+        }
+    }
+}
+
 /// Returns the first token of `output` that looks like `digits.digits...`.
 #[must_use]
 pub(crate) fn version_token(output: &str) -> Option<&str> {
