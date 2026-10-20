@@ -718,7 +718,7 @@ fn clear_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
 /// where the kernel keeps every write, but not across a power loss or a
 /// kernel panic: APFS and ext4 may then keep the sentinel's entry and lose
 /// files the installer wrote before it. Power loss is out of scope for
-/// this proof (ADR 0007, step 2 of Materialize).
+/// this proof (ADR 0007, step 3 of Materialize).
 fn write_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
     let sentinel_err = |source| MaterializeError::Sentinel {
         path: path.clone(),

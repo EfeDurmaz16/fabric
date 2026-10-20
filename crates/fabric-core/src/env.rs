@@ -363,7 +363,7 @@ pub enum RunWhen {
     /// When a cache the detection report says this step fills is missing,
     /// empty or lacks its completion proof; a step that fills no workspace
     /// cache runs when any cache is not whole or the report has none
-    /// (ADR 0007, step 3 of Materialize).
+    /// (ADR 0007, step 4 of Materialize).
     CachesMissing,
     /// On every resume.
     Always,
