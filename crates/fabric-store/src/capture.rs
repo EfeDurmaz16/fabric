@@ -571,6 +571,16 @@ impl Capturer<'_> {
         };
         for item in found {
             let class = policy.classify(&item.rel, &mut markers);
+            if let Some(root) = class.cache_root() {
+                // A cache that holds only directories still gets its row, so
+                // restore can ask the target about it like any other.
+                caches.entry(root.path.clone()).or_insert(CacheSeen {
+                    class: root.class,
+                    carried: 0,
+                    denied: 0,
+                    excluded: 0,
+                });
+            }
             if item.kind == FoundKind::Dir {
                 // A directory travels on its own when the walker listed it
                 // and nothing denies it, so an empty directory is not lost.
@@ -631,12 +641,12 @@ impl Capturer<'_> {
         entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
         let mut cache_entries = Vec::new();
         for (path, seen) in caches {
-            let carry = if seen.carried == 0 {
-                CarryState::NotCarried
-            } else if seen.denied > 0 || seen.excluded > 0 {
-                CarryState::Partial
-            } else {
+            let carry = if seen.denied == 0 && seen.excluded == 0 {
                 CarryState::Carried
+            } else if seen.carried == 0 {
+                CarryState::NotCarried
+            } else {
+                CarryState::Partial
             };
             cache_entries.push(CacheEntry {
                 key: self.req.carry_keys.key(seen.class, &path),
