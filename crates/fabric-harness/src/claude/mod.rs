@@ -548,18 +548,22 @@ impl ClaudeCode {
         process::detect(self.binary().ok()).await
     }
 
-    /// The argument list for `launch`, without the binary. `session` is
-    /// the session the process runs: the one `launch` resumes, or the new
-    /// id it starts under.
-    pub(crate) fn args_for(&self, session: &SessionId, launch: &Launch) -> Vec<String> {
+    /// The session the process runs and the argument list for `launch`,
+    /// without the binary: `--resume` with the session `launch` names, or
+    /// `--session-id` with the id `fresh` mints, so the flag and the id
+    /// always agree.
+    pub(crate) fn args_for(
+        &self,
+        launch: &Launch,
+        fresh: impl FnOnce() -> SessionId,
+    ) -> (SessionId, Vec<String>) {
         let mut args = Vec::new();
         if launch.is_headless() {
             args.extend(["-p", "--output-format", "json"].map(str::to_owned));
         }
-        let flag = if launch.resume().is_some() {
-            "--resume"
-        } else {
-            "--session-id"
+        let (flag, session) = match launch.resume() {
+            Some(session) => ("--resume", session.clone()),
+            None => ("--session-id", fresh()),
         };
         args.push(flag.to_owned());
         args.push(session.as_str().to_owned());
@@ -568,7 +572,7 @@ impl ClaudeCode {
             args.push("--".to_owned());
             args.push(prompt.to_owned());
         }
-        args
+        (session, args)
     }
 
     fn fresh_session() -> SessionId {
@@ -586,11 +590,7 @@ impl ClaudeCode {
         for overlay in self.flags.overlays() {
             refuse_secret_overlay(Path::new(overlay.as_str()))?;
         }
-        let session = match launch.resume() {
-            Some(session) => session.clone(),
-            None => Self::fresh_session(),
-        };
-        let args = self.args_for(&session, launch);
+        let (session, args) = self.args_for(launch, Self::fresh_session);
         let (child, pid) =
             process::spawn(&binary, &args, pipeline::fs_path(&root), env, launch.into())?;
         info!(%session, %pid, "claude: launched");
@@ -703,20 +703,26 @@ mod tests {
             prompt: None,
         };
         assert_eq!(
-            adapter.args_for(&session, &resume),
-            vec![
-                "--resume",
-                "9c9796f0-2682-4546-a963-d314b3ad543f",
-                "--permission-mode",
-                "acceptEdits"
-            ]
+            adapter.args_for(&resume, ClaudeCode::fresh_session),
+            (
+                session.clone(),
+                vec![
+                    "--resume",
+                    "9c9796f0-2682-4546-a963-d314b3ad543f",
+                    "--permission-mode",
+                    "acceptEdits"
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+            )
         );
         let headless = Launch::Headless {
             resume: Some(session.clone()),
             prompt: "--not-a-flag".to_owned(),
         };
         assert_eq!(
-            adapter.args_for(&session, &headless),
+            adapter.args_for(&headless, ClaudeCode::fresh_session).1,
             vec![
                 "-p",
                 "--output-format",
@@ -735,15 +741,21 @@ mod tests {
             prompt: Some("hi".to_owned()),
         };
         assert_eq!(
-            adapter.args_for(&fresh, &new),
-            vec![
-                "--session-id",
-                fresh.as_str(),
-                "--permission-mode",
-                "acceptEdits",
-                "--",
-                "hi"
-            ]
+            adapter.args_for(&new, || fresh.clone()),
+            (
+                fresh.clone(),
+                vec![
+                    "--session-id",
+                    fresh.as_str(),
+                    "--permission-mode",
+                    "acceptEdits",
+                    "--",
+                    "hi"
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+            )
         );
     }
 }
