@@ -5,6 +5,9 @@
 //! can fence the whole group (ADR 0003) and no variable of the calling
 //! process leaks into it. A question about running processes fails closed:
 //! when `pgrep` or `ps` cannot answer, the caller is told so, never "none".
+//! `ps`, `pgrep` and `kill` are run from their system paths, never looked
+//! up on this process's `PATH`, so a planted `ps` cannot report a live
+//! writer as gone.
 
 #![cfg_attr(
     not(all(feature = "acp", feature = "claude", feature = "codex")),
@@ -29,6 +32,28 @@ use crate::harness::{Installed, Launch};
 
 /// How long a version probe may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Where macOS and Linux keep `ps`.
+const PS: &[&str] = &["/bin/ps", "/usr/bin/ps"];
+/// Where macOS and Linux keep `pgrep`.
+const PGREP: &[&str] = &["/usr/bin/pgrep", "/bin/pgrep"];
+/// Where macOS and Linux keep `kill`.
+const KILL: &[&str] = &["/bin/kill", "/usr/bin/kill"];
+
+/// The first of `candidates` that is an executable file.
+fn system_tool(
+    program: &'static str,
+    candidates: &'static [&'static str],
+) -> Result<&'static Path, HarnessError> {
+    candidates
+        .iter()
+        .map(|candidate| Path::new(*candidate))
+        .find(|path| is_executable(path))
+        .ok_or_else(|| HarnessError::ProcessQuery {
+            program,
+            reason: format!("not found at {}", candidates.join(" or ")),
+        })
+}
 
 /// Looks `name` up on the given `PATH` value, as a shell would.
 #[must_use]
@@ -178,7 +203,7 @@ pub(crate) fn spawn(
 /// Sends `SIGKILL` to the process group `pgid` through `kill(1)`; the
 /// crate forbids unsafe code, so it does not call `killpg` itself.
 pub(crate) fn kill_group(pgid: NonZeroU32) -> Result<(), HarnessError> {
-    let status = std::process::Command::new("kill")
+    let status = std::process::Command::new(system_tool("kill", KILL)?)
         .arg("-KILL")
         .arg("--")
         .arg(format!("-{pgid}"))
@@ -193,9 +218,9 @@ pub(crate) fn kill_group(pgid: NonZeroU32) -> Result<(), HarnessError> {
     if status.success() {
         Ok(())
     } else {
-        Err(HarnessError::Spawn {
-            program: "kill".to_owned(),
-            source: std::io::Error::other(format!("kill -KILL -{pgid} exited with {status}")),
+        Err(HarnessError::ProcessQuery {
+            program: "kill",
+            reason: format!("kill -KILL -{pgid} exited with {status}"),
         })
     }
 }
@@ -237,7 +262,7 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 async fn pgrep(args: &[&OsStr]) -> Result<Vec<u32>, HarnessError> {
-    let output = Command::new("pgrep")
+    let output = Command::new(system_tool("pgrep", PGREP)?)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -255,9 +280,9 @@ async fn pgrep(args: &[&OsStr]) -> Result<Vec<u32>, HarnessError> {
             .lines()
             .filter_map(|line| line.trim().parse().ok())
             .collect()),
-        code => Err(HarnessError::Spawn {
-            program: "pgrep".to_owned(),
-            source: std::io::Error::other(format!("pgrep exited with {code:?}")),
+        code => Err(HarnessError::ProcessQuery {
+            program: "pgrep",
+            reason: format!("exited with {code:?}"),
         }),
     }
 }
@@ -285,7 +310,7 @@ pub(crate) async fn running_pids(
 /// and prints the pid for a live process, and exits 1 with no output for
 /// none; any other answer is an error, never "dead".
 pub(crate) async fn pid_alive(pid: u32) -> Result<bool, HarnessError> {
-    let output = Command::new("ps")
+    let output = Command::new(system_tool("ps", PS)?)
         .arg("-o")
         .arg("pid=")
         .arg("-p")
@@ -306,12 +331,12 @@ pub(crate) async fn pid_alive(pid: u32) -> Result<bool, HarnessError> {
     match output.status.code() {
         Some(0) if listed => Ok(true),
         Some(1) if silent => Ok(false),
-        code => Err(HarnessError::Spawn {
-            program: "ps".to_owned(),
-            source: std::io::Error::other(format!(
+        code => Err(HarnessError::ProcessQuery {
+            program: "ps",
+            reason: format!(
                 "ps -p {pid} exited with {code:?}: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
-            )),
+            ),
         }),
     }
 }

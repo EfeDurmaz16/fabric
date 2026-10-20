@@ -119,6 +119,15 @@ pub enum HarnessError {
         #[source]
         source: std::io::Error,
     },
+    /// `ps`, `pgrep` or `kill` gave an answer this crate cannot read as
+    /// yes or no, so a question about running processes is not answered.
+    #[error("{program}: {reason}")]
+    ProcessQuery {
+        /// The tool that was asked.
+        program: &'static str,
+        /// What it answered.
+        reason: String,
+    },
     /// The thread that ran a capture or restore ended without an answer.
     #[error("the task running the operation was cancelled or panicked: {source}")]
     BlockingTask {
