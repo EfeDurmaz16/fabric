@@ -1,12 +1,17 @@
 //! What this node answers its paired peers (ADR 0003, ADR 0013).
 //!
 //! Invariant: a per-job message from a peer whose epoch is behind this
-//! node's is refused with the epoch it lacks, and every record a peer sends
-//! passes the ledger rules before it is stored. This node writes exactly
-//! one decision per move it is the target of, makes it durable before the
+//! node's is refused with the epoch it lacks, checked under the job's lock
+//! so the epoch cannot change before the message acts; a move request or
+//! an abort from a peer ahead of this node is refused too, since this node
+//! must catch up before it acts on one. Every record a peer sends passes
+//! the ledger rules before it is stored. This node writes exactly one
+//! decision per move it is the target of, makes it durable before the
 //! answer leaves, and answers every later question about that move with the
-//! same record, byte for byte. A pull is a read and is answered whatever
-//! the asker's epoch, because the asker is catching up. A pushed page that
+//! same record, byte for byte. A pull and a move status question are reads
+//! and are answered whatever the asker's epoch: the asker of a pull is
+//! catching up, and the source asking for a decision is one epoch behind
+//! once the target imported. A pushed page that
 //! does not continue this node's chain, from a peer at an epoch at least as
 //! high, freezes the job here before the refusal is answered. Manifests and
 //! chunks are named by their hashes and served to any paired peer.
@@ -28,6 +33,7 @@ use crate::clock;
 use crate::error::NodeError;
 use crate::facts::NodeFacts;
 use crate::faults::{self, Action, Point};
+use crate::job::Job;
 use crate::local::ForkRecord;
 use crate::node::{Node, Out};
 use crate::transfer::{fetch_snapshot, is_complete, with_store};
@@ -38,6 +44,22 @@ fn internal(err: &impl std::fmt::Display) -> Fault {
 
 fn bad(err: &impl std::fmt::Display) -> Fault {
     Fault::BadRequest(FaultText::truncated(&err.to_string()))
+}
+
+/// The ADR 0003 epoch check for a message that acts on the job: `None`
+/// when the sender's epoch is this node's, else the refusal to answer.
+fn fence<T>(token: &FencingToken, current: Epoch) -> Option<Fenced<T>> {
+    match token.epoch.cmp(&current) {
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Less => Some(Fenced::StaleEpoch {
+            yours: token.epoch,
+            current,
+        }),
+        std::cmp::Ordering::Greater => Some(Fenced::AheadOfUs {
+            yours: token.epoch,
+            current,
+        }),
+    }
 }
 
 fn record_bytes(bytes: &[u8]) -> Result<RecordBytes, Fault> {
@@ -64,7 +86,7 @@ impl Service for Node {
     }
 
     fn move_request(&self, peer: NodeId, token: FencingToken) -> JobFuture<'_, MoveRequested> {
-        Box::pin(async move { self.answer_move_request(peer, token.job_id).await })
+        Box::pin(async move { self.answer_move_request(peer, token).await })
     }
 
     fn offer(&self, peer: NodeId, token: FencingToken, offer: MoveOffer) -> JobFuture<'_, Offered> {
@@ -82,11 +104,11 @@ impl Service for Node {
 
     fn move_abort(
         &self,
-        _peer: NodeId,
+        peer: NodeId,
         token: FencingToken,
         move_id: MoveId,
     ) -> JobFuture<'_, RecordBytes> {
-        Box::pin(async move { self.answer_move_abort(token.job_id, move_id).await })
+        Box::pin(async move { self.answer_move_abort(peer, token, move_id).await })
     }
 
     fn manifest(
@@ -154,13 +176,33 @@ impl Node {
         }))
     }
 
+    /// Decides against `move_id` for the source of the move, at the source's epoch.
+    ///
+    /// A move already decided is answered with its decision at any epoch,
+    /// since the decision is what the source lacks.
     async fn answer_move_abort(
         &self,
-        id: JobId,
+        peer: NodeId,
+        token: FencingToken,
         move_id: MoveId,
     ) -> Result<Fenced<RecordBytes>, Fault> {
-        let job = self.job(id).await.map_err(|_| Fault::UnknownJob)?;
+        let job = self
+            .job(token.job_id)
+            .await
+            .map_err(|_| Fault::UnknownJob)?;
         let mut job = job.lock().await;
+        if let Some(record) = job.ledger().decision_for(move_id) {
+            return Ok(Fenced::Answer(record_bytes(record.bytes())?));
+        }
+        if let Some(fenced) = fence(&token, job.ledger().lease().epoch()) {
+            return Ok(fenced);
+        }
+        let source = job.ledger().lease().holder();
+        if peer != source {
+            return Err(bad(&format!(
+                "only {source}, the source of move {move_id}, may abort it"
+            )));
+        }
         let answer = job
             .ledger()
             .answer_abort(self.id, move_id, clock::event_id(), clock::now_ms())
@@ -215,33 +257,49 @@ impl Node {
         records: RecordPage,
     ) -> Result<Fenced<Appended>, Fault> {
         let id = token.job_id;
-        if let Ok(job) = self.job(id).await {
-            let current = job.lock().await.ledger().lease().epoch();
+        let mut out = Out::default();
+        // A job new here is made from the page's first record, which must be its `Created`.
+        let known = if let Ok(job) = self.job(id).await {
+            job
+        } else {
+            let first = records
+                .records()
+                .first()
+                .ok_or_else(|| bad(&"an empty page"))?;
+            self.accept_record(id, peer, first.as_bytes())
+                .await
+                .map_err(|e| bad(&e))?;
+            self.job(id).await.map_err(|_| Fault::UnknownJob)?
+        };
+        {
+            let mut job = known.lock().await;
+            let current = job.ledger().lease().epoch();
             if token.epoch < current {
                 return Ok(Fenced::StaleEpoch {
                     yours: token.epoch,
                     current,
                 });
             }
-        }
-        for bytes in records.records() {
-            match self.accept_record(id, peer, bytes.as_bytes()).await {
-                Ok(_) => {}
-                Err(NodeError::Ledger(LedgerError::PrevMismatch { head })) => {
-                    // The sender holds records this node lacks after a
-                    // record this node replaced with its own: the chains
-                    // forked. The epoch check above passed, so the
-                    // sender's epoch is at least this node's.
-                    self.freeze_on_push(id, peer, token.epoch, &records).await?;
-                    return Ok(Fenced::Answer(Appended::Rejected { head }));
+            for bytes in records.records() {
+                match job.accept(bytes.as_bytes(), peer, self.id) {
+                    Ok(_) => {}
+                    Err(NodeError::Ledger(LedgerError::PrevMismatch { head })) => {
+                        // The sender holds records this node lacks after a
+                        // record this node replaced with its own: the chains
+                        // forked. The epoch check above ran under this lock,
+                        // so the sender's epoch is at least this node's.
+                        self.freeze_on_push(&mut job, peer, token.epoch, &records)
+                            .await?;
+                        return Ok(Fenced::Answer(Appended::Rejected { head }));
+                    }
+                    Err(e) => return Err(bad(&e)),
                 }
-                Err(e) => return Err(bad(&e)),
             }
+            job.reconcile_marker().map_err(|e| internal(&e))?;
+            self.settle(&mut job, &mut out)
+                .await
+                .map_err(|e| internal(&e))?;
         }
-        let mut out = Out::default();
-        self.settle_job(id, &mut out)
-            .await
-            .map_err(|e| internal(&e))?;
         for line in out.lines {
             tracing::info!(job = %id, "{line}");
         }
@@ -260,7 +318,7 @@ impl Node {
     /// node's chain, from a peer at an epoch at least as high (ADR 0016, Forks).
     async fn freeze_on_push(
         &self,
-        id: JobId,
+        job: &mut Job,
         peer: NodeId,
         epoch: Epoch,
         records: &RecordPage,
@@ -269,8 +327,8 @@ impl Node {
             return Ok(());
         };
         let mut out = Out::default();
-        self.freeze(
-            id,
+        self.freeze_locked(
+            job,
             &ForkRecord {
                 peer,
                 epoch,
@@ -281,7 +339,7 @@ impl Node {
         .await
         .map_err(|e| internal(&e))?;
         for line in out.lines {
-            tracing::warn!(job = %id, "{line}");
+            tracing::warn!(job = %job.id(), "{line}");
         }
         Ok(())
     }
@@ -305,10 +363,14 @@ impl Node {
     async fn answer_move_request(
         &self,
         peer: NodeId,
-        id: JobId,
+        token: FencingToken,
     ) -> Result<Fenced<MoveRequested>, Fault> {
+        let id = token.job_id;
         let job = self.job(id).await.map_err(|_| Fault::UnknownJob)?;
         let mut job = job.lock().await;
+        if let Some(fenced) = fence(&token, job.ledger().lease().epoch()) {
+            return Ok(fenced);
+        }
         match job.view(self.id) {
             LeaseView::Owner(_) => {}
             LeaseView::Departing { move_id, target } if target == peer => {
@@ -408,5 +470,40 @@ impl Node {
         Ok(Fenced::Answer(Offered::SnapshotIncomplete {
             snapshot: offer.snapshot,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fabric_core::ledger::EventKind;
+
+    use super::*;
+    use crate::ops::tests::{job, node};
+
+    /// A move request from a peer whose epoch is ahead of this node's must
+    /// not suspend the job or write `MoveStarted`: this node has to catch
+    /// up first, and the request may come from a peer the ledger moved past.
+    #[tokio::test]
+    async fn a_move_request_at_another_epoch_changes_nothing() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let ahead = FencingToken {
+            job_id: id,
+            epoch: Epoch::new(2).unwrap(),
+        };
+        let answer = node
+            .answer_move_request(NodeId::from_bytes([9; 32]), ahead)
+            .await
+            .unwrap();
+        assert!(matches!(answer, Fenced::AheadOfUs { .. }), "{answer:?}");
+        let job = node.job(id).await.unwrap();
+        let job = job.lock().await;
+        assert!(
+            job.ledger()
+                .records()
+                .iter()
+                .all(|r| matches!(r.event().kind, EventKind::Created { .. })),
+            "the request wrote to the ledger"
+        );
     }
 }

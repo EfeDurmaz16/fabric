@@ -22,6 +22,7 @@ use fabric_core::moves::LeaseView;
 use fabric_net::wire::{Fenced, Pulled};
 
 use crate::error::NodeError;
+use crate::job::Job;
 use crate::local::ForkRecord;
 use crate::node::{Node, Out, lock};
 use crate::ops::SHORT_DEADLINE;
@@ -233,13 +234,23 @@ impl Node {
     ) -> Result<(), NodeError> {
         let job = self.job(id).await?;
         let mut job = job.lock().await;
+        self.freeze_locked(&mut job, fork, out).await
+    }
+
+    /// Freezes `job`, whose lock the caller holds, and stops its harness.
+    pub(crate) async fn freeze_locked(
+        &self,
+        job: &mut Job,
+        fork: &ForkRecord,
+        out: &mut Out,
+    ) -> Result<(), NodeError> {
         if job.freeze(fork)? {
             out.say(format!(
                 "frozen: {}'s ledger at epoch {} does not continue this node's",
                 fork.peer, fork.epoch
             ));
         }
-        self.settle(&mut job, out).await
+        self.settle(job, out).await
     }
 
     /// The highest epoch in `peer`'s ledger for the job, read from its whole chain.

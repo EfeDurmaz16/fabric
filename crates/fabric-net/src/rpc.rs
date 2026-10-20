@@ -159,8 +159,10 @@ pub type JobFuture<'a, T> = BoxFuture<'a, Result<Fenced<T>, Fault>>;
 /// What a node serves to its peers: per-job messages, manifests and chunks.
 ///
 /// Every per-job method answers a message from `peer` sent under the
-/// fencing `token`, and runs the ADR 0003 epoch check before it reads the
-/// rest. A per-job message can write ledger records, so its future always
+/// fencing `token`, and runs the ADR 0003 epoch check before it acts on the
+/// rest, except `pull` and `move_status`: both are reads, the asker of a
+/// pull is catching up, and the source asking for a move's decision is one
+/// epoch behind once the target imported. A per-job message can write ledger records, so its future always
 /// runs to its end, even after the caller's budget ran out and the caller
 /// was told `Fault::Deadline`. The caller then treats the outcome as
 /// unknown and asks again, with `MoveStatus` for a move.

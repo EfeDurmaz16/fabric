@@ -2093,8 +2093,7 @@ fn describe(kind: &EventKind) -> String {
 }
 
 #[cfg(test)]
-#[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
 
@@ -2105,7 +2104,7 @@ mod tests {
     use crate::paths::StateDir;
 
     /// A node in a fresh directory under `/tmp`, which keeps the socket path short.
-    fn node() -> (tempfile::TempDir, Arc<Node>) {
+    pub(crate) fn node() -> (tempfile::TempDir, Arc<Node>) {
         let dir = tempfile::Builder::new()
             .prefix("fops")
             .tempdir_in("/tmp")
@@ -2126,7 +2125,7 @@ mod tests {
     }
 
     /// A job made from a one-commit repository, owned by `node` at epoch 1.
-    async fn job(dir: &Path, node: &Arc<Node>) -> JobId {
+    pub(crate) async fn job(dir: &Path, node: &Arc<Node>) -> JobId {
         let repo = dir.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::write(repo.join("README.md"), "hello\n").unwrap();

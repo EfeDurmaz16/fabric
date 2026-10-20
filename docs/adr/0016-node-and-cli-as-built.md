@@ -89,7 +89,7 @@ Three protocol details the earlier ADRs left open:
 
 - A node that holds none of a job's records sends `Pull { after: None }` and gets the chain from `Created`. An `after` the answering chain does not hold is answered `NotInChain { head }`: the asker stops when its own chain holds that head, because the peer is only behind, and otherwise the chains forked and the node acts as Forks, below, says.
 - A record a peer sends is checked first as the peer's own. If the ledger says another node wrote it, it is accepted as relayed (ADR 0002, amendment 6), except when the writer is this node: a node writes its own records and never learns one from a peer.
-- A per-job request whose epoch is behind this node's is answered `StaleEpoch`, except `Pull`, which is a read from a node catching up.
+- A per-job request whose epoch is behind this node's is answered `StaleEpoch`, checked under the job's lock, except `Pull` and `MoveStatus`, which are reads: the asker of a pull is catching up, and the source asking for a decision is one epoch behind once the target imported. A `MoveRequest` or a `MoveAbort` whose epoch is ahead of this node's is answered `AheadOfUs`, since this node must catch up before it acts. A `MoveAbort` is accepted only from the move's source, and one for a move already decided is answered with the decision at any epoch.
 
 ### Recovery and catching up
 
