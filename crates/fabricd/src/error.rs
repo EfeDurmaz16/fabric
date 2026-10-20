@@ -72,6 +72,16 @@ pub enum NodeError {
         /// The node that decides it.
         target: NodeId,
     },
+    /// The job ran on this node while a move copied it, so the copy is out of date.
+    #[error(
+        "job {job} ran on this node while {target} copied it, so nothing moved; run `fabric job move {job} --to {target}` again once it has stopped"
+    )]
+    RanDuringMove {
+        /// The job.
+        job: JobId,
+        /// The target of the move.
+        target: NodeId,
+    },
     /// A harness for the job already runs on this node.
     #[error("a harness for job {job} already runs as pid {pid}")]
     AlreadyRunningHarness {

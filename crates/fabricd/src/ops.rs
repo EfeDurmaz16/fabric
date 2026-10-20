@@ -870,25 +870,7 @@ impl Node {
         self.push_records(id, to).await?;
         out.say(format!("{to} holds the ledger and the snapshot"));
 
-        let offer = {
-            let job = self.job(id).await?;
-            let mut job = job.lock().await;
-            if let LeaseView::Owner(_) = job.view(self.id) {
-                let move_id = clock::move_id();
-                let record = job.ledger().start_move(
-                    self.id,
-                    to,
-                    move_id,
-                    clock::event_id(),
-                    clock::now_ms(),
-                )?;
-                job.commit(record, Author::Node(self.id))?;
-                out.say(format!(
-                    "MoveStarted {move_id}: this copy does not run until {to} decides"
-                ));
-            }
-            job.ledger().offer(self.id)
-        };
+        let offer = self.depart(id, to, out).await?;
         faults::hit(Point::AfterDepartingWrite).await;
         let Some(offer) = offer else {
             return Err(NodeError::Peer {
@@ -899,6 +881,47 @@ impl Node {
         };
         self.push_records(id, to).await?;
         self.offer(id, to, offer, out).await
+    }
+
+    /// Commits the source to the move with `MoveStarted` and returns the offer to send.
+    ///
+    /// The job's lock was released while the target copied it, so a run
+    /// may have started here since: what was copied is then out of date,
+    /// and the job stays here. A move already open is offered again as it is.
+    async fn depart(
+        &self,
+        id: JobId,
+        to: NodeId,
+        out: &mut Out,
+    ) -> Result<Option<MoveOffer>, NodeError> {
+        let job = self.job(id).await?;
+        let mut job = job.lock().await;
+        if let LeaseView::Owner(_) = job.view(self.id) {
+            let suspended = job.suspended_in();
+            let unchanged = suspended.is_some()
+                && job.marker()?.is_none_or(|marker| {
+                    matches!(marker.state, MarkerState::Clean { snapshot } if Some(snapshot) == suspended)
+                });
+            if !unchanged {
+                return Err(NodeError::RanDuringMove {
+                    job: id,
+                    target: to,
+                });
+            }
+            let move_id = clock::move_id();
+            let record = job.ledger().start_move(
+                self.id,
+                to,
+                move_id,
+                clock::event_id(),
+                clock::now_ms(),
+            )?;
+            job.commit(record, Author::Node(self.id))?;
+            out.say(format!(
+                "MoveStarted {move_id}: this copy does not run until {to} decides"
+            ));
+        }
+        Ok(job.ledger().offer(self.id))
     }
 
     /// Offers the open move until the target decides, asking again after a lost answer.
@@ -1672,6 +1695,11 @@ fn owner_token(job: &Job, me: NodeId) -> Result<FencingToken, NodeError> {
 }
 
 /// What to launch for `job` on its owner.
+///
+/// The workspace is marked live before the plan leaves the node: from here
+/// on a harness may write to it, so a move refuses to depart from the
+/// snapshot it was copying and a departed copy is never moved aside as if
+/// it held nothing new.
 fn plan(
     job: &Job,
     epoch: Epoch,
@@ -1679,6 +1707,10 @@ fn plan(
     harness: Option<HarnessKind>,
     out: &mut Out,
 ) -> Result<RunPlan, NodeError> {
+    job.set_marker(&Marker {
+        root: root.clone(),
+        state: MarkerState::Live,
+    })?;
     let harness = harness.unwrap_or_else(|| job.harness().clone());
     let session = match job.session()? {
         Some(record) if record.harness == harness => {

@@ -263,6 +263,27 @@ fn e2e_source_killed_mid_transfer() -> Fallible {
     Ok(())
 }
 
+/// A run typed on the source while the target copies the job: the copy is
+/// then out of date, so the move must not depart from it. It refuses, the
+/// source keeps the job, and the move typed again carries the new turn.
+#[test]
+fn e2e_a_run_during_the_transfer_stops_the_move() -> Fallible {
+    let p = setup(Wire::TcpTls, None, Some("mid_transfer:hold"))?;
+    let (job, work) = job_with_work(&p)?;
+    let moving = p.a.spawn(&["job", "move", &job, "--to", &p.b.id])?;
+    wait_for(&p.b.signal(), "the transfer")?;
+    p.a.ok(&["job", "run", &job, "--prompt", "two"])?;
+    fs::remove_file(p.b.signal())?;
+    let output = finish(moving, GIVE_UP)?;
+    let printed = text(&output);
+    assert!(!output.status.success(), "the move departed:\n{printed}");
+    assert!(printed.contains("ran on this node while"), "{printed}");
+    assert_eq!(p.a.lease(&job)?.view, "owner");
+    p.a.ok(&["job", "move", &job, "--to", &p.b.id])?;
+    assert_one_owner(&p.b, &p.a, &job, 2, "departed")?;
+    assert_continues(&p, &p.b, &job, &work, &["one", "two"])
+}
+
 #[test]
 fn e2e_target_killed_after_import_receipt() -> Fallible {
     for wire in WIRES {
