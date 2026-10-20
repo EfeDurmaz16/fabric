@@ -25,7 +25,7 @@ use fabric_core::env::EnvVarName;
 use tokio::process::{Child, Command};
 
 use crate::error::HarnessError;
-use crate::harness::{Installed, Io};
+use crate::harness::{Installed, Launch};
 
 /// How long a version probe may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -105,11 +105,11 @@ pub(crate) enum Wiring {
     Rpc,
 }
 
-impl From<Io> for Wiring {
-    fn from(io: Io) -> Self {
-        match io {
-            Io::Terminal => Wiring::Terminal,
-            Io::Piped => Wiring::Piped,
+impl From<&Launch> for Wiring {
+    fn from(launch: &Launch) -> Self {
+        match launch {
+            Launch::Interactive { .. } => Wiring::Terminal,
+            Launch::Headless { .. } => Wiring::Piped,
         }
     }
 }

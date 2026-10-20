@@ -30,7 +30,7 @@ use crate::denylist;
 use crate::departure::{self, Departure};
 use crate::error::HarnessError;
 use crate::files::{self, Carry, Placement, Source};
-use crate::harness::{self, Harness, Installed, Io, Launch, Restored, Running};
+use crate::harness::{self, Harness, Installed, Launch, Restored, Running};
 use crate::manifest::{Content, HOME_PREFIX, Mutability, StateManifest, under_home};
 use crate::process::{self, Wiring};
 use crate::redact::RedactionCounts;
@@ -287,13 +287,14 @@ impl AcpHarness {
         process::detect(self.binary().ok()).await
     }
 
-    /// Starts the agent, completes the handshake, continues or creates the
-    /// session and returns the process with its protocol client. A prompt
-    /// is sent on a task of its own, whose handle is on the result.
+    /// Starts the agent, completes the handshake, continues `resume` or
+    /// creates a session, and returns the process with its protocol client.
+    /// A prompt is sent on a task of its own, whose handle is on the result.
     pub async fn launch_acp(
         &self,
         workspace: &Path,
-        launch: Launch,
+        resume: Option<SessionId>,
+        prompt: Option<String>,
         env: &[(EnvVarName, String)],
     ) -> Result<AcpRunning, HarnessError> {
         let root = harness::physical_workspace(workspace)?;
@@ -309,7 +310,7 @@ impl AcpHarness {
             });
         };
         let client = AcpClient::attach(stdin, stdout, self.policy);
-        let (session, prompt) = self.open_session(&client, &root, launch).await?;
+        let session = self.open_session(&client, &root, resume).await?;
         guard.disarm();
         let turn = prompt.map(|prompt| {
             let client = client.clone();
@@ -323,23 +324,23 @@ impl AcpHarness {
         })
     }
 
-    /// Runs the handshake and opens the session `launch` names; returns
-    /// the session and the prompt still to send.
+    /// Runs the handshake and continues `resume`, or opens a new session
+    /// when there is none; returns the session.
     async fn open_session(
         &self,
         client: &AcpClient,
         root: &Path,
-        launch: Launch,
-    ) -> Result<(SessionId, Option<String>), HarnessError> {
+        resume: Option<SessionId>,
+    ) -> Result<SessionId, HarnessError> {
         let capabilities = client.initialize().await?;
         let cwd = root.to_string_lossy().into_owned();
-        match launch {
-            Launch::New { prompt } => {
+        match resume {
+            None => {
                 let session = client.new_session(&cwd).await?;
                 info!(%session, agent = %self.program, "acp: new session");
-                Ok((session, Some(prompt)))
+                Ok(session)
             }
-            Launch::Resume { session, prompt } => {
+            Some(session) => {
                 if capabilities.resume {
                     client.resume_session(&session, &cwd).await?;
                 } else if capabilities.load_session {
@@ -350,35 +351,34 @@ impl AcpHarness {
                     });
                 }
                 info!(%session, agent = %self.program, "acp: session continued");
-                Ok((session, prompt))
+                Ok(session)
             }
         }
     }
 
-    /// The trait's headless launch: the prompt turn runs on a task that
-    /// owns the client and closes the agent's stdin when the turn ends.
+    /// The trait's launch, headless only: an ACP agent has no terminal
+    /// mode, so `Launch::Interactive` is refused (`NeedsClient`). The
+    /// prompt turn runs on a task that owns the client and closes the
+    /// agent's stdin when the turn ends; updates the turn streams are
+    /// dropped once `client::UPDATE_BUFFER` wait unread.
     async fn launch_impl(
         &self,
         workspace: &Path,
         launch: Launch,
-        io: Io,
         env: &[(EnvVarName, String)],
     ) -> Result<Running, HarnessError> {
-        if matches!(io, Io::Terminal) {
+        let Launch::Headless { resume, prompt } = launch else {
             return Err(HarnessError::NeedsClient {
                 program: self.program.to_string(),
             });
-        }
-        if matches!(launch, Launch::Resume { prompt: None, .. }) {
-            return Err(HarnessError::HeadlessNeedsPrompt {
-                program: self.program.to_string(),
-            });
-        }
+        };
         let AcpRunning {
             running,
             client,
             turn,
-        } = self.launch_acp(workspace, launch, env).await?;
+        } = self
+            .launch_acp(workspace, resume, Some(prompt), env)
+            .await?;
         let program = self.program.to_string();
         tokio::spawn(async move {
             let outcome = match turn {
@@ -429,9 +429,8 @@ impl Harness for AcpHarness {
         &'a self,
         workspace: &'a Path,
         launch: Launch,
-        io: Io,
         env: &'a [(EnvVarName, String)],
     ) -> BoxFuture<'a, Result<Running, HarnessError>> {
-        Box::pin(self.launch_impl(workspace, launch, io, env))
+        Box::pin(self.launch_impl(workspace, launch, env))
     }
 }

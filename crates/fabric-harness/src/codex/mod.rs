@@ -48,7 +48,7 @@ use crate::denylist;
 use crate::departure::Departure;
 use crate::error::HarnessError;
 use crate::files::{self, Carry, Placement, Relation, Source};
-use crate::harness::{self, Harness, Installed, Io, Launch, Restored, Running};
+use crate::harness::{self, Harness, Installed, Launch, Restored, Running};
 use crate::manifest::{Content, HOME_PREFIX, Mutability, StateManifest};
 use crate::process;
 use crate::redact::RedactionCounts;
@@ -529,22 +529,16 @@ impl Codex {
         &self,
         root: &Path,
         launch: &Launch,
-        io: Io,
     ) -> Result<Vec<String>, HarnessError> {
-        let headless = matches!(io, Io::Piped);
         let mut args = Vec::new();
-        if headless {
+        if launch.is_headless() {
             args.push("exec".to_owned());
         }
-        let prompt = match launch {
-            Launch::New { prompt } => Some(prompt.clone()),
-            Launch::Resume { session, prompt } => {
-                args.push("resume".to_owned());
-                args.push(session.as_str().to_owned());
-                prompt.clone()
-            }
-        };
-        if headless {
+        if let Some(session) = launch.resume() {
+            args.push("resume".to_owned());
+            args.push(session.as_str().to_owned());
+        }
+        if launch.is_headless() {
             args.push("--json".to_owned());
         }
         args.push("-c".to_owned());
@@ -556,17 +550,9 @@ impl Codex {
             args.push("-c".to_owned());
             args.push(pair);
         }
-        match prompt {
-            Some(prompt) => {
-                args.push("--".to_owned());
-                args.push(prompt);
-            }
-            None if headless => {
-                return Err(HarnessError::HeadlessNeedsPrompt {
-                    program: PROGRAM.to_owned(),
-                });
-            }
-            None => {}
+        if let Some(prompt) = launch.prompt() {
+            args.push("--".to_owned());
+            args.push(prompt.to_owned());
         }
         Ok(args)
     }
@@ -575,17 +561,13 @@ impl Codex {
         &self,
         workspace: &Path,
         launch: &Launch,
-        io: Io,
         env: &[(EnvVarName, String)],
     ) -> Result<Running, HarnessError> {
         let root = harness::physical_workspace(workspace)?;
         let binary = self.binary()?;
-        let args = self.args_for(&root, launch, io)?;
-        let session = match launch {
-            Launch::New { .. } => None,
-            Launch::Resume { session, .. } => Some(session.clone()),
-        };
-        let (child, pid) = process::spawn(&binary, &args, &root, env, io.into())?;
+        let args = self.args_for(&root, launch)?;
+        let session = launch.resume().cloned();
+        let (child, pid) = process::spawn(&binary, &args, &root, env, launch.into())?;
         info!(?session, %pid, "codex: launched");
         Ok(Running::new(pid, session, child))
     }
@@ -621,10 +603,9 @@ impl Harness for Codex {
         &'a self,
         workspace: &'a Path,
         launch: Launch,
-        io: Io,
         env: &'a [(EnvVarName, String)],
     ) -> BoxFuture<'a, Result<Running, HarnessError>> {
-        Box::pin(async move { self.launch_impl(workspace, &launch, io, env) })
+        Box::pin(async move { self.launch_impl(workspace, &launch, env) })
     }
 }
 
@@ -643,12 +624,12 @@ mod tests {
             });
         let root = Path::new("/h/fabric/jobs/j/work");
         let session = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
-        let resume = Launch::Resume {
-            session: session.clone(),
+        let resume = Launch::Interactive {
+            resume: Some(session.clone()),
             prompt: None,
         };
         assert_eq!(
-            adapter.args_for(root, &resume, Io::Terminal).unwrap(),
+            adapter.args_for(root, &resume).unwrap(),
             vec![
                 "resume",
                 "019f233e-bb33-7342-85fa-f2d33b14368a",
@@ -664,16 +645,12 @@ mod tests {
                 "model_reasoning_effort=\"high\""
             ]
         );
-        assert!(matches!(
-            adapter.args_for(root, &resume, Io::Piped),
-            Err(HarnessError::HeadlessNeedsPrompt { .. })
-        ));
-        let headless = Launch::Resume {
-            session,
-            prompt: Some("--dangerously-bypass-approvals-and-sandbox".to_owned()),
+        let headless = Launch::Headless {
+            resume: Some(session),
+            prompt: "--dangerously-bypass-approvals-and-sandbox".to_owned(),
         };
         assert_eq!(
-            adapter.args_for(root, &headless, Io::Piped).unwrap(),
+            adapter.args_for(root, &headless).unwrap(),
             vec![
                 "exec",
                 "resume",
@@ -697,10 +674,10 @@ mod tests {
         let args = adapter
             .args_for(
                 quoted,
-                &Launch::New {
-                    prompt: "go".to_owned(),
+                &Launch::Interactive {
+                    resume: None,
+                    prompt: Some("go".to_owned()),
                 },
-                Io::Terminal,
             )
             .unwrap();
         assert_eq!(

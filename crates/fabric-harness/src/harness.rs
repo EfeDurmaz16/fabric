@@ -77,32 +77,52 @@ impl ModelName {
     }
 }
 
-/// How to start a session.
+/// How to start a session, and where its input and output go. A headless
+/// run reads its first message from the command line, so it cannot be
+/// built without one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Launch {
-    /// Start a new session with an opening prompt.
-    New {
-        /// The first user message.
-        prompt: String,
-    },
-    /// Continue a recorded session.
-    Resume {
-        /// The session to continue.
-        session: SessionId,
-        /// A first message to send on resume; required for a headless run.
+    /// In the user's terminal: stdin, stdout and stderr are inherited.
+    Interactive {
+        /// The session to continue; a new one when `None`.
+        resume: Option<SessionId>,
+        /// A first message to send, when there is one.
         prompt: Option<String>,
+    },
+    /// Without a terminal: no stdin, stdout and stderr captured on the
+    /// handle. An ACP agent speaks its protocol on these pipes, so for it
+    /// the protocol client owns them and they are not on the handle.
+    Headless {
+        /// The session to continue; a new one when `None`.
+        resume: Option<SessionId>,
+        /// The first message.
+        prompt: String,
     },
 }
 
-/// How the started process is wired.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Io {
-    /// The user's terminal: stdin, stdout and stderr are inherited.
-    Terminal,
-    /// Headless: no stdin, stdout and stderr captured on the handle. An
-    /// ACP agent speaks its protocol on these pipes, so for it the
-    /// protocol client owns them and they are not on the handle.
-    Piped,
+impl Launch {
+    /// The session to continue, if any.
+    #[must_use]
+    pub fn resume(&self) -> Option<&SessionId> {
+        match self {
+            Launch::Interactive { resume, .. } | Launch::Headless { resume, .. } => resume.as_ref(),
+        }
+    }
+
+    /// The first message, if any.
+    #[must_use]
+    pub fn prompt(&self) -> Option<&str> {
+        match self {
+            Launch::Interactive { prompt, .. } => prompt.as_deref(),
+            Launch::Headless { prompt, .. } => Some(prompt),
+        }
+    }
+
+    /// True for a run without a terminal.
+    #[must_use]
+    pub fn is_headless(&self) -> bool {
+        matches!(self, Launch::Headless { .. })
+    }
 }
 
 /// A harness process this node started, in a process group of its own.
@@ -155,9 +175,9 @@ impl Running {
         self.session.as_ref()
     }
 
-    /// The child process. Its stdout and stderr are set when `Io::Piped`
-    /// was asked for, except for an ACP agent, whose pipes the protocol
-    /// client holds (`AcpHarness::launch_acp` returns that client).
+    /// The child process. Its stdout and stderr are set for a
+    /// `Launch::Headless` run, except for an ACP agent, whose pipes the
+    /// protocol client holds (`AcpHarness::launch_acp` returns that client).
     pub fn child_mut(&mut self) -> &mut Child {
         &mut self.child
     }
@@ -210,7 +230,6 @@ pub trait Harness: Send + Sync {
         &'a self,
         workspace: &'a Path,
         launch: Launch,
-        io: Io,
         env: &'a [(EnvVarName, String)],
     ) -> BoxFuture<'a, Result<Running, HarnessError>>;
 }

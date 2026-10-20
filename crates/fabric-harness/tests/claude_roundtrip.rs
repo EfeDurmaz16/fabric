@@ -18,7 +18,7 @@ use fabric_core::path::AbsPath;
 use fabric_harness::claude::ClaudeCode;
 use fabric_harness::claude::flags::{LaunchFlags, PermissionMode};
 use fabric_harness::manifest::StateManifest;
-use fabric_harness::{Harness, HarnessError, Io, Launch, SessionId};
+use fabric_harness::{Harness, HarnessError, Launch, SessionId};
 
 mod common;
 use common::{fake_claude, project_key};
@@ -830,11 +830,10 @@ async fn launch_resumes_in_the_workspace_with_exactly_the_given_env() {
     let mut running = adapter
         .launch(
             &work,
-            Launch::Resume {
-                session: session(),
+            Launch::Interactive {
+                resume: Some(session()),
                 prompt: None,
             },
-            Io::Terminal,
             &env,
         )
         .await
@@ -858,10 +857,10 @@ async fn launch_resumes_in_the_workspace_with_exactly_the_given_env() {
     let mut running = adapter
         .launch(
             &work,
-            Launch::New {
+            Launch::Headless {
+                resume: None,
                 prompt: "hello".to_owned(),
             },
-            Io::Piped,
             &env,
         )
         .await
@@ -890,14 +889,11 @@ async fn a_settings_overlay_with_a_literal_token_refuses_the_launch() {
         settings: Some(AbsPath::parse(overlay.to_str().unwrap()).unwrap()),
         ..LaunchFlags::default()
     });
-    let resume = || Launch::Resume {
-        session: session(),
-        prompt: Some("go".to_owned()),
+    let resume = || Launch::Headless {
+        resume: Some(session()),
+        prompt: "go".to_owned(),
     };
-    let err = adapter
-        .launch(&work, resume(), Io::Piped, &[])
-        .await
-        .unwrap_err();
+    let err = adapter.launch(&work, resume(), &[]).await.unwrap_err();
     assert!(matches!(err, HarnessError::SecretInOverlay { .. }), "{err}");
     std::fs::write(&overlay, "{\"env\":{\"GH\":\"${GH_TOKEN}\"}}").unwrap();
     let log = home.join("log.txt");
@@ -905,10 +901,7 @@ async fn a_settings_overlay_with_a_literal_token_refuses_the_launch() {
         EnvVarName::parse("FAKE_LOG").unwrap(),
         log.to_string_lossy().into_owned(),
     )];
-    let mut running = adapter
-        .launch(&work, resume(), Io::Piped, &env)
-        .await
-        .unwrap();
+    let mut running = adapter.launch(&work, resume(), &env).await.unwrap();
     running.child_mut().wait().await.unwrap();
     let seen = std::fs::read_to_string(&log).unwrap();
     assert!(

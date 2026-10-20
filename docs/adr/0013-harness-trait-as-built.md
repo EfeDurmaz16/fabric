@@ -30,7 +30,7 @@ trait Harness: Send + Sync {
         Copy what `session` needs into `out`, redacted, and write `out/manifest.json` last.
     fn restore(&self, workspace, state) -> BoxFuture<Result<Restored, HarnessError>>;
         Place a captured tree on this node, all or nothing.
-    fn launch(&self, workspace, Launch, Io, env) -> BoxFuture<Result<Running, HarnessError>>;
+    fn launch(&self, workspace, Launch, env) -> BoxFuture<Result<Running, HarnessError>>;
         Start the harness in a new process group with exactly `env`.
 }
 ```
@@ -39,7 +39,7 @@ The session is an explicit argument, so an adapter never guesses which session a
 
 `capture` and `restore` copy files on a blocking thread. Dropping their future does not stop the copy, so the caller awaits them to completion and does not `launch` the same session until they return. Each adapter takes the `PATH` value to search in its constructor; the library never reads its own process environment.
 
-`Launch` carries the first prompt: `New { prompt }` or `Resume { session, prompt: Option<String> }`. A headless run (`Io::Piped`) needs the prompt, and each adapter refuses one without it (`HeadlessNeedsPrompt`) before it starts a process.
+`Launch` says where the process's input and output go and carries the first prompt: `Interactive { resume: Option<SessionId>, prompt: Option<String> }` runs in the user's terminal, and `Headless { resume: Option<SessionId>, prompt: String }` runs without one. `claude -p` and `codex exec` read their first message from the command line, so a headless launch without a prompt cannot be built. An ACP agent speaks its protocol on its stdio and has no terminal mode, so its trait `launch` refuses `Interactive` (`NeedsClient`); `AcpHarness::launch_acp` returns the protocol client for a caller that wants to drive the session.
 
 ### The manifest and what restore may do
 

@@ -212,12 +212,6 @@ pub enum HarnessError {
         /// One-based line number.
         line: usize,
     },
-    /// A headless run was asked for without the prompt the harness needs to start a turn.
-    #[error("a headless {program} run needs a prompt; pass one or use the terminal")]
-    HeadlessNeedsPrompt {
-        /// The harness program.
-        program: String,
-    },
     /// A protocol agent was asked to run in a terminal, which it cannot do.
     #[error("{program} speaks a protocol on its stdio; it has no terminal mode, attach a client")]
     NeedsClient {

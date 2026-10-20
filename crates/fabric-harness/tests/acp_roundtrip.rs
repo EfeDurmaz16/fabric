@@ -15,7 +15,7 @@ use fabric_core::env::EnvVarName;
 use fabric_core::harness::ProgramName;
 use fabric_harness::acp::AcpHarness;
 use fabric_harness::acp::client::{PermissionPolicy, StopReason};
-use fabric_harness::{Harness, HarnessError, Io, Launch, SessionId};
+use fabric_harness::{Harness, HarnessError, Launch, SessionId};
 use serde_json::Value;
 
 const AGENT: &str = env!("CARGO_BIN_EXE_fake-acp-agent");
@@ -79,9 +79,8 @@ async fn client_runs_a_turn_and_denies_permission_by_default() {
         TIMEOUT,
         adapter.launch_acp(
             &work,
-            Launch::New {
-                prompt: "first".to_owned(),
-            },
+            None,
+            Some("first".to_owned()),
             &env(&state_dir, &[("FAKE_ASK_PERMISSION", "1")]),
         ),
     )
@@ -140,9 +139,8 @@ async fn allow_once_policy_picks_the_allow_option() {
     let started = adapter
         .launch_acp(
             &work,
-            Launch::New {
-                prompt: "go".to_owned(),
-            },
+            None,
+            Some("go".to_owned()),
             &env(&state_dir, &[("FAKE_ASK_PERMISSION", "1")]),
         )
         .await
@@ -170,10 +168,10 @@ async fn the_trait_launch_is_headless_and_owns_the_turn() {
     let err = adapter
         .launch(
             &work,
-            Launch::New {
-                prompt: "x".to_owned(),
+            Launch::Interactive {
+                resume: None,
+                prompt: Some("x".to_owned()),
             },
-            Io::Terminal,
             &env,
         )
         .await
@@ -182,10 +180,10 @@ async fn the_trait_launch_is_headless_and_owns_the_turn() {
     let mut running = adapter
         .launch(
             &work,
-            Launch::New {
+            Launch::Headless {
+                resume: None,
                 prompt: "headless".to_owned(),
             },
-            Io::Piped,
             &env,
         )
         .await
@@ -213,13 +211,7 @@ async fn round_trip(load: &str, resume: &str) -> Result<(PathBuf, Value), Harnes
 
     let adapter = adapter(home.path(), PermissionPolicy::Deny);
     let mut started = adapter
-        .launch_acp(
-            &work,
-            Launch::New {
-                prompt: "start".to_owned(),
-            },
-            &env,
-        )
+        .launch_acp(&work, None, Some("start".to_owned()), &env)
         .await?;
     let session = started.running.session().cloned().unwrap();
     tokio::time::timeout(TIMEOUT, started.client.next_update())
@@ -268,10 +260,8 @@ async fn round_trip(load: &str, resume: &str) -> Result<(PathBuf, Value), Harnes
     let mut started = adapter
         .launch_acp(
             &work,
-            Launch::Resume {
-                session: session.clone(),
-                prompt: Some("after move".to_owned()),
-            },
+            Some(session.clone()),
+            Some("after move".to_owned()),
             &env,
         )
         .await?;
@@ -343,14 +333,7 @@ async fn a_launch_whose_handshake_fails_leaves_no_agent_running() {
         ],
     );
     let err = adapter(home.path(), PermissionPolicy::Deny)
-        .launch_acp(
-            &work,
-            Launch::Resume {
-                session: SessionId::parse("fake-1").unwrap(),
-                prompt: None,
-            },
-            &env,
-        )
+        .launch_acp(&work, Some(SessionId::parse("fake-1").unwrap()), None, &env)
         .await
         .unwrap_err();
     assert!(
