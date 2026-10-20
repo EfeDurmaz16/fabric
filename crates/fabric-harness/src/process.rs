@@ -3,7 +3,8 @@
 //! Invariant: a harness starts in its own process group with exactly the
 //! environment the caller passed, never through a shell, so the supervisor
 //! can fence the whole group (ADR 0003) and no variable of the calling
-//! process leaks into it.
+//! process leaks into it. A question about running processes fails closed:
+//! when `pgrep` cannot answer, the caller is told so, never "none".
 
 use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt;
@@ -121,11 +122,9 @@ pub fn now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-/// Process ids of running processes whose name is exactly `name`, via `pgrep -x`.
-pub async fn running_pids(name: &str) -> Result<Vec<u32>, HarnessError> {
+async fn pgrep(args: &[&OsStr]) -> Result<Vec<u32>, HarnessError> {
     let output = Command::new("pgrep")
-        .arg("-x")
-        .arg(name)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -135,10 +134,34 @@ pub async fn running_pids(name: &str) -> Result<Vec<u32>, HarnessError> {
             program: "pgrep".to_owned(),
             source,
         })?;
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.trim().parse().ok())
-        .collect())
+    // pgrep exits 0 with matches, 1 with none, 2 on a bad invocation and 3
+    // on an internal error; the last two must not read as "none".
+    match output.status.code() {
+        Some(0 | 1) => Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect()),
+        code => Err(HarnessError::Spawn {
+            program: "pgrep".to_owned(),
+            source: std::io::Error::other(format!("pgrep exited with {code:?}")),
+        }),
+    }
+}
+
+/// Process ids of running processes named exactly `name`, plus those whose
+/// command line names `binary` (an npm-installed harness runs as `node`
+/// with the script path on its command line).
+pub async fn running_pids(name: &str, binary: Option<&Path>) -> Result<Vec<u32>, HarnessError> {
+    let mut pids = pgrep(&[OsStr::new("-x"), OsStr::new(name)]).await?;
+    if let Some(binary) = binary {
+        let physical = std::fs::canonicalize(binary).unwrap_or_else(|_| binary.to_path_buf());
+        pids.extend(pgrep(&[OsStr::new("-f"), physical.as_os_str()]).await?);
+    }
+    let own = std::process::id();
+    pids.retain(|pid| *pid != own);
+    pids.sort_unstable();
+    pids.dedup();
+    Ok(pids)
 }
 
 /// The variables a harness needs to find its login and its terminal, taken

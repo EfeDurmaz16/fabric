@@ -151,7 +151,8 @@ impl ClaudeCode {
     /// while no `claude` process runs. Returns true when the file changed.
     pub async fn preseed_trust(&self, workspace: &Path) -> Result<bool, HarnessError> {
         let root = harness::physical_workspace(workspace)?;
-        let pids = process::running_pids(PROGRAM).await?;
+        let binary = self.binary().ok();
+        let pids = process::running_pids(PROGRAM, binary.as_deref()).await?;
         if !pids.is_empty() {
             return Err(HarnessError::HarnessRunning {
                 program: PROGRAM.to_owned(),
