@@ -183,7 +183,10 @@ fn each_lockfile_names_its_manager_and_install() {
     ];
     for (files, manager, command) in cases {
         let mut all = vec![("package.json", PACKAGE_JSON)];
-        all.extend(files.iter().map(|f| (*f, "")));
+        all.extend(files.iter().map(|&f| match f {
+            ".yarnrc.yml" => (f, "nodeLinker: node-modules\n"),
+            _ => (f, ""),
+        }));
         let dir = workspace(&all).unwrap();
         let found = detect(dir.path(), None).unwrap();
         assert_eq!(commands(&found), [command], "{files:?}");
@@ -207,6 +210,7 @@ fn the_package_manager_field_decides_the_yarn_line() {
             r#"{"packageManager":"yarn@4.5.0+sha512.abc"}"#,
         ),
         ("yarn.lock", ""),
+        (".yarnrc.yml", "nodeLinker: node-modules\n"),
     ])
     .unwrap();
     let found = detect(berry.path(), None).unwrap();
@@ -226,6 +230,37 @@ fn the_package_manager_field_decides_the_yarn_line() {
         commands(&detect(classic.path(), None).unwrap()),
         ["yarn install --frozen-lockfile"]
     );
+}
+
+/// Plug'n'Play, Yarn's default, writes no `node_modules`; only the
+/// `node-modules` linker gives a tree materialize can prove whole.
+#[test]
+fn yarn_berry_needs_the_node_modules_linker() {
+    for (yarnrc, refused) in [
+        ("", true),
+        ("nodeLinker: pnp\n", true),
+        ("nodeLinker: pnpm\n", true),
+        ("  nodeLinker: node-modules\n", true),
+        ("nodeLinker: node-modules\n", false),
+        (
+            "enableGlobalCache: true\nnodeLinker: \"node-modules\" # for Fabric\n",
+            false,
+        ),
+        ("nodeLinker: 'node-modules'\n", false),
+    ] {
+        let dir = workspace(&[
+            ("package.json", r#"{"packageManager":"yarn@4.5.0"}"#),
+            ("yarn.lock", ""),
+            (".yarnrc.yml", yarnrc),
+        ])
+        .unwrap();
+        let found = detect(dir.path(), None);
+        assert_eq!(
+            matches!(found, Err(DetectError::YarnPlugAndPlay)),
+            refused,
+            "{yarnrc:?} {found:?}"
+        );
+    }
 }
 
 #[test]

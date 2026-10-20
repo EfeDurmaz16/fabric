@@ -21,6 +21,7 @@
 //! | File | Gives |
 //! |---|---|
 //! | `package.json` with a lockfile | the package manager's install step, `node_modules` as a cache |
+//! | `.yarnrc.yml`, for Yarn 2 and later | `nodeLinker`, which must be `node-modules` |
 //! | `Cargo.toml` | `cargo fetch`, with `--locked` when `Cargo.lock` exists; `target` as a cache |
 //! | `uv.lock`, else `requirements.txt` | `uv sync --frozen`, or a `uv` venv and `uv pip install -r`; `.venv` as a cache |
 //! | `go.mod` | `go mod download`; no cache inside the workspace |
@@ -63,6 +64,7 @@ const READ_FILES: &[&str] = &[
     ".nvmrc",
     ".python-version",
     "go.mod",
+    ".yarnrc.yml",
 ];
 
 /// The largest file detection reads; a bigger one is refused rather than loaded.
@@ -186,6 +188,16 @@ pub enum DetectError {
         /// Zero-based index of the entry in `[[cache]]`.
         index: usize,
     },
+    /// Yarn 2 or later installs with Plug'n'Play here, which writes no `node_modules`.
+    ///
+    /// The `.yarnrc.yml` value is never quoted. A Plug'n'Play install leaves
+    /// no tree whose marker proves it whole, and its `.yarn/unplugged`
+    /// holds native builds for one Node ABI with no carry key, so it is
+    /// refused rather than reinstalled on every resume.
+    #[error(
+        "Yarn 2 or later installs with Plug'n'Play here, which writes no node_modules for Fabric to check or carry; set `nodeLinker: node-modules` in .yarnrc.yml"
+    )]
+    YarnPlugAndPlay,
     /// `package_manager` is set in `.fabric/env.toml` but the root has no `package.json` for it to apply to.
     #[error("`package_manager` is set in {OVERRIDE_FILE} but there is no package.json at the root")]
     PackageManagerWithoutPackageJson,
@@ -628,7 +640,7 @@ pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, Dete
     let mut setup = Vec::new();
     let mut caches = Vec::new();
     let node_manager = match (&package, overrides.package_manager) {
-        (Some(package), declared) => choose_node_manager(root, package, declared)?,
+        (Some(package), declared) => choose_node_manager(&reader, package, declared)?,
         (None, Some(_)) => return Err(DetectError::PackageManagerWithoutPackageJson),
         (None, None) => None,
     };
@@ -997,10 +1009,11 @@ fn read_package_json(reader: &Reader<'_>) -> Result<Option<PackageJson>, DetectE
 /// can rebuild `node_modules`, so it is not a cache and travels as the
 /// user's own files.
 fn choose_node_manager(
-    root: &Path,
+    reader: &Reader<'_>,
     package: &PackageJson,
     declared: Option<PackageManagerName>,
 ) -> Result<Option<ManagerChoice>, DetectError> {
+    let root = reader.root;
     // Ambiguity is decided on the managers that own a present lockfile, not
     // on the file names: Bun's `bun.lock` next to its older `bun.lockb` is
     // one manager, not two.
@@ -1049,7 +1062,28 @@ fn choose_node_manager(
             found: lockfiles,
         });
     }
+    if manager == NodeManager::YarnBerry
+        && yarn_node_linker(reader)?.as_deref() != Some("node-modules")
+    {
+        return Err(DetectError::YarnPlugAndPlay);
+    }
     Ok(Some(ManagerChoice { manager, because }))
+}
+
+/// Returns the top-level `nodeLinker` of `.yarnrc.yml` without quotes, or `None` when the file or the key is absent.
+///
+/// Only the one key is read, line by line: `nodeLinker: <value>` at the
+/// start of a line, the value plain or quoted and optionally followed by a
+/// comment. Absent means Yarn's default, Plug'n'Play.
+fn yarn_node_linker(reader: &Reader<'_>) -> Result<Option<String>, DetectError> {
+    let Some(text) = reader.text(".yarnrc.yml")? else {
+        return Ok(None);
+    };
+    Ok(text.lines().find_map(|line| {
+        let value = line.strip_prefix("nodeLinker:")?;
+        let value = value.split_once(" #").map_or(value, |(before, _)| before);
+        Some(value.trim().trim_matches(['"', '\'']).to_owned())
+    }))
 }
 
 /// Reads `[tools]` from `mise.toml`: a string, the first string of an array, or a table's `version`.

@@ -173,7 +173,7 @@ fn health_follows_the_cache_kind() {
             &[
                 ("package.json", PACKAGE_JSON),
                 ("yarn.lock", ""),
-                (".yarnrc.yml", ""),
+                (".yarnrc.yml", "nodeLinker: node-modules\n"),
                 ("node_modules/.yarn-state.yml", ""),
             ],
             CacheHealth::Healthy,
