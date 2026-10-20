@@ -157,12 +157,14 @@ fn serve_one(
     stop: Option<mpsc::Receiver<()>>,
 ) -> JoinHandle<Result<(), RpcError>> {
     tokio::spawn(async move {
-        let connection = Arc::from(transport.accept().await?);
+        let connection: Arc<dyn Connection> = Arc::from(transport.accept().await?);
+        // The transport let the peer in, so the session serves it under the same pairing.
+        let trust: Arc<dyn Trust> = Arc::new(Paired(vec![connection.peer()]));
         let session = Session::accept(connection, local, version, DEADLINE).await?;
         match stop {
-            None => Err(session.serve(service).await),
+            None => Err(session.serve(service, trust).await),
             Some(mut stop) => tokio::select! {
-                ended = session.serve(service) => Err(ended),
+                ended = session.serve(service, trust) => Err(ended),
                 _ = stop.recv() => {
                     session.close();
                     Ok(())

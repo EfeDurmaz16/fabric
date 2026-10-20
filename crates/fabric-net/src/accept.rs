@@ -171,7 +171,7 @@ impl Handshakes {
 }
 
 /// Runs `trust.refresh` on a blocking thread, off the threads that drive connections.
-async fn refresh(trust: &Arc<dyn Trust>) {
+pub(crate) async fn refresh(trust: &Arc<dyn Trust>) {
     let trust = Arc::clone(trust);
     if let Err(err) = tokio::task::spawn_blocking(move || trust.refresh()).await {
         tracing::error!(error = %err, "refreshing the trust decision failed");

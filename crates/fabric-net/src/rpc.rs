@@ -5,7 +5,10 @@
 //! is; every call carries a deadline that fires on the caller whatever the
 //! peer does; and the caller trusts a chunk only after its bytes hash to
 //! the id it asked for. One stream carries one request and its answer, so
-//! a slow answer never holds up another.
+//! a slow answer never holds up another. A serving session answers only a
+//! peer that is still paired: it checks the trust decision before each
+//! request and asks it again every `TRUST_RECHECK`, and closes the
+//! connection once the peer is unpaired, however long the connection lives.
 //!
 //! The wire types `RequestBody` and `ResponseBody` are built and matched
 //! here only. A caller asks through one typed method per request, and a
@@ -25,10 +28,12 @@ use fabric_core::lease::FencingToken;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
+use crate::accept::refresh;
 use crate::frame::{
     FrameError, MAX_BULK_FRAME, MAX_CHUNK_BYTES, MAX_CONTROL_FRAME, read_frame, write_frame,
 };
 use crate::idle::IdleReader;
+use crate::tls::Trust;
 use crate::transport::{Connection, Stream, TransportError, TransportKind};
 use crate::wire::{
     ChunkBatch, Fault, FaultText, Hello, JobRequest, JobResponse, ManifestChunks, PROTOCOL_VERSION,
@@ -38,6 +43,9 @@ use crate::wire::{
 
 /// A clock difference between two nodes above this is logged at `Hello`.
 pub const CLOCK_SKEW_WARN_MS: u64 = 10_000;
+
+/// How often a serving session re-reads the trust decision, so an unpair ends a connection that stays open.
+pub const TRUST_RECHECK: Duration = Duration::from_secs(5);
 
 /// Why a call failed.
 #[derive(Debug, thiserror::Error)]
@@ -113,6 +121,9 @@ pub enum RpcError {
     /// An earlier error ended this chunk stream; ask for `missing` in a new request.
     #[error("the chunk stream already failed; ask for the missing chunks again")]
     Interrupted,
+    /// The peer is no longer paired, so the serving side closed the connection.
+    #[error("{0} is no longer paired")]
+    Unpaired(NodeId),
 }
 
 /// What a node serves to its peers: per-job messages, manifests and chunks.
@@ -464,24 +475,50 @@ impl Session {
         Ok(ChunkStream::new(recv, id, wanted, idle))
     }
 
-    /// Answers the peer's requests with `service` until the connection ends, and returns why it ended.
+    /// Answers the peer's requests with `service` while `trust` pairs the peer, and returns why it stopped.
     ///
-    /// It never ends otherwise. A connection either side closed comes back
-    /// as `RpcError::Transport(TransportError::Closed(_))`.
-    pub async fn serve(&self, service: Arc<dyn Service>) -> RpcError {
-        loop {
-            let stream = match self.connection.next().await {
-                Ok(stream) => stream,
-                Err(err) => return err.into(),
-            };
-            let peer = self.peer();
-            let service = service.clone();
-            tokio::spawn(async move {
-                if let Err(err) = handle(peer, stream, service).await {
-                    tracing::debug!(%peer, error = %err, "request ended early");
+    /// A connection either side closed comes back as
+    /// `RpcError::Transport(TransportError::Closed(_))`. A peer that `trust`
+    /// no longer pairs, seen before a request or at a recheck every
+    /// `TRUST_RECHECK`, has its connection closed and comes back as
+    /// `RpcError::Unpaired`; requests in flight then fail with it.
+    pub async fn serve(&self, service: Arc<dyn Service>, trust: Arc<dyn Trust>) -> RpcError {
+        let peer = self.peer();
+        let requests = async {
+            loop {
+                let stream = match self.connection.next().await {
+                    Ok(stream) => stream,
+                    Err(err) => return err.into(),
+                };
+                if !trust.is_paired(peer) {
+                    return RpcError::Unpaired(peer);
                 }
-            });
+                let service = service.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = handle(peer, stream, service).await {
+                        tracing::debug!(%peer, error = %err, "request ended early");
+                    }
+                });
+            }
+        };
+        let recheck = async {
+            loop {
+                tokio::time::sleep(TRUST_RECHECK).await;
+                refresh(&trust).await;
+                if !trust.is_paired(peer) {
+                    return RpcError::Unpaired(peer);
+                }
+            }
+        };
+        let ended = tokio::select! {
+            ended = requests => ended,
+            ended = recheck => ended,
+        };
+        if let RpcError::Unpaired(_) = ended {
+            tracing::info!(%peer, "peer unpaired; closing its connection");
+            self.connection.close();
         }
+        ended
     }
 }
 
@@ -905,6 +942,89 @@ mod tests {
             Err(RpcError::ProtocolVersion { ours: PROTOCOL_VERSION, theirs })
                 if theirs == PROTOCOL_VERSION + 1
         ));
+    }
+
+    /// A trust decision the test flips.
+    #[derive(Debug)]
+    struct Revocable(std::sync::atomic::AtomicBool);
+
+    impl Trust for Revocable {
+        fn is_paired(&self, _node: NodeId) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A service that serves nothing; the sessions here only ping.
+    struct Nothing;
+
+    impl Service for Nothing {
+        fn job(
+            &self,
+            _peer: NodeId,
+            _token: FencingToken,
+            _request: JobRequest,
+        ) -> BoxFuture<'_, Result<JobResponse, Fault>> {
+            Box::pin(async { Err(Fault::UnknownJob) })
+        }
+
+        fn manifest(
+            &self,
+            _peer: NodeId,
+            _snapshot: SnapshotId,
+        ) -> BoxFuture<'_, Result<ManifestChunks, Fault>> {
+            Box::pin(async { Err(Fault::UnknownSnapshot) })
+        }
+
+        fn chunk(&self, _peer: NodeId, id: ChunkId) -> BoxFuture<'_, Result<Vec<u8>, Fault>> {
+            Box::pin(async move { Err(Fault::UnknownChunk(id)) })
+        }
+    }
+
+    /// A dialer's session and an acceptor's session that serves under `trust`, over the multiplexer in memory.
+    async fn serving_pair(trust: Arc<Revocable>) -> (Session, tokio::task::JoinHandle<RpcError>) {
+        use crate::mux::{Mux, Side};
+
+        let (dialer_id, acceptor_id) = (NodeId::from_bytes([1; 32]), NodeId::from_bytes([2; 32]));
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let dialer: Arc<dyn Connection> = Arc::new(Mux::spawn(a, Side::Dialer, acceptor_id, addr));
+        let acceptor: Arc<dyn Connection> =
+            Arc::new(Mux::spawn(b, Side::Acceptor, dialer_id, addr));
+        let version = VersionText::truncated("test");
+        let (dialer_session, acceptor_session) = tokio::join!(
+            Session::connect(dialer, dialer_id, version.clone(), IDLE * 10),
+            Session::accept(acceptor, acceptor_id, version, IDLE * 10),
+        );
+        let accepted = acceptor_session.unwrap();
+        let serving = tokio::spawn(async move { accepted.serve(Arc::new(Nothing), trust).await });
+        (dialer_session.unwrap(), serving)
+    }
+
+    /// A peer unpaired while its connection is idle loses the connection
+    /// at the next recheck; keep-alives do not keep its access.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_connection_ends_once_its_peer_is_unpaired() {
+        let trust = Arc::new(Revocable(true.into()));
+        let (session, serving) = serving_pair(Arc::clone(&trust)).await;
+        session.ping(IDLE * 10).await.unwrap();
+        trust.0.store(false, Ordering::SeqCst);
+        let unpaired = tokio::time::Instant::now();
+        assert!(matches!(serving.await.unwrap(), RpcError::Unpaired(_)));
+        assert!(unpaired.elapsed() <= TRUST_RECHECK);
+        assert!(session.ping(IDLE * 10).await.is_err());
+    }
+
+    /// A request that arrives after the trust decision dropped the peer is
+    /// not served, even before the next recheck.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_after_an_unpair_is_not_served() {
+        let trust = Arc::new(Revocable(true.into()));
+        let (session, serving) = serving_pair(Arc::clone(&trust)).await;
+        trust.0.store(false, Ordering::SeqCst);
+        let started = tokio::time::Instant::now();
+        assert!(session.ping(IDLE * 10).await.is_err());
+        assert!(matches!(serving.await.unwrap(), RpcError::Unpaired(_)));
+        assert!(started.elapsed() < TRUST_RECHECK);
     }
 
     /// A stream that failed inside a frame never reads again.
