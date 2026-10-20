@@ -101,6 +101,7 @@ fn carry_key() -> impl Strategy<Value = CarryKey> {
             python_home
         }),
         ("[a-z]{1,6}", "[0-9.]{1,6}").prop_map(|(tool, version)| CarryKey::Other { tool, version }),
+        Just(CarryKey::Unmeasured),
     ]
 }
 

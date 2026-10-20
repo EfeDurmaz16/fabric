@@ -258,6 +258,22 @@ pub enum CarryKey {
         /// The tool's version string.
         version: String,
     },
+    /// The source measured nothing; `matches` never accepts it, even against itself.
+    Unmeasured,
+}
+
+impl CarryKey {
+    /// True when bytes measured under `self` may be used on a node that measured `target` (ADR 0012).
+    ///
+    /// The keys must be equal and neither may be `Unmeasured`. This is the
+    /// comparison restore uses; `==` is plain equality and says `Unmeasured`
+    /// equals itself.
+    #[must_use]
+    pub fn matches(&self, target: &CarryKey) -> bool {
+        !matches!(self, CarryKey::Unmeasured)
+            && !matches!(target, CarryKey::Unmeasured)
+            && self == target
+    }
 }
 
 /// Git state carried by commits and refs, never by `.git` files.
@@ -383,5 +399,22 @@ impl SnapshotManifest {
     /// Returns the snapshot's identity: blake3 of its canonical bytes.
     pub fn id(&self) -> Result<SnapshotId, ManifestError> {
         Ok(SnapshotId::of(&self.encode()?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unmeasured_key_matches_nothing_and_equal_keys_match() {
+        let npm = CarryKey::Other {
+            tool: "npm".to_owned(),
+            version: "10".to_owned(),
+        };
+        assert!(npm.matches(&npm.clone()));
+        assert!(!CarryKey::Unmeasured.matches(&CarryKey::Unmeasured));
+        assert!(!CarryKey::Unmeasured.matches(&npm));
+        assert!(!npm.matches(&CarryKey::Unmeasured));
     }
 }
