@@ -17,6 +17,7 @@ unicode-normalization = "0.1"
 
 [dev-dependencies]
 proptest = { version = "1.12", default-features = false, features = ["std"] }
+tempfile = "3.27"
 
 [lints]
 workspace = true

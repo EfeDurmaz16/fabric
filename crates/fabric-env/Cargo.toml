@@ -16,7 +16,6 @@ toml = { version = "1.1", default-features = false, features = ["std", "parse", 
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-proptest = { version = "1.12", default-features = false, features = ["std"] }
 tempfile = "3.27"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
