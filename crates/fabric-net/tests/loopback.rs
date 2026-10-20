@@ -800,7 +800,7 @@ async fn quic_is_dialed_first_and_tcp_is_the_fallback() -> TestResult {
     };
     let dialed = client.dial(b.id(), server.local_addr()?).await?;
     assert_eq!(dialed.connection.kind(), TransportKind::Quic);
-    assert!(dialed.fallback_reason.is_none());
+    assert!(dialed.quic_failure.is_none());
     assert_eq!(accepting.await??.kind(), TransportKind::Quic);
 
     // A port where UDP is a black hole and only TCP answers. The port TCP
@@ -820,8 +820,10 @@ async fn quic_is_dialed_first_and_tcp_is_the_fallback() -> TestResult {
     };
     let dialed = client.dial_any(b.id(), &[tcp_only_addr.into()]).await?;
     assert_eq!(dialed.connection.kind(), TransportKind::TcpTls);
-    let reason = dialed.fallback_reason.ok_or("the fallback must say why")?;
-    assert!(reason.starts_with("quic:"), "{reason}");
+    assert!(
+        matches!(dialed.quic_failure, Some(TransportError::Timeout(_))),
+        "the fallback must say how QUIC failed"
+    );
     assert_eq!(accepting.await??.kind(), TransportKind::TcpTls);
     Ok(())
 }

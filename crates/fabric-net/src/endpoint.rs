@@ -2,7 +2,7 @@
 //!
 //! Invariant: a dial tries QUIC first and falls back to TCP with TLS only
 //! when QUIC did not complete within `quic_timeout`; the fallback is
-//! reported with its reason, never silent, so a slow path is visible to
+//! reported with QUIC's failure, never silent, so a slow path is visible to
 //! the user and to the ledger. Both transports listen on one port number,
 //! so a user pastes one address at pairing. A forged handshake ends a dial
 //! at once; any other refusal, such as another node at a stale address,
@@ -28,11 +28,13 @@ pub const QUIC_TIMEOUT: Duration = Duration::from_secs(3);
 pub const EPHEMERAL_TRIES: usize = 8;
 
 /// A connection and, when QUIC was not used, why.
+///
+/// `connection.kind()` says which wire served the dial.
 pub struct Dialed {
     /// The connection.
     pub connection: Box<dyn Connection>,
-    /// Why the dial fell back to TCP with TLS; `None` when QUIC served it.
-    pub fallback_reason: Option<String>,
+    /// How QUIC failed before the dial fell back to TCP with TLS; `None` when QUIC served it.
+    pub quic_failure: Option<TransportError>,
 }
 
 /// The transports of one node bound to one port.
@@ -102,19 +104,18 @@ impl Endpoint {
                 Ok(Ok(connection)) => {
                     return Ok(Dialed {
                         connection,
-                        fallback_reason: None,
+                        quic_failure: None,
                     });
                 }
                 Ok(Err(TransportError::Tls(err))) => return Err(TransportError::Tls(err)),
                 Ok(Err(err)) => err,
                 Err(_) => TransportError::Timeout(self.quic_timeout),
             };
-        let reason = format!("quic: {quic_failure}");
-        tracing::info!(%peer, %addr, %reason, "falling back to tcp+tls");
+        tracing::info!(%peer, %addr, quic = %quic_failure, "falling back to tcp+tls");
         let connection = self.tcp.connect(peer, addr).await?;
         Ok(Dialed {
             connection,
-            fallback_reason: Some(reason),
+            quic_failure: Some(quic_failure),
         })
     }
 
