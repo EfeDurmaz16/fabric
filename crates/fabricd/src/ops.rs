@@ -65,6 +65,16 @@ impl Node {
         request: Request,
         out: &mut Out,
     ) -> Result<Option<RunPlan>, NodeError> {
+        if !matches!(
+            request,
+            Request::NodeId
+                | Request::NodeAdd { .. }
+                | Request::NodeList
+                | Request::NodePing { .. }
+                | Request::Doctor { .. }
+        ) {
+            self.recovered().await;
+        }
         match request {
             Request::NodeId => {
                 out.say(format!("{}", self.id));

@@ -73,6 +73,7 @@ pub struct Node {
     sessions: Mutex<HashMap<NodeId, Arc<Session>>>,
     pub(crate) harness_config: HarnessConfig,
     control: Mutex<Option<UnixListener>>,
+    recovered: tokio::sync::watch::Sender<bool>,
     _lock: File,
 }
 
@@ -142,6 +143,7 @@ impl Node {
             sessions: Mutex::new(HashMap::new()),
             harness_config,
             control: Mutex::new(Some(control)),
+            recovered: tokio::sync::watch::Sender::new(false),
             _lock: lock_file,
         });
         tracing::info!(node = %node.id, addr = ?node.local_addr().ok(), "node started");
@@ -351,6 +353,15 @@ impl Node {
                 tracing::info!(job = %id, "{line}");
             }
         }
+        self.recovered.send_replace(true);
+    }
+
+    /// Waits until the start-up recovery has run, so no job command acts on
+    /// a ledger that has not yet learned what the peers wrote while this
+    /// node was away.
+    pub(crate) async fn recovered(&self) {
+        let mut done = self.recovered.subscribe();
+        let _ = done.wait_for(|done| *done).await;
     }
 
     /// Fetches what each paired peer holds after this node's head, so a node
