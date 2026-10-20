@@ -135,12 +135,6 @@ impl LedgerFile {
             poisoned: false,
         })
     }
-
-    /// The file's path.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
 }
 
 fn io_err(path: &Path, source: io::Error) -> LedgerFileError {
