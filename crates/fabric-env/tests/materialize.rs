@@ -126,6 +126,26 @@ fn a_finished_install_runs_nothing() {
     assert!(planned.ready().unwrap().execute(&lock).is_ok());
 }
 
+/// A declared variable is the job's, not only its setup's: a warm resume
+/// that runs no step refuses without it, as a cold one does.
+#[test]
+fn a_plan_with_no_steps_still_needs_the_declared_variables() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
+    let unset = "FABRIC_TEST_UNSET_FOR_A_NOOP_PLAN";
+    let detected = declared(dir.path(), &format!("env = [\"{unset}\"]\nsetup = []\n")).unwrap();
+    let planned = plan(&detected, &lock, &NodeEnv::new(None, Vec::new())).unwrap();
+    assert!(planned.is_noop());
+    match planned.ready() {
+        Err(MaterializeError::CannotRun { programs, env }) => {
+            assert!(programs.is_empty());
+            assert_eq!(env.len(), 1);
+            assert_eq!(env[0].as_str(), unset);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 /// npm, pnpm and Yarn 1 write their own marker before the root package's
 /// lifecycle scripts run, so an install whose `postinstall` fails leaves
 /// the marker over a tree that is not whole. Only the sentinel, written

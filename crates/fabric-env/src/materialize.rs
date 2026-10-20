@@ -350,14 +350,10 @@ impl Plan {
 
     /// Turns the plan into steps that can run, or refuses with every missing program and variable named.
     ///
-    /// A plan with no steps is ready whatever this node lacks, since nothing will run.
+    /// A declared variable is refused even when no step runs: the job
+    /// needs it, not only its setup, and a warm node must not launch a
+    /// harness that a cold node would have stopped for the same variable.
     pub fn ready(self) -> Result<Ready, MaterializeError> {
-        if self.steps.is_empty() {
-            return Ok(Ready {
-                root: self.root,
-                steps: Vec::new(),
-            });
-        }
         let mut steps = Vec::with_capacity(self.steps.len());
         let mut missing = Vec::new();
         for planned in self.steps {
