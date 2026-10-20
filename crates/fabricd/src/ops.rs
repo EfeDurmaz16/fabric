@@ -321,8 +321,13 @@ impl Node {
             (Some(s), Some(_)) => format!("snapshot: {s} (suspended in it)"),
             (Some(s), None) => format!("snapshot: {s} (resumed since)"),
         });
+        let owner_here = matches!(job.view(self.id), LeaseView::Owner(_));
         out.say(match job.marker()? {
             None => "workspace: none on this node".to_owned(),
+            Some(marker) if !owner_here => format!(
+                "workspace: {} is an orphan: it holds changes made after the last snapshot this node published, and nothing here deletes it",
+                marker.root.display()
+            ),
             Some(marker) => format!(
                 "workspace: {} ({})",
                 marker.root.display(),
@@ -1002,7 +1007,10 @@ impl Node {
                 local::remove(&job.dir().harness())?;
             }
         }
-        if let LeaseView::Departed { epoch, .. } = view
+        // A copy that matches a published snapshot holds nothing the job
+        // lacks, so it leaves the root; a copy with changes since the last
+        // snapshot stays where it is, an orphan the user decides about.
+        if let LeaseView::Departed { epoch, .. } | LeaseView::Replica { epoch, .. } = view
             && let Some(marker) = job.reconcile_marker()?
             && matches!(marker.state, MarkerState::Clean { .. })
         {
@@ -1019,7 +1027,7 @@ impl Node {
                         .map_err(|e| NodeError::io(root_parent, e))?;
                 }
                 out.say(format!(
-                    "the departed copy moved out of the root to {}; it is kept, never run",
+                    "this node's copy moved out of the root to {}; it is kept, never run",
                     dest.display()
                 ));
             }
