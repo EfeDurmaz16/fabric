@@ -2387,13 +2387,13 @@ pub(crate) mod tests {
         let mut harness = sleeper();
         register(&node, id, pid(&harness)).await.unwrap();
         let thread = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
-        let name = |pid| {
+        let name_at = |epoch, pid| {
             let (node, thread) = (Arc::clone(&node), thread.clone());
             async move {
                 node.harness_session(
                     NamedSession {
                         job: id,
-                        epoch: Epoch::FIRST,
+                        epoch,
                         pid,
                         harness: HarnessKind::Codex,
                         session: thread,
@@ -2403,12 +2403,20 @@ pub(crate) mod tests {
                 .await
             }
         };
+        let name = |pid| name_at(Epoch::FIRST, pid);
 
         let other = NonZeroU32::new(pid(&harness).get() + 1).unwrap();
         assert!(matches!(
             name(other).await,
             Err(NodeError::HarnessNotRecorded { .. })
         ));
+        assert!(
+            matches!(
+                name_at(Epoch::new(2).unwrap(), pid(&harness)).await,
+                Err(NodeError::Fence(_))
+            ),
+            "a plan of another epoch named the session"
+        );
         let recorded = || async {
             let job = node.job(id).await.unwrap();
             let job = job.lock().await;
