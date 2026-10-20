@@ -706,6 +706,30 @@ args = ["web/out/ran"]
     ));
 }
 
+/// A lock file that is a link would lock whatever it names, such as a
+/// workspace file a restore can replace with a new inode, and a second
+/// resume would then take a second lock.
+#[test]
+fn a_lock_file_that_is_a_link_is_refused() {
+    let locks = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), &[("held", "")]).unwrap();
+    let first = TreeLock::acquire(locks.path(), dir.path()).unwrap();
+    drop(first);
+    let entry = fs::read_dir(locks.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::remove_file(&entry).unwrap();
+    symlink(dir.path().join("held"), &entry).unwrap();
+    assert!(matches!(
+        TreeLock::acquire(locks.path(), dir.path()),
+        Err(MaterializeError::LockNotRegular { .. })
+    ));
+}
+
 /// A lock directory inside the workspace is one the workspace can delete,
 /// which is the failure the lock exists to prevent.
 #[test]

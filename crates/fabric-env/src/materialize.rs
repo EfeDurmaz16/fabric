@@ -82,7 +82,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, TryLockError};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -136,6 +136,12 @@ pub enum MaterializeError {
         /// The IO error.
         #[source]
         source: io::Error,
+    },
+    /// The lock file is a link or not a regular file, so locking it could lock another file.
+    #[error("the lock `{}` is a link or not a regular file; remove it", lock.display())]
+    LockNotRegular {
+        /// The lock file.
+        lock: PathBuf,
     },
     /// The directory for locks lies inside the workspace, where the workspace could delete a lock.
     #[error("the lock directory `{}` lies inside the workspace `{}`", locks.display(), root.display())]
@@ -484,16 +490,33 @@ impl TreeLock {
         }
         let name = blake3::hash(root.as_os_str().as_bytes()).to_hex();
         let path = locks.join(format!("{name}.lock"));
+        let lock_err = |source| MaterializeError::Lock {
+            lock: path.clone(),
+            source,
+        };
+        let not_regular = || MaterializeError::LockNotRegular { lock: path.clone() };
+        // A link here would lock whatever it names, a file in the workspace
+        // included, whose inode a restore can replace; a FIFO would block
+        // the open. The entry is checked before the open and again after
+        // it, by device and inode, so one swapped in between is refused too.
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if !meta.is_file() => return Err(not_regular()),
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(lock_err(source)),
+        }
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&path)
-            .map_err(|source| MaterializeError::Lock {
-                lock: path.clone(),
-                source,
-            })?;
+            .map_err(lock_err)?;
+        let opened = file.metadata().map_err(lock_err)?;
+        let entry = fs::symlink_metadata(&path).map_err(lock_err)?;
+        if !entry.is_file() || entry.dev() != opened.dev() || entry.ino() != opened.ino() {
+            return Err(not_regular());
+        }
         match file.try_lock() {
             Ok(()) => Ok(Self { root, file }),
             Err(TryLockError::WouldBlock) => Err(MaterializeError::TreeBusy { lock: path }),
