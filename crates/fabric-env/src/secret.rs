@@ -198,25 +198,50 @@ impl Staging {
         &self.tracked
     }
 
-    /// Returns the paths capture stages, or refuses when a tracked secret changed without consent.
+    /// Returns what capture stages, or refuses when a tracked secret changed without consent.
     ///
     /// Capture passes each path to `git add -A` as a `:(literal)` pathspec,
-    /// so git applies no pattern of its own. An empty list means there is
-    /// nothing to stage: `git add -A` with no pathspec at all stages
-    /// everything, so capture must not run it then.
-    pub fn paths(self, consent: TrackedSecrets) -> Result<Vec<RelPath>, TrackedSecretChanged> {
-        match consent {
-            TrackedSecrets::Refuse if !self.tracked.is_empty() => Err(TrackedSecretChanged {
-                changed: self.tracked,
-            }),
-            TrackedSecrets::Refuse => Ok(self.stage),
+    /// so git applies no pattern of its own.
+    pub fn paths(self, consent: TrackedSecrets) -> Result<Stage, TrackedSecretChanged> {
+        let mut paths = match consent {
+            TrackedSecrets::Refuse if !self.tracked.is_empty() => {
+                return Err(TrackedSecretChanged {
+                    changed: self.tracked,
+                });
+            }
+            TrackedSecrets::Refuse => self.stage.into_iter(),
             TrackedSecrets::Carry => {
                 let mut paths = self.stage;
                 paths.extend(self.tracked.into_iter().map(|denied| denied.path));
-                Ok(paths)
+                paths.into_iter()
             }
-        }
+        };
+        Ok(match paths.next() {
+            None => Stage::Nothing,
+            Some(first) => Stage::Paths {
+                first,
+                rest: paths.collect(),
+            },
+        })
     }
+}
+
+/// What capture hands `git add`: nothing, or at least one literal path.
+///
+/// `git add -A` with no pathspec at all stages everything, secrets
+/// included, so "nothing to stage" is its own variant and the list of
+/// paths cannot be empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stage {
+    /// Nothing may be staged; capture runs no `git add`.
+    Nothing,
+    /// At least one path to stage.
+    Paths {
+        /// The first path to stage.
+        first: RelPath,
+        /// The paths after it, possibly none.
+        rest: Vec<RelPath>,
+    },
 }
 
 /// Whether the user agreed that changes to tracked files matching a secret pattern may travel.

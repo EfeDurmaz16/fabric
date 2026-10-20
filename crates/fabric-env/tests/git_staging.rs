@@ -13,7 +13,9 @@ use std::process::{Command, Stdio};
 
 use fabric_core::env::{SecretPattern, SecretPatternError};
 use fabric_core::path::RelPath;
-use fabric_env::secret::{Scope, SecretPolicy, TrackedSecretChanged, TrackedSecrets, Tracking};
+use fabric_env::secret::{
+    Scope, SecretPolicy, Stage, TrackedSecretChanged, TrackedSecrets, Tracking,
+};
 
 /// Committed before the working tree changes. The first five are the
 /// failure from the review: source and template files whose names an
@@ -192,13 +194,13 @@ fn capture_w(
                 .into_iter()
                 .map(|path| (path, Tracking::Untracked)),
         );
-    let paths = match policy.staging(changes).paths(consent) {
-        Ok(paths) => paths,
+    let stage = match policy.staging(changes).paths(consent) {
+        Ok(stage) => stage,
         Err(refused) => return Ok(Err(refused)),
     };
-    if !paths.is_empty() {
+    if let Stage::Paths { first, rest } = &stage {
         let mut list = Vec::new();
-        for path in &paths {
+        for path in std::iter::once(first).chain(rest) {
             list.extend_from_slice(b":(literal)");
             list.extend_from_slice(path.as_str().as_bytes());
             list.push(0);
