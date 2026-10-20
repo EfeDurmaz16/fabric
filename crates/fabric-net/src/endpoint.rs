@@ -4,7 +4,9 @@
 //! when QUIC did not complete within `quic_timeout`; the fallback is
 //! reported with its reason, never silent, so a slow path is visible to
 //! the user and to the ledger. Both transports listen on one port number,
-//! so a user pastes one address at pairing.
+//! so a user pastes one address at pairing. A forged handshake ends a dial
+//! at once; any other refusal, such as another node at a stale address,
+//! moves on to the next address.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -16,7 +18,7 @@ use crate::identity::NodeIdentity;
 use crate::peers::HostPort;
 use crate::quic::QuicTransport;
 use crate::tcp::TcpTlsTransport;
-use crate::tls::Trust;
+use crate::tls::{TlsError, Trust};
 use crate::transport::{Connection, Transport, TransportError};
 
 /// How long QUIC gets before the dial falls back to TCP with TLS.
@@ -117,6 +119,11 @@ impl Endpoint {
     }
 
     /// Dials `peer` at the first of `addrs` that answers, resolving names as needed.
+    ///
+    /// An address where another node answers, which a stale address can
+    /// do after DHCP gave it away, is skipped like one that does not
+    /// answer. A handshake signed with a key the certificate does not name
+    /// is a forgery, and ends the dial.
     pub async fn dial_any(
         &self,
         peer: NodeId,
@@ -140,7 +147,9 @@ impl Endpoint {
             for addr in resolved {
                 match self.dial(peer, addr).await {
                     Ok(dialed) => return Ok(dialed),
-                    Err(TransportError::Tls(err)) => return Err(TransportError::Tls(err)),
+                    Err(TransportError::Tls(TlsError::BadSignature)) => {
+                        return Err(TlsError::BadSignature.into());
+                    }
                     Err(err) => {
                         tracing::debug!(%peer, %addr, error = %err, "dial failed");
                         last = err;

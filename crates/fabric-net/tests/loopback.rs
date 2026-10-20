@@ -757,6 +757,33 @@ async fn a_dropped_connection_handle_keeps_its_live_streams() -> TestResult {
     Ok(())
 }
 
+/// A peer's address list can be stale: after DHCP gave an old address of
+/// B to another node C, C answers there with its own valid key. That is
+/// the wrong host, not a forgery, so the dial goes on to B's next address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn another_node_at_a_stale_address_does_not_end_the_dial() -> TestResult {
+    let (a, b, c) = (Node::new()?, Node::new()?, Node::new()?);
+    let any: SocketAddr = ([127, 0, 0, 1], 0).into();
+    let trust_a: Arc<dyn Trust> = Arc::new(Paired(vec![b.id()]));
+    let trust_bc: Arc<dyn Trust> = Arc::new(Paired(vec![a.id()]));
+    let stale = Endpoint::bind(&c.identity, &trust_bc, any)?;
+    let current = Arc::new(Endpoint::bind(&b.identity, &trust_bc, any)?);
+    let client = Endpoint::bind(&a.identity, &trust_a, any)?;
+    let accepting = {
+        let current = current.clone();
+        tokio::spawn(async move { current.accept().await })
+    };
+    let dialed = client
+        .dial_any(
+            b.id(),
+            &[stale.local_addr()?.into(), current.local_addr()?.into()],
+        )
+        .await?;
+    assert_eq!(dialed.connection.peer(), b.id());
+    assert_eq!(accepting.await??.peer(), a.id());
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn quic_is_dialed_first_and_tcp_is_the_fallback() -> TestResult {
     let (a, b) = (Node::new()?, Node::new()?);
