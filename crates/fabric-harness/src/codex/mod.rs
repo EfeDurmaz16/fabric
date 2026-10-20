@@ -179,6 +179,79 @@ fn toml_quoted_key(root: &AbsPath) -> Result<String, HarnessError> {
     Ok(key)
 }
 
+/// The file that holds `rollout` among `all`. Files that share the id are
+/// reduced to the longest when every other one is a byte prefix of it, so
+/// a thread that went to another node and came back never forks silently;
+/// otherwise the lineage of `session` is ambiguous. Only the ids a lineage
+/// reaches are resolved, so a forked rollout of another thread blocks
+/// nothing here.
+fn resolve(
+    session: &SessionId,
+    rollout: &SessionId,
+    all: &[RolloutFile],
+) -> Result<Option<RolloutFile>, HarnessError> {
+    let mut longest: Option<&RolloutFile> = None;
+    for file in all.iter().filter(|f| f.name.rollout_id == *rollout) {
+        let Some(kept) = longest else {
+            longest = Some(file);
+            continue;
+        };
+        longest = Some(match files::compare(&kept.path, &file.path)? {
+            Relation::Missing | Relation::Equal => kept,
+            Relation::ExistingIsPrefix => file,
+            Relation::Diverged => match files::compare(&file.path, &kept.path)? {
+                Relation::ExistingIsPrefix => kept,
+                Relation::Missing | Relation::Equal | Relation::Diverged => {
+                    return Err(HarnessError::LineageAmbiguous {
+                        session: session.clone(),
+                        rollout: rollout.clone(),
+                        paths: vec![kept.path.clone(), file.path.clone()],
+                    });
+                }
+            },
+        });
+    }
+    Ok(longest.cloned())
+}
+
+/// The rollout lineage of `session` among `all`, newest suffix first: the
+/// newest rollout of the thread, then each prefix its `history_base` names.
+fn lineage_in(
+    all: &[RolloutFile],
+    session: &SessionId,
+    searched: &Path,
+) -> Result<Vec<RolloutFile>, HarnessError> {
+    let not_found = || HarnessError::SessionNotFound {
+        kind: HarnessKind::Codex,
+        session: session.clone(),
+        searched: searched.to_path_buf(),
+    };
+    let head_id = all
+        .iter()
+        .find(|f| f.name.thread_id == *session)
+        .map(|f| f.name.rollout_id.clone())
+        .ok_or_else(not_found)?;
+    let head = resolve(session, &head_id, all)?.ok_or_else(not_found)?;
+    let mut chain = vec![head];
+    loop {
+        let last = chain.last().ok_or_else(not_found)?;
+        let Some(prefix_id) = rollout::read_meta(last)?.history_base else {
+            break;
+        };
+        if chain.iter().any(|f| f.name.rollout_id == prefix_id) {
+            break;
+        }
+        let Some(prefix) = resolve(session, &prefix_id, all)? else {
+            return Err(HarnessError::LineageBroken {
+                session: session.clone(),
+                missing: prefix_id,
+            });
+        };
+        chain.push(prefix);
+    }
+    Ok(chain)
+}
+
 impl Codex {
     /// An adapter whose state lives under `home/.codex`, finding `codex`
     /// on the `PATH` value `path_var`.
@@ -246,40 +319,11 @@ impl Codex {
         files::rel_components(rel)
     }
 
-    /// Every rollout in the store, with files that share a rollout id
-    /// reduced to the longest when the shorter ones are byte prefixes of it.
-    fn all_rollouts(&self, session: &SessionId) -> Result<Vec<RolloutFile>, HarnessError> {
+    /// Every rollout file in the store, duplicates included.
+    fn all_rollouts(&self) -> Result<Vec<RolloutFile>, HarnessError> {
         let mut all = rollout::list(&self.store.join("sessions"))?;
         all.extend(rollout::list(&self.store.join("archived_sessions"))?);
-        let mut kept: Vec<RolloutFile> = Vec::with_capacity(all.len());
-        for file in all {
-            let Some(index) = kept
-                .iter()
-                .position(|k| k.name.rollout_id == file.name.rollout_id)
-            else {
-                kept.push(file);
-                continue;
-            };
-            let existing = &kept[index];
-            let keep_existing = match files::compare(&existing.path, &file.path)? {
-                Relation::Missing | Relation::Equal => true,
-                Relation::ExistingIsPrefix => false,
-                Relation::Diverged => match files::compare(&file.path, &existing.path)? {
-                    Relation::ExistingIsPrefix => true,
-                    Relation::Missing | Relation::Equal | Relation::Diverged => {
-                        return Err(HarnessError::LineageAmbiguous {
-                            session: session.clone(),
-                            rollout: file.name.rollout_id.clone(),
-                            paths: vec![existing.path.clone(), file.path],
-                        });
-                    }
-                },
-            };
-            if !keep_existing {
-                kept[index] = file;
-            }
-        }
-        Ok(kept)
+        Ok(all)
     }
 
     /// The newest thread whose rollout records the workspace as its `cwd`.
@@ -300,38 +344,9 @@ impl Codex {
         Ok(None)
     }
 
-    /// The rollout lineage of `session`, newest suffix first.
+    /// The rollout lineage of `session` in this store, newest suffix first.
     pub(crate) fn lineage(&self, session: &SessionId) -> Result<Vec<RolloutFile>, HarnessError> {
-        let all = self.all_rollouts(session)?;
-        let not_found = || HarnessError::SessionNotFound {
-            kind: HarnessKind::Codex,
-            session: session.clone(),
-            searched: self.store.join("sessions"),
-        };
-        let head = all
-            .iter()
-            .find(|f| f.name.thread_id == *session)
-            .cloned()
-            .ok_or_else(not_found)?;
-        let mut chain = vec![head];
-        loop {
-            let last = chain.last().ok_or_else(not_found)?;
-            let meta = rollout::read_meta(last)?;
-            let Some(prefix_id) = meta.history_base else {
-                break;
-            };
-            if chain.iter().any(|f| f.name.rollout_id == prefix_id) {
-                break;
-            }
-            let Some(prefix) = all.iter().find(|f| f.name.rollout_id == prefix_id).cloned() else {
-                return Err(HarnessError::LineageBroken {
-                    session: session.clone(),
-                    missing: prefix_id,
-                });
-            };
-            chain.push(prefix);
-        }
-        Ok(chain)
+        lineage_in(&self.all_rollouts()?, session, &self.store.join("sessions"))
     }
 
     /// Takes the thread writer lock as Codex's `acquire` does: the
@@ -464,38 +479,29 @@ impl Codex {
     /// Where one rollout of `session` lands: over the file that already
     /// holds that rollout on this node, else under `fallback_dir`.
     fn destination(
-        &self,
-        rel: &str,
         session: &SessionId,
+        staged: &RolloutFile,
+        name_text: &str,
         existing: &[RolloutFile],
         fallback_dir: &Path,
-        staged: PathBuf,
-    ) -> Result<Option<Destination>, HarnessError> {
-        let Some((name_text, name)) = self.restorable(rel)? else {
-            return Ok(None);
-        };
-        let same_id: Vec<&RolloutFile> = existing
-            .iter()
-            .filter(|f| f.name.rollout_id == name.rollout_id)
-            .collect();
-        let path = match same_id.as_slice() {
-            [] => fallback_dir.join(name_text),
-            [found] if found.name.compressed == name.compressed => found.path.clone(),
-            found => {
-                let mut paths: Vec<PathBuf> = found.iter().map(|f| f.path.clone()).collect();
-                paths.push(staged);
+    ) -> Result<Destination, HarnessError> {
+        let name = &staged.name;
+        let path = match resolve(session, &name.rollout_id, existing)? {
+            None => fallback_dir.join(name_text),
+            Some(found) if found.name.compressed == name.compressed => found.path,
+            Some(found) => {
                 return Err(HarnessError::LineageAmbiguous {
                     session: session.clone(),
-                    rollout: name.rollout_id,
-                    paths,
+                    rollout: name.rollout_id.clone(),
+                    paths: vec![found.path, staged.path.clone()],
                 });
             }
         };
-        Ok(Some(Destination {
+        Ok(Destination {
             path,
             content: Content::Opaque,
             mutability: Mutability::AppendOnly,
-        }))
+        })
     }
 
     fn restore_sync(
@@ -504,8 +510,22 @@ impl Codex {
         manifest: StateManifest,
     ) -> Result<Restored, HarnessError> {
         let session = manifest.session().clone();
+        // Only the rollouts on the thread's own lineage, derived from the
+        // staged files, may be placed; any other rollout in the manifest
+        // is refused like any other unexpected file.
+        let mut staged = Vec::new();
+        for file in manifest.files() {
+            let rel = file.rel_path.as_str();
+            if let Some((_, name)) = self.restorable(rel)? {
+                staged.push(RolloutFile {
+                    path: state.join(rel),
+                    name,
+                });
+            }
+        }
+        let chain = lineage_in(&staged, &session, state)?;
         let lock = self.hold_writer_lock(&session)?;
-        let existing = self.all_rollouts(&session)?;
+        let existing = self.all_rollouts()?;
         let fallback_dir = self
             .store
             .join("sessions")
@@ -514,7 +534,14 @@ impl Codex {
         // A rollout only grows, so nothing is ever replaced and no
         // departure record is kept.
         let restored = pipeline::restore(manifest, state, None, |rel, _| {
-            self.destination(rel, &session, &existing, &fallback_dir, state.join(rel))
+            let Some((name_text, _)) = self.restorable(rel)? else {
+                return Ok(None);
+            };
+            let path = state.join(rel);
+            let Some(on_lineage) = chain.iter().find(|f| f.path == path) else {
+                return Ok(None);
+            };
+            Self::destination(&session, on_lineage, name_text, &existing, &fallback_dir).map(Some)
         })?;
         drop(lock);
         info!(%session, files = restored.placed.len(), "codex: restored");

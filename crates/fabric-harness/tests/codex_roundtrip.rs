@@ -403,15 +403,41 @@ async fn two_files_for_one_rollout_resolve_by_prefix_or_are_refused() {
     );
 }
 
+#[tokio::test]
+async fn a_forked_rollout_of_another_thread_blocks_nothing() {
+    let src = build_source();
+    let home = src.home.path().canonicalize().unwrap();
+    let other = "019f9999-bb33-7342-85fa-f2d33b149999";
+    let name = format!("rollout-2026-10-17T08-00-00-{other}.jsonl");
+    for (dir, cwd) in [("2026/10/17", "/a"), ("fabric/x", "/b")] {
+        let path = home.join(".codex/sessions").join(dir).join(&name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, session_meta(other, cwd, None)).unwrap();
+    }
+    let adapter = node(&home);
+    let out = tempfile::tempdir().unwrap();
+    let manifest = adapter
+        .capture(&src.work, &thread(), out.path())
+        .await
+        .unwrap();
+    assert_eq!(manifest.files().len(), 2);
+    adapter.restore(&src.work, out.path()).await.unwrap();
+}
+
 /// Writes `manifest` under `out` with one more entry, for `body` at `rel`,
 /// as someone who forged the tree would.
 fn forge(out: &Path, manifest: &StateManifest, rel: &str, body: &[u8]) {
+    forge_as(out, manifest, rel, body, "Replaceable");
+}
+
+/// `forge` with the mutability the entry claims.
+fn forge_as(out: &Path, manifest: &StateManifest, rel: &str, body: &[u8], mutability: &str) {
     let mut value = serde_json::to_value(manifest).unwrap();
     let files = value["files"].as_array_mut().unwrap();
     files.push(serde_json::json!({
         "rel_path": rel,
         "content": "Opaque",
-        "mutability": "Replaceable",
+        "mutability": mutability,
         "size": body.len(),
         "blake3": blake3::hash(body).to_hex().to_string(),
     }));
@@ -456,6 +482,21 @@ async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_the
     forge(out.path(), &manifest, rel, b"payload");
     let err = adapter.restore(&src.work, out.path()).await.unwrap_err();
     assert!(matches!(err, HarnessError::UnexpectedFile { .. }), "{err}");
+    assert!(!home.join(".codex/sessions").exists());
+
+    // So is a well-formed rollout of another thread, off this lineage.
+    let other = "019f9999-bb33-7342-85fa-f2d33b149999";
+    let rel = format!("home/.codex/sessions/2026/10/17/rollout-2026-10-17T08-00-00-{other}.jsonl");
+    let body = session_meta(other, "/a", None);
+    let staged = out.path().join(&rel);
+    std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+    std::fs::write(&staged, &body).unwrap();
+    forge_as(out.path(), &manifest, &rel, body.as_bytes(), "AppendOnly");
+    let err = adapter.restore(&src.work, out.path()).await.unwrap_err();
+    assert!(
+        matches!(err, HarnessError::UnexpectedFile { ref path, .. } if *path == rel),
+        "{err}"
+    );
     assert!(!home.join(".codex/sessions").exists());
     manifest.write(out.path()).unwrap();
 
