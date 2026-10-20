@@ -264,6 +264,14 @@ pub struct Node {
     pub id: String,
 }
 
+/// How one try at starting a daemon ended.
+enum Started {
+    /// It answers and has caught up with its peers.
+    Up,
+    /// It exited because another process took its port first.
+    PortTaken,
+}
+
 /// The next port to try, below the range macOS and Linux hand out for
 /// ephemeral sockets, starting at a point that differs between test runs.
 static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
@@ -273,7 +281,9 @@ static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::n
 ///
 /// Each port is handed out once, so a node killed and started again finds
 /// its port free: a port the system picked would be offered to the next
-/// node another test starts while this one is down.
+/// node another test starts while this one is down. Another process, such
+/// as a run in a sibling worktree, can still bind it between this probe and
+/// the daemon's start; the first start then moves to the next port.
 fn free_port() -> Fallible<u16> {
     use std::sync::atomic::Ordering;
     let base = 20_000 + u16::try_from(std::process::id() % 10_000)?;
@@ -323,10 +333,26 @@ impl Node {
 
     /// Starts the daemon, with `fault` armed when given, and waits until it
     /// answers and has caught up with its peers.
+    ///
+    /// When another process took the port before the first start, the node
+    /// takes the next free one. After that its peers know its address, so a
+    /// restart keeps the port and a taken port fails the test.
     pub fn start(&mut self, fault: Option<&str>) -> Fallible {
         if self.daemon.is_some() {
             return Err(format!("{} already runs", self.name).into());
         }
+        loop {
+            match self.try_start(fault)? {
+                Started::Up => return Ok(()),
+                Started::PortTaken if self.id.is_empty() => self.port = free_port()?,
+                Started::PortTaken => {
+                    return Err(format!("{} lost its port:\n{}", self.name, self.log()).into());
+                }
+            }
+        }
+    }
+
+    fn try_start(&mut self, fault: Option<&str>) -> Fallible<Started> {
         match fs::remove_file(self.signal()) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
             _ => {}
@@ -360,6 +386,15 @@ impl Node {
                     .clone_into(&mut self.id);
                 break;
             }
+            if let Some(daemon) = self.daemon.as_mut()
+                && daemon.try_wait()?.is_some()
+            {
+                self.daemon = None;
+                if self.log().contains("Address already in use") {
+                    return Ok(Started::PortTaken);
+                }
+                return Err(format!("{} exited at start:\n{}", self.name, self.log()).into());
+            }
             if started.elapsed() > START_TIMEOUT {
                 return Err(format!("{} did not start:\n{}", self.name, self.log()).into());
             }
@@ -371,7 +406,7 @@ impl Node {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        Ok(())
+        Ok(Started::Up)
     }
 
     /// Kills the daemon with `SIGKILL` and reaps it.
