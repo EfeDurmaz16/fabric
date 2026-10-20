@@ -5,6 +5,8 @@
 //! the refusal is checked on the tree path right before the copy, so an
 //! adapter bug cannot carry one by accident (ADR 0006, Credentials and
 //! terms). The list is hard-coded on purpose: it is policy, not config.
+//! Names are compared after ASCII case folding, because APFS and
+//! casefolded ext4 open `AUTH.JSON` as `auth.json`.
 
 #![cfg_attr(
     not(any(feature = "acp", feature = "claude", feature = "codex")),
@@ -155,7 +157,8 @@ fn is_env_file(name: &str) -> bool {
 
 /// Returns the rule a tree path breaks, or `None` when it may be carried.
 pub(crate) fn check(rel_path: &str) -> Option<DenyRule> {
-    let components: Vec<&str> = rel_path.split('/').collect();
+    let folded = rel_path.to_ascii_lowercase();
+    let components: Vec<&str> = folded.split('/').collect();
     for name in &components {
         if SECRET_NAMES.contains(name) {
             return Some(DenyRule::CredentialFileName);
@@ -246,6 +249,14 @@ mod tests {
             "home/w/config/server.pem",
             "home/w/.claude/.env.production",
             "home/.fabric/harness/departed/acp-x/s1.json",
+            "home/.fake-agent/AUTH.JSON",
+            "home/w/.ENV",
+            "home/w/.Env.Local",
+            "home/.SSH/config",
+            "home/w/config/SERVER.PEM",
+            "home/.Config/GH/hosts.yml",
+            "home/.claude/History.jsonl",
+            "home/.Codex/Config.toml",
         ] {
             assert!(check(path).is_some(), "{path} should be denied");
         }
@@ -265,6 +276,7 @@ mod tests {
             "home/.codex/archived_sessions/rollout-2026-10-19T10-00-00-abc.jsonl.zst",
             "home/.claude/settings.local.json",
             "home/w/.env.example",
+            "home/w/.ENV.EXAMPLE",
             "home/.fake-agent/sessions/.coordination.lock",
             "home/.config/ghostty/config",
         ] {
