@@ -139,20 +139,10 @@ impl Credentials {
 
     /// A client configuration that accepts only the server `expected`.
     pub(crate) fn client_config(&self, expected: NodeId) -> Result<rustls::ClientConfig, TlsError> {
-        let provider = provider();
-        let algorithms = provider.signature_verification_algorithms;
-        let mut config = rustls::ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(TlsError::Config)?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(PinnedServer {
-                expected,
-                algorithms,
-            }))
+        let config = client_builder(expected)?
             .with_client_auth_cert(vec![self.cert.clone()], self.key.clone_key())
             .map_err(TlsError::Config)?;
-        config.alpn_protocols = vec![ALPN.to_vec()];
-        Ok(config)
+        Ok(finish_client(config))
     }
 
     /// A server configuration that accepts only paired clients.
@@ -160,18 +150,52 @@ impl Credentials {
         &self,
         trust: Arc<dyn Trust>,
     ) -> Result<rustls::ServerConfig, TlsError> {
-        let provider = provider();
-        let algorithms = provider.signature_verification_algorithms;
-        let mut config = rustls::ServerConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(TlsError::Config)?
-            .with_client_cert_verifier(Arc::new(PairedClients { trust, algorithms }))
+        let config = server_builder(trust)?
             .with_single_cert(vec![self.cert.clone()], self.key.clone_key())
             .map_err(TlsError::Config)?;
-        config.alpn_protocols = vec![ALPN.to_vec()];
-        config.max_early_data_size = 0;
-        Ok(config)
+        Ok(finish_server(config))
     }
+}
+
+/// The client side up to its own certificate: TLS 1.3 and the pinned verifier.
+fn client_builder(
+    expected: NodeId,
+) -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert>, TlsError>
+{
+    let provider = provider();
+    let algorithms = provider.signature_verification_algorithms;
+    Ok(rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(TlsError::Config)?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedServer {
+            expected,
+            algorithms,
+        })))
+}
+
+/// The server side up to its own certificate: TLS 1.3 and the paired-clients verifier.
+fn server_builder(
+    trust: Arc<dyn Trust>,
+) -> Result<rustls::ConfigBuilder<rustls::ServerConfig, rustls::server::WantsServerCert>, TlsError>
+{
+    let provider = provider();
+    let algorithms = provider.signature_verification_algorithms;
+    Ok(rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(TlsError::Config)?
+        .with_client_cert_verifier(Arc::new(PairedClients { trust, algorithms })))
+}
+
+fn finish_client(mut config: rustls::ClientConfig) -> rustls::ClientConfig {
+    config.alpn_protocols = vec![ALPN.to_vec()];
+    config
+}
+
+fn finish_server(mut config: rustls::ServerConfig) -> rustls::ServerConfig {
+    config.alpn_protocols = vec![ALPN.to_vec()];
+    config.max_early_data_size = 0;
+    config
 }
 
 fn reject(err: TlsError) -> rustls::Error {
@@ -323,55 +347,153 @@ mod tests {
         }
     }
 
-    /// The server pins the key, not the certificate: a dialer that holds a
-    /// paired node's certificate but another private key cannot complete
-    /// the handshake, because the signature over the handshake is checked
-    /// against the key the certificate names.
-    #[tokio::test]
-    async fn a_paired_certificate_without_its_key_fails_the_handshake() {
-        use tokio::io::AsyncWriteExt;
+    /// A certificate and key pair installed through a resolver, which rustls
+    /// does not check for consistency the way `with_single_cert` does.
+    #[derive(Debug)]
+    struct Forged(Arc<rustls::sign::CertifiedKey>);
+
+    impl Forged {
+        fn new(cert: &CertificateDer<'static>, key_of: &NodeIdentity) -> Arc<Self> {
+            let signer = provider()
+                .key_provider
+                .load_private_key(PrivateKeyDer::Pkcs8(key_of.pkcs8_der()))
+                .unwrap();
+            Arc::new(Self(Arc::new(rustls::sign::CertifiedKey::new(
+                vec![cert.clone()],
+                signer,
+            ))))
+        }
+    }
+
+    impl rustls::client::ResolvesClientCert for Forged {
+        fn resolve(
+            &self,
+            _root_hint_subjects: &[&[u8]],
+            _sigschemes: &[SignatureScheme],
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            Some(self.0.clone())
+        }
+
+        fn has_certs(&self) -> bool {
+            true
+        }
+    }
+
+    impl rustls::server::ResolvesServerCert for Forged {
+        fn resolve(
+            &self,
+            _client_hello: rustls::server::ClientHello<'_>,
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            Some(self.0.clone())
+        }
+    }
+
+    struct Outcome {
+        server: std::io::Result<()>,
+        client: std::io::Result<()>,
+    }
+
+    /// Runs one handshake over an in-memory pipe and reports each side's verdict.
+    ///
+    /// Each side sends one byte and reads the other's, so neither side ends
+    /// before the other's verdict on the handshake reached it.
+    async fn handshake(
+        server: Arc<rustls::ServerConfig>,
+        client: Arc<rustls::ClientConfig>,
+    ) -> Outcome {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio_rustls::{TlsAcceptor, TlsConnector};
 
+        let (client_io, server_io) = tokio::io::duplex(64 << 10);
+        let acceptor = TlsAcceptor::from(server);
+        let accepted = tokio::spawn(async move {
+            let mut tls = acceptor.accept(server_io).await?;
+            tls.read_u8().await?;
+            tls.write_u8(b's').await?;
+            tls.flush().await
+        });
+        let name = ServerName::IpAddress(rustls::pki_types::IpAddr::try_from("127.0.0.1").unwrap());
+        let client = async {
+            let mut tls = TlsConnector::from(client).connect(name, client_io).await?;
+            tls.write_u8(b'c').await?;
+            tls.flush().await?;
+            tls.read_u8().await.map(drop)
+        }
+        .await;
+        Outcome {
+            server: accepted.await.unwrap(),
+            client,
+        }
+    }
+
+    /// The local verifier found a handshake signature that the certificate's key did not make.
+    fn is_bad_signature(result: &std::io::Result<()>) -> bool {
+        matches!(
+            result
+                .as_ref()
+                .err()
+                .and_then(|err| err.get_ref())
+                .and_then(|err| err.downcast_ref::<rustls::Error>()),
+            Some(rustls::Error::InvalidCertificate(
+                CertificateError::BadSignature
+            ))
+        )
+    }
+
+    /// A certificate is public, so each verifier checks the handshake
+    /// signature against the key the certificate names. A side that holds a
+    /// node's certificate with another private key fails inside the
+    /// handshake, as a dialer and as a server. rustls refuses a mismatched
+    /// pair when a config is built, which would make this test pass for the
+    /// wrong reason; the forged side installs its pair through a resolver,
+    /// so the handshake runs and the verifier is what refuses.
+    #[tokio::test]
+    async fn a_certificate_without_its_key_fails_the_handshake_on_either_side() {
         let server = NodeIdentity::generate().unwrap();
-        let honest = NodeIdentity::generate().unwrap();
+        let client = NodeIdentity::generate().unwrap();
         let thief = NodeIdentity::generate().unwrap();
         let server_creds = Credentials::new(&server).unwrap();
-        let honest_creds = Credentials::new(&honest).unwrap();
-        let forged = Credentials {
-            cert: honest_creds.cert.clone(),
-            key: Credentials::new(&thief).unwrap().key,
-        };
-        let trust: Arc<dyn Trust> = Arc::new(Paired(vec![honest.node_id()]));
-        let acceptor = TlsAcceptor::from(Arc::new(server_creds.server_config(trust).unwrap()));
-        let name = ServerName::IpAddress(rustls::pki_types::IpAddr::try_from("127.0.0.1").unwrap());
+        let client_creds = Credentials::new(&client).unwrap();
+        let trust: Arc<dyn Trust> = Arc::new(Paired(vec![client.node_id()]));
 
-        let handshake = |creds: &Credentials| {
-            let config = creds.client_config(server.node_id());
-            let acceptor = acceptor.clone();
-            let name = name.clone();
-            async move {
-                let config = config?;
-                let (client_io, server_io) = tokio::io::duplex(64 << 10);
-                let accepted = tokio::spawn(async move { acceptor.accept(server_io).await });
-                let connector = TlsConnector::from(Arc::new(config));
-                let mut client = connector
-                    .connect(name, client_io)
-                    .await
-                    .map_err(|e| TlsError::Config(rustls::Error::General(e.to_string())))?;
-                // The client believes the handshake is done once it sent its
-                // Finished; the server's verdict shows up on the first read.
-                client.write_all(b"x").await.ok();
-                let _ = client.shutdown().await;
-                accepted
-                    .await
-                    .map_err(|e| TlsError::Config(rustls::Error::General(e.to_string())))?
-                    .map(|_| ())
-                    .map_err(|e| TlsError::Config(rustls::Error::General(e.to_string())))
-            }
-        };
+        let honest = handshake(
+            Arc::new(server_creds.server_config(trust.clone()).unwrap()),
+            Arc::new(client_creds.client_config(server.node_id()).unwrap()),
+        )
+        .await;
+        assert!(honest.server.is_ok() && honest.client.is_ok());
 
-        assert!(handshake(&forged).await.is_err());
-        handshake(&honest_creds).await.unwrap();
+        let forged_dialer = finish_client(
+            client_builder(server.node_id())
+                .unwrap()
+                .with_client_cert_resolver(Forged::new(&client_creds.cert, &thief)),
+        );
+        let outcome = handshake(
+            Arc::new(server_creds.server_config(trust.clone()).unwrap()),
+            Arc::new(forged_dialer),
+        )
+        .await;
+        assert!(
+            is_bad_signature(&outcome.server),
+            "the server must refuse the forged dialer: {:?}",
+            outcome.server
+        );
+
+        let forged_server = finish_server(
+            server_builder(trust)
+                .unwrap()
+                .with_cert_resolver(Forged::new(&server_creds.cert, &thief)),
+        );
+        let outcome = handshake(
+            Arc::new(forged_server),
+            Arc::new(client_creds.client_config(server.node_id()).unwrap()),
+        )
+        .await;
+        assert!(
+            is_bad_signature(&outcome.client),
+            "the dialer must refuse the forged server: {:?}",
+            outcome.client
+        );
     }
 
     #[test]
