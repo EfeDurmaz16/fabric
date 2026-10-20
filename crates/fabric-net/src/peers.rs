@@ -700,6 +700,26 @@ mod tests {
         assert!(!daemon.is_paired(node(1)), "a removed book pairs no one");
     }
 
+    /// The CLI unpairs a node while the daemon, which read the book before,
+    /// records a connection: the revocation sticks on disk and in the daemon.
+    #[test]
+    fn an_unpair_by_hand_survives_the_daemons_next_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers");
+        let daemon = Peers::open(&path).unwrap();
+        daemon.update(|b| b.pair(node(1), None)).unwrap();
+        let cli = Peers::open(&path).unwrap();
+        cli.update(|b| {
+            b.unpair(node(1));
+        })
+        .unwrap();
+        daemon
+            .update(|b| b.seen(node(1), "10.0.0.1:7777".parse().unwrap(), 5))
+            .unwrap();
+        assert!(!PeerBook::load(&path).unwrap().is_paired(node(1)));
+        assert!(!daemon.is_paired(node(1)));
+    }
+
     proptest! {
         #[test]
         fn entries_round_trip_as_text(
