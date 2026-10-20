@@ -1,5 +1,6 @@
-//! The store half of Fabric (ADR 0004): content-addressed objects, the
-//! `SQLite` catalog, and workspace capture and restore.
+//! The store half of Fabric (ADR 0004, as built in ADR 0014):
+//! content-addressed objects, the `SQLite` catalog, and workspace capture
+//! and restore.
 //!
 //! Invariant: nothing the catalog names is missing from disk, and nothing a
 //! restore writes lands outside the directory it was asked to create. Every
@@ -9,7 +10,7 @@
 //! turns a workspace into a `SnapshotManifest` from `fabric-core` whose
 //! objects are all in the store, and restore turns a manifest back into a
 //! directory, with the git state carried as commits and refs, the index
-//! split kept, modes and mtimes exact, and secrets never present.
+//! split kept, modes and mtimes exact, and untracked secrets never present.
 //!
 //! The crate does IO and runs `git`; it knows nothing about the network,
 //! the job ledger or any harness. A caller publishes a manifest after

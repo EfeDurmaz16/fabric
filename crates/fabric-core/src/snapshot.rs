@@ -271,8 +271,9 @@ pub enum CarryKey {
 impl CarryKey {
     /// True when bytes measured under `self` may be used on a node that measured `target` (ADR 0012).
     ///
-    /// The keys must be equal and neither may be `Unmeasured`. This is the
-    /// comparison restore uses; `==` is plain equality and says `Unmeasured`
+    /// The keys must be equal and neither may be `Unmeasured`. A caller
+    /// deciding the carry question, such as the `carry` closure it hands to
+    /// restore, uses this; `==` is plain equality and says `Unmeasured`
     /// equals itself.
     #[must_use]
     pub fn matches(&self, target: &CarryKey) -> bool {

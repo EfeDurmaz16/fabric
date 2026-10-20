@@ -7,7 +7,7 @@
 //! never content.
 
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -15,6 +15,9 @@ use std::time::SystemTime;
 
 use fabric_core::id::ChunkId;
 use fastcdc::v2020::{AVERAGE_MAX, AVERAGE_MIN, FastCDC, MAXIMUM_MAX, MINIMUM_MIN, StreamCDC};
+
+use rustix::fs::{Mode, OFlags};
+use rustix::io::Errno;
 
 use crate::durable::{self, Published};
 
@@ -48,6 +51,12 @@ pub enum ObjectError {
         /// The path.
         path: PathBuf,
     },
+    /// The bytes are longer than any object may be.
+    #[error("{len} bytes is above the {MAX_OBJECT_LEN} byte object bound")]
+    TooLarge {
+        /// The length that was offered.
+        len: usize,
+    },
     /// The chunking parameters break a rule of the chunker.
     #[error("chunk parameters: {0}")]
     BadParams(&'static str),
@@ -58,6 +67,21 @@ fn io_err(path: &Path, source: io::Error) -> ObjectError {
         path: path.to_owned(),
         source,
     }
+}
+
+/// Opens `path` for reading when it is a regular file, and returns `None` for anything else.
+///
+/// The open does not follow a symlink in the last component and does not
+/// wait on a FIFO, and the type is read from the open descriptor, so what
+/// the caller reads is the file that was checked.
+pub(crate) fn open_regular(path: &Path) -> io::Result<Option<File>> {
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let file = match rustix::fs::open(path, flags, Mode::empty()) {
+        Ok(fd) => File::from(fd),
+        Err(Errno::LOOP) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(file.metadata()?.is_file().then_some(file))
 }
 
 /// The largest object a store writes: the bulk frame bound of ADR 0005.
@@ -170,8 +194,6 @@ impl ChunkParams {
 pub struct StoredChunk {
     /// The object's id.
     pub id: ChunkId,
-    /// Its uncompressed length.
-    pub len: u64,
     /// Its length on disk.
     pub stored_len: u64,
     /// Whether this call wrote it, or it was already present.
@@ -239,8 +261,7 @@ impl ObjectStore {
     }
 
     /// Returns the path an object with `id` has or would have.
-    #[must_use]
-    pub fn object_path(&self, id: ChunkId) -> PathBuf {
+    pub(crate) fn object_path(&self, id: ChunkId) -> PathBuf {
         let hex = id.to_string();
         self.objects_dir.join(&hex[..2]).join(hex)
     }
@@ -256,13 +277,17 @@ impl ObjectStore {
     }
 
     /// Writes `bytes` as one object and returns its id; a present object is left as it is.
+    ///
+    /// Bytes above `MAX_OBJECT_LEN` are refused: `read` would report such an object as corrupt.
     pub fn put(&self, bytes: &[u8]) -> Result<StoredChunk, ObjectError> {
+        if bytes.len() > MAX_OBJECT_LEN as usize {
+            return Err(ObjectError::TooLarge { len: bytes.len() });
+        }
         let id = ChunkId::of(bytes);
         let path = self.object_path(id);
         if let Ok(meta) = fs::metadata(&path) {
             return Ok(StoredChunk {
                 id,
-                len: bytes.len() as u64,
                 stored_len: meta.len(),
                 new: false,
             });
@@ -280,7 +305,6 @@ impl ObjectStore {
         self.mark_dirty(id);
         Ok(StoredChunk {
             id,
-            len: bytes.len() as u64,
             stored_len: compressed.len() as u64,
             new: published == Published::New,
         })
@@ -314,7 +338,7 @@ impl ObjectStore {
     ///
     /// A symlink, FIFO, socket or device at `path` is refused, not followed or read.
     pub fn put_file(&self, path: &Path) -> Result<StoredFile, ObjectError> {
-        let file = durable::open_regular(path)
+        let file = open_regular(path)
             .map_err(|e| io_err(path, e))?
             .ok_or_else(|| ObjectError::NotRegular {
                 path: path.to_owned(),

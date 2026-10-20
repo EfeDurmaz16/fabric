@@ -7,25 +7,15 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 
 use fabric_core::id::ChunkId;
-use fabric_store::objects::{ChunkParams, ObjectError};
+use fabric_store::objects::{ChunkParams, MAX_OBJECT_LEN, ObjectError};
 use fabric_store::store::Store;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
 
+mod common;
+
 fn small_params() -> Result<ChunkParams, ObjectError> {
     ChunkParams::new(4096, 64, 256, 1024, 3)
-}
-
-fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
-    let mut state = seed | 1;
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state.to_le_bytes()[3]
-        })
-        .collect()
 }
 
 #[test]
@@ -35,14 +25,14 @@ fn an_object_is_written_once_and_read_back_verified() {
     let objects = store.objects();
     let first = objects.put(b"hello").unwrap();
     assert!(first.new);
-    let path = objects.object_path(first.id);
+    let path = common::object_path(dir.path(), first.id);
     let inode = fs::metadata(&path).unwrap().ino();
     let second = objects.put(b"hello").unwrap();
     assert!(!second.new);
     assert_eq!(second.id, first.id);
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
     assert_eq!(objects.read(first.id).unwrap(), b"hello");
-    assert!(objects.object_path(first.id).exists());
+    assert!(common::object_path(dir.path(), first.id).exists());
     assert_eq!(fs::read_dir(dir.path().join("tmp")).unwrap().count(), 0);
 }
 
@@ -52,7 +42,7 @@ fn a_corrupt_object_is_an_error_not_content() {
     let store = Store::create(dir.path(), small_params().unwrap()).unwrap();
     let objects = store.objects();
     let stored = objects.put(b"the right bytes").unwrap();
-    let path = objects.object_path(stored.id);
+    let path = common::object_path(dir.path(), stored.id);
     let other = zstd::bulk::compress(b"the wrong bytes", 3).unwrap();
     fs::write(&path, other).unwrap();
     assert!(matches!(
@@ -72,11 +62,27 @@ fn a_corrupt_object_is_an_error_not_content() {
 }
 
 #[test]
+fn an_object_above_the_bound_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path(), small_params().unwrap()).unwrap();
+    let len = MAX_OBJECT_LEN as usize + 1;
+    assert!(matches!(
+        store.objects().put(&vec![0u8; len]),
+        Err(ObjectError::TooLarge { len: refused }) if refused == len
+    ));
+    let written: usize = fs::read_dir(dir.path().join("objects"))
+        .unwrap()
+        .map(|shard| fs::read_dir(shard.unwrap().path()).unwrap().count())
+        .sum();
+    assert_eq!(written, 0);
+}
+
+#[test]
 fn a_large_file_is_chunked_the_same_from_disk_and_from_memory() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::create(dir.path(), small_params().unwrap()).unwrap();
     let objects = store.objects();
-    let bytes = pseudo_random(20_000, 42);
+    let bytes = common::pseudo_random(20_000, 42);
     let file = dir.path().join("big.bin");
     fs::write(&file, &bytes).unwrap();
     let from_disk = objects.put_file(&file).unwrap();
@@ -109,7 +115,8 @@ fn chunking_round_trips_and_is_deterministic() {
         cases: 48,
         ..Config::default()
     });
-    let strategy = (0usize..12_000, any::<u64>()).prop_map(|(len, seed)| pseudo_random(len, seed));
+    let strategy =
+        (0usize..12_000, any::<u64>()).prop_map(|(len, seed)| common::pseudo_random(len, seed));
     runner
         .run(&strategy, |bytes| {
             let fail = |e: ObjectError| TestCaseError::fail(e.to_string());

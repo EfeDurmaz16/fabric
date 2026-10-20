@@ -653,17 +653,44 @@ fn the_large_untracked_guard_names_the_file() {
     assert!(capture(&store, &allowed).is_ok());
 }
 
-#[test]
-fn busy_repositories_and_linked_worktrees_are_refused() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("work");
-    make_repo(&root).unwrap();
-    let store = store_in(dir.path()).unwrap();
-    let policy = IgnorePolicy::default();
+/// A repository with every kind of change, a store and the default policy.
+struct BusyFixture {
+    dir: tempfile::TempDir,
+    root: PathBuf,
+    store: Store,
+    policy: IgnorePolicy,
+}
 
-    let merge_head = git(&root).git_path("MERGE_HEAD").unwrap();
+impl BusyFixture {
+    fn new() -> Fallible<BusyFixture> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("work");
+        make_repo(&root)?;
+        let store = store_in(dir.path())?;
+        Ok(BusyFixture {
+            dir,
+            root,
+            store,
+            policy: IgnorePolicy::default(),
+        })
+    }
+
+    /// Captures at `root` and returns the refusal, or `None` when capture succeeds.
+    fn capture_at(&self, root: &Path) -> Option<CaptureError> {
+        capture(&self.store, &request(root, &self.policy, None)).err()
+    }
+
+    fn capture_err(&self) -> Option<CaptureError> {
+        self.capture_at(&self.root)
+    }
+}
+
+#[test]
+fn a_merge_in_progress_is_refused() {
+    let fixture = BusyFixture::new().unwrap();
+    let merge_head = git(&fixture.root).git_path("MERGE_HEAD").unwrap();
     fs::write(&merge_head, "0000000000000000000000000000000000000000\n").unwrap();
-    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    let err = fixture.capture_err().unwrap();
     assert!(
         matches!(
             err,
@@ -673,28 +700,37 @@ fn busy_repositories_and_linked_worktrees_are_refused() {
         ),
         "{err}"
     );
-    fs::remove_file(&merge_head).unwrap();
+}
 
-    let linked = dir.path().join("linked");
-    git(&root)
+#[test]
+fn a_linked_worktree_is_refused() {
+    let fixture = BusyFixture::new().unwrap();
+    let linked = fixture.dir.path().join("linked");
+    git(&fixture.root)
         .run(&["worktree", "add", "-q", linked.to_str().unwrap(), "feature"])
         .unwrap();
-    let err = capture(&store, &request(&linked, &policy, None)).unwrap_err();
+    let err = fixture.capture_at(&linked).unwrap();
     assert!(
         matches!(err, CaptureError::GitLinkedWorktree { .. }),
         "{err}"
     );
+}
 
-    let sub = root.join("d");
-    let err = capture(&store, &request(&sub, &policy, None)).unwrap_err();
+#[test]
+fn a_root_below_the_top_level_is_refused() {
+    let fixture = BusyFixture::new().unwrap();
+    let err = fixture.capture_at(&fixture.root.join("d")).unwrap();
     assert!(
         matches!(err, CaptureError::NotRepositoryRoot { .. }),
         "{err}"
     );
+}
 
-    let rebase = git(&root).git_path("rebase-merge").unwrap();
-    fs::create_dir(&rebase).unwrap();
-    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+#[test]
+fn a_rebase_in_progress_is_refused() {
+    let fixture = BusyFixture::new().unwrap();
+    fs::create_dir(git(&fixture.root).git_path("rebase-merge").unwrap()).unwrap();
+    let err = fixture.capture_err().unwrap();
     assert!(
         matches!(
             err,
@@ -704,11 +740,13 @@ fn busy_repositories_and_linked_worktrees_are_refused() {
         ),
         "{err}"
     );
-    fs::remove_dir(&rebase).unwrap();
+}
 
-    let lock = git(&root).git_path("index.lock").unwrap();
-    fs::write(&lock, "").unwrap();
-    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+#[test]
+fn a_held_index_lock_is_refused() {
+    let fixture = BusyFixture::new().unwrap();
+    fs::write(git(&fixture.root).git_path("index.lock").unwrap(), "").unwrap();
+    let err = fixture.capture_err().unwrap();
     assert!(
         matches!(
             err,
@@ -718,15 +756,18 @@ fn busy_repositories_and_linked_worktrees_are_refused() {
         ),
         "{err}"
     );
-    fs::remove_file(&lock).unwrap();
+}
 
+#[test]
+fn unmerged_index_entries_are_refused() {
+    let fixture = BusyFixture::new().unwrap();
     // A stash applied over a conflicting commit leaves unmerged entries and no MERGE_HEAD.
-    let g = git(&root);
+    let g = git(&fixture.root);
     g.run(&["stash", "push", "-q"]).unwrap();
-    fs::write(root.join("a"), "a committed\n").unwrap();
+    fs::write(fixture.root.join("a"), "a committed\n").unwrap();
     g.run(&["commit", "-q", "-am", "conflicting"]).unwrap();
     assert!(!g.succeeds(&["stash", "apply", "-q"]).unwrap());
-    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    let err = fixture.capture_err().unwrap();
     assert!(
         matches!(
             err,
@@ -736,15 +777,18 @@ fn busy_repositories_and_linked_worktrees_are_refused() {
         ),
         "{err}"
     );
-    g.run(&["reset", "-q", "--hard"]).unwrap();
+}
 
-    // An LFS filter set only in .git/info/attributes, on an untracked file.
-    let info = git(&root).git_path("info/attributes").unwrap();
+#[test]
+fn an_lfs_filter_on_an_untracked_file_is_refused() {
+    let fixture = BusyFixture::new().unwrap();
+    // Set only in .git/info/attributes.
+    let info = git(&fixture.root).git_path("info/attributes").unwrap();
     fs::write(&info, "*.bin filter=lfs\n").unwrap();
-    fs::write(root.join("blob.bin"), "large\n").unwrap();
-    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    fs::write(fixture.root.join("blob.bin"), "large\n").unwrap();
+    let err = fixture.capture_err().unwrap();
     assert!(
-        matches!(&err, CaptureError::GitLfsUnsupported { path } if path == "blob.bin"),
+        matches!(&err, CaptureError::GitLfsUnsupported { path } if path.as_str() == "blob.bin"),
         "{err}"
     );
 }
@@ -809,6 +853,24 @@ fn a_secret_in_the_harness_state_is_left_behind_and_named() {
     assert_eq!(
         report.denied_harness,
         vec![RelPath::parse(".credentials.json").unwrap()]
+    );
+}
+
+#[test]
+fn a_git_file_in_a_plain_directory_is_left_behind_and_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("plain");
+    fs::create_dir_all(root.join("checkout")).unwrap();
+    fs::write(root.join("checkout/.git"), "gitdir: ../../elsewhere\n").unwrap();
+    fs::write(root.join("checkout/x.txt"), "x\n").unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, report } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let files: Vec<&str> = manifest.files.iter().map(|e| e.rel_path.as_str()).collect();
+    assert_eq!(files, vec!["checkout", "checkout/x.txt"]);
+    assert_eq!(
+        report.nested_repositories,
+        vec![RelPath::parse("checkout").unwrap()]
     );
 }
 
@@ -887,6 +949,100 @@ fn a_plain_directory_and_harness_state_round_trip_exactly() {
         verify(&store, snapshot, &target, Verify::All, &|_| true),
         Err(RestoreError::VerifyFailed { path }) if path.as_str() == "a/b/deep.txt"
     ));
+}
+
+/// Gives the owner write permission on every directory under `dir`, so the temp directory can be removed.
+fn make_writable(dir: &Path) -> Fallible {
+    let meta = fs::symlink_metadata(dir)?;
+    if meta.is_dir() {
+        fs::set_permissions(dir, fs::Permissions::from_mode(meta.mode() | 0o700))?;
+        for entry in fs::read_dir(dir)? {
+            make_writable(&entry?.path())?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_read_only_directory_that_holds_files_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("plain");
+    fs::create_dir_all(root.join("ro/sub")).unwrap();
+    fs::write(root.join("ro/sub/f.txt"), "f\n").unwrap();
+    fs::set_permissions(root.join("ro/sub"), fs::Permissions::from_mode(0o555)).unwrap();
+    fs::set_permissions(root.join("ro"), fs::Permissions::from_mode(0o555)).unwrap();
+
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    let outcome = restore_into(&store, snapshot, &target);
+    let same = outcome.is_ok() && listing(&target).unwrap() == listing(&root).unwrap();
+    make_writable(dir.path()).unwrap();
+    outcome.unwrap();
+    assert!(same);
+}
+
+/// Captures `plain_tree` with its harness state and publishes it.
+fn plain_snapshot(dir: &Path) -> Fallible<(Store, SnapshotId)> {
+    let root = dir.join("plain");
+    let state = dir.join("state");
+    plain_tree(&root, &state)?;
+    let mut store = store_in(dir)?;
+    let policy = IgnorePolicy::default();
+    let mut req = request(&root, &policy, None);
+    req.harness_state = Some(&state);
+    let Captured { manifest, .. } = capture(&store, &req)?;
+    let snapshot = store.publish(&manifest)?;
+    Ok((store, snapshot))
+}
+
+fn restore_with_state(
+    store: &Store,
+    snapshot: SnapshotId,
+    target: &Path,
+    state: &Path,
+) -> Result<RestoreReport, RestoreError> {
+    restore(
+        store,
+        &RestoreRequest {
+            snapshot,
+            target,
+            harness_state: Some(state),
+            verify: Verify::All,
+            durability: Durability::ProcessCrash,
+            carry: &|_| true,
+        },
+    )
+}
+
+#[test]
+fn a_harness_directory_with_foreign_files_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, snapshot) = plain_snapshot(dir.path()).unwrap();
+    let state = dir.path().join("state-restored");
+    restore_with_state(&store, snapshot, &dir.path().join("first"), &state).unwrap();
+    fs::write(state.join("other-session.jsonl"), "{}\n").unwrap();
+    let err = restore_with_state(&store, snapshot, &dir.path().join("second"), &state).unwrap_err();
+    assert!(
+        matches!(&err, RestoreError::TargetNotEmpty { path } if *path == state),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_harness_directory_inside_the_target_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, snapshot) = plain_snapshot(dir.path()).unwrap();
+    let target = dir.path().join("restored");
+    fs::create_dir(&target).unwrap();
+    let err = restore_with_state(&store, snapshot, &target, &target.join(".claude")).unwrap_err();
+    assert!(
+        matches!(err, RestoreError::NestedDirectories { .. }),
+        "{err}"
+    );
+    assert_eq!(restore_state(&target).unwrap(), RestoreState::Absent);
 }
 
 #[test]
@@ -1062,7 +1218,7 @@ fn a_submodule_with_local_changes_is_refused_by_its_whole_path() {
     let policy = IgnorePolicy::default();
     let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
     assert!(
-        matches!(&err, CaptureError::GitSubmoduleDirty { path } if path == "my lib"),
+        matches!(&err, CaptureError::GitSubmoduleDirty { path } if path.as_str() == "my lib"),
         "{err}"
     );
 }
@@ -1192,6 +1348,102 @@ fn a_restore_whose_bundle_base_is_gone_names_it() {
             if snapshot == second && base == first),
         "{err}"
     );
+}
+
+#[test]
+fn names_git_would_unquote_or_trim_verify_after_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    fs::write(root.join("\"q"), "quoted\n").unwrap();
+    fs::write(root.join("x\r"), "carriage return\n").unwrap();
+    let g = git(&root);
+    g.run(&["add", "-A"]).unwrap();
+    g.run(&["commit", "-q", "-m", "odd names"]).unwrap();
+    fs::write(root.join("Icon\r"), "").unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let report = restore_into(&store, snapshot, &dir.path().join("restored")).unwrap();
+    assert_eq!(report.verified, 4);
+}
+
+#[test]
+fn a_secret_saved_in_the_stash_is_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    fs::write(root.join(".env"), "AWS_SECRET=hunter2\n").unwrap();
+    git(&root)
+        .run(&["stash", "push", "-q", "--include-untracked"])
+        .unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { report, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    assert_eq!(
+        report.stashed_secrets,
+        vec![RelPath::parse(".env").unwrap()]
+    );
+}
+
+/// Captures a branch named `before`, replaces it with `after` and restores the incremental snapshot.
+fn rename_branch_across_an_incremental_link(before: &str, after: &str) -> Fallible {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("work");
+    one_commit_repo(&root)?;
+    let g = git(&root);
+    g.run(&["branch", before])?;
+    let mut store = store_in(dir.path())?;
+    let policy = IgnorePolicy::default();
+    let first = capture(&store, &request(&root, &policy, None))?;
+    let s1 = store.publish(&first.manifest)?;
+
+    g.run(&["branch", "-D", before])?;
+    g.run(&["commit", "-q", "--allow-empty", "-m", "two"])?;
+    g.run(&["branch", after])?;
+    let second = capture(&store, &request(&root, &policy, Some(s1)))?;
+    assert_eq!(second.report.bundle, Some(BundleKind::Incremental));
+    let s2 = store.publish(&second.manifest)?;
+
+    let target = dir.path().join("restored");
+    restore_into(&store, s2, &target)?;
+    assert_eq!(git_difference(&root, &target)?, None);
+    Ok(())
+}
+
+#[test]
+fn a_branch_that_becomes_a_directory_of_branches_restores() {
+    rename_branch_across_an_incremental_link("feature", "feature/x").unwrap();
+}
+
+#[test]
+fn a_directory_of_branches_that_becomes_a_branch_restores() {
+    rename_branch_across_an_incremental_link("feature/x", "feature").unwrap();
+}
+
+#[test]
+fn the_target_keeps_the_filesystem_settings_git_init_probed() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("probe");
+    fs::create_dir(&probe).unwrap();
+    git(&probe).run(&["init", "-q"]).unwrap();
+    let probed = git_text(&probe, &["config", "--bool", "core.ignorecase"]).unwrap_or_default();
+    let opposite = if probed == "true" { "false" } else { "true" };
+
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    git(&root)
+        .run(&["config", "core.ignorecase", opposite])
+        .unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    let restored = git_text(&target, &["config", "--bool", "core.ignorecase"]).unwrap_or_default();
+    assert_eq!(restored, probed);
 }
 
 #[test]

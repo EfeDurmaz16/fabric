@@ -3,17 +3,17 @@
 //! Invariant: the catalog never names an object that is not on disk. Publish
 //! writes and flushes every object before it inserts a row, gc deletes a row
 //! before it deletes the file, and `check` can prove the rule holds. Exactly
-//! one process holds a store open at a time (ADR 0004, One writer per data
-//! directory).
+//! one process holds a store open at a time (ADR 0014, One writer).
 
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 use fabric_core::id::{ChunkId, SnapshotId};
-use fabric_core::snapshot::{EntryKind, ManifestError, SnapshotManifest};
+use fabric_core::snapshot::{EntryKind, MAX_MANIFEST_LEN, ManifestError, SnapshotManifest};
 
 use crate::catalog::{Catalog, CatalogError, ChunkRef, Role, SnapshotRow};
 use crate::checkpoint;
@@ -97,6 +97,15 @@ fn io_err(path: &Path, source: io::Error) -> StoreError {
     }
 }
 
+/// Encodes a manifest, refusing one longer than `MAX_MANIFEST_LEN`, which no reader decodes.
+pub(crate) fn encode_manifest(manifest: &SnapshotManifest) -> Result<Vec<u8>, ManifestError> {
+    let bytes = manifest.encode()?;
+    if bytes.len() > MAX_MANIFEST_LEN {
+        return Err(ManifestError::TooLarge { len: bytes.len() });
+    }
+    Ok(bytes)
+}
+
 /// What one gc pass removed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GcReport {
@@ -155,15 +164,31 @@ pub struct Store {
     _lock: File,
 }
 
+/// How long a busy store lock is retried before it counts as held.
+const LOCK_PATIENCE: Duration = Duration::from_secs(1);
+
+/// Takes the store's lock, or fails with `Locked` when another process holds it.
+///
+/// A child that another thread of this process forks shares the lock's
+/// open file until it execs, so a lock this process just released can look
+/// held for that instant; a busy lock is retried for `LOCK_PATIENCE`.
 fn take_lock(root: &Path) -> Result<File, StoreError> {
     let path = root.join("lock");
     let file = File::create(&path).map_err(|e| io_err(&path, e))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(fs::TryLockError::WouldBlock) => Err(StoreError::Locked {
-            path: root.to_owned(),
-        }),
-        Err(fs::TryLockError::Error(e)) => Err(io_err(&path, e)),
+    let started = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(fs::TryLockError::WouldBlock) if started.elapsed() < LOCK_PATIENCE => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(StoreError::Locked {
+                    path: root.to_owned(),
+                });
+            }
+            Err(fs::TryLockError::Error(e)) => return Err(io_err(&path, e)),
+        }
     }
 }
 
@@ -247,9 +272,11 @@ impl Store {
     /// Every object the manifest names must already be in the store. The
     /// manifest's own bytes become objects too, the shard directories are
     /// flushed, and only then does the catalog get the rows. Publishing a
-    /// manifest the store already has returns its id and changes nothing.
+    /// manifest the store already has returns its id and changes nothing. A
+    /// manifest above `MAX_MANIFEST_LEN` is refused, since it could never be
+    /// read back.
     pub fn publish(&mut self, manifest: &SnapshotManifest) -> Result<SnapshotId, StoreError> {
-        let bytes = manifest.encode()?;
+        let bytes = encode_manifest(manifest)?;
         let id = SnapshotId::of(&bytes);
         if self.catalog.snapshot(id)?.is_some() {
             return Ok(id);
@@ -343,7 +370,11 @@ impl Store {
     /// Assembles, verifies and decodes the manifest of a snapshot.
     pub fn manifest(&self, id: SnapshotId) -> Result<SnapshotManifest, StoreError> {
         let row = self.snapshot(id)?;
-        let mut bytes = Vec::with_capacity(usize::try_from(row.manifest_len).unwrap_or(0));
+        let len = usize::try_from(row.manifest_len).unwrap_or(usize::MAX);
+        if len > MAX_MANIFEST_LEN {
+            return Err(ManifestError::TooLarge { len }.into());
+        }
+        let mut bytes = Vec::with_capacity(len);
         for chunk in self.catalog.snapshot_chunks(id, Role::Manifest)? {
             bytes.extend_from_slice(&self.objects.read(chunk.id)?);
         }

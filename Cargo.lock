@@ -424,7 +424,6 @@ dependencies = [
 name = "fabric-store"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "fabric-core",
  "fastcdc",
  "proptest",

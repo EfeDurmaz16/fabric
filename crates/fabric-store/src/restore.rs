@@ -1,4 +1,4 @@
-//! Workspace restore (ADR 0004, Restore).
+//! Workspace restore (ADR 0004, Restore; as built in ADR 0014, Restore).
 //!
 //! Invariant: restore writes into a staging directory beside the target and
 //! renames it into place only after every byte is written and, when asked,
@@ -7,14 +7,14 @@
 //! leaves either no target or a complete one: a staging directory that
 //! outlives its process is the sign of a restore that did not finish.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 
-use fabric_core::git::GitOid;
+use fabric_core::git::{GitConfigKey, GitOid};
 use fabric_core::id::SnapshotId;
 use fabric_core::path::{PathError, RelPath};
 use fabric_core::snapshot::{
@@ -83,7 +83,7 @@ pub struct RestoreReport {
     pub submodules: Vec<RelPath>,
     /// Symlinks written whose target is absolute or climbs above the root.
     pub escaping_symlinks: Vec<RelPath>,
-    /// Bundles fetched into the repository.
+    /// Bundles unpacked into the repository.
     pub bundles_fetched: u32,
 }
 
@@ -113,7 +113,7 @@ pub enum RestoreError {
         #[source]
         source: io::Error,
     },
-    /// The store refused.
+    /// The store, or an object in it, refused.
     #[error(transparent)]
     Store(#[from] StoreError),
     /// A git command failed.
@@ -122,14 +122,19 @@ pub enum RestoreError {
     /// The tree writer refused a path.
     #[error(transparent)]
     Write(#[from] WriteError),
-    /// An object could not be read.
-    #[error(transparent)]
-    Object(#[from] ObjectError),
     /// The target is not an absolute path with a parent directory.
     #[error("{path} is not an absolute path with a parent")]
     BadTarget {
         /// The path given.
         path: PathBuf,
+    },
+    /// The target and the harness state directory lie one inside the other.
+    #[error("{harness_state} and {target} lie one inside the other")]
+    NestedDirectories {
+        /// The target, resolved.
+        target: PathBuf,
+        /// The harness state directory, resolved.
+        harness_state: PathBuf,
     },
     /// The target exists and holds something.
     #[error("{path} exists and is not empty")]
@@ -184,6 +189,13 @@ pub enum RestoreError {
         /// The missing base.
         base: SnapshotId,
     },
+}
+
+/// An object error always arrives as `StoreError::Object`, so a caller matches one shape.
+impl From<ObjectError> for RestoreError {
+    fn from(error: ObjectError) -> Self {
+        RestoreError::Store(StoreError::Object(error))
+    }
 }
 
 fn io_err(path: &Path, source: io::Error) -> RestoreError {
@@ -247,9 +259,74 @@ fn check_target_empty(target: &Path) -> Result<(), RestoreError> {
     }
 }
 
+/// Gives the owner write and search permission on `dir` and every directory below it.
+///
+/// A restore that was killed after it applied the recorded modes leaves
+/// read-only directories with files in them, which no unlink can empty.
+/// Links are never followed.
+pub(crate) fn open_up(dir: &Path) -> Result<(), RestoreError> {
+    use rustix::fs::{Mode as RawBits, OFlags};
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let fd = rustix::fs::open(dir, flags, RawBits::empty()).map_err(|e| io_err(dir, e.into()))?;
+    let stat = rustix::fs::fstat(&fd).map_err(|e| io_err(dir, e.into()))?;
+    let bits = RawBits::from_raw_mode(stat.st_mode) | RawBits::RWXU;
+    rustix::fs::fchmod(&fd, bits).map_err(|e| io_err(dir, e.into()))?;
+    for entry in fs::read_dir(dir).map_err(|e| io_err(dir, e))? {
+        let entry = entry.map_err(|e| io_err(dir, e))?;
+        if entry
+            .file_type()
+            .map_err(|e| io_err(&entry.path(), e))?
+            .is_dir()
+        {
+            open_up(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Returns `path` with its deepest existing ancestor resolved, so two spellings of one place compare equal.
+fn resolved(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut ancestor = path;
+    loop {
+        if let Ok(real) = fs::canonicalize(ancestor) {
+            return rest.iter().rev().fold(real, |acc, name| acc.join(name));
+        }
+        match (ancestor.parent(), ancestor.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                ancestor = parent;
+            }
+            _ => return path.to_owned(),
+        }
+    }
+}
+
+/// Refuses a harness state directory inside the target, or a target inside it.
+///
+/// Either rename would then land in a directory the other one fills, and
+/// every rerun would stop at a non-empty target.
+fn refuse_nested(target: &Path, harness_state: &Path) -> Result<(), RestoreError> {
+    let place = |path: &Path| match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => resolved(parent).join(name),
+        _ => path.to_owned(),
+    };
+    let (target, harness_state) = (place(target), place(harness_state));
+    if target.starts_with(&harness_state) || harness_state.starts_with(&target) {
+        return Err(RestoreError::NestedDirectories {
+            target,
+            harness_state,
+        });
+    }
+    Ok(())
+}
+
 /// Makes a fresh staging directory for `target`, removing a stale one.
 fn fresh_staging(target: &Path) -> Result<PathBuf, RestoreError> {
     let staging = staging_path(target)?;
+    if fs::symlink_metadata(&staging).is_ok_and(|meta| meta.is_dir()) {
+        open_up(&staging)?;
+    }
     match fs::remove_dir_all(&staging) {
         Ok(()) => tracing::info!(path = %staging.display(), "removed a half-finished restore"),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -268,7 +345,10 @@ fn move_into_place(staging: &Path, target: &Path) -> Result<(), RestoreError> {
     Ok(())
 }
 
-/// Writes a list of entries: directories, then files, then symlinks, then directory mtimes.
+/// Writes a list of entries: directories, then files, then symlinks, then directory modes and mtimes.
+///
+/// Directories are created owner-only and get their recorded mode last,
+/// deepest first, so a directory captured read-only can still be filled.
 fn write_entries(
     store: &Store,
     writer: &TreeWriter,
@@ -280,7 +360,7 @@ fn write_entries(
     let kept: Vec<&Entry> = entries.iter().filter(|e| !skip(&e.rel_path)).collect();
     for entry in &kept {
         if matches!(entry.kind, EntryKind::Dir) {
-            writer.mkdir(&entry.rel_path, entry.mode)?;
+            writer.mkdir(&entry.rel_path, Mode::from_masked(0o700))?;
         }
     }
     for entry in &kept {
@@ -327,6 +407,7 @@ fn write_entries(
     }
     for entry in kept.iter().rev() {
         if matches!(entry.kind, EntryKind::Dir) {
+            writer.set_dir_mode(&entry.rel_path, entry.mode)?;
             writer.set_mtime(&entry.rel_path, entry.mtime_ns)?;
         }
     }
@@ -496,15 +577,11 @@ fn cat_file_batch(
 ) -> Result<(), RestoreError> {
     let pipe = Path::new("cat-file");
     let mut child = git.spawn_piped(&["cat-file", "--batch"])?;
-    let Some(mut stdin) = child.stdin.take() else {
-        return Err(RestoreError::BadTreeOutput {
-            text: "cat-file has no stdin".to_owned(),
-        });
-    };
-    let Some(stdout) = child.stdout.take() else {
-        return Err(RestoreError::BadTreeOutput {
-            text: "cat-file has no stdout".to_owned(),
-        });
+    let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        let source = io::Error::other("cat-file started without its stdin or stdout pipe");
+        return Err(GitError::Spawn { source }.into());
     };
     let requests: Vec<String> = oids.iter().map(|o| format!("{o}\n")).collect();
     let feeder = thread::spawn(move || {
@@ -544,6 +621,87 @@ struct StagingTarget<'a> {
     durability: Durability,
 }
 
+/// Unpacks every bundle of the chain that ends at `manifest`, oldest first, into `git`'s repository.
+///
+/// Unbundling indexes each pack and writes no refs, so the refs an older
+/// link lists can never collide with the ones `set_refs` writes.
+fn unbundle_chain(
+    store: &Store,
+    snapshot: SnapshotId,
+    manifest: &SnapshotManifest,
+    git: &Git,
+    report: &mut RestoreReport,
+) -> Result<(), RestoreError> {
+    // The chain of bundles, oldest first.
+    let mut chain = vec![manifest.clone()];
+    loop {
+        let base = chain
+            .last()
+            .and_then(|m| m.git.as_ref())
+            .and_then(|g| g.bundle_base);
+        let Some(base) = base else { break };
+        match store.manifest(base) {
+            Ok(m) => chain.push(m),
+            Err(StoreError::UnknownSnapshot(_)) => {
+                return Err(RestoreError::BundleChainBroken { snapshot, base });
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    chain.reverse();
+    for link in &chain {
+        let Some(state) = &link.git else { continue };
+        if state.bundle.is_empty() {
+            continue;
+        }
+        let bundle = TempFile::in_dir(store.objects().tmp_dir());
+        let path = bundle.path();
+        {
+            let mut file = fs::File::create(path).map_err(|e| io_err(path, e))?;
+            for chunk in &state.bundle {
+                file.write_all(&store.objects().read(*chunk)?)
+                    .map_err(|e| io_err(path, e))?;
+            }
+        }
+        let path_text = path.to_string_lossy().into_owned();
+        git.run(&["bundle", "verify", &path_text])?;
+        git.run(&["bundle", "unbundle", &path_text])?;
+        report.bundles_fetched += 1;
+    }
+    Ok(())
+}
+
+/// Sets every ref and `HEAD` exactly as `git_state` records them.
+fn set_refs(git: &Git, git_state: &GitState) -> Result<(), RestoreError> {
+    for (name, oid) in &git_state.refs {
+        if name.as_str() == "refs/stash" {
+            // `git stash list` prints the reflog message, so the entry gets
+            // the stash commit's own subject back.
+            let subject = git.run_text(&["log", "-1", "--format=%s", oid.as_str()])?;
+            git.run(&[
+                "update-ref",
+                "--create-reflog",
+                "-m",
+                &subject,
+                "refs/stash",
+                oid.as_str(),
+            ])?;
+        } else {
+            git.run(&["update-ref", name.as_str(), oid.as_str()])?;
+        }
+    }
+    match &git_state.head {
+        GitHead::Branch(branch) => {
+            let full = format!("refs/heads/{branch}");
+            git.run(&["symbolic-ref", "HEAD", &full])?;
+        }
+        GitHead::Detached(oid) => {
+            git.run(&["update-ref", "--no-deref", "HEAD", oid.as_str()])?;
+        }
+    }
+    Ok(())
+}
+
 /// Restores the repository: objects, refs, `HEAD`, the index and the working tree.
 fn restore_git(
     store: &Store,
@@ -579,82 +737,8 @@ fn restore_git(
         }
     }
 
-    // The chain of bundles, oldest first.
-    let mut chain = vec![manifest.clone()];
-    loop {
-        let base = chain
-            .last()
-            .and_then(|m| m.git.as_ref())
-            .and_then(|g| g.bundle_base);
-        let Some(base) = base else { break };
-        match store.manifest(base) {
-            Ok(m) => chain.push(m),
-            Err(StoreError::UnknownSnapshot(_)) => {
-                return Err(RestoreError::BundleChainBroken { snapshot, base });
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-    chain.reverse();
-    for link in &chain {
-        let Some(state) = &link.git else { continue };
-        if state.bundle.is_empty() {
-            continue;
-        }
-        let bundle = TempFile::in_dir(store.objects().tmp_dir());
-        let path = bundle.path();
-        {
-            let mut file = fs::File::create(path).map_err(|e| io_err(path, e))?;
-            for chunk in &state.bundle {
-                file.write_all(&store.objects().read(*chunk)?)
-                    .map_err(|e| io_err(path, e))?;
-            }
-        }
-        let path_text = path.to_string_lossy().into_owned();
-        git.run(&["bundle", "verify", &path_text])?;
-        git.run(&[
-            "fetch",
-            "-q",
-            "--update-head-ok",
-            &path_text,
-            "+refs/*:refs/*",
-        ])?;
-        report.bundles_fetched += 1;
-    }
-
-    let existing = git.run_text(&["for-each-ref", "--format=%(refname)"])?;
-    for name in existing.lines() {
-        if !git_state.refs.iter().any(|(r, _)| r.as_str() == name) {
-            git.run(&["update-ref", "-d", name])?;
-        }
-    }
-    for (name, oid) in &git_state.refs {
-        if name.as_str() == "refs/stash" {
-            // `git stash list` prints the reflog message, so the entry gets
-            // the stash commit's own subject back.
-            let subject = git.run_text(&["log", "-1", "--format=%s", oid.as_str()])?;
-            let _ = git.output(&["update-ref", "-d", "refs/stash"], &[])?;
-            git.run(&[
-                "update-ref",
-                "--create-reflog",
-                "-m",
-                &subject,
-                "refs/stash",
-                oid.as_str(),
-            ])?;
-        } else {
-            git.run(&["update-ref", name.as_str(), oid.as_str()])?;
-        }
-    }
-    match &git_state.head {
-        GitHead::Branch(branch) => {
-            let full = format!("refs/heads/{branch}");
-            git.run(&["symbolic-ref", "HEAD", &full])?;
-        }
-        GitHead::Detached(oid) => {
-            git.run(&["update-ref", "--no-deref", "HEAD", oid.as_str()])?;
-        }
-    }
+    unbundle_chain(store, snapshot, manifest, &git, report)?;
+    set_refs(&git, git_state)?;
     git.run(&["read-tree", git_state.index_commit.as_str()])?;
 
     let listing = git.run(&["ls-tree", "-r", "-z", git_state.worktree_commit.as_str()])?;
@@ -747,6 +831,29 @@ fn sample<'a, T>(items: &[&'a T], mode: Verify) -> Vec<&'a T> {
     }
 }
 
+/// The most path bytes one `hash-object` command line carries, well under every `ARG_MAX`.
+const ARG_BYTES: usize = 128 << 10;
+
+/// Splits `items` into runs whose paths together stay under `ARG_BYTES`.
+fn path_batches<'a, 'b>(items: &'b [&'a TreeItem]) -> Vec<&'b [&'a TreeItem]> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0;
+    for (index, item) in items.iter().enumerate() {
+        let len = item.rel.as_str().len() + 1;
+        if index > start && bytes + len > ARG_BYTES {
+            batches.push(&items[start..index]);
+            start = index;
+            bytes = 0;
+        }
+        bytes += len;
+    }
+    if start < items.len() {
+        batches.push(&items[start..]);
+    }
+    batches
+}
+
 /// Re-reads the working tree against commit `W` and returns how many entries matched.
 ///
 /// Files are hashed by `git hash-object --no-filters` and compared with the
@@ -775,43 +882,21 @@ fn verify_worktree(
             TreeMode::Symlink => links.push(item),
             TreeMode::File | TreeMode::Exec => {
                 // A missing or replaced file is a verify failure, not a git error.
-                let file = writer.open_file(&item.rel).map_err(|_| mismatch(item))?;
-                if item.rel.as_str().contains('\n') {
-                    // hash-object reads one path per line, so this one is hashed by content.
-                    let mut bytes = Vec::new();
-                    (&file)
-                        .read_to_end(&mut bytes)
-                        .map_err(|_| mismatch(item))?;
-                    let out = git.run_stdin_env(
-                        &["hash-object", "--no-filters", "--stdin"],
-                        &[],
-                        &bytes,
-                    )?;
-                    if String::from_utf8_lossy(&out).trim() != item.oid.as_str() {
-                        return Err(mismatch(item));
-                    }
-                    verified += 1;
-                } else {
-                    by_path.push(item);
-                }
+                writer.open_file(&item.rel).map_err(|_| mismatch(item))?;
+                by_path.push(item);
             }
             TreeMode::Gitlink => {}
         }
     }
-    if !by_path.is_empty() {
-        let mut input = String::new();
-        for item in &by_path {
-            input.push_str(item.rel.as_str());
-            input.push('\n');
-        }
-        let out = git.run_stdin_env(
-            &["hash-object", "--no-filters", "--stdin-paths"],
-            &[],
-            input.as_bytes(),
-        )?;
+    // Paths go as arguments: `--stdin-paths` would C-unquote a name that
+    // starts with '"' and drop a trailing '\r', as in macOS's `Icon\r`.
+    for batch in path_batches(&by_path) {
+        let mut args = vec!["hash-object", "--no-filters", "--"];
+        args.extend(batch.iter().map(|item| item.rel.as_str()));
+        let out = git.run(&args)?;
         let text = String::from_utf8_lossy(&out);
         let mut hashes = text.lines();
-        for item in &by_path {
+        for item in batch {
             if hashes.next() != Some(item.oid.as_str()) {
                 return Err(mismatch(item));
             }
@@ -838,13 +923,40 @@ fn verify_worktree(
     Ok(verified)
 }
 
+/// Adds every path under `base/prefix` to `out`, relative to `base`, without following links.
+///
+/// A name that is not UTF-8 is added with its bad bytes replaced, so it
+/// matches no manifest path.
+fn paths_under(base: &Path, prefix: &str, out: &mut BTreeSet<String>) -> Result<(), RestoreError> {
+    let dir = base.join(prefix);
+    for entry in fs::read_dir(&dir).map_err(|e| io_err(&dir, e))? {
+        let entry = entry.map_err(|e| io_err(&dir, e))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let rel = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if entry
+            .file_type()
+            .map_err(|e| io_err(&entry.path(), e))?
+            .is_dir()
+        {
+            paths_under(base, &rel, out)?;
+        }
+        out.insert(rel);
+    }
+    Ok(())
+}
+
 /// Says whether `dir` already holds the harness state of `manifest`.
 ///
 /// A restore renames the harness state into place before the workspace, so
 /// a kill between the two renames leaves a complete harness directory next
-/// to a half-restored workspace. The rerun re-reads every file against the
-/// store and checks every directory and link; a directory that holds
-/// anything else is foreign and is refused.
+/// to a half-restored workspace. The rerun checks that the directory holds
+/// exactly the manifest's paths, re-reads every file against the store and
+/// checks every directory and link; a directory that holds anything else
+/// is foreign and is refused.
 fn harness_state_complete(
     store: &Store,
     entries: &[Entry],
@@ -857,7 +969,13 @@ fn harness_state_complete(
         RestoreState::Absent | RestoreState::HalfRestored { .. } => return Ok(None),
         RestoreState::Present => {}
     }
-    if entries.is_empty() {
+    let mut found = BTreeSet::new();
+    paths_under(dir, "", &mut found)?;
+    let expected: BTreeSet<String> = entries
+        .iter()
+        .map(|e| e.rel_path.as_str().to_owned())
+        .collect();
+    if entries.is_empty() || found != expected {
         return Err(occupied);
     }
     for entry in entries {
@@ -905,6 +1023,9 @@ fn skipped_caches(
 /// finishes the workspace.
 pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport, RestoreError> {
     let manifest = store.manifest(req.snapshot)?;
+    if let Some(dir) = req.harness_state {
+        refuse_nested(req.target, dir)?;
+    }
     check_target_empty(req.target)?;
     let harness_done = match req.harness_state {
         Some(dir) => harness_state_complete(store, &manifest.harness_state.entries, dir)?,
@@ -977,6 +1098,13 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
 
     if let (Some(git), Some(state)) = (&git, &manifest.git) {
         for (key, value) in &state.config {
+            // These describe the source's filesystem; `git init` probed the target's.
+            if matches!(
+                key,
+                GitConfigKey::CoreIgnoreCase | GitConfigKey::CoreSymlinks
+            ) {
+                continue;
+            }
             git.run(&["config", "--local", &key.to_string(), value.as_str()])?;
         }
     }

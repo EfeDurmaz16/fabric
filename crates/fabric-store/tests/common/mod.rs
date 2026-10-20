@@ -14,6 +14,27 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use fabric_core::id::ChunkId;
+
+/// Returns where the store rooted at `store_root` keeps the object `id`: `objects/<first two hex digits>/<hex>`.
+pub fn object_path(store_root: &Path, id: ChunkId) -> PathBuf {
+    let hex = id.to_string();
+    store_root.join("objects").join(&hex[..2]).join(hex)
+}
+
+/// Returns `len` bytes from a xorshift generator seeded with `seed`, the same on every run.
+pub fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[3]
+        })
+        .collect()
+}
+
 /// A git runner bound to one repository.
 pub struct TestGit {
     repo: PathBuf,

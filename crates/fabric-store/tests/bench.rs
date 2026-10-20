@@ -25,18 +25,6 @@ const SMALL_FILES: usize = 5_000;
 const TRACKED_FILES: usize = 300;
 const LARGE_FILE_BYTES: usize = 24 << 20;
 
-fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
-    let mut state = seed | 1;
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state.to_le_bytes()[3]
-        })
-        .collect()
-}
-
 fn build_workspace(root: &Path) -> Fallible {
     fs::create_dir_all(root.join("src"))?;
     for i in 0..TRACKED_FILES {
@@ -65,17 +53,17 @@ fn build_workspace(root: &Path) -> Fallible {
     for i in 0..20u64 {
         fs::write(
             root.join(format!("dist/bundle{i}.js")),
-            pseudo_random(200 << 10, i),
+            common::pseudo_random(200 << 10, i),
         )?;
     }
     fs::create_dir_all(root.join("data"))?;
     fs::write(
         root.join("data/large1.bin"),
-        pseudo_random(LARGE_FILE_BYTES, 1),
+        common::pseudo_random(LARGE_FILE_BYTES, 1),
     )?;
     fs::write(
         root.join("data/large2.bin"),
-        pseudo_random(LARGE_FILE_BYTES, 2),
+        common::pseudo_random(LARGE_FILE_BYTES, 2),
     )?;
     Ok(())
 }

@@ -1,12 +1,15 @@
-//! Workspace capture (ADR 0004, What a workspace snapshot contains).
+//! Workspace capture (ADR 0004, What a workspace snapshot contains; as
+//! built in ADR 0014, Capture).
 //!
 //! Invariant: capture reads the workspace and writes only objects into the
 //! store, two private commits and one ref under `refs/fabric/` into the
 //! repository, and deletes the job's older refs under `refs/fabric/`. Its
 //! scratch files (index copies, the bundle) live in the store's `tmp/`,
 //! which open and gc clear, never in the user's `.git`. It never touches
-//! the real index, the working tree or the user's refs. A path or state that could not be restored faithfully fails
-//! here, where the user can act, and a secret never becomes an object.
+//! the real index, the working tree or the user's refs. A path or state
+//! that could not be restored faithfully fails here, where the user can
+//! act. An untracked secret never becomes an object; a tracked or stashed
+//! one, already in the user's object store, is named in the report.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
@@ -27,9 +30,9 @@ use fabric_core::snapshot::{
     HarnessState, ManifestError, Mode, Platform, SnapshotManifest,
 };
 
-use crate::durable::{self, TempFile};
+use crate::durable::TempFile;
 use crate::git::{Git, GitError};
-use crate::objects::ObjectError;
+use crate::objects::{ObjectError, StoredFile, open_regular};
 use crate::policy::{Class, IgnorePolicy, Markers};
 use crate::store::{Store, StoreError};
 
@@ -123,6 +126,24 @@ impl std::fmt::Display for BusyReason {
     }
 }
 
+/// A ref or `HEAD` that moved while capture made the bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MovedRef {
+    /// `HEAD`.
+    Head,
+    /// A ref under `refs/`.
+    Ref(RefName),
+}
+
+impl std::fmt::Display for MovedRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MovedRef::Head => f.write_str("HEAD"),
+            MovedRef::Ref(name) => f.write_str(name.as_str()),
+        }
+    }
+}
+
 /// What capture saw, next to the manifest.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CaptureReport {
@@ -144,6 +165,8 @@ pub struct CaptureReport {
     pub denied_harness: Vec<RelPath>,
     /// Tracked paths that match a secret pattern; they travel in the bundle.
     pub tracked_secrets: Vec<RelPath>,
+    /// Paths in the stash's work tree, index or untracked commit that match a secret pattern; they travel in the bundle.
+    pub stashed_secrets: Vec<RelPath>,
     /// Symlinks whose target is absolute or climbs above the root.
     pub escaping_symlinks: Vec<RelPath>,
     /// FIFOs, sockets and devices in the workspace, left behind.
@@ -190,12 +213,9 @@ pub enum CaptureError {
     /// A git command failed.
     #[error(transparent)]
     Git(#[from] GitError),
-    /// The store refused.
+    /// The store, or an object in it, refused.
     #[error(transparent)]
     Store(#[from] StoreError),
-    /// An object could not be written.
-    #[error(transparent)]
-    Object(#[from] ObjectError),
     /// The manifest does not validate.
     #[error(transparent)]
     Manifest(#[from] ManifestError),
@@ -246,13 +266,13 @@ pub enum CaptureError {
     #[error("submodule {path} has local changes")]
     GitSubmoduleDirty {
         /// The submodule path.
-        path: String,
+        path: RelPath,
     },
     /// A path has the LFS filter; the working-tree commit would hold pointers.
     #[error("{path} has filter=lfs, which capture does not support")]
     GitLfsUnsupported {
         /// The first path git says the filter applies to.
-        path: String,
+        path: RelPath,
     },
     /// Untracked files above the limit would enter the user's object store.
     #[error(
@@ -262,7 +282,7 @@ pub enum CaptureError {
         /// The offending paths.
         paths: Vec<RelPath>,
     },
-    /// A path vanished or was replaced between its listing and its read; capture again.
+    /// A path vanished, was replaced or was written to between its listing and its read; capture again.
     #[error("{path} changed while capture ran")]
     WorkspaceChanged {
         /// The path.
@@ -275,10 +295,10 @@ pub enum CaptureError {
         path: RelPath,
     },
     /// A ref or `HEAD` moved while the bundle was made; capture again.
-    #[error("{name} moved while capture ran; capture again")]
+    #[error("{moved} moved while capture ran; capture again")]
     RefsMoved {
         /// The ref that moved, or `HEAD`.
-        name: String,
+        moved: MovedRef,
     },
     /// The parent snapshot belongs to another job.
     #[error("parent snapshot {parent} belongs to job {job}")]
@@ -288,6 +308,13 @@ pub enum CaptureError {
         /// The job it belongs to.
         job: JobId,
     },
+}
+
+/// An object error always arrives as `StoreError::Object`, so a caller matches one shape.
+impl From<ObjectError> for CaptureError {
+    fn from(error: ObjectError) -> Self {
+        CaptureError::Store(StoreError::Object(error))
+    }
 }
 
 fn io_err(path: &Path, source: io::Error) -> CaptureError {
@@ -383,7 +410,7 @@ fn open_listed(full: &Path, found: &Found) -> Result<File, CaptureError> {
     let changed = || CaptureError::WorkspaceChanged {
         path: found.rel.clone(),
     };
-    let file = match durable::open_regular(full) {
+    let file = match open_regular(full) {
         Ok(Some(file)) => file,
         Ok(None) => return Err(changed()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(changed()),
@@ -396,6 +423,26 @@ fn open_listed(full: &Path, found: &Found) -> Result<File, CaptureError> {
     Ok(file)
 }
 
+/// Stores a listed regular file, refusing it if it changed in place while it was read.
+///
+/// Only the inode is checked before the read, so the size and mtime of the
+/// open file are compared with the listing after it: a write during the
+/// read would otherwise store a torn file under the name.
+fn store_listed(store: &Store, full: &Path, found: &Found) -> Result<StoredFile, CaptureError> {
+    let file = open_listed(full, found)?;
+    let stored = store.objects().put_reader(&file, full)?;
+    let after = file.metadata().map_err(|e| io_err(full, e))?;
+    if stored.size != found.meta.len()
+        || after.len() != found.meta.len()
+        || mtime_ns(&after) != mtime_ns(&found.meta)
+    {
+        return Err(CaptureError::WorkspaceChanged {
+            path: found.rel.clone(),
+        });
+    }
+    Ok(stored)
+}
+
 /// What `list_tree` found.
 #[derive(Default)]
 struct Listing {
@@ -406,9 +453,10 @@ struct Listing {
 
 /// Lists a directory tree, sorted by path, never following symlinks.
 ///
-/// A directory named `.git` in any letter case is skipped, and the
-/// directory holding it is listed in `nested`; one at the base itself is
-/// the repository the base is, not content. A FIFO, socket or device is
+/// A `.git` in any letter case, whether a directory or the file a linked
+/// worktree or submodule checkout has, is skipped, and the directory
+/// holding it is listed in `nested`; one at the base itself is the
+/// repository the base is, not content. A FIFO, socket or device is
 /// skipped and listed in `special`.
 fn list_tree(base: &Path) -> Result<Listing, CaptureError> {
     fn walk(base: &Path, prefix: &str, out: &mut Listing) -> Result<(), CaptureError> {
@@ -432,7 +480,7 @@ fn list_tree(base: &Path) -> Result<Listing, CaptureError> {
             };
             let full = base.join(&text);
             let meta = fs::symlink_metadata(&full).map_err(|e| io_err(&full, e))?;
-            if meta.is_dir() && name.eq_ignore_ascii_case(".git") {
+            if name.eq_ignore_ascii_case(".git") {
                 if !prefix.is_empty() {
                     out.nested.push(rel_path(prefix)?);
                 }
@@ -487,8 +535,7 @@ impl Capturer<'_> {
             }
             FoundKind::Dir => EntryKind::Dir,
             FoundKind::File => {
-                let file = open_listed(&full, found)?;
-                let stored = self.store.objects().put_reader(file, &full)?;
+                let stored = store_listed(self.store, &full, found)?;
                 self.report.files += 1;
                 self.report.bytes += stored.size;
                 self.report.new_objects += stored.new_objects;
@@ -615,15 +662,14 @@ impl Capturer<'_> {
     fn store_bundle(
         &mut self,
         built: BuiltBundle,
-        parent: Option<SnapshotId>,
     ) -> Result<(Vec<ChunkId>, Option<SnapshotId>), CaptureError> {
         let (stored, kind) = match built {
             BuiltBundle::Full(file) => ((self.store_scratch_file(file)?, None), BundleKind::Full),
-            BuiltBundle::Incremental(file) => (
-                (self.store_scratch_file(file)?, parent),
+            BuiltBundle::Incremental { file, base } => (
+                (self.store_scratch_file(file)?, Some(base)),
                 BundleKind::Incremental,
             ),
-            BuiltBundle::Empty => ((Vec::new(), parent), BundleKind::Empty),
+            BuiltBundle::Empty { base } => ((Vec::new(), Some(base)), BundleKind::Empty),
         };
         self.report.bundle = Some(kind);
         Ok(stored)
@@ -676,14 +722,82 @@ struct RefView {
     head: GitHead,
 }
 
+impl RefView {
+    /// Names what differs in `later`: `HEAD` first, then the first ref by name.
+    fn moved_in(&self, later: &RefView) -> Option<MovedRef> {
+        if self.head != later.head {
+            return Some(MovedRef::Head);
+        }
+        self.refs
+            .iter()
+            .chain(&later.refs)
+            .filter(|r| !self.refs.contains(r) || !later.refs.contains(r))
+            .map(|(name, _)| name)
+            .min()
+            .map(|name| MovedRef::Ref(name.clone()))
+    }
+}
+
+/// The bundle capture tries to make.
+enum BundlePlan {
+    /// Every object the refs reach.
+    Full,
+    /// Only objects that `tips`, the refs of the snapshot `base`, do not reach.
+    Incremental {
+        /// The snapshot whose bundles carry the excluded objects.
+        base: SnapshotId,
+        /// The object ids in `base`'s refs; never empty.
+        tips: Vec<GitOid>,
+    },
+}
+
+impl BundlePlan {
+    /// Plans the bundle after `parent`: incremental unless there is no parent
+    /// with refs or its chain is already `MAX_BUNDLE_CHAIN` long.
+    fn after(
+        store: &Store,
+        parent: Option<(SnapshotId, &SnapshotManifest)>,
+    ) -> Result<BundlePlan, CaptureError> {
+        let Some((base, manifest)) = parent else {
+            return Ok(BundlePlan::Full);
+        };
+        let Some(git) = &manifest.git else {
+            return Ok(BundlePlan::Full);
+        };
+        if git.refs.is_empty() || chain_depth(store, manifest)? >= MAX_BUNDLE_CHAIN {
+            return Ok(BundlePlan::Full);
+        }
+        Ok(BundlePlan::Incremental {
+            base,
+            tips: git.refs.iter().map(|(_, oid)| oid.clone()).collect(),
+        })
+    }
+
+    /// The parent's tips an incremental bundle leaves out; none for a full one.
+    fn tips(&self) -> &[GitOid] {
+        match self {
+            BundlePlan::Full => &[],
+            BundlePlan::Incremental { tips, .. } => tips,
+        }
+    }
+}
+
 /// A bundle capture made, with the file that holds it.
 enum BuiltBundle {
     /// Every object the refs reach.
     Full(TempFile),
-    /// Only objects the parent's refs did not reach.
-    Incremental(TempFile),
-    /// The parent's refs already reached every object.
-    Empty,
+    /// Only objects the refs of `base` did not reach.
+    Incremental {
+        /// The bundle.
+        file: TempFile,
+        /// The snapshot whose refs the bundle excludes.
+        base: SnapshotId,
+    },
+    /// The refs of `base` already reached every object.
+    Empty {
+        /// The snapshot whose refs reach every object.
+        base: SnapshotId,
+    },
 }
 
 /// The git half of a capture.
@@ -785,7 +899,7 @@ impl GitCapture<'_> {
             let sub = fields.next().unwrap_or("");
             if sub.starts_with('S') && sub[1..].chars().any(|c| c != '.') {
                 // The path is the ninth field and, under -z, may hold spaces.
-                let path = text.splitn(9, ' ').nth(8).unwrap_or("").to_owned();
+                let path = rel_path(text.splitn(9, ' ').nth(8).unwrap_or(""))?;
                 return Err(CaptureError::GitSubmoduleDirty { path });
             }
         }
@@ -806,8 +920,9 @@ impl GitCapture<'_> {
         let fields: Vec<&[u8]> = attrs.split(|b| *b == 0).collect();
         for triple in fields.chunks_exact(3) {
             if triple[2] == b"lfs" {
+                let text = Git::text("lfs path", triple[0])?;
                 return Err(CaptureError::GitLfsUnsupported {
-                    path: String::from_utf8_lossy(triple[0]).into_owned(),
+                    path: rel_path(text)?,
                 });
             }
         }
@@ -938,11 +1053,10 @@ impl GitCapture<'_> {
     /// policy's patterns as the lowest-precedence excludes, which keeps most
     /// secrets out of the user's object store. The policy adds only positive
     /// patterns after the user's rules, so a path the ignored listing names
-    /// is never in `W`. A
-    /// negation in the repository's own ignore files can override that, so
-    /// the private index is then listed and every path that is not tracked
-    /// and that `leave_out` names is removed before the tree is written. The
-    /// removed paths are returned.
+    /// is never in `W`. A negation in the repository's own ignore files can
+    /// override that, so the private index is then listed and every path
+    /// that is not tracked and that `leave_out` names is removed before the
+    /// tree is written. The removed paths are returned.
     fn worktree_commit(
         &self,
         index_tree: &str,
@@ -1038,12 +1152,12 @@ impl GitCapture<'_> {
         ))
     }
 
-    /// Creates the bundle; an empty one has no file.
-    fn bundle(&self, tips: &[GitOid], chain_full: bool) -> Result<BuiltBundle, CaptureError> {
+    /// Creates the bundle `plan` asks for, or a full one when an incremental one cannot be made; an empty one has no file.
+    fn bundle(&self, plan: &BundlePlan) -> Result<BuiltBundle, CaptureError> {
         let path = TempFile::in_dir(&self.scratch);
         let path_text = path.path().to_string_lossy().into_owned();
-        let incremental = !tips.is_empty() && !chain_full;
-        if incremental {
+        if let BundlePlan::Incremental { base, tips } = plan {
+            let base = *base;
             let mut args = vec!["bundle", "create", &path_text, "--all", "--not"];
             let mut existing = Vec::new();
             for tip in tips {
@@ -1060,11 +1174,11 @@ impl GitCapture<'_> {
                 args.extend(existing);
                 let out = self.git.output(&args, &[])?;
                 if out.status.success() && self.git.succeeds(&["bundle", "verify", &path_text])? {
-                    return Ok(BuiltBundle::Incremental(path));
+                    return Ok(BuiltBundle::Incremental { file: path, base });
                 }
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 if stderr.contains("empty bundle") {
-                    return Ok(BuiltBundle::Empty);
+                    return Ok(BuiltBundle::Empty { base });
                 }
                 tracing::warn!(stderr = %stderr.trim(), "incremental bundle failed; making a full one");
             }
@@ -1075,19 +1189,13 @@ impl GitCapture<'_> {
     }
 
     /// Makes the bundle and returns it with the refs and `HEAD` it is proven to hold.
-    fn bundle_with_refs(
-        &self,
-        tips: &[GitOid],
-        chain_full: bool,
-    ) -> Result<(BuiltBundle, RefView), CaptureError> {
+    fn bundle_with_refs(&self, plan: &BundlePlan) -> Result<(BuiltBundle, RefView), CaptureError> {
         let view = self.ref_view()?;
-        let built = self.bundle(tips, chain_full)?;
-        if self.ref_view()? != view {
-            return Err(CaptureError::RefsMoved {
-                name: "a ref or HEAD".to_owned(),
-            });
+        let built = self.bundle(plan)?;
+        if let Some(moved) = view.moved_in(&self.ref_view()?) {
+            return Err(CaptureError::RefsMoved { moved });
         }
-        self.confirm_bundle(&built, &view, tips)?;
+        self.confirm_bundle(&built, &view, plan.tips())?;
         Ok((built, view))
     }
 
@@ -1105,7 +1213,7 @@ impl GitCapture<'_> {
         tips: &[GitOid],
     ) -> Result<(), CaptureError> {
         let listed: BTreeMap<String, String> = match built {
-            BuiltBundle::Full(file) | BuiltBundle::Incremental(file) => {
+            BuiltBundle::Full(file) | BuiltBundle::Incremental { file, .. } => {
                 let path = file.path().to_string_lossy().into_owned();
                 let out = self.git.run_text(&["bundle", "list-heads", &path])?;
                 out.lines()
@@ -1113,39 +1221,58 @@ impl GitCapture<'_> {
                     .map(|(oid, name)| (name.to_owned(), oid.to_owned()))
                     .collect()
             }
-            BuiltBundle::Empty => BTreeMap::new(),
+            BuiltBundle::Empty { .. } => BTreeMap::new(),
         };
-        let mut wanted: Vec<(String, &GitOid)> = view
+        let moved = |moved: &MovedRef| CaptureError::RefsMoved {
+            moved: moved.clone(),
+        };
+        let mut wanted: Vec<(MovedRef, &GitOid)> = view
             .refs
             .iter()
-            .map(|(name, oid)| (name.as_str().to_owned(), oid))
+            .map(|(name, oid)| (MovedRef::Ref(name.clone()), oid))
             .collect();
         if let GitHead::Detached(oid) = &view.head {
-            wanted.push(("HEAD".to_owned(), oid));
+            wanted.push((MovedRef::Head, oid));
         }
         let mut left_out = Vec::new();
         for (name, oid) in &wanted {
-            match listed.get(name) {
+            match listed.get(&name.to_string()) {
                 Some(seen) if seen == oid.as_str() => {}
-                Some(_) => return Err(CaptureError::RefsMoved { name: name.clone() }),
-                None if matches!(built, BuiltBundle::Full(_)) => {
-                    return Err(CaptureError::RefsMoved { name: name.clone() });
-                }
+                Some(_) => return Err(moved(name)),
+                None if matches!(built, BuiltBundle::Full(_)) => return Err(moved(name)),
                 None => left_out.push((name, *oid)),
             }
         }
         for name in listed.keys() {
-            if name != "HEAD" && !wanted.iter().any(|(n, _)| n == name) {
-                return Err(CaptureError::RefsMoved { name: name.clone() });
+            if name != "HEAD" && !wanted.iter().any(|(n, _)| n.to_string() == *name) {
+                let name = RefName::parse(name).map_err(GitError::from)?;
+                return Err(moved(&MovedRef::Ref(name)));
             }
         }
-        if left_out.is_empty() {
-            return Ok(());
+        if self.reaches_beyond(left_out.iter().map(|(_, oid)| *oid), tips)? {
+            // Name the ref; this is the failure path, so one git run per ref is fine.
+            for (name, oid) in &left_out {
+                if self.reaches_beyond([*oid], tips)? {
+                    return Err(moved(name));
+                }
+            }
         }
+        Ok(())
+    }
+
+    /// True when `from` reaches a commit that no tip in `tips` reaches.
+    fn reaches_beyond<'o>(
+        &self,
+        from: impl IntoIterator<Item = &'o GitOid>,
+        tips: &[GitOid],
+    ) -> Result<bool, CaptureError> {
         let mut input = String::new();
-        for (_, oid) in &left_out {
+        for oid in from {
             input.push_str(oid.as_str());
             input.push('\n');
+        }
+        if input.is_empty() {
+            return Ok(false);
         }
         for tip in tips {
             input.push('^');
@@ -1155,15 +1282,7 @@ impl GitCapture<'_> {
         let out = self
             .git
             .run_stdin_env(&["rev-list", "--stdin", "-n1"], &[], input.as_bytes())?;
-        let unreached = String::from_utf8_lossy(&out).trim().to_owned();
-        if unreached.is_empty() {
-            return Ok(());
-        }
-        let name = left_out
-            .iter()
-            .find(|(_, oid)| oid.as_str() == unreached)
-            .map_or(unreached.clone(), |(name, _)| (*name).clone());
-        Err(CaptureError::RefsMoved { name })
+        Ok(!out.trim_ascii().is_empty())
     }
 
     fn delete_older_snap_refs(&self, current: &GitOid) -> Result<(), CaptureError> {
@@ -1209,6 +1328,38 @@ impl GitCapture<'_> {
         }
         mtimes.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(mtimes)
+    }
+
+    /// Lists the paths of the stash commit `stash` and of its index and untracked parents that `denies` names.
+    ///
+    /// The bundle carries `refs/stash` with its parents, so a `.env` saved
+    /// by `git stash -u` travels with it although it was never tracked.
+    fn stashed_secrets(
+        &self,
+        stash: &GitOid,
+        denies: &dyn Fn(&RelPath) -> bool,
+    ) -> Result<Vec<RelPath>, CaptureError> {
+        let mut found = BTreeSet::new();
+        for suffix in ["", "^2", "^3"] {
+            let rev = format!("{}{suffix}", stash.as_str());
+            let commit = format!("{rev}^{{commit}}");
+            if !self
+                .git
+                .succeeds(&["rev-parse", "--verify", "-q", &commit])?
+            {
+                continue;
+            }
+            let out = self
+                .git
+                .run(&["ls-tree", "-r", "-z", "--name-only", &rev])?;
+            for record in Git::records(&out) {
+                let rel = rel_path(Git::text("stash path", record)?)?;
+                if denies(&rel) {
+                    found.insert(rel);
+                }
+            }
+        }
+        Ok(found.into_iter().collect())
     }
 
     /// Reads the allowlisted projection of the local config.
@@ -1276,7 +1427,7 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
                     job: manifest.job_id,
                 });
             }
-            Some(manifest)
+            Some((parent, manifest))
         }
         None => None,
     };
@@ -1285,10 +1436,13 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
         req,
         report: CaptureReport::default(),
     };
-    let (git_state, found) = if let Some(gc) = detect_git(req, store.objects().tmp_dir())? {
-        gc.refuse_bad_states()?;
-        let state = capture_git(&mut capturer, &gc, parent_manifest.as_ref())?;
-        (Some(state), gc.ignored(&mut capturer.report)?)
+    let (git_state, found) = if let Some(repo) = detect_git(req, store.objects().tmp_dir())? {
+        repo.refuse_bad_states()?;
+        let parent = parent_manifest
+            .as_ref()
+            .map(|(id, manifest)| (*id, manifest));
+        let state = capture_git(&mut capturer, &repo, parent)?;
+        (Some(state), repo.ignored(&mut capturer.report)?)
     } else {
         let listing = list_tree(req.root)?;
         capturer.report.nested_repositories.extend(listing.nested);
@@ -1321,7 +1475,7 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
     if let Some(state) = &manifest.git {
         refuse_overlap(&manifest.files, &state.worktree_mtimes)?;
     }
-    manifest.validate()?;
+    crate::store::encode_manifest(&manifest)?;
     Ok(Captured {
         manifest,
         report: capturer.report,
@@ -1397,12 +1551,12 @@ fn chain_depth(store: &Store, manifest: &SnapshotManifest) -> Result<u32, Captur
 
 fn capture_git(
     capturer: &mut Capturer<'_>,
-    gc: &GitCapture<'_>,
-    parent: Option<&SnapshotManifest>,
+    repo: &GitCapture<'_>,
+    parent: Option<(SnapshotId, &SnapshotManifest)>,
 ) -> Result<GitState, CaptureError> {
     let req = capturer.req;
     let policy = req.policy;
-    let (untracked, nested) = gc.untracked()?;
+    let (untracked, nested) = repo.untracked()?;
     capturer
         .report
         .nested_repositories
@@ -1422,15 +1576,15 @@ fn capture_git(
     if !too_large.is_empty() && !req.allow_large_untracked {
         return Err(CaptureError::UntrackedTooLarge { paths: too_large });
     }
-    let tracked: BTreeSet<RelPath> = gc.tracked()?.into_iter().collect();
+    let tracked: BTreeSet<RelPath> = repo.tracked()?.into_iter().collect();
     for rel in &tracked {
         if policy.denies_anywhere(rel) {
             capturer.report.tracked_secrets.push(rel.clone());
         }
     }
 
-    let head_commit = gc.head_commit()?;
-    let (index_commit, index_tree) = gc.index_commit(head_commit.as_ref())?;
+    let head_commit = repo.head_commit()?;
+    let (index_commit, index_tree) = repo.index_commit(head_commit.as_ref())?;
     let under_nested = |rel: &RelPath| nested.iter().any(|root| rel.starts_with(root));
     // A nested repository without a commit makes `add -A` fail, so every
     // nested root is excluded up front as well as removed afterwards.
@@ -1440,7 +1594,7 @@ fn capture_git(
         excludes.push_str(root.as_str());
         excludes.push_str("/\n");
     }
-    let (worktree_commit, removed) = gc.worktree_commit(
+    let (worktree_commit, removed) = repo.worktree_commit(
         &index_tree,
         head_commit.as_ref(),
         &index_commit,
@@ -1455,28 +1609,22 @@ fn capture_git(
         }
     }
     denied.sort();
-    let snap_ref = format!("{}{}", gc.snap_prefix(), worktree_commit.as_str());
-    gc.git
+    let snap_ref = format!("{}{}", repo.snap_prefix(), worktree_commit.as_str());
+    repo.git
         .run(&["update-ref", &snap_ref, worktree_commit.as_str()])?;
 
-    let (tips, chain_full, parent_id): (Vec<GitOid>, bool, Option<SnapshotId>) = match parent {
-        Some(manifest) => match &manifest.git {
-            Some(parent_git) => (
-                parent_git.refs.iter().map(|(_, oid)| oid.clone()).collect(),
-                chain_depth(capturer.store, manifest)? >= MAX_BUNDLE_CHAIN,
-                req.parent,
-            ),
-            None => (Vec::new(), true, None),
-        },
-        None => (Vec::new(), true, None),
-    };
-    gc.delete_older_snap_refs(&worktree_commit)?;
-    let (built, view) = gc.bundle_with_refs(&tips, chain_full)?;
-    let (bundle, bundle_base) = capturer.store_bundle(built, parent_id)?;
+    let plan = BundlePlan::after(capturer.store, parent)?;
+    repo.delete_older_snap_refs(&worktree_commit)?;
+    let (built, view) = repo.bundle_with_refs(&plan)?;
+    let (bundle, bundle_base) = capturer.store_bundle(built)?;
     let RefView { refs, head } = view;
-    let worktree_mtimes = gc.worktree_mtimes(&worktree_commit, &mut capturer.report)?;
-    let config = gc.config(&mut capturer.report)?;
-    let exclude_path = gc.git.git_path("info/exclude")?;
+    if let Some((_, stash)) = refs.iter().find(|(name, _)| name.as_str() == "refs/stash") {
+        capturer.report.stashed_secrets =
+            repo.stashed_secrets(stash, &|rel| policy.denies_anywhere(rel))?;
+    }
+    let worktree_mtimes = repo.worktree_mtimes(&worktree_commit, &mut capturer.report)?;
+    let config = repo.config(&mut capturer.report)?;
+    let exclude_path = repo.git.git_path("info/exclude")?;
     // `info/exclude` is git's own file, not workspace content, so a link to
     // a shared exclude file is followed as git follows it.
     let exclude = if exclude_path.is_file() {
@@ -1504,6 +1652,7 @@ fn capture_git(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::objects::ChunkParams;
 
     fn rel(s: &str) -> RelPath {
         RelPath::parse(s).unwrap()
@@ -1542,13 +1691,27 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn a_file_changed_in_place_after_its_listing_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(&dir.path().join("store"), ChunkParams::DEFAULT).unwrap();
+        let path = dir.path().join("notes.txt");
+        fs::write(&path, "notes").unwrap();
+        let found = Found::new(rel("notes.txt"), fs::symlink_metadata(&path).unwrap()).unwrap();
+        fs::write(&path, "notes, rewritten").unwrap();
+        assert!(matches!(
+            store_listed(&store, &path, &found),
+            Err(CaptureError::WorkspaceChanged { .. })
+        ));
+    }
+
     /// A ref that moves after the bundle is made is refused, full or incremental.
     #[test]
     fn a_ref_the_bundle_does_not_hold_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("work");
         fs::create_dir(&root).unwrap();
-        let gc = GitCapture {
+        let repo = GitCapture {
             git: Git::new(&root).with_date(1_760_000_000_000),
             root: &root,
             job_id: JobId::from_bytes([1; 16]),
@@ -1557,36 +1720,40 @@ mod tests {
             listing_excludes: TempFile::in_dir(dir.path()),
         };
         let commit = |message: &str| {
-            gc.git
+            repo.git
                 .run(&["commit", "-q", "--allow-empty", "-m", message])
                 .unwrap();
         };
-        gc.git.run(&["init", "-q", "-b", "main"]).unwrap();
+        repo.git.run(&["init", "-q", "-b", "main"]).unwrap();
         commit("one");
-        let view = gc.ref_view().unwrap();
-        let full = gc.bundle(&[], true).unwrap();
-        assert!(gc.confirm_bundle(&full, &view, &[]).is_ok());
+        let view = repo.ref_view().unwrap();
+        let full = repo.bundle(&BundlePlan::Full).unwrap();
+        assert!(repo.confirm_bundle(&full, &view, &[]).is_ok());
 
         commit("two");
-        let moved = gc.ref_view().unwrap();
+        let moved = repo.ref_view().unwrap();
         assert!(matches!(
-            gc.confirm_bundle(&full, &moved, &[]),
-            Err(CaptureError::RefsMoved { name }) if name == "refs/heads/main"
+            repo.confirm_bundle(&full, &moved, &[]),
+            Err(CaptureError::RefsMoved { moved: MovedRef::Ref(name) }) if name.as_str() == "refs/heads/main"
         ));
 
         let tips: Vec<GitOid> = moved.refs.iter().map(|(_, oid)| oid.clone()).collect();
         commit("three");
-        let view = gc.ref_view().unwrap();
-        let incremental = gc.bundle(&tips, false).unwrap();
-        assert!(matches!(incremental, BuiltBundle::Incremental(_)));
-        assert!(gc.confirm_bundle(&incremental, &view, &tips).is_ok());
-        gc.git.run(&["checkout", "-q", "-b", "side"]).unwrap();
+        let view = repo.ref_view().unwrap();
+        let plan = BundlePlan::Incremental {
+            base: SnapshotId::of(b"parent"),
+            tips: tips.clone(),
+        };
+        let incremental = repo.bundle(&plan).unwrap();
+        assert!(matches!(incremental, BuiltBundle::Incremental { .. }));
+        assert!(repo.confirm_bundle(&incremental, &view, &tips).is_ok());
+        repo.git.run(&["checkout", "-q", "-b", "side"]).unwrap();
         commit("four");
-        gc.git.run(&["checkout", "-q", "main"]).unwrap();
-        let grown = gc.ref_view().unwrap();
+        repo.git.run(&["checkout", "-q", "main"]).unwrap();
+        let grown = repo.ref_view().unwrap();
         assert!(matches!(
-            gc.confirm_bundle(&incremental, &grown, &tips),
-            Err(CaptureError::RefsMoved { name }) if name == "refs/heads/side"
+            repo.confirm_bundle(&incremental, &grown, &tips),
+            Err(CaptureError::RefsMoved { moved: MovedRef::Ref(name) }) if name.as_str() == "refs/heads/side"
         ));
     }
 

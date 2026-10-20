@@ -11,11 +11,14 @@ use fabric_core::git::GitOid;
 use fabric_core::id::{ChunkId, JobId, NodeId, SnapshotId};
 use fabric_core::path::{AbsPath, RelPath};
 use fabric_core::snapshot::{
-    Entry, EntryKind, GitHead, GitState, HarnessState, Mode, Platform, SnapshotManifest,
+    Entry, EntryKind, GitHead, GitState, HarnessState, MAX_MANIFEST_LEN, ManifestError, Mode,
+    Platform, SnapshotManifest,
 };
 use fabric_store::catalog::CatalogError;
 use fabric_store::objects::{ChunkParams, ObjectError};
 use fabric_store::store::{CheckDepth, Store, StoreError};
+
+mod common;
 
 type Fallible<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -165,6 +168,23 @@ fn publish_refuses_a_manifest_that_names_a_missing_object() {
 }
 
 #[test]
+fn publish_refuses_a_manifest_no_reader_would_decode() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::create(dir.path(), params().unwrap()).unwrap();
+    let mut entry = file_entry(&store, "a", b"a").unwrap();
+    // Each chunk id encodes as its 32 bytes.
+    let count = MAX_MANIFEST_LEN / 32 + 1;
+    let chunks = chunks_of(&entry).unwrap().repeat(count);
+    entry.kind = EntryKind::File { size: 1, chunks };
+    let m = manifest(vec![entry], 4).unwrap();
+    assert!(matches!(
+        store.publish(&m),
+        Err(StoreError::Manifest(ManifestError::TooLarge { .. }))
+    ));
+    assert!(store.snapshots().unwrap().is_empty());
+}
+
+#[test]
 fn publish_refuses_a_bundle_base_the_store_does_not_have() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::create(dir.path(), params().unwrap()).unwrap();
@@ -190,14 +210,19 @@ fn publish_refuses_a_bundle_base_the_store_does_not_have() {
 }
 
 #[test]
-fn one_process_holds_a_store_and_a_foreign_schema_is_refused() {
+fn a_second_open_of_a_held_store_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::create(dir.path(), params().unwrap()).unwrap();
+    let _store = Store::create(dir.path(), params().unwrap()).unwrap();
     assert!(matches!(
         Store::open(dir.path()),
         Err(StoreError::Locked { .. })
     ));
-    drop(store);
+}
+
+#[test]
+fn creating_a_store_over_one_is_refused_and_its_params_survive() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Store::create(dir.path(), params().unwrap()).unwrap());
     assert!(matches!(
         Store::create(dir.path(), params().unwrap()),
         Err(StoreError::AlreadyAStore { .. })
@@ -205,14 +230,21 @@ fn one_process_holds_a_store_and_a_foreign_schema_is_refused() {
     assert!(!dir.path().join("catalog.sqlite.tmp").exists());
     let reopened = Store::open(dir.path()).unwrap();
     assert_eq!(*reopened.objects().params(), params().unwrap());
-    drop(reopened);
+}
 
-    let other = tempfile::tempdir().unwrap();
+#[test]
+fn opening_a_directory_that_is_not_a_store_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
     assert!(matches!(
-        Store::open(other.path()),
+        Store::open(dir.path()),
         Err(StoreError::NotAStore { .. })
     ));
+}
 
+#[test]
+fn a_catalog_with_a_foreign_schema_version_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Store::create(dir.path(), params().unwrap()).unwrap());
     let conn = rusqlite::Connection::open(dir.path().join("catalog.sqlite")).unwrap();
     conn.execute("UPDATE schema_version SET version = 99", [])
         .unwrap();
@@ -251,7 +283,7 @@ fn gc_keeps_shared_objects_and_removes_the_rest_after_the_grace() {
     let first = store.gc(t0, grace).unwrap();
     assert!(first.marked >= 2, "{first:?}");
     assert_eq!(first.removed_chunks, 0);
-    assert!(store.objects().object_path(a_chunks[0]).exists());
+    assert!(common::object_path(dir.path(), a_chunks[0]).exists());
 
     let second = store.gc(t0 + grace / 2, grace).unwrap();
     assert_eq!(second.removed_chunks, 0);
@@ -259,8 +291,8 @@ fn gc_keeps_shared_objects_and_removes_the_rest_after_the_grace() {
     let third = store.gc(t0 + grace, grace).unwrap();
     assert_eq!(third.removed_chunks, first.marked);
     assert!(third.removed_bytes > 0);
-    assert!(!store.objects().object_path(a_chunks[0]).exists());
-    assert!(store.objects().object_path(shared_chunks[0]).exists());
+    assert!(!common::object_path(dir.path(), a_chunks[0]).exists());
+    assert!(common::object_path(dir.path(), shared_chunks[0]).exists());
     assert!(store.manifest(b).is_ok());
     assert!(store.check(CheckDepth::Hashes).unwrap().is_clean());
 }
@@ -277,11 +309,11 @@ fn gc_sweeps_orphan_objects_and_staged_files_only_after_the_grace() {
         .unwrap();
     assert_eq!(patient.removed_tmp, 1);
     assert_eq!(patient.removed_orphans, 0);
-    assert!(store.objects().object_path(orphan.id).exists());
+    assert!(common::object_path(dir.path(), orphan.id).exists());
 
     let eager = store.gc(SystemTime::now(), Duration::ZERO).unwrap();
     assert_eq!(eager.removed_orphans, 1);
-    assert!(!store.objects().object_path(orphan.id).exists());
+    assert!(!common::object_path(dir.path(), orphan.id).exists());
 }
 
 #[test]
@@ -293,7 +325,7 @@ fn check_sees_a_missing_object_and_a_corrupt_one() {
         .publish(&manifest(vec![entry.clone()], 1).unwrap())
         .unwrap();
     let chunks = chunks_of(&entry).unwrap();
-    let path = store.objects().object_path(chunks[0]);
+    let path = common::object_path(dir.path(), chunks[0]);
     let good = fs::read(&path).unwrap();
 
     fs::remove_file(&path).unwrap();
@@ -359,7 +391,7 @@ fn a_corrupt_object_left_without_a_row_is_removed_not_published() {
     let manifest_chunk = ChunkId::of(&m.encode().unwrap());
     let mut store = Store::open(dir.path()).unwrap();
     for chunk in [data, manifest_chunk] {
-        let path = store.objects().object_path(chunk);
+        let path = common::object_path(dir.path(), chunk);
         let good = fs::read(&path).unwrap();
         fs::write(&path, b"lost in a power cut").unwrap();
         assert!(matches!(
