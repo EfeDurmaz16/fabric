@@ -391,4 +391,17 @@ mod tests {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         check_private(dir.path()).unwrap();
     }
+
+    /// A socket path that is a symlink could lead anywhere, such as to a
+    /// socket another user serves run plans on.
+    #[test]
+    fn a_socket_that_is_a_symlink_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fabric.sock");
+        std::os::unix::fs::symlink(dir.path().join("elsewhere.sock"), &socket).unwrap();
+        assert!(matches!(
+            check_private(&socket),
+            Err(ControlError::Untrusted { .. })
+        ));
+    }
 }
