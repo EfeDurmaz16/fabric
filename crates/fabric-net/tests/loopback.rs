@@ -289,7 +289,7 @@ async fn a_refused_dial_does_not_fall_back_to_tcp() -> TestResult {
     let (a, b, c) = (Node::new()?, Node::new()?, Node::new()?);
     let quic_only = b.bind(TransportKind::Quic, &[a.id()])?;
     let trust: Arc<dyn Trust> = Arc::new(Paired(vec![b.id(), c.id()]));
-    let client = Endpoint::bind(&a.identity, trust, ([127, 0, 0, 1], 0).into())?;
+    let client = Endpoint::bind(&a.identity, &trust, ([127, 0, 0, 1], 0).into())?;
     let err = client
         .dial(c.id(), quic_only.local_addr()?)
         .await
@@ -661,9 +661,9 @@ async fn quic_is_dialed_first_and_tcp_is_the_fallback() -> TestResult {
     let trust_a: Arc<dyn Trust> = Arc::new(Paired(vec![b.id()]));
     let trust_b: Arc<dyn Trust> = Arc::new(Paired(vec![a.id()]));
     let any: SocketAddr = ([127, 0, 0, 1], 0).into();
-    let server = Arc::new(Endpoint::bind(&b.identity, trust_b.clone(), any)?);
+    let server = Arc::new(Endpoint::bind(&b.identity, &trust_b, any)?);
     let client =
-        Endpoint::bind(&a.identity, trust_a, any)?.with_quic_timeout(Duration::from_millis(500));
+        Endpoint::bind(&a.identity, &trust_a, any)?.with_quic_timeout(Duration::from_millis(500));
 
     let accepting = {
         let server = server.clone();
@@ -674,10 +674,17 @@ async fn quic_is_dialed_first_and_tcp_is_the_fallback() -> TestResult {
     assert!(dialed.fallback_reason.is_none());
     assert_eq!(accepting.await??.kind(), TransportKind::Quic);
 
-    // A port where UDP is a black hole and only TCP answers.
-    let udp_sink = std::net::UdpSocket::bind(any)?;
-    let tcp_only_addr = SocketAddr::new(any.ip(), udp_sink.local_addr()?.port());
-    let tcp_only = Arc::new(TcpTlsTransport::bind(&b.identity, trust_b, tcp_only_addr)?);
+    // A port where UDP is a black hole and only TCP answers. The port TCP
+    // picks may be taken for UDP by another test; pick again if so.
+    let (tcp_only, _udp_sink) = loop {
+        let tcp_only = Arc::new(TcpTlsTransport::bind(&b.identity, trust_b.clone(), any)?);
+        match std::net::UdpSocket::bind(tcp_only.local_addr()?) {
+            Ok(sink) => break (tcp_only, sink),
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(err) => return Err(err.into()),
+        }
+    };
+    let tcp_only_addr = tcp_only.local_addr()?;
     let accepting = {
         let tcp_only = tcp_only.clone();
         tokio::spawn(async move { tcp_only.accept().await })

@@ -22,6 +22,9 @@ use crate::transport::{Connection, Transport, TransportError};
 /// How long QUIC gets before the dial falls back to TCP with TLS.
 pub const QUIC_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How many ports a bind to port 0 tries before it reports the TCP port taken.
+pub const EPHEMERAL_TRIES: usize = 8;
+
 /// A connection and, when QUIC was not used, why.
 pub struct Dialed {
     /// The connection.
@@ -42,20 +45,34 @@ pub struct Endpoint {
 impl Endpoint {
     /// Binds both transports at `addr`; with port 0 QUIC picks the port and TCP follows.
     ///
+    /// The port QUIC picks is free for UDP but may be taken for TCP; with
+    /// port 0 the bind then picks again, up to `EPHEMERAL_TRIES` times.
     /// Call it inside a tokio runtime.
     pub fn bind(
         identity: &NodeIdentity,
-        trust: Arc<dyn Trust>,
+        trust: &Arc<dyn Trust>,
         addr: SocketAddr,
     ) -> Result<Self, TransportError> {
-        let quic = QuicTransport::bind(identity, Arc::clone(&trust), addr)?;
-        let tcp = TcpTlsTransport::bind(identity, trust, quic.local_addr()?)?;
-        Ok(Self {
-            node: identity.node_id(),
-            quic,
-            tcp,
-            quic_timeout: QUIC_TIMEOUT,
-        })
+        let mut tries = if addr.port() == 0 { EPHEMERAL_TRIES } else { 1 };
+        loop {
+            let quic = QuicTransport::bind(identity, Arc::clone(trust), addr)?;
+            match TcpTlsTransport::bind(identity, Arc::clone(trust), quic.local_addr()?) {
+                Ok(tcp) => {
+                    return Ok(Self {
+                        node: identity.node_id(),
+                        quic,
+                        tcp,
+                        quic_timeout: QUIC_TIMEOUT,
+                    });
+                }
+                Err(TransportError::Io(err))
+                    if err.kind() == std::io::ErrorKind::AddrInUse && tries > 1 =>
+                {
+                    tries -= 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     /// Sets how long QUIC gets before the dial falls back.
