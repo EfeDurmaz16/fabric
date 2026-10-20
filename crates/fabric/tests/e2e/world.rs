@@ -174,19 +174,50 @@ fn make_repo(repo: &Path) -> Fallible {
 pub struct OtherClaude(Child);
 
 impl OtherClaude {
-    /// Starts it under the test's directory.
+    /// Starts it under the test's directory and returns once `pgrep -x
+    /// claude`, the probe the trust pre-seed runs, lists it.
+    ///
+    /// Right after the spawn the child can still carry the test's name, as
+    /// when the exec of the freshly copied binary waits on a busy machine,
+    /// so the probe would miss it.
     pub fn start(env: &Env) -> Fallible<Self> {
         let dir = env.root.join("other");
         fs::create_dir_all(&dir)?;
         let claude = dir.join("claude");
         fs::copy("/bin/sleep", &claude)?;
-        let child = Command::new(&claude)
-            .arg("600")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        Ok(Self(child))
+        let other = Self(
+            Command::new(&claude)
+                .arg("600")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?,
+        );
+        let pid = other.pid().to_string();
+        let pgrep = ["/usr/bin/pgrep", "/bin/pgrep"]
+            .into_iter()
+            .find(|path| Path::new(path).is_file())
+            .ok_or("no pgrep")?;
+        let started = Instant::now();
+        loop {
+            let listed = Command::new(pgrep)
+                .args(if cfg!(target_os = "macos") {
+                    &["-a", "-x", "claude"][..]
+                } else {
+                    &["-x", "claude"][..]
+                })
+                .output()?;
+            if String::from_utf8_lossy(&listed.stdout)
+                .split_whitespace()
+                .any(|listed| listed == pid)
+            {
+                return Ok(other);
+            }
+            if started.elapsed() > START_TIMEOUT {
+                return Err(format!("pgrep never listed the other claude, pid {pid}").into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Its process id.
