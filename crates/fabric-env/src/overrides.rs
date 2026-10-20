@@ -44,11 +44,6 @@ use fabric_core::path::{PathError, RelPath};
 use fabric_core::snapshot::CacheClass;
 use toml::{Table, Value};
 
-use fabric_core::secret::pattern_matches;
-
-/// Where the override file lives, relative to the workspace root.
-pub const OVERRIDE_FILE: &str = ".fabric/env.toml";
-
 /// The directory that holds Fabric's own files in a workspace; never a cache.
 const FABRIC_DIR: &str = ".fabric";
 
@@ -137,17 +132,6 @@ pub enum OverrideError {
     #[error("`secret_patterns[{index}]` repeats an earlier pattern")]
     DuplicatePattern {
         /// Zero-based index of the repeat.
-        index: usize,
-    },
-    /// An entry of `secret_patterns` that denies the override file itself.
-    ///
-    /// Detection reads the override file through the job's patterns, so
-    /// such a pattern would drop every override from the next detection on.
-    #[error(
-        "`secret_patterns[{index}]` matches {OVERRIDE_FILE}, which detection must be able to read"
-    )]
-    PatternDeniesOverrideFile {
-        /// Zero-based index in `secret_patterns`.
         index: usize,
     },
     /// A setup argument shaped like a credential; the spec travels to other nodes.
@@ -393,9 +377,6 @@ fn patterns(value: &Value) -> Result<Vec<SecretPattern>, OverrideError> {
     for (index, text) in strings(value, "secret_patterns")?.into_iter().enumerate() {
         let pattern = SecretPattern::parse(text)
             .map_err(|reason| OverrideError::Pattern { index, reason })?;
-        if pattern_matches(&pattern, OVERRIDE_FILE) {
-            return Err(OverrideError::PatternDeniesOverrideFile { index });
-        }
         if patterns
             .iter()
             .any(|p| p.as_str().eq_ignore_ascii_case(pattern.as_str()))
@@ -832,20 +813,16 @@ when = "always"
         assert_eq!(EnvOverride::parse(siblings).unwrap().caches.len(), 2);
     }
 
-    /// Detection reads the override file through the job's patterns, so a
-    /// pattern that denies it would drop every override from then on.
+    /// The parse-time rule of `SecretPattern` reaches the user with the entry's index.
     #[test]
     fn a_pattern_that_denies_the_override_file_is_refused() {
-        for pattern in ["*.toml", "env.toml", ".fabric", "*", ".FABRIC/ENV.TOML"] {
-            let text = format!("secret_patterns = [\"*.sqlite\", \"{pattern}\"]");
-            assert!(
-                matches!(
-                    EnvOverride::parse(&text),
-                    Err(OverrideError::PatternDeniesOverrideFile { index: 1 })
-                ),
-                "{pattern}"
-            );
-        }
+        assert!(matches!(
+            EnvOverride::parse("secret_patterns = [\"*.sqlite\", \"*.toml\"]"),
+            Err(OverrideError::Pattern {
+                index: 1,
+                reason: SecretPatternError::DeniesOverrideFile
+            })
+        ));
     }
 
     #[test]

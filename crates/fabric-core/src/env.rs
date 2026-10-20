@@ -17,10 +17,14 @@ use crate::credential::looks_like_credential;
 use crate::harness::ProgramName;
 use crate::id::EnvSpecId;
 use crate::path::RelPath;
+use crate::secret::pattern_matches;
 use crate::snapshot::first_out_of_order;
 
 /// The format version this crate writes; the first varint of every encoded spec.
 pub const ENV_SPEC_VERSION: u16 = 0;
+
+/// Where a workspace's override file lives, relative to its root (ADR 0007).
+pub const OVERRIDE_FILE: &str = ".fabric/env.toml";
 
 /// Why an environment spec was refused.
 #[derive(Debug, thiserror::Error)]
@@ -259,14 +263,22 @@ pub enum SecretPatternError {
         /// Zero-based byte index of the character.
         index: usize,
     },
+    /// The pattern denies the override file, which detection reads through the job's patterns.
+    ///
+    /// Such a pattern, `*.toml`, `env.toml` or `.fabric`, would drop every
+    /// override from the next detection on, so it is refused wherever a
+    /// pattern comes from: the override file or a peer's spec.
+    #[error("secret pattern matches {OVERRIDE_FILE}, which detection must be able to read")]
+    DeniesOverrideFile,
 }
 
 /// A secret pattern a job adds to the built-in list: path components separated by `/`, where `*` matches any run of characters.
 ///
 /// Refused: `\`, `[`, `]`, `?`, `!`, `#`, whitespace and NUL, because
-/// gitignore gives them meanings the matcher does not, and empty, `.`, `..`
-/// and `**` components. Checked once, at the boundary, including inside
-/// `Deserialize`. The matcher itself is `fabric_core::secret`.
+/// gitignore gives them meanings the matcher does not; empty, `.`, `..`
+/// and `**` components; and any pattern that denies `OVERRIDE_FILE`.
+/// Checked once, at the boundary, including inside `Deserialize`. The
+/// matcher itself is `fabric_core::secret`.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct SecretPattern(String);
@@ -291,7 +303,11 @@ impl SecretPattern {
                 _ => {}
             }
         }
-        Ok(Self(text.to_owned()))
+        let pattern = Self(text.to_owned());
+        if pattern_matches(&pattern, OVERRIDE_FILE) {
+            return Err(SecretPatternError::DeniesOverrideFile);
+        }
+        Ok(pattern)
     }
 
     /// Returns the pattern text.
@@ -585,6 +601,25 @@ mod tests {
     fn a_bad_secret_pattern_does_not_decode() {
         let bytes = postcard::to_stdvec("**/x").unwrap();
         assert!(postcard::from_bytes::<SecretPattern>(&bytes).is_err());
+    }
+
+    /// Detection reads the override file through the job's patterns, so a
+    /// pattern that denies it would drop every override from then on; a
+    /// peer's spec that holds one does not decode.
+    #[test]
+    fn a_pattern_that_denies_the_override_file_is_refused() {
+        for pattern in ["*.toml", "env.toml", ".fabric", "*", ".FABRIC/ENV.TOML"] {
+            assert_eq!(
+                SecretPattern::parse(pattern),
+                Err(SecretPatternError::DeniesOverrideFile),
+                "{pattern}"
+            );
+        }
+        assert!(SecretPattern::parse("*.sqlite").is_ok());
+        let mut s = spec();
+        s.secret_patterns = vec![SecretPattern(String::from("*.toml"))];
+        let bytes = codec::encode_versioned(ENV_SPEC_VERSION, &s).unwrap();
+        assert!(EnvSpec::decode(&bytes).is_err());
     }
 
     /// Two specs with the same content in another order would have two ids.

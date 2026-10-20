@@ -36,8 +36,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use fabric_core::env::{
-    EnvSpec, EnvSpecError, RunWhen, SecretPattern, SetupStep, Tool, ToolName, ToolSource,
-    ToolVersion,
+    EnvSpec, EnvSpecError, OVERRIDE_FILE, RunWhen, SecretPattern, SetupStep, Tool, ToolName,
+    ToolSource, ToolVersion,
 };
 use fabric_core::harness::ProgramName;
 use fabric_core::path::RelPath;
@@ -45,8 +45,8 @@ use fabric_core::snapshot::CacheClass;
 use toml::Table;
 
 use crate::overrides::{
-    DeclaredCache, DeclaredEcosystem, EnvOverride, OVERRIDE_FILE, OverrideError,
-    PackageManagerName, canonical_tool, line_and_column,
+    DeclaredCache, DeclaredEcosystem, EnvOverride, OverrideError, PackageManagerName,
+    canonical_tool, line_and_column,
 };
 use fabric_core::secret::{Scope, SecretPolicy};
 

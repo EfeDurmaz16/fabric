@@ -289,7 +289,7 @@ fn changed_list(changed: &[Denied]) -> String {
 }
 
 /// Returns true when a job's `pattern` denies `path`, a relative path whose components are separated by `/`.
-pub fn pattern_matches(pattern: &SecretPattern, path: &str) -> bool {
+pub(crate) fn pattern_matches(pattern: &SecretPattern, path: &str) -> bool {
     let names: Vec<&str> = path.split('/').collect();
     path_matches(pattern.as_str(), &names, &[])
 }
