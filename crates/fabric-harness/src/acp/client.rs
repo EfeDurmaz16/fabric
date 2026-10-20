@@ -40,6 +40,10 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(45);
 /// The longest line read from the agent, in bytes.
 pub const MAX_LINE: usize = 16 * 1024 * 1024;
 
+/// How many `session/update` notifications wait for `next_update` before
+/// newer ones are dropped and counted.
+pub const UPDATE_BUFFER: usize = 1024;
+
 /// Why an ACP exchange failed.
 #[derive(Debug, thiserror::Error)]
 pub enum AcpError {
@@ -167,7 +171,8 @@ struct Inner {
     outgoing: Outgoing,
     pending: Pending,
     next_id: AtomicU64,
-    updates: tokio::sync::Mutex<mpsc::UnboundedReceiver<SessionUpdate>>,
+    updates: tokio::sync::Mutex<mpsc::Receiver<SessionUpdate>>,
+    dropped_updates: Arc<AtomicU64>,
     capabilities: Mutex<Option<AgentCapabilities>>,
     reader: JoinHandle<()>,
 }
@@ -272,11 +277,49 @@ fn parse_update(params: &Value) -> Option<SessionUpdate> {
     Some(SessionUpdate { session, update })
 }
 
+/// Where the reader puts `session/update` notifications. The queue is
+/// bounded and a full queue drops the newest update and counts it, rather
+/// than making the reader wait: a reader that waited on a caller who is
+/// not draining updates would never deliver the response that caller is
+/// waiting for. `session/load` replays a whole history as updates, so the
+/// bound is what keeps an undrained client from growing without limit.
+struct UpdateSink {
+    tx: mpsc::Sender<SessionUpdate>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl UpdateSink {
+    fn new(capacity: usize) -> (Self, mpsc::Receiver<SessionUpdate>, Arc<AtomicU64>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let sink = UpdateSink {
+            tx,
+            dropped: Arc::clone(&dropped),
+        };
+        (sink, rx, dropped)
+    }
+
+    fn offer(&self, update: SessionUpdate) {
+        match self.tx.try_send(update) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if self.dropped.fetch_add(1, Ordering::Relaxed) == 0 {
+                    warn!(
+                        buffer = UPDATE_BUFFER,
+                        "acp: session updates are not being read; dropping the newest"
+                    );
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => debug!("acp: update receiver dropped"),
+        }
+    }
+}
+
 async fn read_loop(
     stdout: ChildStdout,
     outgoing: Outgoing,
     pending: Pending,
-    updates: mpsc::UnboundedSender<SessionUpdate>,
+    updates: UpdateSink,
     policy: PermissionPolicy,
 ) {
     let mut reader = BufReader::new(stdout);
@@ -355,10 +398,8 @@ async fn read_loop(
             }
             (None, Some(method)) => {
                 if method == "session/update" {
-                    if let Some(update) = parse_update(&message.params)
-                        && updates.send(update).is_err()
-                    {
-                        debug!("acp: update receiver dropped");
+                    if let Some(update) = parse_update(&message.params) {
+                        updates.offer(update);
                     }
                 } else {
                     debug!(%method, "acp: notification ignored");
@@ -377,12 +418,12 @@ impl AcpClient {
         let (outgoing, lines) = mpsc::unbounded_channel();
         tokio::spawn(write_loop(stdin, lines));
         let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (sink, rx, dropped_updates) = UpdateSink::new(UPDATE_BUFFER);
         let reader = tokio::spawn(read_loop(
             stdout,
             outgoing.clone(),
             Arc::clone(&pending),
-            tx,
+            sink,
             policy,
         ));
         AcpClient {
@@ -391,6 +432,7 @@ impl AcpClient {
                 pending,
                 next_id: AtomicU64::new(1),
                 updates: tokio::sync::Mutex::new(rx),
+                dropped_updates,
                 capabilities: Mutex::new(None),
                 reader,
             }),
@@ -549,8 +591,16 @@ impl AcpClient {
     }
 
     /// Waits for the next `session/update`; `None` once the agent has closed.
+    /// At most `UPDATE_BUFFER` updates wait here; see `dropped_updates`.
     pub async fn next_update(&self) -> Option<SessionUpdate> {
         self.inner.updates.lock().await.recv().await
+    }
+
+    /// How many updates were dropped because `UPDATE_BUFFER` were already
+    /// waiting unread.
+    #[must_use]
+    pub fn dropped_updates(&self) -> u64 {
+        self.inner.dropped_updates.load(Ordering::Relaxed)
     }
 }
 
@@ -600,6 +650,22 @@ mod tests {
             StopReason::parse("new_thing"),
             StopReason::Other("new_thing".to_owned())
         );
+    }
+
+    #[test]
+    fn a_full_update_queue_drops_the_newest_and_counts_it() {
+        let (sink, mut rx, dropped) = UpdateSink::new(2);
+        let update = |n: u64| SessionUpdate {
+            session: SessionId::parse("s1").unwrap(),
+            update: json!(n),
+        };
+        for n in 0..5 {
+            sink.offer(update(n));
+        }
+        assert_eq!(dropped.load(Ordering::Relaxed), 3);
+        assert_eq!(rx.try_recv().unwrap().update, json!(0));
+        assert_eq!(rx.try_recv().unwrap().update, json!(1));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
