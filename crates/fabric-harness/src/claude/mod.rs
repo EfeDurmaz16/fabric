@@ -3,10 +3,13 @@
 //! Invariant: a Claude session is carried as the files Claude itself reads
 //! on `claude --resume <session-id>`: the transcript and sidecars under
 //! every `~/.claude/projects/<key>/` that holds them, the project memory,
-//! `file-history`, `tasks` and `uploads` for the session, and the
-//! project's own `.claude/` files and `CLAUDE.local.md` inside the
-//! workspace. Credentials, the global `~/.claude.json`, the process
-//! registry and the supervisor state never travel (see `denylist`). On
+//! `file-history`, `tasks` and `uploads` for the session, each one
+//! redacted, JSON through the signed-block rule and everything else line
+//! by line. Files inside the workspace (`.claude/`, `CLAUDE.local.md`) are
+//! the workspace snapshot's to carry (ADR 0004), never this adapter's.
+//! Credentials, the global `~/.claude.json`, the process registry and the
+//! supervisor state never travel (see `denylist`), and a symlink in
+//! session state fails the capture instead of being followed. On
 //! restore the project key and every path-bearing string outside a signed
 //! block are mapped to the new workspace and home; signed blocks are never
 //! edited (ADR 0006). Login is never copied and no per-job config
@@ -31,9 +34,7 @@ use tracing::{info, warn};
 use crate::error::HarnessError;
 use crate::files::{self, Source};
 use crate::harness::{self, Harness, Installed, Io, Launch, Restored, Running};
-use crate::manifest::{
-    HOME_PREFIX, MANIFEST_FORMAT, Redaction, Rewrite, StateManifest, WORKSPACE_PREFIX,
-};
+use crate::manifest::{HOME_PREFIX, MANIFEST_FORMAT, Redaction, Rewrite, StateManifest};
 use crate::process;
 use crate::rewrite::{PathMap, RedactionCounts};
 use crate::session::SessionId;
@@ -165,7 +166,7 @@ impl ClaudeCode {
     fn rewrite_for(path: &Path) -> Rewrite {
         match path.extension().and_then(|e| e.to_str()) {
             Some("jsonl" | "json") => Rewrite::JsonText,
-            _ => Rewrite::None,
+            _ => Rewrite::Text,
         }
     }
 
@@ -175,8 +176,16 @@ impl ClaudeCode {
         prefix: &[&str],
         tree_base: &Path,
     ) -> Result<(), HarnessError> {
-        if !dir.is_dir() {
-            return Ok(());
+        match std::fs::symlink_metadata(dir) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(HarnessError::SymlinkInState {
+                    path: dir.to_path_buf(),
+                });
+            }
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(HarnessError::io("read", dir, e)),
         }
         for file in files::walk(dir)? {
             let abs = dir.join(&file);
@@ -199,8 +208,16 @@ impl ClaudeCode {
         prefix: &[&str],
         tree_base: &Path,
     ) -> Result<bool, HarnessError> {
-        if !abs.is_file() {
-            return Ok(false);
+        match std::fs::symlink_metadata(abs) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(HarnessError::SymlinkInState {
+                    path: abs.to_path_buf(),
+                });
+            }
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => return Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(HarnessError::io("read", abs, e)),
         }
         let rel_to_base = abs.strip_prefix(tree_base).unwrap_or(abs);
         let parts = files::rel_components(rel_to_base)?;
@@ -220,11 +237,22 @@ impl ClaudeCode {
         let projects = self.config_dir.join("projects");
         let mut found_transcript = false;
         if let Ok(entries) = std::fs::read_dir(&projects) {
-            let mut keys: Vec<PathBuf> = entries
-                .filter_map(Result::ok)
-                .map(|e| e.path())
-                .filter(|p| p.is_dir())
-                .collect();
+            let mut keys: Vec<PathBuf> = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|e| HarnessError::io("walk", &projects, e))?;
+                let path = entry.path();
+                let kind = entry
+                    .file_type()
+                    .map_err(|e| HarnessError::io("walk", &path, e))?;
+                if kind.is_dir() {
+                    keys.push(path);
+                } else if kind.is_symlink()
+                    && (path.join(format!("{session}.jsonl")).exists()
+                        || path.join(session.as_str()).exists())
+                {
+                    return Err(HarnessError::SymlinkInState { path });
+                }
+            }
             keys.sort();
             for key_dir in keys {
                 let transcript = key_dir.join(format!("{session}.jsonl"));
@@ -274,14 +302,6 @@ impl ClaudeCode {
             &self.config_dir.join("uploads").join(session.as_str()),
             &home_prefix,
             &self.home,
-        )?;
-        let workspace_prefix = [WORKSPACE_PREFIX];
-        Self::add_tree(&mut sources, &root.join(".claude"), &workspace_prefix, root)?;
-        Self::add_file(
-            &mut sources,
-            &root.join("CLAUDE.local.md"),
-            &workspace_prefix,
-            root,
         )?;
         Ok(sources)
     }
@@ -370,7 +390,7 @@ impl ClaudeCode {
             };
             let bytes = match file.rewrite {
                 Rewrite::JsonText => files::rewrite_json_text(&src, &map)?,
-                Rewrite::None => {
+                Rewrite::None | Rewrite::Text => {
                     std::fs::read(&src).map_err(|e| HarnessError::io("read", &src, e))?
                 }
             };

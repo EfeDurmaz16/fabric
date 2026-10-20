@@ -66,6 +66,9 @@ pub struct Carried {
 pub enum Rewrite {
     /// Bytes are placed as they are.
     None,
+    /// Plain text: secret shapes were redacted line by line at capture;
+    /// placed as captured.
+    Text,
     /// JSON text, one document or one per line: strings outside signed
     /// blocks have the old root, home and project key mapped to the new.
     JsonText,

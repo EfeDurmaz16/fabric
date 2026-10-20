@@ -35,7 +35,8 @@ pub struct Source {
 }
 
 /// Lists the regular files under `dir`, relative paths in sorted order.
-/// Symlinks are skipped with a warning; a harness state tree has none.
+/// A symlink is an error: a harness state tree has none, and following one
+/// would carry something outside the tree.
 pub fn walk(dir: &Path) -> Result<Vec<PathBuf>, HarnessError> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -48,8 +49,9 @@ pub fn walk(dir: &Path) -> Result<Vec<PathBuf>, HarnessError> {
                 .file_type()
                 .map_err(|e| HarnessError::io("walk", &path, e))?;
             if kind.is_symlink() {
-                warn!(path = %path.display(), "skipping symlink in harness state");
-            } else if kind.is_dir() {
+                return Err(HarnessError::SymlinkInState { path });
+            }
+            if kind.is_dir() {
                 stack.push(path);
             } else if kind.is_file() {
                 let rel = path
@@ -218,6 +220,36 @@ fn stage_json_text(
     Ok(out.len() as u64)
 }
 
+/// Redacts a plain-text file line by line while copying it; a line that
+/// is not UTF-8 is redacted as bytes and otherwise kept as it is.
+fn stage_text(
+    src: &Path,
+    dst: &Path,
+    redactor: &Redactor,
+    counts: &mut RedactionCounts,
+) -> Result<u64, HarnessError> {
+    let input = fs::File::open(src).map_err(|e| HarnessError::io("read", src, e))?;
+    let mut reader = BufReader::new(input);
+    let mut out = Vec::new();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let n = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|e| HarnessError::io("read", src, e))?;
+        if n == 0 {
+            break;
+        }
+        let redacted = match std::str::from_utf8(&line) {
+            Ok(text) => redactor.apply(text, counts).map(String::into_bytes),
+            Err(_) => redactor.apply_bytes(&line, counts),
+        };
+        out.extend_from_slice(redacted.as_deref().unwrap_or(&line));
+    }
+    write_atomic(dst, &out)?;
+    Ok(out.len() as u64)
+}
+
 /// Stages `sources` under `out`, checking the denylist and redacting JSON
 /// text. Returns the carried entries sorted by path and the redaction counts.
 pub fn stage(
@@ -236,6 +268,7 @@ pub fn stage(
         let dst = out.join(source.rel.as_str());
         let size = match source.rewrite {
             Rewrite::None => copy_file(&source.abs, &dst)?,
+            Rewrite::Text => stage_text(&source.abs, &dst, Redactor::standard(), counts)?,
             Rewrite::JsonText => stage_json_text(&source.abs, &dst, Redactor::standard(), counts)?,
         };
         carried.push(Carried {

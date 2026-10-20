@@ -127,6 +127,12 @@ pub enum HarnessError {
         /// The harness asked to restore it.
         restoring: HarnessKind,
     },
+    /// A symlink sits inside harness state, where none belongs.
+    #[error("{path} is a symlink; harness state is carried as regular files only")]
+    SymlinkInState {
+        /// The symlink.
+        path: PathBuf,
+    },
     /// A file carried byte for byte holds a secret-shaped string.
     #[error("{path} line {line} holds a secret; it cannot be carried byte for byte")]
     SecretInState {

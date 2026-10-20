@@ -18,6 +18,7 @@ use fabric_harness::{Harness, HarnessError, Io, Launch, SessionId};
 
 const SID: &str = "9c9796f0-2682-4546-a963-d314b3ad543f";
 const SECRET: &str = "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456";
+const GITHUB: &str = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab";
 
 struct Fixture {
     home: tempfile::TempDir,
@@ -145,6 +146,11 @@ async fn capture_carries_session_state_only_and_redacts() {
     let home = src.home.path().canonicalize().unwrap();
     let adapter = ClaudeCode::new(home.clone()).with_path_var(OsString::new());
     let out = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.join(".claude/file-history").join(SID).join("abc@v1"),
+        format!("GITHUB_TOKEN={GITHUB}\n"),
+    )
+    .unwrap();
     let manifest = adapter
         .capture(&src.work, &session(), out.path())
         .await
@@ -166,18 +172,33 @@ async fn capture_carries_session_state_only_and_redacts() {
     );
     assert!(paths.contains(&format!("home/.claude/file-history/{SID}/abc@v1").as_str()));
     assert!(paths.contains(&"home/.claude/tasks/session-9c9796f0/1.json"));
-    assert!(paths.contains(&"workspace/.claude/settings.local.json"));
-    assert!(paths.contains(&"workspace/CLAUDE.local.md"));
-    for denied in [".credentials.json", "sessions/", ".claude.json", ".env"] {
+    for denied in [
+        ".credentials.json",
+        "sessions/",
+        ".claude.json",
+        ".env",
+        "workspace/",
+        "settings.local.json",
+        "CLAUDE.local.md",
+    ] {
         assert!(
             !paths.iter().any(|p| p.contains(denied)),
             "{denied} was carried: {paths:?}"
         );
     }
     assert_eq!(manifest.harness_version, None);
-    assert_eq!(manifest.redactions.len(), 1);
-    assert_eq!(manifest.redactions[0].rule, "anthropic-key");
-    assert_eq!(manifest.redactions[0].count, 1);
+    let rules: Vec<(&str, u32)> = manifest
+        .redactions
+        .iter()
+        .map(|r| (r.rule.as_str(), r.count))
+        .collect();
+    assert_eq!(rules, vec![("anthropic-key", 1), ("github-token", 1)]);
+    let history = std::fs::read_to_string(
+        out.path()
+            .join(format!("home/.claude/file-history/{SID}/abc@v1")),
+    )
+    .unwrap();
+    assert_eq!(history, "GITHUB_TOKEN=[REDACTED:github-token]\n");
     let staged = std::fs::read_to_string(
         out.path()
             .join(format!("home/.claude/projects/{key}/{SID}.jsonl")),
@@ -192,35 +213,38 @@ async fn capture_carries_session_state_only_and_redacts() {
 }
 
 #[tokio::test]
-async fn capture_of_a_dotenv_in_the_workspace_claude_dir_is_refused_not_skipped() {
-    // The denylist is a hard stop on anything an adapter lists; the Claude
-    // adapter lists the whole workspace `.claude/` tree, so a `.env` there
-    // must make capture fail closed rather than carry or quietly drop it.
+async fn a_symlink_in_session_state_refuses_the_capture() {
     let src = build_source("w");
-    let adapter = ClaudeCode::new(src.home.path().canonicalize().unwrap());
+    let home = src.home.path().canonicalize().unwrap();
+    let outside = home.join("outside.txt");
+    std::fs::write(&outside, "aws_secret_access_key=supersecret\n").unwrap();
+    let results = home
+        .join(".claude/projects")
+        .join(slug(&src.work).unwrap())
+        .join(format!("{SID}/tool-results"));
+    std::fs::create_dir_all(&results).unwrap();
+    let link = results.join("link.txt");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
     let out = tempfile::tempdir().unwrap();
-    assert!(
-        adapter
-            .capture(&src.work, &session(), out.path())
-            .await
-            .is_ok()
-    );
-    std::fs::write(src.work.join(".claude/.env"), "SECRET=1").unwrap();
-    let out2 = tempfile::tempdir().unwrap();
-    let err = adapter
-        .capture(&src.work, &session(), out2.path())
+    let err = ClaudeCode::new(home.clone())
+        .capture(&src.work, &session(), out.path())
         .await
         .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            HarnessError::Denied {
-                rule: "dotenv file",
-                ..
-            }
-        ),
-        "{err}"
-    );
+    assert!(matches!(err, HarnessError::SymlinkInState { .. }), "{err}");
+    std::fs::remove_file(&link).unwrap();
+    let transcript = home
+        .join(".claude/projects")
+        .join(slug(&src.work).unwrap())
+        .join(format!("{SID}.jsonl"));
+    let real = home.join("real.jsonl");
+    std::fs::rename(&transcript, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &transcript).unwrap();
+    let err = ClaudeCode::new(home.clone())
+        .capture(&src.work, &session(), out.path())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HarnessError::SymlinkInState { .. }), "{err}");
+    assert!(!out.path().join("manifest.json").exists());
 }
 
 #[tokio::test]
@@ -280,11 +304,9 @@ async fn restore_into_another_root_rewrites_paths_but_not_signed_blocks() {
         results.contains(root_a.as_ref()),
         "plain text sidecars are not rewritten"
     );
-    let local = std::fs::read_to_string(work_b.join(".claude/settings.local.json")).unwrap();
-    assert!(local.contains(&format!("Read({root_b}/docs/**)")));
-    assert_eq!(
-        std::fs::read_to_string(work_b.join("CLAUDE.local.md")).unwrap(),
-        "local notes\n"
+    assert!(
+        !work_b.join(".claude").exists(),
+        "workspace files are the workspace snapshot's to carry"
     );
     assert!(!home_b.join(".claude/.credentials.json").exists());
 
