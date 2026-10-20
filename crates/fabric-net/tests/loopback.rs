@@ -112,7 +112,7 @@ fn not_here<T>() -> JobFuture<'static, T> {
 }
 
 impl Service for FakeService {
-    fn pull(&self, _: NodeId, _: FencingToken, _: RecordHash) -> JobFuture<'_, Pulled> {
+    fn pull(&self, _: NodeId, _: FencingToken, _: Option<RecordHash>) -> JobFuture<'_, Pulled> {
         not_here()
     }
 

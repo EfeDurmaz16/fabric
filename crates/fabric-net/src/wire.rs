@@ -364,6 +364,11 @@ pub enum Pulled {
     Last(RecordPage),
     /// A page with more records after it; the sender pulls again after its last record.
     More(RecordPage),
+    /// The asked record is not in the receiver's chain, so the two ledgers forked; the sender runs the ADR 0003 fork rule.
+    NotInChain {
+        /// The receiver's head.
+        head: RecordHash,
+    },
 }
 
 /// What a request asks for.
@@ -394,8 +399,8 @@ pub enum RequestBody {
 pub enum JobRequest {
     /// Asks for the records after `after`; answered with `Records`.
     Pull {
-        /// The receiver's head, or the record it last saw.
-        after: RecordHash,
+        /// The sender's head, or the record it last saw; `None` asks from the job's first record, `Created`.
+        after: Option<RecordHash>,
     },
     /// Replicates one page of records, each as its exact ledger bytes; answered with `Accepted`, `Rejected` or an epoch answer.
     Append {
@@ -922,7 +927,8 @@ mod tests {
 
     fn job_request() -> impl Strategy<Value = JobRequest> {
         prop_oneof![
-            bytes32(RecordHash::from_bytes).prop_map(|after| JobRequest::Pull { after }),
+            proptest::option::of(bytes32(RecordHash::from_bytes))
+                .prop_map(|after| JobRequest::Pull { after }),
             records().prop_map(|records| JobRequest::Append { records }),
             Just(JobRequest::MoveRequest),
             (
@@ -968,6 +974,8 @@ mod tests {
             Just(JobResponse::Records(Pulled::UpToDate)),
             records().prop_map(|page| JobResponse::Records(Pulled::Last(page))),
             records().prop_map(|page| JobResponse::Records(Pulled::More(page))),
+            bytes32(RecordHash::from_bytes)
+                .prop_map(|head| JobResponse::Records(Pulled::NotInChain { head })),
             bytes32(RecordHash::from_bytes).prop_map(|head| JobResponse::Accepted { head }),
             bytes32(RecordHash::from_bytes).prop_map(|head| JobResponse::Rejected { head }),
             (epoch(), epoch())
@@ -1217,6 +1225,7 @@ mod tests {
         let page = page_of(vec![record.clone()]);
         let all = [
             JobResponse::Records(Pulled::More(page)),
+            JobResponse::Records(Pulled::NotInChain { head }),
             JobResponse::Accepted { head },
             JobResponse::Rejected { head },
             JobResponse::MoveStarted { move_id },

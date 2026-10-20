@@ -148,8 +148,13 @@ pub type JobFuture<'a, T> = BoxFuture<'a, Result<Fenced<T>, Fault>>;
 /// was told `Fault::Deadline`. The caller then treats the outcome as
 /// unknown and asks again, with `MoveStatus` for a move.
 pub trait Service: Send + Sync {
-    /// Answers `Pull`: the records after `after`, one page at a time.
-    fn pull(&self, peer: NodeId, token: FencingToken, after: RecordHash) -> JobFuture<'_, Pulled>;
+    /// Answers `Pull`: the records after `after`, or from the first record when it is `None`, one page at a time.
+    fn pull(
+        &self,
+        peer: NodeId,
+        token: FencingToken,
+        after: Option<RecordHash>,
+    ) -> JobFuture<'_, Pulled>;
     /// Answers `Append`: links `records` to this node's ledger, or says where its head is.
     fn append(
         &self,
@@ -476,11 +481,11 @@ impl Session {
         }
     }
 
-    /// Asks for the records after `after` under `token`, waiting at most `deadline`.
+    /// Asks for the records after `after`, or from the first record when it is `None`, under `token`, waiting at most `deadline`.
     pub async fn pull(
         &self,
         token: FencingToken,
-        after: RecordHash,
+        after: Option<RecordHash>,
         deadline: Duration,
     ) -> Result<Fenced<Pulled>, RpcError> {
         self.job(token, JobRequest::Pull { after }, deadline).await
@@ -1111,7 +1116,7 @@ mod tests {
     }
 
     impl Service for Nothing {
-        fn pull(&self, _: NodeId, _: FencingToken, _: RecordHash) -> JobFuture<'_, Pulled> {
+        fn pull(&self, _: NodeId, _: FencingToken, _: Option<RecordHash>) -> JobFuture<'_, Pulled> {
             no_job()
         }
 

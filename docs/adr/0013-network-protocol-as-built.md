@@ -61,7 +61,7 @@ Callers and services see one typed method per request, per-job requests included
 RequestBody  = Hello(Hello) | Ping
              | Job { token: FencingToken, body: JobRequest }
              | WantSnapshot { snapshot } | WantChunks(ChunkBatch)
-JobRequest   = Pull { after } | Append { records: RecordPage } | MoveRequest
+JobRequest   = Pull { after: Option<RecordHash> } | Append { records: RecordPage } | MoveRequest
              | MoveOffer(OfferBody) | MoveStatus { move_id } | MoveAbort { move_id }
 ResponseBody = Hello(Hello) | Pong | Job(JobResponse)
              | ManifestChunks { len, ids } | Chunk { id, zstd } | ChunksDone | Fault(Fault)
@@ -69,7 +69,7 @@ JobResponse  = Records(Pulled) | Accepted { head } | Rejected { head }
              | StaleEpoch { yours, current } | AheadOfUs { yours, current }
              | MoveStarted { move_id } | MoveDecision { record: RecordBytes } | MoveUndecided { move_id }
              | SnapshotIncomplete { snapshot }
-Pulled       = UpToDate | Last(RecordPage) | More(RecordPage)
+Pulled       = UpToDate | Last(RecordPage) | More(RecordPage) | NotInChain { head }
 Hello        = { node, protocol_version, fabric_version, clock_ms }
 OfferBody    = { move_id, head, snapshot }
 ```
@@ -86,7 +86,7 @@ MoveAbort   -> RecordBytes, the decision record
 ```
 
 - `Hello` gains `protocol_version`; a mismatch ends the session at the handshake. Skew is the peer's clock against this node's when the hello arrives.
-- `Pull` and `Records` let a node fetch the records after its head. `Pulled` says whether more records follow, and a page is never empty, so a page with more after it always has a last record to pull after, and an `Append` always carries a record. `AheadOfUs` is the mirror of `StaleEpoch`: the sender's epoch is newer, so the receiver must fetch first. `MoveStarted` and `SnapshotIncomplete` are the owner's and the target's answers in the ADR 0003 move.
+- `Pull` and `Records` let a node fetch the records after its head. A `Pull` with no `after` asks from the job's first record, `Created`, which has no record before it, so a node that holds none of a job's records can still fetch them. `NotInChain { head }` says the asked record is not in the receiver's chain: the two ledgers forked, and the sender runs the ADR 0003 fork rule instead of reading a malformed-request fault. `Pulled` says whether more records follow, and a page is never empty, so a page with more after it always has a last record to pull after, and an `Append` always carries a record. `AheadOfUs` is the mirror of `StaleEpoch`: the sender's epoch is newer, so the receiver must fetch first. `MoveStarted` and `SnapshotIncomplete` are the owner's and the target's answers in the ADR 0003 move.
 - `OfferBody` is a `MoveOffer` without its job id. The fencing token carries the job id, so the id has one home on the wire and a message cannot name one job in its token and another in its offer. The receiver rebuilds the `MoveOffer` from the token.
 - `Fault` says a request was understood and could not be served: unknown job, snapshot or chunk, budget spent, bad request, internal failure.
 - A `ChunkBatch` names 1 to 256 distinct ids; a repeated id is refused at decode, so the missing set stays exact.
