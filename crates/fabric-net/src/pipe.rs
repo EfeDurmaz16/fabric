@@ -15,11 +15,21 @@ use std::task::{Context, Poll, Waker};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+/// Where the write end is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Writer {
+    /// It may still write.
+    Open,
+    /// It finished: the reader sees end of stream after the buffered bytes.
+    Finished,
+    /// It aborted: the reader's next read fails.
+    Aborted,
+}
+
 struct State {
     buf: VecDeque<u8>,
     capacity: usize,
-    writer_gone: bool,
-    aborted: bool,
+    writer: Writer,
     reader_gone: bool,
     read_waker: Option<Waker>,
     write_waker: Option<Waker>,
@@ -36,8 +46,7 @@ pub(crate) fn pipe(capacity: usize) -> (PipeWriter, PipeReader) {
     let state = Arc::new(Mutex::new(State {
         buf: VecDeque::new(),
         capacity,
-        writer_gone: false,
-        aborted: false,
+        writer: Writer::Open,
         reader_gone: false,
         read_waker: None,
         write_waker: None,
@@ -61,11 +70,11 @@ impl PipeReader {
     /// Takes up to `max` buffered bytes, waiting for some; an empty result is the end of the stream.
     pub(crate) fn poll_take(&self, cx: &mut Context<'_>, max: usize) -> Poll<io::Result<Vec<u8>>> {
         let mut state = lock(&self.0);
-        if state.aborted {
+        if state.writer == Writer::Aborted {
             return Poll::Ready(Err(lost()));
         }
         if state.buf.is_empty() {
-            if state.writer_gone {
+            if state.writer == Writer::Finished {
                 return Poll::Ready(Ok(Vec::new()));
             }
             state.read_waker = Some(cx.waker().clone());
@@ -87,11 +96,11 @@ impl AsyncRead for PipeReader {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let mut state = lock(&self.0);
-        if state.aborted {
+        if state.writer == Writer::Aborted {
             return Poll::Ready(Err(lost()));
         }
         if state.buf.is_empty() {
-            if state.writer_gone {
+            if state.writer == Writer::Finished {
                 return Poll::Ready(Ok(()));
             }
             state.read_waker = Some(cx.waker().clone());
@@ -125,7 +134,7 @@ impl PipeWriter {
     /// Ends the pipe with an error: the reader's next read fails, buffered bytes or not.
     pub(crate) fn abort(self) {
         let mut state = lock(&self.0);
-        state.aborted = true;
+        state.writer = Writer::Aborted;
         state.buf.clear();
         if let Some(waker) = state.read_waker.take() {
             waker.wake();
@@ -164,22 +173,25 @@ impl AsyncWrite for PipeWriter {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut state = lock(&self.0);
-        state.writer_gone = true;
-        if let Some(waker) = state.read_waker.take() {
-            waker.wake();
-        }
+        finish(&self.0);
         Poll::Ready(Ok(()))
+    }
+}
+
+/// Ends an open pipe cleanly; an aborted one stays aborted.
+fn finish(state: &Mutex<State>) {
+    let mut state = lock(state);
+    if state.writer == Writer::Open {
+        state.writer = Writer::Finished;
+    }
+    if let Some(waker) = state.read_waker.take() {
+        waker.wake();
     }
 }
 
 impl Drop for PipeWriter {
     fn drop(&mut self) {
-        let mut state = lock(&self.0);
-        state.writer_gone = true;
-        if let Some(waker) = state.read_waker.take() {
-            waker.wake();
-        }
+        finish(&self.0);
     }
 }
 
