@@ -60,7 +60,11 @@ const SECRET_NAMES: &[&str] = &[
     ".netrc",
     ".npmrc",
     ".pypirc",
+    ".git-credentials",
+    ".pgpass",
+    "credentials.tfrc.json",
     "id_rsa",
+    "id_dsa",
     "id_ecdsa",
     "id_ed25519",
 ];
@@ -159,9 +163,12 @@ pub(crate) fn check(rel_path: &str) -> Option<DenyRule> {
         if is_env_file(name) {
             return Some(DenyRule::DotenvFile);
         }
-        if matches!(*name, ".ssh" | ".aws" | ".gnupg" | ".kube") {
+        if matches!(*name, ".ssh" | ".aws" | ".gnupg" | ".kube" | ".docker") {
             return Some(DenyRule::CredentialDirectory);
         }
+    }
+    if components.windows(2).any(|pair| pair == [".config", "gh"]) {
+        return Some(DenyRule::CredentialDirectory);
     }
     if components.first() == Some(&HOME_PREFIX) {
         match (components.get(1), components.get(2)) {
@@ -222,6 +229,12 @@ mod tests {
             "home/.codex/logs_2.sqlite",
             "home/.ssh/id_ed25519",
             "home/.aws/credentials",
+            "home/.git-credentials",
+            "home/.pgpass",
+            "home/.ssh2/id_dsa",
+            "home/.docker/config.json",
+            "home/.config/gh/hosts.yml",
+            "home/.terraform.d/credentials.tfrc.json",
             "home/w/.env",
             "home/w/.env.local",
             "home/w/config/server.pem",
@@ -246,6 +259,7 @@ mod tests {
             "home/.claude/settings.local.json",
             "home/w/.env.example",
             "home/.fake-agent/sessions/.coordination.lock",
+            "home/.config/ghostty/config",
         ] {
             assert_eq!(check(path), None, "{path} should be allowed");
         }
