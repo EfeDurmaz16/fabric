@@ -409,6 +409,13 @@ impl IgnorePolicy {
         text
     }
 
+    /// True when any component of a path matches the full secret list.
+    #[must_use]
+    pub fn is_secret(&self, path: &RelPath) -> bool {
+        let comps: Vec<&str> = path.as_str().split('/').collect();
+        (0..comps.len()).any(|j| self.secrets.iter().any(|p| p.matches_at(&comps, j)))
+    }
+
     /// True when a path matches the full secret list or an exclude, whatever lies above it.
     #[must_use]
     pub fn denies_anywhere(&self, path: &RelPath) -> bool {

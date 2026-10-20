@@ -113,6 +113,8 @@ pub struct CaptureReport {
     pub excluded: Vec<RelPath>,
     /// Untracked paths removed from the working-tree commit by the secret patterns or the excludes.
     pub denied_untracked: Vec<RelPath>,
+    /// Paths in the harness state directory left out by a secret pattern.
+    pub denied_harness: Vec<RelPath>,
     /// Tracked paths that match a secret pattern; they travel in the bundle.
     pub tracked_secrets: Vec<RelPath>,
     /// Symlinks whose target is absolute or climbs above the root.
@@ -508,13 +510,21 @@ impl Capturer<'_> {
         Ok(stored.chunks)
     }
 
-    /// Captures a directory whole: every path, in order, no policy.
-    fn tree_entries(&mut self, base: &Path) -> Result<Vec<Entry>, CaptureError> {
+    /// Captures the harness state directory: every path but those the secret list names.
+    ///
+    /// The adapter's state is not a workspace, so the excludes and cache
+    /// classes do not apply, but a secret never travels from here either:
+    /// Claude Code keeps `.credentials.json` in its state directory on Linux.
+    fn harness_entries(&mut self, base: &Path) -> Result<Vec<Entry>, CaptureError> {
         let mut nested = Vec::new();
         let found = list_tree(base, &mut nested)?;
         self.report.nested_repositories.extend(nested);
         let mut entries = Vec::with_capacity(found.len());
         for item in &found {
+            if self.req.policy.is_secret(&item.rel) {
+                self.report.denied_harness.push(item.rel.clone());
+                continue;
+            }
             entries.push(self.entry_for(base, item)?);
         }
         // The walk lists a directory's children before its siblings, which
@@ -988,7 +998,7 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
     let (files, caches) = capturer.classify_and_store(req.root, found)?;
     let harness_state = match req.harness_state {
         Some(dir) => HarnessState {
-            entries: capturer.tree_entries(dir)?,
+            entries: capturer.harness_entries(dir)?,
         },
         None => HarnessState::default(),
     };

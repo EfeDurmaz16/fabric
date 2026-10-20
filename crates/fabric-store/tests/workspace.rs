@@ -723,6 +723,34 @@ fn listing(root: &Path) -> Fallible<Listing> {
     Ok(out)
 }
 
+#[test]
+fn a_secret_in_the_harness_state_is_left_behind_and_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("plain");
+    let state = dir.path().join("state");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(state.join("sessions")).unwrap();
+    fs::write(state.join("sessions/s1.jsonl"), "{}\n").unwrap();
+    fs::write(state.join(".credentials.json"), "{\"token\":1}\n").unwrap();
+
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let mut req = request(&root, &policy, None);
+    req.harness_state = Some(&state);
+    let Captured { manifest, report } = capture(&store, &req).unwrap();
+    let paths: Vec<&str> = manifest
+        .harness_state
+        .entries
+        .iter()
+        .map(|e| e.rel_path.as_str())
+        .collect();
+    assert_eq!(paths, vec!["sessions", "sessions/s1.jsonl"]);
+    assert_eq!(
+        report.denied_harness,
+        vec![RelPath::parse(".credentials.json").unwrap()]
+    );
+}
+
 fn plain_tree(root: &Path, state: &Path) -> Fallible {
     fs::create_dir_all(root.join("a/b"))?;
     fs::create_dir_all(root.join("empty"))?;
