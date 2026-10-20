@@ -1,7 +1,9 @@
 //! Codex adapter: a paginated lineage with a compressed prefix is captured
-//! under the writer lock, restored onto a node with the same home and
-//! workspace path but no Codex state, under `sessions/fabric/<thread>/`,
-//! and a fake `codex` is launched there.
+//! under Codex's real writer lock, restored onto a node with the same home
+//! and workspace path but no Codex state, under `sessions/fabric/<thread>/`,
+//! brought back over the original, and a fake `codex` is launched there.
+//! Rollouts that share an id, rollouts that hold a secret, manifest paths
+//! that are not rollouts and an active writer are refused.
 
 #![allow(
     clippy::unwrap_used,
@@ -14,11 +16,16 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use fabric_core::env::EnvVarName;
+use fabric_core::path::RelPath;
 use fabric_harness::codex::Codex;
+use fabric_harness::manifest::{Carried, Content, Digest};
 use fabric_harness::{Harness, HarnessError, Io, Launch, SessionId};
 
 const THREAD: &str = "019f233e-bb33-7342-85fa-f2d33b14368a";
 const PREFIX: &str = "019f1111-bb33-7342-85fa-f2d33b14368b";
+const HEAD_NAME: &str = "rollout-2026-10-19T11-00-00-019f233e-bb33-7342-85fa-f2d33b14368a.jsonl";
+const PREFIX_NAME: &str =
+    "rollout-2026-10-18T09-00-00-019f1111-bb33-7342-85fa-f2d33b14368b.jsonl.zst";
 
 fn session_meta(id: &str, cwd: &str, history_base: Option<&str>) -> String {
     let base = match history_base {
@@ -29,6 +36,12 @@ fn session_meta(id: &str, cwd: &str, history_base: Option<&str>) -> String {
     };
     format!(
         "{{\"timestamp\":\"2026-10-19T10:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"session_id\":\"{id}\",\"timestamp\":\"2026-10-19T10:00:00.000Z\",\"cwd\":\"{cwd}\",\"originator\":\"codex_cli_rs\",\"cli_version\":\"0.155.1\",\"history_mode\":\"paginated\"{base}}}}}\n{{\"timestamp\":\"2026-10-19T10:00:01.000Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"hello from {cwd}\"}}]}}}}\n"
+    )
+}
+
+fn turn(text: &str) -> String {
+    format!(
+        "{{\"timestamp\":\"2026-10-19T12:00:00.000Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"{text}\"}}]}}}}\n"
     )
 }
 
@@ -47,7 +60,7 @@ fn build_source() -> Fixture {
     let codex = home_path.join(".codex");
     let day = codex.join("sessions/2026/10/19");
     std::fs::create_dir_all(&day).unwrap();
-    let head = day.join(format!("rollout-2026-10-19T11-00-00-{THREAD}.jsonl"));
+    let head = day.join(HEAD_NAME);
     std::fs::write(
         &head,
         session_meta(THREAD, &work.to_string_lossy(), Some(PREFIX)),
@@ -55,7 +68,7 @@ fn build_source() -> Fixture {
     .unwrap();
     let archived = codex.join("archived_sessions");
     std::fs::create_dir_all(&archived).unwrap();
-    let prefix = archived.join(format!("rollout-2026-10-18T09-00-00-{PREFIX}.jsonl.zst"));
+    let prefix = archived.join(PREFIX_NAME);
     let mut encoder =
         zstd::stream::write::Encoder::new(std::fs::File::create(&prefix).unwrap(), 3).unwrap();
     encoder
@@ -103,6 +116,10 @@ fn thread() -> SessionId {
     SessionId::parse(THREAD).unwrap()
 }
 
+fn lock_dir(home: &Path) -> PathBuf {
+    home.join(".codex/thread-writer-locks")
+}
+
 #[tokio::test]
 async fn capture_follows_the_lineage_and_carries_nothing_else() {
     let src = build_source();
@@ -114,7 +131,7 @@ async fn capture_follows_the_lineage_and_carries_nothing_else() {
     assert_eq!(chain.len(), 2);
     assert_eq!(chain[0].path, src.head);
     assert_eq!(chain[1].path, src.prefix);
-    assert!(chain[1].compressed);
+    assert!(chain[1].name.compressed);
 
     let out = tempfile::tempdir().unwrap();
     let manifest = adapter
@@ -125,10 +142,8 @@ async fn capture_follows_the_lineage_and_carries_nothing_else() {
     assert_eq!(
         paths,
         vec![
-            format!("home/.codex/archived_sessions/rollout-2026-10-18T09-00-00-{PREFIX}.jsonl.zst")
-                .as_str(),
-            format!("home/.codex/sessions/2026/10/19/rollout-2026-10-19T11-00-00-{THREAD}.jsonl")
-                .as_str(),
+            format!("home/.codex/archived_sessions/{PREFIX_NAME}").as_str(),
+            format!("home/.codex/sessions/2026/10/19/{HEAD_NAME}").as_str(),
         ]
     );
     assert_eq!(
@@ -137,12 +152,16 @@ async fn capture_follows_the_lineage_and_carries_nothing_else() {
         "rollout bytes travel verbatim"
     );
     assert!(manifest.redactions.is_empty());
+    let locks = lock_dir(&home);
     assert!(
-        home.join(".codex/thread-writer-locks")
-            .join(format!("{THREAD}.lock"))
-            .is_file(),
-        "capture leaves the lock file Codex expects"
+        locks.join(".coordination.lock").is_file(),
+        "the coordination lock lives where Codex keeps it"
     );
+    assert!(
+        !locks.join(format!("{THREAD}.lock")).exists(),
+        "the thread lock file is removed on release, as Codex does"
+    );
+    assert!(!home.join(".codex/.coordination.lock").exists());
 }
 
 #[tokio::test]
@@ -156,17 +175,17 @@ async fn a_missing_prefix_breaks_the_lineage() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, HarnessError::LineageBroken { ref missing, .. } if missing == PREFIX),
+        matches!(err, HarnessError::LineageBroken { ref missing, .. } if missing.as_str() == PREFIX),
         "{err}"
     );
     assert!(!out.path().join("manifest.json").exists());
 }
 
 #[tokio::test]
-async fn an_active_writer_blocks_capture() {
+async fn an_active_writer_blocks_capture_and_restore() {
     let src = build_source();
     let home = src.home.path().canonicalize().unwrap();
-    let locks = home.join(".codex/thread-writer-locks");
+    let locks = lock_dir(&home);
     std::fs::create_dir_all(&locks).unwrap();
     let holder = std::fs::File::create(locks.join(format!("{THREAD}.lock"))).unwrap();
     holder.lock().unwrap();
@@ -182,6 +201,15 @@ async fn an_active_writer_blocks_capture() {
         .capture(&src.work, &thread(), out.path())
         .await
         .unwrap();
+    // The capture removed the lock file on release, as Codex does; a new
+    // writer opens the path afresh, as Codex's `acquire` does.
+    drop(holder);
+    let holder = std::fs::File::create(locks.join(format!("{THREAD}.lock"))).unwrap();
+    holder.lock().unwrap();
+    let err = adapter.restore(&src.work, out.path()).await.unwrap_err();
+    assert!(matches!(err, HarnessError::ActiveWriter { .. }), "{err}");
+    holder.unlock().unwrap();
+    adapter.restore(&src.work, out.path()).await.unwrap();
 }
 
 #[tokio::test]
@@ -191,10 +219,8 @@ async fn a_rollout_with_a_secret_is_refused_not_carried() {
         .append(true)
         .open(&src.head)
         .unwrap();
-    file.write_all(
-        b"{\"type\":\"response_item\",\"payload\":{\"text\":\"token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab\"}}\n",
-    )
-    .unwrap();
+    file.write_all(turn("token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab").as_bytes())
+        .unwrap();
     drop(file);
     let adapter = Codex::new(src.home.path().canonicalize().unwrap());
     let out = tempfile::tempdir().unwrap();
@@ -210,51 +236,89 @@ async fn a_rollout_with_a_secret_is_refused_not_carried() {
 }
 
 #[tokio::test]
+async fn two_files_for_one_rollout_resolve_by_prefix_or_are_refused() {
+    let src = build_source();
+    let home = src.home.path().canonicalize().unwrap();
+    let adapter = Codex::new(home.clone());
+    let copy_dir = home.join(".codex/sessions/fabric").join(THREAD);
+    std::fs::create_dir_all(&copy_dir).unwrap();
+    let copy = copy_dir.join(HEAD_NAME);
+    let mut longer = std::fs::read_to_string(&src.head).unwrap();
+    longer.push_str(&turn("more"));
+    std::fs::write(&copy, &longer).unwrap();
+    let chain = adapter.lineage(&thread()).unwrap();
+    assert_eq!(chain[0].path, copy, "the longer file wins over its prefix");
+    std::fs::write(&copy, session_meta(THREAD, "/other", Some(PREFIX))).unwrap();
+    let err = adapter.lineage(&thread()).unwrap_err();
+    assert!(
+        matches!(err, HarnessError::LineageAmbiguous { ref paths, .. } if paths.len() == 2),
+        "{err}"
+    );
+}
+
+/// Moves this node's Codex state aside, as if the job ran on another node
+/// with the same home path; returns where it went.
+fn set_aside(home: &Path, name: &str) -> PathBuf {
+    let aside = home.join(name);
+    std::fs::rename(home.join(".codex"), &aside).unwrap();
+    aside
+}
+
+#[tokio::test]
 async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_there() {
     let src = build_source();
+    let home = src.home.path().canonicalize().unwrap();
     let out = tempfile::tempdir().unwrap();
-    let home_b = src.home.path().canonicalize().unwrap();
-    Codex::new(home_b.clone())
+    let manifest = Codex::new(home.clone())
         .capture(&src.work, &thread(), out.path())
         .await
         .unwrap();
-    // The other node has the same home and workspace path (ADR 0011) and
-    // no Codex state.
-    std::fs::rename(home_b.join(".codex"), home_b.join(".codex-departed")).unwrap();
-    let work_b = src.work.clone();
-    let bin = fake_codex(&home_b);
-    let adapter = Codex::new(home_b.clone())
+    set_aside(&home, ".codex-pro");
+
+    let bin = fake_codex(&home);
+    let adapter = Codex::new(home.clone())
         .with_path_var(bin.clone())
         .with_overrides(vec!["sandbox_mode=\"workspace-write\"".to_owned()]);
     let installed = adapter.detect().await.unwrap().unwrap();
     assert_eq!(installed.version.as_deref(), Some("0.155.1"));
 
-    let restored = adapter.restore(&work_b, out.path()).await.unwrap();
-    let target = home_b.join(".codex/sessions/fabric").join(THREAD);
+    // A manifest path that is not a rollout is refused before any write.
+    let rel = "home/.codex/skills/evil.md";
+    let staged = out.path().join(rel);
+    std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+    std::fs::write(&staged, b"payload").unwrap();
+    let mut forged = manifest.clone();
+    forged.files.push(Carried {
+        rel_path: RelPath::parse(rel).unwrap(),
+        content: Content::Opaque,
+        size: 7,
+        blake3: Digest::from_hash(blake3::hash(b"payload")),
+    });
+    forged.files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    forged.write(out.path()).unwrap();
+    let err = adapter.restore(&src.work, out.path()).await.unwrap_err();
+    assert!(matches!(err, HarnessError::UnexpectedFile { .. }), "{err}");
+    assert!(!home.join(".codex/sessions").exists());
+    manifest.write(out.path()).unwrap();
+
+    let restored = adapter.restore(&src.work, out.path()).await.unwrap();
+    let target = home.join(".codex/sessions/fabric").join(THREAD);
     assert_eq!(restored.placed.len(), 2);
-    assert!(
-        target
-            .join(format!("rollout-2026-10-19T11-00-00-{THREAD}.jsonl"))
-            .is_file()
-    );
-    assert!(
-        target
-            .join(format!("rollout-2026-10-18T09-00-00-{PREFIX}.jsonl.zst"))
-            .is_file()
-    );
-    assert!(!home_b.join(".codex/auth.json").exists());
+    assert!(target.join(HEAD_NAME).is_file());
+    assert!(target.join(PREFIX_NAME).is_file());
+    assert!(!home.join(".codex/auth.json").exists());
     assert_eq!(
         adapter.lineage(&thread()).unwrap().len(),
         2,
         "the restored lineage resolves on the target"
     );
-    adapter.restore(&work_b, out.path()).await.unwrap();
+    adapter.restore(&src.work, out.path()).await.unwrap();
 
-    let log = home_b.join("log.txt");
+    let log = home.join("log.txt");
     let env = vec![
         (
             EnvVarName::parse("HOME").unwrap(),
-            home_b.to_string_lossy().into_owned(),
+            home.to_string_lossy().into_owned(),
         ),
         (
             EnvVarName::parse("PATH").unwrap(),
@@ -267,7 +331,7 @@ async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_the
     ];
     let mut running = adapter
         .launch(
-            &work_b,
+            &src.work,
             Launch::Resume {
                 session: thread(),
                 prompt: Some("reply with the secret word".to_owned()),
@@ -277,14 +341,78 @@ async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_the
         )
         .await
         .unwrap();
-    assert!(running.child.wait().await.unwrap().success());
+    assert!(running.child_mut().wait().await.unwrap().success());
     let seen = std::fs::read_to_string(&log).unwrap();
     assert_eq!(
         seen,
         format!(
             "cwd={}\narg=exec\narg=resume\narg={THREAD}\narg=--json\narg=-c\narg=projects.\"{}\".trust_level=trusted\narg=-c\narg=sandbox_mode=\"workspace-write\"\narg=--\narg=reply with the secret word\n",
-            work_b.display(),
-            work_b.display()
+            src.work.display(),
+            src.work.display()
         )
+    );
+}
+
+#[tokio::test]
+async fn a_thread_that_comes_back_lands_over_its_original_file() {
+    let src = build_source();
+    let home = src.home.path().canonicalize().unwrap();
+    let adapter = Codex::new(home.clone());
+    let out_1 = tempfile::tempdir().unwrap();
+    adapter
+        .capture(&src.work, &thread(), out_1.path())
+        .await
+        .unwrap();
+    let pro = set_aside(&home, ".codex-pro");
+
+    adapter.restore(&src.work, out_1.path()).await.unwrap();
+    let head_air = home
+        .join(".codex/sessions/fabric")
+        .join(THREAD)
+        .join(HEAD_NAME);
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&head_air)
+        .unwrap();
+    file.write_all(turn("done on the air").as_bytes()).unwrap();
+    drop(file);
+    let out_2 = tempfile::tempdir().unwrap();
+    adapter
+        .capture(&src.work, &thread(), out_2.path())
+        .await
+        .unwrap();
+    set_aside(&home, ".codex-air");
+    std::fs::rename(&pro, home.join(".codex")).unwrap();
+
+    let restored = adapter.restore(&src.work, out_2.path()).await.unwrap();
+    assert!(
+        restored.placed.contains(&src.head),
+        "the head lands over the original, not beside it: {:?}",
+        restored.placed
+    );
+    assert!(restored.placed.contains(&src.prefix));
+    assert!(
+        !home.join(".codex/sessions/fabric").exists(),
+        "no second copy of the thread was created"
+    );
+    assert!(
+        std::fs::read_to_string(&src.head)
+            .unwrap()
+            .ends_with(&turn("done on the air"))
+    );
+    let chain = adapter.lineage(&thread()).unwrap();
+    assert_eq!(chain[0].path, src.head);
+}
+
+#[test]
+fn the_codex_home_must_be_under_the_home() {
+    let err = Codex::new(PathBuf::from("/h"))
+        .with_codex_home(PathBuf::from("/elsewhere/.codex"))
+        .unwrap_err();
+    assert!(matches!(err, HarnessError::NotUnderHome { .. }), "{err}");
+    assert!(
+        Codex::new(PathBuf::from("/h"))
+            .with_codex_home(PathBuf::from("/h/custom"))
+            .is_ok()
     );
 }

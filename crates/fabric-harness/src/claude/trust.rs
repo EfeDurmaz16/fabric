@@ -1,12 +1,14 @@
 //! Pre-seeding workspace trust in `~/.claude.json`.
 //!
 //! Invariant: the file is edited by read, modify, write to a temporary
-//! file and rename that keeps its mode, only the one key `projects["<root>"].hasTrustDialogAccepted`
-//! changes, and the edit is refused while a `claude` process runs, because
-//! Claude rewrites the file itself and keeps its own backups (ADR 0006,
-//! Trust on the target; `permissions.md`, read 2026-10-19). A missing file
-//! is not created: it means Claude never ran on this node, so there is no
-//! login to trust a workspace for either.
+//! file and rename that keeps its mode, only the one key
+//! `projects["<root>"].hasTrustDialogAccepted` changes, and the edit is
+//! refused while a `claude` process runs, because Claude rewrites the file
+//! itself and keeps its own backups (ADR 0006, Trust on the target;
+//! `permissions.md`, read 2026-10-19). The running check lives in
+//! `ClaudeCode::preseed_trust`, the only caller, which is why nothing here
+//! is public. A missing file is not created: it means Claude never ran on
+//! this node, so there is no login to trust a workspace for either.
 
 use std::path::Path;
 
@@ -16,11 +18,11 @@ use crate::error::HarnessError;
 use crate::files;
 
 /// The key Claude reads to skip the trust dialog.
-pub const TRUST_KEY: &str = "hasTrustDialogAccepted";
+pub(crate) const TRUST_KEY: &str = "hasTrustDialogAccepted";
 
 /// Sets the trust key for `root` in the config file at `config_json`.
 /// Returns true when the file changed.
-pub fn preseed_file(config_json: &Path, root: &Path) -> Result<bool, HarnessError> {
+pub(crate) fn preseed_file(config_json: &Path, root: &Path) -> Result<bool, HarnessError> {
     let bytes = std::fs::read(config_json).map_err(|e| HarnessError::io("read", config_json, e))?;
     let mut value: Value = serde_json::from_slice(&bytes).map_err(|e| HarnessError::Malformed {
         what: "config json",

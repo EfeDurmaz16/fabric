@@ -6,7 +6,50 @@
 //! adapter bug cannot carry one by accident (ADR 0006, Credentials and
 //! terms). The list is hard-coded on purpose: it is policy, not config.
 
+#![cfg_attr(
+    not(any(feature = "acp", feature = "claude", feature = "codex")),
+    allow(dead_code, reason = "checked by the adapters; none is enabled")
+)]
+
+use std::fmt;
+
 use crate::manifest::HOME_PREFIX;
+
+/// Why a tree path may not be carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenyRule {
+    /// A component is the name of a credential or private key file.
+    CredentialFileName,
+    /// A component ends in a key or database suffix.
+    KeyOrDatabaseSuffix,
+    /// A component is a dotenv file that is not an example.
+    DotenvFile,
+    /// A component is a directory that holds credentials.
+    CredentialDirectory,
+    /// A directory under `~/.claude` that is host state, never session state.
+    ClaudeHostStateDirectory,
+    /// A file under `~/.claude` that is host state.
+    ClaudeHostStateFile,
+    /// A directory under `~/.codex` that is host state.
+    CodexHostStateDirectory,
+    /// A file under `~/.codex` that is host state or holds a token.
+    CodexHostStateFile,
+}
+
+impl fmt::Display for DenyRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            DenyRule::CredentialFileName => "credential file name",
+            DenyRule::KeyOrDatabaseSuffix => "key or database file suffix",
+            DenyRule::DotenvFile => "dotenv file",
+            DenyRule::CredentialDirectory => "credential directory",
+            DenyRule::ClaudeHostStateDirectory => "claude host state directory",
+            DenyRule::ClaudeHostStateFile => "claude host state file",
+            DenyRule::CodexHostStateDirectory => "codex host state directory",
+            DenyRule::CodexHostStateFile => "codex host state file",
+        })
+    }
+}
 
 /// Component names that are a credential or a private key wherever they appear.
 const SECRET_NAMES: &[&str] = &[
@@ -104,21 +147,20 @@ fn is_env_file(name: &str) -> bool {
 }
 
 /// Returns the rule a tree path breaks, or `None` when it may be carried.
-#[must_use]
-pub fn check(rel_path: &str) -> Option<&'static str> {
+pub(crate) fn check(rel_path: &str) -> Option<DenyRule> {
     let components: Vec<&str> = rel_path.split('/').collect();
     for name in &components {
         if SECRET_NAMES.contains(name) {
-            return Some("credential file name");
+            return Some(DenyRule::CredentialFileName);
         }
         if SECRET_SUFFIXES.iter().any(|suffix| name.ends_with(suffix)) {
-            return Some("key or database file suffix");
+            return Some(DenyRule::KeyOrDatabaseSuffix);
         }
         if is_env_file(name) {
-            return Some("dotenv file");
+            return Some(DenyRule::DotenvFile);
         }
         if matches!(*name, ".ssh" | ".aws" | ".gnupg" | ".kube") {
-            return Some("credential directory");
+            return Some(DenyRule::CredentialDirectory);
         }
     }
     if components.first() == Some(&HOME_PREFIX) {
@@ -126,22 +168,22 @@ pub fn check(rel_path: &str) -> Option<&'static str> {
             (Some(&".claude"), Some(third)) => {
                 let is_dir = components.len() > 3;
                 if is_dir && CLAUDE_HOST_DIRS.contains(third) {
-                    return Some("claude host state directory");
+                    return Some(DenyRule::ClaudeHostStateDirectory);
                 }
                 if !is_dir && CLAUDE_HOST_FILES.contains(third) {
-                    return Some("claude host state file");
+                    return Some(DenyRule::ClaudeHostStateFile);
                 }
             }
             (Some(&".codex"), Some(third)) => {
                 let is_dir = components.len() > 3;
                 if is_dir && CODEX_HOST_DIRS.contains(third) {
-                    return Some("codex host state directory");
+                    return Some(DenyRule::CodexHostStateDirectory);
                 }
                 if !is_dir && CODEX_HOST_FILES.contains(third) {
-                    return Some("codex host state file");
+                    return Some(DenyRule::CodexHostStateFile);
                 }
                 if *third == "logs" || third.starts_with("logs_") {
-                    return Some("codex host state directory");
+                    return Some(DenyRule::CodexHostStateDirectory);
                 }
             }
             _ => {}
@@ -179,10 +221,10 @@ mod tests {
             "home/.codex/logs_2.sqlite",
             "home/.ssh/id_ed25519",
             "home/.aws/credentials",
-            "workspace/.env",
-            "workspace/.env.local",
-            "workspace/config/server.pem",
-            "workspace/.claude/.env.production",
+            "home/w/.env",
+            "home/w/.env.local",
+            "home/w/config/server.pem",
+            "home/w/.claude/.env.production",
         ] {
             assert!(check(path).is_some(), "{path} should be denied");
         }
@@ -200,9 +242,8 @@ mod tests {
             "home/.claude/settings.json",
             "home/.codex/sessions/2026/10/19/rollout-2026-10-19T10-00-00-abc.jsonl",
             "home/.codex/archived_sessions/rollout-2026-10-19T10-00-00-abc.jsonl.zst",
-            "workspace/.claude/settings.local.json",
-            "workspace/.env.example",
-            "workspace/CLAUDE.local.md",
+            "home/.claude/settings.local.json",
+            "home/w/.env.example",
         ] {
             assert_eq!(check(path), None, "{path} should be allowed");
         }

@@ -2,9 +2,16 @@
 //!
 //! Invariant: any agent that speaks ACP and advertises `session/load` or
 //! `session/resume` can be continued in a new workspace by its session id
-//! alone; Fabric carries the agent's state directory as opaque bytes and
-//! never parses it. An agent whose state directory is not declared cannot
-//! be captured, and the adapter says so instead of guessing.
+//! alone; Fabric carries, from the agent's declared state directory, only
+//! the files whose path names the session, as opaque bytes it never
+//! parses, and refuses a file that holds a secret-shaped string. An agent
+//! whose state directory is not declared cannot be captured or restored,
+//! and the adapter says so instead of guessing. Restore accepts only the
+//! workspace path and home of the capture (ADR 0011) and only files under
+//! the declared state directory whose path names the session. The adapter
+//! cannot tell whether a generic agent is writing a session while it
+//! restores one; the caller owns that guard, through the handle
+//! `launch_acp` returned.
 
 pub mod client;
 
@@ -14,17 +21,21 @@ use std::path::{Path, PathBuf};
 use fabric_core::BoxFuture;
 use fabric_core::env::EnvVarName;
 use fabric_core::harness::{HarnessKind, ProgramName};
-use tracing::info;
+use tokio::task::JoinHandle;
+use tracing::{info, warn};
 
+use crate::denylist;
 use crate::error::HarnessError;
-use crate::files::{self, Source};
+use crate::files::{self, Carry, Placement, Source};
 use crate::harness::{self, Harness, Installed, Io, Launch, Restored, Running};
-use crate::manifest::{HOME_PREFIX, MANIFEST_FORMAT, Redaction, Rewrite, StateManifest};
-use crate::process;
+use crate::manifest::{
+    Content, HOME_PREFIX, MANIFEST_FORMAT, Redaction, StateManifest, under_home,
+};
+use crate::process::{self, Wiring};
 use crate::redact::RedactionCounts;
 use crate::session::SessionId;
 
-use self::client::{AcpClient, PermissionPolicy};
+use self::client::{AcpClient, AcpError, PermissionPolicy, StopReason};
 
 /// An ACP agent started as `program args...`.
 #[derive(Debug, Clone)]
@@ -35,6 +46,27 @@ pub struct AcpHarness {
     state_dir: Option<PathBuf>,
     policy: PermissionPolicy,
     path_var: Option<OsString>,
+}
+
+/// An ACP agent this node started, with the client that owns its pipes.
+/// Dropping the client closes the agent's stdin.
+pub struct AcpRunning {
+    /// The process handle the supervisor records.
+    pub running: Running,
+    /// The protocol connection.
+    pub client: AcpClient,
+    /// The first prompt turn, when `launch_acp` was given a prompt; its
+    /// result says how the turn ended.
+    pub turn: Option<JoinHandle<Result<StopReason, AcpError>>>,
+}
+
+impl std::fmt::Debug for AcpRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcpRunning")
+            .field("running", &self.running)
+            .field("turn_pending", &self.turn.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl AcpHarness {
@@ -52,11 +84,17 @@ impl AcpHarness {
         }
     }
 
-    /// Declares where the agent keeps its sessions; must be under `home`.
-    #[must_use]
-    pub fn with_state_dir(mut self, dir: PathBuf) -> Self {
+    /// Declares where the agent keeps its sessions; refused when `dir` is
+    /// not under the home.
+    pub fn with_state_dir(mut self, dir: PathBuf) -> Result<Self, HarnessError> {
+        if dir.strip_prefix(&self.home).is_err() {
+            return Err(HarnessError::NotUnderHome {
+                path: dir,
+                home: self.home.clone(),
+            });
+        }
         self.state_dir = Some(dir);
-        self
+        Ok(self)
     }
 
     /// Sets how `session/request_permission` is answered.
@@ -85,52 +123,58 @@ impl AcpHarness {
         let dir = self
             .state_dir
             .clone()
-            .ok_or_else(|| HarnessError::Malformed {
-                what: "acp state directory",
-                path: PathBuf::new(),
-                reason: format!("no state directory declared for {}", self.program),
+            .ok_or_else(|| HarnessError::StateDirNotDeclared {
+                program: self.program.to_string(),
             })?;
         let rel = dir
             .strip_prefix(&self.home)
-            .map_err(|_| HarnessError::Malformed {
-                what: "acp state directory",
+            .map_err(|_| HarnessError::NotUnderHome {
                 path: dir.clone(),
-                reason: format!("not under home {}", self.home.display()),
+                home: self.home.clone(),
             })?;
         Ok((dir.clone(), files::rel_components(rel)?))
     }
 
-    async fn capture_impl(
+    fn capture_sync(
         &self,
-        workspace: &Path,
+        root: &Path,
         session: &SessionId,
         out: &Path,
+        version: Option<String>,
     ) -> Result<StateManifest, HarnessError> {
-        let root = harness::physical_workspace(workspace)?;
         let (dir, rel_parts) = self.state_rel()?;
         let mut sources = Vec::new();
         for file in files::walk(&dir)? {
+            let file_parts = files::rel_components(&file)?;
+            if !file_parts
+                .iter()
+                .any(|part| part.contains(session.as_str()))
+            {
+                continue;
+            }
             let mut parts: Vec<&str> = vec![HOME_PREFIX];
             parts.extend(rel_parts.iter().map(String::as_str));
-            let file_parts = files::rel_components(&file)?;
             parts.extend(file_parts.iter().map(String::as_str));
             sources.push(Source {
                 abs: dir.join(&file),
                 rel: files::rel_path(&parts)?,
-                rewrite: Rewrite::None,
+                carry: Carry::OpaqueRefuseSecrets,
+            });
+        }
+        if sources.is_empty() {
+            return Err(HarnessError::SessionNotFound {
+                kind: self.kind(),
+                session: session.clone(),
+                searched: dir,
             });
         }
         let mut counts = RedactionCounts::new();
         let carried = files::stage(&sources, out, &mut counts)?;
-        let version = match self.detect_impl().await {
-            Ok(Some(installed)) => installed.version,
-            _ => None,
-        };
         let manifest = StateManifest {
             format: MANIFEST_FORMAT,
             kind: self.kind(),
             session: session.clone(),
-            root: harness::abs_path(&root)?,
+            root: harness::abs_path(root)?,
             home: harness::abs_path(&self.home)?,
             harness_version: version,
             captured_at_ms: process::now_ms(),
@@ -144,10 +188,85 @@ impl AcpHarness {
                 .collect(),
         };
         manifest.write(out)?;
+        info!(%session, agent = %self.program, files = manifest.files.len(), "acp: captured");
         Ok(manifest)
     }
 
-    fn restore_impl(&self, workspace: &Path, state: &Path) -> Result<Restored, HarnessError> {
+    async fn capture_impl(
+        &self,
+        workspace: &Path,
+        session: &SessionId,
+        out: &Path,
+    ) -> Result<StateManifest, HarnessError> {
+        let root = harness::physical_workspace(workspace)?;
+        let version = match self.detect_impl().await {
+            Ok(Some(installed)) => installed.version,
+            Ok(None) => None,
+            Err(e) => {
+                warn!(error = %e, agent = %self.program, "acp: version probe failed; manifest records none");
+                None
+            }
+        };
+        let adapter = self.clone();
+        let session = session.clone();
+        let out = out.to_path_buf();
+        harness::blocking(move || adapter.capture_sync(&root, &session, &out, version)).await
+    }
+
+    /// True when a tree path lies under the declared state directory and
+    /// one of its components below it names the session, which is the rule
+    /// capture selects files by.
+    fn restorable(rel: &str, state_parts: &[String], session: &SessionId) -> bool {
+        let Some(rest) = under_home(rel) else {
+            return false;
+        };
+        let mut parts = rest.split('/');
+        for expected in state_parts {
+            if parts.next() != Some(expected.as_str()) {
+                return false;
+            }
+        }
+        parts.any(|part| part.contains(session.as_str()))
+    }
+
+    fn restore_sync(
+        &self,
+        root: &Path,
+        state: &Path,
+        manifest: StateManifest,
+    ) -> Result<Restored, HarnessError> {
+        harness::same_place(&manifest, root, &self.home)?;
+        let (_, state_parts) = self.state_rel()?;
+        let mut placements = Vec::with_capacity(manifest.files.len());
+        for file in &manifest.files {
+            let rel = file.rel_path.as_str();
+            if let Some(rule) = denylist::check(rel) {
+                return Err(HarnessError::Denied {
+                    path: rel.to_owned(),
+                    rule,
+                });
+            }
+            let rest =
+                under_home(rel).filter(|_| Self::restorable(rel, &state_parts, &manifest.session));
+            let Some(rest) = rest else {
+                return Err(HarnessError::UnexpectedFile {
+                    kind: self.kind(),
+                    path: rel.to_owned(),
+                });
+            };
+            placements.push(Placement {
+                staged: state.join(rel),
+                dest: self.home.join(rest),
+                content: Content::Opaque,
+            });
+        }
+        files::verify(state, &manifest.files)?;
+        let placed = files::place_all(&placements)?;
+        info!(session = %manifest.session, agent = %self.program, files = placed.len(), "acp: restored");
+        Ok(Restored { manifest, placed })
+    }
+
+    async fn restore_impl(&self, workspace: &Path, state: &Path) -> Result<Restored, HarnessError> {
         let root = harness::physical_workspace(workspace)?;
         let manifest = StateManifest::read(state)?;
         if manifest.kind != self.kind() {
@@ -156,19 +275,9 @@ impl AcpHarness {
                 restoring: self.kind(),
             });
         }
-        harness::same_place(&manifest, &root, &self.home)?;
-        let mut placed = Vec::new();
-        for file in &manifest.files {
-            let Some(rest) = file.rel_path.as_str().strip_prefix("home/") else {
-                continue;
-            };
-            let src = state.join(file.rel_path.as_str());
-            let bytes = std::fs::read(&src).map_err(|e| HarnessError::io("read", &src, e))?;
-            let dest = self.home.join(rest);
-            files::place(&dest, &bytes)?;
-            placed.push(dest);
-        }
-        Ok(Restored { manifest, placed })
+        let adapter = self.clone();
+        let state = state.to_path_buf();
+        harness::blocking(move || adapter.restore_sync(&root, &state, manifest)).await
     }
 
     async fn detect_impl(&self) -> Result<Option<Installed>, HarnessError> {
@@ -176,9 +285,7 @@ impl AcpHarness {
         else {
             return Ok(None);
         };
-        let raw = process::probe(&path, &["--version"])
-            .await
-            .unwrap_or_default();
+        let raw = process::probe(&path, &["--version"]).await?;
         Ok(Some(Installed {
             version: process::version_token(&raw).map(str::to_owned),
             raw,
@@ -186,15 +293,18 @@ impl AcpHarness {
         }))
     }
 
-    async fn launch_impl(
+    /// Starts the agent, completes the handshake, continues or creates the
+    /// session and returns the process with its protocol client. A prompt
+    /// is sent on a task of its own, whose handle is on the result.
+    pub async fn launch_acp(
         &self,
         workspace: &Path,
         launch: Launch,
         env: &[(EnvVarName, String)],
-    ) -> Result<Running, HarnessError> {
+    ) -> Result<AcpRunning, HarnessError> {
         let root = harness::physical_workspace(workspace)?;
         let binary = self.binary()?;
-        let mut child = process::spawn(&binary, &self.args, &root, env, Io::Rpc)?;
+        let (mut child, pid) = process::spawn(&binary, &self.args, &root, env, Wiring::Rpc)?;
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             return Err(HarnessError::Spawn {
                 program: self.program.to_string(),
@@ -202,14 +312,34 @@ impl AcpHarness {
             });
         };
         let client = AcpClient::attach(stdin, stdout, self.policy);
+        let (session, prompt) = self.open_session(&client, &root, launch).await?;
+        let turn = prompt.map(|prompt| {
+            let client = client.clone();
+            let session = session.clone();
+            tokio::spawn(async move { client.prompt(&session, &prompt).await })
+        });
+        Ok(AcpRunning {
+            running: Running::new(pid, Some(session), child),
+            client,
+            turn,
+        })
+    }
+
+    /// Runs the handshake and opens the session `launch` names; returns
+    /// the session and the prompt still to send.
+    async fn open_session(
+        &self,
+        client: &AcpClient,
+        root: &Path,
+        launch: Launch,
+    ) -> Result<(SessionId, Option<String>), HarnessError> {
         let capabilities = client.initialize().await?;
         let cwd = root.to_string_lossy().into_owned();
-        let session = match launch {
+        match launch {
             Launch::New { prompt } => {
                 let session = client.new_session(&cwd).await?;
                 info!(%session, agent = %self.program, "acp: new session");
-                spawn_turn(&client, &session, prompt);
-                session
+                Ok((session, Some(prompt)))
             }
             Launch::Resume { session, prompt } => {
                 if capabilities.resume {
@@ -222,27 +352,50 @@ impl AcpHarness {
                     });
                 }
                 info!(%session, agent = %self.program, "acp: session continued");
-                if let Some(prompt) = prompt {
-                    spawn_turn(&client, &session, prompt);
-                }
-                session
+                Ok((session, prompt))
             }
-        };
-        let mut running = Running::new(child, Some(session));
-        running.acp = Some(client);
+        }
+    }
+
+    /// The trait's headless launch: the prompt turn runs on a task that
+    /// owns the client and closes the agent's stdin when the turn ends.
+    async fn launch_impl(
+        &self,
+        workspace: &Path,
+        launch: Launch,
+        io: Io,
+        env: &[(EnvVarName, String)],
+    ) -> Result<Running, HarnessError> {
+        if matches!(io, Io::Terminal) {
+            return Err(HarnessError::NeedsClient {
+                program: self.program.to_string(),
+            });
+        }
+        if matches!(launch, Launch::Resume { prompt: None, .. }) {
+            return Err(HarnessError::HeadlessNeedsPrompt {
+                program: self.program.to_string(),
+            });
+        }
+        let AcpRunning {
+            running,
+            client,
+            turn,
+        } = self.launch_acp(workspace, launch, env).await?;
+        let program = self.program.to_string();
+        tokio::spawn(async move {
+            let outcome = match turn {
+                Some(turn) => turn.await,
+                None => return,
+            };
+            match outcome {
+                Ok(Ok(reason)) => info!(agent = %program, ?reason, "acp: turn ended"),
+                Ok(Err(e)) => warn!(agent = %program, error = %e, "acp: turn failed"),
+                Err(e) => warn!(agent = %program, error = %e, "acp: turn task ended early"),
+            }
+            drop(client);
+        });
         Ok(running)
     }
-}
-
-/// Sends `prompt` on a task of its own so `launch` returns while the turn runs.
-fn spawn_turn(client: &AcpClient, session: &SessionId, prompt: String) {
-    let client = client.clone();
-    let session = session.clone();
-    tokio::spawn(async move {
-        if let Err(e) = client.prompt(&session, &prompt).await {
-            tracing::warn!(error = %e, "acp: prompt turn failed");
-        }
-    });
 }
 
 impl Harness for AcpHarness {
@@ -271,16 +424,16 @@ impl Harness for AcpHarness {
         workspace: &'a Path,
         state: &'a Path,
     ) -> BoxFuture<'a, Result<Restored, HarnessError>> {
-        Box::pin(async move { self.restore_impl(workspace, state) })
+        Box::pin(self.restore_impl(workspace, state))
     }
 
     fn launch<'a>(
         &'a self,
         workspace: &'a Path,
         launch: Launch,
-        _io: Io,
+        io: Io,
         env: &'a [(EnvVarName, String)],
     ) -> BoxFuture<'a, Result<Running, HarnessError>> {
-        Box::pin(self.launch_impl(workspace, launch, env))
+        Box::pin(self.launch_impl(workspace, launch, io, env))
     }
 }

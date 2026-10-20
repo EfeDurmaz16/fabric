@@ -1,16 +1,20 @@
 //! The state manifest that travels with a captured harness state tree.
 //!
 //! Invariant: a manifest lists every file of the tree except itself by a
-//! relative path under `home/` or `workspace/`, in strict order, and says
-//! which of them hold path-bearing JSON text. The core stores the tree
-//! without reading it (ADR 0006); the adapter that captured it is the only
-//! reader, and it checks the kind before it trusts a field.
+//! relative path under `home/`, in strict order, with the byte length and
+//! `BLAKE3` digest of the staged copy and the content kind that decides how
+//! the bytes were redacted at capture and how restore recognises a node's
+//! own redacted copy. The core stores
+//! the tree without reading it (ADR 0006); the adapter that captured it is
+//! the only reader, and it checks the kind and every digest before it
+//! places a byte.
 
+use std::fmt;
 use std::path::Path;
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::path::{AbsPath, RelPath};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::HarnessError;
 use crate::session::SessionId;
@@ -24,8 +28,12 @@ pub const MANIFEST_FORMAT: u16 = 1;
 /// The prefix of tree paths that restore under the user's home directory.
 pub const HOME_PREFIX: &str = "home";
 
-/// The prefix of tree paths that restore under the workspace root.
-pub const WORKSPACE_PREFIX: &str = "workspace";
+/// The part of a tree path below `HOME_PREFIX`, which restore joins to
+/// the home directory; `None` for a path outside it.
+#[must_use]
+pub fn under_home(rel: &str) -> Option<&str> {
+    rel.strip_prefix(HOME_PREFIX)?.strip_prefix('/')
+}
 
 /// What one capture produced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,25 +61,72 @@ pub struct StateManifest {
 /// One file of the state tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Carried {
-    /// The path inside the tree: `home/...` or `workspace/...`.
+    /// The path inside the tree, under `home/`.
     pub rel_path: RelPath,
-    /// What restore does to the bytes.
-    pub rewrite: Rewrite,
+    /// What the bytes are.
+    pub content: Content,
     /// Byte length of the staged copy.
     pub size: u64,
+    /// `BLAKE3` digest of the staged copy; restore refuses a file that does not match.
+    pub blake3: Digest,
 }
 
-/// How capture treated a file's bytes.
+/// What a carried file's bytes are, which decides how capture redacts them
+/// and how restore compares them with a file already on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Rewrite {
-    /// Bytes are placed as they are.
-    None,
-    /// Plain text: secret shapes were redacted line by line at capture;
-    /// placed as captured.
+pub enum Content {
+    /// Bytes carried as they are; the adapter scanned them for secrets at capture.
+    Opaque,
+    /// Plain text: secret shapes are redacted line by line at capture.
     Text,
-    /// JSON text, one document or one per line: strings outside signed
-    /// blocks were redacted at capture; placed as captured.
-    JsonText,
+    /// One JSON value per line: strings outside signed blocks are redacted
+    /// at capture, and a signed block that holds a secret is dropped.
+    JsonLines,
+    /// One JSON document: treated like `JsonLines`, as a whole.
+    JsonDocument,
+}
+
+/// A `BLAKE3` digest, written as 64 hex characters.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Digest([u8; 32]);
+
+impl Digest {
+    /// Wraps a finished hash.
+    #[must_use]
+    pub fn from_hash(hash: blake3::Hash) -> Self {
+        Digest(*hash.as_bytes())
+    }
+
+    /// Parses the 64-character hex form.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let hash = blake3::Hash::from_hex(text).map_err(|e| e.to_string())?;
+        Ok(Self::from_hash(hash))
+    }
+}
+
+impl fmt::Display for Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&blake3::Hash::from_bytes(self.0).to_hex())
+    }
+}
+
+impl fmt::Debug for Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Digest({self})")
+    }
+}
+
+impl Serialize for Digest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Digest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).map_err(serde::de::Error::custom)
+    }
 }
 
 /// How many matches one redaction rule removed.
@@ -100,13 +155,14 @@ impl StateManifest {
         let mut previous: Option<&RelPath> = None;
         for (index, file) in self.files.iter().enumerate() {
             let text = file.rel_path.as_str();
-            let under_prefix = text
-                .strip_prefix(HOME_PREFIX)
-                .or_else(|| text.strip_prefix(WORKSPACE_PREFIX))
-                .is_some_and(|rest| rest.starts_with('/'));
-            if !under_prefix {
+            if under_home(text).is_none() {
                 return Err(malformed(format!(
-                    "file {index} ({text}) is not under {HOME_PREFIX}/ or {WORKSPACE_PREFIX}/"
+                    "file {index} ({text}) is not under {HOME_PREFIX}/"
+                )));
+            }
+            if text.split('/').any(crate::files::is_temp_name) {
+                return Err(malformed(format!(
+                    "file {index} ({text}) is a temporary file of this crate"
                 )));
             }
             if previous.is_some_and(|p| p >= &file.rel_path) {
@@ -167,21 +223,22 @@ mod tests {
     fn carried(path: &str) -> Carried {
         Carried {
             rel_path: RelPath::parse(path).unwrap(),
-            rewrite: Rewrite::None,
+            content: Content::Opaque,
             size: 0,
+            blake3: Digest::from_hash(blake3::hash(b"")),
         }
     }
 
     #[test]
-    fn files_must_be_sorted_and_under_a_prefix() {
+    fn files_must_be_sorted_and_under_home() {
         let path = Path::new("m");
         assert!(
-            manifest(vec![carried("home/a"), carried("workspace/b")])
+            manifest(vec![carried("home/a"), carried("home/b")])
                 .validate(path)
                 .is_ok()
         );
         assert!(
-            manifest(vec![carried("workspace/b"), carried("home/a")])
+            manifest(vec![carried("home/b"), carried("home/a")])
                 .validate(path)
                 .is_err()
         );
@@ -195,14 +252,26 @@ mod tests {
                 .validate(path)
                 .is_err()
         );
-        assert!(manifest(vec![carried("other/a")]).validate(path).is_err());
+        assert!(
+            manifest(vec![carried("workspace/a")])
+                .validate(path)
+                .is_err()
+        );
+        assert!(
+            manifest(vec![carried("home/.a.fabric-tmp-1-2")])
+                .validate(path)
+                .is_err()
+        );
     }
 
     #[test]
-    fn round_trips_through_the_file() {
+    fn round_trips_through_the_file_and_digests_are_hex() {
         let dir = tempfile::tempdir().unwrap();
         let m = manifest(vec![carried("home/.claude/projects/-w/s1.jsonl")]);
         m.write(dir.path()).unwrap();
         assert_eq!(StateManifest::read(dir.path()).unwrap(), m);
+        let text = std::fs::read_to_string(dir.path().join(MANIFEST_FILE)).unwrap();
+        assert!(text.contains(&blake3::hash(b"").to_hex().to_string()));
+        assert!(serde_json::from_str::<Digest>("\"zz\"").is_err());
     }
 }

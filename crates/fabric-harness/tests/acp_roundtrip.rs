@@ -56,6 +56,7 @@ fn env(state_dir: &Path, extra: &[(&str, &str)]) -> Vec<(EnvVarName, String)> {
 fn adapter(home: &Path, policy: PermissionPolicy) -> AcpHarness {
     AcpHarness::new(program(), vec![], home.to_path_buf())
         .with_state_dir(home.join(".fake-agent/sessions"))
+        .unwrap()
         .with_policy(policy)
         .with_path_var(agent_dir())
 }
@@ -75,22 +76,21 @@ async fn client_runs_a_turn_and_denies_permission_by_default() {
     let state_dir = home.path().join(".fake-agent/sessions");
     let adapter = adapter(home.path(), PermissionPolicy::Deny);
 
-    let running = tokio::time::timeout(
+    let mut started = tokio::time::timeout(
         TIMEOUT,
-        adapter.launch(
+        adapter.launch_acp(
             &work,
             Launch::New {
                 prompt: "first".to_owned(),
             },
-            Io::Rpc,
             &env(&state_dir, &[("FAKE_ASK_PERMISSION", "1")]),
         ),
     )
     .await
     .unwrap()
     .unwrap();
-    let client = running.acp.clone().unwrap();
-    let session = running.session.clone().unwrap();
+    let client = started.client.clone();
+    let session = started.running.session().cloned().unwrap();
     assert_eq!(
         client.capabilities().unwrap().name.as_deref(),
         Some("fake-acp-agent")
@@ -102,6 +102,12 @@ async fn client_runs_a_turn_and_denies_permission_by_default() {
         .unwrap();
     assert_eq!(update.session, session);
     assert_eq!(update.update["content"]["text"], "echo: first");
+    let first_turn = tokio::time::timeout(TIMEOUT, started.turn.take().unwrap())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_turn, StopReason::EndTurn);
 
     let reason = tokio::time::timeout(TIMEOUT, client.prompt(&session, "second"))
         .await
@@ -110,8 +116,8 @@ async fn client_runs_a_turn_and_denies_permission_by_default() {
     assert_eq!(reason, StopReason::EndTurn);
     client.cancel(&session).unwrap();
     drop(client);
-    let mut running = running;
-    running.child.kill().await.ok();
+    drop(started.client);
+    started.running.child_mut().kill().await.ok();
 
     let recorded = state(home.path(), &session);
     let prompts = recorded["prompts"].as_array().unwrap();
@@ -132,20 +138,18 @@ async fn allow_once_policy_picks_the_allow_option() {
     std::fs::create_dir_all(&work).unwrap();
     let state_dir = home.path().join(".fake-agent/sessions");
     let adapter = adapter(home.path(), PermissionPolicy::AllowOnce);
-    let running = adapter
-        .launch(
+    let started = adapter
+        .launch_acp(
             &work,
             Launch::New {
                 prompt: "go".to_owned(),
             },
-            Io::Rpc,
             &env(&state_dir, &[("FAKE_ASK_PERMISSION", "1")]),
         )
         .await
         .unwrap();
-    let client = running.acp.clone().unwrap();
-    let session = running.session.clone().unwrap();
-    tokio::time::timeout(TIMEOUT, client.next_update())
+    let session = started.running.session().cloned().unwrap();
+    tokio::time::timeout(TIMEOUT, started.client.next_update())
         .await
         .unwrap()
         .unwrap();
@@ -156,72 +160,123 @@ async fn allow_once_policy_picks_the_allow_option() {
     );
 }
 
-async fn round_trip(load: &str, resume: &str) -> Result<(PathBuf, Value), HarnessError> {
-    // The other node has the same home and workspace path (ADR 0011) and
-    // none of the agent's state.
+#[tokio::test]
+async fn the_trait_launch_is_headless_and_owns_the_turn() {
     let home = tempfile::tempdir().unwrap();
-    let work_a = home.path().join("fabric/jobs/j1/work");
-    let work_b = work_a.clone();
-    std::fs::create_dir_all(&work_a).unwrap();
-    let env_a = env(
-        &home.path().join(".fake-agent/sessions"),
-        &[("FAKE_LOAD", load), ("FAKE_RESUME", resume)],
-    );
-    let env_b = env_a.clone();
-
-    let a = adapter(home.path(), PermissionPolicy::Deny);
-    let running = a
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let state_dir = home.path().join(".fake-agent/sessions");
+    let adapter = adapter(home.path(), PermissionPolicy::Deny);
+    let env = env(&state_dir, &[]);
+    let err = adapter
         .launch(
-            &work_a,
+            &work,
             Launch::New {
-                prompt: "start".to_owned(),
+                prompt: "x".to_owned(),
             },
-            Io::Rpc,
-            &env_a,
+            Io::Terminal,
+            &env,
         )
-        .await?;
-    let session = running.session.clone().unwrap();
-    let client = running.acp.clone().unwrap();
-    tokio::time::timeout(TIMEOUT, client.next_update())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HarnessError::NeedsClient { .. }), "{err}");
+    let mut running = adapter
+        .launch(
+            &work,
+            Launch::New {
+                prompt: "headless".to_owned(),
+            },
+            Io::Piped,
+            &env,
+        )
+        .await
+        .unwrap();
+    let session = running.session().cloned().unwrap();
+    // The turn task closes the agent's stdin when the turn ends, so the
+    // agent exits on its own and the prompt is on record.
+    let status = tokio::time::timeout(TIMEOUT, running.child_mut().wait())
         .await
         .unwrap()
         .unwrap();
-    drop(client);
-    let mut running = running;
-    running.child.kill().await.ok();
+    assert!(status.success());
+    let recorded = state(home.path(), &session);
+    assert_eq!(recorded["prompts"][0]["text"], "headless");
+}
 
-    let out = tempfile::tempdir().unwrap();
-    let manifest = a.capture(&work_a, &session, out.path()).await?;
-    assert_eq!(manifest.files.len(), 1);
-    assert!(
-        manifest.files[0]
-            .rel_path
-            .as_str()
-            .starts_with("home/.fake-agent/sessions/")
+async fn round_trip(load: &str, resume: &str) -> Result<(PathBuf, Value), HarnessError> {
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("fabric/jobs/j1/work");
+    std::fs::create_dir_all(&work).unwrap();
+    let env = env(
+        &home.path().join(".fake-agent/sessions"),
+        &[("FAKE_LOAD", load), ("FAKE_RESUME", resume)],
     );
 
+    let adapter = adapter(home.path(), PermissionPolicy::Deny);
+    let mut started = adapter
+        .launch_acp(
+            &work,
+            Launch::New {
+                prompt: "start".to_owned(),
+            },
+            &env,
+        )
+        .await?;
+    let session = started.running.session().cloned().unwrap();
+    tokio::time::timeout(TIMEOUT, started.client.next_update())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(TIMEOUT, started.turn.take().unwrap())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    drop(started.client);
+    started.running.child_mut().kill().await.ok();
+
+    // Another session of the same agent must not travel with this one.
+    std::fs::write(
+        home.path()
+            .join(".fake-agent/sessions/fake-other-session.json"),
+        "{\"prompts\":[{\"text\":\"private\"}]}",
+    )
+    .unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let manifest = adapter.capture(&work, &session, out.path()).await?;
+    assert_eq!(manifest.files.len(), 1);
+    assert_eq!(
+        manifest.files[0].rel_path.as_str(),
+        format!("home/.fake-agent/sessions/{session}.json")
+    );
+
+    // The other node: same home and workspace path, none of the state.
     std::fs::rename(
         home.path().join(".fake-agent"),
         home.path().join(".fake-agent-departed"),
     )
     .unwrap();
-    let b = adapter(home.path(), PermissionPolicy::Deny);
-    let restored = b.restore(&work_b, out.path()).await?;
+    let restored = adapter.restore(&work, out.path()).await?;
     assert_eq!(restored.placed.len(), 1);
     assert!(restored.placed[0].starts_with(home.path().join(".fake-agent/sessions")));
+    assert!(
+        !home
+            .path()
+            .join(".fake-agent/sessions/fake-other-session.json")
+            .exists()
+    );
 
-    let running = b
-        .launch(
-            &work_b,
+    let mut started = adapter
+        .launch_acp(
+            &work,
             Launch::Resume {
                 session: session.clone(),
                 prompt: Some("after move".to_owned()),
             },
-            Io::Rpc,
-            &env_b,
+            &env,
         )
         .await?;
-    let client = running.acp.clone().unwrap();
+    let client = started.client.clone();
     let mut saw_echo = false;
     for _ in 0..3 {
         let update = tokio::time::timeout(TIMEOUT, client.next_update())
@@ -234,10 +289,16 @@ async fn round_trip(load: &str, resume: &str) -> Result<(PathBuf, Value), Harnes
         }
     }
     assert!(saw_echo, "the prompt sent on resume was not echoed");
-    let mut running = running;
-    running.child.kill().await.ok();
+    tokio::time::timeout(TIMEOUT, started.turn.take().unwrap())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    drop(client);
+    drop(started.client);
+    started.running.child_mut().kill().await.ok();
     let recorded = state(home.path(), &session);
-    Ok((work_b.canonicalize().unwrap(), recorded))
+    Ok((work.canonicalize().unwrap(), recorded))
 }
 
 #[tokio::test]
@@ -260,6 +321,32 @@ async fn resume_capability_is_preferred_and_its_absence_is_an_error() {
 }
 
 #[tokio::test]
+async fn a_secret_in_the_state_directory_refuses_the_capture() {
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let state_dir = home.path().join(".fake-agent/sessions");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let session = SessionId::parse("fake-9").unwrap();
+    std::fs::write(
+        state_dir.join("fake-9.json"),
+        "{\"prompts\":[{\"text\":\"my key is AKIAABCDEFGHIJKLMNOP\"}]}\n",
+    )
+    .unwrap();
+    let adapter = adapter(home.path(), PermissionPolicy::Deny);
+    let out = tempfile::tempdir().unwrap();
+    let err = adapter
+        .capture(&work, &session, out.path())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, HarnessError::SecretInState { line: 1, .. }),
+        "{err}"
+    );
+    assert!(!out.path().join("manifest.json").exists());
+}
+
+#[tokio::test]
 async fn capture_without_a_declared_state_dir_is_refused() {
     let home = tempfile::tempdir().unwrap();
     let work = home.path().join("work");
@@ -272,13 +359,11 @@ async fn capture_without_a_declared_state_dir_is_refused() {
         .await
         .unwrap_err();
     assert!(
-        matches!(
-            err,
-            HarnessError::Malformed {
-                what: "acp state directory",
-                ..
-            }
-        ),
+        matches!(err, HarnessError::StateDirNotDeclared { .. }),
         "{err}"
     );
+    let err = AcpHarness::new(program(), vec![], home.path().to_path_buf())
+        .with_state_dir(PathBuf::from("/elsewhere"))
+        .unwrap_err();
+    assert!(matches!(err, HarnessError::NotUnderHome { .. }), "{err}");
 }

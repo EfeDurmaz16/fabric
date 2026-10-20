@@ -17,12 +17,13 @@ claude = ["dep:uuid"]
 codex = ["dep:zstd"]
 
 [dependencies]
+blake3 = "1.8"
 fabric-core = { path = "../fabric-core" }
 regex = "1.13"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 thiserror = "2.0"
-tokio = { version = "1.54", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.54", features = ["io-util", "process", "rt", "sync", "time"] }
 tracing = "0.1"
 uuid = { version = "1.28", features = ["v4"], optional = true }
 zstd = { version = "0.14", optional = true }
@@ -30,6 +31,8 @@ zstd = { version = "0.14", optional = true }
 [dev-dependencies]
 proptest = { version = "1.12", default-features = false, features = ["std"] }
 tempfile = "3.27"
+tokio = { version = "1.54", features = ["macros", "rt-multi-thread"] }
+zstd = "0.14"
 
 # A fake ACP agent the integration tests start as a subprocess. It is a test
 # fixture, built only so `CARGO_BIN_EXE_fake-acp-agent` exists for the tests.

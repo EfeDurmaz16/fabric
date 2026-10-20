@@ -18,20 +18,28 @@ use serde::Deserialize;
 
 use crate::error::HarnessError;
 use crate::redact::Redactor;
+use crate::session::SessionId;
+
+/// What a rollout file name says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RolloutName {
+    /// The `YYYY-MM-DDTHH-MM-SS` text from the name; sorts in time order.
+    pub timestamp: String,
+    /// The stable thread id.
+    pub thread_id: SessionId,
+    /// The rollout id; equals the thread id except after a revert.
+    pub rollout_id: SessionId,
+    /// True when the file is `.jsonl.zst`.
+    pub compressed: bool,
+}
 
 /// One rollout file as found on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RolloutFile {
     /// The file, plain or compressed.
     pub path: PathBuf,
-    /// The `YYYY-MM-DDTHH-MM-SS` text from the name; sorts in time order.
-    pub timestamp: String,
-    /// The stable thread id.
-    pub thread_id: String,
-    /// The rollout id; equals the thread id except after a revert.
-    pub rollout_id: String,
-    /// True when the file is `.jsonl.zst`.
-    pub compressed: bool,
+    /// What its name says.
+    pub name: RolloutName,
 }
 
 fn is_uuid_like(text: &str) -> bool {
@@ -44,7 +52,7 @@ fn is_uuid_like(text: &str) -> bool {
 
 /// Parses a rollout file name; `None` for any other name.
 #[must_use]
-pub fn parse_name(name: &str) -> Option<(String, String, String, bool)> {
+pub fn parse_name(name: &str) -> Option<RolloutName> {
     let (core, compressed) = match name.strip_suffix(".jsonl.zst") {
         Some(core) => (core, true),
         None => (name.strip_suffix(".jsonl")?, false),
@@ -67,17 +75,17 @@ pub fn parse_name(name: &str) -> Option<(String, String, String, bool)> {
     if !is_uuid_like(thread) || !is_uuid_like(rollout) {
         return None;
     }
-    Some((
-        timestamp.to_owned(),
-        thread.to_owned(),
-        rollout.to_owned(),
+    Some(RolloutName {
+        timestamp: timestamp.to_owned(),
+        thread_id: SessionId::parse(thread).ok()?,
+        rollout_id: SessionId::parse(rollout).ok()?,
         compressed,
-    ))
+    })
 }
 
-/// Lists every rollout file under `root`, walking all subdirectories. When
-/// a plain and a compressed file share a name, the plain one is listed, as
-/// Codex does.
+/// Lists every rollout file under `root`, walking all subdirectories,
+/// newest first. When a plain and a compressed file share a directory and
+/// a name, the plain one is listed, as Codex does.
 pub fn list(root: &Path) -> Result<Vec<RolloutFile>, HarnessError> {
     let mut found: Vec<RolloutFile> = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -100,31 +108,26 @@ pub fn list(root: &Path) -> Result<Vec<RolloutFile>, HarnessError> {
             if !kind.is_file() {
                 continue;
             }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            let Some((timestamp, thread_id, rollout_id, compressed)) = parse_name(name) else {
+            let Some(name) = parse_name(file_name) else {
                 continue;
             };
-            if compressed {
-                let plain = path.with_file_name(name.trim_end_matches(".zst"));
+            if name.compressed {
+                let plain = path.with_file_name(file_name.trim_end_matches(".zst"));
                 if plain.is_file() {
                     continue;
                 }
             }
-            found.push(RolloutFile {
-                path,
-                timestamp,
-                thread_id,
-                rollout_id,
-                compressed,
-            });
+            found.push(RolloutFile { path, name });
         }
     }
     found.sort_by(|a, b| {
-        b.timestamp
-            .cmp(&a.timestamp)
-            .then_with(|| b.rollout_id.cmp(&a.rollout_id))
+        b.name
+            .timestamp
+            .cmp(&a.name.timestamp)
+            .then_with(|| b.name.rollout_id.cmp(&a.name.rollout_id))
             .then_with(|| a.path.cmp(&b.path))
     });
     Ok(found)
@@ -156,13 +159,13 @@ pub struct Meta {
     /// `session_meta.cwd`.
     pub cwd: Option<String>,
     /// The rollout id of the prefix file, for a paginated suffix.
-    pub history_base: Option<String>,
+    pub history_base: Option<SessionId>,
 }
 
 fn open_lines(file: &RolloutFile) -> Result<Box<dyn BufRead>, HarnessError> {
     let handle =
         std::fs::File::open(&file.path).map_err(|e| HarnessError::io("read", &file.path, e))?;
-    if file.compressed {
+    if file.name.compressed {
         let decoder = zstd::stream::read::Decoder::new(handle)
             .map_err(|e| HarnessError::io("read", &file.path, e))?;
         Ok(Box::new(BufReader::new(decoder)))
@@ -177,22 +180,29 @@ pub fn read_meta(file: &RolloutFile) -> Result<Meta, HarnessError> {
     open_lines(file)?
         .read_line(&mut line)
         .map_err(|e| HarnessError::io("read", &file.path, e))?;
+    let malformed = |reason: String| HarnessError::Malformed {
+        what: "rollout line",
+        path: file.path.clone(),
+        reason,
+    };
     let parsed: FirstLine =
-        serde_json::from_str(line.trim_end()).map_err(|e| HarnessError::Malformed {
-            what: "rollout line",
-            path: file.path.clone(),
-            reason: e.to_string(),
-        })?;
+        serde_json::from_str(line.trim_end()).map_err(|e| malformed(e.to_string()))?;
     if parsed.kind != "session_meta" {
-        return Err(HarnessError::Malformed {
-            what: "rollout line",
-            path: file.path.clone(),
-            reason: format!("first line is {:?}, not session_meta", parsed.kind),
-        });
+        return Err(malformed(format!(
+            "first line is {:?}, not session_meta",
+            parsed.kind
+        )));
     }
+    let history_base = match parsed.payload.history_base {
+        Some(base) => Some(
+            SessionId::parse(&base.thread_id)
+                .map_err(|e| malformed(format!("history_base.thread_id: {e}")))?,
+        ),
+        None => None,
+    };
     Ok(Meta {
         cwd: parsed.payload.cwd,
-        history_base: parsed.payload.history_base.map(|h| h.thread_id),
+        history_base,
     })
 }
 
@@ -226,21 +236,30 @@ mod tests {
 
     #[test]
     fn parses_the_observed_names() {
-        let (ts, thread, rollout, compressed) = parse_name(
+        let name = parse_name(
             "rollout-2026-07-02T17-32-21-019f233e-bb33-7342-85fa-f2d33b14368a.jsonl.zst",
         )
         .unwrap();
-        assert_eq!(ts, "2026-07-02T17-32-21");
-        assert_eq!(thread, "019f233e-bb33-7342-85fa-f2d33b14368a");
-        assert_eq!(rollout, thread);
-        assert!(compressed);
-        let (_, thread, rollout, compressed) = parse_name(
+        assert_eq!(name.timestamp, "2026-07-02T17-32-21");
+        assert_eq!(
+            name.thread_id.as_str(),
+            "019f233e-bb33-7342-85fa-f2d33b14368a"
+        );
+        assert_eq!(name.rollout_id, name.thread_id);
+        assert!(name.compressed);
+        let name = parse_name(
             "rollout-2026-10-19T10-00-00-019f233e-bb33-7342-85fa-f2d33b14368a_019f233e-bb33-7342-85fa-f2d33b14368b.jsonl",
         )
         .unwrap();
-        assert_eq!(thread, "019f233e-bb33-7342-85fa-f2d33b14368a");
-        assert_eq!(rollout, "019f233e-bb33-7342-85fa-f2d33b14368b");
-        assert!(!compressed);
+        assert_eq!(
+            name.thread_id.as_str(),
+            "019f233e-bb33-7342-85fa-f2d33b14368a"
+        );
+        assert_eq!(
+            name.rollout_id.as_str(),
+            "019f233e-bb33-7342-85fa-f2d33b14368b"
+        );
+        assert!(!name.compressed);
         assert!(parse_name("rollout-2026-10-19T10-00-00-not-a-uuid.jsonl").is_none());
         assert!(parse_name("notes.jsonl").is_none());
         assert!(
@@ -256,17 +275,12 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("2026/10/19")).unwrap();
         std::fs::write(dir.path().join(format!("2026/10/19/{a}.jsonl")), "").unwrap();
         std::fs::write(dir.path().join(format!("2026/10/19/{a}.jsonl.zst")), "").unwrap();
-        std::fs::write(
-            dir.path()
-                .join(format!("fabric/x/{b}.jsonl.zst").replace("fabric/x/", "")),
-            "",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join(format!("{b}.jsonl.zst")), "").unwrap();
         let listed = list(dir.path()).unwrap();
         assert_eq!(listed.len(), 2);
-        assert_eq!(listed[0].timestamp, "2026-10-19T11-00-00");
-        assert!(listed[0].compressed);
-        assert!(!listed[1].compressed);
+        assert_eq!(listed[0].name.timestamp, "2026-10-19T11-00-00");
+        assert!(listed[0].name.compressed);
+        assert!(!listed[1].name.compressed);
         assert!(listed[1].path.ends_with(format!("{a}.jsonl")));
     }
 }
