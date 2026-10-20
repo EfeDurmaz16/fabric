@@ -34,10 +34,9 @@
 
 use std::collections::BTreeMap;
 
-use fabric_core::credential::looks_like_credential;
 use fabric_core::env::{
-    EnvVarName, EnvVarNameError, PinError, RunWhen, SecretPattern, SecretPatternError, SetupStep,
-    ToolName, ToolVersion,
+    EnvVarName, EnvVarNameError, PinError, RunWhen, SecretPattern, SecretPatternError, SetupArg,
+    SetupArgError, SetupStep, ToolName, ToolVersion,
 };
 use fabric_core::harness::{ProgramName, ProgramNameError};
 use fabric_core::path::{PathError, RelPath};
@@ -134,15 +133,15 @@ pub enum OverrideError {
         /// Zero-based index of the repeat.
         index: usize,
     },
-    /// A setup argument shaped like a credential; the spec travels to other nodes.
-    #[error(
-        "`setup[{step}].args[{arg}]` looks like a credential; pass it as an `env` name and let the program read it"
-    )]
-    CredentialInArgs {
+    /// A setup argument that is not a `SetupArg`; the argument itself is never quoted.
+    #[error("`setup[{step}].args[{arg}]` {reason}")]
+    Arg {
         /// Zero-based index in `setup`.
         step: usize,
         /// Zero-based index in that step's `args`.
         arg: usize,
+        /// What is wrong with it.
+        reason: SetupArgError,
     },
     /// Two `cache` entries name the same path, ignoring ASCII case.
     #[error("`cache[{index}].path` repeats an earlier cache path")]
@@ -506,9 +505,17 @@ fn steps(value: &Value) -> Result<Vec<SetupStep>, OverrideError> {
             Some(args) => strings(args, &format!("{at}.args"))?,
             None => Vec::new(),
         };
-        if let Some(arg) = args.iter().position(|a| looks_like_credential(a)) {
-            return Err(OverrideError::CredentialInArgs { step: index, arg });
-        }
+        let args = args
+            .into_iter()
+            .enumerate()
+            .map(|(arg, text)| {
+                SetupArg::parse(text).map_err(|reason| OverrideError::Arg {
+                    step: index,
+                    arg,
+                    reason,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let cwd = match entry.get("cwd") {
             Some(cwd) => Some(rel_path(cwd, &format!("{at}.cwd"))?),
             None => None,
@@ -531,7 +538,7 @@ fn steps(value: &Value) -> Result<Vec<SetupStep>, OverrideError> {
         };
         steps.push(SetupStep {
             program,
-            args: args.into_iter().map(str::to_owned).collect(),
+            args,
             cwd,
             when,
         });
@@ -628,7 +635,14 @@ when = "always"
         assert_eq!(setup[0].cwd, Some(RelPath::parse("web").unwrap()));
         assert_eq!(setup[0].when, RunWhen::CachesMissing);
         assert_eq!(setup[1].when, RunWhen::Always);
-        assert_eq!(setup[1].args, ["run", "codegen"]);
+        assert_eq!(
+            setup[1]
+                .args
+                .iter()
+                .map(SetupArg::as_str)
+                .collect::<Vec<_>>(),
+            ["run", "codegen"]
+        );
     }
 
     /// `setup = []` declares that nothing runs, which differs from no
@@ -731,7 +745,11 @@ when = "always"
         );
         assert!(matches!(
             EnvOverride::parse(&text),
-            Err(OverrideError::CredentialInArgs { step: 1, arg: 1 })
+            Err(OverrideError::Arg {
+                step: 1,
+                arg: 1,
+                reason: SetupArgError::Credential
+            })
         ));
     }
 

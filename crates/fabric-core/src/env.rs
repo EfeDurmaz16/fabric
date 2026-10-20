@@ -336,6 +336,59 @@ impl<'de> Deserialize<'de> for SecretPattern {
     }
 }
 
+/// Why a setup argument was refused; the argument itself is never quoted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SetupArgError {
+    /// A control character, such as a terminal escape, a newline or NUL.
+    #[error("has a control character")]
+    Control,
+    /// The text is shaped like a token, a key or a URL with a password.
+    #[error("looks like a credential; pass it as an `env` name and let the program read it")]
+    Credential,
+}
+
+/// One argument of a setup step: any text with no control character that is not shaped like a credential.
+///
+/// The spec travels to other nodes, and a node prints a peer's steps
+/// before it runs them (ADR 0007), so an argument can carry neither a
+/// token nor a terminal escape. Checked once, at the boundary, including
+/// inside `Deserialize`. The empty argument is allowed; programs take it.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct SetupArg(String);
+
+impl SetupArg {
+    /// Checks `text` against the rules and wraps it.
+    pub fn parse(text: &str) -> Result<Self, SetupArgError> {
+        if text.chars().any(char::is_control) {
+            return Err(SetupArgError::Control);
+        }
+        if looks_like_credential(text) {
+            return Err(SetupArgError::Credential);
+        }
+        Ok(Self(text.to_owned()))
+    }
+
+    /// Returns the argument.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SetupArg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SetupArg({:?})", self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SetupArg {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).map_err(serde::de::Error::custom)
+    }
+}
+
 /// What a workspace needs before a harness can run in it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvSpec {
@@ -381,7 +434,7 @@ pub struct SetupStep {
     /// The program to run, looked up on `PATH`, never through a shell.
     pub program: ProgramName,
     /// Its arguments, passed as they are.
-    pub args: Vec<String>,
+    pub args: Vec<SetupArg>,
     /// The directory to run in, relative to the root; `None` is the root itself.
     pub cwd: Option<RelPath>,
     /// When the step runs.
@@ -461,7 +514,7 @@ mod tests {
             }],
             setup: vec![SetupStep {
                 program: ProgramName::parse("npm").unwrap(),
-                args: vec!["ci".into()],
+                args: vec![SetupArg::parse("ci").unwrap()],
                 cwd: None,
                 when: RunWhen::CachesMissing,
             }],
@@ -549,6 +602,22 @@ mod tests {
                 postcard::from_bytes::<ToolVersion>(&bytes).is_err(),
                 "{bad:?}"
             );
+        }
+    }
+
+    /// A peer's step cannot carry a token or a terminal escape to the prompt that prints it.
+    #[test]
+    fn a_setup_arg_is_printable_and_not_a_credential() {
+        for ok in ["", "--frozen-lockfile", "-c", "echo x > out/f", "caf\u{e9}"] {
+            assert!(SetupArg::parse(ok).is_ok(), "{ok:?}");
+        }
+        assert_eq!(SetupArg::parse("\u{1b}[2Jci"), Err(SetupArgError::Control));
+        assert_eq!(SetupArg::parse("a\nb"), Err(SetupArgError::Control));
+        let token = format!("--token=ghp_{}", "q7".repeat(18));
+        assert_eq!(SetupArg::parse(&token), Err(SetupArgError::Credential));
+        for bad in ["\u{1b}[31mci", token.as_str()] {
+            let bytes = postcard::to_stdvec(bad).unwrap();
+            assert!(postcard::from_bytes::<SetupArg>(&bytes).is_err(), "{bad:?}");
         }
     }
 

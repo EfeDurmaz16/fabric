@@ -6,7 +6,9 @@ use std::io;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
-use fabric_core::env::{EnvVarName, PinError, RunWhen, Tool, ToolName, ToolSource, ToolVersion};
+use fabric_core::env::{
+    EnvVarName, PinError, RunWhen, SetupArg, Tool, ToolName, ToolSource, ToolVersion,
+};
 use fabric_core::path::{PathError, RelPath};
 use fabric_core::secret::Scope;
 use fabric_core::snapshot::CacheClass;
@@ -44,7 +46,7 @@ fn commands(detection: &Detection) -> Vec<String> {
         .iter()
         .map(|step| {
             std::iter::once(step.program.as_str())
-                .chain(step.args.iter().map(String::as_str))
+                .chain(step.args.iter().map(SetupArg::as_str))
                 .collect::<Vec<_>>()
                 .join(" ")
         })

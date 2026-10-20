@@ -65,7 +65,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fabric_core::env::{EnvVarName, RunWhen, SetupStep};
+use fabric_core::env::{EnvVarName, RunWhen, SetupArg, SetupStep};
 use fabric_core::harness::ProgramName;
 use fabric_core::path::RelPath;
 use tracing::Dispatch;
@@ -720,7 +720,7 @@ fn run_step(planned: &ReadyStep, lock: &fs::File) -> Result<(), MaterializeError
         "running setup step"
     );
     let mut child = Command::new(program)
-        .args(&planned.step.args)
+        .args(planned.step.args.iter().map(SetupArg::as_str))
         .current_dir(&planned.dir)
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::piped())

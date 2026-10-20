@@ -4,7 +4,8 @@
 use std::collections::BTreeMap;
 
 use fabric_core::env::{
-    EnvSpec, EnvVarName, RunWhen, SecretPattern, SetupStep, Tool, ToolName, ToolSource, ToolVersion,
+    EnvSpec, EnvVarName, RunWhen, SecretPattern, SetupArg, SetupStep, Tool, ToolName, ToolSource,
+    ToolVersion,
 };
 use fabric_core::harness::ProgramName;
 use fabric_core::path::RelPath;
@@ -45,7 +46,10 @@ fn step() -> impl Strategy<Value = SetupStep> {
         .prop_filter_map("not a program name", |(program, args, cwd, when)| {
             Some(SetupStep {
                 program: ProgramName::parse(&program).ok()?,
-                args,
+                args: args
+                    .iter()
+                    .map(|arg| SetupArg::parse(arg).ok())
+                    .collect::<Option<_>>()?,
                 cwd,
                 when,
             })

@@ -36,8 +36,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use fabric_core::env::{
-    EnvSpec, EnvSpecError, OVERRIDE_FILE, RunWhen, SecretPattern, SetupStep, Tool, ToolName,
-    ToolSource, ToolVersion,
+    EnvSpec, EnvSpecError, OVERRIDE_FILE, RunWhen, SecretPattern, SetupArg, SetupStep, Tool,
+    ToolName, ToolSource, ToolVersion,
 };
 use fabric_core::harness::ProgramName;
 use fabric_core::path::RelPath;
@@ -1115,12 +1115,16 @@ fn go_mod_pin(reader: &Reader<'_>) -> Result<Option<Pin>, DetectError> {
         .and_then(|version| pin("go", version, "go.mod", 0)))
 }
 
-fn step(program: &'static str, args: &[&str]) -> Result<SetupStep, DetectError> {
+fn step(program: &'static str, args: &[&'static str]) -> Result<SetupStep, DetectError> {
     let program =
         ProgramName::parse(program).map_err(|_| DetectError::BuiltIn { name: program })?;
+    let args = args
+        .iter()
+        .map(|&arg| SetupArg::parse(arg).map_err(|_| DetectError::BuiltIn { name: arg }))
+        .collect::<Result<_, _>>()?;
     Ok(SetupStep {
         program,
-        args: args.iter().map(|&a| a.to_owned()).collect(),
+        args,
         cwd: None,
         when: RunWhen::CachesMissing,
     })
