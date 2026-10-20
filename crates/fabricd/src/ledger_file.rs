@@ -322,13 +322,12 @@ mod tests {
     }
 
     /// The child side of the kill test: appends notes forever and reports
-    /// each acknowledged count to the progress file.
+    /// each acknowledged count to the progress file. Ignored, so it runs
+    /// only when the kill test launches it with `--ignored`.
     #[test]
+    #[ignore = "the child of a_writer_killed_mid_append_keeps_every_acknowledged_record"]
     fn child_appends_until_killed() {
-        let Some(dir) = std::env::var_os("FABRICD_LEDGER_CHILD") else {
-            return;
-        };
-        let dir = PathBuf::from(dir);
+        let dir = PathBuf::from(std::env::var_os("FABRICD_LEDGER_CHILD").unwrap());
         let (mut file, mut ledger) = write_chain(&dir.join("ledger"), 0);
         for n in 1.. {
             let note = ledger
@@ -350,7 +349,11 @@ mod tests {
     fn a_writer_killed_mid_append_keeps_every_acknowledged_record() {
         let dir = tempfile::tempdir().unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "ledger_file::tests::child_appends_until_killed"])
+            .args([
+                "--ignored",
+                "--exact",
+                "ledger_file::tests::child_appends_until_killed",
+            ])
             .env("FABRICD_LEDGER_CHILD", dir.path())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
