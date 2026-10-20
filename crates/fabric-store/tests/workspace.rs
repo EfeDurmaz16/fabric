@@ -353,7 +353,17 @@ fn a_second_snapshot_carries_only_new_objects_and_restores_through_the_chain() {
     );
     let s2 = store.publish(&second.manifest).unwrap();
 
+    let user_refs = |root: &Path| -> Vec<String> {
+        git_text(root, &["for-each-ref"])
+            .unwrap()
+            .lines()
+            .filter(|line| !line.contains("\trefs/fabric/"))
+            .map(str::to_owned)
+            .collect()
+    };
+    let before = user_refs(&root);
     let third = capture(&store, &request(&root, &policy, Some(s2))).unwrap();
+    assert_eq!(user_refs(&root), before);
     assert_eq!(third.report.bundle, Some(BundleKind::Empty));
     assert!(third.manifest.git.as_ref().unwrap().bundle.is_empty());
     let s3 = store.publish(&third.manifest).unwrap();
@@ -374,8 +384,6 @@ fn a_second_snapshot_carries_only_new_objects_and_restores_through_the_chain() {
         "precious ignored, changed\n"
     );
     // Scratch files live in the store's tmp/ and are gone afterwards.
-    assert!(!root.join(".git/fabric-tmp").exists());
-    assert!(!target.join(".git/fabric-tmp").exists());
     assert_eq!(
         fs::read_dir(dir.path().join("store/tmp")).unwrap().count(),
         0
