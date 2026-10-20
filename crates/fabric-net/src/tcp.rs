@@ -124,6 +124,13 @@ impl TcpTlsTransport {
 /// How long the accept loop waits after the listener fails, for example out of file descriptors.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
+/// How long an accepted socket may stay silent before its first handshake byte.
+///
+/// A dialer sends its `ClientHello` right after connecting, so this is far
+/// shorter than `HANDSHAKE_TIMEOUT`: a host that connects and says nothing
+/// gives its handshake slot back quickly.
+const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Hands every accepted socket to `handshakes` until the transport is dropped.
 async fn accept_loop(listener: TcpListener, acceptor: TlsAcceptor, handshakes: Handshakes) {
     loop {
@@ -140,6 +147,17 @@ async fn accept_loop(listener: TcpListener, acceptor: TlsAcceptor, handshakes: H
         }
         let acceptor = acceptor.clone();
         let handshake = async move {
+            let mut first = [0u8; 1];
+            match tokio::time::timeout(FIRST_BYTE_TIMEOUT, tcp.peek(&mut first)).await {
+                Ok(Ok(0)) => {
+                    return Err(TransportError::Closed(
+                        "closed before its handshake".to_owned(),
+                    ));
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => return Err(err.into()),
+                Err(_) => return Err(TransportError::Timeout(FIRST_BYTE_TIMEOUT)),
+            }
             let tls = acceptor.accept(tcp).await?;
             let peer = peer_of(tls.get_ref().1.peer_certificates())?;
             Ok(Box::new(Mux::spawn(
@@ -174,5 +192,39 @@ impl Transport for TcpTlsTransport {
 
     fn accept(&self) -> BoxFuture<'_, Result<Box<dyn Connection>, TransportError>> {
         Box::pin(self.inbox.next())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[derive(Debug)]
+    struct NoOne;
+
+    impl Trust for NoOne {
+        fn is_paired(&self, _node: NodeId) -> bool {
+            false
+        }
+    }
+
+    /// A host that connects and sends nothing loses its socket after
+    /// `FIRST_BYTE_TIMEOUT`, not the whole handshake timeout, so silent
+    /// sockets give their handshake slots back quickly.
+    #[tokio::test]
+    async fn a_socket_silent_past_the_first_byte_timeout_is_closed() {
+        let identity = NodeIdentity::generate().unwrap();
+        let transport =
+            TcpTlsTransport::bind(&identity, Arc::new(NoOne), ([127, 0, 0, 1], 0).into()).unwrap();
+        let mut silent = TcpStream::connect(transport.local_addr).await.unwrap();
+        let started = tokio::time::Instant::now();
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(FIRST_BYTE_TIMEOUT * 2, silent.read(&mut byte)).await;
+        assert!(
+            matches!(read, Ok(Ok(0) | Err(_))),
+            "the server must close the silent socket"
+        );
+        assert!(started.elapsed() + Duration::from_millis(100) >= FIRST_BYTE_TIMEOUT);
     }
 }
