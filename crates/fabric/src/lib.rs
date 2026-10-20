@@ -520,8 +520,13 @@ async fn launch(
     drop(tree);
     match registered {
         Ok(Response::Done { lines }) => print_lines(&lines)?,
-        Ok(Response::Failed { error, refusal, .. }) => {
+        Ok(Response::Failed {
+            lines,
+            error,
+            refusal,
+        }) => {
             kill_group(&running);
+            print_lines(&lines)?;
             return Err(Refused {
                 refusal,
                 message: format!(
