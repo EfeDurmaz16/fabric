@@ -7,7 +7,7 @@
 //! no Claude Code or Codex session this process runs under claims it as a
 //! child. A version probe runs with this process's environment minus the
 //! same markers, so even that one short call is no child of a host
-//! session. A question about running processes fails closed:
+//! session, and with `PATH` set to the value the binary was found on. A question about running processes fails closed:
 //! when `pgrep` or `ps` cannot answer, the caller is told so, never "none".
 //! `ps`, `pgrep` and `kill` are run from their system paths, never looked
 //! up on this process's `PATH`, so a planted `ps` cannot report a live
@@ -89,14 +89,21 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// This process's environment, as far as its names and values are text
-/// a launch env can hold.
-fn own_env() -> Vec<(EnvVarName, String)> {
-    std::env::vars_os()
+/// a launch env can hold, with `PATH` set to `path_var`: the binary was
+/// found on that value, and a shim such as `#!/usr/bin/env node` must find
+/// its interpreter there too, as it will at launch.
+fn probe_env(path_var: &OsStr) -> Vec<(EnvVarName, String)> {
+    let mut env: Vec<(EnvVarName, String)> = std::env::vars_os()
         .filter_map(|(name, value)| {
             let name = EnvVarName::parse(name.to_str()?).ok()?;
             Some((name, value.into_string().ok()?))
         })
-        .collect()
+        .filter(|(name, _)| name.as_str() != "PATH")
+        .collect();
+    if let (Ok(name), Some(value)) = (EnvVarName::parse("PATH"), path_var.to_str()) {
+        env.push((name, value.to_owned()));
+    }
+    env
 }
 
 /// Runs `binary args...` with `env` minus its parent-session markers and
@@ -142,14 +149,17 @@ async fn probe(
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-/// Asks `binary` for its version; `None` when there is no binary. A
-/// binary that answers with no version in its output is still installed,
-/// with `version` set to `None`.
-pub(crate) async fn detect(binary: Option<PathBuf>) -> Result<Option<Installed>, HarnessError> {
+/// Asks `binary`, found on the `PATH` value `path_var`, for its version;
+/// `None` when there is no binary. A binary that answers with no version
+/// in its output is still installed, with `version` set to `None`.
+pub(crate) async fn detect(
+    binary: Option<PathBuf>,
+    path_var: &OsStr,
+) -> Result<Option<Installed>, HarnessError> {
     let Some(path) = binary else {
         return Ok(None);
     };
-    let raw = probe(&path, &["--version"], &own_env()).await?;
+    let raw = probe(&path, &["--version"], &probe_env(path_var)).await?;
     Ok(Some(Installed {
         version: version_token(&raw).map(str::to_owned),
         raw,
@@ -159,8 +169,12 @@ pub(crate) async fn detect(binary: Option<PathBuf>) -> Result<Option<Installed>,
 
 /// The version `binary` reports, or `None` when there is no binary or the
 /// probe fails; a failed probe is logged, never fatal.
-pub(crate) async fn installed_version(binary: Option<PathBuf>, program: &str) -> Option<String> {
-    match detect(binary).await {
+pub(crate) async fn installed_version(
+    binary: Option<PathBuf>,
+    path_var: &OsStr,
+    program: &str,
+) -> Option<String> {
+    match detect(binary, path_var).await {
         Ok(installed) => installed.and_then(|i| i.version),
         Err(e) => {
             tracing::warn!(program, error = %e, "version probe failed");
@@ -530,9 +544,29 @@ mod tests {
         let binary = dir.path().join("tool");
         std::fs::write(&binary, "#!/bin/sh\necho 'tool 1.2.3'\nexit 1\n").unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let err = detect(Some(binary.clone())).await.unwrap_err();
+        let err = detect(Some(binary.clone()), OsStr::new("/usr/bin:/bin"))
+            .await
+            .unwrap_err();
         assert!(matches!(err, HarnessError::Spawn { .. }), "{err}");
-        assert_eq!(installed_version(Some(binary), "tool").await, None);
+        assert_eq!(
+            installed_version(Some(binary), OsStr::new("/usr/bin:/bin"), "tool").await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_version_probe_finds_an_interpreter_on_the_configured_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let interp = dir.path().join("fabric-test-interp");
+        std::fs::write(&interp, "#!/bin/sh\necho 'tool 4.5.6'\n").unwrap();
+        std::fs::set_permissions(&interp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let binary = dir.path().join("tool");
+        std::fs::write(&binary, "#!/usr/bin/env fabric-test-interp\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path_var =
+            std::env::join_paths([dir.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        let installed = detect(Some(binary), &path_var).await.unwrap().unwrap();
+        assert_eq!(installed.version.as_deref(), Some("4.5.6"));
     }
 
     #[test]

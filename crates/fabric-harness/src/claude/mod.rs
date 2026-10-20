@@ -290,7 +290,7 @@ impl ClaudeCode {
     }
 
     async fn installed_version(&self) -> Option<String> {
-        process::installed_version(self.binary().ok(), PROGRAM).await
+        process::installed_version(self.binary().ok(), &self.path_var, PROGRAM).await
     }
 
     /// Makes sure Claude trusts `workspace`, where Fabric can do so
@@ -660,7 +660,7 @@ impl ClaudeCode {
     }
 
     async fn detect_impl(&self) -> Result<Option<Installed>, HarnessError> {
-        process::detect(self.binary().ok()).await
+        process::detect(self.binary().ok(), &self.path_var).await
     }
 
     /// The session the process runs and the argument list for `launch`,

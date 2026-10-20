@@ -246,7 +246,9 @@ impl AcpHarness {
         out: &Path,
     ) -> Result<StateManifest, HarnessError> {
         let root = pipeline::physical_workspace(workspace)?;
-        let version = process::installed_version(self.binary().ok(), self.program.as_str()).await;
+        let version =
+            process::installed_version(self.binary().ok(), &self.path_var, self.program.as_str())
+                .await;
         let adapter = self.clone();
         let session = session.clone();
         let out = out.to_path_buf();
@@ -298,7 +300,7 @@ impl AcpHarness {
     }
 
     async fn detect_impl(&self) -> Result<Option<Installed>, HarnessError> {
-        process::detect(self.binary().ok()).await
+        process::detect(self.binary().ok(), &self.path_var).await
     }
 
     /// Starts the agent, completes the handshake, continues `resume` or

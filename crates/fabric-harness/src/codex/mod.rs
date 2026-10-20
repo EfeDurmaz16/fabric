@@ -486,7 +486,7 @@ impl Codex {
         out: &Path,
     ) -> Result<StateManifest, HarnessError> {
         let root = pipeline::physical_workspace(workspace)?;
-        let version = process::installed_version(self.binary().ok(), PROGRAM).await;
+        let version = process::installed_version(self.binary().ok(), &self.path_var, PROGRAM).await;
         self.refuse_lockless_writers(version.as_deref()).await?;
         let adapter = self.clone();
         let session = session.clone();
@@ -592,7 +592,7 @@ impl Codex {
     async fn restore_impl(&self, workspace: &Path, state: &Path) -> Result<Restored, HarnessError> {
         let root = pipeline::physical_workspace(workspace)?;
         let manifest = pipeline::open(state, &HarnessKind::Codex, &root, &self.home)?;
-        let version = process::installed_version(self.binary().ok(), PROGRAM).await;
+        let version = process::installed_version(self.binary().ok(), &self.path_var, PROGRAM).await;
         self.refuse_lockless_writers(version.as_deref()).await?;
         let adapter = self.clone();
         let state = state.to_path_buf();
@@ -600,7 +600,7 @@ impl Codex {
     }
 
     async fn detect_impl(&self) -> Result<Option<Installed>, HarnessError> {
-        process::detect(self.binary().ok()).await
+        process::detect(self.binary().ok(), &self.path_var).await
     }
 
     /// The argument list for `launch`, without the binary.
