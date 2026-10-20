@@ -150,7 +150,8 @@ Capture measures carry keys with `fabric-env` detection: a cache detection does 
 ## Open questions
 
 - Should a node that cannot reach the target of its open move offer the user `fabric job move --abort`, which ADR 0003 describes and this build does not have?
-- `fabric orphan export` (ADR 0003) is not built; an orphan workspace is reported and left in place.
+- `fabric orphan export` (ADR 0003) is not built; an orphan workspace is reported, or set aside under `orphan/<epoch>` by a restore, and never deleted.
+- A CLI killed after it launched the harness and before the node recorded it leaves a harness the node does not know, so no suspend, move or fence stops it. Should the node launch through a small supervisor it owns, or the CLI record the pid in the state directory before it registers?
 - The fork rule of ADR 0003 is not built: a node whose ledger forked after a steal, at an epoch no higher than the peer's, freezes the job (Forks, above) until the rule exists.
 - The store applies its own secret list, not `fabric_core::secret` (ADR 0004, integration note of 2026-10-20).
 - How do two nodes find each other after a network change? On the gate (finding F3, 2026-10-20) the Pro moved to another subnet overnight and the Air's address was unreachable from it. Today the user re-pairs with `fabric node add` and a new address. Candidates: Tailscale as an optional underlay whose addresses survive the change, or the reachable side dialing a rendezvous. Decide after the first move on the gate.
