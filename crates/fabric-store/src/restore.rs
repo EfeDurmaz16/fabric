@@ -18,10 +18,10 @@ use fabric_core::git::GitOid;
 use fabric_core::id::SnapshotId;
 use fabric_core::path::{PathError, RelPath};
 use fabric_core::snapshot::{
-    CacheEntry, CarryState, Entry, EntryKind, GitHead, GitState, SnapshotManifest,
+    CacheEntry, CarryState, Entry, EntryKind, GitHead, GitState, Mode, SnapshotManifest,
 };
 
-use crate::capture::{mode_of, symlink_escapes};
+use crate::capture::symlink_escapes;
 use crate::checkpoint;
 use crate::durable::{self, TempFile};
 use crate::git::{Git, GitError};
@@ -667,7 +667,7 @@ fn restore_git(
     let mut blobs: Vec<&TreeItem> = Vec::with_capacity(items.len());
     for item in &items {
         if item.mode == TreeMode::Gitlink {
-            writer.mkdir(&item.rel, mode_of(0o755))?;
+            writer.mkdir(&item.rel, Mode::from_masked(0o755))?;
             report.submodules.push(item.rel.clone());
         } else {
             blobs.push(item);
@@ -697,7 +697,7 @@ fn restore_git(
                 } else {
                     0o644
                 };
-                let mut file = writer.create_file(&item.rel, mode_of(bits))?;
+                let mut file = writer.create_file(&item.rel, Mode::from_masked(bits))?;
                 let written = io::copy(body, &mut file).map_err(|e| io_err(path, e))?;
                 if written != size {
                     return Err(RestoreError::SizeMismatch {

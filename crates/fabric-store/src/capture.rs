@@ -304,15 +304,6 @@ fn rel_path(text: &str) -> Result<RelPath, CaptureError> {
     })
 }
 
-/// Keeps the permission bits of a raw `st_mode`.
-pub(crate) fn mode_of(raw: u32) -> Mode {
-    #[expect(
-        clippy::unwrap_used,
-        reason = "the mask leaves the low nine bits, which Mode::new always accepts"
-    )]
-    u16::try_from(raw & 0o777).ok().and_then(Mode::new).unwrap()
-}
-
 /// Reads a symlink's target, refusing one that is not UTF-8 instead of rewriting it.
 fn utf8_link(full: &Path, rel: &RelPath) -> Result<String, CaptureError> {
     fs::read_link(full)
@@ -511,7 +502,7 @@ impl Capturer<'_> {
         Ok(Entry {
             rel_path: found.rel.clone(),
             kind,
-            mode: mode_of(meta.mode()),
+            mode: Mode::from_masked(meta.mode()),
             mtime_ns: mtime_ns(meta),
         })
     }
@@ -586,7 +577,7 @@ impl Capturer<'_> {
             entries.push(Entry {
                 rel_path: dir.clone(),
                 kind: EntryKind::Dir,
-                mode: mode_of(meta.mode()),
+                mode: Mode::from_masked(meta.mode()),
                 mtime_ns: mtime_ns(&meta),
             });
         }

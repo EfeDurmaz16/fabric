@@ -138,6 +138,12 @@ impl Mode {
         }
     }
 
+    /// Keeps the permission bits of a raw `st_mode` and drops the rest; it cannot fail.
+    #[must_use]
+    pub const fn from_masked(raw: u32) -> Mode {
+        Mode((raw & 0o777) as u16)
+    }
+
     /// Returns the bits.
     #[must_use]
     pub const fn bits(self) -> u16 {
@@ -405,6 +411,12 @@ impl SnapshotManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_masked_keeps_only_the_permission_bits() {
+        assert_eq!(Mode::from_masked(0o100_755).bits(), 0o755);
+        assert_eq!(Mode::from_masked(0o4777).bits(), 0o777);
+    }
 
     #[test]
     fn an_unmeasured_key_matches_nothing_and_equal_keys_match() {

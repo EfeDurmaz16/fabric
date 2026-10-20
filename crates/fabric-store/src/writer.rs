@@ -200,7 +200,6 @@ impl TreeWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::mode_of;
     use std::io::Write;
 
     fn rel(s: &str) -> RelPath {
@@ -216,11 +215,19 @@ mod tests {
             .symlink(&rel("link"), outside.path().to_str().unwrap())
             .unwrap();
         let err = writer
-            .create_file(&rel("link/escaped"), mode_of(0o644))
+            .create_file(
+                &rel("link/escaped"),
+                fabric_core::snapshot::Mode::from_masked(0o644),
+            )
             .unwrap_err();
         assert!(matches!(err, WriteError::ThroughSymlink { .. }), "{err}");
         assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
-        let err = writer.mkdir(&rel("link/sub"), mode_of(0o755)).unwrap_err();
+        let err = writer
+            .mkdir(
+                &rel("link/sub"),
+                fabric_core::snapshot::Mode::from_masked(0o755),
+            )
+            .unwrap_err();
         assert!(matches!(err, WriteError::ThroughSymlink { .. }), "{err}");
     }
 
@@ -229,19 +236,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let writer = TreeWriter::open(dir.path()).unwrap();
         writer
-            .create_file(&rel("a"), mode_of(0o644))
+            .create_file(&rel("a"), fabric_core::snapshot::Mode::from_masked(0o644))
             .unwrap()
             .write_all(b"first")
             .unwrap();
-        let err = writer.create_file(&rel("a"), mode_of(0o644)).unwrap_err();
+        let err = writer
+            .create_file(&rel("a"), fabric_core::snapshot::Mode::from_masked(0o644))
+            .unwrap_err();
         assert!(matches!(err, WriteError::Collision { .. }), "{err}");
         let err = writer.symlink(&rel("a"), "x").unwrap_err();
         assert!(matches!(err, WriteError::Collision { .. }), "{err}");
-        let err = writer.mkdir(&rel("a"), mode_of(0o755)).unwrap_err();
+        let err = writer
+            .mkdir(&rel("a"), fabric_core::snapshot::Mode::from_masked(0o755))
+            .unwrap_err();
         assert!(matches!(err, WriteError::Collision { .. }), "{err}");
         assert_eq!(std::fs::read(dir.path().join("a")).unwrap(), b"first");
-        writer.mkdir(&rel("d"), mode_of(0o700)).unwrap();
-        writer.mkdir(&rel("d"), mode_of(0o700)).unwrap();
+        writer
+            .mkdir(&rel("d"), fabric_core::snapshot::Mode::from_masked(0o700))
+            .unwrap();
+        writer
+            .mkdir(&rel("d"), fabric_core::snapshot::Mode::from_masked(0o700))
+            .unwrap();
     }
 
     #[test]
@@ -250,7 +265,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let writer = TreeWriter::open(dir.path()).unwrap();
         writer
-            .create_file(&rel("x/y/exec"), mode_of(0o764))
+            .create_file(
+                &rel("x/y/exec"),
+                fabric_core::snapshot::Mode::from_masked(0o764),
+            )
             .unwrap();
         writer
             .set_mtime(&rel("x/y/exec"), 1_700_000_000_123_456_789)
