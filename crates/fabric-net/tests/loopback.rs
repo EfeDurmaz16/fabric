@@ -647,7 +647,7 @@ async fn concurrent_streams_do_not_cross_under_backpressure() -> TestResult {
                 for task in tasks {
                     let copied = task
                         .await
-                        .map_err(|e| TransportError::Closed(e.to_string()))??;
+                        .map_err(|e| TransportError::Closed(Box::new(e)))??;
                     assert_eq!(usize::try_from(copied).ok(), Some(LEN));
                 }
                 // Dropping the connection now would discard echoed bytes the

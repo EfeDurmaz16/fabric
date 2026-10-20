@@ -270,7 +270,10 @@ impl Shared {
 }
 
 fn closed() -> TransportError {
-    TransportError::Closed("tcp connection ended".to_owned())
+    TransportError::Closed(Box::new(io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        "tcp connection ended",
+    )))
 }
 
 /// One multiplexed connection over a byte stream.

@@ -59,22 +59,23 @@ pub enum TransportError {
     #[error(transparent)]
     Tls(#[from] TlsError),
     /// The handshake with `addr` did not complete.
-    #[error("handshake with {addr} failed: {reason}")]
+    #[error("handshake with {addr} failed: {source}")]
     Handshake {
         /// The address dialed.
         addr: SocketAddr,
         /// What the wire reported.
-        reason: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
-    /// The connection is closed; the reason is what the wire reported.
+    /// The connection is closed; the source is what the wire reported.
     #[error("connection closed: {0}")]
-    Closed(String),
+    Closed(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// The local endpoint is closed, so nothing can be accepted.
     #[error("the endpoint is closed")]
     EndpointClosed,
     /// The wire's configuration was refused.
     #[error("transport configuration: {0}")]
-    Config(String),
+    Config(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// An operation did not complete within its limit.
     #[error("timed out after {0:?}")]
     Timeout(Duration),

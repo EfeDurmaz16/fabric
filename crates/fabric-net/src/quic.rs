@@ -56,7 +56,7 @@ impl QuicTransport {
         let transport = Arc::new(transport_config()?);
         let rustls_config = credentials.server_config(Arc::clone(&trust))?;
         let quic_config = QuicServerConfig::try_from(rustls_config)
-            .map_err(|err| TransportError::Config(err.to_string()))?;
+            .map_err(|err| TransportError::Config(Box::new(err)))?;
         let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
         server.transport_config(transport.clone());
         let endpoint = quinn::Endpoint::server(server, addr)?;
@@ -99,19 +99,26 @@ impl QuicTransport {
         let refusal = Arc::new(Refusal::default());
         let rustls_config = self.credentials.client_config(peer, &refusal)?;
         let quic_config = QuicClientConfig::try_from(rustls_config)
-            .map_err(|err| TransportError::Config(err.to_string()))?;
+            .map_err(|err| TransportError::Config(Box::new(err)))?;
         let mut client = quinn::ClientConfig::new(Arc::new(quic_config));
         client.transport_config(self.transport.clone());
-        let handshake = |err: &dyn std::fmt::Display| TransportError::Handshake {
-            addr,
-            reason: err.to_string(),
-        };
         let connection = self
             .endpoint
             .connect_with(client, addr, SERVER_NAME)
-            .map_err(|err| handshake(&err))?
+            .map_err(|err| TransportError::Handshake {
+                addr,
+                source: Box::new(err),
+            })?
             .await
-            .map_err(|err| refusal.take().map_or_else(|| handshake(&err), Into::into))?;
+            .map_err(|err| {
+                refusal.take().map_or_else(
+                    || TransportError::Handshake {
+                        addr,
+                        source: Box::new(err),
+                    },
+                    Into::into,
+                )
+            })?;
         let actual = identity_of(&connection)?;
         if actual != peer {
             connection.close(VarInt::from_u32(1), b"peer mismatch");
@@ -145,7 +152,7 @@ async fn accept_loop(endpoint: quinn::Endpoint, handshakes: Handshakes) {
         let handshake = async move {
             let connection = incoming.await.map_err(|err| TransportError::Handshake {
                 addr: remote,
-                reason: err.to_string(),
+                source: Box::new(err),
             })?;
             match identity_of(&connection) {
                 Ok(peer) => Ok(Box::new(QuicConnection {
@@ -166,8 +173,8 @@ async fn accept_loop(endpoint: quinn::Endpoint, handshakes: Handshakes) {
 
 fn transport_config() -> Result<quinn::TransportConfig, TransportError> {
     let mut config = quinn::TransportConfig::default();
-    let idle = IdleTimeout::try_from(IDLE_TIMEOUT)
-        .map_err(|err| TransportError::Config(err.to_string()))?;
+    let idle =
+        IdleTimeout::try_from(IDLE_TIMEOUT).map_err(|err| TransportError::Config(Box::new(err)))?;
     config.max_idle_timeout(Some(idle));
     config.keep_alive_interval(Some(KEEP_ALIVE));
     Ok(config)
@@ -180,8 +187,8 @@ fn identity_of(connection: &quinn::Connection) -> Result<NodeId, TlsError> {
     peer_of(certs.as_deref().map(Vec::as_slice))
 }
 
-fn closed(err: &quinn::ConnectionError) -> TransportError {
-    TransportError::Closed(err.to_string())
+fn closed(err: quinn::ConnectionError) -> TransportError {
+    TransportError::Closed(Box::new(err))
 }
 
 impl Transport for QuicTransport {
@@ -226,14 +233,14 @@ impl Connection for QuicConnection {
 
     fn open(&self) -> BoxFuture<'_, Result<Stream, TransportError>> {
         Box::pin(async {
-            let (send, recv) = self.inner.open_bi().await.map_err(|e| closed(&e))?;
+            let (send, recv) = self.inner.open_bi().await.map_err(closed)?;
             Ok(Stream::new(send, recv))
         })
     }
 
     fn next(&self) -> BoxFuture<'_, Result<Stream, TransportError>> {
         Box::pin(async {
-            let (send, recv) = self.inner.accept_bi().await.map_err(|e| closed(&e))?;
+            let (send, recv) = self.inner.accept_bi().await.map_err(closed)?;
             Ok(Stream::new(send, recv))
         })
     }
