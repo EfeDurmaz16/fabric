@@ -26,6 +26,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::durable;
+use crate::stamp::TreeStamp;
 
 /// Why a node-local file could not be read or written.
 #[derive(Debug, thiserror::Error)]
@@ -82,11 +83,19 @@ pub enum MarkerState {
     Suspending {
         /// The ledger head when the suspend began.
         head: RecordHash,
+        /// The tree as the capture found it; `None` when it could not be measured.
+        tree: Option<TreeStamp>,
     },
-    /// It holds exactly this snapshot.
+    /// It held exactly this snapshot when the tree was `tree`.
+    ///
+    /// A user can edit the tree by hand afterwards, so the snapshot is the
+    /// workspace only while the tree still measures `tree`; `None`, when it
+    /// could not be measured, never does.
     Clean {
         /// The snapshot.
         snapshot: SnapshotId,
+        /// The tree when the snapshot was captured or restored.
+        tree: Option<TreeStamp>,
     },
     /// A restore of this snapshot began and has not finished.
     Restoring {
@@ -114,19 +123,32 @@ pub struct Marker {
 impl Marker {
     /// Whether the workspace belongs to this node's tenure at `epoch`.
     ///
-    /// It does when the marker was written at that epoch, or when it holds,
-    /// or was restoring, exactly `latest`, which any tenure starts from.
-    /// Anything else was left by an earlier tenure and may hold changes the
-    /// job does not have, or lack changes it does.
-    #[must_use]
-    pub fn is_current(&self, epoch: Epoch, latest: Option<SnapshotId>) -> bool {
+    /// It does when the marker was written at that epoch, when it was
+    /// restoring exactly `latest`, or when it holds `latest` and the tree is
+    /// unchanged since, because any tenure starts from `latest`. Anything
+    /// else was left by an earlier tenure and may hold changes the job does
+    /// not have, or lack changes it does.
+    pub async fn is_current(&self, epoch: Epoch, latest: Option<SnapshotId>) -> bool {
+        if self.epoch == epoch {
+            return true;
+        }
         match self.state {
-            MarkerState::Clean { snapshot } | MarkerState::Restoring { snapshot }
-                if Some(snapshot) == latest =>
-            {
-                true
+            MarkerState::Restoring { snapshot } => Some(snapshot) == latest,
+            MarkerState::Clean { snapshot, .. } => {
+                Some(snapshot) == latest && self.is_unchanged().await
             }
-            _ => self.epoch == epoch,
+            MarkerState::Live | MarkerState::Suspending { .. } => false,
+        }
+    }
+
+    /// Whether the workspace is clean and still measures what it did when
+    /// the marker was written.
+    pub async fn is_unchanged(&self) -> bool {
+        match self.state {
+            MarkerState::Clean {
+                tree: Some(tree), ..
+            } => TreeStamp::measure(&self.root).await == Some(tree),
+            _ => false,
         }
     }
 }

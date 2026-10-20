@@ -27,4 +27,5 @@ pub mod node;
 mod ops;
 pub mod paths;
 mod service;
+mod stamp;
 mod transfer;

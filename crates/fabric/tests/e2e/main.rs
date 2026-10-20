@@ -342,6 +342,23 @@ fn e2e_a_duplicated_import_answer_changes_nothing() -> Fallible {
     Ok(())
 }
 
+/// A user edits the tree by hand after a suspend, then moves the job. The
+/// move must capture the edit, so it arrives on the target and nothing is
+/// left only in the departed copy.
+#[test]
+fn e2e_a_hand_edit_after_a_suspend_moves_with_the_job() -> Fallible {
+    let p = setup(Wire::TcpTls, None, None)?;
+    let (job, mut work) = job_with_work(&p)?;
+    p.a.ok(&["job", "suspend", &job])?;
+    let edited = "hello\nedited by hand after the suspend\n";
+    fs::write(p.env.work(&job).join("README.md"), edited)?;
+    let moved = p.a.ok(&["job", "move", &job, "--to", &p.b.id])?;
+    assert!(moved.contains("capturing it again"), "{moved}");
+    assert_one_owner(&p.b, &p.a, &job, 2, "departed")?;
+    edited.clone_into(&mut work.readme);
+    assert_continues(&p, &p.b, &job, &work, &["one"])
+}
+
 #[test]
 fn e2e_a_steal_needs_force_and_fences_the_sleeping_owner() -> Fallible {
     let mut p = setup(Wire::TcpTls, None, None)?;

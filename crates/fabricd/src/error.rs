@@ -107,6 +107,18 @@ pub enum NodeError {
         /// The target of the move.
         target: NodeId,
     },
+    /// The workspace changed after the snapshot a move copied, by hand or by a harness Fabric did not start.
+    #[error(
+        "the workspace of job {job} at {root} changed after the snapshot {target} copied, so nothing moved; run `fabric job move {job} --to {target}` again, which captures the change"
+    )]
+    ChangedDuringMove {
+        /// The job.
+        job: JobId,
+        /// The root.
+        root: PathBuf,
+        /// The target of the move.
+        target: NodeId,
+    },
     /// A harness for the job already runs on this node.
     #[error("a harness for job {job} already runs as pid {pid}")]
     AlreadyRunningHarness {
@@ -281,6 +293,7 @@ impl NodeError {
             NodeError::Unfinished { .. }
             | NodeError::AlreadyRunningHarness { .. }
             | NodeError::RanDuringMove { .. }
+            | NodeError::ChangedDuringMove { .. }
             | NodeError::WorkspaceOccupied { .. }
             | NodeError::NoWorkspace(_)
             | NodeError::StaleWorkspace { .. }

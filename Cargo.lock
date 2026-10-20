@@ -440,6 +440,7 @@ dependencies = [
 name = "fabricd"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "fabric-core",
  "fabric-env",
  "fabric-harness",

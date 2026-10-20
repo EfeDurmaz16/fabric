@@ -207,13 +207,15 @@ impl Job {
         let Some(marker) = self.marker()? else {
             return Ok(None);
         };
-        if let (MarkerState::Suspending { .. }, Some(snapshot)) =
+        if let (MarkerState::Suspending { tree, .. }, Some(snapshot)) =
             (&marker.state, self.suspended_in())
         {
             let clean = Marker {
-                root: marker.root,
-                state: MarkerState::Clean { snapshot },
-                epoch: marker.epoch,
+                state: MarkerState::Clean {
+                    snapshot,
+                    tree: *tree,
+                },
+                ..marker
             };
             self.set_marker(&clean)?;
             return Ok(Some(clean));

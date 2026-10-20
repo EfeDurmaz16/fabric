@@ -44,6 +44,7 @@ use crate::job::Job;
 use crate::local::{self, HarnessRecord, Liveness, Marker, MarkerState, SessionRecord};
 use crate::node::{Node, Out, is_transport};
 use crate::paths::{self, SyncedFolders, check_root, restore_root};
+use crate::stamp::TreeStamp;
 use crate::transfer::{fetch_snapshot, is_complete, with_store};
 
 /// How long a harness gets between `SIGTERM` and `SIGKILL` when a suspend stops it.
@@ -424,7 +425,7 @@ impl Node {
         let job = job.lock().await;
         let token = owner_token(&job, self.id)?;
         let marker = job.reconcile_marker()?.ok_or(NodeError::NoWorkspace(id))?;
-        if !marker.is_current(token.epoch, job.latest()) {
+        if !marker.is_current(token.epoch, job.latest()).await {
             return Err(NodeError::StaleWorkspace {
                 job: id,
                 root: marker.root,
@@ -582,7 +583,7 @@ impl Node {
         let Some(marker) = job.reconcile_marker()? else {
             return job.suspended_in().ok_or(NodeError::NoWorkspace(id));
         };
-        if !marker.is_current(epoch, job.latest()) {
+        if !marker.is_current(epoch, job.latest()).await {
             out.say(format!(
                 "the workspace at {} was left at epoch {}, before this node's tenure, so it is not captured; `fabric job resume {id}` sets it aside",
                 marker.root.display(),
@@ -590,12 +591,17 @@ impl Node {
             ));
             return job.suspended_in().ok_or(NodeError::NoWorkspace(id));
         }
-        if let (MarkerState::Clean { snapshot }, Some(suspended)) =
+        if let (MarkerState::Clean { snapshot, .. }, Some(suspended)) =
             (&marker.state, job.suspended_in())
             && *snapshot == suspended
         {
-            out.say(format!("already suspended in snapshot {suspended}"));
-            return Ok(suspended);
+            if marker.is_unchanged().await {
+                out.say(format!("already suspended in snapshot {suspended}"));
+                return Ok(suspended);
+            }
+            out.say(format!(
+                "the workspace changed after snapshot {suspended}, by hand or by a harness Fabric did not start; capturing it again"
+            ));
         }
         if let MarkerState::Restoring { .. } = marker.state {
             return Err(NodeError::Unfinished {
@@ -618,14 +624,22 @@ impl Node {
             .records()
             .last()
             .map(|r| r.event().kind.clone());
-        let snapshot = if let Some(EventKind::SnapshotPublished { snapshot, .. }) = last {
+        let (snapshot, tree) = if let Some(EventKind::SnapshotPublished { snapshot, .. }) = last {
             out.say(format!("finishing the suspend that published {snapshot}"));
-            snapshot
+            let tree = match marker.state {
+                MarkerState::Suspending { tree, .. } => tree,
+                _ => None,
+            };
+            (snapshot, tree)
         } else {
+            // Measured before the capture, so an edit made while it runs
+            // shows as a change at the next suspend.
+            let tree = TreeStamp::measure(&marker.root).await;
             job.set_marker(&Marker {
                 root: marker.root.clone(),
                 state: MarkerState::Suspending {
                     head: job.ledger().head(),
+                    tree,
                 },
                 epoch,
             })?;
@@ -638,13 +652,13 @@ impl Node {
                     parent: job.latest(),
                 },
             )?;
-            snapshot
+            (snapshot, tree)
         };
         self.confirm_departure(job, path_var, out).await?;
         job.append(self.id, EventKind::Suspended { snapshot })?;
         job.set_marker(&Marker {
             root: marker.root,
-            state: MarkerState::Clean { snapshot },
+            state: MarkerState::Clean { snapshot, tree },
             epoch,
         })?;
         out.say(format!(
@@ -962,20 +976,34 @@ impl Node {
         let mut job = job.lock().await;
         if let LeaseView::Owner(token) = job.view(self.id) {
             let suspended = job.suspended_in();
-            // A workspace an earlier tenure left is not the job's and is
-            // not what was copied; settle leaves it where it is.
-            let unchanged = suspended.is_some()
-                && job
-                    .marker()?
-                    .filter(|marker| marker.is_current(token.epoch, job.latest()))
-                    .is_none_or(|marker| {
-                        matches!(marker.state, MarkerState::Clean { snapshot } if Some(snapshot) == suspended)
-                    });
-            if !unchanged {
+            if suspended.is_none() {
                 return Err(NodeError::RanDuringMove {
                     job: id,
                     target: to,
                 });
+            }
+            // A workspace an earlier tenure left is not the job's and is
+            // not what was copied; settle leaves it where it is.
+            if let Some(marker) = job.marker()?
+                && marker.is_current(token.epoch, job.latest()).await
+            {
+                match marker.state {
+                    MarkerState::Clean { snapshot, .. } if Some(snapshot) == suspended => {
+                        if !marker.is_unchanged().await {
+                            return Err(NodeError::ChangedDuringMove {
+                                job: id,
+                                root: marker.root,
+                                target: to,
+                            });
+                        }
+                    }
+                    _ => {
+                        return Err(NodeError::RanDuringMove {
+                            job: id,
+                            target: to,
+                        });
+                    }
+                }
             }
             let move_id = clock::move_id();
             let record = job.ledger().start_move(
@@ -1190,12 +1218,14 @@ impl Node {
         if forked {
             return Ok(());
         }
-        // A copy that matches a published snapshot holds nothing the job
-        // lacks, so it leaves the root; a copy with changes since the last
-        // snapshot stays where it is, an orphan the user decides about.
+        // A copy that still matches a published snapshot holds nothing the
+        // job lacks, so it leaves the root; a copy with changes since the
+        // last snapshot, by a harness or by hand, stays where it is, an
+        // orphan the user decides about.
         if let LeaseView::Departed { epoch, .. } | LeaseView::Replica { epoch, .. } = view
             && let Some(marker) = job.reconcile_marker()?
             && matches!(marker.state, MarkerState::Clean { .. })
+            && (marker.root.symlink_metadata().is_err() || marker.is_unchanged().await)
         {
             let dest =
                 paths::departed_copy(&marker.root, epoch).ok_or_else(|| no_parent(&marker.root))?;
@@ -1499,7 +1529,7 @@ impl Node {
     ) -> Result<PathBuf, NodeError> {
         let id = job.id();
         let marker = match job.reconcile_marker()? {
-            Some(marker) if !marker.is_current(epoch, job.latest()) => {
+            Some(marker) if !marker.is_current(epoch, job.latest()).await => {
                 self.set_orphan_aside(job, &marker, epoch, out).await?;
                 None
             }
@@ -1578,9 +1608,10 @@ impl Node {
         if has_harness_state {
             self.restore_harness(job, &root, path_var, out).await?;
         }
+        let tree = TreeStamp::measure(&root).await;
         job.set_marker(&Marker {
             root: root.clone(),
-            state: MarkerState::Clean { snapshot },
+            state: MarkerState::Clean { snapshot, tree },
             epoch,
         })?;
         Ok(root)
@@ -2033,7 +2064,7 @@ fn marker_word(state: &MarkerState) -> String {
             "live: the harness may have changed it since the last snapshot".to_owned()
         }
         MarkerState::Suspending { .. } => "a suspend did not finish".to_owned(),
-        MarkerState::Clean { snapshot } => format!("clean at snapshot {snapshot}"),
+        MarkerState::Clean { snapshot, .. } => format!("clean at snapshot {snapshot}"),
         MarkerState::Restoring { snapshot } => format!("a restore of {snapshot} did not finish"),
     }
 }
@@ -2061,6 +2092,7 @@ fn describe(kind: &EventKind) -> String {
     }
 }
 
+#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use std::os::unix::process::CommandExt;

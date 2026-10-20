@@ -13,6 +13,7 @@ publish.workspace = true
 faults = []
 
 [dependencies]
+blake3 = "1.8"
 fabric-core = { path = "../fabric-core" }
 fabric-env = { path = "../fabric-env" }
 fabric-harness = { path = "../fabric-harness" }
