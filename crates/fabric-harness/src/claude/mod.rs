@@ -719,9 +719,14 @@ mod tests {
 
     impl TrustFixture {
         fn new(config: Option<&dyn Fn(&Path) -> String>) -> Self {
+            Self::named("work", config)
+        }
+
+        /// A fixture whose workspace directory is `<home>/a/<name>`.
+        fn named(name: &str, config: Option<&dyn Fn(&Path) -> String>) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let home = std::fs::canonicalize(dir.path()).unwrap();
-            let work = home.join("a").join("work");
+            let work = home.join("a").join(name);
             std::fs::create_dir_all(&work).unwrap();
             if let Some(config) = config {
                 std::fs::write(home.join(".claude.json"), config(&work)).unwrap();
@@ -842,6 +847,29 @@ mod tests {
             before,
             "Claude owns the file while it runs"
         );
+    }
+
+    #[tokio::test]
+    async fn a_workspace_stored_in_nfd_is_refused_before_trust_is_read() {
+        let decomposed = "masau\u{308}stu\u{308}";
+        let fixture = TrustFixture::named(
+            decomposed,
+            Some(&|_: &Path| r#"{"projects":{}}"#.to_owned()),
+        );
+        let before = fixture.config_bytes();
+        let (outcome, asked) = fixture.preseed(Vec::new()).await;
+        assert!(
+            matches!(
+                outcome,
+                Err(HarnessError::Malformed {
+                    what: crate::error::Input::WorkspacePath,
+                    ..
+                })
+            ),
+            "Claude keys trust by the NFC path, so an NFD root must not be written: {outcome:?}"
+        );
+        assert!(!asked);
+        assert_eq!(fixture.config_bytes(), before);
     }
 
     #[tokio::test]

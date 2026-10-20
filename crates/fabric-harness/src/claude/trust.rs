@@ -20,6 +20,13 @@
 //! never reports trust that Claude would not find. Claude also checks the
 //! main checkout of a git worktree; `trusted_by` does not, which at worst
 //! writes a key Claude did not need.
+//!
+//! Claude spells every key, and its working directory, as the NFC form of
+//! the real path (`normalize("NFC")` in the same bundle), while APFS hands
+//! back a name in the form it was stored in. The root here is an
+//! `AbsPath`, which is NFC by type (ADR 0004), and a workspace whose
+//! physical path is not NFC is refused before this module runs, so the
+//! keys Fabric reads and writes are the ones Claude looks up.
 
 use std::path::{Path, PathBuf};
 
