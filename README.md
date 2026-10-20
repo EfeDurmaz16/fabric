@@ -73,6 +73,8 @@ fabric job suspend <job>                 # stops the harness if it still runs, s
 fabric job move <job> --to fab1<air-id>  # the Air owns the job from here; the Pro's copy never runs again
 ```
 
+Before anything changes hands, `move` prints one line per ignored path of the snapshot it takes, and why: `carry`, `rebuild` with the setup step that makes it again on the Air, `refuse`, or `leave` for a secret or for build output made for another os or arch. A `node_modules` or `.venv` with no lockfile always travels, because nothing on the Air could make it again. A refusal stops the move, and `--force` carries the path as it is. `fabric doctor --peer fab1<air-id> --job <job>` prints the same lines for the latest snapshot, and `fabric job status <job>` and `move` say when the snapshot holds no harness session, so the conversation would not continue on the Air.
+
 On the Air:
 
 ```sh

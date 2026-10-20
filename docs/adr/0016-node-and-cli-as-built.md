@@ -119,6 +119,8 @@ The root is refused under `~/Library/Mobile Documents` everywhere, and under `~/
 
 Capture measures carry keys with `fabric-env` detection: a cache detection does not know is `Unmeasured` and never carried. A restore cannot run detection before the workspace exists, so it measures the key of the same shape as the source's: the same package manager, its own versions and paths. Each cache prints one line, carried or rebuilt and why.
 
+2026-10-21: the first sentence above lost a hand-made `node_modules` on the gate (finding F6). A cache detection does not know now records what makes it again, nothing for a dependency tree and the next build for build output, and is decided by the rule of ADR 0012's 2026-10-21 amendment; doctor, move and resume print one line per path from the same function, `fabricd::carry::decide`. `fabric job status` and `fabric job move` say when the snapshot holds no harness session (finding F9).
+
 ### Decisions as ledger events
 
 `fabric job approve` and `reject` append `DecisionRecorded { text: "approved" }` or `"rejected"`, with the user's note after a colon. ADR 0002 makes a new event kind a format version bump; a typed approval record waits for the UI that would read it.
