@@ -581,6 +581,9 @@ impl ClaudeCode {
         out: &Path,
         version: Option<String>,
     ) -> Result<StateManifest, HarnessError> {
+        // Every walk below starts at the config directory and would follow
+        // it, or a directory above it, if it were a link.
+        pipeline::refuse_symlinks(self.home_dir(), &self.config_dir)?;
         let mut counts = RedactionCounts::new();
         let sources = self.sources_for(root, session, &mut counts)?;
         let records = self.departure(session);
