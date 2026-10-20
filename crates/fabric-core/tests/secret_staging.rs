@@ -17,9 +17,9 @@ use fabric_core::secret::{
     TrackedSecretChanged, TrackedSecrets, Tracking,
 };
 
-/// Committed before the working tree changes. The first five are the
-/// failure from the review: source and template files whose names an
-/// over-broad pattern matched, so their edits never reached `W`.
+/// Committed before the working tree changes. The first five are source
+/// and template files whose names an over-broad pattern would match; their
+/// edits must reach `W`.
 const COMMITTED: &[(&str, &str)] = &[
     (".env.example", "A=\n"),
     ("src/id_test.go", "package src\n"),
