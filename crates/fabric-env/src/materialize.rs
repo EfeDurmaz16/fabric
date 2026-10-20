@@ -31,7 +31,10 @@
 //! steps run on every resume; declaring a `[[cache]]` is how a user makes
 //! them skip. A `node_modules` the user installed by hand has no sentinel,
 //! so the first resume after it installs once more; that is the price of
-//! never trusting a tree no step was seen to finish.
+//! never trusting a tree no step was seen to finish. A cache a planned step
+//! fills that is a link, lies under one, or is not a directory stops the
+//! plan: the installer would follow the link and fill a directory outside
+//! the workspace.
 //!
 //! The restore that runs before materialize writes a carried cache only when
 //! its carry key matches this node (ADR 0012), so what is on disk is what
@@ -199,6 +202,14 @@ pub enum MaterializeError {
         programs: Vec<(usize, ProgramName)>,
         /// Every declared variable that is not set.
         env: Vec<EnvVarName>,
+    },
+    /// A cache a planned step fills is a link, lies under one, or is not a directory, so the step would write through it.
+    #[error(
+        "cache `{path}` is a link, lies under one, or is not a directory, and a setup step would write through it; nothing ran; replace it with a real directory or remove it"
+    )]
+    CacheNotADirectory {
+        /// The cache path.
+        path: RelPath,
     },
     /// A step's program did not start.
     #[error("setup step {index} (`{program}`) did not start")]
@@ -596,6 +607,7 @@ pub fn plan(
         });
     }
     assign_sentinels(detected, &mut steps);
+    refuse_linked_fills(&caches, &steps)?;
 
     let missing_env = spec
         .env_var_names
@@ -626,6 +638,28 @@ fn assign_sentinels(detected: &Detection, steps: &mut [PlannedStep]) {
             steps[last].sentinels.write.push(cache.path.clone());
         }
     }
+}
+
+/// Refuses when a planned step would fill a cache that is a link, lies under one, or is not a directory.
+///
+/// An installer follows the link: `uv venv --allow-existing .venv` with
+/// `.venv -> ~/venvs/other` initializes that directory, and the install
+/// after it fills it, so a resume would change an environment outside the
+/// workspace. Each cache a planned step fills is cleared by exactly one of
+/// them, so the clear lists name each such cache once.
+fn refuse_linked_fills(
+    caches: &[CacheReport],
+    steps: &[PlannedStep],
+) -> Result<(), MaterializeError> {
+    for path in steps.iter().flat_map(|step| &step.sentinels.clear) {
+        if caches
+            .iter()
+            .any(|c| &c.path == path && c.health == CacheHealth::NotADirectory)
+        {
+            return Err(MaterializeError::CacheNotADirectory { path: path.clone() });
+        }
+    }
+    Ok(())
 }
 
 /// What lies at a cache path, read without following a link in any component.
@@ -701,9 +735,10 @@ fn clear_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
 
 /// Writes the sentinel of the cache at `path` when the steps left a real directory there, reached through real directories.
 ///
-/// A cache the steps did not create, or one that is or lies under a link,
-/// gets no sentinel: the next plan sees it missing or not a directory and
-/// fills it again, which costs time and never writes outside the workspace.
+/// A cache the steps did not create, or one they left as or under a link,
+/// gets no sentinel: the next plan sees it missing, or refuses it as not a
+/// directory, and never writes outside the workspace. `plan` refuses a
+/// filled cache that is a link before any step runs.
 /// A regular file the steps left at the sentinel's name, such as one
 /// unpacked from an archive of a whole cache, is kept: the steps exited 0,
 /// which is all the sentinel says. Anything else there, a link included,

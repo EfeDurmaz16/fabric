@@ -657,10 +657,11 @@ fn a_missing_target_does_not_run_a_declared_install() {
     assert_eq!(planned.steps().len(), 1);
 }
 
-/// A cache under a linked directory lies outside the workspace: it is never
-/// judged healthy, and its sentinel is neither written nor removed there.
+/// A cache under a linked directory lies outside the workspace. A step
+/// that fills it would follow the link, as `uv venv` does with a linked
+/// `.venv`, so the plan refuses and nothing beyond the link changes.
 #[test]
-fn a_cache_under_a_linked_directory_gets_no_sentinel() {
+fn a_step_never_fills_a_cache_through_a_link() {
     let outside = tempfile::tempdir().unwrap();
     write(outside.path(), &[("out/x", ""), ("kept/x", "")]).unwrap();
     write(outside.path(), &[("kept/.fabric-installed", "")]).unwrap();
@@ -679,22 +680,30 @@ path = "web/kept"
 class = "build"
 
 [[setup]]
-program = "true"
+program = "touch"
+args = ["web/out/ran"]
 "#,
     )
     .unwrap();
-    let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
-    assert!(
-        planned
-            .caches()
-            .iter()
-            .all(|c| c.health == CacheHealth::NotADirectory),
-        "{:?}",
-        planned.caches()
-    );
-    planned.ready().unwrap().execute(&lock).unwrap();
+    match plan(&detected, &lock, &NodeEnv::current()) {
+        Err(MaterializeError::CacheNotADirectory { path }) => {
+            assert_eq!(path.as_str(), "web/kept");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!outside.path().join("out/ran").exists());
     assert!(!outside.path().join("out").join(SENTINEL).exists());
     assert!(outside.path().join("kept").join(SENTINEL).exists());
+
+    symlink(outside.path().join("out"), dir.path().join(".venv")).unwrap();
+    fs::remove_dir_all(dir.path().join(".fabric")).unwrap();
+    fs::remove_file(dir.path().join("web")).unwrap();
+    write(dir.path(), &[("requirements.txt", "")]).unwrap();
+    let detected = detect(dir.path(), &[]).unwrap();
+    assert!(matches!(
+        plan(&detected, &lock, &NodeEnv::current()),
+        Err(MaterializeError::CacheNotADirectory { .. })
+    ));
 }
 
 /// A lock directory inside the workspace is one the workspace can delete,
