@@ -315,6 +315,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "fabricd"
+version = "0.1.0"
+dependencies = [
+ "fabric-core",
+ "fabric-env",
+ "fabric-harness",
+ "fabric-net",
+ "fabric-store",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "ulid",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1247,6 +1267,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "947dde63b6d514cc5e044edad4e0ca7261afd1099d16c83d942cb2b2f348689c"
 dependencies = [
+ "rand",
  "web-time",
 ]
 
