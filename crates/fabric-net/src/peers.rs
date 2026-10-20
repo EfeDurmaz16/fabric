@@ -25,6 +25,8 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -366,6 +368,10 @@ impl PeerBook {
 
     /// Writes the book to `path` whole: a temporary file only this call names, synced, renamed over, directory synced.
     ///
+    /// The temporary file is made with mode 0600 whatever the umask, so the
+    /// book that is renamed into place never lets another local user add a
+    /// node to the trust list.
+    ///
     /// Private on purpose: it takes no lock, so only `Peers::update`, which
     /// reloads the file under the lock first, may call it. A public save of
     /// a stale book would undo another process's unpair.
@@ -376,7 +382,11 @@ impl PeerBook {
         };
         let tmp = temp_sibling(path);
         let written = (|| {
-            let mut file = File::options().write(true).create_new(true).open(&tmp)?;
+            let mut options = File::options();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut file = options.open(&tmp)?;
             file.write_all(self.to_string().as_bytes())?;
             file.sync_all()?;
             checkpoint::reached("peers.after_tmp");
@@ -757,6 +767,21 @@ mod tests {
         book.pair(node(7), None);
         assert!(book.unpair(node(7)));
         assert!(!book.unpair(node(7)));
+    }
+
+    /// The book is the trust list, so a save leaves it writable by its
+    /// owner only, even when the umask would let others write it.
+    #[cfg(unix)]
+    #[test]
+    fn a_saved_book_is_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers");
+        let peers = Peers::open(&path).unwrap();
+        peers.update(|b| b.pair(node(1), None)).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "mode {mode:o}");
     }
 
     #[test]
