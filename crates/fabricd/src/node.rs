@@ -333,12 +333,14 @@ impl Node {
         }
     }
 
-    /// Settles every job after a restart: fences stray harnesses, moves
-    /// departed copies aside and asks the target of an open move for its decision.
+    /// Settles every job after a restart: learns what the paired peers wrote
+    /// while this node was away, fences stray harnesses, moves departed copies
+    /// aside and asks the target of an open move for its decision.
     async fn recover(self: Arc<Self>) {
         let ids: Vec<JobId> = self.jobs.lock().await.keys().copied().collect();
         for id in ids {
             let mut out = Out::default();
+            self.catch_up(id, &mut out).await;
             if let Err(e) = self.settle_job(id, &mut out).await {
                 tracing::warn!(job = %id, error = %e, "recovery left the job as it was");
             }
@@ -347,6 +349,23 @@ impl Node {
             }
             for line in out.lines {
                 tracing::info!(job = %id, "{line}");
+            }
+        }
+    }
+
+    /// Fetches what each paired peer holds after this node's head, so a node
+    /// that slept learns a steal or a decision made while it was away (ADR 0003).
+    async fn catch_up(self: &Arc<Self>, id: JobId, out: &mut Out) {
+        let peers: Vec<NodeId> = self
+            .peers
+            .snapshot()
+            .iter()
+            .filter(|entry| !entry.addrs().is_empty())
+            .map(fabric_net::peers::PeerEntry::node)
+            .collect();
+        for peer in peers {
+            if let Err(e) = self.pull_records(id, peer).await {
+                out.say(format!("did not catch up with {peer}: {e}"));
             }
         }
     }

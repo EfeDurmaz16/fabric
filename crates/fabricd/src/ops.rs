@@ -1150,7 +1150,11 @@ impl Node {
     }
 
     /// Fetches the records `holder` has after this node's head; makes the job if it is new here.
-    async fn pull_records(self: &Arc<Self>, id: JobId, holder: NodeId) -> Result<(), NodeError> {
+    pub(crate) async fn pull_records(
+        self: &Arc<Self>,
+        id: JobId,
+        holder: NodeId,
+    ) -> Result<(), NodeError> {
         loop {
             let (after, epoch) = match self.job(id).await {
                 Ok(job) => {
