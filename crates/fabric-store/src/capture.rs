@@ -29,7 +29,7 @@ use fabric_core::snapshot::{
 
 use crate::durable::{self, TempFile};
 use crate::git::{Git, GitError};
-use crate::objects::ObjectError;
+use crate::objects::{ObjectError, StoredFile};
 use crate::policy::{Class, IgnorePolicy, Markers};
 use crate::store::{Store, StoreError};
 
@@ -264,7 +264,7 @@ pub enum CaptureError {
         /// The offending paths.
         paths: Vec<RelPath>,
     },
-    /// A path vanished or was replaced between its listing and its read; capture again.
+    /// A path vanished, was replaced or was written to between its listing and its read; capture again.
     #[error("{path} changed while capture ran")]
     WorkspaceChanged {
         /// The path.
@@ -398,6 +398,26 @@ fn open_listed(full: &Path, found: &Found) -> Result<File, CaptureError> {
     Ok(file)
 }
 
+/// Stores a listed regular file, refusing it if it changed in place while it was read.
+///
+/// Only the inode is checked before the read, so the size and mtime of the
+/// open file are compared with the listing after it: a write during the
+/// read would otherwise store a torn file under the name.
+fn store_listed(store: &Store, full: &Path, found: &Found) -> Result<StoredFile, CaptureError> {
+    let file = open_listed(full, found)?;
+    let stored = store.objects().put_reader(&file, full)?;
+    let after = file.metadata().map_err(|e| io_err(full, e))?;
+    if stored.size != found.meta.len()
+        || after.len() != found.meta.len()
+        || mtime_ns(&after) != mtime_ns(&found.meta)
+    {
+        return Err(CaptureError::WorkspaceChanged {
+            path: found.rel.clone(),
+        });
+    }
+    Ok(stored)
+}
+
 /// What `list_tree` found.
 #[derive(Default)]
 struct Listing {
@@ -490,8 +510,7 @@ impl Capturer<'_> {
             }
             FoundKind::Dir => EntryKind::Dir,
             FoundKind::File => {
-                let file = open_listed(&full, found)?;
-                let stored = self.store.objects().put_reader(file, &full)?;
+                let stored = store_listed(self.store, &full, found)?;
                 self.report.files += 1;
                 self.report.bytes += stored.size;
                 self.report.new_objects += stored.new_objects;
@@ -1543,6 +1562,7 @@ fn capture_git(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::objects::ChunkParams;
 
     fn rel(s: &str) -> RelPath {
         RelPath::parse(s).unwrap()
@@ -1577,6 +1597,20 @@ mod tests {
         fs::write(&path, "another file").unwrap();
         assert!(matches!(
             open_listed(&path, &found),
+            Err(CaptureError::WorkspaceChanged { .. })
+        ));
+    }
+
+    #[test]
+    fn a_file_changed_in_place_after_its_listing_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(&dir.path().join("store"), ChunkParams::DEFAULT).unwrap();
+        let path = dir.path().join("notes.txt");
+        fs::write(&path, "notes").unwrap();
+        let found = Found::new(rel("notes.txt"), fs::symlink_metadata(&path).unwrap()).unwrap();
+        fs::write(&path, "notes, rewritten").unwrap();
+        assert!(matches!(
+            store_listed(&store, &path, &found),
             Err(CaptureError::WorkspaceChanged { .. })
         ));
     }
