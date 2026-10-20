@@ -387,6 +387,32 @@ impl ObjectStore {
         Ok(file)
     }
 
+    /// Returns the length an object decompresses to, read from its frame header.
+    ///
+    /// The header is not checked against the bytes here; `read` does that.
+    /// A header that records no length, or one above `MAX_OBJECT_LEN`, is corrupt.
+    pub(crate) fn content_len(&self, id: ChunkId) -> Result<u64, ObjectError> {
+        /// `ZSTD_FRAMEHEADERSIZE_MAX`: no frame header is longer.
+        const FRAME_HEADER_MAX: u64 = 18;
+        let path = self.object_path(id);
+        let file = match open_regular(&path) {
+            Ok(Some(file)) => file,
+            Ok(None) => return Err(ObjectError::Corrupt { id }),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(ObjectError::Missing { id });
+            }
+            Err(e) => return Err(io_err(&path, e)),
+        };
+        let mut head = Vec::new();
+        file.take(FRAME_HEADER_MAX)
+            .read_to_end(&mut head)
+            .map_err(|e| io_err(&path, e))?;
+        match zstd::zstd_safe::get_frame_content_size(&head) {
+            Ok(Some(len)) if len <= u64::from(MAX_OBJECT_LEN) => Ok(len),
+            _ => Err(ObjectError::Corrupt { id }),
+        }
+    }
+
     /// Reads and verifies one object.
     ///
     /// No frame of `MAX_OBJECT_LEN` bytes compresses to more than zstd's

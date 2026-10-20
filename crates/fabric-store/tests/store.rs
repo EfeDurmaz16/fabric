@@ -123,6 +123,31 @@ fn publish_refuses_a_manifest_that_names_a_missing_object() {
 }
 
 #[test]
+fn publish_refuses_a_file_whose_objects_do_not_add_up_to_its_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::create(dir.path(), params().unwrap()).unwrap();
+    let real = file_entry(&store, "real", b"seven b").unwrap();
+    let chunks = chunks_of(&real).unwrap();
+    for (size, chunks) in [(8, chunks), (5, Vec::new())] {
+        let m = manifest(
+            vec![Entry {
+                rel_path: RelPath::parse("short").unwrap(),
+                kind: EntryKind::File { size, chunks },
+                mode: Mode::new(0o644).unwrap(),
+                mtime_ns: 0,
+            }],
+            2,
+        )
+        .unwrap();
+        assert!(matches!(
+            store.publish(&m),
+            Err(StoreError::SizeMismatch { size: s, .. }) if s == size
+        ));
+    }
+    assert!(store.snapshots().unwrap().is_empty());
+}
+
+#[test]
 fn publish_refuses_a_manifest_no_reader_would_decode() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::create(dir.path(), params().unwrap()).unwrap();

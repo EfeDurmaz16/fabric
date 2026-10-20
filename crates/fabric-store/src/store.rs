@@ -5,7 +5,7 @@
 //! before it deletes the file, and `check` can prove the rule holds. Exactly
 //! one process holds a store open at a time (ADR 0014, One writer).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -13,6 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use fabric_core::id::{ChunkId, SnapshotId};
+use fabric_core::path::RelPath;
 use fabric_core::snapshot::{EntryKind, MAX_MANIFEST_LEN, ManifestError, SnapshotManifest};
 
 use crate::catalog::{Catalog, CatalogError, ChunkRef, Role, SnapshotRow};
@@ -81,6 +82,16 @@ pub enum StoreError {
     MissingBundleBase {
         /// The base the manifest names.
         base: SnapshotId,
+    },
+    /// A file entry's objects do not add up to the size it records, so no restore could write it.
+    #[error("{path}: the objects hold {held} bytes but the entry records {size}")]
+    SizeMismatch {
+        /// The entry's path.
+        path: RelPath,
+        /// The size the entry records.
+        size: u64,
+        /// The bytes its objects decompress to.
+        held: u64,
     },
     /// A later snapshot's bundle still needs the snapshot's refs.
     #[error("snapshot {base} is the bundle base of a later snapshot")]
@@ -297,6 +308,7 @@ impl Store {
                 stored_len,
             });
         }
+        self.check_sizes(manifest)?;
         let stored = self.objects.put_bytes(&bytes)?;
         let mut manifest_refs = Vec::with_capacity(stored.chunks.len());
         for chunk in stored.chunks {
@@ -324,6 +336,42 @@ impl Store {
         checkpoint::reached("publish.after_commit");
         tracing::info!(snapshot = %id, objects = data.len(), "published");
         Ok(id)
+    }
+
+    /// Refuses a file entry whose objects do not decompress to the size it records.
+    ///
+    /// Restore checks the same sum after it writes the file; a snapshot that
+    /// fails it would publish and never restore.
+    fn check_sizes(&self, manifest: &SnapshotManifest) -> Result<(), StoreError> {
+        let mut lens: HashMap<ChunkId, u64> = HashMap::new();
+        for entry in manifest
+            .files
+            .iter()
+            .chain(manifest.harness_state.entries.iter())
+        {
+            let EntryKind::File { size, chunks } = &entry.kind else {
+                continue;
+            };
+            let mut held = 0u64;
+            for chunk in chunks {
+                let len = if let Some(len) = lens.get(chunk) {
+                    *len
+                } else {
+                    let len = self.objects.content_len(*chunk)?;
+                    lens.insert(*chunk, len);
+                    len
+                };
+                held = held.saturating_add(len);
+            }
+            if held != *size {
+                return Err(StoreError::SizeMismatch {
+                    path: entry.rel_path.clone(),
+                    size: *size,
+                    held,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Makes an object on disk safe for a catalog row to name.
