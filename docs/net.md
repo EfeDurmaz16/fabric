@@ -45,7 +45,9 @@ also ends a connection that is already open, within 5 s. A book that does
 not parse pairs no one until it is fixed, and the error names the line. A
 line holds at most 8 distinct addresses, and a node appears on one line.
 The addresses are the ones pasted at pairing; a connection updates only the
-last-seen time, never the list.
+last-seen time, never the list. Every save writes the book with mode 0600,
+and a book that a group or other users can write pairs no one until it is
+`chmod 600` again.
 
 A short pairing code, where one side shows a few words and the other types
 them to fetch and confirm the id over the connection, is a follow-up. It
