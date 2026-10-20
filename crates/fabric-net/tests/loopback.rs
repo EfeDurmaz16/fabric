@@ -133,7 +133,9 @@ impl Service for FakeService {
                 let _ = stop.send(()).await;
                 std::future::pending::<()>().await;
             }
-            self.chunks.get(&id).cloned().ok_or(Fault::UnknownChunk(id))
+            let bytes = self.chunks.get(&id).ok_or(Fault::UnknownChunk(id))?;
+            zstd::bulk::compress(bytes, 3)
+                .map_err(|err| Fault::Internal(FaultText::truncated(&err.to_string())))
         })
     }
 }
@@ -513,7 +515,8 @@ async fn a_chunk_transfer_resumes_after_the_connection_drops() -> TestResult {
         let mut got = BTreeMap::new();
         let interrupted = loop {
             match stream.next().await {
-                Ok(Some((id, bytes))) => {
+                Ok(Some(chunk)) => {
+                    let (id, _, bytes) = chunk.into_parts();
                     got.insert(id, bytes);
                 }
                 Ok(None) => break None,
@@ -551,7 +554,8 @@ async fn a_chunk_transfer_resumes_after_the_connection_drops() -> TestResult {
             .want_chunks(ChunkBatch::new(missing)?, Duration::from_secs(5))
             .await?;
         let mut resumed = 0;
-        while let Some((id, bytes)) = stream.next().await? {
+        while let Some(chunk) = stream.next().await? {
+            let (id, _, bytes) = chunk.into_parts();
             assert!(
                 got.insert(id, bytes).is_none(),
                 "{kind}: a chunk arrived twice"

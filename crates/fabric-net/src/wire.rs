@@ -451,12 +451,12 @@ pub enum ResponseBody {
     Job(JobResponse),
     /// The manifest's byte length and ordered chunk list.
     ManifestChunks(ManifestChunks),
-    /// One chunk; the receiver trusts it only after hashing the bytes.
+    /// One chunk as the store keeps it; the receiver trusts it only after it decompresses and hashes to `id`.
     Chunk {
         /// The chunk.
         id: ChunkId,
-        /// Its uncompressed bytes.
-        bytes: Vec<u8>,
+        /// One zstd frame of its bytes (ADR 0004), sent as stored.
+        zstd: Vec<u8>,
     },
     /// Every requested chunk was sent.
     ChunksDone,
@@ -690,7 +690,7 @@ mod tests {
                     ManifestChunks::new(len, ids).unwrap()
                 )),
             (bytes32(ChunkId::from_bytes), vec(any::<u8>(), 0..64))
-                .prop_map(|(id, bytes)| ResponseBody::Chunk { id, bytes }),
+                .prop_map(|(id, zstd)| ResponseBody::Chunk { id, zstd }),
             Just(ResponseBody::ChunksDone),
             fault().prop_map(ResponseBody::Fault),
         ]

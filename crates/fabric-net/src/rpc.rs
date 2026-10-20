@@ -25,7 +25,9 @@ use fabric_core::lease::FencingToken;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
-use crate::frame::{FrameError, MAX_BULK_FRAME, MAX_CONTROL_FRAME, read_frame, write_frame};
+use crate::frame::{
+    FrameError, MAX_BULK_FRAME, MAX_CHUNK_BYTES, MAX_CONTROL_FRAME, read_frame, write_frame,
+};
 use crate::idle::IdleReader;
 use crate::transport::{Connection, Stream, TransportError, TransportKind};
 use crate::wire::{
@@ -87,8 +89,8 @@ pub enum RpcError {
         /// The kind received.
         got: &'static str,
     },
-    /// The chunk's bytes do not hash to its id; it is dropped.
-    #[error("chunk {id} did not hash to its id")]
+    /// The chunk does not decompress, within `MAX_CHUNK_BYTES`, to bytes that hash to its id; it is dropped.
+    #[error("chunk {id} did not decompress to bytes that hash to its id")]
     ChunkMismatch {
         /// The id claimed.
         id: ChunkId,
@@ -133,8 +135,9 @@ pub trait Service: Send + Sync {
         peer: NodeId,
         snapshot: SnapshotId,
     ) -> BoxFuture<'_, Result<ManifestChunks, Fault>>;
-    /// Returns the bytes of one chunk for `peer`.
+    /// Returns one chunk for `peer` as the store keeps it: one zstd frame of its bytes (ADR 0004).
     ///
+    /// It goes out as is; the receiver decompresses and checks it.
     /// `Fault::UnknownChunk` says this node does not hold it; a chunk it
     /// holds and could not read is `Fault::Internal`, so the peer never
     /// mistakes a failed read for a missing chunk.
@@ -482,6 +485,59 @@ impl Session {
     }
 }
 
+/// One chunk that arrived and was checked: its zstd frame decompresses to at
+/// most `MAX_CHUNK_BYTES` bytes, and those bytes hash to its id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedChunk {
+    id: ChunkId,
+    stored: Vec<u8>,
+    bytes: Vec<u8>,
+}
+
+impl VerifiedChunk {
+    /// Decompresses `stored` within the chunk bound and keeps it only if the bytes hash to `id`.
+    ///
+    /// The size the frame declares is checked before anything is
+    /// decompressed, and a frame that declares none is decompressed into at
+    /// most `MAX_CHUNK_BYTES`, so a small frame cannot make this node
+    /// allocate more than one chunk.
+    fn check(id: ChunkId, stored: Vec<u8>) -> Option<Self> {
+        let capacity = match zstd::zstd_safe::get_frame_content_size(&stored) {
+            Ok(Some(declared)) => usize::try_from(declared)
+                .ok()
+                .filter(|n| *n <= MAX_CHUNK_BYTES)?,
+            Ok(None) => MAX_CHUNK_BYTES,
+            Err(_) => return None,
+        };
+        let bytes = zstd::bulk::decompress(&stored, capacity).ok()?;
+        (ChunkId::of(&bytes) == id).then_some(Self { id, stored, bytes })
+    }
+
+    /// The chunk's id: blake3 of its bytes.
+    #[must_use]
+    pub fn id(&self) -> ChunkId {
+        self.id
+    }
+
+    /// The chunk's bytes.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The zstd frame as it arrived, which a store can keep as is.
+    #[must_use]
+    pub fn stored(&self) -> &[u8] {
+        &self.stored
+    }
+
+    /// Returns the id, the zstd frame and the bytes.
+    #[must_use]
+    pub fn into_parts(self) -> (ChunkId, Vec<u8>, Vec<u8>) {
+        (self.id, self.stored, self.bytes)
+    }
+}
+
 /// Where a chunk stream is: reading, done, or ended by an error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Progress {
@@ -529,11 +585,11 @@ impl ChunkStream {
         }
     }
 
-    /// Returns the next verified chunk, or `None` once the peer sent every asked chunk.
+    /// Returns the next chunk, verified, or `None` once the peer sent every asked chunk.
     ///
     /// Cancelling the call ends the stream, as an error does: it may have
     /// stopped inside a frame, so the next call returns `Interrupted`.
-    pub async fn next(&mut self) -> Result<Option<(ChunkId, Vec<u8>)>, RpcError> {
+    pub async fn next(&mut self) -> Result<Option<VerifiedChunk>, RpcError> {
         match self.progress {
             Progress::Open => {}
             Progress::Done => return Ok(None),
@@ -550,7 +606,7 @@ impl ChunkStream {
         next
     }
 
-    async fn read_one(&mut self) -> Result<Option<(ChunkId, Vec<u8>)>, RpcError> {
+    async fn read_one(&mut self) -> Result<Option<VerifiedChunk>, RpcError> {
         let body = match read_response(&mut self.recv, self.id, MAX_BULK_FRAME).await {
             Err(RpcError::Frame(FrameError::Io(err))) if err.kind() == io::ErrorKind::TimedOut => {
                 return Err(RpcError::Deadline(self.idle));
@@ -558,15 +614,15 @@ impl ChunkStream {
             other => other?,
         };
         match body {
-            ResponseBody::Chunk { id, bytes } => {
+            ResponseBody::Chunk { id, zstd } => {
                 if !self.wanted.remove(&id) {
                     return Err(RpcError::UnrequestedChunk { id });
                 }
-                if ChunkId::of(&bytes) != id {
+                let Some(chunk) = VerifiedChunk::check(id, zstd) else {
                     self.wanted.insert(id);
                     return Err(RpcError::ChunkMismatch { id });
-                }
-                Ok(Some((id, bytes)))
+                };
+                Ok(Some(chunk))
             }
             ResponseBody::ChunksDone => {
                 if self.wanted.is_empty() {
@@ -650,7 +706,7 @@ async fn send_chunks(
 ) -> Result<(), RpcError> {
     for chunk in batch.ids() {
         let body = match timeout(budget, service.chunk(peer, *chunk)).await {
-            Ok(Ok(bytes)) => ResponseBody::Chunk { id: *chunk, bytes },
+            Ok(Ok(zstd)) => ResponseBody::Chunk { id: *chunk, zstd },
             Ok(Err(fault)) => ResponseBody::Fault(fault),
             Err(_) => ResponseBody::Fault(Fault::Deadline),
         };
@@ -684,6 +740,14 @@ mod tests {
         bytes
     }
 
+    /// A chunk response carrying `bytes` as zstd stores them.
+    fn chunk(id: ChunkId, bytes: &[u8]) -> ResponseBody {
+        ResponseBody::Chunk {
+            id,
+            zstd: zstd::bulk::compress(bytes, 3).unwrap(),
+        }
+    }
+
     fn stream_over(recv: tokio::io::DuplexStream, ids: &[ChunkId]) -> ChunkStream {
         ChunkStream::new(
             Box::new(recv),
@@ -701,14 +765,7 @@ mod tests {
         let id = ChunkId::of(&bytes);
         let (mut send, recv) = tokio::io::duplex(1 << 20);
         let mut stream = stream_over(recv, &[id]);
-        let wire = [
-            frame(ResponseBody::Chunk {
-                id,
-                bytes: bytes.clone(),
-            }),
-            frame(ResponseBody::ChunksDone),
-        ]
-        .concat();
+        let wire = [frame(chunk(id, &bytes)), frame(ResponseBody::ChunksDone)].concat();
         tokio::spawn(async move {
             for piece in wire.chunks(wire.len() / 16) {
                 tokio::time::sleep(IDLE / 3).await;
@@ -716,7 +773,7 @@ mod tests {
             }
         });
         let started = tokio::time::Instant::now();
-        assert_eq!(stream.next().await.unwrap(), Some((id, bytes)));
+        assert_eq!(stream.next().await.unwrap().unwrap().bytes(), bytes);
         assert!(started.elapsed() > IDLE * 4, "the link was not slow");
         assert!(stream.next().await.unwrap().is_none());
     }
@@ -729,10 +786,7 @@ mod tests {
         let id = ChunkId::of(b"x");
         let (mut send, recv) = tokio::io::duplex(1 << 10);
         let mut stream = stream_over(recv, &[id]);
-        let whole = frame(ResponseBody::Chunk {
-            id,
-            bytes: b"x".to_vec(),
-        });
+        let whole = frame(chunk(id, b"x"));
         send.write_all(&whole[..3]).await.unwrap();
         let cancelled = tokio::time::timeout(IDLE / 5, stream.next()).await;
         assert!(cancelled.is_err(), "the call must still be waiting");
@@ -760,16 +814,26 @@ mod tests {
         let id = ChunkId::of(b"x");
         let (mut send, recv) = tokio::io::duplex(1 << 10);
         let mut stream = stream_over(recv, &[id]);
-        send.write_all(&frame(ResponseBody::Chunk {
-            id,
-            bytes: b"y".to_vec(),
-        }))
-        .await
-        .unwrap();
+        send.write_all(&frame(chunk(id, b"y"))).await.unwrap();
         assert!(
             matches!(stream.next().await, Err(RpcError::ChunkMismatch { id: bad }) if bad == id)
         );
         assert_eq!(stream.missing().collect::<Vec<_>>(), [id]);
+    }
+
+    /// A small zstd frame that decompresses past the chunk bound is refused
+    /// even when the bytes would hash to the id, so a peer cannot make this
+    /// node allocate more than one chunk.
+    #[tokio::test]
+    async fn a_chunk_that_decompresses_past_the_bound_is_refused() {
+        let bomb = vec![0u8; MAX_CHUNK_BYTES + 1];
+        let id = ChunkId::of(&bomb);
+        let (mut send, recv) = tokio::io::duplex(1 << 20);
+        let mut stream = stream_over(recv, &[id]);
+        send.write_all(&frame(chunk(id, &bomb))).await.unwrap();
+        assert!(
+            matches!(stream.next().await, Err(RpcError::ChunkMismatch { id: bad }) if bad == id)
+        );
     }
 
     /// The missing set stays exact: a chunk nobody asked for, or one that
@@ -779,24 +843,16 @@ mod tests {
         let (x, y) = (ChunkId::of(b"x"), ChunkId::of(b"y"));
         let (mut send, recv) = tokio::io::duplex(1 << 10);
         let mut stream = stream_over(recv, &[x]);
-        send.write_all(&frame(ResponseBody::Chunk {
-            id: y,
-            bytes: b"y".to_vec(),
-        }))
-        .await
-        .unwrap();
+        send.write_all(&frame(chunk(y, b"y"))).await.unwrap();
         assert!(matches!(stream.next().await, Err(RpcError::UnrequestedChunk { id }) if id == y));
 
         let (mut send, recv) = tokio::io::duplex(1 << 10);
         let mut stream = stream_over(recv, &[x]);
-        let once = frame(ResponseBody::Chunk {
-            id: x,
-            bytes: b"x".to_vec(),
-        });
+        let once = frame(chunk(x, b"x"));
         send.write_all(&[once.clone(), once].concat())
             .await
             .unwrap();
-        assert_eq!(stream.next().await.unwrap(), Some((x, b"x".to_vec())));
+        assert_eq!(stream.next().await.unwrap().unwrap().id(), x);
         assert!(matches!(stream.next().await, Err(RpcError::UnrequestedChunk { id }) if id == x));
     }
 
@@ -806,14 +862,7 @@ mod tests {
         let (x, y) = (ChunkId::of(b"x"), ChunkId::of(b"y"));
         let (mut send, recv) = tokio::io::duplex(1 << 10);
         let mut stream = stream_over(recv, &[x, y]);
-        let wire = [
-            frame(ResponseBody::Chunk {
-                id: x,
-                bytes: b"x".to_vec(),
-            }),
-            frame(ResponseBody::ChunksDone),
-        ]
-        .concat();
+        let wire = [frame(chunk(x, b"x")), frame(ResponseBody::ChunksDone)].concat();
         send.write_all(&wire).await.unwrap();
         assert!(stream.next().await.unwrap().is_some());
         assert!(matches!(
@@ -864,10 +913,7 @@ mod tests {
         let id = ChunkId::of(b"x");
         let (mut send, recv) = tokio::io::duplex(1 << 10);
         let mut stream = stream_over(recv, &[id]);
-        let whole = frame(ResponseBody::Chunk {
-            id,
-            bytes: b"x".to_vec(),
-        });
+        let whole = frame(chunk(id, b"x"));
         send.write_all(&whole[..3]).await.unwrap();
         assert!(matches!(stream.next().await, Err(RpcError::Deadline(d)) if d == IDLE));
         send.write_all(&whole[3..]).await.unwrap();

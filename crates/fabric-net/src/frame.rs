@@ -28,8 +28,11 @@ pub const MAX_CONTROL_FRAME: usize = crate::wire::MAX_RECORD_PAGE + ENVELOPE_ALL
 /// The most bytes one chunk may hold (ADR 0004: whole-file objects up to 8 MiB).
 pub const MAX_CHUNK_BYTES: usize = 8 << 20;
 
-/// The most bytes a bulk frame may carry: one chunk plus its envelope.
-pub const MAX_BULK_FRAME: usize = MAX_CHUNK_BYTES + 1024;
+/// The most bytes one stored chunk may take: zstd's worst case for `MAX_CHUNK_BYTES`.
+pub const MAX_STORED_CHUNK: usize = MAX_CHUNK_BYTES + (MAX_CHUNK_BYTES >> 8);
+
+/// The most bytes a bulk frame may carry: one stored chunk plus its envelope.
+pub const MAX_BULK_FRAME: usize = MAX_STORED_CHUNK + 1024;
 
 const LENGTH_LEN: usize = 4;
 
@@ -182,6 +185,15 @@ mod tests {
             read_frame(&mut other, 16).await,
             Err(FrameError::BadVersion(9))
         ));
+    }
+
+    /// A chunk that does not compress still fits a bulk frame as zstd stores it.
+    #[test]
+    fn the_stored_chunk_bound_is_zstds_worst_case() {
+        assert_eq!(
+            zstd::zstd_safe::compress_bound(MAX_CHUNK_BYTES),
+            MAX_STORED_CHUNK
+        );
     }
 
     proptest! {
