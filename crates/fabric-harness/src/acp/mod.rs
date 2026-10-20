@@ -33,7 +33,7 @@ use crate::harness::{Harness, Installed, Launch, Restored, Running};
 use crate::manifest::{Content, HOME_PREFIX, Mutability, StateManifest, under_home};
 use crate::pipeline::{self, Capturer, Destination};
 use crate::process::{self, Wiring};
-use crate::redact::RedactionCounts;
+use crate::redact::{RedactionCounts, Redactor};
 use crate::session::SessionId;
 use crate::stage::{Carry, Source};
 
@@ -174,6 +174,21 @@ impl AcpHarness {
         Records::of(self.home_dir(), &label, session)
     }
 
+    /// Refuses launch arguments that hold a secret shape, one by one and
+    /// joined, so `--api-key sk-...` is caught either way: the arguments
+    /// are part of the harness kind the manifest records, and the
+    /// manifest is never redacted.
+    fn refuse_secret_args(&self) -> Result<(), HarnessError> {
+        let redactor = Redactor::standard()?;
+        let joined = self.args.join(" ");
+        if redactor.matches(&joined) || self.args.iter().any(|arg| redactor.matches(arg)) {
+            return Err(HarnessError::SecretInArguments {
+                program: self.program.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     fn capture_sync(
         &self,
         root: &AbsPath,
@@ -181,6 +196,7 @@ impl AcpHarness {
         out: &Path,
         version: Option<String>,
     ) -> Result<StateManifest, HarnessError> {
+        self.refuse_secret_args()?;
         let (dir, rel_parts) = self.state_rel()?;
         let mut sources = Vec::new();
         for file in pipeline::walk(&dir)? {

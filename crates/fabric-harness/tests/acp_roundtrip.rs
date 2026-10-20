@@ -477,6 +477,31 @@ async fn a_secret_in_the_state_directory_refuses_the_capture() {
     assert!(!out.path().join("manifest.json").exists());
 }
 
+#[tokio::test]
+async fn a_secret_in_the_launch_arguments_refuses_the_capture() {
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let state_dir = home.path().join(".fake-agent/sessions");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::write(state_dir.join("fake-9.json"), "{}\n").unwrap();
+    let mut args = agent_args();
+    args.extend(["--api-key".to_owned(), format!("sk-ant-{}", "a".repeat(24))]);
+    let adapter = AcpHarness::new(program(), args, abs(home.path()), agent_dir(home.path()))
+        .with_state_dir(&abs(&state_dir))
+        .unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let err = adapter
+        .capture(&work, &SessionId::parse("fake-9").unwrap(), out.path())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, HarnessError::SecretInArguments { .. }),
+        "{err}"
+    );
+    assert!(!out.path().join("manifest.json").exists());
+}
+
 /// Writes session `fake-9` with `escaped` as the JSON text of a prompt and
 /// asserts that capture refuses it at that line.
 async fn assert_state_refused(escaped: &str) {

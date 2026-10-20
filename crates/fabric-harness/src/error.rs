@@ -300,6 +300,13 @@ pub enum HarnessError {
         /// The store the adapter reads.
         store: PathBuf,
     },
+    /// An ACP agent's launch arguments hold a secret shape; they travel in
+    /// the manifest as part of the harness kind, outside any redaction.
+    #[error("the launch arguments of {program} hold a secret; pass it through the environment")]
+    SecretInArguments {
+        /// The agent program.
+        program: String,
+    },
     /// A settings or MCP overlay holds a literal secret instead of a reference.
     #[error("{path} holds a literal secret; use a ${{VAR}} reference in an overlay")]
     SecretInOverlay {
