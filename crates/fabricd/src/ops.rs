@@ -373,18 +373,9 @@ impl Node {
             (Some(s), Some(_)) => format!("snapshot: {s} (suspended in it)"),
             (Some(s), None) => format!("snapshot: {s} (resumed since)"),
         });
-        let owner_here = matches!(job.view(self.id), LeaseView::Owner(_)) && forked.is_none();
         out.say(match job.marker()? {
             None => "workspace: none on this node".to_owned(),
-            Some(marker) if !owner_here => format!(
-                "workspace: {} is an orphan: it holds changes made after the last snapshot this node published, and nothing here deletes it",
-                marker.root.display()
-            ),
-            Some(marker) => format!(
-                "workspace: {} ({})",
-                marker.root.display(),
-                marker_word(&marker.state)
-            ),
+            Some(marker) => workspace_line(&job, self.id, &marker, forked.is_some()).await,
         });
         let running = match job.harness_record()? {
             Some(record) => match record.liveness().await {
@@ -2074,6 +2065,36 @@ fn age(ms: u64) -> String {
     }
 }
 
+/// What `status` says about the workspace `marker` names, from the marker
+/// and how this node relates to the job together.
+async fn workspace_line(job: &Job, me: NodeId, marker: &Marker, frozen: bool) -> String {
+    let root = marker.root.display();
+    match job.view(me) {
+        LeaseView::Owner(token) if !frozen => {
+            if marker.is_current(token.epoch, job.latest()).await {
+                format!("workspace: {root} ({})", marker_word(&marker.state))
+            } else {
+                format!(
+                    "workspace: {root} was left at epoch {}, before this node's tenure; `fabric job resume {}` sets it aside and restores the latest snapshot",
+                    marker.epoch,
+                    job.id()
+                )
+            }
+        }
+        LeaseView::Departing { target, .. } if !frozen && marker.is_unchanged().await => {
+            format!(
+                "workspace: {root} is clean at the snapshot offered to {target} and waits for its decision"
+            )
+        }
+        _ if !frozen && marker.is_unchanged().await => format!(
+            "workspace: {root} is clean at a published snapshot; this node never runs it and moves it aside when it next settles the job"
+        ),
+        _ => format!(
+            "workspace: {root} is an orphan: it may hold changes made after the last snapshot this node published, and nothing here deletes it"
+        ),
+    }
+}
+
 fn view_word(view: &LeaseView) -> &'static str {
     match view {
         LeaseView::Owner(_) => "owner",
@@ -2311,6 +2332,27 @@ pub(crate) mod tests {
             &fabric_net::rpc::RpcError::Deadline(Duration::from_secs(15)),
         );
         assert_eq!(late.refusal(), crate::control::Refusal::Unreachable);
+    }
+
+    /// Users read status when a move is frozen; a clean copy waiting for
+    /// the target must not be called an orphan with unsaved work.
+    #[tokio::test]
+    async fn status_calls_a_departing_clean_copy_clean() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        node.depart(id, NodeId::from_bytes([7; 32]), &mut Out::default())
+            .await
+            .unwrap();
+        let mut out = Out::default();
+        node.job_status(id, &mut out).await.unwrap();
+        let line = out
+            .lines
+            .iter()
+            .find(|line| line.starts_with("workspace: "))
+            .unwrap();
+        assert!(line.contains("waits for its decision"), "{line}");
     }
 
     #[test]
