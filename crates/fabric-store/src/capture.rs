@@ -234,6 +234,12 @@ pub enum CaptureError {
         #[source]
         source: PathError,
     },
+    /// A path's mtime is before 1970, which a manifest cannot hold; touch it.
+    #[error("{path}: the mtime is before 1970")]
+    MtimeBeforeEpoch {
+        /// The path.
+        path: RelPath,
+    },
     /// A file name or a symlink target is not UTF-8, which a manifest cannot hold; rename or relink it.
     #[error("{path:?}: the name or the link target is not UTF-8")]
     NotUtf8 {
@@ -342,10 +348,15 @@ fn utf8_link(full: &Path, rel: &RelPath) -> Result<String, CaptureError> {
         })
 }
 
-fn mtime_ns(meta: &fs::Metadata) -> u64 {
-    let secs = u64::try_from(meta.mtime()).unwrap_or(0);
-    let nanos = u64::try_from(meta.mtime_nsec()).unwrap_or(0);
-    secs.saturating_mul(1_000_000_000).saturating_add(nanos)
+/// Returns the mtime of `meta` in nanoseconds since the epoch.
+///
+/// A manifest records an unsigned time, so an mtime before 1970 is refused
+/// instead of being read as a different time.
+fn mtime_ns(meta: &fs::Metadata, rel: &RelPath) -> Result<u64, CaptureError> {
+    let before = || CaptureError::MtimeBeforeEpoch { path: rel.clone() };
+    let secs = u64::try_from(meta.mtime()).map_err(|_| before())?;
+    let nanos = u64::try_from(meta.mtime_nsec()).map_err(|_| before())?;
+    Ok(secs.saturating_mul(1_000_000_000).saturating_add(nanos))
 }
 
 /// True when a link at `rel` with `target` points outside the tree root.
@@ -434,7 +445,7 @@ fn store_listed(store: &Store, full: &Path, found: &Found) -> Result<StoredFile,
     let after = file.metadata().map_err(|e| io_err(full, e))?;
     if stored.size != found.meta.len()
         || after.len() != found.meta.len()
-        || mtime_ns(&after) != mtime_ns(&found.meta)
+        || (after.mtime(), after.mtime_nsec()) != (found.meta.mtime(), found.meta.mtime_nsec())
     {
         return Err(CaptureError::WorkspaceChanged {
             path: found.rel.clone(),
@@ -550,7 +561,7 @@ impl Capturer<'_> {
             rel_path: found.rel.clone(),
             kind,
             mode: Mode::from_masked(meta.mode()),
-            mtime_ns: mtime_ns(meta),
+            mtime_ns: mtime_ns(meta, &found.rel)?,
         })
     }
 
@@ -635,7 +646,7 @@ impl Capturer<'_> {
                 rel_path: dir.clone(),
                 kind: EntryKind::Dir,
                 mode: Mode::from_masked(meta.mode()),
-                mtime_ns: mtime_ns(&meta),
+                mtime_ns: mtime_ns(&meta, dir)?,
             });
         }
         entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
@@ -1334,7 +1345,8 @@ impl GitCapture<'_> {
                     report.escaping_symlinks.push(rel.clone());
                 }
             }
-            mtimes.push((rel, mtime_ns(&meta)));
+            let mtime = mtime_ns(&meta, &rel)?;
+            mtimes.push((rel, mtime));
         }
         mtimes.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(mtimes)

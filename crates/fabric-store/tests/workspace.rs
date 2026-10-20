@@ -902,6 +902,26 @@ fn a_git_file_in_a_plain_directory_is_left_behind_and_named() {
 }
 
 #[test]
+fn an_mtime_before_1970_is_refused_not_rewritten() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("plain");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("old.txt"), "old\n").unwrap();
+    let half_second_before = UNIX_EPOCH - Duration::from_millis(500);
+    File::open(root.join("old.txt"))
+        .unwrap()
+        .set_modified(half_second_before)
+        .unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    assert!(
+        matches!(&err, CaptureError::MtimeBeforeEpoch { path } if path.as_str() == "old.txt"),
+        "{err}"
+    );
+}
+
+#[test]
 fn a_link_target_that_is_not_utf8_is_refused_not_rewritten() {
     use std::os::unix::ffi::OsStrExt;
     let dir = tempfile::tempdir().unwrap();
