@@ -48,5 +48,6 @@ pub mod codex;
 pub use error::{BadRule, HarnessError, Input, IoOp};
 pub use harness::{
     Harness, Installed, Launch, MAX_MODEL_NAME_LEN, ModelName, ModelNameError, Restored, Running,
+    TurnReport,
 };
 pub use session::{MAX_SESSION_ID_LEN, SessionId, SessionIdError};

@@ -200,6 +200,42 @@ impl Running {
     }
 }
 
+/// What a headless run printed about its turn, as its adapter reads it
+/// line by line (`ClaudeCode::read_headless_line`,
+/// `Codex::read_headless_line`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnReport {
+    /// The session the harness says the turn ran in.
+    pub session: Option<SessionId>,
+    /// The last answer of the turn.
+    pub answer: Option<String>,
+    /// Why the turn failed, when the harness says it did.
+    pub failure: Option<String>,
+}
+
+impl TurnReport {
+    /// Takes `text` as the session the turn ran in. Returns true when it
+    /// names a valid session other than the one already held; an id that
+    /// does not parse is logged and left out.
+    #[cfg(any(feature = "claude", feature = "codex"))]
+    pub(crate) fn note_session(&mut self, text: Option<&str>) -> bool {
+        let Some(text) = text else {
+            return false;
+        };
+        match SessionId::parse(text) {
+            Ok(session) if self.session.as_ref() != Some(&session) => {
+                self.session = Some(session);
+                true
+            }
+            Ok(_) => false,
+            Err(e) => {
+                tracing::warn!(error = %e, "a headless run named a session id that is not valid");
+                false
+            }
+        }
+    }
+}
+
 /// What a restore placed on this node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Restored {
