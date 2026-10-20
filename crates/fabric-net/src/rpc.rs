@@ -25,13 +25,12 @@ use std::time::Duration;
 use fabric_core::BoxFuture;
 use fabric_core::id::{ChunkId, NodeId, SnapshotId};
 use fabric_core::lease::FencingToken;
+use fabric_core::snapshot::MAX_CHUNK_LEN;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
 use crate::accept::refresh;
-use crate::frame::{
-    FrameError, MAX_BULK_FRAME, MAX_CHUNK_BYTES, MAX_CONTROL_FRAME, read_frame, write_frame,
-};
+use crate::frame::{FrameError, MAX_BULK_FRAME, MAX_CONTROL_FRAME, read_frame, write_frame};
 use crate::idle::IdleReader;
 use crate::tls::Trust;
 use crate::transport::{Connection, Stream, TransportError, TransportKind};
@@ -104,7 +103,7 @@ pub enum RpcError {
         /// The kind received.
         got: &'static str,
     },
-    /// The chunk does not decompress, within `MAX_CHUNK_BYTES`, to bytes that hash to its id; it is dropped.
+    /// The chunk does not decompress, within `MAX_CHUNK_LEN`, to bytes that hash to its id; it is dropped.
     #[error("chunk {id} did not decompress to bytes that hash to its id")]
     ChunkMismatch {
         /// The id claimed.
@@ -530,7 +529,7 @@ impl Session {
 }
 
 /// One chunk that arrived and was checked: its zstd frame decompresses to at
-/// most `MAX_CHUNK_BYTES` bytes, and those bytes hash to its id.
+/// most `MAX_CHUNK_LEN` bytes, and those bytes hash to its id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedChunk {
     id: ChunkId,
@@ -543,14 +542,14 @@ impl VerifiedChunk {
     ///
     /// The size the frame declares is checked before anything is
     /// decompressed, and a frame that declares none is decompressed into at
-    /// most `MAX_CHUNK_BYTES`, so a small frame cannot make this node
+    /// most `MAX_CHUNK_LEN`, so a small frame cannot make this node
     /// allocate more than one chunk.
     fn check(id: ChunkId, stored: Vec<u8>) -> Option<Self> {
         let capacity = match zstd::zstd_safe::get_frame_content_size(&stored) {
             Ok(Some(declared)) => usize::try_from(declared)
                 .ok()
-                .filter(|n| *n <= MAX_CHUNK_BYTES)?,
-            Ok(None) => MAX_CHUNK_BYTES,
+                .filter(|n| *n <= MAX_CHUNK_LEN)?,
+            Ok(None) => MAX_CHUNK_LEN,
             Err(_) => return None,
         };
         let bytes = zstd::bulk::decompress(&stored, capacity).ok()?;
@@ -875,7 +874,7 @@ mod tests {
     /// node allocate more than one chunk.
     #[tokio::test]
     async fn a_chunk_that_decompresses_past_the_bound_is_refused() {
-        let bomb = vec![0u8; MAX_CHUNK_BYTES + 1];
+        let bomb = vec![0u8; MAX_CHUNK_LEN + 1];
         let id = ChunkId::of(&bomb);
         let (mut send, recv) = tokio::io::duplex(1 << 20);
         let mut stream = stream_over(recv, &[id]);

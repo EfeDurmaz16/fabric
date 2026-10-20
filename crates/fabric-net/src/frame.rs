@@ -10,6 +10,7 @@
 
 use std::io;
 
+use fabric_core::snapshot::MAX_CHUNK_LEN;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// The frame format version this crate writes.
@@ -25,11 +26,8 @@ const ENVELOPE_ALLOWANCE: usize = 1024;
 /// is as long as the ledger allows, always fits with its envelope.
 pub const MAX_CONTROL_FRAME: usize = crate::wire::MAX_RECORD_PAGE + ENVELOPE_ALLOWANCE;
 
-/// The most bytes one chunk may hold (ADR 0004: whole-file objects up to 8 MiB).
-pub const MAX_CHUNK_BYTES: usize = 8 << 20;
-
-/// The most bytes one stored chunk may take: zstd's worst case for `MAX_CHUNK_BYTES`.
-pub const MAX_STORED_CHUNK: usize = MAX_CHUNK_BYTES + (MAX_CHUNK_BYTES >> 8);
+/// The most bytes one stored chunk may take: zstd's worst case for `MAX_CHUNK_LEN`.
+pub const MAX_STORED_CHUNK: usize = MAX_CHUNK_LEN + (MAX_CHUNK_LEN >> 8);
 
 /// The most bytes a bulk frame may carry: one stored chunk plus its envelope.
 pub const MAX_BULK_FRAME: usize = MAX_STORED_CHUNK + 1024;
@@ -191,7 +189,7 @@ mod tests {
     #[test]
     fn the_stored_chunk_bound_is_zstds_worst_case() {
         assert_eq!(
-            zstd::zstd_safe::compress_bound(MAX_CHUNK_BYTES),
+            zstd::zstd_safe::compress_bound(MAX_CHUNK_LEN),
             MAX_STORED_CHUNK
         );
     }

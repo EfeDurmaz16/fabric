@@ -16,11 +16,9 @@ use fabric_core::id::{ChunkId, Epoch, JobId, MoveId, NodeId, RecordHash, Snapsho
 use fabric_core::lease::FencingToken;
 use fabric_core::ledger::MAX_RECORD_LEN;
 use fabric_core::moves::MoveOffer;
-use fabric_core::snapshot::MAX_MANIFEST_LEN;
+use fabric_core::snapshot::{MAX_CHUNK_LEN, MAX_MANIFEST_LEN};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
-
-use crate::frame::MAX_CHUNK_BYTES;
 
 /// The protocol version both sides must speak; a mismatch ends the session at `Hello`.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -427,7 +425,7 @@ pub struct Response {
 /// The length is 1 to `MAX_MANIFEST_LEN` bytes, checked on decode before
 /// any chunk is fetched, so a peer cannot make this node assemble more than
 /// one manifest cap. The chunk count fits the length: each chunk holds at
-/// least one byte and at most `MAX_CHUNK_BYTES`.
+/// least one byte and at most `MAX_CHUNK_LEN`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ManifestChunks {
     len: u64,
@@ -441,7 +439,7 @@ impl ManifestChunks {
         if len == 0 || len > max {
             return Err(WireError::ManifestSize(len));
         }
-        let fewest = len.div_ceil(u64::try_from(MAX_CHUNK_BYTES).unwrap_or(u64::MAX));
+        let fewest = len.div_ceil(u64::try_from(MAX_CHUNK_LEN).unwrap_or(u64::MAX));
         let count = u64::try_from(ids.len()).unwrap_or(u64::MAX);
         if count < fewest || count > len {
             return Err(WireError::ManifestChunkCount {
@@ -866,7 +864,7 @@ mod tests {
     #[test]
     fn a_manifest_outside_its_bounds_does_not_decode() {
         let max = u64::try_from(MAX_MANIFEST_LEN).unwrap();
-        let per_chunk = u64::try_from(MAX_CHUNK_BYTES).unwrap();
+        let per_chunk = u64::try_from(MAX_CHUNK_LEN).unwrap();
         let ids =
             |n: u64| -> Vec<ChunkId> { (0..n).map(|i| ChunkId::of(&i.to_le_bytes())).collect() };
         let whole = max / per_chunk;
