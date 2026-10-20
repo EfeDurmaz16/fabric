@@ -140,6 +140,9 @@ enum JobCommand {
         /// The first message to send.
         #[arg(long)]
         prompt: Option<String>,
+        /// Waive the preflight refusals that can be waived when pulling.
+        #[arg(long)]
+        force: bool,
     },
     /// Move the job to a paired node by the cooperative move protocol.
     Move {
@@ -366,11 +369,13 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
             on,
             harness,
             prompt,
+            force,
         } => (
             Request::JobResume {
                 job,
                 on,
                 harness,
+                force,
                 path_var: path_var(),
             },
             prompt,

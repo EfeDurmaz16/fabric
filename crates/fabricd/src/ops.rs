@@ -99,10 +99,11 @@ impl Node {
                 job,
                 on,
                 harness,
+                force,
                 path_var,
             } => {
                 return Ok(Some(
-                    self.job_resume(job, on, harness, &path_var, out).await?,
+                    Box::pin(self.job_resume(job, on, harness, force, &path_var, out)).await?,
                 ));
             }
             Request::HarnessStarted {
@@ -810,8 +811,15 @@ impl Node {
                 });
             }
         }
-        self.preflight(to, Some((&harness, &root)), path_var, force, out)
-            .await?;
+        self.preflight(
+            to,
+            Some((&harness, &root)),
+            Target::Peer,
+            path_var,
+            force,
+            out,
+        )
+        .await?;
 
         if matches!(view, LeaseView::Owner(_)) {
             let job = self.job(id).await?;
@@ -1069,6 +1077,7 @@ impl Node {
         id: JobId,
         on: Option<NodeId>,
         harness: Option<HarnessKind>,
+        force: bool,
         path_var: &OsString,
         out: &mut Out,
     ) -> Result<RunPlan, NodeError> {
@@ -1092,6 +1101,20 @@ impl Node {
             },
         };
         if let Some(holder) = holder {
+            let kind = match self.job(id).await {
+                Ok(job) => Some(job.lock().await.harness().clone()),
+                Err(_) => None,
+            };
+            let root = paths::job_root(&self.cfg.home, id);
+            self.preflight(
+                holder,
+                kind.as_ref().map(|kind| (kind, root.as_path())),
+                Target::Here,
+                path_var,
+                force,
+                out,
+            )
+            .await?;
             self.pull(id, holder, out).await?;
         }
         let job = self.job(id).await?;
@@ -1503,6 +1526,7 @@ impl Node {
         self.preflight(
             peer,
             harness.as_ref().zip(root.as_deref()),
+            Target::Peer,
             path_var,
             false,
             out,
@@ -1515,6 +1539,7 @@ impl Node {
         self: &Arc<Self>,
         peer: NodeId,
         job: Option<(&HarnessKind, &Path)>,
+        target: Target,
         path_var: &OsString,
         force: bool,
         out: &mut Out,
@@ -1536,7 +1561,7 @@ impl Node {
             &Context {
                 harness: job.map(|(h, _)| h),
                 root: job.map(|(_, r)| r),
-                target: Target::Peer,
+                target,
                 clock_skew_ms: Some(session.clock_skew_ms()),
                 wire: Some(session.kind().to_string()),
             },

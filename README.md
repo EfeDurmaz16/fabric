@@ -73,7 +73,7 @@ fabric job resume <job>     # restores at the same path, runs setup steps, conti
 
 To bring it back, on the Pro, `fabric job resume <job>` pulls it from the Air. `fabric job status <job>` and `fabric job log <job>` say where the job is and why on either Mac. `FABRIC_LOG=debug` shows what a node does.
 
-On the gate as measured, the Macs run different Claude Code versions, which doctor refuses for a Claude job; `fabric job move ... --force` waives that row and prints it. Close every `claude` on the Air before a resume there: its session registry is too old to tell which sessions run (ADR 0015).
+On the gate as measured, the Macs run different Claude Code versions, which doctor refuses for a Claude job; `fabric job move ... --force` (and `fabric job resume ... --force` for a pull) waives that row and prints it. Close every `claude` on the Air before a resume there: its session registry is too old to tell which sessions run (ADR 0015).
 
 ## Known limits
 

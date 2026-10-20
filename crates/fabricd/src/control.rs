@@ -76,6 +76,8 @@ pub enum Request {
         on: Option<NodeId>,
         /// A harness to use instead of the job's.
         harness: Option<HarnessKind>,
+        /// Waive the preflight refusals that can be waived.
+        force: bool,
         /// The `PATH` of the user's shell.
         path_var: OsString,
     },
