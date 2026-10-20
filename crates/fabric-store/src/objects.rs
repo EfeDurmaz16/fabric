@@ -7,8 +7,8 @@
 //! never content.
 
 use std::collections::HashSet;
-use std::fs::{self, File};
-use std::io::{self, BufReader};
+use std::fs;
+use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::SystemTime;
@@ -41,6 +41,12 @@ pub enum ObjectError {
     Corrupt {
         /// The id whose file is wrong.
         id: ChunkId,
+    },
+    /// The path is not a regular file: a symlink, FIFO, socket or device.
+    #[error("{path} is not a regular file")]
+    NotRegular {
+        /// The path.
+        path: PathBuf,
     },
     /// The chunking parameters break a rule of the chunker.
     #[error("chunk parameters: {0}")]
@@ -258,18 +264,39 @@ impl ObjectStore {
         Ok(file)
     }
 
-    /// Reads the file at `path` into objects by the same rule as `put_bytes`.
+    /// Reads the regular file at `path` into objects by the same rule as `put_bytes`.
     ///
-    /// `size` is the number of bytes read, which is the file's length unless
-    /// something wrote to it meanwhile.
+    /// A symlink, FIFO, socket or device at `path` is refused, not followed or read.
     pub fn put_file(&self, path: &Path) -> Result<StoredFile, ObjectError> {
-        let meta = fs::metadata(path).map_err(|e| io_err(path, e))?;
-        if meta.len() <= self.params.whole_file_limit {
-            let bytes = fs::read(path).map_err(|e| io_err(path, e))?;
-            return self.put_bytes(&bytes);
+        let file = durable::open_regular(path)
+            .map_err(|e| io_err(path, e))?
+            .ok_or_else(|| ObjectError::NotRegular {
+                path: path.to_owned(),
+            })?;
+        self.put_reader(file, path)
+    }
+
+    /// Reads `reader` to its end into objects by the same rule as `put_bytes`.
+    ///
+    /// At most `whole_file_limit + 1` bytes are held at once: a reader that
+    /// turns out longer, including a file that grew after it was measured,
+    /// goes through the streaming chunker from the bytes already read on.
+    /// `size` is the number of bytes read. `path` names the source in errors.
+    pub fn put_reader(
+        &self,
+        mut reader: impl Read,
+        path: &Path,
+    ) -> Result<StoredFile, ObjectError> {
+        let limit = self.params.whole_file_limit;
+        let mut head = Vec::new();
+        (&mut reader)
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut head)
+            .map_err(|e| io_err(path, e))?;
+        if head.len() as u64 <= limit {
+            return self.put_bytes(&head);
         }
-        let reader =
-            BufReader::with_capacity(1 << 20, File::open(path).map_err(|e| io_err(path, e))?);
+        let reader = BufReader::with_capacity(1 << 20, io::Cursor::new(head).chain(reader));
         let p = &self.params;
         let mut file = StoredFile {
             chunks: Vec::new(),

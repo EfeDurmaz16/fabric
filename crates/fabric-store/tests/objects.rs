@@ -151,3 +151,26 @@ fn chunk_parameters_outside_the_chunker_rules_are_refused() {
     assert!(inverted.validate().is_err());
     assert!(ChunkParams::DEFAULT.validate().is_ok());
 }
+
+#[test]
+fn a_path_that_is_not_a_regular_file_is_refused_unread() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(&dir.path().join("store"), small_params()).unwrap();
+    let objects = store.objects();
+    let secret = dir.path().join("secret");
+    fs::write(&secret, "do not read").unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&secret, &link).unwrap();
+    let fifo = dir.path().join("fifo");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    for path in [link, fifo] {
+        let err = objects.put_file(&path).unwrap_err();
+        assert!(matches!(err, ObjectError::NotRegular { .. }), "{err}");
+    }
+}

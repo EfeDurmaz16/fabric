@@ -1412,8 +1412,11 @@ fn capture_git(
     let worktree_mtimes = gc.worktree_mtimes(&worktree_commit, &mut capturer.report)?;
     let config = gc.config(&mut capturer.report)?;
     let exclude_path = gc.git.git_path("info/exclude")?;
+    // `info/exclude` is git's own file, not workspace content, so a link to
+    // a shared exclude file is followed as git follows it.
     let exclude = if exclude_path.is_file() {
-        let stored = capturer.store.objects().put_file(&exclude_path)?;
+        let bytes = fs::read(&exclude_path).map_err(|e| io_err(&exclude_path, e))?;
+        let stored = capturer.store.objects().put_bytes(&bytes)?;
         capturer.report.new_objects += stored.new_objects;
         capturer.report.new_bytes += stored.new_bytes;
         Some(stored.chunks)
