@@ -144,6 +144,8 @@ pub struct CaptureReport {
     pub denied_harness: Vec<RelPath>,
     /// Tracked paths that match a secret pattern; they travel in the bundle.
     pub tracked_secrets: Vec<RelPath>,
+    /// Paths in the stash's work tree, index or untracked commit that match a secret pattern; they travel in the bundle.
+    pub stashed_secrets: Vec<RelPath>,
     /// Symlinks whose target is absolute or climbs above the root.
     pub escaping_symlinks: Vec<RelPath>,
     /// FIFOs, sockets and devices in the workspace, left behind.
@@ -1211,6 +1213,38 @@ impl GitCapture<'_> {
         Ok(mtimes)
     }
 
+    /// Lists the paths of the stash commit `stash` and of its index and untracked parents that `denies` names.
+    ///
+    /// The bundle carries `refs/stash` with its parents, so a `.env` saved
+    /// by `git stash -u` travels with it although it was never tracked.
+    fn stashed_secrets(
+        &self,
+        stash: &GitOid,
+        denies: &dyn Fn(&RelPath) -> bool,
+    ) -> Result<Vec<RelPath>, CaptureError> {
+        let mut found = BTreeSet::new();
+        for suffix in ["", "^2", "^3"] {
+            let rev = format!("{}{suffix}", stash.as_str());
+            let commit = format!("{rev}^{{commit}}");
+            if !self
+                .git
+                .succeeds(&["rev-parse", "--verify", "-q", &commit])?
+            {
+                continue;
+            }
+            let out = self
+                .git
+                .run(&["ls-tree", "-r", "-z", "--name-only", &rev])?;
+            for record in Git::records(&out) {
+                let rel = rel_path(Git::text("stash path", record)?)?;
+                if denies(&rel) {
+                    found.insert(rel);
+                }
+            }
+        }
+        Ok(found.into_iter().collect())
+    }
+
     /// Reads the allowlisted projection of the local config.
     fn config(
         &self,
@@ -1474,6 +1508,10 @@ fn capture_git(
     let (built, view) = gc.bundle_with_refs(&tips, chain_full)?;
     let (bundle, bundle_base) = capturer.store_bundle(built, parent_id)?;
     let RefView { refs, head } = view;
+    if let Some((_, stash)) = refs.iter().find(|(name, _)| name.as_str() == "refs/stash") {
+        capturer.report.stashed_secrets =
+            gc.stashed_secrets(stash, &|rel| policy.denies_anywhere(rel))?;
+    }
     let worktree_mtimes = gc.worktree_mtimes(&worktree_commit, &mut capturer.report)?;
     let config = gc.config(&mut capturer.report)?;
     let exclude_path = gc.git.git_path("info/exclude")?;

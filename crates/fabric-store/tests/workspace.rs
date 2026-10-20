@@ -1246,6 +1246,24 @@ fn names_git_would_unquote_or_trim_verify_after_restore() {
     assert_eq!(report.verified, 4);
 }
 
+#[test]
+fn a_secret_saved_in_the_stash_is_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    fs::write(root.join(".env"), "AWS_SECRET=hunter2\n").unwrap();
+    git(&root)
+        .run(&["stash", "push", "-q", "--include-untracked"])
+        .unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { report, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    assert_eq!(
+        report.stashed_secrets,
+        vec![RelPath::parse(".env").unwrap()]
+    );
+}
+
 /// Captures a branch named `before`, replaces it with `after` and restores the incremental snapshot.
 fn rename_branch_across_an_incremental_link(before: &str, after: &str) -> Fallible {
     let dir = tempfile::tempdir()?;
