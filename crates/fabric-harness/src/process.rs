@@ -71,10 +71,15 @@ fn system_tool(
         })
 }
 
-/// Looks `name` up on the given `PATH` value, as a shell would.
+/// Looks `name` up on the given `PATH` value, as a shell would, except
+/// that a relative or empty entry is skipped: it names a directory
+/// relative to whatever the current directory is, which is Fabric's own
+/// here and the workspace once the harness starts, so the file found and
+/// the file launched could differ. The path returned is always absolute.
 #[must_use]
 pub(crate) fn find_on_path(name: &str, path_var: &OsStr) -> Option<PathBuf> {
     std::env::split_paths(path_var)
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(name))
         .find(|candidate| is_executable(candidate))
 }
@@ -418,6 +423,27 @@ mod tests {
         std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(find_on_path("tool", &var), Some(plain));
         assert_eq!(find_on_path("tool", OsStr::new("")), None);
+    }
+
+    #[test]
+    fn find_on_path_skips_relative_and_empty_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("tool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The test runs from the crate directory; a relative entry that
+        // reaches the tool from there must not count.
+        let cwd = std::env::current_dir().unwrap();
+        let up: PathBuf = cwd.components().skip(1).map(|_| "..").collect();
+        let relative = up.join(dir.path().strip_prefix("/").unwrap());
+        assert!(
+            relative.join("tool").exists(),
+            "the relative entry reaches the tool"
+        );
+        let var = std::env::join_paths([relative.as_path(), Path::new("")]).unwrap();
+        assert_eq!(find_on_path("tool", &var), None);
+        let var = std::env::join_paths([relative.as_path(), dir.path()]).unwrap();
+        assert_eq!(find_on_path("tool", &var), Some(tool));
     }
 
     /// The role a run of `running_pids_sees_a_claude_this_process_runs_under` plays.
