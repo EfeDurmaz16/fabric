@@ -200,21 +200,12 @@ pub struct Staging {
 }
 
 impl Staging {
-    /// Returns the untracked paths the policy keeps out of `W`; capture lists them in its output.
-    pub fn left_out(&self) -> &[Denied] {
-        &self.left_out
-    }
-
-    /// Returns the tracked paths that match a secret pattern and changed in the working tree.
-    pub fn tracked_secrets(&self) -> &[Denied] {
-        &self.tracked
-    }
-
-    /// Returns what capture stages, or refuses when a tracked secret changed without consent.
+    /// Returns what capture stages and what it keeps out, or refuses when a tracked secret changed without consent.
     ///
-    /// Capture passes each path to `git add -A` as a `:(literal)` pathspec,
-    /// so git applies no pattern of its own.
-    pub fn paths(self, consent: TrackedSecrets) -> Result<Stage, TrackedSecretChanged> {
+    /// Capture passes each staged path to `git add -A` as a `:(literal)`
+    /// pathspec, so git applies no pattern of its own, and lists the
+    /// paths kept out in its output.
+    pub fn paths(self, consent: TrackedSecrets) -> Result<Staged, TrackedSecretChanged> {
         let mut paths = match consent {
             TrackedSecrets::Refuse if !self.tracked.is_empty() => {
                 return Err(TrackedSecretChanged {
@@ -228,14 +219,27 @@ impl Staging {
                 paths.into_iter()
             }
         };
-        Ok(match paths.next() {
+        let stage = match paths.next() {
             None => Stage::Nothing,
             Some(first) => Stage::Paths {
                 first,
                 rest: paths.collect(),
             },
+        };
+        Ok(Staged {
+            stage,
+            left_out: self.left_out,
         })
     }
+}
+
+/// The result of sorting a capture's changes: what git stages and the untracked paths the policy kept out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Staged {
+    /// What capture hands `git add`.
+    pub stage: Stage,
+    /// The untracked paths the policy denied, each with its pattern; capture lists them so nothing stays behind silently.
+    pub left_out: Vec<Denied>,
 }
 
 /// What capture hands `git add`: nothing, or at least one literal path.
