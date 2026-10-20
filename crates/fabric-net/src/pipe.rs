@@ -5,7 +5,9 @@
 //! the bytes already written, and aborting it gives the reader an error
 //! instead, so a stream cut off by a lost connection never reads as one that
 //! ended; dropping the reader makes every later write fail with
-//! `BrokenPipe`, so a stream nobody reads cannot fill the heap.
+//! `BrokenPipe`, so a stream nobody reads cannot fill the heap. A `push`
+//! puts all its bytes in or none, and `Drained` counts what the reader took,
+//! which is the credit the multiplexer hands back to the peer.
 
 use std::collections::VecDeque;
 use std::io;
@@ -31,8 +33,24 @@ struct State {
     capacity: usize,
     writer: Writer,
     reader_gone: bool,
+    /// Bytes the reader took that `Drained` has not reported yet.
+    taken: usize,
     read_waker: Option<Waker>,
     write_waker: Option<Waker>,
+    drained_waker: Option<Waker>,
+}
+
+impl State {
+    /// Records `n` bytes taken by the reader and wakes whoever waits for room or for credit.
+    fn took(&mut self, n: usize) {
+        self.taken += n;
+        if let Some(waker) = self.write_waker.take() {
+            waker.wake();
+        }
+        if let Some(waker) = self.drained_waker.take() {
+            waker.wake();
+        }
+    }
 }
 
 /// The read end of a pipe.
@@ -48,8 +66,10 @@ pub(crate) fn pipe(capacity: usize) -> (PipeWriter, PipeReader) {
         capacity,
         writer: Writer::Open,
         reader_gone: false,
+        taken: 0,
         read_waker: None,
         write_waker: None,
+        drained_waker: None,
     }));
     (PipeWriter(state.clone()), PipeReader(state))
 }
@@ -82,9 +102,7 @@ impl PipeReader {
         }
         let n = max.min(state.buf.len());
         let taken: Vec<u8> = state.buf.drain(..n).collect();
-        if let Some(waker) = state.write_waker.take() {
-            waker.wake();
-        }
+        state.took(n);
         Poll::Ready(Ok(taken))
     }
 }
@@ -112,9 +130,7 @@ impl AsyncRead for PipeReader {
         buf.put_slice(&front[..from_front]);
         buf.put_slice(&back[..n - from_front]);
         state.buf.drain(..n);
-        if let Some(waker) = state.write_waker.take() {
-            waker.wake();
-        }
+        state.took(n);
         Poll::Ready(Ok(()))
     }
 }
@@ -127,16 +143,72 @@ impl Drop for PipeReader {
         if let Some(waker) = state.write_waker.take() {
             waker.wake();
         }
+        if let Some(waker) = state.drained_waker.take() {
+            waker.wake();
+        }
+    }
+}
+
+/// Why `push` put nothing in the pipe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refused {
+    /// The bytes do not fit in the room left.
+    Full,
+    /// Nobody will read them.
+    ReaderGone,
+}
+
+/// Counts the bytes the reader of one pipe takes.
+pub(crate) struct Drained(Arc<Mutex<State>>);
+
+impl Drained {
+    /// Waits until the reader took at least `at_least` bytes since the last
+    /// report and returns that count; `None` once the writer ended or the
+    /// reader is gone, when no more bytes will come.
+    pub(crate) fn poll_report(&self, cx: &mut Context<'_>, at_least: usize) -> Poll<Option<usize>> {
+        let mut state = lock(&self.0);
+        if state.reader_gone || state.writer != Writer::Open {
+            return Poll::Ready(None);
+        }
+        if state.taken >= at_least {
+            return Poll::Ready(Some(std::mem::take(&mut state.taken)));
+        }
+        state.drained_waker = Some(cx.waker().clone());
+        Poll::Pending
     }
 }
 
 impl PipeWriter {
+    /// Puts all of `data` in the pipe, or none of it when it does not fit or nobody reads.
+    pub(crate) fn push(&self, data: &[u8]) -> Result<(), Refused> {
+        let mut state = lock(&self.0);
+        if state.reader_gone {
+            return Err(Refused::ReaderGone);
+        }
+        if data.len() > state.capacity.saturating_sub(state.buf.len()) {
+            return Err(Refused::Full);
+        }
+        state.buf.extend(data);
+        if let Some(waker) = state.read_waker.take() {
+            waker.wake();
+        }
+        Ok(())
+    }
+
+    /// Returns a handle that reports what the reader takes.
+    pub(crate) fn drained(&self) -> Drained {
+        Drained(Arc::clone(&self.0))
+    }
+
     /// Ends the pipe with an error: the reader's next read fails, buffered bytes or not.
     pub(crate) fn abort(self) {
         let mut state = lock(&self.0);
         state.writer = Writer::Aborted;
         state.buf.clear();
         if let Some(waker) = state.read_waker.take() {
+            waker.wake();
+        }
+        if let Some(waker) = state.drained_waker.take() {
             waker.wake();
         }
     }
@@ -185,6 +257,9 @@ fn finish(state: &Mutex<State>) {
         state.writer = Writer::Finished;
     }
     if let Some(waker) = state.read_waker.take() {
+        waker.wake();
+    }
+    if let Some(waker) = state.drained_waker.take() {
         waker.wake();
     }
 }

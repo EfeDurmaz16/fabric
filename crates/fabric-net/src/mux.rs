@@ -18,11 +18,17 @@
 //! above `MAX_MUX_PAYLOAD` ends the connection. So a peer can make this node
 //! hold at most `MAX_STREAMS` stream buffers and one frame.
 //!
+//! Each direction of a stream has its own credit, as each QUIC stream has
+//! its own window. A sender starts with `STREAM_BUFFER` bytes of credit and
+//! spends it on `Data`; the receiver's buffer holds exactly that much, and a
+//! `Credit` frame hands back what its reader has taken. The reader of the
+//! connection therefore never waits on one stream: a stream nobody reads
+//! stops only its own sender, and a peer that sends past its credit, or
+//! grants more than a buffer holds, ends the connection.
+//!
 //! The connection lives while its handle or any of its streams does, as a
 //! QUIC connection does; `close` ends it at once and every stream on it
-//! fails. The multiplexer is one TCP stream, so a stream nobody reads holds
-//! up the others once its buffer is full. The protocol reads every stream
-//! it opens.
+//! fails.
 
 use std::collections::HashMap;
 use std::future::poll_fn;
@@ -36,19 +42,23 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::AbortHandle;
 
-use crate::pipe::{PipeReader, PipeWriter, pipe};
+use crate::pipe::{Drained, PipeReader, PipeWriter, Refused, pipe};
 use crate::transport::{Connection, Stream, TransportError, TransportKind};
 
 /// The most payload bytes in one multiplexer frame.
 pub const MAX_MUX_PAYLOAD: usize = 64 << 10;
 
-/// How many bytes one logical stream buffers in each direction before the writer waits.
+/// The credit each direction of a stream starts with, and the bytes its receiver buffers.
 pub const STREAM_BUFFER: usize = 1 << 20;
 
 /// The most streams either side may hold open on one connection, quinn's default.
 pub const MAX_STREAMS: usize = 100;
 
+/// A receiver hands credit back once its reader took this many bytes.
+const CREDIT_STEP: usize = STREAM_BUFFER / 4;
+
 const HEADER_LEN: usize = 9;
+const CREDIT_LEN: usize = 4;
 const OUT_QUEUE: usize = 64;
 
 /// What one multiplexer frame does to its stream.
@@ -60,6 +70,8 @@ enum FrameKind {
     Fin,
     /// The sender's reader is gone; stop sending on the stream.
     Reset,
+    /// Gives the receiver of this frame more credit on the stream: a `u32` byte count.
+    Credit,
 }
 
 impl FrameKind {
@@ -68,6 +80,7 @@ impl FrameKind {
             FrameKind::Data => 0,
             FrameKind::Fin => 1,
             FrameKind::Reset => 2,
+            FrameKind::Credit => 3,
         }
     }
 }
@@ -80,12 +93,14 @@ impl TryFrom<u8> for FrameKind {
             0 => Ok(FrameKind::Data),
             1 => Ok(FrameKind::Fin),
             2 => Ok(FrameKind::Reset),
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("mux frame kind {other} is unknown"),
-            )),
+            3 => Ok(FrameKind::Credit),
+            other => Err(invalid(format!("mux frame kind {other} is unknown"))),
         }
     }
+}
+
+fn invalid(reason: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, reason)
 }
 
 /// Which end of the connection this side is; it fixes which stream ids it opens.
@@ -155,10 +170,10 @@ impl Inbound {
         }
     }
 
-    async fn write(&mut self, payload: &[u8]) -> io::Result<()> {
-        match &mut self.writer {
-            Some(writer) => writer.write_all(payload).await,
-            None => Err(io::ErrorKind::BrokenPipe.into()),
+    fn push(&self, payload: &[u8]) -> Result<(), Refused> {
+        match &self.writer {
+            Some(writer) => writer.push(payload),
+            None => Err(Refused::ReaderGone),
         }
     }
 
@@ -180,6 +195,8 @@ impl Drop for Inbound {
 struct Outbound {
     _stop: oneshot::Sender<()>,
     _slot: Arc<Slot>,
+    /// The bytes this side may still send before the peer hands credit back.
+    credit: Arc<Semaphore>,
 }
 
 #[derive(Default)]
@@ -306,6 +323,7 @@ impl Mux {
 
 /// Sends a locally opened stream: it takes its id with its first frame.
 async fn pump_local(shared: Arc<Shared>, source: PipeReader, inbound: PipeWriter, slot: Arc<Slot>) {
+    let drained = inbound.drained();
     let inbound = Inbound::new(inbound, Arc::clone(&slot));
     let mut ended = shared.ended.subscribe();
     let first = tokio::select! {
@@ -314,6 +332,8 @@ async fn pump_local(shared: Arc<Shared>, source: PipeReader, inbound: PipeWriter
         _ = ended.wait_for(|ended| *ended) => return,
     };
     let (stop_tx, stop_rx) = oneshot::channel();
+    // The first frame spends its own length of the stream's credit.
+    let credit = Arc::new(Semaphore::new(STREAM_BUFFER - first.len()));
     let id = {
         let mut next = shared.next_id.lock().await;
         let Some(id) = *next else {
@@ -332,11 +352,13 @@ async fn pump_local(shared: Arc<Shared>, source: PipeReader, inbound: PipeWriter
                     Outbound {
                         _stop: stop_tx,
                         _slot: slot,
+                        credit: Arc::clone(&credit),
                     },
                 );
             }
         }
         *next = id.checked_add(2);
+        tokio::spawn(grant_credit(Arc::clone(&shared), id, drained));
         // Queued under the id lock, so ids reach the wire in rising order.
         let only_fin = first.is_empty();
         let frame = if only_fin {
@@ -353,16 +375,28 @@ async fn pump_local(shared: Arc<Shared>, source: PipeReader, inbound: PipeWriter
         }
         id
     };
-    send_rest(&shared, id, source, stop_rx).await;
+    send_rest(&shared, id, source, stop_rx, &credit).await;
 }
 
 /// Sends a peer-opened stream's answers; its id and slot were registered when it arrived.
-async fn pump_peer(shared: Arc<Shared>, id: u32, source: PipeReader, stop: oneshot::Receiver<()>) {
-    send_rest(&shared, id, source, stop).await;
+async fn pump_peer(
+    shared: Arc<Shared>,
+    id: u32,
+    source: PipeReader,
+    stop: oneshot::Receiver<()>,
+    credit: Arc<Semaphore>,
+) {
+    send_rest(&shared, id, source, stop, &credit).await;
 }
 
-/// Frames what the stream's writer writes until it finishes, the peer resets it, or the connection ends.
-async fn send_rest(shared: &Shared, id: u32, source: PipeReader, mut stop: oneshot::Receiver<()>) {
+/// Frames what the stream's writer writes, within the stream's credit, until it finishes, the peer resets it, or the connection ends.
+async fn send_rest(
+    shared: &Shared,
+    id: u32,
+    source: PipeReader,
+    mut stop: oneshot::Receiver<()>,
+    credit: &Semaphore,
+) {
     loop {
         let taken = tokio::select! {
             biased;
@@ -376,6 +410,18 @@ async fn send_rest(shared: &Shared, id: u32, source: PipeReader, mut stop: onesh
             let _ = shared.out.send(Outgoing::bare(id, FrameKind::Fin)).await;
             return;
         }
+        // At most MAX_MUX_PAYLOAD, so it fits a u32.
+        let Ok(len) = u32::try_from(taken.len()) else {
+            return;
+        };
+        tokio::select! {
+            biased;
+            _ = &mut stop => return,
+            spent = credit.acquire_many(len) => match spent {
+                Ok(spent) => spent.forget(),
+                Err(_) => return,
+            },
+        }
         let frame = Outgoing {
             id,
             kind: FrameKind::Data,
@@ -387,6 +433,24 @@ async fn send_rest(shared: &Shared, id: u32, source: PipeReader, mut stop: onesh
             sent = shared.out.send(frame) => if sent.is_err() {
                 return;
             },
+        }
+    }
+}
+
+/// Hands the peer credit for `id` each time the stream's reader takes `CREDIT_STEP` bytes, until the peer's direction ends.
+async fn grant_credit(shared: Arc<Shared>, id: u32, drained: Drained) {
+    while let Some(taken) = poll_fn(|cx| drained.poll_report(cx, CREDIT_STEP)).await {
+        // At most STREAM_BUFFER, so it fits a u32.
+        let Ok(taken) = u32::try_from(taken) else {
+            return;
+        };
+        let frame = Outgoing {
+            id,
+            kind: FrameKind::Credit,
+            payload: taken.to_le_bytes().to_vec(),
+        };
+        if shared.out.send(frame).await.is_err() {
+            return;
         }
     }
 }
@@ -465,10 +529,9 @@ async fn demux(
         let kind = FrameKind::try_from(header[4])?;
         let len = u32::from_le_bytes([header[5], header[6], header[7], header[8]]) as usize;
         if len > MAX_MUX_PAYLOAD {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("mux frame of {len} bytes exceeds {MAX_MUX_PAYLOAD}"),
-            ));
+            return Err(invalid(format!(
+                "mux frame of {len} bytes exceeds {MAX_MUX_PAYLOAD}"
+            )));
         }
         let mut payload = vec![0u8; len];
         wire.read_exact(&mut payload).await?;
@@ -482,13 +545,14 @@ async fn demux(
                     if let Some(stream) = finished {
                         stream.finish();
                     }
-                } else {
-                    deliver(shared, id, &payload).await;
+                } else if !deliver(shared, id, &payload)? {
+                    reset(shared, id).await;
                 }
             }
             FrameKind::Reset => {
                 shared.streams().outbound.remove(&id);
             }
+            FrameKind::Credit => credit(shared, id, &payload)?,
         }
     }
 }
@@ -516,6 +580,12 @@ async fn accept_stream(
     let (inbound_writer, inbound_reader) = pipe(STREAM_BUFFER);
     let (outbound_writer, outbound_reader) = pipe(STREAM_BUFFER);
     let (stop_tx, stop_rx) = oneshot::channel();
+    let credit = Arc::new(Semaphore::new(STREAM_BUFFER));
+    tokio::spawn(grant_credit(
+        Arc::clone(shared),
+        id,
+        inbound_writer.drained(),
+    ));
     {
         let mut streams = shared.streams();
         streams
@@ -526,10 +596,17 @@ async fn accept_stream(
             Outbound {
                 _stop: stop_tx,
                 _slot: slot,
+                credit: Arc::clone(&credit),
             },
         );
     }
-    tokio::spawn(pump_peer(Arc::clone(shared), id, outbound_reader, stop_rx));
+    tokio::spawn(pump_peer(
+        Arc::clone(shared),
+        id,
+        outbound_reader,
+        stop_rx,
+        credit,
+    ));
     if incoming
         .try_send(Stream::new(outbound_writer, inbound_reader))
         .is_err()
@@ -539,17 +616,47 @@ async fn accept_stream(
     }
 }
 
-/// Writes a `Data` payload into its stream; a stream whose reader is gone is reset once.
-async fn deliver(shared: &Shared, id: u32, payload: &[u8]) {
-    // A closed stream, ours or the peer's, has no entry: its frames are dropped.
-    let Some(mut stream) = shared.streams().inbound.remove(&id) else {
-        return;
+/// Puts a `Data` payload in its stream's buffer without waiting.
+///
+/// Returns false when the stream's reader is gone, so the caller resets
+/// it once; a closed stream, ours or the peer's, has no entry and its
+/// frames are dropped. A payload the buffer cannot hold means the peer
+/// sent past its credit, and ends the connection.
+fn deliver(shared: &Shared, id: u32, payload: &[u8]) -> io::Result<bool> {
+    let mut streams = shared.streams();
+    let Some(stream) = streams.inbound.get(&id) else {
+        return Ok(true);
     };
-    if stream.write(payload).await.is_ok() {
-        shared.streams().inbound.insert(id, stream);
-    } else {
-        reset(shared, id).await;
+    match stream.push(payload) {
+        Ok(()) => Ok(true),
+        Err(Refused::Full) => Err(invalid(format!(
+            "the peer sent past its credit on stream {id}"
+        ))),
+        Err(Refused::ReaderGone) => {
+            streams.inbound.remove(&id);
+            Ok(false)
+        }
     }
+}
+
+/// Adds the credit the peer handed back for `id`; more than one buffer's worth ends the connection.
+fn credit(shared: &Shared, id: u32, payload: &[u8]) -> io::Result<()> {
+    let bytes: [u8; CREDIT_LEN] = payload
+        .try_into()
+        .map_err(|_| invalid(format!("a credit frame of {} bytes", payload.len())))?;
+    let granted = u32::from_le_bytes(bytes) as usize;
+    let streams = shared.streams();
+    // A stream this side finished or the peer reset has no entry left.
+    let Some(stream) = streams.outbound.get(&id) else {
+        return Ok(());
+    };
+    if stream.credit.available_permits().saturating_add(granted) > STREAM_BUFFER {
+        return Err(invalid(format!(
+            "the peer granted more than a buffer of credit on stream {id}"
+        )));
+    }
+    stream.credit.add_permits(granted);
+    Ok(())
 }
 
 /// Forgets the inbound half of `id` and tells the peer to stop sending on it.
@@ -711,6 +818,26 @@ mod tests {
             }
         }
         assert_eq!(failed, Some(io::ErrorKind::BrokenPipe));
+    }
+
+    /// A peer that sends more than the credit it was given ends the
+    /// connection, instead of making this side buffer or wait on one stream.
+    #[tokio::test]
+    async fn a_peer_that_sends_past_its_credit_ends_the_connection() {
+        let (mux, mut raw) = acceptor_and_raw();
+        let frame = vec![0u8; MAX_MUX_PAYLOAD];
+        for _ in 0..STREAM_BUFFER / MAX_MUX_PAYLOAD {
+            raw.send(1, FrameKind::Data, &frame).await;
+        }
+        let mut unread = mux.next().await.unwrap();
+        raw.send(1, FrameKind::Data, b"x").await;
+        let ended = tokio::time::timeout(Duration::from_secs(1), mux.next()).await;
+        assert!(ended.unwrap().is_err(), "the connection must end");
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            unread.read(&mut byte).await.unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
     }
 
     /// A stream opened but not yet written has no id; it still fails when the connection ends.

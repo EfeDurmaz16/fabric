@@ -586,6 +586,61 @@ async fn concurrent_streams_do_not_cross_under_backpressure() -> TestResult {
     Ok(())
 }
 
+/// A caller may read one stream to its end before it reads the next. Each
+/// QUIC stream has its own window; on TCP the multiplexer gives each stream
+/// its own credit, so a stream nobody reads yet stops only its own sender.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_read_later_does_not_hold_up_the_one_read_now() -> TestResult {
+    const LEN: usize = 4 << 20;
+    for kind in BOTH {
+        let (a, b) = (Node::new()?, Node::new()?);
+        let server = b.bind(kind, &[a.id()])?;
+        let client = a.bind(kind, &[b.id()])?;
+        let serving = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let connection = server.accept().await?;
+                let mut writers = Vec::new();
+                for _ in 0..2 {
+                    let mut stream = connection.next().await?;
+                    let mut ask = [0u8; 1];
+                    stream.read_exact(&mut ask).await?;
+                    writers.push(tokio::spawn(async move {
+                        stream.write_all(&vec![ask[0]; LEN]).await?;
+                        stream.shutdown().await?;
+                        let mut rest = Vec::new();
+                        stream.read_to_end(&mut rest).await.map(drop)
+                    }));
+                }
+                for writer in writers {
+                    writer.await??;
+                }
+                Ok::<(), Box<dyn Error + Send + Sync>>(())
+            })
+        };
+
+        let connection = client.connect(b.id(), server.local_addr()?).await?;
+        let mut first = connection.open().await?;
+        first.write_all(b"1").await?;
+        let mut second = connection.open().await?;
+        second.write_all(b"2").await?;
+        for (stream, byte) in [(&mut first, b'1'), (&mut second, b'2')] {
+            let mut bytes = Vec::with_capacity(LEN);
+            tokio::time::timeout(DEADLINE, stream.read_to_end(&mut bytes))
+                .await
+                .map_err(|_| format!("{kind}: stream {} stalled", char::from(byte)))??;
+            assert!(
+                bytes.len() == LEN && bytes.iter().all(|b| *b == byte),
+                "{kind}"
+            );
+            stream.shutdown().await?;
+        }
+        serving.await??;
+        connection.close();
+    }
+    Ok(())
+}
+
 /// An address that drops SYNs, such as a stale LAN address after the laptop
 /// changed networks, costs the dial timeout and not the operating system's
 /// connect timeout of a minute or more. 10.255.255.1 is routed nowhere on a
