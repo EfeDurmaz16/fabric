@@ -13,7 +13,7 @@ Core types and the network layer only. Nothing suspends or resumes yet.
 | Architecture page and glossary | Written: [docs/architecture.md](docs/architecture.md), [docs/glossary.md](docs/glossary.md) |
 | ADRs 0001 to 0013 | Written, see below; amended 2026-10-19 after the step 1 research; 0013 records the network protocol as built |
 | `crates/fabric-core` | Ids, paths, the job ledger with its record codec, the lease and the cooperative move protocol, snapshot manifests and the environment spec. Pure: no IO, no clock, no socket. Property-tested against the ADR 0003 invariants. |
-| `crates/fabric-net` | Node key, pinned TLS with no CA, QUIC and TCP+TLS transports behind one trait, framed and typed RPC with deadlines and verified chunk transfer, the peer book. Tested with two nodes in one process on both wires. See [docs/net.md](docs/net.md). |
+| `crates/fabric-net` | Node key, pinned TLS with no CA, QUIC and TCP+TLS transports on one port behind one endpoint, framed and typed RPC with deadlines, paged ledger records and verified zstd chunk transfer, the peer book. Tested with two nodes in one process on both wires. See [docs/net.md](docs/net.md). |
 | Every other crate in the layout | Does not exist yet |
 | CI | fmt, clippy, test, doc, `cargo deny` and the hygiene script on macOS and Ubuntu |
 
