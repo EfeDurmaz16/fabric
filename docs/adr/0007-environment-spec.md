@@ -31,7 +31,7 @@ EnvSpec {                        the bytes start with the format version as a va
   secret_patterns: [SecretPattern], patterns the job added to the built-in secret list; only grows; ASCII lowercase; strictly sorted
 }
 Tool      { name: ToolName, version: ToolVersion, source: Detected | Declared }   version is the pin as its file wrote it, never parsed into parts; both are 1 to 64 printable ASCII characters (no space in a name), not credential-shaped, checked on decode
-SetupStep { program: ProgramName, args: [SetupArg], cwd: Option<RelPath>, when: CachesMissing | Always }   cwd None is the root; ProgramName is a bare name, never a path or an option; a SetupArg has no control character and is not credential-shaped, checked on decode
+SetupStep { program: ProgramName, args: [SetupArg], cwd: Option<RelPath>, when: CachesMissing | Always }   cwd None is the root; ProgramName is a bare name with no control character, never a path or an option; a SetupArg has no control character and is not credential-shaped, checked on decode
 ```
 
 `program` is looked up on `PATH` and run with `args` directly, never through a shell. A spec travels with the job and a peer can send one, so there is no string for quoting bugs or a hostile `packageManager` field to hide in. Every part a peer can fill is a parsed type checked inside `Deserialize`: a tool name, pin or setup argument that holds a token or a terminal escape would otherwise reach other nodes and the prompt below. Before the node runs a spec whose id differs from the one it last ran or wrote for that job, it prints the steps and asks, unless the command was given `--yes`.
