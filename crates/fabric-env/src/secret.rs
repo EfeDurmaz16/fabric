@@ -43,13 +43,25 @@ const EVERYWHERE: &[&str] = &[
 
 /// Patterns that apply outside caches only.
 ///
-/// Many npm packages ship `*.pem` and `*.key` test fixtures, source files
-/// named `credentials.js` and `.env.example` samples, and a cache with
-/// holes looks warm and is broken, so inside a cache these do not apply.
+/// Many npm packages ship `*.pem` and `*.key` test fixtures and `ssh2`
+/// ships `id_rsa` ones, and a cache with holes looks warm and is broken,
+/// so inside a cache these do not apply. Key and credential files are
+/// listed by their exact names, not as `id_*` or `credentials*`: those
+/// globs matched source files such as `src/id_test.go` and
+/// `src/credentials.ts`, which are ordinary work.
 const OUTSIDE_CACHES: &[&str] = &[
     ".env.*",
-    "id_*",
-    "credentials*",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "id_ecdsa_sk",
+    "id_ed25519_sk",
+    "credentials",
+    "credentials.json",
+    "credentials.yml",
+    "credentials.yaml",
+    "credentials.toml",
     ".credentials*",
     "*.env",
     "*.pem",
@@ -61,6 +73,11 @@ const OUTSIDE_CACHES: &[&str] = &[
     "*.tfstate.*",
     ".docker/config.json",
 ];
+
+/// Names the built-in patterns never deny: committed templates that list
+/// variable names with empty or sample values, which agents edit as
+/// ordinary work. A pattern a job adds still denies them.
+const TEMPLATES: &[&str] = &[".env.example", ".env.sample", ".env.template", ".env.dist"];
 
 /// Where a path lies, which decides how many patterns apply to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,8 +175,13 @@ impl SecretPolicy {
             .iter()
             .chain(outside)
             .copied()
-            .chain(self.added.iter().map(Pattern::as_str))
-            .find(|pattern| path_matches(pattern, &names))
+            .find(|pattern| path_matches(pattern, &names, TEMPLATES))
+            .or_else(|| {
+                self.added
+                    .iter()
+                    .map(Pattern::as_str)
+                    .find(|pattern| path_matches(pattern, &names, &[]))
+            })
     }
 
     /// Sorts the paths git reports as changed into what capture stages, what it leaves out, and what needs consent.
@@ -283,13 +305,15 @@ fn changed_list(changed: &[Denied]) -> String {
 }
 
 /// Returns true when the components of `pattern` match a run of `names`, the components of a path.
-fn path_matches(pattern: &str, names: &[&str]) -> bool {
+///
+/// A component equal to one of `exempt`, ignoring ASCII case, matches no glob.
+fn path_matches(pattern: &str, names: &[&str], exempt: &[&str]) -> bool {
     let len = pattern.split('/').count();
     names.windows(len).any(|window| {
-        window
-            .iter()
-            .zip(pattern.split('/'))
-            .all(|(name, glob)| glob_matches(glob.as_bytes(), name.as_bytes()))
+        window.iter().zip(pattern.split('/')).all(|(name, glob)| {
+            glob_matches(glob.as_bytes(), name.as_bytes())
+                && !exempt.iter().any(|e| e.eq_ignore_ascii_case(name))
+        })
     })
 }
 
@@ -461,8 +485,17 @@ mod tests {
         ];
         let outside_caches = [
             (".env.local", ".env.*"),
-            ("id_ed25519", "id_*"),
-            ("credentials.json", "credentials*"),
+            ("id_rsa", "id_rsa"),
+            ("id_dsa", "id_dsa"),
+            ("id_ecdsa", "id_ecdsa"),
+            ("id_ed25519", "id_ed25519"),
+            ("id_ecdsa_sk", "id_ecdsa_sk"),
+            ("id_ed25519_sk", "id_ed25519_sk"),
+            ("credentials", "credentials"),
+            ("credentials.json", "credentials.json"),
+            ("credentials.yml", "credentials.yml"),
+            ("credentials.yaml", "credentials.yaml"),
+            ("credentials.toml", "credentials.toml"),
             (".credentials.json", ".credentials*"),
             ("prod.env", "*.env"),
             ("server.pem", "*.pem"),
@@ -520,9 +553,39 @@ mod tests {
             "docker/config.json",
             "envrc",
             "src/identity.rs",
+            "src/id_test.go",
+            "src/id_allocator.rs",
+            "id_rsa.pub",
+            "src/credentials.ts",
+            "lib/credentials_provider.py",
         ] {
             assert_eq!(policy.denies(&path(sample), Scope::Work), None, "{sample}");
         }
+    }
+
+    /// Env templates are committed work; `.env.*` must not deny them, in any
+    /// case or depth, while a job can still add one by name.
+    #[test]
+    fn env_templates_travel_unless_a_job_names_them() {
+        let mut policy = SecretPolicy::default();
+        for sample in [
+            ".env.example",
+            ".env.sample",
+            ".env.template",
+            ".env.dist",
+            "web/.ENV.Example",
+        ] {
+            assert_eq!(policy.denies(&path(sample), Scope::Work), None, "{sample}");
+        }
+        assert_eq!(
+            policy.denies(&path(".env.production"), Scope::Work),
+            Some(".env.*")
+        );
+        policy.widen(Pattern::parse(".env.example").unwrap());
+        assert_eq!(
+            policy.denies(&path(".env.example"), Scope::Work),
+            Some(".env.example")
+        );
     }
 
     /// A job can add a pattern and it applies inside caches too; there is no
@@ -582,7 +645,6 @@ mod tests {
     fn star_backtracks_across_repeated_text() {
         assert!(glob_matches(b"*.tfstate.*", b"a.tfstate.tfstate.bak"));
         assert!(glob_matches(b"*.env", b".env"));
-        assert!(glob_matches(b"id_*", b"id_"));
         assert!(!glob_matches(b"*.key", b"monkey"));
         assert!(!glob_matches(b"*.env", b".envrc"));
     }

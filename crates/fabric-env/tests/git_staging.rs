@@ -16,17 +16,28 @@ use fabric_env::secret::{
     Pattern, PatternError, Scope, SecretPolicy, TrackedSecretChanged, TrackedSecrets, Tracking,
 };
 
-/// Committed before the working tree changes.
+/// Committed before the working tree changes. The first five are the
+/// failure from the review: source and template files whose names an
+/// over-broad pattern matched, so their edits never reached `W`.
 const COMMITTED: &[(&str, &str)] = &[
+    (".env.example", "A=\n"),
+    ("src/id_test.go", "package src\n"),
+    ("src/credentials.ts", "export {}\n"),
     ("src/main.rs", "fn main() {}\n"),
     ("docs/notes.md", "old\n"),
     (".env.production", "PUBLIC_URL=x\n"),
     ("config/server.key", "old key\n"),
-    (".gitignore", ".env*\n!.env.local\n!server.pem\n"),
+    (
+        ".gitignore",
+        ".env*\n!.env.local\n!.env.example\n!.env.sample\n!server.pem\n",
+    ),
 ];
 
 /// Edits made to committed files after the commit; `None` deletes the file.
 const EDITS: &[(&str, Option<&str>)] = &[
+    (".env.example", Some("A=\nNEW_VAR=\n")),
+    ("src/id_test.go", Some("package src // edited\n")),
+    ("src/credentials.ts", None),
     ("docs/notes.md", Some("new\n")),
     (".env.production", None),
     ("config/server.key", Some("new key\n")),
@@ -37,8 +48,10 @@ const EDITS: &[(&str, Option<&str>)] = &[
 /// must reach `W`. No two differ only in case, so the tree is the same on
 /// a case-folding volume.
 const CREATED: &[&str] = &[
+    "src/id_allocator.rs",
     ".env",
     ".env.local",
+    ".env.sample",
     ".envrc",
     "id_ed25519",
     "credentials.json",
@@ -263,7 +276,7 @@ fn w_holds_every_tracked_change_and_no_untracked_secret() {
             .is_some();
         assert_eq!(w.contains_key(*path), !denied, "{path}");
     }
-    for kept in ["src/main.rs", "docs/keys.md"] {
+    for kept in ["src/id_allocator.rs", ".env.sample", "src/main.rs"] {
         assert!(w.contains_key(kept), "{kept}");
     }
     for out in [
