@@ -34,7 +34,7 @@ crates/
   fabric-cli       the `fabric` binary: job init, suspend, resume, job move, job steal, status, doctor, orphan export, node pair, node serve
 ```
 
-`fabric-core`, `fabric-store`, `fabric-net`, `fabric-harness` and `fabric-env` exist today; in `fabric-env`, carry keys and doctor facts are still to come. Dependency direction is strictly downward: `fabric-cli` depends on everything, `fabric-core` depends on nothing in the workspace. Today `fabric-core` defines one trait, `LedgerStore`, and `BoxFuture`, the return type of every dynamically dispatched trait, defined once. `fabric-net` defines `Transport`, the interface of one wire, because its byte streams are tokio types the core does not depend on; the node crate will hold an `Endpoint`, which binds both wires on one port and is the place an iroh endpoint would replace (ADR 0013, network). The `Harness` trait lives in `fabric-harness` for now, because its launch handle owns a child process and the core stays pure (ADR 0013, harness). Nothing in the core knows about QUIC, SQLite or any agent vendor.
+`fabric-core`, `fabric-store`, `fabric-net`, `fabric-harness` and `fabric-env` exist today; in `fabric-env`, carry keys and doctor facts are still to come. Dependency direction is strictly downward: `fabric-cli` depends on everything, `fabric-core` depends on nothing in the workspace. Today `fabric-core` defines one trait, `LedgerStore`, and `BoxFuture`, the return type of every dynamically dispatched trait, defined once. `fabric-net` defines `Transport`, the interface of one wire, because its byte streams are tokio types the core does not depend on; the node crate will hold an `Endpoint`, which binds both wires on one port and is the place an iroh endpoint would replace (ADR 0013). The `Harness` trait lives in `fabric-harness` for now, because its launch handle owns a child process and the core stays pure (ADR 0015). Nothing in the core knows about QUIC, SQLite or any agent vendor.
 
 ## Data structures first
 
@@ -140,7 +140,7 @@ If B dies between steps 7 and 9, B owns epoch 2 and the job is not lost: the sna
 
 ## How to read the ADRs
 
-Read them in number order. 0001 and 0002 define the data. 0003 is the one that protects the user's work and is worth the most review time. 0004 and 0005 are the storage and network mechanics. 0006 and 0007 are the adapters. 0008 is the explicit move and the preflight. 0009 is how we work. 0010 is what Fabric is not. 0011 and 0012 are the two decisions the preflight measurements forced: the root path and which caches travel. 0013 records the network protocol as the code built it and supersedes parts of 0005. 0013 (harness) records the harness trait as built, which supersedes the trait section of 0006. 0014 records the store as built and supersedes the parts of 0004 it names.
+Read them in number order. 0001 and 0002 define the data. 0003 is the one that protects the user's work and is worth the most review time. 0004 and 0005 are the storage and network mechanics. 0006 and 0007 are the adapters. 0008 is the explicit move and the preflight. 0009 is how we work. 0010 is what Fabric is not. 0011 and 0012 are the two decisions the preflight measurements forced: the root path and which caches travel. 0013 records the network protocol as the code built it and supersedes parts of 0005. 0014 records the store as built and supersedes the parts of 0004 it names. 0015 records the harness trait as built and supersedes the trait section of 0006.
 
 ### Evidence paths
 

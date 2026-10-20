@@ -2,7 +2,7 @@
 
 Status: accepted, 2026-10-19
 
-Amended 2026-10-20 after the first implementation (`crates/fabric-harness`, branch `feat/harness`) and its reviews: the trait section and the record of what shipped are superseded by [ADR 0013](0013-harness-trait-as-built.md), and two statements of fact are corrected in place.
+Amended 2026-10-20 after the first implementation (`crates/fabric-harness`, branch `feat/harness`) and its reviews: the trait section and the record of what shipped are superseded by [ADR 0015](0015-harness-trait-as-built.md), and two statements of fact are corrected in place.
 
 Amended 2026-10-19 after step 1 research. The section on the two first adapters now records the exact surfaces the research settled on (`2026-10-19-step1-design-input.md`, sections 1.1, 1.2, 5.3, 5.4 and decisions D13 to D17, D20, D21, D26 to D28; `step1/H1-claude-code.md`, sections 1, 6, 10 and 11; `step1/H2-codex.md`, sections 7, 9, 10 and 13; `step1/H6-environment-and-triggers.md`, section 2.4): Claude through its CLI, Codex through `codex exec resume` first and the app-server only behind a capability probe, no per-job config directories, overlays passed as flags, trust pre-seeded on the target, the harness's own tombstone written during capture, and the credential and licence rules. The trait did not change. References to the root rule now point at ADR 0011.
 
@@ -16,7 +16,7 @@ Fabric's core must not know any of this. If it does, every vendor release is a c
 
 ### The `Harness` trait
 
-Superseded on 2026-10-20 by [ADR 0013](0013-harness-trait-as-built.md), which records the trait as built: where it lives, its five methods, the manifest, and the restore rule. Three parts of the original text still hold.
+Superseded on 2026-10-20 by [ADR 0015](0015-harness-trait-as-built.md), which records the trait as built: where it lives, its five methods, the manifest, and the restore rule. Three parts of the original text still hold.
 
 - `HarnessKind = ClaudeCode | Codex | Acp { program: ProgramName, args: [String] }`. The program is a bare name (no slash, no NUL, no leading `-`, not empty) looked up on `PATH`, never run through a shell (review amendments, 2026-10-19).
 - The harness is chosen at runtime from the ledger (`--harness codex` on a job created under Claude Code), so the core holds a `Box<dyn Harness>`, and the methods return `BoxFuture`, defined in `fabric-core` (ADR 0005), because native `async fn` in a trait is not dyn compatible on the pinned toolchain. The core stores what `capture` produced as the `harness_state` tree of the snapshot (ADR 0004) and never opens it.
@@ -77,12 +77,12 @@ The core sees `harness_state` as a list of relative paths and chunk ids. The onl
 For the Claude Code adapter the contract is concrete, because the research shows what the state carries (H1, sections on the config directory and on identity):
 
 - Never included: `.credentials.json`, anything derived from the Keychain, `~/.claude.json` as a whole (it holds `oauthAccount`, `machineID`, `remoteControlMachineId`, `userID`), `sessions/`, `session-env/`, `shell-snapshots/`, `jobs/`, `daemon/`, `backups/`, `cache/`, `telemetry/`, `stats-cache.json`. Each node signs in once through Anthropic's own flow; carrying credentials would also breach the terms the research cites.
-- Redacted in the transcript and sidecars, following claude-handoff 0.3.0's rules: secret patterns, `.env` values that appear in tool results, the account email and the organization UUID in `session_context` and `credential_org` attachments. Corrected 2026-10-20: the email and the organization UUID are not redacted yet; ADR 0013, "Redaction as built", says what is and why.
+- Redacted in the transcript and sidecars, following claude-handoff 0.3.0's rules: secret patterns, `.env` values that appear in tool results, the account email and the organization UUID in `session_context` and `credential_org` attachments. Corrected 2026-10-20: the email and the organization UUID are not redacted yet; ADR 0015, "Redaction as built", says what is and why.
 - A secret inside a signed `thinking` block cannot be edited without breaking the block (next section). The adapter then drops that whole block, which the API accepts, and counts it in the report.
 
 ### State outside the root is protected like the root
 
-The workspace marker (ADR 0004) keeps a restore from writing over unpublished work in the root. Harness state lives outside the root, so the adapter must give the same guarantee itself. Before `restore` overwrites a file it owns on this node, it compares the bytes on disk with the incoming bytes: equal, or a byte prefix of the incoming file, is allowed, because nothing on disk is lost; anything else is `HarnessStateDiverged { path }` and nothing is written. This is the rule cmux uses for Claude transcripts (research H1, section 9) and it fits because transcripts only grow. Corrected 2026-10-20: not every file grows; ADR 0013 adds the rule for files a harness rewrites in place. The case it catches is the old holder of a fenced job: its transcript continued past the fork while the job's transcript continued elsewhere. The way out is `fabric orphan export`, which captures the divergent state into an orphan snapshot (ADR 0003); after that the files on disk may be replaced.
+The workspace marker (ADR 0004) keeps a restore from writing over unpublished work in the root. Harness state lives outside the root, so the adapter must give the same guarantee itself. Before `restore` overwrites a file it owns on this node, it compares the bytes on disk with the incoming bytes: equal, or a byte prefix of the incoming file, is allowed, because nothing on disk is lost; anything else is `HarnessStateDiverged { path }` and nothing is written. This is the rule cmux uses for Claude transcripts (research H1, section 9) and it fits because transcripts only grow. Corrected 2026-10-20: not every file grows; ADR 0015 adds the rule for files a harness rewrites in place. The case it catches is the old holder of a fenced job: its transcript continued past the fork while the job's transcript continued elsewhere. The way out is `fabric orphan export`, which captures the divergent state into an orphan snapshot (ADR 0003); after that the files on disk may be replaced.
 
 ### Path rewrites: none by default, never inside a signature
 
@@ -96,7 +96,7 @@ When roots differ, which no v0 path allows for Claude Code, the adapter rewrites
 
 ### What the first implementation shipped (2026-10-20)
 
-Superseded by [ADR 0013](0013-harness-trait-as-built.md), which records the code as built, what was verified against the installed binaries and what still needs a live run.
+Superseded by [ADR 0015](0015-harness-trait-as-built.md), which records the code as built, what was verified against the installed binaries and what still needs a live run.
 
 ## Alternatives considered
 
