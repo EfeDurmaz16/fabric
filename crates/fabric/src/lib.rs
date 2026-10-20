@@ -25,6 +25,7 @@ use std::net::SocketAddr;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -34,14 +35,15 @@ use fabric_core::id::{JobId, NodeId};
 use fabric_env::materialize::{CacheHealth, MaterializeError, NodeEnv, TreeLock};
 use fabric_harness::claude::{ClaudeCode, LeftReason, TrustOutcome};
 use fabric_harness::codex::Codex;
-use fabric_harness::{Harness, Launch, Running};
+use fabric_harness::{Harness, Launch, Running, SessionId, TurnReport};
 use fabric_net::endpoint::DialOrder;
 use fabricd::control::{
-    self, ControlError, Decision, NO_DAEMON_EXIT, Refusal, Request, Response, RunPlan,
+    self, ControlError, Decision, NO_DAEMON_EXIT, NamedSession, Refusal, Request, Response, RunPlan,
 };
 use fabricd::harnesses::{HarnessConfig, HarnessEnv, acp_adapter, parse_harness};
 use fabricd::node::{Node, NodeConfig};
 use fabricd::paths::{STATE_DIR_ENV, StateDir};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 mod terminal;
 
@@ -135,6 +137,9 @@ enum JobCommand {
         /// The first message to send; the goal for a new session.
         #[arg(long)]
         prompt: Option<String>,
+        /// Run one turn without a terminal, print the answer and the session, and exit.
+        #[arg(long, requires = "prompt")]
+        headless: bool,
     },
     /// Stop the harness, snapshot the workspace and record the suspend.
     Suspend {
@@ -154,6 +159,9 @@ enum JobCommand {
         /// The first message to send.
         #[arg(long)]
         prompt: Option<String>,
+        /// Run one turn without a terminal, print the answer and the session, and exit.
+        #[arg(long, requires = "prompt")]
+        headless: bool,
         /// Waive the preflight refusals that can be waived when pulling.
         #[arg(long)]
         force: bool,
@@ -387,7 +395,7 @@ async fn serve(state: StateDir, home: PathBuf, args: ServeArgs) -> Result<ExitCo
 
 async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitCode> {
     let socket = state.socket();
-    let (request, prompt) = match command {
+    let (request, mode) = match command {
         JobCommand::New {
             repo,
             goal,
@@ -401,22 +409,27 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
                     goal,
                     harness,
                 },
-                None,
+                Mode::Interactive(None),
             )
         }
-        JobCommand::Run { job, prompt } => (Request::JobRun { job }, prompt),
+        JobCommand::Run {
+            job,
+            prompt,
+            headless,
+        } => (Request::JobRun { job }, Mode::new(prompt, headless)?),
         JobCommand::Suspend { job } => (
             Request::JobSuspend {
                 job,
                 path_var: path_var(),
             },
-            None,
+            Mode::Interactive(None),
         ),
         JobCommand::Resume {
             job,
             on,
             harness,
             prompt,
+            headless,
             force,
         } => (
             Request::JobResume {
@@ -426,7 +439,7 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
                 force,
                 path_var: path_var(),
             },
-            prompt,
+            Mode::new(prompt, headless)?,
         ),
         JobCommand::Move { job, to, force } => (
             Request::JobMove {
@@ -435,21 +448,22 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
                 force,
                 path_var: path_var(),
             },
-            None,
+            Mode::Interactive(None),
         ),
-        JobCommand::Steal { job, force, reason } => {
-            (Request::JobSteal { job, reason, force }, None)
-        }
-        JobCommand::Status { job } => (Request::JobStatus { job }, None),
-        JobCommand::Ls => (Request::JobList, None),
-        JobCommand::Log { job } => (Request::JobLog { job }, None),
+        JobCommand::Steal { job, force, reason } => (
+            Request::JobSteal { job, reason, force },
+            Mode::Interactive(None),
+        ),
+        JobCommand::Status { job } => (Request::JobStatus { job }, Mode::Interactive(None)),
+        JobCommand::Ls => (Request::JobList, Mode::Interactive(None)),
+        JobCommand::Log { job } => (Request::JobLog { job }, Mode::Interactive(None)),
         JobCommand::Approve { job, note } => (
             Request::JobDecide {
                 job,
                 decision: Decision::Approve,
                 note,
             },
-            None,
+            Mode::Interactive(None),
         ),
         JobCommand::Reject { job, note } => (
             Request::JobDecide {
@@ -457,98 +471,61 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
                 decision: Decision::Reject,
                 note,
             },
-            None,
+            Mode::Interactive(None),
         ),
     };
     let Some(plan) = ask(&socket, request).await? else {
         return Ok(ExitCode::SUCCESS);
     };
-    launch(state, home, &plan, prompt).await
+    launch(state, home, &plan, mode).await
 }
 
+/// How the harness runs: attached to this terminal, or for one turn without one.
+#[derive(Debug)]
+enum Mode {
+    /// In this terminal, with the first message when there is one.
+    Interactive(Option<String>),
+    /// One turn without a terminal, started by this message (`--headless`).
+    Headless(String),
+}
+
+impl Mode {
+    fn new(prompt: Option<String>, headless: bool) -> Result<Self> {
+        match (headless, prompt) {
+            (false, prompt) => Ok(Mode::Interactive(prompt)),
+            (true, Some(prompt)) => Ok(Mode::Headless(prompt)),
+            (true, None) => bail!("--headless needs --prompt"),
+        }
+    }
+}
+
+/// How long the output of a headless harness that exited is still read,
+/// for a process it started that holds its standard output open.
+const DRAIN: Duration = Duration::from_secs(2);
+
 /// Runs the plan's setup steps, launches the harness, registers it, and waits for it.
-async fn launch(
-    state: &StateDir,
-    home: &Path,
-    plan: &RunPlan,
-    prompt: Option<String>,
-) -> Result<ExitCode> {
+async fn launch(state: &StateDir, home: &Path, plan: &RunPlan, mode: Mode) -> Result<ExitCode> {
     let tree = materialize(state, &plan.root)?;
     let socket = state.socket();
-    let env = environment();
-    let resume = plan.session.clone();
-    let harness_env = HarnessEnv::new(
-        home,
-        path_var(),
-        HarnessConfig::load(&state.harness_config())?,
-    )?;
-    let first = prompt.or_else(|| resume.is_none().then(|| plan.goal.clone()));
-    let mut running = match &plan.harness {
-        HarnessKind::ClaudeCode => {
-            let claude = ClaudeCode::new(harness_env.home.clone(), harness_env.path_var.clone());
-            let trust = claude.preseed_trust(&plan.root, &env).await?;
-            report_trust(&plan.root, &trust)?;
-            let launch = Launch::Interactive {
-                resume,
-                prompt: first,
-            };
-            claude.launch(&plan.root, launch, &env).await?
-        }
-        HarnessKind::Codex => {
-            let codex = Codex::new(harness_env.home.clone(), harness_env.path_var.clone());
-            let launch = Launch::Interactive {
-                resume,
-                prompt: first,
-            };
-            codex.launch(&plan.root, launch, &env).await?
-        }
-        HarnessKind::Acp { program, args } => {
-            let agent = acp_adapter(program, args, &harness_env)?;
-            let launch = Launch::Headless {
-                resume,
-                prompt: first.unwrap_or_else(|| "Continue.".to_owned()),
-            };
-            agent.launch(&plan.root, launch, &env).await?
-        }
-    };
+    let headless = matches!(mode, Mode::Headless(_));
+    let mut running = start(state, home, plan, mode).await?;
     let pid = running.pid();
-    let registered = control::call(
-        &socket,
-        &Request::HarnessStarted {
-            job: plan.job,
-            epoch: plan.epoch,
-            pid,
-            harness: plan.harness.clone(),
-            session: running.session().cloned(),
-        },
-    )
-    .await;
+    let registered = register(&socket, plan, &running).await;
     drop(tree);
-    match registered {
-        Ok(Response::Done { lines }) => print_lines(&lines)?,
-        Ok(Response::Failed {
-            lines,
-            error,
-            refusal,
-        }) => {
-            kill_group(&running);
-            print_lines(&lines)?;
-            return Err(Refused {
-                refusal,
-                message: format!(
-                    "the node refused the launch, so the harness was stopped: {error}"
-                ),
-            }
-            .into());
-        }
-        Ok(Response::Run { .. }) => {
-            kill_group(&running);
-            bail!("the node answered a registration with a run plan");
-        }
-        Err(e) => {
-            kill_group(&running);
-            bail!("the node could not record the launch, so the harness was stopped: {e}");
-        }
+    if let Err(e) = registered {
+        kill_group(&running);
+        return Err(e);
+    }
+    let read_line: Option<fn(&mut TurnReport, &str) -> bool> = match plan.harness {
+        HarnessKind::ClaudeCode => Some(ClaudeCode::read_headless_line),
+        HarnessKind::Codex => Some(Codex::read_headless_line),
+        // The protocol client holds an ACP agent's output.
+        HarnessKind::Acp { .. } => None,
+    };
+    if let (true, Some(read_line)) = (headless, read_line) {
+        let (report, status) = headless_turn(&socket, plan, &mut running, read_line).await?;
+        print_turn(plan, &report)?;
+        return exited(&socket, plan, pid, status).await;
     }
     // A held harness has not run yet: it gets the terminal first, then starts.
     let handed = if running.is_held() {
@@ -562,7 +539,212 @@ async fn launch(
     }
     let status = running.child_mut().wait().await?;
     drop(handed);
+    if headless {
+        print_turn(
+            plan,
+            &TurnReport {
+                session: running.session().cloned(),
+                ..TurnReport::default()
+            },
+        )?;
+    }
     exited(&socket, plan, pid, status).await
+}
+
+/// Launches the plan's harness in `mode`; held when it is interactive and
+/// standard input is a terminal.
+async fn start(state: &StateDir, home: &Path, plan: &RunPlan, mode: Mode) -> Result<Running> {
+    let env = environment();
+    let resume = plan.session.clone();
+    let harness_env = HarnessEnv::new(
+        home,
+        path_var(),
+        HarnessConfig::load(&state.harness_config())?,
+    )?;
+    let launch = match mode {
+        Mode::Headless(prompt) => Launch::Headless { resume, prompt },
+        Mode::Interactive(prompt) => Launch::Interactive {
+            prompt: prompt.or_else(|| resume.is_none().then(|| plan.goal.clone())),
+            resume,
+        },
+    };
+    Ok(match &plan.harness {
+        HarnessKind::ClaudeCode => {
+            let claude = ClaudeCode::new(harness_env.home.clone(), harness_env.path_var.clone());
+            let trust = claude.preseed_trust(&plan.root, &env).await?;
+            report_trust(&plan.root, &trust)?;
+            claude.launch(&plan.root, launch, &env).await?
+        }
+        HarnessKind::Codex => {
+            let codex = Codex::new(harness_env.home.clone(), harness_env.path_var.clone());
+            codex.launch(&plan.root, launch, &env).await?
+        }
+        HarnessKind::Acp { program, args } => {
+            let agent = acp_adapter(program, args, &harness_env)?;
+            let launch = Launch::Headless {
+                resume: launch.resume().cloned(),
+                prompt: launch.prompt().unwrap_or("Continue.").to_owned(),
+            };
+            agent.launch(&plan.root, launch, &env).await?
+        }
+    })
+}
+
+/// Tells the node the harness started, so it records it and appends
+/// `Resumed`, and prints what it answered. The caller kills the harness's
+/// group on an error.
+async fn register(socket: &Path, plan: &RunPlan, running: &Running) -> Result<()> {
+    let registered = control::call(
+        socket,
+        &Request::HarnessStarted {
+            job: plan.job,
+            epoch: plan.epoch,
+            pid: running.pid(),
+            harness: plan.harness.clone(),
+            session: running.session().cloned(),
+        },
+    )
+    .await;
+    match registered {
+        Ok(Response::Done { lines }) => print_lines(&lines),
+        Ok(Response::Failed {
+            lines,
+            error,
+            refusal,
+        }) => {
+            print_lines(&lines)?;
+            Err(Refused {
+                refusal,
+                message: format!(
+                    "the node refused the launch, so the harness was stopped: {error}"
+                ),
+            }
+            .into())
+        }
+        Ok(Response::Run { .. }) => bail!("the node answered a registration with a run plan"),
+        Err(e) => bail!("the node could not record the launch, so the harness was stopped: {e}"),
+    }
+}
+
+/// Reads a headless turn to its end: the harness's standard error goes to
+/// this command's, its standard output is read line by line into a
+/// report, and a session it names that the node does not hold yet is
+/// recorded at once, so a suspend during the turn captures it.
+async fn headless_turn(
+    socket: &Path,
+    plan: &RunPlan,
+    running: &mut Running,
+    read_line: fn(&mut TurnReport, &str) -> bool,
+) -> Result<(TurnReport, std::process::ExitStatus)> {
+    let pid = running.pid();
+    let child = running.child_mut();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("the headless harness has no standard output"))?;
+    if let Some(mut stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut stderr, &mut tokio::io::stderr()).await;
+        });
+    }
+    let mut report = TurnReport {
+        session: running.session().cloned(),
+        ..TurnReport::default()
+    };
+    let mut lines = BufReader::new(stdout).lines();
+    let mut status = None;
+    loop {
+        let line = if status.is_some() {
+            match tokio::time::timeout(DRAIN, lines.next_line()).await {
+                Ok(line) => line?,
+                Err(_) => break,
+            }
+        } else {
+            tokio::select! {
+                line = lines.next_line() => line?,
+                exit = running.child_mut().wait() => {
+                    status = Some(exit?);
+                    continue;
+                }
+            }
+        };
+        let Some(line) = line else {
+            break;
+        };
+        if read_line(&mut report, &line)
+            && let Some(session) = report.session.clone()
+        {
+            record_session(socket, plan, pid, session).await?;
+        }
+    }
+    let status = match status {
+        Some(status) => status,
+        None => running.child_mut().wait().await?,
+    };
+    Ok((report, status))
+}
+
+/// Asks the node to record `session` for the harness `pid`; a refusal is a
+/// warning, because the turn runs on either way.
+async fn record_session(
+    socket: &Path,
+    plan: &RunPlan,
+    pid: std::num::NonZeroU32,
+    session: SessionId,
+) -> Result<()> {
+    let request = Request::HarnessSession(NamedSession {
+        job: plan.job,
+        epoch: plan.epoch,
+        pid,
+        harness: plan.harness.clone(),
+        session: session.clone(),
+    });
+    let missed = match control::call(socket, &request).await {
+        Ok(Response::Done { lines }) => {
+            print_lines(&lines)?;
+            return Ok(());
+        }
+        Ok(Response::Failed { lines, error, .. }) => {
+            print_lines(&lines)?;
+            error
+        }
+        Ok(Response::Run { .. }) => "it answered with a run plan".to_owned(),
+        Err(e) => e.to_string(),
+    };
+    writeln!(
+        std::io::stderr(),
+        "warning: the node did not record {} session {session} ({missed}); a suspend of job {} does not carry it",
+        plan.harness,
+        plan.job
+    )?;
+    Ok(())
+}
+
+/// Prints what a headless turn reported: the answer on standard output,
+/// then a line naming the session; a failure, a missing answer and a
+/// missing session on standard error.
+fn print_turn(plan: &RunPlan, report: &TurnReport) -> Result<()> {
+    let harness = &plan.harness;
+    if let Some(failure) = &report.failure {
+        writeln!(std::io::stderr(), "the turn failed: {failure}")?;
+    }
+    if let Some(answer) = &report.answer {
+        writeln!(std::io::stdout(), "{answer}")?;
+    } else if report.failure.is_none() && !matches!(harness, HarnessKind::Acp { .. }) {
+        writeln!(std::io::stderr(), "warning: {harness} printed no answer")?;
+    }
+    match (&report.session, &plan.session) {
+        (Some(session), Some(planned)) if session != planned => writeln!(
+            std::io::stderr(),
+            "warning: {harness} continued in session {session}, not in {planned}"
+        )?,
+        (None, _) => writeln!(std::io::stderr(), "warning: {harness} named no session")?,
+        _ => {}
+    }
+    if let Some(session) = &report.session {
+        writeln!(std::io::stdout(), "{harness} session {session}")?;
+    }
+    Ok(())
 }
 
 /// Tells the node the harness exited and picks the exit code: the harness's
