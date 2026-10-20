@@ -746,25 +746,13 @@ fn set_refs(git: &Git, git_state: &GitState) -> Result<(), RestoreError> {
     Ok(())
 }
 
-/// Restores the repository: objects, refs, `HEAD`, the index and the working tree.
-fn restore_git(
+/// Creates the empty repository in the object format of `git_state` and writes its exclude file.
+fn init_repo(
     store: &Store,
-    snapshot: SnapshotId,
-    manifest: &SnapshotManifest,
+    git: &Git,
     git_state: &GitState,
-    target: &StagingTarget<'_>,
-    report: &mut RestoreReport,
-) -> Result<Git, RestoreError> {
-    let StagingTarget {
-        staging,
-        writer,
-        durability,
-    } = *target;
-    let power_loss = durability == Durability::PowerLoss;
-    let mut git = Git::new(staging).with_date(manifest.created_at);
-    if power_loss {
-        git = git.with_full_fsync();
-    }
+    power_loss: bool,
+) -> Result<(), RestoreError> {
     // A SHA-256 repository cannot unpack into a SHA-1 one; the manifest
     // holds one object format, read from the width of its ids.
     let format = if git_state.index_commit.is_sha256() {
@@ -787,6 +775,29 @@ fn restore_git(
             rustix::fs::fsync(&file).map_err(|e| io_err(&path, e.into()))?;
         }
     }
+    Ok(())
+}
+
+/// Restores the repository: objects, refs, `HEAD`, the index and the working tree.
+fn restore_git(
+    store: &Store,
+    snapshot: SnapshotId,
+    manifest: &SnapshotManifest,
+    git_state: &GitState,
+    target: &StagingTarget<'_>,
+    report: &mut RestoreReport,
+) -> Result<Git, RestoreError> {
+    let StagingTarget {
+        staging,
+        writer,
+        durability,
+    } = *target;
+    let power_loss = durability == Durability::PowerLoss;
+    let mut git = Git::new(staging).with_date(manifest.created_at);
+    if power_loss {
+        git = git.with_full_fsync();
+    }
+    init_repo(store, &git, git_state, power_loss)?;
 
     unbundle_chain(store, snapshot, manifest, &git, report)?;
     set_refs(&git, git_state)?;
