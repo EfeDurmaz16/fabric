@@ -118,10 +118,8 @@ impl Service for FakeService {
     ) -> BoxFuture<'_, Result<ManifestChunks, Fault>> {
         Box::pin(async move {
             tokio::time::sleep(self.manifest_delay).await;
-            Ok(ManifestChunks {
-                len: 0,
-                ids: Vec::new(),
-            })
+            ManifestChunks::new(1, vec![ChunkId::of(b"m")])
+                .map_err(|err| Fault::Internal(FaultText::truncated(&err.to_string())))
         })
     }
 

@@ -16,8 +16,11 @@ use fabric_core::id::{ChunkId, Epoch, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::FencingToken;
 use fabric_core::ledger::MAX_RECORD_LEN;
 use fabric_core::moves::MoveOffer;
+use fabric_core::snapshot::MAX_MANIFEST_LEN;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::frame::MAX_CHUNK_BYTES;
 
 /// The protocol version both sides must speak; a mismatch ends the session at `Hello`.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -68,6 +71,17 @@ pub enum WireError {
     /// The records do not fit one page of `MAX_RECORD_PAGE`.
     #[error("the records do not fit a page of {MAX_RECORD_PAGE} bytes")]
     PageFull,
+    /// A manifest is empty or longer than a reader decodes.
+    #[error("a manifest is 1 to {MAX_MANIFEST_LEN} bytes, not {0}")]
+    ManifestSize(u64),
+    /// A manifest's chunk count cannot make its length.
+    #[error("a manifest of {len} bytes cannot be {count} chunks")]
+    ManifestChunkCount {
+        /// The manifest's length.
+        len: u64,
+        /// The chunk count given.
+        count: usize,
+    },
 }
 
 /// Encodes a message as postcard bytes.
@@ -372,12 +386,58 @@ pub struct Response {
 }
 
 /// Where a snapshot's manifest is: its byte length and the chunks that make it, in order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The length is 1 to `MAX_MANIFEST_LEN` bytes, checked on decode before
+/// any chunk is fetched, so a peer cannot make this node assemble more than
+/// one manifest cap. The chunk count fits the length: each chunk holds at
+/// least one byte and at most `MAX_CHUNK_BYTES`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ManifestChunks {
-    /// The manifest's length; refused above the manifest cap before any chunk is fetched.
-    pub len: u64,
+    len: u64,
+    ids: Vec<ChunkId>,
+}
+
+impl ManifestChunks {
+    /// Wraps a manifest's length and chunk list if they are within bounds.
+    pub fn new(len: u64, ids: Vec<ChunkId>) -> Result<Self, WireError> {
+        let max = u64::try_from(MAX_MANIFEST_LEN).unwrap_or(u64::MAX);
+        if len == 0 || len > max {
+            return Err(WireError::ManifestSize(len));
+        }
+        let fewest = len.div_ceil(u64::try_from(MAX_CHUNK_BYTES).unwrap_or(u64::MAX));
+        let count = u64::try_from(ids.len()).unwrap_or(u64::MAX);
+        if count < fewest || count > len {
+            return Err(WireError::ManifestChunkCount {
+                len,
+                count: ids.len(),
+            });
+        }
+        Ok(Self { len, ids })
+    }
+
+    /// The manifest's length in bytes.
+    #[must_use]
+    pub fn byte_len(&self) -> u64 {
+        self.len
+    }
+
     /// The chunks that make the manifest, in order.
-    pub ids: Vec<ChunkId>,
+    #[must_use]
+    pub fn ids(&self) -> &[ChunkId] {
+        &self.ids
+    }
+}
+
+impl<'de> Deserialize<'de> for ManifestChunks {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Unchecked {
+            len: u64,
+            ids: Vec<ChunkId>,
+        }
+        let unchecked = Unchecked::deserialize(deserializer)?;
+        Self::new(unchecked.len, unchecked.ids).map_err(serde::de::Error::custom)
+    }
 }
 
 /// What a response carries.
@@ -621,8 +681,14 @@ mod tests {
             hello().prop_map(ResponseBody::Hello),
             Just(ResponseBody::Pong),
             job_response().prop_map(ResponseBody::Job),
-            (any::<u64>(), vec(bytes32(ChunkId::from_bytes), 0..8))
-                .prop_map(|(len, ids)| ResponseBody::ManifestChunks(ManifestChunks { len, ids })),
+            vec(bytes32(ChunkId::from_bytes), 1..8)
+                .prop_flat_map(|ids| {
+                    let count = u64::try_from(ids.len()).unwrap();
+                    (count..=count * 1024, Just(ids))
+                })
+                .prop_map(|(len, ids)| ResponseBody::ManifestChunks(
+                    ManifestChunks::new(len, ids).unwrap()
+                )),
             (bytes32(ChunkId::from_bytes), vec(any::<u8>(), 0..64))
                 .prop_map(|(id, bytes)| ResponseBody::Chunk { id, bytes }),
             Just(ResponseBody::ChunksDone),
@@ -759,6 +825,33 @@ mod tests {
         assert_eq!(page.push(one_more.clone()), Err(one_more));
         let over: Vec<Vec<u8>> = vec![vec![1; MAX_RECORD_LEN], vec![2]];
         assert!(decode::<RecordPage>(&encode(&over).unwrap()).is_err());
+    }
+
+    /// A manifest above the cap a reader decodes, or a chunk list that
+    /// cannot make the stated length, is refused before any chunk is fetched.
+    #[test]
+    fn a_manifest_outside_its_bounds_does_not_decode() {
+        let max = u64::try_from(MAX_MANIFEST_LEN).unwrap();
+        let per_chunk = u64::try_from(MAX_CHUNK_BYTES).unwrap();
+        let ids =
+            |n: u64| -> Vec<ChunkId> { (0..n).map(|i| ChunkId::of(&i.to_le_bytes())).collect() };
+        let whole = max / per_chunk;
+        assert!(ManifestChunks::new(max, ids(whole)).is_ok());
+        let refused = [
+            (max + 1, ids(whole + 1), "longer than the cap"),
+            (0, ids(1), "empty"),
+            (per_chunk + 1, ids(1), "a chunk above the chunk cap"),
+            (2, ids(3), "a chunk of no bytes"),
+        ];
+        for (len, ids, why) in refused {
+            #[derive(Serialize)]
+            struct Unchecked {
+                len: u64,
+                ids: Vec<ChunkId>,
+            }
+            let bytes = encode(&Unchecked { len, ids }).unwrap();
+            assert!(decode::<ManifestChunks>(&bytes).is_err(), "{why}");
+        }
     }
 
     #[test]
