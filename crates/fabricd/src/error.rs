@@ -184,6 +184,9 @@ pub enum NodeError {
     /// A wire value was out of bounds.
     #[error(transparent)]
     Wire(#[from] fabric_net::wire::WireError),
+    /// The fault spec of the end-to-end test is not one this build knows.
+    #[error(transparent)]
+    Fault(#[from] crate::faults::UnknownFault),
     /// A blocking task panicked or was cancelled.
     #[error("a blocking task ended early: {0}")]
     Task(String),

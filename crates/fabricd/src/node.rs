@@ -109,6 +109,7 @@ impl Node {
             Err(fs::TryLockError::Error(e)) => return Err(NodeError::io(&lock_path, e)),
         }
 
+        crate::faults::arm()?;
         let identity = NodeIdentity::load_or_generate(&cfg.state.node_key())?;
         let peers = Peers::open(cfg.state.peers())?;
         let store = open_store(&cfg.state.store())?;

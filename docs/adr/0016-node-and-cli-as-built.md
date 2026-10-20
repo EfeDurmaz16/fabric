@@ -98,7 +98,7 @@ Capture measures carry keys with `fabric-env` detection: a cache detection does 
 
 ### Fault points
 
-`fabricd` has a `faults` feature, on only in the end-to-end test's build. With it, `FABRIC_FAULT=<point>[:<action>]` arms one of `after_quiesce`, `after_snapshot_publish`, `after_departing_write`, `mid_transfer` and `after_import_receipt`, with `crash` (stop, write the signal file, wait for `SIGKILL`), `stall`, `drop` or `dup`. Without the feature the function is empty and nothing reads the environment.
+`fabricd` has a `faults` feature, on only in the end-to-end test's build. With it, `FABRIC_FAULT=<point>[:<action>]` arms one of `after_quiesce`, `after_snapshot_publish`, `after_departing_write`, `mid_transfer` and `after_import_receipt`, with `crash` (stop, write the signal file, wait for `SIGKILL`), `stall` (two seconds), `hold` (until the test removes the signal file), `drop` or `dup`. A point fires once per daemon process. The value is read once at start, and one that names an unknown point or action stops the node there. Without the feature the functions are empty and nothing reads the environment.
 
 ## Alternatives considered
 
