@@ -286,11 +286,11 @@ pub enum ManagerSource {
 
 impl fmt::Display for ManagerSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            ManagerSource::OverrideFile => "`package_manager` in .fabric/env.toml",
-            ManagerSource::PackageManagerField => "`packageManager` in package.json",
-            ManagerSource::Lockfile => "the only lockfile",
-        })
+        match self {
+            ManagerSource::OverrideFile => write!(f, "`package_manager` in {OVERRIDE_FILE}"),
+            ManagerSource::PackageManagerField => f.write_str("`packageManager` in package.json"),
+            ManagerSource::Lockfile => f.write_str("the only lockfile"),
+        }
     }
 }
 

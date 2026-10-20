@@ -51,7 +51,6 @@ pub const OVERRIDE_FILE: &str = ".fabric/env.toml";
 
 /// The directory that holds Fabric's own files in a workspace; never a cache.
 const FABRIC_DIR: &str = ".fabric";
-const FABRIC_DIR_PREFIX: &str = ".fabric/";
 
 /// Why the override file was refused.
 #[derive(Debug, thiserror::Error)]
@@ -486,11 +485,11 @@ fn caches(value: &Value) -> Result<Vec<DeclaredCache>, OverrideError> {
         }
         // A cache is dropped on a carry mismatch, so a path that holds
         // Fabric's own files or the user's work must not become one by accident.
-        if path.as_str().eq_ignore_ascii_case(FABRIC_DIR)
-            || path
-                .as_str()
-                .get(..FABRIC_DIR_PREFIX.len())
-                .is_some_and(|head| head.eq_ignore_ascii_case(FABRIC_DIR_PREFIX))
+        if path
+            .as_str()
+            .split('/')
+            .next()
+            .is_some_and(|first| first.eq_ignore_ascii_case(FABRIC_DIR))
         {
             return Err(OverrideError::ReservedCache { key: path_key });
         }
@@ -567,11 +566,12 @@ fn required<'a>(entry: &'a Table, name: &str, key: &str) -> Result<&'a Value, Ov
 
 /// Returns `key` when it is safe to quote in an error, or a placeholder.
 ///
-/// A key the file wrote is quoted only when it is at most 64 printable
-/// ASCII characters with no space and not shaped like a credential, so a
-/// token typed where a key belongs never reaches a terminal or a log.
+/// A key the file wrote is quoted only when it passes the rule a tool name
+/// does: at most `MAX_PIN_LEN` printable ASCII characters with no space
+/// and not shaped like a credential, so a token typed where a key belongs
+/// never reaches a terminal or a log.
 fn shown(key: &str) -> &str {
-    if key.len() <= 64 && key.bytes().all(|b| b.is_ascii_graphic()) && !looks_like_credential(key) {
+    if ToolName::parse(key).is_ok() {
         key
     } else {
         "<key not shown>"
