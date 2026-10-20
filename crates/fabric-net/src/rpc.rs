@@ -47,6 +47,13 @@ pub const CLOCK_SKEW_WARN_MS: u64 = 10_000;
 /// How often a serving session re-reads the trust decision, so an unpair ends a connection that stays open.
 pub const TRUST_RECHECK: Duration = Duration::from_secs(5);
 
+/// How long a peer may take to send one whole request on a stream it opened.
+///
+/// A request is at most one control frame, so this allows a link of about
+/// 35 KiB/s, and a peer that sends part of a frame and stops gives its
+/// stream back.
+pub const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Why a call failed.
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
@@ -696,7 +703,12 @@ async fn reply(
 
 async fn handle(peer: NodeId, stream: Stream, service: Arc<dyn Service>) -> Result<(), RpcError> {
     let (mut send, mut recv) = stream.split();
-    let bytes = read_frame(&mut recv, MAX_CONTROL_FRAME).await?;
+    let bytes = timeout(
+        REQUEST_READ_TIMEOUT,
+        read_frame(&mut recv, MAX_CONTROL_FRAME),
+    )
+    .await
+    .map_err(|_| RpcError::Deadline(REQUEST_READ_TIMEOUT))??;
     let request: Request = decode(&bytes)?;
     let budget = Duration::from_millis(u64::from(request.budget_ms));
     let id = request.id;
@@ -1025,6 +1037,26 @@ mod tests {
         assert!(session.ping(IDLE * 10).await.is_err());
         assert!(matches!(serving.await.unwrap(), RpcError::Unpaired(_)));
         assert!(started.elapsed() < TRUST_RECHECK);
+    }
+
+    /// A paired peer that sends part of a request and stops gets its stream
+    /// ended after `REQUEST_READ_TIMEOUT`; it does not hold the stream and
+    /// its task for as long as keep-alives hold the connection.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_that_stops_halfway_loses_its_stream() {
+        let (session, _serving) = serving_pair(Arc::new(Revocable(true.into()))).await;
+        let mut stream = session.connection.open().await.unwrap();
+        stream.write_all(&[64, 0, 0]).await.unwrap();
+        let started = tokio::time::Instant::now();
+        let mut answer = Vec::new();
+        let ended = timeout(
+            REQUEST_READ_TIMEOUT * 2,
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut answer),
+        )
+        .await;
+        assert!(ended.is_ok(), "the server kept the stream");
+        assert!(answer.is_empty());
+        assert!(started.elapsed() >= REQUEST_READ_TIMEOUT);
     }
 
     /// A stream that failed inside a frame never reads again.
