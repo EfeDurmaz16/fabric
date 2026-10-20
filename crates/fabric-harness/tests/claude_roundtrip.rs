@@ -23,6 +23,7 @@ use fabric_harness::{Harness, HarnessError, Io, Launch, SessionId};
 const SID: &str = "9c9796f0-2682-4546-a963-d314b3ad543f";
 const SECRET: &str = "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456";
 const GITHUB: &str = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab";
+const PEM: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----\n";
 
 struct Fixture {
     home: tempfile::TempDir,
@@ -88,6 +89,11 @@ fn build_source(work_rel: &str) -> Fixture {
     std::fs::write(
         project.join(format!("{SID}/tool-results/1.txt")),
         format!("big output mentioning {root}\nand token {SECRET}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(format!("{SID}/tool-results/2.txt")),
+        format!("cat ~/.ssh/id_ed25519\n{PEM}done\n"),
     )
     .unwrap();
     std::fs::write(project.join("memory/MEMORY.md"), "# memory\n").unwrap();
@@ -214,9 +220,10 @@ async fn capture_carries_session_state_only_and_redacts() {
         vec![
             ("anthropic-key", 2),
             ("github-token", 1),
+            ("private-key-block", 1),
             ("signed-block-dropped", 1)
         ],
-        "one match in the transcript, one in the text sidecar, one in file history, one block dropped"
+        "one match in the transcript, one in the text sidecar, one in file history, a key over three lines, one block dropped"
     );
     let staged_path = out
         .path()
@@ -236,6 +243,14 @@ async fn capture_carries_session_state_only_and_redacts() {
     .unwrap();
     assert!(!results.contains(SECRET));
     assert!(results.contains("[REDACTED:anthropic-key]"));
+    let key_results = std::fs::read_to_string(out.path().join(format!(
+        "home/.claude/projects/{key}/{SID}/tool-results/2.txt"
+    )))
+    .unwrap();
+    assert_eq!(
+        key_results,
+        "cat ~/.ssh/id_ed25519\n[REDACTED:private-key-block]\ndone\n"
+    );
     let history = std::fs::read_to_string(
         out.path()
             .join(format!("home/.claude/file-history/{SID}/abc@v1")),

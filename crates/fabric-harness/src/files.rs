@@ -314,6 +314,10 @@ struct Transfer<'a> {
     out: &'a mut dyn Write,
     redactor: &'a Redactor,
     counts: &'a mut RedactionCounts,
+    /// True while the text being read is inside a PEM private key block
+    /// whose BEGIN line was on an earlier line: such lines are dropped up
+    /// to and including the END line.
+    in_private_key: bool,
 }
 
 impl Transfer<'_> {
@@ -363,9 +367,31 @@ impl Transfer<'_> {
         Ok(())
     }
 
-    /// Redacts one line as text: as UTF-8 when it is, as bytes when it is
-    /// not, so a line cut inside a multi-byte character keeps its bytes.
+    /// Redacts one line as text, carrying a PEM private key block across
+    /// lines: the BEGIN line is redacted from the header to its end, every
+    /// later line up to the END line is dropped, and what follows the END
+    /// header on its line is redacted like any other text. A block with no
+    /// END line is dropped to the end of the file.
     fn text_line(&mut self, line: &[u8]) -> Result<(), HarnessError> {
+        if self.in_private_key {
+            let Some(end) = self.redactor.private_key_end(line) else {
+                return Ok(());
+            };
+            self.in_private_key = false;
+            let rest = &line[end..];
+            return if rest.trim_ascii().is_empty() {
+                Ok(())
+            } else {
+                self.text_line(rest)
+            };
+        }
+        self.in_private_key = self.redactor.opens_private_key(line);
+        self.plain_line(line)
+    }
+
+    /// Redacts one line on its own: as UTF-8 when it is, as bytes when it
+    /// is not, so a line cut inside a multi-byte character keeps its bytes.
+    fn plain_line(&mut self, line: &[u8]) -> Result<(), HarnessError> {
         let (body, newline) = split_newline(line);
         let redacted: Option<Vec<u8>> = match std::str::from_utf8(body) {
             Ok(text) => self
@@ -416,6 +442,10 @@ impl Transfer<'_> {
         let mut number = 0usize;
         while self.next_line(reader, &mut line)? {
             number += 1;
+            if self.in_private_key {
+                self.text_line(&line)?;
+                continue;
+            }
             let (body, newline) = split_newline(&line);
             let Ok(text) = std::str::from_utf8(body) else {
                 warn!(path = %self.src.display(), line = number, "not UTF-8; redacted as bytes");
@@ -473,6 +503,7 @@ fn transfer(
         out,
         redactor,
         counts,
+        in_private_key: false,
     };
     match carry {
         Carry::Opaque => step.opaque(&mut reader),
@@ -1027,6 +1058,57 @@ mod tests {
             fs::read(&staged).unwrap(),
             b"key [REDACTED:aws-access-key] here\n\xffraw\n",
             "a line that is not UTF-8 is kept byte for byte"
+        );
+    }
+
+    const PEM: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\nQyNTUxOQAAACBkZXZpY2Uta2V5\n-----END OPENSSH PRIVATE KEY-----\n";
+
+    #[test]
+    fn a_private_key_over_several_lines_is_redacted_as_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        fs::write(&src, format!("before\nkey: {PEM}after\n")).unwrap();
+        let mut counts = RedactionCounts::new();
+        stage(
+            &[source(src, "home/a.txt", Carry::Text)],
+            &dir.path().join("out"),
+            &mut counts,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("out/home/a.txt")).unwrap(),
+            "before\nkey: [REDACTED:private-key-block]\nafter\n"
+        );
+        assert_eq!(counts.get("private-key-block"), Some(&1));
+
+        // A file cut inside the key loses everything after the BEGIN line.
+        let cut = &PEM[..PEM.find("QyNT").unwrap()];
+        let (staged, _) = stage_one(
+            dir.path(),
+            "cut.txt",
+            format!("x\n{cut}").as_bytes(),
+            Carry::Text,
+        );
+        assert_eq!(
+            fs::read_to_string(staged).unwrap(),
+            "x\n[REDACTED:private-key-block]\n"
+        );
+    }
+
+    #[test]
+    fn a_private_key_over_several_lines_refuses_an_opaque_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("s1.json");
+        fs::write(&src, format!("{{\n\"k\": \"x\"\n}}\n{PEM}")).unwrap();
+        let err = stage(
+            &[source(src, "home/s1.json", Carry::OpaqueRefuseSecrets)],
+            &dir.path().join("out"),
+            &mut RedactionCounts::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, HarnessError::SecretInState { line: 4, .. }),
+            "{err}"
         );
     }
 

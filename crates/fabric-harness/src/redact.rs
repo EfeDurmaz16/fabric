@@ -16,7 +16,11 @@ pub type RedactionCounts = BTreeMap<&'static str, u32>;
 /// Secret-shaped text that must never leave the machine it was typed on.
 pub struct Redactor {
     rules: Vec<Rule>,
+    key_end: BytesRegex,
 }
+
+/// The line that closes a PEM private key block.
+const KEY_END: &str = r"-----END [A-Z ]*PRIVATE KEY-----";
 
 struct Rule {
     name: &'static str,
@@ -85,7 +89,7 @@ const PATTERNS: &[Pattern] = &[
     },
     Pattern {
         name: "private-key-block",
-        regex: r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+        regex: r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----|[\s\S]*)",
         accept: any,
     },
     Pattern {
@@ -158,7 +162,11 @@ fn build(patterns: &[Pattern]) -> Result<Redactor, BadRule> {
             })
         })
         .collect::<Result<Vec<Rule>, BadRule>>()?;
-    Ok(Redactor { rules })
+    let key_end = BytesRegex::new(KEY_END).map_err(|e| BadRule {
+        rule: "private-key-block",
+        reason: e.to_string(),
+    })?;
+    Ok(Redactor { rules, key_end })
 }
 
 static STANDARD: LazyLock<Result<Redactor, BadRule>> = LazyLock::new(|| build(PATTERNS));
@@ -172,6 +180,29 @@ impl Redactor {
     /// compile, and then nothing may be captured.
     pub fn standard() -> Result<&'static Redactor, BadRule> {
         STANDARD.as_ref().map_err(Clone::clone)
+    }
+
+    /// Where a PEM private key block opened on an earlier line ends in
+    /// `bytes`: the offset just past its END line, or `None` when the block
+    /// goes on. A block whose BEGIN line has no END after it is redacted to
+    /// the end of that text, so a caller that reads line by line uses this
+    /// to drop every line up to the END line.
+    #[must_use]
+    pub fn private_key_end(&self, bytes: &[u8]) -> Option<usize> {
+        self.key_end.find(bytes).map(|m| m.end())
+    }
+
+    /// True when the last PEM private key BEGIN line in `bytes` has no END
+    /// line after it, so the block continues on the next line.
+    #[must_use]
+    pub fn opens_private_key(&self, bytes: &[u8]) -> bool {
+        let Some(rule) = self.rules.iter().find(|r| r.name == "private-key-block") else {
+            return false;
+        };
+        rule.bytes
+            .find_iter(bytes)
+            .last()
+            .is_some_and(|m| self.key_end.find(m.as_bytes()).is_none())
     }
 
     /// Returns true when any rule matches somewhere in `text`.
