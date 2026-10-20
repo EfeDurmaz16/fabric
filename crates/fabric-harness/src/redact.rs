@@ -37,6 +37,9 @@ struct Pattern {
     accept: fn(&[u8]) -> bool,
 }
 
+/// A pattern with a capture group named `keep` keeps that part and
+/// replaces only the rest: `DB_PASSWORD=` stays, its value does not.
+///
 /// `(?-u:\b)` is an ASCII word boundary. Every key shape starts on one, so
 /// a prefix such as `sk-` inside an ordinary word (`disk-usage`,
 /// `task-list`) never starts a match, and the text and byte forms of a rule
@@ -101,6 +104,16 @@ const PATTERNS: &[Pattern] = &[
         name: "bearer-token",
         regex: r"(?i)(?-u:\b)bearer[ \t]+[A-Za-z0-9._~+/\-]{20,}=*",
         accept: bearer_value_is_token,
+    },
+    Pattern {
+        name: "url-credentials",
+        regex: r"(?-u:\b)(?P<keep>[A-Za-z][A-Za-z0-9+.\-]*://)[^\s/:@]+:[^\s/@]+@",
+        accept: any,
+    },
+    Pattern {
+        name: "secret-assignment",
+        regex: r#"(?-u:\b)(?P<keep>[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|ACCESS_KEY|CREDENTIALS|DATABASE_URL|DSN)[A-Z0-9_]*=['"]?)[^\s'"$\[][^\s'"]{3,}"#,
+        accept: any,
     },
 ];
 
@@ -238,7 +251,8 @@ impl Redactor {
                 let found = caps.get(0).map_or("", |m| m.as_str());
                 if (rule.accept)(found.as_bytes()) {
                     n += 1;
-                    marker.clone()
+                    let keep = caps.name("keep").map_or("", |m| m.as_str());
+                    format!("{keep}{marker}")
                 } else {
                     found.to_owned()
                 }
@@ -266,7 +280,12 @@ impl Redactor {
                     let found = caps.get(0).map_or(&b""[..], |m| m.as_bytes());
                     if (rule.accept)(found) {
                         n += 1;
-                        marker.clone()
+                        let mut out = caps
+                            .name("keep")
+                            .map_or(&b""[..], |m| m.as_bytes())
+                            .to_vec();
+                        out.extend_from_slice(&marker);
+                        out
                     } else {
                         found.to_vec()
                     }
@@ -369,5 +388,37 @@ mod tests {
         ] {
             assert!(r.matches(text), "{text} must match");
         }
+    }
+
+    #[test]
+    fn credentials_in_urls_and_secret_named_assignments_keep_their_names() {
+        let r = Redactor::standard().unwrap();
+        let mut counts = RedactionCounts::new();
+        let text = "DATABASE_URL=postgres://admin:hunter2@db.internal/prod DB_PASSWORD='s3cr3t-value' API_KEY=${API_KEY} PORT=5432";
+        assert_eq!(
+            r.apply(text, &mut counts).unwrap(),
+            "DATABASE_URL=[REDACTED:secret-assignment] DB_PASSWORD='[REDACTED:secret-assignment]' API_KEY=${API_KEY} PORT=5432"
+        );
+        assert_eq!(counts.get("url-credentials"), Some(&1));
+        assert_eq!(counts.get("secret-assignment"), Some(&2));
+        assert_eq!(
+            r.apply(
+                "clone https://bot:ghs_x1@git.example.com/r.git",
+                &mut counts
+            )
+            .unwrap(),
+            "clone https://[REDACTED:url-credentials]git.example.com/r.git"
+        );
+        let once = r
+            .apply(
+                "GITHUB_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab",
+                &mut counts,
+            )
+            .unwrap();
+        assert_eq!(once, "GITHUB_TOKEN=[REDACTED:github-token]");
+        assert!(
+            r.apply(&once, &mut counts).is_none(),
+            "a marker is never redacted again"
+        );
     }
 }
