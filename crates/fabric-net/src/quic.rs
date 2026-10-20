@@ -8,8 +8,11 @@
 //! stalls one does not hold up the next, and only after the peer's address
 //! answered a Retry, so a spoofed source takes no handshake slot.
 
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use fabric_core::BoxFuture;
@@ -17,6 +20,7 @@ use fabric_core::id::NodeId;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{IdleTimeout, VarInt};
 use rustls::pki_types::CertificateDer;
+use tokio::io::AsyncWrite;
 
 use crate::accept::{Handshakes, Inbox};
 use crate::identity::NodeIdentity;
@@ -238,19 +242,68 @@ impl Connection for QuicConnection {
     fn open(&self) -> BoxFuture<'_, Result<Stream, TransportError>> {
         Box::pin(async {
             let (send, recv) = self.inner.open_bi().await.map_err(closed)?;
-            Ok(Stream::new(send, recv))
+            Ok(Stream::new(SendHalf::new(send), recv))
         })
     }
 
     fn next(&self) -> BoxFuture<'_, Result<Stream, TransportError>> {
         Box::pin(async {
             let (send, recv) = self.inner.accept_bi().await.map_err(closed)?;
-            Ok(Stream::new(send, recv))
+            Ok(Stream::new(SendHalf::new(send), recv))
         })
     }
 
     fn close(&self) {
         self.inner.close(VarInt::from_u32(0), b"close");
+    }
+}
+
+/// A stream's send half that resets the stream when dropped in the middle of a write.
+///
+/// quinn finishes a send stream that is dropped, so the bytes already
+/// written are still sent and the stream stays open until the peer reads
+/// them. A write cut off by its caller's timeout must not leave that, so
+/// a drop while a write waits on flow control resets the stream instead:
+/// its bytes are dropped and the peer's read fails.
+struct SendHalf {
+    inner: quinn::SendStream,
+    mid_write: bool,
+}
+
+impl SendHalf {
+    fn new(inner: quinn::SendStream) -> Self {
+        Self {
+            inner,
+            mid_write: false,
+        }
+    }
+}
+
+impl AsyncWrite for SendHalf {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let polled = AsyncWrite::poll_write(Pin::new(&mut self.inner), cx, data);
+        self.mid_write = polled.is_pending();
+        polled
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        AsyncWrite::poll_flush(Pin::new(&mut self.inner), cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        AsyncWrite::poll_shutdown(Pin::new(&mut self.inner), cx)
+    }
+}
+
+impl Drop for SendHalf {
+    fn drop(&mut self) {
+        if self.mid_write {
+            let _ = self.inner.reset(VarInt::from_u32(0));
+        }
     }
 }
 
@@ -267,16 +320,13 @@ mod tests {
         }
     }
 
-    /// A paired peer cannot open a unidirectional stream: nothing would
-    /// read it, so it would hold buffered bytes with no deadline.
-    #[tokio::test]
-    async fn a_peer_gets_no_unidirectional_stream() {
+    /// An acceptor transport and a raw quinn connection to it from a second node, both paired with everyone.
+    async fn raw_pair() -> (QuicTransport, QuicTransport, quinn::Connection) {
         let loopback: SocketAddr = ([127, 0, 0, 1], 0).into();
         let server = NodeIdentity::generate().unwrap();
         let acceptor = QuicTransport::bind(&server, Arc::new(Everyone), loopback).unwrap();
         let dialer_id = NodeIdentity::generate().unwrap();
         let dialer = QuicTransport::bind(&dialer_id, Arc::new(Everyone), loopback).unwrap();
-
         let rustls_config = dialer
             .credentials
             .client_config(server.node_id(), &Arc::new(Refusal::default()))
@@ -291,6 +341,14 @@ mod tests {
             .unwrap()
             .await
             .unwrap();
+        (acceptor, dialer, connection)
+    }
+
+    /// A paired peer cannot open a unidirectional stream: nothing would
+    /// read it, so it would hold buffered bytes with no deadline.
+    #[tokio::test]
+    async fn a_peer_gets_no_unidirectional_stream() {
+        let (acceptor, _dialer, connection) = raw_pair().await;
         let _accepted = acceptor.accept().await.unwrap();
 
         let opened = tokio::time::timeout(Duration::from_millis(500), connection.open_uni()).await;
@@ -299,5 +357,43 @@ mod tests {
             "the acceptor gave credit for a unidirectional stream"
         );
         assert!(connection.open_bi().await.is_ok());
+    }
+
+    /// A send half dropped while its write waits on flow control, as a
+    /// reply that stalled past its limit is, resets the stream: the peer's
+    /// read fails instead of the stream staying open until it reads on.
+    #[tokio::test]
+    async fn a_send_half_dropped_mid_write_resets_its_stream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (acceptor, _dialer, connection) = raw_pair().await;
+        let accepted = acceptor.accept().await.unwrap();
+        let (mut ask, mut answer) = connection.open_bi().await.unwrap();
+        ask.write_all(b"ask").await.unwrap();
+        ask.finish().unwrap();
+        let mut answering = accepted.next().await.unwrap();
+        let mut asked = Vec::new();
+        answering.read_to_end(&mut asked).await.unwrap();
+        let stalled = tokio::time::timeout(
+            Duration::from_millis(200),
+            answering.write_all(&vec![0u8; 8 << 20]),
+        )
+        .await;
+        assert!(
+            stalled.is_err(),
+            "the peer never ran out of flow control credit"
+        );
+        drop(answering);
+
+        let read = tokio::time::timeout(Duration::from_secs(2), answer.read_to_end(usize::MAX))
+            .await
+            .expect("the read never ended");
+        assert!(
+            matches!(
+                read,
+                Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(_)))
+            ),
+            "{read:?}"
+        );
     }
 }
