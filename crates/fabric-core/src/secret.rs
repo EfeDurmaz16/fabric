@@ -421,15 +421,27 @@ fn pattern_matches(pattern: &SecretPattern, path: &str) -> bool {
 
 /// Returns true when the components of `pattern` match a run of `names`, the components of a path.
 ///
-/// A component equal to one of `exempt`, ignoring ASCII case, matches no glob.
+/// The last component of the path, when it equals one of `exempt`
+/// ignoring ASCII case, matches no glob. Only the last: a template is a
+/// file, and a directory that takes a template's name, such as
+/// `.env.example/password.txt`, denies what it holds like any other match.
 fn path_matches(pattern: &str, names: &[&str], exempt: &[&str]) -> bool {
-    let len = pattern.split('/').count();
-    names.windows(len).any(|window| {
-        window.iter().zip(pattern.split('/')).all(|(name, glob)| {
-            glob_matches(glob.as_bytes(), name.as_bytes())
-                && !exempt.iter().any(|e| e.eq_ignore_ascii_case(name))
+    let globs: Vec<&str> = pattern.split('/').collect();
+    let last = names.len().saturating_sub(1);
+    names
+        .windows(globs.len())
+        .enumerate()
+        .any(|(start, window)| {
+            window
+                .iter()
+                .zip(&globs)
+                .enumerate()
+                .all(|(offset, (name, glob))| {
+                    glob_matches(glob.as_bytes(), name.as_bytes())
+                        && !(start + offset == last
+                            && exempt.iter().any(|e| e.eq_ignore_ascii_case(name)))
+                })
         })
-    })
 }
 
 /// Matches one component: `*` is any run of bytes, every other byte matches itself ignoring ASCII case.
@@ -563,7 +575,8 @@ mod tests {
     }
 
     /// Env templates are committed work; `.env.*` must not deny them, in any
-    /// case or depth, while a job can still add one by name.
+    /// case or depth, while a job can still add one by name. A directory
+    /// with a template's name is not a template, so what it holds is denied.
     #[test]
     fn env_templates_travel_unless_a_job_names_them() {
         let mut policy = SecretPolicy::default();
@@ -578,6 +591,10 @@ mod tests {
         }
         assert_eq!(
             policy.denies(&path(".env.production"), Scope::Work),
+            Some(".env.*")
+        );
+        assert_eq!(
+            policy.denies(&path(".env.example/password.txt"), Scope::Work),
             Some(".env.*")
         );
         policy.widen(SecretPattern::parse(".env.example").unwrap());
