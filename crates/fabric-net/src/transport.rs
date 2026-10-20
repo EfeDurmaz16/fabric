@@ -19,6 +19,15 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::tls::TlsError;
 
+/// A connection that has read nothing for this long is closed, on either wire.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often an idle connection sends a keep-alive on either wire, so NAT bindings stay open.
+pub const KEEP_ALIVE: Duration = Duration::from_secs(10);
+
+/// How long a dial may take by default on either wire, connect and handshake together.
+pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Which wire carries a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransportKind {
@@ -171,6 +180,9 @@ pub trait Transport: Send + Sync {
     /// The local address this transport is bound to.
     fn local_addr(&self) -> Result<SocketAddr, TransportError>;
     /// Dials `addr` and accepts the connection only if the peer proves it is `peer`.
+    ///
+    /// Each wire bounds the dial with its own dial timeout, `DIAL_TIMEOUT`
+    /// unless set, and fails with `TransportError::Timeout` past it.
     fn connect(
         &self,
         peer: NodeId,

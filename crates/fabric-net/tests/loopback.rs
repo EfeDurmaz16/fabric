@@ -743,31 +743,37 @@ async fn a_stream_read_later_does_not_hold_up_the_one_read_now() -> TestResult {
     Ok(())
 }
 
-/// An address that drops SYNs, such as a stale LAN address after the laptop
-/// changed networks, costs the dial timeout and not the operating system's
-/// connect timeout of a minute or more. 10.255.255.1 is routed nowhere on a
-/// typical host; where it is refused at once instead, the dial still ends
-/// within the budget.
+/// A peer that never finishes the handshake, such as a stale address that
+/// now swallows packets, costs the dial timeout on either wire, not the
+/// operating system's connect timeout or quinn's idle timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_dial_to_a_black_hole_ends_within_the_dial_timeout() -> TestResult {
+async fn a_dial_whose_handshake_never_finishes_ends_at_the_dial_timeout() -> TestResult {
     let (a, b) = (Node::new()?, Node::new()?);
     let trust: Arc<dyn Trust> = Arc::new(Paired(vec![b.id()]));
+    let any: SocketAddr = ([127, 0, 0, 1], 0).into();
     let budget = Duration::from_millis(300);
-    let client = TcpTlsTransport::bind(&a.identity, trust, ([127, 0, 0, 1], 0).into())?
-        .with_dial_timeout(budget);
-    let started = std::time::Instant::now();
-    let dialed = client
-        .connect(b.id(), ([10, 255, 255, 1], 7777).into())
-        .await;
-    assert!(
-        matches!(
-            dialed,
-            Err(TransportError::Timeout(d)) if d == budget
-        ) || matches!(dialed, Err(TransportError::Io(_))),
-        "{:?}",
-        dialed.err()
-    );
-    assert!(started.elapsed() < Duration::from_secs(2));
+    // UDP that reads every datagram and answers none.
+    let silent_udp = std::net::UdpSocket::bind(any)?;
+    // TCP that completes the connect and never speaks TLS.
+    let silent_tcp = tokio::net::TcpListener::bind(any).await?;
+    let quic: Arc<dyn Transport> =
+        Arc::new(QuicTransport::bind(&a.identity, trust.clone(), any)?.with_dial_timeout(budget));
+    let tcp: Arc<dyn Transport> =
+        Arc::new(TcpTlsTransport::bind(&a.identity, trust, any)?.with_dial_timeout(budget));
+    for (transport, addr) in [
+        (quic, silent_udp.local_addr()?),
+        (tcp, silent_tcp.local_addr()?),
+    ] {
+        let started = std::time::Instant::now();
+        let dialed = transport.connect(b.id(), addr).await;
+        assert!(
+            matches!(dialed, Err(TransportError::Timeout(d)) if d == budget),
+            "{}: {:?}",
+            transport.kind(),
+            dialed.err()
+        );
+        assert!(started.elapsed() < budget + Duration::from_secs(1));
+    }
     Ok(())
 }
 

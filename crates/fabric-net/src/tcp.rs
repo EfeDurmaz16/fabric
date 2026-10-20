@@ -19,10 +19,7 @@ use crate::accept::{Handshakes, Inbox};
 use crate::identity::NodeIdentity;
 use crate::mux::{Mux, Side};
 use crate::tls::{Credentials, Refusal, TlsError, Trust, peer_of};
-use crate::transport::{Connection, Transport, TransportError, TransportKind};
-
-/// How long a dial may take by default, TCP connect and TLS handshake together.
-pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+use crate::transport::{Connection, DIAL_TIMEOUT, Transport, TransportError, TransportKind};
 
 /// A TCP listener that dials and accepts under one node identity.
 pub struct TcpTlsTransport {

@@ -55,8 +55,9 @@ use tokio::task::AbortHandle;
 
 use crate::idle::IdleReader;
 use crate::pipe::{Drained, PipeReader, PipeWriter, Refused, pipe};
-use crate::quic::{IDLE_TIMEOUT, KEEP_ALIVE};
-use crate::transport::{Connection, Stream, TransportError, TransportKind};
+use crate::transport::{
+    Connection, IDLE_TIMEOUT, KEEP_ALIVE, Stream, TransportError, TransportKind,
+};
 
 /// The most payload bytes in one multiplexer frame.
 pub(crate) const MAX_MUX_PAYLOAD: usize = 64 << 10;

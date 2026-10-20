@@ -21,19 +21,17 @@ use rustls::pki_types::CertificateDer;
 use crate::accept::{Handshakes, Inbox};
 use crate::identity::NodeIdentity;
 use crate::tls::{Credentials, Refusal, SERVER_NAME, TlsError, Trust, peer_of};
-use crate::transport::{Connection, Stream, Transport, TransportError, TransportKind};
-
-/// A connection with no traffic for this long is closed.
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// How often an idle connection sends a keep-alive, so NAT bindings stay open.
-pub const KEEP_ALIVE: Duration = Duration::from_secs(10);
+use crate::transport::{
+    Connection, DIAL_TIMEOUT, IDLE_TIMEOUT, KEEP_ALIVE, Stream, Transport, TransportError,
+    TransportKind,
+};
 
 /// A QUIC endpoint that dials and accepts under one node identity.
 pub struct QuicTransport {
     endpoint: quinn::Endpoint,
     credentials: Arc<Credentials>,
     transport: Arc<quinn::TransportConfig>,
+    dial_timeout: Duration,
     inbox: Inbox,
 }
 
@@ -69,11 +67,31 @@ impl QuicTransport {
             endpoint,
             credentials,
             transport,
+            dial_timeout: DIAL_TIMEOUT,
             inbox,
         })
     }
 
+    /// Sets how long a dial may take, handshake included.
+    #[must_use]
+    pub fn with_dial_timeout(mut self, timeout: Duration) -> Self {
+        self.dial_timeout = timeout;
+        self
+    }
+
+    /// Dials within the dial timeout: an address where nothing answers
+    /// costs that long, not quinn's idle timeout.
     async fn dial(
+        &self,
+        peer: NodeId,
+        addr: SocketAddr,
+    ) -> Result<Box<dyn Connection>, TransportError> {
+        tokio::time::timeout(self.dial_timeout, self.handshake(peer, addr))
+            .await
+            .map_err(|_| TransportError::Timeout(self.dial_timeout))?
+    }
+
+    async fn handshake(
         &self,
         peer: NodeId,
         addr: SocketAddr,
