@@ -91,6 +91,20 @@ impl Carry {
     }
 }
 
+/// Ends the process at a named step when `FABRIC_CRASHPOINT` names it, as
+/// `<step>:<index>`. Built only with the `crashpoints` feature, which the
+/// crash tests turn on, so they can stop a capture or restore at an exact
+/// step instead of after a guessed delay.
+#[cfg(feature = "crashpoints")]
+fn crashpoint(step: &str, index: usize) {
+    if std::env::var("FABRIC_CRASHPOINT").is_ok_and(|named| named == format!("{step}:{index}")) {
+        std::process::abort();
+    }
+}
+
+#[cfg(not(feature = "crashpoints"))]
+fn crashpoint(_step: &str, _index: usize) {}
+
 const TEMP_MARK: &str = ".fabric-tmp-";
 const COMPARE_BUFFER: usize = 64 * 1024;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -568,7 +582,7 @@ pub(crate) fn stage(
     let redactor = Redactor::standard()?;
     clear_manifest(out)?;
     let mut carried = Vec::with_capacity(sorted.len());
-    for source in sorted {
+    for (index, source) in sorted.into_iter().enumerate() {
         let dst = out.join(source.rel.as_str());
         let written = write_atomic_with(&dst, |w| {
             transfer(&source.abs, w, source.carry, redactor, counts)
@@ -580,6 +594,7 @@ pub(crate) fn stage(
             size: written.size,
             blake3: written.digest,
         });
+        crashpoint("stage-after-file", index);
     }
     Ok(carried)
 }
@@ -803,7 +818,7 @@ pub(crate) fn place_all(
         .iter()
         .map(|placement| plan(placement, departure))
         .collect::<Result<Vec<Step>, HarnessError>>()?;
-    for (placement, step) in placements.iter().zip(steps) {
+    for (index, (placement, step)) in placements.iter().zip(steps).enumerate() {
         match step {
             Step::Keep => {}
             Step::Replace => {
@@ -816,6 +831,7 @@ pub(crate) fn place_all(
                 })?;
             }
         }
+        crashpoint("place-after-file", index);
     }
     Ok(placements.iter().map(|p| p.dest.clone()).collect())
 }
