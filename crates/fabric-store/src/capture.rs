@@ -6,7 +6,7 @@
 //! user's refs. A path or state that could not be restored faithfully fails
 //! here, where the user can act, and a secret never becomes an object.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
@@ -26,7 +26,7 @@ use fabric_core::snapshot::{
 use crate::durable;
 use crate::git::{Git, GitError};
 use crate::objects::ObjectError;
-use crate::policy::{Class, IgnorePolicy};
+use crate::policy::{Class, IgnorePolicy, Markers};
 use crate::store::{Store, StoreError};
 
 /// An untracked, not ignored file above this many bytes stops capture unless the caller allows it.
@@ -415,8 +415,12 @@ impl Capturer<'_> {
         let mut entries = Vec::new();
         let mut carried_dirs: BTreeSet<RelPath> = BTreeSet::new();
         let mut emitted_dirs: BTreeSet<RelPath> = BTreeSet::new();
+        let mut markers = DirMarkers {
+            root: base,
+            seen: HashMap::new(),
+        };
         for item in found {
-            let classification = policy.classify(&item.rel);
+            let classification = policy.classify(&item.rel, &mut markers);
             if item.meta.is_dir() {
                 // A directory travels on its own when the walker listed it
                 // and nothing denies it, so an empty directory is not lost.
@@ -515,6 +519,22 @@ impl Capturer<'_> {
         // puts `abc/tool.txt` before `abc.jsonl`; the manifest sorts by bytes.
         entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
         Ok(entries)
+    }
+}
+
+/// Looks up a tool file in the workspace once per directory and name.
+struct DirMarkers<'a> {
+    root: &'a Path,
+    seen: HashMap<(String, String), bool>,
+}
+
+impl Markers for DirMarkers<'_> {
+    fn has(&mut self, dir: &str, name: &str) -> bool {
+        let root = self.root;
+        *self
+            .seen
+            .entry((dir.to_owned(), name.to_owned()))
+            .or_insert_with(|| fs::symlink_metadata(root.join(dir).join(name)).is_ok())
     }
 }
 

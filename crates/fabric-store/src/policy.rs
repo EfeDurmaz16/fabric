@@ -5,8 +5,11 @@
 //! can be widened per job but never narrowed. Under a dependency, build or
 //! tool-cache directory only the high-confidence patterns apply, so a
 //! `node_modules` is carried whole or left behind, never with holes it does
-//! not know about. Names are compared with ASCII case folded, as APFS and
-//! git on a Mac compare them, so `Server.PEM` is as secret as `server.pem`.
+//! not know about. A generic directory name such as `out` or `build` is a
+//! cache only next to the file of the tool that makes it, so an ignored
+//! `experiments/out/` with no `package.json` beside it stays precious. Names
+//! are compared with ASCII case folded, as APFS and git on a Mac compare
+//! them, so `Server.PEM` is as secret as `server.pem`.
 
 use std::fs;
 use std::io;
@@ -58,20 +61,77 @@ pub const CACHE_SECRET_PATTERNS: &[&str] = &[
     ".gnupg",
 ];
 
-/// Directory names that hold dependencies.
-pub const DEPS_DIRS: &[&str] = &["node_modules", ".pnpm-store", ".venv", "vendor"];
+/// A directory name that holds a cache, and the files that make it one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheDir {
+    /// The directory name.
+    pub name: &'static str,
+    /// The class of everything under it.
+    pub class: CacheClass,
+    /// Files of which one must sit beside the directory; empty when only a tool makes the name.
+    pub markers: &'static [&'static str],
+}
 
-/// Directory names that hold build output.
-pub const BUILD_DIRS: &[&str] = &["target", "dist", "build", "out", ".next", ".turbo"];
+const fn cache_dir(
+    name: &'static str,
+    class: CacheClass,
+    markers: &'static [&'static str],
+) -> CacheDir {
+    CacheDir {
+        name,
+        class,
+        markers,
+    }
+}
 
-/// Directory names that hold a tool's cache.
-pub const TOOL_CACHE_DIRS: &[&str] = &[
-    "__pycache__",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".cache",
+const NODE: &[&str] = &["package.json"];
+const PYTHON_OR_NODE: &[&str] = &["package.json", "pyproject.toml", "setup.py"];
+
+/// The cache directories every policy starts with.
+pub const CACHE_DIRS: &[CacheDir] = &[
+    cache_dir("node_modules", CacheClass::Deps, &[]),
+    cache_dir(".pnpm-store", CacheClass::Deps, &[]),
+    cache_dir(".venv", CacheClass::Deps, &[]),
+    cache_dir(
+        "vendor",
+        CacheClass::Deps,
+        &["go.mod", "composer.json", "Gemfile"],
+    ),
+    cache_dir("target", CacheClass::Build, &["Cargo.toml", "pom.xml"]),
+    cache_dir("dist", CacheClass::Build, PYTHON_OR_NODE),
+    cache_dir(
+        "build",
+        CacheClass::Build,
+        &[
+            "package.json",
+            "pyproject.toml",
+            "setup.py",
+            "build.gradle",
+            "build.gradle.kts",
+            "CMakeLists.txt",
+        ],
+    ),
+    cache_dir("out", CacheClass::Build, NODE),
+    cache_dir(".next", CacheClass::Build, &[]),
+    cache_dir(".turbo", CacheClass::Build, &[]),
+    cache_dir("__pycache__", CacheClass::ToolCache, &[]),
+    cache_dir(".mypy_cache", CacheClass::ToolCache, &[]),
+    cache_dir(".pytest_cache", CacheClass::ToolCache, &[]),
+    cache_dir(".ruff_cache", CacheClass::ToolCache, &[]),
+    cache_dir(".cache", CacheClass::ToolCache, NODE),
 ];
+
+/// Answers whether a workspace directory holds an entry of a given name.
+pub trait Markers {
+    /// True when the directory at `dir` (root-relative, empty for the root) holds `name`.
+    fn has(&mut self, dir: &str, name: &str) -> bool;
+}
+
+impl<F: FnMut(&str, &str) -> bool> Markers for F {
+    fn has(&mut self, dir: &str, name: &str) -> bool {
+        self(dir, name)
+    }
+}
 
 /// The file in a workspace root that widens the policy for one job.
 pub const FABRICIGNORE: &str = ".fabricignore";
@@ -205,9 +265,7 @@ fn glob(pattern: &str, text: &str) -> bool {
 /// The policy for one capture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IgnorePolicy {
-    deps: Vec<String>,
-    build: Vec<String>,
-    tool_cache: Vec<String>,
+    cache_dirs: Vec<(String, CacheClass, &'static [&'static str])>,
     secrets: Vec<Pattern>,
     cache_secrets: Vec<Pattern>,
     excludes: Vec<Pattern>,
@@ -217,16 +275,13 @@ fn patterns(list: &[&str]) -> Vec<Pattern> {
     list.iter().filter_map(|p| Pattern::parse(p)).collect()
 }
 
-fn names(list: &[&str]) -> Vec<String> {
-    list.iter().map(|s| (*s).to_owned()).collect()
-}
-
 impl Default for IgnorePolicy {
     fn default() -> Self {
         IgnorePolicy {
-            deps: names(DEPS_DIRS),
-            build: names(BUILD_DIRS),
-            tool_cache: names(TOOL_CACHE_DIRS),
+            cache_dirs: CACHE_DIRS
+                .iter()
+                .map(|d| (d.name.to_owned(), d.class, d.markers))
+                .collect(),
             secrets: patterns(SECRET_PATTERNS),
             cache_secrets: patterns(CACHE_SECRET_PATTERNS),
             excludes: Vec::new(),
@@ -235,16 +290,11 @@ impl Default for IgnorePolicy {
 }
 
 impl IgnorePolicy {
-    /// Adds a directory name to the class, so paths under it get that class.
+    /// Makes every directory named `name` a cache of `class`, with no marker needed.
     pub fn add_cache_dir(&mut self, class: CacheClass, name: &str) {
-        let list = match class {
-            CacheClass::Deps => &mut self.deps,
-            CacheClass::Build => &mut self.build,
-            CacheClass::ToolCache => &mut self.tool_cache,
-        };
-        if !list.iter().any(|n| n == name) {
-            list.push(name.to_owned());
-        }
+        self.cache_dirs
+            .retain(|(n, _, _)| !n.eq_ignore_ascii_case(name));
+        self.cache_dirs.push((name.to_owned(), class, &[]));
     }
 
     /// Widens the secret list, in both the full and the narrow form.
@@ -297,26 +347,28 @@ impl IgnorePolicy {
         Ok(added)
     }
 
-    fn cache_class_of(&self, name: &str) -> Option<CacheClass> {
-        if self.deps.iter().any(|n| n == name) {
-            Some(CacheClass::Deps)
-        } else if self.build.iter().any(|n| n == name) {
-            Some(CacheClass::Build)
-        } else if self.tool_cache.iter().any(|n| n == name) {
-            Some(CacheClass::ToolCache)
-        } else {
-            None
-        }
+    /// The class of the directory `comps[i]`, when its name and a marker beside it make it a cache.
+    fn cache_class_at(
+        &self,
+        comps: &[&str],
+        i: usize,
+        markers: &mut dyn Markers,
+    ) -> Option<CacheClass> {
+        let (_, class, needs) = self
+            .cache_dirs
+            .iter()
+            .find(|(name, _, _)| name.eq_ignore_ascii_case(comps[i]))?;
+        let parent = comps[..i].join("/");
+        (needs.is_empty() || needs.iter().any(|m| markers.has(&parent, m))).then_some(*class)
     }
 
-    /// Classifies one ignored path.
-    #[must_use]
-    pub fn classify(&self, path: &RelPath) -> Classification {
+    /// Classifies one ignored path; `markers` says which tool files sit where.
+    pub fn classify(&self, path: &RelPath, markers: &mut dyn Markers) -> Classification {
         let comps: Vec<&str> = path.as_str().split('/').collect();
-        let cache = comps
-            .iter()
-            .enumerate()
-            .find_map(|(i, c)| self.cache_class_of(c).map(|class| (i, class)));
+        let cache = (0..comps.len()).find_map(|i| {
+            self.cache_class_at(&comps, i, markers)
+                .map(|class| (i, class))
+        });
         let cache_root = cache.and_then(|(i, class)| {
             RelPath::parse(&comps[..=i].join("/"))
                 .ok()
@@ -378,6 +430,17 @@ mod tests {
         RelPath::parse(s).unwrap()
     }
 
+    /// Classifies in a workspace whose only tool files are `pkg/a/Cargo.toml` and `web/package.json`.
+    fn classify(p: &IgnorePolicy, path: &str) -> Classification {
+        let mut markers = |dir: &str, name: &str| {
+            matches!(
+                (dir, name),
+                ("pkg/a", "Cargo.toml") | ("web", "package.json")
+            )
+        };
+        p.classify(&rel(path), &mut markers)
+    }
+
     #[test]
     fn glob_rules() {
         assert!(glob("*.pem", "server.pem"));
@@ -402,7 +465,7 @@ mod tests {
             "Credentials.json",
             "home/.SSH/config",
         ] {
-            assert_eq!(p.classify(&rel(path)).class, Class::Secret, "{path}");
+            assert_eq!(classify(&p, path).class, Class::Secret, "{path}");
             assert!(p.denies_anywhere(&rel(path)), "{path}");
         }
     }
@@ -410,55 +473,70 @@ mod tests {
     #[test]
     fn classes_in_order() {
         let p = IgnorePolicy::default();
-        assert_eq!(p.classify(&rel(".env")).class, Class::Secret);
+        assert_eq!(classify(&p, ".env").class, Class::Secret);
+        assert_eq!(classify(&p, "config/.aws/credentials").class, Class::Secret);
+        assert_eq!(classify(&p, ".docker/config.json").class, Class::Secret);
         assert_eq!(
-            p.classify(&rel("config/.aws/credentials")).class,
-            Class::Secret
-        );
-        assert_eq!(p.classify(&rel(".docker/config.json")).class, Class::Secret);
-        assert_eq!(
-            p.classify(&rel("home/.docker/config.json")).class,
+            classify(&p, "home/.docker/config.json").class,
             Class::Secret
         );
         assert_eq!(
-            p.classify(&rel("home/.docker/other.json")).class,
+            classify(&p, "home/.docker/other.json").class,
             Class::Precious
         );
+        assert_eq!(classify(&p, "node_modules/x/index.js").class, Class::Deps);
+        assert_eq!(classify(&p, "pkg/a/target/debug/x").class, Class::Build);
         assert_eq!(
-            p.classify(&rel("node_modules/x/index.js")).class,
-            Class::Deps
-        );
-        assert_eq!(p.classify(&rel("pkg/a/target/debug/x")).class, Class::Build);
-        assert_eq!(
-            p.classify(&rel("src/__pycache__/m.pyc")).class,
+            classify(&p, "src/__pycache__/m.pyc").class,
             Class::ToolCache
         );
+        assert_eq!(classify(&p, "web/out/index.html").class, Class::Build);
+        assert_eq!(classify(&p, "web/OUT/index.html").class, Class::Build);
         assert_eq!(
-            p.classify(&rel("experiments/out/result.csv")).class,
-            Class::Build
-        );
-        assert_eq!(
-            p.classify(&rel("docs/assessment/notes.md")).class,
+            classify(&p, "docs/assessment/notes.md").class,
             Class::Precious
+        );
+    }
+
+    #[test]
+    fn a_generic_name_is_a_cache_only_beside_its_tool_file() {
+        let p = IgnorePolicy::default();
+        for path in [
+            "experiments/out/result.csv",
+            "target/notes.md",
+            "docs/build/report.pdf",
+            "data/.cache/model.bin",
+            "vendor/blob.bin",
+        ] {
+            let found = classify(&p, path);
+            assert_eq!(found.class, Class::Precious, "{path}");
+            assert_eq!(found.cache_root, None, "{path}");
+        }
+        assert_eq!(
+            classify(&p, "pkg/a/target/debug/x").cache_root,
+            Some((rel("pkg/a/target"), CacheClass::Build))
+        );
+        let mut widened = p.clone();
+        widened.add_cache_dir(CacheClass::Build, "out");
+        assert_eq!(
+            classify(&widened, "experiments/out/result.csv").class,
+            Class::Build
         );
     }
 
     #[test]
     fn narrow_list_under_a_cache_and_full_list_under_precious() {
         let p = IgnorePolicy::default();
-        let under_cache = p.classify(&rel("node_modules/pkg/test/fixtures/cert.pem"));
+        let under_cache = classify(&p, "node_modules/pkg/test/fixtures/cert.pem");
         assert_eq!(under_cache.class, Class::Deps);
         assert_eq!(
             under_cache.cache_root,
             Some((rel("node_modules"), CacheClass::Deps))
         );
+        assert_eq!(classify(&p, "node_modules/pkg/.env").class, Class::Secret);
+        assert_eq!(classify(&p, "data/cert.pem").class, Class::Secret);
         assert_eq!(
-            p.classify(&rel("node_modules/pkg/.env")).class,
-            Class::Secret
-        );
-        assert_eq!(p.classify(&rel("data/cert.pem")).class, Class::Secret);
-        assert_eq!(
-            p.classify(&rel("pkg/node_modules/x/.npmrc")).cache_root,
+            classify(&p, "pkg/node_modules/x/.npmrc").cache_root,
             Some((rel("pkg/node_modules"), CacheClass::Deps))
         );
     }
@@ -473,17 +551,11 @@ mod tests {
         .unwrap();
         let mut p = IgnorePolicy::default();
         assert_eq!(p.load_fabricignore(dir.path()).unwrap(), 2);
-        assert_eq!(
-            p.classify(&rel("experiments/out/a.csv")).class,
-            Class::Excluded
-        );
-        assert_eq!(p.classify(&rel("x/notes.bak")).class, Class::Excluded);
-        assert_eq!(p.classify(&rel("x/notes.txt")).class, Class::Precious);
+        assert_eq!(classify(&p, "experiments/out/a.csv").class, Class::Excluded);
+        assert_eq!(classify(&p, "x/notes.bak").class, Class::Excluded);
+        assert_eq!(classify(&p, "x/notes.txt").class, Class::Precious);
         p.add_secret_pattern("*.secret").unwrap();
-        assert_eq!(
-            p.classify(&rel("node_modules/a/b.secret")).class,
-            Class::Secret
-        );
+        assert_eq!(classify(&p, "node_modules/a/b.secret").class, Class::Secret);
         assert!(p.gitignore_lines().contains("**/.docker/config.json\n"));
         assert!(p.gitignore_lines().contains("*.bak\n"));
         assert!(p.add_exclude("/abs").is_err());
