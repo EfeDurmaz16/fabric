@@ -20,8 +20,8 @@ use fabric_core::id::{Epoch, JobId, NodeId, SnapshotId};
 use fabric_core::lease::{FenceError, FencingToken};
 use fabric_core::ledger::{Author, EventKind, Ledger};
 use fabric_core::moves::{CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
-use fabric_harness::SessionId;
-use fabric_harness::manifest::StateManifest;
+use fabric_harness::manifest::{MANIFEST_FILE, StateManifest};
+use fabric_harness::{HarnessError, SessionId};
 use fabric_net::peers::HostPort;
 use fabric_net::rpc::Session;
 use fabric_net::wire::{
@@ -574,6 +574,7 @@ impl Node {
             )?;
             snapshot
         };
+        self.confirm_departure(job, path_var, out).await?;
         job.append(self.id, EventKind::Suspended { snapshot })?;
         job.set_marker(&Marker {
             root: marker.root,
@@ -584,6 +585,39 @@ impl Node {
             job.ledger().lease().epoch()
         ));
         Ok(snapshot)
+    }
+
+    /// Tells the adapter that the snapshot holding its capture is published,
+    /// so its departure record counts at the next restore on this node (ADR 0015).
+    ///
+    /// It runs after `SnapshotPublished` is durable, on the first suspend
+    /// and on the one that finishes it after a crash; a second confirmation
+    /// changes nothing.
+    async fn confirm_departure(
+        &self,
+        job: &Job,
+        path_var: &OsString,
+        out: &mut Out,
+    ) -> Result<(), NodeError> {
+        let Some(record) = job.session()? else {
+            return Ok(());
+        };
+        let state_dir = job.dir().harness_state();
+        if !state_dir.join(MANIFEST_FILE).is_file() {
+            return Ok(());
+        }
+        let manifest = StateManifest::read(&state_dir)?;
+        let harness = adapter(&record.harness, &self.harness_env(path_var)?)?;
+        match harness.confirm_departure(&manifest).await {
+            Ok(()) => Ok(()),
+            Err(HarnessError::DepartureNotPending { session }) => {
+                out.say(format!(
+                    "no departure record waits for session {session}; its rewritable files stay this node's"
+                ));
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Captures the harness state and the workspace and publishes them as one snapshot.
