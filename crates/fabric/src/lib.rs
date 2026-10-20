@@ -34,7 +34,9 @@ use fabric_harness::claude::{ClaudeCode, LeftReason, TrustOutcome};
 use fabric_harness::codex::Codex;
 use fabric_harness::{Harness, Launch, Running};
 use fabric_net::endpoint::DialOrder;
-use fabricd::control::{self, ControlError, NO_DAEMON_EXIT, Refusal, Request, Response, RunPlan};
+use fabricd::control::{
+    self, ControlError, Decision, NO_DAEMON_EXIT, Refusal, Request, Response, RunPlan,
+};
 use fabricd::harnesses::{HarnessConfig, HarnessEnv, acp_adapter, parse_harness};
 use fabricd::node::{Node, NodeConfig};
 use fabricd::paths::{STATE_DIR_ENV, StateDir};
@@ -440,7 +442,7 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
         JobCommand::Approve { job, note } => (
             Request::JobDecide {
                 job,
-                approve: true,
+                decision: Decision::Approve,
                 note,
             },
             None,
@@ -448,7 +450,7 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
         JobCommand::Reject { job, note } => (
             Request::JobDecide {
                 job,
-                approve: false,
+                decision: Decision::Reject,
                 note,
             },
             None,
@@ -559,14 +561,7 @@ async fn exited(
     pid: std::num::NonZeroU32,
     status: std::process::ExitStatus,
 ) -> Result<ExitCode> {
-    let told = control::call(
-        socket,
-        &Request::HarnessExited {
-            job: plan.job,
-            pid: pid.get(),
-        },
-    )
-    .await;
+    let told = control::call(socket, &Request::HarnessExited { job: plan.job, pid }).await;
     let missed = match told {
         Ok(Response::Done { .. }) => None,
         Ok(Response::Failed { error, .. }) => Some(error),

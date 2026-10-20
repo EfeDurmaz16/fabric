@@ -34,7 +34,7 @@ use fabric_store::restore::{
 };
 
 use crate::clock;
-use crate::control::{Request, RunPlan};
+use crate::control::{Decision, Request, RunPlan};
 use crate::doctor::{self, Context, Target};
 use crate::error::NodeError;
 use crate::facts::{MeasuredKeys, NodeFacts, key_difference};
@@ -156,8 +156,12 @@ impl Node {
             Request::JobSteal { job, reason, force } => {
                 self.job_steal(job, reason, force, out).await?;
             }
-            Request::JobDecide { job, approve, note } => {
-                self.job_decide(job, approve, &note, out).await?;
+            Request::JobDecide {
+                job,
+                decision,
+                note,
+            } => {
+                self.job_decide(job, decision, &note, out).await?;
             }
             Request::Doctor {
                 peer,
@@ -530,11 +534,11 @@ impl Node {
         Ok(())
     }
 
-    async fn harness_exited(&self, id: JobId, pid: u32) -> Result<(), NodeError> {
+    async fn harness_exited(&self, id: JobId, pid: NonZeroU32) -> Result<(), NodeError> {
         let job = self.job(id).await?;
         let job = job.lock().await;
         if let Some(record) = job.harness_record()?
-            && record.pid.get() == pid
+            && record.pid == pid
         {
             // The record stands for the group: a background process the
             // harness started keeps it, so a suspend still stops it.
@@ -1772,14 +1776,17 @@ impl Node {
     async fn job_decide(
         &self,
         id: JobId,
-        approve: bool,
+        decision: Decision,
         note: &str,
         out: &mut Out,
     ) -> Result<(), NodeError> {
         let job = self.job(id).await?;
         let mut job = job.lock().await;
         owner_token(&job, self.id)?;
-        let word = if approve { "approved" } else { "rejected" };
+        let word = match decision {
+            Decision::Approve => "approved",
+            Decision::Reject => "rejected",
+        };
         let text = if note.is_empty() {
             word.to_owned()
         } else {

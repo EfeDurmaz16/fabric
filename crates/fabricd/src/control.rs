@@ -105,7 +105,7 @@ pub enum Request {
         /// The job.
         job: JobId,
         /// The process that exited.
-        pid: u32,
+        pid: NonZeroU32,
     },
     /// Stops the harness, snapshots the workspace and records the suspend.
     JobSuspend {
@@ -138,8 +138,8 @@ pub enum Request {
     JobDecide {
         /// The job.
         job: JobId,
-        /// Approve, or reject.
-        approve: bool,
+        /// What the user decided.
+        decision: Decision,
         /// The user's words, if any.
         note: String,
     },
@@ -152,6 +152,15 @@ pub enum Request {
         /// The `PATH` of the user's shell.
         path_var: OsString,
     },
+}
+
+/// A user's decision on a job's work (ADR 0016, Decisions as ledger events).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Decision {
+    /// `fabric job approve`.
+    Approve,
+    /// `fabric job reject`.
+    Reject,
 }
 
 /// What to launch, as the daemon decided it.
