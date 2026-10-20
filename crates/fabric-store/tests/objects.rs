@@ -7,7 +7,7 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 
 use fabric_core::id::ChunkId;
-use fabric_store::objects::{ChunkParams, ObjectError};
+use fabric_store::objects::{ChunkParams, MAX_OBJECT_LEN, ObjectError};
 use fabric_store::store::Store;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
@@ -69,6 +69,22 @@ fn a_corrupt_object_is_an_error_not_content() {
         objects.read(missing),
         Err(ObjectError::Missing { id }) if id == missing
     ));
+}
+
+#[test]
+fn an_object_above_the_bound_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path(), small_params().unwrap()).unwrap();
+    let len = MAX_OBJECT_LEN as usize + 1;
+    assert!(matches!(
+        store.objects().put(&vec![0u8; len]),
+        Err(ObjectError::TooLarge { len: refused }) if refused == len
+    ));
+    let written: usize = fs::read_dir(dir.path().join("objects"))
+        .unwrap()
+        .map(|shard| fs::read_dir(shard.unwrap().path()).unwrap().count())
+        .sum();
+    assert_eq!(written, 0);
 }
 
 #[test]

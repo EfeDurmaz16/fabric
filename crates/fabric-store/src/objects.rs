@@ -48,6 +48,12 @@ pub enum ObjectError {
         /// The path.
         path: PathBuf,
     },
+    /// The bytes are longer than any object may be.
+    #[error("{len} bytes is above the {MAX_OBJECT_LEN} byte object bound")]
+    TooLarge {
+        /// The length that was offered.
+        len: usize,
+    },
     /// The chunking parameters break a rule of the chunker.
     #[error("chunk parameters: {0}")]
     BadParams(&'static str),
@@ -256,7 +262,12 @@ impl ObjectStore {
     }
 
     /// Writes `bytes` as one object and returns its id; a present object is left as it is.
+    ///
+    /// Bytes above `MAX_OBJECT_LEN` are refused: `read` would report such an object as corrupt.
     pub fn put(&self, bytes: &[u8]) -> Result<StoredChunk, ObjectError> {
+        if bytes.len() > MAX_OBJECT_LEN as usize {
+            return Err(ObjectError::TooLarge { len: bytes.len() });
+        }
         let id = ChunkId::of(bytes);
         let path = self.object_path(id);
         if let Ok(meta) = fs::metadata(&path) {

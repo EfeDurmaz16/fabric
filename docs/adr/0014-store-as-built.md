@@ -32,7 +32,7 @@ store/
 
 ### Objects
 
-- `ChunkParams` is built only by `ChunkParams::new`, which keeps FastCDC's rules (`64 <= min <= avg <= max`, average from 256 bytes to 4 MiB) and bounds `max_size` and `whole_file_limit` by `MAX_OBJECT_LEN`, 8 MiB. No object is larger than the bulk frame of ADR 0005, and `read` sizes its buffer from that bound, never from a frame header alone.
+- `ChunkParams` is built only by `ChunkParams::new`, which keeps FastCDC's rules (`64 <= min <= avg <= max`, average from 256 bytes to 4 MiB) and bounds `max_size` and `whole_file_limit` by `MAX_OBJECT_LEN`, 8 MiB. No object is larger than the bulk frame of ADR 0005: `put` refuses longer bytes with `TooLarge`, which matters for a caller that stores bytes a peer sent, and `read` sizes its buffer from that bound, never from a frame header alone.
 - An object is written to `tmp/`, flushed with a plain `fsync`, and hard-linked to its final name. A name that exists is never replaced, so two writers of the same object cannot replace each other's bytes. A reader decompresses and checks the hash before it hands bytes out.
 - `put_file` opens with `O_NOFOLLOW` and `O_NONBLOCK` and checks the type on the open descriptor. A symlink, FIFO, socket or device is refused with `NotRegular`; it is never followed, and a FIFO never blocks. `put_reader` reads at most the whole-file limit plus one byte at once and streams anything longer through FastCDC, so a file that grows while it is read is never held whole.
 - No hard links from the store into a workspace. Objects are compressed, so a link would hand the harness a zstd frame, and a tool that edits a file in place would rewrite the store's copy. Restore always writes bytes.
