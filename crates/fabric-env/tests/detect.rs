@@ -587,25 +587,59 @@ fn a_linked_override_directory_is_refused() {
     }
 }
 
-/// A pin travels in the spec like a setup argument does, so the same
-/// credential guard applies, from a detected file and from the override file.
+/// Pins are informational, so a pin a detected file gives that breaks the
+/// pin rules is dropped and detection goes on: one row per rule. The other
+/// pins stay, and the dropped text appears nowhere in the report.
 #[test]
-fn a_credential_shaped_pin_is_refused_without_echoing_it() {
+fn a_detected_pin_that_breaks_the_rules_is_dropped() {
     let token = format!("ghp_{}", "q7".repeat(18));
-    let detected = workspace(&[(".nvmrc", &token)]).unwrap();
-    match detect(detected.path(), None) {
-        Err(
-            err @ DetectError::Pin {
-                file,
-                entry,
-                reason,
-            },
-        ) => {
-            assert_eq!((file, entry, reason), (".nvmrc", 0, PinError::Credential));
-            assert!(!format!("{err} {err:?}").contains(&token));
-        }
-        other => panic!("{other:?}"),
+    let range = "^12.22.0 || ^14.17.0 || ^16.13.0 || ^18.12.0 || ^20.9.0 || >=21.1.0";
+    let long_name = "cargo:https://github.com/some-organization/some-long-repository-name";
+    let cases: [(&str, String, PinError); 5] = [
+        (".nvmrc", token.clone(), PinError::Credential),
+        (
+            "package.json",
+            format!(r#"{{"engines":{{"node":"{range}"}}}}"#),
+            PinError::TooLong,
+        ),
+        (
+            "mise.toml",
+            format!("[tools]\n\"{long_name}\" = \"1\"\n"),
+            PinError::TooLong,
+        ),
+        (
+            ".tool-versions",
+            "\u{1b}[31mnode 22\n".to_owned(),
+            PinError::BadChar,
+        ),
+        (
+            "mise.toml",
+            "[tools]\nnode = \"\"\n".to_owned(),
+            PinError::Empty,
+        ),
+    ];
+    for (file, text, rule) in cases {
+        let dir = workspace(&[(file, &text), (".python-version", "3.12\n")]).unwrap();
+        let found = detect(dir.path(), None).unwrap();
+        assert!(
+            found.pins().iter().all(|pin| pin.file != file),
+            "{file} {rule:?}"
+        );
+        assert_eq!(
+            found.spec().tools,
+            [tool("python", "3.12", ToolSource::Detected).unwrap()],
+            "{file} {rule:?}"
+        );
+        let shown = format!("{found:?}");
+        assert!(!shown.contains(&token) && !shown.contains(range) && !shown.contains(long_name));
     }
+}
+
+/// A pin the user declares travels in the spec like a setup argument
+/// does, so the same credential guard refuses it, without echoing it.
+#[test]
+fn a_credential_shaped_declared_pin_is_refused_without_echoing_it() {
+    let token = format!("ghp_{}", "q7".repeat(18));
     let declared = workspace(&[(
         ".fabric/env.toml",
         &format!("[tools]\nnode = \"{token}\"\n"),
@@ -650,11 +684,10 @@ fn a_declared_cache_keeps_the_full_secret_list() {
     assert_eq!(scope_of("node_modules"), Scope::Cache);
 }
 
-/// A tool name travels in the spec as a pin does: a token used as a name,
-/// or a name that carries a terminal escape for the node that prints it,
-/// is refused by its position and never quoted.
+/// A declared tool name travels in the spec as a pin does: a token used
+/// as a name is refused by its position and never quoted.
 #[test]
-fn a_bad_tool_name_is_refused_without_echoing_it() {
+fn a_bad_declared_tool_name_is_refused_without_echoing_it() {
     let token = format!("ghp_{}", "q7".repeat(18));
     let declared = workspace(&[(
         ".fabric/env.toml",
@@ -673,26 +706,6 @@ fn a_bad_tool_name_is_refused_without_echoing_it() {
             ));
         }
         other => panic!("{other:?}"),
-    }
-    let escape = "\u{1b}[31mnode";
-    for (file, text) in [
-        (".tool-versions", format!("python 3.12\n{escape} 22\n")),
-        (
-            "mise.toml",
-            "[tools]\n\"\\u001b[31mnode\\n\" = \"22\"\n".to_owned(),
-        ),
-    ] {
-        let dir = workspace(&[(file, &text)]).unwrap();
-        match detect(dir.path(), None) {
-            Err(err @ DetectError::ToolName { .. }) => {
-                assert!(!format!("{err}").contains('\u{1b}'), "{file}");
-                assert!(
-                    matches!(err, DetectError::ToolName { file: f, reason: PinError::BadChar, .. } if f == file),
-                    "{file}"
-                );
-            }
-            other => panic!("{file}: {other:?}"),
-        }
     }
 }
 

@@ -9,7 +9,12 @@
 //! the same spec on every node, and the spec it returns has passed
 //! `EnvSpec::validate`. Every tool name and pin it keeps is short,
 //! printable and not shaped like a credential, because the spec travels to
-//! other nodes; `ToolName` and `ToolVersion` hold that rule by type.
+//! other nodes; `ToolName` and `ToolVersion` hold that rule by type. A pin
+//! a detected file gives that breaks the rule is dropped with a warning
+//! that names the file and the entry, never the text: pins are
+//! informational, so one that nothing reads must not stop a resume. A pin
+//! the override file declares is refused instead, since the user wrote it
+//! on purpose.
 //!
 //! What it reads, and what each file gives:
 //!
@@ -31,7 +36,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use fabric_core::env::{
-    EnvSpec, EnvSpecError, PinError, RunWhen, SecretPattern, SetupStep, Tool, ToolName, ToolSource,
+    EnvSpec, EnvSpecError, RunWhen, SecretPattern, SetupStep, Tool, ToolName, ToolSource,
     ToolVersion,
 };
 use fabric_core::harness::ProgramName;
@@ -77,26 +82,6 @@ pub enum DetectError {
     NotARegularFile {
         /// The file, relative to the root.
         file: &'static str,
-    },
-    /// A tool name in a detected file was refused; the name itself is never quoted.
-    #[error("the tool name of pin {entry} in `{file}` {reason}")]
-    ToolName {
-        /// The file, relative to the root.
-        file: &'static str,
-        /// Zero-based index of the pin among the pins the file gives, in file order.
-        entry: usize,
-        /// What is wrong with it.
-        reason: PinError,
-    },
-    /// A version pin in a detected file was refused; the pin itself is never quoted.
-    #[error("the version of pin {entry} in `{file}` {reason}")]
-    Pin {
-        /// The file, relative to the root.
-        file: &'static str,
-        /// Zero-based index of the pin among the pins the file gives, in file order.
-        entry: usize,
-        /// What is wrong with it.
-        reason: PinError,
     },
     /// A file is larger than detection reads.
     #[error("`{file}` is larger than {MAX_FILE_LEN} bytes")]
@@ -788,13 +773,13 @@ fn collect_pins(
     let mut pins: Vec<Pin> = overrides
         .tools
         .iter()
-        .enumerate()
-        .map(|(entry, (tool, version))| {
-            let mut declared = pin(tool.as_str(), version.as_str(), OVERRIDE_FILE, entry)?;
-            declared.source = ToolSource::Declared;
-            Ok(declared)
+        .map(|(tool, version)| Pin {
+            tool: tool.clone(),
+            version: version.clone(),
+            file: OVERRIDE_FILE,
+            source: ToolSource::Declared,
         })
-        .collect::<Result<_, DetectError>>()?;
+        .collect();
     pins.extend(mise_pins(reader)?);
     pins.extend(tool_versions_pins(reader)?);
     pins.extend(rust_toolchain_pin(reader)?);
@@ -809,34 +794,48 @@ fn collect_pins(
     if let Some(package) = package {
         let mut entry = 0;
         if let Some((name, version)) = &package.manager {
-            pins.push(pin(name.as_str(), version, "package.json", entry)?);
+            pins.extend(pin(name.as_str(), version, "package.json", entry));
             entry += 1;
         }
         if let Some(engine) = &package.engines_node {
-            pins.push(pin("node", engine, "package.json", entry)?);
+            pins.extend(pin("node", engine, "package.json", entry));
         }
     }
     Ok(pins)
 }
 
-/// Builds a detected pin after checking its tool name, read through its alias, and its version.
-fn pin(tool: &str, version: &str, file: &'static str, entry: usize) -> Result<Pin, DetectError> {
-    let tool = ToolName::parse(canonical_tool(tool)).map_err(|reason| DetectError::ToolName {
-        file,
-        entry,
-        reason,
-    })?;
-    let version = ToolVersion::parse(version).map_err(|reason| DetectError::Pin {
-        file,
-        entry,
-        reason,
-    })?;
-    Ok(Pin {
-        tool,
-        version,
-        file,
-        source: ToolSource::Detected,
-    })
+/// Builds a detected pin, reading its tool name through its alias, or drops it when the name or the version breaks the pin rules.
+///
+/// `entry` is the pin's zero-based index among the pins `file` gives. The
+/// warning names the file, the entry and the rule, never the text, so a
+/// token in a pin file does not reach the log. Dropping is as leak-safe as
+/// refusing: a dropped pin never enters the spec.
+fn pin(tool: &str, version: &str, file: &'static str, entry: usize) -> Option<Pin> {
+    let parsed = ToolName::parse(canonical_tool(tool))
+        .map_err(|reason| ("tool name", reason))
+        .and_then(|tool| {
+            ToolVersion::parse(version)
+                .map(|version| (tool, version))
+                .map_err(|reason| ("version", reason))
+        });
+    match parsed {
+        Ok((tool, version)) => Some(Pin {
+            tool,
+            version,
+            file,
+            source: ToolSource::Detected,
+        }),
+        Err((part, reason)) => {
+            tracing::warn!(
+                file,
+                entry,
+                part,
+                %reason,
+                "pin dropped; pins are informational, so detection goes on without it"
+            );
+            None
+        }
+    }
 }
 
 fn detect_rust(
@@ -1042,7 +1041,7 @@ fn mise_pins(reader: &Reader<'_>) -> Result<Vec<Pin>, DetectError> {
     let Some(tools) = table.get("tools").and_then(toml::Value::as_table) else {
         return Ok(Vec::new());
     };
-    tools
+    Ok(tools
         .iter()
         .filter_map(|(tool, value)| match value {
             toml::Value::String(v) => Some((tool, v.as_str())),
@@ -1057,8 +1056,8 @@ fn mise_pins(reader: &Reader<'_>) -> Result<Vec<Pin>, DetectError> {
             _ => None,
         })
         .enumerate()
-        .map(|(entry, (tool, version))| pin(tool, version, "mise.toml", entry))
-        .collect()
+        .filter_map(|(entry, (tool, version))| pin(tool, version, "mise.toml", entry))
+        .collect())
 }
 
 /// Reads `.tool-versions`: `<tool> <version> [<fallback>...]` per line, `#` starts a comment.
@@ -1066,15 +1065,16 @@ fn tool_versions_pins(reader: &Reader<'_>) -> Result<Vec<Pin>, DetectError> {
     let Some(text) = reader.text(".tool-versions")? else {
         return Ok(Vec::new());
     };
-    text.lines()
+    Ok(text
+        .lines()
         .filter_map(|line| {
             let line = line.split_once('#').map_or(line, |(before, _)| before);
             let mut words = line.split_whitespace();
             Some((words.next()?, words.next()?))
         })
         .enumerate()
-        .map(|(entry, (tool, version))| pin(tool, version, ".tool-versions", entry))
-        .collect()
+        .filter_map(|(entry, (tool, version))| pin(tool, version, ".tool-versions", entry))
+        .collect())
 }
 
 /// Reads `toolchain.channel` from `rust-toolchain.toml`.
@@ -1082,12 +1082,11 @@ fn rust_toolchain_pin(reader: &Reader<'_>) -> Result<Option<Pin>, DetectError> {
     let Some(table) = reader.toml("rust-toolchain.toml")? else {
         return Ok(None);
     };
-    table
+    Ok(table
         .get("toolchain")
         .and_then(|t| t.get("channel"))
         .and_then(toml::Value::as_str)
-        .map(|channel| pin("rust", channel, "rust-toolchain.toml", 0))
-        .transpose()
+        .and_then(|channel| pin("rust", channel, "rust-toolchain.toml", 0)))
 }
 
 /// Reads the first line that is not empty and not a `#` comment.
@@ -1099,11 +1098,11 @@ fn first_line_pin(
     let Some(text) = reader.text(file)? else {
         return Ok(None);
     };
-    text.lines()
+    Ok(text
+        .lines()
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|version| pin(tool, version, file, 0))
-        .transpose()
+        .and_then(|version| pin(tool, version, file, 0)))
 }
 
 /// Reads the `go` directive of `go.mod`.
@@ -1111,14 +1110,15 @@ fn go_mod_pin(reader: &Reader<'_>) -> Result<Option<Pin>, DetectError> {
     let Some(text) = reader.text("go.mod")? else {
         return Ok(None);
     };
-    text.lines()
+    Ok(text
+        .lines()
         .find_map(
             |line| match line.split_whitespace().collect::<Vec<_>>().as_slice() {
-                ["go", version, ..] => Some(pin("go", version, "go.mod", 0)),
+                ["go", version, ..] => Some(*version),
                 _ => None,
             },
         )
-        .transpose()
+        .and_then(|version| pin("go", version, "go.mod", 0)))
 }
 
 fn step(program: &'static str, args: &[&str]) -> Result<SetupStep, DetectError> {
