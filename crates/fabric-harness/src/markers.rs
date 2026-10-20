@@ -63,17 +63,25 @@
 //!   editor git opens into a no-op). A user may set any of these outside a
 //!   host session, and then they pass.
 //! - Left out only under the desktop host, when `CLAUDE_CODE_ENTRYPOINT`
-//!   is `claude-desktop`: every `CLAUDE_CODE_*`, `ANTHROPIC_BASE_URL`,
+//!   is `claude-desktop`: every `CLAUDE_CODE_*` except the user's login
+//!   and provider settings in `USER_CLAUDE_CODE`, `ANTHROPIC_BASE_URL`,
 //!   `MCP_CONNECTION_NONBLOCKING` and `MCP_SERVER_CONNECTION_BATCH_SIZE`.
 //!   The desktop host points `ANTHROPIC_BASE_URL` at an endpoint it
 //!   chooses, switches features of the child with `CLAUDE_CODE_*`, and
 //!   makes a headless turn start before its MCP servers connect with the
-//!   two `MCP_` names. A terminal `claude` (`CLAUDE_CODE_ENTRYPOINT=cli`)
-//!   sets none of these, so there the user's own gateway URL,
-//!   `CLAUDE_CODE_USE_BEDROCK` and MCP settings pass. Under the desktop
-//!   host a user's own `CLAUDE_CODE_*` setting is lost too; it belongs in
-//!   a settings overlay. `MCP_TIMEOUT` and `MCP_TOOL_TIMEOUT` are user
-//!   settings and always pass. Other embedding hosts Claude knows
+//!   two `MCP_` names. The prefix stays, so a switch a later desktop
+//!   release adds is left out too. The names in `USER_CLAUDE_CODE` (an
+//!   OAuth token from `claude setup-token`, a client certificate, the
+//!   Bedrock, Vertex, Foundry and other provider switches and their
+//!   skip-auth names, the output token limit) were not in the observed
+//!   desktop environment and some carry a secret, which a settings
+//!   overlay cannot hold, so they pass under every host. Any other user
+//!   `CLAUDE_CODE_*` setting is lost under the desktop host and belongs
+//!   in a settings overlay's `env`. A terminal `claude`
+//!   (`CLAUDE_CODE_ENTRYPOINT=cli`) sets none of these, so there the
+//!   user's own gateway URL, `CLAUDE_CODE_*` settings and MCP settings
+//!   pass. `MCP_TIMEOUT` and `MCP_TOOL_TIMEOUT` are user settings and
+//!   always pass. Other embedding hosts Claude knows
 //!   (`claude-vscode`, `claude-desktop-3p`) were not observed, so they get
 //!   the first two rules only.
 //! - Kept: what Codex sets to describe a confinement the child really
@@ -179,6 +187,30 @@ const DESKTOP: &[Name] = &[
     Name::Is("MCP_SERVER_CONNECTION_BATCH_SIZE"),
 ];
 
+/// The user's own login and provider settings under `CLAUDE_CODE_`, which
+/// the desktop host does not set and which pass under it.
+const USER_CLAUDE_CODE: &[&str] = &[
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+    "CLAUDE_CODE_CLIENT_CERT",
+    "CLAUDE_CODE_CLIENT_KEY",
+    "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE",
+    "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+    "CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
+    "CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
+    "CLAUDE_CODE_SKIP_MANTLE_AUTH",
+];
+
 /// The variable that names the host a session runs under.
 const ENTRYPOINT: &str = "CLAUDE_CODE_ENTRYPOINT";
 
@@ -216,7 +248,7 @@ impl Host {
         let any = |rules: &[Name]| rules.iter().any(|rule| rule.matches(name));
         any(ALWAYS)
             || (self != Host::None && any(HOSTED))
-            || (self == Host::Desktop && any(DESKTOP))
+            || (self == Host::Desktop && any(DESKTOP) && !USER_CLAUDE_CODE.contains(&name))
     }
 }
 
@@ -277,6 +309,10 @@ mod tests {
         "DISABLE_AUTOUPDATER",
         "MCP_TIMEOUT",
         "MCP_TOOL_TIMEOUT",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
     ];
 
     /// Names only a host sets.
@@ -336,10 +372,10 @@ mod tests {
         "BUN_OPTIONS",
     ];
 
-    /// Names the desktop host sets and a user may also set.
+    /// Names the observed desktop session carried and a user may also set.
     const PROVIDER: &[&str] = &[
         "ANTHROPIC_BASE_URL",
-        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_DISABLE_CRON",
         "CLAUDE_CODE_SIMPLE",
         "MCP_CONNECTION_NONBLOCKING",
         "MCP_SERVER_CONNECTION_BATCH_SIZE",
