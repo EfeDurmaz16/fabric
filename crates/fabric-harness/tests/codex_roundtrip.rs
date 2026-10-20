@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use fabric_core::env::EnvVarName;
 use fabric_core::path::RelPath;
 use fabric_harness::codex::Codex;
+use fabric_harness::codex::overrides::{ApprovalPolicy, CodexOverrides, SandboxMode};
 use fabric_harness::manifest::{Carried, Content, Digest, Mutability};
 use fabric_harness::{Harness, HarnessError, Io, Launch, SessionId};
 
@@ -297,7 +298,12 @@ async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_the
     let bin = fake_codex(&home);
     let adapter = Codex::new(home.clone())
         .with_path_var(bin.clone())
-        .with_overrides(vec!["sandbox_mode=\"workspace-write\"".to_owned()]);
+        .with_overrides(CodexOverrides {
+            sandbox: SandboxMode::WorkspaceWrite,
+            approval: ApprovalPolicy::Never,
+            model: None,
+            effort: None,
+        });
     let installed = adapter.detect().await.unwrap().unwrap();
     assert_eq!(installed.version.as_deref(), Some("0.155.1"));
 
@@ -366,7 +372,7 @@ async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_the
     assert_eq!(
         seen,
         format!(
-            "cwd={}\narg=exec\narg=resume\narg={THREAD}\narg=--json\narg=-c\narg=projects.\"{}\".trust_level=trusted\narg=-c\narg=sandbox_mode=\"workspace-write\"\narg=--\narg=reply with the secret word\n",
+            "cwd={}\narg=exec\narg=resume\narg={THREAD}\narg=--json\narg=-c\narg=projects.\"{}\".trust_level=trusted\narg=-c\narg=sandbox_mode=\"workspace-write\"\narg=-c\narg=approval_policy=\"never\"\narg=--\narg=reply with the secret word\n",
             src.work.display(),
             src.work.display()
         )

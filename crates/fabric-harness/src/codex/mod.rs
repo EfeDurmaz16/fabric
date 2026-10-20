@@ -26,10 +26,12 @@
 //! Surfaces used, checked against `codex --help`, `codex resume --help`
 //! and `codex exec resume --help` of 0.155.1 on 2026-10-19: `codex resume
 //! <id> [PROMPT]` for the terminal and `codex exec resume <id> [PROMPT]`
-//! for a headless run, both with `-c key=value` overrides. The prompt is
+//! for a headless run, both with `-c key=value` overrides built from the
+//! typed `overrides::CodexOverrides`, never from free text. The prompt is
 //! passed after `--`, which clap reads as the end of options. The
 //! app-server JSON-RPC surface is not used (ADR 0006, D14).
 
+pub mod overrides;
 pub mod rollout;
 
 use std::ffi::OsString;
@@ -54,6 +56,7 @@ use crate::process;
 use crate::redact::RedactionCounts;
 use crate::session::SessionId;
 
+use self::overrides::CodexOverrides;
 use self::rollout::{RolloutFile, RolloutName};
 
 /// The program name on `PATH`.
@@ -77,7 +80,7 @@ pub struct Codex {
     store: PathBuf,
     binary: Option<PathBuf>,
     path_var: Option<OsString>,
-    overrides: Vec<String>,
+    overrides: Option<CodexOverrides>,
 }
 
 /// Holds Codex's writer lock for a thread; removes the lock file on drop
@@ -184,7 +187,7 @@ impl Codex {
             home,
             binary: None,
             path_var: std::env::var_os("PATH"),
-            overrides: Vec::new(),
+            overrides: None,
         }
     }
 
@@ -215,12 +218,11 @@ impl Codex {
         self
     }
 
-    /// `-c key=value` overrides passed on every run, such as
-    /// `sandbox_mode="workspace-write"` or `model="o3"`; a cold resume
-    /// does not restore them (H2, experiment E3).
+    /// Settings passed as `-c` overrides on every run; a cold resume does
+    /// not restore them (H2, experiment E3).
     #[must_use]
-    pub fn with_overrides(mut self, overrides: Vec<String>) -> Self {
-        self.overrides = overrides;
+    pub fn with_overrides(mut self, overrides: CodexOverrides) -> Self {
+        self.overrides = Some(overrides);
         self
     }
 
@@ -583,9 +585,9 @@ impl Codex {
             "projects.{}.trust_level=trusted",
             toml_quoted_key(root)?
         ));
-        for value in &self.overrides {
+        for pair in self.overrides.iter().flat_map(CodexOverrides::pairs) {
             args.push("-c".to_owned());
-            args.push(value.clone());
+            args.push(pair);
         }
         match prompt {
             Some(prompt) => {
@@ -665,8 +667,12 @@ mod tests {
 
     #[test]
     fn args_follow_the_cli_surface_and_quote_the_root() {
-        let adapter = Codex::new(PathBuf::from("/h"))
-            .with_overrides(vec!["sandbox_mode=\"workspace-write\"".to_owned()]);
+        let adapter = Codex::new(PathBuf::from("/h")).with_overrides(CodexOverrides {
+            sandbox: overrides::SandboxMode::WorkspaceWrite,
+            approval: overrides::ApprovalPolicy::OnRequest,
+            model: Some(crate::harness::ModelName::parse("o3").unwrap()),
+            effort: Some(overrides::Effort::High),
+        });
         let root = Path::new("/h/fabric/jobs/j/work");
         let session = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
         let resume = Launch::Resume {
@@ -681,7 +687,13 @@ mod tests {
                 "-c",
                 "projects.\"/h/fabric/jobs/j/work\".trust_level=trusted",
                 "-c",
-                "sandbox_mode=\"workspace-write\""
+                "sandbox_mode=\"workspace-write\"",
+                "-c",
+                "approval_policy=\"on-request\"",
+                "-c",
+                "model=\"o3\"",
+                "-c",
+                "model_reasoning_effort=\"high\""
             ]
         );
         assert!(matches!(
@@ -703,6 +715,12 @@ mod tests {
                 "projects.\"/h/fabric/jobs/j/work\".trust_level=trusted",
                 "-c",
                 "sandbox_mode=\"workspace-write\"",
+                "-c",
+                "approval_policy=\"on-request\"",
+                "-c",
+                "model=\"o3\"",
+                "-c",
+                "model_reasoning_effort=\"high\"",
                 "--",
                 "--dangerously-bypass-approvals-and-sandbox"
             ]
