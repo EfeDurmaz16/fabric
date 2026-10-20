@@ -13,8 +13,8 @@
     reason = "a failed unwrap inside a test is the test failing"
 )]
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::fmt::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 
@@ -46,6 +46,19 @@ fn session() -> SessionId {
 fn node(home: &Path) -> ClaudeCode {
     let (_, path_var) = fake_claude(home);
     ClaudeCode::new(abs(home), path_var)
+}
+
+/// The Codex adapter for `home`, with a fake `codex` that reports the
+/// version whose writer lock the adapter trusts.
+fn codex_node(home: &Path) -> Codex {
+    let bin = home.join("codex-bin");
+    let script = bin.join("codex");
+    if !script.exists() {
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(&script, "#!/bin/sh\necho \"codex-cli 0.155.1\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    Codex::new(abs(home), bin.into_os_string())
 }
 
 /// Moves `.claude` to `aside` and leaves a node where Claude is installed
@@ -163,10 +176,7 @@ fn crash_child() {
                 node(&home).restore(&work, &out).await.unwrap();
             }
             "codex-restore" => {
-                Codex::new(abs(&home), OsString::new())
-                    .restore(&work, &out)
-                    .await
-                    .unwrap();
+                codex_node(&home).restore(&work, &out).await.unwrap();
             }
             other => panic!("unknown role {other}"),
         }
@@ -351,7 +361,7 @@ async fn a_codex_restore_aborted_mid_way_frees_the_writer_lock_and_converges() {
     let work = build_codex_home(&home);
     let thread = SessionId::parse(THREAD).unwrap();
     let out = tempfile::tempdir().unwrap();
-    let adapter = Codex::new(abs(&home), OsString::new());
+    let adapter = codex_node(&home);
     adapter.capture(&work, &thread, out.path()).await.unwrap();
     let source = regular_files(&home.join(".codex/sessions"));
     std::fs::rename(home.join(".codex"), home.join(".codex-source")).unwrap();

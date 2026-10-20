@@ -21,7 +21,11 @@
 //! The lock protocol follows `codex-rs/rollout/src/writer_lock.rs` at
 //! `e4568a3`: `thread-writer-locks/.coordination.lock` is held only while
 //! a `<thread_id>.lock` is opened and tried, and again while it is
-//! removed; the thread lock is held for the whole copy.
+//! removed; the thread lock is held for the whole copy. The lock is
+//! trusted only when the installed Codex is at least the version it was
+//! checked on; with an older or unknown version, any running `codex`
+//! refuses the capture or restore, because a Codex that takes no lock
+//! would keep appending to a rollout that restore renamed away.
 //!
 //! Surfaces used, checked against `codex --help`, `codex resume --help`
 //! and `codex exec resume --help` of 0.155.1 on 2026-10-19: `codex resume
@@ -66,6 +70,9 @@ pub const RESTORE_SUBDIR: &str = "fabric";
 
 const LOCK_DIR: &str = "thread-writer-locks";
 const COORDINATION_LOCK: &str = ".coordination.lock";
+
+/// The Codex version whose thread writer lock this adapter was checked against.
+const LOCK_READ_ON: &[u32] = &[0, 155, 1];
 
 /// How long a lock attempt waits for Codex's coordination lock, which
 /// Codex holds only across an open and a `try_lock`.
@@ -348,6 +355,28 @@ impl Codex {
         })
     }
 
+    /// Refuses while a `codex` runs that may not take the thread writer
+    /// lock: one older than `LOCK_READ_ON`, or one whose version is unknown.
+    async fn refuse_lockless_writers(&self, version: Option<&str>) -> Result<(), HarnessError> {
+        if version.is_some_and(|v| process::version_at_least(v, LOCK_READ_ON)) {
+            return Ok(());
+        }
+        warn!(
+            ?version,
+            "codex: the writer lock may not be taken by this version; any running codex blocks"
+        );
+        let binary = self.binary().ok();
+        let pids = process::running_pids(PROGRAM, binary.as_deref()).await?;
+        if pids.is_empty() {
+            Ok(())
+        } else {
+            Err(HarnessError::HarnessRunning {
+                program: PROGRAM.to_owned(),
+                pids,
+            })
+        }
+    }
+
     fn capture_sync(
         &self,
         root: &AbsPath,
@@ -402,6 +431,7 @@ impl Codex {
     ) -> Result<StateManifest, HarnessError> {
         let root = pipeline::physical_workspace(workspace)?;
         let version = process::installed_version(self.binary().ok(), PROGRAM).await;
+        self.refuse_lockless_writers(version.as_deref()).await?;
         let adapter = self.clone();
         let session = session.clone();
         let out = out.to_path_buf();
@@ -494,6 +524,8 @@ impl Codex {
     async fn restore_impl(&self, workspace: &Path, state: &Path) -> Result<Restored, HarnessError> {
         let root = pipeline::physical_workspace(workspace)?;
         let manifest = pipeline::open(state, &HarnessKind::Codex, &root, &self.home)?;
+        let version = process::installed_version(self.binary().ok(), PROGRAM).await;
+        self.refuse_lockless_writers(version.as_deref()).await?;
         let adapter = self.clone();
         let state = state.to_path_buf();
         pipeline::blocking(move || adapter.restore_sync(&state, manifest)).await

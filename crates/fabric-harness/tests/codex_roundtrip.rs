@@ -13,6 +13,7 @@
 use std::ffi::OsString;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 use fabric_core::env::EnvVarName;
@@ -104,17 +105,35 @@ fn build_source_at(work_rel: &str) -> Fixture {
     }
 }
 
-fn fake_codex(dir: &Path) -> OsString {
+/// The version the adapter's writer lock rule was checked on.
+const LOCKING_VERSION: &str = "0.155.1";
+
+/// Writes a fake `codex` under `dir/bin` that reports `version`, stays
+/// alive when its first argument is `hold`, and otherwise logs its working
+/// directory and arguments to `$FAKE_LOG`; returns the script and a `PATH`
+/// value that finds it.
+fn fake_codex_reporting(dir: &Path, version: &str) -> (PathBuf, OsString) {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let script = bin.join("codex");
     std::fs::write(
         &script,
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"codex-cli 0.155.1\"; exit 0; fi\n{ echo \"cwd=$(pwd -P)\"; for a in \"$@\"; do echo \"arg=$a\"; done; } > \"$FAKE_LOG\"\n",
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"codex-cli {version}\"; exit 0 ;;\n  hold) sleep 60; exit 0 ;;\nesac\n{{ echo \"cwd=$(pwd -P)\"; for a in \"$@\"; do echo \"arg=$a\"; done; }} > \"$FAKE_LOG\"\n"
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    bin.into_os_string()
+    (script, bin.into_os_string())
+}
+
+fn fake_codex(dir: &Path) -> OsString {
+    fake_codex_reporting(dir, LOCKING_VERSION).1
+}
+
+/// The adapter for `home`, with a fake `codex` that takes the writer lock.
+fn node(home: &Path) -> Codex {
+    Codex::new(abs(home), fake_codex(home))
 }
 
 fn abs(path: &Path) -> AbsPath {
@@ -133,7 +152,7 @@ fn lock_dir(home: &Path) -> PathBuf {
 async fn capture_follows_the_lineage_and_carries_nothing_else() {
     let src = build_source();
     let home = src.home.path().canonicalize().unwrap();
-    let adapter = Codex::new(abs(&home), OsString::new());
+    let adapter = node(&home);
     assert_eq!(adapter.latest_session(&src.work).unwrap(), Some(thread()));
 
     let out = tempfile::tempdir().unwrap();
@@ -175,10 +194,7 @@ async fn capture_follows_the_lineage_and_carries_nothing_else() {
 async fn a_missing_prefix_breaks_the_lineage() {
     let src = build_source();
     std::fs::remove_file(&src.prefix).unwrap();
-    let adapter = Codex::new(
-        abs(&src.home.path().canonicalize().unwrap()),
-        OsString::new(),
-    );
+    let adapter = node(&src.home.path().canonicalize().unwrap());
     let out = tempfile::tempdir().unwrap();
     let err = adapter
         .capture(&src.work, &thread(), out.path())
@@ -199,7 +215,7 @@ async fn an_active_writer_blocks_capture_and_restore() {
     std::fs::create_dir_all(&locks).unwrap();
     let holder = std::fs::File::create(locks.join(format!("{THREAD}.lock"))).unwrap();
     holder.lock().unwrap();
-    let adapter = Codex::new(abs(&home), OsString::new());
+    let adapter = node(&home);
     let out = tempfile::tempdir().unwrap();
     let err = adapter
         .capture(&src.work, &thread(), out.path())
@@ -222,6 +238,66 @@ async fn an_active_writer_blocks_capture_and_restore() {
     adapter.restore(&src.work, out.path()).await.unwrap();
 }
 
+/// A running fake `codex`, killed with its process group on drop.
+struct Held {
+    child: std::process::Child,
+}
+
+impl Held {
+    /// Starts `script hold` in a process group of its own.
+    fn start(script: &Path) -> Self {
+        let child = std::process::Command::new(script)
+            .arg("hold")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        Held { child }
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", self.child.id())])
+            .status();
+        let _ = self.child.wait();
+    }
+}
+
+#[tokio::test]
+async fn a_running_codex_too_old_for_the_writer_lock_blocks_capture_and_restore() {
+    // A Codex older than the lock rule takes no thread lock, so the lock
+    // being free says nothing; the running process must block instead.
+    let src = build_source();
+    let home = src.home.path().canonicalize().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    node(&home)
+        .capture(&src.work, &thread(), out.path())
+        .await
+        .unwrap();
+    let (script, path_var) = fake_codex_reporting(&home, "0.150.0");
+    let adapter = Codex::new(abs(&home), path_var);
+    let held = Held::start(&script);
+    let pid = held.child.id();
+    let again = tempfile::tempdir().unwrap();
+    let err = adapter
+        .capture(&src.work, &thread(), again.path())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, HarnessError::HarnessRunning { ref pids, .. } if pids.contains(&pid)),
+        "{err}"
+    );
+    assert!(!again.path().join("manifest.json").exists());
+    let before = std::fs::read(&src.head).unwrap();
+    let err = adapter.restore(&src.work, out.path()).await.unwrap_err();
+    assert!(
+        matches!(err, HarnessError::HarnessRunning { ref pids, .. } if pids.contains(&pid)),
+        "{err}"
+    );
+    assert_eq!(std::fs::read(&src.head).unwrap(), before);
+}
+
 #[tokio::test]
 async fn a_rollout_with_a_secret_is_refused_not_carried() {
     let src = build_source();
@@ -232,10 +308,7 @@ async fn a_rollout_with_a_secret_is_refused_not_carried() {
     file.write_all(turn("token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab").as_bytes())
         .unwrap();
     drop(file);
-    let adapter = Codex::new(
-        abs(&src.home.path().canonicalize().unwrap()),
-        OsString::new(),
-    );
+    let adapter = node(&src.home.path().canonicalize().unwrap());
     let out = tempfile::tempdir().unwrap();
     let err = adapter
         .capture(&src.work, &thread(), out.path())
@@ -258,10 +331,7 @@ async fn assert_refused_with_turn(escaped: &str) {
         .unwrap();
     file.write_all(turn(escaped).as_bytes()).unwrap();
     drop(file);
-    let adapter = Codex::new(
-        abs(&src.home.path().canonicalize().unwrap()),
-        OsString::new(),
-    );
+    let adapter = node(&src.home.path().canonicalize().unwrap());
     let out = tempfile::tempdir().unwrap();
     let err = adapter
         .capture(&src.work, &thread(), out.path())
@@ -290,10 +360,7 @@ async fn a_workspace_whose_name_holds_sk_inside_a_word_is_captured() {
     // `disk-usage` holds `sk-`; the rollout's `cwd` and its first message
     // name the path, and neither is a key.
     let src = build_source_at("oss/disk-usage-analyzer-service");
-    let adapter = Codex::new(
-        abs(&src.home.path().canonicalize().unwrap()),
-        OsString::new(),
-    );
+    let adapter = node(&src.home.path().canonicalize().unwrap());
     let out = tempfile::tempdir().unwrap();
     let manifest = adapter
         .capture(&src.work, &thread(), out.path())
@@ -307,7 +374,7 @@ async fn a_workspace_whose_name_holds_sk_inside_a_word_is_captured() {
 async fn two_files_for_one_rollout_resolve_by_prefix_or_are_refused() {
     let src = build_source();
     let home = src.home.path().canonicalize().unwrap();
-    let adapter = Codex::new(abs(&home), OsString::new());
+    let adapter = node(&home);
     let copy_dir = home.join(".codex/sessions/fabric").join(THREAD);
     std::fs::create_dir_all(&copy_dir).unwrap();
     let copy = copy_dir.join(HEAD_NAME);
@@ -365,7 +432,7 @@ async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_the
     let src = build_source();
     let home = src.home.path().canonicalize().unwrap();
     let out = tempfile::tempdir().unwrap();
-    let manifest = Codex::new(abs(&home), OsString::new())
+    let manifest = node(&home)
         .capture(&src.work, &thread(), out.path())
         .await
         .unwrap();
@@ -453,7 +520,7 @@ async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_the
 async fn a_thread_that_comes_back_lands_over_its_original_file() {
     let src = build_source();
     let home = src.home.path().canonicalize().unwrap();
-    let adapter = Codex::new(abs(&home), OsString::new());
+    let adapter = node(&home);
     let out_1 = tempfile::tempdir().unwrap();
     adapter
         .capture(&src.work, &thread(), out_1.path())
