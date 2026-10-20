@@ -5,7 +5,8 @@
 //! node id it reports is read from the certificate that handshake checked.
 //! 0-RTT is never enabled, so no application byte is replayable. Incoming
 //! handshakes run in the background (the `accept` module), so a peer that
-//! stalls one does not hold up the next.
+//! stalls one does not hold up the next, and only after the peer's address
+//! answered a Retry, so a spoofed source takes no handshake slot.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -110,9 +111,19 @@ impl QuicTransport {
 }
 
 /// Hands every incoming connection to `handshakes` until the endpoint closes.
+///
+/// An Initial from an address that has not proved it can receive is
+/// answered with a Retry first. A spoofed source never sees the Retry, so
+/// it never reaches a handshake slot.
 async fn accept_loop(endpoint: quinn::Endpoint, handshakes: Handshakes) {
     while let Some(incoming) = endpoint.accept().await {
         let remote = incoming.remote_address();
+        if !incoming.remote_address_validated() {
+            if let Err(err) = incoming.retry() {
+                tracing::debug!(%remote, error = %err, "retry refused");
+            }
+            continue;
+        }
         let handshake = async move {
             let connection = incoming.await.map_err(|err| TransportError::Handshake {
                 addr: remote,
