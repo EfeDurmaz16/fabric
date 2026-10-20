@@ -408,6 +408,38 @@ fn utf8_link(base: &Path, rel: &RelPath) -> Result<String, CaptureError> {
     })
 }
 
+/// What identifies one state of a path: device, inode, size and mtime.
+type Stamp = (u64, u64, u64, i64, i64);
+
+fn stamp(meta: &fs::Metadata) -> Stamp {
+    (
+        meta.dev(),
+        meta.ino(),
+        meta.len(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+    )
+}
+
+/// Stamps every path of `paths` under `root` that exists, without following links.
+fn stamps<'a>(
+    root: &Path,
+    paths: impl Iterator<Item = &'a RelPath>,
+) -> Result<HashMap<RelPath, Stamp>, CaptureError> {
+    let mut out = HashMap::new();
+    for rel in paths {
+        let full = root.join(rel.as_str());
+        match fs::symlink_metadata(&full) {
+            Ok(meta) => {
+                out.insert(rel.clone(), stamp(&meta));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err(&full, e)),
+        }
+    }
+    Ok(out)
+}
+
 /// Returns the mtime of `meta` in nanoseconds since the epoch.
 ///
 /// A manifest records an unsigned time, so an mtime before 1970 is refused
@@ -1442,9 +1474,16 @@ impl GitCapture<'_> {
     }
 
     /// Reads the mtime of every path in `W` and reports the links among them that escape the root.
+    ///
+    /// `before` holds the stamps taken just before `git add -A` built `W`.
+    /// A path whose stamp differs now, or that had none, was written while
+    /// or after `W` was built, so `W` may hold older bytes than the mtime
+    /// recorded here; that fails with `WorkspaceChanged` instead of
+    /// publishing a snapshot that loses the edit.
     fn worktree_mtimes(
         &self,
         worktree: &GitOid,
+        before: &HashMap<RelPath, Stamp>,
         report: &mut CaptureReport,
     ) -> Result<Vec<(RelPath, u64)>, CaptureError> {
         let out = self
@@ -1461,6 +1500,9 @@ impl GitCapture<'_> {
                 }
                 Err(e) => return Err(io_err(&full, e)),
             };
+            if before.get(&rel) != Some(&stamp(&meta)) {
+                return Err(CaptureError::WorkspaceChanged { path: rel });
+            }
             if meta.file_type().is_symlink() {
                 let target = utf8_link(self.root, &rel)?;
                 if symlink_escapes(&rel, &target) {
@@ -1744,6 +1786,7 @@ fn capture_git(
         excludes.push_str(root.as_str());
         excludes.push_str("/\n");
     }
+    let before = stamps(req.root, tracked.iter().chain(untracked.iter()))?;
     let (worktree_commit, removed) = repo.worktree_commit(
         &index_tree,
         head_commit.as_ref(),
@@ -1772,7 +1815,7 @@ fn capture_git(
         capturer.report.stashed_secrets =
             repo.stashed_secrets(stash, &|rel| policy.denies_anywhere(rel))?;
     }
-    let worktree_mtimes = repo.worktree_mtimes(&worktree_commit, &mut capturer.report)?;
+    let worktree_mtimes = repo.worktree_mtimes(&worktree_commit, &before, &mut capturer.report)?;
     let config = repo.config(&mut capturer.report)?;
     let exclude_path = repo.git.git_path("info/exclude")?;
     // `info/exclude` is git's own file, not workspace content, so a link to
@@ -1875,6 +1918,36 @@ mod tests {
         assert!(matches!(
             store_listed(&store, dir.path(), &found),
             Err(CaptureError::WorkspaceChanged { .. })
+        ));
+    }
+
+    /// A file written after `W` was built fails capture instead of travelling with its old bytes.
+    #[test]
+    fn a_file_written_after_w_was_built_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        fs::create_dir(&root).unwrap();
+        let repo = GitCapture {
+            git: Git::new(&root).with_date(1_760_000_000_000),
+            root: &root,
+            job_id: JobId::from_bytes([1; 16]),
+            scratch: dir.path().to_owned(),
+            user_excludes: String::new(),
+            listing_excludes: TempFile::in_dir(dir.path()),
+        };
+        repo.git.run(&["init", "-q", "-b", "main"]).unwrap();
+        fs::write(root.join("a.txt"), "before\n").unwrap();
+        repo.git.run(&["add", "a.txt"]).unwrap();
+        repo.git.run(&["commit", "-q", "-m", "one"]).unwrap();
+        let w = repo.head_commit().unwrap().unwrap();
+        let paths = [rel("a.txt")];
+        let before = stamps(&root, paths.iter()).unwrap();
+        let mut report = CaptureReport::default();
+        assert!(repo.worktree_mtimes(&w, &before, &mut report).is_ok());
+        fs::write(root.join("a.txt"), "written after W\n").unwrap();
+        assert!(matches!(
+            repo.worktree_mtimes(&w, &before, &mut report),
+            Err(CaptureError::WorkspaceChanged { path }) if path.as_str() == "a.txt"
         ));
     }
 
