@@ -295,6 +295,33 @@ fn git_state_survives_capture_and_restore() {
 }
 
 #[test]
+fn a_sha256_repository_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("a"), "a\n").unwrap();
+    let g = git(&root);
+    g.run(&["init", "-q", "-b", "main", "--object-format=sha256"])
+        .unwrap();
+    g.run(&["add", "-A"]).unwrap();
+    g.run(&["commit", "-q", "-m", "one"]).unwrap();
+    fs::write(root.join("a"), "a staged\n").unwrap();
+    g.run(&["add", "a"]).unwrap();
+    fs::write(root.join("a"), "a unstaged\n").unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    assert_eq!(
+        git_text(&target, &["rev-parse", "--show-object-format"]).unwrap(),
+        "sha256"
+    );
+    assert_eq!(git_difference(&root, &target).unwrap(), None);
+}
+
+#[test]
 fn verify_sees_a_tampered_file_and_link_in_the_working_tree() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("work");

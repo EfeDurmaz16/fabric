@@ -750,7 +750,14 @@ fn restore_git(
     if power_loss {
         git = git.with_full_fsync();
     }
-    git.run(&["init", "-q"])?;
+    // A SHA-256 repository cannot unpack into a SHA-1 one; the manifest
+    // holds one object format, read from the width of its ids.
+    let format = if git_state.index_commit.is_sha256() {
+        "--object-format=sha256"
+    } else {
+        "--object-format=sha1"
+    };
+    git.run(&["init", "-q", format])?;
     if let Some(chunks) = &git_state.exclude {
         let path = git.git_path("info/exclude")?;
         if let Some(parent) = path.parent() {
