@@ -970,6 +970,20 @@ fn a_harness_directory_with_foreign_files_is_refused() {
 }
 
 #[test]
+fn a_harness_directory_inside_the_target_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, snapshot) = plain_snapshot(dir.path()).unwrap();
+    let target = dir.path().join("restored");
+    fs::create_dir(&target).unwrap();
+    let err = restore_with_state(&store, snapshot, &target, &target.join(".claude")).unwrap_err();
+    assert!(
+        matches!(err, RestoreError::NestedDirectories { .. }),
+        "{err}"
+    );
+    assert_eq!(restore_state(&target).unwrap(), RestoreState::Absent);
+}
+
+#[test]
 fn a_cache_the_target_cannot_use_is_skipped_and_named() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("work");

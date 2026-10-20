@@ -131,6 +131,14 @@ pub enum RestoreError {
         /// The path given.
         path: PathBuf,
     },
+    /// The target and the harness state directory lie one inside the other.
+    #[error("{harness_state} and {target} lie one inside the other")]
+    NestedDirectories {
+        /// The target, resolved.
+        target: PathBuf,
+        /// The harness state directory, resolved.
+        harness_state: PathBuf,
+    },
     /// The target exists and holds something.
     #[error("{path} exists and is not empty")]
     TargetNotEmpty {
@@ -268,6 +276,43 @@ pub(crate) fn open_up(dir: &Path) -> Result<(), RestoreError> {
         {
             open_up(&entry.path())?;
         }
+    }
+    Ok(())
+}
+
+/// Returns `path` with its deepest existing ancestor resolved, so two spellings of one place compare equal.
+fn resolved(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut ancestor = path;
+    loop {
+        if let Ok(real) = fs::canonicalize(ancestor) {
+            return rest.iter().rev().fold(real, |acc, name| acc.join(name));
+        }
+        match (ancestor.parent(), ancestor.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                ancestor = parent;
+            }
+            _ => return path.to_owned(),
+        }
+    }
+}
+
+/// Refuses a harness state directory inside the target, or a target inside it.
+///
+/// Either rename would then land in a directory the other one fills, and
+/// every rerun would stop at a non-empty target.
+fn refuse_nested(target: &Path, harness_state: &Path) -> Result<(), RestoreError> {
+    let place = |path: &Path| match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => resolved(parent).join(name),
+        _ => path.to_owned(),
+    };
+    let (target, harness_state) = (place(target), place(harness_state));
+    if target.starts_with(&harness_state) || harness_state.starts_with(&target) {
+        return Err(RestoreError::NestedDirectories {
+            target,
+            harness_state,
+        });
     }
     Ok(())
 }
@@ -978,6 +1023,9 @@ fn skipped_caches(
 /// finishes the workspace.
 pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport, RestoreError> {
     let manifest = store.manifest(req.snapshot)?;
+    if let Some(dir) = req.harness_state {
+        refuse_nested(req.target, dir)?;
+    }
     check_target_empty(req.target)?;
     let harness_done = match req.harness_state {
         Some(dir) => harness_state_complete(store, &manifest.harness_state.entries, dir)?,
