@@ -1171,6 +1171,28 @@ fn restore_with_state(
     )
 }
 
+/// Runs the flush of a kept harness directory; a power cut is not simulated.
+#[test]
+fn a_power_loss_rerun_keeps_and_flushes_a_complete_harness_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, snapshot) = plain_snapshot(dir.path()).unwrap();
+    let state = dir.path().join("state-restored");
+    restore_with_state(&store, snapshot, &dir.path().join("first"), &state).unwrap();
+    let report = restore(
+        &store,
+        &RestoreRequest {
+            snapshot,
+            target: &dir.path().join("second"),
+            harness_state: Some(&state),
+            verify: Verify::All,
+            durability: Durability::PowerLoss,
+            carry: &|_| true,
+        },
+    )
+    .unwrap();
+    assert_eq!(report.verified, 10);
+}
+
 #[test]
 fn a_harness_directory_with_foreign_files_is_refused() {
     let dir = tempfile::tempdir().unwrap();

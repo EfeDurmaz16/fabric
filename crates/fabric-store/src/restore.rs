@@ -415,14 +415,16 @@ fn write_entries(
     Ok(())
 }
 
-/// Flushes every directory under `root`, and `root` itself, deepest first, without following links.
+/// Flushes every directory under `root`, and `root` itself, deepest first, without following links; with `files`, every regular file too.
 ///
-/// The files are flushed as they are written, but a file's flush does not
-/// make its name durable: the directory that holds it must be flushed too,
-/// before the rename that publishes the tree. A directory this cannot open
-/// is one `write_entries` gave a recorded mode without read permission, and
-/// it flushed that one already, children first.
-fn sync_dirs(root: &Path) -> Result<(), RestoreError> {
+/// The files restore writes are flushed as they are written, but a file's
+/// flush does not make its name durable: the directory that holds it must
+/// be flushed too, before the rename that publishes the tree. A tree an
+/// earlier run left behind, such as a harness directory a rerun keeps, was
+/// maybe written without any flush, so its files are flushed as well. A
+/// directory this cannot open is one `write_entries` gave a recorded mode
+/// without read permission, and it flushed that one already, children first.
+fn sync_tree(root: &Path, files: bool) -> Result<(), RestoreError> {
     use rustix::fs::{Mode as RawBits, OFlags};
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let fd = match rustix::fs::open(root, flags, RawBits::empty()) {
@@ -432,12 +434,15 @@ fn sync_dirs(root: &Path) -> Result<(), RestoreError> {
     };
     for entry in fs::read_dir(root).map_err(|e| io_err(root, e))? {
         let entry = entry.map_err(|e| io_err(root, e))?;
-        if entry
-            .file_type()
-            .map_err(|e| io_err(&entry.path(), e))?
-            .is_dir()
-        {
-            sync_dirs(&entry.path())?;
+        let path = entry.path();
+        let kind = entry.file_type().map_err(|e| io_err(&path, e))?;
+        if kind.is_dir() {
+            sync_tree(&path, files)?;
+        } else if files && kind.is_file() {
+            let file_flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+            let file = rustix::fs::open(&path, file_flags, RawBits::empty())
+                .map_err(|e| io_err(&path, e.into()))?;
+            rustix::fs::fsync(&file).map_err(|e| io_err(&path, e.into()))?;
         }
     }
     rustix::fs::fsync(&fd).map_err(|e| io_err(root, e.into()))
@@ -1144,7 +1149,13 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
     }
 
     match (req.harness_state, harness_done) {
-        (Some(_), Some(verified)) => report.verified += verified,
+        (Some(dir), Some(verified)) => {
+            // A kept harness directory may come from a ProcessCrash run.
+            if req.durability == Durability::PowerLoss {
+                sync_tree(dir, true)?;
+            }
+            report.verified += verified;
+        }
         (Some(dir), None) => {
             let hs_staging = fresh_staging(dir)?;
             let hs_writer = TreeWriter::open(&hs_staging)?;
@@ -1165,7 +1176,7 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
                 req.verify,
             )?;
             if req.durability == Durability::PowerLoss {
-                sync_dirs(&hs_staging)?;
+                sync_tree(&hs_staging, false)?;
             }
             move_into_place(&hs_staging, dir)?;
             checkpoint::reached("restore.after_harness_rename");
@@ -1186,7 +1197,7 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
         }
     }
     if req.durability == Durability::PowerLoss {
-        sync_dirs(&staging)?;
+        sync_tree(&staging, false)?;
     }
     checkpoint::reached("restore.before_rename");
     move_into_place(&staging, req.target)?;
