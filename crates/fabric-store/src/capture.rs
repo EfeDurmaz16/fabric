@@ -277,7 +277,8 @@ fn rel_path(text: &str) -> Result<RelPath, CaptureError> {
     })
 }
 
-fn mode_of(raw: u32) -> Mode {
+/// Keeps the permission bits of a raw `st_mode`.
+pub(crate) fn mode_of(raw: u32) -> Mode {
     #[expect(
         clippy::unwrap_used,
         reason = "the mask leaves the low nine bits, which Mode::new always accepts"

@@ -13,6 +13,7 @@ use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
 use fabric_core::path::RelPath;
+use fabric_core::snapshot::Mode as EntryMode;
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawMode, Timespec, Timestamps};
 use rustix::io::Errno;
 
@@ -47,8 +48,8 @@ const DIR_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 
-fn mode(bits: u16) -> Mode {
-    Mode::from_raw_mode(RawMode::from(bits))
+fn mode(entry: EntryMode) -> Mode {
+    Mode::from_raw_mode(RawMode::from(entry.bits()))
 }
 
 fn map(errno: Errno, path: &Path) -> WriteError {
@@ -88,7 +89,7 @@ impl TreeWriter {
         match fs::openat(parent, name, DIR_FLAGS, Mode::empty()) {
             Ok(fd) => Ok(fd),
             Err(Errno::NOENT) if create => {
-                match fs::mkdirat(parent, name, mode(0o755)) {
+                match fs::mkdirat(parent, name, Mode::from_raw_mode(0o755)) {
                     Ok(()) | Err(Errno::EXIST) => {}
                     Err(e) => return Err(map(e, so_far)),
                 }
@@ -121,7 +122,7 @@ impl TreeWriter {
     }
 
     /// Creates a directory with `bits`; an existing directory at the path is fine.
-    pub fn mkdir(&self, rel: &RelPath, bits: u16) -> Result<(), WriteError> {
+    pub fn mkdir(&self, rel: &RelPath, bits: EntryMode) -> Result<(), WriteError> {
         let (parent, name) = self.parent_of(rel, true)?;
         let path = Path::new(rel.as_str());
         match fs::mkdirat(&parent, name, mode(bits)) {
@@ -144,7 +145,7 @@ impl TreeWriter {
     }
 
     /// Creates a new file with `bits` and returns it open for writing.
-    pub fn create_file(&self, rel: &RelPath, bits: u16) -> Result<File, WriteError> {
+    pub fn create_file(&self, rel: &RelPath, bits: EntryMode) -> Result<File, WriteError> {
         let (parent, name) = self.parent_of(rel, true)?;
         let path = Path::new(rel.as_str());
         let flags =
@@ -199,6 +200,7 @@ impl TreeWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::mode_of;
     use std::io::Write;
 
     fn rel(s: &str) -> RelPath {
@@ -213,10 +215,12 @@ mod tests {
         writer
             .symlink(&rel("link"), outside.path().to_str().unwrap())
             .unwrap();
-        let err = writer.create_file(&rel("link/escaped"), 0o644).unwrap_err();
+        let err = writer
+            .create_file(&rel("link/escaped"), mode_of(0o644))
+            .unwrap_err();
         assert!(matches!(err, WriteError::ThroughSymlink { .. }), "{err}");
         assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
-        let err = writer.mkdir(&rel("link/sub"), 0o755).unwrap_err();
+        let err = writer.mkdir(&rel("link/sub"), mode_of(0o755)).unwrap_err();
         assert!(matches!(err, WriteError::ThroughSymlink { .. }), "{err}");
     }
 
@@ -225,19 +229,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let writer = TreeWriter::open(dir.path()).unwrap();
         writer
-            .create_file(&rel("a"), 0o644)
+            .create_file(&rel("a"), mode_of(0o644))
             .unwrap()
             .write_all(b"first")
             .unwrap();
-        let err = writer.create_file(&rel("a"), 0o644).unwrap_err();
+        let err = writer.create_file(&rel("a"), mode_of(0o644)).unwrap_err();
         assert!(matches!(err, WriteError::Collision { .. }), "{err}");
         let err = writer.symlink(&rel("a"), "x").unwrap_err();
         assert!(matches!(err, WriteError::Collision { .. }), "{err}");
-        let err = writer.mkdir(&rel("a"), 0o755).unwrap_err();
+        let err = writer.mkdir(&rel("a"), mode_of(0o755)).unwrap_err();
         assert!(matches!(err, WriteError::Collision { .. }), "{err}");
         assert_eq!(std::fs::read(dir.path().join("a")).unwrap(), b"first");
-        writer.mkdir(&rel("d"), 0o700).unwrap();
-        writer.mkdir(&rel("d"), 0o700).unwrap();
+        writer.mkdir(&rel("d"), mode_of(0o700)).unwrap();
+        writer.mkdir(&rel("d"), mode_of(0o700)).unwrap();
     }
 
     #[test]
@@ -245,7 +249,9 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         let dir = tempfile::tempdir().unwrap();
         let writer = TreeWriter::open(dir.path()).unwrap();
-        writer.create_file(&rel("x/y/exec"), 0o764).unwrap();
+        writer
+            .create_file(&rel("x/y/exec"), mode_of(0o764))
+            .unwrap();
         writer
             .set_mtime(&rel("x/y/exec"), 1_700_000_000_123_456_789)
             .unwrap();

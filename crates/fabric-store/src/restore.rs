@@ -21,7 +21,7 @@ use fabric_core::snapshot::{
     CacheEntry, CarryState, Entry, EntryKind, GitHead, GitState, SnapshotManifest,
 };
 
-use crate::capture::symlink_escapes;
+use crate::capture::{mode_of, symlink_escapes};
 use crate::checkpoint;
 use crate::durable::{self, TempFile};
 use crate::git::{Git, GitError};
@@ -280,12 +280,12 @@ fn write_entries(
     let kept: Vec<&Entry> = entries.iter().filter(|e| !skip(&e.rel_path)).collect();
     for entry in &kept {
         if matches!(entry.kind, EntryKind::Dir) {
-            writer.mkdir(&entry.rel_path, entry.mode.bits())?;
+            writer.mkdir(&entry.rel_path, entry.mode)?;
         }
     }
     for entry in &kept {
         if let EntryKind::File { size, chunks } = &entry.kind {
-            let mut file = writer.create_file(&entry.rel_path, entry.mode.bits())?;
+            let mut file = writer.create_file(&entry.rel_path, entry.mode)?;
             let mut written = 0u64;
             for chunk in chunks {
                 let bytes = store.objects().read(*chunk)?;
@@ -667,7 +667,7 @@ fn restore_git(
     let mut blobs: Vec<&TreeItem> = Vec::with_capacity(items.len());
     for item in &items {
         if item.mode == TreeMode::Gitlink {
-            writer.mkdir(&item.rel, 0o755)?;
+            writer.mkdir(&item.rel, mode_of(0o755))?;
             report.submodules.push(item.rel.clone());
         } else {
             blobs.push(item);
@@ -697,7 +697,7 @@ fn restore_git(
                 } else {
                     0o644
                 };
-                let mut file = writer.create_file(&item.rel, bits)?;
+                let mut file = writer.create_file(&item.rel, mode_of(bits))?;
                 let written = io::copy(body, &mut file).map_err(|e| io_err(path, e))?;
                 if written != size {
                     return Err(RestoreError::SizeMismatch {
