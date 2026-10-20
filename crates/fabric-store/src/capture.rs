@@ -1436,13 +1436,13 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
         req,
         report: CaptureReport::default(),
     };
-    let (git_state, found) = if let Some(gc) = detect_git(req, store.objects().tmp_dir())? {
-        gc.refuse_bad_states()?;
+    let (git_state, found) = if let Some(repo) = detect_git(req, store.objects().tmp_dir())? {
+        repo.refuse_bad_states()?;
         let parent = parent_manifest
             .as_ref()
             .map(|(id, manifest)| (*id, manifest));
-        let state = capture_git(&mut capturer, &gc, parent)?;
-        (Some(state), gc.ignored(&mut capturer.report)?)
+        let state = capture_git(&mut capturer, &repo, parent)?;
+        (Some(state), repo.ignored(&mut capturer.report)?)
     } else {
         let listing = list_tree(req.root)?;
         capturer.report.nested_repositories.extend(listing.nested);
@@ -1551,12 +1551,12 @@ fn chain_depth(store: &Store, manifest: &SnapshotManifest) -> Result<u32, Captur
 
 fn capture_git(
     capturer: &mut Capturer<'_>,
-    gc: &GitCapture<'_>,
+    repo: &GitCapture<'_>,
     parent: Option<(SnapshotId, &SnapshotManifest)>,
 ) -> Result<GitState, CaptureError> {
     let req = capturer.req;
     let policy = req.policy;
-    let (untracked, nested) = gc.untracked()?;
+    let (untracked, nested) = repo.untracked()?;
     capturer
         .report
         .nested_repositories
@@ -1576,15 +1576,15 @@ fn capture_git(
     if !too_large.is_empty() && !req.allow_large_untracked {
         return Err(CaptureError::UntrackedTooLarge { paths: too_large });
     }
-    let tracked: BTreeSet<RelPath> = gc.tracked()?.into_iter().collect();
+    let tracked: BTreeSet<RelPath> = repo.tracked()?.into_iter().collect();
     for rel in &tracked {
         if policy.denies_anywhere(rel) {
             capturer.report.tracked_secrets.push(rel.clone());
         }
     }
 
-    let head_commit = gc.head_commit()?;
-    let (index_commit, index_tree) = gc.index_commit(head_commit.as_ref())?;
+    let head_commit = repo.head_commit()?;
+    let (index_commit, index_tree) = repo.index_commit(head_commit.as_ref())?;
     let under_nested = |rel: &RelPath| nested.iter().any(|root| rel.starts_with(root));
     // A nested repository without a commit makes `add -A` fail, so every
     // nested root is excluded up front as well as removed afterwards.
@@ -1594,7 +1594,7 @@ fn capture_git(
         excludes.push_str(root.as_str());
         excludes.push_str("/\n");
     }
-    let (worktree_commit, removed) = gc.worktree_commit(
+    let (worktree_commit, removed) = repo.worktree_commit(
         &index_tree,
         head_commit.as_ref(),
         &index_commit,
@@ -1609,22 +1609,22 @@ fn capture_git(
         }
     }
     denied.sort();
-    let snap_ref = format!("{}{}", gc.snap_prefix(), worktree_commit.as_str());
-    gc.git
+    let snap_ref = format!("{}{}", repo.snap_prefix(), worktree_commit.as_str());
+    repo.git
         .run(&["update-ref", &snap_ref, worktree_commit.as_str()])?;
 
     let plan = BundlePlan::after(capturer.store, parent)?;
-    gc.delete_older_snap_refs(&worktree_commit)?;
-    let (built, view) = gc.bundle_with_refs(&plan)?;
+    repo.delete_older_snap_refs(&worktree_commit)?;
+    let (built, view) = repo.bundle_with_refs(&plan)?;
     let (bundle, bundle_base) = capturer.store_bundle(built)?;
     let RefView { refs, head } = view;
     if let Some((_, stash)) = refs.iter().find(|(name, _)| name.as_str() == "refs/stash") {
         capturer.report.stashed_secrets =
-            gc.stashed_secrets(stash, &|rel| policy.denies_anywhere(rel))?;
+            repo.stashed_secrets(stash, &|rel| policy.denies_anywhere(rel))?;
     }
-    let worktree_mtimes = gc.worktree_mtimes(&worktree_commit, &mut capturer.report)?;
-    let config = gc.config(&mut capturer.report)?;
-    let exclude_path = gc.git.git_path("info/exclude")?;
+    let worktree_mtimes = repo.worktree_mtimes(&worktree_commit, &mut capturer.report)?;
+    let config = repo.config(&mut capturer.report)?;
+    let exclude_path = repo.git.git_path("info/exclude")?;
     // `info/exclude` is git's own file, not workspace content, so a link to
     // a shared exclude file is followed as git follows it.
     let exclude = if exclude_path.is_file() {
@@ -1711,7 +1711,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("work");
         fs::create_dir(&root).unwrap();
-        let gc = GitCapture {
+        let repo = GitCapture {
             git: Git::new(&root).with_date(1_760_000_000_000),
             root: &root,
             job_id: JobId::from_bytes([1; 16]),
@@ -1720,39 +1720,39 @@ mod tests {
             listing_excludes: TempFile::in_dir(dir.path()),
         };
         let commit = |message: &str| {
-            gc.git
+            repo.git
                 .run(&["commit", "-q", "--allow-empty", "-m", message])
                 .unwrap();
         };
-        gc.git.run(&["init", "-q", "-b", "main"]).unwrap();
+        repo.git.run(&["init", "-q", "-b", "main"]).unwrap();
         commit("one");
-        let view = gc.ref_view().unwrap();
-        let full = gc.bundle(&BundlePlan::Full).unwrap();
-        assert!(gc.confirm_bundle(&full, &view, &[]).is_ok());
+        let view = repo.ref_view().unwrap();
+        let full = repo.bundle(&BundlePlan::Full).unwrap();
+        assert!(repo.confirm_bundle(&full, &view, &[]).is_ok());
 
         commit("two");
-        let moved = gc.ref_view().unwrap();
+        let moved = repo.ref_view().unwrap();
         assert!(matches!(
-            gc.confirm_bundle(&full, &moved, &[]),
+            repo.confirm_bundle(&full, &moved, &[]),
             Err(CaptureError::RefsMoved { moved: MovedRef::Ref(name) }) if name.as_str() == "refs/heads/main"
         ));
 
         let tips: Vec<GitOid> = moved.refs.iter().map(|(_, oid)| oid.clone()).collect();
         commit("three");
-        let view = gc.ref_view().unwrap();
+        let view = repo.ref_view().unwrap();
         let plan = BundlePlan::Incremental {
             base: SnapshotId::of(b"parent"),
             tips: tips.clone(),
         };
-        let incremental = gc.bundle(&plan).unwrap();
+        let incremental = repo.bundle(&plan).unwrap();
         assert!(matches!(incremental, BuiltBundle::Incremental { .. }));
-        assert!(gc.confirm_bundle(&incremental, &view, &tips).is_ok());
-        gc.git.run(&["checkout", "-q", "-b", "side"]).unwrap();
+        assert!(repo.confirm_bundle(&incremental, &view, &tips).is_ok());
+        repo.git.run(&["checkout", "-q", "-b", "side"]).unwrap();
         commit("four");
-        gc.git.run(&["checkout", "-q", "main"]).unwrap();
-        let grown = gc.ref_view().unwrap();
+        repo.git.run(&["checkout", "-q", "main"]).unwrap();
+        let grown = repo.ref_view().unwrap();
         assert!(matches!(
-            gc.confirm_bundle(&incremental, &grown, &tips),
+            repo.confirm_bundle(&incremental, &grown, &tips),
             Err(CaptureError::RefsMoved { moved: MovedRef::Ref(name) }) if name.as_str() == "refs/heads/side"
         ));
     }
