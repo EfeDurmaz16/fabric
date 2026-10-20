@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 919b36e9150ecc9ec29c67ee9c4adad4795ba1c45365d536b7bf9cbf1156bdb5 # shrinks to text = "/Users/alpha/fabric/jobs/j1/work", suffix = "-"
+cc 88b12defe952c61cf3f9b688780d4fb8962db092fa5faa05f4d97b9a1f988a90 # shrinks to value = Array [Object {"type": String("thinking"), "thinking": String("/Users/alpha/fabric/jobs/j1/work token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab"), "signature": String("0=aa")}, Object {"type": String("thinking"), "thinking": String("/Users/alpha/fabric/jobs/j1/work token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab"), "signature": String("0+a+")}]
