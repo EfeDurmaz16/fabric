@@ -170,25 +170,26 @@ fn make_repo(repo: &Path) -> Fallible {
 }
 
 /// A process named `claude` that is not the job's, as the Claude Code a
-/// user keeps open: a copy of `sleep` under that name, killed when dropped.
+/// user keeps open: a copy of the fake agent under that name, waiting on
+/// a standard input the test holds open, killed when dropped.
+///
+/// It is not a copy of `/bin/sleep`: macOS kills a copy of a system binary
+/// run from another path with `SIGKILL`, at once or seconds later, which
+/// made the probe miss it under load.
 pub struct OtherClaude(Child);
 
 impl OtherClaude {
     /// Starts it under the test's directory and returns once `pgrep -x
     /// claude`, the probe the trust pre-seed runs, lists it.
-    ///
-    /// Right after the spawn the child can still carry the test's name, as
-    /// when the exec of the freshly copied binary waits on a busy machine,
-    /// so the probe would miss it.
     pub fn start(env: &Env) -> Fallible<Self> {
         let dir = env.root.join("other");
         fs::create_dir_all(&dir)?;
         let claude = dir.join("claude");
-        fs::copy("/bin/sleep", &claude)?;
+        fs::copy(env!("CARGO_BIN_EXE_fabric-fake-agent"), &claude)?;
         let other = Self(
             Command::new(&claude)
-                .arg("600")
-                .stdin(Stdio::null())
+                .env_clear()
+                .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()?,
