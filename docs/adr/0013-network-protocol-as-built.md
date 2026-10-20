@@ -2,7 +2,7 @@
 
 Status: accepted, 2026-10-20
 
-Supersedes four parts of ADR 0005: the `Transport` trait and where iroh would plug in, the message shapes under Framing, the 1 MiB control frame figure, and the multiplexer header under the TCP+TLS fallback. Everything else in ADR 0005 stands, including chunks that travel as zstd frames bounded at 8 MiB decompressed.
+Supersedes six parts of ADR 0005: the `Transport` trait and where iroh would plug in, the message shapes under Framing, the 1 MiB control frame figure, the multiplexer header under the TCP+TLS fallback, the dependency list under Consequences, and the open question on `rcgen` and `ed25519-dalek`. Everything else in ADR 0005 stands, including chunks that travel as zstd frames bounded at 8 MiB decompressed.
 
 ## Context
 
@@ -160,7 +160,7 @@ ADR 0005 says a pair records which side can dial. The peer book does not record 
 
 ## Consequences
 
-- ADR 0005's sections on the trait, the message shapes, the control frame figure and the multiplexer header are history; this ADR and `crates/fabric-net/src/wire.rs` are the reference. The rest of ADR 0005 stands.
+- ADR 0005's sections on the trait, the message shapes, the control frame figure, the multiplexer header, its dependency list and its `rcgen` question are history; this ADR and `crates/fabric-net/src/wire.rs` are the reference. The rest of ADR 0005 stands.
 - `docs/net.md` describes how to run the layer; it follows this ADR.
 
 ## Open questions
