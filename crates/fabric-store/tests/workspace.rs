@@ -1361,6 +1361,30 @@ fn a_directory_of_branches_that_becomes_a_branch_restores() {
 }
 
 #[test]
+fn the_target_keeps_the_filesystem_settings_git_init_probed() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("probe");
+    fs::create_dir(&probe).unwrap();
+    git(&probe).run(&["init", "-q"]).unwrap();
+    let probed = git_text(&probe, &["config", "--bool", "core.ignorecase"]).unwrap_or_default();
+    let opposite = if probed == "true" { "false" } else { "true" };
+
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    git(&root)
+        .run(&["config", "core.ignorecase", opposite])
+        .unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    let restored = git_text(&target, &["config", "--bool", "core.ignorecase"]).unwrap_or_default();
+    assert_eq!(restored, probed);
+}
+
+#[test]
 fn a_config_value_the_projection_refuses_is_named() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("work");

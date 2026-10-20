@@ -14,7 +14,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 
-use fabric_core::git::GitOid;
+use fabric_core::git::{GitConfigKey, GitOid};
 use fabric_core::id::SnapshotId;
 use fabric_core::path::{PathError, RelPath};
 use fabric_core::snapshot::{
@@ -1098,6 +1098,13 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
 
     if let (Some(git), Some(state)) = (&git, &manifest.git) {
         for (key, value) in &state.config {
+            // These describe the source's filesystem; `git init` probed the target's.
+            if matches!(
+                key,
+                GitConfigKey::CoreIgnoreCase | GitConfigKey::CoreSymlinks
+            ) {
+                continue;
+            }
             git.run(&["config", "--local", &key.to_string(), value.as_str()])?;
         }
     }
