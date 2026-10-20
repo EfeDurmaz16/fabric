@@ -267,6 +267,12 @@ pub enum CaptureError {
         /// The path.
         path: RelPath,
     },
+    /// A ref or `HEAD` moved while the bundle was made; capture again.
+    #[error("{name} moved while capture ran; capture again")]
+    RefsMoved {
+        /// The ref that moved, or `HEAD`.
+        name: String,
+    },
     /// The parent snapshot belongs to another job.
     #[error("parent snapshot {parent} belongs to job {job}")]
     ParentJobMismatch {
@@ -601,6 +607,13 @@ impl Markers for DirMarkers<'_> {
     }
 }
 
+/// The refs and `HEAD` of a repository at one moment.
+#[derive(Debug, PartialEq, Eq)]
+struct RefView {
+    refs: Vec<(RefName, GitOid)>,
+    head: GitHead,
+}
+
 /// A bundle capture made, with the file that holds it.
 enum BuiltBundle {
     /// Every object the refs reach.
@@ -933,6 +946,14 @@ impl GitCapture<'_> {
         Ok(refs)
     }
 
+    /// Reads the refs and `HEAD` together.
+    fn ref_view(&self) -> Result<RefView, CaptureError> {
+        Ok(RefView {
+            refs: self.refs()?,
+            head: self.head()?,
+        })
+    }
+
     fn head(&self) -> Result<GitHead, CaptureError> {
         let out = self.git.output(&["symbolic-ref", "-q", "HEAD"], &[])?;
         if out.status.success() {
@@ -987,6 +1008,98 @@ impl GitCapture<'_> {
         self.git.run(&["bundle", "create", &path_text, "--all"])?;
         self.git.run(&["bundle", "verify", &path_text])?;
         Ok(BuiltBundle::Full(path))
+    }
+
+    /// Makes the bundle and returns it with the refs and `HEAD` it is proven to hold.
+    fn bundle_with_refs(
+        &self,
+        tips: &[GitOid],
+        chain_full: bool,
+    ) -> Result<(BuiltBundle, RefView), CaptureError> {
+        let view = self.ref_view()?;
+        let built = self.bundle(tips, chain_full)?;
+        if self.ref_view()? != view {
+            return Err(CaptureError::RefsMoved {
+                name: "a ref or HEAD".to_owned(),
+            });
+        }
+        self.confirm_bundle(&built, &view, tips)?;
+        Ok((built, view))
+    }
+
+    /// Proves that the bundle chain holds every object `view` names.
+    ///
+    /// A ref the bundle lists must have the id `view` gives it. A full
+    /// bundle must list every ref. A ref an incremental or empty bundle
+    /// leaves out must be reachable from the parent's tips, which the
+    /// earlier bundles of the chain carry. Anything else means a ref moved
+    /// while the bundle was made, and the snapshot would not restore.
+    fn confirm_bundle(
+        &self,
+        built: &BuiltBundle,
+        view: &RefView,
+        tips: &[GitOid],
+    ) -> Result<(), CaptureError> {
+        let listed: BTreeMap<String, String> = match built {
+            BuiltBundle::Full(file) | BuiltBundle::Incremental(file) => {
+                let path = file.path().to_string_lossy().into_owned();
+                let out = self.git.run_text(&["bundle", "list-heads", &path])?;
+                out.lines()
+                    .filter_map(|line| line.split_once(' '))
+                    .map(|(oid, name)| (name.to_owned(), oid.to_owned()))
+                    .collect()
+            }
+            BuiltBundle::Empty => BTreeMap::new(),
+        };
+        let mut wanted: Vec<(String, &GitOid)> = view
+            .refs
+            .iter()
+            .map(|(name, oid)| (name.as_str().to_owned(), oid))
+            .collect();
+        if let GitHead::Detached(oid) = &view.head {
+            wanted.push(("HEAD".to_owned(), oid));
+        }
+        let mut left_out = Vec::new();
+        for (name, oid) in &wanted {
+            match listed.get(name) {
+                Some(seen) if seen == oid.as_str() => {}
+                Some(_) => return Err(CaptureError::RefsMoved { name: name.clone() }),
+                None if matches!(built, BuiltBundle::Full(_)) => {
+                    return Err(CaptureError::RefsMoved { name: name.clone() });
+                }
+                None => left_out.push((name, *oid)),
+            }
+        }
+        for name in listed.keys() {
+            if name != "HEAD" && !wanted.iter().any(|(n, _)| n == name) {
+                return Err(CaptureError::RefsMoved { name: name.clone() });
+            }
+        }
+        if left_out.is_empty() {
+            return Ok(());
+        }
+        let mut input = String::new();
+        for (_, oid) in &left_out {
+            input.push_str(oid.as_str());
+            input.push('\n');
+        }
+        for tip in tips {
+            input.push('^');
+            input.push_str(tip.as_str());
+            input.push('\n');
+        }
+        let out = self
+            .git
+            .run_stdin_env(&["rev-list", "--stdin", "-n1"], &[], input.as_bytes())?;
+        let unreached = String::from_utf8_lossy(&out).trim().to_owned();
+        if unreached.is_empty() {
+            return Ok(());
+        }
+        let name = left_out
+            .iter()
+            .find(|(_, oid)| oid.as_str() == unreached)
+            .map_or(unreached.clone(), |(name, _)| (*name).clone());
+        Err(CaptureError::RefsMoved { name })
     }
 
     fn delete_older_snap_refs(&self, current: &GitOid) -> Result<(), CaptureError> {
@@ -1292,11 +1405,10 @@ fn capture_git(
         },
         None => (Vec::new(), true, None),
     };
-    let (bundle, bundle_base) = capturer.store_bundle(gc.bundle(&tips, chain_full)?, parent_id)?;
     gc.delete_older_snap_refs(&worktree_commit)?;
-
-    let refs = gc.refs()?;
-    let head = gc.head()?;
+    let (built, view) = gc.bundle_with_refs(&tips, chain_full)?;
+    let (bundle, bundle_base) = capturer.store_bundle(built, parent_id)?;
+    let RefView { refs, head } = view;
     let worktree_mtimes = gc.worktree_mtimes(&worktree_commit, &mut capturer.report)?;
     let config = gc.config(&mut capturer.report)?;
     let exclude_path = gc.git.git_path("info/exclude")?;
@@ -1337,6 +1449,54 @@ mod tests {
         assert!(symlink_escapes(&rel("d/a"), "../../x"));
         assert!(!symlink_escapes(&rel("d/a"), "b/../c"));
         assert!(!symlink_escapes(&rel("a"), "./b"));
+    }
+
+    /// A ref that moves after the bundle is made is refused, full or incremental.
+    #[test]
+    fn a_ref_the_bundle_does_not_hold_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        fs::create_dir(&root).unwrap();
+        let gc = GitCapture {
+            git: Git::new(&root, 1_760_000_000_000),
+            root: &root,
+            job_id: JobId::from_bytes([1; 16]),
+            scratch: dir.path().to_owned(),
+            user_excludes: String::new(),
+            listing_excludes: TempFile::in_dir(dir.path()),
+        };
+        let commit = |message: &str| {
+            gc.git
+                .run(&["commit", "-q", "--allow-empty", "-m", message])
+                .unwrap();
+        };
+        gc.git.run(&["init", "-q", "-b", "main"]).unwrap();
+        commit("one");
+        let view = gc.ref_view().unwrap();
+        let full = gc.bundle(&[], true).unwrap();
+        assert!(gc.confirm_bundle(&full, &view, &[]).is_ok());
+
+        commit("two");
+        let moved = gc.ref_view().unwrap();
+        assert!(matches!(
+            gc.confirm_bundle(&full, &moved, &[]),
+            Err(CaptureError::RefsMoved { name }) if name == "refs/heads/main"
+        ));
+
+        let tips: Vec<GitOid> = moved.refs.iter().map(|(_, oid)| oid.clone()).collect();
+        commit("three");
+        let view = gc.ref_view().unwrap();
+        let incremental = gc.bundle(&tips, false).unwrap();
+        assert!(matches!(incremental, BuiltBundle::Incremental(_)));
+        assert!(gc.confirm_bundle(&incremental, &view, &tips).is_ok());
+        gc.git.run(&["checkout", "-q", "-b", "side"]).unwrap();
+        commit("four");
+        gc.git.run(&["checkout", "-q", "main"]).unwrap();
+        let grown = gc.ref_view().unwrap();
+        assert!(matches!(
+            gc.confirm_bundle(&incremental, &grown, &tips),
+            Err(CaptureError::RefsMoved { name }) if name == "refs/heads/side"
+        ));
     }
 
     #[test]
