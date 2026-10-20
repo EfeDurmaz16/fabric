@@ -35,6 +35,12 @@ pub enum WriteError {
         /// The path, relative to the tree root.
         path: PathBuf,
     },
+    /// The path is a FIFO, socket, device or directory where a regular file was expected.
+    #[error("{path}: not a regular file")]
+    NotRegular {
+        /// The path, relative to the tree root.
+        path: PathBuf,
+    },
     /// The name already exists; on a case-folding volume this is also how two names that fold together show up.
     #[error("{path}: already exists")]
     Collision {
@@ -229,11 +235,20 @@ impl TreeWriter {
     }
 
     /// Opens an existing regular file for reading without following a link at its name.
+    ///
+    /// The open does not wait on a FIFO, and the type is read from the open
+    /// descriptor, so a file replaced by a FIFO or a device is refused, not read.
     pub fn open_file(&self, rel: &RelPath) -> Result<File, WriteError> {
         let (parent, name) = self.parent_of(rel, false)?;
-        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        let fd = fs::openat(&parent, name, flags, Mode::empty())
-            .map_err(|e| map(e, Path::new(rel.as_str())))?;
+        let path = Path::new(rel.as_str());
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let fd = fs::openat(&parent, name, flags, Mode::empty()).map_err(|e| map(e, path))?;
+        let stat = fs::fstat(&fd).map_err(|e| map(e, path))?;
+        if !FileType::from_raw_mode(stat.st_mode).is_file() {
+            return Err(WriteError::NotRegular {
+                path: path.to_owned(),
+            });
+        }
         Ok(File::from(fd))
     }
 }

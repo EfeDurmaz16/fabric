@@ -1079,6 +1079,32 @@ fn a_plain_directory_and_harness_state_round_trip_exactly() {
     ));
 }
 
+#[test]
+fn verify_reports_a_file_replaced_by_a_fifo_instead_of_waiting_on_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, snapshot) = plain_snapshot(dir.path()).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    fs::remove_file(target.join("run.sh")).unwrap();
+    let made = std::process::Command::new("mkfifo")
+        .arg(target.join("run.sh"))
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = verify(&store, snapshot, &target, Verify::All, &|_| true);
+        let _ = tx.send(outcome);
+    });
+    let outcome = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("verify blocked on the FIFO");
+    assert!(
+        matches!(&outcome, Err(RestoreError::VerifyFailed { path }) if path.as_str() == "run.sh"),
+        "{outcome:?}"
+    );
+}
+
 /// Gives the owner write permission on every directory under `dir`, so the temp directory can be removed.
 fn make_writable(dir: &Path) -> Fallible {
     let meta = fs::symlink_metadata(dir)?;
