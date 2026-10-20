@@ -670,6 +670,8 @@ when = "always"
             format!("[[cache]]\npath = \"/{secret}\"\nclass = \"deps\""),
             format!("[[cache]]\npath = \"x\"\nclass = \"{secret}\""),
             format!("tools = {{ node = [\"{secret}\"] }}"),
+            format!("[tools]\nnode = \"{secret}\""),
+            format!("[tools]\n\"{secret}\" = \"1\""),
             format!("env = [\"{secret}"),
             format!("\"{secret}\" = 1"),
             format!("[[cache]]\npath = \"x\"\nclass = \"deps\"\n\"{secret}\" = 1"),
@@ -706,6 +708,14 @@ when = "always"
         assert!(matches!(
             EnvOverride::parse(&text),
             Err(OverrideError::Pin {
+                index: 1,
+                reason: PinError::Credential
+            })
+        ));
+        let text = format!("[tools]\nzeta = \"1\"\n{token} = \"1\"\n");
+        assert!(matches!(
+            EnvOverride::parse(&text),
+            Err(OverrideError::ToolName {
                 index: 1,
                 reason: PinError::Credential
             })

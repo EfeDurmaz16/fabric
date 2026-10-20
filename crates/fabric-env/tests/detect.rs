@@ -672,24 +672,6 @@ fn a_detected_pin_that_breaks_the_rules_is_dropped() {
     }
 }
 
-/// A pin the user declares travels in the spec like a setup argument
-/// does, so the same credential guard refuses it, without echoing it.
-#[test]
-fn a_credential_shaped_declared_pin_is_refused_without_echoing_it() {
-    let token = format!("ghp_{}", "q7".repeat(18));
-    let declared = workspace(&[(
-        ".fabric/env.toml",
-        &format!("[tools]\nnode = \"{token}\"\n"),
-    )])
-    .unwrap();
-    match detect(declared.path(), None) {
-        Err(err @ DetectError::Override(OverrideError::Pin { .. })) => {
-            assert!(!format!("{err} {err:?}").contains(&token));
-        }
-        other => panic!("{other:?}"),
-    }
-}
-
 /// A declared path may hold the user's own files by mistake, so the full
 /// secret list applies under it; the narrowed list stays for the caches an
 /// ecosystem rule found.
@@ -719,31 +701,6 @@ fn a_declared_cache_keeps_the_full_secret_list() {
         Some(".env.*")
     );
     assert_eq!(scope_of("node_modules"), Scope::Cache);
-}
-
-/// A declared tool name travels in the spec as a pin does: a token used
-/// as a name is refused by its position and never quoted.
-#[test]
-fn a_bad_declared_tool_name_is_refused_without_echoing_it() {
-    let token = format!("ghp_{}", "q7".repeat(18));
-    let declared = workspace(&[(
-        ".fabric/env.toml",
-        &format!("[tools]\n{token} = \"1\"\nnode = \"22\"\n"),
-    )])
-    .unwrap();
-    match detect(declared.path(), None) {
-        Err(err @ DetectError::Override(OverrideError::ToolName { .. })) => {
-            assert!(!format!("{err} {err:?}").contains(&token));
-            assert!(matches!(
-                err,
-                DetectError::Override(OverrideError::ToolName {
-                    index: 0,
-                    reason: PinError::Credential
-                })
-            ));
-        }
-        other => panic!("{other:?}"),
-    }
 }
 
 /// The override file sits in the working tree, where the agent can rewrite
