@@ -18,6 +18,8 @@ use fabric_store::catalog::CatalogError;
 use fabric_store::objects::{ChunkParams, ObjectError};
 use fabric_store::store::{CheckDepth, Store, StoreError};
 
+mod common;
+
 type Fallible<T = ()> = Result<T, Box<dyn Error>>;
 
 const JOB: JobId = JobId::from_bytes([3; 16]);
@@ -224,7 +226,7 @@ fn gc_keeps_shared_objects_and_removes_the_rest_after_the_grace() {
     let first = store.gc(t0, grace).unwrap();
     assert!(first.marked >= 2, "{first:?}");
     assert_eq!(first.removed_chunks, 0);
-    assert!(store.objects().object_path(a_chunks[0]).exists());
+    assert!(common::object_path(dir.path(), a_chunks[0]).exists());
 
     let second = store.gc(t0 + grace / 2, grace).unwrap();
     assert_eq!(second.removed_chunks, 0);
@@ -232,8 +234,8 @@ fn gc_keeps_shared_objects_and_removes_the_rest_after_the_grace() {
     let third = store.gc(t0 + grace, grace).unwrap();
     assert_eq!(third.removed_chunks, first.marked);
     assert!(third.removed_bytes > 0);
-    assert!(!store.objects().object_path(a_chunks[0]).exists());
-    assert!(store.objects().object_path(shared_chunks[0]).exists());
+    assert!(!common::object_path(dir.path(), a_chunks[0]).exists());
+    assert!(common::object_path(dir.path(), shared_chunks[0]).exists());
     assert!(store.manifest(b).is_ok());
     assert!(store.check(CheckDepth::Hashes).unwrap().is_clean());
 }
@@ -250,11 +252,11 @@ fn gc_sweeps_orphan_objects_and_staged_files_only_after_the_grace() {
         .unwrap();
     assert_eq!(patient.removed_tmp, 1);
     assert_eq!(patient.removed_orphans, 0);
-    assert!(store.objects().object_path(orphan.id).exists());
+    assert!(common::object_path(dir.path(), orphan.id).exists());
 
     let eager = store.gc(SystemTime::now(), Duration::ZERO).unwrap();
     assert_eq!(eager.removed_orphans, 1);
-    assert!(!store.objects().object_path(orphan.id).exists());
+    assert!(!common::object_path(dir.path(), orphan.id).exists());
 }
 
 #[test]
@@ -266,7 +268,7 @@ fn check_sees_a_missing_object_and_a_corrupt_one() {
         .publish(&manifest(vec![entry.clone()], 1).unwrap())
         .unwrap();
     let chunks = chunks_of(&entry).unwrap();
-    let path = store.objects().object_path(chunks[0]);
+    let path = common::object_path(dir.path(), chunks[0]);
     let good = fs::read(&path).unwrap();
 
     fs::remove_file(&path).unwrap();
@@ -332,7 +334,7 @@ fn a_corrupt_object_left_without_a_row_is_removed_not_published() {
     let manifest_chunk = ChunkId::of(&m.encode().unwrap());
     let mut store = Store::open(dir.path()).unwrap();
     for chunk in [data, manifest_chunk] {
-        let path = store.objects().object_path(chunk);
+        let path = common::object_path(dir.path(), chunk);
         let good = fs::read(&path).unwrap();
         fs::write(&path, b"lost in a power cut").unwrap();
         assert!(matches!(

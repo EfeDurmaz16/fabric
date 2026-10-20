@@ -12,6 +12,8 @@ use fabric_store::store::Store;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
 
+mod common;
+
 fn small_params() -> Result<ChunkParams, ObjectError> {
     ChunkParams::new(4096, 64, 256, 1024, 3)
 }
@@ -35,14 +37,14 @@ fn an_object_is_written_once_and_read_back_verified() {
     let objects = store.objects();
     let first = objects.put(b"hello").unwrap();
     assert!(first.new);
-    let path = objects.object_path(first.id);
+    let path = common::object_path(dir.path(), first.id);
     let inode = fs::metadata(&path).unwrap().ino();
     let second = objects.put(b"hello").unwrap();
     assert!(!second.new);
     assert_eq!(second.id, first.id);
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
     assert_eq!(objects.read(first.id).unwrap(), b"hello");
-    assert!(objects.object_path(first.id).exists());
+    assert!(common::object_path(dir.path(), first.id).exists());
     assert_eq!(fs::read_dir(dir.path().join("tmp")).unwrap().count(), 0);
 }
 
@@ -52,7 +54,7 @@ fn a_corrupt_object_is_an_error_not_content() {
     let store = Store::create(dir.path(), small_params().unwrap()).unwrap();
     let objects = store.objects();
     let stored = objects.put(b"the right bytes").unwrap();
-    let path = objects.object_path(stored.id);
+    let path = common::object_path(dir.path(), stored.id);
     let other = zstd::bulk::compress(b"the wrong bytes", 3).unwrap();
     fs::write(&path, other).unwrap();
     assert!(matches!(

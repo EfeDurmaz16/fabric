@@ -176,8 +176,6 @@ impl ChunkParams {
 pub struct StoredChunk {
     /// The object's id.
     pub id: ChunkId,
-    /// Its uncompressed length.
-    pub len: u64,
     /// Its length on disk.
     pub stored_len: u64,
     /// Whether this call wrote it, or it was already present.
@@ -245,8 +243,7 @@ impl ObjectStore {
     }
 
     /// Returns the path an object with `id` has or would have.
-    #[must_use]
-    pub fn object_path(&self, id: ChunkId) -> PathBuf {
+    pub(crate) fn object_path(&self, id: ChunkId) -> PathBuf {
         let hex = id.to_string();
         self.objects_dir.join(&hex[..2]).join(hex)
     }
@@ -273,7 +270,6 @@ impl ObjectStore {
         if let Ok(meta) = fs::metadata(&path) {
             return Ok(StoredChunk {
                 id,
-                len: bytes.len() as u64,
                 stored_len: meta.len(),
                 new: false,
             });
@@ -291,7 +287,6 @@ impl ObjectStore {
         self.mark_dirty(id);
         Ok(StoredChunk {
             id,
-            len: bytes.len() as u64,
             stored_len: compressed.len() as u64,
             new: published == Published::New,
         })

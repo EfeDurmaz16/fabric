@@ -14,6 +14,14 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use fabric_core::id::ChunkId;
+
+/// Returns where the store rooted at `store_root` keeps the object `id`: `objects/<first two hex digits>/<hex>`.
+pub fn object_path(store_root: &Path, id: ChunkId) -> PathBuf {
+    let hex = id.to_string();
+    store_root.join("objects").join(&hex[..2]).join(hex)
+}
+
 /// A git runner bound to one repository.
 pub struct TestGit {
     repo: PathBuf,
