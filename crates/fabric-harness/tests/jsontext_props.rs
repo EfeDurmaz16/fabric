@@ -130,7 +130,7 @@ proptest! {
     #[test]
     fn redaction_drops_only_the_signed_blocks_that_hold_a_secret(value in value_with_secrets_strategy()) {
         let text = serde_json::to_string(&value).unwrap();
-        let outcome = transform(&text, Redactor::standard()).unwrap();
+        let outcome = transform(&text, Redactor::standard().unwrap()).unwrap();
         let after = outcome.text.clone().unwrap_or_else(|| text.clone());
         let parsed: Value = serde_json::from_str(&after).expect("output is JSON");
         prop_assert!(!after.contains(SECRET), "a secret survived: {after}");
@@ -154,17 +154,17 @@ proptest! {
             prop_assert_eq!(after, &expected);
         }
 
-        let again = transform(&after, Redactor::standard()).unwrap();
+        let again = transform(&after, Redactor::standard().unwrap()).unwrap();
         prop_assert!(again.text.is_none(), "redaction is idempotent");
     }
 
     #[test]
     fn json_without_a_secret_is_never_changed(value in value_strategy()) {
         let text = serde_json::to_string(&value).unwrap();
-        let outcome = transform(&text, Redactor::standard()).unwrap();
+        let outcome = transform(&text, Redactor::standard().unwrap()).unwrap();
         prop_assert!(outcome.text.is_none());
         let pretty = serde_json::to_string_pretty(&value).unwrap();
-        let outcome = transform(&pretty, Redactor::standard()).unwrap();
+        let outcome = transform(&pretty, Redactor::standard().unwrap()).unwrap();
         prop_assert!(outcome.text.is_none());
     }
 }

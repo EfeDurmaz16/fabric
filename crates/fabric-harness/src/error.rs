@@ -246,6 +246,9 @@ pub enum HarnessError {
         /// The agent program.
         program: String,
     },
+    /// A standard redaction rule does not compile, so nothing is captured.
+    #[error(transparent)]
+    BadRedactionRule(#[from] crate::redact::BadRule),
     /// The Agent Client Protocol exchange failed.
     #[cfg(feature = "acp")]
     #[error("acp: {0}")]

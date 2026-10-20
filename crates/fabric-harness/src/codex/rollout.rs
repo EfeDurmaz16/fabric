@@ -208,6 +208,7 @@ pub fn read_meta(file: &RolloutFile) -> Result<Meta, HarnessError> {
 
 /// Refuses a rollout, plain or compressed, that holds a secret-shaped string.
 pub(crate) fn refuse_secrets(file: &RolloutFile) -> Result<(), HarnessError> {
+    let redactor = Redactor::standard()?;
     let mut lines = open_lines(file)?;
     let mut line = Vec::new();
     let mut number = 0usize;
@@ -221,7 +222,7 @@ pub(crate) fn refuse_secrets(file: &RolloutFile) -> Result<(), HarnessError> {
             return Ok(());
         }
         number += 1;
-        if Redactor::standard().matches_bytes(&line) {
+        if redactor.matches_bytes(&line) {
             return Err(HarnessError::SecretInState {
                 path: file.path.clone(),
                 line: number,

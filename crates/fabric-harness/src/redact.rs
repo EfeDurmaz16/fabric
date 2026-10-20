@@ -130,31 +130,48 @@ fn bearer_value_is_token(matched: &[u8]) -> bool {
     (upper && lower) || (digit && (upper || hex))
 }
 
-static STANDARD: LazyLock<Redactor> = LazyLock::new(|| Redactor {
-    rules: PATTERNS
+/// A standard rule whose pattern does not compile.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("redaction rule {rule} does not compile: {reason}")]
+pub struct BadRule {
+    /// The rule's name.
+    pub rule: &'static str,
+    /// What the regex compiler said.
+    pub reason: String,
+}
+
+/// Compiles every standard rule; one rule that does not compile fails the
+/// whole set, so a pattern edit can never switch a rule off in silence.
+fn build(patterns: &[Pattern]) -> Result<Redactor, BadRule> {
+    let bad = |pattern: &Pattern, e: regex::Error| BadRule {
+        rule: pattern.name,
+        reason: e.to_string(),
+    };
+    let rules = patterns
         .iter()
-        .filter_map(|pattern| {
-            let text = Regex::new(pattern.regex).ok()?;
-            let bytes = BytesRegex::new(pattern.regex).ok()?;
-            Some(Rule {
+        .map(|pattern| {
+            Ok(Rule {
                 name: pattern.name,
-                text,
-                bytes,
+                text: Regex::new(pattern.regex).map_err(|e| bad(pattern, e))?,
+                bytes: BytesRegex::new(pattern.regex).map_err(|e| bad(pattern, e))?,
                 accept: pattern.accept,
             })
         })
-        .collect(),
-});
+        .collect::<Result<Vec<Rule>, BadRule>>()?;
+    Ok(Redactor { rules })
+}
+
+static STANDARD: LazyLock<Result<Redactor, BadRule>> = LazyLock::new(|| build(PATTERNS));
 
 fn count(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
 impl Redactor {
-    /// The standard rule set.
-    #[must_use]
-    pub fn standard() -> &'static Redactor {
-        &STANDARD
+    /// The standard rule set; an error when any of its patterns does not
+    /// compile, and then nothing may be captured.
+    pub fn standard() -> Result<&'static Redactor, BadRule> {
+        STANDARD.as_ref().map_err(Clone::clone)
     }
 
     /// Returns true when any rule matches somewhere in `text`.
@@ -239,12 +256,26 @@ mod tests {
 
     #[test]
     fn every_standard_pattern_compiles() {
-        assert_eq!(Redactor::standard().rules.len(), PATTERNS.len());
+        assert_eq!(Redactor::standard().unwrap().rules.len(), PATTERNS.len());
+        let broken = [
+            Pattern {
+                name: "fine",
+                regex: "x",
+                accept: any,
+            },
+            Pattern {
+                name: "broken",
+                regex: "(",
+                accept: any,
+            },
+        ];
+        let err = build(&broken).err().unwrap();
+        assert_eq!(err.rule, "broken");
     }
 
     #[test]
     fn redacts_and_counts() {
-        let r = Redactor::standard();
+        let r = Redactor::standard().unwrap();
         let mut counts = RedactionCounts::new();
         let text = "key sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456 and ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab";
         let out = r.apply(text, &mut counts).unwrap();
@@ -262,7 +293,7 @@ mod tests {
 
     #[test]
     fn bytes_that_are_not_utf8_are_redacted_and_kept_around_the_match() {
-        let r = Redactor::standard();
+        let r = Redactor::standard().unwrap();
         let mut counts = RedactionCounts::new();
         let mut input = b"caf\xC3 ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab \xFF".to_vec();
         assert!(r.matches_bytes(&input));
@@ -275,7 +306,7 @@ mod tests {
 
     #[test]
     fn ordinary_words_and_paths_are_not_secrets() {
-        let r = Redactor::standard();
+        let r = Redactor::standard().unwrap();
         for text in [
             "/Users/efe/oss/disk-usage-analyzer-service/src/main.rs",
             "task-list-item-checkbox-wrapper-component-with-a-long-name",
@@ -297,7 +328,7 @@ mod tests {
 
     #[test]
     fn real_key_shapes_still_match() {
-        let r = Redactor::standard();
+        let r = Redactor::standard().unwrap();
         for text in [
             "OPENAI_API_KEY=sk-proj-Ab3dEfGhIjKlMnOpQrStUvWxYz0123456789abcd",
             "key sk-Ab3dEfGhIjKlMnOpQrStUvWxYz0123456789abcdEFGH",

@@ -515,11 +515,12 @@ pub(crate) fn stage(
             });
         }
     }
+    let redactor = Redactor::standard()?;
     let mut carried = Vec::with_capacity(sorted.len());
     for source in sorted {
         let dst = out.join(source.rel.as_str());
         let written = write_atomic_with(&dst, |w| {
-            transfer(&source.abs, w, source.carry, Redactor::standard(), counts)
+            transfer(&source.abs, w, source.carry, redactor, counts)
         })?;
         carried.push(Carried {
             rel_path: source.rel.clone(),
@@ -655,7 +656,7 @@ fn redacted_view_prefix(
         existing,
         &mut check,
         Carry::of(content),
-        Redactor::standard(),
+        Redactor::standard()?,
         &mut RedactionCounts::new(),
     );
     match produced {

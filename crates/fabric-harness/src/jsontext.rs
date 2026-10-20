@@ -397,7 +397,7 @@ mod tests {
     const ANTHROPIC: &str = "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456";
 
     fn redact(text: &str) -> Result<Outcome, TransformError> {
-        transform(text, Redactor::standard())
+        transform(text, Redactor::standard().unwrap())
     }
 
     #[test]
