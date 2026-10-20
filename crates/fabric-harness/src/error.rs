@@ -267,6 +267,21 @@ pub enum HarnessError {
         /// The agent program.
         program: String,
     },
+    /// The launch environment points a harness at another config directory
+    /// than the one the adapter reads and writes.
+    #[error(
+        "{program} would keep its state under {dir}, but Fabric reads and writes {expected}; unset {var} or set it to {expected}"
+    )]
+    ConfigDirUnsupported {
+        /// The harness program.
+        program: String,
+        /// The variable that names the directory.
+        var: &'static str,
+        /// The directory the launch environment names.
+        dir: PathBuf,
+        /// The directory the adapter uses.
+        expected: PathBuf,
+    },
     /// A settings or MCP overlay holds a literal secret instead of a reference.
     #[error("{path} holds a literal secret; use a ${{VAR}} reference in an overlay")]
     SecretInOverlay {

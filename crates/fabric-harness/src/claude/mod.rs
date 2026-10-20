@@ -18,7 +18,12 @@
 //! parse, or the installed Claude is older than the version it was read
 //! on), any running `claude` refuses them instead.
 //! Login is never copied and no per-job config directory is set:
-//! `CLAUDE_CONFIG_DIR` keys the login (ADR 0006, D15).
+//! `CLAUDE_CONFIG_DIR` keys the login (ADR 0006, D15). Claude keeps its
+//! config file, projects store and login under `$CLAUDE_CONFIG_DIR` when
+//! it is set (`.claude.json` included, read from the 2.1.294 bundle),
+//! while this adapter reads and writes `~/.claude` and `~/.claude.json`,
+//! so `check_env` refuses an environment that sets it to anything else,
+//! and `launch` runs that check first.
 //!
 //! Surfaces used, checked against `claude --help` of 2.1.294 on
 //! 2026-10-19: `--resume <id>`, `--session-id <uuid>`, `-p` with
@@ -58,6 +63,9 @@ pub use self::trust::{LeftReason, LivePids, TrustOutcome};
 
 /// The program name on `PATH`.
 pub const PROGRAM: &str = "claude";
+
+/// The variable that moves Claude's config directory.
+const CONFIG_DIR_VAR: &str = "CLAUDE_CONFIG_DIR";
 
 /// The Claude Code adapter for one home directory.
 #[derive(Debug, Clone)]
@@ -118,6 +126,27 @@ impl ClaudeCode {
     pub fn with_flags(mut self, flags: LaunchFlags) -> Self {
         self.flags = flags;
         self
+    }
+
+    /// Refuses a launch environment in which Claude would keep its state
+    /// somewhere else than this adapter reads and writes: one that sets
+    /// `CLAUDE_CONFIG_DIR` to any directory but `<home>/.claude`. The CLI
+    /// runs it on the environment it will launch with before it pre-seeds
+    /// trust or captures, which take no environment.
+    pub fn check_env(&self, env: &[(EnvVarName, String)]) -> Result<(), HarnessError> {
+        let set = env
+            .iter()
+            .find(|(name, _)| name.as_str() == CONFIG_DIR_VAR)
+            .map(|(_, value)| PathBuf::from(value));
+        match set {
+            Some(dir) if dir != self.config_dir => Err(HarnessError::ConfigDirUnsupported {
+                program: PROGRAM.to_owned(),
+                var: CONFIG_DIR_VAR,
+                dir,
+                expected: self.config_dir.clone(),
+            }),
+            _ => Ok(()),
+        }
     }
 
     fn binary(&self) -> Result<PathBuf, HarnessError> {
@@ -633,6 +662,7 @@ impl ClaudeCode {
         launch: &Launch,
         env: &[(EnvVarName, String)],
     ) -> Result<Running, HarnessError> {
+        self.check_env(env)?;
         let root = pipeline::physical_workspace(workspace)?;
         let binary = self.binary()?;
         for overlay in self.flags.overlays() {
