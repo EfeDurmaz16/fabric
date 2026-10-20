@@ -93,6 +93,21 @@ pub enum BundleKind {
     Empty,
 }
 
+/// An index entry flag that commits `I` and `W` cannot record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexFlag {
+    /// `git add -N`: `write-tree` leaves the entry out, so restore would make the file plain untracked.
+    IntentToAdd,
+}
+
+impl std::fmt::Display for IndexFlag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            IndexFlag::IntentToAdd => "intent-to-add (git add -N)",
+        })
+    }
+}
+
 /// Why a repository cannot be captured right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BusyReason {
@@ -273,6 +288,14 @@ pub enum CaptureError {
     GitSubmoduleDirty {
         /// The submodule path.
         path: RelPath,
+    },
+    /// An index entry carries a flag the snapshot cannot reproduce; clear it and capture again.
+    #[error("{path} is marked {flag} in the index, which a snapshot cannot carry")]
+    GitIndexFlag {
+        /// The path of the entry.
+        path: RelPath,
+        /// The flag.
+        flag: IndexFlag,
     },
     /// A path has the LFS filter; the working-tree commit would hold pointers.
     #[error("{path} has filter=lfs, which capture does not support")]
@@ -930,10 +953,17 @@ impl GitCapture<'_> {
                 }
                 _ => continue,
             };
+            let path = || rel_path(text.splitn(fields, ' ').last().unwrap_or(""));
+            // An intent-to-add entry is added in the work tree and absent from the index.
+            if fields == 9 && text.split(' ').nth(1) == Some(".A") {
+                return Err(CaptureError::GitIndexFlag {
+                    path: path()?,
+                    flag: IndexFlag::IntentToAdd,
+                });
+            }
             let sub = text.split(' ').nth(2).unwrap_or("");
             if sub.starts_with('S') && sub[1..].chars().any(|c| c != '.') {
-                let path = rel_path(text.splitn(fields, ' ').last().unwrap_or(""))?;
-                return Err(CaptureError::GitSubmoduleDirty { path });
+                return Err(CaptureError::GitSubmoduleDirty { path: path()? });
             }
         }
         // git resolves the attributes itself, from every .gitattributes,

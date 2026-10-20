@@ -17,7 +17,7 @@ use fabric_core::snapshot::{
     CacheClass, CacheEntry, CarryKey, CarryState, Entry, EntryKind, GitHead, Mode,
 };
 use fabric_store::capture::{
-    BundleKind, BusyReason, CaptureError, CaptureRequest, Captured, MAX_BUNDLE_CHAIN,
+    BundleKind, BusyReason, CaptureError, CaptureRequest, Captured, IndexFlag, MAX_BUNDLE_CHAIN,
     UnmeasuredKeys, capture,
 };
 use fabric_store::objects::ChunkParams;
@@ -801,6 +801,25 @@ fn unmerged_index_entries_are_refused() {
             CaptureError::GitBusy {
                 reason: BusyReason::Conflicts
             }
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_intent_to_add_entry_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    make_repo(&root).unwrap();
+    git(&root).run(&["add", "-N", "new.txt"]).unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            CaptureError::GitIndexFlag { path, flag: IndexFlag::IntentToAdd }
+                if path.as_str() == "new.txt"
         ),
         "{err}"
     );
