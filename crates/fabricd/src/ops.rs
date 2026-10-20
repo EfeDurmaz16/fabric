@@ -380,6 +380,16 @@ impl Node {
             (Some(s), Some(_)) => format!("snapshot: {s} (suspended in it)"),
             (Some(s), None) => format!("snapshot: {s} (resumed since)"),
         });
+        if let Some(snapshot) = manifest.latest_snapshot {
+            let read = with_store(&self.store, move |store| Ok(store.manifest(snapshot)?)).await;
+            out.say(match read {
+                Ok(snapshot_manifest) => match session_line(&snapshot_manifest) {
+                    Some(line) => format!("session: {line}"),
+                    None => format!("session: captured in snapshot {snapshot}"),
+                },
+                Err(e) => format!("session: snapshot {snapshot} could not be read: {e}"),
+            });
+        }
         out.say(match job.marker()? {
             None => "workspace: none on this node".to_owned(),
             Some(marker) => workspace_line(&job, self.id, &marker, forked.is_some()).await,
@@ -976,6 +986,9 @@ impl Node {
             }
             for decision in &decisions {
                 out.say(decision.to_string());
+            }
+            if let Some(line) = session_line(&manifest) {
+                out.say(line);
             }
             // Once MoveStarted is written, a refusal could only freeze the
             // job here; a move asked again after it goes on.
@@ -1895,6 +1908,9 @@ impl Node {
                 for decision in &decisions {
                     out.say(decision.to_string());
                 }
+                if let Some(line) = session_line(&manifest) {
+                    out.say(line);
+                }
             }
             (Some(_), None) => out.say(
                 "no snapshot yet; a move decides each ignored path once it has suspended the job",
@@ -2123,6 +2139,19 @@ fn restore_summary(snapshot: SnapshotId, report: &RestoreReport, has_git: bool) 
         parts.join("; ")
     )
 }
+
+/// The line `status` and `move` print about a snapshot's harness state (gate finding F9).
+fn session_line(manifest: &fabric_core::snapshot::SnapshotManifest) -> Option<&'static str> {
+    manifest
+        .harness_state
+        .entries
+        .is_empty()
+        .then_some(NO_SESSION)
+}
+
+/// What a snapshot without harness state means for the conversation.
+const NO_SESSION: &str =
+    "no harness session captured; the conversation will not continue on the target";
 
 fn no_parent(root: &Path) -> NodeError {
     NodeError::io(root, std::io::Error::other("a root needs a parent"))
