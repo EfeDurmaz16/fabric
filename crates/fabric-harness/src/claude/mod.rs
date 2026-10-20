@@ -923,6 +923,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_trusted_directory_above_a_symlink_to_the_workspace_does_not_count() {
+        let fixture = TrustFixture::new(Some(&|work: &Path| {
+            let links = work.parent().unwrap().parent().unwrap().join("links");
+            std::fs::create_dir(&links).unwrap();
+            trusting(&links)
+        }));
+        let link = fixture.home.join("links").join("work");
+        std::os::unix::fs::symlink(&fixture.work, &link).unwrap();
+        let (outcome, asked) = fixture.preseed_at(&link, Vec::new()).await;
+        assert_eq!(
+            outcome.unwrap(),
+            written(&fixture.work),
+            "Claude walks the physical path, so the link's own parent must not count"
+        );
+        assert!(asked);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_workspace_given_in_other_letter_case_is_keyed_by_its_spelling_on_disk() {
+        let fixture =
+            TrustFixture::named("Work", Some(&|_: &Path| r#"{"projects":{}}"#.to_owned()));
+        let typed = fixture.home.join("a").join("work");
+        if !typed.exists() {
+            return;
+        }
+        let (outcome, _) = fixture.preseed_at(&typed, Vec::new()).await;
+        assert_eq!(
+            outcome.unwrap(),
+            written(&fixture.work),
+            "Claude keys trust by getcwd, which spells the path as it is stored"
+        );
+    }
+
+    #[tokio::test]
     async fn a_trusted_workspace_root_writes_nothing() {
         let fixture = TrustFixture::new(Some(&|work: &Path| trusting(work)));
         let before = fixture.config_bytes();
