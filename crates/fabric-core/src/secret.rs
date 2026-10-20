@@ -58,6 +58,12 @@ pub enum SecretPatternError {
     /// pattern comes from: the override file or a peer's spec.
     #[error("secret pattern matches {OVERRIDE_FILE}, which detection must be able to read")]
     DeniesOverrideFile,
+    /// Encoded bytes hold an ASCII capital, which no stored pattern has.
+    #[error("secret pattern has an ASCII capital at index {index}; stored patterns are lowercase")]
+    NotLowercase {
+        /// Zero-based byte index of the capital.
+        index: usize,
+    },
 }
 
 /// A secret pattern a job adds to the built-in list: path components separated by `/`, where `*` matches any run of characters.
@@ -66,12 +72,17 @@ pub enum SecretPatternError {
 /// gitignore gives them meanings the matcher does not; empty, `.`, `..`
 /// and `**` components; and any pattern that denies `OVERRIDE_FILE`.
 /// Checked once, at the boundary, including inside `Deserialize`.
+///
+/// Matching ignores ASCII case, so the stored form is ASCII lowercase:
+/// `parse` folds `*.DB` to `*.db`, and decoding refuses a capital. One
+/// rule then has one value, and equality, ordering and the spec's id agree
+/// with what the matcher does.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct SecretPattern(String);
 
 impl SecretPattern {
-    /// Checks `text` against the pattern rules and wraps it.
+    /// Checks `text` against the pattern rules and wraps it, folded to ASCII lowercase.
     pub fn parse(text: &str) -> Result<Self, SecretPatternError> {
         if text.is_empty() {
             return Err(SecretPatternError::Empty);
@@ -90,7 +101,7 @@ impl SecretPattern {
                 _ => {}
             }
         }
-        let pattern = Self(text.to_owned());
+        let pattern = Self(text.to_ascii_lowercase());
         if pattern_matches(&pattern, OVERRIDE_FILE) {
             return Err(SecretPatternError::DeniesOverrideFile);
         }
@@ -119,6 +130,11 @@ impl fmt::Debug for SecretPattern {
 impl<'de> Deserialize<'de> for SecretPattern {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
+        if let Some(index) = text.bytes().position(|b| b.is_ascii_uppercase()) {
+            return Err(serde::de::Error::custom(SecretPatternError::NotLowercase {
+                index,
+            }));
+        }
         Self::parse(&text).map_err(serde::de::Error::custom)
     }
 }
@@ -634,6 +650,23 @@ mod tests {
     fn a_bad_secret_pattern_does_not_decode() {
         let bytes = postcard::to_stdvec("**/x").unwrap();
         assert!(postcard::from_bytes::<SecretPattern>(&bytes).is_err());
+    }
+
+    /// Two spellings of one rule are one value, so a list of them dedupes
+    /// and sorts by what the matcher does; a peer cannot send the other
+    /// spelling and give the same rule a second spec id.
+    #[test]
+    fn a_pattern_has_one_value_whatever_its_ascii_case() {
+        let upper = SecretPattern::parse("Data/*.DB").unwrap();
+        assert_eq!(upper, SecretPattern::parse("data/*.db").unwrap());
+        assert_eq!(upper.as_str(), "data/*.db");
+        let bytes = postcard::to_stdvec("data/*.DB").unwrap();
+        assert!(postcard::from_bytes::<SecretPattern>(&bytes).is_err());
+        let bytes = postcard::to_stdvec(&upper).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<SecretPattern>(&bytes).unwrap(),
+            upper
+        );
     }
 
     /// Detection reads the override file through the job's patterns, so a

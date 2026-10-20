@@ -380,10 +380,7 @@ fn patterns(value: &Value) -> Result<Vec<SecretPattern>, OverrideError> {
     for (index, text) in strings(value, "secret_patterns")?.into_iter().enumerate() {
         let pattern = SecretPattern::parse(text)
             .map_err(|reason| OverrideError::Pattern { index, reason })?;
-        if patterns
-            .iter()
-            .any(|p| p.as_str().eq_ignore_ascii_case(pattern.as_str()))
-        {
+        if patterns.contains(&pattern) {
             return Err(OverrideError::DuplicatePattern { index });
         }
         patterns.push(pattern);
