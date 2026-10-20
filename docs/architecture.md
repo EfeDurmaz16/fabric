@@ -16,7 +16,7 @@ A job is a goal plus the state needed to keep working on it. Where that state is
 |---|---|---|---|
 | Job record | Goal, append-only event ledger, versioned manifest, pending decisions, an opaque state directory per harness | `fabric-core` | [0001](adr/0001-job-as-unit-of-work.md), [0002](adr/0002-job-ledger-and-record.md) |
 | Storage | Content-addressed snapshots of the workspace: git objects and refs in a bundle, the index and the working tree as two snapshot commits, ignored files by class (deps, build, tool caches and precious files carried, secrets never), harness state | `fabric-store` | [0004](adr/0004-content-addressed-snapshots.md), [0011](adr/0011-path-identity.md) |
-| Compute | The node that owns the job and runs the harness right now. Replaceable by an explicit move. Exactly one live copy. | `fabric-node`, `fabric-net` | [0003](adr/0003-exactly-one-live-copy.md), [0005](adr/0005-transport-and-node-identity.md), [0008](adr/0008-placement-and-triggers.md) |
+| Compute | The node that owns the job and runs the harness right now. Replaceable by an explicit move. Exactly one live copy. | `fabric-node`, `fabric-net` | [0003](adr/0003-exactly-one-live-copy.md), [0005](adr/0005-transport-and-node-identity.md), [0008](adr/0008-placement-and-triggers.md), [0013](adr/0013-network-protocol-as-built.md) |
 | Environment | `EnvSpec`: detected tool versions, setup commands, env var names, cache paths. Caches arrive when their carry key matches; otherwise the node materializes. | `fabric-env` | [0007](adr/0007-environment-spec.md), [0012](adr/0012-dependency-carry.md) |
 
 Harnesses (Claude Code, Codex, anything that speaks the Agent Client Protocol) are adapters on top of these four. The core never reads a harness's files; it moves them as opaque bytes. See [0006](adr/0006-harness-adapters.md).
@@ -140,7 +140,7 @@ If B dies between steps 7 and 9, B owns epoch 2 and the job is not lost: the sna
 
 ## How to read the ADRs
 
-Read them in number order. 0001 and 0002 define the data. 0003 is the one that protects the user's work and is worth the most review time. 0004 and 0005 are the storage and network mechanics. 0006 and 0007 are the adapters. 0008 is the explicit move and the preflight. 0009 is how we work. 0010 is what Fabric is not. 0011 and 0012 are the two decisions the preflight measurements forced: the root path and which caches travel.
+Read them in number order. 0001 and 0002 define the data. 0003 is the one that protects the user's work and is worth the most review time. 0004 and 0005 are the storage and network mechanics. 0006 and 0007 are the adapters. 0008 is the explicit move and the preflight. 0009 is how we work. 0010 is what Fabric is not. 0011 and 0012 are the two decisions the preflight measurements forced: the root path and which caches travel. 0013 records the network protocol as the code built it and supersedes parts of 0005.
 
 ### Evidence paths
 
