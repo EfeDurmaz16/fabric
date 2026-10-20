@@ -36,7 +36,7 @@ Pairing v0 is out of band. On the Air, read the id off the screen of the Pro
 and pair `fab1<pro>@<pro-address>:7777`; on the Pro, the same with the Air's
 id. Once `fabric-cli` exists this is `fabric node pair`; today it is
 `Peers::update` with `PeerBook::pair`. A spec takes an IP address or a name; a name is resolved
-at dial time. A node that is not in the book is refused inside the TLS
+at dial time, and its first 4 distinct addresses are dialed. A node that is not in the book is refused inside the TLS
 handshake and never reaches application code, listening or not.
 
 An `Endpoint` re-reads the book before each handshake, so a pairing written
