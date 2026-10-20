@@ -90,9 +90,9 @@ pub enum NodeError {
         /// Its pid.
         pid: u32,
     },
-    /// The launched harness is not running, or its start time could not be read.
+    /// The launched harness is not running as the leader of its own group, or its start time could not be read.
     #[error(
-        "the harness pid {pid} is not running or its start time cannot be read, so it is not recorded"
+        "the harness pid {pid} is not running as the leader of its own process group, or its start time cannot be read, so it is not recorded"
     )]
     HarnessGone {
         /// The pid the CLI named.

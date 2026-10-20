@@ -6,8 +6,11 @@
 //! restore never writes over work that is not in a published snapshot
 //! (ADR 0004), and the harness record names a process by its pid and the
 //! kernel's start time, so a supervisor never kills a pid that was reused
-//! after the harness exited (ADR 0003). Each file is replaced whole by a
-//! durable rename and read back as `None` when it is absent.
+//! after the harness exited (ADR 0003). The record stands for the whole
+//! process group the harness leads: it is kept while any process of the
+//! group runs, and a stop is done only when the group is empty. Each file
+//! is replaced whole by a durable rename and read back as `None` when it is
+//! absent.
 
 use std::io;
 use std::num::NonZeroU32;
@@ -42,7 +45,31 @@ pub enum LocalError {
         /// Why.
         reason: String,
     },
+    /// The harness group could not be signalled, or outlived `SIGKILL`.
+    #[error(
+        "the harness group of pid {pid} still runs ({reason}); nothing was captured. Stop it by hand, then run the command again"
+    )]
+    Survived {
+        /// The group's leader.
+        pid: NonZeroU32,
+        /// What failed.
+        reason: String,
+    },
 }
+
+/// Whether a recorded harness still runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// The process the record names runs.
+    Leader,
+    /// It exited, and processes it started still run in its group.
+    Group,
+    /// Nothing of it runs.
+    Gone,
+}
+
+/// How long a group gets to empty after `SIGKILL`.
+const KILL_WAIT: Duration = Duration::from_secs(5);
 
 /// What the workspace at a job's root holds on this node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +103,9 @@ pub struct Marker {
 }
 
 /// A harness this node launched for a job, as the supervisor records it (ADR 0003).
+///
+/// A process that leaves the group, with `setsid` for one, is out of reach:
+/// the supervisor signals the group and nothing else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessRecord {
     /// The epoch the harness was launched under; a higher one kills it.
@@ -156,34 +186,86 @@ pub async fn process_started(pid: NonZeroU32) -> Option<String> {
     (output.status.success() && !text.is_empty()).then_some(text)
 }
 
+/// `pid` as a process id that may lead a group Fabric signals: any but 1.
+fn leader_pid(pid: NonZeroU32) -> Option<Pid> {
+    Pid::from_raw(i32::try_from(pid.get()).ok()?).filter(|pid| pid.as_raw_nonzero().get() > 1)
+}
+
+/// True when `pid` runs and leads its own process group, as a launched harness does.
+pub fn leads_group(pid: NonZeroU32) -> bool {
+    leader_pid(pid).is_some_and(|pid| rustix::process::getpgid(Some(pid)) == Ok(pid))
+}
+
 impl HarnessRecord {
-    /// True when the recorded process still runs: the pid lives and started when it did.
-    pub async fn is_alive(&self) -> bool {
-        process_started(self.pid).await.as_deref() == Some(self.started.as_str())
+    /// Whether the recorded process, or any process left in its group, runs.
+    ///
+    /// When the pid names another process now, the group is gone: a pid is
+    /// not given out again while a process group with that id exists.
+    pub async fn liveness(&self) -> Liveness {
+        match process_started(self.pid).await {
+            Some(started) if started == self.started => Liveness::Leader,
+            None if self.group_exists() => Liveness::Group,
+            Some(_) | None => Liveness::Gone,
+        }
     }
 
-    /// Stops the recorded process group: `SIGTERM`, then `SIGKILL` after `grace`.
+    /// The group to signal; never group 1, because `kill(-1)` signals every process.
+    fn group(&self) -> Option<Pid> {
+        leader_pid(self.pid)
+    }
+
+    fn group_exists(&self) -> bool {
+        self.group()
+            .is_some_and(|group| rustix::process::test_kill_process_group(group).is_ok())
+    }
+
+    /// Stops the recorded process group: `SIGTERM`, then `SIGKILL` after
+    /// `grace`, and returns once nothing of the group runs.
     ///
-    /// A process that is gone, or a pid now owned by another process, is
-    /// left alone.
-    pub async fn stop(&self, grace: Duration) {
-        let Some(pid) = Pid::from_raw(self.pid.get().try_into().unwrap_or(i32::MAX)) else {
-            return;
+    /// A group that is gone, or a pid now owned by another process, is left
+    /// alone. A group that cannot be signalled or outlives `SIGKILL` is an
+    /// error, so no caller captures or hands away a workspace it still writes.
+    pub async fn stop(&self, grace: Duration) -> Result<(), LocalError> {
+        if self.liveness().await == Liveness::Gone {
+            return Ok(());
+        }
+        let survived = |reason: String| LocalError::Survived {
+            pid: self.pid,
+            reason,
         };
-        if !self.is_alive().await {
-            return;
+        let group = self
+            .group()
+            .ok_or_else(|| survived("the pid is not a process id".to_owned()))?;
+        self.signal(group, Signal::TERM).map_err(survived)?;
+        if self.wait_gone(grace).await {
+            return Ok(());
         }
-        let _ = rustix::process::kill_process_group(pid, Signal::TERM);
-        let deadline = tokio::time::Instant::now() + grace;
-        while tokio::time::Instant::now() < deadline {
-            if !self.is_alive().await {
-                return;
+        tracing::warn!(pid = self.pid, "harness ignored SIGTERM; killing its group");
+        self.signal(group, Signal::KILL).map_err(survived)?;
+        if self.wait_gone(KILL_WAIT).await {
+            Ok(())
+        } else {
+            Err(survived("it outlived SIGKILL".to_owned()))
+        }
+    }
+
+    fn signal(&self, group: Pid, signal: Signal) -> Result<(), String> {
+        match rustix::process::kill_process_group(group, signal) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+            Err(e) => Err(format!("signal {signal:?} to group {}: {e}", self.pid)),
+        }
+    }
+
+    async fn wait_gone(&self, limit: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            if self.liveness().await == Liveness::Gone {
+                return true;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        if self.is_alive().await {
-            tracing::warn!(pid = self.pid, "harness ignored SIGTERM; killing its group");
-            let _ = rustix::process::kill_process_group(pid, Signal::KILL);
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 }
@@ -191,6 +273,14 @@ impl HarnessRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record_of(child: &tokio::process::Child, started: String) -> HarnessRecord {
+        HarnessRecord {
+            epoch: Epoch::FIRST,
+            pid: NonZeroU32::new(child.id().unwrap()).unwrap(),
+            started,
+        }
+    }
 
     #[tokio::test]
     async fn a_reused_pid_is_not_the_recorded_harness() {
@@ -201,30 +291,60 @@ mod tests {
             .unwrap();
         let pid = NonZeroU32::new(child.id().unwrap()).unwrap();
         let started = process_started(pid).await.unwrap();
-        let record = HarnessRecord {
-            epoch: Epoch::FIRST,
-            pid,
-            started: started.clone(),
-        };
-        assert!(record.is_alive().await);
+        let record = record_of(&child, started.clone());
+        assert_eq!(record.liveness().await, Liveness::Leader);
         let other = HarnessRecord {
             started: format!("{started} but earlier"),
             ..record.clone()
         };
-        assert!(
-            !other.is_alive().await,
+        assert_eq!(
+            other.liveness().await,
+            Liveness::Gone,
             "a different start time is another process"
         );
-        other.stop(Duration::from_millis(100)).await;
-        assert!(
-            record.is_alive().await,
+        other.stop(Duration::from_millis(100)).await.unwrap();
+        assert_eq!(
+            record.liveness().await,
+            Liveness::Leader,
             "stop left a process it does not own alone"
         );
 
         // The test is the parent here, so it reaps; a harness's parent is the CLI.
         let reaper = tokio::spawn(async move { child.wait().await });
-        record.stop(Duration::from_secs(5)).await;
+        record.stop(Duration::from_secs(5)).await.unwrap();
         reaper.await.unwrap().unwrap();
-        assert!(!record.is_alive().await);
+        assert_eq!(record.liveness().await, Liveness::Gone);
+    }
+
+    /// A harness that started a background process and exited: the record
+    /// still stands for the group, and a stop ends what is left of it.
+    #[tokio::test]
+    async fn a_stop_reaches_the_group_after_its_leader_exited() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("child");
+        let mut leader = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("sleep 30 & echo $! > {}", pid_file.display()))
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let started = process_started(NonZeroU32::new(leader.id().unwrap()).unwrap())
+            .await
+            .unwrap();
+        let record = record_of(&leader, started);
+        leader.wait().await.unwrap();
+        let child: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(record.liveness().await, Liveness::Group);
+        record.stop(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(record.liveness().await, Liveness::Gone);
+        let child = Pid::from_raw(child).unwrap();
+        assert!(
+            rustix::process::test_kill_process(child).is_err(),
+            "the background process outlived the stop"
+        );
     }
 }

@@ -41,13 +41,16 @@ use crate::facts::{MeasuredKeys, NodeFacts, key_difference};
 use crate::faults::{self, Action, Point};
 use crate::harnesses::adapter;
 use crate::job::Job;
-use crate::local::{self, HarnessRecord, Marker, MarkerState, SessionRecord};
+use crate::local::{self, HarnessRecord, Liveness, Marker, MarkerState, SessionRecord};
 use crate::node::{Node, Out, is_transport};
 use crate::paths::{self, SyncedFolders, check_root, restore_root};
 use crate::transfer::{fetch_snapshot, is_complete, with_store};
 
 /// How long a harness gets between `SIGTERM` and `SIGKILL` when a suspend stops it.
 pub const STOP_GRACE: Duration = Duration::from_secs(10);
+
+/// How long a fenced harness gets between `SIGTERM` and `SIGKILL`.
+pub const FENCE_GRACE: Duration = Duration::from_secs(5);
 
 /// How long a page of records may take, the snapshot fetch it can start included.
 pub const APPEND_DEADLINE: Duration = Duration::from_mins(10);
@@ -359,13 +362,18 @@ impl Node {
             ),
         });
         let running = match job.harness_record()? {
-            Some(record) if record.is_alive().await => {
-                format!(
+            Some(record) => match record.liveness().await {
+                Liveness::Leader => format!(
                     "harness: running as pid {} since epoch {}",
                     record.pid, record.epoch
-                )
-            }
-            _ => "harness: not running".to_owned(),
+                ),
+                Liveness::Group => format!(
+                    "harness: pid {} exited and processes it started still run in its group; `fabric job suspend {id}` stops them",
+                    record.pid
+                ),
+                Liveness::Gone => "harness: not running".to_owned(),
+            },
+            None => "harness: not running".to_owned(),
         };
         out.say(running);
         out.say(format!("records: {}", manifest.event_count));
@@ -415,7 +423,7 @@ impl Node {
             }
         }
         if let Some(record) = job.harness_record()?
-            && record.is_alive().await
+            && record.liveness().await != Liveness::Gone
         {
             return Err(NodeError::AlreadyRunningHarness {
                 job: id,
@@ -452,12 +460,15 @@ impl Node {
         }
         if let Some(record) = job.harness_record()?
             && record.pid != pid
-            && record.is_alive().await
+            && record.liveness().await != Liveness::Gone
         {
             return Err(NodeError::AlreadyRunningHarness {
                 job: id,
                 pid: record.pid.get(),
             });
+        }
+        if !local::leads_group(pid) {
+            return Err(NodeError::HarnessGone { pid });
         }
         let started = local::process_started(pid)
             .await
@@ -503,11 +514,16 @@ impl Node {
     async fn harness_exited(&self, id: JobId, pid: u32) -> Result<(), NodeError> {
         let job = self.job(id).await?;
         let job = job.lock().await;
-        if job
-            .harness_record()?
-            .is_some_and(|record| record.pid.get() == pid)
+        if let Some(record) = job.harness_record()?
+            && record.pid.get() == pid
         {
-            local::remove(&job.dir().harness())?;
+            // The record stands for the group: a background process the
+            // harness started keeps it, so a suspend still stops it.
+            if record.liveness().await == Liveness::Gone {
+                local::remove(&job.dir().harness())?;
+            } else {
+                tracing::info!(job = %id, pid, "the harness exited and its group still runs");
+            }
         }
         Ok(())
     }
@@ -554,9 +570,9 @@ impl Node {
             });
         }
         if let Some(record) = job.harness_record()? {
-            if record.is_alive().await {
+            if record.liveness().await != Liveness::Gone {
                 out.say(format!("stopping the harness, pid {}", record.pid));
-                record.stop(STOP_GRACE).await;
+                record.stop(STOP_GRACE).await?;
             }
             local::remove(&job.dir().harness())?;
         }
@@ -1114,12 +1130,12 @@ impl Node {
         if let Some(record) = job.harness_record()? {
             let owned = matches!(view, LeaseView::Owner(token) if token.epoch == record.epoch);
             if !owned {
-                if record.is_alive().await {
+                if record.liveness().await != Liveness::Gone {
                     out.say(format!(
                         "fenced: epoch {} is over for this node; stopping harness pid {}",
                         record.epoch, record.pid
                     ));
-                    record.stop(Duration::from_secs(5)).await;
+                    record.stop(FENCE_GRACE).await?;
                 }
                 local::remove(&job.dir().harness())?;
             }
@@ -1211,7 +1227,7 @@ impl Node {
         let token = owner_token(&job, self.id)?;
         let root = self.restore_if_needed(&mut job, path_var, out).await?;
         if let Some(record) = job.harness_record()?
-            && record.is_alive().await
+            && record.liveness().await != Liveness::Gone
         {
             return Err(NodeError::AlreadyRunningHarness {
                 job: id,
