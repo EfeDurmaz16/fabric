@@ -3,7 +3,10 @@
 //! Invariant: every file that enters a state tree passes the denylist, is
 //! redacted or refused as its `Carry` says, and is written durably, with
 //! its length and `BLAKE3` digest recorded for the manifest. A staged tree
-//! is checked against those digests before restore places a byte of it.
+//! holds exactly the files its manifest lists: a file an earlier or failed
+//! capture left in a reused directory is removed before the manifest is
+//! written. A staged tree is checked against those digests before restore
+//! places a byte of it.
 
 #![cfg_attr(
     not(all(feature = "acp", feature = "claude", feature = "codex")),
@@ -13,6 +16,7 @@
     )
 )]
 
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -404,10 +408,58 @@ pub(crate) fn stage(
         });
         crashpoint("stage-after-file", index);
     }
+    let keep: BTreeSet<&str> = carried.iter().map(|c| c.rel_path.as_str()).collect();
+    sweep(out, out, &keep)?;
     Ok(Staged {
         carried,
         replaceable,
     })
+}
+
+/// Removes from `dir`, a directory under the staging root `out`, every
+/// entry that is not a directory and whose tree path is not in `keep`,
+/// and every directory left empty below `out`, so nothing an earlier
+/// capture wrote travels without a manifest entry. Entries are read
+/// without following symlinks; a symlink is removed like a stale file.
+fn sweep(out: &Path, dir: &Path, keep: &BTreeSet<&str>) -> Result<bool, HarnessError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(e) => return Err(HarnessError::io(IoOp::Walk, dir, e)),
+    };
+    let mut empty = true;
+    let mut removed = false;
+    for entry in entries {
+        let entry = entry.map_err(|e| HarnessError::io(IoOp::Walk, dir, e))?;
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .map_err(|e| HarnessError::io(IoOp::Walk, &path, e))?;
+        if kind.is_dir() {
+            if sweep(out, &path, keep)? {
+                fs::remove_dir(&path).map_err(|e| HarnessError::io(IoOp::Remove, &path, e))?;
+                removed = true;
+            } else {
+                empty = false;
+            }
+            continue;
+        }
+        let listed = path
+            .strip_prefix(out)
+            .ok()
+            .and_then(Path::to_str)
+            .is_some_and(|rel| keep.contains(rel));
+        if listed {
+            empty = false;
+        } else {
+            fs::remove_file(&path).map_err(|e| HarnessError::io(IoOp::Remove, &path, e))?;
+            removed = true;
+        }
+    }
+    if removed {
+        durable::fsync_dir(dir)?;
+    }
+    Ok(empty && dir != out)
 }
 
 /// The length and digest of the file at `path`.
@@ -660,6 +712,42 @@ mod tests {
             fs::read_to_string(&staged).unwrap(),
             "{\n  \"token\": \"[REDACTED:github-token]\"\n"
         );
+    }
+
+    #[test]
+    fn a_reused_directory_keeps_only_the_files_of_the_new_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+        let out = dir.path().join("out");
+        let both = vec![
+            source(a.clone(), "home/x/a", Carry::Opaque),
+            source(b, "home/y/b", Carry::Opaque),
+        ];
+        stage(&both, &out, &mut RedactionCounts::new()).unwrap();
+        fs::write(out.join("home/x/.a.fabric-tmp-1-1"), b"cut").unwrap();
+        std::os::unix::fs::symlink(&a, out.join("home/x/link")).unwrap();
+        stage(
+            &[source(a, "home/x/a", Carry::Opaque)],
+            &out,
+            &mut RedactionCounts::new(),
+        )
+        .unwrap();
+        let mut left: Vec<String> = Vec::new();
+        let mut stack = vec![out.clone()];
+        while let Some(d) = stack.pop() {
+            for entry in fs::read_dir(&d).unwrap() {
+                let path = entry.unwrap().path();
+                left.push(path.strip_prefix(&out).unwrap().display().to_string());
+                if path.is_dir() {
+                    stack.push(path);
+                }
+            }
+        }
+        left.sort();
+        assert_eq!(left, ["home", "home/x", "home/x/a"]);
     }
 
     #[test]
