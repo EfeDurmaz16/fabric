@@ -80,7 +80,7 @@ impl Node {
                 out.say(format!("{}", self.id));
                 out.say(format!("listening on {}", self.local_addr()?));
             }
-            Request::NodeAdd { node, addr } => self.node_add(node, &addr, out).await?,
+            Request::NodeAdd { node, addr } => self.node_add(node, addr.as_deref(), out).await?,
             Request::NodeList => self.node_list(out),
             Request::NodePing { node } => self.node_ping(node, out).await?,
             Request::JobNew {
@@ -142,17 +142,31 @@ impl Node {
         Ok(None)
     }
 
-    async fn node_add(&self, node: NodeId, addr: &str, out: &mut Out) -> Result<(), NodeError> {
-        let addr: HostPort = addr.parse().map_err(|e| NodeError::Peer {
-            peer: node,
-            reason: format!("{addr} is not host:port: {e}"),
-        })?;
+    async fn node_add(
+        &self,
+        node: NodeId,
+        addr: Option<&str>,
+        out: &mut Out,
+    ) -> Result<(), NodeError> {
+        let addr: Option<HostPort> = addr
+            .map(|text| {
+                text.parse().map_err(|e| NodeError::Peer {
+                    peer: node,
+                    reason: format!("{text} is not host:port: {e}"),
+                })
+            })
+            .transpose()?;
         let peers = Arc::clone(&self.peers);
-        let shown = addr.to_string();
-        tokio::task::spawn_blocking(move || peers.update(|book| book.pair(node, Some(addr))))
+        let shown = addr.as_ref().map(ToString::to_string);
+        tokio::task::spawn_blocking(move || peers.update(|book| book.pair(node, addr)))
             .await
             .map_err(|e| NodeError::Task(e.to_string()))??;
-        out.say(format!("paired {node} at {shown}"));
+        out.say(match shown {
+            Some(addr) => format!("paired {node} at {addr}"),
+            None => format!(
+                "paired {node} with no address: it may dial this node, and this node never dials it"
+            ),
+        });
         Ok(())
     }
 

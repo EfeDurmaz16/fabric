@@ -84,12 +84,12 @@ enum Wire {
 enum NodeCommand {
     /// Print this node's id and address.
     Id,
-    /// Pair a node at an address.
+    /// Pair a node; give its address when this node can dial it.
     Add {
         /// The node's id, as `fabric node id` prints it there.
         node: NodeId,
-        /// Where it listens, `host:port`.
-        addr: String,
+        /// Where it listens, `host:port`; leave it out for a node behind a NAT that dials in.
+        addr: Option<String>,
     },
     /// List the paired nodes.
     Ls,

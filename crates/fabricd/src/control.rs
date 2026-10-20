@@ -26,12 +26,12 @@ pub const MAX_CONTROL_MESSAGE: usize = 4 << 20;
 pub enum Request {
     /// This node's id and listening address.
     NodeId,
-    /// Pairs a peer at an address (`host:port`).
+    /// Pairs a peer, at an address (`host:port`) when this node can dial it.
     NodeAdd {
         /// The peer.
         node: NodeId,
-        /// Where it listens.
-        addr: String,
+        /// Where it listens; `None` for a peer behind a NAT that only dials in.
+        addr: Option<String>,
     },
     /// The paired peers.
     NodeList,
