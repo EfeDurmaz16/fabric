@@ -39,7 +39,6 @@ use fabric_core::path::{PathError, RelPath};
 use fabric_core::snapshot::CacheClass;
 use toml::{Table, Value};
 
-use crate::detect::PackageManagerName;
 use crate::secret::{Pattern, PatternError};
 
 /// The directory that holds Fabric's own files in a workspace; never a cache.
@@ -181,9 +180,45 @@ pub enum OverrideError {
     },
 }
 
+/// A JavaScript package manager as package.json and the override file name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageManagerName {
+    /// npm.
+    Npm,
+    /// pnpm.
+    Pnpm,
+    /// Yarn, either line; the workspace decides which.
+    Yarn,
+    /// Bun.
+    Bun,
+}
+
+impl PackageManagerName {
+    /// Parses `npm`, `pnpm`, `yarn` or `bun`.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "npm" => Some(Self::Npm),
+            "pnpm" => Some(Self::Pnpm),
+            "yarn" => Some(Self::Yarn),
+            "bun" => Some(Self::Bun),
+            _ => None,
+        }
+    }
+
+    /// Returns the name as package.json writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Npm => "npm",
+            Self::Pnpm => "pnpm",
+            Self::Yarn => "yarn",
+            Self::Bun => "bun",
+        }
+    }
+}
+
 /// A cache path the user declares, with the class the store gives it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeclaredCache {
+pub(crate) struct DeclaredCache {
     /// The path, relative to the workspace root.
     pub path: RelPath,
     /// Its class for the snapshot policy.
@@ -191,8 +226,11 @@ pub struct DeclaredCache {
 }
 
 /// The parsed override file.
+///
+/// Crate-private: `detect` is its only reader, and its sorted, repeat-free
+/// lists are kept so by `parse`, not by the type.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EnvOverride {
+pub(crate) struct EnvOverride {
     /// The package manager to use when the workspace alone does not decide.
     pub package_manager: Option<PackageManagerName>,
     /// Names of environment variables the job needs, sorted; a repeat is refused.

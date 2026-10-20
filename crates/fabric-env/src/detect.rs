@@ -37,7 +37,9 @@ use fabric_core::path::RelPath;
 use fabric_core::snapshot::CacheClass;
 use toml::Table;
 
-use crate::overrides::{EnvOverride, OverrideError, canonical_tool, line_and_column};
+use crate::overrides::{
+    EnvOverride, OverrideError, PackageManagerName, canonical_tool, line_and_column,
+};
 use crate::secret::{Scope, SecretPolicy};
 
 /// Where the override file lives, relative to the workspace root.
@@ -170,42 +172,6 @@ pub enum DetectError {
         /// The name.
         name: &'static str,
     },
-}
-
-/// A JavaScript package manager as package.json and the override file name it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PackageManagerName {
-    /// npm.
-    Npm,
-    /// pnpm.
-    Pnpm,
-    /// Yarn, either line; the workspace decides which.
-    Yarn,
-    /// Bun.
-    Bun,
-}
-
-impl PackageManagerName {
-    /// Parses `npm`, `pnpm`, `yarn` or `bun`.
-    pub fn parse(text: &str) -> Option<Self> {
-        match text {
-            "npm" => Some(Self::Npm),
-            "pnpm" => Some(Self::Pnpm),
-            "yarn" => Some(Self::Yarn),
-            "bun" => Some(Self::Bun),
-            _ => None,
-        }
-    }
-
-    /// Returns the name as package.json writes it.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Npm => "npm",
-            Self::Pnpm => "pnpm",
-            Self::Yarn => "yarn",
-            Self::Bun => "bun",
-        }
-    }
 }
 
 /// A JavaScript package manager, resolved to the line whose install command differs.
