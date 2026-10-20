@@ -305,6 +305,7 @@ impl Node {
                     drop(job);
                     tracing::info!(job = %offer.job_id, move_id = %offer.move_id, "imported");
                     if faults::hit(Point::AfterImportReceipt).await == Some(Action::Drop) {
+                        tracing::warn!(job = %offer.job_id, "fault: dropping the answer to the offer");
                         if let Some(session) = self.open_session(peer) {
                             session.close();
                         }
