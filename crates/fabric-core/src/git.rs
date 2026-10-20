@@ -264,7 +264,7 @@ pub enum GitConfigKey {
     RemotePushUrl(RemoteName),
     /// `remote.<name>.fetch`.
     RemoteFetch(RemoteName),
-    /// `branch.<name>.remote`.
+    /// `branch.<name>.remote`; it may hold a URL, and a credential in one is stripped at capture and refused on decode.
     BranchRemote(BranchName),
     /// `branch.<name>.merge`.
     BranchMerge(BranchName),
@@ -281,12 +281,17 @@ pub enum GitConfigKey {
 }
 
 impl GitConfigKey {
-    /// Returns true for the keys whose value is a remote URL, which must carry no credential.
+    /// Returns true for the keys whose value is or may be a remote URL, which must carry no credential.
+    ///
+    /// `branch.<name>.remote` usually names a remote, but git also takes a
+    /// URL there as the repository to fetch from and push to.
     #[must_use]
     pub const fn is_remote_url(&self) -> bool {
         matches!(
             self,
-            GitConfigKey::RemoteUrl(_) | GitConfigKey::RemotePushUrl(_)
+            GitConfigKey::RemoteUrl(_)
+                | GitConfigKey::RemotePushUrl(_)
+                | GitConfigKey::BranchRemote(_)
         )
     }
 
@@ -476,6 +481,11 @@ mod tests {
         );
         assert!(
             GitConfigKey::parse("remote.origin.pushurl")
+                .unwrap()
+                .is_remote_url()
+        );
+        assert!(
+            GitConfigKey::parse("branch.main.remote")
                 .unwrap()
                 .is_remote_url()
         );
