@@ -71,7 +71,7 @@ fn next_plan(root: &Path) -> TestResult<Plan> {
     let started = Instant::now();
     let lock = loop {
         match TreeLock::acquire(&locks(), root) {
-            Err(MaterializeError::InstallerRunning { .. }) if started.elapsed() < PATIENCE => {
+            Err(MaterializeError::TreeBusy { .. }) if started.elapsed() < PATIENCE => {
                 thread::sleep(Duration::from_millis(20));
             }
             other => break other?,
@@ -205,7 +205,7 @@ args = ["-c", "touch started; while [ ! -e release ]; do sleep 0.02; done; mkdir
     let refused = || {
         matches!(
             TreeLock::acquire(&locks(), dir.path()),
-            Err(MaterializeError::InstallerRunning { .. })
+            Err(MaterializeError::TreeBusy { .. })
         )
     };
     assert!(refused());

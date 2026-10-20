@@ -105,13 +105,13 @@ const OUTPUT_GRACE: Duration = Duration::from_secs(1);
 /// Why materialize could not plan or finish.
 #[derive(Debug, thiserror::Error)]
 pub enum MaterializeError {
-    /// A setup step started by an earlier resume still holds the tree's lock; nothing was restored, planned or run.
+    /// Another resume, or a setup step one started, holds the tree's lock; nothing was restored, planned or run.
     #[error(
-        "a setup step from an earlier resume is still running in this workspace; wait for it to exit or stop the process that holds `{}` open",
+        "another resume, or a setup step one started, holds this workspace; wait for it to finish or stop the process that holds `{}` open",
         lock.display()
     )]
-    InstallerRunning {
-        /// The lock file the step holds open.
+    TreeBusy {
+        /// The lock file the holder has open.
         lock: PathBuf,
     },
     /// The lock file could not be opened, created or locked.
@@ -443,8 +443,8 @@ impl TreeLock {
     /// Takes the lock for the workspace at `root` in `locks`, a directory of this node's Fabric state, creating it when absent.
     ///
     /// The root must exist: the caller creates it, takes the lock, and only
-    /// then restores into it. Refuses with `InstallerRunning` while a step
-    /// an earlier resume started still runs in that tree, whatever has
+    /// then restores into it. Refuses with `TreeBusy` while another resume
+    /// holds the tree, or a step one started still runs in it, whatever has
     /// happened to the files in the tree since.
     pub fn acquire(locks: &Path, root: &Path) -> Result<Self, MaterializeError> {
         let root_err = |source| MaterializeError::Root {
@@ -478,14 +478,9 @@ impl TreeLock {
             })?;
         match file.try_lock() {
             Ok(()) => Ok(Self { root, file }),
-            Err(TryLockError::WouldBlock) => Err(MaterializeError::InstallerRunning { lock: path }),
+            Err(TryLockError::WouldBlock) => Err(MaterializeError::TreeBusy { lock: path }),
             Err(TryLockError::Error(source)) => Err(MaterializeError::Lock { lock: path, source }),
         }
-    }
-
-    /// Returns the workspace root the lock was taken for, resolved.
-    pub fn root(&self) -> &Path {
-        &self.root
     }
 
     /// Refuses when the lock was taken for another tree than `root`.
