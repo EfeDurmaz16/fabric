@@ -29,8 +29,18 @@ pub enum Outcome {
     Fallback,
     /// The move goes ahead; the user should know.
     Warn,
-    /// The move stops unless `--force` turns this into a warning.
-    Refuse,
+    /// The move stops, unless the waiver lets `--force` turn this into a warning.
+    Refuse(Waiver),
+}
+
+/// Whether `--force` can turn a refusal into a warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Waiver {
+    /// It can.
+    Force,
+    /// It cannot: the move would land on a root that does not exist, or
+    /// on a node that cannot run the job's harness (ADR 0008).
+    Never,
 }
 
 impl fmt::Display for Outcome {
@@ -39,7 +49,7 @@ impl fmt::Display for Outcome {
             Outcome::Equal => "ok",
             Outcome::Fallback => "rebuild",
             Outcome::Warn => "warn",
-            Outcome::Refuse => "refuse",
+            Outcome::Refuse(_) => "refuse",
         })
     }
 }
@@ -55,8 +65,6 @@ pub struct Row {
     pub peer: Option<String>,
     /// What it means.
     pub outcome: Outcome,
-    /// Whether `--force` can turn a refusal into a warning.
-    pub forceable: bool,
     /// Why, in one sentence.
     pub note: String,
 }
@@ -121,7 +129,6 @@ fn row(
         here: h,
         peer: p,
         outcome,
-        forceable: true,
         note: if outcome == Outcome::Equal {
             String::new()
         } else {
@@ -135,15 +142,13 @@ fn row(
 pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row> {
     let mut rows = Vec::new();
     for fact in [name::USER, name::HOME] {
-        let mut r = row(
+        rows.push(row(
             fact,
             here,
             peer,
-            Outcome::Refuse,
+            Outcome::Refuse(Waiver::Never),
             "the root would differ and nothing rewrites paths in this phase (ADR 0011)",
-        );
-        r.forceable = false;
-        rows.push(r);
+        ));
     }
     rows.push(row(
         name::OS,
@@ -218,7 +223,6 @@ pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row
         here: Some("dialed".to_owned()),
         peer: ctx.wire.clone(),
         outcome: Outcome::Equal,
-        forceable: true,
         note: "the wire this session runs on".to_owned(),
     });
     rows
@@ -243,7 +247,11 @@ fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Ro
             version,
             here,
             peer,
-            if used { Outcome::Refuse } else { Outcome::Warn },
+            if used {
+                Outcome::Refuse(Waiver::Force)
+            } else {
+                Outcome::Warn
+            },
             if used {
                 "the job's harness must be the same version on both nodes (ADR 0008)"
             } else {
@@ -265,11 +273,10 @@ fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Ro
             here: value(here, login),
             peer: value(peer, login),
             outcome: if refused {
-                Outcome::Refuse
+                Outcome::Refuse(Waiver::Never)
             } else {
                 Outcome::Equal
             },
-            forceable: false,
             note: if refused {
                 "the target has no login for the job's harness; log in there first".to_owned()
             } else {
@@ -305,11 +312,10 @@ fn synced_row(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Row {
         here: show(here),
         peer: show(peer),
         outcome: if refusal.is_some() {
-            Outcome::Refuse
+            Outcome::Refuse(Waiver::Force)
         } else {
             Outcome::Equal
         },
-        forceable: true,
         note: refusal.map(|e| e.to_string()).unwrap_or_default(),
     }
 }
@@ -323,7 +329,6 @@ fn clock_row(ctx: &Context<'_>) -> Row {
         here: Some("the reference".to_owned()),
         peer: ctx.clock_skew_ms.map(|ms| format!("{ms} ms from here")),
         outcome: if over { Outcome::Warn } else { Outcome::Equal },
-        forceable: true,
         note: if over {
             "above 5 s; Cargo and other mtime-keyed caches may rebuild".to_owned()
         } else {
@@ -336,7 +341,11 @@ fn clock_row(ctx: &Context<'_>) -> Row {
 #[must_use]
 pub fn blocking(rows: &[Row], force: bool) -> Vec<&Row> {
     rows.iter()
-        .filter(|r| r.outcome == Outcome::Refuse && !(force && r.forceable))
+        .filter(|r| match r.outcome {
+            Outcome::Refuse(Waiver::Never) => true,
+            Outcome::Refuse(Waiver::Force) => !force,
+            Outcome::Equal | Outcome::Fallback | Outcome::Warn => false,
+        })
         .collect()
 }
 
@@ -424,13 +433,13 @@ mod tests {
                 "user",
                 &[(name::USER, Some("other"))],
                 None,
-                Outcome::Refuse,
+                Outcome::Refuse(Waiver::Never),
             ),
             (
                 "home",
                 &[(name::HOME, Some("/home/x"))],
                 None,
-                Outcome::Refuse,
+                Outcome::Refuse(Waiver::Never),
             ),
             (
                 "pnpm.version",
@@ -478,13 +487,13 @@ mod tests {
                 "claude.version",
                 &[(name::CLAUDE, Some("2.1.199"))],
                 Some(&claude),
-                Outcome::Refuse,
+                Outcome::Refuse(Waiver::Force),
             ),
             (
                 "claude.login",
                 &[(name::CLAUDE_LOGIN, Some("no"))],
                 Some(&claude),
-                Outcome::Refuse,
+                Outcome::Refuse(Waiver::Never),
             ),
             (
                 "codex.version",
@@ -533,7 +542,7 @@ mod tests {
         context.root = Some(root);
         assert_eq!(
             outcome_of(&compare(&pro(), &peer, &context), "icloud"),
-            Outcome::Refuse
+            Outcome::Refuse(Waiver::Force)
         );
         context.target = Target::Here;
         assert_eq!(
