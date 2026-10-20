@@ -1252,7 +1252,9 @@ fn strip_userinfo(url: &str) -> Option<String> {
 /// Captures the workspace described by `req` into `store` and returns the manifest.
 ///
 /// The manifest is not yet published; the caller does that with
-/// `Store::publish`, so the ledger can be the commit point (ADR 0004).
+/// `Store::publish`, so the ledger can be the commit point (ADR 0004), and
+/// runs no `Store::gc` in between, since gc may remove an object the
+/// manifest reuses.
 pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, CaptureError> {
     let root_text = req.root.to_str().ok_or_else(|| CaptureError::BadRoot {
         path: req.root.to_owned(),

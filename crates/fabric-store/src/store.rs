@@ -370,6 +370,10 @@ impl Store {
     /// later pass once the stamp is `grace` old; its row goes before its
     /// file. An object file with no row at all, left by a publish that did
     /// not reach the catalog, is removed once its mtime is `grace` old.
+    ///
+    /// gc must not run between a capture and the publish of its manifest:
+    /// capture can reuse an object that has no row without refreshing its
+    /// mtime, so gc may remove it, and publish then fails with `MissingChunk`.
     pub fn gc(&mut self, now: SystemTime, grace: Duration) -> Result<GcReport, StoreError> {
         let mut report = GcReport {
             removed_tmp: self.objects.clear_tmp()?,
