@@ -212,11 +212,18 @@ impl GitConfigValue {
         Ok(Self(text.to_owned()))
     }
 
-    /// Returns true when the value is a `scheme://` URL whose authority holds
-    /// a credential, by the rule of `credential_range`.
+    /// Returns true when the value is a `scheme://` URL that can carry a
+    /// credential: its authority holds one by the rule of `credential_range`,
+    /// or it has a query or a fragment, where a token such as
+    /// `?access_token=` travels. No part of a query is known to be safe, so
+    /// the whole value is treated as secret.
     #[must_use]
     pub fn has_credential(&self) -> bool {
         credential_range(&self.0).is_some()
+            || self
+                .0
+                .split_once("://")
+                .is_some_and(|(_, rest)| rest.contains(['?', '#']))
     }
 }
 
@@ -457,7 +464,9 @@ mod tests {
         assert!(with("ssh://git:hunter2@github.com/x/y.git"));
         assert!(with("git+ssh://git:hunter2@github.com/x/y.git"));
         assert!(!with("https://github.com/x/y.git"));
-        assert!(!with("https://github.com/x/y.git?u=a@b"));
+        assert!(with("https://github.com/x/y.git?u=a@b"));
+        assert!(with("https://example.com/x.git?access_token=sekrit"));
+        assert!(with("https://example.com/x.git#sekrit"));
         assert!(!with("git@github.com:x/y.git"));
         assert!(!with("/srv/git/y.git"));
         assert!(
