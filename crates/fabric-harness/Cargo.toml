@@ -39,16 +39,6 @@ tempfile = "3.27"
 tokio = { version = "1.54", features = ["macros", "rt-multi-thread"] }
 zstd = "0.14"
 
-# A fake ACP agent the integration tests start as a subprocess. It is a test
-# fixture, built only so `CARGO_BIN_EXE_fake-acp-agent` exists for the tests.
-[[bin]]
-name = "fake-acp-agent"
-path = "fixtures/fake_acp_agent/main.rs"
-test = false
-doc = false
-bench = false
-required-features = ["acp"]
-
 [[test]]
 name = "acp_roundtrip"
 required-features = ["acp"]

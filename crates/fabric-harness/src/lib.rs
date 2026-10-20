@@ -21,16 +21,22 @@
 //! adapters behind cargo features: [`acp`], [`claude`] and [`codex`].
 //! [`manifest::StateManifest`] is the file that travels between the two.
 
+mod crashpoint;
 pub mod denylist;
 pub(crate) mod departure;
+pub(crate) mod durable;
 mod error;
-pub(crate) mod files;
 mod harness;
 pub(crate) mod jsontext;
 pub mod manifest;
+pub(crate) mod markers;
+#[cfg(any(feature = "acp", feature = "claude", feature = "codex"))]
+pub(crate) mod pipeline;
+pub(crate) mod place;
 pub(crate) mod process;
 pub(crate) mod redact;
 mod session;
+pub(crate) mod stage;
 
 #[cfg(feature = "acp")]
 pub mod acp;
@@ -39,7 +45,7 @@ pub mod claude;
 #[cfg(feature = "codex")]
 pub mod codex;
 
-pub use error::{BadRule, HarnessError};
+pub use error::{BadRule, HarnessError, Input, IoOp};
 pub use harness::{
     Harness, Installed, Launch, MAX_MODEL_NAME_LEN, ModelName, ModelNameError, Restored, Running,
 };

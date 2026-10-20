@@ -1,11 +1,13 @@
-//! A fake ACP agent for the integration tests.
+//! A fake ACP agent for the integration tests. `acp_roundtrip` starts its
+//! own test binary as the agent, which then runs `serve` instead of a test.
 //!
 //! It speaks the ACP v1 baseline over stdio, keeps one JSON file per
 //! session under `FAKE_STATE_DIR`, and lets the tests shape its
 //! capabilities through environment variables:
 //! `FAKE_LOAD=0` drops `loadSession`, `FAKE_RESUME=1` advertises
 //! `session/resume`, `FAKE_ASK_PERMISSION=1` asks for permission on every
-//! prompt, `FAKE_PID_FILE` names a file it writes its pid to, and
+//! prompt, `FAKE_PID_FILE` names a file it writes its pid to,
+//! `FAKE_ENV_FILE` names a file it writes the names of its environment to, and
 //! `FAKE_LINGER=1` keeps it alive after its stdin closes, as a hung agent
 //! would.
 
@@ -232,11 +234,17 @@ fn run() -> std::io::Result<()> {
     Ok(())
 }
 
-fn main() -> std::process::ExitCode {
-    if let Some(path) = std::env::var_os("FAKE_PID_FILE")
-        && std::fs::write(path, std::process::id().to_string()).is_err()
-    {
-        return std::process::ExitCode::FAILURE;
+/// Runs the agent until its stdin closes; with `FAKE_LINGER=1` it then
+/// sleeps forever, as a hung agent would.
+pub fn serve() -> std::io::Result<()> {
+    if let Some(path) = std::env::var_os("FAKE_PID_FILE") {
+        std::fs::write(path, std::process::id().to_string())?;
+    }
+    if let Some(path) = std::env::var_os("FAKE_ENV_FILE") {
+        let names: Vec<String> = std::env::vars_os()
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        std::fs::write(path, names.join("\n"))?;
     }
     let result = run();
     if env_flag("FAKE_LINGER", false) {
@@ -244,8 +252,5 @@ fn main() -> std::process::ExitCode {
             std::thread::sleep(std::time::Duration::from_mins(1));
         }
     }
-    match result {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(_) => std::process::ExitCode::FAILURE,
-    }
+    result
 }

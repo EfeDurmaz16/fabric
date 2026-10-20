@@ -1,8 +1,10 @@
 //! Crash tests: a capture or a restore runs in a child process that the
-//! `crashpoints` feature aborts at a named step, after the Nth file it
-//! stages or places. After the abort nothing half written may pass for
-//! state: no manifest is left that a fresh node would accept, every placed
-//! file is whole, and running the same operation again converges. A
+//! `crashpoints` feature kills with `SIGKILL` at a named step, after the
+//! Nth file it stages or places, or after it records a pending departure.
+//! After the kill nothing half written may pass for state: no manifest is
+//! left that a fresh node would accept, every placed file is whole, a
+//! departure that never left moves nothing forward, and running the same
+//! operation again converges. A
 //! process that dies between a rename and the directory fsync loses
 //! nothing, because the page cache outlives it, so that window needs a
 //! power cut, not a kill, and is not tested here.
@@ -13,8 +15,8 @@
     reason = "a failed unwrap inside a test is the test failing"
 )]
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::fmt::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 
@@ -24,7 +26,7 @@ use fabric_harness::manifest::StateManifest;
 use fabric_harness::{Harness, SessionId};
 
 mod common;
-use common::{fake_claude, project_key};
+use common::{abs, fake_claude, project_key};
 
 const SID: &str = "7a1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
 const THREAD: &str = "019f233e-bb33-7342-85fa-f2d33b14368a";
@@ -45,7 +47,20 @@ fn session() -> SessionId {
 /// The adapter for `home`, finding the fake `claude` kept under it.
 fn node(home: &Path) -> ClaudeCode {
     let (_, path_var) = fake_claude(home);
-    ClaudeCode::new(home.to_path_buf(), path_var)
+    ClaudeCode::new(abs(home), path_var)
+}
+
+/// The Codex adapter for `home`, with a fake `codex` that reports the
+/// version whose writer lock the adapter trusts.
+fn codex_node(home: &Path) -> Codex {
+    let bin = home.join("codex-bin");
+    let script = bin.join("codex");
+    if !script.exists() {
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(&script, "#!/bin/sh\necho \"codex-cli 0.155.1\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    Codex::new(abs(home), bin.into_os_string())
 }
 
 /// Moves `.claude` to `aside` and leaves a node where Claude is installed
@@ -124,7 +139,7 @@ fn build_codex_home(home: &Path) -> PathBuf {
 }
 
 /// Runs `role` in a child process with `crashpoint` set; returns true when
-/// the child aborted (SIGABRT), which only the crash point does.
+/// the child died of `SIGKILL`, which only the crash point sends.
 fn run_child(role: &str, home: &Path, work: &Path, out: &Path, crashpoint: &str) -> bool {
     let exe = std::env::current_exe().unwrap();
     let status = std::process::Command::new(exe)
@@ -138,7 +153,7 @@ fn run_child(role: &str, home: &Path, work: &Path, out: &Path, crashpoint: &str)
         .stderr(std::process::Stdio::null())
         .status()
         .unwrap();
-    status.signal() == Some(6)
+    status.signal() == Some(9)
 }
 
 /// The child's body; a no-op unless the parent set the role.
@@ -163,10 +178,7 @@ fn crash_child() {
                 node(&home).restore(&work, &out).await.unwrap();
             }
             "codex-restore" => {
-                Codex::new(home, OsString::new())
-                    .restore(&work, &out)
-                    .await
-                    .unwrap();
+                codex_node(&home).restore(&work, &out).await.unwrap();
             }
             other => panic!("unknown role {other}"),
         }
@@ -214,7 +226,7 @@ fn staged_by_destination(home: &Path, out: &Path) -> BTreeMap<PathBuf, Vec<u8>> 
 }
 
 #[tokio::test]
-async fn a_capture_aborted_after_any_staged_file_leaves_no_manifest() {
+async fn a_capture_killed_after_any_staged_file_leaves_no_manifest() {
     let home_dir = tempfile::tempdir().unwrap();
     let home = home_dir.path().canonicalize().unwrap();
     let work = build_home(&home);
@@ -256,7 +268,7 @@ async fn a_capture_aborted_after_any_staged_file_leaves_no_manifest() {
 }
 
 #[tokio::test]
-async fn a_restore_aborted_after_any_placed_file_leaves_whole_files_and_converges() {
+async fn a_restore_killed_after_any_placed_file_leaves_whole_files_and_converges() {
     let home_dir = tempfile::tempdir().unwrap();
     let home = home_dir.path().canonicalize().unwrap();
     let work = build_home(&home);
@@ -275,16 +287,16 @@ async fn a_restore_aborted_after_any_placed_file_leaves_whole_files_and_converge
         }
         let point = format!("place-after-file:{index}");
         assert!(run_child("restore", &home, &work, out.path(), &point));
-        let after_abort: BTreeMap<PathBuf, Vec<u8>> = regular_files(&projects)
+        let after_kill: BTreeMap<PathBuf, Vec<u8>> = regular_files(&projects)
             .into_iter()
             .filter(|(p, _)| !is_temp(p))
             .collect();
         assert_eq!(
-            after_abort.len(),
+            after_kill.len(),
             index + 1,
             "after {point} exactly the files up to it are placed"
         );
-        for (path, bytes) in &after_abort {
+        for (path, bytes) in &after_kill {
             assert_eq!(
                 staged.get(path),
                 Some(bytes),
@@ -302,13 +314,56 @@ async fn a_restore_aborted_after_any_placed_file_leaves_whole_files_and_converge
 }
 
 #[tokio::test]
-async fn a_codex_restore_aborted_mid_way_frees_the_writer_lock_and_converges() {
+async fn a_capture_killed_before_its_publish_leaves_memory_edited_since_alone() {
+    // Snapshot 1 left and was confirmed. MEMORY.md was then edited here,
+    // and a second capture died after recording it, before any publish.
+    // A restore of snapshot 1 must not take the edit for bytes that left.
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = home_dir.path().canonicalize().unwrap();
+    let work = build_home(&home);
+    let memory = home
+        .join(".claude/projects")
+        .join(project_key(&work))
+        .join("memory/MEMORY.md");
+    std::fs::create_dir_all(memory.parent().unwrap()).unwrap();
+    std::fs::write(&memory, "# memory\n").unwrap();
+    let out_1 = tempfile::tempdir().unwrap();
+    let sent = node(&home)
+        .capture(&work, &session(), out_1.path())
+        .await
+        .unwrap();
+    node(&home).confirm_departure(&sent).await.unwrap();
+
+    std::fs::write(&memory, "# memory\nedited after the job left\n").unwrap();
+    let out_2 = tempfile::tempdir().unwrap();
+    assert!(run_child(
+        "capture",
+        &home,
+        &work,
+        out_2.path(),
+        "capture-after-departure:0"
+    ));
+    assert!(!out_2.path().join("manifest.json").exists());
+
+    let err = node(&home).restore(&work, out_1.path()).await.unwrap_err();
+    assert!(
+        matches!(err, fabric_harness::HarnessError::StateDiverged { ref path } if path == &memory),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&memory).unwrap(),
+        "# memory\nedited after the job left\n"
+    );
+}
+
+#[tokio::test]
+async fn a_codex_restore_killed_mid_way_frees_the_writer_lock_and_converges() {
     let home_dir = tempfile::tempdir().unwrap();
     let home = home_dir.path().canonicalize().unwrap();
     let work = build_codex_home(&home);
     let thread = SessionId::parse(THREAD).unwrap();
     let out = tempfile::tempdir().unwrap();
-    let adapter = Codex::new(home.clone(), OsString::new());
+    let adapter = codex_node(&home);
     adapter.capture(&work, &thread, out.path()).await.unwrap();
     let source = regular_files(&home.join(".codex/sessions"));
     std::fs::rename(home.join(".codex"), home.join(".codex-source")).unwrap();
@@ -327,7 +382,7 @@ async fn a_codex_restore_aborted_mid_way_frees_the_writer_lock_and_converges() {
         .count();
     assert_eq!(placed, 1, "only the first rollout was placed");
 
-    // The aborted process held Codex's thread lock; its death released it.
+    // The killed process held Codex's thread lock; its death released it.
     let restored = adapter.restore(&work, out.path()).await.unwrap();
     assert_eq!(restored.placed.len(), 2);
     for path in &restored.placed {

@@ -64,6 +64,13 @@ impl SessionId {
         Ok(Self(text.to_owned()))
     }
 
+    /// The id of a UUID, in its hyphenated form: hex digits and `-`,
+    /// starting with a digit or a letter, which the rules always accept.
+    #[cfg(feature = "claude")]
+    pub(crate) fn from_uuid(uuid: uuid::Uuid) -> Self {
+        Self(uuid.hyphenated().to_string())
+    }
+
     /// Returns the id text.
     #[must_use]
     pub fn as_str(&self) -> &str {

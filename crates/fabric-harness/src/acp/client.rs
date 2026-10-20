@@ -3,9 +3,12 @@
 //! Invariant: the client speaks only the baseline of ACP schema v1
 //! (`initialize`, `session/new`, `session/load`, `session/resume`,
 //! `session/prompt`, `session/cancel`, `session/update`), answers every
-//! agent request so the agent never blocks, never drops a `session/update`,
-//! and grants a permission only when the policy the caller chose says so,
-//! never more than it says. Deny is the default. A handshake request has a
+//! agent request so the agent never blocks, and grants a permission only
+//! when the policy the caller chose says so, never more than it says. Deny
+//! is the default. At most `UPDATE_BUFFER` `session/update` notifications
+//! wait for `next_update`; newer ones are dropped and counted in
+//! `dropped_updates`, so the reader never waits on a caller who is not
+//! draining updates. A handshake request has a
 //! deadline, so a hung agent cannot hang `launch`. Every message reaches
 //! the agent as one whole line written by a single writer task, so a
 //! caller that drops a request mid-way cannot leave half a line on the
@@ -21,6 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use fabric_core::path::AbsPath;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -85,10 +89,6 @@ pub struct AgentCapabilities {
     pub load_session: bool,
     /// `agentCapabilities.sessionCapabilities.resume` is present.
     pub resume: bool,
-    /// `agentInfo.name`, when sent.
-    pub name: Option<String>,
-    /// `agentInfo.version`, when sent.
-    pub version: Option<String>,
 }
 
 /// Why a prompt turn ended.
@@ -173,7 +173,6 @@ struct Inner {
     next_id: AtomicU64,
     updates: tokio::sync::Mutex<mpsc::Receiver<SessionUpdate>>,
     dropped_updates: Arc<AtomicU64>,
-    capabilities: Mutex<Option<AgentCapabilities>>,
     reader: JoinHandle<()>,
 }
 
@@ -433,7 +432,6 @@ impl AcpClient {
                 next_id: AtomicU64::new(1),
                 updates: tokio::sync::Mutex::new(rx),
                 dropped_updates,
-                capabilities: Mutex::new(None),
                 reader,
             }),
         }
@@ -476,7 +474,7 @@ impl AcpClient {
         write_line(&self.inner.outgoing, &message)
     }
 
-    /// Sends `initialize` and records what the agent can do.
+    /// Sends `initialize` and returns what the agent can do.
     pub async fn initialize(&self) -> Result<AgentCapabilities, AcpError> {
         let result = self
             .handshake(
@@ -512,31 +510,17 @@ impl AcpClient {
                 .and_then(|c| c.get("sessionCapabilities"))
                 .and_then(|s| s.get("resume"))
                 .is_some_and(|r| !r.is_null()),
-            name: result
-                .pointer("/agentInfo/name")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            version: result
-                .pointer("/agentInfo/version")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
         };
-        if let Ok(mut guard) = self.inner.capabilities.lock() {
-            *guard = Some(capabilities.clone());
-        }
         Ok(capabilities)
     }
 
-    /// What `initialize` returned, if it has run.
-    #[must_use]
-    pub fn capabilities(&self) -> Option<AgentCapabilities> {
-        self.inner.capabilities.lock().ok().and_then(|g| g.clone())
-    }
-
     /// Sends `session/new` for `cwd` and returns the new session id.
-    pub async fn new_session(&self, cwd: &str) -> Result<SessionId, AcpError> {
+    pub async fn new_session(&self, cwd: &AbsPath) -> Result<SessionId, AcpError> {
         let result = self
-            .handshake("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
+            .handshake(
+                "session/new",
+                json!({ "cwd": cwd.as_str(), "mcpServers": [] }),
+            )
             .await?;
         let id = result
             .get("sessionId")
@@ -546,20 +530,20 @@ impl AcpClient {
     }
 
     /// Sends `session/load`; the agent replays history as updates.
-    pub async fn load_session(&self, session: &SessionId, cwd: &str) -> Result<(), AcpError> {
+    pub async fn load_session(&self, session: &SessionId, cwd: &AbsPath) -> Result<(), AcpError> {
         self.handshake(
             "session/load",
-            json!({ "sessionId": session.as_str(), "cwd": cwd, "mcpServers": [] }),
+            json!({ "sessionId": session.as_str(), "cwd": cwd.as_str(), "mcpServers": [] }),
         )
         .await?;
         Ok(())
     }
 
     /// Sends `session/resume`; no replay.
-    pub async fn resume_session(&self, session: &SessionId, cwd: &str) -> Result<(), AcpError> {
+    pub async fn resume_session(&self, session: &SessionId, cwd: &AbsPath) -> Result<(), AcpError> {
         self.handshake(
             "session/resume",
-            json!({ "sessionId": session.as_str(), "cwd": cwd, "mcpServers": [] }),
+            json!({ "sessionId": session.as_str(), "cwd": cwd.as_str(), "mcpServers": [] }),
         )
         .await?;
         Ok(())

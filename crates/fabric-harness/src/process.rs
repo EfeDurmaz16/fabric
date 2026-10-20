@@ -1,10 +1,22 @@
 //! Finding, probing and starting harness binaries.
 //!
-//! Invariant: a harness starts in its own process group with exactly the
-//! environment the caller passed, never through a shell, so the supervisor
-//! can fence the whole group (ADR 0003) and no variable of the calling
-//! process leaks into it. A question about running processes fails closed:
+//! Invariant: a harness starts in its own process group with the
+//! environment the caller passed minus the parent-session markers of
+//! `markers`, never through a shell, so the supervisor can fence the whole
+//! group (ADR 0003), no variable of the calling process leaks into it, and
+//! no Claude Code or Codex session this process runs under claims it as a
+//! child. A version probe runs with this process's environment minus the
+//! same markers, so even that one short call is no child of a host
+//! session. A question about running processes fails closed:
 //! when `pgrep` or `ps` cannot answer, the caller is told so, never "none".
+//! `ps`, `pgrep` and `kill` are run from their system paths, never looked
+//! up on this process's `PATH`, so a planted `ps` cannot report a live
+//! writer as gone. A question about running processes includes the
+//! processes this one runs under: BSD `pgrep` on macOS leaves out its own
+//! ancestors unless given `-a` (pgrep(1)), and when Fabric runs from a
+//! Claude Code session the host `claude` is one of them. procps `pgrep` on
+//! Linux includes ancestors already, and there `-a` changes the output, so
+//! the flag is passed on macOS only.
 
 #![cfg_attr(
     not(all(feature = "acp", feature = "claude", feature = "codex")),
@@ -26,9 +38,38 @@ use tokio::process::{Child, Command};
 
 use crate::error::HarnessError;
 use crate::harness::{Installed, Launch};
+use crate::markers;
 
 /// How long a version probe may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Where macOS and Linux keep `ps`.
+const PS: &[&str] = &["/bin/ps", "/usr/bin/ps"];
+/// Where macOS and Linux keep `pgrep`.
+const PGREP: &[&str] = &["/usr/bin/pgrep", "/bin/pgrep"];
+/// Where macOS and Linux keep `kill`.
+const KILL: &[&str] = &["/bin/kill", "/usr/bin/kill"];
+/// The `pgrep` flag that keeps the caller's ancestors in the answer.
+#[cfg(target_os = "macos")]
+const PGREP_WITH_ANCESTORS: &[&str] = &["-a"];
+/// procps `pgrep` keeps ancestors without a flag.
+#[cfg(not(target_os = "macos"))]
+const PGREP_WITH_ANCESTORS: &[&str] = &[];
+
+/// The first of `candidates` that is an executable file.
+fn system_tool(
+    program: &'static str,
+    candidates: &'static [&'static str],
+) -> Result<&'static Path, HarnessError> {
+    candidates
+        .iter()
+        .map(|candidate| Path::new(*candidate))
+        .find(|path| is_executable(path))
+        .ok_or_else(|| HarnessError::ProcessQuery {
+            program,
+            reason: format!("not found at {}", candidates.join(" or ")),
+        })
+}
 
 /// Looks `name` up on the given `PATH` value, as a shell would.
 #[must_use]
@@ -42,11 +83,29 @@ fn is_executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// Runs `binary args...` and returns trimmed stdout, within `PROBE_TIMEOUT`.
-pub(crate) async fn probe(binary: &Path, args: &[&str]) -> Result<String, HarnessError> {
+/// This process's environment, as far as its names and values are text
+/// a launch env can hold.
+fn own_env() -> Vec<(EnvVarName, String)> {
+    std::env::vars_os()
+        .filter_map(|(name, value)| {
+            let name = EnvVarName::parse(name.to_str()?).ok()?;
+            Some((name, value.into_string().ok()?))
+        })
+        .collect()
+}
+
+/// Runs `binary args...` with `env` minus its parent-session markers and
+/// returns trimmed stdout, within `PROBE_TIMEOUT`.
+async fn probe(
+    binary: &Path,
+    args: &[&str],
+    env: &[(EnvVarName, String)],
+) -> Result<String, HarnessError> {
     let program = binary.display().to_string();
     let run = Command::new(binary)
         .args(args)
+        .env_clear()
+        .envs(markers::child_env(env))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -72,12 +131,24 @@ pub(crate) async fn detect(binary: Option<PathBuf>) -> Result<Option<Installed>,
     let Some(path) = binary else {
         return Ok(None);
     };
-    let raw = probe(&path, &["--version"]).await?;
+    let raw = probe(&path, &["--version"], &own_env()).await?;
     Ok(Some(Installed {
         version: version_token(&raw).map(str::to_owned),
         raw,
         path,
     }))
+}
+
+/// The version `binary` reports, or `None` when there is no binary or the
+/// probe fails; a failed probe is logged, never fatal.
+pub(crate) async fn installed_version(binary: Option<PathBuf>, program: &str) -> Option<String> {
+    match detect(binary).await {
+        Ok(installed) => installed.and_then(|i| i.version),
+        Err(e) => {
+            tracing::warn!(program, error = %e, "version probe failed");
+            None
+        }
+    }
 }
 
 /// Returns the first token of `output` that looks like `digits.digits...`.
@@ -114,8 +185,9 @@ impl From<&Launch> for Wiring {
     }
 }
 
-/// Starts `binary args...` in `cwd`, in a new process group, with exactly
-/// `env`, and the stdio `wiring` asks for. Returns the child and its pid.
+/// Starts `binary args...` in `cwd`, in a new process group, with `env`
+/// minus its parent-session markers, and the stdio `wiring` asks for.
+/// Returns the child and its pid.
 pub(crate) fn spawn(
     binary: &Path,
     args: &[String],
@@ -128,7 +200,7 @@ pub(crate) fn spawn(
         .args(args)
         .current_dir(cwd)
         .env_clear()
-        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .envs(markers::child_env(env))
         .process_group(0)
         .kill_on_drop(false);
     match wiring {
@@ -166,7 +238,7 @@ pub(crate) fn spawn(
 /// Sends `SIGKILL` to the process group `pgid` through `kill(1)`; the
 /// crate forbids unsafe code, so it does not call `killpg` itself.
 pub(crate) fn kill_group(pgid: NonZeroU32) -> Result<(), HarnessError> {
-    let status = std::process::Command::new("kill")
+    let status = std::process::Command::new(system_tool("kill", KILL)?)
         .arg("-KILL")
         .arg("--")
         .arg(format!("-{pgid}"))
@@ -181,9 +253,9 @@ pub(crate) fn kill_group(pgid: NonZeroU32) -> Result<(), HarnessError> {
     if status.success() {
         Ok(())
     } else {
-        Err(HarnessError::Spawn {
-            program: "kill".to_owned(),
-            source: std::io::Error::other(format!("kill -KILL -{pgid} exited with {status}")),
+        Err(HarnessError::ProcessQuery {
+            program: "kill",
+            reason: format!("kill -KILL -{pgid} exited with {status}"),
         })
     }
 }
@@ -225,7 +297,8 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 async fn pgrep(args: &[&OsStr]) -> Result<Vec<u32>, HarnessError> {
-    let output = Command::new("pgrep")
+    let output = Command::new(system_tool("pgrep", PGREP)?)
+        .args(PGREP_WITH_ANCESTORS)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -243,9 +316,9 @@ async fn pgrep(args: &[&OsStr]) -> Result<Vec<u32>, HarnessError> {
             .lines()
             .filter_map(|line| line.trim().parse().ok())
             .collect()),
-        code => Err(HarnessError::Spawn {
-            program: "pgrep".to_owned(),
-            source: std::io::Error::other(format!("pgrep exited with {code:?}")),
+        code => Err(HarnessError::ProcessQuery {
+            program: "pgrep",
+            reason: format!("exited with {code:?}"),
         }),
     }
 }
@@ -273,7 +346,7 @@ pub(crate) async fn running_pids(
 /// and prints the pid for a live process, and exits 1 with no output for
 /// none; any other answer is an error, never "dead".
 pub(crate) async fn pid_alive(pid: u32) -> Result<bool, HarnessError> {
-    let output = Command::new("ps")
+    let output = Command::new(system_tool("ps", PS)?)
         .arg("-o")
         .arg("pid=")
         .arg("-p")
@@ -294,12 +367,12 @@ pub(crate) async fn pid_alive(pid: u32) -> Result<bool, HarnessError> {
     match output.status.code() {
         Some(0) if listed => Ok(true),
         Some(1) if silent => Ok(false),
-        code => Err(HarnessError::Spawn {
-            program: "ps".to_owned(),
-            source: std::io::Error::other(format!(
+        code => Err(HarnessError::ProcessQuery {
+            program: "ps",
+            reason: format!(
                 "ps -p {pid} exited with {code:?}: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
-            )),
+            ),
         }),
     }
 }
@@ -345,6 +418,55 @@ mod tests {
         std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(find_on_path("tool", &var), Some(plain));
         assert_eq!(find_on_path("tool", OsStr::new("")), None);
+    }
+
+    /// The role a run of `running_pids_sees_a_claude_this_process_runs_under` plays.
+    const ANCESTOR_ROLE: &str = "FABRIC_TEST_ANCESTOR_ROLE";
+
+    #[tokio::test]
+    async fn running_pids_sees_a_claude_this_process_runs_under() {
+        let test = "process::tests::running_pids_sees_a_claude_this_process_runs_under";
+        let run = |binary: &Path, role: &str| {
+            let status = std::process::Command::new(binary)
+                .args(["--exact", test, "--test-threads=1"])
+                .env(ANCESTOR_ROLE, role)
+                .stdout(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "the {role} run failed");
+        };
+        match std::env::var(ANCESTOR_ROLE).ok().as_deref() {
+            None => {
+                let dir = tempfile::tempdir().unwrap();
+                let claude = dir.path().join("claude");
+                std::fs::copy(std::env::current_exe().unwrap(), &claude).unwrap();
+                run(&claude, "parent");
+            }
+            Some("parent") => run(&std::env::current_exe().unwrap(), "child"),
+            Some(_) => {
+                let parent = std::os::unix::process::parent_id();
+                let pids = running_pids("claude", None).await.unwrap();
+                assert!(
+                    pids.contains(&parent),
+                    "the claude this process runs under ({parent}) is missing from {pids:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_version_probe_does_not_pass_parent_session_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("tool");
+        std::fs::write(&binary, "#!/bin/sh\n/usr/bin/env\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env: Vec<(EnvVarName, String)> = [("CLAUDECODE", "1"), ("FABRIC_PROBE_KEPT", "1")]
+            .into_iter()
+            .map(|(name, value)| (EnvVarName::parse(name).unwrap(), value.to_owned()))
+            .collect();
+        let seen = probe(&binary, &[], &env).await.unwrap();
+        assert!(seen.contains("FABRIC_PROBE_KEPT=1"), "{seen}");
+        assert!(!seen.contains("CLAUDECODE"), "{seen}");
     }
 
     #[tokio::test]

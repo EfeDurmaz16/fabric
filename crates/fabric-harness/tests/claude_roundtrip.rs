@@ -21,7 +21,7 @@ use fabric_harness::manifest::StateManifest;
 use fabric_harness::{Harness, HarnessError, Launch, SessionId};
 
 mod common;
-use common::{fake_claude, project_key};
+use common::{abs, fake_claude, project_key};
 
 const SID: &str = "9c9796f0-2682-4546-a963-d314b3ad543f";
 const SECRET: &str = "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456";
@@ -199,7 +199,7 @@ impl Drop for Held {
 /// The adapter for `home`, finding the fake `claude` kept under it.
 fn node(home: &Path) -> ClaudeCode {
     let (_, path_var) = fake_claude(home);
-    ClaudeCode::new(home.to_path_buf(), path_var)
+    ClaudeCode::new(abs(home), path_var)
 }
 
 fn session() -> SessionId {
@@ -520,6 +520,41 @@ async fn a_manifest_naming_a_file_outside_session_state_is_refused() {
 }
 
 #[tokio::test]
+async fn a_manifest_that_relabels_a_transcript_as_rewritable_is_refused() {
+    // A transcript only grows; a manifest that calls it rewritable would
+    // let restore replace local bytes outright.
+    let src = build_source("w");
+    let home = src.home.path().canonicalize().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let adapter = node(&home);
+    let manifest = adapter
+        .capture(&src.work, &session(), out.path())
+        .await
+        .unwrap();
+    let transcript = format!(
+        "home/.claude/projects/{}/{SID}.jsonl",
+        project_key(&src.work)
+    );
+    let mut value = serde_json::to_value(&manifest).unwrap();
+    for file in value["files"].as_array_mut().unwrap() {
+        if file["rel_path"] == transcript.as_str() {
+            file["mutability"] = "Replaceable".into();
+        }
+    }
+    std::fs::write(out.path().join("manifest.json"), value.to_string()).unwrap();
+    set_aside(&home, ".claude-pro");
+    let err = adapter.restore(&src.work, out.path()).await.unwrap_err();
+    assert!(
+        matches!(err, HarnessError::EntryMismatch { ref path, .. } if *path == transcript),
+        "{err}"
+    );
+    assert!(
+        !home.join(".claude/projects").exists(),
+        "nothing was placed"
+    );
+}
+
+#[tokio::test]
 async fn a_job_that_leaves_and_comes_back_keeps_the_original_and_gains_the_new_turns() {
     // Pro to Air to Pro, same home and root on both. The Pro still holds
     // the unredacted transcript; the copy that comes back was redacted on
@@ -530,10 +565,11 @@ async fn a_job_that_leaves_and_comes_back_keeps_the_original_and_gains_the_new_t
     let transcript = transcript_under(&home, &src.work);
     let original = std::fs::read(&transcript).unwrap();
     let out_1 = tempfile::tempdir().unwrap();
-    adapter
+    let sent = adapter
         .capture(&src.work, &session(), out_1.path())
         .await
         .unwrap();
+    adapter.confirm_departure(&sent).await.unwrap();
     let pro = set_aside(&home, ".claude-pro");
 
     adapter.restore(&src.work, out_1.path()).await.unwrap();
@@ -549,10 +585,11 @@ async fn a_job_that_leaves_and_comes_back_keeps_the_original_and_gains_the_new_t
     std::fs::write(&memory, "# memory\nlearned on the air\n").unwrap();
     std::fs::write(&task, "{\"subject\":\"t\",\"status\":\"done\"}").unwrap();
     let out_2 = tempfile::tempdir().unwrap();
-    adapter
+    let back = adapter
         .capture(&src.work, &session(), out_2.path())
         .await
         .unwrap();
+    adapter.confirm_departure(&back).await.unwrap();
     set_aside(&home, ".claude-air");
     bring_back(&home, &pro);
 
@@ -607,19 +644,21 @@ async fn a_rewritten_file_edited_here_after_the_job_left_is_not_replaced() {
     let home = src.home.path().canonicalize().unwrap();
     let adapter = node(&home);
     let out_1 = tempfile::tempdir().unwrap();
-    adapter
+    let sent = adapter
         .capture(&src.work, &session(), out_1.path())
         .await
         .unwrap();
+    adapter.confirm_departure(&sent).await.unwrap();
     let pro = set_aside(&home, ".claude-pro");
     adapter.restore(&src.work, out_1.path()).await.unwrap();
     let (memory, _) = rewritable_files(&home, &src.work);
     std::fs::write(&memory, "# memory\nfrom the air\n").unwrap();
     let out_2 = tempfile::tempdir().unwrap();
-    adapter
+    let back = adapter
         .capture(&src.work, &session(), out_2.path())
         .await
         .unwrap();
+    adapter.confirm_departure(&back).await.unwrap();
     set_aside(&home, ".claude-air");
     bring_back(&home, &pro);
     // Someone used the Pro's copy after the job left.
@@ -670,6 +709,36 @@ async fn a_symlink_in_session_state_refuses_the_capture() {
         .unwrap_err();
     assert!(matches!(err, HarnessError::SymlinkInState { .. }), "{err}");
     assert!(regular_files(out.path()).is_empty(), "nothing was staged");
+}
+
+#[tokio::test]
+async fn a_symlink_on_the_way_to_a_destination_refuses_the_restore() {
+    // The target node keeps its project memory in the workspace through a
+    // link; restore must not write MEMORY.md through it.
+    let src = build_source("w");
+    let home = src.home.path().canonicalize().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let adapter = node(&home);
+    adapter
+        .capture(&src.work, &session(), out.path())
+        .await
+        .unwrap();
+    set_aside(&home, ".claude-pro");
+    let linked = src.work.join("docs/memory");
+    std::fs::create_dir_all(&linked).unwrap();
+    let project = home.join(".claude/projects").join(project_key(&src.work));
+    std::fs::create_dir_all(&project).unwrap();
+    std::os::unix::fs::symlink(&linked, project.join("memory")).unwrap();
+    let err = adapter.restore(&src.work, out.path()).await.unwrap_err();
+    assert!(
+        matches!(err, HarnessError::SymlinkInState { ref path } if path == &project.join("memory")),
+        "{err}"
+    );
+    assert!(!linked.join("MEMORY.md").exists());
+    assert!(
+        !project.join(format!("{SID}.jsonl")).exists(),
+        "nothing was placed"
+    );
 }
 
 #[tokio::test]
@@ -796,14 +865,14 @@ async fn a_truncated_staged_file_is_refused_before_anything_is_placed() {
 }
 
 #[tokio::test]
-async fn launch_resumes_in_the_workspace_with_exactly_the_given_env() {
+async fn launch_resumes_in_the_workspace_with_only_the_given_env() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().canonicalize().unwrap();
     let work = home.join("w");
     std::fs::create_dir_all(&work).unwrap();
     let (_script, bin_dir) = fake_claude(&home);
     let log = home.join("log.txt");
-    let adapter = ClaudeCode::new(home.clone(), bin_dir.clone()).with_flags(LaunchFlags {
+    let adapter = ClaudeCode::new(abs(&home), bin_dir.clone()).with_flags(LaunchFlags {
         permission_mode: Some(PermissionMode::AcceptEdits),
         ..LaunchFlags::default()
     });
@@ -839,7 +908,6 @@ async fn launch_resumes_in_the_workspace_with_exactly_the_given_env() {
         .await
         .unwrap();
     assert_eq!(running.session().cloned(), Some(session()));
-    assert_eq!(running.pid(), running.pgid());
     assert_eq!(Some(running.pid().get()), running.child_mut().id());
     let status = running.child_mut().wait().await.unwrap();
     assert!(status.success());
@@ -853,6 +921,11 @@ async fn launch_resumes_in_the_workspace_with_exactly_the_given_env() {
     );
     assert!(seen.contains(&format!("home={}", home.display())), "{seen}");
     assert!(seen.contains("leak=unset"), "{seen}");
+    let pid = running.pid();
+    assert!(
+        seen.contains(&format!("pid={pid} pgid={pid}\n")),
+        "the harness leads a process group of its own: {seen}"
+    );
 
     let mut running = adapter
         .launch(
@@ -877,6 +950,132 @@ async fn launch_resumes_in_the_workspace_with_exactly_the_given_env() {
     assert!(seen.contains("arg=--\narg=hello\n"), "{seen}");
 }
 
+/// Names of the variables a fake harness logged as `env:NAME=value`.
+fn env_names(log: &str) -> Vec<&str> {
+    log.lines()
+        .filter_map(|line| line.strip_prefix("env:"))
+        .filter_map(|pair| pair.split_once('=').map(|(name, _)| name))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_launch_from_inside_a_claude_session_leaves_the_parent_markers_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().canonicalize().unwrap();
+    let work = home.join("w");
+    std::fs::create_dir_all(&work).unwrap();
+    let log = home.join("log.txt");
+    let adapter = node(&home);
+    let (_, bin_dir) = fake_claude(&home);
+    let user = [
+        (
+            "PATH",
+            format!("{}:/usr/bin:/bin", bin_dir.to_string_lossy()),
+        ),
+        ("FAKE_LOG", log.to_string_lossy().into_owned()),
+        ("ANTHROPIC_API_KEY", "user-key".to_owned()),
+        ("HTTPS_PROXY", "http://proxy.invalid:3128".to_owned()),
+    ];
+    let parent = [
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_PID",
+        "CLAUDE_EFFORT",
+        "CLAUDE_AGENT_SDK_VERSION",
+        "CLAUDE_PREVIEW_CLASSIFIER_FLOOR",
+        "ANTHROPIC_BASE_URL",
+    ];
+    let env: Vec<(EnvVarName, String)> = user
+        .iter()
+        .map(|(name, value)| (EnvVarName::parse(name).unwrap(), value.clone()))
+        .chain(parent.iter().map(|name| {
+            let value = if *name == "CLAUDE_CODE_ENTRYPOINT" {
+                "claude-desktop"
+            } else {
+                "1"
+            };
+            (EnvVarName::parse(name).unwrap(), value.to_owned())
+        }))
+        .collect();
+    let mut running = adapter
+        .launch(
+            &work,
+            Launch::Headless {
+                resume: Some(session()),
+                prompt: "go".to_owned(),
+            },
+            &env,
+        )
+        .await
+        .unwrap();
+    assert!(running.child_mut().wait().await.unwrap().success());
+    let seen = std::fs::read_to_string(&log).unwrap();
+    let names = env_names(&seen);
+    for (name, _) in &user {
+        assert!(names.contains(name), "{name} is the user's own: {names:?}");
+    }
+    for name in parent {
+        assert!(
+            !names.contains(&name),
+            "{name} belongs to the parent session: {names:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_launch_env_that_moves_the_config_or_login_is_refused_whatever_the_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().canonicalize().unwrap();
+    let work = home.join("w");
+    std::fs::create_dir_all(&work).unwrap();
+    let log = home.join("log.txt");
+    let (_, bin_dir) = fake_claude(&home);
+    let default_dir = home.join(".claude").to_string_lossy().into_owned();
+    for (var, value) in [
+        ("CLAUDE_CONFIG_DIR", default_dir.clone()),
+        ("CLAUDE_CONFIG_DIR", String::new()),
+        (
+            "CLAUDE_CONFIG_DIR",
+            home.join(".config/claude").to_string_lossy().into_owned(),
+        ),
+        ("CLAUDE_SECURESTORAGE_CONFIG_DIR", default_dir.clone()),
+        (
+            "CLAUDE_CODE_CUSTOM_OAUTH_URL",
+            "https://claude.example".to_owned(),
+        ),
+    ] {
+        let env: Vec<(EnvVarName, String)> = [
+            (
+                "PATH",
+                format!("{}:/usr/bin:/bin", bin_dir.to_string_lossy()),
+            ),
+            ("FAKE_LOG", log.to_string_lossy().into_owned()),
+            (var, value.clone()),
+        ]
+        .into_iter()
+        .map(|(name, value)| (EnvVarName::parse(name).unwrap(), value))
+        .collect();
+        let err = node(&home)
+            .launch(
+                &work,
+                Launch::Headless {
+                    resume: Some(session()),
+                    prompt: "go".to_owned(),
+                },
+                &env,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HarnessError::ConfigMoved { var: refused, .. } if *refused == var),
+            "{var}={value:?}: {err}"
+        );
+        assert!(!log.exists(), "{var}={value:?}: claude must not start");
+    }
+}
+
 #[tokio::test]
 async fn a_settings_overlay_with_a_literal_token_refuses_the_launch() {
     let dir = tempfile::tempdir().unwrap();
@@ -895,6 +1094,12 @@ async fn a_settings_overlay_with_a_literal_token_refuses_the_launch() {
     };
     let err = adapter.launch(&work, resume(), &[]).await.unwrap_err();
     assert!(matches!(err, HarnessError::SecretInOverlay { .. }), "{err}");
+    std::fs::write(&overlay, r#"{"env":{"X":"A=1\nDB_PASSWORD=hunter22xyz"}}"#).unwrap();
+    let err = adapter.launch(&work, resume(), &[]).await.unwrap_err();
+    assert!(
+        matches!(err, HarnessError::SecretInOverlay { .. }),
+        "an escaped newline hides nothing: {err}"
+    );
     std::fs::write(&overlay, "{\"env\":{\"GH\":\"${GH_TOKEN}\"}}").unwrap();
     let log = home.join("log.txt");
     let env = [(

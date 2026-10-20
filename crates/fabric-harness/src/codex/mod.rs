@@ -16,12 +16,24 @@
 //! back never forks silently. `auth.json`, the `SQLite` files, the locks and
 //! `config.toml` never travel. `CODEX_HOME` is never set per job because
 //! the keyring entry is derived from it (ADR 0006, D15); trust for the new
-//! path is passed as a `-c` override on every run.
+//! path is passed as a `-c` override on every run. `check_env` refuses a
+//! launch environment under which Codex would use another directory than
+//! the store, because Codex would then write the thread and look for its
+//! login there while capture reads the store, and could carry a stale
+//! copy of the same thread. Codex treats an empty `CODEX_HOME` as unset,
+//! canonicalizes a set one, and keys its keyring entry by the canonical
+//! path (`codex-rs/utils/home-dir/src/lib.rs` and
+//! `codex-rs/login/src/auth/storage.rs` at `e4568a3`), so a value that
+//! names the store under another spelling is accepted.
 //!
 //! The lock protocol follows `codex-rs/rollout/src/writer_lock.rs` at
 //! `e4568a3`: `thread-writer-locks/.coordination.lock` is held only while
 //! a `<thread_id>.lock` is opened and tried, and again while it is
-//! removed; the thread lock is held for the whole copy.
+//! removed; the thread lock is held for the whole copy. The lock is
+//! trusted only when the installed Codex is at least the version it was
+//! checked on; with an older or unknown version, any running `codex`
+//! refuses the capture or restore, because a Codex that takes no lock
+//! would keep appending to a rollout that restore renamed away.
 //!
 //! Surfaces used, checked against `codex --help`, `codex resume --help`
 //! and `codex exec resume --help` of 0.155.1 on 2026-10-19: `codex resume
@@ -42,17 +54,18 @@ use std::time::Duration;
 use fabric_core::BoxFuture;
 use fabric_core::env::EnvVarName;
 use fabric_core::harness::HarnessKind;
+use fabric_core::path::AbsPath;
 use tracing::{info, warn};
 
-use crate::denylist;
-use crate::departure::Departure;
-use crate::error::HarnessError;
-use crate::files::{self, Carry, Placement, Relation, Source};
-use crate::harness::{self, Harness, Installed, Launch, Restored, Running};
+use crate::error::{HarnessError, Input, IoOp};
+use crate::harness::{Harness, Installed, Launch, Restored, Running};
 use crate::manifest::{Content, HOME_PREFIX, Mutability, StateManifest};
+use crate::pipeline::{self, Capturer, Destination};
+use crate::place::{self, Relation};
 use crate::process;
 use crate::redact::RedactionCounts;
 use crate::session::SessionId;
+use crate::stage::{Carry, Source};
 
 use self::overrides::CodexOverrides;
 use self::rollout::{RolloutFile, RolloutName};
@@ -67,14 +80,20 @@ pub const RESTORE_SUBDIR: &str = "fabric";
 const LOCK_DIR: &str = "thread-writer-locks";
 const COORDINATION_LOCK: &str = ".coordination.lock";
 
+/// The Codex version whose thread writer lock this adapter was checked against.
+const LOCK_READ_ON: &[u32] = &[0, 155, 1];
+
 /// How long a lock attempt waits for Codex's coordination lock, which
 /// Codex holds only across an open and a `try_lock`.
 const COORDINATION_WAIT: Duration = Duration::from_secs(2);
 
+/// The variable that names Codex's home directory.
+const HOME_VAR: &str = "CODEX_HOME";
+
 /// The Codex adapter for one `CODEX_HOME` under one home directory.
 #[derive(Debug, Clone)]
 pub struct Codex {
-    home: PathBuf,
+    home: AbsPath,
     store: PathBuf,
     binary: Option<PathBuf>,
     path_var: OsString,
@@ -115,7 +134,7 @@ fn try_lock_for(path: &Path, wait: Duration) -> Result<Option<File>, HarnessErro
         .read(true)
         .write(true)
         .open(path)
-        .map_err(|e| HarnessError::io("write", path, e))?;
+        .map_err(|e| HarnessError::io(IoOp::Write, path, e))?;
     let deadline = std::time::Instant::now() + wait;
     loop {
         match file.try_lock() {
@@ -124,21 +143,21 @@ fn try_lock_for(path: &Path, wait: Duration) -> Result<Option<File>, HarnessErro
                 if std::time::Instant::now() >= deadline {
                     return Ok(None);
                 }
-                // This runs on a blocking thread (`harness::blocking`), so
+                // This runs on a blocking thread (`pipeline::blocking`), so
                 // sleeping here parks no runtime worker.
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Err(TryLockError::Error(e)) => return Err(HarnessError::io("lock", path, e)),
+            Err(TryLockError::Error(e)) => return Err(HarnessError::io(IoOp::Lock, path, e)),
         }
     }
 }
 
 fn lock_coordination(dir: &Path) -> Result<File, HarnessError> {
-    std::fs::create_dir_all(dir).map_err(|e| HarnessError::io("create dir", dir, e))?;
+    std::fs::create_dir_all(dir).map_err(|e| HarnessError::io(IoOp::CreateDir, dir, e))?;
     let path = dir.join(COORDINATION_LOCK);
     try_lock_for(&path, COORDINATION_WAIT)?.ok_or_else(|| {
         HarnessError::io(
-            "lock",
+            IoOp::Lock,
             path,
             std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
@@ -150,16 +169,12 @@ fn lock_coordination(dir: &Path) -> Result<File, HarnessError> {
 
 /// A TOML quoted key for `root`, so `projects."<root>".trust_level` names
 /// exactly this path.
-fn toml_quoted_key(root: &Path) -> Result<String, HarnessError> {
-    let text = root.to_str().ok_or_else(|| HarnessError::Malformed {
-        what: "workspace path",
-        path: root.to_path_buf(),
-        reason: "not UTF-8".to_owned(),
-    })?;
+fn toml_quoted_key(root: &AbsPath) -> Result<String, HarnessError> {
+    let text = root.as_str();
     if text.chars().any(char::is_control) {
         return Err(HarnessError::Malformed {
-            what: "workspace path",
-            path: root.to_path_buf(),
+            what: Input::WorkspacePath,
+            path: PathBuf::from(text),
             reason: "holds a control character".to_owned(),
         });
     }
@@ -176,13 +191,86 @@ fn toml_quoted_key(root: &Path) -> Result<String, HarnessError> {
     Ok(key)
 }
 
+/// The file that holds `rollout` among `all`. Files that share the id are
+/// reduced to the longest when every other one is a byte prefix of it, so
+/// a thread that went to another node and came back never forks silently;
+/// otherwise the lineage of `session` is ambiguous. Only the ids a lineage
+/// reaches are resolved, so a forked rollout of another thread blocks
+/// nothing here.
+fn resolve(
+    session: &SessionId,
+    rollout: &SessionId,
+    all: &[RolloutFile],
+) -> Result<Option<RolloutFile>, HarnessError> {
+    let mut longest: Option<&RolloutFile> = None;
+    for file in all.iter().filter(|f| f.name.rollout_id == *rollout) {
+        let Some(kept) = longest else {
+            longest = Some(file);
+            continue;
+        };
+        longest = Some(match place::compare(&kept.path, &file.path)? {
+            Relation::Missing | Relation::Equal => kept,
+            Relation::ExistingIsPrefix => file,
+            Relation::Diverged => match place::compare(&file.path, &kept.path)? {
+                Relation::ExistingIsPrefix => kept,
+                Relation::Missing | Relation::Equal | Relation::Diverged => {
+                    return Err(HarnessError::LineageAmbiguous {
+                        session: session.clone(),
+                        rollout: rollout.clone(),
+                        paths: vec![kept.path.clone(), file.path.clone()],
+                    });
+                }
+            },
+        });
+    }
+    Ok(longest.cloned())
+}
+
+/// The rollout lineage of `session` among `all`, newest suffix first: the
+/// newest rollout of the thread, then each prefix its `history_base` names.
+fn lineage_in(
+    all: &[RolloutFile],
+    session: &SessionId,
+    searched: &Path,
+) -> Result<Vec<RolloutFile>, HarnessError> {
+    let not_found = || HarnessError::SessionNotFound {
+        kind: HarnessKind::Codex,
+        session: session.clone(),
+        searched: searched.to_path_buf(),
+    };
+    let head_id = all
+        .iter()
+        .find(|f| f.name.thread_id == *session)
+        .map(|f| f.name.rollout_id.clone())
+        .ok_or_else(not_found)?;
+    let head = resolve(session, &head_id, all)?.ok_or_else(not_found)?;
+    let mut chain = vec![head];
+    loop {
+        let last = chain.last().ok_or_else(not_found)?;
+        let Some(prefix_id) = rollout::read_meta(last)?.history_base else {
+            break;
+        };
+        if chain.iter().any(|f| f.name.rollout_id == prefix_id) {
+            break;
+        }
+        let Some(prefix) = resolve(session, &prefix_id, all)? else {
+            return Err(HarnessError::LineageBroken {
+                session: session.clone(),
+                missing: prefix_id,
+            });
+        };
+        chain.push(prefix);
+    }
+    Ok(chain)
+}
+
 impl Codex {
     /// An adapter whose state lives under `home/.codex`, finding `codex`
     /// on the `PATH` value `path_var`.
     #[must_use]
-    pub fn new(home: PathBuf, path_var: OsString) -> Self {
+    pub fn new(home: AbsPath, path_var: OsString) -> Self {
         Codex {
-            store: home.join(".codex"),
+            store: pipeline::fs_path(&home).join(".codex"),
             home,
             binary: None,
             path_var,
@@ -192,15 +280,49 @@ impl Codex {
 
     /// Reads Codex's state from `dir` instead of `home/.codex`; refused
     /// when `dir` is not under the home.
-    pub fn with_codex_home(mut self, dir: PathBuf) -> Result<Self, HarnessError> {
-        if dir.strip_prefix(&self.home).is_err() {
+    pub fn with_codex_home(mut self, dir: &AbsPath) -> Result<Self, HarnessError> {
+        let dir = pipeline::fs_path(dir).to_path_buf();
+        if dir.strip_prefix(self.home_dir()).is_err() {
             return Err(HarnessError::NotUnderHome {
                 path: dir,
-                home: self.home.clone(),
+                home: self.home_dir().to_path_buf(),
             });
         }
         self.store = dir;
         Ok(self)
+    }
+
+    fn home_dir(&self) -> &Path {
+        pipeline::fs_path(&self.home)
+    }
+
+    /// Refuses a launch environment under which Codex would keep its
+    /// sessions and login in another directory than the store: a
+    /// non-empty `CODEX_HOME` naming another directory, or none while the
+    /// store is not `<home>/.codex`. `launch` runs it first.
+    pub fn check_env(&self, env: &[(EnvVarName, String)]) -> Result<(), HarnessError> {
+        let dir = env
+            .iter()
+            .find(|(name, value)| name.as_str() == HOME_VAR && !value.is_empty())
+            .map_or_else(
+                || self.home_dir().join(".codex"),
+                |(_, value)| PathBuf::from(value),
+            );
+        let same = match (
+            std::fs::canonicalize(&dir),
+            std::fs::canonicalize(&self.store),
+        ) {
+            (Ok(dir), Ok(store)) => dir == store,
+            _ => dir == self.store,
+        };
+        if same {
+            Ok(())
+        } else {
+            Err(HarnessError::CodexHomeMismatch {
+                dir,
+                store: self.store.clone(),
+            })
+        }
     }
 
     /// Uses this binary instead of looking `codex` up on `PATH`.
@@ -228,56 +350,26 @@ impl Codex {
     }
 
     fn codex_home_parts(&self) -> Result<Vec<String>, HarnessError> {
-        let rel = self
-            .store
-            .strip_prefix(&self.home)
-            .map_err(|_| HarnessError::NotUnderHome {
-                path: self.store.clone(),
-                home: self.home.clone(),
-            })?;
-        files::rel_components(rel)
+        let rel =
+            self.store
+                .strip_prefix(self.home_dir())
+                .map_err(|_| HarnessError::NotUnderHome {
+                    path: self.store.clone(),
+                    home: self.home_dir().to_path_buf(),
+                })?;
+        pipeline::rel_components(rel)
     }
 
-    /// Every rollout in the store, with files that share a rollout id
-    /// reduced to the longest when the shorter ones are byte prefixes of it.
-    fn all_rollouts(&self, session: &SessionId) -> Result<Vec<RolloutFile>, HarnessError> {
+    /// Every rollout file in the store, duplicates included.
+    fn all_rollouts(&self) -> Result<Vec<RolloutFile>, HarnessError> {
         let mut all = rollout::list(&self.store.join("sessions"))?;
         all.extend(rollout::list(&self.store.join("archived_sessions"))?);
-        let mut kept: Vec<RolloutFile> = Vec::with_capacity(all.len());
-        for file in all {
-            let Some(index) = kept
-                .iter()
-                .position(|k| k.name.rollout_id == file.name.rollout_id)
-            else {
-                kept.push(file);
-                continue;
-            };
-            let existing = &kept[index];
-            let keep_existing = match files::compare(&existing.path, &file.path)? {
-                Relation::Missing | Relation::Equal => true,
-                Relation::ExistingIsPrefix => false,
-                Relation::Diverged => match files::compare(&file.path, &existing.path)? {
-                    Relation::ExistingIsPrefix => true,
-                    Relation::Missing | Relation::Equal | Relation::Diverged => {
-                        return Err(HarnessError::LineageAmbiguous {
-                            session: session.clone(),
-                            rollout: file.name.rollout_id.clone(),
-                            paths: vec![existing.path.clone(), file.path],
-                        });
-                    }
-                },
-            };
-            if !keep_existing {
-                kept[index] = file;
-            }
-        }
-        Ok(kept)
+        Ok(all)
     }
 
     /// The newest thread whose rollout records the workspace as its `cwd`.
     pub fn latest_session(&self, workspace: &Path) -> Result<Option<SessionId>, HarnessError> {
-        let root = harness::physical_workspace(workspace)?;
-        let root_text = root.to_string_lossy();
+        let root = pipeline::physical_workspace(workspace)?;
         for file in rollout::list(&self.store.join("sessions"))? {
             let meta = match rollout::read_meta(&file) {
                 Ok(meta) => meta,
@@ -286,45 +378,16 @@ impl Codex {
                     continue;
                 }
             };
-            if meta.cwd.as_deref() == Some(root_text.as_ref()) {
+            if meta.cwd.as_deref() == Some(root.as_str()) {
                 return Ok(Some(file.name.thread_id));
             }
         }
         Ok(None)
     }
 
-    /// The rollout lineage of `session`, newest suffix first.
+    /// The rollout lineage of `session` in this store, newest suffix first.
     pub(crate) fn lineage(&self, session: &SessionId) -> Result<Vec<RolloutFile>, HarnessError> {
-        let all = self.all_rollouts(session)?;
-        let not_found = || HarnessError::SessionNotFound {
-            kind: HarnessKind::Codex,
-            session: session.clone(),
-            searched: self.store.join("sessions"),
-        };
-        let head = all
-            .iter()
-            .find(|f| f.name.thread_id == *session)
-            .cloned()
-            .ok_or_else(not_found)?;
-        let mut chain = vec![head];
-        loop {
-            let last = chain.last().ok_or_else(not_found)?;
-            let meta = rollout::read_meta(last)?;
-            let Some(prefix_id) = meta.history_base else {
-                break;
-            };
-            if chain.iter().any(|f| f.name.rollout_id == prefix_id) {
-                break;
-            }
-            let Some(prefix) = all.iter().find(|f| f.name.rollout_id == prefix_id).cloned() else {
-                return Err(HarnessError::LineageBroken {
-                    session: session.clone(),
-                    missing: prefix_id,
-                });
-            };
-            chain.push(prefix);
-        }
-        Ok(chain)
+        lineage_in(&self.all_rollouts()?, session, &self.store.join("sessions"))
     }
 
     /// Takes the thread writer lock as Codex's `acquire` does: the
@@ -348,9 +411,31 @@ impl Codex {
         })
     }
 
+    /// Refuses while a `codex` runs that may not take the thread writer
+    /// lock: one older than `LOCK_READ_ON`, or one whose version is unknown.
+    async fn refuse_lockless_writers(&self, version: Option<&str>) -> Result<(), HarnessError> {
+        if version.is_some_and(|v| process::version_at_least(v, LOCK_READ_ON)) {
+            return Ok(());
+        }
+        warn!(
+            ?version,
+            "codex: the writer lock may not be taken by this version; any running codex blocks"
+        );
+        let binary = self.binary().ok();
+        let pids = process::running_pids(PROGRAM, binary.as_deref()).await?;
+        if pids.is_empty() {
+            Ok(())
+        } else {
+            Err(HarnessError::HarnessRunning {
+                program: PROGRAM.to_owned(),
+                pids,
+            })
+        }
+    }
+
     fn capture_sync(
         &self,
-        root: &Path,
+        root: &AbsPath,
         session: &SessionId,
         out: &Path,
         version: Option<String>,
@@ -368,30 +453,28 @@ impl Codex {
                         path: file.path.clone(),
                         home: self.store.clone(),
                     })?;
-            let parts = files::rel_components(rel)?;
+            let parts = pipeline::rel_components(rel)?;
             let mut all: Vec<&str> = vec![HOME_PREFIX];
             all.extend(home_parts.iter().map(String::as_str));
             all.extend(parts.iter().map(String::as_str));
             sources.push(Source {
                 abs: file.path.clone(),
-                rel: files::rel_path(&all)?,
+                rel: pipeline::rel_path(&all)?,
                 carry: Carry::Opaque,
                 mutability: Mutability::AppendOnly,
             });
         }
-        let mut counts = RedactionCounts::new();
-        let carried = files::stage(&sources, out, &mut counts)?;
-        drop(lock);
-        let manifest = StateManifest::new(
-            HarnessKind::Codex,
-            session.clone(),
-            harness::abs_path(root)?,
-            harness::abs_path(&self.home)?,
+        // A rollout only grows, so no departure record is kept.
+        let capturer = Capturer {
+            kind: HarnessKind::Codex,
+            session,
+            root,
+            home: &self.home,
             version,
-            carried,
-            &counts,
-        )?;
-        manifest.write(out)?;
+            departure: None,
+        };
+        let manifest = pipeline::capture(capturer, &sources, RedactionCounts::new(), out)?;
+        drop(lock);
         info!(%session, rollouts = chain.len(), "codex: captured");
         Ok(manifest)
     }
@@ -402,19 +485,13 @@ impl Codex {
         session: &SessionId,
         out: &Path,
     ) -> Result<StateManifest, HarnessError> {
-        let root = harness::physical_workspace(workspace)?;
-        let version = match self.detect_impl().await {
-            Ok(Some(installed)) => installed.version,
-            Ok(None) => None,
-            Err(e) => {
-                warn!(error = %e, "codex: version probe failed; manifest records none");
-                None
-            }
-        };
+        let root = pipeline::physical_workspace(workspace)?;
+        let version = process::installed_version(self.binary().ok(), PROGRAM).await;
+        self.refuse_lockless_writers(version.as_deref()).await?;
         let adapter = self.clone();
         let session = session.clone();
         let out = out.to_path_buf();
-        harness::blocking(move || adapter.capture_sync(&root, &session, &out, version)).await
+        pipeline::blocking(move || adapter.capture_sync(&root, &session, &out, version)).await
     }
 
     /// The rollout file name a tree path carries, when the path lies under
@@ -440,84 +517,86 @@ impl Codex {
         Ok(rollout::parse_name(name).map(|parsed| (name, parsed)))
     }
 
+    /// Where one rollout of `session` lands: over the file that already
+    /// holds that rollout on this node, else under `fallback_dir`.
+    fn destination(
+        session: &SessionId,
+        staged: &RolloutFile,
+        name_text: &str,
+        existing: &[RolloutFile],
+        fallback_dir: &Path,
+    ) -> Result<Destination, HarnessError> {
+        let name = &staged.name;
+        let path = match resolve(session, &name.rollout_id, existing)? {
+            None => fallback_dir.join(name_text),
+            Some(found) if found.name.compressed == name.compressed => found.path,
+            Some(found) => {
+                return Err(HarnessError::LineageAmbiguous {
+                    session: session.clone(),
+                    rollout: name.rollout_id.clone(),
+                    paths: vec![found.path, staged.path.clone()],
+                });
+            }
+        };
+        Ok(Destination {
+            path,
+            content: Content::Opaque,
+            mutability: Mutability::AppendOnly,
+        })
+    }
+
     fn restore_sync(
         &self,
-        root: &Path,
         state: &Path,
         manifest: StateManifest,
     ) -> Result<Restored, HarnessError> {
-        harness::same_place(&manifest, root, &self.home)?;
-        let lock = self.hold_writer_lock(manifest.session())?;
-        let existing = self.all_rollouts(manifest.session())?;
+        let session = manifest.session().clone();
+        // Only the rollouts on the thread's own lineage, derived from the
+        // staged files, may be placed; any other rollout in the manifest
+        // is refused like any other unexpected file.
+        let mut staged = Vec::new();
+        for file in manifest.files() {
+            let rel = file.rel_path.as_str();
+            if let Some((_, name)) = self.restorable(rel)? {
+                staged.push(RolloutFile {
+                    path: state.join(rel),
+                    name,
+                });
+            }
+        }
+        let chain = lineage_in(&staged, &session, state)?;
+        let lock = self.hold_writer_lock(&session)?;
+        let existing = self.all_rollouts()?;
         let fallback_dir = self
             .store
             .join("sessions")
             .join(RESTORE_SUBDIR)
-            .join(manifest.session().as_str());
-        let mut placements = Vec::with_capacity(manifest.files().len());
-        for file in manifest.files() {
-            let rel = file.rel_path.as_str();
-            if let Some(rule) = denylist::check(rel) {
-                return Err(HarnessError::Denied {
-                    path: rel.to_owned(),
-                    rule,
-                });
-            }
-            let restorable = self
-                .restorable(rel)?
-                .filter(|_| file.mutability == Mutability::AppendOnly);
-            let Some((name_text, name)) = restorable else {
-                return Err(HarnessError::UnexpectedFile {
-                    kind: HarnessKind::Codex,
-                    path: rel.to_owned(),
-                });
-            };
-            let staged = state.join(rel);
-            let same_id: Vec<&RolloutFile> = existing
-                .iter()
-                .filter(|f| f.name.rollout_id == name.rollout_id)
-                .collect();
-            let dest = match same_id.as_slice() {
-                [] => fallback_dir.join(name_text),
-                [found] if found.name.compressed == name.compressed => found.path.clone(),
-                found => {
-                    let mut paths: Vec<PathBuf> = found.iter().map(|f| f.path.clone()).collect();
-                    paths.push(staged);
-                    return Err(HarnessError::LineageAmbiguous {
-                        session: manifest.session().clone(),
-                        rollout: name.rollout_id,
-                        paths,
-                    });
-                }
-            };
-            placements.push(Placement {
-                staged,
-                dest,
-                content: Content::Opaque,
-                mutability: Mutability::AppendOnly,
-            });
-        }
-        files::verify(state, manifest.files())?;
+            .join(session.as_str());
         // A rollout only grows, so nothing is ever replaced and no
         // departure record is kept.
-        let placed = files::place_all(&placements, &Departure::default())?;
+        let restored = pipeline::restore(manifest, state, None, |rel, _| {
+            let Some((name_text, _)) = self.restorable(rel)? else {
+                return Ok(None);
+            };
+            let path = state.join(rel);
+            let Some(on_lineage) = chain.iter().find(|f| f.path == path) else {
+                return Ok(None);
+            };
+            Self::destination(&session, on_lineage, name_text, &existing, &fallback_dir).map(Some)
+        })?;
         drop(lock);
-        info!(session = %manifest.session(), files = placed.len(), "codex: restored");
-        Ok(Restored { manifest, placed })
+        info!(%session, files = restored.placed.len(), "codex: restored");
+        Ok(restored)
     }
 
     async fn restore_impl(&self, workspace: &Path, state: &Path) -> Result<Restored, HarnessError> {
-        let root = harness::physical_workspace(workspace)?;
-        let manifest = StateManifest::read(state)?;
-        if *manifest.kind() != HarnessKind::Codex {
-            return Err(HarnessError::WrongHarness {
-                captured: manifest.kind().clone(),
-                restoring: HarnessKind::Codex,
-            });
-        }
+        let root = pipeline::physical_workspace(workspace)?;
+        let manifest = pipeline::open(state, &HarnessKind::Codex, &root, &self.home)?;
+        let version = process::installed_version(self.binary().ok(), PROGRAM).await;
+        self.refuse_lockless_writers(version.as_deref()).await?;
         let adapter = self.clone();
         let state = state.to_path_buf();
-        harness::blocking(move || adapter.restore_sync(&root, &state, manifest)).await
+        pipeline::blocking(move || adapter.restore_sync(&state, manifest)).await
     }
 
     async fn detect_impl(&self) -> Result<Option<Installed>, HarnessError> {
@@ -527,7 +606,7 @@ impl Codex {
     /// The argument list for `launch`, without the binary.
     pub(crate) fn args_for(
         &self,
-        root: &Path,
+        root: &AbsPath,
         launch: &Launch,
     ) -> Result<Vec<String>, HarnessError> {
         let mut args = Vec::new();
@@ -563,11 +642,13 @@ impl Codex {
         launch: &Launch,
         env: &[(EnvVarName, String)],
     ) -> Result<Running, HarnessError> {
-        let root = harness::physical_workspace(workspace)?;
+        self.check_env(env)?;
+        let root = pipeline::physical_workspace(workspace)?;
         let binary = self.binary()?;
         let args = self.args_for(&root, launch)?;
         let session = launch.resume().cloned();
-        let (child, pid) = process::spawn(&binary, &args, &root, env, launch.into())?;
+        let (child, pid) =
+            process::spawn(&binary, &args, pipeline::fs_path(&root), env, launch.into())?;
         info!(?session, %pid, "codex: launched");
         Ok(Running::new(pid, session, child))
     }
@@ -589,6 +670,19 @@ impl Harness for Codex {
         out: &'a Path,
     ) -> BoxFuture<'a, Result<StateManifest, HarnessError>> {
         Box::pin(self.capture_impl(workspace, session, out))
+    }
+
+    /// A rollout only grows, so Codex keeps no departure record and this
+    /// only checks that the manifest is a Codex one.
+    fn confirm_departure<'a>(
+        &'a self,
+        manifest: &'a StateManifest,
+    ) -> BoxFuture<'a, Result<(), HarnessError>> {
+        Box::pin(std::future::ready(pipeline::confirm_departure(
+            manifest,
+            &HarnessKind::Codex,
+            None,
+        )))
     }
 
     fn restore<'a>(
@@ -615,14 +709,15 @@ mod tests {
 
     #[test]
     fn args_follow_the_cli_surface_and_quote_the_root() {
-        let adapter =
-            Codex::new(PathBuf::from("/h"), OsString::new()).with_overrides(CodexOverrides {
+        let adapter = Codex::new(AbsPath::parse("/h").unwrap(), OsString::new()).with_overrides(
+            CodexOverrides {
                 sandbox: overrides::SandboxMode::WorkspaceWrite,
                 approval: overrides::ApprovalPolicy::OnRequest,
                 model: Some(crate::harness::ModelName::parse("o3").unwrap()),
                 effort: Some(overrides::Effort::High),
-            });
-        let root = Path::new("/h/fabric/jobs/j/work");
+            },
+        );
+        let root = &AbsPath::parse("/h/fabric/jobs/j/work").unwrap();
         let session = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
         let resume = Launch::Interactive {
             resume: Some(session.clone()),
@@ -670,7 +765,7 @@ mod tests {
                 "--dangerously-bypass-approvals-and-sandbox"
             ]
         );
-        let quoted = Path::new("/h/say \"hi\"\\there");
+        let quoted = &AbsPath::parse("/h/say \"hi\"\\there").unwrap();
         let args = adapter
             .args_for(
                 quoted,
@@ -685,7 +780,7 @@ mod tests {
             "projects.\"/h/say \\\"hi\\\"\\\\there\".trust_level=trusted"
         );
         assert!(matches!(
-            toml_quoted_key(Path::new("/h/new\nline")),
+            toml_quoted_key(&AbsPath::parse("/h/new\nline").unwrap()),
             Err(HarnessError::Malformed { .. })
         ));
     }

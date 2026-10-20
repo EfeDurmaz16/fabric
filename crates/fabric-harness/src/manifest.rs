@@ -16,8 +16,7 @@ use fabric_core::harness::HarnessKind;
 use fabric_core::path::{AbsPath, RelPath};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::error::HarnessError;
-use crate::redact::RedactionCounts;
+use crate::error::{HarnessError, Input, IoOp};
 use crate::session::SessionId;
 
 /// The file name of the manifest inside a captured state tree.
@@ -257,10 +256,7 @@ impl TryFrom<String> for RuleName {
 impl StateManifest {
     /// Builds the manifest of one capture, sorting `files` by path and
     /// checking the rules of this module.
-    #[cfg_attr(
-        not(any(feature = "acp", feature = "claude", feature = "codex")),
-        allow(dead_code, reason = "used by the adapters; none is enabled")
-    )]
+    #[cfg(any(test, feature = "acp", feature = "claude", feature = "codex"))]
     pub(crate) fn new(
         kind: HarnessKind,
         session: SessionId,
@@ -268,7 +264,7 @@ impl StateManifest {
         home: AbsPath,
         harness_version: Option<String>,
         mut files: Vec<Carried>,
-        counts: &RedactionCounts,
+        counts: &crate::redact::RedactionCounts,
     ) -> Result<Self, ManifestError> {
         files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
         let redactions = counts
@@ -303,7 +299,7 @@ impl StateManifest {
             if under_home(&path).is_none() {
                 return Err(ManifestError::NotUnderHome { index, path });
             }
-            if path.split('/').any(crate::files::is_temp_name) {
+            if path.split('/').any(crate::durable::is_temp_name) {
                 return Err(ManifestError::TemporaryFile { index, path });
             }
             if previous.is_some_and(|p| p >= &file.rel_path) {
@@ -362,23 +358,35 @@ impl StateManifest {
         &self.redactions
     }
 
+    /// The `BLAKE3` digest of the manifest's JSON form, which names one
+    /// capture: equal manifests, read back or kept in memory, share it.
+    #[cfg(any(feature = "acp", feature = "claude", feature = "codex"))]
+    pub(crate) fn digest(&self) -> Result<Digest, HarnessError> {
+        let bytes = serde_json::to_vec(self).map_err(|e| HarnessError::Malformed {
+            what: Input::Manifest,
+            path: std::path::PathBuf::from(MANIFEST_FILE),
+            reason: e.to_string(),
+        })?;
+        Ok(Digest::from_hash(blake3::hash(&bytes)))
+    }
+
     /// Writes the manifest as `MANIFEST_FILE` under `out`.
     pub fn write(&self, out: &Path) -> Result<(), HarnessError> {
         let path = out.join(MANIFEST_FILE);
         let bytes = serde_json::to_vec_pretty(self).map_err(|e| HarnessError::Malformed {
-            what: "manifest",
+            what: Input::Manifest,
             path: path.clone(),
             reason: e.to_string(),
         })?;
-        crate::files::write_atomic(&path, &bytes)
+        crate::durable::write_atomic(&path, &bytes)
     }
 
     /// Reads the manifest under `state`, checking its rules.
     pub fn read(state: &Path) -> Result<Self, HarnessError> {
         let path = state.join(MANIFEST_FILE);
-        let bytes = std::fs::read(&path).map_err(|e| HarnessError::io("read", &path, e))?;
+        let bytes = std::fs::read(&path).map_err(|e| HarnessError::io(IoOp::Read, &path, e))?;
         serde_json::from_slice(&bytes).map_err(|e| HarnessError::Malformed {
-            what: "manifest",
+            what: Input::Manifest,
             path,
             reason: e.to_string(),
         })
@@ -390,7 +398,7 @@ mod tests {
     use super::*;
 
     fn manifest(files: Vec<Carried>) -> Result<StateManifest, ManifestError> {
-        let mut counts = RedactionCounts::new();
+        let mut counts = crate::redact::RedactionCounts::new();
         counts.insert("github-token", 2);
         StateManifest::new(
             HarnessKind::ClaudeCode,

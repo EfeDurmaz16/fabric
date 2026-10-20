@@ -23,18 +23,19 @@ use std::path::{Path, PathBuf};
 use fabric_core::BoxFuture;
 use fabric_core::env::EnvVarName;
 use fabric_core::harness::{HarnessKind, ProgramName};
+use fabric_core::path::AbsPath;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::denylist;
-use crate::departure::{self, Departure};
+use crate::departure::Records;
 use crate::error::HarnessError;
-use crate::files::{self, Carry, Placement, Source};
-use crate::harness::{self, Harness, Installed, Launch, Restored, Running};
+use crate::harness::{Harness, Installed, Launch, Restored, Running};
 use crate::manifest::{Content, HOME_PREFIX, Mutability, StateManifest, under_home};
+use crate::pipeline::{self, Capturer, Destination};
 use crate::process::{self, Wiring};
 use crate::redact::RedactionCounts;
 use crate::session::SessionId;
+use crate::stage::{Carry, Source};
 
 use self::client::{AcpClient, AcpError, PermissionPolicy, StopReason};
 
@@ -51,7 +52,7 @@ fn names_session(part: &str, session: &SessionId) -> bool {
 pub struct AcpHarness {
     program: ProgramName,
     args: Vec<String>,
-    home: PathBuf,
+    home: AbsPath,
     state_dir: Option<PathBuf>,
     policy: PermissionPolicy,
     path_var: OsString,
@@ -83,7 +84,7 @@ impl AcpHarness {
     /// on the `PATH` value `path_var`, with no state directory declared and
     /// the deny permission policy.
     #[must_use]
-    pub fn new(program: ProgramName, args: Vec<String>, home: PathBuf, path_var: OsString) -> Self {
+    pub fn new(program: ProgramName, args: Vec<String>, home: AbsPath, path_var: OsString) -> Self {
         AcpHarness {
             program,
             args,
@@ -96,15 +97,20 @@ impl AcpHarness {
 
     /// Declares where the agent keeps its sessions; refused when `dir` is
     /// not under the home.
-    pub fn with_state_dir(mut self, dir: PathBuf) -> Result<Self, HarnessError> {
-        if dir.strip_prefix(&self.home).is_err() {
+    pub fn with_state_dir(mut self, dir: &AbsPath) -> Result<Self, HarnessError> {
+        let dir = pipeline::fs_path(dir).to_path_buf();
+        if dir.strip_prefix(self.home_dir()).is_err() {
             return Err(HarnessError::NotUnderHome {
                 path: dir,
-                home: self.home.clone(),
+                home: self.home_dir().to_path_buf(),
             });
         }
         self.state_dir = Some(dir);
         Ok(self)
+    }
+
+    fn home_dir(&self) -> &Path {
+        pipeline::fs_path(&self.home)
     }
 
     /// Sets how `session/request_permission` is answered.
@@ -130,31 +136,31 @@ impl AcpHarness {
                 program: self.program.to_string(),
             })?;
         let rel = dir
-            .strip_prefix(&self.home)
+            .strip_prefix(self.home_dir())
             .map_err(|_| HarnessError::NotUnderHome {
                 path: dir.clone(),
-                home: self.home.clone(),
+                home: self.home_dir().to_path_buf(),
             })?;
-        Ok((dir.clone(), files::rel_components(rel)?))
+        Ok((dir.clone(), pipeline::rel_components(rel)?))
     }
 
     /// Where this node records the session's files at capture. An ACP
     /// agent's state is opaque, so every file is treated as rewritable.
-    fn departure_path(&self, session: &SessionId) -> PathBuf {
-        departure::record_path(&self.home, &format!("acp-{}", self.program), session)
+    fn departure(&self, session: &SessionId) -> Records {
+        Records::of(self.home_dir(), &format!("acp-{}", self.program), session)
     }
 
     fn capture_sync(
         &self,
-        root: &Path,
+        root: &AbsPath,
         session: &SessionId,
         out: &Path,
         version: Option<String>,
     ) -> Result<StateManifest, HarnessError> {
         let (dir, rel_parts) = self.state_rel()?;
         let mut sources = Vec::new();
-        for file in files::walk(&dir)? {
-            let file_parts = files::rel_components(&file)?;
+        for file in pipeline::walk(&dir)? {
+            let file_parts = pipeline::rel_components(&file)?;
             if !file_parts.iter().any(|part| names_session(part, session)) {
                 continue;
             }
@@ -163,7 +169,7 @@ impl AcpHarness {
             parts.extend(file_parts.iter().map(String::as_str));
             sources.push(Source {
                 abs: dir.join(&file),
-                rel: files::rel_path(&parts)?,
+                rel: pipeline::rel_path(&parts)?,
                 carry: Carry::OpaqueRefuseSecrets,
                 mutability: Mutability::Replaceable,
             });
@@ -175,19 +181,16 @@ impl AcpHarness {
                 searched: dir,
             });
         }
-        let mut counts = RedactionCounts::new();
-        let carried = files::stage(&sources, out, &mut counts)?;
-        Departure::of(&sources)?.write(&self.departure_path(session))?;
-        let manifest = StateManifest::new(
-            self.kind(),
-            session.clone(),
-            harness::abs_path(root)?,
-            harness::abs_path(&self.home)?,
+        let records = self.departure(session);
+        let capturer = Capturer {
+            kind: self.kind(),
+            session,
+            root,
+            home: &self.home,
             version,
-            carried,
-            &counts,
-        )?;
-        manifest.write(out)?;
+            departure: Some(&records),
+        };
+        let manifest = pipeline::capture(capturer, &sources, RedactionCounts::new(), out)?;
         info!(%session, agent = %self.program, files = manifest.files().len(), "acp: captured");
         Ok(manifest)
     }
@@ -198,19 +201,12 @@ impl AcpHarness {
         session: &SessionId,
         out: &Path,
     ) -> Result<StateManifest, HarnessError> {
-        let root = harness::physical_workspace(workspace)?;
-        let version = match self.detect_impl().await {
-            Ok(Some(installed)) => installed.version,
-            Ok(None) => None,
-            Err(e) => {
-                warn!(error = %e, agent = %self.program, "acp: version probe failed; manifest records none");
-                None
-            }
-        };
+        let root = pipeline::physical_workspace(workspace)?;
+        let version = process::installed_version(self.binary().ok(), self.program.as_str()).await;
         let adapter = self.clone();
         let session = session.clone();
         let out = out.to_path_buf();
-        harness::blocking(move || adapter.capture_sync(&root, &session, &out, version)).await
+        pipeline::blocking(move || adapter.capture_sync(&root, &session, &out, version)).await
     }
 
     /// True when a tree path lies under the declared state directory and
@@ -231,56 +227,30 @@ impl AcpHarness {
 
     fn restore_sync(
         &self,
-        root: &Path,
         state: &Path,
         manifest: StateManifest,
     ) -> Result<Restored, HarnessError> {
-        harness::same_place(&manifest, root, &self.home)?;
         let (_, state_parts) = self.state_rel()?;
-        let mut placements = Vec::with_capacity(manifest.files().len());
-        for file in manifest.files() {
-            let rel = file.rel_path.as_str();
-            if let Some(rule) = denylist::check(rel) {
-                return Err(HarnessError::Denied {
-                    path: rel.to_owned(),
-                    rule,
-                });
-            }
-            let rest = under_home(rel)
-                .filter(|_| Self::restorable(rel, &state_parts, manifest.session()))
-                .filter(|_| file.mutability == Mutability::Replaceable);
-            let Some(rest) = rest else {
-                return Err(HarnessError::UnexpectedFile {
-                    kind: self.kind(),
-                    path: rel.to_owned(),
-                });
-            };
-            placements.push(Placement {
-                staged: state.join(rel),
-                dest: self.home.join(rest),
+        let session = manifest.session().clone();
+        let records = self.departure(&session);
+        let restored = pipeline::restore(manifest, state, Some(&records), |rel, _| {
+            let rest = under_home(rel).filter(|_| Self::restorable(rel, &state_parts, &session));
+            Ok(rest.map(|rest| Destination {
+                path: self.home_dir().join(rest),
                 content: Content::Opaque,
                 mutability: Mutability::Replaceable,
-            });
-        }
-        files::verify(state, manifest.files())?;
-        let departure = Departure::read(&self.departure_path(manifest.session()))?;
-        let placed = files::place_all(&placements, &departure)?;
-        info!(session = %manifest.session(), agent = %self.program, files = placed.len(), "acp: restored");
-        Ok(Restored { manifest, placed })
+            }))
+        })?;
+        info!(%session, agent = %self.program, files = restored.placed.len(), "acp: restored");
+        Ok(restored)
     }
 
     async fn restore_impl(&self, workspace: &Path, state: &Path) -> Result<Restored, HarnessError> {
-        let root = harness::physical_workspace(workspace)?;
-        let manifest = StateManifest::read(state)?;
-        if *manifest.kind() != self.kind() {
-            return Err(HarnessError::WrongHarness {
-                captured: manifest.kind().clone(),
-                restoring: self.kind(),
-            });
-        }
+        let root = pipeline::physical_workspace(workspace)?;
+        let manifest = pipeline::open(state, &self.kind(), &root, &self.home)?;
         let adapter = self.clone();
         let state = state.to_path_buf();
-        harness::blocking(move || adapter.restore_sync(&root, &state, manifest)).await
+        pipeline::blocking(move || adapter.restore_sync(&state, manifest)).await
     }
 
     async fn detect_impl(&self) -> Result<Option<Installed>, HarnessError> {
@@ -297,9 +267,15 @@ impl AcpHarness {
         prompt: Option<String>,
         env: &[(EnvVarName, String)],
     ) -> Result<AcpRunning, HarnessError> {
-        let root = harness::physical_workspace(workspace)?;
+        let root = pipeline::physical_workspace(workspace)?;
         let binary = self.binary()?;
-        let (mut child, pid) = process::spawn(&binary, &self.args, &root, env, Wiring::Rpc)?;
+        let (mut child, pid) = process::spawn(
+            &binary,
+            &self.args,
+            pipeline::fs_path(&root),
+            env,
+            Wiring::Rpc,
+        )?;
         // Until the session is open, an error or a dropped future kills the
         // agent's group, so no agent is left running without a handle.
         let guard = process::GroupGuard::new(pid);
@@ -329,22 +305,21 @@ impl AcpHarness {
     async fn open_session(
         &self,
         client: &AcpClient,
-        root: &Path,
+        cwd: &AbsPath,
         resume: Option<SessionId>,
     ) -> Result<SessionId, HarnessError> {
         let capabilities = client.initialize().await?;
-        let cwd = root.to_string_lossy().into_owned();
         match resume {
             None => {
-                let session = client.new_session(&cwd).await?;
+                let session = client.new_session(cwd).await?;
                 info!(%session, agent = %self.program, "acp: new session");
                 Ok(session)
             }
             Some(session) => {
                 if capabilities.resume {
-                    client.resume_session(&session, &cwd).await?;
+                    client.resume_session(&session, cwd).await?;
                 } else if capabilities.load_session {
-                    client.load_session(&session, &cwd).await?;
+                    client.load_session(&session, cwd).await?;
                 } else {
                     return Err(HarnessError::LoadNotSupported {
                         program: self.program.to_string(),
@@ -415,6 +390,18 @@ impl Harness for AcpHarness {
         out: &'a Path,
     ) -> BoxFuture<'a, Result<StateManifest, HarnessError>> {
         Box::pin(self.capture_impl(workspace, session, out))
+    }
+
+    fn confirm_departure<'a>(
+        &'a self,
+        manifest: &'a StateManifest,
+    ) -> BoxFuture<'a, Result<(), HarnessError>> {
+        let records = self.departure(manifest.session());
+        let manifest = manifest.clone();
+        let kind = self.kind();
+        Box::pin(pipeline::blocking(move || {
+            pipeline::confirm_departure(&manifest, &kind, Some(&records))
+        }))
     }
 
     fn restore<'a>(

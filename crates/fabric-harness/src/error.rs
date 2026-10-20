@@ -27,6 +27,12 @@ pub enum HarnessError {
         /// The path that was given.
         path: PathBuf,
     },
+    /// A path this crate must record or compare as text is not UTF-8.
+    #[error("{path} is not UTF-8")]
+    NotUtf8 {
+        /// The path concerned.
+        path: PathBuf,
+    },
     /// A directory an adapter was configured with is not under the home it serves.
     #[error("{path} is not under home {home}")]
     NotUnderHome {
@@ -73,11 +79,31 @@ pub enum HarnessError {
         /// The tree path from the manifest.
         path: String,
     },
+    /// A manifest entry has another content kind or mutability than the
+    /// adapter's own rule for its path.
+    #[error(
+        "refusing to restore {path}: the manifest treats it otherwise than the {kind} adapter does"
+    )]
+    EntryMismatch {
+        /// The harness restoring.
+        kind: HarnessKind,
+        /// The tree path from the manifest.
+        path: String,
+    },
+    /// A departure was confirmed for a capture this node did not make, or
+    /// one a later capture of the same session replaced.
+    #[error(
+        "no capture of session {session} with this manifest waits on this node; nothing was confirmed"
+    )]
+    DepartureNotPending {
+        /// The session concerned.
+        session: SessionId,
+    },
     /// A file operation failed.
     #[error("{op} {path}: {source}")]
     Io {
-        /// What was being done: `read`, `write`, `create dir`, `walk`, `rename`, `fsync`, `lock`, `canonicalize`.
-        op: &'static str,
+        /// What was being done.
+        op: IoOp,
         /// The path concerned.
         path: PathBuf,
         /// The underlying error.
@@ -92,6 +118,15 @@ pub enum HarnessError {
         /// The underlying error.
         #[source]
         source: std::io::Error,
+    },
+    /// `ps`, `pgrep` or `kill` gave an answer this crate cannot read as
+    /// yes or no, so a question about running processes is not answered.
+    #[error("{program}: {reason}")]
+    ProcessQuery {
+        /// The tool that was asked.
+        program: &'static str,
+        /// What it answered.
+        reason: String,
     },
     /// The thread that ran a capture or restore ended without an answer.
     #[error("the task running the operation was cancelled or panicked: {source}")]
@@ -186,11 +221,11 @@ pub enum HarnessError {
         /// Its process ids.
         pids: Vec<u32>,
     },
-    /// A captured manifest or a vendor file did not parse.
+    /// A captured manifest, a record of this crate or a vendor file did not parse.
     #[error("{what} at {path} does not parse: {reason}")]
     Malformed {
-        /// What was being parsed: `manifest`, `rollout line`, `config json`, `state path`, `workspace path`.
-        what: &'static str,
+        /// What was being parsed.
+        what: Input,
         /// The file concerned.
         path: PathBuf,
         /// The parser's message.
@@ -232,6 +267,30 @@ pub enum HarnessError {
         /// The agent program.
         program: String,
     },
+    /// The launch environment sets a variable that makes the harness keep
+    /// its state or login somewhere other than the adapter reads and writes.
+    #[error(
+        "the launch environment sets {var}, which moves {moves} of {program} away from where Fabric reads them; unset {var}"
+    )]
+    ConfigMoved {
+        /// The harness program.
+        program: String,
+        /// The variable the launch environment sets.
+        var: &'static str,
+        /// What the variable moves, in words.
+        moves: &'static str,
+    },
+    /// The launch environment makes Codex keep its sessions and login in
+    /// another directory than the store the adapter reads.
+    #[error(
+        "the launch environment makes codex keep its sessions and login under {dir}, but Fabric reads {store}; launch with CODEX_HOME set to {store}"
+    )]
+    CodexHomeMismatch {
+        /// The directory Codex would use.
+        dir: PathBuf,
+        /// The store the adapter reads.
+        store: PathBuf,
+    },
     /// A settings or MCP overlay holds a literal secret instead of a reference.
     #[error("{path} holds a literal secret; use a ${{VAR}} reference in an overlay")]
     SecretInOverlay {
@@ -250,9 +309,80 @@ pub enum HarnessError {
     Acp(#[from] crate::acp::client::AcpError),
 }
 
+/// The file operation that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IoOp {
+    /// Reading a file or its metadata.
+    Read,
+    /// Writing a file or setting its mode.
+    Write,
+    /// Creating a directory.
+    CreateDir,
+    /// Listing a directory.
+    Walk,
+    /// Renaming a file into place.
+    Rename,
+    /// Flushing a file or directory to disk.
+    Fsync,
+    /// Taking a file lock.
+    Lock,
+    /// Resolving a path to its physical form.
+    Canonicalize,
+    /// Removing a file.
+    Remove,
+}
+
+impl std::fmt::Display for IoOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            IoOp::Read => "read",
+            IoOp::Write => "write",
+            IoOp::CreateDir => "create dir",
+            IoOp::Walk => "walk",
+            IoOp::Rename => "rename",
+            IoOp::Fsync => "fsync",
+            IoOp::Lock => "lock",
+            IoOp::Canonicalize => "canonicalize",
+            IoOp::Remove => "remove",
+        })
+    }
+}
+
+/// The kind of input that did not parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Input {
+    /// A state manifest.
+    Manifest,
+    /// A departure record under `~/.fabric/harness/departed/`.
+    DepartureRecord,
+    /// The first line of a Codex rollout.
+    RolloutLine,
+    /// Claude's `~/.claude.json`.
+    ConfigJson,
+    /// A path inside a state tree.
+    StatePath,
+    /// A workspace path that a manifest or a harness setting cannot hold.
+    WorkspacePath,
+}
+
+impl std::fmt::Display for Input {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Input::Manifest => "manifest",
+            Input::DepartureRecord => "departure record",
+            Input::RolloutLine => "rollout line",
+            Input::ConfigJson => "config json",
+            Input::StatePath => "state path",
+            Input::WorkspacePath => "workspace path",
+        })
+    }
+}
+
 impl HarnessError {
     /// Wraps an IO error with the operation and the path it concerned.
-    pub(crate) fn io(op: &'static str, path: impl Into<PathBuf>, source: std::io::Error) -> Self {
+    pub(crate) fn io(op: IoOp, path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         HarnessError::Io {
             op,
             path: path.into(),

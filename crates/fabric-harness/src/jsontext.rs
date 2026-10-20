@@ -374,6 +374,41 @@ fn element_removal(text: &str, span: &Range<usize>) -> Range<usize> {
     span.clone()
 }
 
+/// The raw text of every JSON string literal in `text`, quotes included,
+/// read left to right. On a JSON line this is every key and every string
+/// value; on other text it is whatever sits between pairs of quotes.
+fn string_literals(text: &str) -> impl Iterator<Item = &str> {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        let start = at + bytes.get(at..)?.iter().position(|b| *b == b'"')?;
+        let end = scan_string(bytes, start).ok()?;
+        at = end;
+        text.get(start..end)
+    })
+}
+
+/// True when a JSON string literal holds a secret once its escapes are
+/// decoded. A literal that does not decode holds nothing here; the raw
+/// match covers it.
+fn literal_holds_secret(raw: &str, redactor: &Redactor) -> bool {
+    serde_json::from_str::<String>(raw).is_ok_and(|decoded| redactor.matches(&decoded))
+}
+
+/// True when `bytes` hold a secret shape, as they are or inside a JSON
+/// string once its escapes are decoded. Inside a JSON string a newline is
+/// `\n` and a quote is `\"`, which hide an env line or a quoted value from
+/// a match on the raw bytes, so every string literal is decoded and
+/// matched too, keys included. Bytes that are not UTF-8 are read with
+/// replacement characters for the decoded pass.
+pub(crate) fn holds_secret(bytes: &[u8], redactor: &Redactor) -> bool {
+    if redactor.matches_bytes(bytes) {
+        return true;
+    }
+    let text = String::from_utf8_lossy(bytes);
+    string_literals(&text).any(|raw| literal_holds_secret(raw, redactor))
+}
+
 /// Redacts every string outside signed blocks of one JSON text, dropping
 /// a signed array element that holds a secret.
 pub fn transform(text: &str, redactor: &Redactor) -> Result<Outcome, TransformError> {
@@ -381,12 +416,24 @@ pub fn transform(text: &str, redactor: &Redactor) -> Result<Outcome, TransformEr
     let mut outcome = Outcome::default();
     let mut edits: Vec<(Range<usize>, String)> = Vec::new();
 
+    // A block holds a secret when its raw text matches or when one of its
+    // strings does once decoded: an escaped newline or quote hides an env
+    // line or a quoted value from the raw match. Strings are recorded in
+    // order and never overlap, so those inside a span are one run.
+    let holds_secret = |span: &Range<usize>| {
+        let first = scan.strings.partition_point(|s| s.start < span.start);
+        redactor.matches(&text[span.clone()])
+            || scan.strings[first..]
+                .iter()
+                .take_while(|s| s.end <= span.end)
+                .any(|s| literal_holds_secret(&text[s.clone()], redactor))
+    };
     // A signed block nested in another one that is dropped goes with it,
     // so only the outermost blocks that hold a secret are considered.
     let mut holding: Vec<&SignedBlock> = scan
         .signed
         .iter()
-        .filter(|block| redactor.matches(&text[block.span.clone()]))
+        .filter(|block| holds_secret(&block.span))
         .collect();
     holding.sort_by_key(|block| (block.span.start, std::cmp::Reverse(block.span.end)));
     let mut dropped: Vec<Range<usize>> = Vec::new();
@@ -539,6 +586,24 @@ mod tests {
             r#"[1, {{"type":"thinking","thinking":"{ANTHROPIC}","signature":"a"}}, {{"type":"thinking","thinking":"{GITHUB}","signature":"b"}}]"#
         );
         assert_eq!(redact(&trailing_run).unwrap().text.unwrap(), "[1]");
+    }
+
+    #[test]
+    fn a_signed_block_whose_secret_hides_behind_an_escape_is_dropped() {
+        for thinking in [
+            r#"the .env has DB_PASSWORD=\"s3cretpass99\" and more"#,
+            r"NODE_ENV=dev\nAPI_KEY=abcd1234efgh",
+        ] {
+            let line = format!(
+                r#"{{"content":[{{"type":"thinking","thinking":"{thinking}","signature":"s"}},{{"type":"text","text":"a"}}]}}"#
+            );
+            let out = redact(&line).unwrap();
+            assert_eq!(out.dropped_signed_blocks, 1, "{thinking}");
+            assert_eq!(
+                out.text.unwrap(),
+                r#"{"content":[{"type":"text","text":"a"}]}"#
+            );
+        }
     }
 
     #[test]
