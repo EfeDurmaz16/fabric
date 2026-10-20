@@ -3,8 +3,9 @@
 //! Invariant: one handshake never holds up another. Each socket a listener
 //! accepts finishes its handshake in its own task under `HANDSHAKE_TIMEOUT`,
 //! at most `MAX_HANDSHAKES` at once and at most `MAX_PER_SOURCE` from one
-//! source address, so a host that opens sockets and stays silent holds a
-//! few slots, not all of them. Only a finished connection from a
+//! source, so a host that opens sockets and stays silent holds a few slots,
+//! not all of them. A source is an IPv4 address or an IPv6 /64, since one
+//! IPv6 host is given a whole /64 and could otherwise count as many. Only a finished connection from a
 //! node that is still paired reaches the queue that `accept` reads. Reading
 //! the queue is cancel-safe, so a caller that races two transports in
 //! `select!` drops no half-done handshake. The trust decision is refreshed
@@ -13,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
@@ -29,7 +30,7 @@ pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The most handshakes one listener runs at once; the next socket waits for a slot.
 pub(crate) const MAX_HANDSHAKES: usize = 32;
 
-/// The most handshakes one source address may run at once; a socket over it is refused.
+/// The most handshakes one source may run at once; a socket over it is refused.
 pub(crate) const MAX_PER_SOURCE: usize = 4;
 
 /// How many finished connections wait for `accept` before handshakes wait instead.
@@ -79,27 +80,53 @@ impl Drop for Inbox {
     }
 }
 
-/// How many handshakes each source address runs now.
-type Sources = Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>;
+/// What the per-source cap counts by: an IPv4 address, or the /64 that one IPv6 host is given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Source {
+    /// An IPv4 address, also when it arrives mapped into IPv6.
+    V4(Ipv4Addr),
+    /// The first 64 bits of an IPv6 address.
+    V6([u16; 4]),
+}
 
-/// One running handshake's claim on its source address; dropping it gives the claim back.
+impl From<IpAddr> for Source {
+    fn from(ip: IpAddr) -> Self {
+        match ip {
+            IpAddr::V4(v4) => Source::V4(v4),
+            IpAddr::V6(v6) => {
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    Source::V4(v4)
+                } else {
+                    let [a, b, c, d, ..] = v6.segments();
+                    Source::V6([a, b, c, d])
+                }
+            }
+        }
+    }
+}
+
+/// How many handshakes each source runs now.
+type Sources = Arc<std::sync::Mutex<HashMap<Source, usize>>>;
+
+/// One running handshake's claim on its source; dropping it gives the claim back.
 struct SourceClaim {
     sources: Sources,
-    ip: IpAddr,
+    source: Source,
 }
 
 impl SourceClaim {
-    /// Claims a place for `ip`, or `None` when it already runs `MAX_PER_SOURCE` handshakes.
+    /// Claims a place for `ip`'s source, or `None` when it already runs `MAX_PER_SOURCE` handshakes.
     fn take(sources: &Sources, ip: IpAddr) -> Option<Self> {
+        let source = Source::from(ip);
         let mut running = sources.lock().unwrap_or_else(PoisonError::into_inner);
-        let count = running.entry(ip).or_default();
+        let count = running.entry(source).or_default();
         if *count >= MAX_PER_SOURCE {
             return None;
         }
         *count += 1;
         Some(Self {
             sources: Arc::clone(sources),
-            ip,
+            source,
         })
     }
 }
@@ -107,10 +134,10 @@ impl SourceClaim {
 impl Drop for SourceClaim {
     fn drop(&mut self) {
         let mut running = self.sources.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(count) = running.get_mut(&self.ip) {
+        if let Some(count) = running.get_mut(&self.source) {
             *count -= 1;
             if *count == 0 {
-                running.remove(&self.ip);
+                running.remove(&self.source);
             }
         }
     }
@@ -243,5 +270,24 @@ mod tests {
         for mut dropped in held {
             assert_eq!(dropped.try_recv(), Err(oneshot::error::TryRecvError::Empty));
         }
+    }
+
+    /// One IPv6 host owns a /64, so addresses in one /64 count as one
+    /// source, and an IPv4 address counts the same mapped into IPv6.
+    #[test]
+    fn a_source_is_an_ipv4_address_or_an_ipv6_64() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(
+            Source::from(ip("2001:db8:1:2::1")),
+            Source::from(ip("2001:db8:1:2:ffff::9"))
+        );
+        assert_ne!(
+            Source::from(ip("2001:db8:1:2::1")),
+            Source::from(ip("2001:db8:1:3::1"))
+        );
+        assert_eq!(
+            Source::from(ip("::ffff:203.0.113.7")),
+            Source::from(ip("203.0.113.7"))
+        );
     }
 }
