@@ -321,6 +321,11 @@ impl Node {
         })
     }
 
+    /// Its state directory, the `FABRIC_HOME` its commands run with.
+    pub fn state(&self) -> &Path {
+        &self.state
+    }
+
     /// The address it listens on.
     pub fn addr(&self) -> String {
         format!("127.0.0.1:{}", self.port)

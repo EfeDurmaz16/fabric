@@ -10,7 +10,10 @@
 mod world;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
+
+use fabric_env::materialize::TreeLock;
 
 use world::{
     Env, Fallible, Node, OtherClaude, Wire, Work, alive, edit, finish, pair, read_work, text,
@@ -89,12 +92,14 @@ fn assert_one_owner(
     );
     assert_eq!(here.view, "owner");
     assert_eq!(there.view, other_view);
-    let refusal = other.fails(&["job", "run", job])?;
+    let refused = other.run(&["job", "run", job])?;
+    let refusal = text(&refused);
     assert!(
         refusal.contains("does not run") || refusal.contains("is owned by"),
         "{} refused for another reason:\n{refusal}",
         other.name
     );
+    assert_eq!(refused.status.code(), Some(81), "not the owner:\n{refusal}");
     Ok(())
 }
 
@@ -524,6 +529,33 @@ fn e2e_an_owner_that_stayed_up_through_a_steal_refuses_to_run() -> Fallible {
     let output = finish(running, GIVE_UP)?;
     assert!(!output.status.success(), "{}", text(&output));
     assert!(!alive(pid), "the owner's harness outlived the fork");
+    Ok(())
+}
+
+/// The exit codes of ADR 0016 that the other tests do not reach: scripts
+/// and the triggers of ADR 0008 read them, so each is pinned here.
+#[test]
+fn e2e_refusals_exit_with_their_documented_codes() -> Fallible {
+    let p = setup(Wire::TcpTls, None, None)?;
+    let (job, _) = job_with_work(&p)?;
+
+    let nowhere = Node::new(&p.env, "nowhere", Wire::TcpTls)?;
+    fs::set_permissions(nowhere.state(), fs::Permissions::from_mode(0o700))?;
+    let no_daemon = nowhere.run(&["job", "ls"])?;
+    assert_eq!(no_daemon.status.code(), Some(80), "{}", text(&no_daemon));
+
+    // Another run of the workspace holds it while it starts its harness.
+    let held = TreeLock::acquire(&p.a.state().join("locks"), &p.env.work(&job))?;
+    let busy = p.a.run(&["job", "run", &job])?;
+    assert_eq!(busy.status.code(), Some(85), "{}", text(&busy));
+    drop(held);
+
+    let (running, pid) = p.a.run_lingering(&job)?;
+    let twice = p.a.run(&["job", "run", &job])?;
+    assert_eq!(twice.status.code(), Some(85), "{}", text(&twice));
+    p.a.ok(&["job", "suspend", &job])?;
+    finish(running, GIVE_UP)?;
+    assert!(!alive(pid), "the suspend left the harness running");
     Ok(())
 }
 
