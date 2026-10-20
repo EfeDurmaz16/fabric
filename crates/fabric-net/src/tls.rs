@@ -77,9 +77,17 @@ pub enum TlsError {
 }
 
 /// The accept-side trust decision: is this node one we paired with?
+///
+/// `is_paired` runs inside the TLS verifier, on the thread that drives the
+/// handshake and, for QUIC, every connection of the endpoint, so it must
+/// not block. Anything that reads a file belongs in `refresh`, which the
+/// accept path runs on a blocking thread before each handshake.
 pub trait Trust: Send + Sync + fmt::Debug {
-    /// Returns true when `node` may connect to this node.
+    /// Returns true when `node` may connect to this node, without blocking.
     fn is_paired(&self, node: NodeId) -> bool;
+
+    /// Brings the decision up to date; it may block on file IO.
+    fn refresh(&self) {}
 }
 
 /// The one crypto provider of the crate, ring, shared by TLS and key generation.

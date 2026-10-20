@@ -5,7 +5,9 @@
 //! at most `MAX_HANDSHAKES` at once, and only a finished connection from a
 //! node that is still paired reaches the queue that `accept` reads. Reading
 //! the queue is cancel-safe, so a caller that races two transports in
-//! `select!` drops no half-done handshake.
+//! `select!` drops no half-done handshake. The trust decision is refreshed
+//! on a blocking thread before each handshake and again after it, so the
+//! verifier inside the handshake never touches a file.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -95,22 +97,32 @@ impl Handshakes {
         let trust = Arc::clone(&self.trust);
         tokio::spawn(async move {
             let _slot = slot;
-            match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
-                Err(_) => tracing::debug!(%remote, "handshake timed out"),
-                Ok(Err(err)) => tracing::debug!(%remote, error = %err, "handshake refused"),
-                // The verifier checked pairing inside the handshake; checking
-                // again here keeps an unpair made during the handshake.
-                Ok(Ok(connection)) if !trust.is_paired(connection.peer()) => {
-                    tracing::info!(%remote, peer = %connection.peer(), "peer unpaired during the handshake");
-                    connection.close();
-                }
-                Ok(Ok(connection)) => {
-                    // A send fails only when the transport is gone, and then
-                    // dropping the connection is the right end for it.
-                    let _ = tx.send(connection).await;
-                }
+            refresh(&trust).await;
+            let connection = match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
+                Err(_) => return tracing::debug!(%remote, "handshake timed out"),
+                Ok(Err(err)) => return tracing::debug!(%remote, error = %err, "handshake refused"),
+                Ok(Ok(connection)) => connection,
+            };
+            // The verifier checked pairing inside the handshake; checking
+            // again here keeps an unpair made during the handshake.
+            refresh(&trust).await;
+            if !trust.is_paired(connection.peer()) {
+                tracing::info!(%remote, peer = %connection.peer(), "peer unpaired during the handshake");
+                connection.close();
+                return;
             }
+            // A send fails only when the transport is gone, and then
+            // dropping the connection is the right end for it.
+            let _ = tx.send(connection).await;
         });
         true
+    }
+}
+
+/// Runs `trust.refresh` on a blocking thread, off the threads that drive connections.
+async fn refresh(trust: &Arc<dyn Trust>) {
+    let trust = Arc::clone(trust);
+    if let Err(err) = tokio::task::spawn_blocking(move || trust.refresh()).await {
+        tracing::error!(error = %err, "refreshing the trust decision failed");
     }
 }

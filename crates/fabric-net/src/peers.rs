@@ -7,8 +7,10 @@
 //! Two processes share one book file: `fabric node pair` runs by hand while
 //! the daemon serves. Every change therefore reloads the file under an
 //! exclusive lock before it applies, so no writer overwrites another's
-//! pairing, and every trust check reloads the file when it changed, so a
-//! pairing made after the daemon started is honoured at the next handshake.
+//! pairing, and `refresh`, which the accept path runs before every
+//! handshake, reloads the file when it changed, so a pairing made after the
+//! daemon started is honoured at the next handshake. The check inside the
+//! handshake reads only the book in memory.
 //!
 //! Pairing v0 is out of band: `fabric node pair <id>@<host>:<port>` on each
 //! side. A short pairing code, where one side shows six words and the other
@@ -455,9 +457,10 @@ struct Cached {
 /// The peer book behind a file that other processes write too.
 ///
 /// A change reloads the file under an exclusive lock, applies, saves and
-/// swaps the cache. A read reloads the file under a shared lock when its
-/// stamp changed. The cache lock is held only to swap or clone, never
-/// across file IO, so a handshake's trust check does not wait on a save.
+/// swaps the cache. `refresh` reloads the file under a shared lock when
+/// its stamp changed. `is_paired` reads only the cache, and the cache lock
+/// is held only to swap or clone, never across file IO, so a handshake's
+/// trust check never waits on a save.
 #[derive(Debug)]
 pub struct Peers {
     path: PathBuf,
@@ -483,7 +486,7 @@ impl Peers {
     /// Returns a copy of the book as the file holds it now.
     #[must_use]
     pub fn snapshot(&self) -> PeerBook {
-        self.refresh();
+        self.reload();
         PeerBook::clone(&self.book())
     }
 
@@ -512,13 +515,13 @@ impl Peers {
         Ok(())
     }
 
-    /// Reloads the book if the file changed since it was last read.
+    /// Reloads the book if the file changed since it was last read; it blocks on file IO.
     ///
     /// Trust fails closed: a file that cannot be read or parsed pairs no
     /// one until it can, so a hand edit that revokes a node and slips in a
     /// typo never leaves that node trusted. A file that is gone empties the
     /// book too.
-    fn refresh(&self) {
+    fn reload(&self) {
         let stamp = match Stamp::of(&self.path) {
             Ok(stamp) => stamp,
             Err(err) => {
@@ -584,8 +587,11 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 impl Trust for Peers {
     fn is_paired(&self, node: NodeId) -> bool {
-        self.refresh();
         self.book().is_paired(node)
+    }
+
+    fn refresh(&self) {
+        self.reload();
     }
 }
 
@@ -703,6 +709,7 @@ mod tests {
 
         let on_disk = PeerBook::load(&path).unwrap();
         assert!(on_disk.is_paired(node(1)) && on_disk.is_paired(node(2)));
+        daemon.refresh();
         assert!(
             daemon.is_paired(node(2)),
             "the daemon honours the CLI's pairing"
@@ -710,6 +717,7 @@ mod tests {
         assert_eq!(cli.snapshot().get(node(1)).unwrap().last_seen_ms, Some(5));
 
         fs::remove_file(&path).unwrap();
+        daemon.refresh();
         assert!(!daemon.is_paired(node(1)), "a removed book pairs no one");
     }
 
@@ -744,9 +752,11 @@ mod tests {
         assert!(daemon.is_paired(node(1)));
 
         fs::write(&path, format!("{} - -\nnot a peer line\n", node(2))).unwrap();
+        daemon.refresh();
         assert!(!daemon.is_paired(node(1)) && !daemon.is_paired(node(2)));
 
         fs::write(&path, format!("{} - -\n", node(2))).unwrap();
+        daemon.refresh();
         assert!(daemon.is_paired(node(2)), "a fixed book is read again");
     }
 

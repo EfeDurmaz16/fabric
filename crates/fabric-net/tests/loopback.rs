@@ -17,6 +17,7 @@ use fabric_core::lease::FencingToken;
 use fabric_net::endpoint::Endpoint;
 use fabric_net::frame::{FRAME_VERSION, MAX_CONTROL_FRAME};
 use fabric_net::identity::NodeIdentity;
+use fabric_net::peers::Peers;
 use fabric_net::quic::QuicTransport;
 use fabric_net::rpc::{RpcError, Service, Session};
 use fabric_net::tcp::TcpTlsTransport;
@@ -66,7 +67,14 @@ impl Node {
         kind: TransportKind,
         paired: &[NodeId],
     ) -> Result<Arc<dyn Transport>, TransportError> {
-        let trust: Arc<dyn Trust> = Arc::new(Paired(paired.to_vec()));
+        self.bind_trusting(kind, Arc::new(Paired(paired.to_vec())))
+    }
+
+    fn bind_trusting(
+        &self,
+        kind: TransportKind,
+        trust: Arc<dyn Trust>,
+    ) -> Result<Arc<dyn Transport>, TransportError> {
         let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
         Ok(match kind {
             TransportKind::Quic => Arc::new(QuicTransport::bind(&self.identity, trust, addr)?),
@@ -280,6 +288,30 @@ async fn a_refused_dial_does_not_fall_back_to_tcp() -> TestResult {
         matches!(err, TransportError::Tls(TlsError::PeerMismatch { .. })),
         "{err}"
     );
+    Ok(())
+}
+
+/// `fabric node pair` writes the book from another process while the daemon
+/// serves. A pairing written after the daemon bound its port is honoured at
+/// the next handshake: the book is read before the handshake, so the
+/// verifier inside it reads no file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pairing_written_after_bind_is_honoured_at_the_next_handshake() -> TestResult {
+    for kind in BOTH {
+        let (a, b) = (Node::new()?, Node::new()?);
+        let dir = tempfile::tempdir()?;
+        let book = dir.path().join("peers");
+        let server = b.bind_trusting(kind, Peers::open(&book)?)?;
+        let client = a.bind(kind, &[b.id()])?;
+        Peers::open(&book)?.update(|peers| peers.pair(a.id(), None))?;
+
+        let accepting = {
+            let server = server.clone();
+            tokio::spawn(async move { tokio::time::timeout(DEADLINE, server.accept()).await })
+        };
+        let _connection = client.connect(b.id(), server.local_addr()?).await?;
+        assert_eq!(accepting.await???.peer(), a.id(), "{kind}");
+    }
     Ok(())
 }
 
