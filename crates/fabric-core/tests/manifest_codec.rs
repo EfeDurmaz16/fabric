@@ -538,6 +538,32 @@ fn a_remote_url_with_userinfo_on_the_wire_does_not_decode() {
     ));
 }
 
+/// SHA-1 and SHA-256 repositories do not interoperate, so a manifest whose
+/// ids mix the two widths could not be restored into any repository.
+#[test]
+fn mixed_object_id_widths_are_refused() {
+    let sha256 = GitOid::parse(&"d".repeat(64)).unwrap();
+    let mixes: [fn(&mut GitState, GitOid); 4] = [
+        |g, oid| g.refs[0].1 = oid,
+        |g, oid| g.head = GitHead::Detached(oid),
+        |g, oid| g.index_commit = oid,
+        |g, oid| g.worktree_commit = oid,
+    ];
+    for mix in mixes {
+        let mut m = fixed_manifest().unwrap();
+        mix(m.git.as_mut().unwrap(), sha256.clone());
+        assert!(matches!(m.encode(), Err(ManifestError::MixedObjectFormat)));
+    }
+    let mut m = fixed_manifest().unwrap();
+    let git = m.git.as_mut().unwrap();
+    git.refs[0].1 = sha256.clone();
+    git.head = GitHead::Detached(sha256.clone());
+    git.index_commit = sha256.clone();
+    git.worktree_commit = sha256;
+    let bytes = m.encode().unwrap();
+    assert_eq!(SnapshotManifest::decode(&bytes).unwrap(), m);
+}
+
 #[test]
 fn trailing_bytes_do_not_decode() {
     let mut bytes = fixed_manifest().unwrap().encode().unwrap();
