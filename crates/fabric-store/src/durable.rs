@@ -7,7 +7,7 @@
 //! on macOS pushes its pages to the drive without flushing the drive's write
 //! cache, and the directory flush at the commit point issues `F_FULLFSYNC`,
 //! which flushes the whole device cache once for every file written before
-//! it (ADR 0004, Publish). A full flush per object measured 4 ms per file on
+//! it (ADR 0014, Publish). A full flush per object measured 4 ms per file on
 //! APFS, which is minutes for a `node_modules`; one per shard directory is
 //! at most 256 per publish. A shard is flushed when an object was linked
 //! into it in this process, and also when publish names an object that has

@@ -1,12 +1,15 @@
-//! Workspace capture (ADR 0004, What a workspace snapshot contains).
+//! Workspace capture (ADR 0004, What a workspace snapshot contains; as
+//! built in ADR 0014, Capture).
 //!
 //! Invariant: capture reads the workspace and writes only objects into the
 //! store, two private commits and one ref under `refs/fabric/` into the
 //! repository, and deletes the job's older refs under `refs/fabric/`. Its
 //! scratch files (index copies, the bundle) live in the store's `tmp/`,
 //! which open and gc clear, never in the user's `.git`. It never touches
-//! the real index, the working tree or the user's refs. A path or state that could not be restored faithfully fails
-//! here, where the user can act, and a secret never becomes an object.
+//! the real index, the working tree or the user's refs. A path or state
+//! that could not be restored faithfully fails here, where the user can
+//! act. An untracked secret never becomes an object; a tracked or stashed
+//! one, already in the user's object store, is named in the report.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
@@ -1050,11 +1053,10 @@ impl GitCapture<'_> {
     /// policy's patterns as the lowest-precedence excludes, which keeps most
     /// secrets out of the user's object store. The policy adds only positive
     /// patterns after the user's rules, so a path the ignored listing names
-    /// is never in `W`. A
-    /// negation in the repository's own ignore files can override that, so
-    /// the private index is then listed and every path that is not tracked
-    /// and that `leave_out` names is removed before the tree is written. The
-    /// removed paths are returned.
+    /// is never in `W`. A negation in the repository's own ignore files can
+    /// override that, so the private index is then listed and every path
+    /// that is not tracked and that `leave_out` names is removed before the
+    /// tree is written. The removed paths are returned.
     fn worktree_commit(
         &self,
         index_tree: &str,

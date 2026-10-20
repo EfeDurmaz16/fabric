@@ -1,4 +1,4 @@
-//! Workspace restore (ADR 0004, Restore).
+//! Workspace restore (ADR 0004, Restore; as built in ADR 0014, Restore).
 //!
 //! Invariant: restore writes into a staging directory beside the target and
 //! renames it into place only after every byte is written and, when asked,

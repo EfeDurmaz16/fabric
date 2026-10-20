@@ -3,8 +3,7 @@
 //! Invariant: the catalog never names an object that is not on disk. Publish
 //! writes and flushes every object before it inserts a row, gc deletes a row
 //! before it deletes the file, and `check` can prove the rule holds. Exactly
-//! one process holds a store open at a time (ADR 0004, One writer per data
-//! directory).
+//! one process holds a store open at a time (ADR 0014, One writer).
 
 use std::collections::HashSet;
 use std::fs::{self, File};

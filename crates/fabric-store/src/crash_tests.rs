@@ -1,6 +1,7 @@
 //! Crash tests. A child re-executes this test binary, stops at a named
-//! checkpoint inside store creation, publish or restore, and is killed with `SIGKILL`; the
-//! parent then asserts what ADR 0004 promises about the store and the target.
+//! checkpoint inside store creation, publish or restore, and is killed with
+//! `SIGKILL`; the parent then asserts what ADR 0014 promises about the store
+//! and the target.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
