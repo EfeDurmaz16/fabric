@@ -11,10 +11,11 @@ Core types, the store and the network layer. Nothing suspends or resumes yet.
 | What | State |
 |---|---|
 | Architecture page and glossary | Written: [docs/architecture.md](docs/architecture.md), [docs/glossary.md](docs/glossary.md) |
-| ADRs 0001 to 0014 | Written, see below; amended 2026-10-19 after the step 1 research; 0013 records the network protocol and 0014 the store as built |
+| ADRs 0001 to 0014 | Written, see below; amended 2026-10-19 after the step 1 research; the two 0013s and 0014 record the network protocol, the harness trait and the store as built |
 | `crates/fabric-core` | Ids, paths, the job ledger with its record codec, the lease and the cooperative move protocol, snapshot manifests and the environment spec. Pure: no IO, no clock, no socket. Property-tested against the ADR 0003 invariants. |
 | `crates/fabric-store` | Content-addressed objects (blake3, zstd, FastCDC above 8 MiB), the SQLite catalog with refcounts and a graced gc, workspace capture (git state as two private commits and a bundle, ignored files by class, secrets denied) and restore into an empty directory through a staging rename. Crash-tested with `SIGKILL` at every publish and restore checkpoint. No network, no ledger, no CLI. |
 | `crates/fabric-net` | Node key, pinned TLS with no CA, QUIC and TCP+TLS transports on one port behind one endpoint, framed and typed RPC with deadlines, paged ledger records and verified zstd chunk transfer, the peer book. Tested with two nodes in one process on both wires. See [docs/net.md](docs/net.md). |
+| `crates/fabric-harness` | The `Harness` trait and three adapters: Claude Code, Codex and any Agent Client Protocol agent. Captures a session into a redacted state tree with a manifest, restores it all or nothing under the same workspace path and home, never over state that would lose bytes, launches the harness in a new process group with typed flags. A hard-coded denylist keeps credentials and host state out of the tree. Crash-tested at every staged and placed file. |
 | Every other crate in the layout | Does not exist yet |
 | CI | fmt, clippy, test, doc, `cargo deny` and the hygiene script on macOS and Ubuntu |
 
@@ -42,6 +43,7 @@ One job, adopted with `fabric job init` from a checkout where Claude Code is alr
 | [0012](docs/adr/0012-dependency-carry.md) | Dependency carry |
 | [0013](docs/adr/0013-network-protocol-as-built.md) | The network protocol as built |
 | [0014](docs/adr/0014-store-as-built.md) | The store as built |
+| [0013](docs/adr/0013-harness-trait-as-built.md) | Harness trait as built |
 
 Start with the architecture page, then read the ADRs in order. ADR 0003 deserves the most attention; it is the one that protects the user's work. The research notes the ADRs cite are private and live outside this repository; the architecture page says what they are.
 
