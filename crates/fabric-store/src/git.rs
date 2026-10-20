@@ -10,6 +10,7 @@ use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::thread;
 
 use fabric_core::git::GitNameError;
 
@@ -187,13 +188,19 @@ impl Git {
             cmd.env(key, value);
         }
         let mut child = cmd.spawn().map_err(|source| GitError::Spawn { source })?;
-        if let Some(mut stdin) = child.stdin.take() {
-            // A closed pipe means git stopped reading, which the status reports.
-            let _ = stdin.write_all(input);
-        }
-        let output = child
-            .wait_with_output()
-            .map_err(|source| GitError::Spawn { source })?;
+        let stdin = child.stdin.take();
+        // Input is fed from its own thread while stdout drains here, so git
+        // never blocks on a full stdout pipe while this side blocks on stdin.
+        let output = thread::scope(|scope| {
+            if let Some(mut stdin) = stdin {
+                scope.spawn(move || {
+                    // A closed pipe means git stopped reading, which the status reports.
+                    let _ = stdin.write_all(input);
+                });
+            }
+            child.wait_with_output()
+        })
+        .map_err(|source| GitError::Spawn { source })?;
         Self::checked(args, output)
     }
 
@@ -229,5 +236,40 @@ impl Git {
             what,
             text: String::from_utf8_lossy(bytes).into_owned(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn input_and_output_larger_than_a_pipe_do_not_hang() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "p".repeat(200);
+        fs::write(dir.path().join(&name), "x").unwrap();
+        let git = Git::new(dir.path(), 0);
+        git.run(&["init", "-q"]).unwrap();
+        let lines = 20_000;
+        let input = format!("{name}\n").repeat(lines);
+
+        let (done, finished) = mpsc::channel();
+        thread::spawn(move || {
+            let outcome =
+                git.run_stdin_env(&["hash-object", "--stdin-paths"], &[], input.as_bytes());
+            let _ = done.send(outcome);
+        });
+        let out = finished
+            .recv_timeout(Duration::from_mins(1))
+            .expect("git hung on a full pipe")
+            .unwrap();
+        assert_eq!(
+            out.split(|b| *b == b'\n').filter(|l| !l.is_empty()).count(),
+            lines
+        );
     }
 }
