@@ -31,9 +31,9 @@ use crate::frame::{
 use crate::idle::IdleReader;
 use crate::transport::{Connection, Stream, TransportError, TransportKind};
 use crate::wire::{
-    ChunkBatch, Fault, FaultText, Hello, JobRequest, JobResponse, ManifestChunks, PROTOCOL_VERSION,
-    Request, RequestBody, RequestId, Response, ResponseBody, VersionText, WireError, decode,
-    encode, wall_clock_ms,
+    ChunkBatch, Facts, Fault, FaultText, Hello, JobRequest, JobResponse, ManifestChunks,
+    PROTOCOL_VERSION, Request, RequestBody, RequestId, Response, ResponseBody, VersionText,
+    WireError, decode, encode, wall_clock_ms,
 };
 
 /// A clock difference between two nodes above this is logged at `Hello`.
@@ -142,6 +142,8 @@ pub trait Service: Send + Sync {
     /// holds and could not read is `Fault::Internal`, so the peer never
     /// mistakes a failed read for a missing chunk.
     fn chunk(&self, peer: NodeId, id: ChunkId) -> BoxFuture<'_, Result<Vec<u8>, Fault>>;
+    /// Returns what this node measured about itself, for `peer`'s `fabric doctor` (ADR 0008).
+    fn facts(&self, peer: NodeId) -> BoxFuture<'_, Result<Facts, Fault>>;
 }
 
 /// An authenticated connection after the `Hello` exchange.
@@ -190,6 +192,7 @@ fn kind_of(body: &ResponseBody) -> &'static str {
         ResponseBody::Chunk { .. } => "chunk",
         ResponseBody::ChunksDone => "chunks done",
         ResponseBody::Fault(_) => "fault",
+        ResponseBody::Facts(_) => "facts",
     }
 }
 
@@ -422,6 +425,14 @@ impl Session {
         match self.call(body, deadline).await? {
             ResponseBody::Job(response) => Ok(response),
             other => Err(unexpected("job", &other)),
+        }
+    }
+
+    /// Asks what the peer measured about itself, waiting at most `deadline`.
+    pub async fn facts(&self, deadline: Duration) -> Result<Facts, RpcError> {
+        match self.call(RequestBody::Facts, deadline).await? {
+            ResponseBody::Facts(facts) => Ok(facts),
+            other => Err(unexpected("facts", &other)),
         }
     }
 
@@ -684,6 +695,10 @@ async fn handle(peer: NodeId, stream: Stream, service: Arc<dyn Service>) -> Resu
             .await
             .unwrap_or(Err(Fault::Deadline))
             .map_or_else(ResponseBody::Fault, ResponseBody::ManifestChunks),
+        RequestBody::Facts => timeout(budget, service.facts(peer))
+            .await
+            .unwrap_or(Err(Fault::Deadline))
+            .map_or_else(ResponseBody::Fault, ResponseBody::Facts),
         RequestBody::WantChunks(batch) => {
             send_chunks(peer, id, batch, budget, send.as_mut(), service.as_ref()).await?;
             send.shutdown().await.map_err(FrameError::Io)?;

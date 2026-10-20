@@ -23,7 +23,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::frame::MAX_CHUNK_BYTES;
 
 /// The protocol version both sides must speak; a mismatch ends the session at `Hello`.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// The most chunk ids one `WantChunks` request may name.
 pub const MAX_CHUNK_BATCH: usize = 256;
@@ -37,6 +37,15 @@ pub const MAX_FAULT_TEXT: usize = 256;
 /// The most bytes the length prefix of one record takes on the wire: a
 /// varint of a length up to `MAX_RECORD_LEN`.
 const RECORD_PREFIX: usize = 3;
+
+/// The most facts one `Facts` answer carries.
+pub const MAX_FACTS: usize = 64;
+
+/// The most bytes in a fact's name.
+pub const MAX_FACT_NAME: usize = 64;
+
+/// The most bytes in a fact's value; `rustc -vV` is about 300.
+pub const MAX_FACT_VALUE: usize = 4096;
 
 /// The most a page of records may cost, counting each record as its length
 /// plus `RECORD_PREFIX`: one record of the largest size, or many small ones.
@@ -74,6 +83,12 @@ pub enum WireError {
     /// A manifest is empty or longer than a reader decodes.
     #[error("a manifest is 1 to {MAX_MANIFEST_LEN} bytes, not {0}")]
     ManifestSize(u64),
+    /// A fact list is longer than `MAX_FACTS`.
+    #[error("a fact list holds at most {MAX_FACTS} facts, not {0}")]
+    FactCount(usize),
+    /// A fact list is not strictly sorted by name.
+    #[error("fact {0} is out of order or repeated")]
+    FactOrder(String),
     /// A manifest's chunk count cannot make its length.
     #[error("a manifest of {len} bytes cannot be {count} chunks")]
     ManifestChunkCount {
@@ -157,6 +172,57 @@ pub type VersionText = BoundedText<MAX_VERSION_LEN>;
 
 /// The text a `Fault` carries.
 pub type FaultText = BoundedText<MAX_FAULT_TEXT>;
+
+/// The name of one fact a node reports, such as `node.version`.
+pub type FactName = BoundedText<MAX_FACT_NAME>;
+
+/// The value of one fact, the tool's own output kept whole.
+pub type FactValue = BoundedText<MAX_FACT_VALUE>;
+
+/// What a node measured about itself for `fabric doctor` (ADR 0008): at
+/// most `MAX_FACTS` facts, strictly sorted by name, so one name has one value.
+///
+/// A fact the node could not measure is absent, never an empty string, so
+/// "not installed" and "installed and printed nothing" stay different.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct Facts(Vec<(FactName, FactValue)>);
+
+impl Facts {
+    /// Wraps `facts` if there are at most `MAX_FACTS` and the names are strictly sorted.
+    pub fn new(facts: Vec<(FactName, FactValue)>) -> Result<Self, WireError> {
+        if facts.len() > MAX_FACTS {
+            return Err(WireError::FactCount(facts.len()));
+        }
+        if let Some(pair) = facts.windows(2).find(|pair| pair[0].0 >= pair[1].0) {
+            return Err(WireError::FactOrder(pair[1].0.as_str().to_owned()));
+        }
+        Ok(Self(facts))
+    }
+
+    /// Returns the value of `name`, if the node measured it.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.0
+            .binary_search_by(|(key, _)| key.as_str().cmp(name))
+            .ok()
+            .map(|i| self.0[i].1.as_str())
+    }
+
+    /// Returns every fact, sorted by name.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+}
+
+impl<'de> Deserialize<'de> for Facts {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let facts = Vec::<(FactName, FactValue)>::deserialize(deserializer)?;
+        Self::new(facts).map_err(serde::de::Error::custom)
+    }
+}
 
 /// The first message in both directions on a new connection; it carries no job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -345,6 +411,8 @@ pub enum RequestBody {
     },
     /// Asks for the bytes of these chunks; answered with a run of `Chunk` then `ChunksDone`.
     WantChunks(ChunkBatch),
+    /// Asks what the peer measured about itself; answered with `Facts`.
+    Facts,
 }
 
 /// A per-job message (ADR 0003 and ADR 0005).
@@ -499,6 +567,8 @@ pub enum ResponseBody {
     ChunksDone,
     /// The request was understood but could not be served.
     Fault(Fault),
+    /// What the node measured about itself.
+    Facts(Facts),
 }
 
 /// The answer to a per-job message.
@@ -678,7 +748,24 @@ mod tests {
                 .prop_filter_map("batch", |ids| ChunkBatch::new(ids.into_iter().collect())
                     .ok())
                 .prop_map(RequestBody::WantChunks),
+            Just(RequestBody::Facts),
         ]
+    }
+
+    fn facts() -> impl Strategy<Value = Facts> {
+        proptest::collection::btree_map("[a-z.]{1,64}", "[ -~]{0,128}", 0..8).prop_map(|map| {
+            Facts::new(
+                map.into_iter()
+                    .map(|(name, value)| {
+                        (
+                            BoundedText::truncated(&name),
+                            BoundedText::truncated(&value),
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap()
+        })
     }
 
     fn job_response() -> impl Strategy<Value = JobResponse> {
@@ -727,6 +814,7 @@ mod tests {
                 .prop_map(|(id, zstd)| ResponseBody::Chunk { id, zstd }),
             Just(ResponseBody::ChunksDone),
             fault().prop_map(ResponseBody::Fault),
+            facts().prop_map(ResponseBody::Facts),
         ]
     }
 
@@ -886,6 +974,30 @@ mod tests {
             let bytes = encode(&Unchecked { len, ids }).unwrap();
             assert!(decode::<ManifestChunks>(&bytes).is_err(), "{why}");
         }
+    }
+
+    /// A fact list out of order, with a repeated name or over the cap does
+    /// not decode, so a name has one value and the list one byte form.
+    #[test]
+    fn a_fact_list_is_sorted_unique_and_bounded_on_decode() {
+        let pair = |name: &str, value: &str| (name.to_owned(), value.to_owned());
+        let refused = [
+            vec![pair("node.version", "v22"), pair("home", "/Users/x")],
+            vec![pair("home", "/Users/x"), pair("home", "/Users/y")],
+            (0..=MAX_FACTS)
+                .map(|i| pair(&format!("f{i:03}"), "v"))
+                .collect(),
+        ];
+        for facts in refused {
+            assert!(
+                decode::<Facts>(&encode(&facts).unwrap()).is_err(),
+                "{facts:?}"
+            );
+        }
+        let ok = vec![pair("home", "/Users/x"), pair("node.version", "v22")];
+        let facts = decode::<Facts>(&encode(&ok).unwrap()).unwrap();
+        assert_eq!(facts.get("node.version"), Some("v22"));
+        assert_eq!(facts.get("pnpm.version"), None);
     }
 
     #[test]

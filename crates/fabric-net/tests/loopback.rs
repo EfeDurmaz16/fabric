@@ -24,8 +24,8 @@ use fabric_net::tcp::TcpTlsTransport;
 use fabric_net::tls::{TlsError, Trust};
 use fabric_net::transport::{Connection, Transport, TransportError, TransportKind};
 use fabric_net::wire::{
-    ChunkBatch, Fault, FaultText, JobRequest, JobResponse, ManifestChunks, PROTOCOL_VERSION,
-    VersionText,
+    ChunkBatch, FactName, FactValue, Facts, Fault, FaultText, JobRequest, JobResponse,
+    ManifestChunks, PROTOCOL_VERSION, VersionText,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -146,6 +146,16 @@ impl Service for FakeService {
                 .map_err(|err| Fault::Internal(FaultText::truncated(&err.to_string())))
         })
     }
+
+    fn facts(&self, _peer: NodeId) -> BoxFuture<'_, Result<Facts, Fault>> {
+        Box::pin(async move {
+            Facts::new(vec![(
+                FactName::truncated("home"),
+                FactValue::truncated("/Users/x"),
+            )])
+            .map_err(|err| Fault::Internal(FaultText::truncated(&err.to_string())))
+        })
+    }
 }
 
 /// Accepts one connection, runs the acceptor's hello and serves until the connection ends or `stop` fires.
@@ -210,6 +220,7 @@ async fn paired_nodes_exchange_hello_and_ping() -> TestResult {
         assert_eq!(session.remote().protocol_version, PROTOCOL_VERSION);
         session.ping(DEADLINE).await?;
         session.ping(DEADLINE).await?;
+        assert_eq!(session.facts(DEADLINE).await?.get("home"), Some("/Users/x"));
 
         session.close();
         assert!(serving.await?.is_err(), "serve ends with the connection");

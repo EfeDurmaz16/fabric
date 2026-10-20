@@ -84,7 +84,8 @@ Every request runs on its own stream and carries a request number and the
 milliseconds the caller still allows. The caller's deadline fires whatever
 the peer does. The vocabulary is in `wire.rs`: `Hello`, `Ping`, per-job
 messages under a fencing token (job id and epoch), `WantSnapshot`,
-`WantChunks`. A caller asks through one typed method per request and a
+`WantChunks`, and `Facts`, which returns what the peer measured about
+itself for `fabric doctor` (ADR 0016; protocol version 2). A caller asks through one typed method per request and a
 service answers through one, so a request never gets an answer of the wrong
 kind. A per-job request runs to its end on the serving node even when the
 caller's deadline passes first; the caller treats that as an unknown
