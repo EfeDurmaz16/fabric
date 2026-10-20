@@ -1,0 +1,109 @@
+# ADR 0014: The store as built
+
+Status: accepted, 2026-10-20
+
+Supersedes these parts of ADR 0004: Store layout, the store half of One writer per data directory, Publish, the gc paragraph under Suspend, the file writer paragraph under Restore, the snapshot ref and ignore mechanics under What a workspace snapshot contains, and the catalog line under Consequences. Everything else in ADR 0004 stands: the manifest, the classes of ignored files, the marker, the suspend sequence, the in-place restore and transfer.
+
+## Context
+
+ADR 0004 described the store before any code existed. Building `fabric-store` (PR #7) and three rounds of review changed the layout, the publish order and many capture details. ADR 0004 then carried two amendment blocks that said its own body was wrong, which is the drift ADR 0009 forbids. This ADR records what the crate does and why. Each rule that can fail has a test, named in the Consequences.
+
+## Decision
+
+### Store layout
+
+```text
+store/
+  objects/ab/cdef...   one object per file, one zstd frame, named by blake3 of the uncompressed bytes
+  catalog.sqlite       schema_version, settings, chunks, snapshots, snapshot_chunks
+  tmp/                 scratch files of the lock holder; cleared at open and by gc
+  lock                 flock target
+```
+
+- There is no `manifests/` directory. A manifest's bytes are objects like any file's, by the same rule (one object up to the whole-file limit, FastCDC above it). `snapshot_chunks` records the manifest's object ids in order, with the role `Manifest`. A reader assembles them, checks the length and that the bytes hash to the `SnapshotId`, and only then decodes, under the 64 MiB bound. An assembled copy on disk would be a second thing to keep consistent.
+- `settings` holds the chunking parameters and the zstd level the store was created with. They are fixed for the life of the store, so the same bytes give the same ids on every node with the same settings.
+- `chunks` holds each object's id, its length on disk, its refcount and the time its last reference went. The refcount is the number of `snapshot_chunks` rows that name it, and `Store::check` recomputes it.
+- There is no `jobs` or `pins` table. They belong to the crate that owns the ledger.
+- The catalog runs with `journal_mode=WAL`, `synchronous=FULL` and `fullfsync=ON`. It is built under `catalog.sqlite.tmp` and renamed into place after the schema commits, so a `catalog.sqlite` that exists is complete.
+
+### One writer
+
+`Store::open` and `Store::create` take an exclusive `flock` on `<store>/lock` and fail with `StoreError::Locked { path }` when another process holds it. They never wait. The data-directory lock, the node socket and the split of work between the node and the CLI in ADR 0004 are the job crate's; it opens the store under its own lock, so the two never race.
+
+### Objects
+
+- `ChunkParams` is built only by `ChunkParams::new`, which keeps FastCDC's rules (`64 <= min <= avg <= max`, average from 256 bytes to 4 MiB) and bounds `max_size` and `whole_file_limit` by `MAX_OBJECT_LEN`, 8 MiB. No object is larger than the bulk frame of ADR 0005, and `read` sizes its buffer from that bound, never from a frame header alone.
+- An object is written to `tmp/`, flushed with a plain `fsync`, and hard-linked to its final name. A name that exists is never replaced, so two writers of the same object cannot replace each other's bytes. A reader decompresses and checks the hash before it hands bytes out.
+- `put_file` opens with `O_NOFOLLOW` and `O_NONBLOCK` and checks the type on the open descriptor. A symlink, FIFO, socket or device is refused with `NotRegular`; it is never followed, and a FIFO never blocks. `put_reader` reads at most the whole-file limit plus one byte at once and streams anything longer through FastCDC, so a file that grows while it is read is never held whole.
+- No hard links from the store into a workspace. Objects are compressed, so a link would hand the harness a zstd frame, and a tool that edits a file in place would rewrite the store's copy. Restore always writes bytes.
+
+### Publish
+
+`Store::publish` makes a manifest a published snapshot. The caller appends `SnapshotPublished` to the ledger afterwards, so the ledger stays the commit point (ADR 0002).
+
+1. Refuse a `bundle_base` the catalog does not have (`MissingBundleBase`).
+2. Every object the manifest names must be on disk (`MissingChunk` otherwise). An object that has no catalog row, and that this process did not link since its last flush, may come from a process that died before its flush; after a power loss its name can survive without its bytes. Publish re-reads and verifies such an object. A corrupt one is removed and publish fails with `CorruptUnpublished`, so the next capture writes it again. A good one has its shard directory marked for the flush.
+3. Write the manifest's bytes as objects. The same rule as step 2 applies to them.
+4. Flush every marked shard directory with `F_FULLFSYNC` (`fsync` on Linux). A flush that fails keeps its shards marked.
+5. One transaction inserts the snapshot row, the new chunk rows and every reference.
+
+Each object gets a plain `fsync` when it is written, and the shard directories get the one full flush. This is the split git's `core.fsyncMethod=batch` makes. With `F_FULLFSYNC` per object the bench captured 5,022 files in 20.7 s, 4 ms per file; with the split it took 1.8 s when the crate was written. Publishing a manifest the store already has returns its id and changes nothing.
+
+What this survives: a kill at every step, which the crash test proves by killing after the objects, after the flush, before the commit and after it; in every case `check` finds no row naming a missing object and a rerun ends in a clean store. A power loss after step 5, because every object a row names was flushed, or verified and flushed, before the row.
+
+### gc
+
+gc has two passes. One pass stamps chunks whose refcount reached zero; a later pass deletes stamped chunks once the grace has passed, the row first and the file second. An object file with no row, which a publish that died before its transaction leaves behind, is removed once its mtime is older than the grace. `tmp/` is cleared at open and at every gc.
+
+gc must not run between a capture and the publish of its manifest. Capture can reuse an object that is on disk without a row, and `put` does not refresh its mtime; a gc in between can remove it, and publish then fails with `MissingChunk`. That fails closed, and the capture must run again. The lock holder runs capture and publish as one step.
+
+### Losing the catalog
+
+A lost or corrupt catalog cannot be rebuilt from `objects/` alone. The order of a manifest's objects exists only in `snapshot_chunks`. A manifest of 8 MiB or less is one object and could be found by trying to decode every object, but a larger one is lost with the catalog, and so is every snapshot whose manifest is above the whole-file limit. The recovery path is a peer: the snapshot ids are in the ledger, which is a separate file, and a node fetches the snapshot again by id (ADR 0005). Making a single node self-recovering would need a small object per snapshot that lists its manifest's object ids; it is not built.
+
+### Capture: the git half
+
+- `I` is built from a copy of the index in `tmp/`, retried while `index.lock` exists and then refused with `GitBusy { IndexLocked }`. `W` is built in a private index seeded with `I`'s tree, by `git add -A`.
+- One exclude set. Git reads the user's default exclude file (`$XDG_CONFIG_HOME/git/ignore`, else `~/.config/git/ignore`) even with the global config off, while `-c core.excludesFile` replaces it. Capture therefore resolves that file once (or the repository's own `core.excludesFile`) and passes it explicitly to the untracked listing, the ignored listing, the LFS listing and `W`. For `W` the policy's secret and exclude patterns follow it in the same file. They are positive patterns only, so a path the ignored listing names is never in `W`. Before the manifest is validated, capture checks that no path is in both `files` and `W`, and fails with `IgnoredAndInWorktree` if one is: restore checks out `W` and then creates `files` exclusively, so such a snapshot would publish and never restore. A `core.excludesFile` set only in the user's global config is not read, like the rest of that config; a file it ignores is untracked to capture and travels in `W`.
+- Secrets and `W`. A negation in the repository's own ignore files outranks `core.excludesFile`. After `add -A` the private index is listed, and every untracked path the policy denies is removed before `write-tree`. An untracked nested repository is excluded up front and removed too.
+- The snapshot ref is `refs/fabric/<job-id>/snap/<W>`, named by the commit it points at. The job's older snapshot refs are deleted before the refs are read, so they never enter `GitState.refs`.
+- Refs are proven, not assumed. Capture reads the refs and `HEAD`, makes the bundle, reads them again, and checks the bundle's list of heads. A ref the bundle lists must have the recorded id; a full bundle must list every ref; a ref an incremental or empty bundle leaves out must be reachable from the parent's tips, which earlier bundles of the chain carry. Anything else is `RefsMoved`, and the caller captures again. Without this, an IDE's autofetch between the bundle and the listing recorded a tip no bundle held, and every later incremental bundle excluded it too.
+- The bundle is full when there is no parent, after 16 incremental links (`MAX_BUNDLE_CHAIN`), when a parent tip is gone from the repository, or when the incremental bundle fails `git bundle verify`. When the parent's refs already reach every object, git refuses to write an empty bundle; the manifest then has an empty `bundle` with `bundle_base` set, and restore skips it.
+- Refusals, each before anything is published: a root inside a repository but not its top level (`NotRepositoryRoot`), a linked worktree (`GitLinkedWorktree`), a rebase, merge, cherry-pick, revert or bisect in progress, a held `index.lock` or unmerged entries (`GitBusy` with the reason), a submodule with local changes, named by its whole path (`GitSubmoduleDirty`), a path with `filter=lfs` by git's own `check-attr` (`GitLfsUnsupported`), and untracked files above 64 MiB unless allowed (`UntrackedTooLarge`).
+- The config projection keeps the allowlisted keys of ADR 0004. A remote URL loses the part that can hold a credential (`fabric_core::git::credential_range`): the whole `user[:password]@` for `http`, `https` and other schemes, only `:password` for `ssh`, `git+ssh` and `ssh+git`, whose user name picks the account. The report names keys whose URL was stripped (`stripped_userinfo`), keys given more than once (`repeated_config`) and keys left behind because the value starts with `-` or holds a newline (`dropped_config`).
+- How git runs. Every inherited `GIT_*` variable is removed before the sandbox ones of ADR 0004 are set, and git runs with `LC_ALL=C`. The source repository's own config is the user's and is honored there: its clean and smudge filters run during `git add -A` and `git status` on capture, as for any git command the user runs, and git-crypt depends on that. On the target only the projection exists. `commit-tree` ignores `commit.gpgSign`, so no signing program runs.
+
+### Capture: the files half
+
+- Listing. A plain directory and the harness state directory are walked without following links. Each listed path is a directory, a regular file or a symlink; a FIFO, socket or device is skipped and named in `special_files` or `special_harness`. A directory named `.git` in any case is skipped, and the directory holding it is named in `nested_repositories` (or `nested_harness`); its other files are carried.
+- Reading. A listed file is opened with `O_NOFOLLOW` and `O_NONBLOCK` and read only if the open descriptor is a regular file with the device and inode the listing saw. A file swapped for a link to `~/.ssh/id_ed25519` between the listing and the read fails with `WorkspaceChanged`, so a secret never enters the store under a harmless name.
+- Classes. ADR 0004's table reads as if any `out`, `build`, `dist`, `target`, `vendor` or `.cache` were a cache. As built, a generic name is a cache only beside the file of the tool that makes it: `target` needs `Cargo.toml` or `pom.xml`, `out` and `.cache` need `package.json`, `dist` and `build` need a node, python, gradle or cmake file, and `vendor` needs `go.mod`, `composer.json` or a `Gemfile`. Names only a tool makes need none. A directory the job adds through `IgnorePolicy::add_cache_dir` needs none; that is where the `EnvSpec` plugs in. A path's class and its cache root are one value: `Secret` or `Excluded` with an optional root, `Cache` with its root, or `Precious`.
+- Secret and exclude patterns compare names with ASCII case folded, as APFS and git with `core.ignorecase` do. `.fabricignore` holds excludes only. The secret list can be widened, never narrowed. The harness state directory gets the full secret list too; its denied paths are named in `denied_harness`.
+- Carry keys are measured outside this crate. Capture takes a `CarryKeys` implementation. `UnmeasuredKeys` writes `CarryKey::Unmeasured`, and `CarryKey::matches`, the comparison of ADR 0012, never accepts it, not even against itself.
+- Scratch files (index copies, exclude files, bundles) live in the store's `tmp/` and are removed on every path. Nothing is written into the user's `.git` except the two commits, the snapshot ref and the deletion of the job's older snapshot refs.
+
+### Restore
+
+- This crate does the fresh case of ADR 0004's Restore step 2: the target must be absent or empty, the tree is written into `<target>.fabric-restoring`, verified when asked, and renamed onto the target. The marker and the in-place path are the job crate's.
+- The bundle chain is walked from the manifest's `bundle_base`. A base the catalog does not have is `BundleChainBroken`. Publish refuses an unknown base and `forget` refuses a snapshot a remaining one names as its base (`BaseInUse`), so only a damaged catalog reaches that error.
+- `Durability::PowerLoss` flushes every written file and runs git with `core.fsync=all` and `core.fsyncMethod=fsync`; the rename's directory flush then empties the drive cache. `ProcessCrash` relies on the kernel finishing issued writes.
+- With harness state, the harness directory is renamed into place just before the workspace, whose rename stays the commit point. A rerun that finds the harness directory complete keeps it.
+- The file writer opens every component through a directory handle with `O_NOFOLLOW`, using rustix's `openat`, in place of `cap-std`. It creates files with `O_EXCL` in place of ADR 0004's case-folding probe: two files whose names fold together fail with `Collision`, but two directories that fold together are merged, which only a manifest from a case-sensitive peer can hold. The probe and `PathCollision` stay planned for the in-place restore.
+
+## Alternatives considered
+
+1. **Rewrite ADR 0004 in place.** ADR 0009 says an ADR is superseded, not edited, except for errors of fact; ADR 0013 does the same for the network protocol (PR #5). Rejected.
+2. **Keep an assembled manifest file.** A second copy to keep consistent with the objects; it would make the catalog recoverable for large manifests but not the refcounts or the chain. Rejected; the recovery path is a peer.
+3. **Full flush per object.** Measured at 4 ms per file on APFS, minutes for a `node_modules`. Rejected for the batch split.
+4. **Trust every object file that exists.** Cheapest, and after a power loss it publishes a snapshot that only fails at restore, when the source bytes may be gone. Rejected for verifying the objects without a row that this process did not write.
+5. **Read refs after the bundle.** What the first version did; it records tips no bundle holds when a ref moves in between. Rejected for the proof above.
+
+## Consequences
+
+- A capture on a machine whose global git ignore names a file the project creates, such as Claude Code's `.claude/settings.local.json`, restores. Test: `a_file_only_the_global_ignore_names_restores`.
+- A ref that moves while capture runs fails the capture with `RefsMoved` instead of publishing a snapshot that cannot restore. Test: `a_ref_the_bundle_does_not_hold_is_refused`.
+- A FIFO or socket in the workspace or the harness state is named and left behind, and a file replaced after its listing fails the capture. Tests: `a_fifo_or_socket_is_left_behind_and_named`, `a_file_replaced_after_its_listing_is_refused`, `a_path_that_is_not_a_regular_file_is_refused_unread`.
+- Publish never names a corrupt or unflushed object it did not write. Test: `a_corrupt_object_left_without_a_row_is_removed_not_published`; the crash matrix kills publish at every step.
+- The bundle after 16 incremental links is full, and a parent whose tips were pruned gets a full bundle that restores. Tests: `the_bundle_after_the_longest_allowed_chain_is_full`, `a_parent_tip_gone_from_the_repository_makes_a_full_bundle`.
+- A lost catalog loses every snapshot whose manifest is above the whole-file limit until a peer sends it again.
+- `fabric orphan export` must pin the whole bundle chain of the snapshot it exports, not only the snapshot.
