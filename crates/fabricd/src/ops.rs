@@ -965,7 +965,8 @@ impl Node {
     ///
     /// The job's lock was released while the target copied it, so a run
     /// may have started here since: what was copied is then out of date,
-    /// and the job stays here. A move already open is offered again as it is.
+    /// and the job stays here. A move already open toward `to` is offered
+    /// again as it is; one toward another node refuses with that node.
     async fn depart(
         &self,
         id: JobId,
@@ -974,6 +975,17 @@ impl Node {
     ) -> Result<Option<MoveOffer>, NodeError> {
         let job = self.job(id).await?;
         let mut job = job.lock().await;
+        // Another move, typed at the same time, may have departed toward
+        // another node while the target copied the job.
+        if let LeaseView::Departing { move_id, target } = job.view(self.id)
+            && target != to
+        {
+            return Err(NodeError::Departing {
+                job: id,
+                move_id,
+                target,
+            });
+        }
         if let LeaseView::Owner(token) = job.view(self.id) {
             let suspended = job.suspended_in();
             if suspended.is_none() {
@@ -2257,6 +2269,24 @@ pub(crate) mod tests {
         assert!(
             job.session().unwrap().is_none(),
             "the stale session would be continued"
+        );
+    }
+
+    /// Two moves typed at once toward different nodes: the second finds the
+    /// job departing toward the first's target and must name that node,
+    /// not offer the first move to its own.
+    #[tokio::test]
+    async fn a_move_toward_another_node_refuses_with_the_open_moves_target() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let (first, second) = (NodeId::from_bytes([7; 32]), NodeId::from_bytes([8; 32]));
+        node.depart(id, first, &mut Out::default()).await.unwrap();
+        let refused = node.depart(id, second, &mut Out::default()).await;
+        assert!(
+            matches!(refused, Err(NodeError::Departing { target, .. }) if target == first),
+            "{refused:?}"
         );
     }
 
