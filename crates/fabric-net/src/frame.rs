@@ -19,9 +19,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// it sees this byte, so a new length format needs a new ALPN.
 pub const FRAME_VERSION: u8 = 1;
 
-/// Room in a control frame for everything around its one long list, a page
-/// of records or a manifest's chunk ids: the version byte, the request or
-/// response envelope and the list's count.
+/// Room in a frame for everything around its one long field, a page of
+/// records, a manifest's chunk ids or a stored chunk: the version byte, the
+/// request or response envelope and the field's length.
 pub(crate) const ENVELOPE_ALLOWANCE: usize = 1024;
 
 /// The most bytes a control frame may carry: a page of ledger records, move messages, chunk id lists.
@@ -34,7 +34,7 @@ pub const MAX_CONTROL_FRAME: usize = crate::wire::MAX_RECORD_PAGE + ENVELOPE_ALL
 pub const MAX_STORED_CHUNK: usize = MAX_CHUNK_LEN + (MAX_CHUNK_LEN >> 8);
 
 /// The most bytes a bulk frame may carry: one stored chunk plus its envelope.
-pub const MAX_BULK_FRAME: usize = MAX_STORED_CHUNK + 1024;
+pub const MAX_BULK_FRAME: usize = MAX_STORED_CHUNK + ENVELOPE_ALLOWANCE;
 
 const LENGTH_LEN: usize = 4;
 
