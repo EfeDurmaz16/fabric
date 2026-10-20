@@ -26,11 +26,12 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::denylist;
+use crate::departure::{self, Departure};
 use crate::error::HarnessError;
 use crate::files::{self, Carry, Placement, Source};
 use crate::harness::{self, Harness, Installed, Io, Launch, Restored, Running};
 use crate::manifest::{
-    Content, HOME_PREFIX, MANIFEST_FORMAT, Redaction, StateManifest, under_home,
+    Content, HOME_PREFIX, MANIFEST_FORMAT, Mutability, Redaction, StateManifest, under_home,
 };
 use crate::process::{self, Wiring};
 use crate::redact::RedactionCounts;
@@ -136,6 +137,12 @@ impl AcpHarness {
         Ok((dir.clone(), files::rel_components(rel)?))
     }
 
+    /// Where this node records the session's files at capture. An ACP
+    /// agent's state is opaque, so every file is treated as rewritable.
+    fn departure_path(&self, session: &SessionId) -> PathBuf {
+        departure::record_path(&self.home, &format!("acp-{}", self.program), session)
+    }
+
     fn capture_sync(
         &self,
         root: &Path,
@@ -160,6 +167,7 @@ impl AcpHarness {
                 abs: dir.join(&file),
                 rel: files::rel_path(&parts)?,
                 carry: Carry::OpaqueRefuseSecrets,
+                mutability: Mutability::Replaceable,
             });
         }
         if sources.is_empty() {
@@ -171,6 +179,7 @@ impl AcpHarness {
         }
         let mut counts = RedactionCounts::new();
         let carried = files::stage(&sources, out, &mut counts)?;
+        Departure::of(&sources)?.write(&self.departure_path(session))?;
         let manifest = StateManifest {
             format: MANIFEST_FORMAT,
             kind: self.kind(),
@@ -247,8 +256,9 @@ impl AcpHarness {
                     rule,
                 });
             }
-            let rest =
-                under_home(rel).filter(|_| Self::restorable(rel, &state_parts, &manifest.session));
+            let rest = under_home(rel)
+                .filter(|_| Self::restorable(rel, &state_parts, &manifest.session))
+                .filter(|_| file.mutability == Mutability::Replaceable);
             let Some(rest) = rest else {
                 return Err(HarnessError::UnexpectedFile {
                     kind: self.kind(),
@@ -259,10 +269,12 @@ impl AcpHarness {
                 staged: state.join(rel),
                 dest: self.home.join(rest),
                 content: Content::Opaque,
+                mutability: Mutability::Replaceable,
             });
         }
         files::verify(state, &manifest.files)?;
-        let placed = files::place_all(&placements)?;
+        let departure = Departure::read(&self.departure_path(&manifest.session))?;
+        let placed = files::place_all(&placements, &departure)?;
         info!(session = %manifest.session, agent = %self.program, files = placed.len(), "acp: restored");
         Ok(Restored { manifest, placed })
     }

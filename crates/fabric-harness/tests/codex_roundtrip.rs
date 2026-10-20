@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use fabric_core::env::EnvVarName;
 use fabric_core::path::RelPath;
 use fabric_harness::codex::Codex;
-use fabric_harness::manifest::{Carried, Content, Digest};
+use fabric_harness::manifest::{Carried, Content, Digest, Mutability};
 use fabric_harness::{Harness, HarnessError, Io, Launch, SessionId};
 
 const THREAD: &str = "019f233e-bb33-7342-85fa-f2d33b14368a";
@@ -310,6 +310,7 @@ async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_the
     forged.files.push(Carried {
         rel_path: RelPath::parse(rel).unwrap(),
         content: Content::Opaque,
+        mutability: Mutability::Replaceable,
         size: 7,
         blake3: Digest::from_hash(blake3::hash(b"payload")),
     });

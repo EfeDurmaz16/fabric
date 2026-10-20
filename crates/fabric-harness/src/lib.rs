@@ -22,6 +22,7 @@
 //! `tests/jsontext_props.rs` states the signed-block rule against them.
 
 pub mod denylist;
+pub(crate) mod departure;
 pub mod error;
 pub(crate) mod files;
 pub mod harness;

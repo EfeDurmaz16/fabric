@@ -43,10 +43,13 @@ use fabric_core::harness::HarnessKind;
 use tracing::{info, warn};
 
 use crate::denylist;
+use crate::departure::Departure;
 use crate::error::HarnessError;
 use crate::files::{self, Carry, Placement, Relation, Source};
 use crate::harness::{self, Harness, Installed, Io, Launch, Restored, Running};
-use crate::manifest::{Content, HOME_PREFIX, MANIFEST_FORMAT, Redaction, StateManifest};
+use crate::manifest::{
+    Content, HOME_PREFIX, MANIFEST_FORMAT, Mutability, Redaction, StateManifest,
+};
 use crate::process;
 use crate::redact::RedactionCounts;
 use crate::session::SessionId;
@@ -381,6 +384,7 @@ impl Codex {
                 abs: file.path.clone(),
                 rel: files::rel_path(&all)?,
                 carry: Carry::Opaque,
+                mutability: Mutability::AppendOnly,
             });
         }
         let mut counts = RedactionCounts::new();
@@ -475,7 +479,10 @@ impl Codex {
                     rule,
                 });
             }
-            let Some((name_text, name)) = self.restorable(rel)? else {
+            let restorable = self
+                .restorable(rel)?
+                .filter(|_| file.mutability == Mutability::AppendOnly);
+            let Some((name_text, name)) = restorable else {
                 return Err(HarnessError::UnexpectedFile {
                     kind: HarnessKind::Codex,
                     path: rel.to_owned(),
@@ -503,10 +510,13 @@ impl Codex {
                 staged,
                 dest,
                 content: Content::Opaque,
+                mutability: Mutability::AppendOnly,
             });
         }
         files::verify(state, &manifest.files)?;
-        let placed = files::place_all(&placements)?;
+        // A rollout only grows, so nothing is ever replaced and no
+        // departure record is kept.
+        let placed = files::place_all(&placements, &Departure::default())?;
         drop(lock);
         info!(session = %manifest.session, files = placed.len(), "codex: restored");
         Ok(Restored { manifest, placed })

@@ -65,6 +65,9 @@ pub struct Carried {
     pub rel_path: RelPath,
     /// What the bytes are.
     pub content: Content,
+    /// How the harness changes the file, which decides what restore may do
+    /// to a copy already on disk.
+    pub mutability: Mutability,
     /// Byte length of the staged copy.
     pub size: u64,
     /// `BLAKE3` digest of the staged copy; restore refuses a file that does not match.
@@ -84,6 +87,17 @@ pub enum Content {
     JsonLines,
     /// One JSON document: treated like `JsonLines`, as a whole.
     JsonDocument,
+}
+
+/// How a harness changes one of its files after writing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Mutability {
+    /// Only ever grows at the end, such as a transcript or a rollout.
+    AppendOnly,
+    /// Never changes once written, such as a tool result or a file backup.
+    Immutable,
+    /// Rewritten in place, such as memory, a task file or sidecar metadata.
+    Replaceable,
 }
 
 /// A `BLAKE3` digest, written as 64 hex characters.
@@ -224,6 +238,7 @@ mod tests {
         Carried {
             rel_path: RelPath::parse(path).unwrap(),
             content: Content::Opaque,
+            mutability: Mutability::AppendOnly,
             size: 0,
             blake3: Digest::from_hash(blake3::hash(b"")),
         }

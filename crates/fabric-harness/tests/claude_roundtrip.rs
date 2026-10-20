@@ -17,7 +17,7 @@ use fabric_core::env::EnvVarName;
 use fabric_core::path::RelPath;
 use fabric_harness::claude::ClaudeCode;
 use fabric_harness::claude::slug::slug;
-use fabric_harness::manifest::{Carried, Content, Digest};
+use fabric_harness::manifest::{Carried, Content, Digest, Mutability};
 use fabric_harness::{Harness, HarnessError, Io, Launch, SessionId};
 
 mod common;
@@ -323,19 +323,31 @@ async fn capture_carries_session_state_only_and_redacts() {
     }
 }
 
-/// Moves this node's Claude state aside, as if the job ran on another
-/// node with the same home path, where Claude is installed and idle: its
-/// session registry exists and is empty. Returns where the state went.
+/// Moves this node's Claude state and Fabric's departure records aside,
+/// as if the job ran on another node with the same home path, where
+/// Claude is installed and idle: its session registry exists and is
+/// empty. Returns where the state went.
 fn set_aside(home: &Path, name: &str) -> PathBuf {
     let aside = home.join(name);
-    std::fs::rename(home.join(".claude"), &aside).unwrap();
+    std::fs::create_dir_all(&aside).unwrap();
+    std::fs::rename(home.join(".claude"), aside.join("claude")).unwrap();
+    if home.join(".fabric").exists() {
+        std::fs::rename(home.join(".fabric"), aside.join("fabric")).unwrap();
+    }
     std::fs::create_dir_all(home.join(".claude/sessions")).unwrap();
     aside
 }
 
+/// Puts a node's state set aside by `set_aside` back in place.
 fn bring_back(home: &Path, aside: &Path) {
     std::fs::remove_dir_all(home.join(".claude")).unwrap();
-    std::fs::rename(aside, home.join(".claude")).unwrap();
+    std::fs::rename(aside.join("claude"), home.join(".claude")).unwrap();
+    if home.join(".fabric").exists() {
+        std::fs::remove_dir_all(home.join(".fabric")).unwrap();
+    }
+    if aside.join("fabric").exists() {
+        std::fs::rename(aside.join("fabric"), home.join(".fabric")).unwrap();
+    }
 }
 
 fn regular_files(dir: &Path) -> Vec<PathBuf> {
@@ -474,6 +486,7 @@ async fn a_manifest_naming_a_file_outside_session_state_is_refused() {
         forged.files.push(Carried {
             rel_path: RelPath::parse(rel).unwrap(),
             content: Content::Opaque,
+            mutability: Mutability::Replaceable,
             size: body.len() as u64,
             blake3: Digest::from_hash(blake3::hash(body)),
         });
@@ -520,6 +533,10 @@ async fn a_job_that_leaves_and_comes_back_keeps_the_original_and_gains_the_new_t
     let mut on_air = std::fs::read(&transcript).unwrap();
     on_air.extend_from_slice(air_suffix.as_bytes());
     std::fs::write(&transcript, &on_air).unwrap();
+    // Claude rewrites memory and task files in place.
+    let (memory, task) = rewritable_files(&home, &src.work);
+    std::fs::write(&memory, "# memory\nlearned on the air\n").unwrap();
+    std::fs::write(&task, "{\"subject\":\"t\",\"status\":\"done\"}").unwrap();
     let out_2 = tempfile::tempdir().unwrap();
     adapter
         .capture(&src.work, &session(), out_2.path())
@@ -537,6 +554,12 @@ async fn a_job_that_leaves_and_comes_back_keeps_the_original_and_gains_the_new_t
         "the Pro keeps every byte it had, secret and signed block included, plus the Air's turn"
     );
     assert_eq!(mode(&transcript), 0o600);
+    assert_eq!(
+        std::fs::read_to_string(&memory).unwrap(),
+        "# memory\nlearned on the air\n",
+        "a file the Pro left untouched takes the Air's rewrite"
+    );
+    assert!(std::fs::read_to_string(&task).unwrap().contains("done"));
 
     // Restoring again changes nothing, and capturing again yields what the
     // Air sent.
@@ -555,6 +578,57 @@ async fn a_job_that_leaves_and_comes_back_keeps_the_original_and_gains_the_new_t
         .unwrap()
     };
     assert_eq!(staged(out_3.path()), staged(out_2.path()));
+}
+
+/// The project memory and a task file of the session under `home`.
+fn rewritable_files(home: &Path, work: &Path) -> (PathBuf, PathBuf) {
+    (
+        home.join(".claude/projects")
+            .join(slug(work).unwrap())
+            .join("memory/MEMORY.md"),
+        home.join(".claude/tasks/session-9c9796f0/1.json"),
+    )
+}
+
+#[tokio::test]
+async fn a_rewritten_file_edited_here_after_the_job_left_is_not_replaced() {
+    let src = build_source("w");
+    let home = src.home.path().canonicalize().unwrap();
+    let adapter = node(&home);
+    let out_1 = tempfile::tempdir().unwrap();
+    adapter
+        .capture(&src.work, &session(), out_1.path())
+        .await
+        .unwrap();
+    let pro = set_aside(&home, ".claude-pro");
+    adapter.restore(&src.work, out_1.path()).await.unwrap();
+    let (memory, _) = rewritable_files(&home, &src.work);
+    std::fs::write(&memory, "# memory\nfrom the air\n").unwrap();
+    let out_2 = tempfile::tempdir().unwrap();
+    adapter
+        .capture(&src.work, &session(), out_2.path())
+        .await
+        .unwrap();
+    set_aside(&home, ".claude-air");
+    bring_back(&home, &pro);
+    // Someone used the Pro's copy after the job left.
+    std::fs::write(&memory, "# memory\nfrom the pro\n").unwrap();
+    let transcript = transcript_under(&home, &src.work);
+    let before = std::fs::read(&transcript).unwrap();
+    let err = adapter.restore(&src.work, out_2.path()).await.unwrap_err();
+    assert!(
+        matches!(err, HarnessError::StateDiverged { ref path } if path == &memory),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&memory).unwrap(),
+        "# memory\nfrom the pro\n"
+    );
+    assert_eq!(
+        std::fs::read(&transcript).unwrap(),
+        before,
+        "nothing was placed"
+    );
 }
 
 #[tokio::test]

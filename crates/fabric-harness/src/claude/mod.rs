@@ -41,10 +41,13 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::denylist;
+use crate::departure::{self, Departure};
 use crate::error::HarnessError;
 use crate::files::{self, Carry, Placement, Source};
 use crate::harness::{self, Harness, Installed, Io, Launch, Restored, Running};
-use crate::manifest::{HOME_PREFIX, MANIFEST_FORMAT, Redaction, StateManifest, under_home};
+use crate::manifest::{
+    HOME_PREFIX, MANIFEST_FORMAT, Mutability, Redaction, StateManifest, under_home,
+};
 use crate::process;
 use crate::redact::RedactionCounts;
 use crate::session::SessionId;
@@ -320,12 +323,33 @@ impl ClaudeCode {
         let parts = files::rel_components(rel_to_home)?;
         let mut all: Vec<&str> = vec![HOME_PREFIX];
         all.extend(parts.iter().map(String::as_str));
+        let rest: Vec<&str> = parts.iter().map(String::as_str).collect();
         sources.push(Source {
             rel: files::rel_path(&all)?,
             carry: Self::carry_for(abs),
+            mutability: Self::mutability_for(&rest),
             abs: abs.to_path_buf(),
         });
         Ok(true)
+    }
+
+    /// How Claude changes the file at these components under the home:
+    /// transcripts only grow, tool results, file backups and uploads are
+    /// written once, and everything else (memory, tasks, sidecar
+    /// metadata) is rewritten in place.
+    fn mutability_for(parts: &[&str]) -> Mutability {
+        let jsonl = |name: &str| Path::new(name).extension().is_some_and(|e| e == "jsonl");
+        match parts {
+            [".claude", "projects", _, _, "tool-results", ..]
+            | [".claude", "file-history" | "uploads", ..] => Mutability::Immutable,
+            [".claude", "projects", _, .., name] if jsonl(name) => Mutability::AppendOnly,
+            _ => Mutability::Replaceable,
+        }
+    }
+
+    /// Where this node records the session's rewritable files at capture.
+    fn departure_path(&self, session: &SessionId) -> PathBuf {
+        departure::record_path(&self.home, PROGRAM, session)
     }
 
     /// True when a tree path names a file this adapter captures for
@@ -456,6 +480,7 @@ impl ClaudeCode {
         let mut counts = RedactionCounts::new();
         let sources = self.sources_for(root, session, &mut counts)?;
         let carried = files::stage(&sources, out, &mut counts)?;
+        Departure::of(&sources)?.write(&self.departure_path(session))?;
         let manifest = StateManifest {
             format: MANIFEST_FORMAT,
             kind: HarnessKind::ClaudeCode,
@@ -523,14 +548,24 @@ impl ClaudeCode {
                     path: rel.to_owned(),
                 });
             };
+            let parts: Vec<&str> = rest.split('/').collect();
+            if file.mutability != Self::mutability_for(&parts) {
+                return Err(HarnessError::Malformed {
+                    what: "manifest",
+                    path: state.join(rel),
+                    reason: format!("{rel} is not {:?}", file.mutability),
+                });
+            }
             placements.push(Placement {
                 staged: state.join(rel),
                 dest: self.home.join(rest),
                 content: file.content,
+                mutability: file.mutability,
             });
         }
         files::verify(state, &manifest.files)?;
-        let placed = files::place_all(&placements)?;
+        let departure = Departure::read(&self.departure_path(&manifest.session))?;
+        let placed = files::place_all(&placements, &departure)?;
         info!(session = %manifest.session, files = placed.len(), "claude: restored");
         Ok(Restored { manifest, placed })
     }

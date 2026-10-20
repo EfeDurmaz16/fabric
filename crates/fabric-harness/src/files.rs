@@ -8,7 +8,10 @@
 //! protected like the root): the bytes already there are equal to, or a
 //! prefix of, the incoming bytes, or are this node's own copy, whose
 //! redacted form the incoming bytes extend; then only the incoming suffix
-//! is added and the local bytes stay. Every file written keeps the mode of
+//! is added and the local bytes stay. A file the harness rewrites in place
+//! (`Mutability::Replaceable`) may also be replaced outright, but only
+//! when it still holds the bytes this node recorded when the job last left
+//! it (`departure`). Every file written keeps the mode of
 //! the file it replaces, 0600 when there is none. Nothing here is safe
 //! against a process that appends to a destination at the same time; the
 //! adapter's running-harness guard protects that case, not this module.
@@ -31,9 +34,10 @@ use fabric_core::path::RelPath;
 use tracing::warn;
 
 use crate::denylist;
+use crate::departure::Departure;
 use crate::error::HarnessError;
 use crate::jsontext::{self, TransformError};
-use crate::manifest::{Carried, Content, Digest};
+use crate::manifest::{Carried, Content, Digest, Mutability};
 use crate::redact::{RedactionCounts, Redactor};
 
 /// The redaction rule name under which dropped signed blocks are counted.
@@ -48,6 +52,8 @@ pub(crate) struct Source {
     pub rel: RelPath,
     /// How capture treats its bytes.
     pub carry: Carry,
+    /// How the harness changes the file.
+    pub mutability: Mutability,
 }
 
 /// How capture treats a file's bytes.
@@ -556,6 +562,7 @@ pub(crate) fn stage(
         carried.push(Carried {
             rel_path: source.rel.clone(),
             content: source.carry.content(),
+            mutability: source.mutability,
             size: written.size,
             blake3: written.digest,
         });
@@ -563,7 +570,8 @@ pub(crate) fn stage(
     Ok(carried)
 }
 
-fn digest_file(path: &Path) -> Result<Written, HarnessError> {
+/// The length and digest of the file at `path`.
+pub(crate) fn digest_file(path: &Path) -> Result<Written, HarnessError> {
     let mut reader = File::open(path).map_err(|e| HarnessError::io("read", path, e))?;
     let mut sink = Hashing::new(io::sink());
     io::copy(&mut reader, &mut sink).map_err(|e| HarnessError::io("read", path, e))?;
@@ -706,6 +714,8 @@ pub(crate) struct Placement {
     pub dest: PathBuf,
     /// What its bytes are.
     pub content: Content,
+    /// How the harness changes it.
+    pub mutability: Mutability,
 }
 
 /// What restore does at one destination.
@@ -713,7 +723,8 @@ pub(crate) struct Placement {
 enum Step {
     /// The destination already holds these bytes.
     Keep,
-    /// The destination is missing or a prefix: it gets the staged bytes.
+    /// The destination is missing, a prefix, or a rewritable file this node
+    /// has not changed since the job left: it gets the staged bytes.
     Replace,
     /// The destination is this node's own copy, which the incoming file
     /// extends after its first `view_len` bytes: the local bytes are kept
@@ -721,27 +732,28 @@ enum Step {
     Extend { view_len: u64 },
 }
 
-fn plan(placement: &Placement) -> Result<Step, HarnessError> {
-    let diverged = || HarnessError::StateDiverged {
-        path: placement.dest.clone(),
-    };
+fn plan(placement: &Placement, departure: &Departure) -> Result<Step, HarnessError> {
     match compare(&placement.dest, &placement.staged)? {
-        Relation::Equal => Ok(Step::Keep),
-        Relation::Missing | Relation::ExistingIsPrefix => Ok(Step::Replace),
-        Relation::Diverged => match placement.content {
-            Content::Opaque => Err(diverged()),
-            Content::Text | Content::JsonLines | Content::JsonDocument => {
-                let staged_len = fs::metadata(&placement.staged)
-                    .map_err(|e| HarnessError::io("read", &placement.staged, e))?
-                    .len();
-                match redacted_view_prefix(&placement.dest, &placement.staged, placement.content)? {
-                    Some(view_len) if view_len == staged_len => Ok(Step::Keep),
-                    Some(view_len) => Ok(Step::Extend { view_len }),
-                    None => Err(diverged()),
-                }
-            }
-        },
+        Relation::Equal => return Ok(Step::Keep),
+        Relation::Missing | Relation::ExistingIsPrefix => return Ok(Step::Replace),
+        Relation::Diverged => {}
     }
+    if placement.content != Content::Opaque {
+        let staged_len = fs::metadata(&placement.staged)
+            .map_err(|e| HarnessError::io("read", &placement.staged, e))?
+            .len();
+        match redacted_view_prefix(&placement.dest, &placement.staged, placement.content)? {
+            Some(view_len) if view_len == staged_len => return Ok(Step::Keep),
+            Some(view_len) => return Ok(Step::Extend { view_len }),
+            None => {}
+        }
+    }
+    if placement.mutability == Mutability::Replaceable && departure.unchanged(&placement.dest)? {
+        return Ok(Step::Replace);
+    }
+    Err(HarnessError::StateDiverged {
+        path: placement.dest.clone(),
+    })
 }
 
 fn copy_into(path: &Path, out: &mut dyn Write, skip: u64) -> Result<(), HarnessError> {
@@ -755,12 +767,17 @@ fn copy_into(path: &Path, out: &mut dyn Write, skip: u64) -> Result<(), HarnessE
 }
 
 /// Places every file or none. Each destination is first checked against
-/// the module rule; only when all pass is anything written, so a
-/// `StateDiverged` leaves this node as it was. A write that then fails
-/// leaves the files before it placed, each one equal to or an extension of
-/// what was there, and running the restore again converges. Returns every
-/// destination, placed or found equal, in order.
-pub(crate) fn place_all(placements: &[Placement]) -> Result<Vec<PathBuf>, HarnessError> {
+/// the module rule, with `departure` saying which rewritable files this
+/// node has not touched since the job left; only when all pass is anything
+/// written, so a `StateDiverged` leaves this node as it was. A write that
+/// then fails leaves the files before it placed, each one equal to, an
+/// extension of, or an allowed replacement for what was there, and running
+/// the restore again converges. Returns every destination, placed or found
+/// equal, in order.
+pub(crate) fn place_all(
+    placements: &[Placement],
+    departure: &Departure,
+) -> Result<Vec<PathBuf>, HarnessError> {
     let mut dests: Vec<&Path> = placements.iter().map(|p| p.dest.as_path()).collect();
     dests.sort();
     if let Some(pair) = dests.windows(2).find(|pair| pair[0] == pair[1]) {
@@ -770,7 +787,7 @@ pub(crate) fn place_all(placements: &[Placement]) -> Result<Vec<PathBuf>, Harnes
     }
     let steps = placements
         .iter()
-        .map(plan)
+        .map(|placement| plan(placement, departure))
         .collect::<Result<Vec<Step>, HarnessError>>()?;
     for (placement, step) in placements.iter().zip(steps) {
         match step {
@@ -800,6 +817,7 @@ mod tests {
             abs,
             rel: RelPath::parse(rel).unwrap(),
             carry,
+            mutability: Mutability::AppendOnly,
         }
     }
 
@@ -819,11 +837,15 @@ mod tests {
             staged,
             dest: dest.to_path_buf(),
             content,
+            mutability: Mutability::AppendOnly,
         }
     }
 
     fn place_bytes(dest: &Path, dir: &Path, bytes: &[u8]) -> Result<Vec<PathBuf>, HarnessError> {
-        place_all(&[placement(dir, "one", dest, bytes, Content::Opaque)])
+        place_all(
+            &[placement(dir, "one", dest, bytes, Content::Opaque)],
+            &Departure::default(),
+        )
     }
 
     fn mode(path: &Path) -> u32 {
@@ -862,7 +884,7 @@ mod tests {
             placement(dir.path(), "a", &first, b"new\n", Content::JsonLines),
             placement(dir.path(), "b", &last, b"theirs\n", Content::JsonLines),
         ];
-        let err = place_all(&placements).unwrap_err();
+        let err = place_all(&placements, &Departure::default()).unwrap_err();
         assert!(
             matches!(err, HarnessError::StateDiverged { ref path } if path == &last),
             "{err}"
@@ -898,13 +920,16 @@ mod tests {
         let original = format!("{{\"t\":\"{GITHUB}\"}}\n");
         fs::write(&dest, &original).unwrap();
         let incoming = b"{\"t\":\"[REDACTED:github-token]\"}\n{\"more\":1}\n";
-        place_all(&[placement(
-            dir.path(),
-            "a",
-            &dest,
-            incoming,
-            Content::JsonLines,
-        )])
+        place_all(
+            &[placement(
+                dir.path(),
+                "a",
+                &dest,
+                incoming,
+                Content::JsonLines,
+            )],
+            &Departure::default(),
+        )
         .unwrap();
         assert_eq!(
             fs::read_to_string(&dest).unwrap(),
@@ -912,25 +937,31 @@ mod tests {
         );
         // The same incoming copy again changes nothing.
         let before = fs::read(&dest).unwrap();
-        place_all(&[placement(
-            dir.path(),
-            "b",
-            &dest,
-            incoming,
-            Content::JsonLines,
-        )])
+        place_all(
+            &[placement(
+                dir.path(),
+                "b",
+                &dest,
+                incoming,
+                Content::JsonLines,
+            )],
+            &Departure::default(),
+        )
         .unwrap();
         assert_eq!(fs::read(&dest).unwrap(), before);
         // A different edit is still a divergence.
         fs::write(&dest, format!("{{\"t\":\"{GITHUB}\",\"edited\":true}}\n")).unwrap();
         assert!(matches!(
-            place_all(&[placement(
-                dir.path(),
-                "c",
-                &dest,
-                incoming,
-                Content::JsonLines
-            )]),
+            place_all(
+                &[placement(
+                    dir.path(),
+                    "c",
+                    &dest,
+                    incoming,
+                    Content::JsonLines
+                )],
+                &Departure::default(),
+            ),
             Err(HarnessError::StateDiverged { .. })
         ));
     }
