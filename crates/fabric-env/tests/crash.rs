@@ -79,6 +79,89 @@ fn wait_for(path: &Path) -> TestResult<()> {
     Ok(())
 }
 
+/// A resume killed after its step did all the work and before the sentinel
+/// was written leaves no proof, so the next resume fills the cache again.
+#[test]
+fn a_resume_killed_before_the_sentinel_write_leaves_the_cache_to_fill() {
+    if run_child().unwrap() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    declare(
+        dir.path(),
+        r#"
+[[cache]]
+path = "out"
+class = "build"
+
+[[setup]]
+program = "sh"
+args = ["-c", "mkdir -p out && echo x > out/f && kill -9 $PPID"]
+"#,
+    )
+    .unwrap();
+    let status = spawn_child(
+        "a_resume_killed_before_the_sentinel_write_leaves_the_cache_to_fill",
+        dir.path(),
+    )
+    .unwrap()
+    .wait()
+    .unwrap();
+    assert_eq!(status.signal(), Some(9));
+    assert!(dir.path().join("out/f").is_file());
+    assert!(!dir.path().join("out").join(SENTINEL).exists());
+    let next = next_plan(dir.path()).unwrap();
+    assert_eq!(
+        next.caches()[0].health,
+        CacheHealth::Incomplete {
+            expected: &[SENTINEL]
+        }
+    );
+    assert_eq!(next.steps().len(), 1);
+}
+
+/// The sentinel of a whole cache is removed before a step that fills it
+/// starts, so a resume killed during that step leaves no proof behind.
+#[test]
+fn a_resume_killed_during_a_step_removes_the_old_proof() {
+    if run_child().unwrap() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("out")).unwrap();
+    fs::write(dir.path().join("out/f"), "x").unwrap();
+    fs::write(dir.path().join("out").join(SENTINEL), "").unwrap();
+    declare(
+        dir.path(),
+        r#"
+[[cache]]
+path = "out"
+class = "build"
+
+[[setup]]
+program = "sh"
+args = ["-c", "echo y > out/f && kill -9 $PPID"]
+when = "always"
+"#,
+    )
+    .unwrap();
+    let status = spawn_child(
+        "a_resume_killed_during_a_step_removes_the_old_proof",
+        dir.path(),
+    )
+    .unwrap()
+    .wait()
+    .unwrap();
+    assert_eq!(status.signal(), Some(9));
+    assert!(!dir.path().join("out").join(SENTINEL).exists());
+    assert_eq!(
+        next_plan(dir.path()).unwrap().caches()[0].health,
+        CacheHealth::Incomplete {
+            expected: &[SENTINEL]
+        }
+    );
+}
+
 /// After a `kill -9` of resume the installer it started keeps running. The
 /// next resume refuses while it runs, instead of starting a second
 /// installer on the same tree, and proceeds once it has exited.
