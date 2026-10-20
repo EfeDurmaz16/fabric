@@ -34,7 +34,9 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 use crate::accept::refresh;
-use crate::frame::{FrameError, MAX_BULK_FRAME, MAX_CONTROL_FRAME, read_frame, write_frame};
+use crate::frame::{
+    FrameError, MAX_BULK_FRAME, MAX_CONTROL_FRAME, MAX_STORED_CHUNK, read_frame, write_frame,
+};
 use crate::idle::{IdleReader, StallWriter};
 use crate::tls::Trust;
 use crate::transport::{Connection, Stream, TransportError, TransportKind};
@@ -726,8 +728,9 @@ impl Session {
     }
 }
 
-/// One chunk that arrived and was checked: its zstd frame decompresses to at
-/// most `MAX_CHUNK_LEN` bytes, and those bytes hash to its id.
+/// One chunk that arrived and was checked: its zstd encoding is at most
+/// `MAX_STORED_CHUNK` bytes and decompresses to at most `MAX_CHUNK_LEN`
+/// bytes, and those bytes hash to its id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedChunk {
     id: ChunkId,
@@ -743,6 +746,12 @@ impl VerifiedChunk {
     /// most `MAX_CHUNK_LEN`, so a small frame cannot make this node
     /// allocate more than one chunk.
     fn check(id: ChunkId, stored: Vec<u8>) -> Option<Self> {
+        // The bulk frame leaves room for the envelope, so a stored chunk
+        // could be a little longer than any the store writes; it is not
+        // kept, so the store never holds one past its own bound.
+        if stored.len() > MAX_STORED_CHUNK {
+            return None;
+        }
         let capacity = match zstd::zstd_safe::get_frame_content_size(&stored) {
             Ok(Some(declared)) => usize::try_from(declared)
                 .ok()
@@ -1095,6 +1104,23 @@ mod tests {
             check_offered(offered, &incomplete(other)),
             Err(RpcError::WrongSnapshot { offered: o, got }) if o == offered && got == other
         ));
+    }
+
+    /// A chunk whose zstd encoding is longer than any the store writes is
+    /// refused, even when it decompresses to bytes that hash to its id, as
+    /// one padded with a skippable frame does.
+    #[test]
+    fn a_stored_chunk_past_the_stored_bound_is_refused() {
+        let bytes = b"chunk".to_vec();
+        let id = ChunkId::of(&bytes);
+        let mut stored = zstd::bulk::compress(&bytes, 3).unwrap();
+        assert!(VerifiedChunk::check(id, stored.clone()).is_some());
+        let pad = MAX_STORED_CHUNK + 1 - stored.len() - 8;
+        stored.extend_from_slice(&0x184D_2A50_u32.to_le_bytes());
+        stored.extend_from_slice(&u32::try_from(pad).unwrap().to_le_bytes());
+        stored.resize(MAX_STORED_CHUNK + 1, 0);
+        assert_eq!(zstd::bulk::decompress(&stored, 64).unwrap(), bytes);
+        assert!(VerifiedChunk::check(id, stored).is_none());
     }
 
     fn frame(body: ResponseBody) -> Vec<u8> {
