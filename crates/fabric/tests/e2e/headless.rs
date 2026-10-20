@@ -201,6 +201,32 @@ fn e2e_ctrl_c_on_a_headless_run_reaches_the_harness() -> Fallible {
     Ok(())
 }
 
+/// The answer cannot be printed when standard output is gone, as after
+/// the hang-up of the terminal that would have shown it; the node still
+/// hears that the harness exited and drops its record.
+#[test]
+fn e2e_a_headless_run_whose_output_is_gone_still_records_the_exit() -> Fallible {
+    let env = Env::new()?;
+    env.install_fake_codex()?;
+    let (node, job) = job_under(&env, "codex")?;
+    let mut running = node.spawn(&["job", "run", &job, "--headless", "--prompt", "one"])?;
+    drop(running.stdout.take());
+    let output = finish(running, Duration::from_mins(3))?;
+    assert!(!output.status.success(), "{}", text(&output));
+    assert!(
+        text(&output).contains("Broken pipe"),
+        "the answer was printed somewhere:\n{}",
+        text(&output)
+    );
+    let record = node.state().join("jobs").join(&job).join("harness");
+    assert!(
+        !record.exists(),
+        "the node was not told the harness exited:\n{}",
+        text(&output)
+    );
+    Ok(())
+}
+
 /// A headless run needs the prompt it starts its turn with.
 #[test]
 fn e2e_a_headless_run_needs_a_prompt() -> Fallible {
