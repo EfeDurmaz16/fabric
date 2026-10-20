@@ -20,7 +20,6 @@ use fabric_store::capture::{
     BundleKind, BusyReason, CaptureError, CaptureRequest, Captured, MAX_BUNDLE_CHAIN,
     UnmeasuredKeys, capture,
 };
-use fabric_store::git::Git;
 use fabric_store::objects::ChunkParams;
 use fabric_store::policy::{IgnorePolicy, PolicyError, SECRET_PATTERNS};
 use fabric_store::restore::{
@@ -30,14 +29,18 @@ use fabric_store::restore::{
 use fabric_store::store::{CheckDepth, Store, StoreError};
 use fabric_store::writer::WriteError;
 
+mod common;
+
+use common::TestGit;
+
 type Fallible<T = ()> = Result<T, Box<dyn Error>>;
 
 const JOB: JobId = JobId::from_bytes([5; 16]);
 const NODE: NodeId = NodeId::from_bytes([2; 32]);
 const T0: u64 = 1_760_000_000_000;
 
-fn git(root: &Path) -> Git {
-    Git::new(root).with_date(T0)
+fn git(root: &Path) -> TestGit {
+    TestGit::new(root, T0)
 }
 
 fn set_mtime(path: &Path, secs: u64, nanos: u32) -> Fallible {
@@ -157,7 +160,7 @@ fn status(root: &Path) -> Fallible<String> {
 }
 
 fn git_text(root: &Path, args: &[&str]) -> Fallible<String> {
-    Ok(git(root).run_text(args)?)
+    git(root).run_text(args)
 }
 
 fn mtime_of(path: &Path) -> Fallible<(i64, i64)> {

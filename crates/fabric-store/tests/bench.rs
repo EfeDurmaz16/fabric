@@ -10,11 +10,14 @@ use std::time::{Duration, Instant};
 
 use fabric_core::id::{JobId, NodeId, SnapshotId};
 use fabric_store::capture::{BundleKind, CaptureRequest, UnmeasuredKeys, capture};
-use fabric_store::git::Git;
 use fabric_store::objects::ChunkParams;
 use fabric_store::policy::IgnorePolicy;
 use fabric_store::restore::{Durability, RestoreRequest, Verify, restore};
 use fabric_store::store::Store;
+
+mod common;
+
+use common::TestGit;
 
 type Fallible<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -43,7 +46,7 @@ fn build_workspace(root: &Path) -> Fallible {
         )?;
     }
     fs::write(root.join(".gitignore"), "node_modules/\ndist/\ndata/\n")?;
-    let git = Git::new(root).with_date(1_760_000_000_000);
+    let git = TestGit::new(root, 1_760_000_000_000);
     git.run(&["init", "-q", "-b", "main"])?;
     git.run(&["add", "-A"])?;
     git.run(&["commit", "-q", "-m", "one"])?;
@@ -78,7 +81,7 @@ fn build_workspace(root: &Path) -> Fallible {
 }
 
 fn mutate_workspace(root: &Path) -> Fallible {
-    let git = Git::new(root).with_date(1_760_000_060_000);
+    let git = TestGit::new(root, 1_760_000_060_000);
     for i in 0..10 {
         fs::write(
             root.join(format!("src/mod{i}.rs")),

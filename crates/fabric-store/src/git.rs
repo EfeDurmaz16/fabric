@@ -21,7 +21,7 @@ use std::thread;
 use fabric_core::git::GitNameError;
 
 /// The `-c` settings every git command gets.
-pub const CONFIG_FLAGS: &[&str] = &[
+const CONFIG_FLAGS: &[&str] = &[
     "core.fsmonitor=false",
     "core.hooksPath=/dev/null",
     "core.sshCommand=/usr/bin/false",
@@ -74,7 +74,7 @@ const FSYNC_FLAGS: &[&str] = &["core.fsync=all", "core.fsyncMethod=fsync"];
 
 /// A git runner bound to one repository.
 #[derive(Debug, Clone)]
-pub struct Git {
+pub(crate) struct Git {
     repo: PathBuf,
     date: Option<String>,
     full_fsync: bool,
