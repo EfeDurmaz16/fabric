@@ -241,7 +241,8 @@ impl Node {
         let node = Arc::clone(self);
         tokio::spawn(async move {
             let service: Arc<dyn Service> = node.clone();
-            let ended = session.serve(service).await;
+            let trust: Arc<dyn Trust> = node.peers.clone();
+            let ended = session.serve(service, trust).await;
             tracing::info!(%peer, reason = %ended, "session ended");
             let mut sessions = lock(&node.sessions);
             if sessions
@@ -292,11 +293,11 @@ impl Node {
             .dial_any(peer, &addrs)
             .await
             .map_err(|e| unreachable(e.to_string()))?;
-        if let Some(quic) = &dialed.quic_failure {
+        if let Some(quic) = dialed.quic_failure() {
             tracing::info!(%peer, reason = %quic, "QUIC failed; the session runs on TCP with TLS");
         }
         let session = Session::connect(
-            Arc::from(dialed.connection),
+            Arc::from(dialed.into_connection()),
             self.id,
             self.version.clone(),
             HELLO_DEADLINE,
@@ -304,14 +305,12 @@ impl Node {
         .await
         .map_err(|e| unreachable(e.to_string()))?;
         let session = Arc::new(session);
-        let addr = session.remote_addr();
         let peers = Arc::clone(&self.peers);
         let now = crate::clock::now_ms();
         // Only an address this node dialed is recorded: the address an
         // accepted connection came from may sit behind a NAT (ADR 0013).
         let _ =
-            tokio::task::spawn_blocking(move || peers.update(|book| book.seen(peer, addr, now)))
-                .await;
+            tokio::task::spawn_blocking(move || peers.update(|book| book.seen(peer, now))).await;
         self.register(Arc::clone(&session));
         Ok(session)
     }

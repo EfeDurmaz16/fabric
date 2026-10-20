@@ -10,14 +10,14 @@
 //! chunks are named by their hashes and served to any paired peer.
 
 use fabric_core::BoxFuture;
-use fabric_core::id::{ChunkId, JobId, NodeId, SnapshotId};
+use fabric_core::id::{ChunkId, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::FencingToken;
 use fabric_core::ledger::{Author, LedgerError};
-use fabric_core::moves::{AbortAnswer, CompleteSnapshot, LeaseView, OfferAnswer};
-use fabric_net::rpc::Service;
+use fabric_core::moves::{AbortAnswer, CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
+use fabric_net::rpc::{JobFuture, Service};
 use fabric_net::wire::{
-    Facts, Fault, FaultText, JobRequest, JobResponse, ManifestChunks, OfferBody, RecordBytes,
-    RecordPage,
+    Appended, Facts, Fault, FaultText, Fenced, ManifestChunks, MoveRequested, MoveState, Offered,
+    Pulled, RecordBytes, RecordPage,
 };
 use fabric_store::objects::ObjectError;
 use fabric_store::store::StoreError;
@@ -42,13 +42,48 @@ fn record_bytes(bytes: &[u8]) -> Result<RecordBytes, Fault> {
 }
 
 impl Service for Node {
-    fn job(
+    fn pull(
+        &self,
+        _peer: NodeId,
+        token: FencingToken,
+        after: Option<RecordHash>,
+    ) -> JobFuture<'_, Pulled> {
+        Box::pin(async move { self.answer_pull(token.job_id, after).await })
+    }
+
+    fn append(
         &self,
         peer: NodeId,
         token: FencingToken,
-        request: JobRequest,
-    ) -> BoxFuture<'_, Result<JobResponse, Fault>> {
-        Box::pin(async move { self.answer_job(peer, token, request).await })
+        records: RecordPage,
+    ) -> JobFuture<'_, Appended> {
+        Box::pin(async move { self.answer_append(peer, token, records).await })
+    }
+
+    fn move_request(&self, peer: NodeId, token: FencingToken) -> JobFuture<'_, MoveRequested> {
+        Box::pin(async move { self.answer_move_request(peer, token.job_id).await })
+    }
+
+    fn offer(&self, peer: NodeId, token: FencingToken, offer: MoveOffer) -> JobFuture<'_, Offered> {
+        Box::pin(async move { self.answer_offer(peer, token, offer).await })
+    }
+
+    fn move_status(
+        &self,
+        _peer: NodeId,
+        token: FencingToken,
+        move_id: MoveId,
+    ) -> JobFuture<'_, MoveState> {
+        Box::pin(async move { self.answer_move_status(token.job_id, move_id).await })
+    }
+
+    fn move_abort(
+        &self,
+        _peer: NodeId,
+        token: FencingToken,
+        move_id: MoveId,
+    ) -> JobFuture<'_, RecordBytes> {
+        Box::pin(async move { self.answer_move_abort(token.job_id, move_id).await })
     }
 
     fn manifest(
@@ -101,71 +136,73 @@ impl Service for Node {
 }
 
 impl Node {
-    async fn answer_job(
+    async fn answer_move_status(
         &self,
-        peer: NodeId,
-        token: FencingToken,
-        request: JobRequest,
-    ) -> Result<JobResponse, Fault> {
-        let id = token.job_id;
-        match request {
-            JobRequest::Pull { after } => self.answer_pull(id, after).await,
-            JobRequest::Append { records } => self.answer_append(peer, token, records).await,
-            JobRequest::MoveRequest => self.answer_move_request(peer, id).await,
-            JobRequest::MoveOffer(body) => self.answer_offer(peer, token, body).await,
-            JobRequest::MoveStatus { move_id } => {
-                let job = self.job(id).await.map_err(|_| Fault::UnknownJob)?;
-                let job = job.lock().await;
-                Ok(match job.ledger().decision_for(move_id) {
-                    Some(record) => JobResponse::MoveDecision {
-                        record: record_bytes(record.bytes())?,
-                    },
-                    None => JobResponse::MoveUndecided { move_id },
-                })
+        id: JobId,
+        move_id: MoveId,
+    ) -> Result<Fenced<MoveState>, Fault> {
+        let job = self.job(id).await.map_err(|_| Fault::UnknownJob)?;
+        let job = job.lock().await;
+        Ok(Fenced::Answer(match job.ledger().decision_for(move_id) {
+            Some(record) => MoveState::Decided {
+                record: record_bytes(record.bytes())?,
+            },
+            None => MoveState::Undecided { move_id },
+        }))
+    }
+
+    async fn answer_move_abort(
+        &self,
+        id: JobId,
+        move_id: MoveId,
+    ) -> Result<Fenced<RecordBytes>, Fault> {
+        let job = self.job(id).await.map_err(|_| Fault::UnknownJob)?;
+        let mut job = job.lock().await;
+        let answer = job
+            .ledger()
+            .answer_abort(self.id, move_id, clock::event_id(), clock::now_ms())
+            .map_err(|e| bad(&e))?;
+        let record = match answer {
+            AbortAnswer::Decided(record) => record,
+            AbortAnswer::Abort(record) => {
+                job.commit(record.clone(), Author::Node(self.id))
+                    .map_err(|e| internal(&e))?;
+                record
             }
-            JobRequest::MoveAbort { move_id } => {
-                let job = self.job(id).await.map_err(|_| Fault::UnknownJob)?;
-                let mut job = job.lock().await;
-                let answer = job
-                    .ledger()
-                    .answer_abort(self.id, move_id, clock::event_id(), clock::now_ms())
-                    .map_err(|e| bad(&e))?;
-                let record = match answer {
-                    AbortAnswer::Decided(record) => record,
-                    AbortAnswer::Abort(record) => {
-                        job.commit(record.clone(), Author::Node(self.id))
-                            .map_err(|e| internal(&e))?;
-                        record
-                    }
-                };
-                Ok(JobResponse::MoveDecision {
-                    record: record_bytes(record.bytes())?,
-                })
-            }
-        }
+        };
+        Ok(Fenced::Answer(record_bytes(record.bytes())?))
     }
 
     async fn answer_pull(
         &self,
         id: JobId,
-        after: fabric_core::id::RecordHash,
-    ) -> Result<JobResponse, Fault> {
+        after: Option<RecordHash>,
+    ) -> Result<Fenced<Pulled>, Fault> {
         let job = self.job(id).await.map_err(|_| Fault::UnknownJob)?;
         let job = job.lock().await;
         let ledger = job.ledger();
-        // A head this chain does not hold means the asker has nothing yet,
-        // or forked; either way it gets the chain from the start and its
-        // ledger rules decide what links.
-        let suffix = ledger.suffix_after(after).unwrap_or(ledger.records());
-        let mut records = RecordPage::default();
-        let mut more = false;
-        for record in suffix {
-            if records.push(record_bytes(record.bytes())?).is_err() {
-                more = true;
-                break;
+        let suffix = match after {
+            None => ledger.records(),
+            Some(after) => match ledger.suffix_after(after) {
+                Some(suffix) => suffix,
+                None => {
+                    return Ok(Fenced::Answer(Pulled::NotInChain {
+                        head: ledger.head(),
+                    }));
+                }
+            },
+        };
+        let mut rest = suffix.iter();
+        let Some(first) = rest.next() else {
+            return Ok(Fenced::Answer(Pulled::UpToDate));
+        };
+        let mut page = RecordPage::new(record_bytes(first.bytes())?);
+        for record in rest {
+            if page.push(record_bytes(record.bytes())?).is_err() {
+                return Ok(Fenced::Answer(Pulled::More(page)));
             }
         }
-        Ok(JobResponse::Records { records, more })
+        Ok(Fenced::Answer(Pulled::Last(page)))
     }
 
     async fn answer_append(
@@ -173,12 +210,12 @@ impl Node {
         peer: NodeId,
         token: FencingToken,
         records: RecordPage,
-    ) -> Result<JobResponse, Fault> {
+    ) -> Result<Fenced<Appended>, Fault> {
         let id = token.job_id;
         if let Ok(job) = self.job(id).await {
             let current = job.lock().await.ledger().lease().epoch();
             if token.epoch < current {
-                return Ok(JobResponse::StaleEpoch {
+                return Ok(Fenced::StaleEpoch {
                     yours: token.epoch,
                     current,
                 });
@@ -188,7 +225,7 @@ impl Node {
             match self.accept_record(id, peer, bytes.as_bytes()).await {
                 Ok(_) => {}
                 Err(NodeError::Ledger(LedgerError::PrevMismatch { head })) => {
-                    return Ok(JobResponse::Rejected { head });
+                    return Ok(Fenced::Answer(Appended::Rejected { head }));
                 }
                 Err(e) => return Err(bad(&e)),
             }
@@ -208,7 +245,7 @@ impl Node {
         if let Some(snapshot) = latest {
             self.fetch_from(peer, snapshot).await?;
         }
-        Ok(JobResponse::Accepted { head })
+        Ok(Fenced::Answer(Appended::Accepted { head }))
     }
 
     /// Fetches `snapshot` from `peer` over the session the peer opened, unless it is here whole.
@@ -227,13 +264,17 @@ impl Node {
             .map_err(|e| internal(&e))
     }
 
-    async fn answer_move_request(&self, peer: NodeId, id: JobId) -> Result<JobResponse, Fault> {
+    async fn answer_move_request(
+        &self,
+        peer: NodeId,
+        id: JobId,
+    ) -> Result<Fenced<MoveRequested>, Fault> {
         let job = self.job(id).await.map_err(|_| Fault::UnknownJob)?;
         let mut job = job.lock().await;
         match job.view(self.id) {
             LeaseView::Owner(_) => {}
             LeaseView::Departing { move_id, target } if target == peer => {
-                return Ok(JobResponse::MoveStarted { move_id });
+                return Ok(Fenced::Answer(MoveRequested::Started { move_id }));
             }
             LeaseView::Departing { target, .. } => {
                 return Err(bad(&format!("a move toward {target} is open")));
@@ -262,16 +303,15 @@ impl Node {
         for line in out.lines {
             tracing::info!(job = %id, "{line}");
         }
-        Ok(JobResponse::MoveStarted { move_id })
+        Ok(Fenced::Answer(MoveRequested::Started { move_id }))
     }
 
     async fn answer_offer(
         &self,
         peer: NodeId,
         token: FencingToken,
-        body: OfferBody,
-    ) -> Result<JobResponse, Fault> {
-        let offer = body.for_job(token.job_id);
+        offer: MoveOffer,
+    ) -> Result<Fenced<Offered>, Fault> {
         for _ in 0..2 {
             let complete = is_complete(&self.store, offer.snapshot)
                 .await
@@ -295,9 +335,9 @@ impl Node {
                 .map_err(|e| bad(&e))?;
             match answer {
                 OfferAnswer::Decided(record) => {
-                    return Ok(JobResponse::MoveDecision {
+                    return Ok(Fenced::Answer(Offered::Decided {
                         record: record_bytes(record.bytes())?,
-                    });
+                    }));
                 }
                 OfferAnswer::Import(record) => {
                     job.commit(record.clone(), Author::Node(self.id))
@@ -311,13 +351,15 @@ impl Node {
                         }
                         return Err(internal(&"the answer was dropped"));
                     }
-                    return Ok(JobResponse::MoveDecision {
+                    return Ok(Fenced::Answer(Offered::Decided {
                         record: record_bytes(record.bytes())?,
-                    });
+                    }));
                 }
-                OfferAnswer::Rejected { head } => return Ok(JobResponse::Rejected { head }),
+                OfferAnswer::Rejected { head } => {
+                    return Ok(Fenced::Answer(Offered::Rejected { head }));
+                }
                 OfferAnswer::Stale { yours, current } => {
-                    return Ok(JobResponse::StaleEpoch { yours, current });
+                    return Ok(Fenced::StaleEpoch { yours, current });
                 }
                 OfferAnswer::SnapshotIncomplete { snapshot } => {
                     drop(job);
@@ -325,8 +367,8 @@ impl Node {
                 }
             }
         }
-        Ok(JobResponse::SnapshotIncomplete {
+        Ok(Fenced::Answer(Offered::SnapshotIncomplete {
             snapshot: offer.snapshot,
-        })
+        }))
     }
 }

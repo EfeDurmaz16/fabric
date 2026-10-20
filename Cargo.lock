@@ -444,6 +444,7 @@ dependencies = [
  "fabric-harness",
  "fabric-net",
  "fabric-store",
+ "postcard",
  "rustix",
  "serde",
  "serde_json",

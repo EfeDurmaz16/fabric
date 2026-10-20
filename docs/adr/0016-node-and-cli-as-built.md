@@ -59,7 +59,7 @@ The pull (`fabric job resume <job>` on a node that does not own the job) fetches
 
 Three protocol details the earlier ADRs left open:
 
-- `Pull { after }` with an `after` the chain does not hold returns the chain from `Created`. A node that has nothing sends the zero hash. The asker's ledger rules decide what links.
+- A node that holds none of a job's records sends `Pull { after: None }` and gets the chain from `Created`. An `after` the answering chain does not hold is answered `NotInChain { head }`: the asker stops when its own chain holds that head, because the peer is only behind, and otherwise reports that the chains forked, since the fork rule of ADR 0003 is not built.
 - A record a peer sends is checked first as the peer's own. If the ledger says another node wrote it, it is accepted as relayed (ADR 0002, amendment 6), except when the writer is this node: a node writes its own records and never learns one from a peer.
 - A per-job request whose epoch is behind this node's is answered `StaleEpoch`, except `Pull`, which is a read from a node catching up.
 
@@ -88,7 +88,7 @@ Capture measures carry keys with `fabric-env` detection: a cache detection does 
 ### The network questions of ADR 0013
 
 - The node owns the `Service` implementation. The store gained `Store::manifest_chunks` and `ObjectStore::read_stored` so the node can serve without reading the catalog's internals.
-- The peer book records only addresses this node dialed: `seen` is called after a successful dial, never for an accepted connection, whose source address may sit behind a NAT. Which side can dial is therefore the presence of an address.
+- The peer book holds only the addresses the user pasted at pairing. `seen` records the time of a successful dial and no address, and is never called for an accepted connection, whose source address may sit behind a NAT. Which side can dial is therefore the presence of a pasted address.
 - `Endpoint::with_dial_order` takes `QuicThenTcp`, `QuicOnly` or `TcpOnly`; `fabric serve --wire` sets it.
 
 ### Fault points

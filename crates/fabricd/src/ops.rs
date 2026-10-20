@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fabric_core::harness::HarnessKind;
-use fabric_core::id::{Epoch, JobId, NodeId, RecordHash, SnapshotId};
+use fabric_core::id::{Epoch, JobId, NodeId, SnapshotId};
 use fabric_core::lease::{FenceError, FencingToken};
 use fabric_core::ledger::{Author, EventKind, Ledger};
 use fabric_core::moves::{CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
@@ -24,7 +24,9 @@ use fabric_harness::SessionId;
 use fabric_harness::manifest::StateManifest;
 use fabric_net::peers::HostPort;
 use fabric_net::rpc::Session;
-use fabric_net::wire::{JobRequest, JobResponse, RecordBytes, RecordPage};
+use fabric_net::wire::{
+    Appended, Fenced, MoveRequested, MoveState, Offered, Pulled, RecordBytes, RecordPage,
+};
 use fabric_store::capture::{CaptureRequest, capture};
 use fabric_store::policy::IgnorePolicy;
 use fabric_store::restore::{
@@ -58,6 +60,13 @@ pub const SHORT_DEADLINE: Duration = Duration::from_secs(15);
 
 /// How many times a move asks again after a lost answer before it reports the move frozen.
 const MOVE_TRIES: usize = 5;
+
+/// One answer in the offer loop: to the offer itself, or to a later `MoveStatus`.
+#[derive(Debug)]
+enum Asked {
+    Offer(Fenced<Offered>),
+    Status(Fenced<MoveState>),
+}
 
 impl Node {
     pub(crate) async fn dispatch(
@@ -676,31 +685,27 @@ impl Node {
             )
         };
         let token = FencingToken { job_id: id, epoch };
-        let mut pages = Vec::new();
-        let mut page = RecordPage::default();
+        let mut pages: Vec<RecordPage> = Vec::new();
         for record in records {
             let bytes = RecordBytes::new(record.bytes().to_vec())?;
-            if let Err(bytes) = page.push(bytes) {
-                pages.push(std::mem::take(&mut page));
-                page.push(bytes)
-                    .map_err(|_| NodeError::Wire(fabric_net::wire::WireError::PageFull))?;
+            let unplaced = match pages.last_mut() {
+                Some(page) => page.push(bytes).err(),
+                None => Some(bytes),
+            };
+            if let Some(bytes) = unplaced {
+                pages.push(RecordPage::new(bytes));
             }
         }
-        pages.push(page);
         for page in pages {
             let answer = self
                 .call(peer, |session| {
                     let page = page.clone();
-                    async move {
-                        session
-                            .job(token, JobRequest::Append { records: page }, APPEND_DEADLINE)
-                            .await
-                    }
+                    async move { session.append(token, page, APPEND_DEADLINE).await }
                 })
                 .await?;
             match answer {
-                JobResponse::Accepted { .. } => {}
-                JobResponse::Rejected { head } => {
+                Fenced::Answer(Appended::Accepted { .. }) => {}
+                Fenced::Answer(Appended::Rejected { head }) => {
                     return Err(NodeError::Peer {
                         peer,
                         reason: format!(
@@ -708,7 +713,7 @@ impl Node {
                         ),
                     });
                 }
-                JobResponse::StaleEpoch { current, .. } => {
+                Fenced::StaleEpoch { current, .. } => {
                     return Err(NodeError::Peer {
                         peer,
                         reason: format!(
@@ -716,10 +721,12 @@ impl Node {
                         ),
                     });
                 }
-                other => {
+                Fenced::AheadOfUs { current, .. } => {
                     return Err(NodeError::Peer {
                         peer,
-                        reason: format!("unexpected answer to a ledger push: {other:?}"),
+                        reason: format!(
+                            "it is at epoch {current}, older than this node's, and must catch up first"
+                        ),
                     });
                 }
             }
@@ -879,21 +886,26 @@ impl Node {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
             }
-            let request = if attempt == 0 {
-                JobRequest::MoveOffer(offer.into())
-            } else {
-                JobRequest::MoveStatus {
-                    move_id: offer.move_id,
-                }
-            };
-            let answer = self
-                .call(to, |session| {
-                    let request = request.clone();
-                    async move { session.job(token, request, MOVE_DEADLINE).await }
+            let answer = if attempt == 0 {
+                self.call(to, |session| async move {
+                    session.offer(epoch, offer, MOVE_DEADLINE).await
                 })
-                .await;
+                .await
+                .map(Asked::Offer)
+            } else {
+                self.call(to, |session| async move {
+                    session
+                        .move_status(token, offer.move_id, MOVE_DEADLINE)
+                        .await
+                })
+                .await
+                .map(Asked::Status)
+            };
             match answer {
-                Ok(JobResponse::MoveDecision { record }) => {
+                Ok(
+                    Asked::Offer(Fenced::Answer(Offered::Decided { record }))
+                    | Asked::Status(Fenced::Answer(MoveState::Decided { record })),
+                ) => {
                     let twice = faults::hit(Point::AfterImportReceipt).await == Some(Action::Dup);
                     self.apply_decision(id, to, record.as_bytes(), out).await?;
                     if twice {
@@ -901,31 +913,39 @@ impl Node {
                     }
                     return Ok(());
                 }
-                Ok(JobResponse::MoveUndecided { .. }) => {
+                Ok(Asked::Status(Fenced::Answer(MoveState::Undecided { .. }))) => {
                     let answer = self
                         .call(to, |session| async move {
-                            session
-                                .job(token, JobRequest::MoveOffer(offer.into()), MOVE_DEADLINE)
-                                .await
+                            session.offer(epoch, offer, MOVE_DEADLINE).await
                         })
                         .await;
-                    if let Ok(JobResponse::MoveDecision { record }) = answer {
+                    if let Ok(Fenced::Answer(Offered::Decided { record })) = answer {
                         self.apply_decision(id, to, record.as_bytes(), out).await?;
                         return Ok(());
                     }
                     last_error = format!("{to} has not decided: {answer:?}");
                 }
-                Ok(JobResponse::SnapshotIncomplete { .. } | JobResponse::Rejected { .. }) => {
+                Ok(Asked::Offer(Fenced::Answer(
+                    Offered::SnapshotIncomplete { .. } | Offered::Rejected { .. },
+                ))) => {
                     self.push_records(id, to).await?;
                     last_error = format!("{to} lacked records or chunks; pushed them again");
                 }
-                Ok(JobResponse::StaleEpoch { current, .. }) => {
+                Ok(
+                    Asked::Offer(Fenced::StaleEpoch { current, .. })
+                    | Asked::Status(Fenced::StaleEpoch { current, .. }),
+                ) => {
                     return Err(NodeError::Peer {
                         peer: to,
                         reason: format!("it knows epoch {current}; the move cannot complete"),
                     });
                 }
-                Ok(other) => last_error = format!("unexpected answer {other:?}"),
+                Ok(
+                    Asked::Offer(Fenced::AheadOfUs { current, .. })
+                    | Asked::Status(Fenced::AheadOfUs { current, .. }),
+                ) => {
+                    last_error = format!("{to} is at epoch {current} and has not caught up");
+                }
                 Err(e) => {
                     out.say(format!(
                         "no answer from {to} ({e}); asking for its decision"
@@ -996,13 +1016,11 @@ impl Node {
         let token = FencingToken { job_id: id, epoch };
         let answer = self
             .call(target, |session| async move {
-                session
-                    .job(token, JobRequest::MoveStatus { move_id }, SHORT_DEADLINE)
-                    .await
+                session.move_status(token, move_id, SHORT_DEADLINE).await
             })
             .await;
         match answer {
-            Ok(JobResponse::MoveDecision { record }) => {
+            Ok(Fenced::Answer(MoveState::Decided { record })) => {
                 self.apply_decision(id, target, record.as_bytes(), out)
                     .await
             }
@@ -1150,12 +1168,10 @@ impl Node {
         let token = FencingToken { job_id: id, epoch };
         let answer = self
             .call(holder, |session| async move {
-                session
-                    .job(token, JobRequest::MoveRequest, MOVE_DEADLINE)
-                    .await
+                session.move_request(token, MOVE_DEADLINE).await
             })
             .await?;
-        let JobResponse::MoveStarted { move_id } = answer else {
+        let Fenced::Answer(MoveRequested::Started { move_id }) = answer else {
             return Err(NodeError::Peer {
                 peer: holder,
                 reason: format!("it did not start a move: {answer:?}"),
@@ -1220,25 +1236,44 @@ impl Node {
             let (after, epoch) = match self.job(id).await {
                 Ok(job) => {
                     let job = job.lock().await;
-                    (job.ledger().head(), job.ledger().lease().epoch())
+                    (Some(job.ledger().head()), job.ledger().lease().epoch())
                 }
-                Err(_) => (RecordHash::from_bytes([0; 32]), Epoch::FIRST),
+                Err(_) => (None, Epoch::FIRST),
             };
             let token = FencingToken { job_id: id, epoch };
             let answer = self
                 .call(holder, |session| async move {
-                    session
-                        .job(token, JobRequest::Pull { after }, SHORT_DEADLINE)
-                        .await
+                    session.pull(token, after, SHORT_DEADLINE).await
                 })
                 .await?;
-            let JobResponse::Records { records, more } = answer else {
-                return Err(NodeError::Peer {
-                    peer: holder,
-                    reason: format!("unexpected answer to a pull: {answer:?}"),
-                });
+            let (page, more) = match answer {
+                Fenced::Answer(Pulled::UpToDate) => return Ok(()),
+                Fenced::Answer(Pulled::Last(page)) => (page, false),
+                Fenced::Answer(Pulled::More(page)) => (page, true),
+                Fenced::Answer(Pulled::NotInChain { head }) => {
+                    let behind = {
+                        let job = self.job(id).await?;
+                        let job = job.lock().await;
+                        job.ledger().suffix_after(head).is_some()
+                    };
+                    if behind {
+                        return Ok(());
+                    }
+                    return Err(NodeError::Peer {
+                        peer: holder,
+                        reason: format!(
+                            "its ledger forked from this one (its head is {head}); the chains cannot be joined"
+                        ),
+                    });
+                }
+                other => {
+                    return Err(NodeError::Peer {
+                        peer: holder,
+                        reason: format!("unexpected answer to a pull: {other:?}"),
+                    });
+                }
             };
-            for bytes in records.records() {
+            for bytes in page.records() {
                 self.accept_record(id, holder, bytes.as_bytes()).await?;
             }
             if !more {

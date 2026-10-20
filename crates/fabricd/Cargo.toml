@@ -18,6 +18,7 @@ fabric-env = { path = "../fabric-env" }
 fabric-harness = { path = "../fabric-harness" }
 fabric-net = { path = "../fabric-net" }
 fabric-store = { path = "../fabric-store" }
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 rustix = { version = "1.1", features = ["fs", "process"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

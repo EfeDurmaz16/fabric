@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, JobId, NodeId};
-use fabric_net::wire::{decode, encode};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -207,9 +207,24 @@ pub enum ControlError {
     /// A message declares more bytes than `MAX_CONTROL_MESSAGE`.
     #[error("control message of {0} bytes exceeds the cap")]
     TooLarge(usize),
-    /// A message did not decode.
+    /// A message did not encode or decode.
     #[error("control socket: {0}")]
-    Wire(#[from] fabric_net::wire::WireError),
+    Codec(#[from] postcard::Error),
+    /// A message decoded with bytes left over.
+    #[error("control message has {0} trailing bytes")]
+    Trailing(usize),
+}
+
+fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, ControlError> {
+    Ok(postcard::to_stdvec(value)?)
+}
+
+fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ControlError> {
+    let (value, rest) = postcard::take_from_bytes::<T>(bytes)?;
+    if !rest.is_empty() {
+        return Err(ControlError::Trailing(rest.len()));
+    }
+    Ok(value)
 }
 
 async fn write_message(stream: &mut UnixStream, payload: &[u8]) -> Result<(), ControlError> {
@@ -245,12 +260,12 @@ pub async fn call(socket: &Path, request: &Request) -> Result<Response, ControlE
                 source,
             })?;
     write_message(&mut stream, &encode(request)?).await?;
-    Ok(decode(&read_message(&mut stream).await?)?)
+    decode(&read_message(&mut stream).await?)
 }
 
 /// Reads one request from a connection the daemon accepted.
 pub(crate) async fn read_request(stream: &mut UnixStream) -> Result<Request, ControlError> {
-    Ok(decode(&read_message(stream).await?)?)
+    decode(&read_message(stream).await?)
 }
 
 /// Writes the answer to a connection the daemon accepted.

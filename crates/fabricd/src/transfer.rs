@@ -199,7 +199,8 @@ async fn fetch_batch(
     loop {
         match stream.next().await {
             Ok(Some(chunk)) => {
-                let (id, _, bytes) = chunk.into_parts();
+                let id = chunk.id();
+                let bytes = chunk.bytes().to_vec();
                 let stored = with_store(store, move |store| {
                     Ok(store.objects().put(&bytes).map_err(StoreError::from)?)
                 })
