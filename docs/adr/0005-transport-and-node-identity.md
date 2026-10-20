@@ -1,6 +1,6 @@
 # ADR 0005: Transport and node identity
 
-Status: accepted, 2026-10-19
+Status: accepted, 2026-10-19; the `Transport` trait and where iroh plugs in, the message shapes and the 1 MiB control frame figure under Framing, and the multiplexer header under the TCP+TLS fallback are superseded by [ADR 0013](0013-network-protocol-as-built.md), 2026-10-20
 
 Amended 2026-10-19 after step 1 research. The per-job message vocabulary follows the move protocol of ADR 0003: the claim and renewal messages are replaced by `MoveRequest`, `MoveOffer`, `MoveStatus`, `MoveDecision`, `MoveUndecided` and `MoveAbort`. The bulk frame bound follows the whole-file objects of ADR 0004 (8 MiB). The preflight of 2026-10-19 (`step1/preflight-2026-10-19.md`) confirmed the two paths this ADR planned: UDP from the Pro to the Air arrives, so QUIC works direct, and TCP arrives, so the fallback works; the Air has a public address and the Pro is behind NAT, so the Pro dials. Tailscale is stopped on both and is not used.
 

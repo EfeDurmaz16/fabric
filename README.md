@@ -6,14 +6,15 @@ Private repository. Working name; see [ADR 0010](docs/adr/0010-name-and-scope-bo
 
 ## Status, honestly
 
-Core types and the store. Nothing suspends or resumes yet.
+Core types, the store and the network layer. Nothing suspends or resumes yet.
 
 | What | State |
 |---|---|
 | Architecture page and glossary | Written: [docs/architecture.md](docs/architecture.md), [docs/glossary.md](docs/glossary.md) |
-| ADRs 0001 to 0012 and 0014 | Written, see below; amended 2026-10-19 after the step 1 research; 0014 records the store as built |
+| ADRs 0001 to 0014 | Written, see below; amended 2026-10-19 after the step 1 research; 0013 records the network protocol and 0014 the store as built |
 | `crates/fabric-core` | Ids, paths, the job ledger with its record codec, the lease and the cooperative move protocol, snapshot manifests and the environment spec. Pure: no IO, no clock, no socket. Property-tested against the ADR 0003 invariants. |
 | `crates/fabric-store` | Content-addressed objects (blake3, zstd, FastCDC above 8 MiB), the SQLite catalog with refcounts and a graced gc, workspace capture (git state as two private commits and a bundle, ignored files by class, secrets denied) and restore into an empty directory through a staging rename. Crash-tested with `SIGKILL` at every publish and restore checkpoint. No network, no ledger, no CLI. |
+| `crates/fabric-net` | Node key, pinned TLS with no CA, QUIC and TCP+TLS transports on one port behind one endpoint, framed and typed RPC with deadlines, paged ledger records and verified zstd chunk transfer, the peer book. Tested with two nodes in one process on both wires. See [docs/net.md](docs/net.md). |
 | Every other crate in the layout | Does not exist yet |
 | CI | fmt, clippy, test, doc, `cargo deny` and the hygiene script on macOS and Ubuntu |
 
@@ -39,6 +40,7 @@ One job, adopted with `fabric job init` from a checkout where Claude Code is alr
 | [0010](docs/adr/0010-name-and-scope-boundaries.md) | Name and scope boundaries |
 | [0011](docs/adr/0011-path-identity.md) | Path identity |
 | [0012](docs/adr/0012-dependency-carry.md) | Dependency carry |
+| [0013](docs/adr/0013-network-protocol-as-built.md) | The network protocol as built |
 | [0014](docs/adr/0014-store-as-built.md) | The store as built |
 
 Start with the architecture page, then read the ADRs in order. ADR 0003 deserves the most attention; it is the one that protects the user's work. The research notes the ADRs cite are private and live outside this repository; the architecture page says what they are.
