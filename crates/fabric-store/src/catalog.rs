@@ -138,6 +138,12 @@ fn connect(path: &Path) -> Result<Connection, CatalogError> {
     Ok(conn)
 }
 
+/// Reads a column that holds a count or a time, refusing a negative value.
+fn get_u64(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<u64> {
+    let value: i64 = row.get(idx)?;
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(idx, value))
+}
+
 fn opt_snapshot(bytes: Option<[u8; 32]>) -> Option<SnapshotId> {
     bytes.map(SnapshotId::from_bytes)
 }
@@ -249,16 +255,15 @@ impl Catalog {
         Ok(params)
     }
 
+    /// Maps a row; a negative length or time is an error, never 0.
     fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotRow> {
-        let created_at: i64 = row.get(4)?;
-        let manifest_len: i64 = row.get(5)?;
         Ok(SnapshotRow {
             id: SnapshotId::from_bytes(row.get(0)?),
             job_id: JobId::from_bytes(row.get(1)?),
             parent: opt_snapshot(row.get(2)?),
             bundle_base: opt_snapshot(row.get(3)?),
-            created_at: created_at.try_into().unwrap_or(0),
-            manifest_len: manifest_len.try_into().unwrap_or(0),
+            created_at: get_u64(row, 4)?,
+            manifest_len: get_u64(row, 5)?,
         })
     }
 
@@ -300,10 +305,9 @@ impl Catalog {
              WHERE sc.snapshot_id = ?1 AND sc.role = ?2 ORDER BY sc.ordinal",
         )?;
         let rows = stmt.query_map(params![id.to_bytes(), role as i64], |r| {
-            let stored_len: i64 = r.get(1)?;
             Ok(ChunkRef {
                 id: ChunkId::from_bytes(r.get(0)?),
-                stored_len: stored_len.try_into().unwrap_or(0),
+                stored_len: get_u64(r, 1)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -416,10 +420,9 @@ impl Catalog {
                 i64::try_from(now_ms).unwrap_or(i64::MAX)
             ],
             |r| {
-                let stored_len: i64 = r.get(1)?;
                 Ok(ChunkRef {
                     id: ChunkId::from_bytes(r.get(0)?),
-                    stored_len: stored_len.try_into().unwrap_or(0),
+                    stored_len: get_u64(r, 1)?,
                 })
             },
         )?;
