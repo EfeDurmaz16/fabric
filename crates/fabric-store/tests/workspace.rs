@@ -227,10 +227,7 @@ fn git_state_survives_capture_and_restore() {
             path: RelPath::parse("node_modules").unwrap(),
             class: CacheClass::Deps,
             carry: CarryState::Carried,
-            key: CarryKey::Other {
-                tool: "unmeasured".to_owned(),
-                version: String::new(),
-            },
+            key: CarryKey::Unmeasured,
         }]
     );
 

@@ -45,16 +45,13 @@ pub trait CarryKeys {
     fn key(&self, class: CacheClass, path: &RelPath) -> CarryKey;
 }
 
-/// Carry keys for a node that measured nothing; no target ever matches them.
+/// Carry keys for a node that measured nothing: every key is `CarryKey::Unmeasured`, which `CarryKey::matches` never accepts.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UnmeasuredKeys;
 
 impl CarryKeys for UnmeasuredKeys {
     fn key(&self, _class: CacheClass, _path: &RelPath) -> CarryKey {
-        CarryKey::Other {
-            tool: "unmeasured".to_owned(),
-            version: String::new(),
-        }
+        CarryKey::Unmeasured
     }
 }
 
