@@ -908,7 +908,6 @@ async fn launch_resumes_in_the_workspace_with_exactly_the_given_env() {
         .await
         .unwrap();
     assert_eq!(running.session().cloned(), Some(session()));
-    assert_eq!(running.pid(), running.pgid());
     assert_eq!(Some(running.pid().get()), running.child_mut().id());
     let status = running.child_mut().wait().await.unwrap();
     assert!(status.success());
@@ -922,6 +921,11 @@ async fn launch_resumes_in_the_workspace_with_exactly_the_given_env() {
     );
     assert!(seen.contains(&format!("home={}", home.display())), "{seen}");
     assert!(seen.contains("leak=unset"), "{seen}");
+    let pid = running.pid();
+    assert!(
+        seen.contains(&format!("pid={pid} pgid={pid}\n")),
+        "the harness leads a process group of its own: {seen}"
+    );
 
     let mut running = adapter
         .launch(

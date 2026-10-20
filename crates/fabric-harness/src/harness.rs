@@ -153,15 +153,10 @@ impl Running {
         }
     }
 
-    /// The process id.
+    /// The process id, which is also the id of the process group the
+    /// process leads.
     #[must_use]
     pub fn pid(&self) -> NonZeroU32 {
-        self.pid
-    }
-
-    /// The process group id, equal to the pid because the group was created for it.
-    #[must_use]
-    pub fn pgid(&self) -> NonZeroU32 {
         self.pid
     }
 

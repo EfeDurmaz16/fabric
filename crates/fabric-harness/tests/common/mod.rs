@@ -1,7 +1,8 @@
 //! A fake `claude` for the Claude adapter's tests. It reports the version
 //! the session registry was read on, stays alive when its first argument
 //! is `hold` (so the running-process check sees it), and otherwise writes
-//! its working directory, arguments and environment to `$FAKE_LOG`.
+//! its working directory, arguments, environment, pid and process group
+//! to `$FAKE_LOG`.
 //! `project_key` states Claude's project directory rule independently of
 //! the adapter's own.
 
@@ -16,7 +17,7 @@ case "$1" in
   --version) echo "2.1.294 (Claude Code)"; exit 0 ;;
   hold) sleep 60; exit 0 ;;
 esac
-{ echo "cwd=$(pwd -P)"; for a in "$@"; do echo "arg=$a"; done; echo "home=$HOME"; echo "leak=${CARGO_MANIFEST_DIR:-unset}"; } > "$FAKE_LOG"
+{ echo "cwd=$(pwd -P)"; for a in "$@"; do echo "arg=$a"; done; echo "home=$HOME"; echo "leak=${CARGO_MANIFEST_DIR:-unset}"; echo "pid=$$ pgid=$(/bin/ps -o pgid= -p $$ | tr -d ' ')"; } > "$FAKE_LOG"
 "#;
 
 /// Writes the fake under `dir/bin` once; returns the script and a `PATH`
