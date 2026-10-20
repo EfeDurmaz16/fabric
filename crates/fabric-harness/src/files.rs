@@ -274,6 +274,36 @@ fn commit(tmp: &Path, dest: &Path) -> Result<(), HarnessError> {
     fsync_dir(dest.parent().unwrap_or(Path::new(".")))
 }
 
+/// Creates `dir` and every missing ancestor one at a time, fsyncing the
+/// parent of each new directory, so a file renamed into it later is not
+/// lost with its directory entry on a power cut.
+fn create_dirs_durable(dir: &Path) -> Result<(), HarnessError> {
+    let mut missing = Vec::new();
+    let mut at = dir;
+    loop {
+        match fs::metadata(at) {
+            Ok(_) => break,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                missing.push(at);
+                match at.parent() {
+                    Some(parent) => at = parent,
+                    None => break,
+                }
+            }
+            Err(e) => return Err(HarnessError::io("create dir", at, e)),
+        }
+    }
+    for new in missing.into_iter().rev() {
+        match fs::create_dir(new) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(HarnessError::io("create dir", new, e)),
+        }
+        fsync_dir(new.parent().unwrap_or(Path::new(".")))?;
+    }
+    Ok(())
+}
+
 /// Renames `from` over `to` in the same directory and makes the rename durable.
 pub(crate) fn rename_durable(from: &Path, to: &Path) -> Result<(), HarnessError> {
     fs::rename(from, to).map_err(|e| HarnessError::io("rename", to, e))?;
@@ -282,13 +312,13 @@ pub(crate) fn rename_durable(from: &Path, to: &Path) -> Result<(), HarnessError>
 
 /// Writes a file through a temporary sibling and a rename, letting
 /// `produce` write the bytes. The file gets mode 0600, or the mode of the file it
-/// replaces, and the parent directory is fsynced after the rename.
+/// replaces, and the parent directory is fsynced after the rename, as is the
+/// parent of every directory created on the way.
 pub(crate) fn write_atomic_with<F>(path: &Path, produce: F) -> Result<Written, HarnessError>
 where
     F: FnOnce(&mut dyn Write) -> Result<(), HarnessError>,
 {
-    let parent = path.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(parent).map_err(|e| HarnessError::io("create dir", parent, e))?;
+    create_dirs_durable(path.parent().unwrap_or(Path::new(".")))?;
     let tmp = temp_path(path);
     let result = (|| {
         let file = open_temp(&tmp).map_err(|e| HarnessError::io("write", &tmp, e))?;
