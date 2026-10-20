@@ -30,7 +30,8 @@ use std::io::{self, Read};
 use std::path::Path;
 
 use fabric_core::env::{
-    EnvSpec, EnvSpecError, PinError, RunWhen, SetupStep, Tool, ToolName, ToolSource, ToolVersion,
+    EnvSpec, EnvSpecError, PinError, RunWhen, SecretPattern, SetupStep, Tool, ToolName, ToolSource,
+    ToolVersion,
 };
 use fabric_core::harness::ProgramName;
 use fabric_core::path::RelPath;
@@ -404,7 +405,13 @@ impl Detection {
 }
 
 /// Detects the environment of the workspace at `root`, applying `.fabric/env.toml` when present.
-pub fn detect(root: &Path) -> Result<Detection, DetectError> {
+///
+/// `previous` is the job's last spec, or `None` for a job that has none
+/// yet. Every secret pattern it holds stays in force and in the new spec,
+/// even when the override file no longer lists it: a job's secret list
+/// only grows, and the override file is a file in the working tree that
+/// the agent can rewrite.
+pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, DetectError> {
     let overrides = match read_text(root, OVERRIDE_FILE)? {
         Some(text) => EnvOverride::parse(&text)?,
         None => EnvOverride::default(),
@@ -466,8 +473,26 @@ pub fn detect(root: &Path) -> Result<Detection, DetectError> {
         setup.clone_from(declared);
     }
 
+    let recorded = previous.map_or(&[][..], |spec| spec.secret_patterns.as_slice());
+    let dropped = recorded
+        .iter()
+        .filter(|p| !overrides.secret_patterns.contains(p))
+        .count();
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            "secret patterns this job recorded are missing from {OVERRIDE_FILE}; they stay in force"
+        );
+    }
+    let mut secret_patterns: Vec<SecretPattern> = recorded
+        .iter()
+        .chain(&overrides.secret_patterns)
+        .cloned()
+        .collect();
+    secret_patterns.sort();
+    secret_patterns.dedup();
     let mut secrets = SecretPolicy::default();
-    for pattern in &overrides.secret_patterns {
+    for pattern in &secret_patterns {
         secrets.widen(pattern.clone());
     }
 
@@ -476,6 +501,7 @@ pub fn detect(root: &Path) -> Result<Detection, DetectError> {
         setup,
         env_var_names: overrides.env_var_names.clone(),
         cache_paths: caches.iter().map(|c| c.path.clone()).collect(),
+        secret_patterns,
     };
     spec.validate()?;
 

@@ -32,14 +32,13 @@ use std::collections::BTreeMap;
 
 use fabric_core::credential::looks_like_credential;
 use fabric_core::env::{
-    EnvVarName, EnvVarNameError, PinError, RunWhen, SetupStep, ToolName, ToolVersion,
+    EnvVarName, EnvVarNameError, PinError, RunWhen, SecretPattern, SecretPatternError, SetupStep,
+    ToolName, ToolVersion,
 };
 use fabric_core::harness::{ProgramName, ProgramNameError};
 use fabric_core::path::{PathError, RelPath};
 use fabric_core::snapshot::CacheClass;
 use toml::{Table, Value};
-
-use crate::secret::{Pattern, PatternError};
 
 /// The directory that holds Fabric's own files in a workspace; never a cache.
 const FABRIC_DIR: &str = ".fabric";
@@ -124,7 +123,7 @@ pub enum OverrideError {
         index: usize,
         /// What is wrong with it.
         #[source]
-        reason: PatternError,
+        reason: SecretPatternError,
     },
     /// A setup argument shaped like a credential; the spec travels to other nodes.
     #[error(
@@ -236,7 +235,7 @@ pub(crate) struct EnvOverride {
     /// Names of environment variables the job needs, sorted; a repeat is refused.
     pub env_var_names: Vec<EnvVarName>,
     /// Patterns added to the built-in secret list.
-    pub secret_patterns: Vec<Pattern>,
+    pub secret_patterns: Vec<SecretPattern>,
     /// Declared tool pins, by tool name.
     pub tools: BTreeMap<ToolName, ToolVersion>,
     /// Declared cache paths, in file order.
@@ -343,12 +342,12 @@ fn env_names(value: &Value) -> Result<Vec<EnvVarName>, OverrideError> {
     Ok(names)
 }
 
-fn patterns(value: &Value) -> Result<Vec<Pattern>, OverrideError> {
+fn patterns(value: &Value) -> Result<Vec<SecretPattern>, OverrideError> {
     strings(value, "secret_patterns")?
         .into_iter()
         .enumerate()
         .map(|(index, text)| {
-            Pattern::parse(text).map_err(|reason| OverrideError::Pattern { index, reason })
+            SecretPattern::parse(text).map_err(|reason| OverrideError::Pattern { index, reason })
         })
         .collect()
 }

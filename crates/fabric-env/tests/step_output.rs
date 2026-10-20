@@ -50,7 +50,7 @@ when = "always"
 "#,
     )
     .unwrap();
-    let detected = detect(dir.path()).unwrap();
+    let detected = detect(dir.path(), None).unwrap();
     let planned = plan(dir.path(), &detected).unwrap();
     let captured = Captured::default();
     let writer = captured.clone();

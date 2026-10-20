@@ -3,7 +3,10 @@
 //!
 //! Invariant: a path that matches a secret pattern never leaves the node,
 //! and the pattern list can grow per job but never shrink. The built-in
-//! patterns are always on and `SecretPolicy` has no way to remove one.
+//! patterns are always on and `SecretPolicy` has no way to remove one. A
+//! job's own patterns live in its `EnvSpec`, and detection keeps every one
+//! the previous spec held, so dropping a line from `.fabric/env.toml`
+//! does not drop the pattern.
 //! Matching ignores ASCII case, because the owner's volumes fold case and
 //! `.ENV` there is the same file as `.env`.
 //!
@@ -20,6 +23,7 @@
 //! pattern is staged with consent or the capture stops; it is never left
 //! at its index version, which restore would write back over the user's edit.
 
+use fabric_core::env::SecretPattern;
 use fabric_core::path::RelPath;
 
 /// Patterns that apply everywhere, inside caches included.
@@ -88,76 +92,15 @@ pub enum Scope {
     Work,
 }
 
-/// Why a secret pattern was refused.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum PatternError {
-    /// The pattern has no characters.
-    #[error("secret pattern is empty")]
-    Empty,
-    /// A leading, trailing or doubled slash.
-    #[error("secret pattern has an empty component")]
-    EmptyComponent,
-    /// A `.` or `..` component, which no path holds.
-    #[error("secret pattern has a `.` or `..` component")]
-    DotComponent,
-    /// A `**` component; a pattern already matches at any depth.
-    #[error("secret pattern has a `**` component; a pattern already matches at any depth")]
-    DoubleStar,
-    /// A character with a meaning in gitignore that this matcher does not share.
-    #[error("secret pattern has an unsupported character at index {index}")]
-    BadChar {
-        /// Zero-based byte index of the character.
-        index: usize,
-    },
-}
-
-/// A checked secret pattern a job adds to the built-in list.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Pattern(String);
-
-impl Pattern {
-    /// Checks `text` against the pattern rules and wraps it.
-    ///
-    /// Refused: `\`, `[`, `]`, `?`, `!`, `#`, whitespace and NUL, because
-    /// gitignore gives them meanings this matcher does not, and the same
-    /// pattern must deny the same paths in both.
-    pub fn parse(text: &str) -> Result<Self, PatternError> {
-        if text.is_empty() {
-            return Err(PatternError::Empty);
-        }
-        let bad = text.char_indices().find(|&(_, c)| {
-            matches!(c, '\\' | '[' | ']' | '?' | '!' | '#' | '\0') || c.is_whitespace()
-        });
-        if let Some((index, _)) = bad {
-            return Err(PatternError::BadChar { index });
-        }
-        for component in text.split('/') {
-            match component {
-                "" => return Err(PatternError::EmptyComponent),
-                "." | ".." => return Err(PatternError::DotComponent),
-                "**" => return Err(PatternError::DoubleStar),
-                _ => {}
-            }
-        }
-        Ok(Self(text.to_owned()))
-    }
-
-    /// Returns the pattern text.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 /// The built-in secret patterns plus any a job added.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SecretPolicy {
-    added: Vec<Pattern>,
+    added: Vec<SecretPattern>,
 }
 
 impl SecretPolicy {
     /// Adds a pattern that applies in every scope. Adding one twice changes nothing.
-    pub fn widen(&mut self, pattern: Pattern) {
+    pub fn widen(&mut self, pattern: SecretPattern) {
         if !self.added.contains(&pattern) {
             self.added.push(pattern);
         }
@@ -179,7 +122,7 @@ impl SecretPolicy {
             .or_else(|| {
                 self.added
                     .iter()
-                    .map(Pattern::as_str)
+                    .map(SecretPattern::as_str)
                     .find(|pattern| path_matches(pattern, &names, &[]))
             })
     }
@@ -465,7 +408,7 @@ mod tests {
             policy.denies(&path(".env.production"), Scope::Work),
             Some(".env.*")
         );
-        policy.widen(Pattern::parse(".env.example").unwrap());
+        policy.widen(SecretPattern::parse(".env.example").unwrap());
         assert_eq!(
             policy.denies(&path(".env.example"), Scope::Work),
             Some(".env.example")
@@ -479,8 +422,8 @@ mod tests {
         let mut policy = SecretPolicy::default();
         let local_db = path("data/local.sqlite");
         assert_eq!(policy.denies(&local_db, Scope::Work), None);
-        policy.widen(Pattern::parse("*.sqlite").unwrap());
-        policy.widen(Pattern::parse("*.sqlite").unwrap());
+        policy.widen(SecretPattern::parse("*.sqlite").unwrap());
+        policy.widen(SecretPattern::parse("*.sqlite").unwrap());
         assert_eq!(policy.denies(&local_db, Scope::Work), Some("*.sqlite"));
         assert_eq!(
             policy.denies(&path("node_modules/x/local.sqlite"), Scope::Cache),
@@ -489,39 +432,12 @@ mod tests {
         assert_eq!(policy.added.len(), 1);
     }
 
+    /// The built-in list obeys the rules a job's patterns are held to, so
+    /// one matcher serves both.
     #[test]
-    fn a_pattern_that_gitignore_would_read_differently_is_refused() {
-        assert_eq!(Pattern::parse(""), Err(PatternError::Empty));
-        assert_eq!(Pattern::parse("/x"), Err(PatternError::EmptyComponent));
-        assert_eq!(Pattern::parse("x/"), Err(PatternError::EmptyComponent));
-        assert_eq!(Pattern::parse("a/../b"), Err(PatternError::DotComponent));
-        assert_eq!(Pattern::parse("**/x"), Err(PatternError::DoubleStar));
-        assert_eq!(
-            Pattern::parse("!x"),
-            Err(PatternError::BadChar { index: 0 })
-        );
-        assert_eq!(
-            Pattern::parse("#x"),
-            Err(PatternError::BadChar { index: 0 })
-        );
-        assert_eq!(
-            Pattern::parse("x?"),
-            Err(PatternError::BadChar { index: 1 })
-        );
-        assert_eq!(
-            Pattern::parse("[ab]"),
-            Err(PatternError::BadChar { index: 0 })
-        );
-        assert_eq!(
-            Pattern::parse("a b"),
-            Err(PatternError::BadChar { index: 1 })
-        );
-        assert_eq!(
-            Pattern::parse("x\\"),
-            Err(PatternError::BadChar { index: 1 })
-        );
+    fn every_builtin_is_a_valid_pattern() {
         for builtin in EVERYWHERE.iter().chain(OUTSIDE_CACHES) {
-            assert!(Pattern::parse(builtin).is_ok(), "{builtin}");
+            assert!(SecretPattern::parse(builtin).is_ok(), "{builtin}");
         }
     }
 

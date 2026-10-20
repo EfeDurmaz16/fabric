@@ -23,6 +23,7 @@ Amended 2026-10-19 while writing `fabric-env` (PR `feat/env`). Detection and mat
 9. A spec with no cache paths runs its `CachesMissing` steps on every resume. "Is any cache missing" is vacuously false over an empty list, and under that reading `go mod download` (whose cache lives outside the workspace) and any `[[setup]]` declared without a `[[cache]]` would never run. Nothing in an empty list proves the workspace warm, so the steps run; a user who wants them skipped declares the path they rebuild as a `[[cache]]`.
 10. Detection reads regular files only. A symbolic link in its fixed list is refused with the file named, because `.nvmrc -> .env` would read a secret into the spec and `.nvmrc -> ../../.nvmrc` would give two nodes two specs from one workspace (found by the review of PR `feat/env`). Every pin, detected or declared, must be at most 64 printable ASCII characters and not shaped like a credential, the same guard setup arguments get, since pins travel in the spec too.
 11. Tool names are checked like pins (review of PR `feat/env`, 2026-10-20). Before this only versions were checked, so a credential, a terminal escape sequence or a 5000-character string used as a `[tools]` key, a `.tool-versions` word or a `mise.toml` key went into the spec, and a peer's spec decoded with no check at all. `Tool.name` is now `ToolName` and `Tool.version` is `ToolVersion`, parsed types in `fabric-core` checked inside `Deserialize`, and the credential guard moved to `fabric_core::credential` so the decoder can apply it. Errors name a pin by its file and position, never by its text.
+12. A job's secret patterns are kept in its spec, in `secret_patterns` (review of PR `feat/env`, 2026-10-20). They lived only in `.fabric/env.toml`, a working-tree file the agent can rewrite, so deleting a line shrank the list and the next suspend carried what it had denied. `detect` now takes the job's previous spec and keeps the union of its patterns and the file's; a pattern the file dropped stays in force and a warning says so. `SecretPattern` is a parsed type in `fabric-core`, checked inside `Deserialize`, so the list travels with the job and a peer's capture applies it too.
 
 ## Context
 
@@ -40,6 +41,7 @@ EnvSpec {                        the bytes start with the format version as a va
   setup:         [SetupStep],    commands that make the workspace runnable, in the order they run
   env_var_names: [EnvVarName],   names only, never values; `[A-Za-z_][A-Za-z0-9_]*`, strictly sorted
   cache_paths:   [RelPath],      what counts as a cache for snapshot policy and for "is it warm"; strictly sorted
+  secret_patterns: [SecretPattern], patterns the job added to the built-in secret list; only grows; strictly sorted
 }
 Tool      { name: ToolName, version: ToolVersion, source: Detected | Declared }   version is the pin as its file wrote it, never parsed into parts; both are 1 to 64 printable ASCII characters (no space in a name), not credential-shaped, checked on decode
 SetupStep { program: ProgramName, args: [String], cwd: Option<RelPath>, when: CachesMissing | Always }   cwd None is the root; ProgramName is a bare name, never a path or an option

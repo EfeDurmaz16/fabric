@@ -28,7 +28,7 @@ pub enum EnvSpecError {
     /// A list is not strictly sorted by its key, which also catches a repeated key.
     #[error("{list} entry {index} is not strictly after the one before it")]
     OutOfOrder {
-        /// Which list: `tools`, `env_var_names` or `cache_paths`.
+        /// Which list: `tools`, `env_var_names`, `cache_paths` or `secret_patterns`.
         list: &'static str,
         /// Zero-based index of the entry, within its list.
         index: usize,
@@ -238,6 +238,88 @@ macro_rules! pin_text_impls {
 pin_text_impls!(ToolName);
 pin_text_impls!(ToolVersion);
 
+/// Why a secret pattern was refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SecretPatternError {
+    /// The pattern has no characters.
+    #[error("secret pattern is empty")]
+    Empty,
+    /// A leading, trailing or doubled slash.
+    #[error("secret pattern has an empty component")]
+    EmptyComponent,
+    /// A `.` or `..` component, which no path holds.
+    #[error("secret pattern has a `.` or `..` component")]
+    DotComponent,
+    /// A `**` component; a pattern already matches at any depth.
+    #[error("secret pattern has a `**` component; a pattern already matches at any depth")]
+    DoubleStar,
+    /// A character with a meaning in gitignore that the matcher does not share.
+    #[error("secret pattern has an unsupported character at index {index}")]
+    BadChar {
+        /// Zero-based byte index of the character.
+        index: usize,
+    },
+}
+
+/// A secret pattern a job adds to the built-in list: path components separated by `/`, where `*` matches any run of characters.
+///
+/// Refused: `\`, `[`, `]`, `?`, `!`, `#`, whitespace and NUL, because
+/// gitignore gives them meanings the matcher does not, and empty, `.`, `..`
+/// and `**` components. Checked once, at the boundary, including inside
+/// `Deserialize`. The matcher itself is `fabric_env::secret`.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct SecretPattern(String);
+
+impl SecretPattern {
+    /// Checks `text` against the pattern rules and wraps it.
+    pub fn parse(text: &str) -> Result<Self, SecretPatternError> {
+        if text.is_empty() {
+            return Err(SecretPatternError::Empty);
+        }
+        let bad = text.char_indices().find(|&(_, c)| {
+            matches!(c, '\\' | '[' | ']' | '?' | '!' | '#' | '\0') || c.is_whitespace()
+        });
+        if let Some((index, _)) = bad {
+            return Err(SecretPatternError::BadChar { index });
+        }
+        for component in text.split('/') {
+            match component {
+                "" => return Err(SecretPatternError::EmptyComponent),
+                "." | ".." => return Err(SecretPatternError::DotComponent),
+                "**" => return Err(SecretPatternError::DoubleStar),
+                _ => {}
+            }
+        }
+        Ok(Self(text.to_owned()))
+    }
+
+    /// Returns the pattern text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SecretPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Debug for SecretPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SecretPattern({:?})", self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretPattern {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).map_err(serde::de::Error::custom)
+    }
+}
+
 /// What a workspace needs before a harness can run in it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvSpec {
@@ -251,6 +333,10 @@ pub struct EnvSpec {
     pub env_var_names: Vec<EnvVarName>,
     /// Paths that count as caches for snapshot policy and warmth checks. Sorted.
     pub cache_paths: Vec<RelPath>,
+    /// Secret patterns the job added to the built-in list. The list only
+    /// grows: detection keeps every pattern the job's previous spec held,
+    /// even after the override file drops it. Sorted.
+    pub secret_patterns: Vec<SecretPattern>,
 }
 
 /// One tool and the version its workspace pins.
@@ -310,6 +396,10 @@ impl EnvSpec {
                 first_out_of_order(self.env_var_names.iter()),
             ),
             ("cache_paths", first_out_of_order(self.cache_paths.iter())),
+            (
+                "secret_patterns",
+                first_out_of_order(self.secret_patterns.iter()),
+            ),
         ];
         for (list, index) in lists {
             if let Some(index) = index {
@@ -361,6 +451,7 @@ mod tests {
             }],
             env_var_names: vec![var("DATABASE_URL")],
             cache_paths: vec![RelPath::parse("node_modules").unwrap()],
+            secret_patterns: vec![SecretPattern::parse("*.sqlite").unwrap()],
         }
     }
 
@@ -449,6 +540,57 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_secret_pattern_that_gitignore_would_read_differently_is_refused() {
+        assert_eq!(SecretPattern::parse(""), Err(SecretPatternError::Empty));
+        assert_eq!(
+            SecretPattern::parse("/x"),
+            Err(SecretPatternError::EmptyComponent)
+        );
+        assert_eq!(
+            SecretPattern::parse("x/"),
+            Err(SecretPatternError::EmptyComponent)
+        );
+        assert_eq!(
+            SecretPattern::parse("a/../b"),
+            Err(SecretPatternError::DotComponent)
+        );
+        assert_eq!(
+            SecretPattern::parse("**/x"),
+            Err(SecretPatternError::DoubleStar)
+        );
+        assert_eq!(
+            SecretPattern::parse("!x"),
+            Err(SecretPatternError::BadChar { index: 0 })
+        );
+        assert_eq!(
+            SecretPattern::parse("#x"),
+            Err(SecretPatternError::BadChar { index: 0 })
+        );
+        assert_eq!(
+            SecretPattern::parse("x?"),
+            Err(SecretPatternError::BadChar { index: 1 })
+        );
+        assert_eq!(
+            SecretPattern::parse("[ab]"),
+            Err(SecretPatternError::BadChar { index: 0 })
+        );
+        assert_eq!(
+            SecretPattern::parse("a b"),
+            Err(SecretPatternError::BadChar { index: 1 })
+        );
+        assert_eq!(
+            SecretPattern::parse("x\\"),
+            Err(SecretPatternError::BadChar { index: 1 })
+        );
+    }
+
+    #[test]
+    fn a_bad_secret_pattern_does_not_decode() {
+        let bytes = postcard::to_stdvec("**/x").unwrap();
+        assert!(postcard::from_bytes::<SecretPattern>(&bytes).is_err());
     }
 
     /// Two specs with the same content in another order would have two ids.

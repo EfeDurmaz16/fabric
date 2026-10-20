@@ -11,10 +11,9 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use fabric_core::env::{SecretPattern, SecretPatternError};
 use fabric_core::path::RelPath;
-use fabric_env::secret::{
-    Pattern, PatternError, Scope, SecretPolicy, TrackedSecretChanged, TrackedSecrets, Tracking,
-};
+use fabric_env::secret::{Scope, SecretPolicy, TrackedSecretChanged, TrackedSecrets, Tracking};
 
 /// Committed before the working tree changes. The first five are the
 /// failure from the review: source and template files whose names an
@@ -231,9 +230,9 @@ fn capture_w(
     Ok(Ok(files))
 }
 
-fn policy() -> Result<SecretPolicy, PatternError> {
+fn policy() -> Result<SecretPolicy, SecretPatternError> {
     let mut policy = SecretPolicy::default();
-    policy.widen(Pattern::parse("*.sqlite")?);
+    policy.widen(SecretPattern::parse("*.sqlite")?);
     Ok(policy)
 }
 

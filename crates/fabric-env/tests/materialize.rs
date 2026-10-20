@@ -69,14 +69,14 @@ fn write(root: &Path, files: Files) -> io::Result<()> {
 /// Writes `override_toml` as the workspace's `.fabric/env.toml` and detects.
 fn declared(root: &Path, override_toml: &str) -> TestResult<Detection> {
     write(root, &[(".fabric/env.toml", override_toml)])?;
-    Ok(detect(root)?)
+    Ok(detect(root, None)?)
 }
 
 /// A dry run of a fresh checkout plans the install and leaves the tree as it was.
 #[test]
 fn a_fresh_pnpm_workspace_plans_its_install_and_the_dry_run_changes_nothing() {
     let dir = copy_fixture("node-pnpm").unwrap();
-    let detected = detect(dir.path()).unwrap();
+    let detected = detect(dir.path(), None).unwrap();
     let planned = plan(dir.path(), &detected).unwrap();
     assert_eq!(planned.caches()[0].health, CacheHealth::Missing);
     assert_eq!(planned.steps().len(), 1);
@@ -101,7 +101,7 @@ fn a_finished_install_runs_nothing() {
         ],
     )
     .unwrap();
-    let detected = detect(dir.path()).unwrap();
+    let detected = detect(dir.path(), None).unwrap();
     let planned = plan(dir.path(), &detected).unwrap();
     assert_eq!(planned.caches()[0].health, CacheHealth::Healthy);
     assert!(planned.is_noop());
@@ -114,7 +114,7 @@ fn a_finished_install_runs_nothing() {
 fn a_torn_install_runs_again() {
     let dir = copy_fixture("node-pnpm").unwrap();
     write(dir.path(), &[("node_modules/a/package.json", "{}")]).unwrap();
-    let detected = detect(dir.path()).unwrap();
+    let detected = detect(dir.path(), None).unwrap();
     let planned = plan(dir.path(), &detected).unwrap();
     assert_eq!(
         planned.caches()[0].health,
@@ -195,7 +195,7 @@ fn health_follows_the_cache_kind() {
     for (files, health) in cases {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), files).unwrap();
-        let detected = detect(dir.path()).unwrap();
+        let detected = detect(dir.path(), None).unwrap();
         let planned = plan(dir.path(), &detected).unwrap();
         assert_eq!(planned.caches().len(), 1, "{files:?}");
         assert_eq!(planned.caches()[0].health, health, "{files:?}");
@@ -391,7 +391,7 @@ fn a_report_without_caches_runs_its_steps_on_every_resume() {
         &[("go.mod", "module example.com/x\n\ngo 1.22.0\n")],
     )
     .unwrap();
-    let detected = detect(dir.path()).unwrap();
+    let detected = detect(dir.path(), None).unwrap();
     let planned = plan(dir.path(), &detected).unwrap();
     assert!(planned.caches().is_empty());
     assert_eq!(planned.steps().len(), 1);
