@@ -18,7 +18,7 @@ use fabric_net::identity::NodeIdentity;
 use fabric_net::quic::QuicTransport;
 use fabric_net::rpc::{RpcError, Service, Session};
 use fabric_net::tcp::TcpTlsTransport;
-use fabric_net::tls::Trust;
+use fabric_net::tls::{TlsError, Trust};
 use fabric_net::transport::{Connection, Transport, TransportError, TransportKind};
 use fabric_net::wire::{
     ChunkBatch, Fault, FaultText, Hello, PROTOCOL_VERSION, RequestBody, ResponseBody, VersionText,
@@ -203,7 +203,8 @@ async fn a_dial_to_the_wrong_node_id_fails_inside_the_handshake() -> TestResult 
         assert!(
             matches!(
                 err,
-                TransportError::Handshake { .. } | TransportError::Tls(_)
+                TransportError::Tls(TlsError::PeerMismatch { expected, actual })
+                    if expected == c.id() && actual == b.id()
             ),
             "{kind}: {err}"
         );
@@ -212,6 +213,31 @@ async fn a_dial_to_the_wrong_node_id_fails_inside_the_handshake() -> TestResult 
             "{kind}: the server must not surface a connection to the wrong dialer"
         );
     }
+    Ok(())
+}
+
+/// A refusal is final: the endpoint does not retry the wrong node over TCP.
+/// The server has no TCP listener, so a fallback would end in a refused
+/// TCP connection instead of the QUIC refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_dial_does_not_fall_back_to_tcp() -> TestResult {
+    let (a, b, c) = (Node::new()?, Node::new()?, Node::new()?);
+    let quic_only = b.bind(TransportKind::Quic, &[a.id()])?;
+    let trust: Arc<dyn Trust> = Arc::new(Paired(vec![b.id(), c.id()]));
+    let client = Endpoint::bind(&a.identity, trust, ([127, 0, 0, 1], 0).into())?;
+    let _accepting = {
+        let quic_only = quic_only.clone();
+        tokio::spawn(async move { quic_only.accept().await })
+    };
+    let err = client
+        .dial(c.id(), quic_only.local_addr()?)
+        .await
+        .err()
+        .ok_or("a dial that expects the wrong node must fail")?;
+    assert!(
+        matches!(err, TransportError::Tls(TlsError::PeerMismatch { .. })),
+        "{err}"
+    );
     Ok(())
 }
 

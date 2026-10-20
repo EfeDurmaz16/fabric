@@ -16,7 +16,7 @@ use quinn::{IdleTimeout, VarInt};
 use rustls::pki_types::CertificateDer;
 
 use crate::identity::NodeIdentity;
-use crate::tls::{Credentials, SERVER_NAME, TlsError, Trust, peer_of};
+use crate::tls::{Credentials, Refusal, SERVER_NAME, TlsError, Trust, peer_of};
 use crate::transport::{Connection, Stream, Transport, TransportError, TransportKind};
 
 /// A connection with no traffic for this long is closed.
@@ -69,7 +69,8 @@ impl QuicTransport {
         peer: NodeId,
         addr: SocketAddr,
     ) -> Result<Box<dyn Connection>, TransportError> {
-        let rustls_config = self.credentials.client_config(peer)?;
+        let refusal = Arc::new(Refusal::default());
+        let rustls_config = self.credentials.client_config(peer, &refusal)?;
         let quic_config = QuicClientConfig::try_from(rustls_config)
             .map_err(|err| TransportError::Config(err.to_string()))?;
         let mut client = quinn::ClientConfig::new(Arc::new(quic_config));
@@ -83,7 +84,7 @@ impl QuicTransport {
             .connect_with(client, addr, SERVER_NAME)
             .map_err(|err| handshake(&err))?
             .await
-            .map_err(|err| handshake(&err))?;
+            .map_err(|err| refusal.take().map_or_else(|| handshake(&err), Into::into))?;
         let actual = identity_of(&connection)?;
         if actual != peer {
             connection.close(VarInt::from_u32(1), b"peer mismatch");

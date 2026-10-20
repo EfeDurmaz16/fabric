@@ -31,7 +31,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 
 use crate::identity::NodeIdentity;
 use crate::pipe::{PipeReader, PipeWriter, pipe};
-use crate::tls::{Credentials, TlsError, Trust, peer_of};
+use crate::tls::{Credentials, Refusal, TlsError, Trust, peer_of};
 use crate::transport::{Connection, Stream, Transport, TransportError, TransportKind};
 
 /// The most payload bytes in one multiplexer frame.
@@ -95,12 +95,14 @@ impl TcpTlsTransport {
         };
         let tcp = TcpStream::connect(addr).await?;
         tcp.set_nodelay(true)?;
-        let connector = TlsConnector::from(Arc::new(self.credentials.client_config(peer)?));
+        let refusal = Arc::new(Refusal::default());
+        let connector =
+            TlsConnector::from(Arc::new(self.credentials.client_config(peer, &refusal)?));
         let name = ServerName::IpAddress(addr.ip().into());
         let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, connector.connect(name, tcp))
             .await
             .map_err(|_| TransportError::Timeout(HANDSHAKE_TIMEOUT))?
-            .map_err(|err| handshake(&err))?;
+            .map_err(|err| refusal.take().map_or_else(|| handshake(&err), Into::into))?;
         let actual = peer_of(tls.get_ref().1.peer_certificates())?;
         if actual != peer {
             return Err(TlsError::PeerMismatch {

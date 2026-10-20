@@ -14,7 +14,7 @@
 //! Every handshake is a full one and runs the pairing check.
 
 use std::fmt;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use fabric_core::id::NodeId;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -43,7 +43,7 @@ pub const ALPN: &[u8] = b"fabric/1";
 pub(crate) const SERVER_NAME: &str = "fabric";
 
 /// Why a certificate or a TLS configuration was refused.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum TlsError {
     /// The certificate does not parse as X.509.
     #[error("the certificate does not parse")]
@@ -65,6 +65,9 @@ pub enum TlsError {
     /// The peer sent no certificate.
     #[error("the peer sent no certificate")]
     NoCertificate,
+    /// The peer's handshake signature was not made with the key its certificate names.
+    #[error("the handshake signature does not match the certificate key")]
+    BadSignature,
     /// rustls refused the configuration.
     #[error("tls configuration: {0}")]
     Config(#[source] rustls::Error),
@@ -117,6 +120,27 @@ fn spki_of(node: NodeId) -> SubjectPublicKeyInfoDer<'static> {
     SubjectPublicKeyInfoDer::from(der)
 }
 
+/// What the client verifier refused during one dial, kept so the dialer can report it.
+///
+/// quinn turns a verifier's error into text, and tokio-rustls wraps it in an
+/// `io::Error`, so the verifier records its refusal here as well. A dialer
+/// that finds one knows the peer at the address is the wrong node or a
+/// forgery, and that another wire to the same address would not help.
+#[derive(Debug, Default)]
+pub(crate) struct Refusal(Mutex<Option<TlsError>>);
+
+impl Refusal {
+    fn record(&self, err: &TlsError) {
+        let mut slot = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        slot.get_or_insert_with(|| err.clone());
+    }
+
+    /// Takes the recorded refusal, if the verifier made one.
+    pub(crate) fn take(&self) -> Option<TlsError> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
+}
+
 /// This node's certificate and private key, made once per identity.
 #[derive(Debug)]
 pub(crate) struct Credentials {
@@ -142,9 +166,13 @@ impl Credentials {
         })
     }
 
-    /// A client configuration that accepts only the server `expected`.
-    pub(crate) fn client_config(&self, expected: NodeId) -> Result<rustls::ClientConfig, TlsError> {
-        let config = client_builder(expected)?
+    /// A client configuration that accepts only the server `expected` and records a refusal in `refusal`.
+    pub(crate) fn client_config(
+        &self,
+        expected: NodeId,
+        refusal: &Arc<Refusal>,
+    ) -> Result<rustls::ClientConfig, TlsError> {
+        let config = client_builder(expected, refusal)?
             .with_client_auth_cert(vec![self.cert.clone()], self.key.clone_key())
             .map_err(TlsError::Config)?;
         Ok(finish_client(config))
@@ -165,6 +193,7 @@ impl Credentials {
 /// The client side up to its own certificate: TLS 1.3 and the pinned verifier.
 fn client_builder(
     expected: NodeId,
+    refusal: &Arc<Refusal>,
 ) -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert>, TlsError>
 {
     let provider = provider();
@@ -176,6 +205,7 @@ fn client_builder(
         .with_custom_certificate_verifier(Arc::new(PinnedServer {
             expected,
             algorithms,
+            refusal: Arc::clone(refusal),
         })))
 }
 
@@ -220,18 +250,21 @@ fn no_tls12() -> rustls::Error {
 struct PinnedServer {
     expected: NodeId,
     algorithms: WebPkiSupportedAlgorithms,
+    refusal: Arc<Refusal>,
 }
 
 impl PinnedServer {
     fn check(&self, cert: &CertificateDer<'_>) -> Result<(), rustls::Error> {
-        let actual = node_id_of(cert).map_err(reject)?;
-        if actual != self.expected {
-            return Err(reject(TlsError::PeerMismatch {
+        let refused = match node_id_of(cert) {
+            Ok(actual) if actual == self.expected => return Ok(()),
+            Ok(actual) => TlsError::PeerMismatch {
                 expected: self.expected,
                 actual,
-            }));
-        }
-        Ok(())
+            },
+            Err(err) => err,
+        };
+        self.refusal.record(&refused);
+        Err(reject(refused))
     }
 }
 
@@ -265,6 +298,7 @@ impl ServerCertVerifier for PinnedServer {
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
         self.check(cert)?;
         verify_tls13_signature_with_raw_key(message, &spki_of(self.expected), dss, &self.algorithms)
+            .inspect_err(|_| self.refusal.record(&TlsError::BadSignature))
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -466,13 +500,17 @@ mod tests {
 
         let honest = handshake(
             Arc::new(server_creds.server_config(trust.clone()).unwrap()),
-            Arc::new(client_creds.client_config(server.node_id()).unwrap()),
+            Arc::new(
+                client_creds
+                    .client_config(server.node_id(), &Arc::default())
+                    .unwrap(),
+            ),
         )
         .await;
         assert!(honest.server.is_ok() && honest.client.is_ok());
 
         let forged_dialer = finish_client(
-            client_builder(server.node_id())
+            client_builder(server.node_id(), &Arc::default())
                 .unwrap()
                 .with_client_cert_resolver(Forged::new(&client_creds.cert, &thief)),
         );
@@ -494,7 +532,11 @@ mod tests {
         );
         let outcome = handshake(
             Arc::new(forged_server),
-            Arc::new(client_creds.client_config(server.node_id()).unwrap()),
+            Arc::new(
+                client_creds
+                    .client_config(server.node_id(), &Arc::default())
+                    .unwrap(),
+            ),
         )
         .await;
         assert!(
@@ -533,7 +575,7 @@ mod tests {
         let client_config = Arc::new(
             Credentials::new(&client)
                 .unwrap()
-                .client_config(server.node_id())
+                .client_config(server.node_id(), &Arc::default())
                 .unwrap(),
         );
 

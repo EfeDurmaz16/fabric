@@ -43,7 +43,10 @@ pub enum TransportError {
     /// A socket operation failed.
     #[error("io: {0}")]
     Io(#[from] io::Error),
-    /// The pinned handshake refused the peer, or the TLS setup failed.
+    /// This side refused the peer inside the handshake, or the TLS setup failed.
+    ///
+    /// A refusal means the node at the address is not the one dialed, so a
+    /// dial does not retry it on the other wire.
     #[error(transparent)]
     Tls(#[from] TlsError),
     /// The handshake with `addr` did not complete.
