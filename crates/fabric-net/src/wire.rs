@@ -273,6 +273,15 @@ pub struct Response {
     pub body: ResponseBody,
 }
 
+/// Where a snapshot's manifest is: its byte length and the chunks that make it, in order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestChunks {
+    /// The manifest's length; refused above the manifest cap before any chunk is fetched.
+    pub len: u64,
+    /// The chunks that make the manifest, in order.
+    pub ids: Vec<ChunkId>,
+}
+
 /// What a response carries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResponseBody {
@@ -283,12 +292,7 @@ pub enum ResponseBody {
     /// The answer to a per-job message.
     Job(JobResponse),
     /// The manifest's byte length and ordered chunk list.
-    ManifestChunks {
-        /// The manifest's length; refused above the manifest cap before any chunk is fetched.
-        len: u64,
-        /// The chunks that make the manifest, in order.
-        ids: Vec<ChunkId>,
-    },
+    ManifestChunks(ManifestChunks),
     /// One chunk; the receiver trusts it only after hashing the bytes.
     Chunk {
         /// The chunk.
@@ -504,7 +508,7 @@ mod tests {
             Just(ResponseBody::Pong),
             job_response().prop_map(ResponseBody::Job),
             (any::<u64>(), vec(bytes32(ChunkId::from_bytes), 0..8))
-                .prop_map(|(len, ids)| ResponseBody::ManifestChunks { len, ids }),
+                .prop_map(|(len, ids)| ResponseBody::ManifestChunks(ManifestChunks { len, ids })),
             (bytes32(ChunkId::from_bytes), vec(any::<u8>(), 0..64))
                 .prop_map(|(id, bytes)| ResponseBody::Chunk { id, bytes }),
             Just(ResponseBody::ChunksDone),

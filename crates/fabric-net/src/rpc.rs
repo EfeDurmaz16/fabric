@@ -6,6 +6,12 @@
 //! peer does; and the caller trusts a chunk only after its bytes hash to
 //! the id it asked for. One stream carries one request and its answer, so
 //! a slow answer never holds up another.
+//!
+//! The wire types `RequestBody` and `ResponseBody` are built and matched
+//! here only. A caller asks through one typed method per request, and a
+//! `Service` answers through one typed method per request, so neither can
+//! pair a request with an answer of the wrong kind. `Hello` and `Ping`
+//! belong to this layer and never reach a service.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -17,15 +23,16 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use fabric_core::BoxFuture;
-use fabric_core::id::{ChunkId, NodeId};
+use fabric_core::id::{ChunkId, NodeId, SnapshotId};
+use fabric_core::lease::FencingToken;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::time::{Instant, Sleep, timeout};
 
 use crate::frame::{FrameError, MAX_BULK_FRAME, MAX_CONTROL_FRAME, read_frame, write_frame};
 use crate::transport::{Connection, Stream, TransportError, TransportKind};
 use crate::wire::{
-    ChunkBatch, Fault, FaultText, Hello, PROTOCOL_VERSION, Request, RequestBody, RequestId,
-    Response, ResponseBody, WireError, decode, encode,
+    ChunkBatch, Fault, FaultText, Hello, JobRequest, JobResponse, ManifestChunks, PROTOCOL_VERSION,
+    Request, RequestBody, RequestId, Response, ResponseBody, WireError, decode, encode,
 };
 
 /// A clock difference between two nodes above this is logged at `Hello`.
@@ -107,10 +114,21 @@ pub enum RpcError {
     Interrupted,
 }
 
-/// What a node does with the requests a peer sends; `Hello` and `WantChunks` never reach it.
+/// What a node serves to its peers: per-job messages, manifests and chunks.
 pub trait Service: Send + Sync {
-    /// Answers one request from `peer`.
-    fn call(&self, peer: NodeId, request: RequestBody) -> BoxFuture<'_, ResponseBody>;
+    /// Answers one per-job message from `peer`, sent under the fencing `token`.
+    fn job(
+        &self,
+        peer: NodeId,
+        token: FencingToken,
+        request: JobRequest,
+    ) -> BoxFuture<'_, Result<JobResponse, Fault>>;
+    /// Returns the length and chunk list of `snapshot`'s manifest for `peer`.
+    fn manifest(
+        &self,
+        peer: NodeId,
+        snapshot: SnapshotId,
+    ) -> BoxFuture<'_, Result<ManifestChunks, Fault>>;
     /// Returns the bytes of one chunk for `peer`, or `None` if this node does not hold it.
     fn chunk(&self, peer: NodeId, id: ChunkId) -> BoxFuture<'_, Option<Vec<u8>>>;
 }
@@ -136,6 +154,13 @@ fn budget(deadline: Duration) -> u32 {
     u32::try_from(deadline.as_millis()).unwrap_or(u32::MAX)
 }
 
+fn unexpected(expected: &'static str, got: &ResponseBody) -> RpcError {
+    RpcError::UnexpectedResponse {
+        expected,
+        got: kind_of(got),
+    }
+}
+
 fn check_id(sent: RequestId, got: RequestId) -> Result<(), RpcError> {
     if sent == got {
         Ok(())
@@ -149,7 +174,7 @@ fn kind_of(body: &ResponseBody) -> &'static str {
         ResponseBody::Hello(_) => "hello",
         ResponseBody::Pong => "pong",
         ResponseBody::Job(_) => "job",
-        ResponseBody::ManifestChunks { .. } => "manifest chunks",
+        ResponseBody::ManifestChunks(_) => "manifest chunks",
         ResponseBody::Chunk { .. } => "chunk",
         ResponseBody::ChunksDone => "chunks done",
         ResponseBody::Fault(_) => "fault",
@@ -195,10 +220,7 @@ impl Session {
             match read_response(recv.as_mut(), RequestId(0), MAX_CONTROL_FRAME).await? {
                 ResponseBody::Hello(remote) => Ok(remote),
                 ResponseBody::Fault(fault) => Err(RpcError::Fault(fault)),
-                other => Err(RpcError::UnexpectedResponse {
-                    expected: "hello",
-                    got: kind_of(&other),
-                }),
+                other => Err(unexpected("hello", &other)),
             }
         };
         let remote = timeout(deadline, exchange)
@@ -328,11 +350,7 @@ impl Session {
     }
 
     /// Sends one request and waits at most `deadline` for its answer.
-    pub async fn call(
-        &self,
-        body: RequestBody,
-        deadline: Duration,
-    ) -> Result<ResponseBody, RpcError> {
+    async fn call(&self, body: RequestBody, deadline: Duration) -> Result<ResponseBody, RpcError> {
         let id = self.next_request_id();
         let request = Request {
             id,
@@ -341,7 +359,10 @@ impl Session {
         };
         let exchange = async {
             let mut recv = send_request(self.connection.as_ref(), &request).await?;
-            read_response(recv.as_mut(), id, MAX_CONTROL_FRAME).await
+            match read_response(recv.as_mut(), id, MAX_CONTROL_FRAME).await? {
+                ResponseBody::Fault(fault) => Err(RpcError::Fault(fault)),
+                body => Ok(body),
+            }
         };
         timeout(deadline, exchange)
             .await
@@ -352,11 +373,39 @@ impl Session {
     pub async fn ping(&self, deadline: Duration) -> Result<(), RpcError> {
         match self.call(RequestBody::Ping, deadline).await? {
             ResponseBody::Pong => Ok(()),
-            ResponseBody::Fault(fault) => Err(RpcError::Fault(fault)),
-            other => Err(RpcError::UnexpectedResponse {
-                expected: "pong",
-                got: kind_of(&other),
-            }),
+            other => Err(unexpected("pong", &other)),
+        }
+    }
+
+    /// Sends one per-job message under the fencing `token` and waits at most `deadline` for the answer.
+    pub async fn job(
+        &self,
+        token: FencingToken,
+        request: JobRequest,
+        deadline: Duration,
+    ) -> Result<JobResponse, RpcError> {
+        let body = RequestBody::Job {
+            token,
+            body: request,
+        };
+        match self.call(body, deadline).await? {
+            ResponseBody::Job(response) => Ok(response),
+            other => Err(unexpected("job", &other)),
+        }
+    }
+
+    /// Asks for the length and chunk list of `snapshot`'s manifest, waiting at most `deadline`.
+    pub async fn want_snapshot(
+        &self,
+        snapshot: SnapshotId,
+        deadline: Duration,
+    ) -> Result<ManifestChunks, RpcError> {
+        match self
+            .call(RequestBody::WantSnapshot { snapshot }, deadline)
+            .await?
+        {
+            ResponseBody::ManifestChunks(manifest) => Ok(manifest),
+            other => Err(unexpected("manifest chunks", &other)),
         }
     }
 
@@ -531,10 +580,7 @@ impl ChunkStream {
                 }
             }
             ResponseBody::Fault(fault) => Err(RpcError::Fault(fault)),
-            other => Err(RpcError::UnexpectedResponse {
-                expected: "chunk",
-                got: kind_of(&other),
-            }),
+            other => Err(unexpected("chunk", &other)),
         }
     }
 
@@ -561,48 +607,52 @@ async fn handle(peer: NodeId, stream: Stream, service: &dyn Service) -> Result<(
     let request: Request = decode(&bytes)?;
     let budget = Duration::from_millis(u64::from(request.budget_ms));
     let id = request.id;
-    match request.body {
-        RequestBody::Hello(_) => {
-            let fault = Fault::BadRequest(FaultText::truncated("hello after the handshake"));
-            reply(
-                send.as_mut(),
-                id,
-                ResponseBody::Fault(fault),
-                MAX_CONTROL_FRAME,
-            )
-            .await?;
-        }
+    let body = match request.body {
+        RequestBody::Hello(_) => ResponseBody::Fault(Fault::BadRequest(FaultText::truncated(
+            "hello after the handshake",
+        ))),
+        RequestBody::Ping => ResponseBody::Pong,
+        RequestBody::Job { token, body } => timeout(budget, service.job(peer, token, body))
+            .await
+            .unwrap_or(Err(Fault::Deadline))
+            .map_or_else(ResponseBody::Fault, ResponseBody::Job),
+        RequestBody::WantSnapshot { snapshot } => timeout(budget, service.manifest(peer, snapshot))
+            .await
+            .unwrap_or(Err(Fault::Deadline))
+            .map_or_else(ResponseBody::Fault, ResponseBody::ManifestChunks),
         RequestBody::WantChunks(batch) => {
-            for chunk in batch.ids() {
-                let body = match timeout(budget, service.chunk(peer, *chunk)).await {
-                    Ok(Some(bytes)) => ResponseBody::Chunk { id: *chunk, bytes },
-                    Ok(None) => ResponseBody::Fault(Fault::UnknownChunk(*chunk)),
-                    Err(_) => ResponseBody::Fault(Fault::Deadline),
-                };
-                let stop = matches!(body, ResponseBody::Fault(_));
-                reply(send.as_mut(), id, body, MAX_BULK_FRAME).await?;
-                if stop {
-                    return Ok(());
-                }
-            }
-            reply(
-                send.as_mut(),
-                id,
-                ResponseBody::ChunksDone,
-                MAX_CONTROL_FRAME,
-            )
-            .await?;
+            send_chunks(peer, id, batch, budget, send.as_mut(), service).await?;
+            send.shutdown().await.map_err(FrameError::Io)?;
+            return Ok(());
         }
-        other => {
-            let body = match timeout(budget, service.call(peer, other)).await {
-                Ok(body) => body,
-                Err(_) => ResponseBody::Fault(Fault::Deadline),
-            };
-            reply(send.as_mut(), id, body, MAX_CONTROL_FRAME).await?;
-        }
-    }
+    };
+    reply(send.as_mut(), id, body, MAX_CONTROL_FRAME).await?;
     send.shutdown().await.map_err(FrameError::Io)?;
     Ok(())
+}
+
+/// Streams the chunks of one batch, each found within `budget`, then `ChunksDone`; the first fault ends the run.
+async fn send_chunks(
+    peer: NodeId,
+    id: RequestId,
+    batch: ChunkBatch,
+    budget: Duration,
+    send: &mut (dyn AsyncWrite + Send + Unpin),
+    service: &dyn Service,
+) -> Result<(), RpcError> {
+    for chunk in batch.ids() {
+        let body = match timeout(budget, service.chunk(peer, *chunk)).await {
+            Ok(Some(bytes)) => ResponseBody::Chunk { id: *chunk, bytes },
+            Ok(None) => ResponseBody::Fault(Fault::UnknownChunk(*chunk)),
+            Err(_) => ResponseBody::Fault(Fault::Deadline),
+        };
+        let fault = matches!(body, ResponseBody::Fault(_));
+        reply(send, id, body, MAX_BULK_FRAME).await?;
+        if fault {
+            return Ok(());
+        }
+    }
+    reply(send, id, ResponseBody::ChunksDone, MAX_CONTROL_FRAME).await
 }
 
 #[cfg(test)]

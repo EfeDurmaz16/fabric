@@ -1,7 +1,8 @@
 //! Two nodes in one process over loopback, on real QUIC and real TLS over
 //! TCP: the hello exchange, the trust rule at both ends, the frame cap on a
 //! live stream, the call deadline, chunk resume after a dropped connection,
-//! stream isolation under backpressure, and the QUIC first dial.
+//! stream isolation under backpressure, connection lifetime, and the dial
+//! and accept paths of the endpoint.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -11,7 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use fabric_core::BoxFuture;
-use fabric_core::id::{ChunkId, NodeId};
+use fabric_core::id::{ChunkId, NodeId, SnapshotId};
+use fabric_core::lease::FencingToken;
 use fabric_net::endpoint::Endpoint;
 use fabric_net::frame::{FRAME_VERSION, MAX_CONTROL_FRAME};
 use fabric_net::identity::NodeIdentity;
@@ -21,7 +23,8 @@ use fabric_net::tcp::TcpTlsTransport;
 use fabric_net::tls::{TlsError, Trust};
 use fabric_net::transport::{Connection, Transport, TransportError, TransportKind};
 use fabric_net::wire::{
-    ChunkBatch, Fault, FaultText, Hello, PROTOCOL_VERSION, RequestBody, ResponseBody, VersionText,
+    ChunkBatch, Fault, FaultText, Hello, JobRequest, JobResponse, ManifestChunks, PROTOCOL_VERSION,
+    VersionText,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -73,7 +76,7 @@ impl Node {
 
 struct FakeService {
     chunks: BTreeMap<ChunkId, Vec<u8>>,
-    ping_delay: Duration,
+    manifest_delay: Duration,
     drop_on_call: Option<(usize, mpsc::Sender<()>)>,
     calls: AtomicUsize,
 }
@@ -82,7 +85,7 @@ impl FakeService {
     fn new() -> Self {
         Self {
             chunks: BTreeMap::new(),
-            ping_delay: Duration::ZERO,
+            manifest_delay: Duration::ZERO,
             drop_on_call: None,
             calls: AtomicUsize::new(0),
         }
@@ -90,15 +93,26 @@ impl FakeService {
 }
 
 impl Service for FakeService {
-    fn call(&self, _peer: NodeId, request: RequestBody) -> BoxFuture<'_, ResponseBody> {
+    fn job(
+        &self,
+        _peer: NodeId,
+        _token: FencingToken,
+        _request: JobRequest,
+    ) -> BoxFuture<'_, Result<JobResponse, Fault>> {
+        Box::pin(async { Err(Fault::Internal(FaultText::truncated("not in this test"))) })
+    }
+
+    fn manifest(
+        &self,
+        _peer: NodeId,
+        _snapshot: SnapshotId,
+    ) -> BoxFuture<'_, Result<ManifestChunks, Fault>> {
         Box::pin(async move {
-            match request {
-                RequestBody::Ping => {
-                    tokio::time::sleep(self.ping_delay).await;
-                    ResponseBody::Pong
-                }
-                _ => ResponseBody::Fault(Fault::Internal(FaultText::truncated("not in this test"))),
-            }
+            tokio::time::sleep(self.manifest_delay).await;
+            Ok(ManifestChunks {
+                len: 0,
+                ids: Vec::new(),
+            })
         })
     }
 
@@ -331,7 +345,7 @@ async fn a_slow_peer_trips_the_call_deadline() -> TestResult {
         let server = b.bind(kind, &[a.id()])?;
         let client = a.bind(kind, &[b.id()])?;
         let mut service = FakeService::new();
-        service.ping_delay = Duration::from_secs(3);
+        service.manifest_delay = Duration::from_secs(3);
         let _serving = serve_one(server.clone(), b.hello.clone(), Arc::new(service), None);
         let session = connect(
             client.as_ref(),
@@ -344,7 +358,7 @@ async fn a_slow_peer_trips_the_call_deadline() -> TestResult {
         let deadline = Duration::from_millis(300);
         let started = std::time::Instant::now();
         let err = session
-            .ping(deadline)
+            .want_snapshot(SnapshotId::from_bytes([1; 32]), deadline)
             .await
             .err()
             .ok_or("the call must fail")?;
