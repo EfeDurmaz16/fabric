@@ -56,7 +56,7 @@ use fabric_core::path::AbsPath;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::departure::Records;
+use crate::departure::{FABRIC_DIR, Records};
 use crate::error::{HarnessError, IoOp};
 use crate::harness::{Harness, Installed, Launch, Restored, Running};
 use crate::jsontext;
@@ -361,7 +361,12 @@ impl ClaudeCode {
             );
             return Ok(left(LeftReason::ClaudeRunning { pids }));
         }
-        let changed = pipeline::blocking(move || trust::preseed_file(&config, &key)).await?;
+        let lock = self
+            .home_dir()
+            .join(FABRIC_DIR)
+            .join("harness/locks/claude-config.lock");
+        let changed =
+            pipeline::blocking(move || trust::preseed_locked(&config, &key, &lock)).await?;
         Ok(if changed {
             TrustOutcome::Written { key: key_path }
         } else {

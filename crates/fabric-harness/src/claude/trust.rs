@@ -6,8 +6,9 @@
 //! no `claude` process runs, because Claude rewrites the file itself and
 //! keeps its own backups (ADR 0006, Trust on the target). A write is read,
 //! modify, write to a temporary file and rename that keeps the file's
-//! mode, and only the one key `projects["<key>"].hasTrustDialogAccepted`
-//! changes. A file that is a symlink is read through and never written,
+//! mode, done under an exclusive lock in `~/.fabric` so two Fabric
+//! processes never lose each other's key, and only the one key
+//! `projects["<key>"].hasTrustDialogAccepted` changes. A file that is a symlink is read through and never written,
 //! because the rename would replace the link. A missing file is not
 //! created and is not an error: Claude writes its first-run state there,
 //! whose shape Fabric does not own, and a node logged in with
@@ -342,6 +343,31 @@ pub(crate) fn unwritable(config_json: &Path) -> Result<Option<LeftReason>, Harne
         }))
 }
 
+/// `preseed_file` under an exclusive lock on the file `lock`, so two
+/// Fabric processes pre-seeding trust for different workspaces never both
+/// read the same config and lose one key to the other's rename.
+pub(crate) fn preseed_locked(
+    config_json: &Path,
+    key: &AbsPath,
+    lock: &Path,
+) -> Result<bool, HarnessError> {
+    if let Some(parent) = lock.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| HarnessError::io(IoOp::CreateDir, parent, e))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock)
+        .map_err(|e| HarnessError::io(IoOp::Lock, lock, e))?;
+    file.lock()
+        .map_err(|e| HarnessError::io(IoOp::Lock, lock, e))?;
+    let changed = preseed_file(config_json, key);
+    drop(file);
+    changed
+}
+
 /// Sets the trust key `key` in the config file at `config_json`.
 /// Returns true when the file changed.
 pub(crate) fn preseed_file(config_json: &Path, key: &AbsPath) -> Result<bool, HarnessError> {
@@ -412,5 +438,33 @@ mod tests {
         );
         assert_eq!(value["oauthAccount"]["emailAddress"], "x");
         assert!(!preseed_file(&config, &AbsPath::parse("/w").unwrap()).unwrap());
+    }
+
+    #[test]
+    fn concurrent_preseeds_keep_every_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(".claude.json");
+        std::fs::write(&config, r#"{"projects":{}}"#).unwrap();
+        let lock = dir.path().join(".fabric/harness/locks/claude-config.lock");
+        let threads: Vec<_> = (0..16)
+            .map(|n| {
+                let (config, lock) = (config.clone(), lock.clone());
+                std::thread::spawn(move || {
+                    let key = AbsPath::parse(&format!("/w{n}")).unwrap();
+                    preseed_locked(&config, &key, &lock).unwrap();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let value: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        for n in 0..16 {
+            assert_eq!(
+                value["projects"][format!("/w{n}")][TRUST_KEY],
+                Value::Bool(true),
+                "/w{n} was lost"
+            );
+        }
     }
 }
