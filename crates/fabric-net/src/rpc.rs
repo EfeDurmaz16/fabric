@@ -133,8 +133,12 @@ pub trait Service: Send + Sync {
         peer: NodeId,
         snapshot: SnapshotId,
     ) -> BoxFuture<'_, Result<ManifestChunks, Fault>>;
-    /// Returns the bytes of one chunk for `peer`, or `None` if this node does not hold it.
-    fn chunk(&self, peer: NodeId, id: ChunkId) -> BoxFuture<'_, Option<Vec<u8>>>;
+    /// Returns the bytes of one chunk for `peer`.
+    ///
+    /// `Fault::UnknownChunk` says this node does not hold it; a chunk it
+    /// holds and could not read is `Fault::Internal`, so the peer never
+    /// mistakes a failed read for a missing chunk.
+    fn chunk(&self, peer: NodeId, id: ChunkId) -> BoxFuture<'_, Result<Vec<u8>, Fault>>;
 }
 
 /// An authenticated connection after the `Hello` exchange.
@@ -642,8 +646,8 @@ async fn send_chunks(
 ) -> Result<(), RpcError> {
     for chunk in batch.ids() {
         let body = match timeout(budget, service.chunk(peer, *chunk)).await {
-            Ok(Some(bytes)) => ResponseBody::Chunk { id: *chunk, bytes },
-            Ok(None) => ResponseBody::Fault(Fault::UnknownChunk(*chunk)),
+            Ok(Ok(bytes)) => ResponseBody::Chunk { id: *chunk, bytes },
+            Ok(Err(fault)) => ResponseBody::Fault(fault),
             Err(_) => ResponseBody::Fault(Fault::Deadline),
         };
         let fault = matches!(body, ResponseBody::Fault(_));

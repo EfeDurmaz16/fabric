@@ -124,7 +124,7 @@ impl Service for FakeService {
         })
     }
 
-    fn chunk(&self, _peer: NodeId, id: ChunkId) -> BoxFuture<'_, Option<Vec<u8>>> {
+    fn chunk(&self, _peer: NodeId, id: ChunkId) -> BoxFuture<'_, Result<Vec<u8>, Fault>> {
         Box::pin(async move {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if let Some((at, stop)) = &self.drop_on_call
@@ -134,7 +134,7 @@ impl Service for FakeService {
                 let _ = stop.send(()).await;
                 std::future::pending::<()>().await;
             }
-            self.chunks.get(&id).cloned()
+            self.chunks.get(&id).cloned().ok_or(Fault::UnknownChunk(id))
         })
     }
 }
