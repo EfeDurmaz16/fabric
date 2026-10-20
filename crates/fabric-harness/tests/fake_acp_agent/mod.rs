@@ -1,4 +1,5 @@
-//! A fake ACP agent for the integration tests.
+//! A fake ACP agent for the integration tests. `acp_roundtrip` starts its
+//! own test binary as the agent, which then runs `serve` instead of a test.
 //!
 //! It speaks the ACP v1 baseline over stdio, keeps one JSON file per
 //! session under `FAKE_STATE_DIR`, and lets the tests shape its
@@ -232,11 +233,11 @@ fn run() -> std::io::Result<()> {
     Ok(())
 }
 
-fn main() -> std::process::ExitCode {
-    if let Some(path) = std::env::var_os("FAKE_PID_FILE")
-        && std::fs::write(path, std::process::id().to_string()).is_err()
-    {
-        return std::process::ExitCode::FAILURE;
+/// Runs the agent until its stdin closes; with `FAKE_LINGER=1` it then
+/// sleeps forever, as a hung agent would.
+pub fn serve() -> std::io::Result<()> {
+    if let Some(path) = std::env::var_os("FAKE_PID_FILE") {
+        std::fs::write(path, std::process::id().to_string())?;
     }
     let result = run();
     if env_flag("FAKE_LINGER", false) {
@@ -244,8 +245,5 @@ fn main() -> std::process::ExitCode {
             std::thread::sleep(std::time::Duration::from_mins(1));
         }
     }
-    match result {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(_) => std::process::ExitCode::FAILURE,
-    }
+    result
 }

@@ -1,6 +1,8 @@
 //! The ACP client against a fake agent process, and the ACP adapter's
 //! capture, restore and launch round trip onto a node with the same home
-//! and workspace path but none of the agent's state.
+//! and workspace path but none of the agent's state. The fake agent is
+//! this test binary, started with `AGENT_ROLE` set, so no fixture binary
+//! ships with the crate.
 
 #![allow(
     clippy::unwrap_used,
@@ -8,6 +10,7 @@
     reason = "a failed unwrap inside a test is the test failing"
 )]
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -19,37 +22,73 @@ use fabric_harness::acp::client::{PermissionPolicy, StopReason};
 use fabric_harness::{Harness, HarnessError, Launch, SessionId};
 use serde_json::Value;
 
-const AGENT: &str = env!("CARGO_BIN_EXE_fake-acp-agent");
+mod fake_acp_agent;
+
+/// The program name the fake agent is installed under.
+const AGENT: &str = "fake-acp-agent";
+/// Set in the fake agent's environment; this binary then serves as the agent.
+const AGENT_ROLE: &str = "FABRIC_FAKE_ACP_AGENT";
 const TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The fake agent's entry point: a no-op unless the adapter started this
+/// binary as the agent. The test harness has already printed its header
+/// and `test fake_acp_agent ... ` with no newline, so a newline ends that
+/// line first; the client skips lines that are not JSON-RPC.
+#[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the agent exits as soon as it is done: its client may have closed the pipe the test harness would print its result to"
+)]
+fn fake_acp_agent() {
+    if std::env::var_os(AGENT_ROLE).is_some() {
+        let mut out = std::io::stdout();
+        out.write_all(b"\n").and_then(|()| out.flush()).unwrap();
+        let served = fake_acp_agent::serve();
+        std::process::exit(i32::from(served.is_err()));
+    }
+}
 
 fn abs(path: &Path) -> AbsPath {
     AbsPath::parse(path.to_str().unwrap()).unwrap()
 }
 
-fn agent_dir() -> OsString {
-    Path::new(AGENT)
-        .parent()
-        .map(|p| p.as_os_str().to_owned())
-        .unwrap_or_default()
+/// Puts this test binary under `home/agent-bin` as `AGENT` and returns
+/// that directory as a `PATH` value.
+fn agent_dir(home: &Path) -> OsString {
+    let bin = home.join("agent-bin");
+    let agent = bin.join(AGENT);
+    if !agent.exists() {
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        if std::fs::hard_link(&exe, &agent).is_err() {
+            std::fs::copy(&exe, &agent).unwrap();
+        }
+    }
+    bin.into_os_string()
 }
 
 fn program() -> ProgramName {
-    let name = Path::new(AGENT)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("fake-acp-agent");
-    ProgramName::parse(name).unwrap()
+    ProgramName::parse(AGENT).unwrap()
+}
+
+/// The arguments that make the test binary run only `fake_acp_agent`.
+fn agent_args() -> Vec<String> {
+    [
+        "--exact",
+        "fake_acp_agent",
+        "--nocapture",
+        "--test-threads=1",
+    ]
+    .map(str::to_owned)
+    .to_vec()
 }
 
 fn env(state_dir: &Path, extra: &[(&str, &str)]) -> Vec<(EnvVarName, String)> {
     let mut vars = vec![
+        (EnvVarName::parse(AGENT_ROLE).unwrap(), "1".to_owned()),
         (
             EnvVarName::parse("FAKE_STATE_DIR").unwrap(),
             state_dir.to_string_lossy().into_owned(),
-        ),
-        (
-            EnvVarName::parse("PATH").unwrap(),
-            agent_dir().to_string_lossy().into_owned(),
         ),
     ];
     for (k, v) in extra {
@@ -59,7 +98,7 @@ fn env(state_dir: &Path, extra: &[(&str, &str)]) -> Vec<(EnvVarName, String)> {
 }
 
 fn adapter(home: &Path, policy: PermissionPolicy) -> AcpHarness {
-    AcpHarness::new(program(), vec![], abs(home), agent_dir())
+    AcpHarness::new(program(), agent_args(), abs(home), agent_dir(home))
         .with_state_dir(&abs(&home.join(".fake-agent/sessions")))
         .unwrap()
         .with_policy(policy)
@@ -458,7 +497,12 @@ async fn capture_without_a_declared_state_dir_is_refused() {
     let home = tempfile::tempdir().unwrap();
     let work = home.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
-    let adapter = AcpHarness::new(program(), vec![], abs(home.path()), agent_dir());
+    let adapter = AcpHarness::new(
+        program(),
+        agent_args(),
+        abs(home.path()),
+        agent_dir(home.path()),
+    );
     let out = tempfile::tempdir().unwrap();
     let err = adapter
         .capture(&work, &SessionId::parse("fake-1").unwrap(), out.path())
@@ -468,8 +512,13 @@ async fn capture_without_a_declared_state_dir_is_refused() {
         matches!(err, HarnessError::StateDirNotDeclared { .. }),
         "{err}"
     );
-    let err = AcpHarness::new(program(), vec![], abs(home.path()), agent_dir())
-        .with_state_dir(&AbsPath::parse("/elsewhere").unwrap())
-        .unwrap_err();
+    let err = AcpHarness::new(
+        program(),
+        agent_args(),
+        abs(home.path()),
+        agent_dir(home.path()),
+    )
+    .with_state_dir(&AbsPath::parse("/elsewhere").unwrap())
+    .unwrap_err();
     assert!(matches!(err, HarnessError::NotUnderHome { .. }), "{err}");
 }
