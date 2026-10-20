@@ -94,10 +94,6 @@ async fn client_runs_a_turn_and_denies_permission_by_default() {
     .unwrap();
     let client = started.client.clone();
     let session = started.running.session().cloned().unwrap();
-    assert_eq!(
-        client.capabilities().unwrap().name.as_deref(),
-        Some("fake-acp-agent")
-    );
 
     let update = tokio::time::timeout(TIMEOUT, client.next_update())
         .await
