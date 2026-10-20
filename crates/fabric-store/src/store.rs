@@ -64,6 +64,12 @@ pub enum StoreError {
     /// The assembled manifest bytes do not hash to the snapshot id.
     #[error("manifest bytes of snapshot {0} do not hash to its id")]
     ManifestMismatch(SnapshotId),
+    /// The directory already holds a catalog.
+    #[error("{path} is already a store")]
+    AlreadyAStore {
+        /// The store root.
+        path: PathBuf,
+    },
 }
 
 fn io_err(path: &Path, source: io::Error) -> StoreError {
@@ -146,10 +152,9 @@ impl Store {
         let lock = take_lock(root)?;
         let catalog_path = root.join("catalog.sqlite");
         if catalog_path.exists() {
-            return Err(io_err(
-                &catalog_path,
-                io::Error::new(io::ErrorKind::AlreadyExists, "catalog exists"),
-            ));
+            return Err(StoreError::AlreadyAStore {
+                path: root.to_owned(),
+            });
         }
         let objects = ObjectStore::new(root, params);
         objects.create_dirs()?;

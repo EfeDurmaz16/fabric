@@ -1,5 +1,5 @@
 //! Crash tests. A child re-executes this test binary, stops at a named
-//! checkpoint inside publish or restore, and is killed with `SIGKILL`; the
+//! checkpoint inside store creation, publish or restore, and is killed with `SIGKILL`; the
 //! parent then asserts what ADR 0004 promises about the store and the target.
 
 use std::fs;
@@ -85,6 +85,10 @@ fn crash_child() {
         return;
     };
     let dir = PathBuf::from(std::env::var("FABRIC_STORE_CRASH_DIR").unwrap());
+    if mode == "create" {
+        Store::create(&dir.join("store"), ChunkParams::DEFAULT).unwrap();
+        panic!("child did not reach its checkpoint");
+    }
     let mut store = Store::open(&dir.join("store")).unwrap();
     match mode.as_str() {
         "publish" => {
@@ -149,6 +153,25 @@ fn run_child_and_kill(dir: &Path, mode: &str, checkpoint: &str, snapshot: Option
     child.kill().unwrap();
     let status = child.wait().unwrap();
     assert!(!status.success(), "{checkpoint}: child was not killed");
+}
+
+#[test]
+fn create_killed_before_the_catalog_rename_leaves_a_store_create_can_finish() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    run_child_and_kill(dir, "create", "create.before_rename", None);
+
+    let root = dir.join("store");
+    assert!(!root.join("catalog.sqlite").exists());
+    assert!(matches!(
+        Store::open(&root),
+        Err(crate::store::StoreError::NotAStore { .. })
+    ));
+    let mut store = Store::create(&root, ChunkParams::DEFAULT).unwrap();
+    assert!(!root.join("catalog.sqlite.tmp").exists());
+    make_workspace(&dir.join("work")).unwrap();
+    let snapshot = capture_and_publish(&mut store, &dir.join("work")).unwrap();
+    assert!(store.manifest(snapshot).is_ok());
 }
 
 #[test]

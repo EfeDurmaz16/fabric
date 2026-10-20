@@ -131,6 +131,11 @@ fn one_process_holds_a_store_and_a_foreign_schema_is_refused() {
         Err(StoreError::Locked { .. })
     ));
     drop(store);
+    assert!(matches!(
+        Store::create(dir.path(), params()),
+        Err(StoreError::AlreadyAStore { .. })
+    ));
+    assert!(!dir.path().join("catalog.sqlite.tmp").exists());
     let reopened = Store::open(dir.path()).unwrap();
     assert_eq!(*reopened.objects().params(), params());
     drop(reopened);

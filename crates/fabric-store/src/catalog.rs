@@ -7,11 +7,15 @@
 //! with no row is invisible to readers and belongs to gc.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use fabric_core::id::{ChunkId, JobId, SnapshotId};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
+use crate::checkpoint;
+use crate::durable;
 use crate::objects::{ChunkParams, ObjectError};
 
 /// The catalog schema this crate reads and writes.
@@ -40,6 +44,15 @@ pub enum CatalogError {
     /// The recorded chunking parameters break the chunker's rules.
     #[error(transparent)]
     Params(ObjectError),
+    /// A filesystem call on the catalog file failed.
+    #[error("{path}: {source}")]
+    Io {
+        /// The path.
+        path: PathBuf,
+        /// The underlying error.
+        #[source]
+        source: io::Error,
+    },
 }
 
 const SCHEMA: &str = "
@@ -131,8 +144,44 @@ fn opt_snapshot(bytes: Option<[u8; 32]>) -> Option<SnapshotId> {
 
 impl Catalog {
     /// Creates a new catalog file with the schema and the chunking parameters.
+    ///
+    /// The database is built under a temporary name and renamed into place
+    /// after the schema commits, so a `catalog.sqlite` that exists is always
+    /// complete and a kill during creation leaves nothing to clean by hand.
     pub(crate) fn create(path: &Path, params: &ChunkParams) -> Result<Catalog, CatalogError> {
         params.validate().map_err(CatalogError::Params)?;
+        let tmp = path.with_extension("sqlite.tmp");
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let mut name = tmp.clone().into_os_string();
+            name.push(suffix);
+            match fs::remove_file(&name) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(CatalogError::Io {
+                        path: name.into(),
+                        source: e,
+                    });
+                }
+            }
+        }
+        Self::build(&tmp, params)?;
+        checkpoint::reached("create.before_rename");
+        fs::rename(&tmp, path).map_err(|source| CatalogError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+        if let Some(parent) = path.parent() {
+            durable::fsync_dir(parent).map_err(|source| CatalogError::Io {
+                path: parent.to_owned(),
+                source,
+            })?;
+        }
+        Self::open(path)
+    }
+
+    /// Writes the schema and settings into a fresh database at `path` and closes it.
+    fn build(path: &Path, params: &ChunkParams) -> Result<(), CatalogError> {
         let mut conn = connect(path)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(SCHEMA)?;
@@ -154,7 +203,9 @@ impl Catalog {
             )?;
         }
         tx.commit()?;
-        Ok(Catalog { conn })
+        // Closing the last connection checkpoints the WAL into the file.
+        conn.close().map_err(|(_, e)| e)?;
+        Ok(())
     }
 
     /// Opens an existing catalog, refusing another schema version.
