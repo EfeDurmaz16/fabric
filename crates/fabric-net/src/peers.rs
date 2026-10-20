@@ -514,13 +514,17 @@ impl Peers {
 
     /// Reloads the book if the file changed since it was last read.
     ///
-    /// A file that cannot be read or parsed leaves the last good book in
-    /// force and is logged; a file that is gone empties the book.
+    /// Trust fails closed: a file that cannot be read or parsed pairs no
+    /// one until it can, so a hand edit that revokes a node and slips in a
+    /// typo never leaves that node trusted. A file that is gone empties the
+    /// book too.
     fn refresh(&self) {
         let stamp = match Stamp::of(&self.path) {
             Ok(stamp) => stamp,
             Err(err) => {
-                tracing::warn!(path = %self.path.display(), error = %err, "peer book not readable; keeping the last good book");
+                tracing::error!(path = %self.path.display(), error = %err, "peer book not readable; trusting no peer until it is");
+                // No stamp, so the next refresh that can read the file reloads it.
+                self.distrust(None);
                 return;
             }
         };
@@ -535,9 +539,18 @@ impl Peers {
                 };
             }
             Err(err) => {
-                tracing::warn!(path = %self.path.display(), error = %err, "peer book not readable; keeping the last good book");
+                tracing::error!(path = %self.path.display(), error = %err, "peer book does not parse; trusting no peer until it does");
+                self.distrust(stamp);
             }
         }
+    }
+
+    /// Pairs no one until the file at `stamp` changes.
+    fn distrust(&self, stamp: Option<Stamp>) {
+        *lock(&self.cache) = Cached {
+            book: Arc::new(PeerBook::default()),
+            stamp,
+        };
     }
 
     fn book(&self) -> Arc<PeerBook> {
@@ -718,6 +731,23 @@ mod tests {
             .unwrap();
         assert!(!PeerBook::load(&path).unwrap().is_paired(node(1)));
         assert!(!daemon.is_paired(node(1)));
+    }
+
+    /// A hand edit that revokes a node and breaks a line must not leave the
+    /// node trusted: a book that does not parse pairs no one until it does.
+    #[test]
+    fn a_book_that_does_not_parse_pairs_no_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers");
+        let daemon = Peers::open(&path).unwrap();
+        daemon.update(|b| b.pair(node(1), None)).unwrap();
+        assert!(daemon.is_paired(node(1)));
+
+        fs::write(&path, format!("{} - -\nnot a peer line\n", node(2))).unwrap();
+        assert!(!daemon.is_paired(node(1)) && !daemon.is_paired(node(2)));
+
+        fs::write(&path, format!("{} - -\n", node(2))).unwrap();
+        assert!(daemon.is_paired(node(2)), "a fixed book is read again");
     }
 
     proptest! {
