@@ -6,12 +6,11 @@ use std::io;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
-use fabric_core::env::{EnvVarName, RunWhen, Tool, ToolSource};
+use fabric_core::env::{EnvVarName, PinError, RunWhen, Tool, ToolName, ToolSource, ToolVersion};
 use fabric_core::path::{PathError, RelPath};
 use fabric_core::snapshot::CacheClass;
 use fabric_env::detect::{
-    CachePath, DetectError, Detection, Ecosystem, ManagerChoice, ManagerSource, NodeManager,
-    PinError, detect,
+    CachePath, DetectError, Detection, Ecosystem, ManagerChoice, ManagerSource, NodeManager, detect,
 };
 use fabric_env::overrides::OverrideError;
 use fabric_env::secret::Scope;
@@ -51,12 +50,12 @@ fn commands(detection: &Detection) -> Vec<String> {
         .collect()
 }
 
-fn tool(name: &str, version: &str, source: ToolSource) -> Tool {
-    Tool {
-        name: name.to_owned(),
-        version: version.to_owned(),
+fn tool(name: &str, version: &str, source: ToolSource) -> Result<Tool, PinError> {
+    Ok(Tool {
+        name: ToolName::parse(name)?,
+        version: ToolVersion::parse(version)?,
         source,
-    }
+    })
 }
 
 fn cache(path: &str, class: CacheClass, ecosystem: Ecosystem) -> Result<CachePath, PathError> {
@@ -94,8 +93,8 @@ fn a_pnpm_workspace_gives_a_frozen_install_and_node_modules() {
     assert_eq!(
         found.spec().tools,
         [
-            tool("node", "22", ToolSource::Detected),
-            tool("pnpm", "11.23.0", ToolSource::Detected)
+            tool("node", "22", ToolSource::Detected).unwrap(),
+            tool("pnpm", "11.23.0", ToolSource::Detected).unwrap()
         ]
     );
     assert_eq!(found.devcontainer(), None);
@@ -113,7 +112,7 @@ fn cargo_fetch_is_locked_exactly_when_a_lockfile_exists() {
     );
     assert_eq!(
         found.spec().tools,
-        [tool("rust", "1.97.1", ToolSource::Detected)]
+        [tool("rust", "1.97.1", ToolSource::Detected).unwrap()]
     );
 
     let library = workspace(&[("Cargo.toml", "[package]\nname = \"x\"\n")]).unwrap();
@@ -188,7 +187,7 @@ fn the_package_manager_field_decides_the_yarn_line() {
     assert_eq!(commands(&found), ["yarn install --immutable"]);
     assert_eq!(
         found.spec().tools,
-        [tool("yarn", "4.5.0", ToolSource::Detected)]
+        [tool("yarn", "4.5.0", ToolSource::Detected).unwrap()]
     );
 
     let classic = workspace(&[
@@ -313,11 +312,11 @@ fn pins_follow_precedence_and_aliases() {
     assert_eq!(
         found.spec().tools,
         [
-            tool("go", "1.23.0", ToolSource::Detected),
-            tool("node", "24", ToolSource::Detected),
-            tool("python", "3.12", ToolSource::Detected),
-            tool("rust", "1.97.1", ToolSource::Detected),
-            tool("terraform", "1.9.0", ToolSource::Detected),
+            tool("go", "1.23.0", ToolSource::Detected).unwrap(),
+            tool("node", "24", ToolSource::Detected).unwrap(),
+            tool("python", "3.12", ToolSource::Detected).unwrap(),
+            tool("rust", "1.97.1", ToolSource::Detected).unwrap(),
+            tool("terraform", "1.9.0", ToolSource::Detected).unwrap(),
         ]
     );
     assert_eq!(commands(&found), ["go mod download"]);
@@ -379,11 +378,11 @@ fn the_override_file_wins_over_detection() {
     assert_eq!(found.spec().setup[1].when, RunWhen::Always);
     assert_eq!(
         found.spec().tools,
-        [tool("node", "22.23.2", ToolSource::Declared)]
+        [tool("node", "22.23.2", ToolSource::Declared).unwrap()]
     );
     assert_eq!(found.pins()[0].file, ".fabric/env.toml");
     assert_eq!(found.pins()[0].source, ToolSource::Declared);
-    assert_eq!(found.pins()[1].version, "20");
+    assert_eq!(found.pins()[1].version.as_str(), "20");
     assert_eq!(found.pins()[1].source, ToolSource::Detected);
     let names: Vec<&str> = found
         .spec()
@@ -424,12 +423,15 @@ fn a_declared_pin_under_an_alias_replaces_the_detected_one() {
     let found = detect(dir.path()).unwrap();
     assert_eq!(
         found.spec().tools,
-        [tool("node", "22", ToolSource::Declared)]
+        [tool("node", "22", ToolSource::Declared).unwrap()]
     );
     let dir = workspace(&[(".fabric/env.toml", "[tools]\n\"\" = \"22\"\n")]).unwrap();
     assert!(matches!(
         detect(dir.path()),
-        Err(DetectError::Override(OverrideError::EmptyToolName))
+        Err(DetectError::Override(OverrideError::ToolName {
+            index: 0,
+            reason: PinError::Empty
+        }))
     ));
 }
 
@@ -516,8 +518,14 @@ fn a_credential_shaped_pin_is_refused_without_echoing_it() {
     let token = format!("ghp_{}", "q7".repeat(18));
     let detected = workspace(&[(".nvmrc", &token)]).unwrap();
     match detect(detected.path()) {
-        Err(err @ DetectError::Pin { file, reason, .. }) => {
-            assert_eq!((file, reason), (".nvmrc", PinError::Credential));
+        Err(
+            err @ DetectError::Pin {
+                file,
+                entry,
+                reason,
+            },
+        ) => {
+            assert_eq!((file, entry, reason), (".nvmrc", 0, PinError::Credential));
             assert!(!format!("{err} {err:?}").contains(&token));
         }
         other => panic!("{other:?}"),
@@ -564,4 +572,50 @@ fn a_declared_cache_keeps_the_full_secret_list() {
         Some(".env.*")
     );
     assert_eq!(scope_of("node_modules"), Scope::Cache);
+}
+
+/// A tool name travels in the spec as a pin does: a token used as a name,
+/// or a name that carries a terminal escape for the node that prints it,
+/// is refused by its position and never quoted.
+#[test]
+fn a_bad_tool_name_is_refused_without_echoing_it() {
+    let token = format!("ghp_{}", "q7".repeat(18));
+    let declared = workspace(&[(
+        ".fabric/env.toml",
+        &format!("[tools]\n{token} = \"1\"\nnode = \"22\"\n"),
+    )])
+    .unwrap();
+    match detect(declared.path()) {
+        Err(err @ DetectError::Override(OverrideError::ToolName { .. })) => {
+            assert!(!format!("{err} {err:?}").contains(&token));
+            assert!(matches!(
+                err,
+                DetectError::Override(OverrideError::ToolName {
+                    index: 0,
+                    reason: PinError::Credential
+                })
+            ));
+        }
+        other => panic!("{other:?}"),
+    }
+    let escape = "\u{1b}[31mnode";
+    for (file, text) in [
+        (".tool-versions", format!("python 3.12\n{escape} 22\n")),
+        (
+            "mise.toml",
+            "[tools]\n\"\\u001b[31mnode\\n\" = \"22\"\n".to_owned(),
+        ),
+    ] {
+        let dir = workspace(&[(file, &text)]).unwrap();
+        match detect(dir.path()) {
+            Err(err @ DetectError::ToolName { .. }) => {
+                assert!(!format!("{err}").contains('\u{1b}'), "{file}");
+                assert!(
+                    matches!(err, DetectError::ToolName { file: f, reason: PinError::BadChar, .. } if f == file),
+                    "{file}"
+                );
+            }
+            other => panic!("{file}: {other:?}"),
+        }
+    }
 }

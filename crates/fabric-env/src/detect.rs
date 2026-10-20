@@ -7,8 +7,9 @@
 //! rule. It never opens a file the secret policy denies, never reads an
 //! environment variable and never runs a program, so the same files give
 //! the same spec on every node, and the spec it returns has passed
-//! `EnvSpec::validate`. Every pin it keeps is short, printable and not
-//! shaped like a credential, because the spec travels to other nodes.
+//! `EnvSpec::validate`. Every tool name and pin it keeps is short,
+//! printable and not shaped like a credential, because the spec travels to
+//! other nodes; `ToolName` and `ToolVersion` hold that rule by type.
 //!
 //! What it reads, and what each file gives:
 //!
@@ -28,57 +29,22 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
 
-use fabric_core::env::{EnvSpec, EnvSpecError, RunWhen, SetupStep, Tool, ToolSource};
+use fabric_core::env::{
+    EnvSpec, EnvSpecError, PinError, RunWhen, SetupStep, Tool, ToolName, ToolSource, ToolVersion,
+};
 use fabric_core::harness::ProgramName;
 use fabric_core::path::RelPath;
 use fabric_core::snapshot::CacheClass;
 use toml::Table;
 
 use crate::overrides::{EnvOverride, OverrideError, line_and_column};
-use crate::secret::{self, Scope, SecretPolicy};
+use crate::secret::{Scope, SecretPolicy};
 
 /// Where the override file lives, relative to the workspace root.
 pub const OVERRIDE_FILE: &str = ".fabric/env.toml";
 
 /// The largest file detection reads; a bigger one is refused rather than loaded.
 const MAX_FILE_LEN: u64 = 4 << 20;
-
-/// The most characters a version pin may have.
-pub const MAX_PIN_LEN: usize = 64;
-
-/// Why a version pin was refused; the pin itself is never quoted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum PinError {
-    /// The pin has no characters.
-    #[error("version pin is empty")]
-    Empty,
-    /// The pin is longer than `MAX_PIN_LEN` characters.
-    #[error("version pin is longer than {MAX_PIN_LEN} characters")]
-    TooLong,
-    /// A character outside printable ASCII, space included.
-    #[error("version pin has a character outside printable ASCII")]
-    BadChar,
-    /// The pin is shaped like a token, key or password URL.
-    #[error("version pin looks like a credential; the spec travels to other nodes")]
-    Credential,
-}
-
-/// Checks that `version` is a pin and not a value that must stay on this node.
-pub(crate) fn check_pin(version: &str) -> Result<(), PinError> {
-    if version.is_empty() {
-        return Err(PinError::Empty);
-    }
-    if version.len() > MAX_PIN_LEN {
-        return Err(PinError::TooLong);
-    }
-    if !version.bytes().all(|b| (b' '..=b'~').contains(&b)) {
-        return Err(PinError::BadChar);
-    }
-    if secret::looks_like_credential(version) {
-        return Err(PinError::Credential);
-    }
-    Ok(())
-}
 
 /// Why a workspace's environment could not be detected.
 #[derive(Debug, thiserror::Error)]
@@ -100,15 +66,24 @@ pub enum DetectError {
         /// The file, relative to the root.
         file: &'static str,
     },
-    /// A version pin in a detected file was refused.
-    #[error("the `{tool}` pin in `{file}` was refused")]
+    /// A tool name in a detected file was refused; the name itself is never quoted.
+    #[error("the tool name of pin {entry} in `{file}` {reason}")]
+    ToolName {
+        /// The file, relative to the root.
+        file: &'static str,
+        /// Zero-based index of the pin among the pins the file gives, in file order.
+        entry: usize,
+        /// What is wrong with it.
+        reason: PinError,
+    },
+    /// A version pin in a detected file was refused; the pin itself is never quoted.
+    #[error("the version of pin {entry} in `{file}` {reason}")]
     Pin {
         /// The file, relative to the root.
         file: &'static str,
-        /// The tool the pin is for.
-        tool: String,
+        /// Zero-based index of the pin among the pins the file gives, in file order.
+        entry: usize,
         /// What is wrong with it.
-        #[source]
         reason: PinError,
     },
     /// A file is larger than detection reads.
@@ -406,9 +381,9 @@ impl CachePath {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pin {
     /// The tool, with `nodejs` read as `node` and `golang` as `go`, from every file including the override one.
-    pub tool: String,
+    pub tool: ToolName,
     /// The version text as the file wrote it.
-    pub version: String,
+    pub version: ToolVersion,
     /// The file it came from, relative to the root.
     pub file: &'static str,
     /// Whether the user declared it in the override file or detection found it.
@@ -553,13 +528,13 @@ fn collect_pins(
     let mut pins: Vec<Pin> = overrides
         .tools
         .iter()
-        .map(|(tool, version)| Pin {
-            tool: canonical_tool(tool),
-            version: version.clone(),
-            file: OVERRIDE_FILE,
-            source: ToolSource::Declared,
+        .enumerate()
+        .map(|(entry, (tool, version))| {
+            let mut declared = pin(tool.as_str(), version.as_str(), OVERRIDE_FILE, entry)?;
+            declared.source = ToolSource::Declared;
+            Ok(declared)
         })
-        .collect();
+        .collect::<Result<_, DetectError>>()?;
     pins.extend(mise_pins(root)?);
     pins.extend(tool_versions_pins(root)?);
     pins.extend(rust_toolchain_pin(root)?);
@@ -572,26 +547,33 @@ fn collect_pins(
     }
     pins.extend(go_mod_pin(root)?);
     if let Some(package) = package {
+        let mut entry = 0;
         if let Some((name, version)) = &package.manager {
-            pins.push(pin(name.as_str(), version, "package.json")?);
+            pins.push(pin(name.as_str(), version, "package.json", entry)?);
+            entry += 1;
         }
         if let Some(engine) = &package.engines_node {
-            pins.push(pin("node", engine, "package.json")?);
+            pins.push(pin("node", engine, "package.json", entry)?);
         }
     }
     Ok(pins)
 }
 
-/// Builds a detected pin after checking its version.
-fn pin(tool: &str, version: &str, file: &'static str) -> Result<Pin, DetectError> {
-    check_pin(version).map_err(|reason| DetectError::Pin {
+/// Builds a detected pin after checking its tool name, read through its alias, and its version.
+fn pin(tool: &str, version: &str, file: &'static str, entry: usize) -> Result<Pin, DetectError> {
+    let tool = ToolName::parse(canonical_tool(tool)).map_err(|reason| DetectError::ToolName {
         file,
-        tool: tool.to_owned(),
+        entry,
+        reason,
+    })?;
+    let version = ToolVersion::parse(version).map_err(|reason| DetectError::Pin {
+        file,
+        entry,
         reason,
     })?;
     Ok(Pin {
-        tool: tool.to_owned(),
-        version: version.to_owned(),
+        tool,
+        version,
         file,
         source: ToolSource::Detected,
     })
@@ -656,7 +638,7 @@ fn find_devcontainer(root: &Path) -> Result<Option<RelPath>, DetectError> {
 
 /// Takes the first pin per tool, which is the declared one when the override file has it.
 fn chosen_tools(pins: &[Pin]) -> Vec<Tool> {
-    let mut chosen: BTreeMap<&str, &Pin> = BTreeMap::new();
+    let mut chosen: BTreeMap<&ToolName, &Pin> = BTreeMap::new();
     for pin in pins {
         chosen.entry(&pin.tool).or_insert(pin);
     }
@@ -789,15 +771,20 @@ fn mise_pins(root: &Path) -> Result<Vec<Pin>, DetectError> {
     };
     tools
         .iter()
-        .filter_map(|(tool, value)| {
-            let version = match value {
-                toml::Value::String(v) => Some(v.as_str()),
-                toml::Value::Array(items) => items.first().and_then(toml::Value::as_str),
-                toml::Value::Table(t) => t.get("version").and_then(toml::Value::as_str),
-                _ => None,
-            }?;
-            Some(pin(&canonical_tool(tool), version, "mise.toml"))
+        .filter_map(|(tool, value)| match value {
+            toml::Value::String(v) => Some((tool, v.as_str())),
+            toml::Value::Array(items) => items
+                .first()
+                .and_then(toml::Value::as_str)
+                .map(|v| (tool, v)),
+            toml::Value::Table(t) => t
+                .get("version")
+                .and_then(toml::Value::as_str)
+                .map(|v| (tool, v)),
+            _ => None,
         })
+        .enumerate()
+        .map(|(entry, (tool, version))| pin(tool, version, "mise.toml", entry))
         .collect()
 }
 
@@ -810,10 +797,10 @@ fn tool_versions_pins(root: &Path) -> Result<Vec<Pin>, DetectError> {
         .filter_map(|line| {
             let line = line.split_once('#').map_or(line, |(before, _)| before);
             let mut words = line.split_whitespace();
-            let tool = words.next()?;
-            let version = words.next()?;
-            Some(pin(&canonical_tool(tool), version, ".tool-versions"))
+            Some((words.next()?, words.next()?))
         })
+        .enumerate()
+        .map(|(entry, (tool, version))| pin(tool, version, ".tool-versions", entry))
         .collect()
 }
 
@@ -826,7 +813,7 @@ fn rust_toolchain_pin(root: &Path) -> Result<Option<Pin>, DetectError> {
         .get("toolchain")
         .and_then(|t| t.get("channel"))
         .and_then(toml::Value::as_str)
-        .map(|channel| pin("rust", channel, "rust-toolchain.toml"))
+        .map(|channel| pin("rust", channel, "rust-toolchain.toml", 0))
         .transpose()
 }
 
@@ -838,7 +825,7 @@ fn first_line_pin(root: &Path, file: &'static str, tool: &str) -> Result<Option<
     text.lines()
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|version| pin(tool, version, file))
+        .map(|version| pin(tool, version, file, 0))
         .transpose()
 }
 
@@ -850,18 +837,19 @@ fn go_mod_pin(root: &Path) -> Result<Option<Pin>, DetectError> {
     text.lines()
         .find_map(
             |line| match line.split_whitespace().collect::<Vec<_>>().as_slice() {
-                ["go", version, ..] => Some(pin("go", version, "go.mod")),
+                ["go", version, ..] => Some(pin("go", version, "go.mod", 0)),
                 _ => None,
             },
         )
         .transpose()
 }
 
-fn canonical_tool(name: &str) -> String {
+/// Reads `nodejs` as `node` and `golang` as `go`, as asdf and mise do.
+fn canonical_tool(name: &str) -> &str {
     match name {
-        "nodejs" => "node".to_owned(),
-        "golang" => "go".to_owned(),
-        other => other.to_owned(),
+        "nodejs" => "node",
+        "golang" => "go",
+        other => other,
     }
 }
 
@@ -928,36 +916,4 @@ fn read_toml(root: &Path, file: &'static str) -> Result<Option<Table>, DetectErr
         let (line, column) = line_and_column(&text, err.span().map_or(0, |span| span.start));
         DetectError::Toml { file, line, column }
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// One sample per refusal, and the pin shapes real files hold pass.
-    #[test]
-    fn a_pin_is_short_printable_and_not_a_credential() {
-        for ok in [
-            "22",
-            "v20",
-            ">=18 <21",
-            "^18 || ^20",
-            "1.97.1",
-            "lts/*",
-            "3.12",
-        ] {
-            assert_eq!(check_pin(ok), Ok(()), "{ok}");
-        }
-        assert_eq!(check_pin(""), Err(PinError::Empty));
-        assert_eq!(
-            check_pin(&"1".repeat(MAX_PIN_LEN + 1)),
-            Err(PinError::TooLong)
-        );
-        assert_eq!(check_pin("22\u{7}"), Err(PinError::BadChar));
-        assert_eq!(check_pin("2\u{e9}"), Err(PinError::BadChar));
-        assert_eq!(
-            check_pin("https://u:p@registry.example.com/x"),
-            Err(PinError::Credential)
-        );
-    }
 }

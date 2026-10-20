@@ -28,14 +28,19 @@
 //! when = "caches-missing"          # or "always"; caches-missing when absent
 //! ```
 
-use fabric_core::env::{EnvVarName, EnvVarNameError, RunWhen, SetupStep};
+use std::collections::BTreeMap;
+
+use fabric_core::credential::looks_like_credential;
+use fabric_core::env::{
+    EnvVarName, EnvVarNameError, PinError, RunWhen, SetupStep, ToolName, ToolVersion,
+};
 use fabric_core::harness::{ProgramName, ProgramNameError};
 use fabric_core::path::{PathError, RelPath};
 use fabric_core::snapshot::CacheClass;
 use toml::{Table, Value};
 
-use crate::detect::{PackageManagerName, PinError, check_pin};
-use crate::secret::{self, Pattern, PatternError};
+use crate::detect::PackageManagerName;
+use crate::secret::{Pattern, PatternError};
 
 /// The directory that holds Fabric's own files in a workspace; never a cache.
 const FABRIC_DIR: &str = ".fabric";
@@ -152,16 +157,20 @@ pub enum OverrideError {
         /// The path it nests with.
         other: RelPath,
     },
-    /// A `[tools]` entry whose key has no characters.
-    #[error("`tools` has an entry with an empty name")]
-    EmptyToolName,
-    /// A tool pin that is not a short printable version, or that is shaped like a credential.
-    #[error("`{key}` is not a version pin")]
-    Pin {
-        /// The dotted path of the key.
-        key: String,
+    /// A `[tools]` key that is not a tool name; the name itself is never quoted.
+    #[error("the name of `tools[{index}]` {reason}")]
+    ToolName {
+        /// Zero-based index of the entry in `[tools]`, in key order.
+        index: usize,
         /// What is wrong with it.
-        #[source]
+        reason: PinError,
+    },
+    /// A `[tools]` value that is not a version pin; the pin itself is never quoted.
+    #[error("the version of `tools[{index}]` {reason}")]
+    Pin {
+        /// Zero-based index of the entry in `[tools]`, in key order.
+        index: usize,
+        /// What is wrong with it.
         reason: PinError,
     },
 }
@@ -184,8 +193,8 @@ pub struct EnvOverride {
     pub env_var_names: Vec<EnvVarName>,
     /// Patterns added to the built-in secret list.
     pub secret_patterns: Vec<Pattern>,
-    /// Declared tool pins as `(tool, version)`, sorted by tool.
-    pub tools: Vec<(String, String)>,
+    /// Declared tool pins, by tool name.
+    pub tools: BTreeMap<ToolName, ToolVersion>,
     /// Declared cache paths, in file order.
     pub caches: Vec<DeclaredCache>,
     /// Declared setup steps; `Some` replaces every detected step, even when empty.
@@ -300,18 +309,17 @@ fn patterns(value: &Value) -> Result<Vec<Pattern>, OverrideError> {
         .collect()
 }
 
-fn tools(value: &Value) -> Result<Vec<(String, String)>, OverrideError> {
-    // A TOML table iterates in key order, so the result is sorted by tool.
+fn tools(value: &Value) -> Result<BTreeMap<ToolName, ToolVersion>, OverrideError> {
     table(value, "tools")?
         .iter()
-        .map(|(tool, version)| {
-            if tool.is_empty() {
-                return Err(OverrideError::EmptyToolName);
-            }
-            let key = format!("tools.{tool}");
-            let version = string(version, &key)?;
-            check_pin(version).map_err(|reason| OverrideError::Pin { key, reason })?;
-            Ok((tool.clone(), version.to_owned()))
+        .enumerate()
+        .map(|(index, (tool, version))| {
+            let tool = ToolName::parse(tool)
+                .map_err(|reason| OverrideError::ToolName { index, reason })?;
+            let version = string(version, &format!("tools[{index}]"))?;
+            let version = ToolVersion::parse(version)
+                .map_err(|reason| OverrideError::Pin { index, reason })?;
+            Ok((tool, version))
         })
         .collect()
 }
@@ -385,7 +393,7 @@ fn steps(value: &Value) -> Result<Vec<SetupStep>, OverrideError> {
             Some(args) => strings(args, &format!("{at}.args"))?,
             None => Vec::new(),
         };
-        if let Some(arg) = args.iter().position(|a| secret::looks_like_credential(a)) {
+        if let Some(arg) = args.iter().position(|a| looks_like_credential(a)) {
             return Err(OverrideError::CredentialInArgs { step: index, arg });
         }
         let cwd = match entry.get("cwd") {
@@ -473,13 +481,12 @@ when = "always"
             .collect();
         assert_eq!(names, ["DATABASE_URL", "OPENAI_API_KEY"]);
         assert_eq!(parsed.secret_patterns[0].as_str(), "*.sqlite");
-        assert_eq!(
-            parsed.tools,
-            [
-                ("node".to_owned(), "22".to_owned()),
-                ("pnpm".to_owned(), "11.23.0".to_owned())
-            ]
-        );
+        let tools: Vec<(&str, &str)> = parsed
+            .tools
+            .iter()
+            .map(|(name, version)| (name.as_str(), version.as_str()))
+            .collect();
+        assert_eq!(tools, [("node", "22"), ("pnpm", "11.23.0")]);
         assert_eq!(
             parsed.caches,
             [DeclaredCache {

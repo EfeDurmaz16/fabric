@@ -81,6 +81,7 @@
 //! ```
 
 pub mod codec;
+pub mod credential;
 pub mod env;
 pub mod git;
 pub mod harness;
