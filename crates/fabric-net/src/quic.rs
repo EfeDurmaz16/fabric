@@ -177,6 +177,10 @@ fn transport_config() -> Result<quinn::TransportConfig, TransportError> {
         IdleTimeout::try_from(IDLE_TIMEOUT).map_err(|err| TransportError::Config(Box::new(err)))?;
     config.max_idle_timeout(Some(idle));
     config.keep_alive_interval(Some(KEEP_ALIVE));
+    // Requests ride bidirectional streams only. Nothing accepts a
+    // unidirectional one, so a peer gets no credit to open any: one it
+    // could open would sit buffered with no reader and no deadline.
+    config.max_concurrent_uni_streams(VarInt::from_u32(0));
     Ok(config)
 }
 
@@ -247,5 +251,53 @@ impl Connection for QuicConnection {
 
     fn close(&self) {
         self.inner.close(VarInt::from_u32(0), b"close");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct Everyone;
+
+    impl Trust for Everyone {
+        fn is_paired(&self, _node: NodeId) -> bool {
+            true
+        }
+    }
+
+    /// A paired peer cannot open a unidirectional stream: nothing would
+    /// read it, so it would hold buffered bytes with no deadline.
+    #[tokio::test]
+    async fn a_peer_gets_no_unidirectional_stream() {
+        let loopback: SocketAddr = ([127, 0, 0, 1], 0).into();
+        let server = NodeIdentity::generate().unwrap();
+        let acceptor = QuicTransport::bind(&server, Arc::new(Everyone), loopback).unwrap();
+        let dialer_id = NodeIdentity::generate().unwrap();
+        let dialer = QuicTransport::bind(&dialer_id, Arc::new(Everyone), loopback).unwrap();
+
+        let rustls_config = dialer
+            .credentials
+            .client_config(server.node_id(), &Arc::new(Refusal::default()))
+            .unwrap();
+        let mut client =
+            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(rustls_config).unwrap()));
+        client.transport_config(Arc::clone(&dialer.transport));
+        let addr = acceptor.local_addr().unwrap();
+        let connection = dialer
+            .endpoint
+            .connect_with(client, addr, SERVER_NAME)
+            .unwrap()
+            .await
+            .unwrap();
+        let _accepted = acceptor.accept().await.unwrap();
+
+        let opened = tokio::time::timeout(Duration::from_millis(500), connection.open_uni()).await;
+        assert!(
+            opened.is_err(),
+            "the acceptor gave credit for a unidirectional stream"
+        );
+        assert!(connection.open_bi().await.is_ok());
     }
 }
