@@ -50,6 +50,21 @@ use crate::overrides::{
 };
 use fabric_core::secret::{Scope, SecretPolicy};
 
+/// Every file detection opens, relative to the root. `Reader` refuses any
+/// other name, so a new reader must add its file here, where a test checks
+/// that no built-in secret pattern denies it.
+const READ_FILES: &[&str] = &[
+    OVERRIDE_FILE,
+    "package.json",
+    "mise.toml",
+    ".tool-versions",
+    "rust-toolchain.toml",
+    ".node-version",
+    ".nvmrc",
+    ".python-version",
+    "go.mod",
+];
+
 /// The largest file detection reads; a bigger one is refused rather than loaded.
 const MAX_FILE_LEN: u64 = 4 << 20;
 
@@ -1242,7 +1257,12 @@ struct Reader<'a> {
 
 impl Reader<'_> {
     /// Reads `file` as text, or `None` when it is absent or the secret policy denies it.
+    ///
+    /// Refuses a name missing from `READ_FILES` as a bug in this module.
     fn text(&self, file: &'static str) -> Result<Option<String>, DetectError> {
+        if !READ_FILES.contains(&file) {
+            return Err(DetectError::BuiltIn { name: file });
+        }
         if let Some(pattern) = self.secrets.denies(&rel(file)?, Scope::Work) {
             tracing::warn!(
                 file,
@@ -1292,19 +1312,8 @@ mod tests {
     /// pattern that names one makes `Reader` skip it.
     #[test]
     fn no_file_detection_reads_is_a_builtin_secret() {
-        let files = [
-            OVERRIDE_FILE,
-            "package.json",
-            "mise.toml",
-            ".tool-versions",
-            "rust-toolchain.toml",
-            ".node-version",
-            ".nvmrc",
-            ".python-version",
-            "go.mod",
-        ];
         let policy = SecretPolicy::default();
-        for file in files {
+        for &file in READ_FILES {
             assert_eq!(
                 policy.denies(&RelPath::parse(file).unwrap(), Scope::Work),
                 None,
