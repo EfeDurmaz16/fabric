@@ -37,10 +37,10 @@ trait Connection: Send + Sync {
 }
 ```
 
-- `connect` takes one address. Trying several addresses, resolving names and falling back from QUIC to TCP is the job of `Endpoint::dial_any`, so each wire stays a plain dialer and the fallback rule lives in one place. A fallback reports QUIC's failure as a `TransportError`; the connection's `kind` says which wire served.
+- `connect` takes one address and gives up after the wire's dial timeout, 10 s unless set, on both wires alike. Trying several addresses, resolving names and falling back from QUIC to TCP is the job of `Endpoint::dial_any`, so each wire stays a plain dialer and the fallback rule lives in one place. A fallback reports QUIC's failure as a `TransportError`; the connection's `kind` says which wire served.
 - `accept` returns the connection alone. The peer's id is `Connection::peer`, so the fact has one home.
 - `kind` and `remote_addr` exist because the ledger records which wire served a resume and the peer book records where a peer was last seen. `close` ends a connection at once; dropping the handle keeps it open while any stream on it lives, on both wires.
-- A transport accepts in the background: every handshake runs in its own task under a 10 s deadline, at most 32 at once and at most 4 from one source address, and `accept` reads a queue of finished connections. A TCP socket that sends no byte within 2 s is closed, and QUIC answers an address it has not validated with a Retry before any handshake, so neither a silent host nor a spoofed source can hold the slots a paired peer needs. Racing two transports in `select!` loses nothing.
+- A transport accepts in the background: every handshake runs in its own task under a 10 s deadline, at most 32 at once and at most 4 from one source, and `accept` reads a queue of finished connections. A source is an IPv4 address or an IPv6 /64, since one IPv6 host is given a whole /64. A TCP socket that sends no byte within 2 s is closed, and QUIC answers an address it has not validated with a Retry before any handshake, so neither a silent host nor a spoofed source can hold the slots a paired peer needs. Racing two transports in `select!` loses nothing.
 
 ### Requests, not a message stream
 
@@ -53,7 +53,7 @@ Response = { id: RequestId, body: ResponseBody }
 
 A slow answer then never holds up another, which per-request streams give for free on QUIC and the multiplexer gives on TCP. `budget_ms` is the time the caller will still wait, and the caller's own deadline fires whatever the peer does. Past the budget the callee answers `Fault::Deadline`, which the caller sees as `RpcError::Deadline`, the same as its own timer. A read stops there. A per-job request does not: it can write ledger records, so it runs to its end in its own task and only the answer races the budget. The caller treats a deadline as an unknown outcome and asks again, with `MoveStatus` for a move. A chunk fetch is bounded by time without progress instead, so a slow link that keeps moving is never cut.
 
-Callers and services see one typed method per request (`Session::job`, `want_snapshot`, `want_chunks`, `ping`; `Service::job`, `manifest`, `chunk`), so neither side can pair a request with an answer of the wrong kind. Each service method answers with a `Fault` when it cannot serve, so a store that fails to read a chunk says `Internal`, never `UnknownChunk`. `Hello` and `Ping` are answered by the rpc layer and never reach a service. A session builds its own `Hello` from the local node id and software version and reads the clock as it sends it.
+Callers and services see one typed method per request, per-job requests included: `Session::pull`, `append`, `move_request`, `offer`, `move_status`, `move_abort`, `want_snapshot`, `want_chunks` and `ping`, and the same per-job methods plus `manifest` and `chunk` on `Service`. Each per-job request has its own answer type inside `Fenced<T>`, which adds the two epoch verdicts every per-job request can get. On the wire the answers stay one flat `JobResponse`; the rpc layer maps each typed answer onto it and back, and a caller refuses an answer of a kind its request does not take as `UnexpectedResponse`. So neither side can pair a request with an answer of the wrong kind. `Session::offer` takes the `MoveOffer` and the epoch and builds the token from the offer's job, so the two cannot name different jobs. Each service method answers with a `Fault` when it cannot serve, so a store that fails to read a chunk says `Internal`, never `UnknownChunk`. `Hello` and `Ping` are answered by the rpc layer and never reach a service. A session builds its own `Hello` from the local node id and software version and reads the clock as it sends it. A serving session gives a peer 30 s to send a whole request on a stream it opened, so a request that stops halfway gives its stream back.
 
 ### The message set
 
@@ -65,25 +65,38 @@ JobRequest   = Pull { after } | Append { records: RecordPage } | MoveRequest
              | MoveOffer(OfferBody) | MoveStatus { move_id } | MoveAbort { move_id }
 ResponseBody = Hello(Hello) | Pong | Job(JobResponse)
              | ManifestChunks { len, ids } | Chunk { id, zstd } | ChunksDone | Fault(Fault)
-JobResponse  = Records { records: RecordPage, more } | Accepted { head } | Rejected { head }
+JobResponse  = Records(Pulled) | Accepted { head } | Rejected { head }
              | StaleEpoch { yours, current } | AheadOfUs { yours, current }
              | MoveStarted { move_id } | MoveDecision { record: RecordBytes } | MoveUndecided { move_id }
              | SnapshotIncomplete { snapshot }
+Pulled       = UpToDate | Last(RecordPage) | More(RecordPage)
 Hello        = { node, protocol_version, fabric_version, clock_ms }
 OfferBody    = { move_id, head, snapshot }
 ```
 
+The typed answers above the wire, each inside `Fenced<T> = Answer(T) | StaleEpoch | AheadOfUs`:
+
+```text
+Pull        -> Pulled
+Append      -> Appended      = Accepted { head } | Rejected { head }
+MoveRequest -> MoveRequested = Started { move_id } | Rejected { head }
+MoveOffer   -> Offered       = Decided { record } | Rejected { head } | SnapshotIncomplete { snapshot }
+MoveStatus  -> MoveState     = Decided { record } | Undecided { move_id }
+MoveAbort   -> RecordBytes, the decision record
+```
+
 - `Hello` gains `protocol_version`; a mismatch ends the session at the handshake. Skew is the peer's clock against this node's when the hello arrives.
-- `Pull` and `Records` let a node fetch the records after its head. `AheadOfUs` is the mirror of `StaleEpoch`: the sender's epoch is newer, so the receiver must fetch first. `MoveStarted` and `SnapshotIncomplete` are the owner's and the target's answers in the ADR 0003 move.
+- `Pull` and `Records` let a node fetch the records after its head. `Pulled` says whether more records follow, and a page is never empty, so a page with more after it always has a last record to pull after, and an `Append` always carries a record. `AheadOfUs` is the mirror of `StaleEpoch`: the sender's epoch is newer, so the receiver must fetch first. `MoveStarted` and `SnapshotIncomplete` are the owner's and the target's answers in the ADR 0003 move.
 - `OfferBody` is a `MoveOffer` without its job id. The fencing token carries the job id, so the id has one home on the wire and a message cannot name one job in its token and another in its offer. The receiver rebuilds the `MoveOffer` from the token.
 - `Fault` says a request was understood and could not be served: unknown job, snapshot or chunk, budget spent, bad request, internal failure.
 - A `ChunkBatch` names 1 to 256 distinct ids; a repeated id is refused at decode, so the missing set stays exact.
 
 ### Every bound is parsed, and the largest message fits its frame
 
-- A `RecordBytes` is 1 to `MAX_RECORD_LEN` (1 MiB) bytes, the bound of ADR 0002. Records travel in a `RecordPage`, whose cost, each record's length plus 3 bytes for its length prefix, is at most `MAX_RECORD_PAGE`: one record of the largest size, or many small ones. A sender fills a page until it refuses the next record, and `Records` says whether more follow, so a long ledger crosses the wire in pieces.
+- A `RecordBytes` is 1 to `MAX_RECORD_LEN` (1 MiB) bytes, the bound of ADR 0002. Records travel in a `RecordPage` of at least one record, whose cost, each record's length plus 3 bytes for its length prefix, is at most `MAX_RECORD_PAGE`: one record of the largest size, or many small ones. A sender fills a page until it refuses the next record, and `Records` says whether more follow, so a long ledger crosses the wire in pieces.
 - The control frame cap is `MAX_RECORD_PAGE` plus 1 KiB for the envelope, 1 MiB and 1,027 bytes in all, not ADR 0005's 1 MiB: a record may be as long as the ledger allows, so the cap has to hold it with its envelope. A test encodes the largest `Append` and `Records` and checks both fit.
-- `ManifestChunks` holds a length of 1 to `MAX_MANIFEST_LEN` (64 MiB, ADR 0004) and a chunk count that length allows, at least one per 8 MiB and at most one per byte. Both are checked when the message is decoded, before any chunk is fetched.
+- `ManifestChunks` holds a length of 1 to `MAX_MANIFEST_LEN` (64 MiB, ADR 0004) and a chunk count that length allows, at least one per 8 MiB and at most one per byte. The count is also at most `MAX_MANIFEST_CHUNKS`, the ids that fit one control frame beside the envelope, 32,768, so a manifest cut into chunks of 2 KiB on average still fits and the server never fails to write the answer. All of it is checked when the message is built and decoded, before any chunk is fetched.
+- The 8 MiB chunk bound is `MAX_CHUNK_LEN` in `fabric_core::snapshot`, next to `MAX_MANIFEST_LEN`. The store cuts objects to it and the network checks arriving chunks against it, so the two cannot drift apart.
 
 ### Chunks travel as stored
 
@@ -103,7 +116,9 @@ Each frame is `u32 stream id | u8 kind | u32 length | payload`, little endian. A
 - `Credit` hands the peer more credit on one stream, a `u32` byte count.
 - `KeepAlive` names no stream and says the sender is alive.
 
-The dialer opens odd ids and the acceptor even ids. A stream takes its id when its first frame is queued, under one lock, so each side's ids reach the wire in rising order: a peer id above every one seen so far is a new stream, and any other id without an open stream is closed and its frames are dropped. A peer may hold 100 streams open, quinn's default; one more is reset, and this side waits in `open` rather than go over the peer's limit.
+The dialer opens odd ids and the acceptor even ids. A stream takes its id when its first frame is queued, under one lock, so each side's ids reach the wire in rising order: a peer id above every one seen so far is a new stream, and any other id without an open stream is closed and its frames are dropped. A peer may hold 100 streams open, quinn's default; one more is refused with a `Reset` and a `Fin`, so its opener's writer fails and its reader sees the end. This side waits in `open` rather than go over the peer's limit, and a stream it opened queues its `Fin` before its slot is free, so the peer always sees the old stream end before the next one starts.
+
+The connection's reader waits on nothing but the wire. The frames it sends itself, a `Reset` or a refusal, go through a control queue that the writer drains before the data queue, and the reader queues them without waiting. A full control queue means the peer makes this side reset streams while it reads nothing, and ends the connection. So two peers whose writers both wait on a full wire still read, and both drain.
 
 Each direction of a stream has its own credit, as each QUIC stream has its own window. A sender starts with 1 MiB and spends it on `Data`; the receiver buffers exactly that much and returns credit each time its reader has taken 256 KiB. The connection's reader never waits on one stream, so a stream nobody reads stops only its own sender, and a caller may read its streams one after the other on either wire. A peer that sends past its credit, or grants more than a buffer holds, ends the connection.
 
@@ -123,8 +138,9 @@ ADR 0005 says a pair records which side can dial. The peer book does not record 
 
 ### Trust details the code added
 
-- TLS session resumption is off on both sides. A resumed TLS 1.3 handshake restores the peer's certificate from the earlier session without asking the verifier, so a node unpaired since then would keep access.
-- The verifier reads only the peer book in memory, because it runs on the thread that drives the handshake and, for QUIC, every connection of the endpoint. The accept path re-reads the book file on a blocking thread before each handshake and again after it, so a pairing made by `fabric node pair` in another process counts at the next handshake, and an unpair made during a handshake still holds.
+- TLS session resumption is off on both sides. A resumed TLS 1.3 handshake restores the peer's certificate from the earlier session without asking the verifier, so a node unpaired since then would get back in.
+- The verifier reads only the peer book in memory, because it runs on the thread that drives the handshake and, for QUIC, every connection of the endpoint. The accept path re-reads the book file on a blocking thread before each handshake and again after it, so a pairing made by `fabric node pair` in another process counts at the next handshake, and an unpair made during a handshake still holds. A re-read parses the file again whenever its bytes changed. A length or a modified time can stay the same across an edit made in place; the bytes cannot.
+- An unpair ends live connections too. `Session::serve` checks the decision before each request and re-reads it every 5 s, and closes the connection of a peer that is no longer paired. Keep-alives would otherwise hold an unpaired node's connection open for as long as it likes.
 - A book file that cannot be read or does not parse pairs no one until it does. A hand edit that revokes a node and slips in a typo never leaves that node trusted. A book line holds at most 8 distinct addresses and a node appears on one line only, the same bounds the code keeps when it writes.
 - A dial whose peer signed the handshake with a key its certificate does not name is a forgery and fails at once. Any other refusal, such as another node answering at a stale address, moves on to the next address. On one address the endpoint never tries the other wire after a refusal: the node there is the same on both.
 
