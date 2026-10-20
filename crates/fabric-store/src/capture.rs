@@ -957,35 +957,33 @@ impl GitCapture<'_> {
         let all = format!("{}{excludes}", self.user_excludes);
         fs::write(exclude_file.path(), all).map_err(|e| io_err(exclude_file.path(), e))?;
         let env: [(&str, &OsStr); 1] = [("GIT_INDEX_FILE", index.path().as_os_str())];
-        {
-            self.git.run_env(&["read-tree", index_tree], &env)?;
-            let excludes_flag = format!("core.excludesFile={}", exclude_file.path().display());
-            self.git
-                .run_env(&["-c", &excludes_flag, "add", "-A", "--"], &env)?;
-            let mut removed = Vec::new();
-            let listing = self.git.run_env(&["ls-files", "-z"], &env)?;
-            for record in Git::records(&listing) {
-                let rel = rel_path(Git::text("index path", record)?)?;
-                if !tracked.contains(&rel) && leave_out(&rel) {
-                    removed.push(rel);
-                }
+        self.git.run_env(&["read-tree", index_tree], &env)?;
+        let excludes_flag = format!("core.excludesFile={}", exclude_file.path().display());
+        self.git
+            .run_env(&["-c", &excludes_flag, "add", "-A", "--"], &env)?;
+        let mut removed = Vec::new();
+        let listing = self.git.run_env(&["ls-files", "-z"], &env)?;
+        for record in Git::records(&listing) {
+            let rel = rel_path(Git::text("index path", record)?)?;
+            if !tracked.contains(&rel) && leave_out(&rel) {
+                removed.push(rel);
             }
-            if !removed.is_empty() {
-                let mut input = Vec::new();
-                for rel in &removed {
-                    input.extend_from_slice(rel.as_str().as_bytes());
-                    input.push(0);
-                }
-                self.git.run_stdin_env(
-                    &["update-index", "--force-remove", "-z", "--stdin"],
-                    &env,
-                    &input,
-                )?;
-            }
-            let tree = self.git.run_text_env(&["write-tree"], &env)?;
-            let commit = self.commit_tree(&tree, head, Some(index_commit), "fabric worktree")?;
-            Ok((commit, removed))
         }
+        if !removed.is_empty() {
+            let mut input = Vec::new();
+            for rel in &removed {
+                input.extend_from_slice(rel.as_str().as_bytes());
+                input.push(0);
+            }
+            self.git.run_stdin_env(
+                &["update-index", "--force-remove", "-z", "--stdin"],
+                &env,
+                &input,
+            )?;
+        }
+        let tree = self.git.run_text_env(&["write-tree"], &env)?;
+        let commit = self.commit_tree(&tree, head, Some(index_commit), "fabric worktree")?;
+        Ok((commit, removed))
     }
 
     fn snap_prefix(&self) -> String {

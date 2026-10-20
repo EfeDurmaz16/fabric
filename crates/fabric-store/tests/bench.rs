@@ -196,20 +196,7 @@ fn capture_and_restore_timings() {
     );
     let mut store = Store::create(&store_dir, ChunkParams::DEFAULT).unwrap();
 
-    for (label, parent) in [("first", None), ("second", Some(()))] {
-        let parent = match parent {
-            Some(()) => {
-                mutate_workspace(&root).unwrap();
-                store
-                    .catalog()
-                    .snapshots()
-                    .unwrap()
-                    .last()
-                    .map(|row| row.id)
-            }
-            None => None,
-        };
-        let m = snapshot(&mut store, &root, parent).unwrap();
+    let report = |label: &str, m: &Measured, store: &Store| {
         println!(
             "{label}: capture {:.2?} ({} files, {} MiB, bundle {:?}); publish {:.2?}; new objects {} ({} MiB on disk); manifest {} KiB; store {} MiB",
             m.captured_in,
@@ -223,7 +210,12 @@ fn capture_and_restore_timings() {
             dir_bytes(&store_dir).unwrap() >> 20
         );
         let (elapsed, files, bundles) =
-            restore_timed(&store, m.id, &dir.path().join(format!("restore-{label}"))).unwrap();
+            restore_timed(store, m.id, &dir.path().join(format!("restore-{label}"))).unwrap();
         println!("{label}: restore {elapsed:.2?} ({files} files, {bundles} bundles)");
-    }
+    };
+    let first = snapshot(&mut store, &root, None).unwrap();
+    report("first", &first, &store);
+    mutate_workspace(&root).unwrap();
+    let second = snapshot(&mut store, &root, Some(first.id)).unwrap();
+    report("second", &second, &store);
 }

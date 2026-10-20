@@ -884,6 +884,19 @@ fn harness_state_complete(
     }
 }
 
+/// The cache paths whose bytes are not written: rows not carried and rows `carry` turns down.
+fn skipped_caches(
+    manifest: &SnapshotManifest,
+    carry: &dyn Fn(&CacheEntry) -> bool,
+) -> Vec<RelPath> {
+    manifest
+        .caches
+        .iter()
+        .filter(|c| c.carry == CarryState::NotCarried || !carry(c))
+        .map(|c| c.path.clone())
+        .collect()
+}
+
 /// Materializes a snapshot into `req.target`.
 ///
 /// The rename of the workspace staging directory is the commit point. The
@@ -918,12 +931,7 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
     };
     checkpoint::reached("restore.after_git");
 
-    let skipped: Vec<RelPath> = manifest
-        .caches
-        .iter()
-        .filter(|c| c.carry == CarryState::NotCarried || !(req.carry)(c))
-        .map(|c| c.path.clone())
-        .collect();
+    let skipped = skipped_caches(&manifest, req.carry);
     let skip = |rel: &RelPath| skipped.iter().any(|root| rel.starts_with(root));
     write_entries(
         store,
@@ -993,12 +1001,7 @@ pub fn verify(
 ) -> Result<u64, RestoreError> {
     let manifest = store.manifest(snapshot)?;
     let writer = TreeWriter::open(root)?;
-    let skipped: Vec<RelPath> = manifest
-        .caches
-        .iter()
-        .filter(|c| c.carry == CarryState::NotCarried || !carry(c))
-        .map(|c| c.path.clone())
-        .collect();
+    let skipped = skipped_caches(&manifest, carry);
     let skip = |rel: &RelPath| skipped.iter().any(|root| rel.starts_with(root));
     let mut verified = verify_entries(store, &writer, &manifest.files, &skip, mode)?;
     if let Some(state) = &manifest.git {
