@@ -52,6 +52,29 @@ pub(crate) fn temp_path(dir: &Path) -> PathBuf {
     dir.join(format!("{}-{n}-{nanos}.tmp", std::process::id()))
 }
 
+/// A scratch file name that is removed, if it exists, when the guard drops.
+#[derive(Debug)]
+pub(crate) struct TempFile(PathBuf);
+
+impl TempFile {
+    /// Picks a fresh name in `dir`; nothing is created yet.
+    pub(crate) fn in_dir(dir: &Path) -> TempFile {
+        TempFile(temp_path(dir))
+    }
+
+    /// The file's path.
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        // A missing file is the normal case on an early error.
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 /// What `publish_noclobber` found at the final name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Published {

@@ -372,6 +372,13 @@ fn a_second_snapshot_carries_only_new_objects_and_restores_through_the_chain() {
         fs::read_to_string(target.join("build.log")).unwrap(),
         "precious ignored, changed\n"
     );
+    // Scratch files live in the store's tmp/ and are gone afterwards.
+    assert!(!root.join(".git/fabric-tmp").exists());
+    assert!(!target.join(".git/fabric-tmp").exists());
+    assert_eq!(
+        fs::read_dir(dir.path().join("store/tmp")).unwrap().count(),
+        0
+    );
 
     // s2's bundle excludes s1's refs, so s1 must outlive it.
     assert!(matches!(store.forget(s1), Err(StoreError::BaseInUse { base }) if base == s1));

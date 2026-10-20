@@ -23,7 +23,7 @@ use fabric_core::snapshot::{
 
 use crate::capture::symlink_escapes;
 use crate::checkpoint;
-use crate::durable;
+use crate::durable::{self, TempFile};
 use crate::git::{Git, GitError};
 use crate::objects::ObjectError;
 use crate::store::{Store, StoreError};
@@ -564,8 +564,6 @@ fn restore_git(
         git = git.with_full_fsync();
     }
     git.run(&["init", "-q"])?;
-    let scratch = git.git_path("fabric-tmp")?;
-    fs::create_dir_all(&scratch).map_err(|e| io_err(&scratch, e))?;
     if let Some(chunks) = &git_state.exclude {
         let path = git.git_path("info/exclude")?;
         if let Some(parent) = path.parent() {
@@ -603,12 +601,13 @@ fn restore_git(
         if state.bundle.is_empty() {
             continue;
         }
-        let path = durable::temp_path(&scratch);
+        let bundle = TempFile::in_dir(store.objects().tmp_dir());
+        let path = bundle.path();
         {
-            let mut file = fs::File::create(&path).map_err(|e| io_err(&path, e))?;
+            let mut file = fs::File::create(path).map_err(|e| io_err(path, e))?;
             for chunk in &state.bundle {
                 file.write_all(&store.objects().read(*chunk)?)
-                    .map_err(|e| io_err(&path, e))?;
+                    .map_err(|e| io_err(path, e))?;
             }
         }
         let path_text = path.to_string_lossy().into_owned();
@@ -620,7 +619,6 @@ fn restore_git(
             &path_text,
             "+refs/*:refs/*",
         ])?;
-        let _ = fs::remove_file(&path);
         report.bundles_fetched += 1;
     }
 
@@ -730,7 +728,6 @@ fn restore_git(
     }
     // Nonzero whenever a file differs from the index, which is expected here.
     let _ = git.output(&["update-index", "--refresh"], &[])?;
-    let _ = fs::remove_dir_all(&scratch);
     Ok(git)
 }
 

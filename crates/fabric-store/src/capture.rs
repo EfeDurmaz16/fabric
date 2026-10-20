@@ -2,8 +2,10 @@
 //!
 //! Invariant: capture reads the workspace and writes only objects into the
 //! store, two private commits and one ref under `refs/fabric/` into the
-//! repository. It never touches the real index, the working tree or the
-//! user's refs. A path or state that could not be restored faithfully fails
+//! repository, and deletes the job's older refs under `refs/fabric/`. Its
+//! scratch files (index copies, the bundle) live in the store's `tmp/`,
+//! which open and gc clear, never in the user's `.git`. It never touches
+//! the real index, the working tree or the user's refs. A path or state that could not be restored faithfully fails
 //! here, where the user can act, and a secret never becomes an object.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -23,7 +25,7 @@ use fabric_core::snapshot::{
     HarnessState, ManifestError, Mode, Platform, SnapshotManifest,
 };
 
-use crate::durable;
+use crate::durable::TempFile;
 use crate::git::{Git, GitError};
 use crate::objects::ObjectError;
 use crate::policy::{Class, IgnorePolicy, Markers};
@@ -496,10 +498,10 @@ impl Capturer<'_> {
         Ok((entries, cache_entries))
     }
 
-    /// Stores a file capture made, removes it and counts it in the report.
-    fn store_scratch_file(&mut self, path: &Path) -> Result<Vec<ChunkId>, CaptureError> {
-        let stored = self.store.objects().put_file(path)?;
-        let _ = fs::remove_file(path);
+    /// Stores a file capture made and counts it in the report; the file goes with the guard.
+    fn store_scratch_file(&mut self, file: TempFile) -> Result<Vec<ChunkId>, CaptureError> {
+        let stored = self.store.objects().put_file(file.path())?;
+        drop(file);
         self.report.new_objects += stored.new_objects;
         self.report.new_bytes += stored.new_bytes;
         self.report.bytes += stored.size;
@@ -675,7 +677,7 @@ impl GitCapture<'_> {
     fn index_commit(&self, head: Option<&GitOid>) -> Result<(GitOid, String), CaptureError> {
         let index = self.git.git_path("index")?;
         let lock = index.with_extension("lock");
-        let copy = durable::temp_path(&self.scratch);
+        let copy = TempFile::in_dir(&self.scratch);
         let mut tries = 0;
         loop {
             if lock.exists() {
@@ -688,17 +690,16 @@ impl GitCapture<'_> {
                 thread::sleep(Duration::from_millis(200));
                 continue;
             }
-            match fs::copy(&index, &copy) {
+            match fs::copy(&index, copy.path()) {
                 Ok(_) => break,
                 // No index yet: write-tree on a missing index file writes the empty tree.
                 Err(e) if e.kind() == io::ErrorKind::NotFound => break,
                 Err(e) => return Err(io_err(&index, e)),
             }
         }
-        let env: [(&str, &OsStr); 1] = [("GIT_INDEX_FILE", copy.as_os_str())];
+        let env: [(&str, &OsStr); 1] = [("GIT_INDEX_FILE", copy.path().as_os_str())];
         let tree = self.git.run_text_env(&["write-tree"], &env)?;
         let commit = self.commit_tree(&tree, head, None, "fabric index")?;
-        let _ = fs::remove_file(&copy);
         Ok((commit, tree))
     }
 
@@ -737,13 +738,13 @@ impl GitCapture<'_> {
         tracked: &BTreeSet<RelPath>,
         leave_out: &dyn Fn(&RelPath) -> bool,
     ) -> Result<(GitOid, Vec<RelPath>), CaptureError> {
-        let index = durable::temp_path(&self.scratch);
-        let exclude_file = durable::temp_path(&self.scratch);
-        fs::write(&exclude_file, excludes).map_err(|e| io_err(&exclude_file, e))?;
-        let env: [(&str, &OsStr); 1] = [("GIT_INDEX_FILE", index.as_os_str())];
-        let outcome = (|| {
+        let index = TempFile::in_dir(&self.scratch);
+        let exclude_file = TempFile::in_dir(&self.scratch);
+        fs::write(exclude_file.path(), excludes).map_err(|e| io_err(exclude_file.path(), e))?;
+        let env: [(&str, &OsStr); 1] = [("GIT_INDEX_FILE", index.path().as_os_str())];
+        {
             self.git.run_env(&["read-tree", index_tree], &env)?;
-            let excludes_flag = format!("core.excludesFile={}", exclude_file.display());
+            let excludes_flag = format!("core.excludesFile={}", exclude_file.path().display());
             self.git
                 .run_env(&["-c", &excludes_flag, "add", "-A", "--"], &env)?;
             let mut removed = Vec::new();
@@ -769,10 +770,7 @@ impl GitCapture<'_> {
             let tree = self.git.run_text_env(&["write-tree"], &env)?;
             let commit = self.commit_tree(&tree, head, Some(index_commit), "fabric worktree")?;
             Ok((commit, removed))
-        })();
-        let _ = fs::remove_file(&index);
-        let _ = fs::remove_file(&exclude_file);
-        outcome
+        }
     }
 
     fn snap_prefix(&self) -> String {
@@ -824,9 +822,9 @@ impl GitCapture<'_> {
         &self,
         tips: &[GitOid],
         chain_full: bool,
-    ) -> Result<(Option<PathBuf>, BundleKind), CaptureError> {
-        let path = durable::temp_path(&self.scratch);
-        let path_text = path.to_string_lossy().into_owned();
+    ) -> Result<(Option<TempFile>, BundleKind), CaptureError> {
+        let path = TempFile::in_dir(&self.scratch);
+        let path_text = path.path().to_string_lossy().into_owned();
         let incremental = !tips.is_empty() && !chain_full;
         if incremental {
             let mut args = vec!["bundle", "create", &path_text, "--all", "--not"];
@@ -977,7 +975,7 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
         req,
         report: CaptureReport::default(),
     };
-    let (git_state, found) = if let Some(gc) = detect_git(req)? {
+    let (git_state, found) = if let Some(gc) = detect_git(req, store.objects().tmp_dir())? {
         gc.refuse_bad_states()?;
         let state = capture_git(&mut capturer, &gc, parent_manifest.as_ref())?;
         (Some(state), gc.ignored(&mut capturer.report)?)
@@ -1018,7 +1016,10 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
 }
 
 /// Returns a git capture when the root is the top level of a repository.
-fn detect_git<'a>(req: &CaptureRequest<'a>) -> Result<Option<GitCapture<'a>>, CaptureError> {
+fn detect_git<'a>(
+    req: &CaptureRequest<'a>,
+    scratch: &Path,
+) -> Result<Option<GitCapture<'a>>, CaptureError> {
     let git = Git::new(req.root, req.created_at);
     let out = git.output(&["rev-parse", "--show-toplevel"], &[])?;
     if !out.status.success() {
@@ -1035,13 +1036,11 @@ fn detect_git<'a>(req: &CaptureRequest<'a>) -> Result<Option<GitCapture<'a>>, Ca
             toplevel,
         });
     }
-    let scratch = git.git_path("fabric-tmp")?;
-    fs::create_dir_all(&scratch).map_err(|e| io_err(&scratch, e))?;
     Ok(Some(GitCapture {
         git,
         root: req.root,
         job_id: req.job_id,
-        scratch,
+        scratch: scratch.to_owned(),
     }))
 }
 
@@ -1138,8 +1137,8 @@ fn capture_git(
     };
     let (bundle_path, kind) = gc.bundle(&tips, chain_full)?;
     let (bundle, bundle_base) = match (bundle_path, kind) {
-        (Some(path), BundleKind::Incremental) => (capturer.store_scratch_file(&path)?, parent_id),
-        (Some(path), _) => (capturer.store_scratch_file(&path)?, None),
+        (Some(file), BundleKind::Incremental) => (capturer.store_scratch_file(file)?, parent_id),
+        (Some(file), _) => (capturer.store_scratch_file(file)?, None),
         (None, _) => (Vec::new(), parent_id),
     };
     capturer.report.bundle = kind;

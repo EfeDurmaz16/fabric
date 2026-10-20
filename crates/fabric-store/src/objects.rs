@@ -175,6 +175,11 @@ impl ObjectStore {
         fs::create_dir_all(&self.tmp_dir).map_err(|e| io_err(&self.tmp_dir, e))
     }
 
+    /// Returns the staging directory, which only the lock holder writes and open and gc clear.
+    pub(crate) fn tmp_dir(&self) -> &Path {
+        &self.tmp_dir
+    }
+
     /// Returns the parameters the store was created with.
     #[must_use]
     pub fn params(&self) -> &ChunkParams {
