@@ -1,5 +1,5 @@
 //! Core types of Fabric: ids, the job ledger and its lease, the move
-//! protocol, snapshot manifests and the environment spec.
+//! protocol, snapshot manifests, the environment spec and the secret policy.
 //!
 //! This crate is pure. It does no IO, holds no clock and opens no socket.
 //! It depends on nothing else in the workspace and knows nothing about QUIC,
@@ -90,4 +90,5 @@ pub mod lease;
 pub mod ledger;
 pub mod moves;
 pub mod path;
+pub mod secret;
 pub mod snapshot;

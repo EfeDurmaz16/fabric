@@ -8,13 +8,13 @@ use std::path::{Path, PathBuf};
 
 use fabric_core::env::{EnvVarName, PinError, RunWhen, Tool, ToolName, ToolSource, ToolVersion};
 use fabric_core::path::{PathError, RelPath};
+use fabric_core::secret::Scope;
 use fabric_core::snapshot::CacheClass;
 use fabric_env::detect::{
     CacheOrigin, CachePath, Completion, DetectError, Detection, Ecosystem, ManagerChoice,
     ManagerSource, NodeManager, detect,
 };
 use fabric_env::overrides::OverrideError;
-use fabric_env::secret::Scope;
 use tempfile::TempDir;
 
 fn fixture(name: &str) -> PathBuf {

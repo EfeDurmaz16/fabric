@@ -4,8 +4,8 @@
 //! `.fabric/env.toml`, and builds an `EnvSpec`: tool pins, setup steps,
 //! environment variable names and cache paths. The materializer checks a
 //! restored workspace against that spec and runs setup steps only when a
-//! cache is missing or torn. The secret policy is the one list of path
-//! patterns that never leave a node; snapshot capture applies it too.
+//! cache is missing or torn. Detection never opens a file the job's secret
+//! policy (`fabric_core::secret`) denies.
 //!
 //! The crate never reads, stores or logs the value of an environment
 //! variable, never copies a credential and never runs a program through a
@@ -17,4 +17,3 @@
 pub mod detect;
 pub mod materialize;
 pub mod overrides;
-pub mod secret;

@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 
 use fabric_core::env::{SecretPattern, SecretPatternError};
 use fabric_core::path::RelPath;
-use fabric_env::secret::{
+use fabric_core::secret::{
     Scope, SecretPolicy, Stage, TrackedSecretChanged, TrackedSecrets, Tracking,
 };
 

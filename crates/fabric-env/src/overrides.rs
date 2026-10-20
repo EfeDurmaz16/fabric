@@ -44,7 +44,7 @@ use fabric_core::path::{PathError, RelPath};
 use fabric_core::snapshot::CacheClass;
 use toml::{Table, Value};
 
-use crate::secret::pattern_matches;
+use fabric_core::secret::pattern_matches;
 
 /// Where the override file lives, relative to the workspace root.
 pub const OVERRIDE_FILE: &str = ".fabric/env.toml";

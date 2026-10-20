@@ -48,7 +48,7 @@ use crate::overrides::{
     DeclaredCache, DeclaredEcosystem, EnvOverride, OVERRIDE_FILE, OverrideError,
     PackageManagerName, canonical_tool, line_and_column,
 };
-use crate::secret::{Scope, SecretPolicy};
+use fabric_core::secret::{Scope, SecretPolicy};
 
 /// The largest file detection reads; a bigger one is refused rather than loaded.
 const MAX_FILE_LEN: u64 = 4 << 20;

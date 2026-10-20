@@ -1,7 +1,7 @@
 [package]
 name = "fabric-env"
 version = "0.1.0"
-description = "Environment of a Fabric job: EnvSpec detection, the override file, the secret policy and materialization"
+description = "Environment of a Fabric job: EnvSpec detection, the override file and materialization"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

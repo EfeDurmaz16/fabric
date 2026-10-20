@@ -1,5 +1,5 @@
-//! The secret policy, shared by snapshot capture and the environment spec
-//! (ADR 0004, Ignored files by class; ADR 0007, Secrets).
+//! The secret policy: which paths never leave a node (ADR 0004, Ignored
+//! files by class; ADR 0007, Secrets).
 //!
 //! Invariant: a path that matches a secret pattern never leaves the node,
 //! and the pattern list can grow per job but never shrink. The built-in
@@ -23,8 +23,8 @@
 //! pattern is staged with consent or the capture stops; it is never left
 //! at its index version, which restore would write back over the user's edit.
 
-use fabric_core::env::SecretPattern;
-use fabric_core::path::RelPath;
+use crate::env::SecretPattern;
+use crate::path::RelPath;
 
 /// Patterns that apply everywhere, inside caches included.
 ///
@@ -285,7 +285,7 @@ fn changed_list(changed: &[Denied]) -> String {
 }
 
 /// Returns true when a job's `pattern` denies `path`, a relative path whose components are separated by `/`.
-pub(crate) fn pattern_matches(pattern: &SecretPattern, path: &str) -> bool {
+pub fn pattern_matches(pattern: &SecretPattern, path: &str) -> bool {
     let names: Vec<&str> = path.split('/').collect();
     path_matches(pattern.as_str(), &names, &[])
 }

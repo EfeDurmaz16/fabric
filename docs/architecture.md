@@ -25,11 +25,11 @@ Harnesses (Claude Code, Codex, anything that speaks the Agent Client Protocol) a
 
 ```text
 crates/
-  fabric-core      job, ledger, manifest, lease and move state machine, trait definitions
+  fabric-core      job, ledger, manifest, lease and move state machine, the secret policy, trait definitions
   fabric-store     objects, blob store, SQLite catalog, snapshot publish and restore, ignored-file classes
   fabric-net       node identity, Transport trait, QUIC and TCP+TLS, blob transfer, pairing
   fabric-harness   Harness trait, ACP adapter, Claude Code adapter, Codex adapter
-  fabric-env       EnvSpec detection, the .fabric/env.toml override file, the secret policy capture applies, materialization, carry keys, doctor facts
+  fabric-env       EnvSpec detection, the .fabric/env.toml override file, materialization, carry keys, doctor facts
   fabric-node      the long-running node process: owner of the store lock, blob server, move target
   fabric-cli       the `fabric` binary: job init, suspend, resume, job move, job steal, status, doctor, orphan export, node pair, node serve
 ```

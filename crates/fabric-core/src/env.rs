@@ -266,7 +266,7 @@ pub enum SecretPatternError {
 /// Refused: `\`, `[`, `]`, `?`, `!`, `#`, whitespace and NUL, because
 /// gitignore gives them meanings the matcher does not, and empty, `.`, `..`
 /// and `**` components. Checked once, at the boundary, including inside
-/// `Deserialize`. The matcher itself is `fabric_env::secret`.
+/// `Deserialize`. The matcher itself is `fabric_core::secret`.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct SecretPattern(String);
