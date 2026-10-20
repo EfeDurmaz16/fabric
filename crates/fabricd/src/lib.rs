@@ -11,10 +11,19 @@
 //! anything acts on it, so a `kill -9` at any point leaves state the next
 //! command finishes or refuses with the command that resolves it.
 
+pub mod clock;
+pub mod control;
 pub mod doctor;
 mod durable;
+pub mod error;
 pub mod facts;
+pub mod faults;
 pub mod harnesses;
+pub mod job;
 pub mod ledger_file;
 pub mod local;
+pub mod node;
+mod ops;
 pub mod paths;
+mod service;
+pub mod transfer;
