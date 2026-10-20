@@ -972,3 +972,38 @@ fn a_fifo_or_socket_is_left_behind_and_named() {
         vec![RelPath::parse("pipe").unwrap()]
     );
 }
+
+#[test]
+fn a_submodule_with_local_changes_is_refused_by_its_whole_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = dir.path().join("upstream");
+    fs::create_dir(&upstream).unwrap();
+    fs::write(upstream.join("lib.rs"), "one\n").unwrap();
+    let u = git(&upstream);
+    u.run(&["init", "-q", "-b", "main"]).unwrap();
+    u.run(&["add", "-A"]).unwrap();
+    u.run(&["commit", "-q", "-m", "lib"]).unwrap();
+
+    let root = dir.path().join("work");
+    fs::create_dir(&root).unwrap();
+    let g = git(&root);
+    g.run(&["init", "-q", "-b", "main"]).unwrap();
+    g.run(&[
+        "submodule",
+        "add",
+        "-q",
+        upstream.to_str().unwrap(),
+        "my lib",
+    ])
+    .unwrap();
+    g.run(&["commit", "-q", "-m", "with a submodule"]).unwrap();
+    fs::write(root.join("my lib/lib.rs"), "changed\n").unwrap();
+
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    assert!(
+        matches!(&err, CaptureError::GitSubmoduleDirty { path } if path == "my lib"),
+        "{err}"
+    );
+}

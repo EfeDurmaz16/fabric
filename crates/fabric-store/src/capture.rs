@@ -784,7 +784,8 @@ impl GitCapture<'_> {
             let _xy = fields.next();
             let sub = fields.next().unwrap_or("");
             if sub.starts_with('S') && sub[1..].chars().any(|c| c != '.') {
-                let path = text.rsplit(' ').next().unwrap_or("").to_owned();
+                // The path is the ninth field and, under -z, may hold spaces.
+                let path = text.splitn(9, ' ').nth(8).unwrap_or("").to_owned();
                 return Err(CaptureError::GitSubmoduleDirty { path });
             }
         }
