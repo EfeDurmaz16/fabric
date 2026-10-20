@@ -12,14 +12,8 @@ use fabric_store::store::Store;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
 
-fn small_params() -> ChunkParams {
-    ChunkParams {
-        whole_file_limit: 4096,
-        min_size: 64,
-        avg_size: 256,
-        max_size: 1024,
-        zstd_level: 3,
-    }
+fn small_params() -> Result<ChunkParams, ObjectError> {
+    ChunkParams::new(4096, 64, 256, 1024, 3)
 }
 
 fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
@@ -37,7 +31,7 @@ fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
 #[test]
 fn an_object_is_written_once_and_read_back_verified() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::create(dir.path(), small_params()).unwrap();
+    let store = Store::create(dir.path(), small_params().unwrap()).unwrap();
     let objects = store.objects();
     let first = objects.put(b"hello").unwrap();
     assert!(first.new);
@@ -55,7 +49,7 @@ fn an_object_is_written_once_and_read_back_verified() {
 #[test]
 fn a_corrupt_object_is_an_error_not_content() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::create(dir.path(), small_params()).unwrap();
+    let store = Store::create(dir.path(), small_params().unwrap()).unwrap();
     let objects = store.objects();
     let stored = objects.put(b"the right bytes").unwrap();
     let path = objects.object_path(stored.id);
@@ -80,7 +74,7 @@ fn a_corrupt_object_is_an_error_not_content() {
 #[test]
 fn a_large_file_is_chunked_the_same_from_disk_and_from_memory() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::create(dir.path(), small_params()).unwrap();
+    let store = Store::create(dir.path(), small_params().unwrap()).unwrap();
     let objects = store.objects();
     let bytes = pseudo_random(20_000, 42);
     let file = dir.path().join("big.bin");
@@ -109,7 +103,7 @@ fn a_large_file_is_chunked_the_same_from_disk_and_from_memory() {
 #[test]
 fn chunking_round_trips_and_is_deterministic() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::create(dir.path(), small_params()).unwrap();
+    let store = Store::create(dir.path(), small_params().unwrap()).unwrap();
     let objects = store.objects();
     let mut runner = TestRunner::new(Config {
         cases: 48,
@@ -136,26 +130,26 @@ fn chunking_round_trips_and_is_deterministic() {
 
 #[test]
 fn chunk_parameters_outside_the_chunker_rules_are_refused() {
-    let dir = tempfile::tempdir().unwrap();
-    let bad = ChunkParams {
-        avg_size: 8 << 20,
-        ..ChunkParams::DEFAULT
+    let mib = 1 << 20;
+    let refused = |(limit, min, avg, max, level): (u32, u32, u32, u32, i32), what: &str| {
+        let err = ChunkParams::new(limit, min, avg, max, level).unwrap_err();
+        assert!(err.to_string().contains(what), "{err}");
     };
-    let err = Store::create(dir.path(), bad).unwrap_err();
-    assert!(err.to_string().contains("avg_size"), "{err}");
-    let inverted = ChunkParams {
-        min_size: 2 << 20,
-        avg_size: 1 << 20,
-        ..ChunkParams::DEFAULT
-    };
-    assert!(inverted.validate().is_err());
-    assert!(ChunkParams::DEFAULT.validate().is_ok());
+    refused((8 * mib, mib, 8 * mib, 8 * mib, 3), "avg_size");
+    refused((8 * mib, 2 * mib, mib, 8 * mib, 3), "min <= avg <= max");
+    refused((16 * mib, mib, 4 * mib, 8 * mib, 3), "8 MiB");
+    refused((8 * mib, mib, 4 * mib, 16 * mib, 3), "8 MiB");
+    refused((8 * mib, mib, 4 * mib, 8 * mib, 0), "zstd_level");
+    assert_eq!(
+        ChunkParams::new(8 * mib, mib, 4 * mib, 8 * mib, 3).unwrap(),
+        ChunkParams::DEFAULT
+    );
 }
 
 #[test]
 fn a_path_that_is_not_a_regular_file_is_refused_unread() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::create(&dir.path().join("store"), small_params()).unwrap();
+    let store = Store::create(&dir.path().join("store"), small_params().unwrap()).unwrap();
     let objects = store.objects();
     let secret = dir.path().join("secret");
     fs::write(&secret, "do not read").unwrap();

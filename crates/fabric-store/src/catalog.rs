@@ -157,7 +157,6 @@ impl Catalog {
     /// after the schema commits, so a `catalog.sqlite` that exists is always
     /// complete and a kill during creation leaves nothing to clean by hand.
     pub(crate) fn create(path: &Path, params: &ChunkParams) -> Result<Catalog, CatalogError> {
-        params.validate().map_err(CatalogError::Params)?;
         let tmp = path.with_extension("sqlite.tmp");
         for suffix in ["", "-wal", "-shm", "-journal"] {
             let mut name = tmp.clone().into_os_string();
@@ -198,11 +197,11 @@ impl Catalog {
             [SCHEMA_VERSION],
         )?;
         let settings: [(&str, String); 5] = [
-            ("whole_file_limit", params.whole_file_limit.to_string()),
-            ("min_size", params.min_size.to_string()),
-            ("avg_size", params.avg_size.to_string()),
-            ("max_size", params.max_size.to_string()),
-            ("zstd_level", params.zstd_level.to_string()),
+            ("whole_file_limit", params.whole_file_limit().to_string()),
+            ("min_size", params.min_size().to_string()),
+            ("avg_size", params.avg_size().to_string()),
+            ("max_size", params.max_size().to_string()),
+            ("zstd_level", params.zstd_level().to_string()),
         ];
         for (key, value) in settings {
             tx.execute(
@@ -246,15 +245,14 @@ impl Catalog {
 
     /// Returns the chunking parameters recorded at creation.
     pub fn params(&self) -> Result<ChunkParams, CatalogError> {
-        let params = ChunkParams {
-            whole_file_limit: self.setting("whole_file_limit")?,
-            min_size: self.setting("min_size")?,
-            avg_size: self.setting("avg_size")?,
-            max_size: self.setting("max_size")?,
-            zstd_level: self.setting("zstd_level")?,
-        };
-        params.validate().map_err(CatalogError::Params)?;
-        Ok(params)
+        ChunkParams::new(
+            self.setting("whole_file_limit")?,
+            self.setting("min_size")?,
+            self.setting("avg_size")?,
+            self.setting("max_size")?,
+            self.setting("zstd_level")?,
+        )
+        .map_err(CatalogError::Params)
     }
 
     /// Maps a row; a negative length or time is an error, never 0.

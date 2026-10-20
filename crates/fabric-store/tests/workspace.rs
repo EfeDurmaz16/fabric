@@ -49,13 +49,7 @@ fn set_mtime(path: &Path, secs: u64, nanos: u32) -> Fallible {
 fn store_in(dir: &Path) -> Fallible<Store> {
     Ok(Store::create(
         &dir.join("store"),
-        ChunkParams {
-            whole_file_limit: 64 << 10,
-            min_size: 4 << 10,
-            avg_size: 16 << 10,
-            max_size: 64 << 10,
-            zstd_level: 3,
-        },
+        ChunkParams::new(64 << 10, 4 << 10, 16 << 10, 64 << 10, 3)?,
     )?)
 }
 

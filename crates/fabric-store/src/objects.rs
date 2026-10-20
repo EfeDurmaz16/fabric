@@ -60,23 +60,25 @@ fn io_err(path: &Path, source: io::Error) -> ObjectError {
     }
 }
 
+/// The largest object a store writes: the bulk frame bound of ADR 0005.
+pub const MAX_OBJECT_LEN: u32 = 8 << 20;
+
+const _: () = assert!(MAX_OBJECT_LEN as usize <= MAXIMUM_MAX);
+
 /// How files are cut into objects and how objects are compressed.
 ///
 /// A store records its parameters in the catalog when it is created and uses
 /// them for its whole life, so every node that writes the same bytes with the
-/// same parameters writes the same object ids.
+/// same parameters writes the same object ids. Only `new` builds a value, so
+/// every value keeps the chunker's rules and no object exceeds
+/// `MAX_OBJECT_LEN`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkParams {
-    /// A file of this many bytes or fewer is one object.
-    pub whole_file_limit: u64,
-    /// The smallest chunk `FastCDC` may cut above the limit.
-    pub min_size: u32,
-    /// The chunk size `FastCDC` aims for.
-    pub avg_size: u32,
-    /// The largest chunk `FastCDC` may cut.
-    pub max_size: u32,
-    /// The zstd level applied to every object.
-    pub zstd_level: i32,
+    whole_file_limit: u32,
+    min_size: u32,
+    avg_size: u32,
+    max_size: u32,
+    zstd_level: i32,
 }
 
 impl ChunkParams {
@@ -89,11 +91,19 @@ impl ChunkParams {
         zstd_level: 3,
     };
 
-    /// Checks the rules the chunker enforces, so that it never panics on them.
-    pub fn validate(&self) -> Result<(), ObjectError> {
-        let min = self.min_size as usize;
-        let avg = self.avg_size as usize;
-        let max = self.max_size as usize;
+    /// Checks the rules of the chunker and of the object bound, and builds the parameters.
+    ///
+    /// The chunker needs `64 <= min_size <= avg_size <= max_size` and an
+    /// average from 256 bytes to 4 MiB; `max_size` and `whole_file_limit`
+    /// may not exceed `MAX_OBJECT_LEN`, and the zstd level is 1 to 22.
+    pub fn new(
+        whole_file_limit: u32,
+        min_size: u32,
+        avg_size: u32,
+        max_size: u32,
+        zstd_level: i32,
+    ) -> Result<ChunkParams, ObjectError> {
+        let (min, avg, max) = (min_size as usize, avg_size as usize, max_size as usize);
         if min < MINIMUM_MIN {
             return Err(ObjectError::BadParams("min_size is below 64 bytes"));
         }
@@ -102,23 +112,56 @@ impl ChunkParams {
                 "avg_size is outside 256 bytes to 4 MiB",
             ));
         }
-        if max > MAXIMUM_MAX {
-            return Err(ObjectError::BadParams("max_size is above 16 MiB"));
-        }
         if !(min <= avg && avg <= max) {
             return Err(ObjectError::BadParams(
                 "sizes must satisfy min <= avg <= max",
             ));
         }
-        if !(1..=22).contains(&self.zstd_level) {
+        if max_size > MAX_OBJECT_LEN || whole_file_limit > MAX_OBJECT_LEN {
+            return Err(ObjectError::BadParams(
+                "max_size and whole_file_limit may not exceed 8 MiB",
+            ));
+        }
+        if !(1..=22).contains(&zstd_level) {
             return Err(ObjectError::BadParams("zstd_level is outside 1 to 22"));
         }
-        Ok(())
+        Ok(ChunkParams {
+            whole_file_limit,
+            min_size,
+            avg_size,
+            max_size,
+            zstd_level,
+        })
     }
 
-    /// The most bytes one object decompresses to under these parameters.
-    fn largest_object(&self) -> usize {
-        usize::try_from(self.whole_file_limit.max(u64::from(self.max_size))).unwrap_or(usize::MAX)
+    /// A file of this many bytes or fewer is one object.
+    #[must_use]
+    pub const fn whole_file_limit(&self) -> u32 {
+        self.whole_file_limit
+    }
+
+    /// The smallest chunk `FastCDC` may cut above the limit.
+    #[must_use]
+    pub const fn min_size(&self) -> u32 {
+        self.min_size
+    }
+
+    /// The chunk size `FastCDC` aims for.
+    #[must_use]
+    pub const fn avg_size(&self) -> u32 {
+        self.avg_size
+    }
+
+    /// The largest chunk `FastCDC` may cut.
+    #[must_use]
+    pub const fn max_size(&self) -> u32 {
+        self.max_size
+    }
+
+    /// The zstd level applied to every object.
+    #[must_use]
+    pub const fn zstd_level(&self) -> i32 {
+        self.zstd_level
     }
 }
 
@@ -257,7 +300,7 @@ impl ObjectStore {
             new_objects: 0,
             new_bytes: 0,
         };
-        if file.size <= self.params.whole_file_limit {
+        if file.size <= u64::from(self.params.whole_file_limit) {
             file.record(self.put(bytes)?);
             return Ok(file);
         }
@@ -296,10 +339,10 @@ impl ObjectStore {
         mut reader: impl Read,
         path: &Path,
     ) -> Result<StoredFile, ObjectError> {
-        let limit = self.params.whole_file_limit;
+        let limit = u64::from(self.params.whole_file_limit);
         let mut head = Vec::new();
         (&mut reader)
-            .take(limit.saturating_add(1))
+            .take(limit + 1)
             .read_to_end(&mut head)
             .map_err(|e| io_err(path, e))?;
         if head.len() as u64 <= limit {
@@ -336,7 +379,7 @@ impl ObjectStore {
             }
             Err(e) => return Err(io_err(&path, e)),
         };
-        let bound = self.params.largest_object();
+        let bound = MAX_OBJECT_LEN as usize;
         let capacity = match zstd::zstd_safe::get_frame_content_size(&compressed) {
             Ok(Some(n)) if usize::try_from(n).is_ok_and(|n| n <= bound) => {
                 usize::try_from(n).unwrap_or(bound)

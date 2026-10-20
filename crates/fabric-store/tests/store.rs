@@ -14,21 +14,15 @@ use fabric_core::snapshot::{
     Entry, EntryKind, GitHead, GitState, HarnessState, Mode, Platform, SnapshotManifest,
 };
 use fabric_store::catalog::CatalogError;
-use fabric_store::objects::ChunkParams;
+use fabric_store::objects::{ChunkParams, ObjectError};
 use fabric_store::store::{CheckDepth, Store, StoreError};
 
 type Fallible<T = ()> = Result<T, Box<dyn Error>>;
 
 const JOB: JobId = JobId::from_bytes([3; 16]);
 
-fn params() -> ChunkParams {
-    ChunkParams {
-        whole_file_limit: 4096,
-        min_size: 64,
-        avg_size: 256,
-        max_size: 1024,
-        zstd_level: 3,
-    }
+fn params() -> Result<ChunkParams, ObjectError> {
+    ChunkParams::new(4096, 64, 256, 1024, 3)
 }
 
 fn file_entry(store: &Store, path: &str, content: &[u8]) -> Fallible<Entry> {
@@ -75,7 +69,7 @@ fn manifest(files: Vec<Entry>, created_at: u64) -> Fallible<SnapshotManifest> {
 #[test]
 fn publish_is_idempotent_and_the_manifest_reads_back() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = Store::create(dir.path(), params()).unwrap();
+    let mut store = Store::create(dir.path(), params().unwrap()).unwrap();
     let m = manifest(
         vec![
             file_entry(&store, "a.txt", b"alpha").unwrap(),
@@ -99,7 +93,7 @@ fn publish_is_idempotent_and_the_manifest_reads_back() {
 #[test]
 fn publish_refuses_a_manifest_that_names_a_missing_object() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = Store::create(dir.path(), params()).unwrap();
+    let mut store = Store::create(dir.path(), params().unwrap()).unwrap();
     let ghost = ChunkId::of(b"never written");
     let m = manifest(
         vec![Entry {
@@ -128,7 +122,7 @@ fn publish_refuses_a_manifest_that_names_a_missing_object() {
 #[test]
 fn publish_refuses_a_bundle_base_the_store_does_not_have() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = Store::create(dir.path(), params()).unwrap();
+    let mut store = Store::create(dir.path(), params().unwrap()).unwrap();
     let ghost = SnapshotId::of(b"never published");
     let oid = GitOid::parse(&"0".repeat(40)).unwrap();
     let mut m = manifest(vec![file_entry(&store, "a", b"a").unwrap()], 3).unwrap();
@@ -153,19 +147,19 @@ fn publish_refuses_a_bundle_base_the_store_does_not_have() {
 #[test]
 fn one_process_holds_a_store_and_a_foreign_schema_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::create(dir.path(), params()).unwrap();
+    let store = Store::create(dir.path(), params().unwrap()).unwrap();
     assert!(matches!(
         Store::open(dir.path()),
         Err(StoreError::Locked { .. })
     ));
     drop(store);
     assert!(matches!(
-        Store::create(dir.path(), params()),
+        Store::create(dir.path(), params().unwrap()),
         Err(StoreError::AlreadyAStore { .. })
     ));
     assert!(!dir.path().join("catalog.sqlite.tmp").exists());
     let reopened = Store::open(dir.path()).unwrap();
-    assert_eq!(*reopened.objects().params(), params());
+    assert_eq!(*reopened.objects().params(), params().unwrap());
     drop(reopened);
 
     let other = tempfile::tempdir().unwrap();
@@ -190,7 +184,7 @@ fn one_process_holds_a_store_and_a_foreign_schema_is_refused() {
 #[test]
 fn gc_keeps_shared_objects_and_removes_the_rest_after_the_grace() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = Store::create(dir.path(), params()).unwrap();
+    let mut store = Store::create(dir.path(), params().unwrap()).unwrap();
     let shared = file_entry(&store, "shared", b"both snapshots have me").unwrap();
     let only_a = file_entry(&store, "only-a", b"first only").unwrap();
     let a = store
@@ -236,7 +230,7 @@ fn gc_keeps_shared_objects_and_removes_the_rest_after_the_grace() {
 #[test]
 fn gc_sweeps_orphan_objects_and_staged_files_only_after_the_grace() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = Store::create(dir.path(), params()).unwrap();
+    let mut store = Store::create(dir.path(), params().unwrap()).unwrap();
     let orphan = store.objects().put(b"written but never published").unwrap();
     fs::write(dir.path().join("tmp/leftover.tmp"), b"half").unwrap();
 
@@ -255,7 +249,7 @@ fn gc_sweeps_orphan_objects_and_staged_files_only_after_the_grace() {
 #[test]
 fn check_sees_a_missing_object_and_a_corrupt_one() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = Store::create(dir.path(), params()).unwrap();
+    let mut store = Store::create(dir.path(), params().unwrap()).unwrap();
     let entry = file_entry(&store, "f", b"content under check").unwrap();
     let id = store
         .publish(&manifest(vec![entry.clone()], 1).unwrap())
@@ -283,7 +277,7 @@ fn check_sees_a_missing_object_and_a_corrupt_one() {
 #[test]
 fn check_sees_a_wrong_refcount_and_a_broken_chain() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = Store::create(dir.path(), params()).unwrap();
+    let mut store = Store::create(dir.path(), params().unwrap()).unwrap();
     let entry = file_entry(&store, "f", b"counted").unwrap();
     let id = store
         .publish(&manifest(vec![entry.clone()], 1).unwrap())
@@ -318,7 +312,7 @@ fn a_corrupt_object_left_without_a_row_is_removed_not_published() {
     let m;
     let data;
     {
-        let store = Store::create(dir.path(), params()).unwrap();
+        let store = Store::create(dir.path(), params().unwrap()).unwrap();
         let entry = file_entry(&store, "a.txt", b"left by a killed publish").unwrap();
         data = chunks_of(&entry).unwrap()[0];
         m = manifest(vec![entry], 7).unwrap();
