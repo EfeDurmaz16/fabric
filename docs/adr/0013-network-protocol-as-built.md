@@ -130,7 +130,7 @@ Three numbers version the protocol, each for one layer:
 
 - The ALPN `fabric/1` gates the transport: the handshake, and on TCP the multiplexer frame format. A change to either bumps it, and the handshake fails between versions.
 - `PROTOCOL_VERSION` in `Hello` gates the message vocabulary. A change to any request, response or bound bumps it, and two nodes on different versions refuse each other at `Hello` instead of misreading frames.
-- `FRAME_VERSION`, the byte after each frame's length, changes only if the length prefix format itself changes.
+- `FRAME_VERSION`, the byte after each frame's length, names the layout of what follows the length, and changes when that layout does. It cannot version the length prefix itself: a reader parses the length before it sees the byte. A new length format bumps the ALPN instead.
 
 ### Which side dials is not recorded yet
 

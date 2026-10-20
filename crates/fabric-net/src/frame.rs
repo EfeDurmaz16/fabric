@@ -13,7 +13,10 @@ use std::io;
 use fabric_core::snapshot::MAX_CHUNK_LEN;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// The frame format version this crate writes.
+/// The version of the frame layout after the length prefix, which this crate writes.
+///
+/// It cannot version the length prefix: a reader parses the length before
+/// it sees this byte, so a new length format needs a new ALPN.
 pub const FRAME_VERSION: u8 = 1;
 
 /// Room in a control frame for everything around its one long list, a page
