@@ -8,6 +8,13 @@
 //! the program paths and directories the plan resolved. Neither value can
 //! be copied, so one plan runs at most once.
 //!
+//! A `CachesMissing` step runs when what it fills is not whole: a detected
+//! install runs when its own cache is not, so a missing `target` never
+//! reinstalls a whole `node_modules`; `cargo fetch` runs when `target`,
+//! which a build makes from what it fetches, is not; and a step whose
+//! cache is outside the workspace, or that the user declared, runs when
+//! any cache is not whole or the report has none.
+//!
 //! A cache is healthy when it is a non-empty directory that holds the
 //! marker its installer writes last. The marker comes from the cache's
 //! ecosystem in the detection report, so `node_modules` needs the marker of
@@ -38,7 +45,7 @@ use fabric_core::harness::ProgramName;
 use fabric_core::path::RelPath;
 use tracing::Dispatch;
 
-use crate::detect::{CachePath, Detection};
+use crate::detect::{CachePath, Detection, StepScope};
 
 /// The `tracing` target that carries every line a setup step prints.
 pub const SETUP_LOG_TARGET: &str = "fabric_env::setup";
@@ -327,10 +334,19 @@ pub fn plan(detected: &Detection) -> Result<Plan, MaterializeError> {
         .collect::<Result<Vec<_>, MaterializeError>>()?;
     let any_unhealthy =
         caches.is_empty() || caches.iter().any(|c| c.health != CacheHealth::Healthy);
+    let unhealthy = |path: &RelPath| {
+        caches
+            .iter()
+            .any(|c| &c.path == path && c.health != CacheHealth::Healthy)
+    };
 
     let mut steps = Vec::new();
-    for (index, step) in spec.setup.iter().enumerate() {
-        if step.when == RunWhen::CachesMissing && !any_unhealthy {
+    for (index, (step, scope)) in spec.setup.iter().zip(detected.step_scopes()).enumerate() {
+        let needed = match scope {
+            StepScope::Fills(path) | StepScope::Warms(path) => unhealthy(path),
+            StepScope::Outside | StepScope::Declared => any_unhealthy,
+        };
+        if step.when == RunWhen::CachesMissing && !needed {
             continue;
         }
         steps.push(PlannedStep {

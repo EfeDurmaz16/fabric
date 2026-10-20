@@ -385,6 +385,24 @@ impl CachePath {
     }
 }
 
+/// What a setup step fills, which decides when a `CachesMissing` step runs.
+///
+/// This lives in the detection report, not in the spec: the report is
+/// rebuilt from the same files on every node, and linking a step to its
+/// cache in the spec would change the spec format for something every
+/// node can derive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepScope {
+    /// Fills this cache in the workspace; runs when that cache is not whole.
+    Fills(RelPath),
+    /// Fills a per-node cache outside the workspace that a build turns into this cache; runs when this cache is not whole.
+    Warms(RelPath),
+    /// Fills a per-node cache outside the workspace and nothing in it; runs when any cache is not whole, or when there is none.
+    Outside,
+    /// Declared by the user, who did not say what it fills; runs when any cache is not whole, or when there is none.
+    Declared,
+}
+
 /// A version pin found in one file, kept as written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pin {
@@ -407,6 +425,7 @@ pub struct Pin {
 pub struct Detection {
     root: PathBuf,
     spec: EnvSpec,
+    step_scopes: Vec<StepScope>,
     caches: Vec<CachePath>,
     pins: Vec<Pin>,
     node_manager: Option<ManagerChoice>,
@@ -423,6 +442,11 @@ impl Detection {
     /// Returns the spec: one pin per tool, the setup steps, the variable names and the cache paths.
     pub fn spec(&self) -> &EnvSpec {
         &self.spec
+    }
+
+    /// Returns what each setup step fills, one per step of the spec and in the same order.
+    pub fn step_scopes(&self) -> &[StepScope] {
+        &self.step_scopes
     }
 
     /// Returns the spec's cache paths with their class and ecosystem, sorted by path.
@@ -476,9 +500,13 @@ pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, Dete
         (None, None) => None,
     };
     if let Some(choice) = node_manager {
-        setup.push(choice.manager.install_step()?);
+        let node_modules = rel("node_modules")?;
+        setup.push((
+            choice.manager.install_step()?,
+            StepScope::Fills(node_modules.clone()),
+        ));
         caches.push(CachePath {
-            path: rel("node_modules")?,
+            path: node_modules,
             class: CacheClass::Deps,
             ecosystem: Ecosystem::Node(choice.manager),
             origin: CacheOrigin::Detected,
@@ -487,15 +515,19 @@ pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, Dete
     detect_rust(root, &mut setup, &mut caches)?;
     detect_python(root, &mut setup, &mut caches)?;
     if exists(root, "go.mod")? {
-        setup.push(step("go", &["mod", "download"])?);
+        setup.push((step("go", &["mod", "download"])?, StepScope::Outside));
     }
 
     merge_declared_caches(&mut caches, &overrides.caches, node_manager)?;
     caches.sort_by(|a, b| a.path.cmp(&b.path));
 
     if let Some(declared) = &overrides.setup {
-        setup.clone_from(declared);
+        setup = declared
+            .iter()
+            .map(|step| (step.clone(), StepScope::Declared))
+            .collect();
     }
+    let (setup, step_scopes): (Vec<SetupStep>, Vec<StepScope>) = setup.into_iter().unzip();
 
     let secret_patterns = job_secret_patterns(previous, &overrides.secret_patterns);
     let mut secrets = SecretPolicy::default();
@@ -515,6 +547,7 @@ pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, Dete
     Ok(Detection {
         root: root.to_owned(),
         spec,
+        step_scopes,
         caches,
         pins,
         node_manager,
@@ -665,7 +698,7 @@ fn pin(tool: &str, version: &str, file: &'static str, entry: usize) -> Result<Pi
 
 fn detect_rust(
     root: &Path,
-    setup: &mut Vec<SetupStep>,
+    setup: &mut Vec<(SetupStep, StepScope)>,
     caches: &mut Vec<CachePath>,
 ) -> Result<(), DetectError> {
     if !exists(root, "Cargo.toml")? {
@@ -678,9 +711,13 @@ fn detect_rust(
     } else {
         &["fetch"]
     };
-    setup.push(step("cargo", args)?);
+    let target = rel("target")?;
+    // `cargo fetch` fills ~/.cargo, not `target`, but `target` is what a
+    // build makes from it: while `target` is whole the fetch has nothing
+    // to add, and a resume on a warm workspace runs no command.
+    setup.push((step("cargo", args)?, StepScope::Warms(target.clone())));
     caches.push(CachePath {
-        path: rel("target")?,
+        path: target,
         class: CacheClass::Build,
         ecosystem: Ecosystem::Rust,
         origin: CacheOrigin::Detected,
@@ -690,21 +727,26 @@ fn detect_rust(
 
 fn detect_python(
     root: &Path,
-    setup: &mut Vec<SetupStep>,
+    setup: &mut Vec<(SetupStep, StepScope)>,
     caches: &mut Vec<CachePath>,
 ) -> Result<(), DetectError> {
+    let venv = rel(".venv")?;
+    let fills = || StepScope::Fills(venv.clone());
     if exists(root, "uv.lock")? {
-        setup.push(step("uv", &["sync", "--frozen"])?);
+        setup.push((step("uv", &["sync", "--frozen"])?, fills()));
     } else if exists(root, "requirements.txt")? {
         // A bare `pip install` would write into whichever Python is first
         // on PATH; uv puts the packages in the workspace's own `.venv`.
-        setup.push(step("uv", &["venv", "--allow-existing"])?);
-        setup.push(step("uv", &["pip", "install", "-r", "requirements.txt"])?);
+        setup.push((step("uv", &["venv", "--allow-existing"])?, fills()));
+        setup.push((
+            step("uv", &["pip", "install", "-r", "requirements.txt"])?,
+            fills(),
+        ));
     } else {
         return Ok(());
     }
     caches.push(CachePath {
-        path: rel(".venv")?,
+        path: venv,
         class: CacheClass::Deps,
         ecosystem: Ecosystem::Python,
         origin: CacheOrigin::Detected,

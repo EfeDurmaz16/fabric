@@ -408,3 +408,29 @@ fn a_report_without_caches_runs_its_steps_on_every_resume() {
     planned.ready().unwrap().execute().unwrap();
     assert!(dir.path().join("ran").exists());
 }
+
+/// A missing `target` is a build away and says nothing about
+/// `node_modules`; reinstalling a whole carried tree because of it would
+/// throw away the carry on every resume. Only the fetch it gates runs.
+#[test]
+fn a_missing_target_does_not_reinstall_a_whole_node_modules() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        &[
+            ("package.json", PACKAGE_JSON),
+            ("package-lock.json", ""),
+            ("node_modules/.package-lock.json", "{}"),
+            ("Cargo.toml", ""),
+        ],
+    )
+    .unwrap();
+    let detected = detect(dir.path(), None).unwrap();
+    let planned = plan(&detected).unwrap();
+    let programs: Vec<&str> = planned
+        .steps()
+        .iter()
+        .map(|s| s.step().program.as_str())
+        .collect();
+    assert_eq!(programs, ["cargo"]);
+}
