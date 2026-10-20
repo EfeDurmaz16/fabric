@@ -497,8 +497,8 @@ fn a_declared_cache_inside_a_detected_one_is_refused() {
     ])
     .unwrap();
     match detect(dir.path(), None) {
-        Err(DetectError::NestedCache { declared, detected }) => {
-            assert_eq!(declared.as_str(), "node_modules/.cache");
+        Err(DetectError::NestedCache { index, detected }) => {
+            assert_eq!(index, 0);
             assert_eq!(detected.as_str(), "node_modules");
         }
         other => panic!("{other:?}"),
@@ -750,4 +750,18 @@ fn a_declared_ecosystem_cannot_override_a_detected_one() {
         detect(dir.path(), None),
         Err(DetectError::CacheEcosystemConflict { index: 0 })
     ));
+}
+
+/// A job that names a pin file as a secret keeps it out of the spec:
+/// detection does not open it.
+#[test]
+fn a_file_the_job_denies_is_not_read() {
+    let dir = workspace(&[
+        ("mise.toml", "[tools]\nnode = \"24\"\n"),
+        (".fabric/env.toml", "secret_patterns = [\"mise.toml\"]\n"),
+    ])
+    .unwrap();
+    let found = detect(dir.path(), None).unwrap();
+    assert!(found.pins().is_empty());
+    assert!(found.spec().tools.is_empty());
 }

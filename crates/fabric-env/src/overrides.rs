@@ -4,8 +4,10 @@
 //! Invariant: the file names things and never carries a value. An
 //! environment variable is a parsed name, a setup argument or tool pin
 //! shaped like a credential is refused, and no error from this module
-//! quotes text from the file: errors carry key paths, indexes and line
-//! numbers only, so a value the user wrote by mistake does not reach a
+//! quotes a value from the file: errors carry key paths, indexes and line
+//! numbers. The one text from the file an error may quote is an unknown
+//! key's name, and only when it is short, printable and not shaped like a
+//! credential, so a value the user wrote by mistake does not reach a
 //! terminal or a log.
 //!
 //! ```toml
@@ -137,11 +139,11 @@ pub enum OverrideError {
         /// Zero-based index in that step's `args`.
         arg: usize,
     },
-    /// Two `cache` entries name the same path.
-    #[error("cache path `{path}` is declared twice")]
+    /// Two `cache` entries name the same path, ignoring ASCII case.
+    #[error("`cache[{index}].path` repeats an earlier cache path")]
     DuplicateCache {
-        /// The repeated path.
-        path: RelPath,
+        /// Zero-based index of the later entry in `cache`.
+        index: usize,
     },
     /// A `cache` entry under `.fabric`, which holds Fabric's own files and is never a cache.
     #[error("`{key}` is under `.fabric`, which is never a cache")]
@@ -150,12 +152,14 @@ pub enum OverrideError {
         key: String,
     },
     /// A `cache` entry that lies inside, or contains, another declared cache.
-    #[error("cache path `{path}` nests with `{other}`; a cache may not contain another")]
+    #[error(
+        "`cache[{index}].path` nests with `cache[{other}].path`; a cache may not contain another"
+    )]
     NestedCache {
-        /// The path declared later.
-        path: RelPath,
-        /// The path it nests with.
-        other: RelPath,
+        /// Zero-based index of the later entry in `cache`.
+        index: usize,
+        /// Zero-based index of the entry it nests with.
+        other: usize,
     },
     /// A `[tools]` key that is not a tool name; the name itself is never quoted.
     #[error("the name of `tools[{index}]` {reason}")]
@@ -287,7 +291,11 @@ impl EnvOverride {
                 "tools" => parsed.tools = tools(value)?,
                 "cache" => parsed.caches = caches(value)?,
                 "setup" => parsed.setup = Some(steps(value)?),
-                _ => return Err(OverrideError::UnknownKey { key: key.clone() }),
+                _ => {
+                    return Err(OverrideError::UnknownKey {
+                        key: shown(key).to_owned(),
+                    });
+                }
             }
         }
         Ok(parsed)
@@ -443,7 +451,7 @@ fn caches(value: &Value) -> Result<Vec<DeclaredCache>, OverrideError> {
             }
         };
         if caches.iter().any(|c| c.path.eq_ignore_ascii_case(&path)) {
-            return Err(OverrideError::DuplicateCache { path });
+            return Err(OverrideError::DuplicateCache { index });
         }
         // A cache is dropped on a carry mismatch, so a path that holds
         // Fabric's own files or the user's work must not become one by accident.
@@ -455,14 +463,11 @@ fn caches(value: &Value) -> Result<Vec<DeclaredCache>, OverrideError> {
         {
             return Err(OverrideError::ReservedCache { key: path_key });
         }
-        if let Some(other) = caches.iter().find(|c| {
+        if let Some(other) = caches.iter().position(|c| {
             path.starts_with_ignore_ascii_case(&c.path)
                 || c.path.starts_with_ignore_ascii_case(&path)
         }) {
-            return Err(OverrideError::NestedCache {
-                path,
-                other: other.path.clone(),
-            });
+            return Err(OverrideError::NestedCache { index, other });
         }
         caches.push(DeclaredCache {
             path,
@@ -529,10 +534,23 @@ fn required<'a>(entry: &'a Table, name: &str, key: &str) -> Result<&'a Value, Ov
     })
 }
 
+/// Returns `key` when it is safe to quote in an error, or a placeholder.
+///
+/// A key the file wrote is quoted only when it is at most 64 printable
+/// ASCII characters with no space and not shaped like a credential, so a
+/// token typed where a key belongs never reaches a terminal or a log.
+fn shown(key: &str) -> &str {
+    if key.len() <= 64 && key.bytes().all(|b| b.is_ascii_graphic()) && !looks_like_credential(key) {
+        key
+    } else {
+        "<key not shown>"
+    }
+}
+
 fn reject_unknown(entry: &Table, at: &str, known: &[&str]) -> Result<(), OverrideError> {
     match entry.keys().find(|k| !known.contains(&k.as_str())) {
         Some(key) => Err(OverrideError::UnknownKey {
-            key: format!("{at}.{key}"),
+            key: format!("{at}.{}", shown(key)),
         }),
         None => Ok(()),
     }
@@ -627,6 +645,11 @@ when = "always"
             format!("[[cache]]\npath = \"x\"\nclass = \"{secret}\""),
             format!("tools = {{ node = [\"{secret}\"] }}"),
             format!("env = [\"{secret}"),
+            format!("\"{secret}\" = 1"),
+            format!("[[cache]]\npath = \"x\"\nclass = \"deps\"\n\"{secret}\" = 1"),
+            format!(
+                "[[cache]]\npath = \"{secret}\"\nclass = \"deps\"\n[[cache]]\npath = \"{secret}\"\nclass = \"deps\""
+            ),
         ];
         for text in cases {
             let err = EnvOverride::parse(&text).unwrap_err();
@@ -736,8 +759,8 @@ when = "always"
                 "[[cache]]\npath = \"{first}\"\nclass = \"build\"\n[[cache]]\npath = \"{second}\"\nclass = \"build\""
             );
             match EnvOverride::parse(&text) {
-                Err(OverrideError::NestedCache { path, other }) => {
-                    assert_eq!((path.as_str(), other.as_str()), (second, first));
+                Err(OverrideError::NestedCache { index, other }) => {
+                    assert_eq!((index, other), (1, 0), "{first} {second}");
                 }
                 other => panic!("{first} {second}: {other:?}"),
             }

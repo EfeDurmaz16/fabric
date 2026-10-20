@@ -4,7 +4,7 @@
 //! and nothing else. It reads regular files only: a symbolic link in that
 //! list is refused, because a link can point at a file the secret policy
 //! denies or at one outside the workspace, and either would break the next
-//! rule. It never opens a file the secret policy denies, never reads an
+//! rule. It never opens a file the job's secret policy denies, never reads an
 //! environment variable and never runs a program, so the same files give
 //! the same spec on every node, and the spec it returns has passed
 //! `EnvSpec::validate`. Every tool name and pin it keeps is short,
@@ -159,12 +159,12 @@ pub enum DetectError {
     },
     /// A declared cache path lies inside, or contains, a cache detection found.
     #[error(
-        "declared cache `{declared}` nests with detected cache `{detected}`; a cache may not contain another"
+        "`cache[{index}].path` nests with detected cache `{detected}`; a cache may not contain another"
     )]
     NestedCache {
-        /// The declared path.
-        declared: RelPath,
-        /// The detected path it nests with.
+        /// Zero-based index of the entry in `[[cache]]`.
+        index: usize,
+        /// The detected path it nests with, a name detection itself chose.
         detected: RelPath,
     },
     /// A `[[cache]]` entry without `ecosystem` in a workspace where more than one ecosystem was detected.
@@ -523,12 +523,23 @@ impl Detection {
 pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, DetectError> {
     let root = fs::canonicalize(root).map_err(|source| DetectError::Root { source })?;
     let root = root.as_path();
-    let overrides = match read_text(root, OVERRIDE_FILE)? {
+    let recorded = policy(previous.map_or(&[][..], |spec| spec.secret_patterns.as_slice()));
+    let first = Reader {
+        root,
+        secrets: &recorded,
+    };
+    let overrides = match first.text(OVERRIDE_FILE)? {
         Some(text) => EnvOverride::parse(&text)?,
         None => EnvOverride::default(),
     };
-    let package = read_package_json(root)?;
-    let pins = collect_pins(root, &overrides, package.as_ref())?;
+    let secret_patterns = job_secret_patterns(previous, &overrides.secret_patterns);
+    let secrets = policy(&secret_patterns);
+    let reader = Reader {
+        root,
+        secrets: &secrets,
+    };
+    let package = read_package_json(&reader)?;
+    let pins = collect_pins(&reader, &overrides, package.as_ref())?;
 
     let mut setup = Vec::new();
     let mut caches = Vec::new();
@@ -566,12 +577,6 @@ pub fn detect(root: &Path, previous: Option<&EnvSpec>) -> Result<Detection, Dete
             .collect();
     }
     let (setup, step_scopes): (Vec<SetupStep>, Vec<StepScope>) = setup.into_iter().unzip();
-
-    let secret_patterns = job_secret_patterns(previous, &overrides.secret_patterns);
-    let mut secrets = SecretPolicy::default();
-    for pattern in &secret_patterns {
-        secrets.widen(pattern.clone());
-    }
 
     let spec = EnvSpec {
         tools: chosen_tools(&pins),
@@ -623,7 +628,7 @@ fn merge_declared_caches(
                     || c.path.starts_with_ignore_ascii_case(&declared.path))
         }) {
             return Err(DetectError::NestedCache {
-                declared: declared.path.clone(),
+                index,
                 detected: found.path.clone(),
             });
         }
@@ -642,6 +647,15 @@ fn merge_declared_caches(
         });
     }
     Ok(())
+}
+
+/// Returns the built-in policy widened by `patterns`.
+fn policy(patterns: &[SecretPattern]) -> SecretPolicy {
+    let mut policy = SecretPolicy::default();
+    for pattern in patterns {
+        policy.widen(pattern.clone());
+    }
+    policy
 }
 
 /// Returns the job's secret patterns: every one its previous spec held, plus the override file's, sorted.
@@ -676,7 +690,7 @@ fn resolve_ecosystem(named: DeclaredEcosystem, node: Option<ManagerChoice>) -> O
 
 /// Collects every pin, highest precedence first.
 fn collect_pins(
-    root: &Path,
+    reader: &Reader<'_>,
     overrides: &EnvOverride,
     package: Option<&PackageJson>,
 ) -> Result<Vec<Pin>, DetectError> {
@@ -690,17 +704,17 @@ fn collect_pins(
             Ok(declared)
         })
         .collect::<Result<_, DetectError>>()?;
-    pins.extend(mise_pins(root)?);
-    pins.extend(tool_versions_pins(root)?);
-    pins.extend(rust_toolchain_pin(root)?);
+    pins.extend(mise_pins(reader)?);
+    pins.extend(tool_versions_pins(reader)?);
+    pins.extend(rust_toolchain_pin(reader)?);
     for (file, tool) in [
         (".node-version", "node"),
         (".nvmrc", "node"),
         (".python-version", "python"),
     ] {
-        pins.extend(first_line_pin(root, file, tool)?);
+        pins.extend(first_line_pin(reader, file, tool)?);
     }
-    pins.extend(go_mod_pin(root)?);
+    pins.extend(go_mod_pin(reader)?);
     if let Some(package) = package {
         let mut entry = 0;
         if let Some((name, version)) = &package.manager {
@@ -825,8 +839,8 @@ struct PackageJson {
     yarn_major: Option<u64>,
 }
 
-fn read_package_json(root: &Path) -> Result<Option<PackageJson>, DetectError> {
-    let Some(text) = read_text(root, "package.json")? else {
+fn read_package_json(reader: &Reader<'_>) -> Result<Option<PackageJson>, DetectError> {
+    let Some(text) = reader.text("package.json")? else {
         return Ok(None);
     };
     let value: serde_json::Value =
@@ -928,8 +942,8 @@ fn choose_node_manager(
 }
 
 /// Reads `[tools]` from `mise.toml`: a string, the first string of an array, or a table's `version`.
-fn mise_pins(root: &Path) -> Result<Vec<Pin>, DetectError> {
-    let Some(table) = read_toml(root, "mise.toml")? else {
+fn mise_pins(reader: &Reader<'_>) -> Result<Vec<Pin>, DetectError> {
+    let Some(table) = reader.toml("mise.toml")? else {
         return Ok(Vec::new());
     };
     let Some(tools) = table.get("tools").and_then(toml::Value::as_table) else {
@@ -955,8 +969,8 @@ fn mise_pins(root: &Path) -> Result<Vec<Pin>, DetectError> {
 }
 
 /// Reads `.tool-versions`: `<tool> <version> [<fallback>...]` per line, `#` starts a comment.
-fn tool_versions_pins(root: &Path) -> Result<Vec<Pin>, DetectError> {
-    let Some(text) = read_text(root, ".tool-versions")? else {
+fn tool_versions_pins(reader: &Reader<'_>) -> Result<Vec<Pin>, DetectError> {
+    let Some(text) = reader.text(".tool-versions")? else {
         return Ok(Vec::new());
     };
     text.lines()
@@ -971,8 +985,8 @@ fn tool_versions_pins(root: &Path) -> Result<Vec<Pin>, DetectError> {
 }
 
 /// Reads `toolchain.channel` from `rust-toolchain.toml`.
-fn rust_toolchain_pin(root: &Path) -> Result<Option<Pin>, DetectError> {
-    let Some(table) = read_toml(root, "rust-toolchain.toml")? else {
+fn rust_toolchain_pin(reader: &Reader<'_>) -> Result<Option<Pin>, DetectError> {
+    let Some(table) = reader.toml("rust-toolchain.toml")? else {
         return Ok(None);
     };
     table
@@ -984,8 +998,12 @@ fn rust_toolchain_pin(root: &Path) -> Result<Option<Pin>, DetectError> {
 }
 
 /// Reads the first line that is not empty and not a `#` comment.
-fn first_line_pin(root: &Path, file: &'static str, tool: &str) -> Result<Option<Pin>, DetectError> {
-    let Some(text) = read_text(root, file)? else {
+fn first_line_pin(
+    reader: &Reader<'_>,
+    file: &'static str,
+    tool: &str,
+) -> Result<Option<Pin>, DetectError> {
+    let Some(text) = reader.text(file)? else {
         return Ok(None);
     };
     text.lines()
@@ -996,8 +1014,8 @@ fn first_line_pin(root: &Path, file: &'static str, tool: &str) -> Result<Option<
 }
 
 /// Reads the `go` directive of `go.mod`.
-fn go_mod_pin(root: &Path) -> Result<Option<Pin>, DetectError> {
-    let Some(text) = read_text(root, "go.mod")? else {
+fn go_mod_pin(reader: &Reader<'_>) -> Result<Option<Pin>, DetectError> {
+    let Some(text) = reader.text("go.mod")? else {
         return Ok(None);
     };
     text.lines()
@@ -1115,12 +1133,65 @@ fn read_text(root: &Path, file: &'static str) -> Result<Option<String>, DetectEr
         .map_err(|_| DetectError::NotUtf8 { file })
 }
 
-fn read_toml(root: &Path, file: &'static str) -> Result<Option<Table>, DetectError> {
-    let Some(text) = read_text(root, file)? else {
-        return Ok(None);
-    };
-    text.parse::<Table>().map(Some).map_err(|err| {
-        let (line, column) = line_and_column(&text, err.span().map_or(0, |span| span.start));
-        DetectError::Toml { file, line, column }
-    })
+/// Reads the files of the fixed list, skipping any the secret policy denies.
+struct Reader<'a> {
+    root: &'a Path,
+    secrets: &'a SecretPolicy,
+}
+
+impl Reader<'_> {
+    /// Reads `file` as text, or `None` when it is absent or the secret policy denies it.
+    fn text(&self, file: &'static str) -> Result<Option<String>, DetectError> {
+        if let Some(pattern) = self.secrets.denies(&rel(file)?, Scope::Work) {
+            tracing::warn!(
+                file,
+                pattern,
+                "not read: the secret policy denies this file"
+            );
+            return Ok(None);
+        }
+        read_text(self.root, file)
+    }
+
+    /// Reads `file` as a TOML table, or `None` when it is absent or the secret policy denies it.
+    fn toml(&self, file: &'static str) -> Result<Option<Table>, DetectError> {
+        let Some(text) = self.text(file)? else {
+            return Ok(None);
+        };
+        text.parse::<Table>().map(Some).map_err(|err| {
+            let (line, column) = line_and_column(&text, err.span().map_or(0, |span| span.start));
+            DetectError::Toml { file, line, column }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Detection never opens a denied file; for the built-in list that holds
+    /// because no file it reads matches a built-in pattern, and a job
+    /// pattern that names one makes `Reader` skip it.
+    #[test]
+    fn no_file_detection_reads_is_a_builtin_secret() {
+        let files = [
+            OVERRIDE_FILE,
+            "package.json",
+            "mise.toml",
+            ".tool-versions",
+            "rust-toolchain.toml",
+            ".node-version",
+            ".nvmrc",
+            ".python-version",
+            "go.mod",
+        ];
+        let policy = SecretPolicy::default();
+        for file in files {
+            assert_eq!(
+                policy.denies(&RelPath::parse(file).unwrap(), Scope::Work),
+                None,
+                "{file}"
+            );
+        }
+    }
 }
