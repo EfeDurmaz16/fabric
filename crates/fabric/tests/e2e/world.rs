@@ -233,12 +233,28 @@ pub struct Node {
     pub id: String,
 }
 
-/// A port free for both UDP and TCP on loopback right now.
+/// The next port to try, below the range macOS and Linux hand out for
+/// ephemeral sockets, starting at a point that differs between test runs.
+static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// A port free for both UDP and TCP on loopback, and given to no other node
+/// of this test run.
+///
+/// Each port is handed out once, so a node killed and started again finds
+/// its port free: a port the system picked would be offered to the next
+/// node another test starts while this one is down.
 fn free_port() -> Fallible<u16> {
+    use std::sync::atomic::Ordering;
+    let base = 20_000 + u16::try_from(std::process::id() % 10_000)?;
+    let _ = NEXT_PORT.compare_exchange(0, base, Ordering::SeqCst, Ordering::SeqCst);
     loop {
-        let udp = std::net::UdpSocket::bind("127.0.0.1:0")?;
-        let port = udp.local_addr()?.port();
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+        let port = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
+        if port >= 32_000 {
+            return Err("no free port below the ephemeral range".into());
+        }
+        let udp = std::net::UdpSocket::bind(("127.0.0.1", port));
+        let tcp = std::net::TcpListener::bind(("127.0.0.1", port));
+        if udp.is_ok() && tcp.is_ok() {
             return Ok(port);
         }
     }
