@@ -467,7 +467,7 @@ async fn launch(
     plan: &RunPlan,
     prompt: Option<String>,
 ) -> Result<ExitCode> {
-    materialize(state, &plan.root)?;
+    let tree = materialize(state, &plan.root)?;
     let socket = state.socket();
     let env = environment();
     let resume = plan.session.clone();
@@ -517,6 +517,7 @@ async fn launch(
         },
     )
     .await;
+    drop(tree);
     match registered {
         Ok(Response::Done { lines }) => print_lines(&lines)?,
         Ok(Response::Failed { error, refusal, .. }) => {
@@ -591,17 +592,19 @@ async fn exited(
     })
 }
 
-/// Runs the setup steps a restored workspace needs on this node (ADR 0007), printing each.
+/// Runs the setup steps a restored workspace needs on this node (ADR 0007),
+/// printing each, and returns the tree lock it took.
 ///
-/// The tree lock is held from the plan to the last step, so a second
-/// `run` or `resume` of the same workspace refuses while an installer from
-/// this one still writes the tree.
-fn materialize(state: &StateDir, root: &Path) -> Result<()> {
+/// The caller holds the lock until the node has answered the harness's
+/// registration, so a second `run` or `resume` of the same workspace
+/// refuses with the lock's path from the setup steps until the first
+/// harness is recorded, and the node's own check refuses it after that.
+fn materialize(state: &StateDir, root: &Path) -> Result<TreeLock> {
     let lock = TreeLock::acquire(&state.tree_locks(), root)?;
     let detected = fabric_env::detect::detect(root, &[])?;
     let plan = fabric_env::materialize::plan(&detected, &lock, &NodeEnv::current())?;
     if plan.is_noop() {
-        return Ok(());
+        return Ok(lock);
     }
     let mut stdout = std::io::stdout().lock();
     for cache in plan.caches() {
@@ -614,7 +617,7 @@ fn materialize(state: &StateDir, root: &Path) -> Result<()> {
     }
     drop(stdout);
     plan.ready()?.execute(&lock)?;
-    Ok(())
+    Ok(lock)
 }
 
 /// Says where Claude's trust in `root` came from: nothing when its key
