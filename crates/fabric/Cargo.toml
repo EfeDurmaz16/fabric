@@ -1,0 +1,31 @@
+[package]
+name = "fabric"
+version = "0.1.0"
+description = "The fabric command: run the node, pair nodes, and make, run, suspend, move and resume jobs"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+fabric-core = { path = "../fabric-core" }
+fabric-env = { path = "../fabric-env" }
+fabric-harness = { path = "../fabric-harness" }
+fabric-net = { path = "../fabric-net" }
+fabricd = { path = "../fabricd" }
+rustix = { version = "1.1", features = ["process", "termios"] }
+tokio = { version = "1.54", features = ["macros", "process", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "fabric"
+path = "src/main.rs"
+
+[lints]
+workspace = true

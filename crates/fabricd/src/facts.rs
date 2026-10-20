@@ -255,10 +255,10 @@ async fn probe_command(
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .output();
-    let output = tokio::time::timeout(COMMAND_TIMEOUT, child)
-        .await
-        .ok()?
-        .ok()?;
+    tracing::debug!(program, ?args, "measuring");
+    let output = tokio::time::timeout(COMMAND_TIMEOUT, child).await;
+    tracing::debug!(program, ?args, done = output.is_ok(), "measured");
+    let output = output.ok()?.ok()?;
     match probe {
         Probe::ExitCode => Some(if output.status.success() { "yes" } else { "no" }.to_owned()),
         Probe::Output => {
