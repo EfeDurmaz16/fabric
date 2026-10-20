@@ -990,11 +990,14 @@ async fn a_launch_from_inside_a_claude_session_leaves_the_parent_markers_out() {
     let env: Vec<(EnvVarName, String)> = user
         .iter()
         .map(|(name, value)| (EnvVarName::parse(name).unwrap(), value.clone()))
-        .chain(
-            parent
-                .iter()
-                .map(|name| (EnvVarName::parse(name).unwrap(), "1".to_owned())),
-        )
+        .chain(parent.iter().map(|name| {
+            let value = if *name == "CLAUDE_CODE_ENTRYPOINT" {
+                "claude-desktop"
+            } else {
+                "1"
+            };
+            (EnvVarName::parse(name).unwrap(), value.to_owned())
+        }))
         .collect();
     let mut running = adapter
         .launch(

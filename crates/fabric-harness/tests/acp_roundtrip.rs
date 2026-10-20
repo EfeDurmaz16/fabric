@@ -260,7 +260,14 @@ async fn a_launched_agent_does_not_inherit_parent_session_markers() {
         ("FAKE_ENV_FILE", env_file_text.as_str()),
         ("ANTHROPIC_API_KEY", "user-key"),
     ];
-    extra.extend(parent.iter().map(|name| (*name, "1")));
+    extra.extend(parent.iter().map(|name| {
+        let value = if *name == "CLAUDE_CODE_ENTRYPOINT" {
+            "claude-desktop"
+        } else {
+            "1"
+        };
+        (*name, value)
+    }));
     let mut running = adapter
         .launch(
             &work,
