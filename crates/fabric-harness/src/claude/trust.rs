@@ -1,7 +1,7 @@
 //! Pre-seeding workspace trust in `~/.claude.json`.
 //!
 //! Invariant: the file is edited by read, modify, write to a temporary
-//! file and rename, only the one key `projects["<root>"].hasTrustDialogAccepted`
+//! file and rename that keeps its mode, only the one key `projects["<root>"].hasTrustDialogAccepted`
 //! changes, and the edit is refused while a `claude` process runs, because
 //! Claude rewrites the file itself and keeps its own backups (ADR 0006,
 //! Trust on the target; `permissions.md`, read 2026-10-19). A missing file
@@ -78,7 +78,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sets_only_the_trust_key_and_is_idempotent() {
+    fn sets_only_the_trust_key_keeps_the_mode_and_is_idempotent() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join(".claude.json");
         std::fs::write(
@@ -86,7 +88,13 @@ mod tests {
             r#"{"oauthAccount":{"emailAddress":"x"},"projects":{"/other":{"allowedTools":[]}}}"#,
         )
         .unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(preseed_file(&config, Path::new("/w")).unwrap());
+        assert_eq!(
+            std::fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the login file must stay private"
+        );
         let value: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
         assert_eq!(value["projects"]["/w"][TRUST_KEY], Value::Bool(true));
         assert_eq!(

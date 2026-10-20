@@ -7,7 +7,9 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fabric_core::path::RelPath;
 use tracing::warn;
@@ -88,17 +90,44 @@ pub fn rel_components(rel: &Path) -> Result<Vec<String>, HarnessError> {
         .collect()
 }
 
-/// Writes `bytes` to `path` through a temporary file and a rename.
+const TEMP_MARK: &str = ".fabric-tmp-";
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A temporary sibling of `dest`, unique per process and per call.
+fn temp_path(dest: &Path) -> PathBuf {
+    let parent = dest.parent().unwrap_or(Path::new("."));
+    let name = dest.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    parent.join(format!(
+        ".{name}{TEMP_MARK}{}-{}",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Writes `bytes` to `path` through a temporary sibling and a rename. The
+/// file gets the mode of the file it replaces, or 0600 when there is none,
+/// and the parent directory is fsynced after the rename so the rename
+/// survives a power cut.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), HarnessError> {
     let parent = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(parent).map_err(|e| HarnessError::io("create dir", parent, e))?;
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    let tmp = parent.join(format!(".{name}.fabric-tmp-{}", std::process::id()));
+    let tmp = temp_path(path);
     let result = (|| {
-        let mut file = fs::File::create(&tmp)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&tmp, path)
+        match fs::metadata(path) {
+            Ok(meta) => fs::set_permissions(&tmp, meta.permissions())?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        fs::rename(&tmp, path)?;
+        fs::File::open(parent)?.sync_all()
     })();
     if let Err(e) = result {
         let _ = fs::remove_file(&tmp);
@@ -289,6 +318,27 @@ pub fn rewrite_json_text(path: &Path, map: &PathMap) -> Result<Vec<u8>, HarnessE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn written_files_keep_the_mode_they_replace_and_default_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("fresh.jsonl");
+        place(&fresh, b"x\n").unwrap();
+        assert_eq!(mode(&fresh), 0o600);
+        let private = dir.path().join("private.jsonl");
+        fs::write(&private, b"x\n").unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
+        place(&private, b"x\ny\n").unwrap();
+        assert_eq!(mode(&private), 0o600);
+        let shared = dir.path().join("shared.json");
+        fs::write(&shared, b"x\n").unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o644)).unwrap();
+        write_atomic(&shared, b"x\ny\n").unwrap();
+        assert_eq!(mode(&shared), 0o644);
+    }
 
     #[test]
     fn a_line_cut_inside_a_two_byte_character_does_not_stop_capture() {
