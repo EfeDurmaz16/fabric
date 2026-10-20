@@ -100,12 +100,12 @@ pub enum WireError {
 }
 
 /// Encodes a message as postcard bytes.
-pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, WireError> {
+pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, WireError> {
     postcard::to_stdvec(value).map_err(WireError::Malformed)
 }
 
 /// Decodes exactly one message that occupies all of `bytes`.
-pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, WireError> {
+pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, WireError> {
     let (value, rest) = postcard::take_from_bytes::<T>(bytes).map_err(WireError::Malformed)?;
     if !rest.is_empty() {
         return Err(WireError::Trailing(rest.len()));
