@@ -150,12 +150,16 @@ pub struct CaptureReport {
     pub special_files: Vec<RelPath>,
     /// FIFOs, sockets and devices in the harness state directory, left behind.
     pub special_harness: Vec<RelPath>,
-    /// Nested repositories left behind, tracked submodules aside.
-    pub nested_repositories: Vec<String>,
+    /// Nested repositories, tracked submodules aside: in a repository the
+    /// whole nested tree stays behind, in a plain directory its files are
+    /// carried and only its `.git` stays behind.
+    pub nested_repositories: Vec<RelPath>,
+    /// Nested repositories in the harness state directory, whose `.git` stayed behind.
+    pub nested_harness: Vec<RelPath>,
     /// Config keys whose remote URL lost its userinfo.
-    pub stripped_userinfo: Vec<String>,
+    pub stripped_userinfo: Vec<GitConfigKey>,
     /// Repeated config keys where only the last value travels.
-    pub repeated_config: Vec<String>,
+    pub repeated_config: Vec<GitConfigKey>,
     /// The bundle shape; none when the root is not a repository.
     pub bundle: Option<BundleKind>,
 }
@@ -403,15 +407,16 @@ fn open_listed(full: &Path, found: &Found) -> Result<File, CaptureError> {
 #[derive(Default)]
 struct Listing {
     found: Vec<Found>,
-    nested: Vec<String>,
+    nested: Vec<RelPath>,
     special: Vec<RelPath>,
 }
 
 /// Lists a directory tree, sorted by path, never following symlinks.
 ///
-/// A directory named `.git` in any letter case is a nested repository: it
-/// is skipped and its path is listed in `nested`. A FIFO, socket or device
-/// is skipped and listed in `special`.
+/// A directory named `.git` in any letter case is skipped, and the
+/// directory holding it is listed in `nested`; one at the base itself is
+/// the repository the base is, not content. A FIFO, socket or device is
+/// skipped and listed in `special`.
 fn list_tree(base: &Path) -> Result<Listing, CaptureError> {
     fn walk(base: &Path, prefix: &str, out: &mut Listing) -> Result<(), CaptureError> {
         let dir = base.join(prefix);
@@ -435,7 +440,9 @@ fn list_tree(base: &Path) -> Result<Listing, CaptureError> {
             let full = base.join(&text);
             let meta = fs::symlink_metadata(&full).map_err(|e| io_err(&full, e))?;
             if meta.is_dir() && name.eq_ignore_ascii_case(".git") {
-                out.nested.push(text);
+                if !prefix.is_empty() {
+                    out.nested.push(rel_path(prefix)?);
+                }
                 continue;
             }
             let rel = rel_path(&text)?;
@@ -636,7 +643,7 @@ impl Capturer<'_> {
     /// Claude Code keeps `.credentials.json` in its state directory on Linux.
     fn harness_entries(&mut self, base: &Path) -> Result<Vec<Entry>, CaptureError> {
         let listing = list_tree(base)?;
-        self.report.nested_repositories.extend(listing.nested);
+        self.report.nested_harness.extend(listing.nested);
         self.report.special_harness.extend(listing.special);
         let mut entries = Vec::with_capacity(listing.found.len());
         for item in &listing.found {
@@ -814,8 +821,8 @@ impl GitCapture<'_> {
         Ok(())
     }
 
-    /// Lists untracked, not ignored paths; an untracked nested repository is reported, not listed.
-    fn untracked(&self, report: &mut CaptureReport) -> Result<Vec<RelPath>, CaptureError> {
+    /// Lists untracked, not ignored paths, and apart from them the untracked nested repositories.
+    fn untracked(&self) -> Result<(Vec<RelPath>, Vec<RelPath>), CaptureError> {
         let out = self.git.run(&[
             "-c",
             &self.excludes_flag(),
@@ -825,15 +832,15 @@ impl GitCapture<'_> {
             "-z",
         ])?;
         let mut paths = Vec::new();
+        let mut nested = Vec::new();
         for record in Git::records(&out) {
             let text = Git::text("untracked path", record)?;
-            if let Some(dir) = text.strip_suffix('/') {
-                report.nested_repositories.push(dir.to_owned());
-                continue;
+            match text.strip_suffix('/') {
+                Some(dir) => nested.push(rel_path(dir)?),
+                None => paths.push(rel_path(text)?),
             }
-            paths.push(rel_path(text)?);
         }
-        Ok(paths)
+        Ok((paths, nested))
     }
 
     /// Lists tracked paths.
@@ -859,7 +866,7 @@ impl GitCapture<'_> {
         for record in Git::records(&listing) {
             let text = Git::text("ignored path", record)?;
             if let Some(dir) = text.strip_suffix('/') {
-                report.nested_repositories.push(dir.to_owned());
+                report.nested_repositories.push(rel_path(dir)?);
                 continue;
             }
             let rel = rel_path(text)?;
@@ -1231,13 +1238,13 @@ impl GitCapture<'_> {
                 && let Some(stripped) = strip_userinfo(&value)
             {
                 value = stripped;
-                report.stripped_userinfo.push(key.to_string());
+                report.stripped_userinfo.push(key.clone());
             }
             let Ok(value) = GitConfigValue::parse(&value) else {
                 continue;
             };
             if config.insert(key.clone(), value).is_some() {
-                report.repeated_config.push(key.to_string());
+                report.repeated_config.push(key.clone());
             }
         }
         Ok(config.into_iter().collect())
@@ -1401,7 +1408,11 @@ fn capture_git(
 ) -> Result<GitState, CaptureError> {
     let req = capturer.req;
     let policy = req.policy;
-    let untracked = gc.untracked(&mut capturer.report)?;
+    let (untracked, nested) = gc.untracked()?;
+    capturer
+        .report
+        .nested_repositories
+        .extend(nested.iter().cloned());
     let mut too_large = Vec::new();
     for rel in &untracked {
         if policy.denies_anywhere(rel) {
@@ -1423,12 +1434,6 @@ fn capture_git(
             capturer.report.tracked_secrets.push(rel.clone());
         }
     }
-    let nested: Vec<RelPath> = capturer
-        .report
-        .nested_repositories
-        .iter()
-        .map(|dir| rel_path(dir))
-        .collect::<Result<_, _>>()?;
 
     let head_commit = gc.head_commit()?;
     let (index_commit, index_tree) = gc.index_commit(head_commit.as_ref())?;

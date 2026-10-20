@@ -10,6 +10,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
+use fabric_core::git::GitConfigKey;
 use fabric_core::id::{JobId, NodeId, SnapshotId};
 use fabric_core::path::RelPath;
 use fabric_core::snapshot::{
@@ -204,7 +205,10 @@ fn git_state_survives_capture_and_restore() {
         report.denied_untracked,
         vec![RelPath::parse(".env").unwrap()]
     );
-    assert_eq!(report.stripped_userinfo, vec!["remote.origin.url"]);
+    assert_eq!(
+        report.stripped_userinfo,
+        vec![GitConfigKey::parse("remote.origin.url").unwrap()]
+    );
     assert!(report.tracked_secrets.is_empty());
     let state = manifest.git.as_ref().unwrap();
     assert_eq!(state.head, GitHead::Branch("main".parse().unwrap()));
@@ -528,7 +532,10 @@ fn an_untracked_nested_repository_is_left_behind_and_named() {
     let mut store = store_in(dir.path()).unwrap();
     let policy = IgnorePolicy::default();
     let Captured { manifest, report } = capture(&store, &request(&root, &policy, None)).unwrap();
-    assert_eq!(report.nested_repositories, vec!["nested".to_owned()]);
+    assert_eq!(
+        report.nested_repositories,
+        vec![RelPath::parse("nested").unwrap()]
+    );
     assert_eq!(
         report.denied_untracked,
         vec![RelPath::parse(".env").unwrap()]
