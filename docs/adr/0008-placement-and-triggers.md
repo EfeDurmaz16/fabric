@@ -53,7 +53,7 @@ The two-Mac gate is a push from the Pro to the Air (the Pro dials, the Air canno
 
 `--force` turns every Refuse above into a Warn except two rows: the login row, because a resume without a login fails inside the harness with a worse message, and the username and `HOME` row, because the root would not exist on the target (ADR 0011). The output lists every row with both values, and the job record stores the comparison with the move, so a later "why did this rebuild" has an answer.
 
-The measured facts of 2026-10-19 mean the first gate fixture must not depend on pnpm or on native Node modules: it is a small npm-installed, pure-JavaScript project, so that `node_modules` carries under ADR 0012 across Node 22 and Node 26, and `fabric doctor` must still report every mismatch above, because that is the report the owner will read before the first real job.
+The measured facts of 2026-10-19 mean the first gate fixture must not depend on pnpm or on native Node modules: it is a small npm-installed, pure-JavaScript project. ADR 0012 keys every `node_modules` on the Node major, pure JavaScript included, so across Node 22 and Node 26 the fixture takes the install path, and the same fixture proves the carry path once the Air runs Node 22 (ADR 0012, The first gate fixture). `fabric doctor` must still report every mismatch above, because that is the report the owner will read before the first real job.
 
 ### Triggers in this phase
 
