@@ -40,8 +40,11 @@ pub const MAX_MUX_PAYLOAD: usize = 64 << 10;
 /// How many bytes one logical stream buffers in each direction before the writer waits.
 pub const STREAM_BUFFER: usize = 1 << 20;
 
-/// How long a TLS handshake may take before the connection is dropped.
+/// How long an accepted connection may take to finish its TLS handshake.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a dial may take by default, TCP connect and TLS handshake together.
+pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 const HEADER_LEN: usize = 9;
 const KIND_DATA: u8 = 0;
@@ -53,6 +56,7 @@ pub struct TcpTlsTransport {
     listener: TcpListener,
     acceptor: TlsAcceptor,
     credentials: Arc<Credentials>,
+    dial_timeout: Duration,
 }
 
 impl std::fmt::Debug for TcpTlsTransport {
@@ -81,10 +85,30 @@ impl TcpTlsTransport {
             listener,
             acceptor,
             credentials,
+            dial_timeout: DIAL_TIMEOUT,
         })
     }
 
+    /// Sets how long a dial may take, TCP connect and TLS handshake together.
+    #[must_use]
+    pub fn with_dial_timeout(mut self, timeout: Duration) -> Self {
+        self.dial_timeout = timeout;
+        self
+    }
+
+    /// Dials within the dial timeout: an address that drops SYNs costs that
+    /// long, not the operating system's connect timeout of a minute or more.
     async fn dial(
+        &self,
+        peer: NodeId,
+        addr: SocketAddr,
+    ) -> Result<Box<dyn Connection>, TransportError> {
+        tokio::time::timeout(self.dial_timeout, self.connect_and_handshake(peer, addr))
+            .await
+            .map_err(|_| TransportError::Timeout(self.dial_timeout))?
+    }
+
+    async fn connect_and_handshake(
         &self,
         peer: NodeId,
         addr: SocketAddr,
@@ -99,9 +123,9 @@ impl TcpTlsTransport {
         let connector =
             TlsConnector::from(Arc::new(self.credentials.client_config(peer, &refusal)?));
         let name = ServerName::IpAddress(addr.ip().into());
-        let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, connector.connect(name, tcp))
+        let tls = connector
+            .connect(name, tcp)
             .await
-            .map_err(|_| TransportError::Timeout(HANDSHAKE_TIMEOUT))?
             .map_err(|err| refusal.take().map_or_else(|| handshake(&err), Into::into))?;
         let actual = peer_of(tls.get_ref().1.peer_certificates())?;
         if actual != peer {

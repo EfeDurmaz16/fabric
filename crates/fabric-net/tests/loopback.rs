@@ -525,6 +525,34 @@ async fn concurrent_streams_do_not_cross_under_backpressure() -> TestResult {
     Ok(())
 }
 
+/// An address that drops SYNs, such as a stale LAN address after the laptop
+/// changed networks, costs the dial timeout and not the operating system's
+/// connect timeout of a minute or more. 10.255.255.1 is routed nowhere on a
+/// typical host; where it is refused at once instead, the dial still ends
+/// within the budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dial_to_a_black_hole_ends_within_the_dial_timeout() -> TestResult {
+    let (a, b) = (Node::new()?, Node::new()?);
+    let trust: Arc<dyn Trust> = Arc::new(Paired(vec![b.id()]));
+    let budget = Duration::from_millis(300);
+    let client = TcpTlsTransport::bind(&a.identity, trust, ([127, 0, 0, 1], 0).into())?
+        .with_dial_timeout(budget);
+    let started = std::time::Instant::now();
+    let dialed = client
+        .connect(b.id(), ([10, 255, 255, 1], 7777).into())
+        .await;
+    assert!(
+        matches!(
+            dialed,
+            Err(TransportError::Timeout(d)) if d == budget
+        ) || matches!(dialed, Err(TransportError::Io(_))),
+        "{:?}",
+        dialed.err()
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn quic_is_dialed_first_and_tcp_is_the_fallback() -> TestResult {
     let (a, b) = (Node::new()?, Node::new()?);
