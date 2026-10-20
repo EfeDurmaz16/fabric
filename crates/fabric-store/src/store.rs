@@ -155,8 +155,9 @@ pub struct CheckReport {
     /// Snapshots whose bundle base is not in the catalog, with that base.
     pub broken_chains: Vec<(SnapshotId, SnapshotId)>,
     /// Snapshots whose objects are whole but whose manifest does not assemble
-    /// to its id and recorded length, does not decode, or names other data
-    /// objects than the catalog rows; checked at `Hashes` depth only.
+    /// to its id and recorded length, does not decode, names other data
+    /// objects than the catalog rows, or has another job, parent, bundle
+    /// base or creation time than its catalog row; checked at `Hashes` depth only.
     pub bad_manifests: Vec<SnapshotId>,
 }
 
@@ -519,15 +520,19 @@ impl Store {
                 }
             }
             let whole = report.missing.len() + report.corrupt.len() == damaged;
-            if depth == CheckDepth::Hashes && whole && !self.manifest_agrees(row.id)? {
+            if depth == CheckDepth::Hashes && whole && !self.manifest_agrees(&row)? {
                 report.bad_manifests.push(row.id);
             }
         }
         Ok(report)
     }
 
-    /// Says whether a snapshot's manifest assembles, decodes and names the data rows the catalog holds.
-    fn manifest_agrees(&self, id: SnapshotId) -> Result<bool, StoreError> {
+    /// Says whether a snapshot's manifest assembles, decodes, names the data rows the catalog holds and matches its row.
+    ///
+    /// `forget` and gc trust the row's bundle base; a row that lost it
+    /// would let the base of a live chain be forgotten.
+    fn manifest_agrees(&self, row: &SnapshotRow) -> Result<bool, StoreError> {
+        let id = row.id;
         let manifest = match self.manifest(id) {
             Ok(manifest) => manifest,
             Err(StoreError::ManifestMismatch(_) | StoreError::Manifest(_)) => return Ok(false),
@@ -539,6 +544,10 @@ impl Store {
             .iter()
             .map(|chunk| chunk.id)
             .collect();
-        Ok(rows == Self::data_chunks(&manifest))
+        let same_row = row.job_id == manifest.job_id
+            && row.parent == manifest.parent
+            && row.bundle_base == manifest.git.as_ref().and_then(|g| g.bundle_base)
+            && row.created_at == manifest.created_at;
+        Ok(same_row && rows == Self::data_chunks(&manifest))
     }
 }

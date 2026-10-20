@@ -385,6 +385,32 @@ fn check_at_hash_depth_sees_a_manifest_that_does_not_assemble() {
 }
 
 #[test]
+fn check_at_hash_depth_sees_a_row_that_disagrees_with_its_manifest() {
+    for column in ["created_at", "parent", "bundle_base"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::create(dir.path(), params().unwrap()).unwrap();
+        let entry = file_entry(&store, "f", b"row").unwrap();
+        let id = store.publish(&manifest(vec![entry], 1).unwrap()).unwrap();
+        drop(store);
+
+        let conn = rusqlite::Connection::open(dir.path().join("catalog.sqlite")).unwrap();
+        // A bundle base that names the snapshot itself exists, so no chain looks broken.
+        let sql = if column == "created_at" {
+            "UPDATE snapshots SET created_at = created_at + 1 WHERE id = ?1".to_owned()
+        } else {
+            format!("UPDATE snapshots SET {column} = ?1 WHERE id = ?1")
+        };
+        assert_eq!(conn.execute(&sql, [id.to_bytes()]).unwrap(), 1);
+        drop(conn);
+
+        let store = Store::open(dir.path()).unwrap();
+        let report = store.check(CheckDepth::Hashes).unwrap();
+        assert_eq!(report.bad_manifests, vec![id], "{column}");
+        assert!(report.broken_chains.is_empty(), "{column}");
+    }
+}
+
+#[test]
 fn check_at_hash_depth_sees_data_rows_the_manifest_does_not_name() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::create(dir.path(), params().unwrap()).unwrap();
