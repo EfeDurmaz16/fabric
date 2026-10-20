@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use fabric_core::git::{GitConfigKey, GitOid};
-use fabric_core::id::SnapshotId;
+use fabric_core::id::{ChunkId, SnapshotId};
 use fabric_core::path::{PathError, RelPath};
 use fabric_core::snapshot::{
     CacheEntry, CarryState, Entry, EntryKind, GitHead, GitState, Mode, SnapshotManifest,
@@ -68,13 +68,44 @@ pub struct RestoreRequest<'a> {
     pub carry: &'a dyn Fn(&CacheEntry) -> bool,
 }
 
-/// What restore wrote.
+/// Files and bytes written for one class of path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Written {
+    /// Regular files and symlinks.
+    pub files: u64,
+    /// The bytes of the regular files among them.
+    pub bytes: u64,
+}
+
+impl Written {
+    fn add(&mut self, bytes: u64) {
+        self.files += 1;
+        self.bytes += bytes;
+    }
+}
+
+impl std::ops::Add for Written {
+    type Output = Written;
+
+    fn add(self, other: Written) -> Written {
+        Written {
+            files: self.files + other.files,
+            bytes: self.bytes + other.bytes,
+        }
+    }
+}
+
+/// What restore wrote, by class of path.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RestoreReport {
-    /// Files and symlinks written from `files` and `harness_state`.
-    pub files: u64,
-    /// Their bytes.
-    pub bytes: u64,
+    /// Working-tree files the index holds: tracked files, staged or not.
+    pub tracked: Written,
+    /// Working-tree files the index does not hold.
+    pub untracked: Written,
+    /// Ignored files from `files`: precious files and the caches the target writes.
+    pub ignored: Written,
+    /// Harness state files.
+    pub harness: Written,
     /// Files and links re-read and found equal to the store or to the working-tree commit.
     pub verified: u64,
     /// Cache rows whose bytes were not written.
@@ -85,6 +116,14 @@ pub struct RestoreReport {
     pub escaping_symlinks: Vec<RelPath>,
     /// Bundles unpacked into the repository.
     pub bundles_fetched: u32,
+}
+
+impl RestoreReport {
+    /// Every file and byte written, whatever its class.
+    #[must_use]
+    pub fn total(&self) -> Written {
+        self.tracked + self.untracked + self.ignored + self.harness
+    }
 }
 
 /// What a target path holds, as far as a restore is concerned.
@@ -355,6 +394,7 @@ fn write_entries(
     entries: &[Entry],
     skip: &dyn Fn(&RelPath) -> bool,
     durability: Durability,
+    written_here: &mut Written,
     report: &mut RestoreReport,
 ) -> Result<(), RestoreError> {
     let kept: Vec<&Entry> = entries.iter().filter(|e| !skip(&e.rel_path)).collect();
@@ -388,9 +428,8 @@ fn write_entries(
             }
             drop(file);
             writer.set_mtime(&entry.rel_path, entry.mtime_ns)?;
-            report.files += 1;
-            report.bytes += written;
-            if report.files == 1 {
+            written_here.add(written);
+            if written_here.files == 1 {
                 checkpoint::reached("restore.after_first_file");
             }
         }
@@ -402,7 +441,7 @@ fn write_entries(
             if symlink_escapes(&entry.rel_path, target) {
                 report.escaping_symlinks.push(entry.rel_path.clone());
             }
-            report.files += 1;
+            written_here.add(0);
         }
     }
     for entry in kept.iter().rev() {
@@ -702,6 +741,58 @@ fn set_refs(git: &Git, git_state: &GitState) -> Result<(), RestoreError> {
     Ok(())
 }
 
+/// Writes `.git/info/exclude` from its objects.
+fn write_exclude(
+    store: &Store,
+    git: &Git,
+    chunks: &[ChunkId],
+    power_loss: bool,
+) -> Result<(), RestoreError> {
+    let path = git.git_path("info/exclude")?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+    }
+    let mut file = fs::File::create(&path).map_err(|e| io_err(&path, e))?;
+    for chunk in chunks {
+        file.write_all(&store.objects().read(*chunk)?)
+            .map_err(|e| io_err(&path, e))?;
+    }
+    if power_loss {
+        rustix::fs::fsync(&file).map_err(|e| io_err(&path, e.into()))?;
+    }
+    Ok(())
+}
+
+/// Counts the working-tree files restore writes: a path of `W` the index
+/// also holds is tracked, the rest is untracked work.
+struct WorkCounter {
+    indexed: BTreeSet<RelPath>,
+    tracked: Written,
+    untracked: Written,
+}
+
+impl WorkCounter {
+    fn new(git: &Git, index_commit: &GitOid) -> Result<WorkCounter, RestoreError> {
+        let listing = git.run(&["ls-tree", "-r", "-z", index_commit.as_str()])?;
+        Ok(WorkCounter {
+            indexed: parse_tree(&listing)?
+                .into_iter()
+                .map(|item| item.rel)
+                .collect(),
+            tracked: Written::default(),
+            untracked: Written::default(),
+        })
+    }
+
+    fn add(&mut self, rel: &RelPath, bytes: u64) {
+        if self.indexed.contains(rel) {
+            self.tracked.add(bytes);
+        } else {
+            self.untracked.add(bytes);
+        }
+    }
+}
+
 /// Restores the repository: objects, refs, `HEAD`, the index and the working tree.
 fn restore_git(
     store: &Store,
@@ -723,18 +814,7 @@ fn restore_git(
     }
     git.run(&["init", "-q"])?;
     if let Some(chunks) = &git_state.exclude {
-        let path = git.git_path("info/exclude")?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
-        }
-        let mut file = fs::File::create(&path).map_err(|e| io_err(&path, e))?;
-        for chunk in chunks {
-            file.write_all(&store.objects().read(*chunk)?)
-                .map_err(|e| io_err(&path, e))?;
-        }
-        if power_loss {
-            rustix::fs::fsync(&file).map_err(|e| io_err(&path, e.into()))?;
-        }
+        write_exclude(store, &git, chunks, power_loss)?;
     }
 
     unbundle_chain(store, snapshot, manifest, &git, report)?;
@@ -743,6 +823,7 @@ fn restore_git(
 
     let listing = git.run(&["ls-tree", "-r", "-z", git_state.worktree_commit.as_str()])?;
     let items = parse_tree(&listing)?;
+    let mut counted = WorkCounter::new(&git, &git_state.index_commit)?;
     let mtimes: HashMap<&RelPath, u64> = git_state
         .worktree_mtimes
         .iter()
@@ -797,6 +878,7 @@ fn restore_git(
                 if let Some(mtime) = mtimes.get(&item.rel) {
                     writer.set_mtime(&item.rel, *mtime)?;
                 }
+                counted.add(&item.rel, written);
             }
         }
         Ok(())
@@ -809,7 +891,10 @@ fn restore_git(
         if symlink_escapes(&item.rel, &target) {
             report.escaping_symlinks.push(item.rel.clone());
         }
+        counted.add(&item.rel, 0);
     }
+    report.tracked = counted.tracked;
+    report.untracked = counted.untracked;
     // Nonzero whenever a file differs from the index, which is expected here.
     let _ = git.output(&["update-index", "--refresh"], &[])?;
     Ok(git)
@@ -1054,14 +1139,17 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
 
     let skipped = skipped_caches(&manifest, req.carry);
     let skip = |rel: &RelPath| skipped.iter().any(|root| rel.starts_with(root));
+    let mut ignored = Written::default();
     write_entries(
         store,
         &writer,
         &manifest.files,
         &skip,
         req.durability,
+        &mut ignored,
         &mut report,
     )?;
+    report.ignored = ignored;
     report.skipped_caches.clone_from(&skipped);
     checkpoint::reached("restore.after_files");
     report.verified += verify_entries(store, &writer, &manifest.files, &skip, req.verify)?;
@@ -1075,14 +1163,17 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
             let hs_staging = fresh_staging(dir)?;
             let hs_writer = TreeWriter::open(&hs_staging)?;
             let keep_all = |_: &RelPath| false;
+            let mut harness = Written::default();
             write_entries(
                 store,
                 &hs_writer,
                 &manifest.harness_state.entries,
                 &keep_all,
                 req.durability,
+                &mut harness,
                 &mut report,
             )?;
+            report.harness = harness;
             report.verified += verify_entries(
                 store,
                 &hs_writer,
@@ -1111,7 +1202,7 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
     checkpoint::reached("restore.before_rename");
     move_into_place(&staging, req.target)?;
     checkpoint::reached("restore.after_rename");
-    tracing::info!(snapshot = %req.snapshot, target = %req.target.display(), files = report.files, "restored");
+    tracing::info!(snapshot = %req.snapshot, target = %req.target.display(), files = report.total().files, "restored");
     Ok(report)
 }
 

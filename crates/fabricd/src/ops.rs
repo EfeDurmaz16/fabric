@@ -31,7 +31,8 @@ use fabric_net::wire::{
 use fabric_store::capture::{CaptureRequest, capture};
 use fabric_store::policy::IgnorePolicy;
 use fabric_store::restore::{
-    Durability, RestoreRequest, RestoreState, Verify, restore, restore_state,
+    Durability, RestoreReport, RestoreRequest, RestoreState, Verify, Written, restore,
+    restore_state,
 };
 
 use crate::clock;
@@ -1619,15 +1620,8 @@ impl Node {
         let state_dir = job.dir().harness_state();
         if !(resuming && state == RestoreState::Present) {
             let harness_dir = has_harness_state.then(|| state_dir.clone());
-            self.write_snapshot(
-                snapshot,
-                &manifest.caches,
-                &root,
-                harness_dir,
-                path_var,
-                out,
-            )
-            .await?;
+            self.write_snapshot(snapshot, &manifest, &root, harness_dir, path_var, out)
+                .await?;
         }
         if has_harness_state {
             self.restore_harness(job, &root, path_var, out).await?;
@@ -1645,14 +1639,15 @@ impl Node {
     async fn write_snapshot(
         &self,
         snapshot: SnapshotId,
-        caches: &[fabric_core::snapshot::CacheEntry],
+        manifest: &fabric_core::snapshot::SnapshotManifest,
         root: &Path,
         harness_dir: Option<PathBuf>,
         path_var: &OsString,
         out: &mut Out,
     ) -> Result<(), NodeError> {
         let facts = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
-        report_caches(caches, &facts, out);
+        report_caches(&manifest.caches, &facts, out);
+        let has_git = manifest.git.is_some();
         let target = root.to_owned();
         let report = with_store(&self.store, move |store| {
             let carry = |entry: &fabric_core::snapshot::CacheEntry| {
@@ -1671,10 +1666,7 @@ impl Node {
             )?)
         })
         .await?;
-        out.say(format!(
-            "restored snapshot {snapshot}: {} files, {} bytes",
-            report.files, report.bytes
-        ));
+        out.say(restore_summary(snapshot, &report, has_git));
         Ok(())
     }
 
@@ -2005,6 +1997,35 @@ fn report_caches(caches: &[fabric_core::snapshot::CacheEntry], facts: &NodeFacts
             ));
         }
     }
+}
+
+/// `3 files, 54 bytes`.
+fn amount(written: Written) -> String {
+    format!(
+        "{} {}, {} {}",
+        written.files,
+        if written.files == 1 { "file" } else { "files" },
+        written.bytes,
+        if written.bytes == 1 { "byte" } else { "bytes" }
+    )
+}
+
+/// The one line that says what a restore wrote, in total and by class (gate finding F8).
+fn restore_summary(snapshot: SnapshotId, report: &RestoreReport, has_git: bool) -> String {
+    let mut parts = Vec::new();
+    if has_git {
+        parts.push(format!("tracked: {}", amount(report.tracked)));
+        parts.push(format!("untracked: {}", amount(report.untracked)));
+        parts.push(format!("ignored: {}", amount(report.ignored)));
+    } else {
+        parts.push(format!("workspace: {}", amount(report.ignored)));
+    }
+    parts.push(format!("harness state: {}", amount(report.harness)));
+    format!(
+        "restored snapshot {snapshot}: {} ({})",
+        amount(report.total()),
+        parts.join("; ")
+    )
 }
 
 fn no_parent(root: &Path) -> NodeError {
@@ -2421,6 +2442,42 @@ pub(crate) mod tests {
         assert!(
             matches!(refused, Err(NodeError::Forked { .. })),
             "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn the_restore_summary_counts_every_class() {
+        let report = RestoreReport {
+            tracked: Written {
+                files: 5,
+                bytes: 114,
+            },
+            untracked: Written {
+                files: 1,
+                bytes: 10,
+            },
+            ignored: Written {
+                files: 3,
+                bytes: 85,
+            },
+            harness: Written {
+                files: 2,
+                bytes: 771,
+            },
+            ..RestoreReport::default()
+        };
+        let snapshot = SnapshotId::from_bytes([7; 32]);
+        assert_eq!(
+            restore_summary(snapshot, &report, true),
+            format!(
+                "restored snapshot {snapshot}: 11 files, 980 bytes (tracked: 5 files, 114 bytes; untracked: 1 file, 10 bytes; ignored: 3 files, 85 bytes; harness state: 2 files, 771 bytes)"
+            )
+        );
+        assert_eq!(
+            restore_summary(snapshot, &RestoreReport::default(), false),
+            format!(
+                "restored snapshot {snapshot}: 0 files, 0 bytes (workspace: 0 files, 0 bytes; harness state: 0 files, 0 bytes)"
+            )
         );
     }
 

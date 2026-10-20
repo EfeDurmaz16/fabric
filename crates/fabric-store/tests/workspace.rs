@@ -24,8 +24,8 @@ use fabric_store::capture::{
 use fabric_store::objects::ChunkParams;
 use fabric_store::policy::{IgnorePolicy, PolicyError, SECRET_PATTERNS};
 use fabric_store::restore::{
-    Durability, RestoreError, RestoreReport, RestoreRequest, RestoreState, Verify, restore,
-    restore_state, verify,
+    Durability, RestoreError, RestoreReport, RestoreRequest, RestoreState, Verify, Written,
+    restore, restore_state, verify,
 };
 use fabric_store::store::{CheckDepth, Store, StoreError};
 use fabric_store::writer::WriteError;
@@ -186,6 +186,36 @@ fn git_difference(root: &Path, target: &Path) -> Fallible<Option<String>> {
         }
     }
     Ok(None)
+}
+
+/// Gate finding F8: the restore summary said "0 files, 0 bytes" over a
+/// workspace whose untracked notes it had written. Every file restore
+/// writes is counted once, in its class.
+#[test]
+fn restore_counts_every_file_it_writes_by_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    make_repo(&root).unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    assert_eq!(
+        manifest.left_behind,
+        vec![LeftBehind {
+            path: RelPath::parse(".env").unwrap(),
+            reason: LeaveReason::Secret,
+        }]
+    );
+    let snapshot = store.publish(&manifest).unwrap();
+    let restored = restore_into(&store, snapshot, &dir.path().join("restored")).unwrap();
+    // Seven of W's paths the index holds (a symlink counts as a file of no
+    // bytes), two it does not, and three ignored files.
+    let written = |files, bytes| Written { files, bytes };
+    assert_eq!(restored.tracked, written(7, 54));
+    assert_eq!(restored.untracked, written(2, 10));
+    assert_eq!(restored.ignored, written(3, 64));
+    assert_eq!(restored.harness, Written::default());
+    assert_eq!(restored.total(), written(12, 128));
 }
 
 #[test]
@@ -960,7 +990,7 @@ fn a_plain_directory_and_harness_state_round_trip_exactly() {
         },
     )
     .unwrap();
-    assert_eq!(report.files, 5);
+    assert_eq!(report.total().files, 5);
     assert_eq!(report.verified, 2);
     assert_eq!(listing(&target).unwrap(), listing(&root).unwrap());
     assert_eq!(listing(&state_target).unwrap(), listing(&state).unwrap());
@@ -1097,7 +1127,7 @@ fn a_cache_the_target_cannot_use_is_skipped_and_named() {
     );
     assert!(!target.join("node_modules").exists());
     assert!(target.join("build.log").exists());
-    assert_eq!(report.files, 1);
+    assert_eq!(report.ignored.files, 1);
     assert_eq!(status(&target).unwrap(), status(&root).unwrap());
 }
 
