@@ -13,10 +13,11 @@
 //! peer this side's reader is gone, so the peer's writer fails with
 //! `BrokenPipe` instead of sending into nothing, as QUIC's `STOP_SENDING`
 //! does. The peer may hold at most `MAX_STREAMS` streams open, as quinn
-//! allows by default; a stream above that is reset at once, and this side
-//! waits in `open` instead of going over the peer's limit. A frame payload
-//! above `MAX_MUX_PAYLOAD` ends the connection. So a peer can make this node
-//! hold at most `MAX_STREAMS` stream buffers and one frame.
+//! allows by default; a stream above that is refused at once with a `Reset`
+//! and a `Fin`, so both its directions end, and this side waits in `open`
+//! instead of going over the peer's limit. A frame payload above
+//! `MAX_MUX_PAYLOAD` ends the connection. So a peer can make this node hold
+//! at most `MAX_STREAMS` stream buffers and one frame.
 //!
 //! The connection's reader never waits on anything but the wire. The frames
 //! it sends itself, a `Reset` or a refusal, go through a control queue that
@@ -428,10 +429,20 @@ async fn send_rest(
             taken = poll_fn(|cx| source.poll_take(cx, MAX_MUX_PAYLOAD)) => taken.unwrap_or_default(),
         };
         if taken.is_empty() {
-            // The slot goes before the Fin, so a peer that saw the Fin
-            // never counts this stream against the cap.
-            shared.streams().outbound.remove(&id);
-            let _ = shared.out.send(Outgoing::bare(id, FrameKind::Fin)).await;
+            let finished = shared.streams().outbound.remove(&id);
+            let fin = Outgoing::bare(id, FrameKind::Fin);
+            if shared.side.opens(id) {
+                // The next `open` may take this slot once it is free, so the
+                // Fin is queued first: the peer sees this stream end before
+                // the next one starts, and never counts one over its cap.
+                let _ = shared.out.send(fin).await;
+                drop(finished);
+            } else {
+                // The peer opens its next stream once it sees the Fin, so
+                // the slot here is free before the Fin is queued.
+                drop(finished);
+                let _ = shared.out.send(fin).await;
+            }
             return;
         }
         // At most MAX_MUX_PAYLOAD, so it fits a u32.
@@ -595,7 +606,7 @@ async fn demux(
     }
 }
 
-/// Opens the stream the peer just started, or resets it when the peer is at the cap or nobody accepts.
+/// Opens the stream the peer just started, or refuses it when the peer is at the cap or nobody accepts.
 fn accept_stream(
     shared: &Arc<Shared>,
     id: u32,
@@ -608,7 +619,9 @@ fn accept_stream(
         alive.upgrade(),
     ) else {
         tracing::debug!(id, "refusing a peer stream over the cap");
-        return queue_control(shared, id, FrameKind::Reset);
+        // Both directions end: the peer's writer fails and its reader sees the end.
+        queue_control(shared, id, FrameKind::Reset)?;
+        return queue_control(shared, id, FrameKind::Fin);
     };
     let slot = Arc::new(Slot {
         _permit: permit,
@@ -833,9 +846,11 @@ mod tests {
         );
     }
 
-    /// A peer that opens more than `MAX_STREAMS` streams has the extra ones reset.
+    /// A peer that opens more than `MAX_STREAMS` streams has the extra ones
+    /// refused in both directions: reset, and finished, so the peer's reader
+    /// does not wait for an answer that never comes.
     #[tokio::test]
-    async fn a_peer_stream_over_the_cap_is_reset() {
+    async fn a_peer_stream_over_the_cap_is_refused_both_ways() {
         let (mux, mut raw) = acceptor_and_raw();
         let ids: Vec<u32> = (0..=u32::try_from(MAX_STREAMS).unwrap())
             .map(|n| 2 * n + 1)
@@ -850,6 +865,53 @@ mod tests {
         assert!(nothing_from_next(&mux).await);
         let over = *ids.last().unwrap();
         assert_eq!(raw.recv().await, (over, FrameKind::Reset, Vec::new()));
+        assert_eq!(raw.recv().await, (over, FrameKind::Fin, Vec::new()));
+    }
+
+    /// At the peer's cap, `open` waits for a stream to end instead of going
+    /// over the cap, and the stream it then opens is served, not refused.
+    #[tokio::test]
+    async fn an_open_at_the_cap_waits_for_a_stream_to_end_and_is_served() {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let dialer = Arc::new(Mux::spawn(a, Side::Dialer, node(), ADDR));
+        let acceptor = Mux::spawn(b, Side::Acceptor, node(), ADDR);
+        let mut opened = Vec::new();
+        for _ in 0..MAX_STREAMS {
+            let mut stream = dialer.open().await.unwrap();
+            stream.write_all(b"x").await.unwrap();
+            opened.push(stream);
+        }
+        let mut accepted = Vec::new();
+        for _ in 0..MAX_STREAMS {
+            accepted.push(acceptor.next().await.unwrap());
+        }
+        let waiting = {
+            let dialer = Arc::clone(&dialer);
+            tokio::spawn(async move {
+                let mut stream = dialer.open().await.unwrap();
+                stream.write_all(b"late").await.unwrap();
+                stream.shutdown().await.unwrap();
+                stream
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "open went over the peer's cap");
+
+        let mut first = opened.remove(0);
+        first.shutdown().await.unwrap();
+        drop((first, accepted.remove(0)));
+        let mut late = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("open never got the freed slot")
+            .unwrap();
+        let mut arrived = acceptor.next().await.unwrap();
+        let mut bytes = Vec::new();
+        arrived.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"late");
+        drop(arrived);
+        let mut answer = Vec::new();
+        late.read_to_end(&mut answer).await.unwrap();
+        assert!(answer.is_empty());
     }
 
     /// The reader never waits on the writer: with the writer stuck behind a
