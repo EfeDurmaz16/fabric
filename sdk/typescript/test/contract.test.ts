@@ -1,9 +1,9 @@
 // The TypeScript half of the client API's contract test: the same checks as
 // crates/fabric-client/tests/contract.rs on the same files in
 // protocol/fixtures. Every fixture parses and writes back to the same JSON,
-// every op, event kind and refusal reason has a fixture, the messages under
-// `invalid` are refused, and the messages under `tolerated` read as the
-// compatibility rule of ADR 0018 says.
+// every op, event kind, refusal reason and variant of every nested enum has
+// a fixture, the messages under `invalid` are refused, and the messages
+// under `tolerated` read as the compatibility rule of ADR 0018 says.
 
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
@@ -14,20 +14,35 @@ import {
   API_VERSION,
   Answer,
   createFrameDecoder,
+  Decision,
   decodeJson,
+  DoctorReport,
   encodeFrame,
   Event,
   EVENT_KINDS,
+  Harness,
   Hello,
   HelloAnswer,
+  LEDGER_EVENT_KINDS,
+  LedgerEvent,
+  Marker,
   OPS,
+  Outcome,
+  type PreflightRow,
+  Process,
   REASON_CODES,
   REASON_KIND,
   Refusal,
+  RefusalKind,
   Reply,
   Request,
   ROOT_CAPABILITIES,
+  Standing,
+  Step,
   tagsOf,
+  View,
+  Wire,
+  WorkspaceState,
 } from "../src/index.ts";
 
 const FIXTURES = fileURLToPath(new URL("../../../protocol/fixtures/", import.meta.url));
@@ -141,6 +156,170 @@ describe("the shared fixtures", () => {
     }
     expect([...seen].sort()).toStrictEqual([...REASON_CODES].sort());
     expect(REASON_CODES.length).toBe(Object.keys(REASON_KIND).length);
+  });
+
+  // ADR 0018 says the two clients cannot drift apart without a test failing. Ops, event kinds and refusal
+  // reasons each have a test above; this one holds every other enum a message carries, ledger records
+  // included, to a fixture for each variant, listed from the schemas' own options (review finding on PR #13).
+  test("every variant of every nested enum has a fixture", () => {
+    const seen = new Map<string, Set<string>>();
+    const mark = (name: string, variant: string): void => {
+      const variants = seen.get(name) ?? new Set<string>();
+      variants.add(variant);
+      seen.set(name, variants);
+    };
+    const harness = (value: Harness): void => mark("Harness", value.kind);
+    const rows = (values: readonly PreflightRow[]): void => {
+      for (const row of values) {
+        mark("Outcome", row.outcome);
+      }
+    };
+    const refusal = (value: Refusal): void => {
+      mark("RefusalKind", value.kind);
+      if (value.reason.code === "unfinished") {
+        mark("Step", value.reason.step);
+      }
+    };
+    const ledger = (value: LedgerEvent): void => {
+      mark("LedgerEvent", value.kind);
+      if (value.kind === "created" || value.kind === "resumed") {
+        harness(value.harness);
+      }
+    };
+    const event = (value: Event): void => {
+      switch (value.kind) {
+        case "preflight":
+          rows(value.rows);
+          break;
+        case "session_captured":
+        case "session_restored":
+        case "continuing_session":
+          harness(value.harness);
+          break;
+        case "new_session":
+          harness(value.harness);
+          if (value.previous !== undefined) {
+            harness(value.previous.harness);
+          }
+          break;
+        case "decision_left":
+          mark("Standing", value.standing);
+          break;
+        case "not_replicated":
+        case "no_answer":
+        case "move_unanswered":
+        case "holder_not_told":
+        case "owner_not_told":
+        case "not_caught_up":
+        case "left_as_it_was":
+          refusal(value.error);
+          break;
+        default:
+          break;
+      }
+    };
+    const reply = (value: Reply): void => {
+      switch (value.kind) {
+        case "node_ping":
+          mark("Wire", value.wire);
+          break;
+        case "job_list":
+          for (const job of value.jobs) {
+            mark("Standing", job.standing);
+          }
+          break;
+        case "job_status":
+          harness(value.harness);
+          mark("View", value.view.kind);
+          if (value.workspace !== undefined) {
+            mark("WorkspaceState", value.workspace.state.kind);
+            if (value.workspace.state.kind === "current") {
+              mark("Marker", value.workspace.state.marker.kind);
+            }
+          }
+          mark("Process", value.process.kind);
+          break;
+        case "job_log":
+          for (const record of value.records) {
+            ledger(record.event);
+          }
+          break;
+        case "doctor":
+          mark("DoctorReport", value.report.kind);
+          if (value.report.kind === "compared") {
+            rows(value.report.rows);
+          }
+          break;
+        case "job_new":
+        case "job_run":
+        case "job_resume":
+        case "harness_started":
+        case "harness_session":
+          harness(value.harness);
+          break;
+        default:
+          break;
+      }
+    };
+    for (const value of roundTrip("hello_answer", HelloAnswer)) {
+      mark("HelloAnswer", value.type);
+    }
+    for (const value of roundTrip("answer", Answer)) {
+      mark("Answer", value.type);
+      if (value.type === "event") {
+        event(value.event);
+      } else if (value.type === "done") {
+        reply(value.reply);
+      } else {
+        refusal(value.refusal);
+      }
+    }
+    for (const value of roundTrip("request", Request)) {
+      switch (value.op) {
+        case "job_new":
+        case "harness_started":
+        case "harness_session":
+          harness(value.harness);
+          break;
+        case "job_resume":
+          if (value.harness !== undefined) {
+            harness(value.harness);
+          }
+          break;
+        case "job_decide":
+          mark("Decision", value.decision);
+          break;
+        default:
+          break;
+      }
+    }
+    roundTrip("reply", Reply).forEach(reply);
+    roundTrip("event", Event).forEach(event);
+    roundTrip("refusal", Refusal).forEach(refusal);
+
+    const variants: Readonly<Record<string, readonly string[]>> = {
+      Answer: tagsOf("type", Answer.options),
+      Decision: Decision.options,
+      DoctorReport: tagsOf("kind", DoctorReport.options),
+      Harness: tagsOf("kind", Harness.options),
+      HelloAnswer: tagsOf("type", HelloAnswer.options),
+      LedgerEvent: LEDGER_EVENT_KINDS,
+      Marker: tagsOf("kind", Marker.options),
+      Outcome: Outcome.options,
+      Process: tagsOf("kind", Process.options),
+      RefusalKind: RefusalKind.options,
+      Standing: Standing.options,
+      Step: Step.options,
+      View: tagsOf("kind", View.options),
+      Wire: Wire.options,
+      WorkspaceState: tagsOf("kind", WorkspaceState.options),
+    };
+    expect([...seen.keys()].sort()).toStrictEqual(Object.keys(variants).sort());
+    for (const [name, known] of Object.entries(variants)) {
+      expect([...(seen.get(name) ?? [])].sort(), name).toStrictEqual([...known].sort());
+    }
+    // The ledger list the check runs on is the schema's own, so a new kind fails here until it has a fixture.
+    expect(LEDGER_EVENT_KINDS.length).toBe(LedgerEvent.out.options.length - 1);
   });
 
   test("every invalid message is refused at the boundary", () => {
