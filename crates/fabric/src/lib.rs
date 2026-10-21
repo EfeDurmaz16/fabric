@@ -517,7 +517,14 @@ async fn launch(
     .await;
     drop(tree);
     match registered {
-        Ok(Response::Done { lines }) => print_lines(&lines)?,
+        // The harness runs and is recorded, so nothing may end the
+        // supervision now: output that cannot be written, as when the
+        // reader of a pipe went away, is reported and the wait goes on.
+        Ok(Response::Done { lines }) => {
+            if let Err(e) = print_lines(&lines) {
+                tracing::warn!(error = %e, "the node's answer to the launch could not be printed");
+            }
+        }
         Ok(Response::Failed {
             lines,
             error,
