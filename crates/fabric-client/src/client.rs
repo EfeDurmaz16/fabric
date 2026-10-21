@@ -171,12 +171,16 @@ impl Client {
     }
 
     async fn connect(&self) -> Result<(UnixStream, Welcome), ClientError> {
-        if let Some(dir) = self.socket.parent() {
+        // A bare file name has the empty path as its parent, which does not
+        // exist and so would pass; the directory checked is the one the
+        // name resolves in, as the TypeScript SDK checks it.
+        let socket = std::path::absolute(&self.socket).map_err(FrameError::Io)?;
+        if let Some(dir) = socket.parent() {
             check_private(dir)?;
         }
-        check_private(&self.socket)?;
+        check_private(&socket)?;
         let mut stream =
-            UnixStream::connect(&self.socket)
+            UnixStream::connect(&socket)
                 .await
                 .map_err(|source| ClientError::NoDaemon {
                     path: self.socket.clone(),
