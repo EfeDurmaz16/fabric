@@ -1589,6 +1589,34 @@ mod tests {
         );
     }
 
+    /// A transcript whose `version` is not a version refuses the resume
+    /// before claude starts, rather than running it unguarded and without
+    /// its model.
+    #[tokio::test]
+    async fn a_transcript_whose_writer_cannot_be_read_is_refused() {
+        let fixture = Resume::new("2.1.294 (Claude Code)");
+        let transcript = std::fs::read_to_string(&fixture.transcript).unwrap();
+        let unreadable = transcript.replace("\"version\":\"2.1.294\"", "\"version\":\"2.1.x\"");
+        assert_ne!(unreadable, transcript);
+        std::fs::write(&fixture.transcript, &unreadable).unwrap();
+        let refused = fixture.launch().await.unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                HarnessError::Malformed {
+                    what: crate::error::Input::TranscriptLine,
+                    ..
+                }
+            ),
+            "{refused}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&fixture.transcript).unwrap(),
+            unreadable
+        );
+        assert_eq!(fixture.ran(), None, "claude ran unguarded");
+    }
+
     /// The version is asked in the workspace the launch starts claude in,
     /// where a version manager's shim may pin another version than it
     /// picks anywhere else.

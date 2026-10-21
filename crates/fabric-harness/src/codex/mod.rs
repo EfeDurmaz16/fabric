@@ -1117,6 +1117,60 @@ mod tests {
         assert_eq!(fixture.ran(), None);
     }
 
+    /// A `--version` run that fails, such as a version manager's shim with
+    /// no version set for the workspace, which prints to stderr and exits
+    /// 126, refuses the resume: deny by default.
+    #[tokio::test]
+    async fn a_codex_whose_version_run_fails_is_refused() {
+        let fixture = Resume::answering("echo 'No version is set for command codex' >&2; exit 126");
+        let refused = fixture.launch(true).await.unwrap_err();
+        assert!(
+            matches!(&refused, HarnessError::HarnessVersionUnknown { reason, .. } if reason.contains("126")),
+            "{refused}"
+        );
+        assert_eq!(fixture.ran(), None, "codex ran unguarded");
+    }
+
+    /// A thread whose recorded version or lineage cannot be read refuses
+    /// the resume before codex starts, rather than running it unguarded
+    /// and without its settings.
+    #[tokio::test]
+    async fn a_thread_whose_writer_cannot_be_read_is_refused() {
+        let fixture = Resume::new("codex-cli 0.155.1");
+        let rollout = std::fs::read_to_string(&fixture.rollout).unwrap();
+        let unreadable =
+            rollout.replace("\"cli_version\":\"0.155.1\"", "\"cli_version\":\"0.155\"");
+        assert_ne!(unreadable, rollout);
+        std::fs::write(&fixture.rollout, &unreadable).unwrap();
+        let refused = fixture.launch(true).await.unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                HarnessError::Malformed {
+                    what: Input::RolloutLine,
+                    ..
+                }
+            ),
+            "{refused}"
+        );
+        assert_eq!(fixture.ran(), None, "codex ran unguarded");
+
+        // A paginated suffix whose prefix is missing: the newest writer of
+        // the lineage cannot be known.
+        let broken = rollout.replace(
+            "\"cli_version\":\"0.155.1\"",
+            "\"cli_version\":\"0.155.1\",\"history_base\":{\"thread_id\":\"019f233e-bb33-7342-85fa-f2d33b14368b\"}",
+        );
+        assert_ne!(broken, rollout);
+        std::fs::write(&fixture.rollout, &broken).unwrap();
+        let refused = fixture.launch(true).await.unwrap_err();
+        assert!(
+            matches!(&refused, HarnessError::LineageBroken { .. }),
+            "{refused}"
+        );
+        assert_eq!(fixture.ran(), None, "codex ran unguarded");
+    }
+
     /// A headless resume passes the model, effort and sandbox the session
     /// ran with and says so, and leaves the approval policy to `codex
     /// exec`; a new thread reads nothing and passes nothing (gate finding
