@@ -105,10 +105,24 @@ impl NodeFacts {
     /// up on its `PATH` and run with its roots, each set to its value or
     /// removed, never the daemon's own (ADR 0018, The client's environment).
     pub async fn measure(home: &Path, env: &ClientEnv) -> Self {
+        let inherited: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        Self::measure_from(home, env, &inherited).await
+    }
+
+    /// Measures as [`NodeFacts::measure`] does, with `inherited` as the
+    /// daemon's own environment: each tool starts from it, and `env`'s
+    /// `PATH` and roots then replace or remove what they name.
+    async fn measure_from(
+        home: &Path,
+        env: &ClientEnv,
+        inherited: &[(OsString, OsString)],
+    ) -> Self {
         // Each probe is boxed, so the joined future holds 19 pointers, not 19 child processes.
         let run = |program: &'static str, args: &'static [&'static str], probe: Probe| {
             let (env, home) = (env.clone(), home.to_owned());
-            Box::pin(async move { probe_command(program, args, probe, &env, &home).await })
+            Box::pin(
+                async move { probe_command(program, args, probe, &env, &home, inherited).await },
+            )
         };
         let (
             user,
@@ -243,10 +257,14 @@ async fn probe_command(
     probe: Probe,
     env: &ClientEnv,
     home: &Path,
+    inherited: &[(OsString, OsString)],
 ) -> Option<String> {
     let path_var = env.path_var();
     let binary = find_on_path(program, &path_var)?;
     let mut command = tokio::process::Command::new(binary);
+    command
+        .env_clear()
+        .envs(inherited.iter().map(|(k, v)| (k, v)));
     for (name, value) in env.roots.vars() {
         match value {
             Some(value) => command.env(name, value.as_str()),
@@ -458,7 +476,10 @@ mod tests {
     /// Gate finding on PR #8: capture measured carry keys with the daemon's
     /// `CARGO_HOME`, not the requesting CLI's. A request's roots reach the
     /// facts and the tools measured, and a root it leaves unset is removed,
-    /// not taken from the daemon.
+    /// not taken from the daemon. The daemon here sets every root itself,
+    /// whatever the environment the test runs in, so a root taken from it
+    /// shows (review finding on PR #13: the check of removal passed only
+    /// when the test process had no `PNPM_HOME`).
     #[tokio::test]
     async fn facts_are_measured_in_the_environment_the_request_names() {
         let dir = tempfile::tempdir().unwrap();
@@ -477,6 +498,11 @@ mod tests {
             PathDir::parse("/bin").unwrap(),
         ];
         let home = dir.path().join("home");
+        let daemon: Vec<(OsString, OsString)> = Roots::default()
+            .vars()
+            .iter()
+            .map(|(name, _)| ((*name).into(), format!("/daemon/{name}").into()))
+            .collect();
         let client = ClientEnv {
             path: path.clone(),
             roots: Roots {
@@ -485,7 +511,7 @@ mod tests {
                 ..Roots::default()
             },
         };
-        let facts = NodeFacts::measure(&home, &client).await;
+        let facts = NodeFacts::measure_from(&home, &client, &daemon).await;
         assert_eq!(facts.get(name::CARGO_HOME), Some("/client/cargo"));
         assert_eq!(facts.get(name::PNPM), Some("9.9.9"));
         assert_eq!(facts.get(name::PNPM_STORE), Some("/client/pnpm/store"));
@@ -494,7 +520,7 @@ mod tests {
             path,
             roots: Roots::default(),
         };
-        let facts = NodeFacts::measure(&home, &bare).await;
+        let facts = NodeFacts::measure_from(&home, &bare, &daemon).await;
         let default_cargo = home.join(".cargo");
         assert_eq!(facts.get(name::CARGO_HOME), default_cargo.to_str());
         assert_eq!(facts.get(name::PNPM_STORE), Some("unset/store"));
