@@ -279,6 +279,31 @@ fn e2e_a_codex_the_workspace_pinned_is_remembered_after_it_ran() -> Fallible {
     Ok(())
 }
 
+/// The move preflight compares the target's Codex with the newest one
+/// known to have run the thread, not only with the source's: a workspace
+/// pin ran the thread with 0.160.0 on the source, whose daemon finds
+/// 0.155.1, so a target on 0.158.0, newer than the source's, is named as
+/// older than 0.160.0, which its resume guard would refuse (gate finding
+/// F10b).
+#[test]
+fn e2e_a_move_names_the_codex_a_pinned_workspace_ran_when_the_target_is_older() -> Fallible {
+    let p = crate::setup(Wire::TcpTls, None, None)?;
+    p.env.install_fake_codex()?;
+    fs::write(p.b.state().join("codex-version"), "0.158.0\n")?;
+    let job = crate::new_job(&p.env, &p.a, "codex")?;
+    p.a.ok(&["job", "run", &job, "--headless", "--prompt", "one"])?;
+    fs::write(p.env.work(&job).join(".tool-versions"), "codex 0.160.0\n")?;
+    p.a.ok(&["job", "run", &job, "--headless", "--prompt", "two"])?;
+    let refused = p.a.run(&["job", "move", &job, "--to", &p.b.id])?;
+    let said = text(&refused);
+    assert!(!refused.status.success(), "{said}");
+    assert!(
+        said.contains("the target's codex is older than codex 0.160.0"),
+        "{said}"
+    );
+    Ok(())
+}
+
 /// A headless Claude run starts `claude -p --output-format json` with a
 /// session id it chose, prints the answer and the session, and a suspend
 /// captures the transcript; a headless resume continues it with

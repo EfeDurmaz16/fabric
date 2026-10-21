@@ -1000,13 +1000,18 @@ impl Node {
             return Err(fabric_core::ledger::LedgerError::MoveToSelf.into());
         }
         self.resolve_departing(id, out).await?;
-        let (harness, root, view) = {
+        let (harness, root, view, floor) = {
             let job = self.job(id).await?;
             let job = job.lock().await;
             let root = job
                 .marker()?
                 .map_or_else(|| paths::job_root(&self.cfg.home, id), |m| m.root);
-            (job.harness().clone(), root, job.view(self.id))
+            (
+                job.harness().clone(),
+                root,
+                job.view(self.id),
+                session_floor(&job)?,
+            )
         };
         match view {
             LeaseView::Owner(_) => {}
@@ -1045,7 +1050,7 @@ impl Node {
         }
         self.preflight(
             to,
-            Some((&harness, &root)),
+            Some((&harness, &root, floor.as_ref())),
             Target::Peer,
             path_var,
             force,
@@ -1413,14 +1418,17 @@ impl Node {
             if self.job(id).await.is_err() {
                 self.pull_records(id, holder).await?;
             }
-            let kind = match &harness {
-                Some(kind) => kind.clone(),
-                None => self.job(id).await?.lock().await.harness().clone(),
+            let (kind, floor) = {
+                let job = self.job(id).await?;
+                let job = job.lock().await;
+                let kind = harness.clone().unwrap_or_else(|| job.harness().clone());
+                let floor = session_floor(&job)?.filter(|_| &kind == job.harness());
+                (kind, floor)
             };
             let root = paths::job_root(&self.cfg.home, id);
             self.preflight(
                 holder,
-                Some((&kind, root.as_path())),
+                Some((&kind, root.as_path(), floor.as_ref())),
                 Target::Here,
                 path_var,
                 force,
@@ -1991,20 +1999,27 @@ impl Node {
             }
             return Ok(());
         };
-        let (harness, root) = match job {
+        let (harness, root, floor) = match job {
             Some(id) => {
                 let job = self.job(id).await?;
                 let job = job.lock().await;
                 let root = job
                     .marker()?
                     .map_or_else(|| paths::job_root(&self.cfg.home, id), |m| m.root);
-                (Some(job.harness().clone()), Some(root))
+                (
+                    Some(job.harness().clone()),
+                    Some(root),
+                    session_floor(&job)?,
+                )
             }
-            None => (None, None),
+            None => (None, None, None),
         };
         self.preflight(
             peer,
-            harness.as_ref().zip(root.as_deref()),
+            harness
+                .as_ref()
+                .zip(root.as_deref())
+                .map(|(harness, root)| (harness, root, floor.as_ref())),
             Target::Peer,
             path_var,
             false,
@@ -2013,11 +2028,14 @@ impl Node {
         .await
     }
 
-    /// Compares this node's facts with `peer`'s and stops on a refusal `force` does not waive.
+    /// Compares this node's facts with `peer`'s and stops on a refusal
+    /// `force` does not waive. A named job brings its harness, the root
+    /// the target restores into, and the newest version of its harness
+    /// known to have written its session.
     async fn preflight(
         self: &Arc<Self>,
         peer: NodeId,
-        job: Option<(&HarnessKind, &Path)>,
+        job: Option<(&HarnessKind, &Path, Option<&HarnessVersion>)>,
         target: Target,
         path_var: &OsString,
         force: bool,
@@ -2037,11 +2055,12 @@ impl Node {
             &here,
             &theirs,
             &Context {
-                harness: job.map(|(h, _)| h),
-                root: job.map(|(_, r)| r),
+                harness: job.map(|(h, _, _)| h),
+                root: job.map(|(_, r, _)| r),
                 target,
                 clock_skew_ms: Some(clock_skew_ms),
                 wire: Some(wire),
+                floor: job.and_then(|(_, _, floor)| floor),
             },
         );
         for row in &rows {
@@ -2135,6 +2154,16 @@ fn continued(
         session,
         known_writer,
     })
+}
+
+/// The newest version of the job's harness known to have written its
+/// session, from the session record this node holds, when that record is
+/// of the job's own harness.
+fn session_floor(job: &Job) -> Result<Option<HarnessVersion>, NodeError> {
+    Ok(job
+        .session()?
+        .filter(|record| &record.harness == job.harness())
+        .and_then(|record| record.known_writer))
 }
 
 /// The newest harness version known to have written the session a
