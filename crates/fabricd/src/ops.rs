@@ -2801,6 +2801,52 @@ pub(crate) mod tests {
         }
     }
 
+    /// A suspend holds the tree lock from before it stops the harness
+    /// until the snapshot is recorded, so a `fabric job run` that starts
+    /// meanwhile refuses instead of running setup steps under the capture.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_suspend_holds_the_tree_lock_while_it_stops_the_harness() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        node.job_run(id, &mut Out::default()).await.unwrap();
+        // Once asked to stop, the harness says so and takes two seconds to exit.
+        let asked = dir.path().join("asked");
+        let harness = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"trap 'touch "$0"; sleep 2; exit 0' TERM; while :; do sleep 0.05; done"#)
+            .arg(&asked)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        register(&node, id, pid(&harness)).await.unwrap();
+        let reaper = std::thread::spawn(move || {
+            let mut harness = harness;
+            harness.wait()
+        });
+        let suspending = tokio::spawn({
+            let node = Arc::clone(&node);
+            async move { node.suspend(id, &path, &mut Out::default()).await }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !asked.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the suspend never asked the harness to stop"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let root = paths::job_root(&node.cfg.home, id);
+        let setup = TreeLock::acquire(&node.cfg.state.tree_locks(), &root);
+        assert!(
+            matches!(setup, Err(MaterializeError::TreeBusy { .. })),
+            "a run took the tree while the suspend stopped its harness: {setup:?}"
+        );
+        suspending.await.unwrap().unwrap();
+        reaper.join().unwrap().unwrap();
+    }
+
     /// A clean workspace deleted by hand is restored by the next resume,
     /// not handed to the CLI as a root that does not exist.
     #[tokio::test]
