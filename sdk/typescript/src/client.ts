@@ -76,11 +76,14 @@ export type ClientOptions = {
 
 export type CallOptions = {
   /**
-   * Called with each event as it arrives, in order. An event of a kind
-   * this client does not know is skipped. If it throws, the call rejects
-   * with that error; the node still finishes the command.
+   * Called with each event as it arrives, in order. A promise it returns
+   * is awaited before the next event, so an async handler sees them in
+   * order too and the call resolves only after the last one finished. An
+   * event of a kind this client does not know is skipped. If it throws or
+   * rejects, the call rejects with that error; the node still finishes
+   * the command.
    */
-  readonly onEvent?: (event: KnownEvent) => void;
+  readonly onEvent?: ((event: KnownEvent) => void) | ((event: KnownEvent) => Promise<void>);
 };
 
 /** A harness the caller launched from a run plan. */
@@ -139,7 +142,7 @@ export class FabricClient {
         switch (answer.type) {
           case "event":
             if (answer.event.kind !== "unrecognized") {
-              options.onEvent?.(answer.event);
+              await options.onEvent?.(answer.event);
             }
             break;
           case "done": {

@@ -189,6 +189,37 @@ describe("the client", () => {
     expect(suspended).toStrictEqual({ kind: "job_suspend", snapshot: SNAPSHOT });
   });
 
+  // Review finding on PR #13: an async onEvent was not awaited, so the call could resolve before the handler
+  // finished, and a handler that rejected left an unhandled rejection instead of rejecting the call.
+  test("awaits an async onEvent before the next frame and rejects with what it rejects with", async () => {
+    const frames = [
+      { type: "event", event: { kind: "stopping_harness", pid: 4242 } },
+      { type: "event", event: { kind: "suspended", snapshot: SNAPSHOT, epoch: 1 } },
+      { type: "done", reply: { kind: "job_suspend", snapshot: SNAPSHOT } },
+    ];
+    const node = await fakeNode(answers(...frames));
+    const handled: string[] = [];
+    await new FabricClient({ socketPath: node.socketPath }).jobSuspend(JOB, {
+      onEvent: async (event) => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        handled.push(event.kind);
+      },
+    });
+    expect(handled).toStrictEqual(["stopping_harness", "suspended"]);
+
+    const failing = await fakeNode(answers(...frames));
+    const failure = new Error("the handler failed");
+    const error = await rejection(
+      new FabricClient({ socketPath: failing.socketPath }).jobSuspend(JOB, {
+        onEvent: async () => {
+          await Promise.resolve();
+          throw failure;
+        },
+      }),
+    );
+    expect(error).toBe(failure);
+  });
+
   test("rejects a reply of another op with Unexpected", async () => {
     const node = await fakeNode(answers({ type: "done", reply: { kind: "job_suspend", snapshot: SNAPSHOT } }));
     const error = await rejection(new FabricClient({ socketPath: node.socketPath }).jobStatus(JOB));
