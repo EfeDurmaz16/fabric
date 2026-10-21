@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use fabric_client::api::{Answer, Event, Request};
 use fabric_core::id::{JobId, NodeId};
 use fabric_net::endpoint::{DialOrder, Endpoint};
 use fabric_net::identity::NodeIdentity;
@@ -31,7 +32,6 @@ use fabric_store::objects::ChunkParams;
 use fabric_store::store::{Store, StoreError};
 use tokio::net::UnixListener;
 
-use crate::control::{self, Request, Response};
 use crate::error::NodeError;
 use crate::harnesses::{HarnessConfig, HarnessEnv};
 use crate::job::Job;
@@ -183,7 +183,7 @@ impl Node {
                 accepted = control.accept() => match accepted {
                     Ok((stream, _)) => {
                         let node = Arc::clone(&self);
-                        tokio::spawn(Box::pin(node.serve_control(stream)));
+                        tokio::spawn(Box::pin(crate::control::serve(node, stream)));
                     }
                     Err(e) => tracing::warn!(error = %e, "control accept failed"),
                 },
@@ -191,48 +191,13 @@ impl Node {
         }
     }
 
-    async fn serve_control(self: Arc<Self>, mut stream: tokio::net::UnixStream) {
-        let me = rustix::process::geteuid().as_raw();
-        match stream.peer_cred() {
-            Ok(peer) if peer.uid() == me => {}
-            Ok(peer) => {
-                tracing::warn!(
-                    uid = peer.uid(),
-                    "refused a control connection from another user"
-                );
-                return;
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "refused a control connection whose user is unknown");
-                return;
-            }
-        }
-        let request = match control::read_request(&mut stream).await {
-            Ok(request) => request,
-            Err(e) => {
-                tracing::warn!(error = %e, "unreadable control request");
-                return;
-            }
-        };
-        let response = Box::pin(self.handle(request)).await;
-        if let Err(e) = control::write_response(&mut stream, &response).await {
-            tracing::warn!(error = %e, "control response not delivered");
-        }
-    }
-
-    async fn handle(self: &Arc<Self>, request: Request) -> Response {
-        let mut out = Out::default();
-        let result = Box::pin(self.dispatch(request, &mut out)).await;
-        match result {
-            Ok(None) => Response::Done { lines: out.lines },
-            Ok(Some(plan)) => Response::Run {
-                lines: out.lines,
-                plan,
-            },
-            Err(e) => Response::Failed {
-                lines: out.lines,
-                error: e.to_string(),
-                refusal: e.refusal(),
+    /// Runs one client request and answers with its reply or its refusal;
+    /// the events go to `out` as the command makes them.
+    pub(crate) async fn handle(self: &Arc<Self>, request: Request, mut out: Out) -> Answer {
+        match Box::pin(self.dispatch(request, &mut out)).await {
+            Ok(reply) => Answer::Done { reply },
+            Err(e) => Answer::Refused {
+                refusal: e.to_refusal(),
             },
         }
     }
@@ -410,15 +375,37 @@ fn load_jobs(state: &StateDir) -> Result<(Jobs, BTreeMap<JobId, String>), NodeEr
     Ok((jobs, broken))
 }
 
-/// The lines a command prints, one per step or choice.
+/// What a command reports as it runs, one typed event per step or choice
+/// (ADR 0018, Progress as typed events).
+///
+/// This is the one place a node makes events. A command run for a client
+/// streams each one to that client the moment it is made; work no client
+/// asked for, such as recovery or a peer's request, keeps them for its log.
+/// A live stream of every job's events (C2) is this sink made a broadcast.
 #[derive(Debug, Default)]
 pub(crate) struct Out {
-    pub(crate) lines: Vec<String>,
+    live: Option<tokio::sync::mpsc::UnboundedSender<Event>>,
+    /// The events kept when no client streams them.
+    pub(crate) events: Vec<Event>,
 }
 
 impl Out {
-    /// Adds a line.
-    pub(crate) fn say(&mut self, line: impl Into<String>) {
-        self.lines.push(line.into());
+    /// A sink that sends each event to a client's connection as it is made.
+    pub(crate) fn streaming(live: tokio::sync::mpsc::UnboundedSender<Event>) -> Self {
+        Self {
+            live: Some(live),
+            events: Vec::new(),
+        }
+    }
+
+    /// Reports an event.
+    pub(crate) fn emit(&mut self, event: Event) {
+        match &self.live {
+            // A client that left gets no more events; the command runs on.
+            Some(live) => {
+                let _ = live.send(event);
+            }
+            None => self.events.push(event),
+        }
     }
 }

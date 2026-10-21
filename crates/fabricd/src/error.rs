@@ -2,15 +2,16 @@
 //!
 //! Invariant: every refusal says which node owns the job, what state a
 //! move is in, or which file failed, so the CLI prints the one command that
-//! resolves it without parsing text (ADR 0003, Consequences).
+//! resolves it without parsing text (ADR 0003, Consequences). A client gets
+//! the same facts typed, as the reason of a refusal (ADR 0018).
 
 use std::path::PathBuf;
 
+use fabric_client::api::{Reason, Refusal, StealWarning, Step};
 use fabric_core::id::{Epoch, JobId, MoveId, NodeId, SnapshotId};
 use fabric_core::lease::FenceError;
 use fabric_core::ledger::{LedgerError, StoreError as LedgerStoreError};
 
-use crate::control::Refusal;
 use crate::harnesses::HarnessConfigError;
 use crate::ledger_file::LedgerFileError;
 use crate::local::LocalError;
@@ -127,7 +128,7 @@ pub enum NodeError {
         /// The job.
         job: JobId,
         /// Its pid.
-        pid: u32,
+        pid: std::num::NonZeroU32,
     },
     /// The launched harness is not running as the leader of its own group, or its start time could not be read.
     #[error(
@@ -165,14 +166,16 @@ pub enum NodeError {
     #[error("job {0} has no workspace on this node; run `fabric job resume {0}`")]
     NoWorkspace(JobId),
     /// The workspace is mid-suspend or mid-restore.
-    #[error("job {job}: {what} did not finish; run `fabric job {command} {job}` to finish it")]
+    #[error(
+        "job {job}: {} did not finish; run `fabric job {} {job}` to finish it",
+        unfinished_what(*step),
+        unfinished_command(*step)
+    )]
     Unfinished {
         /// The job.
         job: JobId,
-        /// What did not finish.
-        what: &'static str,
-        /// The command that finishes it.
-        command: &'static str,
+        /// Which step did not finish.
+        step: Step,
     },
     /// The job was never suspended, so there is no snapshot to restore or move.
     #[error("job {0} has no snapshot yet; suspend it on its owner first")]
@@ -212,14 +215,23 @@ pub enum NodeError {
         /// What it said.
         reason: String,
     },
-    /// The preflight found rows that stop the move.
+    /// The preflight found rows that stop the move; the facts of those rows.
     #[error(
-        "the preflight refused the move: {0}; `fabric job move` and `fabric job resume` take --force to waive what can be waived"
+        "the preflight refused the move: {}; `fabric job move` and `fabric job resume` take --force to waive what can be waived",
+        .0.join(", ")
     )]
-    Preflight(String),
+    Preflight(Vec<String>),
     /// A steal without `--force`.
-    #[error("{0}")]
-    StealNeedsForce(String),
+    #[error(
+        "a steal would bump the epoch without {}'s consent: {described}. Pass --force to do it",
+        warning.owner
+    )]
+    StealNeedsForce {
+        /// What the steal would cost.
+        warning: StealWarning,
+        /// The same, in words.
+        described: String,
+    },
     /// A snapshot could not be fetched whole.
     #[error("snapshot {snapshot} could not be fetched from {peer}: {reason}")]
     Fetch {
@@ -293,28 +305,127 @@ impl From<LedgerStoreError<LedgerFileError>> for NodeError {
 }
 
 impl NodeError {
-    /// The kind of refusal this is, for the CLI's exit code.
+    /// The refusal a client gets for this error: its reason with its data,
+    /// and this error's sentence (ADR 0018, Refusals).
     #[must_use]
-    pub fn refusal(&self) -> Refusal {
+    pub fn to_refusal(&self) -> Refusal {
+        Refusal::new(self.reason(), self.to_string())
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per error, so the whole mapping reads in one place"
+    )]
+    fn reason(&self) -> Reason {
         match self {
-            NodeError::NotOwner { .. }
-            | NodeError::Departed { .. }
-            | NodeError::UnknownJob(_)
-            | NodeError::Fence(_) => Refusal::NotOwner,
-            NodeError::Departing { .. } | NodeError::Forked { .. } => Refusal::Frozen,
-            NodeError::Unreachable { .. } | NodeError::UnknownPeer(_) => Refusal::Unreachable,
-            NodeError::Preflight(_) | NodeError::StealNeedsForce(_) => Refusal::NeedsForce,
-            NodeError::Unfinished { .. }
-            | NodeError::AlreadyRunningHarness { .. }
-            | NodeError::RanDuringMove { .. }
-            | NodeError::ChangedDuringMove { .. }
-            | NodeError::WorkspaceOccupied { .. }
-            | NodeError::NoWorkspace(_)
-            | NodeError::StaleWorkspace { .. }
-            | NodeError::NoSnapshot(_)
-            | NodeError::HarnessGone { .. }
-            | NodeError::HarnessNotRecorded { .. } => Refusal::JobState,
-            _ => Refusal::Failed,
+            NodeError::UnknownJob(job) => Reason::UnknownJob { job: *job },
+            NodeError::NotOwner { job, owner, epoch } => Reason::NotOwner {
+                job: *job,
+                owner: *owner,
+                epoch: *epoch,
+            },
+            NodeError::Departed { job, owner, epoch } => Reason::Departed {
+                job: *job,
+                owner: *owner,
+                epoch: *epoch,
+            },
+            NodeError::Fence(FenceError::StaleEpoch { yours, current }) => Reason::StaleEpoch {
+                yours: *yours,
+                current: *current,
+            },
+            NodeError::Fence(FenceError::AheadOfUs { yours, current }) => Reason::EpochAhead {
+                yours: *yours,
+                current: *current,
+            },
+            NodeError::Fence(FenceError::WrongJob { token, job }) => Reason::WrongJob {
+                token: *token,
+                job: *job,
+            },
+            NodeError::Departing {
+                job,
+                move_id,
+                target,
+            } => Reason::Departing {
+                job: *job,
+                move_id: *move_id,
+                target: *target,
+            },
+            NodeError::Forked { job, peer, epoch } => Reason::Forked {
+                job: *job,
+                peer: *peer,
+                epoch: *epoch,
+            },
+            NodeError::ForkBehind { job, peer, epoch } => Reason::ForkBehind {
+                job: *job,
+                peer: *peer,
+                epoch: *epoch,
+            },
+            NodeError::Unreachable { peer, .. } => Reason::Unreachable { peer: *peer },
+            NodeError::UnknownPeer(node) => Reason::UnknownPeer { node: *node },
+            NodeError::Preflight(facts) => Reason::Preflight {
+                facts: facts.clone(),
+            },
+            NodeError::StealNeedsForce { warning, .. } => {
+                Reason::StealNeedsForce { warning: *warning }
+            }
+            NodeError::AlreadyRunningHarness { job, pid } => Reason::HarnessRunning {
+                job: *job,
+                pid: *pid,
+            },
+            NodeError::HarnessGone { pid } => Reason::HarnessGone { pid: *pid },
+            NodeError::HarnessNotRecorded { job, pid, session } => Reason::HarnessNotRecorded {
+                job: *job,
+                pid: *pid,
+                session: session.clone(),
+            },
+            NodeError::RanDuringMove { job, target } => Reason::RanDuringMove {
+                job: *job,
+                target: *target,
+            },
+            NodeError::ChangedDuringMove { job, root, target } => Reason::ChangedDuringMove {
+                job: *job,
+                root: root.clone(),
+                target: *target,
+            },
+            NodeError::StaleWorkspace { job, root, epoch } => Reason::StaleWorkspace {
+                job: *job,
+                root: root.clone(),
+                left_at: *epoch,
+            },
+            NodeError::NoWorkspace(job) => Reason::NoWorkspace { job: *job },
+            NodeError::Unfinished { job, step } => Reason::Unfinished {
+                job: *job,
+                step: *step,
+            },
+            NodeError::NoSnapshot(job) => Reason::NoSnapshot { job: *job },
+            NodeError::WorkspaceOccupied { root } => {
+                Reason::WorkspaceOccupied { root: root.clone() }
+            }
+            NodeError::BadAddress { text, .. } => Reason::BadAddress { text: text.clone() },
+            NodeError::Peer { peer, .. } => Reason::Peer { peer: *peer },
+            NodeError::Fetch { snapshot, peer, .. } => Reason::Fetch {
+                snapshot: *snapshot,
+                peer: *peer,
+            },
+            NodeError::Io { .. }
+            | NodeError::AlreadyRunning(_)
+            | NodeError::SocketPathTooLong(_)
+            | NodeError::Ledger(_)
+            | NodeError::LedgerFile(_)
+            | NodeError::Local(_)
+            | NodeError::Paths(_)
+            | NodeError::Store(_)
+            | NodeError::Policy(_)
+            | NodeError::Capture(_)
+            | NodeError::Restore(_)
+            | NodeError::Harness(_)
+            | NodeError::HarnessConfig(_)
+            | NodeError::Transport(_)
+            | NodeError::Identity(_)
+            | NodeError::PeerBook(_)
+            | NodeError::Wire(_)
+            | NodeError::Fault(_)
+            | NodeError::Task(_) => Reason::Internal,
         }
     }
 
@@ -324,5 +435,21 @@ impl NodeError {
             path: path.into(),
             source,
         }
+    }
+}
+
+/// What an unfinished step is, in the words of its refusal.
+fn unfinished_what(step: Step) -> &'static str {
+    match step {
+        Step::Suspend => "a suspend",
+        Step::Restore => "a restore",
+    }
+}
+
+/// The command that finishes an unfinished step.
+fn unfinished_command(step: Step) -> &'static str {
+    match step {
+        Step::Suspend => "suspend",
+        Step::Restore => "resume",
     }
 }

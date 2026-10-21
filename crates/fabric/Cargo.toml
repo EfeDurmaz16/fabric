@@ -17,6 +17,7 @@ fixtures = ["dep:serde_json"]
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
+fabric-client = { path = "../fabric-client" }
 fabric-core = { path = "../fabric-core" }
 fabric-env = { path = "../fabric-env" }
 fabric-harness = { path = "../fabric-harness" }

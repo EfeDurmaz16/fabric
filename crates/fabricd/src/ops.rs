@@ -15,6 +15,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use fabric_client::api::{
+    ClosedJob, Decision, DoctorReport, Event, Fact, HarnessSession, JobCreated, JobList, JobLog,
+    JobStatus, JobSummary, Lease, LedgerEvent, LogRecord, NodeIdentity, Paired, Peer, PeerList,
+    Pong, Process, Registered, Reply, Request, RunPlan, SessionRecorded, SnapshotState, Standing,
+    StealWarning, Step, Suspended, View, Wire, Workspace, WorkspaceState,
+};
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, JobId, NodeId, SnapshotId};
 use fabric_core::lease::{FenceError, FencingToken};
@@ -35,7 +41,6 @@ use fabric_store::restore::{
 };
 
 use crate::clock;
-use crate::control::{Decision, NamedSession, Request, RunPlan};
 use crate::doctor::{self, Context, Target};
 use crate::error::NodeError;
 use crate::facts::{MeasuredKeys, NodeFacts, key_difference};
@@ -44,7 +49,7 @@ use crate::harnesses::adapter;
 use crate::job::Job;
 use crate::local::{self, HarnessRecord, Liveness, Marker, MarkerState, SessionRecord};
 use crate::node::{Node, Out, is_transport};
-use crate::paths::{self, SyncedFolders, check_root, restore_root};
+use crate::paths::{self, RootChoice, SyncedFolders, check_root, restore_root};
 use crate::stamp::TreeStamp;
 use crate::transfer::{fetch_snapshot, is_complete, with_store};
 
@@ -78,9 +83,108 @@ impl Node {
         self: &Arc<Self>,
         request: Request,
         out: &mut Out,
-    ) -> Result<Option<RunPlan>, NodeError> {
-        // Reads answer from local state at once; a command that changes a
-        // job waits until start-up recovery has learned what the peers wrote.
+    ) -> Result<Reply, NodeError> {
+        self.wait_for_recovery(&request, out).await;
+        Ok(match request {
+            Request::NodeId => Reply::NodeId(NodeIdentity {
+                node: self.id,
+                listen: self.local_addr()?,
+            }),
+            Request::NodeAdd { node, addr } => {
+                Reply::NodeAdd(self.node_add(node, addr.as_deref()).await?)
+            }
+            Request::NodeList => Reply::NodeList(self.node_list()),
+            Request::NodePing { node } => Reply::NodePing(self.node_ping(node).await?),
+            Request::JobNew {
+                repo,
+                goal,
+                harness,
+            } => Reply::JobNew(self.job_new(&repo, goal, harness).await?),
+            Request::JobList => Reply::JobList(self.job_list().await),
+            Request::JobStatus { job } => Reply::JobStatus(self.job_status(job).await?),
+            Request::JobLog { job } => Reply::JobLog(self.job_log(job).await?),
+            Request::JobRun { job } => {
+                self.resolve_departing(job, out).await?;
+                self.check_peers(job, out).await;
+                Reply::JobRun(self.job_run(job, out).await?)
+            }
+            Request::JobResume {
+                job,
+                on,
+                harness,
+                force,
+                path,
+            } => {
+                let path_var = self.path_var(path);
+                Reply::JobResume(
+                    Box::pin(self.job_resume(job, on, harness, force, &path_var, out)).await?,
+                )
+            }
+            Request::HarnessStarted {
+                job,
+                epoch,
+                pid,
+                harness,
+                session,
+            } => Reply::HarnessStarted(
+                self.harness_started(job, epoch, pid, harness, session)
+                    .await?,
+            ),
+            Request::HarnessExited { job, pid } => {
+                self.harness_exited(job, pid).await?;
+                Reply::HarnessExited
+            }
+            Request::HarnessSession {
+                job,
+                epoch,
+                pid,
+                harness,
+                session,
+            } => Reply::HarnessSession(
+                self.harness_session(job, epoch, pid, harness, session)
+                    .await?,
+            ),
+            Request::JobSuspend { job, path } => {
+                let path_var = self.path_var(path);
+                self.resolve_departing(job, out).await?;
+                let snapshot = self.suspend(job, &path_var, out).await?;
+                self.replicate(job, out).await;
+                Reply::JobSuspend(Suspended { snapshot })
+            }
+            Request::JobMove {
+                job,
+                to,
+                force,
+                path,
+            } => {
+                let path_var = self.path_var(path);
+                self.job_move(job, to, force, &path_var, out).await?;
+                Reply::JobMove(self.lease(job).await?)
+            }
+            Request::JobSteal { job, reason, force } => {
+                self.job_steal(job, reason, force, out).await?;
+                Reply::JobSteal(self.lease(job).await?)
+            }
+            Request::JobDecide {
+                job,
+                decision,
+                note,
+            } => Reply::JobDecide(fabric_client::api::Decided {
+                text: self.job_decide(job, decision, &note).await?,
+            }),
+            Request::Doctor { peer, job, path } => {
+                let path_var = self.path_var(path);
+                Reply::Doctor {
+                    report: self.doctor(peer, job, &path_var).await?,
+                }
+            }
+        })
+    }
+
+    /// Reads answer from local state at once, saying so while start-up
+    /// recovery runs; a command that changes a job waits until recovery has
+    /// learned what the peers wrote.
+    async fn wait_for_recovery(&self, request: &Request, out: &mut Out) {
         let reads = matches!(
             request,
             Request::JobList | Request::JobStatus { .. } | Request::JobLog { .. }
@@ -94,92 +198,29 @@ impl Node {
                 | Request::Doctor { .. }
         );
         if reads && !self.is_recovered() {
-            out.say(
-                "this node is still catching up with its peers after a restart; what follows may not show what they wrote",
-            );
+            out.emit(Event::CatchingUp);
         } else if !reads && !node_only {
             self.recovered().await;
         }
-        match request {
-            Request::NodeId => {
-                out.say(format!("{}", self.id));
-                out.say(format!("listening on {}", self.local_addr()?));
-            }
-            Request::NodeAdd { node, addr } => self.node_add(node, addr.as_deref(), out).await?,
-            Request::NodeList => self.node_list(out),
-            Request::NodePing { node } => self.node_ping(node, out).await?,
-            Request::JobNew {
-                repo,
-                goal,
-                harness,
-            } => self.job_new(&repo, goal, harness, out).await?,
-            Request::JobList => self.job_list(out).await,
-            Request::JobStatus { job } => self.job_status(job, out).await?,
-            Request::JobLog { job } => self.job_log(job, out).await?,
-            Request::JobRun { job } => {
-                self.resolve_departing(job, out).await?;
-                self.check_peers(job, out).await;
-                return Ok(Some(self.job_run(job, out).await?));
-            }
-            Request::JobResume {
-                job,
-                on,
-                harness,
-                force,
-                path_var,
-            } => {
-                return Ok(Some(
-                    Box::pin(self.job_resume(job, on, harness, force, &path_var, out)).await?,
-                ));
-            }
-            Request::HarnessStarted {
-                job,
-                epoch,
-                pid,
-                harness,
-                session,
-            } => {
-                self.harness_started(job, epoch, pid, harness, session, out)
-                    .await?;
-            }
-            Request::HarnessExited { job, pid } => self.harness_exited(job, pid).await?,
-            Request::HarnessSession(named) => self.harness_session(named, out).await?,
-            Request::JobSuspend { job, path_var } => {
-                self.resolve_departing(job, out).await?;
-                self.suspend(job, &path_var, out).await?;
-                self.replicate(job, out).await;
-            }
-            Request::JobMove {
-                job,
-                to,
-                force,
-                path_var,
-            } => self.job_move(job, to, force, &path_var, out).await?,
-            Request::JobSteal { job, reason, force } => {
-                self.job_steal(job, reason, force, out).await?;
-            }
-            Request::JobDecide {
-                job,
-                decision,
-                note,
-            } => {
-                self.job_decide(job, decision, &note, out).await?;
-            }
-            Request::Doctor {
-                peer,
-                job,
-                path_var,
-            } => self.doctor(peer, job, &path_var, out).await?,
-        }
-        Ok(None)
     }
 
-    async fn node_add(
-        &self,
-        node: NodeId,
-        addr: Option<&str>,
-        out: &mut Out,
-    ) -> Result<(), NodeError> {
+    /// The `PATH` a client sent, or the one the node started with.
+    fn path_var(&self, path: Option<String>) -> OsString {
+        path.map_or_else(|| self.cfg.path_var.clone(), OsString::from)
+    }
+
+    /// Who owns `id` now, at which epoch.
+    async fn lease(&self, id: JobId) -> Result<Lease, NodeError> {
+        let job = self.job(id).await?;
+        let job = job.lock().await;
+        let lease = job.ledger().lease();
+        Ok(Lease {
+            owner: lease.holder(),
+            epoch: lease.epoch(),
+        })
+    }
+
+    async fn node_add(&self, node: NodeId, addr: Option<&str>) -> Result<Paired, NodeError> {
         let addr: Option<HostPort> = addr
             .map(|text| {
                 text.parse()
@@ -194,42 +235,24 @@ impl Node {
         tokio::task::spawn_blocking(move || peers.update(|book| book.pair(node, addr)))
             .await
             .map_err(|e| NodeError::Task(e.to_string()))??;
-        out.say(match shown {
-            Some(addr) => format!("paired {node} at {addr}"),
-            None => format!(
-                "paired {node} with no address: it may dial this node, and this node never dials it"
-            ),
-        });
-        Ok(())
+        Ok(Paired { node, addr: shown })
     }
 
-    fn node_list(&self, out: &mut Out) {
+    fn node_list(&self) -> PeerList {
         let book = self.peers.snapshot();
-        let mut any = false;
-        for entry in book.iter() {
-            any = true;
-            let connected = if self.open_session(entry.node()).is_some() {
-                "connected"
-            } else {
-                "not connected"
-            };
-            let addrs: Vec<String> = entry.addrs().iter().map(ToString::to_string).collect();
-            out.say(format!(
-                "{} {} ({connected})",
-                entry.node(),
-                if addrs.is_empty() {
-                    "-".to_owned()
-                } else {
-                    addrs.join(",")
-                }
-            ));
-        }
-        if !any {
-            out.say("no paired nodes; pair one with `fabric node add <node-id> <host:port>`");
+        PeerList {
+            peers: book
+                .iter()
+                .map(|entry| Peer {
+                    node: entry.node(),
+                    addrs: entry.addrs().iter().map(ToString::to_string).collect(),
+                    connected: self.open_session(entry.node()).is_some(),
+                })
+                .collect(),
         }
     }
 
-    async fn node_ping(self: &Arc<Self>, node: NodeId, out: &mut Out) -> Result<(), NodeError> {
+    async fn node_ping(self: &Arc<Self>, node: NodeId) -> Result<Pong, NodeError> {
         let session = self.dial(node).await?;
         let started = tokio::time::Instant::now();
         session
@@ -239,13 +262,12 @@ impl Node {
                 peer: node,
                 reason: e.to_string(),
             })?;
-        out.say(format!(
-            "{node} answered in {} ms over {}; its clock is {} ms from this one",
-            started.elapsed().as_millis(),
-            session.kind(),
-            session.clock_skew_ms()
-        ));
-        Ok(())
+        Ok(Pong {
+            node,
+            rtt_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            wire: wire(session.kind()),
+            clock_skew_ms: session.clock_skew_ms(),
+        })
     }
 
     async fn job_new(
@@ -253,8 +275,7 @@ impl Node {
         repo: &Path,
         goal: String,
         harness: HarnessKind,
-        out: &mut Out,
-    ) -> Result<(), NodeError> {
+    ) -> Result<JobCreated, NodeError> {
         let id = clock::job_id();
         let root = paths::job_root(&self.cfg.home, id);
         let synced = synced_folders(&self.cfg.home, &self.cfg.path_var).await;
@@ -296,42 +317,40 @@ impl Node {
             .lock()
             .await
             .insert(id, Arc::new(tokio::sync::Mutex::new(job)));
-        out.say(format!("{id}"));
-        out.say(format!(
-            "root {}: a clone of {} under ~/fabric/jobs, the same path on every node with this home (ADR 0011)",
-            root.display(),
-            repo.display()
-        ));
-        out.say(format!(
-            "harness {harness}; this node owns the job at epoch {}",
-            Epoch::FIRST
-        ));
-        Ok(())
+        Ok(JobCreated {
+            job: id,
+            root,
+            repo: repo.to_owned(),
+            harness,
+            epoch: Epoch::FIRST,
+        })
     }
 
-    async fn job_list(&self, out: &mut Out) {
+    async fn job_list(&self) -> JobList {
         let jobs: Vec<_> = self.jobs.lock().await.values().cloned().collect();
-        let jobs_listed = jobs.len() + self.broken_jobs().len();
+        let mut listed = Vec::with_capacity(jobs.len());
         for job in jobs {
             let job = job.lock().await;
             let manifest = job.ledger().manifest();
-            let word = match job.forked() {
-                Ok(Some(_)) => "frozen",
-                Ok(None) => view_word(&job.view(self.id)),
-                Err(_) => "unreadable",
+            let standing = match job.forked() {
+                Ok(Some(_)) => Standing::Frozen,
+                Ok(None) => standing(&job.view(self.id)),
+                Err(_) => Standing::Unreadable,
             };
-            out.say(format!(
-                "{} {word} epoch {} {}",
-                job.id(),
-                manifest.lease.epoch(),
-                manifest.goal
-            ));
+            listed.push(JobSummary {
+                job: job.id(),
+                standing,
+                epoch: manifest.lease.epoch(),
+                goal: manifest.goal.clone(),
+            });
         }
-        for (id, error) in self.broken_jobs() {
-            out.say(format!("{id} closed: {error}"));
-        }
-        if jobs_listed == 0 {
-            out.say("no jobs; make one with `fabric job new --repo <path> --goal <text>`");
+        JobList {
+            jobs: listed,
+            closed: self
+                .broken_jobs()
+                .into_iter()
+                .map(|(job, error)| ClosedJob { job, error })
+                .collect(),
         }
     }
 
@@ -344,77 +363,76 @@ impl Node {
             .collect()
     }
 
-    async fn job_status(self: &Arc<Self>, id: JobId, out: &mut Out) -> Result<(), NodeError> {
+    async fn job_status(self: &Arc<Self>, id: JobId) -> Result<JobStatus, NodeError> {
         let job = self.job(id).await?;
         let job = job.lock().await;
         let manifest = job.ledger().manifest();
-        out.say(format!("job {id}"));
-        out.say(format!("goal: {}", manifest.goal));
-        out.say(format!("harness: {}", manifest.harness));
-        let owner = manifest.lease.holder();
-        out.say(format!(
-            "owner: {owner}{} at epoch {}",
-            if owner == self.id { " (this node)" } else { "" },
-            manifest.lease.epoch()
-        ));
         let forked = job.forked()?;
-        out.say(match (job.view(self.id), &forked) {
-            (_, Some(fork)) => format!(
-                "this node: frozen; {}'s ledger at epoch {} does not continue this node's, so the job was stolen while this node ran it. This copy never runs again; run `fabric job resume {id}` on {} to continue there",
-                fork.peer, fork.epoch, fork.peer
-            ),
-            (LeaseView::Owner(_), None) => "this node: owner".to_owned(),
-            (LeaseView::Departing { move_id, target }, None) => format!(
-                "this node: departing to {target} under move {move_id}; frozen until {target} answers. Run `fabric job move {id} --to {target}` to ask again, or `fabric job steal {id} --force` on another node"
-            ),
-            (LeaseView::Departed { owner, epoch }, None) => format!(
-                "this node: departed; {owner} owns the job at epoch {epoch} and this copy never runs"
-            ),
-            (LeaseView::Replica { owner, .. }, None) => {
-                format!("this node: replica; run `fabric job resume {id}` to pull it from {owner}")
-            }
-        });
-        out.say(match (manifest.latest_snapshot, job.suspended_in()) {
-            (None, _) => "snapshot: none yet".to_owned(),
-            (Some(s), Some(_)) => format!("snapshot: {s} (suspended in it)"),
-            (Some(s), None) => format!("snapshot: {s} (resumed since)"),
-        });
-        out.say(match job.marker()? {
-            None => "workspace: none on this node".to_owned(),
-            Some(marker) => workspace_line(&job, self.id, &marker, forked.is_some()).await,
-        });
-        let running = match job.harness_record()? {
-            Some(record) => match record.liveness().await {
-                Liveness::Leader => format!(
-                    "harness: running as pid {} since epoch {}",
-                    record.pid, record.epoch
-                ),
-                Liveness::Group => format!(
-                    "harness: pid {} exited and processes it started still run in its group; `fabric job suspend {id}` stops them",
-                    record.pid
-                ),
-                Liveness::Gone => "harness: not running".to_owned(),
+        let view = match (job.view(self.id), &forked) {
+            (_, Some(fork)) => View::Frozen {
+                peer: fork.peer,
+                epoch: fork.epoch,
             },
-            None => "harness: not running".to_owned(),
+            (LeaseView::Owner(_), None) => View::Owner,
+            (LeaseView::Departing { move_id, target }, None) => View::Departing { move_id, target },
+            (LeaseView::Departed { owner, epoch }, None) => View::Departed { owner, epoch },
+            (LeaseView::Replica { owner, epoch }, None) => View::Replica { owner, epoch },
         };
-        out.say(running);
-        out.say(format!("records: {}", manifest.event_count));
-        Ok(())
+        let workspace = match job.marker()? {
+            None => None,
+            Some(marker) => Some(Workspace {
+                state: workspace_state(&job, self.id, &marker, forked.is_some()).await,
+                root: marker.root,
+            }),
+        };
+        let process = match job.harness_record()? {
+            Some(record) => match record.liveness().await {
+                Liveness::Leader => Process::Running {
+                    pid: record.pid,
+                    epoch: record.epoch,
+                },
+                Liveness::Group => Process::GroupRemains { pid: record.pid },
+                Liveness::Gone => Process::NotRunning,
+            },
+            None => Process::NotRunning,
+        };
+        Ok(JobStatus {
+            job: id,
+            node: self.id,
+            goal: manifest.goal.clone(),
+            harness: manifest.harness.clone(),
+            owner: manifest.lease.holder(),
+            epoch: manifest.lease.epoch(),
+            view,
+            snapshot: manifest.latest_snapshot.map(|id| SnapshotState {
+                id,
+                suspended: job.suspended_in().is_some(),
+            }),
+            workspace,
+            process,
+            records: manifest.event_count,
+        })
     }
 
-    async fn job_log(&self, id: JobId, out: &mut Out) -> Result<(), NodeError> {
+    async fn job_log(&self, id: JobId) -> Result<JobLog, NodeError> {
         let job = self.job(id).await?;
         let job = job.lock().await;
-        for (n, record) in job.ledger().records().iter().enumerate() {
-            let event = record.event();
-            out.say(format!(
-                "{n:>4} epoch {} at {} {}",
-                event.epoch,
-                event.at,
-                describe(&event.kind)
-            ));
-        }
-        Ok(())
+        Ok(JobLog {
+            records: job
+                .ledger()
+                .records()
+                .iter()
+                .map(|record| {
+                    let event = record.event();
+                    LogRecord {
+                        id: event.id,
+                        epoch: event.epoch,
+                        at: event.at,
+                        event: ledger_event(&event.kind),
+                    }
+                })
+                .collect(),
+        })
     }
 
     async fn job_run(self: &Arc<Self>, id: JobId, out: &mut Out) -> Result<RunPlan, NodeError> {
@@ -434,15 +452,13 @@ impl Node {
             MarkerState::Suspending { .. } => {
                 return Err(NodeError::Unfinished {
                     job: id,
-                    what: "a suspend",
-                    command: "suspend",
+                    step: Step::Suspend,
                 });
             }
             MarkerState::Restoring { .. } => {
                 return Err(NodeError::Unfinished {
                     job: id,
-                    what: "a restore",
-                    command: "resume",
+                    step: Step::Restore,
                 });
             }
         }
@@ -451,7 +467,7 @@ impl Node {
         {
             return Err(NodeError::AlreadyRunningHarness {
                 job: id,
-                pid: record.pid.get(),
+                pid: record.pid,
             });
         }
         plan(&job, token.epoch, marker.root, None, out)
@@ -470,8 +486,7 @@ impl Node {
         pid: NonZeroU32,
         harness: HarnessKind,
         session: Option<SessionId>,
-        out: &mut Out,
-    ) -> Result<(), NodeError> {
+    ) -> Result<Registered, NodeError> {
         let job = self.job(id).await?;
         let mut job = job.lock().await;
         let token = owner_token(&job, self.id)?;
@@ -488,7 +503,7 @@ impl Node {
         {
             return Err(NodeError::AlreadyRunningHarness {
                 job: id,
-                pid: record.pid.get(),
+                pid: record.pid,
             });
         }
         if !local::leads_group(pid).await {
@@ -530,10 +545,11 @@ impl Node {
                 epoch,
             })?;
         }
-        out.say(format!(
-            "Resumed recorded at epoch {epoch}; {harness} runs as pid {pid}"
-        ));
-        Ok(())
+        Ok(Registered {
+            epoch,
+            harness,
+            pid,
+        })
     }
 
     /// Records the session a harness named after it started, for the
@@ -547,16 +563,12 @@ impl Node {
     /// recorded later would name one the snapshot does not hold.
     pub(crate) async fn harness_session(
         &self,
-        named: NamedSession,
-        out: &mut Out,
-    ) -> Result<(), NodeError> {
-        let NamedSession {
-            job: id,
-            epoch,
-            pid,
-            harness,
-            session,
-        } = named;
+        id: JobId,
+        epoch: Epoch,
+        pid: NonZeroU32,
+        harness: HarnessKind,
+        session: SessionId,
+    ) -> Result<SessionRecorded, NodeError> {
         let job = self.job(id).await?;
         let job = job.lock().await;
         let token = owner_token(&job, self.id)?;
@@ -581,8 +593,7 @@ impl Node {
                 session: session.clone(),
             },
         )?;
-        out.say(format!("recorded {harness} session {session}"));
-        Ok(())
+        Ok(SessionRecorded { harness, session })
     }
 
     async fn harness_exited(&self, id: JobId, pid: NonZeroU32) -> Result<(), NodeError> {
@@ -630,11 +641,11 @@ impl Node {
             return job.suspended_in().ok_or(NodeError::NoWorkspace(id));
         };
         if !marker.is_current(epoch, job.latest()).await {
-            out.say(format!(
-                "the workspace at {} was left at epoch {}, before this node's tenure, so it is not captured; `fabric job resume {id}` sets it aside",
-                marker.root.display(),
-                marker.epoch
-            ));
+            out.emit(Event::StaleWorkspaceKept {
+                job: id,
+                root: marker.root.clone(),
+                left_at: marker.epoch,
+            });
             return job.suspended_in().ok_or(NodeError::NoWorkspace(id));
         }
         if let (MarkerState::Clean { snapshot, .. }, Some(suspended)) =
@@ -642,23 +653,24 @@ impl Node {
             && *snapshot == suspended
         {
             if marker.is_unchanged().await {
-                out.say(format!("already suspended in snapshot {suspended}"));
+                out.emit(Event::AlreadySuspended {
+                    snapshot: suspended,
+                });
                 return Ok(suspended);
             }
-            out.say(format!(
-                "the workspace changed after snapshot {suspended}, by hand or by a harness Fabric did not start; capturing it again"
-            ));
+            out.emit(Event::WorkspaceChanged {
+                snapshot: suspended,
+            });
         }
         if let MarkerState::Restoring { .. } = marker.state {
             return Err(NodeError::Unfinished {
                 job: id,
-                what: "a restore",
-                command: "resume",
+                step: Step::Restore,
             });
         }
         if let Some(record) = job.harness_record()? {
             if record.liveness().await != Liveness::Gone {
-                out.say(format!("stopping the harness, pid {}", record.pid));
+                out.emit(Event::StoppingHarness { pid: record.pid });
                 record.stop(STOP_GRACE).await?;
             }
             local::remove(&job.dir().harness())?;
@@ -671,7 +683,7 @@ impl Node {
             .last()
             .map(|r| r.event().kind.clone());
         let (snapshot, tree) = if let Some(EventKind::SnapshotPublished { snapshot, .. }) = last {
-            out.say(format!("finishing the suspend that published {snapshot}"));
+            out.emit(Event::FinishingSuspend { snapshot });
             let tree = match marker.state {
                 MarkerState::Suspending { tree, .. } => tree,
                 _ => None,
@@ -707,10 +719,10 @@ impl Node {
             state: MarkerState::Clean { snapshot, tree },
             epoch,
         })?;
-        out.say(format!(
-            "suspended in snapshot {snapshot}; this node keeps the lease at epoch {}",
-            job.ledger().lease().epoch()
-        ));
+        out.emit(Event::Suspended {
+            snapshot,
+            epoch: job.ledger().lease().epoch(),
+        });
         Ok(snapshot)
     }
 
@@ -738,9 +750,7 @@ impl Node {
         match harness.confirm_departure(&manifest).await {
             Ok(()) => Ok(()),
             Err(HarnessError::DepartureNotPending { session }) => {
-                out.say(format!(
-                    "no departure record waits for session {session}; its rewritable files stay this node's"
-                ));
+                out.emit(Event::NoDepartureRecord { session });
                 Ok(())
             }
             Err(e) => Err(e.into()),
@@ -763,12 +773,11 @@ impl Node {
             job.clear_harness_state()?;
             std::fs::create_dir_all(&state_dir).map_err(|e| NodeError::io(&state_dir, e))?;
             let manifest = harness.capture(root, &session, &state_dir).await?;
-            out.say(format!(
-                "captured {} session {} ({} files)",
-                record.harness,
+            out.emit(Event::SessionCaptured {
+                harness: record.harness.clone(),
                 session,
-                manifest.files().len()
-            ));
+                files: u64::try_from(manifest.files().len()).unwrap_or(u64::MAX),
+            });
             harness_state = Some(state_dir);
         }
         let facts = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
@@ -800,12 +809,16 @@ impl Node {
             Ok((snapshot, captured.report))
         })
         .await?;
-        out.say(format!(
-            "snapshot {snapshot}: {} files, {} bytes, {} new objects",
-            report.files, report.bytes, report.new_objects
-        ));
+        out.emit(Event::SnapshotPublished {
+            snapshot,
+            files: report.files,
+            bytes: report.bytes,
+            new_objects: report.new_objects,
+        });
         for path in report.denied.iter().chain(&report.denied_untracked) {
-            out.say(format!("left behind (secret pattern): {path}"));
+            out.emit(Event::LeftBehind {
+                path: path.to_string(),
+            });
         }
         Ok(snapshot)
     }
@@ -821,8 +834,11 @@ impl Node {
             .collect();
         for peer in peers {
             match self.push_records(id, peer).await {
-                Ok(()) => out.say(format!("copied the ledger and the snapshot to {peer}")),
-                Err(e) => out.say(format!("not copied to {peer}: {e}")),
+                Ok(()) => out.emit(Event::Replicated { peer }),
+                Err(e) => out.emit(Event::NotReplicated {
+                    peer,
+                    error: e.to_refusal(),
+                }),
             }
         }
     }
@@ -941,9 +957,10 @@ impl Node {
         match view {
             LeaseView::Owner(_) => {}
             LeaseView::Departing { target, move_id } if target == to => {
-                out.say(format!(
-                    "move {move_id} toward {to} is open; offering it again"
-                ));
+                out.emit(Event::MoveReoffered {
+                    move_id,
+                    target: to,
+                });
             }
             LeaseView::Departing { move_id, target } => {
                 return Err(NodeError::Departing {
@@ -955,7 +972,7 @@ impl Node {
             // A move asked again after its answer was lost: the target's
             // decision arrived while resolving, and the move is done.
             LeaseView::Departed { owner, epoch } if owner == to => {
-                out.say(format!("{to} already owns the job at epoch {epoch}"));
+                out.emit(Event::AlreadyMoved { owner, epoch });
                 return Ok(());
             }
             LeaseView::Departed { owner, epoch } => {
@@ -989,7 +1006,7 @@ impl Node {
             self.suspend_locked(&mut job, path_var, out).await?;
         }
         self.push_records(id, to).await?;
-        out.say(format!("{to} holds the ledger and the snapshot"));
+        out.emit(Event::TargetHoldsCopy { target: to });
 
         let offer = self.depart(id, to, out).await?;
         faults::hit(Point::AfterDepartingWrite).await;
@@ -1069,9 +1086,10 @@ impl Node {
                 clock::now_ms(),
             )?;
             job.commit(record, Author::Node(self.id))?;
-            out.say(format!(
-                "MoveStarted {move_id}: this copy does not run until {to} decides"
-            ));
+            out.emit(Event::MoveStarted {
+                move_id,
+                target: to,
+            });
         }
         Ok(job.ledger().offer(self.id))
     }
@@ -1159,14 +1177,15 @@ impl Node {
                     last_error = format!("{to} is at epoch {current} and has not caught up");
                 }
                 Err(e) => {
-                    out.say(format!(
-                        "no answer from {to} ({e}); asking for its decision"
-                    ));
                     last_error = e.to_string();
+                    out.emit(Event::NoAnswer {
+                        target: to,
+                        error: e.to_refusal(),
+                    });
                 }
             }
         }
-        out.say(format!("last error: {last_error}"));
+        out.emit(Event::MoveGaveUp { detail: last_error });
         Err(NodeError::Departing {
             job: id,
             move_id: offer.move_id,
@@ -1188,20 +1207,17 @@ impl Node {
         if grew {
             match job.view(self.id) {
                 LeaseView::Departed { owner, epoch } => {
-                    out.say(format!(
-                        "{owner} imported the job and owns it at epoch {epoch}"
-                    ));
+                    out.emit(Event::Imported { owner, epoch });
                 }
                 LeaseView::Owner(token) => {
-                    out.say(format!(
-                        "{from} declined the move; this node owns the job again at epoch {}",
-                        token.epoch
-                    ));
+                    out.emit(Event::Declined {
+                        target: from,
+                        epoch: token.epoch,
+                    });
                 }
-                other => out.say(format!(
-                    "the decision left this node as {}",
-                    view_word(&other)
-                )),
+                other => out.emit(Event::DecisionLeft {
+                    standing: standing(&other),
+                }),
             }
         }
         self.settle(&mut job, out).await
@@ -1237,13 +1253,15 @@ impl Node {
                     .await
             }
             Ok(_) => {
-                out.say(format!("move {move_id} toward {target} is still undecided"));
+                out.emit(Event::MoveUndecided { move_id, target });
                 Ok(())
             }
             Err(e) => {
-                out.say(format!(
-                    "move {move_id} toward {target} is open and {target} did not answer: {e}"
-                ));
+                out.emit(Event::MoveUnanswered {
+                    move_id,
+                    target,
+                    error: e.to_refusal(),
+                });
                 Ok(())
             }
         }
@@ -1261,10 +1279,10 @@ impl Node {
                 !forked && matches!(view, LeaseView::Owner(token) if token.epoch == record.epoch);
             if !owned {
                 if record.liveness().await != Liveness::Gone {
-                    out.say(format!(
-                        "fenced: epoch {} is over for this node; stopping harness pid {}",
-                        record.epoch, record.pid
-                    ));
+                    out.emit(Event::Fenced {
+                        epoch: record.epoch,
+                        pid: record.pid,
+                    });
                     record.stop(FENCE_GRACE).await?;
                 }
                 local::remove(&job.dir().harness())?;
@@ -1285,10 +1303,7 @@ impl Node {
             let dest =
                 paths::departed_copy(&marker.root, epoch).ok_or_else(|| no_parent(&marker.root))?;
             if move_aside(&marker.root, &dest)? {
-                out.say(format!(
-                    "this node's copy moved out of the root to {}; it is kept, never run",
-                    dest.display()
-                ));
+                out.emit(Event::CopyMovedAside { to: dest });
             }
             job.clear_marker()?;
         }
@@ -1362,7 +1377,7 @@ impl Node {
         {
             return Err(NodeError::AlreadyRunningHarness {
                 job: id,
-                pid: record.pid.get(),
+                pid: record.pid,
             });
         }
         plan(&job, token.epoch, root, harness, out)
@@ -1375,7 +1390,7 @@ impl Node {
         holder: NodeId,
         out: &mut Out,
     ) -> Result<(), NodeError> {
-        out.say(format!("pulling job {id} from {holder}"));
+        out.emit(Event::Pulling { job: id, holder });
         self.pull_records(id, holder).await?;
         self.ensure_latest(id, holder).await?;
         let epoch = {
@@ -1404,7 +1419,7 @@ impl Node {
                 });
             }
         };
-        out.say(format!("{holder} started move {move_id} toward this node"));
+        out.emit(Event::HolderStartedMove { holder, move_id });
         self.pull_records(id, holder).await?;
         self.ensure_latest(id, holder).await?;
         faults::hit(Point::BeforeImport).await;
@@ -1456,16 +1471,17 @@ impl Node {
                     });
                 }
             }
-            out.say(format!(
-                "imported move {move_id}; this node owns the job at epoch {}",
-                job.ledger().lease().epoch()
-            ));
+            out.emit(Event::ImportedHere {
+                move_id,
+                epoch: job.ledger().lease().epoch(),
+            });
         }
         // The holder learns the decision now, or from MoveStatus later.
         if let Err(e) = self.push_records(id, holder).await {
-            out.say(format!(
-                "{holder} has not seen the import yet ({e}); it will ask for the decision"
-            ));
+            out.emit(Event::HolderNotTold {
+                holder,
+                error: e.to_refusal(),
+            });
         }
         Ok(())
     }
@@ -1596,7 +1612,7 @@ impl Node {
                 state: MarkerState::Live | MarkerState::Clean { .. },
                 ..
             }) => {
-                out.say(format!("workspace already at {}", root.display()));
+                out.emit(Event::WorkspaceInPlace { root: root.clone() });
                 return Ok(root.clone());
             }
             Some(Marker {
@@ -1605,8 +1621,7 @@ impl Node {
             }) => {
                 return Err(NodeError::Unfinished {
                     job: id,
-                    what: "a suspend",
-                    command: "suspend",
+                    step: Step::Suspend,
                 });
             }
             _ => {}
@@ -1619,7 +1634,16 @@ impl Node {
             id,
             job.dir(),
         );
-        out.say(choice.to_string());
+        out.emit(match &choice {
+            RootChoice::Same(root) => Event::RootChosen {
+                root: root.clone(),
+                recorded: None,
+            },
+            RootChoice::Fallback { root, captured } => Event::RootChosen {
+                root: root.clone(),
+                recorded: Some(captured.clone()),
+            },
+        });
         let root = choice.root().to_owned();
         check_root(
             &root,
@@ -1702,10 +1726,11 @@ impl Node {
             )?)
         })
         .await?;
-        out.say(format!(
-            "restored snapshot {snapshot}: {} files, {} bytes",
-            report.files, report.bytes
-        ));
+        out.emit(Event::Restored {
+            snapshot,
+            files: report.files,
+            bytes: report.bytes,
+        });
         Ok(())
     }
 
@@ -1726,12 +1751,12 @@ impl Node {
             .ok_or_else(|| no_parent(&marker.root))?;
         let dest = unused(&base);
         if move_aside(&marker.root, &dest)? {
-            out.say(format!(
-                "the workspace at {} was left at epoch {}, before this node's tenure at epoch {epoch}, and may differ from the job's latest snapshot; it moved to {}, kept, never run",
-                marker.root.display(),
-                marker.epoch,
-                dest.display()
-            ));
+            out.emit(Event::OrphanSetAside {
+                root: marker.root.clone(),
+                left_at: marker.epoch,
+                epoch,
+                to: dest,
+            });
         }
         local::remove(&job.dir().session())?;
         job.clear_marker()
@@ -1756,11 +1781,10 @@ impl Node {
                 session: state.session().clone(),
             },
         )?;
-        out.say(format!(
-            "restored {} session {}",
-            state.kind(),
-            state.session()
-        ));
+        out.emit(Event::SessionRestored {
+            harness: state.kind().clone(),
+            session: state.session().clone(),
+        });
         Ok(())
     }
 
@@ -1799,27 +1823,32 @@ impl Node {
                 clock::event_id(),
                 clock::now_ms(),
             )?;
-            let warning = format!(
-                "{}; the owner's last record is {}",
-                proposal.warning,
-                age(clock::now_ms().saturating_sub(proposal.warning.last_record_at))
-            );
+            let age_ms = clock::now_ms().saturating_sub(proposal.warning.last_record_at);
+            let described = proposal.warning.with_age(age_ms);
+            let warning = StealWarning {
+                owner: proposal.warning.owner,
+                snapshot: proposal.warning.snapshot,
+                owner_stopped_at_snapshot: proposal.warning.owner_stopped_at_snapshot,
+                last_record_at: proposal.warning.last_record_at,
+                age_ms,
+            };
             if !force {
-                return Err(NodeError::StealNeedsForce(format!(
-                    "a steal would bump the epoch without {owner}'s consent: {warning}. Pass --force to do it"
-                )));
+                return Err(NodeError::StealNeedsForce { warning, described });
             }
-            out.say(format!("warning: {warning}"));
+            out.emit(Event::StealWarning { warning });
             job.commit(proposal.record, Author::Node(self.id))?;
-            job.append(self.id, EventKind::Note { text: warning })?;
-            out.say(format!(
-                "this node owns the job at epoch {}; run `fabric job resume {id}` to restore and launch it here",
-                job.ledger().lease().epoch()
-            ));
+            job.append(self.id, EventKind::Note { text: described })?;
+            out.emit(Event::Stole {
+                job: id,
+                epoch: job.ledger().lease().epoch(),
+            });
             self.settle(&mut job, out).await?;
         }
         if let Err(e) = self.push_records(id, owner).await {
-            out.say(format!("{owner} has not seen the steal yet: {e}"));
+            out.emit(Event::OwnerNotTold {
+                owner,
+                error: e.to_refusal(),
+            });
         }
         Ok(())
     }
@@ -1829,8 +1858,7 @@ impl Node {
         id: JobId,
         decision: Decision,
         note: &str,
-        out: &mut Out,
-    ) -> Result<(), NodeError> {
+    ) -> Result<String, NodeError> {
         let job = self.job(id).await?;
         let mut job = job.lock().await;
         owner_token(&job, self.id)?;
@@ -1844,8 +1872,7 @@ impl Node {
             format!("{word}: {note}")
         };
         job.append(self.id, EventKind::DecisionRecorded { text: text.clone() })?;
-        out.say(format!("recorded: {text}"));
-        Ok(())
+        Ok(text)
     }
 
     async fn doctor(
@@ -1853,15 +1880,19 @@ impl Node {
         peer: Option<NodeId>,
         job: Option<JobId>,
         path_var: &OsString,
-        out: &mut Out,
-    ) -> Result<(), NodeError> {
+    ) -> Result<DoctorReport, NodeError> {
         let Some(peer) = peer else {
             let facts =
                 NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
-            for (name, value) in facts.iter() {
-                out.say(format!("{name}: {}", value.replace('\n', " / ")));
-            }
-            return Ok(());
+            return Ok(DoctorReport::Facts {
+                facts: facts
+                    .iter()
+                    .map(|(name, value)| Fact {
+                        name: name.to_owned(),
+                        value: value.to_owned(),
+                    })
+                    .collect(),
+            });
         };
         let (harness, root) = match job {
             Some(id) => {
@@ -1874,18 +1905,22 @@ impl Node {
             }
             None => (None, None),
         };
-        self.preflight(
+        let rows = self
+            .compare(
+                peer,
+                harness.as_ref().zip(root.as_deref()),
+                Target::Peer,
+                path_var,
+            )
+            .await?;
+        Ok(DoctorReport::Compared {
             peer,
-            harness.as_ref().zip(root.as_deref()),
-            Target::Peer,
-            path_var,
-            false,
-            out,
-        )
-        .await
+            rows: rows.iter().map(doctor::Row::to_wire).collect(),
+        })
     }
 
-    /// Compares this node's facts with `peer`'s and stops on a refusal `force` does not waive.
+    /// Compares this node's facts with `peer`'s, reports the rows, and
+    /// stops on a refusal `force` does not waive.
     async fn preflight(
         self: &Arc<Self>,
         peer: NodeId,
@@ -1895,6 +1930,29 @@ impl Node {
         force: bool,
         out: &mut Out,
     ) -> Result<(), NodeError> {
+        let rows = self.compare(peer, job, target, path_var).await?;
+        out.emit(Event::Preflight {
+            peer,
+            rows: rows.iter().map(doctor::Row::to_wire).collect(),
+        });
+        let blocking = doctor::blocking(&rows, force);
+        if blocking.is_empty() {
+            Ok(())
+        } else {
+            Err(NodeError::Preflight(
+                blocking.iter().map(|row| row.fact.to_owned()).collect(),
+            ))
+        }
+    }
+
+    /// This node's facts compared with `peer`'s, row by row (ADR 0008).
+    async fn compare(
+        self: &Arc<Self>,
+        peer: NodeId,
+        job: Option<(&HarnessKind, &Path)>,
+        target: Target,
+        path_var: &OsString,
+    ) -> Result<Vec<doctor::Row>, NodeError> {
         let here = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
         let session = self.dial(peer).await?;
         let theirs =
@@ -1906,7 +1964,7 @@ impl Node {
                     reason: e.to_string(),
                 })?;
         let theirs = NodeFacts::from_wire(&theirs);
-        let rows = doctor::compare(
+        Ok(doctor::compare(
             &here,
             &theirs,
             &Context {
@@ -1916,17 +1974,7 @@ impl Node {
                 clock_skew_ms: Some(session.clock_skew_ms()),
                 wire: Some(session.kind().to_string()),
             },
-        );
-        for row in &rows {
-            out.say(row.to_string());
-        }
-        let blocking = doctor::blocking(&rows, force);
-        if blocking.is_empty() {
-            Ok(())
-        } else {
-            let facts: Vec<&str> = blocking.iter().map(|r| r.fact).collect();
-            Err(NodeError::Preflight(facts.join(", ")))
-        }
+        ))
     }
 }
 
@@ -1997,18 +2045,27 @@ fn plan(
     let harness = harness.unwrap_or_else(|| job.harness().clone());
     let session = match job.session()? {
         Some(record) if record.harness == harness => {
-            out.say(format!("continuing {harness} session {}", record.session));
+            out.emit(Event::ContinuingSession {
+                harness: harness.clone(),
+                session: record.session.clone(),
+            });
             Some(record.session)
         }
         Some(record) => {
-            out.say(format!(
-                "starting a new {harness} session; the {} session {} stays in the snapshot (cross-harness resume is an experiment, ADR 0006)",
-                record.harness, record.session
-            ));
+            out.emit(Event::NewSession {
+                harness: harness.clone(),
+                previous: Some(HarnessSession {
+                    harness: record.harness,
+                    session: record.session,
+                }),
+            });
             None
         }
         None => {
-            out.say(format!("starting a new {harness} session"));
+            out.emit(Event::NewSession {
+                harness: harness.clone(),
+                previous: None,
+            });
             None
         }
     };
@@ -2027,13 +2084,14 @@ fn report_caches(caches: &[fabric_core::snapshot::CacheEntry], facts: &NodeFacts
     for cache in caches {
         let mine = facts.key_like(&cache.key);
         if cache.key.matches(&mine) && cache.carry == fabric_core::snapshot::CarryState::Carried {
-            out.say(format!("{}: carried, the keys match", cache.path));
+            out.emit(Event::CacheCarried {
+                path: cache.path.to_string(),
+            });
         } else {
-            out.say(format!(
-                "{}: rebuilt here, {}",
-                cache.path,
-                key_difference(&cache.key, &mine)
-            ));
+            out.emit(Event::CacheRebuilt {
+                path: cache.path.to_string(),
+                why: key_difference(&cache.key, &mine),
+            });
         }
     }
 }
@@ -2121,87 +2179,92 @@ fn offered_words(answer: &Fenced<Offered>) -> String {
     }
 }
 
-/// How long ago something happened, `ms` milliseconds back, in the largest whole unit.
-fn age(ms: u64) -> String {
-    let minutes = ms / 60_000;
-    match minutes {
-        0 => "less than a minute old".to_owned(),
-        1..60 => format!("{minutes} min old"),
-        60..2880 => format!("{} h old", minutes / 60),
-        _ => format!("{} days old", minutes / 1440),
-    }
-}
-
 /// What `status` says about the workspace `marker` names, from the marker
 /// and how this node relates to the job together.
-async fn workspace_line(job: &Job, me: NodeId, marker: &Marker, frozen: bool) -> String {
-    let root = marker.root.display();
+async fn workspace_state(job: &Job, me: NodeId, marker: &Marker, frozen: bool) -> WorkspaceState {
     match job.view(me) {
         LeaseView::Owner(token) if !frozen => {
             if marker.is_current(token.epoch, job.latest()).await {
-                format!("workspace: {root} ({})", marker_word(&marker.state))
+                WorkspaceState::Current {
+                    marker: marker_state(&marker.state),
+                }
             } else {
-                format!(
-                    "workspace: {root} was left at epoch {}, before this node's tenure; `fabric job resume {}` sets it aside and restores the latest snapshot",
-                    marker.epoch,
-                    job.id()
-                )
+                WorkspaceState::Stale {
+                    left_at: marker.epoch,
+                }
             }
         }
         LeaseView::Departing { target, .. } if !frozen && marker.is_unchanged().await => {
-            format!(
-                "workspace: {root} is clean at the snapshot offered to {target} and waits for its decision"
-            )
+            WorkspaceState::AwaitingDecision { target }
         }
-        _ if !frozen && marker.is_unchanged().await => format!(
-            "workspace: {root} is clean at a published snapshot; this node never runs it and moves it aside when it next settles the job"
-        ),
-        _ => format!(
-            "workspace: {root} is an orphan: it may hold changes made after the last snapshot this node published, and nothing here deletes it"
-        ),
+        _ if !frozen && marker.is_unchanged().await => WorkspaceState::CleanCopy,
+        _ => WorkspaceState::Orphan,
     }
 }
 
-fn view_word(view: &LeaseView) -> &'static str {
+fn standing(view: &LeaseView) -> Standing {
     match view {
-        LeaseView::Owner(_) => "owner",
-        LeaseView::Departing { .. } => "departing",
-        LeaseView::Departed { .. } => "departed",
-        LeaseView::Replica { .. } => "replica",
+        LeaseView::Owner(_) => Standing::Owner,
+        LeaseView::Departing { .. } => Standing::Departing,
+        LeaseView::Departed { .. } => Standing::Departed,
+        LeaseView::Replica { .. } => Standing::Replica,
     }
 }
 
-fn marker_word(state: &MarkerState) -> String {
+fn marker_state(state: &MarkerState) -> fabric_client::api::Marker {
+    use fabric_client::api::Marker as Shown;
     match state {
-        MarkerState::Live => {
-            "live: the harness may have changed it since the last snapshot".to_owned()
-        }
-        MarkerState::Suspending { .. } => "a suspend did not finish".to_owned(),
-        MarkerState::Clean { snapshot, .. } => format!("clean at snapshot {snapshot}"),
-        MarkerState::Restoring { snapshot } => format!("a restore of {snapshot} did not finish"),
+        MarkerState::Live => Shown::Live,
+        MarkerState::Suspending { .. } => Shown::Suspending,
+        MarkerState::Clean { snapshot, .. } => Shown::Clean {
+            snapshot: *snapshot,
+        },
+        MarkerState::Restoring { snapshot } => Shown::Restoring {
+            snapshot: *snapshot,
+        },
     }
 }
 
-fn describe(kind: &EventKind) -> String {
-    match kind {
+fn ledger_event(kind: &EventKind) -> LedgerEvent {
+    match kind.clone() {
         EventKind::Created {
             goal,
             harness,
             created_by,
             ..
-        } => format!("Created by {created_by} under {harness}: {goal}"),
-        EventKind::MoveStarted { move_id, target } => {
-            format!("MoveStarted {move_id} toward {target}")
+        } => LedgerEvent::Created {
+            created_by,
+            harness,
+            goal,
+        },
+        EventKind::MoveStarted { move_id, target } => LedgerEvent::MoveStarted { move_id, target },
+        EventKind::MoveImported { move_id, from } => LedgerEvent::MoveImported { move_id, from },
+        EventKind::MoveAborted { move_id } => LedgerEvent::MoveAborted { move_id },
+        EventKind::Stolen { by, from, reason } => LedgerEvent::Stolen { by, from, reason },
+        EventKind::SnapshotPublished { snapshot, parent } => {
+            LedgerEvent::SnapshotPublished { snapshot, parent }
         }
-        EventKind::MoveImported { move_id, from } => format!("MoveImported {move_id} from {from}"),
-        EventKind::MoveAborted { move_id } => format!("MoveAborted {move_id}"),
-        EventKind::Stolen { by, from, reason } => format!("Stolen by {by} from {from}: {reason}"),
-        EventKind::SnapshotPublished { snapshot, .. } => format!("SnapshotPublished {snapshot}"),
-        EventKind::Suspended { snapshot } => format!("Suspended in {snapshot}"),
-        EventKind::Resumed { node, harness, .. } => format!("Resumed on {node} under {harness}"),
-        EventKind::EnvSpecChanged { env_spec } => format!("EnvSpecChanged {env_spec}"),
-        EventKind::DecisionRecorded { text } => format!("DecisionRecorded: {text}"),
-        EventKind::Note { text } => format!("Note: {text}"),
+        EventKind::Suspended { snapshot } => LedgerEvent::Suspended { snapshot },
+        EventKind::Resumed {
+            node,
+            snapshot,
+            harness,
+        } => LedgerEvent::Resumed {
+            node,
+            snapshot,
+            harness,
+        },
+        EventKind::EnvSpecChanged { env_spec } => LedgerEvent::EnvSpecChanged { env_spec },
+        EventKind::DecisionRecorded { text } => LedgerEvent::DecisionRecorded { text },
+        EventKind::Note { text } => LedgerEvent::Note { text },
+    }
+}
+
+/// The client API's name for the wire a session runs on.
+fn wire(kind: fabric_net::transport::TransportKind) -> Wire {
+    match kind {
+        fabric_net::transport::TransportKind::Quic => Wire::Quic,
+        fabric_net::transport::TransportKind::TcpTls => Wire::TcpTls,
     }
 }
 
@@ -2264,11 +2327,10 @@ pub(crate) mod tests {
                 .unwrap();
             assert!(status.success());
         }
-        let mut out = Out::default();
-        node.job_new(&repo, "goal".to_owned(), HarnessKind::Codex, &mut out)
+        node.job_new(&repo, "goal".to_owned(), HarnessKind::Codex)
             .await
-            .unwrap();
-        out.lines[0].parse().unwrap()
+            .unwrap()
+            .job
     }
 
     fn sleeper() -> std::process::Child {
@@ -2284,15 +2346,9 @@ pub(crate) mod tests {
     }
 
     async fn register(node: &Arc<Node>, id: JobId, pid: NonZeroU32) -> Result<(), NodeError> {
-        node.harness_started(
-            id,
-            Epoch::FIRST,
-            pid,
-            HarnessKind::Codex,
-            None,
-            &mut Out::default(),
-        )
-        .await
+        node.harness_started(id, Epoch::FIRST, pid, HarnessKind::Codex, None)
+            .await
+            .map(drop)
     }
 
     /// Serves `a` and `b` and pairs them, each with the other's address.
@@ -2300,9 +2356,7 @@ pub(crate) mod tests {
         for (node, peer) in [(a, b), (b, a)] {
             tokio::spawn(Arc::clone(node).run());
             let addr = peer.local_addr().unwrap().to_string();
-            node.node_add(peer.id, Some(&addr), &mut Out::default())
-                .await
-                .unwrap();
+            node.node_add(peer.id, Some(&addr)).await.unwrap();
         }
     }
 
@@ -2391,17 +2445,8 @@ pub(crate) mod tests {
         let name_at = |epoch, pid| {
             let (node, thread) = (Arc::clone(&node), thread.clone());
             async move {
-                node.harness_session(
-                    NamedSession {
-                        job: id,
-                        epoch,
-                        pid,
-                        harness: HarnessKind::Codex,
-                        session: thread,
-                    },
-                    &mut Out::default(),
-                )
-                .await
+                node.harness_session(id, epoch, pid, HarnessKind::Codex, thread)
+                    .await
             }
         };
         let name = |pid| name_at(Epoch::FIRST, pid);
@@ -2467,7 +2512,10 @@ pub(crate) mod tests {
             peer,
             &fabric_net::rpc::RpcError::Deadline(Duration::from_secs(15)),
         );
-        assert_eq!(late.refusal(), crate::control::Refusal::Unreachable);
+        assert_eq!(
+            late.to_refusal().kind(),
+            fabric_client::api::RefusalKind::Unreachable
+        );
     }
 
     /// Users read status when a move is frozen; a clean copy waiting for
@@ -2481,14 +2529,12 @@ pub(crate) mod tests {
         node.depart(id, NodeId::from_bytes([7; 32]), &mut Out::default())
             .await
             .unwrap();
-        let mut out = Out::default();
-        node.job_status(id, &mut out).await.unwrap();
-        let line = out
-            .lines
-            .iter()
-            .find(|line| line.starts_with("workspace: "))
-            .unwrap();
-        assert!(line.contains("waits for its decision"), "{line}");
+        let status = node.job_status(id).await.unwrap();
+        let state = status.workspace.unwrap().state;
+        assert!(
+            matches!(state, WorkspaceState::AwaitingDecision { .. }),
+            "{state:?}"
+        );
     }
 
     /// A node frozen after a fork must not steal on its forked chain: the
@@ -2524,14 +2570,6 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn an_age_reads_in_the_largest_whole_unit() {
-        assert_eq!(age(59_000), "less than a minute old");
-        assert_eq!(age(3 * 60_000), "3 min old");
-        assert_eq!(age(3 * 3_600_000), "3 h old");
-        assert_eq!(age(3 * 86_400_000), "3 days old");
-    }
-
     #[tokio::test]
     async fn a_second_harness_is_refused_while_the_recorded_one_runs() {
         let (dir, node) = node();
@@ -2540,7 +2578,7 @@ pub(crate) mod tests {
         register(&node, id, pid(&first)).await.unwrap();
         let refused = register(&node, id, pid(&second)).await;
         assert!(
-            matches!(refused, Err(NodeError::AlreadyRunningHarness { pid: p, .. }) if p == first.id()),
+            matches!(refused, Err(NodeError::AlreadyRunningHarness { pid: p, .. }) if p.get() == first.id()),
             "{refused:?}"
         );
         for child in [&mut first, &mut second] {

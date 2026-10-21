@@ -9,9 +9,9 @@
 //! inside with a worse message. The comparison is pure; measuring is
 //! `facts`' job.
 
-use std::fmt;
 use std::path::Path;
 
+use fabric_client::api::{Outcome as WireOutcome, PreflightRow};
 use fabric_core::harness::HarnessKind;
 
 use crate::facts::{NodeFacts, major, name};
@@ -43,17 +43,6 @@ pub enum Waiver {
     Never,
 }
 
-impl fmt::Display for Outcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad(match self {
-            Outcome::Equal => "ok",
-            Outcome::Fallback => "rebuild",
-            Outcome::Warn => "warn",
-            Outcome::Refuse(_) => "refuse",
-        })
-    }
-}
-
 /// One line of the preflight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
@@ -69,21 +58,23 @@ pub struct Row {
     pub note: String,
 }
 
-impl fmt::Display for Row {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "absent".to_owned());
-        write!(
-            f,
-            "{:<7} {:<16} here: {}  peer: {}",
-            self.outcome,
-            self.fact,
-            show(&self.here).replace('\n', " / "),
-            show(&self.peer).replace('\n', " / ")
-        )?;
-        if !self.note.is_empty() {
-            write!(f, "  ({})", self.note)?;
+impl Row {
+    /// The row as the client API carries it (ADR 0018).
+    #[must_use]
+    pub fn to_wire(&self) -> PreflightRow {
+        PreflightRow {
+            fact: self.fact.to_owned(),
+            here: self.here.clone(),
+            peer: self.peer.clone(),
+            outcome: match self.outcome {
+                Outcome::Equal => WireOutcome::Equal,
+                Outcome::Fallback => WireOutcome::Fallback,
+                Outcome::Warn => WireOutcome::Warn,
+                Outcome::Refuse(Waiver::Force) => WireOutcome::Refuse,
+                Outcome::Refuse(Waiver::Never) => WireOutcome::RefuseAlways,
+            },
+            note: self.note.clone(),
         }
-        Ok(())
     }
 }
 

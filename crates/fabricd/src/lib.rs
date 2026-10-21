@@ -13,7 +13,7 @@
 
 mod catchup;
 mod clock;
-pub mod control;
+mod control;
 mod doctor;
 mod durable;
 pub mod error;

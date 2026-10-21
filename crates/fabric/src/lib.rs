@@ -3,7 +3,8 @@
 //!
 //! Every command but `serve` is a client of the node daemon on this
 //! machine: it sends one request over the control socket in the state
-//! directory and prints the lines the daemon answers with. The one thing
+//! directory through `fabric-client` (ADR 0018) and prints the node's
+//! typed events and reply as lines (`render`) as they arrive. The one thing
 //! the CLI does itself is the harness, because an interactive agent needs
 //! the user's terminal and the user's shell environment and a daemon has
 //! neither (ADR 0003, Who supervises the harness): it materializes the
@@ -29,6 +30,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use fabric_client::api::{Decision, DoctorReport, Event, RefusalKind, Reply, Request, RunPlan};
+use fabric_client::{Client, ClientError, Launched};
 use fabric_core::env::{EnvVarName, SetupArg};
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{JobId, NodeId};
@@ -38,14 +41,12 @@ use fabric_harness::claude::{ClaudeCode, LeftReason, TrustOutcome};
 use fabric_harness::codex::Codex;
 use fabric_harness::{Harness, Launch, Running, TurnReport};
 use fabric_net::endpoint::DialOrder;
-use fabricd::control::{
-    self, ControlError, Decision, NO_DAEMON_EXIT, NamedSession, Refusal, Request, Response, RunPlan,
-};
 use fabricd::harnesses::{HarnessConfig, HarnessEnv, acp_adapter, parse_harness};
 use fabricd::node::{Node, NodeConfig};
 use fabricd::paths::{STATE_DIR_ENV, StateDir};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+mod render;
 mod terminal;
 
 /// Move a development job between your machines and harnesses.
@@ -240,6 +241,17 @@ fn path_var() -> OsString {
     std::env::var_os("PATH").unwrap_or_default()
 }
 
+/// The `PATH` to send the node, which measures facts with it; the node
+/// uses its own when this one is not UTF-8.
+fn path_text() -> Option<String> {
+    std::env::var_os("PATH").and_then(|path| path.into_string().ok())
+}
+
+/// The client of the node that serves `state`.
+fn client(state: &StateDir) -> Client {
+    Client::new(state.socket()).named(format!("fabric/{}", env!("CARGO_PKG_VERSION")))
+}
+
 /// Where `fabric` prints its own lines: standard output, or standard
 /// error for a headless run, whose standard output carries only the
 /// harness's answer and the line naming the session, for a script to read.
@@ -265,11 +277,40 @@ impl Notes {
     }
 }
 
-/// A refusal the daemon answered, kept typed so `main` can pick the exit code.
+/// A refusal, kept typed so `main` can pick the exit code.
 #[derive(Debug)]
 struct Refused {
-    refusal: Refusal,
+    refusal: RefusalKind,
     message: String,
+}
+
+impl Refused {
+    /// The refusal the node answered with its sentence; any other client error as it is.
+    fn from_client(error: ClientError) -> anyhow::Error {
+        match error {
+            ClientError::Refused(refusal) => Refused {
+                refusal: refusal.kind(),
+                message: refusal.message().to_owned(),
+            }
+            .into(),
+            other => other.into(),
+        }
+    }
+}
+
+/// The exit code of a command that found no daemon to answer it.
+const NO_DAEMON_EXIT: u8 = 80;
+
+/// The exit code for a refusal of `kind` (ADR 0016, Exit codes).
+fn refusal_exit(kind: RefusalKind) -> u8 {
+    match kind {
+        RefusalKind::NotOwner => 81,
+        RefusalKind::Frozen => 82,
+        RefusalKind::Unreachable => 83,
+        RefusalKind::NeedsForce => 84,
+        RefusalKind::JobState => 85,
+        RefusalKind::Failed => 1,
+    }
 }
 
 impl fmt::Display for Refused {
@@ -283,38 +324,49 @@ impl std::error::Error for Refused {}
 /// The exit code for an error that ended a command.
 fn exit_code(error: &anyhow::Error) -> ExitCode {
     if let Some(refused) = error.downcast_ref::<Refused>() {
-        return ExitCode::from(refused.refusal.exit_code());
+        return ExitCode::from(refusal_exit(refused.refusal));
     }
-    if let Some(ControlError::NoDaemon { .. }) = error.downcast_ref::<ControlError>() {
+    if let Some(ClientError::NoDaemon { .. }) = error.downcast_ref::<ClientError>() {
         return ExitCode::from(NO_DAEMON_EXIT);
     }
     ExitCode::FAILURE
 }
 
-/// Sends a request and prints what the daemon printed; a refusal becomes an error.
-async fn ask(socket: &Path, request: Request, notes: Notes) -> Result<Option<RunPlan>> {
-    match control::call(socket, &request).await? {
-        Response::Done { lines } => {
-            notes.print(&lines)?;
-            Ok(None)
-        }
-        Response::Run { lines, plan } => {
-            notes.print(&lines)?;
-            Ok(Some(plan))
-        }
-        Response::Failed {
-            lines,
-            error,
-            refusal,
-        } => {
-            notes.print(&lines)?;
-            Err(Refused {
-                refusal,
-                message: error,
-            }
-            .into())
+/// Prints each event of a call as it arrives, keeping the first failure to print.
+struct Printer {
+    notes: Notes,
+    failed: Option<anyhow::Error>,
+}
+
+impl Printer {
+    fn new(notes: Notes) -> Self {
+        Self {
+            notes,
+            failed: None,
         }
     }
+
+    fn print(&mut self, event: &Event) {
+        if let Err(e) = self.notes.print(&render::event(event)) {
+            self.failed.get_or_insert(e);
+        }
+    }
+
+    /// The first failure to print, if any.
+    fn finish(self) -> Result<()> {
+        self.failed.map_or(Ok(()), Err)
+    }
+}
+
+/// Sends a request, printing each event as it arrives and then the reply;
+/// a refusal becomes an error.
+async fn ask(client: &Client, request: &Request, notes: Notes) -> Result<Reply> {
+    let mut printer = Printer::new(notes);
+    let answered = client.call(request, |event| printer.print(&event)).await;
+    printer.finish()?;
+    let reply = answered.map_err(Refused::from_client)?;
+    notes.print(&render::reply(&reply))?;
+    Ok(reply)
 }
 
 /// Parses the command line, runs the command and returns the exit code.
@@ -353,7 +405,7 @@ pub fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<ExitCode> {
     let home = home()?;
     let state = state_dir(&home)?;
-    let socket = state.socket();
+    let client = client(&state);
     match cli.command {
         Command::Serve(args) => serve(state, home, args).await,
         Command::Node(command) => {
@@ -363,20 +415,34 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 NodeCommand::Ls => Request::NodeList,
                 NodeCommand::Ping { node } => Request::NodePing { node },
             };
-            ask(&socket, request, Notes::Stdout).await?;
+            ask(&client, &request, Notes::Stdout).await?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Doctor { peer, job } => {
-            ask(
-                &socket,
-                Request::Doctor {
-                    peer,
-                    job,
-                    path_var: path_var(),
-                },
-                Notes::Stdout,
-            )
-            .await?;
+            let request = Request::Doctor {
+                peer,
+                job,
+                path: path_text(),
+            };
+            let reply = ask(&client, &request, Notes::Stdout).await?;
+            // The node reports; a row that would stop a move still fails
+            // the command, as a preflight does.
+            if let Reply::Doctor {
+                report: DoctorReport::Compared { rows, .. },
+            } = &reply
+            {
+                let blocking = render::blocking(rows);
+                if !blocking.is_empty() {
+                    return Err(Refused {
+                        refusal: RefusalKind::NeedsForce,
+                        message: format!(
+                            "the preflight refused the move: {}; `fabric job move` and `fabric job resume` take --force to waive what can be waived",
+                            blocking.join(", ")
+                        ),
+                    }
+                    .into());
+                }
+            }
             Ok(ExitCode::SUCCESS)
         }
         Command::Job(command) => job(&state, &home, command).await,
@@ -413,7 +479,7 @@ async fn serve(state: StateDir, home: PathBuf, args: ServeArgs) -> Result<ExitCo
 }
 
 async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitCode> {
-    let socket = state.socket();
+    let client = client(state);
     let (request, mode) = match command {
         JobCommand::New {
             repo,
@@ -439,7 +505,7 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
         JobCommand::Suspend { job } => (
             Request::JobSuspend {
                 job,
-                path_var: path_var(),
+                path: path_text(),
             },
             Mode::Interactive(None),
         ),
@@ -456,7 +522,7 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
                 on,
                 harness,
                 force,
-                path_var: path_var(),
+                path: path_text(),
             },
             Mode::new(prompt, headless)?,
         ),
@@ -465,7 +531,7 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
                 job,
                 to,
                 force,
-                path_var: path_var(),
+                path: path_text(),
             },
             Mode::Interactive(None),
         ),
@@ -493,10 +559,12 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
             Mode::Interactive(None),
         ),
     };
-    let Some(plan) = ask(&socket, request, mode.notes()).await? else {
+    let (Reply::JobRun(plan) | Reply::JobResume(plan)) =
+        ask(&client, &request, mode.notes()).await?
+    else {
         return Ok(ExitCode::SUCCESS);
     };
-    launch(state, home, &plan, mode).await
+    launch(state, home, &client, &plan, mode).await
 }
 
 /// How the harness runs: attached to this terminal, or for one turn without one.
@@ -534,7 +602,13 @@ const DRAIN: Duration = Duration::from_secs(2);
 type ReadLine = fn(&mut TurnReport, &str) -> bool;
 
 /// Runs the plan's setup steps, launches the harness, registers it, and waits for it.
-async fn launch(state: &StateDir, home: &Path, plan: &RunPlan, mode: Mode) -> Result<ExitCode> {
+async fn launch(
+    state: &StateDir,
+    home: &Path,
+    client: &Client,
+    plan: &RunPlan,
+    mode: Mode,
+) -> Result<ExitCode> {
     let notes = mode.notes();
     let read_line: Option<ReadLine> = match (&mode, &plan.harness) {
         (Mode::Headless(_), HarnessKind::ClaudeCode) => Some(ClaudeCode::read_headless_line),
@@ -543,14 +617,13 @@ async fn launch(state: &StateDir, home: &Path, plan: &RunPlan, mode: Mode) -> Re
         _ => None,
     };
     let tree = materialize(state, &plan.root, notes)?;
-    let socket = state.socket();
     let headless = matches!(mode, Mode::Headless(_));
     // Caught from just before the harness starts, so none is lost in
     // between; a signal during the setup steps still ends the command.
     let forward = read_line.map(|_| Forward::new()).transpose()?;
     let mut running = start(state, home, plan, mode, notes).await?;
     let pid = running.pid();
-    let registered = register(&socket, plan, &running, notes).await;
+    let registered = register(client, plan, &running, notes).await;
     drop(tree);
     if let Err(e) = registered {
         kill_group(&running);
@@ -558,7 +631,7 @@ async fn launch(state: &StateDir, home: &Path, plan: &RunPlan, mode: Mode) -> Re
     }
     if let (Some(read_line), Some(forward)) = (read_line, forward) {
         let turn = Turn {
-            socket: &socket,
+            client,
             plan,
             notes,
             read_line,
@@ -568,7 +641,7 @@ async fn launch(state: &StateDir, home: &Path, plan: &RunPlan, mode: Mode) -> Re
         // as after the hang-up of the terminal that would have shown it.
         let printed = print_turn(plan, &report);
         let code = tokio::select! {
-            code = exited(&socket, plan, pid, status, forward.passed > 0) => code?,
+            code = exited(client, plan, pid, status, forward.passed > 0) => code?,
             signal = forward.next() => {
                 writeln!(
                     std::io::stderr(),
@@ -604,7 +677,7 @@ async fn launch(state: &StateDir, home: &Path, plan: &RunPlan, mode: Mode) -> Re
     } else {
         Ok(())
     };
-    let code = exited(&socket, plan, pid, status, false).await?;
+    let code = exited(client, plan, pid, status, false).await?;
     printed?;
     Ok(code)
 }
@@ -657,36 +730,37 @@ async fn start(
 /// Tells the node the harness started, so it records it and appends
 /// `Resumed`, and prints what it answered. The caller kills the harness's
 /// group on an error.
-async fn register(socket: &Path, plan: &RunPlan, running: &Running, notes: Notes) -> Result<()> {
-    let registered = control::call(
-        socket,
-        &Request::HarnessStarted {
-            job: plan.job,
-            epoch: plan.epoch,
-            pid: running.pid(),
-            harness: plan.harness.clone(),
-            session: running.session().cloned(),
-        },
-    )
-    .await;
+async fn register(client: &Client, plan: &RunPlan, running: &Running, notes: Notes) -> Result<()> {
+    let mut printer = Printer::new(notes);
+    let registered = client
+        .harness_started(
+            launched(plan, running.pid()),
+            running.session().cloned(),
+            |event| printer.print(&event),
+        )
+        .await;
+    printer.finish()?;
     match registered {
-        Ok(Response::Done { lines }) => notes.print(&lines),
-        Ok(Response::Failed {
-            lines,
-            error,
-            refusal,
-        }) => {
-            notes.print(&lines)?;
-            Err(Refused {
-                refusal,
-                message: format!(
-                    "the node refused the launch, so the harness was stopped: {error}"
-                ),
-            }
-            .into())
+        Ok(registered) => notes.print(&[render::registered(&registered)]),
+        Err(ClientError::Refused(refusal)) => Err(Refused {
+            refusal: refusal.kind(),
+            message: format!(
+                "the node refused the launch, so the harness was stopped: {}",
+                refusal.message()
+            ),
         }
-        Ok(Response::Run { .. }) => bail!("the node answered a registration with a run plan"),
+        .into()),
         Err(e) => bail!("the node could not record the launch, so the harness was stopped: {e}"),
+    }
+}
+
+/// The harness `pid` launched from `plan`, as the node registers it.
+fn launched(plan: &RunPlan, pid: std::num::NonZeroU32) -> Launched {
+    Launched {
+        job: plan.job,
+        epoch: plan.epoch,
+        pid,
+        harness: plan.harness.clone(),
     }
 }
 
@@ -746,7 +820,7 @@ fn signal_exit(number: i32) -> ExitCode {
 /// A headless turn being read: where to tell the node about a session,
 /// and how to read the harness's output.
 struct Turn<'a> {
-    socket: &'a Path,
+    client: &'a Client,
     plan: &'a RunPlan,
     notes: Notes,
     read_line: ReadLine,
@@ -781,7 +855,7 @@ impl Turn<'_> {
         }
         let (sessions, named) = tokio::sync::mpsc::unbounded_channel();
         let recorder = tokio::spawn(record_sessions(
-            self.socket.to_path_buf(),
+            self.client.clone(),
             self.plan.clone(),
             pid,
             named,
@@ -876,30 +950,25 @@ fn send_to_group(pgid: std::num::NonZeroU32, signal: rustix::process::Signal) {
 /// Asks the node to record each session the harness names, in order, for
 /// the harness `pid`. A refusal is a warning, because the turn runs on.
 async fn record_sessions(
-    socket: PathBuf,
+    client: Client,
     plan: RunPlan,
     pid: std::num::NonZeroU32,
     mut named: tokio::sync::mpsc::UnboundedReceiver<SessionId>,
     notes: Notes,
 ) {
     while let Some(session) = named.recv().await {
-        let request = Request::HarnessSession(NamedSession {
-            job: plan.job,
-            epoch: plan.epoch,
-            pid,
-            harness: plan.harness.clone(),
-            session: session.clone(),
-        });
-        let missed = match control::call(&socket, &request).await {
-            Ok(Response::Done { lines }) => {
-                let _ = notes.print(&lines);
+        let mut printer = Printer::new(notes);
+        let recorded = client
+            .harness_session(launched(&plan, pid), session.clone(), |event| {
+                printer.print(&event);
+            })
+            .await;
+        let missed = match recorded {
+            Ok(recorded) => {
+                let _ = notes.print(&[render::session_recorded(&recorded)]);
                 continue;
             }
-            Ok(Response::Failed { lines, error, .. }) => {
-                let _ = notes.print(&lines);
-                error
-            }
-            Ok(Response::Run { .. }) => "it answered with a run plan".to_owned(),
+            Err(ClientError::Refused(refusal)) => refusal.message().to_owned(),
             Err(e) => e.to_string(),
         };
         let _ = writeln!(
@@ -942,17 +1011,16 @@ fn print_turn(plan: &RunPlan, report: &TurnReport) -> Result<()> {
 /// own, or 128 plus the signal that stopped it, with a line saying why;
 /// `passed_on` says fabric passed a signal of its own on to the harness.
 async fn exited(
-    socket: &Path,
+    client: &Client,
     plan: &RunPlan,
     pid: std::num::NonZeroU32,
     status: std::process::ExitStatus,
     passed_on: bool,
 ) -> Result<ExitCode> {
-    let told = control::call(socket, &Request::HarnessExited { job: plan.job, pid }).await;
+    let told = client.harness_exited(plan.job, pid, |_| {}).await;
     let missed = match told {
-        Ok(Response::Done { .. }) => None,
-        Ok(Response::Failed { error, .. }) => Some(error),
-        Ok(Response::Run { .. }) => Some("it answered with a run plan".to_owned()),
+        Ok(()) => None,
+        Err(ClientError::Refused(refusal)) => Some(refusal.message().to_owned()),
         Err(e) => Some(e.to_string()),
     };
     if let Some(reason) = missed {
@@ -996,7 +1064,7 @@ fn materialize(state: &StateDir, root: &Path, notes: Notes) -> Result<TreeLock> 
         // Another run or resume of this workspace is starting its harness:
         // the same state as a harness that runs, so the same exit code.
         MaterializeError::TreeBusy { .. } => anyhow::Error::new(Refused {
-            refusal: Refusal::JobState,
+            refusal: RefusalKind::JobState,
             message: e.to_string(),
         }),
         e => e.into(),

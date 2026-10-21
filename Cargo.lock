@@ -341,6 +341,7 @@ dependencies = [
  "anyhow",
  "clap",
  "fabric",
+ "fabric-client",
  "fabric-core",
  "fabric-env",
  "fabric-harness",
@@ -456,12 +457,12 @@ name = "fabricd"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "fabric-client",
  "fabric-core",
  "fabric-env",
  "fabric-harness",
  "fabric-net",
  "fabric-store",
- "postcard",
  "rustix",
  "serde",
  "serde_json",
