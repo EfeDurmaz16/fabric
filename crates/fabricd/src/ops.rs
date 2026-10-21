@@ -2312,38 +2312,44 @@ fn summary(goal: &str) -> String {
     }
 }
 
+/// How many paths or keys of one kind a suspend names before it counts the rest.
+const REPORT_PATHS: usize = 20;
+
 /// Says, one line per path or config key, what the snapshot carries that
 /// a secret pattern matches, what of the workspace and the harness state it
 /// leaves out, and what of the repository's config it changed or left out.
 fn report_capture(report: &fabric_store::capture::CaptureReport, out: &mut Out) {
-    for path in report.denied.iter().chain(&report.denied_untracked) {
-        out.say(format!("left behind (secret pattern): {path}"));
-    }
-    for path in &report.denied_harness {
-        out.say(format!(
-            "left behind (secret pattern, harness state): {path}"
-        ));
-    }
-    for path in &report.tracked_secrets {
-        out.say(format!(
-            "travels in the snapshot though a secret pattern matches it (tracked): {path}"
-        ));
-    }
-    for path in &report.stashed_secrets {
-        out.say(format!(
-            "travels in the snapshot though a secret pattern matches it (stashed): {path}"
-        ));
-    }
-    for path in &report.special_files {
-        out.say(format!(
-            "left behind (not a file, link or directory): {path}"
-        ));
-    }
-    for path in &report.special_harness {
-        out.say(format!(
-            "left behind (not a file, link or directory, harness state): {path}"
-        ));
-    }
+    let denied: Vec<_> = report
+        .denied
+        .iter()
+        .chain(&report.denied_untracked)
+        .collect();
+    say_each(out, "left behind (secret pattern)", &denied);
+    say_each(
+        out,
+        "left behind (secret pattern, harness state)",
+        &report.denied_harness,
+    );
+    say_each(
+        out,
+        "travels in the snapshot though a secret pattern matches it (tracked)",
+        &report.tracked_secrets,
+    );
+    say_each(
+        out,
+        "travels in the snapshot though a secret pattern matches it (stashed)",
+        &report.stashed_secrets,
+    );
+    say_each(
+        out,
+        "left behind (not a file, link or directory)",
+        &report.special_files,
+    );
+    say_each(
+        out,
+        "left behind (not a file, link or directory, harness state)",
+        &report.special_harness,
+    );
     // In a repository the whole nested tree stays; in a plain directory
     // its files travel and only its `.git` stays.
     let nested = if report.bundle.is_some() {
@@ -2351,24 +2357,34 @@ fn report_capture(report: &fabric_store::capture::CaptureReport, out: &mut Out) 
     } else {
         "left behind (the .git of a nested repository)"
     };
-    for path in &report.nested_repositories {
-        out.say(format!("{nested}: {path}"));
+    say_each(out, nested, &report.nested_repositories);
+    say_each(
+        out,
+        "left behind (the .git of a nested repository, harness state)",
+        &report.nested_harness,
+    );
+    say_each(
+        out,
+        "travels without its user info (git config)",
+        &report.stripped_userinfo,
+    );
+    say_each(
+        out,
+        "travels with its last value only (git config)",
+        &report.repeated_config,
+    );
+    say_each(out, "left behind (git config)", &report.dropped_config);
+}
+
+/// One line per item under `words`, the first `REPORT_PATHS` of them, then
+/// one that counts the rest, so a suspend's answer stays within one control
+/// message however many paths a workspace holds.
+fn say_each<T: std::fmt::Display>(out: &mut Out, words: &str, items: &[T]) {
+    for item in items.iter().take(REPORT_PATHS) {
+        out.say(format!("{words}: {item}"));
     }
-    for path in &report.nested_harness {
-        out.say(format!(
-            "left behind (the .git of a nested repository, harness state): {path}"
-        ));
-    }
-    for key in &report.stripped_userinfo {
-        out.say(format!("travels without its user info (git config): {key}"));
-    }
-    for key in &report.repeated_config {
-        out.say(format!(
-            "travels with its last value only (git config): {key}"
-        ));
-    }
-    for key in &report.dropped_config {
-        out.say(format!("left behind (git config): {key}"));
+    if items.len() > REPORT_PATHS {
+        out.say(format!("{words}: {} more", items.len() - REPORT_PATHS));
     }
 }
 
@@ -4090,5 +4106,29 @@ pub(crate) mod tests {
             .map(|dir| dir.map(|entry| entry.unwrap().path()).collect())
             .unwrap_or_default();
         assert!(left.is_empty(), "the failed clone stayed behind: {left:?}");
+    }
+
+    /// A workspace can hold any number of paths a secret pattern leaves
+    /// behind. The suspend's answer must stay within one control message,
+    /// so it names the first of them and counts the rest.
+    #[tokio::test]
+    async fn a_suspend_names_a_bounded_number_of_paths() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        for n in 0..500 {
+            std::fs::write(root.join(format!(".env.{n}")), "TOKEN=x\n").unwrap();
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut out = Out::default();
+        node.suspend(id, &path, &mut out).await.unwrap();
+        let named = out
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("left behind (secret pattern): .env."))
+            .count();
+        assert_eq!(named, REPORT_PATHS, "{:?}", out.lines.len());
+        let rest = format!("left behind (secret pattern): {} more", 500 - REPORT_PATHS);
+        assert!(out.lines.contains(&rest), "no line {rest:?}");
     }
 }
