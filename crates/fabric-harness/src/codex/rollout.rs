@@ -381,12 +381,57 @@ fn profile_writes(profile: &serde_json::Value) -> Option<bool> {
     Some(entries.iter().any(|entry| entry["access"] == "write"))
 }
 
-/// The last `turn_context` read so far: its sandbox and the permission
-/// profile it recorded beside it.
+/// Whether a permission profile lets Codex write the workspace `cwd`: the
+/// most specific entry for `cwd` or a directory above it, or a
+/// `project_roots` entry with no subpath, which stands for the workspace
+/// itself, grants `write`. That is the test Codex 0.155.1 applies before
+/// it names a profile `workspace-write` (`to_legacy_sandbox_policy` in
+/// `codex-rs/protocol/src/permissions.rs`), widened to a directory above
+/// the workspace, which the owner's rollouts record after a
+/// workspace-write turn as well. A tie goes to the entry that does not
+/// write, so a profile that writes only elsewhere, such as `/tmp`, or
+/// keeps the workspace read-only under a writable parent, is not one.
+fn profile_writes_workspace(profile: &serde_json::Value, cwd: Option<&str>) -> bool {
+    let Some(cwd) = cwd.map(Path::new).filter(|cwd| cwd.is_absolute()) else {
+        return false;
+    };
+    let Some(entries) = profile["file_system"]["entries"].as_array() else {
+        return false;
+    };
+    let mut nearest: Option<(usize, bool)> = None;
+    for entry in entries {
+        let path = &entry["path"];
+        let depth = match path["type"].as_str() {
+            Some("path") => match path["path"].as_str().map(Path::new) {
+                Some(dir) if dir.is_absolute() && cwd.starts_with(dir) => dir.components().count(),
+                _ => continue,
+            },
+            Some("special")
+                if path["value"]["kind"] == "project_roots"
+                    && path["value"]["subpath"].is_null() =>
+            {
+                cwd.components().count()
+            }
+            _ => continue,
+        };
+        let writes = entry["access"] == "write";
+        nearest = match nearest {
+            Some((best, best_writes)) if best > depth || (best == depth && !best_writes) => {
+                Some((best, best_writes))
+            }
+            _ => Some((depth, writes)),
+        };
+    }
+    nearest.is_some_and(|(_, writes)| writes)
+}
+
+/// The last `turn_context` read so far: its sandbox, the permission
+/// profile it recorded beside it, and its working directory.
 #[derive(Default)]
 struct LastTurn {
     sandbox: Recorded<SandboxMode>,
     profile: Option<serde_json::Value>,
+    cwd: Option<String>,
 }
 
 impl RecordedSettings {
@@ -401,16 +446,20 @@ impl RecordedSettings {
         *turn = LastTurn {
             sandbox: self.sandbox.clone(),
             profile: payload.get("permission_profile").cloned(),
+            cwd: payload["cwd"].as_str().map(str::to_owned),
         };
     }
 
     /// Takes the settings of one `thread_settings_applied` snapshot, the
     /// record of a change between turns. It holds a permission profile,
     /// not a sandbox mode: the sandbox is the last turn's when the profile
-    /// is the one that turn recorded, or still writes after a
-    /// workspace-write turn; read-only when it writes nowhere, so a
-    /// sandbox narrowed between turns is not widened back; otherwise not
-    /// carried. A snapshot with no profile leaves the sandbox as it was.
+    /// is the one that turn recorded, or still writes the workspace (its
+    /// `cwd`, else the last turn's) after a workspace-write turn;
+    /// read-only when it writes nowhere, so a sandbox narrowed between
+    /// turns is not widened back; otherwise not carried, a profile that
+    /// writes only outside the workspace included, so it is never widened
+    /// to the workspace. A snapshot with no profile leaves the sandbox as
+    /// it was.
     fn take_snapshot(&mut self, settings: &serde_json::Value, turn: &LastTurn) {
         self.model = model(settings.get("model"));
         self.effort = effort(settings.get("reasoning_effort"));
@@ -420,12 +469,16 @@ impl RecordedSettings {
             None | Some(serde_json::Value::Null) => return,
             Some(profile) => profile,
         };
+        let cwd = settings["cwd"].as_str().or(turn.cwd.as_deref());
         self.sandbox = if turn.profile.as_ref() == Some(profile) {
             turn.sandbox.clone()
         } else {
             match profile_writes(profile) {
                 Some(false) => Recorded::Carried(SandboxMode::ReadOnly),
-                Some(true) if turn.sandbox == Recorded::Carried(SandboxMode::WorkspaceWrite) => {
+                Some(true)
+                    if turn.sandbox == Recorded::Carried(SandboxMode::WorkspaceWrite)
+                        && profile_writes_workspace(profile, cwd) =>
+                {
                     Recorded::Carried(SandboxMode::WorkspaceWrite)
                 }
                 _ if profile["type"] == "disabled" => Recorded::NotCarried {
@@ -782,6 +835,77 @@ mod tests {
             reason(&after("workspace-write", &ww, unrestricted)),
             "managed: set between turns as a permission profile Fabric cannot name as a sandbox mode"
         );
+    }
+
+    /// A profile set after a workspace-write turn keeps that mode only
+    /// when it writes the workspace: an entry for its `cwd`, or for a
+    /// directory above it with nothing nearer that keeps it read-only, or
+    /// `project_roots`. One that still writes, but only elsewhere, is not
+    /// carried, so `/tmp` alone never becomes workspace writes.
+    #[test]
+    fn a_profile_that_does_not_write_the_workspace_is_not_widened_to_it() {
+        let ww = profile(&["/w/repo", "/tmp"]);
+        let after = |cwd: &str, set: &str| {
+            let set = applied("gpt-6-sol", "high", "on-request", "user", set)
+                .replace("\"cwd\":\"/w\"", &format!("\"cwd\":\"{cwd}\""));
+            read_suffix(&[turn_in("gpt-6-sol", "high", "workspace-write", &ww), set]).sandbox
+        };
+        let entry =
+            |access: &str, path: &str| format!("{{\"access\":\"{access}\",\"path\":{path}}}");
+        let entries = |entries: &[String]| {
+            format!(
+                "{{\"type\":\"managed\",\"file_system\":{{\"type\":\"restricted\",\"entries\":[{}]}},\"network\":\"restricted\"}}",
+                entries.join(",")
+            )
+        };
+        let unnamed = "managed: set between turns as a permission profile Fabric cannot name as a sandbox mode";
+        let ww_carried = Recorded::Carried(SandboxMode::WorkspaceWrite);
+
+        assert_eq!(reason(&after("/w/repo", &profile(&["/tmp"]))), unnamed);
+        assert_eq!(reason(&after("/w/repo", &profile(&["/w/other"]))), unnamed);
+        assert_eq!(after("/w/repo", &profile(&["/w/repo", "/tmp"])), ww_carried);
+        assert_eq!(after("/w/repo", &profile(&["/w"])), ww_carried);
+        let read_only_under_a_writable_parent = entries(&[
+            entry("write", "{\"type\":\"path\",\"path\":\"/w\"}"),
+            entry("read", "{\"type\":\"path\",\"path\":\"/w/repo\"}"),
+        ]);
+        assert_eq!(
+            reason(&after("/w/repo", &read_only_under_a_writable_parent)),
+            unnamed
+        );
+        let project_roots = |subpath: &str| {
+            entries(&[entry(
+                "write",
+                &format!(
+                    "{{\"type\":\"special\",\"value\":{{\"kind\":\"project_roots\"{subpath}}}}}"
+                ),
+            )])
+        };
+        assert_eq!(after("/w/repo", &project_roots("")), ww_carried);
+        assert_eq!(
+            reason(&after("/w/repo", &project_roots(",\"subpath\":\"docs\""))),
+            unnamed
+        );
+        // With no `cwd` in the snapshot, the last turn's says where the
+        // workspace is.
+        let set = applied(
+            "gpt-6-sol",
+            "high",
+            "on-request",
+            "user",
+            &profile(&["/w/repo"]),
+        )
+        .replace(",\"cwd\":\"/w\"", "");
+        let turn = turn_in("gpt-6-sol", "high", "workspace-write", &ww).replace(
+            "\"sandbox_policy\"",
+            "\"cwd\":\"/w/repo\",\"sandbox_policy\"",
+        );
+        assert_eq!(
+            read_suffix(&[turn.clone(), set.clone()]).sandbox,
+            ww_carried
+        );
+        let elsewhere = turn.replace("\"cwd\":\"/w/repo\"", "\"cwd\":\"/v\"");
+        assert_eq!(reason(&read_suffix(&[elsewhere, set]).sandbox), unnamed);
     }
 
     fn reason<T>(recorded: &Recorded<T>) -> String {
