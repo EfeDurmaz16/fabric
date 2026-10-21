@@ -492,8 +492,8 @@ async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_the
 
     let bin = fake_codex(&home);
     let adapter = Codex::new(abs(&home), bin.clone()).with_overrides(CodexOverrides {
-        sandbox: SandboxMode::WorkspaceWrite,
-        approval: ApprovalPolicy::Never,
+        sandbox: Some(SandboxMode::WorkspaceWrite),
+        approval: Some(ApprovalPolicy::Never),
         model: None,
         effort: None,
     });

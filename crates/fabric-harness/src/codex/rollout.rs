@@ -10,16 +10,29 @@
 //! and must travel byte for byte because the reference is a byte offset.
 //! Because the bytes travel verbatim, a rollout that holds a secret-shaped
 //! string is refused rather than carried.
+//!
+//! A session's rollouts are also the record of how it ran, so a resume
+//! reads its settings from them instead of from a second copy in the job
+//! record (gate finding F10a). Record shapes, read from the owner's
+//! rollouts on 2026-10-21 (key names and setting values only): every turn
+//! writes `{"type":"turn_context","payload":{"model","effort",
+//! "approval_policy","sandbox_policy":{"type",...},...}}`. The settings
+//! are the last `turn_context`'s, in lineage order.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use tracing::warn;
 
 use crate::error::{HarnessError, Input, IoOp};
+use crate::harness::ModelName;
+pub(crate) use crate::harness::Recorded;
 use crate::jsontext;
 use crate::redact::Redactor;
 use crate::session::SessionId;
+
+use super::overrides::{ApprovalPolicy, Effort, SandboxMode};
 
 /// What a rollout file name says.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +246,118 @@ pub(crate) fn refuse_secrets(file: &RolloutFile) -> Result<(), HarnessError> {
     }
 }
 
+/// What a Codex session's rollouts record about how it ran.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RecordedSettings {
+    /// The model of the last turn.
+    pub(crate) model: Recorded<ModelName>,
+    /// The reasoning effort of the last turn.
+    pub(crate) effort: Recorded<Effort>,
+    /// The approval policy of the last turn.
+    pub(crate) approval: Recorded<ApprovalPolicy>,
+    /// The sandbox of the last turn.
+    pub(crate) sandbox: Recorded<SandboxMode>,
+}
+
+/// A JSON value as a report shows it: a string as itself, anything else as JSON.
+fn shown(value: &serde_json::Value) -> String {
+    value
+        .as_str()
+        .map_or_else(|| value.to_string(), str::to_owned)
+}
+
+/// A recorded string setting: carried when `parse` takes it, else not
+/// carried with `reason`; absent when missing or `null`.
+fn setting<T>(
+    value: Option<&serde_json::Value>,
+    parse: impl Fn(&str) -> Result<T, String>,
+) -> Recorded<T> {
+    match value {
+        None | Some(serde_json::Value::Null) => Recorded::Absent,
+        Some(serde_json::Value::String(text)) => match parse(text) {
+            Ok(parsed) => Recorded::Carried(parsed),
+            Err(reason) => Recorded::NotCarried {
+                value: text.clone(),
+                reason,
+            },
+        },
+        Some(other) => Recorded::NotCarried {
+            value: shown(other),
+            reason: "the record does not hold it as text".to_owned(),
+        },
+    }
+}
+
+impl RecordedSettings {
+    /// Takes the settings of one `turn_context` payload, replacing all four.
+    fn take_turn(&mut self, payload: &serde_json::Value) {
+        self.model = setting(payload.get("model"), |text| {
+            ModelName::parse(text).map_err(|e| format!("not a model name Fabric passes: {e}"))
+        });
+        self.effort = setting(payload.get("effort"), |text| {
+            Effort::from_record(text).ok_or_else(|| {
+                "not an effort Fabric passes, which are low, medium, high and xhigh".to_owned()
+            })
+        });
+        self.approval = setting(payload.get("approval_policy"), |text| {
+            ApprovalPolicy::from_record(text).ok_or_else(|| {
+                "not an approval policy Fabric passes, which are untrusted, on-request and never".to_owned()
+            })
+        });
+        let sandbox = payload.get("sandbox_policy");
+        let mode = sandbox.and_then(|policy| policy.get("type")).or(sandbox);
+        self.sandbox = setting(mode, |text| {
+            SandboxMode::from_record(text).ok_or_else(|| {
+                if text == "danger-full-access" {
+                    "Fabric never passes full access, ADR 0006".to_owned()
+                } else {
+                    "not a sandbox Fabric passes, which are read-only and workspace-write"
+                        .to_owned()
+                }
+            })
+        });
+    }
+}
+
+/// Reads what the rollouts of a session record, given its lineage newest
+/// suffix first, as `lineage` returns it. A line that does not parse is
+/// skipped, as a cut last line is.
+pub(crate) fn recorded(lineage: &[RolloutFile]) -> Result<RecordedSettings, HarnessError> {
+    let mut settings = RecordedSettings::default();
+    for file in lineage.iter().rev() {
+        let mut lines = open_lines(file)?;
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if lines
+                .read_until(b'\n', &mut line)
+                .map_err(|e| HarnessError::io(IoOp::Read, &file.path, e))?
+                == 0
+            {
+                break;
+            }
+            if !contains(&line, b"\"turn_context\"") {
+                continue;
+            }
+            let record: serde_json::Value = match serde_json::from_slice(&line) {
+                Ok(record) => record,
+                Err(e) => {
+                    warn!(path = %file.path.display(), error = %e, "codex: rollout line skipped");
+                    continue;
+                }
+            };
+            if record["type"] == "turn_context" {
+                settings.take_turn(&record["payload"]);
+            }
+        }
+    }
+    Ok(settings)
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +410,112 @@ mod tests {
         assert!(listed[0].name.compressed);
         assert!(!listed[1].name.compressed);
         assert!(listed[1].path.ends_with(format!("{a}.jsonl")));
+    }
+
+    const THREAD: &str = "019f233e-bb33-7342-85fa-f2d33b14368a";
+    const SUFFIX: &str = "019f233e-bb33-7342-85fa-f2d33b14368b";
+
+    fn meta(version: &str, base: Option<&str>) -> String {
+        let base = base.map_or_else(String::new, |b| {
+            format!(",\"history_base\":{{\"thread_id\":\"{b}\"}}")
+        });
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{THREAD}\",\"cwd\":\"/w\",\"cli_version\":\"{version}\"{base}}}}}\n"
+        )
+    }
+
+    fn turn(model: &str, effort: &str, approval: &str, sandbox: &str) -> String {
+        format!(
+            "{{\"type\":\"turn_context\",\"payload\":{{\"model\":\"{model}\",\"effort\":\"{effort}\",\"approval_policy\":\"{approval}\",\"sandbox_policy\":{{\"type\":\"{sandbox}\",\"network_access\":false}}}}}}\n"
+        )
+    }
+
+    /// The lineage of a thread whose prefix is `prefix` (plain) and whose
+    /// newest suffix is `suffix` (compressed), as `lineage_in` follows it.
+    fn lineage(dir: &Path, prefix: &str, suffix: &str) -> Vec<RolloutFile> {
+        std::fs::write(
+            dir.join(format!("rollout-2026-10-19T10-00-00-{THREAD}.jsonl")),
+            prefix,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!(
+                "rollout-2026-10-21T10-00-00-{THREAD}_{SUFFIX}.jsonl.zst"
+            )),
+            zstd::encode_all(suffix.as_bytes(), 0).unwrap(),
+        )
+        .unwrap();
+        let session = SessionId::parse(THREAD).unwrap();
+        super::super::lineage_in(&list(dir).unwrap(), &session, dir).unwrap()
+    }
+
+    /// The settings are the newest turn's, read through a compressed
+    /// suffix and past a cut line.
+    #[test]
+    fn the_last_turn_across_the_lineage_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = format!(
+            "{}{}{{\"type\":\"response_item\",\"payload\":{{}}}}\n{}",
+            meta("0.163.0-alpha.10.2", None),
+            turn("gpt-5.6-sol", "low", "never", "read-only"),
+            "{\"type\":\"turn_context\",\"payl",
+        );
+        let suffix = format!(
+            "{}{}{}{}",
+            meta("0.155.1", Some(THREAD)),
+            meta("0.142.4", None),
+            turn("gpt-6-astra", "high", "never", "read-only"),
+            turn("gpt-6-sol", "xhigh", "on-request", "workspace-write"),
+        );
+        let chain = lineage(dir.path(), &prefix, &suffix);
+        assert_eq!(chain.len(), 2);
+        let read = recorded(&chain).unwrap();
+        assert_eq!(
+            read,
+            RecordedSettings {
+                model: Recorded::Carried(ModelName::parse("gpt-6-sol").unwrap()),
+                effort: Recorded::Carried(Effort::XHigh),
+                approval: Recorded::Carried(ApprovalPolicy::OnRequest),
+                sandbox: Recorded::Carried(SandboxMode::WorkspaceWrite),
+            }
+        );
+    }
+
+    fn reason<T>(recorded: &Recorded<T>) -> String {
+        match recorded {
+            Recorded::NotCarried { value, reason } => format!("{value}: {reason}"),
+            Recorded::Carried(_) => "carried".to_owned(),
+            Recorded::Absent => "absent".to_owned(),
+        }
+    }
+
+    /// A value outside the closed sets is reported with its reason, never
+    /// carried.
+    #[test]
+    fn values_outside_the_closed_sets_are_not_carried() {
+        let dir = tempfile::tempdir().unwrap();
+        let suffix = format!(
+            "{}{}",
+            meta("0.155.1", Some(THREAD)),
+            turn("gpt 6", "ultra", "on-failure", "danger-full-access"),
+        );
+        let chain = lineage(dir.path(), &meta("0.155.1", None), &suffix);
+        let read = recorded(&chain).unwrap();
+        assert_eq!(
+            reason(&read.model),
+            "gpt 6: not a model name Fabric passes: model name has an invalid character at index 3"
+        );
+        assert_eq!(
+            reason(&read.effort),
+            "ultra: not an effort Fabric passes, which are low, medium, high and xhigh"
+        );
+        assert_eq!(
+            reason(&read.approval),
+            "on-failure: not an approval policy Fabric passes, which are untrusted, on-request and never"
+        );
+        assert_eq!(
+            reason(&read.sandbox),
+            "danger-full-access: Fabric never passes full access, ADR 0006"
+        );
     }
 }

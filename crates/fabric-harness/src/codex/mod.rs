@@ -39,9 +39,21 @@
 //! and `codex exec resume --help` of 0.155.1 on 2026-10-19: `codex resume
 //! <id> [PROMPT]` for the terminal and `codex exec resume <id> [PROMPT]`
 //! for a headless run, both with `-c key=value` overrides built from the
-//! typed `overrides::CodexOverrides`, never from free text. The prompt is
-//! passed after `--`, which clap reads as the end of options. The
-//! app-server JSON-RPC surface is not used (ADR 0006, D14).
+//! typed `overrides::CodexOverrides`, never from free text, placed after
+//! the subcommand: a `-c` before `exec` is ignored by 0.155.1 (seen on the
+//! gate, 2026-10-21). The prompt is passed after `--`, which clap reads as
+//! the end of options. The app-server JSON-RPC surface is not used (ADR
+//! 0006, D14).
+//!
+//! A resume carries the job's settings from the session itself (gate
+//! finding F10a): Codex resumes with the model of this node's
+//! `config.toml`, not the one the thread ran with, so the launch reads
+//! the last `turn_context` of the lineage and passes its model, effort,
+//! approval policy and sandbox, each one the adapter was configured with
+//! winning (`overrides::effective`). A thread with no rollout on this
+//! node records nothing, so it is launched as before and Codex says it
+//! found none. A launch with no session reads nothing and passes only
+//! what was configured.
 
 pub mod overrides;
 pub(crate) mod rollout;
@@ -68,7 +80,7 @@ use crate::session::SessionId;
 use crate::stage::{Carry, Source};
 
 use self::overrides::CodexOverrides;
-use self::rollout::{RolloutFile, RolloutName};
+use self::rollout::{RecordedSettings, RolloutFile, RolloutName};
 
 /// The program name on `PATH`.
 pub const PROGRAM: &str = "codex";
@@ -333,7 +345,8 @@ impl Codex {
     }
 
     /// Settings passed as `-c` overrides on every run; a cold resume does
-    /// not restore them (H2, experiment E3).
+    /// not restore them (H2, experiment E3). On a resume each field set
+    /// here wins over the one the session records.
     #[must_use]
     pub fn with_overrides(mut self, overrides: CodexOverrides) -> Self {
         self.overrides = Some(overrides);
@@ -607,11 +620,26 @@ impl Codex {
         process::detect(self.binary().ok(), &self.path_var).await
     }
 
-    /// The argument list for `launch`, without the binary.
+    /// What the lineage of `session` records, read before a resume.
+    async fn read_session(&self, session: &SessionId) -> Result<RecordedSettings, HarnessError> {
+        let adapter = self.clone();
+        let id = session.clone();
+        // A thread with no rollout here records nothing to carry or to
+        // guard; Codex then says itself that it found none.
+        let recorded = pipeline::blocking(move || match adapter.lineage(&id) {
+            Ok(lineage) => rollout::recorded(&lineage),
+            Err(HarnessError::SessionNotFound { .. }) => Ok(RecordedSettings::default()),
+            Err(e) => Err(e),
+        })
+        .await?;
+        Ok(recorded)
+    }
+
+    /// The argument list for `launch` with `overrides`, without the binary.
     pub(crate) fn args_for(
-        &self,
         root: &AbsPath,
         launch: &Launch,
+        overrides: &CodexOverrides,
     ) -> Result<Vec<String>, HarnessError> {
         let mut args = Vec::new();
         if launch.is_headless() {
@@ -629,7 +657,7 @@ impl Codex {
             "projects.{}.trust_level=trusted",
             toml_quoted_key(root)?
         ));
-        for pair in self.overrides.iter().flat_map(CodexOverrides::pairs) {
+        for pair in overrides.pairs() {
             args.push("-c".to_owned());
             args.push(pair);
         }
@@ -683,12 +711,18 @@ impl Codex {
         self.check_env(env)?;
         let root = pipeline::physical_workspace(workspace)?;
         let binary = self.binary()?;
-        let args = self.args_for(&root, launch)?;
+        let recorded = match launch.resume() {
+            Some(session) => Some(self.read_session(session).await?),
+            None => None,
+        };
+        let (overrides, settings) =
+            overrides::effective(self.overrides.as_ref(), recorded.as_ref());
+        let args = Self::args_for(&root, launch, &overrides)?;
         let session = launch.resume().cloned();
         let spawned =
             process::spawn(&binary, &args, pipeline::fs_path(&root), env, launch.into()).await?;
         info!(?session, pid = %spawned.pid, held = spawned.held, "codex: launched");
-        Ok(Running::new(session, spawned))
+        Ok(Running::new(session, spawned).with_settings(settings))
     }
 }
 
@@ -747,14 +781,12 @@ mod tests {
 
     #[test]
     fn args_follow_the_cli_surface_and_quote_the_root() {
-        let adapter = Codex::new(AbsPath::parse("/h").unwrap(), OsString::new()).with_overrides(
-            CodexOverrides {
-                sandbox: overrides::SandboxMode::WorkspaceWrite,
-                approval: overrides::ApprovalPolicy::OnRequest,
-                model: Some(crate::harness::ModelName::parse("o3").unwrap()),
-                effort: Some(overrides::Effort::High),
-            },
-        );
+        let set = CodexOverrides {
+            sandbox: Some(overrides::SandboxMode::WorkspaceWrite),
+            approval: Some(overrides::ApprovalPolicy::OnRequest),
+            model: Some(crate::harness::ModelName::parse("o3").unwrap()),
+            effort: Some(overrides::Effort::High),
+        };
         let root = &AbsPath::parse("/h/fabric/jobs/j/work").unwrap();
         let session = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
         let resume = Launch::Interactive {
@@ -762,20 +794,20 @@ mod tests {
             prompt: None,
         };
         assert_eq!(
-            adapter.args_for(root, &resume).unwrap(),
+            Codex::args_for(root, &resume, &set).unwrap(),
             vec![
                 "resume",
                 "019f233e-bb33-7342-85fa-f2d33b14368a",
                 "-c",
                 "projects.\"/h/fabric/jobs/j/work\".trust_level=trusted",
                 "-c",
-                "sandbox_mode=\"workspace-write\"",
-                "-c",
-                "approval_policy=\"on-request\"",
-                "-c",
                 "model=\"o3\"",
                 "-c",
-                "model_reasoning_effort=\"high\""
+                "model_reasoning_effort=\"high\"",
+                "-c",
+                "sandbox_mode=\"workspace-write\"",
+                "-c",
+                "approval_policy=\"on-request\""
             ]
         );
         let headless = Launch::Headless {
@@ -783,7 +815,7 @@ mod tests {
             prompt: "--dangerously-bypass-approvals-and-sandbox".to_owned(),
         };
         assert_eq!(
-            adapter.args_for(root, &headless).unwrap(),
+            Codex::args_for(root, &headless, &set).unwrap(),
             vec![
                 "exec",
                 "resume",
@@ -792,27 +824,27 @@ mod tests {
                 "-c",
                 "projects.\"/h/fabric/jobs/j/work\".trust_level=trusted",
                 "-c",
-                "sandbox_mode=\"workspace-write\"",
-                "-c",
-                "approval_policy=\"on-request\"",
-                "-c",
                 "model=\"o3\"",
                 "-c",
                 "model_reasoning_effort=\"high\"",
+                "-c",
+                "sandbox_mode=\"workspace-write\"",
+                "-c",
+                "approval_policy=\"on-request\"",
                 "--",
                 "--dangerously-bypass-approvals-and-sandbox"
             ]
         );
         let quoted = &AbsPath::parse("/h/say \"hi\"\\there").unwrap();
-        let args = adapter
-            .args_for(
-                quoted,
-                &Launch::Interactive {
-                    resume: None,
-                    prompt: Some("go".to_owned()),
-                },
-            )
-            .unwrap();
+        let args = Codex::args_for(
+            quoted,
+            &Launch::Interactive {
+                resume: None,
+                prompt: Some("go".to_owned()),
+            },
+            &CodexOverrides::default(),
+        )
+        .unwrap();
         assert_eq!(
             args[1],
             "projects.\"/h/say \\\"hi\\\"\\\\there\".trust_level=trusted"
@@ -854,5 +886,142 @@ mod tests {
             "{\"type\":\"turn.failed\",\"error\":{\"message\":\"usage limit\"}}",
         );
         assert_eq!(report.failure.as_deref(), Some("usage limit"));
+    }
+
+    const THREAD: &str = "019f233e-bb33-7342-85fa-f2d33b14368a";
+
+    /// A home whose store holds one rollout of `THREAD`, written by Codex
+    /// 0.155.1 with gpt-6-sol, and a fake `codex` that answers
+    /// `--version` with `version_line` and otherwise appends a record to
+    /// the rollout and writes its arguments to `ran`.
+    struct Resume {
+        _dir: tempfile::TempDir,
+        home: PathBuf,
+        adapter: Codex,
+        env: Vec<(EnvVarName, String)>,
+    }
+
+    impl Resume {
+        fn new(version_line: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let home = std::fs::canonicalize(dir.path()).unwrap();
+            std::fs::create_dir_all(home.join("work")).unwrap();
+            let sessions = home.join(".codex/sessions/2026/10/21");
+            std::fs::create_dir_all(&sessions).unwrap();
+            let rollout = sessions.join(format!("rollout-2026-10-21T10-00-00-{THREAD}.jsonl"));
+            std::fs::write(
+                &rollout,
+                format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{THREAD}\",\"cwd\":\"/w\",\"cli_version\":\"0.155.1\"}}}}\n\
+                     {{\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-6-sol\",\"effort\":\"xhigh\",\"approval_policy\":\"on-request\",\"sandbox_policy\":{{\"type\":\"workspace-write\"}}}}}}\n"
+                ),
+            )
+            .unwrap();
+            let binary = home.join("codex");
+            std::fs::write(
+                &binary,
+                format!(
+                    "#!/bin/sh\n\
+                     if [ \"$1\" = --version ]; then echo '{version_line}'; exit 0; fi\n\
+                     echo '{{\"type\":\"event_msg\",\"payload\":{{}}}}' >> '{}'\n\
+                     printf '%s\\n' \"$@\" > \"$HOME/ran\"\n",
+                    rollout.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let adapter = Codex::new(
+                AbsPath::parse(home.to_str().unwrap()).unwrap(),
+                OsString::new(),
+            )
+            .with_binary(binary);
+            let env = vec![(
+                EnvVarName::parse("HOME").unwrap(),
+                home.to_str().unwrap().to_owned(),
+            )];
+            Resume {
+                _dir: dir,
+                home,
+                adapter,
+                env,
+            }
+        }
+
+        async fn launch(&self, resume: bool) -> Result<Running, HarnessError> {
+            let launch = Launch::Headless {
+                resume: resume.then(|| SessionId::parse(THREAD).unwrap()),
+                prompt: "next".to_owned(),
+            };
+            self.adapter
+                .launch(&self.home.join("work"), launch, &self.env)
+                .await
+        }
+
+        fn ran(&self) -> Option<Vec<String>> {
+            let text = std::fs::read_to_string(self.home.join("ran")).ok()?;
+            Some(text.lines().map(str::to_owned).collect())
+        }
+    }
+
+    /// A resume passes the model, effort, approval policy and sandbox the
+    /// session ran with, and says so; a new thread reads nothing and
+    /// passes nothing (gate finding F10a).
+    #[tokio::test]
+    async fn a_resume_passes_the_settings_the_session_ran_with() {
+        let fixture = Resume::new("codex-cli 0.155.1");
+        let mut running = fixture.launch(true).await.unwrap();
+        running.child_mut().wait().await.unwrap();
+        let trust = format!(
+            "projects.\"{}\".trust_level=trusted",
+            fixture.home.join("work").display()
+        );
+        assert_eq!(
+            fixture.ran().unwrap(),
+            [
+                "exec",
+                "resume",
+                THREAD,
+                "--json",
+                "-c",
+                &trust,
+                "-c",
+                "model=\"gpt-6-sol\"",
+                "-c",
+                "model_reasoning_effort=\"xhigh\"",
+                "-c",
+                "sandbox_mode=\"workspace-write\"",
+                "-c",
+                "approval_policy=\"on-request\"",
+                "--",
+                "next"
+            ]
+        );
+        let passed: Vec<String> = running
+            .settings()
+            .passed
+            .iter()
+            .map(|p| format!("{} {}", p.name, p.value))
+            .collect();
+        assert_eq!(
+            passed,
+            [
+                "model gpt-6-sol",
+                "effort xhigh",
+                "sandbox workspace-write",
+                "approval on-request"
+            ]
+        );
+
+        let mut running = fixture.launch(false).await.unwrap();
+        running.child_mut().wait().await.unwrap();
+        assert_eq!(
+            fixture.ran().unwrap(),
+            ["exec", "--json", "-c", &trust, "--", "next"]
+        );
+        assert_eq!(
+            running.settings(),
+            &crate::harness::LaunchSettings::default()
+        );
     }
 }
