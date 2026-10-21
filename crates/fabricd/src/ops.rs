@@ -169,8 +169,7 @@ impl Node {
                 Reply::JobMove(self.lease(job).await?)
             }
             Request::JobSteal { job, reason, force } => {
-                self.job_steal(job, reason, force, out).await?;
-                Reply::JobSteal(self.lease(job).await?)
+                Reply::JobSteal(self.job_steal(job, reason, force, out).await?)
             }
             Request::JobDecide {
                 job,
@@ -1955,13 +1954,18 @@ impl Node {
         Ok(())
     }
 
+    /// Steals `id` and returns the lease the steal made.
+    ///
+    /// The lease is read under the lock that commits the steal: the push to
+    /// the old owner waits without it, and another steal or a move may
+    /// change the lease meanwhile.
     async fn job_steal(
         self: &Arc<Self>,
         id: JobId,
         reason: String,
         force: bool,
         out: &mut Out,
-    ) -> Result<(), NodeError> {
+    ) -> Result<Lease, NodeError> {
         let (owner, complete) = {
             let job = self.job(id).await?;
             let job = job.lock().await;
@@ -1980,7 +1984,7 @@ impl Node {
                 .then_some(CompleteSnapshot::new(latest));
             (job.ledger().lease().holder(), complete)
         };
-        {
+        let stolen = {
             let job = self.job(id).await?;
             let mut job = job.lock().await;
             let proposal = job
@@ -2008,19 +2012,25 @@ impl Node {
             out.emit(Event::StealWarning { warning });
             job.commit(proposal.record, Author::Node(self.id))?;
             job.append(self.id, EventKind::Note { text: described })?;
+            let lease = job.ledger().lease();
+            let stolen = Lease {
+                owner: lease.holder(),
+                epoch: lease.epoch(),
+            };
             out.emit(Event::Stole {
                 job: id,
-                epoch: job.ledger().lease().epoch(),
+                epoch: stolen.epoch,
             });
             self.settle(&mut job, out).await?;
-        }
+            stolen
+        };
         if let Err(e) = self.push_records(id, owner).await {
             out.emit(Event::OwnerNotTold {
                 owner,
                 error: e.to_refusal(),
             });
         }
-        Ok(())
+        Ok(stolen)
     }
 
     async fn job_decide(
@@ -3389,6 +3399,84 @@ pub(crate) mod tests {
             format!("the target of move {move_id} decides it; import or abort instead of stealing")
         );
         assert_eq!(refused.kind(), fabric_client::api::RefusalKind::Failed);
+    }
+
+    /// Review finding on PR #13: the reply to a steal read the lease again
+    /// after the push to the old owner, which waits without the job's lock,
+    /// so a steal or a move in that wait made the reply name a later lease
+    /// than the one the steal made. B steals from A while A holds its job's
+    /// lock, so B's push waits; meanwhile C steals from B. B's reply is the
+    /// lease of its own steal, the one its `stole` event names.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_steal_replies_with_the_lease_it_made() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        let (_dir_c, c) = node();
+        for node in [&a, &b, &c] {
+            tokio::spawn(Arc::clone(node).run());
+        }
+        for (node, peer) in [(&a, &b), (&b, &a), (&b, &c), (&c, &b)] {
+            let addr = peer.local_addr().unwrap().to_string();
+            node.node_add(peer.id, Some(&addr)).await.unwrap();
+        }
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &ToolEnv::current(), &mut Out::default())
+            .await
+            .unwrap();
+        b.pull_records(id, a.id).await.unwrap();
+        b.ensure_latest(id, a.id).await.unwrap();
+        c.pull_records(id, b.id).await.unwrap();
+        c.ensure_latest(id, b.id).await.unwrap();
+
+        let at_a = a.job(id).await.unwrap();
+        let held = at_a.lock().await;
+        let steal = tokio::spawn({
+            let b = Arc::clone(&b);
+            async move {
+                let request = Request::JobSteal {
+                    job: id,
+                    reason: "a sleeps".to_owned(),
+                    force: true,
+                };
+                let mut out = Out::default();
+                let reply = b.dispatch(request, &mut out).await;
+                (reply, out)
+            }
+        });
+        let stolen = Lease {
+            owner: b.id,
+            epoch: Epoch::new(2).unwrap(),
+        };
+        for _ in 0..500 {
+            if b.lease(id).await.unwrap() == stolen {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(b.lease(id).await.unwrap(), stolen);
+        c.pull_records(id, b.id).await.unwrap();
+        c.job_steal(id, "b sleeps".to_owned(), true, &mut Out::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            b.lease(id).await.unwrap(),
+            Lease {
+                owner: c.id,
+                epoch: Epoch::new(3).unwrap(),
+            }
+        );
+        drop(held);
+
+        let (reply, out) = steal.await.unwrap();
+        assert_eq!(reply.unwrap(), Reply::JobSteal(stolen));
+        assert!(
+            out.events.contains(&Event::Stole {
+                job: id,
+                epoch: stolen.epoch,
+            }),
+            "{:?}",
+            out.events
+        );
     }
 
     /// Review finding on PR #13: ACP arguments that hold a secret were
