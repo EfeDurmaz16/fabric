@@ -13,9 +13,12 @@
 //! of the transcript under the workspace's project key, the one `claude
 //! --resume` reads from the workspace, or of the other keys' transcripts
 //! when that key holds none; the writer is the highest `version` of any
-//! line of any of them. A line that does not parse is skipped, as a cut
-//! last line is; a `version` that is there and is not a version is an
-//! error, because the guard cannot compare it.
+//! line of any of them. A line that is not JSON is skipped, as a cut last
+//! line is; a `version` that is there and is not a version, `null` and
+//! any other value that is not text included, is an error, because the
+//! guard cannot compare it. The version is read before the rest of the
+//! line, so a line whose other fields have an unexpected shape still
+//! counts toward the writer.
 //!
 //! `message.model` names the model that served a reply, which is not
 //! always the one the session asked for. When Claude falls back, it writes
@@ -61,8 +64,6 @@ struct Line {
     kind: Option<String>,
     #[serde(default)]
     subtype: Option<String>,
-    #[serde(default)]
-    version: Option<String>,
     #[serde(rename = "isSidechain", default)]
     sidechain: bool,
     #[serde(default)]
@@ -126,23 +127,34 @@ fn read_one(path: &Path, recorded: &mut RecordedClaude) -> Result<(), HarnessErr
         {
             return Ok(());
         }
-        let line: Line = match serde_json::from_slice(&bytes) {
+        let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(e) => {
+                debug!(path = %path.display(), error = %e, "claude: transcript line skipped");
+                continue;
+            }
+        };
+        if let Some(version) = value.get("version") {
+            let malformed = |reason: String| HarnessError::Malformed {
+                what: Input::TranscriptLine,
+                path: path.to_path_buf(),
+                reason: format!("version: {reason}"),
+            };
+            let text = version
+                .as_str()
+                .ok_or_else(|| malformed("not text".to_owned()))?;
+            let version = HarnessVersion::parse(text).map_err(|e| malformed(e.to_string()))?;
+            if recorded.writer.as_ref().is_none_or(|w| version > *w) {
+                recorded.writer = Some(version);
+            }
+        }
+        let line = match Line::deserialize(&value) {
             Ok(line) => line,
             Err(e) => {
                 debug!(path = %path.display(), error = %e, "claude: transcript line skipped");
                 continue;
             }
         };
-        if let Some(text) = &line.version {
-            let version = HarnessVersion::parse(text).map_err(|e| HarnessError::Malformed {
-                what: Input::TranscriptLine,
-                path: path.to_path_buf(),
-                reason: format!("version: {e}"),
-            })?;
-            if recorded.writer.as_ref().is_none_or(|w| version > *w) {
-                recorded.writer = Some(version);
-            }
-        }
         if line.sidechain {
             continue;
         }
@@ -293,6 +305,47 @@ mod tests {
         ]
         .concat();
         assert_eq!(model_of(&latched), model("claude-fable-5"));
+    }
+
+    /// A `version` that is there but is not text fails the read as a bad
+    /// version does, and a line whose other fields have an unexpected
+    /// shape still names its writer: skipping either would leave the guard
+    /// without the newest writer. A line with no `version` is read past.
+    #[test]
+    fn a_writer_is_never_skipped_with_its_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("own.jsonl");
+        let writer_of = |lines: &[String]| {
+            std::fs::write(&path, lines.concat()).unwrap();
+            read(std::slice::from_ref(&path))
+        };
+        let newer = assistant("2.1.300", "claude-opus-5-5", false);
+        for value in ["2100", "null", "[\"2.1.300\"]", "{\"v\":\"2.1.300\"}"] {
+            let line = newer.replace("\"2.1.300\"", value);
+            assert_ne!(line, newer);
+            let read = writer_of(&[assistant("2.1.294", "claude-opus-5-5", false), line]);
+            assert!(
+                matches!(
+                    read,
+                    Err(HarnessError::Malformed {
+                        what: Input::TranscriptLine,
+                        ref reason,
+                        ..
+                    }) if reason == "version: not text"
+                ),
+                "{value}: {read:?}"
+            );
+        }
+        let odd_shape = newer.replace("\"isSidechain\":false", "\"isSidechain\":\"no\"");
+        assert_ne!(odd_shape, newer);
+        let read = writer_of(&[
+            assistant("2.1.294", "claude-opus-5-5", false),
+            odd_shape,
+            "{\"type\":\"summary\",\"summary\":\"no version here\"}\n".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(read.writer.unwrap().as_str(), "2.1.300");
+        assert_eq!(read.model, model("claude-opus-5-5"));
     }
 
     /// A fallback stands for the original model only until a reply comes
