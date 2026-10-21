@@ -9,7 +9,7 @@
 use std::fs;
 
 use fabric_core::harness::HarnessKind;
-use fabric_core::id::{JobId, NodeId, SnapshotId};
+use fabric_core::id::{Epoch, JobId, NodeId, RecordHash, SnapshotId};
 use fabric_core::ledger::{Author, EventKind, Ledger, LedgerError, Record};
 use fabric_core::moves::LeaseView;
 
@@ -163,6 +163,24 @@ impl Job {
         &self.ledger.manifest().harness
     }
 
+    /// The snapshot a suspend begun at `head` in the tenure at `epoch`
+    /// ended in: the last `Suspended` after `head` with no `Resumed` after
+    /// it, when every record after `head` is of that epoch.
+    fn suspended_after(&self, head: RecordHash, epoch: Epoch) -> Option<SnapshotId> {
+        let mut suspended = None;
+        for record in self.ledger.suffix_after(head)? {
+            if record.event().epoch != epoch {
+                return None;
+            }
+            match record.event().kind {
+                EventKind::Suspended { snapshot } => suspended = Some(snapshot),
+                EventKind::Resumed { .. } => suspended = None,
+                _ => {}
+            }
+        }
+        suspended
+    }
+
     /// The snapshot the owner suspended in, when no `Resumed` followed it.
     #[must_use]
     pub fn suspended_in(&self) -> Option<SnapshotId> {
@@ -220,12 +238,17 @@ impl Job {
 
     /// Settles a marker a crash left behind once the ledger says how the
     /// step ended: a suspend whose `Suspended` is durable is clean.
+    ///
+    /// Only a `Suspended` this node wrote after the head the marker
+    /// recorded, in the same tenure, completes that suspend. One from
+    /// before it began, or from another node after a steal or a move, says
+    /// nothing about this tree.
     pub fn reconcile_marker(&self) -> Result<Option<Marker>, NodeError> {
         let Some(marker) = self.marker()? else {
             return Ok(None);
         };
-        if let (MarkerState::Suspending { tree, .. }, Some(snapshot)) =
-            (&marker.state, self.suspended_in())
+        if let MarkerState::Suspending { head, tree } = &marker.state
+            && let Some(snapshot) = self.suspended_after(*head, marker.epoch)
         {
             let clean = Marker {
                 state: MarkerState::Clean {

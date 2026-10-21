@@ -4212,4 +4212,31 @@ pub(crate) mod tests {
             "a fork behind this node's epoch froze the job"
         );
     }
+
+    /// A suspend that failed after its marker said `Suspending` finished
+    /// nothing. A `Suspended` from before that suspend began must not
+    /// settle the marker: the tree holds the work done since, and calling
+    /// it clean at the older snapshot would let a later restore or move
+    /// treat that work as already in a snapshot.
+    #[tokio::test]
+    async fn a_failed_suspend_is_not_settled_by_an_earlier_one() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        node.job_run(id, &mut Out::default()).await.unwrap();
+        let root = paths::job_root(&node.cfg.home, id);
+        std::fs::write(root.join("README.md"), "work after the snapshot\n").unwrap();
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(root.join(".fabric/env.toml"), "not toml [\n").unwrap();
+        let refused = node.suspend(id, &path, &mut Out::default()).await;
+        assert!(matches!(refused, Err(NodeError::Detect(_))), "{refused:?}");
+        let job = node.job(id).await.unwrap();
+        let marker = job.lock().await.reconcile_marker().unwrap().unwrap();
+        assert!(
+            matches!(marker.state, MarkerState::Suspending { .. }),
+            "{:?}",
+            marker.state
+        );
+    }
 }
