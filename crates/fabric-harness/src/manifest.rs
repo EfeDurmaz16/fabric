@@ -335,7 +335,8 @@ impl StateManifest {
     }
 
     /// The harness version at capture: the one installed on the capturing
-    /// node, when the binary was found, or for Codex the known writer when
+    /// node, when the binary was found (for Codex, asked in the workspace,
+    /// as a launch there would run it), or for Codex the known writer when
     /// that is newer (`Codex::with_known_writer`): the one the session
     /// arrived with, raised to the version each resume on the node started
     /// with, so it is at least the newest Codex that ran the session under

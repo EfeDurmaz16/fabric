@@ -67,11 +67,13 @@
 //! 0.142.4. A resume reports the version the guard asked in the
 //! workspace (`Running::version`), the Codex that now runs the thread,
 //! and the node raises the known writer to it; a capture records the
-//! installed version, or the known writer when that is newer, so the
-//! job carries the newest Codex that ran the thread under Fabric to the
-//! next node, even when the capture's own version check, run from the
-//! daemon, finds another Codex than a version manager's shim picks in
-//! the workspace. A Codex that resumed the thread outside Fabric, such
+//! installed version, asked in the workspace as the guard asks it, or the
+//! known writer when that is newer, so the job carries the newest Codex
+//! that ran the thread under Fabric to the next node. The capture runs in
+//! the daemon, with its environment and the CLI's `PATH`, so a shim that
+//! picks the version by an environment variable the CLI set can still
+//! answer it with another Codex than the launch's; the directory, which
+//! `.tool-versions` and `mise.toml` pin by, is the same. A Codex that resumed the thread outside Fabric, such
 //! as a desktop build newer than the CLI on the same node, leaves no
 //! version anywhere and is not seen. A thread with no rollout on this
 //! node has no bytes to protect, so it is launched as before and Codex
@@ -394,8 +396,9 @@ impl Codex {
         self
     }
 
-    /// The version a capture records: the installed one, or the known
-    /// writer when that is newer or the installed one cannot be read.
+    /// The version a capture records: the installed one, as a launch in the
+    /// workspace would run it, or the known writer when that is newer or
+    /// the installed one cannot be read.
     fn captured_version(&self, installed: Option<String>) -> Option<String> {
         let Some(known) = &self.known_writer else {
             return installed;
@@ -555,8 +558,15 @@ impl Codex {
         out: &Path,
     ) -> Result<StateManifest, HarnessError> {
         let root = pipeline::physical_workspace(workspace)?;
-        let installed =
-            process::installed_version(self.binary().ok(), &self.path_var, PROGRAM).await;
+        // Asked in the workspace, where a version manager's shim picks the
+        // Codex a launch there runs, not the one it picks for the daemon.
+        let installed = process::installed_version_in(
+            self.binary().ok(),
+            Some(pipeline::fs_path(&root)),
+            &self.path_var,
+            PROGRAM,
+        )
+        .await;
         self.refuse_lockless_writers(installed.as_deref()).await?;
         let version = self.captured_version(installed);
         let adapter = self.clone();

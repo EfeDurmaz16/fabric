@@ -214,6 +214,29 @@ async fn a_capture_records_the_newest_known_writer() {
     }
 }
 
+/// A capture asks the installed Codex in the workspace, as the resume
+/// guard does: where a version manager's shim pins an older Codex in the
+/// workspace than it picks anywhere else, the capture records the one a
+/// launch there runs, not a newer one that never ran the thread, which
+/// as the known writer would refuse every later resume in that
+/// workspace.
+#[tokio::test]
+async fn a_capture_asks_the_installed_codex_in_the_workspace() {
+    let src = build_source();
+    let home = src.home.path().canonicalize().unwrap();
+    std::fs::write(src.work.join(".tool-versions"), "codex 0.155.1\n").unwrap();
+    let (_, path_var) = fake_codex_reporting(
+        &home,
+        "$(if [ -f .tool-versions ]; then echo 0.155.1; else echo 0.160.0; fi)",
+    );
+    let out = tempfile::tempdir().unwrap();
+    let manifest = Codex::new(abs(&home), path_var)
+        .capture(&src.work, &thread(), out.path())
+        .await
+        .unwrap();
+    assert_eq!(manifest.harness_version(), Some("0.155.1"));
+}
+
 #[tokio::test]
 async fn a_symlinked_codex_store_refuses_capture_and_restore() {
     let src = build_source();

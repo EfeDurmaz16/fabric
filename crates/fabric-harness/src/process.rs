@@ -194,10 +194,19 @@ pub(crate) async fn detect(
     binary: Option<PathBuf>,
     path_var: &OsStr,
 ) -> Result<Option<Installed>, HarnessError> {
+    detect_in(binary, None, path_var).await
+}
+
+/// `detect`, run in `cwd` when one is given.
+async fn detect_in(
+    binary: Option<PathBuf>,
+    cwd: Option<&Path>,
+    path_var: &OsStr,
+) -> Result<Option<Installed>, HarnessError> {
     let Some(path) = binary else {
         return Ok(None);
     };
-    let raw = probe(&path, &["--version"], None, &probe_env(path_var)).await?;
+    let raw = probe(&path, &["--version"], cwd, &probe_env(path_var)).await?;
     Ok(Some(Installed {
         version: version_token(&raw).map(str::to_owned),
         raw,
@@ -227,7 +236,20 @@ pub(crate) async fn installed_version(
     path_var: &OsStr,
     program: &str,
 ) -> Option<String> {
-    match detect(binary, path_var).await {
+    installed_version_in(binary, None, path_var, program).await
+}
+
+/// `installed_version`, run in `cwd` when one is given: a capture asks in
+/// the workspace, where a version manager's shim picks the same Codex a
+/// launch there runs (`reported_version`), not the one it picks for the
+/// daemon's directory.
+pub(crate) async fn installed_version_in(
+    binary: Option<PathBuf>,
+    cwd: Option<&Path>,
+    path_var: &OsStr,
+    program: &str,
+) -> Option<String> {
+    match detect_in(binary, cwd, path_var).await {
         Ok(installed) => installed.and_then(|i| i.version),
         Err(e) => {
             tracing::warn!(program, error = %e, "version probe failed");
