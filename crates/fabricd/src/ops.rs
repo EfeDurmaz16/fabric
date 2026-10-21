@@ -3136,6 +3136,70 @@ pub(crate) mod tests {
         );
     }
 
+    /// Review finding on PR #13: a node kept the last CLI's `PATH` as its
+    /// own and ran tools from it for its peers. With a job's virtualenv
+    /// activated in the shell, or direnv's `node_modules/.bin`, a peer's
+    /// preflight or pull then had the node run `python3` or `node` from
+    /// that workspace, whose files come from the repository and from
+    /// peers' snapshots, long after the shell was gone. The node now keeps
+    /// no directory inside a job's tree, written there or reached through
+    /// a link, and keeps the rest of the shell's environment.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_never_has_the_node_run_a_program_from_a_workspace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use fabric_client::api::{PathDir, Roots, SystemPath};
+
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let root = paths::job_root(&a.cfg.home, id);
+        let venv = root.join(".venv").join("bin");
+        std::fs::create_dir_all(&venv).unwrap();
+        let ran = dir_a.path().join("ran");
+        for program in ["python3", "node", "rustc", "pnpm"] {
+            let path = venv.join(program);
+            let script = format!("#!/bin/sh\necho \"$0\" >> '{}'\n", ran.display());
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let linked = dir_a.path().join("linked");
+        std::os::unix::fs::symlink(&root, &linked).unwrap();
+        let dir = |path: &Path| PathDir::parse(path.to_str().unwrap()).unwrap();
+        let system = |path: &Path| SystemPath::parse(path.to_str().unwrap()).unwrap();
+
+        for workspace in [venv.clone(), linked.join(".venv").join("bin")] {
+            a.remember_env(&ClientEnv {
+                path: vec![
+                    dir(&workspace),
+                    PathDir::parse("/usr/bin").unwrap(),
+                    PathDir::parse("/bin").unwrap(),
+                ],
+                roots: Roots {
+                    cargo_home: Some(SystemPath::parse("/shell/cargo").unwrap()),
+                    rustup_home: Some(system(&root.join(".rustup"))),
+                    ..Roots::default()
+                },
+            });
+            b.doctor(Some(a.id), None, &ToolEnv::current())
+                .await
+                .unwrap();
+            assert!(
+                !ran.exists(),
+                "a peer had the node run {}",
+                std::fs::read_to_string(&ran).unwrap_or_default()
+            );
+            let kept = a.node_env();
+            assert_eq!(kept.path_var(), "/usr/bin:/bin");
+            assert_eq!(
+                kept.root(Roots::CARGO_HOME),
+                Some(std::ffi::OsStr::new("/shell/cargo"))
+            );
+            assert_eq!(kept.root(Roots::RUSTUP_HOME), None);
+        }
+    }
+
     /// Three running nodes and a job A made and owns at epoch 1, which C,
     /// paired with B alone, stole and pushed to B: B is a replica at epoch
     /// 2 with C as its owner, and A, which knows nothing of the steal, is

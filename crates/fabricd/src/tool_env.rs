@@ -2,6 +2,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf};
 
 use fabric_client::api::{ClientEnv, Roots};
 
@@ -74,6 +75,55 @@ impl From<&ClientEnv> for ToolEnv {
                 .map(|(name, value)| (name, value.map(|value| value.as_str().into()))),
         }
     }
+}
+
+/// `env` without each `PATH` entry and each root that lies in one of
+/// `trees`, as written or as the file system resolves it now: a node keeps
+/// a client's environment for work no client asks for, and a directory in
+/// a job's tree holds files a repository or a peer's snapshot wrote, which
+/// the node must not run at a peer's request (review finding on PR #13).
+/// A root left out is removed from the tool's environment, as a root the
+/// client did not set.
+pub(crate) fn outside(mut env: ClientEnv, trees: &[PathBuf]) -> ClientEnv {
+    env.path
+        .retain(|dir| !within(Path::new(dir.as_str()), trees));
+    // Named one by one, so a new root fails to compile until it is here.
+    let Roots {
+        cargo_home,
+        rustup_home,
+        pnpm_home,
+        xdg_data_home,
+    } = &mut env.roots;
+    for root in [cargo_home, rustup_home, pnpm_home, xdg_data_home] {
+        if root
+            .as_ref()
+            .is_some_and(|dir| within(dir.as_path(), trees))
+        {
+            *root = None;
+        }
+    }
+    env
+}
+
+/// Whether `dir` lies in one of `trees`, compared as written and as
+/// resolved, so neither a link nor `..` leads into a tree unseen.
+fn within(dir: &Path, trees: &[PathBuf]) -> bool {
+    let dirs = [Some(dir.to_owned()), resolved(dir)];
+    trees
+        .iter()
+        .flat_map(|tree| [Some(tree.clone()), resolved(tree)])
+        .flatten()
+        .any(|tree| dirs.iter().flatten().any(|dir| dir.starts_with(&tree)))
+}
+
+/// `path` with its longest existing ancestor resolved, links and `..`
+/// included, and the rest as written; `None` for a relative path.
+fn resolved(path: &Path) -> Option<PathBuf> {
+    let parts: Vec<Component<'_>> = path.components().collect();
+    (1..=parts.len()).rev().find_map(|n| {
+        let real = std::fs::canonicalize(parts[..n].iter().collect::<PathBuf>()).ok()?;
+        Some(parts[n..].iter().fold(real, |path, part| path.join(part)))
+    })
 }
 
 #[cfg(test)]

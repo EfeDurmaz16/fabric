@@ -326,10 +326,24 @@ impl Node {
     /// with it, a peer and this node's CLI compared the shell's
     /// `CARGO_HOME` with the daemon's and rebuilt what they could carry
     /// (review finding on PR #13).
+    ///
+    /// A kept environment loses every directory in a job's tree, checked
+    /// each time, since a workspace changes: the shell that sent it may
+    /// have had a job's virtualenv on its `PATH`, and the node would run
+    /// that workspace's programs for whichever peer asked next (review
+    /// finding on PR #13).
     pub(crate) fn node_env(&self) -> ToolEnv {
-        lock(&self.client_env)
-            .as_ref()
-            .map_or_else(|| self.cfg.env.clone(), ToolEnv::from)
+        let kept = lock(&self.client_env).clone();
+        kept.map_or_else(
+            || self.cfg.env.clone(),
+            |env| {
+                let trees = [
+                    crate::paths::home_jobs(&self.cfg.home),
+                    self.cfg.state.jobs(),
+                ];
+                ToolEnv::from(&crate::tool_env::outside(env, &trees))
+            },
+        )
     }
 
     /// Keeps `env`, which a local client sent, as the node's environment,
