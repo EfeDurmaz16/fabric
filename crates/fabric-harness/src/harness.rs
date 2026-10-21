@@ -137,6 +137,8 @@ pub enum SettingName {
     Sandbox,
     /// When the harness asks before it runs a command.
     Approval,
+    /// Who answers what the harness asks: the user, or a reviewer model.
+    Reviewer,
 }
 
 impl std::fmt::Display for SettingName {
@@ -146,6 +148,7 @@ impl std::fmt::Display for SettingName {
             SettingName::Effort => "effort",
             SettingName::Sandbox => "sandbox",
             SettingName::Approval => "approval",
+            SettingName::Reviewer => "approvals reviewer",
         })
     }
 }

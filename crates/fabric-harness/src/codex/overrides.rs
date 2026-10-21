@@ -1,18 +1,34 @@
 //! The `-c` overrides a Codex launch passes.
 //!
-//! Invariant: only the settings ADR 0006 names (sandbox, approval policy,
-//! model, reasoning effort) can be expressed, each from a closed set or a
-//! parsed name, so neither a job record nor a session record can set
-//! another project's trust or any other key. `danger-full-access` is left
-//! out on purpose: adding it is a decision, not a missing case. Values
-//! checked against `codex --help` of 0.155.1 on 2026-10-20, and the
-//! spellings each enum reads against the `turn_context` records of the
-//! owner's rollouts on 2026-10-21 (values only). The approval policy
-//! `untrusted` is not in the set: Codex 0.155.1 refuses to load any
-//! configuration that sets it (`approval_policy = "untrusted" is no
-//! longer supported; remove this setting`, seen on 2026-10-21 with
-//! `codex mcp list -c approval_policy="untrusted"`), yet a `turn_context`
-//! can still record it for a project Codex marks untrusted.
+//! Invariant: only the settings ADR 0006 names (sandbox, approval
+//! policy and approvals reviewer, model, reasoning effort) can be
+//! expressed, each from a closed set or a parsed name, so neither a job
+//! record nor a session record can set another project's trust or any
+//! other key. `danger-full-access` is left out on purpose: adding it is
+//! a decision, not a missing case. Values checked against `codex
+//! --help` of 0.155.1 on 2026-10-20, and the spellings each enum reads
+//! against the `turn_context` records of the owner's rollouts on
+//! 2026-10-21 (values only). The approval policy `untrusted` is not in
+//! the set: Codex 0.155.1 refuses to load any configuration that sets
+//! it (`approval_policy = "untrusted" is no longer supported; remove
+//! this setting`, seen on 2026-10-21 with `codex mcp list -c
+//! approval_policy="untrusted"`), yet a `turn_context` can still record
+//! it for a project Codex marks untrusted.
+//!
+//! The approval policy says when Codex asks, and `approvals_reviewer`
+//! says who answers: the user, or `auto_review`, a reviewer model
+//! (`ApprovalsReviewer` in `codex-rs/protocol/src/config_types.rs` at
+//! `rust-v0.155.1`, which reads the older `guardian_subagent` as
+//! `auto_review` and writes `auto_review`). A terminal `codex resume`
+//! sends the node's reviewer with the thread
+//! (`thread_resume_params_from_config` in
+//! `codex-rs/tui/src/app_server_session.rs` at the same tag), so a
+//! policy carried alone would let the node's reviewer answer what the
+//! session's user answered, or the other way round; the reviewer
+//! travels with the policy. `codex exec resume` sends none unless `-c`
+//! sets it, and Codex then restores the thread's own from the rollout
+//! (`latest_persisted_resume_settings`, `codex-rs/app-server` at the
+//! same tag), so a headless launch neither passes nor reports it.
 //!
 //! A resume takes these settings from the session (`rollout::recorded`),
 //! and any field the adapter was configured with wins over the session's
@@ -89,6 +105,38 @@ impl ApprovalPolicy {
     }
 }
 
+/// The `approvals_reviewer` a run uses: who answers an approval request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalsReviewer {
+    /// `user`: the user answers.
+    User,
+    /// `auto_review`: a reviewer model answers.
+    AutoReview,
+}
+
+impl ApprovalsReviewer {
+    /// The spelling Codex uses, in `-c` and in its records.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApprovalsReviewer::User => "user",
+            ApprovalsReviewer::AutoReview => "auto_review",
+        }
+    }
+
+    /// The reviewer a record spells, the older `guardian_subagent` read
+    /// as `auto_review` as Codex reads it; `None` for any other.
+    #[must_use]
+    pub fn from_record(text: &str) -> Option<Self> {
+        if text == "guardian_subagent" {
+            return Some(ApprovalsReviewer::AutoReview);
+        }
+        [ApprovalsReviewer::User, ApprovalsReviewer::AutoReview]
+            .into_iter()
+            .find(|reviewer| reviewer.as_str() == text)
+    }
+}
+
 /// The `model_reasoning_effort` a run uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effort {
@@ -132,6 +180,8 @@ pub struct CodexOverrides {
     pub sandbox: Option<SandboxMode>,
     /// When to ask before running a command.
     pub approval: Option<ApprovalPolicy>,
+    /// Who answers what Codex asks.
+    pub reviewer: Option<ApprovalsReviewer>,
     /// The model.
     pub model: Option<ModelName>,
     /// The reasoning effort.
@@ -153,6 +203,9 @@ impl CodexOverrides {
         }
         if let Some(approval) = self.approval {
             pairs.push(format!("approval_policy=\"{}\"", approval.as_str()));
+        }
+        if let Some(reviewer) = self.reviewer {
+            pairs.push(format!("approvals_reviewer=\"{}\"", reviewer.as_str()));
         }
         pairs
     }
@@ -285,9 +338,23 @@ pub(crate) fn effective(
             &mut report,
         )
     };
+    // Under `codex exec resume`, Codex restores the thread's own reviewer
+    // when none is passed, so only a pin is.
+    let reviewer = pick(
+        SettingName::Reviewer,
+        pinned.and_then(|p| p.reviewer.as_ref()),
+        if headless {
+            None
+        } else {
+            recorded.map(|r| &r.reviewer)
+        },
+        |v| v.as_str().to_owned(),
+        &mut report,
+    );
     let overrides = CodexOverrides {
         sandbox,
         approval,
+        reviewer,
         model,
         effort,
     };
@@ -306,6 +373,7 @@ mod tests {
                 reason: "not an effort Fabric passes".to_owned(),
             },
             approval: Recorded::Carried(ApprovalPolicy::OnRequest),
+            reviewer: Recorded::Carried(ApprovalsReviewer::User),
             sandbox: Recorded::Carried(SandboxMode::WorkspaceWrite),
             writer: None,
         }
@@ -326,6 +394,7 @@ mod tests {
             CodexOverrides {
                 sandbox: Some(SandboxMode::ReadOnly),
                 approval: Some(ApprovalPolicy::OnRequest),
+                reviewer: Some(ApprovalsReviewer::User),
                 model: Some(ModelName::parse("gpt-6-sol").unwrap()),
                 effort: None,
             }
@@ -341,6 +410,7 @@ mod tests {
                 (SettingName::Model, "gpt-6-sol", Origin::Session),
                 (SettingName::Sandbox, "read-only", Origin::Pinned),
                 (SettingName::Approval, "on-request", Origin::Session),
+                (SettingName::Reviewer, "user", Origin::Session),
             ]
         );
         assert_eq!(
@@ -358,16 +428,23 @@ mod tests {
 
     /// `codex exec` sets its own approval policy over any `-c`, so a
     /// headless launch passes none and says which one it left out, the
-    /// pin's or else the session's.
+    /// pin's or else the session's. It passes no reviewer either and says
+    /// nothing of it: `codex exec resume` restores the thread's own.
     #[test]
     fn a_headless_launch_leaves_the_approval_policy_to_codex_exec() {
         let (overrides, report) = effective(None, Some(&recorded()), true);
-        assert_eq!(overrides.approval, None);
+        assert_eq!((overrides.approval, overrides.reviewer), (None, None));
         assert!(
             report
                 .passed
                 .iter()
-                .all(|p| p.name != SettingName::Approval)
+                .all(|p| !matches!(p.name, SettingName::Approval | SettingName::Reviewer))
+        );
+        assert!(
+            report
+                .not_carried
+                .iter()
+                .all(|n| n.name != SettingName::Reviewer)
         );
         assert_eq!(
             report.not_carried.last(),

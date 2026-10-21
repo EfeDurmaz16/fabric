@@ -44,7 +44,7 @@ use crate::redact::Redactor;
 use crate::session::SessionId;
 use crate::version::HarnessVersion;
 
-use super::overrides::{ApprovalPolicy, Effort, SandboxMode};
+use super::overrides::{ApprovalPolicy, ApprovalsReviewer, Effort, SandboxMode};
 
 /// What a rollout file name says.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,6 +267,8 @@ pub(crate) struct RecordedSettings {
     pub(crate) effort: Recorded<Effort>,
     /// The approval policy of the last turn.
     pub(crate) approval: Recorded<ApprovalPolicy>,
+    /// The approvals reviewer of the last turn.
+    pub(crate) reviewer: Recorded<ApprovalsReviewer>,
     /// The sandbox of the last turn.
     pub(crate) sandbox: Recorded<SandboxMode>,
     /// The highest `cli_version` any `session_meta` line records: the
@@ -304,7 +306,7 @@ fn setting<T>(
 }
 
 impl RecordedSettings {
-    /// Takes the settings of one `turn_context` payload, replacing all four.
+    /// Takes the settings of one `turn_context` payload, replacing all five.
     fn take_turn(&mut self, payload: &serde_json::Value) {
         self.model = setting(payload.get("model"), |text| {
             ModelName::parse(text).map_err(|e| format!("not a model name Fabric passes: {e}"))
@@ -322,6 +324,11 @@ impl RecordedSettings {
                     "not an approval policy Fabric passes, which are on-request and never"
                         .to_owned()
                 }
+            })
+        });
+        self.reviewer = setting(payload.get("approvals_reviewer"), |text| {
+            ApprovalsReviewer::from_record(text).ok_or_else(|| {
+                "not an approvals reviewer Fabric passes, which are user and auto_review".to_owned()
             })
         });
         let sandbox = payload.get("sandbox_policy");
@@ -463,8 +470,18 @@ mod tests {
     }
 
     fn turn(model: &str, effort: &str, approval: &str, sandbox: &str) -> String {
+        turn_reviewed(model, effort, approval, "user", sandbox)
+    }
+
+    fn turn_reviewed(
+        model: &str,
+        effort: &str,
+        approval: &str,
+        reviewer: &str,
+        sandbox: &str,
+    ) -> String {
         format!(
-            "{{\"type\":\"turn_context\",\"payload\":{{\"model\":\"{model}\",\"effort\":\"{effort}\",\"approval_policy\":\"{approval}\",\"sandbox_policy\":{{\"type\":\"{sandbox}\",\"network_access\":false}}}}}}\n"
+            "{{\"type\":\"turn_context\",\"payload\":{{\"model\":\"{model}\",\"effort\":\"{effort}\",\"approval_policy\":\"{approval}\",\"approvals_reviewer\":\"{reviewer}\",\"sandbox_policy\":{{\"type\":\"{sandbox}\",\"network_access\":false}}}}}}\n"
         )
     }
 
@@ -504,8 +521,14 @@ mod tests {
             "{}{}{}{}",
             meta("0.155.1", Some(THREAD)),
             meta("0.142.4", None),
-            turn("gpt-6-astra", "high", "never", "read-only"),
-            turn("gpt-6-sol", "xhigh", "on-request", "workspace-write"),
+            turn_reviewed("gpt-6-astra", "high", "never", "user", "read-only"),
+            turn_reviewed(
+                "gpt-6-sol",
+                "xhigh",
+                "on-request",
+                "auto_review",
+                "workspace-write"
+            ),
         );
         let chain = lineage(dir.path(), &prefix, &suffix);
         assert_eq!(chain.len(), 2);
@@ -516,6 +539,7 @@ mod tests {
                 model: Recorded::Carried(ModelName::parse("gpt-6-sol").unwrap()),
                 effort: Recorded::Carried(Effort::XHigh),
                 approval: Recorded::Carried(ApprovalPolicy::OnRequest),
+                reviewer: Recorded::Carried(ApprovalsReviewer::AutoReview),
                 sandbox: Recorded::Carried(SandboxMode::WorkspaceWrite),
                 writer: Some(HarnessVersion::parse("0.163.0-alpha.10.2").unwrap()),
             }
@@ -539,7 +563,13 @@ mod tests {
         let suffix = format!(
             "{}{}",
             meta("0.155.1", Some(THREAD)),
-            turn("gpt 6", "ultra", "on-failure", "danger-full-access"),
+            turn_reviewed(
+                "gpt 6",
+                "ultra",
+                "on-failure",
+                "bogus",
+                "danger-full-access"
+            ),
         );
         let chain = lineage(dir.path(), &meta("0.155.1", None), &suffix);
         let read = recorded(&chain).unwrap();
@@ -554,6 +584,10 @@ mod tests {
         assert_eq!(
             reason(&read.approval),
             "on-failure: not an approval policy Fabric passes, which are on-request and never"
+        );
+        assert_eq!(
+            reason(&read.reviewer),
+            "bogus: not an approvals reviewer Fabric passes, which are user and auto_review"
         );
         assert_eq!(
             reason(&read.sandbox),

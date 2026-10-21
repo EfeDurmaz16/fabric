@@ -517,6 +517,7 @@ async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_the
     let adapter = Codex::new(abs(&home), bin.clone()).with_overrides(CodexOverrides {
         sandbox: Some(SandboxMode::WorkspaceWrite),
         approval: Some(ApprovalPolicy::Never),
+        reviewer: None,
         model: None,
         effort: None,
     });

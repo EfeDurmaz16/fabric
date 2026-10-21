@@ -49,17 +49,18 @@
 //! finding F10a): Codex resumes with the model of this node's
 //! `config.toml`, not the one the thread ran with, so the launch reads
 //! the last `turn_context` of the lineage and passes its model, effort,
-//! sandbox and, on a terminal run, approval policy, each one the
-//! adapter was configured with winning (`overrides::effective`); `codex
-//! exec` sets its own approval policy and records the `never` it
-//! forced, so a terminal run does not carry a recorded `never`. Before
-//! anything starts it asks the binary it would run for its version and
-//! refuses when that is older than the newest Codex known to have
-//! written the thread, or unreadable (`version::refuse_older`, gate
-//! finding F10b). That is the highest `cli_version` the lineage records
-//! or the known writer the job carried (`with_known_writer`), whichever
-//! is newer: Codex writes `session_meta`, with its version, only when
-//! it creates a rollout, and a resume appends with no version at all
+//! sandbox and, on a terminal run, approval policy and approvals
+//! reviewer, each one the adapter was configured with winning
+//! (`overrides::effective`); `codex exec` sets its own approval policy
+//! and records the `never` it forced, so a terminal run does not carry
+//! a recorded `never`. Before anything starts it asks the binary it
+//! would run for its version and refuses when that is older than the
+//! newest Codex known to have written the thread, or unreadable
+//! (`version::refuse_older`, gate finding F10b). That is the highest
+//! `cli_version` the lineage records or the known writer the job
+//! carried (`with_known_writer`), whichever is newer: Codex writes
+//! `session_meta`, with its version, only when it creates a rollout,
+//! and a resume appends with no version at all
 //! (`codex-rs/rollout/src/recorder.rs` at `rust-v0.155.1`,
 //! `RolloutRecorderParams::Resume` with `meta: None`), so the rollout
 //! of a thread created by 0.142.4 and continued by 0.155.1 names only
@@ -852,6 +853,7 @@ mod tests {
         let set = CodexOverrides {
             sandbox: Some(overrides::SandboxMode::WorkspaceWrite),
             approval: Some(overrides::ApprovalPolicy::OnRequest),
+            reviewer: Some(overrides::ApprovalsReviewer::User),
             model: Some(crate::harness::ModelName::parse("o3").unwrap()),
             effort: Some(overrides::Effort::High),
         };
@@ -875,7 +877,9 @@ mod tests {
                 "-c",
                 "sandbox_mode=\"workspace-write\"",
                 "-c",
-                "approval_policy=\"on-request\""
+                "approval_policy=\"on-request\"",
+                "-c",
+                "approvals_reviewer=\"user\""
             ]
         );
         let headless = Launch::Headless {
@@ -899,6 +903,8 @@ mod tests {
                 "sandbox_mode=\"workspace-write\"",
                 "-c",
                 "approval_policy=\"on-request\"",
+                "-c",
+                "approvals_reviewer=\"user\"",
                 "--",
                 "--dangerously-bypass-approvals-and-sandbox"
             ]
@@ -1171,6 +1177,60 @@ mod tests {
             "{refused}"
         );
         assert_eq!(fixture.ran(), None, "codex ran unguarded");
+    }
+
+    /// A terminal resume after a headless turn: the `never` that `codex
+    /// exec` recorded is not carried, and the approvals reviewer the
+    /// session ran with is, so the node's own reviewer does not take over
+    /// what the session's user answered.
+    #[tokio::test]
+    async fn a_terminal_resume_carries_the_reviewer_and_not_a_recorded_never() {
+        let fixture = Resume::new("codex-cli 0.155.1");
+        let rollout = std::fs::read_to_string(&fixture.rollout).unwrap();
+        let after_exec = rollout.replace(
+            "\"approval_policy\":\"on-request\"",
+            "\"approval_policy\":\"never\",\"approvals_reviewer\":\"user\"",
+        );
+        assert_ne!(after_exec, rollout);
+        std::fs::write(&fixture.rollout, after_exec).unwrap();
+        let launch = Launch::Interactive {
+            resume: Some(SessionId::parse(THREAD).unwrap()),
+            prompt: None,
+        };
+        let mut running = fixture
+            .adapter
+            .launch(&fixture.home.join("work"), launch, &fixture.env)
+            .await
+            .unwrap();
+        running.child_mut().wait().await.unwrap();
+        let ran = fixture.ran().unwrap();
+        assert!(
+            ran.iter().any(|a| a == "approvals_reviewer=\"user\"")
+                && !ran.iter().any(|a| a.starts_with("approval_policy=")),
+            "{ran:?}"
+        );
+        let passed: Vec<String> = running
+            .settings()
+            .passed
+            .iter()
+            .map(|p| format!("{} {}", p.name, p.value))
+            .collect();
+        assert_eq!(
+            passed,
+            [
+                "model gpt-6-sol",
+                "effort xhigh",
+                "sandbox workspace-write",
+                "approvals reviewer user"
+            ]
+        );
+        let left: Vec<String> = running
+            .settings()
+            .not_carried
+            .iter()
+            .map(|n| format!("{} {}", n.name, n.value))
+            .collect();
+        assert_eq!(left, ["approval never"]);
     }
 
     /// A headless resume passes the model, effort and sandbox the session
