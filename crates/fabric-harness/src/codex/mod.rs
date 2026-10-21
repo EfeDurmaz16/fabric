@@ -980,6 +980,27 @@ mod tests {
         assert_eq!(report.failure.as_deref(), Some("usage limit"));
     }
 
+    /// A capture whose own version check cannot read the installed Codex,
+    /// such as a version manager's shim with no version set outside the
+    /// workspace, or a `--version` line that is not a version, records the
+    /// known writer, so the next node's guard keeps the floor. (A capture
+    /// test cannot reach this branch on a node where any `codex` runs: an
+    /// unreadable version makes the capture wait for every one to exit.)
+    #[test]
+    fn a_capture_that_cannot_read_the_installed_codex_records_the_known_writer() {
+        let adapter = Codex::new(AbsPath::parse("/h").unwrap(), OsString::new())
+            .with_known_writer(Some(HarnessVersion::parse("0.160.0").unwrap()));
+        for installed in [None, Some("0.155")] {
+            assert_eq!(
+                adapter
+                    .captured_version(installed.map(str::to_owned))
+                    .as_deref(),
+                Some("0.160.0"),
+                "{installed:?}"
+            );
+        }
+    }
+
     const THREAD: &str = "019f233e-bb33-7342-85fa-f2d33b14368a";
 
     /// A home whose store holds one rollout of `THREAD`, written by Codex
