@@ -97,9 +97,7 @@ impl Node {
     /// Call it inside a tokio runtime: the transports and the socket register with it.
     pub fn start(cfg: NodeConfig) -> Result<Arc<Self>, NodeError> {
         let root = cfg.state.root();
-        fs::create_dir_all(root).map_err(|e| NodeError::io(root, e))?;
-        fs::set_permissions(root, fs::Permissions::from_mode(0o700))
-            .map_err(|e| NodeError::io(root, e))?;
+        prepare_state_dir(root)?;
         let lock_path = cfg.state.lock();
         let lock_file = File::create(&lock_path).map_err(|e| NodeError::io(&lock_path, e))?;
         match lock_file.try_lock() {
@@ -378,6 +376,80 @@ fn open_store(dir: &std::path::Path) -> Result<Store, NodeError> {
     }
 }
 
+/// The names Fabric writes at the top of a state directory.
+const STATE_ENTRIES: [&str; 9] = [
+    "daemon.lock",
+    "fabric.sock",
+    "harness.toml",
+    "jobs",
+    "locks",
+    "node.key",
+    "peers",
+    "peers.lock",
+    "store",
+];
+
+/// Makes the state directory private to this user without taking over one
+/// it does not own.
+///
+/// A missing directory is created with mode 0700. An existing one must be
+/// this user's; when it lets others in, its mode is narrowed only if it
+/// holds nothing but what Fabric writes, so a `FABRIC_HOME` that names a
+/// shared directory, such as `/tmp` or a project, is refused, not changed.
+fn prepare_state_dir(root: &std::path::Path) -> Result<(), NodeError> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let unsafe_dir = |reason: String| NodeError::UnsafeStateDir {
+        path: root.to_owned(),
+        reason,
+    };
+    let meta = match fs::metadata(root) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(root)
+                .map_err(|e| NodeError::io(root, e))?;
+            return fs::set_permissions(root, fs::Permissions::from_mode(0o700))
+                .map_err(|e| NodeError::io(root, e));
+        }
+        Err(e) => return Err(NodeError::io(root, e)),
+    };
+    if !meta.is_dir() {
+        return Err(unsafe_dir("is not a directory".to_owned()));
+    }
+    let me = rustix::process::geteuid().as_raw();
+    if meta.uid() != me {
+        return Err(unsafe_dir(format!(
+            "belongs to user {}, not to you ({me})",
+            meta.uid()
+        )));
+    }
+    let others = meta.mode() & 0o077;
+    if others == 0 {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root).map_err(|e| NodeError::io(root, e))? {
+        let name = entry.map_err(|e| NodeError::io(root, e))?.file_name();
+        let name = name.to_string_lossy();
+        let ours = STATE_ENTRIES.iter().any(|known| {
+            *name == **known
+                || name
+                    .strip_prefix(known)
+                    .and_then(|rest| rest.strip_prefix('.'))
+                    .and_then(|rest| rest.strip_suffix("tmp"))
+                    .is_some_and(|middle| middle.ends_with('.'))
+        });
+        if !ours {
+            return Err(unsafe_dir(format!(
+                "has mode {:o} and holds {name}, which Fabric did not write",
+                meta.mode() & 0o777
+            )));
+        }
+    }
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700)).map_err(|e| NodeError::io(root, e))
+}
+
 type Jobs = BTreeMap<JobId, Arc<tokio::sync::Mutex<Job>>>;
 
 fn load_jobs(state: &StateDir) -> Result<(Jobs, BTreeMap<JobId, String>), NodeError> {
@@ -420,5 +492,48 @@ impl Out {
     /// Adds a line.
     pub(crate) fn say(&mut self, line: impl Into<String>) {
         self.lines.push(line.into());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    fn mode(path: &std::path::Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A `FABRIC_HOME` typed at a shared directory must be refused, not
+    /// narrowed to 0700 under everyone who uses it.
+    #[test]
+    fn a_shared_directory_is_refused_and_left_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("project");
+        fs::create_dir(&shared).unwrap();
+        fs::write(shared.join("notes.txt"), "mine").unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+        let refused = prepare_state_dir(&shared);
+        assert!(
+            matches!(refused, Err(NodeError::UnsafeStateDir { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(mode(&shared), 0o755);
+    }
+
+    #[test]
+    fn a_new_or_fabric_only_directory_is_made_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("a/b/state");
+        prepare_state_dir(&fresh).unwrap();
+        assert_eq!(mode(&fresh), 0o700);
+        let made = dir.path().join("made");
+        fs::create_dir(&made).unwrap();
+        fs::write(made.join("harness.toml"), "").unwrap();
+        fs::write(made.join("peers.42.tmp"), "").unwrap();
+        fs::set_permissions(&made, fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_state_dir(&made).unwrap();
+        assert_eq!(mode(&made), 0o700);
     }
 }

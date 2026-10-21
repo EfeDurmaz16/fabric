@@ -28,6 +28,14 @@ pub enum NodeError {
         #[source]
         source: std::io::Error,
     },
+    /// The state directory exists, lets other users in, and is not one Fabric made.
+    #[error("{path}: {reason}; secure it (chmod 700) or choose a dedicated FABRIC_HOME")]
+    UnsafeStateDir {
+        /// The directory.
+        path: PathBuf,
+        /// What is wrong with it.
+        reason: String,
+    },
     /// Another daemon holds this state directory.
     #[error("another fabric daemon holds {0}")]
     AlreadyRunning(PathBuf),
