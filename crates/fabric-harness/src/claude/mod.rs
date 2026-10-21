@@ -56,7 +56,7 @@ use fabric_core::path::AbsPath;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::departure::Records;
+use crate::departure::{FABRIC_DIR, Records};
 use crate::error::{HarnessError, IoOp};
 use crate::harness::{Harness, Installed, Launch, Restored, Running};
 use crate::jsontext;
@@ -290,7 +290,7 @@ impl ClaudeCode {
     }
 
     async fn installed_version(&self) -> Option<String> {
-        process::installed_version(self.binary().ok(), PROGRAM).await
+        process::installed_version(self.binary().ok(), &self.path_var, PROGRAM).await
     }
 
     /// Makes sure Claude trusts `workspace`, where Fabric can do so
@@ -361,7 +361,12 @@ impl ClaudeCode {
             );
             return Ok(left(LeftReason::ClaudeRunning { pids }));
         }
-        let changed = pipeline::blocking(move || trust::preseed_file(&config, &key)).await?;
+        let lock = self
+            .home_dir()
+            .join(FABRIC_DIR)
+            .join("harness/locks/claude-config.lock");
+        let changed =
+            pipeline::blocking(move || trust::preseed_locked(&config, &key, &lock)).await?;
         Ok(if changed {
             TrustOutcome::Written { key: key_path }
         } else {
@@ -476,6 +481,7 @@ impl ClaudeCode {
     fn add_file_history(
         &self,
         sources: &mut Vec<Source>,
+        root: &AbsPath,
         session: &SessionId,
         counts: &mut RedactionCounts,
     ) -> Result<(), HarnessError> {
@@ -492,7 +498,8 @@ impl ClaudeCode {
             .filter(|s| s.carry == Carry::JsonLines)
             .map(|s| s.abs.as_path())
             .collect();
-        let backups = history::Backups::read(&transcripts)?;
+        let backups =
+            history::Backups::read(&transcripts, self.home_dir(), pipeline::fs_path(root))?;
         for file in pipeline::walk(&dir)? {
             let name = file.to_string_lossy();
             if backups.admit(&name, counts) {
@@ -551,7 +558,7 @@ impl ClaudeCode {
         }
         let key = Self::key_of(root)?;
         self.add_tree(&mut sources, &projects.join(&key).join("memory"))?;
-        self.add_file_history(&mut sources, session, counts)?;
+        self.add_file_history(&mut sources, root, session, counts)?;
         let prefix8: String = session.as_str().chars().take(8).collect();
         self.add_tree(
             &mut sources,
@@ -574,6 +581,9 @@ impl ClaudeCode {
         out: &Path,
         version: Option<String>,
     ) -> Result<StateManifest, HarnessError> {
+        // Every walk below starts at the config directory and would follow
+        // it, or a directory above it, if it were a link.
+        pipeline::refuse_symlinks(self.home_dir(), &self.config_dir)?;
         let mut counts = RedactionCounts::new();
         let sources = self.sources_for(root, session, &mut counts)?;
         let records = self.departure(session);
@@ -658,7 +668,7 @@ impl ClaudeCode {
     }
 
     async fn detect_impl(&self) -> Result<Option<Installed>, HarnessError> {
-        process::detect(self.binary().ok()).await
+        process::detect(self.binary().ok(), &self.path_var).await
     }
 
     /// The session the process runs and the argument list for `launch`,

@@ -477,6 +477,50 @@ async fn a_secret_in_the_state_directory_refuses_the_capture() {
     assert!(!out.path().join("manifest.json").exists());
 }
 
+#[tokio::test]
+async fn a_secret_in_the_launch_arguments_refuses_the_capture() {
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let state_dir = home.path().join(".fake-agent/sessions");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::write(state_dir.join("fake-9.json"), "{}\n").unwrap();
+    let mut args = agent_args();
+    args.extend(["--api-key".to_owned(), format!("sk-ant-{}", "a".repeat(24))]);
+    let adapter = AcpHarness::new(program(), args, abs(home.path()), agent_dir(home.path()))
+        .with_state_dir(&abs(&state_dir))
+        .unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let err = adapter
+        .capture(&work, &SessionId::parse("fake-9").unwrap(), out.path())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, HarnessError::SecretInArguments { .. }),
+        "{err}"
+    );
+    assert!(!out.path().join("manifest.json").exists());
+}
+
+#[tokio::test]
+async fn a_symlinked_state_directory_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(elsewhere.path().join("fake-9.json"), "{}\n").unwrap();
+    std::fs::create_dir_all(home.path().join(".fake-agent")).unwrap();
+    let state_dir = home.path().join(".fake-agent/sessions");
+    std::os::unix::fs::symlink(elsewhere.path(), &state_dir).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let err = adapter(home.path(), PermissionPolicy::Deny)
+        .capture(&work, &SessionId::parse("fake-9").unwrap(), out.path())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HarnessError::SymlinkInState { .. }), "{err}");
+    assert!(!out.path().join("manifest.json").exists());
+}
+
 /// Writes session `fake-9` with `escaped` as the JSON text of a prompt and
 /// asserts that capture refuses it at that line.
 async fn assert_state_refused(escaped: &str) {
@@ -577,4 +621,37 @@ async fn capture_without_a_declared_state_dir_is_refused() {
     .with_state_dir(&AbsPath::parse("/elsewhere").unwrap())
     .unwrap_err();
     assert!(matches!(err, HarnessError::NotUnderHome { .. }), "{err}");
+}
+
+#[test]
+fn a_state_dir_that_overlaps_fabric_state_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+    for dir in [
+        home.path().to_path_buf(),
+        home.path().join(".fabric"),
+        home.path().join(".fabric/harness/departed"),
+        home.path().join(".Fabric/x"),
+    ] {
+        let err = AcpHarness::new(
+            program(),
+            agent_args(),
+            abs(home.path()),
+            agent_dir(home.path()),
+        )
+        .with_state_dir(&abs(&dir))
+        .unwrap_err();
+        assert!(
+            matches!(err, HarnessError::StateDirHoldsFabric { .. }),
+            "{}: {err}",
+            dir.display()
+        );
+    }
+    AcpHarness::new(
+        program(),
+        agent_args(),
+        abs(home.path()),
+        agent_dir(home.path()),
+    )
+    .with_state_dir(&abs(&home.path().join(".fabric-agent/sessions")))
+    .unwrap();
 }

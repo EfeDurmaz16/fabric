@@ -199,6 +199,8 @@ pub trait Harness: Send + Sync {
 
     /// Copies everything `session` needs to continue into `out`, redacted,
     /// and writes the manifest there. The harness must not be running.
+    /// `out` belongs to the capture: a file in it that the new manifest
+    /// does not list, such as one an earlier capture left, is removed.
     fn capture<'a>(
         &'a self,
         workspace: &'a Path,

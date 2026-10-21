@@ -441,6 +441,9 @@ impl Codex {
         version: Option<String>,
     ) -> Result<StateManifest, HarnessError> {
         let home_parts = self.codex_home_parts()?;
+        // Listing rollouts and taking the lock start at the store and would
+        // follow it, or a directory above it, if it were a link.
+        pipeline::refuse_symlinks(self.home_dir(), &self.store)?;
         let lock = self.hold_writer_lock(session)?;
         let chain = self.lineage(session)?;
         let mut sources = Vec::with_capacity(chain.len());
@@ -486,7 +489,7 @@ impl Codex {
         out: &Path,
     ) -> Result<StateManifest, HarnessError> {
         let root = pipeline::physical_workspace(workspace)?;
-        let version = process::installed_version(self.binary().ok(), PROGRAM).await;
+        let version = process::installed_version(self.binary().ok(), &self.path_var, PROGRAM).await;
         self.refuse_lockless_writers(version.as_deref()).await?;
         let adapter = self.clone();
         let session = session.clone();
@@ -565,6 +568,7 @@ impl Codex {
             }
         }
         let chain = lineage_in(&staged, &session, state)?;
+        pipeline::refuse_symlinks(self.home_dir(), &self.store)?;
         let lock = self.hold_writer_lock(&session)?;
         let existing = self.all_rollouts()?;
         let fallback_dir = self
@@ -592,7 +596,7 @@ impl Codex {
     async fn restore_impl(&self, workspace: &Path, state: &Path) -> Result<Restored, HarnessError> {
         let root = pipeline::physical_workspace(workspace)?;
         let manifest = pipeline::open(state, &HarnessKind::Codex, &root, &self.home)?;
-        let version = process::installed_version(self.binary().ok(), PROGRAM).await;
+        let version = process::installed_version(self.binary().ok(), &self.path_var, PROGRAM).await;
         self.refuse_lockless_writers(version.as_deref()).await?;
         let adapter = self.clone();
         let state = state.to_path_buf();
@@ -600,7 +604,7 @@ impl Codex {
     }
 
     async fn detect_impl(&self) -> Result<Option<Installed>, HarnessError> {
-        process::detect(self.binary().ok()).await
+        process::detect(self.binary().ok(), &self.path_var).await
     }
 
     /// The argument list for `launch`, without the binary.

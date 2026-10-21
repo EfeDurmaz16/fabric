@@ -3,7 +3,10 @@
 //! Invariant: every file that enters a state tree passes the denylist, is
 //! redacted or refused as its `Carry` says, and is written durably, with
 //! its length and `BLAKE3` digest recorded for the manifest. A staged tree
-//! is checked against those digests before restore places a byte of it.
+//! holds exactly the files its manifest lists: a file an earlier or failed
+//! capture left in a reused directory is removed before the manifest is
+//! written. A staged tree is checked against those digests before restore
+//! places a byte of it.
 
 #![cfg_attr(
     not(all(feature = "acp", feature = "claude", feature = "codex")),
@@ -13,6 +16,7 @@
     )
 )]
 
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -25,7 +29,7 @@ use crate::denylist;
 use crate::durable::{self, Hashing, Written};
 use crate::error::{HarnessError, IoOp};
 use crate::jsontext::{self, TransformError};
-use crate::manifest::{Carried, Content, MANIFEST_FILE, Mutability};
+use crate::manifest::{Carried, Content, Digest, MANIFEST_FILE, Mutability};
 use crate::redact::{RedactionCounts, Redactor};
 
 /// The redaction rule name under which dropped signed blocks are counted.
@@ -88,6 +92,24 @@ fn split_newline(line: &[u8]) -> (&[u8], &'static [u8]) {
     }
 }
 
+/// A reader that hashes every byte it hands out, so the digest names
+/// exactly the bytes a transfer read and no later state of the file.
+struct HashingRead<R> {
+    inner: R,
+    hasher: blake3::Hasher,
+}
+
+impl<R: io::Read> io::Read for HashingRead<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+}
+
+/// The source of one transfer.
+type Input = BufReader<HashingRead<File>>;
+
 /// What the JSON transform made of one text.
 enum Parsed {
     /// Valid JSON with nothing to redact.
@@ -122,11 +144,7 @@ impl Transfer<'_> {
             .map_err(|e| HarnessError::io(IoOp::Write, self.src, e))
     }
 
-    fn next_line(
-        &self,
-        reader: &mut BufReader<File>,
-        line: &mut Vec<u8>,
-    ) -> Result<bool, HarnessError> {
+    fn next_line(&self, reader: &mut Input, line: &mut Vec<u8>) -> Result<bool, HarnessError> {
         line.clear();
         let n = reader
             .read_until(b'\n', line)
@@ -134,15 +152,12 @@ impl Transfer<'_> {
         Ok(n > 0)
     }
 
-    fn opaque(&mut self, reader: &mut BufReader<File>) -> Result<(), HarnessError> {
+    fn opaque(&mut self, reader: &mut Input) -> Result<(), HarnessError> {
         io::copy(reader, self.out).map_err(|e| HarnessError::io(IoOp::Write, self.src, e))?;
         Ok(())
     }
 
-    fn opaque_refusing_secrets(
-        &mut self,
-        reader: &mut BufReader<File>,
-    ) -> Result<(), HarnessError> {
+    fn opaque_refusing_secrets(&mut self, reader: &mut Input) -> Result<(), HarnessError> {
         let mut line = Vec::new();
         let mut number = 0usize;
         while self.next_line(reader, &mut line)? {
@@ -200,7 +215,7 @@ impl Transfer<'_> {
         }
     }
 
-    fn text(&mut self, reader: &mut BufReader<File>) -> Result<(), HarnessError> {
+    fn text(&mut self, reader: &mut Input) -> Result<(), HarnessError> {
         let mut line = Vec::new();
         while self.next_line(reader, &mut line)? {
             self.text_line(&line)?;
@@ -228,7 +243,7 @@ impl Transfer<'_> {
         }
     }
 
-    fn json_lines(&mut self, reader: &mut BufReader<File>) -> Result<(), HarnessError> {
+    fn json_lines(&mut self, reader: &mut Input) -> Result<(), HarnessError> {
         let mut line = Vec::new();
         let mut number = 0usize;
         while self.next_line(reader, &mut line)? {
@@ -259,7 +274,7 @@ impl Transfer<'_> {
         Ok(())
     }
 
-    fn json_document(&mut self, reader: &mut BufReader<File>) -> Result<(), HarnessError> {
+    fn json_document(&mut self, reader: &mut Input) -> Result<(), HarnessError> {
         let mut bytes = Vec::new();
         io::Read::read_to_end(reader, &mut bytes).map_err(|e| self.read_err(e))?;
         if let Ok(text) = std::str::from_utf8(&bytes) {
@@ -277,18 +292,21 @@ impl Transfer<'_> {
 }
 
 /// Copies `src` into `out` under the rules of `carry`, redacting with
-/// `redactor`. Every kind but a JSON document streams line by line;
-/// documents are the small sidecars (`settings.json`, `*.meta.json`),
-/// never a transcript.
+/// `redactor`, and returns the digest of the bytes it read from `src`.
+/// Every kind but a JSON document streams line by line; documents are the
+/// small sidecars (`settings.json`, `*.meta.json`), never a transcript.
 pub(crate) fn transfer(
     src: &Path,
     out: &mut dyn Write,
     carry: Carry,
     redactor: &Redactor,
     counts: &mut RedactionCounts,
-) -> Result<(), HarnessError> {
+) -> Result<Digest, HarnessError> {
     let input = File::open(src).map_err(|e| HarnessError::io(IoOp::Read, src, e))?;
-    let mut reader = BufReader::new(input);
+    let mut reader = BufReader::new(HashingRead {
+        inner: input,
+        hasher: blake3::Hasher::new(),
+    });
     let mut step = Transfer {
         src,
         out,
@@ -302,7 +320,11 @@ pub(crate) fn transfer(
         Carry::Text => step.text(&mut reader),
         Carry::JsonLines => step.json_lines(&mut reader),
         Carry::JsonDocument => step.json_document(&mut reader),
-    }
+    }?;
+    // Every kind reads to the end; draining is a guard, so the digest
+    // always covers the whole file as this one open saw it.
+    io::copy(&mut reader, &mut io::sink()).map_err(|e| HarnessError::io(IoOp::Read, src, e))?;
+    Ok(Digest::from_hash(reader.into_inner().hasher.finalize()))
 }
 
 fn fold_counts(counts: &mut RedactionCounts, outcome: &jsontext::Outcome) {
@@ -326,20 +348,38 @@ fn clear_manifest(out: &Path) -> Result<(), HarnessError> {
     }
 }
 
+/// What staging produced.
+#[derive(Debug)]
+pub(crate) struct Staged {
+    /// The carried entries, sorted by tree path.
+    pub carried: Vec<Carried>,
+    /// Each rewritable source on this node and the digest of the bytes
+    /// staging read from it, from the same read that staged it.
+    pub replaceable: Vec<(PathBuf, Digest)>,
+}
+
 /// Stages `sources` under `out`, checking the denylist and redacting as
-/// each file's `Carry` says. Returns the carried entries sorted by path and
-/// adds to the redaction counts. An earlier manifest in `out` is removed
-/// first; the caller writes the new one last.
+/// each file's `Carry` says. Returns the carried entries sorted by path,
+/// with the digests of the rewritable sources as read, and adds to the
+/// redaction counts. An earlier manifest in `out` is removed first; the
+/// caller writes the new one last.
 pub(crate) fn stage(
     sources: &[Source],
     out: &Path,
     counts: &mut RedactionCounts,
-) -> Result<Vec<Carried>, HarnessError> {
+) -> Result<Staged, HarnessError> {
     let mut sorted: Vec<&Source> = sources.iter().collect();
     sorted.sort_by(|a, b| a.rel.cmp(&b.rel));
-    if let Some(pair) = sorted.windows(2).find(|pair| pair[0].rel == pair[1].rel) {
+    // Two tree paths that differ only in letter case are one file on APFS
+    // and casefolded ext4, here or on the node that restores them.
+    let mut folded: Vec<String> = sorted
+        .iter()
+        .map(|s| s.rel.as_str().to_lowercase())
+        .collect();
+    folded.sort();
+    if let Some(pair) = folded.windows(2).find(|pair| pair[0] == pair[1]) {
         return Err(HarnessError::DuplicateTreePath {
-            path: pair[0].rel.as_str().to_owned(),
+            path: pair[0].clone(),
         });
     }
     for source in &sorted {
@@ -353,11 +393,19 @@ pub(crate) fn stage(
     let redactor = Redactor::standard()?;
     clear_manifest(out)?;
     let mut carried = Vec::with_capacity(sorted.len());
+    let mut replaceable = Vec::new();
     for (index, source) in sorted.into_iter().enumerate() {
         let dst = out.join(source.rel.as_str());
+        let mut read = None;
         let written = durable::write_atomic_with(&dst, |w| {
-            transfer(&source.abs, w, source.carry, redactor, counts)
+            read = Some(transfer(&source.abs, w, source.carry, redactor, counts)?);
+            Ok(())
         })?;
+        if source.mutability == Mutability::Replaceable
+            && let Some(read) = read
+        {
+            replaceable.push((source.abs.clone(), read));
+        }
         carried.push(Carried {
             rel_path: source.rel.clone(),
             content: source.carry.content(),
@@ -367,7 +415,58 @@ pub(crate) fn stage(
         });
         crashpoint("stage-after-file", index);
     }
-    Ok(carried)
+    let keep: BTreeSet<&str> = carried.iter().map(|c| c.rel_path.as_str()).collect();
+    sweep(out, out, &keep)?;
+    Ok(Staged {
+        carried,
+        replaceable,
+    })
+}
+
+/// Removes from `dir`, a directory under the staging root `out`, every
+/// entry that is not a directory and whose tree path is not in `keep`,
+/// and every directory left empty below `out`, so nothing an earlier
+/// capture wrote travels without a manifest entry. Entries are read
+/// without following symlinks; a symlink is removed like a stale file.
+fn sweep(out: &Path, dir: &Path, keep: &BTreeSet<&str>) -> Result<bool, HarnessError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(e) => return Err(HarnessError::io(IoOp::Walk, dir, e)),
+    };
+    let mut empty = true;
+    let mut removed = false;
+    for entry in entries {
+        let entry = entry.map_err(|e| HarnessError::io(IoOp::Walk, dir, e))?;
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .map_err(|e| HarnessError::io(IoOp::Walk, &path, e))?;
+        if kind.is_dir() {
+            if sweep(out, &path, keep)? {
+                fs::remove_dir(&path).map_err(|e| HarnessError::io(IoOp::Remove, &path, e))?;
+                removed = true;
+            } else {
+                empty = false;
+            }
+            continue;
+        }
+        let listed = path
+            .strip_prefix(out)
+            .ok()
+            .and_then(Path::to_str)
+            .is_some_and(|rel| keep.contains(rel));
+        if listed {
+            empty = false;
+        } else {
+            fs::remove_file(&path).map_err(|e| HarnessError::io(IoOp::Remove, &path, e))?;
+            removed = true;
+        }
+    }
+    if removed {
+        durable::fsync_dir(dir)?;
+    }
+    Ok(empty && dir != out)
 }
 
 /// The length and digest of the file at `path`.
@@ -419,8 +518,8 @@ mod tests {
         fs::write(&src, bytes).unwrap();
         let out = dir.join("out");
         let sources = vec![source(src, &format!("home/{name}"), carry)];
-        let carried = stage(&sources, &out, &mut RedactionCounts::new()).unwrap();
-        (out.join(format!("home/{name}")), carried)
+        let staged = stage(&sources, &out, &mut RedactionCounts::new()).unwrap();
+        (out.join(format!("home/{name}")), staged.carried)
     }
 
     fn mode(path: &Path) -> u32 {
@@ -452,7 +551,21 @@ mod tests {
         fs::write(&a, b"a").unwrap();
         fs::write(&b, b"b").unwrap();
         let sources = vec![
-            source(a, "home/x", Carry::Opaque),
+            source(a.clone(), "home/x", Carry::Opaque),
+            source(b.clone(), "home/x", Carry::Opaque),
+        ];
+        let err = stage(
+            &sources,
+            &dir.path().join("out"),
+            &mut RedactionCounts::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, HarnessError::DuplicateTreePath { .. }),
+            "{err}"
+        );
+        let sources = vec![
+            source(a, "home/X", Carry::Opaque),
             source(b, "home/x", Carry::Opaque),
         ];
         let err = stage(
@@ -481,7 +594,8 @@ mod tests {
             &out,
             &mut counts,
         )
-        .unwrap();
+        .unwrap()
+        .carried;
         let staged = fs::read_to_string(out.join("home/t.jsonl")).unwrap();
         assert!(!staged.contains(GITHUB));
         assert_eq!(counts.get("github-token"), Some(&2));
@@ -619,6 +733,42 @@ mod tests {
             fs::read_to_string(&staged).unwrap(),
             "{\n  \"token\": \"[REDACTED:github-token]\"\n"
         );
+    }
+
+    #[test]
+    fn a_reused_directory_keeps_only_the_files_of_the_new_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+        let out = dir.path().join("out");
+        let both = vec![
+            source(a.clone(), "home/x/a", Carry::Opaque),
+            source(b, "home/y/b", Carry::Opaque),
+        ];
+        stage(&both, &out, &mut RedactionCounts::new()).unwrap();
+        fs::write(out.join("home/x/.a.fabric-tmp-1-1"), b"cut").unwrap();
+        std::os::unix::fs::symlink(&a, out.join("home/x/link")).unwrap();
+        stage(
+            &[source(a, "home/x/a", Carry::Opaque)],
+            &out,
+            &mut RedactionCounts::new(),
+        )
+        .unwrap();
+        let mut left: Vec<String> = Vec::new();
+        let mut stack = vec![out.clone()];
+        while let Some(d) = stack.pop() {
+            for entry in fs::read_dir(&d).unwrap() {
+                let path = entry.unwrap().path();
+                left.push(path.strip_prefix(&out).unwrap().display().to_string());
+                if path.is_dir() {
+                    stack.push(path);
+                }
+            }
+        }
+        left.sort();
+        assert_eq!(left, ["home", "home/x", "home/x/a"]);
     }
 
     #[test]
