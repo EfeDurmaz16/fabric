@@ -19,11 +19,14 @@ import {
   type KnownEvent,
   NoDaemonError,
   OPS,
+  PathDir,
   RefusedError,
   SDK_VERSION,
   SnapshotId,
+  SystemPath,
   UnexpectedError,
   UnsupportedError,
+  UnsupportedFieldError,
   UntrustedError,
 } from "../src/index.ts";
 
@@ -236,6 +239,33 @@ describe("the client", () => {
     expect(error).toMatchObject({ op: "job_steal" });
     const [received] = await Promise.all(node.connections);
     expect(received).toHaveLength(1);
+  });
+
+  // Review finding on PR #13: a node that does not know a request field ignores it, so a client sends a
+  // root only to a node that lists it, and an older node never measures with its own value in its place.
+  test("rejects a root the node does not list with UnsupportedField and sends no request", async () => {
+    const env = { path: [PathDir.parse("/usr/bin")], roots: { cargo_home: SystemPath.parse("/Users/me/.cargo") } };
+    const node = await fakeNode(async (connection) => {
+      await connection.read();
+      connection.send(welcome(["doctor", "env.roots.rustup_home"]));
+    });
+    const error = await rejection(new FabricClient({ socketPath: node.socketPath }).doctor({ env }));
+    expect(error).toBeInstanceOf(UnsupportedFieldError);
+    expect(error).toMatchObject({ op: "doctor", capability: "env.roots.cargo_home" });
+    const [received] = await Promise.all(node.connections);
+    expect(received).toHaveLength(1);
+
+    // A node that lists the root gets the request.
+    const listing = await fakeNode(async (connection) => {
+      await connection.read();
+      connection.send(welcome(["doctor", "env.roots.cargo_home"]));
+      await connection.read();
+      connection.send({ type: "done", reply: { kind: "doctor", report: { kind: "facts", facts: [] } } });
+      connection.end();
+    });
+    await new FabricClient({ socketPath: listing.socketPath }).doctor({ env });
+    const [sent] = await Promise.all(listing.connections);
+    expect(sent?.[1]).toMatchObject({ op: "doctor", env: { roots: { cargo_home: "/Users/me/.cargo" } } });
   });
 
   test("rejects a node that closes right after the hello with ClosedBeforeWelcome", async () => {

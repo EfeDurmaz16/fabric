@@ -107,6 +107,25 @@ export class UnsupportedError extends FabricError {
   }
 }
 
+/**
+ * The node does not list a field the request carries, such as a root of
+ * its environment, so nothing was sent: the node would ignore the field
+ * and answer as if it were absent.
+ */
+export class UnsupportedFieldError extends FabricError {
+  override name = "UnsupportedFieldError";
+  readonly op: Op;
+  readonly capability: string;
+
+  constructor(op: Op, capability: string) {
+    super(
+      `the node does not take \`${capability}\` in \`${op}\` and would measure with its own value; it runs an older fabric`,
+    );
+    this.op = op;
+    this.capability = capability;
+  }
+}
+
 /** The node closed the connection before it welcomed the client. */
 export class ClosedBeforeWelcomeError extends FabricError {
   override name = "ClosedBeforeWelcomeError";

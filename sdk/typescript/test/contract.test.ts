@@ -26,6 +26,7 @@ import {
   Refusal,
   Reply,
   Request,
+  ROOT_CAPABILITIES,
   tagsOf,
 } from "../src/index.ts";
 
@@ -101,10 +102,10 @@ describe("the shared fixtures", () => {
     }
   });
 
-  test("the welcome fixture lists every op, in order", () => {
+  test("the welcome fixture lists every op, in order, then every root", () => {
     const welcome = roundTrip("hello_answer", HelloAnswer).find((answer) => answer.type === "welcome");
     expect(welcome?.type).toBe("welcome");
-    expect(welcome?.type === "welcome" ? welcome.capabilities : []).toStrictEqual([...OPS]);
+    expect(welcome?.type === "welcome" ? welcome.capabilities : []).toStrictEqual([...OPS, ...ROOT_CAPABILITIES]);
   });
 
   test("every op has a request and a reply fixture tagged with its name", () => {

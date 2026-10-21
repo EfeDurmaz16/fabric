@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fabric_client::api::{
-    API_VERSION, Answer, Event, Hello, HelloAnswer, Op, Reason, Refusal, Request, Welcome,
+    API_VERSION, Answer, Event, Hello, HelloAnswer, Op, Reason, Refusal, Request, Roots, Welcome,
 };
 use fabric_client::frame::{self, FrameError};
 use tokio::net::UnixStream;
@@ -66,7 +66,12 @@ pub(crate) async fn serve(node: Arc<Node>, mut stream: UnixStream) {
         api: API_VERSION,
         node: node.id(),
         node_version: node.version.as_str().to_owned(),
-        capabilities: Op::ALL.iter().map(|op| op.name().to_owned()).collect(),
+        capabilities: Op::ALL
+            .iter()
+            .map(|op| op.name())
+            .chain(Roots::capabilities())
+            .map(str::to_owned)
+            .collect(),
     });
     if send(&mut stream, &welcome).await.is_err() {
         return;

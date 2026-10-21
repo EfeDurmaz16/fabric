@@ -62,6 +62,17 @@ pub enum ClientError {
         /// The op.
         op: Op,
     },
+    /// The node does not list a field the request carries, so it would
+    /// ignore the field and answer as if it were absent.
+    #[error(
+        "the node does not take `{capability}` in `{op}` and would measure with its own value; it runs an older fabric"
+    )]
+    UnsupportedField {
+        /// The op.
+        op: Op,
+        /// The capability the field needs, such as `env.roots.cargo_home`.
+        capability: &'static str,
+    },
     /// The node closed the connection before it welcomed the client.
     #[error(
         "the node at {path} closed the connection before it answered the hello; it may run a fabric older than the client API"
@@ -135,6 +146,9 @@ impl Client {
         let (mut stream, welcome) = self.connect().await?;
         if !welcome.serves(op) {
             return Err(ClientError::Unsupported { op });
+        }
+        if let Some(capability) = request.needs().into_iter().find(|c| !welcome.lists(c)) {
+            return Err(ClientError::UnsupportedField { op, capability });
         }
         frame::write(&mut stream, request).await?;
         loop {

@@ -12,7 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use fabric_client::api::{
-    API_VERSION, Answer, Event, Hello, HelloAnswer, Op, Reason, Refusal, Reply, Request,
+    API_VERSION, Answer, Event, Hello, HelloAnswer, Op, Reason, Refusal, Reply, Request, Roots,
 };
 use fabric_client::frame;
 use serde::Serialize;
@@ -84,9 +84,10 @@ fn the_hello_fixture_pins_the_api_version() {
     assert!(hellos.iter().all(|hello| hello.api == API_VERSION));
 }
 
-/// The welcome a node sends lists every op of the api version, in order.
+/// The welcome a node sends lists every op of the api version, in order,
+/// then every root it applies.
 #[test]
-fn the_welcome_fixture_lists_every_op() {
+fn the_welcome_fixture_lists_every_op_and_every_root() {
     let welcome = round_trip::<HelloAnswer>("hello_answer")
         .unwrap()
         .into_iter()
@@ -95,7 +96,11 @@ fn the_welcome_fixture_lists_every_op() {
             HelloAnswer::Incompatible { .. } => None,
         })
         .unwrap();
-    let names: Vec<&str> = Op::ALL.iter().map(|op| op.name()).collect();
+    let names: Vec<&str> = Op::ALL
+        .iter()
+        .map(|op| op.name())
+        .chain(Roots::capabilities())
+        .collect();
     assert_eq!(welcome.capabilities, names);
 }
 

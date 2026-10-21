@@ -24,12 +24,14 @@ import {
   RefusedError,
   UnexpectedError,
   UnsupportedError,
+  UnsupportedFieldError,
   UntrustedError,
 } from "./errors.ts";
 import { createFrameDecoder, decodeJson, encodeFrame } from "./frame.ts";
 import {
   API_VERSION,
   Answer,
+  capabilitiesNeeded,
   type ClientEnv,
   type Decision,
   type DoctorReport,
@@ -123,6 +125,10 @@ export class FabricClient {
     try {
       if (!welcome.capabilities.includes(op)) {
         throw new UnsupportedError(op);
+      }
+      const unlisted = capabilitiesNeeded(checked.data).find((name) => !welcome.capabilities.includes(name));
+      if (unlisted !== undefined) {
+        throw new UnsupportedFieldError(op, unlisted);
       }
       await exchange.send(checked.data);
       for (;;) {

@@ -61,15 +61,23 @@ pub struct Welcome {
     pub node: NodeId,
     /// The node's software version.
     pub node_version: String,
-    /// Every op the node serves, by name; a client sends no other.
+    /// Every op the node serves, by name, then every optional request
+    /// field it applies, such as `env.roots.cargo_home`; a client sends no
+    /// other (ADR 0018, Compatibility).
     pub capabilities: Vec<String>,
 }
 
 impl Welcome {
+    /// Whether the node lists `capability`, an op's name or a field's.
+    #[must_use]
+    pub fn lists(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|name| name == capability)
+    }
+
     /// Whether the node lists `op` among the ops it serves.
     #[must_use]
     pub fn serves(&self, op: Op) -> bool {
-        self.capabilities.iter().any(|name| name == op.name())
+        self.lists(op.name())
     }
 }
 
@@ -396,6 +404,22 @@ pub enum Request {
 }
 
 impl Request {
+    /// The capabilities, beyond its op, a node must list for this request
+    /// to mean what it says: one for each root its environment sets. A
+    /// node that does not know a field ignores it, so without the check an
+    /// older node would measure with its own value in place of the
+    /// client's and nobody would know.
+    #[must_use]
+    pub fn needs(&self) -> Vec<&'static str> {
+        match self {
+            Request::JobResume { env: Some(env), .. }
+            | Request::JobSuspend { env: Some(env), .. }
+            | Request::JobMove { env: Some(env), .. }
+            | Request::Doctor { env: Some(env), .. } => env.roots.needs().collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// The request's op.
     #[must_use]
     pub fn op(&self) -> Op {
@@ -657,16 +681,52 @@ impl Roots {
     /// The variable `xdg_data_home` stands for.
     pub const XDG_DATA_HOME: &str = "XDG_DATA_HOME";
 
+    /// Every root with its capability and its variable, set or not.
+    fn each(&self) -> [(&'static str, &'static str, Option<&SystemPath>); 4] {
+        [
+            (
+                "env.roots.cargo_home",
+                Self::CARGO_HOME,
+                self.cargo_home.as_ref(),
+            ),
+            (
+                "env.roots.rustup_home",
+                Self::RUSTUP_HOME,
+                self.rustup_home.as_ref(),
+            ),
+            (
+                "env.roots.pnpm_home",
+                Self::PNPM_HOME,
+                self.pnpm_home.as_ref(),
+            ),
+            (
+                "env.roots.xdg_data_home",
+                Self::XDG_DATA_HOME,
+                self.xdg_data_home.as_ref(),
+            ),
+        ]
+    }
+
     /// Every root with its variable, set or not, so a tool run for the
     /// client gets each one set to the client's value or removed.
     #[must_use]
     pub fn vars(&self) -> [(&'static str, Option<&SystemPath>); 4] {
-        [
-            (Self::CARGO_HOME, self.cargo_home.as_ref()),
-            (Self::RUSTUP_HOME, self.rustup_home.as_ref()),
-            (Self::PNPM_HOME, self.pnpm_home.as_ref()),
-            (Self::XDG_DATA_HOME, self.xdg_data_home.as_ref()),
-        ]
+        self.each().map(|(_, var, value)| (var, value))
+    }
+
+    /// The capability a node lists for each root it applies,
+    /// `env.roots.<field>`; a client sends a root only to a node that lists it.
+    #[must_use]
+    pub fn capabilities() -> [&'static str; 4] {
+        Self::default().each().map(|(capability, _, _)| capability)
+    }
+
+    /// The capabilities of the roots this environment sets.
+    pub fn needs(&self) -> impl Iterator<Item = &'static str> {
+        self.each()
+            .into_iter()
+            .filter(|(_, _, value)| value.is_some())
+            .map(|(capability, _, _)| capability)
     }
 }
 

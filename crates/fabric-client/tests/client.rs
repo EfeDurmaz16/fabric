@@ -1,15 +1,15 @@
 //! What `Client` does with each kind of answer, against a scripted node on
 //! a temporary socket: an event of an unknown kind is skipped, a reply for
 //! another op is refused, an incompatible node, a welcome of another api
-//! version and an op the node does not list stop the call before the
-//! request is sent, and a node that closes after the hello reads as an
-//! older node.
+//! version, and an op or a root the node does not list stop the call
+//! before the request is sent, and a node that closes after the hello
+//! reads as an older node.
 
 use std::error::Error;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-use fabric_client::api::{Event, Request};
+use fabric_client::api::{ClientEnv, Event, PathDir, Request, Roots, SystemPath};
 use fabric_client::{Client, ClientError, frame};
 use serde_json::{Value, json};
 use tokio::net::UnixListener;
@@ -160,6 +160,43 @@ async fn an_op_the_node_does_not_list_is_not_sent() {
         "{got:?}"
     );
     assert_eq!(served.await.unwrap().unwrap(), None);
+}
+
+/// ADR 0018, Compatibility rule 2: a node that does not know a request
+/// field ignores it, so a client sends a root only to a node that lists
+/// it, and an older node never measures with its own value in place of
+/// the client's (review finding on PR #13).
+#[tokio::test]
+async fn a_root_the_node_does_not_list_is_not_sent() {
+    let doctor = Request::Doctor {
+        peer: None,
+        job: None,
+        env: Some(ClientEnv {
+            path: vec![PathDir::parse("/usr/bin").unwrap()],
+            roots: Roots {
+                cargo_home: Some(SystemPath::parse("/Users/me/.cargo").unwrap()),
+                ..Roots::default()
+            },
+        }),
+    };
+    let (_dir, socket, served) =
+        node(Script::Hello(welcome(&["doctor", "env.roots.rustup_home"]))).unwrap();
+    let got = Client::new(&socket).call(&doctor, |_| {}).await;
+    assert!(
+        matches!(got, Err(ClientError::UnsupportedField { op, capability: "env.roots.cargo_home" }) if op.name() == "doctor"),
+        "{got:?}"
+    );
+    assert_eq!(served.await.unwrap().unwrap(), None);
+
+    // A node that lists the root gets the request.
+    let (_dir, socket, served) = node(Script::Serve {
+        welcome: welcome(&["doctor", "env.roots.cargo_home"]),
+        answers: vec![json!({"type": "done", "reply": {"kind": "doctor", "report": {"kind": "facts", "facts": []}}})],
+    })
+    .unwrap();
+    Client::new(&socket).call(&doctor, |_| {}).await.unwrap();
+    let sent = served.await.unwrap().unwrap().unwrap();
+    assert_eq!(sent["env"]["roots"]["cargo_home"], "/Users/me/.cargo");
 }
 
 /// A node from before the client API reads the hello as a postcard

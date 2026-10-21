@@ -32,6 +32,7 @@ export {
   RefusedError,
   UnexpectedError,
   UnsupportedError,
+  UnsupportedFieldError,
   UntrustedError,
 } from "./errors.ts";
 export { createFrameDecoder, decodeJson, encodeFrame, type FrameDecoder, MAX_FRAME } from "./frame.ts";
@@ -39,6 +40,7 @@ export {
   AcpSettings,
   API_VERSION,
   Answer,
+  capabilitiesNeeded,
   ClientEnv,
   clientEnvFromProcess,
   ClosedJob,
@@ -90,6 +92,7 @@ export {
   Refusal,
   RefusalKind,
   type Registered,
+  ROOT_CAPABILITIES,
   Reply,
   type ReplyTo,
   Request,

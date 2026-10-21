@@ -507,6 +507,19 @@ const ROOT_VARS: Readonly<Record<keyof Roots, string>> = {
   xdg_data_home: "XDG_DATA_HOME",
 };
 
+/** The capability a node lists for a root it applies, as Rust's `Roots::capabilities()`. */
+function rootCapability(root: keyof Roots): string {
+  return `env.roots.${root}`;
+}
+
+/**
+ * The capability a node lists for each root it applies, in the order a
+ * welcome lists them after the ops. A client sends a root only to a node
+ * that lists it, so an older node never measures with its own value in
+ * place of the client's.
+ */
+export const ROOT_CAPABILITIES: readonly string[] = Roots.keyof().options.map(rootCapability);
+
 /**
  * The environment of this process, as Rust's `ClientEnv::from_vars`: its
  * `PATH` without the entries that are not absolute, such as `.`, an empty
@@ -691,4 +704,19 @@ export type Answer = z.infer<typeof Answer>;
 /** Whether `reply` answers `op`. */
 export function isReplyTo<K extends Op>(reply: Reply, op: K): reply is ReplyTo<K> {
   return reply.kind === op;
+}
+
+/**
+ * The capabilities, beyond its op, a node must list for `request` to mean
+ * what it says, as Rust's `Request::needs()`: one for each root its
+ * environment sets.
+ */
+export function capabilitiesNeeded(request: Request): readonly string[] {
+  const env = "env" in request ? request.env : undefined;
+  if (env === undefined) {
+    return [];
+  }
+  return Roots.keyof()
+    .options.filter((root) => env.roots[root] !== undefined)
+    .map(rootCapability);
 }

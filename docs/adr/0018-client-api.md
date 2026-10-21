@@ -45,7 +45,7 @@ One connection carries one exchange:
 
 ```text
 client: Hello      { api: 1, client: "<name>/<version>" }
-node:   Welcome    { type: "welcome", api: 1, node, node_version, capabilities: [op, ...] }
+node:   Welcome    { type: "welcome", api: 1, node, node_version, capabilities: [op, ..., field, ...] }
       | Incompatible { type: "incompatible", api, node_version }        and the node closes
 client: Request    { op: ..., ... }
 node:   Event      { type: "event", event: { kind: ..., ... } }         zero or more, as they happen
@@ -83,7 +83,7 @@ A node runs tools on a client's behalf: it measures the facts `doctor` compares 
 - `path` is the caller's `PATH` as a list of directories, each an absolute path without a `:`, kept as the shell has it: `//`, `..`, a trailing `/` or a decomposed accent stay as written, because the kernel resolves them and the node must find the tools the shell finds. This is not the core's one text form of a path, which is for paths Fabric itself writes. A relative entry or `.` would name a directory of the node's choosing, so both clients leave such entries out and the node refuses a request that holds one.
 - `roots` is a closed set of tool roots, one field each: `cargo_home`, `rustup_home`, `pnpm_home` and `xdg_data_home`, each an absolute path kept as written, as `path` is. They are the variables that decide where the measured tools keep their state: cargo and rustup by their homes, pnpm its store by `PNPM_HOME`, then `XDG_DATA_HOME`.
 
-For that request the node looks programs up on the client's `path` and runs each tool with every root set to the client's value or removed when the client did not set it, never the daemon's own. When `env` is absent, the node uses the environment it started with, which is also what it uses for work no client asked for, such as a peer's move request. A new root is an additive change: an older node ignores the field. `ClientEnv::current()` reads the calling process's environment, and the CLI sends it with each of these requests. An absolute entry or root that is not UTF-8 cannot cross the socket, so reading it fails the command rather than leaving the directory out.
+For that request the node looks programs up on the client's `path` and runs each tool with every root set to the client's value or removed when the client did not set it, never the daemon's own. When `env` is absent, the node uses the environment it started with, which is also what it uses for work no client asked for, such as a peer's move request. A node lists each root it applies in `Welcome.capabilities` as `env.roots.<root>`, such as `env.roots.cargo_home`, and a client sends a root only to a node that lists it, failing with `UnsupportedField` otherwise: an older node would ignore the field and measure with its own value, and nobody would know. A new root is therefore an additive change. A client that does not know a newer root cannot send it, so the node runs the tool with that root unset, as for a shell that does not set it. `ClientEnv::current()` reads the calling process's environment, and the CLI sends it with each of these requests. An absolute entry or root that is not UTF-8 cannot cross the socket, so reading it fails the command rather than leaving the directory out.
 
 A reply's `kind` is its request's `op`, so a client checks that the answer is the one its request takes and refuses any other as a protocol error. The replies are typed records: `node_id { node, listen }`, `node_list { peers: [{ node, addrs, connected }] }`, `node_ping { node, rtt_ms, wire, clock_skew_ms }`, `job_new { job, root, repo, harness, epoch }`, `job_list { jobs: [{ job, standing, epoch, goal }], closed: [{ job, error }] }`, `job_status { job, node, goal, harness, owner, epoch, view, snapshot?, workspace?, process, records }`, `job_log { records: [{ id, epoch, at, event }] }`, `job_run` and `job_resume` with the fields of a run plan, `job_suspend { snapshot }`, `job_move { owner, epoch }`, `job_steal { owner, epoch }`, `job_decide { text }`, `doctor { report }`, `harness_started { epoch, harness, pid }`, `harness_session { harness, session }`, `harness_exited {}`. `crates/fabric-client/src/api.rs` holds every field with its meaning, and `protocol/fixtures` holds one example of each.
 
@@ -113,7 +113,7 @@ Errors that happen before the node answers are the client's own, typed in each c
 1. The hello carries the client's `api`. The node answers `Welcome` when it equals its own and `Incompatible` with its own number otherwise, and closes. The client also checks the number in `Welcome`. There is no range: a node speaks one api version.
 2. Within one api version, a change is additive:
    - a new op, listed in `Welcome.capabilities`; a client sends an op only when the node lists it and otherwise fails with `Unsupported` before sending;
-   - a new optional field in a request, which a node that does not know it ignores, so a client that depends on it checks a capability first;
+   - a new optional field in a request, which a node that does not know it ignores, so the node lists it in `Welcome.capabilities` as `<op>.<field>`, or `env.roots.<root>` for a root of the client's environment, and a client sends it only to a node that lists it, failing with `UnsupportedField` otherwise. A node of api 1 lists its ops and then the four roots;
    - a new field in a reply, an event or a refusal reason, which readers ignore;
    - a new event kind, which a client skips: events report progress and never carry the result;
    - a new refusal reason, which a client reads as `unrecognized` with its `kind` and `message` intact, so the exit code and the sentence still work;
@@ -166,6 +166,6 @@ C2 adds a live event stream and approvals from a phone. It builds on two things 
 ## Open questions
 
 - Should the node offer a headless launch for clients that cannot launch a harness themselves, such as a phone, or should that always go through a node-side client with the user's environment? Decide with C2.
-- Variables that are not roots also change what a tool answers: `RUSTUP_TOOLCHAIN` picks a toolchain, `PYENV_VERSION` a Python, and `git` and the store run with the node's environment. Add them to the client's environment when a measured fact turns out to depend on one.
+- Variables that are not roots also change what a tool answers: `RUSTUP_TOOLCHAIN` picks a toolchain, `PYENV_VERSION` a Python, and `git` and the store run with the node's environment. Add them to the client's environment when a measured fact turns out to depend on one, each as a root with its capability.
 - Should a client be able to keep one connection for several requests? Not needed while every request is local and cheap; reconsider with C4.
 - Does C4's network listener speak this same JSON over TLS, or HTTP? Decide with C4; the message set should not change.

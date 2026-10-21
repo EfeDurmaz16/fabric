@@ -21,6 +21,10 @@
     "doctor",
     "harness_started",
     "harness_session",
-    "harness_exited"
+    "harness_exited",
+    "env.roots.cargo_home",
+    "env.roots.rustup_home",
+    "env.roots.pnpm_home",
+    "env.roots.xdg_data_home"
   ]
 }
