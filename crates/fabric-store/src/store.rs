@@ -5,7 +5,7 @@
 //! before it deletes the file, and `check` can prove the rule holds. Exactly
 //! one process holds a store open at a time (ADR 0014, One writer).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -13,6 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use fabric_core::id::{ChunkId, SnapshotId};
+use fabric_core::path::RelPath;
 use fabric_core::snapshot::{EntryKind, MAX_MANIFEST_LEN, ManifestError, SnapshotManifest};
 
 use crate::catalog::{Catalog, CatalogError, ChunkRef, Role, SnapshotRow};
@@ -82,6 +83,16 @@ pub enum StoreError {
         /// The base the manifest names.
         base: SnapshotId,
     },
+    /// A file entry's objects do not add up to the size it records, so no restore could write it.
+    #[error("{path}: the objects hold {held} bytes but the entry records {size}")]
+    SizeMismatch {
+        /// The entry's path.
+        path: RelPath,
+        /// The size the entry records.
+        size: u64,
+        /// The bytes its objects decompress to.
+        held: u64,
+    },
     /// A later snapshot's bundle still needs the snapshot's refs.
     #[error("snapshot {base} is the bundle base of a later snapshot")]
     BaseInUse {
@@ -143,6 +154,11 @@ pub struct CheckReport {
     pub refcount_mismatches: Vec<ChunkId>,
     /// Snapshots whose bundle base is not in the catalog, with that base.
     pub broken_chains: Vec<(SnapshotId, SnapshotId)>,
+    /// Snapshots whose objects are whole but whose manifest does not assemble
+    /// to its id and recorded length, does not decode, names other data
+    /// objects than the catalog rows, or has another job, parent, bundle
+    /// base or creation time than its catalog row; checked at `Hashes` depth only.
+    pub bad_manifests: Vec<SnapshotId>,
 }
 
 impl CheckReport {
@@ -153,6 +169,7 @@ impl CheckReport {
             && self.corrupt.is_empty()
             && self.refcount_mismatches.is_empty()
             && self.broken_chains.is_empty()
+            && self.bad_manifests.is_empty()
     }
 }
 
@@ -301,6 +318,7 @@ impl Store {
                 stored_len,
             });
         }
+        self.check_sizes(manifest)?;
         let stored = self.objects.put_bytes(&bytes)?;
         let mut manifest_refs = Vec::with_capacity(stored.chunks.len());
         for chunk in stored.chunks {
@@ -328,6 +346,42 @@ impl Store {
         checkpoint::reached("publish.after_commit");
         tracing::info!(snapshot = %id, objects = data.len(), "published");
         Ok(id)
+    }
+
+    /// Refuses a file entry whose objects do not decompress to the size it records.
+    ///
+    /// Restore checks the same sum after it writes the file; a snapshot that
+    /// fails it would publish and never restore.
+    fn check_sizes(&self, manifest: &SnapshotManifest) -> Result<(), StoreError> {
+        let mut lens: HashMap<ChunkId, u64> = HashMap::new();
+        for entry in manifest
+            .files
+            .iter()
+            .chain(manifest.harness_state.entries.iter())
+        {
+            let EntryKind::File { size, chunks } = &entry.kind else {
+                continue;
+            };
+            let mut held = 0u64;
+            for chunk in chunks {
+                let len = if let Some(len) = lens.get(chunk) {
+                    *len
+                } else {
+                    let len = self.objects.content_len(*chunk)?;
+                    lens.insert(*chunk, len);
+                    len
+                };
+                held = held.saturating_add(len);
+            }
+            if held != *size {
+                return Err(StoreError::SizeMismatch {
+                    path: entry.rel_path.clone(),
+                    size: *size,
+                    held,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Makes an object on disk safe for a catalog row to name.
@@ -464,6 +518,7 @@ impl Store {
         let mut seen_ok: HashSet<ChunkId> = HashSet::new();
         for row in self.catalog.snapshots()? {
             report.snapshots += 1;
+            let damaged = report.missing.len() + report.corrupt.len();
             for role in [Role::Manifest, Role::Data] {
                 for chunk in self.catalog.snapshot_chunks(row.id, role)? {
                     if seen_ok.contains(&chunk.id) {
@@ -483,7 +538,35 @@ impl Store {
                     }
                 }
             }
+            let whole = report.missing.len() + report.corrupt.len() == damaged;
+            if depth == CheckDepth::Hashes && whole && !self.manifest_agrees(&row)? {
+                report.bad_manifests.push(row.id);
+            }
         }
         Ok(report)
+    }
+
+    /// Says whether a snapshot's manifest assembles, decodes, names the data rows the catalog holds and matches its row.
+    ///
+    /// `forget` and gc trust the row's bundle base; a row that lost it
+    /// would let the base of a live chain be forgotten.
+    fn manifest_agrees(&self, row: &SnapshotRow) -> Result<bool, StoreError> {
+        let id = row.id;
+        let manifest = match self.manifest(id) {
+            Ok(manifest) => manifest,
+            Err(StoreError::ManifestMismatch(_) | StoreError::Manifest(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let rows: Vec<ChunkId> = self
+            .catalog
+            .snapshot_chunks(id, Role::Data)?
+            .iter()
+            .map(|chunk| chunk.id)
+            .collect();
+        let same_row = row.job_id == manifest.job_id
+            && row.parent == manifest.parent
+            && row.bundle_base == manifest.git.as_ref().and_then(|g| g.bundle_base)
+            && row.created_at == manifest.created_at;
+        Ok(same_row && rows == Self::data_chunks(&manifest))
     }
 }

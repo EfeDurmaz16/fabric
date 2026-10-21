@@ -220,14 +220,16 @@ struct Pattern {
 
 impl Pattern {
     /// Parses a pattern; gitignore syntax the in-process matcher does not
-    /// model (negation, comments, escapes and classes) is refused, so a
-    /// pattern can never mean one thing to git and another to the policy.
+    /// model (negation, comments, escapes, classes and a `**` past the
+    /// leading one, which git matches across any number of directories) is
+    /// refused, so a pattern can never mean one thing to git and another to
+    /// the policy.
     fn parse(text: &str) -> Option<Pattern> {
         let text = text.strip_prefix("**/").unwrap_or(text);
         if text.is_empty()
             || text.starts_with(['/', '!', '#'])
             || text.contains(['\\', '[', ']'])
-            || text.split('/').any(str::is_empty)
+            || text.split('/').any(|c| c.is_empty() || c == "**")
         {
             return None;
         }
@@ -457,6 +459,20 @@ impl IgnorePolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_double_star_past_the_leading_one_is_refused() {
+        for text in ["foo/**/token", "foo/**", "**/a/**/b", "**/**"] {
+            assert_eq!(Pattern::parse(text), None, "{text}");
+        }
+        assert!(Pattern::parse("**/token").is_some());
+        assert!(Pattern::parse("foo/*/token").is_some());
+        let mut policy = IgnorePolicy::default();
+        assert!(matches!(
+            policy.add_secret_pattern("foo/**/token"),
+            Err(PolicyError::BadPolicyPattern { .. })
+        ));
+    }
 
     fn rel(s: &str) -> RelPath {
         RelPath::parse(s).unwrap()

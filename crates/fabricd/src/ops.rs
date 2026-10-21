@@ -39,7 +39,7 @@ use crate::doctor::{self, Context, Target};
 use crate::error::NodeError;
 use crate::facts::{MeasuredKeys, NodeFacts, key_difference};
 use crate::faults::{self, Action, Point};
-use crate::harnesses::adapter;
+use crate::harnesses::{HarnessConfig, adapter, refuse_secret_kind};
 use crate::job::Job;
 use crate::local::{self, HarnessRecord, Liveness, Marker, MarkerState, SessionRecord};
 use crate::node::{Node, Out, is_transport};
@@ -61,6 +61,10 @@ pub const MOVE_DEADLINE: Duration = Duration::from_mins(10);
 
 /// How long a status question or a ping may take.
 pub const SHORT_DEADLINE: Duration = Duration::from_secs(15);
+
+/// The bytes of record lines `job log` answers with at most: half the
+/// control message cap, which leaves room for the encoding around them.
+const LOG_BUDGET: usize = crate::control::MAX_CONTROL_MESSAGE / 2;
 
 /// How many times a move asks again after a lost answer before it reports the move frozen.
 const MOVE_TRIES: usize = 5;
@@ -254,6 +258,7 @@ impl Node {
         harness: HarnessKind,
         out: &mut Out,
     ) -> Result<(), NodeError> {
+        refuse_secret_kind(&harness)?;
         let id = clock::job_id();
         let root = paths::job_root(&self.cfg.home, id);
         let synced = synced_folders(&self.cfg.home, &self.cfg.path_var).await;
@@ -285,12 +290,16 @@ impl Node {
             clock::now_ms(),
         )
         .map_err(fabric_core::ledger::LedgerError::from)?;
-        let job = Job::create(id, self.cfg.state.job(id), &created)?;
-        job.set_marker(&Marker {
-            root: root.clone(),
-            state: MarkerState::Live,
-            epoch: Epoch::FIRST,
-        })?;
+        let job = Job::create_owned(
+            id,
+            self.cfg.state.job(id),
+            &created,
+            &Marker {
+                root: root.clone(),
+                state: MarkerState::Live,
+                epoch: Epoch::FIRST,
+            },
+        )?;
         self.jobs
             .lock()
             .await
@@ -401,18 +410,43 @@ impl Node {
         Ok(())
     }
 
+    /// Prints the job's records, the latest ones when all of them would not
+    /// fit in one control answer.
     async fn job_log(&self, id: JobId, out: &mut Out) -> Result<(), NodeError> {
         let job = self.job(id).await?;
         let job = job.lock().await;
-        for (n, record) in job.ledger().records().iter().enumerate() {
-            let event = record.event();
+        let lines: Vec<String> = job
+            .ledger()
+            .records()
+            .iter()
+            .enumerate()
+            .map(|(n, record)| {
+                let event = record.event();
+                format!(
+                    "{n:>4} epoch {} at {} {}",
+                    event.epoch,
+                    event.at,
+                    describe(&event.kind)
+                )
+            })
+            .collect();
+        // A record is at most 1 MiB, so the latest one always fits.
+        let mut start = lines.len();
+        let mut bytes = 0;
+        while let Some(line) = start.checked_sub(1).map(|i| &lines[i]) {
+            if bytes + line.len() > LOG_BUDGET {
+                break;
+            }
+            bytes += line.len();
+            start -= 1;
+        }
+        if start > 0 {
             out.say(format!(
-                "{n:>4} epoch {} at {} {}",
-                event.epoch,
-                event.at,
-                describe(&event.kind)
+                "the first {start} records are left out; the latest {} fill one answer",
+                lines.len() - start
             ));
         }
+        out.lines.extend(lines.into_iter().skip(start));
         Ok(())
     }
 
@@ -453,7 +487,14 @@ impl Node {
                 pid: record.pid.get(),
             });
         }
-        plan(&job, token.epoch, marker.root, None, out)
+        plan(
+            &job,
+            token.epoch,
+            marker.root,
+            None,
+            &self.harness_config,
+            out,
+        )
     }
 
     /// Records the harness the CLI launched and appends `Resumed`, or refuses.
@@ -471,6 +512,7 @@ impl Node {
         session: Option<SessionId>,
         out: &mut Out,
     ) -> Result<(), NodeError> {
+        refuse_secret_kind(&harness)?;
         let job = self.job(id).await?;
         let mut job = job.lock().await;
         let token = owner_token(&job, self.id)?;
@@ -556,6 +598,7 @@ impl Node {
             harness,
             session,
         } = named;
+        refuse_secret_kind(&harness)?;
         let job = self.job(id).await?;
         let job = job.lock().await;
         let token = owner_token(&job, self.id)?;
@@ -771,8 +814,17 @@ impl Node {
             harness_state = Some(state_dir);
         }
         let facts = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
-        let detection = fabric_env::detect::detect(root, &[]).ok();
-        let keys = MeasuredKeys::new(facts, detection.as_ref());
+        // A workspace whose environment does not detect here would not
+        // materialize on the target either, so the snapshot is refused
+        // before it is published or moved.
+        let detection = fabric_env::detect::detect(root, &[])?;
+        let keys = MeasuredKeys::new(facts, Some(&detection));
+        let secret_patterns: Vec<String> = detection
+            .spec()
+            .secret_patterns
+            .iter()
+            .map(|pattern| pattern.as_str().to_owned())
+            .collect();
         let root = root.to_owned();
         let job_id = job.id();
         let me = self.id;
@@ -780,6 +832,11 @@ impl Node {
         let (snapshot, report) = with_store(&self.store, move |store| {
             let mut policy = IgnorePolicy::default();
             policy.load_fabricignore(&root)?;
+            // The job's own patterns from `.fabric/env.toml` widen the
+            // built-in list; nothing narrows it (ADR 0004).
+            for pattern in &secret_patterns {
+                policy.add_secret_pattern(pattern)?;
+            }
             let captured = capture(
                 store,
                 &CaptureRequest {
@@ -811,14 +868,9 @@ impl Node {
 
     /// Pushes the ledger, and through it the latest snapshot, to every paired peer it can reach.
     pub(crate) async fn replicate(self: &Arc<Self>, id: JobId, out: &mut Out) {
-        let peers: Vec<NodeId> = self
-            .peers
-            .snapshot()
-            .iter()
-            .filter(|entry| !entry.addrs().is_empty())
-            .map(fabric_net::peers::PeerEntry::node)
-            .collect();
-        for peer in peers {
+        // A peer behind a NAT has no address here and is reached over the
+        // session it opened, as every other request reaches it.
+        for peer in self.reachable_peers() {
             match self.push_records(id, peer).await {
                 Ok(()) => out.say(format!("copied the ledger and the snapshot to {peer}")),
                 Err(e) => out.say(format!("not copied to {peer}: {e}")),
@@ -1311,6 +1363,9 @@ impl Node {
         path_var: &OsString,
         out: &mut Out,
     ) -> Result<RunPlan, NodeError> {
+        if let Some(harness) = &harness {
+            refuse_secret_kind(harness)?;
+        }
         self.resolve_departing(id, out).await?;
         if self.job(id).await.is_ok() {
             self.check_peers(id, out).await;
@@ -1334,14 +1389,19 @@ impl Node {
             },
         };
         if let Some(holder) = holder {
-            let kind = match self.job(id).await {
-                Ok(job) => Some(job.lock().await.harness().clone()),
-                Err(_) => None,
+            // The preflight checks the harness that will launch here, so a
+            // job this node has never seen is learned before it runs.
+            if self.job(id).await.is_err() {
+                self.pull_records(id, holder).await?;
+            }
+            let kind = match &harness {
+                Some(kind) => kind.clone(),
+                None => self.job(id).await?.lock().await.harness().clone(),
             };
             let root = paths::job_root(&self.cfg.home, id);
             self.preflight(
                 holder,
-                kind.as_ref().map(|kind| (kind, root.as_path())),
+                Some((&kind, root.as_path())),
                 Target::Here,
                 path_var,
                 force,
@@ -1364,7 +1424,7 @@ impl Node {
                 pid: record.pid.get(),
             });
         }
-        plan(&job, token.epoch, root, harness, out)
+        plan(&job, token.epoch, root, harness, &self.harness_config, out)
     }
 
     /// The pull form of the move: fetch, ask the owner to start a move toward this node, decide it here.
@@ -1511,13 +1571,36 @@ impl Node {
                     });
                 }
             };
-            for bytes in page.records() {
-                self.accept_record(id, holder, bytes.as_bytes()).await?;
+            if !self.take_page(id, holder, &page).await? {
+                // Another pull moved the head while this page was in
+                // flight; asking again from the new head either links or
+                // is answered NotInChain, which the fork rule above takes.
+                continue;
             }
             if !more {
                 return Ok(());
             }
         }
+    }
+
+    /// Takes a pulled page; false when it no longer links to this node's
+    /// head because the head moved after the page was asked for.
+    pub(crate) async fn take_page(
+        &self,
+        id: JobId,
+        holder: NodeId,
+        page: &RecordPage,
+    ) -> Result<bool, NodeError> {
+        for bytes in page.records() {
+            match self.accept_record(id, holder, bytes.as_bytes()).await {
+                Ok(_) => {}
+                Err(NodeError::Ledger(fabric_core::ledger::LedgerError::PrevMismatch {
+                    ..
+                })) => return Ok(false),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
     }
 
     /// Takes one record from `peer`, making the job here from its `Created` record.
@@ -1582,13 +1665,7 @@ impl Node {
         out: &mut Out,
     ) -> Result<PathBuf, NodeError> {
         let id = job.id();
-        let marker = match job.reconcile_marker()? {
-            Some(marker) if !marker.is_current(epoch, job.latest()).await => {
-                self.set_orphan_aside(job, &marker, epoch, out).await?;
-                None
-            }
-            marker => marker,
-        };
+        let marker = self.tenure_marker(job, epoch, out).await?;
         match &marker {
             Some(Marker {
                 root,
@@ -1669,6 +1746,38 @@ impl Node {
             epoch,
         })?;
         Ok(root)
+    }
+
+    /// The marker of a workspace this tenure, at `epoch`, can continue, or
+    /// `None` when the latest snapshot must be restored.
+    ///
+    /// A workspace an earlier tenure left is set aside. A clean workspace
+    /// holds nothing the latest snapshot lacks, so one removed or moved
+    /// outside Fabric is restored from it.
+    async fn tenure_marker(
+        &self,
+        job: &mut Job,
+        epoch: Epoch,
+        out: &mut Out,
+    ) -> Result<Option<Marker>, NodeError> {
+        Ok(match job.reconcile_marker()? {
+            Some(marker) if !marker.is_current(epoch, job.latest()).await => {
+                self.set_orphan_aside(job, &marker, epoch, out).await?;
+                None
+            }
+            Some(Marker {
+                root,
+                state: MarkerState::Clean { .. },
+                ..
+            }) if is_missing(&root)? => {
+                out.say(format!(
+                    "the clean workspace at {} is gone; restoring the latest snapshot",
+                    root.display()
+                ));
+                None
+            }
+            marker => marker,
+        })
     }
 
     /// Writes `snapshot` into the empty `root`, carrying each cache whose key matches this node's.
@@ -1895,15 +2004,14 @@ impl Node {
         out: &mut Out,
     ) -> Result<(), NodeError> {
         let here = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
-        let session = self.dial(peer).await?;
-        let theirs =
-            session
-                .facts(SHORT_DEADLINE * 4)
-                .await
-                .map_err(|e| NodeError::Unreachable {
-                    peer,
-                    reason: e.to_string(),
-                })?;
+        // A session the peer opened is used too: a peer behind a NAT has
+        // no address here and is reachable only over the session it dialed.
+        let (theirs, clock_skew_ms, wire) = self
+            .call(peer, |session| async move {
+                let facts = session.facts(SHORT_DEADLINE * 4).await?;
+                Ok((facts, session.clock_skew_ms(), session.kind().to_string()))
+            })
+            .await?;
         let theirs = NodeFacts::from_wire(&theirs);
         let rows = doctor::compare(
             &here,
@@ -1912,8 +2020,8 @@ impl Node {
                 harness: job.map(|(h, _)| h),
                 root: job.map(|(_, r)| r),
                 target,
-                clock_skew_ms: Some(session.clock_skew_ms()),
-                wire: Some(session.kind().to_string()),
+                clock_skew_ms: Some(clock_skew_ms),
+                wire: Some(wire),
             },
         );
         for row in &rows {
@@ -1986,6 +2094,7 @@ fn plan(
     epoch: Epoch,
     root: PathBuf,
     harness: Option<HarnessKind>,
+    harness_config: &HarnessConfig,
     out: &mut Out,
 ) -> Result<RunPlan, NodeError> {
     job.set_marker(&Marker {
@@ -2018,6 +2127,7 @@ fn plan(
         harness,
         session,
         goal: job.ledger().manifest().goal.clone(),
+        harness_config: harness_config.clone(),
     })
 }
 
@@ -2034,6 +2144,15 @@ fn report_caches(caches: &[fabric_core::snapshot::CacheEntry], facts: &NodeFacts
                 key_difference(&cache.key, &mine)
             ));
         }
+    }
+}
+
+/// Whether nothing, not even a dangling link, is at `path`.
+fn is_missing(path: &Path) -> Result<bool, NodeError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(NodeError::io(path, e)),
     }
 }
 
@@ -2521,6 +2640,321 @@ pub(crate) mod tests {
             matches!(refused, Err(NodeError::Forked { .. })),
             "{refused:?}"
         );
+    }
+
+    /// A pull of a job this node has never seen, or under another harness,
+    /// must be refused when that harness cannot run here, before the job
+    /// changes hands. The test home has no Codex or Claude login.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pull_preflights_the_harness_that_will_launch() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        a.suspend(id, &path, &mut Out::default()).await.unwrap();
+        for (harness, login) in [
+            (None, crate::facts::name::CODEX_LOGIN),
+            (
+                Some(HarnessKind::ClaudeCode),
+                crate::facts::name::CLAUDE_LOGIN,
+            ),
+        ] {
+            let refused = b
+                .job_resume(id, Some(a.id), harness, true, &path, &mut Out::default())
+                .await;
+            assert!(
+                matches!(&refused, Err(NodeError::Preflight(facts)) if facts.contains(login)),
+                "{refused:?}"
+            );
+        }
+        let job = a.job(id).await.unwrap();
+        assert!(matches!(
+            job.lock().await.view(a.id),
+            LeaseView::Owner(token) if token.epoch == Epoch::FIRST
+        ));
+    }
+
+    /// A suspend must not publish a snapshot whose `.fabric/env.toml`
+    /// does not parse: the target would take the job and then fail to
+    /// materialize it.
+    #[tokio::test]
+    async fn a_suspend_refuses_a_workspace_whose_environment_does_not_detect() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(root.join(".fabric/env.toml"), "not toml [\n").unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let refused = node.suspend(id, &path, &mut Out::default()).await;
+        assert!(matches!(refused, Err(NodeError::Detect(_))), "{refused:?}");
+        let job = node.job(id).await.unwrap();
+        assert_eq!(job.lock().await.latest(), None);
+    }
+
+    /// A secret pattern the job adds in `.fabric/env.toml` keeps a matching
+    /// file on this node, as a built-in pattern does.
+    #[tokio::test]
+    async fn a_suspend_leaves_behind_what_the_jobs_secret_patterns_match() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(
+            root.join(".fabric/env.toml"),
+            "secret_patterns = [\"*.sqlite\"]\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("users.sqlite"), "rows\n").unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut out = Out::default();
+        node.suspend(id, &path, &mut out).await.unwrap();
+        assert!(
+            out.lines
+                .iter()
+                .any(|line| line == "left behind (secret pattern): users.sqlite"),
+            "{:?}",
+            out.lines
+        );
+    }
+
+    /// A clean workspace deleted by hand is restored by the next resume,
+    /// not handed to the CLI as a root that does not exist.
+    #[tokio::test]
+    async fn a_resume_restores_a_clean_workspace_that_was_deleted() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let root = paths::job_root(&node.cfg.home, id);
+        std::fs::remove_dir_all(&root).unwrap();
+        let plan = node
+            .job_resume(id, None, None, false, &path, &mut Out::default())
+            .await
+            .unwrap();
+        assert_eq!(plan.root, root);
+        assert_eq!(
+            std::fs::read_to_string(root.join("README.md")).unwrap(),
+            "hello\n"
+        );
+    }
+
+    /// The CLI launches with the configuration the daemon captures and
+    /// restores with, the one it read at start, even after the file changed.
+    #[tokio::test]
+    async fn a_run_plan_carries_the_harness_config_the_node_started_with() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        std::fs::write(
+            node.cfg.state.harness_config(),
+            "[acp.opencode]\nstate_dir = \"elsewhere\"\n",
+        )
+        .unwrap();
+        let plan = node.job_run(id, &mut Out::default()).await.unwrap();
+        let sent: RunPlan = postcard::from_bytes(&postcard::to_stdvec(&plan).unwrap()).unwrap();
+        assert_eq!(sent.harness_config, node.harness_config);
+        assert!(sent.harness_config.acp.is_empty());
+    }
+
+    /// A peer paired without an address, as the Air pairs the Pro, is
+    /// reachable over the session it opened, so doctor works from this side.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn doctor_reaches_an_addressless_peer_over_its_session() {
+        let (_dir_a, a) = node();
+        let (_dir_b, b) = node();
+        tokio::spawn(Arc::clone(&a).run());
+        tokio::spawn(Arc::clone(&b).run());
+        let addr = b.local_addr().unwrap().to_string();
+        a.node_add(b.id, Some(&addr), &mut Out::default())
+            .await
+            .unwrap();
+        b.node_add(a.id, None, &mut Out::default()).await.unwrap();
+        a.node_ping(b.id, &mut Out::default()).await.unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut out = Out::default();
+        // The two test homes differ, which the table refuses; what matters
+        // is that the table was made from the peer's answer.
+        let answered = b.doctor(Some(a.id), None, &path, &mut out).await;
+        assert!(
+            matches!(answered, Ok(()) | Err(NodeError::Preflight(_))),
+            "{answered:?}"
+        );
+        assert!(
+            out.lines
+                .iter()
+                .any(|line| line.contains(" network ") && line.contains("tcp+tls")),
+            "{:?}",
+            out.lines
+        );
+    }
+
+    /// Two peers can answer pulls asked from the same head. Once one page
+    /// lands, the other's no longer links to this node's head; that page
+    /// must lead to the fork rule, not to an error that leaves a
+    /// higher-epoch steal on the other chain unseen.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_page_that_no_longer_links_leads_to_the_fork_rule() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        let (_dir_c, c) = node();
+        tokio::spawn(Arc::clone(&a).run());
+        tokio::spawn(Arc::clone(&c).run());
+        let (at_a, at_c) = (
+            a.local_addr().unwrap().to_string(),
+            c.local_addr().unwrap().to_string(),
+        );
+        for (node, peer, addr) in [
+            (&a, b.id, None),
+            (&a, c.id, Some(&at_c)),
+            (&b, a.id, Some(&at_a)),
+            (&b, c.id, Some(&at_c)),
+            (&c, a.id, Some(&at_a)),
+            (&c, b.id, None),
+        ] {
+            node.node_add(peer, addr.map(String::as_str), &mut Out::default())
+                .await
+                .unwrap();
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let out = &mut Out::default();
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &path, out).await.unwrap();
+        b.pull_records(id, a.id).await.unwrap();
+        c.pull_records(id, a.id).await.unwrap();
+        c.ensure_latest(id, a.id).await.unwrap();
+        // The catch-up c's session started must end before the chains split.
+        for _ in 0..250 {
+            if crate::node::lock(&c.catching_up).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let shared = b.job(id).await.unwrap().lock().await.ledger().head();
+
+        a.job_decide(id, Decision::Approve, "a's own record", out)
+            .await
+            .unwrap();
+        b.pull_records(id, a.id).await.unwrap();
+        c.job_steal(id, "a sleeps".to_owned(), true, out)
+            .await
+            .unwrap();
+        // c's answer to a pull b asked from the shared head, before a's record landed.
+        let token = FencingToken {
+            job_id: id,
+            epoch: Epoch::FIRST,
+        };
+        let answer = b
+            .call(c.id, |session| async move {
+                session.pull(token, Some(shared), SHORT_DEADLINE).await
+            })
+            .await
+            .unwrap();
+        let Fenced::Answer(Pulled::Last(page) | Pulled::More(page)) = answer else {
+            panic!("{answer:?}");
+        };
+
+        assert!(!b.take_page(id, c.id, &page).await.unwrap());
+        let pulled = b.pull_records(id, c.id).await;
+        assert!(
+            matches!(pulled, Err(NodeError::Forked { peer, .. }) if peer == c.id),
+            "{pulled:?}"
+        );
+        let job = b.job(id).await.unwrap();
+        assert!(job.lock().await.forked().unwrap().is_some());
+    }
+
+    /// A suspend copies the job to a peer paired without an address while
+    /// that peer's session is open, so it holds the work if this node goes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_suspend_copies_the_job_to_an_addressless_peer_over_its_session() {
+        let (_dir_a, a) = node();
+        let (dir_b, b) = node();
+        tokio::spawn(Arc::clone(&a).run());
+        tokio::spawn(Arc::clone(&b).run());
+        let addr = b.local_addr().unwrap().to_string();
+        a.node_add(b.id, Some(&addr), &mut Out::default())
+            .await
+            .unwrap();
+        b.node_add(a.id, None, &mut Out::default()).await.unwrap();
+        a.node_ping(b.id, &mut Out::default()).await.unwrap();
+        let id = job(dir_b.path(), &b).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut out = Out::default();
+        b.suspend(id, &path, &mut out).await.unwrap();
+        b.replicate(id, &mut out).await;
+        assert!(a.job(id).await.is_ok(), "{:?}", out.lines);
+    }
+
+    /// A secret in an ACP agent's arguments must be refused before a
+    /// ledger record names the harness, since records reach every peer.
+    #[tokio::test]
+    async fn a_harness_whose_arguments_hold_a_secret_is_never_recorded() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let secret = HarnessKind::Acp {
+            program: fabric_core::harness::ProgramName::parse("opencode").unwrap(),
+            args: vec!["--api-key".to_owned(), format!("sk-ant-{}", "a".repeat(24))],
+        };
+        let refused = node
+            .job_new(
+                dir.path(),
+                "goal".to_owned(),
+                secret.clone(),
+                &mut Out::default(),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(NodeError::HarnessConfig(_))),
+            "{refused:?}"
+        );
+        let mut sleeper = sleeper();
+        let refused = node
+            .harness_started(
+                id,
+                Epoch::FIRST,
+                pid(&sleeper),
+                secret,
+                None,
+                &mut Out::default(),
+            )
+            .await;
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
+        assert!(
+            matches!(refused, Err(NodeError::HarnessConfig(_))),
+            "{refused:?}"
+        );
+        assert_eq!(node.jobs.lock().await.len(), 1);
+        let job = node.job(id).await.unwrap();
+        assert_eq!(job.lock().await.ledger().records().len(), 1);
+    }
+
+    /// A log longer than one control answer can carry still answers, with
+    /// the latest records and a line that says how many were left out.
+    #[tokio::test]
+    async fn a_log_past_the_control_cap_answers_with_the_latest_records() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let long_text = "n".repeat(900 << 10);
+        for _ in 0..5 {
+            node.job_decide(id, Decision::Approve, &long_text, &mut Out::default())
+                .await
+                .unwrap();
+        }
+        let mut out = Out::default();
+        node.job_log(id, &mut out).await.unwrap();
+        let lines = out.lines;
+        let answer = crate::control::Response::Done {
+            lines: lines.clone(),
+        };
+        let encoded = postcard::to_stdvec(&answer).unwrap();
+        assert!(encoded.len() <= crate::control::MAX_CONTROL_MESSAGE);
+        assert!(
+            lines[0].starts_with("the first 4 records are left out"),
+            "{}",
+            &lines[0]
+        );
+        assert!(lines.last().unwrap().starts_with("   5 epoch"));
     }
 
     #[test]

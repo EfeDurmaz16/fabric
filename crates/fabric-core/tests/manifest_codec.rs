@@ -220,8 +220,25 @@ fn manifest() -> impl Strategy<Value = SnapshotManifest> {
         proptest::collection::vec(cache_entry(), 0..3),
     )
         .prop_map(
-            |(job, root, parent, created_at, by, (os, arch), git, files, harness, env, caches)| {
+            |(
+                job,
+                root,
+                parent,
+                created_at,
+                by,
+                (os, arch),
+                mut git,
+                files,
+                harness,
+                env,
+                caches,
+            )| {
                 let caches = sorted_unique(caches, |c| c.path.clone());
+                // A path is in `files` or in the working tree, never both.
+                if let Some(git) = git.as_mut() {
+                    git.worktree_mtimes
+                        .retain(|(path, _)| files.iter().all(|e| e.rel_path != *path));
+                }
                 SnapshotManifest {
                     job_id: JobId::from_bytes(job),
                     root,
@@ -535,6 +552,47 @@ fn a_remote_url_with_userinfo_on_the_wire_does_not_decode() {
     assert!(matches!(
         SnapshotManifest::decode(&token),
         Err(ManifestError::SecretInConfig { index: 0 })
+    ));
+}
+
+/// SHA-1 and SHA-256 repositories do not interoperate, so a manifest whose
+/// ids mix the two widths could not be restored into any repository.
+#[test]
+fn mixed_object_id_widths_are_refused() {
+    let sha256 = GitOid::parse(&"d".repeat(64)).unwrap();
+    let mixes: [fn(&mut GitState, GitOid); 4] = [
+        |g, oid| g.refs[0].1 = oid,
+        |g, oid| g.head = GitHead::Detached(oid),
+        |g, oid| g.index_commit = oid,
+        |g, oid| g.worktree_commit = oid,
+    ];
+    for mix in mixes {
+        let mut m = fixed_manifest().unwrap();
+        mix(m.git.as_mut().unwrap(), sha256.clone());
+        assert!(matches!(m.encode(), Err(ManifestError::MixedObjectFormat)));
+    }
+    let mut m = fixed_manifest().unwrap();
+    let git = m.git.as_mut().unwrap();
+    git.refs[0].1 = sha256.clone();
+    git.head = GitHead::Detached(sha256.clone());
+    git.index_commit = sha256.clone();
+    git.worktree_commit = sha256;
+    let bytes = m.encode().unwrap();
+    assert_eq!(SnapshotManifest::decode(&bytes).unwrap(), m);
+}
+
+/// Restore writes the working tree first and `files` with exclusive
+/// creates, so a path in both would publish and never restore.
+#[test]
+fn a_path_in_files_and_the_working_tree_is_refused() {
+    let mut m = fixed_manifest().unwrap();
+    let path = m.files[0].rel_path.clone();
+    let git = m.git.as_mut().unwrap();
+    git.worktree_mtimes.push((path.clone(), 0));
+    git.worktree_mtimes.sort_by(|a, b| a.0.cmp(&b.0));
+    assert!(matches!(
+        m.encode(),
+        Err(ManifestError::InBothTrees { path: p }) if p == path
     ));
 }
 

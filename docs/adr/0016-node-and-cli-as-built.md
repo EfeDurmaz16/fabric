@@ -32,7 +32,7 @@ The core, the store, the network layer, the harness adapters and the environment
 
 The node is the store's single writer, the ledger files' single appender and the supervisor of every harness it recorded. There is no mode in which the CLI takes the lock itself: without a daemon every job command fails with "no fabric daemon ... start one with `fabric serve`". ADR 0003 allows the `resume` command to be the supervisor when no node runs; that path is not built.
 
-The control socket is `<state>/fabric.sock`. One connection carries one request and one response, each a `u32` length and postcard bytes. A path of 104 bytes or more is refused at start with a message, because macOS cannot bind it. The mode of the state directory is not the only check: the daemon refuses a connection whose peer user id is not its own, and the CLI refuses a state directory or socket another user owns, or a directory others may enter, before it trusts a run plan read there.
+The control socket is `<state>/fabric.sock`. One connection carries one request and one response, each a `u32` length and postcard bytes. A path of 104 bytes or more is refused at start with a message, because macOS cannot bind it. The mode of the state directory is not the only check: the daemon refuses a connection whose peer user id is not its own, and the CLI refuses a state directory or socket another user owns, or a directory others may enter, before it trusts a run plan read there. The daemon reads `harness.toml` once at start, and every run plan carries that copy, so the CLI launches a harness under the configuration the daemon captures and restores it with; an edit to the file takes effect when the daemon restarts.
 
 ### The ledger file
 
@@ -93,7 +93,7 @@ A node can lose a job while its marker says live, keep that orphan, and own the 
 
 The push (`fabric job move <job> --to <node>`, typed on the owner) follows ADR 0003 step by step: preflight, suspend, push the ledger with `Append` (the target fetches the latest snapshot over the same session before it answers the last page), `MoveStarted` made durable, `Append` again so the target holds it, `MoveOffer`. The target answers with the one decision for that move id, durable before the answer leaves. The job's lock is released while the target copies, so before `MoveStarted` the source checks again that the job is suspended in the snapshot it pushed and that no run was planned since; a `run` planned marks the workspace live, and a move that finds it so stops with the job still owned here. A lost answer is followed by `MoveStatus` on a fresh connection; five failed tries leave the source frozen and say so with the one command that resolves it.
 
-The pull (`fabric job resume <job>` on a node that does not own the job) fetches the records and the snapshot, sends `MoveRequest`, and the owner suspends (stopping its harness) and appends `MoveStarted` toward the puller. The puller fetches again, decides the offer from its own replica with `Ledger::answer_offer`, and pushes the `MoveImported` back. `--on <node>` names the node to pull from when this node has never seen the job; otherwise the ledger's owner is used. A pull never moves the job to a third node: resume means here (ADR 0008).
+The pull (`fabric job resume <job>` on a node that does not own the job) fetches the records, runs the preflight against the harness that will launch here (the `--harness` override, or the job's own, read from the fetched records when the job is new here), fetches the snapshot, sends `MoveRequest`, and the owner suspends (stopping its harness) and appends `MoveStarted` toward the puller. The puller fetches again, decides the offer from its own replica with `Ledger::answer_offer`, and pushes the `MoveImported` back. `--on <node>` names the node to pull from when this node has never seen the job; otherwise the ledger's owner is used. A pull never moves the job to a third node: resume means here (ADR 0008).
 
 `fabric job steal <job> --force` writes `Stolen` and a `Note` with the warning; without `--force` it prints what it would do and fails.
 
@@ -127,7 +127,7 @@ The root is refused under `~/Library/Mobile Documents` everywhere, and under `~/
 
 ### Carry keys
 
-Capture measures carry keys with `fabric-env` detection: a cache detection does not know is `Unmeasured` and never carried. A restore cannot run detection before the workspace exists, so it measures the key of the same shape as the source's: the same package manager, its own versions and paths. Each cache prints one line, carried or rebuilt and why.
+Capture measures carry keys with `fabric-env` detection: a cache detection does not know is `Unmeasured` and never carried. A workspace whose detection fails, such as a `.fabric/env.toml` that does not parse, is not captured: the suspend stops and names the error, because the target would take the job and then fail to materialize it. A restore cannot run detection before the workspace exists, so it measures the key of the same shape as the source's: the same package manager, its own versions and paths. Each cache prints one line, carried or rebuilt and why.
 
 ### Decisions as ledger events
 

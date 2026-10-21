@@ -40,7 +40,7 @@ use fabric_net::endpoint::DialOrder;
 use fabricd::control::{
     self, ControlError, Decision, NO_DAEMON_EXIT, NamedSession, Refusal, Request, Response, RunPlan,
 };
-use fabricd::harnesses::{HarnessConfig, HarnessEnv, acp_adapter, parse_harness};
+use fabricd::harnesses::{HarnessEnv, acp_adapter, parse_harness};
 use fabricd::node::{Node, NodeConfig};
 use fabricd::paths::{STATE_DIR_ENV, StateDir};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -547,7 +547,7 @@ async fn launch(state: &StateDir, home: &Path, plan: &RunPlan, mode: Mode) -> Re
     // Caught from just before the harness starts, so none is lost in
     // between; a signal during the setup steps still ends the command.
     let forward = read_line.map(|_| Forward::new()).transpose()?;
-    let mut running = start(state, home, plan, mode, notes).await?;
+    let mut running = start(home, plan, mode, notes).await?;
     let pid = running.pid();
     let registered = register(&socket, plan, &running, notes).await;
     drop(tree);
@@ -610,20 +610,10 @@ async fn launch(state: &StateDir, home: &Path, plan: &RunPlan, mode: Mode) -> Re
 
 /// Launches the plan's harness in `mode`; held when it is interactive and
 /// standard input is a terminal.
-async fn start(
-    state: &StateDir,
-    home: &Path,
-    plan: &RunPlan,
-    mode: Mode,
-    notes: Notes,
-) -> Result<Running> {
+async fn start(home: &Path, plan: &RunPlan, mode: Mode, notes: Notes) -> Result<Running> {
     let env = environment();
     let resume = plan.session.clone();
-    let harness_env = HarnessEnv::new(
-        home,
-        path_var(),
-        HarnessConfig::load(&state.harness_config())?,
-    )?;
+    let harness_env = HarnessEnv::new(home, path_var(), plan.harness_config.clone())?;
     let launch = match mode {
         Mode::Headless(prompt) => Launch::Headless { resume, prompt },
         Mode::Interactive(prompt) => Launch::Interactive {
@@ -1003,6 +993,9 @@ fn materialize(state: &StateDir, root: &Path, notes: Notes) -> Result<TreeLock> 
     let detected = fabric_env::detect::detect(root, &[])?;
     let plan = fabric_env::materialize::plan(&detected, &lock, &NodeEnv::current())?;
     if plan.is_noop() {
+        // A declared variable is required even when no step runs, so a
+        // warm node refuses the launch a cold node would (ADR 0007).
+        plan.ready()?;
         return Ok(lock);
     }
     let mut lines = Vec::new();
@@ -1090,4 +1083,33 @@ fn kill_group(running: &Running) {
 
 fn pid_of(running: &Running) -> Option<rustix::process::Pid> {
     rustix::process::Pid::from_raw(i32::try_from(running.pid().get()).ok()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With every cache whole no step runs, and the declared variable must
+    /// still stop the launch.
+    #[test]
+    fn a_missing_declared_variable_stops_a_launch_with_no_setup_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(
+            root.join(".fabric/env.toml"),
+            "env = [\"FABRIC_TEST_VARIABLE_NO_ONE_SETS\"]\n",
+        )
+        .unwrap();
+        let state =
+            StateDir::resolve(Some(dir.path().join("state").as_os_str()), dir.path()).unwrap();
+        let Err(error) = materialize(&state, &root, Notes::Stdout) else {
+            panic!("the launch went ahead");
+        };
+        let error = error.to_string();
+        assert!(
+            error.contains("FABRIC_TEST_VARIABLE_NO_ONE_SETS"),
+            "{error}"
+        );
+    }
 }

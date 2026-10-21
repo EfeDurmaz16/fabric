@@ -34,8 +34,10 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 use crate::accept::refresh;
-use crate::frame::{FrameError, MAX_BULK_FRAME, MAX_CONTROL_FRAME, read_frame, write_frame};
-use crate::idle::IdleReader;
+use crate::frame::{
+    FrameError, MAX_BULK_FRAME, MAX_CONTROL_FRAME, MAX_STORED_CHUNK, read_frame, write_frame,
+};
+use crate::idle::{IdleReader, StallWriter};
 use crate::tls::Trust;
 use crate::transport::{Connection, Stream, TransportError, TransportKind};
 use crate::wire::{
@@ -57,6 +59,13 @@ pub const TRUST_RECHECK: Duration = Duration::from_secs(5);
 /// 35 KiB/s, and a peer that sends part of a frame and stops gives its
 /// stream back.
 pub const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a reply may wait with no byte taken by the peer before its stream is dropped.
+///
+/// Only time spent waiting on flow control counts, not the time the
+/// service takes, so a peer that asks and then stops reading gives its
+/// stream, and a chunk batch its slot, back.
+pub const REPLY_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The most per-job requests one serving session runs at once, counting work that outlived its caller's budget.
 pub const MAX_JOB_WORK: usize = 16;
@@ -144,6 +153,22 @@ pub enum RpcError {
         yours: Epoch,
         /// The receiver epoch the verdict names.
         current: Epoch,
+    },
+    /// The peer's move status names another move than the one asked about.
+    #[error("asked about move {asked}, the peer answered for move {got}")]
+    WrongMove {
+        /// The move asked about.
+        asked: MoveId,
+        /// The move the answer names.
+        got: MoveId,
+    },
+    /// The peer's answer to an offer names another snapshot to push than the one offered.
+    #[error("offered snapshot {offered}, the peer asked for snapshot {got}")]
+    WrongSnapshot {
+        /// The snapshot the offer named.
+        offered: SnapshotId,
+        /// The snapshot the answer names.
+        got: SnapshotId,
     },
     /// An earlier error ended this chunk stream; ask for `missing` in a new request.
     #[error("the chunk stream already failed; ask for the missing chunks again")]
@@ -261,6 +286,32 @@ fn check_verdict<T>(sent: Epoch, fenced: &Fenced<T>) -> Result<(), RpcError> {
             yours,
             current,
         })
+    }
+}
+
+/// Accepts a move status only if an undecided answer names the move asked about.
+fn check_move(asked: MoveId, fenced: &Fenced<MoveState>) -> Result<(), RpcError> {
+    match *fenced {
+        Fenced::Answer(MoveState::Undecided { move_id }) if move_id != asked => {
+            Err(RpcError::WrongMove {
+                asked,
+                got: move_id,
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Accepts an offer's answer only if an incomplete-snapshot answer names the snapshot offered.
+fn check_offered(offered: SnapshotId, fenced: &Fenced<Offered>) -> Result<(), RpcError> {
+    match *fenced {
+        Fenced::Answer(Offered::SnapshotIncomplete { snapshot }) if snapshot != offered => {
+            Err(RpcError::WrongSnapshot {
+                offered,
+                got: snapshot,
+            })
+        }
+        _ => Ok(()),
     }
 }
 
@@ -569,8 +620,12 @@ impl Session {
             job_id: offer.job_id,
             epoch,
         };
-        self.job(token, JobRequest::MoveOffer(offer.into()), deadline)
-            .await
+        let offered = offer.snapshot;
+        let answer = self
+            .job(token, JobRequest::MoveOffer(offer.into()), deadline)
+            .await?;
+        check_offered(offered, &answer)?;
+        Ok(answer)
     }
 
     /// Asks the target for its decision on `move_id` again under `token`, waiting at most `deadline`.
@@ -580,8 +635,11 @@ impl Session {
         move_id: MoveId,
         deadline: Duration,
     ) -> Result<Fenced<MoveState>, RpcError> {
-        self.job(token, JobRequest::MoveStatus { move_id }, deadline)
-            .await
+        let state = self
+            .job(token, JobRequest::MoveStatus { move_id }, deadline)
+            .await?;
+        check_move(move_id, &state)?;
+        Ok(state)
     }
 
     /// Asks the target to decide against `move_id` under `token`, waiting at most `deadline`; returns its decision record.
@@ -683,8 +741,9 @@ impl Session {
     }
 }
 
-/// One chunk that arrived and was checked: its zstd frame decompresses to at
-/// most `MAX_CHUNK_LEN` bytes, and those bytes hash to its id.
+/// One chunk that arrived and was checked: its zstd encoding is at most
+/// `MAX_STORED_CHUNK` bytes and decompresses to at most `MAX_CHUNK_LEN`
+/// bytes, and those bytes hash to its id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedChunk {
     id: ChunkId,
@@ -700,6 +759,12 @@ impl VerifiedChunk {
     /// most `MAX_CHUNK_LEN`, so a small frame cannot make this node
     /// allocate more than one chunk.
     fn check(id: ChunkId, stored: Vec<u8>) -> Option<Self> {
+        // The bulk frame leaves room for the envelope, so a stored chunk
+        // could be a little longer than any the store writes; it is not
+        // kept, so the store never holds one past its own bound.
+        if stored.len() > MAX_STORED_CHUNK {
+            return None;
+        }
         let capacity = match zstd::zstd_safe::get_frame_content_size(&stored) {
             Ok(Some(declared)) => usize::try_from(declared)
                 .ok()
@@ -879,7 +944,8 @@ async fn handle(
     service: Arc<dyn Service>,
     limits: &Limits,
 ) -> Result<(), RpcError> {
-    let (mut send, mut recv) = stream.split();
+    let (send, mut recv) = stream.split();
+    let mut send = StallWriter::new(send, REPLY_STALL_TIMEOUT);
     let bytes = timeout(
         REQUEST_READ_TIMEOUT,
         read_frame(&mut recv, MAX_CONTROL_FRAME),
@@ -933,7 +999,7 @@ async fn handle(
         RequestBody::WantChunks(batch) => {
             let Ok(Ok(_run)) = timeout(budget, limits.chunk_runs.acquire()).await else {
                 reply(
-                    send.as_mut(),
+                    &mut send,
                     id,
                     ResponseBody::Fault(Fault::Deadline),
                     MAX_CONTROL_FRAME,
@@ -942,12 +1008,12 @@ async fn handle(
                 send.shutdown().await.map_err(FrameError::Io)?;
                 return Ok(());
             };
-            send_chunks(peer, id, batch, budget, send.as_mut(), service.as_ref()).await?;
+            send_chunks(peer, id, batch, budget, &mut send, service.as_ref()).await?;
             send.shutdown().await.map_err(FrameError::Io)?;
             return Ok(());
         }
     };
-    reply(send.as_mut(), id, body, MAX_CONTROL_FRAME).await?;
+    reply(&mut send, id, body, MAX_CONTROL_FRAME).await?;
     send.shutdown().await.map_err(FrameError::Io)?;
     Ok(())
 }
@@ -1031,6 +1097,47 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    /// An undecided status for another move is not an answer about the move asked.
+    #[test]
+    fn a_move_status_for_another_move_is_refused() {
+        let [asked, other] = [1, 2].map(|n| MoveId::from_bytes([n; 16]));
+        let undecided = |move_id| Fenced::Answer(MoveState::Undecided { move_id });
+        assert!(check_move(asked, &undecided(asked)).is_ok());
+        assert!(matches!(
+            check_move(asked, &undecided(other)),
+            Err(RpcError::WrongMove { asked: a, got }) if a == asked && got == other
+        ));
+    }
+
+    /// An incomplete-snapshot answer for another snapshot is not an answer to the offer sent.
+    #[test]
+    fn an_offer_answer_for_another_snapshot_is_refused() {
+        let [offered, other] = [1, 2].map(|n| SnapshotId::from_bytes([n; 32]));
+        let incomplete = |snapshot| Fenced::Answer(Offered::SnapshotIncomplete { snapshot });
+        assert!(check_offered(offered, &incomplete(offered)).is_ok());
+        assert!(matches!(
+            check_offered(offered, &incomplete(other)),
+            Err(RpcError::WrongSnapshot { offered: o, got }) if o == offered && got == other
+        ));
+    }
+
+    /// A chunk whose zstd encoding is longer than any the store writes is
+    /// refused, even when it decompresses to bytes that hash to its id, as
+    /// one padded with a skippable frame does.
+    #[test]
+    fn a_stored_chunk_past_the_stored_bound_is_refused() {
+        let bytes = b"chunk".to_vec();
+        let id = ChunkId::of(&bytes);
+        let mut stored = zstd::bulk::compress(&bytes, 3).unwrap();
+        assert!(VerifiedChunk::check(id, stored.clone()).is_some());
+        let pad = MAX_STORED_CHUNK + 1 - stored.len() - 8;
+        stored.extend_from_slice(&0x184D_2A50_u32.to_le_bytes());
+        stored.extend_from_slice(&u32::try_from(pad).unwrap().to_le_bytes());
+        stored.resize(MAX_STORED_CHUNK + 1, 0);
+        assert_eq!(zstd::bulk::decompress(&stored, 64).unwrap(), bytes);
+        assert!(VerifiedChunk::check(id, stored).is_none());
     }
 
     fn frame(body: ResponseBody) -> Vec<u8> {
@@ -1225,10 +1332,11 @@ mod tests {
         }
     }
 
-    /// A service that serves nothing; with `hang` set, a pull or a chunk never ends.
+    /// A service that serves nothing; with `hang` set, a pull or a chunk never ends; with `chunk_len` set, every chunk is that many bytes.
     #[derive(Default)]
     struct Nothing {
         hang: bool,
+        chunk_len: usize,
         /// How many pulls and chunks were asked for.
         started: std::sync::atomic::AtomicUsize,
     }
@@ -1292,6 +1400,9 @@ mod tests {
         }
 
         fn chunk(&self, _peer: NodeId, id: ChunkId) -> BoxFuture<'_, Result<Vec<u8>, Fault>> {
+            if self.chunk_len > 0 {
+                return self.start(Ok(vec![0; self.chunk_len]));
+            }
             self.start(Err(Fault::UnknownChunk(id)))
         }
 
@@ -1408,6 +1519,31 @@ mod tests {
         let mut over = held.pop().unwrap();
         assert!(matches!(over.next().await, Err(RpcError::Deadline(_))));
         assert_eq!(service.started.load(Ordering::SeqCst), MAX_CHUNK_RUNS);
+    }
+
+    /// A peer that asks for chunks and stops reading them loses those
+    /// batches after `REPLY_STALL_TIMEOUT`, so they give their slots back
+    /// instead of holding them as long as keep-alives hold the connection.
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_the_peer_stops_reading_gives_its_slot_back() {
+        let service = Arc::new(Nothing {
+            chunk_len: 4 << 20,
+            ..Nothing::default()
+        });
+        let (session, _serving) = serving_pair(paired(), Arc::clone(&service)).await;
+        let mut unread = Vec::new();
+        for n in 0..MAX_CHUNK_RUNS {
+            let batch = ChunkBatch::new(vec![ChunkId::of(&n.to_le_bytes())]).unwrap();
+            unread.push(session.want_chunks(batch, IDLE).await.unwrap());
+        }
+        tokio::time::sleep(REPLY_STALL_TIMEOUT + IDLE).await;
+        let batch = ChunkBatch::new(vec![ChunkId::of(b"next")]).unwrap();
+        let mut next = session.want_chunks(batch, IDLE).await.unwrap();
+        assert!(
+            matches!(next.next().await, Err(RpcError::ChunkMismatch { .. })),
+            "the batch was not served"
+        );
+        assert_eq!(service.started.load(Ordering::SeqCst), MAX_CHUNK_RUNS + 1);
     }
 
     /// A stream that failed inside a frame never reads again.

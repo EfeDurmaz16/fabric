@@ -18,7 +18,7 @@ use fabric_harness::Harness;
 use fabric_harness::acp::AcpHarness;
 use fabric_harness::claude::ClaudeCode;
 use fabric_harness::codex::Codex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Why a harness could not be named or configured.
 #[derive(Debug, thiserror::Error)]
@@ -85,16 +85,30 @@ pub fn parse_harness(text: &str) -> Result<HarnessKind, HarnessConfigError> {
             let program = words
                 .next()
                 .ok_or_else(|| HarnessConfigError::Unknown(text.to_owned()))?;
-            Ok(HarnessKind::Acp {
+            let kind = HarnessKind::Acp {
                 program: ProgramName::parse(program)?,
                 args: words.map(str::to_owned).collect(),
-            })
+            };
+            refuse_secret_kind(&kind)?;
+            Ok(kind)
         }
     }
 }
 
+/// Refuses a harness kind whose ACP arguments hold a secret shape.
+///
+/// The kind is written into ledger records that travel to every peer and
+/// are never redacted, so the daemon checks every kind a request names
+/// before it records one, not only at capture.
+pub fn refuse_secret_kind(kind: &HarnessKind) -> Result<(), HarnessConfigError> {
+    if let HarnessKind::Acp { program, args } = kind {
+        fabric_harness::acp::refuse_secret_args(program, args)?;
+    }
+    Ok(())
+}
+
 /// One ACP agent's settings in `harness.toml`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcpConfig {
     /// Where the agent keeps its sessions; relative paths are under the home.
@@ -103,11 +117,15 @@ pub struct AcpConfig {
 
 /// The node's `harness.toml`: settings an adapter cannot discover.
 ///
+/// The daemon reads it once at start and hands its copy to the CLI in
+/// every run plan, so the harness a CLI launches is configured as the one
+/// the daemon captures and restores, even when the file changed since.
+///
 /// ```toml
 /// [acp.opencode]
 /// state_dir = ".local/share/opencode/sessions"
 /// ```
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessConfig {
     /// ACP agents by program name.

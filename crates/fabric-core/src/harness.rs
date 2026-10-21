@@ -26,12 +26,16 @@ pub enum ProgramNameError {
     /// The name starts with `-`, which an argument parser would read as an option.
     #[error("program name starts with `-`")]
     LeadingDash,
+    /// The name holds a control character other than NUL, such as a newline or an escape.
+    #[error("program name contains a control character")]
+    Control,
 }
 
 /// The name of a program to look up on `PATH` and start without a shell.
 ///
 /// Never a path, never an option: no slash, no NUL, no leading `-`, not
-/// empty. Checked once, at the boundary, including inside `Deserialize`, so
+/// empty. No control character either: errors and logs print the name,
+/// and one from a peer must not carry a newline or a terminal escape. Checked once, at the boundary, including inside `Deserialize`, so
 /// a spec or a record from a peer cannot name `/tmp/x`, `../bin/x` or
 /// `-rf`.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -52,6 +56,9 @@ impl ProgramName {
         }
         if text.starts_with('-') {
             return Err(ProgramNameError::LeadingDash);
+        }
+        if text.chars().any(char::is_control) {
+            return Err(ProgramNameError::Control);
         }
         Ok(Self(text.to_owned()))
     }
@@ -151,6 +158,18 @@ mod tests {
         assert_eq!(
             ProgramName::parse("-rf"),
             Err(ProgramNameError::LeadingDash)
+        );
+        assert_eq!(
+            ProgramName::parse("npm\u{1b}[2J"),
+            Err(ProgramNameError::Control)
+        );
+        assert_eq!(
+            ProgramName::parse("npm\nok"),
+            Err(ProgramNameError::Control)
+        );
+        assert_eq!(
+            ProgramName::parse("npm\u{9b}"),
+            Err(ProgramNameError::Control)
         );
         let bytes = postcard::to_stdvec("").unwrap();
         assert!(postcard::from_bytes::<ProgramName>(&bytes).is_err());

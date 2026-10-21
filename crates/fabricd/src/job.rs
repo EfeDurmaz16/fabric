@@ -57,6 +57,23 @@ impl Job {
         })
     }
 
+    /// Creates a job this node makes and owns, with its workspace at `marker`.
+    ///
+    /// The marker is written before the ledger: a crash between the two
+    /// leaves a marker with no ledger, which start-up skips as no job, and
+    /// never an owned ledger with no marker, which no command could run,
+    /// suspend or restore.
+    pub fn create_owned(
+        id: JobId,
+        dir: JobDir,
+        created: &Record,
+        marker: &Marker,
+    ) -> Result<Self, NodeError> {
+        crate::durable::create_dir(dir.dir()).map_err(|e| NodeError::io(dir.dir(), e))?;
+        local::write(&dir.marker(), marker)?;
+        Self::create(id, dir, created)
+    }
+
     /// Opens a job this node held before.
     pub fn open(id: JobId, dir: JobDir) -> Result<Self, NodeError> {
         let file = LedgerFile::open(&dir.ledger())?;
@@ -267,5 +284,36 @@ mod tests {
         assert!(!state.job(asked).dir().exists());
         Job::create(other, state.job(other), &created).unwrap();
         Job::open(other, state.job(other)).unwrap();
+    }
+
+    /// An owned job whose marker could not be written must leave no
+    /// ledger: start-up would load it as a job no command can run.
+    #[test]
+    fn an_owned_job_whose_marker_fails_leaves_no_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::resolve(Some(dir.path().as_os_str()), dir.path()).unwrap();
+        let id = JobId::from_bytes([1; 16]);
+        let created = Ledger::created(
+            id,
+            "goal".into(),
+            HarnessKind::Codex,
+            NodeId::from_bytes([3; 32]),
+            EventId::from_bytes([4; 16]),
+            1,
+        )
+        .unwrap();
+        let marker = Marker {
+            root: dir.path().join("work"),
+            state: MarkerState::Live,
+            epoch: fabric_core::id::Epoch::FIRST,
+        };
+        // A directory where the marker goes makes its write fail.
+        fs::create_dir_all(state.job(id).marker()).unwrap();
+        let failed = Job::create_owned(id, state.job(id), &created, &marker);
+        assert!(failed.is_err(), "{failed:?}");
+        assert!(!state.job(id).ledger().exists());
+        fs::remove_dir(state.job(id).marker()).unwrap();
+        let job = Job::create_owned(id, state.job(id), &created, &marker).unwrap();
+        assert_eq!(job.marker().unwrap(), Some(marker));
     }
 }

@@ -35,6 +35,12 @@ pub enum WriteError {
         /// The path, relative to the tree root.
         path: PathBuf,
     },
+    /// The path is a FIFO, socket, device or directory where a regular file was expected.
+    #[error("{path}: not a regular file")]
+    NotRegular {
+        /// The path, relative to the tree root.
+        path: PathBuf,
+    },
     /// The name already exists; on a case-folding volume this is also how two names that fold together show up.
     #[error("{path}: already exists")]
     Collision {
@@ -64,6 +70,18 @@ fn map(errno: Errno, path: &Path) -> WriteError {
             path: path.to_owned(),
             source: io::Error::from(other),
         },
+    }
+}
+
+/// Access and modification times both set to `mtime_ns` after the epoch.
+fn timestamps(mtime_ns: u64) -> Timestamps {
+    let stamp = Timespec {
+        tv_sec: i64::try_from(mtime_ns / 1_000_000_000).unwrap_or(i64::MAX),
+        tv_nsec: (mtime_ns % 1_000_000_000).try_into().unwrap_or(0),
+    };
+    Timestamps {
+        last_access: stamp,
+        last_modification: stamp,
     }
 }
 
@@ -144,12 +162,28 @@ impl TreeWriter {
         Ok(())
     }
 
-    /// Sets the mode of the directory at `rel` without following a link at its name.
-    pub fn set_dir_mode(&self, rel: &RelPath, bits: EntryMode) -> Result<(), WriteError> {
+    /// Gives the directory at `rel` its mode and mtime, and flushes it when `sync` is set.
+    ///
+    /// All three go through one handle opened while the directory is still
+    /// owner-only, so a recorded mode without read permission cannot stop
+    /// the flush, and the flush carries the new mode and mtime. A link at
+    /// the name is never followed.
+    pub fn finish_dir(
+        &self,
+        rel: &RelPath,
+        bits: EntryMode,
+        mtime_ns: u64,
+        sync: bool,
+    ) -> Result<(), WriteError> {
         let (parent, name) = self.parent_of(rel, false)?;
         let path = Path::new(rel.as_str());
         let dir = fs::openat(&parent, name, DIR_FLAGS, Mode::empty()).map_err(|e| map(e, path))?;
-        fs::fchmod(&dir, mode(bits)).map_err(|e| map(e, path))
+        fs::fchmod(&dir, mode(bits)).map_err(|e| map(e, path))?;
+        fs::futimens(&dir, &timestamps(mtime_ns)).map_err(|e| map(e, path))?;
+        if sync {
+            fs::fsync(&dir).map_err(|e| map(e, path))?;
+        }
+        Ok(())
     }
 
     /// Creates a new file with `bits` and returns it open for writing.
@@ -172,16 +206,21 @@ impl TreeWriter {
     /// Sets the modification time of a file, directory or symlink itself.
     pub fn set_mtime(&self, rel: &RelPath, mtime_ns: u64) -> Result<(), WriteError> {
         let (parent, name) = self.parent_of(rel, false)?;
-        let stamp = Timespec {
-            tv_sec: i64::try_from(mtime_ns / 1_000_000_000).unwrap_or(i64::MAX),
-            tv_nsec: (mtime_ns % 1_000_000_000).try_into().unwrap_or(0),
-        };
-        let times = Timestamps {
-            last_access: stamp,
-            last_modification: stamp,
-        };
-        fs::utimensat(&parent, name, &times, AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|e| map(e, Path::new(rel.as_str())))
+        fs::utimensat(
+            &parent,
+            name,
+            &timestamps(mtime_ns),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|e| map(e, Path::new(rel.as_str())))
+    }
+
+    /// Says whether a directory, not a link to one, is at `rel`.
+    pub fn is_dir(&self, rel: &RelPath) -> Result<bool, WriteError> {
+        let (parent, name) = self.parent_of(rel, false)?;
+        let stat = fs::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|e| map(e, Path::new(rel.as_str())))?;
+        Ok(FileType::from_raw_mode(stat.st_mode).is_dir())
     }
 
     /// Reads the target of the symlink at `rel` without following it.
@@ -196,11 +235,20 @@ impl TreeWriter {
     }
 
     /// Opens an existing regular file for reading without following a link at its name.
+    ///
+    /// The open does not wait on a FIFO, and the type is read from the open
+    /// descriptor, so a file replaced by a FIFO or a device is refused, not read.
     pub fn open_file(&self, rel: &RelPath) -> Result<File, WriteError> {
         let (parent, name) = self.parent_of(rel, false)?;
-        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        let fd = fs::openat(&parent, name, flags, Mode::empty())
-            .map_err(|e| map(e, Path::new(rel.as_str())))?;
+        let path = Path::new(rel.as_str());
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let fd = fs::openat(&parent, name, flags, Mode::empty()).map_err(|e| map(e, path))?;
+        let stat = fs::fstat(&fd).map_err(|e| map(e, path))?;
+        if !FileType::from_raw_mode(stat.st_mode).is_file() {
+            return Err(WriteError::NotRegular {
+                path: path.to_owned(),
+            });
+        }
         Ok(File::from(fd))
     }
 }
