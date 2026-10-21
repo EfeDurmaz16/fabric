@@ -593,6 +593,30 @@ mod tests {
         );
     }
 
+    /// The note orders versions as the resume guard does, not as text:
+    /// `0.155.9` is older than `0.155.10`, and a release is newer than its
+    /// own pre-release, where a string compare says the opposite of both.
+    #[test]
+    fn the_older_target_is_found_by_the_guards_order_not_by_text() {
+        let codex = HarnessKind::Codex;
+        let older = "the target's codex is older";
+        let note = |here: &str, target: &str| {
+            let source = with(&pro(), &[(name::CODEX, Some(here))]);
+            let peer = with(&pro(), &[(name::CODEX, Some(target))]);
+            compare(&source, &peer, &ctx(Some(&codex)))
+                .into_iter()
+                .find(|r| r.fact == name::CODEX)
+                .unwrap()
+                .note
+        };
+        let n = note("codex-cli 0.155.10", "codex-cli 0.155.9");
+        assert!(n.starts_with(older), "{n}");
+        let n = note("codex-cli 0.163.0-alpha.10.2", "codex-cli 0.163.0");
+        assert!(!n.starts_with(older), "{n}");
+        let n = note("codex-cli 0.163.0", "codex-cli 0.163.0-alpha.10.2");
+        assert!(n.starts_with(older), "{n}");
+    }
+
     #[test]
     fn a_root_in_a_folder_the_target_syncs_is_refused() {
         let peer = with(&pro(), &[(name::ICLOUD_DESKTOP, Some("1"))]);
