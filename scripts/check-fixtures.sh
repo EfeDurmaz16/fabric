@@ -3,7 +3,9 @@
 # edited, renamed or removed without a bump of API_VERSION. ADR 0018: within
 # one api version every change to the client API is additive, so its
 # fixtures only grow; a renamed field, a changed type or a removed variant
-# shows up here as an edited fixture. A new shape gets a new fixture.
+# shows up here as an edited fixture. A new shape gets a new fixture, but
+# not a new one under invalid/: that records a value the readers now
+# refuse, a narrower contract, so it needs the bump too.
 # protocol/fixtures/closed pins the variants of each closed enum the same
 # way, so a new variant, which a new fixture alone would let through, needs
 # the bump too.
@@ -86,6 +88,19 @@ fi
 if [ -n "$before" ] && [ "$before" != "$now" ]; then
   echo "API_VERSION $before -> $now: the fixtures of api $before may change"
   exit 0
+fi
+
+# A fixture added under invalid/ records a value the readers refuse from
+# now on, which an older node of the same api may still send: a narrower
+# contract, not a larger one. A base without an API_VERSION predates the
+# client API, and the api's first invalid fixtures come with it.
+if [ -n "$before" ]; then
+  stricter=$(git diff --name-status --no-renames --diff-filter=A "$fork" HEAD -- protocol/fixtures/invalid)
+  if [ -n "$stricter" ]; then
+    printf '%s\n' "$stricter" >&2
+    echo "error: a fixture of api $now added under invalid/ without an API_VERSION bump; it records a value the readers now refuse, which an older node of the same api may still send, so a stricter rule needs a bump (ADR 0018, Compatibility). A test of a rule the readers already had, or of a new op's own rule, goes in each reader's own tests until the next bump" >&2
+    exit 1
+  fi
 fi
 
 # Without rename detection a renamed fixture is a deletion and an addition.

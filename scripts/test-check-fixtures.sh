@@ -50,16 +50,21 @@ required() {
   required_only "$@" "$incompatible_pins"
 }
 
-# A fresh repository whose main holds api 1, one fixture with its required
-# keys, one closed enum and the fixtures of the version handshake, with a
-# branch `base` at that commit.
-new_repo() {
+# A fresh, empty repository.
+bare_repo() {
   rm -rf "$repo"
   mkdir -p "$repo/$(dirname "$api")"
   git_ init -q -b main
   git_ config user.name test
   git_ config user.email test@example.invalid
   git_ config commit.gpgsign false
+}
+
+# A fresh repository whose main holds api 1, one fixture with its required
+# keys, one closed enum and the fixtures of the version handshake, with a
+# branch `base` at that commit.
+new_repo() {
+  bare_repo
   set_version 1
   fixture reply/node_ping.json '{"kind":"node_ping","rtt_ms":3}'
   fixture closed/wire.json '["quic","tcp_tls"]'
@@ -221,6 +226,32 @@ required 'reply/node_ping.json /kind'
 set_version 2
 save 'feat!: api 2'
 expect pass 'a required field made optional with an api bump' "$repo" base
+
+# Review finding on PR #13: a fixture added under invalid/ records a value
+# the readers now refuse, which an older node of the same api may still
+# send, yet it passed as a new fixture.
+session_over_64='{"schema":"reply","value":{"kind":"harness_session","session":"'$(printf '%0100d' 0)'"}}'
+new_repo
+fixture invalid/session_id_over_64.json "$session_over_64"
+save 'fix: refuse a session id over 64 characters'
+expect fail 'a new invalid fixture' "$repo" base
+
+new_repo
+fixture invalid/session_id_over_64.json "$session_over_64"
+set_version 2
+save 'feat!: api 2 refuses a session id over 64 characters'
+expect pass 'a new invalid fixture with an api bump' "$repo" base
+
+bare_repo
+printf 'fabric\n' > "$repo/README.md"
+save 'chore: before the client api'
+git_ branch -q base
+set_version 1
+fixture reply/node_ping.json '{"kind":"node_ping","rtt_ms":3}'
+fixture invalid/session_id_over_64.json "$session_over_64"
+required 'reply/node_ping.json /kind' 'reply/node_ping.json /rtt_ms'
+save 'feat: api 1'
+expect pass 'the invalid fixtures that come with the api' "$repo" base
 
 new_repo
 expect fail 'a base that does not exist' "$repo" nowhere
