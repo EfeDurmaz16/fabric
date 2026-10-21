@@ -690,7 +690,9 @@ impl Node {
         // while it runs, so neither shows as a harness to stop. Taking the
         // lock refuses a capture of a tree an installer is still writing,
         // and holding it to the end keeps a run from starting setup while
-        // the capture reads.
+        // the capture reads. A link at the root would lock, capture and
+        // replicate whatever it names, so it is refused first.
+        refuse_replaced_root(id, &marker.root)?;
         let _tree = self.lock_tree(id, &marker.root)?;
         if let Some(record) = job.harness_record()? {
             if record.liveness().await != Liveness::Gone {
@@ -2234,12 +2236,7 @@ fn plan(
 ) -> Result<RunPlan, NodeError> {
     // The CLI resolves a link at the root and would run setup and the
     // harness in whatever it names, so only a real directory is handed out.
-    if std::fs::symlink_metadata(&root).is_ok_and(|meta| !meta.is_dir()) {
-        return Err(NodeError::RootNotADirectory {
-            job: job.id(),
-            root,
-        });
-    }
+    refuse_replaced_root(job.id(), &root)?;
     job.set_marker(&Marker {
         root: root.clone(),
         state: MarkerState::Live,
@@ -2352,6 +2349,18 @@ fn report_capture(report: &fabric_store::capture::CaptureReport, out: &mut Out) 
             "left behind (the .git of a nested repository, harness state): {path}"
         ));
     }
+}
+
+/// Refuses a root that exists and is not a directory, such as a link put
+/// in place of the directory Fabric wrote; a missing root is left to the caller.
+fn refuse_replaced_root(job: JobId, root: &Path) -> Result<(), NodeError> {
+    if std::fs::symlink_metadata(root).is_ok_and(|meta| !meta.is_dir()) {
+        return Err(NodeError::RootNotADirectory {
+            job,
+            root: root.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Whether nothing, not even a dangling link, is at `path`.
@@ -3945,5 +3954,37 @@ pub(crate) mod tests {
             pulled.lock().await.view(b.id),
             LeaseView::Owner(_)
         ));
+    }
+
+    /// A workspace root replaced with a link to another directory must not
+    /// be captured: the snapshot would publish, and replicate to every
+    /// peer, whatever the link names.
+    #[tokio::test]
+    async fn a_suspend_never_captures_through_a_root_that_is_a_link() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("private.txt"), "not the job's\n").unwrap();
+        let aside = dir.path().join("aside");
+        std::fs::rename(&root, &aside).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &root).unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let refused = node.suspend(id, &path, &mut Out::default()).await;
+        assert!(
+            matches!(&refused, Err(NodeError::RootNotADirectory { root: r, .. }) if *r == root),
+            "{refused:?}"
+        );
+        let job = node.job(id).await.unwrap();
+        assert!(
+            !job.lock()
+                .await
+                .ledger()
+                .records()
+                .iter()
+                .any(|r| matches!(r.event().kind, EventKind::SnapshotPublished { .. })),
+            "a snapshot was published through the link"
+        );
     }
 }

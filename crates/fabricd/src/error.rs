@@ -188,7 +188,7 @@ pub enum NodeError {
     },
     /// The workspace root is a link or a file, put there in place of the directory Fabric wrote.
     #[error(
-        "job {job}: {root} is not a directory but a link or a file, so nothing runs there; move it aside, then run `fabric job resume {job}`, which restores the latest snapshot when the workspace was clean"
+        "job {job}: {root} is not a directory but a link or a file, so nothing runs or is captured there; move it aside, then run `fabric job resume {job}`, which restores the latest snapshot when the workspace was clean"
     )]
     RootNotADirectory {
         /// The job.
