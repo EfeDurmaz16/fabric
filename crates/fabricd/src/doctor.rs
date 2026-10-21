@@ -142,14 +142,22 @@ fn row(
 pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row> {
     let mut rows = Vec::new();
     for fact in [name::USER, name::HOME] {
-        rows.push(row(
+        let mut row = row(
             fact,
             here,
             peer,
             Outcome::Refuse(Waiver::Never),
             "the root would differ and nothing rewrites paths in this phase (ADR 0011)",
-        ));
+        );
+        // Two absences compare equal, and prove nothing about the user.
+        if row.here.is_none() || row.peer.is_none() {
+            row.outcome = Outcome::Refuse(Waiver::Never);
+            "not measured, and the move needs it measured and equal on both nodes (ADR 0011)"
+                .clone_into(&mut row.note);
+        }
+        rows.push(row);
     }
+    rows.push(git_row(here, peer, ctx));
     rows.push(row(
         name::OS,
         here,
@@ -287,6 +295,34 @@ fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Ro
     rows
 }
 
+/// Every job's workspace is a repository and restore runs git, so a job
+/// moves only to a node whose daemon finds git; the versions may differ.
+fn git_row(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Row {
+    let target = match ctx.target {
+        Target::Peer => peer,
+        Target::Here => here,
+    };
+    let missing = target.get(name::GIT).is_none();
+    let (outcome, note) = match (missing, ctx.harness.is_some()) {
+        (false, _) => (Outcome::Equal, ""),
+        (true, true) => (
+            Outcome::Refuse(Waiver::Never),
+            "the target's daemon finds no git, and restore runs it for every job",
+        ),
+        (true, false) => (
+            Outcome::Warn,
+            "the target's daemon finds no git, so no job can move there",
+        ),
+    };
+    Row {
+        fact: name::GIT,
+        here: value(here, name::GIT),
+        peer: value(peer, name::GIT),
+        outcome,
+        note: note.to_owned(),
+    }
+}
+
 fn synced_row(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Row {
     let target = match ctx.target {
         Target::Peer => peer,
@@ -357,6 +393,7 @@ mod tests {
         NodeFacts::from_pairs([
             (name::USER, "efebarandurmaz"),
             (name::HOME, "/Users/efebarandurmaz"),
+            (name::GIT, "git version 2.54.0"),
             (name::OS, "macos"),
             (name::ARCH, "aarch64"),
             (name::PNPM, "11.23.0"),
@@ -559,5 +596,49 @@ mod tests {
             outcome_of(&compare(&pro(), &pro(), &context), "clock"),
             Outcome::Warn
         );
+    }
+
+    /// The user and the home must be measured and equal on both nodes. When
+    /// neither node could read its user name, the two absences are equal,
+    /// and two users with the same `HOME` string must still be refused.
+    #[test]
+    fn an_unmeasured_user_or_home_is_refused_even_on_both_sides() {
+        for fact in [name::USER, name::HOME] {
+            let here = with(&pro(), &[(fact, None)]);
+            for peer in [with(&pro(), &[(fact, None)]), pro()] {
+                let rows = compare(&here, &peer, &ctx(None));
+                assert_eq!(
+                    outcome_of(&rows, fact),
+                    Outcome::Refuse(Waiver::Never),
+                    "{fact}"
+                );
+                assert!(!blocking(&rows, true).is_empty(), "{fact}");
+            }
+        }
+    }
+
+    /// Every job's workspace is a repository, and restore runs git on the
+    /// target. A target whose daemon finds no git would take the job and
+    /// fail to restore it, so a move to it is refused, with no waiver.
+    #[test]
+    fn a_target_without_git_is_refused() {
+        let codex = HarnessKind::Codex;
+        let without = with(&pro(), &[(name::GIT, None)]);
+        let mut pull = ctx(Some(&codex));
+        pull.target = Target::Here;
+        for (here, peer, context, refused) in [
+            (&pro(), &without, ctx(Some(&codex)), true),
+            (&without, &pro(), pull.clone(), true),
+            (&without, &pro(), ctx(Some(&codex)), false),
+            (&pro(), &without, ctx(None), false),
+        ] {
+            let rows = compare(here, peer, &context);
+            assert_eq!(
+                outcome_of(&rows, name::GIT) == Outcome::Refuse(Waiver::Never),
+                refused,
+                "{:?}",
+                context.target
+            );
+        }
     }
 }

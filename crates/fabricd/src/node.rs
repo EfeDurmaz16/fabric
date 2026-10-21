@@ -74,7 +74,12 @@ pub struct Node {
     pub(crate) harness_config: HarnessConfig,
     control: Mutex<Option<UnixListener>>,
     pub(crate) recovered: tokio::sync::watch::Sender<bool>,
-    pub(crate) catching_up: Mutex<BTreeSet<NodeId>>,
+    /// Peers being caught up now, each with whether a session with it
+    /// began since, so its catch-up runs once more when it ends.
+    pub(crate) catching_up: Mutex<BTreeMap<NodeId, bool>>,
+    /// Peers whose session began while start-up recovery ran; recovery
+    /// catches up with each of them once it is done.
+    pub(crate) waiting_catch_up: Mutex<BTreeSet<NodeId>>,
     _lock: File,
 }
 
@@ -97,9 +102,7 @@ impl Node {
     /// Call it inside a tokio runtime: the transports and the socket register with it.
     pub fn start(cfg: NodeConfig) -> Result<Arc<Self>, NodeError> {
         let root = cfg.state.root();
-        fs::create_dir_all(root).map_err(|e| NodeError::io(root, e))?;
-        fs::set_permissions(root, fs::Permissions::from_mode(0o700))
-            .map_err(|e| NodeError::io(root, e))?;
+        prepare_state_dir(root)?;
         let lock_path = cfg.state.lock();
         let lock_file = File::create(&lock_path).map_err(|e| NodeError::io(&lock_path, e))?;
         match lock_file.try_lock() {
@@ -146,7 +149,8 @@ impl Node {
             harness_config,
             control: Mutex::new(Some(control)),
             recovered: tokio::sync::watch::Sender::new(false),
-            catching_up: Mutex::new(BTreeSet::new()),
+            catching_up: Mutex::new(BTreeMap::new()),
+            waiting_catch_up: Mutex::new(BTreeSet::new()),
             _lock: lock_file,
         });
         tracing::info!(node = %node.id, addr = ?node.local_addr().ok(), "node started");
@@ -378,6 +382,182 @@ fn open_store(dir: &std::path::Path) -> Result<Store, NodeError> {
     }
 }
 
+/// The names Fabric writes at the top of a state directory. `harness` is
+/// where the adapters keep departure records and the Claude config lock
+/// under `~/.fabric`, which is the state directory unless `FABRIC_HOME`
+/// names another.
+const STATE_ENTRIES: [&str; 10] = [
+    "daemon.lock",
+    "fabric.sock",
+    "harness",
+    "harness.toml",
+    "jobs",
+    "locks",
+    "node.key",
+    "peers",
+    "peers.lock",
+    "store",
+];
+
+/// Makes the state directory private to this user without taking over one
+/// it does not own.
+///
+/// A missing directory is created with mode 0700. An existing one must be
+/// this user's and must be the directory itself, not a link to one: whoever
+/// owns a link can point it elsewhere while the node runs, and the CLI
+/// refuses a linked state directory anyway. Every entry in it must be this
+/// user's too, whatever its mode: an entry another user made while others
+/// could write there, such as a `peers` book that pairs their node, stays
+/// theirs after the directory is narrowed, so a later start must not trust
+/// it either. When the directory lets others in, it is narrowed only if it
+/// holds nothing but what Fabric writes, so a `FABRIC_HOME` that names a
+/// shared directory, such as `/tmp` or a project, is refused and left as it
+/// was.
+fn prepare_state_dir(root: &std::path::Path) -> Result<(), NodeError> {
+    use std::os::unix::fs::MetadataExt;
+    // The components drop a trailing `/` or `/.`, which would make the
+    // look below follow a link at the end of the path.
+    let root: std::path::PathBuf = root.components().collect();
+    let root = root.as_path();
+    let meta = match fs::symlink_metadata(root) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match make_state_dir(root) {
+            Ok(()) => return Ok(()),
+            // Something took the name after the look: judge it as found.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                fs::symlink_metadata(root).map_err(|e| NodeError::io(root, e))?
+            }
+            Err(e) => return Err(NodeError::io(root, e)),
+        },
+        Err(e) => return Err(NodeError::io(root, e)),
+    };
+    let refuse = |reason: String| NodeError::UnsafeStateDir {
+        path: root.to_owned(),
+        reason,
+    };
+    let me = rustix::process::geteuid().as_raw();
+    if meta.uid() != me {
+        return Err(refuse(format!(
+            "belongs to user {}, not to you ({me}); choose a dedicated FABRIC_HOME",
+            meta.uid()
+        )));
+    }
+    if meta.file_type().is_symlink() {
+        return Err(refuse(
+            "is a symlink; set FABRIC_HOME to the directory itself".to_owned(),
+        ));
+    }
+    if !meta.is_dir() {
+        return Err(refuse(
+            "is not a directory; choose a dedicated FABRIC_HOME".to_owned(),
+        ));
+    }
+    adopt_state_dir(root, &meta, me)
+}
+
+/// Makes `root` a new directory with mode 0700, and its missing parents
+/// with it. `root` itself is made by a plain `mkdir`, which fails on any
+/// name already there, a link included, so a link made after the caller
+/// looked is never followed.
+fn make_state_dir(root: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    if let Some(parent) = root.parent() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+    fs::DirBuilder::new().mode(0o700).create(root)?;
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700))
+}
+
+/// Adopts `root`, a directory user `me` owns, whose metadata is `meta`.
+///
+/// One that others can write is narrowed before its entries are judged,
+/// so none of them can add an entry after the check, and it gets its mode
+/// back when it is refused. One that others can at most read is judged
+/// first, since only its owner can add to it.
+fn adopt_state_dir(root: &std::path::Path, meta: &fs::Metadata, me: u32) -> Result<(), NodeError> {
+    use std::os::unix::fs::MetadataExt;
+    let mode = meta.mode() & 0o777;
+    let others = mode & 0o077;
+    if others == 0 {
+        return judge_entries(root, me, None);
+    }
+    let narrow = || {
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700))
+            .map_err(|e| NodeError::io(root, e))
+    };
+    if others & 0o022 == 0 {
+        judge_entries(root, me, Some(mode))?;
+        return narrow();
+    }
+    narrow()?;
+    judge_entries(root, me, Some(mode)).inspect_err(|_| {
+        let was = fs::Permissions::from_mode(meta.mode() & 0o7777);
+        if let Err(e) = fs::set_permissions(root, was) {
+            tracing::warn!(path = %root.display(), error = %e, "the refused state directory keeps mode 700");
+        }
+    })
+}
+
+/// Refuses the first entry of `root` that is not user `me`'s, and, when
+/// the directory let others in with the mode in `shared`, the first one
+/// Fabric does not write.
+fn judge_entries(root: &std::path::Path, me: u32, shared: Option<u32>) -> Result<(), NodeError> {
+    use std::os::unix::fs::MetadataExt;
+    let refuse = |reason: String| NodeError::UnsafeStateDir {
+        path: root.to_owned(),
+        reason,
+    };
+    for entry in fs::read_dir(root).map_err(|e| NodeError::io(root, e))? {
+        let entry = entry.map_err(|e| NodeError::io(root, e))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // The entry itself, not where a link points: a link is its maker's.
+        let owner = match entry.metadata() {
+            Ok(meta) => meta.uid(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(NodeError::io(entry.path(), e)),
+        };
+        if owner != me {
+            return Err(refuse(format!(
+                "holds {name}, which belongs to user {owner}, not to you ({me}); remove it once you have checked what it holds, or choose a dedicated FABRIC_HOME"
+            )));
+        }
+        if let Some(mode) = shared
+            && !is_state_entry(&name)
+        {
+            return Err(refuse(format!(
+                "has mode {mode:o} and holds {name}, which Fabric did not write; secure it (chmod 700) or choose a dedicated FABRIC_HOME"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `name` is one of `STATE_ENTRIES`, a temporary file Fabric
+/// writes one of them through, or a log. Fabric writes no log itself, but
+/// a user who sends the daemon's output into the state directory, from a
+/// shell or a launchd job, makes the directory and the log before the
+/// first start.
+fn is_state_entry(name: &str) -> bool {
+    if std::path::Path::new(name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("log"))
+    {
+        return true;
+    }
+    STATE_ENTRIES.iter().any(|known| {
+        name == *known
+            || name
+                .strip_prefix(known)
+                .and_then(|rest| rest.strip_prefix('.'))
+                .and_then(|rest| rest.strip_suffix("tmp"))
+                .is_some_and(|middle| middle.ends_with('.'))
+    })
+}
+
 type Jobs = BTreeMap<JobId, Arc<tokio::sync::Mutex<Job>>>;
 
 fn load_jobs(state: &StateDir) -> Result<(Jobs, BTreeMap<JobId, String>), NodeError> {
@@ -420,5 +600,194 @@ impl Out {
     /// Adds a line.
     pub(crate) fn say(&mut self, line: impl Into<String>) {
         self.lines.push(line.into());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    fn mode(path: &std::path::Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A `FABRIC_HOME` typed at a shared directory must be refused, not
+    /// narrowed to 0700 under everyone who uses it.
+    #[test]
+    fn a_shared_directory_is_refused_and_left_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("project");
+        fs::create_dir(&shared).unwrap();
+        fs::write(shared.join("notes.txt"), "mine").unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+        let refused = prepare_state_dir(&shared);
+        assert!(
+            matches!(refused, Err(NodeError::UnsafeStateDir { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(mode(&shared), 0o755);
+    }
+
+    /// An entry another user made while they could write in the
+    /// directory, such as a `peers` book that pairs their node, is still
+    /// theirs once the directory is narrowed, so it is refused at every
+    /// start, not only at the one that narrowed it, and a directory others
+    /// can write keeps its mode. No test can make a file another user
+    /// owns, so the node is told it runs as the next user id.
+    #[test]
+    fn an_entry_another_user_owns_is_refused_whatever_the_mode() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        for was in [0o700, 0o750, 0o775, 0o777] {
+            let state = dir.path().join(format!("{was:o}"));
+            fs::create_dir(&state).unwrap();
+            fs::write(state.join("peers"), "").unwrap();
+            fs::set_permissions(&state, fs::Permissions::from_mode(was)).unwrap();
+            let meta = fs::metadata(&state).unwrap();
+            let other = meta.uid().wrapping_add(1);
+            let refused = adopt_state_dir(&state, &meta, other);
+            assert!(
+                matches!(&refused, Err(NodeError::UnsafeStateDir { reason, .. }) if reason.contains("holds peers, which belongs to user")),
+                "mode {was:o}: {refused:?}"
+            );
+            assert_eq!(mode(&state), was);
+        }
+    }
+
+    /// A directory others can write is narrowed first and then judged, so
+    /// one that holds only this user's own entries under Fabric's names is
+    /// adopted, as a `~/.fabric` made with umask 002 that holds the
+    /// `harness.toml` the user wrote before the first start.
+    #[test]
+    fn a_directory_others_can_write_is_adopted_when_every_entry_is_yours() {
+        let dir = tempfile::tempdir().unwrap();
+        let team = dir.path().join("team");
+        fs::create_dir(&team).unwrap();
+        fs::write(team.join("harness.toml"), "").unwrap();
+        fs::create_dir(team.join("harness")).unwrap();
+        fs::set_permissions(&team, fs::Permissions::from_mode(0o775)).unwrap();
+        prepare_state_dir(&team).unwrap();
+        assert_eq!(mode(&team), 0o700);
+        let empty = dir.path().join("empty");
+        fs::create_dir(&empty).unwrap();
+        fs::set_permissions(&empty, fs::Permissions::from_mode(0o777)).unwrap();
+        prepare_state_dir(&empty).unwrap();
+        assert_eq!(mode(&empty), 0o700);
+        let project = dir.path().join("project");
+        fs::create_dir(&project).unwrap();
+        fs::write(project.join("notes.txt"), "mine").unwrap();
+        fs::set_permissions(&project, fs::Permissions::from_mode(0o777)).unwrap();
+        let refused = prepare_state_dir(&project);
+        assert!(
+            matches!(refused, Err(NodeError::UnsafeStateDir { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(mode(&project), 0o777);
+    }
+
+    /// A user who keeps the daemon's output in the state directory, as
+    /// `fabric serve >>~/.fabric/daemon.log` or a launchd job whose log
+    /// path is there, makes the directory by hand before the first start,
+    /// so it holds the log, made by the shell or by launchd, and the
+    /// default mode.
+    #[test]
+    fn a_directory_that_holds_the_users_log_is_made_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("fabric");
+        fs::create_dir(&home).unwrap();
+        fs::write(home.join("harness.toml"), "").unwrap();
+        fs::write(home.join("daemon.log"), "").unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_state_dir(&home).unwrap();
+        assert_eq!(mode(&home), 0o700);
+    }
+
+    #[test]
+    fn a_new_or_fabric_only_directory_is_made_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("a/b/state");
+        prepare_state_dir(&fresh).unwrap();
+        assert_eq!(mode(&fresh), 0o700);
+        let made = dir.path().join("made");
+        fs::create_dir(&made).unwrap();
+        fs::write(made.join("harness.toml"), "").unwrap();
+        fs::write(made.join("peers.42.tmp"), "").unwrap();
+        // The adapters write here under `~/.fabric` whether or not a node
+        // ever ran with it as its state directory.
+        fs::create_dir_all(made.join("harness/locks")).unwrap();
+        fs::write(made.join("harness/locks/claude-config.lock"), "").unwrap();
+        fs::set_permissions(&made, fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_state_dir(&made).unwrap();
+        assert_eq!(mode(&made), 0o700);
+    }
+
+    /// A `FABRIC_HOME` that is a link is refused however it is spelled,
+    /// and the directory it names keeps its mode: whoever owns the link,
+    /// such as another user who planted it under `/tmp`, could point it
+    /// elsewhere while the node runs, and the CLI refuses a linked state
+    /// directory anyway.
+    #[test]
+    fn a_fabric_home_that_is_a_link_is_refused_and_its_target_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("harness.toml"), "").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("link")).unwrap();
+        for spelled in ["link", "link/", "link/."] {
+            let refused = prepare_state_dir(&dir.path().join(spelled));
+            assert!(
+                matches!(&refused, Err(NodeError::UnsafeStateDir { reason, .. }) if reason.contains("is a symlink")),
+                "{spelled}: {refused:?}"
+            );
+            assert_eq!(mode(&target), 0o755, "{spelled}");
+        }
+    }
+
+    /// A link that takes a missing state directory's name after the start
+    /// looked, as one another user plants under `/tmp`, makes the `mkdir`
+    /// fail instead of being followed, so the directory it names keeps
+    /// its mode.
+    #[test]
+    fn a_link_made_after_the_look_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let made = make_state_dir(&link).map_err(|e| e.kind());
+        assert_eq!(made, Err(std::io::ErrorKind::AlreadyExists));
+        assert_eq!(mode(&target), 0o755);
+    }
+
+    /// An entry that is a link is judged by who made the link, not by who
+    /// owns what it names, so a `peers` link another user planted that
+    /// names a file of this user's is still theirs. No test can make a
+    /// link another user owns, so the link names `/`, which root owns, and
+    /// the node is told it runs as root. Run as root, the test gives the
+    /// link to the next user id.
+    #[test]
+    fn a_state_entry_that_is_a_link_is_judged_as_itself() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        let target = std::path::Path::new("/");
+        let me = fs::metadata(target).unwrap().uid();
+        let peers = state.join("peers");
+        std::os::unix::fs::symlink(target, &peers).unwrap();
+        if fs::symlink_metadata(&peers).unwrap().uid() == me {
+            std::os::unix::fs::lchown(&peers, Some(me + 1), None).unwrap();
+        }
+        let meta = fs::metadata(&state).unwrap();
+        let refused = adopt_state_dir(&state, &meta, me);
+        assert!(
+            matches!(&refused, Err(NodeError::UnsafeStateDir { reason, .. }) if reason.contains("holds peers, which belongs to user")),
+            "{refused:?}"
+        );
     }
 }

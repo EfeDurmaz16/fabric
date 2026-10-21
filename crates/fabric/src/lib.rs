@@ -541,7 +541,7 @@ async fn launch(state: &StateDir, home: &Path, plan: &RunPlan, mode: Mode) -> Re
         // The protocol client holds an ACP agent's output.
         _ => None,
     };
-    let tree = materialize(state, &plan.root, notes)?;
+    let tree = prepare(state, home, plan, notes).await?;
     let socket = state.socket();
     let headless = matches!(mode, Mode::Headless(_));
     // Caught from just before the harness starts, so none is lost in
@@ -659,7 +659,15 @@ async fn register(socket: &Path, plan: &RunPlan, running: &Running, notes: Notes
     )
     .await;
     match registered {
-        Ok(Response::Done { lines }) => notes.print(&lines),
+        // The harness runs and is recorded, so nothing may end the
+        // supervision now: output that cannot be written, as when the
+        // reader of a pipe went away, is reported and the wait goes on.
+        Ok(Response::Done { lines }) => {
+            if let Err(e) = notes.print(&lines) {
+                tracing::warn!(error = %e, "the node's answer to the launch could not be printed");
+            }
+            Ok(())
+        }
         Ok(Response::Failed {
             lines,
             error,
@@ -927,6 +935,37 @@ fn print_turn(plan: &RunPlan, report: &TurnReport) -> Result<()> {
     Ok(())
 }
 
+/// Takes the tree lock and runs the setup steps, once the plan is known
+/// to hold, and returns the lock.
+async fn prepare(state: &StateDir, home: &Path, plan: &RunPlan, notes: Notes) -> Result<TreeLock> {
+    // The node captures and restores the harness's state under its home;
+    // a harness launched under another would keep its session elsewhere.
+    if plan.home != home {
+        bail!(
+            "the node runs with home {} and this command with home {}, so the harness would keep its session where the node never captures it; run the command with HOME={}",
+            plan.home.display(),
+            home.display(),
+            plan.home.display()
+        );
+    }
+    let tree = lock_tree(state, &plan.root)?;
+    // Another launch may have registered its harness and let the lock go
+    // since the plan was made; the node says so before any setup step
+    // writes to the tree.
+    ask(
+        &state.socket(),
+        Request::LaunchCheck {
+            job: plan.job,
+            epoch: plan.epoch,
+            head: plan.head,
+        },
+        notes,
+    )
+    .await?;
+    materialize(&tree, &plan.root, notes)?;
+    Ok(tree)
+}
+
 /// Tells the node the harness exited and picks the exit code: the harness's
 /// own, or 128 plus the signal that stopped it, with a line saying why;
 /// `passed_on` says fabric passed a signal of its own on to the harness.
@@ -973,15 +1012,14 @@ async fn exited(
     })
 }
 
-/// Runs the setup steps a restored workspace needs on this node (ADR 0007),
-/// printing each, and returns the tree lock it took.
+/// Takes the lock over the tree at `root` that setup steps and the launch run under.
 ///
 /// The caller holds the lock until the node has answered the harness's
 /// registration, so a second `run` or `resume` of the same workspace
 /// refuses with the lock's path from the setup steps until the first
 /// harness is recorded, and the node's own check refuses it after that.
-fn materialize(state: &StateDir, root: &Path, notes: Notes) -> Result<TreeLock> {
-    let lock = TreeLock::acquire(&state.tree_locks(), root).map_err(|e| match e {
+fn lock_tree(state: &StateDir, root: &Path) -> Result<TreeLock> {
+    TreeLock::acquire(&state.tree_locks(), root).map_err(|e| match e {
         // Another run or resume of this workspace is starting its harness:
         // the same state as a harness that runs, so the same exit code.
         MaterializeError::TreeBusy { .. } => anyhow::Error::new(Refused {
@@ -989,14 +1027,19 @@ fn materialize(state: &StateDir, root: &Path, notes: Notes) -> Result<TreeLock> 
             message: e.to_string(),
         }),
         e => e.into(),
-    })?;
+    })
+}
+
+/// Runs the setup steps a restored workspace needs on this node (ADR 0007),
+/// printing each, under `lock`.
+fn materialize(lock: &TreeLock, root: &Path, notes: Notes) -> Result<()> {
     let detected = fabric_env::detect::detect(root, &[])?;
-    let plan = fabric_env::materialize::plan(&detected, &lock, &NodeEnv::current())?;
+    let plan = fabric_env::materialize::plan(&detected, lock, &NodeEnv::current())?;
     if plan.is_noop() {
         // A declared variable is required even when no step runs, so a
         // warm node refuses the launch a cold node would (ADR 0007).
         plan.ready()?;
-        return Ok(lock);
+        return Ok(());
     }
     let mut lines = Vec::new();
     for cache in plan.caches() {
@@ -1012,8 +1055,8 @@ fn materialize(state: &StateDir, root: &Path, notes: Notes) -> Result<TreeLock> 
         lines.push(format!("setup: {} {}", step.program, args.join(" ")));
     }
     notes.print(&lines)?;
-    plan.ready()?.execute(&lock)?;
-    Ok(lock)
+    plan.ready()?.execute(lock)?;
+    Ok(())
 }
 
 /// A cache's state before the setup steps run, in words.
@@ -1103,13 +1146,88 @@ mod tests {
         .unwrap();
         let state =
             StateDir::resolve(Some(dir.path().join("state").as_os_str()), dir.path()).unwrap();
-        let Err(error) = materialize(&state, &root, Notes::Stdout) else {
+        let lock = lock_tree(&state, &root).unwrap();
+        let Err(error) = materialize(&lock, &root, Notes::Stdout) else {
             panic!("the launch went ahead");
         };
         let error = error.to_string();
         assert!(
             error.contains("FABRIC_TEST_VARIABLE_NO_ONE_SETS"),
             "{error}"
+        );
+    }
+
+    /// The node captures and restores harness state under its own home.
+    /// A CLI whose `HOME` resolves elsewhere, with the same `FABRIC_HOME`,
+    /// would launch the harness against its home, and the session would
+    /// sit where no suspend looks; the launch is refused before setup.
+    #[tokio::test]
+    async fn a_launch_under_another_home_than_the_nodes_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mine = dir.path().join("mine");
+        let state = StateDir::resolve(Some(dir.path().join("state").as_os_str()), &mine).unwrap();
+        let plan = RunPlan {
+            job: "01M5EBB2BWY97N3YEKD6CDN2EM".parse().unwrap(),
+            epoch: fabric_core::id::Epoch::FIRST,
+            head: fabric_core::id::RecordHash::of(b"a head"),
+            root: dir.path().join("work"),
+            harness: HarnessKind::Codex,
+            session: None,
+            goal: "goal".to_owned(),
+            harness_config: fabricd::harnesses::HarnessConfig::default(),
+            home: dir.path().join("the-nodes"),
+        };
+        let Err(error) = launch(&state, &mine, &plan, Mode::Interactive(None)).await else {
+            panic!("the launch went ahead");
+        };
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("the-nodes") && error.contains("mine"),
+            "{error}"
+        );
+    }
+
+    /// A plan can be overtaken between the node's answer and the tree lock:
+    /// another launch can register its harness and let the lock go. The
+    /// launch must ask the node again under the lock, before any setup step
+    /// writes to the tree. With no node to ask, it stops there, before the
+    /// declared variable it lacks is even looked at.
+    #[tokio::test]
+    async fn a_launch_asks_the_node_again_before_any_setup_step() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let root = dir.path().join("work");
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(
+            root.join(".fabric/env.toml"),
+            "env = [\"FABRIC_TEST_VARIABLE_NO_ONE_SETS\"]\n",
+        )
+        .unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = StateDir::resolve(Some(state_dir.as_os_str()), &home).unwrap();
+        let plan = RunPlan {
+            job: "01M5EBB2BWY97N3YEKD6CDN2EM".parse().unwrap(),
+            epoch: fabric_core::id::Epoch::FIRST,
+            head: fabric_core::id::RecordHash::of(b"a head"),
+            root,
+            harness: HarnessKind::Codex,
+            session: None,
+            goal: "goal".to_owned(),
+            harness_config: fabricd::harnesses::HarnessConfig::default(),
+            home: home.clone(),
+        };
+        let Err(error) = launch(&state, &home, &plan, Mode::Interactive(None)).await else {
+            panic!("the launch went ahead");
+        };
+        assert!(
+            matches!(
+                error.downcast_ref::<ControlError>(),
+                Some(ControlError::NoDaemon { .. })
+            ),
+            "{error:#}"
         );
     }
 }

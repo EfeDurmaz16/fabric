@@ -8,8 +8,11 @@
 //! refuses every command that would run the job from then on. The fork rule
 //! of ADR 0003 is not built, so a node keeps running a forked job only when
 //! the peer's epoch is lower. Catching up runs at start, whenever a session
-//! with a peer begins, and before a run; a peer that does not answer is
-//! skipped for the rest of a pass rather than dialled again for every job.
+//! with a peer begins, and before a run; a session that begins while the
+//! start-up pass runs is caught up when that pass ends, and one that begins
+//! while a catch-up of its peer runs makes that catch-up run once more. A
+//! peer that does not answer is skipped for the rest of a pass rather than
+//! dialled again for every job.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -94,7 +97,31 @@ impl Node {
                 tracing::info!(job = %id, "{line}");
             }
         }
-        self.recovered.send_replace(true);
+        self.end_recovery();
+    }
+
+    /// Marks start-up recovery done and catches up with every peer whose
+    /// session began while it ran, such as an addressless peer that dialed
+    /// in after recovery listed the reachable peers.
+    ///
+    /// A peer recovery already caught up with is caught up again. Its
+    /// catch-up may have ended before its session began, with a steal
+    /// written in between, and a session recovery's own dial opened looks
+    /// the same as a later one. The extra pass costs one pull per job.
+    ///
+    /// The flag is set under the same lock `spawn_catch_up` checks it
+    /// under, so a session that begins at any moment is either queued here
+    /// or caught up on its own, never neither. A catch-up of the same peer
+    /// that already runs then runs once more (`spawn_catch_up`).
+    pub(crate) fn end_recovery(self: &Arc<Self>) {
+        let waiting = {
+            let mut waiting = lock(&self.waiting_catch_up);
+            self.recovered.send_replace(true);
+            std::mem::take(&mut *waiting)
+        };
+        for peer in waiting {
+            self.spawn_catch_up(peer);
+        }
     }
 
     /// Whether the start-up recovery has run.
@@ -102,7 +129,8 @@ impl Node {
         *self.recovered.borrow()
     }
 
-    /// Pulls every job this node knows from `peer` and settles each one.
+    /// Pulls every job this node knows from `peer`, fetches its latest
+    /// snapshot when the store lacks it, and settles each one.
     ///
     /// It stops at the first failure to reach the peer, so an unreachable
     /// peer costs one dial per pass and not one per job. Any other failure
@@ -111,7 +139,14 @@ impl Node {
         let ids: Vec<JobId> = self.jobs.lock().await.keys().copied().collect();
         for id in ids {
             let mut out = Out::default();
-            match self.pull_records(id, peer).await {
+            // A pull, unlike a push, fetches no snapshot, and the next
+            // pull finds the ledger up to date; the latest snapshot is
+            // fetched here so the replica can restore or steal the job.
+            let caught_up = match self.pull_records(id, peer).await {
+                Ok(()) => self.ensure_latest(id, peer).await,
+                Err(e) => Err(e),
+            };
+            match caught_up {
                 Ok(()) => {}
                 Err(e @ (NodeError::Unreachable { .. } | NodeError::UnknownPeer(_))) => {
                     return Err(e);
@@ -129,18 +164,46 @@ impl Node {
     }
 
     /// Catches up with `peer` in the background once a session with it
-    /// begins, unless one already runs for it or start-up recovery, which
-    /// catches up with every peer, has not finished.
+    /// begins. While start-up recovery runs, the peer waits for it
+    /// instead, so the catch-up never acts on a ledger recovery has not
+    /// settled, and is not lost when recovery listed the reachable peers
+    /// before this session began.
+    ///
+    /// When a catch-up of the peer already runs, it runs once more when it
+    /// ends. It may have pulled a job before the peer wrote to it, or be
+    /// waiting on a session that died, which an addressless peer cannot be
+    /// dialled to replace.
     pub(crate) fn spawn_catch_up(self: &Arc<Self>, peer: NodeId) {
-        if !self.is_recovered() || !lock(&self.catching_up).insert(peer) {
-            return;
+        {
+            let mut waiting = lock(&self.waiting_catch_up);
+            if !self.is_recovered() {
+                waiting.insert(peer);
+                return;
+            }
+        }
+        {
+            let mut catching_up = lock(&self.catching_up);
+            if let Some(again) = catching_up.get_mut(&peer) {
+                *again = true;
+                return;
+            }
+            catching_up.insert(peer, false);
         }
         let node = Arc::clone(self);
         tokio::spawn(async move {
-            if let Err(e) = node.catch_up_peer(peer).await {
-                tracing::info!(%peer, error = %e, "did not catch up with the peer");
+            loop {
+                if let Err(e) = node.catch_up_peer(peer).await {
+                    tracing::info!(%peer, error = %e, "did not catch up with the peer");
+                }
+                let mut catching_up = lock(&node.catching_up);
+                match catching_up.get_mut(&peer) {
+                    Some(again) if *again => *again = false,
+                    _ => {
+                        catching_up.remove(&peer);
+                        return;
+                    }
+                }
             }
-            lock(&node.catching_up).remove(&peer);
         });
     }
 
@@ -238,12 +301,23 @@ impl Node {
     }
 
     /// Freezes `job`, whose lock the caller holds, and stops its harness.
+    ///
+    /// The fork rule is applied again under the lock: a steal or an import
+    /// since the caller read this node's epoch can carry it past the
+    /// peer's, and then the peer is the side that stops (`ForkBehind`).
     pub(crate) async fn freeze_locked(
         &self,
         job: &mut Job,
         fork: &ForkRecord,
         out: &mut Out,
     ) -> Result<(), NodeError> {
+        if fork.epoch < job.ledger().lease().epoch() {
+            return Err(NodeError::ForkBehind {
+                job: job.id(),
+                peer: fork.peer,
+                epoch: fork.epoch,
+            });
+        }
         if job.freeze(fork)? {
             out.say(format!(
                 "frozen: {}'s ledger at epoch {} does not continue this node's",
@@ -287,5 +361,33 @@ impl Node {
                 return Ok(epoch);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::node::Out;
+    use crate::ops::tests::{job, node, paired};
+    use crate::transfer::is_complete;
+
+    /// A replica that learned a suspend by a pull, with no push and so no
+    /// fetch, must fetch the snapshot at its next catch-up: the pull then
+    /// finds the ledger up to date, and without the snapshot the replica
+    /// cannot restore or steal the job once the owner is gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_catch_up_fetches_the_snapshot_a_pull_left_out() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let snapshot = a.suspend(id, &path, &mut Out::default()).await.unwrap();
+        b.pull_records(id, a.id).await.unwrap();
+        assert!(!is_complete(&b.store, snapshot).await.unwrap());
+        b.catch_up_peer(a.id).await.unwrap();
+        assert!(
+            is_complete(&b.store, snapshot).await.unwrap(),
+            "the catch-up left the replica without the latest snapshot"
+        );
     }
 }

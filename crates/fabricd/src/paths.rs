@@ -170,6 +170,12 @@ impl JobDir {
         self.dir.join("session")
     }
 
+    /// Every secret pattern the job's spec held at a capture on this node.
+    #[must_use]
+    pub fn secret_patterns(&self) -> PathBuf {
+        self.dir.join("secret-patterns")
+    }
+
     /// The fork record that freezes the job on this node.
     #[must_use]
     pub fn forked(&self) -> PathBuf {

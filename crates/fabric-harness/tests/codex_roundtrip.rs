@@ -12,7 +12,6 @@
 )]
 use std::ffi::OsString;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
@@ -22,6 +21,9 @@ use fabric_harness::codex::Codex;
 use fabric_harness::codex::overrides::{ApprovalPolicy, CodexOverrides, SandboxMode};
 use fabric_harness::manifest::StateManifest;
 use fabric_harness::{Harness, HarnessError, Launch, SessionId};
+
+mod executable;
+use executable::write_executable;
 
 const THREAD: &str = "019f233e-bb33-7342-85fa-f2d33b14368a";
 const PREFIX: &str = "019f1111-bb33-7342-85fa-f2d33b14368b";
@@ -117,14 +119,13 @@ fn fake_codex_reporting(dir: &Path, version: &str) -> (PathBuf, OsString) {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let script = bin.join("codex");
-    std::fs::write(
+    write_executable(
         &script,
         format!(
             "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"codex-cli {version}\"; exit 0 ;;\n  hold) sleep 60; exit 0 ;;\nesac\n{{ echo \"cwd=$(pwd -P)\"; for a in \"$@\"; do echo \"arg=$a\"; done; }} > \"$FAKE_LOG\"\n[ -z \"$FAKE_ENV_LOG\" ] || /usr/bin/env | cut -d= -f1 > \"$FAKE_ENV_LOG\"\n"
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        )
+        .as_bytes(),
+    );
     (script, bin.into_os_string())
 }
 

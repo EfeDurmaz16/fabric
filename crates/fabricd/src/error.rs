@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, JobId, MoveId, NodeId, SnapshotId};
 use fabric_core::lease::FenceError;
 use fabric_core::ledger::{LedgerError, StoreError as LedgerStoreError};
@@ -27,6 +28,14 @@ pub enum NodeError {
         /// The underlying error.
         #[source]
         source: std::io::Error,
+    },
+    /// The state directory, or an entry in it, is not this user's alone to take.
+    #[error("{path}: {reason}")]
+    UnsafeStateDir {
+        /// The directory.
+        path: PathBuf,
+        /// What is wrong with it.
+        reason: String,
     },
     /// Another daemon holds this state directory.
     #[error("another fabric daemon holds {0}")]
@@ -109,6 +118,34 @@ pub enum NodeError {
         /// The target of the move.
         target: NodeId,
     },
+    /// A resume under another harness ran while the move's preflight checked the target for the old one.
+    #[error(
+        "job {job} was resumed under {now} while the preflight checked {target} for {checked}, so nothing moved; run `fabric job move {job} --to {target}` again, which checks {now}"
+    )]
+    HarnessChangedDuringMove {
+        /// The job.
+        job: JobId,
+        /// The harness the preflight checked.
+        checked: Box<HarnessKind>,
+        /// The harness the job runs under now.
+        now: Box<HarnessKind>,
+        /// The target of the move.
+        target: NodeId,
+    },
+    /// The holder resumed under another harness after a pull's preflight checked this node for the old one.
+    #[error(
+        "job {job} was resumed under {now} on {holder} after the preflight checked this node for {checked}, so the move was aborted and {holder} keeps the job; run `fabric job resume {job}` again, which checks {now}"
+    )]
+    HarnessChangedDuringPull {
+        /// The job.
+        job: JobId,
+        /// The node that held the job.
+        holder: NodeId,
+        /// The harness the preflight checked.
+        checked: Box<HarnessKind>,
+        /// The harness the job runs under now.
+        now: Box<HarnessKind>,
+    },
     /// The workspace changed after the snapshot a move copied, by hand or by a harness Fabric did not start.
     #[error(
         "the workspace of job {job} at {root} changed after the snapshot {target} copied, so nothing moved; run `fabric job move {job} --to {target}` again, which captures the change"
@@ -161,6 +198,24 @@ pub enum NodeError {
         /// The epoch its marker was written at.
         epoch: Epoch,
     },
+    /// The workspace root is a link or a file, put there in place of the directory Fabric wrote.
+    #[error(
+        "job {job}: {root} is not a directory but a link or a file, so nothing runs or is captured there; move it aside, then run `fabric job resume {job}`, which restores the latest snapshot when the workspace was clean"
+    )]
+    RootNotADirectory {
+        /// The job.
+        job: JobId,
+        /// The root.
+        root: PathBuf,
+    },
+    /// The job's ledger moved past the head a run plan was made at, so the plan is stale.
+    #[error(
+        "job {job} changed after this launch was planned, by another run or resume, a suspend or a record from a peer, so nothing was launched; run the command again"
+    )]
+    PlanOvertaken {
+        /// The job.
+        job: JobId,
+    },
     /// The job has no workspace on this node.
     #[error("job {0} has no workspace on this node; run `fabric job resume {0}`")]
     NoWorkspace(JobId),
@@ -173,6 +228,20 @@ pub enum NodeError {
         what: &'static str,
         /// The command that finishes it.
         command: &'static str,
+    },
+    /// A process holds the workspace's tree lock: a run or a resume while
+    /// it runs setup steps or launches, or a process a setup step left
+    /// running with the lock as its input.
+    #[error(
+        "job {job}: nothing was captured, since a process holds {lock}, the lock over {root}: a `fabric job run` or `resume` running setup steps or launching, or a process a setup step left running, which holds it until it exits. `lsof {lock}` names it; try again once it is gone"
+    )]
+    SetupRunning {
+        /// The job.
+        job: JobId,
+        /// The root.
+        root: PathBuf,
+        /// The lock file its holder has open.
+        lock: PathBuf,
     },
     /// The job was never suspended, so there is no snapshot to restore or move.
     #[error("job {0} has no snapshot yet; suspend it on its owner first")]
@@ -254,6 +323,9 @@ pub enum NodeError {
     /// The workspace's environment could not be detected, so no node could materialize it.
     #[error("environment detection: {0}")]
     Detect(#[from] fabric_env::detect::DetectError),
+    /// The workspace's tree lock could not be taken.
+    #[error(transparent)]
+    Materialize(#[from] fabric_env::materialize::MaterializeError),
     /// Capture failed.
     #[error(transparent)]
     Capture(#[from] fabric_store::capture::CaptureError),
@@ -308,11 +380,16 @@ impl NodeError {
             NodeError::Unreachable { .. } | NodeError::UnknownPeer(_) => Refusal::Unreachable,
             NodeError::Preflight(_) | NodeError::StealNeedsForce(_) => Refusal::NeedsForce,
             NodeError::Unfinished { .. }
+            | NodeError::SetupRunning { .. }
             | NodeError::AlreadyRunningHarness { .. }
             | NodeError::RanDuringMove { .. }
+            | NodeError::HarnessChangedDuringMove { .. }
+            | NodeError::HarnessChangedDuringPull { .. }
             | NodeError::ChangedDuringMove { .. }
             | NodeError::WorkspaceOccupied { .. }
             | NodeError::NoWorkspace(_)
+            | NodeError::RootNotADirectory { .. }
+            | NodeError::PlanOvertaken { .. }
             | NodeError::StaleWorkspace { .. }
             | NodeError::NoSnapshot(_)
             | NodeError::HarnessGone { .. }

@@ -605,3 +605,63 @@ fn e2e_a_claude_job_launches_and_warns_while_another_claude_runs() -> Fallible {
     );
     Ok(())
 }
+
+/// A `job run` whose reader goes away once the plan is printed, as with a
+/// pipe into `head`, cannot print the node's answer to its registration.
+/// When the test closes the pipe only after that answer was written, it
+/// passes without reaching the fix; it never fails for timing.
+/// It must still supervise the harness it launched: wait for it, and tell
+/// the node when it exits, so the job is not left with a recorded harness
+/// nobody waits for.
+#[test]
+fn e2e_a_run_whose_output_closes_still_supervises_its_harness() -> Fallible {
+    use std::io::BufRead;
+
+    let p = setup(Wire::TcpTls, None, None)?;
+    let (job, _) = job_with_work(&p)?;
+    let pid_file = p.a.state().join("harness.pid");
+    let mut running = p.a.spawn_with(
+        &["job", "run", &job, "--prompt", "two"],
+        &[
+            ("FAKE_LINGER", std::path::Path::new("1")),
+            ("FAKE_PID_FILE", &pid_file),
+        ],
+    )?;
+    // The plan's last line names the session; the CLI writes every plan
+    // line before it launches, and nothing more until the node answers the
+    // registration. The pipe closes in that gap.
+    let mut plan = std::io::BufReader::new(running.stdout.take().ok_or("no stdout")?);
+    loop {
+        let mut line = String::new();
+        if plan.read_line(&mut line)? == 0 {
+            return Err("the CLI printed no session line".into());
+        }
+        if line.starts_with("continuing ") || line.starts_with("starting a new ") {
+            break;
+        }
+    }
+    drop(plan);
+    wait_for(&pid_file, "the harness launch")?;
+    let started = std::time::Instant::now();
+    while !p
+        .a
+        .ok(&["job", "status", &job])?
+        .contains("harness: running as pid")
+    {
+        assert!(started.elapsed() < GIVE_UP, "the harness never registered");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        running.try_wait()?.is_none(),
+        "the CLI stopped supervising once its output closed"
+    );
+    let pid: i32 = fs::read_to_string(&pid_file)?.trim().parse()?;
+    let pid = rustix::process::Pid::from_raw(pid).ok_or("no pid")?;
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
+    let output = finish(running, GIVE_UP)?;
+    assert_eq!(output.status.code(), Some(128 + 15), "{}", text(&output));
+    let status = p.a.ok(&["job", "status", &job])?;
+    assert!(status.contains("harness: not running"), "{status}");
+    Ok(())
+}

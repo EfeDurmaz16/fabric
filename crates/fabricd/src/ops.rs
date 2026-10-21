@@ -16,10 +16,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fabric_core::harness::HarnessKind;
-use fabric_core::id::{Epoch, JobId, NodeId, SnapshotId};
+use fabric_core::id::{Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::{FenceError, FencingToken};
 use fabric_core::ledger::{Author, EventKind, Ledger};
-use fabric_core::moves::{CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
+use fabric_core::moves::{AbortAnswer, CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
+use fabric_env::materialize::{MaterializeError, TreeLock};
 use fabric_harness::manifest::{MANIFEST_FILE, StateManifest};
 use fabric_harness::{HarnessError, SessionId};
 use fabric_net::peers::HostPort;
@@ -30,7 +31,7 @@ use fabric_net::wire::{
 use fabric_store::capture::{CaptureRequest, capture};
 use fabric_store::policy::IgnorePolicy;
 use fabric_store::restore::{
-    Durability, RestoreRequest, RestoreState, Verify, restore, restore_state,
+    Durability, RestoreError, RestoreRequest, RestoreState, Verify, restore, restore_state,
 };
 
 use crate::clock;
@@ -144,6 +145,9 @@ impl Node {
             } => {
                 self.harness_started(job, epoch, pid, harness, session, out)
                     .await?;
+            }
+            Request::LaunchCheck { job, epoch, head } => {
+                self.launch_check(job, epoch, head).await?;
             }
             Request::HarnessExited { job, pid } => self.harness_exited(job, pid).await?,
             Request::HarnessSession(named) => self.harness_session(named, out).await?,
@@ -263,24 +267,8 @@ impl Node {
         let root = paths::job_root(&self.cfg.home, id);
         let synced = synced_folders(&self.cfg.home, &self.cfg.path_var).await;
         check_root(&root, &self.cfg.home, synced)?;
-        let parent = root
-            .parent()
-            .ok_or_else(|| NodeError::io(&root, std::io::Error::other("a root needs a parent")))?;
-        crate::durable::create_dir(parent).map_err(|e| NodeError::io(parent, e))?;
-        let cloned = tokio::process::Command::new("git")
-            .args(["clone", "--quiet", "--"])
-            .arg(repo)
-            .arg(&root)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .await
-            .map_err(|e| NodeError::io(repo, e))?;
-        if !cloned.status.success() {
-            return Err(NodeError::io(
-                repo,
-                std::io::Error::other(String::from_utf8_lossy(&cloned.stderr).trim().to_owned()),
-            ));
-        }
+        // Built before the clone: a goal past the record bound refuses
+        // here, not after a clone that no job and no printed id names.
         let created = Ledger::created(
             id,
             goal,
@@ -290,6 +278,35 @@ impl Node {
             clock::now_ms(),
         )
         .map_err(fabric_core::ledger::LedgerError::from)?;
+        let parent = root
+            .parent()
+            .ok_or_else(|| NodeError::io(&root, std::io::Error::other("a root needs a parent")))?;
+        // The workspace holds what the agent writes, ignored secrets
+        // included; its job directory is this user's alone.
+        crate::durable::create_private_dir(parent).map_err(|e| NodeError::io(parent, e))?;
+        // From here on, a failure leaves no job and no printed id that
+        // names the directory, so it goes; its id is fresh, so nothing
+        // else is in it.
+        let discard = |e: NodeError| {
+            if let Err(left) = std::fs::remove_dir_all(parent) {
+                tracing::warn!(path = %parent.display(), error = %left, "a failed job new left its directory");
+            }
+            e
+        };
+        let cloned = tokio::process::Command::new("git")
+            .args(["clone", "--quiet", "--"])
+            .arg(repo)
+            .arg(&root)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .await
+            .map_err(|e| discard(NodeError::io(repo, e)))?;
+        if !cloned.status.success() {
+            return Err(discard(NodeError::io(
+                repo,
+                std::io::Error::other(String::from_utf8_lossy(&cloned.stderr).trim().to_owned()),
+            )));
+        }
         let job = Job::create_owned(
             id,
             self.cfg.state.job(id),
@@ -299,7 +316,8 @@ impl Node {
                 state: MarkerState::Live,
                 epoch: Epoch::FIRST,
             },
-        )?;
+        )
+        .map_err(discard)?;
         self.jobs
             .lock()
             .await
@@ -332,7 +350,7 @@ impl Node {
                 "{} {word} epoch {} {}",
                 job.id(),
                 manifest.lease.epoch(),
-                manifest.goal
+                summary(&manifest.goal)
             ));
         }
         for (id, error) in self.broken_jobs() {
@@ -402,6 +420,10 @@ impl Node {
                     record.pid
                 ),
                 Liveness::Gone => "harness: not running".to_owned(),
+                Liveness::Unknown => format!(
+                    "harness: pid {} leads a process group and its start time could not be read, so whether it is still the harness is not known",
+                    record.pid
+                ),
             },
             None => "harness: not running".to_owned(),
         };
@@ -492,9 +514,47 @@ impl Node {
             token.epoch,
             marker.root,
             None,
-            &self.harness_config,
+            (&self.harness_config, &self.cfg.home),
             out,
         )
+    }
+
+    /// Refuses a launch whose plan no longer holds: the node no longer owns
+    /// the job at the plan's epoch, records a harness that still runs, or
+    /// holds records past the head the plan was made at.
+    ///
+    /// The CLI asks under the tree lock, before any setup step. A launch of
+    /// the same workspace registers its harness, appending `Resumed`, before
+    /// it lets the lock go, so a plan this passes was not overtaken by one,
+    /// even by one whose harness already exited.
+    pub(crate) async fn launch_check(
+        &self,
+        id: JobId,
+        epoch: Epoch,
+        head: RecordHash,
+    ) -> Result<(), NodeError> {
+        let job = self.job(id).await?;
+        let job = job.lock().await;
+        let token = owner_token(&job, self.id)?;
+        if token.epoch != epoch {
+            return Err(FenceError::StaleEpoch {
+                yours: epoch,
+                current: token.epoch,
+            }
+            .into());
+        }
+        if let Some(record) = job.harness_record()?
+            && record.liveness().await != Liveness::Gone
+        {
+            return Err(NodeError::AlreadyRunningHarness {
+                job: id,
+                pid: record.pid.get(),
+            });
+        }
+        if job.ledger().head() != head {
+            return Err(NodeError::PlanOvertaken { job: id });
+        }
+        Ok(())
     }
 
     /// Records the harness the CLI launched and appends `Resumed`, or refuses.
@@ -698,6 +758,15 @@ impl Node {
                 command: "resume",
             });
         }
+        // The CLI holds the tree's lock from its first setup step until
+        // the harness it launched is recorded, and a setup step holds it
+        // while it runs, so neither shows as a harness to stop. Taking the
+        // lock refuses a capture of a tree an installer is still writing,
+        // and holding it to the end keeps a run from starting setup while
+        // the capture reads. A link at the root would lock, capture and
+        // replicate whatever it names, so it is refused first.
+        refuse_replaced_root(id, &marker.root)?;
+        let _tree = self.lock_tree(id, &marker.root)?;
         if let Some(record) = job.harness_record()? {
             if record.liveness().await != Liveness::Gone {
                 out.say(format!("stopping the harness, pid {}", record.pid));
@@ -754,6 +823,24 @@ impl Node {
             job.ledger().lease().epoch()
         ));
         Ok(snapshot)
+    }
+
+    /// Takes the lock `fabric job run` and `resume` hold over the tree at
+    /// `root` while they run setup steps and launch; `None` when the root is
+    /// gone, since nothing can run setup in it.
+    fn lock_tree(&self, job: JobId, root: &Path) -> Result<Option<TreeLock>, NodeError> {
+        if !root.exists() {
+            return Ok(None);
+        }
+        match TreeLock::acquire(&self.cfg.state.tree_locks(), root) {
+            Ok(lock) => Ok(Some(lock)),
+            Err(MaterializeError::TreeBusy { lock }) => Err(NodeError::SetupRunning {
+                job,
+                root: root.to_owned(),
+                lock,
+            }),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Tells the adapter that the snapshot holding its capture is published,
@@ -817,7 +904,15 @@ impl Node {
         // A workspace whose environment does not detect here would not
         // materialize on the target either, so the snapshot is refused
         // before it is published or moved.
-        let detection = fabric_env::detect::detect(root, &[])?;
+        // A pattern the job ever added stays: removing its line from
+        // `.fabric/env.toml` does not remove it (ADR 0007, Secrets).
+        let recorded: Vec<fabric_core::secret::SecretPattern> =
+            local::read(&job.dir().secret_patterns())?.unwrap_or_default();
+        let detection = fabric_env::detect::detect(root, &recorded)?;
+        local::write(
+            &job.dir().secret_patterns(),
+            &detection.spec().secret_patterns,
+        )?;
         let keys = MeasuredKeys::new(facts, Some(&detection));
         let secret_patterns: Vec<String> = detection
             .spec()
@@ -860,9 +955,7 @@ impl Node {
             "snapshot {snapshot}: {} files, {} bytes, {} new objects",
             report.files, report.bytes, report.new_objects
         ));
-        for path in report.denied.iter().chain(&report.denied_untracked) {
-            out.say(format!("left behind (secret pattern): {path}"));
-        }
+        report_capture(&report, out);
         Ok(snapshot)
     }
 
@@ -1042,7 +1135,7 @@ impl Node {
         self.push_records(id, to).await?;
         out.say(format!("{to} holds the ledger and the snapshot"));
 
-        let offer = self.depart(id, to, out).await?;
+        let offer = self.depart(id, to, &harness, out).await?;
         faults::hit(Point::AfterDepartingWrite).await;
         let Some(offer) = offer else {
             return Err(NodeError::Peer {
@@ -1059,16 +1152,28 @@ impl Node {
     ///
     /// The job's lock was released while the target copied it, so a run
     /// may have started here since: what was copied is then out of date,
-    /// and the job stays here. A move already open toward `to` is offered
-    /// again as it is; one toward another node refuses with that node.
+    /// and the job stays here. The same holds for a resume under another
+    /// harness than `checked`, the one the preflight checked the target
+    /// for. A move already open toward `to` is offered again as it is; one
+    /// toward another node refuses with that node.
     async fn depart(
         &self,
         id: JobId,
         to: NodeId,
+        checked: &HarnessKind,
         out: &mut Out,
     ) -> Result<Option<MoveOffer>, NodeError> {
         let job = self.job(id).await?;
         let mut job = job.lock().await;
+        // A catch-up may have frozen the job while the target copied it;
+        // the target must not import and run a frozen chain.
+        if let Some(fork) = job.forked()? {
+            return Err(NodeError::Forked {
+                job: id,
+                peer: fork.peer,
+                epoch: fork.epoch,
+            });
+        }
         // Another move, typed at the same time, may have departed toward
         // another node while the target copied the job.
         if let LeaseView::Departing { move_id, target } = job.view(self.id)
@@ -1085,6 +1190,14 @@ impl Node {
             if suspended.is_none() {
                 return Err(NodeError::RanDuringMove {
                     job: id,
+                    target: to,
+                });
+            }
+            if job.harness() != checked {
+                return Err(NodeError::HarnessChangedDuringMove {
+                    job: id,
+                    checked: Box::new(checked.clone()),
+                    now: Box::new(job.harness().clone()),
                     target: to,
                 });
             }
@@ -1331,7 +1444,7 @@ impl Node {
         if let LeaseView::Departed { epoch, .. } | LeaseView::Replica { epoch, .. } = view
             && let Some(marker) = job.reconcile_marker()?
             && matches!(marker.state, MarkerState::Clean { .. })
-            && (marker.root.symlink_metadata().is_err() || marker.is_unchanged().await)
+            && (is_missing(&marker.root)? || marker.is_unchanged().await)
         {
             let dest =
                 paths::departed_copy(&marker.root, epoch).ok_or_else(|| no_parent(&marker.root))?;
@@ -1408,7 +1521,10 @@ impl Node {
                 out,
             )
             .await?;
-            self.pull(id, holder, out).await?;
+            // With no harness named, the job's own launches, and the pull
+            // must still find the one the preflight checked.
+            self.pull(id, holder, harness.is_none().then_some(&kind), out)
+                .await?;
         }
         let job = self.job(id).await?;
         let mut job = job.lock().await;
@@ -1424,14 +1540,27 @@ impl Node {
                 pid: record.pid.get(),
             });
         }
-        plan(&job, token.epoch, root, harness, &self.harness_config, out)
+        plan(
+            &job,
+            token.epoch,
+            root,
+            harness,
+            (&self.harness_config, &self.cfg.home),
+            out,
+        )
     }
 
     /// The pull form of the move: fetch, ask the owner to start a move toward this node, decide it here.
+    ///
+    /// `checked` is the harness the preflight checked this node for, when
+    /// the job's own harness will launch. The holder may have resumed under
+    /// another one after that check and before it suspended for the move;
+    /// the move is then aborted, and the holder keeps the job.
     async fn pull(
         self: &Arc<Self>,
         id: JobId,
         holder: NodeId,
+        checked: Option<&HarnessKind>,
         out: &mut Out,
     ) -> Result<(), NodeError> {
         out.say(format!("pulling job {id} from {holder}"));
@@ -1467,58 +1596,43 @@ impl Node {
         self.pull_records(id, holder).await?;
         self.ensure_latest(id, holder).await?;
         faults::hit(Point::BeforeImport).await;
-        {
+        let changed = {
             let job = self.job(id).await?;
             let mut job = job.lock().await;
-            let ledger = job.ledger();
-            let snapshot = ledger
-                .manifest()
-                .latest_snapshot
-                .ok_or(NodeError::NoSnapshot(id))?;
-            let offer = MoveOffer {
-                job_id: id,
-                move_id,
-                head: ledger.head(),
-                snapshot,
-            };
-            let answer = ledger.answer_offer(
-                self.id,
-                &offer,
-                ledger.lease().epoch(),
-                Some(CompleteSnapshot::new(snapshot)),
-                clock::event_id(),
-                clock::now_ms(),
-            )?;
-            match answer {
-                OfferAnswer::Import(record) => job.commit(record, Author::Node(self.id))?,
-                OfferAnswer::Decided(_) => {}
-                OfferAnswer::Rejected { head } => {
-                    return Err(NodeError::Peer {
-                        peer: holder,
-                        reason: format!(
-                            "its move does not link to this node's head {head}; run the resume again"
-                        ),
-                    });
+            // The records hold the holder's `MoveStarted`, after which it
+            // runs nothing, so the harness they name is the one to launch.
+            // A move this node already decided is left to `import`.
+            if let Some(checked) = checked
+                && job.harness() != checked
+                && job.ledger().decision_for(move_id).is_none()
+            {
+                let change = (checked.clone(), job.harness().clone());
+                if let AbortAnswer::Abort(record) = job.ledger().answer_abort(
+                    self.id,
+                    move_id,
+                    clock::event_id(),
+                    clock::now_ms(),
+                )? {
+                    job.commit(record, Author::Node(self.id))?;
                 }
-                OfferAnswer::SnapshotIncomplete { snapshot } => {
-                    return Err(NodeError::Peer {
-                        peer: holder,
-                        reason: format!(
-                            "snapshot {snapshot} did not arrive whole; run the resume again"
-                        ),
-                    });
-                }
-                OfferAnswer::Stale { current, .. } => {
-                    return Err(NodeError::Peer {
-                        peer: holder,
-                        reason: format!("the move is at an epoch behind {current}"),
-                    });
-                }
+                Some(change)
+            } else {
+                self.import(&mut job, holder, move_id, out)?;
+                None
             }
-            out.say(format!(
-                "imported move {move_id}; this node owns the job at epoch {}",
-                job.ledger().lease().epoch()
-            ));
+        };
+        if let Some((checked, now)) = changed {
+            if let Err(e) = self.push_records(id, holder).await {
+                out.say(format!(
+                    "{holder} has not seen the abort yet ({e}); it will ask for the decision"
+                ));
+            }
+            return Err(NodeError::HarnessChangedDuringPull {
+                job: id,
+                holder,
+                checked: Box::new(checked),
+                now: Box::new(now),
+            });
         }
         // The holder learns the decision now, or from MoveStatus later.
         if let Err(e) = self.push_records(id, holder).await {
@@ -1526,6 +1640,67 @@ impl Node {
                 "{holder} has not seen the import yet ({e}); it will ask for the decision"
             ));
         }
+        Ok(())
+    }
+
+    /// Imports the open move `move_id` from `holder` into `job`, whose lock the caller holds.
+    fn import(
+        &self,
+        job: &mut Job,
+        holder: NodeId,
+        move_id: MoveId,
+        out: &mut Out,
+    ) -> Result<(), NodeError> {
+        let id = job.id();
+        let ledger = job.ledger();
+        let snapshot = ledger
+            .manifest()
+            .latest_snapshot
+            .ok_or(NodeError::NoSnapshot(id))?;
+        let offer = MoveOffer {
+            job_id: id,
+            move_id,
+            head: ledger.head(),
+            snapshot,
+        };
+        let answer = ledger.answer_offer(
+            self.id,
+            &offer,
+            ledger.lease().epoch(),
+            Some(CompleteSnapshot::new(snapshot)),
+            clock::event_id(),
+            clock::now_ms(),
+        )?;
+        match answer {
+            OfferAnswer::Import(record) => job.commit(record, Author::Node(self.id))?,
+            OfferAnswer::Decided(_) => {}
+            OfferAnswer::Rejected { head } => {
+                return Err(NodeError::Peer {
+                    peer: holder,
+                    reason: format!(
+                        "its move does not link to this node's head {head}; run the resume again"
+                    ),
+                });
+            }
+            OfferAnswer::SnapshotIncomplete { snapshot } => {
+                return Err(NodeError::Peer {
+                    peer: holder,
+                    reason: format!(
+                        "snapshot {snapshot} did not arrive whole; run the resume again"
+                    ),
+                });
+            }
+            OfferAnswer::Stale { current, .. } => {
+                return Err(NodeError::Peer {
+                    peer: holder,
+                    reason: format!("the move is at an epoch behind {current}"),
+                });
+            }
+        }
+        out.say(format!(
+            "imported move {move_id}; this node owns the job at epoch {}",
+            job.ledger().lease().epoch()
+        ));
         Ok(())
     }
 
@@ -1714,13 +1889,21 @@ impl Node {
             job.clear_harness_state()?;
             local::remove(&job.dir().session())?;
         }
+        // The marker says `Restoring` from before the staging directory
+        // exists, so a tree here may be another process's, written into
+        // the empty root after a kill. Only the snapshot's own tree, which
+        // the restore renamed into place before a kill took the marker's
+        // last write, is accepted.
+        if resuming && state == RestoreState::Present && !self.holds(snapshot, &root).await? {
+            return Err(NodeError::WorkspaceOccupied { root });
+        }
         job.set_marker(&Marker {
             root: root.clone(),
             state: MarkerState::Restoring { snapshot },
             epoch,
         })?;
         if let Some(parent) = root.parent() {
-            crate::durable::create_dir(parent).map_err(|e| NodeError::io(parent, e))?;
+            crate::durable::create_private_dir(parent).map_err(|e| NodeError::io(parent, e))?;
         }
         let has_harness_state = !manifest.harness_state.entries.is_empty();
         let state_dir = job.dir().harness_state();
@@ -1746,6 +1929,31 @@ impl Node {
             epoch,
         })?;
         Ok(root)
+    }
+
+    /// Whether the tree at `root` holds every file of `snapshot` outside
+    /// its caches, read back against the store.
+    async fn holds(&self, snapshot: SnapshotId, root: &Path) -> Result<bool, NodeError> {
+        let root = root.to_owned();
+        with_store(
+            &self.store,
+            move |store| match fabric_store::restore::verify(
+                store,
+                snapshot,
+                &root,
+                Verify::All,
+                &|_| false,
+            ) {
+                Ok(_) => Ok(true),
+                Err(
+                    RestoreError::VerifyFailed { .. }
+                    | RestoreError::Git(_)
+                    | RestoreError::Write(_),
+                ) => Ok(false),
+                Err(e) => Err(e.into()),
+            },
+        )
+        .await
     }
 
     /// The marker of a workspace this tenure, at `epoch`, can continue, or
@@ -1879,9 +2087,12 @@ impl Node {
         force: bool,
         out: &mut Out,
     ) -> Result<(), NodeError> {
-        let (owner, complete) = {
+        // One hold of the job's lock from the fork check to the commit: a
+        // catch-up waiting for it could otherwise freeze the job, or move
+        // it to another owner, after the check and before the steal.
+        let owner = {
             let job = self.job(id).await?;
-            let job = job.lock().await;
+            let mut job = job.lock().await;
             // A frozen chain pushed at a higher epoch would freeze the job
             // on the real owner too, for good.
             if let Some(fork) = job.forked()? {
@@ -1895,11 +2106,8 @@ impl Node {
             let complete = is_complete(&self.store, latest)
                 .await?
                 .then_some(CompleteSnapshot::new(latest));
-            (job.ledger().lease().holder(), complete)
-        };
-        {
-            let job = self.job(id).await?;
-            let mut job = job.lock().await;
+            // The holder the steal takes the job from, who must learn of it.
+            let owner = job.ledger().lease().holder();
             let proposal = job.ledger().steal(
                 self.id,
                 reason,
@@ -1925,7 +2133,8 @@ impl Node {
                 job.ledger().lease().epoch()
             ));
             self.settle(&mut job, out).await?;
-        }
+            owner
+        };
         if let Err(e) = self.push_records(id, owner).await {
             out.say(format!("{owner} has not seen the steal yet: {e}"));
         }
@@ -2088,15 +2297,19 @@ fn owner_token(job: &Job, me: NodeId) -> Result<FencingToken, NodeError> {
 /// The workspace is marked live before the plan leaves the node: from here
 /// on a harness may write to it, so a move refuses to depart from the
 /// snapshot it was copying and a departed copy is never moved aside as if
-/// it held nothing new.
+/// it held nothing new. The plan carries the node's harness configuration
+/// and home, so the CLI launches under what the node captures with.
 fn plan(
     job: &Job,
     epoch: Epoch,
     root: PathBuf,
     harness: Option<HarnessKind>,
-    harness_config: &HarnessConfig,
+    (harness_config, home): (&HarnessConfig, &Path),
     out: &mut Out,
 ) -> Result<RunPlan, NodeError> {
+    // The CLI resolves a link at the root and would run setup and the
+    // harness in whatever it names, so only a real directory is handed out.
+    refuse_replaced_root(job.id(), &root)?;
     job.set_marker(&Marker {
         root: root.clone(),
         state: MarkerState::Live,
@@ -2123,17 +2336,21 @@ fn plan(
     Ok(RunPlan {
         job: job.id(),
         epoch,
+        head: job.ledger().head(),
         root,
+        harness_config: harness_config.for_harness(&harness),
         harness,
         session,
         goal: job.ledger().manifest().goal.clone(),
-        harness_config: harness_config.clone(),
+        home: home.to_owned(),
     })
 }
 
-/// Says, one line per cache, whether its bytes are written here or rebuilt, and why (ADR 0008).
+/// Says, one line per cache, whether its bytes are written here or rebuilt,
+/// and why (ADR 0008); past `REPORT_PATHS` caches it counts the rest, so a
+/// resume's answer stays within one control message.
 fn report_caches(caches: &[fabric_core::snapshot::CacheEntry], facts: &NodeFacts, out: &mut Out) {
-    for cache in caches {
+    for cache in caches.iter().take(REPORT_PATHS) {
         let mine = facts.key_like(&cache.key);
         if cache.key.matches(&mine) && cache.carry == fabric_core::snapshot::CarryState::Carried {
             out.say(format!("{}: carried, the keys match", cache.path));
@@ -2145,6 +2362,114 @@ fn report_caches(caches: &[fabric_core::snapshot::CacheEntry], facts: &NodeFacts
             ));
         }
     }
+    if caches.len() > REPORT_PATHS {
+        out.say(format!(
+            "{} more caches, each carried where the keys match and rebuilt here otherwise",
+            caches.len() - REPORT_PATHS
+        ));
+    }
+}
+
+/// The longest goal summary `job ls` prints, in characters.
+const SUMMARY_CHARS: usize = 72;
+
+/// A goal's first line, cut to `SUMMARY_CHARS`, so that a list of goals
+/// up to the record bound each still fits in one control answer.
+fn summary(goal: &str) -> String {
+    let first = goal.lines().next().unwrap_or_default();
+    match first.char_indices().nth(SUMMARY_CHARS) {
+        Some((cut, _)) => format!("{}...", &first[..cut]),
+        None if first.len() < goal.len() => format!("{first} ..."),
+        None => first.to_owned(),
+    }
+}
+
+/// How many paths or keys of one kind a suspend names before it counts the rest.
+const REPORT_PATHS: usize = 20;
+
+/// Says, one line per path or config key, what the snapshot carries that
+/// a secret pattern matches, what of the workspace and the harness state it
+/// leaves out, and what of the repository's config it changed or left out.
+fn report_capture(report: &fabric_store::capture::CaptureReport, out: &mut Out) {
+    let denied: Vec<_> = report
+        .denied
+        .iter()
+        .chain(&report.denied_untracked)
+        .collect();
+    say_each(out, "left behind (secret pattern)", &denied);
+    say_each(
+        out,
+        "left behind (secret pattern, harness state)",
+        &report.denied_harness,
+    );
+    say_each(
+        out,
+        "travels in the snapshot though a secret pattern matches it (tracked)",
+        &report.tracked_secrets,
+    );
+    say_each(
+        out,
+        "travels in the snapshot though a secret pattern matches it (stashed)",
+        &report.stashed_secrets,
+    );
+    say_each(
+        out,
+        "left behind (not a file, link or directory)",
+        &report.special_files,
+    );
+    say_each(
+        out,
+        "left behind (not a file, link or directory, harness state)",
+        &report.special_harness,
+    );
+    // In a repository the whole nested tree stays; in a plain directory
+    // its files travel and only its `.git` stays.
+    let nested = if report.bundle.is_some() {
+        "left behind (nested repository)"
+    } else {
+        "left behind (the .git of a nested repository)"
+    };
+    say_each(out, nested, &report.nested_repositories);
+    say_each(
+        out,
+        "left behind (the .git of a nested repository, harness state)",
+        &report.nested_harness,
+    );
+    say_each(
+        out,
+        "travels without its user info (git config)",
+        &report.stripped_userinfo,
+    );
+    say_each(
+        out,
+        "travels with its last value only (git config)",
+        &report.repeated_config,
+    );
+    say_each(out, "left behind (git config)", &report.dropped_config);
+}
+
+/// One line per item under `words`, the first `REPORT_PATHS` of them, then
+/// one that counts the rest, so a suspend's answer stays within one control
+/// message however many paths a workspace holds.
+fn say_each<T: std::fmt::Display>(out: &mut Out, words: &str, items: &[T]) {
+    for item in items.iter().take(REPORT_PATHS) {
+        out.say(format!("{words}: {item}"));
+    }
+    if items.len() > REPORT_PATHS {
+        out.say(format!("{words}: {} more", items.len() - REPORT_PATHS));
+    }
+}
+
+/// Refuses a root that exists and is not a directory, such as a link put
+/// in place of the directory Fabric wrote; a missing root is left to the caller.
+fn refuse_replaced_root(job: JobId, root: &Path) -> Result<(), NodeError> {
+    if std::fs::symlink_metadata(root).is_ok_and(|meta| !meta.is_dir()) {
+        return Err(NodeError::RootNotADirectory {
+            job,
+            root: root.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Whether nothing, not even a dangling link, is at `path`.
@@ -2174,8 +2499,11 @@ fn unused(base: &Path) -> PathBuf {
 }
 
 /// Renames the workspace at `root` to `dest` durably; false when there is no workspace at `root`.
+///
+/// Only a root that is not there counts as no workspace: one that cannot
+/// be looked at, behind a parent without search permission, is an error.
 fn move_aside(root: &Path, dest: &Path) -> Result<bool, NodeError> {
-    if !root.exists() {
+    if is_missing(root)? {
         return Ok(false);
     }
     let parent = dest.parent().ok_or_else(|| no_parent(dest))?;
@@ -2357,6 +2685,16 @@ pub(crate) mod tests {
 
     /// A job made from a one-commit repository, owned by `node` at epoch 1.
     pub(crate) async fn job(dir: &Path, node: &Arc<Node>) -> JobId {
+        let repo = repo(dir);
+        let mut out = Out::default();
+        node.job_new(&repo, "goal".to_owned(), HarnessKind::Codex, &mut out)
+            .await
+            .unwrap();
+        out.lines[0].parse().unwrap()
+    }
+
+    /// A one-commit repository at `dir/repo`.
+    fn repo(dir: &Path) -> PathBuf {
         let repo = dir.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::write(repo.join("README.md"), "hello\n").unwrap();
@@ -2382,11 +2720,7 @@ pub(crate) mod tests {
                 .unwrap();
             assert!(status.success());
         }
-        let mut out = Out::default();
-        node.job_new(&repo, "goal".to_owned(), HarnessKind::Codex, &mut out)
-            .await
-            .unwrap();
-        out.lines[0].parse().unwrap()
+        repo
     }
 
     fn sleeper() -> std::process::Child {
@@ -2414,7 +2748,7 @@ pub(crate) mod tests {
     }
 
     /// Serves `a` and `b` and pairs them, each with the other's address.
-    async fn paired(a: &Arc<Node>, b: &Arc<Node>) {
+    pub(crate) async fn paired(a: &Arc<Node>, b: &Arc<Node>) {
         for (node, peer) in [(a, b), (b, a)] {
             tokio::spawn(Arc::clone(node).run());
             let addr = peer.local_addr().unwrap().to_string();
@@ -2472,7 +2806,7 @@ pub(crate) mod tests {
         std::fs::write(thief_root.join("thief.txt"), "b's work\n").unwrap();
         b.suspend(id, &path, out).await.unwrap();
 
-        a.pull(id, b.id, out).await.unwrap();
+        a.pull(id, b.id, None, out).await.unwrap();
         let job = a.job(id).await.unwrap();
         let mut job = job.lock().await;
         let epoch = owner_token(&job, a.id).unwrap().epoch;
@@ -2560,6 +2894,209 @@ pub(crate) mod tests {
         ));
     }
 
+    /// An addressless peer can dial in after start-up recovery listed the
+    /// reachable peers and before it ended. That session must still be
+    /// caught up once recovery ends: a record the peer wrote while this
+    /// node was away, such as a steal, would otherwise stay unknown here
+    /// until the next session or job command.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_that_begins_during_recovery_is_caught_up_after_it() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        a.recovered().await;
+        b.recovered().await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let out = &mut Out::default();
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &path, out).await.unwrap();
+        b.pull_records(id, a.id).await.unwrap();
+        b.ensure_latest(id, a.id).await.unwrap();
+        b.job_steal(id, "a sleeps".to_owned(), true, out)
+            .await
+            .unwrap();
+        // The steal reached a; this record, which b does not push, did not.
+        b.job_decide(id, Decision::Approve, "", out).await.unwrap();
+        let head = |node: Arc<Node>| async move {
+            node.job(id).await.unwrap().lock().await.ledger().head()
+        };
+        let want = head(Arc::clone(&b)).await;
+        assert_ne!(head(Arc::clone(&a)).await, want);
+
+        // a restarts: recovery runs, and b's session begins after
+        // recovery listed the peers it would catch up with.
+        a.recovered.send_replace(false);
+        let kept = b.open_session(a.id).unwrap();
+        b.forget(a.id, &kept);
+        b.node_ping(a.id, out).await.unwrap();
+        a.end_recovery();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while head(Arc::clone(&a)).await != want {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a never caught up with the session b opened during recovery"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Start-up recovery catches each peer up on a task of its own, so it
+    /// can be done with one peer while another holds the pass open. A
+    /// session that peer begins after its catch-up must be caught up when
+    /// the pass ends, or a record it wrote in between, such as a steal,
+    /// stays unknown here while this node's stale harness runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_recovery_caught_up_is_caught_up_again_for_a_later_session() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        let (_dir_c, c) = node();
+        paired(&a, &b).await;
+        tokio::spawn(Arc::clone(&c).run());
+        for (node, peer) in [(&a, &c), (&c, &a)] {
+            let addr = peer.local_addr().unwrap().to_string();
+            node.node_add(peer.id, Some(&addr), &mut Out::default())
+                .await
+                .unwrap();
+        }
+        for node in [&a, &b, &c] {
+            node.recovered().await;
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let out = &mut Out::default();
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &path, out).await.unwrap();
+        b.pull_records(id, a.id).await.unwrap();
+        c.pull_records(id, a.id).await.unwrap();
+        b.ensure_latest(id, a.id).await.unwrap();
+        b.job_steal(id, "a sleeps".to_owned(), true, out)
+            .await
+            .unwrap();
+        let head = |node: Arc<Node>| async move {
+            node.job(id).await.unwrap().lock().await.ledger().head()
+        };
+        let wait_for = |want, what: &'static str| {
+            let a = Arc::clone(&a);
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                while head(Arc::clone(&a)).await != want {
+                    assert!(tokio::time::Instant::now() < deadline, "{what}");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        };
+
+        // a restarts. c answers no pull while the test holds its job, so
+        // the pass stays open after it caught up with b.
+        a.recovered.send_replace(false);
+        let c_job = c.job(id).await.unwrap();
+        let c_paused = c_job.lock().await;
+        b.job_decide(id, Decision::Approve, "before", out)
+            .await
+            .unwrap();
+        let recovery = tokio::spawn(Arc::clone(&a).recover());
+        wait_for(
+            head(Arc::clone(&b)).await,
+            "recovery did not catch up with b",
+        )
+        .await;
+
+        // b writes a record a does not have, then begins a new session.
+        b.job_decide(id, Decision::Approve, "after", out)
+            .await
+            .unwrap();
+        let want = head(Arc::clone(&b)).await;
+        let kept = b.open_session(a.id).unwrap();
+        b.forget(a.id, &kept);
+        b.node_ping(a.id, out).await.unwrap();
+        drop(c_paused);
+        recovery.await.unwrap();
+        assert!(a.is_recovered());
+        wait_for(
+            want,
+            "a never caught up with the session b began after its catch-up",
+        )
+        .await;
+    }
+
+    /// A session can begin while a catch-up of the same peer still runs and
+    /// has gone past the job the peer then wrote to, as when the peer
+    /// changed networks and dialed in again. That catch-up must run once
+    /// more when it ends, or a steal the peer wrote in between stays
+    /// unknown here until the next session while this node's stale
+    /// harness runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_that_begins_during_a_catch_up_of_its_peer_is_caught_up_after_it() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        a.recovered().await;
+        b.recovered().await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let out = &mut Out::default();
+        let mut ids = [
+            job(&dir_a.path().join("one"), &a).await,
+            job(&dir_a.path().join("two"), &a).await,
+        ];
+        // A catch-up pulls the jobs in this order.
+        ids.sort();
+        let [first, second] = ids;
+        for id in ids {
+            a.suspend(id, &path, out).await.unwrap();
+            b.pull_records(id, a.id).await.unwrap();
+        }
+        b.ensure_latest(first, a.id).await.unwrap();
+        b.job_steal(first, "a sleeps".to_owned(), true, out)
+            .await
+            .unwrap();
+        let head = |node: Arc<Node>| async move {
+            node.job(first).await.unwrap().lock().await.ledger().head()
+        };
+        let wait_for = |want, what: &'static str| {
+            let a = Arc::clone(&a);
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                while head(Arc::clone(&a)).await != want {
+                    assert!(tokio::time::Instant::now() < deadline, "{what}");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !crate::node::lock(&a.catching_up).is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the catch-ups the pairing began did not end"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // a catches up with b, which answers no pull of the second job
+        // while the test holds it, so the pass stays open after the first.
+        b.job_decide(first, Decision::Approve, "before", out)
+            .await
+            .unwrap();
+        let b_second = b.job(second).await.unwrap();
+        let b_paused = b_second.lock().await;
+        a.spawn_catch_up(b.id);
+        wait_for(head(Arc::clone(&b)).await, "a did not catch up with b").await;
+
+        // b writes a record a does not have, then begins a new session.
+        b.job_decide(first, Decision::Approve, "after", out)
+            .await
+            .unwrap();
+        let want = head(Arc::clone(&b)).await;
+        let kept = b.open_session(a.id).unwrap();
+        b.forget(a.id, &kept);
+        b.node_ping(a.id, out).await.unwrap();
+        drop(b_paused);
+        wait_for(
+            want,
+            "a never caught up with the session b began during its catch-up",
+        )
+        .await;
+    }
+
     /// Two moves typed at once toward different nodes: the second finds the
     /// job departing toward the first's target and must name that node,
     /// not offer the first move to its own.
@@ -2570,8 +3107,12 @@ pub(crate) mod tests {
         let path = std::env::var_os("PATH").unwrap_or_default();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         let (first, second) = (NodeId::from_bytes([7; 32]), NodeId::from_bytes([8; 32]));
-        node.depart(id, first, &mut Out::default()).await.unwrap();
-        let refused = node.depart(id, second, &mut Out::default()).await;
+        node.depart(id, first, &HarnessKind::Codex, &mut Out::default())
+            .await
+            .unwrap();
+        let refused = node
+            .depart(id, second, &HarnessKind::Codex, &mut Out::default())
+            .await;
         assert!(
             matches!(refused, Err(NodeError::Departing { target, .. }) if target == first),
             "{refused:?}"
@@ -2596,9 +3137,14 @@ pub(crate) mod tests {
         let id = job(dir.path(), &node).await;
         let path = std::env::var_os("PATH").unwrap_or_default();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
-        node.depart(id, NodeId::from_bytes([7; 32]), &mut Out::default())
-            .await
-            .unwrap();
+        node.depart(
+            id,
+            NodeId::from_bytes([7; 32]),
+            &HarnessKind::Codex,
+            &mut Out::default(),
+        )
+        .await
+        .unwrap();
         let mut out = Out::default();
         node.job_status(id, &mut out).await.unwrap();
         let line = out
@@ -2718,6 +3264,96 @@ pub(crate) mod tests {
         );
     }
 
+    /// `fabric job run` holds the tree's lock from its setup steps until
+    /// the harness it launched is recorded, so no harness shows yet. A
+    /// suspend in that window must refuse, not publish a tree an installer
+    /// is still writing.
+    #[tokio::test]
+    async fn a_suspend_refuses_while_setup_holds_the_tree() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        let setup = TreeLock::acquire(&node.cfg.state.tree_locks(), &root).unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let refused = node.suspend(id, &path, &mut Out::default()).await;
+        assert!(
+            matches!(refused, Err(NodeError::SetupRunning { .. })),
+            "{refused:?}"
+        );
+        // A process a setup step left running can hold the lock for good,
+        // so the refusal names the file `lsof` finds it by.
+        let lock = std::fs::read_dir(node.cfg.state.tree_locks())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let said = refused.unwrap_err().to_string();
+        assert!(said.contains(&lock.display().to_string()), "{said}");
+        assert_eq!(node.job(id).await.unwrap().lock().await.latest(), None);
+        drop(setup);
+        // A child another test forked while the lock was held keeps a copy
+        // of its descriptor, and so the lock, until that child execs.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match node.suspend(id, &path, &mut Out::default()).await {
+                Err(NodeError::SetupRunning { .. }) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                done => {
+                    done.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// A suspend holds the tree lock from before it stops the harness
+    /// until the snapshot is recorded, so a `fabric job run` that starts
+    /// meanwhile refuses instead of running setup steps under the capture.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_suspend_holds_the_tree_lock_while_it_stops_the_harness() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        node.job_run(id, &mut Out::default()).await.unwrap();
+        // Once asked to stop, the harness says so and takes two seconds to exit.
+        let asked = dir.path().join("asked");
+        let harness = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"trap 'touch "$0"; sleep 2; exit 0' TERM; while :; do sleep 0.05; done"#)
+            .arg(&asked)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        register(&node, id, pid(&harness)).await.unwrap();
+        let reaper = std::thread::spawn(move || {
+            let mut harness = harness;
+            harness.wait()
+        });
+        let suspending = tokio::spawn({
+            let node = Arc::clone(&node);
+            async move { node.suspend(id, &path, &mut Out::default()).await }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !asked.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the suspend never asked the harness to stop"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let root = paths::job_root(&node.cfg.home, id);
+        let setup = TreeLock::acquire(&node.cfg.state.tree_locks(), &root);
+        assert!(
+            matches!(setup, Err(MaterializeError::TreeBusy { .. })),
+            "a run took the tree while the suspend stopped its harness: {setup:?}"
+        );
+        suspending.await.unwrap().unwrap();
+        reaper.join().unwrap().unwrap();
+    }
+
     /// A clean workspace deleted by hand is restored by the next resume,
     /// not handed to the CLI as a root that does not exist.
     #[tokio::test]
@@ -2754,6 +3390,7 @@ pub(crate) mod tests {
         let sent: RunPlan = postcard::from_bytes(&postcard::to_stdvec(&plan).unwrap()).unwrap();
         assert_eq!(sent.harness_config, node.harness_config);
         assert!(sent.harness_config.acp.is_empty());
+        assert_eq!(sent.home, node.cfg.home);
     }
 
     /// A peer paired without an address, as the Air pairs the Pro, is
@@ -2957,6 +3594,34 @@ pub(crate) mod tests {
         assert!(lines.last().unwrap().starts_with("   5 epoch"));
     }
 
+    /// A secret pattern removed from `.fabric/env.toml` still keeps its
+    /// matches on the node at the next capture.
+    #[tokio::test]
+    async fn a_removed_secret_pattern_still_applies() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(
+            root.join(".fabric/env.toml"),
+            "secret_patterns = [\"*.sqlite\"]\n",
+        )
+        .unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        std::fs::write(root.join(".fabric/env.toml"), "").unwrap();
+        std::fs::write(root.join("users.sqlite"), "rows\n").unwrap();
+        let mut out = Out::default();
+        node.suspend(id, &path, &mut out).await.unwrap();
+        assert!(
+            out.lines
+                .iter()
+                .any(|line| line == "left behind (secret pattern): users.sqlite"),
+            "{:?}",
+            out.lines
+        );
+    }
+
     #[test]
     fn an_age_reads_in_the_largest_whole_unit() {
         assert_eq!(age(59_000), "less than a minute old");
@@ -3005,5 +3670,771 @@ pub(crate) mod tests {
                 .any(|r| matches!(r.event().kind, EventKind::Resumed { .. })),
             "Resumed was appended for a harness nobody supervises"
         );
+    }
+
+    /// A goal past the ledger's record bound still fits in a control
+    /// message, so it reaches the node. The node must refuse it before it
+    /// clones: once the record fails, no job and no id point at the clone.
+    #[tokio::test]
+    async fn a_goal_too_large_for_a_record_is_refused_before_the_clone() {
+        let (dir, node) = node();
+        let repo = repo(dir.path());
+        let goal = "x".repeat(fabric_core::ledger::MAX_RECORD_LEN);
+        let refused = node
+            .job_new(&repo, goal, HarnessKind::Codex, &mut Out::default())
+            .await;
+        assert!(matches!(refused, Err(NodeError::Ledger(_))), "{refused:?}");
+        let jobs = node.cfg.home.join("fabric").join("jobs");
+        let left: Vec<PathBuf> = std::fs::read_dir(&jobs)
+            .map(|dir| dir.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "the clone stayed behind: {left:?}");
+    }
+
+    /// A departed clean copy that cannot be looked at, here because its
+    /// parent lost search permission, is still there. Settling must fail
+    /// and keep the marker, not take the copy for gone and forget it: a
+    /// later resume would then find the root occupied by files no marker
+    /// names.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_copy_that_cannot_be_looked_at_keeps_its_marker() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &path, &mut Out::default()).await.unwrap();
+        b.pull_records(id, a.id).await.unwrap();
+        b.ensure_latest(id, a.id).await.unwrap();
+        let root = paths::job_root(&a.cfg.home, id);
+        let parent = root.parent().unwrap().to_owned();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        b.job_steal(id, "a sleeps".to_owned(), true, &mut Out::default())
+            .await
+            .unwrap();
+        a.settle_job(id, &mut Out::default()).await.unwrap_err();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        a.settle_job(id, &mut Out::default()).await.unwrap();
+        let departed = paths::departed_copy(&root, Epoch::new(2).unwrap()).unwrap();
+        assert!(
+            departed.join("README.md").is_file() && !root.exists(),
+            "the copy stayed in the root with no marker"
+        );
+    }
+
+    /// A catch-up can freeze the job while a move's target copies it. The
+    /// move must not then commit `MoveStarted` on the frozen chain, which
+    /// the target would import and run.
+    #[tokio::test]
+    async fn a_move_does_not_depart_from_a_job_frozen_while_it_was_copied() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        node.freeze(
+            id,
+            &crate::local::ForkRecord {
+                peer: NodeId::from_bytes([8; 32]),
+                epoch: Epoch::FIRST,
+                head: fabric_core::id::RecordHash::of(b"their head"),
+            },
+            &mut Out::default(),
+        )
+        .await
+        .unwrap();
+        let refused = node
+            .depart(
+                id,
+                NodeId::from_bytes([7; 32]),
+                &HarnessKind::Codex,
+                &mut Out::default(),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(NodeError::Forked { .. })),
+            "{refused:?}"
+        );
+        let job = node.job(id).await.unwrap();
+        assert!(
+            !job.lock()
+                .await
+                .ledger()
+                .records()
+                .iter()
+                .any(|r| matches!(r.event().kind, EventKind::MoveStarted { .. })),
+            "MoveStarted was appended on a frozen chain"
+        );
+    }
+
+    /// A catch-up that waits for the job's lock while a steal checks the
+    /// fork can freeze the job between the steal's check and its commit.
+    /// The steal must not then append a new epoch on the frozen chain.
+    /// The lock is fair, so a freeze queued behind the steal runs at the
+    /// steal's first release of the lock.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_steal_appends_nothing_after_a_freeze_it_did_not_see() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &path, &mut Out::default()).await.unwrap();
+        b.pull_records(id, a.id).await.unwrap();
+        b.ensure_latest(id, a.id).await.unwrap();
+        let job = b.job(id).await.unwrap();
+        let held = job.lock().await;
+        let thief = Arc::clone(&b);
+        let steal = tokio::spawn(async move {
+            thief
+                .job_steal(id, "a sleeps".to_owned(), true, &mut Out::default())
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let frozen_job = Arc::clone(&job);
+        let a_id = a.id;
+        let freeze = tokio::spawn(async move {
+            let job = frozen_job.lock().await;
+            job.freeze(&crate::local::ForkRecord {
+                peer: a_id,
+                epoch: Epoch::new(2).unwrap(),
+                head: fabric_core::id::RecordHash::of(b"a head"),
+            })
+            .unwrap();
+            job.ledger().records().len()
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(held);
+        let at_freeze = freeze.await.unwrap();
+        let stolen = steal.await.unwrap();
+        let after = job.lock().await.ledger().records().len();
+        assert_eq!(
+            after, at_freeze,
+            "the steal appended to the chain after it was frozen ({stolen:?})"
+        );
+    }
+
+    /// A `resume --harness` can register another harness while a move's
+    /// preflight checks the target for the old one. The move must not then
+    /// hand the job, now under the new harness, to a target never checked
+    /// for it.
+    #[tokio::test]
+    async fn a_move_does_not_depart_under_a_harness_its_preflight_did_not_check() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let harness = sleeper();
+        node.harness_started(
+            id,
+            Epoch::FIRST,
+            pid(&harness),
+            HarnessKind::ClaudeCode,
+            None,
+            &mut Out::default(),
+        )
+        .await
+        .unwrap();
+        let reaper = std::thread::spawn(move || {
+            let mut harness = harness;
+            harness.wait()
+        });
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        reaper.join().unwrap().unwrap();
+        let refused = node
+            .depart(
+                id,
+                NodeId::from_bytes([7; 32]),
+                &HarnessKind::Codex,
+                &mut Out::default(),
+            )
+            .await;
+        assert!(
+            matches!(
+                &refused,
+                Err(NodeError::HarnessChangedDuringMove { checked, now, .. })
+                    if **checked == HarnessKind::Codex && **now == HarnessKind::ClaudeCode
+            ),
+            "{refused:?}"
+        );
+        let job = node.job(id).await.unwrap();
+        assert!(
+            !job.lock()
+                .await
+                .ledger()
+                .records()
+                .iter()
+                .any(|r| matches!(r.event().kind, EventKind::MoveStarted { .. })),
+            "MoveStarted was appended under an unchecked harness"
+        );
+    }
+
+    /// A clean workspace whose root was replaced with a link to another
+    /// directory is not missing, so a resume does not restore it. Neither
+    /// a run nor a resume may then hand out the root: the CLI resolves the
+    /// link and would run setup and the harness in the other directory.
+    #[tokio::test]
+    async fn a_root_replaced_with_a_link_is_never_launched_in() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let root = paths::job_root(&node.cfg.home, id);
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::rename(&root, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &root).unwrap();
+        let resumed = node
+            .job_resume(id, None, None, false, &path, &mut Out::default())
+            .await;
+        assert!(
+            matches!(&resumed, Err(NodeError::RootNotADirectory { root: r, .. }) if *r == root),
+            "{resumed:?}"
+        );
+        let ran = node.job_run(id, &mut Out::default()).await;
+        assert!(
+            matches!(&ran, Err(NodeError::RootNotADirectory { .. })),
+            "{ran:?}"
+        );
+    }
+
+    /// A restore that died after its marker said `Restoring` and before
+    /// it wrote anything leaves the root empty, and another process can
+    /// fill it before the next resume. The resume must not take those
+    /// files for the restored snapshot; a tree the restore did finish,
+    /// before a kill took the marker's last write, is still accepted.
+    #[tokio::test]
+    async fn a_resumed_restore_accepts_only_the_snapshots_own_tree() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let root = paths::job_root(&node.cfg.home, id);
+        let job = node.job(id).await.unwrap();
+        let mut job = job.lock().await;
+        let restoring = Marker {
+            root: root.clone(),
+            state: MarkerState::Restoring {
+                snapshot: job.latest().unwrap(),
+            },
+            epoch: Epoch::FIRST,
+        };
+
+        job.set_marker(&restoring).unwrap();
+        let restored = node
+            .restore_if_needed(&mut job, Epoch::FIRST, &path, &mut Out::default())
+            .await;
+        assert_eq!(
+            restored.unwrap(),
+            root,
+            "the snapshot's own tree was refused"
+        );
+
+        let theirs = dir.path().join("theirs");
+        std::fs::rename(&root, &theirs).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("README.md"), "not the job's\n").unwrap();
+        job.set_marker(&restoring).unwrap();
+        let refused = node
+            .restore_if_needed(&mut job, Epoch::FIRST, &path, &mut Out::default())
+            .await;
+        assert!(
+            matches!(&refused, Err(NodeError::WorkspaceOccupied { root: r }) if *r == root),
+            "{refused:?}"
+        );
+        assert!(matches!(
+            job.marker().unwrap().unwrap().state,
+            MarkerState::Restoring { .. }
+        ));
+    }
+
+    /// A suspend must say what its snapshot carries that a secret pattern
+    /// matches, and what of the workspace it leaves out: a tracked `.env`
+    /// travels in the bundle, and a nested repository stays behind.
+    /// Before, only ignored and untracked secrets were named.
+    #[tokio::test]
+    async fn a_suspend_names_tracked_secrets_and_nested_repositories() {
+        let (dir, node) = node();
+        let repo = repo(dir.path());
+        std::fs::write(repo.join(".env"), "TOKEN=x\n").unwrap();
+        for args in [
+            &["add", "-f", ".env"][..],
+            &[
+                "-c",
+                "user.name=f",
+                "-c",
+                "user.email=f@x",
+                "commit",
+                "-qm",
+                "2",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let mut out = Out::default();
+        node.job_new(&repo, "goal".to_owned(), HarnessKind::Codex, &mut out)
+            .await
+            .unwrap();
+        let id: JobId = out.lines[0].parse().unwrap();
+        let root = paths::job_root(&node.cfg.home, id);
+        std::fs::create_dir(root.join("vendored")).unwrap();
+        let made = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root.join("vendored"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut out = Out::default();
+        node.suspend(id, &path, &mut out).await.unwrap();
+        for wanted in [
+            "travels in the snapshot though a secret pattern matches it (tracked): .env",
+            "left behind (nested repository): vendored",
+        ] {
+            assert!(
+                out.lines.iter().any(|line| line == wanted),
+                "no line {wanted:?} in {:?}",
+                out.lines
+            );
+        }
+    }
+
+    /// Goals near the record bound, five of them, add up past the control
+    /// message cap. `job ls` must still answer: it names each goal by a
+    /// short summary, and `job status` shows one goal whole.
+    #[tokio::test]
+    async fn a_job_list_fits_one_answer_whatever_the_goals() {
+        let (dir, node) = node();
+        let repo = repo(dir.path());
+        let goal = format!("first line\n{}", "x".repeat(900 << 10));
+        for _ in 0..5 {
+            node.job_new(&repo, goal.clone(), HarnessKind::Codex, &mut Out::default())
+                .await
+                .unwrap();
+        }
+        let mut out = Out::default();
+        node.job_list(&mut out).await;
+        assert_eq!(out.lines.len(), 5);
+        let bytes: usize = out.lines.iter().map(String::len).sum();
+        assert!(
+            bytes < crate::control::MAX_CONTROL_MESSAGE,
+            "{bytes} bytes of lines"
+        );
+        assert!(
+            out.lines
+                .iter()
+                .all(|line| line.ends_with(" first line ...")),
+            "{:?}",
+            out.lines
+        );
+    }
+
+    /// Two runs can both get a plan before either launches. Once the first
+    /// registered its harness and let the tree lock go, the second must be
+    /// refused before its setup steps run in the workspace the first
+    /// harness writes to.
+    #[tokio::test]
+    async fn a_plan_another_launch_overtook_is_refused_before_setup() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let first = node.job_run(id, &mut Out::default()).await.unwrap();
+        let second = node.job_run(id, &mut Out::default()).await.unwrap();
+        node.launch_check(id, first.epoch, first.head)
+            .await
+            .unwrap();
+        let mut harness = sleeper();
+        register(&node, id, pid(&harness)).await.unwrap();
+        let refused = node.launch_check(id, second.epoch, second.head).await;
+        assert!(
+            matches!(refused, Err(NodeError::AlreadyRunningHarness { pid: p, .. }) if p == harness.id()),
+            "{refused:?}"
+        );
+        harness.kill().unwrap();
+        harness.wait().unwrap();
+    }
+
+    /// A workspace holds what the agent writes there, ignored secrets
+    /// included, so the job directory that holds it is this user's alone,
+    /// whether `job new` made it or a restore did.
+    #[tokio::test]
+    async fn a_job_directory_is_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        let parent = root.parent().unwrap().to_owned();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&parent), 0o700, "job new");
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        std::fs::remove_dir_all(&parent).unwrap();
+        node.job_resume(id, None, None, false, &path, &mut Out::default())
+            .await
+            .unwrap();
+        assert!(root.join("README.md").is_file());
+        assert_eq!(mode(&parent), 0o700, "restore");
+    }
+
+    /// A pull checks this node for the harness the job will launch. A
+    /// `resume --harness` on the holder can register another harness after
+    /// that check and before the holder suspends for the move, and the
+    /// pulled records then name it. The pull must abort the move, leaving
+    /// the job with the holder, not import it under a harness never checked
+    /// here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pull_aborts_when_the_holder_changed_harness_after_the_check() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let harness = sleeper();
+        a.harness_started(
+            id,
+            Epoch::FIRST,
+            pid(&harness),
+            HarnessKind::ClaudeCode,
+            None,
+            &mut Out::default(),
+        )
+        .await
+        .unwrap();
+        let reaper = std::thread::spawn(move || {
+            let mut harness = harness;
+            harness.wait()
+        });
+        let pulled = b
+            .pull(id, a.id, Some(&HarnessKind::Codex), &mut Out::default())
+            .await;
+        reaper.join().unwrap().unwrap();
+        assert!(
+            matches!(
+                &pulled,
+                Err(NodeError::HarnessChangedDuringPull { checked, now, .. })
+                    if **checked == HarnessKind::Codex && **now == HarnessKind::ClaudeCode
+            ),
+            "{pulled:?}"
+        );
+        let held = a.job(id).await.unwrap();
+        assert!(
+            matches!(held.lock().await.view(a.id), LeaseView::Owner(_)),
+            "the holder did not get the job back"
+        );
+        let pulled = b.job(id).await.unwrap();
+        assert!(!matches!(
+            pulled.lock().await.view(b.id),
+            LeaseView::Owner(_)
+        ));
+    }
+
+    /// A workspace root replaced with a link to another directory must not
+    /// be captured: the snapshot would publish, and replicate to every
+    /// peer, whatever the link names.
+    #[tokio::test]
+    async fn a_suspend_never_captures_through_a_root_that_is_a_link() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("private.txt"), "not the job's\n").unwrap();
+        let aside = dir.path().join("aside");
+        std::fs::rename(&root, &aside).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &root).unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let refused = node.suspend(id, &path, &mut Out::default()).await;
+        assert!(
+            matches!(&refused, Err(NodeError::RootNotADirectory { root: r, .. }) if *r == root),
+            "{refused:?}"
+        );
+        let job = node.job(id).await.unwrap();
+        assert!(
+            !job.lock()
+                .await
+                .ledger()
+                .records()
+                .iter()
+                .any(|r| matches!(r.event().kind, EventKind::SnapshotPublished { .. })),
+            "a snapshot was published through the link"
+        );
+    }
+
+    /// A suspend must say what of the repository's config it changed or
+    /// left out: a remote URL loses its user info, a URL with a query is
+    /// left behind, and of a repeated key only the last value travels.
+    #[tokio::test]
+    async fn a_suspend_names_the_git_config_it_changed_or_left_out() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        for args in [
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://me:pw@example.com/r.git",
+            ][..],
+            &[
+                "remote",
+                "add",
+                "tokened",
+                "https://example.com/r.git?token=x",
+            ],
+            &[
+                "config",
+                "--add",
+                "remote.origin.fetch",
+                "+refs/tags/*:refs/tags/*",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .status()
+                .unwrap();
+            assert!(status.success(), "{args:?}");
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut out = Out::default();
+        node.suspend(id, &path, &mut out).await.unwrap();
+        for wanted in [
+            "travels without its user info (git config): remote.origin.url",
+            "left behind (git config): remote.tokened.url",
+            "travels with its last value only (git config): remote.origin.fetch",
+        ] {
+            assert!(
+                out.lines.iter().any(|line| line == wanted),
+                "no line {wanted:?} in {:?}",
+                out.lines
+            );
+        }
+    }
+
+    /// A clone can fail after it made the workspace, as when its checkout
+    /// cannot read a file. No job and no printed id then name the workspace,
+    /// so `job new` must take it away with the job directory it made.
+    #[tokio::test]
+    async fn a_clone_that_fails_leaves_no_job_directory() {
+        let (dir, node) = node();
+        let repo = repo(dir.path());
+        let blob = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "HEAD:README.md"])
+            .output()
+            .unwrap();
+        let blob = String::from_utf8(blob.stdout).unwrap();
+        let blob = blob.trim();
+        std::fs::remove_file(repo.join(".git/objects").join(&blob[..2]).join(&blob[2..])).unwrap();
+        let refused = node
+            .job_new(
+                &repo,
+                "goal".to_owned(),
+                HarnessKind::Codex,
+                &mut Out::default(),
+            )
+            .await;
+        assert!(matches!(refused, Err(NodeError::Io { .. })), "{refused:?}");
+        let jobs = node.cfg.home.join("fabric").join("jobs");
+        let left: Vec<PathBuf> = std::fs::read_dir(&jobs)
+            .map(|dir| dir.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "the failed clone stayed behind: {left:?}");
+    }
+
+    /// A workspace can hold any number of paths a secret pattern leaves
+    /// behind. The suspend's answer must stay within one control message,
+    /// so it names the first of them and counts the rest.
+    #[tokio::test]
+    async fn a_suspend_names_a_bounded_number_of_paths() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        for n in 0..500 {
+            std::fs::write(root.join(format!(".env.{n}")), "TOKEN=x\n").unwrap();
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut out = Out::default();
+        node.suspend(id, &path, &mut out).await.unwrap();
+        let named = out
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("left behind (secret pattern): .env."))
+            .count();
+        assert_eq!(named, REPORT_PATHS, "{:?}", out.lines.len());
+        let rest = format!("left behind (secret pattern): {} more", 500 - REPORT_PATHS);
+        assert!(out.lines.contains(&rest), "no line {rest:?}");
+    }
+
+    /// A launch that overtook a plan can register and exit before the
+    /// delayed CLI takes the tree lock: no harness runs, and the epoch is
+    /// the same. The delayed plan still predates that launch's `Resumed`
+    /// and its session, and launching it would record a stale session over
+    /// the new one, so it is refused too.
+    #[tokio::test]
+    async fn a_plan_a_finished_launch_overtook_is_refused_before_setup() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let first = node.job_run(id, &mut Out::default()).await.unwrap();
+        let second = node.job_run(id, &mut Out::default()).await.unwrap();
+        node.launch_check(id, first.epoch, first.head)
+            .await
+            .unwrap();
+        let mut harness = sleeper();
+        let harness_pid = pid(&harness);
+        register(&node, id, harness_pid).await.unwrap();
+        harness.kill().unwrap();
+        harness.wait().unwrap();
+        node.harness_exited(id, harness_pid).await.unwrap();
+        let refused = node.launch_check(id, second.epoch, second.head).await;
+        assert!(
+            matches!(refused, Err(NodeError::PlanOvertaken { .. })),
+            "{refused:?}"
+        );
+    }
+
+    /// `forked_from` reads this node's epoch, then freezes under the job's
+    /// lock. A steal or import in between can carry this node past the
+    /// peer's epoch, and then the peer is the side that stops: the freeze
+    /// must compare again under its lock and leave the job running here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fork_behind_this_nodes_epoch_never_freezes_the_job() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        a.suspend(id, &path, &mut Out::default()).await.unwrap();
+        b.pull_records(id, a.id).await.unwrap();
+        b.ensure_latest(id, a.id).await.unwrap();
+        b.job_steal(id, "a sleeps".to_owned(), true, &mut Out::default())
+            .await
+            .unwrap();
+        let refused = b
+            .freeze(
+                id,
+                &crate::local::ForkRecord {
+                    peer: a.id,
+                    epoch: Epoch::FIRST,
+                    head: fabric_core::id::RecordHash::of(b"a head at epoch 1"),
+                },
+                &mut Out::default(),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(NodeError::ForkBehind { .. })),
+            "{refused:?}"
+        );
+        let job = b.job(id).await.unwrap();
+        assert!(
+            job.lock().await.forked().unwrap().is_none(),
+            "a fork behind this node's epoch froze the job"
+        );
+    }
+
+    /// A suspend that failed after its marker said `Suspending` finished
+    /// nothing. A `Suspended` from before that suspend began must not
+    /// settle the marker: the tree holds the work done since, and calling
+    /// it clean at the older snapshot would let a later restore or move
+    /// treat that work as already in a snapshot.
+    #[tokio::test]
+    async fn a_failed_suspend_is_not_settled_by_an_earlier_one() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        node.job_run(id, &mut Out::default()).await.unwrap();
+        let root = paths::job_root(&node.cfg.home, id);
+        std::fs::write(root.join("README.md"), "work after the snapshot\n").unwrap();
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(root.join(".fabric/env.toml"), "not toml [\n").unwrap();
+        let refused = node.suspend(id, &path, &mut Out::default()).await;
+        assert!(matches!(refused, Err(NodeError::Detect(_))), "{refused:?}");
+        let job = node.job(id).await.unwrap();
+        let marker = job.lock().await.reconcile_marker().unwrap().unwrap();
+        assert!(
+            matches!(marker.state, MarkerState::Suspending { .. }),
+            "{:?}",
+            marker.state
+        );
+    }
+
+    /// A snapshot may name any number of cache paths, and a resume's answer
+    /// must stay within one control message, so the cache report names
+    /// the first of them and counts the rest.
+    #[test]
+    fn a_resume_names_a_bounded_number_of_caches() {
+        let caches: Vec<fabric_core::snapshot::CacheEntry> = (0..500)
+            .map(|n| fabric_core::snapshot::CacheEntry {
+                path: fabric_core::path::RelPath::parse(&format!("caches/{n}")).unwrap(),
+                class: fabric_core::snapshot::CacheClass::ToolCache,
+                carry: fabric_core::snapshot::CarryState::NotCarried,
+                key: fabric_core::snapshot::CarryKey::Unmeasured,
+            })
+            .collect();
+        let mut out = Out::default();
+        report_caches(&caches, &NodeFacts::default(), &mut out);
+        assert_eq!(out.lines.len(), REPORT_PATHS + 1, "{:?}", out.lines.last());
+        assert_eq!(
+            out.lines.last().map(String::as_str),
+            Some("480 more caches, each carried where the keys match and rebuilt here otherwise")
+        );
+    }
+
+    /// `harness.toml` may configure any number of ACP agents. A run plan
+    /// carries only the configuration of the harness it launches, so the
+    /// plan stays within one control message whatever the file holds.
+    #[tokio::test]
+    async fn a_run_plan_carries_only_its_own_harness_config() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::Builder::new()
+            .prefix("fops")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let home = root.join("home");
+        let state = root.join("state");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            state.join("harness.toml"),
+            "[acp.opencode]\nstate_dir = \"oc\"\n[acp.other]\nstate_dir = \"other\"\n",
+        )
+        .unwrap();
+        let node = Node::start(NodeConfig {
+            state: StateDir::resolve(Some(state.as_os_str()), &home).unwrap(),
+            home,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            dial: DialOrder::TcpOnly,
+            path_var: std::env::var_os("PATH").unwrap_or_default(),
+            cargo_home: None,
+        })
+        .unwrap();
+        let repo = repo(&root);
+        for (harness, wanted) in [("acp:opencode", vec!["opencode"]), ("codex", vec![])] {
+            let mut out = Out::default();
+            node.job_new(
+                &repo,
+                "goal".to_owned(),
+                crate::harnesses::parse_harness(harness).unwrap(),
+                &mut out,
+            )
+            .await
+            .unwrap();
+            let id: JobId = out.lines[0].parse().unwrap();
+            let plan = node.job_run(id, &mut Out::default()).await.unwrap();
+            let carried: Vec<&str> = plan.harness_config.acp.keys().map(String::as_str).collect();
+            assert_eq!(carried, wanted, "{harness}");
+        }
     }
 }

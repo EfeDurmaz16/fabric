@@ -557,6 +557,30 @@ pub(crate) fn version_at_least(version: &str, floor: &[u32]) -> bool {
 mod tests {
     use super::*;
 
+    /// Writes `contents` to `path` with mode `0755` through a short `sh`,
+    /// so this process never holds the file open for writing. Linux
+    /// refuses to run a file open for writing (`ETXTBSY`), and a child
+    /// another test forked while this process held it open would keep it
+    /// open until that child ran its own program. A temporary file renamed
+    /// into place would not help: the descriptor follows the file.
+    fn write_executable(path: &Path, contents: &[u8]) {
+        use std::io::Write;
+        let mut writer = std::process::Command::new("/bin/sh")
+            .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The pipe closes at the end of the statement, so `cat` sees the end.
+        writer.stdin.take().unwrap().write_all(contents).unwrap();
+        let status = writer.wait().unwrap();
+        assert!(
+            status.success(),
+            "writing {} failed: {status}",
+            path.display()
+        );
+    }
+
     #[test]
     fn version_token_finds_the_number() {
         assert_eq!(version_token("2.1.294 (Claude Code)"), Some("2.1.294"));
@@ -628,7 +652,10 @@ mod tests {
             None => {
                 let dir = tempfile::tempdir().unwrap();
                 let claude = dir.path().join("claude");
-                std::fs::copy(std::env::current_exe().unwrap(), &claude).unwrap();
+                write_executable(
+                    &claude,
+                    &std::fs::read(std::env::current_exe().unwrap()).unwrap(),
+                );
                 run(&claude, "parent");
             }
             Some("parent") => run(&std::env::current_exe().unwrap(), "child"),
@@ -647,8 +674,7 @@ mod tests {
     async fn a_version_probe_does_not_pass_parent_session_markers() {
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("tool");
-        std::fs::write(&binary, "#!/bin/sh\n/usr/bin/env\n").unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&binary, b"#!/bin/sh\n/usr/bin/env\n");
         let env: Vec<(EnvVarName, String)> = [("CLAUDECODE", "1"), ("FABRIC_PROBE_KEPT", "1")]
             .into_iter()
             .map(|(name, value)| (EnvVarName::parse(name).unwrap(), value.to_owned()))
@@ -662,8 +688,7 @@ mod tests {
     async fn a_version_probe_that_exits_with_a_failure_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("tool");
-        std::fs::write(&binary, "#!/bin/sh\necho 'tool 1.2.3'\nexit 1\n").unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&binary, b"#!/bin/sh\necho 'tool 1.2.3'\nexit 1\n");
         let err = detect(Some(binary.clone()), OsStr::new("/usr/bin:/bin"))
             .await
             .unwrap_err();
@@ -678,11 +703,9 @@ mod tests {
     async fn a_version_probe_finds_an_interpreter_on_the_configured_path() {
         let dir = tempfile::tempdir().unwrap();
         let interp = dir.path().join("fabric-test-interp");
-        std::fs::write(&interp, "#!/bin/sh\necho 'tool 4.5.6'\n").unwrap();
-        std::fs::set_permissions(&interp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&interp, b"#!/bin/sh\necho 'tool 4.5.6'\n");
         let binary = dir.path().join("tool");
-        std::fs::write(&binary, "#!/usr/bin/env fabric-test-interp\n").unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&binary, b"#!/usr/bin/env fabric-test-interp\n");
         let path_var =
             std::env::join_paths([dir.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
         let installed = detect(Some(binary), &path_var).await.unwrap().unwrap();

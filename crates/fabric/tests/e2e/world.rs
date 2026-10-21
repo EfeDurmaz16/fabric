@@ -9,7 +9,7 @@
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
@@ -160,10 +160,7 @@ impl Env {
 
     /// Writes an executable `name` into the test's `bin`, first on the `PATH`.
     fn install(&self, name: &str, script: &str) -> Fallible {
-        let path = self.root.join("bin").join(name);
-        fs::write(&path, script)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
-        Ok(())
+        write_executable(&self.root.join("bin").join(name), script.as_bytes())
     }
 
     /// What a fake harness wrote to `<name>-args`, one argument per line.
@@ -221,6 +218,32 @@ impl Env {
     }
 }
 
+/// Writes `contents` to `path` with mode `0755` through a short `sh`, so
+/// this process never holds the file open for writing. Linux refuses to
+/// run a file open for writing (`ETXTBSY`), and a child another test
+/// forked while this process held it open would keep it open until that
+/// child ran its own program. A temporary file renamed into place would
+/// not help: the descriptor follows the file.
+fn write_executable(path: &Path, contents: &[u8]) -> Fallible {
+    let mut writer = Command::new("/bin/sh")
+        .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()?;
+    // The pipe closes at the end of the statement, so `cat` sees the end.
+    writer
+        .stdin
+        .take()
+        .ok_or("no pipe to the writer")?
+        .write_all(contents)?;
+    let status = writer.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("writing {} failed: {status}", path.display()).into())
+    }
+}
+
 fn find(program: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|dir| dir.join(program))
@@ -273,7 +296,7 @@ impl OtherClaude {
         let dir = env.root.join("other");
         fs::create_dir_all(&dir)?;
         let claude = dir.join("claude");
-        fs::copy(env!("CARGO_BIN_EXE_fabric-fake-agent"), &claude)?;
+        write_executable(&claude, &fs::read(env!("CARGO_BIN_EXE_fabric-fake-agent"))?)?;
         let other = Self(
             Command::new(&claude)
                 .env_clear()
@@ -394,6 +417,8 @@ impl Node {
     /// A node that has not started yet.
     pub fn new(env: &Arc<Env>, name: &'static str, wire: Wire) -> Fallible<Self> {
         let state = env.root.join(name);
+        // Made with the umask's mode, as a user makes it by hand to keep
+        // the daemon's log in it; the node narrows it at its first start.
         fs::create_dir_all(&state)?;
         fs::write(
             state.join("harness.toml"),

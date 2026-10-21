@@ -4,9 +4,11 @@
 //! after every object it names is on disk and was checked against its hash
 //! on arrival, so a fetch cut anywhere leaves at most objects without a row,
 //! never a row without its objects. The manifest's bytes are joined and
-//! checked against the snapshot id before they are decoded. A retry asks
-//! only for what the store still lacks, so a dropped connection costs the
-//! chunks in flight and nothing more.
+//! checked against the snapshot id before they are decoded, and the chunks
+//! a peer lists for a manifest are stored only while what they hold stays
+//! within the length it declared. A retry asks only for what the store
+//! still lacks, so a dropped connection costs the chunks in flight and
+//! nothing more.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -89,7 +91,8 @@ pub async fn fetch_snapshot(
         manifests.push((next, manifest));
     }
     for (id, manifest) in manifests.into_iter().rev() {
-        fetch_chunks(store, session, Store::data_chunks(&manifest), true).await?;
+        // The manifest hashed to its id, so its chunk ids are its own.
+        fetch_chunks(store, session, Store::data_chunks(&manifest), true, None).await?;
         let published = with_store(store, move |store| Ok(store.publish(&manifest)?)).await?;
         if published != id {
             return Err(fail(format!("the manifest published as {published}")));
@@ -114,8 +117,10 @@ async fn fetch_manifest(
         .await
         .map_err(|e| fail(e.to_string()))?;
     let ids = listed.ids().to_vec();
-    fetch_chunks(store, session, ids.clone(), false).await?;
     let len = listed.byte_len();
+    // The ids are the peer's word until the joined bytes hash to the
+    // snapshot id, so what they hold is bounded by the declared length.
+    fetch_chunks(store, session, ids.clone(), false, Some(len)).await?;
     let bytes = with_store(store, move |store| {
         let mut bytes = Vec::new();
         for id in ids {
@@ -135,12 +140,14 @@ async fn fetch_manifest(
 /// Fetches every chunk in `ids` the store lacks, in batches, asking again for what a failure left out.
 ///
 /// `data` marks the fetch of a snapshot's data objects, where the
-/// `mid_transfer` fault point sits.
+/// `mid_transfer` fault point sits. With `limit`, the fetch stops before
+/// it stores a chunk that takes the bytes fetched past it.
 async fn fetch_chunks(
     store: &Arc<Mutex<Store>>,
     session: &Session,
     ids: Vec<ChunkId>,
     data: bool,
+    limit: Option<u64>,
 ) -> Result<(), NodeError> {
     let mut missing = with_store(store, move |store| {
         let mut missing = Vec::new();
@@ -159,15 +166,25 @@ async fn fetch_chunks(
     })
     .await?;
     let mut first = data;
+    let mut room = limit;
     while !missing.is_empty() {
         let rest = missing.split_off(missing.len().min(MAX_CHUNK_BATCH));
         let batch = std::mem::replace(&mut missing, rest);
         let mut wanted = batch;
         let mut attempt = 0;
         while !wanted.is_empty() {
-            match fetch_batch(store, session, wanted.clone(), &mut first).await {
+            match fetch_batch(store, session, wanted.clone(), &mut first, &mut room).await {
                 Ok(()) => wanted.clear(),
-                Err((left, reason)) => {
+                Err(BatchError::PastLimit) => {
+                    return Err(NodeError::Peer {
+                        peer: session.peer(),
+                        reason: format!(
+                            "its chunks hold more than the {} bytes it declared",
+                            limit.unwrap_or_default()
+                        ),
+                    });
+                }
+                Err(BatchError::Retry(left, reason)) => {
                     attempt += 1;
                     if attempt > RETRIES {
                         return Err(NodeError::Peer {
@@ -184,22 +201,37 @@ async fn fetch_chunks(
     Ok(())
 }
 
-/// Fetches one batch; on failure returns the ids that did not arrive.
+/// Why a batch stopped.
+enum BatchError {
+    /// The ids that did not arrive, and why; they are asked for again.
+    Retry(Vec<ChunkId>, String),
+    /// A chunk would take the bytes fetched past the limit; nothing is asked again.
+    PastLimit,
+}
+
+/// Fetches one batch, storing no chunk that does not fit in `room`, which
+/// each stored chunk shrinks.
 async fn fetch_batch(
     store: &Arc<Mutex<Store>>,
     session: &Session,
     ids: Vec<ChunkId>,
     first: &mut bool,
-) -> Result<(), (Vec<ChunkId>, String)> {
-    let batch = ChunkBatch::new(ids.clone()).map_err(|e| (ids.clone(), e.to_string()))?;
+    room: &mut Option<u64>,
+) -> Result<(), BatchError> {
+    let retry = |ids: &[ChunkId], reason: String| BatchError::Retry(ids.to_vec(), reason);
+    let batch = ChunkBatch::new(ids.clone()).map_err(|e| retry(&ids, e.to_string()))?;
     let mut stream = session
         .want_chunks(batch, CHUNK_IDLE)
         .await
-        .map_err(|e| (ids.clone(), e.to_string()))?;
+        .map_err(|e| retry(&ids, e.to_string()))?;
     loop {
         match stream.next().await {
             Ok(Some(chunk)) => {
                 let id = chunk.id();
+                let len = chunk.bytes().len() as u64;
+                if room.is_some_and(|room| len > room) {
+                    return Err(BatchError::PastLimit);
+                }
                 let bytes = chunk.bytes().to_vec();
                 let stored = with_store(store, move |store| {
                     Ok(store.objects().put(&bytes).map_err(StoreError::from)?)
@@ -214,14 +246,175 @@ async fn fetch_batch(
                     // The stream counts the chunk as arrived; it is not stored.
                     let mut left: Vec<ChunkId> = stream.missing().collect();
                     left.push(id);
-                    return Err((left, reason));
+                    return Err(BatchError::Retry(left, reason));
+                }
+                if let Some(room) = room.as_mut() {
+                    *room -= len;
                 }
                 if std::mem::take(first) {
                     faults::hit(Point::MidTransfer).await;
                 }
             }
             Ok(None) => return Ok(()),
-            Err(e) => return Err((stream.missing().collect(), e.to_string())),
+            Err(e) => return Err(BatchError::Retry(stream.missing().collect(), e.to_string())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use fabric_core::BoxFuture;
+    use fabric_core::id::{MoveId, NodeId, RecordHash};
+    use fabric_core::lease::FencingToken;
+    use fabric_core::moves::MoveOffer;
+    use fabric_net::identity::NodeIdentity;
+    use fabric_net::rpc::{JobFuture, Service};
+    use fabric_net::tcp::TcpTlsTransport;
+    use fabric_net::tls::Trust;
+    use fabric_net::transport::{Connection, Transport};
+    use fabric_net::wire::{
+        Appended, Facts, Fault, FaultText, ManifestChunks, MoveRequested, MoveState, Offered,
+        Pulled, RecordBytes, RecordPage, VersionText,
+    };
+    use fabric_store::objects::ChunkParams;
+
+    use super::*;
+
+    const DEADLINE: Duration = Duration::from_secs(5);
+
+    #[derive(Debug)]
+    struct Anyone;
+
+    impl Trust for Anyone {
+        fn is_paired(&self, _: NodeId) -> bool {
+            true
+        }
+    }
+
+    /// A peer whose manifest says it is 16 bytes long and lists chunks of
+    /// 1 MiB each.
+    struct Lying {
+        store: Mutex<Store>,
+        ids: Vec<ChunkId>,
+    }
+
+    fn not_here<T>() -> JobFuture<'static, T> {
+        Box::pin(async { Err(Fault::Internal(FaultText::truncated("not in this test"))) })
+    }
+
+    impl Service for Lying {
+        fn pull(&self, _: NodeId, _: FencingToken, _: Option<RecordHash>) -> JobFuture<'_, Pulled> {
+            not_here()
+        }
+
+        fn append(&self, _: NodeId, _: FencingToken, _: RecordPage) -> JobFuture<'_, Appended> {
+            not_here()
+        }
+
+        fn move_request(&self, _: NodeId, _: FencingToken) -> JobFuture<'_, MoveRequested> {
+            not_here()
+        }
+
+        fn offer(&self, _: NodeId, _: FencingToken, _: MoveOffer) -> JobFuture<'_, Offered> {
+            not_here()
+        }
+
+        fn move_status(&self, _: NodeId, _: FencingToken, _: MoveId) -> JobFuture<'_, MoveState> {
+            not_here()
+        }
+
+        fn move_abort(&self, _: NodeId, _: FencingToken, _: MoveId) -> JobFuture<'_, RecordBytes> {
+            not_here()
+        }
+
+        fn manifest(
+            &self,
+            _: NodeId,
+            _: SnapshotId,
+        ) -> BoxFuture<'_, Result<ManifestChunks, Fault>> {
+            let listed = ManifestChunks::new(16, self.ids.clone())
+                .map_err(|e| Fault::Internal(FaultText::truncated(&e.to_string())));
+            Box::pin(async move { listed })
+        }
+
+        fn chunk(&self, _: NodeId, id: ChunkId) -> BoxFuture<'_, Result<Vec<u8>, Fault>> {
+            let stored = self
+                .store
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .objects()
+                .read_stored(id)
+                .map_err(|e| Fault::Internal(FaultText::truncated(&e.to_string())));
+            Box::pin(async move { stored })
+        }
+
+        fn facts(&self, _: NodeId) -> BoxFuture<'_, Result<Facts, Fault>> {
+            Box::pin(async { Err(Fault::Internal(FaultText::truncated("not in this test"))) })
+        }
+    }
+
+    /// A paired peer that declares a manifest of 16 bytes and lists
+    /// chunks of 1 MiB each must not get them stored: the fetch stops at
+    /// the first byte past the declared length, before the store and the
+    /// memory that joins the manifest fill up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_manifest_whose_chunks_outgrow_its_length_is_cut_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = Store::create(&dir.path().join("source"), ChunkParams::DEFAULT).unwrap();
+        let ids: Vec<ChunkId> = (0..3_u8)
+            .map(|n| source.objects().put(&vec![n; 1 << 20]).unwrap().id)
+            .collect();
+        let here = Arc::new(Mutex::new(
+            Store::create(&dir.path().join("here"), ChunkParams::DEFAULT).unwrap(),
+        ));
+        let (liar, asker) = (
+            NodeIdentity::generate().unwrap(),
+            NodeIdentity::generate().unwrap(),
+        );
+        let (liar_id, asker_id) = (liar.node_id(), asker.node_id());
+        let loopback: SocketAddr = ([127, 0, 0, 1], 0).into();
+        let serving: Arc<dyn Transport> =
+            Arc::new(TcpTlsTransport::bind(&liar, Arc::new(Anyone), loopback).unwrap());
+        let addr = serving.local_addr().unwrap();
+        let service = Arc::new(Lying {
+            store: Mutex::new(source),
+            ids: ids.clone(),
+        });
+        tokio::spawn(async move {
+            let connection: Arc<dyn Connection> = Arc::from(serving.accept().await.unwrap());
+            let session = Session::accept(
+                connection,
+                liar_id,
+                VersionText::new("test").unwrap(),
+                DEADLINE,
+            )
+            .await
+            .unwrap();
+            session.serve(service, Arc::new(Anyone)).await
+        });
+        let dialing = TcpTlsTransport::bind(&asker, Arc::new(Anyone), loopback).unwrap();
+        let connection = Arc::from(dialing.connect(liar_id, addr).await.unwrap());
+        let session = Session::connect(
+            connection,
+            asker_id,
+            VersionText::new("test").unwrap(),
+            DEADLINE,
+        )
+        .await
+        .unwrap();
+
+        let fetched = fetch_snapshot(&here, &session, SnapshotId::of(b"a snapshot")).await;
+        assert!(fetched.is_err(), "{fetched:?}");
+        let here = here.lock().unwrap_or_else(PoisonError::into_inner);
+        let stored: Vec<&ChunkId> = ids
+            .iter()
+            .filter(|id| here.objects().stored_len(**id).is_ok())
+            .collect();
+        assert!(
+            stored.is_empty(),
+            "chunks past the declared length were stored: {stored:?}"
+        );
     }
 }

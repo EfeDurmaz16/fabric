@@ -30,6 +30,8 @@ pub mod name {
     pub const USER: &str = "user";
     /// `$HOME`.
     pub const HOME: &str = "home";
+    /// `git --version`, found on the daemon's own `PATH`, where restore runs it.
+    pub const GIT: &str = "git.version";
     /// The operating system, as Rust names it.
     pub const OS: &str = "os";
     /// The CPU architecture, as Rust names it.
@@ -100,8 +102,22 @@ impl NodeFacts {
         )
     }
 
-    /// Measures this node, looking programs up on `path_var`.
+    /// Measures this node, looking programs up on `path_var`, and git on
+    /// this process's own `PATH`, where restore runs it.
     pub async fn measure(home: &Path, path_var: &OsString, cargo_home: Option<PathBuf>) -> Self {
+        let own_path = std::env::var_os("PATH").unwrap_or_default();
+        let (mut facts, git) = tokio::join!(
+            Box::pin(Self::measure_tools(home, path_var, cargo_home)),
+            probe_command("git", &["--version"], Probe::Output, &own_path, home),
+        );
+        if let Some(git) = git {
+            facts.0.insert(name::GIT.to_owned(), git);
+        }
+        facts
+    }
+
+    /// Measures everything but git, looking programs up on `path_var`.
+    async fn measure_tools(home: &Path, path_var: &OsString, cargo_home: Option<PathBuf>) -> Self {
         // Each probe is boxed, so the joined future holds 19 pointers, not 19 child processes.
         let run = |program: &'static str, args: &'static [&'static str], probe: Probe| {
             let path_var = path_var.clone();
@@ -271,9 +287,15 @@ async fn probe_command(
 }
 
 /// The first executable named `program` on `path_var`.
+///
+/// A relative or empty entry is skipped, as the harness's own lookup
+/// skips it: it names a directory relative to the daemon's working
+/// directory here and to the workspace at launch, so the binary measured
+/// and the binary launched could differ.
 pub fn find_on_path(program: &str, path_var: &OsString) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     std::env::split_paths(path_var)
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(program))
         .find(|candidate| {
             std::fs::metadata(candidate)
@@ -487,5 +509,33 @@ mod tests {
         assert_eq!(major("v22.23.2").as_deref(), Some("22"));
         assert_eq!(major("11.23.0").as_deref(), Some("11"));
         assert_eq!(major("nightly"), None);
+    }
+
+    /// A relative `PATH` entry names a directory relative to the daemon's
+    /// working directory here, and to the workspace once the harness
+    /// starts, so the measured binary and the launched one could differ.
+    /// It is skipped, as the harness's own lookup skips it.
+    #[test]
+    fn a_relative_path_entry_is_never_searched() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("fabric-test-tool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let up = "../".repeat(cwd.components().count());
+        let relative = format!(
+            "{up}{}",
+            dir.path().display().to_string().trim_start_matches('/')
+        );
+        assert!(Path::new(&relative).join("fabric-test-tool").is_file());
+        assert_eq!(
+            find_on_path("fabric-test-tool", &OsString::from(&relative)),
+            None
+        );
+        assert_eq!(
+            find_on_path("fabric-test-tool", &dir.path().as_os_str().to_owned()),
+            Some(tool)
+        );
     }
 }

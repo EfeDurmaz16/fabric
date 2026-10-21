@@ -19,7 +19,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use fabric_core::harness::HarnessKind;
-use fabric_core::id::{Epoch, JobId, NodeId};
+use fabric_core::id::{Epoch, JobId, NodeId, RecordHash};
 use fabric_harness::SessionId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -88,6 +88,17 @@ pub enum Request {
         force: bool,
         /// The `PATH` of the user's shell.
         path_var: OsString,
+    },
+    /// Before any setup step, under the tree lock: whether the plan made at
+    /// `epoch` still holds, so a launch whose plan another launch overtook
+    /// refuses before it writes to the workspace.
+    LaunchCheck {
+        /// The job.
+        job: JobId,
+        /// The epoch the plan was made under.
+        epoch: Epoch,
+        /// The ledger head the plan was made at.
+        head: RecordHash,
     },
     /// The CLI launched the harness; the daemon records it and appends `Resumed`.
     HarnessStarted {
@@ -191,6 +202,9 @@ pub struct RunPlan {
     pub job: JobId,
     /// The epoch this node owns the job at; the launch is fenced on it.
     pub epoch: Epoch,
+    /// The ledger head the plan was made at; a launch whose job moved past
+    /// it, by another launch for one, is refused before setup.
+    pub head: RecordHash,
     /// The workspace root.
     pub root: PathBuf,
     /// The harness to launch.
@@ -201,6 +215,10 @@ pub struct RunPlan {
     pub goal: String,
     /// The node's harness configuration, which the launch must use.
     pub harness_config: HarnessConfig,
+    /// The home the node captures and restores harness state under; a
+    /// launch under another home would keep the session where the node
+    /// never looks.
+    pub home: PathBuf,
 }
 
 /// The daemon's answer.
