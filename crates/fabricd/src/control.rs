@@ -6,7 +6,9 @@
 //! from the user who runs the node. A connection carries one exchange: a
 //! hello, the welcome or an incompatible answer, one request, the events
 //! of the command as the node makes them, and one final answer. A request
-//! that does not parse is refused, never guessed at. A client that leaves
+//! that does not parse is refused, never guessed at, and one over
+//! [`frame::MAX_REQUEST`] is refused unparsed, so one request costs the
+//! node a bounded amount of memory. A client that leaves
 //! does not stop the command, and a client that stops reading does not
 //! hold it: the command runs as its own task, so a move or a suspend never
 //! waits on a socket while it holds a job's lock, and one that stopped
@@ -48,7 +50,14 @@ pub(crate) async fn serve(node: Arc<Node>, mut stream: UnixStream) {
     let Some(hello) = read(&mut stream, "hello").await else {
         return;
     };
-    let hello = match frame::parse::<Hello>(&hello) {
+    // A hello this large is no api's, and parsing it would cost the node
+    // about thirty times its size.
+    let hello = if hello.len() > frame::MAX_REQUEST {
+        Err(too_large("hello", hello.len()))
+    } else {
+        frame::parse::<Hello>(&hello).map_err(|e| e.to_string())
+    };
+    let hello = match hello {
         Ok(hello) if hello.api == API_VERSION => hello,
         parsed => {
             if let Err(e) = &parsed {
@@ -79,13 +88,17 @@ pub(crate) async fn serve(node: Arc<Node>, mut stream: UnixStream) {
     let Some(request) = read(&mut stream, "request").await else {
         return;
     };
-    let request = match frame::parse::<Request>(&request) {
+    let request = if request.len() > frame::MAX_REQUEST {
+        Err(too_large("request", request.len()))
+    } else {
+        frame::parse::<Request>(&request).map_err(|e| {
+            format!("the request does not parse, or names an op this node does not serve: {e}")
+        })
+    };
+    let request = match request {
         Ok(request) => request,
-        Err(e) => {
-            let refusal = Refusal::new(
-                Reason::BadRequest,
-                format!("the request does not parse, or names an op this node does not serve: {e}"),
-            );
+        Err(message) => {
+            let refusal = Refusal::new(Reason::BadRequest, message);
             let _ = send(&mut stream, &Answer::Refused { refusal }).await;
             return;
         }
@@ -136,6 +149,14 @@ where
             let _ = send(&mut stream, &Answer::Refused { refusal }).await;
         }
     }
+}
+
+/// Why the node did not parse a hello or a request of `len` bytes.
+fn too_large(what: &str, len: usize) -> String {
+    format!(
+        "the {what} is {len} bytes, over the {} bytes a node parses",
+        frame::MAX_REQUEST
+    )
 }
 
 /// Why an answer could not be framed, for the refusal that replaces it.
@@ -310,5 +331,77 @@ mod tests {
             }
         );
         relayed.await.unwrap();
+    }
+
+    /// One frame of exactly `len` bytes of JSON: a `node_id` request, or a
+    /// hello, padded with a field the node does not know.
+    fn padded(head: &str, len: usize) -> Vec<u8> {
+        let json = format!("{head},\"x\":\"{}\"}}", "a".repeat(len - head.len() - 8));
+        assert_eq!(json.len(), len);
+        let mut frame = u32::try_from(len).unwrap().to_le_bytes().to_vec();
+        frame.extend_from_slice(json.as_bytes());
+        frame
+    }
+
+    /// Opens a connection to `node`, sends `hello`, and returns the
+    /// client's end with the node's answer.
+    async fn hello(node: &Arc<Node>, hello: &[u8]) -> (UnixStream, HelloAnswer) {
+        use tokio::io::AsyncWriteExt;
+
+        let (node_side, mut client) = UnixStream::pair().unwrap();
+        tokio::spawn(serve(Arc::clone(node), node_side));
+        client.write_all(hello).await.unwrap();
+        let answer = frame::read(&mut client).await.unwrap().unwrap();
+        (client, answer)
+    }
+
+    /// Review finding on PR #13: parsing a frame takes up to about thirty
+    /// times its size, so a 16 MiB request holding zeros in a field the
+    /// node does not know took over 500 MiB of the node's memory. A hello
+    /// or a request over `MAX_REQUEST` is refused unparsed, as `bad_request`
+    /// or as an incompatible hello; one of exactly `MAX_REQUEST` bytes
+    /// still reads.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hello_or_a_request_over_the_request_cap_is_refused_unparsed() {
+        use tokio::io::AsyncWriteExt;
+
+        let (_dir, node) = crate::ops::tests::node();
+        let api = format!("{{\"api\":{API_VERSION},\"client\":\"test\"");
+        for (len, refused) in [(frame::MAX_REQUEST, false), (frame::MAX_REQUEST + 1, true)] {
+            let (mut client, welcome) = hello(&node, &padded(&api, 64)).await;
+            assert!(matches!(welcome, HelloAnswer::Welcome(_)), "{welcome:?}");
+            client
+                .write_all(&padded("{\"op\":\"node_id\"", len))
+                .await
+                .unwrap();
+            let answer: Answer = frame::read(&mut client).await.unwrap().unwrap();
+            if refused {
+                let Answer::Refused { refusal } = answer else {
+                    panic!("{answer:?}");
+                };
+                assert_eq!(refusal.reason(), &Reason::BadRequest);
+                assert_eq!(
+                    refusal.message(),
+                    format!("the request is {len} bytes, over the 1048576 bytes a node parses")
+                );
+            } else {
+                assert!(
+                    matches!(
+                        answer,
+                        Answer::Done {
+                            reply: Reply::NodeId(_)
+                        }
+                    ),
+                    "{answer:?}"
+                );
+            }
+
+            let (_client, answer) = hello(&node, &padded(&api, len)).await;
+            assert_eq!(
+                matches!(answer, HelloAnswer::Incompatible { .. }),
+                refused,
+                "{answer:?}"
+            );
+        }
     }
 }

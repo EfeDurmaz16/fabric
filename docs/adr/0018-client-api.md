@@ -19,14 +19,14 @@ This ADR fixes the contract that any program, in any language, uses against a lo
 
 ### Wire format: length-prefixed JSON on the same socket
 
-The client API runs on `<state>/fabric.sock`, the control socket of ADR 0016. Each frame is a `u32` little-endian length, 1 to 16 MiB, then that many bytes of one UTF-8 JSON object. A reader checks the length against the cap before it allocates. Node-to-node traffic (`fabric-net`, ADR 0013), the ledger and the manifests stay postcard.
+The client API runs on `<state>/fabric.sock`, the control socket of ADR 0016. Each frame is a `u32` little-endian length, 1 to 16 MiB, then that many bytes of one UTF-8 JSON object. A reader checks the length against the cap before it allocates. A node parses a hello or a request only up to 1 MiB and refuses a larger one unparsed, a request with `bad_request` and a hello with `incompatible`: parsing a frame takes up to about thirty times its size, for a frame of small values such as a long array of zeros in a field the node does not know, so a 16 MiB request took over 500 MiB of the node's memory, and a client never needs to send more than the free text of a goal or a note. Node-to-node traffic (`fabric-net`, ADR 0013), the ledger and the manifests stay postcard.
 
 JSON wins on this socket for four reasons:
 
 - Every language a client is likely to be written in reads it without a dependency: `JSON.parse` in JavaScript, `json` in Python, `encoding/json` in Go, `serde_json` in Rust, which the node already uses for its local files.
 - It is self-describing. A tagged object names its variant, so adding a variant or a field never shifts what an old reader sees, and a reader can skip what it does not know (see Compatibility).
 - A person can read it with `socat` while debugging a client.
-- The messages are small and local: an answer is a few hundred bytes, and the largest, a job's log, is bounded by the frame cap. Its size and parse cost do not matter here as they do for chunks on the network.
+- The messages are small and local: an answer is a few hundred bytes, and the largest, a job's log, is bounded by the frame cap. Its size and parse cost do not matter here as they do for chunks on the network, once the node bounds what it parses from a client.
 
 The length prefix, rather than one JSON object per line, lets a reader refuse an oversized frame before it reads it, and it is the framing every other socket in Fabric already uses.
 

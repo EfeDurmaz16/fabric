@@ -18,6 +18,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// The largest frame either side sends or reads: 16 MiB.
 pub const MAX_FRAME: usize = 16 << 20;
 
+/// The largest hello or request a node parses: 1 MiB. Parsing takes up to
+/// about thirty times a frame's size, for a frame of small values such as
+/// a long array of zeros in a field the node does not know, so a node
+/// parses only what a client needs to send, the free text of a goal or a
+/// note included, and refuses the rest unread (ADR 0018).
+pub const MAX_REQUEST: usize = 1 << 20;
+
 /// The largest integer a frame carries, `2^53 - 1`, and the negation of the
 /// smallest: the range a JavaScript number holds exactly (ADR 0018,
 /// Encoding rules).
