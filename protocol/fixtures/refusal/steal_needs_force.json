@@ -1,0 +1,14 @@
+{
+  "kind": "needs_force",
+  "reason": {
+    "code": "steal_needs_force",
+    "warning": {
+      "owner": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+      "snapshot": "abababababababababababababababababababababababababababababababab",
+      "owner_stopped_at_snapshot": false,
+      "last_record_at": 1760000000000,
+      "age_ms": 120000
+    }
+  },
+  "message": "a steal would bump the epoch; pass --force"
+}

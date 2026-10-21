@@ -356,6 +356,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fabric-client"
+version = "0.1.0"
+dependencies = [
+ "fabric-core",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "fabric-core"
 version = "0.1.0"
 dependencies = [

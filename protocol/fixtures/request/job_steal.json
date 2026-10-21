@@ -1,0 +1,6 @@
+{
+  "op": "job_steal",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "reason": "the Pro is asleep",
+  "force": true
+}

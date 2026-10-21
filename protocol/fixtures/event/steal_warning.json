@@ -1,0 +1,10 @@
+{
+  "kind": "steal_warning",
+  "warning": {
+    "owner": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+    "snapshot": "abababababababababababababababababababababababababababababababab",
+    "owner_stopped_at_snapshot": true,
+    "last_record_at": 1760000000000,
+    "age_ms": 10800000
+  }
+}

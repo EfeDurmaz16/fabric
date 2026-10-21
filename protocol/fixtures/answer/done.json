@@ -1,0 +1,7 @@
+{
+  "type": "done",
+  "reply": {
+    "kind": "job_suspend",
+    "snapshot": "abababababababababababababababababababababababababababababababab"
+  }
+}

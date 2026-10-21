@@ -1,0 +1,10 @@
+{
+  "kind": "job_state",
+  "reason": {
+    "code": "changed_during_move",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "root": "/Users/me/fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/work",
+    "target": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba"
+  },
+  "message": "changed during the move"
+}

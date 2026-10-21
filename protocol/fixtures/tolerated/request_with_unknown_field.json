@@ -1,0 +1,12 @@
+{
+  "schema": "request",
+  "value": {
+    "op": "job_status",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "verbose": true
+  },
+  "reads_as": {
+    "op": "job_status",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0"
+  }
+}

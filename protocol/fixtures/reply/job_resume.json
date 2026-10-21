@@ -1,0 +1,10 @@
+{
+  "kind": "job_resume",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "epoch": 2,
+  "root": "/Users/me/fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/work",
+  "harness": {
+    "kind": "claude_code"
+  },
+  "goal": "fix the flaky test"
+}

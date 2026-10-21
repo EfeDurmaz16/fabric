@@ -1,0 +1,138 @@
+{
+  "kind": "job_log",
+  "records": [
+    {
+      "id": "01JC0000000000000000000000",
+      "epoch": 1,
+      "at": 1760000000000,
+      "event": {
+        "kind": "created",
+        "created_by": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+        "harness": {
+          "kind": "claude_code"
+        },
+        "goal": "fix the flaky test"
+      }
+    },
+    {
+      "id": "01JC0000000000000000000001",
+      "epoch": 1,
+      "at": 1760000001000,
+      "event": {
+        "kind": "resumed",
+        "node": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+        "harness": {
+          "kind": "claude_code"
+        }
+      }
+    },
+    {
+      "id": "01JC0000000000000000000002",
+      "epoch": 1,
+      "at": 1760000002000,
+      "event": {
+        "kind": "snapshot_published",
+        "snapshot": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+      }
+    },
+    {
+      "id": "01JC0000000000000000000003",
+      "epoch": 1,
+      "at": 1760000003000,
+      "event": {
+        "kind": "suspended",
+        "snapshot": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+      }
+    },
+    {
+      "id": "01JC0000000000000000000004",
+      "epoch": 1,
+      "at": 1760000004000,
+      "event": {
+        "kind": "snapshot_published",
+        "snapshot": "abababababababababababababababababababababababababababababababab",
+        "parent": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+      }
+    },
+    {
+      "id": "01JC0000000000000000000005",
+      "epoch": 1,
+      "at": 1760000005000,
+      "event": {
+        "kind": "move_started",
+        "move_id": "01JB2Z3Y4X5W6V7T8S9R0QPNMK",
+        "target": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba"
+      }
+    },
+    {
+      "id": "01JC0000000000000000000006",
+      "epoch": 2,
+      "at": 1760000006000,
+      "event": {
+        "kind": "move_imported",
+        "move_id": "01JB2Z3Y4X5W6V7T8S9R0QPNMK",
+        "from": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq"
+      }
+    },
+    {
+      "id": "01JC0000000000000000000007",
+      "epoch": 2,
+      "at": 1760000007000,
+      "event": {
+        "kind": "resumed",
+        "node": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+        "snapshot": "abababababababababababababababababababababababababababababababab",
+        "harness": {
+          "kind": "codex"
+        }
+      }
+    },
+    {
+      "id": "01JC0000000000000000000008",
+      "epoch": 2,
+      "at": 1760000008000,
+      "event": {
+        "kind": "move_aborted",
+        "move_id": "01JB2Z3Y4X5W6V7T8S9R0QPNMK"
+      }
+    },
+    {
+      "id": "01JC0000000000000000000009",
+      "epoch": 3,
+      "at": 1760000009000,
+      "event": {
+        "kind": "stolen",
+        "by": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+        "from": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+        "reason": "the Air is asleep"
+      }
+    },
+    {
+      "id": "01JC0000000000000000000010",
+      "epoch": 3,
+      "at": 1760000010000,
+      "event": {
+        "kind": "env_spec_changed",
+        "env_spec": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+      }
+    },
+    {
+      "id": "01JC0000000000000000000011",
+      "epoch": 3,
+      "at": 1760000011000,
+      "event": {
+        "kind": "decision_recorded",
+        "text": "approved: ship it"
+      }
+    },
+    {
+      "id": "01JC0000000000000000000012",
+      "epoch": 3,
+      "at": 1760000012000,
+      "event": {
+        "kind": "note",
+        "text": "the owner's last record is 3 h old"
+      }
+    }
+  ]
+}

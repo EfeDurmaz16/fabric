@@ -1,0 +1,7 @@
+{
+  "op": "job_move",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "to": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+  "force": false,
+  "path": "/usr/local/bin:/usr/bin:/bin"
+}

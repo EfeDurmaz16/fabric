@@ -1,0 +1,10 @@
+{
+  "kind": "left_as_it_was",
+  "error": {
+    "kind": "failed",
+    "reason": {
+      "code": "internal"
+    },
+    "message": "/x/marker: permission denied"
+  }
+}

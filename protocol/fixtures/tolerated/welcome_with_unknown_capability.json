@@ -1,0 +1,23 @@
+{
+  "schema": "hello_answer",
+  "value": {
+    "type": "welcome",
+    "api": 1,
+    "node": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+    "node_version": "0.1.0",
+    "capabilities": [
+      "job_list",
+      "watch"
+    ]
+  },
+  "reads_as": {
+    "type": "welcome",
+    "api": 1,
+    "node": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+    "node_version": "0.1.0",
+    "capabilities": [
+      "job_list",
+      "watch"
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "kind": "not_owner",
+  "reason": {
+    "code": "epoch_ahead",
+    "yours": 4,
+    "current": 3
+  },
+  "message": "epoch 4 is ahead of this node's 3"
+}

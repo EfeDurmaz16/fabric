@@ -1,0 +1,18 @@
+{
+  "schema": "refusal",
+  "value": {
+    "kind": "job_state",
+    "reason": {
+      "code": "quota_exceeded",
+      "limit": 3
+    },
+    "message": "too many jobs"
+  },
+  "reads_as": {
+    "kind": "job_state",
+    "reason": {
+      "code": "unrecognized"
+    },
+    "message": "too many jobs"
+  }
+}

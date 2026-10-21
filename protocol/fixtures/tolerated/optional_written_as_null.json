@@ -1,0 +1,12 @@
+{
+  "schema": "request",
+  "value": {
+    "op": "job_suspend",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "path": null
+  },
+  "reads_as": {
+    "op": "job_suspend",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0"
+  }
+}

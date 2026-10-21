@@ -1,0 +1,10 @@
+{
+  "schema": "reply",
+  "value": {
+    "kind": "harness_session",
+    "harness": {
+      "kind": "codex"
+    },
+    "session": "../etc"
+  }
+}

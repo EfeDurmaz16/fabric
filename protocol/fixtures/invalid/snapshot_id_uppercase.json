@@ -1,0 +1,7 @@
+{
+  "schema": "reply",
+  "value": {
+    "kind": "job_suspend",
+    "snapshot": "ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB"
+  }
+}

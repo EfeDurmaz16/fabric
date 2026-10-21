@@ -1,0 +1,8 @@
+{
+  "kind": "unreachable",
+  "reason": {
+    "code": "unknown_peer",
+    "node": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba"
+  },
+  "message": "not paired"
+}

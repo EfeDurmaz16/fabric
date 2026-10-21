@@ -1,0 +1,26 @@
+{
+  "type": "welcome",
+  "api": 1,
+  "node": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+  "node_version": "0.1.0",
+  "capabilities": [
+    "node_id",
+    "node_add",
+    "node_list",
+    "node_ping",
+    "job_new",
+    "job_list",
+    "job_status",
+    "job_log",
+    "job_run",
+    "job_resume",
+    "job_suspend",
+    "job_move",
+    "job_steal",
+    "job_decide",
+    "doctor",
+    "harness_started",
+    "harness_session",
+    "harness_exited"
+  ]
+}

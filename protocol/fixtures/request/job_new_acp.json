@@ -1,0 +1,12 @@
+{
+  "op": "job_new",
+  "repo": "/Users/me/oss/some-repo",
+  "goal": "fix the flaky test",
+  "harness": {
+    "kind": "acp",
+    "program": "opencode",
+    "args": [
+      "acp"
+    ]
+  }
+}

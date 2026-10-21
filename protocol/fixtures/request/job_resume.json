@@ -1,0 +1,10 @@
+{
+  "op": "job_resume",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "on": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+  "harness": {
+    "kind": "codex"
+  },
+  "force": true,
+  "path": "/usr/local/bin:/usr/bin:/bin"
+}

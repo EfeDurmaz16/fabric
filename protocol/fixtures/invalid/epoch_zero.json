@@ -1,0 +1,13 @@
+{
+  "schema": "request",
+  "value": {
+    "op": "harness_started",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "epoch": 0,
+    "pid": 4242,
+    "harness": {
+      "kind": "claude_code"
+    },
+    "session": "9c9796f0-2682-4546-a963-d314b3ad543f"
+  }
+}

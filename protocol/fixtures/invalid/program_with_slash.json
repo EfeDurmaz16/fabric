@@ -1,0 +1,13 @@
+{
+  "schema": "request",
+  "value": {
+    "op": "job_new",
+    "repo": "/r",
+    "goal": "g",
+    "harness": {
+      "kind": "acp",
+      "program": "/tmp/x",
+      "args": []
+    }
+  }
+}

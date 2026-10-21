@@ -1,0 +1,27 @@
+{
+  "kind": "job_status",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "node": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+  "goal": "g",
+  "harness": {
+    "kind": "codex"
+  },
+  "owner": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+  "epoch": 1,
+  "view": {
+    "kind": "owner"
+  },
+  "workspace": {
+    "root": "/Users/me/fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/work",
+    "state": {
+      "kind": "current",
+      "marker": {
+        "kind": "live"
+      }
+    }
+  },
+  "process": {
+    "kind": "not_running"
+  },
+  "records": 1
+}

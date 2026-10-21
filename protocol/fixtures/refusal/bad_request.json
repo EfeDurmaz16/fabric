@@ -1,0 +1,7 @@
+{
+  "kind": "failed",
+  "reason": {
+    "code": "bad_request"
+  },
+  "message": "the request does not parse"
+}

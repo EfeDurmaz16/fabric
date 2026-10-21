@@ -1,0 +1,47 @@
+{
+  "kind": "job_list",
+  "jobs": [
+    {
+      "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+      "standing": "owner",
+      "epoch": 1,
+      "goal": "fix the flaky test"
+    },
+    {
+      "job": "01JABCDEFGHJKMNPQRSTVWXYZ1",
+      "standing": "departing",
+      "epoch": 2,
+      "goal": "a"
+    },
+    {
+      "job": "01JABCDEFGHJKMNPQRSTVWXYZ2",
+      "standing": "departed",
+      "epoch": 3,
+      "goal": "b"
+    },
+    {
+      "job": "01JABCDEFGHJKMNPQRSTVWXYZ3",
+      "standing": "replica",
+      "epoch": 1,
+      "goal": "c"
+    },
+    {
+      "job": "01JABCDEFGHJKMNPQRSTVWXYZ4",
+      "standing": "frozen",
+      "epoch": 4,
+      "goal": "d"
+    },
+    {
+      "job": "01JABCDEFGHJKMNPQRSTVWXYZ5",
+      "standing": "unreadable",
+      "epoch": 1,
+      "goal": "e"
+    }
+  ],
+  "closed": [
+    {
+      "job": "01JABCDEFGHJKMNPQRSTVWXYZ6",
+      "error": "ledger is damaged at record 3"
+    }
+  ]
+}

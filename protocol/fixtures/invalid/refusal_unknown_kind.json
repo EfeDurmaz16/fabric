@@ -1,0 +1,10 @@
+{
+  "schema": "refusal",
+  "value": {
+    "kind": "on_fire",
+    "reason": {
+      "code": "internal"
+    },
+    "message": "x"
+  }
+}

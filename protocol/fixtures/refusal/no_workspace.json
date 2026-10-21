@@ -1,0 +1,8 @@
+{
+  "kind": "job_state",
+  "reason": {
+    "code": "no_workspace",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0"
+  },
+  "message": "no workspace"
+}

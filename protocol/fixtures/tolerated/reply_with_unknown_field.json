@@ -1,0 +1,12 @@
+{
+  "schema": "reply",
+  "value": {
+    "kind": "job_suspend",
+    "snapshot": "abababababababababababababababababababababababababababababababab",
+    "bytes": 9
+  },
+  "reads_as": {
+    "kind": "job_suspend",
+    "snapshot": "abababababababababababababababababababababababababababababababab"
+  }
+}

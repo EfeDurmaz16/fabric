@@ -1,0 +1,8 @@
+{
+  "schema": "request",
+  "value": {
+    "op": "harness_exited",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "pid": 0
+  }
+}

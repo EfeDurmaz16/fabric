@@ -1,0 +1,7 @@
+{
+  "kind": "failed",
+  "reason": {
+    "code": "internal"
+  },
+  "message": "/x: permission denied"
+}

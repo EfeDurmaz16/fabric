@@ -1,0 +1,11 @@
+{
+  "kind": "holder_not_told",
+  "holder": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+  "error": {
+    "kind": "failed",
+    "reason": {
+      "code": "internal"
+    },
+    "message": "a blocking task ended early: cancelled"
+  }
+}

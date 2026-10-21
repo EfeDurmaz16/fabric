@@ -1,0 +1,30 @@
+{
+  "schema": "reply",
+  "value": {
+    "kind": "job_log",
+    "records": [
+      {
+        "id": "01JC0000000000000000000000",
+        "epoch": 1,
+        "at": 1,
+        "event": {
+          "kind": "approval_requested",
+          "by": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq"
+        }
+      }
+    ]
+  },
+  "reads_as": {
+    "kind": "job_log",
+    "records": [
+      {
+        "id": "01JC0000000000000000000000",
+        "epoch": 1,
+        "at": 1,
+        "event": {
+          "kind": "unrecognized"
+        }
+      }
+    ]
+  }
+}

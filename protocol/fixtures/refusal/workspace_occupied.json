@@ -1,0 +1,8 @@
+{
+  "kind": "job_state",
+  "reason": {
+    "code": "workspace_occupied",
+    "root": "/Users/me/fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/work"
+  },
+  "message": "holds files"
+}

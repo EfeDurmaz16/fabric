@@ -1,0 +1,4 @@
+{
+  "op": "doctor",
+  "path": "/usr/local/bin:/usr/bin:/bin"
+}
