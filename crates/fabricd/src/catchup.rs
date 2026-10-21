@@ -301,12 +301,23 @@ impl Node {
     }
 
     /// Freezes `job`, whose lock the caller holds, and stops its harness.
+    ///
+    /// The fork rule is applied again under the lock: a steal or an import
+    /// since the caller read this node's epoch can carry it past the
+    /// peer's, and then the peer is the side that stops (`ForkBehind`).
     pub(crate) async fn freeze_locked(
         &self,
         job: &mut Job,
         fork: &ForkRecord,
         out: &mut Out,
     ) -> Result<(), NodeError> {
+        if fork.epoch < job.ledger().lease().epoch() {
+            return Err(NodeError::ForkBehind {
+                job: job.id(),
+                peer: fork.peer,
+                epoch: fork.epoch,
+            });
+        }
         if job.freeze(fork)? {
             out.say(format!(
                 "frozen: {}'s ledger at epoch {} does not continue this node's",

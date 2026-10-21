@@ -4173,4 +4173,43 @@ pub(crate) mod tests {
             "{refused:?}"
         );
     }
+
+    /// `forked_from` reads this node's epoch, then freezes under the job's
+    /// lock. A steal or import in between can carry this node past the
+    /// peer's epoch, and then the peer is the side that stops: the freeze
+    /// must compare again under its lock and leave the job running here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fork_behind_this_nodes_epoch_never_freezes_the_job() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        a.suspend(id, &path, &mut Out::default()).await.unwrap();
+        b.pull_records(id, a.id).await.unwrap();
+        b.ensure_latest(id, a.id).await.unwrap();
+        b.job_steal(id, "a sleeps".to_owned(), true, &mut Out::default())
+            .await
+            .unwrap();
+        let refused = b
+            .freeze(
+                id,
+                &crate::local::ForkRecord {
+                    peer: a.id,
+                    epoch: Epoch::FIRST,
+                    head: fabric_core::id::RecordHash::of(b"a head at epoch 1"),
+                },
+                &mut Out::default(),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(NodeError::ForkBehind { .. })),
+            "{refused:?}"
+        );
+        let job = b.job(id).await.unwrap();
+        assert!(
+            job.lock().await.forked().unwrap().is_none(),
+            "a fork behind this node's epoch froze the job"
+        );
+    }
 }
