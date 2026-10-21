@@ -2,8 +2,10 @@
 // crates/fabric-client/tests/contract.rs on the same files in
 // protocol/fixtures. Every fixture parses and writes back to the same JSON,
 // every op, event kind, refusal reason and variant of every nested enum has
-// a fixture, the messages under `invalid` are refused, and the messages
-// under `tolerated` read as the compatibility rule of ADR 0018 says.
+// a fixture, the messages under `invalid` are refused, the messages under
+// `tolerated` read as the compatibility rule of ADR 0018 says, and every
+// object of every message skips a field it does not know outside what a
+// client launches.
 
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
@@ -164,6 +166,51 @@ function without(value: unknown, pointer: string): unknown {
 
 /** The directories of fixtures that are messages of the api. */
 const MESSAGES = ["hello", "hello_answer", "answer", "request", "reply", "event", "refusal"] as const;
+
+/** Every object in `value`, at any depth, as a JSON pointer below `at`, `value` itself included. */
+function objects(value: unknown, at = ""): string[] {
+  if (Array.isArray(value)) {
+    return value.flatMap((item, index) => objects(item, `${at}/${index}`));
+  }
+  if (typeof value === "object" && value !== null) {
+    return [
+      at,
+      ...Object.entries(value).flatMap(([key, field]) =>
+        objects(field, `${at}/${key.replaceAll("~", "~0").replaceAll("/", "~1")}`),
+      ),
+    ];
+  }
+  return [];
+}
+
+/** The value `pointer` names in `value`. */
+function at(value: unknown, pointer: string): unknown {
+  let here = value;
+  for (const step of pointer.split("/").slice(1)) {
+    here = Object.getOwnPropertyDescriptor(here, step.replaceAll("~1", "/").replaceAll("~0", "~"))?.value;
+  }
+  return here;
+}
+
+/** Whether `value` is a run plan, the reply to `job_run` or `job_resume`. */
+function isPlan(value: unknown): boolean {
+  const kind: unknown = typeof value === "object" && value !== null ? Reflect.get(value, "kind") : undefined;
+  return kind === "job_run" || kind === "job_resume";
+}
+
+/**
+ * Whether the object at `pointer` in `message` is part of what a client launches, where a reader refuses a
+ * field it does not know (ADR 0018, Compatibility, rule 2): a run plan with all it holds, and a harness
+ * wherever it appears.
+ */
+function launched(message: unknown, pointer: string): boolean {
+  const steps = pointer.split("/").slice(1);
+  return (
+    steps.includes("harness") ||
+    isPlan(message) ||
+    steps.some((_, index) => isPlan(at(message, `/${steps.slice(0, index + 1).join("/")}`)))
+  );
+}
 
 describe("the shared fixtures", () => {
   test("every fixture parses and writes back to the same JSON", () => {
@@ -426,6 +473,38 @@ describe("the shared fixtures", () => {
         throw new Error(`tolerated/${name} does not parse: ${parsed.error.message}`);
       }
       expect(written(parsed.data), `tolerated/${name}`).toStrictEqual(field(fixture, "reads_as"));
+    }
+  });
+
+  // ADR 0018, Compatibility, rule 2: a reader skips a field it does not know in a reply, an event or a refusal
+  // reason, and a node one in a request or a hello, except in what a client launches. Only two replies and one
+  // request were held to it, so a reader made strict elsewhere, such as in the incompatible answer, which may grow
+  // a version range (rule 4), or in an event every suspend sends, passed both suites (review finding on PR #13).
+  // Every object of every message fixture gets a field no reader knows, with a value of each JSON kind, a float
+  // among them, read as a frame's body is, and must read as before, or be refused in what a client launches.
+  test("every object skips a field it does not know outside what a client launches", () => {
+    const unknown = { a: [1.5, null, true, "x", {}] };
+    for (const dir of MESSAGES) {
+      const schema = schemaNamed(dir);
+      for (const [name, json] of fixtures(dir)) {
+        for (const pointer of objects(json)) {
+          const grown: unknown = structuredClone(json);
+          const target = at(grown, pointer);
+          if (typeof target !== "object" || target === null) {
+            throw new Error(`${dir}/${name}: ${pointer} names no object`);
+          }
+          Reflect.set(target, "added_by_a_newer_node", unknown);
+          const parsed = schema.safeParse(decodeJson(new TextEncoder().encode(JSON.stringify(grown))));
+          const where = `${dir}/${name}: a field at ${JSON.stringify(pointer)}`;
+          if (launched(json, pointer)) {
+            expect(parsed.success, `${where} was skipped in what a client launches`).toBe(false);
+          } else if (parsed.success) {
+            expect(written(parsed.data), where).toStrictEqual(json);
+          } else {
+            throw new Error(`${where} was refused: ${parsed.error.message}`);
+          }
+        }
+      }
     }
   });
 

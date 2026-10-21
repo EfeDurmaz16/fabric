@@ -1,9 +1,11 @@
 //! The Rust half of the client API's contract test: every fixture in
 //! `protocol/fixtures` parses into its type and writes back to the same
 //! JSON, every op, event kind, refusal reason and variant of every nested
-//! enum has a fixture, the messages under `invalid` are refused, and the
+//! enum has a fixture, the messages under `invalid` are refused, the
 //! messages under `tolerated` read as the newer-node rule of ADR 0018
-//! says. The TypeScript SDK runs the same checks on the same files.
+//! says, and every object of every message skips a field it does not know
+//! outside what a client launches. The TypeScript SDK runs the same
+//! checks on the same files.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -814,6 +816,92 @@ fn a_message_from_a_newer_node_reads_as_the_compatibility_rule_says() {
         let parsed = parse_as(schema, &fixture["value"])
             .unwrap_or_else(|e| panic!("tolerated/{name} does not parse: {e}"));
         assert_eq!(parsed, fixture["reads_as"], "tolerated/{name}");
+    }
+}
+
+/// Every object in `value`, at any depth, as a JSON pointer below `at`,
+/// `value` itself included.
+fn objects(value: &Value, at: &str, into: &mut Vec<String>) {
+    match value {
+        Value::Object(fields) => {
+            into.push(at.to_owned());
+            for (key, field) in fields {
+                let here = format!("{at}/{}", key.replace('~', "~0").replace('/', "~1"));
+                objects(field, &here, into);
+            }
+        }
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                objects(item, &format!("{at}/{i}"), into);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether the object at `pointer` in `message` is part of what a client
+/// launches, where a reader refuses a field it does not know (ADR 0018,
+/// Compatibility, rule 2): a run plan with all it holds, and a harness
+/// wherever it appears.
+fn launched(message: &Value, pointer: &str) -> bool {
+    let mut prefix = String::new();
+    let mut in_plan = is_plan(message);
+    for key in pointer.split('/').skip(1) {
+        if key == "harness" {
+            return true;
+        }
+        prefix = format!("{prefix}/{key}");
+        in_plan |= message.pointer(&prefix).is_some_and(is_plan);
+    }
+    in_plan
+}
+
+/// Whether `value` is a run plan, the reply to `job_run` or `job_resume`.
+fn is_plan(value: &Value) -> bool {
+    matches!(
+        value.get("kind").and_then(Value::as_str),
+        Some("job_run" | "job_resume")
+    )
+}
+
+/// ADR 0018, Compatibility, rule 2: a reader skips a field it does not
+/// know in a reply, an event or a refusal reason, and a node one in a
+/// request or a hello, except in what a client launches. Only two replies
+/// and one request were held to it, so a reader made strict elsewhere,
+/// such as in the incompatible answer, which may grow a version range
+/// (rule 4), or in an event every suspend sends, passed both suites
+/// (review finding on PR #13). Every object of every message fixture now
+/// gets a field no reader knows, with a value of each JSON kind, a float
+/// among them, and must read as before, or be refused in what a client
+/// launches.
+#[test]
+fn every_object_skips_a_field_it_does_not_know_outside_what_a_client_launches() {
+    let unknown = serde_json::json!({ "a": [1.5, null, true, "x", {}] });
+    for dir in MESSAGES {
+        for (name, json) in read_dir(dir).unwrap() {
+            let mut at = Vec::new();
+            objects(&json, "", &mut at);
+            for pointer in at {
+                let mut grown = json.clone();
+                grown
+                    .pointer_mut(&pointer)
+                    .and_then(Value::as_object_mut)
+                    .unwrap()
+                    .insert("added_by_a_newer_node".to_owned(), unknown.clone());
+                let parsed = parse_as(dir, &grown);
+                if launched(&json, &pointer) {
+                    assert!(
+                        parsed.is_err(),
+                        "{dir}/{name}: a field at {pointer:?} was skipped in what a client launches"
+                    );
+                } else {
+                    match parsed {
+                        Ok(read) => assert_eq!(read, json, "{dir}/{name}: a field at {pointer:?}"),
+                        Err(e) => panic!("{dir}/{name}: a field at {pointer:?} was refused: {e}"),
+                    }
+                }
+            }
+        }
     }
 }
 

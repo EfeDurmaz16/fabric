@@ -1,0 +1,17 @@
+{
+  "schema": "hello_answer",
+  "value": {
+    "type": "incompatible",
+    "api": 2,
+    "node_version": "0.2.0",
+    "accepts": [
+      1,
+      2
+    ]
+  },
+  "reads_as": {
+    "type": "incompatible",
+    "api": 2,
+    "node_version": "0.2.0"
+  }
+}

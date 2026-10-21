@@ -158,7 +158,7 @@ C2 adds a live event stream and approvals from a phone. It builds on two things 
 - `SessionId` moves from `fabric-harness` to `fabric-core`, so a client does not depend on the harness adapters.
 - `crates/fabric/src/render.rs`: the human text for every reply, and each event's line from `sentences`.
 - `sdk/typescript`: the TypeScript client for Node and Bun. Strict mode, named exports, zod schemas at the boundary and no other runtime dependency.
-- `protocol/fixtures`: one JSON example of every hello, request, reply, event and refusal reason, some messages both clients must refuse, and one framed hello as hex. The Rust tests and the TypeScript tests both parse every fixture and write it back to the same JSON, so the two clients cannot drift apart without a test failing.
+- `protocol/fixtures`: one JSON example of every hello, request, reply, event and refusal reason, some messages both clients must refuse, and one framed hello as hex. The Rust tests and the TypeScript tests both parse every fixture and write it back to the same JSON, so the two clients cannot drift apart without a test failing. Both also add a field no reader knows to every object of every message fixture, which must read as before outside a run plan and a harness and be refused inside them, so a reader made strict where rule 2 has it skip fails both suites.
 
 ## Alternatives considered
 
