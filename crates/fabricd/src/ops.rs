@@ -334,7 +334,7 @@ impl Node {
                 "{} {word} epoch {} {}",
                 job.id(),
                 manifest.lease.epoch(),
-                manifest.goal
+                summary(&manifest.goal)
             ));
         }
         for (id, error) in self.broken_jobs() {
@@ -2192,6 +2192,20 @@ fn report_caches(caches: &[fabric_core::snapshot::CacheEntry], facts: &NodeFacts
     }
 }
 
+/// The longest goal summary `job ls` prints, in characters.
+const SUMMARY_CHARS: usize = 72;
+
+/// A goal's first line, cut to `SUMMARY_CHARS`, so that a list of goals
+/// up to the record bound each still fits in one control answer.
+fn summary(goal: &str) -> String {
+    let first = goal.lines().next().unwrap_or_default();
+    match first.char_indices().nth(SUMMARY_CHARS) {
+        Some((cut, _)) => format!("{}...", &first[..cut]),
+        None if first.len() < goal.len() => format!("{first} ..."),
+        None => first.to_owned(),
+    }
+}
+
 /// Says, one line per path, what the snapshot carries that a secret
 /// pattern matches, and what of the workspace and the harness state it
 /// leaves out.
@@ -3704,5 +3718,35 @@ pub(crate) mod tests {
                 out.lines
             );
         }
+    }
+
+    /// Goals near the record bound, five of them, add up past the control
+    /// message cap. `job ls` must still answer: it names each goal by a
+    /// short summary, and `job status` shows one goal whole.
+    #[tokio::test]
+    async fn a_job_list_fits_one_answer_whatever_the_goals() {
+        let (dir, node) = node();
+        let repo = repo(dir.path());
+        let goal = format!("first line\n{}", "x".repeat(900 << 10));
+        for _ in 0..5 {
+            node.job_new(&repo, goal.clone(), HarnessKind::Codex, &mut Out::default())
+                .await
+                .unwrap();
+        }
+        let mut out = Out::default();
+        node.job_list(&mut out).await;
+        assert_eq!(out.lines.len(), 5);
+        let bytes: usize = out.lines.iter().map(String::len).sum();
+        assert!(
+            bytes < crate::control::MAX_CONTROL_MESSAGE,
+            "{bytes} bytes of lines"
+        );
+        assert!(
+            out.lines
+                .iter()
+                .all(|line| line.ends_with(" first line ...")),
+            "{:?}",
+            out.lines
+        );
     }
 }
