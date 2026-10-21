@@ -573,10 +573,11 @@ async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_the
         .unwrap();
     assert!(running.child_mut().wait().await.unwrap().success());
     let seen = std::fs::read_to_string(&log).unwrap();
+    // `codex exec` sets its own approval policy, so the pinned one is not passed.
     assert_eq!(
         seen,
         format!(
-            "cwd={}\narg=exec\narg=resume\narg={THREAD}\narg=--json\narg=-c\narg=projects.\"{}\".trust_level=trusted\narg=-c\narg=sandbox_mode=\"workspace-write\"\narg=-c\narg=approval_policy=\"never\"\narg=--\narg=reply with the secret word\n",
+            "cwd={}\narg=exec\narg=resume\narg={THREAD}\narg=--json\narg=-c\narg=projects.\"{}\".trust_level=trusted\narg=-c\narg=sandbox_mode=\"workspace-write\"\narg=--\narg=reply with the secret word\n",
             src.work.display(),
             src.work.display()
         )

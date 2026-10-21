@@ -17,6 +17,12 @@
 //! A resume takes these settings from the session (`rollout::recorded`),
 //! and any field the adapter was configured with wins over the session's
 //! (`effective`). A launch with no session passes only what was configured.
+//! A headless launch passes no approval policy and reports the one it
+//! would have passed as left out: `codex exec` sets its own, `never`,
+//! as a typed override that wins over `-c`, and drops it only when the
+//! node sends approvals to auto review, which then uses the node's own
+//! (`codex-rs/exec/src/lib.rs` at `rust-v0.155.1`, `ConfigOverrides` and
+//! `build_exec_config`).
 
 use crate::harness::{LaunchSettings, ModelName, NotCarried, Origin, PassedSetting, SettingName};
 
@@ -176,12 +182,40 @@ fn pick<T: Clone>(
     Some(value)
 }
 
+/// Why a headless launch passes no approval policy.
+const EXEC_SETS_APPROVAL: &str = "codex exec sets it: never, or this node's own under auto review";
+
+/// One field a launch cannot pass: the value it would have passed, the
+/// pin or else the session's, is reported as left out for `reason`; a
+/// value Fabric does not carry keeps its own reason.
+fn leave_out<T>(
+    name: SettingName,
+    pinned: Option<&T>,
+    recorded: Option<&Recorded<T>>,
+    spell: impl Fn(&T) -> String,
+    reason: &str,
+    report: &mut LaunchSettings,
+) {
+    let left = match (pinned, recorded) {
+        (Some(value), _) | (None, Some(Recorded::Carried(value))) => {
+            NotCarried::new(name, &spell(value), reason)
+        }
+        (None, Some(Recorded::NotCarried { value, reason })) => {
+            NotCarried::new(name, value, reason.clone())
+        }
+        (None, Some(Recorded::Absent) | None) => return,
+    };
+    report.not_carried.push(left);
+}
+
 /// The overrides a launch passes, and what to say about them: each field
 /// the adapter was configured with, else the session's own when the
-/// launch resumes one and Fabric carries its value.
+/// launch resumes one and Fabric carries its value. A `headless` launch
+/// passes no approval policy, because `codex exec` sets its own.
 pub(crate) fn effective(
     pinned: Option<&CodexOverrides>,
     recorded: Option<&RecordedSettings>,
+    headless: bool,
 ) -> (CodexOverrides, LaunchSettings) {
     let mut report = LaunchSettings::default();
     let model = pick(
@@ -205,13 +239,28 @@ pub(crate) fn effective(
         |v| v.as_str().to_owned(),
         &mut report,
     );
-    let approval = pick(
-        SettingName::Approval,
-        pinned.and_then(|p| p.approval.as_ref()),
-        recorded.map(|r| &r.approval),
-        |v| v.as_str().to_owned(),
-        &mut report,
-    );
+    let pinned_approval = pinned.and_then(|p| p.approval.as_ref());
+    let recorded_approval = recorded.map(|r| &r.approval);
+    let spell_approval = |v: &ApprovalPolicy| v.as_str().to_owned();
+    let approval = if headless {
+        leave_out(
+            SettingName::Approval,
+            pinned_approval,
+            recorded_approval,
+            spell_approval,
+            EXEC_SETS_APPROVAL,
+            &mut report,
+        );
+        None
+    } else {
+        pick(
+            SettingName::Approval,
+            pinned_approval,
+            recorded_approval,
+            spell_approval,
+            &mut report,
+        )
+    };
     let overrides = CodexOverrides {
         sandbox,
         approval,
@@ -247,7 +296,7 @@ mod tests {
             sandbox: Some(SandboxMode::ReadOnly),
             ..CodexOverrides::default()
         };
-        let (overrides, report) = effective(Some(&pinned), Some(&recorded()));
+        let (overrides, report) = effective(Some(&pinned), Some(&recorded()), false);
         assert_eq!(
             overrides,
             CodexOverrides {
@@ -278,8 +327,45 @@ mod tests {
                 "not an effort Fabric passes"
             )]
         );
-        let (none, report) = effective(None, None);
+        let (none, report) = effective(None, None, false);
         assert_eq!(none, CodexOverrides::default());
         assert_eq!(report, LaunchSettings::default());
+    }
+
+    /// `codex exec` sets its own approval policy over any `-c`, so a
+    /// headless launch passes none and says which one it left out, the
+    /// pin's or else the session's.
+    #[test]
+    fn a_headless_launch_leaves_the_approval_policy_to_codex_exec() {
+        let (overrides, report) = effective(None, Some(&recorded()), true);
+        assert_eq!(overrides.approval, None);
+        assert!(
+            report
+                .passed
+                .iter()
+                .all(|p| p.name != SettingName::Approval)
+        );
+        assert_eq!(
+            report.not_carried.last(),
+            Some(&NotCarried::new(
+                SettingName::Approval,
+                "on-request",
+                EXEC_SETS_APPROVAL
+            ))
+        );
+        let pinned = CodexOverrides {
+            approval: Some(ApprovalPolicy::Never),
+            ..CodexOverrides::default()
+        };
+        let (overrides, report) = effective(Some(&pinned), None, true);
+        assert_eq!(overrides, CodexOverrides::default());
+        assert_eq!(
+            report.not_carried,
+            [NotCarried::new(
+                SettingName::Approval,
+                "never",
+                EXEC_SETS_APPROVAL
+            )]
+        );
     }
 }

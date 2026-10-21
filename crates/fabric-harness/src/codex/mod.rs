@@ -49,8 +49,9 @@
 //! finding F10a): Codex resumes with the model of this node's
 //! `config.toml`, not the one the thread ran with, so the launch reads
 //! the last `turn_context` of the lineage and passes its model, effort,
-//! approval policy and sandbox, each one the adapter was configured with
-//! winning (`overrides::effective`). Before anything starts it asks the
+//! sandbox and, on a terminal run, approval policy, each one the adapter
+//! was configured with winning (`overrides::effective`); `codex exec`
+//! sets its own approval policy. Before anything starts it asks the
 //! binary it would run for its version and refuses when that is older
 //! than the newest `cli_version` the lineage records, or unreadable
 //! (`version::refuse_older`, gate finding F10b). A lineage that records
@@ -731,8 +732,11 @@ impl Codex {
             Some(session) => Some(self.read_session(&root, &binary, env, session).await?),
             None => None,
         };
-        let (overrides, settings) =
-            overrides::effective(self.overrides.as_ref(), recorded.as_ref());
+        let (overrides, settings) = overrides::effective(
+            self.overrides.as_ref(),
+            recorded.as_ref(),
+            launch.is_headless(),
+        );
         let args = Self::args_for(&root, launch, &overrides)?;
         let session = launch.resume().cloned();
         let spawned =
@@ -1044,9 +1048,10 @@ mod tests {
         assert_eq!(fixture.ran(), None);
     }
 
-    /// A resume passes the model, effort, approval policy and sandbox the
-    /// session ran with, and says so; a new thread reads nothing and
-    /// passes nothing (gate finding F10a).
+    /// A headless resume passes the model, effort and sandbox the session
+    /// ran with and says so, and leaves the approval policy to `codex
+    /// exec`; a new thread reads nothing and passes nothing (gate finding
+    /// F10a).
     #[tokio::test]
     async fn a_resume_passes_the_settings_the_session_ran_with() {
         let fixture = Resume::new("codex-cli 0.155.1");
@@ -1071,8 +1076,6 @@ mod tests {
                 "model_reasoning_effort=\"xhigh\"",
                 "-c",
                 "sandbox_mode=\"workspace-write\"",
-                "-c",
-                "approval_policy=\"on-request\"",
                 "--",
                 "next"
             ]
@@ -1085,13 +1088,17 @@ mod tests {
             .collect();
         assert_eq!(
             passed,
-            [
-                "model gpt-6-sol",
-                "effort xhigh",
-                "sandbox workspace-write",
-                "approval on-request"
-            ]
+            ["model gpt-6-sol", "effort xhigh", "sandbox workspace-write"]
         );
+        // `codex exec` sets its own approval policy, so a headless resume
+        // passes none and says so.
+        let left: Vec<String> = running
+            .settings()
+            .not_carried
+            .iter()
+            .map(|n| format!("{} {}", n.name, n.value))
+            .collect();
+        assert_eq!(left, ["approval on-request"]);
 
         let mut running = fixture.launch(false).await.unwrap();
         running.child_mut().wait().await.unwrap();

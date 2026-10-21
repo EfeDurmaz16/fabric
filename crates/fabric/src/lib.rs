@@ -672,7 +672,7 @@ fn settings_lines(
     }
     for left in &settings.not_carried {
         lines.push(format!(
-            "{} {} is not carried ({}); {harness} uses this node's own setting",
+            "{} {} is not carried ({}); {harness} uses its own setting",
             left.name, left.value, left.reason
         ));
     }
@@ -1209,7 +1209,7 @@ mod tests {
             settings_lines(&HarnessKind::Codex, Some(&session), &settings),
             [
                 "continuing codex session 019f233e-bb33-7342-85fa-f2d33b14368a with model gpt-6-sol, effort xhigh (recorded in the session)",
-                "sandbox danger-full-access is not carried (Fabric never passes full access, ADR 0006); codex uses this node's own setting",
+                "sandbox danger-full-access is not carried (Fabric never passes full access, ADR 0006); codex uses its own setting",
             ]
         );
         let mixed = LaunchSettings {

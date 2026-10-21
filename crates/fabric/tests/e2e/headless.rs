@@ -47,8 +47,8 @@ fn assert_env(env: &Env, name: &str) -> Fallible {
 /// names in its first event while the turn still runs, prints the answer
 /// and the thread, and a suspend captures the rollout; a headless resume
 /// continues that thread with `codex exec resume`, passing the model,
-/// effort, approval policy and sandbox the thread ran with, and says so
-/// (gate finding F10a).
+/// effort and sandbox the thread ran with, and says so, and says that it
+/// left the approval policy to `codex exec` (gate finding F10a).
 #[test]
 fn e2e_a_headless_codex_turn_records_its_thread_for_the_next_capture() -> Fallible {
     let env = Env::new()?;
@@ -112,15 +112,13 @@ fn e2e_a_headless_codex_turn_records_its_thread_for_the_next_capture() -> Fallib
             "model_reasoning_effort=\"xhigh\"",
             "-c",
             "sandbox_mode=\"workspace-write\"",
-            "-c",
-            "approval_policy=\"on-request\"",
             "--",
             "next"
         ]
     );
     assert!(
         resumed.contains(&format!(
-            "continuing codex session {thread} with model gpt-6-sol, effort xhigh, sandbox workspace-write, approval on-request (recorded in the session)"
+            "continuing codex session {thread} with model gpt-6-sol, effort xhigh, sandbox workspace-write (recorded in the session)\napproval on-request is not carried (codex exec sets it: never, or this node's own under auto review); codex uses its own setting\n"
         )),
         "{resumed}"
     );
