@@ -404,6 +404,9 @@ const STATE_ENTRIES: [&str; 10] = [
 /// this user's; when it lets others in, its mode is narrowed only if it
 /// holds nothing but what Fabric writes, so a `FABRIC_HOME` that names a
 /// shared directory, such as `/tmp` or a project, is refused, not changed.
+/// When others can write in it, any of them could have made an entry
+/// under one of Fabric's names, such as a `peers` book that pairs their
+/// node, so it is narrowed only while empty.
 fn prepare_state_dir(root: &std::path::Path) -> Result<(), NodeError> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     let unsafe_dir = |reason: String| NodeError::UnsafeStateDir {
@@ -433,13 +436,20 @@ fn prepare_state_dir(root: &std::path::Path) -> Result<(), NodeError> {
             meta.uid()
         )));
     }
-    let others = meta.mode() & 0o077;
+    let mode = meta.mode() & 0o777;
+    let others = mode & 0o077;
     if others == 0 {
         return Ok(());
     }
+    let writable = others & 0o022 != 0;
     for entry in fs::read_dir(root).map_err(|e| NodeError::io(root, e))? {
         let name = entry.map_err(|e| NodeError::io(root, e))?.file_name();
         let name = name.to_string_lossy();
+        if writable {
+            return Err(unsafe_dir(format!(
+                "has mode {mode:o}, so other users can write in it, and holds {name}, which any of them could have made; check what it holds"
+            )));
+        }
         let ours = STATE_ENTRIES.iter().any(|known| {
             *name == **known
                 || name
@@ -450,12 +460,24 @@ fn prepare_state_dir(root: &std::path::Path) -> Result<(), NodeError> {
         });
         if !ours {
             return Err(unsafe_dir(format!(
-                "has mode {:o} and holds {name}, which Fabric did not write",
-                meta.mode() & 0o777
+                "has mode {mode:o} and holds {name}, which Fabric did not write"
             )));
         }
     }
-    fs::set_permissions(root, fs::Permissions::from_mode(0o700)).map_err(|e| NodeError::io(root, e))
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700))
+        .map_err(|e| NodeError::io(root, e))?;
+    // An entry another user made between the check and the narrowing.
+    if writable
+        && fs::read_dir(root)
+            .map_err(|e| NodeError::io(root, e))?
+            .next()
+            .is_some()
+    {
+        return Err(unsafe_dir(format!(
+            "had mode {mode:o}, so other users could write in it, and an entry appeared while it was narrowed to 700; check what it holds"
+        )));
+    }
+    Ok(())
 }
 
 type Jobs = BTreeMap<JobId, Arc<tokio::sync::Mutex<Job>>>;
@@ -528,6 +550,29 @@ mod tests {
             "{refused:?}"
         );
         assert_eq!(mode(&shared), 0o755);
+    }
+
+    /// Others who can write in a directory could have made any entry in
+    /// it under one of Fabric's names, such as a `peers` book that pairs
+    /// their node, so only an empty one may be narrowed and adopted.
+    #[test]
+    fn a_directory_others_can_write_is_adopted_only_while_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let team = dir.path().join("team");
+        fs::create_dir(&team).unwrap();
+        fs::write(team.join("peers"), "").unwrap();
+        fs::set_permissions(&team, fs::Permissions::from_mode(0o775)).unwrap();
+        let refused = prepare_state_dir(&team);
+        assert!(
+            matches!(refused, Err(NodeError::UnsafeStateDir { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(mode(&team), 0o775);
+        let empty = dir.path().join("empty");
+        fs::create_dir(&empty).unwrap();
+        fs::set_permissions(&empty, fs::Permissions::from_mode(0o777)).unwrap();
+        prepare_state_dir(&empty).unwrap();
+        assert_eq!(mode(&empty), 0o700);
     }
 
     #[test]

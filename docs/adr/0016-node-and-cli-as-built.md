@@ -12,7 +12,7 @@ The core, the store, the network layer, the harness adapters and the environment
 
 ### One process per state directory
 
-`fabric serve` runs the node. It takes an exclusive `flock` on `<state>/daemon.lock` before it opens anything, and keeps it for its whole life. The state directory is `$FABRIC_HOME`, else `~/.fabric`, mode 0700. A missing one is created 0700; an existing one must be the user's, and when it lets others in its mode is narrowed only if it holds nothing but the entries below, so a `FABRIC_HOME` that names `/tmp` or a project directory is refused and left as it was:
+`fabric serve` runs the node. It takes an exclusive `flock` on `<state>/daemon.lock` before it opens anything, and keeps it for its whole life. The state directory is `$FABRIC_HOME`, else `~/.fabric`, mode 0700. A missing one is created 0700; an existing one must be the user's, and when it lets others in its mode is narrowed only if it holds nothing but the entries below, so a `FABRIC_HOME` that names `/tmp` or a project directory is refused and left as it was. When others can write in it, it is narrowed only while empty, since any of them could have made an entry under one of these names, such as a `peers` book that pairs their node:
 
 ```text
 <state>/
