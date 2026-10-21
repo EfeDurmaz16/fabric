@@ -1498,11 +1498,27 @@ impl Node {
                     reason: format!("it did not start a move; its head is {head}"),
                 });
             }
-            fenced => {
-                return Err(NodeError::Peer {
-                    peer: holder,
-                    reason: format!("it did not start a move: {}", fenced_words(&fenced)),
-                });
+            fenced @ Fenced::StaleEpoch { current, .. } => {
+                return Err(NodeError::peer_fact(
+                    holder,
+                    format!("it did not start a move: {}", fenced_words(&fenced)),
+                    Reason::PeerAhead {
+                        job: id,
+                        peer: holder,
+                        epoch: current,
+                    },
+                ));
+            }
+            fenced @ Fenced::AheadOfUs { current, .. } => {
+                return Err(NodeError::peer_fact(
+                    holder,
+                    format!("it did not start a move: {}", fenced_words(&fenced)),
+                    Reason::PeerBehind {
+                        job: id,
+                        peer: holder,
+                        epoch: current,
+                    },
+                ));
             }
         };
         out.emit(Event::HolderStartedMove { holder, move_id });
@@ -3088,16 +3104,20 @@ pub(crate) mod tests {
         );
     }
 
-    /// Review finding on PR #13: a peer that refused a node's records named
-    /// the epoch it knows only in the sentence, as `peer { peer }`. A owns
-    /// the job at epoch 1; C, which does not know A, steals it and pushes
-    /// the steal to B. When a move from A pushes its records to B, B is at
-    /// epoch 2, and the refusal says so as data, with the sentence it had.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn records_pushed_to_a_peer_at_a_newer_epoch_are_refused_with_it() {
+    /// Three running nodes and a job A made and owns at epoch 1, which C,
+    /// paired with B alone, stole and pushed to B: B is a replica at epoch
+    /// 2 with C as its owner, and A, which knows nothing of the steal, is
+    /// still at epoch 1. The directories come first, kept alive.
+    async fn stolen_without_a() -> (
+        [tempfile::TempDir; 3],
+        Arc<Node>,
+        Arc<Node>,
+        Arc<Node>,
+        JobId,
+    ) {
         let (dir_a, a) = node();
-        let (_dir_b, b) = node();
-        let (_dir_c, c) = node();
+        let (dir_b, b) = node();
+        let (dir_c, c) = node();
         for node in [&a, &b, &c] {
             tokio::spawn(Arc::clone(node).run());
         }
@@ -3118,6 +3138,17 @@ pub(crate) mod tests {
             .unwrap();
         c.push_records(id, b.id).await.unwrap();
         assert_eq!(b.lease(id).await.unwrap().epoch, Epoch::new(2).unwrap());
+        assert_eq!(a.lease(id).await.unwrap().epoch, Epoch::FIRST);
+        ([dir_a, dir_b, dir_c], a, b, c, id)
+    }
+
+    /// Review finding on PR #13: a peer that refused a node's records named
+    /// the epoch it knows only in the sentence, as `peer { peer }`. When a
+    /// move from A pushes its records to B, B is at epoch 2, and the
+    /// refusal says so as data, with the sentence it had.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn records_pushed_to_a_peer_at_a_newer_epoch_are_refused_with_it() {
+        let (_dirs, a, b, _c, id) = stolen_without_a().await;
 
         let refused = a.push_records(id, b.id).await.unwrap_err().to_refusal();
         assert_eq!(
@@ -3137,6 +3168,39 @@ pub(crate) mod tests {
             "{}",
             refused.message()
         );
+    }
+
+    /// Review finding on PR #13: the pull form of the move named the
+    /// holder's epoch only in the sentence, as `peer { peer }`. B, at
+    /// epoch 2, asks A, still at epoch 1, to start a move toward it, as
+    /// `fabric job resume --on A` does on B; A answers that B is ahead of
+    /// it, and the refusal says A is behind, at epoch 1, as data.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pull_from_a_holder_at_an_older_epoch_is_refused_with_it() {
+        let (_dirs, a, b, _c, id) = stolen_without_a().await;
+
+        let refused = b
+            .pull(id, a.id, &mut Out::default())
+            .await
+            .unwrap_err()
+            .to_refusal();
+        assert_eq!(
+            refused.reason(),
+            &Reason::PeerBehind {
+                job: id,
+                peer: a.id,
+                epoch: Epoch::FIRST,
+            }
+        );
+        assert_eq!(refused.kind(), fabric_client::api::RefusalKind::Failed);
+        assert_eq!(
+            refused.message(),
+            format!(
+                "{} answered: it did not start a move: it is at epoch 1, behind this node's, and must catch up first",
+                a.id
+            )
+        );
+        assert_eq!(a.lease(id).await.unwrap().epoch, Epoch::FIRST);
     }
 
     #[tokio::test]
