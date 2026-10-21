@@ -14,6 +14,8 @@ use fabric_core::id::{Epoch, JobId};
 use serde_json::json;
 use tokio::net::UnixStream;
 
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -199,6 +201,25 @@ async fn e2e_a_node_turns_away_another_api_version_and_a_request_it_cannot_read(
         ),
         "{answer:?}"
     );
+}
+
+/// Review finding on PR #13: `fabric serve` exited at start when its own
+/// `PATH` or a tool root named a path that is not UTF-8, applying the
+/// client API's rule to an environment that never crosses the socket. It
+/// starts and answers, as it did before the client API.
+#[test]
+fn e2e_a_daemon_whose_own_environment_is_not_utf8_starts() {
+    let env = Env::new().unwrap();
+    let mut node = Node::new(&env, "a", Wire::Quic).unwrap();
+    let mut path = env.path().to_owned();
+    path.push(OsStr::from_bytes(b":/opt/caf\xe9/bin"));
+    node.daemon_env("PATH", path);
+    node.daemon_env(
+        "CARGO_HOME",
+        OsStr::from_bytes(b"/home/\xff/.cargo").to_owned(),
+    );
+    node.start(None).unwrap();
+    assert!(node.ok(&["node", "id"]).unwrap().contains(&node.id));
 }
 
 /// Review finding on PR #8: capture measured carry keys with the node's

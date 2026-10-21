@@ -50,6 +50,7 @@ use crate::local::{self, HarnessRecord, Liveness, Marker, MarkerState, SessionRe
 use crate::node::{Node, Out, is_transport};
 use crate::paths::{self, RootChoice, SyncedFolders, check_root, restore_root};
 use crate::stamp::TreeStamp;
+use crate::tool_env::ToolEnv;
 use crate::transfer::{fetch_snapshot, is_complete, with_store};
 
 /// How long a harness gets between `SIGTERM` and `SIGKILL` when a suspend stops it.
@@ -118,7 +119,7 @@ impl Node {
                 force,
                 env,
             } => {
-                let env = self.client_env(env);
+                let env = self.client_env(env.as_ref());
                 Reply::JobResume(
                     Box::pin(self.job_resume(job, on, harness, force, &env, out)).await?,
                 )
@@ -148,7 +149,7 @@ impl Node {
                     .await?,
             ),
             Request::JobSuspend { job, env } => {
-                let env = self.client_env(env);
+                let env = self.client_env(env.as_ref());
                 self.resolve_departing(job, out).await?;
                 let snapshot = self.suspend(job, &env, out).await?;
                 self.replicate(job, out).await;
@@ -160,7 +161,7 @@ impl Node {
                 force,
                 env,
             } => {
-                let env = self.client_env(env);
+                let env = self.client_env(env.as_ref());
                 self.job_move(job, to, force, &env, out).await?;
                 Reply::JobMove(self.lease(job).await?)
             }
@@ -176,7 +177,7 @@ impl Node {
                 text: self.job_decide(job, decision, &note).await?,
             }),
             Request::Doctor { peer, job, env } => {
-                let env = self.client_env(env);
+                let env = self.client_env(env.as_ref());
                 Reply::Doctor {
                     report: self.doctor(peer, job, &env).await?,
                 }
@@ -209,8 +210,8 @@ impl Node {
 
     /// The environment a client sent, or the one the node started with
     /// (ADR 0018, The client's environment).
-    fn client_env(&self, env: Option<ClientEnv>) -> ClientEnv {
-        env.unwrap_or_else(|| self.cfg.env.clone())
+    fn client_env(&self, env: Option<&ClientEnv>) -> ToolEnv {
+        env.map_or_else(|| self.cfg.env.clone(), ToolEnv::from)
     }
 
     /// Who owns `id` now, at which epoch.
@@ -654,7 +655,7 @@ impl Node {
     pub(crate) async fn suspend(
         &self,
         id: JobId,
-        env: &ClientEnv,
+        env: &ToolEnv,
         out: &mut Out,
     ) -> Result<SnapshotId, NodeError> {
         let job = self.job(id).await?;
@@ -665,7 +666,7 @@ impl Node {
     pub(crate) async fn suspend_locked(
         &self,
         job: &mut Job,
-        env: &ClientEnv,
+        env: &ToolEnv,
         out: &mut Out,
     ) -> Result<SnapshotId, NodeError> {
         let id = job.id();
@@ -768,7 +769,7 @@ impl Node {
     async fn confirm_departure(
         &self,
         job: &Job,
-        env: &ClientEnv,
+        env: &ToolEnv,
         out: &mut Out,
     ) -> Result<(), NodeError> {
         let Some(record) = job.session()? else {
@@ -795,7 +796,7 @@ impl Node {
         &self,
         job: &Job,
         root: &Path,
-        env: &ClientEnv,
+        env: &ToolEnv,
         out: &mut Out,
     ) -> Result<SnapshotId, NodeError> {
         let state_dir = job.dir().harness_state();
@@ -981,7 +982,7 @@ impl Node {
         id: JobId,
         to: NodeId,
         force: bool,
-        env: &ClientEnv,
+        env: &ToolEnv,
         out: &mut Out,
     ) -> Result<(), NodeError> {
         if to == self.id {
@@ -1359,7 +1360,7 @@ impl Node {
         on: Option<NodeId>,
         harness: Option<HarnessKind>,
         force: bool,
-        env: &ClientEnv,
+        env: &ToolEnv,
         out: &mut Out,
     ) -> Result<RunPlan, NodeError> {
         if let Some(harness) = &harness {
@@ -1661,7 +1662,7 @@ impl Node {
         &self,
         job: &mut Job,
         epoch: Epoch,
-        env: &ClientEnv,
+        env: &ToolEnv,
         out: &mut Out,
     ) -> Result<PathBuf, NodeError> {
         let id = job.id();
@@ -1785,7 +1786,7 @@ impl Node {
         caches: &[fabric_core::snapshot::CacheEntry],
         root: &Path,
         harness_dir: Option<PathBuf>,
-        env: &ClientEnv,
+        env: &ToolEnv,
         out: &mut Out,
     ) -> Result<(), NodeError> {
         let facts = NodeFacts::measure(&self.cfg.home, env).await;
@@ -1849,7 +1850,7 @@ impl Node {
         &self,
         job: &Job,
         root: &Path,
-        env: &ClientEnv,
+        env: &ToolEnv,
         out: &mut Out,
     ) -> Result<(), NodeError> {
         let state_dir = job.dir().harness_state();
@@ -1961,7 +1962,7 @@ impl Node {
         self: &Arc<Self>,
         peer: Option<NodeId>,
         job: Option<JobId>,
-        env: &ClientEnv,
+        env: &ToolEnv,
     ) -> Result<DoctorReport, NodeError> {
         let Some(peer) = peer else {
             let facts = NodeFacts::measure(&self.cfg.home, env).await;
@@ -2007,7 +2008,7 @@ impl Node {
         peer: NodeId,
         job: Option<(&HarnessKind, &Path)>,
         target: Target,
-        env: &ClientEnv,
+        env: &ToolEnv,
         force: bool,
         out: &mut Out,
     ) -> Result<(), NodeError> {
@@ -2032,7 +2033,7 @@ impl Node {
         peer: NodeId,
         job: Option<(&HarnessKind, &Path)>,
         target: Target,
-        env: &ClientEnv,
+        env: &ToolEnv,
     ) -> Result<Vec<doctor::Row>, NodeError> {
         let here = NodeFacts::measure(&self.cfg.home, env).await;
         // A session the peer opened is used too: a peer behind a NAT has
@@ -2220,8 +2221,8 @@ fn move_aside(root: &Path, dest: &Path) -> Result<bool, NodeError> {
 }
 
 /// Reads which folders iCloud Drive syncs on this node; off everywhere `defaults` does not exist.
-async fn synced_folders(home: &Path, env: &ClientEnv) -> SyncedFolders {
-    let path_var = env.path_var();
+async fn synced_folders(home: &Path, env: &ToolEnv) -> SyncedFolders {
+    let path_var = env.path_var().to_owned();
     let read = |key: &'static str| {
         let path_var = path_var.clone();
         let home = home.to_owned();
@@ -2385,7 +2386,7 @@ pub(crate) mod tests {
             home,
             listen: "127.0.0.1:0".parse().unwrap(),
             dial: DialOrder::TcpOnly,
-            env: ClientEnv::current().unwrap(),
+            env: ToolEnv::current(),
         })
         .unwrap();
         (dir, node)
@@ -2461,7 +2462,7 @@ pub(crate) mod tests {
         let (dir_a, a) = node();
         let (_dir_b, b) = node();
         paired(&a, &b).await;
-        let path = ClientEnv::current().unwrap();
+        let path = ToolEnv::current();
         let out = &mut Out::default();
         let id = job(dir_a.path(), &a).await;
         a.suspend(id, &path, out).await.unwrap();
@@ -2526,7 +2527,7 @@ pub(crate) mod tests {
     async fn a_session_named_after_the_start_is_recorded_only_for_the_recorded_harness() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = ClientEnv::current().unwrap();
+        let path = ToolEnv::current();
         let out = &mut Out::default();
         node.suspend(id, &path, out).await.unwrap();
         node.job_run(id, out).await.unwrap();
@@ -2585,7 +2586,7 @@ pub(crate) mod tests {
     async fn a_move_toward_another_node_refuses_with_the_open_moves_target() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = ClientEnv::current().unwrap();
+        let path = ToolEnv::current();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         let (first, second) = (NodeId::from_bytes([7; 32]), NodeId::from_bytes([8; 32]));
         node.depart(id, first, &mut Out::default()).await.unwrap();
@@ -2615,7 +2616,7 @@ pub(crate) mod tests {
     async fn status_calls_a_departing_clean_copy_clean() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = ClientEnv::current().unwrap();
+        let path = ToolEnv::current();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         node.depart(id, NodeId::from_bytes([7; 32]), &mut Out::default())
             .await
@@ -2637,7 +2638,7 @@ pub(crate) mod tests {
         let (_dir_b, b) = node();
         paired(&a, &b).await;
         let id = job(dir_a.path(), &a).await;
-        let path = ClientEnv::current().unwrap();
+        let path = ToolEnv::current();
         a.suspend(id, &path, &mut Out::default()).await.unwrap();
         b.pull_records(id, a.id).await.unwrap();
         b.ensure_latest(id, a.id).await.unwrap();
@@ -2670,7 +2671,7 @@ pub(crate) mod tests {
         let (_dir_b, b) = node();
         paired(&a, &b).await;
         let id = job(dir_a.path(), &a).await;
-        let path = ClientEnv::current().unwrap();
+        let path = ToolEnv::current();
         a.suspend(id, &path, &mut Out::default()).await.unwrap();
         for (harness, login) in [
             (None, crate::facts::name::CODEX_LOGIN),
@@ -2704,7 +2705,7 @@ pub(crate) mod tests {
         let root = paths::job_root(&node.cfg.home, id);
         std::fs::create_dir_all(root.join(".fabric")).unwrap();
         std::fs::write(root.join(".fabric/env.toml"), "not toml [\n").unwrap();
-        let path = ClientEnv::current().unwrap();
+        let path = ToolEnv::current();
         let refused = node.suspend(id, &path, &mut Out::default()).await;
         assert!(matches!(refused, Err(NodeError::Detect(_))), "{refused:?}");
         let job = node.job(id).await.unwrap();
@@ -2725,7 +2726,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         std::fs::write(root.join("users.sqlite"), "rows\n").unwrap();
-        let path = ClientEnv::current().unwrap();
+        let path = ToolEnv::current();
         let mut out = Out::default();
         node.suspend(id, &path, &mut out).await.unwrap();
         assert!(
@@ -2743,7 +2744,7 @@ pub(crate) mod tests {
     async fn a_resume_restores_a_clean_workspace_that_was_deleted() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = ClientEnv::current().unwrap();
+        let path = ToolEnv::current();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         let root = paths::job_root(&node.cfg.home, id);
         std::fs::remove_dir_all(&root).unwrap();
@@ -2790,7 +2791,7 @@ pub(crate) mod tests {
         a.node_add(b.id, Some(&addr)).await.unwrap();
         b.node_add(a.id, None).await.unwrap();
         a.node_ping(b.id).await.unwrap();
-        let path = ClientEnv::current().unwrap();
+        let path = ToolEnv::current();
         // The two test homes differ, which the table refuses; what matters
         // is that the table was made from the peer's answer.
         let answered = b.doctor(Some(a.id), None, &path).await.unwrap();
@@ -2832,7 +2833,7 @@ pub(crate) mod tests {
         ] {
             node.node_add(peer, addr.map(String::as_str)).await.unwrap();
         }
-        let path = ClientEnv::current().unwrap();
+        let path = ToolEnv::current();
         let out = &mut Out::default();
         let id = job(dir_a.path(), &a).await;
         a.suspend(id, &path, out).await.unwrap();
@@ -2893,7 +2894,7 @@ pub(crate) mod tests {
         b.node_add(a.id, None).await.unwrap();
         a.node_ping(b.id).await.unwrap();
         let id = job(dir_b.path(), &b).await;
-        let path = ClientEnv::current().unwrap();
+        let path = ToolEnv::current();
         let mut out = Out::default();
         b.suspend(id, &path, &mut out).await.unwrap();
         b.replicate(id, &mut out).await;

@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use fabric_client::api::{Answer, ClientEnv, Event, Request};
+use fabric_client::api::{Answer, Event, Request};
 use fabric_core::id::{JobId, NodeId};
 use fabric_net::endpoint::{DialOrder, Endpoint};
 use fabric_net::identity::NodeIdentity;
@@ -35,6 +35,7 @@ use crate::error::NodeError;
 use crate::harnesses::{HarnessConfig, HarnessEnv};
 use crate::job::Job;
 use crate::paths::StateDir;
+use crate::tool_env::ToolEnv;
 
 /// The longest Unix socket path every supported system binds: macOS allows 103 bytes.
 pub const MAX_SOCKET_PATH: usize = 104;
@@ -55,7 +56,7 @@ pub struct NodeConfig {
     pub dial: DialOrder,
     /// The environment the daemon was started with, for work no client
     /// asked for and for a request that sends none.
-    pub env: ClientEnv,
+    pub env: ToolEnv,
 }
 
 /// A running node.
@@ -311,10 +312,10 @@ impl Node {
     }
 
     /// The adapters' environment for a request made in `env`.
-    pub(crate) fn harness_env(&self, env: &ClientEnv) -> Result<HarnessEnv, NodeError> {
+    pub(crate) fn harness_env(&self, env: &ToolEnv) -> Result<HarnessEnv, NodeError> {
         Ok(HarnessEnv::new(
             &self.cfg.home,
-            env.path_var(),
+            env.path_var().to_owned(),
             self.harness_config.clone(),
         )?)
     }

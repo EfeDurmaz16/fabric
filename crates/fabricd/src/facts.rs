@@ -10,17 +10,19 @@
 //! trusted.
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use fabric_client::api::ClientEnv;
+use fabric_client::api::Roots;
 use fabric_core::path::{AbsPath, RelPath};
 use fabric_core::snapshot::{CacheClass, CarryKey};
 use fabric_env::detect::{Detection, Ecosystem, NodeManager};
 use fabric_net::wire::{FactName, FactValue, Facts, MAX_FACT_VALUE};
 use fabric_store::capture::CarryKeys;
+
+use crate::tool_env::ToolEnv;
 
 /// How long one measuring command may run.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -104,7 +106,7 @@ impl NodeFacts {
     /// Measures this node with the tools `env` names: programs are looked
     /// up on its `PATH` and run with its roots, each set to its value or
     /// removed, never the daemon's own (ADR 0018, The client's environment).
-    pub async fn measure(home: &Path, env: &ClientEnv) -> Self {
+    pub async fn measure(home: &Path, env: &ToolEnv) -> Self {
         let inherited: Vec<(OsString, OsString)> = std::env::vars_os().collect();
         Self::measure_from(home, env, &inherited).await
     }
@@ -112,11 +114,7 @@ impl NodeFacts {
     /// Measures as [`NodeFacts::measure`] does, with `inherited` as the
     /// daemon's own environment: each tool starts from it, and `env`'s
     /// `PATH` and roots then replace or remove what they name.
-    async fn measure_from(
-        home: &Path,
-        env: &ClientEnv,
-        inherited: &[(OsString, OsString)],
-    ) -> Self {
+    async fn measure_from(home: &Path, env: &ToolEnv, inherited: &[(OsString, OsString)]) -> Self {
         // Each probe is boxed, so the joined future holds 19 pointers, not 19 child processes.
         let run = |program: &'static str, args: &'static [&'static str], probe: Probe| {
             let (env, home) = (env.clone(), home.to_owned());
@@ -200,10 +198,12 @@ impl NodeFacts {
         put(name::RUSTC, rustc);
         put(
             name::CARGO_HOME,
-            Some(env.roots.cargo_home.as_ref().map_or_else(
-                || home.join(".cargo").display().to_string(),
-                ToString::to_string,
-            )),
+            Some(
+                env.root(Roots::CARGO_HOME)
+                    .map_or_else(|| home.join(".cargo"), PathBuf::from)
+                    .display()
+                    .to_string(),
+            ),
         );
         put(name::PYTHON, python);
         put(name::PYTHON_HOME, python_home);
@@ -255,25 +255,25 @@ async fn probe_command(
     program: &str,
     args: &[&str],
     probe: Probe,
-    env: &ClientEnv,
+    env: &ToolEnv,
     home: &Path,
     inherited: &[(OsString, OsString)],
 ) -> Option<String> {
     let path_var = env.path_var();
-    let binary = find_on_path(program, &path_var)?;
+    let binary = find_on_path(program, path_var)?;
     let mut command = tokio::process::Command::new(binary);
     command
         .env_clear()
         .envs(inherited.iter().map(|(k, v)| (k, v)));
-    for (name, value) in env.roots.vars() {
+    for (name, value) in env.roots() {
         match value {
-            Some(value) => command.env(name, value.as_str()),
+            Some(value) => command.env(name, value),
             None => command.env_remove(name),
         };
     }
     let child = command
         .args(args)
-        .env("PATH", &path_var)
+        .env("PATH", path_var)
         .env("HOME", home)
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
@@ -304,7 +304,7 @@ async fn probe_command(
 /// with no `PATH` sends an empty list, whose `PATH` value is the empty
 /// string, which a shell reads as the working directory (review finding
 /// on PR #13).
-pub fn find_on_path(program: &str, path_var: &OsString) -> Option<PathBuf> {
+pub fn find_on_path(program: &str, path_var: &OsStr) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     std::env::split_paths(path_var)
         .filter(|dir| dir.is_absolute())
@@ -477,7 +477,7 @@ fn manager_name(manager: NodeManager) -> &'static str {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
-    use fabric_client::api::{PathDir, Roots, SystemPath};
+    use fabric_client::api::{ClientEnv, PathDir, SystemPath};
 
     use super::*;
 
@@ -544,7 +544,7 @@ mod tests {
                 ..Roots::default()
             },
         };
-        let facts = NodeFacts::measure_from(&home, &client, &daemon).await;
+        let facts = NodeFacts::measure_from(&home, &ToolEnv::from(&client), &daemon).await;
         assert_eq!(facts.get(name::CARGO_HOME), Some("/client/cargo"));
         assert_eq!(facts.get(name::PNPM), Some("9.9.9"));
         assert_eq!(facts.get(name::PNPM_STORE), Some("/client/pnpm/store"));
@@ -553,7 +553,7 @@ mod tests {
             path,
             roots: Roots::default(),
         };
-        let facts = NodeFacts::measure_from(&home, &bare, &daemon).await;
+        let facts = NodeFacts::measure_from(&home, &ToolEnv::from(&bare), &daemon).await;
         let default_cargo = home.join(".cargo");
         assert_eq!(facts.get(name::CARGO_HOME), default_cargo.to_str());
         assert_eq!(facts.get(name::PNPM_STORE), Some("unset/store"));

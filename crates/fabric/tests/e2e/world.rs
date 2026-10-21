@@ -354,6 +354,7 @@ pub struct Node {
     port: u16,
     wire: Wire,
     daemon: Option<Child>,
+    daemon_vars: Vec<(&'static str, OsString)>,
     /// Its node id, known once it has started.
     pub id: String,
 }
@@ -411,8 +412,15 @@ impl Node {
             port: free_port()?,
             wire,
             daemon: None,
+            daemon_vars: Vec::new(),
             id: String::new(),
         })
+    }
+
+    /// Sets `name` to `value` in the environment of every later start of
+    /// the daemon, and only the daemon's: its CLI commands run without it.
+    pub fn daemon_env(&mut self, name: &'static str, value: OsString) {
+        self.daemon_vars.push((name, value));
     }
 
     /// Its state directory, the `FABRIC_HOME` its commands run with.
@@ -466,6 +474,7 @@ impl Node {
                 "--wire",
                 self.wire.flag(),
             ])
+            .envs(self.daemon_vars.iter().map(|(name, value)| (name, value)))
             .stdout(log.try_clone()?)
             .stderr(log);
         if let Some(fault) = fault {

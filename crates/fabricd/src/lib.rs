@@ -28,4 +28,5 @@ mod ops;
 pub mod paths;
 mod service;
 mod stamp;
+pub mod tool_env;
 mod transfer;

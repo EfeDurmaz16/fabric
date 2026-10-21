@@ -46,6 +46,7 @@ use fabric_net::endpoint::DialOrder;
 use fabricd::harnesses::{HarnessEnv, acp_adapter, parse_harness};
 use fabricd::node::{Node, NodeConfig};
 use fabricd::paths::{STATE_DIR_ENV, StateDir};
+use fabricd::tool_env::ToolEnv;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 mod render;
@@ -456,7 +457,7 @@ async fn serve(state: StateDir, home: PathBuf, args: ServeArgs) -> Result<ExitCo
         home,
         listen: args.listen,
         dial,
-        env: ClientEnv::current()?,
+        env: ToolEnv::current(),
     })?;
     {
         let mut stdout = std::io::stdout().lock();
