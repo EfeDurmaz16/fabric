@@ -38,7 +38,8 @@
 //! 2026-10-19: `--resume <id>`, `--session-id <uuid>`, `-p` with
 //! `--output-format json`, and the typed flags of `flags::LaunchFlags`;
 //! on a resume also `--model <name>` with the model the session last ran
-//! with (`recorded`, checked against `claude --help` of 2.1.294 on
+//! with, the one it asked for when a fallback served the reply
+//! (`recorded`, checked against `claude --help` of 2.1.294 on
 //! 2026-10-21), so a node whose own settings name another model does not
 //! switch the job's. Before a resume starts, the binary it would run is
 //! asked for its version and refused when that is older than the newest
