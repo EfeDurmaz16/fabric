@@ -334,7 +334,10 @@ impl StateManifest {
         &self.home
     }
 
-    /// The harness version at capture, when the binary was found.
+    /// The harness version at capture: the one installed on the capturing
+    /// node, when the binary was found, or for Codex the known writer the
+    /// session arrived with when that is newer (`Codex::with_known_writer`),
+    /// so it is at least the newest Codex that ran the session under Fabric.
     #[must_use]
     pub fn harness_version(&self) -> Option<&str> {
         self.harness_version.as_deref()

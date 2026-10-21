@@ -53,10 +53,20 @@
 //! was configured with winning (`overrides::effective`); `codex exec`
 //! sets its own approval policy. Before anything starts it asks the
 //! binary it would run for its version and refuses when that is older
-//! than the newest `cli_version` the lineage records, or unreadable
-//! (`version::refuse_older`, gate finding F10b). A lineage that records
-//! no version, which no Codex seen so far writes, is not guarded, and a
-//! thread with no rollout on this node has no bytes to protect, so it is
+//! than the newest Codex known to have written the thread, or unreadable
+//! (`version::refuse_older`, gate finding F10b). That is the highest
+//! `cli_version` the lineage records or the known writer the job carried
+//! (`with_known_writer`), whichever is newer: Codex writes `session_meta`,
+//! with its version, only when it creates a rollout, and a resume appends
+//! with no version at all (`codex-rs/rollout/src/recorder.rs` at
+//! `rust-v0.155.1`, `RolloutRecorderParams::Resume` with `meta: None`), so
+//! the rollout of a thread created by 0.142.4 and continued by 0.155.1
+//! names only 0.142.4. A capture records the installed version, or the
+//! known writer when that is newer, so the job carries the newest Codex
+//! that ran the thread under Fabric to the next node. A Codex that resumed
+//! the thread outside Fabric, such as a desktop build newer than the CLI
+//! on the same node, leaves no version anywhere and is not seen. A thread
+//! with no rollout on this node has no bytes to protect, so it is
 //! launched as before and Codex says it found none. A launch with no
 //! session reads nothing and passes only what was configured.
 
@@ -83,6 +93,7 @@ use crate::process;
 use crate::redact::RedactionCounts;
 use crate::session::SessionId;
 use crate::stage::{Carry, Source};
+use crate::version::HarnessVersion;
 
 use self::overrides::CodexOverrides;
 use self::rollout::{RecordedSettings, RolloutFile, RolloutName};
@@ -115,6 +126,7 @@ pub struct Codex {
     binary: Option<PathBuf>,
     path_var: OsString,
     overrides: Option<CodexOverrides>,
+    known_writer: Option<HarnessVersion>,
 }
 
 /// Holds Codex's writer lock for a thread; removes the lock file on drop
@@ -292,6 +304,7 @@ impl Codex {
             binary: None,
             path_var,
             overrides: None,
+            known_writer: None,
         }
     }
 
@@ -356,6 +369,32 @@ impl Codex {
     pub fn with_overrides(mut self, overrides: CodexOverrides) -> Self {
         self.overrides = Some(overrides);
         self
+    }
+
+    /// The newest Codex known to have written the session this adapter
+    /// captures or resumes, beyond what its rollouts record: the version
+    /// the job's last capture recorded, which travels with the job
+    /// (`StateManifest::harness_version`). A Codex that resumes a thread
+    /// appends to its rollout and writes no `session_meta`, so a rollout
+    /// names only the Codex that created it. The resume guard refuses a
+    /// Codex older than this, and a capture records at least this version,
+    /// so a node that never ran the session cannot lower it.
+    #[must_use]
+    pub fn with_known_writer(mut self, version: Option<HarnessVersion>) -> Self {
+        self.known_writer = version;
+        self
+    }
+
+    /// The version a capture records: the installed one, or the known
+    /// writer when that is newer or the installed one cannot be read.
+    fn captured_version(&self, installed: Option<String>) -> Option<String> {
+        let Some(known) = &self.known_writer else {
+            return installed;
+        };
+        match installed.as_deref().map(HarnessVersion::parse) {
+            Some(Ok(local)) if local >= *known => installed,
+            _ => Some(known.as_str().to_owned()),
+        }
     }
 
     fn binary(&self) -> Result<PathBuf, HarnessError> {
@@ -507,8 +546,10 @@ impl Codex {
         out: &Path,
     ) -> Result<StateManifest, HarnessError> {
         let root = pipeline::physical_workspace(workspace)?;
-        let version = process::installed_version(self.binary().ok(), &self.path_var, PROGRAM).await;
-        self.refuse_lockless_writers(version.as_deref()).await?;
+        let installed =
+            process::installed_version(self.binary().ok(), &self.path_var, PROGRAM).await;
+        self.refuse_lockless_writers(installed.as_deref()).await?;
+        let version = self.captured_version(installed);
         let adapter = self.clone();
         let session = session.clone();
         let out = out.to_path_buf();
@@ -627,7 +668,8 @@ impl Codex {
 
     /// What the lineage of `session` records, read before a resume; refused
     /// when the binary that would run it in `root` is older than its newest
-    /// writer or does not say its version, so nothing starts.
+    /// writer, the highest `cli_version` of the lineage or the known writer,
+    /// or does not say its version, so nothing starts.
     async fn read_session(
         &self,
         root: &AbsPath,
@@ -639,13 +681,17 @@ impl Codex {
         let id = session.clone();
         // A thread with no rollout here records nothing to carry or to
         // guard; Codex then says itself that it found none.
-        let recorded = pipeline::blocking(move || match adapter.lineage(&id) {
-            Ok(lineage) => rollout::recorded(&lineage),
-            Err(HarnessError::SessionNotFound { .. }) => Ok(RecordedSettings::default()),
+        let read = pipeline::blocking(move || match adapter.lineage(&id) {
+            Ok(lineage) => rollout::recorded(&lineage).map(Some),
+            Err(HarnessError::SessionNotFound { .. }) => Ok(None),
             Err(e) => Err(e),
         })
         .await?;
-        if let Some(writer) = &recorded.writer {
+        let Some(recorded) = read else {
+            return Ok(RecordedSettings::default());
+        };
+        let newest = recorded.writer.iter().chain(&self.known_writer).max();
+        if let Some(writer) = newest {
             let cwd = pipeline::fs_path(root);
             crate::version::refuse_older(PROGRAM, binary, cwd, env, session, writer).await?;
         }
@@ -1034,6 +1080,29 @@ mod tests {
             "{refused}"
         );
         assert_eq!(fixture.ran(), None, "the pinned older codex ran");
+    }
+
+    /// A thread created by one Codex and continued by a newer one names
+    /// only its creator in the rollout, because a resume writes no
+    /// `session_meta`; the known writer the job carried refuses the older
+    /// Codex anyway, before it starts.
+    #[tokio::test]
+    async fn an_older_codex_is_refused_a_thread_a_newer_one_continued() {
+        let mut fixture = Resume::new("codex-cli 0.155.1");
+        let newer = HarnessVersion::parse("0.160.0").unwrap();
+        fixture.adapter = fixture.adapter.clone().with_known_writer(Some(newer));
+        let before = std::fs::read(&fixture.rollout).unwrap();
+        let refused = fixture.launch(true).await.unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                HarnessError::HarnessOlderThanSession { local, recorded, .. }
+                    if local.as_str() == "0.155.1" && recorded.as_str() == "0.160.0"
+            ),
+            "{refused}"
+        );
+        assert_eq!(std::fs::read(&fixture.rollout).unwrap(), before);
+        assert_eq!(fixture.ran(), None, "the older codex ran");
     }
 
     /// A codex whose version cannot be read is refused too: deny by default.

@@ -172,6 +172,21 @@ impl fmt::Display for HarnessVersion {
     }
 }
 
+/// Written as the text it was parsed from.
+impl serde::Serialize for HarnessVersion {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.text)
+    }
+}
+
+/// Read through `parse`, so a stored version that is not one fails the read.
+impl<'de> serde::Deserialize<'de> for HarnessVersion {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        HarnessVersion::parse(&text).map_err(serde::de::Error::custom)
+    }
+}
+
 /// True when `version` is at least `floor` by the same order as the
 /// resume guard, pre-releases included; false when either does not
 /// parse, so a caller that cannot tell takes the cautious path. Serves

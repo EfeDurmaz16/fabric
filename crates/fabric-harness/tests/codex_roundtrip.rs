@@ -21,7 +21,7 @@ use fabric_core::path::AbsPath;
 use fabric_harness::codex::Codex;
 use fabric_harness::codex::overrides::{ApprovalPolicy, CodexOverrides, SandboxMode};
 use fabric_harness::manifest::StateManifest;
-use fabric_harness::{Harness, HarnessError, Launch, SessionId};
+use fabric_harness::{Harness, HarnessError, HarnessVersion, Launch, SessionId};
 
 const THREAD: &str = "019f233e-bb33-7342-85fa-f2d33b14368a";
 const PREFIX: &str = "019f1111-bb33-7342-85fa-f2d33b14368b";
@@ -189,6 +189,29 @@ async fn capture_follows_the_lineage_and_carries_nothing_else() {
         "the thread lock file is removed on release, as Codex does"
     );
     assert!(!home.join(".codex/.coordination.lock").exists());
+}
+
+/// A capture records the newest Codex known to have run the thread: the
+/// installed one, or the known writer the job arrived with when that is
+/// newer, so a node that never ran the thread cannot lower it for the
+/// next node's resume guard.
+#[tokio::test]
+async fn a_capture_records_the_newest_known_writer() {
+    let src = build_source();
+    let home = src.home.path().canonicalize().unwrap();
+    for (known, recorded) in [
+        (None, LOCKING_VERSION),
+        (Some("0.142.4"), LOCKING_VERSION),
+        (Some("0.160.0"), "0.160.0"),
+    ] {
+        let out = tempfile::tempdir().unwrap();
+        let manifest = node(&home)
+            .with_known_writer(known.map(|v| HarnessVersion::parse(v).unwrap()))
+            .capture(&src.work, &thread(), out.path())
+            .await
+            .unwrap();
+        assert_eq!(manifest.harness_version(), Some(recorded), "{known:?}");
+    }
 }
 
 #[tokio::test]

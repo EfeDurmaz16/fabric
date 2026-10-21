@@ -22,9 +22,13 @@
 //! line, and a desktop build writes a pre-release such as
 //! `0.163.0-alpha.10.2`. The settings are the last `turn_context`'s, in
 //! lineage order; the writer is the highest `cli_version` of any
-//! `session_meta` line in any file of the lineage, because the newest
-//! Codex that wrote any of the bytes decides which records an older one
-//! would break.
+//! `session_meta` line in any file of the lineage. That is the newest
+//! Codex that created a file of the lineage, not always the newest that
+//! wrote to it: a resume appends without a `session_meta` and records no
+//! version (a rollout on the owner's Mac holds one `session_meta`, by
+//! 0.151.0-alpha.7.2 on 2026-09-02, and turns to 2026-10-20 whose
+//! `turn_context` keys that build did not write), so the resume guard
+//! also takes the known writer the job carries (`Codex::with_known_writer`).
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -265,7 +269,8 @@ pub(crate) struct RecordedSettings {
     pub(crate) approval: Recorded<ApprovalPolicy>,
     /// The sandbox of the last turn.
     pub(crate) sandbox: Recorded<SandboxMode>,
-    /// The highest `cli_version` any `session_meta` line records.
+    /// The highest `cli_version` any `session_meta` line records: the
+    /// newest Codex that created a file of the lineage.
     pub(crate) writer: Option<HarnessVersion>,
 }
 
