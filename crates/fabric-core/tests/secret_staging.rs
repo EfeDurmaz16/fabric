@@ -170,16 +170,27 @@ fn repo() -> io::Result<Repo> {
 /// What `capture_w` returns: the tree of `W` as path to contents, and the paths the policy kept out.
 type Captured = (BTreeMap<String, String>, Vec<Denied>);
 
-/// Plays capture's part: lists the changes against `I`, sorts them, stages
-/// the literal paths into a temporary index and returns the tree with the paths left out.
+/// Plays capture's part: writes `I`'s tree from a copy of the index, seeds
+/// a private index with that tree, lists the changes against it, sorts
+/// them, stages the literal paths and returns the tree with the paths left out.
+///
+/// As in capture, the private index comes from `read-tree` and holds no
+/// file stat, so git compares every tracked file's contents. A copied
+/// index keeps the stat git recorded at commit time, but on Linux the copy
+/// gets a new mtime, so git trusts that stat, and an edit that keeps the
+/// size within the same second ("old" to "new") would be reported unchanged.
 fn capture_w(
     repo: &Repo,
     policy: &SecretPolicy,
     consent: TrackedSecrets,
 ) -> io::Result<Result<Captured, TrackedSecretChanged>> {
     let root = repo.dir.path();
+    let copy = root.join(".git/fabric-index-copy");
+    fs::copy(&repo.index, &copy)?;
+    let index_tree =
+        String::from_utf8(git(root, &copy, &["write-tree"], None)?).map_err(io::Error::other)?;
     let temp = root.join(".git/fabric-capture-index");
-    fs::copy(&repo.index, &temp)?;
+    git(root, &temp, &["read-tree", index_tree.trim()], None)?;
     let tracked = git(
         root,
         &temp,
