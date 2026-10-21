@@ -1,0 +1,170 @@
+# ADR 0018: The client API
+
+Status: accepted, 2026-10-21
+
+Supersedes the paragraph of ADR 0016 on the control socket's encoding (one request and one response, each a `u32` length and postcard bytes) and its Alternative 3, which rejected a JSON control protocol. Everything else in ADR 0016 stands: the socket's place and its owner-only trust, the exit codes, and the split of work between the node and the CLI.
+
+## Context
+
+The thesis says a job can be created, watched, moved, resumed, approved or stopped from anywhere. Fabric ships as a library, an SDK and a CLI, not as an MCP server. Today the only client is the CLI. It talks to the node over the control socket with postcard frames, and most answers are lines of text the node already rendered for a terminal. That serves the CLI and nobody else:
+
+- postcard has no maintained implementation outside Rust, and it encodes an enum variant by its index, so a reader in another language would have to mirror the Rust declaration order exactly. ADR 0016 already had to append `HarnessSession` at the end of the request enum to keep the other indices.
+- A program cannot read a job's owner, epoch or workspace from `["owner: fab1... at epoch 3", ...]` without parsing English.
+- A refusal is a kind and a sentence. The kind decides the exit code; the facts behind it (which node owns the job, at which epoch, which move is open) are only in the sentence.
+- A long command (`move`, `resume`, `run`) reports its steps as lines collected until it ends. Nothing typed comes out while it runs, so a phone cannot show a move in progress.
+
+This ADR fixes the contract that any program, in any language, uses against a local node. The first two clients are the Rust crate `fabric-client`, which the CLI now uses for every request, and the TypeScript SDK in `sdk/typescript`.
+
+## Decision
+
+### Wire format: length-prefixed JSON on the same socket
+
+The client API runs on `<state>/fabric.sock`, the control socket of ADR 0016. Each frame is a `u32` little-endian length, 1 to 16 MiB, then that many bytes of one UTF-8 JSON object. A reader checks the length against the cap before it allocates. Node-to-node traffic (`fabric-net`, ADR 0013), the ledger and the manifests stay postcard.
+
+JSON wins on this socket for four reasons:
+
+- Every language a client is likely to be written in reads it without a dependency: `JSON.parse` in JavaScript, `json` in Python, `encoding/json` in Go, `serde_json` in Rust, which the node already uses for its local files.
+- It is self-describing. A tagged object names its variant, so adding a variant or a field never shifts what an old reader sees, and a reader can skip what it does not know (see Compatibility).
+- A person can read it with `socat` while debugging a client.
+- The messages are small and local: an answer is a few hundred bytes, and the largest, a job's log, is bounded by the frame cap. Its size and parse cost do not matter here as they do for chunks on the network.
+
+The length prefix, rather than one JSON object per line, lets a reader refuse an oversized frame before it reads it, and it is the framing every other socket in Fabric already uses.
+
+Encoding rules, the same in every message:
+
+- Enums are objects tagged by one field: `op` for a request, `type` for a frame from the node, `kind` for a reply, an event and most nested enums, `code` for a refusal reason. Tags and field names are `snake_case`.
+- Ids travel in their text form: a job, move or event id as its 26-character ULID, a node id as `fab1` and 52 base32 characters, a snapshot or env spec id as 64 lowercase hex digits, a session id as the harness wrote it. Each is parsed on arrival, as the core parses it; an id that does not parse refuses the whole message.
+- An epoch is a JSON integer of at least 1. Counts, sizes, pids and times in Unix milliseconds are integers below 2^53, so a JavaScript number holds them exactly.
+- An optional field is absent when it has no value, never `null`. Readers accept `null` as absent.
+- Paths are strings. A path that is not UTF-8 cannot cross the socket and fails the request that names it.
+
+### The exchange
+
+One connection carries one exchange:
+
+```text
+client: Hello      { api: 1, client: "<name>/<version>" }
+node:   Welcome    { type: "welcome", api: 1, node, node_version, capabilities: [op, ...] }
+      | Incompatible { type: "incompatible", api, node_version }        and the node closes
+client: Request    { op: ..., ... }
+node:   Event      { type: "event", event: { kind: ..., ... } }         zero or more, as they happen
+node:   Done       { type: "done", reply: { kind: <the request's op>, ... } }
+      | Refused    { type: "refused", refusal: { kind, reason: { code, ... }, message } }
+                                                                         and the node closes
+```
+
+The node streams each event the moment the step it reports happens, and the final frame follows the last event. A client that disconnects does not stop the command: a move or a suspend runs to its end on the node, as it did before, because stopping halfway is what the ledger protocol already guards against. The node gives a connection 30 seconds to send its hello and its request.
+
+A request that does not parse, or names an op the node does not serve, is answered `Refused` with the reason `bad_request`. A hello that does not parse is answered `Incompatible`.
+
+### The message set (api 1)
+
+```text
+Request (op)   = node_id | node_add { node, addr? } | node_list | node_ping { node }
+               | job_new { repo, goal, harness } | job_list | job_status { job } | job_log { job }
+               | job_run { job } | job_resume { job, on?, harness?, force, env? }
+               | job_suspend { job, env? } | job_move { job, to, force, env? }
+               | job_steal { job, reason, force } | job_decide { job, decision, note }
+               | doctor { peer?, job?, env? }
+               | harness_started { job, epoch, pid, harness, session? }
+               | harness_session { job, epoch, pid, harness, session }
+               | harness_exited { job, pid }
+Harness (kind) = claude_code | codex | acp { program, args }
+ClientEnv      = { path: [dir], roots: { cargo_home?, rustup_home?, pnpm_home?, xdg_data_home? } }
+```
+
+### The client's environment
+
+A node runs tools on a client's behalf: it measures the facts `doctor` compares and the carry keys a snapshot records (ADR 0012) by running `rustc`, `pnpm`, `node` and the rest, and it finds the harness a capture or a restore needs. Those tools answer by the environment they run in. The node used to run them with its own environment and only the caller's `PATH`, so a capture recorded the daemon's `CARGO_HOME` as the key of `target/`, not the one of the shell that asked (review finding on PR #8), and `pnpm store path` and the `rustc` a rustup proxy picks followed the daemon's variables in the same way.
+
+`job_resume`, `job_suspend`, `job_move` and `doctor` take `env`, the caller's environment as data:
+
+- `path` is the caller's `PATH` as a list of directories, each an absolute path in the core's text form and without a `:`. A relative entry or `.` would name a directory of the node's choosing, so the Rust client leaves such entries out and the node refuses a request that holds one.
+- `roots` is a closed set of tool roots, one field each: `cargo_home`, `rustup_home`, `pnpm_home` and `xdg_data_home`, each an absolute path. They are the variables that decide where the measured tools keep their state: cargo and rustup by their homes, pnpm its store by `PNPM_HOME`, then `XDG_DATA_HOME`.
+
+For that request the node looks programs up on the client's `path` and runs each tool with every root set to the client's value or removed when the client did not set it, never the daemon's own. When `env` is absent, the node uses the environment it started with, which is also what it uses for work no client asked for, such as a peer's move request. A new root is an additive change: an older node ignores the field. `ClientEnv::current()` reads the calling process's environment, and the CLI sends it with each of these requests.
+
+A reply's `kind` is its request's `op`, so a client checks that the answer is the one its request takes and refuses any other as a protocol error. The replies are typed records: `node_id { node, listen }`, `node_list { peers: [{ node, addrs, connected }] }`, `node_ping { node, rtt_ms, wire, clock_skew_ms }`, `job_new { job, root, repo, harness, epoch }`, `job_list { jobs: [{ job, standing, epoch, goal }], closed: [{ job, error }] }`, `job_status { job, node, goal, harness, owner, epoch, view, snapshot?, workspace?, process, records }`, `job_log { records: [{ id, epoch, at, event }] }`, `job_run` and `job_resume` with the fields of a run plan, `job_suspend { snapshot }`, `job_move { owner, epoch }`, `job_steal { owner, epoch }`, `job_decide { text }`, `doctor { report }`, `harness_started { epoch, harness, pid }`, `harness_session { harness, session }`, `harness_exited {}`. `crates/fabric-client/src/api.rs` holds every field with its meaning, and `protocol/fixtures` holds one example of each.
+
+`job_status` says what `fabric job status` printed, as data: the node's `view` of the job (`owner`, `departing { move_id, target }`, `departed { owner, epoch }`, `replica { owner, epoch }` or `frozen { peer, epoch }`), what the workspace holds (`current { marker }`, `stale { left_at }`, `awaiting_decision { target }`, `clean_copy` or `orphan`), and whether a harness runs (`not_running`, `running { pid, epoch }` or `group_remains { pid }`).
+
+`doctor` answers a report, `facts { facts }` or `compared { peer, rows }`, and never refuses because a row would stop a move: a diagnostic reports. The CLI keeps exit code 84 for `fabric doctor --peer` when a row refuses, computed from the rows.
+
+### Progress as typed events
+
+Every line the node used to print is now an event with typed fields: `stopping_harness { pid }`, `snapshot_published { snapshot, files, bytes, new_objects }`, `left_behind { path }`, `preflight { peer, rows }`, `move_started { move_id, target }`, `imported { owner, epoch }`, `restored { snapshot, files, bytes }`, `continuing_session { harness, session }` and the rest of the list in `api.rs`. An event that reports a failure the command survived, such as a peer the ledger could not be copied to, carries that failure as a `Refusal`. Three events carry a sentence where the node's explanation has no stable shape yet: `cache_rebuilt { path, why }`, `move_gave_up { detail }` and `not_replicated`'s refusal message.
+
+The CLI renders each event and each reply to the exact line the node printed before, so `fabric`'s output and exit codes do not change; the lines now appear as the steps happen instead of all at the end.
+
+### Refusals
+
+```text
+Refusal = { kind, reason: { code, ... }, message }
+kind    = not_owner | frozen | unreachable | needs_force | job_state | failed
+```
+
+`kind` is the class ADR 0016's exit codes are picked from, unchanged: 81 to 85 and 1. `reason` names the fact behind it with its data, for example `not_owner { job, owner, epoch }`, `departing { job, move_id, target }`, `forked { job, peer, epoch }`, `unfinished { job, step }`, `preflight { facts }` or `harness_running { job, pid }`; a failure with no structure worth typing, a file or the store, is `internal`. `message` is the node's sentence, with the command that resolves it, which the CLI prints after `error:`. A reader checks that a known reason belongs to the kind it came with and refuses the frame otherwise.
+
+Errors that happen before the node answers are the client's own, typed in each client: no daemon at the socket (the CLI's exit 80), a state directory or socket that is not this user's alone (`Untrusted`), an incompatible api, an op the node does not list, a frame over the cap, a frame that does not parse, and a connection closed before the final frame.
+
+### Compatibility
+
+1. The hello carries the client's `api`. The node answers `Welcome` when it equals its own and `Incompatible` with its own number otherwise, and closes. The client also checks the number in `Welcome`. There is no range: a node speaks one api version.
+2. Within one api version, a change is additive:
+   - a new op, listed in `Welcome.capabilities`; a client sends an op only when the node lists it and otherwise fails with `Unsupported` before sending;
+   - a new optional field in a request, which a node that does not know it ignores, so a client that depends on it checks a capability first;
+   - a new field in a reply, an event or a refusal reason, which readers ignore;
+   - a new event kind, which a client skips: events report progress and never carry the result;
+   - a new refusal reason, which a client reads as `unrecognized` with its `kind` and `message` intact, so the exit code and the sentence still work;
+   - a new kind of ledger record in `job_log`, which a client reads as `unrecognized`, since a later ledger format may write one.
+3. Anything else bumps `api`: removing or renaming an op, a field or a kind, changing a field's type or meaning, a new refusal `kind` (exit codes depend on the closed set), a new reply shape for an existing op, or a change to the framing or the exchange.
+
+The Rust crate and the TypeScript SDK both declare `API_VERSION = 1`, and a contract test pins it.
+
+A CLI from before this ADR that reaches a node after it sends postcard, which does not parse as a hello; the node answers `Incompatible` and the old CLI fails to decode it. A new client that reaches an old node gets the connection closed without a welcome and says that the node may run an older fabric. Neither side misreads a frame.
+
+### Security
+
+Unchanged from ADR 0016. The socket lives in the state directory, mode 0700. The node refuses a connection whose peer user id is not its own. The client refuses a state directory or a socket another user owns, a symlink, or a directory others may enter, before it sends anything, because a run plan read there decides what it launches; `fabric-client` and the TypeScript SDK both make these checks. There is no network listener for the client API in this ADR. Remote clients, a phone included, come later with capability tokens (C4): a token names what its holder may do to which job, and the local socket stays the owner's alone.
+
+### The harness stays with the client that launches it
+
+`job_run` and `job_resume` answer a launch plan: the job, the epoch it is fenced on, the root, the harness, the session to continue and the goal. The client that launches the harness, interactive or headless, reports it with `harness_started`, a session the harness names late with `harness_session`, and its end with `harness_exited`, as ADR 0016 describes. The API carries no terminal. Handing a terminal to the harness's process group (`crates/fabric/src/terminal.rs`) stays in the CLI, which owns the terminal; a headless run is the same plan launched without one.
+
+### The seam for C2
+
+C2 adds a live event stream and approvals from a phone. It builds on two things this ADR puts in place. Events are typed and are made in one place on the node, the per-request sink `Out` in `fabricd`, which today forwards to the one connection that asked. C2 turns that sink into a broadcast per job, and a new op, `watch { job? }`, listed as a capability, streams the same `Event` values to any client until it disconnects. Approvals already exist as `job_decide`; C2 adds no new kind of refusal.
+
+### Where the code lives
+
+- `crates/fabric-client`: `api` (every type above, with serde), `frame` (the length-prefixed codec, both directions), and `Client` (connect, the trust checks, the hello, one typed method per op). It depends on `fabric-core`, `serde`, `serde_json`, `thiserror`, `tokio` and `rustix`, all already in the workspace. The node uses `api` and `frame` to serve.
+- `SessionId` moves from `fabric-harness` to `fabric-core`, so a client does not depend on the harness adapters.
+- `crates/fabric/src/render.rs`: the human text for every reply and event.
+- `sdk/typescript`: the TypeScript client for Node and Bun. Strict mode, named exports, zod schemas at the boundary and no other runtime dependency.
+- `protocol/fixtures`: one JSON example of every hello, request, reply, event and refusal reason, some messages both clients must refuse, and one framed hello as hex. The Rust tests and the TypeScript tests both parse every fixture and write it back to the same JSON, so the two clients cannot drift apart without a test failing.
+
+## Alternatives considered
+
+1. **Keep postcard on the socket.** The CLI already speaks it, and it is compact. A client in another language would need a postcard implementation that follows the Rust declaration order of every enum, and there is none we could depend on. Rejected for the client API; kept where only Rust reads it.
+2. **CBOR or MessagePack.** Self-describing and smaller than JSON, but each needs a library in every client language, and the size does not matter on a local socket. Rejected.
+3. **Protocol Buffers or gRPC.** A schema and code generation in every language, an HTTP/2 stack, and a build step for the SDK. Too heavy for a local socket and against the minimal dependency rule. Rejected; worth a look again for C4 if remote clients need generated stubs.
+4. **HTTP with JSON over the Unix socket.** Familiar to clients, but it needs an HTTP server in the node and gives nothing a length prefix does not give here. Rejected for now; C4's network listener may well be HTTP.
+5. **One JSON object per line.** As easy to read in every language, but a reader learns a frame is too large only after it has read it. Rejected.
+6. **Keep the node's text and add a parallel typed API.** Two answers to keep in step for every command. Rejected: the CLI is a client like any other.
+7. **Batch events into the final answer.** Simpler, but it is the behavior C2 cannot build on and that leaves a user staring at a silent move. Rejected.
+8. **An api version range with negotiation.** Nothing older than api 1 exists, and capabilities already cover additive changes. Rejected until a second version exists.
+
+## Consequences
+
+- A program in any language can drive a local node with a socket and a JSON parser, and read typed answers.
+- The CLI and the SDKs share one code path on the node; the CLI has no private protocol.
+- The CLI prints each step as it happens.
+- A change to the API shows up as a fixture change in review, and a client that does not follow fails its contract tests.
+- ADR 0016's paragraph on postcard frames and its Alternative 3 are history.
+
+## Open questions
+
+- Should the node offer a headless launch for clients that cannot launch a harness themselves, such as a phone, or should that always go through a node-side client with the user's environment? Decide with C2.
+- Variables that are not roots also change what a tool answers: `RUSTUP_TOOLCHAIN` picks a toolchain, `PYENV_VERSION` a Python, and `git` and the store run with the node's environment. Add them to the client's environment when a measured fact turns out to depend on one.
+- Should a client be able to keep one connection for several requests? Not needed while every request is local and cheap; reconsider with C4.
+- Does C4's network listener speak this same JSON over TLS, or HTTP? Decide with C4; the message set should not change.
