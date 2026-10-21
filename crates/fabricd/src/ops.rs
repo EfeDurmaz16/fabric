@@ -263,6 +263,17 @@ impl Node {
         let root = paths::job_root(&self.cfg.home, id);
         let synced = synced_folders(&self.cfg.home, &self.cfg.path_var).await;
         check_root(&root, &self.cfg.home, synced)?;
+        // Built before the clone: a goal past the record bound refuses
+        // here, not after a clone that no job and no printed id names.
+        let created = Ledger::created(
+            id,
+            goal,
+            harness.clone(),
+            self.id,
+            clock::event_id(),
+            clock::now_ms(),
+        )
+        .map_err(fabric_core::ledger::LedgerError::from)?;
         let parent = root
             .parent()
             .ok_or_else(|| NodeError::io(&root, std::io::Error::other("a root needs a parent")))?;
@@ -281,15 +292,6 @@ impl Node {
                 std::io::Error::other(String::from_utf8_lossy(&cloned.stderr).trim().to_owned()),
             ));
         }
-        let created = Ledger::created(
-            id,
-            goal,
-            harness.clone(),
-            self.id,
-            clock::event_id(),
-            clock::now_ms(),
-        )
-        .map_err(fabric_core::ledger::LedgerError::from)?;
         let job = Job::create_owned(
             id,
             self.cfg.state.job(id),
@@ -2340,6 +2342,16 @@ pub(crate) mod tests {
 
     /// A job made from a one-commit repository, owned by `node` at epoch 1.
     pub(crate) async fn job(dir: &Path, node: &Arc<Node>) -> JobId {
+        let repo = repo(dir);
+        let mut out = Out::default();
+        node.job_new(&repo, "goal".to_owned(), HarnessKind::Codex, &mut out)
+            .await
+            .unwrap();
+        out.lines[0].parse().unwrap()
+    }
+
+    /// A one-commit repository at `dir/repo`.
+    fn repo(dir: &Path) -> PathBuf {
         let repo = dir.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::write(repo.join("README.md"), "hello\n").unwrap();
@@ -2365,11 +2377,7 @@ pub(crate) mod tests {
                 .unwrap();
             assert!(status.success());
         }
-        let mut out = Out::default();
-        node.job_new(&repo, "goal".to_owned(), HarnessKind::Codex, &mut out)
-            .await
-            .unwrap();
-        out.lines[0].parse().unwrap()
+        repo
     }
 
     fn sleeper() -> std::process::Child {
@@ -3240,5 +3248,24 @@ pub(crate) mod tests {
                 .any(|r| matches!(r.event().kind, EventKind::Resumed { .. })),
             "Resumed was appended for a harness nobody supervises"
         );
+    }
+
+    /// A goal past the ledger's record bound still fits in a control
+    /// message, so it reaches the node. The node must refuse it before it
+    /// clones: once the record fails, no job and no id point at the clone.
+    #[tokio::test]
+    async fn a_goal_too_large_for_a_record_is_refused_before_the_clone() {
+        let (dir, node) = node();
+        let repo = repo(dir.path());
+        let goal = "x".repeat(fabric_core::ledger::MAX_RECORD_LEN);
+        let refused = node
+            .job_new(&repo, goal, HarnessKind::Codex, &mut Out::default())
+            .await;
+        assert!(matches!(refused, Err(NodeError::Ledger(_))), "{refused:?}");
+        let jobs = node.cfg.home.join("fabric").join("jobs");
+        let left: Vec<PathBuf> = std::fs::read_dir(&jobs)
+            .map(|dir| dir.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "the clone stayed behind: {left:?}");
     }
 }
