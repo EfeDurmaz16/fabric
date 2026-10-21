@@ -1,5 +1,5 @@
 //! Harness versions, as `--version` prints them and as sessions record
-//! them.
+//! them, and the guard that keeps an older harness off a newer session.
 //!
 //! Invariant: a version is `MAJOR.MINOR.PATCH`, with an optional
 //! pre-release after `-` and build metadata after `+`, and two versions
@@ -8,10 +8,20 @@
 //! pre-release identifiers one by one, numbers as numbers and below
 //! words, a longer list above its own prefix. Build metadata is ignored.
 //! Anything else does not parse, and a caller that cannot read a version
-//! refuses rather than guesses. Formats seen on
+//! refuses rather than guesses. One parse and one order serve the resume
+//! guard of every adapter and the harness rows of `fabric doctor`, so the
+//! two never disagree on which of two versions is older. Formats seen on
 //! 2026-10-21: `codex-cli 0.155.1` and `2.1.294 (Claude Code)` from
 //! `--version`, and `0.163.0-alpha.10.2` in the `session_meta` of a
 //! rollout the Codex desktop app wrote.
+//!
+//! An older harness must not run a session a newer one wrote (gate
+//! finding F10b): Codex 0.142.4 appended records without the `ordinal`
+//! field 0.155.1 writes, and wrote a `legacy` thread row into its own
+//! database, after which 0.155.1 refused the session. `refuse_older`
+//! therefore asks the binary a launch would run for its version before
+//! anything starts, and refuses when it is older than the newest version
+//! the session records, or when its version cannot be read.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -135,6 +145,40 @@ impl fmt::Display for HarnessVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.text)
     }
+}
+
+/// Refuses to start `binary` on `session` when the version it reports is
+/// older than `recorded`, the newest version the session records, or
+/// cannot be read. Runs `binary --version` with the launch environment
+/// minus the parent-session markers, as the launch itself would run.
+#[cfg(feature = "codex")]
+pub(crate) async fn refuse_older(
+    program: &str,
+    binary: &std::path::Path,
+    env: &[(fabric_core::env::EnvVarName, String)],
+    session: &crate::session::SessionId,
+    recorded: &HarnessVersion,
+) -> Result<(), crate::error::HarnessError> {
+    use crate::error::HarnessError;
+    let unknown = |reason: String| HarnessError::HarnessVersionUnknown {
+        program: program.to_owned(),
+        recorded: recorded.to_string(),
+        session: session.clone(),
+        reason,
+    };
+    let output = crate::process::reported_version(binary, env)
+        .await
+        .map_err(|e| unknown(e.to_string()))?;
+    let local = HarnessVersion::from_output(&output).map_err(|e| unknown(e.to_string()))?;
+    if local < *recorded {
+        return Err(HarnessError::HarnessOlderThanSession {
+            program: program.to_owned(),
+            local: local.to_string(),
+            recorded: recorded.to_string(),
+            session: session.clone(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

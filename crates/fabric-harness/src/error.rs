@@ -221,6 +221,38 @@ pub enum HarnessError {
         /// Its process ids.
         pids: Vec<u32>,
     },
+    /// The harness on this node is older than the newest one that wrote
+    /// the session, so starting it could leave records the newer one
+    /// refuses (gate finding F10b). Nothing was started.
+    #[error(
+        "{program} {local} is older than {program} {recorded}, which wrote session {session}; an older harness cannot run this session and would leave records the newer one refuses, so nothing was started. Update {program} on this node to {recorded} or later"
+    )]
+    HarnessOlderThanSession {
+        /// The harness program.
+        program: String,
+        /// The version the program on this node reports.
+        local: String,
+        /// The newest version the session records.
+        recorded: String,
+        /// The session.
+        session: SessionId,
+    },
+    /// The harness on this node did not report a version that parses, so
+    /// it cannot be shown to be at least the one that wrote the session.
+    /// Nothing was started.
+    #[error(
+        "the version of {program} on this node cannot be read ({reason}); session {session} was written by {program} {recorded}, and an older harness would leave records the newer one refuses, so nothing was started. Check that `{program} --version` prints a version"
+    )]
+    HarnessVersionUnknown {
+        /// The harness program.
+        program: String,
+        /// The newest version the session records.
+        recorded: String,
+        /// The session.
+        session: SessionId,
+        /// Why the version could not be read.
+        reason: String,
+    },
     /// A captured manifest, a record of this crate or a vendor file did not parse.
     #[error("{what} at {path} does not parse: {reason}")]
     Malformed {
@@ -373,7 +405,7 @@ pub enum Input {
     Manifest,
     /// A departure record under `~/.fabric/harness/departed/`.
     DepartureRecord,
-    /// The first line of a Codex rollout.
+    /// A line of a Codex rollout.
     RolloutLine,
     /// Claude's `~/.claude.json`.
     ConfigJson,

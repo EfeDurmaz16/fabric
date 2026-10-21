@@ -199,6 +199,17 @@ pub(crate) async fn detect(
     }))
 }
 
+/// What `binary --version` prints when run with `env` minus its
+/// parent-session markers, as a launch with `env` would run it; for the
+/// resume guard (`version::refuse_older`), which must ask the binary it
+/// is about to start.
+pub(crate) async fn reported_version(
+    binary: &Path,
+    env: &[(EnvVarName, String)],
+) -> Result<String, HarnessError> {
+    probe(binary, &["--version"], env).await
+}
+
 /// The version `binary` reports, or `None` when there is no binary or the
 /// probe fails; a failed probe is logged, never fatal.
 pub(crate) async fn installed_version(

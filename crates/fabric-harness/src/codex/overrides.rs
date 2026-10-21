@@ -236,6 +236,7 @@ mod tests {
             },
             approval: Recorded::Carried(ApprovalPolicy::OnRequest),
             sandbox: Recorded::Carried(SandboxMode::WorkspaceWrite),
+            writer: None,
         }
     }
 

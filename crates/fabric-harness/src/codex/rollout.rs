@@ -16,8 +16,15 @@
 //! record (gate finding F10a). Record shapes, read from the owner's
 //! rollouts on 2026-10-21 (key names and setting values only): every turn
 //! writes `{"type":"turn_context","payload":{"model","effort",
-//! "approval_policy","sandbox_policy":{"type",...},...}}`. The settings
-//! are the last `turn_context`'s, in lineage order.
+//! "approval_policy","sandbox_policy":{"type",...},...}}`, and every file
+//! starts with `{"type":"session_meta","payload":{"cli_version",...}}`. A
+//! thread a parent spawned holds the parent's `session_meta` as a second
+//! line, and a desktop build writes a pre-release such as
+//! `0.163.0-alpha.10.2`. The settings are the last `turn_context`'s, in
+//! lineage order; the writer is the highest `cli_version` of any
+//! `session_meta` line in any file of the lineage, because the newest
+//! Codex that wrote any of the bytes decides which records an older one
+//! would break.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -31,6 +38,7 @@ pub(crate) use crate::harness::Recorded;
 use crate::jsontext;
 use crate::redact::Redactor;
 use crate::session::SessionId;
+use crate::version::HarnessVersion;
 
 use super::overrides::{ApprovalPolicy, Effort, SandboxMode};
 
@@ -257,6 +265,8 @@ pub(crate) struct RecordedSettings {
     pub(crate) approval: Recorded<ApprovalPolicy>,
     /// The sandbox of the last turn.
     pub(crate) sandbox: Recorded<SandboxMode>,
+    /// The highest `cli_version` any `session_meta` line records.
+    pub(crate) writer: Option<HarnessVersion>,
 }
 
 /// A JSON value as a report shows it: a string as itself, anything else as JSON.
@@ -321,7 +331,8 @@ impl RecordedSettings {
 
 /// Reads what the rollouts of a session record, given its lineage newest
 /// suffix first, as `lineage` returns it. A line that does not parse is
-/// skipped, as a cut last line is.
+/// skipped, as a cut last line is; a `cli_version` that is there but is
+/// not a version is an error, because the guard cannot compare it.
 pub(crate) fn recorded(lineage: &[RolloutFile]) -> Result<RecordedSettings, HarnessError> {
     let mut settings = RecordedSettings::default();
     for file in lineage.iter().rev() {
@@ -336,7 +347,8 @@ pub(crate) fn recorded(lineage: &[RolloutFile]) -> Result<RecordedSettings, Harn
             {
                 break;
             }
-            if !contains(&line, b"\"turn_context\"") {
+            let turn = contains(&line, b"\"turn_context\"");
+            if !turn && !contains(&line, b"\"session_meta\"") {
                 continue;
             }
             let record: serde_json::Value = match serde_json::from_slice(&line) {
@@ -346,8 +358,24 @@ pub(crate) fn recorded(lineage: &[RolloutFile]) -> Result<RecordedSettings, Harn
                     continue;
                 }
             };
-            if record["type"] == "turn_context" {
-                settings.take_turn(&record["payload"]);
+            let payload = &record["payload"];
+            match record["type"].as_str() {
+                Some("turn_context") => settings.take_turn(payload),
+                Some("session_meta") => {
+                    let Some(text) = payload.get("cli_version").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let version =
+                        HarnessVersion::parse(text).map_err(|e| HarnessError::Malformed {
+                            what: Input::RolloutLine,
+                            path: file.path.clone(),
+                            reason: format!("session_meta.cli_version: {e}"),
+                        })?;
+                    if settings.writer.as_ref().is_none_or(|w| version > *w) {
+                        settings.writer = Some(version);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -450,9 +478,11 @@ mod tests {
     }
 
     /// The settings are the newest turn's, read through a compressed
-    /// suffix and past a cut line.
+    /// suffix; the writer is the highest `cli_version` of any
+    /// `session_meta` line in any file, a pre-release and a spawned
+    /// thread's copy of its parent's line included.
     #[test]
-    fn the_last_turn_across_the_lineage_is_read() {
+    fn the_last_turn_and_the_newest_writer_across_the_lineage_are_read() {
         let dir = tempfile::tempdir().unwrap();
         let prefix = format!(
             "{}{}{{\"type\":\"response_item\",\"payload\":{{}}}}\n{}",
@@ -477,8 +507,10 @@ mod tests {
                 effort: Recorded::Carried(Effort::XHigh),
                 approval: Recorded::Carried(ApprovalPolicy::OnRequest),
                 sandbox: Recorded::Carried(SandboxMode::WorkspaceWrite),
+                writer: Some(HarnessVersion::parse("0.163.0-alpha.10.2").unwrap()),
             }
         );
+        assert_eq!(read.writer.unwrap().as_str(), "0.163.0-alpha.10.2");
     }
 
     fn reason<T>(recorded: &Recorded<T>) -> String {
@@ -490,9 +522,9 @@ mod tests {
     }
 
     /// A value outside the closed sets is reported with its reason, never
-    /// carried.
+    /// carried, and a `cli_version` that is not a version fails the read.
     #[test]
-    fn values_outside_the_closed_sets_are_not_carried() {
+    fn values_outside_the_closed_sets_are_not_carried_and_a_bad_writer_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let suffix = format!(
             "{}{}",
@@ -517,5 +549,19 @@ mod tests {
             reason(&read.sandbox),
             "danger-full-access: Fabric never passes full access, ADR 0006"
         );
+
+        let dir = tempfile::tempdir().unwrap();
+        let chain = lineage(
+            dir.path(),
+            &meta("0.155.1", None),
+            &meta("not-a-version", Some(THREAD)),
+        );
+        assert!(matches!(
+            recorded(&chain),
+            Err(HarnessError::Malformed {
+                what: Input::RolloutLine,
+                ..
+            })
+        ));
     }
 }

@@ -50,10 +50,14 @@
 //! `config.toml`, not the one the thread ran with, so the launch reads
 //! the last `turn_context` of the lineage and passes its model, effort,
 //! approval policy and sandbox, each one the adapter was configured with
-//! winning (`overrides::effective`). A thread with no rollout on this
-//! node records nothing, so it is launched as before and Codex says it
-//! found none. A launch with no session reads nothing and passes only
-//! what was configured.
+//! winning (`overrides::effective`). Before anything starts it asks the
+//! binary it would run for its version and refuses when that is older
+//! than the newest `cli_version` the lineage records, or unreadable
+//! (`version::refuse_older`, gate finding F10b). A lineage that records
+//! no version, which no Codex seen so far writes, is not guarded, and a
+//! thread with no rollout on this node has no bytes to protect, so it is
+//! launched as before and Codex says it found none. A launch with no
+//! session reads nothing and passes only what was configured.
 
 pub mod overrides;
 pub(crate) mod rollout;
@@ -620,8 +624,15 @@ impl Codex {
         process::detect(self.binary().ok(), &self.path_var).await
     }
 
-    /// What the lineage of `session` records, read before a resume.
-    async fn read_session(&self, session: &SessionId) -> Result<RecordedSettings, HarnessError> {
+    /// What the lineage of `session` records, read before a resume; refused
+    /// when the binary that would run it is older than its newest writer
+    /// or does not say its version, so nothing starts.
+    async fn read_session(
+        &self,
+        binary: &Path,
+        env: &[(EnvVarName, String)],
+        session: &SessionId,
+    ) -> Result<RecordedSettings, HarnessError> {
         let adapter = self.clone();
         let id = session.clone();
         // A thread with no rollout here records nothing to carry or to
@@ -632,6 +643,9 @@ impl Codex {
             Err(e) => Err(e),
         })
         .await?;
+        if let Some(writer) = &recorded.writer {
+            crate::version::refuse_older(PROGRAM, binary, env, session, writer).await?;
+        }
         Ok(recorded)
     }
 
@@ -712,7 +726,7 @@ impl Codex {
         let root = pipeline::physical_workspace(workspace)?;
         let binary = self.binary()?;
         let recorded = match launch.resume() {
-            Some(session) => Some(self.read_session(session).await?),
+            Some(session) => Some(self.read_session(&binary, env, session).await?),
             None => None,
         };
         let (overrides, settings) =
@@ -893,10 +907,11 @@ mod tests {
     /// A home whose store holds one rollout of `THREAD`, written by Codex
     /// 0.155.1 with gpt-6-sol, and a fake `codex` that answers
     /// `--version` with `version_line` and otherwise appends a record to
-    /// the rollout and writes its arguments to `ran`.
+    /// the rollout, as 0.142.4 did, and writes its arguments to `ran`.
     struct Resume {
         _dir: tempfile::TempDir,
         home: PathBuf,
+        rollout: PathBuf,
         adapter: Codex,
         env: Vec<(EnvVarName, String)>,
     }
@@ -943,6 +958,7 @@ mod tests {
             Resume {
                 _dir: dir,
                 home,
+                rollout,
                 adapter,
                 env,
             }
@@ -962,6 +978,42 @@ mod tests {
             let text = std::fs::read_to_string(self.home.join("ran")).ok()?;
             Some(text.lines().map(str::to_owned).collect())
         }
+    }
+
+    /// An older codex on this node is refused before it starts, so the
+    /// rollout a newer one wrote keeps its bytes (gate finding F10b).
+    #[tokio::test]
+    async fn an_older_codex_is_refused_before_it_starts_and_the_rollout_is_untouched() {
+        let fixture = Resume::new("codex-cli 0.142.4");
+        let before = std::fs::read(&fixture.rollout).unwrap();
+        let refused = fixture.launch(true).await.unwrap_err();
+        let HarnessError::HarnessOlderThanSession {
+            local, recorded, ..
+        } = &refused
+        else {
+            panic!("expected HarnessOlderThanSession, got {refused}");
+        };
+        assert_eq!((local.as_str(), recorded.as_str()), ("0.142.4", "0.155.1"));
+        assert!(
+            refused
+                .to_string()
+                .contains("an older harness cannot run this session"),
+            "{refused}"
+        );
+        assert_eq!(std::fs::read(&fixture.rollout).unwrap(), before);
+        assert_eq!(fixture.ran(), None, "the older codex ran");
+    }
+
+    /// A codex whose version cannot be read is refused too: deny by default.
+    #[tokio::test]
+    async fn a_codex_whose_version_cannot_be_read_is_refused() {
+        let fixture = Resume::new("codex-cli");
+        let refused = fixture.launch(true).await.unwrap_err();
+        assert!(
+            matches!(refused, HarnessError::HarnessVersionUnknown { .. }),
+            "{refused}"
+        );
+        assert_eq!(fixture.ran(), None);
     }
 
     /// A resume passes the model, effort, approval policy and sandbox the
