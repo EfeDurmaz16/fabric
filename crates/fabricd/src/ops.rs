@@ -404,6 +404,10 @@ impl Node {
                     record.pid
                 ),
                 Liveness::Gone => "harness: not running".to_owned(),
+                Liveness::Unknown => format!(
+                    "harness: pid {} leads a process group and its start time could not be read, so whether it is still the harness is not known",
+                    record.pid
+                ),
             },
             None => "harness: not running".to_owned(),
         };

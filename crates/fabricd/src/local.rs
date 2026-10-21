@@ -58,6 +58,14 @@ pub enum LocalError {
         /// What failed.
         reason: String,
     },
+    /// The recorded pid leads a group and its start time could not be read.
+    #[error(
+        "pid {pid} leads a process group and its start time could not be read, so whether it is still the harness is not known and it was not signalled; nothing was captured. Run the command again"
+    )]
+    Unidentified {
+        /// The recorded pid.
+        pid: NonZeroU32,
+    },
 }
 
 /// Whether a recorded harness still runs.
@@ -69,6 +77,10 @@ pub enum Liveness {
     Group,
     /// Nothing of it runs.
     Gone,
+    /// Its start time could not be read while a group with its pid runs,
+    /// so that group may be its own or another process's after the pid
+    /// was given out again; nothing signals it.
+    Unknown,
 }
 
 /// How long a group gets to empty after `SIGKILL`.
@@ -240,16 +252,44 @@ pub fn remove(path: &Path) -> Result<(), LocalError> {
     }
 }
 
-/// The kernel's start time of `pid` as `ps -o lstart=` prints it, or `None` when no such process runs.
+/// The program that reads a process's start time and group.
+const PS: &str = "ps";
+
+/// The kernel's start time of `pid` as `ps -o lstart=` prints it, or `None` when no such process runs or `ps` failed.
 pub async fn process_started(pid: NonZeroU32) -> Option<String> {
-    let output = tokio::process::Command::new("ps")
+    match probe_started(PS, pid).await {
+        Started::At(text) => Some(text),
+        Started::Absent | Started::Unknown => None,
+    }
+}
+
+/// What `ps` says about a pid's start time.
+enum Started {
+    /// A process with the pid runs, and started then.
+    At(String),
+    /// `ps` ran and found no process with the pid: it exits 1 and prints nothing.
+    Absent,
+    /// `ps` could not be run, or failed in another way.
+    Unknown,
+}
+
+async fn probe_started(ps: &str, pid: NonZeroU32) -> Started {
+    let Ok(output) = tokio::process::Command::new(ps)
         .args(["-o", "lstart=", "-p", &pid.to_string()])
         .env("LC_ALL", "C")
         .output()
         .await
-        .ok()?;
+    else {
+        return Started::Unknown;
+    };
     let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    (output.status.success() && !text.is_empty()).then_some(text)
+    if output.status.success() && !text.is_empty() {
+        Started::At(text)
+    } else if output.status.code() == Some(1) && text.is_empty() && output.stderr.is_empty() {
+        Started::Absent
+    } else {
+        Started::Unknown
+    }
 }
 
 /// `pid` as a process id that may lead a group Fabric signals: any but 1.
@@ -288,10 +328,17 @@ impl HarnessRecord {
     /// When the pid names another process now, the group is gone: a pid is
     /// not given out again while a process group with that id exists.
     pub async fn liveness(&self) -> Liveness {
-        match process_started(self.pid).await {
-            Some(started) if started == self.started => Liveness::Leader,
-            None if self.group_exists() => Liveness::Group,
-            Some(_) | None => Liveness::Gone,
+        self.liveness_with(PS).await
+    }
+
+    async fn liveness_with(&self, ps: &str) -> Liveness {
+        match probe_started(ps, self.pid).await {
+            Started::At(started) if started == self.started => Liveness::Leader,
+            Started::Absent if self.group_exists() => Liveness::Group,
+            // A failed probe cannot tell this group from one another
+            // process leads under the same pid after it was given out again.
+            Started::Unknown if self.group_exists() => Liveness::Unknown,
+            Started::At(_) | Started::Absent | Started::Unknown => Liveness::Gone,
         }
     }
 
@@ -310,10 +357,18 @@ impl HarnessRecord {
     ///
     /// A group that is gone, or a pid now owned by another process, is left
     /// alone. A group that cannot be signalled or outlives `SIGKILL` is an
-    /// error, so no caller captures or hands away a workspace it still writes.
+    /// error, so no caller captures or hands away a workspace it still writes,
+    /// and so is a group whose leader's start time cannot be read, which is
+    /// never signalled.
     pub async fn stop(&self, grace: Duration) -> Result<(), LocalError> {
-        if self.liveness().await == Liveness::Gone {
-            return Ok(());
+        self.stop_with(grace, PS).await
+    }
+
+    async fn stop_with(&self, grace: Duration, ps: &str) -> Result<(), LocalError> {
+        match self.liveness_with(ps).await {
+            Liveness::Gone => return Ok(()),
+            Liveness::Unknown => return Err(LocalError::Unidentified { pid: self.pid }),
+            Liveness::Leader | Liveness::Group => {}
         }
         let survived = |reason: String| LocalError::Survived {
             pid: self.pid,
@@ -323,12 +378,12 @@ impl HarnessRecord {
             .group()
             .ok_or_else(|| survived("the pid is not a process id".to_owned()))?;
         self.signal(group, Signal::TERM).map_err(survived)?;
-        if self.wait_gone(grace).await {
+        if self.wait_gone(grace, ps).await {
             return Ok(());
         }
         tracing::warn!(pid = self.pid, "harness ignored SIGTERM; killing its group");
         self.signal(group, Signal::KILL).map_err(survived)?;
-        if self.wait_gone(KILL_WAIT).await {
+        if self.wait_gone(KILL_WAIT, ps).await {
             Ok(())
         } else {
             Err(survived("it outlived SIGKILL".to_owned()))
@@ -342,10 +397,10 @@ impl HarnessRecord {
         }
     }
 
-    async fn wait_gone(&self, limit: Duration) -> bool {
+    async fn wait_gone(&self, limit: Duration, ps: &str) -> bool {
         let deadline = tokio::time::Instant::now() + limit;
         loop {
-            if self.liveness().await == Liveness::Gone {
+            if self.liveness_with(ps).await == Liveness::Gone {
                 return true;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -466,5 +521,30 @@ mod tests {
             rustix::process::test_kill_process(child).is_err(),
             "the background process outlived the stop"
         );
+    }
+
+    /// A start-time probe that fails says nothing about who holds the pid
+    /// now. A stale record whose pid another process took, and leads a
+    /// group with, must not have that group signalled on such a failure.
+    #[tokio::test]
+    async fn a_failed_start_time_probe_signals_nothing() {
+        let no_ps = "/nonexistent/fabric-test-ps";
+        let mut other = tokio::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let stale = record_of(&other, "the harness that had this pid".to_owned());
+        assert_eq!(stale.liveness_with(no_ps).await, Liveness::Unknown);
+        let refused = stale.stop_with(Duration::from_millis(100), no_ps).await;
+        assert!(
+            matches!(refused, Err(LocalError::Unidentified { .. })),
+            "{refused:?}"
+        );
+        assert!(
+            other.try_wait().unwrap().is_none(),
+            "the other process's group was signalled"
+        );
+        other.kill().await.unwrap();
     }
 }
