@@ -28,7 +28,8 @@
 //! travels with the policy. `codex exec resume` sends none unless `-c`
 //! sets it, and Codex then restores the thread's own from the rollout
 //! (`latest_persisted_resume_settings`, `codex-rs/app-server` at the
-//! same tag), so a headless launch neither passes nor reports it.
+//! same tag), so a headless launch neither passes nor reports the
+//! recorded one; it passes only a pinned one.
 //!
 //! A resume takes these settings from the session (`rollout::recorded`),
 //! and any field the adapter was configured with wins over the session's
