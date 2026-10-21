@@ -39,7 +39,8 @@ required() {
 }
 
 # A fresh repository whose main holds api 1, one fixture with its required
-# keys and one closed enum, with a branch `base` at that commit.
+# keys, one closed enum and the fixtures of the version handshake, with a
+# branch `base` at that commit.
 new_repo() {
   rm -rf "$repo"
   mkdir -p "$repo/$(dirname "$api")"
@@ -51,6 +52,10 @@ new_repo() {
   fixture reply/node_ping.json '{"kind":"node_ping","rtt_ms":3}'
   fixture closed/wire.json '["quic","tcp_tls"]'
   required 'reply/node_ping.json /kind' 'reply/node_ping.json /rtt_ms'
+  fixture hello/hello.json '{"api":1,"client":"fabric/0.1.0"}'
+  fixture hello_answer/incompatible.json '{"type":"incompatible","api":2,"node_version":"0.2.0"}'
+  fixture closed/hello_answer.json '["incompatible","welcome"]'
+  fixture frame/hello.json '{"value":{"api":1,"client":"fabric/0.1.0"},"hex":"21000000"}'
   save 'feat: api 1'
   git_ branch -q base
 }
@@ -100,6 +105,36 @@ fixture reply/node_ping.json '{"kind":"node_ping","round_trip_ms":3}'
 set_version 2
 save 'feat!: api 2'
 expect pass 'an existing fixture edited with an api bump' "$repo" base
+
+new_repo
+fixture hello/hello.json '{"api":2,"client":"fabric/0.2.0"}'
+set_version 2
+save 'feat!: api 2'
+expect pass 'the hello pinned to a new api version' "$repo" base
+
+new_repo
+fixture hello_answer/incompatible.json '{"type":"incompatible","apis":[2,3],"node_version":"0.3.0"}'
+set_version 2
+save 'feat!: api 2 answers a range'
+expect fail 'the incompatible answer edited with an api bump' "$repo" base
+
+new_repo
+git_ rm -q protocol/fixtures/hello_answer/incompatible.json
+set_version 2
+save 'feat!: api 2'
+expect fail 'the incompatible answer removed with an api bump' "$repo" base
+
+new_repo
+fixture closed/hello_answer.json '["incompatible","redirect","welcome"]'
+set_version 2
+save 'feat!: api 2 redirects'
+expect fail 'a hello answer type added with an api bump' "$repo" base
+
+new_repo
+fixture frame/hello.json '{"value":{"api":1,"client":"fabric/0.1.0"},"hex":"00000021"}'
+set_version 2
+save 'feat!: api 2 frames big-endian'
+expect fail 'the framed hello edited with an api bump' "$repo" base
 
 new_repo
 git_ checkout -q -b feature

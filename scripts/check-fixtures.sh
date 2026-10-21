@@ -15,6 +15,14 @@
 # for a new fixture are fine. CI runs it on every pull request and push to
 # main. Run it before pushing.
 #
+# A few fixtures never change, bump or not: the framed hello, the
+# incompatible answer and the closed list of hello answer types. They are
+# how a client of one api learns that a node speaks another, so a client
+# of every earlier api must still read them; changed at a bump, they would
+# turn the message that says to upgrade into a frame no older client
+# parses. The hello itself may change with a bump, because a node answers
+# a hello it cannot read with the incompatible answer.
+#
 # Usage: scripts/check-fixtures.sh <base-ref>
 # The change checked is the one made since HEAD left base-ref, as a pull
 # request shows it, so fixtures the base added later do not count.
@@ -43,6 +51,17 @@ if [ -z "$now" ]; then
   exit 1
 fi
 before=$(git show "$fork:$api" 2>/dev/null | version)
+
+frozen=$(git diff --name-status --no-renames --diff-filter=DMT "$fork" HEAD -- \
+  protocol/fixtures/frame \
+  protocol/fixtures/hello_answer/incompatible.json \
+  protocol/fixtures/closed/hello_answer.json)
+if [ -n "$frozen" ]; then
+  printf '%s\n' "$frozen" >&2
+  echo "error: a fixture of the version handshake changed; the framed hello, the incompatible answer and the hello answer types stay as they are in every api version, bump or not, since they are how an older client learns that it must upgrade (ADR 0018, Compatibility)" >&2
+  exit 1
+fi
+
 if [ -n "$before" ] && [ "$before" != "$now" ]; then
   echo "API_VERSION $before -> $now: the fixtures of api $before may change"
   exit 0

@@ -119,9 +119,10 @@ Errors that happen before the node answers are the client's own, typed in each c
    - a new event kind, which a client skips: events report progress and never carry the result;
    - a new refusal reason, which a client reads as `unrecognized` with its `kind` and `message` intact, so the exit code and the sentence still work;
    - a new kind of ledger record in `job_log`, which a client reads as `unrecognized`, since a later ledger format may write one.
-3. Anything else bumps `api`: removing or renaming an op, a field or a kind, changing a field's type or meaning, a new refusal `kind` (exit codes depend on the closed set), a new reply shape for an existing op, or a change to the framing or the exchange.
+3. Anything else bumps `api`: removing or renaming an op, a field or a kind, changing a field's type or meaning, a new refusal `kind` (exit codes depend on the closed set), a new reply shape for an existing op, or a change to the exchange after the hello.
+4. Three things never change, bump or not, because they are how a client learns that a node speaks another api: the frame header (a `u32` little-endian length, then one JSON object), the `incompatible` answer `{ type, api, node_version }`, and the two hello answer types, `welcome` and `incompatible`. A client of every earlier api must still read them to tell its user to upgrade; changed at a bump, they would turn that message into a frame the older client cannot parse. The hello may change with a bump, since a node answers a hello it cannot read with `incompatible`. A range of versions (Alternative 8) would therefore come as a new field of `incompatible`, which an older client ignores, never as a new shape of it.
 
-The Rust crate and the TypeScript SDK both declare `API_VERSION = 1`, and a contract test pins it. The fixtures in `protocol/fixtures` follow the same rule: once a fixture is on the base branch, CI refuses a change that edits, renames or removes it unless `API_VERSION` changes too (`scripts/check-fixtures.sh`), so a new shape gets a new fixture and an older client's example stays what that client must still read.
+The Rust crate and the TypeScript SDK both declare `API_VERSION = 1`, and a contract test pins it. The fixtures in `protocol/fixtures` follow the same rule: once a fixture is on the base branch, CI refuses a change that edits, renames or removes it unless `API_VERSION` changes too (`scripts/check-fixtures.sh`), so a new shape gets a new fixture and an older client's example stays what that client must still read. The fixtures of rule 4, `frame/`, `hello_answer/incompatible.json` and `closed/hello_answer.json`, are refused any change even with a bump.
 
 A new fixture alone cannot carry every change that rule 3 names, so two more pins sit beside the examples, held by the same script and checked by both contract suites:
 
@@ -167,7 +168,7 @@ C2 adds a live event stream and approvals from a phone. It builds on two things 
 5. **One JSON object per line.** As easy to read in every language, but a reader learns a frame is too large only after it has read it. Rejected.
 6. **Keep the node's text and add a parallel typed API.** Two answers to keep in step for every command. Rejected: the CLI is a client like any other.
 7. **Batch events into the final answer.** Simpler, but it is the behavior C2 cannot build on and that leaves a user staring at a silent move. Rejected.
-8. **An api version range with negotiation.** Nothing older than api 1 exists, and capabilities already cover additive changes. Rejected until a second version exists.
+8. **An api version range with negotiation.** Nothing older than api 1 exists, and capabilities already cover additive changes. Rejected until a second version exists; then it is a new field of `incompatible` (Compatibility, rule 4).
 
 ## Consequences
 
