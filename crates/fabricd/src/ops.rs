@@ -1551,13 +1551,7 @@ impl Node {
         out: &mut Out,
     ) -> Result<PathBuf, NodeError> {
         let id = job.id();
-        let marker = match job.reconcile_marker()? {
-            Some(marker) if !marker.is_current(epoch, job.latest()).await => {
-                self.set_orphan_aside(job, &marker, epoch, out).await?;
-                None
-            }
-            marker => marker,
-        };
+        let marker = self.tenure_marker(job, epoch, out).await?;
         match &marker {
             Some(Marker {
                 root,
@@ -1638,6 +1632,38 @@ impl Node {
             epoch,
         })?;
         Ok(root)
+    }
+
+    /// The marker of a workspace this tenure, at `epoch`, can continue, or
+    /// `None` when the latest snapshot must be restored.
+    ///
+    /// A workspace an earlier tenure left is set aside. A clean workspace
+    /// holds nothing the latest snapshot lacks, so one removed or moved
+    /// outside Fabric is restored from it.
+    async fn tenure_marker(
+        &self,
+        job: &mut Job,
+        epoch: Epoch,
+        out: &mut Out,
+    ) -> Result<Option<Marker>, NodeError> {
+        Ok(match job.reconcile_marker()? {
+            Some(marker) if !marker.is_current(epoch, job.latest()).await => {
+                self.set_orphan_aside(job, &marker, epoch, out).await?;
+                None
+            }
+            Some(Marker {
+                root,
+                state: MarkerState::Clean { .. },
+                ..
+            }) if is_missing(&root)? => {
+                out.say(format!(
+                    "the clean workspace at {} is gone; restoring the latest snapshot",
+                    root.display()
+                ));
+                None
+            }
+            marker => marker,
+        })
     }
 
     /// Writes `snapshot` into the empty `root`, carrying each cache whose key matches this node's.
@@ -2003,6 +2029,15 @@ fn report_caches(caches: &[fabric_core::snapshot::CacheEntry], facts: &NodeFacts
                 key_difference(&cache.key, &mine)
             ));
         }
+    }
+}
+
+/// Whether nothing, not even a dangling link, is at `path`.
+fn is_missing(path: &Path) -> Result<bool, NodeError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(NodeError::io(path, e)),
     }
 }
 
@@ -2496,6 +2531,27 @@ pub(crate) mod tests {
                 .any(|line| line == "left behind (secret pattern): users.sqlite"),
             "{:?}",
             out.lines
+        );
+    }
+
+    /// A clean workspace deleted by hand is restored by the next resume,
+    /// not handed to the CLI as a root that does not exist.
+    #[tokio::test]
+    async fn a_resume_restores_a_clean_workspace_that_was_deleted() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let root = paths::job_root(&node.cfg.home, id);
+        std::fs::remove_dir_all(&root).unwrap();
+        let plan = node
+            .job_resume(id, None, None, false, &path, &mut Out::default())
+            .await
+            .unwrap();
+        assert_eq!(plan.root, root);
+        assert_eq!(
+            std::fs::read_to_string(root.join("README.md")).unwrap(),
+            "hello\n"
         );
     }
 
