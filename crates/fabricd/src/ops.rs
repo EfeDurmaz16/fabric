@@ -498,7 +498,7 @@ impl Node {
             token.epoch,
             marker.root,
             None,
-            &self.harness_config,
+            (&self.harness_config, &self.cfg.home),
             out,
         )
     }
@@ -1431,7 +1431,14 @@ impl Node {
                 pid: record.pid.get(),
             });
         }
-        plan(&job, token.epoch, root, harness, &self.harness_config, out)
+        plan(
+            &job,
+            token.epoch,
+            root,
+            harness,
+            (&self.harness_config, &self.cfg.home),
+            out,
+        )
     }
 
     /// The pull form of the move: fetch, ask the owner to start a move toward this node, decide it here.
@@ -2129,13 +2136,14 @@ fn owner_token(job: &Job, me: NodeId) -> Result<FencingToken, NodeError> {
 /// The workspace is marked live before the plan leaves the node: from here
 /// on a harness may write to it, so a move refuses to depart from the
 /// snapshot it was copying and a departed copy is never moved aside as if
-/// it held nothing new.
+/// it held nothing new. The plan carries the node's harness configuration
+/// and home, so the CLI launches under what the node captures with.
 fn plan(
     job: &Job,
     epoch: Epoch,
     root: PathBuf,
     harness: Option<HarnessKind>,
-    harness_config: &HarnessConfig,
+    (harness_config, home): (&HarnessConfig, &Path),
     out: &mut Out,
 ) -> Result<RunPlan, NodeError> {
     // The CLI resolves a link at the root and would run setup and the
@@ -2177,6 +2185,7 @@ fn plan(
         session,
         goal: job.ledger().manifest().goal.clone(),
         harness_config: harness_config.clone(),
+        home: home.to_owned(),
     })
 }
 
@@ -3108,6 +3117,7 @@ pub(crate) mod tests {
         let sent: RunPlan = postcard::from_bytes(&postcard::to_stdvec(&plan).unwrap()).unwrap();
         assert_eq!(sent.harness_config, node.harness_config);
         assert!(sent.harness_config.acp.is_empty());
+        assert_eq!(sent.home, node.cfg.home);
     }
 
     /// A peer paired without an address, as the Air pairs the Pro, is

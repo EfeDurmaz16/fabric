@@ -182,6 +182,10 @@ pub struct RunPlan {
     pub goal: String,
     /// The node's harness configuration, which the launch must use.
     pub harness_config: HarnessConfig,
+    /// The home the node captures and restores harness state under; a
+    /// launch under another home would keep the session where the node
+    /// never looks.
+    pub home: PathBuf,
 }
 
 /// The daemon's answer.

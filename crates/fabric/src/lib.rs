@@ -469,6 +469,16 @@ async fn launch(
     plan: &RunPlan,
     prompt: Option<String>,
 ) -> Result<ExitCode> {
+    // The node captures and restores the harness's state under its home;
+    // a harness launched under another would keep its session elsewhere.
+    if plan.home != home {
+        bail!(
+            "the node runs with home {} and this command with home {}, so the harness would keep its session where the node never captures it; run the command with HOME={}",
+            plan.home.display(),
+            home.display(),
+            plan.home.display()
+        );
+    }
     let tree = materialize(state, &plan.root)?;
     let socket = state.socket();
     let env = environment();
@@ -753,6 +763,35 @@ mod tests {
         let error = error.to_string();
         assert!(
             error.contains("FABRIC_TEST_VARIABLE_NO_ONE_SETS"),
+            "{error}"
+        );
+    }
+
+    /// The node captures and restores harness state under its own home.
+    /// A CLI whose `HOME` resolves elsewhere, with the same `FABRIC_HOME`,
+    /// would launch the harness against its home, and the session would
+    /// sit where no suspend looks; the launch is refused before setup.
+    #[tokio::test]
+    async fn a_launch_under_another_home_than_the_nodes_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mine = dir.path().join("mine");
+        let state = StateDir::resolve(Some(dir.path().join("state").as_os_str()), &mine).unwrap();
+        let plan = RunPlan {
+            job: "01M5EBB2BWY97N3YEKD6CDN2EM".parse().unwrap(),
+            epoch: fabric_core::id::Epoch::FIRST,
+            root: dir.path().join("work"),
+            harness: HarnessKind::Codex,
+            session: None,
+            goal: "goal".to_owned(),
+            harness_config: fabricd::harnesses::HarnessConfig::default(),
+            home: dir.path().join("the-nodes"),
+        };
+        let Err(error) = launch(&state, &mine, &plan, None).await else {
+            panic!("the launch went ahead");
+        };
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("the-nodes") && error.contains("mine"),
             "{error}"
         );
     }
