@@ -608,6 +608,9 @@ fn materialize(state: &StateDir, root: &Path) -> Result<TreeLock> {
     let detected = fabric_env::detect::detect(root, &[])?;
     let plan = fabric_env::materialize::plan(&detected, &lock, &NodeEnv::current())?;
     if plan.is_noop() {
+        // A declared variable is required even when no step runs, so a
+        // warm node refuses the launch a cold node would (ADR 0007).
+        plan.ready()?;
         return Ok(lock);
     }
     let mut stdout = std::io::stdout().lock();
@@ -717,4 +720,33 @@ fn kill_group(running: &Running) {
 
 fn pid_of(running: &Running) -> Option<rustix::process::Pid> {
     rustix::process::Pid::from_raw(i32::try_from(running.pid().get()).ok()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With every cache whole no step runs, and the declared variable must
+    /// still stop the launch.
+    #[test]
+    fn a_missing_declared_variable_stops_a_launch_with_no_setup_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(
+            root.join(".fabric/env.toml"),
+            "env = [\"FABRIC_TEST_VARIABLE_NO_ONE_SETS\"]\n",
+        )
+        .unwrap();
+        let state =
+            StateDir::resolve(Some(dir.path().join("state").as_os_str()), dir.path()).unwrap();
+        let Err(error) = materialize(&state, &root) else {
+            panic!("the launch went ahead");
+        };
+        let error = error.to_string();
+        assert!(
+            error.contains("FABRIC_TEST_VARIABLE_NO_ONE_SETS"),
+            "{error}"
+        );
+    }
 }
