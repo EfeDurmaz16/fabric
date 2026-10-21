@@ -786,14 +786,9 @@ impl Node {
 
     /// Pushes the ledger, and through it the latest snapshot, to every paired peer it can reach.
     pub(crate) async fn replicate(self: &Arc<Self>, id: JobId, out: &mut Out) {
-        let peers: Vec<NodeId> = self
-            .peers
-            .snapshot()
-            .iter()
-            .filter(|entry| !entry.addrs().is_empty())
-            .map(fabric_net::peers::PeerEntry::node)
-            .collect();
-        for peer in peers {
+        // A peer behind a NAT has no address here and is reached over the
+        // session it opened, as every other request reaches it.
+        for peer in self.reachable_peers() {
             match self.push_records(id, peer).await {
                 Ok(()) => out.say(format!("copied the ledger and the snapshot to {peer}")),
                 Err(e) => out.say(format!("not copied to {peer}: {e}")),
@@ -2712,6 +2707,28 @@ pub(crate) mod tests {
         );
         let job = b.job(id).await.unwrap();
         assert!(job.lock().await.forked().unwrap().is_some());
+    }
+
+    /// A suspend copies the job to a peer paired without an address while
+    /// that peer's session is open, so it holds the work if this node goes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_suspend_copies_the_job_to_an_addressless_peer_over_its_session() {
+        let (_dir_a, a) = node();
+        let (dir_b, b) = node();
+        tokio::spawn(Arc::clone(&a).run());
+        tokio::spawn(Arc::clone(&b).run());
+        let addr = b.local_addr().unwrap().to_string();
+        a.node_add(b.id, Some(&addr), &mut Out::default())
+            .await
+            .unwrap();
+        b.node_add(a.id, None, &mut Out::default()).await.unwrap();
+        a.node_ping(b.id, &mut Out::default()).await.unwrap();
+        let id = job(dir_b.path(), &b).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut out = Out::default();
+        b.suspend(id, &path, &mut out).await.unwrap();
+        b.replicate(id, &mut out).await;
+        assert!(a.job(id).await.is_ok(), "{:?}", out.lines);
     }
 
     #[test]
