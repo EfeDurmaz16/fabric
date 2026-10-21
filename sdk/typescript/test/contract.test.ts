@@ -429,15 +429,18 @@ describe("the shared fixtures", () => {
     }
   });
 
+  // The framed hello pins the frame header, which never changes, so its body is read as JSON, not as this api's
+  // Hello: the hello may change with a bump, and the frozen api-1 hello must still pass then (review finding on
+  // PR #13). The hello/ fixtures pin the hello's shape.
   test("a hello frames to the fixture bytes and back", () => {
     const fixture = readJson(`${FIXTURES}frame/hello.json`);
-    const hello = Hello.parse(field(fixture, "value"));
+    const hello = field(fixture, "value");
     expect(Buffer.from(encodeFrame(hello)).toString("hex")).toBe(String(field(fixture, "hex")));
     const decoder = createFrameDecoder();
     decoder.push(Buffer.from(String(field(fixture, "hex")), "hex"));
     const body = decoder.next();
     expect(body).toBeDefined();
-    expect(Hello.parse(decodeJson(body ?? new Uint8Array()))).toStrictEqual(hello);
+    expect(decodeJson(body ?? new Uint8Array())).toStrictEqual(hello);
     expect(decoder.buffered()).toBe(0);
   });
 });

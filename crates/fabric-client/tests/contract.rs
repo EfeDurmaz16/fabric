@@ -817,12 +817,16 @@ fn a_message_from_a_newer_node_reads_as_the_compatibility_rule_says() {
     }
 }
 
+/// The framed hello pins the frame header, which never changes, so its
+/// body is read as JSON, not as this api's `Hello`: the hello may change
+/// with a bump, and the frozen api-1 hello must still pass then (review
+/// finding on PR #13). The `hello/` fixtures pin the hello's shape.
 #[tokio::test]
 async fn a_hello_frames_to_the_fixture_bytes_and_back() {
     let fixture: Value =
         serde_json::from_slice(&fs::read(fixtures().join("frame/hello.json")).unwrap()).unwrap();
-    let hello: Hello = serde_json::from_value(fixture["value"].clone()).unwrap();
-    let hex = frame::encode(&hello)
+    let hello = &fixture["value"];
+    let hex = frame::encode(hello)
         .unwrap()
         .iter()
         .fold(String::new(), |mut hex, b| {
@@ -835,6 +839,6 @@ async fn a_hello_frames_to_the_fixture_bytes_and_back() {
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
         .collect();
     let mut reader: &[u8] = &bytes;
-    let read: Hello = frame::read(&mut reader).await.unwrap().unwrap();
-    assert_eq!(read, hello);
+    let read: Value = frame::read(&mut reader).await.unwrap().unwrap();
+    assert_eq!(&read, hello);
 }
