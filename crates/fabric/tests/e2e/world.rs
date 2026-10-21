@@ -114,7 +114,9 @@ impl Env {
 
     /// Puts a fake `codex` first on the `PATH`: it answers `--version` as
     /// the gate's Codex does, `0.155.1`, or with the version in the
-    /// node's `codex-version` file when there is one, and otherwise
+    /// node's `codex-version` file when there is one, or, as an asdf shim
+    /// does, with the `codex` line of a `.tool-versions` in the directory
+    /// it runs in, and otherwise
     /// writes its arguments, one per line, to `codex-args` and its
     /// environment to `codex-env` under the home. Under `exec` it appends the prompt and the turn's settings
     /// (gpt-6-sol, xhigh, on-request, workspace-write) to the thread's
@@ -134,6 +136,7 @@ impl Env {
                 "#!/bin/sh\n\
                  version=0.155.1\n\
                  [ ! -f \"$FABRIC_HOME/codex-version\" ] || version=$(cat \"$FABRIC_HOME/codex-version\")\n\
+                 [ ! -f .tool-versions ] || version=$(sed -n 's/^codex //p' .tool-versions)\n\
                  if [ \"$1\" = --version ]; then echo \"codex-cli $version\"; exit 0; fi\n\
                  printf '%s\\n' \"$@\" > \"$HOME/codex-args\"\n\
                  env > \"$HOME/codex-env\"\n\

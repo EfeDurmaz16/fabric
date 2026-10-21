@@ -141,9 +141,15 @@ impl Node {
                 pid,
                 harness,
                 session,
+                version,
             } => {
-                self.harness_started(job, epoch, pid, harness, session, out)
-                    .await?;
+                let started = Started {
+                    pid,
+                    harness,
+                    session,
+                    version,
+                };
+                self.harness_started(job, epoch, started, out).await?;
             }
             Request::HarnessExited { job, pid } => self.harness_exited(job, pid).await?,
             Request::HarnessSession(named) => self.harness_session(named, out).await?,
@@ -503,15 +509,24 @@ impl Node {
     /// and a process whose start time cannot be read are all refused, and
     /// the CLI then kills the group it launched. The record is written
     /// before `Resumed`, so no harness the ledger says runs is unsupervised.
+    /// The session record keeps the newer of its known writer and the
+    /// version the launch started, because a Codex that resumes a thread
+    /// leaves no version in it, and the capture's own version check runs
+    /// from the daemon, where a version manager's shim can pick another
+    /// Codex than the one the workspace pins.
     pub(crate) async fn harness_started(
         &self,
         id: JobId,
         epoch: Epoch,
-        pid: NonZeroU32,
-        harness: HarnessKind,
-        session: Option<SessionId>,
+        started: Started,
         out: &mut Out,
     ) -> Result<(), NodeError> {
+        let Started {
+            pid,
+            harness,
+            session,
+            version,
+        } = started;
         refuse_secret_kind(&harness)?;
         let job = self.job(id).await?;
         let mut job = job.lock().await;
@@ -556,7 +571,7 @@ impl Node {
             },
         )?;
         if let Some(session) = session {
-            let record = continued(&job, harness.clone(), session)?;
+            let record = continued(&job, harness.clone(), session, version)?;
             local::write(&job.dir().session(), &record)?;
         }
         if let Some(marker) = job.marker()? {
@@ -611,7 +626,7 @@ impl Node {
                 session,
             });
         }
-        let record = continued(&job, harness.clone(), session.clone())?;
+        let record = continued(&job, harness.clone(), session.clone(), None)?;
         local::write(&job.dir().session(), &record)?;
         out.say(format!("recorded {harness} session {session}"));
         Ok(())
@@ -2088,18 +2103,33 @@ fn owner_token(job: &Job, me: NodeId) -> Result<FencingToken, NodeError> {
     }
 }
 
+/// The harness the CLI says it started.
+pub(crate) struct Started {
+    /// Its process, which leads its own group.
+    pub(crate) pid: NonZeroU32,
+    /// Which harness.
+    pub(crate) harness: HarnessKind,
+    /// The session it continues or created, when known.
+    pub(crate) session: Option<SessionId>,
+    /// The version the launch asked of it, when it asked.
+    pub(crate) version: Option<HarnessVersion>,
+}
+
 /// The session record for `session` of `harness`, keeping the known
 /// writer of the record it replaces when that names the same session, so
-/// a launch or a thread named while a turn runs never forgets it.
+/// a launch or a thread named while a turn runs never forgets it, raised
+/// to `started`, the version a launch started on the session.
 fn continued(
     job: &Job,
     harness: HarnessKind,
     session: SessionId,
+    started: Option<HarnessVersion>,
 ) -> Result<SessionRecord, NodeError> {
-    let known_writer = job
+    let kept = job
         .session()?
         .filter(|record| record.harness == harness && record.session == session)
         .and_then(|record| record.known_writer);
+    let known_writer = kept.into_iter().chain(started).max();
     Ok(SessionRecord {
         harness,
         session,
@@ -2441,15 +2471,14 @@ pub(crate) mod tests {
     }
 
     async fn register(node: &Arc<Node>, id: JobId, pid: NonZeroU32) -> Result<(), NodeError> {
-        node.harness_started(
-            id,
-            Epoch::FIRST,
+        let started = Started {
             pid,
-            HarnessKind::Codex,
-            None,
-            &mut Out::default(),
-        )
-        .await
+            harness: HarnessKind::Codex,
+            session: None,
+            version: None,
+        };
+        node.harness_started(id, Epoch::FIRST, started, &mut Out::default())
+            .await
     }
 
     /// Serves `a` and `b` and pairs them, each with the other's address.
@@ -2618,6 +2647,64 @@ pub(crate) mod tests {
             name(pid(&harness)).await,
             Err(NodeError::HarnessNotRecorded { .. })
         ));
+    }
+
+    /// A Codex that resumes a thread writes no version into it, so the
+    /// version the launch started with is the session's known writer from
+    /// then on: the node keeps the newer of it and the one it knew, and a
+    /// launch that reports none or an older one never lowers it.
+    #[tokio::test]
+    async fn a_started_harness_raises_the_known_writer_and_never_lowers_it() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let out = &mut Out::default();
+        node.suspend(id, &path, out).await.unwrap();
+        node.job_run(id, out).await.unwrap();
+        let thread = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
+        let v = |text| HarnessVersion::parse(text).unwrap();
+        let start = |version: Option<HarnessVersion>| {
+            let (node, thread) = (Arc::clone(&node), thread.clone());
+            async move {
+                let mut harness = sleeper();
+                let started = Started {
+                    pid: pid(&harness),
+                    harness: HarnessKind::Codex,
+                    session: Some(thread),
+                    version,
+                };
+                let result = node
+                    .harness_started(id, Epoch::FIRST, started, &mut Out::default())
+                    .await;
+                harness.kill().unwrap();
+                harness.wait().unwrap();
+                node.harness_exited(id, pid(&harness)).await.unwrap();
+                result
+            }
+        };
+        let known = || async {
+            let job = node.job(id).await.unwrap();
+            let job = job.lock().await;
+            job.session()
+                .unwrap()
+                .and_then(|record| record.known_writer)
+        };
+        start(Some(v("0.160.0"))).await.unwrap();
+        assert_eq!(known().await, Some(v("0.160.0")));
+        start(Some(v("0.155.1"))).await.unwrap();
+        assert_eq!(
+            known().await,
+            Some(v("0.160.0")),
+            "an older start lowered it"
+        );
+        start(None).await.unwrap();
+        assert_eq!(
+            known().await,
+            Some(v("0.160.0")),
+            "a start with no version dropped it"
+        );
+        start(Some(v("0.163.0-alpha.10.2"))).await.unwrap();
+        assert_eq!(known().await, Some(v("0.163.0-alpha.10.2")));
     }
 
     /// Two moves typed at once toward different nodes: the second finds the
@@ -2972,9 +3059,12 @@ pub(crate) mod tests {
             .harness_started(
                 id,
                 Epoch::FIRST,
-                pid(&sleeper),
-                secret,
-                None,
+                Started {
+                    pid: pid(&sleeper),
+                    harness: secret,
+                    session: None,
+                    version: None,
+                },
                 &mut Out::default(),
             )
             .await;

@@ -207,6 +207,67 @@ fn e2e_an_older_codex_is_refused_a_thread_a_newer_one_continued() -> Fallible {
     Ok(())
 }
 
+/// A version manager pins a newer Codex in the workspace, and it runs the
+/// thread there, while the node's own version check, run from the
+/// daemon, finds the global one. That newer Codex writes no version into
+/// the rollout, so the node remembers the one the launch started: once
+/// the pin is gone, the older global Codex is refused the thread, and a
+/// suspend records the newer version for the next node (gate finding
+/// F10b).
+#[test]
+fn e2e_a_codex_the_workspace_pinned_is_remembered_after_it_ran() -> Fallible {
+    let env = Env::new()?;
+    env.install_fake_codex()?;
+    let (node, job) = job_under(&env, "codex")?;
+    let thread = Env::CODEX_THREAD;
+    let pin = env.work(&job).join(".tool-versions");
+    node.ok(&["job", "run", &job, "--headless", "--prompt", "one"])?;
+    fs::write(&pin, "codex 0.160.0\n")?;
+    node.ok(&["job", "run", &job, "--headless", "--prompt", "two"])?;
+    let rollout = env.home.join(format!(
+        ".codex/sessions/2026/10/21/rollout-2026-10-21T10-00-00-{thread}.jsonl"
+    ));
+    let continued = fs::read_to_string(&rollout)?;
+    assert!(
+        continued.contains("\"cli_version\":\"0.155.1\"")
+            && !continued.contains("0.160.0")
+            && continued.contains("\"text\":\"two\""),
+        "the rollout names only the codex that created it:\n{continued}"
+    );
+
+    fs::remove_file(&pin)?;
+    fs::write(env.home.join("codex-args"), "")?;
+    let again = node.run(&["job", "run", &job, "--headless", "--prompt", "three"])?;
+    let said = text(&again);
+    assert!(!again.status.success(), "{said}");
+    assert!(
+        said.contains(&format!(
+            "codex 0.155.1 is older than codex 0.160.0, which wrote session {thread}"
+        )),
+        "{said}"
+    );
+    assert_eq!(
+        fs::read_to_string(&rollout)?,
+        continued,
+        "the older codex wrote"
+    );
+    let args = fs::read_to_string(env.home.join("codex-args"))?;
+    assert!(!args.contains("exec"), "the older codex started: {args}");
+
+    node.ok(&["job", "suspend", &job])?;
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(
+        node.state()
+            .join("jobs")
+            .join(&job)
+            .join("harness-state/manifest.json"),
+    )?)?;
+    assert_eq!(
+        manifest["harness_version"], "0.160.0",
+        "the capture recorded the daemon's codex, not the one that ran"
+    );
+    Ok(())
+}
+
 /// A headless Claude run starts `claude -p --output-format json` with a
 /// session id it chose, prints the answer and the session, and a suspend
 /// captures the transcript; a headless resume continues it with

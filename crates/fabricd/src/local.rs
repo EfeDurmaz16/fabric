@@ -190,7 +190,8 @@ pub struct SessionRecord {
     /// The session id the harness minted.
     pub session: SessionId,
     /// The newest harness version known to have written the session: the
-    /// version the capture this node restored, or took last, recorded. A
+    /// version the capture this node restored, or took last, recorded,
+    /// raised to the version each launch on the session started with. A
     /// Codex that resumes a thread leaves no version in its rollout, so
     /// this is what keeps an older Codex off a thread a newer one
     /// continued elsewhere (ADR 0006, Settings travel with the session).

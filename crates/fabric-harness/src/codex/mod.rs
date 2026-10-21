@@ -64,14 +64,19 @@
 //! (`codex-rs/rollout/src/recorder.rs` at `rust-v0.155.1`,
 //! `RolloutRecorderParams::Resume` with `meta: None`), so the rollout
 //! of a thread created by 0.142.4 and continued by 0.155.1 names only
-//! 0.142.4. A capture records the installed version, or the known
-//! writer when that is newer, so the job carries the newest Codex that
-//! ran the thread under Fabric to the next node. A Codex that resumed
-//! the thread outside Fabric, such as a desktop build newer than the
-//! CLI on the same node, leaves no version anywhere and is not seen. A
-//! thread with no rollout on this node has no bytes to protect, so it
-//! is launched as before and Codex says it found none. A launch with no
-//! session reads nothing and passes only what was configured.
+//! 0.142.4. A resume reports the version the guard asked in the
+//! workspace (`Running::version`), the Codex that now runs the thread,
+//! and the node raises the known writer to it; a capture records the
+//! installed version, or the known writer when that is newer, so the
+//! job carries the newest Codex that ran the thread under Fabric to the
+//! next node, even when the capture's own version check, run from the
+//! daemon, finds another Codex than a version manager's shim picks in
+//! the workspace. A Codex that resumed the thread outside Fabric, such
+//! as a desktop build newer than the CLI on the same node, leaves no
+//! version anywhere and is not seen. A thread with no rollout on this
+//! node has no bytes to protect, so it is launched as before and Codex
+//! says it found none. A launch with no session reads nothing and
+//! passes only what was configured.
 
 pub mod overrides;
 pub(crate) mod rollout;
@@ -377,11 +382,12 @@ impl Codex {
     /// The newest Codex known to have written the session this adapter
     /// captures or resumes, beyond what its rollouts record: the version
     /// the job's last capture recorded, which travels with the job
-    /// (`StateManifest::harness_version`). A Codex that resumes a thread
-    /// appends to its rollout and writes no `session_meta`, so a rollout
-    /// names only the Codex that created it. The resume guard refuses a
-    /// Codex older than this, and a capture records at least this version,
-    /// so a node that never ran the session cannot lower it.
+    /// (`StateManifest::harness_version`), or one a resume on this node
+    /// started with since (`Running::version`). A Codex that resumes a
+    /// thread appends to its rollout and writes no `session_meta`, so a
+    /// rollout names only the Codex that created it. The resume guard
+    /// refuses a Codex older than this, and a capture records at least this
+    /// version, so a node that never ran the session cannot lower it.
     #[must_use]
     pub fn with_known_writer(mut self, version: Option<HarnessVersion>) -> Self {
         self.known_writer = version;
@@ -669,17 +675,18 @@ impl Codex {
         process::detect(self.binary().ok(), &self.path_var).await
     }
 
-    /// What the lineage of `session` records, read before a resume; refused
-    /// when the binary that would run it in `root` is older than its newest
-    /// writer, the highest `cli_version` of the lineage or the known writer,
-    /// or does not say its version, so nothing starts.
+    /// What the lineage of `session` records, read before a resume, and the
+    /// version of the binary that will run it in `root`, when there was a
+    /// writer to compare it with; refused when that binary is older than
+    /// the newest writer, the highest `cli_version` of the lineage or the
+    /// known writer, or does not say its version, so nothing starts.
     async fn read_session(
         &self,
         root: &AbsPath,
         binary: &Path,
         env: &[(EnvVarName, String)],
         session: &SessionId,
-    ) -> Result<RecordedSettings, HarnessError> {
+    ) -> Result<(RecordedSettings, Option<HarnessVersion>), HarnessError> {
         let adapter = self.clone();
         let id = session.clone();
         // A thread with no rollout here records nothing to carry or to
@@ -691,14 +698,20 @@ impl Codex {
         })
         .await?;
         let Some(recorded) = read else {
-            return Ok(RecordedSettings::default());
+            return Ok((RecordedSettings::default(), None));
         };
         let newest = recorded.writer.iter().chain(&self.known_writer).max();
-        if let Some(writer) = newest {
-            let cwd = pipeline::fs_path(root);
-            crate::version::refuse_older(PROGRAM, binary, cwd, env, session, writer).await?;
-        }
-        Ok(recorded)
+        let runs = match newest {
+            Some(writer) => {
+                let cwd = pipeline::fs_path(root);
+                Some(
+                    crate::version::refuse_older(PROGRAM, binary, cwd, env, session, writer)
+                        .await?,
+                )
+            }
+            None => None,
+        };
+        Ok((recorded, runs))
     }
 
     /// The argument list for `launch` with `overrides`, without the binary.
@@ -777,9 +790,12 @@ impl Codex {
         self.check_env(env)?;
         let root = pipeline::physical_workspace(workspace)?;
         let binary = self.binary()?;
-        let recorded = match launch.resume() {
-            Some(session) => Some(self.read_session(&root, &binary, env, session).await?),
-            None => None,
+        let (recorded, runs) = match launch.resume() {
+            Some(session) => {
+                let (recorded, runs) = self.read_session(&root, &binary, env, session).await?;
+                (Some(recorded), runs)
+            }
+            None => (None, None),
         };
         let (overrides, settings) = overrides::effective(
             self.overrides.as_ref(),
@@ -791,7 +807,9 @@ impl Codex {
         let spawned =
             process::spawn(&binary, &args, pipeline::fs_path(&root), env, launch.into()).await?;
         info!(?session, pid = %spawned.pid, held = spawned.held, "codex: launched");
-        Ok(Running::new(session, spawned).with_settings(settings))
+        Ok(Running::new(session, spawned)
+            .with_settings(settings)
+            .with_version(runs))
     }
 }
 
@@ -1088,6 +1106,28 @@ mod tests {
             "{refused}"
         );
         assert_eq!(fixture.ran(), None, "the pinned older codex ran");
+    }
+
+    /// A resume reports the version the guard asked in the workspace, the
+    /// Codex that now runs the thread, so the node can remember it: that
+    /// Codex writes no version into the rollout, and a version check run
+    /// anywhere else may find another Codex than a shim picks there. A new
+    /// thread asks nothing and reports nothing.
+    #[tokio::test]
+    async fn a_resume_reports_the_version_it_started() {
+        let fixture = Resume::answering(
+            "if [ -f .tool-versions ]; then echo 'codex-cli 0.160.0'; else echo 'codex-cli 0.155.1'; fi",
+        );
+        std::fs::write(fixture.home.join("work/.tool-versions"), "codex 0.160.0\n").unwrap();
+        let mut running = fixture.launch(true).await.unwrap();
+        running.child_mut().wait().await.unwrap();
+        assert_eq!(
+            running.version().map(HarnessVersion::as_str),
+            Some("0.160.0")
+        );
+        let mut running = fixture.launch(false).await.unwrap();
+        running.child_mut().wait().await.unwrap();
+        assert_eq!(running.version(), None);
     }
 
     /// A thread created by one Codex and continued by a newer one names

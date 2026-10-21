@@ -259,6 +259,7 @@ pub struct Running {
     child: Child,
     held: bool,
     settings: LaunchSettings,
+    version: Option<crate::version::HarnessVersion>,
 }
 
 impl std::fmt::Debug for Running {
@@ -268,6 +269,7 @@ impl std::fmt::Debug for Running {
             .field("session", &self.session)
             .field("held", &self.held)
             .field("settings", &self.settings)
+            .field("version", &self.version)
             .finish_non_exhaustive()
     }
 }
@@ -282,7 +284,26 @@ impl Running {
             child: spawned.child,
             held: spawned.held,
             settings: LaunchSettings::default(),
+            version: None,
         }
+    }
+
+    /// Records the version the launch asked of the binary it started.
+    #[cfg(feature = "codex")]
+    pub(crate) fn with_version(mut self, version: Option<crate::version::HarnessVersion>) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// The version the binary reported when the launch asked it, in the
+    /// directory and environment it then started it in, before it
+    /// started: the version that now runs the session. `None` when the
+    /// launch did not ask, as on a new session. A Codex resume writes no
+    /// version into the rollout, so the node keeps this one as the
+    /// session's known writer (`Codex::with_known_writer`).
+    #[must_use]
+    pub fn version(&self) -> Option<&crate::version::HarnessVersion> {
+        self.version.as_ref()
     }
 
     /// Records what the launch passed and left out.

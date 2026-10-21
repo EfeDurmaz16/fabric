@@ -202,7 +202,8 @@ pub(crate) fn at_least(version: &str, floor: &str) -> bool {
 
 /// Refuses to start `binary` on `session` when the version it reports is
 /// older than `recorded`, the newest version the session records, or
-/// cannot be read. Runs `binary --version` in `cwd`, the directory the
+/// cannot be read, and otherwise returns that version, the one about to
+/// run the session. Runs `binary --version` in `cwd`, the directory the
 /// launch starts it in, with the launch environment minus the
 /// parent-session markers, as the launch itself would run.
 #[cfg(any(feature = "claude", feature = "codex"))]
@@ -213,7 +214,7 @@ pub(crate) async fn refuse_older(
     env: &[(fabric_core::env::EnvVarName, String)],
     session: &crate::session::SessionId,
     recorded: &HarnessVersion,
-) -> Result<(), crate::error::HarnessError> {
+) -> Result<HarnessVersion, crate::error::HarnessError> {
     use crate::error::HarnessError;
     let unknown = |reason: String| HarnessError::HarnessVersionUnknown {
         program: program.to_owned(),
@@ -233,7 +234,7 @@ pub(crate) async fn refuse_older(
             session: session.clone(),
         });
     }
-    Ok(())
+    Ok(local)
 }
 
 #[cfg(test)]

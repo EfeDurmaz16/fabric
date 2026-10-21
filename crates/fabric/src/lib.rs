@@ -722,6 +722,7 @@ async fn register(socket: &Path, plan: &RunPlan, running: &Running, notes: Notes
             pid: running.pid(),
             harness: plan.harness.clone(),
             session: running.session().cloned(),
+            version: running.version().cloned(),
         },
     )
     .await;

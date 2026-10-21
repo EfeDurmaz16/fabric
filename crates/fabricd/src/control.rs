@@ -101,6 +101,11 @@ pub enum Request {
         harness: HarnessKind,
         /// The session it continues or created, when known.
         session: Option<SessionId>,
+        /// The version the launch asked of the harness it started, in the
+        /// workspace and environment it started it in, when it asked: the
+        /// newest known to have run that session, which a later resume of
+        /// it must not go below.
+        version: Option<HarnessVersion>,
     },
     /// The harness exited.
     HarnessExited {
