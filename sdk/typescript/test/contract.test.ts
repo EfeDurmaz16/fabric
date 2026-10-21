@@ -66,8 +66,9 @@ function schemaNamed(name: unknown): z.ZodType {
   return schema;
 }
 
+/** A fixture file, read as the SDK reads a frame's body, so a number keeps the form the file writes it in. */
 function readJson(path: string): unknown {
-  return JSON.parse(readFileSync(path, "utf8"));
+  return decodeJson(readFileSync(path));
 }
 
 /** Every fixture in `dir`, by file name, with its JSON. */

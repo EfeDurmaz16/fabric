@@ -1,0 +1,16 @@
+{
+  "schema": "reply",
+  "value": {
+    "kind": "job_move",
+    "owner": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+    "epoch": 3,
+    "load": 0.5,
+    "share": -0,
+    "since": 1e3
+  },
+  "reads_as": {
+    "kind": "job_move",
+    "owner": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+    "epoch": 3
+  }
+}

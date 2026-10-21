@@ -6,6 +6,10 @@
 // writes as an escape and JSON.parse reads back, but which is not Unicode
 // text and which the Rust reader refuses. Neither direction lets one
 // through, in a value or in a key.
+//
+// JSON.parse also reads an integer written as 2.0, 1e0 or -0, which
+// serde_json reads as a float that no field of the client API takes. The
+// reader refuses one where the Rust reader does (review finding on PR #13).
 
 import { FrameEmptyError, FrameTooLargeError, MalformedError } from "./errors.ts";
 import { isUnicodeText } from "./schema.ts";
@@ -33,7 +37,10 @@ export function encodeFrame(value: unknown): Uint8Array {
   return frame;
 }
 
-/** The JSON value a frame's body holds. */
+/**
+ * The JSON value a frame's body holds. A number written with a fraction,
+ * an exponent or as `-0` reads as a symbol that every schema refuses.
+ */
 export function decodeJson(body: Uint8Array): unknown {
   let text: string;
   try {
@@ -43,7 +50,7 @@ export function decodeJson(body: Uint8Array): unknown {
   }
   let value: unknown;
   try {
-    value = JSON.parse(text);
+    value = MAYBE_NOT_AN_INTEGER.test(text) ? JSON.parse(text, markNonIntegers) : JSON.parse(text);
   } catch (error) {
     throw new MalformedError("not JSON", error);
   }
@@ -54,6 +61,38 @@ export function decodeJson(body: Uint8Array): unknown {
 }
 
 const LONE_SURROGATE = "a string holds a lone UTF-16 surrogate, which is not Unicode text";
+
+/**
+ * What a number written with a fraction, an exponent or as `-0` reads as.
+ * serde_json reads each of them as a float, and every number of the client
+ * API is an integer, so the Rust readers refuse one wherever the message
+ * reads a number and skip it in a field they do not know. A symbol is no
+ * JSON value, so every schema refuses it in the same places and drops it
+ * with an unknown field, where a number would pass `int()`.
+ */
+const NOT_AN_INTEGER = Symbol("a number not written as an integer");
+
+/** The one form serde_json reads as an integer: no fraction, no exponent, no `-0`. */
+const INTEGER = /^(?:0|-?[1-9][0-9]*)$/;
+
+/**
+ * Matches every JSON text holding a number with a fraction or an exponent,
+ * whose digits run into `.`, `e` or `E`, or a `-0`; a match inside a string
+ * only costs the slower parse. Most frames hold none, so they skip the
+ * reviver, which parses several times slower.
+ */
+const MAYBE_NOT_AN_INTEGER = /[0-9][.eE]|-0/;
+
+/**
+ * A reviver that reads a number not written as an integer as
+ * `NOT_AN_INTEGER`. Node 22 and Bun hand a reviver the source text of each
+ * number, which the version JSON.parse made of it no longer tells apart.
+ */
+function markNonIntegers(_key: string, value: unknown, context?: { readonly source?: string }): unknown {
+  return typeof value === "number" && context?.source !== undefined && !INTEGER.test(context.source)
+    ? NOT_AN_INTEGER
+    : value;
+}
 
 /** Whether every string in `value`, keys included, is Unicode text. */
 function isUnicodeJson(value: unknown): boolean {
