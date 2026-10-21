@@ -56,6 +56,10 @@ pub(crate) struct RecordedClaude {
     pub(crate) model: Recorded<ModelName>,
     /// The highest `version` any line records.
     pub(crate) writer: Option<HarnessVersion>,
+    /// The model each transcript ends on, as recorded, in the order read
+    /// and each once; what a resume can name when it cannot tell which
+    /// transcript Claude continues.
+    pub(crate) models: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -91,11 +95,23 @@ fn placeholder(model: &str) -> bool {
     model.starts_with('<') && model.ends_with('>')
 }
 
-/// Reads `transcripts` in order, the last one's model winning.
+/// Reads `transcripts` in order, the model of the last one that records
+/// one winning.
 pub(crate) fn read(transcripts: &[PathBuf]) -> Result<RecordedClaude, HarnessError> {
     let mut recorded = RecordedClaude::default();
     for path in transcripts {
-        read_one(path, &mut recorded)?;
+        let mut one = RecordedClaude::default();
+        read_one(path, &mut one)?;
+        recorded.writer = recorded.writer.max(one.writer);
+        let ends_on = match &one.model {
+            Recorded::Carried(model) => model.as_str(),
+            Recorded::NotCarried { value, .. } => value.as_str(),
+            Recorded::Absent => continue,
+        };
+        if !recorded.models.iter().any(|seen| seen == ends_on) {
+            recorded.models.push(ends_on.to_owned());
+        }
+        recorded.model = one.model;
     }
     Ok(recorded)
 }

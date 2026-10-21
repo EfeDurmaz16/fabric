@@ -749,9 +749,9 @@ impl ClaudeCode {
     /// refused when the binary that would run it is older than its newest
     /// writer or does not say its version, so nothing starts. When the
     /// workspace's own key cannot be named and the session has transcripts
-    /// under several keys, the model is left out, with that reason, rather
-    /// than taken from whichever key sorts last; the writer of every key
-    /// still guards the resume.
+    /// under several keys, the model is left out, with that reason and
+    /// every model the keys end on, rather than taken from whichever key
+    /// sorts last; the writer of every key still guards the resume.
     async fn read_session(
         &self,
         root: &AbsPath,
@@ -761,9 +761,9 @@ impl ClaudeCode {
     ) -> Result<recorded::RecordedClaude, HarnessError> {
         let (transcripts, ambiguous) = self.transcripts(root, session)?;
         let mut recorded = pipeline::blocking(move || recorded::read(&transcripts)).await?;
-        if ambiguous && let Recorded::Carried(model) = &recorded.model {
+        if ambiguous && !recorded.models.is_empty() {
             recorded.model = Recorded::NotCarried {
-                value: model.as_str().to_owned(),
+                value: recorded.models.join(" or "),
                 reason: KEY_UNKNOWN.to_owned(),
             };
         }
@@ -1729,10 +1729,10 @@ mod tests {
     }
 
     /// A workspace whose key Claude cuts and hashes, with the session's
-    /// transcripts under two keys: Claude resumes from the hashed one,
+    /// transcripts under several keys: Claude resumes from the hashed one,
     /// which Fabric cannot name, so no model is passed and the CLI is told
-    /// why, rather than the model of whichever key sorts last. Every key
-    /// still guards the resume.
+    /// why, with every model the keys end on, each once, rather than the
+    /// model of whichever key sorts last. Every key still guards the resume.
     #[tokio::test]
     async fn a_cut_key_with_transcripts_under_several_keys_carries_no_model() {
         let fixture = Resume::new("2.1.294 (Claude Code)");
@@ -1751,10 +1751,16 @@ mod tests {
         };
         let projects = fixture.home.join(".claude/projects");
         let cut = projects.join("-cut-key-1a2b3c");
+        let copy = projects.join("-mm-copy-key");
         let stale = projects.join("-zz-stale-key");
-        for dir in [&cut, &stale] {
+        for dir in [&cut, &copy, &stale] {
             std::fs::create_dir_all(dir).unwrap();
         }
+        std::fs::write(
+            copy.join(format!("{SID}.jsonl")),
+            line("2.1.294", "claude-opus-4-8"),
+        )
+        .unwrap();
         let launch = || Launch::Headless {
             resume: Some(SessionId::parse(SID).unwrap()),
             prompt: "next".to_owned(),
@@ -1800,7 +1806,7 @@ mod tests {
             running.settings().not_carried,
             [NotCarried::new(
                 SettingName::Model,
-                "claude-opus-4-8",
+                "claude-fable-5 or claude-opus-4-8",
                 KEY_UNKNOWN
             )]
         );
