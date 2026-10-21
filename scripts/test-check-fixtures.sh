@@ -33,8 +33,13 @@ save() {
   git_ commit -q -m "$1"
 }
 
-# A fresh repository whose main holds api 1 and one fixture, with a branch
-# `base` at that commit.
+# Writes protocol/required.txt, one argument per line.
+required() {
+  printf '%s\n' "$@" > "$repo/protocol/required.txt"
+}
+
+# A fresh repository whose main holds api 1, one fixture with its required
+# keys and one closed enum, with a branch `base` at that commit.
 new_repo() {
   rm -rf "$repo"
   mkdir -p "$repo/$(dirname "$api")"
@@ -44,6 +49,8 @@ new_repo() {
   git_ config commit.gpgsign false
   set_version 1
   fixture reply/node_ping.json '{"kind":"node_ping","rtt_ms":3}'
+  fixture closed/wire.json '["quic","tcp_tls"]'
+  required 'reply/node_ping.json /kind' 'reply/node_ping.json /rtt_ms'
   save 'feat: api 1'
   git_ branch -q base
 }
@@ -103,6 +110,43 @@ fixture reply/job_list.json '{"kind":"job_list","jobs":[],"closed":[]}'
 save 'test: the base adds a fixture later'
 git_ checkout -q feature
 expect pass 'a fixture the base added after the branch left it' "$repo" base
+
+new_repo
+fixture closed/wire.json '["quic","tcp_tls","websocket"]'
+save 'feat: a wire'
+expect fail 'a closed enum gains a variant' "$repo" base
+
+new_repo
+fixture closed/standing.json '["owner","replica"]'
+save 'feat: a closed enum'
+expect pass 'a new closed enum' "$repo" base
+
+new_repo
+required 'reply/node_ping.json /kind'
+save 'refactor: rtt_ms may be left out'
+expect fail 'a required field made optional' "$repo" base
+
+new_repo
+required 'reply/node_ping.json /kind' 'reply/node_ping.json /rtt_ms' 'reply/node_ping.json /wire'
+save 'refactor: wire is required'
+expect fail 'a field of an existing fixture made required' "$repo" base
+
+new_repo
+fixture reply/node_list.json '{"kind":"node_list","peers":[]}'
+required 'reply/node_list.json /kind' 'reply/node_list.json /peers' 'reply/node_ping.json /kind' 'reply/node_ping.json /rtt_ms'
+save 'test: add a fixture with its required keys'
+expect pass 'the required keys of a new fixture' "$repo" base
+
+new_repo
+git_ rm -q protocol/required.txt
+save 'refactor: drop the pins'
+expect fail 'the required keys removed' "$repo" base
+
+new_repo
+required 'reply/node_ping.json /kind'
+set_version 2
+save 'feat!: api 2'
+expect pass 'a required field made optional with an api bump' "$repo" base
 
 new_repo
 expect fail 'a base that does not exist' "$repo" nowhere

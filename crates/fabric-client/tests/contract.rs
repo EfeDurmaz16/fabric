@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use fabric_client::api::{
     API_VERSION, Answer, Decision, DoctorReport, Event, Hello, HelloAnswer, JobCreated, JobStatus,
     LedgerEvent, Marker, Op, Outcome, PreflightRow, Process, Reason, Refusal, RefusalKind,
-    Registered, Reply, Request, Roots, RunPlan, SessionRecorded, Standing, Step, View, Wire,
-    WorkspaceState,
+    Registered, Reply, Request, Roots, RunPlan, SessionRecorded, Standing, Step, SystemPath, View,
+    Wire, WorkspaceState,
 };
 use fabric_client::frame;
 use fabric_core::harness::HarnessKind;
@@ -274,15 +274,54 @@ fn every_refusal_reason_has_a_fixture_with_its_kind() {
 }
 
 /// Which variants of each enum nested in a message the fixtures hold, by
-/// enum, with how many variants each has.
+/// enum, with how many variants each has, and their tags on the wire.
 #[derive(Default)]
-struct Seen(BTreeMap<&'static str, (BTreeSet<usize>, usize)>);
+struct Seen(BTreeMap<&'static str, (BTreeSet<usize>, usize)>, Tags);
+
+/// The tags each enum's variants were seen with, by enum.
+type Tags = BTreeMap<&'static str, BTreeSet<String>>;
+
+/// The tag `value` is written with: the string itself, or the `kind` or
+/// `type` field of an object. Anything else reads as a tag no pin holds.
+fn tag(value: &impl Serialize) -> String {
+    match serde_json::to_value(value) {
+        Ok(Value::String(name)) => name,
+        Ok(Value::Object(fields)) => fields
+            .get("kind")
+            .or_else(|| fields.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("<an object without a tag>")
+            .to_owned(),
+        Ok(other) => format!("<{other}, not a tagged enum>"),
+        Err(e) => format!("<{e}>"),
+    }
+}
+
+/// The tag `harness` is written with in a message, where the client API's form of it applies.
+fn harness_tag(harness: &HarnessKind) -> String {
+    let request = SystemPath::parse("/").map(|repo| Request::JobNew {
+        repo,
+        goal: String::new(),
+        harness: harness.clone(),
+    });
+    match request.map(serde_json::to_value) {
+        Ok(Ok(request)) => tag(&request["harness"]),
+        Ok(Err(e)) => format!("<{e}>"),
+        Err(e) => format!("<{e}>"),
+    }
+}
 
 impl Seen {
     fn mark(&mut self, name: &'static str, (index, count): (Option<usize>, usize)) {
         let entry = self.0.entry(name).or_default();
         entry.0.insert(index.unwrap_or(usize::MAX));
         entry.1 = count;
+    }
+
+    /// As `mark`, also noting the tag the variant is written with.
+    fn tagged(&mut self, name: &'static str, tag: String, index: (Option<usize>, usize)) {
+        self.mark(name, index);
+        self.1.entry(name).or_default().insert(tag);
     }
 
     fn harness(&mut self, harness: &HarnessKind) {
@@ -294,7 +333,7 @@ impl Seen {
                 HarnessKind::Acp { .. },
             ]
         );
-        self.mark("Harness", index);
+        self.tagged("Harness", harness_tag(harness), index);
     }
 
     fn standing(&mut self, standing: Standing) {
@@ -309,7 +348,7 @@ impl Seen {
                 Standing::Unreadable,
             ]
         );
-        self.mark("Standing", index);
+        self.tagged("Standing", tag(&standing), index);
     }
 
     fn rows(&mut self, rows: &[PreflightRow]) {
@@ -324,7 +363,7 @@ impl Seen {
                     Outcome::RefuseAlways,
                 ]
             );
-            self.mark("Outcome", index);
+            self.tagged("Outcome", tag(&row.outcome), index);
         }
     }
 
@@ -340,10 +379,10 @@ impl Seen {
                 RefusalKind::Failed,
             ]
         );
-        self.mark("RefusalKind", index);
+        self.tagged("RefusalKind", tag(&refusal.kind()), index);
         if let Reason::Unfinished { step, .. } = refusal.reason() {
             let index = variant!(step, [Step::Suspend, Step::Restore]);
-            self.mark("Step", index);
+            self.tagged("Step", tag(step), index);
         }
     }
 
@@ -352,7 +391,7 @@ impl Seen {
             answer,
             [HelloAnswer::Welcome(_), HelloAnswer::Incompatible { .. }]
         );
-        self.mark("HelloAnswer", index);
+        self.tagged("HelloAnswer", tag(answer), index);
     }
 
     fn answer(&mut self, answer: &Answer) {
@@ -364,7 +403,7 @@ impl Seen {
                 Answer::Refused { .. },
             ]
         );
-        self.mark("Answer", index);
+        self.tagged("Answer", tag(answer), index);
         match answer {
             Answer::Event { event } => self.event(event),
             Answer::Done { reply } => self.reply(reply),
@@ -383,7 +422,7 @@ impl Seen {
             | Request::HarnessSession { harness, .. } => self.harness(harness),
             Request::JobDecide { decision, .. } => {
                 let index = variant!(decision, [Decision::Approve, Decision::Reject]);
-                self.mark("Decision", index);
+                self.tagged("Decision", tag(decision), index);
             }
             _ => {}
         }
@@ -393,7 +432,7 @@ impl Seen {
         match reply {
             Reply::NodePing(pong) => {
                 let index = variant!(pong.wire, [Wire::Quic, Wire::TcpTls]);
-                self.mark("Wire", index);
+                self.tagged("Wire", tag(&pong.wire), index);
             }
             Reply::JobList(list) => {
                 for job in &list.jobs {
@@ -411,7 +450,7 @@ impl Seen {
                     report,
                     [DoctorReport::Facts { .. }, DoctorReport::Compared { .. }]
                 );
-                self.mark("DoctorReport", index);
+                self.tagged("DoctorReport", tag(report), index);
                 if let DoctorReport::Compared { rows, .. } = report {
                     self.rows(rows);
                 }
@@ -437,7 +476,7 @@ impl Seen {
                 View::Frozen { .. },
             ]
         );
-        self.mark("View", index);
+        self.tagged("View", tag(&status.view), index);
         if let Some(workspace) = &status.workspace {
             let index = variant!(
                 workspace.state,
@@ -449,7 +488,7 @@ impl Seen {
                     WorkspaceState::Orphan,
                 ]
             );
-            self.mark("WorkspaceState", index);
+            self.tagged("WorkspaceState", tag(&workspace.state), index);
             if let WorkspaceState::Current { marker } = workspace.state {
                 let index = variant!(
                     marker,
@@ -460,7 +499,7 @@ impl Seen {
                         Marker::Restoring { .. },
                     ]
                 );
-                self.mark("Marker", index);
+                self.tagged("Marker", tag(&marker), index);
             }
         }
         let index = variant!(
@@ -471,7 +510,7 @@ impl Seen {
                 Process::GroupRemains { .. },
             ]
         );
-        self.mark("Process", index);
+        self.tagged("Process", tag(&status.process), index);
     }
 
     fn ledger(&mut self, event: &LedgerEvent) {
@@ -523,6 +562,158 @@ impl Seen {
     }
 }
 
+/// Every nested enum's variants the fixtures hold.
+fn seen() -> Fallible<Seen> {
+    let mut seen = Seen::default();
+    for answer in round_trip::<HelloAnswer>("hello_answer")? {
+        seen.hello_answer(&answer);
+    }
+    for answer in round_trip::<Answer>("answer")? {
+        seen.answer(&answer);
+    }
+    for request in round_trip::<Request>("request")? {
+        seen.request(&request);
+    }
+    for reply in round_trip::<Reply>("reply")? {
+        seen.reply(&reply);
+    }
+    for event in round_trip::<Event>("event")? {
+        seen.event(&event);
+    }
+    for refusal in round_trip::<Refusal>("refusal")? {
+        seen.refusal(&refusal);
+    }
+    Ok(seen)
+}
+
+/// The enums whose set of variants is closed: a reader refuses a variant
+/// it does not know, so a new one breaks every reader of the api version
+/// (ADR 0018, Compatibility rule 3). Ops, event kinds, refusal reasons and
+/// ledger record kinds are open and are not here.
+const CLOSED: [(&str, &str); 14] = [
+    ("Answer", "answer"),
+    ("Decision", "decision"),
+    ("DoctorReport", "doctor_report"),
+    ("Harness", "harness"),
+    ("HelloAnswer", "hello_answer"),
+    ("Marker", "marker"),
+    ("Outcome", "outcome"),
+    ("Process", "process"),
+    ("RefusalKind", "refusal_kind"),
+    ("Standing", "standing"),
+    ("Step", "step"),
+    ("View", "view"),
+    ("Wire", "wire"),
+    ("WorkspaceState", "workspace_state"),
+];
+
+/// Each closed enum's tags are the ones `protocol/fixtures/closed` pins
+/// for this api version. `scripts/check-fixtures.sh` refuses an edit of a
+/// pinned file without an api bump, so a new variant of a closed enum,
+/// which a fixture of its own would otherwise let through, needs one too
+/// (review finding on PR #13).
+#[test]
+fn every_closed_enum_has_exactly_the_variants_its_api_version_pins() {
+    let seen = seen().unwrap();
+    let mut pinned = BTreeMap::new();
+    for (name, tags) in read_dir("closed").unwrap() {
+        let tags: BTreeSet<String> = serde_json::from_value(tags).unwrap();
+        pinned.insert(name.trim_end_matches(".json").to_owned(), tags);
+    }
+    let closed: BTreeMap<String, BTreeSet<String>> = CLOSED
+        .iter()
+        .map(|(name, file)| ((*file).to_owned(), seen.1[name].clone()))
+        .collect();
+    assert_eq!(closed, pinned);
+}
+
+/// Every key of `value`, at any depth, as a JSON pointer below `at`.
+fn pointers(value: &Value, at: &str, into: &mut Vec<String>) {
+    match value {
+        Value::Object(fields) => {
+            for (key, field) in fields {
+                let here = format!("{at}/{}", key.replace('~', "~0").replace('/', "~1"));
+                into.push(here.clone());
+                pointers(field, &here, into);
+            }
+        }
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                pointers(item, &format!("{at}/{i}"), into);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `value` without the key `pointer` names.
+fn without(value: &Value, pointer: &str) -> Fallible<Value> {
+    let mut value = value.clone();
+    let (parent, key) = pointer.rsplit_once('/').ok_or("not a JSON pointer")?;
+    let key = key.replace("~1", "/").replace("~0", "~");
+    value
+        .pointer_mut(parent)
+        .and_then(Value::as_object_mut)
+        .ok_or("the pointer's parent is not an object")?
+        .remove(&key);
+    Ok(value)
+}
+
+/// The directories of fixtures that are messages of the api.
+const MESSAGES: [&str; 7] = [
+    "hello",
+    "hello_answer",
+    "answer",
+    "request",
+    "reply",
+    "event",
+    "refusal",
+];
+
+/// The keys each message fixture cannot do without: `<dir>/<file> <pointer>`
+/// for each key whose removal makes the fixture refused, sorted.
+fn required() -> Fallible<Vec<String>> {
+    let mut lines = Vec::new();
+    for dir in MESSAGES {
+        for (name, json) in read_dir(dir)? {
+            let mut keys = Vec::new();
+            pointers(&json, "", &mut keys);
+            for key in keys {
+                if parse_as(dir, &without(&json, &key)?).is_err() {
+                    lines.push(format!("{dir}/{name} {key}"));
+                }
+            }
+        }
+    }
+    lines.sort();
+    Ok(lines)
+}
+
+/// The fields a reader needs are the ones `protocol/required.txt` pins: a
+/// field made optional passes every round trip, yet an older reader that
+/// needs it breaks once a node leaves it out, and one made required breaks
+/// an older writer that leaves it out. `scripts/check-fixtures.sh` refuses
+/// a line of the file removed, or added for a fixture the base had,
+/// without an api bump (review finding on PR #13). After adding a fixture,
+/// `FABRIC_PIN_REQUIRED=1` writes its lines.
+#[test]
+fn every_message_needs_exactly_the_fields_its_api_version_pins() {
+    let path = fixtures().join("../required.txt");
+    let required = required().unwrap();
+    if std::env::var_os("FABRIC_PIN_REQUIRED").is_some() {
+        fs::write(&path, required.join("\n") + "\n").unwrap();
+    }
+    let pinned = fs::read_to_string(&path).unwrap();
+    let pinned: BTreeSet<&str> = pinned.lines().collect();
+    let required: BTreeSet<&str> = required.iter().map(String::as_str).collect();
+    let unpinned: Vec<&&str> = required.difference(&pinned).collect();
+    let optional: Vec<&&str> = pinned.difference(&required).collect();
+    assert!(
+        unpinned.is_empty() && optional.is_empty(),
+        "required but not pinned: {unpinned:#?}\npinned but not required: {optional:#?}"
+    );
+}
+
 /// ADR 0018 says the two clients cannot drift apart without a test
 /// failing. Ops, event kinds and refusal reasons each have a test above;
 /// this one holds every other enum a message carries, ledger records
@@ -531,25 +722,7 @@ impl Seen {
 /// finding on PR #13).
 #[test]
 fn every_variant_of_every_nested_enum_has_a_fixture() {
-    let mut seen = Seen::default();
-    for answer in round_trip::<HelloAnswer>("hello_answer").unwrap() {
-        seen.hello_answer(&answer);
-    }
-    for answer in round_trip::<Answer>("answer").unwrap() {
-        seen.answer(&answer);
-    }
-    for request in round_trip::<Request>("request").unwrap() {
-        seen.request(&request);
-    }
-    for reply in round_trip::<Reply>("reply").unwrap() {
-        seen.reply(&reply);
-    }
-    for event in round_trip::<Event>("event").unwrap() {
-        seen.event(&event);
-    }
-    for refusal in round_trip::<Refusal>("refusal").unwrap() {
-        seen.refusal(&refusal);
-    }
+    let seen = seen().unwrap();
     let names: Vec<&str> = seen.0.keys().copied().collect();
     assert_eq!(
         names,

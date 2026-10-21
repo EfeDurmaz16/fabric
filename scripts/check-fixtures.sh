@@ -3,8 +3,17 @@
 # edited, renamed or removed without a bump of API_VERSION. ADR 0018: within
 # one api version every change to the client API is additive, so its
 # fixtures only grow; a renamed field, a changed type or a removed variant
-# shows up here as an edited fixture. A new shape gets a new fixture. CI
-# runs it on every pull request and push to main. Run it before pushing.
+# shows up here as an edited fixture. A new shape gets a new fixture.
+# protocol/fixtures/closed pins the variants of each closed enum the same
+# way, so a new variant, which a new fixture alone would let through, needs
+# the bump too.
+#
+# It also fails when protocol/required.txt, the keys each message fixture
+# cannot do without, lost a line, or gained one for a fixture the base had,
+# without the bump: a field made optional breaks an older reader once a
+# node leaves it out, and one made required breaks an older writer. Lines
+# for a new fixture are fine. CI runs it on every pull request and push to
+# main. Run it before pushing.
 #
 # Usage: scripts/check-fixtures.sh <base-ref>
 # The change checked is the one made since HEAD left base-ref, as a pull
@@ -44,5 +53,23 @@ changed=$(git diff --name-status --no-renames --diff-filter=DMT "$fork" HEAD -- 
 if [ -n "$changed" ]; then
   printf '%s\n' "$changed" >&2
   echo "error: a fixture of api $now changed without an API_VERSION bump; within one api version a change is additive (ADR 0018, Compatibility), so add a fixture for the new shape, or bump API_VERSION in api.rs and schema.ts if the change is not additive" >&2
+  exit 1
+fi
+
+# Each line is `<dir>/<file> <pointer>` and starts with a letter, so the
+# diff's own `---` and `+++` lines never match.
+pins=protocol/required.txt
+pin_diff=$(git diff -U0 --no-renames "$fork" HEAD -- "$pins")
+removed=$(printf '%s\n' "$pin_diff" | sed -n 's/^-\([a-z]\)/\1/p')
+added=$(printf '%s\n' "$pin_diff" | sed -n 's/^+\([a-z]\)/\1/p')
+of_old_fixtures=$(printf '%s\n' "$added" | while IFS= read -r line; do
+  if [ -n "$line" ] && git cat-file -e "$fork:protocol/fixtures/${line%% *}" 2>/dev/null; then
+    printf '%s\n' "$line"
+  fi
+done)
+if [ -n "$removed" ] || [ -n "$of_old_fixtures" ]; then
+  printf '%s\n' "$removed" | sed '/^$/d; s/^/no longer required: /' >&2
+  printf '%s\n' "$of_old_fixtures" | sed '/^$/d; s/^/newly required: /' >&2
+  echo "error: the fields a message of api $now requires changed without an API_VERSION bump (ADR 0018, Compatibility): keep each pinned line of $pins, add lines only for new fixtures, or bump API_VERSION in api.rs and schema.ts" >&2
   exit 1
 fi

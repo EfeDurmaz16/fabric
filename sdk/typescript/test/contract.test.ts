@@ -104,6 +104,66 @@ function roundTrip<T extends z.ZodType>(dir: string, schema: T): Array<z.output<
   });
 }
 
+/**
+ * The enums whose set of variants is closed, with the tags the schemas know: a reader refuses a variant it does
+ * not know, so a new one breaks every reader of the api version (ADR 0018, Compatibility rule 3). Ops, event
+ * kinds, refusal reasons and ledger record kinds are open and are not here.
+ */
+const CLOSED: Readonly<Record<string, readonly string[]>> = {
+  Answer: tagsOf("type", Answer.options),
+  Decision: Decision.options,
+  DoctorReport: tagsOf("kind", DoctorReport.options),
+  Harness: tagsOf("kind", Harness.options),
+  HelloAnswer: tagsOf("type", HelloAnswer.options),
+  Marker: tagsOf("kind", Marker.options),
+  Outcome: Outcome.options,
+  Process: tagsOf("kind", Process.options),
+  RefusalKind: RefusalKind.options,
+  Standing: Standing.options,
+  Step: Step.options,
+  View: tagsOf("kind", View.options),
+  Wire: Wire.options,
+  WorkspaceState: tagsOf("kind", WorkspaceState.options),
+};
+
+/** `DoctorReport` as `doctor_report`, the name of its file under `closed`. */
+function snakeCase(name: string): string {
+  return name.replace(/(?<=[a-z])(?=[A-Z])/g, "_").toLowerCase();
+}
+
+/** Every key of `value`, at any depth, as a JSON pointer below `at`. */
+function pointers(value: unknown, at = ""): string[] {
+  if (Array.isArray(value)) {
+    return value.flatMap((item, index) => pointers(item, `${at}/${index}`));
+  }
+  if (typeof value === "object" && value !== null) {
+    return Object.entries(value).flatMap(([key, field]) => {
+      const here = `${at}/${key.replaceAll("~", "~0").replaceAll("/", "~1")}`;
+      return [here, ...pointers(field, here)];
+    });
+  }
+  return [];
+}
+
+/** `value` without the key `pointer` names. */
+function without(value: unknown, pointer: string): unknown {
+  const copy: unknown = structuredClone(value);
+  const steps = pointer.split("/").slice(1).map((step) => step.replaceAll("~1", "/").replaceAll("~0", "~"));
+  const key = steps.pop() ?? "";
+  let parent: unknown = copy;
+  for (const step of steps) {
+    parent = Object.getOwnPropertyDescriptor(parent, step)?.value;
+  }
+  if (typeof parent !== "object" || parent === null) {
+    throw new Error(`${pointer} names no key`);
+  }
+  Reflect.deleteProperty(parent, key);
+  return copy;
+}
+
+/** The directories of fixtures that are messages of the api. */
+const MESSAGES = ["hello", "hello_answer", "answer", "request", "reply", "event", "refusal"] as const;
+
 describe("the shared fixtures", () => {
   test("every fixture parses and writes back to the same JSON", () => {
     for (const [dir, schema] of Object.entries(SCHEMAS)) {
@@ -297,29 +357,46 @@ describe("the shared fixtures", () => {
     roundTrip("event", Event).forEach(event);
     roundTrip("refusal", Refusal).forEach(refusal);
 
-    const variants: Readonly<Record<string, readonly string[]>> = {
-      Answer: tagsOf("type", Answer.options),
-      Decision: Decision.options,
-      DoctorReport: tagsOf("kind", DoctorReport.options),
-      Harness: tagsOf("kind", Harness.options),
-      HelloAnswer: tagsOf("type", HelloAnswer.options),
-      LedgerEvent: LEDGER_EVENT_KINDS,
-      Marker: tagsOf("kind", Marker.options),
-      Outcome: Outcome.options,
-      Process: tagsOf("kind", Process.options),
-      RefusalKind: RefusalKind.options,
-      Standing: Standing.options,
-      Step: Step.options,
-      View: tagsOf("kind", View.options),
-      Wire: Wire.options,
-      WorkspaceState: tagsOf("kind", WorkspaceState.options),
-    };
+    const variants = { ...CLOSED, LedgerEvent: LEDGER_EVENT_KINDS };
     expect([...seen.keys()].sort()).toStrictEqual(Object.keys(variants).sort());
     for (const [name, known] of Object.entries(variants)) {
       expect([...(seen.get(name) ?? [])].sort(), name).toStrictEqual([...known].sort());
     }
     // The ledger list the check runs on is the schema's own, so a new kind fails here until it has a fixture.
     expect(LEDGER_EVENT_KINDS.length).toBe(LedgerEvent.out.options.length - 1);
+  });
+
+  // Review finding on PR #13: a new variant of a closed enum came with a fixture of its own, which the fixture
+  // check let through. scripts/check-fixtures.sh refuses an edit of a pinned file without an api bump.
+  test("every closed enum has exactly the variants its api version pins", () => {
+    const pinned = Object.fromEntries(
+      fixtures("closed").map(([name, tags]) => [name.replace(/\.json$/, ""), tags] as const),
+    );
+    const known: Readonly<Record<string, unknown>> = Object.fromEntries(
+      Object.entries(CLOSED).map(([name, tags]) => [snakeCase(name), [...tags].sort()] as const),
+    );
+    expect(known).toStrictEqual(pinned);
+  });
+
+  // Review finding on PR #13: a field made optional passes every round trip, yet an older reader that needs it
+  // breaks once a node leaves it out. scripts/check-fixtures.sh refuses a line of protocol/required.txt removed,
+  // or added for a fixture the base had, without an api bump.
+  test("every message needs exactly the fields its api version pins", () => {
+    const required: string[] = [];
+    for (const dir of MESSAGES) {
+      const schema = schemaNamed(dir);
+      for (const [name, json] of fixtures(dir)) {
+        for (const key of pointers(json)) {
+          if (!schema.safeParse(without(json, key)).success) {
+            required.push(`${dir}/${name} ${key}`);
+          }
+        }
+      }
+    }
+    const pinned = readFileSync(`${FIXTURES}../required.txt`, "utf8").split("\n").filter((line) => line !== "");
+    const unpinned = required.filter((line) => !pinned.includes(line));
+    const optional = pinned.filter((line) => !required.includes(line));
+    expect({ unpinned, optional }).toStrictEqual({ unpinned: [], optional: [] });
   });
 
   test("every invalid message is refused at the boundary", () => {

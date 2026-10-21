@@ -123,6 +123,11 @@ Errors that happen before the node answers are the client's own, typed in each c
 
 The Rust crate and the TypeScript SDK both declare `API_VERSION = 1`, and a contract test pins it. The fixtures in `protocol/fixtures` follow the same rule: once a fixture is on the base branch, CI refuses a change that edits, renames or removes it unless `API_VERSION` changes too (`scripts/check-fixtures.sh`), so a new shape gets a new fixture and an older client's example stays what that client must still read.
 
+A new fixture alone cannot carry every change that rule 3 names, so two more pins sit beside the examples, held by the same script and checked by both contract suites:
+
+- `protocol/fixtures/closed` lists, one file per closed enum, the tags of its variants: the harness kinds, standings, views, workspace states, markers, processes, outcomes, wires, steps, decisions, refusal kinds, doctor reports and the frame and hello answer types. A new variant of one of them fails both suites until its file lists it, and editing that file needs a bump. Ops, event kinds, refusal reasons and ledger record kinds are open and have no such file.
+- `protocol/required.txt` lists, for each message fixture, every key whose removal makes the message refused. A field made optional fails both suites until its lines go, and a field made required until its lines come; the script refuses a removed line, or a line added for a fixture the base had, without a bump. A new fixture brings its own lines, which `FABRIC_PIN_REQUIRED=1 cargo test -p fabric-client --test contract` writes.
+
 A CLI from before this ADR that reaches a node after it sends postcard, which does not parse as a hello; the node answers `Incompatible` and the old CLI fails to decode it. A new client that reaches an old node gets the connection closed without a welcome and says that the node may run an older fabric. Neither side misreads a frame.
 
 ### Security
