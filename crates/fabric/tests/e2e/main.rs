@@ -150,6 +150,11 @@ fn move_and_resume(wire: Wire) -> Fallible {
     assert_one_owner(&p.a, &p.b, &job, 3, "departed")?;
     assert_eq!(p.env.prompts()?, ["one", "next", "back"]);
     assert_eq!(read_work(&p.env, &job)?.readme, work.readme);
+    // No client watched that suspend: the holder logs its steps as the
+    // sentences the CLI prints, not as the events' fields (review finding
+    // on PR #13).
+    let holder = p.b.log();
+    assert!(holder.contains("suspended in snapshot"), "{holder}");
 
     let log = p.b.ok(&["job", "log", &job])?;
     assert!(log.contains("DecisionRecorded: approved: the plan reads right"));
@@ -500,6 +505,13 @@ fn e2e_a_steal_after_a_resume_freezes_the_owner_and_stops_its_harness() -> Falli
     );
     assert!(!alive(pid), "the owner's harness outlived the steal");
     assert_eq!(p.a.lease(&job)?.view, "frozen");
+    // The owner froze on a push no client asked for, so its log says so in words.
+    let owner = p.a.log();
+    assert!(owner.contains("does not continue this node's"), "{owner}");
+    assert!(
+        owner.contains("fenced: epoch 1 is over for this node"),
+        "{owner}"
+    );
     let refusal = p.a.run(&["job", "run", &job])?;
     assert_eq!(refusal.status.code(), Some(82), "{}", text(&refusal));
     assert!(

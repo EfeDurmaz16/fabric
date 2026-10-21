@@ -406,4 +406,11 @@ impl Out {
             None => self.events.push(event),
         }
     }
+
+    /// The kept events as the lines the CLI prints for them, for the
+    /// node's log: an operator reading the log of `fabric serve` reads the
+    /// same sentences as before the client API, not the events' fields.
+    pub(crate) fn lines(&self) -> impl Iterator<Item = String> + '_ {
+        self.events.iter().flat_map(fabric_client::sentences::event)
+    }
 }

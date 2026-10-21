@@ -89,8 +89,8 @@ impl Node {
                 }
                 None => {}
             }
-            for event in out.events {
-                tracing::info!(job = %id, ?event, "recovery");
+            for line in out.lines() {
+                tracing::info!(job = %id, "{line}");
             }
         }
         self.recovered.send_replace(true);
@@ -125,8 +125,8 @@ impl Node {
                     error: e.to_refusal(),
                 });
             }
-            for event in out.events {
-                tracing::info!(job = %id, ?event, "recovery");
+            for line in out.lines() {
+                tracing::info!(job = %id, "{line}");
             }
         }
         Ok(())
@@ -221,8 +221,8 @@ impl Node {
                 &mut out,
             )
             .await;
-        for event in out.events {
-            tracing::warn!(job = %id, ?event, "fork");
+        for line in out.lines() {
+            tracing::warn!(job = %id, "{line}");
         }
         match frozen {
             Ok(()) => NodeError::Forked {

@@ -96,7 +96,7 @@ A reply's `kind` is its request's `op`, so a client checks that the answer is th
 
 Every line the node used to print is now an event with typed fields: `stopping_harness { pid }`, `snapshot_published { snapshot, files, bytes, new_objects }`, `left_behind { path }`, `preflight { peer, rows }`, `move_started { move_id, target }`, `imported { owner, epoch }`, `restored { snapshot, files, bytes }`, `continuing_session { harness, session }` and the rest of the list in `api.rs`. An event that reports a failure the command survived, such as a peer the ledger could not be copied to, carries that failure as a `Refusal`. Three events carry a sentence where the node's explanation has no stable shape yet: `cache_rebuilt { path, why }`, `move_gave_up { detail }` and `not_replicated`'s refusal message.
 
-The CLI renders each event and each reply to the exact line the node printed before, so `fabric`'s output and exit codes do not change; the lines now appear as the steps happen instead of all at the end.
+The CLI renders each event and each reply to the exact line the node printed before, so `fabric`'s output and exit codes do not change; the lines now appear as the steps happen instead of all at the end. Work no client asked for, such as start-up recovery, catch-up, a peer's move request or a fork, keeps its events, and the node logs each as the same line, so the log of `fabric serve` reads as it did.
 
 ### Refusals
 
@@ -139,9 +139,9 @@ C2 adds a live event stream and approvals from a phone. It builds on two things 
 
 ### Where the code lives
 
-- `crates/fabric-client`: `api` (every type above, with serde), `frame` (the length-prefixed codec, both directions), and `Client` (connect, the trust checks, the hello, one typed method per op). It depends on `fabric-core`, `serde`, `serde_json`, `thiserror`, `tokio` and `rustix`, all already in the workspace. The node uses `api` and `frame` to serve.
+- `crates/fabric-client`: `api` (every type above, with serde), `frame` (the length-prefixed codec, both directions), `sentences` (the line each event reads as, which the CLI prints and the node logs), and `Client` (connect, the trust checks, the hello, one typed method per op). It depends on `fabric-core`, `serde`, `serde_json`, `thiserror`, `tokio` and `rustix`, all already in the workspace. The node uses `api` and `frame` to serve.
 - `SessionId` moves from `fabric-harness` to `fabric-core`, so a client does not depend on the harness adapters.
-- `crates/fabric/src/render.rs`: the human text for every reply and event.
+- `crates/fabric/src/render.rs`: the human text for every reply, and each event's line from `sentences`.
 - `sdk/typescript`: the TypeScript client for Node and Bun. Strict mode, named exports, zod schemas at the boundary and no other runtime dependency.
 - `protocol/fixtures`: one JSON example of every hello, request, reply, event and refusal reason, some messages both clients must refuse, and one framed hello as hex. The Rust tests and the TypeScript tests both parse every fixture and write it back to the same JSON, so the two clients cannot drift apart without a test failing.
 

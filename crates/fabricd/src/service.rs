@@ -296,8 +296,8 @@ impl Node {
                 .await
                 .map_err(|e| internal(&e))?;
         }
-        for event in out.events {
-            tracing::info!(job = %id, ?event, "peer request");
+        for line in out.lines() {
+            tracing::info!(job = %id, "{line}");
         }
         let (head, latest) = {
             let job = self.job(id).await.map_err(|_| Fault::UnknownJob)?;
@@ -334,8 +334,8 @@ impl Node {
         )
         .await
         .map_err(|e| internal(&e))?;
-        for event in out.events {
-            tracing::warn!(job = %job.id(), ?event, "fork");
+        for line in out.lines() {
+            tracing::warn!(job = %job.id(), "{line}");
         }
         Ok(())
     }
@@ -396,8 +396,8 @@ impl Node {
             .map_err(|e| internal(&e))?;
         drop(job);
         faults::hit(Point::AfterDepartingWrite).await;
-        for event in out.events {
-            tracing::info!(job = %id, ?event, "peer request");
+        for line in out.lines() {
+            tracing::info!(job = %id, "{line}");
         }
         Ok(Fenced::Answer(MoveRequested::Started { move_id }))
     }

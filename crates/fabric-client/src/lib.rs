@@ -25,6 +25,7 @@
 pub mod api;
 mod client;
 pub mod frame;
+pub mod sentences;
 mod text;
 
 pub use client::{Client, ClientError, Launched, Resume};
