@@ -55,13 +55,10 @@ impl Node {
             let node = Arc::clone(&self);
             tasks.spawn(async move { (peer, node.catch_up_peer(peer).await) });
         }
-        let mut caught_up = BTreeSet::new();
         let mut unreachable = BTreeSet::new();
         while let Some(joined) = tasks.join_next().await {
             match joined {
-                Ok((peer, Ok(()))) => {
-                    caught_up.insert(peer);
-                }
+                Ok((_, Ok(()))) => {}
                 Ok((peer, Err(e))) => {
                     tracing::info!(%peer, error = %e, "did not catch up with the peer");
                     unreachable.insert(peer);
@@ -99,25 +96,29 @@ impl Node {
                 tracing::info!(job = %id, "{line}");
             }
         }
-        self.end_recovery(&caught_up);
+        self.end_recovery();
     }
 
     /// Marks start-up recovery done and catches up with every peer whose
-    /// session began while it ran and that it did not already catch up
-    /// with, such as an addressless peer that dialed in after recovery
-    /// listed the reachable peers.
+    /// session began while it ran, such as an addressless peer that dialed
+    /// in after recovery listed the reachable peers.
+    ///
+    /// A peer recovery already caught up with is caught up again. Its
+    /// catch-up may have ended before its session began, with a steal
+    /// written in between, and a session recovery's own dial opened looks
+    /// the same as a later one. The extra pass costs one pull per job.
     ///
     /// The flag is set under the same lock `spawn_catch_up` checks it
     /// under, so a session that begins at any moment is either queued here
     /// or caught up on its own, never neither.
-    pub(crate) fn end_recovery(self: &Arc<Self>, caught_up: &BTreeSet<NodeId>) {
+    pub(crate) fn end_recovery(self: &Arc<Self>) {
         let waiting = {
             let mut waiting = lock(&self.waiting_catch_up);
             self.recovered.send_replace(true);
             std::mem::take(&mut *waiting)
         };
-        for peer in waiting.difference(caught_up) {
-            self.spawn_catch_up(*peer);
+        for peer in waiting {
+            self.spawn_catch_up(peer);
         }
     }
 

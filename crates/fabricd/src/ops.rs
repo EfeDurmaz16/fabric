@@ -2508,7 +2508,7 @@ pub(crate) mod tests {
         let kept = b.open_session(a.id).unwrap();
         b.forget(a.id, &kept);
         b.node_ping(a.id, out).await.unwrap();
-        a.end_recovery(&std::collections::BTreeSet::new());
+        a.end_recovery();
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while head(Arc::clone(&a)).await != want {
@@ -2518,6 +2518,84 @@ pub(crate) mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// Start-up recovery catches each peer up on a task of its own, so it
+    /// can be done with one peer while another holds the pass open. A
+    /// session that peer begins after its catch-up must be caught up when
+    /// the pass ends, or a record it wrote in between, such as a steal,
+    /// stays unknown here while this node's stale harness runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_recovery_caught_up_is_caught_up_again_for_a_later_session() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        let (_dir_c, c) = node();
+        paired(&a, &b).await;
+        tokio::spawn(Arc::clone(&c).run());
+        for (node, peer) in [(&a, &c), (&c, &a)] {
+            let addr = peer.local_addr().unwrap().to_string();
+            node.node_add(peer.id, Some(&addr), &mut Out::default())
+                .await
+                .unwrap();
+        }
+        for node in [&a, &b, &c] {
+            node.recovered().await;
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let out = &mut Out::default();
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &path, out).await.unwrap();
+        b.pull_records(id, a.id).await.unwrap();
+        c.pull_records(id, a.id).await.unwrap();
+        b.ensure_latest(id, a.id).await.unwrap();
+        b.job_steal(id, "a sleeps".to_owned(), true, out)
+            .await
+            .unwrap();
+        let head = |node: Arc<Node>| async move {
+            node.job(id).await.unwrap().lock().await.ledger().head()
+        };
+        let wait_for = |want, what: &'static str| {
+            let a = Arc::clone(&a);
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                while head(Arc::clone(&a)).await != want {
+                    assert!(tokio::time::Instant::now() < deadline, "{what}");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        };
+
+        // a restarts. c answers no pull while the test holds its job, so
+        // the pass stays open after it caught up with b.
+        a.recovered.send_replace(false);
+        let c_job = c.job(id).await.unwrap();
+        let c_paused = c_job.lock().await;
+        b.job_decide(id, Decision::Approve, "before", out)
+            .await
+            .unwrap();
+        let recovery = tokio::spawn(Arc::clone(&a).recover());
+        wait_for(
+            head(Arc::clone(&b)).await,
+            "recovery did not catch up with b",
+        )
+        .await;
+
+        // b writes a record a does not have, then begins a new session.
+        b.job_decide(id, Decision::Approve, "after", out)
+            .await
+            .unwrap();
+        let want = head(Arc::clone(&b)).await;
+        let kept = b.open_session(a.id).unwrap();
+        b.forget(a.id, &kept);
+        b.node_ping(a.id, out).await.unwrap();
+        drop(c_paused);
+        recovery.await.unwrap();
+        assert!(a.is_recovered());
+        wait_for(
+            want,
+            "a never caught up with the session b began after its catch-up",
+        )
+        .await;
     }
 
     /// Two moves typed at once toward different nodes: the second finds the
