@@ -266,6 +266,28 @@ mod tests {
         assert_eq!(v("0.155.1+build.7"), v("0.155.1"));
     }
 
+    /// The example list of semver.org 2.0.0, section 11, in its own
+    /// ascending order: at the same place a number ranks below a word, so
+    /// `alpha.1` is older than `alpha.beta`, and a session that
+    /// `1.0.0-alpha.beta` wrote refuses `1.0.0-alpha.1`.
+    #[test]
+    fn a_number_ranks_below_a_word_as_semver_orders_its_example() {
+        let ascending = [
+            "1.0.0-alpha",
+            "1.0.0-alpha.1",
+            "1.0.0-alpha.beta",
+            "1.0.0-beta",
+            "1.0.0-beta.2",
+            "1.0.0-beta.11",
+            "1.0.0-rc.1",
+            "1.0.0",
+        ];
+        for pair in ascending.windows(2) {
+            assert!(v(pair[0]) < v(pair[1]), "{} < {}", pair[0], pair[1]);
+            assert!(v(pair[1]) > v(pair[0]), "{} > {}", pair[1], pair[0]);
+        }
+    }
+
     #[test]
     fn only_three_numbers_and_a_pre_release_parse() {
         for bad in [
