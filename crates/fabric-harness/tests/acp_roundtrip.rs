@@ -22,10 +22,7 @@ use fabric_harness::acp::client::{PermissionPolicy, StopReason};
 use fabric_harness::{Harness, HarnessError, Launch, SessionId};
 use serde_json::Value;
 
-mod executable;
 mod fake_acp_agent;
-
-use executable::write_executable;
 
 /// The program name the fake agent is installed under.
 const AGENT: &str = "fake-acp-agent";
@@ -55,18 +52,24 @@ fn abs(path: &Path) -> AbsPath {
     AbsPath::parse(path.to_str().unwrap()).unwrap()
 }
 
-/// Puts this test binary under `home/agent-bin` as `AGENT` and returns
-/// that directory as a `PATH` value. A hard link opens nothing for
-/// writing; a copy goes through `write_executable`.
+/// Puts a symlink to this test binary under `home/agent-bin` as `AGENT`
+/// and returns that directory as a `PATH` value.
+///
+/// A symlink, not a hard link or a copy: macOS can scan a program as it
+/// starts by opening its file by path, and kills the program when that
+/// open fails. With hard links every test's agent was one file under many
+/// short-lived names, and the tests that finished removed theirs while
+/// other agents started, so an agent could be killed before it read a line
+/// and its launch saw a closed connection. Through a symlink every agent
+/// runs from the test binary's own path, which lasts the whole run, and
+/// nothing is opened for writing.
 fn agent_dir(home: &Path) -> OsString {
     let bin = home.join("agent-bin");
     let agent = bin.join(AGENT);
     if !agent.exists() {
         std::fs::create_dir_all(&bin).unwrap();
-        let exe = std::env::current_exe().unwrap();
-        if std::fs::hard_link(&exe, &agent).is_err() {
-            write_executable(&agent, &std::fs::read(&exe).unwrap());
-        }
+        let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
+        std::os::unix::fs::symlink(&exe, &agent).unwrap();
     }
     bin.into_os_string()
 }
