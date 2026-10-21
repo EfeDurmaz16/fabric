@@ -570,8 +570,9 @@ mod tests {
 
     /// The second gate run moved a Codex job with `--force` onto a node
     /// with an older Codex: the row names the older side, in the order the
-    /// resume guard uses, and `--force` still waives it, because the guard
-    /// refuses the older Codex at resume.
+    /// resume guard uses, for a push and for a pull onto this node alike,
+    /// and `--force` still waives it, because the guard refuses the older
+    /// Codex at resume.
     #[test]
     fn an_older_harness_on_the_target_is_named_and_force_still_waives_it() {
         let codex = HarnessKind::Codex;
@@ -590,6 +591,15 @@ mod tests {
         assert_eq!(
             pulled.note,
             "the job's harness must be the same version on both nodes (ADR 0008)"
+        );
+        let pulled_onto_older = row_of(compare(&older, &pro(), &pull));
+        assert_eq!(pulled_onto_older.outcome, Outcome::Refuse(Waiver::Force));
+        assert!(
+            pulled_onto_older
+                .note
+                .starts_with("the target's codex is older"),
+            "{}",
+            pulled_onto_older.note
         );
     }
 
