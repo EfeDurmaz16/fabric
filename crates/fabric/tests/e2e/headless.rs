@@ -122,6 +122,11 @@ fn e2e_a_headless_codex_turn_records_its_thread_for_the_next_capture() -> Fallib
         )),
         "{resumed}"
     );
+    assert_eq!(
+        resumed.matches("continuing codex session").count(),
+        1,
+        "the node names no continuing line of its own:\n{resumed}"
+    );
     let log = node.ok(&["job", "log", &job])?;
     assert_eq!(
         log.matches("Resumed").count(),
