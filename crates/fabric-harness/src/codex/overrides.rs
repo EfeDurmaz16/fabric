@@ -7,7 +7,12 @@
 //! out on purpose: adding it is a decision, not a missing case. Values
 //! checked against `codex --help` of 0.155.1 on 2026-10-20, and the
 //! spellings each enum reads against the `turn_context` records of the
-//! owner's rollouts on 2026-10-21 (values only).
+//! owner's rollouts on 2026-10-21 (values only). The approval policy
+//! `untrusted` is not in the set: Codex 0.155.1 refuses to load any
+//! configuration that sets it (`approval_policy = "untrusted" is no
+//! longer supported; remove this setting`, seen on 2026-10-21 with
+//! `codex mcp list -c approval_policy="untrusted"`), yet a `turn_context`
+//! can still record it for a project Codex marks untrusted.
 //!
 //! A resume takes these settings from the session (`rollout::recorded`),
 //! and any field the adapter was configured with wins over the session's
@@ -48,8 +53,6 @@ impl SandboxMode {
 /// The `approval_policy` a run uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalPolicy {
-    /// `untrusted`: only trusted commands run without asking.
-    Untrusted,
     /// `on-request`: the model decides when to ask.
     OnRequest,
     /// `never`: never ask; a failure goes back to the model.
@@ -61,7 +64,6 @@ impl ApprovalPolicy {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            ApprovalPolicy::Untrusted => "untrusted",
             ApprovalPolicy::OnRequest => "on-request",
             ApprovalPolicy::Never => "never",
         }
@@ -70,13 +72,9 @@ impl ApprovalPolicy {
     /// The policy a record spells; `None` for any other.
     #[must_use]
     pub fn from_record(text: &str) -> Option<Self> {
-        [
-            ApprovalPolicy::Untrusted,
-            ApprovalPolicy::OnRequest,
-            ApprovalPolicy::Never,
-        ]
-        .into_iter()
-        .find(|policy| policy.as_str() == text)
+        [ApprovalPolicy::OnRequest, ApprovalPolicy::Never]
+            .into_iter()
+            .find(|policy| policy.as_str() == text)
     }
 }
 

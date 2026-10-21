@@ -311,7 +311,12 @@ impl RecordedSettings {
         });
         self.approval = setting(payload.get("approval_policy"), |text| {
             ApprovalPolicy::from_record(text).ok_or_else(|| {
-                "not an approval policy Fabric passes, which are untrusted, on-request and never".to_owned()
+                if text == "untrusted" {
+                    "codex 0.155.1 refuses to start with it set".to_owned()
+                } else {
+                    "not an approval policy Fabric passes, which are on-request and never"
+                        .to_owned()
+                }
             })
         });
         let sandbox = payload.get("sandbox_policy");
@@ -543,11 +548,25 @@ mod tests {
         );
         assert_eq!(
             reason(&read.approval),
-            "on-failure: not an approval policy Fabric passes, which are untrusted, on-request and never"
+            "on-failure: not an approval policy Fabric passes, which are on-request and never"
         );
         assert_eq!(
             reason(&read.sandbox),
             "danger-full-access: Fabric never passes full access, ADR 0006"
+        );
+
+        // A project Codex marks untrusted records `untrusted`, which Codex
+        // 0.155.1 refuses to start with when it is set.
+        let dir = tempfile::tempdir().unwrap();
+        let suffix = format!(
+            "{}{}",
+            meta("0.155.1", Some(THREAD)),
+            turn("gpt-6-sol", "high", "untrusted", "workspace-write"),
+        );
+        let chain = lineage(dir.path(), &meta("0.155.1", None), &suffix);
+        assert_eq!(
+            reason(&recorded(&chain).unwrap().approval),
+            "untrusted: codex 0.155.1 refuses to start with it set"
         );
 
         let dir = tempfile::tempdir().unwrap();
