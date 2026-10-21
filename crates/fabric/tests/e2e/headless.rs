@@ -136,6 +136,77 @@ fn e2e_a_headless_codex_turn_records_its_thread_for_the_next_capture() -> Fallib
     Ok(())
 }
 
+/// Codex records its version only in the `session_meta` of a rollout it
+/// creates, never on a resume, so the newest Codex that continued a thread
+/// travels with the job instead: a thread made by 0.155.1 on one node and
+/// continued by 0.160.0 on the other is refused when 0.155.1 would
+/// continue it again, and that Codex never starts, even after a suspend
+/// on its own node captures the thread again (gate finding F10b).
+#[test]
+fn e2e_an_older_codex_is_refused_a_thread_a_newer_one_continued() -> Fallible {
+    let p = crate::setup(Wire::TcpTls, None, None)?;
+    p.env.install_fake_codex()?;
+    fs::write(p.b.state().join("codex-version"), "0.160.0\n")?;
+    let job = crate::new_job(&p.env, &p.a, "codex")?;
+    let thread = Env::CODEX_THREAD;
+    p.a.ok(&["job", "run", &job, "--headless", "--prompt", "one"])?;
+    p.a.ok(&["job", "suspend", &job])?;
+    // The doctor row refuses differing Codex versions; the move waives it.
+    p.a.ok(&["job", "move", &job, "--to", &p.b.id, "--force"])?;
+    p.b.ok(&["job", "resume", &job, "--headless", "--prompt", "two"])?;
+    let rollout = p.env.home.join(format!(
+        ".codex/sessions/2026/10/21/rollout-2026-10-21T10-00-00-{thread}.jsonl"
+    ));
+    let continued = fs::read_to_string(&rollout)?;
+    assert!(
+        continued.contains("\"cli_version\":\"0.155.1\"")
+            && !continued.contains("0.160.0")
+            && continued.contains("\"text\":\"two\""),
+        "the rollout names only the codex that created it:\n{continued}"
+    );
+
+    fs::write(p.env.home.join("codex-args"), "")?;
+    let back = p.a.run(&[
+        "job",
+        "resume",
+        &job,
+        "--force",
+        "--headless",
+        "--prompt",
+        "three",
+    ])?;
+    let said = text(&back);
+    assert!(!back.status.success(), "{said}");
+    assert!(
+        said.contains(&format!(
+            "codex 0.155.1 is older than codex 0.160.0, which wrote session {thread}"
+        )),
+        "{said}"
+    );
+    assert_eq!(
+        fs::read_to_string(&rollout)?,
+        continued,
+        "the older codex wrote"
+    );
+    let args = fs::read_to_string(p.env.home.join("codex-args"))?;
+    assert!(!args.contains("exec"), "the older codex started: {args}");
+
+    // A capture on the node that was refused keeps the newer version, so
+    // suspending there and running again does not get past the guard.
+    p.a.ok(&["job", "suspend", &job])?;
+    let again =
+        p.a.run(&["job", "run", &job, "--headless", "--prompt", "four"])?;
+    let said = text(&again);
+    assert!(!again.status.success(), "{said}");
+    assert!(said.contains("older than codex 0.160.0"), "{said}");
+    assert_eq!(
+        fs::read_to_string(&rollout)?,
+        continued,
+        "the older codex wrote"
+    );
+    Ok(())
+}
+
 /// A headless Claude run starts `claude -p --output-format json` with a
 /// session id it chose, prints the answer and the session, and a suspend
 /// captures the transcript; a headless resume continues it with

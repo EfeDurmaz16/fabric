@@ -113,12 +113,14 @@ impl Env {
     pub const CODEX_THREAD: &str = "019f233e-bb33-7342-85fa-f2d33b14368a";
 
     /// Puts a fake `codex` first on the `PATH`: it answers `--version` as
-    /// the gate's Codex does and otherwise writes its arguments, one per
-    /// line, to `codex-args` and its environment to `codex-env` under the
-    /// home. Under `exec` it appends the prompt and the turn's settings
+    /// the gate's Codex does, `0.155.1`, or with the version in the
+    /// node's `codex-version` file when there is one, and otherwise
+    /// writes its arguments, one per line, to `codex-args` and its
+    /// environment to `codex-env` under the home. Under `exec` it appends the prompt and the turn's settings
     /// (gpt-6-sol, xhigh, on-request, workspace-write) to the thread's
-    /// rollout under `~/.codex/sessions/`, whose first line records it as
-    /// the writer, starting `CODEX_THREAD`, or the thread `exec resume`
+    /// rollout under `~/.codex/sessions/`, whose first line records the
+    /// Codex that created it, as Codex records no version on a resume,
+    /// starting `CODEX_THREAD`, or the thread `exec resume`
     /// names, and prints the events `codex exec --json` prints for one turn. After `thread.started` it waits up to five
     /// seconds for the node's session record of the job and writes `yes`
     /// or `no` to `codex-saw-session`, so a test can tell the thread was
@@ -130,7 +132,9 @@ impl Env {
             "codex",
             &format!(
                 "#!/bin/sh\n\
-                 if [ \"$1\" = --version ]; then echo 'codex-cli 0.155.1'; exit 0; fi\n\
+                 version=0.155.1\n\
+                 [ ! -f \"$FABRIC_HOME/codex-version\" ] || version=$(cat \"$FABRIC_HOME/codex-version\")\n\
+                 if [ \"$1\" = --version ]; then echo \"codex-cli $version\"; exit 0; fi\n\
                  printf '%s\\n' \"$@\" > \"$HOME/codex-args\"\n\
                  env > \"$HOME/codex-env\"\n\
                  [ \"$1\" = exec ] || exit 0\n\
@@ -141,7 +145,7 @@ impl Env {
                  dir=\"$HOME/.codex/sessions/2026/10/21\"\n\
                  mkdir -p \"$dir\"\n\
                  file=\"$dir/rollout-2026-10-21T10-00-00-$thread.jsonl\"\n\
-                 [ -f \"$file\" ] || printf '{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"%s\",\"cwd\":\"%s\",\"cli_version\":\"0.155.1\"}}}}\\n' \"$thread\" \"$(pwd -P)\" > \"$file\"\n\
+                 [ -f \"$file\" ] || printf '{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"%s\",\"cwd\":\"%s\",\"cli_version\":\"%s\"}}}}\\n' \"$thread\" \"$(pwd -P)\" \"$version\" > \"$file\"\n\
                  printf '{{\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-6-sol\",\"effort\":\"xhigh\",\"approval_policy\":\"on-request\",\"sandbox_policy\":{{\"type\":\"workspace-write\"}}}}}}\\n' >> \"$file\"\n\
                  printf '{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"%s\"}}]}}}}\\n' \"$prompt\" >> \"$file\"\n\
                  printf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread\"\n\

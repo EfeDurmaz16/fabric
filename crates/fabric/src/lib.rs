@@ -301,7 +301,7 @@ async fn ask(socket: &Path, request: Request, notes: Notes) -> Result<Option<Run
         }
         Response::Run { lines, plan } => {
             notes.print(&lines)?;
-            Ok(Some(plan))
+            Ok(Some(*plan))
         }
         Response::Failed {
             lines,
@@ -635,7 +635,8 @@ async fn start(home: &Path, plan: &RunPlan, mode: Mode, notes: Notes) -> Result<
             claude.launch(&plan.root, launch, &env).await?
         }
         HarnessKind::Codex => {
-            let codex = Codex::new(harness_env.home.clone(), harness_env.path_var.clone());
+            let codex = Codex::new(harness_env.home.clone(), harness_env.path_var.clone())
+                .with_known_writer(plan.known_writer.clone());
             codex.launch(&plan.root, launch, &env).await?
         }
         HarnessKind::Acp { program, args } => {
