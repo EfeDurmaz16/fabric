@@ -15,6 +15,7 @@
 //! halfway would leave more to recover than one that finishes.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -140,14 +141,82 @@ where
             format!("the command stopped before it answered: {e}"),
         ),
     });
-    match send(&mut stream, &answer).await {
-        Ok(()) | Err(FrameError::Io(_)) => {}
+    let refusal = match (send(&mut stream, &answer).await, answer) {
+        (Ok(()) | Err(FrameError::Io(_)), _) => return,
+        // A refusal's kind sets the exit code and its message names the
+        // command that resolves it, so it keeps both, and its reason: only
+        // a path that is not UTF-8 reads as the message shows it.
+        (Err(_), Answer::Refused { refusal }) => {
+            Refusal::new(lossy(refusal.reason().clone()), refusal.message())
+        }
         // Nothing of it was written, so the client still reads a final
         // frame, and learns the command ran rather than ask for it again.
-        Err(e) => {
-            let refusal = Refusal::new(Reason::Internal, unwritable(&e));
-            let _ = send(&mut stream, &Answer::Refused { refusal }).await;
+        (Err(e), Answer::Done { .. } | Answer::Event { .. }) => {
+            Refusal::new(Reason::Internal, unwritable(&e))
         }
+    };
+    let _ = send(&mut stream, &Answer::Refused { refusal }).await;
+}
+
+/// `reason` with each path written as `Path::display` shows it, U+FFFD in
+/// place of what is not UTF-8, so it has a JSON form. Every reason is
+/// named, so a new one fails to compile until it says whether it holds a
+/// path.
+fn lossy(reason: Reason) -> Reason {
+    let shown = |path: PathBuf| PathBuf::from(path.to_string_lossy().into_owned());
+    match reason {
+        Reason::ChangedDuringMove { job, root, target } => Reason::ChangedDuringMove {
+            job,
+            root: shown(root),
+            target,
+        },
+        Reason::StaleWorkspace { job, root, left_at } => Reason::StaleWorkspace {
+            job,
+            root: shown(root),
+            left_at,
+        },
+        Reason::WorkspaceOccupied { root } => Reason::WorkspaceOccupied { root: shown(root) },
+        Reason::SyncedRoot { root, folder } => Reason::SyncedRoot {
+            root: shown(root),
+            folder: shown(folder),
+        },
+        Reason::UnknownJob { .. }
+        | Reason::NotOwner { .. }
+        | Reason::Departed { .. }
+        | Reason::StaleEpoch { .. }
+        | Reason::EpochAhead { .. }
+        | Reason::WrongJob { .. }
+        | Reason::Departing { .. }
+        | Reason::Forked { .. }
+        | Reason::ForkBehind { .. }
+        | Reason::Unreachable { .. }
+        | Reason::UnknownPeer { .. }
+        | Reason::Preflight { .. }
+        | Reason::StealNeedsForce { .. }
+        | Reason::HarnessRunning { .. }
+        | Reason::HarnessGone { .. }
+        | Reason::HarnessNotRecorded { .. }
+        | Reason::RanDuringMove { .. }
+        | Reason::NoWorkspace { .. }
+        | Reason::Unfinished { .. }
+        | Reason::NoSnapshot { .. }
+        | Reason::BadAddress { .. }
+        | Reason::Peer { .. }
+        | Reason::Fetch { .. }
+        | Reason::PeerAhead { .. }
+        | Reason::PeerBehind { .. }
+        | Reason::PeerForked { .. }
+        | Reason::MoveUnlinked { .. }
+        | Reason::MoveStale { .. }
+        | Reason::MoveToSelf { .. }
+        | Reason::StealByOwner { .. }
+        | Reason::StealWhileDeparting { .. }
+        | Reason::StealByTarget { .. }
+        | Reason::StealWithoutSnapshot { .. }
+        | Reason::SecretInArguments { .. }
+        | Reason::BadRequest
+        | Reason::Internal
+        | Reason::Unrecognized => reason,
     }
 }
 
@@ -281,6 +350,84 @@ mod tests {
             "{}",
             refusal.message()
         );
+    }
+
+    /// Review finding on PR #13: a refusal whose reason names a path
+    /// that is not UTF-8, such as a stale workspace under such a home,
+    /// reached the client as an `internal` refusal saying the command ran.
+    /// The CLI exited 1 instead of 85 with its hint, and a client could
+    /// take a `job_new` refused for its root as a job made. Such a refusal
+    /// now keeps its kind, its reason and its message, and the path reads
+    /// as the message shows it.
+    #[tokio::test]
+    async fn a_refusal_with_a_path_that_is_not_utf8_keeps_its_kind_and_reason() {
+        let job: JobId = "01JABCDEFGHJKMNPQRSTVWXYZ0".parse().unwrap();
+        let target = "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba"
+            .parse()
+            .unwrap();
+        let bad = PathBuf::from(OsString::from_vec(b"/home/\xff/work".to_vec()));
+        let shown = PathBuf::from("/home/\u{fffd}/work");
+        let cases = [
+            (
+                Reason::StaleWorkspace {
+                    job,
+                    root: bad.clone(),
+                    left_at: Epoch::FIRST,
+                },
+                Reason::StaleWorkspace {
+                    job,
+                    root: shown.clone(),
+                    left_at: Epoch::FIRST,
+                },
+            ),
+            (
+                Reason::ChangedDuringMove {
+                    job,
+                    root: bad.clone(),
+                    target,
+                },
+                Reason::ChangedDuringMove {
+                    job,
+                    root: shown.clone(),
+                    target,
+                },
+            ),
+            (
+                Reason::WorkspaceOccupied { root: bad.clone() },
+                Reason::WorkspaceOccupied {
+                    root: shown.clone(),
+                },
+            ),
+            (
+                Reason::SyncedRoot {
+                    root: bad.clone(),
+                    folder: bad.clone(),
+                },
+                Reason::SyncedRoot {
+                    root: shown.clone(),
+                    folder: shown.clone(),
+                },
+            ),
+        ];
+        for (made, read) in cases {
+            let message = format!("refused at {}; run fabric job resume", bad.display());
+            let (node_side, mut client) = UnixStream::pair().unwrap();
+            let (live, made_events) = mpsc::unbounded_channel();
+            let refusal = Refusal::new(made, message.clone());
+            let command = async move {
+                drop(Out::streaming(live));
+                Answer::Refused { refusal }
+            };
+            relay(command, made_events, node_side).await;
+
+            let last: Answer = frame::read(&mut client).await.unwrap().unwrap();
+            assert_eq!(
+                last,
+                Answer::Refused {
+                    refusal: Refusal::new(read, message)
+                }
+            );
+        }
     }
 
     /// Review finding on PR #13: a client that stayed connected but
