@@ -62,6 +62,10 @@ pub const MOVE_DEADLINE: Duration = Duration::from_mins(10);
 /// How long a status question or a ping may take.
 pub const SHORT_DEADLINE: Duration = Duration::from_secs(15);
 
+/// The bytes of record lines `job log` answers with at most: half the
+/// control message cap, which leaves room for the encoding around them.
+const LOG_BUDGET: usize = crate::control::MAX_CONTROL_MESSAGE / 2;
+
 /// How many times a move asks again after a lost answer before it reports the move frozen.
 const MOVE_TRIES: usize = 5;
 
@@ -405,18 +409,43 @@ impl Node {
         Ok(())
     }
 
+    /// Prints the job's records, the latest ones when all of them would not
+    /// fit in one control answer.
     async fn job_log(&self, id: JobId, out: &mut Out) -> Result<(), NodeError> {
         let job = self.job(id).await?;
         let job = job.lock().await;
-        for (n, record) in job.ledger().records().iter().enumerate() {
-            let event = record.event();
+        let lines: Vec<String> = job
+            .ledger()
+            .records()
+            .iter()
+            .enumerate()
+            .map(|(n, record)| {
+                let event = record.event();
+                format!(
+                    "{n:>4} epoch {} at {} {}",
+                    event.epoch,
+                    event.at,
+                    describe(&event.kind)
+                )
+            })
+            .collect();
+        // A record is at most 1 MiB, so the latest one always fits.
+        let mut start = lines.len();
+        let mut bytes = 0;
+        while let Some(line) = start.checked_sub(1).map(|i| &lines[i]) {
+            if bytes + line.len() > LOG_BUDGET {
+                break;
+            }
+            bytes += line.len();
+            start -= 1;
+        }
+        if start > 0 {
             out.say(format!(
-                "{n:>4} epoch {} at {} {}",
-                event.epoch,
-                event.at,
-                describe(&event.kind)
+                "the first {start} records are left out; the latest {} fill one answer",
+                lines.len() - start
             ));
         }
+        out.lines.extend(lines.into_iter().skip(start));
         Ok(())
     }
 
@@ -2778,6 +2807,34 @@ pub(crate) mod tests {
         assert_eq!(node.jobs.lock().await.len(), 1);
         let job = node.job(id).await.unwrap();
         assert_eq!(job.lock().await.ledger().records().len(), 1);
+    }
+
+    /// A log longer than one control answer can carry still answers, with
+    /// the latest records and a line that says how many were left out.
+    #[tokio::test]
+    async fn a_log_past_the_control_cap_answers_with_the_latest_records() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let long_text = "n".repeat(900 << 10);
+        for _ in 0..5 {
+            node.job_decide(id, Decision::Approve, &long_text, &mut Out::default())
+                .await
+                .unwrap();
+        }
+        let mut out = Out::default();
+        node.job_log(id, &mut out).await.unwrap();
+        let lines = out.lines;
+        let answer = crate::control::Response::Done {
+            lines: lines.clone(),
+        };
+        let encoded = postcard::to_stdvec(&answer).unwrap();
+        assert!(encoded.len() <= crate::control::MAX_CONTROL_MESSAGE);
+        assert!(
+            lines[0].starts_with("the first 4 records are left out"),
+            "{}",
+            &lines[0]
+        );
+        assert!(lines.last().unwrap().starts_with("   5 epoch"));
     }
 
     #[test]
