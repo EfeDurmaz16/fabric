@@ -566,14 +566,6 @@ pub(crate) async fn pid_alive(pid: u32) -> Result<bool, HarnessError> {
     }
 }
 
-/// True when the dotted version `version` is at least `floor`, compared
-/// part by part as numbers; a part that is not a number fails the check.
-#[must_use]
-pub(crate) fn version_at_least(version: &str, floor: &[u32]) -> bool {
-    let parts: Option<Vec<u32>> = version.split('.').map(|p| p.parse().ok()).collect();
-    parts.is_some_and(|parts| parts.as_slice() >= floor)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,16 +577,6 @@ mod tests {
         assert_eq!(version_token("fake 1.2"), Some("1.2"));
         assert_eq!(version_token("no version here"), None);
         assert_eq!(version_token(""), None);
-    }
-
-    #[test]
-    fn version_at_least_compares_numbers_not_text() {
-        assert!(version_at_least("2.1.294", &[2, 1, 294]));
-        assert!(version_at_least("2.1.300", &[2, 1, 294]));
-        assert!(version_at_least("2.10.0", &[2, 9, 999]));
-        assert!(!version_at_least("2.1.199", &[2, 1, 294]));
-        assert!(!version_at_least("2.1", &[2, 1, 294]));
-        assert!(!version_at_least("2.1.x", &[2, 1, 294]));
     }
 
     #[test]

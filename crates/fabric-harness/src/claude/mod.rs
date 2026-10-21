@@ -113,7 +113,7 @@ pub struct ClaudeCode {
 
 /// The Claude version whose `~/.claude/sessions/<pid>.json` records this
 /// adapter was checked against.
-const REGISTRY_READ_ON: &[u32] = &[2, 1, 294];
+const REGISTRY_READ_ON: &str = "2.1.294";
 
 /// What the session registry says about a session.
 enum Registry {
@@ -267,7 +267,7 @@ impl ClaudeCode {
         session: &SessionId,
         version: Option<&str>,
     ) -> Result<Registry, HarnessError> {
-        if !version.is_some_and(|v| process::version_at_least(v, REGISTRY_READ_ON)) {
+        if !version.is_some_and(|v| crate::version::at_least(v, REGISTRY_READ_ON)) {
             return Ok(Registry::CannotAnswer(
                 "the claude version is unknown or older than the registry this adapter reads",
             ));

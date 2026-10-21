@@ -172,6 +172,19 @@ impl fmt::Display for HarnessVersion {
     }
 }
 
+/// True when `version` is at least `floor` by the same order as the
+/// resume guard, pre-releases included; false when either does not
+/// parse, so a caller that cannot tell takes the cautious path. Serves
+/// the floors an adapter was checked on, such as the Codex version whose
+/// writer lock it takes.
+#[cfg(any(feature = "claude", feature = "codex"))]
+pub(crate) fn at_least(version: &str, floor: &str) -> bool {
+    match (HarnessVersion::parse(version), HarnessVersion::parse(floor)) {
+        (Ok(version), Ok(floor)) => version >= floor,
+        _ => false,
+    }
+}
+
 /// Refuses to start `binary` on `session` when the version it reports is
 /// older than `recorded`, the newest version the session records, or
 /// cannot be read. Runs `binary --version` in `cwd`, the directory the
@@ -266,6 +279,23 @@ mod tests {
             HarnessVersion::from_output("fake 1.2"),
             Err(VersionError::Malformed(_))
         ));
+    }
+
+    /// A floor an adapter was checked on is compared by the guard's own
+    /// order: a desktop pre-release of a later version is above it, a
+    /// pre-release of the floor itself is below it, and text that is not
+    /// a version is never at least anything.
+    #[cfg(any(feature = "claude", feature = "codex"))]
+    #[test]
+    fn a_floor_is_compared_by_the_same_order_as_the_guard() {
+        assert!(at_least("0.163.0-alpha.10.2", "0.155.1"));
+        assert!(at_least("2.1.300-beta", "2.1.294"));
+        assert!(at_least("2.1.294", "2.1.294"));
+        assert!(at_least("2.10.0", "2.9.999"));
+        assert!(!at_least("0.155.1-alpha.3", "0.155.1"));
+        assert!(!at_least("2.1.199", "2.1.294"));
+        assert!(!at_least("2.1", "2.1.294"));
+        assert!(!at_least("2.1.x", "2.1.294"));
     }
 
     /// A recorded version comes from a file that travelled and is printed

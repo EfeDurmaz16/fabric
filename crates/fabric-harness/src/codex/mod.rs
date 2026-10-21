@@ -97,7 +97,7 @@ const LOCK_DIR: &str = "thread-writer-locks";
 const COORDINATION_LOCK: &str = ".coordination.lock";
 
 /// The Codex version whose thread writer lock this adapter was checked against.
-const LOCK_READ_ON: &[u32] = &[0, 155, 1];
+const LOCK_READ_ON: &str = "0.155.1";
 
 /// How long a lock attempt waits for Codex's coordination lock, which
 /// Codex holds only across an open and a `try_lock`.
@@ -431,7 +431,7 @@ impl Codex {
     /// Refuses while a `codex` runs that may not take the thread writer
     /// lock: one older than `LOCK_READ_ON`, or one whose version is unknown.
     async fn refuse_lockless_writers(&self, version: Option<&str>) -> Result<(), HarnessError> {
-        if version.is_some_and(|v| process::version_at_least(v, LOCK_READ_ON)) {
+        if version.is_some_and(|v| crate::version::at_least(v, LOCK_READ_ON)) {
             return Ok(());
         }
         warn!(
