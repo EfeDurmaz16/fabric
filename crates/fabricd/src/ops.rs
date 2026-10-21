@@ -31,7 +31,7 @@ use fabric_net::wire::{
 use fabric_store::capture::{CaptureRequest, capture};
 use fabric_store::policy::IgnorePolicy;
 use fabric_store::restore::{
-    Durability, RestoreRequest, RestoreState, Verify, restore, restore_state,
+    Durability, RestoreError, RestoreRequest, RestoreState, Verify, restore, restore_state,
 };
 
 use crate::clock;
@@ -1719,6 +1719,14 @@ impl Node {
             job.clear_harness_state()?;
             local::remove(&job.dir().session())?;
         }
+        // The marker says `Restoring` from before the staging directory
+        // exists, so a tree here may be another process's, written into
+        // the empty root after a kill. Only the snapshot's own tree, which
+        // the restore renamed into place before a kill took the marker's
+        // last write, is accepted.
+        if resuming && state == RestoreState::Present && !self.holds(snapshot, &root).await? {
+            return Err(NodeError::WorkspaceOccupied { root });
+        }
         job.set_marker(&Marker {
             root: root.clone(),
             state: MarkerState::Restoring { snapshot },
@@ -1751,6 +1759,31 @@ impl Node {
             epoch,
         })?;
         Ok(root)
+    }
+
+    /// Whether the tree at `root` holds every file of `snapshot` outside
+    /// its caches, read back against the store.
+    async fn holds(&self, snapshot: SnapshotId, root: &Path) -> Result<bool, NodeError> {
+        let root = root.to_owned();
+        with_store(
+            &self.store,
+            move |store| match fabric_store::restore::verify(
+                store,
+                snapshot,
+                &root,
+                Verify::All,
+                &|_| false,
+            ) {
+                Ok(_) => Ok(true),
+                Err(
+                    RestoreError::VerifyFailed { .. }
+                    | RestoreError::Git(_)
+                    | RestoreError::Write(_),
+                ) => Ok(false),
+                Err(e) => Err(e.into()),
+            },
+        )
+        .await
     }
 
     /// The marker of a workspace this tenure, at `epoch`, can continue, or
@@ -3517,5 +3550,55 @@ pub(crate) mod tests {
             matches!(&ran, Err(NodeError::RootNotADirectory { .. })),
             "{ran:?}"
         );
+    }
+
+    /// A restore that died after its marker said `Restoring` and before
+    /// it wrote anything leaves the root empty, and another process can
+    /// fill it before the next resume. The resume must not take those
+    /// files for the restored snapshot; a tree the restore did finish,
+    /// before a kill took the marker's last write, is still accepted.
+    #[tokio::test]
+    async fn a_resumed_restore_accepts_only_the_snapshots_own_tree() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let root = paths::job_root(&node.cfg.home, id);
+        let job = node.job(id).await.unwrap();
+        let mut job = job.lock().await;
+        let restoring = Marker {
+            root: root.clone(),
+            state: MarkerState::Restoring {
+                snapshot: job.latest().unwrap(),
+            },
+            epoch: Epoch::FIRST,
+        };
+
+        job.set_marker(&restoring).unwrap();
+        let restored = node
+            .restore_if_needed(&mut job, Epoch::FIRST, &path, &mut Out::default())
+            .await;
+        assert_eq!(
+            restored.unwrap(),
+            root,
+            "the snapshot's own tree was refused"
+        );
+
+        let theirs = dir.path().join("theirs");
+        std::fs::rename(&root, &theirs).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("README.md"), "not the job's\n").unwrap();
+        job.set_marker(&restoring).unwrap();
+        let refused = node
+            .restore_if_needed(&mut job, Epoch::FIRST, &path, &mut Out::default())
+            .await;
+        assert!(
+            matches!(&refused, Err(NodeError::WorkspaceOccupied { root: r }) if *r == root),
+            "{refused:?}"
+        );
+        assert!(matches!(
+            job.marker().unwrap().unwrap().state,
+            MarkerState::Restoring { .. }
+        ));
     }
 }
