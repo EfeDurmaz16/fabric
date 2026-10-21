@@ -146,6 +146,7 @@ impl Node {
                 self.harness_started(job, epoch, pid, harness, session, out)
                     .await?;
             }
+            Request::LaunchCheck { job, epoch } => self.launch_check(job, epoch).await?,
             Request::HarnessExited { job, pid } => self.harness_exited(job, pid).await?,
             Request::JobSuspend { job, path_var } => {
                 self.resolve_departing(job, out).await?;
@@ -501,6 +502,34 @@ impl Node {
             (&self.harness_config, &self.cfg.home),
             out,
         )
+    }
+
+    /// Refuses a launch whose plan no longer holds: the node no longer owns
+    /// the job at the plan's epoch, or records a harness that still runs.
+    ///
+    /// The CLI asks under the tree lock, before any setup step. A launch of
+    /// the same workspace registers its harness before it lets the lock go,
+    /// so a plan this passes was not overtaken by one.
+    pub(crate) async fn launch_check(&self, id: JobId, epoch: Epoch) -> Result<(), NodeError> {
+        let job = self.job(id).await?;
+        let job = job.lock().await;
+        let token = owner_token(&job, self.id)?;
+        if token.epoch != epoch {
+            return Err(FenceError::StaleEpoch {
+                yours: epoch,
+                current: token.epoch,
+            }
+            .into());
+        }
+        if let Some(record) = job.harness_record()?
+            && record.liveness().await != Liveness::Gone
+        {
+            return Err(NodeError::AlreadyRunningHarness {
+                job: id,
+                pid: record.pid.get(),
+            });
+        }
+        Ok(())
     }
 
     /// Records the harness the CLI launched and appends `Resumed`, or refuses.
@@ -3762,5 +3791,27 @@ pub(crate) mod tests {
             "{:?}",
             out.lines
         );
+    }
+
+    /// Two runs can both get a plan before either launches. Once the first
+    /// registered its harness and let the tree lock go, the second must be
+    /// refused before its setup steps run in the workspace the first
+    /// harness writes to.
+    #[tokio::test]
+    async fn a_plan_another_launch_overtook_is_refused_before_setup() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let first = node.job_run(id, &mut Out::default()).await.unwrap();
+        let second = node.job_run(id, &mut Out::default()).await.unwrap();
+        node.launch_check(id, first.epoch).await.unwrap();
+        let mut harness = sleeper();
+        register(&node, id, pid(&harness)).await.unwrap();
+        let refused = node.launch_check(id, second.epoch).await;
+        assert!(
+            matches!(refused, Err(NodeError::AlreadyRunningHarness { pid: p, .. }) if p == harness.id()),
+            "{refused:?}"
+        );
+        harness.kill().unwrap();
+        harness.wait().unwrap();
     }
 }

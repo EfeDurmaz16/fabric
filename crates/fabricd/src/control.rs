@@ -89,6 +89,15 @@ pub enum Request {
         /// The `PATH` of the user's shell.
         path_var: OsString,
     },
+    /// Before any setup step, under the tree lock: whether the plan made at
+    /// `epoch` still holds, so a launch whose plan another launch overtook
+    /// refuses before it writes to the workspace.
+    LaunchCheck {
+        /// The job.
+        job: JobId,
+        /// The epoch the plan was made under.
+        epoch: Epoch,
+    },
     /// The CLI launched the harness; the daemon records it and appends `Resumed`.
     HarnessStarted {
         /// The job.
