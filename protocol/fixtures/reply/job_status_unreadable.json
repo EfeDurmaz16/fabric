@@ -1,0 +1,25 @@
+{
+  "kind": "job_status",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "node": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+  "goal": "fix the flaky test",
+  "harness": {
+    "kind": "claude_code"
+  },
+  "owner": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+  "epoch": 2,
+  "view": {
+    "kind": "unreadable",
+    "error": "/Users/me/.fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/forked does not parse: expected value at line 1 column 1"
+  },
+  "snapshot": {
+    "id": "abababababababababababababababababababababababababababababababab",
+    "suspended": true
+  },
+  "workspace_unreadable": "/Users/me/.fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/marker does not parse: expected value at line 1 column 1",
+  "process": {
+    "kind": "unreadable",
+    "error": "/Users/me/.fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/harness does not parse: expected value at line 1 column 1"
+  },
+  "records": 7
+}

@@ -363,6 +363,15 @@ async fn ask(client: &Client, request: &Request, notes: Notes) -> Result<Reply> 
     printer.finish()?;
     let reply = answered.map_err(Refused::from_client)?;
     notes.print(&render::reply(&reply))?;
+    if let Reply::JobStatus(status) = &reply
+        && let Some(error) = render::first_unreadable(status)
+    {
+        return Err(Refused {
+            refusal: RefusalKind::Failed,
+            message: error.to_owned(),
+        }
+        .into());
+    }
     Ok(reply)
 }
 

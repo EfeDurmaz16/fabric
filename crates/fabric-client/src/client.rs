@@ -293,7 +293,7 @@ impl Client {
         on_event: impl FnMut(Event),
     ) -> Result<JobStatus, ClientError> {
         match self.call(&Request::JobStatus { job }, on_event).await? {
-            Reply::JobStatus(reply) => Ok(reply),
+            Reply::JobStatus(reply) => Ok(*reply),
             other => Err(unexpected(Op::JobStatus, &other)),
         }
     }

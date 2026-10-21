@@ -786,7 +786,7 @@ pub enum Reply {
     /// For [`Request::JobList`].
     JobList(JobList),
     /// For [`Request::JobStatus`].
-    JobStatus(JobStatus),
+    JobStatus(Box<JobStatus>),
     /// For [`Request::JobLog`].
     JobLog(JobLog),
     /// For [`Request::JobRun`]: what to launch.
@@ -1022,6 +1022,10 @@ pub struct JobStatus {
     /// The workspace on the answering node, if it has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<Workspace>,
+    /// Why the node could not read the job's workspace marker, when it
+    /// could not; `workspace` is then absent and says nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_unreadable: Option<String>,
     /// Whether a harness the node launched for the job runs.
     pub process: Process,
     /// How many records the ledger holds.
@@ -1066,6 +1070,12 @@ pub enum View {
         peer: NodeId,
         /// The highest epoch in the peer's ledger.
         epoch: Epoch,
+    },
+    /// The node's fork record for the job could not be read, so whether a
+    /// peer froze the job here is not known.
+    Unreadable {
+        /// Why, in the node's words.
+        error: String,
     },
 }
 
@@ -1137,7 +1147,7 @@ pub enum Marker {
 }
 
 /// Whether the harness a node launched for a job runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Process {
     /// No harness runs.
@@ -1153,6 +1163,12 @@ pub enum Process {
     GroupRemains {
         /// The group, named by the harness's pid.
         pid: NonZeroU32,
+    },
+    /// The node's record of the harness could not be read, so whether one
+    /// runs is not known.
+    Unreadable {
+        /// Why, in the node's words.
+        error: String,
     },
 }
 

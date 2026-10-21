@@ -3,5 +3,6 @@
   "departing",
   "frozen",
   "owner",
-  "replica"
+  "replica",
+  "unreadable"
 ]

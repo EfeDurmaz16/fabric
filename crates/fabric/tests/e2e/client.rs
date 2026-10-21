@@ -203,6 +203,64 @@ async fn e2e_a_node_turns_away_another_api_version_and_a_request_it_cannot_read(
     );
 }
 
+/// Review finding on PR #13: a job record that does not read made `fabric
+/// job status` print only the error, where before the client API it
+/// printed every line up to the failing record. The node now reports each
+/// record that does not read in its place, and the CLI prints the lines
+/// before the first one and then fails with its sentence, exit 1, as it did.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_a_record_that_does_not_read_leaves_the_rest_of_the_status() {
+    let env = Env::new().unwrap();
+    let (node, client) = started(&env).unwrap();
+    let job = client
+        .job_new(
+            SystemPath::parse(env.repo.to_str().unwrap()).unwrap(),
+            "make the greeting louder".to_owned(),
+            HarnessKind::ClaudeCode,
+            |_| {},
+        )
+        .await
+        .unwrap()
+        .job;
+    let id = job.to_string();
+    let dir = node.state().join("jobs").join(&id);
+    let status = |printed: usize, record: &str| {
+        let output = node.run(&["job", "status", &id]).unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert_eq!(output.status.code(), Some(1), "{stdout}{stderr}");
+        assert_eq!(stdout.lines().count(), printed, "{stdout}");
+        assert!(stdout.starts_with(&format!("job {id}\n")), "{stdout}");
+        let path = dir.join(record);
+        assert!(
+            stderr.starts_with("error: ") && stderr.contains(path.to_str().unwrap()),
+            "{stderr}"
+        );
+    };
+
+    std::fs::write(dir.join("harness"), "not a record").unwrap();
+    status(7, "harness");
+    let read = client.job_status(job, |_| {}).await.unwrap();
+    assert!(matches!(read.process, Process::Unreadable { .. }));
+    assert_eq!(read.view, View::Owner);
+    assert!(read.workspace.is_some());
+
+    std::fs::write(dir.join("marker"), "not a record").unwrap();
+    status(6, "marker");
+    let read = client.job_status(job, |_| {}).await.unwrap();
+    assert!(read.workspace.is_none());
+    assert!(
+        read.workspace_unreadable
+            .is_some_and(|error| error.contains("marker"))
+    );
+
+    std::fs::write(dir.join("forked"), "not a record").unwrap();
+    status(4, "forked");
+    let read = client.job_status(job, |_| {}).await.unwrap();
+    assert!(matches!(read.view, View::Unreadable { .. }));
+    assert_eq!(read.goal, "make the greeting louder");
+}
+
 /// Review finding on PR #13: `fabric serve` exited at start when its own
 /// `PATH` or a tool root named a path that is not UTF-8, applying the
 /// client API's rule to an environment that never crosses the socket. It

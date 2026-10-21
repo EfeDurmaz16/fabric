@@ -397,6 +397,8 @@ export const View = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("departed"), owner: NodeId, epoch: Epoch }),
   z.object({ kind: z.literal("replica"), owner: NodeId, epoch: Epoch }),
   z.object({ kind: z.literal("frozen"), peer: NodeId, epoch: Epoch }),
+  /** The node's fork record could not be read; `error` is why, in its words. */
+  z.object({ kind: z.literal("unreadable"), error: UnicodeText }),
 ]);
 export type View = z.infer<typeof View>;
 
@@ -427,6 +429,8 @@ export const Process = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("not_running") }),
   z.object({ kind: z.literal("running"), pid: Pid, epoch: Epoch }),
   z.object({ kind: z.literal("group_remains"), pid: Pid }),
+  /** The node's record of the harness could not be read; `error` is why, in its words. */
+  z.object({ kind: z.literal("unreadable"), error: UnicodeText }),
 ]);
 export type Process = z.infer<typeof Process>;
 
@@ -676,6 +680,8 @@ export const Reply = z.discriminatedUnion("kind", [
     view: View,
     snapshot: optional(SnapshotState),
     workspace: optional(Workspace),
+    /** Why the workspace marker could not be read; `workspace` is then absent. */
+    workspace_unreadable: optional(UnicodeText),
     process: Process,
     records: count,
   }),

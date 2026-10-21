@@ -157,6 +157,23 @@ pub(crate) fn blocking(rows: &[PreflightRow]) -> Vec<&str> {
         .collect()
 }
 
+/// The sentence of the first part of `status` the node could not read, in
+/// the order its lines print. The CLI prints the lines before it and then
+/// fails with it, as it did when the node itself stopped there.
+pub(crate) fn first_unreadable(status: &JobStatus) -> Option<&str> {
+    if let View::Unreadable { error } = &status.view {
+        return Some(error);
+    }
+    if let Some(error) = &status.workspace_unreadable {
+        return Some(error);
+    }
+    if let Process::Unreadable { error } = &status.process {
+        return Some(error);
+    }
+    None
+}
+
+/// The lines of `status`, up to the first part the node could not read.
 fn job_status(status: &JobStatus) -> Vec<String> {
     let id = status.job;
     let mut lines = vec![
@@ -175,6 +192,7 @@ fn job_status(status: &JobStatus) -> Vec<String> {
         ),
     ];
     lines.push(match &status.view {
+        View::Unreadable { .. } => return lines,
         View::Frozen { peer, epoch } => format!(
             "this node: frozen; {peer}'s ledger at epoch {epoch} does not continue this node's, so the job was stolen while this node ran it. This copy never runs again; run `fabric job resume {id}` on {peer} to continue there"
         ),
@@ -196,6 +214,9 @@ fn job_status(status: &JobStatus) -> Vec<String> {
         }
         Some(snapshot) => format!("snapshot: {} (resumed since)", snapshot.id),
     });
+    if status.workspace_unreadable.is_some() {
+        return lines;
+    }
     lines.push(match &status.workspace {
         None => "workspace: none on this node".to_owned(),
         Some(workspace) => {
@@ -219,7 +240,8 @@ fn job_status(status: &JobStatus) -> Vec<String> {
             }
         }
     });
-    lines.push(match status.process {
+    lines.push(match &status.process {
+        Process::Unreadable { .. } => return lines,
         Process::Running { pid, epoch } => {
             format!("harness: running as pid {pid} since epoch {epoch}")
         }

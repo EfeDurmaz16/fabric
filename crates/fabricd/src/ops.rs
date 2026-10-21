@@ -105,7 +105,7 @@ impl Node {
                 harness,
             } => Reply::JobNew(self.job_new(repo.as_path(), goal, harness).await?),
             Request::JobList => Reply::JobList(self.job_list().await),
-            Request::JobStatus { job } => Reply::JobStatus(self.job_status(job).await?),
+            Request::JobStatus { job } => Reply::JobStatus(Box::new(self.job_status(job).await?)),
             Request::JobLog { job } => Reply::JobLog(self.job_log(job).await?),
             Request::JobRun { job } => {
                 self.resolve_departing(job, out).await?;
@@ -377,26 +377,41 @@ impl Node {
         let job = self.job(id).await?;
         let job = job.lock().await;
         let manifest = job.ledger().manifest();
-        let forked = job.forked()?;
+        // A record that does not read is reported in its place, so the
+        // status still says everything else: it is what a user runs to
+        // find out why a job is broken (review finding on PR #13).
+        let forked = job.forked();
         let view = match (job.view(self.id), &forked) {
-            (_, Some(fork)) => View::Frozen {
+            (_, Err(e)) => View::Unreadable {
+                error: e.to_string(),
+            },
+            (_, Ok(Some(fork))) => View::Frozen {
                 peer: fork.peer,
                 epoch: fork.epoch,
             },
-            (LeaseView::Owner(_), None) => View::Owner,
-            (LeaseView::Departing { move_id, target }, None) => View::Departing { move_id, target },
-            (LeaseView::Departed { owner, epoch }, None) => View::Departed { owner, epoch },
-            (LeaseView::Replica { owner, epoch }, None) => View::Replica { owner, epoch },
+            (LeaseView::Owner(_), Ok(None)) => View::Owner,
+            (LeaseView::Departing { move_id, target }, Ok(None)) => {
+                View::Departing { move_id, target }
+            }
+            (LeaseView::Departed { owner, epoch }, Ok(None)) => View::Departed { owner, epoch },
+            (LeaseView::Replica { owner, epoch }, Ok(None)) => View::Replica { owner, epoch },
         };
-        let workspace = match job.marker()? {
-            None => None,
-            Some(marker) => Some(Workspace {
-                state: workspace_state(&job, self.id, &marker, forked.is_some()).await,
-                root: marker.root,
-            }),
+        // A fork record that does not read may stand for a fork, so the
+        // workspace is judged as a frozen one's: an orphan nothing deletes.
+        let frozen = !matches!(forked, Ok(None));
+        let (workspace, workspace_unreadable) = match job.marker() {
+            Ok(None) => (None, None),
+            Ok(Some(marker)) => (
+                Some(Workspace {
+                    state: workspace_state(&job, self.id, &marker, frozen).await,
+                    root: marker.root,
+                }),
+                None,
+            ),
+            Err(e) => (None, Some(e.to_string())),
         };
-        let process = match job.harness_record()? {
-            Some(record) => match record.liveness().await {
+        let process = match job.harness_record() {
+            Ok(Some(record)) => match record.liveness().await {
                 Liveness::Leader => Process::Running {
                     pid: record.pid,
                     epoch: record.epoch,
@@ -404,7 +419,10 @@ impl Node {
                 Liveness::Group => Process::GroupRemains { pid: record.pid },
                 Liveness::Gone => Process::NotRunning,
             },
-            None => Process::NotRunning,
+            Ok(None) => Process::NotRunning,
+            Err(e) => Process::Unreadable {
+                error: e.to_string(),
+            },
         };
         Ok(JobStatus {
             job: id,
@@ -419,6 +437,7 @@ impl Node {
                 suspended: job.suspended_in().is_some(),
             }),
             workspace,
+            workspace_unreadable,
             process,
             records: manifest.event_count,
         })

@@ -474,6 +474,7 @@ impl Seen {
                 View::Departed { .. },
                 View::Replica { .. },
                 View::Frozen { .. },
+                View::Unreadable { .. },
             ]
         );
         self.tagged("View", tag(&status.view), index);
@@ -508,6 +509,7 @@ impl Seen {
                 Process::NotRunning,
                 Process::Running { .. },
                 Process::GroupRemains { .. },
+                Process::Unreadable { .. },
             ]
         );
         self.tagged("Process", tag(&status.process), index);
