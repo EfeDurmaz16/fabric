@@ -1,0 +1,11 @@
+{
+  "schema": "request",
+  "value": {
+    "op": "job_decide",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "decision": {
+      "approve": null
+    },
+    "note": ""
+  }
+}

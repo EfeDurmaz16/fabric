@@ -4,10 +4,11 @@
 //! Invariant: a reader checks the length against [`MAX_FRAME`] before it
 //! allocates anything, and a frame holds exactly one value with nothing
 //! after it, whose every object is a JSON object with named fields, never
-//! an array in field order, whose every variant is named, never numbered,
-//! and whose every integer a JavaScript number holds exactly. Both
-//! directions use the same functions, so the node and every Rust client
-//! agree on the bytes, and the TypeScript SDK refuses what they refuse.
+//! an array in field order, whose every variant is named as a string,
+//! never numbered or written as a map, and whose every integer a
+//! JavaScript number holds exactly. Both directions use the same
+//! functions, so the node and every Rust client agree on the bytes, and
+//! the TypeScript SDK refuses what they refuse.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -160,20 +161,24 @@ where
 }
 
 /// Parses the JSON of one frame as a `T`, refusing, at any depth, a JSON
-/// array where `T` holds an object, a number where it holds a name, and an
-/// integer beyond [`MAX_SAFE_INTEGER`] either way.
+/// array where `T` holds an object, a number or an object where it holds a
+/// name, any other value in a form `T` does not write, and an integer
+/// beyond [`MAX_SAFE_INTEGER`] either way.
 ///
 /// serde's derived structs and tagged enums also read an array as their
 /// fields in declaration order, so `[1, "x"]` would read as a hello and
-/// `["job_status", "<job>"]` as a request, and an enum nested in a message
+/// `["job_status", "<job>"]` as a request, an enum nested in a message
 /// reads an integer tag as its variant's index, so `{"kind": 0}` would
-/// read as the first harness. Either ties such a client to the Rust
-/// declaration order that ADR 0018 says nobody depends on. An integer past
-/// `2^53 - 1` fits a Rust `u64` but not a JavaScript number. The TypeScript
-/// SDK refuses all three. The check writes the value back and requires
-/// every array the frame held to still be an array there, every number to
-/// still be a number, and every number to be in range; an object field the
-/// type does not know is skipped, as the parse skipped it.
+/// read as the first harness, and a variant without data also reads from a
+/// map of its name to null, so `{"approve": null}` would read as the
+/// decision `"approve"`. Each is a second encoding of the same message,
+/// and the first two tie such a client to the Rust declaration order that
+/// ADR 0018 says nobody depends on. An integer past `2^53 - 1` fits a Rust
+/// `u64` but not a JavaScript number. The TypeScript SDK refuses all of
+/// them. The check writes the value back and requires every value the
+/// frame held to have the JSON type it has there, null aside, which an
+/// optional field may be written as, and every number to be in range; an
+/// object field the type does not know is skipped, as the parse skipped it.
 pub fn parse<T: Serialize + DeserializeOwned>(json: &[u8]) -> Result<T, serde_json::Error> {
     let frame: Value = serde_json::from_slice(json)?;
     let value = T::deserialize(&frame)?;
@@ -202,7 +207,13 @@ fn unlike(frame: &Value, read: &Value) -> Option<&'static str> {
         (Value::Number(_), _) => Some(
             "a number stands where the message has a name, such as a variant written as its index",
         ),
-        _ => None,
+        (Value::Object(_), Value::String(_)) => Some(
+            "an object stands where the message has a name, such as a variant written as a map from its name to null",
+        ),
+        // An optional field written as null reads as left out.
+        (Value::Null, _) => None,
+        (frame, read) => (std::mem::discriminant(frame) != std::mem::discriminant(read))
+            .then_some("a value stands in a form other than the one the message writes there"),
     }
 }
 

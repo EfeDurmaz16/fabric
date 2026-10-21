@@ -1,0 +1,9 @@
+{
+  "schema": "event",
+  "value": {
+    "kind": "decision_left",
+    "standing": {
+      "owner": null
+    }
+  }
+}
