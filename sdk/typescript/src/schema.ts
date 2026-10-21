@@ -208,6 +208,25 @@ export const Harness = z.discriminatedUnion("kind", [
 ]);
 export type Harness = z.infer<typeof Harness>;
 
+/** Whether `text` can be one process argument, which never holds a NUL. */
+function isArgument(text: string): boolean {
+  return !text.includes("\u0000");
+}
+
+/**
+ * A harness a request names. The node records it and a client later
+ * launches it with these arguments, so one that holds a NUL is refused,
+ * as the node refuses it. A reply is not checked: it carries what a node
+ * already recorded, which a client must still be able to read.
+ */
+const RequestHarness = Harness.refine(
+  (harness) => harness.kind !== "acp" || harness.args.every(isArgument),
+  "an ACP argument holds a NUL, which no process argument can",
+);
+
+/** `job_new`'s goal, which a client passes to Claude Code or Codex as an argument. */
+const Goal = UnicodeText.refine(isArgument, "the goal holds a NUL, which no process argument can");
+
 export const HarnessSession = z.object({ harness: Harness, session: SessionId });
 export type HarnessSession = z.infer<typeof HarnessSession>;
 
@@ -609,7 +628,7 @@ export const Request = z.discriminatedUnion("op", [
   z.object({ op: z.literal("node_add"), node: NodeId, addr: optional(UnicodeText) }),
   z.object({ op: z.literal("node_list") }),
   z.object({ op: z.literal("node_ping"), node: NodeId }),
-  z.object({ op: z.literal("job_new"), repo: SystemPath, goal: UnicodeText, harness: Harness }),
+  z.object({ op: z.literal("job_new"), repo: SystemPath, goal: Goal, harness: RequestHarness }),
   z.object({ op: z.literal("job_list") }),
   z.object({ op: z.literal("job_status"), job: JobId }),
   z.object({ op: z.literal("job_log"), job: JobId }),
@@ -618,7 +637,7 @@ export const Request = z.discriminatedUnion("op", [
     op: z.literal("job_resume"),
     job: JobId,
     on: optional(NodeId),
-    harness: optional(Harness),
+    harness: optional(RequestHarness),
     force: z.boolean(),
     env,
   }),
@@ -632,7 +651,7 @@ export const Request = z.discriminatedUnion("op", [
     job: JobId,
     epoch: Epoch,
     pid: Pid,
-    harness: Harness,
+    harness: RequestHarness,
     session: optional(SessionId),
   }),
   z.object({
@@ -640,7 +659,7 @@ export const Request = z.discriminatedUnion("op", [
     job: JobId,
     epoch: Epoch,
     pid: Pid,
-    harness: Harness,
+    harness: RequestHarness,
     session: SessionId,
   }),
   z.object({ op: z.literal("harness_exited"), job: JobId, pid: Pid }),

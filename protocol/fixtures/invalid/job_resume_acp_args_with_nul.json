@@ -1,0 +1,15 @@
+{
+  "schema": "request",
+  "value": {
+    "op": "job_resume",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "harness": {
+      "kind": "acp",
+      "program": "opencode",
+      "args": [
+        "acp\u0000"
+      ]
+    },
+    "force": false
+  }
+}

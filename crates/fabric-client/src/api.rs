@@ -231,6 +231,74 @@ mod harness_option {
     }
 }
 
+/// A harness or a goal a request names. The node records it, and a
+/// client later passes it to a process as arguments, so text holding a
+/// NUL, which no argument can, is refused here rather than recorded for a
+/// launch that cannot happen (review finding on PR #13). Only requests
+/// are checked: a reply carries what a node already recorded, which a
+/// client must still be able to read.
+mod launchable {
+    use fabric_core::harness::HarnessKind;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(kind: &HarnessKind, s: S) -> Result<S::Ok, S::Error> {
+        super::HarnessDef::serialize(kind, s)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<HarnessKind, D::Error> {
+        checked(super::HarnessDef::deserialize(d)?)
+    }
+
+    /// Text passed to a process as one argument.
+    pub(super) fn argument<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+        let text = String::deserialize(d)?;
+        refuse_nul("the goal", &text)?;
+        Ok(text)
+    }
+
+    fn checked<E: serde::de::Error>(kind: HarnessKind) -> Result<HarnessKind, E> {
+        if let HarnessKind::Acp { args, .. } = &kind {
+            args.iter()
+                .try_for_each(|arg| refuse_nul("an ACP argument", arg))?;
+        }
+        Ok(kind)
+    }
+
+    fn refuse_nul<E: serde::de::Error>(what: &str, text: &str) -> Result<(), E> {
+        if text.contains('\0') {
+            return Err(E::custom(format_args!(
+                "{what} holds a NUL, which no process argument can"
+            )));
+        }
+        Ok(())
+    }
+
+    /// A harness in an optional field.
+    pub(super) mod option {
+        use fabric_core::harness::HarnessKind;
+        use serde::{Deserializer, Serializer};
+
+        #[expect(
+            clippy::ref_option,
+            reason = "serde's `with` passes the field by reference"
+        )]
+        pub(in super::super) fn serialize<S: Serializer>(
+            value: &Option<HarnessKind>,
+            s: S,
+        ) -> Result<S::Ok, S::Error> {
+            super::super::harness_option::serialize(value, s)
+        }
+
+        pub(in super::super) fn deserialize<'de, D: Deserializer<'de>>(
+            d: D,
+        ) -> Result<Option<HarnessKind>, D::Error> {
+            super::super::harness_option::deserialize(d)?
+                .map(super::checked)
+                .transpose()
+        }
+    }
+}
+
 /// What a client asks a node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -260,10 +328,12 @@ pub enum Request {
         /// relative one would name a repository relative to wherever the
         /// node was started.
         repo: SystemPath,
-        /// The goal in the user's words.
+        /// The goal in the user's words, which a client passes to Claude
+        /// Code or Codex as an argument, so it holds no NUL.
+        #[serde(deserialize_with = "launchable::argument")]
         goal: String,
         /// The harness the job starts under.
-        #[serde(with = "HarnessDef")]
+        #[serde(with = "launchable")]
         harness: HarnessKind,
     },
     /// Every job this node knows.
@@ -308,7 +378,7 @@ pub enum Request {
         #[serde(
             default,
             skip_serializing_if = "Option::is_none",
-            with = "harness_option"
+            with = "launchable::option"
         )]
         harness: Option<HarnessKind>,
         /// Waive the preflight refusals that can be waived.
@@ -390,7 +460,7 @@ pub enum Request {
         /// The harness process, which leads its own process group.
         pid: NonZeroU32,
         /// The harness that runs.
-        #[serde(with = "HarnessDef")]
+        #[serde(with = "launchable")]
         harness: HarnessKind,
         /// The session it continues or created, when known.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -406,7 +476,7 @@ pub enum Request {
         /// The harness process, as registered.
         pid: NonZeroU32,
         /// The harness that runs.
-        #[serde(with = "HarnessDef")]
+        #[serde(with = "launchable")]
         harness: HarnessKind,
         /// The session it named.
         session: SessionId,
