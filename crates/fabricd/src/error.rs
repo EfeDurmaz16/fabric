@@ -28,8 +28,8 @@ pub enum NodeError {
         #[source]
         source: std::io::Error,
     },
-    /// The state directory exists, lets other users in, and is not one Fabric made.
-    #[error("{path}: {reason}; secure it (chmod 700) or choose a dedicated FABRIC_HOME")]
+    /// The state directory, or an entry in it, is not this user's alone to take.
+    #[error("{path}: {reason}")]
     UnsafeStateDir {
         /// The directory.
         path: PathBuf,

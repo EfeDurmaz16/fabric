@@ -403,18 +403,15 @@ const STATE_ENTRIES: [&str; 10] = [
 /// it does not own.
 ///
 /// A missing directory is created with mode 0700. An existing one must be
-/// this user's; when it lets others in, its mode is narrowed only if it
-/// holds nothing but what Fabric writes, so a `FABRIC_HOME` that names a
-/// shared directory, such as `/tmp` or a project, is refused, not changed.
-/// When others can write in it, any of them could have made an entry
-/// under one of Fabric's names, such as a `peers` book that pairs their
-/// node, so it is narrowed only while empty.
+/// this user's, and so must every entry in it, whatever its mode: an entry
+/// another user made while others could write there, such as a `peers`
+/// book that pairs their node, stays theirs after the directory is
+/// narrowed, so a later start must not trust it either. When the directory
+/// lets others in, it is narrowed only if it holds nothing but what Fabric
+/// writes, so a `FABRIC_HOME` that names a shared directory, such as `/tmp`
+/// or a project, is refused and left as it was.
 fn prepare_state_dir(root: &std::path::Path) -> Result<(), NodeError> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-    let unsafe_dir = |reason: String| NodeError::UnsafeStateDir {
-        path: root.to_owned(),
-        reason,
-    };
     let meta = match fs::metadata(root) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -428,58 +425,101 @@ fn prepare_state_dir(root: &std::path::Path) -> Result<(), NodeError> {
         }
         Err(e) => return Err(NodeError::io(root, e)),
     };
+    let refuse = |reason: String| NodeError::UnsafeStateDir {
+        path: root.to_owned(),
+        reason,
+    };
     if !meta.is_dir() {
-        return Err(unsafe_dir("is not a directory".to_owned()));
+        return Err(refuse(
+            "is not a directory; choose a dedicated FABRIC_HOME".to_owned(),
+        ));
     }
     let me = rustix::process::geteuid().as_raw();
     if meta.uid() != me {
-        return Err(unsafe_dir(format!(
-            "belongs to user {}, not to you ({me})",
+        return Err(refuse(format!(
+            "belongs to user {}, not to you ({me}); choose a dedicated FABRIC_HOME",
             meta.uid()
         )));
     }
+    adopt_state_dir(root, &meta, me)
+}
+
+/// Adopts `root`, a directory user `me` owns, whose metadata is `meta`.
+///
+/// One that others can write is narrowed before its entries are judged,
+/// so none of them can add an entry after the check, and it gets its mode
+/// back when it is refused. One that others can at most read is judged
+/// first, since only its owner can add to it.
+fn adopt_state_dir(root: &std::path::Path, meta: &fs::Metadata, me: u32) -> Result<(), NodeError> {
+    use std::os::unix::fs::MetadataExt;
     let mode = meta.mode() & 0o777;
     let others = mode & 0o077;
     if others == 0 {
-        return Ok(());
+        return judge_entries(root, me, None);
     }
-    let writable = others & 0o022 != 0;
+    let narrow = || {
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700))
+            .map_err(|e| NodeError::io(root, e))
+    };
+    if others & 0o022 == 0 {
+        judge_entries(root, me, Some(mode))?;
+        return narrow();
+    }
+    narrow()?;
+    judge_entries(root, me, Some(mode)).inspect_err(|_| {
+        let was = fs::Permissions::from_mode(meta.mode() & 0o7777);
+        if let Err(e) = fs::set_permissions(root, was) {
+            tracing::warn!(path = %root.display(), error = %e, "the refused state directory keeps mode 700");
+        }
+    })
+}
+
+/// Refuses the first entry of `root` that is not user `me`'s, and, when
+/// the directory let others in with the mode in `shared`, the first one
+/// Fabric does not write.
+fn judge_entries(root: &std::path::Path, me: u32, shared: Option<u32>) -> Result<(), NodeError> {
+    use std::os::unix::fs::MetadataExt;
+    let refuse = |reason: String| NodeError::UnsafeStateDir {
+        path: root.to_owned(),
+        reason,
+    };
     for entry in fs::read_dir(root).map_err(|e| NodeError::io(root, e))? {
-        let name = entry.map_err(|e| NodeError::io(root, e))?.file_name();
+        let entry = entry.map_err(|e| NodeError::io(root, e))?;
+        let name = entry.file_name();
         let name = name.to_string_lossy();
-        if writable {
-            return Err(unsafe_dir(format!(
-                "has mode {mode:o}, so other users can write in it, and holds {name}, which any of them could have made; check what it holds"
+        // The entry itself, not where a link points: a link is its maker's.
+        let owner = match entry.metadata() {
+            Ok(meta) => meta.uid(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(NodeError::io(entry.path(), e)),
+        };
+        if owner != me {
+            return Err(refuse(format!(
+                "holds {name}, which belongs to user {owner}, not to you ({me}); remove it once you have checked what it holds, or choose a dedicated FABRIC_HOME"
             )));
         }
-        let ours = STATE_ENTRIES.iter().any(|known| {
-            *name == **known
-                || name
-                    .strip_prefix(known)
-                    .and_then(|rest| rest.strip_prefix('.'))
-                    .and_then(|rest| rest.strip_suffix("tmp"))
-                    .is_some_and(|middle| middle.ends_with('.'))
-        });
-        if !ours {
-            return Err(unsafe_dir(format!(
-                "has mode {mode:o} and holds {name}, which Fabric did not write"
+        if let Some(mode) = shared
+            && !is_state_entry(&name)
+        {
+            return Err(refuse(format!(
+                "has mode {mode:o} and holds {name}, which Fabric did not write; secure it (chmod 700) or choose a dedicated FABRIC_HOME"
             )));
         }
-    }
-    fs::set_permissions(root, fs::Permissions::from_mode(0o700))
-        .map_err(|e| NodeError::io(root, e))?;
-    // An entry another user made between the check and the narrowing.
-    if writable
-        && fs::read_dir(root)
-            .map_err(|e| NodeError::io(root, e))?
-            .next()
-            .is_some()
-    {
-        return Err(unsafe_dir(format!(
-            "had mode {mode:o}, so other users could write in it, and an entry appeared while it was narrowed to 700; check what it holds"
-        )));
     }
     Ok(())
+}
+
+/// Whether `name` is one of `STATE_ENTRIES` or a temporary file Fabric
+/// writes one of them through.
+fn is_state_entry(name: &str) -> bool {
+    STATE_ENTRIES.iter().any(|known| {
+        name == *known
+            || name
+                .strip_prefix(known)
+                .and_then(|rest| rest.strip_prefix('.'))
+                .and_then(|rest| rest.strip_suffix("tmp"))
+                .is_some_and(|middle| middle.ends_with('.'))
+    })
 }
 
 type Jobs = BTreeMap<JobId, Arc<tokio::sync::Mutex<Job>>>;
@@ -554,27 +594,61 @@ mod tests {
         assert_eq!(mode(&shared), 0o755);
     }
 
-    /// Others who can write in a directory could have made any entry in
-    /// it under one of Fabric's names, such as a `peers` book that pairs
-    /// their node, so only an empty one may be narrowed and adopted.
+    /// An entry another user made while they could write in the
+    /// directory, such as a `peers` book that pairs their node, is still
+    /// theirs once the directory is narrowed, so it is refused at every
+    /// start, not only at the one that narrowed it, and a directory others
+    /// can write keeps its mode. No test can make a file another user
+    /// owns, so the node is told it runs as the next user id.
     #[test]
-    fn a_directory_others_can_write_is_adopted_only_while_empty() {
+    fn an_entry_another_user_owns_is_refused_whatever_the_mode() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        for was in [0o700, 0o750, 0o775, 0o777] {
+            let state = dir.path().join(format!("{was:o}"));
+            fs::create_dir(&state).unwrap();
+            fs::write(state.join("peers"), "").unwrap();
+            fs::set_permissions(&state, fs::Permissions::from_mode(was)).unwrap();
+            let meta = fs::metadata(&state).unwrap();
+            let other = meta.uid().wrapping_add(1);
+            let refused = adopt_state_dir(&state, &meta, other);
+            assert!(
+                matches!(&refused, Err(NodeError::UnsafeStateDir { reason, .. }) if reason.contains("holds peers, which belongs to user")),
+                "mode {was:o}: {refused:?}"
+            );
+            assert_eq!(mode(&state), was);
+        }
+    }
+
+    /// A directory others can write is narrowed first and then judged, so
+    /// one that holds only this user's own entries under Fabric's names is
+    /// adopted, as a `~/.fabric` made with umask 002 that holds the
+    /// `harness.toml` the user wrote before the first start.
+    #[test]
+    fn a_directory_others_can_write_is_adopted_when_every_entry_is_yours() {
         let dir = tempfile::tempdir().unwrap();
         let team = dir.path().join("team");
         fs::create_dir(&team).unwrap();
-        fs::write(team.join("peers"), "").unwrap();
+        fs::write(team.join("harness.toml"), "").unwrap();
+        fs::create_dir(team.join("harness")).unwrap();
         fs::set_permissions(&team, fs::Permissions::from_mode(0o775)).unwrap();
-        let refused = prepare_state_dir(&team);
-        assert!(
-            matches!(refused, Err(NodeError::UnsafeStateDir { .. })),
-            "{refused:?}"
-        );
-        assert_eq!(mode(&team), 0o775);
+        prepare_state_dir(&team).unwrap();
+        assert_eq!(mode(&team), 0o700);
         let empty = dir.path().join("empty");
         fs::create_dir(&empty).unwrap();
         fs::set_permissions(&empty, fs::Permissions::from_mode(0o777)).unwrap();
         prepare_state_dir(&empty).unwrap();
         assert_eq!(mode(&empty), 0o700);
+        let project = dir.path().join("project");
+        fs::create_dir(&project).unwrap();
+        fs::write(project.join("notes.txt"), "mine").unwrap();
+        fs::set_permissions(&project, fs::Permissions::from_mode(0o777)).unwrap();
+        let refused = prepare_state_dir(&project);
+        assert!(
+            matches!(refused, Err(NodeError::UnsafeStateDir { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(mode(&project), 0o777);
     }
 
     #[test]
