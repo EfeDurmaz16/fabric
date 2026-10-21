@@ -407,6 +407,8 @@ pub enum Input {
     DepartureRecord,
     /// A line of a Codex rollout.
     RolloutLine,
+    /// A line of a Claude transcript.
+    TranscriptLine,
     /// Claude's `~/.claude.json`.
     ConfigJson,
     /// A path inside a state tree.
@@ -421,6 +423,7 @@ impl std::fmt::Display for Input {
             Input::Manifest => "manifest",
             Input::DepartureRecord => "departure record",
             Input::RolloutLine => "rollout line",
+            Input::TranscriptLine => "transcript line",
             Input::ConfigJson => "config json",
             Input::StatePath => "state path",
             Input::WorkspacePath => "workspace path",

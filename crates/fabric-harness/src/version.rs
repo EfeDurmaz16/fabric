@@ -151,7 +151,7 @@ impl fmt::Display for HarnessVersion {
 /// older than `recorded`, the newest version the session records, or
 /// cannot be read. Runs `binary --version` with the launch environment
 /// minus the parent-session markers, as the launch itself would run.
-#[cfg(feature = "codex")]
+#[cfg(any(feature = "claude", feature = "codex"))]
 pub(crate) async fn refuse_older(
     program: &str,
     binary: &std::path::Path,

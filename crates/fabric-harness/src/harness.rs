@@ -171,7 +171,7 @@ pub struct PassedSetting {
 }
 
 /// The most characters of a recorded value a report shows.
-#[cfg(feature = "codex")]
+#[cfg(any(feature = "claude", feature = "codex"))]
 const SHOWN_VALUE_LEN: usize = 64;
 
 /// A setting the session records that a launch did not pass, so the
@@ -189,7 +189,7 @@ pub struct NotCarried {
 
 impl NotCarried {
     /// A setting left out, with its recorded value made safe to print.
-    #[cfg(feature = "codex")]
+    #[cfg(any(feature = "claude", feature = "codex"))]
     pub(crate) fn new(name: SettingName, value: &str, reason: impl Into<String>) -> Self {
         let mut shown: String = value
             .chars()
@@ -208,7 +208,7 @@ impl NotCarried {
 }
 
 /// One setting as a session records it, read by an adapter before a resume.
-#[cfg(feature = "codex")]
+#[cfg(any(feature = "claude", feature = "codex"))]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum Recorded<T> {
     /// Recorded with a value Fabric carries.
@@ -276,7 +276,7 @@ impl Running {
     }
 
     /// Records what the launch passed and left out.
-    #[cfg(feature = "codex")]
+    #[cfg(any(feature = "claude", feature = "codex"))]
     pub(crate) fn with_settings(mut self, settings: LaunchSettings) -> Self {
         self.settings = settings;
         self

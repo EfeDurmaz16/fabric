@@ -36,13 +36,22 @@
 //!
 //! Surfaces used, checked against `claude --help` of 2.1.294 on
 //! 2026-10-19: `--resume <id>`, `--session-id <uuid>`, `-p` with
-//! `--output-format json`, and the typed flags of `flags::LaunchFlags`.
+//! `--output-format json`, and the typed flags of `flags::LaunchFlags`;
+//! on a resume also `--model <name>` with the model the session last ran
+//! with (`recorded`, checked against `claude --help` of 2.1.294 on
+//! 2026-10-21), so a node whose own settings name another model does not
+//! switch the job's. Before a resume starts, the binary it would run is
+//! asked for its version and refused when that is older than the newest
+//! `version` the transcripts record, or unreadable
+//! (`version::refuse_older`, gate finding F10); a session that records
+//! no version, or has no transcript on this node, is not guarded.
 //! An overlay file that holds a literal secret refuses the launch. The session registry
 //! `~/.claude/sessions/<pid>.json` (`pid`, `sessionId`) was read on the
 //! owner's machine on 2026-10-20.
 
 pub mod flags;
 pub(crate) mod history;
+pub(crate) mod recorded;
 pub(crate) mod slug;
 pub(crate) mod trust;
 
@@ -58,7 +67,10 @@ use tracing::{debug, info, warn};
 
 use crate::departure::{FABRIC_DIR, Records};
 use crate::error::{HarnessError, IoOp};
-use crate::harness::{Harness, Installed, Launch, Restored, Running, TurnReport};
+use crate::harness::{
+    Harness, Installed, Launch, LaunchSettings, ModelName, NotCarried, Origin, PassedSetting,
+    Recorded, Restored, Running, SettingName, TurnReport,
+};
 use crate::jsontext;
 use crate::manifest::{HOME_PREFIX, Mutability, StateManifest, under_home};
 use crate::pipeline::{self, Capturer, Destination};
@@ -671,14 +683,69 @@ impl ClaudeCode {
         process::detect(self.binary().ok(), &self.path_var).await
     }
 
+    /// Every transcript of `session`, `projects/*/<sid>.jsonl`, in key
+    /// order with the workspace's own key last, so its model wins; none
+    /// when this node holds no transcript of it, which records nothing to
+    /// carry or to guard, and Claude then says itself that it found none.
+    fn transcripts(
+        &self,
+        root: &AbsPath,
+        session: &SessionId,
+    ) -> Result<Vec<PathBuf>, HarnessError> {
+        let projects = self.config_dir.join("projects");
+        let own = projects.join(Self::key_of(root)?);
+        let entries = match std::fs::read_dir(&projects) {
+            Ok(entries) => Some(entries),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(HarnessError::io(IoOp::Walk, &projects, e)),
+        };
+        let mut found = Vec::new();
+        for entry in entries.into_iter().flatten() {
+            let entry = entry.map_err(|e| HarnessError::io(IoOp::Walk, &projects, e))?;
+            let key_dir = entry.path();
+            // A symlink is never followed, as capture follows none.
+            let kind = entry
+                .file_type()
+                .map_err(|e| HarnessError::io(IoOp::Walk, &key_dir, e))?;
+            if !kind.is_dir() {
+                continue;
+            }
+            let transcript = key_dir.join(format!("{session}.jsonl"));
+            if Self::kind_at(&transcript)?.is_some_and(|kind| kind.is_file()) {
+                found.push((key_dir == own, transcript));
+            }
+        }
+        found.sort();
+        Ok(found.into_iter().map(|(_, path)| path).collect())
+    }
+
+    /// What the transcripts of `session` record, read before a resume;
+    /// refused when the binary that would run it is older than its newest
+    /// writer or does not say its version, so nothing starts.
+    async fn read_session(
+        &self,
+        root: &AbsPath,
+        binary: &Path,
+        env: &[(EnvVarName, String)],
+        session: &SessionId,
+    ) -> Result<recorded::RecordedClaude, HarnessError> {
+        let transcripts = self.transcripts(root, session)?;
+        let recorded = pipeline::blocking(move || recorded::read(&transcripts)).await?;
+        if let Some(writer) = &recorded.writer {
+            crate::version::refuse_older(PROGRAM, binary, env, session, writer).await?;
+        }
+        Ok(recorded)
+    }
+
     /// The session the process runs and the argument list for `launch`,
     /// without the binary: `--resume` with the session `launch` names, or
     /// `--session-id` with the id `fresh` mints, so the flag and the id
-    /// always agree.
+    /// always agree, and `--model` when one is given.
     pub(crate) fn args_for(
         &self,
         launch: &Launch,
         fresh: impl FnOnce() -> SessionId,
+        model: Option<&ModelName>,
     ) -> (SessionId, Vec<String>) {
         let mut args = Vec::new();
         if launch.is_headless() {
@@ -690,6 +757,10 @@ impl ClaudeCode {
         };
         args.push(flag.to_owned());
         args.push(session.as_str().to_owned());
+        if let Some(model) = model {
+            args.push("--model".to_owned());
+            args.push(model.as_str().to_owned());
+        }
         args.extend(self.flags.args());
         if let Some(prompt) = launch.prompt() {
             args.push("--".to_owned());
@@ -752,11 +823,32 @@ impl ClaudeCode {
         for overlay in self.flags.overlays() {
             refuse_secret_overlay(Path::new(overlay.as_str()))?;
         }
-        let (session, args) = self.args_for(launch, Self::fresh_session);
+        let mut settings = LaunchSettings::default();
+        let model = match launch.resume() {
+            Some(session) => match self.read_session(&root, &binary, env, session).await?.model {
+                Recorded::Carried(model) => {
+                    settings.passed.push(PassedSetting {
+                        name: SettingName::Model,
+                        value: model.as_str().to_owned(),
+                        origin: Origin::Session,
+                    });
+                    Some(model)
+                }
+                Recorded::NotCarried { value, reason } => {
+                    settings
+                        .not_carried
+                        .push(NotCarried::new(SettingName::Model, &value, reason));
+                    None
+                }
+                Recorded::Absent => None,
+            },
+            None => None,
+        };
+        let (session, args) = self.args_for(launch, Self::fresh_session, model.as_ref());
         let spawned =
             process::spawn(&binary, &args, pipeline::fs_path(&root), env, launch.into()).await?;
         info!(%session, pid = %spawned.pid, held = spawned.held, "claude: launched");
-        Ok(Running::new(Some(session), spawned))
+        Ok(Running::new(Some(session), spawned).with_settings(settings))
     }
 }
 
@@ -1270,7 +1362,7 @@ mod tests {
             prompt: None,
         };
         assert_eq!(
-            adapter.args_for(&resume, ClaudeCode::fresh_session),
+            adapter.args_for(&resume, ClaudeCode::fresh_session, None),
             (
                 session.clone(),
                 vec![
@@ -1289,13 +1381,21 @@ mod tests {
             prompt: "--not-a-flag".to_owned(),
         };
         assert_eq!(
-            adapter.args_for(&headless, ClaudeCode::fresh_session).1,
+            adapter
+                .args_for(
+                    &headless,
+                    ClaudeCode::fresh_session,
+                    Some(&ModelName::parse("claude-opus-5-5").unwrap())
+                )
+                .1,
             vec![
                 "-p",
                 "--output-format",
                 "json",
                 "--resume",
                 "9c9796f0-2682-4546-a963-d314b3ad543f",
+                "--model",
+                "claude-opus-5-5",
                 "--permission-mode",
                 "acceptEdits",
                 "--",
@@ -1308,7 +1408,7 @@ mod tests {
             prompt: Some("hi".to_owned()),
         };
         assert_eq!(
-            adapter.args_for(&new, || fresh.clone()),
+            adapter.args_for(&new, || fresh.clone(), None),
             (
                 fresh.clone(),
                 vec![
@@ -1359,5 +1459,132 @@ mod tests {
         );
         assert_eq!(failed.failure.as_deref(), Some("error_during_execution"));
         assert_eq!(failed.answer, None);
+    }
+
+    const SID: &str = "9c9796f0-2682-4546-a963-d314b3ad543f";
+
+    /// A home whose transcript of `SID` was written by Claude 2.1.294
+    /// with claude-opus-5-5, and a fake `claude` that answers `--version`
+    /// with `version_line` and otherwise appends a line to the transcript
+    /// and writes its arguments to `ran`.
+    struct Resume {
+        _dir: tempfile::TempDir,
+        home: PathBuf,
+        transcript: PathBuf,
+        adapter: ClaudeCode,
+        env: Vec<(EnvVarName, String)>,
+    }
+
+    impl Resume {
+        fn new(version_line: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let home = std::fs::canonicalize(dir.path()).unwrap();
+            let work = home.join("work");
+            std::fs::create_dir_all(&work).unwrap();
+            let key = ClaudeCode::key_of(&AbsPath::parse(work.to_str().unwrap()).unwrap()).unwrap();
+            let project = home.join(".claude/projects").join(key);
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(home.join(".claude/projects/.DS_Store"), "").unwrap();
+            let transcript = project.join(format!("{SID}.jsonl"));
+            std::fs::write(
+                &transcript,
+                "{\"type\":\"assistant\",\"version\":\"2.1.294\",\"isSidechain\":false,\"message\":{\"model\":\"claude-opus-5-5\"}}\n",
+            )
+            .unwrap();
+            let binary = home.join("claude");
+            std::fs::write(
+                &binary,
+                format!(
+                    "#!/bin/sh\n\
+                     if [ \"$1\" = --version ]; then echo '{version_line}'; exit 0; fi\n\
+                     echo '{{\"type\":\"user\"}}' >> '{}'\n\
+                     printf '%s\\n' \"$@\" > \"$HOME/ran\"\n",
+                    transcript.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let adapter = ClaudeCode::new(
+                AbsPath::parse(home.to_str().unwrap()).unwrap(),
+                OsString::new(),
+            )
+            .with_binary(binary);
+            let env = vec![(
+                EnvVarName::parse("HOME").unwrap(),
+                home.to_str().unwrap().to_owned(),
+            )];
+            Resume {
+                _dir: dir,
+                home,
+                transcript,
+                adapter,
+                env,
+            }
+        }
+
+        async fn launch(&self) -> Result<Running, HarnessError> {
+            let launch = Launch::Headless {
+                resume: Some(SessionId::parse(SID).unwrap()),
+                prompt: "next".to_owned(),
+            };
+            self.adapter
+                .launch(&self.home.join("work"), launch, &self.env)
+                .await
+        }
+
+        fn ran(&self) -> Option<Vec<String>> {
+            let text = std::fs::read_to_string(self.home.join("ran")).ok()?;
+            Some(text.lines().map(str::to_owned).collect())
+        }
+    }
+
+    /// An older claude on this node is refused before it starts, so the
+    /// transcript a newer one wrote keeps its bytes.
+    #[tokio::test]
+    async fn an_older_claude_is_refused_before_it_starts() {
+        let fixture = Resume::new("2.1.199 (Claude Code)");
+        let before = std::fs::read(&fixture.transcript).unwrap();
+        let refused = fixture.launch().await.unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                HarnessError::HarnessOlderThanSession { local, recorded, .. }
+                    if local.as_str() == "2.1.199" && recorded.as_str() == "2.1.294"
+            ),
+            "{refused}"
+        );
+        assert_eq!(std::fs::read(&fixture.transcript).unwrap(), before);
+        assert_eq!(fixture.ran(), None, "the older claude ran");
+    }
+
+    /// A resume passes the model the session last ran with, and says so.
+    #[tokio::test]
+    async fn a_resume_passes_the_model_the_session_ran_with() {
+        let fixture = Resume::new("2.1.294 (Claude Code)");
+        let mut running = fixture.launch().await.unwrap();
+        running.child_mut().wait().await.unwrap();
+        assert_eq!(
+            fixture.ran().unwrap(),
+            [
+                "-p",
+                "--output-format",
+                "json",
+                "--resume",
+                SID,
+                "--model",
+                "claude-opus-5-5",
+                "--",
+                "next"
+            ]
+        );
+        assert_eq!(
+            running.settings().passed,
+            [PassedSetting {
+                name: SettingName::Model,
+                value: "claude-opus-5-5".to_owned(),
+                origin: Origin::Session,
+            }]
+        );
     }
 }
