@@ -448,4 +448,17 @@ mod tests {
             assert!(ModelName::parse(bad).is_err(), "{bad:?}");
         }
     }
+
+    /// A recorded value is printed to the user's terminal, and it comes
+    /// from a file that travelled, so an escape sequence in it must not
+    /// reach the terminal and a long one is cut.
+    #[cfg(any(feature = "claude", feature = "codex"))]
+    #[test]
+    fn a_value_left_out_is_shown_without_control_characters_and_cut() {
+        let left = NotCarried::new(SettingName::Model, "a\u{1b}[2Jb\nc", "why");
+        assert_eq!(left.value, "a?[2Jb?c");
+        let long = "m".repeat(SHOWN_VALUE_LEN + 1);
+        let left = NotCarried::new(SettingName::Model, &long, "why");
+        assert_eq!(left.value, format!("{}...", "m".repeat(SHOWN_VALUE_LEN)));
+    }
 }
