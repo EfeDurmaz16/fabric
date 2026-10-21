@@ -2448,6 +2448,53 @@ pub(crate) mod tests {
         );
     }
 
+    /// An addressless peer can dial in after start-up recovery listed the
+    /// reachable peers and before it ended. That session must still be
+    /// caught up once recovery ends: a record the peer wrote while this
+    /// node was away, such as a steal, would otherwise stay unknown here
+    /// until the next session or job command.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_that_begins_during_recovery_is_caught_up_after_it() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        a.recovered().await;
+        b.recovered().await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let out = &mut Out::default();
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &path, out).await.unwrap();
+        b.pull_records(id, a.id).await.unwrap();
+        b.ensure_latest(id, a.id).await.unwrap();
+        b.job_steal(id, "a sleeps".to_owned(), true, out)
+            .await
+            .unwrap();
+        // The steal reached a; this record, which b does not push, did not.
+        b.job_decide(id, Decision::Approve, "", out).await.unwrap();
+        let head = |node: Arc<Node>| async move {
+            node.job(id).await.unwrap().lock().await.ledger().head()
+        };
+        let want = head(Arc::clone(&b)).await;
+        assert_ne!(head(Arc::clone(&a)).await, want);
+
+        // a restarts: recovery runs, and b's session begins after
+        // recovery listed the peers it would catch up with.
+        a.recovered.send_replace(false);
+        let kept = b.open_session(a.id).unwrap();
+        b.forget(a.id, &kept);
+        b.node_ping(a.id, out).await.unwrap();
+        a.end_recovery(&std::collections::BTreeSet::new());
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while head(Arc::clone(&a)).await != want {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a never caught up with the session b opened during recovery"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Two moves typed at once toward different nodes: the second finds the
     /// job departing toward the first's target and must name that node,
     /// not offer the first move to its own.

@@ -8,8 +8,10 @@
 //! refuses every command that would run the job from then on. The fork rule
 //! of ADR 0003 is not built, so a node keeps running a forked job only when
 //! the peer's epoch is lower. Catching up runs at start, whenever a session
-//! with a peer begins, and before a run; a peer that does not answer is
-//! skipped for the rest of a pass rather than dialled again for every job.
+//! with a peer begins, and before a run; a session that begins while the
+//! start-up pass runs is caught up when that pass ends. A peer that does
+//! not answer is skipped for the rest of a pass rather than dialled again
+//! for every job.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -53,10 +55,13 @@ impl Node {
             let node = Arc::clone(&self);
             tasks.spawn(async move { (peer, node.catch_up_peer(peer).await) });
         }
+        let mut caught_up = BTreeSet::new();
         let mut unreachable = BTreeSet::new();
         while let Some(joined) = tasks.join_next().await {
             match joined {
-                Ok((_, Ok(()))) => {}
+                Ok((peer, Ok(()))) => {
+                    caught_up.insert(peer);
+                }
                 Ok((peer, Err(e))) => {
                     tracing::info!(%peer, error = %e, "did not catch up with the peer");
                     unreachable.insert(peer);
@@ -94,7 +99,26 @@ impl Node {
                 tracing::info!(job = %id, "{line}");
             }
         }
-        self.recovered.send_replace(true);
+        self.end_recovery(&caught_up);
+    }
+
+    /// Marks start-up recovery done and catches up with every peer whose
+    /// session began while it ran and that it did not already catch up
+    /// with, such as an addressless peer that dialed in after recovery
+    /// listed the reachable peers.
+    ///
+    /// The flag is set under the same lock `spawn_catch_up` checks it
+    /// under, so a session that begins at any moment is either queued here
+    /// or caught up on its own, never neither.
+    pub(crate) fn end_recovery(self: &Arc<Self>, caught_up: &BTreeSet<NodeId>) {
+        let waiting = {
+            let mut waiting = lock(&self.waiting_catch_up);
+            self.recovered.send_replace(true);
+            std::mem::take(&mut *waiting)
+        };
+        for peer in waiting.difference(caught_up) {
+            self.spawn_catch_up(*peer);
+        }
     }
 
     /// Whether the start-up recovery has run.
@@ -129,10 +153,19 @@ impl Node {
     }
 
     /// Catches up with `peer` in the background once a session with it
-    /// begins, unless one already runs for it or start-up recovery, which
-    /// catches up with every peer, has not finished.
+    /// begins, unless one already runs for it. While start-up recovery
+    /// runs, the peer waits for it instead, so the catch-up never acts on
+    /// a ledger recovery has not settled, and is not lost when recovery
+    /// listed the reachable peers before this session began.
     pub(crate) fn spawn_catch_up(self: &Arc<Self>, peer: NodeId) {
-        if !self.is_recovered() || !lock(&self.catching_up).insert(peer) {
+        {
+            let mut waiting = lock(&self.waiting_catch_up);
+            if !self.is_recovered() {
+                waiting.insert(peer);
+                return;
+            }
+        }
+        if !lock(&self.catching_up).insert(peer) {
             return;
         }
         let node = Arc::clone(self);

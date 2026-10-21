@@ -75,6 +75,9 @@ pub struct Node {
     control: Mutex<Option<UnixListener>>,
     pub(crate) recovered: tokio::sync::watch::Sender<bool>,
     pub(crate) catching_up: Mutex<BTreeSet<NodeId>>,
+    /// Peers whose session began while start-up recovery ran; recovery
+    /// catches up with each of them once it is done.
+    pub(crate) waiting_catch_up: Mutex<BTreeSet<NodeId>>,
     _lock: File,
 }
 
@@ -145,6 +148,7 @@ impl Node {
             control: Mutex::new(Some(control)),
             recovered: tokio::sync::watch::Sender::new(false),
             catching_up: Mutex::new(BTreeSet::new()),
+            waiting_catch_up: Mutex::new(BTreeSet::new()),
             _lock: lock_file,
         });
         tracing::info!(node = %node.id, addr = ?node.local_addr().ok(), "node started");
