@@ -2564,7 +2564,8 @@ pub(crate) mod tests {
     /// records that session for the harness it recorded and for no other
     /// pid, and not once that harness was stopped, because the suspend or
     /// fence that stopped it captured without the session. Naming the same
-    /// session again keeps the newest writer the node knows of it.
+    /// session again keeps the newest writer the node knows of it, and
+    /// naming another one does not hand it that writer.
     #[tokio::test]
     async fn a_session_named_after_the_start_is_recorded_only_for_the_recorded_harness() {
         let (dir, node) = node();
@@ -2638,6 +2639,31 @@ pub(crate) mod tests {
         assert_eq!(
             recorded().await.and_then(|record| record.known_writer),
             Some(known)
+        );
+        // A new thread, as `codex exec resume` answers with when it forks,
+        // was written by none of the versions that wrote the old one, so it
+        // starts with no known writer; keeping the old one's would refuse
+        // the Codex that created the new thread on its next resume.
+        let forked = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368b").unwrap();
+        node.harness_session(
+            NamedSession {
+                job: id,
+                epoch: Epoch::FIRST,
+                pid: pid(&harness),
+                harness: HarnessKind::Codex,
+                session: forked.clone(),
+            },
+            &mut Out::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recorded().await,
+            Some(SessionRecord {
+                harness: HarnessKind::Codex,
+                session: forked,
+                known_writer: None,
+            })
         );
 
         harness.kill().unwrap();
