@@ -403,37 +403,38 @@ const STATE_ENTRIES: [&str; 10] = [
 /// it does not own.
 ///
 /// A missing directory is created with mode 0700. An existing one must be
-/// this user's, and so must every entry in it, whatever its mode: an entry
-/// another user made while others could write there, such as a `peers`
-/// book that pairs their node, stays theirs after the directory is
-/// narrowed, so a later start must not trust it either. When the directory
-/// lets others in, it is narrowed only if it holds nothing but what Fabric
-/// writes, so a `FABRIC_HOME` that names a shared directory, such as `/tmp`
-/// or a project, is refused and left as it was.
+/// this user's and must be the directory itself, not a link to one: whoever
+/// owns a link can point it elsewhere while the node runs, and the CLI
+/// refuses a linked state directory anyway. Every entry in it must be this
+/// user's too, whatever its mode: an entry another user made while others
+/// could write there, such as a `peers` book that pairs their node, stays
+/// theirs after the directory is narrowed, so a later start must not trust
+/// it either. When the directory lets others in, it is narrowed only if it
+/// holds nothing but what Fabric writes, so a `FABRIC_HOME` that names a
+/// shared directory, such as `/tmp` or a project, is refused and left as it
+/// was.
 fn prepare_state_dir(root: &std::path::Path) -> Result<(), NodeError> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-    let meta = match fs::metadata(root) {
+    use std::os::unix::fs::MetadataExt;
+    // The components drop a trailing `/` or `/.`, which would make the
+    // look below follow a link at the end of the path.
+    let root: std::path::PathBuf = root.components().collect();
+    let root = root.as_path();
+    let meta = match fs::symlink_metadata(root) {
         Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(root)
-                .map_err(|e| NodeError::io(root, e))?;
-            return fs::set_permissions(root, fs::Permissions::from_mode(0o700))
-                .map_err(|e| NodeError::io(root, e));
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match make_state_dir(root) {
+            Ok(()) => return Ok(()),
+            // Something took the name after the look: judge it as found.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                fs::symlink_metadata(root).map_err(|e| NodeError::io(root, e))?
+            }
+            Err(e) => return Err(NodeError::io(root, e)),
+        },
         Err(e) => return Err(NodeError::io(root, e)),
     };
     let refuse = |reason: String| NodeError::UnsafeStateDir {
         path: root.to_owned(),
         reason,
     };
-    if !meta.is_dir() {
-        return Err(refuse(
-            "is not a directory; choose a dedicated FABRIC_HOME".to_owned(),
-        ));
-    }
     let me = rustix::process::geteuid().as_raw();
     if meta.uid() != me {
         return Err(refuse(format!(
@@ -441,7 +442,33 @@ fn prepare_state_dir(root: &std::path::Path) -> Result<(), NodeError> {
             meta.uid()
         )));
     }
+    if meta.file_type().is_symlink() {
+        return Err(refuse(
+            "is a symlink; set FABRIC_HOME to the directory itself".to_owned(),
+        ));
+    }
+    if !meta.is_dir() {
+        return Err(refuse(
+            "is not a directory; choose a dedicated FABRIC_HOME".to_owned(),
+        ));
+    }
     adopt_state_dir(root, &meta, me)
+}
+
+/// Makes `root` a new directory with mode 0700, and its missing parents
+/// with it. `root` itself is made by a plain `mkdir`, which fails on any
+/// name already there, a link included, so a link made after the caller
+/// looked is never followed.
+fn make_state_dir(root: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    if let Some(parent) = root.parent() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+    fs::DirBuilder::new().mode(0o700).create(root)?;
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700))
 }
 
 /// Adopts `root`, a directory user `me` owns, whose metadata is `meta`.
@@ -694,5 +721,45 @@ mod tests {
         fs::set_permissions(&made, fs::Permissions::from_mode(0o755)).unwrap();
         prepare_state_dir(&made).unwrap();
         assert_eq!(mode(&made), 0o700);
+    }
+
+    /// A `FABRIC_HOME` that is a link is refused however it is spelled,
+    /// and the directory it names keeps its mode: whoever owns the link,
+    /// such as another user who planted it under `/tmp`, could point it
+    /// elsewhere while the node runs, and the CLI refuses a linked state
+    /// directory anyway.
+    #[test]
+    fn a_fabric_home_that_is_a_link_is_refused_and_its_target_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("harness.toml"), "").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("link")).unwrap();
+        for spelled in ["link", "link/", "link/."] {
+            let refused = prepare_state_dir(&dir.path().join(spelled));
+            assert!(
+                matches!(&refused, Err(NodeError::UnsafeStateDir { reason, .. }) if reason.contains("is a symlink")),
+                "{spelled}: {refused:?}"
+            );
+            assert_eq!(mode(&target), 0o755, "{spelled}");
+        }
+    }
+
+    /// A link that takes a missing state directory's name after the start
+    /// looked, as one another user plants under `/tmp`, makes the `mkdir`
+    /// fail instead of being followed, so the directory it names keeps
+    /// its mode.
+    #[test]
+    fn a_link_made_after_the_look_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let made = make_state_dir(&link).map_err(|e| e.kind());
+        assert_eq!(made, Err(std::io::ErrorKind::AlreadyExists));
+        assert_eq!(mode(&target), 0o755);
     }
 }
