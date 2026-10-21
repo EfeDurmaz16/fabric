@@ -1873,9 +1873,12 @@ impl Node {
         force: bool,
         out: &mut Out,
     ) -> Result<(), NodeError> {
-        let (owner, complete) = {
+        // One hold of the job's lock from the fork check to the commit: a
+        // catch-up waiting for it could otherwise freeze the job, or move
+        // it to another owner, after the check and before the steal.
+        let owner = {
             let job = self.job(id).await?;
-            let job = job.lock().await;
+            let mut job = job.lock().await;
             // A frozen chain pushed at a higher epoch would freeze the job
             // on the real owner too, for good.
             if let Some(fork) = job.forked()? {
@@ -1889,11 +1892,8 @@ impl Node {
             let complete = is_complete(&self.store, latest)
                 .await?
                 .then_some(CompleteSnapshot::new(latest));
-            (job.ledger().lease().holder(), complete)
-        };
-        {
-            let job = self.job(id).await?;
-            let mut job = job.lock().await;
+            // The holder the steal takes the job from, who must learn of it.
+            let owner = job.ledger().lease().holder();
             let proposal = job.ledger().steal(
                 self.id,
                 reason,
@@ -1919,7 +1919,8 @@ impl Node {
                 job.ledger().lease().epoch()
             ));
             self.settle(&mut job, out).await?;
-        }
+            owner
+        };
         if let Err(e) = self.push_records(id, owner).await {
             out.say(format!("{owner} has not seen the steal yet: {e}"));
         }
@@ -3352,6 +3353,53 @@ pub(crate) mod tests {
                 .iter()
                 .any(|r| matches!(r.event().kind, EventKind::MoveStarted { .. })),
             "MoveStarted was appended on a frozen chain"
+        );
+    }
+
+    /// A catch-up that waits for the job's lock while a steal checks the
+    /// fork can freeze the job between the steal's check and its commit.
+    /// The steal must not then append a new epoch on the frozen chain.
+    /// The lock is fair, so a freeze queued behind the steal runs at the
+    /// steal's first release of the lock.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_steal_appends_nothing_after_a_freeze_it_did_not_see() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &path, &mut Out::default()).await.unwrap();
+        b.pull_records(id, a.id).await.unwrap();
+        b.ensure_latest(id, a.id).await.unwrap();
+        let job = b.job(id).await.unwrap();
+        let held = job.lock().await;
+        let thief = Arc::clone(&b);
+        let steal = tokio::spawn(async move {
+            thief
+                .job_steal(id, "a sleeps".to_owned(), true, &mut Out::default())
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let frozen_job = Arc::clone(&job);
+        let a_id = a.id;
+        let freeze = tokio::spawn(async move {
+            let job = frozen_job.lock().await;
+            job.freeze(&crate::local::ForkRecord {
+                peer: a_id,
+                epoch: Epoch::new(2).unwrap(),
+                head: fabric_core::id::RecordHash::of(b"a head"),
+            })
+            .unwrap();
+            job.ledger().records().len()
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(held);
+        let at_freeze = freeze.await.unwrap();
+        let stolen = steal.await.unwrap();
+        let after = job.lock().await.ledger().records().len();
+        assert_eq!(
+            after, at_freeze,
+            "the steal appended to the chain after it was frozen ({stolen:?})"
         );
     }
 }
