@@ -18,15 +18,22 @@
 //! error, because the guard cannot compare it.
 //!
 //! `message.model` names the model that served a reply, which is not
-//! always the one the session asked for. When Claude falls back, it first
-//! writes a `system` line, subtype `model_fallback` (overload or usage
-//! limit) or `model_refusal_fallback`, with `originalModel` and
-//! `fallbackModel` (2.1.294 bundle; 126 refusal fallbacks in the owner's
-//! transcripts on 2026-10-21, after each of which later replies went back
-//! to the original). A reply the fallback served therefore counts as the
-//! original model, so a resume does not pin the fallback for good. An
-//! alias such as `opusplan` is recorded nowhere, so a session run under
-//! one resumes on the full model of its last reply.
+//! always the one the session asked for. When Claude falls back, it writes
+//! a `system` line, subtype `model_fallback` (overload or usage limit) or
+//! `model_refusal_fallback`, with `originalModel` and `fallbackModel`
+//! (2.1.294 bundle), and that line can come before or after the reply the
+//! fallback served. Of the 126 refusal fallbacks in the owner's
+//! transcripts on 2026-10-21 (written by 2.1.197 to 2.1.278), 83 name as
+//! their parent an earlier reply the fallback model served, 27 of which
+//! ended the turn, and in 118 the next reply came from the fallback model
+//! too: Claude stays on it for the rest of the process and goes back to
+//! the original on a session transition (`unlatchRefusalFallbackModel`,
+//! 2.1.294 bundle), which a resume is. So a reply the fallback model
+//! served counts as the original model, whether it comes right before the
+//! fallback line or after it until a reply comes from another model, and
+//! a resume does not pin the fallback for good. An alias such as
+//! `opusplan` is recorded nowhere, so a session run under one resumes on
+//! the full model of its last reply.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -92,11 +99,24 @@ pub(crate) fn read(transcripts: &[PathBuf]) -> Result<RecordedClaude, HarnessErr
     Ok(recorded)
 }
 
+/// The model a resume asks for in place of `model`, or why it cannot.
+fn recorded_model(model: String) -> Recorded<ModelName> {
+    match ModelName::parse(&model) {
+        Ok(name) => Recorded::Carried(name),
+        Err(e) => Recorded::NotCarried {
+            value: model,
+            reason: format!("not a model name Fabric passes: {e}"),
+        },
+    }
+}
+
 fn read_one(path: &Path, recorded: &mut RecordedClaude) -> Result<(), HarnessError> {
     let file = File::open(path).map_err(|e| HarnessError::io(IoOp::Read, path, e))?;
     let mut reader = BufReader::new(file);
     let mut bytes = Vec::new();
     let mut fallback: Option<Fallback> = None;
+    // The model that served the last reply of this file.
+    let mut last_served: Option<String> = None;
     loop {
         bytes.clear();
         if reader
@@ -133,6 +153,10 @@ fn read_one(path: &Path, recorded: &mut RecordedClaude) -> Result<(), HarnessErr
             )
             && let (Some(from), Some(to)) = (line.original_model, line.fallback_model)
         {
+            // The line often follows the reply the fallback served.
+            if last_served.as_deref() == Some(to.as_str()) {
+                recorded.model = recorded_model(from.clone());
+            }
             fallback = Some(Fallback { from, to });
             continue;
         }
@@ -149,16 +173,11 @@ fn read_one(path: &Path, recorded: &mut RecordedClaude) -> Result<(), HarnessErr
             Some(f) if f.to == served => f.from.clone(),
             _ => {
                 fallback = None;
-                served
+                served.clone()
             }
         };
-        recorded.model = match ModelName::parse(&model) {
-            Ok(name) => Recorded::Carried(name),
-            Err(e) => Recorded::NotCarried {
-                value: model,
-                reason: format!("not a model name Fabric passes: {e}"),
-            },
-        };
+        last_served = Some(served);
+        recorded.model = recorded_model(model);
     }
 }
 
@@ -170,6 +189,22 @@ mod tests {
         format!(
             "{{\"type\":\"assistant\",\"version\":\"{version}\",\"isSidechain\":{sidechain},\"message\":{{\"model\":\"{model}\",\"role\":\"assistant\"}}}}\n"
         )
+    }
+
+    /// A refusal fallback from claude-fable-5 to claude-opus-4-8, as
+    /// Claude 2.1.294 writes it.
+    const FALLBACK: &str = "{\"type\":\"system\",\"subtype\":\"model_refusal_fallback\",\"version\":\"2.1.294\",\"isSidechain\":false,\"originalModel\":\"claude-fable-5\",\"fallbackModel\":\"claude-opus-4-8\"}\n";
+
+    /// The model `lines`, as one transcript, gives a resume.
+    fn model_of(lines: &[String]) -> Recorded<ModelName> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("own.jsonl");
+        std::fs::write(&path, lines.concat()).unwrap();
+        read(&[path]).unwrap().model
+    }
+
+    fn model(name: &str) -> Recorded<ModelName> {
+        Recorded::Carried(ModelName::parse(name).unwrap())
     }
 
     /// The model is the last real main-chain one of the last transcript
@@ -210,10 +245,9 @@ mod tests {
 
         // A reply a fallback served stands for the model the session asked
         // for, until a reply comes from another model.
-        let fallback = "{\"type\":\"system\",\"subtype\":\"model_refusal_fallback\",\"version\":\"2.1.294\",\"isSidechain\":false,\"originalModel\":\"claude-fable-5\",\"fallbackModel\":\"claude-opus-4-8\"}\n";
         let served = [
             assistant("2.1.294", "claude-fable-5", false),
-            fallback.to_owned(),
+            FALLBACK.to_owned(),
             assistant("2.1.294", "claude-opus-4-8", false),
             assistant("2.1.294", "claude-opus-4-8", false),
         ]
@@ -238,5 +272,26 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// Claude often writes the fallback line after the reply the fallback
+    /// served, and a turn can end on that reply (83 of the 126 real refusal
+    /// fallbacks, 27 of them at the end of a turn): that reply still stands
+    /// for the model the session asked for, and so do the replies the
+    /// fallback model serves after the line.
+    #[test]
+    fn a_fallback_line_after_the_reply_it_served_still_stands_for_the_original() {
+        let ended = [
+            assistant("2.1.294", "claude-fable-5", false),
+            assistant("2.1.294", "claude-opus-4-8", false),
+            FALLBACK.to_owned(),
+        ];
+        assert_eq!(model_of(&ended), model("claude-fable-5"));
+        let latched = [
+            ended.as_slice(),
+            &[assistant("2.1.294", "claude-opus-4-8", false)],
+        ]
+        .concat();
+        assert_eq!(model_of(&latched), model("claude-fable-5"));
     }
 }
