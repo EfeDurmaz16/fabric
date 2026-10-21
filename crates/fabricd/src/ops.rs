@@ -1284,14 +1284,19 @@ impl Node {
             },
         };
         if let Some(holder) = holder {
-            let kind = match self.job(id).await {
-                Ok(job) => Some(job.lock().await.harness().clone()),
-                Err(_) => None,
+            // The preflight checks the harness that will launch here, so a
+            // job this node has never seen is learned before it runs.
+            if self.job(id).await.is_err() {
+                self.pull_records(id, holder).await?;
+            }
+            let kind = match &harness {
+                Some(kind) => kind.clone(),
+                None => self.job(id).await?.lock().await.harness().clone(),
             };
             let root = paths::job_root(&self.cfg.home, id);
             self.preflight(
                 holder,
-                kind.as_ref().map(|kind| (kind, root.as_path())),
+                Some((&kind, root.as_path())),
                 Target::Here,
                 path_var,
                 force,
@@ -2402,6 +2407,39 @@ pub(crate) mod tests {
             matches!(refused, Err(NodeError::Forked { .. })),
             "{refused:?}"
         );
+    }
+
+    /// A pull of a job this node has never seen, or under another harness,
+    /// must be refused when that harness cannot run here, before the job
+    /// changes hands. The test home has no Codex or Claude login.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pull_preflights_the_harness_that_will_launch() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        a.suspend(id, &path, &mut Out::default()).await.unwrap();
+        for (harness, login) in [
+            (None, crate::facts::name::CODEX_LOGIN),
+            (
+                Some(HarnessKind::ClaudeCode),
+                crate::facts::name::CLAUDE_LOGIN,
+            ),
+        ] {
+            let refused = b
+                .job_resume(id, Some(a.id), harness, true, &path, &mut Out::default())
+                .await;
+            assert!(
+                matches!(&refused, Err(NodeError::Preflight(facts)) if facts.contains(login)),
+                "{refused:?}"
+            );
+        }
+        let job = a.job(id).await.unwrap();
+        assert!(matches!(
+            job.lock().await.view(a.id),
+            LeaseView::Owner(token) if token.epoch == Epoch::FIRST
+        ));
     }
 
     #[test]
