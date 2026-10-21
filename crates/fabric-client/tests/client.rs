@@ -165,7 +165,10 @@ async fn an_op_the_node_does_not_list_is_not_sent() {
 /// ADR 0018, Compatibility rule 2: a node that does not know a request
 /// field ignores it, so a client sends a root only to a node that lists
 /// it, and an older node never measures with its own value in place of
-/// the client's (review finding on PR #13).
+/// the client's. A root the client leaves unset needs the same: it means
+/// removed for the tool, which a node that does not know the root never
+/// does, so it would run the tool with the daemon's value (review
+/// findings on PR #13).
 #[tokio::test]
 async fn a_root_the_node_does_not_list_is_not_sent() {
     let doctor = Request::Doctor {
@@ -188,9 +191,21 @@ async fn a_root_the_node_does_not_list_is_not_sent() {
     );
     assert_eq!(served.await.unwrap().unwrap(), None);
 
-    // A node that lists the root gets the request.
+    // A node that lists the root it sets, but not the ones it leaves unset, does not get it either.
+    let (_dir, socket, served) =
+        node(Script::Hello(welcome(&["doctor", "env.roots.cargo_home"]))).unwrap();
+    let got = Client::new(&socket).call(&doctor, |_| {}).await;
+    assert!(
+        matches!(got, Err(ClientError::UnsupportedField { op, capability: "env.roots.rustup_home" }) if op.name() == "doctor"),
+        "{got:?}"
+    );
+    assert_eq!(served.await.unwrap().unwrap(), None);
+
+    // A node that lists every root gets the request.
+    let mut capabilities = vec!["doctor"];
+    capabilities.extend(Roots::capabilities());
     let (_dir, socket, served) = node(Script::Serve {
-        welcome: welcome(&["doctor", "env.roots.cargo_home"]),
+        welcome: welcome(&capabilities),
         answers: vec![json!({"type": "done", "reply": {"kind": "doctor", "report": {"kind": "facts", "facts": []}}})],
     })
     .unwrap();

@@ -405,17 +405,20 @@ pub enum Request {
 
 impl Request {
     /// The capabilities, beyond its op, a node must list for this request
-    /// to mean what it says: one for each root its environment sets. A
-    /// node that does not know a field ignores it, so without the check an
-    /// older node would measure with its own value in place of the
-    /// client's and nobody would know.
+    /// to mean what it says: with an environment, one for every root this
+    /// client knows, set or not. A root the client sets must reach the
+    /// tool, and one it leaves unset must be removed from the tool's
+    /// environment, never the daemon's own; a node that does not know a
+    /// root does neither, so without the check an older node would measure
+    /// with its own value in place of the client's and nobody would know
+    /// (review findings on PR #13).
     #[must_use]
     pub fn needs(&self) -> Vec<&'static str> {
         match self {
-            Request::JobResume { env: Some(env), .. }
-            | Request::JobSuspend { env: Some(env), .. }
-            | Request::JobMove { env: Some(env), .. }
-            | Request::Doctor { env: Some(env), .. } => env.roots.needs().collect(),
+            Request::JobResume { env: Some(_), .. }
+            | Request::JobSuspend { env: Some(_), .. }
+            | Request::JobMove { env: Some(_), .. }
+            | Request::Doctor { env: Some(_), .. } => Roots::capabilities().to_vec(),
             _ => Vec::new(),
         }
     }
@@ -715,18 +718,11 @@ impl Roots {
     }
 
     /// The capability a node lists for each root it applies,
-    /// `env.roots.<field>`; a client sends a root only to a node that lists it.
+    /// `env.roots.<field>`; a client sends an environment only to a node
+    /// that lists every root the client knows.
     #[must_use]
     pub fn capabilities() -> [&'static str; 4] {
         Self::default().each().map(|(capability, _, _)| capability)
-    }
-
-    /// The capabilities of the roots this environment sets.
-    pub fn needs(&self) -> impl Iterator<Item = &'static str> {
-        self.each()
-            .into_iter()
-            .filter(|(_, _, value)| value.is_some())
-            .map(|(capability, _, _)| capability)
     }
 }
 

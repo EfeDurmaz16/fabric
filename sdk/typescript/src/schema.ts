@@ -514,9 +514,9 @@ function rootCapability(root: keyof Roots): string {
 
 /**
  * The capability a node lists for each root it applies, in the order a
- * welcome lists them after the ops. A client sends a root only to a node
- * that lists it, so an older node never measures with its own value in
- * place of the client's.
+ * welcome lists them after the ops. A client sends an environment only to
+ * a node that lists every root the client knows, so an older node never
+ * measures with its own value in place of the client's.
  */
 export const ROOT_CAPABILITIES: readonly string[] = Roots.keyof().options.map(rootCapability);
 
@@ -708,15 +708,12 @@ export function isReplyTo<K extends Op>(reply: Reply, op: K): reply is ReplyTo<K
 
 /**
  * The capabilities, beyond its op, a node must list for `request` to mean
- * what it says, as Rust's `Request::needs()`: one for each root its
- * environment sets.
+ * what it says, as Rust's `Request::needs()`: with an environment, one for
+ * every root this client knows, set or not. A root left unset must be
+ * removed from the tool's environment, never the daemon's own, and a node
+ * that does not know the root would leave the daemon's value in place.
  */
 export function capabilitiesNeeded(request: Request): readonly string[] {
   const env = "env" in request ? request.env : undefined;
-  if (env === undefined) {
-    return [];
-  }
-  return Roots.keyof()
-    .options.filter((root) => env.roots[root] !== undefined)
-    .map(rootCapability);
+  return env === undefined ? [] : ROOT_CAPABILITIES;
 }

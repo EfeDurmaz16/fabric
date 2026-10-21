@@ -21,6 +21,7 @@ import {
   OPS,
   PathDir,
   RefusedError,
+  ROOT_CAPABILITIES,
   SDK_VERSION,
   SnapshotId,
   SystemPath,
@@ -241,8 +242,9 @@ describe("the client", () => {
     expect(received).toHaveLength(1);
   });
 
-  // Review finding on PR #13: a node that does not know a request field ignores it, so a client sends a
+  // Review findings on PR #13: a node that does not know a request field ignores it, so a client sends a
   // root only to a node that lists it, and an older node never measures with its own value in its place.
+  // A root left unset means removed for the tool, which a node that does not know the root never does.
   test("rejects a root the node does not list with UnsupportedField and sends no request", async () => {
     const env = { path: [PathDir.parse("/usr/bin")], roots: { cargo_home: SystemPath.parse("/Users/me/.cargo") } };
     const node = await fakeNode(async (connection) => {
@@ -255,10 +257,21 @@ describe("the client", () => {
     const [received] = await Promise.all(node.connections);
     expect(received).toHaveLength(1);
 
-    // A node that lists the root gets the request.
-    const listing = await fakeNode(async (connection) => {
+    // A node that lists the root the client sets, but not the ones it leaves unset, does not get it either.
+    const partial = await fakeNode(async (connection) => {
       await connection.read();
       connection.send(welcome(["doctor", "env.roots.cargo_home"]));
+    });
+    const unset = await rejection(new FabricClient({ socketPath: partial.socketPath }).doctor({ env }));
+    expect(unset).toBeInstanceOf(UnsupportedFieldError);
+    expect(unset).toMatchObject({ op: "doctor", capability: "env.roots.rustup_home" });
+    const [partialReceived] = await Promise.all(partial.connections);
+    expect(partialReceived).toHaveLength(1);
+
+    // A node that lists every root gets the request.
+    const listing = await fakeNode(async (connection) => {
+      await connection.read();
+      connection.send(welcome(["doctor", ...ROOT_CAPABILITIES]));
       await connection.read();
       connection.send({ type: "done", reply: { kind: "doctor", report: { kind: "facts", facts: [] } } });
       connection.end();
