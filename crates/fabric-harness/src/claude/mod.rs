@@ -1617,6 +1617,48 @@ mod tests {
         assert_eq!(fixture.ran(), None, "claude ran unguarded");
     }
 
+    /// Transcripts of the session under other project keys count: the
+    /// newest writer of any key is the guard's floor, and their model is
+    /// used when the workspace's own transcript names none.
+    #[tokio::test]
+    async fn transcripts_under_other_project_keys_are_read() {
+        let fixture = Resume::new("2.1.294 (Claude Code)");
+        let other = fixture.home.join(".claude/projects/-elsewhere");
+        std::fs::create_dir_all(&other).unwrap();
+        let elsewhere = other.join(format!("{SID}.jsonl"));
+        std::fs::write(
+            &elsewhere,
+            "{\"type\":\"assistant\",\"version\":\"2.1.300\",\"isSidechain\":false,\"message\":{\"model\":\"claude-fable-5\"}}\n",
+        )
+        .unwrap();
+        let refused = fixture.launch().await.unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                HarnessError::HarnessOlderThanSession { local, recorded, .. }
+                    if local.as_str() == "2.1.294" && recorded.as_str() == "2.1.300"
+            ),
+            "{refused}"
+        );
+        assert_eq!(fixture.ran(), None, "the older claude ran");
+
+        std::fs::write(
+            &elsewhere,
+            "{\"type\":\"assistant\",\"version\":\"2.1.294\",\"isSidechain\":false,\"message\":{\"model\":\"claude-fable-5\"}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &fixture.transcript,
+            "{\"type\":\"user\",\"version\":\"2.1.294\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let mut running = fixture.launch().await.unwrap();
+        running.child_mut().wait().await.unwrap();
+        let ran = fixture.ran().unwrap();
+        let model = ran.iter().position(|a| a == "--model").map(|i| &ran[i + 1]);
+        assert_eq!(model.map(String::as_str), Some("claude-fable-5"), "{ran:?}");
+    }
+
     /// The version is asked in the workspace the launch starts claude in,
     /// where a version manager's shim may pin another version than it
     /// picks anywhere else.
