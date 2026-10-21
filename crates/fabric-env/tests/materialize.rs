@@ -126,6 +126,26 @@ fn a_finished_install_runs_nothing() {
     assert!(planned.ready().unwrap().execute(&lock).is_ok());
 }
 
+/// A declared variable is the job's, not only its setup's: a warm resume
+/// that runs no step refuses without it, as a cold one does.
+#[test]
+fn a_plan_with_no_steps_still_needs_the_declared_variables() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
+    let unset = "FABRIC_TEST_UNSET_FOR_A_NOOP_PLAN";
+    let detected = declared(dir.path(), &format!("env = [\"{unset}\"]\nsetup = []\n")).unwrap();
+    let planned = plan(&detected, &lock, &NodeEnv::new(None, Vec::new())).unwrap();
+    assert!(planned.is_noop());
+    match planned.ready() {
+        Err(MaterializeError::CannotRun { programs, env }) => {
+            assert!(programs.is_empty());
+            assert_eq!(env.len(), 1);
+            assert_eq!(env[0].as_str(), unset);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 /// npm, pnpm and Yarn 1 write their own marker before the root package's
 /// lifecycle scripts run, so an install whose `postinstall` fails leaves
 /// the marker over a tree that is not whole. Only the sentinel, written
@@ -637,10 +657,11 @@ fn a_missing_target_does_not_run_a_declared_install() {
     assert_eq!(planned.steps().len(), 1);
 }
 
-/// A cache under a linked directory lies outside the workspace: it is never
-/// judged healthy, and its sentinel is neither written nor removed there.
+/// A cache under a linked directory lies outside the workspace. A step
+/// that fills it would follow the link, as `uv venv` does with a linked
+/// `.venv`, so the plan refuses and nothing beyond the link changes.
 #[test]
-fn a_cache_under_a_linked_directory_gets_no_sentinel() {
+fn a_step_never_fills_a_cache_through_a_link() {
     let outside = tempfile::tempdir().unwrap();
     write(outside.path(), &[("out/x", ""), ("kept/x", "")]).unwrap();
     write(outside.path(), &[("kept/.fabric-installed", "")]).unwrap();
@@ -659,22 +680,77 @@ path = "web/kept"
 class = "build"
 
 [[setup]]
-program = "true"
+program = "touch"
+args = ["web/out/ran"]
 "#,
     )
     .unwrap();
-    let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
-    assert!(
-        planned
-            .caches()
-            .iter()
-            .all(|c| c.health == CacheHealth::NotADirectory),
-        "{:?}",
-        planned.caches()
-    );
-    planned.ready().unwrap().execute(&lock).unwrap();
+    match plan(&detected, &lock, &NodeEnv::current()) {
+        Err(MaterializeError::CacheNotADirectory { path }) => {
+            assert_eq!(path.as_str(), "web/kept");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!outside.path().join("out/ran").exists());
     assert!(!outside.path().join("out").join(SENTINEL).exists());
     assert!(outside.path().join("kept").join(SENTINEL).exists());
+
+    symlink(outside.path().join("out"), dir.path().join(".venv")).unwrap();
+    fs::remove_dir_all(dir.path().join(".fabric")).unwrap();
+    fs::remove_file(dir.path().join("web")).unwrap();
+    write(dir.path(), &[("requirements.txt", "")]).unwrap();
+    let detected = detect(dir.path(), &[]).unwrap();
+    assert!(matches!(
+        plan(&detected, &lock, &NodeEnv::current()),
+        Err(MaterializeError::CacheNotADirectory { .. })
+    ));
+}
+
+/// The sentinel's name is Fabric's; a directory there must not stop every
+/// resume at the removal before the step.
+#[test]
+fn a_directory_at_the_sentinel_name_is_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
+    write(
+        dir.path(),
+        &[("out/x", ""), ("out/.fabric-installed/inner", "")],
+    )
+    .unwrap();
+    let detected = declared(
+        dir.path(),
+        "[[cache]]\npath = \"out\"\nclass = \"build\"\n\n[[setup]]\nprogram = \"true\"\n",
+    )
+    .unwrap();
+    let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
+    assert_eq!(planned.caches()[0].health, CacheHealth::Incomplete);
+    planned.ready().unwrap().execute(&lock).unwrap();
+    let sentinel = fs::symlink_metadata(dir.path().join("out").join(SENTINEL)).unwrap();
+    assert!(sentinel.is_file());
+}
+
+/// A lock file that is a link would lock whatever it names, such as a
+/// workspace file a restore can replace with a new inode, and a second
+/// resume would then take a second lock.
+#[test]
+fn a_lock_file_that_is_a_link_is_refused() {
+    let locks = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), &[("held", "")]).unwrap();
+    let first = TreeLock::acquire(locks.path(), dir.path()).unwrap();
+    drop(first);
+    let entry = fs::read_dir(locks.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::remove_file(&entry).unwrap();
+    symlink(dir.path().join("held"), &entry).unwrap();
+    assert!(matches!(
+        TreeLock::acquire(locks.path(), dir.path()),
+        Err(MaterializeError::LockNotRegular { .. })
+    ));
 }
 
 /// A lock directory inside the workspace is one the workspace can delete,

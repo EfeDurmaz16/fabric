@@ -4,7 +4,9 @@
 //! and nothing else. It reads regular files only: a symbolic link in that
 //! list is refused, because a link can point at a file the secret policy
 //! denies or at one outside the workspace, and either would break the next
-//! rule. It never opens a file the job's secret policy denies, never reads an
+//! rule. It never opens a file the job's secret policy denies, and counts
+//! one it only checks for, such as a lockfile, as absent, since capture
+//! leaves it behind and the next node will not have it. It never reads an
 //! environment variable and never runs a program, so the same files give
 //! the same spec on every node, and the spec it returns has passed
 //! `EnvSpec::validate`. Every tool name and pin it keeps is short,
@@ -23,7 +25,7 @@
 //! | `package.json` with a lockfile | the package manager's install step, `node_modules` as a cache |
 //! | `.yarnrc.yml`, for Yarn 2 and later | `nodeLinker`, which must be `node-modules` |
 //! | `Cargo.toml` | `cargo fetch`, with `--locked` when `Cargo.lock` exists; `target` as a cache |
-//! | `uv.lock`, else `requirements.txt` | `uv sync --frozen`, or a `uv` venv and `uv pip install -r`; `.venv` as a cache |
+//! | `uv.lock`, else `requirements.txt` | `uv sync --frozen`, or a `uv` venv and `uv pip install --python .venv -r`; `.venv` as a cache |
 //! | `go.mod` | `go mod download`; no cache inside the workspace |
 //! | `mise.toml`, `.tool-versions`, `rust-toolchain.toml`, `.node-version`, `.nvmrc`, `.python-version`, `go.mod`, `package.json` | tool pins, in that order of precedence |
 //! | `.devcontainer/devcontainer.json`, `.devcontainer.json` | recorded, not interpreted |
@@ -269,7 +271,8 @@ impl NodeManager {
     /// Returns the lockfile names the manager writes.
     pub(crate) fn lockfiles(self) -> &'static [&'static str] {
         match self {
-            NodeManager::Npm => &["package-lock.json"],
+            // `npm ci` installs from either; npm reads the shrinkwrap when both exist.
+            NodeManager::Npm => &["npm-shrinkwrap.json", "package-lock.json"],
             NodeManager::Pnpm => &["pnpm-lock.yaml"],
             NodeManager::YarnClassic | NodeManager::YarnBerry => &["yarn.lock"],
             NodeManager::Bun => &["bun.lock", "bun.lockb"],
@@ -612,9 +615,9 @@ pub fn detect(root: &Path, recorded: &[SecretPattern]) -> Result<Detection, Dete
             origin: CacheOrigin::Detected,
         });
     }
-    detect_rust(root, &mut setup, &mut caches)?;
-    detect_python(root, &mut setup, &mut caches)?;
-    if exists(root, "go.mod")? {
+    detect_rust(&reader, &mut setup, &mut caches)?;
+    detect_python(&reader, &mut setup, &mut caches)?;
+    if reader.exists("go.mod")? {
         setup.push((step("go", &["mod", "download"])?, StepScope::Outside));
     }
 
@@ -654,7 +657,7 @@ pub fn detect(root: &Path, recorded: &[SecretPattern]) -> Result<Detection, Dete
         caches,
         pins,
         node_manager,
-        devcontainer: find_devcontainer(root)?,
+        devcontainer: find_devcontainer(&reader)?,
     })
 }
 
@@ -841,16 +844,16 @@ fn pin(tool: &str, version: &str, file: &'static str, at: PinAt) -> Option<Pin> 
 }
 
 fn detect_rust(
-    root: &Path,
+    reader: &Reader<'_>,
     setup: &mut Vec<(SetupStep, StepScope)>,
     caches: &mut Vec<FoundCache>,
 ) -> Result<(), DetectError> {
-    if !exists(root, "Cargo.toml")? {
+    if !reader.exists("Cargo.toml")? {
         return Ok(());
     }
     // `--locked` keeps a resume from rewriting Cargo.lock, as the frozen
     // installs do for JavaScript; without a lockfile there is nothing to keep.
-    let args: &[&str] = if exists(root, "Cargo.lock")? {
+    let args: &[&str] = if reader.exists("Cargo.lock")? {
         &["fetch", "--locked"]
     } else {
         &["fetch"]
@@ -870,20 +873,33 @@ fn detect_rust(
 }
 
 fn detect_python(
-    root: &Path,
+    reader: &Reader<'_>,
     setup: &mut Vec<(SetupStep, StepScope)>,
     caches: &mut Vec<FoundCache>,
 ) -> Result<(), DetectError> {
     let venv = rel(".venv")?;
     let fills = || StepScope::Fills(venv.clone());
-    if exists(root, "uv.lock")? {
+    if reader.exists("uv.lock")? {
         setup.push((step("uv", &["sync", "--frozen"])?, fills()));
-    } else if exists(root, "requirements.txt")? {
+    } else if reader.exists("requirements.txt")? {
         // A bare `pip install` would write into whichever Python is first
-        // on PATH; uv puts the packages in the workspace's own `.venv`.
-        setup.push((step("uv", &["venv", "--allow-existing"])?, fills()));
+        // on PATH. Both steps name `.venv`: without `--python`, `uv pip
+        // install` prefers an activated `VIRTUAL_ENV` or `CONDA_PREFIX`
+        // inherited from the shell that runs resume over the workspace's
+        // own `.venv`, and would fill that one instead.
+        setup.push((step("uv", &["venv", "--allow-existing", ".venv"])?, fills()));
         setup.push((
-            step("uv", &["pip", "install", "-r", "requirements.txt"])?,
+            step(
+                "uv",
+                &[
+                    "pip",
+                    "install",
+                    "--python",
+                    ".venv",
+                    "-r",
+                    "requirements.txt",
+                ],
+            )?,
             fills(),
         ));
     } else {
@@ -898,9 +914,9 @@ fn detect_python(
     Ok(())
 }
 
-fn find_devcontainer(root: &Path) -> Result<Option<RelPath>, DetectError> {
+fn find_devcontainer(reader: &Reader<'_>) -> Result<Option<RelPath>, DetectError> {
     for file in [".devcontainer/devcontainer.json", ".devcontainer.json"] {
-        if exists(root, file)? {
+        if reader.exists(file)? {
             tracing::info!(file, "devcontainer found; recorded, not interpreted");
             return Ok(Some(rel(file)?));
         }
@@ -982,7 +998,6 @@ fn choose_node_manager(
     package: &PackageJson,
     declared: Option<PackageManagerName>,
 ) -> Result<Option<ManagerChoice>, DetectError> {
-    let root = reader.root;
     // Ambiguity is decided on the managers that own a present lockfile, not
     // on the file names: Bun's `bun.lock` next to its older `bun.lockb` is
     // one manager, not two.
@@ -990,7 +1005,7 @@ fn choose_node_manager(
     let mut owners = Vec::new();
     for manager in NodeManager::ALL {
         for &file in manager.lockfiles() {
-            if !lockfiles.contains(&file) && exists(root, file)? {
+            if !lockfiles.contains(&file) && reader.exists(file)? {
                 lockfiles.push(file);
                 if !owners.contains(&manager.name()) {
                     owners.push(manager.name());
@@ -1004,7 +1019,7 @@ fn choose_node_manager(
     }
     let berry = match package.yarn_major {
         Some(major) => major >= 2,
-        None => exists(root, ".yarnrc.yml")?,
+        None => reader.exists(".yarnrc.yml")?,
     };
     let resolve = |name| match name {
         PackageManagerName::Npm => NodeManager::Npm,
@@ -1272,6 +1287,32 @@ struct Reader<'a> {
 }
 
 impl Reader<'_> {
+    /// Returns whether `file` is present for detection: absent when the secret policy denies it, else as `exists` says.
+    ///
+    /// Capture leaves a denied file out of the snapshot, so on the next
+    /// node it is not there. Counting it here would give the source a spec
+    /// the target cannot derive, such as an `npm ci` for a lockfile that
+    /// never arrives.
+    fn exists(&self, file: &'static str) -> Result<bool, DetectError> {
+        if self.denied(file)? {
+            return Ok(false);
+        }
+        exists(self.root, file)
+    }
+
+    /// Returns true when the secret policy denies `file`, and logs which pattern did.
+    fn denied(&self, file: &'static str) -> Result<bool, DetectError> {
+        let Some(pattern) = self.secrets.denies(&rel(file)?, Scope::Work) else {
+            return Ok(false);
+        };
+        tracing::warn!(
+            file,
+            pattern,
+            "not read: the secret policy denies this file"
+        );
+        Ok(true)
+    }
+
     /// Reads `file` as text, or `None` when it is absent or the secret policy denies it.
     ///
     /// Refuses a name missing from `READ_FILES` as a bug in this module.
@@ -1279,12 +1320,7 @@ impl Reader<'_> {
         if !READ_FILES.contains(&file) {
             return Err(DetectError::BuiltIn { name: file });
         }
-        if let Some(pattern) = self.secrets.denies(&rel(file)?, Scope::Work) {
-            tracing::warn!(
-                file,
-                pattern,
-                "not read: the secret policy denies this file"
-            );
+        if self.denied(file)? {
             return Ok(None);
         }
         read_text(self.root, file)

@@ -31,7 +31,10 @@
 //! steps run on every resume; declaring a `[[cache]]` is how a user makes
 //! them skip. A `node_modules` the user installed by hand has no sentinel,
 //! so the first resume after it installs once more; that is the price of
-//! never trusting a tree no step was seen to finish.
+//! never trusting a tree no step was seen to finish. A cache a planned step
+//! fills that is a link, lies under one, or is not a directory stops the
+//! plan: the installer would follow the link and fill a directory outside
+//! the workspace.
 //!
 //! The restore that runs before materialize writes a carried cache only when
 //! its carry key matches this node (ADR 0012), so what is on disk is what
@@ -79,7 +82,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, TryLockError};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -133,6 +136,12 @@ pub enum MaterializeError {
         /// The IO error.
         #[source]
         source: io::Error,
+    },
+    /// The lock file is a link or not a regular file, so locking it could lock another file.
+    #[error("the lock `{}` is a link or not a regular file; remove it", lock.display())]
+    LockNotRegular {
+        /// The lock file.
+        lock: PathBuf,
     },
     /// The directory for locks lies inside the workspace, where the workspace could delete a lock.
     #[error("the lock directory `{}` lies inside the workspace `{}`", locks.display(), root.display())]
@@ -199,6 +208,14 @@ pub enum MaterializeError {
         programs: Vec<(usize, ProgramName)>,
         /// Every declared variable that is not set.
         env: Vec<EnvVarName>,
+    },
+    /// A cache a planned step fills is a link, lies under one, or is not a directory, so the step would write through it.
+    #[error(
+        "cache `{path}` is a link, lies under one, or is not a directory, and a setup step would write through it; nothing ran; replace it with a real directory or remove it"
+    )]
+    CacheNotADirectory {
+        /// The cache path.
+        path: RelPath,
     },
     /// A step's program did not start.
     #[error("setup step {index} (`{program}`) did not start")]
@@ -350,14 +367,10 @@ impl Plan {
 
     /// Turns the plan into steps that can run, or refuses with every missing program and variable named.
     ///
-    /// A plan with no steps is ready whatever this node lacks, since nothing will run.
+    /// A declared variable is refused even when no step runs: the job
+    /// needs it, not only its setup, and a warm node must not launch a
+    /// harness that a cold node would have stopped for the same variable.
     pub fn ready(self) -> Result<Ready, MaterializeError> {
-        if self.steps.is_empty() {
-            return Ok(Ready {
-                root: self.root,
-                steps: Vec::new(),
-            });
-        }
         let mut steps = Vec::with_capacity(self.steps.len());
         let mut missing = Vec::new();
         for planned in self.steps {
@@ -477,16 +490,33 @@ impl TreeLock {
         }
         let name = blake3::hash(root.as_os_str().as_bytes()).to_hex();
         let path = locks.join(format!("{name}.lock"));
+        let open_err = |source| MaterializeError::Lock {
+            lock: path.clone(),
+            source,
+        };
+        let not_regular = || MaterializeError::LockNotRegular { lock: path.clone() };
+        // A link here would lock whatever it names, a file in the workspace
+        // included, whose inode a restore can replace; a FIFO would block
+        // the open. The entry is checked before the open and again after
+        // it, by device and inode, so one swapped in between is refused too.
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if !meta.is_file() => return Err(not_regular()),
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(open_err(source)),
+        }
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&path)
-            .map_err(|source| MaterializeError::Lock {
-                lock: path.clone(),
-                source,
-            })?;
+            .map_err(open_err)?;
+        let opened = file.metadata().map_err(open_err)?;
+        let entry = fs::symlink_metadata(&path).map_err(open_err)?;
+        if !entry.is_file() || entry.dev() != opened.dev() || entry.ino() != opened.ino() {
+            return Err(not_regular());
+        }
         match file.try_lock() {
             Ok(()) => Ok(Self { root, file }),
             Err(TryLockError::WouldBlock) => Err(MaterializeError::TreeBusy { lock: path }),
@@ -600,6 +630,7 @@ pub fn plan(
         });
     }
     assign_sentinels(detected, &mut steps);
+    refuse_linked_fills(&caches, &steps)?;
 
     let missing_env = spec
         .env_var_names
@@ -630,6 +661,28 @@ fn assign_sentinels(detected: &Detection, steps: &mut [PlannedStep]) {
             steps[last].sentinels.write.push(cache.path.clone());
         }
     }
+}
+
+/// Refuses when a planned step would fill a cache that is a link, lies under one, or is not a directory.
+///
+/// An installer follows the link: `uv venv --allow-existing .venv` with
+/// `.venv -> ~/venvs/other` initializes that directory, and the install
+/// after it fills it, so a resume would change an environment outside the
+/// workspace. Each cache a planned step fills is cleared by exactly one of
+/// them, so the clear lists name each such cache once.
+fn refuse_linked_fills(
+    caches: &[CacheReport],
+    steps: &[PlannedStep],
+) -> Result<(), MaterializeError> {
+    for path in steps.iter().flat_map(|step| &step.sentinels.clear) {
+        if caches
+            .iter()
+            .any(|c| &c.path == path && c.health == CacheHealth::NotADirectory)
+        {
+            return Err(MaterializeError::CacheNotADirectory { path: path.clone() });
+        }
+    }
+    Ok(())
 }
 
 /// What lies at a cache path, read without following a link in any component.
@@ -697,22 +750,38 @@ fn clear_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
     let Found::Dir(dir) = find_dir(root, path).map_err(sentinel_err)? else {
         return Ok(());
     };
-    match fs::remove_file(dir.join(SENTINEL)) {
-        Err(err) if err.kind() != io::ErrorKind::NotFound => Err(sentinel_err(err)),
-        _ => Ok(()),
+    remove_entry(&dir.join(SENTINEL)).map_err(sentinel_err)
+}
+
+/// Removes whatever is at `path` without following a link: a directory with all it holds, anything else as a file.
+///
+/// The sentinel's name inside a cache is Fabric's, so a directory there,
+/// such as one an archive unpacked, would otherwise make every resume fail
+/// on the same `remove_file`. `remove_dir_all` does not follow links inside
+/// the directory.
+fn remove_entry(path: &Path) -> io::Result<()> {
+    let removed = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(err) => Err(err),
+    };
+    match removed {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
 }
 
 /// Writes the sentinel of the cache at `path` when the steps left a real directory there, reached through real directories.
 ///
-/// A cache the steps did not create, or one that is or lies under a link,
-/// gets no sentinel: the next plan sees it missing or not a directory and
-/// fills it again, which costs time and never writes outside the workspace.
+/// A cache the steps did not create, or one they left as or under a link,
+/// gets no sentinel: the next plan sees it missing, or refuses it as not a
+/// directory, and never writes outside the workspace. `plan` refuses a
+/// filled cache that is a link before any step runs.
 /// A regular file the steps left at the sentinel's name, such as one
 /// unpacked from an archive of a whole cache, is kept: the steps exited 0,
-/// which is all the sentinel says. Anything else there, a link included,
-/// is removed and the sentinel created in its place, so a link is never
-/// followed.
+/// which is all the sentinel says. Anything else there, a link or a
+/// directory included, is removed and the sentinel created in its place,
+/// so a link is never followed.
 ///
 /// Nothing is synced. The sentinel proves completion across a `kill -9`,
 /// where the kernel keeps every write, but not across a power loss or a
@@ -744,7 +813,7 @@ fn write_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
             {
                 return Ok(());
             }
-            fs::remove_file(&sentinel).map_err(sentinel_err)?;
+            remove_entry(&sentinel).map_err(sentinel_err)?;
             create().map_err(sentinel_err)?
         }
         Err(err) => return Err(sentinel_err(err)),
