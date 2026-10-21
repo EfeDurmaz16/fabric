@@ -1,8 +1,9 @@
 //! What `Client` does with each kind of answer, against a scripted node on
 //! a temporary socket: an event of an unknown kind is skipped, a reply for
-//! another op is refused, an incompatible node and an op the node does not
-//! list stop the call before the request is sent, and a node that closes
-//! after the hello reads as an older node.
+//! another op is refused, an incompatible node, a welcome of another api
+//! version and an op the node does not list stop the call before the
+//! request is sent, and a node that closes after the hello reads as an
+//! older node.
 
 use std::error::Error;
 use std::os::unix::fs::PermissionsExt;
@@ -125,6 +126,24 @@ async fn an_incompatible_node_gets_no_request() {
         .await;
     assert!(
         matches!(&got, Err(ClientError::Incompatible { client: 1, node: 2, node_version }) if node_version == "0.2.0"),
+        "{got:?}"
+    );
+    assert_eq!(served.await.unwrap().unwrap(), None);
+}
+
+/// ADR 0018, Compatibility rule 1: the client checks the number in the
+/// welcome too, so a node that welcomes it at another api version gets
+/// no request (review finding on PR #13).
+#[tokio::test]
+async fn a_welcome_of_another_api_version_gets_no_request() {
+    let mut answer = welcome(&["job_status"]);
+    answer["api"] = json!(2);
+    let (_dir, socket, served) = node(Script::Hello(answer)).unwrap();
+    let got = Client::new(&socket)
+        .call(&status_request().unwrap(), |_| {})
+        .await;
+    assert!(
+        matches!(&got, Err(ClientError::Incompatible { client: 1, node: 2, node_version }) if node_version == "0.1.0"),
         "{got:?}"
     );
     assert_eq!(served.await.unwrap().unwrap(), None);
