@@ -191,10 +191,16 @@ export type RefusalKind = z.infer<typeof RefusalKind>;
 // Records shared by several messages.
 
 /** Which agent drives a job. An unknown kind is an error: a node cannot launch it. */
+/**
+ * What a client launches. A field this client does not know is refused,
+ * not skipped, as in a run plan: a client that dropped one would launch
+ * something else and report the harness without it, which the node
+ * records as the job's (ADR 0018, Compatibility, rule 2).
+ */
 export const Harness = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("claude_code") }),
-  z.object({ kind: z.literal("codex") }),
-  z.object({ kind: z.literal("acp"), program: ProgramName, args: z.array(UnicodeText) }),
+  z.strictObject({ kind: z.literal("claude_code") }),
+  z.strictObject({ kind: z.literal("codex") }),
+  z.strictObject({ kind: z.literal("acp"), program: ProgramName, args: z.array(UnicodeText) }),
 ]);
 export type Harness = z.infer<typeof Harness>;
 
@@ -625,15 +631,21 @@ export type Request = z.infer<typeof Request>;
 export type RequestOf<K extends Op> = Extract<Request, { op: K }>;
 
 /** One ACP agent's settings in the node's `harness.toml`. */
-export const AcpSettings = z.object({ state_dir: Path });
+export const AcpSettings = z.strictObject({ state_dir: Path });
 export type AcpSettings = z.infer<typeof AcpSettings>;
 
 /** The node's harness configuration, which a launch from a run plan must use. */
-export const HarnessConfig = z.object({
+export const HarnessConfig = z.strictObject({
   acp: z.record(UnicodeText, AcpSettings).default(() => ({})),
 });
 export type HarnessConfig = z.infer<typeof HarnessConfig>;
 
+/**
+ * The fields of a run plan. A plan, its harness and its harness config
+ * refuse a field this client does not know: the launch must apply every
+ * setting, and one dropped would launch a harness configured otherwise
+ * than the node captures and restores it (ADR 0018, Compatibility, rule 2).
+ */
 const runPlan = {
   job: JobId,
   epoch: Epoch,
@@ -668,8 +680,8 @@ export const Reply = z.discriminatedUnion("kind", [
     records: count,
   }),
   z.object({ kind: z.literal("job_log"), left_out: count.default(0), records: z.array(LogRecord) }),
-  z.object({ kind: z.literal("job_run"), ...runPlan }),
-  z.object({ kind: z.literal("job_resume"), ...runPlan }),
+  z.strictObject({ kind: z.literal("job_run"), ...runPlan }),
+  z.strictObject({ kind: z.literal("job_resume"), ...runPlan }),
   z.object({ kind: z.literal("job_suspend"), snapshot: SnapshotId }),
   z.object({ kind: z.literal("job_move"), ...lease }),
   z.object({ kind: z.literal("job_steal"), ...lease }),

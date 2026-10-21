@@ -115,7 +115,7 @@ Errors that happen before the node answers are the client's own, typed in each c
 2. Within one api version, a change is additive:
    - a new op, listed in `Welcome.capabilities`; a client sends an op only when the node lists it and otherwise fails with `Unsupported` before sending;
    - a new optional field in a request, which a node that does not know it ignores, so the node lists it in `Welcome.capabilities` as `<op>.<field>`, or `env.roots.<root>` for a root of the client's environment, and a client sends it only to a node that lists it, failing with `UnsupportedField` otherwise. A root counts as sent whenever `env` is, since leaving it unset asks the node to remove it. A node of api 1 lists its ops and then the four roots;
-   - a new field in a reply, an event or a refusal reason, which readers ignore;
+   - a new field in a reply, an event or a refusal reason, which readers ignore, except in what a client launches: a run plan, its `harness_config` and a harness anywhere it appears. Both clients refuse a field they do not know there, because a client applies every setting of a plan, and one that skipped a new field would launch a harness configured otherwise than the node captures and restores it, then report the harness without the field in `harness_started`, which the node records as the job's. A new field there falls under rule 3;
    - a new event kind, which a client skips: events report progress and never carry the result;
    - a new refusal reason, which a client reads as `unrecognized` with its `kind` and `message` intact, so the exit code and the sentence still work;
    - a new kind of ledger record in `job_log`, which a client reads as `unrecognized`, since a later ledger format may write one.

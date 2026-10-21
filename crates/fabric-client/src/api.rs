@@ -179,11 +179,23 @@ impl fmt::Display for Op {
 
 /// The harness kinds as the client API writes them: `{ "kind": "claude_code" }`,
 /// `{ "kind": "codex" }` or `{ "kind": "acp", "program": ..., "args": [...] }`.
+///
+/// A field this client does not know is refused, not skipped: a harness
+/// says what a client launches, and a client that dropped a field would
+/// launch something else and report the harness without it, which the
+/// node records as the job's (ADR 0018, Compatibility, rule 2).
 #[derive(Serialize, Deserialize)]
-#[serde(remote = "HarnessKind", tag = "kind", rename_all = "snake_case")]
+#[serde(
+    remote = "HarnessKind",
+    tag = "kind",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 enum HarnessDef {
-    ClaudeCode,
-    Codex,
+    // Written with braces so serde refuses a field next to the tag; it
+    // skips any field of a unit variant.
+    ClaudeCode {},
+    Codex {},
     Acp {
         program: fabric_core::harness::ProgramName,
         args: Vec<String>,
@@ -1275,7 +1287,14 @@ pub enum LedgerEvent {
 }
 
 /// What to launch for a job, as the node decided it.
+///
+/// A field this client does not know is refused, not skipped, here and in
+/// [`HarnessConfig`] and [`AcpSettings`]: the launch must apply every
+/// setting of the plan, and a client that dropped one would launch a
+/// harness configured otherwise than the node captures and restores it,
+/// with nothing to tell either side (ADR 0018, Compatibility, rule 2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunPlan {
     /// The job.
     #[serde(with = "text")]
@@ -1300,6 +1319,7 @@ pub struct RunPlan {
 
 /// A node's harness configuration, from its `harness.toml` (ADR 0016).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HarnessConfig {
     /// ACP agents' settings, by program name.
     #[serde(default)]
@@ -1308,6 +1328,7 @@ pub struct HarnessConfig {
 
 /// One ACP agent's settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcpSettings {
     /// Where the agent keeps its sessions; a relative path is under the home.
     pub state_dir: PathBuf,

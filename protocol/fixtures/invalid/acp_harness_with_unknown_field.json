@@ -1,0 +1,18 @@
+{
+  "schema": "request",
+  "value": {
+    "op": "harness_started",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "epoch": 2,
+    "pid": 4242,
+    "harness": {
+      "kind": "acp",
+      "program": "opencode",
+      "args": [
+        "acp"
+      ],
+      "cwd": "/tmp"
+    },
+    "session": "9c9796f0-2682-4546-a963-d314b3ad543f"
+  }
+}

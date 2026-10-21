@@ -1,0 +1,24 @@
+{
+  "schema": "reply",
+  "value": {
+    "kind": "job_run",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "epoch": 2,
+    "root": "/Users/me/fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/work",
+    "harness": {
+      "kind": "claude_code"
+    },
+    "session": "9c9796f0-2682-4546-a963-d314b3ad543f",
+    "goal": "fix the flaky test",
+    "harness_config": {
+      "acp": {
+        "opencode": {
+          "state_dir": ".local/share/opencode/sessions"
+        }
+      }
+    },
+    "env": {
+      "CLAUDE_CONFIG_DIR": "/c"
+    }
+  }
+}
