@@ -193,6 +193,31 @@ async fn capture_follows_the_lineage_and_carries_nothing_else() {
 }
 
 #[tokio::test]
+async fn a_symlinked_codex_store_refuses_capture_and_restore() {
+    let src = build_source();
+    let home = src.home.path().canonicalize().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    node(&home)
+        .capture(&src.work, &thread(), out.path())
+        .await
+        .unwrap();
+    let elsewhere = set_aside(&home, "dotfiles-codex");
+    std::os::unix::fs::symlink(&elsewhere, home.join(".codex")).unwrap();
+    let again = tempfile::tempdir().unwrap();
+    let err = node(&home)
+        .capture(&src.work, &thread(), again.path())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HarnessError::SymlinkInState { .. }), "{err}");
+    assert!(!again.path().join("manifest.json").exists());
+    let err = node(&home)
+        .restore(&src.work, out.path())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HarnessError::SymlinkInState { .. }), "{err}");
+}
+
+#[tokio::test]
 async fn a_missing_prefix_breaks_the_lineage() {
     let src = build_source();
     std::fs::remove_file(&src.prefix).unwrap();

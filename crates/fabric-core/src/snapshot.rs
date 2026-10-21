@@ -53,6 +53,15 @@ pub enum ManifestError {
         /// Zero-based index of the entry, within its tree.
         index: usize,
     },
+    /// A path is both in `files` and in the working-tree commit, which restore writes first, so the second write would collide.
+    #[error("{path} is both in files and in the working-tree commit")]
+    InBothTrees {
+        /// The path.
+        path: RelPath,
+    },
+    /// The git state mixes SHA-1 and SHA-256 object ids, which no one repository can hold.
+    #[error("git state mixes SHA-1 and SHA-256 object ids")]
+    MixedObjectFormat,
     /// A remote URL in the config projection carries a credential (`credential_range`), which is where a token lives.
     #[error("config entry {index} is a remote URL with a credential")]
     SecretInConfig {
@@ -292,7 +301,8 @@ impl CarryKey {
 /// Every name in it is a parsed type from `crate::git`, so a manifest from a
 /// peer cannot hold a config key outside the allowlist, a ref name git would
 /// refuse, or a value that reads as an option on a command line; `validate`
-/// adds that a remote URL carries no credential.
+/// adds that a remote URL carries no credential and that every object id has
+/// the same width, one object format for the whole repository.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitState {
     /// The objects of the git bundle, full or incremental.
@@ -379,6 +389,33 @@ impl SnapshotManifest {
                 git.worktree_mtimes.iter().map(|(p, _)| p),
             )?;
             check_sorted("config", git.config.iter().map(|(key, _)| key))?;
+            // SHA-1 and SHA-256 repositories do not interoperate, so a state
+            // that mixes the two widths cannot be restored into any one repository.
+            let sha256 = git.index_commit.is_sha256();
+            let detached = match &git.head {
+                GitHead::Detached(oid) => Some(oid),
+                GitHead::Branch(_) => None,
+            };
+            let mixed = std::iter::once(&git.worktree_commit)
+                .chain(detached)
+                .chain(git.refs.iter().map(|(_, oid)| oid))
+                .any(|oid| oid.is_sha256() != sha256);
+            if mixed {
+                return Err(ManifestError::MixedObjectFormat);
+            }
+            // Restore checks out W, whose paths `worktree_mtimes` lists, and
+            // then creates `files` exclusively; a shared path never restores.
+            for entry in &self.files {
+                if git
+                    .worktree_mtimes
+                    .binary_search_by(|(path, _)| path.cmp(&entry.rel_path))
+                    .is_ok()
+                {
+                    return Err(ManifestError::InBothTrees {
+                        path: entry.rel_path.clone(),
+                    });
+                }
+            }
             // ADR 0004 strips credentials at capture; the receiving node holds
             // the same line, or a token in remote.origin.url would be written
             // into every target's .git/config.

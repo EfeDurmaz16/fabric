@@ -27,6 +27,7 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::credential::looks_like_credential;
 use crate::env::OVERRIDE_FILE;
 use crate::path::RelPath;
 
@@ -58,6 +59,12 @@ pub enum SecretPatternError {
     /// pattern comes from: the override file or a peer's spec.
     #[error("secret pattern matches {OVERRIDE_FILE}, which detection must be able to read")]
     DeniesOverrideFile,
+    /// The pattern is shaped like a credential, such as a token pasted in by mistake.
+    ///
+    /// Patterns travel in the job's spec to other nodes, so a token here
+    /// would leave the node the way the policy exists to prevent.
+    #[error("secret pattern is shaped like a credential; patterns travel in the spec")]
+    Credential,
     /// Encoded bytes hold an ASCII capital, which no stored pattern has.
     #[error("secret pattern has an ASCII capital at index {index}; stored patterns are lowercase")]
     NotLowercase {
@@ -70,7 +77,8 @@ pub enum SecretPatternError {
 ///
 /// Refused: `\`, `[`, `]`, `?`, `!`, `#`, whitespace and NUL, because
 /// gitignore gives them meanings the matcher does not; empty, `.`, `..`
-/// and `**` components; and any pattern that denies `OVERRIDE_FILE`.
+/// and `**` components; any pattern that denies `OVERRIDE_FILE`; and
+/// any pattern shaped like a credential, since patterns travel in the spec.
 /// Checked once, at the boundary, including inside `Deserialize`.
 ///
 /// Matching ignores ASCII case, so the stored form is ASCII lowercase:
@@ -100,6 +108,10 @@ impl SecretPattern {
                 "**" => return Err(SecretPatternError::DoubleStar),
                 _ => {}
             }
+        }
+        // Checked before folding: some shapes, such as `AKIA`, are capitals.
+        if looks_like_credential(text) {
+            return Err(SecretPatternError::Credential);
         }
         let pattern = Self(text.to_ascii_lowercase());
         if pattern_matches(&pattern, OVERRIDE_FILE) {
@@ -409,15 +421,27 @@ fn pattern_matches(pattern: &SecretPattern, path: &str) -> bool {
 
 /// Returns true when the components of `pattern` match a run of `names`, the components of a path.
 ///
-/// A component equal to one of `exempt`, ignoring ASCII case, matches no glob.
+/// The last component of the path, when it equals one of `exempt`
+/// ignoring ASCII case, matches no glob. Only the last: a template is a
+/// file, and a directory that takes a template's name, such as
+/// `.env.example/password.txt`, denies what it holds like any other match.
 fn path_matches(pattern: &str, names: &[&str], exempt: &[&str]) -> bool {
-    let len = pattern.split('/').count();
-    names.windows(len).any(|window| {
-        window.iter().zip(pattern.split('/')).all(|(name, glob)| {
-            glob_matches(glob.as_bytes(), name.as_bytes())
-                && !exempt.iter().any(|e| e.eq_ignore_ascii_case(name))
+    let globs: Vec<&str> = pattern.split('/').collect();
+    let last = names.len().saturating_sub(1);
+    names
+        .windows(globs.len())
+        .enumerate()
+        .any(|(start, window)| {
+            window
+                .iter()
+                .zip(&globs)
+                .enumerate()
+                .all(|(offset, (name, glob))| {
+                    glob_matches(glob.as_bytes(), name.as_bytes())
+                        && !(start + offset == last
+                            && exempt.iter().any(|e| e.eq_ignore_ascii_case(name)))
+                })
         })
-    })
 }
 
 /// Matches one component: `*` is any run of bytes, every other byte matches itself ignoring ASCII case.
@@ -551,7 +575,8 @@ mod tests {
     }
 
     /// Env templates are committed work; `.env.*` must not deny them, in any
-    /// case or depth, while a job can still add one by name.
+    /// case or depth, while a job can still add one by name. A directory
+    /// with a template's name is not a template, so what it holds is denied.
     #[test]
     fn env_templates_travel_unless_a_job_names_them() {
         let mut policy = SecretPolicy::default();
@@ -566,6 +591,10 @@ mod tests {
         }
         assert_eq!(
             policy.denies(&path(".env.production"), Scope::Work),
+            Some(".env.*")
+        );
+        assert_eq!(
+            policy.denies(&path(".env.example/password.txt"), Scope::Work),
             Some(".env.*")
         );
         policy.widen(SecretPattern::parse(".env.example").unwrap());
@@ -594,6 +623,22 @@ mod tests {
 
     /// The built-in list obeys the rules a job's patterns are held to, so
     /// one matcher serves both.
+    /// A token pasted into `secret_patterns` would travel in the spec, so
+    /// it is refused before it is folded and stored, from a file or a peer.
+    #[test]
+    fn a_credential_shaped_pattern_is_refused() {
+        let github = format!("ghp_{}", "a1".repeat(18));
+        for text in [github.as_str(), "AKIAIOSFODNN7EXAMPLE"] {
+            assert_eq!(
+                SecretPattern::parse(text),
+                Err(SecretPatternError::Credential),
+                "{text}"
+            );
+        }
+        let bytes = postcard::to_stdvec(&github).unwrap();
+        assert!(postcard::from_bytes::<SecretPattern>(&bytes).is_err());
+    }
+
     #[test]
     fn every_builtin_is_a_valid_pattern() {
         for builtin in EVERYWHERE.iter().chain(OUTSIDE_CACHES) {

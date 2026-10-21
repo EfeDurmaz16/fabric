@@ -713,6 +713,25 @@ async fn a_symlink_in_session_state_refuses_the_capture() {
 }
 
 #[tokio::test]
+async fn a_symlinked_claude_directory_refuses_the_capture() {
+    let src = build_source("w");
+    let home = src.home.path().canonicalize().unwrap();
+    let elsewhere = home.join("dotfiles-claude");
+    std::fs::rename(home.join(".claude"), &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, home.join(".claude")).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let err = node(&home)
+        .capture(&src.work, &session(), out.path())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, HarnessError::SymlinkInState { ref path } if path == &home.join(".claude")),
+        "{err}"
+    );
+    assert!(regular_files(out.path()).is_empty(), "nothing was staged");
+}
+
+#[tokio::test]
 async fn a_symlink_on_the_way_to_a_destination_refuses_the_restore() {
     // The target node keeps its project memory in the workspace through a
     // link; restore must not write MEMORY.md through it.

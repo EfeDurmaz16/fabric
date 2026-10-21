@@ -7,5 +7,12 @@
     "kind": "claude_code"
   },
   "session": "9c9796f0-2682-4546-a963-d314b3ad543f",
-  "goal": "fix the flaky test"
+  "goal": "fix the flaky test",
+  "harness_config": {
+    "acp": {
+      "opencode": {
+        "state_dir": ".local/share/opencode/sessions"
+      }
+    }
+  }
 }

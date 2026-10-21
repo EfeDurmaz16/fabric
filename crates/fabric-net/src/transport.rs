@@ -87,7 +87,10 @@ pub enum TransportError {
 /// One ordered, bidirectional byte stream inside a connection.
 ///
 /// Shutting down the write side tells the peer this side is done writing;
-/// dropping the stream does the same and stops reading.
+/// dropping the stream does the same and stops reading. Dropping it while
+/// a write waits on flow control, as a timed-out write does, cuts the
+/// stream off instead: the bytes not yet sent are dropped, and the peer's
+/// read fails on QUIC or ends short on TCP.
 pub struct Stream {
     send: Box<dyn AsyncWrite + Send + Unpin>,
     recv: Box<dyn AsyncRead + Send + Unpin>,

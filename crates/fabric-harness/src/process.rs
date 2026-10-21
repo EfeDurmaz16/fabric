@@ -7,7 +7,7 @@
 //! no Claude Code or Codex session this process runs under claims it as a
 //! child. A version probe runs with this process's environment minus the
 //! same markers, so even that one short call is no child of a host
-//! session. A question about running processes fails closed:
+//! session, and with `PATH` set to the value the binary was found on. A question about running processes fails closed:
 //! when `pgrep` or `ps` cannot answer, the caller is told so, never "none".
 //! `ps`, `pgrep` and `kill` are run from their system paths, never looked
 //! up on this process's `PATH`, so a planted `ps` cannot report a live
@@ -103,10 +103,15 @@ fn system_tool(
         })
 }
 
-/// Looks `name` up on the given `PATH` value, as a shell would.
+/// Looks `name` up on the given `PATH` value, as a shell would, except
+/// that a relative or empty entry is skipped: it names a directory
+/// relative to whatever the current directory is, which is Fabric's own
+/// here and the workspace once the harness starts, so the file found and
+/// the file launched could differ. The path returned is always absolute.
 #[must_use]
 pub(crate) fn find_on_path(name: &str, path_var: &OsStr) -> Option<PathBuf> {
     std::env::split_paths(path_var)
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(name))
         .find(|candidate| is_executable(candidate))
 }
@@ -116,18 +121,28 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// This process's environment, as far as its names and values are text
-/// a launch env can hold.
-fn own_env() -> Vec<(EnvVarName, String)> {
-    std::env::vars_os()
+/// a launch env can hold, with `PATH` set to `path_var`: the binary was
+/// found on that value, and a shim such as `#!/usr/bin/env node` must find
+/// its interpreter there too, as it will at launch.
+fn probe_env(path_var: &OsStr) -> Vec<(EnvVarName, String)> {
+    let mut env: Vec<(EnvVarName, String)> = std::env::vars_os()
         .filter_map(|(name, value)| {
             let name = EnvVarName::parse(name.to_str()?).ok()?;
             Some((name, value.into_string().ok()?))
         })
-        .collect()
+        .filter(|(name, _)| name.as_str() != "PATH")
+        .collect();
+    if let (Ok(name), Some(value)) = (EnvVarName::parse("PATH"), path_var.to_str()) {
+        env.push((name, value.to_owned()));
+    }
+    env
 }
 
 /// Runs `binary args...` with `env` minus its parent-session markers and
-/// returns trimmed stdout, within `PROBE_TIMEOUT`.
+/// returns trimmed stdout, within `PROBE_TIMEOUT`. A run that exits with
+/// a failure is an error, whatever it printed: a wrapper that prints a
+/// version and then fails to start is not a working install, and its
+/// version must not be trusted.
 async fn probe(
     binary: &Path,
     args: &[&str],
@@ -153,17 +168,30 @@ async fn probe(
             program: program.clone(),
             source,
         })?;
+    if !output.status.success() {
+        return Err(HarnessError::Spawn {
+            program,
+            source: std::io::Error::other(format!(
+                "{} exited with {}",
+                args.join(" "),
+                output.status
+            )),
+        });
+    }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-/// Asks `binary` for its version; `None` when there is no binary. A
-/// binary that answers with no version in its output is still installed,
-/// with `version` set to `None`.
-pub(crate) async fn detect(binary: Option<PathBuf>) -> Result<Option<Installed>, HarnessError> {
+/// Asks `binary`, found on the `PATH` value `path_var`, for its version;
+/// `None` when there is no binary. A binary that answers with no version
+/// in its output is still installed, with `version` set to `None`.
+pub(crate) async fn detect(
+    binary: Option<PathBuf>,
+    path_var: &OsStr,
+) -> Result<Option<Installed>, HarnessError> {
     let Some(path) = binary else {
         return Ok(None);
     };
-    let raw = probe(&path, &["--version"], &own_env()).await?;
+    let raw = probe(&path, &["--version"], &probe_env(path_var)).await?;
     Ok(Some(Installed {
         version: version_token(&raw).map(str::to_owned),
         raw,
@@ -173,8 +201,12 @@ pub(crate) async fn detect(binary: Option<PathBuf>) -> Result<Option<Installed>,
 
 /// The version `binary` reports, or `None` when there is no binary or the
 /// probe fails; a failed probe is logged, never fatal.
-pub(crate) async fn installed_version(binary: Option<PathBuf>, program: &str) -> Option<String> {
-    match detect(binary).await {
+pub(crate) async fn installed_version(
+    binary: Option<PathBuf>,
+    path_var: &OsStr,
+    program: &str,
+) -> Option<String> {
+    match detect(binary, path_var).await {
         Ok(installed) => installed.and_then(|i| i.version),
         Err(e) => {
             tracing::warn!(program, error = %e, "version probe failed");
@@ -443,6 +475,21 @@ async fn pgrep(args: &[&OsStr]) -> Result<Vec<u32>, HarnessError> {
     }
 }
 
+/// `text` as an extended regular expression that matches only itself:
+/// `pgrep` reads its operand as a pattern, and a path may hold `[`, `(`
+/// or `.`.
+fn ere_literal(text: &OsStr) -> std::ffi::OsString {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let mut out = Vec::with_capacity(text.len());
+    for &byte in text.as_bytes() {
+        if b"\\.[]()*+?{}|^$".contains(&byte) {
+            out.push(b'\\');
+        }
+        out.push(byte);
+    }
+    std::ffi::OsString::from_vec(out)
+}
+
 /// Process ids of running processes named exactly `name`, plus those whose
 /// command line names `binary` (an npm-installed harness runs as `node`
 /// with the script path on its command line).
@@ -453,7 +500,8 @@ pub(crate) async fn running_pids(
     let mut pids = pgrep(&[OsStr::new("-x"), OsStr::new(name)]).await?;
     if let Some(binary) = binary {
         let physical = std::fs::canonicalize(binary).unwrap_or_else(|_| binary.to_path_buf());
-        pids.extend(pgrep(&[OsStr::new("-f"), physical.as_os_str()]).await?);
+        let pattern = ere_literal(physical.as_os_str());
+        pids.extend(pgrep(&[OsStr::new("-f"), &pattern]).await?);
     }
     let own = std::process::id();
     pids.retain(|pid| *pid != own);
@@ -540,6 +588,27 @@ mod tests {
         assert_eq!(find_on_path("tool", OsStr::new("")), None);
     }
 
+    #[test]
+    fn find_on_path_skips_relative_and_empty_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("tool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The test runs from the crate directory; a relative entry that
+        // reaches the tool from there must not count.
+        let cwd = std::env::current_dir().unwrap();
+        let up: PathBuf = cwd.components().skip(1).map(|_| "..").collect();
+        let relative = up.join(dir.path().strip_prefix("/").unwrap());
+        assert!(
+            relative.join("tool").exists(),
+            "the relative entry reaches the tool"
+        );
+        let var = std::env::join_paths([relative.as_path(), Path::new("")]).unwrap();
+        assert_eq!(find_on_path("tool", &var), None);
+        let var = std::env::join_paths([relative.as_path(), dir.path()]).unwrap();
+        assert_eq!(find_on_path("tool", &var), Some(tool));
+    }
+
     /// The role a run of `running_pids_sees_a_claude_this_process_runs_under` plays.
     const ANCESTOR_ROLE: &str = "FABRIC_TEST_ANCESTOR_ROLE";
 
@@ -587,6 +656,65 @@ mod tests {
         let seen = probe(&binary, &[], &env).await.unwrap();
         assert!(seen.contains("FABRIC_PROBE_KEPT=1"), "{seen}");
         assert!(!seen.contains("CLAUDECODE"), "{seen}");
+    }
+
+    #[tokio::test]
+    async fn a_version_probe_that_exits_with_a_failure_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("tool");
+        std::fs::write(&binary, "#!/bin/sh\necho 'tool 1.2.3'\nexit 1\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = detect(Some(binary.clone()), OsStr::new("/usr/bin:/bin"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HarnessError::Spawn { .. }), "{err}");
+        assert_eq!(
+            installed_version(Some(binary), OsStr::new("/usr/bin:/bin"), "tool").await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_version_probe_finds_an_interpreter_on_the_configured_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let interp = dir.path().join("fabric-test-interp");
+        std::fs::write(&interp, "#!/bin/sh\necho 'tool 4.5.6'\n").unwrap();
+        std::fs::set_permissions(&interp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let binary = dir.path().join("tool");
+        std::fs::write(&binary, "#!/usr/bin/env fabric-test-interp\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path_var =
+            std::env::join_paths([dir.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        let installed = detect(Some(binary), &path_var).await.unwrap().unwrap();
+        assert_eq!(installed.version.as_deref(), Some("4.5.6"));
+    }
+
+    #[test]
+    fn ere_literal_escapes_every_metacharacter() {
+        assert_eq!(
+            ere_literal(OsStr::new("/a.b/[x](y)*+?{1}|^$\\")),
+            OsStr::new("/a\\.b/\\[x\\]\\(y\\)\\*\\+\\?\\{1\\}\\|\\^\\$\\\\")
+        );
+    }
+
+    #[tokio::test]
+    async fn running_pids_finds_a_script_whose_path_holds_regex_characters() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("lib[1](x)");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = std::fs::canonicalize(&bin).unwrap().join("claude.js");
+        std::fs::write(&script, "").unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30; :")
+            .arg(&script)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let pids = running_pids("fabric-no-such-name", Some(&script)).await;
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(pids.unwrap().contains(&pid), "the writer was missed");
     }
 
     #[tokio::test]

@@ -144,13 +144,19 @@ fn cargo_fetch_is_locked_exactly_when_a_lockfile_exists() {
 
 #[test]
 fn each_lockfile_names_its_manager_and_install() {
-    let cases: [(&[&str], NodeManager, &str); 7] = [
+    let cases: [(&[&str], NodeManager, &str); 9] = [
         (
             &["pnpm-lock.yaml"],
             NodeManager::Pnpm,
             "pnpm install --frozen-lockfile",
         ),
         (&["package-lock.json"], NodeManager::Npm, "npm ci"),
+        (&["npm-shrinkwrap.json"], NodeManager::Npm, "npm ci"),
+        (
+            &["npm-shrinkwrap.json", "package-lock.json"],
+            NodeManager::Npm,
+            "npm ci",
+        ),
         (
             &["yarn.lock"],
             NodeManager::YarnClassic,
@@ -404,8 +410,8 @@ fn python_installs_into_the_workspace_venv() {
     assert_eq!(
         commands(&detect(requirements.path(), &[]).unwrap()),
         [
-            "uv venv --allow-existing",
-            "uv pip install -r requirements.txt"
+            "uv venv --allow-existing .venv",
+            "uv pip install --python .venv -r requirements.txt"
         ]
     );
 }
@@ -808,4 +814,25 @@ fn a_file_the_job_denies_is_not_read() {
     let found = detect(dir.path(), &[]).unwrap();
     assert!(found.pins().is_empty());
     assert!(found.spec().tools.is_empty());
+}
+
+/// Capture leaves a denied lockfile behind, so the source must detect as
+/// the target will, without it: no install for a lockfile that never
+/// arrives, and no `--locked` for a `Cargo.lock` that stays home.
+#[test]
+fn a_lockfile_the_job_denies_counts_as_absent() {
+    let dir = workspace(&[
+        ("package.json", PACKAGE_JSON),
+        ("package-lock.json", "{}"),
+        ("Cargo.toml", "[package]\nname = \"x\"\n"),
+        ("Cargo.lock", ""),
+        (
+            ".fabric/env.toml",
+            "secret_patterns = [\"package-lock.json\", \"cargo.lock\"]\n",
+        ),
+    ])
+    .unwrap();
+    let found = detect(dir.path(), &[]).unwrap();
+    assert_eq!(commands(&found), ["cargo fetch"]);
+    assert_eq!(found.node_manager(), None);
 }

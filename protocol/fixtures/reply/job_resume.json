@@ -6,5 +6,8 @@
   "harness": {
     "kind": "claude_code"
   },
-  "goal": "fix the flaky test"
+  "goal": "fix the flaky test",
+  "harness_config": {
+    "acp": {}
+  }
 }

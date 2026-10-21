@@ -104,6 +104,10 @@ pub(crate) fn event(event: &Event) -> Vec<String> {
         Event::HolderNotTold { holder, error } => format!(
             "{holder} has not seen the import yet ({error}); it will ask for the decision"
         ),
+        Event::WorkspaceGone { root } => format!(
+            "the clean workspace at {} is gone; restoring the latest snapshot",
+            root.display()
+        ),
         Event::WorkspaceInPlace { root } => format!("workspace already at {}", root.display()),
         Event::RootChosen {
             root,
@@ -263,19 +267,26 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
             )
             .collect(),
         Reply::JobStatus(status) => job_status(status),
-        Reply::JobLog(log) => log
-            .records
-            .iter()
-            .enumerate()
-            .map(|(n, record)| {
+        Reply::JobLog(log) => {
+            let left_out = usize::try_from(log.left_out).unwrap_or(usize::MAX);
+            let cut = (left_out > 0).then(|| {
                 format!(
-                    "{n:>4} epoch {} at {} {}",
-                    record.epoch,
-                    record.at,
-                    ledger_event(&record.event)
+                    "the first {left_out} records are left out; the latest {} fill one answer",
+                    log.records.len()
                 )
-            })
-            .collect(),
+            });
+            cut.into_iter()
+                .chain(log.records.iter().enumerate().map(|(n, record)| {
+                    format!(
+                        "{:>4} epoch {} at {} {}",
+                        left_out.saturating_add(n),
+                        record.epoch,
+                        record.at,
+                        ledger_event(&record.event)
+                    )
+                }))
+                .collect()
+        }
         Reply::JobDecide(decided) => vec![format!("recorded: {}", decided.text)],
         Reply::Doctor {
             report: DoctorReport::Facts { facts },

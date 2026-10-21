@@ -263,6 +263,9 @@ pub enum NodeError {
     /// The ignore policy refused a pattern.
     #[error(transparent)]
     Policy(#[from] fabric_store::policy::PolicyError),
+    /// The workspace's environment could not be detected, so no node could materialize it.
+    #[error("environment detection: {0}")]
+    Detect(#[from] fabric_env::detect::DetectError),
     /// Capture failed.
     #[error(transparent)]
     Capture(#[from] fabric_store::capture::CaptureError),
@@ -416,6 +419,7 @@ impl NodeError {
             | NodeError::Paths(_)
             | NodeError::Store(_)
             | NodeError::Policy(_)
+            | NodeError::Detect(_)
             | NodeError::Capture(_)
             | NodeError::Restore(_)
             | NodeError::Harness(_)

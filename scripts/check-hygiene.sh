@@ -18,8 +18,10 @@ status=0
 em_dash=$(printf '\342\200\224')
 # One pattern for files and commit messages, matched without regard to case.
 # It is anchored at the line start so prose that names the rule, such as
-# "No Co-Authored-By", does not match.
-attribution='^(co-authored-by:|[^a-z0-9]*generated with )'
+# "No Co-Authored-By", does not match. It covers the co-authored-by trailer
+# and generated-by or generated-with lines, as a trailer with a colon or as
+# prose with a space.
+attribution='^(co-authored-by:|[^a-z0-9]*generated[ -](with|by)[: ])'
 
 if git grep -nI -e "$em_dash" ; then
   echo "error: em dash in a tracked file" >&2

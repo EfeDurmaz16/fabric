@@ -48,7 +48,7 @@ pub enum Verify {
 pub enum Durability {
     /// A killed process: the kernel finishes the writes it was given.
     ProcessCrash,
-    /// A power loss: every file restore writes, and the index, refs, packs and config git writes, reach the drive before the rename, and the rename's directory flush empties the drive cache.
+    /// A power loss: every file restore writes, every directory of the staging tree, and the index, refs, packs and config git writes, reach the drive before the rename, and the rename's directory flush empties the drive cache.
     PowerLoss,
 }
 
@@ -380,6 +380,8 @@ fn write_entries(
                     size: *size,
                 });
             }
+            // The mtime goes on before the flush, so the flush carries it too.
+            writer.set_mtime(&entry.rel_path, entry.mtime_ns)?;
             if durability == Durability::PowerLoss {
                 // Plain fsync(2); the parent directory's F_FULLFSYNC after the
                 // rename flushes the device cache once for all of them.
@@ -387,7 +389,6 @@ fn write_entries(
                     .map_err(|e| io_err(Path::new(entry.rel_path.as_str()), e.into()))?;
             }
             drop(file);
-            writer.set_mtime(&entry.rel_path, entry.mtime_ns)?;
             report.files += 1;
             report.bytes += written;
             if report.files == 1 {
@@ -405,16 +406,53 @@ fn write_entries(
             report.files += 1;
         }
     }
+    let sync = durability == Durability::PowerLoss;
     for entry in kept.iter().rev() {
         if matches!(entry.kind, EntryKind::Dir) {
-            writer.set_dir_mode(&entry.rel_path, entry.mode)?;
-            writer.set_mtime(&entry.rel_path, entry.mtime_ns)?;
+            writer.finish_dir(&entry.rel_path, entry.mode, entry.mtime_ns, sync)?;
         }
     }
     Ok(())
 }
 
-/// Re-reads written files against the store and returns how many matched.
+/// Flushes every directory under `root`, and `root` itself, deepest first, without following links; with `files`, every regular file too.
+///
+/// The files restore writes are flushed as they are written, but a file's
+/// flush does not make its name durable: the directory that holds it must
+/// be flushed too, before the rename that publishes the tree. A tree an
+/// earlier run left behind, such as a harness directory a rerun keeps, was
+/// maybe written without any flush, so its files are flushed as well. A
+/// directory this cannot open is one `write_entries` gave a recorded mode
+/// without read permission, and it flushed that one already, children first.
+fn sync_tree(root: &Path, files: bool) -> Result<(), RestoreError> {
+    use rustix::fs::{Mode as RawBits, OFlags};
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let fd = match rustix::fs::open(root, flags, RawBits::empty()) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::ACCESS) => return Ok(()),
+        Err(e) => return Err(io_err(root, e.into())),
+    };
+    for entry in fs::read_dir(root).map_err(|e| io_err(root, e))? {
+        let entry = entry.map_err(|e| io_err(root, e))?;
+        let path = entry.path();
+        let kind = entry.file_type().map_err(|e| io_err(&path, e))?;
+        if kind.is_dir() {
+            sync_tree(&path, files)?;
+        } else if files && kind.is_file() {
+            let file_flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+            let file = rustix::fs::open(&path, file_flags, RawBits::empty())
+                .map_err(|e| io_err(&path, e.into()))?;
+            rustix::fs::fsync(&file).map_err(|e| io_err(&path, e.into()))?;
+        }
+    }
+    rustix::fs::fsync(&fd).map_err(|e| io_err(root, e.into()))
+}
+
+/// Re-reads written entries against the store and returns how many matched.
+///
+/// A file is compared byte for byte, a link by its target, and a directory
+/// must be a directory, so a removed empty directory or a replaced link
+/// fails like a changed file.
 fn verify_entries(
     store: &Store,
     writer: &TreeWriter,
@@ -422,19 +460,30 @@ fn verify_entries(
     skip: &dyn Fn(&RelPath) -> bool,
     mode: Verify,
 ) -> Result<u64, RestoreError> {
-    let files: Vec<&Entry> = entries
-        .iter()
-        .filter(|e| matches!(e.kind, EntryKind::File { .. }) && !skip(&e.rel_path))
-        .collect();
+    let kept: Vec<&Entry> = entries.iter().filter(|e| !skip(&e.rel_path)).collect();
     let mut verified = 0;
-    for entry in sample(&files, mode) {
-        let EntryKind::File { chunks, .. } = &entry.kind else {
-            continue;
-        };
-        let mut file = writer.open_file(&entry.rel_path)?;
+    for entry in sample(&kept, mode) {
         let mismatch = || RestoreError::VerifyFailed {
             path: entry.rel_path.clone(),
         };
+        let chunks = match &entry.kind {
+            EntryKind::File { chunks, .. } => chunks,
+            EntryKind::Dir => {
+                if !writer.is_dir(&entry.rel_path).map_err(|_| mismatch())? {
+                    return Err(mismatch());
+                }
+                verified += 1;
+                continue;
+            }
+            EntryKind::Symlink { target } => {
+                if writer.read_link(&entry.rel_path).map_err(|_| mismatch())? != *target {
+                    return Err(mismatch());
+                }
+                verified += 1;
+                continue;
+            }
+        };
+        let mut file = writer.open_file(&entry.rel_path).map_err(|_| mismatch())?;
         let mut buf = Vec::new();
         for chunk in chunks {
             let expected = store.objects().read(*chunk)?;
@@ -492,8 +541,16 @@ struct TreeItem {
 fn parse_tree(bytes: &[u8]) -> Result<Vec<TreeItem>, RestoreError> {
     let mut items = Vec::new();
     for record in Git::records(bytes) {
-        let text = String::from_utf8_lossy(record).into_owned();
-        let bad = || RestoreError::BadTreeOutput { text: text.clone() };
+        // A name that is not UTF-8 is refused, not rewritten: a lossy
+        // decode would write, and verify, a file under another name.
+        let Ok(text) = std::str::from_utf8(record) else {
+            return Err(RestoreError::BadTreeOutput {
+                text: String::from_utf8_lossy(record).into_owned(),
+            });
+        };
+        let bad = || RestoreError::BadTreeOutput {
+            text: text.to_owned(),
+        };
         let (meta, path) = text.split_once('\t').ok_or_else(bad)?;
         let mut fields = meta.split(' ');
         let mode = fields.next().and_then(TreeMode::parse).ok_or_else(bad)?;
@@ -702,6 +759,38 @@ fn set_refs(git: &Git, git_state: &GitState) -> Result<(), RestoreError> {
     Ok(())
 }
 
+/// Creates the empty repository in the object format of `git_state` and writes its exclude file.
+fn init_repo(
+    store: &Store,
+    git: &Git,
+    git_state: &GitState,
+    power_loss: bool,
+) -> Result<(), RestoreError> {
+    // A SHA-256 repository cannot unpack into a SHA-1 one; the manifest
+    // holds one object format, read from the width of its ids.
+    let format = if git_state.index_commit.is_sha256() {
+        "--object-format=sha256"
+    } else {
+        "--object-format=sha1"
+    };
+    git.run(&["init", "-q", format])?;
+    if let Some(chunks) = &git_state.exclude {
+        let path = git.git_path("info/exclude")?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+        }
+        let mut file = fs::File::create(&path).map_err(|e| io_err(&path, e))?;
+        for chunk in chunks {
+            file.write_all(&store.objects().read(*chunk)?)
+                .map_err(|e| io_err(&path, e))?;
+        }
+        if power_loss {
+            rustix::fs::fsync(&file).map_err(|e| io_err(&path, e.into()))?;
+        }
+    }
+    Ok(())
+}
+
 /// Restores the repository: objects, refs, `HEAD`, the index and the working tree.
 fn restore_git(
     store: &Store,
@@ -721,21 +810,7 @@ fn restore_git(
     if power_loss {
         git = git.with_full_fsync();
     }
-    git.run(&["init", "-q"])?;
-    if let Some(chunks) = &git_state.exclude {
-        let path = git.git_path("info/exclude")?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
-        }
-        let mut file = fs::File::create(&path).map_err(|e| io_err(&path, e))?;
-        for chunk in chunks {
-            file.write_all(&store.objects().read(*chunk)?)
-                .map_err(|e| io_err(&path, e))?;
-        }
-        if power_loss {
-            rustix::fs::fsync(&file).map_err(|e| io_err(&path, e.into()))?;
-        }
-    }
+    init_repo(store, &git, git_state, power_loss)?;
 
     unbundle_chain(store, snapshot, manifest, &git, report)?;
     set_refs(&git, git_state)?;
@@ -790,13 +865,13 @@ fn restore_git(
                         size,
                     });
                 }
+                if let Some(mtime) = mtimes.get(&item.rel) {
+                    writer.set_mtime(&item.rel, *mtime)?;
+                }
                 if power_loss {
                     rustix::fs::fsync(&file).map_err(|e| io_err(path, e.into()))?;
                 }
                 drop(file);
-                if let Some(mtime) = mtimes.get(&item.rel) {
-                    writer.set_mtime(&item.rel, *mtime)?;
-                }
             }
         }
         Ok(())
@@ -1002,7 +1077,11 @@ fn harness_state_complete(
     }
 }
 
-/// The cache paths whose bytes are not written: rows not carried and rows `carry` turns down.
+/// The cache paths whose bytes are not written: rows not wholly carried and rows `carry` turns down.
+///
+/// A `Partial` cache had a secret or an excluded path left out; written, it
+/// would look whole to the tool that reads it, so it is treated as missing
+/// whatever `carry` says.
 fn skipped_caches(
     manifest: &SnapshotManifest,
     carry: &dyn Fn(&CacheEntry) -> bool,
@@ -1010,7 +1089,7 @@ fn skipped_caches(
     manifest
         .caches
         .iter()
-        .filter(|c| c.carry == CarryState::NotCarried || !carry(c))
+        .filter(|c| c.carry != CarryState::Carried || !carry(c))
         .map(|c| c.path.clone())
         .collect()
 }
@@ -1070,7 +1149,13 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
     }
 
     match (req.harness_state, harness_done) {
-        (Some(_), Some(verified)) => report.verified += verified,
+        (Some(dir), Some(verified)) => {
+            // A kept harness directory may come from a ProcessCrash run.
+            if req.durability == Durability::PowerLoss {
+                sync_tree(dir, true)?;
+            }
+            report.verified += verified;
+        }
         (Some(dir), None) => {
             let hs_staging = fresh_staging(dir)?;
             let hs_writer = TreeWriter::open(&hs_staging)?;
@@ -1090,6 +1175,9 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
                 &keep_all,
                 req.verify,
             )?;
+            if req.durability == Durability::PowerLoss {
+                sync_tree(&hs_staging, false)?;
+            }
             move_into_place(&hs_staging, dir)?;
             checkpoint::reached("restore.after_harness_rename");
         }
@@ -1107,6 +1195,9 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
             }
             git.run(&["config", "--local", &key.to_string(), value.as_str()])?;
         }
+    }
+    if req.durability == Durability::PowerLoss {
+        sync_tree(&staging, false)?;
     }
     checkpoint::reached("restore.before_rename");
     move_into_place(&staging, req.target)?;
@@ -1150,6 +1241,20 @@ mod tests {
 
     /// Blobs enough to fill both pipes between this process and git.
     const BLOBS: usize = 300;
+
+    #[test]
+    fn a_tree_name_that_is_not_utf8_is_refused_not_rewritten() {
+        let oid = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+        let mut listing = format!("100644 blob {oid}\tok.txt").into_bytes();
+        listing.push(0);
+        assert_eq!(parse_tree(&listing).unwrap().len(), 1);
+        listing.extend_from_slice(format!("100644 blob {oid}\tbad").as_bytes());
+        listing.extend_from_slice(&[0xff, 0xfe, 0]);
+        assert!(matches!(
+            parse_tree(&listing),
+            Err(RestoreError::BadTreeOutput { .. })
+        ));
+    }
 
     #[test]
     fn a_failing_blob_write_does_not_hang_cat_file() {

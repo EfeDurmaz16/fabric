@@ -387,17 +387,57 @@ impl ObjectStore {
         Ok(file)
     }
 
-    /// Reads and verifies one object.
-    pub fn read(&self, id: ChunkId) -> Result<Vec<u8>, ObjectError> {
+    /// Returns the length an object decompresses to, read from its frame header.
+    ///
+    /// The header is not checked against the bytes here; `read` does that.
+    /// A header that records no length, or one above `MAX_OBJECT_LEN`, is corrupt.
+    pub(crate) fn content_len(&self, id: ChunkId) -> Result<u64, ObjectError> {
+        /// `ZSTD_FRAMEHEADERSIZE_MAX`: no frame header is longer.
+        const FRAME_HEADER_MAX: u64 = 18;
         let path = self.object_path(id);
-        let compressed = match fs::read(&path) {
-            Ok(bytes) => bytes,
+        let file = match open_regular(&path) {
+            Ok(Some(file)) => file,
+            Ok(None) => return Err(ObjectError::Corrupt { id }),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return Err(ObjectError::Missing { id });
             }
             Err(e) => return Err(io_err(&path, e)),
         };
+        let mut head = Vec::new();
+        file.take(FRAME_HEADER_MAX)
+            .read_to_end(&mut head)
+            .map_err(|e| io_err(&path, e))?;
+        match zstd::zstd_safe::get_frame_content_size(&head) {
+            Ok(Some(len)) if len <= u64::from(MAX_OBJECT_LEN) => Ok(len),
+            _ => Err(ObjectError::Corrupt { id }),
+        }
+    }
+
+    /// Reads and verifies one object.
+    ///
+    /// No frame of `MAX_OBJECT_LEN` bytes compresses to more than zstd's
+    /// compression bound for that length, so a longer file is corrupt and is
+    /// refused before it is loaded: a grown file never decides the size of
+    /// the buffer.
+    pub fn read(&self, id: ChunkId) -> Result<Vec<u8>, ObjectError> {
+        let path = self.object_path(id);
         let bound = MAX_OBJECT_LEN as usize;
+        let stored_bound = zstd::zstd_safe::compress_bound(bound) as u64;
+        let file = match open_regular(&path) {
+            Ok(Some(file)) => file,
+            Ok(None) => return Err(ObjectError::Corrupt { id }),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(ObjectError::Missing { id });
+            }
+            Err(e) => return Err(io_err(&path, e)),
+        };
+        let mut compressed = Vec::new();
+        file.take(stored_bound + 1)
+            .read_to_end(&mut compressed)
+            .map_err(|e| io_err(&path, e))?;
+        if compressed.len() as u64 > stored_bound {
+            return Err(ObjectError::Corrupt { id });
+        }
         let capacity = match zstd::zstd_safe::get_frame_content_size(&compressed) {
             Ok(Some(n)) if usize::try_from(n).is_ok_and(|n| n <= bound) => {
                 usize::try_from(n).unwrap_or(bound)

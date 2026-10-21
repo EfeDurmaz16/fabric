@@ -169,6 +169,7 @@ fn event_index(event: &Event) -> usize {
         Event::PeerSilent { .. } => 45,
         Event::LeftAsItWas { .. } => 46,
         Event::Frozen { .. } => 47,
+        Event::WorkspaceGone { .. } => 48,
         Event::Unrecognized => usize::MAX,
     }
 }
@@ -184,7 +185,7 @@ fn every_event_kind_has_a_fixture() {
         !seen.contains(&usize::MAX),
         "a fixture reads as unrecognized"
     );
-    assert_eq!(seen, (0..48).collect(), "event kinds without a fixture");
+    assert_eq!(seen, (0..49).collect(), "event kinds without a fixture");
 }
 
 /// The index of a refusal reason, as `event_index` is for events.

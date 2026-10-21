@@ -978,10 +978,13 @@ pub enum Process {
     },
 }
 
-/// A job's ledger.
+/// A job's ledger, or its latest records when all of them would not fit in one answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobLog {
-    /// Every record, first to last.
+    /// How many of the first records are left out.
+    #[serde(default)]
+    pub left_out: u64,
+    /// The records after those, first to last.
     pub records: Vec<LogRecord>,
 }
 
@@ -1123,6 +1126,25 @@ pub struct RunPlan {
     pub session: Option<SessionId>,
     /// The job's goal, the first message of a new session.
     pub goal: String,
+    /// The node's harness configuration, which the launch must use, so a
+    /// harness runs under the settings the node captures and restores it with.
+    #[serde(default)]
+    pub harness_config: HarnessConfig,
+}
+
+/// A node's harness configuration, from its `harness.toml` (ADR 0016).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessConfig {
+    /// ACP agents' settings, by program name.
+    #[serde(default)]
+    pub acp: std::collections::BTreeMap<String, AcpSettings>,
+}
+
+/// One ACP agent's settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpSettings {
+    /// Where the agent keeps its sessions; a relative path is under the home.
+    pub state_dir: PathBuf,
 }
 
 /// A suspend's result.
@@ -1513,6 +1535,11 @@ pub enum Event {
         holder: NodeId,
         /// Why.
         error: Refusal,
+    },
+    /// The clean workspace at the root is gone, so the latest snapshot is restored.
+    WorkspaceGone {
+        /// The root.
+        root: PathBuf,
     },
     /// The workspace of this tenure is already at its root.
     WorkspaceInPlace {
