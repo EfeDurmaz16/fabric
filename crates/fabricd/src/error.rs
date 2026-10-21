@@ -170,6 +170,17 @@ pub enum NodeError {
         /// The command that finishes it.
         command: &'static str,
     },
+    /// A run or a resume holds the workspace while it runs setup steps or
+    /// launches, or a setup step it started still runs.
+    #[error(
+        "job {job}: a `fabric job run` or `resume` is running setup steps or launching in {root}, or a setup step it started still runs; suspend once the harness has started"
+    )]
+    SetupRunning {
+        /// The job.
+        job: JobId,
+        /// The root.
+        root: PathBuf,
+    },
     /// The job was never suspended, so there is no snapshot to restore or move.
     #[error("job {0} has no snapshot yet; suspend it on its owner first")]
     NoSnapshot(JobId),
@@ -250,6 +261,9 @@ pub enum NodeError {
     /// The workspace's environment could not be detected, so no node could materialize it.
     #[error("environment detection: {0}")]
     Detect(#[from] fabric_env::detect::DetectError),
+    /// The workspace's tree lock could not be taken.
+    #[error(transparent)]
+    Materialize(#[from] fabric_env::materialize::MaterializeError),
     /// Capture failed.
     #[error(transparent)]
     Capture(#[from] fabric_store::capture::CaptureError),
@@ -304,6 +318,7 @@ impl NodeError {
             NodeError::Unreachable { .. } | NodeError::UnknownPeer(_) => Refusal::Unreachable,
             NodeError::Preflight(_) | NodeError::StealNeedsForce(_) => Refusal::NeedsForce,
             NodeError::Unfinished { .. }
+            | NodeError::SetupRunning { .. }
             | NodeError::AlreadyRunningHarness { .. }
             | NodeError::RanDuringMove { .. }
             | NodeError::ChangedDuringMove { .. }

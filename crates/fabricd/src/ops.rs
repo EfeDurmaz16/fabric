@@ -20,6 +20,7 @@ use fabric_core::id::{Epoch, JobId, NodeId, SnapshotId};
 use fabric_core::lease::{FenceError, FencingToken};
 use fabric_core::ledger::{Author, EventKind, Ledger};
 use fabric_core::moves::{CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
+use fabric_env::materialize::{MaterializeError, TreeLock};
 use fabric_harness::manifest::{MANIFEST_FILE, StateManifest};
 use fabric_harness::{HarnessError, SessionId};
 use fabric_net::peers::HostPort;
@@ -647,6 +648,13 @@ impl Node {
                 command: "resume",
             });
         }
+        // The CLI holds the tree's lock from its first setup step until
+        // the harness it launched is recorded, and a setup step holds it
+        // while it runs, so neither shows as a harness to stop. Taking the
+        // lock refuses a capture of a tree an installer is still writing,
+        // and holding it to the end keeps a run from starting setup while
+        // the capture reads.
+        let _tree = self.lock_tree(id, &marker.root)?;
         if let Some(record) = job.harness_record()? {
             if record.liveness().await != Liveness::Gone {
                 out.say(format!("stopping the harness, pid {}", record.pid));
@@ -703,6 +711,23 @@ impl Node {
             job.ledger().lease().epoch()
         ));
         Ok(snapshot)
+    }
+
+    /// Takes the lock `fabric job run` and `resume` hold over the tree at
+    /// `root` while they run setup steps and launch; `None` when the root is
+    /// gone, since nothing can run setup in it.
+    fn lock_tree(&self, job: JobId, root: &Path) -> Result<Option<TreeLock>, NodeError> {
+        if !root.exists() {
+            return Ok(None);
+        }
+        match TreeLock::acquire(&self.cfg.state.tree_locks(), root) {
+            Ok(lock) => Ok(Some(lock)),
+            Err(MaterializeError::TreeBusy { .. }) => Err(NodeError::SetupRunning {
+                job,
+                root: root.to_owned(),
+            }),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Tells the adapter that the snapshot holding its capture is published,
@@ -2651,6 +2676,40 @@ pub(crate) mod tests {
             "{:?}",
             out.lines
         );
+    }
+
+    /// `fabric job run` holds the tree's lock from its setup steps until
+    /// the harness it launched is recorded, so no harness shows yet. A
+    /// suspend in that window must refuse, not publish a tree an installer
+    /// is still writing.
+    #[tokio::test]
+    async fn a_suspend_refuses_while_setup_holds_the_tree() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        let setup = TreeLock::acquire(&node.cfg.state.tree_locks(), &root).unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let refused = node.suspend(id, &path, &mut Out::default()).await;
+        assert!(
+            matches!(refused, Err(NodeError::SetupRunning { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(node.job(id).await.unwrap().lock().await.latest(), None);
+        drop(setup);
+        // A child another test forked while the lock was held keeps a copy
+        // of its descriptor, and so the lock, until that child execs.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match node.suspend(id, &path, &mut Out::default()).await {
+                Err(NodeError::SetupRunning { .. }) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                done => {
+                    done.unwrap();
+                    break;
+                }
+            }
+        }
     }
 
     /// A clean workspace deleted by hand is restored by the next resume,
