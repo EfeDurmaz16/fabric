@@ -142,13 +142,20 @@ fn row(
 pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row> {
     let mut rows = Vec::new();
     for fact in [name::USER, name::HOME] {
-        rows.push(row(
+        let mut row = row(
             fact,
             here,
             peer,
             Outcome::Refuse(Waiver::Never),
             "the root would differ and nothing rewrites paths in this phase (ADR 0011)",
-        ));
+        );
+        // Two absences compare equal, and prove nothing about the user.
+        if row.here.is_none() || row.peer.is_none() {
+            row.outcome = Outcome::Refuse(Waiver::Never);
+            "not measured, and the move needs it measured and equal on both nodes (ADR 0011)"
+                .clone_into(&mut row.note);
+        }
+        rows.push(row);
     }
     rows.push(row(
         name::OS,
@@ -559,5 +566,24 @@ mod tests {
             outcome_of(&compare(&pro(), &pro(), &context), "clock"),
             Outcome::Warn
         );
+    }
+
+    /// The user and the home must be measured and equal on both nodes. When
+    /// neither node could read its user name, the two absences are equal,
+    /// and two users with the same `HOME` string must still be refused.
+    #[test]
+    fn an_unmeasured_user_or_home_is_refused_even_on_both_sides() {
+        for fact in [name::USER, name::HOME] {
+            let here = with(&pro(), &[(fact, None)]);
+            for peer in [with(&pro(), &[(fact, None)]), pro()] {
+                let rows = compare(&here, &peer, &ctx(None));
+                assert_eq!(
+                    outcome_of(&rows, fact),
+                    Outcome::Refuse(Waiver::Never),
+                    "{fact}"
+                );
+                assert!(!blocking(&rows, true).is_empty(), "{fact}");
+            }
+        }
     }
 }
