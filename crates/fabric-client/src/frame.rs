@@ -40,8 +40,21 @@ pub enum FrameError {
 }
 
 /// The bytes of `value` as one frame: its length, then its JSON.
+///
+/// An integer beyond [`MAX_SAFE_INTEGER`], or below its negation, is
+/// written as that bound, so a writer never sends a frame [`parse`] or the
+/// TypeScript SDK refuses. Only a value a peer reported can be that large,
+/// such as a ledger record's time from a broken or forged clock, which a
+/// node relays in `job_log` and a steal's warning, or a peer's clock in
+/// `node_ping`; refusing the frame instead would fail every later read of
+/// that job (review finding on PR #13).
 pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, FrameError> {
-    let json = serde_json::to_vec(value)?;
+    let mut json = serde_json::to_vec(value)?;
+    if has_long_integer(&json) {
+        let mut tree = serde_json::to_value(value)?;
+        bound(&mut tree);
+        json = serde_json::to_vec(&tree)?;
+    }
     let len = u32::try_from(json.len())
         .ok()
         .filter(|len| *len as usize <= MAX_FRAME)
@@ -50,6 +63,52 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, FrameError> {
     frame.extend_from_slice(&len.to_le_bytes());
     frame.extend_from_slice(&json);
     Ok(frame)
+}
+
+/// Whether `json` holds 16 digits in a row outside a string, the least
+/// an integer beyond [`MAX_SAFE_INTEGER`], itself 16 digits long, needs.
+/// A cheap pass, so the common frame is written as serde wrote it.
+fn has_long_integer(json: &[u8]) -> bool {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut digits = 0;
+    for &byte in json {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+        } else if byte.is_ascii_digit() {
+            digits += 1;
+            if digits >= 16 {
+                return true;
+            }
+        } else {
+            digits = 0;
+            in_string = byte == b'"';
+        }
+    }
+    false
+}
+
+/// Writes every integer in `value` beyond [`MAX_SAFE_INTEGER`], or below
+/// its negation, as that bound.
+fn bound(value: &mut Value) {
+    let max = i64::try_from(MAX_SAFE_INTEGER).unwrap_or(i64::MAX);
+    match value {
+        Value::Number(number) => {
+            if number.as_u64().is_some_and(|n| n > MAX_SAFE_INTEGER) {
+                *number = MAX_SAFE_INTEGER.into();
+            } else if number.as_i64().is_some_and(|n| n < -max) {
+                *number = (-max).into();
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(bound),
+        Value::Object(fields) => fields.values_mut().for_each(bound),
+        _ => {}
+    }
 }
 
 /// Writes `value` as one frame and flushes it.
@@ -172,6 +231,63 @@ mod tests {
             read_bytes(&mut reader).await,
             Err(FrameError::TooLarge(len)) if len == MAX_FRAME + 1
         ));
+    }
+
+    /// A record's time and a peer's clock come from another node, so a
+    /// node can hold one past `2^53 - 1`. It writes the bound instead, and
+    /// the frame still reads, here and in the TypeScript SDK; small
+    /// numbers, and digits inside a string, are written as they are
+    /// (review finding on PR #13).
+    #[tokio::test]
+    async fn a_writer_bounds_an_integer_no_reader_takes() {
+        use crate::api::{LedgerEvent, LogRecord, Pong, Reply, Wire};
+
+        let max = i64::try_from(MAX_SAFE_INTEGER).unwrap();
+        for (at, written) in [
+            (u64::MAX, MAX_SAFE_INTEGER),
+            (MAX_SAFE_INTEGER + 1, MAX_SAFE_INTEGER),
+            (MAX_SAFE_INTEGER, MAX_SAFE_INTEGER),
+            (1_760_000_000_000, 1_760_000_000_000),
+        ] {
+            let log = Reply::JobLog(crate::api::JobLog {
+                left_out: 0,
+                records: vec![LogRecord {
+                    id: "01JC0000000000000000000000".parse().unwrap(),
+                    epoch: fabric_core::id::Epoch::FIRST,
+                    at,
+                    event: LedgerEvent::Note {
+                        text: "12345678901234567890".to_owned(),
+                    },
+                }],
+            });
+            let mut reader: &[u8] = &encode(&log).unwrap();
+            let Some(Reply::JobLog(log)) = read(&mut reader).await.unwrap() else {
+                panic!("not a job log");
+            };
+            assert_eq!(log.records[0].at, written);
+            assert_eq!(
+                log.records[0].event,
+                LedgerEvent::Note {
+                    text: "12345678901234567890".to_owned()
+                }
+            );
+        }
+
+        for (skew, written) in [(i64::MIN, -max), (i64::MAX, max), (-340, -340)] {
+            let pong = Reply::NodePing(Pong {
+                node: "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba"
+                    .parse()
+                    .unwrap(),
+                rtt_ms: 12,
+                wire: Wire::Quic,
+                clock_skew_ms: skew,
+            });
+            let mut reader: &[u8] = &encode(&pong).unwrap();
+            let Some(Reply::NodePing(pong)) = read(&mut reader).await.unwrap() else {
+                panic!("not a pong");
+            };
+            assert_eq!(pong.clock_skew_ms, written);
+        }
     }
 
     #[tokio::test]
