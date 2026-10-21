@@ -30,6 +30,8 @@ pub mod name {
     pub const USER: &str = "user";
     /// `$HOME`.
     pub const HOME: &str = "home";
+    /// `git --version`, found on the daemon's own `PATH`, where restore runs it.
+    pub const GIT: &str = "git.version";
     /// The operating system, as Rust names it.
     pub const OS: &str = "os";
     /// The CPU architecture, as Rust names it.
@@ -100,8 +102,22 @@ impl NodeFacts {
         )
     }
 
-    /// Measures this node, looking programs up on `path_var`.
+    /// Measures this node, looking programs up on `path_var`, and git on
+    /// this process's own `PATH`, where restore runs it.
     pub async fn measure(home: &Path, path_var: &OsString, cargo_home: Option<PathBuf>) -> Self {
+        let own_path = std::env::var_os("PATH").unwrap_or_default();
+        let (mut facts, git) = tokio::join!(
+            Box::pin(Self::measure_tools(home, path_var, cargo_home)),
+            probe_command("git", &["--version"], Probe::Output, &own_path, home),
+        );
+        if let Some(git) = git {
+            facts.0.insert(name::GIT.to_owned(), git);
+        }
+        facts
+    }
+
+    /// Measures everything but git, looking programs up on `path_var`.
+    async fn measure_tools(home: &Path, path_var: &OsString, cargo_home: Option<PathBuf>) -> Self {
         // Each probe is boxed, so the joined future holds 19 pointers, not 19 child processes.
         let run = |program: &'static str, args: &'static [&'static str], probe: Probe| {
             let path_var = path_var.clone();
