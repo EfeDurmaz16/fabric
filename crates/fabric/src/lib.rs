@@ -38,7 +38,8 @@ use fabric_harness::codex::Codex;
 use fabric_harness::{Harness, Launch, Running, SessionId, TurnReport};
 use fabric_net::endpoint::DialOrder;
 use fabricd::control::{
-    self, ControlError, Decision, NO_DAEMON_EXIT, NamedSession, Refusal, Request, Response, RunPlan,
+    self, ControlError, Decision, NO_DAEMON_EXIT, NamedSession, Refusal, Request, Response,
+    RunPlan, StartedHarness,
 };
 use fabricd::harnesses::{HarnessEnv, acp_adapter, parse_harness};
 use fabricd::node::{Node, NodeConfig};
@@ -649,13 +650,14 @@ async fn start(home: &Path, plan: &RunPlan, mode: Mode, notes: Notes) -> Result<
 async fn register(socket: &Path, plan: &RunPlan, running: &Running, notes: Notes) -> Result<()> {
     let registered = control::call(
         socket,
-        &Request::HarnessStarted {
+        &Request::HarnessStarted(StartedHarness {
             job: plan.job,
             epoch: plan.epoch,
             pid: running.pid(),
             harness: plan.harness.clone(),
             session: running.session().cloned(),
-        },
+            planned: plan.session.clone(),
+        }),
     )
     .await;
     match registered {
@@ -958,6 +960,8 @@ async fn prepare(state: &StateDir, home: &Path, plan: &RunPlan, notes: Notes) ->
             job: plan.job,
             epoch: plan.epoch,
             head: plan.head,
+            harness: plan.harness.clone(),
+            session: plan.session.clone(),
         },
         notes,
     )

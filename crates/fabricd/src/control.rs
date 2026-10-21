@@ -99,20 +99,13 @@ pub enum Request {
         epoch: Epoch,
         /// The ledger head the plan was made at.
         head: RecordHash,
-    },
-    /// The CLI launched the harness; the daemon records it and appends `Resumed`.
-    HarnessStarted {
-        /// The job.
-        job: JobId,
-        /// The epoch the plan was made under.
-        epoch: Epoch,
-        /// The harness process, which leads its own group.
-        pid: NonZeroU32,
-        /// The harness that runs.
+        /// The harness the plan launches.
         harness: HarnessKind,
-        /// The session it continues or created, when known.
+        /// The session the plan continues; a new one when `None`.
         session: Option<SessionId>,
     },
+    /// The CLI launched the harness; the daemon records it and appends `Resumed`.
+    HarnessStarted(StartedHarness),
     /// The harness exited.
     HarnessExited {
         /// The job.
@@ -169,6 +162,25 @@ pub enum Request {
     /// exec` names a new thread; the daemon records it for the harness it
     /// recorded.
     HarnessSession(NamedSession),
+}
+
+/// A harness the CLI launched, for `Request::HarnessStarted`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartedHarness {
+    /// The job.
+    pub job: JobId,
+    /// The epoch the plan was made under.
+    pub epoch: Epoch,
+    /// The harness process, which leads its own group.
+    pub pid: NonZeroU32,
+    /// The harness that runs.
+    pub harness: HarnessKind,
+    /// The session it continues or created, when known.
+    pub session: Option<SessionId>,
+    /// The session the plan continues; a new one when `None`. A headless
+    /// turn of an earlier launch can name its session while this launch
+    /// runs its setup steps, and the node then refuses this one.
+    pub planned: Option<SessionId>,
 }
 
 /// A session a running harness named, for `Request::HarnessSession`.

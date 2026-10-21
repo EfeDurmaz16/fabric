@@ -216,6 +216,15 @@ pub enum NodeError {
         /// The job.
         job: JobId,
     },
+    /// The job's session moved after a run plan was made, so the plan
+    /// would continue an older one.
+    #[error(
+        "job {job} recorded a session after this launch was planned, as a headless turn does when it names its session late, so the launch would continue an older one; run the command again"
+    )]
+    SessionMoved {
+        /// The job.
+        job: JobId,
+    },
     /// The job has no workspace on this node.
     #[error("job {0} has no workspace on this node; run `fabric job resume {0}`")]
     NoWorkspace(JobId),
@@ -390,6 +399,7 @@ impl NodeError {
             | NodeError::NoWorkspace(_)
             | NodeError::RootNotADirectory { .. }
             | NodeError::PlanOvertaken { .. }
+            | NodeError::SessionMoved { .. }
             | NodeError::StaleWorkspace { .. }
             | NodeError::NoSnapshot(_)
             | NodeError::HarnessGone { .. }
