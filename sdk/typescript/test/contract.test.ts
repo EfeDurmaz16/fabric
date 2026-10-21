@@ -212,6 +212,19 @@ function launched(message: unknown, pointer: string): boolean {
   );
 }
 
+describe("what both readers take and write back apart", () => {
+  // Review finding on PR #13: Rust's SocketAddr reads a port with leading zeros, such as `127.0.0.1:000000`, as port
+  // 0, and the SDK refused one of more than five digits. Rust writes the port back without its zeros and the SDK
+  // keeps the text, so a shared fixture, which both write back to the same JSON, cannot hold one.
+  test("a listen port reads with any number of leading zeros, as Rust's SocketAddr reads it", () => {
+    const node = "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq";
+    const reads = (listen: string): boolean => Reply.safeParse({ kind: "node_id", node, listen }).success;
+    expect(reads("127.0.0.1:000000")).toBe(true);
+    expect(reads("[::1]:0000000000065535")).toBe(true);
+    expect(reads("127.0.0.1:0000065536")).toBe(false);
+  });
+});
+
 describe("the shared fixtures", () => {
   test("every fixture parses and writes back to the same JSON", () => {
     for (const [dir, schema] of Object.entries(SCHEMAS)) {

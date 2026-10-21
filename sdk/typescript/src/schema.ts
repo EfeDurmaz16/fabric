@@ -119,7 +119,8 @@ const Path = UnicodeText;
 const SocketAddr = z.string().refine(isSocketAddr, "not an ip:port socket address");
 
 function isSocketAddr(text: string): boolean {
-  const match = /^(?:\[([^\]]+)\]|([0-9.]+)):([0-9]{1,5})$/.exec(text);
+  // Rust reads a port with any number of leading zeros, so only the u16 bound limits its digits.
+  const match = /^(?:\[([^\]]+)\]|([0-9.]+)):([0-9]+)$/.exec(text);
   if (match === null || Number(match[3]) > 0xffff) {
     return false;
   }
