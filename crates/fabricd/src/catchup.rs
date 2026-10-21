@@ -9,9 +9,10 @@
 //! of ADR 0003 is not built, so a node keeps running a forked job only when
 //! the peer's epoch is lower. Catching up runs at start, whenever a session
 //! with a peer begins, and before a run; a session that begins while the
-//! start-up pass runs is caught up when that pass ends. A peer that does
-//! not answer is skipped for the rest of a pass rather than dialled again
-//! for every job.
+//! start-up pass runs is caught up when that pass ends, and one that begins
+//! while a catch-up of its peer runs makes that catch-up run once more. A
+//! peer that does not answer is skipped for the rest of a pass rather than
+//! dialled again for every job.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -110,7 +111,8 @@ impl Node {
     ///
     /// The flag is set under the same lock `spawn_catch_up` checks it
     /// under, so a session that begins at any moment is either queued here
-    /// or caught up on its own, never neither.
+    /// or caught up on its own, never neither. A catch-up of the same peer
+    /// that already runs then runs once more (`spawn_catch_up`).
     pub(crate) fn end_recovery(self: &Arc<Self>) {
         let waiting = {
             let mut waiting = lock(&self.waiting_catch_up);
@@ -154,10 +156,15 @@ impl Node {
     }
 
     /// Catches up with `peer` in the background once a session with it
-    /// begins, unless one already runs for it. While start-up recovery
-    /// runs, the peer waits for it instead, so the catch-up never acts on
-    /// a ledger recovery has not settled, and is not lost when recovery
-    /// listed the reachable peers before this session began.
+    /// begins. While start-up recovery runs, the peer waits for it
+    /// instead, so the catch-up never acts on a ledger recovery has not
+    /// settled, and is not lost when recovery listed the reachable peers
+    /// before this session began.
+    ///
+    /// When a catch-up of the peer already runs, it runs once more when it
+    /// ends. It may have pulled a job before the peer wrote to it, or be
+    /// waiting on a session that died, which an addressless peer cannot be
+    /// dialled to replace.
     pub(crate) fn spawn_catch_up(self: &Arc<Self>, peer: NodeId) {
         {
             let mut waiting = lock(&self.waiting_catch_up);
@@ -166,15 +173,29 @@ impl Node {
                 return;
             }
         }
-        if !lock(&self.catching_up).insert(peer) {
-            return;
+        {
+            let mut catching_up = lock(&self.catching_up);
+            if let Some(again) = catching_up.get_mut(&peer) {
+                *again = true;
+                return;
+            }
+            catching_up.insert(peer, false);
         }
         let node = Arc::clone(self);
         tokio::spawn(async move {
-            if let Err(e) = node.catch_up_peer(peer).await {
-                tracing::info!(%peer, error = %e, "did not catch up with the peer");
+            loop {
+                if let Err(e) = node.catch_up_peer(peer).await {
+                    tracing::info!(%peer, error = %e, "did not catch up with the peer");
+                }
+                let mut catching_up = lock(&node.catching_up);
+                match catching_up.get_mut(&peer) {
+                    Some(again) if *again => *again = false,
+                    _ => {
+                        catching_up.remove(&peer);
+                        return;
+                    }
+                }
             }
-            lock(&node.catching_up).remove(&peer);
         });
     }
 

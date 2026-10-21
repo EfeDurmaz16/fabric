@@ -74,7 +74,9 @@ pub struct Node {
     pub(crate) harness_config: HarnessConfig,
     control: Mutex<Option<UnixListener>>,
     pub(crate) recovered: tokio::sync::watch::Sender<bool>,
-    pub(crate) catching_up: Mutex<BTreeSet<NodeId>>,
+    /// Peers being caught up now, each with whether a session with it
+    /// began since, so its catch-up runs once more when it ends.
+    pub(crate) catching_up: Mutex<BTreeMap<NodeId, bool>>,
     /// Peers whose session began while start-up recovery ran; recovery
     /// catches up with each of them once it is done.
     pub(crate) waiting_catch_up: Mutex<BTreeSet<NodeId>>,
@@ -147,7 +149,7 @@ impl Node {
             harness_config,
             control: Mutex::new(Some(control)),
             recovered: tokio::sync::watch::Sender::new(false),
-            catching_up: Mutex::new(BTreeSet::new()),
+            catching_up: Mutex::new(BTreeMap::new()),
             waiting_catch_up: Mutex::new(BTreeSet::new()),
             _lock: lock_file,
         });

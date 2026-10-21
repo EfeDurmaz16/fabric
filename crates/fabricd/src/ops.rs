@@ -2599,6 +2599,84 @@ pub(crate) mod tests {
         .await;
     }
 
+    /// A session can begin while a catch-up of the same peer still runs and
+    /// has gone past the job the peer then wrote to, as when the peer
+    /// changed networks and dialed in again. That catch-up must run once
+    /// more when it ends, or a steal the peer wrote in between stays
+    /// unknown here until the next session while this node's stale
+    /// harness runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_that_begins_during_a_catch_up_of_its_peer_is_caught_up_after_it() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        a.recovered().await;
+        b.recovered().await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let out = &mut Out::default();
+        let mut ids = [
+            job(&dir_a.path().join("one"), &a).await,
+            job(&dir_a.path().join("two"), &a).await,
+        ];
+        // A catch-up pulls the jobs in this order.
+        ids.sort();
+        let [first, second] = ids;
+        for id in ids {
+            a.suspend(id, &path, out).await.unwrap();
+            b.pull_records(id, a.id).await.unwrap();
+        }
+        b.ensure_latest(first, a.id).await.unwrap();
+        b.job_steal(first, "a sleeps".to_owned(), true, out)
+            .await
+            .unwrap();
+        let head = |node: Arc<Node>| async move {
+            node.job(first).await.unwrap().lock().await.ledger().head()
+        };
+        let wait_for = |want, what: &'static str| {
+            let a = Arc::clone(&a);
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                while head(Arc::clone(&a)).await != want {
+                    assert!(tokio::time::Instant::now() < deadline, "{what}");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !crate::node::lock(&a.catching_up).is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the catch-ups the pairing began did not end"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // a catches up with b, which answers no pull of the second job
+        // while the test holds it, so the pass stays open after the first.
+        b.job_decide(first, Decision::Approve, "before", out)
+            .await
+            .unwrap();
+        let b_second = b.job(second).await.unwrap();
+        let b_paused = b_second.lock().await;
+        a.spawn_catch_up(b.id);
+        wait_for(head(Arc::clone(&b)).await, "a did not catch up with b").await;
+
+        // b writes a record a does not have, then begins a new session.
+        b.job_decide(first, Decision::Approve, "after", out)
+            .await
+            .unwrap();
+        let want = head(Arc::clone(&b)).await;
+        let kept = b.open_session(a.id).unwrap();
+        b.forget(a.id, &kept);
+        b.node_ping(a.id, out).await.unwrap();
+        drop(b_paused);
+        wait_for(
+            want,
+            "a never caught up with the session b began during its catch-up",
+        )
+        .await;
+    }
+
     /// Two moves typed at once toward different nodes: the second finds the
     /// job departing toward the first's target and must name that node,
     /// not offer the first move to its own.
