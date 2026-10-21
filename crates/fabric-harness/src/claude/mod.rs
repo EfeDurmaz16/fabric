@@ -688,13 +688,19 @@ impl ClaudeCode {
     /// order with the workspace's own key last, so its model wins; none
     /// when this node holds no transcript of it, which records nothing to
     /// carry or to guard, and Claude then says itself that it found none.
+    /// The own key only orders them: a workspace whose key Claude cuts
+    /// and hashes, which this adapter does not compute, has none, and
+    /// every key is still read and guarded.
     fn transcripts(
         &self,
         root: &AbsPath,
         session: &SessionId,
     ) -> Result<Vec<PathBuf>, HarnessError> {
         let projects = self.config_dir.join("projects");
-        let own = projects.join(Self::key_of(root)?);
+        let own = match slug::slug(root) {
+            Ok(key) => Some(projects.join(key)),
+            Err(slug::SlugError::TooLong { .. }) => None,
+        };
         let entries = match std::fs::read_dir(&projects) {
             Ok(entries) => Some(entries),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -713,7 +719,7 @@ impl ClaudeCode {
             }
             let transcript = key_dir.join(format!("{session}.jsonl"));
             if Self::kind_at(&transcript)?.is_some_and(|kind| kind.is_file()) {
-                found.push((key_dir == own, transcript));
+                found.push((own.as_ref() == Some(&key_dir), transcript));
             }
         }
         found.sort();
@@ -1653,6 +1659,67 @@ mod tests {
         )
         .unwrap();
         let mut running = fixture.launch().await.unwrap();
+        running.child_mut().wait().await.unwrap();
+        let ran = fixture.ran().unwrap();
+        let model = ran.iter().position(|a| a == "--model").map(|i| &ran[i + 1]);
+        assert_eq!(model.map(String::as_str), Some("claude-fable-5"), "{ran:?}");
+    }
+
+    /// A workspace whose project key is over 200 characters, which Claude
+    /// cuts and hashes, still resumes: its own key only orders the
+    /// transcripts, and every key is still read and guarded.
+    #[tokio::test]
+    async fn a_workspace_whose_key_claude_cuts_still_resumes_guarded() {
+        let fixture = Resume::new("2.1.294 (Claude Code)");
+        let long = fixture
+            .home
+            .join("work")
+            .join("a".repeat(80))
+            .join("b".repeat(80))
+            .join("c".repeat(80));
+        std::fs::create_dir_all(&long).unwrap();
+        let root = AbsPath::parse(long.to_str().unwrap()).unwrap();
+        assert!(matches!(
+            ClaudeCode::key_of(&root),
+            Err(HarnessError::ProjectKeyTooLong { .. })
+        ));
+        std::fs::remove_file(&fixture.transcript).unwrap();
+        let cut = fixture.home.join(".claude/projects/-cut-key-1a2b3c");
+        std::fs::create_dir_all(&cut).unwrap();
+        let transcript = cut.join(format!("{SID}.jsonl"));
+        let launch = || Launch::Headless {
+            resume: Some(SessionId::parse(SID).unwrap()),
+            prompt: "next".to_owned(),
+        };
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"version\":\"2.1.300\",\"isSidechain\":false,\"message\":{\"model\":\"claude-fable-5\"}}\n",
+        )
+        .unwrap();
+        let refused = fixture
+            .adapter
+            .launch(&long, launch(), &fixture.env)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                HarnessError::HarnessOlderThanSession { recorded, .. } if recorded.as_str() == "2.1.300"
+            ),
+            "{refused}"
+        );
+        assert_eq!(fixture.ran(), None, "the older claude ran");
+
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"version\":\"2.1.294\",\"isSidechain\":false,\"message\":{\"model\":\"claude-fable-5\"}}\n",
+        )
+        .unwrap();
+        let mut running = fixture
+            .adapter
+            .launch(&long, launch(), &fixture.env)
+            .await
+            .unwrap();
         running.child_mut().wait().await.unwrap();
         let ran = fixture.ran().unwrap();
         let model = ran.iter().position(|a| a == "--model").map(|i| &ran[i + 1]);
