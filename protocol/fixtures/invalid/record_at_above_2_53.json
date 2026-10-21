@@ -1,0 +1,18 @@
+{
+  "schema": "reply",
+  "value": {
+    "kind": "job_log",
+    "left_out": 0,
+    "records": [
+      {
+        "id": "01JC0000000000000000000002",
+        "epoch": 1,
+        "at": 9007199254740992,
+        "event": {
+          "kind": "suspended",
+          "snapshot": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        }
+      }
+    ]
+  }
+}

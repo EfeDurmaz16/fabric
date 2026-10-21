@@ -4,8 +4,10 @@
 //! Invariant: a reader checks the length against [`MAX_FRAME`] before it
 //! allocates anything, and a frame holds exactly one value with nothing
 //! after it, whose every object is a JSON object with named fields, never
-//! an array in field order. Both directions use the same functions, so the
-//! node and every Rust client agree on the bytes.
+//! an array in field order, whose every variant is named, never numbered,
+//! and whose every integer a JavaScript number holds exactly. Both
+//! directions use the same functions, so the node and every Rust client
+//! agree on the bytes, and the TypeScript SDK refuses what they refuse.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -14,6 +16,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// The largest frame either side sends or reads: 16 MiB.
 pub const MAX_FRAME: usize = 16 << 20;
+
+/// The largest integer a frame carries, `2^53 - 1`, and the negation of the
+/// smallest: the range a JavaScript number holds exactly (ADR 0018,
+/// Encoding rules).
+pub const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
 /// Why a frame could not be written or read.
 #[derive(Debug, thiserror::Error)]
@@ -93,38 +100,61 @@ where
     }
 }
 
-/// Parses the JSON of one frame as a `T`, refusing a JSON array where `T`
-/// holds an object, at any depth.
+/// Parses the JSON of one frame as a `T`, refusing, at any depth, a JSON
+/// array where `T` holds an object, a number where it holds a name, and an
+/// integer beyond [`MAX_SAFE_INTEGER`] either way.
 ///
 /// serde's derived structs and tagged enums also read an array as their
 /// fields in declaration order, so `[1, "x"]` would read as a hello and
-/// `["job_status", "<job>"]` as a request, tying such a client to the Rust
-/// field order that ADR 0018 says nobody depends on. The TypeScript SDK
-/// refuses the same bytes. The check writes the value back and requires
-/// every array the frame held to still be an array there; an object field
-/// the type does not know is skipped, as the parse skipped it.
+/// `["job_status", "<job>"]` as a request, and an enum nested in a message
+/// reads an integer tag as its variant's index, so `{"kind": 0}` would
+/// read as the first harness. Either ties such a client to the Rust
+/// declaration order that ADR 0018 says nobody depends on. An integer past
+/// `2^53 - 1` fits a Rust `u64` but not a JavaScript number. The TypeScript
+/// SDK refuses all three. The check writes the value back and requires
+/// every array the frame held to still be an array there, every number to
+/// still be a number, and every number to be in range; an object field the
+/// type does not know is skipped, as the parse skipped it.
 pub fn parse<T: Serialize + DeserializeOwned>(json: &[u8]) -> Result<T, serde_json::Error> {
     let frame: Value = serde_json::from_slice(json)?;
     let value = T::deserialize(&frame)?;
-    if positional(&frame, &serde_json::to_value(&value)?) {
-        return Err(serde::de::Error::custom(
-            "a JSON array stands where the message has an object with named fields",
-        ));
+    if let Some(problem) = unlike(&frame, &serde_json::to_value(&value)?) {
+        return Err(serde::de::Error::custom(problem));
     }
     Ok(value)
 }
 
-/// Whether `frame` holds an array where `read`, the same value as the type wrote it back, holds none.
-fn positional(frame: &Value, read: &Value) -> bool {
+/// What in `frame` the type does not read as written: `read` is the same
+/// value as the type wrote it back.
+fn unlike(frame: &Value, read: &Value) -> Option<&'static str> {
     match (frame, read) {
         (Value::Array(frame), Value::Array(read)) => {
-            frame.iter().zip(read).any(|(a, b)| positional(a, b))
+            frame.iter().zip(read).find_map(|(a, b)| unlike(a, b))
         }
-        (Value::Array(_), _) => true,
+        (Value::Array(_), _) => {
+            Some("a JSON array stands where the message has an object with named fields")
+        }
         (Value::Object(frame), Value::Object(read)) => frame
             .iter()
-            .any(|(key, a)| read.get(key).is_some_and(|b| positional(a, b))),
-        _ => false,
+            .find_map(|(key, a)| read.get(key).and_then(|b| unlike(a, b))),
+        (Value::Number(number), Value::Number(_)) => (!safe(number)).then_some(
+            "an integer stands beyond 2^53 - 1 or below its negation, which a JavaScript number does not hold exactly",
+        ),
+        (Value::Number(_), _) => Some(
+            "a number stands where the message has a name, such as a variant written as its index",
+        ),
+        _ => None,
+    }
+}
+
+/// Whether `number` is an integer a JavaScript number holds exactly, or not an integer at all.
+fn safe(number: &serde_json::Number) -> bool {
+    if let Some(n) = number.as_u64() {
+        n <= MAX_SAFE_INTEGER
+    } else if let Some(n) = number.as_i64() {
+        n.unsigned_abs() <= MAX_SAFE_INTEGER
+    } else {
+        true
     }
 }
 

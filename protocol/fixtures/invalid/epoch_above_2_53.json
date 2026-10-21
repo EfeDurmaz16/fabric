@@ -1,0 +1,12 @@
+{
+  "schema": "request",
+  "value": {
+    "op": "harness_started",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "epoch": 9007199254740992,
+    "pid": 4242,
+    "harness": {
+      "kind": "claude_code"
+    }
+  }
+}
