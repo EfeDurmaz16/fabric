@@ -732,7 +732,8 @@ impl ClaudeCode {
         let transcripts = self.transcripts(root, session)?;
         let recorded = pipeline::blocking(move || recorded::read(&transcripts)).await?;
         if let Some(writer) = &recorded.writer {
-            crate::version::refuse_older(PROGRAM, binary, env, session, writer).await?;
+            let cwd = pipeline::fs_path(root);
+            crate::version::refuse_older(PROGRAM, binary, cwd, env, session, writer).await?;
         }
         Ok(recorded)
     }
@@ -1465,8 +1466,8 @@ mod tests {
 
     /// A home whose transcript of `SID` was written by Claude 2.1.294
     /// with claude-opus-5-5, and a fake `claude` that answers `--version`
-    /// with `version_line` and otherwise appends a line to the transcript
-    /// and writes its arguments to `ran`.
+    /// by running the shell text `version` and otherwise appends a line
+    /// to the transcript and writes its arguments to `ran`.
     struct Resume {
         _dir: tempfile::TempDir,
         home: PathBuf,
@@ -1476,7 +1477,12 @@ mod tests {
     }
 
     impl Resume {
+        /// A fake `claude` that answers `--version` with `version_line`.
         fn new(version_line: &str) -> Self {
+            Self::answering(&format!("echo '{version_line}'"))
+        }
+
+        fn answering(version: &str) -> Self {
             use std::os::unix::fs::PermissionsExt;
             let dir = tempfile::tempdir().unwrap();
             let home = std::fs::canonicalize(dir.path()).unwrap();
@@ -1497,7 +1503,7 @@ mod tests {
                 &binary,
                 format!(
                     "#!/bin/sh\n\
-                     if [ \"$1\" = --version ]; then echo '{version_line}'; exit 0; fi\n\
+                     if [ \"$1\" = --version ]; then {version}; exit 0; fi\n\
                      echo '{{\"type\":\"user\"}}' >> '{}'\n\
                      printf '%s\\n' \"$@\" > \"$HOME/ran\"\n",
                     transcript.display()
@@ -1556,6 +1562,26 @@ mod tests {
         );
         assert_eq!(std::fs::read(&fixture.transcript).unwrap(), before);
         assert_eq!(fixture.ran(), None, "the older claude ran");
+    }
+
+    /// The version is asked in the workspace the launch starts claude in,
+    /// where a version manager's shim may pin another version than it
+    /// picks anywhere else.
+    #[tokio::test]
+    async fn the_version_is_asked_in_the_workspace_claude_starts_in() {
+        let fixture = Resume::answering(
+            "if [ -f .tool-versions ]; then echo '2.1.199 (Claude Code)'; else echo '2.1.294 (Claude Code)'; fi",
+        );
+        std::fs::write(fixture.home.join("work/.tool-versions"), "claude 2.1.199\n").unwrap();
+        let refused = fixture.launch().await.unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                HarnessError::HarnessOlderThanSession { local, .. } if local.as_str() == "2.1.199"
+            ),
+            "{refused}"
+        );
+        assert_eq!(fixture.ran(), None, "the pinned older claude ran");
     }
 
     /// A resume passes the model the session last ran with, and says so.

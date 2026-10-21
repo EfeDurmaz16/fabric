@@ -138,7 +138,8 @@ fn probe_env(path_var: &OsStr) -> Vec<(EnvVarName, String)> {
     env
 }
 
-/// Runs `binary args...` with `env` minus its parent-session markers and
+/// Runs `binary args...` with `env` minus its parent-session markers, in
+/// `cwd` when one is given and else in this process's directory, and
 /// returns trimmed stdout, within `PROBE_TIMEOUT`. A run that exits with
 /// a failure is an error, whatever it printed: a wrapper that prints a
 /// version and then fails to start is not a working install, and its
@@ -146,10 +147,15 @@ fn probe_env(path_var: &OsStr) -> Vec<(EnvVarName, String)> {
 async fn probe(
     binary: &Path,
     args: &[&str],
+    cwd: Option<&Path>,
     env: &[(EnvVarName, String)],
 ) -> Result<String, HarnessError> {
     let program = binary.display().to_string();
-    let run = Command::new(binary)
+    let mut command = Command::new(binary);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let run = command
         .args(args)
         .env_clear()
         .envs(markers::child_env(env))
@@ -191,7 +197,7 @@ pub(crate) async fn detect(
     let Some(path) = binary else {
         return Ok(None);
     };
-    let raw = probe(&path, &["--version"], &probe_env(path_var)).await?;
+    let raw = probe(&path, &["--version"], None, &probe_env(path_var)).await?;
     Ok(Some(Installed {
         version: version_token(&raw).map(str::to_owned),
         raw,
@@ -199,15 +205,19 @@ pub(crate) async fn detect(
     }))
 }
 
-/// What `binary --version` prints when run with `env` minus its
-/// parent-session markers, as a launch with `env` would run it; for the
-/// resume guard (`version::refuse_older`), which must ask the binary it
-/// is about to start.
+/// What `binary --version` prints when run in `cwd` with `env` minus its
+/// parent-session markers, as a launch in `cwd` with `env` would run it;
+/// for the resume guard (`version::refuse_older`), which must ask the
+/// binary it is about to start. The directory counts: a version manager's
+/// shim (mise, asdf, Volta) picks the tool version by the directory it
+/// runs in, so a probe from anywhere else could ask another version than
+/// the one `spawn` starts in the workspace.
 pub(crate) async fn reported_version(
     binary: &Path,
+    cwd: &Path,
     env: &[(EnvVarName, String)],
 ) -> Result<String, HarnessError> {
-    probe(binary, &["--version"], env).await
+    probe(binary, &["--version"], Some(cwd), env).await
 }
 
 /// The version `binary` reports, or `None` when there is no binary or the
@@ -664,7 +674,7 @@ mod tests {
             .into_iter()
             .map(|(name, value)| (EnvVarName::parse(name).unwrap(), value.to_owned()))
             .collect();
-        let seen = probe(&binary, &[], &env).await.unwrap();
+        let seen = probe(&binary, &[], None, &env).await.unwrap();
         assert!(seen.contains("FABRIC_PROBE_KEPT=1"), "{seen}");
         assert!(!seen.contains("CLAUDECODE"), "{seen}");
     }

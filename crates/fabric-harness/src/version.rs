@@ -174,12 +174,14 @@ impl fmt::Display for HarnessVersion {
 
 /// Refuses to start `binary` on `session` when the version it reports is
 /// older than `recorded`, the newest version the session records, or
-/// cannot be read. Runs `binary --version` with the launch environment
-/// minus the parent-session markers, as the launch itself would run.
+/// cannot be read. Runs `binary --version` in `cwd`, the directory the
+/// launch starts it in, with the launch environment minus the
+/// parent-session markers, as the launch itself would run.
 #[cfg(any(feature = "claude", feature = "codex"))]
 pub(crate) async fn refuse_older(
     program: &str,
     binary: &std::path::Path,
+    cwd: &std::path::Path,
     env: &[(fabric_core::env::EnvVarName, String)],
     session: &crate::session::SessionId,
     recorded: &HarnessVersion,
@@ -191,7 +193,7 @@ pub(crate) async fn refuse_older(
         session: session.clone(),
         reason,
     };
-    let output = crate::process::reported_version(binary, env)
+    let output = crate::process::reported_version(binary, cwd, env)
         .await
         .map_err(|e| unknown(e.to_string()))?;
     let local = HarnessVersion::from_output(&output).map_err(|e| unknown(e.to_string()))?;

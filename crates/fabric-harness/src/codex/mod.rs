@@ -625,10 +625,11 @@ impl Codex {
     }
 
     /// What the lineage of `session` records, read before a resume; refused
-    /// when the binary that would run it is older than its newest writer
-    /// or does not say its version, so nothing starts.
+    /// when the binary that would run it in `root` is older than its newest
+    /// writer or does not say its version, so nothing starts.
     async fn read_session(
         &self,
+        root: &AbsPath,
         binary: &Path,
         env: &[(EnvVarName, String)],
         session: &SessionId,
@@ -644,7 +645,8 @@ impl Codex {
         })
         .await?;
         if let Some(writer) = &recorded.writer {
-            crate::version::refuse_older(PROGRAM, binary, env, session, writer).await?;
+            let cwd = pipeline::fs_path(root);
+            crate::version::refuse_older(PROGRAM, binary, cwd, env, session, writer).await?;
         }
         Ok(recorded)
     }
@@ -726,7 +728,7 @@ impl Codex {
         let root = pipeline::physical_workspace(workspace)?;
         let binary = self.binary()?;
         let recorded = match launch.resume() {
-            Some(session) => Some(self.read_session(&binary, env, session).await?),
+            Some(session) => Some(self.read_session(&root, &binary, env, session).await?),
             None => None,
         };
         let (overrides, settings) =
@@ -906,8 +908,9 @@ mod tests {
 
     /// A home whose store holds one rollout of `THREAD`, written by Codex
     /// 0.155.1 with gpt-6-sol, and a fake `codex` that answers
-    /// `--version` with `version_line` and otherwise appends a record to
-    /// the rollout, as 0.142.4 did, and writes its arguments to `ran`.
+    /// `--version` by running the shell text `version` and otherwise
+    /// appends a record to the rollout, as 0.142.4 did, and writes its
+    /// arguments to `ran`.
     struct Resume {
         _dir: tempfile::TempDir,
         home: PathBuf,
@@ -917,7 +920,12 @@ mod tests {
     }
 
     impl Resume {
+        /// A fake `codex` that answers `--version` with `version_line`.
         fn new(version_line: &str) -> Self {
+            Self::answering(&format!("echo '{version_line}'"))
+        }
+
+        fn answering(version: &str) -> Self {
             use std::os::unix::fs::PermissionsExt;
             let dir = tempfile::tempdir().unwrap();
             let home = std::fs::canonicalize(dir.path()).unwrap();
@@ -938,7 +946,7 @@ mod tests {
                 &binary,
                 format!(
                     "#!/bin/sh\n\
-                     if [ \"$1\" = --version ]; then echo '{version_line}'; exit 0; fi\n\
+                     if [ \"$1\" = --version ]; then {version}; exit 0; fi\n\
                      echo '{{\"type\":\"event_msg\",\"payload\":{{}}}}' >> '{}'\n\
                      printf '%s\\n' \"$@\" > \"$HOME/ran\"\n",
                     rollout.display()
@@ -1002,6 +1010,26 @@ mod tests {
         );
         assert_eq!(std::fs::read(&fixture.rollout).unwrap(), before);
         assert_eq!(fixture.ran(), None, "the older codex ran");
+    }
+
+    /// The version is asked in the workspace the launch starts codex in:
+    /// a version manager's shim picks the tool version by directory, so a
+    /// probe from anywhere else asks another binary than the one that runs.
+    #[tokio::test]
+    async fn the_version_is_asked_in_the_workspace_codex_starts_in() {
+        let fixture = Resume::answering(
+            "if [ -f .tool-versions ]; then echo 'codex-cli 0.142.4'; else echo 'codex-cli 0.155.1'; fi",
+        );
+        std::fs::write(fixture.home.join("work/.tool-versions"), "codex 0.142.4\n").unwrap();
+        let refused = fixture.launch(true).await.unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                HarnessError::HarnessOlderThanSession { local, .. } if local.as_str() == "0.142.4"
+            ),
+            "{refused}"
+        );
+        assert_eq!(fixture.ran(), None, "the pinned older codex ran");
     }
 
     /// A codex whose version cannot be read is refused too: deny by default.
