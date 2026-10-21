@@ -1,0 +1,14 @@
+{
+  "op": "doctor",
+  "env": {
+    "path": [
+      "/opt/homebrew//bin",
+      "/usr/local/bin/",
+      "/usr/bin/../bin",
+      "/Users/me/cafe\u0301/bin"
+    ],
+    "roots": {
+      "cargo_home": "/Users/me//.cargo/"
+    }
+  }
+}

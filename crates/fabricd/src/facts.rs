@@ -451,7 +451,7 @@ fn manager_name(manager: NodeManager) -> &'static str {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
-    use fabric_client::api::{PathDir, Roots};
+    use fabric_client::api::{PathDir, Roots, SystemPath};
 
     use super::*;
 
@@ -480,8 +480,8 @@ mod tests {
         let client = ClientEnv {
             path: path.clone(),
             roots: Roots {
-                cargo_home: Some(AbsPath::parse("/client/cargo").unwrap()),
-                pnpm_home: Some(AbsPath::parse("/client/pnpm").unwrap()),
+                cargo_home: Some(SystemPath::parse("/client/cargo").unwrap()),
+                pnpm_home: Some(SystemPath::parse("/client/pnpm").unwrap()),
                 ..Roots::default()
             },
         };

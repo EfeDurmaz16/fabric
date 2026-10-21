@@ -10,10 +10,12 @@
 //! optional fields, new event kinds and new refusal reasons, which a
 //! reader skips or reads as `Unrecognized`.
 
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{EnvSpecId, Epoch, EventId, JobId, MoveId, NodeId, SnapshotId};
@@ -435,67 +437,173 @@ pub struct ClientEnv {
 }
 
 impl ClientEnv {
-    /// The environment of this process: its `PATH` without the entries
-    /// that are not absolute directories, such as `.` or a relative one,
-    /// which would name a directory of the node's choosing, and the roots
-    /// it sets. A trailing `/` is dropped.
-    #[must_use]
-    pub fn current() -> Self {
-        let path = std::env::var_os("PATH")
-            .map(|path| {
-                std::env::split_paths(&path)
-                    .filter_map(|dir| PathDir::parse(without_trailing_slash(dir.to_str()?)).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let root = |name: &str| {
-            let value = std::env::var_os(name)?;
-            fabric_core::path::AbsPath::parse(without_trailing_slash(value.to_str()?)).ok()
+    /// The environment of this process, as [`ClientEnv::from_vars`] reads it.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientEnv::from_vars`].
+    pub fn current() -> Result<Self, EnvError> {
+        Self::from_vars(|name| std::env::var_os(name))
+    }
+
+    /// The environment whose variables `var` reads: its `PATH` without the
+    /// entries that are not absolute, such as `.`, an empty one or a
+    /// relative one, which would name a directory of the node's choosing,
+    /// and each root it sets to an absolute path. Every entry and root it
+    /// keeps is kept as written, `//`, `..` and a trailing `/` included, so
+    /// the node finds the tools the client's shell finds.
+    ///
+    /// # Errors
+    ///
+    /// An absolute `PATH` entry or root that is not UTF-8: the socket
+    /// carries text, and leaving it out would have the node measure
+    /// without it.
+    pub fn from_vars(var: impl Fn(&str) -> Option<OsString>) -> Result<Self, EnvError> {
+        let mut path = Vec::new();
+        if let Some(value) = var("PATH") {
+            for dir in std::env::split_paths(&value) {
+                // An entry split from `PATH` holds no `:`.
+                if let Some(dir) = system_path("PATH", dir.as_os_str())?
+                    .and_then(|dir| PathDir::from_system(dir).ok())
+                {
+                    path.push(dir);
+                }
+            }
+        }
+        let root = |name: &'static str| match var(name) {
+            Some(value) => system_path(name, &value),
+            None => Ok(None),
         };
-        Self {
+        Ok(Self {
             path,
             roots: Roots {
-                cargo_home: root(Roots::CARGO_HOME),
-                rustup_home: root(Roots::RUSTUP_HOME),
-                pnpm_home: root(Roots::PNPM_HOME),
-                xdg_data_home: root(Roots::XDG_DATA_HOME),
+                cargo_home: root(Roots::CARGO_HOME)?,
+                rustup_home: root(Roots::RUSTUP_HOME)?,
+                pnpm_home: root(Roots::PNPM_HOME)?,
+                xdg_data_home: root(Roots::XDG_DATA_HOME)?,
             },
-        }
+        })
     }
 
     /// The `PATH` value to run a tool with.
     #[must_use]
-    pub fn path_var(&self) -> std::ffi::OsString {
+    pub fn path_var(&self) -> OsString {
         let dirs: Vec<&str> = self.path.iter().map(PathDir::as_str).collect();
         dirs.join(":").into()
     }
 }
 
-/// `text` without the `/` it ends with, unless it is `/`.
-fn without_trailing_slash(text: &str) -> &str {
-    match text.trim_end_matches('/') {
-        "" => &text[..text.len().min(1)],
-        trimmed => trimmed,
+/// `value` of the variable `var` as a [`SystemPath`]; `None` when it is not absolute.
+fn system_path(var: &'static str, value: &OsStr) -> Result<Option<SystemPath>, EnvError> {
+    if value.as_bytes().first() != Some(&b'/') {
+        return Ok(None);
+    }
+    let text = value.to_str().ok_or_else(|| EnvError {
+        var,
+        value: value.to_owned(),
+    })?;
+    // The kernel keeps NUL out of every variable, so an absolute UTF-8 value parses.
+    Ok(SystemPath::parse(text).ok())
+}
+
+/// A variable of the client's environment that names an absolute path
+/// that is not UTF-8, which the client API cannot carry.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "{var} names {}, which is not UTF-8, and the client API carries only UTF-8 paths; rename it or take it out of {var}",
+    value.to_string_lossy()
+)]
+pub struct EnvError {
+    /// The variable.
+    pub var: &'static str,
+    /// The path it names; for `PATH`, the one entry.
+    pub value: OsString,
+}
+
+/// An absolute path as the operating system resolves it: text that
+/// starts with `/` and holds no NUL.
+///
+/// Unlike the core's [`AbsPath`](fabric_core::path::AbsPath), the one text
+/// form of a path Fabric itself writes, it keeps `//`, `.`, `..`, a
+/// trailing `/`, a `.git` component and any Unicode form, because the
+/// kernel reads it, not Fabric: a tool root or a `PATH` directory names
+/// the directory the client's shell names. A relative path is refused,
+/// since it would name a directory of the node's choosing.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct SystemPath(String);
+
+impl SystemPath {
+    /// Checks `text` against the rules and wraps it.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        if !text.starts_with('/') {
+            return Err(format!("{text:?} is not an absolute path"));
+        }
+        if text.contains('\0') {
+            return Err(format!("{text:?} holds a NUL"));
+        }
+        Ok(Self(text.to_owned()))
+    }
+
+    /// The path's text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The path.
+    #[must_use]
+    pub fn as_path(&self) -> &Path {
+        Path::new(&self.0)
     }
 }
 
-/// One directory of a `PATH`: an absolute path in the core's one text
-/// form, without a `:`, which would split it in two.
+impl AsRef<Path> for SystemPath {
+    fn as_ref(&self) -> &Path {
+        self.as_path()
+    }
+}
+
+impl fmt::Display for SystemPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Debug for SystemPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SystemPath({:?})", self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SystemPath {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        Self::parse(&text).map_err(serde::de::Error::custom)
+    }
+}
+
+/// One directory of a `PATH`: a [`SystemPath`] without a `:`, which would
+/// split it in two.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
-pub struct PathDir(fabric_core::path::AbsPath);
+pub struct PathDir(SystemPath);
 
 impl PathDir {
     /// Checks `text` against the rules and wraps it.
     pub fn parse(text: &str) -> Result<Self, String> {
-        if text.contains(':') {
+        Self::from_system(SystemPath::parse(text)?)
+    }
+
+    /// `dir` as a `PATH` directory, unless it holds a `:`.
+    fn from_system(dir: SystemPath) -> Result<Self, String> {
+        if dir.as_str().contains(':') {
             return Err(format!(
-                "{text:?} holds a `:`, which separates PATH entries"
+                "{:?} holds a `:`, which separates PATH entries",
+                dir.as_str()
             ));
         }
-        fabric_core::path::AbsPath::parse(text)
-            .map(Self)
-            .map_err(|e| format!("{text:?}: {e}"))
+        Ok(Self(dir))
     }
 
     /// The directory's text.
@@ -525,16 +633,16 @@ impl<'de> Deserialize<'de> for PathDir {
 pub struct Roots {
     /// `CARGO_HOME`: where cargo keeps its registry and rustup its proxies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cargo_home: Option<fabric_core::path::AbsPath>,
+    pub cargo_home: Option<SystemPath>,
     /// `RUSTUP_HOME`: where rustup keeps its toolchains.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rustup_home: Option<fabric_core::path::AbsPath>,
+    pub rustup_home: Option<SystemPath>,
     /// `PNPM_HOME`: where pnpm lives, and its store when it is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pnpm_home: Option<fabric_core::path::AbsPath>,
+    pub pnpm_home: Option<SystemPath>,
     /// `XDG_DATA_HOME`: where pnpm keeps its store when `PNPM_HOME` is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub xdg_data_home: Option<fabric_core::path::AbsPath>,
+    pub xdg_data_home: Option<SystemPath>,
 }
 
 impl Roots {
@@ -550,7 +658,7 @@ impl Roots {
     /// Every root with its variable, set or not, so a tool run for the
     /// client gets each one set to the client's value or removed.
     #[must_use]
-    pub fn vars(&self) -> [(&'static str, Option<&fabric_core::path::AbsPath>); 4] {
+    pub fn vars(&self) -> [(&'static str, Option<&SystemPath>); 4] {
         [
             (Self::CARGO_HOME, self.cargo_home.as_ref()),
             (Self::RUSTUP_HOME, self.rustup_home.as_ref()),
@@ -2034,5 +2142,86 @@ impl From<Refusal> for RefusalWire {
             reason: refusal.reason,
             message: refusal.message,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::ffi::OsStringExt;
+
+    use super::*;
+
+    fn vars(pairs: &[(&str, OsString)]) -> impl Fn(&str) -> Option<OsString> {
+        let pairs: Vec<(String, OsString)> = pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), value.clone()))
+            .collect();
+        move |name| {
+            pairs
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    /// Review finding on PR #13: `PATH` entries and roots the shell
+    /// resolves, such as `/opt/homebrew//bin`, were left out because they
+    /// are not in the core's one text form, so the node stopped finding
+    /// tools the shell found. Each absolute one is kept as written; only
+    /// one that is not absolute is left out. The TypeScript SDK's test
+    /// reads the same variables to the same environment.
+    #[test]
+    fn the_client_env_keeps_every_absolute_entry_and_root_as_written() {
+        let env = ClientEnv::from_vars(vars(&[
+            (
+                "PATH",
+                "/usr/local/bin/:.:bin::/opt/x/.git:/opt/homebrew//bin:/usr/bin/../bin:/cafe\u{301}/bin://"
+                    .into(),
+            ),
+            ("CARGO_HOME", "/Users/me//.cargo/".into()),
+            ("RUSTUP_HOME", ".rustup".into()),
+            ("PNPM_HOME", "".into()),
+        ]))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&env).unwrap(),
+            serde_json::json!({
+                "path": [
+                    "/usr/local/bin/",
+                    "/opt/x/.git",
+                    "/opt/homebrew//bin",
+                    "/usr/bin/../bin",
+                    "/cafe\u{301}/bin",
+                    "//"
+                ],
+                "roots": { "cargo_home": "/Users/me//.cargo/" }
+            })
+        );
+    }
+
+    /// An absolute entry or root that is not UTF-8 cannot cross the
+    /// socket; it fails the request instead of vanishing from it.
+    #[test]
+    fn an_absolute_entry_that_is_not_utf8_fails_instead_of_vanishing() {
+        let path = OsString::from_vec(b"/usr/bin:/opt/\xff/bin".to_vec());
+        assert_eq!(
+            ClientEnv::from_vars(vars(&[("PATH", path)])),
+            Err(EnvError {
+                var: "PATH",
+                value: OsString::from_vec(b"/opt/\xff/bin".to_vec()),
+            })
+        );
+        let root = OsString::from_vec(b"/opt/\xff".to_vec());
+        assert!(matches!(
+            ClientEnv::from_vars(vars(&[("CARGO_HOME", root)])),
+            Err(EnvError {
+                var: "CARGO_HOME",
+                ..
+            })
+        ));
+        // A relative one is left out, as every relative entry is.
+        let path = OsString::from_vec(b"/usr/bin:\xff/bin".to_vec());
+        let env = ClientEnv::from_vars(vars(&[("PATH", path)])).unwrap();
+        assert_eq!(env.path_var(), "/usr/bin");
     }
 }

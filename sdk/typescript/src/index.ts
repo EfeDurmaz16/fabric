@@ -36,7 +36,6 @@ export {
 } from "./errors.ts";
 export { createFrameDecoder, decodeJson, encodeFrame, type FrameDecoder, MAX_FRAME } from "./frame.ts";
 export {
-  AbsPath,
   AcpSettings,
   API_VERSION,
   Answer,
@@ -100,6 +99,7 @@ export {
   SessionId,
   type SessionRecorded,
   SnapshotId,
+  SystemPath,
   SnapshotState,
   Standing,
   StealWarning,

@@ -418,7 +418,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let request = Request::Doctor {
                 peer,
                 job,
-                env: Some(ClientEnv::current()),
+                env: Some(ClientEnv::current()?),
             };
             let reply = ask(&client, &request, Notes::Stdout).await?;
             // The node reports; a row that would stop a move still fails
@@ -456,7 +456,7 @@ async fn serve(state: StateDir, home: PathBuf, args: ServeArgs) -> Result<ExitCo
         home,
         listen: args.listen,
         dial,
-        env: ClientEnv::current(),
+        env: ClientEnv::current()?,
     })?;
     {
         let mut stdout = std::io::stdout().lock();
@@ -500,7 +500,7 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
         JobCommand::Suspend { job } => (
             Request::JobSuspend {
                 job,
-                env: Some(ClientEnv::current()),
+                env: Some(ClientEnv::current()?),
             },
             Mode::Interactive(None),
         ),
@@ -517,7 +517,7 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
                 on,
                 harness,
                 force,
-                env: Some(ClientEnv::current()),
+                env: Some(ClientEnv::current()?),
             },
             Mode::new(prompt, headless)?,
         ),
@@ -526,7 +526,7 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
                 job,
                 to,
                 force,
-                env: Some(ClientEnv::current()),
+                env: Some(ClientEnv::current()?),
             },
             Mode::Interactive(None),
         ),

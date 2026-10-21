@@ -455,44 +455,36 @@ export type DoctorReport = z.infer<typeof DoctorReport>;
 
 // The client's environment (ADR 0018, The client's environment).
 
-/** The core's `AbsPath` rules: absolute, no empty, `.`, `..` or `.git` component, no NUL, NFC. */
-function isAbsPath(text: string): boolean {
-  if (!text.startsWith("/")) {
-    return false;
-  }
-  const rest = text.slice(1);
-  if (rest === "") {
-    return true;
-  }
-  if (rest.includes("\u0000")) {
-    return false;
-  }
-  for (const component of rest.split("/")) {
-    // ASCII case only, as Rust's `eq_ignore_ascii_case`: APFS and casefolded ext4 fold `.Git` onto `.git`.
-    if (component === "" || component === "." || component === ".." || /^\.git$/i.test(component)) {
-      return false;
-    }
-  }
-  return text.normalize("NFC") === text;
-}
+/**
+ * An absolute path as the operating system resolves it: text that starts
+ * with `/` and holds no NUL, as Rust's `SystemPath`. Unlike the core's one
+ * text form, it keeps `//`, `.`, `..`, a trailing `/`, a `.git` component
+ * and any Unicode form, because the kernel reads it: a tool root or a
+ * `PATH` directory names the directory the client's shell names. A
+ * relative path would name a directory of the node's choosing.
+ */
+export const SystemPath = z
+  .string()
+  .refine((text) => text.startsWith("/") && !text.includes("\u0000"), "not an absolute path")
+  .brand<"SystemPath">();
+export type SystemPath = z.infer<typeof SystemPath>;
 
-/** An absolute path on the node in the core's one text form. */
-export const AbsPath = z.string().refine(isAbsPath, "not an absolute path in its text form").brand<"AbsPath">();
-export type AbsPath = z.infer<typeof AbsPath>;
-
-/** One directory of a `PATH`: an `AbsPath` without a `:`, which would split it in two. */
+/** One directory of a `PATH`: a `SystemPath` without a `:`, which would split it in two. */
 export const PathDir = z
   .string()
-  .refine((text) => !text.includes(":") && isAbsPath(text), "not an absolute PATH directory without a `:`")
+  .refine(
+    (text) => !text.includes(":") && SystemPath.safeParse(text).success,
+    "not an absolute PATH directory without a `:`",
+  )
   .brand<"PathDir">();
 export type PathDir = z.infer<typeof PathDir>;
 
 /** The tool roots a node takes from a client; a root that is absent is unset for the request. */
 export const Roots = z.object({
-  cargo_home: optional(AbsPath),
-  rustup_home: optional(AbsPath),
-  pnpm_home: optional(AbsPath),
-  xdg_data_home: optional(AbsPath),
+  cargo_home: optional(SystemPath),
+  rustup_home: optional(SystemPath),
+  pnpm_home: optional(SystemPath),
+  xdg_data_home: optional(SystemPath),
 });
 export type Roots = z.infer<typeof Roots>;
 
@@ -516,31 +508,28 @@ const ROOT_VARS: Readonly<Record<keyof Roots, string>> = {
 };
 
 /**
- * The environment of this process, as Rust's `ClientEnv::current()`: its
- * `PATH` without the entries that are not absolute directories, such as
- * `.` or a relative one, which would name a directory of the node's
- * choosing, and the roots it sets. A trailing `/` is dropped.
+ * The environment of this process, as Rust's `ClientEnv::from_vars`: its
+ * `PATH` without the entries that are not absolute, such as `.`, an empty
+ * one or a relative one, which would name a directory of the node's
+ * choosing, and each root it sets to an absolute path. Every entry and
+ * root it keeps is kept as written, so the node finds the tools the
+ * client's shell finds. Node hands a variable that is not UTF-8 to
+ * JavaScript with U+FFFD in place of the bytes it cannot decode.
  */
 export function clientEnvFromProcess(vars: Readonly<Record<string, string | undefined>> = process.env): ClientEnv {
   const path = (vars["PATH"] ?? "").split(":").flatMap((dir) => {
-    const parsed = PathDir.safeParse(withoutTrailingSlash(dir));
+    const parsed = PathDir.safeParse(dir);
     return parsed.success ? [parsed.data] : [];
   });
   const roots: Roots = {};
   for (const field of Roots.keyof().options) {
     const value = vars[ROOT_VARS[field]];
-    const parsed = value === undefined ? undefined : AbsPath.safeParse(withoutTrailingSlash(value));
+    const parsed = value === undefined ? undefined : SystemPath.safeParse(value);
     if (parsed?.success) {
       roots[field] = parsed.data;
     }
   }
   return { path, roots };
-}
-
-/** `text` without the `/` it ends with, unless it is `/`. */
-function withoutTrailingSlash(text: string): string {
-  const trimmed = text.replace(/\/+$/, "");
-  return trimmed === "" ? text.slice(0, 1) : trimmed;
 }
 
 // Requests and replies.

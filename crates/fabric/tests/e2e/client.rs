@@ -15,7 +15,7 @@ use serde_json::json;
 use tokio::net::UnixStream;
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::world::{Env, Fallible, Node, Wire, finish, text};
@@ -204,7 +204,10 @@ async fn e2e_a_node_turns_away_another_api_version_and_a_request_it_cannot_read(
 /// Review finding on PR #8: capture measured carry keys with the node's
 /// `CARGO_HOME` instead of the requesting CLI's. The node here starts with
 /// neither `CARGO_HOME` nor `PNPM_HOME` nor the CLI's tool directory, so
-/// every value below can only come from the CLI's environment.
+/// every value below can only come from the CLI's environment. The tool
+/// directory and `CARGO_HOME` are written with `//` and a trailing `/`,
+/// as a shell resolves them and the core's one text form does not, and
+/// still reach the node (review finding on PR #13).
 #[test]
 fn e2e_doctor_measures_in_the_clis_environment_not_the_nodes() {
     let env = Env::new().unwrap();
@@ -218,10 +221,10 @@ fn e2e_doctor_measures_in_the_clis_environment_not_the_nodes() {
     )
     .unwrap();
     std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let mut path = bin.into_os_string();
-    path.push(":");
+    let mut path = env.root.clone().into_os_string();
+    path.push("//cli-bin/:");
     path.push(env.path());
-    let cargo = env.root.join("cli-cargo");
+    let cargo = PathBuf::from(format!("{}//cli-cargo/", env.root.display()));
     let pnpm_home = env.root.join("cli-pnpm");
     let doctor = node
         .spawn_with(

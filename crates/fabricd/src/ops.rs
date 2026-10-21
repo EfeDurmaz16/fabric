@@ -2385,7 +2385,7 @@ pub(crate) mod tests {
             home,
             listen: "127.0.0.1:0".parse().unwrap(),
             dial: DialOrder::TcpOnly,
-            env: ClientEnv::current(),
+            env: ClientEnv::current().unwrap(),
         })
         .unwrap();
         (dir, node)
@@ -2461,7 +2461,7 @@ pub(crate) mod tests {
         let (dir_a, a) = node();
         let (_dir_b, b) = node();
         paired(&a, &b).await;
-        let path = ClientEnv::current();
+        let path = ClientEnv::current().unwrap();
         let out = &mut Out::default();
         let id = job(dir_a.path(), &a).await;
         a.suspend(id, &path, out).await.unwrap();
@@ -2526,7 +2526,7 @@ pub(crate) mod tests {
     async fn a_session_named_after_the_start_is_recorded_only_for_the_recorded_harness() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = ClientEnv::current();
+        let path = ClientEnv::current().unwrap();
         let out = &mut Out::default();
         node.suspend(id, &path, out).await.unwrap();
         node.job_run(id, out).await.unwrap();
@@ -2585,7 +2585,7 @@ pub(crate) mod tests {
     async fn a_move_toward_another_node_refuses_with_the_open_moves_target() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = ClientEnv::current();
+        let path = ClientEnv::current().unwrap();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         let (first, second) = (NodeId::from_bytes([7; 32]), NodeId::from_bytes([8; 32]));
         node.depart(id, first, &mut Out::default()).await.unwrap();
@@ -2615,7 +2615,7 @@ pub(crate) mod tests {
     async fn status_calls_a_departing_clean_copy_clean() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = ClientEnv::current();
+        let path = ClientEnv::current().unwrap();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         node.depart(id, NodeId::from_bytes([7; 32]), &mut Out::default())
             .await
@@ -2637,7 +2637,7 @@ pub(crate) mod tests {
         let (_dir_b, b) = node();
         paired(&a, &b).await;
         let id = job(dir_a.path(), &a).await;
-        let path = ClientEnv::current();
+        let path = ClientEnv::current().unwrap();
         a.suspend(id, &path, &mut Out::default()).await.unwrap();
         b.pull_records(id, a.id).await.unwrap();
         b.ensure_latest(id, a.id).await.unwrap();
@@ -2670,7 +2670,7 @@ pub(crate) mod tests {
         let (_dir_b, b) = node();
         paired(&a, &b).await;
         let id = job(dir_a.path(), &a).await;
-        let path = ClientEnv::current();
+        let path = ClientEnv::current().unwrap();
         a.suspend(id, &path, &mut Out::default()).await.unwrap();
         for (harness, login) in [
             (None, crate::facts::name::CODEX_LOGIN),
@@ -2704,7 +2704,7 @@ pub(crate) mod tests {
         let root = paths::job_root(&node.cfg.home, id);
         std::fs::create_dir_all(root.join(".fabric")).unwrap();
         std::fs::write(root.join(".fabric/env.toml"), "not toml [\n").unwrap();
-        let path = ClientEnv::current();
+        let path = ClientEnv::current().unwrap();
         let refused = node.suspend(id, &path, &mut Out::default()).await;
         assert!(matches!(refused, Err(NodeError::Detect(_))), "{refused:?}");
         let job = node.job(id).await.unwrap();
@@ -2725,7 +2725,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         std::fs::write(root.join("users.sqlite"), "rows\n").unwrap();
-        let path = ClientEnv::current();
+        let path = ClientEnv::current().unwrap();
         let mut out = Out::default();
         node.suspend(id, &path, &mut out).await.unwrap();
         assert!(
@@ -2743,7 +2743,7 @@ pub(crate) mod tests {
     async fn a_resume_restores_a_clean_workspace_that_was_deleted() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = ClientEnv::current();
+        let path = ClientEnv::current().unwrap();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         let root = paths::job_root(&node.cfg.home, id);
         std::fs::remove_dir_all(&root).unwrap();
@@ -2790,7 +2790,7 @@ pub(crate) mod tests {
         a.node_add(b.id, Some(&addr)).await.unwrap();
         b.node_add(a.id, None).await.unwrap();
         a.node_ping(b.id).await.unwrap();
-        let path = ClientEnv::current();
+        let path = ClientEnv::current().unwrap();
         // The two test homes differ, which the table refuses; what matters
         // is that the table was made from the peer's answer.
         let answered = b.doctor(Some(a.id), None, &path).await.unwrap();
@@ -2832,7 +2832,7 @@ pub(crate) mod tests {
         ] {
             node.node_add(peer, addr.map(String::as_str)).await.unwrap();
         }
-        let path = ClientEnv::current();
+        let path = ClientEnv::current().unwrap();
         let out = &mut Out::default();
         let id = job(dir_a.path(), &a).await;
         a.suspend(id, &path, out).await.unwrap();
@@ -2893,7 +2893,7 @@ pub(crate) mod tests {
         b.node_add(a.id, None).await.unwrap();
         a.node_ping(b.id).await.unwrap();
         let id = job(dir_b.path(), &b).await;
-        let path = ClientEnv::current();
+        let path = ClientEnv::current().unwrap();
         let mut out = Out::default();
         b.suspend(id, &path, &mut out).await.unwrap();
         b.replicate(id, &mut out).await;

@@ -278,18 +278,21 @@ describe("the client", () => {
 });
 
 describe("clientEnvFromProcess", () => {
-  // A relative entry or `.` would name a directory of the node's choosing, so it is left out, not sent.
-  test("keeps the absolute PATH entries without their trailing slash and the roots that parse", () => {
+  // Review finding on PR #13: entries the shell resolves, such as `/opt/homebrew//bin`, were left out
+  // because they are not in the core's one text form. A relative entry or `.` would name a directory of
+  // the node's choosing, so it is left out, not sent; every absolute one is kept as written. The Rust
+  // test `the_client_env_keeps_every_absolute_entry_and_root_as_written` reads the same variables.
+  test("keeps every absolute PATH entry and root as written and leaves out the relative ones", () => {
     const env = clientEnvFromProcess({
-      PATH: "/usr/local/bin/:.:bin::/opt/x/.git:/opt/homebrew/bin://",
-      CARGO_HOME: "/Users/me/.cargo/",
+      PATH: "/usr/local/bin/:.:bin::/opt/x/.git:/opt/homebrew//bin:/usr/bin/../bin:/cafe\u0301/bin://",
+      CARGO_HOME: "/Users/me//.cargo/",
       RUSTUP_HOME: ".rustup",
       PNPM_HOME: "",
       HOME: "/Users/me",
     });
     expect(JSON.parse(JSON.stringify(env))).toStrictEqual({
-      path: ["/usr/local/bin", "/opt/homebrew/bin", "/"],
-      roots: { cargo_home: "/Users/me/.cargo" },
+      path: ["/usr/local/bin/", "/opt/x/.git", "/opt/homebrew//bin", "/usr/bin/../bin", "/cafe\u0301/bin", "//"],
+      roots: { cargo_home: "/Users/me//.cargo/" },
     });
   });
 });
