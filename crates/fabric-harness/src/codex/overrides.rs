@@ -25,7 +25,11 @@
 //! `codex-rs/tui/src/app_server_session.rs` at the same tag), so a
 //! policy carried alone would let the node's reviewer answer what the
 //! session's user answered, or the other way round; the reviewer
-//! travels with the policy. `codex exec resume` sends none unless `-c`
+//! travels with the policy, and only with it: when a terminal launch
+//! does not pass the session's policy, because it is a recorded `never`,
+//! one Fabric does not carry, or a pin replaced it, the session's
+//! reviewer is reported as left out too, so the node's policy keeps the
+//! node's reviewer. A pinned reviewer still passes. `codex exec resume` sends none unless `-c`
 //! sets it, and Codex then restores the thread's own from the rollout
 //! (`latest_persisted_resume_settings`, `codex-rs/app-server` at the
 //! same tag), so a headless launch neither passes nor reports the
@@ -292,6 +296,11 @@ const EXEC_SETS_APPROVAL: &str = "codex exec sets it: never, or this node's own 
 const EXEC_RECORDS_NEVER: &str =
     "codex exec records never for the turns it runs, so it may not be the session's own";
 
+/// Why a terminal launch that does not pass the session's approval policy
+/// does not pass the session's reviewer either.
+const REVIEWER_GOES_WITH_APPROVAL: &str =
+    "it goes with the session's approval policy, which this launch does not pass";
+
 /// The approval a terminal launch may carry from the session: any but a
 /// recorded `never`, which may be the one `codex exec` forced.
 fn terminal_approval(recorded: &Recorded<ApprovalPolicy>) -> Recorded<ApprovalPolicy> {
@@ -332,7 +341,8 @@ fn leave_out<T>(
 /// launch resumes one and Fabric carries its value. A `headless` launch
 /// passes no approval policy, because `codex exec` sets its own, and a
 /// terminal launch does not carry a recorded `never`, because `codex
-/// exec` records the one it forced.
+/// exec` records the one it forced. A terminal launch carries the
+/// session's reviewer only when it carries the session's policy.
 pub(crate) fn effective(
     pinned: Option<&CodexOverrides>,
     recorded: Option<&RecordedSettings>,
@@ -363,6 +373,7 @@ pub(crate) fn effective(
     let pinned_approval = pinned.and_then(|p| p.approval.as_ref());
     let recorded_approval = recorded.map(|r| &r.approval);
     let spell_approval = |v: &ApprovalPolicy| v.as_str().to_owned();
+    let mut session_approval = false;
     let approval = if headless {
         leave_out(
             SettingName::Approval,
@@ -375,6 +386,8 @@ pub(crate) fn effective(
         None
     } else {
         let recorded_approval = recorded_approval.map(terminal_approval);
+        session_approval =
+            pinned_approval.is_none() && matches!(recorded_approval, Some(Recorded::Carried(_)));
         pick(
             SettingName::Approval,
             pinned_approval,
@@ -384,18 +397,38 @@ pub(crate) fn effective(
         )
     };
     // Under `codex exec resume`, Codex restores the thread's own reviewer
-    // when none is passed, so only a pin is.
-    let reviewer = pick(
-        SettingName::Reviewer,
-        pinned.and_then(|p| p.reviewer.as_ref()),
-        if headless {
-            None
-        } else {
-            recorded.map(|r| &r.reviewer)
-        },
-        |v| v.as_str().to_owned(),
-        &mut report,
-    );
+    // when none is passed, so only a pin is. A terminal launch passes the
+    // session's reviewer only with the session's policy.
+    let pinned_reviewer = pinned.and_then(|p| p.reviewer.as_ref());
+    let recorded_reviewer = recorded.map(|r| &r.reviewer);
+    let spell_reviewer = |v: &ApprovalsReviewer| v.as_str().to_owned();
+    let reviewer = if headless {
+        pick(
+            SettingName::Reviewer,
+            pinned_reviewer,
+            None,
+            spell_reviewer,
+            &mut report,
+        )
+    } else if pinned_reviewer.is_some() || session_approval {
+        pick(
+            SettingName::Reviewer,
+            pinned_reviewer,
+            recorded_reviewer,
+            spell_reviewer,
+            &mut report,
+        )
+    } else {
+        leave_out(
+            SettingName::Reviewer,
+            None,
+            recorded_reviewer,
+            spell_reviewer,
+            REVIEWER_GOES_WITH_APPROVAL,
+            &mut report,
+        );
+        None
+    };
     let overrides = CodexOverrides {
         sandbox,
         approval,
@@ -533,19 +566,76 @@ mod tests {
                 .iter()
                 .all(|p| p.name != SettingName::Approval)
         );
-        assert_eq!(
-            report.not_carried.last(),
-            Some(&NotCarried::new(
-                SettingName::Approval,
-                "never",
-                EXEC_RECORDS_NEVER
-            ))
-        );
+        assert!(report.not_carried.contains(&NotCarried::new(
+            SettingName::Approval,
+            "never",
+            EXEC_RECORDS_NEVER
+        )));
         let pinned = CodexOverrides {
             approval: Some(ApprovalPolicy::Never),
             ..CodexOverrides::default()
         };
         let (overrides, _) = effective(Some(&pinned), Some(&after_exec), false);
         assert_eq!(overrides.approval, Some(ApprovalPolicy::Never));
+    }
+
+    /// The reviewer says who answers what the approval policy asks, so a
+    /// terminal launch passes the session's reviewer only with the
+    /// session's policy. When the policy it passes is the node's, a
+    /// recorded `never` or one Fabric does not carry having been left out,
+    /// or a pin's, the session's reviewer is left out too and reported, so
+    /// a node that sends approvals to auto review is not made to ask the
+    /// terminal. A pinned reviewer still passes.
+    #[test]
+    fn a_terminal_launch_carries_the_reviewer_only_with_the_policy() {
+        let reviewer_left_out =
+            NotCarried::new(SettingName::Reviewer, "user", REVIEWER_GOES_WITH_APPROVAL);
+        let after_exec = RecordedSettings {
+            approval: Recorded::Carried(ApprovalPolicy::Never),
+            ..recorded()
+        };
+        let not_carried_policy = RecordedSettings {
+            approval: Recorded::NotCarried {
+                value: "on-failure".to_owned(),
+                reason: "not an approval policy Fabric passes".to_owned(),
+            },
+            ..recorded()
+        };
+        let pinned_policy = CodexOverrides {
+            approval: Some(ApprovalPolicy::OnRequest),
+            ..CodexOverrides::default()
+        };
+        for (pinned, session) in [
+            (None, &after_exec),
+            (None, &not_carried_policy),
+            (Some(&pinned_policy), &recorded()),
+        ] {
+            let (overrides, report) = effective(pinned, Some(session), false);
+            assert_eq!(overrides.reviewer, None, "{pinned:?} {session:?}");
+            assert!(
+                report
+                    .passed
+                    .iter()
+                    .all(|p| p.name != SettingName::Reviewer),
+                "{report:?}"
+            );
+            assert_eq!(report.not_carried.last(), Some(&reviewer_left_out));
+        }
+
+        let (overrides, _) = effective(None, Some(&recorded()), false);
+        assert_eq!(overrides.reviewer, Some(ApprovalsReviewer::User));
+
+        let pinned_reviewer = CodexOverrides {
+            reviewer: Some(ApprovalsReviewer::AutoReview),
+            ..CodexOverrides::default()
+        };
+        let (overrides, report) = effective(Some(&pinned_reviewer), Some(&after_exec), false);
+        assert_eq!(overrides.reviewer, Some(ApprovalsReviewer::AutoReview));
+        assert!(
+            report
+                .not_carried
+                .iter()
+                .all(|n| n.name != SettingName::Reviewer)
+        );
     }
 }

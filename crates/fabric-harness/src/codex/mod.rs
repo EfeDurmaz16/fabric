@@ -1293,58 +1293,76 @@ mod tests {
         assert_eq!(fixture.ran(), None, "codex ran unguarded");
     }
 
-    /// A terminal resume after a headless turn: the `never` that `codex
-    /// exec` recorded is not carried, and the approvals reviewer the
-    /// session ran with is, so the node's own reviewer does not take over
-    /// what the session's user answered.
+    /// A terminal resume passes the approvals reviewer the session ran
+    /// with together with its approval policy, so the node's own reviewer
+    /// does not answer what the session's user answered. After a headless
+    /// turn, the `never` that `codex exec` recorded is not carried, and
+    /// neither is the reviewer that goes with it: the node's policy then
+    /// asks, and the node's reviewer answers.
     #[tokio::test]
-    async fn a_terminal_resume_carries_the_reviewer_and_not_a_recorded_never() {
+    async fn a_terminal_resume_carries_the_reviewer_only_with_the_policy() {
         let fixture = Resume::new("codex-cli 0.155.1");
         let rollout = std::fs::read_to_string(&fixture.rollout).unwrap();
-        let after_exec = rollout.replace(
-            "\"approval_policy\":\"on-request\"",
-            "\"approval_policy\":\"never\",\"approvals_reviewer\":\"user\"",
-        );
-        assert_ne!(after_exec, rollout);
-        std::fs::write(&fixture.rollout, after_exec).unwrap();
-        let launch = Launch::Interactive {
-            resume: Some(SessionId::parse(THREAD).unwrap()),
-            prompt: None,
+        let resume = async |approval: &str| {
+            let ran_with = rollout.replace(
+                "\"approval_policy\":\"on-request\"",
+                &format!("\"approval_policy\":\"{approval}\",\"approvals_reviewer\":\"user\""),
+            );
+            assert_ne!(ran_with, rollout);
+            std::fs::write(&fixture.rollout, ran_with).unwrap();
+            let launch = Launch::Interactive {
+                resume: Some(SessionId::parse(THREAD).unwrap()),
+                prompt: None,
+            };
+            let mut running = fixture
+                .adapter
+                .launch(&fixture.home.join("work"), launch, &fixture.env)
+                .await
+                .unwrap();
+            running.child_mut().wait().await.unwrap();
+            let settings = running.settings();
+            let passed: Vec<String> = settings
+                .passed
+                .iter()
+                .map(|p| format!("{} {}", p.name, p.value))
+                .collect();
+            let left: Vec<String> = settings
+                .not_carried
+                .iter()
+                .map(|n| format!("{} {}", n.name, n.value))
+                .collect();
+            (fixture.ran().unwrap(), passed, left)
         };
-        let mut running = fixture
-            .adapter
-            .launch(&fixture.home.join("work"), launch, &fixture.env)
-            .await
-            .unwrap();
-        running.child_mut().wait().await.unwrap();
-        let ran = fixture.ran().unwrap();
+
+        let (ran, passed, left) = resume("on-request").await;
         assert!(
             ran.iter().any(|a| a == "approvals_reviewer=\"user\"")
-                && !ran.iter().any(|a| a.starts_with("approval_policy=")),
+                && ran.iter().any(|a| a == "approval_policy=\"on-request\""),
             "{ran:?}"
         );
-        let passed: Vec<String> = running
-            .settings()
-            .passed
-            .iter()
-            .map(|p| format!("{} {}", p.name, p.value))
-            .collect();
         assert_eq!(
             passed,
             [
                 "model gpt-6-sol",
                 "effort xhigh",
                 "sandbox workspace-write",
+                "approval on-request",
                 "approvals reviewer user"
             ]
         );
-        let left: Vec<String> = running
-            .settings()
-            .not_carried
-            .iter()
-            .map(|n| format!("{} {}", n.name, n.value))
-            .collect();
-        assert_eq!(left, ["approval never"]);
+        assert!(left.is_empty(), "{left:?}");
+
+        let (ran, passed, left) = resume("never").await;
+        assert!(
+            !ran.iter().any(|a| a.starts_with("approvals_reviewer="))
+                && !ran.iter().any(|a| a.starts_with("approval_policy=")),
+            "{ran:?}"
+        );
+        assert_eq!(
+            passed,
+            ["model gpt-6-sol", "effort xhigh", "sandbox workspace-write"]
+        );
+        assert_eq!(left, ["approval never", "approvals reviewer user"]);
     }
 
     /// A terminal resume that passes the thread's model passes its effort
