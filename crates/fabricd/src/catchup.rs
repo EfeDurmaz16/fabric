@@ -129,7 +129,8 @@ impl Node {
         *self.recovered.borrow()
     }
 
-    /// Pulls every job this node knows from `peer` and settles each one.
+    /// Pulls every job this node knows from `peer`, fetches its latest
+    /// snapshot when the store lacks it, and settles each one.
     ///
     /// It stops at the first failure to reach the peer, so an unreachable
     /// peer costs one dial per pass and not one per job. Any other failure
@@ -138,7 +139,14 @@ impl Node {
         let ids: Vec<JobId> = self.jobs.lock().await.keys().copied().collect();
         for id in ids {
             let mut out = Out::default();
-            match self.pull_records(id, peer).await {
+            // A pull, unlike a push, fetches no snapshot, and the next
+            // pull finds the ledger up to date; the latest snapshot is
+            // fetched here so the replica can restore or steal the job.
+            let caught_up = match self.pull_records(id, peer).await {
+                Ok(()) => self.ensure_latest(id, peer).await,
+                Err(e) => Err(e),
+            };
+            match caught_up {
                 Ok(()) => {}
                 Err(e @ (NodeError::Unreachable { .. } | NodeError::UnknownPeer(_))) => {
                     return Err(e);
@@ -342,5 +350,33 @@ impl Node {
                 return Ok(epoch);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::node::Out;
+    use crate::ops::tests::{job, node, paired};
+    use crate::transfer::is_complete;
+
+    /// A replica that learned a suspend by a pull, with no push and so no
+    /// fetch, must fetch the snapshot at its next catch-up: the pull then
+    /// finds the ledger up to date, and without the snapshot the replica
+    /// cannot restore or steal the job once the owner is gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_catch_up_fetches_the_snapshot_a_pull_left_out() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let snapshot = a.suspend(id, &path, &mut Out::default()).await.unwrap();
+        b.pull_records(id, a.id).await.unwrap();
+        assert!(!is_complete(&b.store, snapshot).await.unwrap());
+        b.catch_up_peer(a.id).await.unwrap();
+        assert!(
+            is_complete(&b.store, snapshot).await.unwrap(),
+            "the catch-up left the replica without the latest snapshot"
+        );
     }
 }

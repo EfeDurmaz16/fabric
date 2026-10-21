@@ -2535,7 +2535,7 @@ pub(crate) mod tests {
     }
 
     /// Serves `a` and `b` and pairs them, each with the other's address.
-    async fn paired(a: &Arc<Node>, b: &Arc<Node>) {
+    pub(crate) async fn paired(a: &Arc<Node>, b: &Arc<Node>) {
         for (node, peer) in [(a, b), (b, a)] {
             tokio::spawn(Arc::clone(node).run());
             let addr = peer.local_addr().unwrap().to_string();
