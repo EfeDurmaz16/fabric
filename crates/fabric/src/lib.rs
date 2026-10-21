@@ -473,11 +473,7 @@ async fn launch(
     let socket = state.socket();
     let env = environment();
     let resume = plan.session.clone();
-    let harness_env = HarnessEnv::new(
-        home,
-        path_var(),
-        plan.harness_config.clone(),
-    )?;
+    let harness_env = HarnessEnv::new(home, path_var(), plan.harness_config.clone())?;
     let first = prompt.or_else(|| resume.is_none().then(|| plan.goal.clone()));
     let (mut running, interactive) = match &plan.harness {
         HarnessKind::ClaudeCode => {

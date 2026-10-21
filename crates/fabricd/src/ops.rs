@@ -452,7 +452,14 @@ impl Node {
                 pid: record.pid.get(),
             });
         }
-        plan(&job, token.epoch, marker.root, None, &self.harness_config, out)
+        plan(
+            &job,
+            token.epoch,
+            marker.root,
+            None,
+            &self.harness_config,
+            out,
+        )
     }
 
     /// Records the harness the CLI launched and appends `Resumed`, or refuses.
@@ -1890,15 +1897,14 @@ impl Node {
         out: &mut Out,
     ) -> Result<(), NodeError> {
         let here = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
-        let session = self.dial(peer).await?;
-        let theirs =
-            session
-                .facts(SHORT_DEADLINE * 4)
-                .await
-                .map_err(|e| NodeError::Unreachable {
-                    peer,
-                    reason: e.to_string(),
-                })?;
+        // A session the peer opened is used too: a peer behind a NAT has
+        // no address here and is reachable only over the session it dialed.
+        let (theirs, clock_skew_ms, wire) = self
+            .call(peer, |session| async move {
+                let facts = session.facts(SHORT_DEADLINE * 4).await?;
+                Ok((facts, session.clock_skew_ms(), session.kind().to_string()))
+            })
+            .await?;
         let theirs = NodeFacts::from_wire(&theirs);
         let rows = doctor::compare(
             &here,
@@ -1907,8 +1913,8 @@ impl Node {
                 harness: job.map(|(h, _)| h),
                 root: job.map(|(_, r)| r),
                 target,
-                clock_skew_ms: Some(session.clock_skew_ms()),
-                wire: Some(session.kind().to_string()),
+                clock_skew_ms: Some(clock_skew_ms),
+                wire: Some(wire),
             },
         );
         for row in &rows {
@@ -2572,6 +2578,38 @@ pub(crate) mod tests {
         let sent: RunPlan = postcard::from_bytes(&postcard::to_stdvec(&plan).unwrap()).unwrap();
         assert_eq!(sent.harness_config, node.harness_config);
         assert!(sent.harness_config.acp.is_empty());
+    }
+
+    /// A peer paired without an address, as the Air pairs the Pro, is
+    /// reachable over the session it opened, so doctor works from this side.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn doctor_reaches_an_addressless_peer_over_its_session() {
+        let (_dir_a, a) = node();
+        let (_dir_b, b) = node();
+        tokio::spawn(Arc::clone(&a).run());
+        tokio::spawn(Arc::clone(&b).run());
+        let addr = b.local_addr().unwrap().to_string();
+        a.node_add(b.id, Some(&addr), &mut Out::default())
+            .await
+            .unwrap();
+        b.node_add(a.id, None, &mut Out::default()).await.unwrap();
+        a.node_ping(b.id, &mut Out::default()).await.unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut out = Out::default();
+        // The two test homes differ, which the table refuses; what matters
+        // is that the table was made from the peer's answer.
+        let answered = b.doctor(Some(a.id), None, &path, &mut out).await;
+        assert!(
+            matches!(answered, Ok(()) | Err(NodeError::Preflight(_))),
+            "{answered:?}"
+        );
+        assert!(
+            out.lines
+                .iter()
+                .any(|line| line.contains(" network ") && line.contains("tcp+tls")),
+            "{:?}",
+            out.lines
+        );
     }
 
     #[test]
