@@ -2295,9 +2295,11 @@ fn plan(
     })
 }
 
-/// Says, one line per cache, whether its bytes are written here or rebuilt, and why (ADR 0008).
+/// Says, one line per cache, whether its bytes are written here or rebuilt,
+/// and why (ADR 0008); past `REPORT_PATHS` caches it counts the rest, so a
+/// resume's answer stays within one control message.
 fn report_caches(caches: &[fabric_core::snapshot::CacheEntry], facts: &NodeFacts, out: &mut Out) {
-    for cache in caches {
+    for cache in caches.iter().take(REPORT_PATHS) {
         let mine = facts.key_like(&cache.key);
         if cache.key.matches(&mine) && cache.carry == fabric_core::snapshot::CarryState::Carried {
             out.say(format!("{}: carried, the keys match", cache.path));
@@ -2308,6 +2310,12 @@ fn report_caches(caches: &[fabric_core::snapshot::CacheEntry], facts: &NodeFacts
                 key_difference(&cache.key, &mine)
             ));
         }
+    }
+    if caches.len() > REPORT_PATHS {
+        out.say(format!(
+            "{} more caches, each carried where the keys match and rebuilt here otherwise",
+            caches.len() - REPORT_PATHS
+        ));
     }
 }
 
@@ -4237,6 +4245,28 @@ pub(crate) mod tests {
             matches!(marker.state, MarkerState::Suspending { .. }),
             "{:?}",
             marker.state
+        );
+    }
+
+    /// A snapshot may name any number of cache paths, and a resume's answer
+    /// must stay within one control message, so the cache report names
+    /// the first of them and counts the rest.
+    #[test]
+    fn a_resume_names_a_bounded_number_of_caches() {
+        let caches: Vec<fabric_core::snapshot::CacheEntry> = (0..500)
+            .map(|n| fabric_core::snapshot::CacheEntry {
+                path: fabric_core::path::RelPath::parse(&format!("caches/{n}")).unwrap(),
+                class: fabric_core::snapshot::CacheClass::ToolCache,
+                carry: fabric_core::snapshot::CarryState::NotCarried,
+                key: fabric_core::snapshot::CarryKey::Unmeasured,
+            })
+            .collect();
+        let mut out = Out::default();
+        report_caches(&caches, &NodeFacts::default(), &mut out);
+        assert_eq!(out.lines.len(), REPORT_PATHS + 1, "{:?}", out.lines.last());
+        assert_eq!(
+            out.lines.last().map(String::as_str),
+            Some("480 more caches, each carried where the keys match and rebuilt here otherwise")
         );
     }
 }
