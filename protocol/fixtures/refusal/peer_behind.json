@@ -1,0 +1,10 @@
+{
+  "kind": "failed",
+  "reason": {
+    "code": "peer_behind",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "peer": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+    "epoch": 2
+  },
+  "message": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba answered: it is at epoch 2, older than this node's, and must catch up first"
+}

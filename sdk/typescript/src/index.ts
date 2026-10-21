@@ -90,6 +90,7 @@ export {
   Reason,
   REASON_CODES,
   REASON_KIND,
+  RecordHash,
   Refusal,
   RefusalKind,
   type Registered,

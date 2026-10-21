@@ -18,7 +18,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use fabric_core::harness::HarnessKind;
-use fabric_core::id::{EnvSpecId, Epoch, EventId, JobId, MoveId, NodeId, SnapshotId};
+use fabric_core::id::{EnvSpecId, Epoch, EventId, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::session::SessionId;
 use serde::{Deserialize, Serialize};
 
@@ -2110,6 +2110,65 @@ pub enum Reason {
         #[serde(with = "text")]
         peer: NodeId,
     },
+    /// A peer knows a newer epoch of the job than this node: the job moved
+    /// on without this node, which catches up with `fabric job resume`.
+    PeerAhead {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The peer.
+        #[serde(with = "text")]
+        peer: NodeId,
+        /// The epoch the peer knows.
+        epoch: Epoch,
+    },
+    /// A peer is at an older epoch of the job and must catch up first.
+    PeerBehind {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The peer.
+        #[serde(with = "text")]
+        peer: NodeId,
+        /// The epoch the peer is at.
+        epoch: Epoch,
+    },
+    /// A peer's ledger of the job does not continue this node's: the chains forked.
+    PeerForked {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The peer.
+        #[serde(with = "text")]
+        peer: NodeId,
+        /// The hash of the peer's last record.
+        #[serde(with = "text")]
+        head: RecordHash,
+    },
+    /// The move a peer started does not link to this node's ledger, which
+    /// lacks records it builds on; the pull is run again.
+    MoveUnlinked {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The peer that started the move.
+        #[serde(with = "text")]
+        peer: NodeId,
+        /// The hash of this node's last record.
+        #[serde(with = "text")]
+        head: RecordHash,
+    },
+    /// The move a peer started is at an epoch behind the one this node knows.
+    MoveStale {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The peer that started the move.
+        #[serde(with = "text")]
+        peer: NodeId,
+        /// The epoch this node knows.
+        epoch: Epoch,
+    },
     /// The request did not parse, or names an op the node does not serve.
     BadRequest,
     /// A failure with no structure worth typing: a file, the store, a harness adapter.
@@ -2147,6 +2206,11 @@ impl Reason {
             | Reason::BadAddress { .. }
             | Reason::Peer { .. }
             | Reason::Fetch { .. }
+            | Reason::PeerAhead { .. }
+            | Reason::PeerBehind { .. }
+            | Reason::PeerForked { .. }
+            | Reason::MoveUnlinked { .. }
+            | Reason::MoveStale { .. }
             | Reason::BadRequest
             | Reason::Internal => RefusalKind::Failed,
             Reason::Unrecognized => return None,

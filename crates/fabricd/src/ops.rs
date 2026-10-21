@@ -17,11 +17,11 @@ use std::time::Duration;
 use fabric_client::api::{
     ClientEnv, ClosedJob, Decision, DoctorReport, Event, Fact, HarnessSession, JobCreated, JobList,
     JobLog, JobStatus, JobSummary, Lease, LedgerEvent, LogRecord, NodeIdentity, Paired, Peer,
-    PeerList, Pong, Process, Registered, Reply, Request, RunPlan, SessionRecorded, SnapshotState,
-    Standing, StealWarning, Step, Suspended, View, Wire, Workspace, WorkspaceState,
+    PeerList, Pong, Process, Reason, Registered, Reply, Request, RunPlan, SessionRecorded,
+    SnapshotState, Standing, StealWarning, Step, Suspended, View, Wire, Workspace, WorkspaceState,
 };
 use fabric_core::harness::HarnessKind;
-use fabric_core::id::{Epoch, JobId, NodeId, SnapshotId};
+use fabric_core::id::{Epoch, JobId, MoveId, NodeId, SnapshotId};
 use fabric_core::lease::{FenceError, FencingToken};
 use fabric_core::ledger::{Author, EventKind, Ledger};
 use fabric_core::moves::{CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
@@ -942,28 +942,43 @@ impl Node {
             match answer {
                 Fenced::Answer(Appended::Accepted { .. }) => {}
                 Fenced::Answer(Appended::Rejected { head }) => {
-                    return Err(NodeError::Peer {
+                    return Err(NodeError::peer_fact(
                         peer,
-                        reason: format!(
+                        format!(
                             "its ledger does not continue this one (its head is {head}); the chains forked"
                         ),
-                    });
+                        Reason::PeerForked {
+                            job: id,
+                            peer,
+                            head,
+                        },
+                    ));
                 }
                 Fenced::StaleEpoch { current, .. } => {
-                    return Err(NodeError::Peer {
+                    return Err(NodeError::peer_fact(
                         peer,
-                        reason: format!(
+                        format!(
                             "it knows epoch {current}, newer than this node's; run `fabric job resume {id}` to catch up"
                         ),
-                    });
+                        Reason::PeerAhead {
+                            job: id,
+                            peer,
+                            epoch: current,
+                        },
+                    ));
                 }
                 Fenced::AheadOfUs { current, .. } => {
-                    return Err(NodeError::Peer {
+                    return Err(NodeError::peer_fact(
                         peer,
-                        reason: format!(
+                        format!(
                             "it is at epoch {current}, older than this node's, and must catch up first"
                         ),
-                    });
+                        Reason::PeerBehind {
+                            job: id,
+                            peer,
+                            epoch: current,
+                        },
+                    ));
                 }
             }
         }
@@ -1220,10 +1235,15 @@ impl Node {
                     Asked::Offer(Fenced::StaleEpoch { current, .. })
                     | Asked::Status(Fenced::StaleEpoch { current, .. }),
                 ) => {
-                    return Err(NodeError::Peer {
-                        peer: to,
-                        reason: format!("it knows epoch {current}; the move cannot complete"),
-                    });
+                    return Err(NodeError::peer_fact(
+                        to,
+                        format!("it knows epoch {current}; the move cannot complete"),
+                        Reason::PeerAhead {
+                            job: id,
+                            peer: to,
+                            epoch: current,
+                        },
+                    ));
                 }
                 Ok(
                     Asked::Offer(Fenced::AheadOfUs { current, .. })
@@ -1486,59 +1506,7 @@ impl Node {
         self.pull_records(id, holder).await?;
         self.ensure_latest(id, holder).await?;
         faults::hit(Point::BeforeImport).await;
-        {
-            let job = self.job(id).await?;
-            let mut job = job.lock().await;
-            let ledger = job.ledger();
-            let snapshot = ledger
-                .manifest()
-                .latest_snapshot
-                .ok_or(NodeError::NoSnapshot(id))?;
-            let offer = MoveOffer {
-                job_id: id,
-                move_id,
-                head: ledger.head(),
-                snapshot,
-            };
-            let answer = ledger.answer_offer(
-                self.id,
-                &offer,
-                ledger.lease().epoch(),
-                Some(CompleteSnapshot::new(snapshot)),
-                clock::event_id(),
-                clock::now_ms(),
-            )?;
-            match answer {
-                OfferAnswer::Import(record) => job.commit(record, Author::Node(self.id))?,
-                OfferAnswer::Decided(_) => {}
-                OfferAnswer::Rejected { head } => {
-                    return Err(NodeError::Peer {
-                        peer: holder,
-                        reason: format!(
-                            "its move does not link to this node's head {head}; run the resume again"
-                        ),
-                    });
-                }
-                OfferAnswer::SnapshotIncomplete { snapshot } => {
-                    return Err(NodeError::Peer {
-                        peer: holder,
-                        reason: format!(
-                            "snapshot {snapshot} did not arrive whole; run the resume again"
-                        ),
-                    });
-                }
-                OfferAnswer::Stale { current, .. } => {
-                    return Err(NodeError::Peer {
-                        peer: holder,
-                        reason: format!("the move is at an epoch behind {current}"),
-                    });
-                }
-            }
-            out.emit(Event::ImportedHere {
-                move_id,
-                epoch: job.ledger().lease().epoch(),
-            });
-        }
+        self.import_pulled_move(id, holder, move_id, out).await?;
         // The holder learns the decision now, or from MoveStatus later.
         if let Err(e) = self.push_records(id, holder).await {
             out.emit(Event::HolderNotTold {
@@ -1546,6 +1514,81 @@ impl Node {
                 error: e.to_refusal(),
             });
         }
+        Ok(())
+    }
+
+    /// Imports the move `holder` started for `id`, whose records and
+    /// snapshot this node now holds, or says why its ledger does not take it.
+    async fn import_pulled_move(
+        &self,
+        id: JobId,
+        holder: NodeId,
+        move_id: MoveId,
+        out: &mut Out,
+    ) -> Result<(), NodeError> {
+        let job = self.job(id).await?;
+        let mut job = job.lock().await;
+        let ledger = job.ledger();
+        let snapshot = ledger
+            .manifest()
+            .latest_snapshot
+            .ok_or(NodeError::NoSnapshot(id))?;
+        let offer = MoveOffer {
+            job_id: id,
+            move_id,
+            head: ledger.head(),
+            snapshot,
+        };
+        let answer = ledger.answer_offer(
+            self.id,
+            &offer,
+            ledger.lease().epoch(),
+            Some(CompleteSnapshot::new(snapshot)),
+            clock::event_id(),
+            clock::now_ms(),
+        )?;
+        match answer {
+            OfferAnswer::Import(record) => job.commit(record, Author::Node(self.id))?,
+            OfferAnswer::Decided(_) => {}
+            OfferAnswer::Rejected { head } => {
+                return Err(NodeError::peer_fact(
+                    holder,
+                    format!(
+                        "its move does not link to this node's head {head}; run the resume again"
+                    ),
+                    Reason::MoveUnlinked {
+                        job: id,
+                        peer: holder,
+                        head,
+                    },
+                ));
+            }
+            OfferAnswer::SnapshotIncomplete { snapshot } => {
+                return Err(NodeError::peer_fact(
+                    holder,
+                    format!("snapshot {snapshot} did not arrive whole; run the resume again"),
+                    Reason::Fetch {
+                        snapshot,
+                        peer: holder,
+                    },
+                ));
+            }
+            OfferAnswer::Stale { current, .. } => {
+                return Err(NodeError::peer_fact(
+                    holder,
+                    format!("the move is at an epoch behind {current}"),
+                    Reason::MoveStale {
+                        job: id,
+                        peer: holder,
+                        epoch: current,
+                    },
+                ));
+            }
+        }
+        out.emit(Event::ImportedHere {
+            move_id,
+            epoch: job.ledger().lease().epoch(),
+        });
         Ok(())
     }
 
@@ -2976,6 +3019,57 @@ pub(crate) mod tests {
         };
         assert!(
             fabric_client::frame::encode(&answer).unwrap().len() <= fabric_client::frame::MAX_FRAME
+        );
+    }
+
+    /// Review finding on PR #13: a peer that refused a node's records named
+    /// the epoch it knows only in the sentence, as `peer { peer }`. A owns
+    /// the job at epoch 1; C, which does not know A, steals it and pushes
+    /// the steal to B. When a move from A pushes its records to B, B is at
+    /// epoch 2, and the refusal says so as data, with the sentence it had.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn records_pushed_to_a_peer_at_a_newer_epoch_are_refused_with_it() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        let (_dir_c, c) = node();
+        for node in [&a, &b, &c] {
+            tokio::spawn(Arc::clone(node).run());
+        }
+        for (node, peer) in [(&a, &b), (&b, &a), (&b, &c), (&c, &b)] {
+            let addr = peer.local_addr().unwrap().to_string();
+            node.node_add(peer.id, Some(&addr)).await.unwrap();
+        }
+        let out = &mut Out::default();
+        let env = ToolEnv::current();
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &env, out).await.unwrap();
+        b.pull_records(id, a.id).await.unwrap();
+        b.ensure_latest(id, a.id).await.unwrap();
+        c.pull_records(id, b.id).await.unwrap();
+        c.ensure_latest(id, b.id).await.unwrap();
+        c.job_steal(id, "a sleeps".to_owned(), true, out)
+            .await
+            .unwrap();
+        c.push_records(id, b.id).await.unwrap();
+        assert_eq!(b.lease(id).await.unwrap().epoch, Epoch::new(2).unwrap());
+
+        let refused = a.push_records(id, b.id).await.unwrap_err().to_refusal();
+        assert_eq!(
+            refused.reason(),
+            &Reason::PeerAhead {
+                job: id,
+                peer: b.id,
+                epoch: Epoch::new(2).unwrap(),
+            }
+        );
+        assert_eq!(refused.kind(), fabric_client::api::RefusalKind::Failed);
+        assert!(
+            refused.message().starts_with(&format!(
+                "{} answered: it knows epoch 2, newer than this node's",
+                b.id
+            )),
+            "{}",
+            refused.message()
         );
     }
 

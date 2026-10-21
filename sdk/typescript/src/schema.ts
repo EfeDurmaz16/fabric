@@ -100,6 +100,10 @@ export type SnapshotId = z.infer<typeof SnapshotId>;
 export const EnvSpecId = z.string().regex(HEX_32, "not 64 lowercase hex digits").brand<"EnvSpecId">();
 export type EnvSpecId = z.infer<typeof EnvSpecId>;
 
+/** The hash of one ledger record, which the next record links to. */
+export const RecordHash = z.string().regex(HEX_32, "not 64 lowercase hex digits").brand<"RecordHash">();
+export type RecordHash = z.infer<typeof RecordHash>;
+
 /** A session id a harness minted: safe in a file name and on a command line. */
 export const SessionId = z.string().regex(SESSION_ID, "not a session id").brand<"SessionId">();
 export type SessionId = z.infer<typeof SessionId>;
@@ -254,6 +258,11 @@ const reasonOptions = [
   z.object({ code: z.literal("bad_address"), text: UnicodeText }),
   z.object({ code: z.literal("peer"), peer: NodeId }),
   z.object({ code: z.literal("fetch"), snapshot: SnapshotId, peer: NodeId }),
+  z.object({ code: z.literal("peer_ahead"), job: JobId, peer: NodeId, epoch: Epoch }),
+  z.object({ code: z.literal("peer_behind"), job: JobId, peer: NodeId, epoch: Epoch }),
+  z.object({ code: z.literal("peer_forked"), job: JobId, peer: NodeId, head: RecordHash }),
+  z.object({ code: z.literal("move_unlinked"), job: JobId, peer: NodeId, head: RecordHash }),
+  z.object({ code: z.literal("move_stale"), job: JobId, peer: NodeId, epoch: Epoch }),
   z.object({ code: z.literal("bad_request") }),
   z.object({ code: z.literal("internal") }),
 ] as const;
@@ -297,6 +306,11 @@ export const REASON_KIND: Readonly<Record<KnownReason["code"], RefusalKind>> = {
   bad_address: "failed",
   peer: "failed",
   fetch: "failed",
+  peer_ahead: "failed",
+  peer_behind: "failed",
+  peer_forked: "failed",
+  move_unlinked: "failed",
+  move_stale: "failed",
   bad_request: "failed",
   internal: "failed",
 };

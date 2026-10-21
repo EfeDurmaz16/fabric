@@ -215,6 +215,18 @@ pub enum NodeError {
         /// What it said.
         reason: String,
     },
+    /// The peer answered with a fact that stops the command, such as a
+    /// newer epoch or a ledger that does not continue this one; a client
+    /// reads `fact`, and the sentence says what to do.
+    #[error("{peer} answered: {reason}")]
+    PeerFact {
+        /// The peer.
+        peer: NodeId,
+        /// What it said, with what to do about it.
+        reason: String,
+        /// The fact as the client API names it.
+        fact: Box<Reason>,
+    },
     /// The preflight found rows that stop the move; the facts of those rows.
     #[error(
         "the preflight refused the move: {}; `fabric job move` and `fabric job resume` take --force to waive what can be waived",
@@ -406,6 +418,7 @@ impl NodeError {
             }
             NodeError::BadAddress { text, .. } => Reason::BadAddress { text: text.clone() },
             NodeError::Peer { peer, .. } => Reason::Peer { peer: *peer },
+            NodeError::PeerFact { fact, .. } => (**fact).clone(),
             NodeError::Fetch { snapshot, peer, .. } => Reason::Fetch {
                 snapshot: *snapshot,
                 peer: *peer,
@@ -430,6 +443,15 @@ impl NodeError {
             | NodeError::Wire(_)
             | NodeError::Fault(_)
             | NodeError::Task(_) => Reason::Internal,
+        }
+    }
+
+    /// A peer's answer that names `fact`, with `reason`, what it said.
+    pub(crate) fn peer_fact(peer: NodeId, reason: String, fact: Reason) -> Self {
+        NodeError::PeerFact {
+            peer,
+            reason,
+            fact: Box::new(fact),
         }
     }
 
