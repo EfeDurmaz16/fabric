@@ -203,8 +203,10 @@ export class EnvError extends FabricError {
 }
 
 /**
- * The request does not validate, so it never left the client. Only a
- * caller without the types, or one that cast around them, meets this.
+ * The request, or the client name its hello carries, does not validate,
+ * so it never left the client. A caller meets this with a string that
+ * holds a lone UTF-16 surrogate, or without the types, or by casting
+ * around them.
  */
 export class InvalidRequestError extends FabricError {
   override name = "InvalidRequestError";

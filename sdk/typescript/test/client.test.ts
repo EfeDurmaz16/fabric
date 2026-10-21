@@ -15,6 +15,7 @@ import {
   decodeJson,
   encodeFrame,
   FabricClient,
+  FabricError,
   IncompatibleError,
   InvalidRequestError,
   JobId,
@@ -329,6 +330,21 @@ describe("the client", () => {
       expect(await rejection(call)).toBeInstanceOf(InvalidRequestError);
     }
     expect(node.connections).toHaveLength(0);
+  });
+
+  // Review finding on PR #13: a name cut with `.slice()` failed every call with a raw ZodError, which no
+  // `instanceof FabricError` branch matches.
+  test("refuses a name holding a lone surrogate when it is constructed, with InvalidRequest", () => {
+    const label = "my app \u{1F600}";
+    let error: unknown;
+    try {
+      new FabricClient({ socketPath: "/nowhere/fabric.sock", name: label.slice(0, 8) });
+    } catch (thrown) {
+      error = thrown;
+    }
+    expect(error).toBeInstanceOf(InvalidRequestError);
+    expect(error).toBeInstanceOf(FabricError);
+    expect(new FabricClient({ socketPath: "/nowhere/fabric.sock", name: label }).name).toBe(label);
   });
 
   test("rejects a node that closes right after the hello with ClosedBeforeWelcome", async () => {

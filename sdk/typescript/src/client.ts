@@ -100,10 +100,21 @@ export type Launched = {
 export class FabricClient {
   readonly socketPath: string;
   readonly name: string;
+  readonly #hello: Hello;
 
+  /**
+   * Throws `InvalidRequestError` for a name the hello cannot carry, such
+   * as one cut with `.slice()` in the middle of an emoji, which holds a
+   * lone UTF-16 surrogate.
+   */
   constructor(options: ClientOptions) {
     this.socketPath = options.socketPath;
     this.name = options.name ?? `fabric-sdk-typescript/${SDK_VERSION}`;
+    const hello = Hello.safeParse({ api: API_VERSION, client: this.name });
+    if (!hello.success) {
+      throw new InvalidRequestError(`the client name: ${hello.error.message}`, hello.error);
+    }
+    this.#hello = hello.data;
   }
 
   /** Connects, checks the api version and returns what the node says about itself. */
@@ -306,7 +317,7 @@ export class FabricClient {
     try {
       let answer: HelloAnswer | null;
       try {
-        await exchange.send(Hello.parse({ api: API_VERSION, client: this.name }));
+        await exchange.send(this.#hello);
         answer = await exchange.receive(HelloAnswer);
       } catch (error) {
         // An older node reads the hello as a postcard request it cannot
