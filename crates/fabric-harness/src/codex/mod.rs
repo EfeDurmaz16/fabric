@@ -1347,6 +1347,42 @@ mod tests {
         assert_eq!(left, ["approval never"]);
     }
 
+    /// A terminal resume that passes the thread's model passes its effort
+    /// too, whatever effort codex names: with `-c model` set, codex 0.155.1
+    /// stops restoring the thread's own model and effort and takes this
+    /// node's effort, so an effort left out would drop an `ultra` thread to
+    /// the node's default.
+    #[tokio::test]
+    async fn a_terminal_resume_passes_every_effort_codex_names_with_the_model() {
+        let fixture = Resume::new("codex-cli 0.155.1");
+        let rollout = std::fs::read_to_string(&fixture.rollout).unwrap();
+        for effort in ["ultra", "max", "minimal", "none", "persistent"] {
+            let ran_at =
+                rollout.replace("\"effort\":\"xhigh\"", &format!("\"effort\":\"{effort}\""));
+            assert_ne!(ran_at, rollout);
+            std::fs::write(&fixture.rollout, &ran_at).unwrap();
+            let launch = Launch::Interactive {
+                resume: Some(SessionId::parse(THREAD).unwrap()),
+                prompt: None,
+            };
+            let mut running = fixture
+                .adapter
+                .launch(&fixture.home.join("work"), launch, &fixture.env)
+                .await
+                .unwrap();
+            running.child_mut().wait().await.unwrap();
+            let ran = fixture.ran().unwrap();
+            let pairs: Vec<&str> = ran
+                .iter()
+                .filter(|a| a.starts_with("model"))
+                .map(String::as_str)
+                .collect();
+            let expected = format!("model_reasoning_effort=\"{effort}\"");
+            assert_eq!(pairs, ["model=\"gpt-6-sol\"", expected.as_str()], "{ran:?}");
+            assert!(running.settings().not_carried.is_empty(), "{effort}");
+        }
+    }
+
     /// A headless resume passes the model, effort and sandbox the session
     /// ran with and says so, and leaves the approval policy to `codex
     /// exec`; a new thread reads nothing and passes nothing (gate finding

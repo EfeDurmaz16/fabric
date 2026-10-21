@@ -312,9 +312,7 @@ impl RecordedSettings {
             ModelName::parse(text).map_err(|e| format!("not a model name Fabric passes: {e}"))
         });
         self.effort = setting(payload.get("effort"), |text| {
-            Effort::from_record(text).ok_or_else(|| {
-                "not an effort Fabric passes, which are low, medium, high and xhigh".to_owned()
-            })
+            Effort::from_record(text).ok_or_else(|| "not an effort codex 0.155.1 names".to_owned())
         });
         self.approval = setting(payload.get("approval_policy"), |text| {
             ApprovalPolicy::from_record(text).ok_or_else(|| {
@@ -565,7 +563,7 @@ mod tests {
             meta("0.155.1", Some(THREAD)),
             turn_reviewed(
                 "gpt 6",
-                "ultra",
+                "turbo",
                 "on-failure",
                 "bogus",
                 "danger-full-access"
@@ -579,7 +577,7 @@ mod tests {
         );
         assert_eq!(
             reason(&read.effort),
-            "ultra: not an effort Fabric passes, which are low, medium, high and xhigh"
+            "turbo: not an effort codex 0.155.1 names"
         );
         assert_eq!(
             reason(&read.approval),

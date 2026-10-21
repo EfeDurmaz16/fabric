@@ -31,6 +31,19 @@
 //! same tag), so a headless launch neither passes nor reports the
 //! recorded one; it passes only a pinned one.
 //!
+//! The effort set is every effort Codex 0.155.1 names, `max` and
+//! `ultra` included, not the four `codex --help` lists: with `-c model`
+//! set, a terminal `codex resume` 0.155.1 sends this node's effort, and
+//! the app server then skips its own restore of the thread's model and
+//! effort (`resume_model_settings_for_overrides` in
+//! `codex-rs/tui/src/app/config_persistence.rs` and
+//! `merge_persisted_resume_metadata` in `codex-rs/app-server`, at
+//! `rust-v0.155.1`). So a recorded effort Fabric left out while it
+//! passed the model was not kept but replaced by the node's. A record
+//! that names no effort still resumes on the node's effort when the
+//! model is passed, where Codex alone would clear it to the model's
+//! default; nothing in `-c` can say "no effort".
+//!
 //! A resume takes these settings from the session (`rollout::recorded`),
 //! and any field the adapter was configured with wins over the session's
 //! (`effective`). A launch with no session passes only what was configured.
@@ -138,9 +151,16 @@ impl ApprovalsReviewer {
     }
 }
 
-/// The `model_reasoning_effort` a run uses.
+/// The `model_reasoning_effort` a run uses: every effort Codex 0.155.1
+/// names (`ReasoningEffort` in `codex-rs/protocol/src/openai_models.rs`
+/// at `rust-v0.155.1`). Codex also takes any other text as an effort a
+/// model defines; Fabric does not pass one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effort {
+    /// `none`.
+    None,
+    /// `minimal`.
+    Minimal,
     /// `low`.
     Low,
     /// `medium`.
@@ -149,24 +169,48 @@ pub enum Effort {
     High,
     /// `xhigh`.
     XHigh,
+    /// `max`.
+    Max,
+    /// `ultra`.
+    Ultra,
+    /// `persistent`.
+    Persistent,
 }
 
 impl Effort {
+    /// Every effort, in Codex's order.
+    const ALL: [Effort; 9] = [
+        Effort::None,
+        Effort::Minimal,
+        Effort::Low,
+        Effort::Medium,
+        Effort::High,
+        Effort::XHigh,
+        Effort::Max,
+        Effort::Ultra,
+        Effort::Persistent,
+    ];
+
     /// The spelling Codex uses, in `-c` and in its records.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Effort::None => "none",
+            Effort::Minimal => "minimal",
             Effort::Low => "low",
             Effort::Medium => "medium",
             Effort::High => "high",
             Effort::XHigh => "xhigh",
+            Effort::Max => "max",
+            Effort::Ultra => "ultra",
+            Effort::Persistent => "persistent",
         }
     }
 
     /// The effort a record spells; `None` for any other.
     #[must_use]
     pub fn from_record(text: &str) -> Option<Self> {
-        [Effort::Low, Effort::Medium, Effort::High, Effort::XHigh]
+        Effort::ALL
             .into_iter()
             .find(|effort| effort.as_str() == text)
     }
@@ -370,8 +414,8 @@ mod tests {
         RecordedSettings {
             model: Recorded::Carried(ModelName::parse("gpt-6-sol").unwrap()),
             effort: Recorded::NotCarried {
-                value: "ultra".to_owned(),
-                reason: "not an effort Fabric passes".to_owned(),
+                value: "turbo".to_owned(),
+                reason: "not an effort codex 0.155.1 names".to_owned(),
             },
             approval: Recorded::Carried(ApprovalPolicy::OnRequest),
             reviewer: Recorded::Carried(ApprovalsReviewer::User),
@@ -418,8 +462,8 @@ mod tests {
             report.not_carried,
             [NotCarried::new(
                 SettingName::Effort,
-                "ultra",
-                "not an effort Fabric passes"
+                "turbo",
+                "not an effort codex 0.155.1 names"
             )]
         );
         let (none, report) = effective(None, None, false);
