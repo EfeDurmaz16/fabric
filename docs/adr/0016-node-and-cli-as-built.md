@@ -16,9 +16,10 @@ The core, the store, the network layer, the harness adapters and the environment
 
 ```text
 <state>/
-  daemon.lock   node.key   peers   harness.toml (optional)   fabric.sock
+  daemon.lock   node.key   peers   peers.lock   harness.toml (optional)   fabric.sock
   store/        the store of ADR 0014
   locks/        one tree lock per workspace root, so one installer runs per tree (ADR 0007)
+  harness/      the adapters' departure records and Claude config lock, always under ~/.fabric (ADR 0015)
   jobs/<job-id>/
     ledger      append-only records (ADR 0002)
     manifest    the derived job manifest

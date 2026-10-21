@@ -380,10 +380,14 @@ fn open_store(dir: &std::path::Path) -> Result<Store, NodeError> {
     }
 }
 
-/// The names Fabric writes at the top of a state directory.
-const STATE_ENTRIES: [&str; 9] = [
+/// The names Fabric writes at the top of a state directory. `harness` is
+/// where the adapters keep departure records and the Claude config lock
+/// under `~/.fabric`, which is the state directory unless `FABRIC_HOME`
+/// names another.
+const STATE_ENTRIES: [&str; 10] = [
     "daemon.lock",
     "fabric.sock",
+    "harness",
     "harness.toml",
     "jobs",
     "locks",
@@ -536,6 +540,10 @@ mod tests {
         fs::create_dir(&made).unwrap();
         fs::write(made.join("harness.toml"), "").unwrap();
         fs::write(made.join("peers.42.tmp"), "").unwrap();
+        // The adapters write here under `~/.fabric` whether or not a node
+        // ever ran with it as its state directory.
+        fs::create_dir_all(made.join("harness/locks")).unwrap();
+        fs::write(made.join("harness/locks/claude-config.lock"), "").unwrap();
         fs::set_permissions(&made, fs::Permissions::from_mode(0o755)).unwrap();
         prepare_state_dir(&made).unwrap();
         assert_eq!(mode(&made), 0o700);
