@@ -176,8 +176,10 @@ pub struct PassedSetting {
 /// The most characters of a recorded value a report shows.
 const SHOWN_VALUE_LEN: usize = 64;
 
-/// A setting the session records that a launch did not pass, so the
-/// harness falls back to this node's own configuration for it.
+/// A setting the session records, or the adapter was configured with
+/// (`Origin::Pinned`), that a launch did not pass, so the harness falls
+/// back to this node's own configuration for it. A pinned approval policy
+/// on a headless Codex launch is one: `codex exec` sets its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotCarried {
     /// Which setting.
