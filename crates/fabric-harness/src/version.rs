@@ -205,6 +205,7 @@ mod tests {
         ];
         for pair in ascending.windows(2) {
             assert!(v(pair[0]) < v(pair[1]), "{} < {}", pair[0], pair[1]);
+            assert!(v(pair[1]) > v(pair[0]), "{} > {}", pair[1], pair[0]);
         }
         assert_eq!(v("0.155.1+build.7"), v("0.155.1"));
     }
