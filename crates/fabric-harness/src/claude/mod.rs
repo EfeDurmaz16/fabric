@@ -408,6 +408,52 @@ impl ClaudeCode {
         }
     }
 
+    /// The project key directories under `projects` that may hold
+    /// `session`, in path order; none when there is no `projects`. A key
+    /// that is a symlink is not walked, and one that holds the session, as
+    /// a transcript or a directory, is refused (`SymlinkInState`), because
+    /// Claude follows it. Capture and the resume guard both walk these, so
+    /// a layout capture refuses never resumes unguarded.
+    fn session_keys(projects: &Path, session: &SessionId) -> Result<Vec<PathBuf>, HarnessError> {
+        let entries = match std::fs::read_dir(projects) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(HarnessError::io(IoOp::Walk, projects, e)),
+        };
+        let mut keys = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| HarnessError::io(IoOp::Walk, projects, e))?;
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .map_err(|e| HarnessError::io(IoOp::Walk, &path, e))?;
+            if kind.is_dir() {
+                keys.push(path);
+            } else if kind.is_symlink()
+                && (path.join(format!("{session}.jsonl")).exists()
+                    || path.join(session.as_str()).exists())
+            {
+                return Err(HarnessError::SymlinkInState { path });
+            }
+        }
+        keys.sort();
+        Ok(keys)
+    }
+
+    /// The transcript of `session` under `key_dir` when it is a regular
+    /// file; a symlink there is refused (`SymlinkInState`), for capture and
+    /// for the resume guard alike.
+    fn transcript_in(key_dir: &Path, session: &SessionId) -> Result<Option<PathBuf>, HarnessError> {
+        let transcript = key_dir.join(format!("{session}.jsonl"));
+        match Self::kind_at(&transcript)? {
+            Some(kind) if kind.is_symlink() => {
+                Err(HarnessError::SymlinkInState { path: transcript })
+            }
+            Some(kind) if kind.is_file() => Ok(Some(transcript)),
+            _ => Ok(None),
+        }
+    }
+
     fn add_tree(&self, sources: &mut Vec<Source>, dir: &Path) -> Result<(), HarnessError> {
         match Self::kind_at(dir)? {
             Some(kind) if kind.is_symlink() => Err(HarnessError::SymlinkInState {
@@ -535,36 +581,13 @@ impl ClaudeCode {
         let mut sources = Vec::new();
         let projects = self.config_dir.join("projects");
         let mut found_transcript = false;
-        let entries = match std::fs::read_dir(&projects) {
-            Ok(entries) => Some(entries),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(HarnessError::io(IoOp::Walk, &projects, e)),
-        };
-        if let Some(entries) = entries {
-            let mut keys = Vec::new();
-            for entry in entries {
-                let entry = entry.map_err(|e| HarnessError::io(IoOp::Walk, &projects, e))?;
-                let path = entry.path();
-                let kind = entry
-                    .file_type()
-                    .map_err(|e| HarnessError::io(IoOp::Walk, &path, e))?;
-                if kind.is_dir() {
-                    keys.push(path);
-                } else if kind.is_symlink()
-                    && (path.join(format!("{session}.jsonl")).exists()
-                        || path.join(session.as_str()).exists())
-                {
-                    return Err(HarnessError::SymlinkInState { path });
-                }
+        for key_dir in Self::session_keys(&projects, session)? {
+            if let Some(transcript) = Self::transcript_in(&key_dir, session)?
+                && self.add_file(&mut sources, &transcript)?
+            {
+                found_transcript = true;
             }
-            keys.sort();
-            for key_dir in keys {
-                let transcript = key_dir.join(format!("{session}.jsonl"));
-                if self.add_file(&mut sources, &transcript)? {
-                    found_transcript = true;
-                }
-                self.add_tree(&mut sources, &key_dir.join(session.as_str()))?;
-            }
+            self.add_tree(&mut sources, &key_dir.join(session.as_str()))?;
         }
         if !found_transcript {
             return Err(HarnessError::SessionNotFound {
@@ -692,6 +715,9 @@ impl ClaudeCode {
     /// order with the workspace's own key last, so its model wins; none
     /// when this node holds no transcript of it, which records nothing to
     /// carry or to guard, and Claude then says itself that it found none.
+    /// A symlinked key that holds the session, or a symlinked transcript,
+    /// is refused as capture refuses it (`SymlinkInState`): Claude follows
+    /// the link, so skipping it would leave its writer unguarded.
     /// The own key only orders them: a workspace whose key Claude cuts
     /// and hashes, which this adapter does not compute, has none, and
     /// every key is still read and guarded. The flag is true when such a
@@ -708,24 +734,9 @@ impl ClaudeCode {
             Ok(key) => Some(projects.join(key)),
             Err(slug::SlugError::TooLong { .. }) => None,
         };
-        let entries = match std::fs::read_dir(&projects) {
-            Ok(entries) => Some(entries),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(HarnessError::io(IoOp::Walk, &projects, e)),
-        };
         let mut found = Vec::new();
-        for entry in entries.into_iter().flatten() {
-            let entry = entry.map_err(|e| HarnessError::io(IoOp::Walk, &projects, e))?;
-            let key_dir = entry.path();
-            // A symlink is never followed, as capture follows none.
-            let kind = entry
-                .file_type()
-                .map_err(|e| HarnessError::io(IoOp::Walk, &key_dir, e))?;
-            if !kind.is_dir() {
-                continue;
-            }
-            let transcript = key_dir.join(format!("{session}.jsonl"));
-            if Self::kind_at(&transcript)?.is_some_and(|kind| kind.is_file()) {
+        for key_dir in Self::session_keys(&projects, session)? {
+            if let Some(transcript) = Self::transcript_in(&key_dir, session)? {
                 found.push((own.as_ref() == Some(&key_dir), transcript));
             }
         }
@@ -1587,6 +1598,40 @@ mod tests {
         );
         assert_eq!(std::fs::read(&fixture.transcript).unwrap(), before);
         assert_eq!(fixture.ran(), None, "the older claude ran");
+    }
+
+    /// A project key or a transcript of the session that is a symlink, as
+    /// a folder synced from another Mac makes it, refuses the resume as it
+    /// refuses capture: Claude follows the link and appends to what a newer
+    /// Claude wrote there, so a guard that skipped it would let an older
+    /// Claude run unguarded.
+    #[tokio::test]
+    async fn a_symlinked_key_or_transcript_refuses_the_resume_as_capture_does() {
+        let fixture = Resume::new("2.1.199 (Claude Code)");
+        let newer = "{\"type\":\"assistant\",\"version\":\"2.1.300\",\"isSidechain\":false,\"message\":{\"model\":\"claude-fable-5\"}}\n";
+        std::fs::write(&fixture.transcript, newer).unwrap();
+        let key = fixture.transcript.parent().unwrap().to_path_buf();
+        let shared = fixture.home.join("shared-key");
+        std::fs::rename(&key, &shared).unwrap();
+        std::os::unix::fs::symlink(&shared, &key).unwrap();
+        let refused = fixture.launch().await.unwrap_err();
+        assert!(
+            matches!(&refused, HarnessError::SymlinkInState { path } if *path == key),
+            "{refused}"
+        );
+        assert_eq!(fixture.ran(), None, "the older claude ran");
+
+        std::fs::remove_file(&key).unwrap();
+        std::fs::create_dir(&key).unwrap();
+        let shared_transcript = shared.join(format!("{SID}.jsonl"));
+        std::os::unix::fs::symlink(&shared_transcript, &fixture.transcript).unwrap();
+        let refused = fixture.launch().await.unwrap_err();
+        assert!(
+            matches!(&refused, HarnessError::SymlinkInState { path } if *path == fixture.transcript),
+            "{refused}"
+        );
+        assert_eq!(fixture.ran(), None, "the older claude ran");
+        assert_eq!(std::fs::read_to_string(&shared_transcript).unwrap(), newer);
     }
 
     /// A session whose transcripts sit under two project keys resumes with
