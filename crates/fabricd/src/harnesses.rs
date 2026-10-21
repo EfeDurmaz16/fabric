@@ -134,6 +134,23 @@ pub struct HarnessConfig {
 }
 
 impl HarnessConfig {
+    /// The part of this configuration `kind` is built from: the entry of its
+    /// ACP program, or nothing. A run plan carries only this, so its size
+    /// does not grow with the agents the file configures.
+    #[must_use]
+    pub fn for_harness(&self, kind: &HarnessKind) -> HarnessConfig {
+        let acp = match kind {
+            HarnessKind::Acp { program, .. } => self
+                .acp
+                .get(program.as_str())
+                .map(|config| (program.as_str().to_owned(), config.clone()))
+                .into_iter()
+                .collect(),
+            HarnessKind::ClaudeCode | HarnessKind::Codex => BTreeMap::new(),
+        };
+        HarnessConfig { acp }
+    }
+
     /// Reads `path`; a missing file is the empty configuration.
     pub fn load(path: &Path) -> Result<Self, HarnessConfigError> {
         let text = match std::fs::read_to_string(path) {

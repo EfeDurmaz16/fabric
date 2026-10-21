@@ -2287,10 +2287,10 @@ fn plan(
         epoch,
         head: job.ledger().head(),
         root,
+        harness_config: harness_config.for_harness(&harness),
         harness,
         session,
         goal: job.ledger().manifest().goal.clone(),
-        harness_config: harness_config.clone(),
         home: home.to_owned(),
     })
 }
@@ -4268,5 +4268,53 @@ pub(crate) mod tests {
             out.lines.last().map(String::as_str),
             Some("480 more caches, each carried where the keys match and rebuilt here otherwise")
         );
+    }
+
+    /// `harness.toml` may configure any number of ACP agents. A run plan
+    /// carries only the configuration of the harness it launches, so the
+    /// plan stays within one control message whatever the file holds.
+    #[tokio::test]
+    async fn a_run_plan_carries_only_its_own_harness_config() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::Builder::new()
+            .prefix("fops")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let home = root.join("home");
+        let state = root.join("state");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            state.join("harness.toml"),
+            "[acp.opencode]\nstate_dir = \"oc\"\n[acp.other]\nstate_dir = \"other\"\n",
+        )
+        .unwrap();
+        let node = Node::start(NodeConfig {
+            state: StateDir::resolve(Some(state.as_os_str()), &home).unwrap(),
+            home,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            dial: DialOrder::TcpOnly,
+            path_var: std::env::var_os("PATH").unwrap_or_default(),
+            cargo_home: None,
+        })
+        .unwrap();
+        let repo = repo(&root);
+        for (harness, wanted) in [("acp:opencode", vec!["opencode"]), ("codex", vec![])] {
+            let mut out = Out::default();
+            node.job_new(
+                &repo,
+                "goal".to_owned(),
+                crate::harnesses::parse_harness(harness).unwrap(),
+                &mut out,
+            )
+            .await
+            .unwrap();
+            let id: JobId = out.lines[0].parse().unwrap();
+            let plan = node.job_run(id, &mut Out::default()).await.unwrap();
+            let carried: Vec<&str> = plan.harness_config.acp.keys().map(String::as_str).collect();
+            assert_eq!(carried, wanted, "{harness}");
+        }
     }
 }
