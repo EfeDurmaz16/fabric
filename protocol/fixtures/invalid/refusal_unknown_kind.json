@@ -3,7 +3,7 @@
   "value": {
     "kind": "on_fire",
     "reason": {
-      "code": "internal"
+      "code": "quota_exceeded"
     },
     "message": "x"
   }
