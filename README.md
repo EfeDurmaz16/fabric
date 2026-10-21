@@ -21,7 +21,7 @@ A job can move between two of your Macs by hand: made from a repository, run und
 | `crates/fabric-client` | The client API of a node (ADR 0018): typed requests, replies, progress events and refusals as length-prefixed JSON on the control socket after a version handshake, and a Rust client. `protocol/fixtures` holds one example of every message; the Rust and TypeScript clients both test against it. |
 | `sdk/typescript` | The TypeScript client of the same API for Node 22 and Bun: zod schemas at the boundary, the same trust checks and handshake as the Rust client, and the same contract test against `protocol/fixtures`, plus an end-to-end test against a real node. |
 | `crates/fabric` | The `fabric` command, and the end-to-end test: two daemons over loopback on QUIC and on TCP+TLS, a job moved and back, the move broken at five named points by `SIGKILL` of either node or a lost or repeated answer. |
-| CI | fmt, clippy, test, the end-to-end test, doc, `cargo deny` and the hygiene script on macOS and Ubuntu |
+| CI | fmt, clippy, test, the end-to-end test, doc, `cargo deny`, the hygiene script, and the TypeScript SDK's typecheck, contract and end-to-end tests, on macOS and Ubuntu |
 
 ## Two Macs, by hand
 
