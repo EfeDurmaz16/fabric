@@ -120,7 +120,7 @@ Errors that happen before the node answers are the client's own, typed in each c
    - a new kind of ledger record in `job_log`, which a client reads as `unrecognized`, since a later ledger format may write one.
 3. Anything else bumps `api`: removing or renaming an op, a field or a kind, changing a field's type or meaning, a new refusal `kind` (exit codes depend on the closed set), a new reply shape for an existing op, or a change to the framing or the exchange.
 
-The Rust crate and the TypeScript SDK both declare `API_VERSION = 1`, and a contract test pins it.
+The Rust crate and the TypeScript SDK both declare `API_VERSION = 1`, and a contract test pins it. The fixtures in `protocol/fixtures` follow the same rule: once a fixture is on the base branch, CI refuses a change that edits, renames or removes it unless `API_VERSION` changes too (`scripts/check-fixtures.sh`), so a new shape gets a new fixture and an older client's example stays what that client must still read.
 
 A CLI from before this ADR that reaches a node after it sends postcard, which does not parse as a hello; the node answers `Incompatible` and the old CLI fails to decode it. A new client that reaches an old node gets the connection closed without a welcome and says that the node may run an older fabric. Neither side misreads a frame.
 

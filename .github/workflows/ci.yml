@@ -50,6 +50,24 @@ jobs:
             scripts/check-hygiene.sh
           fi
 
+      - name: Prove the fixture check fires
+        run: scripts/test-check-fixtures.sh
+
+      # ADR 0018: within one api version the client API only grows, so a
+      # fixture the base already had changes only with an API_VERSION bump.
+      # The base is the one the hygiene step uses; a push that created main
+      # has none, and nothing is checked.
+      - name: Existing fixtures change only with an api bump
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ -n "$BASE_REF" ]; then
+            scripts/check-fixtures.sh "origin/$BASE_REF"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ]; then
+            scripts/check-fixtures.sh "$BEFORE"
+          fi
+
   check:
     name: check (${{ matrix.os }})
     strategy:
