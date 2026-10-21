@@ -58,6 +58,7 @@ import {
   type SessionId,
   type SessionRecorded,
   type Suspended,
+  type SystemPath,
   type Welcome,
 } from "./schema.ts";
 
@@ -171,8 +172,12 @@ export class FabricClient {
     return this.call({ op: "node_ping", node }, options);
   }
 
-  /** Makes a job from the repository at `repo`, an absolute path on the node. */
-  jobNew(repo: string, goal: string, harness: Harness, options?: CallOptions): Promise<JobCreated> {
+  /**
+   * Makes a job from the repository at `repo`, an absolute path on the
+   * node; a relative one never leaves the client, since the node would
+   * read it against its own working directory.
+   */
+  jobNew(repo: SystemPath, goal: string, harness: Harness, options?: CallOptions): Promise<JobCreated> {
     return this.call({ op: "job_new", repo, goal, harness }, options);
   }
 

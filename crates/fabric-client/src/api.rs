@@ -236,8 +236,10 @@ pub enum Request {
     },
     /// Makes a job from a repository, rooted at `~/fabric/jobs/<id>/work`.
     JobNew {
-        /// The repository to clone, an absolute path on the node.
-        repo: PathBuf,
+        /// The repository to clone, an absolute path on the node; a
+        /// relative one would name a repository relative to wherever the
+        /// node was started.
+        repo: SystemPath,
         /// The goal in the user's words.
         goal: String,
         /// The harness the job starts under.

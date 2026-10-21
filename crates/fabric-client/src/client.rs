@@ -17,7 +17,7 @@ use tokio::net::UnixStream;
 use crate::api::{
     API_VERSION, Answer, ClientEnv, Decision, DoctorReport, Event, Hello, HelloAnswer, JobCreated,
     JobList, JobLog, JobStatus, Lease, NodeIdentity, Op, Paired, PeerList, Pong, Refusal,
-    Registered, Reply, Request, RunPlan, SessionRecorded, Suspended, Welcome,
+    Registered, Reply, Request, RunPlan, SessionRecorded, Suspended, SystemPath, Welcome,
 };
 use crate::frame::{self, FrameError};
 
@@ -244,7 +244,7 @@ impl Client {
     /// Makes a job from the repository at `repo`, an absolute path on the node.
     pub async fn job_new(
         &self,
-        repo: PathBuf,
+        repo: SystemPath,
         goal: String,
         harness: HarnessKind,
         on_event: impl FnMut(Event),

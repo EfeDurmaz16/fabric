@@ -102,7 +102,7 @@ impl Node {
                 repo,
                 goal,
                 harness,
-            } => Reply::JobNew(self.job_new(&repo, goal, harness).await?),
+            } => Reply::JobNew(self.job_new(repo.as_path(), goal, harness).await?),
             Request::JobList => Reply::JobList(self.job_list().await),
             Request::JobStatus { job } => Reply::JobStatus(self.job_status(job).await?),
             Request::JobLog { job } => Reply::JobLog(self.job_log(job).await?),

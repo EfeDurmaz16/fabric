@@ -24,6 +24,7 @@ import {
   type KnownEvent,
   NoDaemonError,
   RefusedError,
+  SystemPath,
   type Welcome,
 } from "../src/index.ts";
 
@@ -199,7 +200,7 @@ describe.skipIf(BIN === "")("against a real fabric daemon", () => {
 
   test("job_new makes a job at epoch 1 rooted under the home", async () => {
     const { client, home, repo } = the();
-    const created = await client.jobNew(repo, GOAL, { kind: "claude_code" });
+    const created = await client.jobNew(SystemPath.parse(repo), GOAL, { kind: "claude_code" });
     expect<number>(created.epoch).toBe(1);
     expect(created.root).toBe(join(home, "fabric", "jobs", created.job, "work"));
     expect(created.repo).toBe(repo);

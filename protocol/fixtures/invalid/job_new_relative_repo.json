@@ -1,0 +1,11 @@
+{
+  "schema": "request",
+  "value": {
+    "op": "job_new",
+    "repo": "myrepo",
+    "goal": "g",
+    "harness": {
+      "kind": "claude_code"
+    }
+  }
+}

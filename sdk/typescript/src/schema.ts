@@ -542,7 +542,7 @@ export const Request = z.discriminatedUnion("op", [
   z.object({ op: z.literal("node_add"), node: NodeId, addr: optional(z.string()) }),
   z.object({ op: z.literal("node_list") }),
   z.object({ op: z.literal("node_ping"), node: NodeId }),
-  z.object({ op: z.literal("job_new"), repo: Path, goal: z.string(), harness: Harness }),
+  z.object({ op: z.literal("job_new"), repo: SystemPath, goal: z.string(), harness: Harness }),
   z.object({ op: z.literal("job_list") }),
   z.object({ op: z.literal("job_status"), job: JobId }),
   z.object({ op: z.literal("job_log"), job: JobId }),

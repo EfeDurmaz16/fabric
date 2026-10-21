@@ -6,7 +6,7 @@
 
 use fabric_client::api::{
     Answer, Decision, Event, HelloAnswer, LedgerEvent, Marker, Process, Reason, RefusalKind, Reply,
-    Request, Standing, View, WorkspaceState,
+    Request, Standing, SystemPath, View, WorkspaceState,
 };
 use fabric_client::{Client, ClientError, frame};
 use fabric_core::harness::HarnessKind;
@@ -41,7 +41,7 @@ async fn e2e_a_client_makes_reads_decides_and_suspends_a_job_with_typed_answers(
 
     let created = client
         .job_new(
-            env.repo.clone(),
+            SystemPath::parse(env.repo.to_str().unwrap()).unwrap(),
             "make the greeting louder".to_owned(),
             HarnessKind::ClaudeCode,
             |_| {},

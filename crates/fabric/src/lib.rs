@@ -31,7 +31,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use fabric_client::api::{
-    ClientEnv, Decision, DoctorReport, Event, RefusalKind, Reply, Request, RunPlan,
+    ClientEnv, Decision, DoctorReport, Event, RefusalKind, Reply, Request, RunPlan, SystemPath,
 };
 use fabric_client::{Client, ClientError, Launched};
 use fabric_core::env::{EnvVarName, SetupArg};
@@ -481,8 +481,17 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
             goal,
             harness,
         } => {
-            let repo = std::fs::canonicalize(&repo)
+            let canonical = std::fs::canonicalize(&repo)
                 .with_context(|| format!("repository {}", repo.display()))?;
+            let repo = canonical
+                .to_str()
+                .and_then(|text| SystemPath::parse(text).ok())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "repository {} is not a UTF-8 path, which the client API cannot carry",
+                        canonical.display()
+                    )
+                })?;
             (
                 Request::JobNew {
                     repo,

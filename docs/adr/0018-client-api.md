@@ -37,7 +37,7 @@ Encoding rules, the same in every message:
 - Ids travel in their text form: a job, move or event id as its 26-character ULID, a node id as `fab1` and 52 base32 characters, a snapshot or env spec id as 64 lowercase hex digits, a session id as the harness wrote it. Each is parsed on arrival, as the core parses it; an id that does not parse refuses the whole message.
 - An epoch is a JSON integer of at least 1. Counts, sizes, pids and times in Unix milliseconds are integers below 2^53, so a JavaScript number holds them exactly.
 - An optional field is absent when it has no value, never `null`. Readers accept `null` as absent.
-- Paths are strings. A path that is not UTF-8 cannot cross the socket and fails the request that names it.
+- Paths are strings. A path that is not UTF-8 cannot cross the socket and fails the request that names it. A path a client sends for the node to use, the repository of `job_new`, a `PATH` directory or a tool root, must be absolute and is refused otherwise, since the node would read a relative one against the directory it was started in.
 
 ### The exchange
 
