@@ -1,0 +1,26 @@
+{
+  "schema": "request",
+  "value": {
+    "op": "doctor",
+    "env": {
+      "path": [
+        "/bin"
+      ],
+      "roots": {
+        "cargo_home": "/c",
+        "go_path": "/g"
+      }
+    }
+  },
+  "reads_as": {
+    "op": "doctor",
+    "env": {
+      "path": [
+        "/bin"
+      ],
+      "roots": {
+        "cargo_home": "/c"
+      }
+    }
+  }
+}

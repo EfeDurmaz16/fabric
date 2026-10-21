@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use fabric_client::api::ClientEnv;
 use fabric_core::path::{AbsPath, RelPath};
 use fabric_core::snapshot::{CacheClass, CarryKey};
 use fabric_env::detect::{Detection, Ecosystem, NodeManager};
@@ -100,13 +101,14 @@ impl NodeFacts {
         )
     }
 
-    /// Measures this node, looking programs up on `path_var`.
-    pub async fn measure(home: &Path, path_var: &OsString, cargo_home: Option<PathBuf>) -> Self {
+    /// Measures this node with the tools `env` names: programs are looked
+    /// up on its `PATH` and run with its roots, each set to its value or
+    /// removed, never the daemon's own (ADR 0018, The client's environment).
+    pub async fn measure(home: &Path, env: &ClientEnv) -> Self {
         // Each probe is boxed, so the joined future holds 19 pointers, not 19 child processes.
         let run = |program: &'static str, args: &'static [&'static str], probe: Probe| {
-            let path_var = path_var.clone();
-            let home = home.to_owned();
-            Box::pin(async move { probe_command(program, args, probe, &path_var, &home).await })
+            let (env, home) = (env.clone(), home.to_owned());
+            Box::pin(async move { probe_command(program, args, probe, &env, &home).await })
         };
         let (
             user,
@@ -184,12 +186,10 @@ impl NodeFacts {
         put(name::RUSTC, rustc);
         put(
             name::CARGO_HOME,
-            Some(
-                cargo_home
-                    .unwrap_or_else(|| home.join(".cargo"))
-                    .display()
-                    .to_string(),
-            ),
+            Some(env.roots.cargo_home.as_ref().map_or_else(
+                || home.join(".cargo").display().to_string(),
+                ToString::to_string,
+            )),
         );
         put(name::PYTHON, python);
         put(name::PYTHON_HOME, python_home);
@@ -241,13 +241,21 @@ async fn probe_command(
     program: &str,
     args: &[&str],
     probe: Probe,
-    path_var: &OsString,
+    env: &ClientEnv,
     home: &Path,
 ) -> Option<String> {
-    let binary = find_on_path(program, path_var)?;
-    let child = tokio::process::Command::new(binary)
+    let path_var = env.path_var();
+    let binary = find_on_path(program, &path_var)?;
+    let mut command = tokio::process::Command::new(binary);
+    for (name, value) in env.roots.vars() {
+        match value {
+            Some(value) => command.env(name, value.as_str()),
+            None => command.env_remove(name),
+        };
+    }
+    let child = command
         .args(args)
-        .env("PATH", path_var)
+        .env("PATH", &path_var)
         .env("HOME", home)
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
@@ -441,7 +449,56 @@ fn manager_name(manager: NodeManager) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use fabric_client::api::{PathDir, Roots};
+
     use super::*;
+
+    /// Gate finding on PR #8: capture measured carry keys with the daemon's
+    /// `CARGO_HOME`, not the requesting CLI's. A request's roots reach the
+    /// facts and the tools measured, and a root it leaves unset is removed,
+    /// not taken from the daemon.
+    #[tokio::test]
+    async fn facts_are_measured_in_the_environment_the_request_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let pnpm = bin.join("pnpm");
+        std::fs::write(
+            &pnpm,
+            "#!/bin/sh\ncase \"$1\" in\n--version) echo 9.9.9 ;;\nstore) echo \"${PNPM_HOME:-unset}/store\" ;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = vec![
+            PathDir::parse(bin.to_str().unwrap()).unwrap(),
+            PathDir::parse("/usr/bin").unwrap(),
+            PathDir::parse("/bin").unwrap(),
+        ];
+        let home = dir.path().join("home");
+        let client = ClientEnv {
+            path: path.clone(),
+            roots: Roots {
+                cargo_home: Some(AbsPath::parse("/client/cargo").unwrap()),
+                pnpm_home: Some(AbsPath::parse("/client/pnpm").unwrap()),
+                ..Roots::default()
+            },
+        };
+        let facts = NodeFacts::measure(&home, &client).await;
+        assert_eq!(facts.get(name::CARGO_HOME), Some("/client/cargo"));
+        assert_eq!(facts.get(name::PNPM), Some("9.9.9"));
+        assert_eq!(facts.get(name::PNPM_STORE), Some("/client/pnpm/store"));
+
+        let bare = ClientEnv {
+            path,
+            roots: Roots::default(),
+        };
+        let facts = NodeFacts::measure(&home, &bare).await;
+        let default_cargo = home.join(".cargo");
+        assert_eq!(facts.get(name::CARGO_HOME), default_cargo.to_str());
+        assert_eq!(facts.get(name::PNPM_STORE), Some("unset/store"));
+    }
 
     fn pro() -> NodeFacts {
         NodeFacts::from_pairs([

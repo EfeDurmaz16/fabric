@@ -1,0 +1,9 @@
+{
+  "schema": "request",
+  "value": {
+    "op": "doctor",
+    "env": {
+      "roots": {}
+    }
+  }
+}

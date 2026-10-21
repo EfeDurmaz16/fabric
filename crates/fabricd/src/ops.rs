@@ -9,17 +9,16 @@
 //! does anything else with the job, and never becomes runnable again
 //! without a record the target wrote (ADR 0003).
 
-use std::ffi::OsString;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use fabric_client::api::{
-    ClosedJob, Decision, DoctorReport, Event, Fact, HarnessSession, JobCreated, JobList, JobLog,
-    JobStatus, JobSummary, Lease, LedgerEvent, LogRecord, NodeIdentity, Paired, Peer, PeerList,
-    Pong, Process, Registered, Reply, Request, RunPlan, SessionRecorded, SnapshotState, Standing,
-    StealWarning, Step, Suspended, View, Wire, Workspace, WorkspaceState,
+    ClientEnv, ClosedJob, Decision, DoctorReport, Event, Fact, HarnessSession, JobCreated, JobList,
+    JobLog, JobStatus, JobSummary, Lease, LedgerEvent, LogRecord, NodeIdentity, Paired, Peer,
+    PeerList, Pong, Process, Registered, Reply, Request, RunPlan, SessionRecorded, SnapshotState,
+    Standing, StealWarning, Step, Suspended, View, Wire, Workspace, WorkspaceState,
 };
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, JobId, NodeId, SnapshotId};
@@ -113,11 +112,11 @@ impl Node {
                 on,
                 harness,
                 force,
-                path,
+                env,
             } => {
-                let path_var = self.path_var(path);
+                let env = self.client_env(env);
                 Reply::JobResume(
-                    Box::pin(self.job_resume(job, on, harness, force, &path_var, out)).await?,
+                    Box::pin(self.job_resume(job, on, harness, force, &env, out)).await?,
                 )
             }
             Request::HarnessStarted {
@@ -144,10 +143,10 @@ impl Node {
                 self.harness_session(job, epoch, pid, harness, session)
                     .await?,
             ),
-            Request::JobSuspend { job, path } => {
-                let path_var = self.path_var(path);
+            Request::JobSuspend { job, env } => {
+                let env = self.client_env(env);
                 self.resolve_departing(job, out).await?;
-                let snapshot = self.suspend(job, &path_var, out).await?;
+                let snapshot = self.suspend(job, &env, out).await?;
                 self.replicate(job, out).await;
                 Reply::JobSuspend(Suspended { snapshot })
             }
@@ -155,10 +154,10 @@ impl Node {
                 job,
                 to,
                 force,
-                path,
+                env,
             } => {
-                let path_var = self.path_var(path);
-                self.job_move(job, to, force, &path_var, out).await?;
+                let env = self.client_env(env);
+                self.job_move(job, to, force, &env, out).await?;
                 Reply::JobMove(self.lease(job).await?)
             }
             Request::JobSteal { job, reason, force } => {
@@ -172,10 +171,10 @@ impl Node {
             } => Reply::JobDecide(fabric_client::api::Decided {
                 text: self.job_decide(job, decision, &note).await?,
             }),
-            Request::Doctor { peer, job, path } => {
-                let path_var = self.path_var(path);
+            Request::Doctor { peer, job, env } => {
+                let env = self.client_env(env);
                 Reply::Doctor {
-                    report: self.doctor(peer, job, &path_var).await?,
+                    report: self.doctor(peer, job, &env).await?,
                 }
             }
         })
@@ -204,9 +203,10 @@ impl Node {
         }
     }
 
-    /// The `PATH` a client sent, or the one the node started with.
-    fn path_var(&self, path: Option<String>) -> OsString {
-        path.map_or_else(|| self.cfg.path_var.clone(), OsString::from)
+    /// The environment a client sent, or the one the node started with
+    /// (ADR 0018, The client's environment).
+    fn client_env(&self, env: Option<ClientEnv>) -> ClientEnv {
+        env.unwrap_or_else(|| self.cfg.env.clone())
     }
 
     /// Who owns `id` now, at which epoch.
@@ -278,7 +278,7 @@ impl Node {
     ) -> Result<JobCreated, NodeError> {
         let id = clock::job_id();
         let root = paths::job_root(&self.cfg.home, id);
-        let synced = synced_folders(&self.cfg.home, &self.cfg.path_var).await;
+        let synced = synced_folders(&self.cfg.home, &self.cfg.env).await;
         check_root(&root, &self.cfg.home, synced)?;
         let parent = root
             .parent()
@@ -621,18 +621,18 @@ impl Node {
     pub(crate) async fn suspend(
         &self,
         id: JobId,
-        path_var: &OsString,
+        env: &ClientEnv,
         out: &mut Out,
     ) -> Result<SnapshotId, NodeError> {
         let job = self.job(id).await?;
         let mut job = job.lock().await;
-        self.suspend_locked(&mut job, path_var, out).await
+        self.suspend_locked(&mut job, env, out).await
     }
 
     pub(crate) async fn suspend_locked(
         &self,
         job: &mut Job,
-        path_var: &OsString,
+        env: &ClientEnv,
         out: &mut Out,
     ) -> Result<SnapshotId, NodeError> {
         let id = job.id();
@@ -701,7 +701,7 @@ impl Node {
                 },
                 epoch,
             })?;
-            let snapshot = self.capture(job, &marker.root, path_var, out).await?;
+            let snapshot = self.capture(job, &marker.root, env, out).await?;
             faults::hit(Point::AfterSnapshotPublish).await;
             job.append(
                 self.id,
@@ -712,7 +712,7 @@ impl Node {
             )?;
             (snapshot, tree)
         };
-        self.confirm_departure(job, path_var, out).await?;
+        self.confirm_departure(job, env, out).await?;
         job.append(self.id, EventKind::Suspended { snapshot })?;
         job.set_marker(&Marker {
             root: marker.root,
@@ -735,7 +735,7 @@ impl Node {
     async fn confirm_departure(
         &self,
         job: &Job,
-        path_var: &OsString,
+        env: &ClientEnv,
         out: &mut Out,
     ) -> Result<(), NodeError> {
         let Some(record) = job.session()? else {
@@ -746,7 +746,7 @@ impl Node {
             return Ok(());
         }
         let manifest = StateManifest::read(&state_dir)?;
-        let harness = adapter(&record.harness, &self.harness_env(path_var)?)?;
+        let harness = adapter(&record.harness, &self.harness_env(env)?)?;
         match harness.confirm_departure(&manifest).await {
             Ok(()) => Ok(()),
             Err(HarnessError::DepartureNotPending { session }) => {
@@ -762,14 +762,14 @@ impl Node {
         &self,
         job: &Job,
         root: &Path,
-        path_var: &OsString,
+        env: &ClientEnv,
         out: &mut Out,
     ) -> Result<SnapshotId, NodeError> {
         let state_dir = job.dir().harness_state();
         let mut harness_state = None;
         if let Some(record) = job.session()? {
             let session = record.session;
-            let harness = adapter(&record.harness, &self.harness_env(path_var)?)?;
+            let harness = adapter(&record.harness, &self.harness_env(env)?)?;
             job.clear_harness_state()?;
             std::fs::create_dir_all(&state_dir).map_err(|e| NodeError::io(&state_dir, e))?;
             let manifest = harness.capture(root, &session, &state_dir).await?;
@@ -780,7 +780,7 @@ impl Node {
             });
             harness_state = Some(state_dir);
         }
-        let facts = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
+        let facts = NodeFacts::measure(&self.cfg.home, env).await;
         let detection = fabric_env::detect::detect(root, &[]).ok();
         let keys = MeasuredKeys::new(facts, detection.as_ref());
         let root = root.to_owned();
@@ -939,7 +939,7 @@ impl Node {
         id: JobId,
         to: NodeId,
         force: bool,
-        path_var: &OsString,
+        env: &ClientEnv,
         out: &mut Out,
     ) -> Result<(), NodeError> {
         if to == self.id {
@@ -990,20 +990,13 @@ impl Node {
                 });
             }
         }
-        self.preflight(
-            to,
-            Some((&harness, &root)),
-            Target::Peer,
-            path_var,
-            force,
-            out,
-        )
-        .await?;
+        self.preflight(to, Some((&harness, &root)), Target::Peer, env, force, out)
+            .await?;
 
         if matches!(view, LeaseView::Owner(_)) {
             let job = self.job(id).await?;
             let mut job = job.lock().await;
-            self.suspend_locked(&mut job, path_var, out).await?;
+            self.suspend_locked(&mut job, env, out).await?;
         }
         self.push_records(id, to).await?;
         out.emit(Event::TargetHoldsCopy { target: to });
@@ -1324,7 +1317,7 @@ impl Node {
         on: Option<NodeId>,
         harness: Option<HarnessKind>,
         force: bool,
-        path_var: &OsString,
+        env: &ClientEnv,
         out: &mut Out,
     ) -> Result<RunPlan, NodeError> {
         self.resolve_departing(id, out).await?;
@@ -1359,7 +1352,7 @@ impl Node {
                 holder,
                 kind.as_ref().map(|kind| (kind, root.as_path())),
                 Target::Here,
-                path_var,
+                env,
                 force,
                 out,
             )
@@ -1370,7 +1363,7 @@ impl Node {
         let mut job = job.lock().await;
         let token = owner_token(&job, self.id)?;
         let root = self
-            .restore_if_needed(&mut job, token.epoch, path_var, out)
+            .restore_if_needed(&mut job, token.epoch, env, out)
             .await?;
         if let Some(record) = job.harness_record()?
             && record.liveness().await != Liveness::Gone
@@ -1595,7 +1588,7 @@ impl Node {
         &self,
         job: &mut Job,
         epoch: Epoch,
-        path_var: &OsString,
+        env: &ClientEnv,
         out: &mut Out,
     ) -> Result<PathBuf, NodeError> {
         let id = job.id();
@@ -1648,7 +1641,7 @@ impl Node {
         check_root(
             &root,
             &self.cfg.home,
-            synced_folders(&self.cfg.home, path_var).await,
+            synced_folders(&self.cfg.home, env).await,
         )?;
         let resuming = matches!(
             &marker,
@@ -1674,18 +1667,11 @@ impl Node {
         let state_dir = job.dir().harness_state();
         if !(resuming && state == RestoreState::Present) {
             let harness_dir = has_harness_state.then(|| state_dir.clone());
-            self.write_snapshot(
-                snapshot,
-                &manifest.caches,
-                &root,
-                harness_dir,
-                path_var,
-                out,
-            )
-            .await?;
+            self.write_snapshot(snapshot, &manifest.caches, &root, harness_dir, env, out)
+                .await?;
         }
         if has_harness_state {
-            self.restore_harness(job, &root, path_var, out).await?;
+            self.restore_harness(job, &root, env, out).await?;
         }
         let tree = TreeStamp::measure(&root).await;
         job.set_marker(&Marker {
@@ -1703,10 +1689,10 @@ impl Node {
         caches: &[fabric_core::snapshot::CacheEntry],
         root: &Path,
         harness_dir: Option<PathBuf>,
-        path_var: &OsString,
+        env: &ClientEnv,
         out: &mut Out,
     ) -> Result<(), NodeError> {
-        let facts = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
+        let facts = NodeFacts::measure(&self.cfg.home, env).await;
         report_caches(caches, &facts, out);
         let target = root.to_owned();
         let report = with_store(&self.store, move |store| {
@@ -1767,12 +1753,12 @@ impl Node {
         &self,
         job: &Job,
         root: &Path,
-        path_var: &OsString,
+        env: &ClientEnv,
         out: &mut Out,
     ) -> Result<(), NodeError> {
         let state_dir = job.dir().harness_state();
         let state = StateManifest::read(&state_dir)?;
-        let harness = adapter(state.kind(), &self.harness_env(path_var)?)?;
+        let harness = adapter(state.kind(), &self.harness_env(env)?)?;
         harness.restore(root, &state_dir).await?;
         local::write(
             &job.dir().session(),
@@ -1879,11 +1865,10 @@ impl Node {
         self: &Arc<Self>,
         peer: Option<NodeId>,
         job: Option<JobId>,
-        path_var: &OsString,
+        env: &ClientEnv,
     ) -> Result<DoctorReport, NodeError> {
         let Some(peer) = peer else {
-            let facts =
-                NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
+            let facts = NodeFacts::measure(&self.cfg.home, env).await;
             return Ok(DoctorReport::Facts {
                 facts: facts
                     .iter()
@@ -1910,7 +1895,7 @@ impl Node {
                 peer,
                 harness.as_ref().zip(root.as_deref()),
                 Target::Peer,
-                path_var,
+                env,
             )
             .await?;
         Ok(DoctorReport::Compared {
@@ -1926,11 +1911,11 @@ impl Node {
         peer: NodeId,
         job: Option<(&HarnessKind, &Path)>,
         target: Target,
-        path_var: &OsString,
+        env: &ClientEnv,
         force: bool,
         out: &mut Out,
     ) -> Result<(), NodeError> {
-        let rows = self.compare(peer, job, target, path_var).await?;
+        let rows = self.compare(peer, job, target, env).await?;
         out.emit(Event::Preflight {
             peer,
             rows: rows.iter().map(doctor::Row::to_wire).collect(),
@@ -1951,9 +1936,9 @@ impl Node {
         peer: NodeId,
         job: Option<(&HarnessKind, &Path)>,
         target: Target,
-        path_var: &OsString,
+        env: &ClientEnv,
     ) -> Result<Vec<doctor::Row>, NodeError> {
-        let here = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
+        let here = NodeFacts::measure(&self.cfg.home, env).await;
         let session = self.dial(peer).await?;
         let theirs =
             session
@@ -2129,7 +2114,8 @@ fn move_aside(root: &Path, dest: &Path) -> Result<bool, NodeError> {
 }
 
 /// Reads which folders iCloud Drive syncs on this node; off everywhere `defaults` does not exist.
-async fn synced_folders(home: &Path, path_var: &OsString) -> SyncedFolders {
+async fn synced_folders(home: &Path, env: &ClientEnv) -> SyncedFolders {
+    let path_var = env.path_var();
     let read = |key: &'static str| {
         let path_var = path_var.clone();
         let home = home.to_owned();
@@ -2293,8 +2279,7 @@ pub(crate) mod tests {
             home,
             listen: "127.0.0.1:0".parse().unwrap(),
             dial: DialOrder::TcpOnly,
-            path_var: std::env::var_os("PATH").unwrap_or_default(),
-            cargo_home: None,
+            env: ClientEnv::current(),
         })
         .unwrap();
         (dir, node)
@@ -2370,7 +2355,7 @@ pub(crate) mod tests {
         let (dir_a, a) = node();
         let (_dir_b, b) = node();
         paired(&a, &b).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = ClientEnv::current();
         let out = &mut Out::default();
         let id = job(dir_a.path(), &a).await;
         a.suspend(id, &path, out).await.unwrap();
@@ -2435,7 +2420,7 @@ pub(crate) mod tests {
     async fn a_session_named_after_the_start_is_recorded_only_for_the_recorded_harness() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = ClientEnv::current();
         let out = &mut Out::default();
         node.suspend(id, &path, out).await.unwrap();
         node.job_run(id, out).await.unwrap();
@@ -2494,7 +2479,7 @@ pub(crate) mod tests {
     async fn a_move_toward_another_node_refuses_with_the_open_moves_target() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = ClientEnv::current();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         let (first, second) = (NodeId::from_bytes([7; 32]), NodeId::from_bytes([8; 32]));
         node.depart(id, first, &mut Out::default()).await.unwrap();
@@ -2524,7 +2509,7 @@ pub(crate) mod tests {
     async fn status_calls_a_departing_clean_copy_clean() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = ClientEnv::current();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         node.depart(id, NodeId::from_bytes([7; 32]), &mut Out::default())
             .await
@@ -2546,7 +2531,7 @@ pub(crate) mod tests {
         let (_dir_b, b) = node();
         paired(&a, &b).await;
         let id = job(dir_a.path(), &a).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = ClientEnv::current();
         a.suspend(id, &path, &mut Out::default()).await.unwrap();
         b.pull_records(id, a.id).await.unwrap();
         b.ensure_latest(id, a.id).await.unwrap();

@@ -1,7 +1,8 @@
 //! A real node driven through `fabric-client` instead of the CLI: the
 //! replies are typed and agree with what the CLI prints, a suspend streams
 //! its steps as events before its reply, a refusal arrives with its reason,
-//! and a client of another api version is turned away at the hello.
+//! a client of another api version is turned away at the hello, and the
+//! node measures in the environment of the CLI that asked, not its own.
 
 use fabric_client::api::{
     Answer, Decision, Event, HelloAnswer, LedgerEvent, Marker, Process, Reason, RefusalKind, Reply,
@@ -13,7 +14,11 @@ use fabric_core::id::{Epoch, JobId};
 use serde_json::json;
 use tokio::net::UnixStream;
 
-use crate::world::{Env, Fallible, Node, Wire};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::time::Duration;
+
+use crate::world::{Env, Fallible, Node, Wire, finish, text};
 
 /// A started node, and a client of it.
 fn started(env: &std::sync::Arc<Env>) -> Fallible<(Node, Client)> {
@@ -165,5 +170,51 @@ async fn e2e_a_node_turns_away_another_api_version_and_a_request_it_cannot_read(
             }
         ),
         "{answer:?}"
+    );
+}
+
+/// Review finding on PR #8: capture measured carry keys with the node's
+/// `CARGO_HOME` instead of the requesting CLI's. The node here starts with
+/// neither `CARGO_HOME` nor `PNPM_HOME` nor the CLI's tool directory, so
+/// every value below can only come from the CLI's environment.
+#[test]
+fn e2e_doctor_measures_in_the_clis_environment_not_the_nodes() {
+    let env = Env::new().unwrap();
+    let (node, _client) = started(&env).unwrap();
+    let bin = env.root.join("cli-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let pnpm = bin.join("pnpm");
+    std::fs::write(
+        &pnpm,
+        "#!/bin/sh\ncase \"$1\" in\n--version) echo 9.9.9 ;;\nstore) echo \"$PNPM_HOME/store\" ;;\nesac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = bin.into_os_string();
+    path.push(":");
+    path.push(env.path());
+    let cargo = env.root.join("cli-cargo");
+    let pnpm_home = env.root.join("cli-pnpm");
+    let doctor = node
+        .spawn_with(
+            &["doctor"],
+            &[
+                ("PATH", Path::new(&path)),
+                ("CARGO_HOME", &cargo),
+                ("PNPM_HOME", &pnpm_home),
+            ],
+        )
+        .unwrap();
+    let output = finish(doctor, Duration::from_mins(1)).unwrap();
+    let printed = text(&output);
+    assert!(output.status.success(), "{printed}");
+    assert!(
+        printed.contains(&format!("cargo.home: {}", cargo.display())),
+        "{printed}"
+    );
+    assert!(printed.contains("pnpm.version: 9.9.9"), "{printed}");
+    assert!(
+        printed.contains(&format!("pnpm.store: {}/store", pnpm_home.display())),
+        "{printed}"
     );
 }

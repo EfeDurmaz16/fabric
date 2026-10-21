@@ -2,5 +2,11 @@
   "op": "doctor",
   "peer": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
   "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
-  "path": "/usr/local/bin:/usr/bin:/bin"
+  "env": {
+    "path": [
+      "/usr/bin",
+      "/bin"
+    ],
+    "roots": {}
+  }
 }

@@ -3,7 +3,7 @@
   "value": {
     "op": "job_suspend",
     "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
-    "path": null
+    "env": null
   },
   "reads_as": {
     "op": "job_suspend",

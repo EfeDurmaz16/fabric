@@ -283,18 +283,18 @@ pub enum Request {
         harness: Option<HarnessKind>,
         /// Waive the preflight refusals that can be waived.
         force: bool,
-        /// The `PATH` of the caller's shell; the node's own when absent.
+        /// The caller's environment; the node's own when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        path: Option<String>,
+        env: Option<ClientEnv>,
     },
     /// Stops the harness, snapshots the workspace and records the suspend.
     JobSuspend {
         /// The job.
         #[serde(with = "text")]
         job: JobId,
-        /// The `PATH` of the caller's shell; the node's own when absent.
+        /// The caller's environment; the node's own when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        path: Option<String>,
+        env: Option<ClientEnv>,
     },
     /// Moves the job to a peer by the cooperative move protocol.
     JobMove {
@@ -306,9 +306,9 @@ pub enum Request {
         to: NodeId,
         /// Waive the preflight refusals that can be waived.
         force: bool,
-        /// The `PATH` of the caller's shell; the node's own when absent.
+        /// The caller's environment; the node's own when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        path: Option<String>,
+        env: Option<ClientEnv>,
     },
     /// Takes the job without the owner's consent (ADR 0003, The steal).
     JobSteal {
@@ -346,9 +346,9 @@ pub enum Request {
             with = "text::option"
         )]
         job: Option<JobId>,
-        /// The `PATH` of the caller's shell; the node's own when absent.
+        /// The caller's environment; the node's own when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        path: Option<String>,
+        env: Option<ClientEnv>,
     },
     /// The client launched the planned harness; the node records it and appends `Resumed`.
     HarnessStarted {
@@ -415,6 +415,148 @@ impl Request {
             Request::HarnessSession { .. } => Op::HarnessSession,
             Request::HarnessExited { .. } => Op::HarnessExited,
         }
+    }
+}
+
+/// The environment of the client a request runs for (ADR 0018, The
+/// client's environment).
+///
+/// A node measures facts, picks carry keys and finds harnesses with the
+/// tools this environment names, not with its own: a cache is carried or
+/// rebuilt by the toolchain the user's shell runs. A root it does not set
+/// is unset for the request, never the node's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientEnv {
+    /// The directories of the client's `PATH`, in order.
+    pub path: Vec<PathDir>,
+    /// The tool roots the client's environment sets.
+    #[serde(default)]
+    pub roots: Roots,
+}
+
+impl ClientEnv {
+    /// The environment of this process: its `PATH` without the entries
+    /// that are not absolute directories, such as `.` or a relative one,
+    /// which would name a directory of the node's choosing, and the roots
+    /// it sets. A trailing `/` is dropped.
+    #[must_use]
+    pub fn current() -> Self {
+        let path = std::env::var_os("PATH")
+            .map(|path| {
+                std::env::split_paths(&path)
+                    .filter_map(|dir| PathDir::parse(without_trailing_slash(dir.to_str()?)).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let root = |name: &str| {
+            let value = std::env::var_os(name)?;
+            fabric_core::path::AbsPath::parse(without_trailing_slash(value.to_str()?)).ok()
+        };
+        Self {
+            path,
+            roots: Roots {
+                cargo_home: root(Roots::CARGO_HOME),
+                rustup_home: root(Roots::RUSTUP_HOME),
+                pnpm_home: root(Roots::PNPM_HOME),
+                xdg_data_home: root(Roots::XDG_DATA_HOME),
+            },
+        }
+    }
+
+    /// The `PATH` value to run a tool with.
+    #[must_use]
+    pub fn path_var(&self) -> std::ffi::OsString {
+        let dirs: Vec<&str> = self.path.iter().map(PathDir::as_str).collect();
+        dirs.join(":").into()
+    }
+}
+
+/// `text` without the `/` it ends with, unless it is `/`.
+fn without_trailing_slash(text: &str) -> &str {
+    match text.trim_end_matches('/') {
+        "" => &text[..text.len().min(1)],
+        trimmed => trimmed,
+    }
+}
+
+/// One directory of a `PATH`: an absolute path in the core's one text
+/// form, without a `:`, which would split it in two.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct PathDir(fabric_core::path::AbsPath);
+
+impl PathDir {
+    /// Checks `text` against the rules and wraps it.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        if text.contains(':') {
+            return Err(format!(
+                "{text:?} holds a `:`, which separates PATH entries"
+            ));
+        }
+        fabric_core::path::AbsPath::parse(text)
+            .map(Self)
+            .map_err(|e| format!("{text:?}: {e}"))
+    }
+
+    /// The directory's text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Debug for PathDir {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PathDir({:?})", self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for PathDir {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        Self::parse(&text).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The tool roots a node takes from a client's environment: the closed
+/// set of variables that decide where the tools it measures keep their
+/// state. A root that is absent is unset for the request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Roots {
+    /// `CARGO_HOME`: where cargo keeps its registry and rustup its proxies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cargo_home: Option<fabric_core::path::AbsPath>,
+    /// `RUSTUP_HOME`: where rustup keeps its toolchains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rustup_home: Option<fabric_core::path::AbsPath>,
+    /// `PNPM_HOME`: where pnpm lives, and its store when it is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pnpm_home: Option<fabric_core::path::AbsPath>,
+    /// `XDG_DATA_HOME`: where pnpm keeps its store when `PNPM_HOME` is unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xdg_data_home: Option<fabric_core::path::AbsPath>,
+}
+
+impl Roots {
+    /// The variable `cargo_home` stands for.
+    pub const CARGO_HOME: &str = "CARGO_HOME";
+    /// The variable `rustup_home` stands for.
+    pub const RUSTUP_HOME: &str = "RUSTUP_HOME";
+    /// The variable `pnpm_home` stands for.
+    pub const PNPM_HOME: &str = "PNPM_HOME";
+    /// The variable `xdg_data_home` stands for.
+    pub const XDG_DATA_HOME: &str = "XDG_DATA_HOME";
+
+    /// Every root with its variable, set or not, so a tool run for the
+    /// client gets each one set to the client's value or removed.
+    #[must_use]
+    pub fn vars(&self) -> [(&'static str, Option<&fabric_core::path::AbsPath>); 4] {
+        [
+            (Self::CARGO_HOME, self.cargo_home.as_ref()),
+            (Self::RUSTUP_HOME, self.rustup_home.as_ref()),
+            (Self::PNPM_HOME, self.pnpm_home.as_ref()),
+            (Self::XDG_DATA_HOME, self.xdg_data_home.as_ref()),
+        ]
     }
 }
 

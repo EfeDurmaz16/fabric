@@ -15,9 +15,9 @@ use fabric_core::session::SessionId;
 use tokio::net::UnixStream;
 
 use crate::api::{
-    API_VERSION, Answer, Decision, DoctorReport, Event, Hello, HelloAnswer, JobCreated, JobList,
-    JobLog, JobStatus, Lease, NodeIdentity, Op, Paired, PeerList, Pong, Refusal, Registered, Reply,
-    Request, RunPlan, SessionRecorded, Suspended, Welcome,
+    API_VERSION, Answer, ClientEnv, Decision, DoctorReport, Event, Hello, HelloAnswer, JobCreated,
+    JobList, JobLog, JobStatus, Lease, NodeIdentity, Op, Paired, PeerList, Pong, Refusal,
+    Registered, Reply, Request, RunPlan, SessionRecorded, Suspended, Welcome,
 };
 use crate::frame::{self, FrameError};
 
@@ -315,14 +315,14 @@ impl Client {
             on,
             harness,
             force,
-            path,
+            env,
         } = resume;
         let request = Request::JobResume {
             job,
             on,
             harness,
             force,
-            path,
+            env,
         };
         match self.call(&request, on_event).await? {
             Reply::JobResume(plan) => Ok(plan),
@@ -330,15 +330,16 @@ impl Client {
         }
     }
 
-    /// Stops the harness, snapshots the workspace and records the suspend.
+    /// Stops the harness, snapshots the workspace and records the suspend,
+    /// measuring with `env`, the caller's environment, or the node's own.
     pub async fn job_suspend(
         &self,
         job: JobId,
-        path: Option<String>,
+        env: Option<ClientEnv>,
         on_event: impl FnMut(Event),
     ) -> Result<Suspended, ClientError> {
         match self
-            .call(&Request::JobSuspend { job, path }, on_event)
+            .call(&Request::JobSuspend { job, env }, on_event)
             .await?
         {
             Reply::JobSuspend(reply) => Ok(reply),
@@ -352,14 +353,14 @@ impl Client {
         job: JobId,
         to: NodeId,
         force: bool,
-        path: Option<String>,
+        env: Option<ClientEnv>,
         on_event: impl FnMut(Event),
     ) -> Result<Lease, ClientError> {
         let request = Request::JobMove {
             job,
             to,
             force,
-            path,
+            env,
         };
         match self.call(&request, on_event).await? {
             Reply::JobMove(reply) => Ok(reply),
@@ -406,11 +407,11 @@ impl Client {
         &self,
         peer: Option<NodeId>,
         job: Option<JobId>,
-        path: Option<String>,
+        env: Option<ClientEnv>,
         on_event: impl FnMut(Event),
     ) -> Result<DoctorReport, ClientError> {
         match self
-            .call(&Request::Doctor { peer, job, path }, on_event)
+            .call(&Request::Doctor { peer, job, env }, on_event)
             .await?
         {
             Reply::Doctor { report } => Ok(report),
@@ -494,8 +495,8 @@ pub struct Resume {
     pub harness: Option<HarnessKind>,
     /// Waive the preflight refusals that can be waived.
     pub force: bool,
-    /// The `PATH` of the caller's shell; the node's own when `None`.
-    pub path: Option<String>,
+    /// The caller's environment; the node's own when `None`.
+    pub env: Option<ClientEnv>,
 }
 
 /// A harness the caller launched from a plan, for [`Client::harness_started`]

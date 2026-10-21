@@ -1,0 +1,12 @@
+{
+  "schema": "request",
+  "value": {
+    "op": "doctor",
+    "env": {
+      "path": [
+        "/usr/bin:/bin"
+      ],
+      "roots": {}
+    }
+  }
+}

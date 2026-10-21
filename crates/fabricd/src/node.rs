@@ -11,7 +11,6 @@
 //! ask the other for chunks over the connection one of them dialed.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::OsString;
 use std::fs::{self, File};
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
@@ -19,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use fabric_client::api::{Answer, Event, Request};
+use fabric_client::api::{Answer, ClientEnv, Event, Request};
 use fabric_core::id::{JobId, NodeId};
 use fabric_net::endpoint::{DialOrder, Endpoint};
 use fabric_net::identity::NodeIdentity;
@@ -54,10 +53,9 @@ pub struct NodeConfig {
     pub listen: SocketAddr,
     /// Which wires a dial tries.
     pub dial: DialOrder,
-    /// The `PATH` the daemon was started with, for work no CLI asked for.
-    pub path_var: OsString,
-    /// `CARGO_HOME`, when set.
-    pub cargo_home: Option<PathBuf>,
+    /// The environment the daemon was started with, for work no client
+    /// asked for and for a request that sends none.
+    pub env: ClientEnv,
 }
 
 /// A running node.
@@ -312,11 +310,11 @@ impl Node {
             .ok_or(NodeError::UnknownJob(id))
     }
 
-    /// The adapters' environment for a request made with `path_var`.
-    pub(crate) fn harness_env(&self, path_var: &OsString) -> Result<HarnessEnv, NodeError> {
+    /// The adapters' environment for a request made in `env`.
+    pub(crate) fn harness_env(&self, env: &ClientEnv) -> Result<HarnessEnv, NodeError> {
         Ok(HarnessEnv::new(
             &self.cfg.home,
-            path_var.clone(),
+            env.path_var(),
             self.harness_config.clone(),
         )?)
     }

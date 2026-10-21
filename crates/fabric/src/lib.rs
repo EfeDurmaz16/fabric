@@ -30,7 +30,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use fabric_client::api::{Decision, DoctorReport, Event, RefusalKind, Reply, Request, RunPlan};
+use fabric_client::api::{
+    ClientEnv, Decision, DoctorReport, Event, RefusalKind, Reply, Request, RunPlan,
+};
 use fabric_client::{Client, ClientError, Launched};
 use fabric_core::env::{EnvVarName, SetupArg};
 use fabric_core::harness::HarnessKind;
@@ -241,12 +243,6 @@ fn path_var() -> OsString {
     std::env::var_os("PATH").unwrap_or_default()
 }
 
-/// The `PATH` to send the node, which measures facts with it; the node
-/// uses its own when this one is not UTF-8.
-fn path_text() -> Option<String> {
-    std::env::var_os("PATH").and_then(|path| path.into_string().ok())
-}
-
 /// The client of the node that serves `state`.
 fn client(state: &StateDir) -> Client {
     Client::new(state.socket()).named(format!("fabric/{}", env!("CARGO_PKG_VERSION")))
@@ -422,7 +418,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let request = Request::Doctor {
                 peer,
                 job,
-                path: path_text(),
+                env: Some(ClientEnv::current()),
             };
             let reply = ask(&client, &request, Notes::Stdout).await?;
             // The node reports; a row that would stop a move still fails
@@ -460,8 +456,7 @@ async fn serve(state: StateDir, home: PathBuf, args: ServeArgs) -> Result<ExitCo
         home,
         listen: args.listen,
         dial,
-        path_var: path_var(),
-        cargo_home: std::env::var_os("CARGO_HOME").map(PathBuf::from),
+        env: ClientEnv::current(),
     })?;
     {
         let mut stdout = std::io::stdout().lock();
@@ -505,7 +500,7 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
         JobCommand::Suspend { job } => (
             Request::JobSuspend {
                 job,
-                path: path_text(),
+                env: Some(ClientEnv::current()),
             },
             Mode::Interactive(None),
         ),
@@ -522,7 +517,7 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
                 on,
                 harness,
                 force,
-                path: path_text(),
+                env: Some(ClientEnv::current()),
             },
             Mode::new(prompt, headless)?,
         ),
@@ -531,7 +526,7 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
                 job,
                 to,
                 force,
-                path: path_text(),
+                env: Some(ClientEnv::current()),
             },
             Mode::Interactive(None),
         ),

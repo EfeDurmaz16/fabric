@@ -149,13 +149,9 @@ impl Service for Node {
 
     fn facts(&self, _peer: NodeId) -> BoxFuture<'_, Result<Facts, Fault>> {
         Box::pin(async move {
-            Ok(NodeFacts::measure(
-                &self.cfg.home,
-                &self.cfg.path_var,
-                self.cfg.cargo_home.clone(),
-            )
-            .await
-            .to_wire())
+            Ok(NodeFacts::measure(&self.cfg.home, &self.cfg.env)
+                .await
+                .to_wire())
         })
     }
 }
@@ -387,8 +383,8 @@ impl Node {
             }
         }
         let mut out = Out::default();
-        let path_var = self.cfg.path_var.clone();
-        self.suspend_locked(&mut job, &path_var, &mut out)
+        let env = self.cfg.env.clone();
+        self.suspend_locked(&mut job, &env, &mut out)
             .await
             .map_err(|e| internal(&e))?;
         let move_id = clock::move_id();

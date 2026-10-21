@@ -72,6 +72,11 @@ impl Env {
         }))
     }
 
+    /// The `PATH` every process of the test runs with.
+    pub fn path(&self) -> &std::ffi::OsStr {
+        &self.path
+    }
+
     /// The job's root, the same path on both nodes.
     pub fn work(&self, job: &str) -> PathBuf {
         self.home.join("fabric").join("jobs").join(job).join("work")
