@@ -604,6 +604,8 @@ fn e2e_a_claude_job_launches_and_warns_while_another_claude_runs() -> Fallible {
 
 /// A `job run` whose reader goes away once the plan is printed, as with a
 /// pipe into `head`, cannot print the node's answer to its registration.
+/// When the test closes the pipe only after that answer was written, it
+/// passes without reaching the fix; it never fails for timing.
 /// It must still supervise the harness it launched: wait for it, and tell
 /// the node when it exits, so the job is not left with a recorded harness
 /// nobody waits for.
@@ -621,8 +623,20 @@ fn e2e_a_run_whose_output_closes_still_supervises_its_harness() -> Fallible {
             ("FAKE_PID_FILE", &pid_file),
         ],
     )?;
-    let mut first = String::new();
-    std::io::BufReader::new(running.stdout.take().ok_or("no stdout")?).read_line(&mut first)?;
+    // The plan's last line names the session; the CLI writes every plan
+    // line before it launches, and nothing more until the node answers the
+    // registration. The pipe closes in that gap.
+    let mut plan = std::io::BufReader::new(running.stdout.take().ok_or("no stdout")?);
+    loop {
+        let mut line = String::new();
+        if plan.read_line(&mut line)? == 0 {
+            return Err("the CLI printed no session line".into());
+        }
+        if line.starts_with("continuing ") || line.starts_with("starting a new ") {
+            break;
+        }
+    }
+    drop(plan);
     wait_for(&pid_file, "the harness launch")?;
     let started = std::time::Instant::now();
     while !p
