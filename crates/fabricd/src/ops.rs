@@ -23,7 +23,7 @@ use fabric_client::api::{
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, JobId, MoveId, NodeId, SnapshotId};
 use fabric_core::lease::{FenceError, FencingToken};
-use fabric_core::ledger::{Author, EventKind, Ledger};
+use fabric_core::ledger::{Author, EventKind, Ledger, LedgerError};
 use fabric_core::moves::{CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
 use fabric_core::session::SessionId;
 use fabric_harness::HarnessError;
@@ -1023,7 +1023,10 @@ impl Node {
         out: &mut Out,
     ) -> Result<(), NodeError> {
         if to == self.id {
-            return Err(fabric_core::ledger::LedgerError::MoveToSelf.into());
+            return Err(NodeError::ledger_fact(
+                LedgerError::MoveToSelf,
+                Reason::MoveToSelf { job: id },
+            ));
         }
         self.resolve_departing(id, out).await?;
         let (harness, root, view) = {
@@ -1980,13 +1983,16 @@ impl Node {
         {
             let job = self.job(id).await?;
             let mut job = job.lock().await;
-            let proposal = job.ledger().steal(
-                self.id,
-                reason,
-                complete,
-                clock::event_id(),
-                clock::now_ms(),
-            )?;
+            let proposal = job
+                .ledger()
+                .steal(
+                    self.id,
+                    reason,
+                    complete,
+                    clock::event_id(),
+                    clock::now_ms(),
+                )
+                .map_err(|e| steal_refused(&job, self.id, e))?;
             let age_ms = clock::now_ms().saturating_sub(proposal.warning.last_record_at);
             let described = proposal.warning.with_age(age_ms);
             let warning = StealWarning {
@@ -2154,6 +2160,32 @@ fn answer_error(peer: NodeId, err: &fabric_net::rpc::RpcError) -> NodeError {
             reason: err.to_string(),
         },
     }
+}
+
+/// The refusal of a steal `me` asked for and the ledger of `job` did not
+/// take, with the facts of the job that explain it.
+fn steal_refused(job: &Job, me: NodeId, error: LedgerError) -> NodeError {
+    let id = job.id();
+    let fact = match (&error, job.view(me)) {
+        (LedgerError::StealBySelf, LeaseView::Departing { move_id, target }) => {
+            Reason::StealWhileDeparting {
+                job: id,
+                move_id,
+                target,
+            }
+        }
+        (LedgerError::StealBySelf, _) => Reason::StealByOwner { job: id },
+        (LedgerError::StealByTarget { move_id }, _) => Reason::StealByTarget {
+            job: id,
+            move_id: *move_id,
+        },
+        (LedgerError::StealWithoutSnapshot, _) => match job.latest() {
+            Some(snapshot) => Reason::StealWithoutSnapshot { job: id, snapshot },
+            None => return NodeError::NoSnapshot(id),
+        },
+        _ => return error.into(),
+    };
+    NodeError::ledger_fact(error, fact)
 }
 
 /// The owner's fencing token, or the refusal that says who owns the job.
@@ -3201,6 +3233,132 @@ pub(crate) mod tests {
             )
         );
         assert_eq!(a.lease(id).await.unwrap().epoch, Epoch::FIRST);
+    }
+
+    /// The refusal `node` gives when it asks to steal `id`.
+    async fn steal_refusal(node: &Arc<Node>, id: JobId) -> fabric_client::api::Refusal {
+        node.job_steal(id, "a sleeps".to_owned(), true, &mut Out::default())
+            .await
+            .unwrap_err()
+            .to_refusal()
+    }
+
+    /// Review finding on PR #13: what a ledger rule refuses of a request
+    /// came back as `internal`, the reason of a failed file or store, with
+    /// the job's facts only in the sentence. A move to the owner itself
+    /// names the job, with the rule's sentence as before.
+    #[tokio::test]
+    async fn a_move_to_the_owner_itself_is_refused_with_the_job() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+
+        let refused = node
+            .job_move(id, node.id, true, &ToolEnv::current(), &mut Out::default())
+            .await
+            .unwrap_err()
+            .to_refusal();
+        assert_eq!(refused.reason(), &Reason::MoveToSelf { job: id });
+        assert_eq!(refused.kind(), fabric_client::api::RefusalKind::Failed);
+        assert_eq!(refused.message(), "cannot move a job to its owner");
+    }
+
+    /// Review finding on PR #13: a steal the ledger refuses came back as
+    /// `internal`. Each refusal now names the facts of the job that explain
+    /// it, with the rule's sentence as before: the owner asks, B asks
+    /// without the latest snapshot whole, the owner asks while a move it
+    /// started toward B is open, and B, that move's target, asks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_steal_the_ledger_refuses_names_the_facts_that_explain_it() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &ToolEnv::current(), &mut Out::default())
+            .await
+            .unwrap();
+        let snapshot = a.job(id).await.unwrap().lock().await.latest().unwrap();
+
+        let refused = steal_refusal(&a, id).await;
+        assert_eq!(refused.reason(), &Reason::StealByOwner { job: id });
+        assert_eq!(refused.message(), "the owner cannot steal its own job");
+
+        b.pull_records(id, a.id).await.unwrap();
+        let refused = steal_refusal(&b, id).await;
+        assert_eq!(
+            refused.reason(),
+            &Reason::StealWithoutSnapshot { job: id, snapshot }
+        );
+        assert_eq!(
+            refused.message(),
+            "steal refused: the latest published snapshot is not complete in the local store"
+        );
+
+        let move_id = clock::move_id();
+        {
+            let job = a.job(id).await.unwrap();
+            let mut job = job.lock().await;
+            let record = job
+                .ledger()
+                .start_move(a.id, b.id, move_id, clock::event_id(), clock::now_ms())
+                .unwrap();
+            job.commit(record, Author::Node(a.id)).unwrap();
+        }
+        let refused = steal_refusal(&a, id).await;
+        assert_eq!(
+            refused.reason(),
+            &Reason::StealWhileDeparting {
+                job: id,
+                move_id,
+                target: b.id,
+            }
+        );
+        assert_eq!(refused.message(), "the owner cannot steal its own job");
+
+        b.pull_records(id, a.id).await.unwrap();
+        let refused = steal_refusal(&b, id).await;
+        assert_eq!(
+            refused.reason(),
+            &Reason::StealByTarget { job: id, move_id }
+        );
+        assert_eq!(
+            refused.message(),
+            format!("the target of move {move_id} decides it; import or abort instead of stealing")
+        );
+        assert_eq!(refused.kind(), fabric_client::api::RefusalKind::Failed);
+    }
+
+    /// Review finding on PR #13: ACP arguments that hold a secret were
+    /// refused as `internal`; the refusal names the program.
+    #[tokio::test]
+    async fn acp_arguments_that_hold_a_secret_are_refused_with_the_program() {
+        let (_dir, node) = node();
+        let harness = HarnessKind::Acp {
+            program: fabric_core::harness::ProgramName::parse("opencode").unwrap(),
+            args: vec!["--api-key".to_owned(), format!("sk-ant-{}", "a".repeat(24))],
+        };
+
+        let refused = node
+            .job_resume(
+                clock::job_id(),
+                None,
+                Some(harness),
+                false,
+                &ToolEnv::current(),
+                &mut Out::default(),
+            )
+            .await
+            .unwrap_err()
+            .to_refusal();
+        assert_eq!(
+            refused.reason(),
+            &Reason::SecretInArguments {
+                program: "opencode".to_owned()
+            }
+        );
+        assert_eq!(
+            refused.message(),
+            "the launch arguments of opencode hold a secret; pass it through the environment"
+        );
     }
 
     #[tokio::test]

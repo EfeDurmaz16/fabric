@@ -1,0 +1,8 @@
+{
+  "kind": "failed",
+  "reason": {
+    "code": "move_to_self",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0"
+  },
+  "message": "cannot move a job to its owner"
+}

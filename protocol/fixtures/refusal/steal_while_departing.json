@@ -1,0 +1,10 @@
+{
+  "kind": "failed",
+  "reason": {
+    "code": "steal_while_departing",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "move_id": "01JB2Z3Y4X5W6V7T8S9R0QPNMK",
+    "target": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba"
+  },
+  "message": "the owner cannot steal its own job"
+}

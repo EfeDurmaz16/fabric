@@ -1,0 +1,8 @@
+{
+  "kind": "failed",
+  "reason": {
+    "code": "steal_by_owner",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0"
+  },
+  "message": "the owner cannot steal its own job"
+}

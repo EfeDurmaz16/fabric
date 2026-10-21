@@ -1,0 +1,9 @@
+{
+  "kind": "failed",
+  "reason": {
+    "code": "synced_root",
+    "root": "/Users/me/Documents/work",
+    "folder": "/Users/me/Documents"
+  },
+  "message": "/Users/me/Documents/work is inside /Users/me/Documents, which iCloud Drive syncs on this node; a job root must not be (ADR 0011)"
+}

@@ -2268,6 +2268,66 @@ pub enum Reason {
         /// The epoch this node knows.
         epoch: Epoch,
     },
+    /// A move named the node that owns the job as its target.
+    MoveToSelf {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+    },
+    /// The node asked to steal a job it owns.
+    StealByOwner {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+    },
+    /// The node asked to steal a job it owns and started a move of, which
+    /// is open: the target decides it, so the node asks the target again or
+    /// another node steals.
+    StealWhileDeparting {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The open move.
+        #[serde(with = "text")]
+        move_id: MoveId,
+        /// The node that decides it.
+        #[serde(with = "text")]
+        target: NodeId,
+    },
+    /// The node asked to steal a job it is the target of an open move of;
+    /// it imports or aborts the move instead.
+    StealByTarget {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The open move.
+        #[serde(with = "text")]
+        move_id: MoveId,
+    },
+    /// The node asked to steal a job whose latest snapshot it does not
+    /// hold whole; a steal never resumes from nothing.
+    StealWithoutSnapshot {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The latest snapshot.
+        #[serde(with = "text")]
+        snapshot: SnapshotId,
+    },
+    /// The arguments of an ACP harness hold what looks like a secret, which
+    /// would travel in the ledger and the manifests; it belongs in the
+    /// environment.
+    SecretInArguments {
+        /// The agent program.
+        program: String,
+    },
+    /// A job's root lies in a folder a sync service rewrites (ADR 0011).
+    SyncedRoot {
+        /// The root.
+        root: PathBuf,
+        /// The synced folder that holds it.
+        folder: PathBuf,
+    },
     /// The request did not parse, or names an op the node does not serve.
     BadRequest,
     /// A failure with no structure worth typing: a file, the store, a harness adapter.
@@ -2310,6 +2370,13 @@ impl Reason {
             | Reason::PeerForked { .. }
             | Reason::MoveUnlinked { .. }
             | Reason::MoveStale { .. }
+            | Reason::MoveToSelf { .. }
+            | Reason::StealByOwner { .. }
+            | Reason::StealWhileDeparting { .. }
+            | Reason::StealByTarget { .. }
+            | Reason::StealWithoutSnapshot { .. }
+            | Reason::SecretInArguments { .. }
+            | Reason::SyncedRoot { .. }
             | Reason::BadRequest
             | Reason::Internal => RefusalKind::Failed,
             Reason::Unrecognized => return None,

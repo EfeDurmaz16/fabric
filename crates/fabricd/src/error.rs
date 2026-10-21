@@ -11,6 +11,7 @@ use fabric_client::api::{Reason, Refusal, StealWarning, Step};
 use fabric_core::id::{Epoch, JobId, MoveId, NodeId, SnapshotId};
 use fabric_core::lease::FenceError;
 use fabric_core::ledger::{LedgerError, StoreError as LedgerStoreError};
+use fabric_harness::HarnessError;
 
 use crate::harnesses::HarnessConfigError;
 use crate::ledger_file::LedgerFileError;
@@ -227,6 +228,16 @@ pub enum NodeError {
         /// The fact as the client API names it.
         fact: Box<Reason>,
     },
+    /// A ledger rule refused what was asked of the job, such as a move to
+    /// the owner itself or a steal by the owner or by a move's target; a
+    /// client reads `fact`, and the sentence is the rule's.
+    #[error("{error}")]
+    LedgerFact {
+        /// The rule's refusal.
+        error: LedgerError,
+        /// The fact as the client API names it.
+        fact: Box<Reason>,
+    },
     /// The preflight found rows that stop the move; the facts of those rows.
     #[error(
         "the preflight refused the move: {}; `fabric job move` and `fabric job resume` take --force to waive what can be waived",
@@ -418,7 +429,19 @@ impl NodeError {
             }
             NodeError::BadAddress { text, .. } => Reason::BadAddress { text: text.clone() },
             NodeError::Peer { peer, .. } => Reason::Peer { peer: *peer },
-            NodeError::PeerFact { fact, .. } => (**fact).clone(),
+            NodeError::PeerFact { fact, .. } | NodeError::LedgerFact { fact, .. } => {
+                (**fact).clone()
+            }
+            NodeError::Paths(PathsError::SyncedRoot { root, folder, .. }) => Reason::SyncedRoot {
+                root: root.clone(),
+                folder: folder.clone(),
+            },
+            NodeError::Harness(HarnessError::SecretInArguments { program })
+            | NodeError::HarnessConfig(HarnessConfigError::Adapter(
+                HarnessError::SecretInArguments { program },
+            )) => Reason::SecretInArguments {
+                program: program.clone(),
+            },
             NodeError::Fetch { snapshot, peer, .. } => Reason::Fetch {
                 snapshot: *snapshot,
                 peer: *peer,
@@ -455,6 +478,14 @@ impl NodeError {
         }
     }
 
+    /// A ledger rule's refusal `error`, which names `fact`.
+    pub(crate) fn ledger_fact(error: LedgerError, fact: Reason) -> Self {
+        NodeError::LedgerFact {
+            error,
+            fact: Box::new(fact),
+        }
+    }
+
     /// A filesystem error at `path`.
     pub(crate) fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         NodeError::Io {
@@ -477,5 +508,52 @@ fn unfinished_command(step: Step) -> &'static str {
     match step {
         Step::Suspend => "suspend",
         Step::Restore => "resume",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use fabric_client::api::RefusalKind;
+
+    use super::*;
+    use crate::paths::{SyncedFolders, check_root};
+
+    /// Review finding on PR #13: a root in a synced folder was refused as
+    /// `internal`; the refusal names the root and the folder.
+    #[test]
+    fn a_root_in_a_synced_folder_is_refused_with_the_root_and_the_folder() {
+        let home = Path::new("/Users/x");
+        let icloud = home.join("Library/Mobile Documents");
+        let root = icloud.join("w");
+        let refused =
+            NodeError::from(check_root(&root, home, SyncedFolders::default()).unwrap_err())
+                .to_refusal();
+        assert_eq!(
+            refused.reason(),
+            &Reason::SyncedRoot {
+                root,
+                folder: icloud,
+            }
+        );
+        assert_eq!(refused.kind(), RefusalKind::Failed);
+    }
+
+    /// The same secret found by the adapter, when a suspend captures the
+    /// state of an ACP harness a job already records, names the program as
+    /// the refusal of a request that carries it does.
+    #[test]
+    fn a_secret_the_adapter_finds_in_acp_arguments_is_refused_with_the_program() {
+        let refused = NodeError::from(HarnessError::SecretInArguments {
+            program: "opencode".to_owned(),
+        })
+        .to_refusal();
+        assert_eq!(
+            refused.reason(),
+            &Reason::SecretInArguments {
+                program: "opencode".to_owned()
+            }
+        );
     }
 }

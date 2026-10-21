@@ -1,0 +1,9 @@
+{
+  "kind": "failed",
+  "reason": {
+    "code": "steal_without_snapshot",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "snapshot": "abababababababababababababababababababababababababababababababab"
+  },
+  "message": "steal refused: the latest published snapshot is not complete in the local store"
+}

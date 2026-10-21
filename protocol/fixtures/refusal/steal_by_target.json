@@ -1,0 +1,9 @@
+{
+  "kind": "failed",
+  "reason": {
+    "code": "steal_by_target",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "move_id": "01JB2Z3Y4X5W6V7T8S9R0QPNMK"
+  },
+  "message": "the target of move 01JB2Z3Y4X5W6V7T8S9R0QPNMK decides it; import or abort instead of stealing"
+}
