@@ -1153,6 +1153,31 @@ mod tests {
         assert_eq!(fixture.ran(), None, "the older codex ran");
     }
 
+    /// The floor is the higher of the two writers either way: a known
+    /// writer older than the rollout's `cli_version`, such as one a daemon
+    /// read from another Codex than a workspace pinned, does not lower it.
+    #[tokio::test]
+    async fn a_known_writer_older_than_the_rollout_does_not_lower_the_floor() {
+        let mut fixture = Resume::new("codex-cli 0.158.0");
+        let rollout = std::fs::read_to_string(&fixture.rollout).unwrap();
+        let newer = rollout.replace("\"cli_version\":\"0.155.1\"", "\"cli_version\":\"0.160.0\"");
+        assert_ne!(newer, rollout);
+        std::fs::write(&fixture.rollout, &newer).unwrap();
+        let older = HarnessVersion::parse("0.155.1").unwrap();
+        fixture.adapter = fixture.adapter.clone().with_known_writer(Some(older));
+        let refused = fixture.launch(true).await.unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                HarnessError::HarnessOlderThanSession { local, recorded, .. }
+                    if local.as_str() == "0.158.0" && recorded.as_str() == "0.160.0"
+            ),
+            "{refused}"
+        );
+        assert_eq!(std::fs::read_to_string(&fixture.rollout).unwrap(), newer);
+        assert_eq!(fixture.ran(), None, "the older codex ran");
+    }
+
     /// A codex whose version cannot be read is refused too: deny by default.
     #[tokio::test]
     async fn a_codex_whose_version_cannot_be_read_is_refused() {
