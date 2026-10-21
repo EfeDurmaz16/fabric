@@ -127,23 +127,35 @@ where
             format!("the command stopped before it answered: {e}"),
         ),
     });
-    if let Err(FrameError::TooLarge(len)) = send(&mut stream, &answer).await {
-        let refusal = Refusal::new(
-            Reason::Internal,
-            format!(
-                "the answer is {len} bytes, over the {} the control socket carries; the command itself ran",
-                frame::MAX_FRAME
-            ),
-        );
-        let _ = send(&mut stream, &Answer::Refused { refusal }).await;
+    match send(&mut stream, &answer).await {
+        Ok(()) | Err(FrameError::Io(_)) => {}
+        // Nothing of it was written, so the client still reads a final
+        // frame, and learns the command ran rather than ask for it again.
+        Err(e) => {
+            let refusal = Refusal::new(Reason::Internal, unwritable(&e));
+            let _ = send(&mut stream, &Answer::Refused { refusal }).await;
+        }
+    }
+}
+
+/// Why an answer could not be framed, for the refusal that replaces it.
+fn unwritable(error: &FrameError) -> String {
+    match error {
+        FrameError::TooLarge(len) => format!(
+            "the answer is {len} bytes, over the {} the control socket carries; the command itself ran",
+            frame::MAX_FRAME
+        ),
+        // Such as a path that is not UTF-8, under a home that is not.
+        e => format!("the answer cannot be written as JSON ({e}); the command itself ran"),
     }
 }
 
 async fn deliver(stream: &mut UnixStream, event: Event) -> bool {
     match send(stream, &Answer::Event { event }).await {
-        // One event too large to frame is dropped; the client still gets the rest.
-        Ok(()) | Err(FrameError::TooLarge(_)) => true,
-        Err(_) => false,
+        Err(FrameError::Io(_)) => false,
+        // One event that cannot be framed, too large or holding a path
+        // that is not UTF-8, is dropped; the client still gets the rest.
+        Ok(()) | Err(_) => true,
     }
 }
 
@@ -181,10 +193,74 @@ async fn send<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> Result
 
 #[cfg(test)]
 mod tests {
-    use fabric_client::api::Reply;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::path::PathBuf;
+
+    use fabric_client::api::{JobCreated, Reply};
+    use fabric_core::harness::HarnessKind;
+    use fabric_core::id::{Epoch, JobId};
     use tokio::sync::oneshot;
 
     use super::*;
+
+    /// Review finding on PR #13: under a home that is not UTF-8, which
+    /// the node accepts, a job's root has no JSON form. Such an answer
+    /// ended the connection with no final frame, so a client could not
+    /// tell that `job_new` had made the job and might make it again, and
+    /// such an event ended the relay before the rest. The event is now
+    /// dropped and the answer becomes an `internal` refusal saying that
+    /// the command ran.
+    #[tokio::test]
+    async fn an_answer_with_no_json_form_is_refused_and_such_an_event_dropped() {
+        let job: JobId = "01JABCDEFGHJKMNPQRSTVWXYZ0".parse().unwrap();
+        let root = PathBuf::from(OsString::from_vec(
+            b"/home/\xff/fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/work".to_vec(),
+        ));
+        let (node_side, mut client) = UnixStream::pair().unwrap();
+        let (live, made) = mpsc::unbounded_channel();
+        let command = async move {
+            let mut out = Out::streaming(live);
+            out.emit(Event::StaleWorkspaceKept {
+                job,
+                root: root.clone(),
+                left_at: Epoch::FIRST,
+            });
+            out.emit(Event::LeftBehind {
+                path: "after".to_owned(),
+            });
+            Answer::Done {
+                reply: Reply::JobNew(JobCreated {
+                    job,
+                    root,
+                    repo: PathBuf::from("/repo"),
+                    harness: HarnessKind::ClaudeCode,
+                    epoch: Epoch::FIRST,
+                }),
+            }
+        };
+        relay(command, made, node_side).await;
+
+        let next: Answer = frame::read(&mut client).await.unwrap().unwrap();
+        assert_eq!(
+            next,
+            Answer::Event {
+                event: Event::LeftBehind {
+                    path: "after".to_owned()
+                }
+            }
+        );
+        let last: Answer = frame::read(&mut client).await.unwrap().unwrap();
+        let Answer::Refused { refusal } = last else {
+            panic!("{last:?}");
+        };
+        assert_eq!(refusal.reason(), &Reason::Internal);
+        assert!(
+            refusal.message().ends_with("the command itself ran"),
+            "{}",
+            refusal.message()
+        );
+    }
 
     /// Review finding on PR #13: a client that stayed connected but
     /// stopped reading stalled a suspend between two events, with the
