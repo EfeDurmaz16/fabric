@@ -1054,6 +1054,15 @@ impl Node {
     ) -> Result<Option<MoveOffer>, NodeError> {
         let job = self.job(id).await?;
         let mut job = job.lock().await;
+        // A catch-up may have frozen the job while the target copied it;
+        // the target must not import and run a frozen chain.
+        if let Some(fork) = job.forked()? {
+            return Err(NodeError::Forked {
+                job: id,
+                peer: fork.peer,
+                epoch: fork.epoch,
+            });
+        }
         // Another move, typed at the same time, may have departed toward
         // another node while the target copied the job.
         if let LeaseView::Departing { move_id, target } = job.view(self.id)
@@ -3304,6 +3313,45 @@ pub(crate) mod tests {
         assert!(
             departed.join("README.md").is_file() && !root.exists(),
             "the copy stayed in the root with no marker"
+        );
+    }
+
+    /// A catch-up can freeze the job while a move's target copies it. The
+    /// move must not then commit `MoveStarted` on the frozen chain, which
+    /// the target would import and run.
+    #[tokio::test]
+    async fn a_move_does_not_depart_from_a_job_frozen_while_it_was_copied() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        node.freeze(
+            id,
+            &crate::local::ForkRecord {
+                peer: NodeId::from_bytes([8; 32]),
+                epoch: Epoch::FIRST,
+                head: fabric_core::id::RecordHash::of(b"their head"),
+            },
+            &mut Out::default(),
+        )
+        .await
+        .unwrap();
+        let refused = node
+            .depart(id, NodeId::from_bytes([7; 32]), &mut Out::default())
+            .await;
+        assert!(
+            matches!(refused, Err(NodeError::Forked { .. })),
+            "{refused:?}"
+        );
+        let job = node.job(id).await.unwrap();
+        assert!(
+            !job.lock()
+                .await
+                .ledger()
+                .records()
+                .iter()
+                .any(|r| matches!(r.event().kind, EventKind::MoveStarted { .. })),
+            "MoveStarted was appended on a frozen chain"
         );
     }
 }
