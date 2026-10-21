@@ -37,6 +37,7 @@ pub(crate) mod process;
 pub(crate) mod redact;
 mod session;
 pub(crate) mod stage;
+mod version;
 
 #[cfg(feature = "acp")]
 pub mod acp;
@@ -51,3 +52,4 @@ pub use harness::{
     TurnReport,
 };
 pub use session::{MAX_SESSION_ID_LEN, SessionId, SessionIdError};
+pub use version::{HarnessVersion, VersionError};
