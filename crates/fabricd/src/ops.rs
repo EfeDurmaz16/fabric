@@ -721,8 +721,11 @@ impl Node {
             harness_state = Some(state_dir);
         }
         let facts = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
-        let detection = fabric_env::detect::detect(root, &[]).ok();
-        let keys = MeasuredKeys::new(facts, detection.as_ref());
+        // A workspace whose environment does not detect here would not
+        // materialize on the target either, so the snapshot is refused
+        // before it is published or moved.
+        let detection = fabric_env::detect::detect(root, &[])?;
+        let keys = MeasuredKeys::new(facts, Some(&detection));
         let root = root.to_owned();
         let job_id = job.id();
         let me = self.id;
@@ -2440,6 +2443,23 @@ pub(crate) mod tests {
             job.lock().await.view(a.id),
             LeaseView::Owner(token) if token.epoch == Epoch::FIRST
         ));
+    }
+
+    /// A suspend must not publish a snapshot whose `.fabric/env.toml`
+    /// does not parse: the target would take the job and then fail to
+    /// materialize it.
+    #[tokio::test]
+    async fn a_suspend_refuses_a_workspace_whose_environment_does_not_detect() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(root.join(".fabric/env.toml"), "not toml [\n").unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let refused = node.suspend(id, &path, &mut Out::default()).await;
+        assert!(matches!(refused, Err(NodeError::Detect(_))), "{refused:?}");
+        let job = node.job(id).await.unwrap();
+        assert_eq!(job.lock().await.latest(), None);
     }
 
     #[test]

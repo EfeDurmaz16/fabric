@@ -117,7 +117,7 @@ The root is refused under `~/Library/Mobile Documents` everywhere, and under `~/
 
 ### Carry keys
 
-Capture measures carry keys with `fabric-env` detection: a cache detection does not know is `Unmeasured` and never carried. A restore cannot run detection before the workspace exists, so it measures the key of the same shape as the source's: the same package manager, its own versions and paths. Each cache prints one line, carried or rebuilt and why.
+Capture measures carry keys with `fabric-env` detection: a cache detection does not know is `Unmeasured` and never carried. A workspace whose detection fails, such as a `.fabric/env.toml` that does not parse, is not captured: the suspend stops and names the error, because the target would take the job and then fail to materialize it. A restore cannot run detection before the workspace exists, so it measures the key of the same shape as the source's: the same package manager, its own versions and paths. Each cache prints one line, carried or rebuilt and why.
 
 ### Decisions as ledger events
 
