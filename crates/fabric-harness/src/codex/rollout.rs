@@ -873,6 +873,13 @@ mod tests {
             reason(&after("/w/repo", &read_only_under_a_writable_parent)),
             unnamed
         );
+        // Two entries for the workspace itself: the one that does not
+        // write wins, in either order.
+        let write = entry("write", "{\"type\":\"path\",\"path\":\"/w/repo\"}");
+        let deny = entry("deny", "{\"type\":\"path\",\"path\":\"/w/repo\"}");
+        for pair in [[write.clone(), deny.clone()], [deny, write]] {
+            assert_eq!(reason(&after("/w/repo", &entries(&pair))), unnamed);
+        }
         let project_roots = |subpath: &str| {
             entries(&[entry(
                 "write",
