@@ -1491,13 +1491,36 @@ impl Node {
                     });
                 }
             };
-            for bytes in page.records() {
-                self.accept_record(id, holder, bytes.as_bytes()).await?;
+            if !self.take_page(id, holder, &page).await? {
+                // Another pull moved the head while this page was in
+                // flight; asking again from the new head either links or
+                // is answered NotInChain, which the fork rule above takes.
+                continue;
             }
             if !more {
                 return Ok(());
             }
         }
+    }
+
+    /// Takes a pulled page; false when it no longer links to this node's
+    /// head because the head moved after the page was asked for.
+    pub(crate) async fn take_page(
+        &self,
+        id: JobId,
+        holder: NodeId,
+        page: &RecordPage,
+    ) -> Result<bool, NodeError> {
+        for bytes in page.records() {
+            match self.accept_record(id, holder, bytes.as_bytes()).await {
+                Ok(_) => {}
+                Err(NodeError::Ledger(fabric_core::ledger::LedgerError::PrevMismatch {
+                    ..
+                })) => return Ok(false),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
     }
 
     /// Takes one record from `peer`, making the job here from its `Created` record.
@@ -2614,6 +2637,81 @@ pub(crate) mod tests {
             "{:?}",
             out.lines
         );
+    }
+
+    /// Two peers can answer pulls asked from the same head. Once one page
+    /// lands, the other's no longer links to this node's head; that page
+    /// must lead to the fork rule, not to an error that leaves a
+    /// higher-epoch steal on the other chain unseen.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_page_that_no_longer_links_leads_to_the_fork_rule() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        let (_dir_c, c) = node();
+        tokio::spawn(Arc::clone(&a).run());
+        tokio::spawn(Arc::clone(&c).run());
+        let (at_a, at_c) = (
+            a.local_addr().unwrap().to_string(),
+            c.local_addr().unwrap().to_string(),
+        );
+        for (node, peer, addr) in [
+            (&a, b.id, None),
+            (&a, c.id, Some(&at_c)),
+            (&b, a.id, Some(&at_a)),
+            (&b, c.id, Some(&at_c)),
+            (&c, a.id, Some(&at_a)),
+            (&c, b.id, None),
+        ] {
+            node.node_add(peer, addr.map(String::as_str), &mut Out::default())
+                .await
+                .unwrap();
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let out = &mut Out::default();
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &path, out).await.unwrap();
+        b.pull_records(id, a.id).await.unwrap();
+        c.pull_records(id, a.id).await.unwrap();
+        c.ensure_latest(id, a.id).await.unwrap();
+        // The catch-up c's session started must end before the chains split.
+        for _ in 0..250 {
+            if crate::node::lock(&c.catching_up).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let shared = b.job(id).await.unwrap().lock().await.ledger().head();
+
+        a.job_decide(id, Decision::Approve, "a's own record", out)
+            .await
+            .unwrap();
+        b.pull_records(id, a.id).await.unwrap();
+        c.job_steal(id, "a sleeps".to_owned(), true, out)
+            .await
+            .unwrap();
+        // c's answer to a pull b asked from the shared head, before a's record landed.
+        let token = FencingToken {
+            job_id: id,
+            epoch: Epoch::FIRST,
+        };
+        let answer = b
+            .call(c.id, |session| async move {
+                session.pull(token, Some(shared), SHORT_DEADLINE).await
+            })
+            .await
+            .unwrap();
+        let Fenced::Answer(Pulled::Last(page) | Pulled::More(page)) = answer else {
+            panic!("{answer:?}");
+        };
+
+        assert!(!b.take_page(id, c.id, &page).await.unwrap());
+        let pulled = b.pull_records(id, c.id).await;
+        assert!(
+            matches!(pulled, Err(NodeError::Forked { peer, .. }) if peer == c.id),
+            "{pulled:?}"
+        );
+        let job = b.job(id).await.unwrap();
+        assert!(job.lock().await.forked().unwrap().is_some());
     }
 
     #[test]
