@@ -154,6 +154,34 @@ async fn e2e_a_node_turns_away_another_api_version_and_a_request_it_cannot_read(
     };
     assert_eq!(refusal.reason(), &Reason::BadRequest);
 
+    // A hello or a request written as a JSON array, its fields in the
+    // Rust declaration order, is not read (review finding on PR #13).
+    let mut stream = UnixStream::connect(&socket).await.unwrap();
+    frame::write(&mut stream, &json!([1, "positional"]))
+        .await
+        .unwrap();
+    let answer: HelloAnswer = frame::read(&mut stream).await.unwrap().unwrap();
+    assert!(
+        matches!(answer, HelloAnswer::Incompatible { api: 1, .. }),
+        "{answer:?}"
+    );
+    let mut stream = UnixStream::connect(&socket).await.unwrap();
+    frame::write(&mut stream, &json!({"api": 1, "client": "test"}))
+        .await
+        .unwrap();
+    let _welcome: HelloAnswer = frame::read(&mut stream).await.unwrap().unwrap();
+    frame::write(
+        &mut stream,
+        &json!(["job_status", "01JABCDEFGHJKMNPQRSTVWXYZ0"]),
+    )
+    .await
+    .unwrap();
+    let answer: Answer = frame::read(&mut stream).await.unwrap().unwrap();
+    let Answer::Refused { refusal } = answer else {
+        panic!("{answer:?}");
+    };
+    assert_eq!(refusal.reason(), &Reason::BadRequest);
+
     // The same request as a typed client sends it is served.
     let mut stream = UnixStream::connect(&socket).await.unwrap();
     frame::write(&mut stream, &json!({"api": 1, "client": "test"}))

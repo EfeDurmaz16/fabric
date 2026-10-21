@@ -1,0 +1,9 @@
+{
+  "schema": "answer",
+  "value": [
+    "done",
+    {
+      "kind": "harness_exited"
+    }
+  ]
+}

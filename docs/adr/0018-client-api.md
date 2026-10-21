@@ -33,6 +33,7 @@ The length prefix, rather than one JSON object per line, lets a reader refuse an
 Encoding rules, the same in every message:
 
 - Enums are objects tagged by one field: `op` for a request, `type` for a frame from the node, `kind` for a reply, an event and most nested enums, `code` for a refusal reason. Tags and field names are `snake_case`.
+- A record is a JSON object with named fields, never an array of its values in field order. A reader refuses an array where a record belongs, at any depth, so no client comes to depend on the order in which the Rust types declare their fields.
 - Ids travel in their text form: a job, move or event id as its 26-character ULID, a node id as `fab1` and 52 base32 characters, a snapshot or env spec id as 64 lowercase hex digits, a session id as the harness wrote it. Each is parsed on arrival, as the core parses it; an id that does not parse refuses the whole message.
 - An epoch is a JSON integer of at least 1. Counts, sizes, pids and times in Unix milliseconds are integers below 2^53, so a JavaScript number holds them exactly.
 - An optional field is absent when it has no value, never `null`. Readers accept `null` as absent.

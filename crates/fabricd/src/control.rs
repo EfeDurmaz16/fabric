@@ -48,7 +48,7 @@ pub(crate) async fn serve(node: Arc<Node>, mut stream: UnixStream) {
     let Some(hello) = read(&mut stream, "hello").await else {
         return;
     };
-    let hello = match serde_json::from_slice::<Hello>(&hello) {
+    let hello = match frame::parse::<Hello>(&hello) {
         Ok(hello) if hello.api == API_VERSION => hello,
         parsed => {
             if let Err(e) = &parsed {
@@ -74,7 +74,7 @@ pub(crate) async fn serve(node: Arc<Node>, mut stream: UnixStream) {
     let Some(request) = read(&mut stream, "request").await else {
         return;
     };
-    let request = match serde_json::from_slice::<Request>(&request) {
+    let request = match frame::parse::<Request>(&request) {
         Ok(request) => request,
         Err(e) => {
             let refusal = Refusal::new(

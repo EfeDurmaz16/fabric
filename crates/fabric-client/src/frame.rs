@@ -3,11 +3,13 @@
 //!
 //! Invariant: a reader checks the length against [`MAX_FRAME`] before it
 //! allocates anything, and a frame holds exactly one value with nothing
-//! after it. Both directions use the same functions, so the node and every
-//! Rust client agree on the bytes.
+//! after it, whose every object is a JSON object with named fields, never
+//! an array in field order. Both directions use the same functions, so the
+//! node and every Rust client agree on the bytes.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// The largest frame either side sends or reads: 16 MiB.
@@ -83,11 +85,46 @@ pub async fn read_bytes<R: AsyncRead + Unpin>(
 pub async fn read<R, T>(reader: &mut R) -> Result<Option<T>, FrameError>
 where
     R: AsyncRead + Unpin,
-    T: DeserializeOwned,
+    T: Serialize + DeserializeOwned,
 {
     match read_bytes(reader).await? {
-        Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Some(bytes) => Ok(Some(parse(&bytes)?)),
         None => Ok(None),
+    }
+}
+
+/// Parses the JSON of one frame as a `T`, refusing a JSON array where `T`
+/// holds an object, at any depth.
+///
+/// serde's derived structs and tagged enums also read an array as their
+/// fields in declaration order, so `[1, "x"]` would read as a hello and
+/// `["job_status", "<job>"]` as a request, tying such a client to the Rust
+/// field order that ADR 0018 says nobody depends on. The TypeScript SDK
+/// refuses the same bytes. The check writes the value back and requires
+/// every array the frame held to still be an array there; an object field
+/// the type does not know is skipped, as the parse skipped it.
+pub fn parse<T: Serialize + DeserializeOwned>(json: &[u8]) -> Result<T, serde_json::Error> {
+    let frame: Value = serde_json::from_slice(json)?;
+    let value = T::deserialize(&frame)?;
+    if positional(&frame, &serde_json::to_value(&value)?) {
+        return Err(serde::de::Error::custom(
+            "a JSON array stands where the message has an object with named fields",
+        ));
+    }
+    Ok(value)
+}
+
+/// Whether `frame` holds an array where `read`, the same value as the type wrote it back, holds none.
+fn positional(frame: &Value, read: &Value) -> bool {
+    match (frame, read) {
+        (Value::Array(frame), Value::Array(read)) => {
+            frame.iter().zip(read).any(|(a, b)| positional(a, b))
+        }
+        (Value::Array(_), _) => true,
+        (Value::Object(frame), Value::Object(read)) => frame
+            .iter()
+            .any(|(key, a)| read.get(key).is_some_and(|b| positional(a, b))),
+        _ => false,
     }
 }
 

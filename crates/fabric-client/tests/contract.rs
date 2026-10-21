@@ -45,12 +45,17 @@ fn read_dir(dir: &str) -> Fallible<Vec<(String, Value)>> {
     Ok(files)
 }
 
+/// Parses `value` as a `T` the way a frame from the socket is parsed.
+fn at_the_boundary<T: Serialize + DeserializeOwned>(value: &Value) -> Fallible<T> {
+    Ok(frame::parse(&serde_json::to_vec(value)?)?)
+}
+
 /// Parses every fixture in `dir` as a `T`, checks it writes back to the same JSON, and returns the values.
 fn round_trip<T: Serialize + DeserializeOwned>(dir: &str) -> Fallible<Vec<T>> {
     let mut values = Vec::new();
     for (name, json) in read_dir(dir)? {
-        let value: T = serde_json::from_value(json.clone())
-            .map_err(|e| format!("{dir}/{name} does not parse: {e}"))?;
+        let value: T =
+            at_the_boundary(&json).map_err(|e| format!("{dir}/{name} does not parse: {e}"))?;
         let written = serde_json::to_value(&value)?;
         if written != json {
             return Err(
@@ -234,9 +239,9 @@ fn every_refusal_reason_has_a_fixture_with_its_kind() {
 }
 
 /// Parses `value` as the type its fixture names, and writes it back.
-fn parse_as(schema: &str, value: Value) -> Fallible<Value> {
-    fn again<T: Serialize + DeserializeOwned>(value: Value) -> Fallible<Value> {
-        Ok(serde_json::to_value(serde_json::from_value::<T>(value)?)?)
+fn parse_as(schema: &str, value: &Value) -> Fallible<Value> {
+    fn again<T: Serialize + DeserializeOwned>(value: &Value) -> Fallible<Value> {
+        Ok(serde_json::to_value(at_the_boundary::<T>(value)?)?)
     }
     match schema {
         "hello" => again::<Hello>(value),
@@ -254,7 +259,7 @@ fn parse_as(schema: &str, value: Value) -> Fallible<Value> {
 fn every_invalid_message_is_refused_at_the_boundary() {
     for (name, fixture) in read_dir("invalid").unwrap() {
         let schema = fixture["schema"].as_str().unwrap();
-        let parsed = parse_as(schema, fixture["value"].clone());
+        let parsed = parse_as(schema, &fixture["value"]);
         assert!(parsed.is_err(), "invalid/{name} parsed as {parsed:?}");
     }
 }
@@ -263,7 +268,7 @@ fn every_invalid_message_is_refused_at_the_boundary() {
 fn a_message_from_a_newer_node_reads_as_the_compatibility_rule_says() {
     for (name, fixture) in read_dir("tolerated").unwrap() {
         let schema = fixture["schema"].as_str().unwrap();
-        let parsed = parse_as(schema, fixture["value"].clone())
+        let parsed = parse_as(schema, &fixture["value"])
             .unwrap_or_else(|e| panic!("tolerated/{name} does not parse: {e}"));
         assert_eq!(parsed, fixture["reads_as"], "tolerated/{name}");
     }

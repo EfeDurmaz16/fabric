@@ -1,0 +1,15 @@
+{
+  "schema": "reply",
+  "value": {
+    "kind": "node_list",
+    "peers": [
+      [
+        "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+        [
+          "10.0.0.2:7777"
+        ],
+        true
+      ]
+    ]
+  }
+}
