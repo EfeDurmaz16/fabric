@@ -509,9 +509,18 @@ fn judge_entries(root: &std::path::Path, me: u32, shared: Option<u32>) -> Result
     Ok(())
 }
 
-/// Whether `name` is one of `STATE_ENTRIES` or a temporary file Fabric
-/// writes one of them through.
+/// Whether `name` is one of `STATE_ENTRIES`, a temporary file Fabric
+/// writes one of them through, or a log. Fabric writes no log itself, but
+/// a user who sends the daemon's output into the state directory, from a
+/// shell or a launchd job, makes the directory and the log before the
+/// first start.
 fn is_state_entry(name: &str) -> bool {
+    if std::path::Path::new(name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("log"))
+    {
+        return true;
+    }
     STATE_ENTRIES.iter().any(|known| {
         name == *known
             || name
@@ -649,6 +658,23 @@ mod tests {
             "{refused:?}"
         );
         assert_eq!(mode(&project), 0o777);
+    }
+
+    /// A user who keeps the daemon's output in the state directory, as
+    /// `fabric serve >>~/.fabric/daemon.log` or a launchd job whose log
+    /// path is there, makes the directory by hand before the first start,
+    /// so it holds the log, made by the shell or by launchd, and the
+    /// default mode.
+    #[test]
+    fn a_directory_that_holds_the_users_log_is_made_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("fabric");
+        fs::create_dir(&home).unwrap();
+        fs::write(home.join("harness.toml"), "").unwrap();
+        fs::write(home.join("daemon.log"), "").unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_state_dir(&home).unwrap();
+        assert_eq!(mode(&home), 0o700);
     }
 
     #[test]

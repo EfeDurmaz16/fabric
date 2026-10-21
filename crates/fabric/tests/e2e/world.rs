@@ -10,7 +10,6 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
@@ -331,10 +330,9 @@ impl Node {
     /// A node that has not started yet.
     pub fn new(env: &Arc<Env>, name: &'static str, wire: Wire) -> Fallible<Self> {
         let state = env.root.join(name);
+        // Made with the umask's mode, as a user makes it by hand to keep
+        // the daemon's log in it; the node narrows it at its first start.
         fs::create_dir_all(&state)?;
-        // The daemon's log is written here too, which the node does not
-        // write itself, so the directory starts private as a user's would.
-        fs::set_permissions(&state, fs::Permissions::from_mode(0o700))?;
         fs::write(
             state.join("harness.toml"),
             "[acp.fabric-fake-agent]\nstate_dir = \".fake-agent\"\n",
