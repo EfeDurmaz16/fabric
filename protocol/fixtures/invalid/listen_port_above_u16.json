@@ -1,0 +1,8 @@
+{
+  "schema": "reply",
+  "value": {
+    "kind": "node_id",
+    "node": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+    "listen": "127.0.0.1:70000"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "schema": "request",
+  "value": {
+    "op": "job_status",
+    "job": "81JABCDEFGHJKMNPQRSTVWXYZ0"
+  }
+}

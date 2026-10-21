@@ -1,0 +1,10 @@
+{
+  "schema": "event",
+  "value": {
+    "kind": "snapshot_published",
+    "snapshot": "abababababababababababababababababababababababababababababababab",
+    "files": -1,
+    "bytes": 52428800,
+    "new_objects": 41
+  }
+}

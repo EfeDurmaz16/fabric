@@ -5,6 +5,6 @@
     "harness": {
       "kind": "codex"
     },
-    "session": "../etc"
+    "session": "a/../../etc"
   }
 }

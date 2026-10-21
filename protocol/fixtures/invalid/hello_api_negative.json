@@ -1,0 +1,7 @@
+{
+  "schema": "hello",
+  "value": {
+    "api": -1,
+    "client": "fabric/0.1.0"
+  }
+}
