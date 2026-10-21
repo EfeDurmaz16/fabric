@@ -1129,6 +1129,34 @@ mod tests {
         assert_eq!(fixture.ran(), None, "the pinned older codex ran");
     }
 
+    /// The version is asked with the environment the launch starts codex
+    /// with: a version manager's shim also picks the tool version from it
+    /// (`ASDF_CODEX_VERSION`), so a probe without it asks another binary
+    /// than the one that runs.
+    #[tokio::test]
+    async fn the_version_is_asked_with_the_environment_codex_starts_with() {
+        let mut fixture = Resume::answering(
+            "if [ -n \"$ASDF_CODEX_VERSION\" ]; then echo \"codex-cli $ASDF_CODEX_VERSION\"; else echo 'codex-cli 0.155.1'; fi",
+        );
+        fixture.env.push((
+            EnvVarName::parse("ASDF_CODEX_VERSION").unwrap(),
+            "0.142.4".to_owned(),
+        ));
+        let refused = fixture.launch(true).await.unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                HarnessError::HarnessOlderThanSession { local, .. } if local.as_str() == "0.142.4"
+            ),
+            "{refused}"
+        );
+        assert_eq!(
+            fixture.ran(),
+            None,
+            "the older codex the environment picks ran"
+        );
+    }
+
     /// A resume reports the version the guard asked in the workspace, the
     /// Codex that now runs the thread, so the node can remember it: that
     /// Codex writes no version into the rollout, and a version check run
