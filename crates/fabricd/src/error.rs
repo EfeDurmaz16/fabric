@@ -170,16 +170,19 @@ pub enum NodeError {
         /// The command that finishes it.
         command: &'static str,
     },
-    /// A run or a resume holds the workspace while it runs setup steps or
-    /// launches, or a setup step it started still runs.
+    /// A process holds the workspace's tree lock: a run or a resume while
+    /// it runs setup steps or launches, or a process a setup step left
+    /// running with the lock as its input.
     #[error(
-        "job {job}: a `fabric job run` or `resume` is running setup steps or launching in {root}, or a setup step it started still runs; suspend once the harness has started"
+        "job {job}: nothing was captured, since a process holds {lock}, the lock over {root}: a `fabric job run` or `resume` running setup steps or launching, or a process a setup step left running, which holds it until it exits. `lsof {lock}` names it; try again once it is gone"
     )]
     SetupRunning {
         /// The job.
         job: JobId,
         /// The root.
         root: PathBuf,
+        /// The lock file its holder has open.
+        lock: PathBuf,
     },
     /// The job was never suspended, so there is no snapshot to restore or move.
     #[error("job {0} has no snapshot yet; suspend it on its owner first")]

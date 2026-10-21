@@ -722,9 +722,10 @@ impl Node {
         }
         match TreeLock::acquire(&self.cfg.state.tree_locks(), root) {
             Ok(lock) => Ok(Some(lock)),
-            Err(MaterializeError::TreeBusy { .. }) => Err(NodeError::SetupRunning {
+            Err(MaterializeError::TreeBusy { lock }) => Err(NodeError::SetupRunning {
                 job,
                 root: root.to_owned(),
+                lock,
             }),
             Err(e) => Err(e.into()),
         }
@@ -2772,6 +2773,16 @@ pub(crate) mod tests {
             matches!(refused, Err(NodeError::SetupRunning { .. })),
             "{refused:?}"
         );
+        // A process a setup step left running can hold the lock for good,
+        // so the refusal names the file `lsof` finds it by.
+        let lock = std::fs::read_dir(node.cfg.state.tree_locks())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let said = refused.unwrap_err().to_string();
+        assert!(said.contains(&lock.display().to_string()), "{said}");
         assert_eq!(node.job(id).await.unwrap().lock().await.latest(), None);
         drop(setup);
         // A child another test forked while the lock was held keeps a copy
