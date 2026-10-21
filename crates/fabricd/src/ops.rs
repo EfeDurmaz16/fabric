@@ -2104,10 +2104,9 @@ fn plan(
     })?;
     let harness = harness.unwrap_or_else(|| job.harness().clone());
     let session = match job.session()? {
-        Some(record) if record.harness == harness => {
-            out.say(format!("continuing {harness} session {}", record.session));
-            Some(record.session)
-        }
+        // The CLI says it once the harness has started, with the settings
+        // the launch carried from the session (gate finding F10).
+        Some(record) if record.harness == harness => Some(record.session),
         Some(record) => {
             out.say(format!(
                 "starting a new {harness} session; the {} session {} stays in the snapshot (cross-harness resume is an experiment, ADR 0006)",

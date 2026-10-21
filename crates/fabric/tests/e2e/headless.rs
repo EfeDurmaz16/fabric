@@ -46,7 +46,9 @@ fn assert_env(env: &Env, name: &str) -> Fallible {
 /// A headless Codex run starts `codex exec`, records the thread Codex
 /// names in its first event while the turn still runs, prints the answer
 /// and the thread, and a suspend captures the rollout; a headless resume
-/// continues that thread with `codex exec resume`.
+/// continues that thread with `codex exec resume`, passing the model,
+/// effort, approval policy and sandbox the thread ran with, and says so
+/// (gate finding F10a).
 #[test]
 fn e2e_a_headless_codex_turn_records_its_thread_for_the_next_capture() -> Fallible {
     let env = Env::new()?;
@@ -98,8 +100,29 @@ fn e2e_a_headless_codex_turn_records_its_thread_for_the_next_capture() -> Fallib
     assert_eq!(
         env.fake_args("codex")?,
         [
-            "exec", "resume", thread, "--json", "-c", &trust, "--", "next"
+            "exec",
+            "resume",
+            thread,
+            "--json",
+            "-c",
+            &trust,
+            "-c",
+            "model=\"gpt-6-sol\"",
+            "-c",
+            "model_reasoning_effort=\"xhigh\"",
+            "-c",
+            "sandbox_mode=\"workspace-write\"",
+            "-c",
+            "approval_policy=\"on-request\"",
+            "--",
+            "next"
         ]
+    );
+    assert!(
+        resumed.contains(&format!(
+            "continuing codex session {thread} with model gpt-6-sol, effort xhigh, sandbox workspace-write, approval on-request (recorded in the session)"
+        )),
+        "{resumed}"
     );
     let log = node.ok(&["job", "log", &job])?;
     assert_eq!(
@@ -112,7 +135,8 @@ fn e2e_a_headless_codex_turn_records_its_thread_for_the_next_capture() -> Fallib
 
 /// A headless Claude run starts `claude -p --output-format json` with a
 /// session id it chose, prints the answer and the session, and a suspend
-/// captures the transcript; a headless resume continues it with `--resume`.
+/// captures the transcript; a headless resume continues it with
+/// `--resume` and the model the session ran with.
 #[test]
 fn e2e_a_headless_claude_turn_prints_its_answer_and_is_captured() -> Fallible {
     let env = Env::new()?;
@@ -164,6 +188,8 @@ fn e2e_a_headless_claude_turn_prints_its_answer_and_is_captured() -> Fallible {
             "json",
             "--resume",
             session.as_str(),
+            "--model",
+            "claude-opus-5-5",
             "--",
             "two"
         ]
