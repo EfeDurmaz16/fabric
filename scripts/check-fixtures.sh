@@ -16,12 +16,14 @@
 # main. Run it before pushing.
 #
 # A few fixtures never change, bump or not: the framed hello, the
-# incompatible answer and the closed list of hello answer types. They are
-# how a client of one api learns that a node speaks another, so a client
-# of every earlier api must still read them; changed at a bump, they would
-# turn the message that says to upgrade into a frame no older client
-# parses. The hello itself may change with a bump, because a node answers
-# a hello it cannot read with the incompatible answer.
+# incompatible answer and the closed list of hello answer types, and so do
+# their lines in protocol/required.txt. They are how a client of one api
+# learns that a node speaks another, so a client of every earlier api must
+# still read them; changed at a bump, they would turn the message that
+# says to upgrade into a frame no older client parses, and so would a
+# field of the incompatible answer made optional. The hello itself may
+# change with a bump, because a node answers a hello it cannot read with
+# the incompatible answer.
 #
 # Usage: scripts/check-fixtures.sh <base-ref>
 # The change checked is the one made since HEAD left base-ref, as a pull
@@ -62,6 +64,25 @@ if [ -n "$frozen" ]; then
   exit 1
 fi
 
+# The pins of the frozen fixtures the base had, compared as sets, so a pin
+# file sorted anew passes and one that lost or gained such a line does not.
+# A frozen fixture the base did not have brings its lines, as any new one.
+pins=protocol/required.txt
+frozen_pins() {
+  git show "$1:$pins" 2>/dev/null |
+    sed -n '/^frame\//p; /^hello_answer\/incompatible\.json /p' |
+    while IFS= read -r line; do
+      if git cat-file -e "$fork:protocol/fixtures/${line%% *}" 2>/dev/null; then
+        printf '%s\n' "$line"
+      fi
+    done |
+    LC_ALL=C sort
+}
+if [ "$(frozen_pins "$fork")" != "$(frozen_pins HEAD)" ]; then
+  echo "error: the required keys of a fixture of the version handshake changed in $pins; the framed hello and the incompatible answer need the same fields in every api version, bump or not, since they are how an older client learns that it must upgrade (ADR 0018, Compatibility)" >&2
+  exit 1
+fi
+
 if [ -n "$before" ] && [ "$before" != "$now" ]; then
   echo "API_VERSION $before -> $now: the fixtures of api $before may change"
   exit 0
@@ -77,7 +98,6 @@ fi
 
 # Each line is `<dir>/<file> <pointer>` and starts with a letter, so the
 # diff's own `---` and `+++` lines never match.
-pins=protocol/required.txt
 pin_diff=$(git diff -U0 --no-renames "$fork" HEAD -- "$pins")
 removed=$(printf '%s\n' "$pin_diff" | sed -n 's/^-\([a-z]\)/\1/p')
 added=$(printf '%s\n' "$pin_diff" | sed -n 's/^+\([a-z]\)/\1/p')

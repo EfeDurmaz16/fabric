@@ -33,9 +33,21 @@ save() {
   git_ commit -q -m "$1"
 }
 
-# Writes protocol/required.txt, one argument per line.
-required() {
+# Writes protocol/required.txt, one argument per line, without the pins of
+# the incompatible answer.
+required_only() {
   printf '%s\n' "$@" > "$repo/protocol/required.txt"
+}
+
+# The pins of the incompatible answer, which stay in every api version.
+incompatible_pins='hello_answer/incompatible.json /api
+hello_answer/incompatible.json /node_version
+hello_answer/incompatible.json /type'
+
+# Writes protocol/required.txt, one argument per line, then the pins of the
+# incompatible answer.
+required() {
+  required_only "$@" "$incompatible_pins"
 }
 
 # A fresh repository whose main holds api 1, one fixture with its required
@@ -135,6 +147,33 @@ fixture frame/hello.json '{"value":{"api":1,"client":"fabric/0.1.0"},"hex":"0000
 set_version 2
 save 'feat!: api 2 frames big-endian'
 expect fail 'the framed hello edited with an api bump' "$repo" base
+
+# Review finding on PR #13: the file of the incompatible answer was frozen
+# but its pins were not, so api 2 could make node_version optional, which
+# every older client fails to parse instead of saying to upgrade.
+new_repo
+required_only 'reply/node_ping.json /kind' 'reply/node_ping.json /rtt_ms' \
+  'hello_answer/incompatible.json /api' 'hello_answer/incompatible.json /type'
+set_version 2
+save 'feat!: api 2 may hide the node version'
+expect fail 'a field of the incompatible answer made optional with an api bump' "$repo" base
+
+new_repo
+git_ rm -q protocol/required.txt
+set_version 2
+save 'feat!: api 2 drops the pins'
+expect fail 'the pins of the incompatible answer removed with an api bump' "$repo" base
+
+new_repo
+git_ checkout -q -b without-handshake
+git_ rm -q protocol/fixtures/hello_answer/incompatible.json
+required_only 'reply/node_ping.json /kind' 'reply/node_ping.json /rtt_ms'
+save 'test: a base without the incompatible answer'
+git_ checkout -q -b feature
+fixture hello_answer/incompatible.json '{"type":"incompatible","api":2,"node_version":"0.2.0"}'
+required 'reply/node_ping.json /kind' 'reply/node_ping.json /rtt_ms'
+save 'feat: the incompatible answer with its pins'
+expect pass 'the incompatible answer added with its pins' "$repo" without-handshake
 
 new_repo
 git_ checkout -q -b feature
