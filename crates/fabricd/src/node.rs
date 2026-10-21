@@ -762,4 +762,32 @@ mod tests {
         assert_eq!(made, Err(std::io::ErrorKind::AlreadyExists));
         assert_eq!(mode(&target), 0o755);
     }
+
+    /// An entry that is a link is judged by who made the link, not by who
+    /// owns what it names, so a `peers` link another user planted that
+    /// names a file of this user's is still theirs. No test can make a
+    /// link another user owns, so the link names `/`, which root owns, and
+    /// the node is told it runs as root. Run as root, the test gives the
+    /// link to the next user id.
+    #[test]
+    fn a_state_entry_that_is_a_link_is_judged_as_itself() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        let target = std::path::Path::new("/");
+        let me = fs::metadata(target).unwrap().uid();
+        let peers = state.join("peers");
+        std::os::unix::fs::symlink(target, &peers).unwrap();
+        if fs::symlink_metadata(&peers).unwrap().uid() == me {
+            std::os::unix::fs::lchown(&peers, Some(me + 1), None).unwrap();
+        }
+        let meta = fs::metadata(&state).unwrap();
+        let refused = adopt_state_dir(&state, &meta, me);
+        assert!(
+            matches!(&refused, Err(NodeError::UnsafeStateDir { reason, .. }) if reason.contains("holds peers, which belongs to user")),
+            "{refused:?}"
+        );
+    }
 }
