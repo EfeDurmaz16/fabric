@@ -85,12 +85,26 @@ pub fn parse_harness(text: &str) -> Result<HarnessKind, HarnessConfigError> {
             let program = words
                 .next()
                 .ok_or_else(|| HarnessConfigError::Unknown(text.to_owned()))?;
-            Ok(HarnessKind::Acp {
+            let kind = HarnessKind::Acp {
                 program: ProgramName::parse(program)?,
                 args: words.map(str::to_owned).collect(),
-            })
+            };
+            refuse_secret_kind(&kind)?;
+            Ok(kind)
         }
     }
+}
+
+/// Refuses a harness kind whose ACP arguments hold a secret shape.
+///
+/// The kind is written into ledger records that travel to every peer and
+/// are never redacted, so the daemon checks every kind a request names
+/// before it records one, not only at capture.
+pub fn refuse_secret_kind(kind: &HarnessKind) -> Result<(), HarnessConfigError> {
+    if let HarnessKind::Acp { program, args } = kind {
+        fabric_harness::acp::refuse_secret_args(program, args)?;
+    }
+    Ok(())
 }
 
 /// One ACP agent's settings in `harness.toml`.

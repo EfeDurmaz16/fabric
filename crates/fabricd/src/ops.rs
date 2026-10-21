@@ -39,7 +39,7 @@ use crate::doctor::{self, Context, Target};
 use crate::error::NodeError;
 use crate::facts::{MeasuredKeys, NodeFacts, key_difference};
 use crate::faults::{self, Action, Point};
-use crate::harnesses::{HarnessConfig, adapter};
+use crate::harnesses::{HarnessConfig, adapter, refuse_secret_kind};
 use crate::job::Job;
 use crate::local::{self, HarnessRecord, Liveness, Marker, MarkerState, SessionRecord};
 use crate::node::{Node, Out, is_transport};
@@ -253,6 +253,7 @@ impl Node {
         harness: HarnessKind,
         out: &mut Out,
     ) -> Result<(), NodeError> {
+        refuse_secret_kind(&harness)?;
         let id = clock::job_id();
         let root = paths::job_root(&self.cfg.home, id);
         let synced = synced_folders(&self.cfg.home, &self.cfg.path_var).await;
@@ -481,6 +482,7 @@ impl Node {
         session: Option<SessionId>,
         out: &mut Out,
     ) -> Result<(), NodeError> {
+        refuse_secret_kind(&harness)?;
         let job = self.job(id).await?;
         let mut job = job.lock().await;
         let token = owner_token(&job, self.id)?;
@@ -1281,6 +1283,9 @@ impl Node {
         path_var: &OsString,
         out: &mut Out,
     ) -> Result<RunPlan, NodeError> {
+        if let Some(harness) = &harness {
+            refuse_secret_kind(harness)?;
+        }
         self.resolve_departing(id, out).await?;
         if self.job(id).await.is_ok() {
             self.check_peers(id, out).await;
@@ -2729,6 +2734,50 @@ pub(crate) mod tests {
         b.suspend(id, &path, &mut out).await.unwrap();
         b.replicate(id, &mut out).await;
         assert!(a.job(id).await.is_ok(), "{:?}", out.lines);
+    }
+
+    /// A secret in an ACP agent's arguments must be refused before a
+    /// ledger record names the harness, since records reach every peer.
+    #[tokio::test]
+    async fn a_harness_whose_arguments_hold_a_secret_is_never_recorded() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let secret = HarnessKind::Acp {
+            program: fabric_core::harness::ProgramName::parse("opencode").unwrap(),
+            args: vec!["--api-key".to_owned(), format!("sk-ant-{}", "a".repeat(24))],
+        };
+        let refused = node
+            .job_new(
+                dir.path(),
+                "goal".to_owned(),
+                secret.clone(),
+                &mut Out::default(),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(NodeError::HarnessConfig(_))),
+            "{refused:?}"
+        );
+        let mut sleeper = sleeper();
+        let refused = node
+            .harness_started(
+                id,
+                Epoch::FIRST,
+                pid(&sleeper),
+                secret,
+                None,
+                &mut Out::default(),
+            )
+            .await;
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
+        assert!(
+            matches!(refused, Err(NodeError::HarnessConfig(_))),
+            "{refused:?}"
+        );
+        assert_eq!(node.jobs.lock().await.len(), 1);
+        let job = node.job(id).await.unwrap();
+        assert_eq!(job.lock().await.ledger().records().len(), 1);
     }
 
     #[test]

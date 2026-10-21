@@ -47,6 +47,22 @@ fn names_session(part: &str, session: &SessionId) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
 }
 
+/// Refuses launch arguments that hold a secret shape, one by one and
+/// joined, so `--api-key sk-...` is caught either way: the arguments are
+/// part of the harness kind that the job's ledger and the manifest record,
+/// and neither is ever redacted. A caller that records a kind checks it
+/// here before it writes anything.
+pub fn refuse_secret_args(program: &ProgramName, args: &[String]) -> Result<(), HarnessError> {
+    let redactor = Redactor::standard()?;
+    let joined = args.join(" ");
+    if redactor.matches(&joined) || args.iter().any(|arg| redactor.matches(arg)) {
+        return Err(HarnessError::SecretInArguments {
+            program: program.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// An ACP agent started as `program args...`.
 #[derive(Debug, Clone)]
 pub struct AcpHarness {
@@ -174,19 +190,8 @@ impl AcpHarness {
         Records::of(self.home_dir(), &label, session)
     }
 
-    /// Refuses launch arguments that hold a secret shape, one by one and
-    /// joined, so `--api-key sk-...` is caught either way: the arguments
-    /// are part of the harness kind the manifest records, and the
-    /// manifest is never redacted.
     fn refuse_secret_args(&self) -> Result<(), HarnessError> {
-        let redactor = Redactor::standard()?;
-        let joined = self.args.join(" ");
-        if redactor.matches(&joined) || self.args.iter().any(|arg| redactor.matches(arg)) {
-            return Err(HarnessError::SecretInArguments {
-                program: self.program.to_string(),
-            });
-        }
-        Ok(())
+        refuse_secret_args(&self.program, &self.args)
     }
 
     fn capture_sync(
