@@ -2302,9 +2302,9 @@ fn summary(goal: &str) -> String {
     }
 }
 
-/// Says, one line per path, what the snapshot carries that a secret
-/// pattern matches, and what of the workspace and the harness state it
-/// leaves out.
+/// Says, one line per path or config key, what the snapshot carries that
+/// a secret pattern matches, what of the workspace and the harness state it
+/// leaves out, and what of the repository's config it changed or left out.
 fn report_capture(report: &fabric_store::capture::CaptureReport, out: &mut Out) {
     for path in report.denied.iter().chain(&report.denied_untracked) {
         out.say(format!("left behind (secret pattern): {path}"));
@@ -2348,6 +2348,17 @@ fn report_capture(report: &fabric_store::capture::CaptureReport, out: &mut Out) 
         out.say(format!(
             "left behind (the .git of a nested repository, harness state): {path}"
         ));
+    }
+    for key in &report.stripped_userinfo {
+        out.say(format!("travels without its user info (git config): {key}"));
+    }
+    for key in &report.repeated_config {
+        out.say(format!(
+            "travels with its last value only (git config): {key}"
+        ));
+    }
+    for key in &report.dropped_config {
+        out.say(format!("left behind (git config): {key}"));
     }
 }
 
@@ -3986,5 +3997,57 @@ pub(crate) mod tests {
                 .any(|r| matches!(r.event().kind, EventKind::SnapshotPublished { .. })),
             "a snapshot was published through the link"
         );
+    }
+
+    /// A suspend must say what of the repository's config it changed or
+    /// left out: a remote URL loses its user info, a URL with a query is
+    /// left behind, and of a repeated key only the last value travels.
+    #[tokio::test]
+    async fn a_suspend_names_the_git_config_it_changed_or_left_out() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        for args in [
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://me:pw@example.com/r.git",
+            ][..],
+            &[
+                "remote",
+                "add",
+                "tokened",
+                "https://example.com/r.git?token=x",
+            ],
+            &[
+                "config",
+                "--add",
+                "remote.origin.fetch",
+                "+refs/tags/*:refs/tags/*",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .status()
+                .unwrap();
+            assert!(status.success(), "{args:?}");
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut out = Out::default();
+        node.suspend(id, &path, &mut out).await.unwrap();
+        for wanted in [
+            "travels without its user info (git config): remote.origin.url",
+            "left behind (git config): remote.tokened.url",
+            "travels with its last value only (git config): remote.origin.fetch",
+        ] {
+            assert!(
+                out.lines.iter().any(|line| line == wanted),
+                "no line {wanted:?} in {:?}",
+                out.lines
+            );
+        }
     }
 }
