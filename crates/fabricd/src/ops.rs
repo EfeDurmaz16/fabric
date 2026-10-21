@@ -16,10 +16,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fabric_core::harness::HarnessKind;
-use fabric_core::id::{Epoch, JobId, NodeId, SnapshotId};
+use fabric_core::id::{Epoch, JobId, MoveId, NodeId, SnapshotId};
 use fabric_core::lease::{FenceError, FencingToken};
 use fabric_core::ledger::{Author, EventKind, Ledger};
-use fabric_core::moves::{CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
+use fabric_core::moves::{AbortAnswer, CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
 use fabric_env::materialize::{MaterializeError, TreeLock};
 use fabric_harness::manifest::{MANIFEST_FILE, StateManifest};
 use fabric_harness::{HarnessError, SessionId};
@@ -1446,7 +1446,10 @@ impl Node {
                 out,
             )
             .await?;
-            self.pull(id, holder, out).await?;
+            // With no harness named, the job's own launches, and the pull
+            // must still find the one the preflight checked.
+            self.pull(id, holder, harness.is_none().then_some(&kind), out)
+                .await?;
         }
         let job = self.job(id).await?;
         let mut job = job.lock().await;
@@ -1473,10 +1476,16 @@ impl Node {
     }
 
     /// The pull form of the move: fetch, ask the owner to start a move toward this node, decide it here.
+    ///
+    /// `checked` is the harness the preflight checked this node for, when
+    /// the job's own harness will launch. The holder may have resumed under
+    /// another one after that check and before it suspended for the move;
+    /// the move is then aborted, and the holder keeps the job.
     async fn pull(
         self: &Arc<Self>,
         id: JobId,
         holder: NodeId,
+        checked: Option<&HarnessKind>,
         out: &mut Out,
     ) -> Result<(), NodeError> {
         out.say(format!("pulling job {id} from {holder}"));
@@ -1512,58 +1521,43 @@ impl Node {
         self.pull_records(id, holder).await?;
         self.ensure_latest(id, holder).await?;
         faults::hit(Point::BeforeImport).await;
-        {
+        let changed = {
             let job = self.job(id).await?;
             let mut job = job.lock().await;
-            let ledger = job.ledger();
-            let snapshot = ledger
-                .manifest()
-                .latest_snapshot
-                .ok_or(NodeError::NoSnapshot(id))?;
-            let offer = MoveOffer {
-                job_id: id,
-                move_id,
-                head: ledger.head(),
-                snapshot,
-            };
-            let answer = ledger.answer_offer(
-                self.id,
-                &offer,
-                ledger.lease().epoch(),
-                Some(CompleteSnapshot::new(snapshot)),
-                clock::event_id(),
-                clock::now_ms(),
-            )?;
-            match answer {
-                OfferAnswer::Import(record) => job.commit(record, Author::Node(self.id))?,
-                OfferAnswer::Decided(_) => {}
-                OfferAnswer::Rejected { head } => {
-                    return Err(NodeError::Peer {
-                        peer: holder,
-                        reason: format!(
-                            "its move does not link to this node's head {head}; run the resume again"
-                        ),
-                    });
+            // The records hold the holder's `MoveStarted`, after which it
+            // runs nothing, so the harness they name is the one to launch.
+            // A move this node already decided is left to `import`.
+            if let Some(checked) = checked
+                && job.harness() != checked
+                && job.ledger().decision_for(move_id).is_none()
+            {
+                let change = (checked.clone(), job.harness().clone());
+                if let AbortAnswer::Abort(record) = job.ledger().answer_abort(
+                    self.id,
+                    move_id,
+                    clock::event_id(),
+                    clock::now_ms(),
+                )? {
+                    job.commit(record, Author::Node(self.id))?;
                 }
-                OfferAnswer::SnapshotIncomplete { snapshot } => {
-                    return Err(NodeError::Peer {
-                        peer: holder,
-                        reason: format!(
-                            "snapshot {snapshot} did not arrive whole; run the resume again"
-                        ),
-                    });
-                }
-                OfferAnswer::Stale { current, .. } => {
-                    return Err(NodeError::Peer {
-                        peer: holder,
-                        reason: format!("the move is at an epoch behind {current}"),
-                    });
-                }
+                Some(change)
+            } else {
+                self.import(&mut job, holder, move_id, out)?;
+                None
             }
-            out.say(format!(
-                "imported move {move_id}; this node owns the job at epoch {}",
-                job.ledger().lease().epoch()
-            ));
+        };
+        if let Some((checked, now)) = changed {
+            if let Err(e) = self.push_records(id, holder).await {
+                out.say(format!(
+                    "{holder} has not seen the abort yet ({e}); it will ask for the decision"
+                ));
+            }
+            return Err(NodeError::HarnessChangedDuringPull {
+                job: id,
+                holder,
+                checked: Box::new(checked),
+                now: Box::new(now),
+            });
         }
         // The holder learns the decision now, or from MoveStatus later.
         if let Err(e) = self.push_records(id, holder).await {
@@ -1571,6 +1565,67 @@ impl Node {
                 "{holder} has not seen the import yet ({e}); it will ask for the decision"
             ));
         }
+        Ok(())
+    }
+
+    /// Imports the open move `move_id` from `holder` into `job`, whose lock the caller holds.
+    fn import(
+        &self,
+        job: &mut Job,
+        holder: NodeId,
+        move_id: MoveId,
+        out: &mut Out,
+    ) -> Result<(), NodeError> {
+        let id = job.id();
+        let ledger = job.ledger();
+        let snapshot = ledger
+            .manifest()
+            .latest_snapshot
+            .ok_or(NodeError::NoSnapshot(id))?;
+        let offer = MoveOffer {
+            job_id: id,
+            move_id,
+            head: ledger.head(),
+            snapshot,
+        };
+        let answer = ledger.answer_offer(
+            self.id,
+            &offer,
+            ledger.lease().epoch(),
+            Some(CompleteSnapshot::new(snapshot)),
+            clock::event_id(),
+            clock::now_ms(),
+        )?;
+        match answer {
+            OfferAnswer::Import(record) => job.commit(record, Author::Node(self.id))?,
+            OfferAnswer::Decided(_) => {}
+            OfferAnswer::Rejected { head } => {
+                return Err(NodeError::Peer {
+                    peer: holder,
+                    reason: format!(
+                        "its move does not link to this node's head {head}; run the resume again"
+                    ),
+                });
+            }
+            OfferAnswer::SnapshotIncomplete { snapshot } => {
+                return Err(NodeError::Peer {
+                    peer: holder,
+                    reason: format!(
+                        "snapshot {snapshot} did not arrive whole; run the resume again"
+                    ),
+                });
+            }
+            OfferAnswer::Stale { current, .. } => {
+                return Err(NodeError::Peer {
+                    peer: holder,
+                    reason: format!("the move is at an epoch behind {current}"),
+                });
+            }
+        }
+        out.say(format!(
+            "imported move {move_id}; this node owns the job at epoch {}",
+            job.ledger().lease().epoch()
+        ));
         Ok(())
     }
 
@@ -2633,7 +2688,7 @@ pub(crate) mod tests {
         std::fs::write(thief_root.join("thief.txt"), "b's work\n").unwrap();
         b.suspend(id, &path, out).await.unwrap();
 
-        a.pull(id, b.id, out).await.unwrap();
+        a.pull(id, b.id, None, out).await.unwrap();
         let job = a.job(id).await.unwrap();
         let mut job = job.lock().await;
         let epoch = owner_token(&job, a.id).unwrap().epoch;
@@ -3837,5 +3892,58 @@ pub(crate) mod tests {
             .unwrap();
         assert!(root.join("README.md").is_file());
         assert_eq!(mode(&parent), 0o700, "restore");
+    }
+
+    /// A pull checks this node for the harness the job will launch. A
+    /// `resume --harness` on the holder can register another harness after
+    /// that check and before the holder suspends for the move, and the
+    /// pulled records then name it. The pull must abort the move, leaving
+    /// the job with the holder, not import it under a harness never checked
+    /// here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pull_aborts_when_the_holder_changed_harness_after_the_check() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let harness = sleeper();
+        a.harness_started(
+            id,
+            Epoch::FIRST,
+            pid(&harness),
+            HarnessKind::ClaudeCode,
+            None,
+            &mut Out::default(),
+        )
+        .await
+        .unwrap();
+        let reaper = std::thread::spawn(move || {
+            let mut harness = harness;
+            harness.wait()
+        });
+        let pulled = b
+            .pull(id, a.id, Some(&HarnessKind::Codex), &mut Out::default())
+            .await;
+        reaper.join().unwrap().unwrap();
+        assert!(
+            matches!(
+                &pulled,
+                Err(NodeError::HarnessChangedDuringPull { checked, now, .. })
+                    if **checked == HarnessKind::Codex && **now == HarnessKind::ClaudeCode
+            ),
+            "{pulled:?}"
+        );
+        let held = a.job(id).await.unwrap();
+        assert!(
+            matches!(held.lock().await.view(a.id), LeaseView::Owner(_)),
+            "the holder did not get the job back"
+        );
+        let pulled = b.job(id).await.unwrap();
+        assert!(!matches!(
+            pulled.lock().await.view(b.id),
+            LeaseView::Owner(_)
+        ));
     }
 }

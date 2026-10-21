@@ -132,6 +132,20 @@ pub enum NodeError {
         /// The target of the move.
         target: NodeId,
     },
+    /// The holder resumed under another harness after a pull's preflight checked this node for the old one.
+    #[error(
+        "job {job} was resumed under {now} on {holder} after the preflight checked this node for {checked}, so the move was aborted and {holder} keeps the job; run `fabric job resume {job}` again, which checks {now}"
+    )]
+    HarnessChangedDuringPull {
+        /// The job.
+        job: JobId,
+        /// The node that held the job.
+        holder: NodeId,
+        /// The harness the preflight checked.
+        checked: Box<HarnessKind>,
+        /// The harness the job runs under now.
+        now: Box<HarnessKind>,
+    },
     /// The workspace changed after the snapshot a move copied, by hand or by a harness Fabric did not start.
     #[error(
         "the workspace of job {job} at {root} changed after the snapshot {target} copied, so nothing moved; run `fabric job move {job} --to {target}` again, which captures the change"
@@ -350,6 +364,7 @@ impl NodeError {
             | NodeError::AlreadyRunningHarness { .. }
             | NodeError::RanDuringMove { .. }
             | NodeError::HarnessChangedDuringMove { .. }
+            | NodeError::HarnessChangedDuringPull { .. }
             | NodeError::ChangedDuringMove { .. }
             | NodeError::WorkspaceOccupied { .. }
             | NodeError::NoWorkspace(_)
