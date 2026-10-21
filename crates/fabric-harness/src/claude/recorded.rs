@@ -294,4 +294,19 @@ mod tests {
         .concat();
         assert_eq!(model_of(&latched), model("claude-fable-5"));
     }
+
+    /// A fallback stands for the original model only until a reply comes
+    /// from another model: a user who then switches to the fallback's model
+    /// with `/model` keeps it on resume.
+    #[test]
+    fn a_reply_from_another_model_ends_the_fallback() {
+        let switched = [
+            assistant("2.1.294", "claude-fable-5", false),
+            FALLBACK.to_owned(),
+            assistant("2.1.294", "claude-opus-4-8", false),
+            assistant("2.1.294", "claude-fable-5", false),
+            assistant("2.1.294", "claude-opus-4-8", false),
+        ];
+        assert_eq!(model_of(&switched), model("claude-opus-4-8"));
+    }
 }
