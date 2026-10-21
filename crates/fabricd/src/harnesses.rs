@@ -18,7 +18,7 @@ use fabric_harness::Harness;
 use fabric_harness::acp::AcpHarness;
 use fabric_harness::claude::ClaudeCode;
 use fabric_harness::codex::Codex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Why a harness could not be named or configured.
 #[derive(Debug, thiserror::Error)]
@@ -94,7 +94,7 @@ pub fn parse_harness(text: &str) -> Result<HarnessKind, HarnessConfigError> {
 }
 
 /// One ACP agent's settings in `harness.toml`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcpConfig {
     /// Where the agent keeps its sessions; relative paths are under the home.
@@ -103,11 +103,15 @@ pub struct AcpConfig {
 
 /// The node's `harness.toml`: settings an adapter cannot discover.
 ///
+/// The daemon reads it once at start and hands its copy to the CLI in
+/// every run plan, so the harness a CLI launches is configured as the one
+/// the daemon captures and restores, even when the file changed since.
+///
 /// ```toml
 /// [acp.opencode]
 /// state_dir = ".local/share/opencode/sessions"
 /// ```
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessConfig {
     /// ACP agents by program name.

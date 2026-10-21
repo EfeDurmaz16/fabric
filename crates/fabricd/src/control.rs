@@ -26,6 +26,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
+use crate::harnesses::HarnessConfig;
+
 /// The largest control message, either way.
 pub const MAX_CONTROL_MESSAGE: usize = 4 << 20;
 
@@ -178,6 +180,8 @@ pub struct RunPlan {
     pub session: Option<SessionId>,
     /// The job's goal, the first message of a new session.
     pub goal: String,
+    /// The node's harness configuration, which the launch must use.
+    pub harness_config: HarnessConfig,
 }
 
 /// The daemon's answer.

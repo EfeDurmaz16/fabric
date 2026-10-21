@@ -37,7 +37,7 @@ use fabric_net::endpoint::DialOrder;
 use fabricd::control::{
     self, ControlError, Decision, NO_DAEMON_EXIT, Refusal, Request, Response, RunPlan,
 };
-use fabricd::harnesses::{HarnessConfig, HarnessEnv, acp_adapter, parse_harness};
+use fabricd::harnesses::{HarnessEnv, acp_adapter, parse_harness};
 use fabricd::node::{Node, NodeConfig};
 use fabricd::paths::{STATE_DIR_ENV, StateDir};
 
@@ -476,7 +476,7 @@ async fn launch(
     let harness_env = HarnessEnv::new(
         home,
         path_var(),
-        HarnessConfig::load(&state.harness_config())?,
+        plan.harness_config.clone(),
     )?;
     let first = prompt.or_else(|| resume.is_none().then(|| plan.goal.clone()));
     let (mut running, interactive) = match &plan.harness {

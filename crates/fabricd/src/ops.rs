@@ -39,7 +39,7 @@ use crate::doctor::{self, Context, Target};
 use crate::error::NodeError;
 use crate::facts::{MeasuredKeys, NodeFacts, key_difference};
 use crate::faults::{self, Action, Point};
-use crate::harnesses::adapter;
+use crate::harnesses::{HarnessConfig, adapter};
 use crate::job::Job;
 use crate::local::{self, HarnessRecord, Liveness, Marker, MarkerState, SessionRecord};
 use crate::node::{Node, Out, is_transport};
@@ -452,7 +452,7 @@ impl Node {
                 pid: record.pid.get(),
             });
         }
-        plan(&job, token.epoch, marker.root, None, out)
+        plan(&job, token.epoch, marker.root, None, &self.harness_config, out)
     }
 
     /// Records the harness the CLI launched and appends `Resumed`, or refuses.
@@ -1333,7 +1333,7 @@ impl Node {
                 pid: record.pid.get(),
             });
         }
-        plan(&job, token.epoch, root, harness, out)
+        plan(&job, token.epoch, root, harness, &self.harness_config, out)
     }
 
     /// The pull form of the move: fetch, ask the owner to start a move toward this node, decide it here.
@@ -1981,6 +1981,7 @@ fn plan(
     epoch: Epoch,
     root: PathBuf,
     harness: Option<HarnessKind>,
+    harness_config: &HarnessConfig,
     out: &mut Out,
 ) -> Result<RunPlan, NodeError> {
     job.set_marker(&Marker {
@@ -2013,6 +2014,7 @@ fn plan(
         harness,
         session,
         goal: job.ledger().manifest().goal.clone(),
+        harness_config: harness_config.clone(),
     })
 }
 
@@ -2553,6 +2555,23 @@ pub(crate) mod tests {
             std::fs::read_to_string(root.join("README.md")).unwrap(),
             "hello\n"
         );
+    }
+
+    /// The CLI launches with the configuration the daemon captures and
+    /// restores with, the one it read at start, even after the file changed.
+    #[tokio::test]
+    async fn a_run_plan_carries_the_harness_config_the_node_started_with() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        std::fs::write(
+            node.cfg.state.harness_config(),
+            "[acp.opencode]\nstate_dir = \"elsewhere\"\n",
+        )
+        .unwrap();
+        let plan = node.job_run(id, &mut Out::default()).await.unwrap();
+        let sent: RunPlan = postcard::from_bytes(&postcard::to_stdvec(&plan).unwrap()).unwrap();
+        assert_eq!(sent.harness_config, node.harness_config);
+        assert!(sent.harness_config.acp.is_empty());
     }
 
     #[test]
