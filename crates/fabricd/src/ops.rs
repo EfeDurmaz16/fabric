@@ -1316,7 +1316,7 @@ impl Node {
         if let LeaseView::Departed { epoch, .. } | LeaseView::Replica { epoch, .. } = view
             && let Some(marker) = job.reconcile_marker()?
             && matches!(marker.state, MarkerState::Clean { .. })
-            && (marker.root.symlink_metadata().is_err() || marker.is_unchanged().await)
+            && (is_missing(&marker.root)? || marker.is_unchanged().await)
         {
             let dest =
                 paths::departed_copy(&marker.root, epoch).ok_or_else(|| no_parent(&marker.root))?;
@@ -2159,8 +2159,11 @@ fn unused(base: &Path) -> PathBuf {
 }
 
 /// Renames the workspace at `root` to `dest` durably; false when there is no workspace at `root`.
+///
+/// Only a root that is not there counts as no workspace: one that cannot
+/// be looked at, behind a parent without search permission, is an error.
 fn move_aside(root: &Path, dest: &Path) -> Result<bool, NodeError> {
-    if !root.exists() {
+    if is_missing(root)? {
         return Ok(false);
     }
     let parent = dest.parent().ok_or_else(|| no_parent(dest))?;
@@ -3267,5 +3270,40 @@ pub(crate) mod tests {
             .map(|dir| dir.map(|entry| entry.unwrap().path()).collect())
             .unwrap_or_default();
         assert!(left.is_empty(), "the clone stayed behind: {left:?}");
+    }
+
+    /// A departed clean copy that cannot be looked at, here because its
+    /// parent lost search permission, is still there. Settling must fail
+    /// and keep the marker, not take the copy for gone and forget it: a
+    /// later resume would then find the root occupied by files no marker
+    /// names.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_copy_that_cannot_be_looked_at_keeps_its_marker() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &path, &mut Out::default()).await.unwrap();
+        b.pull_records(id, a.id).await.unwrap();
+        b.ensure_latest(id, a.id).await.unwrap();
+        let root = paths::job_root(&a.cfg.home, id);
+        let parent = root.parent().unwrap().to_owned();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        b.job_steal(id, "a sleeps".to_owned(), true, &mut Out::default())
+            .await
+            .unwrap();
+        a.settle_job(id, &mut Out::default()).await.unwrap_err();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        a.settle_job(id, &mut Out::default()).await.unwrap();
+        let departed = paths::departed_copy(&root, Epoch::new(2).unwrap()).unwrap();
+        assert!(
+            departed.join("README.md").is_file() && !root.exists(),
+            "the copy stayed in the root with no marker"
+        );
     }
 }
