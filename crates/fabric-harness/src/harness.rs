@@ -131,6 +131,8 @@ impl Launch {
 pub enum SettingName {
     /// The model.
     Model,
+    /// The provider that serves the model, such as Codex's `openai`.
+    Provider,
     /// The reasoning effort.
     Effort,
     /// The sandbox commands run in.
@@ -145,6 +147,7 @@ impl std::fmt::Display for SettingName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             SettingName::Model => "model",
+            SettingName::Provider => "model provider",
             SettingName::Effort => "effort",
             SettingName::Sandbox => "sandbox",
             SettingName::Approval => "approval",

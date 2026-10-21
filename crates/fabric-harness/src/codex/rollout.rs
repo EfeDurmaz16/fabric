@@ -22,16 +22,17 @@
 //! rollouts on 2026-10-21 (key names and setting values only): every turn
 //! writes `{"type":"turn_context","payload":{"model","effort",
 //! "approval_policy","sandbox_policy":{"type",...},...}}`, and every file
-//! starts with `{"type":"session_meta","payload":{"cli_version",...}}`. A
+//! starts with `{"type":"session_meta","payload":{"cli_version",
+//! "model_provider",...}}`; a `turn_context` names no provider. A
 //! thread a parent spawned holds the parent's `session_meta` as a second
 //! line, and a desktop build writes a pre-release such as
 //! `0.163.0-alpha.10.2`. A setting changed between turns, such as with
 //! `/model` or `/permissions`, is recorded as `{"type":"event_msg",
 //! "payload":{"type":"thread_settings_applied","thread_settings":{"model",
-//! "reasoning_effort","approval_policy","approvals_reviewer",
-//! "permission_profile",...}}}` (5,036 of them in the owner's plain
-//! rollouts, read on 2026-10-21), and Codex 0.155.1 restores the newer of
-//! the two records on resume (`latest_persisted_resume_settings` in
+//! "model_provider_id","reasoning_effort","approval_policy",
+//! "approvals_reviewer","permission_profile",...}}}` (5,036 of them in
+//! the owner's plain rollouts, read on 2026-10-21), and Codex 0.155.1
+//! restores the newer of the two records on resume (`latest_persisted_resume_settings` in
 //! `codex-rs/app-server` and `apply_rollout_item` in
 //! `codex-rs/state/src/extract.rs`, at `rust-v0.155.1`). So the settings
 //! are those of the last of either record, in lineage order: in 7 of the
@@ -62,7 +63,7 @@ use crate::redact::Redactor;
 use crate::session::SessionId;
 use crate::version::HarnessVersion;
 
-use super::overrides::{ApprovalPolicy, ApprovalsReviewer, Effort, SandboxMode};
+use super::overrides::{ApprovalPolicy, ApprovalsReviewer, Effort, ProviderId, SandboxMode};
 
 /// What a rollout file name says.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,6 +343,9 @@ pub(crate) fn refuse_secrets(file: &RolloutFile) -> Result<(), HarnessError> {
 pub(crate) struct RecordedSettings {
     /// The model of the last turn, or of a change after it.
     pub(crate) model: Recorded<ModelName>,
+    /// The provider that served it: the `model_provider` of the newest
+    /// `session_meta`, or the `model_provider_id` of a change after it.
+    pub(crate) provider: Recorded<ProviderId>,
     /// The reasoning effort of the last turn, or of a change after it.
     pub(crate) effort: Recorded<Effort>,
     /// The approval policy of the last turn, or of a change after it.
@@ -387,6 +391,12 @@ fn setting<T>(
 fn model(value: Option<&serde_json::Value>) -> Recorded<ModelName> {
     setting(value, |text| {
         ModelName::parse(text).map_err(|e| format!("not a model name Fabric passes: {e}"))
+    })
+}
+
+fn provider(value: Option<&serde_json::Value>) -> Recorded<ProviderId> {
+    setting(value, |text| {
+        ProviderId::parse(text).map_err(|e| format!("not a provider id Fabric passes: {e}"))
     })
 }
 
@@ -528,6 +538,7 @@ impl RecordedSettings {
     /// it was.
     fn take_snapshot(&mut self, settings: &serde_json::Value, turn: &LastTurn) {
         self.model = model(settings.get("model"));
+        self.provider = provider(settings.get("model_provider_id"));
         self.effort = effort(settings.get("reasoning_effort"));
         self.approval = approval(settings.get("approval_policy"));
         self.reviewer = reviewer(settings.get("approvals_reviewer"));
@@ -604,6 +615,12 @@ pub(crate) fn recorded(lineage: &[RolloutFile]) -> Result<RecordedSettings, Harn
                     settings.take_snapshot(&payload["thread_settings"], &turn);
                 }
                 Some("session_meta") => {
+                    // A meta that names no provider, from a Codex that did
+                    // not record one, leaves the one read before.
+                    match provider(payload.get("model_provider")) {
+                        Recorded::Absent => {}
+                        named => settings.provider = named,
+                    }
                     let malformed = |reason: String| HarnessError::Malformed {
                         what: Input::RolloutLine,
                         path: file.path.clone(),
@@ -807,6 +824,7 @@ mod tests {
             read,
             RecordedSettings {
                 model: Recorded::Carried(ModelName::parse("gpt-6-sol").unwrap()),
+                provider: Recorded::Absent,
                 effort: Recorded::Carried(Effort::XHigh),
                 approval: Recorded::Carried(ApprovalPolicy::OnRequest),
                 reviewer: Recorded::Carried(ApprovalsReviewer::AutoReview),
@@ -852,6 +870,47 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let suffix = format!("{}{}", meta("0.155.1", Some(THREAD)), records.concat());
         recorded(&lineage(dir.path(), &meta("0.155.1", None), &suffix)).unwrap()
+    }
+
+    /// The provider that served the model is the newest `session_meta`'s
+    /// `model_provider`, through a compressed suffix whose meta, from a
+    /// Codex that recorded none, names none; a settings change after it,
+    /// which Codex 0.155.1 also writes on every resume, names the one
+    /// that now serves the model, and a turn, which names no provider,
+    /// leaves it.
+    #[test]
+    fn the_provider_is_the_newest_meta_s_or_a_later_change_s() {
+        let on = |provider: &str| {
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{THREAD}\",\"cwd\":\"/w\",\"cli_version\":\"0.155.1\",\"model_provider\":\"{provider}\"}}}}\n"
+            )
+        };
+        let shown = |read: RecordedSettings| match read.provider {
+            Recorded::Carried(id) => id.as_str().to_owned(),
+            other => format!("{other:?}"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = format!(
+            "{}{}",
+            on("azure"),
+            turn("gpt-5-deploy", "high", "on-request", "read-only")
+        );
+        let suffix = format!(
+            "{}{}",
+            meta("0.155.1", Some(THREAD)),
+            turn("gpt-5-deploy", "high", "on-request", "read-only")
+        );
+        let read = recorded(&lineage(dir.path(), &prefix, &suffix)).unwrap();
+        assert_eq!(shown(read), "azure");
+
+        let ww = profile(&["/w"]);
+        let read = read_suffix(&[
+            on("azure"),
+            turn_in("gpt-5-deploy", "high", "workspace-write", &ww),
+            applied("gpt-6-sol", "xhigh", "on-request", "user", &ww),
+            turn_in("gpt-6-sol", "xhigh", "workspace-write", &ww),
+        ]);
+        assert_eq!(shown(read), "openai");
     }
 
     /// A setting changed between turns, which Codex records as

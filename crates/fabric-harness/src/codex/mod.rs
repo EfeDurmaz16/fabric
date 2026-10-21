@@ -48,10 +48,10 @@
 //! A resume carries the job's settings from the session itself (gate
 //! finding F10a): Codex resumes with the model of this node's
 //! `config.toml`, not the one the thread ran with, so the launch reads
-//! the last `turn_context` of the lineage and passes its model, effort,
-//! sandbox and, on a terminal run, approval policy and approvals
-//! reviewer, each one the adapter was configured with winning
-//! (`overrides::effective`); `codex exec` sets its own approval policy
+//! the last `turn_context` of the lineage and passes its model, with the
+//! provider that served it, effort, sandbox and, on a terminal run,
+//! approval policy and approvals reviewer, each one the adapter was
+//! configured with winning (`overrides::effective`); `codex exec` sets its own approval policy
 //! and records the `never` it forced, so a terminal run does not carry
 //! a recorded `never`. Before anything starts it asks the binary it
 //! would run for its version and refuses when that is older than the
@@ -109,7 +109,7 @@ use crate::session::SessionId;
 use crate::stage::{Carry, Source};
 use crate::version::HarnessVersion;
 
-use self::overrides::CodexOverrides;
+use self::overrides::{CodexOverrides, LaunchOverrides};
 use self::rollout::{RecordedSettings, RolloutFile, RolloutName};
 
 /// The program name on `PATH`.
@@ -750,7 +750,7 @@ impl Codex {
     pub(crate) fn args_for(
         root: &AbsPath,
         launch: &Launch,
-        overrides: &CodexOverrides,
+        overrides: &LaunchOverrides,
     ) -> Result<Vec<String>, HarnessError> {
         let mut args = Vec::new();
         if launch.is_headless() {
@@ -907,6 +907,10 @@ mod tests {
             model: Some(crate::harness::ModelName::parse("o3").unwrap()),
             effort: Some(overrides::Effort::High),
         };
+        let set = LaunchOverrides {
+            settings: set,
+            provider: None,
+        };
         let root = &AbsPath::parse("/h/fabric/jobs/j/work").unwrap();
         let session = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
         let resume = Launch::Interactive {
@@ -966,7 +970,7 @@ mod tests {
                 resume: None,
                 prompt: Some("go".to_owned()),
             },
-            &CodexOverrides::default(),
+            &LaunchOverrides::default(),
         )
         .unwrap();
         assert_eq!(
@@ -1321,6 +1325,34 @@ mod tests {
             matches!(&refused, HarnessError::SymlinkInState { path } if *path == day),
             "{refused}"
         );
+    }
+
+    /// A thread that ran on another provider than this node's default
+    /// resumes with that provider beside its model, so Codex does not send
+    /// the model to a provider that does not serve it, and the report
+    /// names both.
+    #[tokio::test]
+    async fn a_resume_passes_the_provider_the_session_s_model_ran_on() {
+        let fixture = Resume::new("codex-cli 0.155.1");
+        let rollout = std::fs::read_to_string(&fixture.rollout).unwrap();
+        let on_azure = rollout.replace(
+            "\"cli_version\":\"0.155.1\"",
+            "\"cli_version\":\"0.155.1\",\"model_provider\":\"azure\"",
+        );
+        assert_ne!(on_azure, rollout);
+        std::fs::write(&fixture.rollout, &on_azure).unwrap();
+        let mut running = fixture.launch(true).await.unwrap();
+        running.child_mut().wait().await.unwrap();
+        let ran = fixture.ran().unwrap();
+        let at = ran.iter().position(|a| a == "model=\"gpt-6-sol\"").unwrap();
+        assert_eq!(ran[at + 1..at + 3], ["-c", "model_provider=\"azure\""]);
+        let passed: Vec<String> = running
+            .settings()
+            .passed
+            .iter()
+            .map(|p| format!("{} {}", p.name, p.value))
+            .collect();
+        assert_eq!(passed[..2], ["model gpt-6-sol", "model provider azure"]);
     }
 
     /// A codex whose version cannot be read is refused too: deny by default.
