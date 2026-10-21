@@ -191,9 +191,20 @@ fn e2e_an_older_codex_is_refused_a_thread_a_newer_one_continued() -> Fallible {
     let args = fs::read_to_string(p.env.home.join("codex-args"))?;
     assert!(!args.contains("exec"), "the older codex started: {args}");
 
-    // A capture on the node that was refused keeps the newer version, so
-    // suspending there and running again does not get past the guard.
+    // A capture on the node that was refused records the newer version,
+    // not the older one installed there, so the snapshot carries it to the
+    // next node; and running again there does not get past the guard.
     p.a.ok(&["job", "suspend", &job])?;
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(
+        p.a.state()
+            .join("jobs")
+            .join(&job)
+            .join("harness-state/manifest.json"),
+    )?)?;
+    assert_eq!(
+        manifest["harness_version"], "0.160.0",
+        "the capture lowered the known writer"
+    );
     let again =
         p.a.run(&["job", "run", &job, "--headless", "--prompt", "four"])?;
     let said = text(&again);

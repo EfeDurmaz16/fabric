@@ -2707,6 +2707,57 @@ pub(crate) mod tests {
         assert_eq!(known().await, Some(v("0.163.0-alpha.10.2")));
     }
 
+    /// A capture records the newer of the installed Codex and the known
+    /// writer, and the session record keeps what the capture recorded, so
+    /// a run on this node after the snapshot is held to the same floor as
+    /// a node that restores the snapshot.
+    #[tokio::test]
+    async fn a_capture_raises_the_known_writer_to_the_version_it_records() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let thread = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap().join("home");
+        let sessions = home.join(".codex/sessions/2026/10/21");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join(format!("rollout-2026-10-21T10-00-00-{thread}.jsonl")),
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread}\",\"cwd\":\"/w\",\"cli_version\":\"0.155.1\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let codex = bin.join("codex");
+        std::fs::write(&codex, "#!/bin/sh\necho 'codex-cli 0.160.0'\n").unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut path = bin.into_os_string();
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+        {
+            let job = node.job(id).await.unwrap();
+            let job = job.lock().await;
+            let record = SessionRecord {
+                harness: HarnessKind::Codex,
+                session: thread.clone(),
+                known_writer: Some(HarnessVersion::parse("0.155.1").unwrap()),
+            };
+            local::write(&job.dir().session(), &record).unwrap();
+        }
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let job = node.job(id).await.unwrap();
+        let job = job.lock().await;
+        let manifest = StateManifest::read(&job.dir().harness_state()).unwrap();
+        assert_eq!(manifest.harness_version(), Some("0.160.0"));
+        assert_eq!(
+            job.session()
+                .unwrap()
+                .and_then(|record| record.known_writer),
+            Some(HarnessVersion::parse("0.160.0").unwrap())
+        );
+    }
+
     /// Two moves typed at once toward different nodes: the second finds the
     /// job departing toward the first's target and must name that node,
     /// not offer the first move to its own.
