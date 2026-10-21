@@ -444,7 +444,8 @@ impl RecordedSettings {
 /// Reads what the rollouts of a session record, given its lineage newest
 /// suffix first, as `lineage` returns it. A line that does not parse is
 /// skipped, as a cut last line is; a `cli_version` that is there but is
-/// not a version is an error, because the guard cannot compare it.
+/// not a version, `null` and any other value that is not text included,
+/// is an error, because the guard cannot compare it.
 pub(crate) fn recorded(lineage: &[RolloutFile]) -> Result<RecordedSettings, HarnessError> {
     let mut settings = RecordedSettings::default();
     let mut turn = LastTurn::default();
@@ -484,15 +485,18 @@ pub(crate) fn recorded(lineage: &[RolloutFile]) -> Result<RecordedSettings, Harn
                     settings.take_snapshot(&payload["thread_settings"], &turn);
                 }
                 Some("session_meta") => {
-                    let Some(text) = payload.get("cli_version").and_then(|v| v.as_str()) else {
-                        continue;
+                    let malformed = |reason: String| HarnessError::Malformed {
+                        what: Input::RolloutLine,
+                        path: file.path.clone(),
+                        reason: format!("session_meta.cli_version: {reason}"),
+                    };
+                    let text = match payload.get("cli_version") {
+                        None => continue,
+                        Some(serde_json::Value::String(text)) => text,
+                        Some(_) => return Err(malformed("not text".to_owned())),
                     };
                     let version =
-                        HarnessVersion::parse(text).map_err(|e| HarnessError::Malformed {
-                            what: Input::RolloutLine,
-                            path: file.path.clone(),
-                            reason: format!("session_meta.cli_version: {e}"),
-                        })?;
+                        HarnessVersion::parse(text).map_err(|e| malformed(e.to_string()))?;
                     if settings.writer.as_ref().is_none_or(|w| version > *w) {
                         settings.writer = Some(version);
                     }
@@ -854,5 +858,41 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A `cli_version` that is there but is not text fails the read as a
+    /// bad version does: skipped, it would leave the guard without the
+    /// newest writer. Only a `session_meta` with no `cli_version` is
+    /// read past.
+    #[test]
+    fn a_writer_recorded_as_anything_but_text_is_refused() {
+        let quoted = meta("0.160.0", Some(THREAD));
+        for value in ["160", "null", "[\"0.160.0\"]", "{\"v\":\"0.160.0\"}"] {
+            let dir = tempfile::tempdir().unwrap();
+            let suffix = quoted.replace("\"0.160.0\"", value);
+            assert_ne!(suffix, quoted);
+            let chain = lineage(dir.path(), &meta("0.155.1", None), &suffix);
+            assert!(
+                matches!(
+                    recorded(&chain),
+                    Err(HarnessError::Malformed {
+                        what: Input::RolloutLine,
+                        ref reason,
+                        ..
+                    }) if reason == "session_meta.cli_version: not text"
+                ),
+                "{value}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let chain = lineage(
+            dir.path(),
+            &meta("0.155.1", None),
+            &quoted.replace(",\"cli_version\":\"0.160.0\"", ""),
+        );
+        assert_eq!(
+            recorded(&chain).unwrap().writer.map(|w| w.to_string()),
+            Some("0.155.1".to_owned())
+        );
     }
 }
