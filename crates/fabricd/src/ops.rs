@@ -845,9 +845,7 @@ impl Node {
             "snapshot {snapshot}: {} files, {} bytes, {} new objects",
             report.files, report.bytes, report.new_objects
         ));
-        for path in report.denied.iter().chain(&report.denied_untracked) {
-            out.say(format!("left behind (secret pattern): {path}"));
-        }
+        report_capture(&report, out);
         Ok(snapshot)
     }
 
@@ -2191,6 +2189,55 @@ fn report_caches(caches: &[fabric_core::snapshot::CacheEntry], facts: &NodeFacts
                 key_difference(&cache.key, &mine)
             ));
         }
+    }
+}
+
+/// Says, one line per path, what the snapshot carries that a secret
+/// pattern matches, and what of the workspace and the harness state it
+/// leaves out.
+fn report_capture(report: &fabric_store::capture::CaptureReport, out: &mut Out) {
+    for path in report.denied.iter().chain(&report.denied_untracked) {
+        out.say(format!("left behind (secret pattern): {path}"));
+    }
+    for path in &report.denied_harness {
+        out.say(format!(
+            "left behind (secret pattern, harness state): {path}"
+        ));
+    }
+    for path in &report.tracked_secrets {
+        out.say(format!(
+            "travels in the snapshot though a secret pattern matches it (tracked): {path}"
+        ));
+    }
+    for path in &report.stashed_secrets {
+        out.say(format!(
+            "travels in the snapshot though a secret pattern matches it (stashed): {path}"
+        ));
+    }
+    for path in &report.special_files {
+        out.say(format!(
+            "left behind (not a file, link or directory): {path}"
+        ));
+    }
+    for path in &report.special_harness {
+        out.say(format!(
+            "left behind (not a file, link or directory, harness state): {path}"
+        ));
+    }
+    // In a repository the whole nested tree stays; in a plain directory
+    // its files travel and only its `.git` stays.
+    let nested = if report.bundle.is_some() {
+        "left behind (nested repository)"
+    } else {
+        "left behind (the .git of a nested repository)"
+    };
+    for path in &report.nested_repositories {
+        out.say(format!("{nested}: {path}"));
+    }
+    for path in &report.nested_harness {
+        out.say(format!(
+            "left behind (the .git of a nested repository, harness state): {path}"
+        ));
     }
 }
 
@@ -3600,5 +3647,62 @@ pub(crate) mod tests {
             job.marker().unwrap().unwrap().state,
             MarkerState::Restoring { .. }
         ));
+    }
+
+    /// A suspend must say what its snapshot carries that a secret pattern
+    /// matches, and what of the workspace it leaves out: a tracked `.env`
+    /// travels in the bundle, and a nested repository stays behind.
+    /// Before, only ignored and untracked secrets were named.
+    #[tokio::test]
+    async fn a_suspend_names_tracked_secrets_and_nested_repositories() {
+        let (dir, node) = node();
+        let repo = repo(dir.path());
+        std::fs::write(repo.join(".env"), "TOKEN=x\n").unwrap();
+        for args in [
+            &["add", "-f", ".env"][..],
+            &[
+                "-c",
+                "user.name=f",
+                "-c",
+                "user.email=f@x",
+                "commit",
+                "-qm",
+                "2",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let mut out = Out::default();
+        node.job_new(&repo, "goal".to_owned(), HarnessKind::Codex, &mut out)
+            .await
+            .unwrap();
+        let id: JobId = out.lines[0].parse().unwrap();
+        let root = paths::job_root(&node.cfg.home, id);
+        std::fs::create_dir(root.join("vendored")).unwrap();
+        let made = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root.join("vendored"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut out = Out::default();
+        node.suspend(id, &path, &mut out).await.unwrap();
+        for wanted in [
+            "travels in the snapshot though a secret pattern matches it (tracked): .env",
+            "left behind (nested repository): vendored",
+        ] {
+            assert!(
+                out.lines.iter().any(|line| line == wanted),
+                "no line {wanted:?} in {:?}",
+                out.lines
+            );
+        }
     }
 }
