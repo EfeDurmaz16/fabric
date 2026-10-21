@@ -1192,7 +1192,9 @@ mod tests {
     }
 
     /// The continuing line names the carried settings and where they came
-    /// from, and each setting left out gets a line saying why.
+    /// from, and each setting left out gets a line saying why. A resume
+    /// that carries nothing still says which session it continues, since
+    /// the node no longer prints a continuing line of its own.
     #[test]
     fn the_report_names_what_was_carried_and_what_was_not() {
         let session = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
@@ -1226,5 +1228,20 @@ mod tests {
             ["codex runs with model o3 (pinned), effort xhigh (recorded in the session)"]
         );
         assert!(settings_lines(&HarnessKind::Codex, None, &LaunchSettings::default()).is_empty());
+        let nothing_carried = LaunchSettings {
+            passed: Vec::new(),
+            not_carried: vec![NotCarried {
+                name: SettingName::Model,
+                value: "claude-fable-5 or claude-opus-4-8".to_owned(),
+                reason: "the session has transcripts under several project keys".to_owned(),
+            }],
+        };
+        assert_eq!(
+            settings_lines(&HarnessKind::ClaudeCode, Some(&session), &nothing_carried),
+            [
+                "continuing claude-code session 019f233e-bb33-7342-85fa-f2d33b14368a",
+                "model claude-fable-5 or claude-opus-4-8 is not carried (the session has transcripts under several project keys); claude-code uses its own setting",
+            ]
+        );
     }
 }
