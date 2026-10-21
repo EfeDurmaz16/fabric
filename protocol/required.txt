@@ -832,6 +832,9 @@ reply/node_add_without_address.json /node
 reply/node_id.json /kind
 reply/node_id.json /listen
 reply/node_id.json /node
+reply/node_id_scoped.json /kind
+reply/node_id_scoped.json /listen
+reply/node_id_scoped.json /node
 reply/node_list.json /kind
 reply/node_list.json /peers
 reply/node_list.json /peers/0/addrs

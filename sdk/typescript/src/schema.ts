@@ -130,9 +130,14 @@ function isSocketAddr(text: string): boolean {
   if (v6 === undefined) {
     return false;
   }
-  // Rust accepts a numeric scope id after `%`, as in `[fe80::1%2]:7777`.
+  // Rust accepts a numeric scope id after `%`, as in `[fe80::1%2]:7777`,
+  // that fits a u32, leading zeros and all.
   const [address = "", scope, ...rest] = v6.split("%");
-  return rest.length === 0 && isIPv6(address) && (scope === undefined || /^[0-9]+$/.test(scope));
+  return (
+    rest.length === 0 &&
+    isIPv6(address) &&
+    (scope === undefined || (/^[0-9]+$/.test(scope) && Number(scope) <= U32_MAX))
+  );
 }
 
 /** A field that may be absent; `null` reads as absent, as serde reads it. */
