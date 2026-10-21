@@ -8,8 +8,10 @@
 // through, in a value or in a key.
 //
 // JSON.parse also reads an integer written as 2.0, 1e0 or -0, which
-// serde_json reads as a float that no field of the client API takes. The
-// reader refuses one where the Rust reader does (review finding on PR #13).
+// serde_json reads as a float that no field of the client API takes, and
+// TextDecoder drops a leading byte order mark, which serde_json refuses.
+// The reader refuses both where the Rust reader does (review finding on
+// PR #13).
 
 import { FrameEmptyError, FrameTooLargeError, MalformedError } from "./errors.ts";
 import { isUnicodeText } from "./schema.ts";
@@ -20,7 +22,9 @@ export const MAX_FRAME = 16 << 20;
 const HEADER = 4;
 const encoder = new TextEncoder();
 // Fatal, so bytes that are not UTF-8 fail the frame instead of turning into U+FFFD.
-const decoder = new TextDecoder("utf-8", { fatal: true });
+// A leading byte order mark stays U+FEFF, which JSON.parse refuses as
+// serde_json does, instead of being dropped before the parse.
+const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /** The bytes of `value` as one frame: its length, then its JSON. */
 export function encodeFrame(value: unknown): Uint8Array {

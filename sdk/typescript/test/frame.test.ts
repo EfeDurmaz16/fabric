@@ -77,6 +77,17 @@ describe("the frame encoder", () => {
   });
 });
 
+// Review finding on PR #13: a .NET or PowerShell writer may start UTF-8 text with a byte order mark. serde_json
+// refuses it, and TextDecoder dropped it by default, so the SDK read a frame the node answers with bad_request.
+describe("a byte order mark", () => {
+  const json = new TextEncoder().encode('{"kind":"stopping_harness","pid":7}');
+
+  test("before the JSON is refused", () => {
+    expect(() => decodeJson(Uint8Array.of(0xef, 0xbb, 0xbf, ...json))).toThrow(MalformedError);
+    expect(decodeJson(json)).toStrictEqual({ kind: "stopping_harness", pid: 7 });
+  });
+});
+
 // Review finding on PR #13: half an emoji, as `.slice()` leaves it, is a lone UTF-16 surrogate. JSON.stringify
 // writes it as an escape the node's reader refuses, and JSON.parse reads that escape back.
 describe("a lone surrogate", () => {

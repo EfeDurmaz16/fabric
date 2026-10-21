@@ -19,7 +19,7 @@ This ADR fixes the contract that any program, in any language, uses against a lo
 
 ### Wire format: length-prefixed JSON on the same socket
 
-The client API runs on `<state>/fabric.sock`, the control socket of ADR 0016. Each frame is a `u32` little-endian length, 1 to 16 MiB, then that many bytes of one UTF-8 JSON object. A reader checks the length against the cap before it allocates. A node parses a hello or a request only up to 1 MiB and refuses a larger one unparsed, a request with `bad_request` and a hello with `incompatible`: parsing a frame takes up to about thirty times its size, for a frame of small values such as a long array of zeros in a field the node does not know, so a 16 MiB request took over 500 MiB of the node's memory, and a client never needs to send more than the free text of a goal or a note. Node-to-node traffic (`fabric-net`, ADR 0013), the ledger and the manifests stay postcard.
+The client API runs on `<state>/fabric.sock`, the control socket of ADR 0016. Each frame is a `u32` little-endian length, 1 to 16 MiB, then that many bytes of one UTF-8 JSON object, with no byte order mark before it. A reader checks the length against the cap before it allocates. A node parses a hello or a request only up to 1 MiB and refuses a larger one unparsed, a request with `bad_request` and a hello with `incompatible`: parsing a frame takes up to about thirty times its size, for a frame of small values such as a long array of zeros in a field the node does not know, so a 16 MiB request took over 500 MiB of the node's memory, and a client never needs to send more than the free text of a goal or a note. Node-to-node traffic (`fabric-net`, ADR 0013), the ledger and the manifests stay postcard.
 
 JSON wins on this socket for four reasons:
 
