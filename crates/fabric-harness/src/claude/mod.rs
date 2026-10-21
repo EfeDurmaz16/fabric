@@ -116,6 +116,10 @@ pub struct ClaudeCode {
 /// adapter was checked against.
 const REGISTRY_READ_ON: &str = "2.1.294";
 
+/// Why a model is not carried when the transcript Claude resumes cannot
+/// be told from the others.
+const KEY_UNKNOWN: &str = "the session has transcripts under several project keys, and Claude resumes from this workspace's key, which it cuts and hashes, so Fabric cannot tell which one";
+
 /// What the session registry says about a session.
 enum Registry {
     /// These live processes registered the session; empty when none did.
@@ -690,12 +694,15 @@ impl ClaudeCode {
     /// carry or to guard, and Claude then says itself that it found none.
     /// The own key only orders them: a workspace whose key Claude cuts
     /// and hashes, which this adapter does not compute, has none, and
-    /// every key is still read and guarded.
+    /// every key is still read and guarded. The flag is true when such a
+    /// workspace's session has transcripts under more than one key: Claude
+    /// resumes from the hashed key, which cannot be told apart from the
+    /// others, so the order says nothing about which model it restores.
     fn transcripts(
         &self,
         root: &AbsPath,
         session: &SessionId,
-    ) -> Result<Vec<PathBuf>, HarnessError> {
+    ) -> Result<(Vec<PathBuf>, bool), HarnessError> {
         let projects = self.config_dir.join("projects");
         let own = match slug::slug(root) {
             Ok(key) => Some(projects.join(key)),
@@ -723,12 +730,17 @@ impl ClaudeCode {
             }
         }
         found.sort();
-        Ok(found.into_iter().map(|(_, path)| path).collect())
+        let ambiguous = own.is_none() && found.len() > 1;
+        Ok((found.into_iter().map(|(_, path)| path).collect(), ambiguous))
     }
 
     /// What the transcripts of `session` record, read before a resume;
     /// refused when the binary that would run it is older than its newest
-    /// writer or does not say its version, so nothing starts.
+    /// writer or does not say its version, so nothing starts. When the
+    /// workspace's own key cannot be named and the session has transcripts
+    /// under several keys, the model is left out, with that reason, rather
+    /// than taken from whichever key sorts last; the writer of every key
+    /// still guards the resume.
     async fn read_session(
         &self,
         root: &AbsPath,
@@ -736,8 +748,14 @@ impl ClaudeCode {
         env: &[(EnvVarName, String)],
         session: &SessionId,
     ) -> Result<recorded::RecordedClaude, HarnessError> {
-        let transcripts = self.transcripts(root, session)?;
-        let recorded = pipeline::blocking(move || recorded::read(&transcripts)).await?;
+        let (transcripts, ambiguous) = self.transcripts(root, session)?;
+        let mut recorded = pipeline::blocking(move || recorded::read(&transcripts)).await?;
+        if ambiguous && let Recorded::Carried(model) = &recorded.model {
+            recorded.model = Recorded::NotCarried {
+                value: model.as_str().to_owned(),
+                reason: KEY_UNKNOWN.to_owned(),
+            };
+        }
         if let Some(writer) = &recorded.writer {
             let cwd = pipeline::fs_path(root);
             crate::version::refuse_older(PROGRAM, binary, cwd, env, session, writer).await?;
@@ -1663,6 +1681,84 @@ mod tests {
         let ran = fixture.ran().unwrap();
         let model = ran.iter().position(|a| a == "--model").map(|i| &ran[i + 1]);
         assert_eq!(model.map(String::as_str), Some("claude-fable-5"), "{ran:?}");
+    }
+
+    /// A workspace whose key Claude cuts and hashes, with the session's
+    /// transcripts under two keys: Claude resumes from the hashed one,
+    /// which Fabric cannot name, so no model is passed and the CLI is told
+    /// why, rather than the model of whichever key sorts last. Every key
+    /// still guards the resume.
+    #[tokio::test]
+    async fn a_cut_key_with_transcripts_under_several_keys_carries_no_model() {
+        let fixture = Resume::new("2.1.294 (Claude Code)");
+        let long = fixture
+            .home
+            .join("work")
+            .join("a".repeat(80))
+            .join("b".repeat(80))
+            .join("c".repeat(80));
+        std::fs::create_dir_all(&long).unwrap();
+        std::fs::remove_file(&fixture.transcript).unwrap();
+        let line = |version: &str, model: &str| {
+            format!(
+                "{{\"type\":\"assistant\",\"version\":\"{version}\",\"isSidechain\":false,\"message\":{{\"model\":\"{model}\"}}}}\n"
+            )
+        };
+        let projects = fixture.home.join(".claude/projects");
+        let cut = projects.join("-cut-key-1a2b3c");
+        let stale = projects.join("-zz-stale-key");
+        for dir in [&cut, &stale] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let launch = || Launch::Headless {
+            resume: Some(SessionId::parse(SID).unwrap()),
+            prompt: "next".to_owned(),
+        };
+        std::fs::write(
+            cut.join(format!("{SID}.jsonl")),
+            line("2.1.300", "claude-fable-5"),
+        )
+        .unwrap();
+        std::fs::write(
+            stale.join(format!("{SID}.jsonl")),
+            line("2.1.294", "claude-opus-4-8"),
+        )
+        .unwrap();
+        let refused = fixture
+            .adapter
+            .launch(&long, launch(), &fixture.env)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                HarnessError::HarnessOlderThanSession { recorded, .. } if recorded.as_str() == "2.1.300"
+            ),
+            "{refused}"
+        );
+        assert_eq!(fixture.ran(), None, "the older claude ran");
+
+        std::fs::write(
+            cut.join(format!("{SID}.jsonl")),
+            line("2.1.294", "claude-fable-5"),
+        )
+        .unwrap();
+        let mut running = fixture
+            .adapter
+            .launch(&long, launch(), &fixture.env)
+            .await
+            .unwrap();
+        running.child_mut().wait().await.unwrap();
+        let ran = fixture.ran().unwrap();
+        assert!(!ran.iter().any(|a| a == "--model"), "{ran:?}");
+        assert_eq!(
+            running.settings().not_carried,
+            [NotCarried::new(
+                SettingName::Model,
+                "claude-opus-4-8",
+                KEY_UNKNOWN
+            )]
+        );
     }
 
     /// A workspace whose project key is over 200 characters, which Claude
