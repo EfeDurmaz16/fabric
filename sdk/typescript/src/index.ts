@@ -20,6 +20,7 @@ export {
 export {
   ClosedBeforeAnswerError,
   ClosedBeforeWelcomeError,
+  EnvError,
   FabricError,
   FrameEmptyError,
   FrameError,

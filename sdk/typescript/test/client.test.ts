@@ -10,6 +10,7 @@ import {
   clientEnvFromProcess,
   ClosedBeforeAnswerError,
   ClosedBeforeWelcomeError,
+  EnvError,
   createFrameDecoder,
   decodeJson,
   encodeFrame,
@@ -354,6 +355,32 @@ describe("clientEnvFromProcess", () => {
     expect(JSON.parse(JSON.stringify(env))).toStrictEqual({
       path: ["/usr/local/bin/", "/opt/x/.git", "/opt/homebrew//bin", "/usr/bin/../bin", "/cafe\u0301/bin", "//"],
       roots: { cargo_home: "/Users/me//.cargo/" },
+    });
+  });
+
+  // Review finding on PR #13: Node and Bun read `/opt/caf\xe9/bin` as `/opt/caf\ufffd/bin`, a directory
+  // that does not exist, and the node measured without the client's one. Rust's `ClientEnv::from_vars`
+  // fails on the bytes; here the U+FFFD they became fails the same way, naming the variable.
+  test("refuses an absolute PATH entry or root that holds U+FFFD, as Rust refuses one that is not UTF-8", () => {
+    const refusal = (vars: Record<string, string>): unknown => {
+      try {
+        clientEnvFromProcess(vars);
+      } catch (error) {
+        return error;
+      }
+      return undefined;
+    };
+    const entry = refusal({ PATH: "/usr/bin:/opt/caf\ufffd/bin:/bin" });
+    expect(entry).toBeInstanceOf(EnvError);
+    expect(entry).toMatchObject({ variable: "PATH", value: "/opt/caf\ufffd/bin" });
+    const root = refusal({ PATH: "/usr/bin", CARGO_HOME: "/home/\ufffd/.cargo" });
+    expect(root).toBeInstanceOf(EnvError);
+    expect(root).toMatchObject({ variable: "CARGO_HOME", value: "/home/\ufffd/.cargo" });
+    // A relative entry or root is left out before its text matters, as in Rust.
+    const relative = clientEnvFromProcess({ PATH: "caf\ufffd:/bin", PNPM_HOME: "pnpm\ufffd" });
+    expect(JSON.parse(JSON.stringify(relative))).toStrictEqual({
+      path: ["/bin"],
+      roots: {},
     });
   });
 });

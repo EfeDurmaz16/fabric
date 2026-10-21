@@ -180,6 +180,29 @@ export class RefusedError extends FabricError {
 }
 
 /**
+ * A variable of the caller's environment names an absolute path the
+ * client API cannot carry, as Rust's `EnvError`. Node and Bun hand a
+ * variable that is not UTF-8 to JavaScript with U+FFFD in place of each
+ * byte they cannot decode, and the text that is left names another
+ * directory, so a value holding U+FFFD is refused rather than sent.
+ */
+export class EnvError extends FabricError {
+  override name = "EnvError";
+  /** The variable. */
+  readonly variable: string;
+  /** The path it names; for `PATH`, the one entry. */
+  readonly value: string;
+
+  constructor(variable: string, value: string) {
+    super(
+      `${variable} names ${value}, which is not UTF-8, and the client API carries only UTF-8 paths; rename it or take it out of ${variable}`,
+    );
+    this.variable = variable;
+    this.value = value;
+  }
+}
+
+/**
  * The request does not validate, so it never left the client. Only a
  * caller without the types, or one that cast around them, meets this.
  */

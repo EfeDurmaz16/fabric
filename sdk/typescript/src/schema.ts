@@ -12,6 +12,8 @@
 import { isIPv4, isIPv6 } from "node:net";
 import { z } from "zod";
 
+import { EnvError } from "./errors.ts";
+
 /** The version of the client API this SDK speaks; a node answers only the same number. */
 export const API_VERSION = 1;
 
@@ -538,23 +540,39 @@ export const ROOT_CAPABILITIES: readonly string[] = Roots.keyof().options.map(ro
  * one or a relative one, which would name a directory of the node's
  * choosing, and each root it sets to an absolute path. Every entry and
  * root it keeps is kept as written, so the node finds the tools the
- * client's shell finds. Node hands a variable that is not UTF-8 to
- * JavaScript with U+FFFD in place of the bytes it cannot decode.
+ * client's shell finds.
+ *
+ * Throws `EnvError` for an absolute entry or root that holds U+FFFD. Node
+ * and Bun hand a variable that is not UTF-8 to JavaScript with U+FFFD in
+ * place of each byte they cannot decode, so `/opt/caf\xe9/bin` arrives as
+ * `/opt/caf\ufffd/bin`, a directory that does not exist. Sending it would
+ * have the node measure without the client's directory, which Rust
+ * prevents by failing the command; JavaScript cannot tell such a value
+ * from a path that holds U+FFFD itself, so it refuses both.
  */
 export function clientEnvFromProcess(vars: Readonly<Record<string, string | undefined>> = process.env): ClientEnv {
   const path = (vars["PATH"] ?? "").split(":").flatMap((dir) => {
-    const parsed = PathDir.safeParse(dir);
+    const parsed = PathDir.safeParse(utf8Path("PATH", dir));
     return parsed.success ? [parsed.data] : [];
   });
   const roots: Roots = {};
   for (const field of Roots.keyof().options) {
-    const value = vars[ROOT_VARS[field]];
-    const parsed = value === undefined ? undefined : SystemPath.safeParse(value);
+    const variable = ROOT_VARS[field];
+    const value = vars[variable];
+    const parsed = value === undefined ? undefined : SystemPath.safeParse(utf8Path(variable, value));
     if (parsed?.success) {
       roots[field] = parsed.data;
     }
   }
   return { path, roots };
+}
+
+/** `value` of `variable`, refused when it is absolute and holds U+FFFD, as `clientEnvFromProcess` says. */
+function utf8Path(variable: string, value: string): string {
+  if (value.startsWith("/") && value.includes("\ufffd")) {
+    throw new EnvError(variable, value);
+  }
+  return value;
 }
 
 // Requests and replies.
