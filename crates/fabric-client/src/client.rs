@@ -176,9 +176,9 @@ impl Client {
         // name resolves in, as the TypeScript SDK checks it.
         let socket = std::path::absolute(&self.socket).map_err(FrameError::Io)?;
         if let Some(dir) = socket.parent() {
-            check_private(dir)?;
+            check_private(dir, &self.socket)?;
         }
-        check_private(&socket)?;
+        check_private(&socket, &self.socket)?;
         let mut stream =
             UnixStream::connect(&socket)
                 .await
@@ -543,15 +543,22 @@ fn unexpected(op: Op, reply: &Reply) -> ClientError {
 
 /// Refuses `path` unless this user owns it and, for a directory, no one else may enter it.
 ///
-/// A missing path passes: the connect that follows reports it as no daemon.
-fn check_private(path: &Path) -> Result<(), ClientError> {
+/// A missing path is no daemon at `socket`, and nothing is dialed: a
+/// directory missing now could be made, with a socket in it, by anyone who
+/// may write its parent, as in `/tmp`, before the connect.
+fn check_private(path: &Path, socket: &Path) -> Result<(), ClientError> {
     let untrusted = |reason: String| ClientError::Untrusted {
         path: path.to_owned(),
         reason,
     };
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ClientError::NoDaemon {
+                path: socket.to_owned(),
+                source,
+            });
+        }
         Err(e) => return Err(FrameError::Io(e).into()),
     };
     let me = rustix::process::geteuid().as_raw();
@@ -582,13 +589,28 @@ mod tests {
     #[test]
     fn a_state_directory_others_can_enter_is_not_trusted() {
         let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fabric.sock");
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(matches!(
-            check_private(dir.path()),
+            check_private(dir.path(), &socket),
             Err(ClientError::Untrusted { .. })
         ));
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        check_private(dir.path()).unwrap();
+        check_private(dir.path(), &socket).unwrap();
+    }
+
+    /// Review finding on PR #13: a socket under a missing directory passed
+    /// both checks, so anyone who may write the parent, as in `/tmp`, could
+    /// make the directory and a socket of theirs in it before the connect.
+    #[test]
+    fn a_socket_under_a_missing_directory_is_no_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("new").join("fabric.sock");
+        let missing = check_private(&dir.path().join("new"), &socket);
+        assert!(
+            matches!(&missing, Err(ClientError::NoDaemon { path, .. }) if *path == socket),
+            "{missing:?}"
+        );
     }
 
     /// A socket path that is a symlink could lead anywhere, such as to a
@@ -599,7 +621,7 @@ mod tests {
         let socket = dir.path().join("fabric.sock");
         std::os::unix::fs::symlink(dir.path().join("elsewhere.sock"), &socket).unwrap();
         assert!(matches!(
-            check_private(&socket),
+            check_private(&socket, &socket),
             Err(ClientError::Untrusted { .. })
         ));
     }

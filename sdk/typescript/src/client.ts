@@ -311,8 +311,8 @@ export class FabricClient {
     // Resolved once: the connect goes to the path the checks passed, even
     // if the working directory changes while they wait.
     const socket = resolve(this.socketPath);
-    await checkPrivate(dirname(socket));
-    await checkPrivate(socket);
+    await checkPrivate(dirname(socket), socket);
+    await checkPrivate(socket, socket);
     const exchange = openExchange(await dial(socket));
     try {
       let answer: HelloAnswer | null;
@@ -447,16 +447,17 @@ function openExchange(socket: Socket): Exchange {
 
 /**
  * Refuses `path` unless this user owns it and, for a directory, no one
- * else may enter it. A missing path passes: the connect that follows
- * reports it as no daemon.
+ * else may enter it. A missing path is no daemon at `socket`, and nothing
+ * is dialed: a directory missing now could be made, with a socket in it,
+ * by anyone who may write its parent, as in `/tmp`, before the connect.
  */
-async function checkPrivate(path: string): Promise<void> {
+async function checkPrivate(path: string, socket: string): Promise<void> {
   let stats: Stats;
   try {
     stats = await lstat(path);
   } catch (error) {
     if (errorCode(error) === "ENOENT") {
-      return;
+      throw new NoDaemonError(socket, error);
     }
     throw new FrameIoError(error);
   }

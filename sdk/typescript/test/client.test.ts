@@ -1,8 +1,9 @@
 // The client against a fake node on a temporary unix socket: what it sends,
 // what it hands to `onEvent`, and which error each broken exchange gives.
 
-import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { afterEach, describe, expect, mock, test } from "bun:test";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 
@@ -57,6 +58,9 @@ type FakeNode = {
 };
 
 const cleanups: Array<() => void> = [];
+
+/** node:fs/promises as loaded, before a test stands in for it. */
+const REAL_FS_PROMISES = { ...fsPromises };
 
 afterEach(() => {
   for (const cleanup of cleanups.splice(0)) {
@@ -399,6 +403,34 @@ describe("the client", () => {
   test("rejects a socket nothing listens on with NoDaemon", async () => {
     const error = await rejection(new FabricClient({ socketPath: join(tempDir(), "fabric.sock") }).hello());
     expect(error).toBeInstanceOf(NoDaemonError);
+  });
+
+  // Review finding on PR #13: a socket under a missing directory passed both checks, so anyone who may write the
+  // parent, as in /tmp, could make the directory and a socket of theirs in it before the connect. Here both appear
+  // right after the client finds the directory missing, as another user racing it would make them.
+  test("rejects a socket under a missing directory with NoDaemon before connecting", async () => {
+    const reply = { type: "done", reply: { kind: "job_list", jobs: [], closed: [] } };
+    const socketPath = join(tempDir(), "new", "fabric.sock");
+    const raced: FakeNode[] = [];
+    mock.module("node:fs/promises", () => ({
+      ...REAL_FS_PROMISES,
+      async lstat(path: string) {
+        try {
+          return await REAL_FS_PROMISES.lstat(path);
+        } catch (error) {
+          if (path === dirname(socketPath) && raced.length === 0) {
+            mkdirSync(path);
+            raced.push(await fakeNode(answers(reply), path));
+          }
+          throw error;
+        }
+      },
+    }));
+    cleanups.push(() => mock.module("node:fs/promises", () => REAL_FS_PROMISES));
+    const error = await rejection(new FabricClient({ socketPath }).jobList());
+    expect(error).toBeInstanceOf(NoDaemonError);
+    expect(raced).toHaveLength(1);
+    expect(raced[0]?.connections).toHaveLength(0);
   });
 });
 

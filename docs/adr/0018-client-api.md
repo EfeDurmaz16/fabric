@@ -134,7 +134,7 @@ A CLI from before this ADR that reaches a node after it sends postcard, which do
 
 ### Security
 
-Unchanged from ADR 0016. The socket lives in the state directory, mode 0700. The node refuses a connection whose peer user id is not its own. The client refuses a state directory or a socket another user owns, a symlink, or a directory others may enter, before it sends anything, because a run plan read there decides what it launches; `fabric-client` and the TypeScript SDK both make these checks. There is no network listener for the client API in this ADR. Remote clients, a phone included, come later with capability tokens (C4): a token names what its holder may do to which job, and the local socket stays the owner's alone.
+Unchanged from ADR 0016. The socket lives in the state directory, mode 0700. The node refuses a connection whose peer user id is not its own. The client refuses a state directory or a socket another user owns, a symlink, or a directory others may enter, before it sends anything, because a run plan read there decides what it launches; `fabric-client` and the TypeScript SDK both make these checks. A missing state directory or socket is no daemon, and the client does not dial: a directory missing at the check could be made, with a socket in it, by anyone who may write its parent, as in `/tmp`, before the connect (review finding on PR #13). There is no network listener for the client API in this ADR. Remote clients, a phone included, come later with capability tokens (C4): a token names what its holder may do to which job, and the local socket stays the owner's alone.
 
 Some fields name the node's own machine, not a job, and are safe only because whoever reaches the socket is the node's owner:
 
