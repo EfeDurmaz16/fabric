@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use fabric_client::api::{Answer, Event, Request};
+use fabric_client::api::{Answer, ClientEnv, Event, Request};
 use fabric_core::id::{JobId, NodeId};
 use fabric_net::endpoint::{DialOrder, Endpoint};
 use fabric_net::identity::NodeIdentity;
@@ -55,7 +55,8 @@ pub struct NodeConfig {
     /// Which wires a dial tries.
     pub dial: DialOrder,
     /// The environment the daemon was started with, for work no client
-    /// asked for and for a request that sends none.
+    /// asked for and for a request that sends none, until a local client
+    /// sends one.
     pub env: ToolEnv,
 }
 
@@ -74,6 +75,7 @@ pub struct Node {
     control: Mutex<Option<UnixListener>>,
     pub(crate) recovered: tokio::sync::watch::Sender<bool>,
     pub(crate) catching_up: Mutex<BTreeSet<NodeId>>,
+    client_env: Mutex<Option<ClientEnv>>,
     _lock: File,
 }
 
@@ -132,6 +134,10 @@ impl Node {
         let control = UnixListener::bind(&socket).map_err(|e| NodeError::io(&socket, e))?;
 
         let version = VersionText::new(env!("CARGO_PKG_VERSION"))?;
+        let client_env = crate::local::read(&cfg.state.client_env()).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "the environment a client last sent does not read; the node uses its own until a client sends one");
+            None
+        });
         let node = Arc::new(Self {
             id: identity.node_id(),
             cfg,
@@ -146,6 +152,7 @@ impl Node {
             control: Mutex::new(Some(control)),
             recovered: tokio::sync::watch::Sender::new(false),
             catching_up: Mutex::new(BTreeSet::new()),
+            client_env: Mutex::new(client_env),
             _lock: lock_file,
         });
         tracing::info!(node = %node.id, addr = ?node.local_addr().ok(), "node started");
@@ -309,6 +316,34 @@ impl Node {
             .get(&id)
             .cloned()
             .ok_or(NodeError::UnknownJob(id))
+    }
+
+    /// The node's environment, for work no client asked for, such as a
+    /// peer's pull or a peer's preflight, and for a request that sends
+    /// none: the one the last local client sent, kept across restarts, or
+    /// the daemon's own until a client sends one (ADR 0018, The client's
+    /// environment). The daemon's own is rarely the user's shell: measured
+    /// with it, a peer and this node's CLI compared the shell's
+    /// `CARGO_HOME` with the daemon's and rebuilt what they could carry
+    /// (review finding on PR #13).
+    pub(crate) fn node_env(&self) -> ToolEnv {
+        lock(&self.client_env)
+            .as_ref()
+            .map_or_else(|| self.cfg.env.clone(), ToolEnv::from)
+    }
+
+    /// Keeps `env`, which a local client sent, as the node's environment,
+    /// on disk too when it changed. A failure to write it is logged: the
+    /// request still runs in its own environment.
+    pub(crate) fn remember_env(&self, env: &ClientEnv) {
+        let mut kept = lock(&self.client_env);
+        if kept.as_ref() == Some(env) {
+            return;
+        }
+        if let Err(e) = crate::local::write(&self.cfg.state.client_env(), env) {
+            tracing::warn!(error = %e, "could not keep the environment a client sent");
+        }
+        *kept = Some(env.clone());
     }
 
     /// The adapters' environment for a request made in `env`.

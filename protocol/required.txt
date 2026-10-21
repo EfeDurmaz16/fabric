@@ -912,6 +912,9 @@ request/job_resume_minimal.json /job
 request/job_resume_minimal.json /op
 request/job_run.json /job
 request/job_run.json /op
+request/job_run_with_env.json /env/path
+request/job_run_with_env.json /job
+request/job_run_with_env.json /op
 request/job_status.json /job
 request/job_status.json /op
 request/job_steal.json /force

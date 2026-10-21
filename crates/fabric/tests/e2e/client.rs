@@ -20,7 +20,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::world::{Env, Fallible, Node, Wire, finish, text};
+use crate::world::{Env, Fallible, Node, Wire, finish, pair, text};
 
 /// A started node, and a client of it.
 fn started(env: &std::sync::Arc<Env>) -> Fallible<(Node, Client)> {
@@ -259,6 +259,57 @@ async fn e2e_a_record_that_does_not_read_leaves_the_rest_of_the_status() {
     let read = client.job_status(job, |_| {}).await.unwrap();
     assert!(matches!(read.view, View::Unreadable { .. }));
     assert_eq!(read.goal, "make the greeting louder");
+}
+
+/// Review finding on PR #13: a node measured for its peers, a peer's
+/// preflight and the capture a peer's pull asks for, in the environment
+/// the daemon started with, while it measured for its own CLI in the
+/// CLI's. With `CARGO_HOME` set in the shell and not for the daemons,
+/// `doctor --peer` and a pull compared the shell's value with the daemon's
+/// and rebuilt `target/` where they carried it before. A node now keeps the
+/// environment its last local client sent, across a restart, and measures
+/// for its peers with it.
+#[test]
+fn e2e_a_node_measures_for_its_peers_in_the_environment_its_cli_sent() {
+    let env = Env::new().unwrap();
+    let mut a = Node::new(&env, "a", Wire::Quic).unwrap();
+    let mut b = Node::new(&env, "b", Wire::Quic).unwrap();
+    a.start(None).unwrap();
+    b.start(None).unwrap();
+    pair(&a, &b).unwrap();
+    let cargo = env.root.join("shell-cargo");
+    let shell = [("CARGO_HOME", cargo.as_path())];
+    let peer = b.id.clone();
+    let compared = |a: &Node| {
+        let doctor = a.spawn_with(&["doctor", "--peer", &peer], &shell).unwrap();
+        let output = finish(doctor, Duration::from_mins(1)).unwrap();
+        let printed = text(&output);
+        assert!(output.status.success(), "{printed}");
+        printed
+            .lines()
+            .find(|line| line.contains("cargo.home"))
+            .unwrap_or_else(|| panic!("no cargo.home row in:\n{printed}"))
+            .to_owned()
+    };
+    // Until a client of b sends an environment, b measures in its own.
+    let row = compared(&a);
+    assert!(row.starts_with("rebuild"), "{row}");
+
+    let local = b.spawn_with(&["doctor"], &shell).unwrap();
+    assert!(
+        finish(local, Duration::from_mins(1))
+            .unwrap()
+            .status
+            .success()
+    );
+    let row = compared(&a);
+    assert!(row.starts_with("ok"), "{row}");
+    assert!(row.contains(cargo.to_str().unwrap()), "{row}");
+
+    b.kill().unwrap();
+    b.start(None).unwrap();
+    let row = compared(&a);
+    assert!(row.starts_with("ok"), "{row}");
 }
 
 /// Review finding on PR #13: `fabric serve` exited at start when its own

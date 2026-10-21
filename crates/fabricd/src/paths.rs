@@ -114,6 +114,13 @@ impl StateDir {
         self.root.join("daemon.lock")
     }
 
+    /// The environment the last local client sent, which the node uses
+    /// for work no client asks for (ADR 0018, The client's environment).
+    #[must_use]
+    pub fn client_env(&self) -> PathBuf {
+        self.root.join("client-env")
+    }
+
     /// The optional harness configuration file.
     #[must_use]
     pub fn harness_config(&self) -> PathBuf {

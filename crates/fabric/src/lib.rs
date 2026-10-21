@@ -490,32 +490,25 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
             repo,
             goal,
             harness,
-        } => {
-            let canonical = std::fs::canonicalize(&repo)
-                .with_context(|| format!("repository {}", repo.display()))?;
-            let repo = canonical
-                .to_str()
-                .and_then(|text| SystemPath::parse(text).ok())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "repository {} is not a UTF-8 path, which the client API cannot carry",
-                        canonical.display()
-                    )
-                })?;
-            (
-                Request::JobNew {
-                    repo,
-                    goal,
-                    harness,
-                },
-                Mode::Interactive(None),
-            )
-        }
+        } => (
+            Request::JobNew {
+                repo: repository(&repo)?,
+                goal,
+                harness,
+            },
+            Mode::Interactive(None),
+        ),
         JobCommand::Run {
             job,
             prompt,
             headless,
-        } => (Request::JobRun { job }, Mode::new(prompt, headless)?),
+        } => (
+            Request::JobRun {
+                job,
+                env: Some(ClientEnv::current()?),
+            },
+            Mode::new(prompt, headless)?,
+        ),
         JobCommand::Suspend { job } => (
             Request::JobSuspend {
                 job,
@@ -579,6 +572,21 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
         return Ok(ExitCode::SUCCESS);
     };
     launch(state, home, &client, &plan, mode).await
+}
+
+/// The repository `fabric job new` names, as the absolute path the client API carries.
+fn repository(repo: &Path) -> Result<SystemPath> {
+    let canonical =
+        std::fs::canonicalize(repo).with_context(|| format!("repository {}", repo.display()))?;
+    canonical
+        .to_str()
+        .and_then(|text| SystemPath::parse(text).ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "repository {} is not a UTF-8 path, which the client API cannot carry",
+                canonical.display()
+            )
+        })
 }
 
 /// How the harness runs: attached to this terminal, or for one turn without one.

@@ -89,6 +89,9 @@ impl Node {
         out: &mut Out,
     ) -> Result<Reply, NodeError> {
         self.wait_for_recovery(&request, out).await;
+        if let Some(env) = request.env() {
+            self.remember_env(env);
+        }
         Ok(match request {
             Request::NodeId => Reply::NodeId(NodeIdentity {
                 node: self.id,
@@ -107,7 +110,7 @@ impl Node {
             Request::JobList => Reply::JobList(self.job_list().await),
             Request::JobStatus { job } => Reply::JobStatus(Box::new(self.job_status(job).await?)),
             Request::JobLog { job } => Reply::JobLog(self.job_log(job).await?),
-            Request::JobRun { job } => {
+            Request::JobRun { job, env: _ } => {
                 self.resolve_departing(job, out).await?;
                 self.check_peers(job, out).await;
                 Reply::JobRun(self.job_run(job, out).await?)
@@ -211,7 +214,7 @@ impl Node {
     /// The environment a client sent, or the one the node started with
     /// (ADR 0018, The client's environment).
     fn client_env(&self, env: Option<&ClientEnv>) -> ToolEnv {
-        env.map_or_else(|| self.cfg.env.clone(), ToolEnv::from)
+        env.map_or_else(|| self.node_env(), ToolEnv::from)
     }
 
     /// Who owns `id` now, at which epoch.
@@ -284,7 +287,7 @@ impl Node {
         refuse_secret_kind(&harness)?;
         let id = clock::job_id();
         let root = paths::job_root(&self.cfg.home, id);
-        let synced = synced_folders(&self.cfg.home, &self.cfg.env).await;
+        let synced = synced_folders(&self.cfg.home, &self.node_env()).await;
         check_root(&root, &self.cfg.home, synced)?;
         let parent = root
             .parent()
@@ -3019,6 +3022,69 @@ pub(crate) mod tests {
         };
         assert!(
             fabric_client::frame::encode(&answer).unwrap().len() <= fabric_client::frame::MAX_FRAME
+        );
+    }
+
+    /// Review finding on PR #13: the capture a peer's pull asks for
+    /// measured carry keys in the daemon's environment, while the puller
+    /// restores in its CLI's, so with `CARGO_HOME` set in the shell and not
+    /// for the daemon a pull rebuilt `target/` where the base carried it.
+    /// The holder now captures in the environment its last local client
+    /// sent: here a `rustc` and a `CARGO_HOME` only that environment names.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_capture_for_a_peers_pull_measures_in_the_environment_a_client_sent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use fabric_client::api::{PathDir, Roots, SystemPath};
+        use fabric_core::path::AbsPath;
+        use fabric_core::snapshot::CarryKey;
+
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let root = paths::job_root(&a.cfg.home, id);
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir(root.join("target")).unwrap();
+        std::fs::write(root.join("target").join("built"), "bytes\n").unwrap();
+        let bin = dir_a.path().join("shell-bin");
+        std::fs::create_dir(&bin).unwrap();
+        let rustc = bin.join("rustc");
+        std::fs::write(&rustc, "#!/bin/sh\necho rustc 1.0.0-shell\n").unwrap();
+        std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        a.remember_env(&ClientEnv {
+            path: vec![
+                PathDir::parse(bin.to_str().unwrap()).unwrap(),
+                PathDir::parse("/usr/bin").unwrap(),
+                PathDir::parse("/bin").unwrap(),
+            ],
+            roots: Roots {
+                cargo_home: Some(SystemPath::parse("/shell/cargo").unwrap()),
+                ..Roots::default()
+            },
+        });
+
+        b.pull(id, a.id, &mut Out::default()).await.unwrap();
+        let snapshot = b.job(id).await.unwrap().lock().await.latest().unwrap();
+        let manifest = with_store(&b.store, move |store| Ok(store.manifest(snapshot)?))
+            .await
+            .unwrap();
+        let target = manifest
+            .caches
+            .iter()
+            .find(|cache| cache.path.as_str() == "target")
+            .unwrap();
+        assert_eq!(
+            target.key,
+            CarryKey::Rust {
+                rustc_vv: "rustc 1.0.0-shell".to_owned(),
+                cargo_home: AbsPath::parse("/shell/cargo").unwrap(),
+            }
         );
     }
 

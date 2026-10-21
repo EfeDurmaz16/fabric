@@ -613,7 +613,7 @@ export const Request = z.discriminatedUnion("op", [
   z.object({ op: z.literal("job_list") }),
   z.object({ op: z.literal("job_status"), job: JobId }),
   z.object({ op: z.literal("job_log"), job: JobId }),
-  z.object({ op: z.literal("job_run"), job: JobId }),
+  z.object({ op: z.literal("job_run"), job: JobId, env }),
   z.object({
     op: z.literal("job_resume"),
     job: JobId,

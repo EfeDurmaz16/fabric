@@ -278,13 +278,16 @@ describe.skipIf(BIN === "")("against a real fabric daemon", () => {
   });
 
   // The node measures in the environment the client sends, not its own (review finding on PR #8).
-  test("doctor measures with the client's roots, and with the node's own without them", async () => {
+  // Without one it measures in the last one a client sent, or its own until a client sends one, as
+  // it does for a peer (review finding on PR #13). No earlier test sends an environment.
+  test("doctor measures with the client's roots, and without them with the last a client sent", async () => {
     const { client, home } = the();
     const cargoHome = (report: DoctorReport): string | undefined =>
       report.kind === "facts" ? report.facts.find((fact) => fact.name === "cargo.home")?.value : undefined;
     const env = ClientEnv.parse({ path: daemonPath().split(delimiter), roots: { cargo_home: "/x/cargo" } });
-    expect(cargoHome(await client.doctor({ env }))).toBe("/x/cargo");
     expect(cargoHome(await client.doctor())).toBe(join(home, ".cargo"));
+    expect(cargoHome(await client.doctor({ env }))).toBe("/x/cargo");
+    expect(cargoHome(await client.doctor())).toBe("/x/cargo");
   });
 
   test("a hello of another api version is answered incompatible", async () => {

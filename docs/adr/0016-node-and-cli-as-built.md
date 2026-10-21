@@ -21,6 +21,7 @@ The core, the store, the network layer, the harness adapters and the environment
 ```text
 <state>/
   daemon.lock   node.key   peers   harness.toml (optional)   fabric.sock
+  client-env    the environment the last local client sent, once one has (ADR 0018)
   store/        the store of ADR 0014
   locks/        one tree lock per workspace root, so one installer runs per tree (ADR 0007)
   jobs/<job-id>/

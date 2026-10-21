@@ -202,9 +202,14 @@ export class FabricClient {
     return this.call({ op: "job_log", job }, options);
   }
 
-  /** Checks the job may run on the node and returns what to launch. */
-  jobRun(job: JobId, options?: CallOptions): Promise<RunPlan> {
-    return this.call({ op: "job_run", job }, options);
+  /**
+   * Checks the job may run on the node and returns what to launch. `env`
+   * is the environment the caller launches the harness in, such as
+   * `clientEnvFromProcess()`; the node keeps it for work no client asks
+   * for, such as a peer's pull of the job.
+   */
+  jobRun(job: JobId, options: CallOptions & { readonly env?: ClientEnv } = {}): Promise<RunPlan> {
+    return this.call({ op: "job_run", job, env: options.env }, options);
   }
 
   /** Pulls the job if another node owns it, restores it, and returns what to launch. */

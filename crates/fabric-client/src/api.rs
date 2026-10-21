@@ -285,6 +285,12 @@ pub enum Request {
         /// The job.
         #[serde(with = "text")]
         job: JobId,
+        /// The environment the caller launches the harness in. The node
+        /// measures nothing for this request; it keeps the environment, as
+        /// it keeps every one a local client sends, for work no client asks
+        /// for, such as a peer's pull of the job.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<ClientEnv>,
     },
     /// Pulls the job if another node owns it, restores it if needed, and answers what to launch.
     JobResume {
@@ -426,12 +432,35 @@ impl Request {
     /// (review findings on PR #13).
     #[must_use]
     pub fn needs(&self) -> Vec<&'static str> {
+        if self.env().is_some() {
+            Roots::capabilities().to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The caller's environment, when the request carries one.
+    #[must_use]
+    pub fn env(&self) -> Option<&ClientEnv> {
         match self {
-            Request::JobResume { env: Some(_), .. }
-            | Request::JobSuspend { env: Some(_), .. }
-            | Request::JobMove { env: Some(_), .. }
-            | Request::Doctor { env: Some(_), .. } => Roots::capabilities().to_vec(),
-            _ => Vec::new(),
+            Request::JobRun { env, .. }
+            | Request::JobResume { env, .. }
+            | Request::JobSuspend { env, .. }
+            | Request::JobMove { env, .. }
+            | Request::Doctor { env, .. } => env.as_ref(),
+            Request::NodeId
+            | Request::NodeAdd { .. }
+            | Request::NodeList
+            | Request::NodePing { .. }
+            | Request::JobNew { .. }
+            | Request::JobList
+            | Request::JobStatus { .. }
+            | Request::JobLog { .. }
+            | Request::JobSteal { .. }
+            | Request::JobDecide { .. }
+            | Request::HarnessStarted { .. }
+            | Request::HarnessSession { .. }
+            | Request::HarnessExited { .. } => None,
         }
     }
 

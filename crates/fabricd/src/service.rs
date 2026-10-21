@@ -149,7 +149,7 @@ impl Service for Node {
 
     fn facts(&self, _peer: NodeId) -> BoxFuture<'_, Result<Facts, Fault>> {
         Box::pin(async move {
-            Ok(NodeFacts::measure(&self.cfg.home, &self.cfg.env)
+            Ok(NodeFacts::measure(&self.cfg.home, &self.node_env())
                 .await
                 .to_wire())
         })
@@ -383,7 +383,7 @@ impl Node {
             }
         }
         let mut out = Out::default();
-        let env = self.cfg.env.clone();
+        let env = self.node_env();
         self.suspend_locked(&mut job, &env, &mut out)
             .await
             .map_err(|e| internal(&e))?;

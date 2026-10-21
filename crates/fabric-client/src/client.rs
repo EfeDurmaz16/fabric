@@ -310,13 +310,16 @@ impl Client {
         }
     }
 
-    /// Checks the job may run on the node and returns what to launch.
+    /// Checks the job may run on the node and returns what to launch;
+    /// `env` is the environment the caller launches the harness in, which
+    /// the node keeps for work no client asks for.
     pub async fn job_run(
         &self,
         job: JobId,
+        env: Option<ClientEnv>,
         on_event: impl FnMut(Event),
     ) -> Result<RunPlan, ClientError> {
-        match self.call(&Request::JobRun { job }, on_event).await? {
+        match self.call(&Request::JobRun { job, env }, on_event).await? {
             Reply::JobRun(plan) => Ok(plan),
             other => Err(unexpected(Op::JobRun, &other)),
         }
