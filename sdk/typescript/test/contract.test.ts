@@ -177,10 +177,22 @@ describe("the shared fixtures", () => {
     }
   });
 
-  test("the welcome fixture lists every op, in order, then every root", () => {
-    const welcome = roundTrip("hello_answer", HelloAnswer).find((answer) => answer.type === "welcome");
-    expect(welcome?.type).toBe("welcome");
-    expect(welcome?.type === "welcome" ? welcome.capabilities : []).toStrictEqual([...OPS, ...ROOT_CAPABILITIES]);
+  // A new op or root is additive and a fixture on the base never changes
+  // within an api version, so the new list gets a welcome fixture of its
+  // own: one lists all of it, every other part of it in the same order.
+  test("the welcome fixtures list every op, in order, then every root", () => {
+    const names: string[] = [...OPS, ...ROOT_CAPABILITIES];
+    const welcomes = roundTrip("hello_answer", HelloAnswer).flatMap((answer) =>
+      answer.type === "welcome" ? [answer.capabilities] : [],
+    );
+    for (const listed of welcomes) {
+      let next = 0;
+      for (const name of listed) {
+        next = names.indexOf(name, next) + 1;
+        expect(next, `${name} in ${JSON.stringify(listed)}`).toBeGreaterThan(0);
+      }
+    }
+    expect(welcomes).toContainEqual(names);
   });
 
   test("every op has a request and a reply fixture tagged with its name", () => {

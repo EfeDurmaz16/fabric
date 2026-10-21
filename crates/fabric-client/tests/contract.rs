@@ -89,23 +89,37 @@ fn the_hello_fixture_pins_the_api_version() {
 }
 
 /// The welcome a node sends lists every op of the api version, in order,
-/// then every root it applies.
+/// then every root it applies. A new op or root is additive (ADR 0018,
+/// rule 2), and a fixture already on the base never changes within an api
+/// version, so the new list gets a welcome fixture of its own: one welcome
+/// fixture lists all of it, and every other lists part of it in the same
+/// order, as a node of an earlier release of the api did.
 #[test]
-fn the_welcome_fixture_lists_every_op_and_every_root() {
-    let welcome = round_trip::<HelloAnswer>("hello_answer")
-        .unwrap()
-        .into_iter()
-        .find_map(|answer| match answer {
-            HelloAnswer::Welcome(welcome) => Some(welcome),
-            HelloAnswer::Incompatible { .. } => None,
-        })
-        .unwrap();
+fn the_welcome_fixtures_list_every_op_and_every_root() {
     let names: Vec<&str> = Op::ALL
         .iter()
         .map(|op| op.name())
         .chain(Roots::capabilities())
         .collect();
-    assert_eq!(welcome.capabilities, names);
+    let welcomes: Vec<Vec<String>> = round_trip::<HelloAnswer>("hello_answer")
+        .unwrap()
+        .into_iter()
+        .filter_map(|answer| match answer {
+            HelloAnswer::Welcome(welcome) => Some(welcome.capabilities),
+            HelloAnswer::Incompatible { .. } => None,
+        })
+        .collect();
+    for listed in &welcomes {
+        let mut rest = names.iter();
+        assert!(
+            listed.iter().all(|name| rest.any(|known| known == name)),
+            "a welcome fixture lists {listed:?}, which is not part of {names:?} in its order"
+        );
+    }
+    assert!(
+        welcomes.iter().any(|listed| *listed == names),
+        "no welcome fixture lists {names:?}"
+    );
 }
 
 #[test]
