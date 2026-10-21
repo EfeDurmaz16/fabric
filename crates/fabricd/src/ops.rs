@@ -281,6 +281,15 @@ impl Node {
         // The workspace holds what the agent writes, ignored secrets
         // included; its job directory is this user's alone.
         crate::durable::create_private_dir(parent).map_err(|e| NodeError::io(parent, e))?;
+        // From here on, a failure leaves no job and no printed id that
+        // names the directory, so it goes; its id is fresh, so nothing
+        // else is in it.
+        let discard = |e: NodeError| {
+            if let Err(left) = std::fs::remove_dir_all(parent) {
+                tracing::warn!(path = %parent.display(), error = %left, "a failed job new left its directory");
+            }
+            e
+        };
         let cloned = tokio::process::Command::new("git")
             .args(["clone", "--quiet", "--"])
             .arg(repo)
@@ -288,12 +297,12 @@ impl Node {
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .await
-            .map_err(|e| NodeError::io(repo, e))?;
+            .map_err(|e| discard(NodeError::io(repo, e)))?;
         if !cloned.status.success() {
-            return Err(NodeError::io(
+            return Err(discard(NodeError::io(
                 repo,
                 std::io::Error::other(String::from_utf8_lossy(&cloned.stderr).trim().to_owned()),
-            ));
+            )));
         }
         let job = Job::create_owned(
             id,
@@ -304,7 +313,8 @@ impl Node {
                 state: MarkerState::Live,
                 epoch: Epoch::FIRST,
             },
-        )?;
+        )
+        .map_err(discard)?;
         self.jobs
             .lock()
             .await
@@ -4049,5 +4059,36 @@ pub(crate) mod tests {
                 out.lines
             );
         }
+    }
+
+    /// A clone can fail after it made the workspace, as when its checkout
+    /// cannot read a file. No job and no printed id then name the workspace,
+    /// so `job new` must take it away with the job directory it made.
+    #[tokio::test]
+    async fn a_clone_that_fails_leaves_no_job_directory() {
+        let (dir, node) = node();
+        let repo = repo(dir.path());
+        let blob = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "HEAD:README.md"])
+            .output()
+            .unwrap();
+        let blob = String::from_utf8(blob.stdout).unwrap();
+        let blob = blob.trim();
+        std::fs::remove_file(repo.join(".git/objects").join(&blob[..2]).join(&blob[2..])).unwrap();
+        let refused = node
+            .job_new(
+                &repo,
+                "goal".to_owned(),
+                HarnessKind::Codex,
+                &mut Out::default(),
+            )
+            .await;
+        assert!(matches!(refused, Err(NodeError::Io { .. })), "{refused:?}");
+        let jobs = node.cfg.home.join("fabric").join("jobs");
+        let left: Vec<PathBuf> = std::fs::read_dir(&jobs)
+            .map(|dir| dir.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "the failed clone stayed behind: {left:?}");
     }
 }
