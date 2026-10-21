@@ -165,8 +165,7 @@ impl Node {
                 env,
             } => {
                 let env = self.client_env(env.as_ref());
-                self.job_move(job, to, force, &env, out).await?;
-                Reply::JobMove(self.lease(job).await?)
+                Reply::JobMove(self.job_move(job, to, force, &env, out).await?)
             }
             Request::JobSteal { job, reason, force } => {
                 Reply::JobSteal(self.job_steal(job, reason, force, out).await?)
@@ -217,14 +216,11 @@ impl Node {
     }
 
     /// Who owns `id` now, at which epoch.
+    #[cfg(test)]
     async fn lease(&self, id: JobId) -> Result<Lease, NodeError> {
         let job = self.job(id).await?;
         let job = job.lock().await;
-        let lease = job.ledger().lease();
-        Ok(Lease {
-            owner: lease.holder(),
-            epoch: lease.epoch(),
-        })
+        Ok(lease_of(&job))
     }
 
     async fn node_add(&self, node: NodeId, addr: Option<&str>) -> Result<Paired, NodeError> {
@@ -1013,6 +1009,11 @@ impl Node {
     }
 
     /// The push form of the move (ADR 0003): suspend, push, `MoveStarted`, offer, decision.
+    /// Moves `id` to `to` and returns the lease the move's decision made.
+    ///
+    /// The lease is read under the lock that applies the decision, or that
+    /// finds it applied: another steal or move may change it once the lock
+    /// is released.
     async fn job_move(
         self: &Arc<Self>,
         id: JobId,
@@ -1020,7 +1021,7 @@ impl Node {
         force: bool,
         env: &ToolEnv,
         out: &mut Out,
-    ) -> Result<(), NodeError> {
+    ) -> Result<Lease, NodeError> {
         if to == self.id {
             return Err(NodeError::ledger_fact(
                 LedgerError::MoveToSelf,
@@ -1055,7 +1056,7 @@ impl Node {
             // decision arrived while resolving, and the move is done.
             LeaseView::Departed { owner, epoch } if owner == to => {
                 out.emit(Event::AlreadyMoved { owner, epoch });
-                return Ok(());
+                return Ok(Lease { owner, epoch });
             }
             LeaseView::Departed { owner, epoch } => {
                 return Err(NodeError::Departed {
@@ -1176,7 +1177,7 @@ impl Node {
         to: NodeId,
         offer: MoveOffer,
         out: &mut Out,
-    ) -> Result<(), NodeError> {
+    ) -> Result<Lease, NodeError> {
         let epoch = {
             let job = self.job(id).await?;
             let job = job.lock().await;
@@ -1209,11 +1210,11 @@ impl Node {
                     | Asked::Status(Fenced::Answer(MoveState::Decided { record })),
                 ) => {
                     let twice = faults::hit(Point::AfterImportReceipt).await == Some(Action::Dup);
-                    self.apply_decision(id, to, record.as_bytes(), out).await?;
+                    let lease = self.apply_decision(id, to, record.as_bytes(), out).await?;
                     if twice {
-                        self.apply_decision(id, to, record.as_bytes(), out).await?;
+                        return self.apply_decision(id, to, record.as_bytes(), out).await;
                     }
-                    return Ok(());
+                    return Ok(lease);
                 }
                 Ok(Asked::Status(Fenced::Answer(MoveState::Undecided { .. }))) => {
                     let answer = self
@@ -1223,8 +1224,7 @@ impl Node {
                         .await;
                     last_error = match answer {
                         Ok(Fenced::Answer(Offered::Decided { record })) => {
-                            self.apply_decision(id, to, record.as_bytes(), out).await?;
-                            return Ok(());
+                            return self.apply_decision(id, to, record.as_bytes(), out).await;
                         }
                         Ok(answer) => format!("{to} has not decided: {}", offered_words(&answer)),
                         Err(e) => format!("{to} has not decided: {e}"),
@@ -1274,13 +1274,15 @@ impl Node {
     }
 
     /// Appends the target's decision for an open move; a decision already held changes nothing.
+    ///
+    /// Returns the lease the decision left, read under the lock that applies it.
     async fn apply_decision(
         self: &Arc<Self>,
         id: JobId,
         from: NodeId,
         bytes: &[u8],
         out: &mut Out,
-    ) -> Result<(), NodeError> {
+    ) -> Result<Lease, NodeError> {
         let job = self.job(id).await?;
         let mut job = job.lock().await;
         let grew = job.accept(bytes, from, self.id)?;
@@ -1300,7 +1302,9 @@ impl Node {
                 }),
             }
         }
-        self.settle(&mut job, out).await
+        let lease = lease_of(&job);
+        self.settle(&mut job, out).await?;
+        Ok(lease)
     }
 
     /// Asks the target of this node's open move for its decision, and applies it.
@@ -1328,10 +1332,10 @@ impl Node {
             })
             .await;
         match answer {
-            Ok(Fenced::Answer(MoveState::Decided { record })) => {
-                self.apply_decision(id, target, record.as_bytes(), out)
-                    .await
-            }
+            Ok(Fenced::Answer(MoveState::Decided { record })) => self
+                .apply_decision(id, target, record.as_bytes(), out)
+                .await
+                .map(drop),
             Ok(_) => {
                 out.emit(Event::MoveUndecided { move_id, target });
                 Ok(())
@@ -2012,11 +2016,7 @@ impl Node {
             out.emit(Event::StealWarning { warning });
             job.commit(proposal.record, Author::Node(self.id))?;
             job.append(self.id, EventKind::Note { text: described })?;
-            let lease = job.ledger().lease();
-            let stolen = Lease {
-                owner: lease.holder(),
-                epoch: lease.epoch(),
-            };
+            let stolen = lease_of(&job);
             out.emit(Event::Stole {
                 job: id,
                 epoch: stolen.epoch,
@@ -2174,6 +2174,15 @@ fn answer_error(peer: NodeId, err: &fabric_net::rpc::RpcError) -> NodeError {
 
 /// The refusal of a steal `me` asked for and the ledger of `job` did not
 /// take, with the facts of the job that explain it.
+/// Who owns `job` now, at which epoch; the caller holds its lock.
+fn lease_of(job: &Job) -> Lease {
+    let lease = job.ledger().lease();
+    Lease {
+        owner: lease.holder(),
+        epoch: lease.epoch(),
+    }
+}
+
 fn steal_refused(job: &Job, me: NodeId, error: LedgerError) -> NodeError {
     let id = job.id();
     let fact = match (&error, job.view(me)) {
@@ -3477,6 +3486,81 @@ pub(crate) mod tests {
             "{:?}",
             out.events
         );
+    }
+
+    /// Review finding on PR #13: the reply to a move read the lease again
+    /// once the move returned, outside the lock that applied the target's
+    /// decision. The offer now returns the lease that decision made, B at
+    /// epoch 2, as its `imported` event says. The race itself needs an
+    /// operation queued on the job's lock while the decision is applied,
+    /// which no test here can order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_decided_move_returns_the_lease_its_decision_made() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let out = &mut Out::default();
+        a.suspend(id, &ToolEnv::current(), out).await.unwrap();
+        let offer = a.depart(id, b.id, out).await.unwrap().unwrap();
+        a.push_records(id, b.id).await.unwrap();
+
+        let moved = Lease {
+            owner: b.id,
+            epoch: Epoch::new(2).unwrap(),
+        };
+        assert_eq!(a.offer(id, b.id, offer, out).await.unwrap(), moved);
+        let imported = Event::Imported {
+            owner: b.id,
+            epoch: moved.epoch,
+        };
+        assert!(out.events.contains(&imported), "{:?}", out.events);
+    }
+
+    /// A move typed again after its answer was lost learns the decision and
+    /// replies with the lease it made, read with the view that found the
+    /// move done.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_typed_again_after_a_lost_answer_replies_with_its_lease() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let out = &mut Out::default();
+        a.suspend(id, &ToolEnv::current(), out).await.unwrap();
+        let offer = a.depart(id, b.id, out).await.unwrap().unwrap();
+        a.push_records(id, b.id).await.unwrap();
+        // B imports; its answer never reaches A's ledger.
+        let answer = a
+            .call(b.id, |session| async move {
+                session.offer(Epoch::FIRST, offer, MOVE_DEADLINE).await
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(answer, Fenced::Answer(Offered::Decided { .. })),
+            "{answer:?}"
+        );
+
+        let request = Request::JobMove {
+            job: id,
+            to: b.id,
+            force: false,
+            env: None,
+        };
+        let moved = Lease {
+            owner: b.id,
+            epoch: Epoch::new(2).unwrap(),
+        };
+        assert_eq!(
+            a.dispatch(request, out).await.unwrap(),
+            Reply::JobMove(moved)
+        );
+        let done = Event::AlreadyMoved {
+            owner: b.id,
+            epoch: moved.epoch,
+        };
+        assert!(out.events.contains(&done), "{:?}", out.events);
     }
 
     /// Review finding on PR #13: ACP arguments that hold a secret were
