@@ -296,10 +296,18 @@ async fn probe_command(
     }
 }
 
-/// The first executable named `program` on `path_var`.
+/// The first executable named `program` on `path_var`, always an absolute path.
+///
+/// A relative or empty entry is skipped, as the harness adapters skip it:
+/// it names a directory relative to the daemon's working directory, which
+/// is wherever `fabric serve` started, not one the client chose. A client
+/// with no `PATH` sends an empty list, whose `PATH` value is the empty
+/// string, which a shell reads as the working directory (review finding
+/// on PR #13).
 pub fn find_on_path(program: &str, path_var: &OsString) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     std::env::split_paths(path_var)
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(program))
         .find(|candidate| {
             std::fs::metadata(candidate)
@@ -472,6 +480,31 @@ mod tests {
     use fabric_client::api::{PathDir, Roots, SystemPath};
 
     use super::*;
+
+    /// A tool in a directory the client's `PATH` names only relatively is
+    /// not found, and an empty entry, which an empty client `PATH` gives,
+    /// goes through the same filter: the node would resolve either against
+    /// its own working directory (review finding on PR #13).
+    #[test]
+    fn find_on_path_skips_relative_and_empty_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("tool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The test runs from the crate directory; a relative entry that
+        // reaches the tool from there must not count.
+        let cwd = std::env::current_dir().unwrap();
+        let up: PathBuf = cwd.components().skip(1).map(|_| "..").collect();
+        let relative = up.join(dir.path().strip_prefix("/").unwrap());
+        assert!(
+            relative.join("tool").exists(),
+            "the relative entry reaches the tool"
+        );
+        let var = std::env::join_paths([relative.as_path(), Path::new("")]).unwrap();
+        assert_eq!(find_on_path("tool", &var), None);
+        let var = std::env::join_paths([relative.as_path(), dir.path()]).unwrap();
+        assert_eq!(find_on_path("tool", &var), Some(tool));
+    }
 
     /// Gate finding on PR #8: capture measured carry keys with the daemon's
     /// `CARGO_HOME`, not the requesting CLI's. A request's roots reach the
