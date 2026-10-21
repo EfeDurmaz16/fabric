@@ -63,7 +63,8 @@ const ULID = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/;
 const NODE_ID = /^fab1[a-z2-7]{51}[aq]$/;
 const HEX_32 = /^[0-9a-f]{64}$/;
 const SESSION_ID = /^(?![-.])[A-Za-z0-9._:-]{1,128}$/;
-const PROGRAM_NAME = /^(?!-)[^/\u0000]+$/;
+// No control character, C0, DEL or C1 (`\p{Cc}`, which holds NUL), as Rust's `char::is_control`.
+const PROGRAM_NAME = /^(?!-)[^/\p{Cc}]+$/u;
 
 export const JobId = z.string().regex(ULID, "not a ULID in its text form").brand<"JobId">();
 export type JobId = z.infer<typeof JobId>;
@@ -87,7 +88,7 @@ export type EnvSpecId = z.infer<typeof EnvSpecId>;
 export const SessionId = z.string().regex(SESSION_ID, "not a session id").brand<"SessionId">();
 export type SessionId = z.infer<typeof SessionId>;
 
-/** A program to look up on `PATH`: never a path, never an option. */
+/** A program to look up on `PATH`: never a path, never an option, never a control character. */
 export const ProgramName = z.string().regex(PROGRAM_NAME, "not a bare program name").brand<"ProgramName">();
 export type ProgramName = z.infer<typeof ProgramName>;
 
