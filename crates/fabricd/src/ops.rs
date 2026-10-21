@@ -2103,6 +2103,14 @@ fn plan(
     harness_config: &HarnessConfig,
     out: &mut Out,
 ) -> Result<RunPlan, NodeError> {
+    // The CLI resolves a link at the root and would run setup and the
+    // harness in whatever it names, so only a real directory is handed out.
+    if std::fs::symlink_metadata(&root).is_ok_and(|meta| !meta.is_dir()) {
+        return Err(NodeError::RootNotADirectory {
+            job: job.id(),
+            root,
+        });
+    }
     job.set_marker(&Marker {
         root: root.clone(),
         state: MarkerState::Live,
@@ -3480,6 +3488,34 @@ pub(crate) mod tests {
                 .iter()
                 .any(|r| matches!(r.event().kind, EventKind::MoveStarted { .. })),
             "MoveStarted was appended under an unchecked harness"
+        );
+    }
+
+    /// A clean workspace whose root was replaced with a link to another
+    /// directory is not missing, so a resume does not restore it. Neither
+    /// a run nor a resume may then hand out the root: the CLI resolves the
+    /// link and would run setup and the harness in the other directory.
+    #[tokio::test]
+    async fn a_root_replaced_with_a_link_is_never_launched_in() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let root = paths::job_root(&node.cfg.home, id);
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::rename(&root, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &root).unwrap();
+        let resumed = node
+            .job_resume(id, None, None, false, &path, &mut Out::default())
+            .await;
+        assert!(
+            matches!(&resumed, Err(NodeError::RootNotADirectory { root: r, .. }) if *r == root),
+            "{resumed:?}"
+        );
+        let ran = node.job_run(id, &mut Out::default()).await;
+        assert!(
+            matches!(&ran, Err(NodeError::RootNotADirectory { .. })),
+            "{ran:?}"
         );
     }
 }

@@ -172,6 +172,16 @@ pub enum NodeError {
         /// The epoch its marker was written at.
         epoch: Epoch,
     },
+    /// The workspace root is a link or a file, put there in place of the directory Fabric wrote.
+    #[error(
+        "job {job}: {root} is not a directory but a link or a file, so nothing runs there; move it aside, then run `fabric job resume {job}`, which restores the latest snapshot when the workspace was clean"
+    )]
+    RootNotADirectory {
+        /// The job.
+        job: JobId,
+        /// The root.
+        root: PathBuf,
+    },
     /// The job has no workspace on this node.
     #[error("job {0} has no workspace on this node; run `fabric job resume {0}`")]
     NoWorkspace(JobId),
@@ -343,6 +353,7 @@ impl NodeError {
             | NodeError::ChangedDuringMove { .. }
             | NodeError::WorkspaceOccupied { .. }
             | NodeError::NoWorkspace(_)
+            | NodeError::RootNotADirectory { .. }
             | NodeError::StaleWorkspace { .. }
             | NodeError::NoSnapshot(_)
             | NodeError::HarnessGone { .. } => Refusal::JobState,
