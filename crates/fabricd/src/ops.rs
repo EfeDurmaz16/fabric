@@ -284,12 +284,16 @@ impl Node {
             clock::now_ms(),
         )
         .map_err(fabric_core::ledger::LedgerError::from)?;
-        let job = Job::create(id, self.cfg.state.job(id), &created)?;
-        job.set_marker(&Marker {
-            root: root.clone(),
-            state: MarkerState::Live,
-            epoch: Epoch::FIRST,
-        })?;
+        let job = Job::create_owned(
+            id,
+            self.cfg.state.job(id),
+            &created,
+            &Marker {
+                root: root.clone(),
+                state: MarkerState::Live,
+                epoch: Epoch::FIRST,
+            },
+        )?;
         self.jobs
             .lock()
             .await
