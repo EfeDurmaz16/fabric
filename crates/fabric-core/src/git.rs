@@ -212,11 +212,18 @@ impl GitConfigValue {
         Ok(Self(text.to_owned()))
     }
 
-    /// Returns true when the value is a `scheme://` URL whose authority holds
-    /// a credential, by the rule of `credential_range`.
+    /// Returns true when the value is a `scheme://` URL that can carry a
+    /// credential: its authority holds one by the rule of `credential_range`,
+    /// or it has a query or a fragment, where a token such as
+    /// `?access_token=` travels. No part of a query is known to be safe, so
+    /// the whole value is treated as secret.
     #[must_use]
     pub fn has_credential(&self) -> bool {
         credential_range(&self.0).is_some()
+            || self
+                .0
+                .split_once("://")
+                .is_some_and(|(_, rest)| rest.contains(['?', '#']))
     }
 }
 
@@ -257,7 +264,7 @@ pub enum GitConfigKey {
     RemotePushUrl(RemoteName),
     /// `remote.<name>.fetch`.
     RemoteFetch(RemoteName),
-    /// `branch.<name>.remote`.
+    /// `branch.<name>.remote`; it may hold a URL, and a credential in one is stripped at capture and refused on decode.
     BranchRemote(BranchName),
     /// `branch.<name>.merge`.
     BranchMerge(BranchName),
@@ -274,12 +281,17 @@ pub enum GitConfigKey {
 }
 
 impl GitConfigKey {
-    /// Returns true for the keys whose value is a remote URL, which must carry no credential.
+    /// Returns true for the keys whose value is or may be a remote URL, which must carry no credential.
+    ///
+    /// `branch.<name>.remote` usually names a remote, but git also takes a
+    /// URL there as the repository to fetch from and push to.
     #[must_use]
     pub const fn is_remote_url(&self) -> bool {
         matches!(
             self,
-            GitConfigKey::RemoteUrl(_) | GitConfigKey::RemotePushUrl(_)
+            GitConfigKey::RemoteUrl(_)
+                | GitConfigKey::RemotePushUrl(_)
+                | GitConfigKey::BranchRemote(_)
         )
     }
 
@@ -457,7 +469,9 @@ mod tests {
         assert!(with("ssh://git:hunter2@github.com/x/y.git"));
         assert!(with("git+ssh://git:hunter2@github.com/x/y.git"));
         assert!(!with("https://github.com/x/y.git"));
-        assert!(!with("https://github.com/x/y.git?u=a@b"));
+        assert!(with("https://github.com/x/y.git?u=a@b"));
+        assert!(with("https://example.com/x.git?access_token=sekrit"));
+        assert!(with("https://example.com/x.git#sekrit"));
         assert!(!with("git@github.com:x/y.git"));
         assert!(!with("/srv/git/y.git"));
         assert!(
@@ -467,6 +481,11 @@ mod tests {
         );
         assert!(
             GitConfigKey::parse("remote.origin.pushurl")
+                .unwrap()
+                .is_remote_url()
+        );
+        assert!(
+            GitConfigKey::parse("branch.main.remote")
                 .unwrap()
                 .is_remote_url()
         );

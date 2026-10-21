@@ -53,6 +53,12 @@ pub enum ManifestError {
         /// Zero-based index of the entry, within its tree.
         index: usize,
     },
+    /// A path is both in `files` and in the working-tree commit, which restore writes first, so the second write would collide.
+    #[error("{path} is both in files and in the working-tree commit")]
+    InBothTrees {
+        /// The path.
+        path: RelPath,
+    },
     /// The git state mixes SHA-1 and SHA-256 object ids, which no one repository can hold.
     #[error("git state mixes SHA-1 and SHA-256 object ids")]
     MixedObjectFormat,
@@ -396,6 +402,19 @@ impl SnapshotManifest {
                 .any(|oid| oid.is_sha256() != sha256);
             if mixed {
                 return Err(ManifestError::MixedObjectFormat);
+            }
+            // Restore checks out W, whose paths `worktree_mtimes` lists, and
+            // then creates `files` exclusively; a shared path never restores.
+            for entry in &self.files {
+                if git
+                    .worktree_mtimes
+                    .binary_search_by(|(path, _)| path.cmp(&entry.rel_path))
+                    .is_ok()
+                {
+                    return Err(ManifestError::InBothTrees {
+                        path: entry.rel_path.clone(),
+                    });
+                }
             }
             // ADR 0004 strips credentials at capture; the receiving node holds
             // the same line, or a token in remote.origin.url would be written

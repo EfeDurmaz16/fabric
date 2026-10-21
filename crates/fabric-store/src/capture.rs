@@ -32,7 +32,7 @@ use fabric_core::snapshot::{
 
 use crate::durable::TempFile;
 use crate::git::{Git, GitError};
-use crate::objects::{ObjectError, StoredFile, open_regular};
+use crate::objects::{ObjectError, StoredFile};
 use crate::policy::{Class, IgnorePolicy, Markers};
 use crate::store::{Store, StoreError};
 
@@ -91,6 +91,27 @@ pub enum BundleKind {
     Incremental,
     /// The parent's refs already reached every object; nothing to carry.
     Empty,
+}
+
+/// An index entry flag that commits `I` and `W` cannot record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexFlag {
+    /// `git add -N`: `write-tree` leaves the entry out, so restore would make the file plain untracked.
+    IntentToAdd,
+    /// Skip-worktree, which sparse checkout sets: `add -A` leaves the path alone, so `W` would hold a file the work tree does not.
+    SkipWorktree,
+    /// `git update-index --assume-unchanged`: `add -A` skips the file, so `W` would hold the index's copy, not the bytes on disk.
+    AssumeUnchanged,
+}
+
+impl std::fmt::Display for IndexFlag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            IndexFlag::IntentToAdd => "intent-to-add (git add -N)",
+            IndexFlag::SkipWorktree => "skip-worktree (sparse checkout)",
+            IndexFlag::AssumeUnchanged => "assume-unchanged",
+        })
+    }
 }
 
 /// Why a repository cannot be captured right now.
@@ -183,7 +204,7 @@ pub struct CaptureReport {
     pub stripped_userinfo: Vec<GitConfigKey>,
     /// Repeated config keys where only the last value travels.
     pub repeated_config: Vec<GitConfigKey>,
-    /// Allowlisted config keys left behind because their value starts with `-` or holds a newline.
+    /// Allowlisted config keys left behind because `GitConfigValue` refuses the value, or because it is a remote URL with a query or fragment, where a token can travel.
     pub dropped_config: Vec<GitConfigKey>,
     /// The bundle shape; none when the root is not a repository.
     pub bundle: Option<BundleKind>,
@@ -234,6 +255,12 @@ pub enum CaptureError {
         #[source]
         source: PathError,
     },
+    /// A path's mtime is before 1970, which a manifest cannot hold; touch it.
+    #[error("{path}: the mtime is before 1970")]
+    MtimeBeforeEpoch {
+        /// The path.
+        path: RelPath,
+    },
     /// A file name or a symlink target is not UTF-8, which a manifest cannot hold; rename or relink it.
     #[error("{path:?}: the name or the link target is not UTF-8")]
     NotUtf8 {
@@ -267,6 +294,17 @@ pub enum CaptureError {
     GitSubmoduleDirty {
         /// The submodule path.
         path: RelPath,
+    },
+    /// The repository is a shallow clone; the bundle cannot carry the boundary `.git/shallow` records.
+    #[error("the repository is a shallow clone; run git fetch --unshallow and capture again")]
+    GitShallow,
+    /// An index entry carries a flag the snapshot cannot reproduce; clear it and capture again.
+    #[error("{path} is marked {flag} in the index, which a snapshot cannot carry")]
+    GitIndexFlag {
+        /// The path of the entry.
+        path: RelPath,
+        /// The flag.
+        flag: IndexFlag,
     },
     /// A path has the LFS filter; the working-tree commit would hold pointers.
     #[error("{path} has filter=lfs, which capture does not support")]
@@ -331,21 +369,89 @@ fn rel_path(text: &str) -> Result<RelPath, CaptureError> {
     })
 }
 
-/// Reads a symlink's target, refusing one that is not UTF-8 instead of rewriting it.
-fn utf8_link(full: &Path, rel: &RelPath) -> Result<String, CaptureError> {
-    fs::read_link(full)
-        .map_err(|e| io_err(full, e))?
-        .into_os_string()
-        .into_string()
-        .map_err(|_| CaptureError::NotUtf8 {
-            path: rel.as_str().to_owned(),
-        })
+/// Opens the directory that holds `rel` under `base` and returns it with the last name of `rel`.
+///
+/// `base` itself may be a link, as a harness state directory often is; no
+/// component below it is followed. A component that is a link or not a
+/// directory any more gives `None`: the tree changed after it was listed,
+/// and a path-based open would have read through the link.
+fn parent_below<'a>(
+    base: &Path,
+    rel: &'a RelPath,
+) -> io::Result<Option<(rustix::fd::OwnedFd, &'a str)>> {
+    use rustix::fs::{Mode as RawBits, OFlags};
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let mut dir = rustix::fs::open(base, flags, RawBits::empty())?;
+    let mut parts: Vec<&str> = rel.as_str().split('/').collect();
+    let name = parts.pop().unwrap_or_default();
+    for part in parts {
+        dir = match rustix::fs::openat(&dir, part, flags | OFlags::NOFOLLOW, RawBits::empty()) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+    }
+    Ok(Some((dir, name)))
 }
 
-fn mtime_ns(meta: &fs::Metadata) -> u64 {
-    let secs = u64::try_from(meta.mtime()).unwrap_or(0);
-    let nanos = u64::try_from(meta.mtime_nsec()).unwrap_or(0);
-    secs.saturating_mul(1_000_000_000).saturating_add(nanos)
+/// Reads the target of the link at `rel` under `base`, refusing one that is not UTF-8 instead of rewriting it.
+fn utf8_link(base: &Path, rel: &RelPath) -> Result<String, CaptureError> {
+    let full = base.join(rel.as_str());
+    let changed = || CaptureError::WorkspaceChanged { path: rel.clone() };
+    let Some((dir, name)) = parent_below(base, rel).map_err(|e| io_err(&full, e))? else {
+        return Err(changed());
+    };
+    let target = match rustix::fs::readlinkat(&dir, name, Vec::new()) {
+        Ok(target) => target,
+        Err(rustix::io::Errno::NOENT | rustix::io::Errno::INVAL) => return Err(changed()),
+        Err(e) => return Err(io_err(&full, e.into())),
+    };
+    String::from_utf8(target.into_bytes()).map_err(|_| CaptureError::NotUtf8 {
+        path: rel.as_str().to_owned(),
+    })
+}
+
+/// What identifies one state of a path: device, inode, size and mtime.
+type Stamp = (u64, u64, u64, i64, i64);
+
+fn stamp(meta: &fs::Metadata) -> Stamp {
+    (
+        meta.dev(),
+        meta.ino(),
+        meta.len(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+    )
+}
+
+/// Stamps every path of `paths` under `root` that exists, without following links.
+fn stamps<'a>(
+    root: &Path,
+    paths: impl Iterator<Item = &'a RelPath>,
+) -> Result<HashMap<RelPath, Stamp>, CaptureError> {
+    let mut out = HashMap::new();
+    for rel in paths {
+        let full = root.join(rel.as_str());
+        match fs::symlink_metadata(&full) {
+            Ok(meta) => {
+                out.insert(rel.clone(), stamp(&meta));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err(&full, e)),
+        }
+    }
+    Ok(out)
+}
+
+/// Returns the mtime of `meta` in nanoseconds since the epoch.
+///
+/// A manifest records an unsigned time, so an mtime before 1970 is refused
+/// instead of being read as a different time.
+fn mtime_ns(meta: &fs::Metadata, rel: &RelPath) -> Result<u64, CaptureError> {
+    let before = || CaptureError::MtimeBeforeEpoch { path: rel.clone() };
+    let secs = u64::try_from(meta.mtime()).map_err(|_| before())?;
+    let nanos = u64::try_from(meta.mtime_nsec()).map_err(|_| before())?;
+    Ok(secs.saturating_mul(1_000_000_000).saturating_add(nanos))
 }
 
 /// True when a link at `rel` with `target` points outside the tree root.
@@ -401,22 +507,32 @@ impl Found {
     }
 }
 
-/// Opens a listed regular file, refusing it unless it is still the inode the listing saw.
+/// Opens a listed regular file under `base`, refusing it unless it is still the inode the listing saw.
 ///
 /// A path swapped for a link, a FIFO or another file after the listing
-/// fails here, so the bytes stored under a name are the bytes of the file
-/// the secret patterns judged by that name.
-fn open_listed(full: &Path, found: &Found) -> Result<File, CaptureError> {
+/// fails here, and so does a path whose directory was swapped for a link:
+/// the open walks down from `base` through directory handles and follows
+/// no link, so the bytes stored under a name are the bytes of the file the
+/// secret patterns judged by that name.
+fn open_listed(base: &Path, found: &Found) -> Result<File, CaptureError> {
+    use rustix::fs::{Mode as RawBits, OFlags};
+    let full = base.join(found.rel.as_str());
     let changed = || CaptureError::WorkspaceChanged {
         path: found.rel.clone(),
     };
-    let file = match open_regular(full) {
-        Ok(Some(file)) => file,
-        Ok(None) => return Err(changed()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(changed()),
-        Err(e) => return Err(io_err(full, e)),
+    let Some((dir, name)) = parent_below(base, &found.rel).map_err(|e| io_err(&full, e))? else {
+        return Err(changed());
     };
-    let meta = file.metadata().map_err(|e| io_err(full, e))?;
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let file = match rustix::fs::openat(&dir, name, flags, RawBits::empty()) {
+        Ok(fd) => File::from(fd),
+        Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOENT) => return Err(changed()),
+        Err(e) => return Err(io_err(&full, e.into())),
+    };
+    let meta = file.metadata().map_err(|e| io_err(&full, e))?;
+    if !meta.is_file() {
+        return Err(changed());
+    }
     if meta.dev() != found.meta.dev() || meta.ino() != found.meta.ino() {
         return Err(changed());
     }
@@ -428,13 +544,14 @@ fn open_listed(full: &Path, found: &Found) -> Result<File, CaptureError> {
 /// Only the inode is checked before the read, so the size and mtime of the
 /// open file are compared with the listing after it: a write during the
 /// read would otherwise store a torn file under the name.
-fn store_listed(store: &Store, full: &Path, found: &Found) -> Result<StoredFile, CaptureError> {
-    let file = open_listed(full, found)?;
-    let stored = store.objects().put_reader(&file, full)?;
-    let after = file.metadata().map_err(|e| io_err(full, e))?;
+fn store_listed(store: &Store, base: &Path, found: &Found) -> Result<StoredFile, CaptureError> {
+    let full = base.join(found.rel.as_str());
+    let file = open_listed(base, found)?;
+    let stored = store.objects().put_reader(&file, &full)?;
+    let after = file.metadata().map_err(|e| io_err(&full, e))?;
     if stored.size != found.meta.len()
         || after.len() != found.meta.len()
-        || mtime_ns(&after) != mtime_ns(&found.meta)
+        || (after.mtime(), after.mtime_nsec()) != (found.meta.mtime(), found.meta.mtime_nsec())
     {
         return Err(CaptureError::WorkspaceChanged {
             path: found.rel.clone(),
@@ -523,10 +640,9 @@ impl Capturer<'_> {
     /// Turns a found path into an entry, writing its bytes into the store.
     fn entry_for(&mut self, base: &Path, found: &Found) -> Result<Entry, CaptureError> {
         let meta = &found.meta;
-        let full = base.join(found.rel.as_str());
         let kind = match found.kind {
             FoundKind::Symlink => {
-                let target = utf8_link(&full, &found.rel)?;
+                let target = utf8_link(base, &found.rel)?;
                 if symlink_escapes(&found.rel, &target) {
                     self.report.escaping_symlinks.push(found.rel.clone());
                 }
@@ -535,7 +651,7 @@ impl Capturer<'_> {
             }
             FoundKind::Dir => EntryKind::Dir,
             FoundKind::File => {
-                let stored = store_listed(self.store, &full, found)?;
+                let stored = store_listed(self.store, base, found)?;
                 self.report.files += 1;
                 self.report.bytes += stored.size;
                 self.report.new_objects += stored.new_objects;
@@ -550,7 +666,7 @@ impl Capturer<'_> {
             rel_path: found.rel.clone(),
             kind,
             mode: Mode::from_masked(meta.mode()),
-            mtime_ns: mtime_ns(meta),
+            mtime_ns: mtime_ns(meta, &found.rel)?,
         })
     }
 
@@ -571,6 +687,16 @@ impl Capturer<'_> {
         };
         for item in found {
             let class = policy.classify(&item.rel, &mut markers);
+            if let Some(root) = class.cache_root() {
+                // A cache that holds only directories still gets its row, so
+                // restore can ask the target about it like any other.
+                caches.entry(root.path.clone()).or_insert(CacheSeen {
+                    class: root.class,
+                    carried: 0,
+                    denied: 0,
+                    excluded: 0,
+                });
+            }
             if item.kind == FoundKind::Dir {
                 // A directory travels on its own when the walker listed it
                 // and nothing denies it, so an empty directory is not lost.
@@ -625,18 +751,18 @@ impl Capturer<'_> {
                 rel_path: dir.clone(),
                 kind: EntryKind::Dir,
                 mode: Mode::from_masked(meta.mode()),
-                mtime_ns: mtime_ns(&meta),
+                mtime_ns: mtime_ns(&meta, dir)?,
             });
         }
         entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
         let mut cache_entries = Vec::new();
         for (path, seen) in caches {
-            let carry = if seen.carried == 0 {
-                CarryState::NotCarried
-            } else if seen.denied > 0 || seen.excluded > 0 {
-                CarryState::Partial
-            } else {
+            let carry = if seen.denied == 0 && seen.excluded == 0 {
                 CarryState::Carried
+            } else if seen.carried == 0 {
+                CarryState::NotCarried
+            } else {
+                CarryState::Partial
             };
             cache_entries.push(CacheEntry {
                 key: self.req.carry_keys.key(seen.class, &path),
@@ -881,26 +1007,70 @@ impl GitCapture<'_> {
                 return Err(CaptureError::GitBusy { reason });
             }
         }
+        // A shallow clone's boundary commits name parents it does not
+        // have; restored without `.git/shallow`, the repository fails fsck.
+        if self
+            .git
+            .run_text(&["rev-parse", "--is-shallow-repository"])?
+            == "true"
+        {
+            return Err(CaptureError::GitShallow);
+        }
         if !self.git.run(&["ls-files", "-u", "-z"])?.is_empty() {
             return Err(CaptureError::GitBusy {
                 reason: BusyReason::Conflicts,
             });
         }
-        let status = self
-            .git
-            .run(&["status", "--porcelain=v2", "-z", "--untracked-files=no"])?;
-        for record in Git::records(&status) {
+        // `ls-files -v` tags a skip-worktree entry `S` and an
+        // assume-unchanged one in lower case.
+        let entries = self.git.run(&["ls-files", "-v", "-z"])?;
+        for record in Git::records(&entries) {
+            let text = Git::text("index entry", record)?;
+            let (tag, path) = text.split_once(' ').unwrap_or((text, ""));
+            let flag = match tag {
+                "S" | "s" => IndexFlag::SkipWorktree,
+                "h" => IndexFlag::AssumeUnchanged,
+                _ => continue,
+            };
+            return Err(CaptureError::GitIndexFlag {
+                path: rel_path(path)?,
+                flag,
+            });
+        }
+        // `--ignore-submodules=none` overrides a `submodule.<name>.ignore`
+        // in the config or in .gitmodules, which would hide the local work.
+        let status = self.git.run(&[
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=no",
+            "--ignore-submodules=none",
+        ])?;
+        let mut records = Git::records(&status);
+        while let Some(record) = records.next() {
             let text = Git::text("status record", record)?;
-            let mut fields = text.split(' ');
-            if fields.next() != Some("1") {
-                continue;
+            // The path is the last field and, under -z, may hold spaces. A
+            // rename record has one more field and is followed by a record
+            // that holds the old path.
+            let fields = match text.split(' ').next() {
+                Some("1") => 9,
+                Some("2") => {
+                    records.next();
+                    10
+                }
+                _ => continue,
+            };
+            let path = || rel_path(text.splitn(fields, ' ').last().unwrap_or(""));
+            // An intent-to-add entry is added in the work tree and absent from the index.
+            if fields == 9 && text.split(' ').nth(1) == Some(".A") {
+                return Err(CaptureError::GitIndexFlag {
+                    path: path()?,
+                    flag: IndexFlag::IntentToAdd,
+                });
             }
-            let _xy = fields.next();
-            let sub = fields.next().unwrap_or("");
+            let sub = text.split(' ').nth(2).unwrap_or("");
             if sub.starts_with('S') && sub[1..].chars().any(|c| c != '.') {
-                // The path is the ninth field and, under -z, may hold spaces.
-                let path = rel_path(text.splitn(9, ' ').nth(8).unwrap_or(""))?;
-                return Err(CaptureError::GitSubmoduleDirty { path });
+                return Err(CaptureError::GitSubmoduleDirty { path: path()? });
             }
         }
         // git resolves the attributes itself, from every .gitattributes,
@@ -1004,24 +1174,41 @@ impl GitCapture<'_> {
         let index = self.git.git_path("index")?;
         let lock = index.with_extension("lock");
         let copy = TempFile::in_dir(&self.scratch);
+        // The copy counts only if no lock appeared and the index was not
+        // replaced while it was read: git writes `index.lock` and renames it
+        // over the index, so a copy taken in between holds the old state.
+        let stamp = |path: &Path| match fs::metadata(path) {
+            Ok(meta) => Ok(Some((
+                meta.dev(),
+                meta.ino(),
+                meta.len(),
+                meta.mtime(),
+                meta.mtime_nsec(),
+            ))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io_err(path, e)),
+        };
         let mut tries = 0;
         loop {
-            if lock.exists() {
-                tries += 1;
-                if tries > 10 {
-                    return Err(CaptureError::GitBusy {
-                        reason: BusyReason::IndexLocked,
-                    });
+            if !lock.exists() {
+                let before = stamp(&index)?;
+                match fs::copy(&index, copy.path()) {
+                    Ok(_) => {}
+                    // No index yet: write-tree on a missing index file writes the empty tree.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(io_err(&index, e)),
                 }
-                thread::sleep(Duration::from_millis(200));
-                continue;
+                if !lock.exists() && stamp(&index)? == before {
+                    break;
+                }
             }
-            match fs::copy(&index, copy.path()) {
-                Ok(_) => break,
-                // No index yet: write-tree on a missing index file writes the empty tree.
-                Err(e) if e.kind() == io::ErrorKind::NotFound => break,
-                Err(e) => return Err(io_err(&index, e)),
+            tries += 1;
+            if tries > 10 {
+                return Err(CaptureError::GitBusy {
+                    reason: BusyReason::IndexLocked,
+                });
             }
+            thread::sleep(Duration::from_millis(200));
         }
         let env: [(&str, &OsStr); 1] = [("GIT_INDEX_FILE", copy.path().as_os_str())];
         let tree = self.git.run_text_env(&["write-tree"], &env)?;
@@ -1299,9 +1486,16 @@ impl GitCapture<'_> {
     }
 
     /// Reads the mtime of every path in `W` and reports the links among them that escape the root.
+    ///
+    /// `before` holds the stamps taken just before `git add -A` built `W`.
+    /// A path whose stamp differs now, or that had none, was written while
+    /// or after `W` was built, so `W` may hold older bytes than the mtime
+    /// recorded here; that fails with `WorkspaceChanged` instead of
+    /// publishing a snapshot that loses the edit.
     fn worktree_mtimes(
         &self,
         worktree: &GitOid,
+        before: &HashMap<RelPath, Stamp>,
         report: &mut CaptureReport,
     ) -> Result<Vec<(RelPath, u64)>, CaptureError> {
         let out = self
@@ -1318,13 +1512,17 @@ impl GitCapture<'_> {
                 }
                 Err(e) => return Err(io_err(&full, e)),
             };
+            if before.get(&rel) != Some(&stamp(&meta)) {
+                return Err(CaptureError::WorkspaceChanged { path: rel });
+            }
             if meta.file_type().is_symlink() {
-                let target = utf8_link(&full, &rel)?;
+                let target = utf8_link(self.root, &rel)?;
                 if symlink_escapes(&rel, &target) {
                     report.escaping_symlinks.push(rel.clone());
                 }
             }
-            mtimes.push((rel, mtime_ns(&meta)));
+            let mtime = mtime_ns(&meta, &rel)?;
+            mtimes.push((rel, mtime));
         }
         mtimes.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(mtimes)
@@ -1386,6 +1584,12 @@ impl GitCapture<'_> {
                 report.dropped_config.push(key);
                 continue;
             };
+            // Only a query or fragment is left after the strip; the
+            // receiving node would refuse the manifest that carried it.
+            if key.is_remote_url() && value.has_credential() {
+                report.dropped_config.push(key);
+                continue;
+            }
             if config.insert(key.clone(), value).is_some() {
                 report.repeated_config.push(key.clone());
             }
@@ -1508,7 +1712,20 @@ fn detect_git<'a>(
     let git = Git::new(req.root).with_date(req.created_at);
     let out = git.output(&["rev-parse", "--show-toplevel"], &[])?;
     if !out.status.success() {
-        return Ok(None);
+        // Only "not a repository" makes the root a plain directory. Any
+        // other failure, such as `safe.directory` refusing a repository
+        // another user owns or a config git cannot parse, is surfaced:
+        // capturing the root as plain files would drop its git state.
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+        if stderr.contains("not a git repository") {
+            return Ok(None);
+        }
+        return Err(GitError::Failed {
+            command: "rev-parse --show-toplevel".to_owned(),
+            code: out.status.code(),
+            stderr,
+        }
+        .into());
     }
     let toplevel = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
     let same = match (fs::canonicalize(&toplevel), fs::canonicalize(req.root)) {
@@ -1594,6 +1811,7 @@ fn capture_git(
         excludes.push_str(root.as_str());
         excludes.push_str("/\n");
     }
+    let before = stamps(req.root, tracked.iter().chain(untracked.iter()))?;
     let (worktree_commit, removed) = repo.worktree_commit(
         &index_tree,
         head_commit.as_ref(),
@@ -1622,7 +1840,7 @@ fn capture_git(
         capturer.report.stashed_secrets =
             repo.stashed_secrets(stash, &|rel| policy.denies_anywhere(rel))?;
     }
-    let worktree_mtimes = repo.worktree_mtimes(&worktree_commit, &mut capturer.report)?;
+    let worktree_mtimes = repo.worktree_mtimes(&worktree_commit, &before, &mut capturer.report)?;
     let config = repo.config(&mut capturer.report)?;
     let exclude_path = repo.git.git_path("info/exclude")?;
     // `info/exclude` is git's own file, not workspace content, so a link to
@@ -1680,13 +1898,36 @@ mod tests {
         fs::rename(&path, dir.path().join("kept")).unwrap();
         std::os::unix::fs::symlink(&key, &path).unwrap();
         assert!(matches!(
-            open_listed(&path, &found),
+            open_listed(dir.path(), &found),
             Err(CaptureError::WorkspaceChanged { .. })
         ));
         fs::remove_file(&path).unwrap();
         fs::write(&path, "another file").unwrap();
         assert!(matches!(
-            open_listed(&path, &found),
+            open_listed(dir.path(), &found),
+            Err(CaptureError::WorkspaceChanged { .. })
+        ));
+    }
+
+    /// A listing that walked through a directory swapped for a link saw the
+    /// outside file's own inode, so only the walk from the base catches it.
+    #[test]
+    fn a_directory_replaced_by_a_link_is_not_read_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("work");
+        let outside = dir.path().join("home");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("notes.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("sub")).unwrap();
+        let listed = fs::symlink_metadata(outside.join("notes.txt")).unwrap();
+        let found = Found::new(rel("sub/notes.txt"), listed).unwrap();
+        assert!(matches!(
+            open_listed(&base, &found),
+            Err(CaptureError::WorkspaceChanged { .. })
+        ));
+        assert!(matches!(
+            utf8_link(&base, &rel("sub/notes.txt")),
             Err(CaptureError::WorkspaceChanged { .. })
         ));
     }
@@ -1700,8 +1941,38 @@ mod tests {
         let found = Found::new(rel("notes.txt"), fs::symlink_metadata(&path).unwrap()).unwrap();
         fs::write(&path, "notes, rewritten").unwrap();
         assert!(matches!(
-            store_listed(&store, &path, &found),
+            store_listed(&store, dir.path(), &found),
             Err(CaptureError::WorkspaceChanged { .. })
+        ));
+    }
+
+    /// A file written after `W` was built fails capture instead of travelling with its old bytes.
+    #[test]
+    fn a_file_written_after_w_was_built_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        fs::create_dir(&root).unwrap();
+        let repo = GitCapture {
+            git: Git::new(&root).with_date(1_760_000_000_000),
+            root: &root,
+            job_id: JobId::from_bytes([1; 16]),
+            scratch: dir.path().to_owned(),
+            user_excludes: String::new(),
+            listing_excludes: TempFile::in_dir(dir.path()),
+        };
+        repo.git.run(&["init", "-q", "-b", "main"]).unwrap();
+        fs::write(root.join("a.txt"), "before\n").unwrap();
+        repo.git.run(&["add", "a.txt"]).unwrap();
+        repo.git.run(&["commit", "-q", "-m", "one"]).unwrap();
+        let w = repo.head_commit().unwrap().unwrap();
+        let paths = [rel("a.txt")];
+        let before = stamps(&root, paths.iter()).unwrap();
+        let mut report = CaptureReport::default();
+        assert!(repo.worktree_mtimes(&w, &before, &mut report).is_ok());
+        fs::write(root.join("a.txt"), "written after W\n").unwrap();
+        assert!(matches!(
+            repo.worktree_mtimes(&w, &before, &mut report),
+            Err(CaptureError::WorkspaceChanged { path }) if path.as_str() == "a.txt"
         ));
     }
 
