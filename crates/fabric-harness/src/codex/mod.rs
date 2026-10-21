@@ -77,8 +77,12 @@
 //! as a desktop build newer than the CLI on the same node, leaves no
 //! version anywhere and is not seen. A thread with no rollout on this
 //! node has no bytes to protect, so it is launched as before and Codex
-//! says it found none. A launch with no session reads nothing and
-//! passes only what was configured.
+//! says it found none. A rollout of the thread that only a symlink under
+//! `sessions/` or `archived_sessions/` reaches is not "no rollout": Codex
+//! opens it through the link, from the path its database holds, so the
+//! guard refuses it (`SymlinkInState`) by the walk capture uses
+//! (`lineage`), as capture does. A launch with no session reads nothing
+//! and passes only what was configured.
 
 pub mod overrides;
 pub(crate) mod rollout;
@@ -431,9 +435,17 @@ impl Codex {
 
     /// Every rollout file in the store, duplicates included.
     fn all_rollouts(&self) -> Result<Vec<RolloutFile>, HarnessError> {
-        let mut all = rollout::list(&self.store.join("sessions"))?;
-        all.extend(rollout::list(&self.store.join("archived_sessions"))?);
-        Ok(all)
+        Ok(self.scan_store()?.0)
+    }
+
+    /// Every rollout file in the store, duplicates included, and the
+    /// symlinks the walk met and did not follow.
+    fn scan_store(&self) -> Result<(Vec<RolloutFile>, Vec<PathBuf>), HarnessError> {
+        let (mut all, mut links) = rollout::scan(&self.store.join("sessions"))?;
+        let (archived, archived_links) = rollout::scan(&self.store.join("archived_sessions"))?;
+        all.extend(archived);
+        links.extend(archived_links);
+        Ok((all, links))
     }
 
     /// The newest thread whose rollout records the workspace as its `cwd`.
@@ -454,9 +466,18 @@ impl Codex {
         Ok(None)
     }
 
-    /// The rollout lineage of `session` in this store, newest suffix first.
+    /// The rollout lineage of `session` in this store, newest suffix
+    /// first. A rollout of the thread reached through a symlink under
+    /// `sessions/` or `archived_sessions/` is refused (`SymlinkInState`):
+    /// Codex opens it through the link, from the path its database holds,
+    /// so capture and the resume guard, which both read the lineage here,
+    /// never skip it and find no rollout, or an older one.
     pub(crate) fn lineage(&self, session: &SessionId) -> Result<Vec<RolloutFile>, HarnessError> {
-        lineage_in(&self.all_rollouts()?, session, &self.store.join("sessions"))
+        let (all, links) = self.scan_store()?;
+        if let Some(path) = rollout::link_reaching(&links, session)? {
+            return Err(HarnessError::SymlinkInState { path });
+        }
+        lineage_in(&all, session, &self.store.join("sessions"))
     }
 
     /// Takes the thread writer lock as Codex's `acquire` does: the
@@ -700,7 +721,8 @@ impl Codex {
         let adapter = self.clone();
         let id = session.clone();
         // A thread with no rollout here records nothing to carry or to
-        // guard; Codex then says itself that it found none.
+        // guard; Codex then says itself that it found none. One that only
+        // a symlink reaches is refused by `lineage`, not found missing.
         let read = pipeline::blocking(move || match adapter.lineage(&id) {
             Ok(lineage) => rollout::recorded(&lineage).map(Some),
             Err(HarnessError::SessionNotFound { .. }) => Ok(None),
@@ -1235,6 +1257,70 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&fixture.rollout).unwrap(), newer);
         assert_eq!(fixture.ran(), None, "the older codex ran");
+    }
+
+    /// A rollout of the thread reached through a symlink under
+    /// `sessions/`, a day directory or the file itself, as a folder synced
+    /// from another Mac makes it, refuses the resume and the capture alike.
+    /// Codex resumes it through the link, from the path its state database
+    /// holds, while a walk that skips the link finds no rollout, so a
+    /// guard that skipped it would let an older codex append to what a
+    /// newer one wrote, with no version check and the known writer
+    /// dropped too.
+    #[tokio::test]
+    async fn a_rollout_behind_a_symlink_refuses_the_resume_and_the_capture() {
+        let mut fixture = Resume::new("codex-cli 0.142.4");
+        let newer = HarnessVersion::parse("0.160.0").unwrap();
+        fixture.adapter = fixture.adapter.clone().with_known_writer(Some(newer));
+        let before = std::fs::read(&fixture.rollout).unwrap();
+        let year = fixture.home.join(".codex/sessions/2026");
+        let synced = fixture.home.join("synced-2026");
+        std::fs::rename(&year, &synced).unwrap();
+        std::os::unix::fs::symlink(&synced, &year).unwrap();
+        let refused = fixture.launch(true).await.unwrap_err();
+        assert!(
+            matches!(&refused, HarnessError::SymlinkInState { path } if *path == year),
+            "{refused}"
+        );
+        assert_eq!(fixture.ran(), None, "the older codex ran");
+        assert_eq!(std::fs::read(&fixture.rollout).unwrap(), before);
+
+        // The rollout file itself a link, in a real day directory.
+        std::fs::remove_file(&year).unwrap();
+        std::fs::create_dir_all(fixture.rollout.parent().unwrap()).unwrap();
+        let shared = synced
+            .join("10/21")
+            .join(fixture.rollout.file_name().unwrap());
+        std::os::unix::fs::symlink(&shared, &fixture.rollout).unwrap();
+        let refused = fixture.launch(true).await.unwrap_err();
+        assert!(
+            matches!(&refused, HarnessError::SymlinkInState { path } if *path == fixture.rollout),
+            "{refused}"
+        );
+        assert_eq!(fixture.ran(), None, "the older codex ran");
+        assert_eq!(std::fs::read(&shared).unwrap(), before);
+
+        // Capture refuses the same layout by the same rule. A codex at
+        // the lock's floor, so no running codex on the machine blocks it.
+        let capturing = Resume::new("codex-cli 0.155.1");
+        let day = capturing.rollout.parent().unwrap().to_path_buf();
+        let synced = capturing.home.join("synced-day");
+        std::fs::rename(&day, &synced).unwrap();
+        std::os::unix::fs::symlink(&synced, &day).unwrap();
+        let out = capturing.home.join("out");
+        let refused = capturing
+            .adapter
+            .capture(
+                &capturing.home.join("work"),
+                &SessionId::parse(THREAD).unwrap(),
+                &out,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&refused, HarnessError::SymlinkInState { path } if *path == day),
+            "{refused}"
+        );
     }
 
     /// A codex whose version cannot be read is refused too: deny by default.

@@ -4,7 +4,12 @@
 //! `rollout-<YYYY-MM-DDTHH-MM-SS>-<thread_id>[_<rollout_id>].jsonl[.zst]`,
 //! anywhere under `sessions/` or `archived_sessions/`, which is how Codex
 //! itself finds it when its `SQLite` row is missing (`codex-rs/rollout/src/
-//! list.rs`, `visit_rollout_filenames`, at `e4568a3`, 2026-10-19). A
+//! list.rs`, `visit_rollout_filenames`, at `e4568a3`, 2026-10-19). Neither
+//! walk follows a symlink, but Codex looks a thread up in its `SQLite`
+//! database first and opens the path it holds, through any link
+//! (`find_thread_path_by_id_str_in_subdir` at `rust-v0.155.1`), so a
+//! rollout of the thread reached through a symlink under either folder is
+//! refused (`link_reaching`), never skipped. A
 //! paginated thread owns only its suffix; the prefix lives in the rollout
 //! named by `session_meta.history_base.thread_id`, which is a rollout id,
 //! and must travel byte for byte because the reference is a byte offset.
@@ -124,9 +129,17 @@ pub fn parse_name(name: &str) -> Option<RolloutName> {
 
 /// Lists every rollout file under `root`, walking all subdirectories,
 /// newest first. When a plain and a compressed file share a directory and
-/// a name, the plain one is listed, as Codex does.
+/// a name, the plain one is listed, as Codex does. A symlink is not
+/// followed and not listed.
 pub fn list(root: &Path) -> Result<Vec<RolloutFile>, HarnessError> {
+    Ok(scan(root)?.0)
+}
+
+/// The rollout files under `root`, as `list` gives them, and every
+/// symlink the walk met and did not follow.
+pub(crate) fn scan(root: &Path) -> Result<(Vec<RolloutFile>, Vec<PathBuf>), HarnessError> {
     let mut found: Vec<RolloutFile> = Vec::new();
+    let mut links = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
@@ -142,6 +155,10 @@ pub fn list(root: &Path) -> Result<Vec<RolloutFile>, HarnessError> {
                 .map_err(|e| HarnessError::io(IoOp::Walk, &path, e))?;
             if kind.is_dir() {
                 stack.push(path);
+                continue;
+            }
+            if kind.is_symlink() {
+                links.push(path);
                 continue;
             }
             if !kind.is_file() {
@@ -169,7 +186,56 @@ pub fn list(root: &Path) -> Result<Vec<RolloutFile>, HarnessError> {
             .then_with(|| b.name.rollout_id.cmp(&a.name.rollout_id))
             .then_with(|| a.path.cmp(&b.path))
     });
-    Ok(found)
+    links.sort();
+    Ok((found, links))
+}
+
+/// The first of `links`, as `scan` met them, through which a rollout of
+/// `session` is reached: a link whose own name is a rollout of the
+/// thread, or a link to a directory that holds one at any depth, the
+/// links inside it followed in turn, each directory once. A link that
+/// leads nowhere reaches nothing. Codex opens a rollout through such a
+/// link, so capture and the resume guard refuse it rather than skip it.
+pub(crate) fn link_reaching(
+    links: &[PathBuf],
+    session: &SessionId,
+) -> Result<Option<PathBuf>, HarnessError> {
+    let of_session = |name: &str| parse_name(name).is_some_and(|n| n.thread_id == *session);
+    let mut seen = std::collections::HashSet::new();
+    for link in links {
+        let mut stack = vec![link.clone()];
+        while let Some(path) = stack.pop() {
+            let meta = match std::fs::metadata(&path) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(HarnessError::io(IoOp::Walk, &path, e)),
+            };
+            if meta.is_file() {
+                if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(of_session)
+                {
+                    return Ok(Some(link.clone()));
+                }
+                continue;
+            }
+            if !meta.is_dir() {
+                continue;
+            }
+            let real =
+                std::fs::canonicalize(&path).map_err(|e| HarnessError::io(IoOp::Walk, &path, e))?;
+            if !seen.insert(real) {
+                continue;
+            }
+            let (files, inner) = scan(&path)?;
+            if files.iter().any(|f| f.name.thread_id == *session) {
+                return Ok(Some(link.clone()));
+            }
+            stack.extend(inner);
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Deserialize)]
@@ -621,6 +687,48 @@ mod tests {
 
     const THREAD: &str = "019f233e-bb33-7342-85fa-f2d33b14368a";
     const SUFFIX: &str = "019f233e-bb33-7342-85fa-f2d33b14368b";
+
+    /// Only a link that reaches a rollout of the thread counts, so a link
+    /// to another thread's folder blocks nothing: a link that leads
+    /// nowhere, or only to another thread's rollout, reaches nothing; one
+    /// that reaches the thread through a link inside it is named by the
+    /// outer link `scan` met; and a link back to a folder already walked
+    /// ends the walk.
+    #[test]
+    fn only_a_link_that_reaches_the_thread_counts() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let other = dir.path().join("other");
+        let inner = dir.path().join("inner");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(
+            other.join(format!("rollout-2026-10-21T10-00-00-{SUFFIX}.jsonl")),
+            "",
+        )
+        .unwrap();
+        symlink(&other, root.join("2025")).unwrap();
+        symlink(dir.path().join("gone"), root.join("2024")).unwrap();
+        symlink(&root, other.join("back")).unwrap();
+        let session = SessionId::parse(THREAD).unwrap();
+        let (files, links) = scan(&root).unwrap();
+        assert!(files.is_empty());
+        assert_eq!(link_reaching(&links, &session).unwrap(), None);
+
+        std::fs::write(
+            inner.join(format!("rollout-2026-10-21T10-00-00-{THREAD}.jsonl")),
+            "",
+        )
+        .unwrap();
+        symlink(&inner, other.join("10")).unwrap();
+        let (_, links) = scan(&root).unwrap();
+        assert_eq!(
+            link_reaching(&links, &session).unwrap(),
+            Some(root.join("2025"))
+        );
+    }
 
     fn meta(version: &str, base: Option<&str>) -> String {
         let base = base.map_or_else(String::new, |b| {
