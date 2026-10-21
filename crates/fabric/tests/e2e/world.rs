@@ -307,6 +307,9 @@ impl Node {
     pub fn new(env: &Arc<Env>, name: &'static str, wire: Wire) -> Fallible<Self> {
         let state = env.root.join(name);
         fs::create_dir_all(&state)?;
+        // The daemon's log is written here too, which the node does not
+        // write itself, so the directory starts private as a user's would.
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700))?;
         fs::write(
             state.join("harness.toml"),
             "[acp.fabric-fake-agent]\nstate_dir = \".fake-agent\"\n",
