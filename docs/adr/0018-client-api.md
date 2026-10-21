@@ -53,7 +53,7 @@ node:   Done       { type: "done", reply: { kind: <the request's op>, ... } }
                                                                          and the node closes
 ```
 
-The node streams each event the moment the step it reports happens, and the final frame follows the last event. A client that disconnects does not stop the command: a move or a suspend runs to its end on the node, as it did before, because stopping halfway is what the ledger protocol already guards against. The node gives a connection 30 seconds to send its hello and its request.
+The node streams each event the moment the step it reports happens, and the final frame follows the last event. A client that disconnects does not stop the command, and a client that stays connected but stops reading, such as a CLI stopped with Ctrl-Z or writing to a paused terminal, does not pause it: the command runs as its own task, and its events wait in the node's memory until the client reads them or leaves. A move or a suspend runs to its end on the node, as it did before, and never waits on a socket while it holds the job's lock, because stopping halfway is what the ledger protocol already guards against. The node gives a connection 30 seconds to send its hello and its request.
 
 A request that does not parse, or names an op the node does not serve, is answered `Refused` with the reason `bad_request`. A hello that does not parse is answered `Incompatible`.
 
@@ -133,7 +133,7 @@ Unchanged from ADR 0016. The socket lives in the state directory, mode 0700. The
 
 ### The seam for C2
 
-C2 adds a live event stream and approvals from a phone. It builds on two things this ADR puts in place. Events are typed and are made in one place on the node, the per-request sink `Out` in `fabricd`, which today forwards to the one connection that asked. C2 turns that sink into a broadcast per job, and a new op, `watch { job? }`, listed as a capability, streams the same `Event` values to any client until it disconnects. Approvals already exist as `job_decide`; C2 adds no new kind of refusal.
+C2 adds a live event stream and approvals from a phone. It builds on two things this ADR puts in place. Events are typed and are made in one place on the node, the per-request sink `Out` in `fabricd`, which today forwards to the one connection that asked. C2 turns that sink into a broadcast per job, and a new op, `watch { job? }`, listed as a capability, streams the same `Event` values to any client until it disconnects. Each watcher reads from its own queue, as the client that asked does today, so a slow watcher cannot hold a command. Approvals already exist as `job_decide`; C2 adds no new kind of refusal.
 
 ### Where the code lives
 

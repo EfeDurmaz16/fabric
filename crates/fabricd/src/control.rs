@@ -7,9 +7,12 @@
 //! hello, the welcome or an incompatible answer, one request, the events
 //! of the command as the node makes them, and one final answer. A request
 //! that does not parse is refused, never guessed at. A client that leaves
-//! does not stop the command: a move or a suspend that stopped halfway
-//! would leave more to recover than one that finishes.
+//! does not stop the command, and a client that stops reading does not
+//! hold it: the command runs as its own task, so a move or a suspend never
+//! waits on a socket while it holds a job's lock, and one that stopped
+//! halfway would leave more to recover than one that finishes.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -86,28 +89,39 @@ pub(crate) async fn serve(node: Arc<Node>, mut stream: UnixStream) {
     run(node, request, stream).await;
 }
 
-/// Runs `request`, writing each event the moment the command makes it, then the final answer.
-async fn run(node: Arc<Node>, request: Request, mut stream: UnixStream) {
-    let (events, mut made) = mpsc::unbounded_channel();
-    let work = async move { node.handle(request, Out::streaming(events)).await };
-    tokio::pin!(work);
-    let mut connected = true;
-    let answer = loop {
-        tokio::select! {
-            biased;
-            Some(event) = made.recv() => {
-                connected = connected && deliver(&mut stream, event).await;
-            }
-            answer = &mut work => break answer,
+/// Runs `request`, writing each event the moment the client takes it, then the final answer.
+async fn run(node: Arc<Node>, request: Request, stream: UnixStream) {
+    let (events, made) = mpsc::unbounded_channel();
+    let command = async move { node.handle(request, Out::streaming(events)).await };
+    relay(command, made, stream).await;
+}
+
+/// Runs `command` as its own task and writes the events it sends on
+/// `made` to `stream`, in order, then its answer.
+///
+/// The command never waits on the client. A client that stops reading,
+/// such as a CLI stopped with Ctrl-Z or writing to a paused terminal, only
+/// lets the channel grow, while the command runs to its end and lets go
+/// of the job's lock; the client reads the rest when it reads again. The
+/// channel closes when the command ends, because its sender lives in the
+/// command's [`Out`], so every event the command made precedes its answer.
+async fn relay<C>(command: C, mut made: mpsc::UnboundedReceiver<Event>, mut stream: UnixStream)
+where
+    C: Future<Output = Answer> + Send + 'static,
+{
+    let command = tokio::spawn(command);
+    while let Some(event) = made.recv().await {
+        if !deliver(&mut stream, event).await {
+            // The client left; the command runs on without it.
+            return;
         }
-    };
-    // The command made these before it ended, so they go before its answer.
-    while let Ok(event) = made.try_recv() {
-        connected = connected && deliver(&mut stream, event).await;
     }
-    if !connected {
-        return;
-    }
+    let answer = command.await.unwrap_or_else(|e| Answer::Refused {
+        refusal: Refusal::new(
+            Reason::Internal,
+            format!("the command stopped before it answered: {e}"),
+        ),
+    });
     if let Err(FrameError::TooLarge(len)) = send(&mut stream, &answer).await {
         let refusal = Refusal::new(
             Reason::Internal,
@@ -158,4 +172,62 @@ async fn send<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> Result
         Err(e) => tracing::warn!(error = %e, "a control answer could not be written"),
     }
     sent
+}
+
+#[cfg(test)]
+mod tests {
+    use fabric_client::api::Reply;
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    /// Review finding on PR #13: a client that stayed connected but
+    /// stopped reading stalled a suspend between two events, with the
+    /// job's lock held, until it read again. The command now ends on its
+    /// own, and the client still gets every event in order, then the
+    /// answer, once it reads.
+    #[tokio::test]
+    async fn a_client_that_stops_reading_does_not_stall_the_command() {
+        // About 2 MB of events, far more than a socket buffer holds on macOS or Linux.
+        const EVENTS: usize = 2_000;
+        let (node_side, mut client) = UnixStream::pair().unwrap();
+        let (live, made) = mpsc::unbounded_channel();
+        let (ended, command_ended) = oneshot::channel();
+        let command = async move {
+            let mut out = Out::streaming(live);
+            for i in 0..EVENTS {
+                out.emit(Event::LeftBehind {
+                    path: format!("{i:05}/{}", "x".repeat(1_000)),
+                });
+                // One step at a time, as a suspend makes them.
+                tokio::task::yield_now().await;
+            }
+            let _ = ended.send(());
+            Answer::Done {
+                reply: Reply::HarnessExited,
+            }
+        };
+        let relayed = tokio::spawn(relay(command, made, node_side));
+
+        tokio::time::timeout(Duration::from_secs(10), command_ended)
+            .await
+            .expect("the command waited for a client that stopped reading")
+            .unwrap();
+        for i in 0..EVENTS {
+            let answer: Answer = frame::read(&mut client).await.unwrap().unwrap();
+            let prefix = format!("{i:05}/");
+            assert!(
+                matches!(&answer, Answer::Event { event: Event::LeftBehind { path } } if path.starts_with(&prefix)),
+                "event {i}: {answer:?}"
+            );
+        }
+        let last: Answer = frame::read(&mut client).await.unwrap().unwrap();
+        assert_eq!(
+            last,
+            Answer::Done {
+                reply: Reply::HarnessExited
+            }
+        );
+        relayed.await.unwrap();
+    }
 }
