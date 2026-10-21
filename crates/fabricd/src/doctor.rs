@@ -8,11 +8,21 @@
 //! with no login for the job's harness, because the harness would fail
 //! inside with a worse message. The comparison is pure; measuring is
 //! `facts`' job.
+//!
+//! One row orders versions, and only to word its note: when the job's
+//! harness is older on the target, the note says so, read through
+//! `fabric_harness::HarnessVersion`, the parse and the order the resume
+//! guard uses, so the preflight and the guard never disagree on which
+//! side is older. The outcome stays the equality refusal that `--force`
+//! waives: a move only copies bytes, and the guard refuses the older
+//! harness at resume, before it can touch the session, whatever the move
+//! was told (gate finding F10).
 
 use std::fmt;
 use std::path::Path;
 
 use fabric_core::harness::HarnessKind;
+use fabric_harness::HarnessVersion;
 
 use crate::facts::{NodeFacts, major, name};
 use crate::paths::{SyncedFolders, check_root};
@@ -232,17 +242,19 @@ fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Ro
     let mut rows = Vec::new();
     let pairs = [
         (
+            "claude",
             name::CLAUDE,
             name::CLAUDE_LOGIN,
             matches!(ctx.harness, Some(HarnessKind::ClaudeCode)),
         ),
         (
+            "codex",
             name::CODEX,
             name::CODEX_LOGIN,
             matches!(ctx.harness, Some(HarnessKind::Codex)),
         ),
     ];
-    for (version, login, used) in pairs {
+    for (program, version, login, used) in pairs {
         let mut r = row(
             version,
             here,
@@ -261,6 +273,11 @@ fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Ro
         if !used && r.outcome == Outcome::Warn && ctx.harness.is_some() {
             r.outcome = Outcome::Equal;
             r.note.clear();
+        }
+        if used && r.outcome != Outcome::Equal && target_is_older(here, peer, version, ctx.target) {
+            r.note = format!(
+                "the target's {program} is older; a resume there refuses a session a newer {program} wrote, so update {program} there first (ADR 0006)"
+            );
         }
         rows.push(r);
         let target_login = match ctx.target {
@@ -285,6 +302,23 @@ fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Ro
         });
     }
     rows
+}
+
+/// True when the target's `fact` is an older version than the source's,
+/// both read as `--version` output; false when either does not parse.
+fn target_is_older(here: &NodeFacts, peer: &NodeFacts, fact: &str, target: Target) -> bool {
+    let read = |facts: &NodeFacts| {
+        facts
+            .get(fact)
+            .and_then(|text| HarnessVersion::from_output(text).ok())
+    };
+    let (Some(here), Some(peer)) = (read(here), read(peer)) else {
+        return false;
+    };
+    match target {
+        Target::Peer => peer < here,
+        Target::Here => here < peer,
+    }
 }
 
 fn synced_row(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Row {
@@ -532,6 +566,31 @@ mod tests {
         let facts: Vec<&str> = blocking(&rows, true).iter().map(|r| r.fact).collect();
         assert_eq!(facts, vec![name::HOME, name::CLAUDE_LOGIN]);
         assert_eq!(blocking(&rows, false).len(), 3);
+    }
+
+    /// The second gate run moved a Codex job with `--force` onto a node
+    /// with an older Codex: the row names the older side, in the order the
+    /// resume guard uses, and `--force` still waives it, because the guard
+    /// refuses the older Codex at resume.
+    #[test]
+    fn an_older_harness_on_the_target_is_named_and_force_still_waives_it() {
+        let codex = HarnessKind::Codex;
+        let older = with(&pro(), &[(name::CODEX, Some("codex-cli 0.142.4"))]);
+        let row_of = |rows: Vec<Row>| rows.into_iter().find(|r| r.fact == name::CODEX).unwrap();
+        let pushed = row_of(compare(&pro(), &older, &ctx(Some(&codex))));
+        assert_eq!(pushed.outcome, Outcome::Refuse(Waiver::Force));
+        assert!(
+            pushed.note.starts_with("the target's codex is older"),
+            "{}",
+            pushed.note
+        );
+        let mut pull = ctx(Some(&codex));
+        pull.target = Target::Here;
+        let pulled = row_of(compare(&pro(), &older, &pull));
+        assert_eq!(
+            pulled.note,
+            "the job's harness must be the same version on both nodes (ADR 0008)"
+        );
     }
 
     #[test]
