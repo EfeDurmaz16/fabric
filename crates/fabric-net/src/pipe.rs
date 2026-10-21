@@ -4,7 +4,9 @@
 //! memory; dropping the writer gives the reader a clean end of stream after
 //! the bytes already written, and aborting it gives the reader an error
 //! instead, so a stream cut off by a lost connection never reads as one that
-//! ended; dropping the reader makes every later write fail with
+//! ended; dropping the writer while one of its writes waits for room, as a
+//! timed-out or cancelled write does, aborts it, so a message cut off halfway
+//! is never sent on as a whole stream; dropping the reader makes every later write fail with
 //! `BrokenPipe`, so a stream nobody reads cannot fill the heap. A `push`
 //! puts all its bytes in or none, and `Drained` counts what the reader took,
 //! which is the credit the multiplexer hands back to the peer, and reports
@@ -59,7 +61,11 @@ impl State {
 pub(crate) struct PipeReader(Arc<Mutex<State>>);
 
 /// The write end of a pipe.
-pub(crate) struct PipeWriter(Arc<Mutex<State>>);
+pub(crate) struct PipeWriter {
+    state: Arc<Mutex<State>>,
+    /// The last write waited for room, so dropping now cuts a write off.
+    mid_write: bool,
+}
 
 /// Makes a pipe that buffers at most `capacity` bytes.
 pub(crate) fn pipe(capacity: usize) -> (PipeWriter, PipeReader) {
@@ -73,7 +79,13 @@ pub(crate) fn pipe(capacity: usize) -> (PipeWriter, PipeReader) {
         write_waker: None,
         drained_waker: None,
     }));
-    (PipeWriter(state.clone()), PipeReader(state))
+    (
+        PipeWriter {
+            state: state.clone(),
+            mid_write: false,
+        },
+        PipeReader(state),
+    )
 }
 
 fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
@@ -106,6 +118,16 @@ impl PipeReader {
         let taken: Vec<u8> = state.buf.drain(..n).collect();
         state.took(n);
         Poll::Ready(Ok(taken))
+    }
+
+    /// Ready once the writer aborted, so a pump waiting on something else can stop.
+    pub(crate) fn poll_aborted(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut state = lock(&self.0);
+        if state.writer == Writer::Aborted {
+            return Poll::Ready(());
+        }
+        state.read_waker = Some(cx.waker().clone());
+        Poll::Pending
     }
 }
 
@@ -196,7 +218,7 @@ impl Drained {
 impl PipeWriter {
     /// Puts all of `data` in the pipe, or none of it when it does not fit or nobody reads.
     pub(crate) fn push(&self, data: &[u8]) -> Result<(), Refused> {
-        let mut state = lock(&self.0);
+        let mut state = lock(&self.state);
         if state.reader_gone {
             return Err(Refused::ReaderGone);
         }
@@ -212,47 +234,44 @@ impl PipeWriter {
 
     /// Returns a handle that reports what the reader takes.
     pub(crate) fn drained(&self) -> Drained {
-        Drained(Arc::clone(&self.0))
+        Drained(Arc::clone(&self.state))
     }
 
     /// Ends the pipe with an error: the reader's next read fails, buffered bytes or not.
     pub(crate) fn abort(self) {
-        let mut state = lock(&self.0);
-        state.writer = Writer::Aborted;
-        state.buf.clear();
-        if let Some(waker) = state.read_waker.take() {
-            waker.wake();
-        }
-        if let Some(waker) = state.drained_waker.take() {
-            waker.wake();
-        }
+        abort(&self.state);
     }
 }
 
 impl AsyncWrite for PipeWriter {
     fn poll_write(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let mut state = lock(&self.0);
-        if state.reader_gone {
-            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
-        }
-        if data.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-        let room = state.capacity.saturating_sub(state.buf.len());
-        if room == 0 {
-            state.write_waker = Some(cx.waker().clone());
-            return Poll::Pending;
-        }
-        let n = room.min(data.len());
-        state.buf.extend(&data[..n]);
-        if let Some(waker) = state.read_waker.take() {
-            waker.wake();
-        }
-        Poll::Ready(Ok(n))
+        let polled = {
+            let mut state = lock(&self.state);
+            if state.reader_gone {
+                Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+            } else if data.is_empty() {
+                Poll::Ready(Ok(0))
+            } else {
+                let room = state.capacity.saturating_sub(state.buf.len());
+                if room == 0 {
+                    state.write_waker = Some(cx.waker().clone());
+                    Poll::Pending
+                } else {
+                    let n = room.min(data.len());
+                    state.buf.extend(&data[..n]);
+                    if let Some(waker) = state.read_waker.take() {
+                        waker.wake();
+                    }
+                    Poll::Ready(Ok(n))
+                }
+            }
+        };
+        self.mid_write = polled.is_pending();
+        polled
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -260,8 +279,21 @@ impl AsyncWrite for PipeWriter {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        finish(&self.0);
+        finish(&self.state);
         Poll::Ready(Ok(()))
+    }
+}
+
+/// Ends the pipe with an error and wakes whoever waits on it.
+fn abort(state: &Mutex<State>) {
+    let mut state = lock(state);
+    state.writer = Writer::Aborted;
+    state.buf.clear();
+    if let Some(waker) = state.read_waker.take() {
+        waker.wake();
+    }
+    if let Some(waker) = state.drained_waker.take() {
+        waker.wake();
     }
 }
 
@@ -281,7 +313,11 @@ fn finish(state: &Mutex<State>) {
 
 impl Drop for PipeWriter {
     fn drop(&mut self) {
-        finish(&self.0);
+        if self.mid_write {
+            abort(&self.state);
+        } else {
+            finish(&self.state);
+        }
     }
 }
 

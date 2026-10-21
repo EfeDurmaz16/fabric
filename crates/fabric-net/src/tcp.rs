@@ -19,7 +19,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use crate::accept::{Handshakes, Inbox};
 use crate::identity::NodeIdentity;
 use crate::mux::{Mux, Side};
-use crate::tls::{Credentials, Refusal, TlsError, Trust, peer_of};
+use crate::tls::{Credentials, Refusal, TlsError, Trust, check_alpn, peer_of};
 use crate::transport::{Connection, DIAL_TIMEOUT, Transport, TransportError, TransportKind};
 
 /// A TCP listener that dials and accepts under one node identity.
@@ -103,6 +103,7 @@ impl TcpTlsTransport {
                 Into::into,
             )
         })?;
+        check_alpn(tls.get_ref().1.alpn_protocol())?;
         let actual = peer_of(tls.get_ref().1.peer_certificates())?;
         if actual != peer {
             return Err(TlsError::PeerMismatch {
@@ -159,6 +160,7 @@ async fn accept_loop(listener: TcpListener, acceptor: TlsAcceptor, handshakes: H
                 Err(_) => return Err(TransportError::Timeout(FIRST_BYTE_TIMEOUT)),
             }
             let tls = acceptor.accept(tcp).await?;
+            check_alpn(tls.get_ref().1.alpn_protocol())?;
             let peer = peer_of(tls.get_ref().1.peer_certificates())?;
             Ok(Box::new(Mux::spawn(
                 TlsStream::Server(tls),
@@ -207,6 +209,45 @@ mod tests {
         fn is_paired(&self, _node: NodeId) -> bool {
             false
         }
+    }
+
+    #[derive(Debug)]
+    struct Everyone;
+
+    impl Trust for Everyone {
+        fn is_paired(&self, _node: NodeId) -> bool {
+            true
+        }
+    }
+
+    /// A paired client that offers no ALPN finishes its TLS handshake, but
+    /// the acceptor never hands its socket to the multiplexer: the bytes
+    /// after the handshake may be framed some other way.
+    #[tokio::test]
+    async fn a_paired_client_without_alpn_never_reaches_the_queue() {
+        let server = NodeIdentity::generate().unwrap();
+        let transport =
+            TcpTlsTransport::bind(&server, Arc::new(Everyone), ([127, 0, 0, 1], 0).into()).unwrap();
+        let client = Credentials::new(&NodeIdentity::generate().unwrap()).unwrap();
+        let mut config = client
+            .client_config(server.node_id(), &Arc::new(Refusal::default()))
+            .unwrap();
+        config.alpn_protocols.clear();
+        let tcp = TcpStream::connect(transport.local_addr).await.unwrap();
+        let name = ServerName::IpAddress(transport.local_addr.ip().into());
+        let mut tls = TlsConnector::from(Arc::new(config))
+            .connect(name, tcp)
+            .await
+            .expect("TLS alone lets a client without ALPN finish");
+        assert_eq!(tls.get_ref().1.alpn_protocol(), None);
+        let queued = tokio::time::timeout(Duration::from_millis(500), transport.accept()).await;
+        assert!(queued.is_err(), "the connection reached the queue");
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), tls.read(&mut byte)).await;
+        assert!(
+            matches!(read, Ok(Ok(0) | Err(_))),
+            "the acceptor must close it"
+        );
     }
 
     /// A host that connects and sends nothing loses its socket after
