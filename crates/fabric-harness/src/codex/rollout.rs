@@ -20,9 +20,22 @@
 //! starts with `{"type":"session_meta","payload":{"cli_version",...}}`. A
 //! thread a parent spawned holds the parent's `session_meta` as a second
 //! line, and a desktop build writes a pre-release such as
-//! `0.163.0-alpha.10.2`. The settings are the last `turn_context`'s, in
-//! lineage order; the writer is the highest `cli_version` of any
-//! `session_meta` line in any file of the lineage. That is the newest
+//! `0.163.0-alpha.10.2`. A setting changed between turns, such as with
+//! `/model` or `/permissions`, is recorded as `{"type":"event_msg",
+//! "payload":{"type":"thread_settings_applied","thread_settings":{"model",
+//! "reasoning_effort","approval_policy","approvals_reviewer",
+//! "permission_profile",...}}}` (5,036 of them in the owner's plain
+//! rollouts, read on 2026-10-21), and Codex 0.155.1 restores the newer of
+//! the two records on resume (`latest_persisted_resume_settings` in
+//! `codex-rs/app-server` and `apply_rollout_item` in
+//! `codex-rs/state/src/extract.rs`, at `rust-v0.155.1`). So the settings
+//! are those of the last of either record, in lineage order: in 7 of the
+//! owner's 12,238 rollouts a change after the last turn names another
+//! model or effort, one of them from gpt-5.5, the model gate finding
+//! F10a got a 400 for, to gpt-6-astra. A snapshot holds a permission
+//! profile rather than a sandbox mode, and `take_snapshot` says which
+//! mode it reads from one. The writer is the highest `cli_version` of
+//! any `session_meta` line in any file of the lineage. That is the newest
 //! Codex that created a file of the lineage, not always the newest that
 //! wrote to it: a resume appends without a `session_meta` and records no
 //! version (a rollout on the owner's Mac holds one `session_meta`, by
@@ -261,15 +274,15 @@ pub(crate) fn refuse_secrets(file: &RolloutFile) -> Result<(), HarnessError> {
 /// What a Codex session's rollouts record about how it ran.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RecordedSettings {
-    /// The model of the last turn.
+    /// The model of the last turn, or of a change after it.
     pub(crate) model: Recorded<ModelName>,
-    /// The reasoning effort of the last turn.
+    /// The reasoning effort of the last turn, or of a change after it.
     pub(crate) effort: Recorded<Effort>,
-    /// The approval policy of the last turn.
+    /// The approval policy of the last turn, or of a change after it.
     pub(crate) approval: Recorded<ApprovalPolicy>,
-    /// The approvals reviewer of the last turn.
+    /// The approvals reviewer of the last turn, or of a change after it.
     pub(crate) reviewer: Recorded<ApprovalsReviewer>,
-    /// The sandbox of the last turn.
+    /// The sandbox of the last turn, or of a change after it.
     pub(crate) sandbox: Recorded<SandboxMode>,
     /// The highest `cli_version` any `session_meta` line records: the
     /// newest Codex that created a file of the lineage.
@@ -305,42 +318,126 @@ fn setting<T>(
     }
 }
 
+fn model(value: Option<&serde_json::Value>) -> Recorded<ModelName> {
+    setting(value, |text| {
+        ModelName::parse(text).map_err(|e| format!("not a model name Fabric passes: {e}"))
+    })
+}
+
+fn effort(value: Option<&serde_json::Value>) -> Recorded<Effort> {
+    setting(value, |text| {
+        Effort::from_record(text).ok_or_else(|| "not an effort codex 0.155.1 names".to_owned())
+    })
+}
+
+fn approval(value: Option<&serde_json::Value>) -> Recorded<ApprovalPolicy> {
+    setting(value, |text| {
+        ApprovalPolicy::from_record(text).ok_or_else(|| {
+            if text == "untrusted" {
+                "codex 0.155.1 refuses to start with it set".to_owned()
+            } else {
+                "not an approval policy Fabric passes, which are on-request and never".to_owned()
+            }
+        })
+    })
+}
+
+fn reviewer(value: Option<&serde_json::Value>) -> Recorded<ApprovalsReviewer> {
+    setting(value, |text| {
+        ApprovalsReviewer::from_record(text).ok_or_else(|| {
+            "not an approvals reviewer Fabric passes, which are user and auto_review".to_owned()
+        })
+    })
+}
+
+/// Why full access is never carried.
+const FULL_ACCESS: &str = "Fabric never passes full access, ADR 0006";
+
+/// Why a permission profile set between turns is not carried.
+const PROFILE_UNNAMED: &str =
+    "set between turns as a permission profile Fabric cannot name as a sandbox mode";
+
+fn sandbox(value: Option<&serde_json::Value>) -> Recorded<SandboxMode> {
+    setting(value, |text| {
+        SandboxMode::from_record(text).ok_or_else(|| {
+            if text == "danger-full-access" {
+                FULL_ACCESS.to_owned()
+            } else {
+                "not a sandbox Fabric passes, which are read-only and workspace-write".to_owned()
+            }
+        })
+    })
+}
+
+/// Whether a managed permission profile with a restricted file system
+/// lets Codex write anywhere; `None` for any other profile, such as one
+/// without a sandbox (`disabled`) or with an unrestricted file system.
+fn profile_writes(profile: &serde_json::Value) -> Option<bool> {
+    let file_system = &profile["file_system"];
+    if profile["type"] != "managed" || file_system["type"] != "restricted" {
+        return None;
+    }
+    let entries = file_system["entries"].as_array()?;
+    Some(entries.iter().any(|entry| entry["access"] == "write"))
+}
+
+/// The last `turn_context` read so far: its sandbox and the permission
+/// profile it recorded beside it.
+#[derive(Default)]
+struct LastTurn {
+    sandbox: Recorded<SandboxMode>,
+    profile: Option<serde_json::Value>,
+}
+
 impl RecordedSettings {
     /// Takes the settings of one `turn_context` payload, replacing all five.
-    fn take_turn(&mut self, payload: &serde_json::Value) {
-        self.model = setting(payload.get("model"), |text| {
-            ModelName::parse(text).map_err(|e| format!("not a model name Fabric passes: {e}"))
-        });
-        self.effort = setting(payload.get("effort"), |text| {
-            Effort::from_record(text).ok_or_else(|| "not an effort codex 0.155.1 names".to_owned())
-        });
-        self.approval = setting(payload.get("approval_policy"), |text| {
-            ApprovalPolicy::from_record(text).ok_or_else(|| {
-                if text == "untrusted" {
-                    "codex 0.155.1 refuses to start with it set".to_owned()
-                } else {
-                    "not an approval policy Fabric passes, which are on-request and never"
-                        .to_owned()
+    fn take_turn(&mut self, payload: &serde_json::Value, turn: &mut LastTurn) {
+        self.model = model(payload.get("model"));
+        self.effort = effort(payload.get("effort"));
+        self.approval = approval(payload.get("approval_policy"));
+        self.reviewer = reviewer(payload.get("approvals_reviewer"));
+        let policy = payload.get("sandbox_policy");
+        self.sandbox = sandbox(policy.and_then(|policy| policy.get("type")).or(policy));
+        *turn = LastTurn {
+            sandbox: self.sandbox.clone(),
+            profile: payload.get("permission_profile").cloned(),
+        };
+    }
+
+    /// Takes the settings of one `thread_settings_applied` snapshot, the
+    /// record of a change between turns. It holds a permission profile,
+    /// not a sandbox mode: the sandbox is the last turn's when the profile
+    /// is the one that turn recorded, or still writes after a
+    /// workspace-write turn; read-only when it writes nowhere, so a
+    /// sandbox narrowed between turns is not widened back; otherwise not
+    /// carried. A snapshot with no profile leaves the sandbox as it was.
+    fn take_snapshot(&mut self, settings: &serde_json::Value, turn: &LastTurn) {
+        self.model = model(settings.get("model"));
+        self.effort = effort(settings.get("reasoning_effort"));
+        self.approval = approval(settings.get("approval_policy"));
+        self.reviewer = reviewer(settings.get("approvals_reviewer"));
+        let profile = match settings.get("permission_profile") {
+            None | Some(serde_json::Value::Null) => return,
+            Some(profile) => profile,
+        };
+        self.sandbox = if turn.profile.as_ref() == Some(profile) {
+            turn.sandbox.clone()
+        } else {
+            match profile_writes(profile) {
+                Some(false) => Recorded::Carried(SandboxMode::ReadOnly),
+                Some(true) if turn.sandbox == Recorded::Carried(SandboxMode::WorkspaceWrite) => {
+                    Recorded::Carried(SandboxMode::WorkspaceWrite)
                 }
-            })
-        });
-        self.reviewer = setting(payload.get("approvals_reviewer"), |text| {
-            ApprovalsReviewer::from_record(text).ok_or_else(|| {
-                "not an approvals reviewer Fabric passes, which are user and auto_review".to_owned()
-            })
-        });
-        let sandbox = payload.get("sandbox_policy");
-        let mode = sandbox.and_then(|policy| policy.get("type")).or(sandbox);
-        self.sandbox = setting(mode, |text| {
-            SandboxMode::from_record(text).ok_or_else(|| {
-                if text == "danger-full-access" {
-                    "Fabric never passes full access, ADR 0006".to_owned()
-                } else {
-                    "not a sandbox Fabric passes, which are read-only and workspace-write"
-                        .to_owned()
-                }
-            })
-        });
+                _ if profile["type"] == "disabled" => Recorded::NotCarried {
+                    value: "danger-full-access".to_owned(),
+                    reason: FULL_ACCESS.to_owned(),
+                },
+                _ => Recorded::NotCarried {
+                    value: shown(&profile["type"]),
+                    reason: PROFILE_UNNAMED.to_owned(),
+                },
+            }
+        };
     }
 }
 
@@ -350,6 +447,7 @@ impl RecordedSettings {
 /// not a version is an error, because the guard cannot compare it.
 pub(crate) fn recorded(lineage: &[RolloutFile]) -> Result<RecordedSettings, HarnessError> {
     let mut settings = RecordedSettings::default();
+    let mut turn = LastTurn::default();
     for file in lineage.iter().rev() {
         let mut lines = open_lines(file)?;
         let mut line = Vec::new();
@@ -362,8 +460,14 @@ pub(crate) fn recorded(lineage: &[RolloutFile]) -> Result<RecordedSettings, Harn
             {
                 break;
             }
-            let turn = contains(&line, b"\"turn_context\"");
-            if !turn && !contains(&line, b"\"session_meta\"") {
+            if ![
+                &b"\"turn_context\""[..],
+                b"\"session_meta\"",
+                b"\"thread_settings_applied\"",
+            ]
+            .iter()
+            .any(|kind| contains(&line, kind))
+            {
                 continue;
             }
             let record: serde_json::Value = match serde_json::from_slice(&line) {
@@ -375,7 +479,10 @@ pub(crate) fn recorded(lineage: &[RolloutFile]) -> Result<RecordedSettings, Harn
             };
             let payload = &record["payload"];
             match record["type"].as_str() {
-                Some("turn_context") => settings.take_turn(payload),
+                Some("turn_context") => settings.take_turn(payload, &mut turn),
+                Some("event_msg") if payload["type"] == "thread_settings_applied" => {
+                    settings.take_snapshot(&payload["thread_settings"], &turn);
+                }
                 Some("session_meta") => {
                     let Some(text) = payload.get("cli_version").and_then(|v| v.as_str()) else {
                         continue;
@@ -543,6 +650,134 @@ mod tests {
             }
         );
         assert_eq!(read.writer.unwrap().as_str(), "0.163.0-alpha.10.2");
+    }
+
+    /// A permission profile as Codex 0.155.1 records one: managed, with
+    /// a read entry for the root and a write entry for each of `writes`.
+    fn profile(writes: &[&str]) -> String {
+        let mut entries = vec![
+            "{\"access\":\"read\",\"path\":{\"type\":\"special\",\"value\":{\"kind\":\"root\"}}}"
+                .to_owned(),
+        ];
+        entries.extend(writes.iter().map(|path| {
+            format!("{{\"access\":\"write\",\"path\":{{\"type\":\"path\",\"path\":\"{path}\"}}}}")
+        }));
+        format!(
+            "{{\"type\":\"managed\",\"file_system\":{{\"type\":\"restricted\",\"entries\":[{}]}},\"network\":\"restricted\"}}",
+            entries.join(",")
+        )
+    }
+
+    /// A `turn_context` that records `permission_profile` beside its sandbox.
+    fn turn_in(model: &str, effort: &str, sandbox: &str, profile: &str) -> String {
+        format!(
+            "{{\"type\":\"turn_context\",\"payload\":{{\"model\":\"{model}\",\"effort\":\"{effort}\",\"approval_policy\":\"on-request\",\"approvals_reviewer\":\"user\",\"sandbox_policy\":{{\"type\":\"{sandbox}\"}},\"permission_profile\":{profile}}}}}\n"
+        )
+    }
+
+    /// The `event_msg` Codex writes when a setting changes between turns,
+    /// such as `/model` or `/permissions` in the terminal.
+    fn applied(model: &str, effort: &str, approval: &str, reviewer: &str, profile: &str) -> String {
+        format!(
+            "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"thread_settings_applied\",\"thread_id\":\"{THREAD}\",\"thread_settings\":{{\"model\":\"{model}\",\"model_provider_id\":\"openai\",\"approval_policy\":\"{approval}\",\"approvals_reviewer\":\"{reviewer}\",\"permission_profile\":{profile},\"cwd\":\"/w\",\"reasoning_effort\":\"{effort}\"}}}}}}\n"
+        )
+    }
+
+    fn read_suffix(records: &[String]) -> RecordedSettings {
+        let dir = tempfile::tempdir().unwrap();
+        let suffix = format!("{}{}", meta("0.155.1", Some(THREAD)), records.concat());
+        recorded(&lineage(dir.path(), &meta("0.155.1", None), &suffix)).unwrap()
+    }
+
+    /// A setting changed between turns, which Codex records as
+    /// `thread_settings_applied` and itself restores on resume when it is
+    /// the newer record, wins over the last turn; a turn after it wins
+    /// again. Seen on the owner's Mac: a last turn on gpt-5.5 at xhigh,
+    /// then `/model` to gpt-6-astra at medium.
+    #[test]
+    fn the_newer_of_the_last_turn_and_a_settings_change_is_read() {
+        let ww = profile(&["/w", "/w/.git", "/tmp"]);
+        let read = read_suffix(&[
+            turn_in("gpt-5.5", "xhigh", "workspace-write", &ww),
+            applied(
+                "gpt-6-astra",
+                "medium",
+                "never",
+                "auto_review",
+                &profile(&["/w"]),
+            ),
+        ]);
+        assert_eq!(
+            (
+                read.model,
+                read.effort,
+                read.approval,
+                read.reviewer,
+                read.sandbox
+            ),
+            (
+                Recorded::Carried(ModelName::parse("gpt-6-astra").unwrap()),
+                Recorded::Carried(Effort::Medium),
+                Recorded::Carried(ApprovalPolicy::Never),
+                Recorded::Carried(ApprovalsReviewer::AutoReview),
+                Recorded::Carried(SandboxMode::WorkspaceWrite),
+            )
+        );
+        let read = read_suffix(&[
+            applied("gpt-6-astra", "medium", "never", "auto_review", &ww),
+            turn_in("gpt-5.5", "xhigh", "read-only", &profile(&[])),
+        ]);
+        assert_eq!(
+            (read.model, read.effort, read.reviewer, read.sandbox),
+            (
+                Recorded::Carried(ModelName::parse("gpt-5.5").unwrap()),
+                Recorded::Carried(Effort::XHigh),
+                Recorded::Carried(ApprovalsReviewer::User),
+                Recorded::Carried(SandboxMode::ReadOnly),
+            )
+        );
+    }
+
+    /// A settings change records a permission profile, not a sandbox
+    /// mode. One that writes nowhere is read-only, so a sandbox narrowed
+    /// between turns is not widened back; one equal to the last turn's,
+    /// or that still writes after a workspace-write turn, keeps the turn's
+    /// mode; full access and any other profile are not carried.
+    #[test]
+    fn a_permission_profile_set_between_turns_gives_the_sandbox_it_names() {
+        let ww = profile(&["/w", "/tmp"]);
+        let after = |sandbox: &str, turn_profile: &str, set: &str| {
+            read_suffix(&[
+                turn_in("gpt-6-sol", "high", sandbox, turn_profile),
+                applied("gpt-6-sol", "high", "on-request", "user", set),
+            ])
+            .sandbox
+        };
+        assert_eq!(
+            after("workspace-write", &ww, &profile(&[])),
+            Recorded::Carried(SandboxMode::ReadOnly)
+        );
+        assert_eq!(
+            after("workspace-write", &ww, &profile(&["/w"])),
+            Recorded::Carried(SandboxMode::WorkspaceWrite)
+        );
+        assert_eq!(
+            after("read-only", &ww, &ww),
+            Recorded::Carried(SandboxMode::ReadOnly)
+        );
+        assert_eq!(
+            reason(&after("read-only", &profile(&[]), &ww)),
+            "managed: set between turns as a permission profile Fabric cannot name as a sandbox mode"
+        );
+        assert_eq!(
+            reason(&after("workspace-write", &ww, "{\"type\":\"disabled\"}")),
+            "danger-full-access: Fabric never passes full access, ADR 0006"
+        );
+        let unrestricted = "{\"type\":\"managed\",\"file_system\":{\"type\":\"unrestricted\"},\"network\":\"enabled\"}";
+        assert_eq!(
+            reason(&after("workspace-write", &ww, unrestricted)),
+            "managed: set between turns as a permission profile Fabric cannot name as a sandbox mode"
+        );
     }
 
     fn reason<T>(recorded: &Recorded<T>) -> String {
