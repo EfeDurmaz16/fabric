@@ -5,13 +5,15 @@
 //! then every variable of its environment as `env:NAME=value`, to
 //! `$FAKE_LOG`.
 //! `project_key` states Claude's project directory rule independently of
-//! the adapter's own.
+//! the adapter's own. A test binary that uses this module also declares
+//! `mod executable;`, which writes the fake.
 
 use std::ffi::OsString;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use fabric_core::path::AbsPath;
+
+use crate::executable::write_executable;
 
 const SCRIPT: &str = r#"#!/bin/sh
 case "$1" in
@@ -28,8 +30,7 @@ pub fn fake_claude(dir: &Path) -> (PathBuf, OsString) {
     let script = bin.join("claude");
     if !script.exists() {
         std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(&script, SCRIPT).unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&script, SCRIPT.as_bytes());
     }
     (script, bin.into_os_string())
 }

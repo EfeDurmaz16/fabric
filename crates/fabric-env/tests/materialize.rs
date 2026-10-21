@@ -9,9 +9,10 @@
 
 use std::error::Error;
 use std::fs;
-use std::io;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::io::{self, Write};
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use fabric_core::env::{EnvVarName, RunWhen};
@@ -66,6 +67,35 @@ fn write(root: &Path, files: Files) -> io::Result<()> {
         fs::write(full, text)?;
     }
     Ok(())
+}
+
+/// Writes `text` to `path` with mode `0755` through a short `sh`, so this
+/// process never holds the file open for writing. Linux refuses to run a
+/// file open for writing (`ETXTBSY`), and a child another test forked
+/// while this process held it open would keep it open until that child
+/// ran its own program. A temporary file renamed into place would not
+/// help: the descriptor follows the file.
+fn write_executable(path: &Path, text: &str) -> io::Result<()> {
+    let mut writer = Command::new("/bin/sh")
+        .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()?;
+    // The pipe closes at the end of the statement, so `cat` sees the end.
+    writer
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("no pipe to the writer"))?
+        .write_all(text.as_bytes())?;
+    let status = writer.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "writing {} failed: {status}",
+            path.display()
+        )))
+    }
 }
 
 /// Takes the tree's lock in this test binary's own lock directory, as resume does before restore.
@@ -161,12 +191,11 @@ fn an_installer_marker_left_by_a_failed_install_is_not_proof() {
     .unwrap();
     let bin = tempfile::tempdir().unwrap();
     let npm = bin.path().join("npm");
-    fs::write(
+    write_executable(
         &npm,
         "#!/bin/sh\nmkdir -p node_modules/a && echo {} > node_modules/.package-lock.json && [ -e postinstall-ok ]\n",
     )
     .unwrap();
-    fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).unwrap();
     let node = NodeEnv::new(Some(bin.path().as_os_str().to_owned()), Vec::new());
     let resume = || plan(&detect(dir.path(), &[]).unwrap(), &lock, &node).unwrap();
 

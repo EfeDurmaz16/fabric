@@ -9,6 +9,7 @@
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -82,14 +83,12 @@ impl Env {
     /// line, to `fake_claude_args` and exits.
     pub fn install_fake_claude(&self) -> Fallible {
         let claude = self.root.join("bin").join("claude");
-        fs::write(
+        write_executable(
             &claude,
-            "#!/bin/sh\n\
+            b"#!/bin/sh\n\
              if [ \"$1\" = --version ]; then echo '2.1.294 (Claude Code)'; exit 0; fi\n\
              printf '%s\\n' \"$@\" > \"$HOME/claude-args\"\n",
-        )?;
-        fs::set_permissions(&claude, fs::Permissions::from_mode(0o755))?;
-        Ok(())
+        )
     }
 
     /// The arguments the fake `claude` was last launched with.
@@ -130,6 +129,32 @@ impl Env {
             command.env("FABRIC_LOG", level);
         }
         command
+    }
+}
+
+/// Writes `contents` to `path` with mode `0755` through a short `sh`, so
+/// this process never holds the file open for writing. Linux refuses to
+/// run a file open for writing (`ETXTBSY`), and a child another test
+/// forked while this process held it open would keep it open until that
+/// child ran its own program. A temporary file renamed into place would
+/// not help: the descriptor follows the file.
+fn write_executable(path: &Path, contents: &[u8]) -> Fallible {
+    let mut writer = Command::new("/bin/sh")
+        .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()?;
+    // The pipe closes at the end of the statement, so `cat` sees the end.
+    writer
+        .stdin
+        .take()
+        .ok_or("no pipe to the writer")?
+        .write_all(contents)?;
+    let status = writer.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("writing {} failed: {status}", path.display()).into())
     }
 }
 
@@ -185,7 +210,7 @@ impl OtherClaude {
         let dir = env.root.join("other");
         fs::create_dir_all(&dir)?;
         let claude = dir.join("claude");
-        fs::copy(env!("CARGO_BIN_EXE_fabric-fake-agent"), &claude)?;
+        write_executable(&claude, &fs::read(env!("CARGO_BIN_EXE_fabric-fake-agent"))?)?;
         let other = Self(
             Command::new(&claude)
                 .env_clear()

@@ -21,6 +21,7 @@ use fabric_harness::manifest::StateManifest;
 use fabric_harness::{Harness, HarnessError, Launch, SessionId};
 
 mod common;
+mod executable;
 use common::{abs, fake_claude, project_key};
 
 const SID: &str = "9c9796f0-2682-4546-a963-d314b3ad543f";
