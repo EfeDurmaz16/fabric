@@ -294,10 +294,12 @@ export class FabricClient {
   }
 
   private async connect(): Promise<{ exchange: Exchange; welcome: Welcome }> {
+    // Resolved once: the connect goes to the path the checks passed, even
+    // if the working directory changes while they wait.
     const socket = resolve(this.socketPath);
     await checkPrivate(dirname(socket));
     await checkPrivate(socket);
-    const exchange = openExchange(await dial(this.socketPath));
+    const exchange = openExchange(await dial(socket));
     try {
       let answer: HelloAnswer | null;
       try {

@@ -4,7 +4,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import {
   clientEnvFromProcess,
@@ -331,6 +331,22 @@ describe("the client", () => {
     const error = await rejection(new FabricClient({ socketPath: link }).hello());
     expect(error).toBeInstanceOf(UntrustedError);
     expect(node.connections).toHaveLength(0);
+  });
+
+  // Review finding on PR #13: the checks resolved a relative socket path once and the connect resolved it
+  // again, so a working directory changed while a check waited sent the request to a socket never checked.
+  test("connects to the socket its checks passed when the working directory changes meanwhile", async () => {
+    const reply = { type: "done", reply: { kind: "job_list", jobs: [], closed: [] } };
+    const checked = await fakeNode(answers(reply));
+    const unchecked = await fakeNode(answers(reply), tempDir(0o755));
+    const cwd = process.cwd();
+    cleanups.unshift(() => process.chdir(cwd));
+    process.chdir(dirname(checked.socketPath));
+    const listed = new FabricClient({ socketPath: "fabric.sock" }).jobList();
+    process.chdir(dirname(unchecked.socketPath));
+    await listed;
+    expect(checked.connections).toHaveLength(1);
+    expect(unchecked.connections).toHaveLength(0);
   });
 
   test("rejects a socket nothing listens on with NoDaemon", async () => {
