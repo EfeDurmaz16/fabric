@@ -822,7 +822,9 @@ impl Node {
                 session,
                 manifest.files().len()
             ));
-            let known_writer = known_writer(&manifest).or(record.known_writer.clone());
+            // A Codex capture records at least the known writer it was
+            // given, so this keeps it or raises it.
+            let known_writer = known_writer(&manifest);
             local::write(
                 &job.dir().session(),
                 &SessionRecord {
@@ -2167,10 +2169,18 @@ fn session_floor(job: &Job) -> Result<Option<HarnessVersion>, NodeError> {
 }
 
 /// The newest harness version known to have written the session a
-/// capture holds, read from its manifest; `None`, logged, when the
-/// manifest records none that parses, and the resume guard then has only
-/// what the session's own files record.
+/// capture holds, read from its manifest, for a Codex session only; `None`,
+/// logged, when a Codex manifest records none that parses, and the resume
+/// guard then has only what the session's own files record. A Codex
+/// resume writes no version into the rollout, so the job carries this
+/// one. A Claude transcript records the version of every Claude that
+/// wrote a line, and an ACP agent's state is opaque, so for them the
+/// version a capture records is only the one installed where it ran,
+/// which no guard reads (ADR 0006).
 fn known_writer(manifest: &StateManifest) -> Option<HarnessVersion> {
+    if *manifest.kind() != HarnessKind::Codex {
+        return None;
+    }
     let text = manifest.harness_version()?;
     match HarnessVersion::parse(text) {
         Ok(version) => Some(version),
@@ -2810,6 +2820,36 @@ pub(crate) mod tests {
                 .unwrap()
                 .and_then(|record| record.known_writer),
             Some(HarnessVersion::parse("0.160.0").unwrap())
+        );
+    }
+
+    /// Only a Codex capture gives the job a known writer: for Claude the
+    /// version a capture records is only the one installed where it ran,
+    /// not one known to have written the session, and nothing guards on
+    /// it, so a restore or a capture of a Claude session records none.
+    #[test]
+    fn only_a_codex_capture_gives_a_known_writer() {
+        let manifest = |kind: HarnessKind, version: &str| -> StateManifest {
+            serde_json::from_value(serde_json::json!({
+                "format": fabric_harness::manifest::MANIFEST_FORMAT,
+                "kind": kind,
+                "session": "s1",
+                "root": "/w",
+                "home": "/h",
+                "harness_version": version,
+                "captured_at_ms": 0,
+                "files": [],
+                "redactions": [],
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            known_writer(&manifest(HarnessKind::Codex, "0.160.0")),
+            Some(HarnessVersion::parse("0.160.0").unwrap())
+        );
+        assert_eq!(
+            known_writer(&manifest(HarnessKind::ClaudeCode, "2.1.294")),
+            None
         );
     }
 
