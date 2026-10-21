@@ -49,25 +49,27 @@
 //! finding F10a): Codex resumes with the model of this node's
 //! `config.toml`, not the one the thread ran with, so the launch reads
 //! the last `turn_context` of the lineage and passes its model, effort,
-//! sandbox and, on a terminal run, approval policy, each one the adapter
-//! was configured with winning (`overrides::effective`); `codex exec`
-//! sets its own approval policy. Before anything starts it asks the
-//! binary it would run for its version and refuses when that is older
-//! than the newest Codex known to have written the thread, or unreadable
-//! (`version::refuse_older`, gate finding F10b). That is the highest
-//! `cli_version` the lineage records or the known writer the job carried
-//! (`with_known_writer`), whichever is newer: Codex writes `session_meta`,
-//! with its version, only when it creates a rollout, and a resume appends
-//! with no version at all (`codex-rs/rollout/src/recorder.rs` at
-//! `rust-v0.155.1`, `RolloutRecorderParams::Resume` with `meta: None`), so
-//! the rollout of a thread created by 0.142.4 and continued by 0.155.1
-//! names only 0.142.4. A capture records the installed version, or the
-//! known writer when that is newer, so the job carries the newest Codex
-//! that ran the thread under Fabric to the next node. A Codex that resumed
-//! the thread outside Fabric, such as a desktop build newer than the CLI
-//! on the same node, leaves no version anywhere and is not seen. A thread
-//! with no rollout on this node has no bytes to protect, so it is
-//! launched as before and Codex says it found none. A launch with no
+//! sandbox and, on a terminal run, approval policy, each one the
+//! adapter was configured with winning (`overrides::effective`); `codex
+//! exec` sets its own approval policy and records the `never` it
+//! forced, so a terminal run does not carry a recorded `never`. Before
+//! anything starts it asks the binary it would run for its version and
+//! refuses when that is older than the newest Codex known to have
+//! written the thread, or unreadable (`version::refuse_older`, gate
+//! finding F10b). That is the highest `cli_version` the lineage records
+//! or the known writer the job carried (`with_known_writer`), whichever
+//! is newer: Codex writes `session_meta`, with its version, only when
+//! it creates a rollout, and a resume appends with no version at all
+//! (`codex-rs/rollout/src/recorder.rs` at `rust-v0.155.1`,
+//! `RolloutRecorderParams::Resume` with `meta: None`), so the rollout
+//! of a thread created by 0.142.4 and continued by 0.155.1 names only
+//! 0.142.4. A capture records the installed version, or the known
+//! writer when that is newer, so the job carries the newest Codex that
+//! ran the thread under Fabric to the next node. A Codex that resumed
+//! the thread outside Fabric, such as a desktop build newer than the
+//! CLI on the same node, leaves no version anywhere and is not seen. A
+//! thread with no rollout on this node has no bytes to protect, so it
+//! is launched as before and Codex says it found none. A launch with no
 //! session reads nothing and passes only what was configured.
 
 pub mod overrides;

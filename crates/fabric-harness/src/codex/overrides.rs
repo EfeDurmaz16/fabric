@@ -22,7 +22,12 @@
 //! as a typed override that wins over `-c`, and drops it only when the
 //! node sends approvals to auto review, which then uses the node's own
 //! (`codex-rs/exec/src/lib.rs` at `rust-v0.155.1`, `ConfigOverrides` and
-//! `build_exec_config`).
+//! `build_exec_config`). A turn `codex exec` ran therefore records the
+//! `never` it forced (all 77 exec turns in the owner's rollouts whose
+//! approvals go to the user, counted on 2026-10-21), and nothing in a
+//! `turn_context` tells an exec turn from a terminal one, so a terminal
+//! launch does not carry a recorded `never` either: it reports it as left
+//! out, and Codex uses the node's own policy.
 
 use crate::harness::{LaunchSettings, ModelName, NotCarried, Origin, PassedSetting, SettingName};
 
@@ -185,6 +190,22 @@ fn pick<T: Clone>(
 /// Why a headless launch passes no approval policy.
 const EXEC_SETS_APPROVAL: &str = "codex exec sets it: never, or this node's own under auto review";
 
+/// Why a terminal launch does not carry a recorded `never`.
+const EXEC_RECORDS_NEVER: &str =
+    "codex exec records never for the turns it runs, so it may not be the session's own";
+
+/// The approval a terminal launch may carry from the session: any but a
+/// recorded `never`, which may be the one `codex exec` forced.
+fn terminal_approval(recorded: &Recorded<ApprovalPolicy>) -> Recorded<ApprovalPolicy> {
+    match recorded {
+        Recorded::Carried(ApprovalPolicy::Never) => Recorded::NotCarried {
+            value: ApprovalPolicy::Never.as_str().to_owned(),
+            reason: EXEC_RECORDS_NEVER.to_owned(),
+        },
+        other => other.clone(),
+    }
+}
+
 /// One field a launch cannot pass: the value it would have passed, the
 /// pin or else the session's, is reported as left out for `reason`; a
 /// value Fabric does not carry keeps its own reason.
@@ -211,7 +232,9 @@ fn leave_out<T>(
 /// The overrides a launch passes, and what to say about them: each field
 /// the adapter was configured with, else the session's own when the
 /// launch resumes one and Fabric carries its value. A `headless` launch
-/// passes no approval policy, because `codex exec` sets its own.
+/// passes no approval policy, because `codex exec` sets its own, and a
+/// terminal launch does not carry a recorded `never`, because `codex
+/// exec` records the one it forced.
 pub(crate) fn effective(
     pinned: Option<&CodexOverrides>,
     recorded: Option<&RecordedSettings>,
@@ -253,10 +276,11 @@ pub(crate) fn effective(
         );
         None
     } else {
+        let recorded_approval = recorded_approval.map(terminal_approval);
         pick(
             SettingName::Approval,
             pinned_approval,
-            recorded_approval,
+            recorded_approval.as_ref(),
             spell_approval,
             &mut report,
         )
@@ -367,5 +391,39 @@ mod tests {
                 EXEC_SETS_APPROVAL
             )]
         );
+    }
+
+    /// A turn `codex exec` ran records the `never` it forced, and nothing
+    /// in the record says which turns those were, so a terminal resume
+    /// after a headless turn does not carry `never`: it says so, and Codex
+    /// asks as the node's own policy says. A pinned `never` still passes.
+    #[test]
+    fn a_terminal_launch_does_not_carry_a_recorded_never() {
+        let after_exec = RecordedSettings {
+            approval: Recorded::Carried(ApprovalPolicy::Never),
+            ..recorded()
+        };
+        let (overrides, report) = effective(None, Some(&after_exec), false);
+        assert_eq!(overrides.approval, None);
+        assert!(
+            report
+                .passed
+                .iter()
+                .all(|p| p.name != SettingName::Approval)
+        );
+        assert_eq!(
+            report.not_carried.last(),
+            Some(&NotCarried::new(
+                SettingName::Approval,
+                "never",
+                EXEC_RECORDS_NEVER
+            ))
+        );
+        let pinned = CodexOverrides {
+            approval: Some(ApprovalPolicy::Never),
+            ..CodexOverrides::default()
+        };
+        let (overrides, _) = effective(Some(&pinned), Some(&after_exec), false);
+        assert_eq!(overrides.approval, Some(ApprovalPolicy::Never));
     }
 }
