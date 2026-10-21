@@ -15,6 +15,7 @@ import {
   encodeFrame,
   FabricClient,
   IncompatibleError,
+  InvalidRequestError,
   JobId,
   type KnownEvent,
   NoDaemonError,
@@ -279,6 +280,23 @@ describe("the client", () => {
     await new FabricClient({ socketPath: listing.socketPath }).doctor({ env });
     const [sent] = await Promise.all(listing.connections);
     expect(sent?.[1]).toMatchObject({ op: "doctor", env: { roots: { cargo_home: "/Users/me/.cargo" } } });
+  });
+
+  // Review finding on PR #13: a goal, note or reason cut with `.slice()` can end in half an emoji, which the
+  // schema accepted and the node refused as bad_request. It is refused before the client connects.
+  test("refuses a string holding a lone surrogate before it connects", async () => {
+    const node = await fakeNode(answers());
+    const client = new FabricClient({ socketPath: node.socketPath });
+    const cut = "make it faster \u{1F680}".slice(0, 16);
+    const harness = { kind: "claude_code" } as const;
+    for (const call of [
+      client.jobNew(SystemPath.parse("/Users/me/oss/some-repo"), cut, harness),
+      client.jobDecide(JOB, "approve", cut),
+      client.jobSteal(JOB, { reason: cut }),
+    ]) {
+      expect(await rejection(call)).toBeInstanceOf(InvalidRequestError);
+    }
+    expect(node.connections).toHaveLength(0);
   });
 
   test("rejects a node that closes right after the hello with ClosedBeforeWelcome", async () => {

@@ -55,6 +55,20 @@ export type Epoch = z.infer<typeof Epoch>;
 export const Pid = z.number().int().min(1).max(U32_MAX).brand<"Pid">();
 export type Pid = z.infer<typeof Pid>;
 
+// Text. The node's JSON reader refuses a lone UTF-16 surrogate, such as
+// half an emoji cut off by `.slice()`, which a JavaScript string may hold
+// but a Rust string may not. Every string in a message is checked, so a
+// request holding one never leaves the client, as Rust refuses it too.
+
+const LONE_SURROGATE = /\p{Cs}/u;
+
+/** Whether `text` is Unicode text, with no UTF-16 surrogate apart from its pair. */
+export function isUnicodeText(text: string): boolean {
+  return !LONE_SURROGATE.test(text);
+}
+
+const UnicodeText = z.string().refine(isUnicodeText, "holds a lone UTF-16 surrogate, which is not Unicode text");
+
 // Ids, each in its one text form.
 
 // 26 uppercase Crockford base32 characters; the first carries 3 bits, so 0 to 7.
@@ -89,11 +103,11 @@ export const SessionId = z.string().regex(SESSION_ID, "not a session id").brand<
 export type SessionId = z.infer<typeof SessionId>;
 
 /** A program to look up on `PATH`: never a path, never an option, never a control character. */
-export const ProgramName = z.string().regex(PROGRAM_NAME, "not a bare program name").brand<"ProgramName">();
+export const ProgramName = UnicodeText.regex(PROGRAM_NAME, "not a bare program name").brand<"ProgramName">();
 export type ProgramName = z.infer<typeof ProgramName>;
 
-/** A path on the node. Only UTF-8 paths cross the socket, and JSON strings are always text. */
-const Path = z.string();
+/** A path on the node. Only UTF-8 paths cross the socket, so a path is Unicode text. */
+const Path = UnicodeText;
 
 /** `ip:port` or `[ipv6]:port`, as Rust's `SocketAddr` reads it. */
 const SocketAddr = z.string().refine(isSocketAddr, "not an ip:port socket address");
@@ -178,7 +192,7 @@ export type RefusalKind = z.infer<typeof RefusalKind>;
 export const Harness = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("claude_code") }),
   z.object({ kind: z.literal("codex") }),
-  z.object({ kind: z.literal("acp"), program: ProgramName, args: z.array(z.string()) }),
+  z.object({ kind: z.literal("acp"), program: ProgramName, args: z.array(UnicodeText) }),
 ]);
 export type Harness = z.infer<typeof Harness>;
 
@@ -186,11 +200,11 @@ export const HarnessSession = z.object({ harness: Harness, session: SessionId })
 export type HarnessSession = z.infer<typeof HarnessSession>;
 
 export const PreflightRow = z.object({
-  fact: z.string(),
-  here: optional(z.string()),
-  peer: optional(z.string()),
+  fact: UnicodeText,
+  here: optional(UnicodeText),
+  peer: optional(UnicodeText),
   outcome: Outcome,
-  note: z.string(),
+  note: UnicodeText,
 });
 export type PreflightRow = z.infer<typeof PreflightRow>;
 
@@ -217,7 +231,7 @@ const reasonOptions = [
   z.object({ code: z.literal("fork_behind"), job: JobId, peer: NodeId, epoch: Epoch }),
   z.object({ code: z.literal("unreachable"), peer: NodeId }),
   z.object({ code: z.literal("unknown_peer"), node: NodeId }),
-  z.object({ code: z.literal("preflight"), facts: z.array(z.string()) }),
+  z.object({ code: z.literal("preflight"), facts: z.array(UnicodeText) }),
   z.object({ code: z.literal("steal_needs_force"), warning: StealWarning }),
   z.object({ code: z.literal("harness_running"), job: JobId, pid: Pid }),
   z.object({ code: z.literal("harness_gone"), pid: Pid }),
@@ -229,7 +243,7 @@ const reasonOptions = [
   z.object({ code: z.literal("unfinished"), job: JobId, step: Step }),
   z.object({ code: z.literal("no_snapshot"), job: JobId }),
   z.object({ code: z.literal("workspace_occupied"), root: Path }),
-  z.object({ code: z.literal("bad_address"), text: z.string() }),
+  z.object({ code: z.literal("bad_address"), text: UnicodeText }),
   z.object({ code: z.literal("peer"), peer: NodeId }),
   z.object({ code: z.literal("fetch"), snapshot: SnapshotId, peer: NodeId }),
   z.object({ code: z.literal("bad_request") }),
@@ -285,7 +299,7 @@ export const REASON_KIND: Readonly<Record<KnownReason["code"], RefusalKind>> = {
  * code and the sentence still work.
  */
 export const Refusal = z
-  .object({ kind: RefusalKind, reason: Reason, message: z.string() })
+  .object({ kind: RefusalKind, reason: Reason, message: UnicodeText })
   .refine(({ kind, reason }) => reason.code === "unrecognized" || REASON_KIND[reason.code] === kind, {
     message: "the refusal's kind does not agree with its reason",
     path: ["kind"],
@@ -310,7 +324,7 @@ const eventOptions = [
     bytes: count,
     new_objects: count,
   }),
-  z.object({ kind: z.literal("left_behind"), path: z.string() }),
+  z.object({ kind: z.literal("left_behind"), path: UnicodeText }),
   z.object({ kind: z.literal("no_departure_record"), session: SessionId }),
   z.object({ kind: z.literal("suspended"), snapshot: SnapshotId, epoch: Epoch }),
   z.object({ kind: z.literal("replicated"), peer: NodeId }),
@@ -320,7 +334,7 @@ const eventOptions = [
   z.object({ kind: z.literal("target_holds_copy"), target: NodeId }),
   z.object({ kind: z.literal("move_started"), move_id: MoveId, target: NodeId }),
   z.object({ kind: z.literal("no_answer"), target: NodeId, error: Refusal }),
-  z.object({ kind: z.literal("move_gave_up"), detail: z.string() }),
+  z.object({ kind: z.literal("move_gave_up"), detail: UnicodeText }),
   z.object({ kind: z.literal("imported"), owner: NodeId, epoch: Epoch }),
   z.object({ kind: z.literal("declined"), target: NodeId, epoch: Epoch }),
   z.object({ kind: z.literal("decision_left"), standing: Standing }),
@@ -336,8 +350,8 @@ const eventOptions = [
   z.object({ kind: z.literal("workspace_gone"), root: Path }),
   z.object({ kind: z.literal("workspace_in_place"), root: Path }),
   z.object({ kind: z.literal("root_chosen"), root: Path, recorded: optional(Path) }),
-  z.object({ kind: z.literal("cache_carried"), path: z.string() }),
-  z.object({ kind: z.literal("cache_rebuilt"), path: z.string(), why: z.string() }),
+  z.object({ kind: z.literal("cache_carried"), path: UnicodeText }),
+  z.object({ kind: z.literal("cache_rebuilt"), path: UnicodeText, why: UnicodeText }),
   z.object({ kind: z.literal("restored"), snapshot: SnapshotId, files: count, bytes: count }),
   z.object({ kind: z.literal("orphan_set_aside"), root: Path, left_at: Epoch, epoch: Epoch, to: Path }),
   z.object({ kind: z.literal("session_restored"), harness: Harness, session: SessionId }),
@@ -409,17 +423,17 @@ export const Process = z.discriminatedUnion("kind", [
 export type Process = z.infer<typeof Process>;
 
 const ledgerEventOptions = [
-  z.object({ kind: z.literal("created"), created_by: NodeId, harness: Harness, goal: z.string() }),
+  z.object({ kind: z.literal("created"), created_by: NodeId, harness: Harness, goal: UnicodeText }),
   z.object({ kind: z.literal("move_started"), move_id: MoveId, target: NodeId }),
   z.object({ kind: z.literal("move_imported"), move_id: MoveId, from: NodeId }),
   z.object({ kind: z.literal("move_aborted"), move_id: MoveId }),
-  z.object({ kind: z.literal("stolen"), by: NodeId, from: NodeId, reason: z.string() }),
+  z.object({ kind: z.literal("stolen"), by: NodeId, from: NodeId, reason: UnicodeText }),
   z.object({ kind: z.literal("snapshot_published"), snapshot: SnapshotId, parent: optional(SnapshotId) }),
   z.object({ kind: z.literal("suspended"), snapshot: SnapshotId }),
   z.object({ kind: z.literal("resumed"), node: NodeId, snapshot: optional(SnapshotId), harness: Harness }),
   z.object({ kind: z.literal("env_spec_changed"), env_spec: EnvSpecId }),
-  z.object({ kind: z.literal("decision_recorded"), text: z.string() }),
-  z.object({ kind: z.literal("note"), text: z.string() }),
+  z.object({ kind: z.literal("decision_recorded"), text: UnicodeText }),
+  z.object({ kind: z.literal("note"), text: UnicodeText }),
 ] as const;
 
 /** Every ledger record kind this client knows, read from the schema. */
@@ -435,16 +449,16 @@ export type LedgerEvent = z.infer<typeof LedgerEvent>;
 export const LogRecord = z.object({ id: EventId, epoch: Epoch, at: count, event: LedgerEvent });
 export type LogRecord = z.infer<typeof LogRecord>;
 
-export const Peer = z.object({ node: NodeId, addrs: z.array(z.string()), connected: z.boolean() });
+export const Peer = z.object({ node: NodeId, addrs: z.array(UnicodeText), connected: z.boolean() });
 export type Peer = z.infer<typeof Peer>;
 
-export const JobSummary = z.object({ job: JobId, standing: Standing, epoch: Epoch, goal: z.string() });
+export const JobSummary = z.object({ job: JobId, standing: Standing, epoch: Epoch, goal: UnicodeText });
 export type JobSummary = z.infer<typeof JobSummary>;
 
-export const ClosedJob = z.object({ job: JobId, error: z.string() });
+export const ClosedJob = z.object({ job: JobId, error: UnicodeText });
 export type ClosedJob = z.infer<typeof ClosedJob>;
 
-export const Fact = z.object({ name: z.string(), value: z.string() });
+export const Fact = z.object({ name: UnicodeText, value: UnicodeText });
 export type Fact = z.infer<typeof Fact>;
 
 export const DoctorReport = z.discriminatedUnion("kind", [
@@ -463,15 +477,13 @@ export type DoctorReport = z.infer<typeof DoctorReport>;
  * `PATH` directory names the directory the client's shell names. A
  * relative path would name a directory of the node's choosing.
  */
-export const SystemPath = z
-  .string()
+export const SystemPath = UnicodeText
   .refine((text) => text.startsWith("/") && !text.includes("\u0000"), "not an absolute path")
   .brand<"SystemPath">();
 export type SystemPath = z.infer<typeof SystemPath>;
 
 /** One directory of a `PATH`: a `SystemPath` without a `:`, which would split it in two. */
-export const PathDir = z
-  .string()
+export const PathDir = UnicodeText
   .refine(
     (text) => !text.includes(":") && SystemPath.safeParse(text).success,
     "not an absolute PATH directory without a `:`",
@@ -552,10 +564,10 @@ const env = optional(ClientEnv);
 /** What a client asks a node; an unknown op is an error. */
 export const Request = z.discriminatedUnion("op", [
   z.object({ op: z.literal("node_id") }),
-  z.object({ op: z.literal("node_add"), node: NodeId, addr: optional(z.string()) }),
+  z.object({ op: z.literal("node_add"), node: NodeId, addr: optional(UnicodeText) }),
   z.object({ op: z.literal("node_list") }),
   z.object({ op: z.literal("node_ping"), node: NodeId }),
-  z.object({ op: z.literal("job_new"), repo: SystemPath, goal: z.string(), harness: Harness }),
+  z.object({ op: z.literal("job_new"), repo: SystemPath, goal: UnicodeText, harness: Harness }),
   z.object({ op: z.literal("job_list") }),
   z.object({ op: z.literal("job_status"), job: JobId }),
   z.object({ op: z.literal("job_log"), job: JobId }),
@@ -570,8 +582,8 @@ export const Request = z.discriminatedUnion("op", [
   }),
   z.object({ op: z.literal("job_suspend"), job: JobId, env }),
   z.object({ op: z.literal("job_move"), job: JobId, to: NodeId, force: z.boolean(), env }),
-  z.object({ op: z.literal("job_steal"), job: JobId, reason: z.string(), force: z.boolean() }),
-  z.object({ op: z.literal("job_decide"), job: JobId, decision: Decision, note: z.string() }),
+  z.object({ op: z.literal("job_steal"), job: JobId, reason: UnicodeText, force: z.boolean() }),
+  z.object({ op: z.literal("job_decide"), job: JobId, decision: Decision, note: UnicodeText }),
   z.object({ op: z.literal("doctor"), peer: optional(NodeId), job: optional(JobId), env }),
   z.object({
     op: z.literal("harness_started"),
@@ -600,7 +612,7 @@ export type AcpSettings = z.infer<typeof AcpSettings>;
 
 /** The node's harness configuration, which a launch from a run plan must use. */
 export const HarnessConfig = z.object({
-  acp: z.record(z.string(), AcpSettings).default(() => ({})),
+  acp: z.record(UnicodeText, AcpSettings).default(() => ({})),
 });
 export type HarnessConfig = z.infer<typeof HarnessConfig>;
 
@@ -610,7 +622,7 @@ const runPlan = {
   root: Path,
   harness: Harness,
   session: optional(SessionId),
-  goal: z.string(),
+  goal: UnicodeText,
   harness_config: HarnessConfig.default(() => ({ acp: {} })),
 };
 const lease = { owner: NodeId, epoch: Epoch };
@@ -618,7 +630,7 @@ const lease = { owner: NodeId, epoch: Epoch };
 /** The result of a request; its kind is the request's op, and an unknown kind is an error. */
 export const Reply = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("node_id"), node: NodeId, listen: SocketAddr }),
-  z.object({ kind: z.literal("node_add"), node: NodeId, addr: optional(z.string()) }),
+  z.object({ kind: z.literal("node_add"), node: NodeId, addr: optional(UnicodeText) }),
   z.object({ kind: z.literal("node_list"), peers: z.array(Peer) }),
   z.object({ kind: z.literal("node_ping"), node: NodeId, rtt_ms: count, wire: Wire, clock_skew_ms: signedCount }),
   z.object({ kind: z.literal("job_new"), job: JobId, root: Path, repo: Path, harness: Harness, epoch: Epoch }),
@@ -627,7 +639,7 @@ export const Reply = z.discriminatedUnion("kind", [
     kind: z.literal("job_status"),
     job: JobId,
     node: NodeId,
-    goal: z.string(),
+    goal: UnicodeText,
     harness: Harness,
     owner: NodeId,
     epoch: Epoch,
@@ -643,7 +655,7 @@ export const Reply = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("job_suspend"), snapshot: SnapshotId }),
   z.object({ kind: z.literal("job_move"), ...lease }),
   z.object({ kind: z.literal("job_steal"), ...lease }),
-  z.object({ kind: z.literal("job_decide"), text: z.string() }),
+  z.object({ kind: z.literal("job_decide"), text: UnicodeText }),
   z.object({ kind: z.literal("doctor"), report: DoctorReport }),
   z.object({ kind: z.literal("harness_started"), epoch: Epoch, harness: Harness, pid: Pid }),
   z.object({ kind: z.literal("harness_session"), harness: Harness, session: SessionId }),
@@ -669,7 +681,7 @@ export type SessionRecorded = ReplyTo<"harness_session">;
 // The exchange.
 
 /** The client's first frame on a connection. */
-export const Hello = z.object({ api: z.number().int().min(0).max(U32_MAX), client: z.string() });
+export const Hello = z.object({ api: z.number().int().min(0).max(U32_MAX), client: UnicodeText });
 export type Hello = z.infer<typeof Hello>;
 
 /** What a node says about itself when it accepts a client. */
@@ -677,8 +689,8 @@ export const Welcome = z.object({
   type: z.literal("welcome"),
   api: z.number().int().min(0).max(U32_MAX),
   node: NodeId,
-  node_version: z.string(),
-  capabilities: z.array(z.string()),
+  node_version: UnicodeText,
+  capabilities: z.array(UnicodeText),
 });
 export type Welcome = z.infer<typeof Welcome>;
 
@@ -688,7 +700,7 @@ export const HelloAnswer = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("incompatible"),
     api: z.number().int().min(0).max(U32_MAX),
-    node_version: z.string(),
+    node_version: UnicodeText,
   }),
 ]);
 export type HelloAnswer = z.infer<typeof HelloAnswer>;

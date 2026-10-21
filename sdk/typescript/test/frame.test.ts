@@ -3,7 +3,15 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { createFrameDecoder, encodeFrame, FrameEmptyError, FrameTooLargeError, MAX_FRAME } from "../src/index.ts";
+import {
+  createFrameDecoder,
+  decodeJson,
+  encodeFrame,
+  FrameEmptyError,
+  FrameTooLargeError,
+  MalformedError,
+  MAX_FRAME,
+} from "../src/index.ts";
 
 function header(length: number): Uint8Array {
   const bytes = new Uint8Array(4);
@@ -66,5 +74,25 @@ describe("the frame decoder", () => {
 describe("the frame encoder", () => {
   test("writes the length little-endian before the UTF-8 JSON", () => {
     expect([...encodeFrame("é")]).toStrictEqual([4, 0, 0, 0, 0x22, 0xc3, 0xa9, 0x22]);
+  });
+});
+
+// Review finding on PR #13: half an emoji, as `.slice()` leaves it, is a lone UTF-16 surrogate. JSON.stringify
+// writes it as an escape the node's reader refuses, and JSON.parse reads that escape back.
+describe("a lone surrogate", () => {
+  const rocket = "make it faster \u{1F680}";
+  const cut = rocket.slice(0, 16);
+  const bytes = (json: string): Uint8Array => new TextEncoder().encode(json);
+
+  test("is not written in a value or a key", () => {
+    expect(() => encodeFrame({ goal: cut })).toThrow(MalformedError);
+    expect(() => encodeFrame({ [cut]: "goal" })).toThrow(MalformedError);
+    expect(text(encodeFrame({ goal: rocket }).subarray(4))).toBe(`{"goal":"${rocket}"}`);
+  });
+
+  test("is not read in a value or a key", () => {
+    expect(() => decodeJson(bytes('{"goal":"make it faster \\ud83d"}'))).toThrow(MalformedError);
+    expect(() => decodeJson(bytes('{"\\udc80":"goal"}'))).toThrow(MalformedError);
+    expect(decodeJson(bytes('{"goal":"make it faster \\ud83d\\ude80"}'))).toStrictEqual({ goal: rocket });
   });
 });

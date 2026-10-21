@@ -1,8 +1,14 @@
 // The framing of the client socket (ADR 0018): a u32 little-endian length,
 // then that many bytes of one UTF-8 JSON object. Mirrors
 // crates/fabric-client/src/frame.rs byte for byte.
+//
+// A JavaScript string may hold a lone UTF-16 surrogate, which JSON.stringify
+// writes as an escape and JSON.parse reads back, but which is not Unicode
+// text and which the Rust reader refuses. Neither direction lets one
+// through, in a value or in a key.
 
 import { FrameEmptyError, FrameTooLargeError, MalformedError } from "./errors.ts";
+import { isUnicodeText } from "./schema.ts";
 
 /** The largest frame either side sends or reads: 16 MiB. */
 export const MAX_FRAME = 16 << 20;
@@ -14,6 +20,9 @@ const decoder = new TextDecoder("utf-8", { fatal: true });
 
 /** The bytes of `value` as one frame: its length, then its JSON. */
 export function encodeFrame(value: unknown): Uint8Array {
+  if (!isUnicodeJson(value)) {
+    throw new MalformedError(LONE_SURROGATE);
+  }
   const body = encoder.encode(JSON.stringify(value));
   if (body.length > MAX_FRAME) {
     throw new FrameTooLargeError(body.length, MAX_FRAME);
@@ -32,11 +41,32 @@ export function decodeJson(body: Uint8Array): unknown {
   } catch (error) {
     throw new MalformedError("not UTF-8", error);
   }
+  let value: unknown;
   try {
-    return JSON.parse(text);
+    value = JSON.parse(text);
   } catch (error) {
     throw new MalformedError("not JSON", error);
   }
+  if (!isUnicodeJson(value)) {
+    throw new MalformedError(LONE_SURROGATE);
+  }
+  return value;
+}
+
+const LONE_SURROGATE = "a string holds a lone UTF-16 surrogate, which is not Unicode text";
+
+/** Whether every string in `value`, keys included, is Unicode text. */
+function isUnicodeJson(value: unknown): boolean {
+  if (typeof value === "string") {
+    return isUnicodeText(value);
+  }
+  if (Array.isArray(value)) {
+    return value.every(isUnicodeJson);
+  }
+  if (typeof value === "object" && value !== null) {
+    return Object.entries(value).every(([key, field]) => isUnicodeText(key) && isUnicodeJson(field));
+  }
+  return true;
 }
 
 /** An incremental reader of frames from a byte stream. */
