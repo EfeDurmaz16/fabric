@@ -1027,7 +1027,7 @@ impl Node {
         self.push_records(id, to).await?;
         out.say(format!("{to} holds the ledger and the snapshot"));
 
-        let offer = self.depart(id, to, out).await?;
+        let offer = self.depart(id, to, &harness, out).await?;
         faults::hit(Point::AfterDepartingWrite).await;
         let Some(offer) = offer else {
             return Err(NodeError::Peer {
@@ -1044,12 +1044,15 @@ impl Node {
     ///
     /// The job's lock was released while the target copied it, so a run
     /// may have started here since: what was copied is then out of date,
-    /// and the job stays here. A move already open toward `to` is offered
-    /// again as it is; one toward another node refuses with that node.
+    /// and the job stays here. The same holds for a resume under another
+    /// harness than `checked`, the one the preflight checked the target
+    /// for. A move already open toward `to` is offered again as it is; one
+    /// toward another node refuses with that node.
     async fn depart(
         &self,
         id: JobId,
         to: NodeId,
+        checked: &HarnessKind,
         out: &mut Out,
     ) -> Result<Option<MoveOffer>, NodeError> {
         let job = self.job(id).await?;
@@ -1079,6 +1082,14 @@ impl Node {
             if suspended.is_none() {
                 return Err(NodeError::RanDuringMove {
                     job: id,
+                    target: to,
+                });
+            }
+            if job.harness() != checked {
+                return Err(NodeError::HarnessChangedDuringMove {
+                    job: id,
+                    checked: Box::new(checked.clone()),
+                    now: Box::new(job.harness().clone()),
                     target: to,
                 });
             }
@@ -2708,8 +2719,12 @@ pub(crate) mod tests {
         let path = std::env::var_os("PATH").unwrap_or_default();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         let (first, second) = (NodeId::from_bytes([7; 32]), NodeId::from_bytes([8; 32]));
-        node.depart(id, first, &mut Out::default()).await.unwrap();
-        let refused = node.depart(id, second, &mut Out::default()).await;
+        node.depart(id, first, &HarnessKind::Codex, &mut Out::default())
+            .await
+            .unwrap();
+        let refused = node
+            .depart(id, second, &HarnessKind::Codex, &mut Out::default())
+            .await;
         assert!(
             matches!(refused, Err(NodeError::Departing { target, .. }) if target == first),
             "{refused:?}"
@@ -2734,9 +2749,14 @@ pub(crate) mod tests {
         let id = job(dir.path(), &node).await;
         let path = std::env::var_os("PATH").unwrap_or_default();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
-        node.depart(id, NodeId::from_bytes([7; 32]), &mut Out::default())
-            .await
-            .unwrap();
+        node.depart(
+            id,
+            NodeId::from_bytes([7; 32]),
+            &HarnessKind::Codex,
+            &mut Out::default(),
+        )
+        .await
+        .unwrap();
         let mut out = Out::default();
         node.job_status(id, &mut out).await.unwrap();
         let line = out
@@ -3338,7 +3358,12 @@ pub(crate) mod tests {
         .await
         .unwrap();
         let refused = node
-            .depart(id, NodeId::from_bytes([7; 32]), &mut Out::default())
+            .depart(
+                id,
+                NodeId::from_bytes([7; 32]),
+                &HarnessKind::Codex,
+                &mut Out::default(),
+            )
             .await;
         assert!(
             matches!(refused, Err(NodeError::Forked { .. })),
@@ -3400,6 +3425,61 @@ pub(crate) mod tests {
         assert_eq!(
             after, at_freeze,
             "the steal appended to the chain after it was frozen ({stolen:?})"
+        );
+    }
+
+    /// A `resume --harness` can register another harness while a move's
+    /// preflight checks the target for the old one. The move must not then
+    /// hand the job, now under the new harness, to a target never checked
+    /// for it.
+    #[tokio::test]
+    async fn a_move_does_not_depart_under_a_harness_its_preflight_did_not_check() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let harness = sleeper();
+        node.harness_started(
+            id,
+            Epoch::FIRST,
+            pid(&harness),
+            HarnessKind::ClaudeCode,
+            None,
+            &mut Out::default(),
+        )
+        .await
+        .unwrap();
+        let reaper = std::thread::spawn(move || {
+            let mut harness = harness;
+            harness.wait()
+        });
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        reaper.join().unwrap().unwrap();
+        let refused = node
+            .depart(
+                id,
+                NodeId::from_bytes([7; 32]),
+                &HarnessKind::Codex,
+                &mut Out::default(),
+            )
+            .await;
+        assert!(
+            matches!(
+                &refused,
+                Err(NodeError::HarnessChangedDuringMove { checked, now, .. })
+                    if **checked == HarnessKind::Codex && **now == HarnessKind::ClaudeCode
+            ),
+            "{refused:?}"
+        );
+        let job = node.job(id).await.unwrap();
+        assert!(
+            !job.lock()
+                .await
+                .ledger()
+                .records()
+                .iter()
+                .any(|r| matches!(r.event().kind, EventKind::MoveStarted { .. })),
+            "MoveStarted was appended under an unchecked harness"
         );
     }
 }

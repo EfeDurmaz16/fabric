@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, JobId, MoveId, NodeId, SnapshotId};
 use fabric_core::lease::FenceError;
 use fabric_core::ledger::{LedgerError, StoreError as LedgerStoreError};
@@ -114,6 +115,20 @@ pub enum NodeError {
     RanDuringMove {
         /// The job.
         job: JobId,
+        /// The target of the move.
+        target: NodeId,
+    },
+    /// A resume under another harness ran while the move's preflight checked the target for the old one.
+    #[error(
+        "job {job} was resumed under {now} while the preflight checked {target} for {checked}, so nothing moved; run `fabric job move {job} --to {target}` again, which checks {now}"
+    )]
+    HarnessChangedDuringMove {
+        /// The job.
+        job: JobId,
+        /// The harness the preflight checked.
+        checked: Box<HarnessKind>,
+        /// The harness the job runs under now.
+        now: Box<HarnessKind>,
         /// The target of the move.
         target: NodeId,
     },
@@ -324,6 +339,7 @@ impl NodeError {
             | NodeError::SetupRunning { .. }
             | NodeError::AlreadyRunningHarness { .. }
             | NodeError::RanDuringMove { .. }
+            | NodeError::HarnessChangedDuringMove { .. }
             | NodeError::ChangedDuringMove { .. }
             | NodeError::WorkspaceOccupied { .. }
             | NodeError::NoWorkspace(_)
