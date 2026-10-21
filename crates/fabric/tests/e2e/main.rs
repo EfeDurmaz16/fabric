@@ -6,9 +6,11 @@
 //! two ledgers agree on the epoch, the departed copy refuses to run, and the
 //! owner resumes the job with its workspace and its harness session whole.
 //! One more test runs a Claude job on one node beside a running `claude`,
-//! `terminal` runs a Codex job under a pseudo-terminal, and `headless`
-//! runs Claude and Codex turns without one.
+//! `terminal` runs a Codex job under a pseudo-terminal, `headless`
+//! runs Claude and Codex turns without one, and `client` drives a node
+//! through `fabric-client` instead of the CLI.
 
+mod client;
 mod headless;
 mod terminal;
 mod world;
