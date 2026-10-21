@@ -278,7 +278,9 @@ impl Node {
         let parent = root
             .parent()
             .ok_or_else(|| NodeError::io(&root, std::io::Error::other("a root needs a parent")))?;
-        crate::durable::create_dir(parent).map_err(|e| NodeError::io(parent, e))?;
+        // The workspace holds what the agent writes, ignored secrets
+        // included; its job directory is this user's alone.
+        crate::durable::create_private_dir(parent).map_err(|e| NodeError::io(parent, e))?;
         let cloned = tokio::process::Command::new("git")
             .args(["clone", "--quiet", "--"])
             .arg(repo)
@@ -1771,7 +1773,7 @@ impl Node {
             epoch,
         })?;
         if let Some(parent) = root.parent() {
-            crate::durable::create_dir(parent).map_err(|e| NodeError::io(parent, e))?;
+            crate::durable::create_private_dir(parent).map_err(|e| NodeError::io(parent, e))?;
         }
         let has_harness_state = !manifest.harness_state.entries.is_empty();
         let state_dir = job.dir().harness_state();
@@ -3813,5 +3815,27 @@ pub(crate) mod tests {
         );
         harness.kill().unwrap();
         harness.wait().unwrap();
+    }
+
+    /// A workspace holds what the agent writes there, ignored secrets
+    /// included, so the job directory that holds it is this user's alone,
+    /// whether `job new` made it or a restore did.
+    #[tokio::test]
+    async fn a_job_directory_is_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        let parent = root.parent().unwrap().to_owned();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&parent), 0o700, "job new");
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        std::fs::remove_dir_all(&parent).unwrap();
+        node.job_resume(id, None, None, false, &path, &mut Out::default())
+            .await
+            .unwrap();
+        assert!(root.join("README.md").is_file());
+        assert_eq!(mode(&parent), 0o700, "restore");
     }
 }

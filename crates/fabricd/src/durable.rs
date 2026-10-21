@@ -64,6 +64,25 @@ pub(crate) fn create_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
+/// Creates `dir`, mode 0700, and its parents, then flushes the parent so
+/// the new name is durable; a `dir` that already exists keeps its mode.
+pub(crate) fn create_private_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    if dir.is_dir() {
+        return Ok(());
+    }
+    let parent = dir
+        .parent()
+        .ok_or_else(|| io::Error::other("a private directory needs a parent"))?;
+    fs::create_dir_all(parent)?;
+    match fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    sync_dir(parent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

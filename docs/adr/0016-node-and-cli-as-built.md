@@ -71,7 +71,7 @@ A harness that exits with a code from 80 to 85 cannot be told from a refusal by 
 
 ### Job roots and departed copies
 
-`fabric job new --repo <path>` clones the repository into `~/fabric/jobs/<job-id>/work` (ADR 0011, rule 2). `fabric job init`, which adopts a checkout in place, is not built; ADR 0001's statement that `init` is the only way a job starts is superseded by `new` for this phase.
+`fabric job new --repo <path>` clones the repository into `~/fabric/jobs/<job-id>/work` (ADR 0011, rule 2). The node makes `~/fabric/jobs/<job-id>` mode 0700, there and when a restore makes it, since the workspace holds what the agent writes, ignored secrets included; a directory that already exists keeps its mode (Codex review, 2026-10-21). `fabric job init`, which adopts a checkout in place, is not built; ADR 0001's statement that `init` is the only way a job starts is superseded by `new` for this phase.
 
 A restore lands at the root the snapshot recorded only when that root is exactly `~/fabric/jobs/<job-id>/work` under this node's home, because the root arrives from a peer and any other path, such as `~/.ssh`, is a bug or a hostile peer. When it is not, the job lands under `<state>/jobs/<job-id>/work`, and the CLI prints why. The adapters of ADR 0015 still refuse a different root or home, so only a harness without path-keyed state can continue there; doctor refuses the move before it gets this far.
 
