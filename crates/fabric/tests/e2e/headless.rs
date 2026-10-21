@@ -373,6 +373,44 @@ fn e2e_ctrl_c_on_a_headless_run_reaches_the_harness() -> Fallible {
     Ok(())
 }
 
+/// A signal while the resume guard asks the harness for its version,
+/// which can take as long as the probe's timeout, ends the command as one
+/// during the earlier setup steps does: the harness never starts, so the
+/// turn the user stopped is neither begun nor cut, and the session is
+/// untouched.
+#[test]
+fn e2e_a_signal_before_the_harness_starts_ends_a_headless_run() -> Fallible {
+    let env = Env::new()?;
+    env.install_fake_codex()?;
+    let (node, job) = job_under(&env, "codex")?;
+    node.ok(&["job", "run", &job, "--headless", "--prompt", "one"])?;
+    let rollout = env.home.join(format!(
+        ".codex/sessions/2026/10/21/rollout-2026-10-21T10-00-00-{}.jsonl",
+        Env::CODEX_THREAD
+    ));
+    let before = fs::read_to_string(&rollout)?;
+    fs::write(env.home.join("codex-args"), "")?;
+    let running = node.spawn_with(
+        &["job", "run", &job, "--headless", "--prompt", "two"],
+        &[("FAKE_CODEX_PROBE_WAIT", Path::new("1"))],
+    )?;
+    wait_for(&env.home.join("codex-probing"), "the version check")?;
+    let fabric =
+        rustix::process::Pid::from_raw(i32::try_from(running.id())?).ok_or("fabric has no pid")?;
+    rustix::process::kill_process(fabric, rustix::process::Signal::TERM)?;
+    let output = finish(running, Duration::from_mins(3))?;
+    let said = text(&output);
+    assert_eq!(output.status.code(), Some(143), "{said}");
+    assert!(
+        said.contains("interrupted before the harness started") && !said.contains("continuing"),
+        "the harness started:\n{said}"
+    );
+    let args = fs::read_to_string(env.home.join("codex-args"))?;
+    assert!(!args.contains("exec"), "the harness started: {args}");
+    assert_eq!(fs::read_to_string(&rollout)?, before, "the session changed");
+    Ok(())
+}
+
 /// The answer cannot be printed when standard output is gone, as after
 /// the hang-up of the terminal that would have shown it; the node still
 /// hears that the harness exited and drops its record.

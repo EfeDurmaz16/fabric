@@ -548,8 +548,29 @@ async fn launch(state: &StateDir, home: &Path, plan: &RunPlan, mode: Mode) -> Re
     let headless = matches!(mode, Mode::Headless(_));
     // Caught from just before the harness starts, so none is lost in
     // between; a signal during the setup steps still ends the command.
-    let forward = read_line.map(|_| Forward::new()).transpose()?;
-    let mut running = start(home, plan, mode, notes).await?;
+    let mut forward = read_line.map(|_| Forward::new()).transpose()?;
+    let started = start(home, plan, mode, notes);
+    let mut running = match forward.as_mut() {
+        // The resume guard runs inside `start`, before the harness exists,
+        // and can wait as long as a `--version` run. A signal then still
+        // ends the command, with nothing started: `start` is dropped where
+        // it waits, and a headless spawn starts the process and returns in
+        // one poll, so it is never dropped with a harness running.
+        Some(signals) => tokio::select! {
+            biased;
+            signal = signals.next() => {
+                // The terminal may be gone, as after a hang-up; the exit
+                // code still says what ended the command.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "interrupted before the harness started; nothing ran"
+                );
+                return Ok(signal_exit(signal.as_raw()));
+            }
+            running = started => running?,
+        },
+        None => started.await?,
+    };
     let pid = running.pid();
     let said = settings_lines(&plan.harness, plan.session.as_ref(), running.settings());
     let registered = match notes.print(&said) {

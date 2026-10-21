@@ -128,7 +128,9 @@ impl Env {
     /// or `no` to `codex-saw-session`, so a test can tell the thread was
     /// recorded while the turn ran. With `FAKE_CODEX_WAIT` set it then
     /// touches `codex-waiting` and runs until a `SIGINT`, which it writes
-    /// to `codex-signal` before it exits with 130.
+    /// to `codex-signal` before it exits with 130. With
+    /// `FAKE_CODEX_PROBE_WAIT` set, `--version` touches `codex-probing`
+    /// and answers three seconds later.
     pub fn install_fake_codex(&self) -> Fallible {
         self.install(
             "codex",
@@ -137,7 +139,10 @@ impl Env {
                  version=0.155.1\n\
                  [ ! -f \"$FABRIC_HOME/codex-version\" ] || version=$(cat \"$FABRIC_HOME/codex-version\")\n\
                  [ ! -f .tool-versions ] || version=$(sed -n 's/^codex //p' .tool-versions)\n\
-                 if [ \"$1\" = --version ]; then echo \"codex-cli $version\"; exit 0; fi\n\
+                 if [ \"$1\" = --version ]; then\n\
+                   if [ -n \"$FAKE_CODEX_PROBE_WAIT\" ]; then touch \"$HOME/codex-probing\"; sleep 3; fi\n\
+                   echo \"codex-cli $version\"; exit 0\n\
+                 fi\n\
                  printf '%s\\n' \"$@\" > \"$HOME/codex-args\"\n\
                  env > \"$HOME/codex-env\"\n\
                  [ \"$1\" = exec ] || exit 0\n\
