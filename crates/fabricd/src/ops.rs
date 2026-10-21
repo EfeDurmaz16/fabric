@@ -766,7 +766,15 @@ impl Node {
         // A workspace whose environment does not detect here would not
         // materialize on the target either, so the snapshot is refused
         // before it is published or moved.
-        let detection = fabric_env::detect::detect(root, &[])?;
+        // A pattern the job ever added stays: removing its line from
+        // `.fabric/env.toml` does not remove it (ADR 0007, Secrets).
+        let recorded: Vec<fabric_core::secret::SecretPattern> =
+            local::read(&job.dir().secret_patterns())?.unwrap_or_default();
+        let detection = fabric_env::detect::detect(root, &recorded)?;
+        local::write(
+            &job.dir().secret_patterns(),
+            &detection.spec().secret_patterns,
+        )?;
         let keys = MeasuredKeys::new(facts, Some(&detection));
         let secret_patterns: Vec<String> = detection
             .spec()
@@ -2835,6 +2843,34 @@ pub(crate) mod tests {
             &lines[0]
         );
         assert!(lines.last().unwrap().starts_with("   5 epoch"));
+    }
+
+    /// A secret pattern removed from `.fabric/env.toml` still keeps its
+    /// matches on the node at the next capture.
+    #[tokio::test]
+    async fn a_removed_secret_pattern_still_applies() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(
+            root.join(".fabric/env.toml"),
+            "secret_patterns = [\"*.sqlite\"]\n",
+        )
+        .unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        std::fs::write(root.join(".fabric/env.toml"), "").unwrap();
+        std::fs::write(root.join("users.sqlite"), "rows\n").unwrap();
+        let mut out = Out::default();
+        node.suspend(id, &path, &mut out).await.unwrap();
+        assert!(
+            out.lines
+                .iter()
+                .any(|line| line == "left behind (secret pattern): users.sqlite"),
+            "{:?}",
+            out.lines
+        );
     }
 
     #[test]

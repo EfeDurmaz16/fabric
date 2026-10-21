@@ -25,6 +25,7 @@ The core, the store, the network layer, the harness adapters and the environment
     marker      what the workspace at the root holds, and the epoch it was written at (ADR 0004)
     harness     the harness this node launched: pid, kernel start time, epoch
     session     the harness session the job continues here
+    secret-patterns  every secret pattern the job's spec held at a capture here (ADR 0004)
     harness-state/   capture output and restore input for the adapter
 ```
 
