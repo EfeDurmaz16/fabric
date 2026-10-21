@@ -1565,6 +1565,30 @@ mod tests {
         assert_eq!(fixture.ran(), None, "the older claude ran");
     }
 
+    /// A session whose transcripts sit under two project keys resumes with
+    /// the model of the workspace's own key, the one `claude --resume`
+    /// reads from the workspace, even when the other key sorts after it.
+    #[tokio::test]
+    async fn the_workspace_transcript_gives_the_model_over_another_key() {
+        let fixture = Resume::new("2.1.294 (Claude Code)");
+        let other = fixture.home.join(".claude/projects/zz-other-key");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(
+            other.join(format!("{SID}.jsonl")),
+            "{\"type\":\"assistant\",\"version\":\"2.1.294\",\"isSidechain\":false,\"message\":{\"model\":\"claude-fable-5\"}}\n",
+        )
+        .unwrap();
+        let mut running = fixture.launch().await.unwrap();
+        running.child_mut().wait().await.unwrap();
+        let ran = fixture.ran().unwrap();
+        let model = ran.iter().position(|a| a == "--model").map(|i| &ran[i + 1]);
+        assert_eq!(
+            model.map(String::as_str),
+            Some("claude-opus-5-5"),
+            "{ran:?}"
+        );
+    }
+
     /// The version is asked in the workspace the launch starts claude in,
     /// where a version manager's shim may pin another version than it
     /// picks anywhere else.
