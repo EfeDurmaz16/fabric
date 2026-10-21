@@ -171,7 +171,6 @@ pub struct PassedSetting {
 }
 
 /// The most characters of a recorded value a report shows.
-#[cfg(any(feature = "claude", feature = "codex"))]
 const SHOWN_VALUE_LEN: usize = 64;
 
 /// A setting the session records that a launch did not pass, so the
@@ -187,21 +186,29 @@ pub struct NotCarried {
     pub reason: String,
 }
 
+/// `text` as a terminal may show it: cut to 64 characters, with `...`
+/// after a cut, and every control character replaced by `?`. Text that
+/// comes from a file that travelled goes through this before an error or
+/// a note prints it.
+pub(crate) fn shown(text: &str) -> String {
+    let mut shown: String = text
+        .chars()
+        .take(SHOWN_VALUE_LEN)
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    if text.chars().count() > SHOWN_VALUE_LEN {
+        shown.push_str("...");
+    }
+    shown
+}
+
 impl NotCarried {
     /// A setting left out, with its recorded value made safe to print.
     #[cfg(any(feature = "claude", feature = "codex"))]
     pub(crate) fn new(name: SettingName, value: &str, reason: impl Into<String>) -> Self {
-        let mut shown: String = value
-            .chars()
-            .take(SHOWN_VALUE_LEN)
-            .map(|c| if c.is_control() { '?' } else { c })
-            .collect();
-        if value.chars().count() > SHOWN_VALUE_LEN {
-            shown.push_str("...");
-        }
         NotCarried {
             name,
-            value: shown,
+            value: shown(value),
             reason: reason.into(),
         }
     }

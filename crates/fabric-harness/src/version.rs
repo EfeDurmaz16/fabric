@@ -2,13 +2,18 @@
 //! them, and the guard that keeps an older harness off a newer session.
 //!
 //! Invariant: a version is `MAJOR.MINOR.PATCH`, with an optional
-//! pre-release after `-` and build metadata after `+`, and two versions
-//! are ordered by semver precedence (semver.org 2.0.0, section 11): the
-//! three numbers, then a release above any of its pre-releases, then the
-//! pre-release identifiers one by one, numbers as numbers and below
-//! words, a longer list above its own prefix. Build metadata is ignored.
-//! Anything else does not parse, and a caller that cannot read a version
-//! refuses rather than guesses. One parse and one order serve the resume
+//! pre-release after `-` and build metadata after `+`, each a list of
+//! dot-separated identifiers of ASCII letters, digits and `-`, and at most
+//! `MAX_LEN` bytes in all; two versions are ordered by semver precedence
+//! (semver.org 2.0.0, section 11): the three numbers, then a release
+//! above any of its pre-releases, then the pre-release identifiers one by
+//! one, numbers as numbers and below words, a longer list above its own
+//! prefix. Build metadata is checked and then ignored. Anything else does
+//! not parse, and a caller that cannot read a version refuses rather than
+//! guesses. A version comes from a file that travelled and is printed in
+//! a refusal, so the text a parsed version keeps holds no character a
+//! terminal acts on, and the text a parse error keeps is cut and has its
+//! control characters replaced. One parse and one order serve the resume
 //! guard of every adapter and the harness rows of `fabric doctor`, so the
 //! two never disagree on which of two versions is older. Formats seen on
 //! 2026-10-21: `codex-cli 0.155.1` and `2.1.294 (Claude Code)` from
@@ -26,15 +31,31 @@
 use std::cmp::Ordering;
 use std::fmt;
 
-/// Why a version did not parse.
+/// The longest version text that parses. The longest seen, a desktop
+/// Codex pre-release such as `0.163.0-alpha.10.2`, is 18 bytes.
+const MAX_LEN: usize = 64;
+
+/// Why a version did not parse. The text it holds is cut and has its
+/// control characters replaced (`harness::shown`), because it can come
+/// from a file that travelled and is printed to a terminal.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum VersionError {
     /// The text holds no token that starts like a version.
     #[error("{0:?} holds no version")]
     NoVersion(String),
-    /// The token is not `MAJOR.MINOR.PATCH` with an optional pre-release.
+    /// The token is not `MAJOR.MINOR.PATCH` with an optional pre-release
+    /// and build metadata, or is longer than `MAX_LEN` bytes.
     #[error("{0:?} is not MAJOR.MINOR.PATCH with an optional pre-release")]
     Malformed(String),
+}
+
+/// True for a non-empty list of dot-separated, non-empty identifiers of
+/// ASCII letters, digits and `-`, as semver's pre-release and build
+/// metadata are.
+fn identifiers(text: &str) -> bool {
+    text.split('.').all(|part| {
+        !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
 }
 
 /// One dot-separated identifier of a pre-release. The variant order is
@@ -58,8 +79,15 @@ pub struct HarnessVersion {
 impl HarnessVersion {
     /// Parses a version such as `0.155.1` or `0.163.0-alpha.10.2`.
     pub fn parse(text: &str) -> Result<Self, VersionError> {
-        let malformed = || VersionError::Malformed(text.to_owned());
-        let without_build = text.split_once('+').map_or(text, |(version, _)| version);
+        let malformed = || VersionError::Malformed(crate::harness::shown(text));
+        if text.len() > MAX_LEN {
+            return Err(malformed());
+        }
+        let without_build = match text.split_once('+') {
+            Some((version, build)) if identifiers(build) => version,
+            Some(_) => return Err(malformed()),
+            None => text,
+        };
         let (core_text, pre_text) = match without_build.split_once('-') {
             Some((core, pre)) => (core, Some(pre)),
             None => (without_build, None),
@@ -72,19 +100,16 @@ impl HarnessVersion {
         if parts.next().is_some() {
             return Err(malformed());
         }
-        let mut pre = Vec::new();
-        for part in pre_text.into_iter().flat_map(|p| p.split('.')) {
-            let identifier = if let Some(n) = number(part) {
-                Identifier::Number(n)
-            } else if !part.is_empty()
-                && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-            {
-                Identifier::Word(part.to_owned())
-            } else {
-                return Err(malformed());
-            };
-            pre.push(identifier);
+        if pre_text.is_some_and(|p| !identifiers(p)) {
+            return Err(malformed());
         }
+        let pre = pre_text
+            .into_iter()
+            .flat_map(|p| p.split('.'))
+            .map(|part| {
+                number(part).map_or_else(|| Identifier::Word(part.to_owned()), Identifier::Number)
+            })
+            .collect();
         Ok(HarnessVersion {
             core,
             pre,
@@ -96,7 +121,7 @@ impl HarnessVersion {
     /// starts like one, as `codex-cli 0.155.1` or `2.1.294 (Claude Code)`.
     pub fn from_output(output: &str) -> Result<Self, VersionError> {
         let token = crate::process::version_token(output)
-            .ok_or_else(|| VersionError::NoVersion(output.to_owned()))?;
+            .ok_or_else(|| VersionError::NoVersion(crate::harness::shown(output)))?;
         Self::parse(token)
     }
 
@@ -239,5 +264,25 @@ mod tests {
             HarnessVersion::from_output("fake 1.2"),
             Err(VersionError::Malformed(_))
         ));
+    }
+
+    /// A recorded version comes from a file that travelled and is printed
+    /// in a refusal, so its build metadata is held to semver's identifiers
+    /// and its length to `MAX_LEN`; an escape sequence after `+` does not
+    /// parse, and the error that names it shows no control character and
+    /// stays short.
+    #[test]
+    fn build_metadata_is_checked_and_a_bad_version_is_shown_safely() {
+        assert_eq!(v("0.155.1+build-7.x"), v("0.155.1"));
+        let escape = "99.0.0+\u{1b}]52;c;aGk=\u{7}";
+        let long = format!("1.0.0+{}", "a".repeat(MAX_LEN));
+        for bad in ["0.155.1+", "0.155.1+a b", "0.155.1+a..b", escape, &long] {
+            assert!(HarnessVersion::parse(bad).is_err(), "{bad:?}");
+        }
+        let flood = format!("1.0.0+\u{1b}{}", "x".repeat(1 << 20));
+        for text in [escape, flood.as_str()] {
+            let shown = HarnessVersion::parse(text).unwrap_err().to_string();
+            assert!(!shown.contains('\u{1b}') && shown.len() < 200, "{shown:?}");
+        }
     }
 }
