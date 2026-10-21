@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fabric_core::harness::HarnessKind;
-use fabric_core::id::{Epoch, JobId, MoveId, NodeId, SnapshotId};
+use fabric_core::id::{Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::{FenceError, FencingToken};
 use fabric_core::ledger::{Author, EventKind, Ledger};
 use fabric_core::moves::{AbortAnswer, CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
@@ -146,7 +146,9 @@ impl Node {
                 self.harness_started(job, epoch, pid, harness, session, out)
                     .await?;
             }
-            Request::LaunchCheck { job, epoch } => self.launch_check(job, epoch).await?,
+            Request::LaunchCheck { job, epoch, head } => {
+                self.launch_check(job, epoch, head).await?;
+            }
             Request::HarnessExited { job, pid } => self.harness_exited(job, pid).await?,
             Request::JobSuspend { job, path_var } => {
                 self.resolve_departing(job, out).await?;
@@ -517,12 +519,19 @@ impl Node {
     }
 
     /// Refuses a launch whose plan no longer holds: the node no longer owns
-    /// the job at the plan's epoch, or records a harness that still runs.
+    /// the job at the plan's epoch, records a harness that still runs, or
+    /// holds records past the head the plan was made at.
     ///
     /// The CLI asks under the tree lock, before any setup step. A launch of
-    /// the same workspace registers its harness before it lets the lock go,
-    /// so a plan this passes was not overtaken by one.
-    pub(crate) async fn launch_check(&self, id: JobId, epoch: Epoch) -> Result<(), NodeError> {
+    /// the same workspace registers its harness, appending `Resumed`, before
+    /// it lets the lock go, so a plan this passes was not overtaken by one,
+    /// even by one whose harness already exited.
+    pub(crate) async fn launch_check(
+        &self,
+        id: JobId,
+        epoch: Epoch,
+        head: RecordHash,
+    ) -> Result<(), NodeError> {
         let job = self.job(id).await?;
         let job = job.lock().await;
         let token = owner_token(&job, self.id)?;
@@ -540,6 +549,9 @@ impl Node {
                 job: id,
                 pid: record.pid.get(),
             });
+        }
+        if job.ledger().head() != head {
+            return Err(NodeError::PlanOvertaken { job: id });
         }
         Ok(())
     }
@@ -2273,6 +2285,7 @@ fn plan(
     Ok(RunPlan {
         job: job.id(),
         epoch,
+        head: job.ledger().head(),
         root,
         harness,
         session,
@@ -3906,10 +3919,12 @@ pub(crate) mod tests {
         let id = job(dir.path(), &node).await;
         let first = node.job_run(id, &mut Out::default()).await.unwrap();
         let second = node.job_run(id, &mut Out::default()).await.unwrap();
-        node.launch_check(id, first.epoch).await.unwrap();
+        node.launch_check(id, first.epoch, first.head)
+            .await
+            .unwrap();
         let mut harness = sleeper();
         register(&node, id, pid(&harness)).await.unwrap();
-        let refused = node.launch_check(id, second.epoch).await;
+        let refused = node.launch_check(id, second.epoch, second.head).await;
         assert!(
             matches!(refused, Err(NodeError::AlreadyRunningHarness { pid: p, .. }) if p == harness.id()),
             "{refused:?}"
@@ -4130,5 +4145,32 @@ pub(crate) mod tests {
         assert_eq!(named, REPORT_PATHS, "{:?}", out.lines.len());
         let rest = format!("left behind (secret pattern): {} more", 500 - REPORT_PATHS);
         assert!(out.lines.contains(&rest), "no line {rest:?}");
+    }
+
+    /// A launch that overtook a plan can register and exit before the
+    /// delayed CLI takes the tree lock: no harness runs, and the epoch is
+    /// the same. The delayed plan still predates that launch's `Resumed`
+    /// and its session, and launching it would record a stale session over
+    /// the new one, so it is refused too.
+    #[tokio::test]
+    async fn a_plan_a_finished_launch_overtook_is_refused_before_setup() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let first = node.job_run(id, &mut Out::default()).await.unwrap();
+        let second = node.job_run(id, &mut Out::default()).await.unwrap();
+        node.launch_check(id, first.epoch, first.head)
+            .await
+            .unwrap();
+        let mut harness = sleeper();
+        let harness_pid = pid(&harness);
+        register(&node, id, harness_pid).await.unwrap();
+        harness.kill().unwrap();
+        harness.wait().unwrap();
+        node.harness_exited(id, harness_pid).await.unwrap();
+        let refused = node.launch_check(id, second.epoch, second.head).await;
+        assert!(
+            matches!(refused, Err(NodeError::PlanOvertaken { .. })),
+            "{refused:?}"
+        );
     }
 }

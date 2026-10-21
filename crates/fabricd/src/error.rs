@@ -196,6 +196,14 @@ pub enum NodeError {
         /// The root.
         root: PathBuf,
     },
+    /// The job's ledger moved past the head a run plan was made at, so the plan is stale.
+    #[error(
+        "job {job} changed after this launch was planned, by another run or resume, a suspend or a record from a peer, so nothing was launched; run the command again"
+    )]
+    PlanOvertaken {
+        /// The job.
+        job: JobId,
+    },
     /// The job has no workspace on this node.
     #[error("job {0} has no workspace on this node; run `fabric job resume {0}`")]
     NoWorkspace(JobId),
@@ -369,6 +377,7 @@ impl NodeError {
             | NodeError::WorkspaceOccupied { .. }
             | NodeError::NoWorkspace(_)
             | NodeError::RootNotADirectory { .. }
+            | NodeError::PlanOvertaken { .. }
             | NodeError::StaleWorkspace { .. }
             | NodeError::NoSnapshot(_)
             | NodeError::HarnessGone { .. } => Refusal::JobState,

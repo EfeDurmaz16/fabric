@@ -578,6 +578,7 @@ async fn prepare(state: &StateDir, home: &Path, plan: &RunPlan) -> Result<TreeLo
         Request::LaunchCheck {
             job: plan.job,
             epoch: plan.epoch,
+            head: plan.head,
         },
     )
     .await?;
@@ -803,6 +804,7 @@ mod tests {
         let plan = RunPlan {
             job: "01M5EBB2BWY97N3YEKD6CDN2EM".parse().unwrap(),
             epoch: fabric_core::id::Epoch::FIRST,
+            head: fabric_core::id::RecordHash::of(b"a head"),
             root: dir.path().join("work"),
             harness: HarnessKind::Codex,
             session: None,
@@ -844,6 +846,7 @@ mod tests {
         let plan = RunPlan {
             job: "01M5EBB2BWY97N3YEKD6CDN2EM".parse().unwrap(),
             epoch: fabric_core::id::Epoch::FIRST,
+            head: fabric_core::id::RecordHash::of(b"a head"),
             root,
             harness: HarnessKind::Codex,
             session: None,

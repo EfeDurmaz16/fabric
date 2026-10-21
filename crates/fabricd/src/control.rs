@@ -19,7 +19,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use fabric_core::harness::HarnessKind;
-use fabric_core::id::{Epoch, JobId, NodeId};
+use fabric_core::id::{Epoch, JobId, NodeId, RecordHash};
 use fabric_harness::SessionId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -97,6 +97,8 @@ pub enum Request {
         job: JobId,
         /// The epoch the plan was made under.
         epoch: Epoch,
+        /// The ledger head the plan was made at.
+        head: RecordHash,
     },
     /// The CLI launched the harness; the daemon records it and appends `Resumed`.
     HarnessStarted {
@@ -181,6 +183,9 @@ pub struct RunPlan {
     pub job: JobId,
     /// The epoch this node owns the job at; the launch is fenced on it.
     pub epoch: Epoch,
+    /// The ledger head the plan was made at; a launch whose job moved past
+    /// it, by another launch for one, is refused before setup.
+    pub head: RecordHash,
     /// The workspace root.
     pub root: PathBuf,
     /// The harness to launch.
