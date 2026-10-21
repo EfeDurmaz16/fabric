@@ -20,10 +20,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 
+use fabric_core::session::SessionId;
+use fabric_harness::Harness;
 use fabric_harness::claude::ClaudeCode;
 use fabric_harness::codex::Codex;
 use fabric_harness::manifest::StateManifest;
-use fabric_harness::{Harness, SessionId};
 
 mod common;
 use common::{abs, fake_claude, project_key};

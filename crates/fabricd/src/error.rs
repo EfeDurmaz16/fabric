@@ -147,7 +147,7 @@ pub enum NodeError {
         /// The pid the CLI named.
         pid: std::num::NonZeroU32,
         /// The session it named.
-        session: fabric_harness::SessionId,
+        session: fabric_core::session::SessionId,
     },
     /// The workspace at the root was left by an earlier tenure of this node.
     #[error(

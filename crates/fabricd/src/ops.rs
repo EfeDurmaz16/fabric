@@ -20,8 +20,9 @@ use fabric_core::id::{Epoch, JobId, NodeId, SnapshotId};
 use fabric_core::lease::{FenceError, FencingToken};
 use fabric_core::ledger::{Author, EventKind, Ledger};
 use fabric_core::moves::{CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
+use fabric_core::session::SessionId;
+use fabric_harness::HarnessError;
 use fabric_harness::manifest::{MANIFEST_FILE, StateManifest};
-use fabric_harness::{HarnessError, SessionId};
 use fabric_net::peers::HostPort;
 use fabric_net::rpc::Session;
 use fabric_net::wire::{

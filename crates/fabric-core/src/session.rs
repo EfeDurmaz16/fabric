@@ -11,6 +11,9 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+/// The lowercase hex digits a UUID is written with.
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
 /// The most characters a session id may have.
 pub const MAX_SESSION_ID_LEN: usize = 128;
 
@@ -64,11 +67,20 @@ impl SessionId {
         Ok(Self(text.to_owned()))
     }
 
-    /// The id of a UUID, in its hyphenated form: hex digits and `-`,
-    /// starting with a digit or a letter, which the rules always accept.
-    #[cfg(feature = "claude")]
-    pub(crate) fn from_uuid(uuid: uuid::Uuid) -> Self {
-        Self(uuid.hyphenated().to_string())
+    /// The id of the UUID with these 16 bytes, in its lowercase
+    /// hyphenated form: hex digits and `-`, starting with a digit or a
+    /// letter, which the rules always accept.
+    #[must_use]
+    pub fn from_uuid_bytes(bytes: [u8; 16]) -> Self {
+        let mut text = String::with_capacity(36);
+        for (i, b) in bytes.iter().enumerate() {
+            if matches!(i, 4 | 6 | 8 | 10) {
+                text.push('-');
+            }
+            text.push(char::from(HEX[usize::from(b >> 4)]));
+            text.push(char::from(HEX[usize::from(b & 0x0f)]));
+        }
+        Self(text)
     }
 
     /// Returns the id text.
@@ -132,6 +144,19 @@ mod tests {
                 len: MAX_SESSION_ID_LEN + 1
             })
         );
-        assert!(serde_json::from_str::<SessionId>("\"../x\"").is_err());
+        let bytes = postcard::to_stdvec("../x").unwrap();
+        assert!(postcard::from_bytes::<SessionId>(&bytes).is_err());
+    }
+
+    #[test]
+    fn a_uuid_is_written_lowercase_and_hyphenated() {
+        let bytes = [
+            0x9c, 0x97, 0x96, 0xf0, 0x26, 0x82, 0x45, 0x46, 0xa9, 0x63, 0xd3, 0x14, 0xb3, 0xad,
+            0x54, 0x3f,
+        ];
+        assert_eq!(
+            SessionId::from_uuid_bytes(bytes).as_str(),
+            "9c9796f0-2682-4546-a963-d314b3ad543f"
+        );
     }
 }

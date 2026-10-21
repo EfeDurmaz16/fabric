@@ -32,10 +32,11 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use fabric_core::env::{EnvVarName, SetupArg};
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{JobId, NodeId};
+use fabric_core::session::SessionId;
 use fabric_env::materialize::{CacheHealth, MaterializeError, NodeEnv, TreeLock};
 use fabric_harness::claude::{ClaudeCode, LeftReason, TrustOutcome};
 use fabric_harness::codex::Codex;
-use fabric_harness::{Harness, Launch, Running, SessionId, TurnReport};
+use fabric_harness::{Harness, Launch, Running, TurnReport};
 use fabric_net::endpoint::DialOrder;
 use fabricd::control::{
     self, ControlError, Decision, NO_DAEMON_EXIT, NamedSession, Refusal, Request, Response, RunPlan,

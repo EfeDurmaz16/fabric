@@ -18,10 +18,11 @@ use std::path::{Path, PathBuf};
 
 use fabric_core::env::EnvVarName;
 use fabric_core::path::AbsPath;
+use fabric_core::session::SessionId;
 use fabric_harness::codex::Codex;
 use fabric_harness::codex::overrides::{ApprovalPolicy, CodexOverrides, SandboxMode};
 use fabric_harness::manifest::StateManifest;
-use fabric_harness::{Harness, HarnessError, Launch, SessionId};
+use fabric_harness::{Harness, HarnessError, Launch};
 
 const THREAD: &str = "019f233e-bb33-7342-85fa-f2d33b14368a";
 const PREFIX: &str = "019f1111-bb33-7342-85fa-f2d33b14368b";

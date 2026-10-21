@@ -17,9 +17,10 @@ use std::time::Duration;
 use fabric_core::env::EnvVarName;
 use fabric_core::harness::ProgramName;
 use fabric_core::path::AbsPath;
+use fabric_core::session::SessionId;
 use fabric_harness::acp::AcpHarness;
 use fabric_harness::acp::client::{PermissionPolicy, StopReason};
-use fabric_harness::{Harness, HarnessError, Launch, SessionId};
+use fabric_harness::{Harness, HarnessError, Launch};
 use serde_json::Value;
 
 mod fake_acp_agent;

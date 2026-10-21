@@ -12,11 +12,11 @@ use std::path::{Path, PathBuf};
 use fabric_core::BoxFuture;
 use fabric_core::env::EnvVarName;
 use fabric_core::harness::HarnessKind;
+use fabric_core::session::SessionId;
 use tokio::process::Child;
 
 use crate::error::HarnessError;
 use crate::manifest::StateManifest;
-use crate::session::SessionId;
 
 /// An installed harness binary.
 #[derive(Debug, Clone, PartialEq, Eq)]

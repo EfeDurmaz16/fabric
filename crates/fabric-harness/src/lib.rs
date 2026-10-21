@@ -35,7 +35,6 @@ pub(crate) mod pipeline;
 pub(crate) mod place;
 pub(crate) mod process;
 pub(crate) mod redact;
-mod session;
 pub(crate) mod stage;
 
 #[cfg(feature = "acp")]
@@ -50,4 +49,3 @@ pub use harness::{
     Harness, Installed, Launch, MAX_MODEL_NAME_LEN, ModelName, ModelNameError, Restored, Running,
     TurnReport,
 };
-pub use session::{MAX_SESSION_ID_LEN, SessionId, SessionIdError};

@@ -8,8 +8,7 @@ use std::path::PathBuf;
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::path::AbsPath;
-
-use crate::session::SessionId;
+use fabric_core::session::SessionId;
 
 /// Why an adapter operation failed.
 #[derive(Debug, thiserror::Error)]

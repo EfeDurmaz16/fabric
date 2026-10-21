@@ -24,12 +24,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use fabric_core::session::SessionId;
 use serde::{Deserialize, Serialize};
 
 use crate::durable;
 use crate::error::{HarnessError, Input, IoOp};
 use crate::manifest::{Digest, Mutability};
-use crate::session::SessionId;
 use crate::stage::{self, Source};
 
 /// The record format this crate writes.

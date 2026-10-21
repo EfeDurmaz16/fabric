@@ -24,6 +24,7 @@ use fabric_core::BoxFuture;
 use fabric_core::env::EnvVarName;
 use fabric_core::harness::{HarnessKind, ProgramName};
 use fabric_core::path::AbsPath;
+use fabric_core::session::SessionId;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -34,7 +35,6 @@ use crate::manifest::{Content, HOME_PREFIX, Mutability, StateManifest, under_hom
 use crate::pipeline::{self, Capturer, Destination};
 use crate::process::{self, Wiring};
 use crate::redact::RedactionCounts;
-use crate::session::SessionId;
 use crate::stage::{Carry, Source};
 
 use self::client::{AcpClient, AcpError, PermissionPolicy, StopReason};

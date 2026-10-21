@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, JobId, NodeId};
-use fabric_harness::SessionId;
+use fabric_core::session::SessionId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

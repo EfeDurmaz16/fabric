@@ -14,12 +14,12 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+use fabric_core::session::SessionId;
 use serde::Deserialize;
 
 use crate::error::{HarnessError, Input, IoOp};
 use crate::jsontext;
 use crate::redact::Redactor;
-use crate::session::SessionId;
 
 /// What a rollout file name says.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fabric_core::path::AbsPath;
+use fabric_core::session::SessionId;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -32,8 +33,6 @@ use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
-
-use crate::session::SessionId;
 
 /// The protocol version this client speaks.
 pub const PROTOCOL_VERSION: u16 = 1;
