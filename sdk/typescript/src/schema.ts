@@ -140,9 +140,14 @@ function isSocketAddr(text: string): boolean {
   );
 }
 
+/** `schema` reading `null` as absent, as serde reads every optional field and every field with a default in api.rs. */
+function nullAsAbsent<T extends z.ZodType>(schema: T) {
+  return z.preprocess((value) => (value === null ? undefined : value), schema);
+}
+
 /** A field that may be absent; `null` reads as absent, as serde reads it. */
 function optional<T extends z.ZodType>(schema: T) {
-  return z.preprocess((value) => (value === null ? undefined : value), schema.optional());
+  return nullAsAbsent(schema.optional());
 }
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
@@ -567,11 +572,11 @@ export type Roots = z.infer<typeof Roots>;
 /**
  * The environment a request runs in: the node looks programs up on `path`
  * and runs each tool with `roots`, instead of its own. `roots` reads as
- * `{}` when absent and is always written.
+ * `{}` when absent or `null` and is always written.
  */
 export const ClientEnv = z.object({
   path: z.array(PathDir),
-  roots: Roots.default(() => ({})),
+  roots: nullAsAbsent(Roots.default(() => ({}))),
 });
 export type ClientEnv = z.infer<typeof ClientEnv>;
 
@@ -692,7 +697,7 @@ export type AcpSettings = z.infer<typeof AcpSettings>;
 
 /** The node's harness configuration, which a launch from a run plan must use. */
 export const HarnessConfig = z.strictObject({
-  acp: z.record(UnicodeText, AcpSettings).default(() => ({})),
+  acp: nullAsAbsent(z.record(UnicodeText, AcpSettings).default(() => ({}))),
 });
 export type HarnessConfig = z.infer<typeof HarnessConfig>;
 
@@ -709,7 +714,7 @@ const runPlan = {
   harness: Harness,
   session: optional(SessionId),
   goal: UnicodeText,
-  harness_config: HarnessConfig.default(() => ({ acp: {} })),
+  harness_config: nullAsAbsent(HarnessConfig.default(() => ({ acp: {} }))),
 };
 const lease = { owner: NodeId, epoch: Epoch };
 
@@ -737,7 +742,7 @@ export const Reply = z.discriminatedUnion("kind", [
     process: Process,
     records: count,
   }),
-  z.object({ kind: z.literal("job_log"), left_out: count.default(0), records: z.array(LogRecord) }),
+  z.object({ kind: z.literal("job_log"), left_out: nullAsAbsent(count.default(0)), records: z.array(LogRecord) }),
   z.strictObject({ kind: z.literal("job_run"), ...runPlan }),
   z.strictObject({ kind: z.literal("job_resume"), ...runPlan }),
   z.object({ kind: z.literal("job_suspend"), snapshot: SnapshotId }),

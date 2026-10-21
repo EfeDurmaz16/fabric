@@ -1,0 +1,13 @@
+{
+  "schema": "reply",
+  "value": {
+    "kind": "job_log",
+    "left_out": null,
+    "records": []
+  },
+  "reads_as": {
+    "kind": "job_log",
+    "left_out": 0,
+    "records": []
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "schema": "reply",
+  "value": {
+    "kind": "job_run",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "epoch": 2,
+    "root": "/Users/me/fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/work",
+    "harness": {
+      "kind": "claude_code"
+    },
+    "goal": "fix the flaky test",
+    "harness_config": {
+      "acp": null
+    }
+  },
+  "reads_as": {
+    "kind": "job_run",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "epoch": 2,
+    "root": "/Users/me/fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/work",
+    "harness": {
+      "kind": "claude_code"
+    },
+    "goal": "fix the flaky test",
+    "harness_config": {
+      "acp": {}
+    }
+  }
+}

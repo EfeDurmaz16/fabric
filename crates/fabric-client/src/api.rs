@@ -202,6 +202,18 @@ enum HarnessDef {
     },
 }
 
+/// Reads a field that has a default, taking `null` as absent: ADR 0018
+/// says readers accept `null` for an optional field, and serde's
+/// `default` covers only a missing key, so `"roots": null` was refused
+/// while `"env": null` read (review finding on PR #13).
+fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 /// A harness kind in the client API's form, for an optional field.
 mod harness_option {
     use fabric_core::harness::HarnessKind;
@@ -572,7 +584,7 @@ pub struct ClientEnv {
     /// The directories of the client's `PATH`, in order.
     pub path: Vec<PathDir>,
     /// The tool roots the client's environment sets.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub roots: Roots,
 }
 
@@ -1275,7 +1287,7 @@ pub enum Process {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobLog {
     /// How many of the first records are left out.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub left_out: u64,
     /// The records after those, first to last.
     pub records: Vec<LogRecord>,
@@ -1428,7 +1440,7 @@ pub struct RunPlan {
     pub goal: String,
     /// The node's harness configuration, which the launch must use, so a
     /// harness runs under the settings the node captures and restores it with.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub harness_config: HarnessConfig,
 }
 
@@ -1437,7 +1449,7 @@ pub struct RunPlan {
 #[serde(deny_unknown_fields)]
 pub struct HarnessConfig {
     /// ACP agents' settings, by program name.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub acp: std::collections::BTreeMap<String, AcpSettings>,
 }
 
