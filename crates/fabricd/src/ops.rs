@@ -841,6 +841,54 @@ impl Node {
         }
     }
 
+    /// Captures the session of the harness the job ran last into its harness
+    /// state directory, and returns that directory, or `None` when there is
+    /// no session to carry.
+    async fn capture_harness(
+        &self,
+        job: &Job,
+        root: &Path,
+        path_var: &OsString,
+        out: &mut Out,
+    ) -> Result<Option<PathBuf>, NodeError> {
+        let state_dir = job.dir().harness_state();
+        let Some(record) = job_session(job, root, &self.cfg.home, job.harness())? else {
+            return Ok(None);
+        };
+        let session = record.session;
+        let harness = adapter(&record.harness, &self.harness_env(path_var)?)?;
+        let carried = state_names(&state_dir, &record.harness, &session);
+        job.clear_harness_state()?;
+        std::fs::create_dir_all(&state_dir).map_err(|e| NodeError::io(&state_dir, e))?;
+        match harness.capture(root, &session, &state_dir).await {
+            Ok(manifest) => {
+                out.say(format!(
+                    "captured {} session {} ({} files)",
+                    record.harness,
+                    session,
+                    manifest.files().len()
+                ));
+                Ok(Some(state_dir))
+            }
+            // A launch records its session before the harness writes any
+            // of it, and a harness stopped at once, as by a signal that
+            // ended the run while the node recorded it, never does. Nothing
+            // of it exists to carry, and no snapshot carries it, since this
+            // node never captured or restored it, so the record goes and
+            // the capture goes on.
+            Err(HarnessError::SessionNotFound { .. }) if !carried => {
+                job.forget_session()?;
+                job.clear_harness_state()?;
+                out.say(format!(
+                    "{} session {} left no state on this node and no snapshot holds it, so it never started; the snapshot carries no harness state and the next run starts a new session",
+                    record.harness, session
+                ));
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Captures the harness state and the workspace and publishes them as one snapshot.
     async fn capture(
         &self,
@@ -849,22 +897,7 @@ impl Node {
         path_var: &OsString,
         out: &mut Out,
     ) -> Result<SnapshotId, NodeError> {
-        let state_dir = job.dir().harness_state();
-        let mut harness_state = None;
-        if let Some(record) = job_session(job, root, &self.cfg.home, job.harness())? {
-            let session = record.session;
-            let harness = adapter(&record.harness, &self.harness_env(path_var)?)?;
-            job.clear_harness_state()?;
-            std::fs::create_dir_all(&state_dir).map_err(|e| NodeError::io(&state_dir, e))?;
-            let manifest = harness.capture(root, &session, &state_dir).await?;
-            out.say(format!(
-                "captured {} session {} ({} files)",
-                record.harness,
-                session,
-                manifest.files().len()
-            ));
-            harness_state = Some(state_dir);
-        }
+        let harness_state = self.capture_harness(job, root, path_var, out).await?;
         let facts = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
         // A workspace whose environment does not detect here would not
         // materialize on the target either, so the snapshot is refused
@@ -2296,6 +2329,19 @@ fn owner_token(job: &Job, me: NodeId) -> Result<FencingToken, NodeError> {
     }
 }
 
+/// Whether the harness state in `state_dir`, the last this node captured
+/// or restored for the job, is `session` of `kind`, so a snapshot carries
+/// it. A state that cannot be read counts as that session, so a session
+/// is never dropped for a file this node cannot read.
+fn state_names(state_dir: &Path, kind: &HarnessKind, session: &SessionId) -> bool {
+    if !state_dir.join(MANIFEST_FILE).is_file() {
+        return false;
+    }
+    StateManifest::read(state_dir).map_or(true, |state| {
+        state.kind() == kind && state.session() == session
+    })
+}
+
 /// The job's session for `harness`, the one a capture takes or a plan
 /// launches: the one recorded for it, else, when both `harness` and the
 /// harness the job ran last are Codex, the thread the job's workspace
@@ -2857,6 +2903,81 @@ pub(crate) mod tests {
         let job = job.lock().await;
         let state = StateManifest::read(&job.dir().harness_state()).unwrap();
         (job.session().unwrap(), state.session().clone())
+    }
+
+    /// Records a harness launched to continue `session`, which exits at once.
+    async fn ran_briefly(node: &Arc<Node>, id: JobId, session: &SessionId) {
+        let out = &mut Out::default();
+        node.job_run(id, out).await.unwrap();
+        let mut harness = sleeper();
+        node.harness_started(
+            id,
+            Epoch::FIRST,
+            pid(&harness),
+            HarnessKind::Codex,
+            Some(session.clone()),
+            out,
+        )
+        .await
+        .unwrap();
+        harness.kill().unwrap();
+        harness.wait().unwrap();
+        node.harness_exited(id, pid(&harness)).await.unwrap();
+    }
+
+    /// A launch whose harness was stopped before it wrote anything, as by a
+    /// signal while the node recorded it, leaves a recorded session with no
+    /// state here. The suspend says so and goes on without harness state,
+    /// instead of failing every suspend and move of the job from then on.
+    #[tokio::test]
+    async fn a_suspend_goes_on_when_the_recorded_session_never_started() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = locking_codex(dir.path());
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let session = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
+        ran_briefly(&node, id, &session).await;
+
+        let out = &mut Out::default();
+        node.suspend(id, &path, out).await.unwrap();
+        let job = node.job(id).await.unwrap();
+        let job = job.lock().await;
+        assert_eq!(job.session().unwrap(), None);
+        assert!(!job.dir().harness_state().join(MANIFEST_FILE).exists());
+        assert!(
+            out.lines.iter().any(|line| line.contains(session.as_str())),
+            "{:?}",
+            out.lines
+        );
+    }
+
+    /// A session this node captured, whose files are gone when it is to be
+    /// captured again, still fails the suspend: the job's snapshots carry
+    /// that conversation, and a capture without it would drop it.
+    #[tokio::test]
+    async fn a_suspend_fails_when_a_captured_session_is_gone() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = locking_codex(dir.path());
+        let thread = codex_thread_in(&node, id);
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        ran_briefly(&node, id, &thread).await;
+        std::fs::remove_dir_all(node.cfg.home.join(".codex/sessions")).unwrap();
+
+        let err = node
+            .suspend(id, &path, &mut Out::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                NodeError::Harness(HarnessError::SessionNotFound { .. })
+            ),
+            "{err}"
+        );
+        let job = node.job(id).await.unwrap();
+        let record = job.lock().await.session().unwrap();
+        assert_eq!(record.map(|record| record.session), Some(thread));
     }
 
     /// A Codex started with no thread to resume makes its thread only once
