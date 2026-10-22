@@ -174,6 +174,18 @@ pub enum NodeError {
         /// The pid the CLI named.
         pid: std::num::NonZeroU32,
     },
+    /// A session was named for a harness this node no longer records.
+    #[error(
+        "job {job}: pid {pid} is not the harness this node records, because a suspend, a move or a fence stopped it, so its session {session} is not recorded"
+    )]
+    HarnessNotRecorded {
+        /// The job.
+        job: JobId,
+        /// The pid the CLI named.
+        pid: std::num::NonZeroU32,
+        /// The session it named.
+        session: fabric_harness::SessionId,
+    },
     /// The workspace at the root was left by an earlier tenure of this node.
     #[error(
         "job {job}: the workspace at {root} was left at epoch {epoch}, before this node's tenure, and may differ from the job's latest snapshot; run `fabric job resume {job}`, which sets it aside and restores the latest snapshot"
@@ -201,6 +213,15 @@ pub enum NodeError {
         "job {job} changed after this launch was planned, by another run or resume, a suspend or a record from a peer, so nothing was launched; run the command again"
     )]
     PlanOvertaken {
+        /// The job.
+        job: JobId,
+    },
+    /// The job's session moved after a run plan was made, so the plan
+    /// would continue an older one.
+    #[error(
+        "job {job} recorded a session after this launch was planned, as a headless turn does when it names its session late, so the launch would continue an older one; run the command again"
+    )]
+    SessionMoved {
         /// The job.
         job: JobId,
     },
@@ -378,9 +399,11 @@ impl NodeError {
             | NodeError::NoWorkspace(_)
             | NodeError::RootNotADirectory { .. }
             | NodeError::PlanOvertaken { .. }
+            | NodeError::SessionMoved { .. }
             | NodeError::StaleWorkspace { .. }
             | NodeError::NoSnapshot(_)
-            | NodeError::HarnessGone { .. } => Refusal::JobState,
+            | NodeError::HarnessGone { .. }
+            | NodeError::HarnessNotRecorded { .. } => Refusal::JobState,
             _ => Refusal::Failed,
         }
     }

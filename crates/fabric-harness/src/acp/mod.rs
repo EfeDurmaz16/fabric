@@ -346,17 +346,19 @@ impl AcpHarness {
     ) -> Result<AcpRunning, HarnessError> {
         let root = pipeline::physical_workspace(workspace)?;
         let binary = self.binary()?;
-        let (mut child, pid) = process::spawn(
+        let mut spawned = process::spawn(
             &binary,
             &self.args,
             pipeline::fs_path(&root),
             env,
             Wiring::Rpc,
-        )?;
+        )
+        .await?;
         // Until the session is open, an error or a dropped future kills the
         // agent's group, so no agent is left running without a handle.
-        let guard = process::GroupGuard::new(pid);
-        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        let guard = process::GroupGuard::new(spawned.pid);
+        let (Some(stdin), Some(stdout)) = (spawned.child.stdin.take(), spawned.child.stdout.take())
+        else {
             return Err(HarnessError::Spawn {
                 program: self.program.to_string(),
                 source: std::io::Error::other("agent started without stdio pipes"),
@@ -371,7 +373,7 @@ impl AcpHarness {
             tokio::spawn(async move { client.prompt(&session, &prompt).await })
         });
         Ok(AcpRunning {
-            running: Running::new(pid, Some(session), child),
+            running: Running::new(Some(session), spawned),
             client,
             turn,
         })

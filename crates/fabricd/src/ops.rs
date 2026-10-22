@@ -37,7 +37,7 @@ use fabric_store::restore::{
 };
 
 use crate::clock;
-use crate::control::{Decision, Request, RunPlan};
+use crate::control::{Decision, NamedSession, Request, RunPlan, StartedHarness};
 use crate::doctor::{self, Context, Target};
 use crate::error::NodeError;
 use crate::facts::{MeasuredKeys, NodeFacts, key_difference};
@@ -138,20 +138,19 @@ impl Node {
                     Box::pin(self.job_resume(job, on, harness, force, &path_var, out)).await?,
                 ));
             }
-            Request::HarnessStarted {
+            Request::HarnessStarted(started) => self.harness_started(started, out).await?,
+            Request::LaunchCheck {
                 job,
                 epoch,
-                pid,
+                head,
                 harness,
                 session,
             } => {
-                self.harness_started(job, epoch, pid, harness, session, out)
+                self.launch_check(job, epoch, head, &harness, session.as_ref())
                     .await?;
             }
-            Request::LaunchCheck { job, epoch, head } => {
-                self.launch_check(job, epoch, head).await?;
-            }
             Request::HarnessExited { job, pid } => self.harness_exited(job, pid).await?,
+            Request::HarnessSession(named) => self.harness_session(named, out).await?,
             Request::JobSuspend { job, path_var } => {
                 self.resolve_departing(job, out).await?;
                 self.suspend(job, &path_var, out).await?;
@@ -550,18 +549,23 @@ impl Node {
     }
 
     /// Refuses a launch whose plan no longer holds: the node no longer owns
-    /// the job at the plan's epoch, records a harness that still runs, or
-    /// holds records past the head the plan was made at.
+    /// the job at the plan's epoch, records a harness that still runs,
+    /// holds records past the head the plan was made at, or records another
+    /// session for `harness` than the `session` the plan continues.
     ///
     /// The CLI asks under the tree lock, before any setup step. A launch of
     /// the same workspace registers its harness, appending `Resumed`, before
     /// it lets the lock go, so a plan this passes was not overtaken by one,
-    /// even by one whose harness already exited.
+    /// even by one whose harness already exited. A headless turn can name
+    /// its session after its harness exited, which moves no head, so the
+    /// session is compared as well, here and again at registration.
     pub(crate) async fn launch_check(
         &self,
         id: JobId,
         epoch: Epoch,
         head: RecordHash,
+        harness: &HarnessKind,
+        session: Option<&SessionId>,
     ) -> Result<(), NodeError> {
         let job = self.job(id).await?;
         let job = job.lock().await;
@@ -584,24 +588,29 @@ impl Node {
         if job.ledger().head() != head {
             return Err(NodeError::PlanOvertaken { job: id });
         }
-        Ok(())
+        refuse_moved_session(&job, harness, session)
     }
 
     /// Records the harness the CLI launched and appends `Resumed`, or refuses.
     ///
     /// It fails closed: a stale epoch, a harness already recorded and alive,
-    /// and a process whose start time cannot be read are all refused, and
-    /// the CLI then kills the group it launched. The record is written
-    /// before `Resumed`, so no harness the ledger says runs is unsupervised.
+    /// a session that moved since the plan, and a process whose start time
+    /// cannot be read are all refused, and the CLI then kills the group it
+    /// launched. The record is written before `Resumed`, so no harness the
+    /// ledger says runs is unsupervised.
     pub(crate) async fn harness_started(
         &self,
-        id: JobId,
-        epoch: Epoch,
-        pid: NonZeroU32,
-        harness: HarnessKind,
-        session: Option<SessionId>,
+        started: StartedHarness,
         out: &mut Out,
     ) -> Result<(), NodeError> {
+        let StartedHarness {
+            job: id,
+            epoch,
+            pid,
+            harness,
+            session,
+            planned,
+        } = started;
         faults::hit(Point::BeforeHarnessRecord).await;
         refuse_secret_kind(&harness)?;
         let job = self.job(id).await?;
@@ -623,6 +632,9 @@ impl Node {
                 pid: record.pid.get(),
             });
         }
+        // The setup steps ran after the CLI's check, and an earlier
+        // headless turn may have named its session meanwhile.
+        refuse_moved_session(&job, &harness, planned.as_ref())?;
         if !local::leads_group(pid).await {
             return Err(NodeError::HarnessGone { pid });
         }
@@ -679,6 +691,58 @@ impl Node {
         out.say(format!(
             "Resumed recorded at epoch {epoch}; {harness} runs as pid {pid}"
         ));
+        Ok(())
+    }
+
+    /// Records the session a harness named after it started, for the
+    /// harness this node recorded: a headless Codex run names a new thread
+    /// only once it runs, and a capture without the session would leave the
+    /// thread behind.
+    ///
+    /// It refuses a stale epoch and a pid that is not the recorded
+    /// harness's. A suspend, a move or a fence that stopped the harness
+    /// removed its record and captured the session the job held then, so a
+    /// session recorded later would name one the snapshot does not hold. A
+    /// fresh Codex's thread is not lost to that: the capture takes it from
+    /// the job's workspace (`job_session`).
+    pub(crate) async fn harness_session(
+        &self,
+        named: NamedSession,
+        out: &mut Out,
+    ) -> Result<(), NodeError> {
+        let NamedSession {
+            job: id,
+            epoch,
+            pid,
+            harness,
+            session,
+        } = named;
+        refuse_secret_kind(&harness)?;
+        let job = self.job(id).await?;
+        let job = job.lock().await;
+        let token = owner_token(&job, self.id)?;
+        if token.epoch != epoch {
+            return Err(FenceError::StaleEpoch {
+                yours: epoch,
+                current: token.epoch,
+            }
+            .into());
+        }
+        if job.harness_record()?.is_none_or(|record| record.pid != pid) {
+            return Err(NodeError::HarnessNotRecorded {
+                job: id,
+                pid,
+                session,
+            });
+        }
+        local::write(
+            &job.dir().session(),
+            &SessionRecord {
+                harness: harness.clone(),
+                session: session.clone(),
+            },
+        )?;
+        out.say(format!("recorded {harness} session {session}"));
         Ok(())
     }
 
@@ -2425,6 +2489,21 @@ fn owner_token(job: &Job, me: NodeId) -> Result<FencingToken, NodeError> {
     }
 }
 
+/// Refuses a launch planned to continue `planned` when the session a plan
+/// for `harness` would continue now is another: an earlier headless turn
+/// named its session after the plan was made.
+fn refuse_moved_session(
+    job: &Job,
+    harness: &HarnessKind,
+    planned: Option<&SessionId>,
+) -> Result<(), NodeError> {
+    let now = job.session()?.filter(|record| record.harness == *harness);
+    if now.as_ref().map(|record| &record.session) != planned {
+        return Err(NodeError::SessionMoved { job: job.id() });
+    }
+    Ok(())
+}
+
 /// Whether the harness state in `state_dir`, the last this node captured
 /// or restored for the job, is `session` of `kind`, so a snapshot carries
 /// it. A state that cannot be read counts as that session, so a session
@@ -3025,13 +3104,28 @@ pub(crate) mod tests {
         NonZeroU32::new(child.id()).unwrap()
     }
 
+    /// Asks `node` whether `plan` still holds, as the CLI does under the tree lock.
+    async fn check(node: &Node, plan: &RunPlan) -> Result<(), NodeError> {
+        node.launch_check(
+            plan.job,
+            plan.epoch,
+            plan.head,
+            &plan.harness,
+            plan.session.as_ref(),
+        )
+        .await
+    }
+
     async fn register(node: &Arc<Node>, id: JobId, pid: NonZeroU32) -> Result<(), NodeError> {
         node.harness_started(
-            id,
-            Epoch::FIRST,
-            pid,
-            HarnessKind::Codex,
-            None,
+            StartedHarness {
+                job: id,
+                epoch: Epoch::FIRST,
+                pid,
+                harness: HarnessKind::Codex,
+                session: None,
+                planned: None,
+            },
             &mut Out::default(),
         )
         .await
@@ -3114,14 +3208,17 @@ pub(crate) mod tests {
     /// Records a harness launched to continue `session`, which exits at once.
     async fn ran_briefly(node: &Arc<Node>, id: JobId, session: &SessionId) {
         let out = &mut Out::default();
-        node.job_run(id, out).await.unwrap();
+        let plan = node.job_run(id, out).await.unwrap();
         let mut harness = sleeper();
         node.harness_started(
-            id,
-            Epoch::FIRST,
-            pid(&harness),
-            HarnessKind::Codex,
-            Some(session.clone()),
+            StartedHarness {
+                job: id,
+                epoch: Epoch::FIRST,
+                pid: pid(&harness),
+                harness: HarnessKind::Codex,
+                session: Some(session.clone()),
+                planned: plan.session,
+            },
             out,
         )
         .await
@@ -3244,6 +3341,60 @@ pub(crate) mod tests {
         assert_eq!(
             recorded_and_captured(&node, id).await,
             (Some(record), thread)
+        );
+    }
+
+    /// A fresh headless Codex names its thread only once it runs, and the
+    /// CLI sends it to the node then. A suspend that takes the job first
+    /// stops the harness and drops its record, so the late session is
+    /// refused; the suspend must still carry the thread, which it finds in
+    /// the job's workspace as for any fresh Codex (Codex review of PR #10,
+    /// 2026-10-22).
+    #[tokio::test]
+    async fn a_suspend_before_a_late_session_record_still_carries_the_thread() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = locking_codex(dir.path());
+        let out = &mut Out::default();
+        node.suspend(id, &path, out).await.unwrap();
+        node.job_run(id, out).await.unwrap();
+        let harness = sleeper();
+        let harness_pid = pid(&harness);
+        register(&node, id, harness_pid).await.unwrap();
+        let thread = codex_thread_in(&node, id);
+
+        // The suspend stops the harness, which is reaped as the CLI would.
+        let reaper = std::thread::spawn(move || {
+            let mut harness = harness;
+            harness.wait()
+        });
+        node.suspend(id, &path, out).await.unwrap();
+        reaper.join().unwrap().unwrap();
+        let late = node
+            .harness_session(
+                NamedSession {
+                    job: id,
+                    epoch: Epoch::FIRST,
+                    pid: harness_pid,
+                    harness: HarnessKind::Codex,
+                    session: thread.clone(),
+                },
+                &mut Out::default(),
+            )
+            .await;
+        assert!(
+            matches!(late, Err(NodeError::HarnessNotRecorded { .. })),
+            "{late:?}"
+        );
+        let record = SessionRecord {
+            harness: HarnessKind::Codex,
+            session: thread.clone(),
+        };
+        assert_eq!(
+            recorded_and_captured(&node, id).await,
+            (Some(record), thread),
+            "{:?}",
+            out.lines
         );
     }
 
@@ -3497,6 +3648,75 @@ pub(crate) mod tests {
             job.session().unwrap().is_none(),
             "the stale session would be continued"
         );
+    }
+
+    /// A headless Codex run names its thread only once it runs. The node
+    /// records that session for the harness it recorded and for no other
+    /// pid, and not once that harness was stopped, because the suspend or
+    /// fence that stopped it captured without the session.
+    #[tokio::test]
+    async fn a_session_named_after_the_start_is_recorded_only_for_the_recorded_harness() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let out = &mut Out::default();
+        node.suspend(id, &path, out).await.unwrap();
+        node.job_run(id, out).await.unwrap();
+        let mut harness = sleeper();
+        register(&node, id, pid(&harness)).await.unwrap();
+        let thread = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
+        let name_at = |epoch, pid| {
+            let (node, thread) = (Arc::clone(&node), thread.clone());
+            async move {
+                node.harness_session(
+                    NamedSession {
+                        job: id,
+                        epoch,
+                        pid,
+                        harness: HarnessKind::Codex,
+                        session: thread,
+                    },
+                    &mut Out::default(),
+                )
+                .await
+            }
+        };
+        let name = |pid| name_at(Epoch::FIRST, pid);
+
+        let other = NonZeroU32::new(pid(&harness).get() + 1).unwrap();
+        assert!(matches!(
+            name(other).await,
+            Err(NodeError::HarnessNotRecorded { .. })
+        ));
+        assert!(
+            matches!(
+                name_at(Epoch::new(2).unwrap(), pid(&harness)).await,
+                Err(NodeError::Fence(_))
+            ),
+            "a plan of another epoch named the session"
+        );
+        let recorded = || async {
+            let job = node.job(id).await.unwrap();
+            let job = job.lock().await;
+            job.session().unwrap()
+        };
+        assert_eq!(recorded().await, None);
+        name(pid(&harness)).await.unwrap();
+        assert_eq!(
+            recorded().await,
+            Some(SessionRecord {
+                harness: HarnessKind::Codex,
+                session: thread.clone(),
+            })
+        );
+
+        harness.kill().unwrap();
+        harness.wait().unwrap();
+        node.harness_exited(id, pid(&harness)).await.unwrap();
+        assert!(matches!(
+            name(pid(&harness)).await,
+            Err(NodeError::HarnessNotRecorded { .. })
+        ));
     }
 
     /// The setup steps a node approved for a job run code from the
@@ -3996,17 +4216,25 @@ pub(crate) mod tests {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
         let session_file = node.cfg.state.job(id).session();
-        // A directory where the session goes makes its write fail.
-        std::fs::create_dir_all(session_file.join("in-the-way")).unwrap();
+        // A directory at the name the session is written under before its
+        // rename makes the write fail, while the registration's check of
+        // the session it continues still reads none.
+        let mut temp_name = session_file.file_name().unwrap().to_os_string();
+        temp_name.push(format!(".{}.tmp", std::process::id()));
+        let in_the_way = session_file.with_file_name(temp_name);
+        std::fs::create_dir_all(in_the_way.join("in-the-way")).unwrap();
         let mut harness = sleeper();
         let session = SessionId::parse("new-session").unwrap();
         let failed = node
             .harness_started(
-                id,
-                Epoch::FIRST,
-                pid(&harness),
-                HarnessKind::Codex,
-                Some(session.clone()),
+                StartedHarness {
+                    job: id,
+                    epoch: Epoch::FIRST,
+                    pid: pid(&harness),
+                    harness: HarnessKind::Codex,
+                    session: Some(session.clone()),
+                    planned: None,
+                },
                 &mut Out::default(),
             )
             .await;
@@ -4020,7 +4248,8 @@ pub(crate) mod tests {
             EventKind::Resumed { .. }
         ));
         // As after a restart: the session file was never written.
-        std::fs::remove_dir_all(&session_file).unwrap();
+        assert!(!session_file.exists());
+        std::fs::remove_dir_all(&in_the_way).unwrap();
         let kept = job.session().unwrap().map(|record| record.session);
         assert_eq!(kept, Some(session));
     }
@@ -4379,11 +4608,14 @@ pub(crate) mod tests {
         let mut sleeper = sleeper();
         let refused = node
             .harness_started(
-                id,
-                Epoch::FIRST,
-                pid(&sleeper),
-                secret,
-                None,
+                StartedHarness {
+                    job: id,
+                    epoch: Epoch::FIRST,
+                    pid: pid(&sleeper),
+                    harness: secret,
+                    session: None,
+                    planned: None,
+                },
                 &mut Out::default(),
             )
             .await;
@@ -4705,11 +4937,14 @@ pub(crate) mod tests {
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         let harness = sleeper();
         node.harness_started(
-            id,
-            Epoch::FIRST,
-            pid(&harness),
-            HarnessKind::ClaudeCode,
-            None,
+            StartedHarness {
+                job: id,
+                epoch: Epoch::FIRST,
+                pid: pid(&harness),
+                harness: HarnessKind::ClaudeCode,
+                session: None,
+                planned: None,
+            },
             &mut Out::default(),
         )
         .await
@@ -4986,12 +5221,10 @@ pub(crate) mod tests {
         let id = job(dir.path(), &node).await;
         let first = node.job_run(id, &mut Out::default()).await.unwrap();
         let second = node.job_run(id, &mut Out::default()).await.unwrap();
-        node.launch_check(id, first.epoch, first.head)
-            .await
-            .unwrap();
+        check(&node, &first).await.unwrap();
         let mut harness = sleeper();
         register(&node, id, pid(&harness)).await.unwrap();
-        let refused = node.launch_check(id, second.epoch, second.head).await;
+        let refused = check(&node, &second).await;
         assert!(
             matches!(refused, Err(NodeError::AlreadyRunningHarness { pid: p, .. }) if p == harness.id()),
             "{refused:?}"
@@ -5038,11 +5271,14 @@ pub(crate) mod tests {
         a.suspend(id, &path, &mut Out::default()).await.unwrap();
         let harness = sleeper();
         a.harness_started(
-            id,
-            Epoch::FIRST,
-            pid(&harness),
-            HarnessKind::ClaudeCode,
-            None,
+            StartedHarness {
+                job: id,
+                epoch: Epoch::FIRST,
+                pid: pid(&harness),
+                harness: HarnessKind::ClaudeCode,
+                session: None,
+                planned: None,
+            },
             &mut Out::default(),
         )
         .await
@@ -5218,20 +5454,82 @@ pub(crate) mod tests {
         let id = job(dir.path(), &node).await;
         let first = node.job_run(id, &mut Out::default()).await.unwrap();
         let second = node.job_run(id, &mut Out::default()).await.unwrap();
-        node.launch_check(id, first.epoch, first.head)
-            .await
-            .unwrap();
+        check(&node, &first).await.unwrap();
         let mut harness = sleeper();
         let harness_pid = pid(&harness);
         register(&node, id, harness_pid).await.unwrap();
         harness.kill().unwrap();
         harness.wait().unwrap();
         node.harness_exited(id, harness_pid).await.unwrap();
-        let refused = node.launch_check(id, second.epoch, second.head).await;
+        let refused = check(&node, &second).await;
         assert!(
             matches!(refused, Err(NodeError::PlanOvertaken { .. })),
             "{refused:?}"
         );
+    }
+
+    /// A headless turn can name its session after its harness exited,
+    /// while the CLI still reads the turn's output, and that moves no
+    /// ledger head. A plan made in between would continue the session from
+    /// before the turn and leave the turn's out, so it is refused under the
+    /// tree lock, and at registration when the session arrives while the
+    /// setup steps run.
+    #[tokio::test]
+    async fn a_plan_made_before_a_late_session_is_refused() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        node.job_run(id, &mut Out::default()).await.unwrap();
+        let mut turn = sleeper();
+        let turn_pid = pid(&turn);
+        register(&node, id, turn_pid).await.unwrap();
+        turn.kill().unwrap();
+        turn.wait().unwrap();
+        // The CLI reaped the turn and reads the rest of its output.
+        let next = node.job_run(id, &mut Out::default()).await.unwrap();
+        assert_eq!(next.session, None);
+        check(&node, &next).await.unwrap();
+        let thread = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
+        node.harness_session(
+            NamedSession {
+                job: id,
+                epoch: Epoch::FIRST,
+                pid: turn_pid,
+                harness: HarnessKind::Codex,
+                session: thread.clone(),
+            },
+            &mut Out::default(),
+        )
+        .await
+        .unwrap();
+
+        let refused = check(&node, &next).await;
+        assert!(
+            matches!(refused, Err(NodeError::SessionMoved { .. })),
+            "{refused:?}"
+        );
+        let mut launched = sleeper();
+        let refused = node
+            .harness_started(
+                StartedHarness {
+                    job: id,
+                    epoch: next.epoch,
+                    pid: pid(&launched),
+                    harness: next.harness.clone(),
+                    session: None,
+                    planned: next.session.clone(),
+                },
+                &mut Out::default(),
+            )
+            .await;
+        launched.kill().unwrap();
+        launched.wait().unwrap();
+        assert!(
+            matches!(refused, Err(NodeError::SessionMoved { .. })),
+            "{refused:?}"
+        );
+        let job = node.job(id).await.unwrap();
+        let recorded = job.lock().await.session().unwrap();
+        assert_eq!(recorded.map(|record| record.session), Some(thread));
     }
 
     /// `forked_from` reads this node's epoch, then freezes under the job's

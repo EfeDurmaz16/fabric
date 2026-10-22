@@ -2,6 +2,8 @@
 
 Status: accepted, 2026-10-19
 
+Amended 2026-10-21 after gate finding F5 (Codex 0.155.1 exited with "Interrupted system call" under `fabric job run`): an interactive harness launched from a terminal starts held behind a trampoline until its process group owns the terminal, and the CLI takes the terminal back when the harness exits, under "Launching in the user's terminal".
+
 Amended 2026-10-20 after the first gate run (gate findings F1 and F2): the trust pre-seed no longer refuses while `claude` runs, and a launched harness no longer inherits the markers of a Claude Code or Codex session Fabric runs under. Both are dated amendments in place, under "Trust on the target" and "The `Harness` trait".
 
 Amended 2026-10-20 after the reviews of the F1 and F2 fixes: the parent-session markers are split by evidence into identity markers, host-session markers and desktop-host markers, under "The `Harness` trait"; the trust pre-seed leaves a symlinked or missing `~/.claude.json` to Claude, and a launch environment that moves `CLAUDE_CONFIG_DIR` is refused, under "Rules shared by both adapters".
@@ -73,6 +75,26 @@ These two get dedicated adapters because the first gate is Claude Code and the s
 - Secondary harnesses come later and in this order: OpenCode (export and import JSON, the cheapest carry), then Pi (one JSONL under a directory Fabric may own). Copilot, Cursor and Amp wait for a read of their terms (design input, D17).
 
 Each adapter is a module in `fabric-harness` behind a cargo feature. The core compiles with no adapter enabled.
+
+### Launching in the user's terminal
+
+Added 2026-10-21 (gate finding F5).
+
+The harness runs in a process group of its own, so the node can kill exactly the harness and what it started (ADR 0003, Fencing). A process in a group that is not the terminal's foreground group is stopped by `SIGTTOU` when it sets the terminal's modes and by `SIGTTIN` when it reads it (POSIX, General Terminal Interface). The first build spawned the harness, waited for the node to record it, and only then made its group the foreground group and sent the group a `SIGCONT`. On the Pro, `fabric job run` of a Codex job printed that Codex ran and Codex exited at once with "Error: Interrupted system call (os error 4)". The end-to-end test `terminal::e2e_a_terminal_harness_owns_the_terminal_before_it_starts` reproduces it against that build with a fake harness that sets the terminal's modes at its first instruction, as a full-screen agent does: it was not in the foreground at start, `tcsetattr` failed with the same error, and it got a `SIGCONT`. Two things went wrong: a harness that touched the terminal first was stopped and then continued in the middle of a call, and a harness that had not touched it yet still got a `SIGCONT` it had not asked for, which interrupts a blocking call of a process that handles `SIGCONT`, as Codex does for its own suspend.
+
+The rule: the harness never runs before its process group owns the terminal, and it never sees a `SIGCONT` from Fabric.
+
+Options considered:
+
+- (a) A trampoline. When the standard input the harness inherits is a terminal, the adapter spawns `/bin/sh -c 'unset -f kill && kill -STOP $$ && exec "$@"' fabric-hold <harness> <args...>` in a new process group, with the harness's path and arguments passed as positional parameters, never inside the script text. `unset -f kill` is there because bash, which is `/bin/sh` on macOS, imports exported functions from the environment, and a function named `kill` would run in place of the builtin and skip the stop; `unset` is a special builtin, which no function can shadow (found in review, 2026-10-21). `spawn` returns once `waitid` (rustix, `WSTOPPED | WEXITED | WNOWAIT`) reports the shell stopped. The CLI registers the pid while it is held, makes the group the foreground group with `tcsetpgrp`, and continues it (`Running::release`); the shell then execs the harness in the same process, so the pid, the group and the start time the node recorded stay true, and the `SIGCONT` is delivered to the shell before the exec. Chosen.
+- (b) Keep the harness in the terminal's foreground group, which is the CLI's, and fence by walking the process tree. A process that forks twice is reparented to `launchd` and leaves the tree, a walk with `ps` races with every fork, Ctrl-C would reach the CLI too, and the node's record of one group per harness (ADR 0016) would have to change. Rejected.
+- (c) Give the terminal away in the child between fork and exec, as a job-control shell does. It needs `pre_exec`, which is unsafe, and the workspace forbids unsafe code. A variant that re-executes `fabric` as its own trampoline (block `SIGTTOU`, `tcsetpgrp`, then exec the harness) avoids the stop and the continue, but the harness would run before the node recorded it, the adapter library could not do it alone, and it needs the path of the `fabric` binary. Rejected.
+
+Because the CLI registers the harness while it is held, an interactive harness launched from a terminal no longer runs before the node has recorded it, and a node refusal kills a stopped shell rather than a harness that may have written its session. A hand-over whose `tcsetpgrp` fails is no reason to start the harness without the terminal, where its first read would stop it: the CLI kills the held group, tells the node it exited and fails the command (Codex review, 2026-10-22). A CLI killed while it holds the harness leaves a stopped shell whose group becomes orphaned when the CLI dies; the kernel then sends it `SIGHUP` and `SIGCONT`, and it exits without running the harness, unless `SIGHUP` was ignored when `fabric` started (`nohup`). A node that stops a held harness waits out the `SIGTERM` grace, because a stopped process acts on no signal but `SIGKILL` and `SIGCONT`, and then kills it.
+
+When the harness exits, the CLI takes the terminal back for its own group before it prints anything. The CLI is then in a background group, and `tcsetpgrp` from a background group stops the caller with `SIGTTOU` unless the caller blocks or ignores it, so the calling thread blocks `SIGTTOU` for that one call. rustix has no safe signal mask, so the CLI uses `nix` 0.31 (`pthread_sigmask`, MIT, released 2026-05-11). The forward hand-over does not block it: a `fabric job run` started in the background stops on `tcsetpgrp` until the shell brings it to the foreground, as any job that takes the terminal does.
+
+With no terminal on standard input, nothing is held and nothing is handed over or taken back: the harness starts at once in its own group, as before. `/bin/sh` exists on every macOS and Linux node.
 
 ### Credentials and terms
 

@@ -127,10 +127,16 @@ impl Launch {
 /// A harness process this node started, in a process group of its own.
 /// Only this crate builds one, from a child it spawned, so the pid is
 /// real and is also the process group id.
+///
+/// A `Launch::Interactive` run whose standard input is a terminal starts
+/// held: a trampoline, stopped before it execs the harness, so the harness
+/// never touches the terminal before its group owns it. The caller makes
+/// the group the terminal's foreground group, then calls `release`.
 pub struct Running {
     pid: NonZeroU32,
     session: Option<SessionId>,
     child: Child,
+    held: bool,
 }
 
 impl std::fmt::Debug for Running {
@@ -138,6 +144,7 @@ impl std::fmt::Debug for Running {
         f.debug_struct("Running")
             .field("pid", &self.pid)
             .field("session", &self.session)
+            .field("held", &self.held)
             .finish_non_exhaustive()
     }
 }
@@ -145,12 +152,31 @@ impl std::fmt::Debug for Running {
 impl Running {
     /// Wraps a child that `process::spawn` started in a new process group.
     #[cfg(any(feature = "acp", feature = "claude", feature = "codex"))]
-    pub(crate) fn new(pid: NonZeroU32, session: Option<SessionId>, child: Child) -> Self {
+    pub(crate) fn new(session: Option<SessionId>, spawned: crate::process::Spawned) -> Self {
         Running {
-            pid,
+            pid: spawned.pid,
             session,
-            child,
+            child: spawned.child,
+            held: spawned.held,
         }
+    }
+
+    /// True while the harness waits, stopped before its exec, for its
+    /// process group to be given the terminal.
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        self.held
+    }
+
+    /// Lets a held harness start by continuing its process group; the
+    /// trampoline then execs the harness. Call it once the group is the
+    /// terminal's foreground group. A harness that is not held is left alone.
+    pub fn release(&mut self) -> Result<(), HarnessError> {
+        if self.held {
+            crate::process::continue_group(self.pid)?;
+            self.held = false;
+        }
+        Ok(())
     }
 
     /// The process id, which is also the id of the process group the
@@ -171,6 +197,42 @@ impl Running {
     /// protocol client holds (`AcpHarness::launch_acp` returns that client).
     pub fn child_mut(&mut self) -> &mut Child {
         &mut self.child
+    }
+}
+
+/// What a headless run printed about its turn, as its adapter reads it
+/// line by line (`ClaudeCode::read_headless_line`,
+/// `Codex::read_headless_line`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnReport {
+    /// The session the harness says the turn ran in.
+    pub session: Option<SessionId>,
+    /// The last answer of the turn.
+    pub answer: Option<String>,
+    /// Why the turn failed, when the harness says it did.
+    pub failure: Option<String>,
+}
+
+impl TurnReport {
+    /// Takes `text` as the session the turn ran in. Returns true when it
+    /// names a valid session other than the one already held; an id that
+    /// does not parse is logged and left out.
+    #[cfg(any(feature = "claude", feature = "codex"))]
+    pub(crate) fn note_session(&mut self, text: Option<&str>) -> bool {
+        let Some(text) = text else {
+            return false;
+        };
+        match SessionId::parse(text) {
+            Ok(session) if self.session.as_ref() != Some(&session) => {
+                self.session = Some(session);
+                true
+            }
+            Ok(_) => false,
+            Err(e) => {
+                tracing::warn!(error = %e, "a headless run named a session id that is not valid");
+                false
+            }
+        }
     }
 }
 

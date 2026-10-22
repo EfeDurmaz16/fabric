@@ -79,23 +79,115 @@ impl Env {
 
     /// Puts a fake `claude` first on the `PATH`: it answers `--version` as
     /// the gate's Claude does and otherwise writes its arguments, one per
-    /// line, to `fake_claude_args` and exits.
+    /// line, to `claude-args` and its environment to `claude-env` under the
+    /// home. With `-p` it also appends the prompt to the session's
+    /// transcript under `~/.claude/projects/<slug>/`, as Claude does, and
+    /// prints the one result object `claude -p --output-format json` prints.
     pub fn install_fake_claude(&self) -> Fallible {
-        let claude = self.root.join("bin").join("claude");
-        write_executable(
-            &claude,
-            b"#!/bin/sh\n\
+        self.install(
+            "claude",
+            "#!/bin/sh\n\
              if [ \"$1\" = --version ]; then echo '2.1.294 (Claude Code)'; exit 0; fi\n\
-             printf '%s\\n' \"$@\" > \"$HOME/claude-args\"\n",
+             printf '%s\\n' \"$@\" > \"$HOME/claude-args\"\n\
+             env > \"$HOME/claude-env\"\n\
+             headless=; session=; prompt=\n\
+             while [ $# -gt 0 ]; do\n\
+               case \"$1\" in\n\
+                 -p) headless=1 ;;\n\
+                 --session-id|--resume) session=\"$2\"; shift ;;\n\
+                 --) prompt=\"$2\"; shift ;;\n\
+               esac\n\
+               shift\n\
+             done\n\
+             [ -n \"$headless\" ] || exit 0\n\
+             dir=\"$HOME/.claude/projects/$(pwd -P | sed 's/[^A-Za-z0-9]/-/g')\"\n\
+             mkdir -p \"$dir\"\n\
+             printf '{\"type\":\"user\",\"sessionId\":\"%s\",\"message\":{\"role\":\"user\",\"content\":\"%s\"}}\\n' \"$session\" \"$prompt\" >> \"$dir/$session.jsonl\"\n\
+             printf '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"claude did: %s\",\"session_id\":\"%s\"}\\n' \"$prompt\" \"$session\"\n",
         )
+    }
+
+    /// The thread the fake `codex` starts.
+    pub const CODEX_THREAD: &str = "019f233e-bb33-7342-85fa-f2d33b14368a";
+
+    /// Puts a fake `codex` first on the `PATH`: it answers `--version` as
+    /// the gate's Codex does and otherwise writes its arguments, one per
+    /// line, to `codex-args` and its environment to `codex-env` under the
+    /// home. Under `exec` it appends the prompt to the thread's rollout
+    /// under `~/.codex/sessions/`, starting `CODEX_THREAD`, or the thread
+    /// `exec resume` names, and prints the events `codex exec --json`
+    /// prints for one turn. After `thread.started` it waits up to five
+    /// seconds for the node's session record of the job and writes `yes`
+    /// or `no` to `codex-saw-session`, so a test can tell the thread was
+    /// recorded while the turn ran. With `FAKE_CODEX_WAIT` set it then
+    /// touches `codex-waiting` and runs until a `SIGINT`, which it writes
+    /// to `codex-signal` before it exits with 130. With
+    /// `FAKE_CODEX_LATE_STDERR` set it leaves a process behind that writes
+    /// `codex: late diagnostics` to its standard error half a second after
+    /// the turn ends, with its standard output already closed.
+    pub fn install_fake_codex(&self) -> Fallible {
+        self.install(
+            "codex",
+            &format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = --version ]; then echo 'codex-cli 0.155.1'; exit 0; fi\n\
+                 printf '%s\\n' \"$@\" > \"$HOME/codex-args\"\n\
+                 env > \"$HOME/codex-env\"\n\
+                 [ \"$1\" = exec ] || exit 0\n\
+                 thread={thread}\n\
+                 if [ \"$2\" = resume ]; then thread=\"$3\"; fi\n\
+                 prompt=\n\
+                 while [ $# -gt 0 ]; do if [ \"$1\" = -- ]; then prompt=\"$2\"; fi; shift; done\n\
+                 dir=\"$HOME/.codex/sessions/2026/10/21\"\n\
+                 mkdir -p \"$dir\"\n\
+                 file=\"$dir/rollout-2026-10-21T10-00-00-$thread.jsonl\"\n\
+                 [ -f \"$file\" ] || printf '{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"%s\",\"cwd\":\"%s\"}}}}\\n' \"$thread\" \"$(pwd -P)\" > \"$file\"\n\
+                 printf '{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"%s\"}}]}}}}\\n' \"$prompt\" >> \"$file\"\n\
+                 printf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread\"\n\
+                 record=\"$FABRIC_HOME/jobs/$(basename \"$(dirname \"$(pwd -P)\")\")/session\"\n\
+                 tries=0\n\
+                 while [ ! -f \"$record\" ] && [ $tries -lt 100 ]; do sleep 0.05; tries=$((tries + 1)); done\n\
+                 if [ -f \"$record\" ]; then echo yes > \"$HOME/codex-saw-session\"; else echo no > \"$HOME/codex-saw-session\"; fi\n\
+                 if [ -n \"$FAKE_CODEX_WAIT\" ]; then\n\
+                   trap 'echo interrupted > \"$HOME/codex-signal\"; exit 130' INT\n\
+                   touch \"$HOME/codex-waiting\"\n\
+                   while :; do sleep 0.1; done\n\
+                 fi\n\
+                 if [ -n \"$FAKE_CODEX_LATE_STDERR\" ]; then\n\
+                   ( exec >/dev/null; sleep 0.5; echo 'codex: late diagnostics' >&2 ) &\n\
+                 fi\n\
+                 echo '{{\"type\":\"turn.started\"}}'\n\
+                 printf '{{\"type\":\"item.completed\",\"item\":{{\"id\":\"item_0\",\"type\":\"agent_message\",\"text\":\"codex did: %s\"}}}}\\n' \"$prompt\"\n\
+                 echo '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"cached_input_tokens\":0,\"output_tokens\":1}}}}'\n",
+                thread = Self::CODEX_THREAD
+            ),
+        )
+    }
+
+    /// Writes an executable `name` into the test's `bin`, first on the `PATH`.
+    fn install(&self, name: &str, script: &str) -> Fallible {
+        write_executable(&self.root.join("bin").join(name), script.as_bytes())
+    }
+
+    /// What a fake harness wrote to `<name>-args`, one argument per line.
+    pub fn fake_args(&self, name: &str) -> Fallible<Vec<String>> {
+        Ok(fs::read_to_string(self.home.join(format!("{name}-args")))?
+            .lines()
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// The names of the variables a fake harness found in its environment.
+    pub fn fake_env_names(&self, name: &str) -> Fallible<Vec<String>> {
+        Ok(fs::read_to_string(self.home.join(format!("{name}-env")))?
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(name, _)| name.to_owned()))
+            .collect())
     }
 
     /// The arguments the fake `claude` was last launched with.
     pub fn fake_claude_args(&self) -> Fallible<Vec<String>> {
-        Ok(fs::read_to_string(self.home.join("claude-args"))?
-            .lines()
-            .map(str::to_owned)
-            .collect())
+        self.fake_args("claude")
     }
 
     /// The fake agent's file for its first session.
@@ -115,7 +207,8 @@ impl Env {
             .collect())
     }
 
-    fn command(&self, program: &str, state: &Path) -> Command {
+    /// A command for `program` with the environment every process of the test runs with.
+    pub fn command(&self, program: &str, state: &Path) -> Command {
         let mut command = Command::new(program);
         command
             .env_clear()

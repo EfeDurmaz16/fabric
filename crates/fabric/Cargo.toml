@@ -10,7 +10,8 @@ publish.workspace = true
 [features]
 # Named fault points in the node, for the end-to-end test only.
 faults = ["fabricd/faults"]
-# The fake ACP agent the end-to-end test launches as a harness.
+# The fake harnesses the end-to-end test launches: the ACP agent and a
+# full-screen harness for the terminal tests.
 fixtures = ["dep:serde_json"]
 
 [dependencies]
@@ -21,9 +22,10 @@ fabric-env = { path = "../fabric-env" }
 fabric-harness = { path = "../fabric-harness" }
 fabric-net = { path = "../fabric-net" }
 fabricd = { path = "../fabricd" }
+nix = { version = "0.31", default-features = false, features = ["signal"] }
 rustix = { version = "1.1", features = ["process", "termios"] }
 serde_json = { version = "1.0", optional = true }
-tokio = { version = "1.54", features = ["macros", "process", "rt-multi-thread", "signal"] }
+tokio = { version = "1.54", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
@@ -31,6 +33,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # The end-to-end test runs this package's binaries with the fault points
 # and the fake agent built in; this turns both on for test builds only.
 fabric = { path = ".", features = ["faults", "fixtures"] }
+# The terminal tests open a pseudo-terminal and make it a session's
+# controlling terminal; rustix is already a dependency of this package.
+rustix = { version = "1.1", features = ["fs", "process", "pty", "termios"] }
 tempfile = "3.27"
 # The signal test runs a control socket that never answers, under a deadline.
 tokio = { version = "1.54", features = ["net", "time"] }
@@ -40,6 +45,16 @@ tokio = { version = "1.54", features = ["net", "time"] }
 [[bin]]
 name = "fabric-fake-agent"
 path = "fixtures/fake_agent.rs"
+test = false
+doc = false
+bench = false
+required-features = ["fixtures"]
+
+# A harness that sets the terminal's modes and reads from it the moment it
+# starts, for the end-to-end test's terminal tests.
+[[bin]]
+name = "fabric-fake-terminal"
+path = "fixtures/fake_terminal.rs"
 test = false
 doc = false
 bench = false

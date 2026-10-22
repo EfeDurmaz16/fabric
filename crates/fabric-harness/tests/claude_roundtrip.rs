@@ -1066,6 +1066,9 @@ async fn launch_resumes_in_the_workspace_with_only_the_given_env() {
         .unwrap();
     assert_eq!(running.session().cloned(), Some(session()));
     assert_eq!(Some(running.pid().get()), running.child_mut().id());
+    // Under a terminal the launch is held until released; elsewhere this
+    // does nothing.
+    running.release().unwrap();
     let status = running.child_mut().wait().await.unwrap();
     assert!(status.success());
     let seen = std::fs::read_to_string(&log).unwrap();

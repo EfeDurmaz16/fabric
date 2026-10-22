@@ -66,7 +66,7 @@ use fabric_core::path::AbsPath;
 use tracing::{info, warn};
 
 use crate::error::{HarnessError, Input, IoOp};
-use crate::harness::{Harness, Installed, Launch, Restored, Running};
+use crate::harness::{Harness, Installed, Launch, Restored, Running, TurnReport};
 use crate::manifest::{Content, HOME_PREFIX, Mutability, StateManifest};
 use crate::pipeline::{self, Capturer, Destination};
 use crate::place::{self, Relation};
@@ -767,7 +767,41 @@ impl Codex {
         Ok(args)
     }
 
-    fn launch_impl(
+    /// Reads one line of what `codex exec --json` printed into `report`.
+    /// The events, from `codex-rs/exec/src/exec_events.rs`, unchanged from
+    /// 0.142.0 to 0.163.0: `thread.started` names the thread, the same id
+    /// for `exec resume`; each `item.completed` whose item is an
+    /// `agent_message` carries an answer, the last one being the turn's;
+    /// `turn.failed` carries the failure. An `error` event can be a retry
+    /// and ends nothing, so it is left alone, as is any other line.
+    /// Returns true when the line named a thread other than the one
+    /// `report` held: a new thread, or a resume Codex answered with a new
+    /// thread because it found no match.
+    pub fn read_headless_line(report: &mut TurnReport, line: &str) -> bool {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            return false;
+        };
+        match event["type"].as_str() {
+            Some("thread.started") => return report.note_session(event["thread_id"].as_str()),
+            Some("item.completed") if event["item"]["type"] == "agent_message" => {
+                if let Some(text) = event["item"]["text"].as_str() {
+                    report.answer = Some(text.to_owned());
+                }
+            }
+            Some("turn.failed") => {
+                report.failure = Some(
+                    event["error"]["message"]
+                        .as_str()
+                        .unwrap_or("the turn failed")
+                        .to_owned(),
+                );
+            }
+            _ => {}
+        }
+        false
+    }
+
+    async fn launch_impl(
         &self,
         workspace: &Path,
         launch: &Launch,
@@ -778,10 +812,10 @@ impl Codex {
         let binary = self.binary()?;
         let args = self.args_for(&root, launch)?;
         let session = launch.resume().cloned();
-        let (child, pid) =
-            process::spawn(&binary, &args, pipeline::fs_path(&root), env, launch.into())?;
-        info!(?session, %pid, "codex: launched");
-        Ok(Running::new(pid, session, child))
+        let spawned =
+            process::spawn(&binary, &args, pipeline::fs_path(&root), env, launch.into()).await?;
+        info!(?session, pid = %spawned.pid, held = spawned.held, "codex: launched");
+        Ok(Running::new(session, spawned))
     }
 }
 
@@ -830,7 +864,7 @@ impl Harness for Codex {
         launch: Launch,
         env: &'a [(EnvVarName, String)],
     ) -> BoxFuture<'a, Result<Running, HarnessError>> {
-        Box::pin(async move { self.launch_impl(workspace, &launch, env) })
+        Box::pin(async move { self.launch_impl(workspace, &launch, env).await })
     }
 }
 
@@ -914,5 +948,38 @@ mod tests {
             toml_quoted_key(&AbsPath::parse("/h/new\nline").unwrap()),
             Err(HarnessError::Malformed { .. })
         ));
+    }
+
+    #[test]
+    fn headless_events_give_the_thread_and_the_last_answer() {
+        let thread = "019f233e-bb33-7342-85fa-f2d33b14368a";
+        let mut report = TurnReport::default();
+        let lines = [
+            format!("{{\"type\":\"thread.started\",\"thread_id\":\"{thread}\"}}"),
+            "{\"type\":\"turn.started\"}".to_owned(),
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"agent_message\",\"text\":\"first\"}}".to_owned(),
+            "{\"type\":\"error\",\"message\":\"Reconnecting... 1/5\"}".to_owned(),
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_1\",\"type\":\"reasoning\",\"text\":\"thinking\"}}".to_owned(),
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_2\",\"type\":\"agent_message\",\"text\":\"last\"}}".to_owned(),
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"cached_input_tokens\":0,\"output_tokens\":1}}".to_owned(),
+        ];
+        let named: Vec<bool> = lines
+            .iter()
+            .map(|line| Codex::read_headless_line(&mut report, line))
+            .collect();
+        assert_eq!(named, [true, false, false, false, false, false, false]);
+        assert_eq!(
+            report,
+            TurnReport {
+                session: Some(SessionId::parse(thread).unwrap()),
+                answer: Some("last".to_owned()),
+                failure: None,
+            }
+        );
+        Codex::read_headless_line(
+            &mut report,
+            "{\"type\":\"turn.failed\",\"error\":{\"message\":\"usage limit\"}}",
+        );
+        assert_eq!(report.failure.as_deref(), Some("usage limit"));
     }
 }

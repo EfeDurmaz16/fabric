@@ -64,7 +64,7 @@ use tracing::{debug, info, warn};
 
 use crate::departure::{FABRIC_DIR, Records};
 use crate::error::{HarnessError, IoOp};
-use crate::harness::{Harness, Installed, Launch, Restored, Running};
+use crate::harness::{Harness, Installed, Launch, Restored, Running, TurnReport};
 use crate::jsontext;
 use crate::manifest::{HOME_PREFIX, Mutability, StateManifest, under_home};
 use crate::pipeline::{self, Capturer, Destination};
@@ -809,11 +809,49 @@ impl ClaudeCode {
         (session, args)
     }
 
+    /// Reads one line of what `claude -p --output-format json` printed
+    /// into `report`. Claude prints one JSON object when the turn ends,
+    /// `{"type":"result", "subtype", "is_error", "result", "session_id",
+    /// ...}`, and prints a failure inside the run as that result too
+    /// (code.claude.com/docs/en/headless, read 2026-10-21); any other line
+    /// is left alone. Returns true when the line named a session other
+    /// than the one `report` held, as a resume that forked would.
+    pub fn read_headless_line(report: &mut TurnReport, line: &str) -> bool {
+        #[derive(Deserialize)]
+        struct Outcome {
+            #[serde(rename = "type")]
+            kind: String,
+            #[serde(default)]
+            subtype: Option<String>,
+            #[serde(default)]
+            is_error: bool,
+            #[serde(default)]
+            result: Option<String>,
+            #[serde(default)]
+            session_id: Option<String>,
+        }
+        let Ok(outcome) = serde_json::from_str::<Outcome>(line.trim()) else {
+            return false;
+        };
+        if outcome.kind != "result" {
+            return false;
+        }
+        match (outcome.is_error, outcome.result) {
+            (false, Some(text)) => report.answer = Some(text),
+            (true, Some(text)) => report.failure = Some(text),
+            (true, None) => {
+                report.failure = Some(outcome.subtype.unwrap_or_else(|| "error".to_owned()));
+            }
+            (false, None) => {}
+        }
+        report.note_session(outcome.session_id.as_deref())
+    }
+
     fn fresh_session() -> SessionId {
         SessionId::from_uuid(uuid::Uuid::new_v4())
     }
 
-    fn launch_impl(
+    async fn launch_impl(
         &self,
         workspace: &Path,
         launch: &Launch,
@@ -826,10 +864,10 @@ impl ClaudeCode {
             refuse_secret_overlay(Path::new(overlay.as_str()))?;
         }
         let (session, args) = self.args_for(launch, Self::fresh_session);
-        let (child, pid) =
-            process::spawn(&binary, &args, pipeline::fs_path(&root), env, launch.into())?;
-        info!(%session, %pid, "claude: launched");
-        Ok(Running::new(pid, Some(session), child))
+        let spawned =
+            process::spawn(&binary, &args, pipeline::fs_path(&root), env, launch.into()).await?;
+        info!(%session, pid = %spawned.pid, held = spawned.held, "claude: launched");
+        Ok(Running::new(Some(session), spawned))
     }
 }
 
@@ -889,7 +927,7 @@ impl Harness for ClaudeCode {
         launch: Launch,
         env: &'a [(EnvVarName, String)],
     ) -> BoxFuture<'a, Result<Running, HarnessError>> {
-        Box::pin(async move { self.launch_impl(workspace, &launch, env) })
+        Box::pin(async move { self.launch_impl(workspace, &launch, env).await })
     }
 }
 
@@ -1401,5 +1439,40 @@ mod tests {
                 .collect()
             )
         );
+    }
+
+    #[test]
+    fn a_headless_result_gives_the_answer_and_the_session() {
+        let sid = "9c9796f0-2682-4546-a963-d314b3ad543f";
+        let mut report = TurnReport::default();
+        assert!(!ClaudeCode::read_headless_line(&mut report, "not json"));
+        assert!(!ClaudeCode::read_headless_line(
+            &mut report,
+            "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"x\"}"
+        ));
+        let done = format!(
+            "{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"two lines\\nof answer\",\"session_id\":\"{sid}\",\"total_cost_usd\":0.01}}"
+        );
+        assert!(ClaudeCode::read_headless_line(&mut report, &done));
+        assert!(
+            !ClaudeCode::read_headless_line(&mut report, &done),
+            "the same session again is no change"
+        );
+        assert_eq!(
+            report,
+            TurnReport {
+                session: Some(SessionId::parse(sid).unwrap()),
+                answer: Some("two lines\nof answer".to_owned()),
+                failure: None,
+            }
+        );
+
+        let mut failed = TurnReport::default();
+        ClaudeCode::read_headless_line(
+            &mut failed,
+            "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"session_id\":\"s1\"}",
+        );
+        assert_eq!(failed.failure.as_deref(), Some("error_during_execution"));
+        assert_eq!(failed.answer, None);
     }
 }
