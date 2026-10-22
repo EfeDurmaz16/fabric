@@ -29,6 +29,13 @@ pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
 }
 
 /// Replaces `path` with `bytes`: a temporary sibling, a full flush, a rename, a directory flush.
+///
+/// The temporary is always a new file this call made: anything already at
+/// its name, a file left by a process that had this pid or a link another
+/// process planted, is removed and never written through. A link there
+/// would otherwise have this write overwrite the file it names, and for a
+/// ledger the link itself renamed into place would take every later append.
+/// Callers write one path from one task at a time, under the job's lock.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let dir = path
         .parent()
@@ -40,7 +47,7 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     temp_name.push(format!(".{}.tmp", std::process::id()));
     let temp = dir.join(temp_name);
     let written = (|| {
-        let mut file = File::create(&temp)?;
+        let mut file = create_new(&temp)?;
         file.write_all(bytes)?;
         full_sync(&file)?;
         fs::rename(&temp, path)
@@ -50,6 +57,26 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
     written?;
     sync_dir(dir)
+}
+
+/// Creates `path` as a new file, after removing whatever is at the name.
+///
+/// `O_EXCL` fails on any entry at the name, a link included, and never
+/// follows one, so the file opened is the one created here.
+fn create_new(path: &Path) -> io::Result<File> {
+    let open = || {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    };
+    match open() {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            fs::remove_file(path)?;
+            open()
+        }
+        opened => opened,
+    }
 }
 
 /// Creates `dir` and its parents, then flushes the parent so the new name is durable.
@@ -86,6 +113,31 @@ pub(crate) fn create_private_dir(dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The temporary's name is predictable, and a process that can write
+    /// in the state directory, such as a harness, can put a link there. The
+    /// write must not go through it to the file it names.
+    #[test]
+    fn a_link_at_the_temporary_name_is_not_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"keep").unwrap();
+        let path = dir.path().join("ledger");
+        let temp = dir
+            .path()
+            .join(format!("ledger.{}.tmp", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &temp).unwrap();
+        write_atomic(&path, b"new").unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert!(
+            !fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(fs::symlink_metadata(&temp).is_err(), "the link was left");
+    }
 
     #[test]
     fn a_replaced_file_holds_the_new_bytes_and_no_temporary_is_left() {
