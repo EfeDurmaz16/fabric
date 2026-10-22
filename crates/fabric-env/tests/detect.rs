@@ -606,6 +606,28 @@ fn a_linked_pin_file_is_refused_without_reading_it() {
     }
 }
 
+/// A file detection only checks for selects the step that reads it, so a
+/// link there would have `npm ci` read a lockfile outside the workspace,
+/// and a directory there would select an install that cannot run. Both
+/// are refused with the file named, as a linked pin file is.
+#[test]
+fn a_linked_or_non_regular_file_detection_checks_for_is_refused() {
+    let elsewhere = workspace(&[("lock.json", "{}")]).unwrap();
+    let linked = workspace(&[("package.json", PACKAGE_JSON)]).unwrap();
+    symlink(
+        elsewhere.path().join("lock.json"),
+        linked.path().join("package-lock.json"),
+    )
+    .unwrap();
+    let directory = workspace(&[("Cargo.toml/x", "")]).unwrap();
+    for (dir, name) in [(&linked, "package-lock.json"), (&directory, "Cargo.toml")] {
+        match detect(dir.path(), &[]) {
+            Err(DetectError::NotARegularFile { file }) => assert_eq!(file, name),
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+}
+
 /// A link anywhere on the way is refused, not only in the last component:
 /// `.fabric -> ../other/.fabric` would read another workspace's setup steps.
 #[test]

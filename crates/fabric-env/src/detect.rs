@@ -4,12 +4,14 @@
 //! and nothing else. It reads regular files only: a symbolic link in that
 //! list is refused, because a link can point at a file the secret policy
 //! denies or at one outside the workspace, and either would break the next
-//! rule. It never opens a file the job's secret policy denies, and counts
-//! one it only checks for, such as a lockfile, as absent, since capture
-//! leaves it behind and the next node will not have it. It never reads an
-//! environment variable and never runs a program, so the same files give
-//! the same spec on every node, and the spec it returns has passed
-//! `EnvSpec::validate`. Every tool name and pin it keeps is short,
+//! rule. That holds for a file it only checks for, such as a lockfile, as
+//! well, since the step that file selects reads it. It never opens a file
+//! the job's secret policy denies, and counts a denied file it only checks
+//! for as absent, since capture leaves it behind and the next node will
+//! not have it. It never reads an environment variable and never runs a
+//! program, so the same files give the same spec on every node, and the
+//! spec it returns has passed `EnvSpec::validate`. Every tool name and pin
+//! it keeps is short,
 //! printable and not shaped like a credential, because the spec travels to
 //! other nodes; `ToolName` and `ToolVersion` hold that rule by type. A pin
 //! a detected file gives that breaks the rule is dropped with a warning
@@ -1190,18 +1192,23 @@ fn rel(path: &'static str) -> Result<RelPath, DetectError> {
     RelPath::parse(path).map_err(|_| DetectError::BuiltIn { name: path })
 }
 
-/// Returns whether something named `file` exists under `root`, a link included; an error other than "not found" is an error.
+/// Returns whether the regular file `file` is under `root`; a link or another file that is not regular is refused, and an error other than "not found" is an error.
 ///
-/// A link counts as present because the snapshot carries it as a link, so
-/// every node answers the same; what it points at is never read here. A
-/// directory on the way that is a link, such as `.devcontainer -> ..`,
-/// means `file` is not in the workspace, so it counts as absent.
+/// A file detection only checks for still selects the step that reads it:
+/// with `package-lock.json -> ../lock.json` the spec says `npm ci` and the
+/// installer reads a file outside the workspace, which can differ from
+/// node to node, and a directory at a lockfile's name would select an
+/// install that cannot run. Both are refused, as `read_text` refuses a
+/// linked pin file. A directory on the way that is a link, such as
+/// `.devcontainer -> ..`, means `file` is not in the workspace, so it
+/// counts as absent.
 fn exists(root: &Path, file: &'static str) -> Result<bool, DetectError> {
     let Some(full) = inside(root, file)? else {
         return Ok(false);
     };
     match fs::symlink_metadata(full) {
-        Ok(_) => Ok(true),
+        Ok(meta) if meta.is_file() => Ok(true),
+        Ok(_) => Err(DetectError::NotARegularFile { file }),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(source) => Err(DetectError::Read { file, source }),
     }
