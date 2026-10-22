@@ -312,7 +312,7 @@ fn mode(bits: u16) -> Result<Mode, Box<dyn Error>> {
 fn fixed_manifest() -> Result<SnapshotManifest, Box<dyn Error>> {
     Ok(SnapshotManifest {
         job_id: JobId::from_bytes([1; 16]),
-        root: AbsPath::parse("/Users/efebarandurmaz/fabric/jobs/x/work")?,
+        root: AbsPath::parse("/Users/me/fabric/jobs/x/work")?,
         parent: None,
         created_at: 1_760_000_000_000,
         created_by: NodeId::from_bytes([2; 32]),
@@ -380,7 +380,7 @@ fn format_version_one_hash_is_pinned() {
     let id = fixed_manifest().unwrap().id().unwrap().to_string();
     assert_eq!(
         id,
-        "ae53cc1d8df4107a0e29dc531939ec45b20f5f66f6d391e0f30eb1e36d7c6123"
+        "3b1e42341097eeb196f3d8b83787fd08b855fc0eb300138ae058a14cfadb8844"
     );
 }
 
