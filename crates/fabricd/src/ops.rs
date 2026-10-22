@@ -701,8 +701,10 @@ impl Node {
     ///
     /// It refuses a stale epoch and a pid that is not the recorded
     /// harness's. A suspend, a move or a fence that stopped the harness
-    /// removed its record and captured without the session, so a session
-    /// recorded later would name one the snapshot does not hold.
+    /// removed its record and captured the session the job held then, so a
+    /// session recorded later would name one the snapshot does not hold. A
+    /// fresh Codex's thread is not lost to that: the capture takes it from
+    /// the job's workspace (`job_session`).
     pub(crate) async fn harness_session(
         &self,
         named: NamedSession,

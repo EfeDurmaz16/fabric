@@ -1034,7 +1034,7 @@ async fn record_sessions(
         };
         let _ = writeln!(
             std::io::stderr(),
-            "warning: the node did not record {} session {session} ({missed}); a suspend of job {} does not carry it",
+            "warning: the node did not record {} session {session} ({missed}); job {} keeps the session the node holds, or, for a new Codex thread, the one its next capture finds in the workspace",
             plan.harness,
             plan.job
         );
