@@ -19,7 +19,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use fabric_core::harness::HarnessKind;
-use fabric_core::id::{Epoch, JobId, NodeId};
+use fabric_core::id::{Epoch, JobId, NodeId, RecordHash};
 use fabric_harness::{HarnessVersion, SessionId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -89,24 +89,23 @@ pub enum Request {
         /// The `PATH` of the user's shell.
         path_var: OsString,
     },
-    /// The CLI launched the harness; the daemon records it and appends `Resumed`.
-    HarnessStarted {
+    /// Before any setup step, under the tree lock: whether the plan made at
+    /// `epoch` still holds, so a launch whose plan another launch overtook
+    /// refuses before it writes to the workspace.
+    LaunchCheck {
         /// The job.
         job: JobId,
         /// The epoch the plan was made under.
         epoch: Epoch,
-        /// The harness process, which leads its own group.
-        pid: NonZeroU32,
-        /// The harness that runs.
+        /// The ledger head the plan was made at.
+        head: RecordHash,
+        /// The harness the plan launches.
         harness: HarnessKind,
-        /// The session it continues or created, when known.
+        /// The session the plan continues; a new one when `None`.
         session: Option<SessionId>,
-        /// The version the launch asked of the harness it started, in the
-        /// workspace and environment it started it in, when it asked: the
-        /// newest known to have run that session, which a later resume of
-        /// it must not go below.
-        version: Option<HarnessVersion>,
     },
+    /// The CLI launched the harness; the daemon records it and appends `Resumed`.
+    HarnessStarted(StartedHarness),
     /// The harness exited.
     HarnessExited {
         /// The job.
@@ -165,6 +164,30 @@ pub enum Request {
     HarnessSession(NamedSession),
 }
 
+/// A harness the CLI launched, for `Request::HarnessStarted`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartedHarness {
+    /// The job.
+    pub job: JobId,
+    /// The epoch the plan was made under.
+    pub epoch: Epoch,
+    /// The harness process, which leads its own group.
+    pub pid: NonZeroU32,
+    /// The harness that runs.
+    pub harness: HarnessKind,
+    /// The session it continues or created, when known.
+    pub session: Option<SessionId>,
+    /// The session the plan continues; a new one when `None`. A headless
+    /// turn of an earlier launch can name its session while this launch
+    /// runs its setup steps, and the node then refuses this one.
+    pub planned: Option<SessionId>,
+    /// The version the launch asked of the harness it started, in the
+    /// workspace and environment it started it in, when it asked: the
+    /// newest known to have run that session, which a later resume of it
+    /// must not go below.
+    pub version: Option<HarnessVersion>,
+}
+
 /// A session a running harness named, for `Request::HarnessSession`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NamedSession {
@@ -196,6 +219,9 @@ pub struct RunPlan {
     pub job: JobId,
     /// The epoch this node owns the job at; the launch is fenced on it.
     pub epoch: Epoch,
+    /// The ledger head the plan was made at; a launch whose job moved past
+    /// it, by another launch for one, is refused before setup.
+    pub head: RecordHash,
     /// The workspace root.
     pub root: PathBuf,
     /// The harness to launch.
@@ -209,6 +235,10 @@ pub struct RunPlan {
     pub goal: String,
     /// The node's harness configuration, which the launch must use.
     pub harness_config: HarnessConfig,
+    /// The home the node captures and restores harness state under; a
+    /// launch under another home would keep the session where the node
+    /// never looks.
+    pub home: PathBuf,
 }
 
 /// The daemon's answer.

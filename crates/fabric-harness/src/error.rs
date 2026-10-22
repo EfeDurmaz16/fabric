@@ -169,6 +169,15 @@ pub enum HarnessError {
         /// The file on this node that would have been overwritten.
         path: PathBuf,
     },
+    /// A destination changed after restore checked it and before restore
+    /// replaced it, as a harness that started and wrote to it would change it.
+    #[error(
+        "harness state at {path} changed while it was being restored; stop the harness that writes it and restore again"
+    )]
+    StateChanged {
+        /// The file on this node that changed.
+        path: PathBuf,
+    },
     /// A staged file does not match the length and digest its manifest records.
     #[error("staged file {path} is corrupt: {reason}")]
     StateCorrupt {

@@ -21,6 +21,7 @@ use fabric_harness::manifest::StateManifest;
 use fabric_harness::{Harness, HarnessError, Launch, SessionId};
 
 mod common;
+mod executable;
 use common::{abs, fake_claude, project_key};
 
 const SID: &str = "9c9796f0-2682-4546-a963-d314b3ad543f";
@@ -465,6 +466,64 @@ async fn restore_on_a_fresh_node_places_the_staged_bytes_and_protects_what_is_th
     );
 }
 
+/// Claude keeps a session's plan under `~/.claude/plans/`, named by the
+/// slug its transcript records, and reads it back on `--resume`. The plans
+/// of the session travel; another session's plan does not.
+#[tokio::test]
+async fn the_plans_a_transcript_names_travel_with_the_session() {
+    let src = build_source("fabric/jobs/j1/work");
+    let home = src.home.path().canonicalize().unwrap();
+    let transcript = transcript_under(&home, &src.work);
+    let text = std::fs::read_to_string(&transcript).unwrap();
+    std::fs::write(
+        &transcript,
+        format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{SID}\",\"slug\":\"dreamy-popping-cerf\"}}\n{text}"
+        ),
+    )
+    .unwrap();
+    let plans = home.join(".claude/plans");
+    std::fs::create_dir_all(&plans).unwrap();
+    let ours = [
+        "dreamy-popping-cerf-agent-a97a8637863f59591.md",
+        "dreamy-popping-cerf.md",
+    ];
+    for name in ours {
+        std::fs::write(plans.join(name), format!("# {name}\n1. fix the test\n")).unwrap();
+    }
+    std::fs::write(
+        plans.join("toasty-kindling-flame.md"),
+        "# another session\n",
+    )
+    .unwrap();
+    let adapter = node(&home);
+    let out = tempfile::tempdir().unwrap();
+    let manifest = adapter
+        .capture(&src.work, &session(), out.path())
+        .await
+        .unwrap();
+    let carried: Vec<&str> = manifest
+        .files()
+        .iter()
+        .map(|f| f.rel_path.as_str())
+        .filter(|p| p.starts_with("home/.claude/plans/"))
+        .collect();
+    assert_eq!(
+        carried,
+        ours.map(|name| format!("home/.claude/plans/{name}"))
+    );
+
+    set_aside(&home, ".claude-pro");
+    adapter.restore(&src.work, out.path()).await.unwrap();
+    for name in ours {
+        assert_eq!(
+            std::fs::read_to_string(home.join(".claude/plans").join(name)).unwrap(),
+            format!("# {name}\n1. fix the test\n")
+        );
+    }
+    assert!(!home.join(".claude/plans/toasty-kindling-flame.md").exists());
+}
+
 /// Writes `manifest` under `out` with one more entry, for `body` at `rel`,
 /// as someone who forged the tree would.
 fn forge(out: &Path, manifest: &StateManifest, rel: &str, body: &[u8]) {
@@ -679,6 +738,85 @@ async fn a_rewritten_file_edited_here_after_the_job_left_is_not_replaced() {
         before,
         "nothing was placed"
     );
+}
+
+/// Takes the session out to another node and back: captures here and
+/// confirms, restores on a node with the same home, lets `away` change the
+/// state there, captures it back, and puts this node's state in place
+/// again. Returns the capture that came back.
+async fn round_trip(
+    adapter: &ClaudeCode,
+    work: &Path,
+    home: &Path,
+    away: impl FnOnce(),
+) -> tempfile::TempDir {
+    let out_1 = tempfile::tempdir().unwrap();
+    let sent = adapter
+        .capture(work, &session(), out_1.path())
+        .await
+        .unwrap();
+    adapter.confirm_departure(&sent).await.unwrap();
+    let pro = set_aside(home, ".claude-pro");
+    adapter.restore(work, out_1.path()).await.unwrap();
+    away();
+    let out_2 = tempfile::tempdir().unwrap();
+    let back = adapter
+        .capture(work, &session(), out_2.path())
+        .await
+        .unwrap();
+    adapter.confirm_departure(&back).await.unwrap();
+    set_aside(home, ".claude-air");
+    bring_back(home, &pro);
+    out_2
+}
+
+/// A file this node made for the session after the job left is work the
+/// incoming state never saw, such as a fenced holder's new memory file.
+/// Left beside the incoming state, the resumed session would read both
+/// histories; restore refuses it as it refuses an edited file.
+#[tokio::test]
+async fn a_file_made_here_after_the_job_left_is_divergence() {
+    let src = build_source("w");
+    let home = src.home.path().canonicalize().unwrap();
+    let adapter = node(&home);
+    let back = round_trip(&adapter, &src.work, &home, || {}).await;
+    let (memory, _) = rewritable_files(&home, &src.work);
+    let note = memory.with_file_name("from-the-pro.md");
+    std::fs::write(&note, "written after the job left\n").unwrap();
+    let transcript = transcript_under(&home, &src.work);
+    let before = std::fs::read(&transcript).unwrap();
+    let err = adapter.restore(&src.work, back.path()).await.unwrap_err();
+    assert!(
+        matches!(err, HarnessError::StateDiverged { ref path } if path == &note),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&note).unwrap(),
+        "written after the job left\n"
+    );
+    assert_eq!(
+        std::fs::read(&transcript).unwrap(),
+        before,
+        "nothing was placed"
+    );
+}
+
+/// A file the job dropped while it was away, which this node left
+/// untouched since, goes: kept, the resumed session would still read a
+/// task the job finished on the other node.
+#[tokio::test]
+async fn a_file_the_job_dropped_and_this_node_left_untouched_is_removed() {
+    let src = build_source("w");
+    let home = src.home.path().canonicalize().unwrap();
+    let adapter = node(&home);
+    let (_, task) = rewritable_files(&home, &src.work);
+    let back = round_trip(&adapter, &src.work, &home, || {
+        std::fs::remove_file(&task).unwrap();
+    })
+    .await;
+    assert!(task.exists());
+    adapter.restore(&src.work, back.path()).await.unwrap();
+    assert!(!task.exists(), "the task the job dropped is still here");
 }
 
 #[tokio::test]

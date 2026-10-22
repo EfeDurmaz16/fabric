@@ -3,11 +3,12 @@
 //! Invariant: every row compares strings for equality and never parses a
 //! version into a range, because every coupling the research found was an
 //! exact-string one. A row that refuses stops a move unless the user passes
-//! `--force`, and two rows refuse even then: a different user or home,
-//! because the root would not exist on the target (ADR 0011), and a target
-//! with no login for the job's harness, because the harness would fail
-//! inside with a worse message. The comparison is pure; measuring is
-//! `facts`' job.
+//! `--force`, and some refuse even then: a different user or home, because
+//! the root would not exist on the target (ADR 0011), and a target with no
+//! login for the job's harness, or for an ACP job no agent or no
+//! `state_dir` for it, because the harness would fail inside with a worse
+//! message once the target owns the job. The comparison is pure; measuring
+//! is `facts`' job.
 //!
 //! One row orders versions, and only to word its note and warn: when the
 //! job's harness on the target is older than the source's, or than the
@@ -166,14 +167,23 @@ fn row(
 pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row> {
     let mut rows = Vec::new();
     for fact in [name::USER, name::HOME] {
-        rows.push(row(
+        let mut row = row(
             fact,
             here,
             peer,
             Outcome::Refuse(Waiver::Never),
             "the root would differ and nothing rewrites paths in this phase (ADR 0011)",
-        ));
+        );
+        // Two absences compare equal, and prove nothing about the user.
+        if row.here.is_none() || row.peer.is_none() {
+            row.outcome = Outcome::Refuse(Waiver::Never);
+            "not measured, and the move needs it measured and equal on both nodes (ADR 0011)"
+                .clone_into(&mut row.note);
+        }
+        rows.push(row);
     }
+    rows.push(git_row(here, peer, ctx));
+    rows.push(lsof_row(here, peer, ctx));
     rows.push(row(
         name::OS,
         here,
@@ -316,6 +326,9 @@ fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Ro
             },
         });
     }
+    if let Some(HarnessKind::Acp { program, .. }) = ctx.harness {
+        rows.extend(acp_rows(program.as_str(), here, peer, ctx));
+    }
     rows
 }
 
@@ -351,6 +364,101 @@ fn older_target(
             "the target's {program} is older; a resume there refuses a session a newer {program} wrote, so update {program} there first (ADR 0006)"
         )),
         _ => None,
+    }
+}
+
+/// The rows for an ACP job: the target must find the agent and give it a
+/// `state_dir`, or the job would be owned by a node that cannot launch it,
+/// restore its session or capture it. Only the target of a pull measures
+/// them; a peer does not report its agents, so a push can only warn.
+fn acp_rows(program: &str, here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> [Row; 2] {
+    let missing = [
+        (
+            name::ACP_AGENT,
+            format!("this node's PATH has no {program}, so the job could not launch here"),
+        ),
+        (
+            name::ACP_STATE_DIR,
+            format!(
+                "harness.toml here gives {program} no state_dir capture and restore accept (none, one outside the home or under ~/.fabric, or one reached through a link), so its session could not be restored or captured here"
+            ),
+        ),
+    ];
+    missing.map(|(fact, absent)| {
+        let (outcome, note) = match ctx.target {
+            Target::Here if here.get(fact).is_some() => (Outcome::Equal, String::new()),
+            Target::Here => (Outcome::Refuse(Waiver::Never), absent),
+            Target::Peer => (
+                Outcome::Warn,
+                format!(
+                    "a peer does not report its ACP agents, so whether it has {program} and a state_dir for it is not checked"
+                ),
+            ),
+        };
+        Row {
+            fact,
+            here: value(here, fact),
+            peer: value(peer, fact),
+            outcome,
+            note,
+        }
+    })
+}
+
+/// Every job's workspace is a repository and restore runs git, so a job
+/// moves only to a node whose daemon finds git; the versions may differ.
+fn git_row(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Row {
+    let target = match ctx.target {
+        Target::Peer => peer,
+        Target::Here => here,
+    };
+    let missing = target.get(name::GIT).is_none();
+    let (outcome, note) = match (missing, ctx.harness.is_some()) {
+        (false, _) => (Outcome::Equal, ""),
+        (true, true) => (
+            Outcome::Refuse(Waiver::Never),
+            "the target's daemon finds no git, and restore runs it for every job",
+        ),
+        (true, false) => (
+            Outcome::Warn,
+            "the target's daemon finds no git, so no job can move there",
+        ),
+    };
+    Row {
+        fact: name::GIT,
+        here: value(here, name::GIT),
+        peer: value(peer, name::GIT),
+        outcome,
+        note: note.to_owned(),
+    }
+}
+
+/// Every suspend or move of a Codex job asks `lsof` whether a Codex
+/// process holds the thread's rollout open, and fails on a node that has
+/// none, so a Codex job moves only to a node where it is found.
+fn lsof_row(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Row {
+    let target = match ctx.target {
+        Target::Peer => peer,
+        Target::Here => here,
+    };
+    let missing = target.get(name::LSOF).is_none();
+    let (outcome, note) = match (missing, ctx.harness) {
+        (true, Some(HarnessKind::Codex)) => (
+            Outcome::Refuse(Waiver::Never),
+            "the target has no lsof, which every suspend or move of a Codex job runs, so the job could leave it only by a steal",
+        ),
+        (true, None) => (
+            Outcome::Warn,
+            "the target has no lsof, so a Codex job could not be suspended or moved there",
+        ),
+        (false, _) | (true, Some(_)) => (Outcome::Equal, ""),
+    };
+    Row {
+        fact: name::LSOF,
+        here: value(here, name::LSOF),
+        peer: value(peer, name::LSOF),
+        outcome,
+        note: note.to_owned(),
     }
 }
 
@@ -422,19 +530,18 @@ mod tests {
 
     fn pro() -> NodeFacts {
         NodeFacts::from_pairs([
-            (name::USER, "efebarandurmaz"),
-            (name::HOME, "/Users/efebarandurmaz"),
+            (name::USER, "me"),
+            (name::HOME, "/Users/me"),
+            (name::GIT, "git version 2.54.0"),
+            (name::LSOF, "/usr/sbin/lsof"),
             (name::OS, "macos"),
             (name::ARCH, "aarch64"),
             (name::PNPM, "11.23.0"),
-            (
-                name::PNPM_STORE,
-                "/Users/efebarandurmaz/Library/pnpm/store/v11",
-            ),
+            (name::PNPM_STORE, "/Users/me/Library/pnpm/store/v11"),
             (name::NODE, "v22.23.2"),
             (name::NODE_ABI, "127"),
             (name::RUSTC, "rustc 1.97.1"),
-            (name::CARGO_HOME, "/Users/efebarandurmaz/.cargo"),
+            (name::CARGO_HOME, "/Users/me/.cargo"),
             (name::MACOS, "26.6.2"),
             (name::MACOS_SDK, "27.0"),
             (name::CLAUDE, "2.1.294 (Claude Code)"),
@@ -702,7 +809,7 @@ mod tests {
     #[test]
     fn a_root_in_a_folder_the_target_syncs_is_refused() {
         let peer = with(&pro(), &[(name::ICLOUD_DESKTOP, Some("1"))]);
-        let root = Path::new("/Users/efebarandurmaz/Desktop/job");
+        let root = Path::new("/Users/me/Desktop/job");
         let mut context = ctx(None);
         context.root = Some(root);
         assert_eq!(
@@ -724,5 +831,77 @@ mod tests {
             outcome_of(&compare(&pro(), &pro(), &context), "clock"),
             Outcome::Warn
         );
+    }
+
+    /// The user and the home must be measured and equal on both nodes. When
+    /// neither node could read its user name, the two absences are equal,
+    /// and two users with the same `HOME` string must still be refused.
+    #[test]
+    fn an_unmeasured_user_or_home_is_refused_even_on_both_sides() {
+        for fact in [name::USER, name::HOME] {
+            let here = with(&pro(), &[(fact, None)]);
+            for peer in [with(&pro(), &[(fact, None)]), pro()] {
+                let rows = compare(&here, &peer, &ctx(None));
+                assert_eq!(
+                    outcome_of(&rows, fact),
+                    Outcome::Refuse(Waiver::Never),
+                    "{fact}"
+                );
+                assert!(!blocking(&rows, true).is_empty(), "{fact}");
+            }
+        }
+    }
+
+    /// Every suspend or move of a Codex job asks `lsof` whether Codex holds
+    /// the thread's rollout open, and fails on a node that has none. So a
+    /// Codex job is refused a target without it, with no waiver: it could
+    /// leave that node only by a steal.
+    #[test]
+    fn a_target_without_lsof_is_refused_a_codex_job() {
+        let codex = HarnessKind::Codex;
+        let claude = HarnessKind::ClaudeCode;
+        let without = with(&pro(), &[(name::LSOF, None)]);
+        let mut pull = ctx(Some(&codex));
+        pull.target = Target::Here;
+        for (here, peer, context, refused) in [
+            (&pro(), &without, ctx(Some(&codex)), true),
+            (&without, &pro(), pull.clone(), true),
+            (&without, &pro(), ctx(Some(&codex)), false),
+            (&pro(), &without, ctx(Some(&claude)), false),
+        ] {
+            let rows = compare(here, peer, &context);
+            assert_eq!(
+                outcome_of(&rows, name::LSOF) == Outcome::Refuse(Waiver::Never),
+                refused,
+                "{:?} {:?}",
+                context.target,
+                context.harness
+            );
+        }
+    }
+
+    /// Every job's workspace is a repository, and restore runs git on the
+    /// target. A target whose daemon finds no git would take the job and
+    /// fail to restore it, so a move to it is refused, with no waiver.
+    #[test]
+    fn a_target_without_git_is_refused() {
+        let codex = HarnessKind::Codex;
+        let without = with(&pro(), &[(name::GIT, None)]);
+        let mut pull = ctx(Some(&codex));
+        pull.target = Target::Here;
+        for (here, peer, context, refused) in [
+            (&pro(), &without, ctx(Some(&codex)), true),
+            (&without, &pro(), pull.clone(), true),
+            (&without, &pro(), ctx(Some(&codex)), false),
+            (&pro(), &without, ctx(None), false),
+        ] {
+            let rows = compare(here, peer, &context);
+            assert_eq!(
+                outcome_of(&rows, name::GIT) == Outcome::Refuse(Waiver::Never),
+                refused,
+                "{:?}",
+                context.target
+            );
+        }
     }
 }

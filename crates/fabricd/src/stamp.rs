@@ -10,8 +10,9 @@
 //! the repository too, so its writes are left out: `.git/objects`, where an
 //! object added never changes what the refs, the index or the tree hold,
 //! and `.git/refs/fabric`, the refs that keep snapshot commits alive. A
-//! directory counts by its path alone, since what its own times record is
-//! the entries, which count themselves.
+//! directory counts by its path and its mode, which a snapshot keeps; its
+//! times are left out, since what they record is the entries, which count
+//! themselves, and a capture's writes would move them.
 
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -62,6 +63,9 @@ fn walk(root: &Path) -> io::Result<TreeStamp> {
             hasher.update(path);
             if meta.is_dir() {
                 hasher.update(b"d");
+                // A snapshot keeps the mode; the times record entries,
+                // which count themselves.
+                hasher.update(&u64::from(meta.mode()).to_le_bytes());
                 pending.push(rel);
                 continue;
             }
@@ -100,6 +104,23 @@ mod tests {
         std::fs::write(root.join(".git/refs/fabric/job/snap/s1"), "oid\n").unwrap();
         assert_eq!(TreeStamp::measure(root).await, Some(before));
         std::fs::write(root.join("README.md"), "hello, edited\n").unwrap();
+        assert_ne!(TreeStamp::measure(root).await, Some(before));
+    }
+
+    /// A snapshot keeps each directory's mode, so a `chmod` of a directory,
+    /// which changes no entry under it, must change the stamp; otherwise a
+    /// suspend reuses the old snapshot and the change is lost.
+    #[tokio::test]
+    async fn a_directory_mode_change_changes_the_stamp() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("empty")).unwrap();
+        std::fs::set_permissions(root.join("empty"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let before = TreeStamp::measure(root).await.unwrap();
+        std::fs::set_permissions(root.join("empty"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
         assert_ne!(TreeStamp::measure(root).await, Some(before));
     }
 }

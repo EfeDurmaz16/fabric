@@ -9,6 +9,9 @@
 //! peer that is still paired: it checks the trust decision before each
 //! request and asks it again every `TRUST_RECHECK`, and closes the
 //! connection once the peer is unpaired, however long the connection lives.
+//! The work a node runs for one peer is capped over all the peer's
+//! sessions, so a peer that connects again, or holds several connections,
+//! gets no more than one session's worth.
 //!
 //! The wire types `RequestBody`, `ResponseBody` and `JobResponse` are built
 //! and matched here only. A caller asks through one typed method per
@@ -18,10 +21,10 @@
 //! one, and a caller refuses one as `RpcError::UnexpectedResponse`. `Hello`
 //! and `Ping` belong to this layer and never reach a service.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use fabric_core::BoxFuture;
@@ -67,10 +70,10 @@ pub const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// stream, and a chunk batch its slot, back.
 pub const REPLY_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The most per-job requests one serving session runs at once, counting work that outlived its caller's budget.
+/// The most per-job requests a node runs at once for one peer, over all its sessions, counting work that outlived its caller's budget.
 pub const MAX_JOB_WORK: usize = 16;
 
-/// The most chunk batches one serving session sends at once; each holds up to one chunk frame while it waits on flow control.
+/// The most chunk batches a node sends one peer at once, over all its sessions; each holds up to one chunk frame while it waits on flow control.
 pub const MAX_CHUNK_RUNS: usize = 4;
 
 /// Why a call failed.
@@ -711,9 +714,18 @@ impl Session {
     /// no longer pairs, seen before a request or at a recheck every
     /// `TRUST_RECHECK`, has its connection closed and comes back as
     /// `RpcError::Unpaired`; requests in flight then fail with it.
-    pub async fn serve(&self, service: Arc<dyn Service>, trust: Arc<dyn Trust>) -> RpcError {
+    ///
+    /// `limits` is the node's one `ServeLimits`: every session with the
+    /// same peer counts against the same caps, so work a closed session
+    /// left running still counts against the next.
+    pub async fn serve(
+        &self,
+        service: Arc<dyn Service>,
+        trust: Arc<dyn Trust>,
+        limits: &ServeLimits,
+    ) -> RpcError {
         let peer = self.peer();
-        let limits = Limits::new();
+        let limits = limits.of(peer);
         let requests = async {
             loop {
                 let stream = match self.connection.next().await {
@@ -932,8 +944,36 @@ async fn reply(
     Ok(())
 }
 
-/// What one serving session may run at once, so a paired peer's requests cannot grow its work or memory without bound.
-#[derive(Clone)]
+/// What a node runs at once for each peer, counted over all of that peer's sessions.
+///
+/// A node keeps one and hands it to every `Session::serve`, so a paired
+/// peer cannot grow the node's work or memory without bound by connecting
+/// again or by holding several connections: the work a closed session
+/// left running past its caller's budget still holds its place. A peer
+/// with no session and no work left is forgotten, since fresh caps count
+/// the same.
+#[derive(Debug, Default)]
+pub struct ServeLimits {
+    peers: Mutex<HashMap<NodeId, Limits>>,
+}
+
+impl ServeLimits {
+    /// Caps that count no work yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The caps every session with `peer` shares.
+    fn of(&self, peer: NodeId) -> Limits {
+        let mut peers = self.peers.lock().unwrap_or_else(PoisonError::into_inner);
+        peers.retain(|_, limits| limits.in_use());
+        peers.entry(peer).or_insert_with(Limits::new).clone()
+    }
+}
+
+/// What one peer's sessions may run at once.
+#[derive(Debug, Clone)]
 struct Limits {
     /// Held by each per-job request's work until the work ends, budget or not.
     job_work: Arc<Semaphore>,
@@ -947,6 +987,16 @@ impl Limits {
             job_work: Arc::new(Semaphore::new(MAX_JOB_WORK)),
             chunk_runs: Arc::new(Semaphore::new(MAX_CHUNK_RUNS)),
         }
+    }
+
+    /// Whether a session or its work holds these caps besides the `ServeLimits` that keeps them.
+    ///
+    /// Each serving session and each request it runs holds a clone, and
+    /// work past its budget holds a `job_work` permit, so both counts drop
+    /// to one only when nothing but the map is left. Nothing can take a
+    /// new clone then except through the map, under its lock.
+    fn in_use(&self) -> bool {
+        Arc::strong_count(&self.job_work) > 1 || Arc::strong_count(&self.chunk_runs) > 1
     }
 }
 
@@ -1437,6 +1487,15 @@ mod tests {
         trust: Arc<Revocable>,
         service: Arc<Nothing>,
     ) -> (Session, tokio::task::JoinHandle<RpcError>) {
+        serving_pair_under(trust, service, Arc::default()).await
+    }
+
+    /// `serving_pair`, served under `limits`; the dialer is the same peer on every call.
+    async fn serving_pair_under(
+        trust: Arc<Revocable>,
+        service: Arc<Nothing>,
+        limits: Arc<ServeLimits>,
+    ) -> (Session, tokio::task::JoinHandle<RpcError>) {
         use crate::mux::{Mux, Side};
 
         let (dialer_id, acceptor_id) = (NodeId::from_bytes([1; 32]), NodeId::from_bytes([2; 32]));
@@ -1451,7 +1510,7 @@ mod tests {
             Session::accept(acceptor, acceptor_id, version, IDLE * 10),
         );
         let accepted = acceptor_session.unwrap();
-        let serving = tokio::spawn(async move { accepted.serve(service, trust).await });
+        let serving = tokio::spawn(async move { accepted.serve(service, trust, &limits).await });
         (dialer_session.unwrap(), serving)
     }
 
@@ -1503,39 +1562,64 @@ mod tests {
     }
 
     /// Work a per-job request leaves behind when its budget runs out still
-    /// counts against the session's cap, so a peer cannot pile up ledger
-    /// work by sending requests whose budget is spent at once.
+    /// counts against the peer's cap after its session closed, so a peer
+    /// cannot pile up ledger work by sending requests whose budget is spent
+    /// at once, then connecting again and sending more.
     #[tokio::test(start_paused = true)]
-    async fn job_work_past_its_budget_is_bounded_per_session() {
+    async fn job_work_past_its_budget_is_bounded_per_peer() {
         let service = Nothing::hanging();
-        let (session, _serving) = serving_pair(paired(), Arc::clone(&service)).await;
+        let limits = Arc::new(ServeLimits::new());
         let token = FencingToken {
             job_id: fabric_core::id::JobId::from_bytes([1; 16]),
             epoch: Epoch::FIRST,
         };
-        for _ in 0..2 * MAX_JOB_WORK {
-            let pulled = session.pull(token, None, Duration::from_millis(1)).await;
-            assert!(matches!(pulled, Err(RpcError::Deadline(_))), "{pulled:?}");
+        for _ in 0..2 {
+            let (session, serving) =
+                serving_pair_under(paired(), Arc::clone(&service), Arc::clone(&limits)).await;
+            for _ in 0..MAX_JOB_WORK {
+                let pulled = session.pull(token, None, Duration::from_millis(1)).await;
+                assert!(matches!(pulled, Err(RpcError::Deadline(_))), "{pulled:?}");
+            }
+            session.close();
+            serving.await.unwrap();
         }
         tokio::time::sleep(IDLE).await;
         assert_eq!(service.started.load(Ordering::SeqCst), MAX_JOB_WORK);
     }
 
     /// A peer that asks for chunks and reads none holds at most
-    /// `MAX_CHUNK_RUNS` batches in flight; the next one waits its budget and
-    /// is told so, instead of pinning another chunk's memory.
+    /// `MAX_CHUNK_RUNS` batches in flight over all its connections; the
+    /// next one waits its budget and is told so, instead of pinning another
+    /// chunk's memory.
     #[tokio::test(start_paused = true)]
-    async fn chunk_batches_in_flight_are_bounded_per_session() {
+    async fn chunk_batches_in_flight_are_bounded_per_peer() {
         let service = Nothing::hanging();
-        let (session, _serving) = serving_pair(paired(), Arc::clone(&service)).await;
+        let limits = Arc::new(ServeLimits::new());
+        let (first, _serving) =
+            serving_pair_under(paired(), Arc::clone(&service), Arc::clone(&limits)).await;
         let mut held = Vec::new();
-        for n in 0..=MAX_CHUNK_RUNS {
+        for n in 0..MAX_CHUNK_RUNS {
             let batch = ChunkBatch::new(vec![ChunkId::of(&n.to_le_bytes())]).unwrap();
-            held.push(session.want_chunks(batch, IDLE).await.unwrap());
+            held.push(first.want_chunks(batch, IDLE).await.unwrap());
         }
-        let mut over = held.pop().unwrap();
+        let (second, _serving) = serving_pair_under(paired(), Arc::clone(&service), limits).await;
+        let batch = ChunkBatch::new(vec![ChunkId::of(b"over")]).unwrap();
+        let mut over = second.want_chunks(batch, IDLE).await.unwrap();
         assert!(matches!(over.next().await, Err(RpcError::Deadline(_))));
         assert_eq!(service.started.load(Ordering::SeqCst), MAX_CHUNK_RUNS);
+    }
+
+    /// The caps of a peer with no session and no work left are dropped, so
+    /// the node keeps no entry for every peer it ever served.
+    #[test]
+    fn caps_nothing_holds_are_forgotten() {
+        let limits = ServeLimits::new();
+        let [a, b] = [1, 2].map(|n| NodeId::from_bytes([n; 32]));
+        let _held = limits.of(a);
+        drop(limits.of(b));
+        limits.of(a);
+        let peers = limits.peers.lock().unwrap();
+        assert_eq!(peers.keys().collect::<Vec<_>>(), [&a]);
     }
 
     /// A peer that asks for chunks and stops reading them loses those

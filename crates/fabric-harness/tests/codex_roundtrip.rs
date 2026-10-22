@@ -12,7 +12,6 @@
 )]
 use std::ffi::OsString;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
@@ -22,6 +21,9 @@ use fabric_harness::codex::Codex;
 use fabric_harness::codex::overrides::{ApprovalPolicy, CodexOverrides, SandboxMode};
 use fabric_harness::manifest::StateManifest;
 use fabric_harness::{Harness, HarnessError, HarnessVersion, Launch, SessionId};
+
+mod executable;
+use executable::write_executable;
 
 const THREAD: &str = "019f233e-bb33-7342-85fa-f2d33b14368a";
 const PREFIX: &str = "019f1111-bb33-7342-85fa-f2d33b14368b";
@@ -123,14 +125,13 @@ fn fake_codex_answering(dir: &Path, answer: &str) -> (PathBuf, OsString) {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let script = bin.join("codex");
-    std::fs::write(
+    write_executable(
         &script,
         format!(
             "#!/bin/sh\ncase \"$1\" in\n  --version) {answer} ;;\n  hold) sleep 60; exit 0 ;;\nesac\n{{ echo \"cwd=$(pwd -P)\"; for a in \"$@\"; do echo \"arg=$a\"; done; }} > \"$FAKE_LOG\"\n[ -z \"$FAKE_ENV_LOG\" ] || /usr/bin/env | cut -d= -f1 > \"$FAKE_ENV_LOG\"\n"
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        )
+        .as_bytes(),
+    );
     (script, bin.into_os_string())
 }
 
@@ -397,6 +398,59 @@ async fn a_running_codex_too_old_for_the_writer_lock_blocks_capture_and_restore(
     assert!(!again.path().join("manifest.json").exists());
     let before = std::fs::read(&src.head).unwrap();
     let err = adapter.restore(&src.work, out.path()).await.unwrap_err();
+    assert!(
+        matches!(err, HarnessError::HarnessRunning { ref pids, .. } if pids.contains(&pid)),
+        "{err}"
+    );
+    assert_eq!(std::fs::read(&src.head).unwrap(), before);
+}
+
+/// A Codex that was running before the binary on disk was upgraded to
+/// one that takes the writer lock may itself take none. It still holds the
+/// rollout of its thread open, and that must block capture and restore
+/// even though the installed version trusts the lock.
+#[tokio::test]
+async fn a_live_writer_that_takes_no_lock_blocks_capture_and_restore() {
+    let src = build_source();
+    let home = src.home.path().canonicalize().unwrap();
+    let adapter = node(&home);
+    let out = tempfile::tempdir().unwrap();
+    adapter
+        .capture(&src.work, &thread(), out.path())
+        .await
+        .unwrap();
+    let ready = home.join("holder-ready");
+    let mut holder = std::process::Command::new("/bin/sh")
+        .args(["-c", r#"exec 3>>"$1" && : > "$2" && exec sleep 60"#, "sh"])
+        .arg(&src.head)
+        .arg(&ready)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the holder never opened the rollout"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let pid = holder.id();
+    let again = tempfile::tempdir().unwrap();
+    let captured = adapter.capture(&src.work, &thread(), again.path()).await;
+    let before = std::fs::read(&src.head).unwrap();
+    let restored = adapter.restore(&src.work, out.path()).await;
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", "--", &format!("-{pid}")])
+        .status();
+    let _ = holder.wait();
+    let err = captured.unwrap_err();
+    assert!(
+        matches!(err, HarnessError::HarnessRunning { ref pids, .. } if pids.contains(&pid)),
+        "{err}"
+    );
+    assert!(!again.path().join("manifest.json").exists());
+    let err = restored.unwrap_err();
     assert!(
         matches!(err, HarnessError::HarnessRunning { ref pids, .. } if pids.contains(&pid)),
         "{err}"
@@ -711,6 +765,45 @@ async fn a_thread_that_comes_back_lands_over_its_original_file() {
         std::fs::read_to_string(&src.head)
             .unwrap()
             .ends_with(&turn("done on the air"))
+    );
+}
+
+/// A rollout of the thread that this node's codex wrote after the job
+/// left, which the incoming lineage does not hold, is divergence. Left in
+/// place, it would be the newest rollout of the thread here, and the
+/// resumed thread would continue this node's history, not the job's.
+#[tokio::test]
+async fn a_rollout_made_here_after_the_job_left_is_divergence() {
+    const LATER: &str = "019f233e-bb33-7342-85fa-f2d33b14368c";
+    let src = build_source();
+    let home = src.home.path().canonicalize().unwrap();
+    let adapter = node(&home);
+    let out_1 = tempfile::tempdir().unwrap();
+    adapter
+        .capture(&src.work, &thread(), out_1.path())
+        .await
+        .unwrap();
+    let pro = set_aside(&home, ".codex-pro");
+    adapter.restore(&src.work, out_1.path()).await.unwrap();
+    let out_2 = tempfile::tempdir().unwrap();
+    adapter
+        .capture(&src.work, &thread(), out_2.path())
+        .await
+        .unwrap();
+    set_aside(&home, ".codex-air");
+    std::fs::rename(&pro, home.join(".codex")).unwrap();
+    let later = src.head.with_file_name(format!(
+        "rollout-2026-10-20T09-00-00-{THREAD}_{LATER}.jsonl"
+    ));
+    std::fs::write(
+        &later,
+        session_meta(THREAD, &src.work.to_string_lossy(), Some(THREAD)),
+    )
+    .unwrap();
+    let err = adapter.restore(&src.work, out_2.path()).await.unwrap_err();
+    assert!(
+        matches!(err, HarnessError::StateDiverged { ref path } if path == &later),
+        "{err}"
     );
 }
 

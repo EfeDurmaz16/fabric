@@ -3,17 +3,21 @@
 //! Invariant: a Claude session is carried as the files Claude itself reads
 //! on `claude --resume <session-id>`: the transcript and sidecars under
 //! every `~/.claude/projects/<key>/` that holds them, the project memory,
-//! `file-history`, `tasks` and `uploads` for the session. Files inside the
-//! workspace (`.claude/`, `CLAUDE.local.md`) are the workspace snapshot's
-//! to carry (ADR 0004), never this adapter's. Credentials, the global
-//! `~/.claude.json`, the process registry and the supervisor state never
-//! travel (see `denylist`), and a symlink is never followed. Restore
+//! `file-history`, `tasks` and `uploads` for the session, and the plan
+//! files under `~/.claude/plans/` its transcripts name (`plans`). Files
+//! inside the workspace (`.claude/`, `CLAUDE.local.md`) are the workspace
+//! snapshot's to carry (ADR 0004), never this adapter's. Credentials, the
+//! global `~/.claude.json`, the process registry and the supervisor state
+//! never travel (see `denylist`), and a symlink is never followed. Restore
 //! accepts only the workspace path and home the state was captured under
 //! (ADR 0011), so nothing is rewritten, and places a file only where
 //! capture takes one from; any other path in a manifest is refused before
 //! anything is written. A capture or restore is refused while a `claude`
 //! process registered for the same session is alive, because
 //! `place::place_all` cannot protect a file that is being appended to.
+//! Claude takes no lock, so one that starts after that check is caught
+//! only by its writes: restore checks each file again just before it
+//! replaces it and stops at one that changed (`StateChanged`).
 //! When the registry cannot answer (it is missing, a record does not
 //! parse, or the installed Claude is older than the version it was read
 //! on), any running `claude` refuses them instead.
@@ -52,10 +56,12 @@
 
 pub mod flags;
 pub(crate) mod history;
+pub(crate) mod plans;
 pub(crate) mod recorded;
 pub(crate) mod slug;
 pub(crate) mod trust;
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -152,10 +158,31 @@ impl ClaudeCode {
         }
     }
 
-    /// Uses this binary instead of looking `claude` up on `PATH`.
+    /// Uses this binary instead of looking `claude` up on `PATH`. The
+    /// path is absolute: the version probe runs in this process's
+    /// directory and the launch in the workspace, so a relative path would
+    /// name one file to the probe and another to the launch.
+    ///
+    /// ```
+    /// # use fabric_core::path::AbsPath;
+    /// # use fabric_harness::claude::ClaudeCode;
+    /// let home = AbsPath::parse("/h").unwrap();
+    /// let binary = AbsPath::parse("/opt/claude/bin/claude").unwrap();
+    /// let _ = ClaudeCode::new(home, Default::default()).with_binary(&binary);
+    /// ```
+    ///
+    /// A relative path does not type-check:
+    ///
+    /// ```compile_fail,E0308
+    /// # use fabric_core::path::AbsPath;
+    /// # use fabric_harness::claude::ClaudeCode;
+    /// let home = AbsPath::parse("/h").unwrap();
+    /// let binary = std::path::PathBuf::from("./bin/claude");
+    /// let _ = ClaudeCode::new(home, Default::default()).with_binary(&binary);
+    /// ```
     #[must_use]
-    pub fn with_binary(mut self, binary: PathBuf) -> Self {
-        self.binary = Some(binary);
+    pub fn with_binary(mut self, binary: &AbsPath) -> Self {
+        self.binary = Some(pipeline::fs_path(binary).to_path_buf());
         self
     }
 
@@ -518,9 +545,15 @@ impl ClaudeCode {
     }
 
     /// True when a tree path names a file this adapter captures for
-    /// `session` of the workspace whose key is `root_key`. Restore refuses
-    /// every other path, so a manifest cannot place a file elsewhere.
-    fn restorable(rel: &str, session: &SessionId, root_key: &str) -> bool {
+    /// `session` of the workspace whose key is `root_key`, whose
+    /// transcripts name the plan slugs `plan_slugs`. Restore refuses every
+    /// other path, so a manifest cannot place a file elsewhere.
+    fn restorable(
+        rel: &str,
+        session: &SessionId,
+        root_key: &str,
+        plan_slugs: &BTreeSet<String>,
+    ) -> bool {
         let Some(rest) = under_home(rel) else {
             return false;
         };
@@ -535,8 +568,44 @@ impl ClaudeCode {
             [".claude", "projects", key, "memory", _, ..] => *key == root_key,
             [".claude", "file-history" | "uploads", dir, _, ..] => *dir == sid,
             [".claude", "tasks", dir, _, ..] => *dir == tasks,
+            [".claude", "plans", name] => plans::belongs(name, plan_slugs),
             _ => false,
         }
+    }
+
+    /// Adds the plan files under `~/.claude/plans/` that belong to the
+    /// session whose main transcripts are `transcripts`.
+    fn add_plans(
+        &self,
+        sources: &mut Vec<Source>,
+        transcripts: &[&Path],
+    ) -> Result<(), HarnessError> {
+        let dir = self.config_dir.join("plans");
+        match Self::kind_at(&dir)? {
+            Some(kind) if kind.is_symlink() => {
+                return Err(HarnessError::SymlinkInState { path: dir });
+            }
+            Some(kind) if kind.is_dir() => {}
+            _ => return Ok(()),
+        }
+        let slugs = plans::slugs(transcripts)?;
+        if slugs.is_empty() {
+            return Ok(());
+        }
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&dir).map_err(|e| HarnessError::io(IoOp::Walk, &dir, e))? {
+            let entry = entry.map_err(|e| HarnessError::io(IoOp::Walk, &dir, e))?;
+            if let Some(name) = entry.file_name().to_str()
+                && plans::belongs(name, &slugs)
+            {
+                names.push(name.to_owned());
+            }
+        }
+        names.sort();
+        for name in names {
+            self.add_file(sources, &dir.join(name))?;
+        }
+        Ok(())
     }
 
     /// Adds the backups under `file-history/<sid>/` that the transcripts
@@ -578,23 +647,35 @@ impl ClaudeCode {
         session: &SessionId,
         counts: &mut RedactionCounts,
     ) -> Result<Vec<Source>, HarnessError> {
-        let mut sources = Vec::new();
-        let projects = self.config_dir.join("projects");
-        let mut found_transcript = false;
-        for key_dir in Self::session_keys(&projects, session)? {
-            if let Some(transcript) = Self::transcript_in(&key_dir, session)?
-                && self.add_file(&mut sources, &transcript)?
-            {
-                found_transcript = true;
-            }
-            self.add_tree(&mut sources, &key_dir.join(session.as_str()))?;
-        }
+        let (sources, found_transcript) = self.session_sources(root, session, counts)?;
         if !found_transcript {
             return Err(HarnessError::SessionNotFound {
                 kind: HarnessKind::ClaudeCode,
                 session: session.clone(),
-                searched: projects,
+                searched: self.config_dir.join("projects"),
             });
+        }
+        Ok(sources)
+    }
+
+    /// Every file of `session` that capture takes from this node, and
+    /// whether its transcript was among them.
+    fn session_sources(
+        &self,
+        root: &AbsPath,
+        session: &SessionId,
+        counts: &mut RedactionCounts,
+    ) -> Result<(Vec<Source>, bool), HarnessError> {
+        let mut sources = Vec::new();
+        let projects = self.config_dir.join("projects");
+        let mut transcripts = Vec::new();
+        for key_dir in Self::session_keys(&projects, session)? {
+            if let Some(transcript) = Self::transcript_in(&key_dir, session)?
+                && self.add_file(&mut sources, &transcript)?
+            {
+                transcripts.push(transcript);
+            }
+            self.add_tree(&mut sources, &key_dir.join(session.as_str()))?;
         }
         let key = Self::key_of(root)?;
         self.add_tree(&mut sources, &projects.join(&key).join("memory"))?;
@@ -611,7 +692,9 @@ impl ClaudeCode {
             &mut sources,
             &self.config_dir.join("uploads").join(session.as_str()),
         )?;
-        Ok(sources)
+        let transcripts: Vec<&Path> = transcripts.iter().map(PathBuf::as_path).collect();
+        self.add_plans(&mut sources, &transcripts)?;
+        Ok((sources, !transcripts.is_empty()))
     }
 
     fn capture_sync(
@@ -663,8 +746,15 @@ impl ClaudeCode {
 
     /// Where a tree path of `session` lands under the home, and how
     /// capture treats it; `None` for a path capture never takes.
-    fn destination(&self, rel: &str, session: &SessionId, root_key: &str) -> Option<Destination> {
-        let rest = under_home(rel).filter(|_| Self::restorable(rel, session, root_key))?;
+    fn destination(
+        &self,
+        rel: &str,
+        session: &SessionId,
+        root_key: &str,
+        plan_slugs: &BTreeSet<String>,
+    ) -> Option<Destination> {
+        let rest =
+            under_home(rel).filter(|_| Self::restorable(rel, session, root_key, plan_slugs))?;
         let parts: Vec<&str> = rest.split('/').collect();
         Some(Destination {
             path: self.home_dir().join(rest),
@@ -682,8 +772,29 @@ impl ClaudeCode {
         let root_key = Self::key_of(root)?;
         let session = manifest.session().clone();
         let records = self.departure(&session);
-        let restored = pipeline::restore(manifest, state, Some(&records), |rel, _| {
-            Ok(self.destination(rel, &session, &root_key))
+        pipeline::refuse_symlinks(self.home_dir(), &self.config_dir)?;
+        let (held, _) = self.session_sources(root, &session, &mut RedactionCounts::new())?;
+        // The staged main transcripts name the plans that may be placed.
+        // Their digests are checked before anything is placed, and one that
+        // is missing fails that check, so it names no plan here.
+        let transcript = format!("{session}.jsonl");
+        let staged: Vec<PathBuf> = manifest
+            .files()
+            .iter()
+            .map(|file| file.rel_path.as_str())
+            .filter(|rel| {
+                matches!(
+                    rel.split('/').collect::<Vec<_>>().as_slice(),
+                    [HOME_PREFIX, ".claude", "projects", _, name] if *name == transcript
+                )
+            })
+            .map(|rel| state.join(rel))
+            .filter(|path| path.is_file())
+            .collect();
+        let staged: Vec<&Path> = staged.iter().map(PathBuf::as_path).collect();
+        let plan_slugs = plans::slugs(&staged)?;
+        let restored = pipeline::restore(manifest, state, Some(&records), &held, |rel, _| {
+            Ok(self.destination(rel, &session, &root_key, &plan_slugs))
         })?;
         info!(%session, files = restored.placed.len(), "claude: restored");
         Ok(restored)
@@ -1364,7 +1475,8 @@ mod tests {
     #[test]
     fn restore_accepts_only_the_places_capture_reads() {
         let sid = SessionId::parse("9c9796f0-2682-4546-a963-d314b3ad543f").unwrap();
-        let ok = |rel: &str| ClaudeCode::restorable(rel, &sid, "-w");
+        let slugs = BTreeSet::from(["dreamy-popping-cerf".to_owned()]);
+        let ok = |rel: &str| ClaudeCode::restorable(rel, &sid, "-w", &slugs);
         for rel in [
             "home/.claude/projects/-w/9c9796f0-2682-4546-a963-d314b3ad543f.jsonl",
             "home/.claude/projects/-other/9c9796f0-2682-4546-a963-d314b3ad543f/tool-results/1.txt",
@@ -1372,6 +1484,7 @@ mod tests {
             "home/.claude/file-history/9c9796f0-2682-4546-a963-d314b3ad543f/abc@v1",
             "home/.claude/tasks/session-9c9796f0/1.json",
             "home/.claude/uploads/9c9796f0-2682-4546-a963-d314b3ad543f/a.png",
+            "home/.claude/plans/dreamy-popping-cerf.md",
         ] {
             assert!(ok(rel), "{rel} must be accepted");
         }
@@ -1384,6 +1497,8 @@ mod tests {
             "home/.claude/file-history/another/abc@v1",
             "home/.claude/tasks/session-00000000/1.json",
             "home/.claude/projects/-w/9c9796f0-2682-4546-a963-d314b3ad543f",
+            "home/.claude/plans/another-session-slug.md",
+            "home/.claude/plans/dreamy-popping-cerf.md/x",
         ] {
             assert!(!ok(rel), "{rel} must be refused");
         }
@@ -1555,7 +1670,7 @@ mod tests {
                 AbsPath::parse(home.to_str().unwrap()).unwrap(),
                 OsString::new(),
             )
-            .with_binary(binary);
+            .with_binary(&AbsPath::parse(binary.to_str().unwrap()).unwrap());
             let env = vec![(
                 EnvVarName::parse("HOME").unwrap(),
                 home.to_str().unwrap().to_owned(),

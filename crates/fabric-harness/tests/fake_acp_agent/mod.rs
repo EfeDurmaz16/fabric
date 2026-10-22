@@ -62,9 +62,15 @@ impl Agent {
         serde_json::from_slice(&bytes).ok()
     }
 
+    /// Writes the state whole or not at all: a temporary file renamed over
+    /// the old one, so a kill between `session/cancel` and the test's read
+    /// never leaves an empty file behind.
     fn save_state(&self, session: &str, state: &Value) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.state_dir)?;
-        std::fs::write(self.state_path(session), serde_json::to_vec_pretty(state)?)
+        let path = self.state_path(session);
+        let partial = self.state_dir.join(format!("{session}.json.partial"));
+        std::fs::write(&partial, serde_json::to_vec_pretty(state)?)?;
+        std::fs::rename(partial, path)
     }
 
     fn initialize() -> Value {

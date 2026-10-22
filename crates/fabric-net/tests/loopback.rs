@@ -20,7 +20,7 @@ use fabric_net::frame::{FRAME_VERSION, MAX_CONTROL_FRAME};
 use fabric_net::identity::NodeIdentity;
 use fabric_net::peers::Peers;
 use fabric_net::quic::QuicTransport;
-use fabric_net::rpc::{JobFuture, RpcError, Service, Session};
+use fabric_net::rpc::{JobFuture, RpcError, ServeLimits, Service, Session};
 use fabric_net::tcp::TcpTlsTransport;
 use fabric_net::tls::{TlsError, Trust};
 use fabric_net::transport::{Connection, Transport, TransportError, TransportKind};
@@ -197,10 +197,11 @@ fn serve_one(
         // The transport let the peer in, so the session serves it under the same pairing.
         let trust: Arc<dyn Trust> = Arc::new(Paired(vec![connection.peer()]));
         let session = Session::accept(connection, local, version, DEADLINE).await?;
+        let limits = ServeLimits::new();
         match stop {
-            None => Err(session.serve(service, trust).await),
+            None => Err(session.serve(service, trust, &limits).await),
             Some(mut stop) => tokio::select! {
-                ended = session.serve(service, trust) => Err(ended),
+                ended = session.serve(service, trust, &limits) => Err(ended),
                 _ = stop.recv() => {
                     session.close();
                     Ok(())

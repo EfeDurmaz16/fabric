@@ -19,9 +19,10 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use fabric_core::path::RelPath;
 use fabric_env::detect::detect;
 use fabric_env::materialize::{
-    CacheHealth, MaterializeError, NodeEnv, Plan, SENTINEL, TreeLock, plan,
+    CacheHealth, MaterializeError, NodeEnv, Plan, SENTINEL, TreeLock, plan, sentinel_text,
 };
 
 const ROOT_VAR: &str = "FABRIC_CRASH_ROOT";
@@ -138,7 +139,6 @@ fn a_resume_killed_during_a_step_removes_the_old_proof() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir(dir.path().join("out")).unwrap();
     fs::write(dir.path().join("out/f"), "x").unwrap();
-    fs::write(dir.path().join("out").join(SENTINEL), "").unwrap();
     declare(
         dir.path(),
         r#"
@@ -153,6 +153,12 @@ when = "always"
 "#,
     )
     .unwrap();
+    let whole = sentinel_text(
+        &detect(dir.path(), &[]).unwrap(),
+        &RelPath::parse("out").unwrap(),
+    )
+    .unwrap();
+    fs::write(dir.path().join("out").join(SENTINEL), whole).unwrap();
     let status = spawn_child(
         "a_resume_killed_during_a_step_removes_the_old_proof",
         dir.path(),
@@ -223,4 +229,50 @@ args = ["-c", "touch started; while [ ! -e release ]; do sleep 0.02; done; mkdir
     assert!(dir.path().join("out/f").is_file());
     assert_eq!(next.caches()[0].health, CacheHealth::Incomplete);
     assert_eq!(next.steps().len(), 1);
+}
+
+/// A step may replace its standard input, as `sh -c 'exec </dev/null; ...'`
+/// does, and the lock must outlive a killed resume all the same: the step
+/// holds the locked file under a number of its own as well, which the
+/// redirection leaves open.
+#[test]
+fn a_step_that_replaces_its_input_still_holds_the_tree_after_resume_dies() {
+    if run_child().unwrap() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    declare(
+        dir.path(),
+        r#"
+[[cache]]
+path = "out"
+class = "build"
+
+[[setup]]
+program = "sh"
+args = ["-c", "exec </dev/null; touch started; while [ ! -e release ]; do sleep 0.02; done; mkdir -p out; echo x > out/f"]
+"#,
+    )
+    .unwrap();
+    let mut child = spawn_child(
+        "a_step_that_replaces_its_input_still_holds_the_tree_after_resume_dies",
+        dir.path(),
+    )
+    .unwrap();
+    wait_for(&dir.path().join("started")).unwrap();
+    child.kill().unwrap();
+    assert_eq!(child.wait().unwrap().signal(), Some(9));
+
+    let busy = TreeLock::acquire(&locks(), dir.path());
+    // The step finishes before the check, so a failing run leaves none behind.
+    fs::write(dir.path().join("release"), "").unwrap();
+    wait_for(&dir.path().join("out/f")).unwrap();
+    assert!(
+        matches!(busy, Err(MaterializeError::TreeBusy { .. })),
+        "{busy:?}"
+    );
+    drop(busy);
+
+    let next = next_plan(dir.path()).unwrap();
+    assert_eq!(next.caches()[0].health, CacheHealth::Incomplete);
 }

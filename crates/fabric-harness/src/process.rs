@@ -81,6 +81,8 @@ const PS: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 const PGREP: &[&str] = &["/usr/bin/pgrep", "/bin/pgrep"];
 /// Where macOS and Linux keep `kill`.
 const KILL: &[&str] = &["/bin/kill", "/usr/bin/kill"];
+/// Where macOS and Linux keep `lsof`.
+pub(crate) const LSOF: &[&str] = &["/usr/sbin/lsof", "/usr/bin/lsof", "/sbin/lsof", "/bin/lsof"];
 /// The `pgrep` flag that keeps the caller's ancestors in the answer.
 #[cfg(target_os = "macos")]
 const PGREP_WITH_ANCESTORS: &[&str] = &["-a"];
@@ -89,7 +91,7 @@ const PGREP_WITH_ANCESTORS: &[&str] = &["-a"];
 const PGREP_WITH_ANCESTORS: &[&str] = &[];
 
 /// The first of `candidates` that is an executable file.
-fn system_tool(
+pub(crate) fn system_tool(
     program: &'static str,
     candidates: &'static [&'static str],
 ) -> Result<&'static Path, HarnessError> {
@@ -588,9 +590,75 @@ pub(crate) async fn pid_alive(pid: u32) -> Result<bool, HarnessError> {
     }
 }
 
+/// Process ids, other than this one, that hold any of `files` open,
+/// asked of `lsof`. It lists them and exits 0 when every file is open, or
+/// 1 when some is not, and then says nothing on its error output; anything
+/// on that output, as for a file that vanished, or any other exit is an
+/// error, never "none". It runs from a blocking thread, under a lock the
+/// caller holds, so it is synchronous.
+pub(crate) fn holding(files: &[PathBuf]) -> Result<Vec<u32>, HarnessError> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let output = std::process::Command::new(system_tool("lsof", LSOF)?)
+        .arg("-t")
+        .arg("--")
+        .args(files)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|source| HarnessError::Spawn {
+            program: "lsof".to_owned(),
+            source,
+        })?;
+    let own = std::process::id();
+    let mut pids: Vec<u32> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .filter(|pid| *pid != own)
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    match output.status.code() {
+        Some(0 | 1) if output.stderr.trim_ascii().is_empty() => Ok(pids),
+        code => Err(HarnessError::ProcessQuery {
+            program: "lsof",
+            reason: format!(
+                "exited with {code:?}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes `contents` to `path` with mode `0755` through a short `sh`,
+    /// so this process never holds the file open for writing. Linux
+    /// refuses to run a file open for writing (`ETXTBSY`), and a child
+    /// another test forked while this process held it open would keep it
+    /// open until that child ran its own program. A temporary file renamed
+    /// into place would not help: the descriptor follows the file.
+    fn write_executable(path: &Path, contents: &[u8]) {
+        use std::io::Write;
+        let mut writer = std::process::Command::new("/bin/sh")
+            .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The pipe closes at the end of the statement, so `cat` sees the end.
+        writer.stdin.take().unwrap().write_all(contents).unwrap();
+        let status = writer.wait().unwrap();
+        assert!(
+            status.success(),
+            "writing {} failed: {status}",
+            path.display()
+        );
+    }
 
     #[test]
     fn version_token_finds_the_number() {
@@ -653,7 +721,10 @@ mod tests {
             None => {
                 let dir = tempfile::tempdir().unwrap();
                 let claude = dir.path().join("claude");
-                std::fs::copy(std::env::current_exe().unwrap(), &claude).unwrap();
+                write_executable(
+                    &claude,
+                    &std::fs::read(std::env::current_exe().unwrap()).unwrap(),
+                );
                 run(&claude, "parent");
             }
             Some("parent") => run(&std::env::current_exe().unwrap(), "child"),
@@ -672,8 +743,7 @@ mod tests {
     async fn a_version_probe_does_not_pass_parent_session_markers() {
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("tool");
-        std::fs::write(&binary, "#!/bin/sh\n/usr/bin/env\n").unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&binary, b"#!/bin/sh\n/usr/bin/env\n");
         let env: Vec<(EnvVarName, String)> = [("CLAUDECODE", "1"), ("FABRIC_PROBE_KEPT", "1")]
             .into_iter()
             .map(|(name, value)| (EnvVarName::parse(name).unwrap(), value.to_owned()))
@@ -687,8 +757,7 @@ mod tests {
     async fn a_version_probe_that_exits_with_a_failure_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("tool");
-        std::fs::write(&binary, "#!/bin/sh\necho 'tool 1.2.3'\nexit 1\n").unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&binary, b"#!/bin/sh\necho 'tool 1.2.3'\nexit 1\n");
         let err = detect(Some(binary.clone()), OsStr::new("/usr/bin:/bin"))
             .await
             .unwrap_err();
@@ -703,11 +772,9 @@ mod tests {
     async fn a_version_probe_finds_an_interpreter_on_the_configured_path() {
         let dir = tempfile::tempdir().unwrap();
         let interp = dir.path().join("fabric-test-interp");
-        std::fs::write(&interp, "#!/bin/sh\necho 'tool 4.5.6'\n").unwrap();
-        std::fs::set_permissions(&interp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&interp, b"#!/bin/sh\necho 'tool 4.5.6'\n");
         let binary = dir.path().join("tool");
-        std::fs::write(&binary, "#!/usr/bin/env fabric-test-interp\n").unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&binary, b"#!/usr/bin/env fabric-test-interp\n");
         let path_var =
             std::env::join_paths([dir.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
         let installed = detect(Some(binary), &path_var).await.unwrap().unwrap();

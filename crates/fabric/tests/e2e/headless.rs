@@ -6,6 +6,7 @@
 //! keep their session files where Claude Code and Codex keep theirs.
 
 use std::fs;
+use std::io::{BufRead, Read};
 use std::path::Path;
 use std::time::Duration;
 
@@ -470,6 +471,158 @@ fn e2e_a_headless_run_whose_output_is_gone_still_records_the_exit() -> Fallible 
         !record.exists(),
         "the node was not told the harness exited:\n{}",
         text(&output)
+    );
+    Ok(())
+}
+
+/// A script that reads a headless run's output and acts once the turn is
+/// printed, before `fabric` exits, must find the node done with the
+/// harness: the node is told the harness exited before any line of the
+/// turn is printed (Codex review, 2026-10-22).
+#[test]
+fn e2e_a_headless_run_tells_the_node_before_it_prints_the_turn() -> Fallible {
+    let env = Env::new()?;
+    env.install_fake_codex()?;
+    let (node, job) = job_under(&env, "codex")?;
+    let record = node.state().join("jobs").join(&job).join("harness");
+    let mut running = node.spawn(&["job", "run", &job, "--headless", "--prompt", "one"])?;
+    // Standard error is read from the start, so a full pipe never stops
+    // `fabric` before it prints the turn.
+    let mut stderr = running
+        .stderr
+        .take()
+        .ok_or("the run has no standard error")?;
+    let errors = std::thread::spawn(move || {
+        let mut errors = String::new();
+        let _ = stderr.read_to_string(&mut errors);
+        errors
+    });
+    let stdout = running
+        .stdout
+        .take()
+        .ok_or("the run has no standard output")?;
+    let mut lines = std::io::BufReader::new(stdout);
+    let mut first = String::new();
+    lines.read_line(&mut first)?;
+    let recorded = record.exists();
+    let mut rest = String::new();
+    lines.read_to_string(&mut rest)?;
+    let output = finish(running, Duration::from_mins(3))?;
+    let errors = errors
+        .join()
+        .map_err(|_| "the reader of standard error panicked")?;
+    assert_eq!(first, "codex did: one\n", "{errors}");
+    assert!(
+        !recorded,
+        "the turn was printed while the node still recorded the harness:\n{errors}"
+    );
+    assert_eq!(
+        rest,
+        format!("codex session {}\n", Env::CODEX_THREAD),
+        "{errors}"
+    );
+    assert!(output.status.success(), "{errors}");
+    Ok(())
+}
+
+/// What a headless harness writes to standard error reaches the user
+/// whole, even when a process it started writes it after the turn ended:
+/// `fabric` copies it to its end before it exits (Codex review, 2026-10-22).
+#[test]
+fn e2e_a_headless_run_forwards_standard_error_to_its_end() -> Fallible {
+    let env = Env::new()?;
+    env.install_fake_codex()?;
+    let (node, job) = job_under(&env, "codex")?;
+    let running = node.spawn_with(
+        &["job", "run", &job, "--headless", "--prompt", "one"],
+        &[("FAKE_CODEX_LATE_STDERR", Path::new("1"))],
+    )?;
+    let output = finish(running, Duration::from_mins(3))?;
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("codex: late diagnostics"),
+        "the harness's last diagnostics were dropped:\n{}",
+        text(&output)
+    );
+    Ok(())
+}
+
+/// Ctrl-C on a headless ACP run reaches the agent too, which runs in a
+/// process group of its own: here the agent stays alive after its turn,
+/// the signal ends it, and `fabric` tells the node before it exits, so no
+/// agent runs on that nobody watches (Codex review, 2026-10-22).
+#[test]
+fn e2e_ctrl_c_on_a_headless_acp_run_reaches_the_agent() -> Fallible {
+    let env = Env::new()?;
+    let (node, job) = job_under(&env, crate::AGENT)?;
+    let pid_file = node.state().join("agent.pid");
+    let running = node.spawn_with(
+        &["job", "run", &job, "--headless", "--prompt", "two"],
+        &[
+            ("FAKE_LINGER", Path::new("1")),
+            ("FAKE_PID_FILE", &pid_file),
+        ],
+    )?;
+    let started = std::time::Instant::now();
+    while !node
+        .ok(&["job", "status", &job])?
+        .contains("harness: running as pid")
+    {
+        if started.elapsed() > Duration::from_mins(1) {
+            return Err("the agent never registered".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let agent: i32 = fs::read_to_string(&pid_file)?.trim().parse()?;
+    // The agent writes to the run's standard error too, so the run's end is
+    // its exit, not the end of its output, which an agent left running
+    // would keep open.
+    let mut running = running;
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_string(&mut text);
+            }
+            text
+        })
+    };
+    let stdout = drain(running.stdout.take().map(|pipe| Box::new(pipe) as _));
+    let stderr = drain(running.stderr.take().map(|pipe| Box::new(pipe) as _));
+    let fabric =
+        rustix::process::Pid::from_raw(i32::try_from(running.id())?).ok_or("fabric has no pid")?;
+    rustix::process::kill_process(fabric, rustix::process::Signal::INT)?;
+    let started = std::time::Instant::now();
+    let exited = loop {
+        if let Some(status) = running.try_wait()? {
+            break Some(status);
+        }
+        if started.elapsed() > Duration::from_mins(1) {
+            let _ = running.kill();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let left = crate::world::alive(agent);
+    if left && let Some(agent) = rustix::process::Pid::from_raw(agent) {
+        let _ = rustix::process::kill_process_group(agent, rustix::process::Signal::KILL);
+    }
+    let printed = format!(
+        "{}{}",
+        stdout
+            .join()
+            .map_err(|_| "the reader of standard output panicked")?,
+        stderr
+            .join()
+            .map_err(|_| "the reader of standard error panicked")?
+    );
+    let exited = exited.ok_or_else(|| format!("fabric did not exit:\n{printed}"))?;
+    assert!(!left, "the agent ran on after fabric exited:\n{printed}");
+    assert_eq!(exited.code(), Some(130), "{printed}");
+    let status = node.ok(&["job", "status", &job])?;
+    assert!(
+        !status.contains("harness: running"),
+        "the node still records the agent:\n{status}"
     );
     Ok(())
 }

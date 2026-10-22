@@ -8,9 +8,13 @@
 //! local bytes stay. A file the harness rewrites in place
 //! (`Mutability::Replaceable`) may also be replaced outright, but only
 //! when it still holds the bytes this node recorded when the job last left
-//! it, which the caller answers. Nothing here is safe against a process
-//! that appends to a destination at the same time; the adapter's
-//! running-harness guard protects that case, not this module.
+//! it, which the caller answers. Each destination is checked again just
+//! before its rename: when its length, times or inode moved since it was
+//! planned, as a harness that started after the adapter's running-harness
+//! guard and wrote to it would move them, the restore stops there
+//! (`StateChanged`) and the bytes that harness wrote stay. A write that
+//! lands between that check and the rename is not caught; only a lock the
+//! harness itself honours could close that window.
 
 #![cfg_attr(
     not(all(feature = "acp", feature = "claude", feature = "codex")),
@@ -22,6 +26,7 @@
 
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::crashpoint::crashpoint;
@@ -172,7 +177,51 @@ enum Step {
     Extend { view_len: u64 },
 }
 
-fn plan(placement: &Placement, unchanged: Unchanged<'_>) -> Result<Step, HarnessError> {
+/// What a destination was when restore planned it: its device, inode,
+/// length, modification and change times, or `None` when it was missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Seen(Option<[i64; 7]>);
+
+impl Seen {
+    fn of(path: &Path) -> Result<Self, HarnessError> {
+        let meta = match fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Seen(None)),
+            Err(e) => return Err(HarnessError::io(IoOp::Read, path, e)),
+        };
+        let wide = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+        Ok(Seen(Some([
+            wide(meta.dev()),
+            wide(meta.ino()),
+            wide(meta.size()),
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.ctime(),
+            meta.ctime_nsec(),
+        ])))
+    }
+
+    /// Refuses `path` when it is no longer what was seen.
+    fn still(self, path: &Path) -> Result<(), HarnessError> {
+        if Seen::of(path)? == self {
+            Ok(())
+        } else {
+            Err(HarnessError::StateChanged {
+                path: path.to_path_buf(),
+            })
+        }
+    }
+}
+
+fn plan(placement: &Placement, unchanged: Unchanged<'_>) -> Result<(Step, Seen), HarnessError> {
+    // Read before the bytes are compared, so a write during the compare
+    // shows at the check before the rename.
+    let seen = Seen::of(&placement.dest)?;
+    let step = plan_step(placement, unchanged)?;
+    Ok((step, seen))
+}
+
+fn plan_step(placement: &Placement, unchanged: Unchanged<'_>) -> Result<Step, HarnessError> {
     match compare(&placement.dest, &placement.staged)? {
         Relation::Equal => return Ok(Step::Keep),
         Relation::Missing | Relation::ExistingIsPrefix => return Ok(Step::Replace),
@@ -210,10 +259,11 @@ fn copy_into(path: &Path, out: &mut dyn Write, skip: u64) -> Result<(), HarnessE
 /// the module rule, with `unchanged` saying which rewritable files this
 /// node has not touched since the job left; only when all pass is anything
 /// written, so a `StateDiverged` leaves this node as it was. A write that
-/// then fails leaves the files before it placed, each one equal to, an
-/// extension of, or an allowed replacement for what was there, and running
-/// the restore again converges. Returns every destination, placed or found
-/// equal, in order.
+/// then fails, or a destination that changed since it was checked
+/// (`StateChanged`), leaves the files before it placed, each one equal to,
+/// an extension of, or an allowed replacement for what was there, and
+/// running the restore again converges. Returns every destination, placed
+/// or found equal, in order.
 pub(crate) fn place_all(
     placements: &[Placement],
     unchanged: Unchanged<'_>,
@@ -234,20 +284,27 @@ pub(crate) fn place_all(
     let steps = placements
         .iter()
         .map(|placement| plan(placement, unchanged))
-        .collect::<Result<Vec<Step>, HarnessError>>()?;
-    for (index, (placement, step)) in placements.iter().zip(steps).enumerate() {
+        .collect::<Result<Vec<(Step, Seen)>, HarnessError>>()?;
+    for (index, (placement, (step, seen))) in placements.iter().zip(steps).enumerate() {
+        let dest = &placement.dest;
         match step {
             Step::Keep => {}
             Step::Replace => {
-                durable::write_atomic_with(&placement.dest, |w| {
-                    copy_into(&placement.staged, w, 0)
-                })?;
+                durable::write_atomic_checked(
+                    dest,
+                    |w| copy_into(&placement.staged, w, 0),
+                    || seen.still(dest),
+                )?;
             }
             Step::Extend { view_len } => {
-                durable::write_atomic_with(&placement.dest, |w| {
-                    copy_into(&placement.dest, w, 0)?;
-                    copy_into(&placement.staged, w, view_len)
-                })?;
+                durable::write_atomic_checked(
+                    dest,
+                    |w| {
+                        copy_into(dest, w, 0)?;
+                        copy_into(&placement.staged, w, view_len)
+                    },
+                    || seen.still(dest),
+                )?;
             }
         }
         crashpoint("place-after-file", index);
@@ -353,6 +410,41 @@ mod tests {
         );
         assert!(!first.exists(), "nothing is placed when one file diverges");
         assert_eq!(fs::read(&last).unwrap(), b"mine\n");
+    }
+
+    /// A harness that starts after the running-harness guard and appends
+    /// a turn once restore has checked the transcript must not have that
+    /// turn replaced by the staged copy.
+    #[test]
+    fn a_destination_written_after_it_was_planned_is_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("t.jsonl");
+        let memory = dir.path().join("MEMORY.md");
+        fs::write(&transcript, b"one\n").unwrap();
+        fs::write(&memory, b"old\n").unwrap();
+        let mut rewritable = placement(dir.path(), "m", &memory, b"new\n", Content::Opaque);
+        rewritable.mutability = Mutability::Replaceable;
+        let placements = [
+            placement(dir.path(), "t", &transcript, b"one\ntwo\n", Content::Opaque),
+            rewritable,
+        ];
+        // Asked while the second file is planned, after the first was: the
+        // live turn lands between the transcript's plan and its write.
+        let live_turn = |_: &Path| -> Result<bool, HarnessError> {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .unwrap();
+            file.write_all(b"live\n").unwrap();
+            Ok(true)
+        };
+        let err = place_all(&placements, &live_turn).unwrap_err();
+        assert!(
+            matches!(err, HarnessError::StateChanged { ref path } if path == &transcript),
+            "{err}"
+        );
+        assert_eq!(fs::read(&transcript).unwrap(), b"one\nlive\n");
+        assert_eq!(fs::read(&memory).unwrap(), b"old\n");
     }
 
     #[test]
