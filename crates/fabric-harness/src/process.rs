@@ -50,7 +50,7 @@ const PGREP: &[&str] = &["/usr/bin/pgrep", "/bin/pgrep"];
 /// Where macOS and Linux keep `kill`.
 const KILL: &[&str] = &["/bin/kill", "/usr/bin/kill"];
 /// Where macOS and Linux keep `lsof`.
-const LSOF: &[&str] = &["/usr/sbin/lsof", "/usr/bin/lsof", "/sbin/lsof", "/bin/lsof"];
+pub(crate) const LSOF: &[&str] = &["/usr/sbin/lsof", "/usr/bin/lsof", "/sbin/lsof", "/bin/lsof"];
 /// The `pgrep` flag that keeps the caller's ancestors in the answer.
 #[cfg(target_os = "macos")]
 const PGREP_WITH_ANCESTORS: &[&str] = &["-a"];
@@ -59,7 +59,7 @@ const PGREP_WITH_ANCESTORS: &[&str] = &["-a"];
 const PGREP_WITH_ANCESTORS: &[&str] = &[];
 
 /// The first of `candidates` that is an executable file.
-fn system_tool(
+pub(crate) fn system_tool(
     program: &'static str,
     candidates: &'static [&'static str],
 ) -> Result<&'static Path, HarnessError> {

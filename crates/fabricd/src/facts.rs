@@ -34,6 +34,9 @@ pub mod name {
     pub const HOME: &str = "home";
     /// `git --version`, found on the daemon's own `PATH`, where restore runs it.
     pub const GIT: &str = "git.version";
+    /// Where Codex capture and restore find `lsof`, which they ask whether
+    /// a Codex process holds a thread's rollout open.
+    pub const LSOF: &str = "lsof";
     /// The operating system, as Rust names it.
     pub const OS: &str = "os";
     /// The CPU architecture, as Rust names it.
@@ -110,8 +113,9 @@ impl NodeFacts {
         )
     }
 
-    /// Measures this node, looking programs up on `path_var`, and git on
-    /// this process's own `PATH`, where restore runs it.
+    /// Measures this node, looking programs up on `path_var`, git on this
+    /// process's own `PATH`, where restore runs it, and `lsof` where Codex
+    /// capture looks for it.
     pub async fn measure(home: &Path, path_var: &OsString, cargo_home: Option<PathBuf>) -> Self {
         let own_path = std::env::var_os("PATH").unwrap_or_default();
         let (mut facts, git) = tokio::join!(
@@ -120,6 +124,11 @@ impl NodeFacts {
         );
         if let Some(git) = git {
             facts.0.insert(name::GIT.to_owned(), git);
+        }
+        if let Some(lsof) = fabric_harness::codex::Codex::lsof() {
+            facts
+                .0
+                .insert(name::LSOF.to_owned(), lsof.display().to_string());
         }
         facts
     }

@@ -159,6 +159,7 @@ pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row
         rows.push(row);
     }
     rows.push(git_row(here, peer, ctx));
+    rows.push(lsof_row(here, peer, ctx));
     rows.push(row(
         name::OS,
         here,
@@ -365,6 +366,35 @@ fn git_row(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Row {
     }
 }
 
+/// Every suspend or move of a Codex job asks `lsof` whether a Codex
+/// process holds the thread's rollout open, and fails on a node that has
+/// none, so a Codex job moves only to a node where it is found.
+fn lsof_row(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Row {
+    let target = match ctx.target {
+        Target::Peer => peer,
+        Target::Here => here,
+    };
+    let missing = target.get(name::LSOF).is_none();
+    let (outcome, note) = match (missing, ctx.harness) {
+        (true, Some(HarnessKind::Codex)) => (
+            Outcome::Refuse(Waiver::Never),
+            "the target has no lsof, which every suspend or move of a Codex job runs, so the job could leave it only by a steal",
+        ),
+        (true, None) => (
+            Outcome::Warn,
+            "the target has no lsof, so a Codex job could not be suspended or moved there",
+        ),
+        (false, _) | (true, Some(_)) => (Outcome::Equal, ""),
+    };
+    Row {
+        fact: name::LSOF,
+        here: value(here, name::LSOF),
+        peer: value(peer, name::LSOF),
+        outcome,
+        note: note.to_owned(),
+    }
+}
+
 fn synced_row(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Row {
     let target = match ctx.target {
         Target::Peer => peer,
@@ -436,6 +466,7 @@ mod tests {
             (name::USER, "me"),
             (name::HOME, "/Users/me"),
             (name::GIT, "git version 2.54.0"),
+            (name::LSOF, "/usr/sbin/lsof"),
             (name::OS, "macos"),
             (name::ARCH, "aarch64"),
             (name::PNPM, "11.23.0"),
@@ -653,6 +684,34 @@ mod tests {
                 );
                 assert!(!blocking(&rows, true).is_empty(), "{fact}");
             }
+        }
+    }
+
+    /// Every suspend or move of a Codex job asks `lsof` whether Codex holds
+    /// the thread's rollout open, and fails on a node that has none. So a
+    /// Codex job is refused a target without it, with no waiver: it could
+    /// leave that node only by a steal.
+    #[test]
+    fn a_target_without_lsof_is_refused_a_codex_job() {
+        let codex = HarnessKind::Codex;
+        let claude = HarnessKind::ClaudeCode;
+        let without = with(&pro(), &[(name::LSOF, None)]);
+        let mut pull = ctx(Some(&codex));
+        pull.target = Target::Here;
+        for (here, peer, context, refused) in [
+            (&pro(), &without, ctx(Some(&codex)), true),
+            (&without, &pro(), pull.clone(), true),
+            (&without, &pro(), ctx(Some(&codex)), false),
+            (&pro(), &without, ctx(Some(&claude)), false),
+        ] {
+            let rows = compare(here, peer, &context);
+            assert_eq!(
+                outcome_of(&rows, name::LSOF) == Outcome::Refuse(Waiver::Never),
+                refused,
+                "{:?} {:?}",
+                context.target,
+                context.harness
+            );
         }
     }
 

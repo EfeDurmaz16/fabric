@@ -415,6 +415,14 @@ impl Codex {
         Ok(all)
     }
 
+    /// Where this node's `lsof` is, or `None` when it has none. Capture
+    /// and restore ask it whether a Codex process holds a thread's rollout
+    /// open, so without it every capture of a thread fails.
+    #[must_use]
+    pub fn lsof() -> Option<&'static Path> {
+        process::system_tool("lsof", process::LSOF).ok()
+    }
+
     /// The newest thread whose rollout records the workspace as its `cwd`.
     pub fn latest_session(&self, workspace: &Path) -> Result<Option<SessionId>, HarnessError> {
         let root = pipeline::physical_workspace(workspace)?;
