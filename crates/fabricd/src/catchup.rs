@@ -210,10 +210,21 @@ impl Node {
     /// Before a launch: asks each reachable peer, within `CHECK_DEADLINE`,
     /// for the records it holds after this node's head, so a node that
     /// stayed up through a steal or a move learns it before it runs the job.
-    /// A peer that does not answer in time is named and skipped.
+    /// A peer that does not answer in time is named and skipped, and so is
+    /// one this node cannot ask at all: paired with no address and with no
+    /// session open, it may have stolen the job while this node was away.
     pub(crate) async fn check_peers(self: &Arc<Self>, id: JobId, out: &mut Out) {
+        let reachable = self.reachable_peers();
+        for entry in self.peers.snapshot().iter() {
+            if !reachable.contains(&entry.node()) {
+                out.say(format!(
+                    "{} has no address here and no session open with this node, so a move or a steal there is not known here",
+                    entry.node()
+                ));
+            }
+        }
         let mut tasks = tokio::task::JoinSet::new();
-        for peer in self.reachable_peers() {
+        for peer in reachable {
             let node = Arc::clone(self);
             tasks.spawn(async move {
                 let pulled =
@@ -369,6 +380,29 @@ mod tests {
     use crate::node::Out;
     use crate::ops::tests::{job, node, paired};
     use crate::transfer::is_complete;
+
+    /// A peer paired with no address, and with no session open, cannot be
+    /// asked before a launch whether it stole the job while this node was
+    /// away. The launch goes ahead on this node's ledger (ADR 0016), and the
+    /// check must say which peer it could not ask, as it does for one that
+    /// does not answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_check_names_a_peer_it_cannot_ask() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        a.peers.update(|book| book.pair(b.id, None)).unwrap();
+        let id = job(dir_a.path(), &a).await;
+        let mut out = Out::default();
+        a.check_peers(id, &mut out).await;
+        let peer = b.id.to_string();
+        assert!(
+            out.lines
+                .iter()
+                .any(|line| line.starts_with(&peer) && line.contains("no address")),
+            "{:?}",
+            out.lines
+        );
+    }
 
     /// A replica that learned a suspend by a pull, with no push and so no
     /// fetch, must fetch the snapshot at its next catch-up: the pull then
