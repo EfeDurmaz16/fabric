@@ -162,6 +162,11 @@ fn row(
     }
 }
 
+/// What the os and arch rows say: a path something on the target can
+/// make again does not cross a platform, and a path nothing can make
+/// again does, since leaving it out would lose it (`crate::carry`).
+const PLATFORM_NOTE: &str = "only a path nothing on the target can make again crosses; the carry lines say what happens to each path, ADR 0012";
+
 /// Compares this node's facts with a peer's, row by row (ADR 0008, the table).
 #[must_use]
 pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row> {
@@ -184,20 +189,8 @@ pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row
     }
     rows.push(git_row(here, peer, ctx));
     rows.push(lsof_row(here, peer, ctx));
-    rows.push(row(
-        name::OS,
-        here,
-        peer,
-        Outcome::Warn,
-        "no cache is carried across operating systems",
-    ));
-    rows.push(row(
-        name::ARCH,
-        here,
-        peer,
-        Outcome::Warn,
-        "no cache is carried across architectures",
-    ));
+    rows.push(row(name::OS, here, peer, Outcome::Warn, PLATFORM_NOTE));
+    rows.push(row(name::ARCH, here, peer, Outcome::Warn, PLATFORM_NOTE));
     for fact in [name::PNPM, name::PNPM_STORE] {
         rows.push(row(
             fact,
@@ -901,6 +894,36 @@ mod tests {
                 refused,
                 "{:?}",
                 context.target
+            );
+        }
+    }
+
+    /// The os and arch rows used to say no cache crosses, while the carry
+    /// decision carries a tree nothing on the target can make again to
+    /// any platform. The rows now say what the decision does.
+    #[test]
+    fn the_os_and_arch_rows_say_what_the_carry_decision_does() {
+        use crate::carry::{CarryDecision, decide};
+        use fabric_core::snapshot::{CacheClass, CacheEntry, CarryKey, CarryState, Remake};
+        let tree = CacheEntry {
+            path: fabric_core::path::RelPath::parse("node_modules").unwrap(),
+            class: CacheClass::Deps,
+            carry: CarryState::Carried,
+            key: CarryKey::Unmeasured,
+            remake: Remake::Nothing,
+            native_files: 0,
+        };
+        for (fact, change) in [(name::OS, "linux"), (name::ARCH, "x86_64")] {
+            let peer = with(&pro(), &[(fact, Some(change))]);
+            let rows = compare(&pro(), &peer, &ctx(None));
+            let row = rows.iter().find(|r| r.fact == fact).unwrap();
+            assert_eq!(row.note, PLATFORM_NOTE, "{fact}");
+            assert!(
+                matches!(
+                    decide(&tree, &pro().platform(), &peer),
+                    CarryDecision::Carry { .. }
+                ),
+                "{fact}"
             );
         }
     }
