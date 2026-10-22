@@ -884,6 +884,18 @@ impl Node {
             .iter()
             .map(|pattern| pattern.as_str().to_owned())
             .collect();
+        // A cache the job declares has a name no built-in rule knows, so
+        // the policy is told its path: the snapshot records it with its
+        // carry key, and a target whose key differs rebuilds it.
+        let declared: Vec<(
+            fabric_core::snapshot::CacheClass,
+            fabric_core::path::RelPath,
+        )> = detection
+            .caches()
+            .iter()
+            .filter(|cache| cache.origin == fabric_env::detect::CacheOrigin::Declared)
+            .map(|cache| (cache.class, cache.path.clone()))
+            .collect();
         let root = root.to_owned();
         let job_id = job.id();
         let me = self.id;
@@ -895,6 +907,9 @@ impl Node {
             // built-in list; nothing narrows it (ADR 0004).
             for pattern in &secret_patterns {
                 policy.add_secret_pattern(pattern)?;
+            }
+            for (class, path) in &declared {
+                policy.add_declared_cache(*class, path);
             }
             let captured = capture(
                 store,
@@ -3356,6 +3371,34 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&session_file).unwrap();
         let kept = job.session().unwrap().map(|record| record.session);
         assert_eq!(kept, Some(session));
+    }
+
+    /// A cache `.fabric/env.toml` declares, with a name no built-in rule
+    /// knows, must reach the snapshot as a cache with its carry key. As
+    /// the user's own files it would be written on every target, platform
+    /// or not, sentinel included, and the setup step that rebuilds it
+    /// would never run there.
+    #[tokio::test]
+    async fn a_suspend_records_a_declared_cache_as_a_cache() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(
+            root.join(".fabric/env.toml"),
+            "[[cache]]\npath = \".output\"\nclass = \"build\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join(".gitignore"), ".output/\n").unwrap();
+        std::fs::create_dir_all(root.join(".output/server")).unwrap();
+        std::fs::write(root.join(".output/server/index.mjs"), "export {}\n").unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let snapshot = node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let manifest = with_store(&node.store, move |store| Ok(store.manifest(snapshot)?))
+            .await
+            .unwrap();
+        let caches: Vec<&str> = manifest.caches.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(caches, [".output"], "{manifest:?}");
     }
 
     /// A suspend must not publish a snapshot whose `.fabric/env.toml`
