@@ -1413,14 +1413,35 @@ fn restore_state_tells_absent_from_half_restored_and_present() {
     assert_eq!(restore_state(&target).unwrap(), RestoreState::Absent);
     fs::create_dir(&target).unwrap();
     assert_eq!(restore_state(&target).unwrap(), RestoreState::Absent);
-    fs::create_dir(dir.path().join("t.fabric-restoring")).unwrap();
+    fs::create_dir_all(dir.path().join("t.fabric-restoring/tree")).unwrap();
     assert!(matches!(
         restore_state(&target).unwrap(),
         RestoreState::HalfRestored { .. }
     ));
-    fs::remove_dir(dir.path().join("t.fabric-restoring")).unwrap();
+    fs::remove_dir_all(dir.path().join("t.fabric-restoring")).unwrap();
     fs::write(target.join("x"), "x").unwrap();
     assert_eq!(restore_state(&target).unwrap(), RestoreState::Present);
+}
+
+/// A directory that happens to carry the staging name is refused, not deleted.
+#[test]
+fn a_staging_directory_restore_did_not_make_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, snapshot) = plain_snapshot(dir.path()).unwrap();
+    let target = dir.path().join("t");
+    let foreign = dir.path().join("t.fabric-restoring");
+    fs::create_dir(&foreign).unwrap();
+    fs::write(foreign.join("mine.txt"), "not a restore's\n").unwrap();
+    let err = restore_into(&store, snapshot, &target).unwrap_err();
+    assert!(
+        matches!(&err, RestoreError::ForeignStaging { path } if *path == foreign),
+        "{err}"
+    );
+    assert_eq!(
+        fs::read_to_string(foreign.join("mine.txt")).unwrap(),
+        "not a restore's\n"
+    );
+    assert!(!target.exists());
 }
 
 /// The child half: runs with `XDG_CONFIG_HOME` pointing at a git ignore file of its own.

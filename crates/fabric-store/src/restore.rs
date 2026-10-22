@@ -5,7 +5,10 @@
 //! verified. Nothing is written through a symlink or outside the staging
 //! directory, an existing target with content is never touched, and a crash
 //! leaves either no target or a complete one: a staging directory that
-//! outlives its process is the sign of a restore that did not finish.
+//! outlives its process is the sign of a restore that did not finish. A
+//! staging directory is removed only when it holds the owner file restore
+//! writes into it first; a directory of that name that restore did not
+//! make is refused, never deleted.
 
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
@@ -31,6 +34,15 @@ use crate::writer::{TreeWriter, WriteError};
 
 /// The suffix of the staging directory a restore writes into.
 pub const STAGING_SUFFIX: &str = ".fabric-restoring";
+
+/// The file a restore writes first into its staging directory, which proves the directory is its own.
+const STAGING_OWNER: &str = "fabric-staging";
+
+/// What the owner file holds.
+const STAGING_MAGIC: &[u8] = b"fabric restore staging, v1\n";
+
+/// The directory inside the staging directory that is renamed onto the target.
+const STAGING_TREE: &str = "tree";
 
 /// How much of the written tree is re-read against the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +140,12 @@ pub enum RestoreError {
         /// The path given.
         path: PathBuf,
     },
+    /// A directory with the staging name exists that no restore made; it is left alone.
+    #[error("{path} exists and was not made by a restore; move it away and retry")]
+    ForeignStaging {
+        /// The directory.
+        path: PathBuf,
+    },
     /// The target and the harness state directory lie one inside the other.
     #[error("{harness_state} and {target} lie one inside the other")]
     NestedDirectories {
@@ -221,10 +239,74 @@ fn staging_path(target: &Path) -> Result<PathBuf, RestoreError> {
     Ok(parent.join(format!("{name}{STAGING_SUFFIX}")))
 }
 
+/// Reads at most one byte more than the owner file holds, or `None` when `staging` has no owner file.
+fn owner_bytes(staging: &Path) -> Result<Option<Vec<u8>>, RestoreError> {
+    use rustix::fs::{Mode as RawBits, OFlags};
+    let path = staging.join(STAGING_OWNER);
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let file = match rustix::fs::open(&path, flags, RawBits::empty()) {
+        Ok(fd) => fs::File::from(fd),
+        // Absent, or a link in its place, which is not the owner file.
+        Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => {
+            return Ok(None);
+        }
+        Err(e) => return Err(io_err(&path, e.into())),
+    };
+    // Nor is a FIFO or a directory.
+    if !file.metadata().map_err(|e| io_err(&path, e))?.is_file() {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    file.take(STAGING_MAGIC.len() as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| io_err(&path, e))?;
+    Ok(Some(bytes))
+}
+
+/// What a directory at the staging path is, as far as restore can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Staging {
+    /// Not a directory a restore made: no owner file, and not empty.
+    Foreign,
+    /// A restore's: empty, as a kill right after its creation leaves it, or
+    /// holding the owner file, whole or cut short while it was written.
+    Ours {
+        /// True while it holds the tree, which is renamed onto the target last.
+        tree: bool,
+    },
+}
+
+/// Tells a staging directory a restore made from any other directory of that name.
+fn staging_kind(staging: &Path) -> Result<Staging, RestoreError> {
+    match fs::symlink_metadata(staging) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Ok(Staging::Foreign),
+        Err(e) => return Err(io_err(staging, e)),
+    }
+    let mut names = Vec::new();
+    for entry in fs::read_dir(staging).map_err(|e| io_err(staging, e))? {
+        names.push(entry.map_err(|e| io_err(staging, e))?.file_name());
+    }
+    let owned = names.is_empty()
+        || owner_bytes(staging)?.is_some_and(|bytes| STAGING_MAGIC.starts_with(&bytes));
+    Ok(if owned {
+        Staging::Ours {
+            tree: names.iter().any(|name| name == STAGING_TREE),
+        }
+    } else {
+        Staging::Foreign
+    })
+}
+
 /// Says whether `target` is absent, half restored or present.
+///
+/// A staging directory of a restore that holds no tree, because the tree
+/// was already renamed onto the target or never made, does not count; the
+/// target says what is there.
 pub fn restore_state(target: &Path) -> Result<RestoreState, RestoreError> {
     if let Ok(staging) = staging_path(target)
-        && staging.exists()
+        && fs::symlink_metadata(&staging).is_ok()
+        && staging_kind(&staging)? != (Staging::Ours { tree: false })
     {
         return Ok(RestoreState::HalfRestored { staging });
     }
@@ -321,26 +403,60 @@ fn refuse_nested(target: &Path, harness_state: &Path) -> Result<(), RestoreError
     Ok(())
 }
 
-/// Makes a fresh staging directory for `target`, removing a stale one.
-fn fresh_staging(target: &Path) -> Result<PathBuf, RestoreError> {
+/// Makes a fresh staging directory for `target`, removing a stale one a restore made, and returns the tree inside it.
+///
+/// The owner file is written, and under `PowerLoss` flushed, before the
+/// tree exists, so a staging directory that holds anything restore wrote
+/// also holds the proof that restore made it. A directory of the staging
+/// name without that proof is `ForeignStaging`.
+fn fresh_staging(target: &Path, durability: Durability) -> Result<PathBuf, RestoreError> {
     let staging = staging_path(target)?;
-    if fs::symlink_metadata(&staging).is_ok_and(|meta| meta.is_dir()) {
-        open_up(&staging)?;
-    }
-    match fs::remove_dir_all(&staging) {
-        Ok(()) => tracing::info!(path = %staging.display(), "removed a half-finished restore"),
+    match fs::symlink_metadata(&staging) {
+        Ok(_) => {
+            if staging_kind(&staging)? == Staging::Foreign {
+                return Err(RestoreError::ForeignStaging { path: staging });
+            }
+            open_up(&staging)?;
+            fs::remove_dir_all(&staging).map_err(|e| io_err(&staging, e))?;
+            tracing::info!(path = %staging.display(), "removed a half-finished restore");
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(io_err(&staging, e)),
     }
     fs::create_dir(&staging).map_err(|e| io_err(&staging, e))?;
-    Ok(staging)
+    let owner = staging.join(STAGING_OWNER);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&owner)
+        .map_err(|e| io_err(&owner, e))?;
+    file.write_all(STAGING_MAGIC)
+        .map_err(|e| io_err(&owner, e))?;
+    if durability == Durability::PowerLoss {
+        rustix::fs::fsync(&file).map_err(|e| io_err(&owner, e.into()))?;
+        rustix::fs::fsync(fs::File::open(&staging).map_err(|e| io_err(&staging, e))?)
+            .map_err(|e| io_err(&staging, e.into()))?;
+    }
+    let tree = staging.join(STAGING_TREE);
+    fs::create_dir(&tree).map_err(|e| io_err(&tree, e))?;
+    Ok(tree)
 }
 
-/// Renames the staging directory onto the target and flushes the parent.
-fn move_into_place(staging: &Path, target: &Path) -> Result<(), RestoreError> {
-    fs::rename(staging, target).map_err(|e| io_err(target, e))?;
+/// Renames the staging tree onto the target, flushes the parent, then removes the emptied staging directory.
+fn move_into_place(tree: &Path, target: &Path) -> Result<(), RestoreError> {
+    fs::rename(tree, target).map_err(|e| io_err(target, e))?;
     if let Some(parent) = target.parent() {
         durable::fsync_dir(parent).map_err(|e| io_err(parent, e))?;
+    }
+    // The tree is in place, so the restore has succeeded; a staging
+    // directory a kill leaves here holds the owner file or nothing, and
+    // `restore_state` and the next `fresh_staging` both know it for what it is.
+    if let Some(staging) = tree.parent() {
+        let removed =
+            fs::remove_file(staging.join(STAGING_OWNER)).and_then(|()| fs::remove_dir(staging));
+        if let Err(e) = removed {
+            tracing::warn!(path = %staging.display(), error = %e, "could not remove a finished staging directory");
+        }
     }
     Ok(())
 }
@@ -1110,7 +1226,7 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
         Some(dir) => harness_state_complete(store, &manifest.harness_state.entries, dir)?,
         None => None,
     };
-    let staging = fresh_staging(req.target)?;
+    let staging = fresh_staging(req.target, req.durability)?;
     let writer = TreeWriter::open(&staging)?;
     let mut report = RestoreReport::default();
 
@@ -1157,7 +1273,7 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
             report.verified += verified;
         }
         (Some(dir), None) => {
-            let hs_staging = fresh_staging(dir)?;
+            let hs_staging = fresh_staging(dir, req.durability)?;
             let hs_writer = TreeWriter::open(&hs_staging)?;
             let keep_all = |_: &RelPath| false;
             write_entries(
