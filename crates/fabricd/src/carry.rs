@@ -270,8 +270,9 @@ fn cannot_run(steps: &[SetupStep], key: &CarryKey, target: &NodeFacts) -> Option
 /// snapshot captured on `source` (ADR 0012, as amended 2026-10-21).
 ///
 /// - Nothing makes the path again (a dependency tree with no lockfile, a
-///   declared cache no step fills): carry, whatever the versions, with a
-///   warning when native addons inside were built for another ABI.
+///   declared cache no step fills): carry, whatever the versions and the
+///   platform, with a warning when native addons inside were built for
+///   another ABI, or when it may hold binaries for another platform.
 /// - Setup steps make it from a lockfile: carry when the keys match; else
 ///   rebuild when the target can run those steps as the source would; else
 ///   carry when the platform matches and nothing inside is native; else
@@ -290,6 +291,18 @@ pub fn decide(entry: &CacheEntry, source: &Platform, target: &NodeFacts) -> Carr
     match &entry.remake {
         Remake::Nothing => {
             let mut warnings = seen.warnings;
+            // A tree keyed on the addon ABI with no addon inside is plain
+            // JavaScript, which runs anywhere; anything else made for one
+            // platform may hold binaries for it.
+            let plain_js = entry.native_files == 0
+                && matches!(&entry.key, CarryKey::Other { tool, .. } if tool == NODE_ABI_TOOL);
+            if !seen.same_platform && seen.native.is_none() && !plain_js {
+                warnings.push(format!(
+                    "it was made for {}, and the target is {}; anything built for that platform inside may not run there",
+                    platform_name(source),
+                    platform_name(&seen.target_platform)
+                ));
+            }
             if let CarryKey::Python { .. } = entry.key
                 && !entry.key.matches(&seen.theirs)
             {
@@ -645,6 +658,52 @@ mod tests {
         let decision = decide(&hand_made_tree(), &macos(), &linux());
         assert!(decision.writes(), "{decision:?}");
         assert!(!decision.refuses());
+    }
+
+    /// A venv nothing can make again still crosses, since leaving it out
+    /// would lose it, but its interpreter link and compiled modules are
+    /// for the source's platform, so the line says so even where the
+    /// interpreter keys match. A tree of plain JavaScript needs no warning.
+    #[test]
+    fn a_path_nothing_remakes_says_when_it_crosses_a_platform() {
+        let target = NodeFacts::from_pairs([
+            (name::OS, "linux"),
+            (name::ARCH, "aarch64"),
+            (name::PYTHON, "Python 3.12.1"),
+            (name::PYTHON_HOME, "/opt/py312"),
+        ]);
+        let venv = entry(
+            ".venv",
+            CacheClass::Deps,
+            CarryKey::Python {
+                python_version: "Python 3.12.1".to_owned(),
+                python_home: fabric_core::path::AbsPath::parse("/opt/py312").unwrap(),
+            },
+            Remake::Nothing,
+        );
+        let decision = decide(&venv, &macos(), &target);
+        let CarryDecision::Carry { warnings, .. } = &decision else {
+            panic!("{decision:?}");
+        };
+        assert_eq!(
+            warnings,
+            &[
+                "it was made for macos-aarch64, and the target is linux-aarch64; anything built for that platform inside may not run there"
+            ]
+        );
+        let same = NodeFacts::from_pairs([
+            (name::OS, "macos"),
+            (name::ARCH, "aarch64"),
+            (name::PYTHON, "Python 3.12.1"),
+            (name::PYTHON_HOME, "/opt/py312"),
+        ]);
+        assert!(
+            matches!(decide(&venv, &macos(), &same), CarryDecision::Carry { warnings, .. } if warnings.is_empty())
+        );
+        assert!(matches!(
+            decide(&hand_made_tree(), &macos(), &linux()),
+            CarryDecision::Carry { warnings, .. } if warnings.is_empty()
+        ));
     }
 
     #[test]
