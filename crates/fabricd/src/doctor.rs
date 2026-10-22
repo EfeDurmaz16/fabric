@@ -433,20 +433,17 @@ mod tests {
 
     fn pro() -> NodeFacts {
         NodeFacts::from_pairs([
-            (name::USER, "efebarandurmaz"),
-            (name::HOME, "/Users/efebarandurmaz"),
+            (name::USER, "me"),
+            (name::HOME, "/Users/me"),
             (name::GIT, "git version 2.54.0"),
             (name::OS, "macos"),
             (name::ARCH, "aarch64"),
             (name::PNPM, "11.23.0"),
-            (
-                name::PNPM_STORE,
-                "/Users/efebarandurmaz/Library/pnpm/store/v11",
-            ),
+            (name::PNPM_STORE, "/Users/me/Library/pnpm/store/v11"),
             (name::NODE, "v22.23.2"),
             (name::NODE_ABI, "127"),
             (name::RUSTC, "rustc 1.97.1"),
-            (name::CARGO_HOME, "/Users/efebarandurmaz/.cargo"),
+            (name::CARGO_HOME, "/Users/me/.cargo"),
             (name::MACOS, "26.6.2"),
             (name::MACOS_SDK, "27.0"),
             (name::CLAUDE, "2.1.294 (Claude Code)"),
@@ -616,7 +613,7 @@ mod tests {
     #[test]
     fn a_root_in_a_folder_the_target_syncs_is_refused() {
         let peer = with(&pro(), &[(name::ICLOUD_DESKTOP, Some("1"))]);
-        let root = Path::new("/Users/efebarandurmaz/Desktop/job");
+        let root = Path::new("/Users/me/Desktop/job");
         let mut context = ctx(None);
         context.root = Some(root);
         assert_eq!(
