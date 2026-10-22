@@ -661,11 +661,26 @@ struct EmptyDirs {
 /// cannot be opened for lack of permission, as a container's volume owned
 /// by another user, is listed in `unreadable` and not walked: git's own
 /// listings skip it with a warning, so nothing under it travels either way.
+/// An entry removed after its directory was listed, as a watcher's
+/// temporary file under an excluded `tmp/`, is skipped: nothing of it is
+/// left to carry, and the walk covers paths the snapshot never carries.
 fn empty_dirs(root: &Path, skip: &dyn Fn(&RelPath) -> bool) -> Result<EmptyDirs, CaptureError> {
+    empty_dirs_with(root, skip, &|path| fs::symlink_metadata(path))
+}
+
+/// The lstat `empty_dirs_with` calls on each entry.
+type Lstat<'a> = dyn Fn(&Path) -> io::Result<fs::Metadata> + 'a;
+
+/// `empty_dirs` with the lstat it calls on each entry, so a test can remove one in between.
+fn empty_dirs_with(
+    root: &Path,
+    skip: &dyn Fn(&RelPath) -> bool,
+    lstat: &Lstat<'_>,
+) -> Result<EmptyDirs, CaptureError> {
     fn walk(
         root: &Path,
         prefix: &str,
-        skip: &dyn Fn(&RelPath) -> bool,
+        (skip, lstat): (&dyn Fn(&RelPath) -> bool, &Lstat<'_>),
         out: &mut EmptyDirs,
     ) -> Result<(), CaptureError> {
         let dir = root.join(prefix);
@@ -675,6 +690,7 @@ fn empty_dirs(root: &Path, skip: &dyn Fn(&RelPath) -> bool) -> Result<EmptyDirs,
                 out.unreadable.push(rel_path(prefix)?);
                 return Ok(());
             }
+            Err(e) if e.kind() == io::ErrorKind::NotFound && !prefix.is_empty() => return Ok(()),
             Err(e) => return Err(io_err(&dir, e)),
         };
         let mut names: Vec<_> = entries
@@ -689,12 +705,15 @@ fn empty_dirs(root: &Path, skip: &dyn Fn(&RelPath) -> bool) -> Result<EmptyDirs,
         if !prefix.is_empty() && names.is_empty() {
             let rel = rel_path(prefix)?;
             if !skip(&rel) {
-                let meta = fs::symlink_metadata(&dir).map_err(|e| io_err(&dir, e))?;
-                out.found.push(Found {
-                    rel,
-                    kind: FoundKind::Dir,
-                    meta,
-                });
+                match lstat(&dir) {
+                    Ok(meta) => out.found.push(Found {
+                        rel,
+                        kind: FoundKind::Dir,
+                        meta,
+                    }),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(io_err(&dir, e)),
+                }
             }
             return Ok(());
         }
@@ -710,15 +729,19 @@ fn empty_dirs(root: &Path, skip: &dyn Fn(&RelPath) -> bool) -> Result<EmptyDirs,
                 format!("{prefix}/{name}")
             };
             let full = root.join(&text);
-            let meta = fs::symlink_metadata(&full).map_err(|e| io_err(&full, e))?;
+            let meta = match lstat(&full) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(io_err(&full, e)),
+            };
             if meta.is_dir() {
-                walk(root, &text, skip, out)?;
+                walk(root, &text, (skip, lstat), out)?;
             }
         }
         Ok(())
     }
     let mut out = EmptyDirs::default();
-    walk(root, "", skip, &mut out)?;
+    walk(root, "", (skip, lstat), &mut out)?;
     Ok(out)
 }
 
@@ -2675,6 +2698,42 @@ mod tests {
         assert!(symlink_escapes(&rel("d/a"), "../../x"));
         assert!(!symlink_escapes(&rel("d/a"), "b/../c"));
         assert!(!symlink_escapes(&rel("a"), "./b"));
+    }
+
+    /// An entry removed after its directory was listed, as a watcher's
+    /// temporary file or directory under an excluded `tmp/`, is skipped:
+    /// nothing of it is left to carry, and failing the walk would fail
+    /// every capture while the watcher runs.
+    #[test]
+    fn an_entry_that_vanishes_during_the_empty_directory_walk_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("tmp/gone-dir/inner")).unwrap();
+        fs::create_dir_all(root.join("tmp/gone-empty")).unwrap();
+        fs::write(root.join("tmp/gone.txt"), "x").unwrap();
+        fs::create_dir(root.join("empty")).unwrap();
+        // An lstat of a doomed entry is where a watcher removes it: the
+        // file before its lstat, the full directory right after, and the
+        // empty one between its listing and the lstat that records it.
+        let empty_seen = std::cell::Cell::new(false);
+        let lstat = |path: &Path| {
+            if path.ends_with("tmp/gone.txt")
+                || path.ends_with("tmp/gone-empty") && empty_seen.get()
+            {
+                fs::remove_dir(path)
+                    .or_else(|_| fs::remove_file(path))
+                    .unwrap();
+            }
+            empty_seen.set(empty_seen.get() || path.ends_with("tmp/gone-empty"));
+            let meta = fs::symlink_metadata(path);
+            if path.ends_with("tmp/gone-dir") {
+                fs::remove_dir_all(path).unwrap();
+            }
+            meta
+        };
+        let found = empty_dirs_with(root, &|_| false, &lstat).unwrap();
+        let found: Vec<&str> = found.found.iter().map(|item| item.rel.as_str()).collect();
+        assert_eq!(found, ["empty"]);
     }
 
     #[test]
