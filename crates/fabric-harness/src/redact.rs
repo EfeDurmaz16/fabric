@@ -351,7 +351,7 @@ mod tests {
     fn ordinary_words_and_paths_are_not_secrets() {
         let r = Redactor::standard().unwrap();
         for text in [
-            "/Users/efe/oss/disk-usage-analyzer-service/src/main.rs",
+            "/Users/me/oss/disk-usage-analyzer-service/src/main.rs",
             "task-list-item-checkbox-wrapper-component-with-a-long-name",
             "risk-assessment-framework-v2-with-many-more-words-after-it",
             "flask-authentication-demo-app-and-another-long-suffix-here",
