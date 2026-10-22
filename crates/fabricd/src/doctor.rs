@@ -126,9 +126,12 @@ pub struct Context<'a> {
     /// The wire the session runs on, and how QUIC failed if it fell back.
     pub wire: Option<String>,
     /// The newest version of the job's harness known to have written its
-    /// session (`SessionRecord::known_writer`), when this node holds the
-    /// job's session record. The resume guard refuses a harness older
-    /// than it, and a capture on the source records at least it.
+    /// session (`SessionRecord::known_writer`), as the job's owner records
+    /// it: this node's record when it owns the job, else the owner's,
+    /// asked over the wire, since a node the job left keeps the record of
+    /// its own tenure and one that never ran it holds none. The resume
+    /// guard refuses a harness older than it, and a capture on the source
+    /// records at least it.
     pub floor: Option<&'a HarnessVersion>,
 }
 

@@ -284,9 +284,12 @@ fn e2e_a_codex_the_workspace_pinned_is_remembered_after_it_ran() -> Fallible {
 /// pin ran the thread with 0.160.0 on the source, whose daemon finds
 /// 0.155.1, so a target on 0.158.0, newer than the source's, is named as
 /// older than 0.160.0, which its resume guard would refuse (gate finding
-/// F10b).
+/// F10b). The known writer is the owner's, so the same holds for
+/// `fabric doctor --peer --job` on the owner, for a pull typed on the
+/// target, which holds no session record of the job, and for the doctor
+/// on that node, which judges the owner as the target.
 #[test]
-fn e2e_a_move_names_the_codex_a_pinned_workspace_ran_when_the_target_is_older() -> Fallible {
+fn e2e_the_preflight_names_the_codex_a_pinned_workspace_ran_when_the_target_is_older() -> Fallible {
     let p = crate::setup(Wire::TcpTls, None, None)?;
     p.env.install_fake_codex()?;
     fs::write(p.b.state().join("codex-version"), "0.158.0\n")?;
@@ -294,13 +297,22 @@ fn e2e_a_move_names_the_codex_a_pinned_workspace_ran_when_the_target_is_older() 
     p.a.ok(&["job", "run", &job, "--headless", "--prompt", "one"])?;
     fs::write(p.env.work(&job).join(".tool-versions"), "codex 0.160.0\n")?;
     p.a.ok(&["job", "run", &job, "--headless", "--prompt", "two"])?;
+    let older = "the target's codex is older than codex 0.160.0";
     let refused = p.a.run(&["job", "move", &job, "--to", &p.b.id])?;
     let said = text(&refused);
     assert!(!refused.status.success(), "{said}");
-    assert!(
-        said.contains("the target's codex is older than codex 0.160.0"),
-        "{said}"
-    );
+    assert!(said.contains(older), "{said}");
+
+    let doctor = text(&p.a.run(&["doctor", "--peer", &p.b.id, "--job", &job])?);
+    assert!(doctor.contains(older), "{doctor}");
+
+    let pulled = p.b.run(&["job", "resume", &job, "--on", &p.a.id])?;
+    let said = text(&pulled);
+    assert!(!pulled.status.success(), "{said}");
+    assert!(said.contains(older), "{said}");
+
+    let doctor = text(&p.b.run(&["doctor", "--peer", &p.a.id, "--job", &job])?);
+    assert!(doctor.contains(older), "{doctor}");
     Ok(())
 }
 

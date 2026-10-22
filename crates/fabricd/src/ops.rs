@@ -25,7 +25,8 @@ use fabric_harness::{HarnessError, HarnessVersion, SessionId};
 use fabric_net::peers::HostPort;
 use fabric_net::rpc::Session;
 use fabric_net::wire::{
-    Appended, Fenced, MoveRequested, MoveState, Offered, Pulled, RecordBytes, RecordPage,
+    Appended, Fenced, KnownWriter, MoveRequested, MoveState, Offered, Pulled, RecordBytes,
+    RecordPage,
 };
 use fabric_store::capture::{CaptureRequest, capture};
 use fabric_store::policy::IgnorePolicy;
@@ -1420,12 +1421,19 @@ impl Node {
             if self.job(id).await.is_err() {
                 self.pull_records(id, holder).await?;
             }
-            let (kind, floor) = {
+            let (kind, same) = {
                 let job = self.job(id).await?;
                 let job = job.lock().await;
                 let kind = harness.clone().unwrap_or_else(|| job.harness().clone());
-                let floor = session_floor(&job)?.filter(|_| &kind == job.harness());
-                (kind, floor)
+                let same = &kind == job.harness();
+                (kind, same)
+            };
+            // The known writer is the holder's: a record this node kept
+            // from an earlier tenure may be older than the holder's.
+            let floor = if same {
+                self.owners_floor(id, holder, out).await
+            } else {
+                None
             };
             let root = paths::job_root(&self.cfg.home, id);
             self.preflight(
@@ -2003,16 +2011,27 @@ impl Node {
         };
         let (harness, root, floor) = match job {
             Some(id) => {
-                let job = self.job(id).await?;
-                let job = job.lock().await;
-                let root = job
-                    .marker()?
-                    .map_or_else(|| paths::job_root(&self.cfg.home, id), |m| m.root);
-                (
-                    Some(job.harness().clone()),
-                    Some(root),
-                    session_floor(&job)?,
-                )
+                let (harness, root, owner, kept) = {
+                    let job = self.job(id).await?;
+                    let job = job.lock().await;
+                    let root = job
+                        .marker()?
+                        .map_or_else(|| paths::job_root(&self.cfg.home, id), |m| m.root);
+                    let (owner, kept) = match job.view(self.id) {
+                        LeaseView::Owner(_) | LeaseView::Departing { .. } => {
+                            (None, session_floor(&job)?)
+                        }
+                        LeaseView::Departed { owner, .. } | LeaseView::Replica { owner, .. } => {
+                            (Some(owner), None)
+                        }
+                    };
+                    (job.harness().clone(), root, owner, kept)
+                };
+                let floor = match owner {
+                    Some(owner) => self.owners_floor(id, owner, out).await,
+                    None => kept,
+                };
+                (Some(harness), Some(root), floor)
             }
             None => (None, None, None),
         };
@@ -2034,6 +2053,53 @@ impl Node {
     /// `force` does not waive. A named job brings its harness, the root
     /// the target restores into, and the newest version of its harness
     /// known to have written its session.
+    /// The newest version of the job's harness known to have written its
+    /// session, asked of `owner`, which alone holds a current record of
+    /// it: a node the job left keeps the record of its own tenure, and a
+    /// node that never ran it holds none. An owner that does not answer,
+    /// or answers with no version this node reads, leaves it unknown, and
+    /// the preflight then judges the target against the source alone.
+    async fn owners_floor(
+        self: &Arc<Self>,
+        id: JobId,
+        owner: NodeId,
+        out: &mut Out,
+    ) -> Option<HarnessVersion> {
+        let epoch = match self.job(id).await {
+            Ok(job) => job.lock().await.ledger().lease().epoch(),
+            Err(_) => Epoch::FIRST,
+        };
+        let token = FencingToken { job_id: id, epoch };
+        let asked = self
+            .call(owner, |session| async move {
+                session.known_writer(token, SHORT_DEADLINE).await
+            })
+            .await;
+        let text = match asked {
+            Ok(Fenced::Answer(KnownWriter { version })) => version?,
+            Ok(fenced) => {
+                out.say(format!(
+                    "{owner} did not say the job's known writer: {}",
+                    fenced_words(&fenced)
+                ));
+                return None;
+            }
+            Err(e) => {
+                out.say(format!("{owner} did not say the job's known writer: {e}"));
+                return None;
+            }
+        };
+        match HarnessVersion::parse(text.as_str()) {
+            Ok(version) => Some(version),
+            Err(e) => {
+                out.say(format!(
+                    "{owner} named {text} as the job's known writer, which is not a version: {e}"
+                ));
+                None
+            }
+        }
+    }
+
     async fn preflight(
         self: &Arc<Self>,
         peer: NodeId,
