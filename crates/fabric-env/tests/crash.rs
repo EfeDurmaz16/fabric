@@ -19,9 +19,10 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use fabric_core::path::RelPath;
 use fabric_env::detect::detect;
 use fabric_env::materialize::{
-    CacheHealth, MaterializeError, NodeEnv, Plan, SENTINEL, TreeLock, plan,
+    CacheHealth, MaterializeError, NodeEnv, Plan, SENTINEL, TreeLock, plan, sentinel_text,
 };
 
 const ROOT_VAR: &str = "FABRIC_CRASH_ROOT";
@@ -138,7 +139,6 @@ fn a_resume_killed_during_a_step_removes_the_old_proof() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir(dir.path().join("out")).unwrap();
     fs::write(dir.path().join("out/f"), "x").unwrap();
-    fs::write(dir.path().join("out").join(SENTINEL), "").unwrap();
     declare(
         dir.path(),
         r#"
@@ -153,6 +153,12 @@ when = "always"
 "#,
     )
     .unwrap();
+    let whole = sentinel_text(
+        &detect(dir.path(), &[]).unwrap(),
+        &RelPath::parse("out").unwrap(),
+    )
+    .unwrap();
+    fs::write(dir.path().join("out").join(SENTINEL), whole).unwrap();
     let status = spawn_child(
         "a_resume_killed_during_a_step_removes_the_old_proof",
         dir.path(),

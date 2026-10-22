@@ -24,7 +24,12 @@
 //! writes after the last one exits 0. An installer's own file is never
 //! proof: npm, pnpm and Yarn 1 write theirs before the root package's
 //! lifecycle scripts run, so a `postinstall` that fails or is interrupted
-//! leaves it over a tree that is not whole. A cache no step fills needs
+//! leaves it over a tree that is not whole. The sentinel holds the digest
+//! of the files at the root that the steps read, such as `package.json`
+//! and the lockfile, and proves the cache only while they are unchanged:
+//! a lockfile edited since the install, or a cache carried from before
+//! the edit, is stale and filled again, though the spec, which holds the
+//! commands and not the files, is the same. A cache no step fills needs
 //! only to be non-empty. An install that fails or is killed halfway
 //! leaves no proof, so the next plan fills the cache again. A report with
 //! no cache paths has nothing that proves warmth, so its `CachesMissing`
@@ -100,12 +105,38 @@ use crate::detect::{CachePath, Completion, Detection, StepGate};
 ///
 /// It is removed before the first of those steps starts and written after
 /// the last one succeeds, so a step that fails or is killed leaves the
-/// cache without it and the next plan fills the cache again.
+/// cache without it and the next plan fills the cache again. It holds the
+/// digest of the files the steps read (`sentinel_text`), so a lockfile
+/// changed since leaves the cache stale and the next plan fills it again.
 pub const SENTINEL: &str = ".fabric-installed";
 
-/// What the sentinel file holds; only its presence is read.
-const SENTINEL_TEXT: &[u8] =
-    b"Written by Fabric after the setup steps that fill this cache exited 0.\n";
+/// The first line of the sentinel, for a reader who finds the file.
+const SENTINEL_HEADER: &str =
+    "Written by Fabric after the setup steps that fill this cache exited 0.\n";
+
+/// The most bytes of a sentinel `plan` reads; one Fabric wrote is far shorter.
+const MAX_SENTINEL: u64 = 4 << 10;
+
+/// Returns what the sentinel of the cache at `path` holds once the steps that fill it exit 0, or `None` when no step fills it.
+///
+/// That is a header line and the digest of the files the steps of the
+/// cache's ecosystem read at the root, such as `package.json` and the
+/// lockfile for `node_modules`. A sentinel that holds anything else, one
+/// an older Fabric wrote included, leaves the cache `Stale`.
+pub fn sentinel_text(detected: &Detection, path: &RelPath) -> Option<String> {
+    detected
+        .caches_with_inputs()
+        .find(|(cache, _)| &cache.path == path)
+        .and_then(|(cache, inputs)| match cache.completion {
+            Completion::Sentinel { .. } => Some(sentinel_for(inputs)),
+            Completion::Content => None,
+        })
+}
+
+/// Formats the sentinel for a cache whose inputs have this digest.
+fn sentinel_for(inputs: &blake3::Hash) -> String {
+    format!("{SENTINEL_HEADER}inputs {}\n", inputs.to_hex())
+}
 
 /// The `tracing` target that carries every line a setup step prints.
 pub const SETUP_LOG_TARGET: &str = "fabric_env::setup";
@@ -282,6 +313,8 @@ pub enum CacheHealth {
     Empty,
     /// A directory with content and no `SENTINEL`, so the steps that fill it may not have finished.
     Incomplete,
+    /// A directory whose `SENTINEL` was written for other inputs than the workspace has now, such as a lockfile changed since the install.
+    Stale,
 }
 
 /// One cache path and its health.
@@ -303,11 +336,11 @@ pub struct PlannedStep {
     sentinels: Sentinels,
 }
 
-/// The caches whose sentinel a step removes before it runs and writes after it succeeds.
+/// The caches whose sentinel a step removes before it runs, and those it writes, with their text, after it succeeds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Sentinels {
     clear: Vec<RelPath>,
-    write: Vec<RelPath>,
+    write: Vec<(RelPath, String)>,
 }
 
 impl PlannedStep {
@@ -558,8 +591,8 @@ impl Ready {
                 clear_sentinel(&self.root, path)?;
             }
             run_step(step, &lock.file)?;
-            for path in &step.sentinels.write {
-                write_sentinel(&self.root, path)?;
+            for (path, text) in &step.sentinels.write {
+                write_sentinel(&self.root, path, text)?;
             }
         }
         Ok(())
@@ -595,12 +628,11 @@ pub fn plan(
 
     let spec = detected.spec();
     let caches = detected
-        .caches()
-        .iter()
-        .map(|cache| {
+        .caches_with_inputs()
+        .map(|(cache, inputs)| {
             Ok(CacheReport {
                 path: cache.path.clone(),
-                health: inspect(&root, cache)?,
+                health: inspect(&root, cache, inputs)?,
             })
         })
         .collect::<Result<Vec<_>, MaterializeError>>()?;
@@ -649,7 +681,7 @@ pub fn plan(
 
 /// Gives each sentinel cache to the planned steps that fill it: the first clears it, the last writes it.
 fn assign_sentinels(detected: &Detection, steps: &mut [PlannedStep]) {
-    for cache in detected.caches() {
+    for (cache, inputs) in detected.caches_with_inputs() {
         let Completion::Sentinel { filled_by } = &cache.completion else {
             continue;
         };
@@ -658,7 +690,10 @@ fn assign_sentinels(detected: &Detection, steps: &mut [PlannedStep]) {
             steps[first].sentinels.clear.push(cache.path.clone());
         }
         if let Some(last) = steps.iter().rposition(fills) {
-            steps[last].sentinels.write.push(cache.path.clone());
+            steps[last]
+                .sentinels
+                .write
+                .push((cache.path.clone(), sentinel_for(inputs)));
         }
     }
 }
@@ -713,7 +748,11 @@ fn find_dir(root: &Path, path: &RelPath) -> io::Result<Found> {
     Ok(Found::Dir(full))
 }
 
-fn inspect(root: &Path, cache: &CachePath) -> Result<CacheHealth, MaterializeError> {
+fn inspect(
+    root: &Path,
+    cache: &CachePath,
+    inputs: &blake3::Hash,
+) -> Result<CacheHealth, MaterializeError> {
     let inspect_err = |source| MaterializeError::Inspect {
         path: cache.path.clone(),
         source,
@@ -728,14 +767,30 @@ fn inspect(root: &Path, cache: &CachePath) -> Result<CacheHealth, MaterializeErr
     }
     match &cache.completion {
         Completion::Content => Ok(CacheHealth::Healthy),
-        Completion::Sentinel { .. } => {
-            if fs::symlink_metadata(full.join(SENTINEL)).is_ok_and(|meta| meta.is_file()) {
-                Ok(CacheHealth::Healthy)
-            } else {
-                Ok(CacheHealth::Incomplete)
-            }
-        }
+        Completion::Sentinel { .. } => Ok(match read_sentinel(&full.join(SENTINEL)) {
+            None => CacheHealth::Incomplete,
+            Some(text) if text == sentinel_for(inputs).as_bytes() => CacheHealth::Healthy,
+            Some(_) => CacheHealth::Stale,
+        }),
     }
+}
+
+/// Reads the first `MAX_SENTINEL` bytes of the sentinel at `path`, or `None` when no regular file is there or it cannot be read.
+///
+/// A sentinel that cannot be read proves nothing, so the cache counts as
+/// not finished and is filled again.
+fn read_sentinel(path: &Path) -> Option<Vec<u8>> {
+    let seen = fs::symlink_metadata(path)
+        .ok()
+        .filter(fs::Metadata::is_file)?;
+    let file = fs::File::open(path).ok()?;
+    let opened = file.metadata().ok()?;
+    if !opened.is_file() || opened.dev() != seen.dev() || opened.ino() != seen.ino() {
+        return None;
+    }
+    let mut text = Vec::new();
+    file.take(MAX_SENTINEL).read_to_end(&mut text).ok()?;
+    Some(text)
 }
 
 /// Removes the sentinel of the cache at `path`; nothing there, or a cache reached through a link, is left alone.
@@ -771,24 +826,24 @@ fn remove_entry(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Writes the sentinel of the cache at `path` when the steps left a real directory there, reached through real directories.
+/// Writes `text` as the sentinel of the cache at `path` when the steps left a real directory there, reached through real directories.
 ///
 /// A cache the steps did not create, or one they left as or under a link,
 /// gets no sentinel: the next plan sees it missing, or refuses it as not a
 /// directory, and never writes outside the workspace. `plan` refuses a
 /// filled cache that is a link before any step runs.
-/// A regular file the steps left at the sentinel's name, such as one
-/// unpacked from an archive of a whole cache, is kept: the steps exited 0,
-/// which is all the sentinel says. Anything else there, a link or a
-/// directory included, is removed and the sentinel created in its place,
-/// so a link is never followed.
+/// Whatever the steps left at the sentinel's name is removed and the
+/// sentinel created in its place: a link, so it is never followed, a
+/// directory, and a regular file, such as one unpacked from an archive of
+/// a cache built from other inputs, so the sentinel names the inputs this
+/// run read.
 ///
 /// Nothing is synced. The sentinel proves completion across a `kill -9`,
 /// where the kernel keeps every write, but not across a power loss or a
 /// kernel panic: APFS and ext4 may then keep the sentinel's entry and lose
 /// files the installer wrote before it. Power loss is out of scope for
 /// this proof (ADR 0007, step 3 of Materialize).
-fn write_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
+fn write_sentinel(root: &Path, path: &RelPath, text: &str) -> Result<(), MaterializeError> {
     let sentinel_err = |source| MaterializeError::Sentinel {
         path: path.clone(),
         source,
@@ -807,18 +862,12 @@ fn write_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
     let mut file = match create() {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            if fs::symlink_metadata(&sentinel)
-                .map_err(sentinel_err)?
-                .is_file()
-            {
-                return Ok(());
-            }
             remove_entry(&sentinel).map_err(sentinel_err)?;
             create().map_err(sentinel_err)?
         }
         Err(err) => return Err(sentinel_err(err)),
     };
-    file.write_all(SENTINEL_TEXT).map_err(sentinel_err)
+    file.write_all(text.as_bytes()).map_err(sentinel_err)
 }
 
 fn step_dir(root: &Path, index: usize, step: &SetupStep) -> Result<PathBuf, MaterializeError> {

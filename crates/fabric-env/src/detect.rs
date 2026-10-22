@@ -32,6 +32,13 @@
 //! | `mise.toml`, `.tool-versions`, `rust-toolchain.toml`, `.node-version`, `.nvmrc`, `.python-version`, `go.mod`, `package.json` | tool pins, in that order of precedence |
 //! | `.devcontainer/devcontainer.json`, `.devcontainer.json` | recorded, not interpreted |
 //! | `.fabric/env.toml` | the user's overrides, which win over everything above |
+//!
+//! It also hashes, without keeping them, the files each ecosystem's steps
+//! read: `package.json` with the manager's lockfiles and configuration,
+//! `Cargo.toml` and `Cargo.lock`, `pyproject.toml` and `uv.lock` or
+//! `requirements.txt`, `go.mod` and `go.sum`. The report keeps one digest
+//! per cache, which materialize writes into the cache's sentinel, so a
+//! lockfile changed since the install makes the cache stale.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -57,7 +64,10 @@ use fabric_core::secret::{Scope, SecretPattern, SecretPolicy};
 
 /// Every file detection opens, relative to the root. `Reader` refuses any
 /// other name, so a new reader must add its file here, where a test checks
-/// that no built-in secret pattern denies it.
+/// that no built-in secret pattern denies it. The lockfiles, manifests and
+/// manager configuration a setup step reads are hashed whole, and most of
+/// them are never parsed: their digest goes into the sentinel of the cache
+/// the step fills (`Inputs`).
 const READ_FILES: &[&str] = &[
     OVERRIDE_FILE,
     "package.json",
@@ -69,6 +79,22 @@ const READ_FILES: &[&str] = &[
     ".python-version",
     "go.mod",
     ".yarnrc.yml",
+    "npm-shrinkwrap.json",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    ".pnpmfile.cjs",
+    "yarn.lock",
+    ".yarnrc",
+    "bun.lock",
+    "bun.lockb",
+    "bunfig.toml",
+    "Cargo.toml",
+    "Cargo.lock",
+    "pyproject.toml",
+    "uv.lock",
+    "requirements.txt",
+    "go.sum",
 ];
 
 /// The largest file detection reads; a bigger one is refused rather than loaded.
@@ -278,6 +304,20 @@ impl NodeManager {
             NodeManager::Pnpm => &["pnpm-lock.yaml"],
             NodeManager::YarnClassic | NodeManager::YarnBerry => &["yarn.lock"],
             NodeManager::Bun => &["bun.lock", "bun.lockb"],
+        }
+    }
+
+    /// Returns the files at the root its install reads besides `package.json`: its lockfiles and its own configuration, which can name code the install runs.
+    ///
+    /// `.npmrc` is not among them: the secret policy denies it, so it never
+    /// travels and is never read.
+    fn inputs(self) -> &'static [&'static str] {
+        match self {
+            NodeManager::Npm => &["npm-shrinkwrap.json", "package-lock.json"],
+            NodeManager::Pnpm => &["pnpm-lock.yaml", "pnpm-workspace.yaml", ".pnpmfile.cjs"],
+            NodeManager::YarnClassic => &["yarn.lock", ".yarnrc"],
+            NodeManager::YarnBerry => &["yarn.lock", ".yarnrc.yml"],
+            NodeManager::Bun => &["bun.lock", "bun.lockb", "bunfig.toml"],
         }
     }
 
@@ -504,6 +544,85 @@ impl FoundCache {
     }
 }
 
+/// The files at the root that each ecosystem's steps read, as the rules that fired found them.
+///
+/// The steps run code these files name: a lockfile picks the packages
+/// whose install scripts run, and `package.json` holds the root package's
+/// own. A cache's sentinel records the digest of its ecosystem's files, so
+/// a changed lockfile makes its cache stale even though the spec, which
+/// holds the commands and not the files, has not changed.
+#[derive(Debug, Default)]
+struct Inputs {
+    node: Vec<&'static str>,
+    rust: &'static [&'static str],
+    python: &'static [&'static str],
+    go: &'static [&'static str],
+}
+
+impl Inputs {
+    /// Returns every file of every ecosystem, sorted, each once.
+    fn all(&self) -> Vec<&'static str> {
+        let mut files: Vec<&'static str> = self
+            .node
+            .iter()
+            .chain(self.rust)
+            .chain(self.python)
+            .chain(self.go)
+            .copied()
+            .collect();
+        files.sort_unstable();
+        files.dedup();
+        files
+    }
+
+    /// Returns the files whose digest proves a cache of `ecosystem` current, sorted.
+    ///
+    /// Nothing says what an `other` cache is made from, so every input counts for it.
+    fn of(&self, ecosystem: Ecosystem) -> Vec<&'static str> {
+        let mut files = match ecosystem {
+            Ecosystem::Node(_) => self.node.clone(),
+            Ecosystem::Rust => self.rust.to_vec(),
+            Ecosystem::Python => self.python.to_vec(),
+            Ecosystem::Other => return self.all(),
+        };
+        files.sort_unstable();
+        files.dedup();
+        files
+    }
+
+    /// Hashes every input file once and returns, per cache, the digest of the files of its ecosystem.
+    ///
+    /// Each present file adds its name, a zero byte and the blake3 of its
+    /// bytes, in name order; an absent or denied file adds nothing, so
+    /// adding or removing a lockfile changes the digest too.
+    fn digests(
+        &self,
+        reader: &Reader<'_>,
+        caches: &[FoundCache],
+    ) -> Result<Vec<blake3::Hash>, DetectError> {
+        let mut files = BTreeMap::new();
+        for file in self.all() {
+            if let Some(hash) = reader.digest(file)? {
+                files.insert(file, hash);
+            }
+        }
+        Ok(caches
+            .iter()
+            .map(|cache| {
+                let mut hasher = blake3::Hasher::new();
+                for file in self.of(cache.ecosystem) {
+                    if let Some(hash) = files.get(file) {
+                        hasher.update(file.as_bytes());
+                        hasher.update(&[0]);
+                        hasher.update(hash.as_bytes());
+                    }
+                }
+                hasher.finalize()
+            })
+            .collect())
+    }
+}
+
 /// A version pin found in one file, kept as written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pin {
@@ -529,6 +648,8 @@ pub struct Detection {
     /// One gate per step of `spec.setup`, in the same order; built with it in `detect` and never changed.
     step_gates: Vec<StepGate>,
     caches: Vec<CachePath>,
+    /// One digest per cache, in the same order: the files the steps of its ecosystem read (`Inputs`).
+    inputs: Vec<blake3::Hash>,
     pins: Vec<Pin>,
     node_manager: Option<ManagerChoice>,
     devcontainer: Option<RelPath>,
@@ -553,6 +674,11 @@ impl Detection {
     /// Returns the spec's cache paths with their class, ecosystem and completion, sorted by path.
     pub fn caches(&self) -> &[CachePath] {
         &self.caches
+    }
+
+    /// Returns each cache with the digest of the files its setup steps read, which its sentinel records.
+    pub(crate) fn caches_with_inputs(&self) -> impl Iterator<Item = (&CachePath, &blake3::Hash)> {
+        self.caches.iter().zip(&self.inputs)
     }
 
     /// Returns every pin found, in order of precedence; the spec holds the first one per tool.
@@ -599,12 +725,16 @@ pub fn detect(root: &Path, recorded: &[SecretPattern]) -> Result<Detection, Dete
 
     let mut setup = Vec::new();
     let mut caches = Vec::new();
+    let mut inputs = Inputs::default();
     let node_manager = match (&package, overrides.package_manager) {
         (Some(package), declared) => choose_node_manager(&reader, package, declared)?,
         (None, Some(_)) => return Err(DetectError::PackageManagerWithoutPackageJson),
         (None, None) => None,
     };
     if let Some(choice) = node_manager {
+        inputs.node = std::iter::once("package.json")
+            .chain(choice.manager.inputs().iter().copied())
+            .collect();
         let node_modules = rel("node_modules")?;
         setup.push((
             choice.manager.install_step()?,
@@ -617,14 +747,16 @@ pub fn detect(root: &Path, recorded: &[SecretPattern]) -> Result<Detection, Dete
             origin: CacheOrigin::Detected,
         });
     }
-    detect_rust(&reader, &mut setup, &mut caches)?;
-    detect_python(&reader, &mut setup, &mut caches)?;
+    inputs.rust = detect_rust(&reader, &mut setup, &mut caches)?;
+    inputs.python = detect_python(&reader, &mut setup, &mut caches)?;
     if reader.exists("go.mod")? {
+        inputs.go = &["go.mod", "go.sum"];
         setup.push((step("go", &["mod", "download"])?, StepScope::Outside));
     }
 
     merge_declared_caches(&mut caches, &overrides.caches, node_manager)?;
     caches.sort_by(|a, b| a.path.cmp(&b.path));
+    let cache_inputs = inputs.digests(&reader, &caches)?;
 
     if let Some(declared) = &overrides.setup {
         setup = declared
@@ -657,6 +789,7 @@ pub fn detect(root: &Path, recorded: &[SecretPattern]) -> Result<Detection, Dete
         spec,
         step_gates,
         caches,
+        inputs: cache_inputs,
         pins,
         node_manager,
         devcontainer: find_devcontainer(&reader)?,
@@ -845,13 +978,14 @@ fn pin(tool: &str, version: &str, file: &'static str, at: PinAt) -> Option<Pin> 
     }
 }
 
+/// Adds Cargo's step and cache, and returns the files they read.
 fn detect_rust(
     reader: &Reader<'_>,
     setup: &mut Vec<(SetupStep, StepScope)>,
     caches: &mut Vec<FoundCache>,
-) -> Result<(), DetectError> {
+) -> Result<&'static [&'static str], DetectError> {
     if !reader.exists("Cargo.toml")? {
-        return Ok(());
+        return Ok(&[]);
     }
     // `--locked` keeps a resume from rewriting Cargo.lock, as the frozen
     // installs do for JavaScript; without a lockfile there is nothing to keep.
@@ -871,18 +1005,20 @@ fn detect_rust(
         ecosystem: Ecosystem::Rust,
         origin: CacheOrigin::Detected,
     });
-    Ok(())
+    Ok(&["Cargo.toml", "Cargo.lock"])
 }
 
+/// Adds uv's steps and `.venv`, and returns the files the steps read.
 fn detect_python(
     reader: &Reader<'_>,
     setup: &mut Vec<(SetupStep, StepScope)>,
     caches: &mut Vec<FoundCache>,
-) -> Result<(), DetectError> {
+) -> Result<&'static [&'static str], DetectError> {
     let venv = rel(".venv")?;
     let fills = || StepScope::Fills(venv.clone());
-    if reader.exists("uv.lock")? {
+    let inputs: &'static [&'static str] = if reader.exists("uv.lock")? {
         setup.push((step("uv", &["sync", "--frozen"])?, fills()));
+        &["pyproject.toml", "uv.lock"]
     } else if reader.exists("requirements.txt")? {
         // A bare `pip install` would write into whichever Python is first
         // on PATH. Both steps name `.venv`: without `--python`, `uv pip
@@ -904,16 +1040,17 @@ fn detect_python(
             )?,
             fills(),
         ));
+        &["requirements.txt"]
     } else {
-        return Ok(());
-    }
+        return Ok(&[]);
+    };
     caches.push(FoundCache {
         path: venv,
         class: CacheClass::Deps,
         ecosystem: Ecosystem::Python,
         origin: CacheOrigin::Detected,
     });
-    Ok(())
+    Ok(inputs)
 }
 
 fn find_devcontainer(reader: &Reader<'_>) -> Result<Option<RelPath>, DetectError> {
@@ -1233,7 +1370,7 @@ fn inside(root: &Path, file: &'static str) -> Result<Option<PathBuf>, DetectErro
     Ok(Some(full))
 }
 
-/// Reads the regular file `file` under `root` as UTF-8, or `None` when nothing is there.
+/// Opens the regular file `file` under `root`, or returns `None` when nothing is there.
 ///
 /// No component may be a link: `.nvmrc -> .env` would put a secret into
 /// the spec, `.nvmrc -> ../../.nvmrc` would give two nodes two specs from
@@ -1244,7 +1381,7 @@ fn inside(root: &Path, file: &'static str) -> Result<Option<PathBuf>, DetectErro
 /// real ones. That closes the window between the check and the open
 /// without `O_NOFOLLOW`, which std does not name and which would cover the
 /// last component only.
-fn read_text(root: &Path, file: &'static str) -> Result<Option<String>, DetectError> {
+fn open_regular(root: &Path, file: &'static str) -> Result<Option<fs::File>, DetectError> {
     let read_err = |source| DetectError::Read { file, source };
     let not_regular = || DetectError::NotARegularFile { file };
     let mut parents = file.split('/').collect::<Vec<_>>();
@@ -1274,11 +1411,19 @@ fn read_text(root: &Path, file: &'static str) -> Result<Option<String>, DetectEr
     if inside(root, file)?.is_none() {
         return Err(not_regular());
     }
+    Ok(Some(handle))
+}
+
+/// Reads the regular file `file` under `root` as UTF-8, or `None` when nothing is there.
+fn read_text(root: &Path, file: &'static str) -> Result<Option<String>, DetectError> {
+    let Some(handle) = open_regular(root, file)? else {
+        return Ok(None);
+    };
     let mut bytes = Vec::new();
     handle
         .take(MAX_FILE_LEN + 1)
         .read_to_end(&mut bytes)
-        .map_err(read_err)?;
+        .map_err(|source| DetectError::Read { file, source })?;
     if bytes.len() as u64 > MAX_FILE_LEN {
         return Err(DetectError::TooLarge { file });
     }
@@ -1331,6 +1476,28 @@ impl Reader<'_> {
             return Ok(None);
         }
         read_text(self.root, file)
+    }
+
+    /// Returns the blake3 of the bytes of `file`, or `None` when it is absent or the secret policy denies it.
+    ///
+    /// The file goes through the hasher in pieces and none of it is kept,
+    /// so a lockfile larger than `MAX_FILE_LEN` is hashed, not refused.
+    /// Refuses a name missing from `READ_FILES` as a bug in this module.
+    fn digest(&self, file: &'static str) -> Result<Option<blake3::Hash>, DetectError> {
+        if !READ_FILES.contains(&file) {
+            return Err(DetectError::BuiltIn { name: file });
+        }
+        if self.denied(file)? {
+            return Ok(None);
+        }
+        let Some(handle) = open_regular(self.root, file)? else {
+            return Ok(None);
+        };
+        let mut hasher = blake3::Hasher::new();
+        hasher
+            .update_reader(handle)
+            .map_err(|source| DetectError::Read { file, source })?;
+        Ok(Some(hasher.finalize()))
     }
 
     /// Reads `file` as a TOML table, or `None` when it is absent or the secret policy denies it.

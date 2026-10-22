@@ -681,6 +681,7 @@ fn health_words(health: &CacheHealth) -> &'static str {
         CacheHealth::NotADirectory => "not a directory",
         CacheHealth::Empty => "empty",
         CacheHealth::Incomplete => "left unfinished by an earlier install",
+        CacheHealth::Stale => "installed from other lockfiles than the workspace has now",
     }
 }
 
