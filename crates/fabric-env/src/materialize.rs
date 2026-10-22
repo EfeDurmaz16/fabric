@@ -765,6 +765,23 @@ fn find_dir(root: &Path, path: &RelPath) -> io::Result<Found> {
     Ok(Found::Dir(full))
 }
 
+/// Returns what `plan` would find at the cache `path` of the tree
+/// `detected` describes, or `None` when the report names no such cache.
+///
+/// A capturing node asks it to record whether a cache's bytes stand in for
+/// the steps that fill it: on a target with the same inputs, a `Healthy`
+/// cache runs none of them.
+pub fn cache_health(
+    detected: &Detection,
+    path: &RelPath,
+) -> Result<Option<CacheHealth>, MaterializeError> {
+    detected
+        .caches_with_inputs()
+        .find(|(cache, _)| &cache.path == path)
+        .map(|(cache, inputs)| inspect(detected.root(), cache, inputs))
+        .transpose()
+}
+
 fn inspect(
     root: &Path,
     cache: &CachePath,

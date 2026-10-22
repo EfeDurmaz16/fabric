@@ -28,7 +28,7 @@ use fabric_core::id::{ChunkId, EnvSpecId, JobId, NodeId, SnapshotId};
 use fabric_core::path::{AbsPath, PathError, RelPath};
 use fabric_core::snapshot::{
     CacheClass, CacheEntry, CarryKey, CarryState, Entry, EntryKind, GitHead, GitState,
-    HarnessState, ManifestError, Mode, Platform, SnapshotManifest,
+    HarnessState, LeaveReason, LeftBehind, ManifestError, Mode, Platform, Remake, SnapshotManifest,
 };
 
 use crate::durable::TempFile;
@@ -43,13 +43,20 @@ pub const LARGE_UNTRACKED_LIMIT: u64 = 64 << 20;
 /// How many incremental bundles may chain before the next one is full.
 pub const MAX_BUNDLE_CHAIN: u32 = 16;
 
-/// Measures the strings a cache depends on (ADR 0012), per cache path.
+/// What the capturing node knows about each cache path that a target
+/// decides it by (ADR 0012): the strings it depends on and what makes it again.
 pub trait CarryKeys {
     /// Returns the key for the cache at `path`.
     fn key(&self, class: CacheClass, path: &RelPath) -> CarryKey;
+
+    /// Returns what makes the cache at `path` again on a node that does not write its bytes.
+    fn remake(&self, class: CacheClass, path: &RelPath) -> Remake;
 }
 
-/// Carry keys for a node that measured nothing: every key is `CarryKey::Unmeasured`, which `CarryKey::matches` never accepts.
+/// Carry keys for a node that measured nothing: every key is
+/// `CarryKey::Unmeasured`, which `CarryKey::matches` never accepts, and
+/// nothing is known to make any cache again, so every one is the user's
+/// own files.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UnmeasuredKeys;
 
@@ -57,6 +64,20 @@ impl CarryKeys for UnmeasuredKeys {
     fn key(&self, _class: CacheClass, _path: &RelPath) -> CarryKey {
         CarryKey::Unmeasured
     }
+
+    fn remake(&self, _class: CacheClass, _path: &RelPath) -> Remake {
+        Remake::Nothing
+    }
+}
+
+/// True when `path` names a native Node addon, which loads only under the
+/// ABI it was built for, whether the path is the file or a link to it.
+fn is_native_addon(path: &RelPath) -> bool {
+    let name = path.as_str().rsplit('/').next().unwrap_or_default();
+    name.len() > ".node".len()
+        && name
+            .get(name.len() - ".node".len()..)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(".node"))
 }
 
 /// What to capture and under which policy.
@@ -884,6 +905,7 @@ struct CacheSeen {
     carried: u64,
     denied: u64,
     excluded: u64,
+    native: u64,
 }
 
 struct Capturer<'a> {
@@ -951,6 +973,7 @@ impl Capturer<'_> {
                     carried: 0,
                     denied: 0,
                     excluded: 0,
+                    native: 0,
                 });
             }
             if item.kind == FoundKind::Dir {
@@ -969,6 +992,7 @@ impl Capturer<'_> {
                     carried: 0,
                     denied: 0,
                     excluded: 0,
+                    native: 0,
                 })
             });
             match class {
@@ -989,6 +1013,13 @@ impl Capturer<'_> {
                 Class::Cache(_) | Class::Precious => {
                     if let Some(seen) = seen {
                         seen.carried += 1;
+                        // Node loads an addon through a link as it loads the
+                        // file, so a link named `*.node` counts too.
+                        if matches!(item.kind, FoundKind::File | FoundKind::Symlink)
+                            && is_native_addon(&item.rel)
+                        {
+                            seen.native += 1;
+                        }
                     }
                 }
             }
@@ -1017,9 +1048,11 @@ impl Capturer<'_> {
             };
             cache_entries.push(CacheEntry {
                 key: self.req.carry_keys.key(seen.class, &path),
+                remake: self.req.carry_keys.remake(seen.class, &path),
                 path,
                 class: seen.class,
                 carry,
+                native_files: seen.native,
             });
         }
         Ok((entries, cache_entries))
@@ -2351,6 +2384,24 @@ fn strip_userinfo(url: &str) -> Option<String> {
     Some(format!("{}{}", &url[..range.start], &url[range.end..]))
 }
 
+/// The manifest of the snapshot `req` follows, refused when it belongs to another job.
+fn parent_manifest(
+    store: &Store,
+    req: &CaptureRequest<'_>,
+) -> Result<Option<(SnapshotId, SnapshotManifest)>, CaptureError> {
+    let Some(parent) = req.parent else {
+        return Ok(None);
+    };
+    let manifest = store.manifest(parent)?;
+    if manifest.job_id != req.job_id {
+        return Err(CaptureError::ParentJobMismatch {
+            parent,
+            job: manifest.job_id,
+        });
+    }
+    Ok(Some((parent, manifest)))
+}
+
 /// Captures the workspace described by `req` into `store` and returns the manifest.
 ///
 /// The manifest is not yet published; the caller does that with
@@ -2367,19 +2418,7 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
     if !req.root.is_dir() {
         return Err(bad_root());
     }
-    let parent_manifest = match req.parent {
-        Some(parent) => {
-            let manifest = store.manifest(parent)?;
-            if manifest.job_id != req.job_id {
-                return Err(CaptureError::ParentJobMismatch {
-                    parent,
-                    job: manifest.job_id,
-                });
-            }
-            Some((parent, manifest))
-        }
-        None => None,
-    };
+    let parent_manifest = parent_manifest(store, req)?;
     let mut capturer = Capturer {
         store,
         req,
@@ -2452,6 +2491,7 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
         harness_state,
         env_spec: req.env_spec,
         caches,
+        left_behind: left_behind(&capturer.report, req.policy),
     };
     if let Some(state) = &manifest.git {
         refuse_overlap(&manifest.files, &state.worktree_mtimes)?;
@@ -2461,6 +2501,37 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
         manifest,
         report: capturer.report,
     })
+}
+
+/// Every ignored or untracked workspace path a secret pattern or `.fabricignore` keeps on this node, with that reason, sorted by path.
+///
+/// An untracked path removed from the working-tree commit is a secret when
+/// the secret list names it and an exclusion otherwise, since those are the
+/// only two lists that remove one. The harness state's own denials are not
+/// workspace paths and are not listed, and neither is what capture leaves
+/// out for another reason (`special_files`, `unreadable`,
+/// `nested_repositories`), which the report names.
+fn left_behind(report: &CaptureReport, policy: &IgnorePolicy) -> Vec<LeftBehind> {
+    let secret = |path: &RelPath| LeftBehind {
+        path: path.clone(),
+        reason: LeaveReason::Secret,
+    };
+    let mut left: Vec<LeftBehind> = report.denied.iter().map(secret).collect();
+    left.extend(report.excluded.iter().map(|path| LeftBehind {
+        path: path.clone(),
+        reason: LeaveReason::Excluded,
+    }));
+    left.extend(report.denied_untracked.iter().map(|path| LeftBehind {
+        path: path.clone(),
+        reason: if policy.is_secret(path) {
+            LeaveReason::Secret
+        } else {
+            LeaveReason::Excluded
+        },
+    }));
+    left.sort_by(|a, b| a.path.cmp(&b.path));
+    left.dedup_by(|a, b| a.path == b.path);
+    left
 }
 
 /// Refuses a capture whose ignored files and working-tree commit share a path.
@@ -2688,6 +2759,15 @@ mod tests {
 
     fn rel(s: &str) -> RelPath {
         RelPath::parse(s).unwrap()
+    }
+
+    #[test]
+    fn a_native_addon_is_a_file_named_dot_node() {
+        assert!(is_native_addon(&rel("node_modules/x/build/Release/x.node")));
+        assert!(is_native_addon(&rel("node_modules/x/X.NODE")));
+        assert!(!is_native_addon(&rel("node_modules/x/.node")));
+        assert!(!is_native_addon(&rel("node_modules/x/index.js")));
+        assert!(!is_native_addon(&rel("node_modules/x.node.js")));
     }
 
     #[test]

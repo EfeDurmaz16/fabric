@@ -169,7 +169,11 @@ fn restore_timed(store: &Store, id: SnapshotId, target: &Path) -> Fallible<(Dura
             carry: &|_| true,
         },
     )?;
-    Ok((started.elapsed(), report.files, report.bundles_fetched))
+    Ok((
+        started.elapsed(),
+        report.total().files,
+        report.bundles_fetched,
+    ))
 }
 
 #[test]

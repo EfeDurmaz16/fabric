@@ -5,12 +5,15 @@
 use std::error::Error;
 
 use fabric_core::codec::{CodecError, VersionedError};
+use fabric_core::env::{RunWhen, SetupArg, SetupStep};
 use fabric_core::git::{BranchName, GitConfigKey, GitConfigValue, GitOid, RefName};
+use fabric_core::harness::ProgramName;
 use fabric_core::id::{ChunkId, EnvSpecId, JobId, NodeId, SnapshotId};
 use fabric_core::path::{AbsPath, RelPath};
 use fabric_core::snapshot::{
     CacheClass, CacheEntry, CarryKey, CarryState, Entry, EntryKind, GitHead, GitState,
-    HarnessState, MANIFEST_VERSION, ManifestError, Mode, Platform, SnapshotManifest,
+    HarnessState, LeaveReason, LeftBehind, MANIFEST_VERSION, ManifestError, Mode, Platform, Remake,
+    SnapshotManifest,
 };
 use proptest::prelude::*;
 
@@ -105,6 +108,48 @@ fn carry_key() -> impl Strategy<Value = CarryKey> {
     ]
 }
 
+fn setup_step() -> impl Strategy<Value = SetupStep> {
+    (
+        "(npm|pnpm|uv|cargo)",
+        proptest::collection::vec("[a-z-]{1,8}", 0..3),
+        proptest::option::of(rel_path()),
+        prop_oneof![Just(RunWhen::CachesMissing), Just(RunWhen::Always)],
+    )
+        .prop_filter_map("valid step", |(program, args, cwd, when)| {
+            Some(SetupStep {
+                program: ProgramName::parse(&program).ok()?,
+                args: args
+                    .iter()
+                    .map(|a| SetupArg::parse(a))
+                    .collect::<Result<_, _>>()
+                    .ok()?,
+                cwd,
+                when,
+            })
+        })
+}
+
+fn remake() -> impl Strategy<Value = Remake> {
+    prop_oneof![
+        (proptest::collection::vec(setup_step(), 1..3), any::<bool>())
+            .prop_map(|(steps, installed)| Remake::Setup { steps, installed }),
+        Just(Remake::NextBuild),
+        Just(Remake::Nothing),
+    ]
+}
+
+fn left_behind() -> impl Strategy<Value = Vec<LeftBehind>> {
+    proptest::collection::vec(
+        (
+            rel_path(),
+            prop_oneof![Just(LeaveReason::Secret), Just(LeaveReason::Excluded)],
+        )
+            .prop_map(|(path, reason)| LeftBehind { path, reason }),
+        0..3,
+    )
+    .prop_map(|items| sorted_unique(items, |l| l.path.clone()))
+}
+
 fn cache_entry() -> impl Strategy<Value = CacheEntry> {
     (
         rel_path(),
@@ -119,13 +164,19 @@ fn cache_entry() -> impl Strategy<Value = CacheEntry> {
             Just(CarryState::NotCarried)
         ],
         carry_key(),
+        remake(),
+        any::<u64>(),
     )
-        .prop_map(|(path, class, carry, key)| CacheEntry {
-            path,
-            class,
-            carry,
-            key,
-        })
+        .prop_map(
+            |(path, class, carry, key, remake, native_files)| CacheEntry {
+                path,
+                class,
+                carry,
+                key,
+                remake,
+                native_files,
+            },
+        )
 }
 
 /// Sorts `items` by `key` and keeps a repeated key's items in their order, as capture does for config.
@@ -223,7 +274,10 @@ fn manifest() -> impl Strategy<Value = SnapshotManifest> {
         tree(),
         tree(),
         proptest::option::of(any::<[u8; 32]>()),
-        proptest::collection::vec(cache_entry(), 0..3),
+        (
+            proptest::collection::vec(cache_entry(), 0..3),
+            left_behind(),
+        ),
     )
         .prop_map(
             |(
@@ -237,7 +291,7 @@ fn manifest() -> impl Strategy<Value = SnapshotManifest> {
                 files,
                 harness,
                 env,
-                caches,
+                (caches, left_behind),
             )| {
                 let caches = sorted_unique(caches, |c| c.path.clone());
                 // A path is in `files` or in the working tree, never both,
@@ -263,6 +317,7 @@ fn manifest() -> impl Strategy<Value = SnapshotManifest> {
                     harness_state: HarnessState { entries: harness },
                     env_spec: env.map(EnvSpecId::from_bytes),
                     caches,
+                    left_behind,
                 }
             },
         )
@@ -380,19 +435,35 @@ fn fixed_manifest() -> Result<SnapshotManifest, Box<dyn Error>> {
                 pm_major: "10".into(),
                 pnpm_store_path: None,
             },
+            remake: Remake::Setup {
+                steps: vec![SetupStep {
+                    program: ProgramName::parse("npm")?,
+                    args: vec![SetupArg::parse("ci")?],
+                    cwd: None,
+                    when: RunWhen::CachesMissing,
+                }],
+                installed: true,
+            },
+            native_files: 0,
+        }],
+        left_behind: vec![LeftBehind {
+            path: RelPath::parse(".env")?,
+            reason: LeaveReason::Secret,
         }],
     })
 }
 
-/// Pins format version 1. A field added, removed or reordered changes this
-/// hash and must come with a version bump once version 1 has shipped; until
-/// then a review correction updates the pin in the same commit.
+/// Pins format version 2. A field added, removed or reordered changes this
+/// hash and must come with a version bump, as version 2 did when the cache
+/// rows gained what a target decides them by (2026-10-21). `installed`
+/// joined `Remake::Setup` on 2026-10-22, before version 2 was merged or
+/// written by any released build, so it is part of version 2.
 #[test]
-fn format_version_one_hash_is_pinned() {
+fn format_version_two_hash_is_pinned() {
     let id = fixed_manifest().unwrap().id().unwrap().to_string();
     assert_eq!(
         id,
-        "3b1e42341097eeb196f3d8b83787fd08b855fc0eb300138ae058a14cfadb8844"
+        "67d16a515a83e7bec72705376208b8f039045c5428e7f95bc862df7724b5c765"
     );
 }
 
@@ -434,6 +505,15 @@ fn a_repeated_or_unsorted_path_is_refused() {
             index: 1
         })
     ));
+    let mut m = fixed_manifest().unwrap();
+    m.left_behind.push(m.left_behind[0].clone());
+    assert!(matches!(
+        m.encode(),
+        Err(ManifestError::OutOfOrder {
+            list: "left_behind",
+            index: 1
+        })
+    ));
 }
 
 /// `config` is sorted by key, but a key git holds more than once keeps one
@@ -469,6 +549,21 @@ fn a_repeated_config_key_keeps_its_values_and_an_unsorted_one_is_refused() {
             list: "config",
             index: 1
         })
+    ));
+}
+
+/// A cache row that says setup steps remake it must name one: a target
+/// would otherwise plan a rebuild that runs nothing and drop the bytes.
+#[test]
+fn a_remake_with_no_setup_step_is_refused() {
+    let mut m = fixed_manifest().unwrap();
+    m.caches[0].remake = Remake::Setup {
+        steps: Vec::new(),
+        installed: true,
+    };
+    assert!(matches!(
+        m.encode(),
+        Err(ManifestError::EmptyRemake { index: 0 })
     ));
 }
 
@@ -683,10 +778,10 @@ fn trailing_bytes_do_not_decode() {
 fn unknown_version_and_oversize_are_refused() {
     let mut bytes = fixed_manifest().unwrap().encode().unwrap();
     assert_eq!(bytes[0], u8::try_from(MANIFEST_VERSION).unwrap());
-    bytes[0] = 2;
+    bytes[0] = 1;
     assert!(matches!(
         SnapshotManifest::decode(&bytes),
-        Err(ManifestError::Codec(VersionedError::UnknownVersion(2)))
+        Err(ManifestError::Codec(VersionedError::UnknownVersion(1)))
     ));
     let big = vec![0u8; fabric_core::snapshot::MAX_MANIFEST_LEN + 1];
     assert!(matches!(

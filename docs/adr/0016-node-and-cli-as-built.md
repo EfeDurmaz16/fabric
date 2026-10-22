@@ -138,6 +138,8 @@ Capture measures carry keys with `fabric-env` detection: a cache detection does 
 
 Capture also stores the spec detection made as an object of the store and names it in the snapshot's `env_spec`, and takes as the job's recorded secret patterns those of `jobs/<job-id>/secret-patterns` joined with those of the spec the job's latest snapshot names, so the patterns travel with the job (ADR 0007, amended 2026-10-22).
 
+2026-10-21: the first sentence above lost a hand-made `node_modules` on the gate (finding F6). A cache detection does not know now records what makes it again, nothing for a dependency tree and the next build for build output, and is decided by the rule of ADR 0012's 2026-10-21 amendment; doctor, move and resume print one line per path from the same function, `fabricd::carry::decide`. `fabric job status` and `fabric job move` say when the snapshot holds no harness session (finding F9).
+
 ### Decisions as ledger events
 
 `fabric job approve` and `reject` append `DecisionRecorded { text: "approved" }` or `"rejected"`, with the user's note after a colon. ADR 0002 makes a new event kind a format version bump; a typed approval record waits for the UI that would read it.

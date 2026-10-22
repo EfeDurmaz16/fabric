@@ -14,7 +14,8 @@ use fabric_core::git::GitConfigKey;
 use fabric_core::id::{JobId, NodeId, SnapshotId};
 use fabric_core::path::RelPath;
 use fabric_core::snapshot::{
-    CacheClass, CacheEntry, CarryKey, CarryState, Entry, EntryKind, GitHead, ManifestError, Mode,
+    CacheClass, CacheEntry, CarryKey, CarryState, Entry, EntryKind, GitHead, LeaveReason,
+    LeftBehind, ManifestError, Mode, Remake,
 };
 use fabric_store::capture::{
     BundleKind, BusyReason, CaptureError, CaptureRequest, Captured, CarryKeys, IndexFlag,
@@ -23,8 +24,8 @@ use fabric_store::capture::{
 use fabric_store::objects::ChunkParams;
 use fabric_store::policy::{IgnorePolicy, PolicyError, SECRET_PATTERNS};
 use fabric_store::restore::{
-    Durability, RestoreError, RestoreReport, RestoreRequest, RestoreState, Verify, restore,
-    restore_state, verify,
+    Durability, RestoreError, RestoreReport, RestoreRequest, RestoreState, Verify, Written,
+    restore, restore_state, verify,
 };
 use fabric_store::store::{CheckDepth, Store, StoreError};
 use fabric_store::writer::WriteError;
@@ -187,6 +188,36 @@ fn git_difference(root: &Path, target: &Path) -> Fallible<Option<String>> {
     Ok(None)
 }
 
+/// Gate finding F8: the restore summary said "0 files, 0 bytes" over a
+/// workspace whose untracked notes it had written. Every file restore
+/// writes is counted once, in its class.
+#[test]
+fn restore_counts_every_file_it_writes_by_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    make_repo(&root).unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    assert_eq!(
+        manifest.left_behind,
+        vec![LeftBehind {
+            path: RelPath::parse(".env").unwrap(),
+            reason: LeaveReason::Secret,
+        }]
+    );
+    let snapshot = store.publish(&manifest).unwrap();
+    let restored = restore_into(&store, snapshot, &dir.path().join("restored")).unwrap();
+    // Seven of W's paths the index holds (a symlink counts as a file of no
+    // bytes), two it does not, and three ignored files.
+    let written = |files, bytes| Written { files, bytes };
+    assert_eq!(restored.tracked, written(7, 54));
+    assert_eq!(restored.untracked, written(2, 10));
+    assert_eq!(restored.ignored, written(3, 64));
+    assert_eq!(restored.harness, Written::default());
+    assert_eq!(restored.total(), written(12, 128));
+}
+
 #[test]
 fn git_state_survives_capture_and_restore() {
     let dir = tempfile::tempdir().unwrap();
@@ -231,6 +262,8 @@ fn git_state_survives_capture_and_restore() {
             class: CacheClass::Deps,
             carry: CarryState::Carried,
             key: CarryKey::Unmeasured,
+            remake: Remake::Nothing,
+            native_files: 0,
         }]
     );
 
@@ -248,7 +281,7 @@ fn git_state_survives_capture_and_restore() {
         },
     )
     .unwrap();
-    assert_eq!(restored.files, 3);
+    assert_eq!(restored.ignored.files, 3);
     // Three ignored files, two directories of theirs, one of W and the nine entries of W.
     assert_eq!(restored.verified, 15);
     assert_eq!(restore_state(&target).unwrap(), RestoreState::Present);
@@ -279,15 +312,13 @@ fn git_state_survives_capture_and_restore() {
         fs::metadata(target.join("g")).unwrap().mode() & 0o777,
         0o755
     );
-    assert_eq!(
-        mtime_of(&target.join("node_modules/pkg/index.js")).unwrap(),
-        (1_600_000_000, 123_456_789)
-    );
-    assert_eq!(
-        mtime_of(&target.join("build.log")).unwrap(),
-        (1_650_000_000, 42)
-    );
-    assert_eq!(mtime_of(&target.join("d/b")).unwrap(), (1_655_000_000, 7));
+    for (path, mtime) in [
+        ("node_modules/pkg/index.js", (1_600_000_000, 123_456_789)),
+        ("build.log", (1_650_000_000, 42)),
+        ("d/b", (1_655_000_000, 7)),
+    ] {
+        assert_eq!(mtime_of(&target.join(path)).unwrap(), mtime, "{path}");
+    }
     assert_eq!(
         fs::read_to_string(target.join("new.txt")).unwrap(),
         "untracked\n"
@@ -503,6 +534,11 @@ fn secret_fixture(root: &Path) -> Fallible {
     fs::create_dir_all(root.join("node_modules/pkg"))?;
     fs::write(root.join("node_modules/pkg/cert.pem"), "fixture")?;
     fs::write(root.join("node_modules/pkg/.env"), "leak")?;
+    fs::create_dir_all(root.join("node_modules/pkg/build/Release"))?;
+    fs::write(
+        root.join("node_modules/pkg/build/Release/pkg.node"),
+        "addon",
+    )?;
     fs::write(root.join(".fabricignore"), "scratch\n")?;
     fs::create_dir_all(root.join("scratch"))?;
     fs::write(root.join("scratch/out.bin"), "excluded")?;
@@ -548,7 +584,24 @@ fn every_secret_pattern_keeps_its_file_out_of_the_manifest() {
     assert!(files.contains(&".fabricignore"));
     assert_eq!(manifest.caches.len(), 1);
     assert_eq!(manifest.caches[0].carry, CarryState::Partial);
+    assert_eq!(manifest.caches[0].native_files, 1);
     assert_eq!(report.denied.len(), SECRET_PATTERNS.len() * 2 + 1);
+    // The manifest names every path that stayed behind, so the target can
+    // say what it will not find: each secret, and the exclusion.
+    let mut expected: Vec<LeftBehind> = report
+        .denied
+        .iter()
+        .map(|path| LeftBehind {
+            path: path.clone(),
+            reason: LeaveReason::Secret,
+        })
+        .chain([LeftBehind {
+            path: RelPath::parse("scratch/out.bin").unwrap(),
+            reason: LeaveReason::Excluded,
+        }])
+        .collect();
+    expected.sort_by(|a, b| a.path.cmp(&b.path));
+    assert_eq!(manifest.left_behind, expected);
 }
 
 fn worktree_paths(
@@ -1167,6 +1220,10 @@ impl CarryKeys for WritesLate<'_> {
         }
         CarryKey::Unmeasured
     }
+
+    fn remake(&self, _class: CacheClass, _path: &RelPath) -> Remake {
+        Remake::Nothing
+    }
 }
 
 /// A file a still-running harness writes after its directory was listed fails the capture instead of being left out.
@@ -1218,6 +1275,10 @@ impl CarryKeys for AppendsLate<'_> {
                 .and_then(|mut file| std::io::Write::write_all(&mut file, b"written late\n"));
         }
         CarryKey::Unmeasured
+    }
+
+    fn remake(&self, _class: CacheClass, _path: &RelPath) -> Remake {
+        Remake::Nothing
     }
 }
 
@@ -1292,6 +1353,10 @@ impl CarryKeys for WritesAside<'_> {
             let _ = fs::write(self.appears, "rotated\n");
         }
         CarryKey::Unmeasured
+    }
+
+    fn remake(&self, _class: CacheClass, _path: &RelPath) -> Remake {
+        Remake::Nothing
     }
 }
 
@@ -1478,7 +1543,7 @@ fn a_plain_directory_and_harness_state_round_trip_exactly() {
         },
     )
     .unwrap();
-    assert_eq!(report.files, 5);
+    assert_eq!(report.total().files, 5);
     assert_eq!(report.verified, 2);
     assert_eq!(listing(&target).unwrap(), listing(&root).unwrap());
     assert_eq!(listing(&state_target).unwrap(), listing(&state).unwrap());
@@ -1678,12 +1743,40 @@ fn a_cache_the_target_cannot_use_is_skipped_and_named() {
     );
     assert!(!target.join("node_modules").exists());
     assert!(target.join("build.log").exists());
-    assert_eq!(report.files, 1);
+    assert_eq!(report.ignored.files, 1);
     assert_eq!(status(&target).unwrap(), status(&root).unwrap());
 }
 
+/// Node follows a link named `*.node` and loads the addon it reaches,
+/// which is built for one ABI, so the cache row counts the link as an
+/// addon. Counted as nothing, a locked tree whose target cannot rebuild
+/// it would travel as plain JavaScript (review of PR #11).
 #[test]
-fn a_partial_cache_is_skipped_even_when_the_target_could_use_it() {
+fn a_native_addon_reached_through_a_link_is_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("plain");
+    fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+    fs::create_dir_all(root.join("prebuilds")).unwrap();
+    fs::write(root.join("node_modules/pkg/index.js"), "x\n").unwrap();
+    fs::write(root.join("prebuilds/pkg-darwin-arm64.bin"), "addon").unwrap();
+    std::os::unix::fs::symlink(
+        "../../prebuilds/pkg-darwin-arm64.bin",
+        root.join("node_modules/pkg/pkg.node"),
+    )
+    .unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    assert_eq!(manifest.caches.len(), 1, "{:?}", manifest.caches);
+    assert_eq!(manifest.caches[0].native_files, 1);
+}
+
+/// A partial cache is written or left out as the caller's carry rule
+/// says, like any other row: fabricd decides the hole once, for doctor,
+/// move and resume, and rebuilds a partial cache a setup step fills while
+/// it writes one nothing can make again. The secret under it never travels.
+#[test]
+fn a_partial_cache_is_written_only_where_the_carry_rule_says() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("plain");
     fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
@@ -1695,14 +1788,33 @@ fn a_partial_cache_is_skipped_even_when_the_target_could_use_it() {
     let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
     assert_eq!(manifest.caches[0].carry, CarryState::Partial);
     let snapshot = store.publish(&manifest).unwrap();
-    let target = dir.path().join("restored");
-    let report = restore_into(&store, snapshot, &target).unwrap();
+    let written = dir.path().join("written");
+    let report = restore_into(&store, snapshot, &written).unwrap();
+    assert!(report.skipped_caches.is_empty(), "{report:?}");
+    assert_eq!(
+        fs::read_to_string(written.join("node_modules/pkg/index.js")).unwrap(),
+        "x\n"
+    );
+    assert!(!written.join("node_modules/pkg/.env").exists());
+    let skipped = dir.path().join("skipped");
+    let report = restore(
+        &store,
+        &RestoreRequest {
+            snapshot,
+            target: &skipped,
+            harness_state: None,
+            verify: Verify::All,
+            durability: Durability::ProcessCrash,
+            carry: &|_| false,
+        },
+    )
+    .unwrap();
     assert_eq!(
         report.skipped_caches,
         vec![RelPath::parse("node_modules").unwrap()]
     );
-    assert!(!target.join("node_modules").exists());
-    assert!(target.join("keep.txt").exists());
+    assert!(!skipped.join("node_modules").exists());
+    assert!(skipped.join("keep.txt").exists());
 }
 
 #[test]

@@ -162,6 +162,11 @@ fn row(
     }
 }
 
+/// What the os and arch rows say: a path something on the target can
+/// make again does not cross a platform, and a path nothing can make
+/// again does, since leaving it out would lose it (`crate::carry`).
+const PLATFORM_NOTE: &str = "only a path nothing on the target can make again crosses; the carry lines say what happens to each path, ADR 0012";
+
 /// Compares this node's facts with a peer's, row by row (ADR 0008, the table).
 #[must_use]
 pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row> {
@@ -184,27 +189,15 @@ pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row
     }
     rows.push(git_row(here, peer, ctx));
     rows.push(lsof_row(here, peer, ctx));
-    rows.push(row(
-        name::OS,
-        here,
-        peer,
-        Outcome::Warn,
-        "no cache is carried across operating systems",
-    ));
-    rows.push(row(
-        name::ARCH,
-        here,
-        peer,
-        Outcome::Warn,
-        "no cache is carried across architectures",
-    ));
+    rows.push(row(name::OS, here, peer, Outcome::Warn, PLATFORM_NOTE));
+    rows.push(row(name::ARCH, here, peer, Outcome::Warn, PLATFORM_NOTE));
     for fact in [name::PNPM, name::PNPM_STORE] {
         rows.push(row(
             fact,
             here,
             peer,
             Outcome::Fallback,
-            "a pnpm node_modules is not carried; the lockfile install runs (ADR 0012)",
+            "a pnpm node_modules is rebuilt only where the same pnpm major runs; the carry lines say what happens to each path, ADR 0012",
         ));
     }
     let mut node = row(
@@ -220,7 +213,7 @@ pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row
     );
     if node.outcome != Outcome::Equal && node_majors.0 != node_majors.1 {
         node.outcome = Outcome::Fallback;
-        "node_modules is not carried across Node majors; the lockfile install runs (ADR 0012)"
+        "a node_modules with a lockfile is rebuilt, one without travels as it is; the carry lines say which, ADR 0012"
             .clone_into(&mut node.note);
     }
     rows.push(node);
@@ -229,7 +222,7 @@ pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row
         here,
         peer,
         Outcome::Fallback,
-        "native addons built for one ABI do not load under another",
+        "native addons built for one ABI do not load under another; the carry lines name a tree that holds one",
     ));
     for fact in [name::RUSTC, name::CARGO_HOME] {
         rows.push(row(
@@ -237,7 +230,7 @@ pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row
             here,
             peer,
             Outcome::Fallback,
-            "target/ is not carried; cargo rebuilds (ADR 0012)",
+            "target/ is left for the next cargo build to make again (ADR 0012)",
         ));
     }
     for fact in [name::MACOS, name::MACOS_SDK] {
@@ -901,6 +894,36 @@ mod tests {
                 refused,
                 "{:?}",
                 context.target
+            );
+        }
+    }
+
+    /// The os and arch rows used to say no cache crosses, while the carry
+    /// decision carries a tree nothing on the target can make again to
+    /// any platform. The rows now say what the decision does.
+    #[test]
+    fn the_os_and_arch_rows_say_what_the_carry_decision_does() {
+        use crate::carry::{CarryDecision, decide};
+        use fabric_core::snapshot::{CacheClass, CacheEntry, CarryKey, CarryState, Remake};
+        let tree = CacheEntry {
+            path: fabric_core::path::RelPath::parse("node_modules").unwrap(),
+            class: CacheClass::Deps,
+            carry: CarryState::Carried,
+            key: CarryKey::Unmeasured,
+            remake: Remake::Nothing,
+            native_files: 0,
+        };
+        for (fact, change) in [(name::OS, "linux"), (name::ARCH, "x86_64")] {
+            let peer = with(&pro(), &[(fact, Some(change))]);
+            let rows = compare(&pro(), &peer, &ctx(None));
+            let row = rows.iter().find(|r| r.fact == fact).unwrap();
+            assert_eq!(row.note, PLATFORM_NOTE, "{fact}");
+            assert!(
+                matches!(
+                    decide(&tree, &pro().platform(), &peer),
+                    CarryDecision::Carry { .. }
+                ),
+                "{fact}"
             );
         }
     }
