@@ -604,11 +604,12 @@ async fn launch(
             read_line,
         };
         let (report, status) = turn.run(&mut running, &mut interrupts).await?;
-        // The node hears of the exit even when the answer cannot be printed,
+        // The node hears of the exit before anything prints the turn, so a
+        // script that reads the session line finds the harness no longer
+        // recorded, and hears of it even when the answer cannot be printed,
         // as after the hang-up of the terminal that would have shown it.
-        let printed = print_turn(plan, &report);
         let code = exited(&socket, plan, pid, status, &mut interrupts).await?;
-        printed?;
+        print_turn(plan, &report)?;
         return Ok(code);
     }
     // A held harness has not run yet: it gets the terminal first, then starts.
@@ -628,19 +629,16 @@ async fn launch(
         signal = interrupts.next() => return Ok(signal_exit(signal.as_raw())),
     };
     drop(handed);
-    let printed = if headless {
+    let code = exited(&socket, plan, pid, status, &mut interrupts).await?;
+    if headless {
         print_turn(
             plan,
             &TurnReport {
                 session: running.session().cloned(),
                 ..TurnReport::default()
             },
-        )
-    } else {
-        Ok(())
-    };
-    let code = exited(&socket, plan, pid, status, &mut interrupts).await?;
-    printed?;
+        )?;
+    }
     Ok(code)
 }
 

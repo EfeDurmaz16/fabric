@@ -6,6 +6,7 @@
 //! keep their session files where Claude Code and Codex keep theirs.
 
 use std::fs;
+use std::io::{BufRead, Read};
 use std::path::Path;
 use std::time::Duration;
 
@@ -224,6 +225,56 @@ fn e2e_a_headless_run_whose_output_is_gone_still_records_the_exit() -> Fallible 
         "the node was not told the harness exited:\n{}",
         text(&output)
     );
+    Ok(())
+}
+
+/// A script that reads a headless run's output and acts once the turn is
+/// printed, before `fabric` exits, must find the node done with the
+/// harness: the node is told the harness exited before any line of the
+/// turn is printed (Codex review, 2026-10-22).
+#[test]
+fn e2e_a_headless_run_tells_the_node_before_it_prints_the_turn() -> Fallible {
+    let env = Env::new()?;
+    env.install_fake_codex()?;
+    let (node, job) = job_under(&env, "codex")?;
+    let record = node.state().join("jobs").join(&job).join("harness");
+    let mut running = node.spawn(&["job", "run", &job, "--headless", "--prompt", "one"])?;
+    // Standard error is read from the start, so a full pipe never stops
+    // `fabric` before it prints the turn.
+    let mut stderr = running
+        .stderr
+        .take()
+        .ok_or("the run has no standard error")?;
+    let errors = std::thread::spawn(move || {
+        let mut errors = String::new();
+        let _ = stderr.read_to_string(&mut errors);
+        errors
+    });
+    let stdout = running
+        .stdout
+        .take()
+        .ok_or("the run has no standard output")?;
+    let mut lines = std::io::BufReader::new(stdout);
+    let mut first = String::new();
+    lines.read_line(&mut first)?;
+    let recorded = record.exists();
+    let mut rest = String::new();
+    lines.read_to_string(&mut rest)?;
+    let output = finish(running, Duration::from_mins(3))?;
+    let errors = errors
+        .join()
+        .map_err(|_| "the reader of standard error panicked")?;
+    assert_eq!(first, "codex did: one\n", "{errors}");
+    assert!(
+        !recorded,
+        "the turn was printed while the node still recorded the harness:\n{errors}"
+    );
+    assert_eq!(
+        rest,
+        format!("codex session {}\n", Env::CODEX_THREAD),
+        "{errors}"
+    );
+    assert!(output.status.success(), "{errors}");
     Ok(())
 }
 
