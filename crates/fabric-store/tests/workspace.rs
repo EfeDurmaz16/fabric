@@ -1202,6 +1202,37 @@ fn a_file_added_after_the_listing_fails_the_capture() {
     }
 }
 
+/// git leaves a directory it cannot read out of its listings, with a
+/// warning, as a container's database volume owned by another user: the
+/// walk that finds empty directories leaves it out too and the report
+/// names it, instead of failing every capture of the repository.
+#[test]
+fn a_directory_capture_cannot_read_is_left_behind_and_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    fs::create_dir_all(root.join("pgdata")).unwrap();
+    fs::write(root.join("pgdata/PG_VERSION"), "17\n").unwrap();
+    fs::write(root.join("a.txt"), "a\n").unwrap();
+    fs::write(root.join(".gitignore"), "pgdata/\n").unwrap();
+    let g = git(&root);
+    g.run(&["init", "-q", "-b", "main"]).unwrap();
+    g.run(&["add", "-A"]).unwrap();
+    g.run(&["commit", "-q", "-m", "one"]).unwrap();
+    let pgdata = root.join("pgdata");
+    fs::set_permissions(&pgdata, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&pgdata).is_ok() {
+        // Run as root, which reads any directory: nothing to prove here.
+        fs::set_permissions(&pgdata, fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let captured = capture(&store, &request(&root, &policy, None));
+    fs::set_permissions(&pgdata, fs::Permissions::from_mode(0o755)).unwrap();
+    let Captured { report, .. } = captured.unwrap();
+    assert_eq!(report.unreadable, vec![RelPath::parse("pgdata").unwrap()]);
+}
+
 #[test]
 fn a_plain_directory_and_harness_state_round_trip_exactly() {
     let dir = tempfile::tempdir().unwrap();

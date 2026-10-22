@@ -202,6 +202,9 @@ pub struct CaptureReport {
     pub special_files: Vec<RelPath>,
     /// FIFOs, sockets and devices in the harness state directory, left behind.
     pub special_harness: Vec<RelPath>,
+    /// Directories of a repository capture could not open, left behind
+    /// with everything under them, as git's listings leave them.
+    pub unreadable: Vec<RelPath>,
     /// Nested repositories, tracked submodules aside: in a repository the
     /// whole nested tree stays behind, in a plain directory its files are
     /// carried and only its `.git` stays behind.
@@ -640,22 +643,41 @@ fn list_tree(base: &Path) -> Result<Listing, CaptureError> {
     Ok(out)
 }
 
+/// What the walk for empty directories found.
+#[derive(Default)]
+struct EmptyDirs {
+    /// Every empty directory.
+    found: Vec<Found>,
+    /// Every directory below the root it could not open.
+    unreadable: Vec<RelPath>,
+}
+
 /// Lists every empty directory under `root`, without following links, for the git half, whose listings name only files.
 ///
 /// A directory that holds `.git` in any letter case is a repository, a
 /// nested one or a submodule checkout, and is not walked. `skip` names an
 /// empty directory that travels another way, such as a submodule that was
-/// never initialized, whose path `W` holds.
-fn empty_dirs(root: &Path, skip: &dyn Fn(&RelPath) -> bool) -> Result<Vec<Found>, CaptureError> {
+/// never initialized, whose path `W` holds. A directory below the root that
+/// cannot be opened for lack of permission, as a container's volume owned
+/// by another user, is listed in `unreadable` and not walked: git's own
+/// listings skip it with a warning, so nothing under it travels either way.
+fn empty_dirs(root: &Path, skip: &dyn Fn(&RelPath) -> bool) -> Result<EmptyDirs, CaptureError> {
     fn walk(
         root: &Path,
         prefix: &str,
         skip: &dyn Fn(&RelPath) -> bool,
-        out: &mut Vec<Found>,
+        out: &mut EmptyDirs,
     ) -> Result<(), CaptureError> {
         let dir = root.join(prefix);
-        let mut names: Vec<_> = fs::read_dir(&dir)
-            .map_err(|e| io_err(&dir, e))?
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied && !prefix.is_empty() => {
+                out.unreadable.push(rel_path(prefix)?);
+                return Ok(());
+            }
+            Err(e) => return Err(io_err(&dir, e)),
+        };
+        let mut names: Vec<_> = entries
             .map(|e| e.map(|e| e.file_name()))
             .collect::<Result<_, _>>()
             .map_err(|e| io_err(&dir, e))?;
@@ -668,7 +690,7 @@ fn empty_dirs(root: &Path, skip: &dyn Fn(&RelPath) -> bool) -> Result<Vec<Found>
             let rel = rel_path(prefix)?;
             if !skip(&rel) {
                 let meta = fs::symlink_metadata(&dir).map_err(|e| io_err(&dir, e))?;
-                out.push(Found {
+                out.found.push(Found {
                     rel,
                     kind: FoundKind::Dir,
                     meta,
@@ -695,7 +717,7 @@ fn empty_dirs(root: &Path, skip: &dyn Fn(&RelPath) -> bool) -> Result<Vec<Found>
         }
         Ok(())
     }
-    let mut out = Vec::new();
+    let mut out = EmptyDirs::default();
     walk(root, "", skip, &mut out)?;
     Ok(out)
 }
@@ -2188,16 +2210,14 @@ fn strip_userinfo(url: &str) -> Option<String> {
 /// runs no `Store::gc` in between, since gc may remove an object the
 /// manifest reuses.
 pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, CaptureError> {
-    let root_text = req.root.to_str().ok_or_else(|| CaptureError::BadRoot {
+    let bad_root = || CaptureError::BadRoot {
         path: req.root.to_owned(),
-    })?;
-    let root = AbsPath::parse(root_text).map_err(|_| CaptureError::BadRoot {
-        path: req.root.to_owned(),
-    })?;
+    };
+    let root = (req.root.to_str())
+        .and_then(|text| AbsPath::parse(text).ok())
+        .ok_or_else(bad_root)?;
     if !req.root.is_dir() {
-        return Err(CaptureError::BadRoot {
-            path: req.root.to_owned(),
-        });
+        return Err(bad_root());
     }
     let parent_manifest = match req.parent {
         Some(parent) => {
@@ -2236,7 +2256,9 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
         // git lists files only, so an empty directory, untracked or
         // ignored, comes from a walk; one `W` holds as a submodule stays out.
         let in_w: HashSet<&RelPath> = seen.paths.iter().collect();
-        found.extend(empty_dirs(req.root, &|rel| in_w.contains(rel))?);
+        let empty = empty_dirs(req.root, &|rel| in_w.contains(rel))?;
+        found.extend(empty.found);
+        capturer.report.unreadable = empty.unreadable;
         (
             Some(state),
             found,

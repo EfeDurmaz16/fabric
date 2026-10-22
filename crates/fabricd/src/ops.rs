@@ -2481,6 +2481,11 @@ fn report_capture(report: &fabric_store::capture::CaptureReport, out: &mut Out) 
         "left behind (not a file, link or directory, harness state)",
         &report.special_harness,
     );
+    say_each(
+        out,
+        "left behind with everything under it (this user cannot read the directory)",
+        &report.unreadable,
+    );
     // In a repository the whole nested tree stays; in a plain directory
     // its files travel and only its `.git` stays.
     let nested = if report.bundle.is_some() {
