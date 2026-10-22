@@ -2174,7 +2174,13 @@ impl Node {
         force: bool,
         out: &mut Out,
     ) -> Result<(), NodeError> {
-        let here = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
+        let mut here =
+            NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
+        // The agent of an ACP job is named per job, so only the target of a
+        // pull, this node, can look for it.
+        if let (Target::Here, Some((HarnessKind::Acp { program, .. }, _))) = (target, job) {
+            here.measure_acp(program.as_str(), path_var, &self.harness_config);
+        }
         // A session the peer opened is used too: a peer behind a NAT has
         // no address here and is reachable only over the session it dialed.
         let (theirs, clock_skew_ms, wire) = self
@@ -3258,6 +3264,54 @@ pub(crate) mod tests {
             assert!(
                 matches!(&refused, Err(NodeError::Preflight(facts)) if facts.contains(login)),
                 "{refused:?}"
+            );
+        }
+        let job = a.job(id).await.unwrap();
+        assert!(matches!(
+            job.lock().await.view(a.id),
+            LeaseView::Owner(token) if token.epoch == Epoch::FIRST
+        ));
+    }
+
+    /// A pull of an ACP job must find the agent on the pulling command's
+    /// `PATH` and a `state_dir` for it in this node's `harness.toml` before
+    /// it takes the job. Otherwise the job would be owned by a node that
+    /// cannot launch it, or cannot restore and capture its session, and
+    /// `--force` does not waive either.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pull_refuses_an_acp_agent_this_node_cannot_run() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        a.suspend(id, &path, &mut Out::default()).await.unwrap();
+        // The two test nodes have different homes, which refuses too.
+        for (agent, agent_found) in [
+            ("acp:fabric-no-such-agent", false),
+            // `sh` is on every PATH, and no harness.toml here names it.
+            ("acp:sh", true),
+        ] {
+            let harness = crate::harnesses::parse_harness(agent).unwrap();
+            let refused = b
+                .job_resume(
+                    id,
+                    Some(a.id),
+                    Some(harness),
+                    true,
+                    &path,
+                    &mut Out::default(),
+                )
+                .await;
+            let Err(NodeError::Preflight(facts)) = &refused else {
+                panic!("{agent}: {refused:?}");
+            };
+            let facts: Vec<&str> = facts.split(", ").collect();
+            assert!(facts.contains(&"acp.state_dir"), "{agent}: {facts:?}");
+            assert_eq!(
+                facts.contains(&"acp.agent"),
+                !agent_found,
+                "{agent}: {facts:?}"
             );
         }
         let job = a.job(id).await.unwrap();

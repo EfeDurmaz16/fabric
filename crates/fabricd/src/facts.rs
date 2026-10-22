@@ -21,6 +21,8 @@ use fabric_env::detect::{Detection, Ecosystem, NodeManager};
 use fabric_net::wire::{FactName, FactValue, Facts, MAX_FACT_VALUE};
 use fabric_store::capture::CarryKeys;
 
+use crate::harnesses::HarnessConfig;
+
 /// How long one measuring command may run.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -76,6 +78,12 @@ pub mod name {
     pub const ICLOUD_DESKTOP: &str = "icloud.desktop";
     /// Whether iCloud Drive syncs `~/Documents`.
     pub const ICLOUD_DOCUMENTS: &str = "icloud.documents";
+    /// Where the `PATH` of the pulling command finds the job's ACP agent;
+    /// measured by the target of a pull only, never sent to a peer.
+    pub const ACP_AGENT: &str = "acp.agent";
+    /// The `state_dir` the target's `harness.toml` gives the job's ACP
+    /// agent; measured by the target of a pull only, never sent to a peer.
+    pub const ACP_STATE_DIR: &str = "acp.state_dir";
 }
 
 /// One node's measured facts, by name.
@@ -216,6 +224,22 @@ impl NodeFacts {
         put(name::ICLOUD_DESKTOP, desktop);
         put(name::ICLOUD_DOCUMENTS, documents);
         Self(facts)
+    }
+
+    /// Adds what this node has for the ACP agent `program`: where `path_var`
+    /// finds it, and the `state_dir` `config` gives it. Either is absent
+    /// when the node has none.
+    pub fn measure_acp(&mut self, program: &str, path_var: &OsString, config: &HarnessConfig) {
+        if let Some(found) = find_on_path(program, path_var) {
+            self.0
+                .insert(name::ACP_AGENT.to_owned(), found.display().to_string());
+        }
+        if let Some(entry) = config.acp.get(program) {
+            self.0.insert(
+                name::ACP_STATE_DIR.to_owned(),
+                entry.state_dir.display().to_string(),
+            );
+        }
     }
 
     /// The value of a fact, if it was measured.

@@ -3,11 +3,12 @@
 //! Invariant: every row compares strings for equality and never parses a
 //! version into a range, because every coupling the research found was an
 //! exact-string one. A row that refuses stops a move unless the user passes
-//! `--force`, and two rows refuse even then: a different user or home,
-//! because the root would not exist on the target (ADR 0011), and a target
-//! with no login for the job's harness, because the harness would fail
-//! inside with a worse message. The comparison is pure; measuring is
-//! `facts`' job.
+//! `--force`, and some refuse even then: a different user or home, because
+//! the root would not exist on the target (ADR 0011), and a target with no
+//! login for the job's harness, or for an ACP job no agent or no
+//! `state_dir` for it, because the harness would fail inside with a worse
+//! message once the target owns the job. The comparison is pure; measuring
+//! is `facts`' job.
 
 use std::fmt;
 use std::path::Path;
@@ -292,7 +293,48 @@ fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Ro
             },
         });
     }
+    if let Some(HarnessKind::Acp { program, .. }) = ctx.harness {
+        rows.extend(acp_rows(program.as_str(), here, peer, ctx));
+    }
     rows
+}
+
+/// The rows for an ACP job: the target must find the agent and give it a
+/// `state_dir`, or the job would be owned by a node that cannot launch it,
+/// restore its session or capture it. Only the target of a pull measures
+/// them; a peer does not report its agents, so a push can only warn.
+fn acp_rows(program: &str, here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> [Row; 2] {
+    let missing = [
+        (
+            name::ACP_AGENT,
+            format!("this node's PATH has no {program}, so the job could not launch here"),
+        ),
+        (
+            name::ACP_STATE_DIR,
+            format!(
+                "harness.toml here gives {program} no state_dir, so its session could not be restored or captured here"
+            ),
+        ),
+    ];
+    missing.map(|(fact, absent)| {
+        let (outcome, note) = match ctx.target {
+            Target::Here if here.get(fact).is_some() => (Outcome::Equal, String::new()),
+            Target::Here => (Outcome::Refuse(Waiver::Never), absent),
+            Target::Peer => (
+                Outcome::Warn,
+                format!(
+                    "a peer does not report its ACP agents, so whether it has {program} and a state_dir for it is not checked"
+                ),
+            ),
+        };
+        Row {
+            fact,
+            here: value(here, fact),
+            peer: value(peer, fact),
+            outcome,
+            note,
+        }
+    })
 }
 
 /// Every job's workspace is a repository and restore runs git, so a job
