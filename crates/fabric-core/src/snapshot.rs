@@ -6,7 +6,8 @@
 //! that is hashed: two manifests with the same fields have the same
 //! `SnapshotId` on every node and in every version of this crate that writes
 //! format version 1. A tree never places an entry below a file or a symlink,
-//! and no mode bit above the low nine is representable.
+//! `files` and the working-tree commit meet only at a directory of
+//! `files`, and no mode bit above the low nine is representable.
 
 use std::collections::HashSet;
 
@@ -58,6 +59,18 @@ pub enum ManifestError {
     InBothTrees {
         /// The path.
         path: RelPath,
+    },
+    /// A path in `files` and a path in the working-tree commit lie one below the other, and the upper one is not a directory, so restore cannot write both.
+    ///
+    /// Every working-tree path is a leaf of its commit's tree (a file, a
+    /// symlink or a submodule), so nothing in `files` may lie below one, and
+    /// a `files` entry above one must be the directory the two trees share.
+    #[error("{files} in files and {worktree} in the working-tree commit lie one below the other")]
+    TreesNest {
+        /// The path in `files`.
+        files: RelPath,
+        /// The path in the working-tree commit.
+        worktree: RelPath,
     },
     /// The git state mixes SHA-1 and SHA-256 object ids, which no one repository can hold.
     #[error("git state mixes SHA-1 and SHA-256 object ids")]
@@ -358,19 +371,67 @@ fn check_sorted<K: Ord>(
     }
 }
 
+/// Returns the proper ancestors of a relative path, shortest first: `a` and `a/b` for `a/b/c`.
+fn ancestors(path: &str) -> impl Iterator<Item = &str> {
+    path.match_indices('/').map(move |(i, _)| &path[..i])
+}
+
 fn check_tree(list: &'static str, entries: &[Entry]) -> Result<(), ManifestError> {
     check_sorted(list, entries.iter().map(|e| &e.rel_path))?;
     let mut non_dirs = HashSet::new();
     for (index, entry) in entries.iter().enumerate() {
         let path = entry.rel_path.as_str();
-        let under_non_dir = path
-            .match_indices('/')
-            .any(|(i, _)| non_dirs.contains(&path[..i]));
+        let under_non_dir = ancestors(path).any(|a| non_dirs.contains(a));
         if under_non_dir {
             return Err(ManifestError::UnderNonDir { index });
         }
         if !matches!(entry.kind, EntryKind::Dir) {
             non_dirs.insert(path);
+        }
+    }
+    Ok(())
+}
+
+/// Checks that restore can write `files` after the working-tree commit `W`.
+///
+/// Restore checks out `W`, whose paths `worktree_mtimes` lists, and then
+/// creates `files` exclusively. A shared path never restores, nor does a
+/// `files` entry below a `W` path, which is a file, a symlink or a
+/// submodule, nor a `files` file or symlink above a `W` path, where `W`
+/// already made a directory. Both lists are sorted by path, so each
+/// ancestor is one binary search.
+fn check_trees_apart(files: &[Entry], worktree: &[(RelPath, u64)]) -> Result<(), ManifestError> {
+    let in_worktree = |path: &str| {
+        worktree
+            .binary_search_by(|(p, _)| p.as_str().cmp(path))
+            .ok()
+    };
+    for entry in files {
+        let path = entry.rel_path.as_str();
+        if in_worktree(path).is_some() {
+            return Err(ManifestError::InBothTrees {
+                path: entry.rel_path.clone(),
+            });
+        }
+        if let Some(index) = ancestors(path).find_map(in_worktree) {
+            return Err(ManifestError::TreesNest {
+                files: entry.rel_path.clone(),
+                worktree: worktree[index].0.clone(),
+            });
+        }
+    }
+    for (path, _) in worktree {
+        let above = ancestors(path.as_str()).find_map(|a| {
+            files
+                .binary_search_by(|e| e.rel_path.as_str().cmp(a))
+                .ok()
+                .filter(|&i| !matches!(files[i].kind, EntryKind::Dir))
+        });
+        if let Some(index) = above {
+            return Err(ManifestError::TreesNest {
+                files: files[index].rel_path.clone(),
+                worktree: path.clone(),
+            });
         }
     }
     Ok(())
@@ -403,19 +464,7 @@ impl SnapshotManifest {
             if mixed {
                 return Err(ManifestError::MixedObjectFormat);
             }
-            // Restore checks out W, whose paths `worktree_mtimes` lists, and
-            // then creates `files` exclusively; a shared path never restores.
-            for entry in &self.files {
-                if git
-                    .worktree_mtimes
-                    .binary_search_by(|(path, _)| path.cmp(&entry.rel_path))
-                    .is_ok()
-                {
-                    return Err(ManifestError::InBothTrees {
-                        path: entry.rel_path.clone(),
-                    });
-                }
-            }
+            check_trees_apart(&self.files, &git.worktree_mtimes)?;
             // ADR 0004 strips credentials at capture; the receiving node holds
             // the same line, or a token in remote.origin.url would be written
             // into every target's .git/config.

@@ -234,10 +234,16 @@ fn manifest() -> impl Strategy<Value = SnapshotManifest> {
                 caches,
             )| {
                 let caches = sorted_unique(caches, |c| c.path.clone());
-                // A path is in `files` or in the working tree, never both.
+                // A path is in `files` or in the working tree, never both,
+                // and the two nest only below a directory in `files`.
                 if let Some(git) = git.as_mut() {
-                    git.worktree_mtimes
-                        .retain(|(path, _)| files.iter().all(|e| e.rel_path != *path));
+                    git.worktree_mtimes.retain(|(path, _)| {
+                        files.iter().all(|e| {
+                            !e.rel_path.starts_with(path)
+                                && (matches!(e.kind, EntryKind::Dir)
+                                    || !path.starts_with(&e.rel_path))
+                        })
+                    });
                 }
                 SnapshotManifest {
                     job_id: JobId::from_bytes(job),
@@ -594,6 +600,39 @@ fn a_path_in_files_and_the_working_tree_is_refused() {
         m.encode(),
         Err(ManifestError::InBothTrees { path: p }) if p == path
     ));
+}
+
+/// Restore checks out the working tree before it creates `files`, so a
+/// `files` entry below a working-tree file, or a `files` file or symlink
+/// above a working-tree path, never restores; a `files` directory above
+/// one is the parent the two trees share.
+#[test]
+fn a_files_entry_nested_with_a_working_tree_path_is_refused() {
+    // The fixed manifest's working tree holds `src/lib.rs`.
+    let mut m = fixed_manifest().unwrap();
+    let nest = |m: &SnapshotManifest, files: &str, worktree: &str| {
+        matches!(m.encode(), Err(ManifestError::TreesNest { files: f, worktree: w })
+            if f.as_str() == files && w.as_str() == worktree)
+    };
+    m.files = vec![dir("src/lib.rs/x").unwrap()];
+    assert!(nest(&m, "src/lib.rs/x", "src/lib.rs"));
+    m.files = vec![Entry {
+        rel_path: RelPath::parse("src").unwrap(),
+        kind: EntryKind::File {
+            size: 0,
+            chunks: vec![],
+        },
+        mode: mode(0o644).unwrap(),
+        mtime_ns: 1,
+    }];
+    assert!(nest(&m, "src", "src/lib.rs"));
+    m.files[0].kind = EntryKind::Symlink {
+        target: "elsewhere".into(),
+    };
+    assert!(nest(&m, "src", "src/lib.rs"));
+    m.files = vec![dir("src").unwrap(), dir("src/target").unwrap()];
+    let bytes = m.encode().unwrap();
+    assert_eq!(SnapshotManifest::decode(&bytes).unwrap(), m);
 }
 
 #[test]

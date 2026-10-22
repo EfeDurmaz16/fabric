@@ -622,8 +622,21 @@ fn a_hostile_manifest_cannot_write_through_a_link_or_over_a_file() {
         mtime_ns: 0,
     };
 
+    // A path below a working-tree link is refused before it can publish.
     let mut through_link = manifest.clone();
     through_link.files = vec![entry("escape/evil")];
+    let err = store.publish(&through_link).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::Manifest(ManifestError::TreesNest { files, worktree })
+            if files.as_str() == "escape/evil" && worktree.as_str() == "escape"),
+        "{err}"
+    );
+    // Validation sees the working tree only through `worktree_mtimes`, which
+    // a peer can leave the link out of; the writer still refuses the path.
+    let git_state = through_link.git.as_mut().unwrap();
+    git_state
+        .worktree_mtimes
+        .retain(|(path, _)| path.as_str() != "escape");
     let id = store.publish(&through_link).unwrap();
     let target = dir.path().join("t1");
     let err = restore_into(&store, id, &target).unwrap_err();
