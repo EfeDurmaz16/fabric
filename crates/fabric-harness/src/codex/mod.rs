@@ -325,10 +325,31 @@ impl Codex {
         }
     }
 
-    /// Uses this binary instead of looking `codex` up on `PATH`.
+    /// Uses this binary instead of looking `codex` up on `PATH`. The
+    /// path is absolute: the version probe runs in this process's
+    /// directory and the launch in the workspace, so a relative path would
+    /// name one file to the probe and another to the launch.
+    ///
+    /// ```
+    /// # use fabric_core::path::AbsPath;
+    /// # use fabric_harness::codex::Codex;
+    /// let home = AbsPath::parse("/h").unwrap();
+    /// let binary = AbsPath::parse("/opt/codex/bin/codex").unwrap();
+    /// let _ = Codex::new(home, Default::default()).with_binary(&binary);
+    /// ```
+    ///
+    /// A relative path does not type-check:
+    ///
+    /// ```compile_fail,E0308
+    /// # use fabric_core::path::AbsPath;
+    /// # use fabric_harness::codex::Codex;
+    /// let home = AbsPath::parse("/h").unwrap();
+    /// let binary = std::path::PathBuf::from("./bin/codex");
+    /// let _ = Codex::new(home, Default::default()).with_binary(&binary);
+    /// ```
     #[must_use]
-    pub fn with_binary(mut self, binary: PathBuf) -> Self {
-        self.binary = Some(binary);
+    pub fn with_binary(mut self, binary: &AbsPath) -> Self {
+        self.binary = Some(pipeline::fs_path(binary).to_path_buf());
         self
     }
 

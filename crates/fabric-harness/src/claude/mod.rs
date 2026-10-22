@@ -135,10 +135,31 @@ impl ClaudeCode {
         }
     }
 
-    /// Uses this binary instead of looking `claude` up on `PATH`.
+    /// Uses this binary instead of looking `claude` up on `PATH`. The
+    /// path is absolute: the version probe runs in this process's
+    /// directory and the launch in the workspace, so a relative path would
+    /// name one file to the probe and another to the launch.
+    ///
+    /// ```
+    /// # use fabric_core::path::AbsPath;
+    /// # use fabric_harness::claude::ClaudeCode;
+    /// let home = AbsPath::parse("/h").unwrap();
+    /// let binary = AbsPath::parse("/opt/claude/bin/claude").unwrap();
+    /// let _ = ClaudeCode::new(home, Default::default()).with_binary(&binary);
+    /// ```
+    ///
+    /// A relative path does not type-check:
+    ///
+    /// ```compile_fail,E0308
+    /// # use fabric_core::path::AbsPath;
+    /// # use fabric_harness::claude::ClaudeCode;
+    /// let home = AbsPath::parse("/h").unwrap();
+    /// let binary = std::path::PathBuf::from("./bin/claude");
+    /// let _ = ClaudeCode::new(home, Default::default()).with_binary(&binary);
+    /// ```
     #[must_use]
-    pub fn with_binary(mut self, binary: PathBuf) -> Self {
-        self.binary = Some(binary);
+    pub fn with_binary(mut self, binary: &AbsPath) -> Self {
+        self.binary = Some(pipeline::fs_path(binary).to_path_buf());
         self
     }
 
