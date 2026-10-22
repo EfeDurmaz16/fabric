@@ -1783,7 +1783,8 @@ impl Node {
             .await?;
             // With no harness named, the job's own launches, and the pull
             // must still find the one the preflight checked.
-            self.pull(id, holder, harness.is_none().then_some(&kind), out)
+            let checked = harness.is_none().then_some(&kind);
+            self.pull(id, holder, (checked, force), path_var, out)
                 .await?;
         }
         let job = self.job(id).await?;
@@ -1820,7 +1821,8 @@ impl Node {
         self: &Arc<Self>,
         id: JobId,
         holder: NodeId,
-        checked: Option<&HarnessKind>,
+        (checked, force): (Option<&HarnessKind>, bool),
+        path_var: &OsString,
         out: &mut Out,
     ) -> Result<(), NodeError> {
         out.say(format!("pulling job {id} from {holder}"));
@@ -1855,18 +1857,34 @@ impl Node {
         out.say(format!("{holder} started move {move_id} toward this node"));
         self.pull_records(id, holder).await?;
         self.ensure_latest(id, holder).await?;
+        // A path this node can neither use nor make again stops the pull
+        // before it imports, as it stops a push before `MoveStarted`.
+        let refused = if force {
+            None
+        } else {
+            self.carry_refusal_here(id, path_var, out).await?
+        };
         faults::hit(Point::BeforeImport).await;
-        let changed = {
+        let stopped = {
             let job = self.job(id).await?;
             let mut job = job.lock().await;
             // The records hold the holder's `MoveStarted`, after which it
             // runs nothing, so the harness they name is the one to launch.
             // A move this node already decided is left to `import`.
-            if let Some(checked) = checked
-                && job.harness() != checked
-                && job.ledger().decision_for(move_id).is_none()
-            {
-                let change = (checked.clone(), job.harness().clone());
+            let undecided = job.ledger().decision_for(move_id).is_none();
+            let stop = match checked {
+                Some(checked) if undecided && job.harness() != checked => {
+                    Some(NodeError::HarnessChangedDuringPull {
+                        job: id,
+                        holder,
+                        checked: Box::new(checked.clone()),
+                        now: Box::new(job.harness().clone()),
+                    })
+                }
+                _ if undecided => refused,
+                _ => None,
+            };
+            if stop.is_some() {
                 if let AbortAnswer::Abort(record) = job.ledger().answer_abort(
                     self.id,
                     move_id,
@@ -1875,24 +1893,18 @@ impl Node {
                 )? {
                     job.commit(record, Author::Node(self.id))?;
                 }
-                Some(change)
             } else {
                 self.import(&mut job, holder, move_id, out)?;
-                None
             }
+            stop
         };
-        if let Some((checked, now)) = changed {
+        if let Some(stop) = stopped {
             if let Err(e) = self.push_records(id, holder).await {
                 out.say(format!(
                     "{holder} has not seen the abort yet ({e}); it will ask for the decision"
                 ));
             }
-            return Err(NodeError::HarnessChangedDuringPull {
-                job: id,
-                holder,
-                checked: Box::new(checked),
-                now: Box::new(now),
-            });
+            return Err(stop);
         }
         // The holder learns the decision now, or from MoveStatus later.
         if let Err(e) = self.push_records(id, holder).await {
@@ -1901,6 +1913,37 @@ impl Node {
             ));
         }
         Ok(())
+    }
+
+    /// Decides here, with this node's facts, each ignored path of the job's
+    /// latest snapshot, and returns the refusal to stop a pull with when
+    /// one of them is refused, after printing the decisions.
+    async fn carry_refusal_here(
+        &self,
+        id: JobId,
+        path_var: &OsString,
+        out: &mut Out,
+    ) -> Result<Option<NodeError>, NodeError> {
+        let latest = {
+            let job = self.job(id).await?;
+            let job = job.lock().await;
+            job.latest()
+        };
+        let Some(snapshot) = latest else {
+            return Ok(None);
+        };
+        let manifest = with_store(&self.store, move |store| Ok(store.manifest(snapshot)?)).await?;
+        let facts = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
+        let decisions = carry::decide_all(&manifest, &facts);
+        let mut said = Out::default();
+        let refusal = refuse_carry(&decisions, false, &mut said).err();
+        if refusal.is_some() {
+            out.say(format!(
+                "what this node would do with each ignored path of snapshot {snapshot}:"
+            ));
+            say_decisions(out, &decisions, PathDecision::to_string);
+        }
+        Ok(refusal)
     }
 
     /// Imports the open move `move_id` from `holder` into `job`, whose lock the caller holds.
@@ -2966,7 +3009,8 @@ fn plan(
 }
 
 /// One decision as resume prints it: a refused path is written anyway,
-/// because it arrived through `--force` or a pull and leaving it out would lose it.
+/// because it arrived through `--force`, or the job was already here, and
+/// leaving it out would lose it.
 fn restore_line(decision: &PathDecision) -> String {
     if decision.decision.refuses() {
         format!("{decision}; written anyway, since nothing here can make it again")
@@ -3418,6 +3462,11 @@ pub(crate) mod tests {
         })
         .unwrap();
         (dir, node)
+    }
+
+    /// This process's `PATH`, as the CLI passes its own.
+    fn path_var() -> OsString {
+        std::env::var_os("PATH").unwrap_or_default()
     }
 
     /// A job made from a one-commit repository, owned by `node` at epoch 1.
@@ -4203,7 +4252,9 @@ pub(crate) mod tests {
         std::fs::write(thief_root.join("thief.txt"), "b's work\n").unwrap();
         b.suspend(id, &path, out).await.unwrap();
 
-        a.pull(id, b.id, None, out).await.unwrap();
+        a.pull(id, b.id, (None, false), &path_var(), out)
+            .await
+            .unwrap();
         let job = a.job(id).await.unwrap();
         let mut job = job.lock().await;
         let epoch = owner_token(&job, a.id).unwrap().epoch;
@@ -4352,7 +4403,9 @@ pub(crate) mod tests {
         let out = &mut Out::default();
         let id = job(dir_a.path(), &a).await;
         a.suspend(id, &path, out).await.unwrap();
-        b.pull(id, a.id, None, out).await.unwrap();
+        b.pull(id, a.id, (None, false), &path_var(), out)
+            .await
+            .unwrap();
         let approved = b.cfg.state.job(id).env_spec_ran();
         std::fs::write(&approved, "spec inputs\n").unwrap();
 
@@ -5446,7 +5499,9 @@ pub(crate) mod tests {
         std::fs::write(root.join(".fabric/env.toml"), "").unwrap();
         a.suspend(id, &path, out).await.unwrap();
 
-        b.pull(id, a.id, None, out).await.unwrap();
+        b.pull(id, a.id, (None, false), &path_var(), out)
+            .await
+            .unwrap();
         let root = {
             let job = b.job(id).await.unwrap();
             let mut job = job.lock().await;
@@ -6027,7 +6082,13 @@ pub(crate) mod tests {
             harness.wait()
         });
         let pulled = b
-            .pull(id, a.id, Some(&HarnessKind::Codex), &mut Out::default())
+            .pull(
+                id,
+                a.id,
+                (Some(&HarnessKind::Codex), false),
+                &path_var(),
+                &mut Out::default(),
+            )
             .await;
         reaper.join().unwrap().unwrap();
         assert!(
@@ -6037,6 +6098,54 @@ pub(crate) mod tests {
                     if **checked == HarnessKind::Codex && **now == HarnessKind::ClaudeCode
             ),
             "{pulled:?}"
+        );
+        let held = a.job(id).await.unwrap();
+        assert!(
+            matches!(held.lock().await.view(a.id), LeaseView::Owner(_)),
+            "the holder did not get the job back"
+        );
+        let pulled = b.job(id).await.unwrap();
+        assert!(!matches!(
+            pulled.lock().await.view(b.id),
+            LeaseView::Owner(_)
+        ));
+    }
+
+    /// A pull decides each ignored path of the snapshot with this node's
+    /// facts before it imports, as a push does before `MoveStarted`. A
+    /// locked tree this node can neither rebuild nor use, here a pnpm tree
+    /// no finished install vouches for on a node whose `PATH` has no pnpm,
+    /// aborts the move and leaves the job with the holder; imported first,
+    /// the job would own a tree its resume cannot install (review of PR #11).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pull_aborts_when_this_node_cannot_use_or_rebuild_a_path() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let root = paths::job_root(&a.cfg.home, id);
+        std::fs::write(root.join("package.json"), "{\"name\": \"x\"}\n").unwrap();
+        std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), "1;\n").unwrap();
+        a.suspend(id, &path_var(), &mut Out::default())
+            .await
+            .unwrap();
+        let no_pnpm = OsString::from("/usr/bin:/bin");
+        let mut out = Out::default();
+        let pulled = b.pull(id, a.id, (None, false), &no_pnpm, &mut out).await;
+        assert!(
+            matches!(&pulled, Err(NodeError::Preflight(text)) if text.contains("node_modules")),
+            "{pulled:?} {:?}",
+            out.lines
+        );
+        assert!(
+            out.lines
+                .iter()
+                .any(|line| line.starts_with("refuse  node_modules")),
+            "{:?}",
+            out.lines
         );
         let held = a.job(id).await.unwrap();
         assert!(

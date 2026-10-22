@@ -36,10 +36,10 @@ pub enum CarryDecision {
         /// Why the bytes are not used.
         because: String,
     },
-    /// The target can neither use the bytes nor make the path again. A move
-    /// stops here unless forced; a forced one, and a restore that meets this
-    /// without a move, writes the bytes, since leaving them out would lose
-    /// them.
+    /// The target can neither use the bytes nor make the path again. A
+    /// move, pushed or pulled, stops here unless forced; a forced one, and
+    /// a restore that meets this without a move, writes the bytes, since
+    /// leaving them out would lose them.
     Refuse {
         /// Why, precisely.
         reason: String,
@@ -80,8 +80,9 @@ pub enum LeaveBehindReason {
 
 impl CarryDecision {
     /// True when the target writes the bytes: carried, or refused, since a
-    /// refused path reaches a restore only through `--force` or a pull,
-    /// and leaving it out there would lose it.
+    /// refused path reaches a restore only through `--force`, or on the
+    /// node that already owns the job, and leaving it out there would lose
+    /// it.
     #[must_use]
     pub const fn writes(&self) -> bool {
         matches!(
