@@ -1413,6 +1413,34 @@ fn a_cache_git_does_not_ignore_travels_whole() {
     assert!(!target.join("server.pem").exists());
 }
 
+/// A directory with a cache's name that holds a tracked file is the
+/// project's own, not a cache: an untracked key dropped beside the tracked
+/// file, as a signing key in an Electron app's `build`, is judged by the
+/// full secret list. It stays behind, the report names it, and it never
+/// becomes an object in the repository.
+#[test]
+fn an_untracked_key_beside_a_tracked_file_under_a_cache_name_stays_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    fs::create_dir_all(root.join("build")).unwrap();
+    fs::write(root.join("package.json"), "{}\n").unwrap();
+    fs::write(root.join("build/entitlements.plist"), "<plist/>\n").unwrap();
+    let g = git(&root);
+    g.run(&["init", "-q", "-b", "main"]).unwrap();
+    g.run(&["add", "-A"]).unwrap();
+    g.run(&["commit", "-q", "-m", "one"]).unwrap();
+    fs::write(root.join("build/developer-id.p12"), "key\n").unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { report, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    assert_eq!(
+        report.denied_untracked,
+        vec![RelPath::parse("build/developer-id.p12").unwrap()]
+    );
+    let objects = g.run_text(&["rev-list", "--objects", "--all"]).unwrap();
+    assert!(!objects.contains("developer-id.p12"), "{objects}");
+}
+
 #[test]
 fn a_plain_directory_and_harness_state_round_trip_exactly() {
     let dir = tempfile::tempdir().unwrap();

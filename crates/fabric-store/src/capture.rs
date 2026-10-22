@@ -741,6 +741,52 @@ fn carried_by<'a>(policy: &'a IgnorePolicy, root: &'a Path) -> impl FnMut(&RelPa
     move |rel| policy.classify(rel, &mut markers).carried()
 }
 
+/// Every directory that holds a tracked path, ASCII case folded, as the
+/// policy compares names.
+fn tracked_dirs(tracked: &BTreeSet<RelPath>) -> HashSet<String> {
+    let mut dirs = HashSet::new();
+    for rel in tracked {
+        let text = rel.as_str().to_ascii_lowercase();
+        let mut end = text.len();
+        // A directory already listed came with every directory above it.
+        while let Some(at) = text[..end].rfind('/') {
+            if !dirs.insert(text[..at].to_owned()) {
+                break;
+            }
+            end = at;
+        }
+    }
+    dirs
+}
+
+/// Answers whether `W` carries an untracked path under `policy`.
+///
+/// Below a cache it is judged as an ignored path is, by the cache's
+/// narrower list, so a `node_modules` git does not ignore travels whole.
+/// A directory with a cache's name that holds a tracked path is the
+/// project's own, not a cache, such as a `build` beside `package.json`
+/// that holds an app's tracked entitlements: a key dropped there gets the
+/// full list, as anywhere outside a cache.
+fn untracked_carried_by<'a>(
+    policy: &'a IgnorePolicy,
+    root: &'a Path,
+    tracked_dirs: &'a HashSet<String>,
+) -> impl FnMut(&RelPath) -> bool + 'a {
+    let mut markers = DirMarkers {
+        root,
+        seen: HashMap::new(),
+    };
+    move |rel| {
+        let class = policy.classify(rel, &mut markers);
+        match class.cache_root() {
+            Some(cache) if tracked_dirs.contains(&cache.path.as_str().to_ascii_lowercase()) => {
+                !policy.denies_anywhere(rel)
+            }
+            _ => class.carried(),
+        }
+    }
+}
+
 impl Census {
     /// Stamps every found path that `carried` keeps and records the bare `names` beside them.
     ///
@@ -1116,6 +1162,8 @@ enum BuiltBundle {
 struct GitCapture<'a> {
     git: Git,
     root: &'a Path,
+    /// The job's ignored-file policy, which judges what the snapshot carries.
+    policy: &'a IgnorePolicy,
     job_id: JobId,
     scratch: PathBuf,
     /// The user's own exclude rules, which every listing and `W` start from.
@@ -1184,6 +1232,8 @@ struct GitSeen {
     untracked: (Vec<RelPath>, Vec<RelPath>),
     /// The untracked paths `W` leaves out, which a secret pattern denies or `.fabricignore` excludes.
     left_out: BTreeSet<RelPath>,
+    /// The directories that hold a tracked path, which judge an untracked one (`untracked_carried_by`).
+    tracked_dirs: HashSet<String>,
     /// The directories of `W` with their mode and mtime, which travel in `files`.
     dirs: Vec<Entry>,
 }
@@ -1203,8 +1253,9 @@ impl GitCapture<'_> {
     /// before it was built, and `files` the ignored ones as they were
     /// listed; a path that appeared or changed after that would be missing
     /// from the snapshot, or older in it, and lost with the move. A path
-    /// `carried` refuses is in neither, so it may change: an untracked one
-    /// `W` left out, or one that appears.
+    /// the snapshot does not carry is in neither, so it may change: an
+    /// untracked one `W` left out or that appears and the policy refuses
+    /// (`untracked_carried_by`), or an ignored one `carried` refuses.
     fn unchanged_since(
         &self,
         seen: &GitSeen,
@@ -1230,9 +1281,11 @@ impl GitCapture<'_> {
             .filter(|rel| !seen.left_out.contains(*rel))
             .chain(&seen.untracked.1)
             .collect();
+        let mut untracked_carried =
+            untracked_carried_by(self.policy, self.root, &seen.tracked_dirs);
         let after: BTreeSet<&RelPath> = paths
             .iter()
-            .filter(|rel| carried(rel))
+            .filter(|rel| untracked_carried(rel))
             .chain(&nested)
             .collect();
         if let Some(rel) = before.symmetric_difference(&after).min() {
@@ -2446,6 +2499,7 @@ fn detect_git<'a>(
     Ok(Some(GitCapture {
         git,
         root: req.root,
+        policy: req.policy,
         job_id: req.job_id,
         scratch: scratch.to_owned(),
         user_excludes,
@@ -2471,17 +2525,18 @@ fn chain_depth(store: &Store, manifest: &SnapshotManifest) -> Result<u32, Captur
 /// and refuses one above `LARGE_UNTRACKED_LIMIT` that `W` would hold, unless
 /// the request allows it.
 ///
-/// An untracked path under a cache is judged as an ignored one is, by the
-/// cache's narrower list: a cache git does not ignore, such as a
-/// `node_modules` installed before a `.gitignore` was written, travels in
-/// `W` whole, or the target would hold it with holes its sentinel calls
-/// whole.
+/// An untracked path under a cache that holds no tracked path is judged
+/// as an ignored one is, by the cache's narrower list: a cache git does
+/// not ignore, such as a `node_modules` installed before a `.gitignore`
+/// was written, travels in `W` whole, or the target would hold it with
+/// holes its sentinel calls whole (`untracked_carried_by`).
 fn untracked_left_out(
     capturer: &mut Capturer<'_>,
     untracked: &[RelPath],
+    tracked_dirs: &HashSet<String>,
 ) -> Result<BTreeSet<RelPath>, CaptureError> {
     let req = capturer.req;
-    let mut carried = carried_by(req.policy, req.root);
+    let mut carried = untracked_carried_by(req.policy, req.root, tracked_dirs);
     let mut left_out = BTreeSet::new();
     let mut too_large = Vec::new();
     for rel in untracked {
@@ -2514,8 +2569,9 @@ fn capture_git(
         .report
         .nested_repositories
         .extend(nested.iter().cloned());
-    let left_out = untracked_left_out(capturer, &untracked)?;
     let tracked: BTreeSet<RelPath> = repo.tracked()?.into_iter().collect();
+    let tracked_dirs = tracked_dirs(&tracked);
+    let left_out = untracked_left_out(capturer, &untracked, &tracked_dirs)?;
     for rel in &tracked {
         if policy.denies_anywhere(rel) {
             capturer.report.tracked_secrets.push(rel.clone());
@@ -2596,6 +2652,7 @@ fn capture_git(
         stamps: before,
         untracked: (untracked, nested),
         left_out,
+        tracked_dirs,
         dirs: repo.worktree_dirs(&state.worktree_commit)?,
     };
     Ok((state, seen))
@@ -2689,6 +2746,7 @@ mod tests {
         let repo = GitCapture {
             git: Git::new(&root).with_date(1_760_000_000_000),
             root: &root,
+            policy: &IgnorePolicy::default(),
             job_id: JobId::from_bytes([1; 16]),
             scratch: dir.path().to_owned(),
             user_excludes: String::new(),
@@ -2719,6 +2777,7 @@ mod tests {
         let repo = GitCapture {
             git: Git::new(&root).with_date(1_760_000_000_000),
             root: &root,
+            policy: &IgnorePolicy::default(),
             job_id: JobId::from_bytes([1; 16]),
             scratch: dir.path().to_owned(),
             user_excludes: String::new(),
@@ -2758,6 +2817,7 @@ mod tests {
         let repo = GitCapture {
             git: Git::new(&root).with_date(1_760_000_000_000),
             root: &root,
+            policy: &IgnorePolicy::default(),
             job_id: JobId::from_bytes([1; 16]),
             scratch: dir.path().to_owned(),
             user_excludes: String::new(),
