@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use fabric_core::id::{ChunkId, SnapshotId};
+use fabric_core::env::{EnvSpec, EnvSpecError};
+use fabric_core::id::{ChunkId, EnvSpecId, SnapshotId};
 use fabric_core::path::RelPath;
 use fabric_core::snapshot::{EntryKind, MAX_MANIFEST_LEN, ManifestError, SnapshotManifest};
 
@@ -53,6 +54,9 @@ pub enum StoreError {
     /// The manifest does not validate or encode.
     #[error(transparent)]
     Manifest(#[from] ManifestError),
+    /// An environment spec does not validate, encode or decode.
+    #[error(transparent)]
+    EnvSpec(#[from] EnvSpecError),
     /// A manifest names an object that is not in the store.
     #[error("manifest names object {chunk}, which is not in the store")]
     MissingChunk {
@@ -105,6 +109,12 @@ pub enum StoreError {
         /// The snapshot that cannot be forgotten yet.
         base: SnapshotId,
     },
+}
+
+/// The object that holds a spec's bytes: an `EnvSpecId` and a `ChunkId`
+/// are both blake3 of the same bytes, so the ids are equal.
+fn spec_object(id: EnvSpecId) -> ChunkId {
+    ChunkId::from_bytes(id.to_bytes())
 }
 
 fn io_err(path: &Path, source: io::Error) -> StoreError {
@@ -265,10 +275,12 @@ impl Store {
         &self.objects
     }
 
-    /// Every object a manifest reaches, in list order, bundle and exclude first.
+    /// Every object a manifest reaches, in list order, bundle and exclude
+    /// first, and the environment spec it names last.
     ///
     /// A node that fetches a snapshot from a peer asks for exactly these,
-    /// then publishes the manifest; publish refuses while one is missing.
+    /// then publishes the manifest; publish refuses while one is missing,
+    /// and gc keeps them while the snapshot is kept.
     #[must_use]
     pub fn data_chunks(manifest: &SnapshotManifest) -> Vec<ChunkId> {
         let mut ids = Vec::new();
@@ -287,7 +299,24 @@ impl Store {
                 ids.extend(chunks.iter().copied());
             }
         }
+        if let Some(spec) = manifest.env_spec {
+            ids.push(spec_object(spec));
+        }
         ids
+    }
+
+    /// Stores the canonical bytes of `spec` as one object and returns the
+    /// spec's id, which a manifest names in `env_spec`.
+    pub fn put_env_spec(&self, spec: &EnvSpec) -> Result<EnvSpecId, StoreError> {
+        let bytes = spec.encode()?;
+        self.objects.put(&bytes)?;
+        Ok(EnvSpecId::of(&bytes))
+    }
+
+    /// Reads the environment spec stored under `id`.
+    pub fn env_spec(&self, id: EnvSpecId) -> Result<EnvSpec, StoreError> {
+        let bytes = self.objects.read(spec_object(id))?;
+        Ok(EnvSpec::decode(&bytes)?)
     }
 
     /// Makes a manifest a published snapshot and returns its id.
