@@ -178,11 +178,21 @@ impl JobDir {
     }
 
     /// The Codex threads the job's workspace held when a Codex with no
-    /// thread to resume was planned here, until a capture or a plan takes
-    /// the thread that launch made, the oldest one not among them.
+    /// thread to resume was planned here and its launch was recorded, until
+    /// a capture or a plan takes the thread that launch made, the oldest one
+    /// not among them.
     #[must_use]
     pub fn fresh_codex(&self) -> PathBuf {
         self.dir.join("fresh-codex")
+    }
+
+    /// The Codex threads the job's workspace held when a Codex with no
+    /// thread to resume was planned here, until the registration of that
+    /// launch makes it `fresh_codex`. A plan the CLI never launched leaves
+    /// it here, so no thread made later by hand is taken for the job's.
+    #[must_use]
+    pub fn fresh_codex_planned(&self) -> PathBuf {
+        self.dir.join("fresh-codex.planned")
     }
 
     /// The id of the environment spec whose setup steps the user last let

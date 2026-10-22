@@ -300,6 +300,7 @@ impl Job {
     pub fn set_session(&self, record: &SessionRecord) -> Result<(), NodeError> {
         local::remove(&self.dir.session_pending())?;
         local::remove(&self.dir.fresh_codex())?;
+        local::remove(&self.dir.fresh_codex_planned())?;
         Ok(local::write(&self.dir.session(), record)?)
     }
 
@@ -307,6 +308,7 @@ impl Job {
     pub fn forget_session(&self) -> Result<(), NodeError> {
         local::remove(&self.dir.session_pending())?;
         local::remove(&self.dir.fresh_codex())?;
+        local::remove(&self.dir.fresh_codex_planned())?;
         Ok(local::remove(&self.dir.session())?)
     }
 

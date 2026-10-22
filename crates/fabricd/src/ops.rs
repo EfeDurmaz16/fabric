@@ -656,6 +656,18 @@ impl Node {
         if record.is_some() {
             job.session()?;
         }
+        // The threads a fresh Codex plan noted count only once its launch is
+        // recorded: a plan the CLI never launched, as when the user said no
+        // to its setup steps, must not make a thread a later `codex` typed
+        // by hand in the workspace the job's.
+        let planned = job.dir().fresh_codex_planned();
+        if harness == HarnessKind::Codex
+            && record.is_none()
+            && let Some(before) = local::read::<Vec<SessionId>>(&planned)?
+        {
+            local::write(&job.dir().fresh_codex(), &before)?;
+        }
+        local::remove(&planned)?;
         if let Some(marker) = job.marker()? {
             job.set_marker(&Marker {
                 root: marker.root,
@@ -2492,7 +2504,10 @@ fn plan(
         }
     };
     if harness == HarnessKind::Codex && session.is_none() {
-        local::write(&job.dir().fresh_codex(), &codex_threads(&root, home)?)?;
+        local::write(
+            &job.dir().fresh_codex_planned(),
+            &codex_threads(&root, home)?,
+        )?;
     }
     Ok(RunPlan {
         job: job.id(),
@@ -3132,6 +3147,22 @@ pub(crate) mod tests {
 
         fresh_codex_run(&node, id, || {}).await;
         assert_eq!(session_to_capture(&node, id).await, Some(claude));
+    }
+
+    /// A fresh Codex plan the CLI never launched, as when the user said no
+    /// to its setup steps, starts no thread of the job's: a `codex` typed
+    /// by hand in the workspace afterwards must not be taken for it.
+    #[tokio::test]
+    async fn a_fresh_codex_plan_never_launched_takes_no_thread() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        node.suspend(id, &locking_codex(dir.path()), &mut Out::default())
+            .await
+            .unwrap();
+        let plan = node.job_run(id, &mut Out::default()).await.unwrap();
+        assert_eq!(plan.session, None);
+        codex_thread_in(&node, id);
+        assert_eq!(session_to_capture(&node, id).await, None);
     }
 
     /// A fresh Codex's thread is the first the workspace gains after its
