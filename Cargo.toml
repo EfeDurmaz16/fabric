@@ -6,6 +6,39 @@ resolver = "3"
 edition = "2024"
 license = "MIT"
 rust-version = "1.97"
+publish = false
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+missing_docs = "deny"
+
+# clippy::all stays at its defaults: setting it to warn would demote
+# clippy::correctness from deny to warn.
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Pedantic lints turned off on purpose:
+# - must_use_candidate fires on nearly every pure function. Put #[must_use]
+#   where ignoring the value is a bug.
+# - missing_errors_doc asks for an "# Errors" section on every fallible
+#   function. The thiserror enums already document each failure.
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+# Restriction lints that back the project rules. clippy.toml allows unwrap,
+# expect, panic and print inside tests. A local `cargo clippy` without
+# `-D warnings` reports these as errors, as CI does; pedantic findings show
+# as warnings locally and fail CI under `-D warnings`.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+# std::process::exit is a disallowed method in clippy.toml. clippy::exit alone
+# exempts main, the one place a binary would call it.
+disallowed_methods = "deny"
+# Every #[allow] and #[expect] names its reason, so a suppression cannot
+# switch a rule off silently.
+allow_attributes_without_reason = "deny"

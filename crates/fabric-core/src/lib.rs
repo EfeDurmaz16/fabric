@@ -1,14 +1,5 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+//! Core types of Fabric. Empty until the first job and lease types land; the
+//! architecture ADRs describe the intended shape.
+//!
+//! This crate depends on nothing else in the workspace and knows nothing about
+//! QUIC, a database, or any agent vendor. Everything above it is an adapter.
