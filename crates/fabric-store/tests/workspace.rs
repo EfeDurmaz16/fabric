@@ -217,6 +217,7 @@ fn git_state_survives_capture_and_restore() {
         paths,
         vec![
             "build.log",
+            "d",
             "node_modules",
             "node_modules/pkg",
             "node_modules/pkg/cert.pem",
@@ -248,8 +249,8 @@ fn git_state_survives_capture_and_restore() {
     )
     .unwrap();
     assert_eq!(restored.files, 3);
-    // Three ignored files, their two directories and the nine entries of W.
-    assert_eq!(restored.verified, 14);
+    // Three ignored files, two directories of theirs, one of W and the nine entries of W.
+    assert_eq!(restored.verified, 15);
     assert_eq!(restore_state(&target).unwrap(), RestoreState::Present);
 
     assert_eq!(git_difference(&root, &target).unwrap(), None);
@@ -294,6 +295,37 @@ fn git_state_survives_capture_and_restore() {
     assert!(store.check(CheckDepth::Hashes).unwrap().is_clean());
 }
 
+/// A directory of tracked files keeps its mode and mtime, which no git tree records.
+#[test]
+fn a_tracked_directory_keeps_its_mode_and_mtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    fs::create_dir_all(root.join("private/keys")).unwrap();
+    fs::write(root.join("private/keys/notes.txt"), "notes\n").unwrap();
+    let g = git(&root);
+    g.run(&["init", "-q", "-b", "main"]).unwrap();
+    g.run(&["add", "-A"]).unwrap();
+    g.run(&["commit", "-q", "-m", "one"]).unwrap();
+    fs::set_permissions(root.join("private"), fs::Permissions::from_mode(0o700)).unwrap();
+    set_mtime(&root.join("private/keys"), 1_500_000_000, 5).unwrap();
+
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    assert_eq!(
+        fs::metadata(target.join("private")).unwrap().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        mtime_of(&target.join("private/keys")).unwrap(),
+        (1_500_000_000, 5)
+    );
+    assert_eq!(git_difference(&root, &target).unwrap(), None);
+}
+
 #[test]
 fn a_sha256_repository_round_trips() {
     let dir = tempfile::tempdir().unwrap();
@@ -335,7 +367,7 @@ fn verify_sees_a_tampered_file_and_link_in_the_working_tree() {
 
     assert_eq!(
         verify(&store, snapshot, &target, Verify::All, &|_| true).unwrap(),
-        14
+        15
     );
     fs::write(target.join("new.txt"), "cut short").unwrap();
     assert!(matches!(

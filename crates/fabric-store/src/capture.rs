@@ -1049,6 +1049,8 @@ struct GitSeen {
     stamps: HashMap<RelPath, Stamp>,
     /// The untracked listing: paths, then nested repositories.
     untracked: (Vec<RelPath>, Vec<RelPath>),
+    /// The directories of `W` with their mode and mtime, which travel in `files`.
+    dirs: Vec<Entry>,
 }
 
 /// What `capture` checks after every file is stored, by the kind of root.
@@ -1893,6 +1895,46 @@ impl GitCapture<'_> {
         Ok(mtimes)
     }
 
+    /// Reads the mode and mtime of every directory of `W`.
+    ///
+    /// A tree holds no metadata of its own directories, so restore would
+    /// make each with the default mode and a fresh mtime, and a directory
+    /// the user kept at 0700 would open up; these entries carry the
+    /// source's, as the walk of a plain directory does.
+    fn worktree_dirs(&self, worktree: &GitOid) -> Result<Vec<Entry>, CaptureError> {
+        let out = self
+            .git
+            .run(&["ls-tree", "-r", "-t", "-z", worktree.as_str()])?;
+        let mut dirs = Vec::new();
+        for record in Git::records(&out) {
+            let text = Git::text("tree entry", record)?;
+            let (meta, path) = text.split_once('\t').ok_or_else(|| GitError::Parse {
+                what: "tree entry",
+                text: text.to_owned(),
+            })?;
+            if meta.split(' ').nth(1) != Some("tree") {
+                continue;
+            }
+            let rel = rel_path(path)?;
+            let full = self.root.join(path);
+            let meta = match fs::symlink_metadata(&full) {
+                Ok(meta) if meta.is_dir() => meta,
+                Ok(_) => return Err(CaptureError::WorkspaceChanged { path: rel }),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    return Err(CaptureError::WorkspaceChanged { path: rel });
+                }
+                Err(e) => return Err(io_err(&full, e)),
+            };
+            dirs.push(Entry {
+                mode: Mode::from_masked(meta.mode()),
+                mtime_ns: mtime_ns(&meta, &rel)?,
+                rel_path: rel,
+                kind: EntryKind::Dir,
+            });
+        }
+        Ok(dirs)
+    }
+
     /// Lists the paths of every stash entry in `stashes` and of their index and untracked parents that `denies` names.
     ///
     /// The bundle carries every stash entry with its parents, so a `.env`
@@ -2037,13 +2079,15 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
         req,
         report: CaptureReport::default(),
     };
+    let mut worktree_dirs = Vec::new();
     let (git_state, found, settle) = if let Some(repo) = detect_git(req, store.objects().tmp_dir())?
     {
         repo.refuse_bad_states()?;
         let parent = parent_manifest
             .as_ref()
             .map(|(id, manifest)| (*id, manifest));
-        let (state, seen) = capture_git(&mut capturer, &repo, parent)?;
+        let (state, mut seen) = capture_git(&mut capturer, &repo, parent)?;
+        worktree_dirs = std::mem::take(&mut seen.dirs);
         let report = &mut capturer.report;
         let (special, nested) = (report.special_files.len(), report.nested_repositories.len());
         let found = repo.ignored(report)?;
@@ -2063,7 +2107,13 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
         capturer.report.special_files.extend(listing.special);
         (None, listing.found, Settle::Plain(census))
     };
-    let (files, caches) = capturer.classify_and_store(req.root, found)?;
+    let (mut files, caches) = capturer.classify_and_store(req.root, found)?;
+    // A directory of `W` that also holds a carried ignored file has its entry already.
+    for dir in worktree_dirs {
+        if let Err(at) = files.binary_search_by(|e| e.rel_path.cmp(&dir.rel_path)) {
+            files.insert(at, dir);
+        }
+    }
     match &settle {
         Settle::Git(git) => git.0.unchanged_since(&git.1, &git.2)?,
         Settle::Plain(census) => census.unchanged_under(req.root)?,
@@ -2283,6 +2333,7 @@ fn capture_git(
         paths: stamped,
         stamps: before,
         untracked: (untracked, nested),
+        dirs: repo.worktree_dirs(&state.worktree_commit)?,
     };
     Ok((state, seen))
 }
