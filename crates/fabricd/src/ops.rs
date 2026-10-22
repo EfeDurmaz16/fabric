@@ -211,17 +211,25 @@ impl Node {
     }
 
     fn node_list(&self, out: &mut Out) {
+        self.node_list_within(LINES_BUDGET, out);
+    }
+
+    /// Lists every paired node in one row each, in the book's order,
+    /// keeping the last rows that fit in `budget` bytes: a row is bounded
+    /// by the addresses the book keeps for a peer, but the book does not
+    /// bound how many peers it holds, and enough of them would otherwise
+    /// answer past the control message cap.
+    fn node_list_within(&self, budget: usize, out: &mut Out) {
         let book = self.peers.snapshot();
-        let mut any = false;
+        let mut lines = Vec::new();
         for entry in book.iter() {
-            any = true;
             let connected = if self.open_session(entry.node()).is_some() {
                 "connected"
             } else {
                 "not connected"
             };
             let addrs: Vec<String> = entry.addrs().iter().map(ToString::to_string).collect();
-            out.say(format!(
+            lines.push(format!(
                 "{} {} ({connected})",
                 entry.node(),
                 if addrs.is_empty() {
@@ -231,9 +239,18 @@ impl Node {
                 }
             ));
         }
-        if !any {
+        if lines.is_empty() {
             out.say("no paired nodes; pair one with `fabric node add <node-id> <host:port>`");
+            return;
         }
+        let (left_out, kept) = latest_within(lines, budget);
+        if left_out > 0 {
+            out.say(format!(
+                "the first {left_out} paired nodes are left out; the other {} fill one answer",
+                kept.len()
+            ));
+        }
+        out.lines.extend(kept);
     }
 
     /// Pings `node` over its live session, or a new dial when there is
@@ -4633,6 +4650,36 @@ pub(crate) mod tests {
             "{:?}",
             out.lines
         );
+    }
+
+    /// Each row of `node ls` is bounded, and the peer book does not bound
+    /// how many peers it holds. The answer keeps the last rows that fit its
+    /// budget and says how many it left out.
+    #[tokio::test]
+    async fn a_node_list_past_its_budget_keeps_the_last_rows() {
+        let (_dir, node) = node();
+        for byte in 1..=3_u8 {
+            node.node_add(
+                NodeId::from_bytes([byte; 32]),
+                Some(&format!("10.0.0.{byte}:1")),
+                &mut Out::default(),
+            )
+            .await
+            .unwrap();
+        }
+        let mut all = Out::default();
+        node.node_list(&mut all);
+        assert_eq!(all.lines.len(), 3, "{:?}", all.lines);
+        let row = all.lines[2].len();
+        let mut out = Out::default();
+        node.node_list_within(2 * row, &mut out);
+        assert_eq!(out.lines.len(), 3, "{:?}", out.lines);
+        assert!(
+            out.lines[0].starts_with("the first 1 paired nodes are left out"),
+            "{:?}",
+            out.lines
+        );
+        assert_eq!(out.lines[1..], all.lines[1..], "{:?}", out.lines);
     }
 
     /// Each row of `job ls` is bounded, and enough jobs still add up past
