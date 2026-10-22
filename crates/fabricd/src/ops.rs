@@ -1931,6 +1931,13 @@ impl Node {
         if resuming && state == RestoreState::Present && !self.holds(snapshot, &root).await? {
             return Err(NodeError::WorkspaceOccupied { root });
         }
+        // The setup steps this node approved run code from the workspace
+        // that no spec id or install digest covers, such as a script a
+        // declared step names; another node's snapshot may hold the
+        // agent's edits of it, so its steps are approved again (ADR 0007).
+        if manifest.created_by != self.id {
+            local::remove(&job.dir().env_spec_ran())?;
+        }
         job.set_marker(&Marker {
             root: root.clone(),
             state: MarkerState::Restoring { snapshot },
@@ -3297,6 +3304,34 @@ pub(crate) mod tests {
             job.session().unwrap().is_none(),
             "the stale session would be continued"
         );
+    }
+
+    /// The setup steps a node approved for a job run code from the
+    /// workspace: a script a declared step names, a file a lifecycle
+    /// script runs, a Yarn release. A workspace another node captured may
+    /// hold the agent's edits of any of them, which no spec id or install
+    /// digest covers, so restoring it here drops the approval and the next
+    /// launch that runs a step asks again.
+    #[tokio::test]
+    async fn a_restore_of_a_peers_snapshot_drops_the_setup_approval() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let out = &mut Out::default();
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &path, out).await.unwrap();
+        b.pull(id, a.id, None, out).await.unwrap();
+        let approved = b.cfg.state.job(id).env_spec_ran();
+        std::fs::write(&approved, "spec inputs\n").unwrap();
+
+        let job = b.job(id).await.unwrap();
+        let mut job = job.lock().await;
+        let epoch = owner_token(&job, b.id).unwrap().epoch;
+        b.restore_if_needed(&mut job, epoch, &path, out)
+            .await
+            .unwrap();
+        assert!(!approved.exists(), "{:?}", out.lines);
     }
 
     /// An addressless peer can dial in after start-up recovery listed the

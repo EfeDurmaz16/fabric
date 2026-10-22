@@ -131,7 +131,7 @@ enum JobCommand {
         /// The first message to send; the goal for a new session.
         #[arg(long)]
         prompt: Option<String>,
-        /// Run the setup steps of an environment spec this node has not run for the job without asking.
+        /// Run setup steps this node has not approved for the job, as the workspace now is, without asking.
         #[arg(long)]
         yes: bool,
     },
@@ -156,7 +156,7 @@ enum JobCommand {
         /// Waive the preflight refusals that can be waived when pulling.
         #[arg(long)]
         force: bool,
-        /// Run the setup steps of an environment spec this node has not run for the job without asking.
+        /// Run setup steps this node has not approved for the job, as the workspace now is, without asking.
         #[arg(long)]
         yes: bool,
     },
@@ -794,6 +794,9 @@ fn materialize(lock: &TreeLock, root: &Path, approval: &Approval<'_>) -> Result<
 /// install inputs, than it last ran for the job, the user approves them,
 /// by answering at the terminal or with `--yes`. A spec this node only
 /// captured still asks: the agent may have written it during the run.
+/// The node removes the record when it restores a snapshot another node
+/// captured, since the steps also run files no digest covers, such as a
+/// script a declared step names, and the agent may have edited them there.
 struct Approval<'a> {
     /// Where the spec id and install inputs this node last ran for the job are kept.
     record: PathBuf,
@@ -818,7 +821,7 @@ impl Approval<'_> {
             return Err(Refused {
                 refusal: Refusal::NeedsForce,
                 message: format!(
-                    "the setup steps above come from environment spec {id}, which this node has not run for the job over these lockfiles and install configuration, and were not approved; read them and what changed, then run the command again with --yes"
+                    "the setup steps above come from environment spec {id}, which this node has not run for the job over these lockfiles and install configuration, or not since the workspace came from another node, and were not approved; read them and what changed, then run the command again with --yes"
                 ),
             }
             .into());
@@ -841,7 +844,7 @@ fn ask_on_terminal() -> Result<bool> {
     let mut stderr = std::io::stderr();
     write!(
         stderr,
-        "this node has not run these setup steps for the job; run them? [y/N] "
+        "this node has not approved these setup steps for the job as its workspace now is; run them? [y/N] "
     )?;
     stderr.flush()?;
     let mut answer = String::new();

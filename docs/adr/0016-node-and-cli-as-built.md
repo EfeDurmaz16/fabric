@@ -28,7 +28,7 @@ The core, the store, the network layer, the harness adapters and the environment
     session     the harness session the job continues here
     session.pending  a registration's session, until the Resumed after it is durable
     fresh-codex  the Codex threads the workspace held when a Codex with no thread to resume was planned here
-    env-spec-ran  the spec id and install inputs whose setup steps the user approved here, written by the CLI (ADR 0007)
+    env-spec-ran  the spec id and install inputs whose setup steps the user approved here, written by the CLI, removed by a restore of another node's snapshot (ADR 0007)
     secret-patterns  every secret pattern the job's spec held at a capture here (ADR 0004)
     harness-state/   capture output and restore input for the adapter
 ```
@@ -66,7 +66,7 @@ A refusal crosses the control socket with its kind next to its text, so the CLI 
 | 81 | Not the owner: another node owns the job, this node does not know it, or the plan's epoch is over |
 | 82 | Frozen: a move this node started waits for its target, or the job is frozen after a fork |
 | 83 | A peer could not be reached, or gave no answer in time |
-| 84 | Refused without `--force`: the preflight, or a steal's dry run; or without `--yes`: setup steps this node has not run for the job over these install inputs, not approved (ADR 0007) |
+| 84 | Refused without `--force`: the preflight, or a steal's dry run; or without `--yes`: setup steps this node has not run for the job over these install inputs, or not since the workspace came from another node, not approved (ADR 0007) |
 | 85 | The job's state stops the command: a suspend or restore to finish, a harness that runs or another `run` or `resume` of the workspace still starting one, a workspace an earlier tenure left, no snapshot, a run during a move |
 | 1 | Any other failure; 2 is a usage error from the argument parser |
 
