@@ -185,6 +185,16 @@ fn create_dirs_durable(dir: &Path) -> Result<(), HarnessError> {
     Ok(())
 }
 
+/// Removes the file at `path`, if any, and makes the removal durable.
+pub(crate) fn remove_durable(path: &Path) -> Result<(), HarnessError> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(HarnessError::io(IoOp::Remove, path, e)),
+    }
+    fsync_dir(path.parent().unwrap_or(Path::new(".")))
+}
+
 /// Renames `from` over `to` in the same directory and makes the rename durable.
 pub(crate) fn rename_durable(from: &Path, to: &Path) -> Result<(), HarnessError> {
     fs::rename(from, to).map_err(|e| HarnessError::io(IoOp::Rename, to, e))?;

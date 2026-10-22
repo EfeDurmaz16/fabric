@@ -686,6 +686,45 @@ async fn a_thread_that_comes_back_lands_over_its_original_file() {
     );
 }
 
+/// A rollout of the thread that this node's codex wrote after the job
+/// left, which the incoming lineage does not hold, is divergence. Left in
+/// place, it would be the newest rollout of the thread here, and the
+/// resumed thread would continue this node's history, not the job's.
+#[tokio::test]
+async fn a_rollout_made_here_after_the_job_left_is_divergence() {
+    const LATER: &str = "019f233e-bb33-7342-85fa-f2d33b14368c";
+    let src = build_source();
+    let home = src.home.path().canonicalize().unwrap();
+    let adapter = node(&home);
+    let out_1 = tempfile::tempdir().unwrap();
+    adapter
+        .capture(&src.work, &thread(), out_1.path())
+        .await
+        .unwrap();
+    let pro = set_aside(&home, ".codex-pro");
+    adapter.restore(&src.work, out_1.path()).await.unwrap();
+    let out_2 = tempfile::tempdir().unwrap();
+    adapter
+        .capture(&src.work, &thread(), out_2.path())
+        .await
+        .unwrap();
+    set_aside(&home, ".codex-air");
+    std::fs::rename(&pro, home.join(".codex")).unwrap();
+    let later = src.head.with_file_name(format!(
+        "rollout-2026-10-20T09-00-00-{THREAD}_{LATER}.jsonl"
+    ));
+    std::fs::write(
+        &later,
+        session_meta(THREAD, &src.work.to_string_lossy(), Some(THREAD)),
+    )
+    .unwrap();
+    let err = adapter.restore(&src.work, out_2.path()).await.unwrap_err();
+    assert!(
+        matches!(err, HarnessError::StateDiverged { ref path } if path == &later),
+        "{err}"
+    );
+}
+
 #[test]
 fn the_codex_home_must_be_under_the_home() {
     let err = Codex::new(AbsPath::parse("/h").unwrap(), OsString::new())

@@ -740,6 +740,85 @@ async fn a_rewritten_file_edited_here_after_the_job_left_is_not_replaced() {
     );
 }
 
+/// Takes the session out to another node and back: captures here and
+/// confirms, restores on a node with the same home, lets `away` change the
+/// state there, captures it back, and puts this node's state in place
+/// again. Returns the capture that came back.
+async fn round_trip(
+    adapter: &ClaudeCode,
+    work: &Path,
+    home: &Path,
+    away: impl FnOnce(),
+) -> tempfile::TempDir {
+    let out_1 = tempfile::tempdir().unwrap();
+    let sent = adapter
+        .capture(work, &session(), out_1.path())
+        .await
+        .unwrap();
+    adapter.confirm_departure(&sent).await.unwrap();
+    let pro = set_aside(home, ".claude-pro");
+    adapter.restore(work, out_1.path()).await.unwrap();
+    away();
+    let out_2 = tempfile::tempdir().unwrap();
+    let back = adapter
+        .capture(work, &session(), out_2.path())
+        .await
+        .unwrap();
+    adapter.confirm_departure(&back).await.unwrap();
+    set_aside(home, ".claude-air");
+    bring_back(home, &pro);
+    out_2
+}
+
+/// A file this node made for the session after the job left is work the
+/// incoming state never saw, such as a fenced holder's new memory file.
+/// Left beside the incoming state, the resumed session would read both
+/// histories; restore refuses it as it refuses an edited file.
+#[tokio::test]
+async fn a_file_made_here_after_the_job_left_is_divergence() {
+    let src = build_source("w");
+    let home = src.home.path().canonicalize().unwrap();
+    let adapter = node(&home);
+    let back = round_trip(&adapter, &src.work, &home, || {}).await;
+    let (memory, _) = rewritable_files(&home, &src.work);
+    let note = memory.with_file_name("from-the-pro.md");
+    std::fs::write(&note, "written after the job left\n").unwrap();
+    let transcript = transcript_under(&home, &src.work);
+    let before = std::fs::read(&transcript).unwrap();
+    let err = adapter.restore(&src.work, back.path()).await.unwrap_err();
+    assert!(
+        matches!(err, HarnessError::StateDiverged { ref path } if path == &note),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&note).unwrap(),
+        "written after the job left\n"
+    );
+    assert_eq!(
+        std::fs::read(&transcript).unwrap(),
+        before,
+        "nothing was placed"
+    );
+}
+
+/// A file the job dropped while it was away, which this node left
+/// untouched since, goes: kept, the resumed session would still read a
+/// task the job finished on the other node.
+#[tokio::test]
+async fn a_file_the_job_dropped_and_this_node_left_untouched_is_removed() {
+    let src = build_source("w");
+    let home = src.home.path().canonicalize().unwrap();
+    let adapter = node(&home);
+    let (_, task) = rewritable_files(&home, &src.work);
+    let back = round_trip(&adapter, &src.work, &home, || {
+        std::fs::remove_file(&task).unwrap();
+    })
+    .await;
+    assert!(task.exists());
+    adapter.restore(&src.work, back.path()).await.unwrap();
+    assert!(!task.exists(), "the task the job dropped is still here");
+}
+
 #[tokio::test]
 async fn a_symlink_in_session_state_refuses_the_capture() {
     let src = build_source("w");

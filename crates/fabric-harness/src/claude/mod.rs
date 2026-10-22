@@ -584,6 +584,25 @@ impl ClaudeCode {
         session: &SessionId,
         counts: &mut RedactionCounts,
     ) -> Result<Vec<Source>, HarnessError> {
+        let (sources, found_transcript) = self.session_sources(root, session, counts)?;
+        if !found_transcript {
+            return Err(HarnessError::SessionNotFound {
+                kind: HarnessKind::ClaudeCode,
+                session: session.clone(),
+                searched: self.config_dir.join("projects"),
+            });
+        }
+        Ok(sources)
+    }
+
+    /// Every file of `session` that capture takes from this node, and
+    /// whether its transcript was among them.
+    fn session_sources(
+        &self,
+        root: &AbsPath,
+        session: &SessionId,
+        counts: &mut RedactionCounts,
+    ) -> Result<(Vec<Source>, bool), HarnessError> {
         let mut sources = Vec::new();
         let projects = self.config_dir.join("projects");
         let mut transcripts = Vec::new();
@@ -618,13 +637,6 @@ impl ClaudeCode {
                 self.add_tree(&mut sources, &key_dir.join(session.as_str()))?;
             }
         }
-        if transcripts.is_empty() {
-            return Err(HarnessError::SessionNotFound {
-                kind: HarnessKind::ClaudeCode,
-                session: session.clone(),
-                searched: projects,
-            });
-        }
         let key = Self::key_of(root)?;
         self.add_tree(&mut sources, &projects.join(&key).join("memory"))?;
         self.add_file_history(&mut sources, root, session, counts)?;
@@ -642,7 +654,7 @@ impl ClaudeCode {
         )?;
         let transcripts: Vec<&Path> = transcripts.iter().map(PathBuf::as_path).collect();
         self.add_plans(&mut sources, &transcripts)?;
-        Ok(sources)
+        Ok((sources, !transcripts.is_empty()))
     }
 
     fn capture_sync(
@@ -720,6 +732,8 @@ impl ClaudeCode {
         let root_key = Self::key_of(root)?;
         let session = manifest.session().clone();
         let records = self.departure(&session);
+        pipeline::refuse_symlinks(self.home_dir(), &self.config_dir)?;
+        let (held, _) = self.session_sources(root, &session, &mut RedactionCounts::new())?;
         // The staged main transcripts name the plans that may be placed.
         // Their digests are checked before anything is placed, and one that
         // is missing fails that check, so it names no plan here.
@@ -739,7 +753,7 @@ impl ClaudeCode {
             .collect();
         let staged: Vec<&Path> = staged.iter().map(PathBuf::as_path).collect();
         let plan_slugs = plans::slugs(&staged)?;
-        let restored = pipeline::restore(manifest, state, Some(&records), |rel, _| {
+        let restored = pipeline::restore(manifest, state, Some(&records), &held, |rel, _| {
             Ok(self.destination(rel, &session, &root_key, &plan_slugs))
         })?;
         info!(%session, files = restored.placed.len(), "claude: restored");

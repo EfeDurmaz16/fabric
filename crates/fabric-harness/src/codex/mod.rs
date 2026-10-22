@@ -241,20 +241,42 @@ fn lineage_in(
     session: &SessionId,
     searched: &Path,
 ) -> Result<Vec<RolloutFile>, HarnessError> {
-    let not_found = || HarnessError::SessionNotFound {
-        kind: HarnessKind::Codex,
-        session: session.clone(),
-        searched: searched.to_path_buf(),
-    };
-    let head_id = all
+    let (chain, missing) = walk_lineage(all, session)?;
+    if let Some(missing) = missing {
+        return Err(HarnessError::LineageBroken {
+            session: session.clone(),
+            missing,
+        });
+    }
+    if chain.is_empty() {
+        return Err(HarnessError::SessionNotFound {
+            kind: HarnessKind::Codex,
+            session: session.clone(),
+            searched: searched.to_path_buf(),
+        });
+    }
+    Ok(chain)
+}
+
+/// As much of the lineage of `session` among `all` as is there, newest
+/// suffix first, and the first prefix it names that is not; an empty chain
+/// when `all` holds no rollout of the thread.
+fn walk_lineage(
+    all: &[RolloutFile],
+    session: &SessionId,
+) -> Result<(Vec<RolloutFile>, Option<SessionId>), HarnessError> {
+    let Some(head_id) = all
         .iter()
         .find(|f| f.name.thread_id == *session)
         .map(|f| f.name.rollout_id.clone())
-        .ok_or_else(not_found)?;
-    let head = resolve(session, &head_id, all)?.ok_or_else(not_found)?;
+    else {
+        return Ok((Vec::new(), None));
+    };
+    let Some(head) = resolve(session, &head_id, all)? else {
+        return Ok((Vec::new(), None));
+    };
     let mut chain = vec![head];
-    loop {
-        let last = chain.last().ok_or_else(not_found)?;
+    while let Some(last) = chain.last() {
         let Some(prefix_id) = rollout::read_meta(last)?.history_base else {
             break;
         };
@@ -262,14 +284,11 @@ fn lineage_in(
             break;
         }
         let Some(prefix) = resolve(session, &prefix_id, all)? else {
-            return Err(HarnessError::LineageBroken {
-                session: session.clone(),
-                missing: prefix_id,
-            });
+            return Ok((chain, Some(prefix_id)));
         };
         chain.push(prefix);
     }
-    Ok(chain)
+    Ok((chain, None))
 }
 
 impl Codex {
@@ -495,23 +514,7 @@ impl Codex {
         let mut sources = Vec::with_capacity(chain.len());
         for file in &chain {
             rollout::refuse_secrets(file)?;
-            let rel =
-                file.path
-                    .strip_prefix(&self.store)
-                    .map_err(|_| HarnessError::NotUnderHome {
-                        path: file.path.clone(),
-                        home: self.store.clone(),
-                    })?;
-            let parts = pipeline::rel_components(rel)?;
-            let mut all: Vec<&str> = vec![HOME_PREFIX];
-            all.extend(home_parts.iter().map(String::as_str));
-            all.extend(parts.iter().map(String::as_str));
-            sources.push(Source {
-                abs: file.path.clone(),
-                rel: pipeline::rel_path(&all)?,
-                carry: Carry::Opaque,
-                mutability: Mutability::AppendOnly,
-            });
+            sources.push(self.source_of(file, &home_parts)?);
         }
         // A rollout only grows, so no departure record is kept.
         let capturer = Capturer {
@@ -526,6 +529,27 @@ impl Codex {
         drop(lock);
         info!(%session, rollouts = chain.len(), "codex: captured");
         Ok(manifest)
+    }
+
+    /// The capture source of one rollout file under this store.
+    fn source_of(&self, file: &RolloutFile, home_parts: &[String]) -> Result<Source, HarnessError> {
+        let rel = file
+            .path
+            .strip_prefix(&self.store)
+            .map_err(|_| HarnessError::NotUnderHome {
+                path: file.path.clone(),
+                home: self.store.clone(),
+            })?;
+        let parts = pipeline::rel_components(rel)?;
+        let mut all: Vec<&str> = vec![HOME_PREFIX];
+        all.extend(home_parts.iter().map(String::as_str));
+        all.extend(parts.iter().map(String::as_str));
+        Ok(Source {
+            abs: file.path.clone(),
+            rel: pipeline::rel_path(&all)?,
+            carry: Carry::Opaque,
+            mutability: Mutability::AppendOnly,
+        })
     }
 
     async fn capture_impl(
@@ -632,9 +656,17 @@ impl Codex {
             .join("sessions")
             .join(RESTORE_SUBDIR)
             .join(session.as_str());
+        // The thread's rollouts here, as far as its lineage reaches: one
+        // the incoming lineage does not place was written after the job left.
+        let home_parts = self.codex_home_parts()?;
+        let held = walk_lineage(&existing, &session)?
+            .0
+            .iter()
+            .map(|file| self.source_of(file, &home_parts))
+            .collect::<Result<Vec<Source>, HarnessError>>()?;
         // A rollout only grows, so nothing is ever replaced and no
         // departure record is kept.
-        let restored = pipeline::restore(manifest, state, None, |rel, _| {
+        let restored = pipeline::restore(manifest, state, None, &held, |rel, _| {
             let Some((name_text, _)) = self.restorable(rel)? else {
                 return Ok(None);
             };
