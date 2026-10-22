@@ -23,14 +23,18 @@ export class NoDaemonError extends FabricError {
   }
 }
 
-/** The state directory or the socket is not this user's alone. */
+/**
+ * The state directory or the socket is not this user's alone, or a
+ * directory above them is one someone other than this user or root can
+ * change.
+ */
 export class UntrustedError extends FabricError {
   override name = "UntrustedError";
   readonly path: string;
   readonly reason: string;
 
   constructor(path: string, reason: string) {
-    super(`${path} ${reason}, so its answers are not trusted; it must be yours and mode 0700`);
+    super(`${path} ${reason}, so the socket's answers are not trusted`);
     this.path = path;
     this.reason = reason;
   }

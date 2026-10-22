@@ -2,7 +2,8 @@
 // what it hands to `onEvent`, and which error each broken exchange gives.
 
 import { afterEach, describe, expect, mock, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
@@ -407,21 +408,32 @@ describe("the client", () => {
 
   // Review finding on PR #13: a socket under a missing directory passed both checks, so anyone who may write the
   // parent, as in /tmp, could make the directory and a socket of theirs in it before the connect. Here both appear
-  // right after the client finds the directory missing, as another user racing it would make them.
+  // right after the client first finds the directory missing, by either call, as another user racing it would.
   test("rejects a socket under a missing directory with NoDaemon before connecting", async () => {
     const reply = { type: "done", reply: { kind: "job_list", jobs: [], closed: [] } };
     const socketPath = join(tempDir(), "new", "fabric.sock");
     const raced: FakeNode[] = [];
+    const race = async (path: string): Promise<void> => {
+      if (path === dirname(socketPath) && raced.length === 0) {
+        mkdirSync(path);
+        raced.push(await fakeNode(answers(reply), path));
+      }
+    };
     mock.module("node:fs/promises", () => ({
       ...REAL_FS_PROMISES,
       async lstat(path: string) {
         try {
           return await REAL_FS_PROMISES.lstat(path);
         } catch (error) {
-          if (path === dirname(socketPath) && raced.length === 0) {
-            mkdirSync(path);
-            raced.push(await fakeNode(answers(reply), path));
-          }
+          await race(path);
+          throw error;
+        }
+      },
+      async realpath(path: string) {
+        try {
+          return await REAL_FS_PROMISES.realpath(path);
+        } catch (error) {
+          await race(path);
           throw error;
         }
       },
@@ -431,6 +443,92 @@ describe("the client", () => {
     expect(error).toBeInstanceOf(NoDaemonError);
     expect(raced).toHaveLength(1);
     expect(raced[0]?.connections).toHaveLength(0);
+  });
+
+  // Review finding on PR #13: only the state directory and the socket were checked, so whoever may write a
+  // directory above them could swap the state directory for one of theirs between the checks and the connect.
+  // A directory above must be one only this user or root can change; a sticky one, as /tmp is, qualifies.
+  test("rejects a directory above the socket that group or others may write, unless it is sticky", async () => {
+    const above = tempDir();
+    const state = join(above, "state");
+    mkdirSync(state, { mode: 0o700 });
+    const node = await fakeNode(answers(), state);
+    for (const mode of [0o757, 0o775]) {
+      chmodSync(above, mode);
+      const error = await rejection(new FabricClient({ socketPath: node.socketPath }).hello());
+      expect(error).toBeInstanceOf(UntrustedError);
+      expect(error).toMatchObject({ path: realpathSync(above) });
+    }
+    expect(node.connections).toHaveLength(0);
+    // Bun's chmodSync drops the sticky bit (1.3.14), so chmod(1) sets it.
+    execFileSync("chmod", ["1777", above]);
+    await new FabricClient({ socketPath: node.socketPath }).hello();
+    expect(node.connections).toHaveLength(1);
+  });
+
+  // The same finding: a directory above the socket that another user owns is theirs to change. Making one takes
+  // root, so lstat reports the socket's own parent as another user's here.
+  test("rejects a directory above the socket that another user owns", async () => {
+    const above = realpathSync(tempDir());
+    const state = join(above, "state");
+    mkdirSync(state, { mode: 0o700 });
+    const node = await fakeNode(answers(), state);
+    mock.module("node:fs/promises", () => ({
+      ...REAL_FS_PROMISES,
+      async lstat(path: string) {
+        const stats = await REAL_FS_PROMISES.lstat(path);
+        return path === above ? Object.assign(Object.create(Object.getPrototypeOf(stats)), stats, { uid: 4242 }) : stats;
+      },
+    }));
+    cleanups.push(() => mock.module("node:fs/promises", () => REAL_FS_PROMISES));
+    const error = await rejection(new FabricClient({ socketPath: node.socketPath }).hello());
+    expect(error).toBeInstanceOf(UntrustedError);
+    expect(error).toMatchObject({ path: above });
+    expect(node.connections).toHaveLength(0);
+  });
+
+  // The same finding: a symlink on the way to the socket, here in a directory anyone may write, could be pointed at
+  // another user's socket after the checks passed. The client dials the directory the link named when it was
+  // resolved and checked, so the swap made right after the last check reaches nobody.
+  test("connects where the checks looked when a link on the way is swapped after them", async () => {
+    const reply = { type: "done", reply: { kind: "job_list", jobs: [], closed: [] } };
+    const node = async (): Promise<{ real: string; node: FakeNode }> => {
+      const real = tempDir();
+      mkdirSync(join(real, "state"), { mode: 0o700 });
+      return { real, node: await fakeNode(answers(reply), join(real, "state")) };
+    };
+    const checked = await node();
+    const swapped = await node();
+    const link = join(tempDir(0o777), "link");
+    symlinkSync(checked.real, link);
+    const lastCheck = join(realpathSync(checked.real), "state", "fabric.sock");
+    mock.module("node:fs/promises", () => ({
+      ...REAL_FS_PROMISES,
+      async lstat(path: string) {
+        const stats = await REAL_FS_PROMISES.lstat(path);
+        if (path === lastCheck) {
+          unlinkSync(link);
+          symlinkSync(swapped.real, link);
+        }
+        return stats;
+      },
+    }));
+    cleanups.push(() => mock.module("node:fs/promises", () => REAL_FS_PROMISES));
+    await new FabricClient({ socketPath: join(link, "state", "fabric.sock") }).jobList();
+    expect(checked.node.connections).toHaveLength(1);
+    expect(swapped.node.connections).toHaveLength(0);
+  });
+
+  // A link above the state directory is resolved, but the state directory itself stays refused as a link, as the
+  // node refuses its own (ADR 0016): whoever owns the link could point it elsewhere while the node runs.
+  test("rejects a state directory that is a symlink with Untrusted before connecting", async () => {
+    const node = await fakeNode(answers());
+    const link = join(tempDir(), "state");
+    symlinkSync(dirname(node.socketPath), link);
+    const error = await rejection(new FabricClient({ socketPath: join(link, "fabric.sock") }).hello());
+    expect(error).toBeInstanceOf(UntrustedError);
+    expect(error).toMatchObject({ path: link, reason: "is a symlink" });
+    expect(node.connections).toHaveLength(0);
   });
 });
 

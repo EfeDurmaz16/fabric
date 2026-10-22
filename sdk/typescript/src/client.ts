@@ -1,15 +1,16 @@
 // A client of one local node, mirroring crates/fabric-client/src/client.rs.
 //
 // Nothing is sent before the state directory and the socket prove to be
-// this user's alone, because a run plan read from the socket decides what
-// the caller launches (ADR 0016). Every call is one connection: a hello,
-// the node's welcome, one request, the node's events as they happen and
-// one final answer, whose kind must be the request's op.
+// this user's alone, and every directory above them one that only this
+// user or root can change, because a run plan read from the socket decides
+// what the caller launches (ADR 0016, ADR 0018). Every call is one
+// connection: a hello, the node's welcome, one request, the node's events
+// as they happen and one final answer, whose kind must be the request's op.
 
 import type { Stats } from "node:fs";
-import { lstat } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import { createConnection, type Socket } from "node:net";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import type { z } from "zod";
 
 import {
@@ -332,9 +333,7 @@ export class FabricClient {
     // Resolved once: the connect goes to the path the checks passed, even
     // if the working directory changes while they wait.
     const socket = resolve(this.socketPath);
-    await checkPrivate(dirname(socket), socket);
-    await checkPrivate(socket, socket);
-    const exchange = openExchange(await dial(socket));
+    const exchange = openExchange(await dial(await trustedPath(socket), socket));
     try {
       let answer: HelloAnswer | null;
       try {
@@ -370,12 +369,13 @@ type Exchange = {
   close(): void;
 };
 
-function dial(path: string): Promise<Socket> {
+/** Connects to `path`, reporting a failure as no daemon at `shown`, the socket as the caller named it. */
+function dial(path: string, shown: string): Promise<Socket> {
   return new Promise((resolvePromise, reject) => {
     const socket = createConnection({ path });
     const failed = (error: Error): void => {
       socket.destroy();
-      reject(new NoDaemonError(path, error));
+      reject(new NoDaemonError(shown, error));
     };
     socket.once("error", failed);
     socket.once("connect", () => {
@@ -467,25 +467,44 @@ function openExchange(socket: Socket): Exchange {
 }
 
 /**
- * Refuses `path` unless this user owns it and, for a directory, no one
- * else may enter it. A missing path is no daemon at `socket`, and nothing
- * is dialed: a directory missing now could be made, with a socket in it,
- * by anyone who may write its parent, as in `/tmp`, before the connect.
+ * The path to dial for the absolute path `socket`, once the socket, its
+ * directory and every directory above them passed their checks. The state
+ * directory itself must not be a symlink, as the node requires of its own
+ * (ADR 0016). A link above it, such as macOS's `/tmp`, is resolved once,
+ * and every check after that is made on the resolved path, which is the
+ * one returned: the directory, then the socket's name. The connect goes
+ * through no symlink, so a link someone else may swap after the checks, or
+ * that lives in a directory they may write, cannot send it elsewhere. A
+ * missing directory is no daemon at `socket`, and nothing is dialed: a
+ * directory missing now could be made, with a socket in it, by anyone who
+ * may write its parent, as in `/tmp`, before the connect.
  */
-async function checkPrivate(path: string, socket: string): Promise<void> {
-  let stats: Stats;
-  try {
-    stats = await lstat(path);
-  } catch (error) {
-    if (errorCode(error) === "ENOENT") {
-      throw new NoDaemonError(socket, error);
-    }
-    throw new FrameIoError(error);
+async function trustedPath(socket: string): Promise<string> {
+  const name = basename(socket);
+  if (name === "") {
+    throw new NoDaemonError(socket, new Error("the path names no socket file"));
   }
   const me = process.geteuid?.();
   if (me === undefined) {
-    throw new UntrustedError(path, "cannot be checked on this platform");
+    throw new UntrustedError(socket, "cannot be checked on this platform");
   }
+  await checkPrivate(dirname(socket), socket, me);
+  let dir: string;
+  try {
+    dir = await realpath(dirname(socket));
+  } catch (error) {
+    throw notFound(error, socket);
+  }
+  await checkPrivate(dir, socket, me);
+  await checkAncestors(dir, socket, me);
+  const path = join(dir, name);
+  await checkPrivate(path, socket, me);
+  return path;
+}
+
+/** Refuses `path` unless the user `me` owns it, it is not a symlink and, for a directory, no one else may enter it. */
+async function checkPrivate(path: string, socket: string, me: number): Promise<void> {
+  const stats = await lstatOrNoDaemon(path, socket);
   if (stats.uid !== me) {
     throw new UntrustedError(path, `belongs to user ${stats.uid}, not to you (${me})`);
   }
@@ -493,8 +512,61 @@ async function checkPrivate(path: string, socket: string): Promise<void> {
     throw new UntrustedError(path, "is a symlink");
   }
   if (stats.isDirectory() && (stats.mode & 0o077) !== 0) {
-    throw new UntrustedError(path, `has mode ${(stats.mode & 0o777).toString(8)}, which lets others in`);
+    throw new UntrustedError(
+      path,
+      `has mode ${(stats.mode & 0o777).toString(8)}, which lets others in; the state directory must be mode 0700`,
+    );
   }
+}
+
+/**
+ * Refuses `dir` unless every directory above it, up to `/`, is one only
+ * the user `me` or root can change, as OpenSSH's StrictModes asks of the
+ * directories above `authorized_keys`: owned by one of them, and not
+ * writable by group or others unless it is sticky, as `/tmp` is. Whoever
+ * may rename an entry of such a directory could put a directory of theirs
+ * in its place between the checks and the connect. In a sticky directory
+ * only an entry's owner may rename it, and the entry below is checked to
+ * be this user's or root's.
+ */
+async function checkAncestors(dir: string, socket: string, me: number): Promise<void> {
+  for (let child = dir, path = dirname(dir); path !== child; child = path, path = dirname(path)) {
+    const stats = await lstatOrNoDaemon(path, socket);
+    const refusal = ancestorRefusal(stats, me);
+    if (refusal !== undefined) {
+      throw new UntrustedError(path, refusal);
+    }
+  }
+}
+
+/** Why a directory above the socket with `stats` is not one only `me` or root can change, if it is not. */
+function ancestorRefusal(stats: Stats, me: number): string | undefined {
+  if (!stats.isDirectory()) {
+    return "is above the socket and is not a directory";
+  }
+  if (stats.uid !== me && stats.uid !== 0) {
+    return `is above the socket and belongs to user ${stats.uid}, not to you (${me}) or root`;
+  }
+  if ((stats.mode & 0o022) !== 0 && (stats.mode & 0o1000) === 0) {
+    return (
+      `is above the socket and has mode ${(stats.mode & 0o7777).toString(8)}, which lets others replace what is ` +
+      "in it; it must not be writable by group or others unless it is sticky"
+    );
+  }
+  return undefined;
+}
+
+async function lstatOrNoDaemon(path: string, socket: string): Promise<Stats> {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    throw notFound(error, socket);
+  }
+}
+
+/** A missing path as no daemon at `socket`, any other failure as a failed read. */
+function notFound(error: unknown, socket: string): FabricError {
+  return errorCode(error) === "ENOENT" ? new NoDaemonError(socket, error) : new FrameIoError(error);
 }
 
 function errorCode(error: unknown): string | undefined {
