@@ -618,6 +618,14 @@ impl Node {
                 started,
             },
         )?;
+        // The session is recorded as pending before `Resumed` and moved into
+        // place after it, so a crash between the two does not leave a
+        // `Resumed` whose session a later capture would miss.
+        let record = session.map(|session| SessionRecord {
+            harness: harness.clone(),
+            session,
+        });
+        job.begin_session(epoch, record.as_ref())?;
         let snapshot = job.latest();
         job.append(
             self.id,
@@ -627,14 +635,8 @@ impl Node {
                 harness: harness.clone(),
             },
         )?;
-        if let Some(session) = session {
-            local::write(
-                &job.dir().session(),
-                &SessionRecord {
-                    harness: harness.clone(),
-                    session,
-                },
-            )?;
+        if record.is_some() {
+            job.session()?;
         }
         if let Some(marker) = job.marker()? {
             job.set_marker(&Marker {
@@ -1849,7 +1851,7 @@ impl Node {
                 return Err(NodeError::WorkspaceOccupied { root });
             }
             job.clear_harness_state()?;
-            local::remove(&job.dir().session())?;
+            job.forget_session()?;
         }
         // The marker says `Restoring` from before the staging directory
         // exists, so a tree here may be another process's, written into
@@ -2011,7 +2013,7 @@ impl Node {
                 dest.display()
             ));
         }
-        local::remove(&job.dir().session())?;
+        job.forget_session()?;
         job.clear_marker()
     }
 
@@ -2027,13 +2029,10 @@ impl Node {
         let state = StateManifest::read(&state_dir)?;
         let harness = adapter(state.kind(), &self.harness_env(path_var)?)?;
         harness.restore(root, &state_dir).await?;
-        local::write(
-            &job.dir().session(),
-            &SessionRecord {
-                harness: state.kind().clone(),
-                session: state.session().clone(),
-            },
-        )?;
+        job.set_session(&SessionRecord {
+            harness: state.kind().clone(),
+            session: state.session().clone(),
+        })?;
         out.say(format!(
             "restored {} session {}",
             state.kind(),
@@ -3319,6 +3318,44 @@ pub(crate) mod tests {
             job.lock().await.view(a.id),
             LeaseView::Owner(token) if token.epoch == Epoch::FIRST
         ));
+    }
+
+    /// A registration appends `Resumed` and then writes the session the
+    /// harness started. A daemon that dies between the two, here a session
+    /// file that cannot be written, must not lose that session: the next
+    /// capture would leave the new conversation out of the snapshot.
+    #[tokio::test]
+    async fn a_session_whose_write_failed_after_resumed_is_kept() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let session_file = node.cfg.state.job(id).session();
+        // A directory where the session goes makes its write fail.
+        std::fs::create_dir_all(session_file.join("in-the-way")).unwrap();
+        let mut harness = sleeper();
+        let session = SessionId::parse("new-session").unwrap();
+        let failed = node
+            .harness_started(
+                id,
+                Epoch::FIRST,
+                pid(&harness),
+                HarnessKind::Codex,
+                Some(session.clone()),
+                &mut Out::default(),
+            )
+            .await;
+        harness.kill().unwrap();
+        harness.wait().unwrap();
+        assert!(failed.is_err(), "{failed:?}");
+        let job = node.job(id).await.unwrap();
+        let job = job.lock().await;
+        assert!(matches!(
+            job.ledger().records().last().unwrap().event().kind,
+            EventKind::Resumed { .. }
+        ));
+        // As after a restart: the session file was never written.
+        std::fs::remove_dir_all(&session_file).unwrap();
+        let kept = job.session().unwrap().map(|record| record.session);
+        assert_eq!(kept, Some(session));
     }
 
     /// A suspend must not publish a snapshot whose `.fabric/env.toml`

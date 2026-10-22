@@ -170,6 +170,13 @@ impl JobDir {
         self.dir.join("session")
     }
 
+    /// The session a registration recorded before its `Resumed`, until it
+    /// moves to `session`.
+    #[must_use]
+    pub fn session_pending(&self) -> PathBuf {
+        self.dir.join("session.pending")
+    }
+
     /// Every secret pattern the job's spec held at a capture on this node.
     #[must_use]
     pub fn secret_patterns(&self) -> PathBuf {

@@ -203,6 +203,23 @@ pub struct SessionRecord {
     pub session: SessionId,
 }
 
+/// A session a registration recorded before its `Resumed`, until the
+/// session file holds it.
+///
+/// It is the job's session only if the record right after `after` is that
+/// `Resumed`: a crash between the two writes then leaves it to be moved
+/// into place, and a crash before the `Resumed` leaves one to drop, since
+/// the CLI killed the harness that named it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingSession {
+    /// The ledger head the registration's `Resumed` follows.
+    pub after: RecordHash,
+    /// The epoch the harness was registered under.
+    pub epoch: Epoch,
+    /// The session.
+    pub record: SessionRecord,
+}
+
 /// Reads a node-local file, or `None` when it does not exist.
 pub fn read<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, LocalError> {
     let bytes = match std::fs::read(path) {
