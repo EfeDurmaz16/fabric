@@ -1,12 +1,25 @@
 # Fabric
 
-A job is the unit of development work. Storage, compute, environment and harness stay decoupled, so a job started under Claude Code on one machine can be suspended, resumed on another machine with its dependencies, and continued by a different agent.
+Fabric moves a coding-agent job from one machine to another and lets you pick it up where it stopped. The workspace goes with it: staged and unstaged changes, untracked files, dependency caches and build output. So does the agent's session, so Claude Code or Codex continues the same conversation on the other machine. Secrets stay behind.
 
-Private repository. Working name; see [ADR 0010](docs/adr/0010-name-and-scope-boundaries.md) on the name collision.
+The idea underneath is that the job, not the machine, is the unit of development work. Where a job's state is stored, which machine runs it, which toolchain it needs and which agent drives it are separate questions, and Fabric keeps them separate, so a job started under Claude Code on one machine can be suspended, resumed on another machine with its dependencies, and continued by a different agent.
+
+Fabric is a working name. It collides with Microsoft Fabric and others, and may change; see [ADR 0010](docs/adr/0010-name-and-scope-boundaries.md).
 
 ## Status, honestly
 
-A job can move between two of your Macs by hand: made from a repository, run under a harness, suspended, moved, resumed on the other Mac with its uncommitted work and its harness session, and moved back, safe under `kill -9` of either node at every step the end-to-end test names. The first run on the real two Macs, on 2026-10-20, stopped at `fabric job run` while Claude Code was open (gate finding F1, fixed since), and on 2026-10-21 Codex exited under `fabric job run` with "Interrupted system call" because it touched the terminal before its process group owned it (gate finding F5; the fix is tested under a pseudo-terminal and not yet rerun on the Macs); no move has run between them yet, and the test runs two nodes on one machine. Only the fake ACP agent has gone through a full move; Claude Code and Codex are wired the same way and still need their live run (ADR 0015).
+A job can move between two of your Macs by hand: made from a repository, run under a harness, suspended, moved, resumed on the other Mac with its uncommitted work and its harness session, and moved back, safe under `kill -9` of either node at every step the end-to-end test names.
+
+On 2026-10-21 a Codex job moved between two real Macs with its workspace and its conversation. It answered a first turn on one Mac, was suspended and moved to the other, and there it resumed and answered a question about its first turn.
+
+| Step | Measured |
+|---|---|
+| Suspend: stop the agent, snapshot the workspace and the session | 0.85 s |
+| Move to the other Mac | 1.15 s |
+| Resume and run one headless turn there | 6 s |
+| Workspace on the target | Identical to the source: git status, staged and unstaged diffs, the untracked file, `node_modules` and `dist`. `.env` was left behind, as a secret is. |
+
+That run found that the resumed agent used the other Mac's model setting instead of the job's, and pinned the model by hand; a resume now carries the settings the session ran with (gate finding F10). Claude Code has not yet been run across two machines. The end-to-end test runs two nodes on one machine.
 
 | What | State |
 |---|---|
@@ -22,6 +35,26 @@ A job can move between two of your Macs by hand: made from a repository, run und
 | `sdk/typescript` | The TypeScript client of the same API for Node 22 and Bun: zod schemas at the boundary, the same trust checks and handshake as the Rust client, and the same contract test against `protocol/fixtures`, plus an end-to-end test against a real node. |
 | `crates/fabric` | The `fabric` command, and the end-to-end test: two daemons over loopback on QUIC and on TCP+TLS, a job moved and back, the move broken at five named points by `SIGKILL` of either node or a lost or repeated answer. |
 | CI | fmt, clippy, test, the end-to-end test, doc, `cargo deny`, the hygiene script, and the TypeScript SDK's typecheck, contract and end-to-end tests, on macOS and Ubuntu |
+
+## How a move works
+
+```mermaid
+sequenceDiagram
+    participant A as Mac A (owner)
+    participant B as Mac B
+    A->>A: suspend: stop agent, snapshot workspace and session
+    A->>B: copy ledger and snapshot
+    A->>B: MoveStarted, A stops being runnable
+    B->>A: MoveImported, B owns the job
+    B->>B: resume: restore files, rebuild caches, continue session
+```
+
+- **One live copy.** Every job has an append-only, hash-chained ledger. A move is a short protocol over that ledger, so at most one machine can run the job at a time, even when a machine is killed in the middle of a move.
+- **Content-addressed snapshots.** The workspace is stored as blake3 chunks in a local store with a SQLite catalog. A move sends only the chunks the other machine lacks. Git state goes as a bundle plus the index and the working tree.
+- **Carry or rebuild.** Dependency caches and build output travel when the other machine can use them, and are made again there by their setup step or the next build when it cannot. Secret-shaped files never leave the machine.
+- **Harness adapters.** Claude Code, Codex and any Agent Client Protocol agent. Each adapter captures the agent's session files and restores them on the other machine.
+- **Pinned peers.** Machines pair by ed25519 node id and talk over QUIC with TLS pinned to that id, or TCP with TLS when UDP is blocked. No central server.
+- **Client API.** A versioned JSON API on the node's local socket, with a Rust client crate and a TypeScript SDK checked against the same message fixtures.
 
 ## Two Macs, by hand
 
