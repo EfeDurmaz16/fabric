@@ -870,14 +870,33 @@ impl Node {
         // materialize on the target either, so the snapshot is refused
         // before it is published or moved.
         // A pattern the job ever added stays: removing its line from
-        // `.fabric/env.toml` does not remove it (ADR 0007, Secrets).
-        let recorded: Vec<fabric_core::secret::SecretPattern> =
+        // `.fabric/env.toml` does not remove it (ADR 0007, Secrets). The
+        // node that recorded it may be another one; the spec of the job's
+        // latest snapshot travels with the job and holds what it recorded.
+        let parent = job.latest();
+        let mut recorded: Vec<fabric_core::secret::SecretPattern> =
             local::read(&job.dir().secret_patterns())?.unwrap_or_default();
+        if let Some(parent) = parent {
+            let travelled = with_store(&self.store, move |store| {
+                let manifest = store.manifest(parent)?;
+                Ok(manifest
+                    .env_spec
+                    .map(|spec| store.env_spec(spec))
+                    .transpose()?)
+            })
+            .await?;
+            if let Some(spec) = travelled {
+                recorded.extend(spec.secret_patterns);
+                recorded.sort();
+                recorded.dedup();
+            }
+        }
         let detection = fabric_env::detect::detect(root, &recorded)?;
         local::write(
             &job.dir().secret_patterns(),
             &detection.spec().secret_patterns,
         )?;
+        let spec = detection.spec().clone();
         let keys = MeasuredKeys::new(facts, Some(&detection));
         let secret_patterns: Vec<String> = detection
             .spec()
@@ -900,7 +919,6 @@ impl Node {
         let root = root.to_owned();
         let job_id = job.id();
         let me = self.id;
-        let parent = job.latest();
         let (snapshot, report) = with_store(&self.store, move |store| {
             let mut policy = IgnorePolicy::default();
             policy.load_fabricignore(&root)?;
@@ -912,6 +930,9 @@ impl Node {
             for (class, path) in &declared {
                 policy.add_declared_cache(*class, path);
             }
+            // The snapshot names the spec and the store keeps its bytes, so
+            // a peer that fetches the snapshot fetches the spec (ADR 0007).
+            let env_spec = store.put_env_spec(&spec)?;
             let captured = capture(
                 store,
                 &CaptureRequest {
@@ -923,7 +944,7 @@ impl Node {
                     policy: &policy,
                     carry_keys: &keys,
                     harness_state: harness_state.as_deref(),
-                    env_spec: None,
+                    env_spec: Some(env_spec),
                     allow_large_untracked: false,
                 },
             )?;
@@ -3794,6 +3815,50 @@ pub(crate) mod tests {
         std::fs::write(root.join("users.sqlite"), "rows\n").unwrap();
         let mut out = Out::default();
         node.suspend(id, &path, &mut out).await.unwrap();
+        assert!(
+            out.lines
+                .iter()
+                .any(|line| line == "left behind (secret pattern): users.sqlite"),
+            "{:?}",
+            out.lines
+        );
+    }
+
+    /// A secret pattern the job's spec recorded travels with the job: the
+    /// node that pulls it keeps leaving behind what the pattern matches
+    /// after the line left `.fabric/env.toml`, as the node that recorded
+    /// it does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recorded_secret_pattern_travels_with_the_job() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let out = &mut Out::default();
+        let id = job(dir_a.path(), &a).await;
+        let root = paths::job_root(&a.cfg.home, id);
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(
+            root.join(".fabric/env.toml"),
+            "secret_patterns = [\"*.sqlite\"]\n",
+        )
+        .unwrap();
+        a.suspend(id, &path, out).await.unwrap();
+        std::fs::write(root.join(".fabric/env.toml"), "").unwrap();
+        a.suspend(id, &path, out).await.unwrap();
+
+        b.pull(id, a.id, None, out).await.unwrap();
+        let root = {
+            let job = b.job(id).await.unwrap();
+            let mut job = job.lock().await;
+            let epoch = owner_token(&job, b.id).unwrap().epoch;
+            b.restore_if_needed(&mut job, epoch, &path, out)
+                .await
+                .unwrap()
+        };
+        std::fs::write(root.join("users.sqlite"), "rows\n").unwrap();
+        let mut out = Out::default();
+        b.suspend(id, &path, &mut out).await.unwrap();
         assert!(
             out.lines
                 .iter()
