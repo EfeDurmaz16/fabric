@@ -2659,6 +2659,10 @@ fn refuse_rows(rows: &[doctor::Row], force: bool) -> Result<(), NodeError> {
 
 /// Stops on a path the target can neither use nor make again, unless
 /// `force`, which carries it as it is (gate finding F6).
+///
+/// The first `REPORT_PATHS` refused paths are named and the rest counted,
+/// so the answer stays within one control message however many caches a
+/// snapshot holds.
 fn refuse_carry(decisions: &[PathDecision], force: bool, out: &mut Out) -> Result<(), NodeError> {
     let refused: Vec<String> = decisions
         .iter()
@@ -2668,16 +2672,23 @@ fn refuse_carry(decisions: &[PathDecision], force: bool, out: &mut Out) -> Resul
     if refused.is_empty() {
         return Ok(());
     }
+    let mut named = refused
+        .iter()
+        .take(REPORT_PATHS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if refused.len() > REPORT_PATHS {
+        named = format!("{named} and {} more", refused.len() - REPORT_PATHS);
+    }
     if force {
         out.say(format!(
-            "--force: {} travels as it is, and the target writes it",
-            refused.join(", ")
+            "--force: {named} travels as it is, and the target writes it"
         ));
         return Ok(());
     }
     Err(NodeError::Preflight(format!(
-        "the target can neither use nor rebuild {}",
-        refused.join(", ")
+        "the target can neither use nor rebuild {named}"
     )))
 }
 
@@ -4669,6 +4680,27 @@ pub(crate) mod tests {
             out.lines,
             ["--force: node_modules travels as it is, and the target writes it"]
         );
+    }
+
+    /// A monorepo may hold any number of refused trees, and the refusal
+    /// must stay within one control message, so it names the first of
+    /// them and counts the rest.
+    #[test]
+    fn a_refusal_names_a_bounded_number_of_paths() {
+        let refused: Vec<PathDecision> = (0..25)
+            .map(|n| PathDecision {
+                path: fabric_core::path::RelPath::parse(&format!("p{n}/node_modules")).unwrap(),
+                decision: carry::CarryDecision::Refuse {
+                    reason: "pnpm is not installed on the target".to_owned(),
+                },
+            })
+            .collect();
+        let err = refuse_carry(&refused, false, &mut Out::default()).unwrap_err();
+        let NodeError::Preflight(text) = &err else {
+            panic!("{err}");
+        };
+        assert!(text.ends_with("p19/node_modules and 5 more"), "{text}");
+        assert!(!text.contains("p20/"), "{text}");
     }
 
     #[test]
