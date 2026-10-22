@@ -725,6 +725,24 @@ impl Detection {
         self.caches.iter().zip(&self.inputs)
     }
 
+    /// Returns one digest of every cache's path and the digest of the files
+    /// its setup steps read, in path order: what an approval of the spec's
+    /// steps covers besides the spec's id (ADR 0007, step 4).
+    ///
+    /// A lockfile, `package.json` or a manager's own configuration can name
+    /// code an install runs, and can change while the spec, which holds the
+    /// commands, keeps its id.
+    #[must_use]
+    pub fn inputs_digest(&self) -> blake3::Hash {
+        let mut hasher = blake3::Hasher::new();
+        for (cache, inputs) in self.caches_with_inputs() {
+            hasher.update(cache.path.as_str().as_bytes());
+            hasher.update(&[0]);
+            hasher.update(inputs.as_bytes());
+        }
+        hasher.finalize()
+    }
+
     /// Returns every pin found, in order of precedence; the spec holds the first one per tool.
     pub fn pins(&self) -> &[Pin] {
         &self.pins

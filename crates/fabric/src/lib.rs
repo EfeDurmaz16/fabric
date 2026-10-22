@@ -777,7 +777,8 @@ fn materialize(lock: &TreeLock, root: &Path, approval: &Approval<'_>) -> Result<
     // Programs and variables are checked first, so the user is never asked
     // about steps that cannot run here.
     let ready = plan.ready()?;
-    approval.approve(detected.spec().id()?)?;
+    let inputs = detected.inputs_digest().to_hex();
+    approval.approve(detected.spec().id()?, &inputs)?;
     ready.execute(lock)?;
     Ok(())
 }
@@ -786,12 +787,15 @@ fn materialize(lock: &TreeLock, root: &Path, approval: &Approval<'_>) -> Result<
 ///
 /// A restored workspace brings its spec, and with it the programs its
 /// steps run, from wherever it was last edited, an agent's edit of
-/// `.fabric/env.toml` included. So before this node runs the steps of a
-/// spec other than the one it last ran for the job, the user approves
-/// them, by answering at the terminal or with `--yes`. A spec this node
-/// only captured still asks: the agent may have written it during the run.
+/// `.fabric/env.toml` included. It brings the files those programs read
+/// too: a lockfile, `package.json`'s scripts or `.pnpmfile.cjs` name code
+/// an install runs, and change without changing the spec's id. So before
+/// this node runs the steps of a spec, or of the same spec over other
+/// install inputs, than it last ran for the job, the user approves them,
+/// by answering at the terminal or with `--yes`. A spec this node only
+/// captured still asks: the agent may have written it during the run.
 struct Approval<'a> {
-    /// Where the id of the spec this node last ran for the job is kept.
+    /// Where the spec id and install inputs this node last ran for the job are kept.
     record: PathBuf,
     /// `--yes`: run a new spec's steps without asking.
     yes: bool,
@@ -800,25 +804,27 @@ struct Approval<'a> {
 }
 
 impl Approval<'_> {
-    /// Lets the steps of `spec` run, or refuses, and records the spec once
-    /// approved so the next launch of it does not ask again.
-    fn approve(&self, spec: EnvSpecId) -> Result<()> {
+    /// Lets the steps of `spec` run over the install inputs whose digest is
+    /// `inputs`, in hex, or refuses, and records the pair once approved so
+    /// the next launch of the same does not ask again.
+    fn approve(&self, spec: EnvSpecId, inputs: &str) -> Result<()> {
         let id = spec.to_string();
+        let approved = format!("{id} {inputs}");
         let ran = std::fs::read_to_string(&self.record).ok();
-        if ran.as_deref().map(str::trim) == Some(id.as_str()) {
+        if ran.as_deref().map(str::trim) == Some(approved.as_str()) {
             return Ok(());
         }
         if !self.yes && !(self.ask)()? {
             return Err(Refused {
                 refusal: Refusal::NeedsForce,
                 message: format!(
-                    "the setup steps above come from environment spec {id}, which this node has not run for the job, and were not approved; read them, then run the command again with --yes"
+                    "the setup steps above come from environment spec {id}, which this node has not run for the job over these lockfiles and install configuration, and were not approved; read them and what changed, then run the command again with --yes"
                 ),
             }
             .into());
         }
         let temp = self.record.with_extension("tmp");
-        std::fs::write(&temp, format!("{id}\n"))
+        std::fs::write(&temp, format!("{approved}\n"))
             .and_then(|()| std::fs::rename(&temp, &self.record))
             .with_context(|| format!("recording the approved spec in {}", self.record.display()))?;
         Ok(())
@@ -1024,6 +1030,47 @@ mod tests {
         assert!(
             !root.join("other").exists(),
             "a changed step ran unapproved"
+        );
+    }
+
+    /// An approval holds for the install inputs it was given with too. A
+    /// lockfile or a manager's configuration names code the install runs,
+    /// and can change while the spec, which holds only the commands, keeps
+    /// its id; once one changed and the step that reads it is due, the
+    /// launch asks again.
+    #[test]
+    fn a_changed_install_input_asks_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(root.join("go.mod"), "module example.com/m\n").unwrap();
+        std::fs::write(
+            root.join(".fabric/env.toml"),
+            "[[cache]]\npath = \"out\"\nclass = \"build\"\n\n[[setup]]\nprogram = \"sh\"\nargs = [\"-c\", \"echo ran >> ran.log; mkdir -p out; echo x > out/f\"]\n",
+        )
+        .unwrap();
+        let state =
+            StateDir::resolve(Some(dir.path().join("state").as_os_str()), dir.path()).unwrap();
+        let lock = lock_tree(&state, &root).unwrap();
+        let approval = |ask| Approval {
+            record: dir.path().join("env-spec-ran"),
+            yes: false,
+            ask,
+        };
+        let yes = || Ok(true);
+        materialize(&lock, &root, &approval(&yes)).unwrap();
+        materialize(&lock, &root, &unasked(dir.path())).unwrap();
+        std::fs::write(
+            root.join("go.mod"),
+            "module example.com/m\n\nrequire example.com/x v1.0.0\n",
+        )
+        .unwrap();
+        let no = || Ok(false);
+        assert!(materialize(&lock, &root, &approval(&no)).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("ran.log")).unwrap(),
+            "ran\n",
+            "the step ran again unapproved"
         );
     }
 
