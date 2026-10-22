@@ -16,9 +16,10 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use fabric_core::env::{EnvVarName, RunWhen};
+use fabric_core::path::RelPath;
 use fabric_env::detect::{Detection, detect};
 use fabric_env::materialize::{
-    CacheHealth, MaterializeError, NodeEnv, Plan, SENTINEL, TreeLock, plan,
+    CacheHealth, MaterializeError, NodeEnv, Plan, SENTINEL, TreeLock, plan, sentinel_text,
 };
 use tempfile::TempDir;
 
@@ -112,6 +113,13 @@ fn dry_run(detected: &Detection) -> TestResult<Plan> {
     Ok(plan(detected, &lock, &NodeEnv::current())?)
 }
 
+/// Writes the sentinel a finished install leaves in `cache`, for the files the workspace has now.
+fn seal(detected: &Detection, cache: &str) -> TestResult<()> {
+    let text = sentinel_text(detected, &RelPath::parse(cache)?).ok_or("no step fills the cache")?;
+    fs::write(detected.root().join(cache).join(SENTINEL), text)?;
+    Ok(())
+}
+
 /// Writes `override_toml` as the workspace's `.fabric/env.toml` and detects.
 fn declared(root: &Path, override_toml: &str) -> TestResult<Detection> {
     write(root, &[(".fabric/env.toml", override_toml)])?;
@@ -141,15 +149,9 @@ fn a_fresh_pnpm_workspace_plans_its_install_and_the_dry_run_changes_nothing() {
 fn a_finished_install_runs_nothing() {
     let dir = copy_fixture("node-pnpm").unwrap();
     let lock = take_lock(dir.path()).unwrap();
-    write(
-        dir.path(),
-        &[
-            ("node_modules/.fabric-installed", ""),
-            ("node_modules/a/package.json", "{}"),
-        ],
-    )
-    .unwrap();
+    write(dir.path(), &[("node_modules/a/package.json", "{}")]).unwrap();
     let detected = detect(dir.path(), &[]).unwrap();
+    seal(&detected, "node_modules").unwrap();
     let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
     assert_eq!(planned.caches()[0].health, CacheHealth::Healthy);
     assert!(planned.is_noop());
@@ -213,17 +215,60 @@ fn an_installer_marker_left_by_a_failed_install_is_not_proof() {
     assert!(resume().is_noop());
 }
 
+/// The spec holds the install command, not the lockfile, so a lockfile
+/// changed since the install, by a pull or on the node a cache was carried
+/// from, leaves the spec as it was. The sentinel records the files the
+/// install read, so the next resume installs again instead of launching
+/// over packages the lockfile no longer names.
+#[test]
+fn a_lockfile_changed_since_the_install_installs_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
+    write(
+        dir.path(),
+        &[
+            ("package.json", PACKAGE_JSON),
+            ("package-lock.json", r#"{"lockfileVersion":3}"#),
+        ],
+    )
+    .unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    write_executable(
+        &bin.path().join("npm"),
+        "#!/bin/sh\nmkdir -p node_modules/a && echo {} > node_modules/a/package.json\n",
+    )
+    .unwrap();
+    let node = NodeEnv::new(Some(bin.path().as_os_str().to_owned()), Vec::new());
+    let resume = || plan(&detect(dir.path(), &[]).unwrap(), &lock, &node).unwrap();
+    resume().ready().unwrap().execute(&lock).unwrap();
+    assert!(resume().is_noop());
+
+    write(
+        dir.path(),
+        &[(
+            "package-lock.json",
+            r#"{"lockfileVersion":3,"packages":{"node_modules/b":{}}}"#,
+        )],
+    )
+    .unwrap();
+    let changed = resume();
+    assert_eq!(changed.caches()[0].health, CacheHealth::Stale);
+    assert_eq!(changed.steps().len(), 1);
+}
+
 /// One row per rule: a cache a step fills needs the sentinel, whatever
 /// else its installer left there; a cache no step fills needs content.
+/// A row whose cache is sealed has the sentinel a finished install leaves.
 #[test]
 fn health_follows_the_cache_kind() {
-    let cases: [(Files, CacheHealth); 9] = [
+    let cases: [(Files, Option<&str>, CacheHealth); 9] = [
         (
             &[
                 ("package.json", PACKAGE_JSON),
                 ("package-lock.json", ""),
                 ("node_modules/a/package.json", "{}"),
             ],
+            None,
             CacheHealth::Incomplete,
         ),
         (
@@ -231,8 +276,8 @@ fn health_follows_the_cache_kind() {
                 ("package.json", PACKAGE_JSON),
                 ("bun.lock", ""),
                 ("node_modules/a/package.json", "{}"),
-                ("node_modules/.fabric-installed", ""),
             ],
+            Some("node_modules"),
             CacheHealth::Healthy,
         ),
         // `uv venv` writes pyvenv.cfg before any package, so it proves nothing.
@@ -241,26 +286,30 @@ fn health_follows_the_cache_kind() {
                 ("requirements.txt", ""),
                 (".venv/pyvenv.cfg", "home = /x\n"),
             ],
+            None,
             CacheHealth::Incomplete,
         ),
         (
-            &[
-                ("uv.lock", ""),
-                (".venv/pyvenv.cfg", ""),
-                (".venv/.fabric-installed", ""),
-            ],
+            &[("uv.lock", ""), (".venv/pyvenv.cfg", "")],
+            Some(".venv"),
             CacheHealth::Healthy,
         ),
         (
             &[("Cargo.toml", ""), ("target/debug/x", "")],
+            None,
             CacheHealth::Healthy,
         ),
         (
             &[("Cargo.toml", ""), ("target", "")],
+            None,
             CacheHealth::NotADirectory,
         ),
-        (&[("Cargo.toml", "")], CacheHealth::Missing),
-        (&[("Cargo.toml", ""), ("target/", "")], CacheHealth::Empty),
+        (&[("Cargo.toml", "")], None, CacheHealth::Missing),
+        (
+            &[("Cargo.toml", ""), ("target/", "")],
+            None,
+            CacheHealth::Empty,
+        ),
         // A declared cache that no step fills is whole when it has content.
         (
             &[
@@ -270,13 +319,18 @@ fn health_follows_the_cache_kind() {
                 ),
                 ("out/x", ""),
             ],
+            None,
             CacheHealth::Healthy,
         ),
     ];
-    for (files, health) in cases {
+    for (files, sealed, health) in cases {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), files).unwrap();
-        let planned = dry_run(&detect(dir.path(), &[]).unwrap()).unwrap();
+        let detected = detect(dir.path(), &[]).unwrap();
+        if let Some(cache) = sealed {
+            seal(&detected, cache).unwrap();
+        }
+        let planned = dry_run(&detected).unwrap();
         assert_eq!(planned.caches().len(), 1, "{files:?}");
         assert_eq!(planned.caches()[0].health, health, "{files:?}");
     }
@@ -289,35 +343,32 @@ fn a_declared_node_cache_is_proven_by_content_or_its_sentinel() {
     let warm_npm = [
         ("package.json", PACKAGE_JSON),
         ("package-lock.json", ""),
-        ("node_modules/.fabric-installed", ""),
+        ("node_modules/a/package.json", "{}"),
         (".output/index.js", ""),
     ];
     let cache = "[[cache]]\npath = \".output\"\nclass = \"build\"\necosystem = \"node\"\n";
     let with_step = format!("{cache}[[setup]]\nprogram = \"true\"\n");
-    let cases: [(&str, Option<&str>, CacheHealth); 3] = [
-        (cache, None, CacheHealth::Healthy),
-        (&with_step, None, CacheHealth::Incomplete),
-        (
-            &with_step,
-            Some(".output/.fabric-installed"),
-            CacheHealth::Healthy,
-        ),
+    let cases: [(&str, bool, CacheHealth); 3] = [
+        (cache, false, CacheHealth::Healthy),
+        (&with_step, false, CacheHealth::Incomplete),
+        (&with_step, true, CacheHealth::Healthy),
     ];
-    for (override_toml, sentinel, health) in cases {
+    for (override_toml, sealed, health) in cases {
         let dir = tempfile::tempdir().unwrap();
         let lock = take_lock(dir.path()).unwrap();
         write(dir.path(), &warm_npm).unwrap();
-        if let Some(sentinel) = sentinel {
-            write(dir.path(), &[(sentinel, "")]).unwrap();
-        }
         let detected = declared(dir.path(), override_toml).unwrap();
+        seal(&detected, "node_modules").unwrap();
+        if sealed {
+            seal(&detected, ".output").unwrap();
+        }
         let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
         let output = planned
             .caches()
             .iter()
             .find(|c| c.path.as_str() == ".output")
             .unwrap();
-        assert_eq!(output.health, health, "{override_toml} {sentinel:?}");
+        assert_eq!(output.health, health, "{override_toml} {sealed}");
     }
 }
 
@@ -622,6 +673,36 @@ fn a_report_without_caches_runs_its_steps_on_every_resume() {
     assert!(dir.path().join("ran").exists());
 }
 
+/// Go's module cache is per node and lies outside the workspace, so it is
+/// never carried, and a healthy `node_modules` beside it says nothing about
+/// it: on a node that never downloaded the modules, `go mod download` runs
+/// while the carried install does not.
+#[test]
+fn a_step_that_fills_a_cache_outside_the_workspace_runs_beside_a_warm_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
+    write(
+        dir.path(),
+        &[
+            ("package.json", PACKAGE_JSON),
+            ("package-lock.json", ""),
+            ("node_modules/a/package.json", "{}"),
+            ("go.mod", "module example.com/x\n\ngo 1.22.0\n"),
+        ],
+    )
+    .unwrap();
+    let detected = detect(dir.path(), &[]).unwrap();
+    seal(&detected, "node_modules").unwrap();
+    let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
+    assert_eq!(planned.caches()[0].health, CacheHealth::Healthy);
+    let programs: Vec<&str> = planned
+        .steps()
+        .iter()
+        .map(|s| s.step().program.as_str())
+        .collect();
+    assert_eq!(programs, ["go"]);
+}
+
 /// A missing `target` is a build away and says nothing about
 /// `node_modules`; reinstalling a whole carried tree because of it would
 /// throw away the carry on every resume. Only the fetch it gates runs.
@@ -634,12 +715,13 @@ fn a_missing_target_does_not_reinstall_a_whole_node_modules() {
         &[
             ("package.json", PACKAGE_JSON),
             ("package-lock.json", ""),
-            ("node_modules/.fabric-installed", ""),
+            ("node_modules/a/package.json", "{}"),
             ("Cargo.toml", ""),
         ],
     )
     .unwrap();
     let detected = detect(dir.path(), &[]).unwrap();
+    seal(&detected, "node_modules").unwrap();
     let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
     let programs: Vec<&str> = planned
         .steps()
@@ -662,18 +744,14 @@ fn a_missing_target_does_not_run_a_declared_install() {
             ("package.json", PACKAGE_JSON),
             ("package-lock.json", ""),
             ("node_modules/a/package.json", "{}"),
-            ("node_modules/.fabric-installed", ""),
             ("Cargo.toml", ""),
         ],
     )
     .unwrap();
     let override_toml = "[[setup]]\nprogram = \"npm\"\nargs = [\"ci\"]\n";
-    let planned = plan(
-        &declared(dir.path(), override_toml).unwrap(),
-        &lock,
-        &NodeEnv::current(),
-    )
-    .unwrap();
+    let detected = declared(dir.path(), override_toml).unwrap();
+    seal(&detected, "node_modules").unwrap();
+    let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
     assert!(planned.is_noop(), "{:?}", planned.steps());
 
     fs::remove_file(dir.path().join("node_modules").join(SENTINEL)).unwrap();
@@ -820,10 +898,11 @@ fn a_lock_for_another_tree_does_not_plan_or_run_this_one() {
 }
 
 /// A step that leaves the sentinel itself, as one that unpacks an archive
-/// of a whole cache does, succeeds; a link it leaves there is replaced by
-/// a real sentinel and never followed.
+/// of a whole cache does, succeeds, and the sentinel is written again for
+/// the files this run read; a link it leaves there is replaced by a real
+/// sentinel and never followed.
 #[test]
-fn a_sentinel_the_steps_left_is_kept_and_a_link_there_is_replaced() {
+fn a_sentinel_the_steps_left_is_written_again_and_a_link_there_is_replaced() {
     let outside = tempfile::tempdir().unwrap();
     fs::write(outside.path().join("target"), "outside").unwrap();
     let dir = tempfile::tempdir().unwrap();

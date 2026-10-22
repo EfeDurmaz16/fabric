@@ -606,6 +606,56 @@ fn a_linked_pin_file_is_refused_without_reading_it() {
     }
 }
 
+/// A file detection only checks for selects the step that reads it, so a
+/// link there out of the workspace would have `npm ci` read a lockfile
+/// that differs from node to node, one to a file the secret policy denies
+/// names a file capture leaves behind, and a directory there would select
+/// an install that cannot run. Each is refused with the file named, as a
+/// linked pin file is.
+#[test]
+fn a_linked_or_non_regular_file_detection_checks_for_is_refused() {
+    let elsewhere = workspace(&[("lock.json", "{}")]).unwrap();
+    let linked = workspace(&[("package.json", PACKAGE_JSON)]).unwrap();
+    symlink(
+        elsewhere.path().join("lock.json"),
+        linked.path().join("package-lock.json"),
+    )
+    .unwrap();
+    let denied = workspace(&[(".env", "django==5.2\n")]).unwrap();
+    symlink(".env", denied.path().join("requirements.txt")).unwrap();
+    let directory = workspace(&[("Cargo.toml/x", "")]).unwrap();
+    for (dir, name) in [
+        (&linked, "package-lock.json"),
+        (&denied, "requirements.txt"),
+        (&directory, "Cargo.toml"),
+    ] {
+        match detect(dir.path(), &[]) {
+            Err(DetectError::NotARegularFile { file }) => assert_eq!(file, name),
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+}
+
+/// A link inside the workspace to a regular file there, as Django's
+/// `requirements.txt -> requirements/base.txt`, travels as a link and
+/// resolves the same on every node, so it counts as the file it names:
+/// the same steps, and the same install inputs, as a copy of that file.
+#[test]
+fn a_file_detection_checks_for_may_link_to_a_file_inside_the_workspace() {
+    let base = "django==5.2\n";
+    let copied = workspace(&[("requirements.txt", base)]).unwrap();
+    let linked = workspace(&[("requirements/base.txt", base)]).unwrap();
+    symlink(
+        "requirements/base.txt",
+        linked.path().join("requirements.txt"),
+    )
+    .unwrap();
+    let copied = detect(copied.path(), &[]).unwrap();
+    let linked = detect(linked.path(), &[]).unwrap();
+    assert_eq!(commands(&linked), commands(&copied));
+    assert_eq!(linked.inputs_digest(), copied.inputs_digest());
+}
+
 /// A link anywhere on the way is refused, not only in the last component:
 /// `.fabric -> ../other/.fabric` would read another workspace's setup steps.
 #[test]

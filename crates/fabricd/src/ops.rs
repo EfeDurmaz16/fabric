@@ -20,7 +20,9 @@ use fabric_core::id::{Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::{FenceError, FencingToken};
 use fabric_core::ledger::{Author, EventKind, Ledger};
 use fabric_core::moves::{AbortAnswer, CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
+use fabric_core::snapshot::Platform;
 use fabric_env::materialize::{MaterializeError, TreeLock};
+use fabric_harness::codex::Codex;
 use fabric_harness::manifest::{MANIFEST_FILE, StateManifest};
 use fabric_harness::{HarnessError, SessionId};
 use fabric_net::peers::HostPort;
@@ -40,7 +42,7 @@ use crate::doctor::{self, Context, Target};
 use crate::error::NodeError;
 use crate::facts::{MeasuredKeys, NodeFacts, key_difference};
 use crate::faults::{self, Action, Point};
-use crate::harnesses::{HarnessConfig, adapter, refuse_secret_kind};
+use crate::harnesses::{HarnessConfig, HarnessEnv, adapter, refuse_secret_kind};
 use crate::job::Job;
 use crate::local::{self, HarnessRecord, Liveness, Marker, MarkerState, SessionRecord};
 use crate::node::{Node, Out, is_transport};
@@ -63,9 +65,9 @@ pub const MOVE_DEADLINE: Duration = Duration::from_mins(10);
 /// How long a status question or a ping may take.
 pub const SHORT_DEADLINE: Duration = Duration::from_secs(15);
 
-/// The bytes of record lines `job log` answers with at most: half the
+/// The bytes of lines `job log` and `job ls` answer with at most: half the
 /// control message cap, which leaves room for the encoding around them.
-const LOG_BUDGET: usize = crate::control::MAX_CONTROL_MESSAGE / 2;
+const LINES_BUDGET: usize = crate::control::MAX_CONTROL_MESSAGE / 2;
 
 /// How many times a move asks again after a lost answer before it reports the move frozen.
 const MOVE_TRIES: usize = 5;
@@ -209,17 +211,25 @@ impl Node {
     }
 
     fn node_list(&self, out: &mut Out) {
+        self.node_list_within(LINES_BUDGET, out);
+    }
+
+    /// Lists every paired node in one row each, in the book's order,
+    /// keeping the last rows that fit in `budget` bytes: a row is bounded
+    /// by the addresses the book keeps for a peer, but the book does not
+    /// bound how many peers it holds, and enough of them would otherwise
+    /// answer past the control message cap.
+    fn node_list_within(&self, budget: usize, out: &mut Out) {
         let book = self.peers.snapshot();
-        let mut any = false;
+        let mut lines = Vec::new();
         for entry in book.iter() {
-            any = true;
             let connected = if self.open_session(entry.node()).is_some() {
                 "connected"
             } else {
                 "not connected"
             };
             let addrs: Vec<String> = entry.addrs().iter().map(ToString::to_string).collect();
-            out.say(format!(
+            lines.push(format!(
                 "{} {} ({connected})",
                 entry.node(),
                 if addrs.is_empty() {
@@ -229,26 +239,38 @@ impl Node {
                 }
             ));
         }
-        if !any {
+        if lines.is_empty() {
             out.say("no paired nodes; pair one with `fabric node add <node-id> <host:port>`");
+            return;
         }
+        let (left_out, kept) = latest_within(lines, budget);
+        if left_out > 0 {
+            out.say(format!(
+                "the first {left_out} paired nodes are left out; the other {} fill one answer",
+                kept.len()
+            ));
+        }
+        out.lines.extend(kept);
     }
 
+    /// Pings `node` over its live session, or a new dial when there is
+    /// none or the live one fails: a second dial while a session is live
+    /// would replace it and cut the calls other commands make on it.
     async fn node_ping(self: &Arc<Self>, node: NodeId, out: &mut Out) -> Result<(), NodeError> {
-        let session = self.dial(node).await?;
-        let started = tokio::time::Instant::now();
-        session
-            .ping(SHORT_DEADLINE)
-            .await
-            .map_err(|e| NodeError::Unreachable {
-                peer: node,
-                reason: e.to_string(),
-            })?;
+        let (took, wire, skew) = self
+            .call(node, |session| async move {
+                let started = tokio::time::Instant::now();
+                session.ping(SHORT_DEADLINE).await?;
+                Ok((
+                    started.elapsed(),
+                    session.kind().to_string(),
+                    session.clock_skew_ms(),
+                ))
+            })
+            .await?;
         out.say(format!(
-            "{node} answered in {} ms over {}; its clock is {} ms from this one",
-            started.elapsed().as_millis(),
-            session.kind(),
-            session.clock_skew_ms()
+            "{node} answered in {} ms over {wire}; its clock is {skew} ms from this one",
+            took.as_millis(),
         ));
         Ok(())
     }
@@ -334,8 +356,16 @@ impl Node {
     }
 
     async fn job_list(&self, out: &mut Out) {
+        self.job_list_within(LINES_BUDGET, out).await;
+    }
+
+    /// Lists every job in one row each, oldest first, keeping the latest
+    /// rows that fit in `budget` bytes: each row is bounded, and a node
+    /// that made tens of thousands of jobs would otherwise answer past the
+    /// control message cap.
+    async fn job_list_within(&self, budget: usize, out: &mut Out) {
         let jobs: Vec<_> = self.jobs.lock().await.values().cloned().collect();
-        let jobs_listed = jobs.len() + self.broken_jobs().len();
+        let mut lines = Vec::new();
         for job in jobs {
             let job = job.lock().await;
             let manifest = job.ledger().manifest();
@@ -344,7 +374,7 @@ impl Node {
                 Ok(None) => view_word(&job.view(self.id)),
                 Err(_) => "unreadable",
             };
-            out.say(format!(
+            lines.push(format!(
                 "{} {word} epoch {} {}",
                 job.id(),
                 manifest.lease.epoch(),
@@ -352,11 +382,20 @@ impl Node {
             ));
         }
         for (id, error) in self.broken_jobs() {
-            out.say(format!("{id} closed: {error}"));
+            lines.push(format!("{id} closed: {error}"));
         }
-        if jobs_listed == 0 {
+        if lines.is_empty() {
             out.say("no jobs; make one with `fabric job new --repo <path> --goal <text>`");
+            return;
         }
+        let (left_out, kept) = latest_within(lines, budget);
+        if left_out > 0 {
+            out.say(format!(
+                "the {left_out} oldest jobs are left out; the latest {} fill one answer, and `fabric job status <job>` shows any job",
+                kept.len()
+            ));
+        }
+        out.lines.extend(kept);
     }
 
     fn broken_jobs(&self) -> Vec<(JobId, String)> {
@@ -451,22 +490,14 @@ impl Node {
             })
             .collect();
         // A record is at most 1 MiB, so the latest one always fits.
-        let mut start = lines.len();
-        let mut bytes = 0;
-        while let Some(line) = start.checked_sub(1).map(|i| &lines[i]) {
-            if bytes + line.len() > LOG_BUDGET {
-                break;
-            }
-            bytes += line.len();
-            start -= 1;
-        }
+        let (start, kept) = latest_within(lines, LINES_BUDGET);
         if start > 0 {
             out.say(format!(
                 "the first {start} records are left out; the latest {} fill one answer",
-                lines.len() - start
+                kept.len()
             ));
         }
-        out.lines.extend(lines.into_iter().skip(start));
+        out.lines.extend(kept);
         Ok(())
     }
 
@@ -580,6 +611,7 @@ impl Node {
             session,
             planned,
         } = started;
+        faults::hit(Point::BeforeHarnessRecord).await;
         refuse_secret_kind(&harness)?;
         let job = self.job(id).await?;
         let mut job = job.lock().await;
@@ -617,6 +649,14 @@ impl Node {
                 started,
             },
         )?;
+        // The session is recorded as pending before `Resumed` and moved into
+        // place after it, so a crash between the two does not leave a
+        // `Resumed` whose session a later capture would miss.
+        let record = session.map(|session| SessionRecord {
+            harness: harness.clone(),
+            session,
+        });
+        job.begin_session(epoch, record.as_ref())?;
         let snapshot = job.latest();
         job.append(
             self.id,
@@ -626,15 +666,21 @@ impl Node {
                 harness: harness.clone(),
             },
         )?;
-        if let Some(session) = session {
-            local::write(
-                &job.dir().session(),
-                &SessionRecord {
-                    harness: harness.clone(),
-                    session,
-                },
-            )?;
+        if record.is_some() {
+            job.session()?;
         }
+        // The threads a fresh Codex plan noted count only once its launch is
+        // recorded: a plan the CLI never launched, as when the user said no
+        // to its setup steps, must not make a thread a later `codex` typed
+        // by hand in the workspace the job's.
+        let planned = job.dir().fresh_codex_planned();
+        if harness == HarnessKind::Codex
+            && record.is_none()
+            && let Some(before) = local::read::<Vec<SessionId>>(&planned)?
+        {
+            local::write(&job.dir().fresh_codex(), &before)?;
+        }
+        local::remove(&planned)?;
         if let Some(marker) = job.marker()? {
             job.set_marker(&Marker {
                 root: marker.root,
@@ -887,6 +933,86 @@ impl Node {
         }
     }
 
+    /// Captures the session of the harness the job ran last into its harness
+    /// state directory, and returns that directory, or `None` when there is
+    /// no session to carry.
+    ///
+    /// The capture is written beside the last one and replaces it only once
+    /// it succeeds, so a capture that fails leaves the state the job's last
+    /// snapshot carries where it was.
+    async fn capture_harness(
+        &self,
+        job: &Job,
+        root: &Path,
+        path_var: &OsString,
+        out: &mut Out,
+    ) -> Result<Option<PathBuf>, NodeError> {
+        let state_dir = job.dir().harness_state();
+        let next = job.dir().harness_state_next();
+        let old = job.dir().harness_state_old();
+        finish_state_swap(&state_dir, &next, &old)?;
+        let Some(record) = job_session(job, root, &self.cfg.home, job.harness())? else {
+            return Ok(None);
+        };
+        let session = record.session;
+        let harness = adapter(&record.harness, &self.harness_env(path_var)?)?;
+        let carried = state_names(&state_dir, &record.harness, &session);
+        std::fs::create_dir_all(&next).map_err(|e| NodeError::io(&next, e))?;
+        let captured = harness.capture(root, &session, &next).await;
+        if captured.is_err() {
+            remove_dir_if_any(&next)?;
+        }
+        match captured {
+            Ok(manifest) => {
+                if std::fs::symlink_metadata(&state_dir).is_ok() {
+                    std::fs::rename(&state_dir, &old).map_err(|e| NodeError::io(&state_dir, e))?;
+                }
+                std::fs::rename(&next, &state_dir).map_err(|e| NodeError::io(&next, e))?;
+                remove_dir_if_any(&old)?;
+                out.say(format!(
+                    "captured {} session {} ({} files)",
+                    record.harness,
+                    session,
+                    manifest.files().len()
+                ));
+                Ok(Some(state_dir))
+            }
+            // A launch records its session before the harness writes any
+            // of it, and a harness stopped at once, as by a signal that
+            // ended the run while the node recorded it, never does. Nothing
+            // of it exists to carry, and no snapshot carries it, since this
+            // node never captured or restored it, so the record goes and
+            // the capture goes on. The state this node last captured or
+            // restored, of the session the job held before, stays in the
+            // snapshot and stays the job's session.
+            Err(HarnessError::SessionNotFound { .. }) if !carried => {
+                let before = StateManifest::read(&state_dir).ok();
+                let kept = if let Some(state) = &before {
+                    job.set_session(&SessionRecord {
+                        harness: state.kind().clone(),
+                        session: state.session().clone(),
+                    })?;
+                    format!(
+                        "the snapshot keeps the {} session {} it held before",
+                        state.kind(),
+                        state.session()
+                    )
+                } else {
+                    job.forget_session()?;
+                    job.clear_harness_state()?;
+                    "the snapshot carries no harness state and the next run starts a new session"
+                        .to_owned()
+                };
+                out.say(format!(
+                    "{} session {} left no state on this node and no snapshot holds it, so it never started; {kept}",
+                    record.harness, session
+                ));
+                Ok(before.map(|_| state_dir))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Captures the harness state and the workspace and publishes them as one snapshot.
     async fn capture(
         &self,
@@ -895,35 +1021,39 @@ impl Node {
         path_var: &OsString,
         out: &mut Out,
     ) -> Result<SnapshotId, NodeError> {
-        let state_dir = job.dir().harness_state();
-        let mut harness_state = None;
-        if let Some(record) = job.session()? {
-            let session = record.session;
-            let harness = adapter(&record.harness, &self.harness_env(path_var)?)?;
-            job.clear_harness_state()?;
-            std::fs::create_dir_all(&state_dir).map_err(|e| NodeError::io(&state_dir, e))?;
-            let manifest = harness.capture(root, &session, &state_dir).await?;
-            out.say(format!(
-                "captured {} session {} ({} files)",
-                record.harness,
-                session,
-                manifest.files().len()
-            ));
-            harness_state = Some(state_dir);
-        }
+        let harness_state = self.capture_harness(job, root, path_var, out).await?;
         let facts = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
         // A workspace whose environment does not detect here would not
         // materialize on the target either, so the snapshot is refused
         // before it is published or moved.
         // A pattern the job ever added stays: removing its line from
-        // `.fabric/env.toml` does not remove it (ADR 0007, Secrets).
-        let recorded: Vec<fabric_core::secret::SecretPattern> =
+        // `.fabric/env.toml` does not remove it (ADR 0007, Secrets). The
+        // node that recorded it may be another one; the spec of the job's
+        // latest snapshot travels with the job and holds what it recorded.
+        let parent = job.latest();
+        let mut recorded: Vec<fabric_core::secret::SecretPattern> =
             local::read(&job.dir().secret_patterns())?.unwrap_or_default();
+        if let Some(parent) = parent {
+            let travelled = with_store(&self.store, move |store| {
+                let manifest = store.manifest(parent)?;
+                Ok(manifest
+                    .env_spec
+                    .map(|spec| store.env_spec(spec))
+                    .transpose()?)
+            })
+            .await?;
+            if let Some(spec) = travelled {
+                recorded.extend(spec.secret_patterns);
+                recorded.sort();
+                recorded.dedup();
+            }
+        }
         let detection = fabric_env::detect::detect(root, &recorded)?;
         local::write(
             &job.dir().secret_patterns(),
             &detection.spec().secret_patterns,
         )?;
+        let spec = detection.spec().clone();
         let keys = MeasuredKeys::new(facts, Some(&detection));
         let secret_patterns: Vec<String> = detection
             .spec()
@@ -931,10 +1061,21 @@ impl Node {
             .iter()
             .map(|pattern| pattern.as_str().to_owned())
             .collect();
+        // A cache the job declares has a name no built-in rule knows, so
+        // the policy is told its path: the snapshot records it with its
+        // carry key, and a target whose key differs rebuilds it.
+        let declared: Vec<(
+            fabric_core::snapshot::CacheClass,
+            fabric_core::path::RelPath,
+        )> = detection
+            .caches()
+            .iter()
+            .filter(|cache| cache.origin == fabric_env::detect::CacheOrigin::Declared)
+            .map(|cache| (cache.class, cache.path.clone()))
+            .collect();
         let root = root.to_owned();
         let job_id = job.id();
         let me = self.id;
-        let parent = job.latest();
         let (snapshot, report) = with_store(&self.store, move |store| {
             let mut policy = IgnorePolicy::default();
             policy.load_fabricignore(&root)?;
@@ -943,6 +1084,12 @@ impl Node {
             for pattern in &secret_patterns {
                 policy.add_secret_pattern(pattern)?;
             }
+            for (class, path) in &declared {
+                policy.add_declared_cache(*class, path);
+            }
+            // The snapshot names the spec and the store keeps its bytes, so
+            // a peer that fetches the snapshot fetches the spec (ADR 0007).
+            let env_spec = store.put_env_spec(&spec)?;
             let captured = capture(
                 store,
                 &CaptureRequest {
@@ -954,7 +1101,7 @@ impl Node {
                     policy: &policy,
                     carry_keys: &keys,
                     harness_state: harness_state.as_deref(),
-                    env_spec: None,
+                    env_spec: Some(env_spec),
                     allow_large_untracked: false,
                 },
             )?;
@@ -1062,7 +1209,7 @@ impl Node {
             Ok(value) => Ok(value),
             Err(e) if is_transport(&e) => {
                 self.forget(peer, &session);
-                let session = self.dial(peer).await?;
+                let session = self.session(peer).await?;
                 f(session).await.map_err(|e| NodeError::Unreachable {
                     peer,
                     reason: e.to_string(),
@@ -1831,7 +1978,7 @@ impl Node {
             Ok(()) => Ok(()),
             Err(first) => {
                 self.forget(peer, &session);
-                let session = self.dial(peer).await.map_err(|_| first)?;
+                let session = self.session(peer).await.map_err(|_| first)?;
                 fetch_snapshot(&self.store, &session, snapshot).await
             }
         }
@@ -1898,7 +2045,7 @@ impl Node {
                 return Err(NodeError::WorkspaceOccupied { root });
             }
             job.clear_harness_state()?;
-            local::remove(&job.dir().session())?;
+            job.forget_session()?;
         }
         // The marker says `Restoring` from before the staging directory
         // exists, so a tree here may be another process's, written into
@@ -1907,6 +2054,13 @@ impl Node {
         // last write, is accepted.
         if resuming && state == RestoreState::Present && !self.holds(snapshot, &root).await? {
             return Err(NodeError::WorkspaceOccupied { root });
+        }
+        // The setup steps this node approved run code from the workspace
+        // that no spec id or install digest covers, such as a script a
+        // declared step names; another node's snapshot may hold the
+        // agent's edits of it, so its steps are approved again (ADR 0007).
+        if manifest.created_by != self.id {
+            local::remove(&job.dir().env_spec_ran())?;
         }
         job.set_marker(&Marker {
             root: root.clone(),
@@ -1922,7 +2076,7 @@ impl Node {
             let harness_dir = has_harness_state.then(|| state_dir.clone());
             self.write_snapshot(
                 snapshot,
-                &manifest.caches,
+                (&manifest.caches, &manifest.platform),
                 &root,
                 harness_dir,
                 path_var,
@@ -1995,26 +2149,53 @@ impl Node {
                 ));
                 None
             }
+            // A root deleted or moved away while the marker says live
+            // holds nothing to continue, and a directory made there later
+            // would be launched in as if it were the workspace. So the
+            // latest snapshot is restored, once no harness of the tenure
+            // still runs in the old tree.
+            Some(Marker {
+                root,
+                state: MarkerState::Live,
+                ..
+            }) if is_missing(&root)? => {
+                if let Some(record) = job.harness_record()?
+                    && record.liveness().await != Liveness::Gone
+                {
+                    return Err(NodeError::AlreadyRunningHarness {
+                        job: job.id(),
+                        pid: record.pid.get(),
+                    });
+                }
+                out.say(format!(
+                    "the workspace at {} is gone; restoring the latest snapshot, and work since it that no suspend captured is lost",
+                    root.display()
+                ));
+                None
+            }
             marker => marker,
         })
     }
 
-    /// Writes `snapshot` into the empty `root`, carrying each cache whose key matches this node's.
+    /// Writes `snapshot` into the empty `root`, carrying each cache whose
+    /// key matches this node's when it was built on this node's platform.
     async fn write_snapshot(
         &self,
         snapshot: SnapshotId,
-        caches: &[fabric_core::snapshot::CacheEntry],
+        (caches, built_on): (&[fabric_core::snapshot::CacheEntry], &Platform),
         root: &Path,
         harness_dir: Option<PathBuf>,
         path_var: &OsString,
         out: &mut Out,
     ) -> Result<(), NodeError> {
         let facts = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
-        report_caches(caches, &facts, out);
+        let here = this_platform();
+        report_caches(caches, (built_on, &here), &facts, out);
         let target = root.to_owned();
+        let built_on = built_on.clone();
         let report = with_store(&self.store, move |store| {
             let carry = |entry: &fabric_core::snapshot::CacheEntry| {
-                entry.key.matches(&facts.key_like(&entry.key))
+                carries(entry, (&built_on, &here), &facts)
             };
             Ok(restore(
                 store,
@@ -2060,7 +2241,7 @@ impl Node {
                 dest.display()
             ));
         }
-        local::remove(&job.dir().session())?;
+        job.forget_session()?;
         job.clear_marker()
     }
 
@@ -2076,13 +2257,10 @@ impl Node {
         let state = StateManifest::read(&state_dir)?;
         let harness = adapter(state.kind(), &self.harness_env(path_var)?)?;
         harness.restore(root, &state_dir).await?;
-        local::write(
-            &job.dir().session(),
-            &SessionRecord {
-                harness: state.kind().clone(),
-                session: state.session().clone(),
-            },
-        )?;
+        job.set_session(&SessionRecord {
+            harness: state.kind().clone(),
+            session: state.session().clone(),
+        })?;
         out.say(format!(
             "restored {} session {}",
             state.kind(),
@@ -2223,7 +2401,13 @@ impl Node {
         force: bool,
         out: &mut Out,
     ) -> Result<(), NodeError> {
-        let here = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
+        let mut here =
+            NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
+        // The agent of an ACP job is named per job, so only the target of a
+        // pull, this node, can look for it.
+        if let (Target::Here, Some((HarnessKind::Acp { program, .. }, _))) = (target, job) {
+            here.measure_acp(program, &self.harness_env(path_var)?);
+        }
         // A session the peer opened is used too: a peer behind a NAT has
         // no address here and is reachable only over the session it dialed.
         let (theirs, clock_skew_ms, wire) = self
@@ -2318,6 +2502,79 @@ fn refuse_moved_session(
     Ok(())
 }
 
+/// Whether the harness state in `state_dir`, the last this node captured
+/// or restored for the job, is `session` of `kind`, so a snapshot carries
+/// it. A state that cannot be read counts as that session, so a session
+/// is never dropped for a file this node cannot read.
+fn state_names(state_dir: &Path, kind: &HarnessKind, session: &SessionId) -> bool {
+    if !state_dir.join(MANIFEST_FILE).is_file() {
+        return false;
+    }
+    StateManifest::read(state_dir).map_or(true, |state| {
+        state.kind() == kind && state.session() == session
+    })
+}
+
+/// The job's session for `harness`, the one a capture takes or a plan
+/// launches: the one recorded for it, else, when both `harness` and the
+/// harness the job ran last are Codex, the thread a fresh Codex launched
+/// here made, else the record of the harness it ran before, if any.
+///
+/// A Codex launched without a thread to resume makes one only once it
+/// runs, after its launch was recorded, so no launch can name it. Its
+/// rollout records the workspace it started in as its `cwd`, and the
+/// workspace is the job's own (`paths::job_root`). The plan of such a
+/// launch notes the threads the workspace held then (`JobDir::fresh_codex`),
+/// so the launch's thread is the oldest one outside that note: an older
+/// thread is the job's from before, as one a Codex run here made before
+/// the job switched to Claude, and a newer one was made by something the
+/// launch ran, a `codex exec`, a sub-agent or a review. It is recorded
+/// here, as a launch that named it would have been. Without it, a suspend
+/// would carry the workspace and leave the conversation behind, or carry
+/// the state of the harness the job ran before it switched to Codex. With
+/// no such plan since the job last arrived, or no thread from it, the
+/// record stands. A plan for another harness leaves the record alone:
+/// after a fresh Codex the record still names the session of the harness
+/// before it, which a resume under that harness continues.
+fn job_session(
+    job: &Job,
+    root: &Path,
+    home: &Path,
+    harness: &HarnessKind,
+) -> Result<Option<SessionRecord>, NodeError> {
+    let recorded = job.session()?;
+    if *harness != HarnessKind::Codex
+        || *job.harness() != HarnessKind::Codex
+        || recorded
+            .as_ref()
+            .is_some_and(|record| record.harness == *harness)
+    {
+        return Ok(recorded);
+    }
+    let Some(before) = local::read::<Vec<SessionId>>(&job.dir().fresh_codex())? else {
+        return Ok(recorded);
+    };
+    let Some(thread) = codex_threads(root, home)?
+        .into_iter()
+        .find(|thread| !before.contains(thread))
+    else {
+        return Ok(recorded);
+    };
+    let record = SessionRecord {
+        harness: HarnessKind::Codex,
+        session: thread,
+    };
+    local::write(&job.dir().session(), &record)?;
+    local::remove(&job.dir().fresh_codex())?;
+    Ok(Some(record))
+}
+
+/// The Codex threads whose rollouts under `home` record `root` as their `cwd`, oldest first.
+fn codex_threads(root: &Path, home: &Path) -> Result<Vec<SessionId>, NodeError> {
+    let env = HarnessEnv::new(home, OsString::new(), HarnessConfig::default())?;
+    Ok(Codex::new(env.home, env.path_var).threads_in(root)?)
+}
+
 /// What to launch for `job` on its owner.
 ///
 /// The workspace is marked live before the plan leaves the node: from here
@@ -2342,7 +2599,7 @@ fn plan(
         epoch,
     })?;
     let harness = harness.unwrap_or_else(|| job.harness().clone());
-    let session = match job.session()? {
+    let session = match job_session(job, &root, home, &harness)? {
         Some(record) if record.harness == harness => {
             out.say(format!("continuing {harness} session {}", record.session));
             Some(record.session)
@@ -2359,6 +2616,12 @@ fn plan(
             None
         }
     };
+    if harness == HarnessKind::Codex && session.is_none() {
+        local::write(
+            &job.dir().fresh_codex_planned(),
+            &codex_threads(&root, home)?,
+        )?;
+    }
     Ok(RunPlan {
         job: job.id(),
         epoch,
@@ -2375,10 +2638,47 @@ fn plan(
 /// Says, one line per cache, whether its bytes are written here or rebuilt,
 /// and why (ADR 0008); past `REPORT_PATHS` caches it counts the rest, so a
 /// resume's answer stays within one control message.
-fn report_caches(caches: &[fabric_core::snapshot::CacheEntry], facts: &NodeFacts, out: &mut Out) {
+/// The operating system and architecture of this node, as a capture here
+/// records them in its snapshot.
+fn this_platform() -> Platform {
+    Platform {
+        os: std::env::consts::OS.to_owned(),
+        arch: std::env::consts::ARCH.to_owned(),
+    }
+}
+
+/// Whether a restore here writes the cache `entry` of a snapshot captured
+/// on `built_on` rather than leaving it to its install step.
+///
+/// The keys must match, and the platforms must be one: a Node key names
+/// the Node and package manager majors, not the platform, and a Python key
+/// may match across platforms too, while a `node_modules` or a venv holds
+/// native addons and binaries built for the platform it was installed on
+/// (ADR 0004, Restore, step 6).
+fn carries(
+    entry: &fabric_core::snapshot::CacheEntry,
+    (built_on, here): (&Platform, &Platform),
+    facts: &NodeFacts,
+) -> bool {
+    built_on == here && entry.key.matches(&facts.key_like(&entry.key))
+}
+
+fn report_caches(
+    caches: &[fabric_core::snapshot::CacheEntry],
+    (built_on, here): (&Platform, &Platform),
+    facts: &NodeFacts,
+    out: &mut Out,
+) {
     for cache in caches.iter().take(REPORT_PATHS) {
         let mine = facts.key_like(&cache.key);
-        if cache.key.matches(&mine) && cache.carry == fabric_core::snapshot::CarryState::Carried {
+        if built_on != here {
+            out.say(format!(
+                "{}: rebuilt here, it was built on {} {} and this node is {} {}",
+                cache.path, built_on.os, built_on.arch, here.os, here.arch
+            ));
+        } else if carries(cache, (built_on, here), facts)
+            && cache.carry == fabric_core::snapshot::CarryState::Carried
+        {
             out.say(format!("{}: carried, the keys match", cache.path));
         } else {
             out.say(format!(
@@ -2401,6 +2701,22 @@ const SUMMARY_CHARS: usize = 72;
 
 /// A goal's first line, cut to `SUMMARY_CHARS`, so that a list of goals
 /// up to the record bound each still fits in one control answer.
+/// The last of `lines` that fit in `budget` bytes together, in order, and
+/// how many before them were left out.
+fn latest_within(mut lines: Vec<String>, budget: usize) -> (usize, Vec<String>) {
+    let mut start = lines.len();
+    let mut bytes = 0;
+    while let Some(line) = start.checked_sub(1).map(|i| &lines[i]) {
+        if bytes + line.len() > budget {
+            break;
+        }
+        bytes += line.len();
+        start -= 1;
+    }
+    let kept = lines.split_off(start);
+    (start, kept)
+}
+
 fn summary(goal: &str) -> String {
     let first = goal.lines().next().unwrap_or_default();
     match first.char_indices().nth(SUMMARY_CHARS) {
@@ -2440,6 +2756,11 @@ fn report_capture(report: &fabric_store::capture::CaptureReport, out: &mut Out) 
     );
     say_each(
         out,
+        "travels as git's check-in output, not its own bytes (filter attribute)",
+        &report.filtered,
+    );
+    say_each(
+        out,
         "left behind (not a file, link or directory)",
         &report.special_files,
     );
@@ -2447,6 +2768,11 @@ fn report_capture(report: &fabric_store::capture::CaptureReport, out: &mut Out) 
         out,
         "left behind (not a file, link or directory, harness state)",
         &report.special_harness,
+    );
+    say_each(
+        out,
+        "left behind with everything under it (this user cannot read the directory)",
+        &report.unreadable,
     );
     // In a repository the whole nested tree stays; in a plain directory
     // its files travel and only its `.git` stays.
@@ -2465,11 +2791,6 @@ fn report_capture(report: &fabric_store::capture::CaptureReport, out: &mut Out) 
         out,
         "travels without its user info (git config)",
         &report.stripped_userinfo,
-    );
-    say_each(
-        out,
-        "travels with its last value only (git config)",
-        &report.repeated_config,
     );
     say_each(out, "left behind (git config)", &report.dropped_config);
 }
@@ -2499,6 +2820,26 @@ fn refuse_replaced_root(job: JobId, root: &Path) -> Result<(), NodeError> {
 }
 
 /// Whether nothing, not even a dangling link, is at `path`.
+/// Finishes or undoes a swap of the harness state a capture killed midway
+/// left: a new state not yet in place goes, and the last state set aside
+/// comes back when nothing took its place.
+fn finish_state_swap(state_dir: &Path, next: &Path, old: &Path) -> Result<(), NodeError> {
+    remove_dir_if_any(next)?;
+    if is_missing(state_dir)? && !is_missing(old)? {
+        std::fs::rename(old, state_dir).map_err(|e| NodeError::io(old, e))
+    } else {
+        remove_dir_if_any(old)
+    }
+}
+
+fn remove_dir_if_any(dir: &Path) -> Result<(), NodeError> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(NodeError::io(dir, e)),
+    }
+}
+
 fn is_missing(path: &Path) -> Result<bool, NodeError> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(false),
@@ -2788,6 +3129,393 @@ pub(crate) mod tests {
         .await
     }
 
+    /// A `PATH` whose `codex` reports a version that takes the thread
+    /// writer lock, so a capture never waits on a real `codex` running here.
+    fn locking_codex(dir: &Path) -> OsString {
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let status = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                r#"printf '#!/bin/sh\necho codex-cli 0.155.1\n' > "$1/codex" && chmod 755 "$1/codex""#,
+                "sh",
+            ])
+            .arg(&bin)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap()
+    }
+
+    /// Writes the rollout a Codex started in the job's workspace makes, and
+    /// returns its thread.
+    fn codex_thread_in(node: &Node, id: JobId) -> SessionId {
+        codex_rollout_in(node, id, "019f233e-bb33-7342-85fa-f2d33b14368a", "10:00")
+    }
+
+    /// Writes the rollout of `thread`, started in the job's workspace at
+    /// `time` (`HH:MM`) on 2026-10-22, and returns the thread.
+    fn codex_rollout_in(node: &Node, id: JobId, thread: &str, time: &str) -> SessionId {
+        let root = std::fs::canonicalize(paths::job_root(&node.cfg.home, id)).unwrap();
+        let day = node.cfg.home.join(".codex/sessions/2026/10/22");
+        std::fs::create_dir_all(&day).unwrap();
+        let name_time = time.replace(':', "-");
+        std::fs::write(
+            day.join(format!("rollout-2026-10-22T{name_time}-00-{thread}.jsonl")),
+            format!(
+                "{{\"timestamp\":\"2026-10-22T{time}:00.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread}\",\"timestamp\":\"2026-10-22T{time}:00.000Z\",\"cwd\":\"{}\",\"originator\":\"codex_cli_rs\",\"cli_version\":\"0.155.1\"}}}}\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        SessionId::parse(thread).unwrap()
+    }
+
+    /// Plans a Codex launch with no thread to resume, records it and lets
+    /// its harness exit; `made` runs while it runs, as the threads that
+    /// launch makes are written then.
+    async fn fresh_codex_run(node: &Arc<Node>, id: JobId, made: impl FnOnce()) {
+        let out = &mut Out::default();
+        let plan = node.job_run(id, out).await.unwrap();
+        assert_eq!(plan.session, None, "{:?}", out.lines);
+        let mut harness = sleeper();
+        register(node, id, pid(&harness)).await.unwrap();
+        made();
+        harness.kill().unwrap();
+        harness.wait().unwrap();
+        node.harness_exited(id, pid(&harness)).await.unwrap();
+    }
+
+    /// The session a capture of the job would take now.
+    async fn session_to_capture(node: &Node, id: JobId) -> Option<SessionRecord> {
+        let job = node.job(id).await.unwrap();
+        let job = job.lock().await;
+        assert_eq!(*job.harness(), HarnessKind::Codex);
+        let root = paths::job_root(&node.cfg.home, id);
+        job_session(&job, &root, &node.cfg.home, job.harness()).unwrap()
+    }
+
+    /// The session the job records and the one its last capture holds.
+    async fn recorded_and_captured(node: &Node, id: JobId) -> (Option<SessionRecord>, SessionId) {
+        let job = node.job(id).await.unwrap();
+        let job = job.lock().await;
+        let state = StateManifest::read(&job.dir().harness_state()).unwrap();
+        (job.session().unwrap(), state.session().clone())
+    }
+
+    /// Records a harness launched to continue `session`, which exits at once.
+    async fn ran_briefly(node: &Arc<Node>, id: JobId, session: &SessionId) {
+        let out = &mut Out::default();
+        let plan = node.job_run(id, out).await.unwrap();
+        let mut harness = sleeper();
+        node.harness_started(
+            StartedHarness {
+                job: id,
+                epoch: Epoch::FIRST,
+                pid: pid(&harness),
+                harness: HarnessKind::Codex,
+                session: Some(session.clone()),
+                planned: plan.session,
+            },
+            out,
+        )
+        .await
+        .unwrap();
+        harness.kill().unwrap();
+        harness.wait().unwrap();
+        node.harness_exited(id, pid(&harness)).await.unwrap();
+    }
+
+    /// A launch whose harness was stopped before it wrote anything, as by a
+    /// signal while the node recorded it, leaves a recorded session with no
+    /// state here. The suspend says so and goes on without harness state,
+    /// instead of failing every suspend and move of the job from then on.
+    #[tokio::test]
+    async fn a_suspend_goes_on_when_the_recorded_session_never_started() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = locking_codex(dir.path());
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let session = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
+        ran_briefly(&node, id, &session).await;
+
+        let out = &mut Out::default();
+        node.suspend(id, &path, out).await.unwrap();
+        let job = node.job(id).await.unwrap();
+        let job = job.lock().await;
+        assert_eq!(job.session().unwrap(), None);
+        assert!(!job.dir().harness_state().join(MANIFEST_FILE).exists());
+        assert!(
+            out.lines.iter().any(|line| line.contains(session.as_str())),
+            "{:?}",
+            out.lines
+        );
+    }
+
+    /// A launch of a new session that never started, after the job's
+    /// last session was captured, must not drop that session: the snapshot
+    /// keeps the state the job held before, and the job continues it.
+    #[tokio::test]
+    async fn a_session_that_never_started_leaves_the_one_before_in_the_snapshot() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = locking_codex(dir.path());
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let mut thread = None;
+        fresh_codex_run(&node, id, || thread = Some(codex_thread_in(&node, id))).await;
+        let thread = thread.unwrap();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let never = SessionId::parse("019f2340-0000-7000-8000-0000000000ff").unwrap();
+        assert_ne!(never, thread);
+        ran_briefly(&node, id, &never).await;
+
+        let out = &mut Out::default();
+        node.suspend(id, &path, out).await.unwrap();
+        let before = SessionRecord {
+            harness: HarnessKind::Codex,
+            session: thread.clone(),
+        };
+        let (recorded, captured) = recorded_and_captured(&node, id).await;
+        assert_eq!(recorded, Some(before), "{:?}", out.lines);
+        assert_eq!(captured, thread);
+    }
+
+    /// A session this node captured, whose files are gone when it is to be
+    /// captured again, still fails the suspend: the job's snapshots carry
+    /// that conversation, and a capture without it would drop it.
+    #[tokio::test]
+    async fn a_suspend_fails_when_a_captured_session_is_gone() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = locking_codex(dir.path());
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let mut thread = None;
+        fresh_codex_run(&node, id, || thread = Some(codex_thread_in(&node, id))).await;
+        let thread = thread.unwrap();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        ran_briefly(&node, id, &thread).await;
+        std::fs::remove_dir_all(node.cfg.home.join(".codex/sessions")).unwrap();
+
+        let err = node
+            .suspend(id, &path, &mut Out::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                NodeError::Harness(HarnessError::SessionNotFound { .. })
+            ),
+            "{err}"
+        );
+        let job = node.job(id).await.unwrap();
+        let record = job.lock().await.session().unwrap();
+        assert_eq!(record.map(|record| record.session), Some(thread));
+    }
+
+    /// A Codex started with no thread to resume makes its thread only once
+    /// it runs, so its launch records no session. The suspend takes the
+    /// thread the job's workspace holds, records it and captures it, so the
+    /// conversation travels with the workspace.
+    #[tokio::test]
+    async fn a_suspend_captures_the_thread_a_fresh_codex_started() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = locking_codex(dir.path());
+        let out = &mut Out::default();
+        node.suspend(id, &path, out).await.unwrap();
+        node.job_run(id, out).await.unwrap();
+        let mut harness = sleeper();
+        register(&node, id, pid(&harness)).await.unwrap();
+        let thread = codex_thread_in(&node, id);
+        harness.kill().unwrap();
+        harness.wait().unwrap();
+        node.harness_exited(id, pid(&harness)).await.unwrap();
+
+        node.suspend(id, &path, out).await.unwrap();
+        let record = SessionRecord {
+            harness: HarnessKind::Codex,
+            session: thread.clone(),
+        };
+        assert_eq!(
+            recorded_and_captured(&node, id).await,
+            (Some(record), thread)
+        );
+    }
+
+    /// A job that ran Codex, then Claude, then a fresh Codex that made no
+    /// thread, as one not logged in on this node, still holds its Claude
+    /// session: the thread of the first Codex run is older than the launch
+    /// and is not taken in its place, so a capture carries the Claude
+    /// session and a resume does not continue the stale thread.
+    #[tokio::test]
+    async fn a_fresh_codex_that_made_no_thread_takes_no_older_one() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        node.suspend(id, &locking_codex(dir.path()), &mut Out::default())
+            .await
+            .unwrap();
+        codex_thread_in(&node, id);
+        let claude = SessionRecord {
+            harness: HarnessKind::ClaudeCode,
+            session: SessionId::parse("9c9796f0-2682-4546-a963-d314b3ad543f").unwrap(),
+        };
+        local::write(&node.cfg.state.job(id).session(), &claude).unwrap();
+
+        fresh_codex_run(&node, id, || {}).await;
+        assert_eq!(session_to_capture(&node, id).await, Some(claude));
+    }
+
+    /// A fresh Codex plan the CLI never launched, as when the user said no
+    /// to its setup steps, starts no thread of the job's: a `codex` typed
+    /// by hand in the workspace afterwards must not be taken for it.
+    #[tokio::test]
+    async fn a_fresh_codex_plan_never_launched_takes_no_thread() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        node.suspend(id, &locking_codex(dir.path()), &mut Out::default())
+            .await
+            .unwrap();
+        let plan = node.job_run(id, &mut Out::default()).await.unwrap();
+        assert_eq!(plan.session, None);
+        codex_thread_in(&node, id);
+        assert_eq!(session_to_capture(&node, id).await, None);
+    }
+
+    /// A fresh Codex's thread is the first the workspace gains after its
+    /// plan; a thread something it ran made later, as a `codex exec` the
+    /// agent ran in the workspace or a sub-agent, is not the job's.
+    #[tokio::test]
+    async fn a_fresh_codex_takes_its_own_thread_not_a_later_one() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        node.suspend(id, &locking_codex(dir.path()), &mut Out::default())
+            .await
+            .unwrap();
+        let mut own = None;
+        fresh_codex_run(&node, id, || {
+            own = Some(codex_thread_in(&node, id));
+            codex_rollout_in(&node, id, "019f2340-0000-7000-8000-000000000001", "10:05");
+        })
+        .await;
+        let own = SessionRecord {
+            harness: HarnessKind::Codex,
+            session: own.unwrap(),
+        };
+        assert_eq!(session_to_capture(&node, id).await, Some(own));
+    }
+
+    /// A run planned after a fresh Codex exited, with no suspend in
+    /// between, continues the thread that Codex made rather than start
+    /// another one beside it.
+    #[tokio::test]
+    async fn a_run_after_a_fresh_codex_continues_its_thread() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        node.suspend(id, &locking_codex(dir.path()), &mut Out::default())
+            .await
+            .unwrap();
+        let mut thread = None;
+        fresh_codex_run(&node, id, || thread = Some(codex_thread_in(&node, id))).await;
+
+        let plan = node.job_run(id, &mut Out::default()).await.unwrap();
+        assert_eq!(plan.session, thread);
+    }
+
+    /// A job that switched from Claude to Codex still records the Claude
+    /// session; the suspend carries the Codex thread, the conversation the
+    /// job's harness now holds, not the other harness's state.
+    #[tokio::test]
+    async fn a_suspend_after_a_switch_to_codex_captures_the_codex_thread() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = locking_codex(dir.path());
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        local::write(
+            &node.cfg.state.job(id).session(),
+            &SessionRecord {
+                harness: HarnessKind::ClaudeCode,
+                session: SessionId::parse("9c9796f0-2682-4546-a963-d314b3ad543f").unwrap(),
+            },
+        )
+        .unwrap();
+        let mut thread = None;
+        fresh_codex_run(&node, id, || thread = Some(codex_thread_in(&node, id))).await;
+        let thread = thread.unwrap();
+
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let record = SessionRecord {
+            harness: HarnessKind::Codex,
+            session: thread.clone(),
+        };
+        assert_eq!(
+            recorded_and_captured(&node, id).await,
+            (Some(record), thread)
+        );
+    }
+
+    /// A job ran Claude, then a fresh Codex, which recorded no session, so
+    /// the Claude one is still the job's. A resume under Claude continues
+    /// that session; the Codex thread the workspace holds neither replaces
+    /// the record nor is continued, since the plan launches Claude.
+    #[tokio::test]
+    async fn a_resume_under_claude_after_a_fresh_codex_continues_the_claude_session() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let claude = SessionRecord {
+            harness: HarnessKind::ClaudeCode,
+            session: SessionId::parse("9c9796f0-2682-4546-a963-d314b3ad543f").unwrap(),
+        };
+        local::write(&node.cfg.state.job(id).session(), &claude).unwrap();
+        codex_thread_in(&node, id);
+
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let plan = node
+            .job_resume(
+                id,
+                None,
+                Some(HarnessKind::ClaudeCode),
+                false,
+                &path,
+                &mut Out::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan.session.as_ref(), Some(&claude.session));
+        let job = node.job(id).await.unwrap();
+        assert_eq!(job.lock().await.session().unwrap(), Some(claude));
+    }
+
+    /// A job that ran Codex, then Claude, keeps its Claude session when a
+    /// resume switches it back to Codex: the older Codex thread in the
+    /// workspace does not take the record's place. The Codex launch may
+    /// never be recorded, and the next capture would then carry that old
+    /// thread for the job's Claude run.
+    #[tokio::test]
+    async fn a_resume_under_codex_after_claude_leaves_the_claude_record() {
+        let (dir, node) = node();
+        let repo = repo(dir.path());
+        let mut out = Out::default();
+        node.job_new(&repo, "goal".to_owned(), HarnessKind::ClaudeCode, &mut out)
+            .await
+            .unwrap();
+        let id: JobId = out.lines[0].parse().unwrap();
+        let claude = SessionRecord {
+            harness: HarnessKind::ClaudeCode,
+            session: SessionId::parse("9c9796f0-2682-4546-a963-d314b3ad543f").unwrap(),
+        };
+        local::write(&node.cfg.state.job(id).session(), &claude).unwrap();
+        codex_thread_in(&node, id);
+
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let plan = node
+            .job_resume(id, None, Some(HarnessKind::Codex), false, &path, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(plan.session, None);
+        let job = node.job(id).await.unwrap();
+        assert_eq!(job.lock().await.session().unwrap(), Some(claude));
+    }
+
     /// Serves `a` and `b` and pairs them, each with the other's address.
     pub(crate) async fn paired(a: &Arc<Node>, b: &Arc<Node>) {
         for (node, peer) in [(a, b), (b, a)] {
@@ -2933,6 +3661,34 @@ pub(crate) mod tests {
             name(pid(&harness)).await,
             Err(NodeError::HarnessNotRecorded { .. })
         ));
+    }
+
+    /// The setup steps a node approved for a job run code from the
+    /// workspace: a script a declared step names, a file a lifecycle
+    /// script runs, a Yarn release. A workspace another node captured may
+    /// hold the agent's edits of any of them, which no spec id or install
+    /// digest covers, so restoring it here drops the approval and the next
+    /// launch that runs a step asks again.
+    #[tokio::test]
+    async fn a_restore_of_a_peers_snapshot_drops_the_setup_approval() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let out = &mut Out::default();
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &path, out).await.unwrap();
+        b.pull(id, a.id, None, out).await.unwrap();
+        let approved = b.cfg.state.job(id).env_spec_ran();
+        std::fs::write(&approved, "spec inputs\n").unwrap();
+
+        let job = b.job(id).await.unwrap();
+        let mut job = job.lock().await;
+        let epoch = owner_token(&job, b.id).unwrap().epoch;
+        b.restore_if_needed(&mut job, epoch, &path, out)
+            .await
+            .unwrap();
+        assert!(!approved.exists(), "{:?}", out.lines);
     }
 
     /// An addressless peer can dial in after start-up recovery listed the
@@ -3260,6 +4016,214 @@ pub(crate) mod tests {
             job.lock().await.view(a.id),
             LeaseView::Owner(token) if token.epoch == Epoch::FIRST
         ));
+    }
+
+    /// A pull of an ACP job must find the agent on the pulling command's
+    /// `PATH` and a `state_dir` for it in this node's `harness.toml` before
+    /// it takes the job. Otherwise the job would be owned by a node that
+    /// cannot launch it, or cannot restore and capture its session, and
+    /// `--force` does not waive either.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pull_refuses_an_acp_agent_this_node_cannot_run() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        a.suspend(id, &path, &mut Out::default()).await.unwrap();
+        // The two test nodes have different homes, which refuses too.
+        for (agent, agent_found) in [
+            ("acp:fabric-no-such-agent", false),
+            // `sh` is on every PATH, and no harness.toml here names it.
+            ("acp:sh", true),
+        ] {
+            let harness = crate::harnesses::parse_harness(agent).unwrap();
+            let refused = b
+                .job_resume(
+                    id,
+                    Some(a.id),
+                    Some(harness),
+                    true,
+                    &path,
+                    &mut Out::default(),
+                )
+                .await;
+            let Err(NodeError::Preflight(facts)) = &refused else {
+                panic!("{agent}: {refused:?}");
+            };
+            let facts: Vec<&str> = facts.split(", ").collect();
+            assert!(facts.contains(&"acp.state_dir"), "{agent}: {facts:?}");
+            assert_eq!(
+                facts.contains(&"acp.agent"),
+                !agent_found,
+                "{agent}: {facts:?}"
+            );
+        }
+        let job = a.job(id).await.unwrap();
+        assert!(matches!(
+            job.lock().await.view(a.id),
+            LeaseView::Owner(token) if token.epoch == Epoch::FIRST
+        ));
+    }
+
+    /// A workspace deleted while its marker says live holds nothing to
+    /// continue. The next resume must restore the latest snapshot, not
+    /// hand out a root that does not exist, where a directory made later
+    /// would be launched in as the workspace.
+    #[tokio::test]
+    async fn a_live_workspace_whose_root_is_gone_is_restored() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let plan = node.job_run(id, &mut Out::default()).await.unwrap();
+        std::fs::remove_dir_all(&plan.root).unwrap();
+        let out = &mut Out::default();
+        let resumed = node
+            .job_resume(id, None, None, false, &path, out)
+            .await
+            .unwrap();
+        assert_eq!(resumed.root, plan.root);
+        assert!(
+            resumed.root.join(".git").is_dir(),
+            "the root was not restored: {:?}",
+            out.lines
+        );
+    }
+
+    /// A `state_dir` that harness.toml names but capture and restore refuse,
+    /// under `~/.fabric` or reached through a link, is no `state_dir`: a
+    /// pull must refuse it before ownership moves, or the job would be
+    /// owned by a node that cannot restore or capture its session.
+    #[tokio::test]
+    async fn a_pull_refuses_an_acp_state_dir_capture_would_refuse() {
+        let (dir_a, a) = node();
+        let dir_b = tempfile::Builder::new()
+            .prefix("fops")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = std::fs::canonicalize(dir_b.path()).unwrap();
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(&root, home.join("linked")).unwrap();
+        let state = StateDir::resolve(Some(root.join("state").as_os_str()), &home).unwrap();
+        std::fs::create_dir_all(state.harness_config().parent().unwrap()).unwrap();
+        std::fs::write(
+            state.harness_config(),
+            "[acp.sh]\nstate_dir = \".fabric/sh\"\n\n[acp.cat]\nstate_dir = \"linked/sessions\"\n\n[acp.true]\nstate_dir = \"sessions\"\n",
+        )
+        .unwrap();
+        let b = Node::start(NodeConfig {
+            state,
+            home,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            dial: DialOrder::TcpOnly,
+            path_var: std::env::var_os("PATH").unwrap_or_default(),
+            cargo_home: None,
+        })
+        .unwrap();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        a.suspend(id, &path, &mut Out::default()).await.unwrap();
+        // The two test nodes have different homes, which refuses every pull.
+        for (agent, usable) in [("acp:sh", false), ("acp:cat", false), ("acp:true", true)] {
+            let harness = crate::harnesses::parse_harness(agent).unwrap();
+            let refused = b
+                .job_resume(
+                    id,
+                    Some(a.id),
+                    Some(harness),
+                    true,
+                    &path,
+                    &mut Out::default(),
+                )
+                .await;
+            let Err(NodeError::Preflight(facts)) = &refused else {
+                panic!("{agent}: {refused:?}");
+            };
+            let facts: Vec<&str> = facts.split(", ").collect();
+            assert_eq!(
+                facts.contains(&"acp.state_dir"),
+                !usable,
+                "{agent}: {facts:?}"
+            );
+        }
+    }
+
+    /// A registration appends `Resumed` and then writes the session the
+    /// harness started. A daemon that dies between the two, here a session
+    /// file that cannot be written, must not lose that session: the next
+    /// capture would leave the new conversation out of the snapshot.
+    #[tokio::test]
+    async fn a_session_whose_write_failed_after_resumed_is_kept() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let session_file = node.cfg.state.job(id).session();
+        // A directory at the name the session is written under before its
+        // rename makes the write fail, while the registration's check of
+        // the session it continues still reads none.
+        let mut temp_name = session_file.file_name().unwrap().to_os_string();
+        temp_name.push(format!(".{}.tmp", std::process::id()));
+        let in_the_way = session_file.with_file_name(temp_name);
+        std::fs::create_dir_all(in_the_way.join("in-the-way")).unwrap();
+        let mut harness = sleeper();
+        let session = SessionId::parse("new-session").unwrap();
+        let failed = node
+            .harness_started(
+                StartedHarness {
+                    job: id,
+                    epoch: Epoch::FIRST,
+                    pid: pid(&harness),
+                    harness: HarnessKind::Codex,
+                    session: Some(session.clone()),
+                    planned: None,
+                },
+                &mut Out::default(),
+            )
+            .await;
+        harness.kill().unwrap();
+        harness.wait().unwrap();
+        assert!(failed.is_err(), "{failed:?}");
+        let job = node.job(id).await.unwrap();
+        let job = job.lock().await;
+        assert!(matches!(
+            job.ledger().records().last().unwrap().event().kind,
+            EventKind::Resumed { .. }
+        ));
+        // As after a restart: the session file was never written.
+        assert!(!session_file.exists());
+        std::fs::remove_dir_all(&in_the_way).unwrap();
+        let kept = job.session().unwrap().map(|record| record.session);
+        assert_eq!(kept, Some(session));
+    }
+
+    /// A cache `.fabric/env.toml` declares, with a name no built-in rule
+    /// knows, must reach the snapshot as a cache with its carry key. As
+    /// the user's own files it would be written on every target, platform
+    /// or not, sentinel included, and the setup step that rebuilds it
+    /// would never run there.
+    #[tokio::test]
+    async fn a_suspend_records_a_declared_cache_as_a_cache() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(
+            root.join(".fabric/env.toml"),
+            "[[cache]]\npath = \".output\"\nclass = \"build\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join(".gitignore"), ".output/\n").unwrap();
+        std::fs::create_dir_all(root.join(".output/server")).unwrap();
+        std::fs::write(root.join(".output/server/index.mjs"), "export {}\n").unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let snapshot = node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let manifest = with_store(&node.store, move |store| Ok(store.manifest(snapshot)?))
+            .await
+            .unwrap();
+        let caches: Vec<&str> = manifest.caches.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(caches, [".output"], "{manifest:?}");
     }
 
     /// A suspend must not publish a snapshot whose `.fabric/env.toml`
@@ -3657,6 +4621,50 @@ pub(crate) mod tests {
         std::fs::write(root.join("users.sqlite"), "rows\n").unwrap();
         let mut out = Out::default();
         node.suspend(id, &path, &mut out).await.unwrap();
+        assert!(
+            out.lines
+                .iter()
+                .any(|line| line == "left behind (secret pattern): users.sqlite"),
+            "{:?}",
+            out.lines
+        );
+    }
+
+    /// A secret pattern the job's spec recorded travels with the job: the
+    /// node that pulls it keeps leaving behind what the pattern matches
+    /// after the line left `.fabric/env.toml`, as the node that recorded
+    /// it does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recorded_secret_pattern_travels_with_the_job() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let out = &mut Out::default();
+        let id = job(dir_a.path(), &a).await;
+        let root = paths::job_root(&a.cfg.home, id);
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(
+            root.join(".fabric/env.toml"),
+            "secret_patterns = [\"*.sqlite\"]\n",
+        )
+        .unwrap();
+        a.suspend(id, &path, out).await.unwrap();
+        std::fs::write(root.join(".fabric/env.toml"), "").unwrap();
+        a.suspend(id, &path, out).await.unwrap();
+
+        b.pull(id, a.id, None, out).await.unwrap();
+        let root = {
+            let job = b.job(id).await.unwrap();
+            let mut job = job.lock().await;
+            let epoch = owner_token(&job, b.id).unwrap().epoch;
+            b.restore_if_needed(&mut job, epoch, &path, out)
+                .await
+                .unwrap()
+        };
+        std::fs::write(root.join("users.sqlite"), "rows\n").unwrap();
+        let mut out = Out::default();
+        b.suspend(id, &path, &mut out).await.unwrap();
         assert!(
             out.lines
                 .iter()
@@ -4084,6 +5092,69 @@ pub(crate) mod tests {
         );
     }
 
+    /// Each row of `node ls` is bounded, and the peer book does not bound
+    /// how many peers it holds. The answer keeps the last rows that fit its
+    /// budget and says how many it left out.
+    #[tokio::test]
+    async fn a_node_list_past_its_budget_keeps_the_last_rows() {
+        let (_dir, node) = node();
+        for byte in 1..=3_u8 {
+            node.node_add(
+                NodeId::from_bytes([byte; 32]),
+                Some(&format!("10.0.0.{byte}:1")),
+                &mut Out::default(),
+            )
+            .await
+            .unwrap();
+        }
+        let mut all = Out::default();
+        node.node_list(&mut all);
+        assert_eq!(all.lines.len(), 3, "{:?}", all.lines);
+        let row = all.lines[2].len();
+        let mut out = Out::default();
+        node.node_list_within(2 * row, &mut out);
+        assert_eq!(out.lines.len(), 3, "{:?}", out.lines);
+        assert!(
+            out.lines[0].starts_with("the first 1 paired nodes are left out"),
+            "{:?}",
+            out.lines
+        );
+        assert_eq!(out.lines[1..], all.lines[1..], "{:?}", out.lines);
+    }
+
+    /// Each row of `job ls` is bounded, and enough jobs still add up past
+    /// the control message cap. The answer keeps the latest rows that fit
+    /// its budget and says how many older ones it left out.
+    #[tokio::test]
+    async fn a_job_list_past_its_budget_keeps_the_latest_rows() {
+        let (dir, node) = node();
+        let repo = repo(dir.path());
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let mut out = Out::default();
+            node.job_new(&repo, "goal".to_owned(), HarnessKind::Codex, &mut out)
+                .await
+                .unwrap();
+            ids.push(out.lines[0].clone());
+        }
+        // Rows are in id order, and an id begins with its time.
+        ids.sort();
+        let mut all = Out::default();
+        node.job_list(&mut all).await;
+        assert_eq!(all.lines.len(), 3, "{:?}", all.lines);
+        let row = all.lines[2].len();
+        let mut out = Out::default();
+        node.job_list_within(2 * row, &mut out).await;
+        assert_eq!(out.lines.len(), 3, "{:?}", out.lines);
+        assert!(
+            out.lines[0].starts_with("the 1 oldest jobs are left out"),
+            "{:?}",
+            out.lines
+        );
+        assert!(out.lines[1].starts_with(&ids[1]), "{:?}", out.lines);
+        assert!(out.lines[2].starts_with(&ids[2]), "{:?}", out.lines);
+    }
+
     /// Two runs can both get a plan before either launches. Once the first
     /// registered its harness and let the tree lock go, the second must be
     /// refused before its setup steps run in the workspace the first
@@ -4217,8 +5288,8 @@ pub(crate) mod tests {
     }
 
     /// A suspend must say what of the repository's config it changed or
-    /// left out: a remote URL loses its user info, a URL with a query is
-    /// left behind, and of a repeated key only the last value travels.
+    /// left out: a remote URL loses its user info, and a URL with a query
+    /// is left behind.
     #[tokio::test]
     async fn a_suspend_names_the_git_config_it_changed_or_left_out() {
         let (dir, node) = node();
@@ -4237,12 +5308,6 @@ pub(crate) mod tests {
                 "tokened",
                 "https://example.com/r.git?token=x",
             ],
-            &[
-                "config",
-                "--add",
-                "remote.origin.fetch",
-                "+refs/tags/*:refs/tags/*",
-            ],
         ] {
             let status = std::process::Command::new("git")
                 .current_dir(&root)
@@ -4258,7 +5323,6 @@ pub(crate) mod tests {
         for wanted in [
             "travels without its user info (git config): remote.origin.url",
             "left behind (git config): remote.tokened.url",
-            "travels with its last value only (git config): remote.origin.fetch",
         ] {
             assert!(
                 out.lines.iter().any(|line| line == wanted),
@@ -4478,6 +5542,39 @@ pub(crate) mod tests {
         );
     }
 
+    /// A Node key names the Node and package manager majors and not the
+    /// platform, so a `node_modules` built on another operating system or
+    /// architecture can match it. Its native addons would run here under a
+    /// valid install sentinel, so a cache crosses no platform.
+    #[test]
+    fn a_cache_built_on_another_platform_is_not_carried() {
+        let facts = NodeFacts::from_pairs([
+            (crate::facts::name::NODE, "v22.23.2"),
+            (crate::facts::name::NPM, "10.9.2"),
+        ]);
+        let entry = fabric_core::snapshot::CacheEntry {
+            path: fabric_core::path::RelPath::parse("node_modules").unwrap(),
+            class: fabric_core::snapshot::CacheClass::Deps,
+            carry: fabric_core::snapshot::CarryState::Carried,
+            key: fabric_core::snapshot::CarryKey::Node {
+                node_major: "22".to_owned(),
+                package_manager: "npm".to_owned(),
+                pm_major: "10".to_owned(),
+                pnpm_store_path: None,
+            },
+        };
+        let here = Platform {
+            os: "macos".to_owned(),
+            arch: "aarch64".to_owned(),
+        };
+        let elsewhere = Platform {
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+        };
+        assert!(carries(&entry, (&here, &here), &facts));
+        assert!(!carries(&entry, (&elsewhere, &here), &facts));
+    }
+
     /// A snapshot may name any number of cache paths, and a resume's answer
     /// must stay within one control message, so the cache report names
     /// the first of them and counts the rest.
@@ -4492,7 +5589,8 @@ pub(crate) mod tests {
             })
             .collect();
         let mut out = Out::default();
-        report_caches(&caches, &NodeFacts::default(), &mut out);
+        let here = this_platform();
+        report_caches(&caches, (&here, &here), &NodeFacts::default(), &mut out);
         assert_eq!(out.lines.len(), REPORT_PATHS + 1, "{:?}", out.lines.last());
         assert_eq!(
             out.lines.last().map(String::as_str),

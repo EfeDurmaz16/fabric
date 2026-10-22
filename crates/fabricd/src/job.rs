@@ -16,7 +16,9 @@ use fabric_core::moves::LeaseView;
 use crate::clock;
 use crate::error::NodeError;
 use crate::ledger_file::{self, LedgerFile};
-use crate::local::{self, ForkRecord, HarnessRecord, Marker, MarkerState, SessionRecord};
+use crate::local::{
+    self, ForkRecord, HarnessRecord, Marker, MarkerState, PendingSession, SessionRecord,
+};
 use crate::paths::JobDir;
 
 /// A job's ledger and files on this node.
@@ -33,7 +35,11 @@ impl Job {
     ///
     /// The record is checked before anything is written, and the ledger
     /// appears whole or not at all, so a refused or failed create leaves
-    /// nothing that would stop the job being learned later.
+    /// nothing that would stop the job being learned later. That holds when
+    /// the derived manifest fails to write after the ledger is durable, as
+    /// on a full disk: the job is not held in memory then, and a ledger
+    /// left on disk would make every later offer of the record fail on it
+    /// until the node restarts.
     pub fn create(id: JobId, dir: JobDir, created: &Record) -> Result<Self, NodeError> {
         let EventKind::Created { job_id, .. } = created.event().kind else {
             return Err(LedgerError::FirstNotCreated(created.event().kind.name()).into());
@@ -48,7 +54,13 @@ impl Job {
         let ledger = Ledger::replay(job_id, [created.clone()])?;
         crate::durable::create_dir(dir.dir()).map_err(|e| NodeError::io(dir.dir(), e))?;
         let file = LedgerFile::create(&dir.ledger(), created)?;
-        ledger_file::write_manifest(&dir.manifest(), &ledger)?;
+        if let Err(e) = ledger_file::write_manifest(&dir.manifest(), &ledger) {
+            drop(file);
+            if let Err(removed) = local::remove(&dir.ledger()) {
+                tracing::warn!(error = %removed, "a failed job create left its ledger");
+            }
+            return Err(e.into());
+        }
         Ok(Self {
             id: job_id,
             dir,
@@ -62,16 +74,31 @@ impl Job {
     /// The marker is written before the ledger: a crash between the two
     /// leaves a marker with no ledger, which start-up skips as no job, and
     /// never an owned ledger with no marker, which no command could run,
-    /// suspend or restore.
+    /// suspend or restore. `id` is fresh, so a failure removes the job's
+    /// directory with whatever it wrote: a ledger left there after the
+    /// derived manifest failed would load at the next start as a job whose
+    /// workspace the caller has deleted and whose id it never printed.
     pub fn create_owned(
         id: JobId,
         dir: JobDir,
         created: &Record,
         marker: &Marker,
     ) -> Result<Self, NodeError> {
-        crate::durable::create_dir(dir.dir()).map_err(|e| NodeError::io(dir.dir(), e))?;
-        local::write(&dir.marker(), marker)?;
-        Self::create(id, dir, created)
+        let path = dir.dir().to_owned();
+        let made = crate::durable::create_dir(&path)
+            .map_err(|e| NodeError::io(&path, e))
+            .and_then(|()| Ok(local::write(&dir.marker(), marker)?))
+            .and_then(|()| Self::create(id, dir, created));
+        if made.is_err() {
+            match fs::remove_dir_all(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "a failed job create left its directory");
+                }
+            }
+        }
+        made
     }
 
     /// Opens a job this node held before.
@@ -218,8 +245,71 @@ impl Job {
     }
 
     /// The session the job continues on this node, if known.
+    ///
+    /// A registration records its session as pending before its `Resumed`
+    /// and moves it into place after, so a crash between the two is settled
+    /// here: the pending session becomes the job's when the record right
+    /// after the head it names is that `Resumed`, and is dropped otherwise.
     pub fn session(&self) -> Result<Option<SessionRecord>, NodeError> {
+        let pending_path = self.dir.session_pending();
+        if let Some(pending) = local::read::<PendingSession>(&pending_path)? {
+            let resumed = self
+                .ledger
+                .suffix_after(pending.after)
+                .and_then(<[Record]>::first)
+                .is_some_and(|next| {
+                    next.event().epoch == pending.epoch
+                        && matches!(
+                            &next.event().kind,
+                            EventKind::Resumed { harness, .. } if *harness == pending.record.harness
+                        )
+                });
+            if resumed {
+                local::write(&self.dir.session(), &pending.record)?;
+            }
+            local::remove(&pending_path)?;
+        }
         Ok(local::read(&self.dir.session())?)
+    }
+
+    /// Records the session a registration at `epoch` starts, before its
+    /// `Resumed` is appended after the current head; with none, drops one
+    /// an earlier registration left, which that `Resumed` would otherwise
+    /// seem to confirm.
+    pub fn begin_session(
+        &self,
+        epoch: Epoch,
+        record: Option<&SessionRecord>,
+    ) -> Result<(), NodeError> {
+        match record {
+            Some(record) => local::write(
+                &self.dir.session_pending(),
+                &PendingSession {
+                    after: self.ledger.head(),
+                    epoch,
+                    record: record.clone(),
+                },
+            )?,
+            None => local::remove(&self.dir.session_pending())?,
+        }
+        Ok(())
+    }
+
+    /// Records the session a restore placed, over any a registration left
+    /// pending and any fresh Codex launch planned here before.
+    pub fn set_session(&self, record: &SessionRecord) -> Result<(), NodeError> {
+        local::remove(&self.dir.session_pending())?;
+        local::remove(&self.dir.fresh_codex())?;
+        local::remove(&self.dir.fresh_codex_planned())?;
+        Ok(local::write(&self.dir.session(), record)?)
+    }
+
+    /// Forgets the session, a pending one and any fresh Codex launch planned here included.
+    pub fn forget_session(&self) -> Result<(), NodeError> {
+        local::remove(&self.dir.session_pending())?;
+        local::remove(&self.dir.fresh_codex())?;
+        local::remove(&self.dir.fresh_codex_planned())?;
+        Ok(local::remove(&self.dir.session())?)
     }
 
     /// The fork record that freezes the job here, if a peer's ledger forked from this one.
@@ -335,8 +425,103 @@ mod tests {
         let failed = Job::create_owned(id, state.job(id), &created, &marker);
         assert!(failed.is_err(), "{failed:?}");
         assert!(!state.job(id).ledger().exists());
-        fs::remove_dir(state.job(id).marker()).unwrap();
         let job = Job::create_owned(id, state.job(id), &created, &marker).unwrap();
         assert_eq!(job.marker().unwrap(), Some(marker));
+    }
+
+    /// A registration that died before its `Resumed` leaves a pending
+    /// session whose harness the CLI killed, and which may never have been
+    /// written. It must not become the job's session: every later capture
+    /// would look for it and fail.
+    #[test]
+    fn a_pending_session_without_its_resumed_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::resolve(Some(dir.path().as_os_str()), dir.path()).unwrap();
+        let id = JobId::from_bytes([1; 16]);
+        let created = Ledger::created(
+            id,
+            "goal".into(),
+            HarnessKind::Codex,
+            NodeId::from_bytes([3; 32]),
+            EventId::from_bytes([4; 16]),
+            1,
+        )
+        .unwrap();
+        let marker = Marker {
+            root: dir.path().join("work"),
+            state: MarkerState::Live,
+            epoch: fabric_core::id::Epoch::FIRST,
+        };
+        let job = Job::create_owned(id, state.job(id), &created, &marker).unwrap();
+        let record = SessionRecord {
+            harness: HarnessKind::Codex,
+            session: fabric_harness::SessionId::parse("never-ran").unwrap(),
+        };
+        job.begin_session(fabric_core::id::Epoch::FIRST, Some(&record))
+            .unwrap();
+        assert_eq!(job.session().unwrap(), None);
+        assert!(!state.job(id).session_pending().exists());
+    }
+
+    /// A peer's `Created` can be durable here when the derived manifest
+    /// beside it fails to write, as on a full disk. The job is not held
+    /// then, so its ledger must go too: left on disk, it would make every
+    /// later offer of the record fail until the node restarts.
+    #[test]
+    fn a_learned_job_whose_manifest_fails_can_be_learned_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::resolve(Some(dir.path().as_os_str()), dir.path()).unwrap();
+        let id = JobId::from_bytes([1; 16]);
+        let created = Ledger::created(
+            id,
+            "goal".into(),
+            HarnessKind::Codex,
+            NodeId::from_bytes([3; 32]),
+            EventId::from_bytes([4; 16]),
+            1,
+        )
+        .unwrap();
+        // A directory where the manifest goes makes its write fail after
+        // the ledger is written.
+        fs::create_dir_all(state.job(id).manifest().join("in-the-way")).unwrap();
+        let failed = Job::create(id, state.job(id), &created);
+        assert!(failed.is_err(), "{failed:?}");
+        fs::remove_dir_all(state.job(id).manifest()).unwrap();
+        Job::create(id, state.job(id), &created).unwrap();
+        Job::open(id, state.job(id)).unwrap();
+    }
+
+    /// The ledger can be durable when the derived manifest beside it fails
+    /// to write, as on a full disk. The job's id was never printed and its
+    /// workspace is gone, so the create must not leave that ledger for the
+    /// next start to load as an owned job nothing can run.
+    #[test]
+    fn an_owned_job_whose_manifest_fails_leaves_no_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::resolve(Some(dir.path().as_os_str()), dir.path()).unwrap();
+        let id = JobId::from_bytes([1; 16]);
+        let created = Ledger::created(
+            id,
+            "goal".into(),
+            HarnessKind::Codex,
+            NodeId::from_bytes([3; 32]),
+            EventId::from_bytes([4; 16]),
+            1,
+        )
+        .unwrap();
+        let marker = Marker {
+            root: dir.path().join("work"),
+            state: MarkerState::Live,
+            epoch: fabric_core::id::Epoch::FIRST,
+        };
+        // A directory where the manifest goes makes its write fail after
+        // the ledger is written.
+        fs::create_dir_all(state.job(id).manifest().join("in-the-way")).unwrap();
+        let failed = Job::create_owned(id, state.job(id), &created, &marker);
+        assert!(failed.is_err(), "{failed:?}");
+        assert!(
+            !state.job(id).ledger().exists(),
+            "the ledger stayed without its job"
+        );
     }
 }

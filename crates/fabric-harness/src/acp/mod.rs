@@ -141,6 +141,15 @@ impl AcpHarness {
         pipeline::fs_path(&self.home)
     }
 
+    /// Refuses, before any session is placed or taken, a state directory
+    /// that capture and restore would refuse: none declared, or one reached
+    /// through a link below the home. A target checks this before it takes
+    /// a job it would then be unable to resume.
+    pub fn check_state_dir(&self) -> Result<(), HarnessError> {
+        let (dir, _) = self.state_rel()?;
+        pipeline::refuse_symlinks(self.home_dir(), &dir)
+    }
+
     /// Sets how `session/request_permission` is answered.
     #[must_use]
     pub fn with_policy(mut self, policy: PermissionPolicy) -> Self {
@@ -207,22 +216,7 @@ impl AcpHarness {
         // directory itself, so a linked state root or a linked directory
         // above it would carry files from outside the home.
         pipeline::refuse_symlinks(self.home_dir(), &dir)?;
-        let mut sources = Vec::new();
-        for file in pipeline::walk(&dir)? {
-            let file_parts = pipeline::rel_components(&file)?;
-            if !file_parts.iter().any(|part| names_session(part, session)) {
-                continue;
-            }
-            let mut parts: Vec<&str> = vec![HOME_PREFIX];
-            parts.extend(rel_parts.iter().map(String::as_str));
-            parts.extend(file_parts.iter().map(String::as_str));
-            sources.push(Source {
-                abs: dir.join(&file),
-                rel: pipeline::rel_path(&parts)?,
-                carry: Carry::OpaqueRefuseSecrets,
-                mutability: Mutability::Replaceable,
-            });
-        }
+        let sources = Self::session_sources(&dir, &rel_parts, session)?;
         if sources.is_empty() {
             return Err(HarnessError::SessionNotFound {
                 kind: self.kind(),
@@ -242,6 +236,32 @@ impl AcpHarness {
         let manifest = pipeline::capture(capturer, &sources, RedactionCounts::new(), out)?;
         info!(%session, agent = %self.program, files = manifest.files().len(), "acp: captured");
         Ok(manifest)
+    }
+
+    /// Every file under the state directory `dir` that is named for
+    /// `session`, as capture takes it; `rel_parts` is `dir` under the home.
+    fn session_sources(
+        dir: &Path,
+        rel_parts: &[String],
+        session: &SessionId,
+    ) -> Result<Vec<Source>, HarnessError> {
+        let mut sources = Vec::new();
+        for file in pipeline::walk(dir)? {
+            let file_parts = pipeline::rel_components(&file)?;
+            if !file_parts.iter().any(|part| names_session(part, session)) {
+                continue;
+            }
+            let mut parts: Vec<&str> = vec![HOME_PREFIX];
+            parts.extend(rel_parts.iter().map(String::as_str));
+            parts.extend(file_parts.iter().map(String::as_str));
+            sources.push(Source {
+                abs: dir.join(&file),
+                rel: pipeline::rel_path(&parts)?,
+                carry: Carry::OpaqueRefuseSecrets,
+                mutability: Mutability::Replaceable,
+            });
+        }
+        Ok(sources)
     }
 
     async fn capture_impl(
@@ -281,10 +301,16 @@ impl AcpHarness {
         state: &Path,
         manifest: StateManifest,
     ) -> Result<Restored, HarnessError> {
-        let (_, state_parts) = self.state_rel()?;
+        let (dir, state_parts) = self.state_rel()?;
         let session = manifest.session().clone();
         let records = self.departure(&session);
-        let restored = pipeline::restore(manifest, state, Some(&records), |rel, _| {
+        pipeline::refuse_symlinks(self.home_dir(), &dir)?;
+        let held = if dir.exists() {
+            Self::session_sources(&dir, &state_parts, &session)?
+        } else {
+            Vec::new()
+        };
+        let restored = pipeline::restore(manifest, state, Some(&records), &held, |rel, _| {
             let rest = under_home(rel).filter(|_| Self::restorable(rel, &state_parts, &session));
             Ok(rest.map(|rest| Destination {
                 path: self.home_dir().join(rest),

@@ -5,8 +5,9 @@
 //! on arrival, so a fetch cut anywhere leaves at most objects without a row,
 //! never a row without its objects. The manifest's bytes are joined and
 //! checked against the snapshot id before they are decoded, and the chunks
-//! a peer lists for a manifest are stored only while what they hold stays
-//! within the length it declared. A retry asks only for what the store
+//! a peer lists for a manifest are stored and joined only while what they
+//! hold stays within the length it declared, a chunk listed twice or
+//! already held counted each time it is listed. A retry asks only for what the store
 //! still lacks, so a dropped connection costs the chunks in flight and
 //! nothing more.
 
@@ -121,10 +122,18 @@ async fn fetch_manifest(
     // The ids are the peer's word until the joined bytes hash to the
     // snapshot id, so what they hold is bounded by the declared length.
     fetch_chunks(store, session, ids.clone(), false, Some(len)).await?;
+    let peer = session.peer();
     let bytes = with_store(store, move |store| {
         let mut bytes = Vec::new();
         for id in ids {
-            bytes.extend_from_slice(&store.objects().read(id).map_err(StoreError::from)?);
+            let chunk = store.objects().read(id).map_err(StoreError::from)?;
+            // The fetch counted each new chunk once. One listed again, or
+            // one this store already held, is counted here, so the join
+            // never grows past the declared length.
+            if (bytes.len() + chunk.len()) as u64 > len {
+                return Err(past_declared(peer, len));
+            }
+            bytes.extend_from_slice(&chunk);
         }
         Ok(bytes)
     })
@@ -176,13 +185,7 @@ async fn fetch_chunks(
             match fetch_batch(store, session, wanted.clone(), &mut first, &mut room).await {
                 Ok(()) => wanted.clear(),
                 Err(BatchError::PastLimit) => {
-                    return Err(NodeError::Peer {
-                        peer: session.peer(),
-                        reason: format!(
-                            "its chunks hold more than the {} bytes it declared",
-                            limit.unwrap_or_default()
-                        ),
-                    });
+                    return Err(past_declared(session.peer(), limit.unwrap_or_default()));
                 }
                 Err(BatchError::Retry(left, reason)) => {
                     attempt += 1;
@@ -199,6 +202,14 @@ async fn fetch_chunks(
         }
     }
     Ok(())
+}
+
+/// The chunks `peer` listed for a manifest hold more than the `len` bytes it declared.
+fn past_declared(peer: fabric_core::id::NodeId, len: u64) -> NodeError {
+    NodeError::Peer {
+        peer,
+        reason: format!("its chunks hold more than the {len} bytes it declared"),
+    }
 }
 
 /// Why a batch stopped.
@@ -270,7 +281,7 @@ mod tests {
     use fabric_core::lease::FencingToken;
     use fabric_core::moves::MoveOffer;
     use fabric_net::identity::NodeIdentity;
-    use fabric_net::rpc::{JobFuture, Service};
+    use fabric_net::rpc::{JobFuture, ServeLimits, Service};
     use fabric_net::tcp::TcpTlsTransport;
     use fabric_net::tls::Trust;
     use fabric_net::transport::{Connection, Transport};
@@ -355,6 +366,48 @@ mod tests {
         }
     }
 
+    /// A session with a paired peer that serves `source` and lists `ids`
+    /// as the chunks of a 16-byte manifest.
+    async fn ask_liar(source: Store, ids: Vec<ChunkId>) -> Session {
+        let (liar, asker) = (
+            NodeIdentity::generate().unwrap(),
+            NodeIdentity::generate().unwrap(),
+        );
+        let (liar_id, asker_id) = (liar.node_id(), asker.node_id());
+        let loopback: SocketAddr = ([127, 0, 0, 1], 0).into();
+        let serving: Arc<dyn Transport> =
+            Arc::new(TcpTlsTransport::bind(&liar, Arc::new(Anyone), loopback).unwrap());
+        let addr = serving.local_addr().unwrap();
+        let service = Arc::new(Lying {
+            store: Mutex::new(source),
+            ids,
+        });
+        tokio::spawn(async move {
+            let connection: Arc<dyn Connection> = Arc::from(serving.accept().await.unwrap());
+            let session = Session::accept(
+                connection,
+                liar_id,
+                VersionText::new("test").unwrap(),
+                DEADLINE,
+            )
+            .await
+            .unwrap();
+            session
+                .serve(service, Arc::new(Anyone), &ServeLimits::new())
+                .await
+        });
+        let dialing = TcpTlsTransport::bind(&asker, Arc::new(Anyone), loopback).unwrap();
+        let connection = Arc::from(dialing.connect(liar_id, addr).await.unwrap());
+        Session::connect(
+            connection,
+            asker_id,
+            VersionText::new("test").unwrap(),
+            DEADLINE,
+        )
+        .await
+        .unwrap()
+    }
+
     /// A paired peer that declares a manifest of 16 bytes and lists
     /// chunks of 1 MiB each must not get them stored: the fetch stops at
     /// the first byte past the declared length, before the store and the
@@ -369,41 +422,7 @@ mod tests {
         let here = Arc::new(Mutex::new(
             Store::create(&dir.path().join("here"), ChunkParams::DEFAULT).unwrap(),
         ));
-        let (liar, asker) = (
-            NodeIdentity::generate().unwrap(),
-            NodeIdentity::generate().unwrap(),
-        );
-        let (liar_id, asker_id) = (liar.node_id(), asker.node_id());
-        let loopback: SocketAddr = ([127, 0, 0, 1], 0).into();
-        let serving: Arc<dyn Transport> =
-            Arc::new(TcpTlsTransport::bind(&liar, Arc::new(Anyone), loopback).unwrap());
-        let addr = serving.local_addr().unwrap();
-        let service = Arc::new(Lying {
-            store: Mutex::new(source),
-            ids: ids.clone(),
-        });
-        tokio::spawn(async move {
-            let connection: Arc<dyn Connection> = Arc::from(serving.accept().await.unwrap());
-            let session = Session::accept(
-                connection,
-                liar_id,
-                VersionText::new("test").unwrap(),
-                DEADLINE,
-            )
-            .await
-            .unwrap();
-            session.serve(service, Arc::new(Anyone)).await
-        });
-        let dialing = TcpTlsTransport::bind(&asker, Arc::new(Anyone), loopback).unwrap();
-        let connection = Arc::from(dialing.connect(liar_id, addr).await.unwrap());
-        let session = Session::connect(
-            connection,
-            asker_id,
-            VersionText::new("test").unwrap(),
-            DEADLINE,
-        )
-        .await
-        .unwrap();
+        let session = ask_liar(source, ids.clone()).await;
 
         let fetched = fetch_snapshot(&here, &session, SnapshotId::of(b"a snapshot")).await;
         assert!(fetched.is_err(), "{fetched:?}");
@@ -415,6 +434,31 @@ mod tests {
         assert!(
             stored.is_empty(),
             "chunks past the declared length were stored: {stored:?}"
+        );
+    }
+
+    /// The fetch counts a chunk against the declared length when it
+    /// arrives, so a chunk the store already holds, listed sixteen times
+    /// under a 16-byte manifest, costs the fetch nothing. Joining the
+    /// manifest must count it each time it is listed and stop at the
+    /// first byte past the length, before it reads the chunk again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_chunk_listed_again_and_again_is_cut_off_at_the_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = Store::create(&dir.path().join("source"), ChunkParams::DEFAULT).unwrap();
+        let held = source.objects().put(&vec![7; 1 << 20]).unwrap().id;
+        let here = Store::create(&dir.path().join("here"), ChunkParams::DEFAULT).unwrap();
+        here.objects().put(&vec![7; 1 << 20]).unwrap();
+        let here = Arc::new(Mutex::new(here));
+        let session = ask_liar(source, vec![held; 16]).await;
+
+        let fetched = fetch_snapshot(&here, &session, SnapshotId::of(b"a snapshot")).await;
+        assert!(
+            matches!(
+                &fetched,
+                Err(NodeError::Peer { reason, .. }) if reason.contains("more than the 16 bytes")
+            ),
+            "{fetched:?}"
         );
     }
 }

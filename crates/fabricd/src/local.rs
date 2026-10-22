@@ -175,7 +175,8 @@ pub struct HarnessRecord {
     pub epoch: Epoch,
     /// Its process id, which is also its process group id.
     pub pid: NonZeroU32,
-    /// The kernel's start time of the process, as `ps` prints it.
+    /// The kernel's start time of the process, as `ps` prints it, and on
+    /// Linux its start in clock ticks since boot after it.
     pub started: String,
 }
 
@@ -201,6 +202,23 @@ pub struct SessionRecord {
     pub harness: HarnessKind,
     /// The session id the harness minted.
     pub session: SessionId,
+}
+
+/// A session a registration recorded before its `Resumed`, until the
+/// session file holds it.
+///
+/// It is the job's session only if the record right after `after` is that
+/// `Resumed`: a crash between the two writes then leaves it to be moved
+/// into place, and a crash before the `Resumed` leaves one to drop, since
+/// the CLI killed the harness that named it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingSession {
+    /// The ledger head the registration's `Resumed` follows.
+    pub after: RecordHash,
+    /// The epoch the harness was registered under.
+    pub epoch: Epoch,
+    /// The session.
+    pub record: SessionRecord,
 }
 
 /// Reads a node-local file, or `None` when it does not exist.
@@ -255,7 +273,14 @@ pub fn remove(path: &Path) -> Result<(), LocalError> {
 /// The program that reads a process's start time and group.
 const PS: &str = "ps";
 
-/// The kernel's start time of `pid` as `ps -o lstart=` prints it, or `None` when no such process runs or `ps` failed.
+/// The kernel's start time of `pid` as `ps -o lstart=` prints it, and on
+/// Linux its start in clock ticks since boot after it, or `None` when no
+/// such process runs or `ps` failed.
+///
+/// `lstart` has whole seconds, and a pid can be given out again within
+/// one on a busy Linux host whose pid space is 32768; the ticks, a hundredth
+/// of a second, tell the two processes apart. macOS gives out pids up to
+/// 99998 and cannot start that many processes in a second.
 pub async fn process_started(pid: NonZeroU32) -> Option<String> {
     match probe_started(PS, pid).await {
         Started::At(text) => Some(text),
@@ -284,12 +309,65 @@ async fn probe_started(ps: &str, pid: NonZeroU32) -> Started {
     };
     let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if output.status.success() && !text.is_empty() {
-        Started::At(text)
+        match kernel_start(pid) {
+            KernelStart::NotKept => Started::At(text),
+            KernelStart::Ticks(ticks) => Started::At(format!("{text} {ticks}")),
+            // The process ended, or its pid passed to another, after `ps`
+            // read it; which one this is cannot be told.
+            KernelStart::Unread => Started::Unknown,
+        }
     } else if output.status.code() == Some(1) && text.is_empty() && output.stderr.is_empty() {
         Started::Absent
     } else {
         Started::Unknown
     }
+}
+
+/// What the kernel says of a process's start, finer than `ps` does.
+enum KernelStart {
+    /// This platform keeps nothing finer that Fabric reads.
+    #[cfg_attr(
+        target_os = "linux",
+        expect(dead_code, reason = "Linux keeps the start in ticks")
+    )]
+    NotKept,
+    /// Clock ticks since boot.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "only Linux start ticks are read")
+    )]
+    Ticks(u64),
+    /// The platform keeps it and it could not be read.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "only Linux start ticks are read")
+    )]
+    Unread,
+}
+
+/// The start of `pid` in clock ticks since boot, read from `/proc`.
+#[cfg(target_os = "linux")]
+fn kernel_start(pid: NonZeroU32) -> KernelStart {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .as_deref()
+        .and_then(start_ticks)
+        .map_or(KernelStart::Unread, KernelStart::Ticks)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kernel_start(_pid: NonZeroU32) -> KernelStart {
+    KernelStart::NotKept
+}
+
+/// Field 22 of a `/proc/<pid>/stat` line, the process's start in clock
+/// ticks since boot. The command name in field 2 is in parentheses and may
+/// hold spaces and parentheses itself, so fields are counted from the last
+/// `)`.
+#[cfg(any(target_os = "linux", test))]
+fn start_ticks(stat: &str) -> Option<u64> {
+    let (_, after_name) = stat.rsplit_once(')')?;
+    after_name.split_whitespace().nth(19)?.parse().ok()
 }
 
 /// `pid` as a process id that may lead a group Fabric signals: any but 1.
@@ -421,6 +499,59 @@ mod tests {
             pid: NonZeroU32::new(child.id().unwrap()).unwrap(),
             started,
         }
+    }
+
+    /// A command name may hold spaces and parentheses; the start is still
+    /// the 22nd field of the line.
+    #[test]
+    fn the_start_ticks_are_read_past_any_command_name() {
+        let stat =
+            "4321 (a) b (c)) S 1 4321 4321 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654 1000 100";
+        assert_eq!(start_ticks(stat), Some(987_654));
+        assert_eq!(start_ticks("4321 (sleep) S 1"), None);
+    }
+
+    /// Two processes started in the same second have one `lstart`, and a
+    /// pid given out again within that second must not make the second
+    /// process pass for the first.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn two_processes_started_in_one_second_have_different_starts() {
+        let spawn = || {
+            tokio::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap()
+        };
+        let lstart = |pid: u32| {
+            String::from_utf8(
+                std::process::Command::new("ps")
+                    .args(["-o", "lstart=", "-p", &pid.to_string()])
+                    .env("LC_ALL", "C")
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+        };
+        for _ in 0..20 {
+            let mut first = spawn();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let mut second = spawn();
+            let (a, b) = (first.id().unwrap(), second.id().unwrap());
+            let same_second = lstart(a) == lstart(b);
+            let starts = (
+                process_started(NonZeroU32::new(a).unwrap()).await,
+                process_started(NonZeroU32::new(b).unwrap()).await,
+            );
+            first.kill().await.unwrap();
+            second.kill().await.unwrap();
+            if same_second {
+                assert_ne!(starts.0, starts.1);
+                return;
+            }
+        }
+        panic!("no two processes started in one second");
     }
 
     #[tokio::test]

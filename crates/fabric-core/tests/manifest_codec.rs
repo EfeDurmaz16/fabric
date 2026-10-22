@@ -128,6 +128,12 @@ fn cache_entry() -> impl Strategy<Value = CacheEntry> {
         })
 }
 
+/// Sorts `items` by `key` and keeps a repeated key's items in their order, as capture does for config.
+fn sorted<T, K: Ord>(mut items: Vec<T>, key: impl Fn(&T) -> K) -> Vec<T> {
+    items.sort_by_key(|a| key(a));
+    items
+}
+
 /// Sorts `items` by `key` and drops a repeated key, as capture does.
 fn sorted_unique<T, K: Ord>(mut items: Vec<T>, key: impl Fn(&T) -> K) -> Vec<T> {
     items.sort_by_key(|a| key(a));
@@ -199,7 +205,7 @@ fn git_state() -> impl Strategy<Value = GitState> {
                 index_commit,
                 worktree_commit,
                 worktree_mtimes: sorted_unique(worktree_mtimes, |(path, _)| path.clone()),
-                config: sorted_unique(config, |(key, _)| key.clone()),
+                config: sorted(config, |(key, _)| key.clone()),
                 exclude,
             },
         )
@@ -234,10 +240,16 @@ fn manifest() -> impl Strategy<Value = SnapshotManifest> {
                 caches,
             )| {
                 let caches = sorted_unique(caches, |c| c.path.clone());
-                // A path is in `files` or in the working tree, never both.
+                // A path is in `files` or in the working tree, never both,
+                // and the two nest only below a directory in `files`.
                 if let Some(git) = git.as_mut() {
-                    git.worktree_mtimes
-                        .retain(|(path, _)| files.iter().all(|e| e.rel_path != *path));
+                    git.worktree_mtimes.retain(|(path, _)| {
+                        files.iter().all(|e| {
+                            !e.rel_path.starts_with(path)
+                                && (matches!(e.kind, EntryKind::Dir)
+                                    || !path.starts_with(&e.rel_path))
+                        })
+                    });
                 }
                 SnapshotManifest {
                     job_id: JobId::from_bytes(job),
@@ -312,7 +324,7 @@ fn mode(bits: u16) -> Result<Mode, Box<dyn Error>> {
 fn fixed_manifest() -> Result<SnapshotManifest, Box<dyn Error>> {
     Ok(SnapshotManifest {
         job_id: JobId::from_bytes([1; 16]),
-        root: AbsPath::parse("/Users/efebarandurmaz/fabric/jobs/x/work")?,
+        root: AbsPath::parse("/Users/me/fabric/jobs/x/work")?,
         parent: None,
         created_at: 1_760_000_000_000,
         created_by: NodeId::from_bytes([2; 32]),
@@ -380,7 +392,7 @@ fn format_version_one_hash_is_pinned() {
     let id = fixed_manifest().unwrap().id().unwrap().to_string();
     assert_eq!(
         id,
-        "ae53cc1d8df4107a0e29dc531939ec45b20f5f66f6d391e0f30eb1e36d7c6123"
+        "3b1e42341097eeb196f3d8b83787fd08b855fc0eb300138ae058a14cfadb8844"
     );
 }
 
@@ -422,9 +434,35 @@ fn a_repeated_or_unsorted_path_is_refused() {
             index: 1
         })
     ));
+}
+
+/// `config` is sorted by key, but a key git holds more than once keeps one
+/// entry per value in git's order, such as a second fetch refspec; a key
+/// below the one before it is still refused.
+#[test]
+fn a_repeated_config_key_keeps_its_values_and_an_unsorted_one_is_refused() {
     let mut m = fixed_manifest().unwrap();
+    let fetch = GitConfigKey::parse("remote.origin.fetch").unwrap();
+    m.git.as_mut().unwrap().config = vec![
+        (
+            fetch.clone(),
+            GitConfigValue::parse("+refs/heads/*:refs/remotes/origin/*").unwrap(),
+        ),
+        (
+            fetch,
+            GitConfigValue::parse("+refs/pull/*/head:refs/remotes/origin/pr/*").unwrap(),
+        ),
+    ];
+    let bytes = m.encode().unwrap();
+    assert_eq!(SnapshotManifest::decode(&bytes).unwrap(), m);
     let git = m.git.as_mut().unwrap();
-    git.config.push(git.config[0].clone());
+    git.config.insert(
+        0,
+        (
+            GitConfigKey::parse("push.default").unwrap(),
+            GitConfigValue::parse("simple").unwrap(),
+        ),
+    );
     assert!(matches!(
         m.encode(),
         Err(ManifestError::OutOfOrder {
@@ -594,6 +632,39 @@ fn a_path_in_files_and_the_working_tree_is_refused() {
         m.encode(),
         Err(ManifestError::InBothTrees { path: p }) if p == path
     ));
+}
+
+/// Restore checks out the working tree before it creates `files`, so a
+/// `files` entry below a working-tree file, or a `files` file or symlink
+/// above a working-tree path, never restores; a `files` directory above
+/// one is the parent the two trees share.
+#[test]
+fn a_files_entry_nested_with_a_working_tree_path_is_refused() {
+    // The fixed manifest's working tree holds `src/lib.rs`.
+    let mut m = fixed_manifest().unwrap();
+    let nest = |m: &SnapshotManifest, files: &str, worktree: &str| {
+        matches!(m.encode(), Err(ManifestError::TreesNest { files: f, worktree: w })
+            if f.as_str() == files && w.as_str() == worktree)
+    };
+    m.files = vec![dir("src/lib.rs/x").unwrap()];
+    assert!(nest(&m, "src/lib.rs/x", "src/lib.rs"));
+    m.files = vec![Entry {
+        rel_path: RelPath::parse("src").unwrap(),
+        kind: EntryKind::File {
+            size: 0,
+            chunks: vec![],
+        },
+        mode: mode(0o644).unwrap(),
+        mtime_ns: 1,
+    }];
+    assert!(nest(&m, "src", "src/lib.rs"));
+    m.files[0].kind = EntryKind::Symlink {
+        target: "elsewhere".into(),
+    };
+    assert!(nest(&m, "src", "src/lib.rs"));
+    m.files = vec![dir("src").unwrap(), dir("src/target").unwrap()];
+    let bytes = m.encode().unwrap();
+    assert_eq!(SnapshotManifest::decode(&bytes).unwrap(), m);
 }
 
 #[test]

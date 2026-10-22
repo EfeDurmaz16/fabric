@@ -14,8 +14,11 @@
 //! install runs when its own cache is not, and a declared step when one of
 //! the caches it fills is not, so a missing `target` never reinstalls a
 //! whole `node_modules`; `cargo fetch` runs when `target`, which a build
-//! makes from what it fetches, is not; and a step that fills no cache in
-//! the workspace runs when any cache is not whole or the report has none.
+//! makes from what it fetches, is not; `go mod download`, which fills
+//! only this node's module cache outside the workspace, runs on every
+//! resume, since nothing carried proves that cache warm; and a declared
+//! step that fills no cache runs when any cache is not whole or the report
+//! has none.
 //!
 //! A cache is healthy when it is a non-empty directory that holds proof
 //! that whatever filled it finished. For a cache a setup step fills, the
@@ -24,7 +27,12 @@
 //! writes after the last one exits 0. An installer's own file is never
 //! proof: npm, pnpm and Yarn 1 write theirs before the root package's
 //! lifecycle scripts run, so a `postinstall` that fails or is interrupted
-//! leaves it over a tree that is not whole. A cache no step fills needs
+//! leaves it over a tree that is not whole. The sentinel holds the digest
+//! of the files at the root that the steps read, such as `package.json`
+//! and the lockfile, and proves the cache only while they are unchanged:
+//! a lockfile edited since the install, or a cache carried from before
+//! the edit, is stale and filled again, though the spec, which holds the
+//! commands and not the files, is the same. A cache no step fills needs
 //! only to be non-empty. An install that fails or is killed halfway
 //! leaves no proof, so the next plan fills the cache again. A report with
 //! no cache paths has nothing that proves warmth, so its `CachesMissing`
@@ -56,18 +64,22 @@
 //! anything in the tree, and a lock they can unlink guards nothing. The
 //! caller takes it before restore writes the tree and holds it through
 //! `plan` and `execute`, which take it by reference, so neither can run
-//! without it. `execute` hands that same open file to every step as its
-//! standard input, an empty file that reads as end of input. The lock
-//! belongs to the open file, which the installer and the processes that
-//! inherit its input share, so it outlives a killed resume and ends when
-//! the last of them exits; until then `TreeLock::acquire` refuses, so a
-//! second resume neither restores over nor starts a second installer on a
-//! tree the first one is still writing. A process a step leaves behind
-//! with that input still open, such as a daemon that did not redirect it,
-//! holds the lock too, and resumes refuse until it exits.
+//! without it. `execute` hands that same open file to every step twice:
+//! as its standard input, an empty file that reads as end of input, and
+//! under a descriptor number above the standard three, so a step that
+//! replaces its input, as `sh -c 'exec </dev/null; ...'` does, still holds
+//! it. The lock belongs to the open file, which the installer and the
+//! processes that inherit either descriptor share, so it outlives a killed
+//! resume and ends when the last of them exits; until then
+//! `TreeLock::acquire` refuses, so a second resume neither restores over
+//! nor starts a second installer on a tree the first one is still
+//! writing. A process a step leaves behind with either descriptor still
+//! open, such as a daemon that did not close them, holds the lock too, and
+//! resumes refuse until it exits.
 //!
-//! The reverse gap is open: a process the step starts with its own
-//! standard input does not hold the lock. npm runs dependency install
+//! The reverse gap is open: a process the step starts holds the lock only
+//! when it inherits one of those descriptors, and Node and Python pass on
+//! only the ones they name. npm runs dependency install
 //! scripts, such as a `node-gyp` build, with piped input, so if the
 //! installer alone is killed (the OOM killer, a force quit) while such a
 //! build still writes, the lock is released and the next resume can start
@@ -81,6 +93,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, TryLockError};
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -100,12 +113,38 @@ use crate::detect::{CachePath, Completion, Detection, StepGate};
 ///
 /// It is removed before the first of those steps starts and written after
 /// the last one succeeds, so a step that fails or is killed leaves the
-/// cache without it and the next plan fills the cache again.
+/// cache without it and the next plan fills the cache again. It holds the
+/// digest of the files the steps read (`sentinel_text`), so a lockfile
+/// changed since leaves the cache stale and the next plan fills it again.
 pub const SENTINEL: &str = ".fabric-installed";
 
-/// What the sentinel file holds; only its presence is read.
-const SENTINEL_TEXT: &[u8] =
-    b"Written by Fabric after the setup steps that fill this cache exited 0.\n";
+/// The first line of the sentinel, for a reader who finds the file.
+const SENTINEL_HEADER: &str =
+    "Written by Fabric after the setup steps that fill this cache exited 0.\n";
+
+/// The most bytes of a sentinel `plan` reads; one Fabric wrote is far shorter.
+const MAX_SENTINEL: u64 = 4 << 10;
+
+/// Returns what the sentinel of the cache at `path` holds once the steps that fill it exit 0, or `None` when no step fills it.
+///
+/// That is a header line and the digest of the files the steps of the
+/// cache's ecosystem read at the root, such as `package.json` and the
+/// lockfile for `node_modules`. A sentinel that holds anything else, one
+/// an older Fabric wrote included, leaves the cache `Stale`.
+pub fn sentinel_text(detected: &Detection, path: &RelPath) -> Option<String> {
+    detected
+        .caches_with_inputs()
+        .find(|(cache, _)| &cache.path == path)
+        .and_then(|(cache, inputs)| match cache.completion {
+            Completion::Sentinel { .. } => Some(sentinel_for(inputs)),
+            Completion::Content => None,
+        })
+}
+
+/// Formats the sentinel for a cache whose inputs have this digest.
+fn sentinel_for(inputs: &blake3::Hash) -> String {
+    format!("{SENTINEL_HEADER}inputs {}\n", inputs.to_hex())
+}
 
 /// The `tracing` target that carries every line a setup step prints.
 pub const SETUP_LOG_TARGET: &str = "fabric_env::setup";
@@ -282,6 +321,8 @@ pub enum CacheHealth {
     Empty,
     /// A directory with content and no `SENTINEL`, so the steps that fill it may not have finished.
     Incomplete,
+    /// A directory whose `SENTINEL` was written for other inputs than the workspace has now, such as a lockfile changed since the install.
+    Stale,
 }
 
 /// One cache path and its health.
@@ -300,14 +341,15 @@ pub struct PlannedStep {
     step: SetupStep,
     dir: PathBuf,
     program: Option<PathBuf>,
+    cleared: &'static [&'static str],
     sentinels: Sentinels,
 }
 
-/// The caches whose sentinel a step removes before it runs and writes after it succeeds.
+/// The caches whose sentinel a step removes before it runs, and those it writes, with their text, after it succeeds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Sentinels {
     clear: Vec<RelPath>,
-    write: Vec<RelPath>,
+    write: Vec<(RelPath, String)>,
 }
 
 impl PlannedStep {
@@ -380,6 +422,7 @@ impl Plan {
                     step: planned.step,
                     dir: planned.dir,
                     program,
+                    cleared: planned.cleared,
                     sentinels: planned.sentinels,
                 }),
                 None => missing.push((planned.index, planned.step.program)),
@@ -405,13 +448,16 @@ struct ReadyStep {
     step: SetupStep,
     dir: PathBuf,
     program: PathBuf,
+    cleared: &'static [&'static str],
     sentinels: Sentinels,
 }
 
 /// What `plan` reads from this node's environment: `PATH`, and whether each declared variable is set.
 ///
 /// It decides only what `plan` checks. A step runs with the environment
-/// of the process that calls `execute`, as ADR 0007 says.
+/// of the process that calls `execute`, as ADR 0007 says, less the
+/// variables that would move a detected `uv` step out of the workspace,
+/// such as `UV_PROJECT_ENVIRONMENT`.
 #[derive(Debug, Clone)]
 pub struct NodeEnv {
     path: Option<OsString>,
@@ -456,7 +502,8 @@ impl NodeEnv {
 /// The lock that keeps one installer per workspace tree, held in this node's Fabric state.
 ///
 /// Dropping it releases the lock, unless a setup step still holds the
-/// same open file as its standard input.
+/// same open file, which it gets as its standard input and under a
+/// descriptor number of its own.
 #[derive(Debug)]
 pub struct TreeLock {
     root: PathBuf,
@@ -550,7 +597,8 @@ impl Ready {
     /// Takes the value: what the plan read from the disk is stale once a
     /// step has run, so a second run needs a new plan. `lock` must be the
     /// tree's lock the plan was made under; each step gets its open file
-    /// as standard input, so the lock lasts as long as the step does.
+    /// as standard input and under a descriptor number of its own, so the
+    /// lock lasts as long as the step does.
     pub fn execute(self, lock: &TreeLock) -> Result<(), MaterializeError> {
         lock.covers(&self.root)?;
         for step in &self.steps {
@@ -558,8 +606,8 @@ impl Ready {
                 clear_sentinel(&self.root, path)?;
             }
             run_step(step, &lock.file)?;
-            for path in &step.sentinels.write {
-                write_sentinel(&self.root, path)?;
+            for (path, text) in &step.sentinels.write {
+                write_sentinel(&self.root, path, text)?;
             }
         }
         Ok(())
@@ -595,12 +643,11 @@ pub fn plan(
 
     let spec = detected.spec();
     let caches = detected
-        .caches()
-        .iter()
-        .map(|cache| {
+        .caches_with_inputs()
+        .map(|(cache, inputs)| {
             Ok(CacheReport {
                 path: cache.path.clone(),
-                health: inspect(&root, cache)?,
+                health: inspect(&root, cache, inputs)?,
             })
         })
         .collect::<Result<Vec<_>, MaterializeError>>()?;
@@ -617,6 +664,7 @@ pub fn plan(
         let needed = match gate {
             StepGate::Caches(paths) => paths.iter().any(unhealthy),
             StepGate::AnyCache => any_unhealthy,
+            StepGate::EveryResume => true,
         };
         if step.when == RunWhen::CachesMissing && !needed {
             continue;
@@ -626,6 +674,7 @@ pub fn plan(
             step: step.clone(),
             dir: step_dir(&root, index, step)?,
             program: find_on_path(node.path.as_deref(), &root, &step.program),
+            cleared: detected.cleared(index),
             sentinels: Sentinels::default(),
         });
     }
@@ -649,7 +698,7 @@ pub fn plan(
 
 /// Gives each sentinel cache to the planned steps that fill it: the first clears it, the last writes it.
 fn assign_sentinels(detected: &Detection, steps: &mut [PlannedStep]) {
-    for cache in detected.caches() {
+    for (cache, inputs) in detected.caches_with_inputs() {
         let Completion::Sentinel { filled_by } = &cache.completion else {
             continue;
         };
@@ -658,7 +707,10 @@ fn assign_sentinels(detected: &Detection, steps: &mut [PlannedStep]) {
             steps[first].sentinels.clear.push(cache.path.clone());
         }
         if let Some(last) = steps.iter().rposition(fills) {
-            steps[last].sentinels.write.push(cache.path.clone());
+            steps[last]
+                .sentinels
+                .write
+                .push((cache.path.clone(), sentinel_for(inputs)));
         }
     }
 }
@@ -713,7 +765,11 @@ fn find_dir(root: &Path, path: &RelPath) -> io::Result<Found> {
     Ok(Found::Dir(full))
 }
 
-fn inspect(root: &Path, cache: &CachePath) -> Result<CacheHealth, MaterializeError> {
+fn inspect(
+    root: &Path,
+    cache: &CachePath,
+    inputs: &blake3::Hash,
+) -> Result<CacheHealth, MaterializeError> {
     let inspect_err = |source| MaterializeError::Inspect {
         path: cache.path.clone(),
         source,
@@ -728,14 +784,30 @@ fn inspect(root: &Path, cache: &CachePath) -> Result<CacheHealth, MaterializeErr
     }
     match &cache.completion {
         Completion::Content => Ok(CacheHealth::Healthy),
-        Completion::Sentinel { .. } => {
-            if fs::symlink_metadata(full.join(SENTINEL)).is_ok_and(|meta| meta.is_file()) {
-                Ok(CacheHealth::Healthy)
-            } else {
-                Ok(CacheHealth::Incomplete)
-            }
-        }
+        Completion::Sentinel { .. } => Ok(match read_sentinel(&full.join(SENTINEL)) {
+            None => CacheHealth::Incomplete,
+            Some(text) if text == sentinel_for(inputs).as_bytes() => CacheHealth::Healthy,
+            Some(_) => CacheHealth::Stale,
+        }),
     }
+}
+
+/// Reads the first `MAX_SENTINEL` bytes of the sentinel at `path`, or `None` when no regular file is there or it cannot be read.
+///
+/// A sentinel that cannot be read proves nothing, so the cache counts as
+/// not finished and is filled again.
+fn read_sentinel(path: &Path) -> Option<Vec<u8>> {
+    let seen = fs::symlink_metadata(path)
+        .ok()
+        .filter(fs::Metadata::is_file)?;
+    let file = fs::File::open(path).ok()?;
+    let opened = file.metadata().ok()?;
+    if !opened.is_file() || opened.dev() != seen.dev() || opened.ino() != seen.ino() {
+        return None;
+    }
+    let mut text = Vec::new();
+    file.take(MAX_SENTINEL).read_to_end(&mut text).ok()?;
+    Some(text)
 }
 
 /// Removes the sentinel of the cache at `path`; nothing there, or a cache reached through a link, is left alone.
@@ -771,24 +843,24 @@ fn remove_entry(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Writes the sentinel of the cache at `path` when the steps left a real directory there, reached through real directories.
+/// Writes `text` as the sentinel of the cache at `path` when the steps left a real directory there, reached through real directories.
 ///
 /// A cache the steps did not create, or one they left as or under a link,
 /// gets no sentinel: the next plan sees it missing, or refuses it as not a
 /// directory, and never writes outside the workspace. `plan` refuses a
 /// filled cache that is a link before any step runs.
-/// A regular file the steps left at the sentinel's name, such as one
-/// unpacked from an archive of a whole cache, is kept: the steps exited 0,
-/// which is all the sentinel says. Anything else there, a link or a
-/// directory included, is removed and the sentinel created in its place,
-/// so a link is never followed.
+/// Whatever the steps left at the sentinel's name is removed and the
+/// sentinel created in its place: a link, so it is never followed, a
+/// directory, and a regular file, such as one unpacked from an archive of
+/// a cache built from other inputs, so the sentinel names the inputs this
+/// run read.
 ///
 /// Nothing is synced. The sentinel proves completion across a `kill -9`,
 /// where the kernel keeps every write, but not across a power loss or a
 /// kernel panic: APFS and ext4 may then keep the sentinel's entry and lose
 /// files the installer wrote before it. Power loss is out of scope for
 /// this proof (ADR 0007, step 3 of Materialize).
-fn write_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
+fn write_sentinel(root: &Path, path: &RelPath, text: &str) -> Result<(), MaterializeError> {
     let sentinel_err = |source| MaterializeError::Sentinel {
         path: path.clone(),
         source,
@@ -807,18 +879,12 @@ fn write_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
     let mut file = match create() {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            if fs::symlink_metadata(&sentinel)
-                .map_err(sentinel_err)?
-                .is_file()
-            {
-                return Ok(());
-            }
             remove_entry(&sentinel).map_err(sentinel_err)?;
             create().map_err(sentinel_err)?
         }
         Err(err) => return Err(sentinel_err(err)),
     };
-    file.write_all(SENTINEL_TEXT).map_err(sentinel_err)
+    file.write_all(text.as_bytes()).map_err(sentinel_err)
 }
 
 fn step_dir(root: &Path, index: usize, step: &SetupStep) -> Result<PathBuf, MaterializeError> {
@@ -866,7 +932,11 @@ fn run_step(planned: &ReadyStep, lock: &fs::File) -> Result<(), MaterializeError
     };
     // The step inherits the locked file itself, not a copy of the lock, so
     // the lock lasts as long as the step does, whatever happens to resume.
+    // It gets it twice: as its standard input, and under a number of its
+    // own that a step replacing its input, as `exec </dev/null` does,
+    // leaves open.
     let stdin = lock.try_clone().map_err(spawn_err)?;
+    let held = inheritable(lock).map_err(spawn_err)?;
     tracing::info!(
         target: SETUP_LOG_TARGET,
         step = index,
@@ -875,14 +945,21 @@ fn run_step(planned: &ReadyStep, lock: &fs::File) -> Result<(), MaterializeError
         dir = %planned.dir.display(),
         "running setup step"
     );
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    for name in planned.cleared {
+        command.env_remove(name);
+    }
+    let spawned = command
         .args(planned.step.args.iter().map(SetupArg::as_str))
         .current_dir(&planned.dir)
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .map_err(spawn_err)?;
+        .spawn();
+    // The step has its copy now; this one would pass to whatever else this
+    // process started.
+    drop(held);
+    let mut child = spawned.map_err(spawn_err)?;
     // Lines are logged from reader threads, which do not inherit the
     // caller's scoped subscriber; hand it to them.
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
@@ -929,6 +1006,19 @@ fn run_step(planned: &ReadyStep, lock: &fs::File) -> Result<(), MaterializeError
     }
     tracing::info!(target: SETUP_LOG_TARGET, step = index, program = %name, "setup step finished");
     Ok(())
+}
+
+/// Returns a copy of the descriptor of `file`, numbered 3 or above, that a program this process starts inherits.
+///
+/// Numbers 0 to 2 are the ones `Command` points at a step's input and
+/// output, which would replace the copy in the step. Without close-on-exec
+/// the copy also passes to any other program this process starts while it
+/// is open, so `run_step` closes it as soon as the step has started; resume
+/// starts nothing else meanwhile.
+fn inheritable(file: &fs::File) -> io::Result<OwnedFd> {
+    let fd = rustix::io::fcntl_dupfd_cloexec(file, 3)?;
+    rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty())?;
+    Ok(fd)
 }
 
 /// Starts a thread that forwards `pipe` to the log and reports on `done` at EOF; returns how many threads started.

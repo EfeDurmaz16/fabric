@@ -9,8 +9,8 @@
 //! which the all-ASCII key has as many of as it has bytes. The rule is lossy and is never inverted; Fabric
 //! recomputes it from the path it knows. Read on 2026-10-19 from
 //! `code.claude.com/docs/en/sessions.md` and checked against the owner's
-//! own store, where `/Users/efebarandurmaz/Desktop/compass` is filed as
-//! `-Users-efebarandurmaz-Desktop-compass` and a `.data` component became
+//! own store, where `/Users/me/Desktop/compass` is filed as
+//! `-Users-me-Desktop-compass` and a `.data` component became
 //! `--data`. Claude cuts a key longer than 200 characters and appends a
 //! hash whose function the docs do not name, so such a path is refused
 //! rather than guessed.
@@ -60,8 +60,8 @@ mod tests {
     #[test]
     fn matches_the_observed_store() {
         assert_eq!(
-            slug(&abs("/Users/efebarandurmaz/Desktop/compass")).unwrap(),
-            "-Users-efebarandurmaz-Desktop-compass"
+            slug(&abs("/Users/me/Desktop/compass")).unwrap(),
+            "-Users-me-Desktop-compass"
         );
         assert_eq!(
             slug(&abs("/Users/x/apps/workspace/.data/y")).unwrap(),

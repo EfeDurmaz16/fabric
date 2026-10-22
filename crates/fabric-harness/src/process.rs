@@ -81,6 +81,8 @@ const PS: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 const PGREP: &[&str] = &["/usr/bin/pgrep", "/bin/pgrep"];
 /// Where macOS and Linux keep `kill`.
 const KILL: &[&str] = &["/bin/kill", "/usr/bin/kill"];
+/// Where macOS and Linux keep `lsof`.
+pub(crate) const LSOF: &[&str] = &["/usr/sbin/lsof", "/usr/bin/lsof", "/sbin/lsof", "/bin/lsof"];
 /// The `pgrep` flag that keeps the caller's ancestors in the answer.
 #[cfg(target_os = "macos")]
 const PGREP_WITH_ANCESTORS: &[&str] = &["-a"];
@@ -89,7 +91,7 @@ const PGREP_WITH_ANCESTORS: &[&str] = &["-a"];
 const PGREP_WITH_ANCESTORS: &[&str] = &[];
 
 /// The first of `candidates` that is an executable file.
-fn system_tool(
+pub(crate) fn system_tool(
     program: &'static str,
     candidates: &'static [&'static str],
 ) -> Result<&'static Path, HarnessError> {
@@ -539,6 +541,48 @@ pub(crate) async fn pid_alive(pid: u32) -> Result<bool, HarnessError> {
             program: "ps",
             reason: format!(
                 "ps -p {pid} exited with {code:?}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        }),
+    }
+}
+
+/// Process ids, other than this one, that hold any of `files` open,
+/// asked of `lsof`. It lists them and exits 0 when every file is open, or
+/// 1 when some is not, and then says nothing on its error output; anything
+/// on that output, as for a file that vanished, or any other exit is an
+/// error, never "none". It runs from a blocking thread, under a lock the
+/// caller holds, so it is synchronous.
+pub(crate) fn holding(files: &[PathBuf]) -> Result<Vec<u32>, HarnessError> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let output = std::process::Command::new(system_tool("lsof", LSOF)?)
+        .arg("-t")
+        .arg("--")
+        .args(files)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|source| HarnessError::Spawn {
+            program: "lsof".to_owned(),
+            source,
+        })?;
+    let own = std::process::id();
+    let mut pids: Vec<u32> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .filter(|pid| *pid != own)
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    match output.status.code() {
+        Some(0 | 1) if output.stderr.trim_ascii().is_empty() => Ok(pids),
+        code => Err(HarnessError::ProcessQuery {
+            program: "lsof",
+            reason: format!(
+                "exited with {code:?}: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             ),
         }),

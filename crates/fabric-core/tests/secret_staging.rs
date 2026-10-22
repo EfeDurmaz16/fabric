@@ -211,7 +211,7 @@ fn capture_w(
                 .into_iter()
                 .map(|path| (path, Tracking::Untracked)),
         );
-    let Staged { stage, left_out } = match policy.staging(changes).paths(consent) {
+    let Staged { stage, left_out } = match policy.staging(changes, |_| Scope::Work).paths(consent) {
         Ok(staged) => staged,
         Err(refused) => return Ok(Err(refused)),
     };
