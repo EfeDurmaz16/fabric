@@ -728,12 +728,42 @@ fn empty_dirs(root: &Path, skip: &dyn Fn(&RelPath) -> bool) -> Result<EmptyDirs,
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Census(BTreeMap<RelPath, Option<Stamp>>);
 
+/// Whether the snapshot carries a listed path; a census leaves out every path it refuses.
+type Carried<'a> = dyn FnMut(&RelPath) -> bool + 'a;
+
+/// Answers whether the snapshot carries a workspace path under `policy`:
+/// one a secret pattern denies or `.fabricignore` excludes never travels.
+fn carried_by<'a>(policy: &'a IgnorePolicy, root: &'a Path) -> impl FnMut(&RelPath) -> bool + 'a {
+    let mut markers = DirMarkers {
+        root,
+        seen: HashMap::new(),
+    };
+    move |rel| policy.classify(rel, &mut markers).carried()
+}
+
 impl Census {
-    /// Stamps every found path and records the bare `names` beside them.
-    fn of<'a>(found: &[Found], names: impl Iterator<Item = &'a RelPath>) -> Census {
+    /// Stamps every found path that `carried` keeps and records the bare `names` beside them.
+    ///
+    /// A path the snapshot does not carry is not in it whatever it holds,
+    /// so it may change while capture runs, as a dev server's log does. A
+    /// directory is stamped by its identity alone: its mtime moves whenever
+    /// an entry is added to it or removed, carried or not, and every carried
+    /// entry is compared on its own.
+    fn of<'a>(
+        found: &[Found],
+        names: impl Iterator<Item = &'a RelPath>,
+        carried: &mut Carried<'_>,
+    ) -> Census {
         let mut paths: BTreeMap<RelPath, Option<Stamp>> = found
             .iter()
-            .map(|item| (item.rel.clone(), Some(stamp(&item.meta))))
+            .filter(|item| carried(&item.rel))
+            .map(|item| {
+                let stamp = match item.kind {
+                    FoundKind::Dir => (item.meta.dev(), item.meta.ino(), 0, 0, 0),
+                    FoundKind::File | FoundKind::Symlink => stamp(&item.meta),
+                };
+                (item.rel.clone(), Some(stamp))
+            })
             .collect();
         paths.extend(names.map(|rel| (rel.clone(), None)));
         Census(paths)
@@ -761,10 +791,10 @@ impl Census {
         }
     }
 
-    /// Walks `base` again and fails with `WorkspaceChanged` when a path was added, removed, replaced or written since this census.
-    fn unchanged_under(&self, base: &Path) -> Result<(), CaptureError> {
+    /// Walks `base` again and fails with `WorkspaceChanged` when a path `carried` keeps was added, removed, replaced or written since this census.
+    fn unchanged_under(&self, base: &Path, carried: &mut Carried<'_>) -> Result<(), CaptureError> {
         let later = list_tree(base)?;
-        self.unchanged_in(&Census::of(&later.found, later.special.iter()))
+        self.unchanged_in(&Census::of(&later.found, later.special.iter(), carried))
     }
 }
 
@@ -960,7 +990,7 @@ impl Capturer<'_> {
     /// Claude Code keeps `.credentials.json` in its state directory on Linux.
     fn harness_entries(&mut self, base: &Path) -> Result<Vec<Entry>, CaptureError> {
         let listing = list_tree(base)?;
-        let census = Census::of(&listing.found, listing.special.iter());
+        let census = Census::of(&listing.found, listing.special.iter(), &mut |_| true);
         self.report.nested_harness.extend(listing.nested);
         self.report.special_harness.extend(listing.special);
         let mut entries = Vec::with_capacity(listing.found.len());
@@ -973,7 +1003,7 @@ impl Capturer<'_> {
         }
         // A file the adapter wrote after its directory was listed would
         // otherwise be missing from the snapshot, and lost with the move.
-        census.unchanged_under(base)?;
+        census.unchanged_under(base, &mut |_| true)?;
         // The walk lists a directory's children before its siblings, which
         // puts `abc/tool.txt` before `abc.jsonl`; the manifest sorts by bytes.
         entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
@@ -1152,6 +1182,8 @@ struct GitSeen {
     stamps: HashMap<RelPath, Stamp>,
     /// The untracked listing: paths, then nested repositories.
     untracked: (Vec<RelPath>, Vec<RelPath>),
+    /// The untracked paths `W` leaves out, which a secret pattern denies or `.fabricignore` excludes.
+    left_out: BTreeSet<RelPath>,
     /// The directories of `W` with their mode and mtime, which travel in `files`.
     dirs: Vec<Entry>,
 }
@@ -1170,20 +1202,39 @@ impl GitCapture<'_> {
     /// `W` holds the tracked and untracked paths as their stamps were just
     /// before it was built, and `files` the ignored ones as they were
     /// listed; a path that appeared or changed after that would be missing
-    /// from the snapshot, or older in it, and lost with the move.
-    fn unchanged_since(&self, seen: &GitSeen, ignored: &Census) -> Result<(), CaptureError> {
-        let now = stamps(self.root, seen.paths.iter())?;
-        let changed = seen
+    /// from the snapshot, or older in it, and lost with the move. A path
+    /// `carried` refuses is in neither, so it may change: an untracked one
+    /// `W` left out, or one that appears.
+    fn unchanged_since(
+        &self,
+        seen: &GitSeen,
+        ignored: &Census,
+        carried: &mut Carried<'_>,
+    ) -> Result<(), CaptureError> {
+        let in_w = seen
             .paths
             .iter()
+            .filter(|rel| !seen.left_out.contains(*rel));
+        let now = stamps(self.root, in_w.clone())?;
+        let changed = in_w
             .filter(|rel| now.get(*rel) != seen.stamps.get(*rel))
             .min();
         if let Some(rel) = changed {
             return Err(CaptureError::WorkspaceChanged { path: rel.clone() });
         }
         let (paths, nested) = self.untracked()?;
-        let before: BTreeSet<&RelPath> = seen.untracked.0.iter().chain(&seen.untracked.1).collect();
-        let after: BTreeSet<&RelPath> = paths.iter().chain(&nested).collect();
+        let before: BTreeSet<&RelPath> = seen
+            .untracked
+            .0
+            .iter()
+            .filter(|rel| !seen.left_out.contains(*rel))
+            .chain(&seen.untracked.1)
+            .collect();
+        let after: BTreeSet<&RelPath> = paths
+            .iter()
+            .filter(|rel| carried(rel))
+            .chain(&nested)
+            .collect();
         if let Some(rel) = before.symmetric_difference(&after).min() {
             return Err(CaptureError::WorkspaceChanged {
                 path: (*rel).clone(),
@@ -1195,7 +1246,7 @@ impl GitCapture<'_> {
             .special_files
             .iter()
             .chain(&report.nested_repositories);
-        ignored.unchanged_in(&Census::of(&found, names))
+        ignored.unchanged_in(&Census::of(&found, names, carried))
     }
 
     /// The `-c` value that makes a listing read the same user exclude rules as `W`.
@@ -2238,6 +2289,7 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
         report: CaptureReport::default(),
     };
     let mut worktree_dirs = Vec::new();
+    let mut carried = carried_by(req.policy, req.root);
     let (git_state, found, settle) = if let Some(repo) = detect_git(req, store.objects().tmp_dir())?
     {
         repo.refuse_bad_states()?;
@@ -2252,7 +2304,7 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
         let names = report.special_files[special..]
             .iter()
             .chain(&report.nested_repositories[nested..]);
-        let ignored = Census::of(&found, names);
+        let ignored = Census::of(&found, names, &mut carried);
         // git lists files only, so an empty directory, untracked or
         // ignored, comes from a walk; one `W` holds as a submodule stays out.
         let in_w: HashSet<&RelPath> = seen.paths.iter().collect();
@@ -2266,7 +2318,7 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
         )
     } else {
         let listing = list_tree(req.root)?;
-        let census = Census::of(&listing.found, listing.special.iter());
+        let census = Census::of(&listing.found, listing.special.iter(), &mut carried);
         capturer.report.nested_repositories.extend(listing.nested);
         capturer.report.special_files.extend(listing.special);
         (None, listing.found, Settle::Plain(census))
@@ -2279,8 +2331,8 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
         }
     }
     match &settle {
-        Settle::Git(git) => git.0.unchanged_since(&git.1, &git.2)?,
-        Settle::Plain(census) => census.unchanged_under(req.root)?,
+        Settle::Git(git) => git.0.unchanged_since(&git.1, &git.2, &mut carried)?,
+        Settle::Plain(census) => census.unchanged_under(req.root, &mut carried)?,
     }
     let harness_state = match req.harness_state {
         Some(dir) => HarnessState {
@@ -2407,9 +2459,11 @@ fn capture_git(
         .nested_repositories
         .extend(nested.iter().cloned());
     let mut too_large = Vec::new();
+    let mut left_out = BTreeSet::new();
     for rel in &untracked {
         if policy.denies_anywhere(rel) {
             capturer.report.denied_untracked.push(rel.clone());
+            left_out.insert(rel.clone());
             continue;
         }
         let full = req.root.join(rel.as_str());
@@ -2497,6 +2551,7 @@ fn capture_git(
         paths: stamped,
         stamps: before,
         untracked: (untracked, nested),
+        left_out,
         dirs: repo.worktree_dirs(&state.worktree_commit)?,
     };
     Ok((state, seen))

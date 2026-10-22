@@ -1202,6 +1202,76 @@ fn a_file_added_after_the_listing_fails_the_capture() {
     }
 }
 
+/// Carry keys that, the first time capture asks, append to `grows` and
+/// write `appears`, as a dev server writes and rotates its log.
+struct WritesAside<'a> {
+    grows: &'a Path,
+    appears: &'a Path,
+}
+
+impl CarryKeys for WritesAside<'_> {
+    fn key(&self, _class: CacheClass, _path: &RelPath) -> CarryKey {
+        if !self.appears.exists() {
+            // A failed write leaves nothing changed, and the test proves nothing.
+            let _ = fs::OpenOptions::new()
+                .append(true)
+                .open(self.grows)
+                .and_then(|mut file| std::io::Write::write_all(&mut file, b"one more line\n"));
+            let _ = fs::write(self.appears, "rotated\n");
+        }
+        CarryKey::Unmeasured
+    }
+}
+
+/// A file the snapshot never carries, here one `.fabricignore` excludes,
+/// may change or appear while capture runs, as a running dev server's log
+/// does, in the root or beside carried files: it is not in the snapshot
+/// either way, so the capture goes on.
+#[test]
+fn a_file_the_snapshot_leaves_out_may_change_while_capture_runs() {
+    for repository in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::create_dir_all(root.join("logs")).unwrap();
+        fs::write(root.join("node_modules/pkg/index.js"), "1;\n").unwrap();
+        fs::write(root.join("logs/README"), "logs\n").unwrap();
+        fs::write(root.join(".fabricignore"), "*.log\n").unwrap();
+        if repository {
+            fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+            let g = git(&root);
+            g.run(&["init", "-q", "-b", "main"]).unwrap();
+            g.run(&["add", "-A"]).unwrap();
+            g.run(&["commit", "-q", "-m", "one"]).unwrap();
+        }
+        fs::write(root.join("dev.log"), "started\n").unwrap();
+        let store = store_in(dir.path()).unwrap();
+        let mut policy = IgnorePolicy::default();
+        policy.load_fabricignore(&root).unwrap();
+        let (grows, appears) = (root.join("dev.log"), root.join("logs/dev.1.log"));
+        let keys = WritesAside {
+            grows: &grows,
+            appears: &appears,
+        };
+        let mut req = request(&root, &policy, None);
+        req.carry_keys = &keys;
+        let captured = capture(&store, &req);
+        assert!(
+            appears.exists(),
+            "repository {repository}: nothing was written"
+        );
+        let Captured { manifest, .. } =
+            captured.unwrap_or_else(|e| panic!("repository {repository}: {e}"));
+        assert!(
+            !manifest
+                .files
+                .iter()
+                .any(|e| matches!(e.rel_path.as_str(), "dev.log" | "logs/dev.1.log")),
+            "repository {repository}"
+        );
+    }
+}
+
 /// git leaves a directory it cannot read out of its listings, with a
 /// warning, as a container's database volume owned by another user: the
 /// walk that finds empty directories leaves it out too and the report
