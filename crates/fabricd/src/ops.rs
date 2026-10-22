@@ -21,6 +21,7 @@ use fabric_core::lease::{FenceError, FencingToken};
 use fabric_core::ledger::{Author, EventKind, Ledger};
 use fabric_core::moves::{AbortAnswer, CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
 use fabric_env::materialize::{MaterializeError, TreeLock};
+use fabric_harness::codex::Codex;
 use fabric_harness::manifest::{MANIFEST_FILE, StateManifest};
 use fabric_harness::{HarnessError, SessionId};
 use fabric_net::peers::HostPort;
@@ -40,7 +41,7 @@ use crate::doctor::{self, Context, Target};
 use crate::error::NodeError;
 use crate::facts::{MeasuredKeys, NodeFacts, key_difference};
 use crate::faults::{self, Action, Point};
-use crate::harnesses::{HarnessConfig, adapter, refuse_secret_kind};
+use crate::harnesses::{HarnessConfig, HarnessEnv, adapter, refuse_secret_kind};
 use crate::job::Job;
 use crate::local::{self, HarnessRecord, Liveness, Marker, MarkerState, SessionRecord};
 use crate::node::{Node, Out, is_transport};
@@ -835,7 +836,7 @@ impl Node {
     ) -> Result<SnapshotId, NodeError> {
         let state_dir = job.dir().harness_state();
         let mut harness_state = None;
-        if let Some(record) = job.session()? {
+        if let Some(record) = job_session(job, root, &self.cfg.home)? {
             let session = record.session;
             let harness = adapter(&record.harness, &self.harness_env(path_var)?)?;
             job.clear_harness_state()?;
@@ -2241,6 +2242,40 @@ fn owner_token(job: &Job, me: NodeId) -> Result<FencingToken, NodeError> {
     }
 }
 
+/// The job's session: the one recorded for the harness the job runs,
+/// else, when that harness is Codex, the thread the job's workspace holds,
+/// else the record of the harness it ran before, if any.
+///
+/// A Codex launched without a thread to resume makes one only once it
+/// runs, after its launch was recorded, so no launch can name it. Its
+/// rollout records the workspace it started in as its `cwd`, and the
+/// workspace is the job's own (`paths::job_root`), so the newest thread
+/// with that `cwd` is the job's; it is recorded here, as a launch that
+/// named it would have been. Without it, a suspend would carry the
+/// workspace and leave the conversation behind, or carry the state of the
+/// harness the job ran before it switched to Codex.
+fn job_session(job: &Job, root: &Path, home: &Path) -> Result<Option<SessionRecord>, NodeError> {
+    let recorded = job.session()?;
+    let harness = job.harness();
+    if *harness != HarnessKind::Codex
+        || recorded
+            .as_ref()
+            .is_some_and(|record| record.harness == *harness)
+    {
+        return Ok(recorded);
+    }
+    let env = HarnessEnv::new(home, OsString::new(), HarnessConfig::default())?;
+    let Some(thread) = Codex::new(env.home, env.path_var).latest_session(root)? else {
+        return Ok(recorded);
+    };
+    let record = SessionRecord {
+        harness: HarnessKind::Codex,
+        session: thread,
+    };
+    local::write(&job.dir().session(), &record)?;
+    Ok(Some(record))
+}
+
 /// What to launch for `job` on its owner.
 ///
 /// The workspace is marked live before the plan leaves the node: from here
@@ -2265,7 +2300,7 @@ fn plan(
         epoch,
     })?;
     let harness = harness.unwrap_or_else(|| job.harness().clone());
-    let session = match job.session()? {
+    let session = match job_session(job, &root, home)? {
         Some(record) if record.harness == harness => {
             out.say(format!("continuing {harness} session {}", record.session));
             Some(record.session)
@@ -2694,6 +2729,109 @@ pub(crate) mod tests {
             &mut Out::default(),
         )
         .await
+    }
+
+    /// A `PATH` whose `codex` reports a version that takes the thread
+    /// writer lock, so a capture never waits on a real `codex` running here.
+    fn locking_codex(dir: &Path) -> OsString {
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let status = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                r#"printf '#!/bin/sh\necho codex-cli 0.155.1\n' > "$1/codex" && chmod 755 "$1/codex""#,
+                "sh",
+            ])
+            .arg(&bin)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap()
+    }
+
+    /// Writes the rollout a Codex started in the job's workspace makes, and
+    /// returns its thread.
+    fn codex_thread_in(node: &Node, id: JobId) -> SessionId {
+        let root = std::fs::canonicalize(paths::job_root(&node.cfg.home, id)).unwrap();
+        let thread = "019f233e-bb33-7342-85fa-f2d33b14368a";
+        let day = node.cfg.home.join(".codex/sessions/2026/10/22");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(
+            day.join(format!("rollout-2026-10-22T10-00-00-{thread}.jsonl")),
+            format!(
+                "{{\"timestamp\":\"2026-10-22T10:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread}\",\"timestamp\":\"2026-10-22T10:00:00.000Z\",\"cwd\":\"{}\",\"originator\":\"codex_cli_rs\",\"cli_version\":\"0.155.1\"}}}}\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        SessionId::parse(thread).unwrap()
+    }
+
+    /// The session the job records and the one its last capture holds.
+    async fn recorded_and_captured(node: &Node, id: JobId) -> (Option<SessionRecord>, SessionId) {
+        let job = node.job(id).await.unwrap();
+        let job = job.lock().await;
+        let state = StateManifest::read(&job.dir().harness_state()).unwrap();
+        (job.session().unwrap(), state.session().clone())
+    }
+
+    /// A Codex started with no thread to resume makes its thread only once
+    /// it runs, so its launch records no session. The suspend takes the
+    /// thread the job's workspace holds, records it and captures it, so the
+    /// conversation travels with the workspace.
+    #[tokio::test]
+    async fn a_suspend_captures_the_thread_a_fresh_codex_started() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = locking_codex(dir.path());
+        let out = &mut Out::default();
+        node.suspend(id, &path, out).await.unwrap();
+        node.job_run(id, out).await.unwrap();
+        let mut harness = sleeper();
+        register(&node, id, pid(&harness)).await.unwrap();
+        let thread = codex_thread_in(&node, id);
+        harness.kill().unwrap();
+        harness.wait().unwrap();
+        node.harness_exited(id, pid(&harness)).await.unwrap();
+
+        node.suspend(id, &path, out).await.unwrap();
+        let record = SessionRecord {
+            harness: HarnessKind::Codex,
+            session: thread.clone(),
+        };
+        assert_eq!(
+            recorded_and_captured(&node, id).await,
+            (Some(record), thread)
+        );
+    }
+
+    /// A job that switched from Claude to Codex still records the Claude
+    /// session; the suspend carries the Codex thread, the conversation the
+    /// job's harness now holds, not the other harness's state.
+    #[tokio::test]
+    async fn a_suspend_after_a_switch_to_codex_captures_the_codex_thread() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = locking_codex(dir.path());
+        local::write(
+            &node.cfg.state.job(id).session(),
+            &SessionRecord {
+                harness: HarnessKind::ClaudeCode,
+                session: SessionId::parse("9c9796f0-2682-4546-a963-d314b3ad543f").unwrap(),
+            },
+        )
+        .unwrap();
+        let thread = codex_thread_in(&node, id);
+
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let record = SessionRecord {
+            harness: HarnessKind::Codex,
+            session: thread.clone(),
+        };
+        assert_eq!(
+            recorded_and_captured(&node, id).await,
+            (Some(record), thread)
+        );
     }
 
     /// Serves `a` and `b` and pairs them, each with the other's address.
