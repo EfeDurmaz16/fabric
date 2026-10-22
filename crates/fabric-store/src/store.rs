@@ -5,14 +5,16 @@
 //! before it deletes the file, and `check` can prove the rule holds. Exactly
 //! one process holds a store open at a time (ADR 0014, One writer).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use fabric_core::id::{ChunkId, SnapshotId};
+use fabric_core::env::{EnvSpec, EnvSpecError};
+use fabric_core::id::{ChunkId, EnvSpecId, SnapshotId};
+use fabric_core::path::RelPath;
 use fabric_core::snapshot::{EntryKind, MAX_MANIFEST_LEN, ManifestError, SnapshotManifest};
 
 use crate::catalog::{Catalog, CatalogError, ChunkRef, Role, SnapshotRow};
@@ -52,6 +54,9 @@ pub enum StoreError {
     /// The manifest does not validate or encode.
     #[error(transparent)]
     Manifest(#[from] ManifestError),
+    /// An environment spec does not validate, encode or decode.
+    #[error(transparent)]
+    EnvSpec(#[from] EnvSpecError),
     /// A manifest names an object that is not in the store.
     #[error("manifest names object {chunk}, which is not in the store")]
     MissingChunk {
@@ -82,12 +87,34 @@ pub enum StoreError {
         /// The base the manifest names.
         base: SnapshotId,
     },
+    /// A manifest's bundle base has no git state, or one in another object format, so its bundle cannot come first in the chain.
+    #[error("bundle base {base} has no git state in the object format of the snapshot")]
+    IncompatibleBundleBase {
+        /// The base the manifest names.
+        base: SnapshotId,
+    },
+    /// A file entry's objects do not add up to the size it records, so no restore could write it.
+    #[error("{path}: the objects hold {held} bytes but the entry records {size}")]
+    SizeMismatch {
+        /// The entry's path.
+        path: RelPath,
+        /// The size the entry records.
+        size: u64,
+        /// The bytes its objects decompress to.
+        held: u64,
+    },
     /// A later snapshot's bundle still needs the snapshot's refs.
     #[error("snapshot {base} is the bundle base of a later snapshot")]
     BaseInUse {
         /// The snapshot that cannot be forgotten yet.
         base: SnapshotId,
     },
+}
+
+/// The object that holds a spec's bytes: an `EnvSpecId` and a `ChunkId`
+/// are both blake3 of the same bytes, so the ids are equal.
+fn spec_object(id: EnvSpecId) -> ChunkId {
+    ChunkId::from_bytes(id.to_bytes())
 }
 
 fn io_err(path: &Path, source: io::Error) -> StoreError {
@@ -143,6 +170,11 @@ pub struct CheckReport {
     pub refcount_mismatches: Vec<ChunkId>,
     /// Snapshots whose bundle base is not in the catalog, with that base.
     pub broken_chains: Vec<(SnapshotId, SnapshotId)>,
+    /// Snapshots whose objects are whole but whose manifest does not assemble
+    /// to its id and recorded length, does not decode, names other data
+    /// objects than the catalog rows, or has another job, parent, bundle
+    /// base or creation time than its catalog row; checked at `Hashes` depth only.
+    pub bad_manifests: Vec<SnapshotId>,
 }
 
 impl CheckReport {
@@ -153,6 +185,7 @@ impl CheckReport {
             && self.corrupt.is_empty()
             && self.refcount_mismatches.is_empty()
             && self.broken_chains.is_empty()
+            && self.bad_manifests.is_empty()
     }
 }
 
@@ -242,10 +275,12 @@ impl Store {
         &self.objects
     }
 
-    /// Every object a manifest reaches, in list order, bundle and exclude first.
+    /// Every object a manifest reaches, in list order, bundle and exclude
+    /// first, and the environment spec it names last.
     ///
     /// A node that fetches a snapshot from a peer asks for exactly these,
-    /// then publishes the manifest; publish refuses while one is missing.
+    /// then publishes the manifest; publish refuses while one is missing,
+    /// and gc keeps them while the snapshot is kept.
     #[must_use]
     pub fn data_chunks(manifest: &SnapshotManifest) -> Vec<ChunkId> {
         let mut ids = Vec::new();
@@ -264,7 +299,24 @@ impl Store {
                 ids.extend(chunks.iter().copied());
             }
         }
+        if let Some(spec) = manifest.env_spec {
+            ids.push(spec_object(spec));
+        }
         ids
+    }
+
+    /// Stores the canonical bytes of `spec` as one object and returns the
+    /// spec's id, which a manifest names in `env_spec`.
+    pub fn put_env_spec(&self, spec: &EnvSpec) -> Result<EnvSpecId, StoreError> {
+        let bytes = spec.encode()?;
+        self.objects.put(&bytes)?;
+        Ok(EnvSpecId::of(&bytes))
+    }
+
+    /// Reads the environment spec stored under `id`.
+    pub fn env_spec(&self, id: EnvSpecId) -> Result<EnvSpec, StoreError> {
+        let bytes = self.objects.read(spec_object(id))?;
+        Ok(EnvSpec::decode(&bytes)?)
     }
 
     /// Makes a manifest a published snapshot and returns its id.
@@ -274,17 +326,29 @@ impl Store {
     /// flushed, and only then does the catalog get the rows. Publishing a
     /// manifest the store already has returns its id and changes nothing. A
     /// manifest above `MAX_MANIFEST_LEN` is refused, since it could never be
-    /// read back.
+    /// read back. A bundle base must be in the store and hold git state in
+    /// the manifest's object format: restore unpacks the base's bundles into
+    /// a repository of that format before this one's.
     pub fn publish(&mut self, manifest: &SnapshotManifest) -> Result<SnapshotId, StoreError> {
         let bytes = encode_manifest(manifest)?;
         let id = SnapshotId::of(&bytes);
         if self.catalog.snapshot(id)?.is_some() {
             return Ok(id);
         }
-        if let Some(base) = manifest.git.as_ref().and_then(|g| g.bundle_base)
-            && self.catalog.snapshot(base)?.is_none()
+        if let Some(git) = &manifest.git
+            && let Some(base) = git.bundle_base
         {
-            return Err(StoreError::MissingBundleBase { base });
+            if self.catalog.snapshot(base)?.is_none() {
+                return Err(StoreError::MissingBundleBase { base });
+            }
+            let sha256 = git.index_commit.is_sha256();
+            let compatible = self
+                .manifest(base)?
+                .git
+                .is_some_and(|b| b.index_commit.is_sha256() == sha256);
+            if !compatible {
+                return Err(StoreError::IncompatibleBundleBase { base });
+            }
         }
         let mut data = Vec::new();
         for chunk in Self::data_chunks(manifest) {
@@ -301,6 +365,7 @@ impl Store {
                 stored_len,
             });
         }
+        self.check_sizes(manifest)?;
         let stored = self.objects.put_bytes(&bytes)?;
         let mut manifest_refs = Vec::with_capacity(stored.chunks.len());
         for chunk in stored.chunks {
@@ -328,6 +393,42 @@ impl Store {
         checkpoint::reached("publish.after_commit");
         tracing::info!(snapshot = %id, objects = data.len(), "published");
         Ok(id)
+    }
+
+    /// Refuses a file entry whose objects do not decompress to the size it records.
+    ///
+    /// Restore checks the same sum after it writes the file; a snapshot that
+    /// fails it would publish and never restore.
+    fn check_sizes(&self, manifest: &SnapshotManifest) -> Result<(), StoreError> {
+        let mut lens: HashMap<ChunkId, u64> = HashMap::new();
+        for entry in manifest
+            .files
+            .iter()
+            .chain(manifest.harness_state.entries.iter())
+        {
+            let EntryKind::File { size, chunks } = &entry.kind else {
+                continue;
+            };
+            let mut held = 0u64;
+            for chunk in chunks {
+                let len = if let Some(len) = lens.get(chunk) {
+                    *len
+                } else {
+                    let len = self.objects.content_len(*chunk)?;
+                    lens.insert(*chunk, len);
+                    len
+                };
+                held = held.saturating_add(len);
+            }
+            if held != *size {
+                return Err(StoreError::SizeMismatch {
+                    path: entry.rel_path.clone(),
+                    size: *size,
+                    held,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Makes an object on disk safe for a catalog row to name.
@@ -368,6 +469,11 @@ impl Store {
     }
 
     /// Assembles, verifies and decodes the manifest of a snapshot.
+    ///
+    /// Assembly stops at the recorded length: a catalog that lists more
+    /// manifest objects than that length holds is a mismatch, found before
+    /// the extra objects are read, so a damaged catalog never makes this
+    /// hold more than the recorded length and one object.
     pub fn manifest(&self, id: SnapshotId) -> Result<SnapshotManifest, StoreError> {
         let row = self.snapshot(id)?;
         let len = usize::try_from(row.manifest_len).unwrap_or(usize::MAX);
@@ -376,7 +482,14 @@ impl Store {
         }
         let mut bytes = Vec::with_capacity(len);
         for chunk in self.catalog.snapshot_chunks(id, Role::Manifest)? {
-            bytes.extend_from_slice(&self.objects.read(chunk.id)?);
+            if bytes.len() >= len {
+                return Err(StoreError::ManifestMismatch(id));
+            }
+            let part = self.objects.read(chunk.id)?;
+            if part.len() > len - bytes.len() {
+                return Err(StoreError::ManifestMismatch(id));
+            }
+            bytes.extend_from_slice(&part);
         }
         if bytes.len() as u64 != row.manifest_len || SnapshotId::of(&bytes) != id {
             return Err(StoreError::ManifestMismatch(id));
@@ -464,6 +577,7 @@ impl Store {
         let mut seen_ok: HashSet<ChunkId> = HashSet::new();
         for row in self.catalog.snapshots()? {
             report.snapshots += 1;
+            let damaged = report.missing.len() + report.corrupt.len();
             for role in [Role::Manifest, Role::Data] {
                 for chunk in self.catalog.snapshot_chunks(row.id, role)? {
                     if seen_ok.contains(&chunk.id) {
@@ -483,7 +597,35 @@ impl Store {
                     }
                 }
             }
+            let whole = report.missing.len() + report.corrupt.len() == damaged;
+            if depth == CheckDepth::Hashes && whole && !self.manifest_agrees(&row)? {
+                report.bad_manifests.push(row.id);
+            }
         }
         Ok(report)
+    }
+
+    /// Says whether a snapshot's manifest assembles, decodes, names the data rows the catalog holds and matches its row.
+    ///
+    /// `forget` and gc trust the row's bundle base; a row that lost it
+    /// would let the base of a live chain be forgotten.
+    fn manifest_agrees(&self, row: &SnapshotRow) -> Result<bool, StoreError> {
+        let id = row.id;
+        let manifest = match self.manifest(id) {
+            Ok(manifest) => manifest,
+            Err(StoreError::ManifestMismatch(_) | StoreError::Manifest(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let rows: Vec<ChunkId> = self
+            .catalog
+            .snapshot_chunks(id, Role::Data)?
+            .iter()
+            .map(|chunk| chunk.id)
+            .collect();
+        let same_row = row.job_id == manifest.job_id
+            && row.parent == manifest.parent
+            && row.bundle_base == manifest.git.as_ref().and_then(|g| g.bundle_base)
+            && row.created_at == manifest.created_at;
+        Ok(same_row && rows == Self::data_chunks(&manifest))
     }
 }

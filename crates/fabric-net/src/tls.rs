@@ -68,6 +68,9 @@ pub enum TlsError {
     /// The peer's handshake signature was not made with the key its certificate names.
     #[error("the handshake signature does not match the certificate key")]
     BadSignature,
+    /// The handshake ended without both sides agreeing on `ALPN`, so the peer may frame bytes another way.
+    #[error("the peer did not agree on the fabric/1 protocol")]
+    NoAlpn,
     /// rustls refused the configuration.
     #[error("tls configuration: {0}")]
     Config(#[source] rustls::Error),
@@ -111,6 +114,19 @@ pub(crate) fn node_id_of(cert: &CertificateDer<'_>) -> Result<NodeId, TlsError> 
     }
     let key: [u8; 32] = key.try_into().map_err(|_| TlsError::NotEd25519)?;
     Ok(NodeId::from_bytes(key))
+}
+
+/// Refuses a finished handshake that did not select `ALPN`.
+///
+/// QUIC refuses this inside rustls. Over TCP, TLS lets a client that
+/// offers no ALPN finish its handshake, so the TCP wire checks here on
+/// both sides before any multiplexer frame is read or written.
+pub(crate) fn check_alpn(selected: Option<&[u8]>) -> Result<(), TlsError> {
+    if selected == Some(ALPN) {
+        Ok(())
+    } else {
+        Err(TlsError::NoAlpn)
+    }
 }
 
 /// Reads the node id of the first certificate in a peer's chain.

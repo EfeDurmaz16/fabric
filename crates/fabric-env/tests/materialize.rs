@@ -9,15 +9,17 @@
 
 use std::error::Error;
 use std::fs;
-use std::io;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::io::{self, Write};
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use fabric_core::env::{EnvVarName, RunWhen};
+use fabric_core::path::RelPath;
 use fabric_env::detect::{Detection, detect};
 use fabric_env::materialize::{
-    CacheHealth, MaterializeError, NodeEnv, Plan, SENTINEL, TreeLock, plan,
+    CacheHealth, MaterializeError, NodeEnv, Plan, SENTINEL, TreeLock, plan, sentinel_text,
 };
 use tempfile::TempDir;
 
@@ -68,6 +70,35 @@ fn write(root: &Path, files: Files) -> io::Result<()> {
     Ok(())
 }
 
+/// Writes `text` to `path` with mode `0755` through a short `sh`, so this
+/// process never holds the file open for writing. Linux refuses to run a
+/// file open for writing (`ETXTBSY`), and a child another test forked
+/// while this process held it open would keep it open until that child
+/// ran its own program. A temporary file renamed into place would not
+/// help: the descriptor follows the file.
+fn write_executable(path: &Path, text: &str) -> io::Result<()> {
+    let mut writer = Command::new("/bin/sh")
+        .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()?;
+    // The pipe closes at the end of the statement, so `cat` sees the end.
+    writer
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("no pipe to the writer"))?
+        .write_all(text.as_bytes())?;
+    let status = writer.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "writing {} failed: {status}",
+            path.display()
+        )))
+    }
+}
+
 /// Takes the tree's lock in this test binary's own lock directory, as resume does before restore.
 fn take_lock(root: &Path) -> TestResult<TreeLock> {
     Ok(TreeLock::acquire(
@@ -80,6 +111,13 @@ fn take_lock(root: &Path) -> TestResult<TreeLock> {
 fn dry_run(detected: &Detection) -> TestResult<Plan> {
     let lock = take_lock(detected.root())?;
     Ok(plan(detected, &lock, &NodeEnv::current())?)
+}
+
+/// Writes the sentinel a finished install leaves in `cache`, for the files the workspace has now.
+fn seal(detected: &Detection, cache: &str) -> TestResult<()> {
+    let text = sentinel_text(detected, &RelPath::parse(cache)?).ok_or("no step fills the cache")?;
+    fs::write(detected.root().join(cache).join(SENTINEL), text)?;
+    Ok(())
 }
 
 /// Writes `override_toml` as the workspace's `.fabric/env.toml` and detects.
@@ -111,19 +149,33 @@ fn a_fresh_pnpm_workspace_plans_its_install_and_the_dry_run_changes_nothing() {
 fn a_finished_install_runs_nothing() {
     let dir = copy_fixture("node-pnpm").unwrap();
     let lock = take_lock(dir.path()).unwrap();
-    write(
-        dir.path(),
-        &[
-            ("node_modules/.fabric-installed", ""),
-            ("node_modules/a/package.json", "{}"),
-        ],
-    )
-    .unwrap();
+    write(dir.path(), &[("node_modules/a/package.json", "{}")]).unwrap();
     let detected = detect(dir.path(), &[]).unwrap();
+    seal(&detected, "node_modules").unwrap();
     let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
     assert_eq!(planned.caches()[0].health, CacheHealth::Healthy);
     assert!(planned.is_noop());
     assert!(planned.ready().unwrap().execute(&lock).is_ok());
+}
+
+/// A declared variable is the job's, not only its setup's: a warm resume
+/// that runs no step refuses without it, as a cold one does.
+#[test]
+fn a_plan_with_no_steps_still_needs_the_declared_variables() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
+    let unset = "FABRIC_TEST_UNSET_FOR_A_NOOP_PLAN";
+    let detected = declared(dir.path(), &format!("env = [\"{unset}\"]\nsetup = []\n")).unwrap();
+    let planned = plan(&detected, &lock, &NodeEnv::new(None, Vec::new())).unwrap();
+    assert!(planned.is_noop());
+    match planned.ready() {
+        Err(MaterializeError::CannotRun { programs, env }) => {
+            assert!(programs.is_empty());
+            assert_eq!(env.len(), 1);
+            assert_eq!(env[0].as_str(), unset);
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 /// npm, pnpm and Yarn 1 write their own marker before the root package's
@@ -141,12 +193,11 @@ fn an_installer_marker_left_by_a_failed_install_is_not_proof() {
     .unwrap();
     let bin = tempfile::tempdir().unwrap();
     let npm = bin.path().join("npm");
-    fs::write(
+    write_executable(
         &npm,
         "#!/bin/sh\nmkdir -p node_modules/a && echo {} > node_modules/.package-lock.json && [ -e postinstall-ok ]\n",
     )
     .unwrap();
-    fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).unwrap();
     let node = NodeEnv::new(Some(bin.path().as_os_str().to_owned()), Vec::new());
     let resume = || plan(&detect(dir.path(), &[]).unwrap(), &lock, &node).unwrap();
 
@@ -164,17 +215,60 @@ fn an_installer_marker_left_by_a_failed_install_is_not_proof() {
     assert!(resume().is_noop());
 }
 
+/// The spec holds the install command, not the lockfile, so a lockfile
+/// changed since the install, by a pull or on the node a cache was carried
+/// from, leaves the spec as it was. The sentinel records the files the
+/// install read, so the next resume installs again instead of launching
+/// over packages the lockfile no longer names.
+#[test]
+fn a_lockfile_changed_since_the_install_installs_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
+    write(
+        dir.path(),
+        &[
+            ("package.json", PACKAGE_JSON),
+            ("package-lock.json", r#"{"lockfileVersion":3}"#),
+        ],
+    )
+    .unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    write_executable(
+        &bin.path().join("npm"),
+        "#!/bin/sh\nmkdir -p node_modules/a && echo {} > node_modules/a/package.json\n",
+    )
+    .unwrap();
+    let node = NodeEnv::new(Some(bin.path().as_os_str().to_owned()), Vec::new());
+    let resume = || plan(&detect(dir.path(), &[]).unwrap(), &lock, &node).unwrap();
+    resume().ready().unwrap().execute(&lock).unwrap();
+    assert!(resume().is_noop());
+
+    write(
+        dir.path(),
+        &[(
+            "package-lock.json",
+            r#"{"lockfileVersion":3,"packages":{"node_modules/b":{}}}"#,
+        )],
+    )
+    .unwrap();
+    let changed = resume();
+    assert_eq!(changed.caches()[0].health, CacheHealth::Stale);
+    assert_eq!(changed.steps().len(), 1);
+}
+
 /// One row per rule: a cache a step fills needs the sentinel, whatever
 /// else its installer left there; a cache no step fills needs content.
+/// A row whose cache is sealed has the sentinel a finished install leaves.
 #[test]
 fn health_follows_the_cache_kind() {
-    let cases: [(Files, CacheHealth); 9] = [
+    let cases: [(Files, Option<&str>, CacheHealth); 9] = [
         (
             &[
                 ("package.json", PACKAGE_JSON),
                 ("package-lock.json", ""),
                 ("node_modules/a/package.json", "{}"),
             ],
+            None,
             CacheHealth::Incomplete,
         ),
         (
@@ -182,8 +276,8 @@ fn health_follows_the_cache_kind() {
                 ("package.json", PACKAGE_JSON),
                 ("bun.lock", ""),
                 ("node_modules/a/package.json", "{}"),
-                ("node_modules/.fabric-installed", ""),
             ],
+            Some("node_modules"),
             CacheHealth::Healthy,
         ),
         // `uv venv` writes pyvenv.cfg before any package, so it proves nothing.
@@ -192,26 +286,30 @@ fn health_follows_the_cache_kind() {
                 ("requirements.txt", ""),
                 (".venv/pyvenv.cfg", "home = /x\n"),
             ],
+            None,
             CacheHealth::Incomplete,
         ),
         (
-            &[
-                ("uv.lock", ""),
-                (".venv/pyvenv.cfg", ""),
-                (".venv/.fabric-installed", ""),
-            ],
+            &[("uv.lock", ""), (".venv/pyvenv.cfg", "")],
+            Some(".venv"),
             CacheHealth::Healthy,
         ),
         (
             &[("Cargo.toml", ""), ("target/debug/x", "")],
+            None,
             CacheHealth::Healthy,
         ),
         (
             &[("Cargo.toml", ""), ("target", "")],
+            None,
             CacheHealth::NotADirectory,
         ),
-        (&[("Cargo.toml", "")], CacheHealth::Missing),
-        (&[("Cargo.toml", ""), ("target/", "")], CacheHealth::Empty),
+        (&[("Cargo.toml", "")], None, CacheHealth::Missing),
+        (
+            &[("Cargo.toml", ""), ("target/", "")],
+            None,
+            CacheHealth::Empty,
+        ),
         // A declared cache that no step fills is whole when it has content.
         (
             &[
@@ -221,13 +319,18 @@ fn health_follows_the_cache_kind() {
                 ),
                 ("out/x", ""),
             ],
+            None,
             CacheHealth::Healthy,
         ),
     ];
-    for (files, health) in cases {
+    for (files, sealed, health) in cases {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), files).unwrap();
-        let planned = dry_run(&detect(dir.path(), &[]).unwrap()).unwrap();
+        let detected = detect(dir.path(), &[]).unwrap();
+        if let Some(cache) = sealed {
+            seal(&detected, cache).unwrap();
+        }
+        let planned = dry_run(&detected).unwrap();
         assert_eq!(planned.caches().len(), 1, "{files:?}");
         assert_eq!(planned.caches()[0].health, health, "{files:?}");
     }
@@ -240,35 +343,32 @@ fn a_declared_node_cache_is_proven_by_content_or_its_sentinel() {
     let warm_npm = [
         ("package.json", PACKAGE_JSON),
         ("package-lock.json", ""),
-        ("node_modules/.fabric-installed", ""),
+        ("node_modules/a/package.json", "{}"),
         (".output/index.js", ""),
     ];
     let cache = "[[cache]]\npath = \".output\"\nclass = \"build\"\necosystem = \"node\"\n";
     let with_step = format!("{cache}[[setup]]\nprogram = \"true\"\n");
-    let cases: [(&str, Option<&str>, CacheHealth); 3] = [
-        (cache, None, CacheHealth::Healthy),
-        (&with_step, None, CacheHealth::Incomplete),
-        (
-            &with_step,
-            Some(".output/.fabric-installed"),
-            CacheHealth::Healthy,
-        ),
+    let cases: [(&str, bool, CacheHealth); 3] = [
+        (cache, false, CacheHealth::Healthy),
+        (&with_step, false, CacheHealth::Incomplete),
+        (&with_step, true, CacheHealth::Healthy),
     ];
-    for (override_toml, sentinel, health) in cases {
+    for (override_toml, sealed, health) in cases {
         let dir = tempfile::tempdir().unwrap();
         let lock = take_lock(dir.path()).unwrap();
         write(dir.path(), &warm_npm).unwrap();
-        if let Some(sentinel) = sentinel {
-            write(dir.path(), &[(sentinel, "")]).unwrap();
-        }
         let detected = declared(dir.path(), override_toml).unwrap();
+        seal(&detected, "node_modules").unwrap();
+        if sealed {
+            seal(&detected, ".output").unwrap();
+        }
         let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
         let output = planned
             .caches()
             .iter()
             .find(|c| c.path.as_str() == ".output")
             .unwrap();
-        assert_eq!(output.health, health, "{override_toml} {sentinel:?}");
+        assert_eq!(output.health, health, "{override_toml} {sealed}");
     }
 }
 
@@ -573,6 +673,36 @@ fn a_report_without_caches_runs_its_steps_on_every_resume() {
     assert!(dir.path().join("ran").exists());
 }
 
+/// Go's module cache is per node and lies outside the workspace, so it is
+/// never carried, and a healthy `node_modules` beside it says nothing about
+/// it: on a node that never downloaded the modules, `go mod download` runs
+/// while the carried install does not.
+#[test]
+fn a_step_that_fills_a_cache_outside_the_workspace_runs_beside_a_warm_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
+    write(
+        dir.path(),
+        &[
+            ("package.json", PACKAGE_JSON),
+            ("package-lock.json", ""),
+            ("node_modules/a/package.json", "{}"),
+            ("go.mod", "module example.com/x\n\ngo 1.22.0\n"),
+        ],
+    )
+    .unwrap();
+    let detected = detect(dir.path(), &[]).unwrap();
+    seal(&detected, "node_modules").unwrap();
+    let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
+    assert_eq!(planned.caches()[0].health, CacheHealth::Healthy);
+    let programs: Vec<&str> = planned
+        .steps()
+        .iter()
+        .map(|s| s.step().program.as_str())
+        .collect();
+    assert_eq!(programs, ["go"]);
+}
+
 /// A missing `target` is a build away and says nothing about
 /// `node_modules`; reinstalling a whole carried tree because of it would
 /// throw away the carry on every resume. Only the fetch it gates runs.
@@ -585,12 +715,13 @@ fn a_missing_target_does_not_reinstall_a_whole_node_modules() {
         &[
             ("package.json", PACKAGE_JSON),
             ("package-lock.json", ""),
-            ("node_modules/.fabric-installed", ""),
+            ("node_modules/a/package.json", "{}"),
             ("Cargo.toml", ""),
         ],
     )
     .unwrap();
     let detected = detect(dir.path(), &[]).unwrap();
+    seal(&detected, "node_modules").unwrap();
     let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
     let programs: Vec<&str> = planned
         .steps()
@@ -613,18 +744,14 @@ fn a_missing_target_does_not_run_a_declared_install() {
             ("package.json", PACKAGE_JSON),
             ("package-lock.json", ""),
             ("node_modules/a/package.json", "{}"),
-            ("node_modules/.fabric-installed", ""),
             ("Cargo.toml", ""),
         ],
     )
     .unwrap();
     let override_toml = "[[setup]]\nprogram = \"npm\"\nargs = [\"ci\"]\n";
-    let planned = plan(
-        &declared(dir.path(), override_toml).unwrap(),
-        &lock,
-        &NodeEnv::current(),
-    )
-    .unwrap();
+    let detected = declared(dir.path(), override_toml).unwrap();
+    seal(&detected, "node_modules").unwrap();
+    let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
     assert!(planned.is_noop(), "{:?}", planned.steps());
 
     fs::remove_file(dir.path().join("node_modules").join(SENTINEL)).unwrap();
@@ -637,10 +764,11 @@ fn a_missing_target_does_not_run_a_declared_install() {
     assert_eq!(planned.steps().len(), 1);
 }
 
-/// A cache under a linked directory lies outside the workspace: it is never
-/// judged healthy, and its sentinel is neither written nor removed there.
+/// A cache under a linked directory lies outside the workspace. A step
+/// that fills it would follow the link, as `uv venv` does with a linked
+/// `.venv`, so the plan refuses and nothing beyond the link changes.
 #[test]
-fn a_cache_under_a_linked_directory_gets_no_sentinel() {
+fn a_step_never_fills_a_cache_through_a_link() {
     let outside = tempfile::tempdir().unwrap();
     write(outside.path(), &[("out/x", ""), ("kept/x", "")]).unwrap();
     write(outside.path(), &[("kept/.fabric-installed", "")]).unwrap();
@@ -659,22 +787,77 @@ path = "web/kept"
 class = "build"
 
 [[setup]]
-program = "true"
+program = "touch"
+args = ["web/out/ran"]
 "#,
     )
     .unwrap();
-    let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
-    assert!(
-        planned
-            .caches()
-            .iter()
-            .all(|c| c.health == CacheHealth::NotADirectory),
-        "{:?}",
-        planned.caches()
-    );
-    planned.ready().unwrap().execute(&lock).unwrap();
+    match plan(&detected, &lock, &NodeEnv::current()) {
+        Err(MaterializeError::CacheNotADirectory { path }) => {
+            assert_eq!(path.as_str(), "web/kept");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!outside.path().join("out/ran").exists());
     assert!(!outside.path().join("out").join(SENTINEL).exists());
     assert!(outside.path().join("kept").join(SENTINEL).exists());
+
+    symlink(outside.path().join("out"), dir.path().join(".venv")).unwrap();
+    fs::remove_dir_all(dir.path().join(".fabric")).unwrap();
+    fs::remove_file(dir.path().join("web")).unwrap();
+    write(dir.path(), &[("requirements.txt", "")]).unwrap();
+    let detected = detect(dir.path(), &[]).unwrap();
+    assert!(matches!(
+        plan(&detected, &lock, &NodeEnv::current()),
+        Err(MaterializeError::CacheNotADirectory { .. })
+    ));
+}
+
+/// The sentinel's name is Fabric's; a directory there must not stop every
+/// resume at the removal before the step.
+#[test]
+fn a_directory_at_the_sentinel_name_is_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
+    write(
+        dir.path(),
+        &[("out/x", ""), ("out/.fabric-installed/inner", "")],
+    )
+    .unwrap();
+    let detected = declared(
+        dir.path(),
+        "[[cache]]\npath = \"out\"\nclass = \"build\"\n\n[[setup]]\nprogram = \"true\"\n",
+    )
+    .unwrap();
+    let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
+    assert_eq!(planned.caches()[0].health, CacheHealth::Incomplete);
+    planned.ready().unwrap().execute(&lock).unwrap();
+    let sentinel = fs::symlink_metadata(dir.path().join("out").join(SENTINEL)).unwrap();
+    assert!(sentinel.is_file());
+}
+
+/// A lock file that is a link would lock whatever it names, such as a
+/// workspace file a restore can replace with a new inode, and a second
+/// resume would then take a second lock.
+#[test]
+fn a_lock_file_that_is_a_link_is_refused() {
+    let locks = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), &[("held", "")]).unwrap();
+    let first = TreeLock::acquire(locks.path(), dir.path()).unwrap();
+    drop(first);
+    let entry = fs::read_dir(locks.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::remove_file(&entry).unwrap();
+    symlink(dir.path().join("held"), &entry).unwrap();
+    assert!(matches!(
+        TreeLock::acquire(locks.path(), dir.path()),
+        Err(MaterializeError::LockNotRegular { .. })
+    ));
 }
 
 /// A lock directory inside the workspace is one the workspace can delete,
@@ -715,10 +898,11 @@ fn a_lock_for_another_tree_does_not_plan_or_run_this_one() {
 }
 
 /// A step that leaves the sentinel itself, as one that unpacks an archive
-/// of a whole cache does, succeeds; a link it leaves there is replaced by
-/// a real sentinel and never followed.
+/// of a whole cache does, succeeds, and the sentinel is written again for
+/// the files this run read; a link it leaves there is replaced by a real
+/// sentinel and never followed.
 #[test]
-fn a_sentinel_the_steps_left_is_kept_and_a_link_there_is_replaced() {
+fn a_sentinel_the_steps_left_is_written_again_and_a_link_there_is_replaced() {
     let outside = tempfile::tempdir().unwrap();
     fs::write(outside.path().join("target"), "outside").unwrap();
     let dir = tempfile::tempdir().unwrap();

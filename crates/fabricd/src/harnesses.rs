@@ -14,11 +14,11 @@ use std::path::{Path, PathBuf};
 
 use fabric_core::harness::{HarnessKind, ProgramName};
 use fabric_core::path::{AbsPath, PathError};
-use fabric_harness::Harness;
 use fabric_harness::acp::AcpHarness;
 use fabric_harness::claude::ClaudeCode;
 use fabric_harness::codex::Codex;
-use serde::Deserialize;
+use fabric_harness::{Harness, HarnessVersion};
+use serde::{Deserialize, Serialize};
 
 /// Why a harness could not be named or configured.
 #[derive(Debug, thiserror::Error)]
@@ -60,7 +60,24 @@ pub enum HarnessConfigError {
         /// What is wrong with it.
         reason: PathError,
     },
+    /// An ACP state directory in `harness.toml` is longer than any path the system opens.
+    #[error(
+        "{path}: the state_dir of [acp.{program}] is {len} bytes, past the {MAX_STATE_DIR_LEN} a path may have"
+    )]
+    StateDirTooLong {
+        /// The file.
+        path: PathBuf,
+        /// The agent whose entry it is.
+        program: String,
+        /// Its length in bytes.
+        len: usize,
+    },
 }
+
+/// The longest `state_dir` `harness.toml` may give an agent: `PATH_MAX` on
+/// Linux, four times macOS's. A run plan carries the entry it launches with,
+/// so this bound keeps every plan within one control message.
+pub const MAX_STATE_DIR_LEN: usize = 4096;
 
 fn abs_path(path: &Path) -> Result<AbsPath, HarnessConfigError> {
     let text = path
@@ -85,16 +102,30 @@ pub fn parse_harness(text: &str) -> Result<HarnessKind, HarnessConfigError> {
             let program = words
                 .next()
                 .ok_or_else(|| HarnessConfigError::Unknown(text.to_owned()))?;
-            Ok(HarnessKind::Acp {
+            let kind = HarnessKind::Acp {
                 program: ProgramName::parse(program)?,
                 args: words.map(str::to_owned).collect(),
-            })
+            };
+            refuse_secret_kind(&kind)?;
+            Ok(kind)
         }
     }
 }
 
+/// Refuses a harness kind whose ACP arguments hold a secret shape.
+///
+/// The kind is written into ledger records that travel to every peer and
+/// are never redacted, so the daemon checks every kind a request names
+/// before it records one, not only at capture.
+pub fn refuse_secret_kind(kind: &HarnessKind) -> Result<(), HarnessConfigError> {
+    if let HarnessKind::Acp { program, args } = kind {
+        fabric_harness::acp::refuse_secret_args(program, args)?;
+    }
+    Ok(())
+}
+
 /// One ACP agent's settings in `harness.toml`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcpConfig {
     /// Where the agent keeps its sessions; relative paths are under the home.
@@ -103,11 +134,15 @@ pub struct AcpConfig {
 
 /// The node's `harness.toml`: settings an adapter cannot discover.
 ///
+/// The daemon reads it once at start and hands its copy to the CLI in
+/// every run plan, so the harness a CLI launches is configured as the one
+/// the daemon captures and restores, even when the file changed since.
+///
 /// ```toml
 /// [acp.opencode]
 /// state_dir = ".local/share/opencode/sessions"
 /// ```
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessConfig {
     /// ACP agents by program name.
@@ -116,7 +151,28 @@ pub struct HarnessConfig {
 }
 
 impl HarnessConfig {
+    /// The part of this configuration `kind` is built from: the entry of its
+    /// ACP program, or nothing. A run plan carries only this, so its size
+    /// does not grow with the agents the file configures.
+    #[must_use]
+    pub fn for_harness(&self, kind: &HarnessKind) -> HarnessConfig {
+        let acp = match kind {
+            HarnessKind::Acp { program, .. } => self
+                .acp
+                .get(program.as_str())
+                .map(|config| (program.as_str().to_owned(), config.clone()))
+                .into_iter()
+                .collect(),
+            HarnessKind::ClaudeCode | HarnessKind::Codex => BTreeMap::new(),
+        };
+        HarnessConfig { acp }
+    }
+
     /// Reads `path`; a missing file is the empty configuration.
+    ///
+    /// A `state_dir` past `MAX_STATE_DIR_LEN` is refused here, at start: a
+    /// run plan carries it, and a plan past the control message cap would
+    /// fail every run of that agent as a broken socket.
     pub fn load(path: &Path) -> Result<Self, HarnessConfigError> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
@@ -128,10 +184,21 @@ impl HarnessConfig {
                 });
             }
         };
-        toml::from_str(&text).map_err(|e| HarnessConfigError::Parse {
+        let config: Self = toml::from_str(&text).map_err(|e| HarnessConfigError::Parse {
             path: path.to_owned(),
             reason: e.to_string(),
-        })
+        })?;
+        for (program, entry) in &config.acp {
+            let len = entry.state_dir.as_os_str().len();
+            if len > MAX_STATE_DIR_LEN {
+                return Err(HarnessConfigError::StateDirTooLong {
+                    path: path.to_owned(),
+                    program: program.clone(),
+                    len,
+                });
+            }
+        }
+        Ok(config)
     }
 }
 
@@ -161,16 +228,23 @@ impl HarnessEnv {
     }
 }
 
-/// Builds the adapter for `kind` on this node.
+/// Builds the adapter for `kind` on this node. `known_writer` is the
+/// newest harness version known to have written the session the adapter
+/// will capture (`SessionRecord::known_writer`); only the Codex adapter
+/// takes it, because a Claude transcript records the version of every
+/// Claude that wrote a line and an ACP agent's state is opaque.
 pub fn adapter(
     kind: &HarnessKind,
     env: &HarnessEnv,
+    known_writer: Option<HarnessVersion>,
 ) -> Result<Box<dyn Harness>, HarnessConfigError> {
     Ok(match kind {
         HarnessKind::ClaudeCode => {
             Box::new(ClaudeCode::new(env.home.clone(), env.path_var.clone()))
         }
-        HarnessKind::Codex => Box::new(Codex::new(env.home.clone(), env.path_var.clone())),
+        HarnessKind::Codex => Box::new(
+            Codex::new(env.home.clone(), env.path_var.clone()).with_known_writer(known_writer),
+        ),
         HarnessKind::Acp { program, args } => Box::new(acp_adapter(program, args, env)?),
     })
 }
@@ -226,5 +300,24 @@ mod tests {
         );
         std::fs::write(&path, "[acp.opencode]\nstate = \"s\"\n").unwrap();
         assert!(HarnessConfig::load(&path).is_err());
+    }
+
+    /// A run plan carries the launched agent's entry whole, so an entry
+    /// with a `state_dir` of megabytes would make every run plan of that
+    /// agent too large to send. The file is refused when the node starts.
+    #[test]
+    fn a_state_dir_longer_than_a_path_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("harness.toml");
+        let long = "s".repeat(5 << 20);
+        std::fs::write(&path, format!("[acp.opencode]\nstate_dir = \"{long}\"\n")).unwrap();
+        let refused = HarnessConfig::load(&path);
+        assert!(
+            matches!(
+                refused,
+                Err(HarnessConfigError::StateDirTooLong { len, .. }) if len == long.len()
+            ),
+            "{refused:?}"
+        );
     }
 }

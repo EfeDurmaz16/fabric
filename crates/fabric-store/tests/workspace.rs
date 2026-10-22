@@ -15,11 +15,11 @@ use fabric_core::id::{JobId, NodeId, SnapshotId};
 use fabric_core::path::RelPath;
 use fabric_core::snapshot::{
     CacheClass, CacheEntry, CarryKey, CarryState, Entry, EntryKind, GitHead, LeaveReason,
-    LeftBehind, Mode, Remake,
+    LeftBehind, ManifestError, Mode, Remake,
 };
 use fabric_store::capture::{
-    BundleKind, BusyReason, CaptureError, CaptureRequest, Captured, MAX_BUNDLE_CHAIN,
-    UnmeasuredKeys, capture,
+    BundleKind, BusyReason, CaptureError, CaptureRequest, Captured, CarryKeys, IndexFlag,
+    MAX_BUNDLE_CHAIN, UnmeasuredKeys, capture,
 };
 use fabric_store::objects::ChunkParams;
 use fabric_store::policy::{IgnorePolicy, PolicyError, SECRET_PATTERNS};
@@ -248,6 +248,7 @@ fn git_state_survives_capture_and_restore() {
         paths,
         vec![
             "build.log",
+            "d",
             "node_modules",
             "node_modules/pkg",
             "node_modules/pkg/cert.pem",
@@ -280,8 +281,9 @@ fn git_state_survives_capture_and_restore() {
         },
     )
     .unwrap();
-    // Three ignored files plus the nine entries of W.
-    assert_eq!(restored.verified, 12);
+    assert_eq!(restored.ignored.files, 3);
+    // Three ignored files, two directories of theirs, one of W and the nine entries of W.
+    assert_eq!(restored.verified, 15);
     assert_eq!(restore_state(&target).unwrap(), RestoreState::Present);
 
     assert_eq!(git_difference(&root, &target).unwrap(), None);
@@ -310,20 +312,105 @@ fn git_state_survives_capture_and_restore() {
         fs::metadata(target.join("g")).unwrap().mode() & 0o777,
         0o755
     );
-    assert_eq!(
-        mtime_of(&target.join("node_modules/pkg/index.js")).unwrap(),
-        (1_600_000_000, 123_456_789)
-    );
-    assert_eq!(
-        mtime_of(&target.join("build.log")).unwrap(),
-        (1_650_000_000, 42)
-    );
-    assert_eq!(mtime_of(&target.join("d/b")).unwrap(), (1_655_000_000, 7));
+    for (path, mtime) in [
+        ("node_modules/pkg/index.js", (1_600_000_000, 123_456_789)),
+        ("build.log", (1_650_000_000, 42)),
+        ("d/b", (1_655_000_000, 7)),
+    ] {
+        assert_eq!(mtime_of(&target.join(path)).unwrap(), mtime, "{path}");
+    }
     assert_eq!(
         fs::read_to_string(target.join("new.txt")).unwrap(),
         "untracked\n"
     );
     assert!(store.check(CheckDepth::Hashes).unwrap().is_clean());
+}
+
+/// A directory of tracked files keeps its mode and mtime, which no git tree records.
+#[test]
+fn a_tracked_directory_keeps_its_mode_and_mtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    fs::create_dir_all(root.join("private/keys")).unwrap();
+    fs::write(root.join("private/keys/notes.txt"), "notes\n").unwrap();
+    let g = git(&root);
+    g.run(&["init", "-q", "-b", "main"]).unwrap();
+    g.run(&["add", "-A"]).unwrap();
+    g.run(&["commit", "-q", "-m", "one"]).unwrap();
+    fs::set_permissions(root.join("private"), fs::Permissions::from_mode(0o700)).unwrap();
+    set_mtime(&root.join("private/keys"), 1_500_000_000, 5).unwrap();
+
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    assert_eq!(
+        fs::metadata(target.join("private")).unwrap().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        mtime_of(&target.join("private/keys")).unwrap(),
+        (1_500_000_000, 5)
+    );
+    assert_eq!(git_difference(&root, &target).unwrap(), None);
+}
+
+/// An empty directory in a repository, untracked or ignored, travels like one in a plain directory.
+#[test]
+fn an_empty_directory_in_a_repository_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    fs::write(root.join(".gitignore"), "build/\n").unwrap();
+    for empty in ["logs", "build/cache", "deep/er/est"] {
+        fs::create_dir_all(root.join(empty)).unwrap();
+    }
+    set_mtime(&root.join("logs"), 1_500_000_000, 3).unwrap();
+
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    for empty in ["logs", "build/cache", "deep/er/est"] {
+        assert!(target.join(empty).is_dir(), "{empty}");
+        assert_eq!(
+            fs::read_dir(target.join(empty)).unwrap().count(),
+            0,
+            "{empty}"
+        );
+    }
+    assert_eq!(mtime_of(&target.join("logs")).unwrap(), (1_500_000_000, 3));
+}
+
+#[test]
+fn a_sha256_repository_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("a"), "a\n").unwrap();
+    let g = git(&root);
+    g.run(&["init", "-q", "-b", "main", "--object-format=sha256"])
+        .unwrap();
+    g.run(&["add", "-A"]).unwrap();
+    g.run(&["commit", "-q", "-m", "one"]).unwrap();
+    fs::write(root.join("a"), "a staged\n").unwrap();
+    g.run(&["add", "a"]).unwrap();
+    fs::write(root.join("a"), "a unstaged\n").unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    assert_eq!(
+        git_text(&target, &["rev-parse", "--show-object-format"]).unwrap(),
+        "sha256"
+    );
+    assert_eq!(git_difference(&root, &target).unwrap(), None);
 }
 
 #[test]
@@ -340,7 +427,7 @@ fn verify_sees_a_tampered_file_and_link_in_the_working_tree() {
 
     assert_eq!(
         verify(&store, snapshot, &target, Verify::All, &|_| true).unwrap(),
-        12
+        15
     );
     fs::write(target.join("new.txt"), "cut short").unwrap();
     assert!(matches!(
@@ -649,8 +736,21 @@ fn a_hostile_manifest_cannot_write_through_a_link_or_over_a_file() {
         mtime_ns: 0,
     };
 
+    // A path below a working-tree link is refused before it can publish.
     let mut through_link = manifest.clone();
     through_link.files = vec![entry("escape/evil")];
+    let err = store.publish(&through_link).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::Manifest(ManifestError::TreesNest { files, worktree })
+            if files.as_str() == "escape/evil" && worktree.as_str() == "escape"),
+        "{err}"
+    );
+    // Validation sees the working tree only through `worktree_mtimes`, which
+    // a peer can leave the link out of; the writer still refuses the path.
+    let git_state = through_link.git.as_mut().unwrap();
+    git_state
+        .worktree_mtimes
+        .retain(|(path, _)| path.as_str() != "escape");
     let id = store.publish(&through_link).unwrap();
     let target = dir.path().join("t1");
     let err = restore_into(&store, id, &target).unwrap_err();
@@ -665,12 +765,12 @@ fn a_hostile_manifest_cannot_write_through_a_link_or_over_a_file() {
     ));
     assert!(!target.exists());
 
+    // A path in both trees is refused before it can publish.
     let mut over_file = manifest.clone();
     over_file.files = vec![entry("tracked.txt")];
-    let id = store.publish(&over_file).unwrap();
-    let err = restore_into(&store, id, &dir.path().join("t2")).unwrap_err();
+    let err = store.publish(&over_file).unwrap_err();
     assert!(
-        matches!(err, RestoreError::Write(WriteError::Collision { .. })),
+        matches!(&err, StoreError::Manifest(ManifestError::InBothTrees { path }) if path.as_str() == "tracked.txt"),
         "{err}"
     );
 
@@ -834,6 +934,109 @@ fn unmerged_index_entries_are_refused() {
 }
 
 #[test]
+fn a_repository_git_cannot_read_is_an_error_not_a_plain_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    let config = root.join(".git/config");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str("[broken\n");
+    fs::write(&config, text).unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    assert!(matches!(err, CaptureError::Git(_)), "{err}");
+}
+
+#[test]
+fn a_shallow_clone_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = dir.path().join("upstream");
+    fs::create_dir(&upstream).unwrap();
+    let u = git(&upstream);
+    u.run(&["init", "-q", "-b", "main"]).unwrap();
+    for message in ["one", "two"] {
+        u.run(&["commit", "-q", "--allow-empty", "-m", message])
+            .unwrap();
+    }
+    let url = format!("file://{}", upstream.display());
+    git(dir.path())
+        .run(&["clone", "-q", "--depth", "1", &url, "work"])
+        .unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let root = dir.path().join("work");
+    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    assert!(matches!(err, CaptureError::GitShallow), "{err}");
+}
+
+#[test]
+fn an_intent_to_add_entry_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    make_repo(&root).unwrap();
+    git(&root).run(&["add", "-N", "new.txt"]).unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            CaptureError::GitIndexFlag { path, flag: IndexFlag::IntentToAdd }
+                if path.as_str() == "new.txt"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_sparse_checkout_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    make_repo(&root).unwrap();
+    let g = git(&root);
+    g.run(&["stash", "push", "-q", "--include-untracked"])
+        .unwrap();
+    g.run(&["sparse-checkout", "set", "--no-cone", "/a", "/d/"])
+        .unwrap();
+    assert!(!root.join("exec.sh").exists());
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            CaptureError::GitIndexFlag {
+                flag: IndexFlag::SkipWorktree,
+                ..
+            }
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_assume_unchanged_entry_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    make_repo(&root).unwrap();
+    git(&root)
+        .run(&["update-index", "--assume-unchanged", "d/b"])
+        .unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            CaptureError::GitIndexFlag { path, flag: IndexFlag::AssumeUnchanged }
+                if path.as_str() == "d/b"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
 fn an_lfs_filter_on_an_untracked_file_is_refused() {
     let fixture = BusyFixture::new().unwrap();
     // Set only in .git/info/attributes.
@@ -843,6 +1046,30 @@ fn an_lfs_filter_on_an_untracked_file_is_refused() {
     let err = fixture.capture_err().unwrap();
     assert!(
         matches!(&err, CaptureError::GitLfsUnsupported { path } if path.as_str() == "blob.bin"),
+        "{err}"
+    );
+}
+
+/// A clean filter puts what it makes of a file into `W`, and restore
+/// writes blobs with no smudge, so the target would hold the cleaned bytes:
+/// git-crypt's ciphertext where the agent had plaintext. An attribute
+/// whose driver is not configured changes nothing and is not refused.
+#[test]
+fn a_path_under_a_configured_clean_filter_is_refused() {
+    let fixture = BusyFixture::new().unwrap();
+    fs::write(fixture.root.join(".gitattributes"), "*.up filter=upper\n").unwrap();
+    fs::write(fixture.root.join("note.up"), "plain\n").unwrap();
+    assert!(fixture.capture_err().is_none());
+    git(&fixture.root)
+        .run(&["config", "filter.upper.clean", "tr a-z A-Z"])
+        .unwrap();
+    let err = fixture.capture_err().unwrap();
+    assert!(
+        matches!(
+            &err,
+            CaptureError::GitFilterUnsupported { path, filter }
+                if path.as_str() == "note.up" && filter == "upper"
+        ),
         "{err}"
     );
 }
@@ -929,6 +1156,26 @@ fn a_git_file_in_a_plain_directory_is_left_behind_and_named() {
 }
 
 #[test]
+fn an_mtime_before_1970_is_refused_not_rewritten() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("plain");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("old.txt"), "old\n").unwrap();
+    let half_second_before = UNIX_EPOCH - Duration::from_millis(500);
+    File::open(root.join("old.txt"))
+        .unwrap()
+        .set_modified(half_second_before)
+        .unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    assert!(
+        matches!(&err, CaptureError::MtimeBeforeEpoch { path } if path.as_str() == "old.txt"),
+        "{err}"
+    );
+}
+
+#[test]
 fn a_link_target_that_is_not_utf8_is_refused_not_rewritten() {
     use std::os::unix::ffi::OsStrExt;
     let dir = tempfile::tempdir().unwrap();
@@ -958,6 +1205,312 @@ fn plain_tree(root: &Path, state: &Path) -> Fallible {
     fs::write(state.join("sessions/s1/tool.txt"), "tool\n")?;
     fs::write(state.join("sessions/s1.jsonl"), "{}\n")?;
     Ok(())
+}
+
+/// Carry keys that write a file into the workspace the first time capture asks, after the listing.
+struct WritesLate<'a> {
+    file: &'a Path,
+}
+
+impl CarryKeys for WritesLate<'_> {
+    fn key(&self, _class: CacheClass, _path: &RelPath) -> CarryKey {
+        if !self.file.exists() {
+            // A failed write leaves nothing to find, and the test's assertion fails.
+            let _ = fs::write(self.file, "written after the listing\n");
+        }
+        CarryKey::Unmeasured
+    }
+
+    fn remake(&self, _class: CacheClass, _path: &RelPath) -> Remake {
+        Remake::Nothing
+    }
+}
+
+/// A file a still-running harness writes after its directory was listed fails the capture instead of being left out.
+#[test]
+fn a_file_added_after_the_listing_fails_the_capture() {
+    for repository in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::write(root.join("node_modules/pkg/index.js"), "1;\n").unwrap();
+        fs::write(root.join("a.txt"), "a\n").unwrap();
+        if repository {
+            fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+            let g = git(&root);
+            g.run(&["init", "-q", "-b", "main"]).unwrap();
+            g.run(&["add", "-A"]).unwrap();
+            g.run(&["commit", "-q", "-m", "one"]).unwrap();
+        }
+        let store = store_in(dir.path()).unwrap();
+        let policy = IgnorePolicy::default();
+        for late in ["late.txt", "node_modules/pkg/late.js"] {
+            let file = root.join(late);
+            let keys = WritesLate { file: &file };
+            let mut req = request(&root, &policy, None);
+            req.carry_keys = &keys;
+            let err = capture(&store, &req).unwrap_err();
+            assert!(
+                matches!(&err, CaptureError::WorkspaceChanged { path } if path.as_str() == late),
+                "repository {repository}: {err}"
+            );
+            fs::remove_file(&file).unwrap();
+        }
+    }
+}
+
+/// Carry keys that append a line to `file` the first time capture asks, after `W` was built.
+struct AppendsLate<'a> {
+    file: &'a Path,
+    done: std::cell::Cell<bool>,
+}
+
+impl CarryKeys for AppendsLate<'_> {
+    fn key(&self, _class: CacheClass, _path: &RelPath) -> CarryKey {
+        if !self.done.replace(true) {
+            // A failed write leaves the file as it was, and the test's assertion fails.
+            let _ = fs::OpenOptions::new()
+                .append(true)
+                .open(self.file)
+                .and_then(|mut file| std::io::Write::write_all(&mut file, b"written late\n"));
+        }
+        CarryKey::Unmeasured
+    }
+
+    fn remake(&self, _class: CacheClass, _path: &RelPath) -> Remake {
+        Remake::Nothing
+    }
+}
+
+/// A tracked file written after `W` was built and its mtimes were read
+/// fails the capture, instead of travelling with the bytes it had before.
+#[test]
+fn a_tracked_file_written_after_w_was_built_fails_the_capture() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+    fs::write(root.join("node_modules/pkg/index.js"), "1;\n").unwrap();
+    fs::write(root.join("a.txt"), "a\n").unwrap();
+    fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+    let g = git(&root);
+    g.run(&["init", "-q", "-b", "main"]).unwrap();
+    g.run(&["add", "-A"]).unwrap();
+    g.run(&["commit", "-q", "-m", "one"]).unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let file = root.join("a.txt");
+    let keys = AppendsLate {
+        file: &file,
+        done: std::cell::Cell::new(false),
+    };
+    let mut req = request(&root, &policy, None);
+    req.carry_keys = &keys;
+    let err = capture(&store, &req).unwrap_err();
+    assert!(
+        matches!(&err, CaptureError::WorkspaceChanged { path } if path.as_str() == "a.txt"),
+        "{err}"
+    );
+}
+
+/// A harness state directory that gains a file while capture stores it
+/// fails the capture, as a workspace does: a file the adapter wrote after
+/// the directory was listed would be missing from the snapshot. The
+/// directory here is the store's own `objects/`, which capture writes into
+/// as it stores each file it listed there.
+#[test]
+fn a_harness_file_added_after_the_listing_fails_the_capture() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("plain");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("a.txt"), "a\n").unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let objects = dir.path().join("store/objects");
+    let mut req = request(&root, &policy, None);
+    req.harness_state = Some(&objects);
+    let err = capture(&store, &req).unwrap_err();
+    assert!(
+        matches!(&err, CaptureError::WorkspaceChanged { .. }),
+        "{err}"
+    );
+}
+
+/// Carry keys that, the first time capture asks, append to `grows` and
+/// write `appears`, as a dev server writes and rotates its log.
+struct WritesAside<'a> {
+    grows: &'a Path,
+    appears: &'a Path,
+}
+
+impl CarryKeys for WritesAside<'_> {
+    fn key(&self, _class: CacheClass, _path: &RelPath) -> CarryKey {
+        if !self.appears.exists() {
+            // A failed write leaves nothing changed, and the test proves nothing.
+            let _ = fs::OpenOptions::new()
+                .append(true)
+                .open(self.grows)
+                .and_then(|mut file| std::io::Write::write_all(&mut file, b"one more line\n"));
+            let _ = fs::write(self.appears, "rotated\n");
+        }
+        CarryKey::Unmeasured
+    }
+
+    fn remake(&self, _class: CacheClass, _path: &RelPath) -> Remake {
+        Remake::Nothing
+    }
+}
+
+/// A file the snapshot never carries, here one `.fabricignore` excludes,
+/// may change or appear while capture runs, as a running dev server's log
+/// does, in the root or beside carried files: it is not in the snapshot
+/// either way, so the capture goes on. In a repository the log is listed
+/// as untracked, or, when git ignores it too as most repositories ignore
+/// `*.log`, with the ignored files.
+#[test]
+fn a_file_the_snapshot_leaves_out_may_change_while_capture_runs() {
+    for (repository, gitignored) in [(false, false), (true, false), (true, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::create_dir_all(root.join("logs")).unwrap();
+        fs::write(root.join("node_modules/pkg/index.js"), "1;\n").unwrap();
+        fs::write(root.join("logs/README"), "logs\n").unwrap();
+        fs::write(root.join(".fabricignore"), "*.log\n").unwrap();
+        if repository {
+            let ignore = if gitignored {
+                "node_modules/\n*.log\n"
+            } else {
+                "node_modules/\n"
+            };
+            fs::write(root.join(".gitignore"), ignore).unwrap();
+            let g = git(&root);
+            g.run(&["init", "-q", "-b", "main"]).unwrap();
+            g.run(&["add", "-A"]).unwrap();
+            g.run(&["commit", "-q", "-m", "one"]).unwrap();
+        }
+        fs::write(root.join("dev.log"), "started\n").unwrap();
+        let store = store_in(dir.path()).unwrap();
+        let mut policy = IgnorePolicy::default();
+        policy.load_fabricignore(&root).unwrap();
+        let (grows, appears) = (root.join("dev.log"), root.join("logs/dev.1.log"));
+        let keys = WritesAside {
+            grows: &grows,
+            appears: &appears,
+        };
+        let mut req = request(&root, &policy, None);
+        req.carry_keys = &keys;
+        let captured = capture(&store, &req);
+        assert!(
+            appears.exists(),
+            "repository {repository}, gitignored {gitignored}: nothing was written"
+        );
+        let Captured { manifest, .. } = captured
+            .unwrap_or_else(|e| panic!("repository {repository}, gitignored {gitignored}: {e}"));
+        assert!(
+            !manifest
+                .files
+                .iter()
+                .any(|e| matches!(e.rel_path.as_str(), "dev.log" | "logs/dev.1.log")),
+            "repository {repository}, gitignored {gitignored}"
+        );
+    }
+}
+
+/// git leaves a directory it cannot read out of its listings, with a
+/// warning, as a container's database volume owned by another user: the
+/// walk that finds empty directories leaves it out too and the report
+/// names it, instead of failing every capture of the repository.
+#[test]
+fn a_directory_capture_cannot_read_is_left_behind_and_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    fs::create_dir_all(root.join("pgdata")).unwrap();
+    fs::write(root.join("pgdata/PG_VERSION"), "17\n").unwrap();
+    fs::write(root.join("a.txt"), "a\n").unwrap();
+    fs::write(root.join(".gitignore"), "pgdata/\n").unwrap();
+    let g = git(&root);
+    g.run(&["init", "-q", "-b", "main"]).unwrap();
+    g.run(&["add", "-A"]).unwrap();
+    g.run(&["commit", "-q", "-m", "one"]).unwrap();
+    let pgdata = root.join("pgdata");
+    fs::set_permissions(&pgdata, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&pgdata).is_ok() {
+        // Run as root, which reads any directory: nothing to prove here.
+        fs::set_permissions(&pgdata, fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let captured = capture(&store, &request(&root, &policy, None));
+    fs::set_permissions(&pgdata, fs::Permissions::from_mode(0o755)).unwrap();
+    let Captured { report, .. } = captured.unwrap();
+    assert_eq!(report.unreadable, vec![RelPath::parse("pgdata").unwrap()]);
+}
+
+/// A cache git does not ignore, as a `node_modules` an agent installed
+/// before anyone wrote a `.gitignore`, travels in `W` as an ignored cache
+/// travels in the files: whole, with what only the full secret list names,
+/// such as a package's test key. Otherwise the target holds a cache with a
+/// hole that its sentinel calls whole. A secret the cache list names, and
+/// one outside any cache, still stay behind.
+#[test]
+fn a_cache_git_does_not_ignore_travels_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    fs::create_dir_all(root.join("node_modules/pkg/test")).unwrap();
+    fs::write(root.join("node_modules/pkg/index.js"), "1;\n").unwrap();
+    fs::write(root.join("node_modules/pkg/test/fixture.pem"), "fixture\n").unwrap();
+    fs::write(root.join("node_modules/pkg/.env"), "TOKEN=1\n").unwrap();
+    fs::write(root.join("server.pem"), "key\n").unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, report } = capture(&store, &request(&root, &policy, None)).unwrap();
+    assert_eq!(
+        report.denied_untracked,
+        vec![
+            RelPath::parse("node_modules/pkg/.env").unwrap(),
+            RelPath::parse("server.pem").unwrap(),
+        ]
+    );
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    assert_eq!(
+        fs::read_to_string(target.join("node_modules/pkg/test/fixture.pem")).unwrap(),
+        "fixture\n"
+    );
+    assert!(target.join("node_modules/pkg/index.js").is_file());
+    assert!(!target.join("node_modules/pkg/.env").exists());
+    assert!(!target.join("server.pem").exists());
+}
+
+/// A directory with a cache's name that holds a tracked file is the
+/// project's own, not a cache: an untracked key dropped beside the tracked
+/// file, as a signing key in an Electron app's `build`, is judged by the
+/// full secret list. It stays behind, the report names it, and it never
+/// becomes an object in the repository.
+#[test]
+fn an_untracked_key_beside_a_tracked_file_under_a_cache_name_stays_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    fs::create_dir_all(root.join("build")).unwrap();
+    fs::write(root.join("package.json"), "{}\n").unwrap();
+    fs::write(root.join("build/entitlements.plist"), "<plist/>\n").unwrap();
+    let g = git(&root);
+    g.run(&["init", "-q", "-b", "main"]).unwrap();
+    g.run(&["add", "-A"]).unwrap();
+    g.run(&["commit", "-q", "-m", "one"]).unwrap();
+    fs::write(root.join("build/developer-id.p12"), "key\n").unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { report, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    assert_eq!(
+        report.denied_untracked,
+        vec![RelPath::parse("build/developer-id.p12").unwrap()]
+    );
+    let objects = g.run_text(&["rev-list", "--objects", "--all"]).unwrap();
+    assert!(!objects.contains("developer-id.p12"), "{objects}");
 }
 
 #[test]
@@ -994,15 +1547,56 @@ fn a_plain_directory_and_harness_state_round_trip_exactly() {
     assert_eq!(report.verified, 2);
     assert_eq!(listing(&target).unwrap(), listing(&root).unwrap());
     assert_eq!(listing(&state_target).unwrap(), listing(&state).unwrap());
+    // Three directories, two files and a link.
     assert_eq!(
         verify(&store, snapshot, &target, Verify::All, &|_| true).unwrap(),
-        2
+        6
     );
+    fs::remove_dir(target.join("empty")).unwrap();
+    assert!(matches!(
+        verify(&store, snapshot, &target, Verify::All, &|_| true),
+        Err(RestoreError::VerifyFailed { path }) if path.as_str() == "empty"
+    ));
+    fs::create_dir(target.join("empty")).unwrap();
+    fs::remove_file(target.join("alias")).unwrap();
+    symlink("run.sh", target.join("alias")).unwrap();
+    assert!(matches!(
+        verify(&store, snapshot, &target, Verify::All, &|_| true),
+        Err(RestoreError::VerifyFailed { path }) if path.as_str() == "alias"
+    ));
+    fs::remove_file(target.join("alias")).unwrap();
+    symlink("a/b/deep.txt", target.join("alias")).unwrap();
     fs::write(target.join("a/b/deep.txt"), "tampered\n").unwrap();
     assert!(matches!(
         verify(&store, snapshot, &target, Verify::All, &|_| true),
         Err(RestoreError::VerifyFailed { path }) if path.as_str() == "a/b/deep.txt"
     ));
+}
+
+#[test]
+fn verify_reports_a_file_replaced_by_a_fifo_instead_of_waiting_on_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, snapshot) = plain_snapshot(dir.path()).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    fs::remove_file(target.join("run.sh")).unwrap();
+    let made = std::process::Command::new("mkfifo")
+        .arg(target.join("run.sh"))
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = verify(&store, snapshot, &target, Verify::All, &|_| true);
+        let _ = tx.send(outcome);
+    });
+    let outcome = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("verify blocked on the FIFO");
+    assert!(
+        matches!(&outcome, Err(RestoreError::VerifyFailed { path }) if path.as_str() == "run.sh"),
+        "{outcome:?}"
+    );
 }
 
 /// Gives the owner write permission on every directory under `dir`, so the temp directory can be removed.
@@ -1071,6 +1665,28 @@ fn restore_with_state(
     )
 }
 
+/// Runs the flush of a kept harness directory; a power cut is not simulated.
+#[test]
+fn a_power_loss_rerun_keeps_and_flushes_a_complete_harness_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, snapshot) = plain_snapshot(dir.path()).unwrap();
+    let state = dir.path().join("state-restored");
+    restore_with_state(&store, snapshot, &dir.path().join("first"), &state).unwrap();
+    let report = restore(
+        &store,
+        &RestoreRequest {
+            snapshot,
+            target: &dir.path().join("second"),
+            harness_state: Some(&state),
+            verify: Verify::All,
+            durability: Durability::PowerLoss,
+            carry: &|_| true,
+        },
+    )
+    .unwrap();
+    assert_eq!(report.verified, 10);
+}
+
 #[test]
 fn a_harness_directory_with_foreign_files_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -1132,20 +1748,96 @@ fn a_cache_the_target_cannot_use_is_skipped_and_named() {
 }
 
 #[test]
+fn a_partial_cache_is_skipped_even_when_the_target_could_use_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("plain");
+    fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+    fs::write(root.join("node_modules/pkg/index.js"), "x\n").unwrap();
+    fs::write(root.join("node_modules/pkg/.env"), "leak\n").unwrap();
+    fs::write(root.join("keep.txt"), "keep\n").unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    assert_eq!(manifest.caches[0].carry, CarryState::Partial);
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    let report = restore_into(&store, snapshot, &target).unwrap();
+    assert_eq!(
+        report.skipped_caches,
+        vec![RelPath::parse("node_modules").unwrap()]
+    );
+    assert!(!target.join("node_modules").exists());
+    assert!(target.join("keep.txt").exists());
+}
+
+#[test]
+fn a_cache_of_empty_directories_gets_a_row_the_target_can_turn_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("plain");
+    fs::create_dir_all(root.join("node_modules/.bin")).unwrap();
+    fs::write(root.join("keep.txt"), "keep\n").unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    assert_eq!(manifest.caches.len(), 1);
+    assert_eq!(manifest.caches[0].carry, CarryState::Carried);
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    let report = restore(
+        &store,
+        &RestoreRequest {
+            snapshot,
+            target: &target,
+            harness_state: None,
+            verify: Verify::All,
+            durability: Durability::ProcessCrash,
+            carry: &|_| false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        report.skipped_caches,
+        vec![RelPath::parse("node_modules").unwrap()]
+    );
+    assert!(!target.join("node_modules").exists());
+}
+
+#[test]
 fn restore_state_tells_absent_from_half_restored_and_present() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("t");
     assert_eq!(restore_state(&target).unwrap(), RestoreState::Absent);
     fs::create_dir(&target).unwrap();
     assert_eq!(restore_state(&target).unwrap(), RestoreState::Absent);
-    fs::create_dir(dir.path().join("t.fabric-restoring")).unwrap();
+    fs::create_dir_all(dir.path().join("t.fabric-restoring/tree")).unwrap();
     assert!(matches!(
         restore_state(&target).unwrap(),
         RestoreState::HalfRestored { .. }
     ));
-    fs::remove_dir(dir.path().join("t.fabric-restoring")).unwrap();
+    fs::remove_dir_all(dir.path().join("t.fabric-restoring")).unwrap();
     fs::write(target.join("x"), "x").unwrap();
     assert_eq!(restore_state(&target).unwrap(), RestoreState::Present);
+}
+
+/// A directory that happens to carry the staging name is refused, not deleted.
+#[test]
+fn a_staging_directory_restore_did_not_make_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, snapshot) = plain_snapshot(dir.path()).unwrap();
+    let target = dir.path().join("t");
+    let foreign = dir.path().join("t.fabric-restoring");
+    fs::create_dir(&foreign).unwrap();
+    fs::write(foreign.join("mine.txt"), "not a restore's\n").unwrap();
+    let err = restore_into(&store, snapshot, &target).unwrap_err();
+    assert!(
+        matches!(&err, RestoreError::ForeignStaging { path } if *path == foreign),
+        "{err}"
+    );
+    assert_eq!(
+        fs::read_to_string(foreign.join("mine.txt")).unwrap(),
+        "not a restore's\n"
+    );
+    assert!(!target.exists());
 }
 
 /// The child half: runs with `XDG_CONFIG_HOME` pointing at a git ignore file of its own.
@@ -1242,30 +1934,66 @@ fn a_fifo_or_socket_is_left_behind_and_named() {
     );
 }
 
-#[test]
-fn a_submodule_with_local_changes_is_refused_by_its_whole_path() {
-    let dir = tempfile::tempdir().unwrap();
-    let upstream = dir.path().join("upstream");
-    fs::create_dir(&upstream).unwrap();
-    fs::write(upstream.join("lib.rs"), "one\n").unwrap();
+/// Makes a repository at `<dir>/work` with a committed submodule at `my lib`.
+fn repo_with_submodule(dir: &Path) -> Fallible<PathBuf> {
+    let upstream = dir.join("upstream");
+    fs::create_dir(&upstream)?;
+    fs::write(upstream.join("lib.rs"), "one\n")?;
     let u = git(&upstream);
-    u.run(&["init", "-q", "-b", "main"]).unwrap();
-    u.run(&["add", "-A"]).unwrap();
-    u.run(&["commit", "-q", "-m", "lib"]).unwrap();
-
-    let root = dir.path().join("work");
-    fs::create_dir(&root).unwrap();
+    u.run(&["init", "-q", "-b", "main"])?;
+    u.run(&["add", "-A"])?;
+    u.run(&["commit", "-q", "-m", "lib"])?;
+    let root = dir.join("work");
+    fs::create_dir(&root)?;
     let g = git(&root);
-    g.run(&["init", "-q", "-b", "main"]).unwrap();
+    g.run(&["init", "-q", "-b", "main"])?;
     g.run(&[
         "submodule",
         "add",
         "-q",
-        upstream.to_str().unwrap(),
+        upstream.to_str().ok_or("path")?,
         "my lib",
-    ])
-    .unwrap();
-    g.run(&["commit", "-q", "-m", "with a submodule"]).unwrap();
+    ])?;
+    g.run(&["commit", "-q", "-m", "with a submodule"])?;
+    Ok(root)
+}
+
+#[test]
+fn a_submodule_the_config_ignores_is_still_refused_when_dirty() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = repo_with_submodule(dir.path()).unwrap();
+    git(&root)
+        .run(&["config", "submodule.my lib.ignore", "all"])
+        .unwrap();
+    fs::write(root.join("my lib/lib.rs"), "changed\n").unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    assert!(
+        matches!(&err, CaptureError::GitSubmoduleDirty { path } if path.as_str() == "my lib"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_renamed_dirty_submodule_is_refused_by_its_new_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = repo_with_submodule(dir.path()).unwrap();
+    git(&root).run(&["mv", "my lib", "your lib"]).unwrap();
+    fs::write(root.join("your lib/lib.rs"), "changed\n").unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let err = capture(&store, &request(&root, &policy, None)).unwrap_err();
+    assert!(
+        matches!(&err, CaptureError::GitSubmoduleDirty { path } if path.as_str() == "your lib"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_submodule_with_local_changes_is_refused_by_its_whole_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = repo_with_submodule(dir.path()).unwrap();
     fs::write(root.join("my lib/lib.rs"), "changed\n").unwrap();
 
     let store = store_in(dir.path()).unwrap();
@@ -1441,6 +2169,85 @@ fn a_secret_saved_in_the_stash_is_named() {
     );
 }
 
+/// A file whose bytes git converts on check-in comes back with the bytes it had, not the converted blob.
+#[test]
+fn a_file_git_converts_on_check_in_restores_with_its_own_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    fs::create_dir(&root).unwrap();
+    let g = git(&root);
+    g.run(&["init", "-q", "-b", "main"]).unwrap();
+    fs::write(
+        root.join(".gitattributes"),
+        "*.txt text eol=crlf\n*.id ident\n",
+    )
+    .unwrap();
+    fs::write(root.join("lines.txt"), "one\r\ntwo\r\n").unwrap();
+    fs::write(root.join("stamp.id"), "$Id$\n").unwrap();
+    g.run(&["add", "-A"]).unwrap();
+    g.run(&["commit", "-q", "-m", "one"]).unwrap();
+    // Checkout expands `$Id$`; the blob keeps it collapsed.
+    fs::remove_file(root.join("stamp.id")).unwrap();
+    g.run(&["checkout", "--", "stamp.id"]).unwrap();
+    fs::write(root.join("new.txt"), "untracked\r\n").unwrap();
+    let expanded = fs::read(root.join("stamp.id")).unwrap();
+    assert_ne!(expanded, b"$Id$\n");
+
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, report } = capture(&store, &request(&root, &policy, None)).unwrap();
+    assert!(report.filtered.is_empty(), "{:?}", report.filtered);
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    for name in ["lines.txt", "stamp.id", "new.txt"] {
+        assert_eq!(
+            fs::read(target.join(name)).unwrap(),
+            fs::read(root.join(name)).unwrap(),
+            "{name}"
+        );
+    }
+    assert_eq!(git_difference(&root, &target).unwrap(), None);
+}
+
+/// Every stash entry comes back at its index, and a secret in an older one is named.
+#[test]
+fn every_stash_entry_survives_capture_and_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    let g = git(&root);
+    fs::write(root.join(".env"), "AWS_SECRET=hunter2\n").unwrap();
+    g.run(&["stash", "push", "-q", "--include-untracked", "-m", "oldest"])
+        .unwrap();
+    for message in ["middle", "newest"] {
+        fs::write(root.join("a"), format!("{message}\n")).unwrap();
+        g.run(&["stash", "push", "-q", "-m", message]).unwrap();
+    }
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, report } = capture(&store, &request(&root, &policy, None)).unwrap();
+    assert_eq!(
+        report.stashed_secrets,
+        vec![RelPath::parse(".env").unwrap()]
+    );
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+
+    let list = git_text(&target, &["stash", "list"]).unwrap();
+    assert_eq!(list, git_text(&root, &["stash", "list"]).unwrap());
+    assert_eq!(list.lines().count(), 3, "{list}");
+    for n in 0..3 {
+        let entry = format!("stash@{{{n}}}");
+        assert_eq!(
+            git_text(&target, &["rev-parse", &entry]).unwrap(),
+            git_text(&root, &["rev-parse", &entry]).unwrap(),
+            "{entry}"
+        );
+    }
+}
+
 /// Captures a branch named `before`, replaces it with `after` and restores the incremental snapshot.
 fn rename_branch_across_an_incremental_link(before: &str, after: &str) -> Fallible {
     let dir = tempfile::tempdir()?;
@@ -1498,6 +2305,94 @@ fn the_target_keeps_the_filesystem_settings_git_init_probed() {
     restore_into(&store, snapshot, &target).unwrap();
     let restored = git_text(&target, &["config", "--bool", "core.ignorecase"]).unwrap_or_default();
     assert_eq!(restored, probed);
+}
+
+#[test]
+fn a_remote_url_with_a_query_token_is_left_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    git(&root)
+        .run(&[
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/x.git?access_token=sekrit",
+        ])
+        .unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, report } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let key = GitConfigKey::parse("remote.origin.url").unwrap();
+    assert_eq!(report.dropped_config, vec![key]);
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    let config = fs::read_to_string(target.join(".git/config")).unwrap();
+    assert!(!config.contains("sekrit"), "{config}");
+}
+
+#[test]
+fn a_credential_in_a_branch_remote_url_is_stripped() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    git(&root)
+        .run(&[
+            "config",
+            "branch.main.remote",
+            "https://token@example.com/x.git",
+        ])
+        .unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, report } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let key = GitConfigKey::parse("branch.main.remote").unwrap();
+    assert_eq!(report.stripped_userinfo, vec![key]);
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    assert_eq!(
+        git_text(&target, &["config", "branch.main.remote"]).unwrap(),
+        "https://example.com/x.git"
+    );
+}
+
+/// git holds a key more than once after `git config --add`, as for a
+/// second fetch refspec that maps pull requests or a second remote URL for
+/// a mirror. Every value travels in git's order, which decides the URL git
+/// fetches from.
+#[test]
+fn every_value_of_a_repeated_config_key_travels_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    let g = git(&root);
+    g.run(&["remote", "add", "origin", "https://example.com/a.git"])
+        .unwrap();
+    for (key, value) in [
+        (
+            "remote.origin.fetch",
+            "+refs/pull/*/head:refs/remotes/origin/pr/*",
+        ),
+        ("remote.origin.url", "https://example.com/b.git"),
+    ] {
+        g.run(&["config", "--add", key, value]).unwrap();
+    }
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    assert_eq!(
+        git_text(&target, &["config", "--get-all", "remote.origin.fetch"]).unwrap(),
+        "+refs/heads/*:refs/remotes/origin/*\n+refs/pull/*/head:refs/remotes/origin/pr/*"
+    );
+    assert_eq!(
+        git_text(&target, &["config", "--get-all", "remote.origin.url"]).unwrap(),
+        "https://example.com/a.git\nhttps://example.com/b.git"
+    );
 }
 
 #[test]

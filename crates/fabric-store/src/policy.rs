@@ -7,9 +7,11 @@
 //! `node_modules` is carried whole or left behind, never with holes it does
 //! not know about. A generic directory name such as `out` or `build` is a
 //! cache only next to the file of the tool that makes it, so an ignored
-//! `experiments/out/` with no `package.json` beside it stays precious. Names
-//! are compared with ASCII case folded, as APFS and git on a Mac compare
-//! them, so `Server.PEM` is as secret as `server.pem`.
+//! `experiments/out/` with no `package.json` beside it stays precious. A
+//! cache the job declares by its path is a cache whatever its name, and
+//! keeps the full secret list (ADR 0007, The override file). Names are
+//! compared with ASCII case folded, as APFS and git on a Mac compare them,
+//! so `Server.PEM` is as secret as `server.pem`.
 
 use std::fs;
 use std::io;
@@ -220,14 +222,16 @@ struct Pattern {
 
 impl Pattern {
     /// Parses a pattern; gitignore syntax the in-process matcher does not
-    /// model (negation, comments, escapes and classes) is refused, so a
-    /// pattern can never mean one thing to git and another to the policy.
+    /// model (negation, comments, escapes, classes and a `**` past the
+    /// leading one, which git matches across any number of directories) is
+    /// refused, so a pattern can never mean one thing to git and another to
+    /// the policy.
     fn parse(text: &str) -> Option<Pattern> {
         let text = text.strip_prefix("**/").unwrap_or(text);
         if text.is_empty()
             || text.starts_with(['/', '!', '#'])
             || text.contains(['\\', '[', ']'])
-            || text.split('/').any(str::is_empty)
+            || text.split('/').any(|c| c.is_empty() || c == "**")
         {
             return None;
         }
@@ -284,6 +288,7 @@ fn glob(pattern: &str, text: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IgnorePolicy {
     cache_dirs: Vec<CacheRule>,
+    declared: Vec<CacheRoot>,
     secrets: Vec<Pattern>,
     cache_secrets: Vec<Pattern>,
     excludes: Vec<Pattern>,
@@ -312,6 +317,7 @@ impl Default for IgnorePolicy {
                     markers: d.markers,
                 })
                 .collect(),
+            declared: Vec::new(),
             secrets: patterns(SECRET_PATTERNS),
             cache_secrets: patterns(CACHE_SECRET_PATTERNS),
             excludes: Vec::new(),
@@ -329,6 +335,36 @@ impl IgnorePolicy {
             class,
             markers: &[],
         });
+    }
+
+    /// Makes `path` from the root, and everything under it, a cache of
+    /// `class`, as `.fabric/env.toml` declares one. The full secret list
+    /// applies under it: a path the user declared can be a mistake that
+    /// holds the user's own keys, and a declared cache found inside it, or
+    /// a cache directory name under it, does not narrow that.
+    pub fn add_declared_cache(&mut self, class: CacheClass, path: &RelPath) {
+        self.declared.retain(|root| root.path != *path);
+        self.declared.push(CacheRoot {
+            path: path.clone(),
+            class,
+        });
+    }
+
+    /// The declared cache `comps` lies in, as the index of its last
+    /// component and its class.
+    fn declared_at(&self, comps: &[&str]) -> Option<(usize, CacheClass)> {
+        self.declared
+            .iter()
+            .filter_map(|root| {
+                let declared: Vec<&str> = root.path.as_str().split('/').collect();
+                (declared.len() <= comps.len()
+                    && declared
+                        .iter()
+                        .zip(comps)
+                        .all(|(d, c)| d.eq_ignore_ascii_case(c)))
+                .then(|| (declared.len() - 1, root.class))
+            })
+            .min_by_key(|(at, _)| *at)
     }
 
     /// Widens the secret list, in both the full and the narrow form.
@@ -396,9 +432,12 @@ impl IgnorePolicy {
     /// Classifies one ignored path; `markers` says which tool files sit where.
     pub fn classify(&self, path: &RelPath, markers: &mut dyn Markers) -> Class {
         let comps: Vec<&str> = path.as_str().split('/').collect();
-        let cache = (0..comps.len()).find_map(|i| {
-            self.cache_class_at(&comps, i, markers)
-                .map(|class| (i, class))
+        let declared = self.declared_at(&comps);
+        let cache = declared.or_else(|| {
+            (0..comps.len()).find_map(|i| {
+                self.cache_class_at(&comps, i, markers)
+                    .map(|class| (i, class))
+            })
         });
         let cache_root = cache.and_then(|(i, class)| {
             RelPath::parse(&comps[..=i].join("/"))
@@ -406,7 +445,7 @@ impl IgnorePolicy {
                 .map(|path| CacheRoot { path, class })
         });
         let secret = (0..comps.len()).any(|j| {
-            let narrow = cache.is_some_and(|(i, _)| j > i);
+            let narrow = declared.is_none() && cache.is_some_and(|(i, _)| j > i);
             let list = if narrow {
                 &self.cache_secrets
             } else {
@@ -458,6 +497,20 @@ impl IgnorePolicy {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_double_star_past_the_leading_one_is_refused() {
+        for text in ["foo/**/token", "foo/**", "**/a/**/b", "**/**"] {
+            assert_eq!(Pattern::parse(text), None, "{text}");
+        }
+        assert!(Pattern::parse("**/token").is_some());
+        assert!(Pattern::parse("foo/*/token").is_some());
+        let mut policy = IgnorePolicy::default();
+        assert!(matches!(
+            policy.add_secret_pattern("foo/**/token"),
+            Err(PolicyError::BadPolicyPattern { .. })
+        ));
+    }
+
     fn rel(s: &str) -> RelPath {
         RelPath::parse(s).unwrap()
     }
@@ -482,6 +535,29 @@ mod tests {
             )
         };
         p.classify(&rel(path), &mut markers)
+    }
+
+    /// A cache `.fabric/env.toml` declares, such as `.output`, has no name
+    /// the policy knows. It must still be a cache, so a snapshot records it
+    /// with a carry key rather than as the user's own files, and the full
+    /// secret list applies under it, a key file included.
+    #[test]
+    fn a_declared_cache_is_a_cache_with_the_full_secret_list() {
+        let mut p = IgnorePolicy::default();
+        assert_eq!(classify(&p, ".output/server/index.mjs"), Class::Precious);
+        p.add_declared_cache(CacheClass::Build, &rel(".output"));
+        assert_eq!(
+            classify(&p, ".output/server/index.mjs"),
+            cache(".output", CacheClass::Build)
+        );
+        assert_eq!(
+            classify(&p, ".output/node_modules/x/index.js"),
+            cache(".output", CacheClass::Build)
+        );
+        for secret in [".output/server.pem", ".output/node_modules/x/tls.key"] {
+            assert!(is_secret(&classify(&p, secret)), "{secret}");
+        }
+        assert_eq!(classify(&p, "web/.output/index.mjs"), Class::Precious);
     }
 
     #[test]

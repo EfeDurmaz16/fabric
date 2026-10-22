@@ -10,7 +10,10 @@
 //! only then does it become the record restore reads. A capture whose
 //! publish failed, or a process killed between capture and publish, so
 //! never moves the record forward, and a file edited here after the last
-//! published capture is never overwritten. Records live under
+//! published capture is never overwritten. Writing a pending record and
+//! confirming one run under one `flock` per session, so a confirm compares
+//! and renames the same pending record and never promotes a later capture
+//! that replaced it in between. Records live under
 //! `~/.fabric/harness/departed/` and never travel.
 
 #![cfg_attr(
@@ -22,15 +25,20 @@
 )]
 
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::durable;
 use crate::error::{HarnessError, Input, IoOp};
-use crate::manifest::{Digest, Mutability};
+use crate::manifest::Digest;
 use crate::session::SessionId;
-use crate::stage::{self, Source};
+use crate::stage;
+
+/// The directory under the home where Fabric keeps its own harness state,
+/// which no adapter may capture or restore into.
+pub(crate) const FABRIC_DIR: &str = ".fabric";
 
 /// The record format this crate writes.
 const FORMAT: u16 = 1;
@@ -53,31 +61,53 @@ pub(crate) struct Records {
     active: PathBuf,
     /// The record of the last capture, until the core confirms it.
     pending: PathBuf,
+    /// The file whose `flock` serializes writing the pending record with
+    /// confirming it.
+    lock: PathBuf,
 }
 
 impl Records {
     /// The records of `session` for the harness `label` under `home`.
     pub(crate) fn of(home: &Path, label: &str, session: &SessionId) -> Self {
-        let dir = home.join(".fabric/harness/departed").join(label);
+        let dir = home.join(FABRIC_DIR).join("harness/departed").join(label);
         Records {
             active: dir.join(format!("{session}.json")),
             pending: dir.join(format!("{session}.pending.json")),
+            lock: dir.join(format!("{session}.lock")),
         }
     }
 
-    /// Records the rewritable `sources` of the capture whose manifest has
+    /// Holds the session's record lock until the file is dropped. Another
+    /// process that captures or confirms the same session waits for it;
+    /// the lock goes with the process that held it, however it ends.
+    fn hold(&self) -> Result<File, HarnessError> {
+        let dir = self.lock.parent().unwrap_or(Path::new("."));
+        std::fs::create_dir_all(dir).map_err(|e| HarnessError::io(IoOp::CreateDir, dir, e))?;
+        let file = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&self.lock)
+            .map_err(|e| HarnessError::io(IoOp::Write, &self.lock, e))?;
+        file.lock()
+            .map_err(|e| HarnessError::io(IoOp::Lock, &self.lock, e))?;
+        Ok(file)
+    }
+
+    /// Records the rewritable files of the capture whose manifest has
     /// digest `capture`, as pending; it replaces any earlier pending record.
+    /// `read` holds each file and the digest of the bytes staging read from
+    /// it. The file is never read again here: an edit made after staging
+    /// must not be recorded as the bytes that left.
     pub(crate) fn write_pending(
         &self,
-        sources: &[Source],
+        read: &[(PathBuf, Digest)],
         capture: Digest,
     ) -> Result<(), HarnessError> {
         let mut files = BTreeMap::new();
-        for source in sources {
-            if source.mutability == Mutability::Replaceable {
-                let digest = stage::digest_file(&source.abs)?.digest;
-                files.insert(utf8(&source.abs)?.to_owned(), digest);
-            }
+        for (abs, digest) in read {
+            files.insert(utf8(abs)?.to_owned(), *digest);
         }
         let record = Departure {
             format: FORMAT,
@@ -89,6 +119,7 @@ impl Records {
             path: self.pending.clone(),
             reason: e.to_string(),
         })?;
+        let _held = self.hold()?;
         durable::write_atomic(&self.pending, &bytes)
     }
 
@@ -98,6 +129,7 @@ impl Records {
     /// pending nor active was not made here or was replaced by a later
     /// one, and is refused, leaving both records as they were.
     pub(crate) fn confirm(&self, session: &SessionId, capture: Digest) -> Result<(), HarnessError> {
+        let _held = self.hold()?;
         if read(&self.pending)?.is_some_and(|p| p.capture == Some(capture)) {
             return durable::rename_durable(&self.pending, &self.active);
         }
@@ -157,8 +189,17 @@ impl Departure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stage::Carry;
+    use crate::manifest::Mutability;
+    use crate::redact::RedactionCounts;
+    use crate::stage::{Carry, Source};
     use fabric_core::path::RelPath;
+
+    /// Stages `sources` under `dir/out` and records the capture `capture`
+    /// as pending from what staging read.
+    fn capture(records: &Records, dir: &Path, sources: &[Source], capture: Digest) {
+        let staged = stage::stage(sources, &dir.join("out"), &mut RedactionCounts::new()).unwrap();
+        records.write_pending(&staged.replaceable, capture).unwrap();
+    }
 
     fn digest(text: &str) -> Digest {
         Digest::from_hash(blake3::hash(text.as_bytes()))
@@ -193,7 +234,7 @@ mod tests {
         let (memory, sources) = sources(dir.path());
         let session = SessionId::parse("s1").unwrap();
         let records = Records::of(dir.path(), "claude", &session);
-        records.write_pending(&sources, digest("m1")).unwrap();
+        capture(&records, dir.path(), &sources, digest("m1"));
         assert!(!records.active().unwrap().unchanged(&memory).unwrap());
 
         records.confirm(&session, digest("m1")).unwrap();
@@ -214,12 +255,12 @@ mod tests {
         let (memory, sources) = sources(dir.path());
         let session = SessionId::parse("s1").unwrap();
         let records = Records::of(dir.path(), "claude", &session);
-        records.write_pending(&sources, digest("m1")).unwrap();
+        capture(&records, dir.path(), &sources, digest("m1"));
         records.confirm(&session, digest("m1")).unwrap();
         std::fs::write(&memory, "# memory\nsecond\n").unwrap();
-        records.write_pending(&sources, digest("m2")).unwrap();
+        capture(&records, dir.path(), &sources, digest("m2"));
         std::fs::write(&memory, "# memory\nthird\n").unwrap();
-        records.write_pending(&sources, digest("m3")).unwrap();
+        capture(&records, dir.path(), &sources, digest("m3"));
         assert!(matches!(
             records.confirm(&session, digest("m2")),
             Err(HarnessError::DepartureNotPending { .. })
@@ -229,5 +270,97 @@ mod tests {
             records.active().unwrap().unchanged(&memory).unwrap(),
             "the refused confirm left the active record alone"
         );
+    }
+
+    /// A confirm compares the pending record with its capture and then
+    /// renames it. A capture of the same session by another process in
+    /// between would have the rename promote that later capture, which no
+    /// snapshot published yet, so the two take turns under the record lock.
+    #[test]
+    fn writing_and_confirming_a_pending_record_take_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, sources) = sources(dir.path());
+        let session = SessionId::parse("s1").unwrap();
+        let records = Records::of(dir.path(), "claude", &session);
+        capture(&records, dir.path(), &sources, digest("m1"));
+        let pending = || read(&records.pending).unwrap().map(|p| p.capture);
+        let wait = || std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // A capture holds the lock: a confirm of m1 waits, then finds m2.
+        let capturing = records.hold().unwrap();
+        let confirm = {
+            let (records, session) = (records.clone(), session.clone());
+            std::thread::spawn(move || records.confirm(&session, digest("m1")))
+        };
+        wait();
+        let m2 = Departure {
+            format: FORMAT,
+            capture: Some(digest("m2")),
+            files: BTreeMap::new(),
+        };
+        durable::write_atomic(&records.pending, &serde_json::to_vec(&m2).unwrap()).unwrap();
+        drop(capturing);
+        assert!(
+            matches!(
+                confirm.join().unwrap(),
+                Err(HarnessError::DepartureNotPending { .. })
+            ),
+            "a confirm promoted a capture that replaced its own"
+        );
+
+        // A confirm holds the lock: a capture waits until it is done.
+        let staged = stage::stage(
+            &sources,
+            &dir.path().join("out3"),
+            &mut RedactionCounts::new(),
+        )
+        .unwrap();
+        let confirming = records.hold().unwrap();
+        let later = {
+            let records = records.clone();
+            std::thread::spawn(move || records.write_pending(&staged.replaceable, digest("m3")))
+        };
+        wait();
+        assert_eq!(
+            pending(),
+            Some(Some(digest("m2"))),
+            "a capture replaced the pending record under a confirm"
+        );
+        drop(confirming);
+        later.join().unwrap().unwrap();
+        assert_eq!(pending(), Some(Some(digest("m3"))));
+    }
+
+    #[test]
+    fn the_record_holds_the_bytes_staging_read_not_a_later_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (memory, sources) = sources(dir.path());
+        let session = SessionId::parse("s1").unwrap();
+        let records = Records::of(dir.path(), "claude", &session);
+        let staged = stage::stage(
+            &sources,
+            &dir.path().join("out"),
+            &mut RedactionCounts::new(),
+        )
+        .unwrap();
+        // An edit lands after staging read the file and before the record.
+        std::fs::write(
+            &memory,
+            "# memory
+edited after staging
+",
+        )
+        .unwrap();
+        records
+            .write_pending(&staged.replaceable, digest("m1"))
+            .unwrap();
+        records.confirm(&session, digest("m1")).unwrap();
+        let active = records.active().unwrap();
+        assert!(
+            !active.unchanged(&memory).unwrap(),
+            "the edit never left this node, so restore must not replace it"
+        );
+        std::fs::write(&memory, "# memory\n").unwrap();
+        assert!(active.unchanged(&memory).unwrap());
     }
 }

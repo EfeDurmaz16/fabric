@@ -27,13 +27,13 @@ use fabric_core::path::AbsPath;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::departure::Records;
+use crate::departure::{FABRIC_DIR, Records};
 use crate::error::HarnessError;
 use crate::harness::{Harness, Installed, Launch, Restored, Running};
 use crate::manifest::{Content, HOME_PREFIX, Mutability, StateManifest, under_home};
 use crate::pipeline::{self, Capturer, Destination};
 use crate::process::{self, Wiring};
-use crate::redact::RedactionCounts;
+use crate::redact::{RedactionCounts, Redactor};
 use crate::session::SessionId;
 use crate::stage::{Carry, Source};
 
@@ -45,6 +45,22 @@ use self::client::{AcpClient, AcpError, PermissionPolicy, StopReason};
 fn names_session(part: &str, session: &SessionId) -> bool {
     part.strip_prefix(session.as_str())
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
+/// Refuses launch arguments that hold a secret shape, one by one and
+/// joined, so `--api-key sk-...` is caught either way: the arguments are
+/// part of the harness kind that the job's ledger and the manifest record,
+/// and neither is ever redacted. A caller that records a kind checks it
+/// here before it writes anything.
+pub fn refuse_secret_args(program: &ProgramName, args: &[String]) -> Result<(), HarnessError> {
+    let redactor = Redactor::standard()?;
+    let joined = args.join(" ");
+    if redactor.matches(&joined) || args.iter().any(|arg| redactor.matches(arg)) {
+        return Err(HarnessError::SecretInArguments {
+            program: program.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// An ACP agent started as `program args...`.
@@ -96,13 +112,25 @@ impl AcpHarness {
     }
 
     /// Declares where the agent keeps its sessions; refused when `dir` is
-    /// not under the home.
+    /// not under the home, or when it is the home or lies under
+    /// `~/.fabric`, in any letter case: either way capture would walk
+    /// Fabric's own departure records, which never travel.
     pub fn with_state_dir(mut self, dir: &AbsPath) -> Result<Self, HarnessError> {
         let dir = pipeline::fs_path(dir).to_path_buf();
-        if dir.strip_prefix(self.home_dir()).is_err() {
+        let Ok(rel) = dir.strip_prefix(self.home_dir()) else {
             return Err(HarnessError::NotUnderHome {
                 path: dir,
                 home: self.home_dir().to_path_buf(),
+            });
+        };
+        let holds_fabric = rel
+            .components()
+            .next()
+            .is_none_or(|first| first.as_os_str().eq_ignore_ascii_case(FABRIC_DIR));
+        if holds_fabric {
+            return Err(HarnessError::StateDirHoldsFabric {
+                path: dir,
+                fabric: self.home_dir().join(FABRIC_DIR),
             });
         }
         self.state_dir = Some(dir);
@@ -111,6 +139,15 @@ impl AcpHarness {
 
     fn home_dir(&self) -> &Path {
         pipeline::fs_path(&self.home)
+    }
+
+    /// Refuses, before any session is placed or taken, a state directory
+    /// that capture and restore would refuse: none declared, or one reached
+    /// through a link below the home. A target checks this before it takes
+    /// a job it would then be unable to resume.
+    pub fn check_state_dir(&self) -> Result<(), HarnessError> {
+        let (dir, _) = self.state_rel()?;
+        pipeline::refuse_symlinks(self.home_dir(), &dir)
     }
 
     /// Sets how `session/request_permission` is answered.
@@ -146,8 +183,24 @@ impl AcpHarness {
 
     /// Where this node records the session's files at capture. An ACP
     /// agent's state is opaque, so every file is treated as rewritable.
+    /// The records are keyed by the whole harness kind, program and
+    /// arguments, so two agents started through one program, such as
+    /// `node`, never share a record for a session id they both use.
     fn departure(&self, session: &SessionId) -> Records {
-        Records::of(self.home_dir(), &format!("acp-{}", self.program), session)
+        let mut kind = blake3::Hasher::new();
+        for part in
+            std::iter::once(self.program.as_str()).chain(self.args.iter().map(String::as_str))
+        {
+            kind.update(&(part.len() as u64).to_le_bytes());
+            kind.update(part.as_bytes());
+        }
+        let kind = kind.finalize().to_hex();
+        let label = format!("acp-{}-{}", self.program, &kind[..16]);
+        Records::of(self.home_dir(), &label, session)
+    }
+
+    fn refuse_secret_args(&self) -> Result<(), HarnessError> {
+        refuse_secret_args(&self.program, &self.args)
     }
 
     fn capture_sync(
@@ -157,23 +210,13 @@ impl AcpHarness {
         out: &Path,
         version: Option<String>,
     ) -> Result<StateManifest, HarnessError> {
+        self.refuse_secret_args()?;
         let (dir, rel_parts) = self.state_rel()?;
-        let mut sources = Vec::new();
-        for file in pipeline::walk(&dir)? {
-            let file_parts = pipeline::rel_components(&file)?;
-            if !file_parts.iter().any(|part| names_session(part, session)) {
-                continue;
-            }
-            let mut parts: Vec<&str> = vec![HOME_PREFIX];
-            parts.extend(rel_parts.iter().map(String::as_str));
-            parts.extend(file_parts.iter().map(String::as_str));
-            sources.push(Source {
-                abs: dir.join(&file),
-                rel: pipeline::rel_path(&parts)?,
-                carry: Carry::OpaqueRefuseSecrets,
-                mutability: Mutability::Replaceable,
-            });
-        }
+        // The walk refuses symlinks below the directory but follows the
+        // directory itself, so a linked state root or a linked directory
+        // above it would carry files from outside the home.
+        pipeline::refuse_symlinks(self.home_dir(), &dir)?;
+        let sources = Self::session_sources(&dir, &rel_parts, session)?;
         if sources.is_empty() {
             return Err(HarnessError::SessionNotFound {
                 kind: self.kind(),
@@ -195,6 +238,32 @@ impl AcpHarness {
         Ok(manifest)
     }
 
+    /// Every file under the state directory `dir` that is named for
+    /// `session`, as capture takes it; `rel_parts` is `dir` under the home.
+    fn session_sources(
+        dir: &Path,
+        rel_parts: &[String],
+        session: &SessionId,
+    ) -> Result<Vec<Source>, HarnessError> {
+        let mut sources = Vec::new();
+        for file in pipeline::walk(dir)? {
+            let file_parts = pipeline::rel_components(&file)?;
+            if !file_parts.iter().any(|part| names_session(part, session)) {
+                continue;
+            }
+            let mut parts: Vec<&str> = vec![HOME_PREFIX];
+            parts.extend(rel_parts.iter().map(String::as_str));
+            parts.extend(file_parts.iter().map(String::as_str));
+            sources.push(Source {
+                abs: dir.join(&file),
+                rel: pipeline::rel_path(&parts)?,
+                carry: Carry::OpaqueRefuseSecrets,
+                mutability: Mutability::Replaceable,
+            });
+        }
+        Ok(sources)
+    }
+
     async fn capture_impl(
         &self,
         workspace: &Path,
@@ -202,7 +271,9 @@ impl AcpHarness {
         out: &Path,
     ) -> Result<StateManifest, HarnessError> {
         let root = pipeline::physical_workspace(workspace)?;
-        let version = process::installed_version(self.binary().ok(), self.program.as_str()).await;
+        let version =
+            process::installed_version(self.binary().ok(), &self.path_var, self.program.as_str())
+                .await;
         let adapter = self.clone();
         let session = session.clone();
         let out = out.to_path_buf();
@@ -230,10 +301,16 @@ impl AcpHarness {
         state: &Path,
         manifest: StateManifest,
     ) -> Result<Restored, HarnessError> {
-        let (_, state_parts) = self.state_rel()?;
+        let (dir, state_parts) = self.state_rel()?;
         let session = manifest.session().clone();
         let records = self.departure(&session);
-        let restored = pipeline::restore(manifest, state, Some(&records), |rel, _| {
+        pipeline::refuse_symlinks(self.home_dir(), &dir)?;
+        let held = if dir.exists() {
+            Self::session_sources(&dir, &state_parts, &session)?
+        } else {
+            Vec::new()
+        };
+        let restored = pipeline::restore(manifest, state, Some(&records), &held, |rel, _| {
             let rest = under_home(rel).filter(|_| Self::restorable(rel, &state_parts, &session));
             Ok(rest.map(|rest| Destination {
                 path: self.home_dir().join(rest),
@@ -254,7 +331,7 @@ impl AcpHarness {
     }
 
     async fn detect_impl(&self) -> Result<Option<Installed>, HarnessError> {
-        process::detect(self.binary().ok()).await
+        process::detect(self.binary().ok(), &self.path_var).await
     }
 
     /// Starts the agent, completes the handshake, continues `resume` or
@@ -269,17 +346,19 @@ impl AcpHarness {
     ) -> Result<AcpRunning, HarnessError> {
         let root = pipeline::physical_workspace(workspace)?;
         let binary = self.binary()?;
-        let (mut child, pid) = process::spawn(
+        let mut spawned = process::spawn(
             &binary,
             &self.args,
             pipeline::fs_path(&root),
             env,
             Wiring::Rpc,
-        )?;
+        )
+        .await?;
         // Until the session is open, an error or a dropped future kills the
         // agent's group, so no agent is left running without a handle.
-        let guard = process::GroupGuard::new(pid);
-        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        let guard = process::GroupGuard::new(spawned.pid);
+        let (Some(stdin), Some(stdout)) = (spawned.child.stdin.take(), spawned.child.stdout.take())
+        else {
             return Err(HarnessError::Spawn {
                 program: self.program.to_string(),
                 source: std::io::Error::other("agent started without stdio pipes"),
@@ -294,7 +373,7 @@ impl AcpHarness {
             tokio::spawn(async move { client.prompt(&session, &prompt).await })
         });
         Ok(AcpRunning {
-            running: Running::new(pid, Some(session), child),
+            running: Running::new(Some(session), spawned),
             client,
             turn,
         })
@@ -419,5 +498,32 @@ impl Harness for AcpHarness {
         env: &'a [(EnvVarName, String)],
     ) -> BoxFuture<'a, Result<Running, HarnessError>> {
         Box::pin(self.launch_impl(workspace, launch, env))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn adapter(args: &[&str]) -> AcpHarness {
+        AcpHarness::new(
+            ProgramName::parse("node").unwrap(),
+            args.iter().map(|a| (*a).to_owned()).collect(),
+            AbsPath::parse("/h").unwrap(),
+            OsString::new(),
+        )
+    }
+
+    #[test]
+    fn departure_records_are_keyed_by_program_and_arguments() {
+        let session = SessionId::parse("s1").unwrap();
+        let a = adapter(&["agent-a.js"]).departure(&session);
+        assert_eq!(a, adapter(&["agent-a.js"]).departure(&session));
+        assert_ne!(a, adapter(&["agent-b.js"]).departure(&session));
+        assert_ne!(
+            adapter(&["a", "b"]).departure(&session),
+            adapter(&["ab"]).departure(&session),
+            "argument boundaries count"
+        );
     }
 }

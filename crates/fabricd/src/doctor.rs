@@ -3,16 +3,33 @@
 //! Invariant: every row compares strings for equality and never parses a
 //! version into a range, because every coupling the research found was an
 //! exact-string one. A row that refuses stops a move unless the user passes
-//! `--force`, and two rows refuse even then: a different user or home,
-//! because the root would not exist on the target (ADR 0011), and a target
-//! with no login for the job's harness, because the harness would fail
-//! inside with a worse message. The comparison is pure; measuring is
-//! `facts`' job.
+//! `--force`, and some refuse even then: a different user or home, because
+//! the root would not exist on the target (ADR 0011), and a target with no
+//! login for the job's harness, or for an ACP job no agent or no
+//! `state_dir` for it, because the harness would fail inside with a worse
+//! message once the target owns the job. The comparison is pure; measuring
+//! is `facts`' job.
+//!
+//! One row orders versions, and only to word its note and warn: when the
+//! job's harness on the target is older than the source's, or than the
+//! newest known to have written the job's session (`Context::floor`, the
+//! known writer the guard refuses below), the note says so, read through
+//! `fabric_harness::HarnessVersion`, the parse and the order the resume
+//! guard uses. Both sides are the versions each daemon finds from its own
+//! directory; a version manager's pin in the workspace can pick another,
+//! and the rollout's own `cli_version` is not read here, so the note is a
+//! warning ahead of the guard, not the guard. The outcome stays the
+//! equality refusal that `--force` waives, and a target whose version
+//! matches the source's but is older than the known writer only warns: a
+//! move only copies bytes, and the guard refuses the older harness at
+//! resume, before it can touch the session, whatever the move was told
+//! (gate finding F10).
 
 use std::fmt;
 use std::path::Path;
 
 use fabric_core::harness::HarnessKind;
+use fabric_harness::HarnessVersion;
 
 use crate::facts::{NodeFacts, major, name};
 use crate::paths::{SyncedFolders, check_root};
@@ -109,6 +126,14 @@ pub struct Context<'a> {
     pub clock_skew_ms: Option<i64>,
     /// The wire the session runs on, and how QUIC failed if it fell back.
     pub wire: Option<String>,
+    /// The newest version of the job's harness known to have written its
+    /// session (`SessionRecord::known_writer`), as the job's owner records
+    /// it: this node's record when it owns the job, else the owner's,
+    /// asked over the wire, since a node the job left keeps the record of
+    /// its own tenure and one that never ran it holds none. The resume
+    /// guard refuses a harness older than it, and a capture on the source
+    /// records at least it.
+    pub floor: Option<&'a HarnessVersion>,
 }
 
 fn value(facts: &NodeFacts, fact: &str) -> Option<String> {
@@ -142,14 +167,23 @@ fn row(
 pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row> {
     let mut rows = Vec::new();
     for fact in [name::USER, name::HOME] {
-        rows.push(row(
+        let mut row = row(
             fact,
             here,
             peer,
             Outcome::Refuse(Waiver::Never),
             "the root would differ and nothing rewrites paths in this phase (ADR 0011)",
-        ));
+        );
+        // Two absences compare equal, and prove nothing about the user.
+        if row.here.is_none() || row.peer.is_none() {
+            row.outcome = Outcome::Refuse(Waiver::Never);
+            "not measured, and the move needs it measured and equal on both nodes (ADR 0011)"
+                .clone_into(&mut row.note);
+        }
+        rows.push(row);
     }
+    rows.push(git_row(here, peer, ctx));
+    rows.push(lsof_row(here, peer, ctx));
     rows.push(row(
         name::OS,
         here,
@@ -232,17 +266,19 @@ fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Ro
     let mut rows = Vec::new();
     let pairs = [
         (
+            "claude",
             name::CLAUDE,
             name::CLAUDE_LOGIN,
             matches!(ctx.harness, Some(HarnessKind::ClaudeCode)),
         ),
         (
+            "codex",
             name::CODEX,
             name::CODEX_LOGIN,
             matches!(ctx.harness, Some(HarnessKind::Codex)),
         ),
     ];
-    for (version, login, used) in pairs {
+    for (program, version, login, used) in pairs {
         let mut r = row(
             version,
             here,
@@ -261,6 +297,12 @@ fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Ro
         if !used && r.outcome == Outcome::Warn && ctx.harness.is_some() {
             r.outcome = Outcome::Equal;
             r.note.clear();
+        }
+        if used && let Some(note) = older_target(here, peer, version, program, ctx) {
+            if r.outcome == Outcome::Equal {
+                r.outcome = Outcome::Warn;
+            }
+            r.note = note;
         }
         rows.push(r);
         let target_login = match ctx.target {
@@ -284,7 +326,140 @@ fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Ro
             },
         });
     }
+    if let Some(HarnessKind::Acp { program, .. }) = ctx.harness {
+        rows.extend(acp_rows(program.as_str(), here, peer, ctx));
+    }
     rows
+}
+
+/// The note for a target whose `fact`, read as `--version` output, is
+/// older than the newest known to have written the session
+/// (`Context::floor`) when that is above the source's, naming it, or else
+/// older than the source's; `None` when it is neither, or when the
+/// target's does not parse.
+fn older_target(
+    here: &NodeFacts,
+    peer: &NodeFacts,
+    fact: &str,
+    program: &str,
+    ctx: &Context<'_>,
+) -> Option<String> {
+    let read = |facts: &NodeFacts| {
+        facts
+            .get(fact)
+            .and_then(|text| HarnessVersion::from_output(text).ok())
+    };
+    let (source, target) = match ctx.target {
+        Target::Peer => (read(here), read(peer)?),
+        Target::Here => (read(peer), read(here)?),
+    };
+    let floor = ctx
+        .floor
+        .filter(|floor| source.as_ref().is_none_or(|source| *floor > source));
+    match floor {
+        Some(floor) if target < *floor => Some(format!(
+            "the target's {program} is older than {program} {floor}, the newest known to have written the session; a resume there refuses it, so update {program} there first (ADR 0006)"
+        )),
+        _ if source.is_some_and(|source| target < source) => Some(format!(
+            "the target's {program} is older; a resume there refuses a session a newer {program} wrote, so update {program} there first (ADR 0006)"
+        )),
+        _ => None,
+    }
+}
+
+/// The rows for an ACP job: the target must find the agent and give it a
+/// `state_dir`, or the job would be owned by a node that cannot launch it,
+/// restore its session or capture it. Only the target of a pull measures
+/// them; a peer does not report its agents, so a push can only warn.
+fn acp_rows(program: &str, here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> [Row; 2] {
+    let missing = [
+        (
+            name::ACP_AGENT,
+            format!("this node's PATH has no {program}, so the job could not launch here"),
+        ),
+        (
+            name::ACP_STATE_DIR,
+            format!(
+                "harness.toml here gives {program} no state_dir capture and restore accept (none, one outside the home or under ~/.fabric, or one reached through a link), so its session could not be restored or captured here"
+            ),
+        ),
+    ];
+    missing.map(|(fact, absent)| {
+        let (outcome, note) = match ctx.target {
+            Target::Here if here.get(fact).is_some() => (Outcome::Equal, String::new()),
+            Target::Here => (Outcome::Refuse(Waiver::Never), absent),
+            Target::Peer => (
+                Outcome::Warn,
+                format!(
+                    "a peer does not report its ACP agents, so whether it has {program} and a state_dir for it is not checked"
+                ),
+            ),
+        };
+        Row {
+            fact,
+            here: value(here, fact),
+            peer: value(peer, fact),
+            outcome,
+            note,
+        }
+    })
+}
+
+/// Every job's workspace is a repository and restore runs git, so a job
+/// moves only to a node whose daemon finds git; the versions may differ.
+fn git_row(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Row {
+    let target = match ctx.target {
+        Target::Peer => peer,
+        Target::Here => here,
+    };
+    let missing = target.get(name::GIT).is_none();
+    let (outcome, note) = match (missing, ctx.harness.is_some()) {
+        (false, _) => (Outcome::Equal, ""),
+        (true, true) => (
+            Outcome::Refuse(Waiver::Never),
+            "the target's daemon finds no git, and restore runs it for every job",
+        ),
+        (true, false) => (
+            Outcome::Warn,
+            "the target's daemon finds no git, so no job can move there",
+        ),
+    };
+    Row {
+        fact: name::GIT,
+        here: value(here, name::GIT),
+        peer: value(peer, name::GIT),
+        outcome,
+        note: note.to_owned(),
+    }
+}
+
+/// Every suspend or move of a Codex job asks `lsof` whether a Codex
+/// process holds the thread's rollout open, and fails on a node that has
+/// none, so a Codex job moves only to a node where it is found.
+fn lsof_row(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Row {
+    let target = match ctx.target {
+        Target::Peer => peer,
+        Target::Here => here,
+    };
+    let missing = target.get(name::LSOF).is_none();
+    let (outcome, note) = match (missing, ctx.harness) {
+        (true, Some(HarnessKind::Codex)) => (
+            Outcome::Refuse(Waiver::Never),
+            "the target has no lsof, which every suspend or move of a Codex job runs, so the job could leave it only by a steal",
+        ),
+        (true, None) => (
+            Outcome::Warn,
+            "the target has no lsof, so a Codex job could not be suspended or moved there",
+        ),
+        (false, _) | (true, Some(_)) => (Outcome::Equal, ""),
+    };
+    Row {
+        fact: name::LSOF,
+        here: value(here, name::LSOF),
+        peer: value(peer, name::LSOF),
+        outcome,
+        note: note.to_owned(),
+    }
 }
 
 fn synced_row(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Row {
@@ -355,19 +530,18 @@ mod tests {
 
     fn pro() -> NodeFacts {
         NodeFacts::from_pairs([
-            (name::USER, "efebarandurmaz"),
-            (name::HOME, "/Users/efebarandurmaz"),
+            (name::USER, "me"),
+            (name::HOME, "/Users/me"),
+            (name::GIT, "git version 2.54.0"),
+            (name::LSOF, "/usr/sbin/lsof"),
             (name::OS, "macos"),
             (name::ARCH, "aarch64"),
             (name::PNPM, "11.23.0"),
-            (
-                name::PNPM_STORE,
-                "/Users/efebarandurmaz/Library/pnpm/store/v11",
-            ),
+            (name::PNPM_STORE, "/Users/me/Library/pnpm/store/v11"),
             (name::NODE, "v22.23.2"),
             (name::NODE_ABI, "127"),
             (name::RUSTC, "rustc 1.97.1"),
-            (name::CARGO_HOME, "/Users/efebarandurmaz/.cargo"),
+            (name::CARGO_HOME, "/Users/me/.cargo"),
             (name::MACOS, "26.6.2"),
             (name::MACOS_SDK, "27.0"),
             (name::CLAUDE, "2.1.294 (Claude Code)"),
@@ -420,6 +594,7 @@ mod tests {
             target: Target::Peer,
             clock_skew_ms: Some(9),
             wire: Some("quic".to_owned()),
+            floor: None,
         }
     }
 
@@ -534,10 +709,107 @@ mod tests {
         assert_eq!(blocking(&rows, false).len(), 3);
     }
 
+    /// The second gate run moved a Codex job with `--force` onto a node
+    /// with an older Codex: the row names the older side, in the order the
+    /// resume guard uses, for a push and for a pull onto this node alike,
+    /// and `--force` still waives it, because the guard refuses the older
+    /// Codex at resume.
+    #[test]
+    fn an_older_harness_on_the_target_is_named_and_force_still_waives_it() {
+        let codex = HarnessKind::Codex;
+        let older = with(&pro(), &[(name::CODEX, Some("codex-cli 0.142.4"))]);
+        let row_of = |rows: Vec<Row>| rows.into_iter().find(|r| r.fact == name::CODEX).unwrap();
+        let pushed = row_of(compare(&pro(), &older, &ctx(Some(&codex))));
+        assert_eq!(pushed.outcome, Outcome::Refuse(Waiver::Force));
+        assert!(
+            pushed.note.starts_with("the target's codex is older"),
+            "{}",
+            pushed.note
+        );
+        let mut pull = ctx(Some(&codex));
+        pull.target = Target::Here;
+        let pulled = row_of(compare(&pro(), &older, &pull));
+        assert_eq!(
+            pulled.note,
+            "the job's harness must be the same version on both nodes (ADR 0008)"
+        );
+        let pulled_onto_older = row_of(compare(&older, &pro(), &pull));
+        assert_eq!(pulled_onto_older.outcome, Outcome::Refuse(Waiver::Force));
+        assert!(
+            pulled_onto_older
+                .note
+                .starts_with("the target's codex is older"),
+            "{}",
+            pulled_onto_older.note
+        );
+    }
+
+    /// The note orders versions as the resume guard does, not as text:
+    /// `0.155.9` is older than `0.155.10`, and a release is newer than its
+    /// own pre-release, where a string compare says the opposite of both.
+    #[test]
+    fn the_older_target_is_found_by_the_guards_order_not_by_text() {
+        let codex = HarnessKind::Codex;
+        let older = "the target's codex is older";
+        let note = |here: &str, target: &str| {
+            let source = with(&pro(), &[(name::CODEX, Some(here))]);
+            let peer = with(&pro(), &[(name::CODEX, Some(target))]);
+            compare(&source, &peer, &ctx(Some(&codex)))
+                .into_iter()
+                .find(|r| r.fact == name::CODEX)
+                .unwrap()
+                .note
+        };
+        let n = note("codex-cli 0.155.10", "codex-cli 0.155.9");
+        assert!(n.starts_with(older), "{n}");
+        let n = note("codex-cli 0.163.0-alpha.10.2", "codex-cli 0.163.0");
+        assert!(!n.starts_with(older), "{n}");
+        let n = note("codex-cli 0.163.0", "codex-cli 0.163.0-alpha.10.2");
+        assert!(n.starts_with(older), "{n}");
+    }
+
+    /// The session's floor is the newest Codex known to have written it,
+    /// which a version manager's pin in the workspace can put above what
+    /// the source's daemon finds: here 0.160.0 ran the thread while the
+    /// source's daemon finds 0.155.1. A target on 0.158.0 looks newer than
+    /// the source, yet the guard there refuses it, so the note names the
+    /// floor; a target on the source's own version is not refused by the
+    /// row and only warns; a target at the floor gets no such note.
+    #[test]
+    fn the_older_target_is_named_against_the_newest_known_writer() {
+        let codex = HarnessKind::Codex;
+        let floor = HarnessVersion::parse("0.160.0").unwrap();
+        let older_than_floor = "the target's codex is older than codex 0.160.0, the newest known to have written the session";
+        let row = |target: &str| {
+            let peer = with(&pro(), &[(name::CODEX, Some(target))]);
+            let mut context = ctx(Some(&codex));
+            context.floor = Some(&floor);
+            compare(&pro(), &peer, &context)
+                .into_iter()
+                .find(|r| r.fact == name::CODEX)
+                .unwrap()
+        };
+        let between = row("codex-cli 0.158.0");
+        assert_eq!(between.outcome, Outcome::Refuse(Waiver::Force));
+        assert!(
+            between.note.starts_with(older_than_floor),
+            "{}",
+            between.note
+        );
+        let same = row("codex-cli 0.155.1");
+        assert_eq!(same.outcome, Outcome::Warn);
+        assert!(same.note.starts_with(older_than_floor), "{}", same.note);
+        let at_floor = row("codex-cli 0.160.0");
+        assert_eq!(
+            at_floor.note,
+            "the job's harness must be the same version on both nodes (ADR 0008)"
+        );
+    }
+
     #[test]
     fn a_root_in_a_folder_the_target_syncs_is_refused() {
         let peer = with(&pro(), &[(name::ICLOUD_DESKTOP, Some("1"))]);
-        let root = Path::new("/Users/efebarandurmaz/Desktop/job");
+        let root = Path::new("/Users/me/Desktop/job");
         let mut context = ctx(None);
         context.root = Some(root);
         assert_eq!(
@@ -559,5 +831,77 @@ mod tests {
             outcome_of(&compare(&pro(), &pro(), &context), "clock"),
             Outcome::Warn
         );
+    }
+
+    /// The user and the home must be measured and equal on both nodes. When
+    /// neither node could read its user name, the two absences are equal,
+    /// and two users with the same `HOME` string must still be refused.
+    #[test]
+    fn an_unmeasured_user_or_home_is_refused_even_on_both_sides() {
+        for fact in [name::USER, name::HOME] {
+            let here = with(&pro(), &[(fact, None)]);
+            for peer in [with(&pro(), &[(fact, None)]), pro()] {
+                let rows = compare(&here, &peer, &ctx(None));
+                assert_eq!(
+                    outcome_of(&rows, fact),
+                    Outcome::Refuse(Waiver::Never),
+                    "{fact}"
+                );
+                assert!(!blocking(&rows, true).is_empty(), "{fact}");
+            }
+        }
+    }
+
+    /// Every suspend or move of a Codex job asks `lsof` whether Codex holds
+    /// the thread's rollout open, and fails on a node that has none. So a
+    /// Codex job is refused a target without it, with no waiver: it could
+    /// leave that node only by a steal.
+    #[test]
+    fn a_target_without_lsof_is_refused_a_codex_job() {
+        let codex = HarnessKind::Codex;
+        let claude = HarnessKind::ClaudeCode;
+        let without = with(&pro(), &[(name::LSOF, None)]);
+        let mut pull = ctx(Some(&codex));
+        pull.target = Target::Here;
+        for (here, peer, context, refused) in [
+            (&pro(), &without, ctx(Some(&codex)), true),
+            (&without, &pro(), pull.clone(), true),
+            (&without, &pro(), ctx(Some(&codex)), false),
+            (&pro(), &without, ctx(Some(&claude)), false),
+        ] {
+            let rows = compare(here, peer, &context);
+            assert_eq!(
+                outcome_of(&rows, name::LSOF) == Outcome::Refuse(Waiver::Never),
+                refused,
+                "{:?} {:?}",
+                context.target,
+                context.harness
+            );
+        }
+    }
+
+    /// Every job's workspace is a repository, and restore runs git on the
+    /// target. A target whose daemon finds no git would take the job and
+    /// fail to restore it, so a move to it is refused, with no waiver.
+    #[test]
+    fn a_target_without_git_is_refused() {
+        let codex = HarnessKind::Codex;
+        let without = with(&pro(), &[(name::GIT, None)]);
+        let mut pull = ctx(Some(&codex));
+        pull.target = Target::Here;
+        for (here, peer, context, refused) in [
+            (&pro(), &without, ctx(Some(&codex)), true),
+            (&without, &pro(), pull.clone(), true),
+            (&without, &pro(), ctx(Some(&codex)), false),
+            (&pro(), &without, ctx(None), false),
+        ] {
+            let rows = compare(here, peer, &context);
+            assert_eq!(
+                outcome_of(&rows, name::GIT) == Outcome::Refuse(Waiver::Never),
+                refused,
+                "{:?}",
+                context.target
+            );
+        }
     }
 }

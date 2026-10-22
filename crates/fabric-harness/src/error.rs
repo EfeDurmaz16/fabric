@@ -169,6 +169,15 @@ pub enum HarnessError {
         /// The file on this node that would have been overwritten.
         path: PathBuf,
     },
+    /// A destination changed after restore checked it and before restore
+    /// replaced it, as a harness that started and wrote to it would change it.
+    #[error(
+        "harness state at {path} changed while it was being restored; stop the harness that writes it and restore again"
+    )]
+    StateChanged {
+        /// The file on this node that changed.
+        path: PathBuf,
+    },
     /// A staged file does not match the length and digest its manifest records.
     #[error("staged file {path} is corrupt: {reason}")]
     StateCorrupt {
@@ -221,6 +230,38 @@ pub enum HarnessError {
         /// Its process ids.
         pids: Vec<u32>,
     },
+    /// The harness on this node is older than the newest one that wrote
+    /// the session, so starting it could leave records the newer one
+    /// refuses (gate finding F10b). Nothing was started.
+    #[error(
+        "{program} {local} is older than {program} {recorded}, which wrote session {session}; an older harness cannot run this session and would leave records the newer one refuses, so nothing was started. Update {program} on this node to {recorded} or later"
+    )]
+    HarnessOlderThanSession {
+        /// The harness program.
+        program: String,
+        /// The version the program on this node reports.
+        local: String,
+        /// The newest version the session records.
+        recorded: String,
+        /// The session.
+        session: SessionId,
+    },
+    /// The harness on this node did not report a version that parses, so
+    /// it cannot be shown to be at least the one that wrote the session.
+    /// Nothing was started.
+    #[error(
+        "the version of {program} on this node cannot be read ({reason}); session {session} was written by {program} {recorded}, and an older harness would leave records the newer one refuses, so nothing was started. Check that `{program} --version` prints a version"
+    )]
+    HarnessVersionUnknown {
+        /// The harness program.
+        program: String,
+        /// The newest version the session records.
+        recorded: String,
+        /// The session.
+        session: SessionId,
+        /// Why the version could not be read.
+        reason: String,
+    },
     /// A captured manifest, a record of this crate or a vendor file did not parse.
     #[error("{what} at {path} does not parse: {reason}")]
     Malformed {
@@ -267,6 +308,15 @@ pub enum HarnessError {
         /// The agent program.
         program: String,
     },
+    /// An ACP state directory is Fabric's own state directory, lies inside
+    /// it, or holds it.
+    #[error("{path} overlaps Fabric's own state at {fabric}; an agent's state directory must not")]
+    StateDirHoldsFabric {
+        /// The declared state directory.
+        path: PathBuf,
+        /// Fabric's state directory under the home.
+        fabric: PathBuf,
+    },
     /// The launch environment sets a variable that makes the harness keep
     /// its state or login somewhere other than the adapter reads and writes.
     #[error(
@@ -290,6 +340,13 @@ pub enum HarnessError {
         dir: PathBuf,
         /// The store the adapter reads.
         store: PathBuf,
+    },
+    /// An ACP agent's launch arguments hold a secret shape; they travel in
+    /// the manifest as part of the harness kind, outside any redaction.
+    #[error("the launch arguments of {program} hold a secret; pass it through the environment")]
+    SecretInArguments {
+        /// The agent program.
+        program: String,
     },
     /// A settings or MCP overlay holds a literal secret instead of a reference.
     #[error("{path} holds a literal secret; use a ${{VAR}} reference in an overlay")]
@@ -357,8 +414,10 @@ pub enum Input {
     Manifest,
     /// A departure record under `~/.fabric/harness/departed/`.
     DepartureRecord,
-    /// The first line of a Codex rollout.
+    /// A line of a Codex rollout.
     RolloutLine,
+    /// A line of a Claude transcript.
+    TranscriptLine,
     /// Claude's `~/.claude.json`.
     ConfigJson,
     /// A path inside a state tree.
@@ -373,6 +432,7 @@ impl std::fmt::Display for Input {
             Input::Manifest => "manifest",
             Input::DepartureRecord => "departure record",
             Input::RolloutLine => "rollout line",
+            Input::TranscriptLine => "transcript line",
             Input::ConfigJson => "config json",
             Input::StatePath => "state path",
             Input::WorkspacePath => "workspace path",

@@ -144,13 +144,19 @@ fn cargo_fetch_is_locked_exactly_when_a_lockfile_exists() {
 
 #[test]
 fn each_lockfile_names_its_manager_and_install() {
-    let cases: [(&[&str], NodeManager, &str); 7] = [
+    let cases: [(&[&str], NodeManager, &str); 9] = [
         (
             &["pnpm-lock.yaml"],
             NodeManager::Pnpm,
             "pnpm install --frozen-lockfile",
         ),
         (&["package-lock.json"], NodeManager::Npm, "npm ci"),
+        (&["npm-shrinkwrap.json"], NodeManager::Npm, "npm ci"),
+        (
+            &["npm-shrinkwrap.json", "package-lock.json"],
+            NodeManager::Npm,
+            "npm ci",
+        ),
         (
             &["yarn.lock"],
             NodeManager::YarnClassic,
@@ -404,8 +410,8 @@ fn python_installs_into_the_workspace_venv() {
     assert_eq!(
         commands(&detect(requirements.path(), &[]).unwrap()),
         [
-            "uv venv --allow-existing",
-            "uv pip install -r requirements.txt"
+            "uv venv --allow-existing .venv",
+            "uv pip install --python .venv -r requirements.txt"
         ]
     );
 }
@@ -598,6 +604,56 @@ fn a_linked_pin_file_is_refused_without_reading_it() {
         Err(DetectError::NotARegularFile { file }) => assert_eq!(file, ".nvmrc"),
         other => panic!("{other:?}"),
     }
+}
+
+/// A file detection only checks for selects the step that reads it, so a
+/// link there out of the workspace would have `npm ci` read a lockfile
+/// that differs from node to node, one to a file the secret policy denies
+/// names a file capture leaves behind, and a directory there would select
+/// an install that cannot run. Each is refused with the file named, as a
+/// linked pin file is.
+#[test]
+fn a_linked_or_non_regular_file_detection_checks_for_is_refused() {
+    let elsewhere = workspace(&[("lock.json", "{}")]).unwrap();
+    let linked = workspace(&[("package.json", PACKAGE_JSON)]).unwrap();
+    symlink(
+        elsewhere.path().join("lock.json"),
+        linked.path().join("package-lock.json"),
+    )
+    .unwrap();
+    let denied = workspace(&[(".env", "django==5.2\n")]).unwrap();
+    symlink(".env", denied.path().join("requirements.txt")).unwrap();
+    let directory = workspace(&[("Cargo.toml/x", "")]).unwrap();
+    for (dir, name) in [
+        (&linked, "package-lock.json"),
+        (&denied, "requirements.txt"),
+        (&directory, "Cargo.toml"),
+    ] {
+        match detect(dir.path(), &[]) {
+            Err(DetectError::NotARegularFile { file }) => assert_eq!(file, name),
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+}
+
+/// A link inside the workspace to a regular file there, as Django's
+/// `requirements.txt -> requirements/base.txt`, travels as a link and
+/// resolves the same on every node, so it counts as the file it names:
+/// the same steps, and the same install inputs, as a copy of that file.
+#[test]
+fn a_file_detection_checks_for_may_link_to_a_file_inside_the_workspace() {
+    let base = "django==5.2\n";
+    let copied = workspace(&[("requirements.txt", base)]).unwrap();
+    let linked = workspace(&[("requirements/base.txt", base)]).unwrap();
+    symlink(
+        "requirements/base.txt",
+        linked.path().join("requirements.txt"),
+    )
+    .unwrap();
+    let copied = detect(copied.path(), &[]).unwrap();
+    let linked = detect(linked.path(), &[]).unwrap();
+    assert_eq!(commands(&linked), commands(&copied));
+    assert_eq!(linked.inputs_digest(), copied.inputs_digest());
 }
 
 /// A link anywhere on the way is refused, not only in the last component:
@@ -808,4 +864,25 @@ fn a_file_the_job_denies_is_not_read() {
     let found = detect(dir.path(), &[]).unwrap();
     assert!(found.pins().is_empty());
     assert!(found.spec().tools.is_empty());
+}
+
+/// Capture leaves a denied lockfile behind, so the source must detect as
+/// the target will, without it: no install for a lockfile that never
+/// arrives, and no `--locked` for a `Cargo.lock` that stays home.
+#[test]
+fn a_lockfile_the_job_denies_counts_as_absent() {
+    let dir = workspace(&[
+        ("package.json", PACKAGE_JSON),
+        ("package-lock.json", "{}"),
+        ("Cargo.toml", "[package]\nname = \"x\"\n"),
+        ("Cargo.lock", ""),
+        (
+            ".fabric/env.toml",
+            "secret_patterns = [\"package-lock.json\", \"cargo.lock\"]\n",
+        ),
+    ])
+    .unwrap();
+    let found = detect(dir.path(), &[]).unwrap();
+    assert_eq!(commands(&found), ["cargo fetch"]);
+    assert_eq!(found.node_manager(), None);
 }

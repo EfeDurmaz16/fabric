@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, NodeId, RecordHash, SnapshotId};
-use fabric_harness::SessionId;
+use fabric_harness::{HarnessVersion, SessionId};
 use rustix::process::{Pid, Signal};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -58,6 +58,14 @@ pub enum LocalError {
         /// What failed.
         reason: String,
     },
+    /// The recorded pid leads a group and its start time could not be read.
+    #[error(
+        "pid {pid} leads a process group and its start time could not be read, so whether it is still the harness is not known and it was not signalled; nothing was captured. Run the command again"
+    )]
+    Unidentified {
+        /// The recorded pid.
+        pid: NonZeroU32,
+    },
 }
 
 /// Whether a recorded harness still runs.
@@ -69,6 +77,10 @@ pub enum Liveness {
     Group,
     /// Nothing of it runs.
     Gone,
+    /// Its start time could not be read while a group with its pid runs,
+    /// so that group may be its own or another process's after the pid
+    /// was given out again; nothing signals it.
+    Unknown,
 }
 
 /// How long a group gets to empty after `SIGKILL`.
@@ -163,7 +175,8 @@ pub struct HarnessRecord {
     pub epoch: Epoch,
     /// Its process id, which is also its process group id.
     pub pid: NonZeroU32,
-    /// The kernel's start time of the process, as `ps` prints it.
+    /// The kernel's start time of the process, as `ps` prints it, and on
+    /// Linux its start in clock ticks since boot after it.
     pub started: String,
 }
 
@@ -189,6 +202,33 @@ pub struct SessionRecord {
     pub harness: HarnessKind,
     /// The session id the harness minted.
     pub session: SessionId,
+    /// For a Codex session, the newest Codex known to have written it: the
+    /// version the capture this node restored, or took last, recorded,
+    /// raised to the version each launch on the session started with. A
+    /// Codex that resumes a thread leaves no version in its rollout, so
+    /// this is what keeps an older Codex off a thread a newer one
+    /// continued elsewhere (ADR 0006, Settings travel with the session).
+    /// `None` for any other harness, whose guard reads the session's own
+    /// files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_writer: Option<HarnessVersion>,
+}
+
+/// A session a registration recorded before its `Resumed`, until the
+/// session file holds it.
+///
+/// It is the job's session only if the record right after `after` is that
+/// `Resumed`: a crash between the two writes then leaves it to be moved
+/// into place, and a crash before the `Resumed` leaves one to drop, since
+/// the CLI killed the harness that named it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingSession {
+    /// The ledger head the registration's `Resumed` follows.
+    pub after: RecordHash,
+    /// The epoch the harness was registered under.
+    pub epoch: Epoch,
+    /// The session.
+    pub record: SessionRecord,
 }
 
 /// Reads a node-local file, or `None` when it does not exist.
@@ -240,16 +280,104 @@ pub fn remove(path: &Path) -> Result<(), LocalError> {
     }
 }
 
-/// The kernel's start time of `pid` as `ps -o lstart=` prints it, or `None` when no such process runs.
+/// The program that reads a process's start time and group.
+const PS: &str = "ps";
+
+/// The kernel's start time of `pid` as `ps -o lstart=` prints it, and on
+/// Linux its start in clock ticks since boot after it, or `None` when no
+/// such process runs or `ps` failed.
+///
+/// `lstart` has whole seconds, and a pid can be given out again within
+/// one on a busy Linux host whose pid space is 32768; the ticks, a hundredth
+/// of a second, tell the two processes apart. macOS gives out pids up to
+/// 99998 and cannot start that many processes in a second.
 pub async fn process_started(pid: NonZeroU32) -> Option<String> {
-    let output = tokio::process::Command::new("ps")
+    match probe_started(PS, pid).await {
+        Started::At(text) => Some(text),
+        Started::Absent | Started::Unknown => None,
+    }
+}
+
+/// What `ps` says about a pid's start time.
+enum Started {
+    /// A process with the pid runs, and started then.
+    At(String),
+    /// `ps` ran and found no process with the pid: it exits 1 and prints nothing.
+    Absent,
+    /// `ps` could not be run, or failed in another way.
+    Unknown,
+}
+
+async fn probe_started(ps: &str, pid: NonZeroU32) -> Started {
+    let Ok(output) = tokio::process::Command::new(ps)
         .args(["-o", "lstart=", "-p", &pid.to_string()])
         .env("LC_ALL", "C")
         .output()
         .await
-        .ok()?;
+    else {
+        return Started::Unknown;
+    };
     let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    (output.status.success() && !text.is_empty()).then_some(text)
+    if output.status.success() && !text.is_empty() {
+        match kernel_start(pid) {
+            KernelStart::NotKept => Started::At(text),
+            KernelStart::Ticks(ticks) => Started::At(format!("{text} {ticks}")),
+            // The process ended, or its pid passed to another, after `ps`
+            // read it; which one this is cannot be told.
+            KernelStart::Unread => Started::Unknown,
+        }
+    } else if output.status.code() == Some(1) && text.is_empty() && output.stderr.is_empty() {
+        Started::Absent
+    } else {
+        Started::Unknown
+    }
+}
+
+/// What the kernel says of a process's start, finer than `ps` does.
+enum KernelStart {
+    /// This platform keeps nothing finer that Fabric reads.
+    #[cfg_attr(
+        target_os = "linux",
+        expect(dead_code, reason = "Linux keeps the start in ticks")
+    )]
+    NotKept,
+    /// Clock ticks since boot.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "only Linux start ticks are read")
+    )]
+    Ticks(u64),
+    /// The platform keeps it and it could not be read.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "only Linux start ticks are read")
+    )]
+    Unread,
+}
+
+/// The start of `pid` in clock ticks since boot, read from `/proc`.
+#[cfg(target_os = "linux")]
+fn kernel_start(pid: NonZeroU32) -> KernelStart {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .as_deref()
+        .and_then(start_ticks)
+        .map_or(KernelStart::Unread, KernelStart::Ticks)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kernel_start(_pid: NonZeroU32) -> KernelStart {
+    KernelStart::NotKept
+}
+
+/// Field 22 of a `/proc/<pid>/stat` line, the process's start in clock
+/// ticks since boot. The command name in field 2 is in parentheses and may
+/// hold spaces and parentheses itself, so fields are counted from the last
+/// `)`.
+#[cfg(any(target_os = "linux", test))]
+fn start_ticks(stat: &str) -> Option<u64> {
+    let (_, after_name) = stat.rsplit_once(')')?;
+    after_name.split_whitespace().nth(19)?.parse().ok()
 }
 
 /// `pid` as a process id that may lead a group Fabric signals: any but 1.
@@ -288,10 +416,17 @@ impl HarnessRecord {
     /// When the pid names another process now, the group is gone: a pid is
     /// not given out again while a process group with that id exists.
     pub async fn liveness(&self) -> Liveness {
-        match process_started(self.pid).await {
-            Some(started) if started == self.started => Liveness::Leader,
-            None if self.group_exists() => Liveness::Group,
-            Some(_) | None => Liveness::Gone,
+        self.liveness_with(PS).await
+    }
+
+    async fn liveness_with(&self, ps: &str) -> Liveness {
+        match probe_started(ps, self.pid).await {
+            Started::At(started) if started == self.started => Liveness::Leader,
+            Started::Absent if self.group_exists() => Liveness::Group,
+            // A failed probe cannot tell this group from one another
+            // process leads under the same pid after it was given out again.
+            Started::Unknown if self.group_exists() => Liveness::Unknown,
+            Started::At(_) | Started::Absent | Started::Unknown => Liveness::Gone,
         }
     }
 
@@ -310,10 +445,18 @@ impl HarnessRecord {
     ///
     /// A group that is gone, or a pid now owned by another process, is left
     /// alone. A group that cannot be signalled or outlives `SIGKILL` is an
-    /// error, so no caller captures or hands away a workspace it still writes.
+    /// error, so no caller captures or hands away a workspace it still writes,
+    /// and so is a group whose leader's start time cannot be read, which is
+    /// never signalled.
     pub async fn stop(&self, grace: Duration) -> Result<(), LocalError> {
-        if self.liveness().await == Liveness::Gone {
-            return Ok(());
+        self.stop_with(grace, PS).await
+    }
+
+    async fn stop_with(&self, grace: Duration, ps: &str) -> Result<(), LocalError> {
+        match self.liveness_with(ps).await {
+            Liveness::Gone => return Ok(()),
+            Liveness::Unknown => return Err(LocalError::Unidentified { pid: self.pid }),
+            Liveness::Leader | Liveness::Group => {}
         }
         let survived = |reason: String| LocalError::Survived {
             pid: self.pid,
@@ -323,12 +466,12 @@ impl HarnessRecord {
             .group()
             .ok_or_else(|| survived("the pid is not a process id".to_owned()))?;
         self.signal(group, Signal::TERM).map_err(survived)?;
-        if self.wait_gone(grace).await {
+        if self.wait_gone(grace, ps).await {
             return Ok(());
         }
         tracing::warn!(pid = self.pid, "harness ignored SIGTERM; killing its group");
         self.signal(group, Signal::KILL).map_err(survived)?;
-        if self.wait_gone(KILL_WAIT).await {
+        if self.wait_gone(KILL_WAIT, ps).await {
             Ok(())
         } else {
             Err(survived("it outlived SIGKILL".to_owned()))
@@ -342,10 +485,10 @@ impl HarnessRecord {
         }
     }
 
-    async fn wait_gone(&self, limit: Duration) -> bool {
+    async fn wait_gone(&self, limit: Duration, ps: &str) -> bool {
         let deadline = tokio::time::Instant::now() + limit;
         loop {
-            if self.liveness().await == Liveness::Gone {
+            if self.liveness_with(ps).await == Liveness::Gone {
                 return true;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -366,6 +509,59 @@ mod tests {
             pid: NonZeroU32::new(child.id().unwrap()).unwrap(),
             started,
         }
+    }
+
+    /// A command name may hold spaces and parentheses; the start is still
+    /// the 22nd field of the line.
+    #[test]
+    fn the_start_ticks_are_read_past_any_command_name() {
+        let stat =
+            "4321 (a) b (c)) S 1 4321 4321 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654 1000 100";
+        assert_eq!(start_ticks(stat), Some(987_654));
+        assert_eq!(start_ticks("4321 (sleep) S 1"), None);
+    }
+
+    /// Two processes started in the same second have one `lstart`, and a
+    /// pid given out again within that second must not make the second
+    /// process pass for the first.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn two_processes_started_in_one_second_have_different_starts() {
+        let spawn = || {
+            tokio::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap()
+        };
+        let lstart = |pid: u32| {
+            String::from_utf8(
+                std::process::Command::new("ps")
+                    .args(["-o", "lstart=", "-p", &pid.to_string()])
+                    .env("LC_ALL", "C")
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+        };
+        for _ in 0..20 {
+            let mut first = spawn();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let mut second = spawn();
+            let (a, b) = (first.id().unwrap(), second.id().unwrap());
+            let same_second = lstart(a) == lstart(b);
+            let starts = (
+                process_started(NonZeroU32::new(a).unwrap()).await,
+                process_started(NonZeroU32::new(b).unwrap()).await,
+            );
+            first.kill().await.unwrap();
+            second.kill().await.unwrap();
+            if same_second {
+                assert_ne!(starts.0, starts.1);
+                return;
+            }
+        }
+        panic!("no two processes started in one second");
     }
 
     #[tokio::test]
@@ -466,5 +662,30 @@ mod tests {
             rustix::process::test_kill_process(child).is_err(),
             "the background process outlived the stop"
         );
+    }
+
+    /// A start-time probe that fails says nothing about who holds the pid
+    /// now. A stale record whose pid another process took, and leads a
+    /// group with, must not have that group signalled on such a failure.
+    #[tokio::test]
+    async fn a_failed_start_time_probe_signals_nothing() {
+        let no_ps = "/nonexistent/fabric-test-ps";
+        let mut other = tokio::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let stale = record_of(&other, "the harness that had this pid".to_owned());
+        assert_eq!(stale.liveness_with(no_ps).await, Liveness::Unknown);
+        let refused = stale.stop_with(Duration::from_millis(100), no_ps).await;
+        assert!(
+            matches!(refused, Err(LocalError::Unidentified { .. })),
+            "{refused:?}"
+        );
+        assert!(
+            other.try_wait().unwrap().is_none(),
+            "the other process's group was signalled"
+        );
+        other.kill().await.unwrap();
     }
 }

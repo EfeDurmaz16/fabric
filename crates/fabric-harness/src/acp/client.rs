@@ -5,7 +5,9 @@
 //! `session/prompt`, `session/cancel`, `session/update`), answers every
 //! agent request so the agent never blocks, and grants a permission only
 //! when the policy the caller chose says so, never more than it says. Deny
-//! is the default. At most `UPDATE_BUFFER` `session/update` notifications
+//! is the default. Once a turn is cancelled, every permission request for
+//! its session is answered `cancelled` until the next prompt, as the
+//! schema asks of `session/cancel`, so no tool runs after a cancel. At most `UPDATE_BUFFER` `session/update` notifications
 //! wait for `next_update`; newer ones are dropped and counted in
 //! `dropped_updates`, so the reader never waits on a caller who is not
 //! draining updates. A handshake request has a
@@ -13,13 +15,15 @@
 //! the agent as one whole line written by a single writer task, so a
 //! caller that drops a request mid-way cannot leave half a line on the
 //! agent's stdin, and a dropped request leaves no waiter behind. A line
-//! from the agent longer than `MAX_LINE` closes the connection.
+//! from the agent longer than `MAX_LINE` closes the connection, and so
+//! does an agent that stops reading its stdin while `OUTGOING_BUFFER`
+//! lines wait for it.
 //!
 //! Field names follow `schema/v1/schema.json` of
 //! `agentclientprotocol/agent-client-protocol` at schema v1.26.0
 //! (2026-10-16), read on 2026-10-19.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -43,6 +47,10 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// The longest line read from the agent, in bytes.
 pub const MAX_LINE: usize = 16 * 1024 * 1024;
+
+/// How many lines may wait for the writer before the agent is taken to
+/// have stopped reading its stdin and the connection is closed.
+pub const OUTGOING_BUFFER: usize = 1024;
 
 /// How many `session/update` notifications wait for `next_update` before
 /// newer ones are dropped and counted.
@@ -68,6 +76,10 @@ pub enum AcpError {
     /// The agent closed its stdout.
     #[error("agent closed the connection")]
     Closed,
+    /// `OUTGOING_BUFFER` lines already waited for an agent that is not
+    /// reading its stdin.
+    #[error("the agent stopped reading: {OUTGOING_BUFFER} lines wait unwritten")]
+    Saturated,
     /// A handshake request got no answer within `HANDSHAKE_TIMEOUT`.
     #[error("{method} got no answer within {HANDSHAKE_TIMEOUT:?}")]
     Timeout {
@@ -165,11 +177,14 @@ impl PermissionPolicy {
 
 type Waiter = oneshot::Sender<Result<Value, AcpError>>;
 type Pending = Arc<Mutex<Option<HashMap<u64, Waiter>>>>;
-type Outgoing = mpsc::UnboundedSender<String>;
+type Outgoing = mpsc::Sender<String>;
+/// The sessions whose turn was cancelled and has not been prompted since.
+type Cancelled = Arc<Mutex<HashSet<String>>>;
 
 struct Inner {
     outgoing: Outgoing,
     pending: Pending,
+    cancelled: Cancelled,
     next_id: AtomicU64,
     updates: tokio::sync::Mutex<mpsc::Receiver<SessionUpdate>>,
     dropped_updates: Arc<AtomicU64>,
@@ -216,12 +231,18 @@ struct RpcErrorBody {
 fn write_line(outgoing: &Outgoing, value: &Value) -> Result<(), AcpError> {
     let mut text = serde_json::to_string(value).map_err(|e| AcpError::Protocol(e.to_string()))?;
     text.push('\n');
-    outgoing.send(text).map_err(|_| AcpError::Closed)
+    outgoing.try_send(text).map_err(|e| match e {
+        mpsc::error::TrySendError::Full(_) => AcpError::Saturated,
+        mpsc::error::TrySendError::Closed(_) => AcpError::Closed,
+    })
 }
 
 /// Writes queued lines to the agent until every sender is gone or a write
-/// fails; then the agent's stdin is closed.
-async fn write_loop(mut stdin: ChildStdin, mut lines: mpsc::UnboundedReceiver<String>) {
+/// fails; then the agent's stdin is closed. A failed write fails every
+/// waiting request: its line, or a later one, never reached the agent, and
+/// an agent that keeps its stdout open would otherwise leave a request
+/// with no deadline, such as a prompt, waiting forever.
+async fn write_loop(mut stdin: ChildStdin, mut lines: mpsc::Receiver<String>, pending: Pending) {
     while let Some(line) = lines.recv().await {
         let written = async {
             stdin.write_all(line.as_bytes()).await?;
@@ -229,6 +250,8 @@ async fn write_loop(mut stdin: ChildStdin, mut lines: mpsc::UnboundedReceiver<St
         };
         if let Err(e) = written.await {
             warn!(error = %e, "acp: write failed");
+            lines.close();
+            fail_pending(&pending);
             break;
         }
     }
@@ -314,10 +337,30 @@ impl UpdateSink {
     }
 }
 
+/// The answer to a `session/request_permission` with `params`: cancelled
+/// for a session whose turn was cancelled, else what `policy` picks.
+fn permission_answer(policy: PermissionPolicy, cancelled: &Cancelled, params: &Value) -> Value {
+    let session = params.get("sessionId").and_then(Value::as_str);
+    // A poisoned set cannot say the session is live; answer cancelled.
+    let is_cancelled = cancelled
+        .lock()
+        .map_or(true, |set| session.is_some_and(|s| set.contains(s)));
+    if is_cancelled {
+        return json!({ "outcome": { "outcome": "cancelled" } });
+    }
+    let options = params
+        .get("options")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    policy.choose(&options)
+}
+
 async fn read_loop(
     stdout: ChildStdout,
     outgoing: Outgoing,
     pending: Pending,
+    cancelled: Cancelled,
     updates: UpdateSink,
     policy: PermissionPolicy,
 ) {
@@ -356,13 +399,8 @@ async fn read_loop(
         match (message.id, message.method) {
             (Some(id), Some(method)) => {
                 let response = if method == "session/request_permission" {
-                    let options = message
-                        .params
-                        .get("options")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    json!({ "jsonrpc": "2.0", "id": id, "result": policy.choose(&options) })
+                    let answer = permission_answer(policy, &cancelled, &message.params);
+                    json!({ "jsonrpc": "2.0", "id": id, "result": answer })
                 } else {
                     debug!(%method, "acp: agent request not supported; answering method not found");
                     json!({
@@ -371,8 +409,8 @@ async fn read_loop(
                         "error": { "code": -32601, "message": format!("method not supported by this client: {method}") }
                     })
                 };
-                if write_line(&outgoing, &response).is_err() {
-                    warn!("acp: writer closed; stopping");
+                if let Err(e) = write_line(&outgoing, &response) {
+                    warn!(error = %e, "acp: cannot answer the agent; closing");
                     break;
                 }
             }
@@ -414,14 +452,16 @@ impl AcpClient {
     /// Takes over the agent's pipes and starts reading.
     #[must_use]
     pub fn attach(stdin: ChildStdin, stdout: ChildStdout, policy: PermissionPolicy) -> Self {
-        let (outgoing, lines) = mpsc::unbounded_channel();
-        tokio::spawn(write_loop(stdin, lines));
+        let (outgoing, lines) = mpsc::channel(OUTGOING_BUFFER);
         let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
+        let cancelled: Cancelled = Arc::new(Mutex::new(HashSet::new()));
+        tokio::spawn(write_loop(stdin, lines, Arc::clone(&pending)));
         let (sink, rx, dropped_updates) = UpdateSink::new(UPDATE_BUFFER);
         let reader = tokio::spawn(read_loop(
             stdout,
             outgoing.clone(),
             Arc::clone(&pending),
+            Arc::clone(&cancelled),
             sink,
             policy,
         ));
@@ -429,6 +469,7 @@ impl AcpClient {
             inner: Arc::new(Inner {
                 outgoing,
                 pending,
+                cancelled,
                 next_id: AtomicU64::new(1),
                 updates: tokio::sync::Mutex::new(rx),
                 dropped_updates,
@@ -549,8 +590,14 @@ impl AcpClient {
         Ok(())
     }
 
-    /// Sends one text prompt and waits for the turn to end.
+    /// Sends one text prompt and waits for the turn to end. A new turn
+    /// lifts an earlier cancel of the session.
     pub async fn prompt(&self, session: &SessionId, text: &str) -> Result<StopReason, AcpError> {
+        self.inner
+            .cancelled
+            .lock()
+            .map_err(|_| AcpError::Protocol("cancelled set poisoned".to_owned()))?
+            .remove(session.as_str());
         let result = self
             .request(
                 "session/prompt",
@@ -569,8 +616,14 @@ impl AcpClient {
         Ok(StopReason::parse(reason))
     }
 
-    /// Queues `session/cancel`.
+    /// Queues `session/cancel`. From now until the next `prompt` of the
+    /// session, its permission requests are answered `cancelled`.
     pub fn cancel(&self, session: &SessionId) -> Result<(), AcpError> {
+        self.inner
+            .cancelled
+            .lock()
+            .map_err(|_| AcpError::Protocol("cancelled set poisoned".to_owned()))?
+            .insert(session.as_str().to_owned());
         self.notify("session/cancel", &json!({ "sessionId": session.as_str() }))
     }
 
@@ -627,6 +680,36 @@ mod tests {
     }
 
     #[test]
+    fn a_cancelled_session_gets_no_permission_until_its_next_prompt() {
+        let cancelled: Cancelled = Arc::new(Mutex::new(HashSet::new()));
+        let params = json!({
+            "sessionId": "s1",
+            "options": [{ "optionId": "a", "name": "Allow", "kind": "allow_once" }]
+        });
+        let allowed = json!({ "outcome": { "outcome": "selected", "optionId": "a" } });
+        let refused = json!({ "outcome": { "outcome": "cancelled" } });
+        assert_eq!(
+            permission_answer(PermissionPolicy::AllowOnce, &cancelled, &params),
+            allowed
+        );
+        cancelled.lock().unwrap().insert("s1".to_owned());
+        assert_eq!(
+            permission_answer(PermissionPolicy::AllowOnce, &cancelled, &params),
+            refused
+        );
+        let other = json!({ "sessionId": "s2", "options": params["options"].clone() });
+        assert_eq!(
+            permission_answer(PermissionPolicy::AllowOnce, &cancelled, &other),
+            allowed
+        );
+        cancelled.lock().unwrap().remove("s1");
+        assert_eq!(
+            permission_answer(PermissionPolicy::AllowOnce, &cancelled, &params),
+            allowed
+        );
+    }
+
+    #[test]
     fn stop_reason_keeps_unknown_values() {
         assert_eq!(StopReason::parse("end_turn"), StopReason::EndTurn);
         assert_eq!(StopReason::parse("cancelled"), StopReason::Cancelled);
@@ -650,6 +733,52 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap().update, json!(0));
         assert_eq!(rx.try_recv().unwrap().update, json!(1));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_fails_a_waiting_prompt() {
+        // The agent closes its stdin but keeps its stdout open.
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec 0<&-; sleep 30")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let client = AcpClient::attach(stdin, stdout, PermissionPolicy::Deny);
+        let session = SessionId::parse("s1").unwrap();
+        let answer = tokio::time::timeout(Duration::from_secs(10), client.prompt(&session, "hi"))
+            .await
+            .expect("the prompt must fail, not wait for an answer that cannot come");
+        assert!(answer.is_err());
+        child.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_stops_reading_is_disconnected_not_buffered() {
+        // The agent floods permission requests and never reads an answer.
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"session/request_permission","params":{"options":[]}}"#;
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("while :; do echo '{request}'; done"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let client = AcpClient::attach(stdin, stdout, PermissionPolicy::Deny);
+        let session = SessionId::parse("s1").unwrap();
+        let answer = tokio::time::timeout(Duration::from_secs(20), client.prompt(&session, "hi"))
+            .await
+            .expect("the prompt must fail once the queue is full");
+        assert!(answer.is_err());
+        child.kill().await.unwrap();
     }
 
     #[test]

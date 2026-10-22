@@ -18,11 +18,14 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use fabric_core::env::SetupStep;
+use fabric_core::harness::ProgramName;
 use fabric_core::path::{AbsPath, RelPath};
 use fabric_core::snapshot::{CacheClass, CarryKey, Platform, Remake};
 use fabric_env::detect::{CacheOrigin, Completion, Detection, Ecosystem, NodeManager};
 use fabric_net::wire::{FactName, FactValue, Facts, MAX_FACT_VALUE};
 use fabric_store::capture::CarryKeys;
+
+use crate::harnesses::HarnessEnv;
 
 /// How long one measuring command may run.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -33,6 +36,11 @@ pub mod name {
     pub const USER: &str = "user";
     /// `$HOME`.
     pub const HOME: &str = "home";
+    /// `git --version`, found on the daemon's own `PATH`, where restore runs it.
+    pub const GIT: &str = "git.version";
+    /// Where Codex capture and restore find `lsof`, which they ask whether
+    /// a Codex process holds a thread's rollout open.
+    pub const LSOF: &str = "lsof";
     /// The operating system, as Rust names it.
     pub const OS: &str = "os";
     /// The CPU architecture, as Rust names it.
@@ -79,6 +87,12 @@ pub mod name {
     pub const ICLOUD_DESKTOP: &str = "icloud.desktop";
     /// Whether iCloud Drive syncs `~/Documents`.
     pub const ICLOUD_DOCUMENTS: &str = "icloud.documents";
+    /// Where the `PATH` of the pulling command finds the job's ACP agent;
+    /// measured by the target of a pull only, never sent to a peer.
+    pub const ACP_AGENT: &str = "acp.agent";
+    /// The `state_dir` the target's `harness.toml` gives the job's ACP
+    /// agent; measured by the target of a pull only, never sent to a peer.
+    pub const ACP_STATE_DIR: &str = "acp.state_dir";
 }
 
 /// One node's measured facts, by name.
@@ -105,8 +119,28 @@ impl NodeFacts {
         )
     }
 
-    /// Measures this node, looking programs up on `path_var`.
+    /// Measures this node, looking programs up on `path_var`, git on this
+    /// process's own `PATH`, where restore runs it, and `lsof` where Codex
+    /// capture looks for it.
     pub async fn measure(home: &Path, path_var: &OsString, cargo_home: Option<PathBuf>) -> Self {
+        let own_path = std::env::var_os("PATH").unwrap_or_default();
+        let (mut facts, git) = tokio::join!(
+            Box::pin(Self::measure_tools(home, path_var, cargo_home)),
+            probe_command("git", &["--version"], Probe::Output, &own_path, home),
+        );
+        if let Some(git) = git {
+            facts.0.insert(name::GIT.to_owned(), git);
+        }
+        if let Some(lsof) = fabric_harness::codex::Codex::lsof() {
+            facts
+                .0
+                .insert(name::LSOF.to_owned(), lsof.display().to_string());
+        }
+        facts
+    }
+
+    /// Measures everything but git, looking programs up on `path_var`.
+    async fn measure_tools(home: &Path, path_var: &OsString, cargo_home: Option<PathBuf>) -> Self {
         // Each probe is boxed, so the joined future holds 20 pointers, not 20 child processes.
         let run = |program: &'static str, args: &'static [&'static str], probe: Probe| {
             let path_var = path_var.clone();
@@ -203,6 +237,27 @@ impl NodeFacts {
         Self(facts)
     }
 
+    /// Adds what this node has for the ACP agent `program`: where the
+    /// `PATH` of `env` finds it, and the `state_dir` its configuration gives
+    /// it. Either is absent when the node has none, and the state directory
+    /// is absent too when capture and restore would refuse it: outside the
+    /// home, the home itself or under `~/.fabric`, or reached through a link.
+    pub fn measure_acp(&mut self, program: &ProgramName, env: &HarnessEnv) {
+        if let Some(found) = find_on_path(program.as_str(), &env.path_var) {
+            self.0
+                .insert(name::ACP_AGENT.to_owned(), found.display().to_string());
+        }
+        if let Some(entry) = env.config.acp.get(program.as_str())
+            && crate::harnesses::acp_adapter(program, &[], env)
+                .is_ok_and(|adapter| adapter.check_state_dir().is_ok())
+        {
+            self.0.insert(
+                name::ACP_STATE_DIR.to_owned(),
+                entry.state_dir.display().to_string(),
+            );
+        }
+    }
+
     /// The value of a fact, if it was measured.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&str> {
@@ -272,9 +327,15 @@ async fn probe_command(
 }
 
 /// The first executable named `program` on `path_var`.
+///
+/// A relative or empty entry is skipped, as the harness's own lookup
+/// skips it: it names a directory relative to the daemon's working
+/// directory here and to the workspace at launch, so the binary measured
+/// and the binary launched could differ.
 pub fn find_on_path(program: &str, path_var: &OsString) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     std::env::split_paths(path_var)
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(program))
         .find(|candidate| {
             std::fs::metadata(candidate)
@@ -672,5 +733,33 @@ mod tests {
         assert_eq!(major("v22.23.2").as_deref(), Some("22"));
         assert_eq!(major("11.23.0").as_deref(), Some("11"));
         assert_eq!(major("nightly"), None);
+    }
+
+    /// A relative `PATH` entry names a directory relative to the daemon's
+    /// working directory here, and to the workspace once the harness
+    /// starts, so the measured binary and the launched one could differ.
+    /// It is skipped, as the harness's own lookup skips it.
+    #[test]
+    fn a_relative_path_entry_is_never_searched() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("fabric-test-tool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let up = "../".repeat(cwd.components().count());
+        let relative = format!(
+            "{up}{}",
+            dir.path().display().to_string().trim_start_matches('/')
+        );
+        assert!(Path::new(&relative).join("fabric-test-tool").is_file());
+        assert_eq!(
+            find_on_path("fabric-test-tool", &OsString::from(&relative)),
+            None
+        );
+        assert_eq!(
+            find_on_path("fabric-test-tool", &dir.path().as_os_str().to_owned()),
+            Some(tool)
+        );
     }
 }

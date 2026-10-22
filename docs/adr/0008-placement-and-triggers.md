@@ -4,6 +4,8 @@ Status: accepted, 2026-10-19
 
 2026-10-20: [ADR 0016](0016-node-and-cli-as-built.md) records `fabric doctor` as built, with the rows that warn where this table refuses and why.
 
+Amended 2026-10-21 after gate finding F10: the harness version rows still compare strings and `--force` still waives them, and when the target's version is the older one the note says so, read through the same parse and order the resume guard of ADR 0006 uses. That guard, not this row, keeps an older harness off a session, and no flag waives it.
+
 Amended 2026-10-19 after step 1 research. The root rule moved to ADR 0011. This ADR now states the one placement command of this phase, `fabric job move <job> --to <node>`, the pull form of it, the rule that every automatic choice prints its reason, and the preflight `fabric doctor` runs before any move (`2026-10-19-step1-design-input.md`, sections 8.0 and 9, D18 and D19; `step1/preflight-2026-10-19.md`). Triggers stay out of this phase.
 
 ## Context
@@ -25,7 +27,7 @@ There is no placement policy. There are two commands and both name the node:
 
 Nothing picks a node. A warm-cache rule was considered (prefer the node that already holds most of the latest snapshot's chunks) and dropped, because right after a move the warmest node is always the one the user just left. The warm-cache measure survives as information: `fabric status` shows, per paired node, the fraction of the latest snapshot's chunks that node holds, and the owner of every job, so the user can see where a move would be cheap and who holds what before typing anything.
 
-Where Fabric does choose, it prints the reason in the command's output, one line per choice. In this phase the choices are: the workspace root ("same path as the source, `/Users/efebarandurmaz/oss/x`", ADR 0011), the transport ("TCP+TLS: QUIC to `fab1...` timed out after 2 s", ADR 0005), each cache carried or rebuilt ("`node_modules` rebuilt: pnpm 11.23.0 on the source, none here", ADR 0012), and each setup step run ("`pnpm install --frozen-lockfile`: `node_modules` missing", ADR 0007). A choice the user cannot see is a choice the user cannot correct, and the research's one documented placement failure is a silent one (T3 #15814, cited in the design input, D19).
+Where Fabric does choose, it prints the reason in the command's output, one line per choice. In this phase the choices are: the workspace root ("same path as the source, `/Users/me/oss/x`", ADR 0011), the transport ("TCP+TLS: QUIC to `fab1...` timed out after 2 s", ADR 0005), each cache carried or rebuilt ("`node_modules` rebuilt: pnpm 11.23.0 on the source, none here", ADR 0012), and each setup step run ("`pnpm install --frozen-lockfile`: `node_modules` missing", ADR 0007). A choice the user cannot see is a choice the user cannot correct, and the research's one documented placement failure is a silent one (T3 #15814, cited in the design input, D19).
 
 The two-Mac gate is a push from the Pro to the Air (the Pro dials, the Air cannot) followed by `fabric resume` on the Air, and a pull from the Pro to bring the job back (ADR 0005, Pairing).
 
@@ -42,7 +44,7 @@ The two-Mac gate is a push from the Pro to the Air (the Pro dials, the Air canno
 | `CARGO_HOME` | `${CARGO_HOME:-$HOME/.cargo}` | Carry `target` off. |
 | macOS version and SDK | `sw_vers -productVersion`, `xcrun --show-sdk-version` | Warn. Carry of native build output is already keyed on rustc and Node. |
 | Claude Code version | `claude --version` | Refuse when the job's harness is Claude and the versions differ; the floor for the gate is 2.1.300 on both (ADR 0006). |
-| Codex version | `codex --version` | Refuse when the job's harness is Codex and the versions differ. |
+| Codex version | `codex --version` | Refuse when the job's harness is Codex and the versions differ. Amended 2026-10-21 (F10): both version rows name an older target in the note; `--force` still waives them, because the resume refuses a harness older than the session's newest writer before it starts (ADR 0006, Settings travel with the session). |
 | Harness login | `claude auth status`, `codex login status`, exit code only | Refuse when the target has no login for the job's harness. Reported as yes or no; the account is never printed. |
 | Other logins the job record names | `gh auth status`, `npm whoami`, `vercel whoami`, each only when named | Warn before the harness starts a turn that would push or publish. |
 | Clock offset | `sntp -d time.apple.com` on each node, the difference | Refuse above 5 s when any mtime-keyed cache is carried (Cargo, `tsc --build`, turbo); warn otherwise. Measured on 2026-10-19: Pro +0.064 s, Air +0.055 s. |
@@ -53,7 +55,7 @@ The two-Mac gate is a push from the Pro to the Air (the Pro dials, the Air canno
 
 `--force` turns every Refuse above into a Warn except two rows: the login row, because a resume without a login fails inside the harness with a worse message, and the username and `HOME` row, because the root would not exist on the target (ADR 0011). The output lists every row with both values, and the job record stores the comparison with the move, so a later "why did this rebuild" has an answer.
 
-The measured facts of 2026-10-19 mean the first gate fixture must not depend on pnpm or on native Node modules: it is a small npm-installed, pure-JavaScript project, so that `node_modules` carries under ADR 0012 across Node 22 and Node 26, and `fabric doctor` must still report every mismatch above, because that is the report the owner will read before the first real job.
+The measured facts of 2026-10-19 mean the first gate fixture must not depend on pnpm or on native Node modules: it is a small npm-installed, pure-JavaScript project. ADR 0012 keys every `node_modules` on the Node major, pure JavaScript included, so across Node 22 and Node 26 the fixture takes the install path, and the same fixture proves the carry path once the Air runs Node 22 (ADR 0012, The first gate fixture). `fabric doctor` must still report every mismatch above, because that is the report the owner will read before the first real job.
 
 ### Triggers in this phase
 

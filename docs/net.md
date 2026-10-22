@@ -36,7 +36,7 @@ Pairing v0 is out of band. On the Air, read the id off the screen of the Pro
 and pair `fab1<pro>@<pro-address>:7777`; on the Pro, the same with the Air's
 id. Once `fabric-cli` exists this is `fabric node pair`; today it is
 `Peers::update` with `PeerBook::pair`. A spec takes an IP address or a name; a name is resolved
-at dial time. A node that is not in the book is refused inside the TLS
+at dial time, and its first 4 distinct addresses are dialed. A node that is not in the book is refused inside the TLS
 handshake and never reaches application code, listening or not.
 
 An `Endpoint` re-reads the book before each handshake, so a pairing written
@@ -45,7 +45,9 @@ also ends a connection that is already open, within 5 s. A book that does
 not parse pairs no one until it is fixed, and the error names the line. A
 line holds at most 8 distinct addresses, and a node appears on one line.
 The addresses are the ones pasted at pairing; a connection updates only the
-last-seen time, never the list.
+last-seen time, never the list. Every save writes the book with mode 0600,
+and a book that a group or other users can write pairs no one until it is
+`chmod 600` again.
 
 A short pairing code, where one side shows a few words and the other types
 them to fetch and confirm the id over the connection, is a follow-up. It

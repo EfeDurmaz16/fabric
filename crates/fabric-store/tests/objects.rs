@@ -62,6 +62,25 @@ fn a_corrupt_object_is_an_error_not_content() {
 }
 
 #[test]
+fn a_grown_object_file_is_corrupt_without_being_loaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::create(dir.path(), small_params().unwrap()).unwrap();
+    let stored = store.objects().put(b"small").unwrap();
+    let path = common::object_path(dir.path(), stored.id);
+    // Sparse, so the disk holds almost nothing; a read of the whole file would ask for 16 GiB.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(16 << 30)
+        .unwrap();
+    assert!(matches!(
+        store.objects().read(stored.id),
+        Err(ObjectError::Corrupt { id }) if id == stored.id
+    ));
+}
+
+#[test]
 fn an_object_above_the_bound_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::create(dir.path(), small_params().unwrap()).unwrap();

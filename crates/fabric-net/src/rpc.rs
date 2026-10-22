@@ -9,6 +9,9 @@
 //! peer that is still paired: it checks the trust decision before each
 //! request and asks it again every `TRUST_RECHECK`, and closes the
 //! connection once the peer is unpaired, however long the connection lives.
+//! The work a node runs for one peer is capped over all the peer's
+//! sessions, so a peer that connects again, or holds several connections,
+//! gets no more than one session's worth.
 //!
 //! The wire types `RequestBody`, `ResponseBody` and `JobResponse` are built
 //! and matched here only. A caller asks through one typed method per
@@ -18,10 +21,10 @@
 //! one, and a caller refuses one as `RpcError::UnexpectedResponse`. `Hello`
 //! and `Ping` belong to this layer and never reach a service.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use fabric_core::BoxFuture;
@@ -34,15 +37,17 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 use crate::accept::refresh;
-use crate::frame::{FrameError, MAX_BULK_FRAME, MAX_CONTROL_FRAME, read_frame, write_frame};
-use crate::idle::IdleReader;
+use crate::frame::{
+    FrameError, MAX_BULK_FRAME, MAX_CONTROL_FRAME, MAX_STORED_CHUNK, read_frame, write_frame,
+};
+use crate::idle::{IdleReader, StallWriter};
 use crate::tls::Trust;
 use crate::transport::{Connection, Stream, TransportError, TransportKind};
 use crate::wire::{
     Appended, ChunkBatch, Facts, Fault, FaultText, Fenced, Hello, JobAnswer, JobRequest,
-    JobResponse, ManifestChunks, MoveRequested, MoveState, Offered, PROTOCOL_VERSION, Pulled,
-    RecordBytes, RecordPage, Request, RequestBody, RequestId, Response, ResponseBody, VersionText,
-    WireError, decode, encode, wall_clock_ms,
+    JobResponse, KnownWriter, ManifestChunks, MoveRequested, MoveState, Offered, PROTOCOL_VERSION,
+    Pulled, RecordBytes, RecordPage, Request, RequestBody, RequestId, Response, ResponseBody,
+    VersionText, WireError, decode, encode, wall_clock_ms,
 };
 
 /// A clock difference between two nodes above this is logged at `Hello`.
@@ -58,10 +63,17 @@ pub const TRUST_RECHECK: Duration = Duration::from_secs(5);
 /// stream back.
 pub const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The most per-job requests one serving session runs at once, counting work that outlived its caller's budget.
+/// How long a reply may wait with no byte taken by the peer before its stream is dropped.
+///
+/// Only time spent waiting on flow control counts, not the time the
+/// service takes, so a peer that asks and then stops reading gives its
+/// stream, and a chunk batch its slot, back.
+pub const REPLY_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The most per-job requests a node runs at once for one peer, over all its sessions, counting work that outlived its caller's budget.
 pub const MAX_JOB_WORK: usize = 16;
 
-/// The most chunk batches one serving session sends at once; each holds up to one chunk frame while it waits on flow control.
+/// The most chunk batches a node sends one peer at once, over all its sessions; each holds up to one chunk frame while it waits on flow control.
 pub const MAX_CHUNK_RUNS: usize = 4;
 
 /// Why a call failed.
@@ -145,6 +157,22 @@ pub enum RpcError {
         /// The receiver epoch the verdict names.
         current: Epoch,
     },
+    /// The peer's move status names another move than the one asked about.
+    #[error("asked about move {asked}, the peer answered for move {got}")]
+    WrongMove {
+        /// The move asked about.
+        asked: MoveId,
+        /// The move the answer names.
+        got: MoveId,
+    },
+    /// The peer's answer to an offer names another snapshot to push than the one offered.
+    #[error("offered snapshot {offered}, the peer asked for snapshot {got}")]
+    WrongSnapshot {
+        /// The snapshot the offer named.
+        offered: SnapshotId,
+        /// The snapshot the answer names.
+        got: SnapshotId,
+    },
     /// An earlier error ended this chunk stream; ask for `missing` in a new request.
     #[error("the chunk stream already failed; ask for the missing chunks again")]
     Interrupted,
@@ -160,9 +188,10 @@ pub type JobFuture<'a, T> = BoxFuture<'a, Result<Fenced<T>, Fault>>;
 ///
 /// Every per-job method answers a message from `peer` sent under the
 /// fencing `token`, and runs the ADR 0003 epoch check before it acts on the
-/// rest, except `pull` and `move_status`: both are reads, the asker of a
-/// pull is catching up, and the source asking for a move's decision is one
-/// epoch behind once the target imported. A per-job message can write ledger records, so its future always
+/// rest, except `pull`, `move_status` and `known_writer`: all are reads,
+/// the asker of a pull is catching up, the source asking for a move's
+/// decision is one epoch behind once the target imported, and a node about
+/// to pull the job asks its owner for the known writer from any epoch. A per-job message can write ledger records, so its future always
 /// runs to its end, even after the caller's budget ran out and the caller
 /// was told `Fault::Deadline`. The caller then treats the outcome as
 /// unknown and asks again, with `MoveStatus` for a move.
@@ -199,6 +228,8 @@ pub trait Service: Send + Sync {
         token: FencingToken,
         move_id: MoveId,
     ) -> JobFuture<'_, RecordBytes>;
+    /// Answers `KnownWriter`: the newest version of the job's harness known to have written its session, when this node owns the job.
+    fn known_writer(&self, peer: NodeId, token: FencingToken) -> JobFuture<'_, KnownWriter>;
     /// Returns the length and chunk list of `snapshot`'s manifest for `peer`.
     fn manifest(
         &self,
@@ -261,6 +292,32 @@ fn check_verdict<T>(sent: Epoch, fenced: &Fenced<T>) -> Result<(), RpcError> {
             yours,
             current,
         })
+    }
+}
+
+/// Accepts a move status only if an undecided answer names the move asked about.
+fn check_move(asked: MoveId, fenced: &Fenced<MoveState>) -> Result<(), RpcError> {
+    match *fenced {
+        Fenced::Answer(MoveState::Undecided { move_id }) if move_id != asked => {
+            Err(RpcError::WrongMove {
+                asked,
+                got: move_id,
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Accepts an offer's answer only if an incomplete-snapshot answer names the snapshot offered.
+fn check_offered(offered: SnapshotId, fenced: &Fenced<Offered>) -> Result<(), RpcError> {
+    match *fenced {
+        Fenced::Answer(Offered::SnapshotIncomplete { snapshot }) if snapshot != offered => {
+            Err(RpcError::WrongSnapshot {
+                offered,
+                got: snapshot,
+            })
+        }
+        _ => Ok(()),
     }
 }
 
@@ -569,8 +626,12 @@ impl Session {
             job_id: offer.job_id,
             epoch,
         };
-        self.job(token, JobRequest::MoveOffer(offer.into()), deadline)
-            .await
+        let offered = offer.snapshot;
+        let answer = self
+            .job(token, JobRequest::MoveOffer(offer.into()), deadline)
+            .await?;
+        check_offered(offered, &answer)?;
+        Ok(answer)
     }
 
     /// Asks the target for its decision on `move_id` again under `token`, waiting at most `deadline`.
@@ -580,8 +641,11 @@ impl Session {
         move_id: MoveId,
         deadline: Duration,
     ) -> Result<Fenced<MoveState>, RpcError> {
-        self.job(token, JobRequest::MoveStatus { move_id }, deadline)
-            .await
+        let state = self
+            .job(token, JobRequest::MoveStatus { move_id }, deadline)
+            .await?;
+        check_move(move_id, &state)?;
+        Ok(state)
     }
 
     /// Asks the target to decide against `move_id` under `token`, waiting at most `deadline`; returns its decision record.
@@ -593,6 +657,15 @@ impl Session {
     ) -> Result<Fenced<RecordBytes>, RpcError> {
         self.job(token, JobRequest::MoveAbort { move_id }, deadline)
             .await
+    }
+
+    /// Asks the owner for the newest version of the job's harness known to have written its session under `token`, waiting at most `deadline`.
+    pub async fn known_writer(
+        &self,
+        token: FencingToken,
+        deadline: Duration,
+    ) -> Result<Fenced<KnownWriter>, RpcError> {
+        self.job(token, JobRequest::KnownWriter, deadline).await
     }
 
     /// Asks for the length and chunk list of `snapshot`'s manifest, waiting at most `deadline`.
@@ -641,9 +714,18 @@ impl Session {
     /// no longer pairs, seen before a request or at a recheck every
     /// `TRUST_RECHECK`, has its connection closed and comes back as
     /// `RpcError::Unpaired`; requests in flight then fail with it.
-    pub async fn serve(&self, service: Arc<dyn Service>, trust: Arc<dyn Trust>) -> RpcError {
+    ///
+    /// `limits` is the node's one `ServeLimits`: every session with the
+    /// same peer counts against the same caps, so work a closed session
+    /// left running still counts against the next.
+    pub async fn serve(
+        &self,
+        service: Arc<dyn Service>,
+        trust: Arc<dyn Trust>,
+        limits: &ServeLimits,
+    ) -> RpcError {
         let peer = self.peer();
-        let limits = Limits::new();
+        let limits = limits.of(peer);
         let requests = async {
             loop {
                 let stream = match self.connection.next().await {
@@ -683,8 +765,9 @@ impl Session {
     }
 }
 
-/// One chunk that arrived and was checked: its zstd frame decompresses to at
-/// most `MAX_CHUNK_LEN` bytes, and those bytes hash to its id.
+/// One chunk that arrived and was checked: its zstd encoding is at most
+/// `MAX_STORED_CHUNK` bytes and decompresses to at most `MAX_CHUNK_LEN`
+/// bytes, and those bytes hash to its id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedChunk {
     id: ChunkId,
@@ -700,6 +783,12 @@ impl VerifiedChunk {
     /// most `MAX_CHUNK_LEN`, so a small frame cannot make this node
     /// allocate more than one chunk.
     fn check(id: ChunkId, stored: Vec<u8>) -> Option<Self> {
+        // The bulk frame leaves room for the envelope, so a stored chunk
+        // could be a little longer than any the store writes; it is not
+        // kept, so the store never holds one past its own bound.
+        if stored.len() > MAX_STORED_CHUNK {
+            return None;
+        }
         let capacity = match zstd::zstd_safe::get_frame_content_size(&stored) {
             Ok(Some(declared)) => usize::try_from(declared)
                 .ok()
@@ -855,8 +944,36 @@ async fn reply(
     Ok(())
 }
 
-/// What one serving session may run at once, so a paired peer's requests cannot grow its work or memory without bound.
-#[derive(Clone)]
+/// What a node runs at once for each peer, counted over all of that peer's sessions.
+///
+/// A node keeps one and hands it to every `Session::serve`, so a paired
+/// peer cannot grow the node's work or memory without bound by connecting
+/// again or by holding several connections: the work a closed session
+/// left running past its caller's budget still holds its place. A peer
+/// with no session and no work left is forgotten, since fresh caps count
+/// the same.
+#[derive(Debug, Default)]
+pub struct ServeLimits {
+    peers: Mutex<HashMap<NodeId, Limits>>,
+}
+
+impl ServeLimits {
+    /// Caps that count no work yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The caps every session with `peer` shares.
+    fn of(&self, peer: NodeId) -> Limits {
+        let mut peers = self.peers.lock().unwrap_or_else(PoisonError::into_inner);
+        peers.retain(|_, limits| limits.in_use());
+        peers.entry(peer).or_insert_with(Limits::new).clone()
+    }
+}
+
+/// What one peer's sessions may run at once.
+#[derive(Debug, Clone)]
 struct Limits {
     /// Held by each per-job request's work until the work ends, budget or not.
     job_work: Arc<Semaphore>,
@@ -871,6 +988,16 @@ impl Limits {
             chunk_runs: Arc::new(Semaphore::new(MAX_CHUNK_RUNS)),
         }
     }
+
+    /// Whether a session or its work holds these caps besides the `ServeLimits` that keeps them.
+    ///
+    /// Each serving session and each request it runs holds a clone, and
+    /// work past its budget holds a `job_work` permit, so both counts drop
+    /// to one only when nothing but the map is left. Nothing can take a
+    /// new clone then except through the map, under its lock.
+    fn in_use(&self) -> bool {
+        Arc::strong_count(&self.job_work) > 1 || Arc::strong_count(&self.chunk_runs) > 1
+    }
 }
 
 async fn handle(
@@ -879,7 +1006,8 @@ async fn handle(
     service: Arc<dyn Service>,
     limits: &Limits,
 ) -> Result<(), RpcError> {
-    let (mut send, mut recv) = stream.split();
+    let (send, mut recv) = stream.split();
+    let mut send = StallWriter::new(send, REPLY_STALL_TIMEOUT);
     let bytes = timeout(
         REQUEST_READ_TIMEOUT,
         read_frame(&mut recv, MAX_CONTROL_FRAME),
@@ -933,7 +1061,7 @@ async fn handle(
         RequestBody::WantChunks(batch) => {
             let Ok(Ok(_run)) = timeout(budget, limits.chunk_runs.acquire()).await else {
                 reply(
-                    send.as_mut(),
+                    &mut send,
                     id,
                     ResponseBody::Fault(Fault::Deadline),
                     MAX_CONTROL_FRAME,
@@ -942,12 +1070,12 @@ async fn handle(
                 send.shutdown().await.map_err(FrameError::Io)?;
                 return Ok(());
             };
-            send_chunks(peer, id, batch, budget, send.as_mut(), service.as_ref()).await?;
+            send_chunks(peer, id, batch, budget, &mut send, service.as_ref()).await?;
             send.shutdown().await.map_err(FrameError::Io)?;
             return Ok(());
         }
     };
-    reply(send.as_mut(), id, body, MAX_CONTROL_FRAME).await?;
+    reply(&mut send, id, body, MAX_CONTROL_FRAME).await?;
     send.shutdown().await.map_err(FrameError::Io)?;
     Ok(())
 }
@@ -977,6 +1105,7 @@ async fn answer_job(
             .move_abort(peer, token, move_id)
             .await?
             .into_response(),
+        JobRequest::KnownWriter => service.known_writer(peer, token).await?.into_response(),
     })
 }
 
@@ -1031,6 +1160,47 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    /// An undecided status for another move is not an answer about the move asked.
+    #[test]
+    fn a_move_status_for_another_move_is_refused() {
+        let [asked, other] = [1, 2].map(|n| MoveId::from_bytes([n; 16]));
+        let undecided = |move_id| Fenced::Answer(MoveState::Undecided { move_id });
+        assert!(check_move(asked, &undecided(asked)).is_ok());
+        assert!(matches!(
+            check_move(asked, &undecided(other)),
+            Err(RpcError::WrongMove { asked: a, got }) if a == asked && got == other
+        ));
+    }
+
+    /// An incomplete-snapshot answer for another snapshot is not an answer to the offer sent.
+    #[test]
+    fn an_offer_answer_for_another_snapshot_is_refused() {
+        let [offered, other] = [1, 2].map(|n| SnapshotId::from_bytes([n; 32]));
+        let incomplete = |snapshot| Fenced::Answer(Offered::SnapshotIncomplete { snapshot });
+        assert!(check_offered(offered, &incomplete(offered)).is_ok());
+        assert!(matches!(
+            check_offered(offered, &incomplete(other)),
+            Err(RpcError::WrongSnapshot { offered: o, got }) if o == offered && got == other
+        ));
+    }
+
+    /// A chunk whose zstd encoding is longer than any the store writes is
+    /// refused, even when it decompresses to bytes that hash to its id, as
+    /// one padded with a skippable frame does.
+    #[test]
+    fn a_stored_chunk_past_the_stored_bound_is_refused() {
+        let bytes = b"chunk".to_vec();
+        let id = ChunkId::of(&bytes);
+        let mut stored = zstd::bulk::compress(&bytes, 3).unwrap();
+        assert!(VerifiedChunk::check(id, stored.clone()).is_some());
+        let pad = MAX_STORED_CHUNK + 1 - stored.len() - 8;
+        stored.extend_from_slice(&0x184D_2A50_u32.to_le_bytes());
+        stored.extend_from_slice(&u32::try_from(pad).unwrap().to_le_bytes());
+        stored.resize(MAX_STORED_CHUNK + 1, 0);
+        assert_eq!(zstd::bulk::decompress(&stored, 64).unwrap(), bytes);
+        assert!(VerifiedChunk::check(id, stored).is_none());
     }
 
     fn frame(body: ResponseBody) -> Vec<u8> {
@@ -1225,10 +1395,11 @@ mod tests {
         }
     }
 
-    /// A service that serves nothing; with `hang` set, a pull or a chunk never ends.
+    /// A service that serves nothing; with `hang` set, a pull or a chunk never ends; with `chunk_len` set, every chunk is that many bytes.
     #[derive(Default)]
     struct Nothing {
         hang: bool,
+        chunk_len: usize,
         /// How many pulls and chunks were asked for.
         started: std::sync::atomic::AtomicUsize,
     }
@@ -1283,6 +1454,10 @@ mod tests {
             no_job()
         }
 
+        fn known_writer(&self, _: NodeId, _: FencingToken) -> JobFuture<'_, KnownWriter> {
+            no_job()
+        }
+
         fn manifest(
             &self,
             _peer: NodeId,
@@ -1292,6 +1467,9 @@ mod tests {
         }
 
         fn chunk(&self, _peer: NodeId, id: ChunkId) -> BoxFuture<'_, Result<Vec<u8>, Fault>> {
+            if self.chunk_len > 0 {
+                return self.start(Ok(vec![0; self.chunk_len]));
+            }
             self.start(Err(Fault::UnknownChunk(id)))
         }
 
@@ -1309,6 +1487,15 @@ mod tests {
         trust: Arc<Revocable>,
         service: Arc<Nothing>,
     ) -> (Session, tokio::task::JoinHandle<RpcError>) {
+        serving_pair_under(trust, service, Arc::default()).await
+    }
+
+    /// `serving_pair`, served under `limits`; the dialer is the same peer on every call.
+    async fn serving_pair_under(
+        trust: Arc<Revocable>,
+        service: Arc<Nothing>,
+        limits: Arc<ServeLimits>,
+    ) -> (Session, tokio::task::JoinHandle<RpcError>) {
         use crate::mux::{Mux, Side};
 
         let (dialer_id, acceptor_id) = (NodeId::from_bytes([1; 32]), NodeId::from_bytes([2; 32]));
@@ -1323,7 +1510,7 @@ mod tests {
             Session::accept(acceptor, acceptor_id, version, IDLE * 10),
         );
         let accepted = acceptor_session.unwrap();
-        let serving = tokio::spawn(async move { accepted.serve(service, trust).await });
+        let serving = tokio::spawn(async move { accepted.serve(service, trust, &limits).await });
         (dialer_session.unwrap(), serving)
     }
 
@@ -1375,39 +1562,89 @@ mod tests {
     }
 
     /// Work a per-job request leaves behind when its budget runs out still
-    /// counts against the session's cap, so a peer cannot pile up ledger
-    /// work by sending requests whose budget is spent at once.
+    /// counts against the peer's cap after its session closed, so a peer
+    /// cannot pile up ledger work by sending requests whose budget is spent
+    /// at once, then connecting again and sending more.
     #[tokio::test(start_paused = true)]
-    async fn job_work_past_its_budget_is_bounded_per_session() {
+    async fn job_work_past_its_budget_is_bounded_per_peer() {
         let service = Nothing::hanging();
-        let (session, _serving) = serving_pair(paired(), Arc::clone(&service)).await;
+        let limits = Arc::new(ServeLimits::new());
         let token = FencingToken {
             job_id: fabric_core::id::JobId::from_bytes([1; 16]),
             epoch: Epoch::FIRST,
         };
-        for _ in 0..2 * MAX_JOB_WORK {
-            let pulled = session.pull(token, None, Duration::from_millis(1)).await;
-            assert!(matches!(pulled, Err(RpcError::Deadline(_))), "{pulled:?}");
+        for _ in 0..2 {
+            let (session, serving) =
+                serving_pair_under(paired(), Arc::clone(&service), Arc::clone(&limits)).await;
+            for _ in 0..MAX_JOB_WORK {
+                let pulled = session.pull(token, None, Duration::from_millis(1)).await;
+                assert!(matches!(pulled, Err(RpcError::Deadline(_))), "{pulled:?}");
+            }
+            session.close();
+            serving.await.unwrap();
         }
         tokio::time::sleep(IDLE).await;
         assert_eq!(service.started.load(Ordering::SeqCst), MAX_JOB_WORK);
     }
 
     /// A peer that asks for chunks and reads none holds at most
-    /// `MAX_CHUNK_RUNS` batches in flight; the next one waits its budget and
-    /// is told so, instead of pinning another chunk's memory.
+    /// `MAX_CHUNK_RUNS` batches in flight over all its connections; the
+    /// next one waits its budget and is told so, instead of pinning another
+    /// chunk's memory.
     #[tokio::test(start_paused = true)]
-    async fn chunk_batches_in_flight_are_bounded_per_session() {
+    async fn chunk_batches_in_flight_are_bounded_per_peer() {
         let service = Nothing::hanging();
-        let (session, _serving) = serving_pair(paired(), Arc::clone(&service)).await;
+        let limits = Arc::new(ServeLimits::new());
+        let (first, _serving) =
+            serving_pair_under(paired(), Arc::clone(&service), Arc::clone(&limits)).await;
         let mut held = Vec::new();
-        for n in 0..=MAX_CHUNK_RUNS {
+        for n in 0..MAX_CHUNK_RUNS {
             let batch = ChunkBatch::new(vec![ChunkId::of(&n.to_le_bytes())]).unwrap();
-            held.push(session.want_chunks(batch, IDLE).await.unwrap());
+            held.push(first.want_chunks(batch, IDLE).await.unwrap());
         }
-        let mut over = held.pop().unwrap();
+        let (second, _serving) = serving_pair_under(paired(), Arc::clone(&service), limits).await;
+        let batch = ChunkBatch::new(vec![ChunkId::of(b"over")]).unwrap();
+        let mut over = second.want_chunks(batch, IDLE).await.unwrap();
         assert!(matches!(over.next().await, Err(RpcError::Deadline(_))));
         assert_eq!(service.started.load(Ordering::SeqCst), MAX_CHUNK_RUNS);
+    }
+
+    /// The caps of a peer with no session and no work left are dropped, so
+    /// the node keeps no entry for every peer it ever served.
+    #[test]
+    fn caps_nothing_holds_are_forgotten() {
+        let limits = ServeLimits::new();
+        let [a, b] = [1, 2].map(|n| NodeId::from_bytes([n; 32]));
+        let _held = limits.of(a);
+        drop(limits.of(b));
+        limits.of(a);
+        let peers = limits.peers.lock().unwrap();
+        assert_eq!(peers.keys().collect::<Vec<_>>(), [&a]);
+    }
+
+    /// A peer that asks for chunks and stops reading them loses those
+    /// batches after `REPLY_STALL_TIMEOUT`, so they give their slots back
+    /// instead of holding them as long as keep-alives hold the connection.
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_the_peer_stops_reading_gives_its_slot_back() {
+        let service = Arc::new(Nothing {
+            chunk_len: 4 << 20,
+            ..Nothing::default()
+        });
+        let (session, _serving) = serving_pair(paired(), Arc::clone(&service)).await;
+        let mut unread = Vec::new();
+        for n in 0..MAX_CHUNK_RUNS {
+            let batch = ChunkBatch::new(vec![ChunkId::of(&n.to_le_bytes())]).unwrap();
+            unread.push(session.want_chunks(batch, IDLE).await.unwrap());
+        }
+        tokio::time::sleep(REPLY_STALL_TIMEOUT + IDLE).await;
+        let batch = ChunkBatch::new(vec![ChunkId::of(b"next")]).unwrap();
+        let mut next = session.want_chunks(batch, IDLE).await.unwrap();
+        assert!(
+            matches!(next.next().await, Err(RpcError::ChunkMismatch { .. })),
+            "the batch was not served"
+        );
+        assert_eq!(service.started.load(Ordering::SeqCst), MAX_CHUNK_RUNS + 1);
     }
 
     /// A stream that failed inside a frame never reads again.

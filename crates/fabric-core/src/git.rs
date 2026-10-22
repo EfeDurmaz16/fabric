@@ -26,7 +26,8 @@ pub enum GitNameError {
     /// A config key outside the allowlist of ADR 0004.
     #[error("config key {0} is not in the carried allowlist")]
     KeyNotAllowed(String),
-    /// A config value with a newline or NUL, or one that starts with `-`.
+    /// A config value with a newline or NUL, one that starts with `-`, or
+    /// one in git's `<transport>::<address>` remote helper form.
     #[error("config value is not valid")]
     BadValue,
 }
@@ -81,6 +82,12 @@ parsed_string!(
 );
 
 impl GitOid {
+    /// Returns true for a 64-character SHA-256 id, false for a 40-character SHA-1 id.
+    #[must_use]
+    pub fn is_sha256(&self) -> bool {
+        self.0.len() == 64
+    }
+
     /// Checks `text` against the rule and wraps it.
     pub fn parse(text: &str) -> Result<Self, GitNameError> {
         let hex = text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
@@ -164,23 +171,59 @@ impl RemoteName {
 
 parsed_string!(
     GitConfigValue,
-    "A config value restore may pass to `git config`: no newline, no NUL, no leading `-`."
+    "A config value restore may pass to `git config`: no newline, no NUL, no leading `-`, no `<transport>::` prefix."
 );
+
+/// Returns true when git reads `url` as `<transport>::<address>`, the form
+/// that makes `git fetch` and `git push` run `git remote-<transport>` with
+/// the address, so the peer that wrote the manifest picks the program.
+/// `ext::<command>` runs the command itself when `protocol.ext.allow`
+/// permits it, and the allow check matches the name exactly: git 2.54 lets
+/// `EXT::` past it and refuses only because no `remote-EXT` exists. Every
+/// helper form is refused rather than a list of names. The prefix rule is
+/// git's own `is_urlschemechar`: a letter, then letters, digits, `+`, `-`
+/// and `.`.
+fn is_remote_helper_form(url: &str) -> bool {
+    let bytes = url.as_bytes();
+    if !bytes.first().is_some_and(u8::is_ascii_alphabetic) {
+        return false;
+    }
+    let end = bytes
+        .iter()
+        .position(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')))
+        .unwrap_or(bytes.len());
+    bytes[end..].starts_with(b"::")
+}
 
 impl GitConfigValue {
     /// Checks `text` against the rules and wraps it.
+    ///
+    /// The helper-form rule applies to every key, not only the remote URL
+    /// keys: `branch.<n>.remote` may hold a URL too, and no other key on the
+    /// allowlist has a legitimate value of that shape.
     pub fn parse(text: &str) -> Result<Self, GitNameError> {
-        if text.starts_with('-') || text.contains('\n') || text.contains('\0') {
+        if text.starts_with('-')
+            || text.contains('\n')
+            || text.contains('\0')
+            || is_remote_helper_form(text)
+        {
             return Err(GitNameError::BadValue);
         }
         Ok(Self(text.to_owned()))
     }
 
-    /// Returns true when the value is a `scheme://` URL whose authority holds
-    /// a credential, by the rule of `credential_range`.
+    /// Returns true when the value is a `scheme://` URL that can carry a
+    /// credential: its authority holds one by the rule of `credential_range`,
+    /// or it has a query or a fragment, where a token such as
+    /// `?access_token=` travels. No part of a query is known to be safe, so
+    /// the whole value is treated as secret.
     #[must_use]
     pub fn has_credential(&self) -> bool {
         credential_range(&self.0).is_some()
+            || self
+                .0
+                .split_once("://")
+                .is_some_and(|(_, rest)| rest.contains(['?', '#']))
     }
 }
 
@@ -221,7 +264,7 @@ pub enum GitConfigKey {
     RemotePushUrl(RemoteName),
     /// `remote.<name>.fetch`.
     RemoteFetch(RemoteName),
-    /// `branch.<name>.remote`.
+    /// `branch.<name>.remote`; it may hold a URL, and a credential in one is stripped at capture and refused on decode.
     BranchRemote(BranchName),
     /// `branch.<name>.merge`.
     BranchMerge(BranchName),
@@ -238,12 +281,17 @@ pub enum GitConfigKey {
 }
 
 impl GitConfigKey {
-    /// Returns true for the keys whose value is a remote URL, which must carry no credential.
+    /// Returns true for the keys whose value is or may be a remote URL, which must carry no credential.
+    ///
+    /// `branch.<name>.remote` usually names a remote, but git also takes a
+    /// URL there as the repository to fetch from and push to.
     #[must_use]
     pub const fn is_remote_url(&self) -> bool {
         matches!(
             self,
-            GitConfigKey::RemoteUrl(_) | GitConfigKey::RemotePushUrl(_)
+            GitConfigKey::RemoteUrl(_)
+                | GitConfigKey::RemotePushUrl(_)
+                | GitConfigKey::BranchRemote(_)
         )
     }
 
@@ -421,7 +469,9 @@ mod tests {
         assert!(with("ssh://git:hunter2@github.com/x/y.git"));
         assert!(with("git+ssh://git:hunter2@github.com/x/y.git"));
         assert!(!with("https://github.com/x/y.git"));
-        assert!(!with("https://github.com/x/y.git?u=a@b"));
+        assert!(with("https://github.com/x/y.git?u=a@b"));
+        assert!(with("https://example.com/x.git?access_token=sekrit"));
+        assert!(with("https://example.com/x.git#sekrit"));
         assert!(!with("git@github.com:x/y.git"));
         assert!(!with("/srv/git/y.git"));
         assert!(
@@ -431,6 +481,11 @@ mod tests {
         );
         assert!(
             GitConfigKey::parse("remote.origin.pushurl")
+                .unwrap()
+                .is_remote_url()
+        );
+        assert!(
+            GitConfigKey::parse("branch.main.remote")
                 .unwrap()
                 .is_remote_url()
         );
@@ -451,6 +506,38 @@ mod tests {
         );
         assert_eq!(GitConfigValue::parse("a\nb"), Err(GitNameError::BadValue));
         assert_eq!(GitConfigValue::parse("a\0b"), Err(GitNameError::BadValue));
+    }
+
+    /// `ext::sh -c ...` in `remote.origin.url` would run the command on the
+    /// target's next `git fetch` wherever `protocol.ext.allow` permits it.
+    #[test]
+    fn config_values_refuse_the_remote_helper_form() {
+        for bad in [
+            "ext::sh -c touch% /tmp/pwned",
+            "EXT::sh -c id",
+            "fd::7",
+            "codecommit::us-east-1://repo",
+            "a+b.c-d::x",
+        ] {
+            assert_eq!(
+                GitConfigValue::parse(bad),
+                Err(GitNameError::BadValue),
+                "{bad}"
+            );
+        }
+        for good in [
+            "https://github.com/x/y.git",
+            "ssh://git@github.com/x/y.git",
+            "git@github.com:x/y.git",
+            "/srv/git/y.git",
+            "./ext::x",
+            "1ext::x",
+            "+refs/heads/*:refs/remotes/origin/*",
+            "refs/heads/main",
+            "origin",
+        ] {
+            assert!(GitConfigValue::parse(good).is_ok(), "{good}");
+        }
     }
 
     #[test]

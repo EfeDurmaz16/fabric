@@ -12,7 +12,7 @@
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
@@ -82,25 +82,131 @@ impl Env {
 
     /// Puts a fake `claude` first on the `PATH`: it answers `--version` as
     /// the gate's Claude does and otherwise writes its arguments, one per
-    /// line, to `fake_claude_args` and exits.
+    /// line, to `claude-args` and its environment to `claude-env` under the
+    /// home. With `-p` it also appends the prompt and an answer by
+    /// `claude-opus-5-5`, both stamped with its version, to the session's
+    /// transcript under `~/.claude/projects/<slug>/`, as Claude does, and
+    /// prints the one result object `claude -p --output-format json` prints.
     pub fn install_fake_claude(&self) -> Fallible {
-        let claude = self.root.join("bin").join("claude");
-        fs::write(
-            &claude,
+        self.install(
+            "claude",
             "#!/bin/sh\n\
              if [ \"$1\" = --version ]; then echo '2.1.294 (Claude Code)'; exit 0; fi\n\
-             printf '%s\\n' \"$@\" > \"$HOME/claude-args\"\n",
-        )?;
-        fs::set_permissions(&claude, fs::Permissions::from_mode(0o755))?;
-        Ok(())
+             printf '%s\\n' \"$@\" > \"$HOME/claude-args\"\n\
+             env > \"$HOME/claude-env\"\n\
+             headless=; session=; prompt=\n\
+             while [ $# -gt 0 ]; do\n\
+               case \"$1\" in\n\
+                 -p) headless=1 ;;\n\
+                 --session-id|--resume) session=\"$2\"; shift ;;\n\
+                 --) prompt=\"$2\"; shift ;;\n\
+               esac\n\
+               shift\n\
+             done\n\
+             [ -n \"$headless\" ] || exit 0\n\
+             dir=\"$HOME/.claude/projects/$(pwd -P | sed 's/[^A-Za-z0-9]/-/g')\"\n\
+             mkdir -p \"$dir\"\n\
+             printf '{\"type\":\"user\",\"version\":\"2.1.294\",\"sessionId\":\"%s\",\"message\":{\"role\":\"user\",\"content\":\"%s\"}}\\n' \"$session\" \"$prompt\" >> \"$dir/$session.jsonl\"\n\
+             printf '{\"type\":\"assistant\",\"version\":\"2.1.294\",\"sessionId\":\"%s\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-opus-5-5\"}}\\n' \"$session\" >> \"$dir/$session.jsonl\"\n\
+             printf '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"claude did: %s\",\"session_id\":\"%s\"}\\n' \"$prompt\" \"$session\"\n",
+        )
+    }
+
+    /// The thread the fake `codex` starts.
+    pub const CODEX_THREAD: &str = "019f233e-bb33-7342-85fa-f2d33b14368a";
+
+    /// Puts a fake `codex` first on the `PATH`: it answers `--version` as
+    /// the gate's Codex does, `0.155.1`, or with the version in the
+    /// node's `codex-version` file when there is one, or, as an asdf shim
+    /// does, with the `codex` line of a `.tool-versions` in the directory
+    /// it runs in, and otherwise
+    /// writes its arguments, one per line, to `codex-args` and its
+    /// environment to `codex-env` under the home. Under `exec` it appends the prompt and the turn's settings
+    /// (gpt-6-sol, xhigh, on-request, workspace-write) to the thread's
+    /// rollout under `~/.codex/sessions/`, whose first line records the
+    /// Codex that created it, as Codex records no version on a resume,
+    /// starting `CODEX_THREAD`, or the thread `exec resume`
+    /// names, and prints the events `codex exec --json` prints for one turn. After `thread.started` it waits up to five
+    /// seconds for the node's session record of the job and writes `yes`
+    /// or `no` to `codex-saw-session`, so a test can tell the thread was
+    /// recorded while the turn ran. With `FAKE_CODEX_WAIT` set it then
+    /// touches `codex-waiting` and runs until a `SIGINT`, which it writes
+    /// to `codex-signal` before it exits with 130. With
+    /// `FAKE_CODEX_PROBE_WAIT` set, `--version` touches `codex-probing`
+    /// and answers three seconds later. With `FAKE_CODEX_LATE_STDERR` set
+    /// it leaves a process behind that writes `codex: late diagnostics` to
+    /// its standard error half a second after the turn ends, with its
+    /// standard output already closed.
+    pub fn install_fake_codex(&self) -> Fallible {
+        self.install(
+            "codex",
+            &format!(
+                "#!/bin/sh\n\
+                 version=0.155.1\n\
+                 [ ! -f \"$FABRIC_HOME/codex-version\" ] || version=$(cat \"$FABRIC_HOME/codex-version\")\n\
+                 [ ! -f .tool-versions ] || version=$(sed -n 's/^codex //p' .tool-versions)\n\
+                 if [ \"$1\" = --version ]; then\n\
+                   if [ -n \"$FAKE_CODEX_PROBE_WAIT\" ]; then touch \"$HOME/codex-probing\"; sleep 3; fi\n\
+                   echo \"codex-cli $version\"; exit 0\n\
+                 fi\n\
+                 printf '%s\\n' \"$@\" > \"$HOME/codex-args\"\n\
+                 env > \"$HOME/codex-env\"\n\
+                 [ \"$1\" = exec ] || exit 0\n\
+                 thread={thread}\n\
+                 if [ \"$2\" = resume ]; then thread=\"$3\"; fi\n\
+                 prompt=\n\
+                 while [ $# -gt 0 ]; do if [ \"$1\" = -- ]; then prompt=\"$2\"; fi; shift; done\n\
+                 dir=\"$HOME/.codex/sessions/2026/10/21\"\n\
+                 mkdir -p \"$dir\"\n\
+                 file=\"$dir/rollout-2026-10-21T10-00-00-$thread.jsonl\"\n\
+                 [ -f \"$file\" ] || printf '{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"%s\",\"cwd\":\"%s\",\"cli_version\":\"%s\"}}}}\\n' \"$thread\" \"$(pwd -P)\" \"$version\" > \"$file\"\n\
+                 printf '{{\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-6-sol\",\"effort\":\"xhigh\",\"approval_policy\":\"on-request\",\"sandbox_policy\":{{\"type\":\"workspace-write\"}}}}}}\\n' >> \"$file\"\n\
+                 printf '{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"%s\"}}]}}}}\\n' \"$prompt\" >> \"$file\"\n\
+                 printf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread\"\n\
+                 record=\"$FABRIC_HOME/jobs/$(basename \"$(dirname \"$(pwd -P)\")\")/session\"\n\
+                 tries=0\n\
+                 while [ ! -f \"$record\" ] && [ $tries -lt 100 ]; do sleep 0.05; tries=$((tries + 1)); done\n\
+                 if [ -f \"$record\" ]; then echo yes > \"$HOME/codex-saw-session\"; else echo no > \"$HOME/codex-saw-session\"; fi\n\
+                 if [ -n \"$FAKE_CODEX_WAIT\" ]; then\n\
+                   trap 'echo interrupted > \"$HOME/codex-signal\"; exit 130' INT\n\
+                   touch \"$HOME/codex-waiting\"\n\
+                   while :; do sleep 0.1; done\n\
+                 fi\n\
+                 if [ -n \"$FAKE_CODEX_LATE_STDERR\" ]; then\n\
+                   ( exec >/dev/null; sleep 0.5; echo 'codex: late diagnostics' >&2 ) &\n\
+                 fi\n\
+                 echo '{{\"type\":\"turn.started\"}}'\n\
+                 printf '{{\"type\":\"item.completed\",\"item\":{{\"id\":\"item_0\",\"type\":\"agent_message\",\"text\":\"codex did: %s\"}}}}\\n' \"$prompt\"\n\
+                 echo '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"cached_input_tokens\":0,\"output_tokens\":1}}}}'\n",
+                thread = Self::CODEX_THREAD
+            ),
+        )
+    }
+
+    /// Writes an executable `name` into the test's `bin`, first on the `PATH`.
+    fn install(&self, name: &str, script: &str) -> Fallible {
+        write_executable(&self.root.join("bin").join(name), script.as_bytes())
+    }
+
+    /// What a fake harness wrote to `<name>-args`, one argument per line.
+    pub fn fake_args(&self, name: &str) -> Fallible<Vec<String>> {
+        Ok(fs::read_to_string(self.home.join(format!("{name}-args")))?
+            .lines()
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// The names of the variables a fake harness found in its environment.
+    pub fn fake_env_names(&self, name: &str) -> Fallible<Vec<String>> {
+        Ok(fs::read_to_string(self.home.join(format!("{name}-env")))?
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(name, _)| name.to_owned()))
+            .collect())
     }
 
     /// The arguments the fake `claude` was last launched with.
     pub fn fake_claude_args(&self) -> Fallible<Vec<String>> {
-        Ok(fs::read_to_string(self.home.join("claude-args"))?
-            .lines()
-            .map(str::to_owned)
-            .collect())
+        self.fake_args("claude")
     }
 
     /// The fake agent's file for its first session.
@@ -120,10 +226,12 @@ impl Env {
             .collect())
     }
 
-    /// A command for the node whose state directory is `state`: its own
-    /// `bin` comes first on the `PATH`, then the programs both nodes share.
-    fn command(&self, program: &str, state: &Path) -> Command {
-        let mut dirs = vec![state.join("bin")];
+    /// A command for `program` with the environment every process of the
+    /// test runs with, for the node whose state directory is `state`: its
+    /// own programs come first on the `PATH` (`node_bin`), then the
+    /// programs both nodes share.
+    pub fn command(&self, program: &str, state: &Path) -> Command {
+        let mut dirs = vec![node_bin(state)];
         dirs.extend(std::env::split_paths(&self.path));
         let path = std::env::join_paths(dirs).unwrap_or_else(|_| self.path.clone());
         let mut command = Command::new(program);
@@ -138,6 +246,42 @@ impl Env {
             command.env("FABRIC_LOG", level);
         }
         command
+    }
+}
+
+/// The directory of the programs only the node whose state directory is
+/// `state` runs, such as its `fake_node`. It sits beside the state
+/// directory, not in it: a node refuses to start in a state directory of
+/// the umask's mode that holds anything Fabric did not write.
+fn node_bin(state: &Path) -> PathBuf {
+    let mut name = state.file_name().unwrap_or_default().to_owned();
+    name.push(".bin");
+    state.with_file_name(name)
+}
+
+/// Writes `contents` to `path` with mode `0755` through a short `sh`, so
+/// this process never holds the file open for writing. Linux refuses to
+/// run a file open for writing (`ETXTBSY`), and a child another test
+/// forked while this process held it open would keep it open until that
+/// child ran its own program. A temporary file renamed into place would
+/// not help: the descriptor follows the file.
+fn write_executable(path: &Path, contents: &[u8]) -> Fallible {
+    let mut writer = Command::new("/bin/sh")
+        .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()?;
+    // The pipe closes at the end of the statement, so `cat` sees the end.
+    writer
+        .stdin
+        .take()
+        .ok_or("no pipe to the writer")?
+        .write_all(contents)?;
+    let status = writer.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("writing {} failed: {status}", path.display()).into())
     }
 }
 
@@ -202,7 +346,7 @@ impl OtherClaude {
         let dir = env.root.join("other");
         fs::create_dir_all(&dir)?;
         let claude = dir.join("claude");
-        fs::copy(env!("CARGO_BIN_EXE_fabric-fake-agent"), &claude)?;
+        write_executable(&claude, &fs::read(env!("CARGO_BIN_EXE_fabric-fake-agent"))?)?;
         let other = Self(
             Command::new(&claude)
                 .env_clear()
@@ -323,7 +467,10 @@ impl Node {
     /// A node that has not started yet.
     pub fn new(env: &Arc<Env>, name: &'static str, wire: Wire) -> Fallible<Self> {
         let state = env.root.join(name);
-        fs::create_dir_all(state.join("bin"))?;
+        // Made with the umask's mode, as a user makes it by hand to keep
+        // the daemon's log in it; the node narrows it at its first start.
+        fs::create_dir_all(&state)?;
+        fs::create_dir_all(node_bin(&state))?;
         fs::write(
             state.join("harness.toml"),
             "[acp.fabric-fake-agent]\nstate_dir = \".fake-agent\"\n",
@@ -348,18 +495,16 @@ impl Node {
     /// for `--version` and `abi` for `-p process.versions.modules`, as the
     /// probes doctor and the carry keys run ask. It runs no JavaScript.
     pub fn fake_node(&self, version: &str, abi: &str) -> Fallible {
-        let node = self.state.join("bin").join("node");
-        fs::write(
-            &node,
+        write_executable(
+            &node_bin(&self.state).join("node"),
             format!(
                 "#!/bin/sh\n\
                  if [ \"$1\" = --version ]; then echo {version}; exit 0; fi\n\
                  if [ \"$1\" = -p ]; then echo {abi}; exit 0; fi\n\
                  exit 1\n"
-            ),
-        )?;
-        fs::set_permissions(&node, fs::Permissions::from_mode(0o755))?;
-        Ok(())
+            )
+            .as_bytes(),
+        )
     }
 
     /// The address it listens on.

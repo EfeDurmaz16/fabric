@@ -5,7 +5,10 @@
 //! verified. Nothing is written through a symlink or outside the staging
 //! directory, an existing target with content is never touched, and a crash
 //! leaves either no target or a complete one: a staging directory that
-//! outlives its process is the sign of a restore that did not finish.
+//! outlives its process is the sign of a restore that did not finish. A
+//! staging directory is removed only when it holds the owner file restore
+//! writes into it first; a directory of that name that restore did not
+//! make is refused, never deleted.
 
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
@@ -14,14 +17,14 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 
-use fabric_core::git::{GitConfigKey, GitOid};
-use fabric_core::id::{ChunkId, SnapshotId};
+use fabric_core::git::{GitConfigKey, GitConfigValue, GitOid};
+use fabric_core::id::{JobId, SnapshotId};
 use fabric_core::path::{PathError, RelPath};
 use fabric_core::snapshot::{
     CacheEntry, CarryState, Entry, EntryKind, GitHead, GitState, Mode, SnapshotManifest,
 };
 
-use crate::capture::symlink_escapes;
+use crate::capture::{stash_prefix, symlink_escapes};
 use crate::checkpoint;
 use crate::durable::{self, TempFile};
 use crate::git::{Git, GitError};
@@ -31,6 +34,15 @@ use crate::writer::{TreeWriter, WriteError};
 
 /// The suffix of the staging directory a restore writes into.
 pub const STAGING_SUFFIX: &str = ".fabric-restoring";
+
+/// The file a restore writes first into its staging directory, which proves the directory is its own.
+const STAGING_OWNER: &str = "fabric-staging";
+
+/// What the owner file holds.
+const STAGING_MAGIC: &[u8] = b"fabric restore staging, v1\n";
+
+/// The directory inside the staging directory that is renamed onto the target.
+const STAGING_TREE: &str = "tree";
 
 /// How much of the written tree is re-read against the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +60,7 @@ pub enum Verify {
 pub enum Durability {
     /// A killed process: the kernel finishes the writes it was given.
     ProcessCrash,
-    /// A power loss: every file restore writes, and the index, refs, packs and config git writes, reach the drive before the rename, and the rename's directory flush empties the drive cache.
+    /// A power loss: every file restore writes, every directory of the staging tree, and the index, refs, packs and config git writes, reach the drive before the rename, and the rename's directory flush empties the drive cache.
     PowerLoss,
 }
 
@@ -167,6 +179,12 @@ pub enum RestoreError {
         /// The path given.
         path: PathBuf,
     },
+    /// A directory with the staging name exists that no restore made; it is left alone.
+    #[error("{path} exists and was not made by a restore; move it away and retry")]
+    ForeignStaging {
+        /// The directory.
+        path: PathBuf,
+    },
     /// The target and the harness state directory lie one inside the other.
     #[error("{harness_state} and {target} lie one inside the other")]
     NestedDirectories {
@@ -260,10 +278,74 @@ fn staging_path(target: &Path) -> Result<PathBuf, RestoreError> {
     Ok(parent.join(format!("{name}{STAGING_SUFFIX}")))
 }
 
+/// Reads at most one byte more than the owner file holds, or `None` when `staging` has no owner file.
+fn owner_bytes(staging: &Path) -> Result<Option<Vec<u8>>, RestoreError> {
+    use rustix::fs::{Mode as RawBits, OFlags};
+    let path = staging.join(STAGING_OWNER);
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let file = match rustix::fs::open(&path, flags, RawBits::empty()) {
+        Ok(fd) => fs::File::from(fd),
+        // Absent, or a link in its place, which is not the owner file.
+        Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => {
+            return Ok(None);
+        }
+        Err(e) => return Err(io_err(&path, e.into())),
+    };
+    // Nor is a FIFO or a directory.
+    if !file.metadata().map_err(|e| io_err(&path, e))?.is_file() {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    file.take(STAGING_MAGIC.len() as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| io_err(&path, e))?;
+    Ok(Some(bytes))
+}
+
+/// What a directory at the staging path is, as far as restore can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Staging {
+    /// Not a directory a restore made: no owner file, and not empty.
+    Foreign,
+    /// A restore's: empty, as a kill right after its creation leaves it, or
+    /// holding the owner file, whole or cut short while it was written.
+    Ours {
+        /// True while it holds the tree, which is renamed onto the target last.
+        tree: bool,
+    },
+}
+
+/// Tells a staging directory a restore made from any other directory of that name.
+fn staging_kind(staging: &Path) -> Result<Staging, RestoreError> {
+    match fs::symlink_metadata(staging) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Ok(Staging::Foreign),
+        Err(e) => return Err(io_err(staging, e)),
+    }
+    let mut names = Vec::new();
+    for entry in fs::read_dir(staging).map_err(|e| io_err(staging, e))? {
+        names.push(entry.map_err(|e| io_err(staging, e))?.file_name());
+    }
+    let owned = names.is_empty()
+        || owner_bytes(staging)?.is_some_and(|bytes| STAGING_MAGIC.starts_with(&bytes));
+    Ok(if owned {
+        Staging::Ours {
+            tree: names.iter().any(|name| name == STAGING_TREE),
+        }
+    } else {
+        Staging::Foreign
+    })
+}
+
 /// Says whether `target` is absent, half restored or present.
+///
+/// A staging directory of a restore that holds no tree, because the tree
+/// was already renamed onto the target or never made, does not count; the
+/// target says what is there.
 pub fn restore_state(target: &Path) -> Result<RestoreState, RestoreError> {
     if let Ok(staging) = staging_path(target)
-        && staging.exists()
+        && fs::symlink_metadata(&staging).is_ok()
+        && staging_kind(&staging)? != (Staging::Ours { tree: false })
     {
         return Ok(RestoreState::HalfRestored { staging });
     }
@@ -360,26 +442,60 @@ fn refuse_nested(target: &Path, harness_state: &Path) -> Result<(), RestoreError
     Ok(())
 }
 
-/// Makes a fresh staging directory for `target`, removing a stale one.
-fn fresh_staging(target: &Path) -> Result<PathBuf, RestoreError> {
+/// Makes a fresh staging directory for `target`, removing a stale one a restore made, and returns the tree inside it.
+///
+/// The owner file is written, and under `PowerLoss` flushed, before the
+/// tree exists, so a staging directory that holds anything restore wrote
+/// also holds the proof that restore made it. A directory of the staging
+/// name without that proof is `ForeignStaging`.
+fn fresh_staging(target: &Path, durability: Durability) -> Result<PathBuf, RestoreError> {
     let staging = staging_path(target)?;
-    if fs::symlink_metadata(&staging).is_ok_and(|meta| meta.is_dir()) {
-        open_up(&staging)?;
-    }
-    match fs::remove_dir_all(&staging) {
-        Ok(()) => tracing::info!(path = %staging.display(), "removed a half-finished restore"),
+    match fs::symlink_metadata(&staging) {
+        Ok(_) => {
+            if staging_kind(&staging)? == Staging::Foreign {
+                return Err(RestoreError::ForeignStaging { path: staging });
+            }
+            open_up(&staging)?;
+            fs::remove_dir_all(&staging).map_err(|e| io_err(&staging, e))?;
+            tracing::info!(path = %staging.display(), "removed a half-finished restore");
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(io_err(&staging, e)),
     }
     fs::create_dir(&staging).map_err(|e| io_err(&staging, e))?;
-    Ok(staging)
+    let owner = staging.join(STAGING_OWNER);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&owner)
+        .map_err(|e| io_err(&owner, e))?;
+    file.write_all(STAGING_MAGIC)
+        .map_err(|e| io_err(&owner, e))?;
+    if durability == Durability::PowerLoss {
+        rustix::fs::fsync(&file).map_err(|e| io_err(&owner, e.into()))?;
+        rustix::fs::fsync(fs::File::open(&staging).map_err(|e| io_err(&staging, e))?)
+            .map_err(|e| io_err(&staging, e.into()))?;
+    }
+    let tree = staging.join(STAGING_TREE);
+    fs::create_dir(&tree).map_err(|e| io_err(&tree, e))?;
+    Ok(tree)
 }
 
-/// Renames the staging directory onto the target and flushes the parent.
-fn move_into_place(staging: &Path, target: &Path) -> Result<(), RestoreError> {
-    fs::rename(staging, target).map_err(|e| io_err(target, e))?;
+/// Renames the staging tree onto the target, flushes the parent, then removes the emptied staging directory.
+fn move_into_place(tree: &Path, target: &Path) -> Result<(), RestoreError> {
+    fs::rename(tree, target).map_err(|e| io_err(target, e))?;
     if let Some(parent) = target.parent() {
         durable::fsync_dir(parent).map_err(|e| io_err(parent, e))?;
+    }
+    // The tree is in place, so the restore has succeeded; a staging
+    // directory a kill leaves here holds the owner file or nothing, and
+    // `restore_state` and the next `fresh_staging` both know it for what it is.
+    if let Some(staging) = tree.parent() {
+        let removed =
+            fs::remove_file(staging.join(STAGING_OWNER)).and_then(|()| fs::remove_dir(staging));
+        if let Err(e) = removed {
+            tracing::warn!(path = %staging.display(), error = %e, "could not remove a finished staging directory");
+        }
     }
     Ok(())
 }
@@ -420,6 +536,8 @@ fn write_entries(
                     size: *size,
                 });
             }
+            // The mtime goes on before the flush, so the flush carries it too.
+            writer.set_mtime(&entry.rel_path, entry.mtime_ns)?;
             if durability == Durability::PowerLoss {
                 // Plain fsync(2); the parent directory's F_FULLFSYNC after the
                 // rename flushes the device cache once for all of them.
@@ -427,7 +545,6 @@ fn write_entries(
                     .map_err(|e| io_err(Path::new(entry.rel_path.as_str()), e.into()))?;
             }
             drop(file);
-            writer.set_mtime(&entry.rel_path, entry.mtime_ns)?;
             written_here.add(written);
             if written_here.files == 1 {
                 checkpoint::reached("restore.after_first_file");
@@ -444,16 +561,53 @@ fn write_entries(
             written_here.add(0);
         }
     }
+    let sync = durability == Durability::PowerLoss;
     for entry in kept.iter().rev() {
         if matches!(entry.kind, EntryKind::Dir) {
-            writer.set_dir_mode(&entry.rel_path, entry.mode)?;
-            writer.set_mtime(&entry.rel_path, entry.mtime_ns)?;
+            writer.finish_dir(&entry.rel_path, entry.mode, entry.mtime_ns, sync)?;
         }
     }
     Ok(())
 }
 
-/// Re-reads written files against the store and returns how many matched.
+/// Flushes every directory under `root`, and `root` itself, deepest first, without following links; with `files`, every regular file too.
+///
+/// The files restore writes are flushed as they are written, but a file's
+/// flush does not make its name durable: the directory that holds it must
+/// be flushed too, before the rename that publishes the tree. A tree an
+/// earlier run left behind, such as a harness directory a rerun keeps, was
+/// maybe written without any flush, so its files are flushed as well. A
+/// directory this cannot open is one `write_entries` gave a recorded mode
+/// without read permission, and it flushed that one already, children first.
+fn sync_tree(root: &Path, files: bool) -> Result<(), RestoreError> {
+    use rustix::fs::{Mode as RawBits, OFlags};
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let fd = match rustix::fs::open(root, flags, RawBits::empty()) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::ACCESS) => return Ok(()),
+        Err(e) => return Err(io_err(root, e.into())),
+    };
+    for entry in fs::read_dir(root).map_err(|e| io_err(root, e))? {
+        let entry = entry.map_err(|e| io_err(root, e))?;
+        let path = entry.path();
+        let kind = entry.file_type().map_err(|e| io_err(&path, e))?;
+        if kind.is_dir() {
+            sync_tree(&path, files)?;
+        } else if files && kind.is_file() {
+            let file_flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+            let file = rustix::fs::open(&path, file_flags, RawBits::empty())
+                .map_err(|e| io_err(&path, e.into()))?;
+            rustix::fs::fsync(&file).map_err(|e| io_err(&path, e.into()))?;
+        }
+    }
+    rustix::fs::fsync(&fd).map_err(|e| io_err(root, e.into()))
+}
+
+/// Re-reads written entries against the store and returns how many matched.
+///
+/// A file is compared byte for byte, a link by its target, and a directory
+/// must be a directory, so a removed empty directory or a replaced link
+/// fails like a changed file.
 fn verify_entries(
     store: &Store,
     writer: &TreeWriter,
@@ -461,19 +615,30 @@ fn verify_entries(
     skip: &dyn Fn(&RelPath) -> bool,
     mode: Verify,
 ) -> Result<u64, RestoreError> {
-    let files: Vec<&Entry> = entries
-        .iter()
-        .filter(|e| matches!(e.kind, EntryKind::File { .. }) && !skip(&e.rel_path))
-        .collect();
+    let kept: Vec<&Entry> = entries.iter().filter(|e| !skip(&e.rel_path)).collect();
     let mut verified = 0;
-    for entry in sample(&files, mode) {
-        let EntryKind::File { chunks, .. } = &entry.kind else {
-            continue;
-        };
-        let mut file = writer.open_file(&entry.rel_path)?;
+    for entry in sample(&kept, mode) {
         let mismatch = || RestoreError::VerifyFailed {
             path: entry.rel_path.clone(),
         };
+        let chunks = match &entry.kind {
+            EntryKind::File { chunks, .. } => chunks,
+            EntryKind::Dir => {
+                if !writer.is_dir(&entry.rel_path).map_err(|_| mismatch())? {
+                    return Err(mismatch());
+                }
+                verified += 1;
+                continue;
+            }
+            EntryKind::Symlink { target } => {
+                if writer.read_link(&entry.rel_path).map_err(|_| mismatch())? != *target {
+                    return Err(mismatch());
+                }
+                verified += 1;
+                continue;
+            }
+        };
+        let mut file = writer.open_file(&entry.rel_path).map_err(|_| mismatch())?;
         let mut buf = Vec::new();
         for chunk in chunks {
             let expected = store.objects().read(*chunk)?;
@@ -531,8 +696,16 @@ struct TreeItem {
 fn parse_tree(bytes: &[u8]) -> Result<Vec<TreeItem>, RestoreError> {
     let mut items = Vec::new();
     for record in Git::records(bytes) {
-        let text = String::from_utf8_lossy(record).into_owned();
-        let bad = || RestoreError::BadTreeOutput { text: text.clone() };
+        // A name that is not UTF-8 is refused, not rewritten: a lossy
+        // decode would write, and verify, a file under another name.
+        let Ok(text) = std::str::from_utf8(record) else {
+            return Err(RestoreError::BadTreeOutput {
+                text: String::from_utf8_lossy(record).into_owned(),
+            });
+        };
+        let bad = || RestoreError::BadTreeOutput {
+            text: text.to_owned(),
+        };
         let (meta, path) = text.split_once('\t').ok_or_else(bad)?;
         let mut fields = meta.split(' ');
         let mode = fields.next().and_then(TreeMode::parse).ok_or_else(bad)?;
@@ -710,21 +883,44 @@ fn unbundle_chain(
     Ok(())
 }
 
+/// Adds `oid` as the newest stash entry.
+fn push_stash_entry(git: &Git, oid: &GitOid) -> Result<(), RestoreError> {
+    // `git stash list` prints the reflog message, so the entry gets the
+    // stash commit's own subject back.
+    let subject = git.run_text(&["log", "-1", "--format=%s", oid.as_str()])?;
+    git.run(&[
+        "update-ref",
+        "--create-reflog",
+        "-m",
+        &subject,
+        "refs/stash",
+        oid.as_str(),
+    ])?;
+    Ok(())
+}
+
 /// Sets every ref and `HEAD` exactly as `git_state` records them.
-fn set_refs(git: &Git, git_state: &GitState) -> Result<(), RestoreError> {
+///
+/// The stash list is rebuilt oldest first from the refs capture pinned
+/// under the job's stash prefix, then `refs/stash` itself, so every entry
+/// comes back at its index.
+fn set_refs(git: &Git, git_state: &GitState, job_id: JobId) -> Result<(), RestoreError> {
+    let prefix = stash_prefix(job_id);
+    let mut older: Vec<(u64, &GitOid)> = git_state
+        .refs
+        .iter()
+        .filter_map(|(name, oid)| {
+            let n = name.as_str().strip_prefix(&prefix)?.parse().ok()?;
+            Some((n, oid))
+        })
+        .collect();
+    older.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
     for (name, oid) in &git_state.refs {
         if name.as_str() == "refs/stash" {
-            // `git stash list` prints the reflog message, so the entry gets
-            // the stash commit's own subject back.
-            let subject = git.run_text(&["log", "-1", "--format=%s", oid.as_str()])?;
-            git.run(&[
-                "update-ref",
-                "--create-reflog",
-                "-m",
-                &subject,
-                "refs/stash",
-                oid.as_str(),
-            ])?;
+            for (_, entry) in &older {
+                push_stash_entry(git, entry)?;
+            }
+            push_stash_entry(git, oid)?;
         } else {
             git.run(&["update-ref", name.as_str(), oid.as_str()])?;
         }
@@ -741,24 +937,34 @@ fn set_refs(git: &Git, git_state: &GitState) -> Result<(), RestoreError> {
     Ok(())
 }
 
-/// Writes `.git/info/exclude` from its objects.
-fn write_exclude(
+/// Creates the empty repository in the object format of `git_state` and writes its exclude file.
+fn init_repo(
     store: &Store,
     git: &Git,
-    chunks: &[ChunkId],
+    git_state: &GitState,
     power_loss: bool,
 ) -> Result<(), RestoreError> {
-    let path = git.git_path("info/exclude")?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
-    }
-    let mut file = fs::File::create(&path).map_err(|e| io_err(&path, e))?;
-    for chunk in chunks {
-        file.write_all(&store.objects().read(*chunk)?)
-            .map_err(|e| io_err(&path, e))?;
-    }
-    if power_loss {
-        rustix::fs::fsync(&file).map_err(|e| io_err(&path, e.into()))?;
+    // A SHA-256 repository cannot unpack into a SHA-1 one; the manifest
+    // holds one object format, read from the width of its ids.
+    let format = if git_state.index_commit.is_sha256() {
+        "--object-format=sha256"
+    } else {
+        "--object-format=sha1"
+    };
+    git.run(&["init", "-q", format])?;
+    if let Some(chunks) = &git_state.exclude {
+        let path = git.git_path("info/exclude")?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+        }
+        let mut file = fs::File::create(&path).map_err(|e| io_err(&path, e))?;
+        for chunk in chunks {
+            file.write_all(&store.objects().read(*chunk)?)
+                .map_err(|e| io_err(&path, e))?;
+        }
+        if power_loss {
+            rustix::fs::fsync(&file).map_err(|e| io_err(&path, e.into()))?;
+        }
     }
     Ok(())
 }
@@ -812,13 +1018,10 @@ fn restore_git(
     if power_loss {
         git = git.with_full_fsync();
     }
-    git.run(&["init", "-q"])?;
-    if let Some(chunks) = &git_state.exclude {
-        write_exclude(store, &git, chunks, power_loss)?;
-    }
+    init_repo(store, &git, git_state, power_loss)?;
 
     unbundle_chain(store, snapshot, manifest, &git, report)?;
-    set_refs(&git, git_state)?;
+    set_refs(&git, git_state, manifest.job_id)?;
     git.run(&["read-tree", git_state.index_commit.as_str()])?;
 
     let listing = git.run(&["ls-tree", "-r", "-z", git_state.worktree_commit.as_str()])?;
@@ -871,13 +1074,13 @@ fn restore_git(
                         size,
                     });
                 }
+                if let Some(mtime) = mtimes.get(&item.rel) {
+                    writer.set_mtime(&item.rel, *mtime)?;
+                }
                 if power_loss {
                     rustix::fs::fsync(&file).map_err(|e| io_err(path, e.into()))?;
                 }
                 drop(file);
-                if let Some(mtime) = mtimes.get(&item.rel) {
-                    writer.set_mtime(&item.rel, *mtime)?;
-                }
                 counted.add(&item.rel, written);
             }
         }
@@ -1087,7 +1290,11 @@ fn harness_state_complete(
     }
 }
 
-/// The cache paths whose bytes are not written: rows not carried and rows `carry` turns down.
+/// The cache paths whose bytes are not written: rows not wholly carried and rows `carry` turns down.
+///
+/// A `Partial` cache had a secret or an excluded path left out; written, it
+/// would look whole to the tool that reads it, so it is treated as missing
+/// whatever `carry` says.
 fn skipped_caches(
     manifest: &SnapshotManifest,
     carry: &dyn Fn(&CacheEntry) -> bool,
@@ -1095,7 +1302,7 @@ fn skipped_caches(
     manifest
         .caches
         .iter()
-        .filter(|c| c.carry == CarryState::NotCarried || !carry(c))
+        .filter(|c| c.carry != CarryState::Carried || !carry(c))
         .map(|c| c.path.clone())
         .collect()
 }
@@ -1116,7 +1323,7 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
         Some(dir) => harness_state_complete(store, &manifest.harness_state.entries, dir)?,
         None => None,
     };
-    let staging = fresh_staging(req.target)?;
+    let staging = fresh_staging(req.target, req.durability)?;
     let writer = TreeWriter::open(&staging)?;
     let mut report = RestoreReport::default();
 
@@ -1158,9 +1365,15 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
     }
 
     match (req.harness_state, harness_done) {
-        (Some(_), Some(verified)) => report.verified += verified,
+        (Some(dir), Some(verified)) => {
+            // A kept harness directory may come from a ProcessCrash run.
+            if req.durability == Durability::PowerLoss {
+                sync_tree(dir, true)?;
+            }
+            report.verified += verified;
+        }
         (Some(dir), None) => {
-            let hs_staging = fresh_staging(dir)?;
+            let hs_staging = fresh_staging(dir, req.durability)?;
             let hs_writer = TreeWriter::open(&hs_staging)?;
             let keep_all = |_: &RelPath| false;
             let mut harness = Written::default();
@@ -1181,6 +1394,9 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
                 &keep_all,
                 req.verify,
             )?;
+            if req.durability == Durability::PowerLoss {
+                sync_tree(&hs_staging, false)?;
+            }
             move_into_place(&hs_staging, dir)?;
             checkpoint::reached("restore.after_harness_rename");
         }
@@ -1188,22 +1404,41 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
     }
 
     if let (Some(git), Some(state)) = (&git, &manifest.git) {
-        for (key, value) in &state.config {
-            // These describe the source's filesystem; `git init` probed the target's.
-            if matches!(
-                key,
-                GitConfigKey::CoreIgnoreCase | GitConfigKey::CoreSymlinks
-            ) {
-                continue;
-            }
-            git.run(&["config", "--local", &key.to_string(), value.as_str()])?;
-        }
+        write_config(git, &state.config)?;
+    }
+    if req.durability == Durability::PowerLoss {
+        sync_tree(&staging, false)?;
     }
     checkpoint::reached("restore.before_rename");
     move_into_place(&staging, req.target)?;
     checkpoint::reached("restore.after_rename");
     tracing::info!(snapshot = %req.snapshot, target = %req.target.display(), files = report.total().files, "restored");
     Ok(report)
+}
+
+/// Writes the carried config projection, the last step of a git restore (ADR 0004).
+///
+/// A repeated key's values sit together in the source's order: the first
+/// replaces whatever `git init` wrote, and the rest follow it.
+fn write_config(git: &Git, config: &[(GitConfigKey, GitConfigValue)]) -> Result<(), RestoreError> {
+    let mut previous = None;
+    for (key, value) in config {
+        // These describe the source's filesystem; `git init` probed the target's.
+        if matches!(
+            key,
+            GitConfigKey::CoreIgnoreCase | GitConfigKey::CoreSymlinks
+        ) {
+            continue;
+        }
+        let mode = if previous == Some(key) {
+            "--add"
+        } else {
+            "--replace-all"
+        };
+        git.run(&["config", "--local", mode, &key.to_string(), value.as_str()])?;
+        previous = Some(key);
+    }
+    Ok(())
 }
 
 /// Re-reads the `files` and the working tree of a snapshot under `root` and returns how many matched.
@@ -1241,6 +1476,20 @@ mod tests {
 
     /// Blobs enough to fill both pipes between this process and git.
     const BLOBS: usize = 300;
+
+    #[test]
+    fn a_tree_name_that_is_not_utf8_is_refused_not_rewritten() {
+        let oid = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+        let mut listing = format!("100644 blob {oid}\tok.txt").into_bytes();
+        listing.push(0);
+        assert_eq!(parse_tree(&listing).unwrap().len(), 1);
+        listing.extend_from_slice(format!("100644 blob {oid}\tbad").as_bytes());
+        listing.extend_from_slice(&[0xff, 0xfe, 0]);
+        assert!(matches!(
+            parse_tree(&listing),
+            Err(RestoreError::BadTreeOutput { .. })
+        ));
+    }
 
     #[test]
     fn a_failing_blob_write_does_not_hang_cat_file() {
