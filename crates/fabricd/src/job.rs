@@ -35,7 +35,11 @@ impl Job {
     ///
     /// The record is checked before anything is written, and the ledger
     /// appears whole or not at all, so a refused or failed create leaves
-    /// nothing that would stop the job being learned later.
+    /// nothing that would stop the job being learned later. That holds when
+    /// the derived manifest fails to write after the ledger is durable, as
+    /// on a full disk: the job is not held in memory then, and a ledger
+    /// left on disk would make every later offer of the record fail on it
+    /// until the node restarts.
     pub fn create(id: JobId, dir: JobDir, created: &Record) -> Result<Self, NodeError> {
         let EventKind::Created { job_id, .. } = created.event().kind else {
             return Err(LedgerError::FirstNotCreated(created.event().kind.name()).into());
@@ -50,7 +54,13 @@ impl Job {
         let ledger = Ledger::replay(job_id, [created.clone()])?;
         crate::durable::create_dir(dir.dir()).map_err(|e| NodeError::io(dir.dir(), e))?;
         let file = LedgerFile::create(&dir.ledger(), created)?;
-        ledger_file::write_manifest(&dir.manifest(), &ledger)?;
+        if let Err(e) = ledger_file::write_manifest(&dir.manifest(), &ledger) {
+            drop(file);
+            if let Err(removed) = local::remove(&dir.ledger()) {
+                tracing::warn!(error = %removed, "a failed job create left its ledger");
+            }
+            return Err(e.into());
+        }
         Ok(Self {
             id: job_id,
             dir,
@@ -449,6 +459,34 @@ mod tests {
             .unwrap();
         assert_eq!(job.session().unwrap(), None);
         assert!(!state.job(id).session_pending().exists());
+    }
+
+    /// A peer's `Created` can be durable here when the derived manifest
+    /// beside it fails to write, as on a full disk. The job is not held
+    /// then, so its ledger must go too: left on disk, it would make every
+    /// later offer of the record fail until the node restarts.
+    #[test]
+    fn a_learned_job_whose_manifest_fails_can_be_learned_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::resolve(Some(dir.path().as_os_str()), dir.path()).unwrap();
+        let id = JobId::from_bytes([1; 16]);
+        let created = Ledger::created(
+            id,
+            "goal".into(),
+            HarnessKind::Codex,
+            NodeId::from_bytes([3; 32]),
+            EventId::from_bytes([4; 16]),
+            1,
+        )
+        .unwrap();
+        // A directory where the manifest goes makes its write fail after
+        // the ledger is written.
+        fs::create_dir_all(state.job(id).manifest().join("in-the-way")).unwrap();
+        let failed = Job::create(id, state.job(id), &created);
+        assert!(failed.is_err(), "{failed:?}");
+        fs::remove_dir_all(state.job(id).manifest()).unwrap();
+        Job::create(id, state.job(id), &created).unwrap();
+        Job::open(id, state.job(id)).unwrap();
     }
 
     /// The ledger can be durable when the derived manifest beside it fails
