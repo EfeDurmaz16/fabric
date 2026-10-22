@@ -17,8 +17,8 @@ use fabric_core::snapshot::{
     CacheClass, CacheEntry, CarryKey, CarryState, Entry, EntryKind, GitHead, ManifestError, Mode,
 };
 use fabric_store::capture::{
-    BundleKind, BusyReason, CaptureError, CaptureRequest, Captured, IndexFlag, MAX_BUNDLE_CHAIN,
-    UnmeasuredKeys, capture,
+    BundleKind, BusyReason, CaptureError, CaptureRequest, Captured, CarryKeys, IndexFlag,
+    MAX_BUNDLE_CHAIN, UnmeasuredKeys, capture,
 };
 use fabric_store::objects::ChunkParams;
 use fabric_store::policy::{IgnorePolicy, PolicyError, SECRET_PATTERNS};
@@ -1067,6 +1067,54 @@ fn plain_tree(root: &Path, state: &Path) -> Fallible {
     fs::write(state.join("sessions/s1/tool.txt"), "tool\n")?;
     fs::write(state.join("sessions/s1.jsonl"), "{}\n")?;
     Ok(())
+}
+
+/// Carry keys that write a file into the workspace the first time capture asks, after the listing.
+struct WritesLate<'a> {
+    file: &'a Path,
+}
+
+impl CarryKeys for WritesLate<'_> {
+    fn key(&self, _class: CacheClass, _path: &RelPath) -> CarryKey {
+        if !self.file.exists() {
+            // A failed write leaves nothing to find, and the test's assertion fails.
+            let _ = fs::write(self.file, "written after the listing\n");
+        }
+        CarryKey::Unmeasured
+    }
+}
+
+/// A file a still-running harness writes after its directory was listed fails the capture instead of being left out.
+#[test]
+fn a_file_added_after_the_listing_fails_the_capture() {
+    for repository in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::write(root.join("node_modules/pkg/index.js"), "1;\n").unwrap();
+        fs::write(root.join("a.txt"), "a\n").unwrap();
+        if repository {
+            fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+            let g = git(&root);
+            g.run(&["init", "-q", "-b", "main"]).unwrap();
+            g.run(&["add", "-A"]).unwrap();
+            g.run(&["commit", "-q", "-m", "one"]).unwrap();
+        }
+        let store = store_in(dir.path()).unwrap();
+        let policy = IgnorePolicy::default();
+        for late in ["late.txt", "node_modules/pkg/late.js"] {
+            let file = root.join(late);
+            let keys = WritesLate { file: &file };
+            let mut req = request(&root, &policy, None);
+            req.carry_keys = &keys;
+            let err = capture(&store, &req).unwrap_err();
+            assert!(
+                matches!(&err, CaptureError::WorkspaceChanged { path } if path.as_str() == late),
+                "repository {repository}: {err}"
+            );
+            fs::remove_file(&file).unwrap();
+        }
+    }
 }
 
 #[test]

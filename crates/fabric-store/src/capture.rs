@@ -620,6 +620,52 @@ fn list_tree(base: &Path) -> Result<Listing, CaptureError> {
     Ok(out)
 }
 
+/// Every path a listing saw, with the stamp of each, to tell whether the tree changed after it was listed.
+///
+/// A FIFO, socket or device has no stamp; only its name counts.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Census(BTreeMap<RelPath, Option<Stamp>>);
+
+impl Census {
+    /// Stamps every found path and records the bare `names` beside them.
+    fn of<'a>(found: &[Found], names: impl Iterator<Item = &'a RelPath>) -> Census {
+        let mut paths: BTreeMap<RelPath, Option<Stamp>> = found
+            .iter()
+            .map(|item| (item.rel.clone(), Some(stamp(&item.meta))))
+            .collect();
+        paths.extend(names.map(|rel| (rel.clone(), None)));
+        Census(paths)
+    }
+
+    /// Fails with `WorkspaceChanged` on the first path, by name, that only one of the two lists, or else that `later` lists with another stamp.
+    ///
+    /// An added file also changes its directory's stamp; the file is the
+    /// one worth naming.
+    fn unchanged_in(&self, later: &Census) -> Result<(), CaptureError> {
+        let names: BTreeSet<&RelPath> = self.0.keys().chain(later.0.keys()).collect();
+        let changed = names
+            .iter()
+            .find(|rel| self.0.contains_key(**rel) != later.0.contains_key(**rel))
+            .or_else(|| {
+                names
+                    .iter()
+                    .find(|rel| self.0.get(**rel) != later.0.get(**rel))
+            });
+        match changed {
+            Some(rel) => Err(CaptureError::WorkspaceChanged {
+                path: (*rel).clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Walks `base` again and fails with `WorkspaceChanged` when a path was added, removed, replaced or written since this census.
+    fn unchanged_under(&self, base: &Path) -> Result<(), CaptureError> {
+        let later = list_tree(base)?;
+        self.unchanged_in(&Census::of(&later.found, later.special.iter()))
+    }
+}
+
 /// Counts of what the policy did under one cache root.
 struct CacheSeen {
     class: CacheClass,
@@ -806,6 +852,7 @@ impl Capturer<'_> {
     /// Claude Code keeps `.credentials.json` in its state directory on Linux.
     fn harness_entries(&mut self, base: &Path) -> Result<Vec<Entry>, CaptureError> {
         let listing = list_tree(base)?;
+        let census = Census::of(&listing.found, listing.special.iter());
         self.report.nested_harness.extend(listing.nested);
         self.report.special_harness.extend(listing.special);
         let mut entries = Vec::with_capacity(listing.found.len());
@@ -816,6 +863,9 @@ impl Capturer<'_> {
             }
             entries.push(self.entry_for(base, item)?);
         }
+        // A file the adapter wrote after its directory was listed would
+        // otherwise be missing from the snapshot, and lost with the move.
+        census.unchanged_under(base)?;
         // The walk lists a directory's children before its siblings, which
         // puts `abc/tool.txt` before `abc.jsonl`; the manifest sorts by bytes.
         entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
@@ -974,7 +1024,58 @@ fn user_excludes(git: &Git, root: &Path) -> Result<String, CaptureError> {
     }
 }
 
+/// What the git half saw of the work tree, checked again once every file is stored.
+struct GitSeen {
+    /// Every tracked and untracked path, existing or not.
+    paths: Vec<RelPath>,
+    /// The stamps of those that existed just before `W` was built.
+    stamps: HashMap<RelPath, Stamp>,
+    /// The untracked listing: paths, then nested repositories.
+    untracked: (Vec<RelPath>, Vec<RelPath>),
+}
+
+/// What `capture` checks after every file is stored, by the kind of root.
+enum Settle<'a> {
+    /// A repository: its paths, untracked listing and ignored files.
+    Git(Box<(GitCapture<'a>, GitSeen, Census)>),
+    /// A plain directory: its walk.
+    Plain(Census),
+}
+
 impl GitCapture<'_> {
+    /// Fails with `WorkspaceChanged` when a path of the work tree was added, removed or written after capture listed it.
+    ///
+    /// `W` holds the tracked and untracked paths as their stamps were just
+    /// before it was built, and `files` the ignored ones as they were
+    /// listed; a path that appeared or changed after that would be missing
+    /// from the snapshot, or older in it, and lost with the move.
+    fn unchanged_since(&self, seen: &GitSeen, ignored: &Census) -> Result<(), CaptureError> {
+        let now = stamps(self.root, seen.paths.iter())?;
+        let changed = seen
+            .paths
+            .iter()
+            .filter(|rel| now.get(*rel) != seen.stamps.get(*rel))
+            .min();
+        if let Some(rel) = changed {
+            return Err(CaptureError::WorkspaceChanged { path: rel.clone() });
+        }
+        let (paths, nested) = self.untracked()?;
+        let before: BTreeSet<&RelPath> = seen.untracked.0.iter().chain(&seen.untracked.1).collect();
+        let after: BTreeSet<&RelPath> = paths.iter().chain(&nested).collect();
+        if let Some(rel) = before.symmetric_difference(&after).min() {
+            return Err(CaptureError::WorkspaceChanged {
+                path: (*rel).clone(),
+            });
+        }
+        let mut report = CaptureReport::default();
+        let found = self.ignored(&mut report)?;
+        let names = report
+            .special_files
+            .iter()
+            .chain(&report.nested_repositories);
+        ignored.unchanged_in(&Census::of(&found, names))
+    }
+
     /// The `-c` value that makes a listing read the same user exclude rules as `W`.
     fn excludes_flag(&self) -> String {
         format!(
@@ -1672,20 +1773,37 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
         req,
         report: CaptureReport::default(),
     };
-    let (git_state, found) = if let Some(repo) = detect_git(req, store.objects().tmp_dir())? {
+    let (git_state, found, settle) = if let Some(repo) = detect_git(req, store.objects().tmp_dir())?
+    {
         repo.refuse_bad_states()?;
         let parent = parent_manifest
             .as_ref()
             .map(|(id, manifest)| (*id, manifest));
-        let state = capture_git(&mut capturer, &repo, parent)?;
-        (Some(state), repo.ignored(&mut capturer.report)?)
+        let (state, seen) = capture_git(&mut capturer, &repo, parent)?;
+        let report = &mut capturer.report;
+        let (special, nested) = (report.special_files.len(), report.nested_repositories.len());
+        let found = repo.ignored(report)?;
+        let names = report.special_files[special..]
+            .iter()
+            .chain(&report.nested_repositories[nested..]);
+        let ignored = Census::of(&found, names);
+        (
+            Some(state),
+            found,
+            Settle::Git(Box::new((repo, seen, ignored))),
+        )
     } else {
         let listing = list_tree(req.root)?;
+        let census = Census::of(&listing.found, listing.special.iter());
         capturer.report.nested_repositories.extend(listing.nested);
         capturer.report.special_files.extend(listing.special);
-        (None, listing.found)
+        (None, listing.found, Settle::Plain(census))
     };
     let (files, caches) = capturer.classify_and_store(req.root, found)?;
+    match &settle {
+        Settle::Git(git) => git.0.unchanged_since(&git.1, &git.2)?,
+        Settle::Plain(census) => census.unchanged_under(req.root)?,
+    }
     let harness_state = match req.harness_state {
         Some(dir) => HarnessState {
             entries: capturer.harness_entries(dir)?,
@@ -1802,7 +1920,7 @@ fn capture_git(
     capturer: &mut Capturer<'_>,
     repo: &GitCapture<'_>,
     parent: Option<(SnapshotId, &SnapshotManifest)>,
-) -> Result<GitState, CaptureError> {
+) -> Result<(GitState, GitSeen), CaptureError> {
     let req = capturer.req;
     let policy = req.policy;
     let (untracked, nested) = repo.untracked()?;
@@ -1843,7 +1961,8 @@ fn capture_git(
         excludes.push_str(root.as_str());
         excludes.push_str("/\n");
     }
-    let before = stamps(req.root, tracked.iter().chain(untracked.iter()))?;
+    let stamped: Vec<RelPath> = tracked.iter().chain(untracked.iter()).cloned().collect();
+    let before = stamps(req.root, stamped.iter())?;
     let (worktree_commit, removed) = repo.worktree_commit(
         &index_tree,
         head_commit.as_ref(),
@@ -1886,7 +2005,7 @@ fn capture_git(
     } else {
         None
     };
-    Ok(GitState {
+    let state = GitState {
         bundle,
         bundle_base,
         refs,
@@ -1896,7 +2015,13 @@ fn capture_git(
         worktree_mtimes,
         config,
         exclude,
-    })
+    };
+    let seen = GitSeen {
+        paths: stamped,
+        stamps: before,
+        untracked: (untracked, nested),
+    };
+    Ok((state, seen))
 }
 
 #[cfg(test)]
