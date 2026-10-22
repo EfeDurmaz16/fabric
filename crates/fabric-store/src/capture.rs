@@ -189,9 +189,12 @@ pub struct CaptureReport {
     pub tracked_secrets: Vec<RelPath>,
     /// Paths in the stash's work tree, index or untracked commit that match a secret pattern; they travel in the bundle.
     pub stashed_secrets: Vec<RelPath>,
-    /// Paths of `W` whose bytes a clean filter changed on check-in, as
-    /// git-crypt encrypts them; they travel, and restore writes them, as the
-    /// filter's output, the way a fresh clone has them before its smudge.
+    /// Paths of `W` under a `filter` attribute whose blob differs from the
+    /// file's own bytes; they travel as git's check-in output, so bytes a
+    /// filter hides never enter `W`. A filter the repository configures with
+    /// a clean step is refused first (`GitFilterUnsupported`), so this names
+    /// a path another check-in conversion changed, or one whose filter was
+    /// configured while capture ran.
     pub filtered: Vec<RelPath>,
     /// Symlinks whose target is absolute or climbs above the root.
     pub escaping_symlinks: Vec<RelPath>,
@@ -314,6 +317,18 @@ pub enum CaptureError {
     GitLfsUnsupported {
         /// The first path git says the filter applies to.
         path: RelPath,
+    },
+    /// A path has a clean filter the repository config sets up, such as
+    /// git-crypt's; `W` would hold the cleaned bytes and restore writes
+    /// them as they are, with no smudge.
+    #[error(
+        "{path} has filter={filter}, which this repository configures; capture would carry the filtered bytes, not the file"
+    )]
+    GitFilterUnsupported {
+        /// The first path git says the filter applies to.
+        path: RelPath,
+        /// The filter driver's name.
+        filter: String,
     },
     /// Untracked files above the limit would enter the user's object store.
     #[error(
@@ -1242,6 +1257,12 @@ impl GitCapture<'_> {
                 return Err(CaptureError::GitSubmoduleDirty { path: path()? });
             }
         }
+        self.refuse_filters()
+    }
+
+    /// Refuses a path whose bytes `git add -A` would change: one under the
+    /// LFS filter, or under a clean filter the repository configures.
+    fn refuse_filters(&self) -> Result<(), CaptureError> {
         // git resolves the attributes itself, from every .gitattributes,
         // tracked or not, and from .git/info/attributes.
         let paths = self.git.run(&[
@@ -1256,12 +1277,23 @@ impl GitCapture<'_> {
         let attrs =
             self.git
                 .run_stdin_env(&["check-attr", "-z", "--stdin", "filter"], &[], &paths)?;
+        let drivers = self.clean_filters()?;
         let fields: Vec<&[u8]> = attrs.split(|b| *b == 0).collect();
         for triple in fields.chunks_exact(3) {
             if triple[2] == b"lfs" {
                 let text = Git::text("lfs path", triple[0])?;
                 return Err(CaptureError::GitLfsUnsupported {
                     path: rel_path(text)?,
+                });
+            }
+            // `git add -A` runs the driver's clean step into `W`, and
+            // restore writes blobs with no smudge step, so the target would
+            // hold the filtered bytes (git-crypt's ciphertext).
+            if drivers.iter().any(|name| name.as_bytes() == triple[2]) {
+                let text = Git::text("filtered path", triple[0])?;
+                return Err(CaptureError::GitFilterUnsupported {
+                    path: rel_path(text)?,
+                    filter: Git::text("filter name", triple[2])?.to_owned(),
                 });
             }
         }
@@ -1294,6 +1326,44 @@ impl GitCapture<'_> {
             });
         }
         Ok(paths)
+    }
+
+    /// Names every filter driver whose clean step `git add` runs here: one
+    /// with a non-empty `clean` or `process` command in the config git reads
+    /// for this repository, includes too. An attribute that names any other
+    /// driver leaves the bytes as they are.
+    fn clean_filters(&self) -> Result<Vec<String>, CaptureError> {
+        let args = [
+            "config",
+            "-z",
+            "--get-regexp",
+            r"^filter\..*\.(clean|process)$",
+        ];
+        let out = self.git.output(&args, &[])?;
+        // `--get-regexp` exits 1 when no key matches.
+        if out.status.code() == Some(1) && out.stdout.is_empty() {
+            return Ok(Vec::new());
+        }
+        let out = Git::checked(&args, out)?;
+        let mut names = Vec::new();
+        for record in Git::records(&out) {
+            let text = Git::text("config record", record)?;
+            let (key, value) = text.split_once('\n').unwrap_or((text, "true"));
+            if value.is_empty() {
+                continue;
+            }
+            let name = key
+                .strip_prefix("filter.")
+                .and_then(|rest| {
+                    rest.strip_suffix(".clean")
+                        .or_else(|| rest.strip_suffix(".process"))
+                })
+                .unwrap_or("");
+            if !name.is_empty() {
+                names.push(name.to_owned());
+            }
+        }
+        Ok(names)
     }
 
     /// Lists untracked, not ignored paths, and apart from them the untracked nested repositories.
@@ -1515,7 +1585,9 @@ impl GitCapture<'_> {
     /// blob differs from the file hashed with no filters gets the file's
     /// own bytes instead, unless a `filter` attribute applies: the bytes a
     /// clean filter hides, as git-crypt's plaintext, never enter `W`, and
-    /// the path is named for the report.
+    /// the path is named for the report. `refuse_filters` has already
+    /// refused a configured clean filter, so this guard holds only if one
+    /// appears while capture runs.
     fn keep_worktree_bytes(&self, env: &[(&str, &OsStr)]) -> Result<Vec<RelPath>, CaptureError> {
         let files = self.convertible_files(env)?;
         let mut changed: Vec<&IndexBlob> = Vec::new();

@@ -2447,7 +2447,7 @@ fn report_capture(report: &fabric_store::capture::CaptureReport, out: &mut Out) 
     );
     say_each(
         out,
-        "travels as its clean filter's output, as a fresh clone has it (git attributes)",
+        "travels as git's check-in output, not its own bytes (filter attribute)",
         &report.filtered,
     );
     say_each(

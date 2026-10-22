@@ -997,6 +997,30 @@ fn an_lfs_filter_on_an_untracked_file_is_refused() {
     );
 }
 
+/// A clean filter puts what it makes of a file into `W`, and restore
+/// writes blobs with no smudge, so the target would hold the cleaned bytes:
+/// git-crypt's ciphertext where the agent had plaintext. An attribute
+/// whose driver is not configured changes nothing and is not refused.
+#[test]
+fn a_path_under_a_configured_clean_filter_is_refused() {
+    let fixture = BusyFixture::new().unwrap();
+    fs::write(fixture.root.join(".gitattributes"), "*.up filter=upper\n").unwrap();
+    fs::write(fixture.root.join("note.up"), "plain\n").unwrap();
+    assert!(fixture.capture_err().is_none());
+    git(&fixture.root)
+        .run(&["config", "filter.upper.clean", "tr a-z A-Z"])
+        .unwrap();
+    let err = fixture.capture_err().unwrap();
+    assert!(
+        matches!(
+            &err,
+            CaptureError::GitFilterUnsupported { path, filter }
+                if path.as_str() == "note.up" && filter == "upper"
+        ),
+        "{err}"
+    );
+}
+
 type Listing = BTreeMap<String, (String, u32, i64, i64)>;
 
 fn listing(root: &Path) -> Fallible<Listing> {
@@ -1873,35 +1897,6 @@ fn a_file_git_converts_on_check_in_restores_with_its_own_bytes() {
         );
     }
     assert_eq!(git_difference(&root, &target).unwrap(), None);
-}
-
-/// A path a clean filter changes travels as the filter's output, never as the bytes it hides, and is named.
-#[test]
-fn a_path_under_a_clean_filter_is_named_and_travels_filtered() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("work");
-    fs::create_dir(&root).unwrap();
-    let g = git(&root);
-    g.run(&["init", "-q", "-b", "main"]).unwrap();
-    let rot13 = "tr A-Za-z N-ZA-Mn-za-m";
-    g.run(&["config", "filter.rot13.clean", rot13]).unwrap();
-    g.run(&["config", "filter.rot13.smudge", rot13]).unwrap();
-    fs::write(root.join(".gitattributes"), "*.rot filter=rot13\n").unwrap();
-    fs::write(root.join("plain.rot"), "hello\n").unwrap();
-    g.run(&["add", "-A"]).unwrap();
-    g.run(&["commit", "-q", "-m", "one"]).unwrap();
-
-    let mut store = store_in(dir.path()).unwrap();
-    let policy = IgnorePolicy::default();
-    let Captured { manifest, report } = capture(&store, &request(&root, &policy, None)).unwrap();
-    assert_eq!(report.filtered, vec![RelPath::parse("plain.rot").unwrap()]);
-    let snapshot = store.publish(&manifest).unwrap();
-    let target = dir.path().join("restored");
-    restore_into(&store, snapshot, &target).unwrap();
-    assert_eq!(
-        fs::read_to_string(target.join("plain.rot")).unwrap(),
-        "uryyb\n"
-    );
 }
 
 /// Every stash entry comes back at its index, and a secret in an older one is named.

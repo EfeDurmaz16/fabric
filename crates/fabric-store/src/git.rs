@@ -8,9 +8,11 @@
 //! repository's config holds only the allowlisted keys.
 //!
 //! The source repository's own config is the user's and is honored there.
-//! Its clean and smudge filters run during `git add -A` and `git status` on
-//! capture, as they do for every other git command the user runs, and a
-//! repository that needs them (git-crypt) depends on that.
+//! Its filters run during `git status` on capture, as they do for every
+//! other git command the user runs. A path under a clean filter that config
+//! sets up (git-crypt's) is refused before `git add -A`, because restore
+//! writes blobs with no smudge step and the target would hold the filtered
+//! bytes.
 
 use std::ffi::OsStr;
 use std::io::{self, Write};
@@ -149,7 +151,7 @@ impl Git {
         cmd.output().map_err(|source| GitError::Spawn { source })
     }
 
-    fn checked(args: &[&str], output: Output) -> Result<Vec<u8>, GitError> {
+    pub(crate) fn checked(args: &[&str], output: Output) -> Result<Vec<u8>, GitError> {
         if output.status.success() {
             Ok(output.stdout)
         } else {
