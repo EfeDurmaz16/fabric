@@ -189,6 +189,10 @@ pub struct CaptureReport {
     pub tracked_secrets: Vec<RelPath>,
     /// Paths in the stash's work tree, index or untracked commit that match a secret pattern; they travel in the bundle.
     pub stashed_secrets: Vec<RelPath>,
+    /// Paths of `W` whose bytes a clean filter changed on check-in, as
+    /// git-crypt encrypts them; they travel, and restore writes them, as the
+    /// filter's output, the way a fresh clone has them before its smudge.
+    pub filtered: Vec<RelPath>,
     /// Symlinks whose target is absolute or climbs above the root.
     pub escaping_symlinks: Vec<RelPath>,
     /// FIFOs, sockets and devices in the workspace, left behind.
@@ -1025,6 +1029,18 @@ fn user_excludes(git: &Git, root: &Path) -> Result<String, CaptureError> {
     }
 }
 
+/// A regular file in an index, as `ls-files -s` lists it.
+struct IndexBlob {
+    /// `100644` or `100755`.
+    mode: String,
+    /// The blob id the index holds.
+    oid: String,
+    /// The path, relative to the root.
+    path: String,
+    /// True when a `filter` attribute applies to the path.
+    filtered: bool,
+}
+
 /// What the git half saw of the work tree, checked again once every file is stored.
 struct GitSeen {
     /// Every tracked and untracked path, existing or not.
@@ -1374,7 +1390,9 @@ impl GitCapture<'_> {
     /// is never in `W`. A negation in the repository's own ignore files can
     /// override that, so the private index is then listed and every path
     /// that is not tracked and that `leave_out` names is removed before the
-    /// tree is written. The removed paths are returned.
+    /// tree is written. Then `keep_worktree_bytes` puts back the bytes
+    /// git's own conversions changed. The removed paths are returned, and
+    /// the paths a clean filter changed.
     fn worktree_commit(
         &self,
         index_tree: &str,
@@ -1383,7 +1401,7 @@ impl GitCapture<'_> {
         excludes: &str,
         tracked: &BTreeSet<RelPath>,
         leave_out: &dyn Fn(&RelPath) -> bool,
-    ) -> Result<(GitOid, Vec<RelPath>), CaptureError> {
+    ) -> Result<(GitOid, Vec<RelPath>, Vec<RelPath>), CaptureError> {
         let index = TempFile::in_dir(&self.scratch);
         let exclude_file = TempFile::in_dir(&self.scratch);
         let all = format!("{}{excludes}", self.user_excludes);
@@ -1413,9 +1431,151 @@ impl GitCapture<'_> {
                 &input,
             )?;
         }
+        let filtered = self.keep_worktree_bytes(&env)?;
         let tree = self.git.run_text_env(&["write-tree"], &env)?;
         let commit = self.commit_tree(&tree, head, Some(index_commit), "fabric worktree")?;
-        Ok((commit, removed))
+        Ok((commit, removed, filtered))
+    }
+
+    /// Makes every regular file in the index `env` names hold the bytes in the work tree, except under a clean filter, and returns the paths a clean filter changed.
+    ///
+    /// `git add -A` stores what check-in makes of a file: line endings
+    /// converted by `text`, `eol` or `core.autocrlf`, `$Id$` collapsed by
+    /// `ident`, the text re-encoded by `working-tree-encoding`, the output
+    /// of a `filter` driver. Restore writes the blob as it is, so such a
+    /// file would come back with other bytes than it had. A path whose
+    /// blob differs from the file hashed with no filters gets the file's
+    /// own bytes instead, unless a `filter` attribute applies: the bytes a
+    /// clean filter hides, as git-crypt's plaintext, never enter `W`, and
+    /// the path is named for the report.
+    fn keep_worktree_bytes(&self, env: &[(&str, &OsStr)]) -> Result<Vec<RelPath>, CaptureError> {
+        let files = self.convertible_files(env)?;
+        let mut changed: Vec<&IndexBlob> = Vec::new();
+        let mut named = Vec::new();
+        for batch in arg_batches(&files, |file| file.path.len()) {
+            let paths = batch.iter().map(|file| file.path.as_str());
+            let hashes = self.hash_files(&["hash-object", "--no-filters"], paths, env)?;
+            for (file, hash) in batch.iter().zip(hashes) {
+                if hash != file.oid && file.filtered {
+                    named.push(rel_path(&file.path)?);
+                } else if hash != file.oid {
+                    changed.push(file);
+                }
+            }
+        }
+        let mut index_info = Vec::new();
+        for batch in arg_batches(&changed, |file| file.path.len()) {
+            let paths = batch.iter().map(|file| file.path.as_str());
+            let hashes = self.hash_files(&["hash-object", "-w", "--no-filters"], paths, env)?;
+            for (file, raw) in batch.iter().zip(hashes) {
+                index_info
+                    .extend_from_slice(format!("{} {raw}\t{}", file.mode, file.path).as_bytes());
+                index_info.push(0);
+            }
+        }
+        if !index_info.is_empty() {
+            self.git
+                .run_stdin_env(&["update-index", "-z", "--index-info"], env, &index_info)?;
+        }
+        Ok(named)
+    }
+
+    /// Lists the regular files of the index `env` names that git can convert on check-in.
+    ///
+    /// Git converts nothing on check-in unless `core.autocrlf` is on or one
+    /// of `ATTRS` applies to the path, so only those paths are worth hashing.
+    fn convertible_files(&self, env: &[(&str, &OsStr)]) -> Result<Vec<IndexBlob>, CaptureError> {
+        const ATTRS: [&str; 6] = [
+            "filter",
+            "ident",
+            "working-tree-encoding",
+            "text",
+            "eol",
+            "crlf",
+        ];
+        let listing = self.git.run_env(&["ls-files", "-s", "-z"], env)?;
+        let mut files = Vec::new();
+        for record in Git::records(&listing) {
+            let text = Git::text("index entry", record)?;
+            let bad = || GitError::Parse {
+                what: "index entry",
+                text: text.to_owned(),
+            };
+            let (meta, path) = text.split_once('\t').ok_or_else(bad)?;
+            let mut fields = meta.split(' ');
+            let (Some(mode), Some(oid)) = (fields.next(), fields.next()) else {
+                return Err(bad().into());
+            };
+            if mode == "100644" || mode == "100755" {
+                files.push(IndexBlob {
+                    mode: mode.to_owned(),
+                    oid: oid.to_owned(),
+                    path: path.to_owned(),
+                    filtered: false,
+                });
+            }
+        }
+        if files.is_empty() {
+            return Ok(files);
+        }
+        let autocrlf = self
+            .git
+            .output(&["config", "--get", "core.autocrlf"], env)?;
+        let autocrlf = autocrlf.status.success()
+            && !matches!(
+                String::from_utf8_lossy(&autocrlf.stdout).trim(),
+                "false" | "no" | "off" | "0" | ""
+            );
+        let mut input = Vec::new();
+        for file in &files {
+            input.extend_from_slice(file.path.as_bytes());
+            input.push(0);
+        }
+        let mut args = vec!["check-attr", "-z", "--stdin"];
+        args.extend(ATTRS);
+        let attrs = self.git.run_stdin_env(&args, env, &input)?;
+        // Each path's attributes come as (path, name, value) triples.
+        let mut converting: BTreeSet<&[u8]> = BTreeSet::new();
+        let mut filtered: BTreeSet<&[u8]> = BTreeSet::new();
+        let fields: Vec<&[u8]> = attrs.split(|b| *b == 0).collect();
+        for triple in fields.chunks_exact(3) {
+            if triple[2] == b"unspecified" || triple[2] == b"unset" {
+                continue;
+            }
+            converting.insert(triple[0]);
+            if triple[1] == b"filter" {
+                filtered.insert(triple[0]);
+            }
+        }
+        files.retain(|file| autocrlf || converting.contains(file.path.as_bytes()));
+        for file in &mut files {
+            file.filtered = filtered.contains(file.path.as_bytes());
+        }
+        Ok(files)
+    }
+
+    /// Runs a `hash-object` command line on `paths` and returns one id per path, in order.
+    fn hash_files<'p>(
+        &self,
+        command: &[&'p str],
+        paths: impl Iterator<Item = &'p str>,
+        env: &[(&str, &OsStr)],
+    ) -> Result<Vec<String>, CaptureError> {
+        let mut args = command.to_vec();
+        args.push("--");
+        args.extend(paths);
+        let wanted = args.len() - command.len() - 1;
+        let out = self.git.run_env(&args, env)?;
+        let text = Git::text("blob ids", &out)?;
+        let hashes: Vec<String> = text.lines().map(str::to_owned).collect();
+        if hashes.len() != wanted {
+            return Err(GitError::Parse {
+                what: "blob ids",
+                text: text.to_owned(),
+            }
+            .into());
+        }
+        Ok(hashes)
     }
 
     fn snap_prefix(&self) -> String {
@@ -1809,6 +1969,27 @@ impl GitCapture<'_> {
     }
 }
 
+/// The most path bytes one git command line carries, well under every `ARG_MAX`.
+const ARG_BYTES: usize = 128 << 10;
+
+/// Splits `items` into runs whose lengths by `len`, one byte more each, stay under `ARG_BYTES`.
+fn arg_batches<T>(items: &[T], len: impl Fn(&T) -> usize) -> Vec<&[T]> {
+    let mut batches = Vec::new();
+    let (mut start, mut bytes) = (0, 0);
+    for (index, item) in items.iter().enumerate() {
+        let size = len(item) + 1;
+        if index > start && bytes + size > ARG_BYTES {
+            batches.push(&items[start..index]);
+            (start, bytes) = (index, 0);
+        }
+        bytes += size;
+    }
+    if start < items.len() {
+        batches.push(&items[start..]);
+    }
+    batches
+}
+
 /// The prefix of the refs that hold a job's stash entries older than `refs/stash`; restore rebuilds the stash list from them.
 pub(crate) fn stash_prefix(job_id: JobId) -> String {
     format!("refs/fabric/{job_id}/stash/")
@@ -2046,7 +2227,7 @@ fn capture_git(
     }
     let stamped: Vec<RelPath> = tracked.iter().chain(untracked.iter()).cloned().collect();
     let before = stamps(req.root, stamped.iter())?;
-    let (worktree_commit, removed) = repo.worktree_commit(
+    let (worktree_commit, removed, filtered) = repo.worktree_commit(
         &index_tree,
         head_commit.as_ref(),
         &index_commit,
@@ -2054,6 +2235,7 @@ fn capture_git(
         &tracked,
         &|rel| policy.denies_anywhere(rel) || under_nested(rel),
     )?;
+    capturer.report.filtered = filtered;
     let denied = &mut capturer.report.denied_untracked;
     for rel in removed {
         if !under_nested(&rel) && !denied.contains(&rel) {

@@ -2363,6 +2363,11 @@ fn report_capture(report: &fabric_store::capture::CaptureReport, out: &mut Out) 
     );
     say_each(
         out,
+        "travels as its clean filter's output, as a fresh clone has it (git attributes)",
+        &report.filtered,
+    );
+    say_each(
+        out,
         "left behind (not a file, link or directory)",
         &report.special_files,
     );

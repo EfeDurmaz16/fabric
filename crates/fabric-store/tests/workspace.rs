@@ -1773,6 +1773,76 @@ fn a_secret_saved_in_the_stash_is_named() {
     );
 }
 
+/// A file whose bytes git converts on check-in comes back with the bytes it had, not the converted blob.
+#[test]
+fn a_file_git_converts_on_check_in_restores_with_its_own_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    fs::create_dir(&root).unwrap();
+    let g = git(&root);
+    g.run(&["init", "-q", "-b", "main"]).unwrap();
+    fs::write(
+        root.join(".gitattributes"),
+        "*.txt text eol=crlf\n*.id ident\n",
+    )
+    .unwrap();
+    fs::write(root.join("lines.txt"), "one\r\ntwo\r\n").unwrap();
+    fs::write(root.join("stamp.id"), "$Id$\n").unwrap();
+    g.run(&["add", "-A"]).unwrap();
+    g.run(&["commit", "-q", "-m", "one"]).unwrap();
+    // Checkout expands `$Id$`; the blob keeps it collapsed.
+    fs::remove_file(root.join("stamp.id")).unwrap();
+    g.run(&["checkout", "--", "stamp.id"]).unwrap();
+    fs::write(root.join("new.txt"), "untracked\r\n").unwrap();
+    let expanded = fs::read(root.join("stamp.id")).unwrap();
+    assert_ne!(expanded, b"$Id$\n");
+
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, report } = capture(&store, &request(&root, &policy, None)).unwrap();
+    assert!(report.filtered.is_empty(), "{:?}", report.filtered);
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    for name in ["lines.txt", "stamp.id", "new.txt"] {
+        assert_eq!(
+            fs::read(target.join(name)).unwrap(),
+            fs::read(root.join(name)).unwrap(),
+            "{name}"
+        );
+    }
+    assert_eq!(git_difference(&root, &target).unwrap(), None);
+}
+
+/// A path a clean filter changes travels as the filter's output, never as the bytes it hides, and is named.
+#[test]
+fn a_path_under_a_clean_filter_is_named_and_travels_filtered() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    fs::create_dir(&root).unwrap();
+    let g = git(&root);
+    g.run(&["init", "-q", "-b", "main"]).unwrap();
+    let rot13 = "tr A-Za-z N-ZA-Mn-za-m";
+    g.run(&["config", "filter.rot13.clean", rot13]).unwrap();
+    g.run(&["config", "filter.rot13.smudge", rot13]).unwrap();
+    fs::write(root.join(".gitattributes"), "*.rot filter=rot13\n").unwrap();
+    fs::write(root.join("plain.rot"), "hello\n").unwrap();
+    g.run(&["add", "-A"]).unwrap();
+    g.run(&["commit", "-q", "-m", "one"]).unwrap();
+
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, report } = capture(&store, &request(&root, &policy, None)).unwrap();
+    assert_eq!(report.filtered, vec![RelPath::parse("plain.rot").unwrap()]);
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    assert_eq!(
+        fs::read_to_string(target.join("plain.rot")).unwrap(),
+        "uryyb\n"
+    );
+}
+
 /// Every stash entry comes back at its index, and a secret in an older one is named.
 #[test]
 fn every_stash_entry_survives_capture_and_restore() {
