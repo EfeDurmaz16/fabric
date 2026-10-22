@@ -1747,8 +1747,12 @@ fn a_cache_the_target_cannot_use_is_skipped_and_named() {
     assert_eq!(status(&target).unwrap(), status(&root).unwrap());
 }
 
+/// A partial cache is written or left out as the caller's carry rule
+/// says, like any other row: fabricd decides the hole once, for doctor,
+/// move and resume, and rebuilds a partial cache a setup step fills while
+/// it writes one nothing can make again. The secret under it never travels.
 #[test]
-fn a_partial_cache_is_skipped_even_when_the_target_could_use_it() {
+fn a_partial_cache_is_written_only_where_the_carry_rule_says() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("plain");
     fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
@@ -1760,14 +1764,33 @@ fn a_partial_cache_is_skipped_even_when_the_target_could_use_it() {
     let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
     assert_eq!(manifest.caches[0].carry, CarryState::Partial);
     let snapshot = store.publish(&manifest).unwrap();
-    let target = dir.path().join("restored");
-    let report = restore_into(&store, snapshot, &target).unwrap();
+    let written = dir.path().join("written");
+    let report = restore_into(&store, snapshot, &written).unwrap();
+    assert!(report.skipped_caches.is_empty(), "{report:?}");
+    assert_eq!(
+        fs::read_to_string(written.join("node_modules/pkg/index.js")).unwrap(),
+        "x\n"
+    );
+    assert!(!written.join("node_modules/pkg/.env").exists());
+    let skipped = dir.path().join("skipped");
+    let report = restore(
+        &store,
+        &RestoreRequest {
+            snapshot,
+            target: &skipped,
+            harness_state: None,
+            verify: Verify::All,
+            durability: Durability::ProcessCrash,
+            carry: &|_| false,
+        },
+    )
+    .unwrap();
     assert_eq!(
         report.skipped_caches,
         vec![RelPath::parse("node_modules").unwrap()]
     );
-    assert!(!target.join("node_modules").exists());
-    assert!(target.join("keep.txt").exists());
+    assert!(!skipped.join("node_modules").exists());
+    assert!(skipped.join("keep.txt").exists());
 }
 
 #[test]

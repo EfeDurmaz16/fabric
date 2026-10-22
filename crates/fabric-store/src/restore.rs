@@ -1290,11 +1290,15 @@ fn harness_state_complete(
     }
 }
 
-/// The cache paths whose bytes are not written: rows not wholly carried and rows `carry` turns down.
+/// The cache paths whose bytes are not written: rows nothing of which was captured, and rows `carry` turns down.
 ///
-/// A `Partial` cache had a secret or an excluded path left out; written, it
-/// would look whole to the tool that reads it, so it is treated as missing
-/// whatever `carry` says.
+/// A `Partial` cache had a secret or an excluded path left out, and is
+/// written when `carry` says so. The caller weighs the hole: written, the
+/// cache may look whole to the tool that reads it, and left out, a cache
+/// nothing on the target can make again is lost. fabricd's carry decision
+/// rebuilds a partial cache a setup step fills and writes one nothing can
+/// fill, with a warning (ADR 0004, 2026-10-21), and the store writes
+/// exactly what it decides.
 fn skipped_caches(
     manifest: &SnapshotManifest,
     carry: &dyn Fn(&CacheEntry) -> bool,
@@ -1302,7 +1306,7 @@ fn skipped_caches(
     manifest
         .caches
         .iter()
-        .filter(|c| c.carry != CarryState::Carried || !carry(c))
+        .filter(|c| c.carry == CarryState::NotCarried || !carry(c))
         .map(|c| c.path.clone())
         .collect()
 }
