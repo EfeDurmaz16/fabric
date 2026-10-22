@@ -584,6 +584,7 @@ impl Node {
         session: Option<SessionId>,
         out: &mut Out,
     ) -> Result<(), NodeError> {
+        faults::hit(Point::BeforeHarnessRecord).await;
         refuse_secret_kind(&harness)?;
         let job = self.job(id).await?;
         let mut job = job.lock().await;

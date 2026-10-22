@@ -33,18 +33,22 @@ pub enum Point {
     /// The target made `MoveImported` durable and did not answer yet; on the
     /// source, the answer just arrived.
     AfterImportReceipt,
+    /// A CLI asked to record the harness it launched, and the node has
+    /// written nothing for it yet.
+    BeforeHarnessRecord,
 }
 
 impl Point {
     /// Every point, for parsing.
     #[cfg(feature = "faults")]
-    const ALL: [Point; 6] = [
+    const ALL: [Point; 7] = [
         Point::AfterQuiesce,
         Point::AfterSnapshotPublish,
         Point::AfterDepartingWrite,
         Point::MidTransfer,
         Point::BeforeImport,
         Point::AfterImportReceipt,
+        Point::BeforeHarnessRecord,
     ];
 
     fn name(self) -> &'static str {
@@ -55,6 +59,7 @@ impl Point {
             Point::MidTransfer => "mid_transfer",
             Point::BeforeImport => "before_import",
             Point::AfterImportReceipt => "after_import_receipt",
+            Point::BeforeHarnessRecord => "before_harness_record",
         }
     }
 }

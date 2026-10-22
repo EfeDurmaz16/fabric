@@ -661,3 +661,48 @@ fn e2e_a_run_whose_output_closes_still_supervises_its_harness() -> Fallible {
     assert!(status.contains("harness: not running"), "{status}");
     Ok(())
 }
+
+/// A `job run` ended by a signal after it launched the harness and before
+/// the node recorded it, as by Ctrl-C or a `kill` while the node is slow to
+/// answer, must stop the harness. It runs in a group of its own, so the
+/// signal does not reach it, no node supervises it yet, and once the tree
+/// lock goes with the command a second run could start another agent in
+/// the workspace.
+#[test]
+fn e2e_a_run_ended_before_its_harness_is_recorded_stops_it() -> Fallible {
+    let p = setup(Wire::TcpTls, Some("before_harness_record:hold"), None)?;
+    let job = new_job(&p.env, &p.a, AGENT)?;
+    let pid_file = p.a.state().join("harness.pid");
+    let running = p.a.spawn_with(
+        &["job", "run", &job, "--prompt", "one"],
+        &[
+            ("FAKE_LINGER", std::path::Path::new("1")),
+            ("FAKE_PID_FILE", &pid_file),
+        ],
+    )?;
+    wait_for(&p.a.signal(), "the registration")?;
+    wait_for(&pid_file, "the harness launch")?;
+    let harness: i32 = fs::read_to_string(&pid_file)?.trim().parse()?;
+    let cli = rustix::process::Pid::from_raw(i32::try_from(running.id())?).ok_or("no pid")?;
+    rustix::process::kill_process(cli, rustix::process::Signal::TERM)?;
+    let started = std::time::Instant::now();
+    while alive(harness) && started.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // A harness left running holds the CLI's output open, so it is
+    // stopped here before the output is read.
+    let outlived = alive(harness);
+    if outlived && let Some(pid) = rustix::process::Pid::from_raw(harness) {
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+    }
+    // The node may go on to record the harness it was asked about.
+    fs::remove_file(p.a.signal())?;
+    let output = finish(running, GIVE_UP)?;
+    assert!(
+        !outlived,
+        "the harness outlived the ended run: {}",
+        text(&output)
+    );
+    assert_eq!(output.status.code(), Some(128 + 15), "{}", text(&output));
+    Ok(())
+}

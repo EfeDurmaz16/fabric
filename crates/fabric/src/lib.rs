@@ -475,7 +475,11 @@ async fn launch(
     let resume = plan.session.clone();
     let harness_env = HarnessEnv::new(home, path_var(), plan.harness_config.clone())?;
     let first = prompt.or_else(|| resume.is_none().then(|| plan.goal.clone()));
-    let (mut running, interactive) = match &plan.harness {
+    // Caught from before the harness starts: until the node records it, the
+    // harness runs in a group of its own that nothing else supervises, so
+    // a signal that ends this command must stop it first.
+    let mut interrupts = Interrupts::new()?;
+    let (adapter, launch, interactive): (Box<dyn Harness>, Launch, bool) = match &plan.harness {
         HarnessKind::ClaudeCode => {
             let claude = ClaudeCode::new(harness_env.home.clone(), harness_env.path_var.clone());
             let trust = claude.preseed_trust(&plan.root, &env).await?;
@@ -484,7 +488,7 @@ async fn launch(
                 resume,
                 prompt: first,
             };
-            (claude.launch(&plan.root, launch, &env).await?, true)
+            (Box::new(claude), launch, true)
         }
         HarnessKind::Codex => {
             let codex = Codex::new(harness_env.home.clone(), harness_env.path_var.clone());
@@ -492,7 +496,7 @@ async fn launch(
                 resume,
                 prompt: first,
             };
-            (codex.launch(&plan.root, launch, &env).await?, true)
+            (Box::new(codex), launch, true)
         }
         HarnessKind::Acp { program, args } => {
             let agent = acp_adapter(program, args, &harness_env)?;
@@ -500,21 +504,29 @@ async fn launch(
                 resume,
                 prompt: first.unwrap_or_else(|| "Continue.".to_owned()),
             };
-            (agent.launch(&plan.root, launch, &env).await?, false)
+            (Box::new(agent), launch, false)
         }
     };
+    // An adapter whose launch is dropped before it returns kills what it started.
+    let mut running = tokio::select! {
+        running = adapter.launch(&plan.root, launch, &env) => running?,
+        signal = interrupts.next() => return interrupted(signal, plan),
+    };
     let pid = running.pid();
-    let registered = control::call(
-        &socket,
-        &Request::HarnessStarted {
-            job: plan.job,
-            epoch: plan.epoch,
-            pid,
-            harness: plan.harness.clone(),
-            session: running.session().cloned(),
-        },
-    )
-    .await;
+    let started = Request::HarnessStarted {
+        job: plan.job,
+        epoch: plan.epoch,
+        pid,
+        harness: plan.harness.clone(),
+        session: running.session().cloned(),
+    };
+    let registered = tokio::select! {
+        registered = control::call(&socket, &started) => registered,
+        signal = interrupts.next() => {
+            kill_group(&running);
+            return interrupted(signal, plan);
+        }
+    };
     drop(tree);
     match registered {
         // The harness runs and is recorded, so nothing may end the
@@ -552,8 +564,58 @@ async fn launch(
     if interactive {
         give_terminal(&running);
     }
-    let status = running.child_mut().wait().await?;
+    let status = tokio::select! {
+        status = running.child_mut().wait() => status?,
+        // The node supervises the harness now, so a signal ends this
+        // command as it did before any was caught, and the harness runs on.
+        signal = interrupts.next() => return Ok(signal_exit(signal)),
+    };
     exited(&socket, plan, pid, status).await
+}
+
+/// The signals that end this command: Ctrl-C, the hang-up of a closed
+/// terminal or SSH session, and a termination.
+struct Interrupts {
+    interrupt: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl Interrupts {
+    fn new() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            hangup: signal(SignalKind::hangup())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    /// The next one to arrive, as its number.
+    async fn next(&mut self) -> i32 {
+        use rustix::process::Signal;
+        tokio::select! {
+            _ = self.interrupt.recv() => Signal::INT.as_raw(),
+            _ = self.hangup.recv() => Signal::HUP.as_raw(),
+            _ = self.terminate.recv() => Signal::TERM.as_raw(),
+        }
+    }
+}
+
+/// Ends a launch that `signal` cut before the node recorded its harness,
+/// which the caller stopped if it had started.
+fn interrupted(signal: i32, plan: &RunPlan) -> Result<ExitCode> {
+    writeln!(
+        std::io::stderr(),
+        "interrupted by signal {signal} before the node recorded the harness, so the harness was stopped; `fabric job status {}` shows what the node holds",
+        plan.job
+    )?;
+    Ok(signal_exit(signal))
+}
+
+/// The exit code of a command ended by the signal numbered `signal`.
+fn signal_exit(signal: i32) -> ExitCode {
+    ExitCode::from(u8::try_from(128 + signal).unwrap_or(u8::MAX))
 }
 
 /// Takes the tree lock and runs the setup steps, once the plan is known
@@ -614,9 +676,7 @@ async fn exited(
             "the harness was stopped by signal {signal}; the node stops it when the job is suspended, moves away or is stolen. Run `fabric job status {}` to see why",
             plan.job
         )?;
-        return Ok(ExitCode::from(
-            u8::try_from(128 + signal).unwrap_or(u8::MAX),
-        ));
+        return Ok(signal_exit(signal));
     }
     Ok(match status.code() {
         Some(0) => ExitCode::SUCCESS,
