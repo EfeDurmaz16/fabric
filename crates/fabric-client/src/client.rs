@@ -1,10 +1,12 @@
 //! A client of one local node.
 //!
 //! Invariant: nothing is sent before the state directory and the socket
-//! prove to be this user's alone, because a run plan read from the socket
-//! decides what the caller launches (ADR 0016). Every call is one
-//! connection: a hello, the node's welcome, one request, the node's events
-//! as they happen and one final answer, whose kind must be the request's op.
+//! prove to be this user's alone, and every directory above them one that
+//! only this user or root can change, because a run plan read from the
+//! socket decides what the caller launches (ADR 0016, ADR 0018). Every
+//! call is one connection: a hello, the node's welcome, one request, the
+//! node's events as they happen and one final answer, whose kind must be
+//! the request's op.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -34,8 +36,10 @@ pub enum ClientError {
         #[source]
         source: std::io::Error,
     },
-    /// The state directory or the socket is not this user's alone.
-    #[error("{path} {reason}, so its answers are not trusted; it must be yours and mode 0700")]
+    /// The state directory or the socket is not this user's alone, or a
+    /// directory above them is one someone other than this user or root
+    /// can change.
+    #[error("{path} {reason}, so the socket's answers are not trusted")]
     Untrusted {
         /// The directory or socket.
         path: PathBuf,
@@ -172,14 +176,7 @@ impl Client {
     }
 
     async fn connect(&self) -> Result<(UnixStream, Welcome), ClientError> {
-        // A bare file name has the empty path as its parent, which does not
-        // exist and so would pass; the directory checked is the one the
-        // name resolves in, as the TypeScript SDK checks it.
-        let socket = std::path::absolute(&self.socket).map_err(FrameError::Io)?;
-        if let Some(dir) = socket.parent() {
-            check_private(dir, &self.socket)?;
-        }
-        check_private(&socket, &self.socket)?;
+        let socket = trusted_path(&self.socket)?;
         let mut stream =
             UnixStream::connect(&socket)
                 .await
@@ -584,26 +581,48 @@ fn unexpected(op: Op, reply: &Reply) -> ClientError {
     }
 }
 
-/// Refuses `path` unless this user owns it and, for a directory, no one else may enter it.
+/// The path to dial for `socket`, once the socket, its directory and every
+/// directory above them passed their checks.
 ///
-/// A missing path is no daemon at `socket`, and nothing is dialed: a
-/// directory missing now could be made, with a socket in it, by anyone who
-/// may write its parent, as in `/tmp`, before the connect.
+/// The state directory itself must not be a symlink, as the node requires
+/// of its own (ADR 0016). A link above it, such as macOS's `/tmp`, is
+/// resolved once, and every check after that is made on the resolved path,
+/// which is the one returned: the directory, then the socket's name. The
+/// connect goes through no symlink, so a link someone else may swap after
+/// the checks, or that lives in a directory they may write, cannot send it
+/// elsewhere. A bare file name resolves in the working directory, as the
+/// TypeScript SDK resolves it. A missing directory is no daemon at
+/// `socket`, and nothing is dialed: a directory missing now could be made,
+/// with a socket in it, by anyone who may write its parent, as in `/tmp`,
+/// before the connect.
+fn trusted_path(socket: &Path) -> Result<PathBuf, ClientError> {
+    let absolute = std::path::absolute(socket).map_err(FrameError::Io)?;
+    let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) else {
+        return Err(ClientError::NoDaemon {
+            path: socket.to_owned(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the path names no socket file",
+            ),
+        });
+    };
+    check_private(parent, socket)?;
+    let dir = std::fs::canonicalize(parent).map_err(|e| not_found(e, socket))?;
+    check_private(&dir, socket)?;
+    check_ancestors(&dir, socket)?;
+    let path = dir.join(name);
+    check_private(&path, socket)?;
+    Ok(path)
+}
+
+/// Refuses `path` unless this user owns it, it is not a symlink and, for a
+/// directory, no one else may enter it.
 fn check_private(path: &Path, socket: &Path) -> Result<(), ClientError> {
     let untrusted = |reason: String| ClientError::Untrusted {
         path: path.to_owned(),
         reason,
     };
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ClientError::NoDaemon {
-                path: socket.to_owned(),
-                source,
-            });
-        }
-        Err(e) => return Err(FrameError::Io(e).into()),
-    };
+    let meta = std::fs::symlink_metadata(path).map_err(|e| not_found(e, socket))?;
     let me = rustix::process::geteuid().as_raw();
     if meta.uid() != me {
         return Err(untrusted(format!(
@@ -616,11 +635,67 @@ fn check_private(path: &Path, socket: &Path) -> Result<(), ClientError> {
     }
     if meta.is_dir() && meta.mode() & 0o077 != 0 {
         return Err(untrusted(format!(
-            "has mode {:o}, which lets others in",
+            "has mode {:o}, which lets others in; the state directory must be mode 0700",
             meta.mode() & 0o777
         )));
     }
     Ok(())
+}
+
+/// Refuses `dir` unless every directory above it, up to `/`, is one only
+/// this user or root can change.
+///
+/// The rule is the one OpenSSH's `StrictModes` applies to the directories
+/// above `authorized_keys`: owned by this user or root, and not writable
+/// by group or others, here unless it is sticky, as `/tmp` is. Whoever may
+/// rename an entry of such a directory could put a directory of theirs in
+/// its place between the checks and the connect. In a sticky directory
+/// only an entry's owner may rename it, and the entry below is checked to
+/// be this user's or root's.
+fn check_ancestors(dir: &Path, socket: &Path) -> Result<(), ClientError> {
+    let me = rustix::process::geteuid().as_raw();
+    for path in dir.ancestors().skip(1) {
+        let meta = std::fs::symlink_metadata(path).map_err(|e| not_found(e, socket))?;
+        if let Some(reason) = ancestor_refusal(meta.is_dir(), meta.uid(), meta.mode(), me) {
+            return Err(ClientError::Untrusted {
+                path: path.to_owned(),
+                reason,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Why a directory above the socket is not one only `me` or root can
+/// change, given what `lstat` says of it, if it is not.
+fn ancestor_refusal(is_dir: bool, uid: u32, mode: u32, me: u32) -> Option<String> {
+    if !is_dir {
+        return Some("is above the socket and is not a directory".to_owned());
+    }
+    if uid != me && uid != 0 {
+        return Some(format!(
+            "is above the socket and belongs to user {uid}, not to you ({me}) or root"
+        ));
+    }
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        return Some(format!(
+            "is above the socket and has mode {:o}, which lets others replace what is in it; it must not be writable by group or others unless it is sticky",
+            mode & 0o7777
+        ));
+    }
+    None
+}
+
+/// A missing path as no daemon at `socket`, any other failure as a failed read.
+fn not_found(source: std::io::Error, socket: &Path) -> ClientError {
+    if source.kind() == std::io::ErrorKind::NotFound {
+        ClientError::NoDaemon {
+            path: socket.to_owned(),
+            source,
+        }
+    } else {
+        FrameError::Io(source).into()
+    }
 }
 
 #[cfg(test)]
@@ -667,5 +742,73 @@ mod tests {
             check_private(&socket, &socket),
             Err(ClientError::Untrusted { .. })
         ));
+    }
+
+    /// Review finding on PR #13: only the state directory and the socket
+    /// were checked, so whoever may write a directory above them could swap
+    /// the state directory for one of theirs between the checks and the
+    /// connect. A sticky directory, as `/tmp` is, lets only an entry's
+    /// owner rename it, so it qualifies.
+    #[test]
+    fn a_directory_above_the_socket_group_or_others_may_write_is_not_trusted_unless_sticky() {
+        let dir = tempfile::tempdir().unwrap();
+        let above = dir.path().canonicalize().unwrap().join("above");
+        let state = above.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = state.join("fabric.sock");
+        for mode in [0o757, 0o775] {
+            std::fs::set_permissions(&above, std::fs::Permissions::from_mode(mode)).unwrap();
+            let got = check_ancestors(&state, &socket);
+            assert!(
+                matches!(&got, Err(ClientError::Untrusted { path, .. }) if *path == above),
+                "{mode:o}: {got:?}"
+            );
+        }
+        std::fs::set_permissions(&above, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        check_ancestors(&state, &socket).unwrap();
+    }
+
+    /// The same finding: a directory above the socket that another user
+    /// owns is theirs to change, while root's and this user's are not.
+    /// Making one of another user's takes root, so this reads the rule.
+    #[test]
+    fn a_directory_above_the_socket_only_this_user_or_root_may_own() {
+        let me = 501;
+        assert!(ancestor_refusal(true, 4242, 0o755, me).is_some());
+        assert_eq!(ancestor_refusal(true, 0, 0o755, me), None);
+        assert_eq!(ancestor_refusal(true, me, 0o700, me), None);
+        assert!(ancestor_refusal(false, me, 0o755, me).is_some());
+    }
+
+    /// The same finding: a symlink on the way to the socket, here in a
+    /// directory anyone may write, could be pointed elsewhere after the
+    /// checks. The path dialed is the one checked, with the link resolved.
+    /// The state directory itself stays refused as a link, as the node
+    /// refuses its own.
+    #[test]
+    fn the_path_dialed_goes_through_no_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let state = root.join("real").join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(state.join("fabric.sock")).unwrap();
+        let open = root.join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), open.join("link")).unwrap();
+        let through_link = open.join("link").join("state").join("fabric.sock");
+        assert_eq!(
+            trusted_path(&through_link).unwrap(),
+            state.join("fabric.sock")
+        );
+
+        std::os::unix::fs::symlink(&state, open.join("state")).unwrap();
+        let linked_state = trusted_path(&open.join("state").join("fabric.sock"));
+        assert!(
+            matches!(&linked_state, Err(ClientError::Untrusted { path, reason }) if *path == open.join("state") && reason == "is a symlink"),
+            "{linked_state:?}"
+        );
     }
 }

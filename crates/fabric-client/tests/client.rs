@@ -2,8 +2,9 @@
 //! a temporary socket: an event of an unknown kind is skipped, a reply for
 //! another op is refused, an incompatible node, a welcome of another api
 //! version, and an op or a root the node does not list stop the call
-//! before the request is sent, and a node that closes after the hello
-//! reads as an older node.
+//! before the request is sent, a node that closes after the hello reads as
+//! an older node, and a socket under a directory others may write is not
+//! dialed.
 
 use std::error::Error;
 use std::os::unix::fs::PermissionsExt;
@@ -250,4 +251,28 @@ async fn a_refusal_arrives_typed_with_the_nodes_sentence() {
         }
     );
     assert_eq!(refusal.message(), "job is not known on this node");
+}
+
+/// Review finding on PR #13: a directory above the state directory that
+/// others may write lets them swap the state directory for one of theirs
+/// between the checks and the connect, so the client refuses it and does
+/// not dial. A node there that is dialed closes at once, so a client that
+/// dials fails the match instead of waiting for a welcome.
+#[tokio::test]
+async fn a_directory_above_the_socket_others_may_write_gets_no_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let above = dir.path().canonicalize().unwrap().join("above");
+    let state = above.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&above, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let listener = UnixListener::bind(state.join("fabric.sock")).unwrap();
+    let dialed = tokio::spawn(async move { listener.accept().await.map(drop) });
+    let got = Client::new(state.join("fabric.sock")).hello().await;
+    assert!(
+        matches!(&got, Err(ClientError::Untrusted { path, .. }) if *path == above),
+        "{got:?}"
+    );
+    assert!(!dialed.is_finished(), "the client dialed");
+    dialed.abort();
 }
