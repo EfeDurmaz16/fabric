@@ -69,8 +69,11 @@ use fabric_core::secret::{Scope, SecretPattern, SecretPolicy};
 /// that no built-in secret pattern denies it. The lockfiles, manifests and
 /// manager configuration a setup step reads are hashed whole, and most of
 /// them are never parsed: their digest goes into the sentinel of the cache
-/// the step fills (`Inputs`).
-const READ_FILES: &[&str] = &[
+/// the step fills (`Inputs`). A node that captures a workspace reads this
+/// list too: a snapshot that leaves one of these files behind is detected
+/// otherwise on its target, so no setup step there is known to make a
+/// cache again.
+pub const READ_FILES: &[&str] = &[
     OVERRIDE_FILE,
     "package.json",
     "mise.toml",

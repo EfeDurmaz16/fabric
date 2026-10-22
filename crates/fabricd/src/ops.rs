@@ -1120,7 +1120,7 @@ impl Node {
             // The snapshot names the spec and the store keeps its bytes, so
             // a peer that fetches the snapshot fetches the spec (ADR 0007).
             let env_spec = store.put_env_spec(&spec)?;
-            let captured = capture(
+            let mut captured = capture(
                 store,
                 &CaptureRequest {
                     root: &root,
@@ -1135,6 +1135,7 @@ impl Node {
                     allow_large_untracked: false,
                 },
             )?;
+            crate::facts::forget_lost_remakes(&mut captured.manifest);
             let snapshot = store.publish(&captured.manifest)?;
             let has_git = captured.manifest.git.is_some();
             Ok((
@@ -4946,6 +4947,43 @@ pub(crate) mod tests {
             .unwrap();
         let caches: Vec<&str> = manifest.caches.iter().map(|c| c.path.as_str()).collect();
         assert_eq!(caches, [".output"], "{manifest:?}");
+    }
+
+    /// A lockfile `.fabricignore` keeps on this node is missing on the
+    /// target, whose detection then plans no install for `node_modules`,
+    /// so a row that still promised a rebuild would lose the tree there.
+    /// The snapshot records that nothing makes it again, and the carry
+    /// decision carries it (review of PR #11).
+    #[tokio::test]
+    async fn a_suspend_whose_lockfile_stays_behind_records_no_rebuild() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        std::fs::write(root.join("package.json"), "{\"name\": \"x\"}\n").unwrap();
+        std::fs::write(root.join("package-lock.json"), "{}\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::write(root.join(".fabricignore"), "package-lock.json\n").unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), "1;\n").unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let snapshot = node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let manifest = with_store(&node.store, move |store| Ok(store.manifest(snapshot)?))
+            .await
+            .unwrap();
+        assert!(
+            manifest
+                .left_behind
+                .iter()
+                .any(|left| left.path.as_str() == "package-lock.json"),
+            "{:?}",
+            manifest.left_behind
+        );
+        let tree = manifest
+            .caches
+            .iter()
+            .find(|cache| cache.path.as_str() == "node_modules")
+            .unwrap();
+        assert_eq!(tree.remake, fabric_core::snapshot::Remake::Nothing);
     }
 
     /// A suspend must not publish a snapshot whose `.fabric/env.toml`

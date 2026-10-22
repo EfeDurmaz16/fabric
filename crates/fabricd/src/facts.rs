@@ -20,7 +20,7 @@ use std::time::Duration;
 use fabric_core::env::SetupStep;
 use fabric_core::harness::ProgramName;
 use fabric_core::path::{AbsPath, RelPath};
-use fabric_core::snapshot::{CacheClass, CarryKey, Platform, Remake};
+use fabric_core::snapshot::{CacheClass, CarryKey, Platform, Remake, SnapshotManifest};
 use fabric_env::detect::{CacheOrigin, Completion, Detection, Ecosystem, NodeManager};
 use fabric_net::wire::{FactName, FactValue, Facts, MAX_FACT_VALUE};
 use fabric_store::capture::CarryKeys;
@@ -625,6 +625,37 @@ impl CarryKeys for MeasuredKeys {
     }
 }
 
+/// Turns each cache row that setup steps remake into one nothing remakes
+/// when a file detection reads stayed on this node, and returns the paths
+/// it turned.
+///
+/// The target learns the steps from its own detection over the restored
+/// tree. With a lockfile, a package manifest, the manager's configuration
+/// or `.fabric/env.toml` left behind by `.fabricignore` or a secret
+/// pattern, that detection does not see what this node saw and may plan
+/// no step for the path, so a rebuild the row promised would never run
+/// and the bytes, left out for it, would be lost. Nothing on the target is
+/// then known to make the path again, and it travels as the user's files.
+pub fn forget_lost_remakes(manifest: &mut SnapshotManifest) -> Vec<RelPath> {
+    let lost = manifest.left_behind.iter().any(|left| {
+        fabric_env::detect::READ_FILES.iter().any(|file| {
+            RelPath::parse(file).is_ok_and(|file| file.starts_with_ignore_ascii_case(&left.path))
+        })
+    });
+    if !lost {
+        return Vec::new();
+    }
+    manifest
+        .caches
+        .iter_mut()
+        .filter(|cache| matches!(cache.remake, Remake::Setup(_)))
+        .map(|cache| {
+            cache.remake = Remake::Nothing;
+            cache.path.clone()
+        })
+        .collect()
+}
+
 fn manager_name(manager: NodeManager) -> &'static str {
     match manager {
         NodeManager::Npm => "npm",
@@ -706,6 +737,72 @@ mod tests {
             }
         );
         assert_eq!(keys.remake(CacheClass::Build, &dist), Remake::NextBuild);
+    }
+
+    /// A row setup steps remake keeps its steps while what detection
+    /// reads travels, and becomes the user's files once the lockfile, or
+    /// a directory that holds one of those files, stayed behind: the
+    /// target's detection would plan no step for it (review of PR #11).
+    #[test]
+    fn a_rebuild_whose_inputs_stayed_behind_becomes_the_users_files() {
+        use fabric_core::snapshot::{
+            CacheEntry, CarryState, HarnessState, LeaveReason, LeftBehind,
+        };
+        let manifest = |left: &[(&str, LeaveReason)]| SnapshotManifest {
+            job_id: fabric_core::id::JobId::from_bytes([1; 16]),
+            root: AbsPath::parse("/w").unwrap(),
+            parent: None,
+            created_at: 0,
+            created_by: fabric_core::id::NodeId::from_bytes([2; 32]),
+            platform: pro().platform(),
+            git: None,
+            files: Vec::new(),
+            harness_state: HarnessState::default(),
+            env_spec: None,
+            caches: vec![
+                CacheEntry {
+                    path: RelPath::parse("dist").unwrap(),
+                    class: CacheClass::Build,
+                    carry: CarryState::Carried,
+                    key: CarryKey::Unmeasured,
+                    remake: Remake::NextBuild,
+                    native_files: 0,
+                },
+                CacheEntry {
+                    path: RelPath::parse("node_modules").unwrap(),
+                    class: CacheClass::Deps,
+                    carry: CarryState::Carried,
+                    key: CarryKey::Unmeasured,
+                    remake: Remake::Setup(vec![SetupStep {
+                        program: ProgramName::parse("npm").unwrap(),
+                        args: vec![fabric_core::env::SetupArg::parse("ci").unwrap()],
+                        cwd: None,
+                        when: fabric_core::env::RunWhen::CachesMissing,
+                    }]),
+                    native_files: 0,
+                },
+            ],
+            left_behind: left
+                .iter()
+                .map(|(path, reason)| LeftBehind {
+                    path: RelPath::parse(path).unwrap(),
+                    reason: *reason,
+                })
+                .collect(),
+        };
+        let mut kept = manifest(&[(".env", LeaveReason::Secret)]);
+        assert!(forget_lost_remakes(&mut kept).is_empty());
+        assert!(matches!(kept.caches[1].remake, Remake::Setup(_)));
+        for left in ["package-lock.json", ".fabric"] {
+            let mut lost = manifest(&[(left, LeaveReason::Excluded)]);
+            assert_eq!(
+                forget_lost_remakes(&mut lost),
+                [RelPath::parse("node_modules").unwrap()],
+                "{left}"
+            );
+            assert_eq!(lost.caches[1].remake, Remake::Nothing, "{left}");
+            assert_eq!(lost.caches[0].remake, Remake::NextBuild, "{left}");
+        }
     }
 
     /// A tree with a lockfile records the install step that fills it.
