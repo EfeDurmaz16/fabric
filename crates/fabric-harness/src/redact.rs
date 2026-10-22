@@ -125,21 +125,39 @@ fn any(_: &[u8]) -> bool {
 }
 
 /// True unless the value after the first `=` is a number of three digits
-/// or fewer: `MAX_TOKENS=512`, `TOKEN_TTL=60` and `PASSWORD_MIN_LENGTH=8`
-/// name a count, a time or a length, and a secret that short protects
-/// nothing. A longer number still counts, as it did before any value
-/// length was accepted.
+/// or fewer under a name whose secret word is qualified: `MAX_TOKENS=512`,
+/// `TOKEN_TTL=60` and `PASSWORD_MIN_LENGTH=8` name a count, a time or a
+/// length. A name that ends in its secret word names the secret itself, so
+/// `CVV_SECRET=123` and `OTP_TOKEN=42` still count, and so does a longer
+/// number under any name, as before any value length was accepted.
 fn assigned_value_is_secret(matched: &[u8]) -> bool {
-    let value = matched
+    let (name, value) = matched
         .iter()
         .position(|b| *b == b'=')
-        .map_or(matched, |at| &matched[at + 1..]);
+        .map_or((&[][..], matched), |at| {
+            (&matched[..at], &matched[at + 1..])
+        });
     let value = value
         .strip_prefix(b"'")
         .or_else(|| value.strip_prefix(b"\""))
         .unwrap_or(value);
-    value.len() > 3 || !value.iter().all(u8::is_ascii_digit)
+    value.len() > 3
+        || !value.iter().all(u8::is_ascii_digit)
+        || SECRET_ENDINGS.iter().any(|end| name.ends_with(end))
 }
+
+/// The words that, at the end of a variable's name, make it the name of a
+/// secret rather than of a setting about one.
+const SECRET_ENDINGS: &[&[u8]] = &[
+    b"SECRET",
+    b"TOKEN",
+    b"PASSWORD",
+    b"PASSWD",
+    b"KEY",
+    b"CREDENTIALS",
+    b"DATABASE_URL",
+    b"DSN",
+];
 
 /// True for a random-looking key: it has an upper-case letter and a lower-case
 /// letter or a digit. A kebab-case name has no upper-case letter.
@@ -412,9 +430,26 @@ mod tests {
         assert_eq!(counts.get("secret-assignment"), Some(&2));
     }
 
-    /// A count, a length or a time to live is a small number, and a secret
-    /// of three digits or fewer protects nothing; for Codex a match refuses
-    /// every later capture of the thread, so these are not secrets.
+    /// A short number under a name that ends in its secret word is that
+    /// secret, such as a card's code or a one-time code, and must not be
+    /// carried in a transcript.
+    #[test]
+    fn a_short_number_under_a_name_that_ends_in_a_secret_word_is_a_secret() {
+        let r = Redactor::standard().unwrap();
+        for text in [
+            "CVV_SECRET=123",
+            "OTP_TOKEN=42",
+            "DB_PASSWORD='7'",
+            "STRIPE_API_KEY=1",
+        ] {
+            assert!(r.matches(text), "{text} must match");
+            assert!(r.matches_bytes(text.as_bytes()), "{text} as bytes");
+        }
+    }
+
+    /// A count, a length or a time to live is a small number under a name
+    /// that goes on past its secret word; for Codex a match refuses every
+    /// later capture of the thread, so these are not secrets.
     #[test]
     fn a_short_number_under_a_secret_word_is_not_a_secret() {
         let r = Redactor::standard().unwrap();
