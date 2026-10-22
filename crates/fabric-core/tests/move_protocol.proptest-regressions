@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9557ec9e34d381948f9d1428c04d22c0f144c8d1de1e36a7f3e8063389583042 # shrinks to ops = [Suspend { node: 0 }, StartMove { src: 0, dst: 1 }, Drop { idx: 0 }]
+cc 723efbe1dd95d92dd87f1f558425ebb9e758b287807f9851c4ecafa953cf6cff # shrinks to ops = [Suspend { node: 0 }, StartMove { src: 0, dst: 2 }, Sync { from: 0, to: 2 }, Abort { node: 0 }, Suspend { node: 0 }]

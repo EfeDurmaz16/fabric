@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1927e779521cef418791a69454e8d41369d9fcb342cd493f34e14f0d801449e8 # shrinks to a = Event { id: EventId(00000000000000000000000000), prev: None, epoch: Epoch(1), at: 0, kind: SnapshotPublished { snapshot: SnapshotId(0000000000000000000000000000000000000000000000000000000000000000), parent: Some(SnapshotId(0000000000000000000000000000000000000000000078f0a188b2b9a9e48886)) } }, b = Event { id: EventId(0ZJ8TKJ6MFKWE4SRCAJ42NEMSS), prev: None, epoch: Epoch(133), at: 4641877456323775406, kind: Created { goal: "(/8&I%&", harness: ClaudeCode, created_by: NodeId(fab1rlw45wtkalzav4pcnmupamkkxtbwgoj3casrckqkui4iqa3vfxcq) } }, cut = Index(140725100553487654)

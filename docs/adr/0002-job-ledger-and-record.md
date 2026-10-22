@@ -4,6 +4,32 @@ Status: accepted, 2026-10-19
 
 Amended 2026-10-19 after step 1 research. The event kinds and the acceptance rule follow the move protocol of ADR 0003 (`2026-10-19-step1-design-input.md`, section 4.8 and D11): `LeaseClaimed` and `LeaseReleased` are replaced by `MoveStarted`, `MoveImported`, `MoveAborted` and `Stolen`, there is no epoch 0 and no free lease, and the arbiter is gone. Nothing else in this ADR changed.
 
+Amended 2026-10-19 while writing `fabric-core` (PR `feat/core`). Four corrections of fact, each found by making the types compile and the replay test pass:
+
+1. `Stolen` carries `by` as well as `from`. The first text named only the stolen-from node, so a replay from the file alone could not say who owns the job after the steal; the thief was known only to the transport. The record is now `Stolen { by, from, reason }` and `by` is the writer.
+2. A new kind, `EnvSpecChanged { env_spec }`, written by the owner at its epoch. Without it the manifest's `env_spec` could not be rebuilt from the ledger, which this ADR promises for every manifest field. ADR 0007's "a `Note` in the ledger" for an edited spec is this record.
+3. `JobManifest` gains `created_at` and `updated_at`, the `at` of the first and the last record. Informational, like `at` itself.
+4. The record framing is made exact: `length` counts the bytes after itself (`format_version`, the postcard payload and the 16 checksum bytes); the checksum is the first 16 bytes of blake3 over `length | format_version | payload`; `prev` and the manifest's `head` are blake3 over the whole frame. `MoveStarted` is accepted only when the workspace is suspended in the latest published snapshot (the last `Suspended` names it and no `Resumed` follows; a `Note` or `DecisionRecorded` in between does not matter), which is step 1 of the move in ADR 0003 stated as a rule the ledger enforces. The first text of this rule read the head record's kind, so any note the CLI wrote after `fabric suspend` blocked the move; the second review corrected it.
+
+Amended 2026-10-19 after the adversarial review of PR `feat/core`. Eight corrections, each with the test that pins it:
+
+1. The length field has its own check. One flipped bit in the length of a middle record made `scan` report a torn tail at that offset, so a store following the torn-tail rule would have truncated every later record, `MoveImported` included. The frame is now `u32 length | u32 header_check | u8 format_version | postcard(Event) | checksum`, where `header_check` is the first 4 bytes of blake3 over the length field and `checksum` is the first 16 bytes of blake3 over everything before it. A header that does not verify is corruption, never a torn tail. A record is at most 1 MiB (`MAX_RECORD_LEN`, the control frame bound of ADR 0005); a header that verifies and declares more is refused before any allocation, in a file and in a frame from a peer.
+2. The torn-tail rule below is restated with the header: a last record whose header verifies and whose declared end is past end of file is torn. The at-end-of-file case is the power-loss shape on APFS and ext4 where the inode size and the first page landed and the pages after it read back as zero; it is torn only while the checksum bytes read back as zero, which is the one way to tell a write that stopped early from a record that was complete (the second review reversed the first text of this point, which accepted dropping a complete last record with a failed checksum; such a record may be an acknowledged `MoveImported`, and the store now fails closed on it). The property test has no `Ok` arm any more: a flipped bit anywhere in a non-tail record is corruption at that offset.
+3. `Created` carries `job_id`. Without it a ledger could not prove which job it was: records of job X delivered under job Y's directory replayed cleanly and minted fencing tokens for Y. `replay` and `open` take the job the caller expects and refuse a mismatch with `WrongJob`. `MoveOffer` carries `job_id` for the same reason (ADR 0003).
+4. A decoder refuses bytes after the value. postcard ignores trailing bytes, so one event had many valid frames and a manifest with junk appended decoded to a value whose `id()` differed from blake3 of the bytes. Every decode in the crate is exact; `decode(bytes).id() == blake3(bytes)` holds for manifests and one event has one frame hash.
+5. The format version is the first varint of a manifest's bytes, not a field of the struct. `JobManifest`, `SnapshotManifest` and `EnvSpec` have no `version` member; `encode` writes the constant and `decode` reads and checks it, so a wrong version cannot exist in memory and `UnknownVersion` is a decode-only error. The bytes did not change.
+6. Who delivered a record is one of two things, and the ledger says which checks each gets. `Author::Node(peer)` is a record from a transport-proved peer, who must be the node the writer rule names. `Author::Relayed` is a record fetched from a paired peer that is not necessarily its writer, which happens whenever a replica fetches a suffix holding another node's records from the owner; it gets the link, epoch and content checks and not the sender check, because records carry no signature. A relayed record is trusted as far as the paired peer is. Per-record signatures by node key, already an open question below, are the way to close this and are one more field in a new format version. There is no `OwnFile`: a node's own file is replayed with the same checks as a relayed suffix.
+7. Two content rules were missing: `SnapshotPublished.parent` must equal the latest published snapshot (`WrongParent`), and a `Resumed` that names a snapshot must name the latest one (`UnknownSnapshot`). A record whose epoch is above the one the rules require is `AheadOfUs`, as the fencing token already distinguishes, instead of `StaleEpoch`.
+8. `Epoch` zero is refused on the wire, not only by `Epoch::new`. The record bytes of every event kind and of the job manifest are pinned by a test, as the snapshot manifest's already were, so a reordered variant or field is a failing test.
+
+Amended 2026-10-19 after the second adversarial review of PR `feat/core`. Five corrections, each pinned by a test, applied in place above and in the rules below:
+
+1. A whole last record whose checksum bytes are present and wrong is corruption, not a torn tail; only a tail whose checksum bytes read back as zero is torn (review amendment 2 above, reversed). Dropping a complete record can drop an acknowledged `MoveImported`.
+2. A decoder refuses non-canonical bytes as well as trailing ones. postcard reads an overlong varint as the same number, so one event had two frame hashes and an `EnvSpec` could have an id that was not blake3 of its bytes. Every decode re-encodes and compares; inside a frame any decode failure is `Corrupt { offset }`.
+3. `MoveStarted` requires the workspace to be suspended in the latest published snapshot, derived from the records (the last `Suspended` names it and no `Resumed` follows), not the head record's kind, so a `Note` after `fabric suspend` does not block a move.
+4. A `move_id` names one move. A `MoveStarted` whose id an earlier move used is refused with `MoveIdReused`; otherwise the target answers every offer for the new move with the old decision.
+5. `Ledger::accept` is private and `commit` is the one way to grow a ledger; a store that refuses the append proves the record is never shown. `verify` takes an `Author`, as `commit` does.
+
 ## Context
 
 A job must be readable after any crash, on any node, by any future version of Fabric. It must also show what happened, in order, so that a user on a second machine can see why a job is in the state it is in. The T3 Code store is an event-sourced SQLite file with 64 migrations that the research judged unsafe to write from outside (`2026-10-19-t3code-vs-fabric.md`, section 5a). We want the opposite: a format small enough to describe on one page and safe to read with a hex editor.
@@ -24,8 +50,10 @@ The ledger is an append-only file of events. One file per job per node, at `<fab
 Each record on disk:
 
 ```text
-u32 length | u8 format_version | postcard(Event) | blake3(prev 3 fields)[0..16]
+u32 length | u32 header_check | u8 format_version | postcard(Event) | blake3(all before)[0..16]
 ```
+
+`length` counts the bytes after the header. `header_check` is blake3 of the length field, first 4 bytes. A frame is at most 1 MiB.
 
 ```text
 Event {
@@ -37,14 +65,15 @@ Event {
 }
 
 EventKind =
-  | Created { goal: String, harness: HarnessKind, created_by: NodeId }        created_by owns the job at epoch 1
+  | Created { job_id: JobId, goal: String, harness: HarnessKind, created_by: NodeId }   created_by owns the job at epoch 1; job_id is checked on every replay
   | MoveStarted { move_id: MoveId, target: NodeId }                           by the owner, at its epoch
   | MoveImported { move_id: MoveId, from: NodeId }                            by the target, at epoch + 1
   | MoveAborted { move_id: MoveId }                                           by the target, at the owner's epoch
-  | Stolen { from: NodeId, reason: String }                                   by the new owner, at epoch + 1, behind --force
+  | Stolen { by: NodeId, from: NodeId, reason: String }                      by `by`, the new owner, at epoch + 1, behind --force
   | SnapshotPublished { snapshot: SnapshotId, parent: Option<SnapshotId> }
   | Suspended { snapshot: SnapshotId }
   | Resumed { node: NodeId, snapshot: Option<SnapshotId>, harness: HarnessKind }   None only for the Resumed that `fabric job init` appends
+  | EnvSpecChanged { env_spec: EnvSpecId }                                   by the owner, at its epoch
   | DecisionRecorded { text: String }
   | Note { text: String }
 ```
@@ -54,9 +83,9 @@ Rules:
 - Append only. No record is ever rewritten.
 - Hash chained. `prev` makes insertion in the middle detectable. This is cheap tamper evidence, not security against a malicious node.
 - Durable before visible. Every append is one `write` of the whole record followed by a full flush of the file: `fsync` on Linux, `fcntl(F_FULLFSYNC)` on macOS, where plain `fsync` leaves the bytes in the drive's write cache (ADR 0004, publish). The first append to a new ledger file is followed by the same flush on `jobs/<job-id>/`, since a new file is durable only once its directory is. A record is not reported to any caller and not sent to any peer before the flush returns. The `MoveImported` or `MoveAborted` a target writes is fsynced before `MoveDecision` leaves the node; otherwise a crash between the two forgets the decision while the source acts on it.
-- Checksummed per record. On open, the reader walks forward. A failing record is a torn tail only if it is the last thing in the file: its declared end is at or past end of file, or every byte from its start to end of file is zero. A torn tail is truncated and the records before it are valid. Any other failure is corruption, not a crash: open fails with `LedgerCorrupt { offset }`, the file is not modified and the manifest is not rebuilt. A record in the middle is never dropped to make the rest readable, because the dropped record may be the `MoveImported` or `Stolen` that fences a live copy. `fabric job repair` is a later command; v0 refuses and says where.
-- Owned by one writer at a time. While the lease is `Owned`, only the owner appends, and the kinds it may write are `MoveStarted`, `SnapshotPublished`, `Suspended`, `Resumed`, `DecisionRecorded` and `Note`. While the lease is `Departing`, only the target named by the open `MoveStarted` appends, and the only kinds it may write are `MoveImported` and `MoveAborted` for that `move_id`. `Stolen` is the one record a node writes without being the owner or the target (ADR 0003, The steal). Every other node holds a replica: a byte-for-byte copy of the writer's records, in the writer's order.
-- Accepted from a peer only when it links. A replica appends a peer record only if `record.prev` equals the replica's head. Then `MoveImported` and `Stolen` must carry `epoch == current_epoch + 1`, every other kind must carry `epoch == current_epoch`, and the record must come from the node the previous rule allows to write at that moment. A record whose `prev` does not match is answered with `Rejected { head }` and the sender fetches the missing suffix; if neither head is a prefix of the other the ledgers have forked and ADR 0003 says which chain wins. A record with any other epoch is answered with `StaleEpoch { yours, current }` and dropped.
+- Checksummed per record, header and body. On open, the reader walks forward. A failing record is a torn tail only if it is the last thing in the file and its checksum never landed: its header verifies and its declared end is past end of file, its header is cut short, every byte from its start to end of file is zero, or its declared end is end of file and its 16 checksum bytes read back as zero. A header that does not verify is corruption wherever it is, and so is a last record whose checksum bytes are present and wrong: a record is acknowledged only after its whole frame is durable, so a present checksum means the record was complete once and a wrong one is bit rot, which must not be truncated away. A torn tail is truncated and the records before it are valid. Any other failure is corruption, not a crash: open fails with `LedgerCorrupt { offset }`, the file is not modified and the manifest is not rebuilt. A record in the middle is never dropped to make the rest readable, because the dropped record may be the `MoveImported` or `Stolen` that fences a live copy. `fabric job repair` is a later command; v0 refuses and says where.
+- Owned by one writer at a time. While the lease is `Owned`, only the owner appends, and the kinds it may write are `MoveStarted`, `SnapshotPublished`, `Suspended`, `Resumed`, `EnvSpecChanged`, `DecisionRecorded` and `Note`. While the lease is `Departing`, only the target named by the open `MoveStarted` appends, and the only kinds it may write are `MoveImported` and `MoveAborted` for that `move_id`. `Stolen` is the one record a node writes without being the owner or the target (ADR 0003, The steal). Every other node holds a replica: a byte-for-byte copy of the writer's records, in the writer's order.
+- Accepted from a peer only when it links. A replica appends a peer record only if `record.prev` equals the replica's head. Then `MoveImported` and `Stolen` must carry `epoch == current_epoch + 1`, every other kind must carry `epoch == current_epoch`, and the record must come from the node the previous rule allows to write at that moment when the transport proved the sender (`Author::Node`); a suffix relayed by another paired peer (`Author::Relayed`) skips only that sender check (amendment 6 above). A record whose `prev` does not match is answered with `Rejected { head }` and the sender fetches the missing suffix; if neither head is a prefix of the other the ledgers have forked and ADR 0003 says which chain wins. A record with any other epoch is answered with `StaleEpoch { yours, current }` and dropped.
 - Ordered by file position, not by `at` or by ULID. Clocks are not trusted for ordering.
 
 ### The job manifest
@@ -64,8 +93,7 @@ Rules:
 A derived, versioned summary that any node can rebuild from the ledger. It exists so that `fabric status` does not replay the file, and so that a peer can fetch "the head" in one message.
 
 ```text
-JobManifest {
-  version:         u16,          format version of this struct
+JobManifest {                    the bytes start with the format version as a varint; it is not a field
   job_id:          JobId,
   goal:            String,
   harness:         HarnessKind,
@@ -74,6 +102,8 @@ JobManifest {
   lease:           LeaseState,
   head:            [u8; 32],     blake3 of the last ledger record
   event_count:     u64,
+  created_at:      u64,          the `at` of Created
+  updated_at:      u64,          the `at` of the last record
 }
 ```
 
@@ -87,7 +117,8 @@ Each snapshot carries a `harness_state` tree (ADR 0004). The core copies it, has
 
 postcard for the ledger and manifests. It is compact, deterministic and `no_std`, but it is not self-describing, so:
 
-- every record and every manifest carries an explicit `format_version`;
+- every record and every manifest carries an explicit `format_version`, as the first thing in its bytes;
+- a decoder refuses bytes after the value and bytes that are not what the encoder writes for the value they decode to (postcard reads an overlong varint as the same number), so a value has one byte form and its hash is the hash of that value alone; inside a record frame such bytes are corruption at that offset;
 - a reader that sees a version it does not know fails with a clear error instead of guessing;
 - field order is append-only within a version; a new version is a new struct.
 

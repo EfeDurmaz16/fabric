@@ -47,32 +47,33 @@ SnapshotId   = blake3 hash of the manifest bytes
 ChunkId      = blake3 hash of an object: a whole file up to 8 MiB, or one FastCDC chunk above that
 
 Event        = { id: ULID, prev: blake3 of previous event, epoch, kind }
-EventKind    = Created | MoveStarted { move_id, target } | MoveImported { move_id, from }
-             | MoveAborted { move_id } | Stolen { from, reason }
-             | SnapshotPublished | Suspended | Resumed | DecisionRecorded | Note
+EventKind    = Created { job_id, goal, harness, created_by } | MoveStarted { move_id, target } | MoveImported { move_id, from }
+             | MoveAborted { move_id } | Stolen { by, from, reason }
+             | SnapshotPublished | Suspended | Resumed | EnvSpecChanged | DecisionRecorded | Note
 
-JobManifest  = { version, job_id, goal, harness_kind, env_spec: EnvSpecId,
-                 latest_snapshot: Option<SnapshotId>, lease: LeaseState }
+JobManifest  = { job_id, goal, harness, env_spec: Option<EnvSpecId>,
+                 latest_snapshot: Option<SnapshotId>, lease: LeaseState, head, event_count,
+                 created_at, updated_at }
 LeaseState   = Owned { node, epoch } | Departing { node, epoch, move_id, target }
 
-SnapshotManifest = { version, job_id, root: AbsPath, parent: Option<SnapshotId>, created_at, created_by,
+SnapshotManifest = { job_id, root: AbsPath, parent: Option<SnapshotId>, created_at, created_by,
                      platform: { os, arch }, git: Option<GitState>, files: [Entry],
                      harness_state: [Entry], env_spec: Option<EnvSpecId>, caches: [CacheEntry] }
 GitState     = { bundle, bundle_base, refs, head, index_commit, worktree_commit,
                  worktree_mtimes, config, exclude }
-CacheEntry   = { path: RelPath, class: Deps | Build | ToolCache, carried: bool, key: CarryKey, partial: bool }
+CacheEntry   = { path: RelPath, class: Deps | Build | ToolCache, carry: Carried | Partial | NotCarried, key: CarryKey }
 CarryKey     = Node { node_major, package_manager, pm_major, pnpm_store_path }
              | Rust { rustc_vv, cargo_home } | Python { python_version, python_home } | Other { tool, version }
 Marker       = { root, job_id, base: Option<SnapshotId>,
                  state: Clean | Dirty | Suspending { epoch, head } | Restoring { targets } }
                node-local, at <fabric-data>/jobs/<job-id>/marker, never inside the workspace
-Entry        = { rel_path: RelPath, kind: File | Dir | Symlink, mode, mtime_ns, chunks: [ChunkId], size }
+Entry        = { rel_path: RelPath, kind: File { size, chunks: [ChunkId] } | Dir | Symlink { target }, mode, mtime_ns }
 
-EnvSpec      = { version, tools: [{ name, version, source }], setup: [{ argv, cwd, when }],
+EnvSpec      = { tools: [{ name, version, source }], setup: [{ program, args, cwd, when }],
                  env_var_names: [String], cache_paths: [RelPath] }
 ```
 
-Every id is either content-derived (hashes) or time-sortable and collision-free (ULIDs). The one host path is `SnapshotManifest.root`, the directory the job was captured in, which is also where every node restores it (ADR 0011). Nothing is a vendor session id. There is no clock in any state transition: the lease has an epoch and no expiry (ADR 0003).
+Every list in a manifest is strictly sorted by its key, and every manifest's bytes start with the format version. Every id is either content-derived (hashes) or time-sortable and collision-free (ULIDs), and the core makes none of them: the edge draws ULIDs from its clock and hands the core the bytes. The one host path is `SnapshotManifest.root`, the directory the job was captured in, which is also where every node restores it (ADR 0011). Nothing is a vendor session id. There is no clock in any state transition: the lease has an epoch and no expiry (ADR 0003).
 
 ## Data flow: move from one node to another
 

@@ -4,6 +4,12 @@ Status: accepted, 2026-10-19
 
 Amended 2026-10-19 after step 1 research. Step 1 of Materialize now reads the per-cache carry key of ADR 0012 instead of the `{ os, arch }` pair alone, and `tools` records the exact strings `fabric doctor` compares (ADR 0008). Nothing else changed.
 
+Amended 2026-10-19 while writing `fabric-core` (PR `feat/core`): `SetupStep.cwd` is `Option<RelPath>`, where `None` is the workspace root, because a `RelPath` cannot name the root itself (ADR 0004 forbids empty and `.` components). The edited-spec record is `EnvSpecChanged` (ADR 0002), not a free-text `Note`.
+
+Amended 2026-10-19 after the adversarial review of PR `feat/core`: a setup step is `{ program, args, cwd, when }` rather than `{ argv, cwd, when }`, so the shape matches `HarnessKind::Acp` (ADR 0006). The second review found that this alone did not remove the empty command: `program` was a bare string and `""`, `/tmp/x`, `../bin/x` and `-rf` all decoded. `program` is now `ProgramName`, a parsed type that is non-empty and holds no slash, no NUL and no leading `-`, checked inside `Deserialize`, so "looked up on `PATH`" is true by type. The format version is the first varint of the spec's bytes, not a field of the struct (ADR 0002, review amendment 5).
+
+Amended 2026-10-19 after the second adversarial review of PR `feat/core`: `program` is a `ProgramName` (amendment above, corrected in place), `env_var_names` holds `EnvVarName` values that cannot carry a `=`, and `tools`, `env_var_names` and `cache_paths` are strictly sorted so that one content has one `EnvSpecId`; a spec that breaks either rule is refused on encode and on decode.
+
 ## Context
 
 The job's workspace arrives with its caches when the platform matches (ADR 0004). When it does not, or when a cache was excluded, the node must be able to make itself ready without the user typing anything. The standard for describing environments is `devcontainer.json` (about 1.69M monthly npm downloads of `@devcontainers/cli` per the landscape, section 7). But a devcontainer is a container recipe, and v0 runs harnesses directly on two Macs with no container.
@@ -15,20 +21,19 @@ Also: environments contain secrets, and secrets must not travel in snapshots (AD
 ### `EnvSpec` v0
 
 ```text
-EnvSpec {
-  version:       u16,
-  tools:         [Tool],         detected, informational, used to warn on mismatch
-  setup:         [SetupStep],    commands that make the workspace runnable
-  env_var_names: [String],       names only, never values
-  cache_paths:   [RelPath],      what counts as a cache for snapshot policy and for "is it warm"
+EnvSpec {                        the bytes start with the format version as a varint; it is not a field
+  tools:         [Tool],         detected, informational, used to warn on mismatch; strictly sorted by name
+  setup:         [SetupStep],    commands that make the workspace runnable, in the order they run
+  env_var_names: [EnvVarName],   names only, never values; `[A-Za-z_][A-Za-z0-9_]*`, strictly sorted
+  cache_paths:   [RelPath],      what counts as a cache for snapshot policy and for "is it warm"; strictly sorted
 }
 Tool      { name: String, version: String, source: Detected | Declared }   version is the tool's own exact string (`rustc -vV`, `node --version`, `pnpm --version`), never parsed into parts
-SetupStep { argv: [String], cwd: RelPath, when: CachesMissing | Always }
+SetupStep { program: ProgramName, args: [String], cwd: Option<RelPath>, when: CachesMissing | Always }   cwd None is the root; ProgramName is a bare name, never a path or an option
 ```
 
-`argv` is executed directly, never through a shell. A spec travels with the job and a peer can send one, so there is no string for quoting bugs or a hostile `packageManager` field to hide in. Before the node runs a spec whose id differs from the one it last ran or wrote for that job, it prints the steps and asks, unless the command was given `--yes`.
+`program` is looked up on `PATH` and run with `args` directly, never through a shell. A spec travels with the job and a peer can send one, so there is no string for quoting bugs or a hostile `packageManager` field to hide in. Before the node runs a spec whose id differs from the one it last ran or wrote for that job, it prints the steps and asks, unless the command was given `--yes`.
 
-`EnvSpecId` is the blake3 of the postcard bytes. A job references an `EnvSpec` by id; editing produces a new id and a `Note` in the ledger.
+`EnvSpecId` is the blake3 of the postcard bytes. A job references an `EnvSpec` by id; editing produces a new id and an `EnvSpecChanged` record in the ledger. The id is only an identity if the same content has one byte form, so `tools`, `env_var_names` and `cache_paths` are strictly sorted by their key and a spec that is not, from a peer or from a caller, is refused with `EnvSpecError::OutOfOrder { list, index }`; `setup` keeps the order it runs in. An environment variable name is a parsed `EnvVarName` that cannot hold `=`, so a value cannot travel inside a name (second review of PR `feat/core`, 2026-10-19).
 
 ### Detection
 

@@ -6,15 +6,15 @@ Private repository. Working name; see [ADR 0010](docs/adr/0010-name-and-scope-bo
 
 ## Status, honestly
 
-Design only. There is no working code.
+Core types only. Nothing suspends or resumes yet.
 
 | What | State |
 |---|---|
 | Architecture page and glossary | Written: [docs/architecture.md](docs/architecture.md), [docs/glossary.md](docs/glossary.md) |
 | ADRs 0001 to 0012 | Written, see below; amended 2026-10-19 after the step 1 research |
-| `crates/fabric-core` | A cargo template with an `add` function. It will be replaced in the core stage. |
+| `crates/fabric-core` | Ids, paths, the job ledger with its record codec, the lease and the cooperative move protocol, snapshot manifests and the environment spec. Pure: no IO, no clock, no socket. Property-tested against the ADR 0003 invariants. |
 | Every other crate in the layout | Does not exist yet |
-| CI | Not configured yet |
+| CI | fmt, clippy, test, doc, `cargo deny` and the hygiene script on macOS and Ubuntu |
 
 Nothing here suspends or resumes anything. Do not install it.
 
@@ -51,7 +51,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-These pass today because there is almost nothing to build.
+`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`, `cargo deny check` and `scripts/check-hygiene.sh origin/main` complete the set; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
