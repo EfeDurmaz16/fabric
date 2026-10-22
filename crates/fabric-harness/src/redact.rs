@@ -40,7 +40,8 @@ struct Pattern {
 }
 
 /// A pattern with a capture group named `keep` keeps that part and
-/// replaces only the rest: `DB_PASSWORD=` stays, its value does not.
+/// replaces only the rest: `DB_PASSWORD=` stays, its value does not, at
+/// any length; only a `${VAR}` reference or an earlier marker is left.
 ///
 /// `(?-u:\b)` is an ASCII word boundary. Every key shape starts on one, so
 /// a prefix such as `sk-` inside an ordinary word (`disk-usage`,
@@ -114,7 +115,7 @@ const PATTERNS: &[Pattern] = &[
     },
     Pattern {
         name: "secret-assignment",
-        regex: r#"(?-u:\b)(?P<keep>[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|ACCESS_KEY|CREDENTIALS|DATABASE_URL|DSN)[A-Z0-9_]*=['"]?)[^\s'"$\[][^\s'"]{3,}"#,
+        regex: r#"(?-u:\b)(?P<keep>[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|ACCESS_KEY|CREDENTIALS|DATABASE_URL|DSN)[A-Z0-9_]*=['"]?)[^\s'"$\[][^\s'"]*"#,
         accept: any,
     },
 ];
@@ -380,6 +381,18 @@ mod tests {
         ] {
             assert!(r.matches(text), "{text} must match");
         }
+    }
+
+    #[test]
+    fn a_short_value_of_a_secret_named_variable_is_redacted() {
+        let r = Redactor::standard().unwrap();
+        let mut counts = RedactionCounts::new();
+        assert_eq!(
+            r.apply("DB_PASSWORD=abc TOKEN='x' API_KEY= PORT=1", &mut counts)
+                .unwrap(),
+            "DB_PASSWORD=[REDACTED:secret-assignment] TOKEN='[REDACTED:secret-assignment]' API_KEY= PORT=1"
+        );
+        assert_eq!(counts.get("secret-assignment"), Some(&2));
     }
 
     #[test]
