@@ -37,6 +37,7 @@ import {
   type DoctorReport,
   type Epoch,
   type Harness,
+  type HarnessVersion,
   Hello,
   HelloAnswer,
   isReplyTo,
@@ -94,6 +95,16 @@ export type Launched = {
   /** The harness process, which leads its own process group. */
   readonly pid: Pid;
   readonly harness: Harness;
+};
+
+/** What a launch knows of the harness it started, for `harnessStarted`. */
+export type Started = {
+  /** The session it continues or created, when known. */
+  readonly session?: SessionId;
+  /** The session the plan continues; a new one when absent. A node that recorded another since refuses the launch. */
+  readonly planned?: SessionId;
+  /** The version the launch asked of the harness, when it asked: the newest known to have run the session. */
+  readonly version?: HarnessVersion;
 };
 
 /** A client of the node whose control socket is at a path. */
@@ -287,13 +298,23 @@ export class FabricClient {
   }
 
   /**
-   * Tells the node the planned harness runs as `launch.pid`, so it records
-   * it and appends `Resumed`; `session` is the session it continues or
-   * created, when known.
+   * Asks the node whether `plan` still holds: before any setup step, under
+   * the tree lock, so a launch whose plan another launch, a suspend or a
+   * peer's record overtook refuses before it writes to the workspace.
    */
-  harnessStarted(launch: Launched, session?: SessionId, options?: CallOptions): Promise<Registered> {
+  async launchCheck(plan: RunPlan, options?: CallOptions): Promise<void> {
+    const { job, epoch, head, harness, session } = plan;
+    await this.call({ op: "launch_check", job, epoch, head, harness, session }, options);
+  }
+
+  /**
+   * Tells the node the planned harness runs as `launch.pid`, so it records
+   * it and appends `Resumed`, with what the launch knows of it in `started`.
+   */
+  harnessStarted(launch: Launched, started: Started = {}, options?: CallOptions): Promise<Registered> {
     const { job, epoch, pid, harness } = launch;
-    return this.call({ op: "harness_started", job, epoch, pid, harness, session }, options);
+    const { session, planned, version } = started;
+    return this.call({ op: "harness_started", job, epoch, pid, harness, session, planned, version }, options);
   }
 
   /** Tells the node the running harness named `session`. */

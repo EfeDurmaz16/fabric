@@ -15,6 +15,10 @@ import type { z } from "zod";
 import {
   API_VERSION,
   Answer,
+  CAPABILITIES,
+  CAPTURE_NOTES,
+  type CarryLine,
+  CarryFor,
   createFrameDecoder,
   Decision,
   decodeJson,
@@ -38,10 +42,12 @@ import {
   RefusalKind,
   Reply,
   Request,
-  ROOT_CAPABILITIES,
+  SnapshotSession,
   Standing,
   Step,
   tagsOf,
+  Verdict,
+  type VerdictCount,
   View,
   Wire,
   WorkspaceState,
@@ -110,10 +116,11 @@ function roundTrip<T extends z.ZodType>(dir: string, schema: T): Array<z.output<
 /**
  * The enums whose set of variants is closed, with the tags the schemas know: a reader refuses a variant it does
  * not know, so a new one breaks every reader of the api version (ADR 0018, Compatibility rule 3). Ops, event
- * kinds, refusal reasons and ledger record kinds are open and are not here.
+ * kinds, refusal reasons, ledger record kinds and capture notes are open and are not here.
  */
 const CLOSED: Readonly<Record<string, readonly string[]>> = {
   Answer: tagsOf("type", Answer.options),
+  CarryFor: tagsOf("kind", CarryFor.options),
   Decision: Decision.options,
   DoctorReport: tagsOf("kind", DoctorReport.options),
   Harness: tagsOf("kind", Harness.options),
@@ -122,8 +129,10 @@ const CLOSED: Readonly<Record<string, readonly string[]>> = {
   Outcome: Outcome.options,
   Process: tagsOf("kind", Process.options),
   RefusalKind: RefusalKind.options,
+  SnapshotSession: tagsOf("kind", SnapshotSession.options),
   Standing: Standing.options,
   Step: Step.options,
+  Verdict: Verdict.options,
   View: tagsOf("kind", View.options),
   Wire: Wire.options,
   WorkspaceState: tagsOf("kind", WorkspaceState.options),
@@ -198,15 +207,21 @@ function isPlan(value: unknown): boolean {
   return kind === "job_run" || kind === "job_resume";
 }
 
+/** Whether `value` is a harness, by its kind. */
+function isHarness(value: unknown): boolean {
+  const kind: unknown = typeof value === "object" && value !== null ? Reflect.get(value, "kind") : undefined;
+  return kind === "claude_code" || kind === "codex" || kind === "acp";
+}
+
 /**
  * Whether the object at `pointer` in `message` is part of what a client launches, where a reader refuses a
  * field it does not know (ADR 0018, Compatibility, rule 2): a run plan with all it holds, and a harness
- * wherever it appears.
+ * wherever it appears, as `harness` or as the harness a refusal names.
  */
 function launched(message: unknown, pointer: string): boolean {
   const steps = pointer.split("/").slice(1);
   return (
-    steps.includes("harness") ||
+    isHarness(at(message, pointer)) ||
     isPlan(message) ||
     steps.some((_, index) => isPlan(at(message, `/${steps.slice(0, index + 1).join("/")}`)))
   );
@@ -238,11 +253,11 @@ describe("the shared fixtures", () => {
     }
   });
 
-  // A new op or root is additive and a fixture on the base never changes
-  // within an api version, so the new list gets a welcome fixture of its
-  // own: one lists all of it, every other part of it in the same order.
-  test("the welcome fixtures list every op, in order, then every root", () => {
-    const names: string[] = [...OPS, ...ROOT_CAPABILITIES];
+  // A new op, field or root is additive and a fixture on the base never
+  // changes within an api version, so the new list gets a welcome fixture of
+  // its own: one lists all of it, every other part of it in the same order.
+  test("the welcome fixtures list every op, in order, then every field and every root", () => {
+    const names: string[] = [...CAPABILITIES];
     const welcomes = roundTrip("hello_answer", HelloAnswer).flatMap((answer) =>
       answer.type === "welcome" ? [answer.capabilities] : [],
     );
@@ -312,6 +327,15 @@ describe("the shared fixtures", () => {
       if (value.reason.code === "unfinished") {
         mark("Step", value.reason.step);
       }
+      if (value.reason.code === "harness_changed_during_move" || value.reason.code === "harness_changed_during_pull") {
+        harness(value.reason.checked);
+        harness(value.reason.now);
+      }
+    };
+    const carry = (paths: readonly CarryLine[], more: readonly VerdictCount[]): void => {
+      for (const { verdict } of [...paths, ...more]) {
+        mark("Verdict", verdict);
+      }
     };
     const ledger = (value: LedgerEvent): void => {
       mark("LedgerEvent", value.kind);
@@ -344,8 +368,25 @@ describe("the shared fixtures", () => {
         case "holder_not_told":
         case "owner_not_told":
         case "not_caught_up":
+        case "known_writer_unknown":
+        case "abort_not_told":
         case "left_as_it_was":
           refusal(value.error);
+          break;
+        case "session_never_started":
+          harness(value.harness);
+          if (value.kept !== undefined) {
+            harness(value.kept.harness);
+          }
+          break;
+        case "capture_report":
+          for (const group of value.groups) {
+            mark("CaptureNote", group.note);
+          }
+          break;
+        case "carry_decided":
+          mark("CarryFor", value.context.kind);
+          carry(value.paths, value.more);
           break;
         default:
           break;
@@ -371,6 +412,9 @@ describe("the shared fixtures", () => {
             }
           }
           mark("Process", value.process.kind);
+          if (value.snapshot?.session !== undefined) {
+            mark("SnapshotSession", value.snapshot.session.kind);
+          }
           break;
         case "job_log":
           for (const record of value.records) {
@@ -381,6 +425,9 @@ describe("the shared fixtures", () => {
           mark("DoctorReport", value.report.kind);
           if (value.report.kind === "compared") {
             rows(value.report.rows);
+            if (value.report.carry !== undefined) {
+              carry(value.report.carry.paths, value.report.carry.more);
+            }
           }
           break;
         case "job_new":
@@ -412,6 +459,7 @@ describe("the shared fixtures", () => {
         case "job_new":
         case "harness_started":
         case "harness_session":
+        case "launch_check":
           harness(value.harness);
           break;
         case "job_resume":
@@ -430,7 +478,7 @@ describe("the shared fixtures", () => {
     roundTrip("event", Event).forEach(event);
     roundTrip("refusal", Refusal).forEach(refusal);
 
-    const variants = { ...CLOSED, LedgerEvent: LEDGER_EVENT_KINDS };
+    const variants = { ...CLOSED, CaptureNote: CAPTURE_NOTES, LedgerEvent: LEDGER_EVENT_KINDS };
     expect([...seen.keys()].sort()).toStrictEqual(Object.keys(variants).sort());
     for (const [name, known] of Object.entries(variants)) {
       expect([...(seen.get(name) ?? [])].sort(), name).toStrictEqual([...known].sort());

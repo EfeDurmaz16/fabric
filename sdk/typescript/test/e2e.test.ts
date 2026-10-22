@@ -255,7 +255,12 @@ describe.skipIf(BIN === "")("against a real fabric daemon", () => {
     expect(published).toMatchObject({ kind: "snapshot_published", snapshot: suspended.snapshot });
     expect(events.at(-1)).toStrictEqual({ kind: "suspended", snapshot: suspended.snapshot, epoch: Epoch.parse(1) });
     const status = await the().client.jobStatus(theJob());
-    expect(status.snapshot).toStrictEqual({ id: suspended.snapshot, suspended: true });
+    // No harness ran, so the snapshot holds no session to continue.
+    expect(status.snapshot).toStrictEqual({
+      id: suspended.snapshot,
+      suspended: true,
+      session: { kind: "not_captured" },
+    });
     const log = await the().client.jobLog(theJob());
     expect(log.records.map((record) => record.event.kind)).toStrictEqual([
       "created",

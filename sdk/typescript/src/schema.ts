@@ -37,6 +37,7 @@ export const OPS = [
   "harness_started",
   "harness_session",
   "harness_exited",
+  "launch_check",
 ] as const;
 
 /** The name of a request, which is also the kind of its reply. */
@@ -107,6 +108,30 @@ export type RecordHash = z.infer<typeof RecordHash>;
 /** A session id a harness minted: safe in a file name and on a command line. */
 export const SessionId = z.string().regex(SESSION_ID, "not a session id").brand<"SessionId">();
 export type SessionId = z.infer<typeof SessionId>;
+
+/** The most bytes a harness version may have, as `MAX_LEN` in Rust's `HarnessVersion`. */
+const VERSION_MAX_LEN = 64;
+const U64_MAX = 18_446_744_073_709_551_615n;
+// `MAJOR.MINOR.PATCH`, a pre-release after `-` and build metadata after `+`,
+// each a list of dot-separated identifiers of ASCII letters, digits and `-`.
+const VERSION = /^([0-9]+)\.([0-9]+)\.([0-9]+)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+
+/** Whether `text` parses as Rust's `HarnessVersion::parse` reads it, each number within a u64. */
+function isHarnessVersion(text: string): boolean {
+  const match = VERSION.exec(text);
+  return (
+    match !== null &&
+    text.length <= VERSION_MAX_LEN &&
+    match.slice(1, 4).every((number) => BigInt(number ?? "") <= U64_MAX)
+  );
+}
+
+/** A harness version, such as `0.155.1` or `0.163.0-alpha.10.2`, in the form a session records it. */
+export const HarnessVersion = z
+  .string()
+  .refine(isHarnessVersion, "not MAJOR.MINOR.PATCH with an optional pre-release")
+  .brand<"HarnessVersion">();
+export type HarnessVersion = z.infer<typeof HarnessVersion>;
 
 /** A program to look up on `PATH`: never a path, never an option, never a control character. */
 export const ProgramName = UnicodeText.regex(PROGRAM_NAME, "not a bare program name").brand<"ProgramName">();
@@ -203,6 +228,38 @@ export type Step = z.infer<typeof Step>;
 export const RefusalKind = z.enum(["not_owner", "frozen", "unreachable", "needs_force", "job_state", "failed"]);
 export type RefusalKind = z.infer<typeof RefusalKind>;
 
+/** What a target does with one ignored path of a snapshot (ADR 0012); a closed set. */
+export const Verdict = z.enum(["carry", "rebuild", "refuse", "leave"]);
+export type Verdict = z.infer<typeof Verdict>;
+
+/**
+ * What a capture did with a path or a config key its report names; a note
+ * this client does not know reads as `unrecognized`, as serde's
+ * `#[serde(other)]` reads it.
+ */
+export const CAPTURE_NOTES = [
+  "secret",
+  "excluded",
+  "secret_harness",
+  "tracked_secret",
+  "stashed_secret",
+  "filtered",
+  "special",
+  "special_harness",
+  "unreadable",
+  "nested_repository",
+  "nested_git",
+  "nested_git_harness",
+  "stripped_userinfo",
+  "dropped_config",
+] as const;
+export const CaptureNote = z.preprocess(
+  (value) =>
+    typeof value === "string" && !(CAPTURE_NOTES as readonly string[]).includes(value) ? "unrecognized" : value,
+  z.enum([...CAPTURE_NOTES, "unrecognized"]),
+);
+export type CaptureNote = z.infer<typeof CaptureNote>;
+
 // Records shared by several messages.
 
 /** Which agent drives a job. An unknown kind is an error: a node cannot launch it. */
@@ -249,6 +306,40 @@ export const PreflightRow = z.object({
   note: UnicodeText,
 });
 export type PreflightRow = z.infer<typeof PreflightRow>;
+
+/** One ignored path of a snapshot and what a target does with it. */
+export const CarryLine = z.object({ path: UnicodeText, verdict: Verdict, why: UnicodeText });
+export type CarryLine = z.infer<typeof CarryLine>;
+
+/** How many paths after the first ones got one verdict. */
+export const VerdictCount = z.object({ verdict: Verdict, paths: count });
+export type VerdictCount = z.infer<typeof VerdictCount>;
+
+/** Which decision a carry event reports: who decides, and what follows from it; a closed set. */
+export const CarryFor = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("move"), target: NodeId }),
+  z.object({ kind: z.literal("pull") }),
+  z.object({ kind: z.literal("restore") }),
+]);
+export type CarryFor = z.infer<typeof CarryFor>;
+
+/** A group of paths or config keys a capture treated apart: the first named, the rest counted. */
+export const CaptureGroup = z.object({ note: CaptureNote, items: z.array(UnicodeText), more: count });
+export type CaptureGroup = z.infer<typeof CaptureGroup>;
+
+/** Files and bytes written. */
+export const Written = z.object({ files: count, bytes: count });
+export type Written = z.infer<typeof Written>;
+
+/** What a restore wrote by class; without a git bundle, `ignored` counts every file of the workspace. */
+export const RestoredClasses = z.object({
+  git: z.boolean(),
+  tracked: Written,
+  untracked: Written,
+  ignored: Written,
+  harness: Written,
+});
+export type RestoredClasses = z.infer<typeof RestoredClasses>;
 
 export const StealWarning = z.object({
   owner: NodeId,
@@ -302,6 +393,25 @@ const reasonOptions = [
   z.object({ code: z.literal("synced_root"), root: Path, folder: Path }),
   z.object({ code: z.literal("bad_request") }),
   z.object({ code: z.literal("internal") }),
+  z.object({ code: z.literal("carry_refused"), paths: z.array(UnicodeText), more: count }),
+  z.object({ code: z.literal("setup_running"), job: JobId, root: Path, lock: Path }),
+  z.object({
+    code: z.literal("harness_changed_during_move"),
+    job: JobId,
+    checked: Harness,
+    now: Harness,
+    target: NodeId,
+  }),
+  z.object({
+    code: z.literal("harness_changed_during_pull"),
+    job: JobId,
+    holder: NodeId,
+    checked: Harness,
+    now: Harness,
+  }),
+  z.object({ code: z.literal("root_not_a_directory"), job: JobId, root: Path }),
+  z.object({ code: z.literal("plan_overtaken"), job: JobId }),
+  z.object({ code: z.literal("session_moved"), job: JobId }),
 ] as const;
 
 /** Every refusal reason this client knows, read from the schema. */
@@ -328,6 +438,7 @@ export const REASON_KIND: Readonly<Record<KnownReason["code"], RefusalKind>> = {
   unreachable: "unreachable",
   unknown_peer: "unreachable",
   preflight: "needs_force",
+  carry_refused: "needs_force",
   steal_needs_force: "needs_force",
   harness_running: "job_state",
   harness_gone: "job_state",
@@ -339,6 +450,12 @@ export const REASON_KIND: Readonly<Record<KnownReason["code"], RefusalKind>> = {
   unfinished: "job_state",
   no_snapshot: "job_state",
   workspace_occupied: "job_state",
+  setup_running: "job_state",
+  harness_changed_during_move: "job_state",
+  harness_changed_during_pull: "job_state",
+  root_not_a_directory: "job_state",
+  plan_overtaken: "job_state",
+  session_moved: "job_state",
   fork_behind: "failed",
   bad_address: "failed",
   peer: "failed",
@@ -389,6 +506,8 @@ const eventOptions = [
     files: count,
     bytes: count,
     new_objects: count,
+    /** Whether the snapshot holds a git bundle, so `files` counts only the ignored and harness files; absent is false. */
+    git_bundle: optional(z.boolean()),
   }),
   z.object({ kind: z.literal("left_behind"), path: UnicodeText }),
   z.object({ kind: z.literal("no_departure_record"), session: SessionId }),
@@ -418,7 +537,13 @@ const eventOptions = [
   z.object({ kind: z.literal("root_chosen"), root: Path, recorded: optional(Path) }),
   z.object({ kind: z.literal("cache_carried"), path: UnicodeText }),
   z.object({ kind: z.literal("cache_rebuilt"), path: UnicodeText, why: UnicodeText }),
-  z.object({ kind: z.literal("restored"), snapshot: SnapshotId, files: count, bytes: count }),
+  z.object({
+    kind: z.literal("restored"),
+    snapshot: SnapshotId,
+    files: count,
+    bytes: count,
+    classes: optional(RestoredClasses),
+  }),
   z.object({ kind: z.literal("orphan_set_aside"), root: Path, left_at: Epoch, epoch: Epoch, to: Path }),
   z.object({ kind: z.literal("session_restored"), harness: Harness, session: SessionId }),
   z.object({ kind: z.literal("steal_warning"), warning: StealWarning }),
@@ -430,6 +555,27 @@ const eventOptions = [
   z.object({ kind: z.literal("peer_silent"), peer: NodeId, waited_s: count }),
   z.object({ kind: z.literal("left_as_it_was"), error: Refusal }),
   z.object({ kind: z.literal("frozen"), peer: NodeId, epoch: Epoch }),
+  z.object({
+    kind: z.literal("session_never_started"),
+    harness: Harness,
+    session: SessionId,
+    kept: optional(HarnessSession),
+  }),
+  z.object({ kind: z.literal("capture_report"), groups: z.array(CaptureGroup) }),
+  z.object({
+    kind: z.literal("carry_decided"),
+    context: CarryFor,
+    snapshot: SnapshotId,
+    paths: z.array(CarryLine),
+    more: z.array(VerdictCount),
+  }),
+  z.object({ kind: z.literal("no_session_captured"), snapshot: SnapshotId }),
+  z.object({ kind: z.literal("carried_by_force"), paths: z.array(UnicodeText), more: count }),
+  z.object({ kind: z.literal("known_writer_unknown"), owner: NodeId, error: Refusal }),
+  z.object({ kind: z.literal("known_writer_unreadable"), owner: NodeId, text: UnicodeText, error: UnicodeText }),
+  z.object({ kind: z.literal("abort_not_told"), holder: NodeId, error: Refusal }),
+  z.object({ kind: z.literal("peer_not_asked"), peer: NodeId }),
+  z.object({ kind: z.literal("live_workspace_gone"), root: Path }),
 ] as const;
 
 /** Every event kind this client knows, read from the schema. */
@@ -480,13 +626,24 @@ export type WorkspaceState = z.infer<typeof WorkspaceState>;
 export const Workspace = z.object({ root: Path, state: WorkspaceState });
 export type Workspace = z.infer<typeof Workspace>;
 
-export const SnapshotState = z.object({ id: SnapshotId, suspended: z.boolean() });
+/** Whether a snapshot carries a harness session (gate finding F9); a closed set. */
+export const SnapshotSession = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("captured") }),
+  z.object({ kind: z.literal("not_captured") }),
+  /** The node could not read the snapshot's manifest; `error` is why, in its words. */
+  z.object({ kind: z.literal("unreadable"), error: UnicodeText }),
+]);
+export type SnapshotSession = z.infer<typeof SnapshotSession>;
+
+export const SnapshotState = z.object({ id: SnapshotId, suspended: z.boolean(), session: optional(SnapshotSession) });
 export type SnapshotState = z.infer<typeof SnapshotState>;
 
 export const Process = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("not_running") }),
   z.object({ kind: z.literal("running"), pid: Pid, epoch: Epoch }),
   z.object({ kind: z.literal("group_remains"), pid: Pid }),
+  /** A process leads the harness's group and its start time could not be read, so whether it is the harness is not known. */
+  z.object({ kind: z.literal("unconfirmed"), pid: Pid }),
   /** The node's record of the harness could not be read; `error` is why, in its words. */
   z.object({ kind: z.literal("unreadable"), error: UnicodeText }),
 ]);
@@ -531,9 +688,30 @@ export type ClosedJob = z.infer<typeof ClosedJob>;
 export const Fact = z.object({ name: UnicodeText, value: UnicodeText });
 export type Fact = z.infer<typeof Fact>;
 
+/**
+ * What a peer would do with each ignored path of a job's latest snapshot,
+ * as `doctor` reports it before a move; without a snapshot, a move
+ * decides each path once it has suspended the job.
+ */
+export const CarryReport = z.object({
+  snapshot: optional(SnapshotId),
+  paths: z.array(CarryLine),
+  more: z.array(VerdictCount),
+  /** The first paths the peer can neither use nor make again, which stop a move unless it is forced. */
+  refused: z.array(UnicodeText),
+  refused_more: count,
+  session_captured: z.boolean(),
+});
+export type CarryReport = z.infer<typeof CarryReport>;
+
 export const DoctorReport = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("facts"), facts: z.array(Fact) }),
-  z.object({ kind: z.literal("compared"), peer: NodeId, rows: z.array(PreflightRow) }),
+  z.object({
+    kind: z.literal("compared"),
+    peer: NodeId,
+    rows: z.array(PreflightRow),
+    carry: optional(CarryReport),
+  }),
 ]);
 export type DoctorReport = z.infer<typeof DoctorReport>;
 
@@ -678,6 +856,10 @@ export const Request = z.discriminatedUnion("op", [
     pid: Pid,
     harness: RequestHarness,
     session: optional(SessionId),
+    /** The session the plan continued; sent only to a node that lists `harness_started.planned`. */
+    planned: optional(SessionId),
+    /** The version the launch asked of the harness; sent only to a node that lists `harness_started.version`. */
+    version: optional(HarnessVersion),
   }),
   z.object({
     op: z.literal("harness_session"),
@@ -688,6 +870,14 @@ export const Request = z.discriminatedUnion("op", [
     session: SessionId,
   }),
   z.object({ op: z.literal("harness_exited"), job: JobId, pid: Pid }),
+  z.object({
+    op: z.literal("launch_check"),
+    job: JobId,
+    epoch: Epoch,
+    head: RecordHash,
+    harness: RequestHarness,
+    session: optional(SessionId),
+  }),
 ]);
 export type Request = z.infer<typeof Request>;
 export type RequestOf<K extends Op> = Extract<Request, { op: K }>;
@@ -711,11 +901,17 @@ export type HarnessConfig = z.infer<typeof HarnessConfig>;
 const runPlan = {
   job: JobId,
   epoch: Epoch,
+  /** The ledger head the plan was made at, which a launch sends back in `launch_check`. */
+  head: RecordHash,
   root: Path,
   harness: Harness,
   session: optional(SessionId),
+  /** The newest harness version known to have written the session, which a resume must not go below. */
+  known_writer: optional(HarnessVersion),
   goal: UnicodeText,
   harness_config: nullAsAbsent(HarnessConfig.default(() => ({ acp: {} }))),
+  /** The home the node captures and restores harness state under; a launch under another home is refused. */
+  home: Path,
 };
 const lease = { owner: NodeId, epoch: Epoch };
 
@@ -723,10 +919,17 @@ const lease = { owner: NodeId, epoch: Epoch };
 export const Reply = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("node_id"), node: NodeId, listen: SocketAddr }),
   z.object({ kind: z.literal("node_add"), node: NodeId, addr: optional(UnicodeText) }),
-  z.object({ kind: z.literal("node_list"), peers: z.array(Peer) }),
+  /** `left_out` counts the first peers left out so the rest fit in one answer; absent when none is. */
+  z.object({ kind: z.literal("node_list"), peers: z.array(Peer), left_out: optional(count) }),
   z.object({ kind: z.literal("node_ping"), node: NodeId, rtt_ms: count, wire: Wire, clock_skew_ms: signedCount }),
   z.object({ kind: z.literal("job_new"), job: JobId, root: Path, repo: Path, harness: Harness, epoch: Epoch }),
-  z.object({ kind: z.literal("job_list"), jobs: z.array(JobSummary), closed: z.array(ClosedJob) }),
+  /** `left_out` counts the oldest jobs left out so the rest fit in one answer; absent when none is. */
+  z.object({
+    kind: z.literal("job_list"),
+    jobs: z.array(JobSummary),
+    closed: z.array(ClosedJob),
+    left_out: optional(count),
+  }),
   z.object({
     kind: z.literal("job_status"),
     job: JobId,
@@ -754,6 +957,7 @@ export const Reply = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("harness_started"), epoch: Epoch, harness: Harness, pid: Pid }),
   z.object({ kind: z.literal("harness_session"), harness: Harness, session: SessionId }),
   z.object({ kind: z.literal("harness_exited") }),
+  z.object({ kind: z.literal("launch_check") }),
 ]);
 export type Reply = z.infer<typeof Reply>;
 export type ReplyTo<K extends Op> = Extract<Reply, { kind: K }>;
@@ -812,14 +1016,34 @@ export function isReplyTo<K extends Op>(reply: Reply, op: K): reply is ReplyTo<K
   return reply.kind === op;
 }
 
+/** The optional request fields a node lists as `<op>.<field>` once it applies them, as Rust's `Request::FIELDS`. */
+export const REQUEST_FIELDS = ["harness_started.planned", "harness_started.version"] as const;
+
+/**
+ * Every capability a node of this api version lists in its welcome, in
+ * order: its ops, then the optional request fields it applies, then the
+ * roots of a client's environment, as Rust's `capabilities()`.
+ */
+export const CAPABILITIES: readonly string[] = [...OPS, ...REQUEST_FIELDS, ...ROOT_CAPABILITIES];
+
 /**
  * The capabilities, beyond its op, a node must list for `request` to mean
  * what it says, as Rust's `Request::needs()`: with an environment, one for
- * every root this client knows, set or not. A root left unset must be
- * removed from the tool's environment, never the daemon's own, and a node
- * that does not know the root would leave the daemon's value in place.
+ * every root this client knows, set or not, and for `harness_started`, one
+ * for each optional field it sends. A root left unset must be removed from
+ * the tool's environment, never the daemon's own, and a node that does not
+ * know the root would leave the daemon's value in place.
  */
 export function capabilitiesNeeded(request: Request): readonly string[] {
   const env = "env" in request ? request.env : undefined;
-  return env === undefined ? [] : ROOT_CAPABILITIES;
+  const needs: string[] = env === undefined ? [] : [...ROOT_CAPABILITIES];
+  if (request.op === "harness_started") {
+    if (request.planned !== undefined) {
+      needs.push(REQUEST_FIELDS[0]);
+    }
+    if (request.version !== undefined) {
+      needs.push(REQUEST_FIELDS[1]);
+    }
+  }
+  return needs;
 }
