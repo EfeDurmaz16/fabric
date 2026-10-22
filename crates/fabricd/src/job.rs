@@ -62,16 +62,31 @@ impl Job {
     /// The marker is written before the ledger: a crash between the two
     /// leaves a marker with no ledger, which start-up skips as no job, and
     /// never an owned ledger with no marker, which no command could run,
-    /// suspend or restore.
+    /// suspend or restore. `id` is fresh, so a failure removes the job's
+    /// directory with whatever it wrote: a ledger left there after the
+    /// derived manifest failed would load at the next start as a job whose
+    /// workspace the caller has deleted and whose id it never printed.
     pub fn create_owned(
         id: JobId,
         dir: JobDir,
         created: &Record,
         marker: &Marker,
     ) -> Result<Self, NodeError> {
-        crate::durable::create_dir(dir.dir()).map_err(|e| NodeError::io(dir.dir(), e))?;
-        local::write(&dir.marker(), marker)?;
-        Self::create(id, dir, created)
+        let path = dir.dir().to_owned();
+        let made = crate::durable::create_dir(&path)
+            .map_err(|e| NodeError::io(&path, e))
+            .and_then(|()| Ok(local::write(&dir.marker(), marker)?))
+            .and_then(|()| Self::create(id, dir, created));
+        if made.is_err() {
+            match fs::remove_dir_all(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "a failed job create left its directory");
+                }
+            }
+        }
+        made
     }
 
     /// Opens a job this node held before.
@@ -335,8 +350,41 @@ mod tests {
         let failed = Job::create_owned(id, state.job(id), &created, &marker);
         assert!(failed.is_err(), "{failed:?}");
         assert!(!state.job(id).ledger().exists());
-        fs::remove_dir(state.job(id).marker()).unwrap();
         let job = Job::create_owned(id, state.job(id), &created, &marker).unwrap();
         assert_eq!(job.marker().unwrap(), Some(marker));
+    }
+
+    /// The ledger can be durable when the derived manifest beside it fails
+    /// to write, as on a full disk. The job's id was never printed and its
+    /// workspace is gone, so the create must not leave that ledger for the
+    /// next start to load as an owned job nothing can run.
+    #[test]
+    fn an_owned_job_whose_manifest_fails_leaves_no_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::resolve(Some(dir.path().as_os_str()), dir.path()).unwrap();
+        let id = JobId::from_bytes([1; 16]);
+        let created = Ledger::created(
+            id,
+            "goal".into(),
+            HarnessKind::Codex,
+            NodeId::from_bytes([3; 32]),
+            EventId::from_bytes([4; 16]),
+            1,
+        )
+        .unwrap();
+        let marker = Marker {
+            root: dir.path().join("work"),
+            state: MarkerState::Live,
+            epoch: fabric_core::id::Epoch::FIRST,
+        };
+        // A directory where the manifest goes makes its write fail after
+        // the ledger is written.
+        fs::create_dir_all(state.job(id).manifest().join("in-the-way")).unwrap();
+        let failed = Job::create_owned(id, state.job(id), &created, &marker);
+        assert!(failed.is_err(), "{failed:?}");
+        assert!(
+            !state.job(id).ledger().exists(),
+            "the ledger stayed without its job"
+        );
     }
 }
