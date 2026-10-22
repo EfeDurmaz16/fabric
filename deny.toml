@@ -1,0 +1,33 @@
+# cargo-deny policy for the whole dependency graph.
+# Reference: https://embarkstudios.github.io/cargo-deny/
+# Fields not set here keep the cargo-deny 0.20 defaults.
+
+[advisories]
+# Vulnerability advisories always fail the check. These make the rest fail too.
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+
+[licenses]
+# This list is the policy, not an inventory, so it may name licenses that no
+# current dependency uses.
+allow = [
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MIT",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Zlib",
+]
+unused-allowed-license = "allow"
+
+[bans]
+wildcards = "deny"
+# Path dependencies between crates with publish = false may omit a version.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
