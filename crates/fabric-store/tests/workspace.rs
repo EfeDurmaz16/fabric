@@ -1303,6 +1303,44 @@ fn a_directory_capture_cannot_read_is_left_behind_and_named() {
     assert_eq!(report.unreadable, vec![RelPath::parse("pgdata").unwrap()]);
 }
 
+/// A cache git does not ignore, as a `node_modules` an agent installed
+/// before anyone wrote a `.gitignore`, travels in `W` as an ignored cache
+/// travels in the files: whole, with what only the full secret list names,
+/// such as a package's test key. Otherwise the target holds a cache with a
+/// hole that its sentinel calls whole. A secret the cache list names, and
+/// one outside any cache, still stay behind.
+#[test]
+fn a_cache_git_does_not_ignore_travels_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    fs::create_dir_all(root.join("node_modules/pkg/test")).unwrap();
+    fs::write(root.join("node_modules/pkg/index.js"), "1;\n").unwrap();
+    fs::write(root.join("node_modules/pkg/test/fixture.pem"), "fixture\n").unwrap();
+    fs::write(root.join("node_modules/pkg/.env"), "TOKEN=1\n").unwrap();
+    fs::write(root.join("server.pem"), "key\n").unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, report } = capture(&store, &request(&root, &policy, None)).unwrap();
+    assert_eq!(
+        report.denied_untracked,
+        vec![
+            RelPath::parse("node_modules/pkg/.env").unwrap(),
+            RelPath::parse("server.pem").unwrap(),
+        ]
+    );
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    assert_eq!(
+        fs::read_to_string(target.join("node_modules/pkg/test/fixture.pem")).unwrap(),
+        "fixture\n"
+    );
+    assert!(target.join("node_modules/pkg/index.js").is_file());
+    assert!(!target.join("node_modules/pkg/.env").exists());
+    assert!(!target.join("server.pem").exists());
+}
+
 #[test]
 fn a_plain_directory_and_harness_state_round_trip_exactly() {
     let dir = tempfile::tempdir().unwrap();

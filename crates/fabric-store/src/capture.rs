@@ -1601,16 +1601,18 @@ impl GitCapture<'_> {
     /// is never in `W`. A negation in the repository's own ignore files can
     /// override that, so the private index is then listed and every path
     /// that is not tracked and that `leave_out` names is removed before the
-    /// tree is written. Then `keep_worktree_bytes` puts back the bytes
-    /// git's own conversions changed. The removed paths are returned, and
-    /// the paths a clean filter changed.
+    /// tree is written. Every untracked path in `carried` that `add -A`
+    /// skipped is then added: one under a cache that only the full secret
+    /// list names. Then `keep_worktree_bytes` puts back the bytes git's own
+    /// conversions changed. The removed paths are returned, and the paths a
+    /// clean filter changed.
     fn worktree_commit(
         &self,
         index_tree: &str,
         head: Option<&GitOid>,
         index_commit: &GitOid,
         excludes: &str,
-        tracked: &BTreeSet<RelPath>,
+        (tracked, carried): (&BTreeSet<RelPath>, &BTreeSet<&RelPath>),
         leave_out: &dyn Fn(&RelPath) -> bool,
     ) -> Result<(GitOid, Vec<RelPath>, Vec<RelPath>), CaptureError> {
         let index = TempFile::in_dir(&self.scratch);
@@ -1623,12 +1625,31 @@ impl GitCapture<'_> {
         self.git
             .run_env(&["-c", &excludes_flag, "add", "-A", "--"], &env)?;
         let mut removed = Vec::new();
+        let mut added = HashSet::new();
         let listing = self.git.run_env(&["ls-files", "-z"], &env)?;
         for record in Git::records(&listing) {
             let rel = rel_path(Git::text("index path", record)?)?;
             if !tracked.contains(&rel) && leave_out(&rel) {
                 removed.push(rel);
+            } else {
+                added.insert(rel);
             }
+        }
+        // The excludes hold the full secret list, so `add -A` skipped a
+        // path under a cache that only that list names; `carried` keeps it.
+        // `--remove` drops a path that vanished since the listing, which
+        // the check after the capture then names.
+        let mut input = Vec::new();
+        for rel in carried.iter().filter(|rel| !added.contains(**rel)) {
+            input.extend_from_slice(rel.as_str().as_bytes());
+            input.push(0);
+        }
+        if !input.is_empty() {
+            self.git.run_stdin_env(
+                &["update-index", "--add", "--remove", "-z", "--stdin"],
+                &env,
+                &input,
+            )?;
         }
         if !removed.is_empty() {
             let mut input = Vec::new();
@@ -2446,22 +2467,25 @@ fn chain_depth(store: &Store, manifest: &SnapshotManifest) -> Result<u32, Captur
     Ok(depth)
 }
 
-fn capture_git(
+/// Returns the untracked paths `W` leaves out, each named in the report,
+/// and refuses one above `LARGE_UNTRACKED_LIMIT` that `W` would hold, unless
+/// the request allows it.
+///
+/// An untracked path under a cache is judged as an ignored one is, by the
+/// cache's narrower list: a cache git does not ignore, such as a
+/// `node_modules` installed before a `.gitignore` was written, travels in
+/// `W` whole, or the target would hold it with holes its sentinel calls
+/// whole.
+fn untracked_left_out(
     capturer: &mut Capturer<'_>,
-    repo: &GitCapture<'_>,
-    parent: Option<(SnapshotId, &SnapshotManifest)>,
-) -> Result<(GitState, GitSeen), CaptureError> {
+    untracked: &[RelPath],
+) -> Result<BTreeSet<RelPath>, CaptureError> {
     let req = capturer.req;
-    let policy = req.policy;
-    let (untracked, nested) = repo.untracked()?;
-    capturer
-        .report
-        .nested_repositories
-        .extend(nested.iter().cloned());
-    let mut too_large = Vec::new();
+    let mut carried = carried_by(req.policy, req.root);
     let mut left_out = BTreeSet::new();
-    for rel in &untracked {
-        if policy.denies_anywhere(rel) {
+    let mut too_large = Vec::new();
+    for rel in untracked {
+        if !carried(rel) {
             capturer.report.denied_untracked.push(rel.clone());
             left_out.insert(rel.clone());
             continue;
@@ -2475,6 +2499,22 @@ fn capture_git(
     if !too_large.is_empty() && !req.allow_large_untracked {
         return Err(CaptureError::UntrackedTooLarge { paths: too_large });
     }
+    Ok(left_out)
+}
+
+fn capture_git(
+    capturer: &mut Capturer<'_>,
+    repo: &GitCapture<'_>,
+    parent: Option<(SnapshotId, &SnapshotManifest)>,
+) -> Result<(GitState, GitSeen), CaptureError> {
+    let req = capturer.req;
+    let policy = req.policy;
+    let (untracked, nested) = repo.untracked()?;
+    capturer
+        .report
+        .nested_repositories
+        .extend(nested.iter().cloned());
+    let left_out = untracked_left_out(capturer, &untracked)?;
     let tracked: BTreeSet<RelPath> = repo.tracked()?.into_iter().collect();
     for rel in &tracked {
         if policy.denies_anywhere(rel) {
@@ -2495,13 +2535,17 @@ fn capture_git(
     }
     let stamped: Vec<RelPath> = tracked.iter().chain(untracked.iter()).cloned().collect();
     let before = stamps(req.root, stamped.iter())?;
+    let in_w: BTreeSet<&RelPath> = untracked
+        .iter()
+        .filter(|rel| !left_out.contains(*rel))
+        .collect();
     let (worktree_commit, removed, filtered) = repo.worktree_commit(
         &index_tree,
         head_commit.as_ref(),
         &index_commit,
         &excludes,
-        &tracked,
-        &|rel| policy.denies_anywhere(rel) || under_nested(rel),
+        (&tracked, &in_w),
+        &|rel| !in_w.contains(rel) || under_nested(rel),
     )?;
     capturer.report.filtered = filtered;
     let denied = &mut capturer.report.denied_untracked;
