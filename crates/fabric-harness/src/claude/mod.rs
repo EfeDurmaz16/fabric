@@ -14,6 +14,9 @@
 //! anything is written. A capture or restore is refused while a `claude`
 //! process registered for the same session is alive, because
 //! `place::place_all` cannot protect a file that is being appended to.
+//! Claude takes no lock, so one that starts after that check is caught
+//! only by its writes: restore checks each file again just before it
+//! replaces it and stops at one that changed (`StateChanged`).
 //! When the registry cannot answer (it is missing, a record does not
 //! parse, or the installed Claude is older than the version it was read
 //! on), any running `claude` refuses them instead.

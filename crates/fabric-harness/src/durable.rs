@@ -199,6 +199,21 @@ pub(crate) fn write_atomic_with<F>(path: &Path, produce: F) -> Result<Written, H
 where
     F: FnOnce(&mut dyn Write) -> Result<(), HarnessError>,
 {
+    write_atomic_checked(path, produce, || Ok(()))
+}
+
+/// `write_atomic_with`, running `check` once the temporary file is
+/// written and synced and just before the rename; an error from it leaves
+/// `path` as it was and removes the temporary file.
+pub(crate) fn write_atomic_checked<F, C>(
+    path: &Path,
+    produce: F,
+    check: C,
+) -> Result<Written, HarnessError>
+where
+    F: FnOnce(&mut dyn Write) -> Result<(), HarnessError>,
+    C: FnOnce() -> Result<(), HarnessError>,
+{
     create_dirs_durable(path.parent().unwrap_or(Path::new(".")))?;
     let (tmp, file) = create_temp(path)?;
     let result = (|| {
@@ -210,6 +225,7 @@ where
         let (file, written) = hashing.finish();
         file.sync_all()
             .map_err(|e| HarnessError::io(IoOp::Write, &tmp, e))?;
+        check()?;
         commit(&tmp, path)?;
         Ok(written)
     })();
