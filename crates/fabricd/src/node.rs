@@ -301,15 +301,44 @@ impl Node {
             {
                 opened.remove(&(peer, side));
             }
-            drop(opened);
-            let mut sessions = lock(&node.sessions);
-            if sessions
-                .get(&peer)
-                .is_some_and(|kept| Arc::ptr_eq(kept, &session))
-            {
+            node.keep_another(&opened, peer, &session);
+        });
+    }
+
+    /// Drops `session` as the one kept for calls to `peer`, and keeps in its
+    /// place the session the other side opened, when one is live.
+    ///
+    /// Two nodes that dialed each other at once hold one session each way,
+    /// and only the one registered last is kept for calls. Without this, the
+    /// end of that one would leave the other live but out of reach: the
+    /// next call would dial again, and that dial would close the hidden one
+    /// a call may still be using. The caller holds `opened`, so a session
+    /// that ends meanwhile is never kept.
+    fn keep_another(
+        &self,
+        opened: &HashMap<(NodeId, Side), Arc<Session>>,
+        peer: NodeId,
+        session: &Arc<Session>,
+    ) {
+        let mut sessions = lock(&self.sessions);
+        if !sessions
+            .get(&peer)
+            .is_some_and(|kept| Arc::ptr_eq(kept, session))
+        {
+            return;
+        }
+        let other = [Side::Dialed, Side::Accepted]
+            .into_iter()
+            .filter_map(|side| opened.get(&(peer, side)))
+            .find(|other| !Arc::ptr_eq(other, session));
+        match other {
+            Some(other) => {
+                sessions.insert(peer, Arc::clone(other));
+            }
+            None => {
                 sessions.remove(&peer);
             }
-        });
+        }
     }
 
     /// A live session with `peer`: the one already open, or a new dial.
@@ -334,15 +363,12 @@ impl Node {
         lock(&self.sessions).get(&peer).cloned()
     }
 
-    /// Drops the kept session with `peer` after a call on it failed at the transport.
+    /// Drops the kept session with `peer` after a call on it failed at the
+    /// transport, and keeps the session the other side opened, if any.
     pub(crate) fn forget(&self, peer: NodeId, session: &Arc<Session>) {
-        let mut sessions = lock(&self.sessions);
-        if sessions
-            .get(&peer)
-            .is_some_and(|kept| Arc::ptr_eq(kept, session))
-        {
-            sessions.remove(&peer);
-        }
+        let opened = lock(&self.opened);
+        self.keep_another(&opened, peer, session);
+        drop(opened);
         session.close();
     }
 
@@ -694,6 +720,49 @@ mod tests {
         second.ping(deadline).await.unwrap();
         let pinged = first.ping(deadline).await;
         assert!(pinged.is_err(), "the first session still serves");
+    }
+
+    /// Two nodes that dial each other at once hold a session each way, and
+    /// only the one registered last is kept for calls. When that one ends,
+    /// the other must be kept in its place: left out of reach, the next
+    /// call would dial again and close it under a call still using it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_session_each_way_survives_the_other_ending() {
+        let (_dir_a, a) = crate::ops::tests::node();
+        let (_dir_b, b) = crate::ops::tests::node();
+        crate::ops::tests::paired(&a, &b).await;
+        let dialed = a.session(b.id).await.unwrap();
+        let addr: fabric_net::peers::HostPort =
+            a.local_addr().unwrap().to_string().parse().unwrap();
+        // A session b opens without keeping it, so a holds one each way.
+        let accepted = Session::connect(
+            Arc::from(
+                b.endpoint
+                    .dial_any(a.id, std::slice::from_ref(&addr))
+                    .await
+                    .unwrap()
+                    .into_connection(),
+            ),
+            b.id,
+            b.version.clone(),
+            HELLO_DEADLINE,
+        )
+        .await
+        .unwrap();
+        // a answers on a session only after it registered it.
+        accepted.ping(Duration::from_secs(5)).await.unwrap();
+        assert!(!Arc::ptr_eq(&a.open_session(b.id).unwrap(), &dialed));
+        accepted.close();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while lock(&a.opened).contains_key(&(b.id, Side::Accepted)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the session never ended"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let kept = a.open_session(b.id).expect("no session kept");
+        assert!(Arc::ptr_eq(&kept, &dialed));
     }
 
     fn mode(path: &std::path::Path) -> u32 {
