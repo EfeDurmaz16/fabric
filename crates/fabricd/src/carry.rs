@@ -660,6 +660,44 @@ mod tests {
         assert!(!decision.refuses());
     }
 
+    /// A Node or Python key names no platform, so equal keys can match
+    /// across platforms, while a `node_modules` or a venv holds binaries
+    /// built for the platform it was installed on. A tree something on
+    /// the target can make again never crosses; it is rebuilt there, and
+    /// build output is left behind.
+    #[test]
+    fn a_cache_built_on_another_platform_is_not_carried() {
+        let target = NodeFacts::from_pairs([
+            (name::OS, "linux"),
+            (name::ARCH, "x86_64"),
+            (name::NODE, "v22.23.2"),
+            (name::NPM, "10.9.2"),
+            (name::PYTHON, "Python 3.12.1"),
+            (name::PYTHON_HOME, "/opt/py312"),
+            (name::UV, "uv 0.9.5"),
+        ]);
+        let venv = entry(
+            ".venv",
+            CacheClass::Deps,
+            CarryKey::Python {
+                python_version: "Python 3.12.1".to_owned(),
+                python_home: fabric_core::path::AbsPath::parse("/opt/py312").unwrap(),
+            },
+            Remake::Setup(vec![step("uv", &["sync", "--frozen"])]),
+        );
+        for tree in [npm_tree(), venv] {
+            assert!(tree.key.matches(&target.key_like(&tree.key)), "{tree:?}");
+            let decision = decide(&tree, &macos(), &target);
+            assert!(
+                matches!(decision, CarryDecision::Rebuild { .. }),
+                "{decision:?}"
+            );
+            assert!(!decision.writes());
+        }
+        assert!(!decide(&dist(), &macos(), &target).writes());
+        assert!(decide(&npm_tree(), &macos(), &pro()).writes());
+    }
+
     /// A venv nothing can make again still crosses, since leaving it out
     /// would lose it, but its interpreter link and compiled modules are
     /// for the source's platform, so the line says so even where the
