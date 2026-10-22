@@ -422,6 +422,11 @@ impl Store {
     }
 
     /// Assembles, verifies and decodes the manifest of a snapshot.
+    ///
+    /// Assembly stops at the recorded length: a catalog that lists more
+    /// manifest objects than that length holds is a mismatch, found before
+    /// the extra objects are read, so a damaged catalog never makes this
+    /// hold more than the recorded length and one object.
     pub fn manifest(&self, id: SnapshotId) -> Result<SnapshotManifest, StoreError> {
         let row = self.snapshot(id)?;
         let len = usize::try_from(row.manifest_len).unwrap_or(usize::MAX);
@@ -430,7 +435,14 @@ impl Store {
         }
         let mut bytes = Vec::with_capacity(len);
         for chunk in self.catalog.snapshot_chunks(id, Role::Manifest)? {
-            bytes.extend_from_slice(&self.objects.read(chunk.id)?);
+            if bytes.len() >= len {
+                return Err(StoreError::ManifestMismatch(id));
+            }
+            let part = self.objects.read(chunk.id)?;
+            if part.len() > len - bytes.len() {
+                return Err(StoreError::ManifestMismatch(id));
+            }
+            bytes.extend_from_slice(&part);
         }
         if bytes.len() as u64 != row.manifest_len || SnapshotId::of(&bytes) != id {
             return Err(StoreError::ManifestMismatch(id));

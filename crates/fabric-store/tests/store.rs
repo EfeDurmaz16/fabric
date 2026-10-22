@@ -429,6 +429,39 @@ fn check_at_hash_depth_sees_a_manifest_that_does_not_assemble() {
     assert!(!report.is_clean());
 }
 
+/// A row past the recorded length is a mismatch found before its object is read.
+#[test]
+fn manifest_assembly_stops_at_the_recorded_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::create(dir.path(), params().unwrap()).unwrap();
+    let entry = file_entry(&store, "f", b"listed").unwrap();
+    let id = store.publish(&manifest(vec![entry], 1).unwrap()).unwrap();
+    drop(store);
+
+    // The extra row names an object with a catalog row and no file, so
+    // reading it would fail with `Missing` instead of the mismatch.
+    let ghost = ChunkId::of(b"never stored");
+    let conn = rusqlite::Connection::open(dir.path().join("catalog.sqlite")).unwrap();
+    conn.execute(
+        "INSERT INTO chunks (id, stored_len, refcount) VALUES (?1, 1, 1)",
+        [ghost.to_bytes()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO snapshot_chunks (snapshot_id, role, ordinal, chunk_id) VALUES (?1, 0, 1000, ?2)",
+        rusqlite::params![id.to_bytes(), ghost.to_bytes()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = Store::open(dir.path()).unwrap();
+    let err = store.manifest(id).unwrap_err();
+    assert!(
+        matches!(err, StoreError::ManifestMismatch(m) if m == id),
+        "{err}"
+    );
+}
+
 #[test]
 fn check_at_hash_depth_sees_a_row_that_disagrees_with_its_manifest() {
     for column in ["created_at", "parent", "bundle_base"] {
