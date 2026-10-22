@@ -2042,6 +2042,30 @@ impl Node {
                 ));
                 None
             }
+            // A root deleted or moved away while the marker says live
+            // holds nothing to continue, and a directory made there later
+            // would be launched in as if it were the workspace. So the
+            // latest snapshot is restored, once no harness of the tenure
+            // still runs in the old tree.
+            Some(Marker {
+                root,
+                state: MarkerState::Live,
+                ..
+            }) if is_missing(&root)? => {
+                if let Some(record) = job.harness_record()?
+                    && record.liveness().await != Liveness::Gone
+                {
+                    return Err(NodeError::AlreadyRunningHarness {
+                        job: job.id(),
+                        pid: record.pid.get(),
+                    });
+                }
+                out.say(format!(
+                    "the workspace at {} is gone; restoring the latest snapshot, and work since it that no suspend captured is lost",
+                    root.display()
+                ));
+                None
+            }
             marker => marker,
         })
     }
@@ -3724,6 +3748,31 @@ pub(crate) mod tests {
             job.lock().await.view(a.id),
             LeaseView::Owner(token) if token.epoch == Epoch::FIRST
         ));
+    }
+
+    /// A workspace deleted while its marker says live holds nothing to
+    /// continue. The next resume must restore the latest snapshot, not
+    /// hand out a root that does not exist, where a directory made later
+    /// would be launched in as the workspace.
+    #[tokio::test]
+    async fn a_live_workspace_whose_root_is_gone_is_restored() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let plan = node.job_run(id, &mut Out::default()).await.unwrap();
+        std::fs::remove_dir_all(&plan.root).unwrap();
+        let out = &mut Out::default();
+        let resumed = node
+            .job_resume(id, None, None, false, &path, out)
+            .await
+            .unwrap();
+        assert_eq!(resumed.root, plan.root);
+        assert!(
+            resumed.root.join(".git").is_dir(),
+            "the root was not restored: {:?}",
+            out.lines
+        );
     }
 
     /// A `state_dir` that harness.toml names but capture and restore refuse,
