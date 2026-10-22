@@ -2160,8 +2160,9 @@ fn continued(
 
 /// The newest version of the job's harness known to have written its
 /// session, from the session record this node holds, when that record is
-/// of the job's own harness.
-fn session_floor(job: &Job) -> Result<Option<HarnessVersion>, NodeError> {
+/// of the job's own harness. Only the owner's record is current: a node
+/// the job left keeps the one from its own tenure (`Node::owners_floor`).
+pub(crate) fn session_floor(job: &Job) -> Result<Option<HarnessVersion>, NodeError> {
     Ok(job
         .session()?
         .filter(|record| &record.harness == job.harness())

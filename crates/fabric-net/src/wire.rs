@@ -25,7 +25,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// The protocol version both sides must speak; a mismatch ends the session at `Hello`.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// The most chunk ids one `WantChunks` request may name.
 pub const MAX_CHUNK_BATCH: usize = 256;
@@ -508,6 +508,9 @@ pub enum JobRequest {
         /// The move.
         move_id: MoveId,
     },
+    /// Asks the owner for the newest version of the job's harness known to
+    /// have written its session (ADR 0006); answered with `KnownWriter`.
+    KnownWriter,
 }
 
 /// A `MoveOffer` without its job id, which the request's fencing token carries.
@@ -690,6 +693,13 @@ pub enum JobResponse {
         /// The snapshot to push.
         snapshot: SnapshotId,
     },
+    /// The newest version of the job's harness known to have written its
+    /// session, as the owner records it; `None` from a node that does not
+    /// own the job or knows none.
+    KnownWriter {
+        /// The version, as the harness prints it.
+        version: Option<VersionText>,
+    },
 }
 
 impl JobResponse {
@@ -705,6 +715,7 @@ impl JobResponse {
             JobResponse::MoveDecision { .. } => "move decision",
             JobResponse::MoveUndecided { .. } => "move undecided",
             JobResponse::SnapshotIncomplete { .. } => "snapshot incomplete",
+            JobResponse::KnownWriter { .. } => "known writer",
         }
     }
 }
@@ -793,6 +804,16 @@ pub enum MoveState {
         /// The move.
         move_id: MoveId,
     },
+}
+
+/// The answer to `KnownWriter`: the newest version of the job's harness
+/// known to have written its session, which only the job's owner holds
+/// a current record of (ADR 0006).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownWriter {
+    /// The version, as the harness prints it; `None` from a node that does
+    /// not own the job or knows none.
+    pub version: Option<VersionText>,
 }
 
 /// One request's answer type and how it sits in the flat `JobResponse`.
@@ -918,6 +939,23 @@ impl JobAnswer for RecordBytes {
     }
 }
 
+impl JobAnswer for KnownWriter {
+    const KIND: &'static str = "known writer";
+
+    fn into_response(self) -> JobResponse {
+        JobResponse::KnownWriter {
+            version: self.version,
+        }
+    }
+
+    fn from_response(response: JobResponse) -> Result<Self, JobResponse> {
+        match response {
+            JobResponse::KnownWriter { version } => Ok(KnownWriter { version }),
+            other => Err(other),
+        }
+    }
+}
+
 /// An epoch verdict answers any per-job request, so it reads back whatever the request.
 impl<T: JobAnswer> JobAnswer for Fenced<T> {
     const KIND: &'static str = T::KIND;
@@ -1034,6 +1072,7 @@ mod tests {
                 )),
             bytes16(MoveId::from_bytes).prop_map(|move_id| JobRequest::MoveStatus { move_id }),
             bytes16(MoveId::from_bytes).prop_map(|move_id| JobRequest::MoveAbort { move_id }),
+            Just(JobRequest::KnownWriter),
         ]
     }
 
@@ -1093,6 +1132,8 @@ mod tests {
             bytes16(MoveId::from_bytes).prop_map(|move_id| JobResponse::MoveUndecided { move_id }),
             bytes32(SnapshotId::from_bytes)
                 .prop_map(|snapshot| JobResponse::SnapshotIncomplete { snapshot }),
+            proptest::option::of(text::<MAX_VERSION_LEN>())
+                .prop_map(|version| JobResponse::KnownWriter { version }),
         ]
     }
 

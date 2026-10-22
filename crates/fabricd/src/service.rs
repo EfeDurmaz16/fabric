@@ -23,8 +23,8 @@ use fabric_core::ledger::{Author, LedgerError};
 use fabric_core::moves::{AbortAnswer, CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
 use fabric_net::rpc::{JobFuture, Service};
 use fabric_net::wire::{
-    Appended, Facts, Fault, FaultText, Fenced, ManifestChunks, MoveRequested, MoveState, Offered,
-    Pulled, RecordBytes, RecordPage,
+    Appended, Facts, Fault, FaultText, Fenced, KnownWriter, ManifestChunks, MoveRequested,
+    MoveState, Offered, Pulled, RecordBytes, RecordPage, VersionText,
 };
 use fabric_store::objects::ObjectError;
 use fabric_store::store::StoreError;
@@ -36,6 +36,7 @@ use crate::faults::{self, Action, Point};
 use crate::job::Job;
 use crate::local::ForkRecord;
 use crate::node::{Node, Out};
+use crate::ops::session_floor;
 use crate::transfer::{fetch_snapshot, is_complete, with_store};
 
 fn internal(err: &impl std::fmt::Display) -> Fault {
@@ -111,6 +112,10 @@ impl Service for Node {
         Box::pin(async move { self.answer_move_abort(peer, token, move_id).await })
     }
 
+    fn known_writer(&self, _peer: NodeId, token: FencingToken) -> JobFuture<'_, KnownWriter> {
+        Box::pin(async move { self.answer_known_writer(token.job_id).await })
+    }
+
     fn manifest(
         &self,
         _peer: NodeId,
@@ -161,6 +166,28 @@ impl Service for Node {
 }
 
 impl Node {
+    /// The known writer of the job's session from this node's session
+    /// record, at any epoch, while this node owns the job: a node the job
+    /// left keeps the record of its own tenure, which the owner may have
+    /// raised since, so it answers none.
+    async fn answer_known_writer(&self, id: JobId) -> Result<Fenced<KnownWriter>, Fault> {
+        let job = self.job(id).await.map_err(|_| Fault::UnknownJob)?;
+        let job = job.lock().await;
+        let owns = matches!(
+            job.view(self.id),
+            LeaseView::Owner(_) | LeaseView::Departing { .. }
+        );
+        let floor = if owns {
+            session_floor(&job).map_err(|e| internal(&e))?
+        } else {
+            None
+        };
+        let version = floor
+            .map(|version| VersionText::new(version.as_str().to_owned()).map_err(|e| internal(&e)))
+            .transpose()?;
+        Ok(Fenced::Answer(KnownWriter { version }))
+    }
+
     async fn answer_move_status(
         &self,
         id: JobId,
