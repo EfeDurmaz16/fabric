@@ -1747,6 +1747,30 @@ fn a_cache_the_target_cannot_use_is_skipped_and_named() {
     assert_eq!(status(&target).unwrap(), status(&root).unwrap());
 }
 
+/// Node follows a link named `*.node` and loads the addon it reaches,
+/// which is built for one ABI, so the cache row counts the link as an
+/// addon. Counted as nothing, a locked tree whose target cannot rebuild
+/// it would travel as plain JavaScript (review of PR #11).
+#[test]
+fn a_native_addon_reached_through_a_link_is_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("plain");
+    fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+    fs::create_dir_all(root.join("prebuilds")).unwrap();
+    fs::write(root.join("node_modules/pkg/index.js"), "x\n").unwrap();
+    fs::write(root.join("prebuilds/pkg-darwin-arm64.bin"), "addon").unwrap();
+    std::os::unix::fs::symlink(
+        "../../prebuilds/pkg-darwin-arm64.bin",
+        root.join("node_modules/pkg/pkg.node"),
+    )
+    .unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    assert_eq!(manifest.caches.len(), 1, "{:?}", manifest.caches);
+    assert_eq!(manifest.caches[0].native_files, 1);
+}
+
 /// A partial cache is written or left out as the caller's carry rule
 /// says, like any other row: fabricd decides the hole once, for doctor,
 /// move and resume, and rebuilds a partial cache a setup step fills while

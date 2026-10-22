@@ -70,7 +70,8 @@ impl CarryKeys for UnmeasuredKeys {
     }
 }
 
-/// True when `path` names a native Node addon, which loads only under the ABI it was built for.
+/// True when `path` names a native Node addon, which loads only under the
+/// ABI it was built for, whether the path is the file or a link to it.
 fn is_native_addon(path: &RelPath) -> bool {
     let name = path.as_str().rsplit('/').next().unwrap_or_default();
     name.len() > ".node".len()
@@ -1012,7 +1013,11 @@ impl Capturer<'_> {
                 Class::Cache(_) | Class::Precious => {
                     if let Some(seen) = seen {
                         seen.carried += 1;
-                        if item.kind == FoundKind::File && is_native_addon(&item.rel) {
+                        // Node loads an addon through a link as it loads the
+                        // file, so a link named `*.node` counts too.
+                        if matches!(item.kind, FoundKind::File | FoundKind::Symlink)
+                            && is_native_addon(&item.rel)
+                        {
                             seen.native += 1;
                         }
                     }
