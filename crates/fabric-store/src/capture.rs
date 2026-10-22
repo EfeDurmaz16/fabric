@@ -1019,22 +1019,7 @@ impl GitCapture<'_> {
                 reason: BusyReason::Conflicts,
             });
         }
-        // `ls-files -v` tags a skip-worktree entry `S` and an
-        // assume-unchanged one in lower case.
-        let entries = self.git.run(&["ls-files", "-v", "-z"])?;
-        for record in Git::records(&entries) {
-            let text = Git::text("index entry", record)?;
-            let (tag, path) = text.split_once(' ').unwrap_or((text, ""));
-            let flag = match tag {
-                "S" | "s" => IndexFlag::SkipWorktree,
-                "h" => IndexFlag::AssumeUnchanged,
-                _ => continue,
-            };
-            return Err(CaptureError::GitIndexFlag {
-                path: rel_path(path)?,
-                flag,
-            });
-        }
+        self.refuse_flagged_entries(&[])?;
         // `--ignore-submodules=none` overrides a `submodule.<name>.ignore`
         // in the config or in .gitmodules, which would hide the local work.
         let status = self.git.run(&[
@@ -1095,6 +1080,34 @@ impl GitCapture<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Refuses a skip-worktree or assume-unchanged entry in the index `env` names, and returns every path in it.
+    fn refuse_flagged_entries(
+        &self,
+        env: &[(&str, &OsStr)],
+    ) -> Result<BTreeSet<String>, CaptureError> {
+        // `ls-files -v` tags a skip-worktree entry `S` and an
+        // assume-unchanged one in lower case.
+        let entries = self.git.run_env(&["ls-files", "-v", "-z"], env)?;
+        let mut paths = BTreeSet::new();
+        for record in Git::records(&entries) {
+            let text = Git::text("index entry", record)?;
+            let (tag, path) = text.split_once(' ').unwrap_or((text, ""));
+            let flag = match tag {
+                "S" | "s" => IndexFlag::SkipWorktree,
+                "h" => IndexFlag::AssumeUnchanged,
+                _ => {
+                    paths.insert(path.to_owned());
+                    continue;
+                }
+            };
+            return Err(CaptureError::GitIndexFlag {
+                path: rel_path(path)?,
+                flag,
+            });
+        }
+        Ok(paths)
     }
 
     /// Lists untracked, not ignored paths, and apart from them the untracked nested repositories.
@@ -1168,6 +1181,11 @@ impl GitCapture<'_> {
     }
 
     /// Copies the real index and builds commit `I` from the copy.
+    ///
+    /// The flags `refuse_bad_states` refused on the real index are checked
+    /// again on the copy `I` is built from, since another git process can
+    /// set one between that probe and the copy. An intent-to-add entry is
+    /// one the copy holds and its written tree leaves out.
     fn index_commit(&self, head: Option<&GitOid>) -> Result<(GitOid, String), CaptureError> {
         let index = self.git.git_path("index")?;
         let lock = index.with_extension("lock");
@@ -1209,7 +1227,20 @@ impl GitCapture<'_> {
             thread::sleep(Duration::from_millis(200));
         }
         let env: [(&str, &OsStr); 1] = [("GIT_INDEX_FILE", copy.path().as_os_str())];
+        let indexed = self.refuse_flagged_entries(&env)?;
         let tree = self.git.run_text_env(&["write-tree"], &env)?;
+        let written = self
+            .git
+            .run(&["ls-tree", "-r", "-z", "--name-only", &tree])?;
+        let mut written: BTreeSet<&[u8]> = Git::records(&written).collect();
+        for path in &indexed {
+            if !written.remove(path.as_bytes()) {
+                return Err(CaptureError::GitIndexFlag {
+                    path: rel_path(path)?,
+                    flag: IndexFlag::IntentToAdd,
+                });
+            }
+        }
         let commit = self.commit_tree(&tree, head, None, "fabric index")?;
         Ok((commit, tree))
     }
@@ -1974,6 +2005,45 @@ mod tests {
         assert!(matches!(
             repo.worktree_mtimes(&w, &before, &mut report),
             Err(CaptureError::WorkspaceChanged { path }) if path.as_str() == "a.txt"
+        ));
+    }
+
+    /// A flag set after `refuse_bad_states` probed the real index is refused on the copy `I` is built from.
+    #[test]
+    fn a_flag_set_after_the_probe_is_refused_on_the_index_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        fs::create_dir(&root).unwrap();
+        let repo = GitCapture {
+            git: Git::new(&root).with_date(1_760_000_000_000),
+            root: &root,
+            job_id: JobId::from_bytes([1; 16]),
+            scratch: dir.path().to_owned(),
+            user_excludes: String::new(),
+            listing_excludes: TempFile::in_dir(dir.path()),
+        };
+        repo.git.run(&["init", "-q", "-b", "main"]).unwrap();
+        fs::write(root.join("a.txt"), "a\n").unwrap();
+        repo.git.run(&["add", "a.txt"]).unwrap();
+        repo.git.run(&["commit", "-q", "-m", "one"]).unwrap();
+        let head = repo.head_commit().unwrap();
+        assert!(repo.index_commit(head.as_ref()).is_ok());
+
+        repo.git
+            .run(&["update-index", "--assume-unchanged", "a.txt"])
+            .unwrap();
+        assert!(matches!(
+            repo.index_commit(head.as_ref()),
+            Err(CaptureError::GitIndexFlag { flag: IndexFlag::AssumeUnchanged, path }) if path.as_str() == "a.txt"
+        ));
+        repo.git
+            .run(&["update-index", "--no-assume-unchanged", "a.txt"])
+            .unwrap();
+        fs::write(root.join("b.txt"), "b\n").unwrap();
+        repo.git.run(&["add", "-N", "b.txt"]).unwrap();
+        assert!(matches!(
+            repo.index_commit(head.as_ref()),
+            Err(CaptureError::GitIndexFlag { flag: IndexFlag::IntentToAdd, path }) if path.as_str() == "b.txt"
         ));
     }
 
