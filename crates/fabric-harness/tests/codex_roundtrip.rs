@@ -20,7 +20,7 @@ use fabric_core::path::AbsPath;
 use fabric_harness::codex::Codex;
 use fabric_harness::codex::overrides::{ApprovalPolicy, CodexOverrides, SandboxMode};
 use fabric_harness::manifest::StateManifest;
-use fabric_harness::{Harness, HarnessError, Launch, SessionId};
+use fabric_harness::{Harness, HarnessError, HarnessVersion, Launch, SessionId};
 
 mod executable;
 use executable::write_executable;
@@ -116,13 +116,19 @@ const LOCKING_VERSION: &str = "0.155.1";
 /// set, the names of its environment there; returns the script and a
 /// `PATH` value that finds it.
 fn fake_codex_reporting(dir: &Path, version: &str) -> (PathBuf, OsString) {
+    fake_codex_answering(dir, &format!("echo \"codex-cli {version}\"; exit 0"))
+}
+
+/// `fake_codex_reporting`, answering `--version` by running the shell text
+/// `answer`.
+fn fake_codex_answering(dir: &Path, answer: &str) -> (PathBuf, OsString) {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let script = bin.join("codex");
     write_executable(
         &script,
         format!(
-            "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"codex-cli {version}\"; exit 0 ;;\n  hold) sleep 60; exit 0 ;;\nesac\n{{ echo \"cwd=$(pwd -P)\"; for a in \"$@\"; do echo \"arg=$a\"; done; }} > \"$FAKE_LOG\"\n[ -z \"$FAKE_ENV_LOG\" ] || /usr/bin/env | cut -d= -f1 > \"$FAKE_ENV_LOG\"\n"
+            "#!/bin/sh\ncase \"$1\" in\n  --version) {answer} ;;\n  hold) sleep 60; exit 0 ;;\nesac\n{{ echo \"cwd=$(pwd -P)\"; for a in \"$@\"; do echo \"arg=$a\"; done; }} > \"$FAKE_LOG\"\n[ -z \"$FAKE_ENV_LOG\" ] || /usr/bin/env | cut -d= -f1 > \"$FAKE_ENV_LOG\"\n"
         )
         .as_bytes(),
     );
@@ -190,6 +196,80 @@ async fn capture_follows_the_lineage_and_carries_nothing_else() {
         "the thread lock file is removed on release, as Codex does"
     );
     assert!(!home.join(".codex/.coordination.lock").exists());
+}
+
+/// A capture records the newest Codex known to have run the thread: the
+/// installed one, or the known writer the job arrived with when that is
+/// newer, so a node that never ran the thread cannot lower it for the
+/// next node's resume guard.
+#[tokio::test]
+async fn a_capture_records_the_newest_known_writer() {
+    let src = build_source();
+    let home = src.home.path().canonicalize().unwrap();
+    for (known, recorded) in [
+        (None, LOCKING_VERSION),
+        (Some("0.142.4"), LOCKING_VERSION),
+        (Some("0.160.0"), "0.160.0"),
+    ] {
+        let out = tempfile::tempdir().unwrap();
+        let manifest = node(&home)
+            .with_known_writer(known.map(|v| HarnessVersion::parse(v).unwrap()))
+            .capture(&src.work, &thread(), out.path())
+            .await
+            .unwrap();
+        assert_eq!(manifest.harness_version(), Some(recorded), "{known:?}");
+    }
+}
+
+/// A capture asks the installed Codex in the workspace, as the resume
+/// guard does: where a version manager's shim pins an older Codex in the
+/// workspace than it picks anywhere else, the capture records the one a
+/// launch there runs, not a newer one that never ran the thread, which
+/// as the known writer would refuse every later resume in that
+/// workspace.
+#[tokio::test]
+async fn a_capture_asks_the_installed_codex_in_the_workspace() {
+    let src = build_source();
+    let home = src.home.path().canonicalize().unwrap();
+    std::fs::write(src.work.join(".tool-versions"), "codex 0.155.1\n").unwrap();
+    let (_, path_var) = fake_codex_reporting(
+        &home,
+        "$(if [ -f .tool-versions ]; then echo 0.155.1; else echo 0.160.0; fi)",
+    );
+    let out = tempfile::tempdir().unwrap();
+    let manifest = Codex::new(abs(&home), path_var)
+        .capture(&src.work, &thread(), out.path())
+        .await
+        .unwrap();
+    assert_eq!(manifest.harness_version(), Some("0.155.1"));
+}
+
+/// A running `codex` is judged by the Codex the daemon's directory picks,
+/// as restore judges it, not by the one a workspace pin picks: a pin this
+/// node lacks runs no Codex in the workspace, and its shim answers no
+/// version there. A capture that took that for a writer of unknown version
+/// refused while any `codex` ran, such as a desktop app's, so a job whose
+/// resume the guard refused for that pin could not be moved off the node.
+/// The capture still records the known writer.
+#[tokio::test]
+async fn a_workspace_pin_this_node_lacks_does_not_block_capture_on_a_running_codex() {
+    let src = build_source();
+    let home = src.home.path().canonicalize().unwrap();
+    std::fs::write(src.work.join(".tool-versions"), "codex 0.160.0\n").unwrap();
+    let (script, path_var) = fake_codex_answering(
+        &home,
+        &format!(
+            "if [ -f .tool-versions ]; then echo 'No preset version installed for command codex' >&2; exit 126; fi; echo \"codex-cli {LOCKING_VERSION}\"; exit 0"
+        ),
+    );
+    let _held = Held::start(&script);
+    let out = tempfile::tempdir().unwrap();
+    let manifest = Codex::new(abs(&home), path_var)
+        .with_known_writer(Some(HarnessVersion::parse("0.160.0").unwrap()))
+        .capture(&src.work, &thread(), out.path())
+        .await
+        .unwrap();
+    assert_eq!(manifest.harness_version(), Some("0.160.0"));
 }
 
 #[tokio::test]
@@ -546,8 +626,9 @@ async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_the
 
     let bin = fake_codex(&home);
     let adapter = Codex::new(abs(&home), bin.clone()).with_overrides(CodexOverrides {
-        sandbox: SandboxMode::WorkspaceWrite,
-        approval: ApprovalPolicy::Never,
+        sandbox: Some(SandboxMode::WorkspaceWrite),
+        approval: Some(ApprovalPolicy::Never),
+        reviewer: None,
         model: None,
         effort: None,
     });
@@ -627,10 +708,11 @@ async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_the
         .unwrap();
     assert!(running.child_mut().wait().await.unwrap().success());
     let seen = std::fs::read_to_string(&log).unwrap();
+    // `codex exec` sets its own approval policy, so the pinned one is not passed.
     assert_eq!(
         seen,
         format!(
-            "cwd={}\narg=exec\narg=resume\narg={THREAD}\narg=--json\narg=-c\narg=projects.\"{}\".trust_level=trusted\narg=-c\narg=sandbox_mode=\"workspace-write\"\narg=-c\narg=approval_policy=\"never\"\narg=--\narg=reply with the secret word\n",
+            "cwd={}\narg=exec\narg=resume\narg={THREAD}\narg=--json\narg=-c\narg=projects.\"{}\".trust_level=trusted\narg=-c\narg=sandbox_mode=\"workspace-write\"\narg=--\narg=reply with the secret word\n",
             src.work.display(),
             src.work.display()
         )

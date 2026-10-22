@@ -37,6 +37,7 @@ pub(crate) mod process;
 pub(crate) mod redact;
 mod session;
 pub(crate) mod stage;
+mod version;
 
 #[cfg(feature = "acp")]
 pub mod acp;
@@ -47,7 +48,8 @@ pub mod codex;
 
 pub use error::{BadRule, HarnessError, Input, IoOp};
 pub use harness::{
-    Harness, Installed, Launch, MAX_MODEL_NAME_LEN, ModelName, ModelNameError, Restored, Running,
-    TurnReport,
+    Harness, Installed, Launch, LaunchSettings, MAX_MODEL_NAME_LEN, ModelName, ModelNameError,
+    NotCarried, Origin, PassedSetting, Restored, Running, SettingName, TurnReport,
 };
 pub use session::{MAX_SESSION_ID_LEN, SessionId, SessionIdError};
+pub use version::{HarnessVersion, VersionError};

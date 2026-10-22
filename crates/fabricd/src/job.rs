@@ -456,6 +456,7 @@ mod tests {
         let record = SessionRecord {
             harness: HarnessKind::Codex,
             session: fabric_harness::SessionId::parse("never-ran").unwrap(),
+            known_writer: None,
         };
         job.begin_session(fabric_core::id::Epoch::FIRST, Some(&record))
             .unwrap();

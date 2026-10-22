@@ -9,11 +9,27 @@
 //! `state_dir` for it, because the harness would fail inside with a worse
 //! message once the target owns the job. The comparison is pure; measuring
 //! is `facts`' job.
+//!
+//! One row orders versions, and only to word its note and warn: when the
+//! job's harness on the target is older than the source's, or than the
+//! newest known to have written the job's session (`Context::floor`, the
+//! known writer the guard refuses below), the note says so, read through
+//! `fabric_harness::HarnessVersion`, the parse and the order the resume
+//! guard uses. Both sides are the versions each daemon finds from its own
+//! directory; a version manager's pin in the workspace can pick another,
+//! and the rollout's own `cli_version` is not read here, so the note is a
+//! warning ahead of the guard, not the guard. The outcome stays the
+//! equality refusal that `--force` waives, and a target whose version
+//! matches the source's but is older than the known writer only warns: a
+//! move only copies bytes, and the guard refuses the older harness at
+//! resume, before it can touch the session, whatever the move was told
+//! (gate finding F10).
 
 use std::fmt;
 use std::path::Path;
 
 use fabric_core::harness::HarnessKind;
+use fabric_harness::HarnessVersion;
 
 use crate::facts::{NodeFacts, major, name};
 use crate::paths::{SyncedFolders, check_root};
@@ -110,6 +126,14 @@ pub struct Context<'a> {
     pub clock_skew_ms: Option<i64>,
     /// The wire the session runs on, and how QUIC failed if it fell back.
     pub wire: Option<String>,
+    /// The newest version of the job's harness known to have written its
+    /// session (`SessionRecord::known_writer`), as the job's owner records
+    /// it: this node's record when it owns the job, else the owner's,
+    /// asked over the wire, since a node the job left keeps the record of
+    /// its own tenure and one that never ran it holds none. The resume
+    /// guard refuses a harness older than it, and a capture on the source
+    /// records at least it.
+    pub floor: Option<&'a HarnessVersion>,
 }
 
 fn value(facts: &NodeFacts, fact: &str) -> Option<String> {
@@ -242,17 +266,19 @@ fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Ro
     let mut rows = Vec::new();
     let pairs = [
         (
+            "claude",
             name::CLAUDE,
             name::CLAUDE_LOGIN,
             matches!(ctx.harness, Some(HarnessKind::ClaudeCode)),
         ),
         (
+            "codex",
             name::CODEX,
             name::CODEX_LOGIN,
             matches!(ctx.harness, Some(HarnessKind::Codex)),
         ),
     ];
-    for (version, login, used) in pairs {
+    for (program, version, login, used) in pairs {
         let mut r = row(
             version,
             here,
@@ -271,6 +297,12 @@ fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Ro
         if !used && r.outcome == Outcome::Warn && ctx.harness.is_some() {
             r.outcome = Outcome::Equal;
             r.note.clear();
+        }
+        if used && let Some(note) = older_target(here, peer, version, program, ctx) {
+            if r.outcome == Outcome::Equal {
+                r.outcome = Outcome::Warn;
+            }
+            r.note = note;
         }
         rows.push(r);
         let target_login = match ctx.target {
@@ -298,6 +330,41 @@ fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Ro
         rows.extend(acp_rows(program.as_str(), here, peer, ctx));
     }
     rows
+}
+
+/// The note for a target whose `fact`, read as `--version` output, is
+/// older than the newest known to have written the session
+/// (`Context::floor`) when that is above the source's, naming it, or else
+/// older than the source's; `None` when it is neither, or when the
+/// target's does not parse.
+fn older_target(
+    here: &NodeFacts,
+    peer: &NodeFacts,
+    fact: &str,
+    program: &str,
+    ctx: &Context<'_>,
+) -> Option<String> {
+    let read = |facts: &NodeFacts| {
+        facts
+            .get(fact)
+            .and_then(|text| HarnessVersion::from_output(text).ok())
+    };
+    let (source, target) = match ctx.target {
+        Target::Peer => (read(here), read(peer)?),
+        Target::Here => (read(peer), read(here)?),
+    };
+    let floor = ctx
+        .floor
+        .filter(|floor| source.as_ref().is_none_or(|source| *floor > source));
+    match floor {
+        Some(floor) if target < *floor => Some(format!(
+            "the target's {program} is older than {program} {floor}, the newest known to have written the session; a resume there refuses it, so update {program} there first (ADR 0006)"
+        )),
+        _ if source.is_some_and(|source| target < source) => Some(format!(
+            "the target's {program} is older; a resume there refuses a session a newer {program} wrote, so update {program} there first (ADR 0006)"
+        )),
+        _ => None,
+    }
 }
 
 /// The rows for an ACP job: the target must find the agent and give it a
@@ -527,6 +594,7 @@ mod tests {
             target: Target::Peer,
             clock_skew_ms: Some(9),
             wire: Some("quic".to_owned()),
+            floor: None,
         }
     }
 
@@ -639,6 +707,103 @@ mod tests {
         let facts: Vec<&str> = blocking(&rows, true).iter().map(|r| r.fact).collect();
         assert_eq!(facts, vec![name::HOME, name::CLAUDE_LOGIN]);
         assert_eq!(blocking(&rows, false).len(), 3);
+    }
+
+    /// The second gate run moved a Codex job with `--force` onto a node
+    /// with an older Codex: the row names the older side, in the order the
+    /// resume guard uses, for a push and for a pull onto this node alike,
+    /// and `--force` still waives it, because the guard refuses the older
+    /// Codex at resume.
+    #[test]
+    fn an_older_harness_on_the_target_is_named_and_force_still_waives_it() {
+        let codex = HarnessKind::Codex;
+        let older = with(&pro(), &[(name::CODEX, Some("codex-cli 0.142.4"))]);
+        let row_of = |rows: Vec<Row>| rows.into_iter().find(|r| r.fact == name::CODEX).unwrap();
+        let pushed = row_of(compare(&pro(), &older, &ctx(Some(&codex))));
+        assert_eq!(pushed.outcome, Outcome::Refuse(Waiver::Force));
+        assert!(
+            pushed.note.starts_with("the target's codex is older"),
+            "{}",
+            pushed.note
+        );
+        let mut pull = ctx(Some(&codex));
+        pull.target = Target::Here;
+        let pulled = row_of(compare(&pro(), &older, &pull));
+        assert_eq!(
+            pulled.note,
+            "the job's harness must be the same version on both nodes (ADR 0008)"
+        );
+        let pulled_onto_older = row_of(compare(&older, &pro(), &pull));
+        assert_eq!(pulled_onto_older.outcome, Outcome::Refuse(Waiver::Force));
+        assert!(
+            pulled_onto_older
+                .note
+                .starts_with("the target's codex is older"),
+            "{}",
+            pulled_onto_older.note
+        );
+    }
+
+    /// The note orders versions as the resume guard does, not as text:
+    /// `0.155.9` is older than `0.155.10`, and a release is newer than its
+    /// own pre-release, where a string compare says the opposite of both.
+    #[test]
+    fn the_older_target_is_found_by_the_guards_order_not_by_text() {
+        let codex = HarnessKind::Codex;
+        let older = "the target's codex is older";
+        let note = |here: &str, target: &str| {
+            let source = with(&pro(), &[(name::CODEX, Some(here))]);
+            let peer = with(&pro(), &[(name::CODEX, Some(target))]);
+            compare(&source, &peer, &ctx(Some(&codex)))
+                .into_iter()
+                .find(|r| r.fact == name::CODEX)
+                .unwrap()
+                .note
+        };
+        let n = note("codex-cli 0.155.10", "codex-cli 0.155.9");
+        assert!(n.starts_with(older), "{n}");
+        let n = note("codex-cli 0.163.0-alpha.10.2", "codex-cli 0.163.0");
+        assert!(!n.starts_with(older), "{n}");
+        let n = note("codex-cli 0.163.0", "codex-cli 0.163.0-alpha.10.2");
+        assert!(n.starts_with(older), "{n}");
+    }
+
+    /// The session's floor is the newest Codex known to have written it,
+    /// which a version manager's pin in the workspace can put above what
+    /// the source's daemon finds: here 0.160.0 ran the thread while the
+    /// source's daemon finds 0.155.1. A target on 0.158.0 looks newer than
+    /// the source, yet the guard there refuses it, so the note names the
+    /// floor; a target on the source's own version is not refused by the
+    /// row and only warns; a target at the floor gets no such note.
+    #[test]
+    fn the_older_target_is_named_against_the_newest_known_writer() {
+        let codex = HarnessKind::Codex;
+        let floor = HarnessVersion::parse("0.160.0").unwrap();
+        let older_than_floor = "the target's codex is older than codex 0.160.0, the newest known to have written the session";
+        let row = |target: &str| {
+            let peer = with(&pro(), &[(name::CODEX, Some(target))]);
+            let mut context = ctx(Some(&codex));
+            context.floor = Some(&floor);
+            compare(&pro(), &peer, &context)
+                .into_iter()
+                .find(|r| r.fact == name::CODEX)
+                .unwrap()
+        };
+        let between = row("codex-cli 0.158.0");
+        assert_eq!(between.outcome, Outcome::Refuse(Waiver::Force));
+        assert!(
+            between.note.starts_with(older_than_floor),
+            "{}",
+            between.note
+        );
+        let same = row("codex-cli 0.155.1");
+        assert_eq!(same.outcome, Outcome::Warn);
+        assert!(same.note.starts_with(older_than_floor), "{}", same.note);
+        let at_floor = row("codex-cli 0.160.0");
+        assert_eq!(
+            at_floor.note,
+            "the job's harness must be the same version on both nodes (ADR 0008)"
+        );
     }
 
     #[test]

@@ -25,9 +25,9 @@ use fabric_net::tcp::TcpTlsTransport;
 use fabric_net::tls::{TlsError, Trust};
 use fabric_net::transport::{Connection, Transport, TransportError, TransportKind};
 use fabric_net::wire::{
-    Appended, ChunkBatch, FactName, FactValue, Facts, Fault, FaultText, ManifestChunks,
-    MoveRequested, MoveState, Offered, PROTOCOL_VERSION, Pulled, RecordBytes, RecordPage,
-    VersionText,
+    Appended, ChunkBatch, FactName, FactValue, Facts, Fault, FaultText, KnownWriter,
+    ManifestChunks, MoveRequested, MoveState, Offered, PROTOCOL_VERSION, Pulled, RecordBytes,
+    RecordPage, VersionText,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -138,6 +138,10 @@ impl Service for FakeService {
     }
 
     fn move_abort(&self, _: NodeId, _: FencingToken, _: MoveId) -> JobFuture<'_, RecordBytes> {
+        not_here()
+    }
+
+    fn known_writer(&self, _: NodeId, _: FencingToken) -> JobFuture<'_, KnownWriter> {
         not_here()
     }
 

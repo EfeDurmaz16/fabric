@@ -24,11 +24,12 @@ use fabric_core::snapshot::Platform;
 use fabric_env::materialize::{MaterializeError, TreeLock};
 use fabric_harness::codex::Codex;
 use fabric_harness::manifest::{MANIFEST_FILE, StateManifest};
-use fabric_harness::{HarnessError, SessionId};
+use fabric_harness::{HarnessError, HarnessVersion, SessionId};
 use fabric_net::peers::HostPort;
 use fabric_net::rpc::Session;
 use fabric_net::wire::{
-    Appended, Fenced, MoveRequested, MoveState, Offered, Pulled, RecordBytes, RecordPage,
+    Appended, Fenced, KnownWriter, MoveRequested, MoveState, Offered, Pulled, RecordBytes,
+    RecordPage,
 };
 use fabric_store::capture::{CaptureRequest, capture};
 use fabric_store::policy::IgnorePolicy;
@@ -598,6 +599,11 @@ impl Node {
     /// cannot be read are all refused, and the CLI then kills the group it
     /// launched. The record is written before `Resumed`, so no harness the
     /// ledger says runs is unsupervised.
+    /// The session record keeps the newer of its known writer and the
+    /// version the launch started, because a Codex that resumes a thread
+    /// leaves no version in it, and the capture's own version check runs
+    /// from the daemon, where a version manager's shim can pick another
+    /// Codex than the one the workspace pins.
     pub(crate) async fn harness_started(
         &self,
         started: StartedHarness,
@@ -610,6 +616,7 @@ impl Node {
             harness,
             session,
             planned,
+            version,
         } = started;
         faults::hit(Point::BeforeHarnessRecord).await;
         refuse_secret_kind(&harness)?;
@@ -652,10 +659,9 @@ impl Node {
         // The session is recorded as pending before `Resumed` and moved into
         // place after it, so a crash between the two does not leave a
         // `Resumed` whose session a later capture would miss.
-        let record = session.map(|session| SessionRecord {
-            harness: harness.clone(),
-            session,
-        });
+        let record = session
+            .map(|session| continued(&job, harness.clone(), session, version))
+            .transpose()?;
         job.begin_session(epoch, record.as_ref())?;
         let snapshot = job.latest();
         job.append(
@@ -735,13 +741,8 @@ impl Node {
                 session,
             });
         }
-        local::write(
-            &job.dir().session(),
-            &SessionRecord {
-                harness: harness.clone(),
-                session: session.clone(),
-            },
-        )?;
+        let record = continued(&job, harness.clone(), session.clone(), None)?;
+        local::write(&job.dir().session(), &record)?;
         out.say(format!("recorded {harness} session {session}"));
         Ok(())
     }
@@ -922,7 +923,7 @@ impl Node {
             return Ok(());
         }
         let manifest = StateManifest::read(&state_dir)?;
-        let harness = adapter(&record.harness, &self.harness_env(path_var)?)?;
+        let harness = adapter(&record.harness, &self.harness_env(path_var)?, None)?;
         match harness.confirm_departure(&manifest).await {
             Ok(()) => Ok(()),
             Err(HarnessError::DepartureNotPending { session }) => {
@@ -956,8 +957,14 @@ impl Node {
         let Some(record) = job_session(job, root, &self.cfg.home, job.harness())? else {
             return Ok(None);
         };
-        let session = record.session;
-        let harness = adapter(&record.harness, &self.harness_env(path_var)?)?;
+        let session = record.session.clone();
+        // The capture records at least the newest writer this node knows,
+        // so a node that never ran the session cannot lower it.
+        let harness = adapter(
+            &record.harness,
+            &self.harness_env(path_var)?,
+            record.known_writer.clone(),
+        )?;
         let carried = state_names(&state_dir, &record.harness, &session);
         std::fs::create_dir_all(&next).map_err(|e| NodeError::io(&next, e))?;
         let captured = harness.capture(root, &session, &next).await;
@@ -977,6 +984,14 @@ impl Node {
                     session,
                     manifest.files().len()
                 ));
+                let known_writer = writer_after(record.known_writer.clone(), &manifest);
+                local::write(
+                    &job.dir().session(),
+                    &SessionRecord {
+                        known_writer,
+                        ..record
+                    },
+                )?;
                 Ok(Some(state_dir))
             }
             // A launch records its session before the harness writes any
@@ -993,6 +1008,7 @@ impl Node {
                     job.set_session(&SessionRecord {
                         harness: state.kind().clone(),
                         session: state.session().clone(),
+                        known_writer: known_writer(state),
                     })?;
                     format!(
                         "the snapshot keeps the {} session {} it held before",
@@ -1234,13 +1250,18 @@ impl Node {
             return Err(fabric_core::ledger::LedgerError::MoveToSelf.into());
         }
         self.resolve_departing(id, out).await?;
-        let (harness, root, view) = {
+        let (harness, root, view, floor) = {
             let job = self.job(id).await?;
             let job = job.lock().await;
             let root = job
                 .marker()?
                 .map_or_else(|| paths::job_root(&self.cfg.home, id), |m| m.root);
-            (job.harness().clone(), root, job.view(self.id))
+            (
+                job.harness().clone(),
+                root,
+                job.view(self.id),
+                session_floor(&job)?,
+            )
         };
         match view {
             LeaseView::Owner(_) => {}
@@ -1279,7 +1300,7 @@ impl Node {
         }
         self.preflight(
             to,
-            Some((&harness, &root)),
+            Some((&harness, &root, floor.as_ref())),
             Target::Peer,
             path_var,
             force,
@@ -1667,14 +1688,24 @@ impl Node {
             if self.job(id).await.is_err() {
                 self.pull_records(id, holder).await?;
             }
-            let kind = match &harness {
-                Some(kind) => kind.clone(),
-                None => self.job(id).await?.lock().await.harness().clone(),
+            let (kind, same) = {
+                let job = self.job(id).await?;
+                let job = job.lock().await;
+                let kind = harness.clone().unwrap_or_else(|| job.harness().clone());
+                let same = &kind == job.harness();
+                (kind, same)
+            };
+            // The known writer is the holder's: a record this node kept
+            // from an earlier tenure may be older than the holder's.
+            let floor = if same {
+                self.owners_floor(id, holder, out).await
+            } else {
+                None
             };
             let root = paths::job_root(&self.cfg.home, id);
             self.preflight(
                 holder,
-                Some((&kind, root.as_path())),
+                Some((&kind, root.as_path(), floor.as_ref())),
                 Target::Here,
                 path_var,
                 force,
@@ -2257,11 +2288,16 @@ impl Node {
     ) -> Result<(), NodeError> {
         let state_dir = job.dir().harness_state();
         let state = StateManifest::read(&state_dir)?;
-        let harness = adapter(state.kind(), &self.harness_env(path_var)?)?;
+        let harness = adapter(state.kind(), &self.harness_env(path_var)?, None)?;
         harness.restore(root, &state_dir).await?;
+        let previous = job
+            .session()?
+            .filter(|record| record.harness == *state.kind() && record.session == *state.session())
+            .and_then(|record| record.known_writer);
         job.set_session(&SessionRecord {
             harness: state.kind().clone(),
             session: state.session().clone(),
+            known_writer: writer_after(previous, &state),
         })?;
         out.say(format!(
             "restored {} session {}",
@@ -2371,20 +2407,38 @@ impl Node {
             }
             return Ok(());
         };
-        let (harness, root) = match job {
+        let (harness, root, floor) = match job {
             Some(id) => {
-                let job = self.job(id).await?;
-                let job = job.lock().await;
-                let root = job
-                    .marker()?
-                    .map_or_else(|| paths::job_root(&self.cfg.home, id), |m| m.root);
-                (Some(job.harness().clone()), Some(root))
+                let (harness, root, owner, kept) = {
+                    let job = self.job(id).await?;
+                    let job = job.lock().await;
+                    let root = job
+                        .marker()?
+                        .map_or_else(|| paths::job_root(&self.cfg.home, id), |m| m.root);
+                    let (owner, kept) = match job.view(self.id) {
+                        LeaseView::Owner(_) | LeaseView::Departing { .. } => {
+                            (None, session_floor(&job)?)
+                        }
+                        LeaseView::Departed { owner, .. } | LeaseView::Replica { owner, .. } => {
+                            (Some(owner), None)
+                        }
+                    };
+                    (job.harness().clone(), root, owner, kept)
+                };
+                let floor = match owner {
+                    Some(owner) => self.owners_floor(id, owner, out).await,
+                    None => kept,
+                };
+                (Some(harness), Some(root), floor)
             }
-            None => (None, None),
+            None => (None, None, None),
         };
         self.preflight(
             peer,
-            harness.as_ref().zip(root.as_deref()),
+            harness
+                .as_ref()
+                .zip(root.as_deref())
+                .map(|(harness, root)| (harness, root, floor.as_ref())),
             Target::Peer,
             path_var,
             false,
@@ -2393,11 +2447,61 @@ impl Node {
         .await
     }
 
-    /// Compares this node's facts with `peer`'s and stops on a refusal `force` does not waive.
+    /// Compares this node's facts with `peer`'s and stops on a refusal
+    /// `force` does not waive. A named job brings its harness, the root
+    /// the target restores into, and the newest version of its harness
+    /// known to have written its session.
+    /// The newest version of the job's harness known to have written its
+    /// session, asked of `owner`, which alone holds a current record of
+    /// it: a node the job left keeps the record of its own tenure, and a
+    /// node that never ran it holds none. An owner that does not answer,
+    /// or answers with no version this node reads, leaves it unknown, and
+    /// the preflight then judges the target against the source alone.
+    async fn owners_floor(
+        self: &Arc<Self>,
+        id: JobId,
+        owner: NodeId,
+        out: &mut Out,
+    ) -> Option<HarnessVersion> {
+        let epoch = match self.job(id).await {
+            Ok(job) => job.lock().await.ledger().lease().epoch(),
+            Err(_) => Epoch::FIRST,
+        };
+        let token = FencingToken { job_id: id, epoch };
+        let asked = self
+            .call(owner, |session| async move {
+                session.known_writer(token, SHORT_DEADLINE).await
+            })
+            .await;
+        let text = match asked {
+            Ok(Fenced::Answer(KnownWriter { version })) => version?,
+            Ok(fenced) => {
+                out.say(format!(
+                    "{owner} did not say the job's known writer: {}",
+                    fenced_words(&fenced)
+                ));
+                return None;
+            }
+            Err(e) => {
+                out.say(format!("{owner} did not say the job's known writer: {e}"));
+                return None;
+            }
+        };
+        match HarnessVersion::parse(text.as_str()) {
+            Ok(version) => Some(version),
+            Err(e) => {
+                out.say(format!(
+                    "{owner} named {text} as the job's known writer, which is not a version: {e}"
+                ));
+                None
+            }
+        }
+    }
+
     async fn preflight(
         self: &Arc<Self>,
         peer: NodeId,
-        job: Option<(&HarnessKind, &Path)>,
+        job: Option<(&HarnessKind, &Path, Option<&HarnessVersion>)>,
         target: Target,
         path_var: &OsString,
         force: bool,
@@ -2407,7 +2511,7 @@ impl Node {
             NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
         // The agent of an ACP job is named per job, so only the target of a
         // pull, this node, can look for it.
-        if let (Target::Here, Some((HarnessKind::Acp { program, .. }, _))) = (target, job) {
+        if let (Target::Here, Some((HarnessKind::Acp { program, .. }, _, _))) = (target, job) {
             here.measure_acp(program, &self.harness_env(path_var)?);
         }
         // A session the peer opened is used too: a peer behind a NAT has
@@ -2423,11 +2527,12 @@ impl Node {
             &here,
             &theirs,
             &Context {
-                harness: job.map(|(h, _)| h),
-                root: job.map(|(_, r)| r),
+                harness: job.map(|(h, _, _)| h),
+                root: job.map(|(_, r, _)| r),
                 target,
                 clock_skew_ms: Some(clock_skew_ms),
                 wire: Some(wire),
+                floor: job.and_then(|(_, _, floor)| floor),
             },
         );
         for row in &rows {
@@ -2487,6 +2592,82 @@ fn owner_token(job: &Job, me: NodeId) -> Result<FencingToken, NodeError> {
             epoch,
         }),
     }
+}
+
+/// The session record for `session` of `harness`, keeping the known
+/// writer of the record it replaces when that names the same session, so
+/// a launch or a thread named while a turn runs never forgets it, raised
+/// to `started`, the version a launch started on the session.
+fn continued(
+    job: &Job,
+    harness: HarnessKind,
+    session: SessionId,
+    started: Option<HarnessVersion>,
+) -> Result<SessionRecord, NodeError> {
+    let kept = job
+        .session()?
+        .filter(|record| record.harness == harness && record.session == session)
+        .and_then(|record| record.known_writer);
+    let known_writer = kept.into_iter().chain(started).max();
+    Ok(SessionRecord {
+        harness,
+        session,
+        known_writer,
+    })
+}
+
+/// The newest version of the job's harness known to have written its
+/// session, from the session record this node holds, when that record is
+/// of the job's own harness. Only the owner's record is current: a node
+/// the job left keeps the one from its own tenure (`Node::owners_floor`).
+pub(crate) fn session_floor(job: &Job) -> Result<Option<HarnessVersion>, NodeError> {
+    Ok(job
+        .session()?
+        .filter(|record| &record.harness == job.harness())
+        .and_then(|record| record.known_writer))
+}
+
+/// The newest harness version known to have written the session a
+/// capture holds, read from its manifest, for a Codex session only; `None`,
+/// logged, when a Codex manifest records none that parses, and the session
+/// record then keeps the known writer it held (`writer_after`). A Codex
+/// resume writes no version into the rollout, so the job carries this
+/// one. A Claude transcript records the version of every Claude that
+/// wrote a line, and an ACP agent's state is opaque, so for them the
+/// version a capture records is only the one installed where it ran,
+/// which no guard reads (ADR 0006).
+fn known_writer(manifest: &StateManifest) -> Option<HarnessVersion> {
+    if *manifest.kind() != HarnessKind::Codex {
+        return None;
+    }
+    let text = manifest.harness_version()?;
+    match HarnessVersion::parse(text) {
+        Ok(version) => Some(version),
+        Err(e) => {
+            tracing::warn!(session = %manifest.session(), error = %e, "the captured harness version is not a version");
+            None
+        }
+    }
+}
+
+/// The known writer the session record keeps after a capture or a
+/// restore of `manifest`: the version the manifest records, or, when it
+/// records none that parses, `previous`, the one the record held for the
+/// same session; `None` for any harness but Codex. A version that does not
+/// parse is ignored and the job's previous known writer stays the floor:
+/// it cannot be ordered, so it cannot raise one, and failing the capture
+/// would keep the job from being suspended or moved off the node for the
+/// Codex installed there (decided 2026-10-22 by the owner, ADR 0006). A
+/// Codex capture records at least the known writer it was given, so after
+/// a capture this keeps it or raises it.
+fn writer_after(
+    previous: Option<HarnessVersion>,
+    manifest: &StateManifest,
+) -> Option<HarnessVersion> {
+    if *manifest.kind() != HarnessKind::Codex {
+        return None;
+    }
+    known_writer(manifest).or(previous)
 }
 
 /// Refuses a launch planned to continue `planned` when the session a plan
@@ -2562,9 +2743,12 @@ fn job_session(
     else {
         return Ok(recorded);
     };
+    // The thread's rollout records the Codex that created it, which the
+    // resume guard reads, and no launch has resumed it yet.
     let record = SessionRecord {
         harness: HarnessKind::Codex,
         session: thread,
+        known_writer: None,
     };
     local::write(&job.dir().session(), &record)?;
     local::remove(&job.dir().fresh_codex())?;
@@ -2601,21 +2785,20 @@ fn plan(
         epoch,
     })?;
     let harness = harness.unwrap_or_else(|| job.harness().clone());
-    let session = match job_session(job, &root, home, &harness)? {
-        Some(record) if record.harness == harness => {
-            out.say(format!("continuing {harness} session {}", record.session));
-            Some(record.session)
-        }
+    let (session, known_writer) = match job_session(job, &root, home, &harness)? {
+        // The CLI says it once the harness has started, with the settings
+        // the launch carried from the session (gate finding F10).
+        Some(record) if record.harness == harness => (Some(record.session), record.known_writer),
         Some(record) => {
             out.say(format!(
                 "starting a new {harness} session; the {} session {} stays in the snapshot (cross-harness resume is an experiment, ADR 0006)",
                 record.harness, record.session
             ));
-            None
+            (None, None)
         }
         None => {
             out.say(format!("starting a new {harness} session"));
-            None
+            (None, None)
         }
     };
     if harness == HarnessKind::Codex && session.is_none() {
@@ -2632,6 +2815,7 @@ fn plan(
         harness_config: harness_config.for_harness(&harness),
         harness,
         session,
+        known_writer,
         goal: job.ledger().manifest().goal.clone(),
         home: home.to_owned(),
     })
@@ -3125,6 +3309,7 @@ pub(crate) mod tests {
                 harness: HarnessKind::Codex,
                 session: None,
                 planned: None,
+                version: None,
             },
             &mut Out::default(),
         )
@@ -3218,6 +3403,7 @@ pub(crate) mod tests {
                 harness: HarnessKind::Codex,
                 session: Some(session.clone()),
                 planned: plan.session,
+                version: None,
             },
             out,
         )
@@ -3276,6 +3462,8 @@ pub(crate) mod tests {
         let before = SessionRecord {
             harness: HarnessKind::Codex,
             session: thread.clone(),
+            // The capture records the version `locking_codex` reports.
+            known_writer: Some(HarnessVersion::parse("0.155.1").unwrap()),
         };
         let (recorded, captured) = recorded_and_captured(&node, id).await;
         assert_eq!(recorded, Some(before), "{:?}", out.lines);
@@ -3337,6 +3525,8 @@ pub(crate) mod tests {
         let record = SessionRecord {
             harness: HarnessKind::Codex,
             session: thread.clone(),
+            // The capture records the version `locking_codex` reports.
+            known_writer: Some(HarnessVersion::parse("0.155.1").unwrap()),
         };
         assert_eq!(
             recorded_and_captured(&node, id).await,
@@ -3389,12 +3579,202 @@ pub(crate) mod tests {
         let record = SessionRecord {
             harness: HarnessKind::Codex,
             session: thread.clone(),
+            // The capture records the version `locking_codex` reports.
+            known_writer: Some(HarnessVersion::parse("0.155.1").unwrap()),
         };
         assert_eq!(
             recorded_and_captured(&node, id).await,
             (Some(record), thread),
             "{:?}",
             out.lines
+        );
+    }
+
+    /// A Codex that resumes a thread writes no version into it, so the
+    /// version the launch started with is the session's known writer from
+    /// then on: the node keeps the newer of it and the one it knew, and a
+    /// launch that reports none or an older one never lowers it.
+    #[tokio::test]
+    async fn a_started_harness_raises_the_known_writer_and_never_lowers_it() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let out = &mut Out::default();
+        node.suspend(id, &path, out).await.unwrap();
+        node.job_run(id, out).await.unwrap();
+        let thread = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
+        let v = |text| HarnessVersion::parse(text).unwrap();
+        let start = |version: Option<HarnessVersion>| {
+            let (node, thread) = (Arc::clone(&node), thread.clone());
+            async move {
+                // The plan continues whatever session the job records then.
+                let planned = {
+                    let job = node.job(id).await.unwrap();
+                    let job = job.lock().await;
+                    job.session().unwrap().map(|record| record.session)
+                };
+                let mut harness = sleeper();
+                let started = StartedHarness {
+                    job: id,
+                    epoch: Epoch::FIRST,
+                    pid: pid(&harness),
+                    harness: HarnessKind::Codex,
+                    session: Some(thread),
+                    planned,
+                    version,
+                };
+                let result = node.harness_started(started, &mut Out::default()).await;
+                harness.kill().unwrap();
+                harness.wait().unwrap();
+                node.harness_exited(id, pid(&harness)).await.unwrap();
+                result
+            }
+        };
+        let known = || async {
+            let job = node.job(id).await.unwrap();
+            let job = job.lock().await;
+            job.session()
+                .unwrap()
+                .and_then(|record| record.known_writer)
+        };
+        start(Some(v("0.160.0"))).await.unwrap();
+        assert_eq!(known().await, Some(v("0.160.0")));
+        start(Some(v("0.155.1"))).await.unwrap();
+        assert_eq!(
+            known().await,
+            Some(v("0.160.0")),
+            "an older start lowered it"
+        );
+        start(None).await.unwrap();
+        assert_eq!(
+            known().await,
+            Some(v("0.160.0")),
+            "a start with no version dropped it"
+        );
+        start(Some(v("0.163.0-alpha.10.2"))).await.unwrap();
+        assert_eq!(known().await, Some(v("0.163.0-alpha.10.2")));
+    }
+
+    /// A capture records the newer of the installed Codex and the known
+    /// writer, and the session record keeps what the capture recorded, so
+    /// a run on this node after the snapshot is held to the same floor as
+    /// a node that restores the snapshot.
+    #[tokio::test]
+    async fn a_capture_raises_the_known_writer_to_the_version_it_records() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let thread = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap().join("home");
+        let sessions = home.join(".codex/sessions/2026/10/21");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join(format!("rollout-2026-10-21T10-00-00-{thread}.jsonl")),
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread}\",\"cwd\":\"/w\",\"cli_version\":\"0.155.1\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let codex = bin.join("codex");
+        std::fs::write(&codex, "#!/bin/sh\necho 'codex-cli 0.160.0'\n").unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut path = bin.into_os_string();
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+        {
+            let job = node.job(id).await.unwrap();
+            let job = job.lock().await;
+            let record = SessionRecord {
+                harness: HarnessKind::Codex,
+                session: thread.clone(),
+                known_writer: Some(HarnessVersion::parse("0.155.1").unwrap()),
+            };
+            local::write(&job.dir().session(), &record).unwrap();
+        }
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let job = node.job(id).await.unwrap();
+        let job = job.lock().await;
+        let manifest = StateManifest::read(&job.dir().harness_state()).unwrap();
+        assert_eq!(manifest.harness_version(), Some("0.160.0"));
+        assert_eq!(
+            job.session()
+                .unwrap()
+                .and_then(|record| record.known_writer),
+            Some(HarnessVersion::parse("0.160.0").unwrap())
+        );
+    }
+
+    /// A Codex snapshot whose recorded version does not parse, as one a
+    /// capture wrote before the known writer, which recorded the installed
+    /// `--version` token as it was, gives no floor of its own. The restore
+    /// neither fails nor drops the floor: the known writer this node held
+    /// for the session stays (decided 2026-10-22 by the owner, ADR 0006).
+    #[tokio::test]
+    async fn a_restore_of_a_version_that_does_not_parse_keeps_the_known_writer() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = locking_codex(dir.path());
+        let thread = codex_thread_in(&node, id);
+        let known = HarnessVersion::parse("0.160.0").unwrap();
+        let job = node.job(id).await.unwrap();
+        job.lock()
+            .await
+            .set_session(&SessionRecord {
+                harness: HarnessKind::Codex,
+                session: thread,
+                known_writer: Some(known.clone()),
+            })
+            .unwrap();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let job = job.lock().await;
+        let manifest = job.dir().harness_state().join(MANIFEST_FILE);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        assert_eq!(value["harness_version"], "0.160.0");
+        value["harness_version"] = "0.155".into();
+        std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let root = paths::job_root(&node.cfg.home, id);
+        node.restore_harness(&job, &root, &path, &mut Out::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            job.session()
+                .unwrap()
+                .and_then(|record| record.known_writer),
+            Some(known)
+        );
+    }
+
+    /// Only a Codex capture gives the job a known writer: for Claude the
+    /// version a capture records is only the one installed where it ran,
+    /// not one known to have written the session, and nothing guards on
+    /// it, so a restore or a capture of a Claude session records none.
+    #[test]
+    fn only_a_codex_capture_gives_a_known_writer() {
+        let manifest = |kind: HarnessKind, version: &str| -> StateManifest {
+            serde_json::from_value(serde_json::json!({
+                "format": fabric_harness::manifest::MANIFEST_FORMAT,
+                "kind": kind,
+                "session": "s1",
+                "root": "/w",
+                "home": "/h",
+                "harness_version": version,
+                "captured_at_ms": 0,
+                "files": [],
+                "redactions": [],
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            known_writer(&manifest(HarnessKind::Codex, "0.160.0")),
+            Some(HarnessVersion::parse("0.160.0").unwrap())
+        );
+        assert_eq!(
+            known_writer(&manifest(HarnessKind::ClaudeCode, "2.1.294")),
+            None
         );
     }
 
@@ -3414,6 +3794,7 @@ pub(crate) mod tests {
         let claude = SessionRecord {
             harness: HarnessKind::ClaudeCode,
             session: SessionId::parse("9c9796f0-2682-4546-a963-d314b3ad543f").unwrap(),
+            known_writer: None,
         };
         local::write(&node.cfg.state.job(id).session(), &claude).unwrap();
 
@@ -3456,6 +3837,7 @@ pub(crate) mod tests {
         let own = SessionRecord {
             harness: HarnessKind::Codex,
             session: own.unwrap(),
+            known_writer: None,
         };
         assert_eq!(session_to_capture(&node, id).await, Some(own));
     }
@@ -3491,6 +3873,7 @@ pub(crate) mod tests {
             &SessionRecord {
                 harness: HarnessKind::ClaudeCode,
                 session: SessionId::parse("9c9796f0-2682-4546-a963-d314b3ad543f").unwrap(),
+                known_writer: None,
             },
         )
         .unwrap();
@@ -3502,6 +3885,8 @@ pub(crate) mod tests {
         let record = SessionRecord {
             harness: HarnessKind::Codex,
             session: thread.clone(),
+            // The capture records the version `locking_codex` reports.
+            known_writer: Some(HarnessVersion::parse("0.155.1").unwrap()),
         };
         assert_eq!(
             recorded_and_captured(&node, id).await,
@@ -3520,6 +3905,7 @@ pub(crate) mod tests {
         let claude = SessionRecord {
             harness: HarnessKind::ClaudeCode,
             session: SessionId::parse("9c9796f0-2682-4546-a963-d314b3ad543f").unwrap(),
+            known_writer: None,
         };
         local::write(&node.cfg.state.job(id).session(), &claude).unwrap();
         codex_thread_in(&node, id);
@@ -3558,6 +3944,7 @@ pub(crate) mod tests {
         let claude = SessionRecord {
             harness: HarnessKind::ClaudeCode,
             session: SessionId::parse("9c9796f0-2682-4546-a963-d314b3ad543f").unwrap(),
+            known_writer: None,
         };
         local::write(&node.cfg.state.job(id).session(), &claude).unwrap();
         codex_thread_in(&node, id);
@@ -3611,6 +3998,7 @@ pub(crate) mod tests {
             &SessionRecord {
                 harness: HarnessKind::Codex,
                 session: SessionId::parse("stale-session").unwrap(),
+                known_writer: None,
             },
         )
         .unwrap();
@@ -3653,7 +4041,9 @@ pub(crate) mod tests {
     /// A headless Codex run names its thread only once it runs. The node
     /// records that session for the harness it recorded and for no other
     /// pid, and not once that harness was stopped, because the suspend or
-    /// fence that stopped it captured without the session.
+    /// fence that stopped it captured without the session. Naming the same
+    /// session again keeps the newest writer the node knows of it, and
+    /// naming another one does not hand it that writer.
     #[tokio::test]
     async fn a_session_named_after_the_start_is_recorded_only_for_the_recorded_harness() {
         let (dir, node) = node();
@@ -3707,6 +4097,50 @@ pub(crate) mod tests {
             Some(SessionRecord {
                 harness: HarnessKind::Codex,
                 session: thread.clone(),
+                known_writer: None,
+            })
+        );
+        // Naming the session again keeps the newest writer the node knows
+        // of it, which the resume guard and the next capture need.
+        let known = HarnessVersion::parse("0.160.0").unwrap();
+        {
+            let job = node.job(id).await.unwrap();
+            let job = job.lock().await;
+            let record = SessionRecord {
+                harness: HarnessKind::Codex,
+                session: thread.clone(),
+                known_writer: Some(known.clone()),
+            };
+            local::write(&job.dir().session(), &record).unwrap();
+        }
+        name(pid(&harness)).await.unwrap();
+        assert_eq!(
+            recorded().await.and_then(|record| record.known_writer),
+            Some(known)
+        );
+        // A new thread, as `codex exec resume` answers with when it forks,
+        // was written by none of the versions that wrote the old one, so it
+        // starts with no known writer; keeping the old one's would refuse
+        // the Codex that created the new thread on its next resume.
+        let forked = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368b").unwrap();
+        node.harness_session(
+            NamedSession {
+                job: id,
+                epoch: Epoch::FIRST,
+                pid: pid(&harness),
+                harness: HarnessKind::Codex,
+                session: forked.clone(),
+            },
+            &mut Out::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recorded().await,
+            Some(SessionRecord {
+                harness: HarnessKind::Codex,
+                session: forked,
+                known_writer: None,
             })
         );
 
@@ -4234,6 +4668,7 @@ pub(crate) mod tests {
                     harness: HarnessKind::Codex,
                     session: Some(session.clone()),
                     planned: None,
+                    version: None,
                 },
                 &mut Out::default(),
             )
@@ -4615,6 +5050,7 @@ pub(crate) mod tests {
                     harness: secret,
                     session: None,
                     planned: None,
+                    version: None,
                 },
                 &mut Out::default(),
             )
@@ -4944,6 +5380,7 @@ pub(crate) mod tests {
                 harness: HarnessKind::ClaudeCode,
                 session: None,
                 planned: None,
+                version: None,
             },
             &mut Out::default(),
         )
@@ -5278,6 +5715,7 @@ pub(crate) mod tests {
                 harness: HarnessKind::ClaudeCode,
                 session: None,
                 planned: None,
+                version: None,
             },
             &mut Out::default(),
         )
@@ -5517,6 +5955,7 @@ pub(crate) mod tests {
                     harness: next.harness.clone(),
                     session: None,
                     planned: next.session.clone(),
+                    version: None,
                 },
                 &mut Out::default(),
             )

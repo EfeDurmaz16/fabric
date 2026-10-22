@@ -40,7 +40,16 @@
 //!
 //! Surfaces used, checked against `claude --help` of 2.1.294 on
 //! 2026-10-19: `--resume <id>`, `--session-id <uuid>`, `-p` with
-//! `--output-format json`, and the typed flags of `flags::LaunchFlags`.
+//! `--output-format json`, and the typed flags of `flags::LaunchFlags`;
+//! on a resume also `--model <name>` with the model the session last ran
+//! with, the one it asked for when a fallback served the reply
+//! (`recorded`, checked against `claude --help` of 2.1.294 on
+//! 2026-10-21), so a node whose own settings name another model does not
+//! switch the job's. Before a resume starts, the binary it would run is
+//! asked for its version and refused when that is older than the newest
+//! `version` the transcripts record, or unreadable
+//! (`version::refuse_older`, gate finding F10); a session that records
+//! no version, or has no transcript on this node, is not guarded.
 //! An overlay file that holds a literal secret refuses the launch. The session registry
 //! `~/.claude/sessions/<pid>.json` (`pid`, `sessionId`) was read on the
 //! owner's machine on 2026-10-20.
@@ -48,6 +57,7 @@
 pub mod flags;
 pub(crate) mod history;
 pub(crate) mod plans;
+pub(crate) mod recorded;
 pub(crate) mod slug;
 pub(crate) mod trust;
 
@@ -64,7 +74,10 @@ use tracing::{debug, info, warn};
 
 use crate::departure::{FABRIC_DIR, Records};
 use crate::error::{HarnessError, IoOp};
-use crate::harness::{Harness, Installed, Launch, Restored, Running, TurnReport};
+use crate::harness::{
+    Harness, Installed, Launch, LaunchSettings, ModelName, NotCarried, Origin, PassedSetting,
+    Recorded, Restored, Running, SettingName, TurnReport,
+};
 use crate::jsontext;
 use crate::manifest::{HOME_PREFIX, Mutability, StateManifest, under_home};
 use crate::pipeline::{self, Capturer, Destination};
@@ -107,7 +120,11 @@ pub struct ClaudeCode {
 
 /// The Claude version whose `~/.claude/sessions/<pid>.json` records this
 /// adapter was checked against.
-const REGISTRY_READ_ON: &[u32] = &[2, 1, 294];
+const REGISTRY_READ_ON: &str = "2.1.294";
+
+/// Why a model is not carried when the transcript Claude resumes cannot
+/// be told from the others.
+const KEY_UNKNOWN: &str = "the session's transcripts under several project keys do not all end on one model, and Claude resumes from this workspace's key, which it cuts and hashes, so Fabric cannot tell which one";
 
 /// What the session registry says about a session.
 enum Registry {
@@ -282,7 +299,7 @@ impl ClaudeCode {
         session: &SessionId,
         version: Option<&str>,
     ) -> Result<Registry, HarnessError> {
-        if !version.is_some_and(|v| process::version_at_least(v, REGISTRY_READ_ON)) {
+        if !version.is_some_and(|v| crate::version::at_least(v, REGISTRY_READ_ON)) {
             return Ok(Registry::CannotAnswer(
                 "the claude version is unknown or older than the registry this adapter reads",
             ));
@@ -415,6 +432,52 @@ impl ClaudeCode {
             Ok(meta) => Ok(Some(meta.file_type())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(HarnessError::io(IoOp::Read, path, e)),
+        }
+    }
+
+    /// The project key directories under `projects` that may hold
+    /// `session`, in path order; none when there is no `projects`. A key
+    /// that is a symlink is not walked, and one that holds the session, as
+    /// a transcript or a directory, is refused (`SymlinkInState`), because
+    /// Claude follows it. Capture and the resume guard both walk these, so
+    /// a layout capture refuses never resumes unguarded.
+    fn session_keys(projects: &Path, session: &SessionId) -> Result<Vec<PathBuf>, HarnessError> {
+        let entries = match std::fs::read_dir(projects) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(HarnessError::io(IoOp::Walk, projects, e)),
+        };
+        let mut keys = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| HarnessError::io(IoOp::Walk, projects, e))?;
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .map_err(|e| HarnessError::io(IoOp::Walk, &path, e))?;
+            if kind.is_dir() {
+                keys.push(path);
+            } else if kind.is_symlink()
+                && (path.join(format!("{session}.jsonl")).exists()
+                    || path.join(session.as_str()).exists())
+            {
+                return Err(HarnessError::SymlinkInState { path });
+            }
+        }
+        keys.sort();
+        Ok(keys)
+    }
+
+    /// The transcript of `session` under `key_dir` when it is a regular
+    /// file; a symlink there is refused (`SymlinkInState`), for capture and
+    /// for the resume guard alike.
+    fn transcript_in(key_dir: &Path, session: &SessionId) -> Result<Option<PathBuf>, HarnessError> {
+        let transcript = key_dir.join(format!("{session}.jsonl"));
+        match Self::kind_at(&transcript)? {
+            Some(kind) if kind.is_symlink() => {
+                Err(HarnessError::SymlinkInState { path: transcript })
+            }
+            Some(kind) if kind.is_file() => Ok(Some(transcript)),
+            _ => Ok(None),
         }
     }
 
@@ -606,36 +669,13 @@ impl ClaudeCode {
         let mut sources = Vec::new();
         let projects = self.config_dir.join("projects");
         let mut transcripts = Vec::new();
-        let entries = match std::fs::read_dir(&projects) {
-            Ok(entries) => Some(entries),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(HarnessError::io(IoOp::Walk, &projects, e)),
-        };
-        if let Some(entries) = entries {
-            let mut keys = Vec::new();
-            for entry in entries {
-                let entry = entry.map_err(|e| HarnessError::io(IoOp::Walk, &projects, e))?;
-                let path = entry.path();
-                let kind = entry
-                    .file_type()
-                    .map_err(|e| HarnessError::io(IoOp::Walk, &path, e))?;
-                if kind.is_dir() {
-                    keys.push(path);
-                } else if kind.is_symlink()
-                    && (path.join(format!("{session}.jsonl")).exists()
-                        || path.join(session.as_str()).exists())
-                {
-                    return Err(HarnessError::SymlinkInState { path });
-                }
+        for key_dir in Self::session_keys(&projects, session)? {
+            if let Some(transcript) = Self::transcript_in(&key_dir, session)?
+                && self.add_file(&mut sources, &transcript)?
+            {
+                transcripts.push(transcript);
             }
-            keys.sort();
-            for key_dir in keys {
-                let transcript = key_dir.join(format!("{session}.jsonl"));
-                if self.add_file(&mut sources, &transcript)? {
-                    transcripts.push(transcript);
-                }
-                self.add_tree(&mut sources, &key_dir.join(session.as_str()))?;
-            }
+            self.add_tree(&mut sources, &key_dir.join(session.as_str()))?;
         }
         let key = Self::key_of(root)?;
         self.add_tree(&mut sources, &projects.join(&key).join("memory"))?;
@@ -782,14 +822,82 @@ impl ClaudeCode {
         process::detect(self.binary().ok(), &self.path_var).await
     }
 
+    /// Every transcript of `session`, `projects/*/<sid>.jsonl`, in key
+    /// order with the workspace's own key last, so its model wins; none
+    /// when this node holds no transcript of it, which records nothing to
+    /// carry or to guard, and Claude then says itself that it found none.
+    /// A symlinked key that holds the session, or a symlinked transcript,
+    /// is refused as capture refuses it (`SymlinkInState`): Claude follows
+    /// the link, so skipping it would leave its writer unguarded.
+    /// The own key only orders them: a workspace whose key Claude cuts
+    /// and hashes, which this adapter does not compute, has none, and
+    /// every key is still read and guarded. The flag is true when such a
+    /// workspace's session has transcripts under more than one key: Claude
+    /// resumes from the hashed key, which cannot be told apart from the
+    /// others, so the order says nothing about which transcript it
+    /// continues.
+    fn transcripts(
+        &self,
+        root: &AbsPath,
+        session: &SessionId,
+    ) -> Result<(Vec<PathBuf>, bool), HarnessError> {
+        let projects = self.config_dir.join("projects");
+        let own = match slug::slug(root) {
+            Ok(key) => Some(projects.join(key)),
+            Err(slug::SlugError::TooLong { .. }) => None,
+        };
+        let mut found = Vec::new();
+        for key_dir in Self::session_keys(&projects, session)? {
+            if let Some(transcript) = Self::transcript_in(&key_dir, session)? {
+                found.push((own.as_ref() == Some(&key_dir), transcript));
+            }
+        }
+        found.sort();
+        let ambiguous = own.is_none() && found.len() > 1;
+        Ok((found.into_iter().map(|(_, path)| path).collect(), ambiguous))
+    }
+
+    /// What the transcripts of `session` record, read before a resume;
+    /// refused when the binary that would run it is older than its newest
+    /// writer or does not say its version, so nothing starts. When the
+    /// workspace's own key cannot be named and the session has transcripts
+    /// under several keys that do not all end on one model, the model is
+    /// left out, with that reason and every model the keys end on, rather
+    /// than taken from whichever key sorts last. When each ends on the
+    /// same model, the key Claude resumes from ends on it too, so it is
+    /// carried. The writer of every key still guards the resume.
+    async fn read_session(
+        &self,
+        root: &AbsPath,
+        binary: &Path,
+        env: &[(EnvVarName, String)],
+        session: &SessionId,
+    ) -> Result<recorded::RecordedClaude, HarnessError> {
+        let (transcripts, ambiguous) = self.transcripts(root, session)?;
+        let mut recorded = pipeline::blocking(move || recorded::read(&transcripts)).await?;
+        let one_model = recorded.models.len() == 1 && !recorded.without_model;
+        if ambiguous && !one_model && !recorded.models.is_empty() {
+            recorded.model = Recorded::NotCarried {
+                value: recorded.models.join(" or "),
+                reason: KEY_UNKNOWN.to_owned(),
+            };
+        }
+        if let Some(writer) = &recorded.writer {
+            let cwd = pipeline::fs_path(root);
+            crate::version::refuse_older(PROGRAM, binary, cwd, env, session, writer).await?;
+        }
+        Ok(recorded)
+    }
+
     /// The session the process runs and the argument list for `launch`,
     /// without the binary: `--resume` with the session `launch` names, or
     /// `--session-id` with the id `fresh` mints, so the flag and the id
-    /// always agree.
+    /// always agree, and `--model` when one is given.
     pub(crate) fn args_for(
         &self,
         launch: &Launch,
         fresh: impl FnOnce() -> SessionId,
+        model: Option<&ModelName>,
     ) -> (SessionId, Vec<String>) {
         let mut args = Vec::new();
         if launch.is_headless() {
@@ -801,6 +909,10 @@ impl ClaudeCode {
         };
         args.push(flag.to_owned());
         args.push(session.as_str().to_owned());
+        if let Some(model) = model {
+            args.push("--model".to_owned());
+            args.push(model.as_str().to_owned());
+        }
         args.extend(self.flags.args());
         if let Some(prompt) = launch.prompt() {
             args.push("--".to_owned());
@@ -863,11 +975,32 @@ impl ClaudeCode {
         for overlay in self.flags.overlays() {
             refuse_secret_overlay(Path::new(overlay.as_str()))?;
         }
-        let (session, args) = self.args_for(launch, Self::fresh_session);
+        let mut settings = LaunchSettings::default();
+        let model = match launch.resume() {
+            Some(session) => match self.read_session(&root, &binary, env, session).await?.model {
+                Recorded::Carried(model) => {
+                    settings.passed.push(PassedSetting {
+                        name: SettingName::Model,
+                        value: model.as_str().to_owned(),
+                        origin: Origin::Session,
+                    });
+                    Some(model)
+                }
+                Recorded::NotCarried { value, reason } => {
+                    settings
+                        .not_carried
+                        .push(NotCarried::new(SettingName::Model, &value, reason));
+                    None
+                }
+                Recorded::Absent => None,
+            },
+            None => None,
+        };
+        let (session, args) = self.args_for(launch, Self::fresh_session, model.as_ref());
         let spawned =
             process::spawn(&binary, &args, pipeline::fs_path(&root), env, launch.into()).await?;
         info!(%session, pid = %spawned.pid, held = spawned.held, "claude: launched");
-        Ok(Running::new(Some(session), spawned))
+        Ok(Running::new(Some(session), spawned).with_settings(settings))
     }
 }
 
@@ -1385,7 +1518,7 @@ mod tests {
             prompt: None,
         };
         assert_eq!(
-            adapter.args_for(&resume, ClaudeCode::fresh_session),
+            adapter.args_for(&resume, ClaudeCode::fresh_session, None),
             (
                 session.clone(),
                 vec![
@@ -1404,13 +1537,21 @@ mod tests {
             prompt: "--not-a-flag".to_owned(),
         };
         assert_eq!(
-            adapter.args_for(&headless, ClaudeCode::fresh_session).1,
+            adapter
+                .args_for(
+                    &headless,
+                    ClaudeCode::fresh_session,
+                    Some(&ModelName::parse("claude-opus-5-5").unwrap())
+                )
+                .1,
             vec![
                 "-p",
                 "--output-format",
                 "json",
                 "--resume",
                 "9c9796f0-2682-4546-a963-d314b3ad543f",
+                "--model",
+                "claude-opus-5-5",
                 "--permission-mode",
                 "acceptEdits",
                 "--",
@@ -1423,7 +1564,7 @@ mod tests {
             prompt: Some("hi".to_owned()),
         };
         assert_eq!(
-            adapter.args_for(&new, || fresh.clone()),
+            adapter.args_for(&new, || fresh.clone(), None),
             (
                 fresh.clone(),
                 vec![
@@ -1474,5 +1615,508 @@ mod tests {
         );
         assert_eq!(failed.failure.as_deref(), Some("error_during_execution"));
         assert_eq!(failed.answer, None);
+    }
+
+    const SID: &str = "9c9796f0-2682-4546-a963-d314b3ad543f";
+
+    /// A home whose transcript of `SID` was written by Claude 2.1.294
+    /// with claude-opus-5-5, and a fake `claude` that answers `--version`
+    /// by running the shell text `version` and otherwise appends a line
+    /// to the transcript and writes its arguments to `ran`.
+    struct Resume {
+        _dir: tempfile::TempDir,
+        home: PathBuf,
+        transcript: PathBuf,
+        adapter: ClaudeCode,
+        env: Vec<(EnvVarName, String)>,
+    }
+
+    impl Resume {
+        /// A fake `claude` that answers `--version` with `version_line`.
+        fn new(version_line: &str) -> Self {
+            Self::answering(&format!("echo '{version_line}'"))
+        }
+
+        fn answering(version: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let home = std::fs::canonicalize(dir.path()).unwrap();
+            let work = home.join("work");
+            std::fs::create_dir_all(&work).unwrap();
+            let key = ClaudeCode::key_of(&AbsPath::parse(work.to_str().unwrap()).unwrap()).unwrap();
+            let project = home.join(".claude/projects").join(key);
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(home.join(".claude/projects/.DS_Store"), "").unwrap();
+            let transcript = project.join(format!("{SID}.jsonl"));
+            std::fs::write(
+                &transcript,
+                "{\"type\":\"assistant\",\"version\":\"2.1.294\",\"isSidechain\":false,\"message\":{\"model\":\"claude-opus-5-5\"}}\n",
+            )
+            .unwrap();
+            let binary = home.join("claude");
+            std::fs::write(
+                &binary,
+                format!(
+                    "#!/bin/sh\n\
+                     if [ \"$1\" = --version ]; then {version}; exit 0; fi\n\
+                     echo '{{\"type\":\"user\"}}' >> '{}'\n\
+                     printf '%s\\n' \"$@\" > \"$HOME/ran\"\n",
+                    transcript.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let adapter = ClaudeCode::new(
+                AbsPath::parse(home.to_str().unwrap()).unwrap(),
+                OsString::new(),
+            )
+            .with_binary(&AbsPath::parse(binary.to_str().unwrap()).unwrap());
+            let env = vec![(
+                EnvVarName::parse("HOME").unwrap(),
+                home.to_str().unwrap().to_owned(),
+            )];
+            Resume {
+                _dir: dir,
+                home,
+                transcript,
+                adapter,
+                env,
+            }
+        }
+
+        async fn launch(&self) -> Result<Running, HarnessError> {
+            let launch = Launch::Headless {
+                resume: Some(SessionId::parse(SID).unwrap()),
+                prompt: "next".to_owned(),
+            };
+            self.adapter
+                .launch(&self.home.join("work"), launch, &self.env)
+                .await
+        }
+
+        fn ran(&self) -> Option<Vec<String>> {
+            let text = std::fs::read_to_string(self.home.join("ran")).ok()?;
+            Some(text.lines().map(str::to_owned).collect())
+        }
+    }
+
+    /// An older claude on this node is refused before it starts, so the
+    /// transcript a newer one wrote keeps its bytes.
+    #[tokio::test]
+    async fn an_older_claude_is_refused_before_it_starts() {
+        let fixture = Resume::new("2.1.199 (Claude Code)");
+        let before = std::fs::read(&fixture.transcript).unwrap();
+        let refused = fixture.launch().await.unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                HarnessError::HarnessOlderThanSession { local, recorded, .. }
+                    if local.as_str() == "2.1.199" && recorded.as_str() == "2.1.294"
+            ),
+            "{refused}"
+        );
+        assert_eq!(std::fs::read(&fixture.transcript).unwrap(), before);
+        assert_eq!(fixture.ran(), None, "the older claude ran");
+    }
+
+    /// A project key or a transcript of the session that is a symlink, as
+    /// a folder synced from another Mac makes it, refuses the resume as it
+    /// refuses capture: Claude follows the link and appends to what a newer
+    /// Claude wrote there, so a guard that skipped it would let an older
+    /// Claude run unguarded.
+    #[tokio::test]
+    async fn a_symlinked_key_or_transcript_refuses_the_resume_as_capture_does() {
+        let fixture = Resume::new("2.1.199 (Claude Code)");
+        let newer = "{\"type\":\"assistant\",\"version\":\"2.1.300\",\"isSidechain\":false,\"message\":{\"model\":\"claude-fable-5\"}}\n";
+        std::fs::write(&fixture.transcript, newer).unwrap();
+        let key = fixture.transcript.parent().unwrap().to_path_buf();
+        let shared = fixture.home.join("shared-key");
+        std::fs::rename(&key, &shared).unwrap();
+        std::os::unix::fs::symlink(&shared, &key).unwrap();
+        let refused = fixture.launch().await.unwrap_err();
+        assert!(
+            matches!(&refused, HarnessError::SymlinkInState { path } if *path == key),
+            "{refused}"
+        );
+        assert_eq!(fixture.ran(), None, "the older claude ran");
+
+        std::fs::remove_file(&key).unwrap();
+        std::fs::create_dir(&key).unwrap();
+        let shared_transcript = shared.join(format!("{SID}.jsonl"));
+        std::os::unix::fs::symlink(&shared_transcript, &fixture.transcript).unwrap();
+        let refused = fixture.launch().await.unwrap_err();
+        assert!(
+            matches!(&refused, HarnessError::SymlinkInState { path } if *path == fixture.transcript),
+            "{refused}"
+        );
+        assert_eq!(fixture.ran(), None, "the older claude ran");
+        assert_eq!(std::fs::read_to_string(&shared_transcript).unwrap(), newer);
+    }
+
+    /// A session whose transcripts sit under two project keys resumes with
+    /// the model of the workspace's own key, the one `claude --resume`
+    /// reads from the workspace, even when the other key sorts after it.
+    #[tokio::test]
+    async fn the_workspace_transcript_gives_the_model_over_another_key() {
+        let fixture = Resume::new("2.1.294 (Claude Code)");
+        let other = fixture.home.join(".claude/projects/zz-other-key");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(
+            other.join(format!("{SID}.jsonl")),
+            "{\"type\":\"assistant\",\"version\":\"2.1.294\",\"isSidechain\":false,\"message\":{\"model\":\"claude-fable-5\"}}\n",
+        )
+        .unwrap();
+        let mut running = fixture.launch().await.unwrap();
+        running.child_mut().wait().await.unwrap();
+        let ran = fixture.ran().unwrap();
+        let model = ran.iter().position(|a| a == "--model").map(|i| &ran[i + 1]);
+        assert_eq!(
+            model.map(String::as_str),
+            Some("claude-opus-5-5"),
+            "{ran:?}"
+        );
+    }
+
+    /// A transcript whose `version` is not a version refuses the resume
+    /// before claude starts, rather than running it unguarded and without
+    /// its model.
+    #[tokio::test]
+    async fn a_transcript_whose_writer_cannot_be_read_is_refused() {
+        let fixture = Resume::new("2.1.294 (Claude Code)");
+        let transcript = std::fs::read_to_string(&fixture.transcript).unwrap();
+        let unreadable = transcript.replace("\"version\":\"2.1.294\"", "\"version\":\"2.1.x\"");
+        assert_ne!(unreadable, transcript);
+        std::fs::write(&fixture.transcript, &unreadable).unwrap();
+        let refused = fixture.launch().await.unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                HarnessError::Malformed {
+                    what: crate::error::Input::TranscriptLine,
+                    ..
+                }
+            ),
+            "{refused}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&fixture.transcript).unwrap(),
+            unreadable
+        );
+        assert_eq!(fixture.ran(), None, "claude ran unguarded");
+    }
+
+    /// Transcripts of the session under other project keys count: the
+    /// newest writer of any key is the guard's floor, and their model is
+    /// used when the workspace's own transcript names none.
+    #[tokio::test]
+    async fn transcripts_under_other_project_keys_are_read() {
+        let fixture = Resume::new("2.1.294 (Claude Code)");
+        let other = fixture.home.join(".claude/projects/-elsewhere");
+        std::fs::create_dir_all(&other).unwrap();
+        let elsewhere = other.join(format!("{SID}.jsonl"));
+        std::fs::write(
+            &elsewhere,
+            "{\"type\":\"assistant\",\"version\":\"2.1.300\",\"isSidechain\":false,\"message\":{\"model\":\"claude-fable-5\"}}\n",
+        )
+        .unwrap();
+        let refused = fixture.launch().await.unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                HarnessError::HarnessOlderThanSession { local, recorded, .. }
+                    if local.as_str() == "2.1.294" && recorded.as_str() == "2.1.300"
+            ),
+            "{refused}"
+        );
+        assert_eq!(fixture.ran(), None, "the older claude ran");
+
+        std::fs::write(
+            &elsewhere,
+            "{\"type\":\"assistant\",\"version\":\"2.1.294\",\"isSidechain\":false,\"message\":{\"model\":\"claude-fable-5\"}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &fixture.transcript,
+            "{\"type\":\"user\",\"version\":\"2.1.294\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let mut running = fixture.launch().await.unwrap();
+        running.child_mut().wait().await.unwrap();
+        let ran = fixture.ran().unwrap();
+        let model = ran.iter().position(|a| a == "--model").map(|i| &ran[i + 1]);
+        assert_eq!(model.map(String::as_str), Some("claude-fable-5"), "{ran:?}");
+    }
+
+    /// A workspace whose key Claude cuts and hashes, with the session's
+    /// transcripts under several keys: Claude resumes from the hashed one,
+    /// which Fabric cannot name, so no model is passed and the CLI is told
+    /// why, with every model the keys end on, each once, rather than the
+    /// model of whichever key sorts last. Every key still guards the resume.
+    #[tokio::test]
+    async fn a_cut_key_with_transcripts_under_several_keys_carries_no_model() {
+        let fixture = Resume::new("2.1.294 (Claude Code)");
+        let long = fixture
+            .home
+            .join("work")
+            .join("a".repeat(80))
+            .join("b".repeat(80))
+            .join("c".repeat(80));
+        std::fs::create_dir_all(&long).unwrap();
+        std::fs::remove_file(&fixture.transcript).unwrap();
+        let line = |version: &str, model: &str| {
+            format!(
+                "{{\"type\":\"assistant\",\"version\":\"{version}\",\"isSidechain\":false,\"message\":{{\"model\":\"{model}\"}}}}\n"
+            )
+        };
+        let projects = fixture.home.join(".claude/projects");
+        let cut = projects.join("-cut-key-1a2b3c");
+        let copy = projects.join("-mm-copy-key");
+        let stale = projects.join("-zz-stale-key");
+        for dir in [&cut, &copy, &stale] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(
+            copy.join(format!("{SID}.jsonl")),
+            line("2.1.294", "claude-opus-4-8"),
+        )
+        .unwrap();
+        let launch = || Launch::Headless {
+            resume: Some(SessionId::parse(SID).unwrap()),
+            prompt: "next".to_owned(),
+        };
+        std::fs::write(
+            cut.join(format!("{SID}.jsonl")),
+            line("2.1.300", "claude-fable-5"),
+        )
+        .unwrap();
+        std::fs::write(
+            stale.join(format!("{SID}.jsonl")),
+            line("2.1.294", "claude-opus-4-8"),
+        )
+        .unwrap();
+        let refused = fixture
+            .adapter
+            .launch(&long, launch(), &fixture.env)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                HarnessError::HarnessOlderThanSession { recorded, .. } if recorded.as_str() == "2.1.300"
+            ),
+            "{refused}"
+        );
+        assert_eq!(fixture.ran(), None, "the older claude ran");
+
+        std::fs::write(
+            cut.join(format!("{SID}.jsonl")),
+            line("2.1.294", "claude-fable-5"),
+        )
+        .unwrap();
+        let mut running = fixture
+            .adapter
+            .launch(&long, launch(), &fixture.env)
+            .await
+            .unwrap();
+        running.child_mut().wait().await.unwrap();
+        let ran = fixture.ran().unwrap();
+        assert!(!ran.iter().any(|a| a == "--model"), "{ran:?}");
+        assert_eq!(
+            running.settings().not_carried,
+            [NotCarried::new(
+                SettingName::Model,
+                "claude-fable-5 or claude-opus-4-8",
+                KEY_UNKNOWN
+            )]
+        );
+    }
+
+    /// A cut key leaves the model out only when the keys' transcripts do
+    /// not all end on one model: when each ends on the same model, the key
+    /// Claude resumes from ends on it whichever that is, so it is carried;
+    /// when one records no model, Claude may resume that one on its own
+    /// setting, so none is.
+    #[tokio::test]
+    async fn a_cut_key_carries_the_model_every_key_ends_on() {
+        let fixture = Resume::new("2.1.294 (Claude Code)");
+        let long = fixture
+            .home
+            .join("work")
+            .join("a".repeat(80))
+            .join("b".repeat(80))
+            .join("c".repeat(80));
+        std::fs::create_dir_all(&long).unwrap();
+        std::fs::remove_file(&fixture.transcript).unwrap();
+        let projects = fixture.home.join(".claude/projects");
+        let cut = projects.join("-cut-key-1a2b3c");
+        let stale = projects.join("-zz-stale-key");
+        for dir in [&cut, &stale] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(
+                dir.join(format!("{SID}.jsonl")),
+                "{\"type\":\"assistant\",\"version\":\"2.1.294\",\"isSidechain\":false,\"message\":{\"model\":\"claude-opus-5-5\"}}\n",
+            )
+            .unwrap();
+        }
+        let launch = || Launch::Headless {
+            resume: Some(SessionId::parse(SID).unwrap()),
+            prompt: "next".to_owned(),
+        };
+        let mut running = fixture
+            .adapter
+            .launch(&long, launch(), &fixture.env)
+            .await
+            .unwrap();
+        running.child_mut().wait().await.unwrap();
+        assert_eq!(
+            fixture.ran().unwrap(),
+            [
+                "-p",
+                "--output-format",
+                "json",
+                "--resume",
+                SID,
+                "--model",
+                "claude-opus-5-5",
+                "--",
+                "next"
+            ]
+        );
+        assert_eq!(running.settings().not_carried, []);
+
+        // The fake appended a line to the workspace's own transcript.
+        std::fs::remove_file(&fixture.transcript).unwrap();
+        std::fs::write(
+            stale.join(format!("{SID}.jsonl")),
+            "{\"type\":\"user\",\"version\":\"2.1.294\",\"isSidechain\":false}\n",
+        )
+        .unwrap();
+        let mut running = fixture
+            .adapter
+            .launch(&long, launch(), &fixture.env)
+            .await
+            .unwrap();
+        running.child_mut().wait().await.unwrap();
+        let ran = fixture.ran().unwrap();
+        assert!(!ran.iter().any(|a| a == "--model"), "{ran:?}");
+        assert_eq!(
+            running.settings().not_carried,
+            [NotCarried::new(
+                SettingName::Model,
+                "claude-opus-5-5",
+                KEY_UNKNOWN
+            )]
+        );
+    }
+
+    /// A workspace whose project key is over 200 characters, which Claude
+    /// cuts and hashes, still resumes: its own key only orders the
+    /// transcripts, and every key is still read and guarded.
+    #[tokio::test]
+    async fn a_workspace_whose_key_claude_cuts_still_resumes_guarded() {
+        let fixture = Resume::new("2.1.294 (Claude Code)");
+        let long = fixture
+            .home
+            .join("work")
+            .join("a".repeat(80))
+            .join("b".repeat(80))
+            .join("c".repeat(80));
+        std::fs::create_dir_all(&long).unwrap();
+        let root = AbsPath::parse(long.to_str().unwrap()).unwrap();
+        assert!(matches!(
+            ClaudeCode::key_of(&root),
+            Err(HarnessError::ProjectKeyTooLong { .. })
+        ));
+        std::fs::remove_file(&fixture.transcript).unwrap();
+        let cut = fixture.home.join(".claude/projects/-cut-key-1a2b3c");
+        std::fs::create_dir_all(&cut).unwrap();
+        let transcript = cut.join(format!("{SID}.jsonl"));
+        let launch = || Launch::Headless {
+            resume: Some(SessionId::parse(SID).unwrap()),
+            prompt: "next".to_owned(),
+        };
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"version\":\"2.1.300\",\"isSidechain\":false,\"message\":{\"model\":\"claude-fable-5\"}}\n",
+        )
+        .unwrap();
+        let refused = fixture
+            .adapter
+            .launch(&long, launch(), &fixture.env)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                HarnessError::HarnessOlderThanSession { recorded, .. } if recorded.as_str() == "2.1.300"
+            ),
+            "{refused}"
+        );
+        assert_eq!(fixture.ran(), None, "the older claude ran");
+
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"version\":\"2.1.294\",\"isSidechain\":false,\"message\":{\"model\":\"claude-fable-5\"}}\n",
+        )
+        .unwrap();
+        let mut running = fixture
+            .adapter
+            .launch(&long, launch(), &fixture.env)
+            .await
+            .unwrap();
+        running.child_mut().wait().await.unwrap();
+        let ran = fixture.ran().unwrap();
+        let model = ran.iter().position(|a| a == "--model").map(|i| &ran[i + 1]);
+        assert_eq!(model.map(String::as_str), Some("claude-fable-5"), "{ran:?}");
+    }
+
+    /// The version is asked in the workspace the launch starts claude in,
+    /// where a version manager's shim may pin another version than it
+    /// picks anywhere else.
+    #[tokio::test]
+    async fn the_version_is_asked_in_the_workspace_claude_starts_in() {
+        let fixture = Resume::answering(
+            "if [ -f .tool-versions ]; then echo '2.1.199 (Claude Code)'; else echo '2.1.294 (Claude Code)'; fi",
+        );
+        std::fs::write(fixture.home.join("work/.tool-versions"), "claude 2.1.199\n").unwrap();
+        let refused = fixture.launch().await.unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                HarnessError::HarnessOlderThanSession { local, .. } if local.as_str() == "2.1.199"
+            ),
+            "{refused}"
+        );
+        assert_eq!(fixture.ran(), None, "the pinned older claude ran");
+    }
+
+    /// A resume passes the model the session last ran with, and says so.
+    #[tokio::test]
+    async fn a_resume_passes_the_model_the_session_ran_with() {
+        let fixture = Resume::new("2.1.294 (Claude Code)");
+        let mut running = fixture.launch().await.unwrap();
+        running.child_mut().wait().await.unwrap();
+        assert_eq!(
+            fixture.ran().unwrap(),
+            [
+                "-p",
+                "--output-format",
+                "json",
+                "--resume",
+                SID,
+                "--model",
+                "claude-opus-5-5",
+                "--",
+                "next"
+            ]
+        );
+        assert_eq!(
+            running.settings().passed,
+            [PassedSetting {
+                name: SettingName::Model,
+                value: "claude-opus-5-5".to_owned(),
+                origin: Origin::Session,
+            }]
+        );
     }
 }

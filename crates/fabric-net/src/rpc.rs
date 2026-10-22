@@ -45,9 +45,9 @@ use crate::tls::Trust;
 use crate::transport::{Connection, Stream, TransportError, TransportKind};
 use crate::wire::{
     Appended, ChunkBatch, Facts, Fault, FaultText, Fenced, Hello, JobAnswer, JobRequest,
-    JobResponse, ManifestChunks, MoveRequested, MoveState, Offered, PROTOCOL_VERSION, Pulled,
-    RecordBytes, RecordPage, Request, RequestBody, RequestId, Response, ResponseBody, VersionText,
-    WireError, decode, encode, wall_clock_ms,
+    JobResponse, KnownWriter, ManifestChunks, MoveRequested, MoveState, Offered, PROTOCOL_VERSION,
+    Pulled, RecordBytes, RecordPage, Request, RequestBody, RequestId, Response, ResponseBody,
+    VersionText, WireError, decode, encode, wall_clock_ms,
 };
 
 /// A clock difference between two nodes above this is logged at `Hello`.
@@ -188,9 +188,10 @@ pub type JobFuture<'a, T> = BoxFuture<'a, Result<Fenced<T>, Fault>>;
 ///
 /// Every per-job method answers a message from `peer` sent under the
 /// fencing `token`, and runs the ADR 0003 epoch check before it acts on the
-/// rest, except `pull` and `move_status`: both are reads, the asker of a
-/// pull is catching up, and the source asking for a move's decision is one
-/// epoch behind once the target imported. A per-job message can write ledger records, so its future always
+/// rest, except `pull`, `move_status` and `known_writer`: all are reads,
+/// the asker of a pull is catching up, the source asking for a move's
+/// decision is one epoch behind once the target imported, and a node about
+/// to pull the job asks its owner for the known writer from any epoch. A per-job message can write ledger records, so its future always
 /// runs to its end, even after the caller's budget ran out and the caller
 /// was told `Fault::Deadline`. The caller then treats the outcome as
 /// unknown and asks again, with `MoveStatus` for a move.
@@ -227,6 +228,8 @@ pub trait Service: Send + Sync {
         token: FencingToken,
         move_id: MoveId,
     ) -> JobFuture<'_, RecordBytes>;
+    /// Answers `KnownWriter`: the newest version of the job's harness known to have written its session, when this node owns the job.
+    fn known_writer(&self, peer: NodeId, token: FencingToken) -> JobFuture<'_, KnownWriter>;
     /// Returns the length and chunk list of `snapshot`'s manifest for `peer`.
     fn manifest(
         &self,
@@ -654,6 +657,15 @@ impl Session {
     ) -> Result<Fenced<RecordBytes>, RpcError> {
         self.job(token, JobRequest::MoveAbort { move_id }, deadline)
             .await
+    }
+
+    /// Asks the owner for the newest version of the job's harness known to have written its session under `token`, waiting at most `deadline`.
+    pub async fn known_writer(
+        &self,
+        token: FencingToken,
+        deadline: Duration,
+    ) -> Result<Fenced<KnownWriter>, RpcError> {
+        self.job(token, JobRequest::KnownWriter, deadline).await
     }
 
     /// Asks for the length and chunk list of `snapshot`'s manifest, waiting at most `deadline`.
@@ -1093,6 +1105,7 @@ async fn answer_job(
             .move_abort(peer, token, move_id)
             .await?
             .into_response(),
+        JobRequest::KnownWriter => service.known_writer(peer, token).await?.into_response(),
     })
 }
 
@@ -1438,6 +1451,10 @@ mod tests {
         }
 
         fn move_abort(&self, _: NodeId, _: FencingToken, _: MoveId) -> JobFuture<'_, RecordBytes> {
+            no_job()
+        }
+
+        fn known_writer(&self, _: NodeId, _: FencingToken) -> JobFuture<'_, KnownWriter> {
             no_job()
         }
 

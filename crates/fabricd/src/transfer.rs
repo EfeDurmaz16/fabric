@@ -286,8 +286,8 @@ mod tests {
     use fabric_net::tls::Trust;
     use fabric_net::transport::{Connection, Transport};
     use fabric_net::wire::{
-        Appended, Facts, Fault, FaultText, ManifestChunks, MoveRequested, MoveState, Offered,
-        Pulled, RecordBytes, RecordPage, VersionText,
+        Appended, Facts, Fault, FaultText, KnownWriter, ManifestChunks, MoveRequested, MoveState,
+        Offered, Pulled, RecordBytes, RecordPage, VersionText,
     };
     use fabric_store::objects::ChunkParams;
 
@@ -337,6 +337,10 @@ mod tests {
         }
 
         fn move_abort(&self, _: NodeId, _: FencingToken, _: MoveId) -> JobFuture<'_, RecordBytes> {
+            not_here()
+        }
+
+        fn known_writer(&self, _: NodeId, _: FencingToken) -> JobFuture<'_, KnownWriter> {
             not_here()
         }
 

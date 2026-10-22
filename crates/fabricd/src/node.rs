@@ -244,7 +244,7 @@ impl Node {
             Ok(None) => Response::Done { lines: out.lines },
             Ok(Some(plan)) => Response::Run {
                 lines: out.lines,
-                plan,
+                plan: Box::new(plan),
             },
             Err(e) => Response::Failed {
                 lines: out.lines,

@@ -14,10 +14,10 @@ use std::path::{Path, PathBuf};
 
 use fabric_core::harness::{HarnessKind, ProgramName};
 use fabric_core::path::{AbsPath, PathError};
-use fabric_harness::Harness;
 use fabric_harness::acp::AcpHarness;
 use fabric_harness::claude::ClaudeCode;
 use fabric_harness::codex::Codex;
+use fabric_harness::{Harness, HarnessVersion};
 use serde::{Deserialize, Serialize};
 
 /// Why a harness could not be named or configured.
@@ -228,16 +228,23 @@ impl HarnessEnv {
     }
 }
 
-/// Builds the adapter for `kind` on this node.
+/// Builds the adapter for `kind` on this node. `known_writer` is the
+/// newest harness version known to have written the session the adapter
+/// will capture (`SessionRecord::known_writer`); only the Codex adapter
+/// takes it, because a Claude transcript records the version of every
+/// Claude that wrote a line and an ACP agent's state is opaque.
 pub fn adapter(
     kind: &HarnessKind,
     env: &HarnessEnv,
+    known_writer: Option<HarnessVersion>,
 ) -> Result<Box<dyn Harness>, HarnessConfigError> {
     Ok(match kind {
         HarnessKind::ClaudeCode => {
             Box::new(ClaudeCode::new(env.home.clone(), env.path_var.clone()))
         }
-        HarnessKind::Codex => Box::new(Codex::new(env.home.clone(), env.path_var.clone())),
+        HarnessKind::Codex => Box::new(
+            Codex::new(env.home.clone(), env.path_var.clone()).with_known_writer(known_writer),
+        ),
         HarnessKind::Acp { program, args } => Box::new(acp_adapter(program, args, env)?),
     })
 }

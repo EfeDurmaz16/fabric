@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, NodeId, RecordHash, SnapshotId};
-use fabric_harness::SessionId;
+use fabric_harness::{HarnessVersion, SessionId};
 use rustix::process::{Pid, Signal};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -202,6 +202,16 @@ pub struct SessionRecord {
     pub harness: HarnessKind,
     /// The session id the harness minted.
     pub session: SessionId,
+    /// For a Codex session, the newest Codex known to have written it: the
+    /// version the capture this node restored, or took last, recorded,
+    /// raised to the version each launch on the session started with. A
+    /// Codex that resumes a thread leaves no version in its rollout, so
+    /// this is what keeps an older Codex off a thread a newer one
+    /// continued elsewhere (ADR 0006, Settings travel with the session).
+    /// `None` for any other harness, whose guard reads the session's own
+    /// files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_writer: Option<HarnessVersion>,
 }
 
 /// A session a registration recorded before its `Resumed`, until the

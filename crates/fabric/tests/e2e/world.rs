@@ -80,7 +80,8 @@ impl Env {
     /// Puts a fake `claude` first on the `PATH`: it answers `--version` as
     /// the gate's Claude does and otherwise writes its arguments, one per
     /// line, to `claude-args` and its environment to `claude-env` under the
-    /// home. With `-p` it also appends the prompt to the session's
+    /// home. With `-p` it also appends the prompt and an answer by
+    /// `claude-opus-5-5`, both stamped with its version, to the session's
     /// transcript under `~/.claude/projects/<slug>/`, as Claude does, and
     /// prints the one result object `claude -p --output-format json` prints.
     pub fn install_fake_claude(&self) -> Fallible {
@@ -102,7 +103,8 @@ impl Env {
              [ -n \"$headless\" ] || exit 0\n\
              dir=\"$HOME/.claude/projects/$(pwd -P | sed 's/[^A-Za-z0-9]/-/g')\"\n\
              mkdir -p \"$dir\"\n\
-             printf '{\"type\":\"user\",\"sessionId\":\"%s\",\"message\":{\"role\":\"user\",\"content\":\"%s\"}}\\n' \"$session\" \"$prompt\" >> \"$dir/$session.jsonl\"\n\
+             printf '{\"type\":\"user\",\"version\":\"2.1.294\",\"sessionId\":\"%s\",\"message\":{\"role\":\"user\",\"content\":\"%s\"}}\\n' \"$session\" \"$prompt\" >> \"$dir/$session.jsonl\"\n\
+             printf '{\"type\":\"assistant\",\"version\":\"2.1.294\",\"sessionId\":\"%s\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-opus-5-5\"}}\\n' \"$session\" >> \"$dir/$session.jsonl\"\n\
              printf '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"claude did: %s\",\"session_id\":\"%s\"}\\n' \"$prompt\" \"$session\"\n",
         )
     }
@@ -111,26 +113,39 @@ impl Env {
     pub const CODEX_THREAD: &str = "019f233e-bb33-7342-85fa-f2d33b14368a";
 
     /// Puts a fake `codex` first on the `PATH`: it answers `--version` as
-    /// the gate's Codex does and otherwise writes its arguments, one per
-    /// line, to `codex-args` and its environment to `codex-env` under the
-    /// home. Under `exec` it appends the prompt to the thread's rollout
-    /// under `~/.codex/sessions/`, starting `CODEX_THREAD`, or the thread
-    /// `exec resume` names, and prints the events `codex exec --json`
-    /// prints for one turn. After `thread.started` it waits up to five
+    /// the gate's Codex does, `0.155.1`, or with the version in the
+    /// node's `codex-version` file when there is one, or, as an asdf shim
+    /// does, with the `codex` line of a `.tool-versions` in the directory
+    /// it runs in, and otherwise
+    /// writes its arguments, one per line, to `codex-args` and its
+    /// environment to `codex-env` under the home. Under `exec` it appends the prompt and the turn's settings
+    /// (gpt-6-sol, xhigh, on-request, workspace-write) to the thread's
+    /// rollout under `~/.codex/sessions/`, whose first line records the
+    /// Codex that created it, as Codex records no version on a resume,
+    /// starting `CODEX_THREAD`, or the thread `exec resume`
+    /// names, and prints the events `codex exec --json` prints for one turn. After `thread.started` it waits up to five
     /// seconds for the node's session record of the job and writes `yes`
     /// or `no` to `codex-saw-session`, so a test can tell the thread was
     /// recorded while the turn ran. With `FAKE_CODEX_WAIT` set it then
     /// touches `codex-waiting` and runs until a `SIGINT`, which it writes
     /// to `codex-signal` before it exits with 130. With
-    /// `FAKE_CODEX_LATE_STDERR` set it leaves a process behind that writes
-    /// `codex: late diagnostics` to its standard error half a second after
-    /// the turn ends, with its standard output already closed.
+    /// `FAKE_CODEX_PROBE_WAIT` set, `--version` touches `codex-probing`
+    /// and answers three seconds later. With `FAKE_CODEX_LATE_STDERR` set
+    /// it leaves a process behind that writes `codex: late diagnostics` to
+    /// its standard error half a second after the turn ends, with its
+    /// standard output already closed.
     pub fn install_fake_codex(&self) -> Fallible {
         self.install(
             "codex",
             &format!(
                 "#!/bin/sh\n\
-                 if [ \"$1\" = --version ]; then echo 'codex-cli 0.155.1'; exit 0; fi\n\
+                 version=0.155.1\n\
+                 [ ! -f \"$FABRIC_HOME/codex-version\" ] || version=$(cat \"$FABRIC_HOME/codex-version\")\n\
+                 [ ! -f .tool-versions ] || version=$(sed -n 's/^codex //p' .tool-versions)\n\
+                 if [ \"$1\" = --version ]; then\n\
+                   if [ -n \"$FAKE_CODEX_PROBE_WAIT\" ]; then touch \"$HOME/codex-probing\"; sleep 3; fi\n\
+                   echo \"codex-cli $version\"; exit 0\n\
+                 fi\n\
                  printf '%s\\n' \"$@\" > \"$HOME/codex-args\"\n\
                  env > \"$HOME/codex-env\"\n\
                  [ \"$1\" = exec ] || exit 0\n\
@@ -141,7 +156,8 @@ impl Env {
                  dir=\"$HOME/.codex/sessions/2026/10/21\"\n\
                  mkdir -p \"$dir\"\n\
                  file=\"$dir/rollout-2026-10-21T10-00-00-$thread.jsonl\"\n\
-                 [ -f \"$file\" ] || printf '{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"%s\",\"cwd\":\"%s\"}}}}\\n' \"$thread\" \"$(pwd -P)\" > \"$file\"\n\
+                 [ -f \"$file\" ] || printf '{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"%s\",\"cwd\":\"%s\",\"cli_version\":\"%s\"}}}}\\n' \"$thread\" \"$(pwd -P)\" \"$version\" > \"$file\"\n\
+                 printf '{{\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-6-sol\",\"effort\":\"xhigh\",\"approval_policy\":\"on-request\",\"sandbox_policy\":{{\"type\":\"workspace-write\"}}}}}}\\n' >> \"$file\"\n\
                  printf '{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"%s\"}}]}}}}\\n' \"$prompt\" >> \"$file\"\n\
                  printf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread\"\n\
                  record=\"$FABRIC_HOME/jobs/$(basename \"$(dirname \"$(pwd -P)\")\")/session\"\n\

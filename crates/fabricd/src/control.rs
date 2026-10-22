@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, JobId, NodeId, RecordHash};
-use fabric_harness::SessionId;
+use fabric_harness::{HarnessVersion, SessionId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -181,6 +181,11 @@ pub struct StartedHarness {
     /// turn of an earlier launch can name its session while this launch
     /// runs its setup steps, and the node then refuses this one.
     pub planned: Option<SessionId>,
+    /// The version the launch asked of the harness it started, in the
+    /// workspace and environment it started it in, when it asked: the
+    /// newest known to have run that session, which a later resume of it
+    /// must not go below.
+    pub version: Option<HarnessVersion>,
 }
 
 /// A session a running harness named, for `Request::HarnessSession`.
@@ -223,6 +228,9 @@ pub struct RunPlan {
     pub harness: HarnessKind,
     /// The session to continue; a new one when `None`.
     pub session: Option<SessionId>,
+    /// The newest harness version known to have written that session,
+    /// which the launch's resume guard refuses to go below.
+    pub known_writer: Option<HarnessVersion>,
     /// The job's goal, the first message of a new session.
     pub goal: String,
     /// The node's harness configuration, which the launch must use.
@@ -245,8 +253,8 @@ pub enum Response {
     Run {
         /// What happened, one line per step or choice.
         lines: Vec<String>,
-        /// What to launch.
-        plan: RunPlan,
+        /// What to launch; boxed, as the largest answer by far.
+        plan: Box<RunPlan>,
     },
     /// Refused or failed; print the lines, then the error.
     Failed {

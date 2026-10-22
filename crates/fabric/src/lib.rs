@@ -35,7 +35,9 @@ use fabric_core::id::{EnvSpecId, JobId, NodeId};
 use fabric_env::materialize::{CacheHealth, MaterializeError, NodeEnv, TreeLock};
 use fabric_harness::claude::{ClaudeCode, LeftReason, TrustOutcome};
 use fabric_harness::codex::Codex;
-use fabric_harness::{Harness, Launch, Running, SessionId, TurnReport};
+use fabric_harness::{
+    Harness, Launch, LaunchSettings, Origin, PassedSetting, Running, SessionId, TurnReport,
+};
 use fabric_net::endpoint::DialOrder;
 use fabricd::control::{
     self, ControlError, Decision, NO_DAEMON_EXIT, NamedSession, Refusal, Request, Response,
@@ -306,7 +308,7 @@ async fn ask(socket: &Path, request: Request, notes: Notes) -> Result<Option<Run
         }
         Response::Run { lines, plan } => {
             notes.print(&lines)?;
-            Ok(Some(plan))
+            Ok(Some(*plan))
         }
         Response::Failed {
             lines,
@@ -578,18 +580,27 @@ async fn launch(
     // the setup steps still ends the command.
     let mut interrupts = Interrupts::new()?;
     let (adapter, how) = adapter_for(home, plan, mode, notes, &env).await?;
-    // An adapter whose launch is dropped before it returns kills what it started.
+    // The resume guard runs inside the launch, before the harness exists,
+    // and can wait as long as a `--version` run; a signal then ends the
+    // command with nothing started. An adapter whose launch is dropped
+    // before it returns kills what it started, and a signal already caught
+    // wins over a launch that would finish in the same poll.
     let mut running = tokio::select! {
+        biased;
+        signal = interrupts.next() => return Ok(interrupted_before_start(signal)),
         running = adapter.launch(&plan.root, how, &env) => running?,
-        signal = interrupts.next() => return interrupted(signal, plan),
     };
     let pid = running.pid();
-    let registered = tokio::select! {
-        registered = register(&socket, plan, &running, notes) => registered,
-        signal = interrupts.next() => {
-            kill_group(&running);
-            return interrupted(signal, plan);
-        }
+    let said = settings_lines(&plan.harness, plan.session.as_ref(), running.settings());
+    let registered = match notes.print(&said) {
+        Ok(()) => tokio::select! {
+            registered = register(&socket, plan, &running, notes) => registered,
+            signal = interrupts.next() => {
+                kill_group(&running);
+                return interrupted(signal, plan);
+            }
+        },
+        Err(e) => Err(e),
     };
     drop(tree);
     if let Err(e) = registered {
@@ -714,7 +725,8 @@ async fn adapter_for(
             (Box::new(claude), launch)
         }
         HarnessKind::Codex => {
-            let codex = Codex::new(harness_env.home.clone(), harness_env.path_var.clone());
+            let codex = Codex::new(harness_env.home.clone(), harness_env.path_var.clone())
+                .with_known_writer(plan.known_writer.clone());
             (Box::new(codex), launch)
         }
         HarnessKind::Acp { program, args } => {
@@ -726,6 +738,66 @@ async fn adapter_for(
             (Box::new(agent), launch)
         }
     })
+}
+
+/// What the CLI says once the harness has started: the session it
+/// continues and the settings the launch carried, and one line for each
+/// setting the session records that the launch left out, with why, so a
+/// job never runs on another model or sandbox without the user being told
+/// (gate finding F10).
+fn settings_lines(
+    harness: &HarnessKind,
+    session: Option<&SessionId>,
+    settings: &LaunchSettings,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    match (session, settings_words(&settings.passed)) {
+        (Some(session), Some(with)) => {
+            lines.push(format!(
+                "continuing {harness} session {session} with {with}"
+            ));
+        }
+        (Some(session), None) => lines.push(format!("continuing {harness} session {session}")),
+        (None, Some(with)) => lines.push(format!("{harness} runs with {with}")),
+        (None, None) => {}
+    }
+    for left in &settings.not_carried {
+        lines.push(format!(
+            "{} {} is not carried ({}); {harness} uses its own setting",
+            left.name, left.value, left.reason
+        ));
+    }
+    lines
+}
+
+/// `model gpt-6-sol, effort xhigh (recorded in the session)`, with the
+/// origin once when every setting shares it and after each one otherwise.
+fn settings_words(passed: &[PassedSetting]) -> Option<String> {
+    let first = passed.first()?;
+    let shared = passed.iter().all(|p| p.origin == first.origin);
+    let items: Vec<String> = passed
+        .iter()
+        .map(|p| {
+            if shared {
+                format!("{} {}", p.name, p.value)
+            } else {
+                format!("{} {} ({})", p.name, p.value, origin_words(p.origin))
+            }
+        })
+        .collect();
+    let words = items.join(", ");
+    Some(if shared {
+        format!("{words} ({})", origin_words(first.origin))
+    } else {
+        words
+    })
+}
+
+fn origin_words(origin: Origin) -> &'static str {
+    match origin {
+        Origin::Session => "recorded in the session",
+        Origin::Pinned => "pinned",
+    }
 }
 
 /// Tells the node the harness started, so it records it and appends
@@ -741,6 +813,7 @@ async fn register(socket: &Path, plan: &RunPlan, running: &Running, notes: Notes
             harness: plan.harness.clone(),
             session: running.session().cloned(),
             planned: plan.session.clone(),
+            version: running.version().cloned(),
         }),
     )
     .await;
@@ -834,6 +907,19 @@ fn interrupted(signal: rustix::process::Signal, plan: &RunPlan) -> Result<ExitCo
         plan.job
     )?;
     Ok(signal_exit(number))
+}
+
+/// Ends a launch that `signal` cut before the harness started, as while
+/// the resume guard asks the harness its version: nothing was started, or
+/// what the launch had begun was stopped when it was dropped, before any
+/// turn. The terminal may be gone, as after a hang-up; the exit code still
+/// says what ended the command.
+fn interrupted_before_start(signal: rustix::process::Signal) -> ExitCode {
+    let _ = writeln!(
+        std::io::stderr(),
+        "interrupted before the harness started; no turn ran"
+    );
+    signal_exit(signal.as_raw())
 }
 
 /// The exit code of a command ended by the signal numbered `number`.
@@ -1362,6 +1448,8 @@ fn pid_of(running: &Running) -> Option<rustix::process::Pid> {
 
 #[cfg(test)]
 mod tests {
+    use fabric_harness::{NotCarried, SettingName};
+
     use super::*;
 
     /// The signal tests send a signal to this whole process, which every
@@ -1403,6 +1491,7 @@ mod tests {
             root: dir.join("work"),
             harness: HarnessKind::Codex,
             session: None,
+            known_writer: None,
             goal: "goal".to_owned(),
             harness_config: fabricd::harnesses::HarnessConfig::default(),
             home: dir.to_owned(),
@@ -1659,6 +1748,68 @@ mod tests {
         );
     }
 
+    fn passed(name: SettingName, value: &str, origin: Origin) -> PassedSetting {
+        PassedSetting {
+            name,
+            value: value.to_owned(),
+            origin,
+        }
+    }
+
+    /// The continuing line names the carried settings and where they came
+    /// from, and each setting left out gets a line saying why. A resume
+    /// that carries nothing still says which session it continues, since
+    /// the node no longer prints a continuing line of its own.
+    #[test]
+    fn the_report_names_what_was_carried_and_what_was_not() {
+        let session = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
+        let settings = LaunchSettings {
+            passed: vec![
+                passed(SettingName::Model, "gpt-6-sol", Origin::Session),
+                passed(SettingName::Effort, "xhigh", Origin::Session),
+            ],
+            not_carried: vec![NotCarried {
+                name: SettingName::Sandbox,
+                value: "danger-full-access".to_owned(),
+                reason: "Fabric never passes full access, ADR 0006".to_owned(),
+            }],
+        };
+        assert_eq!(
+            settings_lines(&HarnessKind::Codex, Some(&session), &settings),
+            [
+                "continuing codex session 019f233e-bb33-7342-85fa-f2d33b14368a with model gpt-6-sol, effort xhigh (recorded in the session)",
+                "sandbox danger-full-access is not carried (Fabric never passes full access, ADR 0006); codex uses its own setting",
+            ]
+        );
+        let mixed = LaunchSettings {
+            passed: vec![
+                passed(SettingName::Model, "o3", Origin::Pinned),
+                passed(SettingName::Effort, "xhigh", Origin::Session),
+            ],
+            not_carried: Vec::new(),
+        };
+        assert_eq!(
+            settings_lines(&HarnessKind::Codex, None, &mixed),
+            ["codex runs with model o3 (pinned), effort xhigh (recorded in the session)"]
+        );
+        assert!(settings_lines(&HarnessKind::Codex, None, &LaunchSettings::default()).is_empty());
+        let nothing_carried = LaunchSettings {
+            passed: Vec::new(),
+            not_carried: vec![NotCarried {
+                name: SettingName::Model,
+                value: "claude-fable-5 or claude-opus-4-8".to_owned(),
+                reason: "the session has transcripts under several project keys".to_owned(),
+            }],
+        };
+        assert_eq!(
+            settings_lines(&HarnessKind::ClaudeCode, Some(&session), &nothing_carried),
+            [
+                "continuing claude-code session 019f233e-bb33-7342-85fa-f2d33b14368a",
+                "model claude-fable-5 or claude-opus-4-8 is not carried (the session has transcripts under several project keys); claude-code uses its own setting",
+            ]
+        );
+    }
+
     /// The node captures and restores harness state under its own home.
     /// A CLI whose `HOME` resolves elsewhere, with the same `FABRIC_HOME`,
     /// would launch the harness against its home, and the session would
@@ -1675,6 +1826,7 @@ mod tests {
             root: dir.path().join("work"),
             harness: HarnessKind::Codex,
             session: None,
+            known_writer: None,
             goal: "goal".to_owned(),
             harness_config: fabricd::harnesses::HarnessConfig::default(),
             home: dir.path().join("the-nodes"),
@@ -1725,6 +1877,7 @@ mod tests {
             root,
             harness: HarnessKind::Codex,
             session: None,
+            known_writer: None,
             goal: "goal".to_owned(),
             harness_config: fabricd::harnesses::HarnessConfig::default(),
             home: home.clone(),
