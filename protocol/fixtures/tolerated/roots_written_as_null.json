@@ -1,0 +1,21 @@
+{
+  "schema": "request",
+  "value": {
+    "op": "doctor",
+    "env": {
+      "path": [
+        "/bin"
+      ],
+      "roots": null
+    }
+  },
+  "reads_as": {
+    "op": "doctor",
+    "env": {
+      "path": [
+        "/bin"
+      ],
+      "roots": {}
+    }
+  }
+}

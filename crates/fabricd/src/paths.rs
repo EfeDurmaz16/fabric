@@ -114,6 +114,13 @@ impl StateDir {
         self.root.join("daemon.lock")
     }
 
+    /// The environment the last local client sent, which the node uses
+    /// for work no client asks for (ADR 0018, The client's environment).
+    #[must_use]
+    pub fn client_env(&self) -> PathBuf {
+        self.root.join("client-env")
+    }
+
     /// The optional harness configuration file.
     #[must_use]
     pub fn harness_config(&self) -> PathBuf {
@@ -241,13 +248,17 @@ impl JobDir {
     }
 }
 
+/// The directory under `home` that holds every job's root and the copies
+/// set aside beside it: `<home>/fabric/jobs`.
+#[must_use]
+pub fn home_jobs(home: &Path) -> PathBuf {
+    home.join("fabric").join("jobs")
+}
+
 /// The root of a job made on a node with home `home`: `<home>/fabric/jobs/<job-id>/work`.
 #[must_use]
 pub fn job_root(home: &Path, job: JobId) -> PathBuf {
-    home.join("fabric")
-        .join("jobs")
-        .join(job.to_string())
-        .join("work")
+    home_jobs(home).join(job.to_string()).join("work")
 }
 
 /// Where a departed copy of the workspace at `root` goes once another node

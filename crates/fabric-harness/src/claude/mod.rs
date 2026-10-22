@@ -69,6 +69,7 @@ use fabric_core::BoxFuture;
 use fabric_core::env::EnvVarName;
 use fabric_core::harness::HarnessKind;
 use fabric_core::path::AbsPath;
+use fabric_core::session::SessionId;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
@@ -83,7 +84,6 @@ use crate::manifest::{HOME_PREFIX, Mutability, StateManifest, under_home};
 use crate::pipeline::{self, Capturer, Destination};
 use crate::process;
 use crate::redact::{RedactionCounts, Redactor};
-use crate::session::SessionId;
 use crate::stage::{Carry, Source};
 
 use self::flags::LaunchFlags;
@@ -960,7 +960,7 @@ impl ClaudeCode {
     }
 
     fn fresh_session() -> SessionId {
-        SessionId::from_uuid(uuid::Uuid::new_v4())
+        SessionId::from_uuid_bytes(uuid::Uuid::new_v4().into_bytes())
     }
 
     async fn launch_impl(

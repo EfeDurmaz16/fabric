@@ -1,0 +1,18 @@
+{
+  "kind": "node_list",
+  "peers": [
+    {
+      "node": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+      "addrs": [
+        "air.local:7777",
+        "10.0.0.2:7777"
+      ],
+      "connected": true
+    },
+    {
+      "node": "fab1ambqgaydambqgaydambqgaydambqgaydambqgaydambqgaydambq",
+      "addrs": [],
+      "connected": false
+    }
+  ]
+}

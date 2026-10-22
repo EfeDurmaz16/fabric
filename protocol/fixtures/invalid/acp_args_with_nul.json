@@ -1,0 +1,16 @@
+{
+  "schema": "request",
+  "value": {
+    "op": "job_new",
+    "repo": "/r",
+    "goal": "g",
+    "harness": {
+      "kind": "acp",
+      "program": "opencode",
+      "args": [
+        "acp",
+        "--model\u0000x"
+      ]
+    }
+  }
+}

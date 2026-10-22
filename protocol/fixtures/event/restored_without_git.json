@@ -1,0 +1,25 @@
+{
+  "kind": "restored",
+  "snapshot": "abababababababababababababababababababababababababababababababab",
+  "files": 4,
+  "bytes": 92,
+  "classes": {
+    "git": false,
+    "tracked": {
+      "files": 0,
+      "bytes": 0
+    },
+    "untracked": {
+      "files": 0,
+      "bytes": 0
+    },
+    "ignored": {
+      "files": 3,
+      "bytes": 85
+    },
+    "harness": {
+      "files": 1,
+      "bytes": 7
+    }
+  }
+}

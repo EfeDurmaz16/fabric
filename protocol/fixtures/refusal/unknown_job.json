@@ -1,0 +1,8 @@
+{
+  "kind": "not_owner",
+  "reason": {
+    "code": "unknown_job",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0"
+  },
+  "message": "job 01JABCDEFGHJKMNPQRSTVWXYZ0 is not known on this node"
+}

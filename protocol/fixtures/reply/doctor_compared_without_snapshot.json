@@ -1,0 +1,30 @@
+{
+  "kind": "doctor",
+  "report": {
+    "kind": "compared",
+    "peer": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+    "rows": [
+      {
+        "fact": "user",
+        "here": "me",
+        "peer": "me",
+        "outcome": "equal",
+        "note": ""
+      },
+      {
+        "fact": "os",
+        "here": "macos",
+        "peer": "linux",
+        "outcome": "warn",
+        "note": "only a path nothing on the target can make again crosses; the carry lines say what happens to each path, ADR 0012"
+      }
+    ],
+    "carry": {
+      "paths": [],
+      "more": [],
+      "refused": [],
+      "refused_more": 0,
+      "session_captured": false
+    }
+  }
+}

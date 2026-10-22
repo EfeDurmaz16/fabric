@@ -9,22 +9,31 @@
 //! does anything else with the job, and never becomes runnable again
 //! without a record the target wrote (ADR 0003).
 
-use std::ffi::OsString;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use fabric_client::api::{
+    CaptureGroup, CaptureNote, CarryFor, CarryLine, CarryReport, ClientEnv, ClosedJob, Decision,
+    DoctorReport, Event, Fact, HarnessSession, JobCreated, JobList, JobLog, JobStatus, JobSummary,
+    Lease, LedgerEvent, LogRecord, NodeIdentity, Paired, Peer, PeerList, Pong, Process, Reason,
+    Refusal, Registered, Reply, Request, RestoredClasses, RunPlan, SessionRecorded,
+    SnapshotSession, SnapshotState, Standing, StealWarning, Step, Suspended, Verdict, VerdictCount,
+    View, Wire, Workspace, WorkspaceState,
+};
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::{FenceError, FencingToken};
-use fabric_core::ledger::{Author, EventKind, Ledger};
+use fabric_core::ledger::{Author, EventKind, Ledger, LedgerError};
 use fabric_core::moves::{AbortAnswer, CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
+use fabric_core::session::SessionId;
 use fabric_core::snapshot::LeaveReason;
+use fabric_core::version::HarnessVersion;
 use fabric_env::materialize::{MaterializeError, TreeLock};
+use fabric_harness::HarnessError;
 use fabric_harness::codex::Codex;
 use fabric_harness::manifest::{MANIFEST_FILE, StateManifest};
-use fabric_harness::{HarnessError, HarnessVersion, SessionId};
 use fabric_net::peers::HostPort;
 use fabric_net::rpc::Session;
 use fabric_net::wire::{
@@ -40,7 +49,6 @@ use fabric_store::restore::{
 
 use crate::carry::{self, PathDecision};
 use crate::clock;
-use crate::control::{Decision, NamedSession, Request, RunPlan, StartedHarness};
 use crate::doctor::{self, Context, Target};
 use crate::error::NodeError;
 use crate::facts::{MeasuredKeys, NodeFacts};
@@ -49,8 +57,9 @@ use crate::harnesses::{HarnessConfig, HarnessEnv, adapter, refuse_secret_kind};
 use crate::job::Job;
 use crate::local::{self, HarnessRecord, Liveness, Marker, MarkerState, SessionRecord};
 use crate::node::{Node, Out, is_transport};
-use crate::paths::{self, SyncedFolders, check_root, restore_root};
+use crate::paths::{self, RootChoice, SyncedFolders, check_root, restore_root};
 use crate::stamp::TreeStamp;
+use crate::tool_env::ToolEnv;
 use crate::transfer::{fetch_snapshot, is_complete, with_store};
 
 /// How long a harness gets between `SIGTERM` and `SIGKILL` when a suspend stops it.
@@ -68,9 +77,10 @@ pub const MOVE_DEADLINE: Duration = Duration::from_mins(10);
 /// How long a status question or a ping may take.
 pub const SHORT_DEADLINE: Duration = Duration::from_secs(15);
 
-/// The bytes of lines `job log` and `job ls` answer with at most: half the
-/// control message cap, which leaves room for the encoding around them.
-const LINES_BUDGET: usize = crate::control::MAX_CONTROL_MESSAGE / 2;
+/// The bytes of JSON `job log`, `job ls` and `node ls` answer with at
+/// most: half the control frame cap, which leaves room for the encoding
+/// around them.
+const LIST_BUDGET: usize = fabric_client::frame::MAX_FRAME / 2;
 
 /// How many times a move asks again after a lost answer before it reports the move frozen.
 const MOVE_TRIES: usize = 5;
@@ -83,13 +93,138 @@ enum Asked {
 }
 
 impl Node {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per op, so how every request is served reads in one place"
+    )]
     pub(crate) async fn dispatch(
         self: &Arc<Self>,
         request: Request,
         out: &mut Out,
-    ) -> Result<Option<RunPlan>, NodeError> {
-        // Reads answer from local state at once; a command that changes a
-        // job waits until start-up recovery has learned what the peers wrote.
+    ) -> Result<Reply, NodeError> {
+        self.wait_for_recovery(&request, out).await;
+        if let Some(env) = request.env() {
+            self.remember_env(env);
+        }
+        Ok(match request {
+            Request::NodeId => Reply::NodeId(NodeIdentity {
+                node: self.id,
+                listen: self.local_addr()?,
+            }),
+            Request::NodeAdd { node, addr } => {
+                Reply::NodeAdd(self.node_add(node, addr.as_deref()).await?)
+            }
+            Request::NodeList => Reply::NodeList(self.node_list()),
+            Request::NodePing { node } => Reply::NodePing(self.node_ping(node).await?),
+            Request::JobNew {
+                repo,
+                goal,
+                harness,
+            } => Reply::JobNew(self.job_new(repo.as_path(), goal, harness).await?),
+            Request::JobList => Reply::JobList(self.job_list().await),
+            Request::JobStatus { job } => Reply::JobStatus(Box::new(self.job_status(job).await?)),
+            Request::JobLog { job } => Reply::JobLog(self.job_log(job).await?),
+            Request::JobRun { job, env: _ } => {
+                self.resolve_departing(job, out).await?;
+                self.check_peers(job, out).await;
+                Reply::JobRun(self.job_run(job, out).await?)
+            }
+            Request::JobResume {
+                job,
+                on,
+                harness,
+                force,
+                env,
+            } => {
+                let env = self.client_env(env.as_ref());
+                Reply::JobResume(
+                    Box::pin(self.job_resume(job, on, harness, force, &env, out)).await?,
+                )
+            }
+            Request::HarnessStarted {
+                job,
+                epoch,
+                pid,
+                harness,
+                session,
+                planned,
+                version,
+            } => Reply::HarnessStarted(
+                self.harness_started(StartedHarness {
+                    job,
+                    epoch,
+                    pid,
+                    harness,
+                    session,
+                    planned,
+                    version,
+                })
+                .await?,
+            ),
+            Request::LaunchCheck {
+                job,
+                epoch,
+                head,
+                harness,
+                session,
+            } => {
+                self.launch_check(job, epoch, head, &harness, session.as_ref())
+                    .await?;
+                Reply::LaunchCheck
+            }
+            Request::HarnessExited { job, pid } => {
+                self.harness_exited(job, pid).await?;
+                Reply::HarnessExited
+            }
+            Request::HarnessSession {
+                job,
+                epoch,
+                pid,
+                harness,
+                session,
+            } => Reply::HarnessSession(
+                self.harness_session(job, epoch, pid, harness, session)
+                    .await?,
+            ),
+            Request::JobSuspend { job, env } => {
+                let env = self.client_env(env.as_ref());
+                self.resolve_departing(job, out).await?;
+                let snapshot = self.suspend(job, &env, out).await?;
+                self.replicate(job, out).await;
+                Reply::JobSuspend(Suspended { snapshot })
+            }
+            Request::JobMove {
+                job,
+                to,
+                force,
+                env,
+            } => {
+                let env = self.client_env(env.as_ref());
+                Reply::JobMove(self.job_move(job, to, force, &env, out).await?)
+            }
+            Request::JobSteal { job, reason, force } => {
+                Reply::JobSteal(self.job_steal(job, reason, force, out).await?)
+            }
+            Request::JobDecide {
+                job,
+                decision,
+                note,
+            } => Reply::JobDecide(fabric_client::api::Decided {
+                text: self.job_decide(job, decision, &note).await?,
+            }),
+            Request::Doctor { peer, job, env } => {
+                let env = self.client_env(env.as_ref());
+                Reply::Doctor {
+                    report: self.doctor(peer, job, &env, out).await?,
+                }
+            }
+        })
+    }
+
+    /// Reads answer from local state at once, saying so while start-up
+    /// recovery runs; a command that changes a job waits until recovery has
+    /// learned what the peers wrote.
+    async fn wait_for_recovery(&self, request: &Request, out: &mut Out) {
         let reads = matches!(
             request,
             Request::JobList | Request::JobStatus { .. } | Request::JobLog { .. }
@@ -103,93 +238,27 @@ impl Node {
                 | Request::Doctor { .. }
         );
         if reads && !self.is_recovered() {
-            out.say(
-                "this node is still catching up with its peers after a restart; what follows may not show what they wrote",
-            );
+            out.emit(Event::CatchingUp);
         } else if !reads && !node_only {
             self.recovered().await;
         }
-        match request {
-            Request::NodeId => {
-                out.say(format!("{}", self.id));
-                out.say(format!("listening on {}", self.local_addr()?));
-            }
-            Request::NodeAdd { node, addr } => self.node_add(node, addr.as_deref(), out).await?,
-            Request::NodeList => self.node_list(out),
-            Request::NodePing { node } => self.node_ping(node, out).await?,
-            Request::JobNew {
-                repo,
-                goal,
-                harness,
-            } => self.job_new(&repo, goal, harness, out).await?,
-            Request::JobList => self.job_list(out).await,
-            Request::JobStatus { job } => self.job_status(job, out).await?,
-            Request::JobLog { job } => self.job_log(job, out).await?,
-            Request::JobRun { job } => {
-                self.resolve_departing(job, out).await?;
-                self.check_peers(job, out).await;
-                return Ok(Some(self.job_run(job, out).await?));
-            }
-            Request::JobResume {
-                job,
-                on,
-                harness,
-                force,
-                path_var,
-            } => {
-                return Ok(Some(
-                    Box::pin(self.job_resume(job, on, harness, force, &path_var, out)).await?,
-                ));
-            }
-            Request::HarnessStarted(started) => self.harness_started(started, out).await?,
-            Request::LaunchCheck {
-                job,
-                epoch,
-                head,
-                harness,
-                session,
-            } => {
-                self.launch_check(job, epoch, head, &harness, session.as_ref())
-                    .await?;
-            }
-            Request::HarnessExited { job, pid } => self.harness_exited(job, pid).await?,
-            Request::HarnessSession(named) => self.harness_session(named, out).await?,
-            Request::JobSuspend { job, path_var } => {
-                self.resolve_departing(job, out).await?;
-                self.suspend(job, &path_var, out).await?;
-                self.replicate(job, out).await;
-            }
-            Request::JobMove {
-                job,
-                to,
-                force,
-                path_var,
-            } => self.job_move(job, to, force, &path_var, out).await?,
-            Request::JobSteal { job, reason, force } => {
-                self.job_steal(job, reason, force, out).await?;
-            }
-            Request::JobDecide {
-                job,
-                decision,
-                note,
-            } => {
-                self.job_decide(job, decision, &note, out).await?;
-            }
-            Request::Doctor {
-                peer,
-                job,
-                path_var,
-            } => self.doctor(peer, job, &path_var, out).await?,
-        }
-        Ok(None)
     }
 
-    async fn node_add(
-        &self,
-        node: NodeId,
-        addr: Option<&str>,
-        out: &mut Out,
-    ) -> Result<(), NodeError> {
+    /// The environment a client sent, or the one the node started with
+    /// (ADR 0018, The client's environment).
+    fn client_env(&self, env: Option<&ClientEnv>) -> ToolEnv {
+        env.map_or_else(|| self.node_env(), ToolEnv::from)
+    }
+
+    /// Who owns `id` now, at which epoch.
+    #[cfg(test)]
+    async fn lease(&self, id: JobId) -> Result<Lease, NodeError> {
+        let job = self.job(id).await?;
+        let job = job.lock().await;
+        Ok(lease_of(&job))
+    }
+
+    async fn node_add(&self, node: NodeId, addr: Option<&str>) -> Result<Paired, NodeError> {
         let addr: Option<HostPort> = addr
             .map(|text| {
                 text.parse()
@@ -204,78 +273,56 @@ impl Node {
         tokio::task::spawn_blocking(move || peers.update(|book| book.pair(node, addr)))
             .await
             .map_err(|e| NodeError::Task(e.to_string()))??;
-        out.say(match shown {
-            Some(addr) => format!("paired {node} at {addr}"),
-            None => format!(
-                "paired {node} with no address: it may dial this node, and this node never dials it"
-            ),
-        });
-        Ok(())
+        Ok(Paired { node, addr: shown })
     }
 
-    fn node_list(&self, out: &mut Out) {
-        self.node_list_within(LINES_BUDGET, out);
+    fn node_list(&self) -> PeerList {
+        self.node_list_within(LIST_BUDGET)
     }
 
-    /// Lists every paired node in one row each, in the book's order,
-    /// keeping the last rows that fit in `budget` bytes: a row is bounded
-    /// by the addresses the book keeps for a peer, but the book does not
-    /// bound how many peers it holds, and enough of them would otherwise
-    /// answer past the control message cap.
-    fn node_list_within(&self, budget: usize, out: &mut Out) {
+    /// Lists every paired node in the book's order, keeping the last that
+    /// fit in `budget` bytes of JSON: an entry is bounded by the addresses
+    /// the book keeps for a peer, but the book does not bound how many
+    /// peers it holds, and enough of them would otherwise answer past the
+    /// frame cap.
+    fn node_list_within(&self, budget: usize) -> PeerList {
         let book = self.peers.snapshot();
-        let mut lines = Vec::new();
-        for entry in book.iter() {
-            let connected = if self.open_session(entry.node()).is_some() {
-                "connected"
-            } else {
-                "not connected"
-            };
-            let addrs: Vec<String> = entry.addrs().iter().map(ToString::to_string).collect();
-            lines.push(format!(
-                "{} {} ({connected})",
-                entry.node(),
-                if addrs.is_empty() {
-                    "-".to_owned()
-                } else {
-                    addrs.join(",")
-                }
-            ));
+        let peers = book
+            .iter()
+            .map(|entry| Peer {
+                node: entry.node(),
+                addrs: entry.addrs().iter().map(ToString::to_string).collect(),
+                connected: self.open_session(entry.node()).is_some(),
+            })
+            .collect();
+        let (left_out, peers) = latest_within(peers, budget);
+        PeerList {
+            peers,
+            left_out: count(left_out),
         }
-        if lines.is_empty() {
-            out.say("no paired nodes; pair one with `fabric node add <node-id> <host:port>`");
-            return;
-        }
-        let (left_out, kept) = latest_within(lines, budget);
-        if left_out > 0 {
-            out.say(format!(
-                "the first {left_out} paired nodes are left out; the other {} fill one answer",
-                kept.len()
-            ));
-        }
-        out.lines.extend(kept);
     }
 
     /// Pings `node` over its live session, or a new dial when there is
     /// none or the live one fails: a second dial while a session is live
     /// would replace it and cut the calls other commands make on it.
-    async fn node_ping(self: &Arc<Self>, node: NodeId, out: &mut Out) -> Result<(), NodeError> {
-        let (took, wire, skew) = self
+    async fn node_ping(self: &Arc<Self>, node: NodeId) -> Result<Pong, NodeError> {
+        let (took, wire, clock_skew_ms) = self
             .call(node, |session| async move {
                 let started = tokio::time::Instant::now();
                 session.ping(SHORT_DEADLINE).await?;
                 Ok((
                     started.elapsed(),
-                    session.kind().to_string(),
+                    wire(session.kind()),
                     session.clock_skew_ms(),
                 ))
             })
             .await?;
-        out.say(format!(
-            "{node} answered in {} ms over {wire}; its clock is {skew} ms from this one",
-            took.as_millis(),
-        ));
-        Ok(())
+        Ok(Pong {
+            node,
+            rtt_ms: u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
+            wire,
+            clock_skew_ms,
+        })
     }
 
     async fn job_new(
@@ -283,12 +330,11 @@ impl Node {
         repo: &Path,
         goal: String,
         harness: HarnessKind,
-        out: &mut Out,
-    ) -> Result<(), NodeError> {
+    ) -> Result<JobCreated, NodeError> {
         refuse_secret_kind(&harness)?;
         let id = clock::job_id();
         let root = paths::job_root(&self.cfg.home, id);
-        let synced = synced_folders(&self.cfg.home, &self.cfg.path_var).await;
+        let synced = synced_folders(&self.cfg.home, &self.node_env()).await;
         check_root(&root, &self.cfg.home, synced)?;
         // Built before the clone: a goal past the record bound refuses
         // here, not after a clone that no job and no printed id names.
@@ -345,60 +391,60 @@ impl Node {
             .lock()
             .await
             .insert(id, Arc::new(tokio::sync::Mutex::new(job)));
-        out.say(format!("{id}"));
-        out.say(format!(
-            "root {}: a clone of {} under ~/fabric/jobs, the same path on every node with this home (ADR 0011)",
-            root.display(),
-            repo.display()
-        ));
-        out.say(format!(
-            "harness {harness}; this node owns the job at epoch {}",
-            Epoch::FIRST
-        ));
-        Ok(())
+        Ok(JobCreated {
+            job: id,
+            root,
+            repo: repo.to_owned(),
+            harness,
+            epoch: Epoch::FIRST,
+        })
     }
 
-    async fn job_list(&self, out: &mut Out) {
-        self.job_list_within(LINES_BUDGET, out).await;
+    async fn job_list(&self) -> JobList {
+        self.job_list_within(LIST_BUDGET).await
     }
 
-    /// Lists every job in one row each, oldest first, keeping the latest
-    /// rows that fit in `budget` bytes: each row is bounded, and a node
-    /// that made tens of thousands of jobs would otherwise answer past the
-    /// control message cap.
-    async fn job_list_within(&self, budget: usize, out: &mut Out) {
+    /// Lists every job, oldest first, then each job whose ledger did not
+    /// open, keeping the latest entries that fit in `budget` bytes of JSON:
+    /// an entry is bounded, since a goal is listed by its first line cut to
+    /// `SUMMARY_CHARS`, and a node that made tens of thousands of jobs
+    /// would otherwise answer past the frame cap.
+    async fn job_list_within(&self, budget: usize) -> JobList {
         let jobs: Vec<_> = self.jobs.lock().await.values().cloned().collect();
-        let mut lines = Vec::new();
+        let mut listed = Vec::with_capacity(jobs.len());
         for job in jobs {
             let job = job.lock().await;
             let manifest = job.ledger().manifest();
-            let word = match job.forked() {
-                Ok(Some(_)) => "frozen",
-                Ok(None) => view_word(&job.view(self.id)),
-                Err(_) => "unreadable",
+            let standing = match job.forked() {
+                Ok(Some(_)) => Standing::Frozen,
+                Ok(None) => standing(&job.view(self.id)),
+                Err(_) => Standing::Unreadable,
             };
-            lines.push(format!(
-                "{} {word} epoch {} {}",
-                job.id(),
-                manifest.lease.epoch(),
-                summary(&manifest.goal)
-            ));
+            listed.push(Listed::Job(JobSummary {
+                job: job.id(),
+                standing,
+                epoch: manifest.lease.epoch(),
+                goal: summary(&manifest.goal),
+            }));
         }
-        for (id, error) in self.broken_jobs() {
-            lines.push(format!("{id} closed: {error}"));
+        listed.extend(
+            self.broken_jobs()
+                .into_iter()
+                .map(|(job, error)| Listed::Closed(ClosedJob { job, error })),
+        );
+        let (left_out, kept) = latest_within(listed, budget);
+        let mut list = JobList {
+            jobs: Vec::new(),
+            closed: Vec::new(),
+            left_out: count(left_out),
+        };
+        for entry in kept {
+            match entry {
+                Listed::Job(job) => list.jobs.push(job),
+                Listed::Closed(closed) => list.closed.push(closed),
+            }
         }
-        if lines.is_empty() {
-            out.say("no jobs; make one with `fabric job new --repo <path> --goal <text>`");
-            return;
-        }
-        let (left_out, kept) = latest_within(lines, budget);
-        if left_out > 0 {
-            out.say(format!(
-                "the {left_out} oldest jobs are left out; the latest {} fill one answer, and `fabric job status <job>` shows any job",
-                kept.len()
-            ));
-        }
-        out.lines.extend(kept);
+        list
     }
 
     fn broken_jobs(&self) -> Vec<(JobId, String)> {
@@ -410,108 +456,118 @@ impl Node {
             .collect()
     }
 
-    async fn job_status(self: &Arc<Self>, id: JobId, out: &mut Out) -> Result<(), NodeError> {
+    async fn job_status(self: &Arc<Self>, id: JobId) -> Result<JobStatus, NodeError> {
         let job = self.job(id).await?;
         let job = job.lock().await;
         let manifest = job.ledger().manifest();
-        out.say(format!("job {id}"));
-        out.say(format!("goal: {}", manifest.goal));
-        out.say(format!("harness: {}", manifest.harness));
-        let owner = manifest.lease.holder();
-        out.say(format!(
-            "owner: {owner}{} at epoch {}",
-            if owner == self.id { " (this node)" } else { "" },
-            manifest.lease.epoch()
-        ));
-        let forked = job.forked()?;
-        out.say(match (job.view(self.id), &forked) {
-            (_, Some(fork)) => format!(
-                "this node: frozen; {}'s ledger at epoch {} does not continue this node's, so the job was stolen while this node ran it. This copy never runs again; run `fabric job resume {id}` on {} to continue there",
-                fork.peer, fork.epoch, fork.peer
-            ),
-            (LeaseView::Owner(_), None) => "this node: owner".to_owned(),
-            (LeaseView::Departing { move_id, target }, None) => format!(
-                "this node: departing to {target} under move {move_id}; frozen until {target} answers. Run `fabric job move {id} --to {target}` to ask again, or `fabric job steal {id} --force` on another node"
-            ),
-            (LeaseView::Departed { owner, epoch }, None) => format!(
-                "this node: departed; {owner} owns the job at epoch {epoch} and this copy never runs"
-            ),
-            (LeaseView::Replica { owner, .. }, None) => {
-                format!("this node: replica; run `fabric job resume {id}` to pull it from {owner}")
-            }
-        });
-        out.say(match (manifest.latest_snapshot, job.suspended_in()) {
-            (None, _) => "snapshot: none yet".to_owned(),
-            (Some(s), Some(_)) => format!("snapshot: {s} (suspended in it)"),
-            (Some(s), None) => format!("snapshot: {s} (resumed since)"),
-        });
-        if let Some(snapshot) = manifest.latest_snapshot {
-            let read = with_store(&self.store, move |store| Ok(store.manifest(snapshot)?)).await;
-            out.say(match read {
-                Ok(snapshot_manifest) => match session_line(&snapshot_manifest) {
-                    Some(line) => format!("session: {line}"),
-                    None => format!("session: captured in snapshot {snapshot}"),
-                },
-                Err(e) => format!("session: snapshot {snapshot} could not be read: {e}"),
-            });
-        }
-        out.say(match job.marker()? {
-            None => "workspace: none on this node".to_owned(),
-            Some(marker) => workspace_line(&job, self.id, &marker, forked.is_some()).await,
-        });
-        let running = match job.harness_record()? {
-            Some(record) => match record.liveness().await {
-                Liveness::Leader => format!(
-                    "harness: running as pid {} since epoch {}",
-                    record.pid, record.epoch
-                ),
-                Liveness::Group => format!(
-                    "harness: pid {} exited and processes it started still run in its group; `fabric job suspend {id}` stops them",
-                    record.pid
-                ),
-                Liveness::Gone => "harness: not running".to_owned(),
-                Liveness::Unknown => format!(
-                    "harness: pid {} leads a process group and its start time could not be read, so whether it is still the harness is not known",
-                    record.pid
-                ),
+        // A record that does not read is reported in its place, so the
+        // status still says everything else: it is what a user runs to
+        // find out why a job is broken (review finding on PR #13).
+        let forked = job.forked();
+        let view = match (job.view(self.id), &forked) {
+            (_, Err(e)) => View::Unreadable {
+                error: e.to_string(),
             },
-            None => "harness: not running".to_owned(),
+            (_, Ok(Some(fork))) => View::Frozen {
+                peer: fork.peer,
+                epoch: fork.epoch,
+            },
+            (LeaseView::Owner(_), Ok(None)) => View::Owner,
+            (LeaseView::Departing { move_id, target }, Ok(None)) => {
+                View::Departing { move_id, target }
+            }
+            (LeaseView::Departed { owner, epoch }, Ok(None)) => View::Departed { owner, epoch },
+            (LeaseView::Replica { owner, epoch }, Ok(None)) => View::Replica { owner, epoch },
         };
-        out.say(running);
-        out.say(format!("records: {}", manifest.event_count));
-        Ok(())
+        let snapshot = match manifest.latest_snapshot {
+            Some(id) => {
+                let read = with_store(&self.store, move |store| Ok(store.manifest(id)?)).await;
+                Some(SnapshotState {
+                    id,
+                    suspended: job.suspended_in().is_some(),
+                    session: Some(match read {
+                        Ok(manifest) if manifest.harness_state.entries.is_empty() => {
+                            SnapshotSession::NotCaptured
+                        }
+                        Ok(_) => SnapshotSession::Captured,
+                        Err(e) => SnapshotSession::Unreadable {
+                            error: e.to_string(),
+                        },
+                    }),
+                })
+            }
+            None => None,
+        };
+        // A fork record that does not read may stand for a fork, so the
+        // workspace is judged as a frozen one's: an orphan nothing deletes.
+        let frozen = !matches!(forked, Ok(None));
+        let (workspace, workspace_unreadable) = match job.marker() {
+            Ok(None) => (None, None),
+            Ok(Some(marker)) => (
+                Some(Workspace {
+                    state: workspace_state(&job, self.id, &marker, frozen).await,
+                    root: marker.root,
+                }),
+                None,
+            ),
+            Err(e) => (None, Some(e.to_string())),
+        };
+        let process = match job.harness_record() {
+            Ok(Some(record)) => match record.liveness().await {
+                Liveness::Leader => Process::Running {
+                    pid: record.pid,
+                    epoch: record.epoch,
+                },
+                Liveness::Group => Process::GroupRemains { pid: record.pid },
+                Liveness::Gone => Process::NotRunning,
+                Liveness::Unknown => Process::Unconfirmed { pid: record.pid },
+            },
+            Ok(None) => Process::NotRunning,
+            Err(e) => Process::Unreadable {
+                error: e.to_string(),
+            },
+        };
+        Ok(JobStatus {
+            job: id,
+            node: self.id,
+            goal: manifest.goal.clone(),
+            harness: manifest.harness.clone(),
+            owner: manifest.lease.holder(),
+            epoch: manifest.lease.epoch(),
+            view,
+            snapshot,
+            workspace,
+            workspace_unreadable,
+            process,
+            records: manifest.event_count,
+        })
     }
 
-    /// Prints the job's records, the latest ones when all of them would not
-    /// fit in one control answer.
-    async fn job_log(&self, id: JobId, out: &mut Out) -> Result<(), NodeError> {
+    /// The job's records, the latest ones when all of them would not fit
+    /// in one control answer.
+    async fn job_log(&self, id: JobId) -> Result<JobLog, NodeError> {
         let job = self.job(id).await?;
         let job = job.lock().await;
-        let lines: Vec<String> = job
+        let records: Vec<LogRecord> = job
             .ledger()
             .records()
             .iter()
-            .enumerate()
-            .map(|(n, record)| {
+            .map(|record| {
                 let event = record.event();
-                format!(
-                    "{n:>4} epoch {} at {} {}",
-                    event.epoch,
-                    event.at,
-                    describe(&event.kind)
-                )
+                LogRecord {
+                    id: event.id,
+                    epoch: event.epoch,
+                    at: event.at,
+                    event: ledger_event(&event.kind),
+                }
             })
             .collect();
         // A record is at most 1 MiB, so the latest one always fits.
-        let (start, kept) = latest_within(lines, LINES_BUDGET);
-        if start > 0 {
-            out.say(format!(
-                "the first {start} records are left out; the latest {} fill one answer",
-                kept.len()
-            ));
-        }
-        out.lines.extend(kept);
-        Ok(())
+        let (start, records) = latest_within(records, LIST_BUDGET);
+        Ok(JobLog {
+            left_out: count(start),
+            records,
+        })
     }
 
     async fn job_run(self: &Arc<Self>, id: JobId, out: &mut Out) -> Result<RunPlan, NodeError> {
@@ -531,15 +587,13 @@ impl Node {
             MarkerState::Suspending { .. } => {
                 return Err(NodeError::Unfinished {
                     job: id,
-                    what: "a suspend",
-                    command: "suspend",
+                    step: Step::Suspend,
                 });
             }
             MarkerState::Restoring { .. } => {
                 return Err(NodeError::Unfinished {
                     job: id,
-                    what: "a restore",
-                    command: "resume",
+                    step: Step::Restore,
                 });
             }
         }
@@ -548,7 +602,7 @@ impl Node {
         {
             return Err(NodeError::AlreadyRunningHarness {
                 job: id,
-                pid: record.pid.get(),
+                pid: record.pid,
             });
         }
         plan(
@@ -595,7 +649,7 @@ impl Node {
         {
             return Err(NodeError::AlreadyRunningHarness {
                 job: id,
-                pid: record.pid.get(),
+                pid: record.pid,
             });
         }
         if job.ledger().head() != head {
@@ -619,8 +673,7 @@ impl Node {
     pub(crate) async fn harness_started(
         &self,
         started: StartedHarness,
-        out: &mut Out,
-    ) -> Result<(), NodeError> {
+    ) -> Result<Registered, NodeError> {
         let StartedHarness {
             job: id,
             epoch,
@@ -648,7 +701,7 @@ impl Node {
         {
             return Err(NodeError::AlreadyRunningHarness {
                 job: id,
-                pid: record.pid.get(),
+                pid: record.pid,
             });
         }
         // The setup steps ran after the CLI's check, and an earlier
@@ -706,10 +759,11 @@ impl Node {
                 epoch,
             })?;
         }
-        out.say(format!(
-            "Resumed recorded at epoch {epoch}; {harness} runs as pid {pid}"
-        ));
-        Ok(())
+        Ok(Registered {
+            epoch,
+            harness,
+            pid,
+        })
     }
 
     /// Records the session a harness named after it started, for the
@@ -725,16 +779,12 @@ impl Node {
     /// the job's workspace (`job_session`).
     pub(crate) async fn harness_session(
         &self,
-        named: NamedSession,
-        out: &mut Out,
-    ) -> Result<(), NodeError> {
-        let NamedSession {
-            job: id,
-            epoch,
-            pid,
-            harness,
-            session,
-        } = named;
+        id: JobId,
+        epoch: Epoch,
+        pid: NonZeroU32,
+        harness: HarnessKind,
+        session: SessionId,
+    ) -> Result<SessionRecorded, NodeError> {
         refuse_secret_kind(&harness)?;
         let job = self.job(id).await?;
         let job = job.lock().await;
@@ -755,8 +805,7 @@ impl Node {
         }
         let record = continued(&job, harness.clone(), session.clone(), None)?;
         local::write(&job.dir().session(), &record)?;
-        out.say(format!("recorded {harness} session {session}"));
-        Ok(())
+        Ok(SessionRecorded { harness, session })
     }
 
     async fn harness_exited(&self, id: JobId, pid: NonZeroU32) -> Result<(), NodeError> {
@@ -784,18 +833,18 @@ impl Node {
     pub(crate) async fn suspend(
         &self,
         id: JobId,
-        path_var: &OsString,
+        env: &ToolEnv,
         out: &mut Out,
     ) -> Result<SnapshotId, NodeError> {
         let job = self.job(id).await?;
         let mut job = job.lock().await;
-        self.suspend_locked(&mut job, path_var, out).await
+        self.suspend_locked(&mut job, env, out).await
     }
 
     pub(crate) async fn suspend_locked(
         &self,
         job: &mut Job,
-        path_var: &OsString,
+        env: &ToolEnv,
         out: &mut Out,
     ) -> Result<SnapshotId, NodeError> {
         let id = job.id();
@@ -804,11 +853,11 @@ impl Node {
             return job.suspended_in().ok_or(NodeError::NoWorkspace(id));
         };
         if !marker.is_current(epoch, job.latest()).await {
-            out.say(format!(
-                "the workspace at {} was left at epoch {}, before this node's tenure, so it is not captured; `fabric job resume {id}` sets it aside",
-                marker.root.display(),
-                marker.epoch
-            ));
+            out.emit(Event::StaleWorkspaceKept {
+                job: id,
+                root: marker.root.clone(),
+                left_at: marker.epoch,
+            });
             return job.suspended_in().ok_or(NodeError::NoWorkspace(id));
         }
         if let (MarkerState::Clean { snapshot, .. }, Some(suspended)) =
@@ -816,18 +865,19 @@ impl Node {
             && *snapshot == suspended
         {
             if marker.is_unchanged().await {
-                out.say(format!("already suspended in snapshot {suspended}"));
+                out.emit(Event::AlreadySuspended {
+                    snapshot: suspended,
+                });
                 return Ok(suspended);
             }
-            out.say(format!(
-                "the workspace changed after snapshot {suspended}, by hand or by a harness Fabric did not start; capturing it again"
-            ));
+            out.emit(Event::WorkspaceChanged {
+                snapshot: suspended,
+            });
         }
         if let MarkerState::Restoring { .. } = marker.state {
             return Err(NodeError::Unfinished {
                 job: id,
-                what: "a restore",
-                command: "resume",
+                step: Step::Restore,
             });
         }
         // The CLI holds the tree's lock from its first setup step until
@@ -841,7 +891,7 @@ impl Node {
         let _tree = self.lock_tree(id, &marker.root)?;
         if let Some(record) = job.harness_record()? {
             if record.liveness().await != Liveness::Gone {
-                out.say(format!("stopping the harness, pid {}", record.pid));
+                out.emit(Event::StoppingHarness { pid: record.pid });
                 record.stop(STOP_GRACE).await?;
             }
             local::remove(&job.dir().harness())?;
@@ -854,7 +904,7 @@ impl Node {
             .last()
             .map(|r| r.event().kind.clone());
         let (snapshot, tree) = if let Some(EventKind::SnapshotPublished { snapshot, .. }) = last {
-            out.say(format!("finishing the suspend that published {snapshot}"));
+            out.emit(Event::FinishingSuspend { snapshot });
             let tree = match marker.state {
                 MarkerState::Suspending { tree, .. } => tree,
                 _ => None,
@@ -872,7 +922,7 @@ impl Node {
                 },
                 epoch,
             })?;
-            let snapshot = self.capture(job, &marker.root, path_var, out).await?;
+            let snapshot = self.capture(job, &marker.root, env, out).await?;
             faults::hit(Point::AfterSnapshotPublish).await;
             job.append(
                 self.id,
@@ -883,17 +933,17 @@ impl Node {
             )?;
             (snapshot, tree)
         };
-        self.confirm_departure(job, path_var, out).await?;
+        self.confirm_departure(job, env, out).await?;
         job.append(self.id, EventKind::Suspended { snapshot })?;
         job.set_marker(&Marker {
             root: marker.root,
             state: MarkerState::Clean { snapshot, tree },
             epoch,
         })?;
-        out.say(format!(
-            "suspended in snapshot {snapshot}; this node keeps the lease at epoch {}",
-            job.ledger().lease().epoch()
-        ));
+        out.emit(Event::Suspended {
+            snapshot,
+            epoch: job.ledger().lease().epoch(),
+        });
         Ok(snapshot)
     }
 
@@ -924,7 +974,7 @@ impl Node {
     async fn confirm_departure(
         &self,
         job: &Job,
-        path_var: &OsString,
+        env: &ToolEnv,
         out: &mut Out,
     ) -> Result<(), NodeError> {
         let Some(record) = job.session()? else {
@@ -935,13 +985,11 @@ impl Node {
             return Ok(());
         }
         let manifest = StateManifest::read(&state_dir)?;
-        let harness = adapter(&record.harness, &self.harness_env(path_var)?, None)?;
+        let harness = adapter(&record.harness, &self.harness_env(env)?, None)?;
         match harness.confirm_departure(&manifest).await {
             Ok(()) => Ok(()),
             Err(HarnessError::DepartureNotPending { session }) => {
-                out.say(format!(
-                    "no departure record waits for session {session}; its rewritable files stay this node's"
-                ));
+                out.emit(Event::NoDepartureRecord { session });
                 Ok(())
             }
             Err(e) => Err(e.into()),
@@ -959,7 +1007,7 @@ impl Node {
         &self,
         job: &Job,
         root: &Path,
-        path_var: &OsString,
+        env: &ToolEnv,
         out: &mut Out,
     ) -> Result<Option<PathBuf>, NodeError> {
         let state_dir = job.dir().harness_state();
@@ -974,7 +1022,7 @@ impl Node {
         // so a node that never ran the session cannot lower it.
         let harness = adapter(
             &record.harness,
-            &self.harness_env(path_var)?,
+            &self.harness_env(env)?,
             record.known_writer.clone(),
         )?;
         let carried = state_names(&state_dir, &record.harness, &session);
@@ -990,12 +1038,11 @@ impl Node {
                 }
                 std::fs::rename(&next, &state_dir).map_err(|e| NodeError::io(&next, e))?;
                 remove_dir_if_any(&old)?;
-                out.say(format!(
-                    "captured {} session {} ({} files)",
-                    record.harness,
-                    session,
-                    manifest.files().len()
-                ));
+                out.emit(Event::SessionCaptured {
+                    harness: record.harness.clone(),
+                    session: session.clone(),
+                    files: count(manifest.files().len()),
+                });
                 let known_writer = writer_after(record.known_writer.clone(), &manifest);
                 local::write(
                     &job.dir().session(),
@@ -1022,21 +1069,20 @@ impl Node {
                         session: state.session().clone(),
                         known_writer: known_writer(state),
                     })?;
-                    format!(
-                        "the snapshot keeps the {} session {} it held before",
-                        state.kind(),
-                        state.session()
-                    )
+                    Some(HarnessSession {
+                        harness: state.kind().clone(),
+                        session: state.session().clone(),
+                    })
                 } else {
                     job.forget_session()?;
                     job.clear_harness_state()?;
-                    "the snapshot carries no harness state and the next run starts a new session"
-                        .to_owned()
+                    None
                 };
-                out.say(format!(
-                    "{} session {} left no state on this node and no snapshot holds it, so it never started; {kept}",
-                    record.harness, session
-                ));
+                out.emit(Event::SessionNeverStarted {
+                    harness: record.harness,
+                    session,
+                    kept,
+                });
                 Ok(before.map(|_| state_dir))
             }
             Err(e) => Err(e.into()),
@@ -1048,11 +1094,11 @@ impl Node {
         &self,
         job: &Job,
         root: &Path,
-        path_var: &OsString,
+        env: &ToolEnv,
         out: &mut Out,
     ) -> Result<SnapshotId, NodeError> {
-        let harness_state = self.capture_harness(job, root, path_var, out).await?;
-        let facts = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
+        let harness_state = self.capture_harness(job, root, env, out).await?;
+        let facts = NodeFacts::measure(&self.cfg.home, env).await;
         // A workspace whose environment does not detect here would not
         // materialize on the target either, so the snapshot is refused
         // before it is published or moved.
@@ -1149,16 +1195,12 @@ impl Node {
         let (snapshot, report, has_git, left_behind) = captured;
         // `files` counts what is outside git; the bundle carries the rest,
         // tracked and untracked, and its bytes are in `bytes`.
-        out.say(if has_git {
-            format!(
-                "snapshot {snapshot}: {} ignored and harness files and a git bundle of the tracked and untracked work, {} bytes, {} new objects",
-                report.files, report.bytes, report.new_objects
-            )
-        } else {
-            format!(
-                "snapshot {snapshot}: {} files, {} bytes, {} new objects",
-                report.files, report.bytes, report.new_objects
-            )
+        out.emit(Event::SnapshotPublished {
+            snapshot,
+            files: report.files,
+            bytes: report.bytes,
+            new_objects: report.new_objects,
+            git_bundle: has_git,
         });
         report_capture(&report, &left_behind, out);
         Ok(snapshot)
@@ -1170,8 +1212,11 @@ impl Node {
         // session it opened, as every other request reaches it.
         for peer in self.reachable_peers() {
             match self.push_records(id, peer).await {
-                Ok(()) => out.say(format!("copied the ledger and the snapshot to {peer}")),
-                Err(e) => out.say(format!("not copied to {peer}: {e}")),
+                Ok(()) => out.emit(Event::Replicated { peer }),
+                Err(e) => out.emit(Event::NotReplicated {
+                    peer,
+                    error: e.to_refusal(),
+                }),
             }
         }
     }
@@ -1213,28 +1258,43 @@ impl Node {
             match answer {
                 Fenced::Answer(Appended::Accepted { .. }) => {}
                 Fenced::Answer(Appended::Rejected { head }) => {
-                    return Err(NodeError::Peer {
+                    return Err(NodeError::peer_fact(
                         peer,
-                        reason: format!(
+                        format!(
                             "its ledger does not continue this one (its head is {head}); the chains forked"
                         ),
-                    });
+                        Reason::PeerForked {
+                            job: id,
+                            peer,
+                            head,
+                        },
+                    ));
                 }
                 Fenced::StaleEpoch { current, .. } => {
-                    return Err(NodeError::Peer {
+                    return Err(NodeError::peer_fact(
                         peer,
-                        reason: format!(
+                        format!(
                             "it knows epoch {current}, newer than this node's; run `fabric job resume {id}` to catch up"
                         ),
-                    });
+                        Reason::PeerAhead {
+                            job: id,
+                            peer,
+                            epoch: current,
+                        },
+                    ));
                 }
                 Fenced::AheadOfUs { current, .. } => {
-                    return Err(NodeError::Peer {
+                    return Err(NodeError::peer_fact(
                         peer,
-                        reason: format!(
+                        format!(
                             "it is at epoch {current}, older than this node's, and must catch up first"
                         ),
-                    });
+                        Reason::PeerBehind {
+                            job: id,
+                            peer,
+                            epoch: current,
+                        },
+                    ));
                 }
             }
         }
@@ -1267,16 +1327,24 @@ impl Node {
     }
 
     /// The push form of the move (ADR 0003): suspend, push, `MoveStarted`, offer, decision.
+    /// Moves `id` to `to` and returns the lease the move's decision made.
+    ///
+    /// The lease is read under the lock that applies the decision, or that
+    /// finds it applied: another steal or move may change it once the lock
+    /// is released.
     async fn job_move(
         self: &Arc<Self>,
         id: JobId,
         to: NodeId,
         force: bool,
-        path_var: &OsString,
+        env: &ToolEnv,
         out: &mut Out,
-    ) -> Result<(), NodeError> {
+    ) -> Result<Lease, NodeError> {
         if to == self.id {
-            return Err(fabric_core::ledger::LedgerError::MoveToSelf.into());
+            return Err(NodeError::ledger_fact(
+                LedgerError::MoveToSelf,
+                Reason::MoveToSelf { job: id },
+            ));
         }
         self.resolve_departing(id, out).await?;
         let (harness, root, view, floor) = {
@@ -1295,9 +1363,10 @@ impl Node {
         match view {
             LeaseView::Owner(_) => {}
             LeaseView::Departing { target, move_id } if target == to => {
-                out.say(format!(
-                    "move {move_id} toward {to} is open; offering it again"
-                ));
+                out.emit(Event::MoveReoffered {
+                    move_id,
+                    target: to,
+                });
             }
             LeaseView::Departing { move_id, target } => {
                 return Err(NodeError::Departing {
@@ -1309,8 +1378,8 @@ impl Node {
             // A move asked again after its answer was lost: the target's
             // decision arrived while resolving, and the move is done.
             LeaseView::Departed { owner, epoch } if owner == to => {
-                out.say(format!("{to} already owns the job at epoch {epoch}"));
-                return Ok(());
+                out.emit(Event::AlreadyMoved { owner, epoch });
+                return Ok(Lease { owner, epoch });
             }
             LeaseView::Departed { owner, epoch } => {
                 return Err(NodeError::Departed {
@@ -1332,7 +1401,7 @@ impl Node {
                 to,
                 Some((&harness, &root, floor.as_ref())),
                 Target::Peer,
-                path_var,
+                env,
                 force,
                 out,
             )
@@ -1342,7 +1411,7 @@ impl Node {
         let snapshot = if owner {
             let job = self.job(id).await?;
             let mut job = job.lock().await;
-            Some(self.suspend_locked(&mut job, path_var, out).await?)
+            Some(self.suspend_locked(&mut job, env, out).await?)
         } else {
             let job = self.job(id).await?;
             let job = job.lock().await;
@@ -1355,7 +1424,7 @@ impl Node {
                 .await?;
         }
         self.push_records(id, to).await?;
-        out.say(format!("{to} holds the ledger and the snapshot"));
+        out.emit(Event::TargetHoldsCopy { target: to });
 
         let offer = self.depart(id, to, &harness, out).await?;
         faults::hit(Point::AfterDepartingWrite).await;
@@ -1370,7 +1439,7 @@ impl Node {
         self.offer(id, to, offer, out).await
     }
 
-    /// Prints what `to`, which measured `theirs`, does with each ignored
+    /// Reports what `to`, which measured `theirs`, does with each ignored
     /// path of `snapshot`, and stops on a path it can neither use nor make
     /// again unless `force` says so. With `force` absent nothing stops.
     async fn carry_for_move(
@@ -1384,13 +1453,14 @@ impl Node {
         let manifest = with_store(&self.store, move |store| Ok(store.manifest(snapshot)?)).await?;
         let decisions = carry::decide_all(&manifest, theirs);
         if !decisions.is_empty() {
-            out.say(format!(
-                "what {to} does with each ignored path of snapshot {snapshot}:"
+            out.emit(carry_decided(
+                CarryFor::Move { target: to },
+                snapshot,
+                &decisions,
             ));
         }
-        say_decisions(out, &decisions, PathDecision::to_string);
-        if let Some(line) = session_line(&manifest) {
-            out.say(line);
+        if manifest.harness_state.entries.is_empty() {
+            out.emit(Event::NoSessionCaptured { snapshot });
         }
         match force {
             Some(force) => refuse_carry(&decisions, force, out),
@@ -1483,9 +1553,10 @@ impl Node {
                 clock::now_ms(),
             )?;
             job.commit(record, Author::Node(self.id))?;
-            out.say(format!(
-                "MoveStarted {move_id}: this copy does not run until {to} decides"
-            ));
+            out.emit(Event::MoveStarted {
+                move_id,
+                target: to,
+            });
         }
         Ok(job.ledger().offer(self.id))
     }
@@ -1497,7 +1568,7 @@ impl Node {
         to: NodeId,
         offer: MoveOffer,
         out: &mut Out,
-    ) -> Result<(), NodeError> {
+    ) -> Result<Lease, NodeError> {
         let epoch = {
             let job = self.job(id).await?;
             let job = job.lock().await;
@@ -1530,11 +1601,11 @@ impl Node {
                     | Asked::Status(Fenced::Answer(MoveState::Decided { record })),
                 ) => {
                     let twice = faults::hit(Point::AfterImportReceipt).await == Some(Action::Dup);
-                    self.apply_decision(id, to, record.as_bytes(), out).await?;
+                    let lease = self.apply_decision(id, to, record.as_bytes(), out).await?;
                     if twice {
-                        self.apply_decision(id, to, record.as_bytes(), out).await?;
+                        return self.apply_decision(id, to, record.as_bytes(), out).await;
                     }
-                    return Ok(());
+                    return Ok(lease);
                 }
                 Ok(Asked::Status(Fenced::Answer(MoveState::Undecided { .. }))) => {
                     let answer = self
@@ -1544,8 +1615,7 @@ impl Node {
                         .await;
                     last_error = match answer {
                         Ok(Fenced::Answer(Offered::Decided { record })) => {
-                            self.apply_decision(id, to, record.as_bytes(), out).await?;
-                            return Ok(());
+                            return self.apply_decision(id, to, record.as_bytes(), out).await;
                         }
                         Ok(answer) => format!("{to} has not decided: {}", offered_words(&answer)),
                         Err(e) => format!("{to} has not decided: {e}"),
@@ -1561,10 +1631,15 @@ impl Node {
                     Asked::Offer(Fenced::StaleEpoch { current, .. })
                     | Asked::Status(Fenced::StaleEpoch { current, .. }),
                 ) => {
-                    return Err(NodeError::Peer {
-                        peer: to,
-                        reason: format!("it knows epoch {current}; the move cannot complete"),
-                    });
+                    return Err(NodeError::peer_fact(
+                        to,
+                        format!("it knows epoch {current}; the move cannot complete"),
+                        Reason::PeerAhead {
+                            job: id,
+                            peer: to,
+                            epoch: current,
+                        },
+                    ));
                 }
                 Ok(
                     Asked::Offer(Fenced::AheadOfUs { current, .. })
@@ -1573,14 +1648,15 @@ impl Node {
                     last_error = format!("{to} is at epoch {current} and has not caught up");
                 }
                 Err(e) => {
-                    out.say(format!(
-                        "no answer from {to} ({e}); asking for its decision"
-                    ));
                     last_error = e.to_string();
+                    out.emit(Event::NoAnswer {
+                        target: to,
+                        error: e.to_refusal(),
+                    });
                 }
             }
         }
-        out.say(format!("last error: {last_error}"));
+        out.emit(Event::MoveGaveUp { detail: last_error });
         Err(NodeError::Departing {
             job: id,
             move_id: offer.move_id,
@@ -1589,36 +1665,37 @@ impl Node {
     }
 
     /// Appends the target's decision for an open move; a decision already held changes nothing.
+    ///
+    /// Returns the lease the decision left, read under the lock that applies it.
     async fn apply_decision(
         self: &Arc<Self>,
         id: JobId,
         from: NodeId,
         bytes: &[u8],
         out: &mut Out,
-    ) -> Result<(), NodeError> {
+    ) -> Result<Lease, NodeError> {
         let job = self.job(id).await?;
         let mut job = job.lock().await;
         let grew = job.accept(bytes, from, self.id)?;
         if grew {
             match job.view(self.id) {
                 LeaseView::Departed { owner, epoch } => {
-                    out.say(format!(
-                        "{owner} imported the job and owns it at epoch {epoch}"
-                    ));
+                    out.emit(Event::Imported { owner, epoch });
                 }
                 LeaseView::Owner(token) => {
-                    out.say(format!(
-                        "{from} declined the move; this node owns the job again at epoch {}",
-                        token.epoch
-                    ));
+                    out.emit(Event::Declined {
+                        target: from,
+                        epoch: token.epoch,
+                    });
                 }
-                other => out.say(format!(
-                    "the decision left this node as {}",
-                    view_word(&other)
-                )),
+                other => out.emit(Event::DecisionLeft {
+                    standing: standing(&other),
+                }),
             }
         }
-        self.settle(&mut job, out).await
+        let lease = lease_of(&job);
+        self.settle(&mut job, out).await?;
+        Ok(lease)
     }
 
     /// Asks the target of this node's open move for its decision, and applies it.
@@ -1646,18 +1723,20 @@ impl Node {
             })
             .await;
         match answer {
-            Ok(Fenced::Answer(MoveState::Decided { record })) => {
-                self.apply_decision(id, target, record.as_bytes(), out)
-                    .await
-            }
+            Ok(Fenced::Answer(MoveState::Decided { record })) => self
+                .apply_decision(id, target, record.as_bytes(), out)
+                .await
+                .map(drop),
             Ok(_) => {
-                out.say(format!("move {move_id} toward {target} is still undecided"));
+                out.emit(Event::MoveUndecided { move_id, target });
                 Ok(())
             }
             Err(e) => {
-                out.say(format!(
-                    "move {move_id} toward {target} is open and {target} did not answer: {e}"
-                ));
+                out.emit(Event::MoveUnanswered {
+                    move_id,
+                    target,
+                    error: e.to_refusal(),
+                });
                 Ok(())
             }
         }
@@ -1675,10 +1754,10 @@ impl Node {
                 !forked && matches!(view, LeaseView::Owner(token) if token.epoch == record.epoch);
             if !owned {
                 if record.liveness().await != Liveness::Gone {
-                    out.say(format!(
-                        "fenced: epoch {} is over for this node; stopping harness pid {}",
-                        record.epoch, record.pid
-                    ));
+                    out.emit(Event::Fenced {
+                        epoch: record.epoch,
+                        pid: record.pid,
+                    });
                     record.stop(FENCE_GRACE).await?;
                 }
                 local::remove(&job.dir().harness())?;
@@ -1699,10 +1778,7 @@ impl Node {
             let dest =
                 paths::departed_copy(&marker.root, epoch).ok_or_else(|| no_parent(&marker.root))?;
             if move_aside(&marker.root, &dest)? {
-                out.say(format!(
-                    "this node's copy moved out of the root to {}; it is kept, never run",
-                    dest.display()
-                ));
+                out.emit(Event::CopyMovedAside { to: dest });
             }
             job.clear_marker()?;
         }
@@ -1723,7 +1799,7 @@ impl Node {
         on: Option<NodeId>,
         harness: Option<HarnessKind>,
         force: bool,
-        path_var: &OsString,
+        env: &ToolEnv,
         out: &mut Out,
     ) -> Result<RunPlan, NodeError> {
         if let Some(harness) = &harness {
@@ -1776,7 +1852,7 @@ impl Node {
                 holder,
                 Some((&kind, root.as_path(), floor.as_ref())),
                 Target::Here,
-                path_var,
+                env,
                 force,
                 out,
             )
@@ -1784,21 +1860,20 @@ impl Node {
             // With no harness named, the job's own launches, and the pull
             // must still find the one the preflight checked.
             let checked = harness.is_none().then_some(&kind);
-            self.pull(id, holder, (checked, force), path_var, out)
-                .await?;
+            self.pull(id, holder, (checked, force), env, out).await?;
         }
         let job = self.job(id).await?;
         let mut job = job.lock().await;
         let token = owner_token(&job, self.id)?;
         let root = self
-            .restore_if_needed(&mut job, token.epoch, path_var, out)
+            .restore_if_needed(&mut job, token.epoch, env, out)
             .await?;
         if let Some(record) = job.harness_record()?
             && record.liveness().await != Liveness::Gone
         {
             return Err(NodeError::AlreadyRunningHarness {
                 job: id,
-                pid: record.pid.get(),
+                pid: record.pid,
             });
         }
         plan(
@@ -1822,10 +1897,10 @@ impl Node {
         id: JobId,
         holder: NodeId,
         (checked, force): (Option<&HarnessKind>, bool),
-        path_var: &OsString,
+        env: &ToolEnv,
         out: &mut Out,
     ) -> Result<(), NodeError> {
-        out.say(format!("pulling job {id} from {holder}"));
+        out.emit(Event::Pulling { job: id, holder });
         self.pull_records(id, holder).await?;
         self.ensure_latest(id, holder).await?;
         let epoch = {
@@ -1839,22 +1914,8 @@ impl Node {
                 session.move_request(token, MOVE_DEADLINE).await
             })
             .await?;
-        let move_id = match answer {
-            Fenced::Answer(MoveRequested::Started { move_id }) => move_id,
-            Fenced::Answer(MoveRequested::Rejected { head }) => {
-                return Err(NodeError::Peer {
-                    peer: holder,
-                    reason: format!("it did not start a move; its head is {head}"),
-                });
-            }
-            fenced => {
-                return Err(NodeError::Peer {
-                    peer: holder,
-                    reason: format!("it did not start a move: {}", fenced_words(&fenced)),
-                });
-            }
-        };
-        out.say(format!("{holder} started move {move_id} toward this node"));
+        let move_id = started_move(id, holder, answer)?;
+        out.emit(Event::HolderStartedMove { holder, move_id });
         self.pull_records(id, holder).await?;
         self.ensure_latest(id, holder).await?;
         // A path this node can neither use nor make again stops the pull
@@ -1862,7 +1923,7 @@ impl Node {
         let refused = if force {
             None
         } else {
-            self.carry_refusal_here(id, path_var, out).await?
+            self.carry_refusal_here(id, env, out).await?
         };
         faults::hit(Point::BeforeImport).await;
         let stopped = {
@@ -1900,28 +1961,30 @@ impl Node {
         };
         if let Some(stop) = stopped {
             if let Err(e) = self.push_records(id, holder).await {
-                out.say(format!(
-                    "{holder} has not seen the abort yet ({e}); it will ask for the decision"
-                ));
+                out.emit(Event::AbortNotTold {
+                    holder,
+                    error: e.to_refusal(),
+                });
             }
             return Err(stop);
         }
         // The holder learns the decision now, or from MoveStatus later.
         if let Err(e) = self.push_records(id, holder).await {
-            out.say(format!(
-                "{holder} has not seen the import yet ({e}); it will ask for the decision"
-            ));
+            out.emit(Event::HolderNotTold {
+                holder,
+                error: e.to_refusal(),
+            });
         }
         Ok(())
     }
 
     /// Decides here, with this node's facts, each ignored path of the job's
     /// latest snapshot, and returns the refusal to stop a pull with when
-    /// one of them is refused, after printing the decisions.
+    /// one of them is refused, after reporting the decisions.
     async fn carry_refusal_here(
         &self,
         id: JobId,
-        path_var: &OsString,
+        env: &ToolEnv,
         out: &mut Out,
     ) -> Result<Option<NodeError>, NodeError> {
         let latest = {
@@ -1933,20 +1996,17 @@ impl Node {
             return Ok(None);
         };
         let manifest = with_store(&self.store, move |store| Ok(store.manifest(snapshot)?)).await?;
-        let facts = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
+        let facts = NodeFacts::measure(&self.cfg.home, env).await;
         let decisions = carry::decide_all(&manifest, &facts);
-        let mut said = Out::default();
-        let refusal = refuse_carry(&decisions, false, &mut said).err();
+        let refusal = refuse_carry(&decisions, false, &mut Out::default()).err();
         if refusal.is_some() {
-            out.say(format!(
-                "what this node would do with each ignored path of snapshot {snapshot}:"
-            ));
-            say_decisions(out, &decisions, PathDecision::to_string);
+            out.emit(carry_decided(CarryFor::Pull, snapshot, &decisions));
         }
         Ok(refusal)
     }
 
-    /// Imports the open move `move_id` from `holder` into `job`, whose lock the caller holds.
+    /// Imports the open move `move_id` from `holder` into `job`, whose lock
+    /// the caller holds, or says why its ledger does not take it.
     fn import(
         &self,
         job: &mut Job,
@@ -1978,32 +2038,44 @@ impl Node {
             OfferAnswer::Import(record) => job.commit(record, Author::Node(self.id))?,
             OfferAnswer::Decided(_) => {}
             OfferAnswer::Rejected { head } => {
-                return Err(NodeError::Peer {
-                    peer: holder,
-                    reason: format!(
+                return Err(NodeError::peer_fact(
+                    holder,
+                    format!(
                         "its move does not link to this node's head {head}; run the resume again"
                     ),
-                });
+                    Reason::MoveUnlinked {
+                        job: id,
+                        peer: holder,
+                        head,
+                    },
+                ));
             }
             OfferAnswer::SnapshotIncomplete { snapshot } => {
-                return Err(NodeError::Peer {
-                    peer: holder,
-                    reason: format!(
-                        "snapshot {snapshot} did not arrive whole; run the resume again"
-                    ),
-                });
+                return Err(NodeError::peer_fact(
+                    holder,
+                    format!("snapshot {snapshot} did not arrive whole; run the resume again"),
+                    Reason::Fetch {
+                        snapshot,
+                        peer: holder,
+                    },
+                ));
             }
             OfferAnswer::Stale { current, .. } => {
-                return Err(NodeError::Peer {
-                    peer: holder,
-                    reason: format!("the move is at an epoch behind {current}"),
-                });
+                return Err(NodeError::peer_fact(
+                    holder,
+                    format!("the move is at an epoch behind {current}"),
+                    Reason::MoveStale {
+                        job: id,
+                        peer: holder,
+                        epoch: current,
+                    },
+                ));
             }
         }
-        out.say(format!(
-            "imported move {move_id}; this node owns the job at epoch {}",
-            job.ledger().lease().epoch()
-        ));
+        out.emit(Event::ImportedHere {
+            move_id,
+            epoch: job.ledger().lease().epoch(),
+        });
         Ok(())
     }
 
@@ -2139,7 +2211,7 @@ impl Node {
         &self,
         job: &mut Job,
         epoch: Epoch,
-        path_var: &OsString,
+        env: &ToolEnv,
         out: &mut Out,
     ) -> Result<PathBuf, NodeError> {
         let id = job.id();
@@ -2150,7 +2222,7 @@ impl Node {
                 state: MarkerState::Live | MarkerState::Clean { .. },
                 ..
             }) => {
-                out.say(format!("workspace already at {}", root.display()));
+                out.emit(Event::WorkspaceInPlace { root: root.clone() });
                 return Ok(root.clone());
             }
             Some(Marker {
@@ -2159,8 +2231,7 @@ impl Node {
             }) => {
                 return Err(NodeError::Unfinished {
                     job: id,
-                    what: "a suspend",
-                    command: "suspend",
+                    step: Step::Suspend,
                 });
             }
             _ => {}
@@ -2173,12 +2244,21 @@ impl Node {
             id,
             job.dir(),
         );
-        out.say(choice.to_string());
+        out.emit(match &choice {
+            RootChoice::Same(root) => Event::RootChosen {
+                root: root.clone(),
+                recorded: None,
+            },
+            RootChoice::Fallback { root, captured } => Event::RootChosen {
+                root: root.clone(),
+                recorded: Some(captured.clone()),
+            },
+        });
         let root = choice.root().to_owned();
         check_root(
             &root,
             &self.cfg.home,
-            synced_folders(&self.cfg.home, path_var).await,
+            synced_folders(&self.cfg.home, env).await,
         )?;
         let resuming = matches!(
             &marker,
@@ -2219,11 +2299,11 @@ impl Node {
         let state_dir = job.dir().harness_state();
         if !(resuming && state == RestoreState::Present) {
             let harness_dir = has_harness_state.then(|| state_dir.clone());
-            self.write_snapshot(snapshot, &manifest, &root, harness_dir, path_var, out)
+            self.write_snapshot(snapshot, &manifest, &root, harness_dir, env, out)
                 .await?;
         }
         if has_harness_state {
-            self.restore_harness(job, &root, path_var, out).await?;
+            self.restore_harness(job, &root, env, out).await?;
         }
         let tree = TreeStamp::measure(&root).await;
         job.set_marker(&Marker {
@@ -2281,10 +2361,7 @@ impl Node {
                 state: MarkerState::Clean { .. },
                 ..
             }) if is_missing(&root)? => {
-                out.say(format!(
-                    "the clean workspace at {} is gone; restoring the latest snapshot",
-                    root.display()
-                ));
+                out.emit(Event::WorkspaceGone { root });
                 None
             }
             // A root deleted or moved away while the marker says live
@@ -2302,13 +2379,10 @@ impl Node {
                 {
                     return Err(NodeError::AlreadyRunningHarness {
                         job: job.id(),
-                        pid: record.pid.get(),
+                        pid: record.pid,
                     });
                 }
-                out.say(format!(
-                    "the workspace at {} is gone; restoring the latest snapshot, and work since it that no suspend captured is lost",
-                    root.display()
-                ));
+                out.emit(Event::LiveWorkspaceGone { root });
                 None
             }
             marker => marker,
@@ -2323,17 +2397,14 @@ impl Node {
         manifest: &fabric_core::snapshot::SnapshotManifest,
         root: &Path,
         harness_dir: Option<PathBuf>,
-        path_var: &OsString,
+        env: &ToolEnv,
         out: &mut Out,
     ) -> Result<(), NodeError> {
-        let facts = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
+        let facts = NodeFacts::measure(&self.cfg.home, env).await;
         let decisions = carry::decide_all(manifest, &facts);
         if !decisions.is_empty() {
-            out.say(format!(
-                "what this node does with each ignored path of snapshot {snapshot}:"
-            ));
+            out.emit(carry_decided(CarryFor::Restore, snapshot, &decisions));
         }
-        say_decisions(out, &decisions, restore_line);
         let writes: std::collections::BTreeSet<fabric_core::path::RelPath> = decisions
             .into_iter()
             .filter(|d| d.decision.writes())
@@ -2356,7 +2427,7 @@ impl Node {
             )?)
         })
         .await?;
-        out.say(restore_summary(snapshot, &report, has_git));
+        out.emit(restored(snapshot, &report, has_git));
         Ok(())
     }
 
@@ -2377,12 +2448,12 @@ impl Node {
             .ok_or_else(|| no_parent(&marker.root))?;
         let dest = unused(&base);
         if move_aside(&marker.root, &dest)? {
-            out.say(format!(
-                "the workspace at {} was left at epoch {}, before this node's tenure at epoch {epoch}, and may differ from the job's latest snapshot; it moved to {}, kept, never run",
-                marker.root.display(),
-                marker.epoch,
-                dest.display()
-            ));
+            out.emit(Event::OrphanSetAside {
+                root: marker.root.clone(),
+                left_at: marker.epoch,
+                epoch,
+                to: dest,
+            });
         }
         job.forget_session()?;
         job.clear_marker()
@@ -2393,12 +2464,12 @@ impl Node {
         &self,
         job: &Job,
         root: &Path,
-        path_var: &OsString,
+        env: &ToolEnv,
         out: &mut Out,
     ) -> Result<(), NodeError> {
         let state_dir = job.dir().harness_state();
         let state = StateManifest::read(&state_dir)?;
-        let harness = adapter(state.kind(), &self.harness_env(path_var)?, None)?;
+        let harness = adapter(state.kind(), &self.harness_env(env)?, None)?;
         harness.restore(root, &state_dir).await?;
         let previous = job
             .session()?
@@ -2409,25 +2480,28 @@ impl Node {
             session: state.session().clone(),
             known_writer: writer_after(previous, &state),
         })?;
-        out.say(format!(
-            "restored {} session {}",
-            state.kind(),
-            state.session()
-        ));
+        out.emit(Event::SessionRestored {
+            harness: state.kind().clone(),
+            session: state.session().clone(),
+        });
         Ok(())
     }
 
+    /// Steals `id` and returns the lease the steal made.
+    ///
+    /// One hold of the job's lock runs from the fork check to the commit,
+    /// and the lease is read under it: a catch-up waiting for the lock
+    /// could otherwise freeze the job, or move it to another owner, after
+    /// the check and before the steal. The push to the old owner waits
+    /// without it, and another steal or a move may change the lease then.
     async fn job_steal(
         self: &Arc<Self>,
         id: JobId,
         reason: String,
         force: bool,
         out: &mut Out,
-    ) -> Result<(), NodeError> {
-        // One hold of the job's lock from the fork check to the commit: a
-        // catch-up waiting for it could otherwise freeze the job, or move
-        // it to another owner, after the check and before the steal.
-        let owner = {
+    ) -> Result<Lease, NodeError> {
+        let (owner, stolen) = {
             let job = self.job(id).await?;
             let mut job = job.lock().await;
             // A frozen chain pushed at a higher epoch would freeze the job
@@ -2445,37 +2519,46 @@ impl Node {
                 .then_some(CompleteSnapshot::new(latest));
             // The holder the steal takes the job from, who must learn of it.
             let owner = job.ledger().lease().holder();
-            let proposal = job.ledger().steal(
-                self.id,
-                reason,
-                complete,
-                clock::event_id(),
-                clock::now_ms(),
-            )?;
-            let warning = format!(
-                "{}; the owner's last record is {}",
-                proposal.warning,
-                age(clock::now_ms().saturating_sub(proposal.warning.last_record_at))
-            );
+            let proposal = job
+                .ledger()
+                .steal(
+                    self.id,
+                    reason,
+                    complete,
+                    clock::event_id(),
+                    clock::now_ms(),
+                )
+                .map_err(|e| steal_refused(&job, self.id, e))?;
+            let age_ms = clock::now_ms().saturating_sub(proposal.warning.last_record_at);
+            let described = proposal.warning.with_age(age_ms);
+            let warning = StealWarning {
+                owner: proposal.warning.owner,
+                snapshot: proposal.warning.snapshot,
+                owner_stopped_at_snapshot: proposal.warning.owner_stopped_at_snapshot,
+                last_record_at: proposal.warning.last_record_at,
+                age_ms,
+            };
             if !force {
-                return Err(NodeError::StealNeedsForce(format!(
-                    "a steal would bump the epoch without {owner}'s consent: {warning}. Pass --force to do it"
-                )));
+                return Err(NodeError::StealNeedsForce { warning, described });
             }
-            out.say(format!("warning: {warning}"));
+            out.emit(Event::StealWarning { warning });
             job.commit(proposal.record, Author::Node(self.id))?;
-            job.append(self.id, EventKind::Note { text: warning })?;
-            out.say(format!(
-                "this node owns the job at epoch {}; run `fabric job resume {id}` to restore and launch it here",
-                job.ledger().lease().epoch()
-            ));
+            job.append(self.id, EventKind::Note { text: described })?;
+            let stolen = lease_of(&job);
+            out.emit(Event::Stole {
+                job: id,
+                epoch: stolen.epoch,
+            });
             self.settle(&mut job, out).await?;
-            owner
+            (owner, stolen)
         };
         if let Err(e) = self.push_records(id, owner).await {
-            out.say(format!("{owner} has not seen the steal yet: {e}"));
+            out.emit(Event::OwnerNotTold {
+                owner,
+                error: e.to_refusal(),
+            });
         }
-        Ok(())
+        Ok(stolen)
     }
 
     async fn job_decide(
@@ -2483,8 +2566,7 @@ impl Node {
         id: JobId,
         decision: Decision,
         note: &str,
-        out: &mut Out,
-    ) -> Result<(), NodeError> {
+    ) -> Result<String, NodeError> {
         let job = self.job(id).await?;
         let mut job = job.lock().await;
         owner_token(&job, self.id)?;
@@ -2498,24 +2580,27 @@ impl Node {
             format!("{word}: {note}")
         };
         job.append(self.id, EventKind::DecisionRecorded { text: text.clone() })?;
-        out.say(format!("recorded: {text}"));
-        Ok(())
+        Ok(text)
     }
 
     async fn doctor(
         self: &Arc<Self>,
         peer: Option<NodeId>,
         job: Option<JobId>,
-        path_var: &OsString,
+        env: &ToolEnv,
         out: &mut Out,
-    ) -> Result<(), NodeError> {
+    ) -> Result<DoctorReport, NodeError> {
         let Some(peer) = peer else {
-            let facts =
-                NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
-            for (name, value) in facts.iter() {
-                out.say(format!("{name}: {}", value.replace('\n', " / ")));
-            }
-            return Ok(());
+            let facts = NodeFacts::measure(&self.cfg.home, env).await;
+            return Ok(DoctorReport::Facts {
+                facts: facts
+                    .iter()
+                    .map(|(name, value)| Fact {
+                        name: name.to_owned(),
+                        value: value.to_owned(),
+                    })
+                    .collect(),
+            });
         };
         let (harness, root, floor, latest) = match job {
             Some(id) => {
@@ -2551,33 +2636,24 @@ impl Node {
                     .zip(root.as_deref())
                     .map(|(harness, root)| (harness, root, floor.as_ref())),
                 Target::Peer,
-                path_var,
+                env,
             )
             .await?;
-        for row in &rows {
-            out.say(row.to_string());
-        }
-        let mut decisions = Vec::new();
-        match (job, latest) {
+        let carry = match (job, latest) {
             (Some(_), Some(snapshot)) => {
                 let manifest =
                     with_store(&self.store, move |store| Ok(store.manifest(snapshot)?)).await?;
-                decisions = carry::decide_all(&manifest, &theirs);
-                out.say(format!(
-                    "what {peer} would do with each ignored path of snapshot {snapshot}; a move decides again on the snapshot it takes:"
-                ));
-                say_decisions(out, &decisions, PathDecision::to_string);
-                if let Some(line) = session_line(&manifest) {
-                    out.say(line);
-                }
+                let decisions = carry::decide_all(&manifest, &theirs);
+                Some(carry_report(Some(&manifest), snapshot, &decisions))
             }
-            (Some(_), None) => out.say(
-                "no snapshot yet; a move decides each ignored path once it has suspended the job",
-            ),
-            (None, _) => {}
-        }
-        refuse_rows(&rows, false)?;
-        refuse_carry(&decisions, false, out)
+            (Some(_), None) => Some(CarryReport::default()),
+            (None, _) => None,
+        };
+        Ok(DoctorReport::Compared {
+            peer,
+            rows: rows.iter().map(doctor::Row::to_wire).collect(),
+            carry,
+        })
     }
 
     /// The newest version of the job's harness known to have written its
@@ -2605,31 +2681,49 @@ impl Node {
         let text = match asked {
             Ok(Fenced::Answer(KnownWriter { version })) => version?,
             Ok(fenced) => {
-                out.say(format!(
-                    "{owner} did not say the job's known writer: {}",
-                    fenced_words(&fenced)
-                ));
+                let reason = match fenced {
+                    Fenced::StaleEpoch { current, .. } => Reason::PeerAhead {
+                        job: id,
+                        peer: owner,
+                        epoch: current,
+                    },
+                    Fenced::AheadOfUs { current, .. } => Reason::PeerBehind {
+                        job: id,
+                        peer: owner,
+                        epoch: current,
+                    },
+                    Fenced::Answer(_) => Reason::Peer { peer: owner },
+                };
+                out.emit(Event::KnownWriterUnknown {
+                    owner,
+                    error: Refusal::new(reason, fenced_words(&fenced)),
+                });
                 return None;
             }
             Err(e) => {
-                out.say(format!("{owner} did not say the job's known writer: {e}"));
+                out.emit(Event::KnownWriterUnknown {
+                    owner,
+                    error: e.to_refusal(),
+                });
                 return None;
             }
         };
         match HarnessVersion::parse(text.as_str()) {
             Ok(version) => Some(version),
             Err(e) => {
-                out.say(format!(
-                    "{owner} named {text} as the job's known writer, which is not a version: {e}"
-                ));
+                out.emit(Event::KnownWriterUnreadable {
+                    owner,
+                    text: text.as_str().to_owned(),
+                    error: e.to_string(),
+                });
                 None
             }
         }
     }
 
-    /// Compares this node's facts with `peer`'s, prints the rows, stops on
-    /// a refusal `force` does not waive, and returns the peer's facts. A
-    /// named job brings its harness, the root the target restores into,
+    /// Compares this node's facts with `peer`'s, reports the rows, stops
+    /// on a refusal `force` does not waive, and returns the peer's facts.
+    /// A named job brings its harness, the root the target restores into,
     /// and the newest version of its harness known to have written its
     /// session.
     async fn preflight(
@@ -2637,32 +2731,32 @@ impl Node {
         peer: NodeId,
         job: Option<(&HarnessKind, &Path, Option<&HarnessVersion>)>,
         target: Target,
-        path_var: &OsString,
+        env: &ToolEnv,
         force: bool,
         out: &mut Out,
     ) -> Result<NodeFacts, NodeError> {
-        let (rows, theirs) = self.compare(peer, job, target, path_var).await?;
-        for row in &rows {
-            out.say(row.to_string());
-        }
+        let (rows, theirs) = self.compare(peer, job, target, env).await?;
+        out.emit(Event::Preflight {
+            peer,
+            rows: rows.iter().map(doctor::Row::to_wire).collect(),
+        });
         refuse_rows(&rows, force)?;
         Ok(theirs)
     }
 
-    /// Measures this node, asks `peer` for its facts, and compares them row by row.
+    /// Measures this node, asks `peer` for its facts, and compares them row by row (ADR 0008).
     async fn compare(
         self: &Arc<Self>,
         peer: NodeId,
         job: Option<(&HarnessKind, &Path, Option<&HarnessVersion>)>,
         target: Target,
-        path_var: &OsString,
+        env: &ToolEnv,
     ) -> Result<(Vec<doctor::Row>, NodeFacts), NodeError> {
-        let mut here =
-            NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
+        let mut here = NodeFacts::measure(&self.cfg.home, env).await;
         // The agent of an ACP job is named per job, so only the target of a
         // pull, this node, can look for it.
         if let (Target::Here, Some((HarnessKind::Acp { program, .. }, _, _))) = (target, job) {
-            here.measure_acp(program, &self.harness_env(path_var)?);
+            here.measure_acp(program, &self.harness_env(env)?);
         }
         // A session the peer opened is used too: a peer behind a NAT has
         // no address here and is reachable only over the session it dialed.
@@ -2689,14 +2783,48 @@ impl Node {
     }
 }
 
+/// The move `holder` started toward this node at its request, or why it did not.
+fn started_move(
+    id: JobId,
+    holder: NodeId,
+    answer: Fenced<MoveRequested>,
+) -> Result<MoveId, NodeError> {
+    match answer {
+        Fenced::Answer(MoveRequested::Started { move_id }) => Ok(move_id),
+        Fenced::Answer(MoveRequested::Rejected { head }) => Err(NodeError::Peer {
+            peer: holder,
+            reason: format!("it did not start a move; its head is {head}"),
+        }),
+        fenced @ Fenced::StaleEpoch { current, .. } => Err(NodeError::peer_fact(
+            holder,
+            format!("it did not start a move: {}", fenced_words(&fenced)),
+            Reason::PeerAhead {
+                job: id,
+                peer: holder,
+                epoch: current,
+            },
+        )),
+        fenced @ Fenced::AheadOfUs { current, .. } => Err(NodeError::peer_fact(
+            holder,
+            format!("it did not start a move: {}", fenced_words(&fenced)),
+            Reason::PeerBehind {
+                job: id,
+                peer: holder,
+                epoch: current,
+            },
+        )),
+    }
+}
+
 /// Stops on a row `force` does not waive.
 fn refuse_rows(rows: &[doctor::Row], force: bool) -> Result<(), NodeError> {
     let blocking = doctor::blocking(rows, force);
     if blocking.is_empty() {
         Ok(())
     } else {
-        let facts: Vec<&str> = blocking.iter().map(|r| r.fact).collect();
-        Err(NodeError::Preflight(facts.join(", ")))
+        Err(NodeError::Preflight(
+            blocking.iter().map(|row| row.fact.to_owned()).collect(),
+        ))
     }
 }
 
@@ -2704,35 +2832,29 @@ fn refuse_rows(rows: &[doctor::Row], force: bool) -> Result<(), NodeError> {
 /// `force`, which carries it as it is (gate finding F6).
 ///
 /// The first `REPORT_PATHS` refused paths are named and the rest counted,
-/// so the answer stays within one control message however many caches a
-/// snapshot holds.
+/// so the answer stays bounded however many caches a snapshot holds.
 fn refuse_carry(decisions: &[PathDecision], force: bool, out: &mut Out) -> Result<(), NodeError> {
-    let refused: Vec<String> = decisions
-        .iter()
-        .filter(|d| d.decision.refuses())
-        .map(|d| d.path.to_string())
-        .collect();
-    if refused.is_empty() {
+    let (paths, more) = refused_paths(decisions);
+    if paths.is_empty() {
         return Ok(());
-    }
-    let mut named = refused
-        .iter()
-        .take(REPORT_PATHS)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(", ");
-    if refused.len() > REPORT_PATHS {
-        named = format!("{named} and {} more", refused.len() - REPORT_PATHS);
     }
     if force {
-        out.say(format!(
-            "--force: {named} travels as it is, and the target writes it"
-        ));
+        out.emit(Event::CarriedByForce { paths, more });
         return Ok(());
     }
-    Err(NodeError::Preflight(format!(
-        "the target can neither use nor rebuild {named}"
-    )))
+    Err(NodeError::CarryRefused { paths, more })
+}
+
+/// The first `REPORT_PATHS` paths of `decisions` the target can neither
+/// use nor make again, and how many more there are.
+fn refused_paths(decisions: &[PathDecision]) -> (Vec<String>, u64) {
+    let refused: Vec<&PathDecision> = decisions.iter().filter(|d| d.decision.refuses()).collect();
+    let paths = refused
+        .iter()
+        .take(REPORT_PATHS)
+        .map(|d| d.path.to_string())
+        .collect();
+    (paths, count(refused.len().saturating_sub(REPORT_PATHS)))
 }
 
 /// What a call that reached `peer` and failed means: a peer that gave no
@@ -2749,6 +2871,41 @@ fn answer_error(peer: NodeId, err: &fabric_net::rpc::RpcError) -> NodeError {
             reason: err.to_string(),
         },
     }
+}
+
+/// The refusal of a steal `me` asked for and the ledger of `job` did not
+/// take, with the facts of the job that explain it.
+/// Who owns `job` now, at which epoch; the caller holds its lock.
+fn lease_of(job: &Job) -> Lease {
+    let lease = job.ledger().lease();
+    Lease {
+        owner: lease.holder(),
+        epoch: lease.epoch(),
+    }
+}
+
+fn steal_refused(job: &Job, me: NodeId, error: LedgerError) -> NodeError {
+    let id = job.id();
+    let fact = match (&error, job.view(me)) {
+        (LedgerError::StealBySelf, LeaseView::Departing { move_id, target }) => {
+            Reason::StealWhileDeparting {
+                job: id,
+                move_id,
+                target,
+            }
+        }
+        (LedgerError::StealBySelf, _) => Reason::StealByOwner { job: id },
+        (LedgerError::StealByTarget { move_id }, _) => Reason::StealByTarget {
+            job: id,
+            move_id: *move_id,
+        },
+        (LedgerError::StealWithoutSnapshot, _) => match job.latest() {
+            Some(snapshot) => Reason::StealWithoutSnapshot { job: id, snapshot },
+            None => return NodeError::NoSnapshot(id),
+        },
+        _ => return error.into(),
+    };
+    NodeError::ledger_fact(error, fact)
 }
 
 /// The owner's fencing token, or the refusal that says who owns the job.
@@ -2944,7 +3101,7 @@ fn job_session(
 
 /// The Codex threads whose rollouts under `home` record `root` as their `cwd`, oldest first.
 fn codex_threads(root: &Path, home: &Path) -> Result<Vec<SessionId>, NodeError> {
-    let env = HarnessEnv::new(home, OsString::new(), HarnessConfig::default())?;
+    let env = HarnessEnv::new(home, std::ffi::OsString::new(), HarnessConfig::default())?;
     Ok(Codex::new(env.home, env.path_var).threads_in(root)?)
 }
 
@@ -2973,18 +3130,30 @@ fn plan(
     })?;
     let harness = harness.unwrap_or_else(|| job.harness().clone());
     let (session, known_writer) = match job_session(job, &root, home, &harness)? {
-        // The CLI says it once the harness has started, with the settings
-        // the launch carried from the session (gate finding F10).
-        Some(record) if record.harness == harness => (Some(record.session), record.known_writer),
+        // The CLI says it again once the harness has started, with the
+        // settings the launch carried from the session (gate finding F10).
+        Some(record) if record.harness == harness => {
+            out.emit(Event::ContinuingSession {
+                harness: harness.clone(),
+                session: record.session.clone(),
+            });
+            (Some(record.session), record.known_writer)
+        }
         Some(record) => {
-            out.say(format!(
-                "starting a new {harness} session; the {} session {} stays in the snapshot (cross-harness resume is an experiment, ADR 0006)",
-                record.harness, record.session
-            ));
+            out.emit(Event::NewSession {
+                harness: harness.clone(),
+                previous: Some(HarnessSession {
+                    harness: record.harness,
+                    session: record.session,
+                }),
+            });
             (None, None)
         }
         None => {
-            out.say(format!("starting a new {harness} session"));
+            out.emit(Event::NewSession {
+                harness: harness.clone(),
+                previous: None,
+            });
             (None, None)
         }
     };
@@ -2999,7 +3168,7 @@ fn plan(
         epoch,
         head: job.ledger().head(),
         root,
-        harness_config: harness_config.for_harness(&harness),
+        harness_config: (&harness_config.for_harness(&harness)).into(),
         harness,
         session,
         known_writer,
@@ -3008,69 +3177,93 @@ fn plan(
     })
 }
 
-/// One decision as resume prints it: a refused path is written anyway,
-/// because it arrived through `--force`, or the job was already here, and
-/// leaving it out would lose it.
-fn restore_line(decision: &PathDecision) -> String {
-    if decision.decision.refuses() {
-        format!("{decision}; written anyway, since nothing here can make it again")
-    } else {
-        decision.to_string()
+/// The carry decisions `decisions` as one event: the first
+/// `REPORT_PATHS` of them, then the rest counted by verdict, so a report
+/// stays bounded however many paths a snapshot names (ADR 0008).
+fn carry_decided(context: CarryFor, snapshot: SnapshotId, decisions: &[PathDecision]) -> Event {
+    let (paths, more) = carry_lines(decisions);
+    Event::CarryDecided {
+        context,
+        snapshot,
+        paths,
+        more,
     }
 }
 
-/// Prints the first `REPORT_PATHS` decisions, one line each through
-/// `line`, then one line that counts the rest by what the target does
-/// with them, so an answer stays within one control message however many
-/// paths a snapshot names (ADR 0008).
-fn say_decisions(
-    out: &mut Out,
+/// What a peer would do with each ignored path of `snapshot`, whose
+/// manifest is `manifest`, as `doctor` reports it.
+fn carry_report(
+    manifest: Option<&fabric_core::snapshot::SnapshotManifest>,
+    snapshot: SnapshotId,
     decisions: &[PathDecision],
-    line: impl Fn(&PathDecision) -> String,
-) {
-    for decision in decisions.iter().take(REPORT_PATHS) {
-        out.say(line(decision));
+) -> CarryReport {
+    let (paths, more) = carry_lines(decisions);
+    let (refused, refused_more) = refused_paths(decisions);
+    CarryReport {
+        snapshot: Some(snapshot),
+        paths,
+        more,
+        refused,
+        refused_more,
+        session_captured: manifest.is_some_and(|m| !m.harness_state.entries.is_empty()),
     }
-    let rest = decisions.get(REPORT_PATHS..).unwrap_or_default();
-    if rest.is_empty() {
-        return;
-    }
-    let mut counts: Vec<(&str, usize)> = Vec::new();
-    for decision in rest {
-        let word = decision.decision.word();
-        match counts.iter_mut().find(|(w, _)| *w == word) {
-            Some((_, n)) => *n += 1,
-            None => counts.push((word, 1)),
+}
+
+/// The first `REPORT_PATHS` decisions as lines of the client API, and the
+/// rest counted by verdict, in the order each verdict first comes.
+fn carry_lines(decisions: &[PathDecision]) -> (Vec<CarryLine>, Vec<VerdictCount>) {
+    let paths = decisions
+        .iter()
+        .take(REPORT_PATHS)
+        .map(|decision| CarryLine {
+            path: decision.path.to_string(),
+            verdict: verdict(&decision.decision),
+            why: decision.decision.to_string(),
+        })
+        .collect();
+    let mut more: Vec<VerdictCount> = Vec::new();
+    for decision in decisions.get(REPORT_PATHS..).unwrap_or_default() {
+        let verdict = verdict(&decision.decision);
+        match more.iter_mut().find(|count| count.verdict == verdict) {
+            Some(count) => count.paths += 1,
+            None => more.push(VerdictCount { verdict, paths: 1 }),
         }
     }
-    let counts: Vec<String> = counts
-        .iter()
-        .map(|(word, n)| format!("{word} {n}"))
-        .collect();
-    out.say(format!("{} more paths: {}", rest.len(), counts.join(", ")));
+    (paths, more)
 }
 
-/// The longest goal summary `job ls` prints, in characters.
+/// A carry decision's verdict, as the client API names it.
+fn verdict(decision: &carry::CarryDecision) -> Verdict {
+    match decision {
+        carry::CarryDecision::Carry { .. } => Verdict::Carry,
+        carry::CarryDecision::Rebuild { .. } => Verdict::Rebuild,
+        carry::CarryDecision::Refuse { .. } => Verdict::Refuse,
+        carry::CarryDecision::LeaveBehind { .. } => Verdict::Leave,
+    }
+}
+
+/// The longest goal summary `job ls` lists, in characters.
 const SUMMARY_CHARS: usize = 72;
 
-/// A goal's first line, cut to `SUMMARY_CHARS`, so that a list of goals
-/// up to the record bound each still fits in one control answer.
-/// The last of `lines` that fit in `budget` bytes together, in order, and
-/// how many before them were left out.
-fn latest_within(mut lines: Vec<String>, budget: usize) -> (usize, Vec<String>) {
-    let mut start = lines.len();
-    let mut bytes = 0;
-    while let Some(line) = start.checked_sub(1).map(|i| &lines[i]) {
-        if bytes + line.len() > budget {
+/// The last of `items` that fit in `budget` bytes of JSON together, in
+/// order, and how many before them were left out.
+fn latest_within<T: serde::Serialize>(mut items: Vec<T>, budget: usize) -> (usize, Vec<T>) {
+    let mut start = items.len();
+    let mut bytes = 0_usize;
+    while let Some(item) = start.checked_sub(1).map(|i| &items[i]) {
+        let size = serde_json::to_vec(item).map_or(usize::MAX, |json| json.len());
+        if bytes.saturating_add(size) > budget {
             break;
         }
-        bytes += line.len();
+        bytes += size;
         start -= 1;
     }
-    let kept = lines.split_off(start);
+    let kept = items.split_off(start);
     (start, kept)
 }
 
+/// A goal's first line, cut to `SUMMARY_CHARS`, so that a list of goals
+/// up to the record bound each still fits in one answer.
 fn summary(goal: &str) -> String {
     let first = goal.lines().next().unwrap_or_default();
     match first.char_indices().nth(SUMMARY_CHARS) {
@@ -3080,15 +3273,47 @@ fn summary(goal: &str) -> String {
     }
 }
 
+/// `n` as a count of the client API.
+fn count(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+/// One entry of `job ls`: a job whose ledger opened, or one that did not.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum Listed {
+    Job(JobSummary),
+    Closed(ClosedJob),
+}
+
+/// A harness a client launched, for `Node::harness_started`.
+pub(crate) struct StartedHarness {
+    /// The job.
+    pub(crate) job: JobId,
+    /// The epoch the plan was made under.
+    pub(crate) epoch: Epoch,
+    /// The harness process, which leads its own group.
+    pub(crate) pid: NonZeroU32,
+    /// The harness that runs.
+    pub(crate) harness: HarnessKind,
+    /// The session it continues or created, when known.
+    pub(crate) session: Option<SessionId>,
+    /// The session the plan continues; a new one when `None`.
+    pub(crate) planned: Option<SessionId>,
+    /// The version the launch asked of the harness it started, when it asked.
+    pub(crate) version: Option<HarnessVersion>,
+}
+
 /// How many paths or keys of one kind a suspend names before it counts the rest.
 const REPORT_PATHS: usize = 20;
 
-/// Says, one line per path or config key, what the snapshot carries that
-/// a secret pattern matches, what of the workspace and the harness state it
-/// leaves out, and what of the repository's config it changed or left out.
-/// The workspace paths a secret pattern or `.fabricignore` kept here are
-/// the snapshot's own `left_behind` list, so the suspend names them as a
-/// target will (`crate::carry`).
+/// Says what the snapshot carries that a secret pattern matches, what of
+/// the workspace and the harness state it leaves out, and what of the
+/// repository's config it changed or left out, one group per kind, the
+/// first `REPORT_PATHS` of each named and the rest counted. The workspace
+/// paths a secret pattern or `.fabricignore` kept here are the snapshot's
+/// own `left_behind` list, so the suspend names them as a target will
+/// (`crate::carry`).
 fn report_capture(
     report: &fabric_store::capture::CaptureReport,
     left_behind: &[fabric_core::snapshot::LeftBehind],
@@ -3101,82 +3326,48 @@ fn report_capture(
             .map(|left| &left.path)
             .collect()
     };
-    say_each(
-        out,
-        "left behind (secret pattern)",
-        &because(LeaveReason::Secret),
-    );
-    say_each(
-        out,
-        "left behind (.fabricignore)",
-        &because(LeaveReason::Excluded),
-    );
-    say_each(
-        out,
-        "left behind (secret pattern, harness state)",
-        &report.denied_harness,
-    );
-    say_each(
-        out,
-        "travels in the snapshot though a secret pattern matches it (tracked)",
-        &report.tracked_secrets,
-    );
-    say_each(
-        out,
-        "travels in the snapshot though a secret pattern matches it (stashed)",
-        &report.stashed_secrets,
-    );
-    say_each(
-        out,
-        "travels as git's check-in output, not its own bytes (filter attribute)",
-        &report.filtered,
-    );
-    say_each(
-        out,
-        "left behind (not a file, link or directory)",
-        &report.special_files,
-    );
-    say_each(
-        out,
-        "left behind (not a file, link or directory, harness state)",
-        &report.special_harness,
-    );
-    say_each(
-        out,
-        "left behind with everything under it (this user cannot read the directory)",
-        &report.unreadable,
-    );
     // In a repository the whole nested tree stays; in a plain directory
     // its files travel and only its `.git` stays.
     let nested = if report.bundle.is_some() {
-        "left behind (nested repository)"
+        CaptureNote::NestedRepository
     } else {
-        "left behind (the .git of a nested repository)"
+        CaptureNote::NestedGit
     };
-    say_each(out, nested, &report.nested_repositories);
-    say_each(
-        out,
-        "left behind (the .git of a nested repository, harness state)",
-        &report.nested_harness,
-    );
-    say_each(
-        out,
-        "travels without its user info (git config)",
-        &report.stripped_userinfo,
-    );
-    say_each(out, "left behind (git config)", &report.dropped_config);
+    let groups: Vec<CaptureGroup> = [
+        group(CaptureNote::Secret, &because(LeaveReason::Secret)),
+        group(CaptureNote::Excluded, &because(LeaveReason::Excluded)),
+        group(CaptureNote::SecretHarness, &report.denied_harness),
+        group(CaptureNote::TrackedSecret, &report.tracked_secrets),
+        group(CaptureNote::StashedSecret, &report.stashed_secrets),
+        group(CaptureNote::Filtered, &report.filtered),
+        group(CaptureNote::Special, &report.special_files),
+        group(CaptureNote::SpecialHarness, &report.special_harness),
+        group(CaptureNote::Unreadable, &report.unreadable),
+        group(nested, &report.nested_repositories),
+        group(CaptureNote::NestedGitHarness, &report.nested_harness),
+        group(CaptureNote::StrippedUserinfo, &report.stripped_userinfo),
+        group(CaptureNote::DroppedConfig, &report.dropped_config),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !groups.is_empty() {
+        out.emit(Event::CaptureReport { groups });
+    }
 }
 
-/// One line per item under `words`, the first `REPORT_PATHS` of them, then
-/// one that counts the rest, so a suspend's answer stays within one control
-/// message however many paths a workspace holds.
-fn say_each<T: std::fmt::Display>(out: &mut Out, words: &str, items: &[T]) {
-    for item in items.iter().take(REPORT_PATHS) {
-        out.say(format!("{words}: {item}"));
-    }
-    if items.len() > REPORT_PATHS {
-        out.say(format!("{words}: {} more", items.len() - REPORT_PATHS));
-    }
+/// The group of `items` under `note`, the first `REPORT_PATHS` named and
+/// the rest counted; `None` when there are none.
+fn group<T: std::fmt::Display>(note: CaptureNote, items: &[T]) -> Option<CaptureGroup> {
+    (!items.is_empty()).then(|| CaptureGroup {
+        note,
+        items: items
+            .iter()
+            .take(REPORT_PATHS)
+            .map(ToString::to_string)
+            .collect(),
+        more: count(items.len().saturating_sub(REPORT_PATHS)),
+    })
 }
 
 /// Refuses a root that exists and is not a directory, such as a link put
@@ -3191,7 +3382,6 @@ fn refuse_replaced_root(job: JobId, root: &Path) -> Result<(), NodeError> {
     Ok(())
 }
 
-/// Whether nothing, not even a dangling link, is at `path`.
 /// Finishes or undoes a swap of the harness state a capture killed midway
 /// left: a new state not yet in place goes, and the last state set aside
 /// comes back when nothing took its place.
@@ -3212,6 +3402,7 @@ fn remove_dir_if_any(dir: &Path) -> Result<(), NodeError> {
     }
 }
 
+/// Whether nothing, not even a dangling link, is at `path`.
 fn is_missing(path: &Path) -> Result<bool, NodeError> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(false),
@@ -3220,47 +3411,26 @@ fn is_missing(path: &Path) -> Result<bool, NodeError> {
     }
 }
 
-/// `3 files, 54 bytes`.
-fn amount(written: Written) -> String {
-    format!(
-        "{} {}, {} {}",
-        written.files,
-        if written.files == 1 { "file" } else { "files" },
-        written.bytes,
-        if written.bytes == 1 { "byte" } else { "bytes" }
-    )
-}
-
-/// The one line that says what a restore wrote, in total and by class (gate finding F8).
-fn restore_summary(snapshot: SnapshotId, report: &RestoreReport, has_git: bool) -> String {
-    let mut parts = Vec::new();
-    if has_git {
-        parts.push(format!("tracked: {}", amount(report.tracked)));
-        parts.push(format!("untracked: {}", amount(report.untracked)));
-        parts.push(format!("ignored: {}", amount(report.ignored)));
-    } else {
-        parts.push(format!("workspace: {}", amount(report.ignored)));
+/// What a restore wrote, in total and by class (gate finding F8).
+fn restored(snapshot: SnapshotId, report: &RestoreReport, git: bool) -> Event {
+    let written = |w: Written| fabric_client::api::Written {
+        files: w.files,
+        bytes: w.bytes,
+    };
+    let total = report.total();
+    Event::Restored {
+        snapshot,
+        files: total.files,
+        bytes: total.bytes,
+        classes: Some(RestoredClasses {
+            git,
+            tracked: written(report.tracked),
+            untracked: written(report.untracked),
+            ignored: written(report.ignored),
+            harness: written(report.harness),
+        }),
     }
-    parts.push(format!("harness state: {}", amount(report.harness)));
-    format!(
-        "restored snapshot {snapshot}: {} ({})",
-        amount(report.total()),
-        parts.join("; ")
-    )
 }
-
-/// The line `status` and `move` print about a snapshot's harness state (gate finding F9).
-fn session_line(manifest: &fabric_core::snapshot::SnapshotManifest) -> Option<&'static str> {
-    manifest
-        .harness_state
-        .entries
-        .is_empty()
-        .then_some(NO_SESSION)
-}
-
-/// What a snapshot without harness state means for the conversation.
-const NO_SESSION: &str =
-    "no harness session captured; the conversation will not continue on the target";
 
 fn no_parent(root: &Path) -> NodeError {
     NodeError::io(root, std::io::Error::other("a root needs a parent"))
@@ -3298,7 +3468,8 @@ fn move_aside(root: &Path, dest: &Path) -> Result<bool, NodeError> {
 }
 
 /// Reads which folders iCloud Drive syncs on this node; off everywhere `defaults` does not exist.
-async fn synced_folders(home: &Path, path_var: &OsString) -> SyncedFolders {
+async fn synced_folders(home: &Path, env: &ToolEnv) -> SyncedFolders {
+    let path_var = env.path_var().to_owned();
     let read = |key: &'static str| {
         let path_var = path_var.clone();
         let home = home.to_owned();
@@ -3348,87 +3519,92 @@ fn offered_words(answer: &Fenced<Offered>) -> String {
     }
 }
 
-/// How long ago something happened, `ms` milliseconds back, in the largest whole unit.
-fn age(ms: u64) -> String {
-    let minutes = ms / 60_000;
-    match minutes {
-        0 => "less than a minute old".to_owned(),
-        1..60 => format!("{minutes} min old"),
-        60..2880 => format!("{} h old", minutes / 60),
-        _ => format!("{} days old", minutes / 1440),
-    }
-}
-
 /// What `status` says about the workspace `marker` names, from the marker
 /// and how this node relates to the job together.
-async fn workspace_line(job: &Job, me: NodeId, marker: &Marker, frozen: bool) -> String {
-    let root = marker.root.display();
+async fn workspace_state(job: &Job, me: NodeId, marker: &Marker, frozen: bool) -> WorkspaceState {
     match job.view(me) {
         LeaseView::Owner(token) if !frozen => {
             if marker.is_current(token.epoch, job.latest()).await {
-                format!("workspace: {root} ({})", marker_word(&marker.state))
+                WorkspaceState::Current {
+                    marker: marker_state(&marker.state),
+                }
             } else {
-                format!(
-                    "workspace: {root} was left at epoch {}, before this node's tenure; `fabric job resume {}` sets it aside and restores the latest snapshot",
-                    marker.epoch,
-                    job.id()
-                )
+                WorkspaceState::Stale {
+                    left_at: marker.epoch,
+                }
             }
         }
         LeaseView::Departing { target, .. } if !frozen && marker.is_unchanged().await => {
-            format!(
-                "workspace: {root} is clean at the snapshot offered to {target} and waits for its decision"
-            )
+            WorkspaceState::AwaitingDecision { target }
         }
-        _ if !frozen && marker.is_unchanged().await => format!(
-            "workspace: {root} is clean at a published snapshot; this node never runs it and moves it aside when it next settles the job"
-        ),
-        _ => format!(
-            "workspace: {root} is an orphan: it may hold changes made after the last snapshot this node published, and nothing here deletes it"
-        ),
+        _ if !frozen && marker.is_unchanged().await => WorkspaceState::CleanCopy,
+        _ => WorkspaceState::Orphan,
     }
 }
 
-fn view_word(view: &LeaseView) -> &'static str {
+fn standing(view: &LeaseView) -> Standing {
     match view {
-        LeaseView::Owner(_) => "owner",
-        LeaseView::Departing { .. } => "departing",
-        LeaseView::Departed { .. } => "departed",
-        LeaseView::Replica { .. } => "replica",
+        LeaseView::Owner(_) => Standing::Owner,
+        LeaseView::Departing { .. } => Standing::Departing,
+        LeaseView::Departed { .. } => Standing::Departed,
+        LeaseView::Replica { .. } => Standing::Replica,
     }
 }
 
-fn marker_word(state: &MarkerState) -> String {
+fn marker_state(state: &MarkerState) -> fabric_client::api::Marker {
+    use fabric_client::api::Marker as Shown;
     match state {
-        MarkerState::Live => {
-            "live: the harness may have changed it since the last snapshot".to_owned()
-        }
-        MarkerState::Suspending { .. } => "a suspend did not finish".to_owned(),
-        MarkerState::Clean { snapshot, .. } => format!("clean at snapshot {snapshot}"),
-        MarkerState::Restoring { snapshot } => format!("a restore of {snapshot} did not finish"),
+        MarkerState::Live => Shown::Live,
+        MarkerState::Suspending { .. } => Shown::Suspending,
+        MarkerState::Clean { snapshot, .. } => Shown::Clean {
+            snapshot: *snapshot,
+        },
+        MarkerState::Restoring { snapshot } => Shown::Restoring {
+            snapshot: *snapshot,
+        },
     }
 }
 
-fn describe(kind: &EventKind) -> String {
-    match kind {
+fn ledger_event(kind: &EventKind) -> LedgerEvent {
+    match kind.clone() {
         EventKind::Created {
             goal,
             harness,
             created_by,
             ..
-        } => format!("Created by {created_by} under {harness}: {goal}"),
-        EventKind::MoveStarted { move_id, target } => {
-            format!("MoveStarted {move_id} toward {target}")
+        } => LedgerEvent::Created {
+            created_by,
+            harness,
+            goal,
+        },
+        EventKind::MoveStarted { move_id, target } => LedgerEvent::MoveStarted { move_id, target },
+        EventKind::MoveImported { move_id, from } => LedgerEvent::MoveImported { move_id, from },
+        EventKind::MoveAborted { move_id } => LedgerEvent::MoveAborted { move_id },
+        EventKind::Stolen { by, from, reason } => LedgerEvent::Stolen { by, from, reason },
+        EventKind::SnapshotPublished { snapshot, parent } => {
+            LedgerEvent::SnapshotPublished { snapshot, parent }
         }
-        EventKind::MoveImported { move_id, from } => format!("MoveImported {move_id} from {from}"),
-        EventKind::MoveAborted { move_id } => format!("MoveAborted {move_id}"),
-        EventKind::Stolen { by, from, reason } => format!("Stolen by {by} from {from}: {reason}"),
-        EventKind::SnapshotPublished { snapshot, .. } => format!("SnapshotPublished {snapshot}"),
-        EventKind::Suspended { snapshot } => format!("Suspended in {snapshot}"),
-        EventKind::Resumed { node, harness, .. } => format!("Resumed on {node} under {harness}"),
-        EventKind::EnvSpecChanged { env_spec } => format!("EnvSpecChanged {env_spec}"),
-        EventKind::DecisionRecorded { text } => format!("DecisionRecorded: {text}"),
-        EventKind::Note { text } => format!("Note: {text}"),
+        EventKind::Suspended { snapshot } => LedgerEvent::Suspended { snapshot },
+        EventKind::Resumed {
+            node,
+            snapshot,
+            harness,
+        } => LedgerEvent::Resumed {
+            node,
+            snapshot,
+            harness,
+        },
+        EventKind::EnvSpecChanged { env_spec } => LedgerEvent::EnvSpecChanged { env_spec },
+        EventKind::DecisionRecorded { text } => LedgerEvent::DecisionRecorded { text },
+        EventKind::Note { text } => LedgerEvent::Note { text },
+    }
+}
+
+/// The client API's name for the wire a session runs on.
+fn wire(kind: fabric_net::transport::TransportKind) -> Wire {
+    match kind {
+        fabric_net::transport::TransportKind::Quic => Wire::Quic,
+        fabric_net::transport::TransportKind::TcpTls => Wire::TcpTls,
     }
 }
 
@@ -3457,26 +3633,24 @@ pub(crate) mod tests {
             home,
             listen: "127.0.0.1:0".parse().unwrap(),
             dial: DialOrder::TcpOnly,
-            path_var: std::env::var_os("PATH").unwrap_or_default(),
-            cargo_home: None,
+            env: ToolEnv::current(),
         })
         .unwrap();
         (dir, node)
     }
 
-    /// This process's `PATH`, as the CLI passes its own.
-    fn path_var() -> OsString {
-        std::env::var_os("PATH").unwrap_or_default()
+    /// This process's environment, as the CLI sends its own.
+    fn env() -> ToolEnv {
+        ToolEnv::current()
     }
 
     /// A job made from a one-commit repository, owned by `node` at epoch 1.
     pub(crate) async fn job(dir: &Path, node: &Arc<Node>) -> JobId {
         let repo = repo(dir);
-        let mut out = Out::default();
-        node.job_new(&repo, "goal".to_owned(), HarnessKind::Codex, &mut out)
+        node.job_new(&repo, "goal".to_owned(), HarnessKind::Codex)
             .await
-            .unwrap();
-        out.lines[0].parse().unwrap()
+            .unwrap()
+            .job
     }
 
     /// A one-commit repository at `dir/repo`.
@@ -3534,24 +3708,22 @@ pub(crate) mod tests {
     }
 
     async fn register(node: &Arc<Node>, id: JobId, pid: NonZeroU32) -> Result<(), NodeError> {
-        node.harness_started(
-            StartedHarness {
-                job: id,
-                epoch: Epoch::FIRST,
-                pid,
-                harness: HarnessKind::Codex,
-                session: None,
-                planned: None,
-                version: None,
-            },
-            &mut Out::default(),
-        )
+        node.harness_started(StartedHarness {
+            job: id,
+            epoch: Epoch::FIRST,
+            pid,
+            harness: HarnessKind::Codex,
+            session: None,
+            planned: None,
+            version: None,
+        })
         .await
+        .map(drop)
     }
 
     /// A `PATH` whose `codex` reports a version that takes the thread
     /// writer lock, so a capture never waits on a real `codex` running here.
-    fn locking_codex(dir: &Path) -> OsString {
+    fn locking_codex(dir: &Path) -> ToolEnv {
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let status = std::process::Command::new("/bin/sh")
@@ -3564,7 +3736,15 @@ pub(crate) mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap()
+        on_path(
+            &std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
+                .unwrap(),
+        )
+    }
+
+    /// An environment of `path` alone, with no tool root set.
+    fn on_path(path: &std::ffi::OsStr) -> ToolEnv {
+        ToolEnv::from_vars(|name| (name == "PATH").then(|| path.to_owned()))
     }
 
     /// Writes the rollout a Codex started in the job's workspace makes, and
@@ -3597,7 +3777,7 @@ pub(crate) mod tests {
     async fn fresh_codex_run(node: &Arc<Node>, id: JobId, made: impl FnOnce()) {
         let out = &mut Out::default();
         let plan = node.job_run(id, out).await.unwrap();
-        assert_eq!(plan.session, None, "{:?}", out.lines);
+        assert_eq!(plan.session, None, "{:?}", out.said());
         let mut harness = sleeper();
         register(node, id, pid(&harness)).await.unwrap();
         made();
@@ -3628,18 +3808,15 @@ pub(crate) mod tests {
         let out = &mut Out::default();
         let plan = node.job_run(id, out).await.unwrap();
         let mut harness = sleeper();
-        node.harness_started(
-            StartedHarness {
-                job: id,
-                epoch: Epoch::FIRST,
-                pid: pid(&harness),
-                harness: HarnessKind::Codex,
-                session: Some(session.clone()),
-                planned: plan.session,
-                version: None,
-            },
-            out,
-        )
+        node.harness_started(StartedHarness {
+            job: id,
+            epoch: Epoch::FIRST,
+            pid: pid(&harness),
+            harness: HarnessKind::Codex,
+            session: Some(session.clone()),
+            planned: plan.session,
+            version: None,
+        })
         .await
         .unwrap();
         harness.kill().unwrap();
@@ -3667,9 +3844,11 @@ pub(crate) mod tests {
         assert_eq!(job.session().unwrap(), None);
         assert!(!job.dir().harness_state().join(MANIFEST_FILE).exists());
         assert!(
-            out.lines.iter().any(|line| line.contains(session.as_str())),
+            out.said()
+                .iter()
+                .any(|line| line.contains(session.as_str())),
             "{:?}",
-            out.lines
+            out.said()
         );
     }
 
@@ -3699,7 +3878,7 @@ pub(crate) mod tests {
             known_writer: Some(HarnessVersion::parse("0.155.1").unwrap()),
         };
         let (recorded, captured) = recorded_and_captured(&node, id).await;
-        assert_eq!(recorded, Some(before), "{:?}", out.lines);
+        assert_eq!(recorded, Some(before), "{:?}", out.said());
         assert_eq!(captured, thread);
     }
 
@@ -3795,14 +3974,11 @@ pub(crate) mod tests {
         reaper.join().unwrap().unwrap();
         let late = node
             .harness_session(
-                NamedSession {
-                    job: id,
-                    epoch: Epoch::FIRST,
-                    pid: harness_pid,
-                    harness: HarnessKind::Codex,
-                    session: thread.clone(),
-                },
-                &mut Out::default(),
+                id,
+                Epoch::FIRST,
+                harness_pid,
+                HarnessKind::Codex,
+                thread.clone(),
             )
             .await;
         assert!(
@@ -3819,7 +3995,7 @@ pub(crate) mod tests {
             recorded_and_captured(&node, id).await,
             (Some(record), thread),
             "{:?}",
-            out.lines
+            out.said()
         );
     }
 
@@ -3831,7 +4007,7 @@ pub(crate) mod tests {
     async fn a_started_harness_raises_the_known_writer_and_never_lowers_it() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         let out = &mut Out::default();
         node.suspend(id, &path, out).await.unwrap();
         node.job_run(id, out).await.unwrap();
@@ -3856,7 +4032,7 @@ pub(crate) mod tests {
                     planned,
                     version,
                 };
-                let result = node.harness_started(started, &mut Out::default()).await;
+                let result = node.harness_started(started).await;
                 harness.kill().unwrap();
                 harness.wait().unwrap();
                 node.harness_exited(id, pid(&harness)).await.unwrap();
@@ -3916,6 +4092,7 @@ pub(crate) mod tests {
         let mut path = bin.into_os_string();
         path.push(":");
         path.push(std::env::var_os("PATH").unwrap_or_default());
+        let path = on_path(&path);
         {
             let job = node.job(id).await.unwrap();
             let job = job.lock().await;
@@ -4143,7 +4320,7 @@ pub(crate) mod tests {
         local::write(&node.cfg.state.job(id).session(), &claude).unwrap();
         codex_thread_in(&node, id);
 
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         let plan = node
             .job_resume(
                 id,
@@ -4169,11 +4346,11 @@ pub(crate) mod tests {
     async fn a_resume_under_codex_after_claude_leaves_the_claude_record() {
         let (dir, node) = node();
         let repo = repo(dir.path());
-        let mut out = Out::default();
-        node.job_new(&repo, "goal".to_owned(), HarnessKind::ClaudeCode, &mut out)
+        let id = node
+            .job_new(&repo, "goal".to_owned(), HarnessKind::ClaudeCode)
             .await
-            .unwrap();
-        let id: JobId = out.lines[0].parse().unwrap();
+            .unwrap()
+            .job;
         let claude = SessionRecord {
             harness: HarnessKind::ClaudeCode,
             session: SessionId::parse("9c9796f0-2682-4546-a963-d314b3ad543f").unwrap(),
@@ -4182,9 +4359,16 @@ pub(crate) mod tests {
         local::write(&node.cfg.state.job(id).session(), &claude).unwrap();
         codex_thread_in(&node, id);
 
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         let plan = node
-            .job_resume(id, None, Some(HarnessKind::Codex), false, &path, &mut out)
+            .job_resume(
+                id,
+                None,
+                Some(HarnessKind::Codex),
+                false,
+                &path,
+                &mut Out::default(),
+            )
             .await
             .unwrap();
         assert_eq!(plan.session, None);
@@ -4197,9 +4381,7 @@ pub(crate) mod tests {
         for (node, peer) in [(a, b), (b, a)] {
             tokio::spawn(Arc::clone(node).run());
             let addr = peer.local_addr().unwrap().to_string();
-            node.node_add(peer.id, Some(&addr), &mut Out::default())
-                .await
-                .unwrap();
+            node.node_add(peer.id, Some(&addr)).await.unwrap();
         }
     }
 
@@ -4213,7 +4395,7 @@ pub(crate) mod tests {
         let (dir_a, a) = node();
         let (_dir_b, b) = node();
         paired(&a, &b).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = ToolEnv::current();
         let out = &mut Out::default();
         let id = job(dir_a.path(), &a).await;
         a.suspend(id, &path, out).await.unwrap();
@@ -4252,9 +4434,7 @@ pub(crate) mod tests {
         std::fs::write(thief_root.join("thief.txt"), "b's work\n").unwrap();
         b.suspend(id, &path, out).await.unwrap();
 
-        a.pull(id, b.id, (None, false), &path_var(), out)
-            .await
-            .unwrap();
+        a.pull(id, b.id, (None, false), &env(), out).await.unwrap();
         let job = a.job(id).await.unwrap();
         let mut job = job.lock().await;
         let epoch = owner_token(&job, a.id).unwrap().epoch;
@@ -4283,7 +4463,7 @@ pub(crate) mod tests {
     async fn a_session_named_after_the_start_is_recorded_only_for_the_recorded_harness() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = ToolEnv::current();
         let out = &mut Out::default();
         node.suspend(id, &path, out).await.unwrap();
         node.job_run(id, out).await.unwrap();
@@ -4293,17 +4473,8 @@ pub(crate) mod tests {
         let name_at = |epoch, pid| {
             let (node, thread) = (Arc::clone(&node), thread.clone());
             async move {
-                node.harness_session(
-                    NamedSession {
-                        job: id,
-                        epoch,
-                        pid,
-                        harness: HarnessKind::Codex,
-                        session: thread,
-                    },
-                    &mut Out::default(),
-                )
-                .await
+                node.harness_session(id, epoch, pid, HarnessKind::Codex, thread)
+                    .await
             }
         };
         let name = |pid| name_at(Epoch::FIRST, pid);
@@ -4359,14 +4530,11 @@ pub(crate) mod tests {
         // the Codex that created the new thread on its next resume.
         let forked = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368b").unwrap();
         node.harness_session(
-            NamedSession {
-                job: id,
-                epoch: Epoch::FIRST,
-                pid: pid(&harness),
-                harness: HarnessKind::Codex,
-                session: forked.clone(),
-            },
-            &mut Out::default(),
+            id,
+            Epoch::FIRST,
+            pid(&harness),
+            HarnessKind::Codex,
+            forked.clone(),
         )
         .await
         .unwrap();
@@ -4399,13 +4567,11 @@ pub(crate) mod tests {
         let (dir_a, a) = node();
         let (_dir_b, b) = node();
         paired(&a, &b).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         let out = &mut Out::default();
         let id = job(dir_a.path(), &a).await;
         a.suspend(id, &path, out).await.unwrap();
-        b.pull(id, a.id, (None, false), &path_var(), out)
-            .await
-            .unwrap();
+        b.pull(id, a.id, (None, false), &env(), out).await.unwrap();
         let approved = b.cfg.state.job(id).env_spec_ran();
         std::fs::write(&approved, "spec inputs\n").unwrap();
 
@@ -4415,7 +4581,7 @@ pub(crate) mod tests {
         b.restore_if_needed(&mut job, epoch, &path, out)
             .await
             .unwrap();
-        assert!(!approved.exists(), "{:?}", out.lines);
+        assert!(!approved.exists(), "{:?}", out.said());
     }
 
     /// An addressless peer can dial in after start-up recovery listed the
@@ -4430,7 +4596,7 @@ pub(crate) mod tests {
         paired(&a, &b).await;
         a.recovered().await;
         b.recovered().await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         let out = &mut Out::default();
         let id = job(dir_a.path(), &a).await;
         a.suspend(id, &path, out).await.unwrap();
@@ -4440,7 +4606,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         // The steal reached a; this record, which b does not push, did not.
-        b.job_decide(id, Decision::Approve, "", out).await.unwrap();
+        b.job_decide(id, Decision::Approve, "").await.unwrap();
         let head = |node: Arc<Node>| async move {
             node.job(id).await.unwrap().lock().await.ledger().head()
         };
@@ -4452,7 +4618,7 @@ pub(crate) mod tests {
         a.recovered.send_replace(false);
         let kept = b.open_session(a.id).unwrap();
         b.forget(a.id, &kept);
-        b.node_ping(a.id, out).await.unwrap();
+        b.node_ping(a.id).await.unwrap();
         a.end_recovery();
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -4479,14 +4645,12 @@ pub(crate) mod tests {
         tokio::spawn(Arc::clone(&c).run());
         for (node, peer) in [(&a, &c), (&c, &a)] {
             let addr = peer.local_addr().unwrap().to_string();
-            node.node_add(peer.id, Some(&addr), &mut Out::default())
-                .await
-                .unwrap();
+            node.node_add(peer.id, Some(&addr)).await.unwrap();
         }
         for node in [&a, &b, &c] {
             node.recovered().await;
         }
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         let out = &mut Out::default();
         let id = job(dir_a.path(), &a).await;
         a.suspend(id, &path, out).await.unwrap();
@@ -4515,9 +4679,7 @@ pub(crate) mod tests {
         a.recovered.send_replace(false);
         let c_job = c.job(id).await.unwrap();
         let c_paused = c_job.lock().await;
-        b.job_decide(id, Decision::Approve, "before", out)
-            .await
-            .unwrap();
+        b.job_decide(id, Decision::Approve, "before").await.unwrap();
         let recovery = tokio::spawn(Arc::clone(&a).recover());
         wait_for(
             head(Arc::clone(&b)).await,
@@ -4526,13 +4688,11 @@ pub(crate) mod tests {
         .await;
 
         // b writes a record a does not have, then begins a new session.
-        b.job_decide(id, Decision::Approve, "after", out)
-            .await
-            .unwrap();
+        b.job_decide(id, Decision::Approve, "after").await.unwrap();
         let want = head(Arc::clone(&b)).await;
         let kept = b.open_session(a.id).unwrap();
         b.forget(a.id, &kept);
-        b.node_ping(a.id, out).await.unwrap();
+        b.node_ping(a.id).await.unwrap();
         drop(c_paused);
         recovery.await.unwrap();
         assert!(a.is_recovered());
@@ -4556,7 +4716,7 @@ pub(crate) mod tests {
         paired(&a, &b).await;
         a.recovered().await;
         b.recovered().await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         let out = &mut Out::default();
         let mut ids = [
             job(&dir_a.path().join("one"), &a).await,
@@ -4597,7 +4757,7 @@ pub(crate) mod tests {
 
         // a catches up with b, which answers no pull of the second job
         // while the test holds it, so the pass stays open after the first.
-        b.job_decide(first, Decision::Approve, "before", out)
+        b.job_decide(first, Decision::Approve, "before")
             .await
             .unwrap();
         let b_second = b.job(second).await.unwrap();
@@ -4606,13 +4766,13 @@ pub(crate) mod tests {
         wait_for(head(Arc::clone(&b)).await, "a did not catch up with b").await;
 
         // b writes a record a does not have, then begins a new session.
-        b.job_decide(first, Decision::Approve, "after", out)
+        b.job_decide(first, Decision::Approve, "after")
             .await
             .unwrap();
         let want = head(Arc::clone(&b)).await;
         let kept = b.open_session(a.id).unwrap();
         b.forget(a.id, &kept);
-        b.node_ping(a.id, out).await.unwrap();
+        b.node_ping(a.id).await.unwrap();
         drop(b_paused);
         wait_for(
             want,
@@ -4628,7 +4788,7 @@ pub(crate) mod tests {
     async fn a_move_toward_another_node_refuses_with_the_open_moves_target() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = ToolEnv::current();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         let (first, second) = (NodeId::from_bytes([7; 32]), NodeId::from_bytes([8; 32]));
         node.depart(id, first, &HarnessKind::Codex, &mut Out::default())
@@ -4650,7 +4810,10 @@ pub(crate) mod tests {
             peer,
             &fabric_net::rpc::RpcError::Deadline(Duration::from_secs(15)),
         );
-        assert_eq!(late.refusal(), crate::control::Refusal::Unreachable);
+        assert_eq!(
+            late.to_refusal().kind(),
+            fabric_client::api::RefusalKind::Unreachable
+        );
     }
 
     /// Users read status when a move is frozen; a clean copy waiting for
@@ -4659,7 +4822,7 @@ pub(crate) mod tests {
     async fn status_calls_a_departing_clean_copy_clean() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = ToolEnv::current();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         node.depart(
             id,
@@ -4669,14 +4832,12 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        let mut out = Out::default();
-        node.job_status(id, &mut out).await.unwrap();
-        let line = out
-            .lines
-            .iter()
-            .find(|line| line.starts_with("workspace: "))
-            .unwrap();
-        assert!(line.contains("waits for its decision"), "{line}");
+        let status = node.job_status(id).await.unwrap();
+        let state = status.workspace.unwrap().state;
+        assert!(
+            matches!(state, WorkspaceState::AwaitingDecision { .. }),
+            "{state:?}"
+        );
     }
 
     /// A node frozen after a fork must not steal on its forked chain: the
@@ -4688,7 +4849,7 @@ pub(crate) mod tests {
         let (_dir_b, b) = node();
         paired(&a, &b).await;
         let id = job(dir_a.path(), &a).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = ToolEnv::current();
         a.suspend(id, &path, &mut Out::default()).await.unwrap();
         b.pull_records(id, a.id).await.unwrap();
         b.ensure_latest(id, a.id).await.unwrap();
@@ -4722,15 +4883,15 @@ pub(crate) mod tests {
                 reason: "pnpm is not installed on the target".to_owned(),
             },
         };
-        let mut out = Out { lines: Vec::new() };
+        let mut out = Out::default();
         let err = refuse_carry(std::slice::from_ref(&refused), false, &mut out).unwrap_err();
         assert!(
-            matches!(&err, NodeError::Preflight(text) if text.contains("node_modules")),
+            matches!(&err, NodeError::CarryRefused { paths, more: 0 } if paths == &["node_modules"]),
             "{err}"
         );
         refuse_carry(&[refused], true, &mut out).unwrap();
         assert_eq!(
-            out.lines,
+            out.said(),
             ["--force: node_modules travels as it is, and the target writes it"]
         );
     }
@@ -4749,10 +4910,8 @@ pub(crate) mod tests {
             })
             .collect();
         let err = refuse_carry(&refused, false, &mut Out::default()).unwrap_err();
-        let NodeError::Preflight(text) = &err else {
-            panic!("{err}");
-        };
-        assert!(text.ends_with("p19/node_modules and 5 more"), "{text}");
+        let text = err.to_string();
+        assert!(text.contains("p19/node_modules and 5 more;"), "{text}");
         assert!(!text.contains("p20/"), "{text}");
     }
 
@@ -4778,14 +4937,17 @@ pub(crate) mod tests {
             ..RestoreReport::default()
         };
         let snapshot = SnapshotId::from_bytes([7; 32]);
+        let summary = |report: &RestoreReport, git: bool| {
+            fabric_client::sentences::event(&restored(snapshot, report, git)).join("\n")
+        };
         assert_eq!(
-            restore_summary(snapshot, &report, true),
+            summary(&report, true),
             format!(
                 "restored snapshot {snapshot}: 11 files, 980 bytes (tracked: 5 files, 114 bytes; untracked: 1 file, 10 bytes; ignored: 3 files, 85 bytes; harness state: 2 files, 771 bytes)"
             )
         );
         assert_eq!(
-            restore_summary(snapshot, &RestoreReport::default(), false),
+            summary(&RestoreReport::default(), false),
             format!(
                 "restored snapshot {snapshot}: 0 files, 0 bytes (workspace: 0 files, 0 bytes; harness state: 0 files, 0 bytes)"
             )
@@ -4801,7 +4963,7 @@ pub(crate) mod tests {
         let (_dir_b, b) = node();
         paired(&a, &b).await;
         let id = job(dir_a.path(), &a).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = ToolEnv::current();
         a.suspend(id, &path, &mut Out::default()).await.unwrap();
         for (harness, login) in [
             (None, crate::facts::name::CODEX_LOGIN),
@@ -4814,7 +4976,7 @@ pub(crate) mod tests {
                 .job_resume(id, Some(a.id), harness, true, &path, &mut Out::default())
                 .await;
             assert!(
-                matches!(&refused, Err(NodeError::Preflight(facts)) if facts.contains(login)),
+                matches!(&refused, Err(NodeError::Preflight(facts)) if facts.iter().any(|fact| fact == login)),
                 "{refused:?}"
             );
         }
@@ -4836,7 +4998,7 @@ pub(crate) mod tests {
         let (_dir_b, b) = node();
         paired(&a, &b).await;
         let id = job(dir_a.path(), &a).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         a.suspend(id, &path, &mut Out::default()).await.unwrap();
         // The two test nodes have different homes, which refuses too.
         for (agent, agent_found) in [
@@ -4858,7 +5020,7 @@ pub(crate) mod tests {
             let Err(NodeError::Preflight(facts)) = &refused else {
                 panic!("{agent}: {refused:?}");
             };
-            let facts: Vec<&str> = facts.split(", ").collect();
+            let facts: Vec<&str> = facts.iter().map(String::as_str).collect();
             assert!(facts.contains(&"acp.state_dir"), "{agent}: {facts:?}");
             assert_eq!(
                 facts.contains(&"acp.agent"),
@@ -4881,7 +5043,7 @@ pub(crate) mod tests {
     async fn a_live_workspace_whose_root_is_gone_is_restored() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         let plan = node.job_run(id, &mut Out::default()).await.unwrap();
         std::fs::remove_dir_all(&plan.root).unwrap();
@@ -4894,7 +5056,7 @@ pub(crate) mod tests {
         assert!(
             resumed.root.join(".git").is_dir(),
             "the root was not restored: {:?}",
-            out.lines
+            out.said()
         );
     }
 
@@ -4925,13 +5087,12 @@ pub(crate) mod tests {
             home,
             listen: "127.0.0.1:0".parse().unwrap(),
             dial: DialOrder::TcpOnly,
-            path_var: std::env::var_os("PATH").unwrap_or_default(),
-            cargo_home: None,
+            env: ToolEnv::current(),
         })
         .unwrap();
         paired(&a, &b).await;
         let id = job(dir_a.path(), &a).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         a.suspend(id, &path, &mut Out::default()).await.unwrap();
         // The two test nodes have different homes, which refuses every pull.
         for (agent, usable) in [("acp:sh", false), ("acp:cat", false), ("acp:true", true)] {
@@ -4949,7 +5110,7 @@ pub(crate) mod tests {
             let Err(NodeError::Preflight(facts)) = &refused else {
                 panic!("{agent}: {refused:?}");
             };
-            let facts: Vec<&str> = facts.split(", ").collect();
+            let facts: Vec<&str> = facts.iter().map(String::as_str).collect();
             assert_eq!(
                 facts.contains(&"acp.state_dir"),
                 !usable,
@@ -4977,18 +5138,15 @@ pub(crate) mod tests {
         let mut harness = sleeper();
         let session = SessionId::parse("new-session").unwrap();
         let failed = node
-            .harness_started(
-                StartedHarness {
-                    job: id,
-                    epoch: Epoch::FIRST,
-                    pid: pid(&harness),
-                    harness: HarnessKind::Codex,
-                    session: Some(session.clone()),
-                    planned: None,
-                    version: None,
-                },
-                &mut Out::default(),
-            )
+            .harness_started(StartedHarness {
+                job: id,
+                epoch: Epoch::FIRST,
+                pid: pid(&harness),
+                harness: HarnessKind::Codex,
+                session: Some(session.clone()),
+                planned: None,
+                version: None,
+            })
             .await;
         harness.kill().unwrap();
         harness.wait().unwrap();
@@ -5025,7 +5183,7 @@ pub(crate) mod tests {
         std::fs::write(root.join(".gitignore"), ".output/\n").unwrap();
         std::fs::create_dir_all(root.join(".output/server")).unwrap();
         std::fs::write(root.join(".output/server/index.mjs"), "export {}\n").unwrap();
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         let snapshot = node.suspend(id, &path, &mut Out::default()).await.unwrap();
         let manifest = with_store(&node.store, move |store| Ok(store.manifest(snapshot)?))
             .await
@@ -5050,7 +5208,7 @@ pub(crate) mod tests {
         std::fs::write(root.join(".fabricignore"), "package-lock.json\n").unwrap();
         std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
         std::fs::write(root.join("node_modules/pkg/index.js"), "1;\n").unwrap();
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         let snapshot = node.suspend(id, &path, &mut Out::default()).await.unwrap();
         let manifest = with_store(&node.store, move |store| Ok(store.manifest(snapshot)?))
             .await
@@ -5081,7 +5239,7 @@ pub(crate) mod tests {
         let root = paths::job_root(&node.cfg.home, id);
         std::fs::create_dir_all(root.join(".fabric")).unwrap();
         std::fs::write(root.join(".fabric/env.toml"), "not toml [\n").unwrap();
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = ToolEnv::current();
         let refused = node.suspend(id, &path, &mut Out::default()).await;
         assert!(matches!(refused, Err(NodeError::Detect(_))), "{refused:?}");
         let job = node.job(id).await.unwrap();
@@ -5102,15 +5260,20 @@ pub(crate) mod tests {
         )
         .unwrap();
         std::fs::write(root.join("users.sqlite"), "rows\n").unwrap();
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = ToolEnv::current();
         let mut out = Out::default();
         node.suspend(id, &path, &mut out).await.unwrap();
+        let left = CaptureGroup {
+            note: CaptureNote::Secret,
+            items: vec!["users.sqlite".to_owned()],
+            more: 0,
+        };
         assert!(
-            out.lines
-                .iter()
-                .any(|line| line == "left behind (secret pattern): users.sqlite"),
+            out.events.iter().any(
+                |event| matches!(event, Event::CaptureReport { groups } if groups.contains(&left))
+            ),
             "{:?}",
-            out.lines
+            out.events
         );
     }
 
@@ -5124,7 +5287,7 @@ pub(crate) mod tests {
         let id = job(dir.path(), &node).await;
         let root = paths::job_root(&node.cfg.home, id);
         let setup = TreeLock::acquire(&node.cfg.state.tree_locks(), &root).unwrap();
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         let refused = node.suspend(id, &path, &mut Out::default()).await;
         assert!(
             matches!(refused, Err(NodeError::SetupRunning { .. })),
@@ -5165,7 +5328,7 @@ pub(crate) mod tests {
     async fn a_suspend_holds_the_tree_lock_while_it_stops_the_harness() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         node.job_run(id, &mut Out::default()).await.unwrap();
         // Once asked to stop, the harness says so and takes two seconds to exit.
@@ -5210,7 +5373,7 @@ pub(crate) mod tests {
     async fn a_resume_restores_a_clean_workspace_that_was_deleted() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = ToolEnv::current();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         let root = paths::job_root(&node.cfg.home, id);
         std::fs::remove_dir_all(&root).unwrap();
@@ -5237,8 +5400,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let plan = node.job_run(id, &mut Out::default()).await.unwrap();
-        let sent: RunPlan = postcard::from_bytes(&postcard::to_stdvec(&plan).unwrap()).unwrap();
-        assert_eq!(sent.harness_config, node.harness_config);
+        let sent: RunPlan = serde_json::from_slice(&serde_json::to_vec(&plan).unwrap()).unwrap();
         assert!(sent.harness_config.acp.is_empty());
         assert_eq!(sent.home, node.cfg.home);
     }
@@ -5252,26 +5414,26 @@ pub(crate) mod tests {
         tokio::spawn(Arc::clone(&a).run());
         tokio::spawn(Arc::clone(&b).run());
         let addr = b.local_addr().unwrap().to_string();
-        a.node_add(b.id, Some(&addr), &mut Out::default())
-            .await
-            .unwrap();
-        b.node_add(a.id, None, &mut Out::default()).await.unwrap();
-        a.node_ping(b.id, &mut Out::default()).await.unwrap();
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let mut out = Out::default();
+        a.node_add(b.id, Some(&addr)).await.unwrap();
+        b.node_add(a.id, None).await.unwrap();
+        a.node_ping(b.id).await.unwrap();
+        let path = ToolEnv::current();
         // The two test homes differ, which the table refuses; what matters
         // is that the table was made from the peer's answer.
-        let answered = b.doctor(Some(a.id), None, &path, &mut out).await;
+        let answered = b
+            .doctor(Some(a.id), None, &path, &mut Out::default())
+            .await
+            .unwrap();
+        let DoctorReport::Compared { rows, .. } = answered else {
+            panic!("{answered:?}");
+        };
         assert!(
-            matches!(answered, Ok(()) | Err(NodeError::Preflight(_))),
-            "{answered:?}"
-        );
-        assert!(
-            out.lines
-                .iter()
-                .any(|line| line.contains(" network ") && line.contains("tcp+tls")),
-            "{:?}",
-            out.lines
+            rows.iter().any(|row| row.fact == "network"
+                && row
+                    .peer
+                    .as_deref()
+                    .is_some_and(|wire| wire.contains("tcp+tls"))),
+            "{rows:?}"
         );
     }
 
@@ -5298,11 +5460,9 @@ pub(crate) mod tests {
             (&c, a.id, Some(&at_a)),
             (&c, b.id, None),
         ] {
-            node.node_add(peer, addr.map(String::as_str), &mut Out::default())
-                .await
-                .unwrap();
+            node.node_add(peer, addr.map(String::as_str)).await.unwrap();
         }
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = ToolEnv::current();
         let out = &mut Out::default();
         let id = job(dir_a.path(), &a).await;
         a.suspend(id, &path, out).await.unwrap();
@@ -5318,7 +5478,7 @@ pub(crate) mod tests {
         }
         let shared = b.job(id).await.unwrap().lock().await.ledger().head();
 
-        a.job_decide(id, Decision::Approve, "a's own record", out)
+        a.job_decide(id, Decision::Approve, "a's own record")
             .await
             .unwrap();
         b.pull_records(id, a.id).await.unwrap();
@@ -5359,17 +5519,15 @@ pub(crate) mod tests {
         tokio::spawn(Arc::clone(&a).run());
         tokio::spawn(Arc::clone(&b).run());
         let addr = b.local_addr().unwrap().to_string();
-        a.node_add(b.id, Some(&addr), &mut Out::default())
-            .await
-            .unwrap();
-        b.node_add(a.id, None, &mut Out::default()).await.unwrap();
-        a.node_ping(b.id, &mut Out::default()).await.unwrap();
+        a.node_add(b.id, Some(&addr)).await.unwrap();
+        b.node_add(a.id, None).await.unwrap();
+        a.node_ping(b.id).await.unwrap();
         let id = job(dir_b.path(), &b).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = ToolEnv::current();
         let mut out = Out::default();
         b.suspend(id, &path, &mut out).await.unwrap();
         b.replicate(id, &mut out).await;
-        assert!(a.job(id).await.is_ok(), "{:?}", out.lines);
+        assert!(a.job(id).await.is_ok(), "{:?}", out.events);
     }
 
     /// A secret in an ACP agent's arguments must be refused before a
@@ -5383,12 +5541,7 @@ pub(crate) mod tests {
             args: vec!["--api-key".to_owned(), format!("sk-ant-{}", "a".repeat(24))],
         };
         let refused = node
-            .job_new(
-                dir.path(),
-                "goal".to_owned(),
-                secret.clone(),
-                &mut Out::default(),
-            )
+            .job_new(dir.path(), "goal".to_owned(), secret.clone())
             .await;
         assert!(
             matches!(refused, Err(NodeError::HarnessConfig(_))),
@@ -5396,18 +5549,15 @@ pub(crate) mod tests {
         );
         let mut sleeper = sleeper();
         let refused = node
-            .harness_started(
-                StartedHarness {
-                    job: id,
-                    epoch: Epoch::FIRST,
-                    pid: pid(&sleeper),
-                    harness: secret,
-                    session: None,
-                    planned: None,
-                    version: None,
-                },
-                &mut Out::default(),
-            )
+            .harness_started(StartedHarness {
+                job: id,
+                epoch: Epoch::FIRST,
+                pid: pid(&sleeper),
+                harness: secret,
+                session: None,
+                planned: None,
+                version: None,
+            })
             .await;
         sleeper.kill().unwrap();
         sleeper.wait().unwrap();
@@ -5421,31 +5571,557 @@ pub(crate) mod tests {
     }
 
     /// A log longer than one control answer can carry still answers, with
-    /// the latest records and a line that says how many were left out.
+    /// the latest records and how many were left out.
     #[tokio::test]
     async fn a_log_past_the_control_cap_answers_with_the_latest_records() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
         let long_text = "n".repeat(900 << 10);
-        for _ in 0..5 {
-            node.job_decide(id, Decision::Approve, &long_text, &mut Out::default())
+        for _ in 0..10 {
+            node.job_decide(id, Decision::Approve, &long_text)
                 .await
                 .unwrap();
         }
-        let mut out = Out::default();
-        node.job_log(id, &mut out).await.unwrap();
-        let lines = out.lines;
-        let answer = crate::control::Response::Done {
-            lines: lines.clone(),
+        let log = node.job_log(id).await.unwrap();
+        assert!(log.left_out > 0, "nothing was left out");
+        assert_eq!(log.left_out + log.records.len() as u64, 11);
+        assert!(matches!(
+            log.records.last().map(|record| &record.event),
+            Some(LedgerEvent::DecisionRecorded { .. })
+        ));
+        let answer = fabric_client::api::Answer::Done {
+            reply: Reply::JobLog(log),
         };
-        let encoded = postcard::to_stdvec(&answer).unwrap();
-        assert!(encoded.len() <= crate::control::MAX_CONTROL_MESSAGE);
         assert!(
-            lines[0].starts_with("the first 4 records are left out"),
-            "{}",
-            &lines[0]
+            fabric_client::frame::encode(&answer).unwrap().len() <= fabric_client::frame::MAX_FRAME
         );
-        assert!(lines.last().unwrap().starts_with("   5 epoch"));
+    }
+
+    /// Review finding on PR #13: the capture a peer's pull asks for
+    /// measured carry keys in the daemon's environment, while the puller
+    /// restores in its CLI's, so with `CARGO_HOME` set in the shell and not
+    /// for the daemon a pull rebuilt `target/` where the base carried it.
+    /// The holder now captures in the environment its last local client
+    /// sent: here a `rustc` and a `CARGO_HOME` only that environment names.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_capture_for_a_peers_pull_measures_in_the_environment_a_client_sent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use fabric_client::api::{PathDir, Roots, SystemPath};
+        use fabric_core::path::AbsPath;
+        use fabric_core::snapshot::CarryKey;
+
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let root = paths::job_root(&a.cfg.home, id);
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir(root.join("target")).unwrap();
+        std::fs::write(root.join("target").join("built"), "bytes\n").unwrap();
+        let bin = dir_a.path().join("shell-bin");
+        std::fs::create_dir(&bin).unwrap();
+        let rustc = bin.join("rustc");
+        std::fs::write(&rustc, "#!/bin/sh\necho rustc 1.0.0-shell\n").unwrap();
+        std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        a.remember_env(&ClientEnv {
+            path: vec![
+                PathDir::parse(bin.to_str().unwrap()).unwrap(),
+                PathDir::parse("/usr/bin").unwrap(),
+                PathDir::parse("/bin").unwrap(),
+            ],
+            roots: Roots {
+                cargo_home: Some(SystemPath::parse("/shell/cargo").unwrap()),
+                ..Roots::default()
+            },
+        });
+
+        b.pull(
+            id,
+            a.id,
+            (None, false),
+            &ToolEnv::current(),
+            &mut Out::default(),
+        )
+        .await
+        .unwrap();
+        let snapshot = b.job(id).await.unwrap().lock().await.latest().unwrap();
+        let manifest = with_store(&b.store, move |store| Ok(store.manifest(snapshot)?))
+            .await
+            .unwrap();
+        let target = manifest
+            .caches
+            .iter()
+            .find(|cache| cache.path.as_str() == "target")
+            .unwrap();
+        assert_eq!(
+            target.key,
+            CarryKey::Rust {
+                rustc_vv: "rustc 1.0.0-shell".to_owned(),
+                cargo_home: AbsPath::parse("/shell/cargo").unwrap(),
+            }
+        );
+    }
+
+    /// Review finding on PR #13: a node kept the last CLI's `PATH` as its
+    /// own and ran tools from it for its peers. With a job's virtualenv
+    /// activated in the shell, or direnv's `node_modules/.bin`, a peer's
+    /// preflight or pull then had the node run `python3` or `node` from
+    /// that workspace, whose files come from the repository and from
+    /// peers' snapshots, long after the shell was gone. The node now keeps
+    /// no directory inside a job's tree, written there or reached through
+    /// a link, and keeps the rest of the shell's environment.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_never_has_the_node_run_a_program_from_a_workspace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use fabric_client::api::{PathDir, Roots, SystemPath};
+
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let root = paths::job_root(&a.cfg.home, id);
+        let venv = root.join(".venv").join("bin");
+        std::fs::create_dir_all(&venv).unwrap();
+        let ran = dir_a.path().join("ran");
+        for program in ["python3", "node", "rustc", "pnpm"] {
+            let path = venv.join(program);
+            let script = format!("#!/bin/sh\necho \"$0\" >> '{}'\n", ran.display());
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let linked = dir_a.path().join("linked");
+        std::os::unix::fs::symlink(&root, &linked).unwrap();
+        let dir = |path: &Path| PathDir::parse(path.to_str().unwrap()).unwrap();
+        let system = |path: &Path| SystemPath::parse(path.to_str().unwrap()).unwrap();
+
+        for workspace in [venv.clone(), linked.join(".venv").join("bin")] {
+            a.remember_env(&ClientEnv {
+                path: vec![
+                    dir(&workspace),
+                    PathDir::parse("/usr/bin").unwrap(),
+                    PathDir::parse("/bin").unwrap(),
+                ],
+                roots: Roots {
+                    cargo_home: Some(SystemPath::parse("/shell/cargo").unwrap()),
+                    rustup_home: Some(system(&root.join(".rustup"))),
+                    ..Roots::default()
+                },
+            });
+            b.doctor(Some(a.id), None, &ToolEnv::current(), &mut Out::default())
+                .await
+                .unwrap();
+            assert!(
+                !ran.exists(),
+                "a peer had the node run {}",
+                std::fs::read_to_string(&ran).unwrap_or_default()
+            );
+            let kept = a.node_env();
+            assert_eq!(kept.path_var(), "/usr/bin:/bin");
+            assert_eq!(
+                kept.root(Roots::CARGO_HOME),
+                Some(std::ffi::OsStr::new("/shell/cargo"))
+            );
+            assert_eq!(kept.root(Roots::RUSTUP_HOME), None);
+        }
+    }
+
+    /// Three running nodes and a job A made and owns at epoch 1, which C,
+    /// paired with B alone, stole and pushed to B: B is a replica at epoch
+    /// 2 with C as its owner, and A, which knows nothing of the steal, is
+    /// still at epoch 1. The directories come first, kept alive.
+    async fn stolen_without_a() -> (
+        [tempfile::TempDir; 3],
+        Arc<Node>,
+        Arc<Node>,
+        Arc<Node>,
+        JobId,
+    ) {
+        let (dir_a, a) = node();
+        let (dir_b, b) = node();
+        let (dir_c, c) = node();
+        for node in [&a, &b, &c] {
+            tokio::spawn(Arc::clone(node).run());
+        }
+        for (node, peer) in [(&a, &b), (&b, &a), (&b, &c), (&c, &b)] {
+            let addr = peer.local_addr().unwrap().to_string();
+            node.node_add(peer.id, Some(&addr)).await.unwrap();
+        }
+        let out = &mut Out::default();
+        let env = ToolEnv::current();
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &env, out).await.unwrap();
+        b.pull_records(id, a.id).await.unwrap();
+        b.ensure_latest(id, a.id).await.unwrap();
+        c.pull_records(id, b.id).await.unwrap();
+        c.ensure_latest(id, b.id).await.unwrap();
+        c.job_steal(id, "a sleeps".to_owned(), true, out)
+            .await
+            .unwrap();
+        c.push_records(id, b.id).await.unwrap();
+        assert_eq!(b.lease(id).await.unwrap().epoch, Epoch::new(2).unwrap());
+        assert_eq!(a.lease(id).await.unwrap().epoch, Epoch::FIRST);
+        ([dir_a, dir_b, dir_c], a, b, c, id)
+    }
+
+    /// Review finding on PR #13: a peer that refused a node's records named
+    /// the epoch it knows only in the sentence, as `peer { peer }`. When a
+    /// move from A pushes its records to B, B is at epoch 2, and the
+    /// refusal says so as data, with the sentence it had.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn records_pushed_to_a_peer_at_a_newer_epoch_are_refused_with_it() {
+        let (_dirs, a, b, _c, id) = stolen_without_a().await;
+
+        let refused = a.push_records(id, b.id).await.unwrap_err().to_refusal();
+        assert_eq!(
+            refused.reason(),
+            &Reason::PeerAhead {
+                job: id,
+                peer: b.id,
+                epoch: Epoch::new(2).unwrap(),
+            }
+        );
+        assert_eq!(refused.kind(), fabric_client::api::RefusalKind::Failed);
+        assert!(
+            refused.message().starts_with(&format!(
+                "{} answered: it knows epoch 2, newer than this node's",
+                b.id
+            )),
+            "{}",
+            refused.message()
+        );
+    }
+
+    /// Review finding on PR #13: the pull form of the move named the
+    /// holder's epoch only in the sentence, as `peer { peer }`. B, at
+    /// epoch 2, asks A, still at epoch 1, to start a move toward it, as
+    /// `fabric job resume --on A` does on B; A answers that B is ahead of
+    /// it, and the refusal says A is behind, at epoch 1, as data.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pull_from_a_holder_at_an_older_epoch_is_refused_with_it() {
+        let (_dirs, a, b, _c, id) = stolen_without_a().await;
+
+        let refused = b
+            .pull(
+                id,
+                a.id,
+                (None, false),
+                &ToolEnv::current(),
+                &mut Out::default(),
+            )
+            .await
+            .unwrap_err()
+            .to_refusal();
+        assert_eq!(
+            refused.reason(),
+            &Reason::PeerBehind {
+                job: id,
+                peer: a.id,
+                epoch: Epoch::FIRST,
+            }
+        );
+        assert_eq!(refused.kind(), fabric_client::api::RefusalKind::Failed);
+        assert_eq!(
+            refused.message(),
+            format!(
+                "{} answered: it did not start a move: it is at epoch 1, behind this node's, and must catch up first",
+                a.id
+            )
+        );
+        assert_eq!(a.lease(id).await.unwrap().epoch, Epoch::FIRST);
+    }
+
+    /// The refusal `node` gives when it asks to steal `id`.
+    async fn steal_refusal(node: &Arc<Node>, id: JobId) -> fabric_client::api::Refusal {
+        node.job_steal(id, "a sleeps".to_owned(), true, &mut Out::default())
+            .await
+            .unwrap_err()
+            .to_refusal()
+    }
+
+    /// Review finding on PR #13: what a ledger rule refuses of a request
+    /// came back as `internal`, the reason of a failed file or store, with
+    /// the job's facts only in the sentence. A move to the owner itself
+    /// names the job, with the rule's sentence as before.
+    #[tokio::test]
+    async fn a_move_to_the_owner_itself_is_refused_with_the_job() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+
+        let refused = node
+            .job_move(id, node.id, true, &ToolEnv::current(), &mut Out::default())
+            .await
+            .unwrap_err()
+            .to_refusal();
+        assert_eq!(refused.reason(), &Reason::MoveToSelf { job: id });
+        assert_eq!(refused.kind(), fabric_client::api::RefusalKind::Failed);
+        assert_eq!(refused.message(), "cannot move a job to its owner");
+    }
+
+    /// Review finding on PR #13: a steal the ledger refuses came back as
+    /// `internal`. Each refusal now names the facts of the job that explain
+    /// it, with the rule's sentence as before: the owner asks, B asks
+    /// without the latest snapshot whole, the owner asks while a move it
+    /// started toward B is open, and B, that move's target, asks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_steal_the_ledger_refuses_names_the_facts_that_explain_it() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &ToolEnv::current(), &mut Out::default())
+            .await
+            .unwrap();
+        let snapshot = a.job(id).await.unwrap().lock().await.latest().unwrap();
+
+        let refused = steal_refusal(&a, id).await;
+        assert_eq!(refused.reason(), &Reason::StealByOwner { job: id });
+        assert_eq!(refused.message(), "the owner cannot steal its own job");
+
+        b.pull_records(id, a.id).await.unwrap();
+        let refused = steal_refusal(&b, id).await;
+        assert_eq!(
+            refused.reason(),
+            &Reason::StealWithoutSnapshot { job: id, snapshot }
+        );
+        assert_eq!(
+            refused.message(),
+            "steal refused: the latest published snapshot is not complete in the local store"
+        );
+
+        let move_id = clock::move_id();
+        {
+            let job = a.job(id).await.unwrap();
+            let mut job = job.lock().await;
+            let record = job
+                .ledger()
+                .start_move(a.id, b.id, move_id, clock::event_id(), clock::now_ms())
+                .unwrap();
+            job.commit(record, Author::Node(a.id)).unwrap();
+        }
+        let refused = steal_refusal(&a, id).await;
+        assert_eq!(
+            refused.reason(),
+            &Reason::StealWhileDeparting {
+                job: id,
+                move_id,
+                target: b.id,
+            }
+        );
+        assert_eq!(refused.message(), "the owner cannot steal its own job");
+
+        b.pull_records(id, a.id).await.unwrap();
+        let refused = steal_refusal(&b, id).await;
+        assert_eq!(
+            refused.reason(),
+            &Reason::StealByTarget { job: id, move_id }
+        );
+        assert_eq!(
+            refused.message(),
+            format!("the target of move {move_id} decides it; import or abort instead of stealing")
+        );
+        assert_eq!(refused.kind(), fabric_client::api::RefusalKind::Failed);
+    }
+
+    /// Review finding on PR #13: the reply to a steal read the lease again
+    /// after the push to the old owner, which waits without the job's lock,
+    /// so a steal or a move in that wait made the reply name a later lease
+    /// than the one the steal made. B steals from A while A holds its job's
+    /// lock, so B's push waits; meanwhile C steals from B. B's reply is the
+    /// lease of its own steal, the one its `stole` event names.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_steal_replies_with_the_lease_it_made() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        let (_dir_c, c) = node();
+        for node in [&a, &b, &c] {
+            tokio::spawn(Arc::clone(node).run());
+        }
+        for (node, peer) in [(&a, &b), (&b, &a), (&b, &c), (&c, &b)] {
+            let addr = peer.local_addr().unwrap().to_string();
+            node.node_add(peer.id, Some(&addr)).await.unwrap();
+        }
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &ToolEnv::current(), &mut Out::default())
+            .await
+            .unwrap();
+        b.pull_records(id, a.id).await.unwrap();
+        b.ensure_latest(id, a.id).await.unwrap();
+        c.pull_records(id, b.id).await.unwrap();
+        c.ensure_latest(id, b.id).await.unwrap();
+
+        let at_a = a.job(id).await.unwrap();
+        let held = at_a.lock().await;
+        let steal = tokio::spawn({
+            let b = Arc::clone(&b);
+            async move {
+                let request = Request::JobSteal {
+                    job: id,
+                    reason: "a sleeps".to_owned(),
+                    force: true,
+                };
+                let mut out = Out::default();
+                let reply = b.dispatch(request, &mut out).await;
+                (reply, out)
+            }
+        });
+        let stolen = Lease {
+            owner: b.id,
+            epoch: Epoch::new(2).unwrap(),
+        };
+        for _ in 0..500 {
+            if b.lease(id).await.unwrap() == stolen {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(b.lease(id).await.unwrap(), stolen);
+        c.pull_records(id, b.id).await.unwrap();
+        c.job_steal(id, "b sleeps".to_owned(), true, &mut Out::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            b.lease(id).await.unwrap(),
+            Lease {
+                owner: c.id,
+                epoch: Epoch::new(3).unwrap(),
+            }
+        );
+        drop(held);
+
+        let (reply, out) = steal.await.unwrap();
+        assert_eq!(reply.unwrap(), Reply::JobSteal(stolen));
+        assert!(
+            out.events.contains(&Event::Stole {
+                job: id,
+                epoch: stolen.epoch,
+            }),
+            "{:?}",
+            out.events
+        );
+    }
+
+    /// Review finding on PR #13: the reply to a move read the lease again
+    /// once the move returned, outside the lock that applied the target's
+    /// decision. The offer now returns the lease that decision made, B at
+    /// epoch 2, as its `imported` event says. The race itself needs an
+    /// operation queued on the job's lock while the decision is applied,
+    /// which no test here can order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_decided_move_returns_the_lease_its_decision_made() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let out = &mut Out::default();
+        a.suspend(id, &ToolEnv::current(), out).await.unwrap();
+        let offer = a
+            .depart(id, b.id, &HarnessKind::Codex, out)
+            .await
+            .unwrap()
+            .unwrap();
+        a.push_records(id, b.id).await.unwrap();
+
+        let moved = Lease {
+            owner: b.id,
+            epoch: Epoch::new(2).unwrap(),
+        };
+        assert_eq!(a.offer(id, b.id, offer, out).await.unwrap(), moved);
+        let imported = Event::Imported {
+            owner: b.id,
+            epoch: moved.epoch,
+        };
+        assert!(out.events.contains(&imported), "{:?}", out.events);
+    }
+
+    /// A move typed again after its answer was lost learns the decision and
+    /// replies with the lease it made, read with the view that found the
+    /// move done.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_typed_again_after_a_lost_answer_replies_with_its_lease() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let out = &mut Out::default();
+        a.suspend(id, &ToolEnv::current(), out).await.unwrap();
+        let offer = a
+            .depart(id, b.id, &HarnessKind::Codex, out)
+            .await
+            .unwrap()
+            .unwrap();
+        a.push_records(id, b.id).await.unwrap();
+        // B imports; its answer never reaches A's ledger.
+        let answer = a
+            .call(b.id, |session| async move {
+                session.offer(Epoch::FIRST, offer, MOVE_DEADLINE).await
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(answer, Fenced::Answer(Offered::Decided { .. })),
+            "{answer:?}"
+        );
+
+        let request = Request::JobMove {
+            job: id,
+            to: b.id,
+            force: false,
+            env: None,
+        };
+        let moved = Lease {
+            owner: b.id,
+            epoch: Epoch::new(2).unwrap(),
+        };
+        assert_eq!(
+            a.dispatch(request, out).await.unwrap(),
+            Reply::JobMove(moved)
+        );
+        let done = Event::AlreadyMoved {
+            owner: b.id,
+            epoch: moved.epoch,
+        };
+        assert!(out.events.contains(&done), "{:?}", out.events);
+    }
+
+    /// Review finding on PR #13: ACP arguments that hold a secret were
+    /// refused as `internal`; the refusal names the program.
+    #[tokio::test]
+    async fn acp_arguments_that_hold_a_secret_are_refused_with_the_program() {
+        let (_dir, node) = node();
+        let harness = HarnessKind::Acp {
+            program: fabric_core::harness::ProgramName::parse("opencode").unwrap(),
+            args: vec!["--api-key".to_owned(), format!("sk-ant-{}", "a".repeat(24))],
+        };
+
+        let refused = node
+            .job_resume(
+                clock::job_id(),
+                None,
+                Some(harness),
+                false,
+                &ToolEnv::current(),
+                &mut Out::default(),
+            )
+            .await
+            .unwrap_err()
+            .to_refusal();
+        assert_eq!(
+            refused.reason(),
+            &Reason::SecretInArguments {
+                program: "opencode".to_owned()
+            }
+        );
+        assert_eq!(
+            refused.message(),
+            "the launch arguments of opencode hold a secret; pass it through the environment"
+        );
     }
 
     /// A secret pattern removed from `.fabric/env.toml` still keeps its
@@ -5461,18 +6137,18 @@ pub(crate) mod tests {
             "secret_patterns = [\"*.sqlite\"]\n",
         )
         .unwrap();
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         std::fs::write(root.join(".fabric/env.toml"), "").unwrap();
         std::fs::write(root.join("users.sqlite"), "rows\n").unwrap();
         let mut out = Out::default();
         node.suspend(id, &path, &mut out).await.unwrap();
         assert!(
-            out.lines
+            out.said()
                 .iter()
                 .any(|line| line == "left behind (secret pattern): users.sqlite"),
             "{:?}",
-            out.lines
+            out.said()
         );
     }
 
@@ -5485,7 +6161,7 @@ pub(crate) mod tests {
         let (dir_a, a) = node();
         let (_dir_b, b) = node();
         paired(&a, &b).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         let out = &mut Out::default();
         let id = job(dir_a.path(), &a).await;
         let root = paths::job_root(&a.cfg.home, id);
@@ -5499,9 +6175,7 @@ pub(crate) mod tests {
         std::fs::write(root.join(".fabric/env.toml"), "").unwrap();
         a.suspend(id, &path, out).await.unwrap();
 
-        b.pull(id, a.id, (None, false), &path_var(), out)
-            .await
-            .unwrap();
+        b.pull(id, a.id, (None, false), &env(), out).await.unwrap();
         let root = {
             let job = b.job(id).await.unwrap();
             let mut job = job.lock().await;
@@ -5514,20 +6188,12 @@ pub(crate) mod tests {
         let mut out = Out::default();
         b.suspend(id, &path, &mut out).await.unwrap();
         assert!(
-            out.lines
+            out.said()
                 .iter()
                 .any(|line| line == "left behind (secret pattern): users.sqlite"),
             "{:?}",
-            out.lines
+            out.said()
         );
-    }
-
-    #[test]
-    fn an_age_reads_in_the_largest_whole_unit() {
-        assert_eq!(age(59_000), "less than a minute old");
-        assert_eq!(age(3 * 60_000), "3 min old");
-        assert_eq!(age(3 * 3_600_000), "3 h old");
-        assert_eq!(age(3 * 86_400_000), "3 days old");
     }
 
     #[tokio::test]
@@ -5538,7 +6204,7 @@ pub(crate) mod tests {
         register(&node, id, pid(&first)).await.unwrap();
         let refused = register(&node, id, pid(&second)).await;
         assert!(
-            matches!(refused, Err(NodeError::AlreadyRunningHarness { pid: p, .. }) if p == first.id()),
+            matches!(refused, Err(NodeError::AlreadyRunningHarness { pid: p, .. }) if p.get() == first.id()),
             "{refused:?}"
         );
         for child in [&mut first, &mut second] {
@@ -5580,9 +6246,7 @@ pub(crate) mod tests {
         let (dir, node) = node();
         let repo = repo(dir.path());
         let goal = "x".repeat(fabric_core::ledger::MAX_RECORD_LEN);
-        let refused = node
-            .job_new(&repo, goal, HarnessKind::Codex, &mut Out::default())
-            .await;
+        let refused = node.job_new(&repo, goal, HarnessKind::Codex).await;
         assert!(matches!(refused, Err(NodeError::Ledger(_))), "{refused:?}");
         let jobs = node.cfg.home.join("fabric").join("jobs");
         let left: Vec<PathBuf> = std::fs::read_dir(&jobs)
@@ -5605,7 +6269,7 @@ pub(crate) mod tests {
         let (dir_a, a) = node();
         let (_dir_b, b) = node();
         paired(&a, &b).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         let id = job(dir_a.path(), &a).await;
         a.suspend(id, &path, &mut Out::default()).await.unwrap();
         b.pull_records(id, a.id).await.unwrap();
@@ -5633,7 +6297,7 @@ pub(crate) mod tests {
     async fn a_move_does_not_depart_from_a_job_frozen_while_it_was_copied() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         node.freeze(
             id,
@@ -5680,7 +6344,7 @@ pub(crate) mod tests {
         let (dir_a, a) = node();
         let (_dir_b, b) = node();
         paired(&a, &b).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         let id = job(dir_a.path(), &a).await;
         a.suspend(id, &path, &mut Out::default()).await.unwrap();
         b.pull_records(id, a.id).await.unwrap();
@@ -5725,21 +6389,18 @@ pub(crate) mod tests {
     async fn a_move_does_not_depart_under_a_harness_its_preflight_did_not_check() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         let harness = sleeper();
-        node.harness_started(
-            StartedHarness {
-                job: id,
-                epoch: Epoch::FIRST,
-                pid: pid(&harness),
-                harness: HarnessKind::ClaudeCode,
-                session: None,
-                planned: None,
-                version: None,
-            },
-            &mut Out::default(),
-        )
+        node.harness_started(StartedHarness {
+            job: id,
+            epoch: Epoch::FIRST,
+            pid: pid(&harness),
+            harness: HarnessKind::ClaudeCode,
+            session: None,
+            planned: None,
+            version: None,
+        })
         .await
         .unwrap();
         let reaper = std::thread::spawn(move || {
@@ -5784,7 +6445,7 @@ pub(crate) mod tests {
     async fn a_root_replaced_with_a_link_is_never_launched_in() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         let root = paths::job_root(&node.cfg.home, id);
         let elsewhere = dir.path().join("elsewhere");
@@ -5813,7 +6474,7 @@ pub(crate) mod tests {
     async fn a_resumed_restore_accepts_only_the_snapshots_own_tree() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         let root = paths::job_root(&node.cfg.home, id);
         let job = node.job(id).await.unwrap();
@@ -5883,11 +6544,11 @@ pub(crate) mod tests {
                 .unwrap();
             assert!(status.success());
         }
-        let mut out = Out::default();
-        node.job_new(&repo, "goal".to_owned(), HarnessKind::Codex, &mut out)
+        let id = node
+            .job_new(&repo, "goal".to_owned(), HarnessKind::Codex)
             .await
-            .unwrap();
-        let id: JobId = out.lines[0].parse().unwrap();
+            .unwrap()
+            .job;
         let root = paths::job_root(&node.cfg.home, id);
         std::fs::create_dir(root.join("vendored")).unwrap();
         let made = std::process::Command::new("git")
@@ -5896,7 +6557,7 @@ pub(crate) mod tests {
             .status()
             .unwrap();
         assert!(made.success());
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         let mut out = Out::default();
         node.suspend(id, &path, &mut out).await.unwrap();
         for wanted in [
@@ -5904,9 +6565,9 @@ pub(crate) mod tests {
             "left behind (nested repository): vendored",
         ] {
             assert!(
-                out.lines.iter().any(|line| line == wanted),
+                out.said().iter().any(|line| line == wanted),
                 "no line {wanted:?} in {:?}",
-                out.lines
+                out.said()
             );
         }
     }
@@ -5920,30 +6581,24 @@ pub(crate) mod tests {
         let repo = repo(dir.path());
         let goal = format!("first line\n{}", "x".repeat(900 << 10));
         for _ in 0..5 {
-            node.job_new(&repo, goal.clone(), HarnessKind::Codex, &mut Out::default())
+            node.job_new(&repo, goal.clone(), HarnessKind::Codex)
                 .await
                 .unwrap();
         }
-        let mut out = Out::default();
-        node.job_list(&mut out).await;
-        assert_eq!(out.lines.len(), 5);
-        let bytes: usize = out.lines.iter().map(String::len).sum();
+        let list = node.job_list().await;
+        assert_eq!((list.jobs.len(), list.left_out), (5, 0));
+        let bytes = serde_json::to_vec(&list).unwrap().len();
+        assert!(bytes < LIST_BUDGET, "{bytes} bytes of jobs");
         assert!(
-            bytes < crate::control::MAX_CONTROL_MESSAGE,
-            "{bytes} bytes of lines"
-        );
-        assert!(
-            out.lines
-                .iter()
-                .all(|line| line.ends_with(" first line ...")),
+            list.jobs.iter().all(|job| job.goal == "first line ..."),
             "{:?}",
-            out.lines
+            list.jobs
         );
     }
 
-    /// Each row of `node ls` is bounded, and the peer book does not bound
-    /// how many peers it holds. The answer keeps the last rows that fit its
-    /// budget and says how many it left out.
+    /// Each peer of `node ls` is bounded, and the peer book does not bound
+    /// how many peers it holds. The answer keeps the last peers that fit
+    /// its budget and says how many it left out.
     #[tokio::test]
     async fn a_node_list_past_its_budget_keeps_the_last_rows() {
         let (_dir, node) = node();
@@ -5951,57 +6606,42 @@ pub(crate) mod tests {
             node.node_add(
                 NodeId::from_bytes([byte; 32]),
                 Some(&format!("10.0.0.{byte}:1")),
-                &mut Out::default(),
             )
             .await
             .unwrap();
         }
-        let mut all = Out::default();
-        node.node_list(&mut all);
-        assert_eq!(all.lines.len(), 3, "{:?}", all.lines);
-        let row = all.lines[2].len();
-        let mut out = Out::default();
-        node.node_list_within(2 * row, &mut out);
-        assert_eq!(out.lines.len(), 3, "{:?}", out.lines);
-        assert!(
-            out.lines[0].starts_with("the first 1 paired nodes are left out"),
-            "{:?}",
-            out.lines
-        );
-        assert_eq!(out.lines[1..], all.lines[1..], "{:?}", out.lines);
+        let all = node.node_list();
+        assert_eq!((all.peers.len(), all.left_out), (3, 0));
+        let row = serde_json::to_vec(&all.peers[2]).unwrap().len();
+        let cut = node.node_list_within(2 * row);
+        assert_eq!(cut.left_out, 1);
+        assert_eq!(cut.peers, all.peers[1..]);
     }
 
-    /// Each row of `job ls` is bounded, and enough jobs still add up past
-    /// the control message cap. The answer keeps the latest rows that fit
-    /// its budget and says how many older ones it left out.
+    /// Each job of `job ls` is bounded, and enough jobs still add up past
+    /// the frame cap. The answer keeps the latest jobs that fit its budget
+    /// and says how many older ones it left out.
     #[tokio::test]
     async fn a_job_list_past_its_budget_keeps_the_latest_rows() {
         let (dir, node) = node();
         let repo = repo(dir.path());
         let mut ids = Vec::new();
         for _ in 0..3 {
-            let mut out = Out::default();
-            node.job_new(&repo, "goal".to_owned(), HarnessKind::Codex, &mut out)
+            let created = node
+                .job_new(&repo, "goal".to_owned(), HarnessKind::Codex)
                 .await
                 .unwrap();
-            ids.push(out.lines[0].clone());
+            ids.push(created.job);
         }
-        // Rows are in id order, and an id begins with its time.
+        // Jobs are in id order, and an id begins with its time.
         ids.sort();
-        let mut all = Out::default();
-        node.job_list(&mut all).await;
-        assert_eq!(all.lines.len(), 3, "{:?}", all.lines);
-        let row = all.lines[2].len();
-        let mut out = Out::default();
-        node.job_list_within(2 * row, &mut out).await;
-        assert_eq!(out.lines.len(), 3, "{:?}", out.lines);
-        assert!(
-            out.lines[0].starts_with("the 1 oldest jobs are left out"),
-            "{:?}",
-            out.lines
-        );
-        assert!(out.lines[1].starts_with(&ids[1]), "{:?}", out.lines);
-        assert!(out.lines[2].starts_with(&ids[2]), "{:?}", out.lines);
+        let all = node.job_list().await;
+        assert_eq!((all.jobs.len(), all.left_out), (3, 0));
+        let row = serde_json::to_vec(&all.jobs[2]).unwrap().len();
+        let cut = node.job_list_within(2 * row).await;
+        assert_eq!(cut.left_out, 1);
+        let kept: Vec<JobId> = cut.jobs.iter().map(|job| job.job).collect();
+        assert_eq!(kept, ids[1..]);
     }
 
     /// Two runs can both get a plan before either launches. Once the first
@@ -6019,7 +6659,7 @@ pub(crate) mod tests {
         register(&node, id, pid(&harness)).await.unwrap();
         let refused = check(&node, &second).await;
         assert!(
-            matches!(refused, Err(NodeError::AlreadyRunningHarness { pid: p, .. }) if p == harness.id()),
+            matches!(refused, Err(NodeError::AlreadyRunningHarness { pid: p, .. }) if p.get() == harness.id()),
             "{refused:?}"
         );
         harness.kill().unwrap();
@@ -6038,7 +6678,7 @@ pub(crate) mod tests {
         let parent = root.parent().unwrap().to_owned();
         let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&parent), 0o700, "job new");
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         std::fs::remove_dir_all(&parent).unwrap();
         node.job_resume(id, None, None, false, &path, &mut Out::default())
@@ -6059,22 +6699,19 @@ pub(crate) mod tests {
         let (dir_a, a) = node();
         let (_dir_b, b) = node();
         paired(&a, &b).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         let id = job(dir_a.path(), &a).await;
         a.suspend(id, &path, &mut Out::default()).await.unwrap();
         let harness = sleeper();
-        a.harness_started(
-            StartedHarness {
-                job: id,
-                epoch: Epoch::FIRST,
-                pid: pid(&harness),
-                harness: HarnessKind::ClaudeCode,
-                session: None,
-                planned: None,
-                version: None,
-            },
-            &mut Out::default(),
-        )
+        a.harness_started(StartedHarness {
+            job: id,
+            epoch: Epoch::FIRST,
+            pid: pid(&harness),
+            harness: HarnessKind::ClaudeCode,
+            session: None,
+            planned: None,
+            version: None,
+        })
         .await
         .unwrap();
         let reaper = std::thread::spawn(move || {
@@ -6086,7 +6723,7 @@ pub(crate) mod tests {
                 id,
                 a.id,
                 (Some(&HarnessKind::Codex), false),
-                &path_var(),
+                &env(),
                 &mut Out::default(),
             )
             .await;
@@ -6129,23 +6766,21 @@ pub(crate) mod tests {
         std::fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
         std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
         std::fs::write(root.join("node_modules/pkg/index.js"), "1;\n").unwrap();
-        a.suspend(id, &path_var(), &mut Out::default())
-            .await
-            .unwrap();
-        let no_pnpm = OsString::from("/usr/bin:/bin");
+        a.suspend(id, &env(), &mut Out::default()).await.unwrap();
+        let no_pnpm = on_path(std::ffi::OsStr::new("/usr/bin:/bin"));
         let mut out = Out::default();
         let pulled = b.pull(id, a.id, (None, false), &no_pnpm, &mut out).await;
         assert!(
-            matches!(&pulled, Err(NodeError::Preflight(text)) if text.contains("node_modules")),
+            matches!(&pulled, Err(NodeError::CarryRefused { paths, .. }) if paths == &["node_modules"]),
             "{pulled:?} {:?}",
-            out.lines
+            out.said()
         );
         assert!(
-            out.lines
+            out.said()
                 .iter()
                 .any(|line| line.starts_with("refuse  node_modules")),
             "{:?}",
-            out.lines
+            out.said()
         );
         let held = a.job(id).await.unwrap();
         assert!(
@@ -6173,7 +6808,7 @@ pub(crate) mod tests {
         let aside = dir.path().join("aside");
         std::fs::rename(&root, &aside).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &root).unwrap();
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         let refused = node.suspend(id, &path, &mut Out::default()).await;
         assert!(
             matches!(&refused, Err(NodeError::RootNotADirectory { root: r, .. }) if *r == root),
@@ -6221,7 +6856,7 @@ pub(crate) mod tests {
                 .unwrap();
             assert!(status.success(), "{args:?}");
         }
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         let mut out = Out::default();
         node.suspend(id, &path, &mut out).await.unwrap();
         for wanted in [
@@ -6229,9 +6864,9 @@ pub(crate) mod tests {
             "left behind (git config): remote.tokened.url",
         ] {
             assert!(
-                out.lines.iter().any(|line| line == wanted),
+                out.said().iter().any(|line| line == wanted),
                 "no line {wanted:?} in {:?}",
-                out.lines
+                out.said()
             );
         }
     }
@@ -6252,12 +6887,7 @@ pub(crate) mod tests {
         let blob = blob.trim();
         std::fs::remove_file(repo.join(".git/objects").join(&blob[..2]).join(&blob[2..])).unwrap();
         let refused = node
-            .job_new(
-                &repo,
-                "goal".to_owned(),
-                HarnessKind::Codex,
-                &mut Out::default(),
-            )
+            .job_new(&repo, "goal".to_owned(), HarnessKind::Codex)
             .await;
         assert!(matches!(refused, Err(NodeError::Io { .. })), "{refused:?}");
         let jobs = node.cfg.home.join("fabric").join("jobs");
@@ -6278,17 +6908,17 @@ pub(crate) mod tests {
         for n in 0..500 {
             std::fs::write(root.join(format!(".env.{n}")), "TOKEN=x\n").unwrap();
         }
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         let mut out = Out::default();
         node.suspend(id, &path, &mut out).await.unwrap();
         let named = out
-            .lines
+            .said()
             .iter()
             .filter(|line| line.starts_with("left behind (secret pattern): .env."))
             .count();
-        assert_eq!(named, REPORT_PATHS, "{:?}", out.lines.len());
+        assert_eq!(named, REPORT_PATHS, "{:?}", out.said().len());
         let rest = format!("left behind (secret pattern): {} more", 500 - REPORT_PATHS);
-        assert!(out.lines.contains(&rest), "no line {rest:?}");
+        assert!(out.said().contains(&rest), "no line {rest:?}");
     }
 
     /// A launch that overtook a plan can register and exit before the
@@ -6338,14 +6968,11 @@ pub(crate) mod tests {
         check(&node, &next).await.unwrap();
         let thread = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
         node.harness_session(
-            NamedSession {
-                job: id,
-                epoch: Epoch::FIRST,
-                pid: turn_pid,
-                harness: HarnessKind::Codex,
-                session: thread.clone(),
-            },
-            &mut Out::default(),
+            id,
+            Epoch::FIRST,
+            turn_pid,
+            HarnessKind::Codex,
+            thread.clone(),
         )
         .await
         .unwrap();
@@ -6357,18 +6984,15 @@ pub(crate) mod tests {
         );
         let mut launched = sleeper();
         let refused = node
-            .harness_started(
-                StartedHarness {
-                    job: id,
-                    epoch: next.epoch,
-                    pid: pid(&launched),
-                    harness: next.harness.clone(),
-                    session: None,
-                    planned: next.session.clone(),
-                    version: None,
-                },
-                &mut Out::default(),
-            )
+            .harness_started(StartedHarness {
+                job: id,
+                epoch: next.epoch,
+                pid: pid(&launched),
+                harness: next.harness.clone(),
+                session: None,
+                planned: next.session.clone(),
+                version: None,
+            })
             .await;
         launched.kill().unwrap();
         launched.wait().unwrap();
@@ -6391,7 +7015,7 @@ pub(crate) mod tests {
         let (_dir_b, b) = node();
         paired(&a, &b).await;
         let id = job(dir_a.path(), &a).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         a.suspend(id, &path, &mut Out::default()).await.unwrap();
         b.pull_records(id, a.id).await.unwrap();
         b.ensure_latest(id, a.id).await.unwrap();
@@ -6429,7 +7053,7 @@ pub(crate) mod tests {
     async fn a_failed_suspend_is_not_settled_by_an_earlier_one() {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = env();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         node.job_run(id, &mut Out::default()).await.unwrap();
         let root = paths::job_root(&node.cfg.home, id);
@@ -6468,10 +7092,21 @@ pub(crate) mod tests {
             })
             .collect();
         let mut out = Out::default();
-        say_decisions(&mut out, &decisions, PathDecision::to_string);
-        assert_eq!(out.lines.len(), REPORT_PATHS + 1, "{:?}", out.lines.last());
+        out.emit(carry_decided(
+            CarryFor::Move {
+                target: NodeId::from_bytes([9; 32]),
+            },
+            SnapshotId::from_bytes([7; 32]),
+            &decisions,
+        ));
         assert_eq!(
-            out.lines.last().map(String::as_str),
+            out.said().len(),
+            REPORT_PATHS + 2,
+            "{:?}",
+            out.said().last()
+        );
+        assert_eq!(
+            out.said().last().map(String::as_str),
             Some("480 more paths: leave 470, rebuild 10")
         );
     }
@@ -6502,22 +7137,20 @@ pub(crate) mod tests {
             home,
             listen: "127.0.0.1:0".parse().unwrap(),
             dial: DialOrder::TcpOnly,
-            path_var: std::env::var_os("PATH").unwrap_or_default(),
-            cargo_home: None,
+            env: ToolEnv::current(),
         })
         .unwrap();
         let repo = repo(&root);
         for (harness, wanted) in [("acp:opencode", vec!["opencode"]), ("codex", vec![])] {
-            let mut out = Out::default();
-            node.job_new(
-                &repo,
-                "goal".to_owned(),
-                crate::harnesses::parse_harness(harness).unwrap(),
-                &mut out,
-            )
-            .await
-            .unwrap();
-            let id: JobId = out.lines[0].parse().unwrap();
+            let id = node
+                .job_new(
+                    &repo,
+                    "goal".to_owned(),
+                    crate::harnesses::parse_harness(harness).unwrap(),
+                )
+                .await
+                .unwrap()
+                .job;
             let plan = node.job_run(id, &mut Out::default()).await.unwrap();
             let carried: Vec<&str> = plan.harness_config.acp.keys().map(String::as_str).collect();
             assert_eq!(carried, wanted, "{harness}");

@@ -145,6 +145,22 @@ impl fmt::Display for StealWarning {
     }
 }
 
+impl StealWarning {
+    /// The warning in words, with how old the owner's last record is:
+    /// `age_ms` before now by the reader's clock, which the core does not have.
+    #[must_use]
+    pub fn with_age(&self, age_ms: u64) -> String {
+        let minutes = age_ms / 60_000;
+        let age = match minutes {
+            0 => "less than a minute old".to_owned(),
+            1..60 => format!("{minutes} min old"),
+            60..2880 => format!("{} h old", minutes / 60),
+            _ => format!("{} days old", minutes / 1440),
+        };
+        format!("{self}; the owner's last record is {age}")
+    }
+}
+
 /// How one node relates to a job's lease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseView {
@@ -421,6 +437,24 @@ mod tests {
     use crate::harness::HarnessKind;
     use crate::id::JobId;
     use crate::ledger::{Author, MemoryStore};
+
+    #[test]
+    fn the_age_of_the_owners_last_record_reads_in_the_largest_whole_unit() {
+        let warning = StealWarning {
+            owner: NodeId::from_bytes([1; 32]),
+            last_record_at: 0,
+            snapshot: SnapshotId::from_bytes([2; 32]),
+            owner_stopped_at_snapshot: false,
+        };
+        let age = |ms| {
+            let text = warning.with_age(ms);
+            text.rsplit_once("is ").unwrap().1.to_owned()
+        };
+        assert_eq!(age(59_000), "less than a minute old");
+        assert_eq!(age(3 * 60_000), "3 min old");
+        assert_eq!(age(3 * 3_600_000), "3 h old");
+        assert_eq!(age(3 * 86_400_000), "3 days old");
+    }
 
     fn node(b: u8) -> NodeId {
         NodeId::from_bytes([b; 32])

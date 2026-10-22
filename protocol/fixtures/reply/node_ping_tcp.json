@@ -1,0 +1,7 @@
+{
+  "kind": "node_ping",
+  "node": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+  "rtt_ms": 30,
+  "wire": "tcp_tls",
+  "clock_skew_ms": 5
+}

@@ -1,0 +1,9 @@
+{
+  "kind": "job_state",
+  "reason": {
+    "code": "ran_during_move",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "target": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba"
+  },
+  "message": "ran during the move"
+}

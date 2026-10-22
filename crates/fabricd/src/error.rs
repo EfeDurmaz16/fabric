@@ -2,16 +2,18 @@
 //!
 //! Invariant: every refusal says which node owns the job, what state a
 //! move is in, or which file failed, so the CLI prints the one command that
-//! resolves it without parsing text (ADR 0003, Consequences).
+//! resolves it without parsing text (ADR 0003, Consequences). A client gets
+//! the same facts typed, as the reason of a refusal (ADR 0018).
 
 use std::path::PathBuf;
 
+use fabric_client::api::{Reason, Refusal, StealWarning, Step};
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, JobId, MoveId, NodeId, SnapshotId};
 use fabric_core::lease::FenceError;
 use fabric_core::ledger::{LedgerError, StoreError as LedgerStoreError};
+use fabric_harness::HarnessError;
 
-use crate::control::Refusal;
 use crate::harnesses::HarnessConfigError;
 use crate::ledger_file::LedgerFileError;
 use crate::local::LocalError;
@@ -164,7 +166,7 @@ pub enum NodeError {
         /// The job.
         job: JobId,
         /// Its pid.
-        pid: u32,
+        pid: std::num::NonZeroU32,
     },
     /// The launched harness is not running as the leader of its own group, or its start time could not be read.
     #[error(
@@ -184,7 +186,7 @@ pub enum NodeError {
         /// The pid the CLI named.
         pid: std::num::NonZeroU32,
         /// The session it named.
-        session: fabric_harness::SessionId,
+        session: fabric_core::session::SessionId,
     },
     /// The workspace at the root was left by an earlier tenure of this node.
     #[error(
@@ -229,14 +231,16 @@ pub enum NodeError {
     #[error("job {0} has no workspace on this node; run `fabric job resume {0}`")]
     NoWorkspace(JobId),
     /// The workspace is mid-suspend or mid-restore.
-    #[error("job {job}: {what} did not finish; run `fabric job {command} {job}` to finish it")]
+    #[error(
+        "job {job}: {} did not finish; run `fabric job {} {job}` to finish it",
+        unfinished_what(*step),
+        unfinished_command(*step)
+    )]
     Unfinished {
         /// The job.
         job: JobId,
-        /// What did not finish.
-        what: &'static str,
-        /// The command that finishes it.
-        command: &'static str,
+        /// Which step did not finish.
+        step: Step,
     },
     /// A process holds the workspace's tree lock: a run or a resume while
     /// it runs setup steps or launches, or a process a setup step left
@@ -290,14 +294,56 @@ pub enum NodeError {
         /// What it said.
         reason: String,
     },
-    /// The preflight found rows that stop the move.
+    /// The peer answered with a fact that stops the command, such as a
+    /// newer epoch or a ledger that does not continue this one; a client
+    /// reads `fact`, and the sentence says what to do.
+    #[error("{peer} answered: {reason}")]
+    PeerFact {
+        /// The peer.
+        peer: NodeId,
+        /// What it said, with what to do about it.
+        reason: String,
+        /// The fact as the client API names it.
+        fact: Box<Reason>,
+    },
+    /// A ledger rule refused what was asked of the job, such as a move to
+    /// the owner itself or a steal by the owner or by a move's target; a
+    /// client reads `fact`, and the sentence is the rule's.
+    #[error("{error}")]
+    LedgerFact {
+        /// The rule's refusal.
+        error: LedgerError,
+        /// The fact as the client API names it.
+        fact: Box<Reason>,
+    },
+    /// The preflight found rows that stop the move; the facts of those rows.
     #[error(
-        "the preflight refused the move: {0}; `fabric job move` and `fabric job resume` take --force to waive what can be waived"
+        "the preflight refused the move: {}; `fabric job move` and `fabric job resume` take --force to waive what can be waived",
+        .0.join(", ")
     )]
-    Preflight(String),
+    Preflight(Vec<String>),
+    /// The snapshot a move takes holds paths the target can neither use nor make again.
+    #[error(
+        "the preflight refused the move: the target can neither use nor rebuild {}; `fabric job move` and `fabric job resume` take --force to waive what can be waived",
+        fabric_client::sentences::named(.paths, *.more)
+    )]
+    CarryRefused {
+        /// The first of the paths.
+        paths: Vec<String>,
+        /// How many more there are.
+        more: u64,
+    },
     /// A steal without `--force`.
-    #[error("{0}")]
-    StealNeedsForce(String),
+    #[error(
+        "a steal would bump the epoch without {}'s consent: {described}. Pass --force to do it",
+        warning.owner
+    )]
+    StealNeedsForce {
+        /// What the steal would cost.
+        warning: StealWarning,
+        /// The same, in words.
+        described: String,
+    },
     /// A snapshot could not be fetched whole.
     #[error("snapshot {snapshot} could not be fetched from {peer}: {reason}")]
     Fetch {
@@ -377,34 +423,197 @@ impl From<LedgerStoreError<LedgerFileError>> for NodeError {
 }
 
 impl NodeError {
-    /// The kind of refusal this is, for the CLI's exit code.
+    /// The refusal a client gets for this error: its reason with its data,
+    /// and this error's sentence (ADR 0018, Refusals).
     #[must_use]
-    pub fn refusal(&self) -> Refusal {
+    pub fn to_refusal(&self) -> Refusal {
+        Refusal::new(self.reason(), self.to_string())
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per error, so the whole mapping reads in one place"
+    )]
+    fn reason(&self) -> Reason {
         match self {
-            NodeError::NotOwner { .. }
-            | NodeError::Departed { .. }
-            | NodeError::UnknownJob(_)
-            | NodeError::Fence(_) => Refusal::NotOwner,
-            NodeError::Departing { .. } | NodeError::Forked { .. } => Refusal::Frozen,
-            NodeError::Unreachable { .. } | NodeError::UnknownPeer(_) => Refusal::Unreachable,
-            NodeError::Preflight(_) | NodeError::StealNeedsForce(_) => Refusal::NeedsForce,
-            NodeError::Unfinished { .. }
-            | NodeError::SetupRunning { .. }
-            | NodeError::AlreadyRunningHarness { .. }
-            | NodeError::RanDuringMove { .. }
-            | NodeError::HarnessChangedDuringMove { .. }
-            | NodeError::HarnessChangedDuringPull { .. }
-            | NodeError::ChangedDuringMove { .. }
-            | NodeError::WorkspaceOccupied { .. }
-            | NodeError::NoWorkspace(_)
-            | NodeError::RootNotADirectory { .. }
-            | NodeError::PlanOvertaken { .. }
-            | NodeError::SessionMoved { .. }
-            | NodeError::StaleWorkspace { .. }
-            | NodeError::NoSnapshot(_)
-            | NodeError::HarnessGone { .. }
-            | NodeError::HarnessNotRecorded { .. } => Refusal::JobState,
-            _ => Refusal::Failed,
+            NodeError::UnknownJob(job) => Reason::UnknownJob { job: *job },
+            NodeError::NotOwner { job, owner, epoch } => Reason::NotOwner {
+                job: *job,
+                owner: *owner,
+                epoch: *epoch,
+            },
+            NodeError::Departed { job, owner, epoch } => Reason::Departed {
+                job: *job,
+                owner: *owner,
+                epoch: *epoch,
+            },
+            NodeError::Fence(FenceError::StaleEpoch { yours, current }) => Reason::StaleEpoch {
+                yours: *yours,
+                current: *current,
+            },
+            NodeError::Fence(FenceError::AheadOfUs { yours, current }) => Reason::EpochAhead {
+                yours: *yours,
+                current: *current,
+            },
+            NodeError::Fence(FenceError::WrongJob { token, job }) => Reason::WrongJob {
+                token: *token,
+                job: *job,
+            },
+            NodeError::Departing {
+                job,
+                move_id,
+                target,
+            } => Reason::Departing {
+                job: *job,
+                move_id: *move_id,
+                target: *target,
+            },
+            NodeError::Forked { job, peer, epoch } => Reason::Forked {
+                job: *job,
+                peer: *peer,
+                epoch: *epoch,
+            },
+            NodeError::ForkBehind { job, peer, epoch } => Reason::ForkBehind {
+                job: *job,
+                peer: *peer,
+                epoch: *epoch,
+            },
+            NodeError::Unreachable { peer, .. } => Reason::Unreachable { peer: *peer },
+            NodeError::UnknownPeer(node) => Reason::UnknownPeer { node: *node },
+            NodeError::Preflight(facts) => Reason::Preflight {
+                facts: facts.clone(),
+            },
+            NodeError::CarryRefused { paths, more } => Reason::CarryRefused {
+                paths: paths.clone(),
+                more: *more,
+            },
+            NodeError::StealNeedsForce { warning, .. } => {
+                Reason::StealNeedsForce { warning: *warning }
+            }
+            NodeError::AlreadyRunningHarness { job, pid } => Reason::HarnessRunning {
+                job: *job,
+                pid: *pid,
+            },
+            NodeError::HarnessGone { pid } => Reason::HarnessGone { pid: *pid },
+            NodeError::HarnessNotRecorded { job, pid, session } => Reason::HarnessNotRecorded {
+                job: *job,
+                pid: *pid,
+                session: session.clone(),
+            },
+            NodeError::RanDuringMove { job, target } => Reason::RanDuringMove {
+                job: *job,
+                target: *target,
+            },
+            NodeError::ChangedDuringMove { job, root, target } => Reason::ChangedDuringMove {
+                job: *job,
+                root: root.clone(),
+                target: *target,
+            },
+            NodeError::HarnessChangedDuringMove {
+                job,
+                checked,
+                now,
+                target,
+            } => Reason::HarnessChangedDuringMove {
+                job: *job,
+                checked: checked.clone(),
+                now: now.clone(),
+                target: *target,
+            },
+            NodeError::HarnessChangedDuringPull {
+                job,
+                holder,
+                checked,
+                now,
+            } => Reason::HarnessChangedDuringPull {
+                job: *job,
+                holder: *holder,
+                checked: checked.clone(),
+                now: now.clone(),
+            },
+            NodeError::SetupRunning { job, root, lock } => Reason::SetupRunning {
+                job: *job,
+                root: root.clone(),
+                lock: lock.clone(),
+            },
+            NodeError::RootNotADirectory { job, root } => Reason::RootNotADirectory {
+                job: *job,
+                root: root.clone(),
+            },
+            NodeError::PlanOvertaken { job } => Reason::PlanOvertaken { job: *job },
+            NodeError::SessionMoved { job } => Reason::SessionMoved { job: *job },
+            NodeError::StaleWorkspace { job, root, epoch } => Reason::StaleWorkspace {
+                job: *job,
+                root: root.clone(),
+                left_at: *epoch,
+            },
+            NodeError::NoWorkspace(job) => Reason::NoWorkspace { job: *job },
+            NodeError::Unfinished { job, step } => Reason::Unfinished {
+                job: *job,
+                step: *step,
+            },
+            NodeError::NoSnapshot(job) => Reason::NoSnapshot { job: *job },
+            NodeError::WorkspaceOccupied { root } => {
+                Reason::WorkspaceOccupied { root: root.clone() }
+            }
+            NodeError::BadAddress { text, .. } => Reason::BadAddress { text: text.clone() },
+            NodeError::Peer { peer, .. } => Reason::Peer { peer: *peer },
+            NodeError::PeerFact { fact, .. } | NodeError::LedgerFact { fact, .. } => {
+                (**fact).clone()
+            }
+            NodeError::Paths(PathsError::SyncedRoot { root, folder, .. }) => Reason::SyncedRoot {
+                root: root.clone(),
+                folder: folder.clone(),
+            },
+            NodeError::Harness(HarnessError::SecretInArguments { program })
+            | NodeError::HarnessConfig(HarnessConfigError::Adapter(
+                HarnessError::SecretInArguments { program },
+            )) => Reason::SecretInArguments {
+                program: program.clone(),
+            },
+            NodeError::Fetch { snapshot, peer, .. } => Reason::Fetch {
+                snapshot: *snapshot,
+                peer: *peer,
+            },
+            NodeError::Io { .. }
+            | NodeError::UnsafeStateDir { .. }
+            | NodeError::AlreadyRunning(_)
+            | NodeError::SocketPathTooLong(_)
+            | NodeError::Ledger(_)
+            | NodeError::LedgerFile(_)
+            | NodeError::Local(_)
+            | NodeError::Paths(_)
+            | NodeError::Store(_)
+            | NodeError::Policy(_)
+            | NodeError::Detect(_)
+            | NodeError::Materialize(_)
+            | NodeError::Capture(_)
+            | NodeError::Restore(_)
+            | NodeError::Harness(_)
+            | NodeError::HarnessConfig(_)
+            | NodeError::Transport(_)
+            | NodeError::Identity(_)
+            | NodeError::PeerBook(_)
+            | NodeError::Wire(_)
+            | NodeError::Fault(_)
+            | NodeError::Task(_) => Reason::Internal,
+        }
+    }
+
+    /// A peer's answer that names `fact`, with `reason`, what it said.
+    pub(crate) fn peer_fact(peer: NodeId, reason: String, fact: Reason) -> Self {
+        NodeError::PeerFact {
+            peer,
+            reason,
+            fact: Box::new(fact),
+        }
+    }
+
+    /// A ledger rule's refusal `error`, which names `fact`.
+    pub(crate) fn ledger_fact(error: LedgerError, fact: Reason) -> Self {
+        NodeError::LedgerFact {
+            error,
+            fact: Box::new(fact),
         }
     }
 
@@ -414,5 +623,68 @@ impl NodeError {
             path: path.into(),
             source,
         }
+    }
+}
+
+/// What an unfinished step is, in the words of its refusal.
+fn unfinished_what(step: Step) -> &'static str {
+    match step {
+        Step::Suspend => "a suspend",
+        Step::Restore => "a restore",
+    }
+}
+
+/// The command that finishes an unfinished step.
+fn unfinished_command(step: Step) -> &'static str {
+    match step {
+        Step::Suspend => "suspend",
+        Step::Restore => "resume",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use fabric_client::api::RefusalKind;
+
+    use super::*;
+    use crate::paths::{SyncedFolders, check_root};
+
+    /// Review finding on PR #13: a root in a synced folder was refused as
+    /// `internal`; the refusal names the root and the folder.
+    #[test]
+    fn a_root_in_a_synced_folder_is_refused_with_the_root_and_the_folder() {
+        let home = Path::new("/Users/x");
+        let icloud = home.join("Library/Mobile Documents");
+        let root = icloud.join("w");
+        let refused =
+            NodeError::from(check_root(&root, home, SyncedFolders::default()).unwrap_err())
+                .to_refusal();
+        assert_eq!(
+            refused.reason(),
+            &Reason::SyncedRoot {
+                root,
+                folder: icloud,
+            }
+        );
+        assert_eq!(refused.kind(), RefusalKind::Failed);
+    }
+
+    /// The same secret found by the adapter, when a suspend captures the
+    /// state of an ACP harness a job already records, names the program as
+    /// the refusal of a request that carries it does.
+    #[test]
+    fn a_secret_the_adapter_finds_in_acp_arguments_is_refused_with_the_program() {
+        let refused = NodeError::from(HarnessError::SecretInArguments {
+            program: "opencode".to_owned(),
+        })
+        .to_refusal();
+        assert_eq!(
+            refused.reason(),
+            &Reason::SecretInArguments {
+                program: "opencode".to_owned()
+            }
+        );
     }
 }

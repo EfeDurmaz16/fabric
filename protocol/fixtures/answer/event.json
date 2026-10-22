@@ -1,0 +1,7 @@
+{
+  "type": "event",
+  "event": {
+    "kind": "stopping_harness",
+    "pid": 4242
+  }
+}

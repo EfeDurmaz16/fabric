@@ -20,7 +20,8 @@ use std::time::Duration;
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, NodeId, RecordHash, SnapshotId};
-use fabric_harness::{HarnessVersion, SessionId};
+use fabric_core::session::SessionId;
+use fabric_core::version::HarnessVersion;
 use rustix::process::{Pid, Signal};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};

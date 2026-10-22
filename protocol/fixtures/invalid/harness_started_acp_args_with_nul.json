@@ -1,0 +1,16 @@
+{
+  "schema": "request",
+  "value": {
+    "op": "harness_started",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "epoch": 1,
+    "pid": 4242,
+    "harness": {
+      "kind": "acp",
+      "program": "opencode",
+      "args": [
+        "\u0000"
+      ]
+    }
+  }
+}

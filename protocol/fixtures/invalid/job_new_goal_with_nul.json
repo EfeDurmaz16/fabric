@@ -1,0 +1,11 @@
+{
+  "schema": "request",
+  "value": {
+    "op": "job_new",
+    "repo": "/r",
+    "goal": "fix\u0000the build",
+    "harness": {
+      "kind": "claude_code"
+    }
+  }
+}

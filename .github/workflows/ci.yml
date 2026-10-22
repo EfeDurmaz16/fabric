@@ -50,6 +50,24 @@ jobs:
             scripts/check-hygiene.sh
           fi
 
+      - name: Prove the fixture check fires
+        run: scripts/test-check-fixtures.sh
+
+      # ADR 0018: within one api version the client API only grows, so a
+      # fixture the base already had changes only with an API_VERSION bump.
+      # The base is the one the hygiene step uses; a push that created main
+      # has none, and nothing is checked.
+      - name: Existing fixtures change only with an api bump
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ -n "$BASE_REF" ]; then
+            scripts/check-fixtures.sh "origin/$BASE_REF"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ]; then
+            scripts/check-fixtures.sh "$BEFORE"
+          fi
+
   check:
     name: check (${{ matrix.os }})
     strategy:
@@ -99,3 +117,59 @@ jobs:
         run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
+
+  # The TypeScript SDK: its types, its build, its contract test against the
+  # shared fixtures in protocol/fixtures, its end-to-end test against a real
+  # node built from this commit, and the packed package imported by plain
+  # Node 22 from node_modules.
+  sdk-typescript:
+    name: sdk typescript (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+
+      # The package test packs the SDK with npm and imports it with this
+      # Node, the floor package.json names.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Build
+        run: bun run build
+
+      - name: Install the toolchain from rust-toolchain.toml
+        working-directory: .
+        run: rustup toolchain install --no-self-update
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build the node
+        working-directory: .
+        run: cargo build -p fabric --locked
+
+      - name: Test
+        env:
+          FABRIC_BIN: ${{ github.workspace }}/target/debug/fabric
+        run: bun test

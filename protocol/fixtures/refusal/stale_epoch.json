@@ -1,0 +1,9 @@
+{
+  "kind": "not_owner",
+  "reason": {
+    "code": "stale_epoch",
+    "yours": 2,
+    "current": 3
+  },
+  "message": "stale epoch 2, current is 3"
+}

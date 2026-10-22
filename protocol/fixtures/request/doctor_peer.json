@@ -1,0 +1,12 @@
+{
+  "op": "doctor",
+  "peer": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "env": {
+    "path": [
+      "/usr/bin",
+      "/bin"
+    ],
+    "roots": {}
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "kind": "frozen",
+  "reason": {
+    "code": "forked",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "peer": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+    "epoch": 3
+  },
+  "message": "job is frozen on this node"
+}

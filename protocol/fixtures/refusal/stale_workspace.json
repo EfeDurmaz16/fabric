@@ -1,0 +1,10 @@
+{
+  "kind": "job_state",
+  "reason": {
+    "code": "stale_workspace",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "root": "/Users/me/fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/work",
+    "left_at": 1
+  },
+  "message": "left at epoch 1"
+}

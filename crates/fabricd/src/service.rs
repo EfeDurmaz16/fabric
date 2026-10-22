@@ -154,13 +154,9 @@ impl Service for Node {
 
     fn facts(&self, _peer: NodeId) -> BoxFuture<'_, Result<Facts, Fault>> {
         Box::pin(async move {
-            Ok(NodeFacts::measure(
-                &self.cfg.home,
-                &self.cfg.path_var,
-                self.cfg.cargo_home.clone(),
-            )
-            .await
-            .to_wire())
+            Ok(NodeFacts::measure(&self.cfg.home, &self.node_env())
+                .await
+                .to_wire())
         })
     }
 }
@@ -327,7 +323,7 @@ impl Node {
                 .await
                 .map_err(|e| internal(&e))?;
         }
-        for line in out.lines {
+        for line in out.lines() {
             tracing::info!(job = %id, "{line}");
         }
         let (head, latest) = {
@@ -365,7 +361,7 @@ impl Node {
         )
         .await
         .map_err(|e| internal(&e))?;
-        for line in out.lines {
+        for line in out.lines() {
             tracing::warn!(job = %job.id(), "{line}");
         }
         Ok(())
@@ -414,8 +410,8 @@ impl Node {
             }
         }
         let mut out = Out::default();
-        let path_var = self.cfg.path_var.clone();
-        self.suspend_locked(&mut job, &path_var, &mut out)
+        let env = self.node_env();
+        self.suspend_locked(&mut job, &env, &mut out)
             .await
             .map_err(|e| internal(&e))?;
         let move_id = clock::move_id();
@@ -427,7 +423,7 @@ impl Node {
             .map_err(|e| internal(&e))?;
         drop(job);
         faults::hit(Point::AfterDepartingWrite).await;
-        for line in out.lines {
+        for line in out.lines() {
             tracing::info!(job = %id, "{line}");
         }
         Ok(Fenced::Answer(MoveRequested::Started { move_id }))

@@ -18,6 +18,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use fabric_client::api::Event;
 use fabric_core::id::{Epoch, JobId, NodeId, RecordHash};
 use fabric_core::lease::FencingToken;
 use fabric_core::ledger::{Ledger, LedgerError, Record};
@@ -82,9 +83,7 @@ impl Node {
             };
             match target {
                 Some(target) if unreachable.contains(&target) => {
-                    out.say(format!(
-                        "the open move waits for {target}, which did not answer"
-                    ));
+                    out.emit(Event::MoveWaits { target });
                 }
                 Some(_) => {
                     if let Err(e) = self.resolve_departing(id, &mut out).await {
@@ -93,7 +92,7 @@ impl Node {
                 }
                 None => {}
             }
-            for line in out.lines {
+            for line in out.lines() {
                 tracing::info!(job = %id, "{line}");
             }
         }
@@ -151,12 +150,17 @@ impl Node {
                 Err(e @ (NodeError::Unreachable { .. } | NodeError::UnknownPeer(_))) => {
                     return Err(e);
                 }
-                Err(e) => out.say(format!("did not catch up with {peer}: {e}")),
+                Err(e) => out.emit(Event::NotCaughtUp {
+                    peer,
+                    error: e.to_refusal(),
+                }),
             }
             if let Err(e) = self.settle_job(id, &mut out).await {
-                out.say(format!("left as it was: {e}"));
+                out.emit(Event::LeftAsItWas {
+                    error: e.to_refusal(),
+                });
             }
-            for line in out.lines {
+            for line in out.lines() {
                 tracing::info!(job = %id, "{line}");
             }
         }
@@ -217,10 +221,7 @@ impl Node {
         let reachable = self.reachable_peers();
         for entry in self.peers.snapshot().iter() {
             if !reachable.contains(&entry.node()) {
-                out.say(format!(
-                    "{} has no address here and no session open with this node, so a move or a steal there is not known here",
-                    entry.node()
-                ));
+                out.emit(Event::PeerNotAsked { peer: entry.node() });
             }
         }
         let mut tasks = tokio::task::JoinSet::new();
@@ -235,16 +236,21 @@ impl Node {
         while let Some(joined) = tasks.join_next().await {
             match joined {
                 Ok((_, Ok(Ok(())))) => {}
-                Ok((peer, Ok(Err(e)))) => out.say(format!("did not catch up with {peer}: {e}")),
-                Ok((peer, Err(_))) => out.say(format!(
-                    "{peer} did not answer within {} s, so a move or a steal there is not known here",
-                    CHECK_DEADLINE.as_secs()
-                )),
+                Ok((peer, Ok(Err(e)))) => out.emit(Event::NotCaughtUp {
+                    peer,
+                    error: e.to_refusal(),
+                }),
+                Ok((peer, Err(_))) => out.emit(Event::PeerSilent {
+                    peer,
+                    waited_s: CHECK_DEADLINE.as_secs(),
+                }),
                 Err(e) => tracing::warn!(error = %e, "a catch-up task ended early"),
             }
         }
         if let Err(e) = self.settle_job(id, out).await {
-            out.say(format!("left as it was: {e}"));
+            out.emit(Event::LeftAsItWas {
+                error: e.to_refusal(),
+            });
         }
     }
 
@@ -286,7 +292,7 @@ impl Node {
                 &mut out,
             )
             .await;
-        for line in out.lines {
+        for line in out.lines() {
             tracing::warn!(job = %id, "{line}");
         }
         match frozen {
@@ -330,10 +336,10 @@ impl Node {
             });
         }
         if job.freeze(fork)? {
-            out.say(format!(
-                "frozen: {}'s ledger at epoch {} does not continue this node's",
-                fork.peer, fork.epoch
-            ));
+            out.emit(Event::Frozen {
+                peer: fork.peer,
+                epoch: fork.epoch,
+            });
         }
         self.settle(job, out).await
     }
@@ -446,11 +452,11 @@ mod tests {
         a.check_peers(id, &mut out).await;
         let peer = b.id.to_string();
         assert!(
-            out.lines
+            out.said()
                 .iter()
                 .any(|line| line.starts_with(&peer) && line.contains("no address")),
             "{:?}",
-            out.lines
+            out.said()
         );
     }
 
@@ -464,7 +470,7 @@ mod tests {
         let (_dir_b, b) = node();
         paired(&a, &b).await;
         let id = job(dir_a.path(), &a).await;
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = crate::tool_env::ToolEnv::current();
         let snapshot = a.suspend(id, &path, &mut Out::default()).await.unwrap();
         b.pull_records(id, a.id).await.unwrap();
         assert!(!is_complete(&b.store, snapshot).await.unwrap());

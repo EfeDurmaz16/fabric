@@ -1,0 +1,8 @@
+{
+  "schema": "event",
+  "value": {
+    "kind": "fenced",
+    "epoch": 0,
+    "pid": 4242
+  }
+}

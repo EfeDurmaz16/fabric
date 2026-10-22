@@ -1,25 +1,60 @@
 # Fabric
 
-A job is the unit of development work. Storage, compute, environment and harness stay decoupled, so a job started under Claude Code on one machine can be suspended, resumed on another machine with its dependencies, and continued by a different agent.
+Fabric moves a coding-agent job from one machine to another and lets you pick it up where it stopped. The workspace goes with it: staged and unstaged changes, untracked files, dependency caches and build output. So does the agent's session, so Claude Code or Codex continues the same conversation on the other machine. Secrets stay behind.
 
-Private repository. Working name; see [ADR 0010](docs/adr/0010-name-and-scope-boundaries.md) on the name collision.
+The idea underneath is that the job, not the machine, is the unit of development work. Where a job's state is stored, which machine runs it, which toolchain it needs and which agent drives it are separate questions, and Fabric keeps them separate, so a job started under Claude Code on one machine can be suspended, resumed on another machine with its dependencies, and continued by a different agent.
+
+Fabric is a working name. It collides with Microsoft Fabric and others, and may change; see [ADR 0010](docs/adr/0010-name-and-scope-boundaries.md).
 
 ## Status, honestly
 
-A job can move between two of your Macs by hand: made from a repository, run under a harness, suspended, moved, resumed on the other Mac with its uncommitted work and its harness session, and moved back, safe under `kill -9` of either node at every step the end-to-end test names. The first run on the real two Macs, on 2026-10-20, stopped at `fabric job run` while Claude Code was open (gate finding F1, fixed since), and on 2026-10-21 Codex exited under `fabric job run` with "Interrupted system call" because it touched the terminal before its process group owned it (gate finding F5; the fix is tested under a pseudo-terminal and not yet rerun on the Macs); no move has run between them yet, and the test runs two nodes on one machine. Only the fake ACP agent has gone through a full move; Claude Code and Codex are wired the same way and still need their live run (ADR 0015).
+A job can move between two of your Macs by hand: made from a repository, run under a harness, suspended, moved, resumed on the other Mac with its uncommitted work and its harness session, and moved back, safe under `kill -9` of either node at every step the end-to-end test names.
+
+On 2026-10-21 a Codex job moved between two real Macs with its workspace and its conversation. It answered a first turn on one Mac, was suspended and moved to the other, and there it resumed and answered a question about its first turn.
+
+| Step | Measured |
+|---|---|
+| Suspend: stop the agent, snapshot the workspace and the session | 0.85 s |
+| Move to the other Mac | 1.15 s |
+| Resume and run one headless turn there | 6 s |
+| Workspace on the target | Identical to the source: git status, staged and unstaged diffs, the untracked file, `node_modules` and `dist`. `.env` was left behind, as a secret is. |
+
+That run found that the resumed agent used the other Mac's model setting instead of the job's, and pinned the model by hand; a resume now carries the settings the session ran with (gate finding F10). Claude Code has not yet been run across two machines. The end-to-end test runs two nodes on one machine.
 
 | What | State |
 |---|---|
 | Architecture page and glossary | Written: [docs/architecture.md](docs/architecture.md), [docs/glossary.md](docs/glossary.md) |
-| ADRs 0001 to 0016 | Written, see below; amended 2026-10-19 after the step 1 research; 0013 to 0016 record the network protocol, the store, the harness trait, and the node and CLI as built |
+| ADRs 0001 to 0016, 0018 | Written, see below; amended 2026-10-19 after the step 1 research; 0013 to 0016 record the network protocol, the store, the harness trait, and the node and CLI as built; 0018 records the client API |
 | `crates/fabric-core` | Ids, paths, the job ledger with its record codec, the lease and the cooperative move protocol, snapshot manifests, the environment spec and the secret policy. Pure: no IO, no clock, no socket. Property-tested against the ADR 0003 invariants; the secret staging contract is tested against real `git`. |
 | `crates/fabric-store` | Content-addressed objects (blake3, zstd, FastCDC above 8 MiB), the SQLite catalog with refcounts and a graced gc, workspace capture (git state as two private commits and a bundle, ignored files by class, secrets denied) and restore into an empty directory through a staging rename. Crash-tested with `SIGKILL` at every publish and restore checkpoint. Capture still applies its own secret list, not `fabric_core::secret` (ADR 0004). |
 | `crates/fabric-net` | Node key, pinned TLS with no CA, QUIC and TCP+TLS transports on one port behind one endpoint, framed and typed RPC with deadlines, paged ledger records, verified zstd chunk transfer, the facts doctor compares, the peer book. See [docs/net.md](docs/net.md). |
 | `crates/fabric-harness` | The `Harness` trait and three adapters: Claude Code, Codex and any Agent Client Protocol agent. Captures a session into a redacted state tree with a manifest, restores it all or nothing under the same workspace path and home, never over state that would lose bytes, launches the harness in a new process group with typed flags and without the markers of a Claude Code or Codex session Fabric runs under, holding an interactive one stopped before its exec until its group owns the terminal (gate finding F5), and reads the answer and session a headless Claude or Codex turn prints. Pre-seeds Claude's workspace trust under the key Claude reads for project settings (the main checkout of the repository, or the workspace) only when that key is not already set, and leaves it to Claude while one runs or when `~/.claude.json` is missing or a symlink, saying when a trusted ancestor still skips the dialog but leaves the project settings off. A hard-coded denylist keeps credentials and host state out of the tree. Crash-tested with `SIGKILL` after every staged and placed Claude file, after a pending departure record, and in a Codex restore. |
 | `crates/fabric-env` | `EnvSpec` detection from the files a workspace already has and from `.fabric/env.toml`, and the materializer that runs setup steps only when a cache is missing or torn, with a dry run. Tested against fixture workspaces, real setup processes and `SIGKILL`. |
 | `crates/fabricd` | The node: one process per state directory holding the store, one ledger file per job, the network service and the control socket. Suspend, the push move, the pull resume, the steal behind `--force`, doctor, and recovery after a restart. See [ADR 0016](docs/adr/0016-node-and-cli-as-built.md). |
+| `crates/fabric-client` | The client API of a node (ADR 0018): typed requests, replies, progress events and refusals as length-prefixed JSON on the control socket after a version handshake, and a Rust client. `protocol/fixtures` holds one example of every message; the Rust and TypeScript clients both test against it. |
+| `sdk/typescript` | The TypeScript client of the same API for Node 22 and Bun, built to JavaScript with declarations in `dist/`: zod schemas at the boundary, the same trust checks and handshake as the Rust client, and the same contract test against `protocol/fixtures`, plus an end-to-end test against a real node and a test that imports the packed package with plain Node from `node_modules`. |
 | `crates/fabric` | The `fabric` command, and the end-to-end test: two daemons over loopback on QUIC and on TCP+TLS, a job moved and back, the move broken at five named points by `SIGKILL` of either node or a lost or repeated answer. |
-| CI | fmt, clippy, test, the end-to-end test, doc, `cargo deny` and the hygiene script on macOS and Ubuntu |
+| CI | fmt, clippy, test, the end-to-end test, doc, `cargo deny`, the hygiene script, and the TypeScript SDK's typecheck, build, contract, package and end-to-end tests, on macOS and Ubuntu |
+
+## How a move works
+
+```mermaid
+sequenceDiagram
+    participant A as Mac A (owner)
+    participant B as Mac B
+    A->>A: suspend: stop agent, snapshot workspace and session
+    A->>B: copy ledger and snapshot
+    A->>B: MoveStarted, A stops being runnable
+    B->>A: MoveImported, B owns the job
+    B->>B: resume: restore files, rebuild caches, continue session
+```
+
+- **One live copy.** Every job has an append-only, hash-chained ledger. A move is a short protocol over that ledger, so at most one machine can run the job at a time, even when a machine is killed in the middle of a move.
+- **Content-addressed snapshots.** The workspace is stored as blake3 chunks in a local store with a SQLite catalog. A move sends only the chunks the other machine lacks. Git state goes as a bundle plus the index and the working tree.
+- **Carry or rebuild.** Dependency caches and build output travel when the other machine can use them, and are made again there by their setup step or the next build when it cannot. Secret-shaped files never leave the machine.
+- **Harness adapters.** Claude Code, Codex and any Agent Client Protocol agent. Each adapter captures the agent's session files and restores them on the other machine.
+- **Pinned peers.** Machines pair by ed25519 node id and talk over QUIC with TLS pinned to that id, or TCP with TLS when UDP is blocked. No central server.
+- **Client API.** A versioned JSON API on the node's local socket, with a Rust client crate and a TypeScript SDK checked against the same message fixtures.
 
 ## Two Macs, by hand
 
@@ -120,6 +155,7 @@ A resume continues with the settings the session ran with, not the ones the othe
 | [0014](docs/adr/0014-store-as-built.md) | The store as built |
 | [0015](docs/adr/0015-harness-trait-as-built.md) | The harness trait as built |
 | [0016](docs/adr/0016-node-and-cli-as-built.md) | The node and the CLI as built |
+| [0018](docs/adr/0018-client-api.md) | The client API |
 
 Start with the architecture page, then read the ADRs in order. ADR 0003 deserves the most attention; it is the one that protects the user's work. The research notes the ADRs cite are private and live outside this repository; the architecture page says what they are.
 

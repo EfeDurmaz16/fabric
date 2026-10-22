@@ -1,0 +1,5 @@
+{
+  "kind": "cache_rebuilt",
+  "path": "target",
+  "why": "CARGO_HOME /a on the source, /b here"
+}

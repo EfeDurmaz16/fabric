@@ -28,12 +28,12 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use fabric_core::session::SessionId;
 use serde::{Deserialize, Serialize};
 
 use crate::durable;
 use crate::error::{HarnessError, Input, IoOp};
 use crate::manifest::Digest;
-use crate::session::SessionId;
 use crate::stage;
 
 /// The directory under the home where Fabric keeps its own harness state,

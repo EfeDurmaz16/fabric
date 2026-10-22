@@ -1,0 +1,12 @@
+{
+  "op": "harness_started",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "epoch": 2,
+  "pid": 4242,
+  "harness": {
+    "kind": "codex"
+  },
+  "session": "019f233e-bb33-7342-85fa-f2d33b14368a",
+  "planned": "019f233e-bb33-7342-85fa-f2d33b14368a",
+  "version": "0.155.1"
+}

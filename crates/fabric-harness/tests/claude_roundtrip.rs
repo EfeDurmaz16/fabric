@@ -15,10 +15,11 @@ use std::path::{Path, PathBuf};
 
 use fabric_core::env::EnvVarName;
 use fabric_core::path::AbsPath;
+use fabric_core::session::SessionId;
 use fabric_harness::claude::ClaudeCode;
 use fabric_harness::claude::flags::{LaunchFlags, PermissionMode};
 use fabric_harness::manifest::StateManifest;
-use fabric_harness::{Harness, HarnessError, Launch, SessionId};
+use fabric_harness::{Harness, HarnessError, Launch};
 
 mod common;
 mod executable;

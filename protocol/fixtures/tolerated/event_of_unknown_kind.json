@@ -1,0 +1,10 @@
+{
+  "schema": "event",
+  "value": {
+    "kind": "teleported",
+    "to": "mars"
+  },
+  "reads_as": {
+    "kind": "unrecognized"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "op": "job_new",
+  "repo": "/Users/me/oss/some-repo",
+  "goal": "fix the flaky test",
+  "harness": {
+    "kind": "claude_code"
+  }
+}

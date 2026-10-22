@@ -1,0 +1,10 @@
+{
+  "kind": "frozen",
+  "reason": {
+    "code": "departing",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "move_id": "01JB2Z3Y4X5W6V7T8S9R0QPNMK",
+    "target": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba"
+  },
+  "message": "job is departing"
+}

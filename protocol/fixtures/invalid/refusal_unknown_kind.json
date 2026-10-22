@@ -1,0 +1,10 @@
+{
+  "schema": "refusal",
+  "value": {
+    "kind": "on_fire",
+    "reason": {
+      "code": "quota_exceeded"
+    },
+    "message": "x"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "schema": "request",
+  "value": {
+    "op": "node_ping",
+    "node": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibb"
+  }
+}

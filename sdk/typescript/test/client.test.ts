@@ -1,0 +1,579 @@
+// The client against a fake node on a temporary unix socket: what it sends,
+// what it hands to `onEvent`, and which error each broken exchange gives.
+
+import { afterEach, describe, expect, mock, test } from "bun:test";
+import { execFileSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync } from "node:fs";
+import * as fsPromises from "node:fs/promises";
+import { createServer, type Server, type Socket } from "node:net";
+import { dirname, join } from "node:path";
+
+import {
+  clientEnvFromProcess,
+  ClosedBeforeAnswerError,
+  ClosedBeforeWelcomeError,
+  EnvError,
+  createFrameDecoder,
+  decodeJson,
+  encodeFrame,
+  FabricClient,
+  FabricError,
+  IncompatibleError,
+  InvalidRequestError,
+  JobId,
+  type KnownEvent,
+  NoDaemonError,
+  OPS,
+  PathDir,
+  RefusedError,
+  ROOT_CAPABILITIES,
+  SDK_VERSION,
+  SnapshotId,
+  SystemPath,
+  UnexpectedError,
+  UnsupportedError,
+  UnsupportedFieldError,
+  UntrustedError,
+} from "../src/index.ts";
+
+const NODE = "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq";
+const JOB = JobId.parse("01JABCDEFGHJKMNPQRSTVWXYZ0");
+const SNAPSHOT = SnapshotId.parse("ab".repeat(32));
+
+function welcome(capabilities: readonly string[] = OPS): unknown {
+  return { type: "welcome", api: 1, node: NODE, node_version: "0.1.0", capabilities };
+}
+
+/** One accepted connection, as the fake node sees it. */
+type Peer = {
+  /** The next frame from the client, or `null` once it closed. */
+  read(): Promise<unknown>;
+  send(value: unknown): void;
+  end(): void;
+};
+
+type FakeNode = {
+  socketPath: string;
+  /** Every frame each connection received, once the connection closed. */
+  connections: Promise<unknown[]>[];
+};
+
+const cleanups: Array<() => void> = [];
+
+/** node:fs/promises as loaded, before a test stands in for it. */
+const REAL_FS_PROMISES = { ...fsPromises };
+
+afterEach(() => {
+  for (const cleanup of cleanups.splice(0)) {
+    cleanup();
+  }
+});
+
+/** A directory under /tmp, short enough for a socket path, with `mode`. */
+function tempDir(mode = 0o700): string {
+  const dir = mkdtempSync("/tmp/fsdk");
+  chmodSync(dir, mode);
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+function peer(socket: Socket, received: unknown[]): Peer {
+  const decoder = createFrameDecoder();
+  const frames: unknown[] = [];
+  let closed = false;
+  let wake: (() => void) | undefined;
+  socket.on("data", (chunk: Buffer) => {
+    decoder.push(chunk);
+    for (let frame = decoder.next(); frame !== undefined; frame = decoder.next()) {
+      const value = decodeJson(frame);
+      received.push(value);
+      frames.push(value);
+    }
+    wake?.();
+  });
+  socket.on("close", () => {
+    closed = true;
+    wake?.();
+  });
+  socket.on("error", () => {});
+  return {
+    async read() {
+      for (;;) {
+        if (frames.length > 0) {
+          return frames.shift();
+        }
+        if (closed) {
+          return null;
+        }
+        await new Promise<void>((resolve) => {
+          wake = resolve;
+        });
+      }
+    },
+    send(value) {
+      socket.write(encodeFrame(value));
+    },
+    end() {
+      socket.end();
+    },
+  };
+}
+
+/** Starts a node on `<dir>/fabric.sock` that runs `script` on each connection, after it drains. */
+async function fakeNode(script: (peer: Peer) => Promise<void>, dir = tempDir()): Promise<FakeNode> {
+  const socketPath = join(dir, "fabric.sock");
+  const connections: Promise<unknown[]>[] = [];
+  const server: Server = createServer((socket) => {
+    const received: unknown[] = [];
+    connections.push(
+      new Promise((resolve) => {
+        socket.on("close", () => resolve(received));
+        const connection = peer(socket, received);
+        void script(connection).then(async () => {
+          // Read until the client leaves, so anything it sent late is recorded.
+          while ((await connection.read()) !== null) {}
+        });
+      }),
+    );
+  });
+  await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+  cleanups.push(() => server.close());
+  return { socketPath, connections };
+}
+
+/** A script that welcomes the client, reads its request and answers with `frames`. */
+function answers(...frames: unknown[]): (peer: Peer) => Promise<void> {
+  return async (connection) => {
+    await connection.read();
+    connection.send(welcome());
+    await connection.read();
+    for (const frame of frames) {
+      connection.send(frame);
+    }
+    connection.end();
+  };
+}
+
+async function rejection(promise: Promise<unknown>): Promise<unknown> {
+  try {
+    await promise;
+  } catch (error) {
+    return error;
+  }
+  throw new Error("the call did not reject");
+}
+
+describe("the client", () => {
+  test("names this SDK and its version in the hello", async () => {
+    const node = await fakeNode(answers({ type: "done", reply: { kind: "job_list", jobs: [], closed: [] } }));
+    await new FabricClient({ socketPath: node.socketPath }).jobList();
+    const [received] = await Promise.all(node.connections);
+    expect(received?.[0]).toStrictEqual({ api: 1, client: `fabric-sdk-typescript/${SDK_VERSION}` });
+    expect(received?.[1]).toStrictEqual({ op: "job_list" });
+    const manifest: unknown = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+    expect(manifest).toMatchObject({ version: SDK_VERSION });
+  });
+
+  test("skips unknown event kinds and hands known ones to onEvent in order", async () => {
+    const node = await fakeNode(
+      answers(
+        { type: "event", event: { kind: "stopping_harness", pid: 4242 } },
+        { type: "event", event: { kind: "teleported", to: "mars" } },
+        {
+          type: "event",
+          event: { kind: "snapshot_published", snapshot: SNAPSHOT, files: 3, bytes: 10, new_objects: 1 },
+        },
+        { type: "event", event: { kind: "suspended", snapshot: SNAPSHOT, epoch: 1 } },
+        { type: "done", reply: { kind: "job_suspend", snapshot: SNAPSHOT } },
+      ),
+    );
+    const events: KnownEvent[] = [];
+    const suspended = await new FabricClient({ socketPath: node.socketPath }).jobSuspend(JOB, {
+      onEvent: (event) => events.push(event),
+    });
+    expect(events.map((event) => event.kind)).toStrictEqual(["stopping_harness", "snapshot_published", "suspended"]);
+    expect(suspended).toStrictEqual({ kind: "job_suspend", snapshot: SNAPSHOT });
+  });
+
+  // Review finding on PR #13: an async onEvent was not awaited, so the call could resolve before the handler
+  // finished, and a handler that rejected left an unhandled rejection instead of rejecting the call.
+  test("awaits an async onEvent before the next frame and rejects with what it rejects with", async () => {
+    const frames = [
+      { type: "event", event: { kind: "stopping_harness", pid: 4242 } },
+      { type: "event", event: { kind: "suspended", snapshot: SNAPSHOT, epoch: 1 } },
+      { type: "done", reply: { kind: "job_suspend", snapshot: SNAPSHOT } },
+    ];
+    const node = await fakeNode(answers(...frames));
+    const handled: string[] = [];
+    await new FabricClient({ socketPath: node.socketPath }).jobSuspend(JOB, {
+      onEvent: async (event) => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        handled.push(event.kind);
+      },
+    });
+    expect(handled).toStrictEqual(["stopping_harness", "suspended"]);
+
+    const failing = await fakeNode(answers(...frames));
+    const failure = new Error("the handler failed");
+    const error = await rejection(
+      new FabricClient({ socketPath: failing.socketPath }).jobSuspend(JOB, {
+        onEvent: async () => {
+          await Promise.resolve();
+          throw failure;
+        },
+      }),
+    );
+    expect(error).toBe(failure);
+  });
+
+  test("rejects a reply of another op with Unexpected", async () => {
+    const node = await fakeNode(answers({ type: "done", reply: { kind: "job_suspend", snapshot: SNAPSHOT } }));
+    const error = await rejection(new FabricClient({ socketPath: node.socketPath }).jobStatus(JOB));
+    expect(error).toBeInstanceOf(UnexpectedError);
+    expect(error).toMatchObject({ op: "job_status", got: "job_suspend" });
+  });
+
+  test("rejects a refusal with Refused, carrying its kind, reason and message", async () => {
+    const refusal = {
+      kind: "not_owner",
+      reason: { code: "unknown_job", job: JOB },
+      message: `job ${JOB} is not known on this node`,
+    };
+    const node = await fakeNode(answers({ type: "refused", refusal }));
+    const error = await rejection(new FabricClient({ socketPath: node.socketPath }).jobStatus(JOB));
+    expect(error).toBeInstanceOf(RefusedError);
+    expect(error).toMatchObject({ kind: "not_owner", reason: refusal.reason, message: refusal.message });
+  });
+
+  test("rejects an incompatible node with Incompatible and sends no request", async () => {
+    const node = await fakeNode(async (connection) => {
+      await connection.read();
+      connection.send({ type: "incompatible", api: 2, node_version: "0.2.0" });
+    });
+    const error = await rejection(new FabricClient({ socketPath: node.socketPath }).jobList());
+    expect(error).toBeInstanceOf(IncompatibleError);
+    expect(error).toMatchObject({ client: 1, node: 2, nodeVersion: "0.2.0" });
+    const [received] = await Promise.all(node.connections);
+    expect(received).toHaveLength(1);
+  });
+
+  test("rejects a welcome of another api version with Incompatible and sends no request", async () => {
+    const node = await fakeNode(async (connection) => {
+      await connection.read();
+      connection.send({ type: "welcome", api: 2, node: NODE, node_version: "0.2.0", capabilities: OPS });
+    });
+    const error = await rejection(new FabricClient({ socketPath: node.socketPath }).jobList());
+    expect(error).toBeInstanceOf(IncompatibleError);
+    expect(error).toMatchObject({ client: 1, node: 2, nodeVersion: "0.2.0" });
+    const [received] = await Promise.all(node.connections);
+    expect(received).toHaveLength(1);
+  });
+
+  test("rejects an op the node does not list with Unsupported and sends no request", async () => {
+    const node = await fakeNode(async (connection) => {
+      await connection.read();
+      connection.send(welcome(OPS.filter((op) => op !== "job_steal")));
+    });
+    const error = await rejection(new FabricClient({ socketPath: node.socketPath }).jobSteal(JOB));
+    expect(error).toBeInstanceOf(UnsupportedError);
+    expect(error).toMatchObject({ op: "job_steal" });
+    const [received] = await Promise.all(node.connections);
+    expect(received).toHaveLength(1);
+  });
+
+  // Review findings on PR #13: a node that does not know a request field ignores it, so a client sends a
+  // root only to a node that lists it, and an older node never measures with its own value in its place.
+  // A root left unset means removed for the tool, which a node that does not know the root never does.
+  test("rejects a root the node does not list with UnsupportedField and sends no request", async () => {
+    const env = { path: [PathDir.parse("/usr/bin")], roots: { cargo_home: SystemPath.parse("/Users/me/.cargo") } };
+    const node = await fakeNode(async (connection) => {
+      await connection.read();
+      connection.send(welcome(["doctor", "env.roots.rustup_home"]));
+    });
+    const error = await rejection(new FabricClient({ socketPath: node.socketPath }).doctor({ env }));
+    expect(error).toBeInstanceOf(UnsupportedFieldError);
+    expect(error).toMatchObject({ op: "doctor", capability: "env.roots.cargo_home" });
+    const [received] = await Promise.all(node.connections);
+    expect(received).toHaveLength(1);
+
+    // A node that lists the root the client sets, but not the ones it leaves unset, does not get it either.
+    const partial = await fakeNode(async (connection) => {
+      await connection.read();
+      connection.send(welcome(["doctor", "env.roots.cargo_home"]));
+    });
+    const unset = await rejection(new FabricClient({ socketPath: partial.socketPath }).doctor({ env }));
+    expect(unset).toBeInstanceOf(UnsupportedFieldError);
+    expect(unset).toMatchObject({ op: "doctor", capability: "env.roots.rustup_home" });
+    const [partialReceived] = await Promise.all(partial.connections);
+    expect(partialReceived).toHaveLength(1);
+
+    // A node that lists every root gets the request.
+    const listing = await fakeNode(async (connection) => {
+      await connection.read();
+      connection.send(welcome(["doctor", ...ROOT_CAPABILITIES]));
+      await connection.read();
+      connection.send({ type: "done", reply: { kind: "doctor", report: { kind: "facts", facts: [] } } });
+      connection.end();
+    });
+    await new FabricClient({ socketPath: listing.socketPath }).doctor({ env });
+    const [sent] = await Promise.all(listing.connections);
+    expect(sent?.[1]).toMatchObject({ op: "doctor", env: { roots: { cargo_home: "/Users/me/.cargo" } } });
+  });
+
+  // Review finding on PR #13: a goal, note or reason cut with `.slice()` can end in half an emoji, which the
+  // schema accepted and the node refused as bad_request. It is refused before the client connects.
+  test("refuses a string holding a lone surrogate before it connects", async () => {
+    const node = await fakeNode(answers());
+    const client = new FabricClient({ socketPath: node.socketPath });
+    const cut = "make it faster \u{1F680}".slice(0, 16);
+    const harness = { kind: "claude_code" } as const;
+    for (const call of [
+      client.jobNew(SystemPath.parse("/Users/me/oss/some-repo"), cut, harness),
+      client.jobDecide(JOB, "approve", cut),
+      client.jobSteal(JOB, { reason: cut }),
+    ]) {
+      expect(await rejection(call)).toBeInstanceOf(InvalidRequestError);
+    }
+    expect(node.connections).toHaveLength(0);
+  });
+
+  // Review finding on PR #13: a name cut with `.slice()` failed every call with a raw ZodError, which no
+  // `instanceof FabricError` branch matches.
+  test("refuses a name holding a lone surrogate when it is constructed, with InvalidRequest", () => {
+    const label = "my app \u{1F600}";
+    let error: unknown;
+    try {
+      new FabricClient({ socketPath: "/nowhere/fabric.sock", name: label.slice(0, 8) });
+    } catch (thrown) {
+      error = thrown;
+    }
+    expect(error).toBeInstanceOf(InvalidRequestError);
+    expect(error).toBeInstanceOf(FabricError);
+    expect(new FabricClient({ socketPath: "/nowhere/fabric.sock", name: label }).name).toBe(label);
+  });
+
+  test("rejects a node that closes right after the hello with ClosedBeforeWelcome", async () => {
+    const node = await fakeNode(async (connection) => {
+      await connection.read();
+      connection.end();
+    });
+    const error = await rejection(new FabricClient({ socketPath: node.socketPath }).hello());
+    expect(error).toBeInstanceOf(ClosedBeforeWelcomeError);
+  });
+
+  test("rejects a node that closes after the request with ClosedBeforeAnswer", async () => {
+    const node = await fakeNode(answers({ type: "event", event: { kind: "catching_up" } }));
+    const error = await rejection(new FabricClient({ socketPath: node.socketPath }).jobList());
+    expect(error).toBeInstanceOf(ClosedBeforeAnswerError);
+    expect(error).toMatchObject({ op: "job_list" });
+  });
+
+  test("rejects a socket directory others may enter with Untrusted before connecting", async () => {
+    const node = await fakeNode(answers(), tempDir(0o755));
+    const error = await rejection(new FabricClient({ socketPath: node.socketPath }).hello());
+    expect(error).toBeInstanceOf(UntrustedError);
+    expect(node.connections).toHaveLength(0);
+  });
+
+  // A symlink could lead anywhere, such as to a socket another user serves run plans on.
+  test("rejects a socket path that is a symlink with Untrusted before connecting", async () => {
+    const node = await fakeNode(answers());
+    const link = join(tempDir(), "fabric.sock");
+    symlinkSync(node.socketPath, link);
+    const error = await rejection(new FabricClient({ socketPath: link }).hello());
+    expect(error).toBeInstanceOf(UntrustedError);
+    expect(node.connections).toHaveLength(0);
+  });
+
+  // Review finding on PR #13: the checks resolved a relative socket path once and the connect resolved it
+  // again, so a working directory changed while a check waited sent the request to a socket never checked.
+  test("connects to the socket its checks passed when the working directory changes meanwhile", async () => {
+    const reply = { type: "done", reply: { kind: "job_list", jobs: [], closed: [] } };
+    const checked = await fakeNode(answers(reply));
+    const unchecked = await fakeNode(answers(reply), tempDir(0o755));
+    const cwd = process.cwd();
+    cleanups.unshift(() => process.chdir(cwd));
+    process.chdir(dirname(checked.socketPath));
+    const listed = new FabricClient({ socketPath: "fabric.sock" }).jobList();
+    process.chdir(dirname(unchecked.socketPath));
+    await listed;
+    expect(checked.connections).toHaveLength(1);
+    expect(unchecked.connections).toHaveLength(0);
+  });
+
+  test("rejects a socket nothing listens on with NoDaemon", async () => {
+    const error = await rejection(new FabricClient({ socketPath: join(tempDir(), "fabric.sock") }).hello());
+    expect(error).toBeInstanceOf(NoDaemonError);
+  });
+
+  // Review finding on PR #13: a socket under a missing directory passed both checks, so anyone who may write the
+  // parent, as in /tmp, could make the directory and a socket of theirs in it before the connect. Here both appear
+  // right after the client first finds the directory missing, by either call, as another user racing it would.
+  test("rejects a socket under a missing directory with NoDaemon before connecting", async () => {
+    const reply = { type: "done", reply: { kind: "job_list", jobs: [], closed: [] } };
+    const socketPath = join(tempDir(), "new", "fabric.sock");
+    const raced: FakeNode[] = [];
+    const race = async (path: string): Promise<void> => {
+      if (path === dirname(socketPath) && raced.length === 0) {
+        mkdirSync(path);
+        raced.push(await fakeNode(answers(reply), path));
+      }
+    };
+    mock.module("node:fs/promises", () => ({
+      ...REAL_FS_PROMISES,
+      async lstat(path: string) {
+        try {
+          return await REAL_FS_PROMISES.lstat(path);
+        } catch (error) {
+          await race(path);
+          throw error;
+        }
+      },
+      async realpath(path: string) {
+        try {
+          return await REAL_FS_PROMISES.realpath(path);
+        } catch (error) {
+          await race(path);
+          throw error;
+        }
+      },
+    }));
+    cleanups.push(() => mock.module("node:fs/promises", () => REAL_FS_PROMISES));
+    const error = await rejection(new FabricClient({ socketPath }).jobList());
+    expect(error).toBeInstanceOf(NoDaemonError);
+    expect(raced).toHaveLength(1);
+    expect(raced[0]?.connections).toHaveLength(0);
+  });
+
+  // Review finding on PR #13: only the state directory and the socket were checked, so whoever may write a
+  // directory above them could swap the state directory for one of theirs between the checks and the connect.
+  // A directory above must be one only this user or root can change; a sticky one, as /tmp is, qualifies.
+  test("rejects a directory above the socket that group or others may write, unless it is sticky", async () => {
+    const above = tempDir();
+    const state = join(above, "state");
+    mkdirSync(state, { mode: 0o700 });
+    const node = await fakeNode(answers(), state);
+    for (const mode of [0o757, 0o775]) {
+      chmodSync(above, mode);
+      const error = await rejection(new FabricClient({ socketPath: node.socketPath }).hello());
+      expect(error).toBeInstanceOf(UntrustedError);
+      expect(error).toMatchObject({ path: realpathSync(above) });
+    }
+    expect(node.connections).toHaveLength(0);
+    // Bun's chmodSync drops the sticky bit (1.3.14), so chmod(1) sets it.
+    execFileSync("chmod", ["1777", above]);
+    await new FabricClient({ socketPath: node.socketPath }).hello();
+    expect(node.connections).toHaveLength(1);
+  });
+
+  // The same finding: a directory above the socket that another user owns is theirs to change. Making one takes
+  // root, so lstat reports the socket's own parent as another user's here.
+  test("rejects a directory above the socket that another user owns", async () => {
+    const above = realpathSync(tempDir());
+    const state = join(above, "state");
+    mkdirSync(state, { mode: 0o700 });
+    const node = await fakeNode(answers(), state);
+    mock.module("node:fs/promises", () => ({
+      ...REAL_FS_PROMISES,
+      async lstat(path: string) {
+        const stats = await REAL_FS_PROMISES.lstat(path);
+        return path === above ? Object.assign(Object.create(Object.getPrototypeOf(stats)), stats, { uid: 4242 }) : stats;
+      },
+    }));
+    cleanups.push(() => mock.module("node:fs/promises", () => REAL_FS_PROMISES));
+    const error = await rejection(new FabricClient({ socketPath: node.socketPath }).hello());
+    expect(error).toBeInstanceOf(UntrustedError);
+    expect(error).toMatchObject({ path: above });
+    expect(node.connections).toHaveLength(0);
+  });
+
+  // The same finding: a symlink on the way to the socket, here in a directory anyone may write, could be pointed at
+  // another user's socket after the checks passed. The client dials the directory the link named when it was
+  // resolved and checked, so the swap made right after the last check reaches nobody.
+  test("connects where the checks looked when a link on the way is swapped after them", async () => {
+    const reply = { type: "done", reply: { kind: "job_list", jobs: [], closed: [] } };
+    const node = async (): Promise<{ real: string; node: FakeNode }> => {
+      const real = tempDir();
+      mkdirSync(join(real, "state"), { mode: 0o700 });
+      return { real, node: await fakeNode(answers(reply), join(real, "state")) };
+    };
+    const checked = await node();
+    const swapped = await node();
+    const link = join(tempDir(0o777), "link");
+    symlinkSync(checked.real, link);
+    const lastCheck = join(realpathSync(checked.real), "state", "fabric.sock");
+    mock.module("node:fs/promises", () => ({
+      ...REAL_FS_PROMISES,
+      async lstat(path: string) {
+        const stats = await REAL_FS_PROMISES.lstat(path);
+        if (path === lastCheck) {
+          unlinkSync(link);
+          symlinkSync(swapped.real, link);
+        }
+        return stats;
+      },
+    }));
+    cleanups.push(() => mock.module("node:fs/promises", () => REAL_FS_PROMISES));
+    await new FabricClient({ socketPath: join(link, "state", "fabric.sock") }).jobList();
+    expect(checked.node.connections).toHaveLength(1);
+    expect(swapped.node.connections).toHaveLength(0);
+  });
+
+  // A link above the state directory is resolved, but the state directory itself stays refused as a link, as the
+  // node refuses its own (ADR 0016): whoever owns the link could point it elsewhere while the node runs.
+  test("rejects a state directory that is a symlink with Untrusted before connecting", async () => {
+    const node = await fakeNode(answers());
+    const link = join(tempDir(), "state");
+    symlinkSync(dirname(node.socketPath), link);
+    const error = await rejection(new FabricClient({ socketPath: join(link, "fabric.sock") }).hello());
+    expect(error).toBeInstanceOf(UntrustedError);
+    expect(error).toMatchObject({ path: link, reason: "is a symlink" });
+    expect(node.connections).toHaveLength(0);
+  });
+});
+
+describe("clientEnvFromProcess", () => {
+  // Review finding on PR #13: entries the shell resolves, such as `/opt/homebrew//bin`, were left out
+  // because they are not in the core's one text form. A relative entry or `.` would name a directory of
+  // the node's choosing, so it is left out, not sent; every absolute one is kept as written. The Rust
+  // test `the_client_env_keeps_every_absolute_entry_and_root_as_written` reads the same variables.
+  test("keeps every absolute PATH entry and root as written and leaves out the relative ones", () => {
+    const env = clientEnvFromProcess({
+      PATH: "/usr/local/bin/:.:bin::/opt/x/.git:/opt/homebrew//bin:/usr/bin/../bin:/cafe\u0301/bin://",
+      CARGO_HOME: "/Users/me//.cargo/",
+      RUSTUP_HOME: ".rustup",
+      PNPM_HOME: "",
+      HOME: "/Users/me",
+    });
+    expect(JSON.parse(JSON.stringify(env))).toStrictEqual({
+      path: ["/usr/local/bin/", "/opt/x/.git", "/opt/homebrew//bin", "/usr/bin/../bin", "/cafe\u0301/bin", "//"],
+      roots: { cargo_home: "/Users/me//.cargo/" },
+    });
+  });
+
+  // Review finding on PR #13: Node and Bun read `/opt/caf\xe9/bin` as `/opt/caf\ufffd/bin`, a directory
+  // that does not exist, and the node measured without the client's one. Rust's `ClientEnv::from_vars`
+  // fails on the bytes; here the U+FFFD they became fails the same way, naming the variable.
+  test("refuses an absolute PATH entry or root that holds U+FFFD, as Rust refuses one that is not UTF-8", () => {
+    const refusal = (vars: Record<string, string>): unknown => {
+      try {
+        clientEnvFromProcess(vars);
+      } catch (error) {
+        return error;
+      }
+      return undefined;
+    };
+    const entry = refusal({ PATH: "/usr/bin:/opt/caf\ufffd/bin:/bin" });
+    expect(entry).toBeInstanceOf(EnvError);
+    expect(entry).toMatchObject({ variable: "PATH", value: "/opt/caf\ufffd/bin" });
+    const root = refusal({ PATH: "/usr/bin", CARGO_HOME: "/home/\ufffd/.cargo" });
+    expect(root).toBeInstanceOf(EnvError);
+    expect(root).toMatchObject({ variable: "CARGO_HOME", value: "/home/\ufffd/.cargo" });
+    // A relative entry or root is left out before its text matters, as in Rust.
+    const relative = clientEnvFromProcess({ PATH: "caf\ufffd:/bin", PNPM_HOME: "pnpm\ufffd" });
+    expect(JSON.parse(JSON.stringify(relative))).toStrictEqual({
+      path: ["/bin"],
+      roots: {},
+    });
+  });
+});

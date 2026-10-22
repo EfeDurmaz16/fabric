@@ -1,0 +1,8 @@
+{
+  "kind": "failed",
+  "reason": {
+    "code": "peer",
+    "peer": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba"
+  },
+  "message": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba answered: no"
+}

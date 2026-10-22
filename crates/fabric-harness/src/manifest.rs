@@ -14,10 +14,10 @@ use std::path::Path;
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::path::{AbsPath, RelPath};
+use fabric_core::session::SessionId;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::{HarnessError, Input, IoOp};
-use crate::session::SessionId;
 
 /// The file name of the manifest inside a captured state tree.
 pub const MANIFEST_FILE: &str = "manifest.json";

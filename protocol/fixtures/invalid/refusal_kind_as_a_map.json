@@ -1,0 +1,12 @@
+{
+  "schema": "refusal",
+  "value": {
+    "kind": {
+      "failed": null
+    },
+    "reason": {
+      "code": "internal"
+    },
+    "message": "x"
+  }
+}

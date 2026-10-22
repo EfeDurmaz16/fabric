@@ -1,0 +1,23 @@
+{
+  "op": "job_resume",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "on": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+  "harness": {
+    "kind": "codex"
+  },
+  "force": true,
+  "env": {
+    "path": [
+      "/Users/me/.cargo/bin",
+      "/opt/homebrew/bin",
+      "/usr/bin",
+      "/bin"
+    ],
+    "roots": {
+      "cargo_home": "/Users/me/.cargo",
+      "rustup_home": "/Users/me/.rustup",
+      "pnpm_home": "/Users/me/Library/pnpm",
+      "xdg_data_home": "/Users/me/.local/share"
+    }
+  }
+}

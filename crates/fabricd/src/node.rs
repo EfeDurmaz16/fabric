@@ -15,7 +15,6 @@
 //! made one at a time, so this node never displaces a session it is using.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::OsString;
 use std::fs::{self, File};
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
@@ -23,6 +22,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use fabric_client::api::{Answer, ClientEnv, Event, Request};
 use fabric_core::id::{JobId, NodeId};
 use fabric_net::endpoint::{DialOrder, Endpoint};
 use fabric_net::identity::NodeIdentity;
@@ -35,11 +35,11 @@ use fabric_store::objects::ChunkParams;
 use fabric_store::store::{Store, StoreError};
 use tokio::net::UnixListener;
 
-use crate::control::{self, Request, Response};
 use crate::error::NodeError;
 use crate::harnesses::{HarnessConfig, HarnessEnv};
 use crate::job::Job;
 use crate::paths::StateDir;
+use crate::tool_env::ToolEnv;
 
 /// The longest Unix socket path every supported system binds: macOS allows 103 bytes.
 pub const MAX_SOCKET_PATH: usize = 104;
@@ -58,10 +58,10 @@ pub struct NodeConfig {
     pub listen: SocketAddr,
     /// Which wires a dial tries.
     pub dial: DialOrder,
-    /// The `PATH` the daemon was started with, for work no CLI asked for.
-    pub path_var: OsString,
-    /// `CARGO_HOME`, when set.
-    pub cargo_home: Option<PathBuf>,
+    /// The environment the daemon was started with, for work no client
+    /// asked for and for a request that sends none, until a local client
+    /// sends one.
+    pub env: ToolEnv,
 }
 
 /// A running node.
@@ -90,6 +90,9 @@ pub struct Node {
     /// Peers whose session began while start-up recovery ran; recovery
     /// catches up with each of them once it is done.
     pub(crate) waiting_catch_up: Mutex<BTreeSet<NodeId>>,
+    /// The environment the last local client sent, which the node uses
+    /// for work no client asks for (ADR 0018, The client's environment).
+    client_env: Mutex<Option<ClientEnv>>,
     _lock: File,
 }
 
@@ -146,6 +149,10 @@ impl Node {
         let control = UnixListener::bind(&socket).map_err(|e| NodeError::io(&socket, e))?;
 
         let version = VersionText::new(env!("CARGO_PKG_VERSION"))?;
+        let client_env = crate::local::read(&cfg.state.client_env()).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "the environment a client last sent does not read; the node uses its own until a client sends one");
+            None
+        });
         let node = Arc::new(Self {
             id: identity.node_id(),
             cfg,
@@ -164,6 +171,7 @@ impl Node {
             recovered: tokio::sync::watch::Sender::new(false),
             catching_up: Mutex::new(BTreeMap::new()),
             waiting_catch_up: Mutex::new(BTreeSet::new()),
+            client_env: Mutex::new(client_env),
             _lock: lock_file,
         });
         tracing::info!(node = %node.id, addr = ?node.local_addr().ok(), "node started");
@@ -200,7 +208,7 @@ impl Node {
                 accepted = control.accept() => match accepted {
                     Ok((stream, _)) => {
                         let node = Arc::clone(&self);
-                        tokio::spawn(Box::pin(node.serve_control(stream)));
+                        tokio::spawn(Box::pin(crate::control::serve(node, stream)));
                     }
                     Err(e) => tracing::warn!(error = %e, "control accept failed"),
                 },
@@ -208,48 +216,13 @@ impl Node {
         }
     }
 
-    async fn serve_control(self: Arc<Self>, mut stream: tokio::net::UnixStream) {
-        let me = rustix::process::geteuid().as_raw();
-        match stream.peer_cred() {
-            Ok(peer) if peer.uid() == me => {}
-            Ok(peer) => {
-                tracing::warn!(
-                    uid = peer.uid(),
-                    "refused a control connection from another user"
-                );
-                return;
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "refused a control connection whose user is unknown");
-                return;
-            }
-        }
-        let request = match control::read_request(&mut stream).await {
-            Ok(request) => request,
-            Err(e) => {
-                tracing::warn!(error = %e, "unreadable control request");
-                return;
-            }
-        };
-        let response = Box::pin(self.handle(request)).await;
-        if let Err(e) = control::write_response(&mut stream, &response).await {
-            tracing::warn!(error = %e, "control response not delivered");
-        }
-    }
-
-    async fn handle(self: &Arc<Self>, request: Request) -> Response {
-        let mut out = Out::default();
-        let result = Box::pin(self.dispatch(request, &mut out)).await;
-        match result {
-            Ok(None) => Response::Done { lines: out.lines },
-            Ok(Some(plan)) => Response::Run {
-                lines: out.lines,
-                plan: Box::new(plan),
-            },
-            Err(e) => Response::Failed {
-                lines: out.lines,
-                error: e.to_string(),
-                refusal: e.refusal(),
+    /// Runs one client request and answers with its reply or its refusal;
+    /// the events go to `out` as the command makes them.
+    pub(crate) async fn handle(self: &Arc<Self>, request: Request, mut out: Out) -> Answer {
+        match Box::pin(self.dispatch(request, &mut out)).await {
+            Ok(reply) => Answer::Done { reply },
+            Err(e) => Answer::Refused {
+                refusal: e.to_refusal(),
             },
         }
     }
@@ -418,11 +391,53 @@ impl Node {
             .ok_or(NodeError::UnknownJob(id))
     }
 
-    /// The adapters' environment for a request made with `path_var`.
-    pub(crate) fn harness_env(&self, path_var: &OsString) -> Result<HarnessEnv, NodeError> {
+    /// The node's environment, for work no client asked for, such as a
+    /// peer's pull or a peer's preflight, and for a request that sends
+    /// none: the one the last local client sent, kept across restarts, or
+    /// the daemon's own until a client sends one (ADR 0018, The client's
+    /// environment). The daemon's own is rarely the user's shell: measured
+    /// with it, a peer and this node's CLI compared the shell's
+    /// `CARGO_HOME` with the daemon's and rebuilt what they could carry
+    /// (review finding on PR #13).
+    ///
+    /// A kept environment loses every directory in a job's tree, checked
+    /// each time, since a workspace changes: the shell that sent it may
+    /// have had a job's virtualenv on its `PATH`, and the node would run
+    /// that workspace's programs for whichever peer asked next (review
+    /// finding on PR #13).
+    pub(crate) fn node_env(&self) -> ToolEnv {
+        let kept = lock(&self.client_env).clone();
+        kept.map_or_else(
+            || self.cfg.env.clone(),
+            |env| {
+                let trees = [
+                    crate::paths::home_jobs(&self.cfg.home),
+                    self.cfg.state.jobs(),
+                ];
+                ToolEnv::from(&crate::tool_env::outside(env, &trees))
+            },
+        )
+    }
+
+    /// Keeps `env`, which a local client sent, as the node's environment,
+    /// on disk too when it changed. A failure to write it is logged: the
+    /// request still runs in its own environment.
+    pub(crate) fn remember_env(&self, env: &ClientEnv) {
+        let mut kept = lock(&self.client_env);
+        if kept.as_ref() == Some(env) {
+            return;
+        }
+        if let Err(e) = crate::local::write(&self.cfg.state.client_env(), env) {
+            tracing::warn!(error = %e, "could not keep the environment a client sent");
+        }
+        *kept = Some(env.clone());
+    }
+
+    /// The adapters' environment for a request made in `env`.
+    pub(crate) fn harness_env(&self, env: &ToolEnv) -> Result<HarnessEnv, NodeError> {
         Ok(HarnessEnv::new(
             &self.cfg.home,
-            path_var.clone(),
+            env.path_var().to_owned(),
             self.harness_config.clone(),
         )?)
     }
@@ -462,7 +477,8 @@ fn open_store(dir: &std::path::Path) -> Result<Store, NodeError> {
 /// where the adapters keep departure records and the Claude config lock
 /// under `~/.fabric`, which is the state directory unless `FABRIC_HOME`
 /// names another.
-const STATE_ENTRIES: [&str; 10] = [
+const STATE_ENTRIES: [&str; 11] = [
+    "client-env",
     "daemon.lock",
     "fabric.sock",
     "harness",
@@ -666,16 +682,51 @@ fn load_jobs(state: &StateDir) -> Result<(Jobs, BTreeMap<JobId, String>), NodeEr
     Ok((jobs, broken))
 }
 
-/// The lines a command prints, one per step or choice.
+/// What a command reports as it runs, one typed event per step or choice
+/// (ADR 0018, Progress as typed events).
+///
+/// This is the one place a node makes events. A command run for a client
+/// streams each one to that client the moment it is made; work no client
+/// asked for, such as recovery or a peer's request, keeps them for its log.
+/// A live stream of every job's events (C2) is this sink made a broadcast.
 #[derive(Debug, Default)]
 pub(crate) struct Out {
-    pub(crate) lines: Vec<String>,
+    live: Option<tokio::sync::mpsc::UnboundedSender<Event>>,
+    /// The events kept when no client streams them.
+    pub(crate) events: Vec<Event>,
 }
 
 impl Out {
-    /// Adds a line.
-    pub(crate) fn say(&mut self, line: impl Into<String>) {
-        self.lines.push(line.into());
+    /// A sink that sends each event to a client's connection as it is made.
+    pub(crate) fn streaming(live: tokio::sync::mpsc::UnboundedSender<Event>) -> Self {
+        Self {
+            live: Some(live),
+            events: Vec::new(),
+        }
+    }
+
+    /// Reports an event.
+    pub(crate) fn emit(&mut self, event: Event) {
+        match &self.live {
+            // A client that left gets no more events; the command runs on.
+            Some(live) => {
+                let _ = live.send(event);
+            }
+            None => self.events.push(event),
+        }
+    }
+
+    /// The kept events as the lines the CLI prints for them, for the
+    /// node's log: an operator reading the log of `fabric serve` reads the
+    /// same sentences as before the client API, not the events' fields.
+    pub(crate) fn lines(&self) -> impl Iterator<Item = String> + '_ {
+        self.events.iter().flat_map(fabric_client::sentences::event)
+    }
+
+    /// The kept events' lines, collected, for a test to read.
+    #[cfg(test)]
+    pub(crate) fn said(&self) -> Vec<String> {
+        self.lines().collect()
     }
 }
 

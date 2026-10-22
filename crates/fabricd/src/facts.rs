@@ -12,11 +12,12 @@
 //! never leaves out (`crate::carry`).
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use fabric_client::api::Roots;
 use fabric_core::env::SetupStep;
 use fabric_core::harness::ProgramName;
 use fabric_core::path::{AbsPath, RelPath};
@@ -27,6 +28,7 @@ use fabric_net::wire::{FactName, FactValue, Facts, MAX_FACT_VALUE};
 use fabric_store::capture::CarryKeys;
 
 use crate::harnesses::HarnessEnv;
+use crate::tool_env::ToolEnv;
 
 /// How long one measuring command may run.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -120,14 +122,30 @@ impl NodeFacts {
         )
     }
 
-    /// Measures this node, looking programs up on `path_var`, git on this
-    /// process's own `PATH`, where restore runs it, and `lsof` where Codex
-    /// capture looks for it.
-    pub async fn measure(home: &Path, path_var: &OsString, cargo_home: Option<PathBuf>) -> Self {
-        let own_path = std::env::var_os("PATH").unwrap_or_default();
+    /// Measures this node with the tools `env` names: programs are looked
+    /// up on its `PATH` and run with its roots, each set to its value or
+    /// removed, never the daemon's own (ADR 0018, The client's environment).
+    /// git is measured on the daemon's own `PATH`, where restore runs it,
+    /// and `lsof` where Codex capture looks for it.
+    pub async fn measure(home: &Path, env: &ToolEnv) -> Self {
+        let inherited: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        Self::measure_from(home, env, &inherited).await
+    }
+
+    /// Measures as [`NodeFacts::measure`] does, with `inherited` as the
+    /// daemon's own environment: each tool starts from it, and `env`'s
+    /// `PATH` and roots then replace or remove what they name; git runs in
+    /// `inherited` alone.
+    async fn measure_from(home: &Path, env: &ToolEnv, inherited: &[(OsString, OsString)]) -> Self {
+        let own = ToolEnv::from_vars(|name| {
+            inherited
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        });
         let (mut facts, git) = tokio::join!(
-            Box::pin(Self::measure_tools(home, path_var, cargo_home)),
-            probe_command("git", &["--version"], Probe::Output, &own_path, home),
+            Box::pin(Self::measure_tools(home, env, inherited)),
+            probe_command("git", &["--version"], Probe::Output, &own, home, inherited),
         );
         if let Some(git) = git {
             facts.0.insert(name::GIT.to_owned(), git);
@@ -140,13 +158,11 @@ impl NodeFacts {
         facts
     }
 
-    /// Measures everything but git, looking programs up on `path_var`.
-    async fn measure_tools(home: &Path, path_var: &OsString, cargo_home: Option<PathBuf>) -> Self {
+    /// Measures everything but git with the tools `env` names.
+    async fn measure_tools(home: &Path, env: &ToolEnv, inherited: &[(OsString, OsString)]) -> Self {
         // Each probe is boxed, so the joined future holds 20 pointers, not 20 child processes.
         let run = |program: &'static str, args: &'static [&'static str], probe: Probe| {
-            let path_var = path_var.clone();
-            let home = home.to_owned();
-            Box::pin(async move { probe_command(program, args, probe, &path_var, &home).await })
+            Box::pin(probe_command(program, args, probe, env, home, inherited))
         };
         let (
             user,
@@ -224,8 +240,15 @@ impl NodeFacts {
         put(name::YARN, yarn);
         put(name::BUN, bun);
         put(name::RUSTC, rustc);
-        let cargo_home = cargo_home.unwrap_or_else(|| home.join(".cargo"));
-        put(name::CARGO_HOME, Some(cargo_home.display().to_string()));
+        put(
+            name::CARGO_HOME,
+            Some(
+                env.root(Roots::CARGO_HOME)
+                    .map_or_else(|| home.join(".cargo"), PathBuf::from)
+                    .display()
+                    .to_string(),
+            ),
+        );
         put(name::PYTHON, python);
         put(name::PYTHON_HOME, python_home);
         put(name::UV, uv);
@@ -298,11 +321,23 @@ async fn probe_command(
     program: &str,
     args: &[&str],
     probe: Probe,
-    path_var: &OsString,
+    env: &ToolEnv,
     home: &Path,
+    inherited: &[(OsString, OsString)],
 ) -> Option<String> {
+    let path_var = env.path_var();
     let binary = find_on_path(program, path_var)?;
-    let child = tokio::process::Command::new(binary)
+    let mut command = tokio::process::Command::new(binary);
+    command
+        .env_clear()
+        .envs(inherited.iter().map(|(k, v)| (k, v)));
+    for (name, value) in env.roots() {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
+    let child = command
         .args(args)
         .env("PATH", path_var)
         .env("HOME", home)
@@ -327,13 +362,16 @@ async fn probe_command(
     }
 }
 
-/// The first executable named `program` on `path_var`.
+/// The first executable named `program` on `path_var`, always an absolute path.
 ///
 /// A relative or empty entry is skipped, as the harness's own lookup
 /// skips it: it names a directory relative to the daemon's working
-/// directory here and to the workspace at launch, so the binary measured
-/// and the binary launched could differ.
-pub fn find_on_path(program: &str, path_var: &OsString) -> Option<PathBuf> {
+/// directory, which is wherever `fabric serve` started, not one the client
+/// chose, and relative to the workspace at launch, so the binary measured
+/// and the binary launched could differ. A client with no `PATH` sends an
+/// empty list, whose `PATH` value is the empty string, which a shell reads
+/// as the working directory (review finding on PR #13).
+pub fn find_on_path(program: &str, path_var: &OsStr) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     std::env::split_paths(path_var)
         .filter(|dir| dir.is_absolute())
@@ -675,7 +713,89 @@ fn manager_name(manager: NodeManager) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use fabric_client::api::{ClientEnv, PathDir, SystemPath};
+
     use super::*;
+
+    /// A tool in a directory the client's `PATH` names only relatively is
+    /// not found, and an empty entry, which an empty client `PATH` gives,
+    /// goes through the same filter: the node would resolve either against
+    /// its own working directory (review finding on PR #13).
+    #[test]
+    fn find_on_path_skips_relative_and_empty_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("tool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The test runs from the crate directory; a relative entry that
+        // reaches the tool from there must not count.
+        let cwd = std::env::current_dir().unwrap();
+        let up: PathBuf = cwd.components().skip(1).map(|_| "..").collect();
+        let relative = up.join(dir.path().strip_prefix("/").unwrap());
+        assert!(
+            relative.join("tool").exists(),
+            "the relative entry reaches the tool"
+        );
+        let var = std::env::join_paths([relative.as_path(), Path::new("")]).unwrap();
+        assert_eq!(find_on_path("tool", &var), None);
+        let var = std::env::join_paths([relative.as_path(), dir.path()]).unwrap();
+        assert_eq!(find_on_path("tool", &var), Some(tool));
+    }
+
+    /// Gate finding on PR #8: capture measured carry keys with the daemon's
+    /// `CARGO_HOME`, not the requesting CLI's. A request's roots reach the
+    /// facts and the tools measured, and a root it leaves unset is removed,
+    /// not taken from the daemon. The daemon here sets every root itself,
+    /// whatever the environment the test runs in, so a root taken from it
+    /// shows (review finding on PR #13: the check of removal passed only
+    /// when the test process had no `PNPM_HOME`).
+    #[tokio::test]
+    async fn facts_are_measured_in_the_environment_the_request_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let pnpm = bin.join("pnpm");
+        std::fs::write(
+            &pnpm,
+            "#!/bin/sh\ncase \"$1\" in\n--version) echo 9.9.9 ;;\nstore) echo \"${PNPM_HOME:-unset}/store\" ;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = vec![
+            PathDir::parse(bin.to_str().unwrap()).unwrap(),
+            PathDir::parse("/usr/bin").unwrap(),
+            PathDir::parse("/bin").unwrap(),
+        ];
+        let home = dir.path().join("home");
+        let daemon: Vec<(OsString, OsString)> = Roots::default()
+            .vars()
+            .iter()
+            .map(|(name, _)| ((*name).into(), format!("/daemon/{name}").into()))
+            .collect();
+        let client = ClientEnv {
+            path: path.clone(),
+            roots: Roots {
+                cargo_home: Some(SystemPath::parse("/client/cargo").unwrap()),
+                pnpm_home: Some(SystemPath::parse("/client/pnpm").unwrap()),
+                ..Roots::default()
+            },
+        };
+        let facts = NodeFacts::measure_from(&home, &ToolEnv::from(&client), &daemon).await;
+        assert_eq!(facts.get(name::CARGO_HOME), Some("/client/cargo"));
+        assert_eq!(facts.get(name::PNPM), Some("9.9.9"));
+        assert_eq!(facts.get(name::PNPM_STORE), Some("/client/pnpm/store"));
+
+        let bare = ClientEnv {
+            path,
+            roots: Roots::default(),
+        };
+        let facts = NodeFacts::measure_from(&home, &ToolEnv::from(&bare), &daemon).await;
+        let default_cargo = home.join(".cargo");
+        assert_eq!(facts.get(name::CARGO_HOME), default_cargo.to_str());
+        assert_eq!(facts.get(name::PNPM_STORE), Some("unset/store"));
+    }
 
     fn pro() -> NodeFacts {
         NodeFacts::from_pairs([
@@ -887,7 +1007,7 @@ mod tests {
             None
         );
         assert_eq!(
-            find_on_path("fabric-test-tool", &dir.path().as_os_str().to_owned()),
+            find_on_path("fabric-test-tool", dir.path().as_os_str()),
             Some(tool)
         );
     }

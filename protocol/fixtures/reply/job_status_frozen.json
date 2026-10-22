@@ -1,0 +1,30 @@
+{
+  "kind": "job_status",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "node": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+  "goal": "g",
+  "harness": {
+    "kind": "claude_code"
+  },
+  "owner": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+  "epoch": 2,
+  "view": {
+    "kind": "frozen",
+    "peer": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+    "epoch": 3
+  },
+  "snapshot": {
+    "id": "abababababababababababababababababababababababababababababababab",
+    "suspended": false
+  },
+  "workspace": {
+    "root": "/Users/me/fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/work",
+    "state": {
+      "kind": "orphan"
+    }
+  },
+  "process": {
+    "kind": "not_running"
+  },
+  "records": 8
+}

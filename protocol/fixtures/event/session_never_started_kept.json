@@ -1,0 +1,13 @@
+{
+  "kind": "session_never_started",
+  "harness": {
+    "kind": "codex"
+  },
+  "session": "019f233e-bb33-7342-85fa-f2d33b14368a",
+  "kept": {
+    "harness": {
+      "kind": "claude_code"
+    },
+    "session": "9c9796f0-2682-4546-a963-d314b3ad543f"
+  }
+}

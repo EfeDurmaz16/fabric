@@ -52,6 +52,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+use fabric_core::session::SessionId;
 use serde::Deserialize;
 use tracing::warn;
 
@@ -60,7 +61,6 @@ use crate::harness::ModelName;
 pub(crate) use crate::harness::Recorded;
 use crate::jsontext;
 use crate::redact::Redactor;
-use crate::session::SessionId;
 use crate::version::HarnessVersion;
 
 use super::overrides::{ApprovalPolicy, ApprovalsReviewer, Effort, ProviderId, SandboxMode};

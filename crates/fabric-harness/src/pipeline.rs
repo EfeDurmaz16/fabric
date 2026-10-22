@@ -33,6 +33,7 @@ use tracing::warn;
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::path::AbsPath;
+use fabric_core::session::SessionId;
 
 use crate::crashpoint::crashpoint;
 use crate::denylist;
@@ -43,7 +44,6 @@ use crate::harness::Restored;
 use crate::manifest::{Carried, Content, Mutability, StateManifest};
 use crate::place::{self, Placement};
 use crate::redact::RedactionCounts;
-use crate::session::SessionId;
 use crate::stage::{self, Source};
 
 /// Checks that `workspace` is an absolute directory and returns its

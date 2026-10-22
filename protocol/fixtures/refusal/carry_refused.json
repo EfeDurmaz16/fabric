@@ -1,0 +1,11 @@
+{
+  "kind": "needs_force",
+  "reason": {
+    "code": "carry_refused",
+    "paths": [
+      "node_modules"
+    ],
+    "more": 0
+  },
+  "message": "the preflight refused the move: the target can neither use nor rebuild node_modules; `fabric job move` and `fabric job resume` take --force to waive what can be waived"
+}

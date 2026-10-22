@@ -1,0 +1,14 @@
+{
+  "kind": "known_writer_unknown",
+  "owner": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+  "error": {
+    "kind": "failed",
+    "reason": {
+      "code": "peer_ahead",
+      "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+      "peer": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+      "epoch": 3
+    },
+    "message": "it knows epoch 3, newer than this node's"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "kind": "failed",
+  "reason": {
+    "code": "move_stale",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "peer": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+    "epoch": 5
+  },
+  "message": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba answered: the move is at an epoch behind 5"
+}

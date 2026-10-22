@@ -1,0 +1,8 @@
+{
+  "schema": "request",
+  "value": {
+    "op": "job_steal",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "reason": ""
+  }
+}

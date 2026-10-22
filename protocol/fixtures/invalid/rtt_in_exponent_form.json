@@ -1,0 +1,10 @@
+{
+  "schema": "reply",
+  "value": {
+    "kind": "node_ping",
+    "node": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+    "rtt_ms": 1e0,
+    "wire": "quic",
+    "clock_skew_ms": -340
+  }
+}

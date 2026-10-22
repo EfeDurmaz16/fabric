@@ -1,0 +1,20 @@
+{
+  "kind": "preflight",
+  "peer": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+  "rows": [
+    {
+      "fact": "user",
+      "here": "me",
+      "peer": "me",
+      "outcome": "equal",
+      "note": ""
+    },
+    {
+      "fact": "claude",
+      "here": "2.1.3 (Claude Code)",
+      "peer": "2.1.2 (Claude Code)",
+      "outcome": "refuse",
+      "note": "the job's harness must be the same version on both nodes (ADR 0008)"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "kind": "harness_started",
+  "epoch": 2,
+  "harness": {
+    "kind": "claude_code"
+  },
+  "pid": 4242
+}

@@ -14,7 +14,7 @@
 mod carry;
 mod catchup;
 mod clock;
-pub mod control;
+mod control;
 mod doctor;
 mod durable;
 pub mod error;
@@ -29,4 +29,5 @@ mod ops;
 pub mod paths;
 mod service;
 mod stamp;
+pub mod tool_env;
 mod transfer;

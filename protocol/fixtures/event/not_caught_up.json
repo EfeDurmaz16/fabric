@@ -1,0 +1,12 @@
+{
+  "kind": "not_caught_up",
+  "peer": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+  "error": {
+    "kind": "failed",
+    "reason": {
+      "code": "peer",
+      "peer": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba"
+    },
+    "message": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba answered: bad request"
+  }
+}

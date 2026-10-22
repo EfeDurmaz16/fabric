@@ -1,0 +1,7 @@
+{
+  "schema": "event",
+  "value": {
+    "kind": "stopping_harness",
+    "pid": 4E3
+  }
+}

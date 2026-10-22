@@ -1,0 +1,10 @@
+{
+  "schema": "hello_answer",
+  "value": {
+    "type": "welcome",
+    "api": 1,
+    "node": "fab1",
+    "node_version": "0.1.0",
+    "capabilities": []
+  }
+}

@@ -29,6 +29,19 @@ cargo deny check
 scripts/check-hygiene.sh origin/main
 ```
 
+The TypeScript SDK in `sdk/typescript` needs Bun, and Node 22 with npm on
+`PATH` for its package test. Its end-to-end test runs against a node built
+from your tree:
+
+```sh
+cargo build -p fabric --locked
+cd sdk/typescript
+bun install --frozen-lockfile
+bun run typecheck
+bun run build
+FABRIC_BIN="$PWD/../../target/debug/fabric" bun test
+```
+
 `scripts/check-hygiene.sh` fails on an em dash or an AI attribution line in any
 tracked file or in any commit message on the branch, from any directory in the
 repository. `scripts/test-check-hygiene.sh` proves it fires; CI runs it first.

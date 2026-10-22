@@ -1,0 +1,6 @@
+{
+  "op": "job_decide",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "decision": "approve",
+  "note": "ship it"
+}

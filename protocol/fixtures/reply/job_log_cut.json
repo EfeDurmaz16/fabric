@@ -1,0 +1,15 @@
+{
+  "kind": "job_log",
+  "left_out": 4,
+  "records": [
+    {
+      "id": "01JC0000000000000000000004",
+      "epoch": 1,
+      "at": 1760000004000,
+      "event": {
+        "kind": "decision_recorded",
+        "text": "approved: nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn"
+      }
+    }
+  ]
+}

@@ -51,6 +51,7 @@ use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fabric_core::env::EnvVarName;
+use fabric_core::version::version_token;
 use tokio::process::{Child, Command};
 
 use crate::error::HarnessError;
@@ -258,20 +259,6 @@ pub(crate) async fn installed_version_in(
             None
         }
     }
-}
-
-/// Returns the first token of `output` that looks like `digits.digits...`.
-#[must_use]
-pub(crate) fn version_token(output: &str) -> Option<&str> {
-    output.split_whitespace().find(|token| {
-        let mut parts = token.split('.');
-        let first = parts.next().unwrap_or("");
-        !first.is_empty()
-            && first.bytes().all(|b| b.is_ascii_digit())
-            && parts
-                .next()
-                .is_some_and(|second| second.bytes().next().is_some_and(|b| b.is_ascii_digit()))
-    })
 }
 
 /// How a spawned process's stdio is wired.
@@ -658,15 +645,6 @@ mod tests {
             "writing {} failed: {status}",
             path.display()
         );
-    }
-
-    #[test]
-    fn version_token_finds_the_number() {
-        assert_eq!(version_token("2.1.294 (Claude Code)"), Some("2.1.294"));
-        assert_eq!(version_token("codex-cli 0.155.1"), Some("0.155.1"));
-        assert_eq!(version_token("fake 1.2"), Some("1.2"));
-        assert_eq!(version_token("no version here"), None);
-        assert_eq!(version_token(""), None);
     }
 
     #[test]

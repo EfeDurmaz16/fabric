@@ -1,0 +1,11 @@
+{
+  "op": "job_suspend",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "env": {
+    "path": [
+      "/usr/bin",
+      "/bin"
+    ],
+    "roots": {}
+  }
+}

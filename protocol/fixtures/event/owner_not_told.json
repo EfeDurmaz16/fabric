@@ -1,0 +1,12 @@
+{
+  "kind": "owner_not_told",
+  "owner": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+  "error": {
+    "kind": "unreachable",
+    "reason": {
+      "code": "unknown_peer",
+      "node": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba"
+    },
+    "message": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba is not paired with an address; run `fabric node add fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba <host:port>`"
+  }
+}

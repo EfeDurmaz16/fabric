@@ -1,0 +1,10 @@
+{
+  "kind": "job_state",
+  "reason": {
+    "code": "harness_not_recorded",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "pid": 4242,
+    "session": "019f233e-bb33-7342-85fa-f2d33b14368a"
+  },
+  "message": "not recorded"
+}

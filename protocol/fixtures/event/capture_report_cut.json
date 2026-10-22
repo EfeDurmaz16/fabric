@@ -1,0 +1,14 @@
+{
+  "kind": "capture_report",
+  "groups": [
+    {
+      "note": "secret",
+      "items": [
+        ".env.0",
+        ".env.1",
+        ".env.2"
+      ],
+      "more": 480
+    }
+  ]
+}

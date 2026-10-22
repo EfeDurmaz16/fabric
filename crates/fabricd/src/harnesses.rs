@@ -14,10 +14,11 @@ use std::path::{Path, PathBuf};
 
 use fabric_core::harness::{HarnessKind, ProgramName};
 use fabric_core::path::{AbsPath, PathError};
+use fabric_core::version::HarnessVersion;
+use fabric_harness::Harness;
 use fabric_harness::acp::AcpHarness;
 use fabric_harness::claude::ClaudeCode;
 use fabric_harness::codex::Codex;
-use fabric_harness::{Harness, HarnessVersion};
 use serde::{Deserialize, Serialize};
 
 /// Why a harness could not be named or configured.
@@ -148,6 +149,40 @@ pub struct HarnessConfig {
     /// ACP agents by program name.
     #[serde(default)]
     pub acp: BTreeMap<String, AcpConfig>,
+}
+
+impl From<&HarnessConfig> for fabric_client::api::HarnessConfig {
+    fn from(config: &HarnessConfig) -> Self {
+        Self {
+            acp: config
+                .acp
+                .iter()
+                .map(|(program, acp)| {
+                    let settings = fabric_client::api::AcpSettings {
+                        state_dir: acp.state_dir.clone(),
+                    };
+                    (program.clone(), settings)
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<fabric_client::api::HarnessConfig> for HarnessConfig {
+    fn from(config: fabric_client::api::HarnessConfig) -> Self {
+        Self {
+            acp: config
+                .acp
+                .into_iter()
+                .map(|(program, settings)| {
+                    let acp = AcpConfig {
+                        state_dir: settings.state_dir,
+                    };
+                    (program, acp)
+                })
+                .collect(),
+        }
+    }
 }
 
 impl HarnessConfig {

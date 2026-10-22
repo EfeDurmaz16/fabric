@@ -1,0 +1,10 @@
+{
+  "kind": "not_owner",
+  "reason": {
+    "code": "departed",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "owner": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+    "epoch": 3
+  },
+  "message": "job departed"
+}

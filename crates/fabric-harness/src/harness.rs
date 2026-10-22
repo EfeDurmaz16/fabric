@@ -12,11 +12,11 @@ use std::path::{Path, PathBuf};
 use fabric_core::BoxFuture;
 use fabric_core::env::EnvVarName;
 use fabric_core::harness::HarnessKind;
+use fabric_core::session::SessionId;
 use tokio::process::Child;
 
 use crate::error::HarnessError;
 use crate::manifest::StateManifest;
-use crate::session::SessionId;
 
 /// An installed harness binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +177,7 @@ pub struct PassedSetting {
 }
 
 /// The most characters of a recorded value a report shows.
+#[cfg(any(feature = "claude", feature = "codex"))]
 const SHOWN_VALUE_LEN: usize = 64;
 
 /// A setting the session records, or the adapter was configured with
@@ -198,6 +199,7 @@ pub struct NotCarried {
 /// after a cut, and every control character replaced by `?`. Text that
 /// comes from a file that travelled goes through this before an error or
 /// a note prints it.
+#[cfg(any(feature = "claude", feature = "codex"))]
 pub(crate) fn shown(text: &str) -> String {
     let mut shown: String = text
         .chars()

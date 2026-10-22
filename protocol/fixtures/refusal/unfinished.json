@@ -1,0 +1,9 @@
+{
+  "kind": "job_state",
+  "reason": {
+    "code": "unfinished",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "step": "suspend"
+  },
+  "message": "a suspend did not finish"
+}

@@ -107,6 +107,7 @@ use fabric_core::BoxFuture;
 use fabric_core::env::EnvVarName;
 use fabric_core::harness::HarnessKind;
 use fabric_core::path::AbsPath;
+use fabric_core::session::SessionId;
 use tracing::{info, warn};
 
 use crate::error::{HarnessError, Input, IoOp};
@@ -116,7 +117,6 @@ use crate::pipeline::{self, Capturer, Destination};
 use crate::place::{self, Relation};
 use crate::process;
 use crate::redact::RedactionCounts;
-use crate::session::SessionId;
 use crate::stage::{Carry, Source};
 use crate::version::HarnessVersion;
 

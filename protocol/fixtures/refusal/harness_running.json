@@ -1,0 +1,9 @@
+{
+  "kind": "job_state",
+  "reason": {
+    "code": "harness_running",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "pid": 4242
+  },
+  "message": "a harness runs as pid 4242"
+}

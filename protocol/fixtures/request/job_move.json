@@ -1,0 +1,20 @@
+{
+  "op": "job_move",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "to": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+  "force": false,
+  "env": {
+    "path": [
+      "/Users/me/.cargo/bin",
+      "/opt/homebrew/bin",
+      "/usr/bin",
+      "/bin"
+    ],
+    "roots": {
+      "cargo_home": "/Users/me/.cargo",
+      "rustup_home": "/Users/me/.rustup",
+      "pnpm_home": "/Users/me/Library/pnpm",
+      "xdg_data_home": "/Users/me/.local/share"
+    }
+  }
+}

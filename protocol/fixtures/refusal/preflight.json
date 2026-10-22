@@ -1,0 +1,11 @@
+{
+  "kind": "needs_force",
+  "reason": {
+    "code": "preflight",
+    "facts": [
+      "claude",
+      "home"
+    ]
+  },
+  "message": "the preflight refused the move: claude, home"
+}

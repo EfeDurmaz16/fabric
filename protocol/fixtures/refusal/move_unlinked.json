@@ -1,0 +1,10 @@
+{
+  "kind": "failed",
+  "reason": {
+    "code": "move_unlinked",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "peer": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+    "head": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+  },
+  "message": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba answered: its move does not link to this node's head cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd; run the resume again"
+}

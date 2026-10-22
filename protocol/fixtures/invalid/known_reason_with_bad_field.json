@@ -1,0 +1,11 @@
+{
+  "schema": "refusal",
+  "value": {
+    "kind": "not_owner",
+    "reason": {
+      "code": "unknown_job",
+      "job": "nope"
+    },
+    "message": "x"
+  }
+}

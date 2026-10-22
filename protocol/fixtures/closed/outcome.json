@@ -1,0 +1,7 @@
+[
+  "equal",
+  "fallback",
+  "refuse",
+  "refuse_always",
+  "warn"
+]

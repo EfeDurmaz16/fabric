@@ -35,7 +35,6 @@ pub(crate) mod pipeline;
 pub(crate) mod place;
 pub(crate) mod process;
 pub(crate) mod redact;
-mod session;
 pub(crate) mod stage;
 mod version;
 
@@ -51,5 +50,3 @@ pub use harness::{
     Harness, Installed, Launch, LaunchSettings, MAX_MODEL_NAME_LEN, ModelName, ModelNameError,
     NotCarried, Origin, PassedSetting, Restored, Running, SettingName, TurnReport,
 };
-pub use session::{MAX_SESSION_ID_LEN, SessionId, SessionIdError};
-pub use version::{HarnessVersion, VersionError};

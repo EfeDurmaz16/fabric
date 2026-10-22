@@ -3,7 +3,8 @@
 //!
 //! Every command but `serve` is a client of the node daemon on this
 //! machine: it sends one request over the control socket in the state
-//! directory and prints the lines the daemon answers with. The one thing
+//! directory through `fabric-client` (ADR 0018) and prints the node's
+//! typed events and reply as lines (`render`) as they arrive. The one thing
 //! the CLI does itself is the harness, because an interactive agent needs
 //! the user's terminal and the user's shell environment and a daemon has
 //! neither (ADR 0003, Who supervises the harness): it materializes the
@@ -29,25 +30,26 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use fabric_client::api::{
+    ClientEnv, Decision, DoctorReport, Event, RefusalKind, Reply, Request, RunPlan, SystemPath,
+};
+use fabric_client::{Client, ClientError, Launched, Started};
 use fabric_core::env::{EnvVarName, SetupArg};
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{EnvSpecId, JobId, NodeId};
+use fabric_core::session::SessionId;
 use fabric_env::materialize::{CacheHealth, MaterializeError, NodeEnv, TreeLock};
 use fabric_harness::claude::{ClaudeCode, LeftReason, TrustOutcome};
 use fabric_harness::codex::Codex;
-use fabric_harness::{
-    Harness, Launch, LaunchSettings, Origin, PassedSetting, Running, SessionId, TurnReport,
-};
+use fabric_harness::{Harness, Launch, LaunchSettings, Origin, PassedSetting, Running, TurnReport};
 use fabric_net::endpoint::DialOrder;
-use fabricd::control::{
-    self, ControlError, Decision, NO_DAEMON_EXIT, NamedSession, Refusal, Request, Response,
-    RunPlan, StartedHarness,
-};
 use fabricd::harnesses::{HarnessEnv, acp_adapter, parse_harness};
 use fabricd::node::{Node, NodeConfig};
 use fabricd::paths::{STATE_DIR_ENV, StateDir};
+use fabricd::tool_env::ToolEnv;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+mod render;
 mod terminal;
 
 /// Move a development job between your machines and harnesses.
@@ -248,6 +250,11 @@ fn path_var() -> OsString {
     std::env::var_os("PATH").unwrap_or_default()
 }
 
+/// The client of the node that serves `state`.
+fn client(state: &StateDir) -> Client {
+    Client::new(state.socket()).named(format!("fabric/{}", env!("CARGO_PKG_VERSION")))
+}
+
 /// Where `fabric` prints its own lines: standard output, or standard
 /// error for a headless run, whose standard output carries only the
 /// harness's answer and the line naming the session, for a script to read.
@@ -273,11 +280,40 @@ impl Notes {
     }
 }
 
-/// A refusal the daemon answered, kept typed so `main` can pick the exit code.
+/// A refusal, kept typed so `main` can pick the exit code.
 #[derive(Debug)]
 struct Refused {
-    refusal: Refusal,
+    refusal: RefusalKind,
     message: String,
+}
+
+impl Refused {
+    /// The refusal the node answered with its sentence; any other client error as it is.
+    fn from_client(error: ClientError) -> anyhow::Error {
+        match error {
+            ClientError::Refused(refusal) => Refused {
+                refusal: refusal.kind(),
+                message: refusal.message().to_owned(),
+            }
+            .into(),
+            other => other.into(),
+        }
+    }
+}
+
+/// The exit code of a command that found no daemon to answer it.
+const NO_DAEMON_EXIT: u8 = 80;
+
+/// The exit code for a refusal of `kind` (ADR 0016, Exit codes).
+fn refusal_exit(kind: RefusalKind) -> u8 {
+    match kind {
+        RefusalKind::NotOwner => 81,
+        RefusalKind::Frozen => 82,
+        RefusalKind::Unreachable => 83,
+        RefusalKind::NeedsForce => 84,
+        RefusalKind::JobState => 85,
+        RefusalKind::Failed => 1,
+    }
 }
 
 impl fmt::Display for Refused {
@@ -291,38 +327,58 @@ impl std::error::Error for Refused {}
 /// The exit code for an error that ended a command.
 fn exit_code(error: &anyhow::Error) -> ExitCode {
     if let Some(refused) = error.downcast_ref::<Refused>() {
-        return ExitCode::from(refused.refusal.exit_code());
+        return ExitCode::from(refusal_exit(refused.refusal));
     }
-    if let Some(ControlError::NoDaemon { .. }) = error.downcast_ref::<ControlError>() {
+    if let Some(ClientError::NoDaemon { .. }) = error.downcast_ref::<ClientError>() {
         return ExitCode::from(NO_DAEMON_EXIT);
     }
     ExitCode::FAILURE
 }
 
-/// Sends a request and prints what the daemon printed; a refusal becomes an error.
-async fn ask(socket: &Path, request: Request, notes: Notes) -> Result<Option<RunPlan>> {
-    match control::call(socket, &request).await? {
-        Response::Done { lines } => {
-            notes.print(&lines)?;
-            Ok(None)
-        }
-        Response::Run { lines, plan } => {
-            notes.print(&lines)?;
-            Ok(Some(*plan))
-        }
-        Response::Failed {
-            lines,
-            error,
-            refusal,
-        } => {
-            notes.print(&lines)?;
-            Err(Refused {
-                refusal,
-                message: error,
-            }
-            .into())
+/// Prints each event of a call as it arrives, keeping the first failure to print.
+struct Printer {
+    notes: Notes,
+    failed: Option<anyhow::Error>,
+}
+
+impl Printer {
+    fn new(notes: Notes) -> Self {
+        Self {
+            notes,
+            failed: None,
         }
     }
+
+    fn print(&mut self, event: &Event) {
+        if let Err(e) = self.notes.print(&render::event(event)) {
+            self.failed.get_or_insert(e);
+        }
+    }
+
+    /// The first failure to print, if any.
+    fn finish(self) -> Result<()> {
+        self.failed.map_or(Ok(()), Err)
+    }
+}
+
+/// Sends a request, printing each event as it arrives and then the reply;
+/// a refusal becomes an error.
+async fn ask(client: &Client, request: &Request, notes: Notes) -> Result<Reply> {
+    let mut printer = Printer::new(notes);
+    let answered = client.call(request, |event| printer.print(&event)).await;
+    printer.finish()?;
+    let reply = answered.map_err(Refused::from_client)?;
+    notes.print(&render::reply(&reply))?;
+    if let Reply::JobStatus(status) = &reply
+        && let Some(error) = render::first_unreadable(status)
+    {
+        return Err(Refused {
+            refusal: RefusalKind::Failed,
+            message: error.to_owned(),
+        }
+        .into());
+    }
+    Ok(reply)
 }
 
 /// Parses the command line, runs the command and returns the exit code.
@@ -361,7 +417,7 @@ pub fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<ExitCode> {
     let home = home()?;
     let state = state_dir(&home)?;
-    let socket = state.socket();
+    let client = client(&state);
     match cli.command {
         Command::Serve(args) => serve(state, home, args).await,
         Command::Node(command) => {
@@ -371,20 +427,29 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 NodeCommand::Ls => Request::NodeList,
                 NodeCommand::Ping { node } => Request::NodePing { node },
             };
-            ask(&socket, request, Notes::Stdout).await?;
+            ask(&client, &request, Notes::Stdout).await?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Doctor { peer, job } => {
-            ask(
-                &socket,
-                Request::Doctor {
-                    peer,
-                    job,
-                    path_var: path_var(),
-                },
-                Notes::Stdout,
-            )
-            .await?;
+            let request = Request::Doctor {
+                peer,
+                job,
+                env: Some(ClientEnv::current()?),
+            };
+            let reply = ask(&client, &request, Notes::Stdout).await?;
+            // The node reports; a row or a path that would stop a move
+            // still fails the command, as a preflight does.
+            if let Reply::Doctor {
+                report: DoctorReport::Compared { rows, carry, .. },
+            } = &reply
+                && let Some(message) = render::refused_move(rows, carry.as_ref())
+            {
+                return Err(Refused {
+                    refusal: RefusalKind::NeedsForce,
+                    message,
+                }
+                .into());
+            }
             Ok(ExitCode::SUCCESS)
         }
         Command::Job(command) => job(&state, &home, command).await,
@@ -402,8 +467,7 @@ async fn serve(state: StateDir, home: PathBuf, args: ServeArgs) -> Result<ExitCo
         home,
         listen: args.listen,
         dial,
-        path_var: path_var(),
-        cargo_home: std::env::var_os("CARGO_HOME").map(PathBuf::from),
+        env: ToolEnv::current(),
     })?;
     {
         let mut stdout = std::io::stdout().lock();
@@ -421,40 +485,53 @@ async fn serve(state: StateDir, home: PathBuf, args: ServeArgs) -> Result<ExitCo
 }
 
 async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitCode> {
-    let socket = state.socket();
-    let mut yes = false;
-    let (request, mode) = match command {
+    let client = client(state);
+    let (request, mode, yes) = job_request(command)?;
+    let (Reply::JobRun(plan) | Reply::JobResume(plan)) =
+        ask(&client, &request, mode.notes()).await?
+    else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    let approval = Approval {
+        record: state.job(plan.job).env_spec_ran(),
+        yes,
+        ask: &ask_on_terminal,
+    };
+    launch(state, home, &client, &plan, mode, &approval).await
+}
+
+/// The request a job command sends, how a harness it launches runs, and
+/// whether `--yes` lets setup steps this node has not approved run without asking.
+fn job_request(command: JobCommand) -> Result<(Request, Mode, bool)> {
+    let env = || ClientEnv::current().map(Some);
+    Ok(match command {
         JobCommand::New {
             repo,
             goal,
             harness,
-        } => {
-            let repo = std::fs::canonicalize(&repo)
-                .with_context(|| format!("repository {}", repo.display()))?;
-            (
-                Request::JobNew {
-                    repo,
-                    goal,
-                    harness,
-                },
-                Mode::Interactive(None),
-            )
-        }
+        } => (
+            Request::JobNew {
+                repo: repository(&repo)?,
+                goal,
+                harness,
+            },
+            Mode::Interactive(None),
+            false,
+        ),
         JobCommand::Run {
             job,
             prompt,
             headless,
-            yes: given,
-        } => {
-            yes = given;
-            (Request::JobRun { job }, Mode::new(prompt, headless)?)
-        }
+            yes,
+        } => (
+            Request::JobRun { job, env: env()? },
+            Mode::new(prompt, headless)?,
+            yes,
+        ),
         JobCommand::Suspend { job } => (
-            Request::JobSuspend {
-                job,
-                path_var: path_var(),
-            },
+            Request::JobSuspend { job, env: env()? },
             Mode::Interactive(None),
+            false,
         ),
         JobCommand::Resume {
             job,
@@ -463,36 +540,36 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
             prompt,
             headless,
             force,
-            yes: given,
-        } => {
-            yes = given;
-            (
-                Request::JobResume {
-                    job,
-                    on,
-                    harness,
-                    force,
-                    path_var: path_var(),
-                },
-                Mode::new(prompt, headless)?,
-            )
-        }
+            yes,
+        } => (
+            Request::JobResume {
+                job,
+                on,
+                harness,
+                force,
+                env: env()?,
+            },
+            Mode::new(prompt, headless)?,
+            yes,
+        ),
         JobCommand::Move { job, to, force } => (
             Request::JobMove {
                 job,
                 to,
                 force,
-                path_var: path_var(),
+                env: env()?,
             },
             Mode::Interactive(None),
+            false,
         ),
         JobCommand::Steal { job, force, reason } => (
             Request::JobSteal { job, reason, force },
             Mode::Interactive(None),
+            false,
         ),
-        JobCommand::Status { job } => (Request::JobStatus { job }, Mode::Interactive(None)),
-        JobCommand::Ls => (Request::JobList, Mode::Interactive(None)),
-        JobCommand::Log { job } => (Request::JobLog { job }, Mode::Interactive(None)),
+        JobCommand::Status { job } => (Request::JobStatus { job }, Mode::Interactive(None), false),
+        JobCommand::Ls => (Request::JobList, Mode::Interactive(None), false),
+        JobCommand::Log { job } => (Request::JobLog { job }, Mode::Interactive(None), false),
         JobCommand::Approve { job, note } => (
             Request::JobDecide {
                 job,
@@ -500,6 +577,7 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
                 note,
             },
             Mode::Interactive(None),
+            false,
         ),
         JobCommand::Reject { job, note } => (
             Request::JobDecide {
@@ -508,17 +586,24 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
                 note,
             },
             Mode::Interactive(None),
+            false,
         ),
-    };
-    let Some(plan) = ask(&socket, request, mode.notes()).await? else {
-        return Ok(ExitCode::SUCCESS);
-    };
-    let approval = Approval {
-        record: state.job(plan.job).env_spec_ran(),
-        yes,
-        ask: &ask_on_terminal,
-    };
-    launch(state, home, &plan, mode, &approval).await
+    })
+}
+
+/// The repository `fabric job new` names, as the absolute path the client API carries.
+fn repository(repo: &Path) -> Result<SystemPath> {
+    let canonical =
+        std::fs::canonicalize(repo).with_context(|| format!("repository {}", repo.display()))?;
+    canonical
+        .to_str()
+        .and_then(|text| SystemPath::parse(text).ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "repository {} is not a UTF-8 path, which the client API cannot carry",
+                canonical.display()
+            )
+        })
 }
 
 /// How the harness runs: attached to this terminal, or for one turn without one.
@@ -559,6 +644,7 @@ type ReadLine = fn(&mut TurnReport, &str) -> bool;
 async fn launch(
     state: &StateDir,
     home: &Path,
+    client: &Client,
     plan: &RunPlan,
     mode: Mode,
     approval: &Approval<'_>,
@@ -570,8 +656,7 @@ async fn launch(
         // The protocol client holds an ACP agent's output.
         _ => None,
     };
-    let tree = prepare(state, home, plan, notes, approval).await?;
-    let socket = state.socket();
+    let tree = prepare(state, home, client, plan, notes, approval).await?;
     let headless = matches!(mode, Mode::Headless(_));
     let env = environment();
     // Caught from before the harness starts: until the node records it, the
@@ -594,7 +679,7 @@ async fn launch(
     let said = settings_lines(&plan.harness, plan.session.as_ref(), running.settings());
     let registered = match notes.print(&said) {
         Ok(()) => tokio::select! {
-            registered = register(&socket, plan, &running, notes) => registered,
+            registered = register(client, plan, &running, notes) => registered,
             signal = interrupts.next() => {
                 kill_group(&running);
                 return interrupted(signal, plan);
@@ -609,7 +694,7 @@ async fn launch(
     }
     if let Some(read_line) = read_line {
         let turn = Turn {
-            socket: &socket,
+            client,
             plan,
             notes,
             read_line,
@@ -622,7 +707,7 @@ async fn launch(
         // script that reads the session line finds the harness no longer
         // recorded, and hears of it even when the answer cannot be printed,
         // as after the hang-up of the terminal that would have shown it.
-        let code = exited(&socket, plan, pid, status, &mut interrupts).await?;
+        let code = exited(client, plan, pid, status, &mut interrupts).await?;
         print_turn(plan, &report)?;
         return Ok(code);
     }
@@ -634,14 +719,14 @@ async fn launch(
                 let error = anyhow!(
                     "the terminal could not be given to the harness ({e}), so it was stopped before it ran"
                 );
-                return Err(abandon(&socket, plan, &mut running, &mut interrupts, error).await);
+                return Err(abandon(client, plan, &mut running, &mut interrupts, error).await);
             }
         }
     } else {
         None
     };
     if let Err(e) = running.release() {
-        return Err(abandon(&socket, plan, &mut running, &mut interrupts, e.into()).await);
+        return Err(abandon(client, plan, &mut running, &mut interrupts, e.into()).await);
     }
     let status = if headless {
         // An agent run headless gets no signal of a terminal either, so
@@ -656,7 +741,7 @@ async fn launch(
         }
     };
     drop(handed);
-    let code = exited(&socket, plan, pid, status, &mut interrupts).await?;
+    let code = exited(client, plan, pid, status, &mut interrupts).await?;
     if headless {
         print_turn(
             plan,
@@ -674,7 +759,7 @@ async fn launch(
 /// signal stops the wait for the node, which finds the group gone at its
 /// next look.
 async fn abandon(
-    socket: &Path,
+    client: &Client,
     plan: &RunPlan,
     running: &mut Running,
     interrupts: &mut Interrupts,
@@ -684,14 +769,10 @@ async fn abandon(
     if let Err(e) = running.child_mut().wait().await {
         tracing::warn!(error = %e, "the stopped harness could not be reaped");
     }
-    let request = Request::HarnessExited {
-        job: plan.job,
-        pid: running.pid(),
-    };
     tokio::select! {
-        told = control::call(socket, &request) => {
-            if !matches!(told, Ok(Response::Done { .. })) {
-                tracing::warn!(?told, "the node did not record that the stopped harness exited");
+        told = client.harness_exited(plan.job, running.pid(), |_| {}) => {
+            if let Err(e) = told {
+                tracing::warn!(error = %e, "the node did not record that the stopped harness exited");
             }
         }
         _ = interrupts.next() => {}
@@ -709,7 +790,7 @@ async fn adapter_for(
     env: &[(EnvVarName, String)],
 ) -> Result<(Box<dyn Harness>, Launch)> {
     let resume = plan.session.clone();
-    let harness_env = HarnessEnv::new(home, path_var(), plan.harness_config.clone())?;
+    let harness_env = HarnessEnv::new(home, path_var(), plan.harness_config.clone().into())?;
     let launch = match mode {
         Mode::Headless(prompt) => Launch::Headless { resume, prompt },
         Mode::Interactive(prompt) => Launch::Interactive {
@@ -803,46 +884,50 @@ fn origin_words(origin: Origin) -> &'static str {
 /// Tells the node the harness started, so it records it and appends
 /// `Resumed`, and prints what it answered. The caller kills the harness's
 /// group on an error.
-async fn register(socket: &Path, plan: &RunPlan, running: &Running, notes: Notes) -> Result<()> {
-    let registered = control::call(
-        socket,
-        &Request::HarnessStarted(StartedHarness {
-            job: plan.job,
-            epoch: plan.epoch,
-            pid: running.pid(),
-            harness: plan.harness.clone(),
-            session: running.session().cloned(),
-            planned: plan.session.clone(),
-            version: running.version().cloned(),
-        }),
-    )
-    .await;
+async fn register(client: &Client, plan: &RunPlan, running: &Running, notes: Notes) -> Result<()> {
+    let mut printer = Printer::new(notes);
+    let started = Started {
+        session: running.session().cloned(),
+        planned: plan.session.clone(),
+        version: running.version().cloned(),
+    };
+    let registered = client
+        .harness_started(launched(plan, running.pid()), started, |event| {
+            printer.print(&event);
+        })
+        .await;
+    if let Err(e) = printer.finish() {
+        tracing::warn!(error = %e, "the node's events of the launch could not be printed");
+    }
     match registered {
         // The harness runs and is recorded, so nothing may end the
         // supervision now: output that cannot be written, as when the
         // reader of a pipe went away, is reported and the wait goes on.
-        Ok(Response::Done { lines }) => {
-            if let Err(e) = notes.print(&lines) {
+        Ok(registered) => {
+            if let Err(e) = notes.print(&[render::registered(&registered)]) {
                 tracing::warn!(error = %e, "the node's answer to the launch could not be printed");
             }
             Ok(())
         }
-        Ok(Response::Failed {
-            lines,
-            error,
-            refusal,
-        }) => {
-            notes.print(&lines)?;
-            Err(Refused {
-                refusal,
-                message: format!(
-                    "the node refused the launch, so the harness was stopped: {error}"
-                ),
-            }
-            .into())
+        Err(ClientError::Refused(refusal)) => Err(Refused {
+            refusal: refusal.kind(),
+            message: format!(
+                "the node refused the launch, so the harness was stopped: {}",
+                refusal.message()
+            ),
         }
-        Ok(Response::Run { .. }) => bail!("the node answered a registration with a run plan"),
+        .into()),
         Err(e) => bail!("the node could not record the launch, so the harness was stopped: {e}"),
+    }
+}
+
+/// The harness `pid` launched from `plan`, as the node registers it.
+fn launched(plan: &RunPlan, pid: std::num::NonZeroU32) -> Launched {
+    Launched {
+        job: plan.job,
+        epoch: plan.epoch,
+        pid,
+        harness: plan.harness.clone(),
     }
 }
 
@@ -943,7 +1028,7 @@ enum TurnEnd {
 /// A headless turn being read: where to tell the node about a session,
 /// and how to read the harness's output.
 struct Turn<'a> {
-    socket: &'a Path,
+    client: &'a Client,
     plan: &'a RunPlan,
     notes: Notes,
     read_line: ReadLine,
@@ -974,7 +1059,7 @@ impl Turn<'_> {
         });
         let (sessions, named) = tokio::sync::mpsc::unbounded_channel();
         let recorder = tokio::spawn(record_sessions(
-            self.socket.to_path_buf(),
+            self.client.clone(),
             self.plan.clone(),
             pid,
             named,
@@ -1092,30 +1177,25 @@ fn send_to_group(pgid: std::num::NonZeroU32, signal: rustix::process::Signal) {
 /// Asks the node to record each session the harness names, in order, for
 /// the harness `pid`. A refusal is a warning, because the turn runs on.
 async fn record_sessions(
-    socket: PathBuf,
+    client: Client,
     plan: RunPlan,
     pid: std::num::NonZeroU32,
     mut named: tokio::sync::mpsc::UnboundedReceiver<SessionId>,
     notes: Notes,
 ) {
     while let Some(session) = named.recv().await {
-        let request = Request::HarnessSession(NamedSession {
-            job: plan.job,
-            epoch: plan.epoch,
-            pid,
-            harness: plan.harness.clone(),
-            session: session.clone(),
-        });
-        let missed = match control::call(&socket, &request).await {
-            Ok(Response::Done { lines }) => {
-                let _ = notes.print(&lines);
+        let mut printer = Printer::new(notes);
+        let recorded = client
+            .harness_session(launched(&plan, pid), session.clone(), |event| {
+                printer.print(&event);
+            })
+            .await;
+        let missed = match recorded {
+            Ok(recorded) => {
+                let _ = notes.print(&[render::session_recorded(&recorded)]);
                 continue;
             }
-            Ok(Response::Failed { lines, error, .. }) => {
-                let _ = notes.print(&lines);
-                error
-            }
-            Ok(Response::Run { .. }) => "it answered with a run plan".to_owned(),
+            Err(ClientError::Refused(refusal)) => refusal.message().to_owned(),
             Err(e) => e.to_string(),
         };
         let _ = writeln!(
@@ -1159,6 +1239,7 @@ fn print_turn(plan: &RunPlan, report: &TurnReport) -> Result<()> {
 async fn prepare(
     state: &StateDir,
     home: &Path,
+    client: &Client,
     plan: &RunPlan,
     notes: Notes,
     approval: &Approval<'_>,
@@ -1177,18 +1258,12 @@ async fn prepare(
     // Another launch may have registered its harness and let the lock go
     // since the plan was made; the node says so before any setup step
     // writes to the tree.
-    ask(
-        &state.socket(),
-        Request::LaunchCheck {
-            job: plan.job,
-            epoch: plan.epoch,
-            head: plan.head,
-            harness: plan.harness.clone(),
-            session: plan.session.clone(),
-        },
-        notes,
-    )
-    .await?;
+    let mut printer = Printer::new(notes);
+    let checked = client
+        .launch_check(plan, |event| printer.print(&event))
+        .await;
+    printer.finish()?;
+    checked.map_err(Refused::from_client)?;
     materialize(&tree, &plan.root, notes, approval)?;
     Ok(tree)
 }
@@ -1201,15 +1276,14 @@ async fn prepare(
 /// can keep for minutes, so a signal ends the wait as it ends the command
 /// at any other point; the node finds the group gone at its next look.
 async fn exited(
-    socket: &Path,
+    client: &Client,
     plan: &RunPlan,
     pid: std::num::NonZeroU32,
     status: std::process::ExitStatus,
     interrupts: &mut Interrupts,
 ) -> Result<ExitCode> {
-    let request = Request::HarnessExited { job: plan.job, pid };
     let told = tokio::select! {
-        told = control::call(socket, &request) => told,
+        told = client.harness_exited(plan.job, pid, |_| {}) => told,
         signal = interrupts.next() => {
             let number = signal.as_raw();
             writeln!(
@@ -1221,9 +1295,8 @@ async fn exited(
         }
     };
     let missed = match told {
-        Ok(Response::Done { .. }) => None,
-        Ok(Response::Failed { error, .. }) => Some(error),
-        Ok(Response::Run { .. }) => Some("it answered with a run plan".to_owned()),
+        Ok(()) => None,
+        Err(ClientError::Refused(refusal)) => Some(refusal.message().to_owned()),
         Err(e) => Some(e.to_string()),
     };
     if let Some(reason) = missed {
@@ -1266,7 +1339,7 @@ fn lock_tree(state: &StateDir, root: &Path) -> Result<TreeLock> {
         // Another run or resume of this workspace is starting its harness:
         // the same state as a harness that runs, so the same exit code.
         MaterializeError::TreeBusy { .. } => anyhow::Error::new(Refused {
-            refusal: Refusal::JobState,
+            refusal: RefusalKind::JobState,
             message: e.to_string(),
         }),
         e => e.into(),
@@ -1343,7 +1416,7 @@ impl Approval<'_> {
         }
         if !self.yes && !(self.ask)()? {
             return Err(Refused {
-                refusal: Refusal::NeedsForce,
+                refusal: RefusalKind::NeedsForce,
                 message: format!(
                     "the setup steps above come from environment spec {id}, which this node has not run for the job over these lockfiles and install configuration, or not since the workspace came from another node, and were not approved; read them and what changed, then run the command again with --yes"
                 ),
@@ -1493,7 +1566,7 @@ mod tests {
             session: None,
             known_writer: None,
             goal: "goal".to_owned(),
-            harness_config: fabricd::harnesses::HarnessConfig::default(),
+            harness_config: fabric_client::api::HarnessConfig::default(),
             home: dir.to_owned(),
         }
     }
@@ -1524,7 +1597,7 @@ mod tests {
         let harness_env = HarnessEnv::new(
             &plan.home,
             bin.into_os_string(),
-            plan.harness_config.clone(),
+            plan.harness_config.clone().into(),
         )
         .unwrap();
         let env = [(
@@ -1574,8 +1647,9 @@ mod tests {
             rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::HUP)
                 .unwrap();
         });
+        let client = Client::new(&socket);
         let turn = Turn {
-            socket: &socket,
+            client: &client,
             plan: &plan,
             notes: Notes::Stderr,
             read_line: Codex::read_headless_line,
@@ -1639,7 +1713,7 @@ mod tests {
             matches!(
                 error.downcast_ref::<Refused>(),
                 Some(Refused {
-                    refusal: Refusal::NeedsForce,
+                    refusal: RefusalKind::NeedsForce,
                     ..
                 })
             ),
@@ -1828,12 +1902,13 @@ mod tests {
             session: None,
             known_writer: None,
             goal: "goal".to_owned(),
-            harness_config: fabricd::harnesses::HarnessConfig::default(),
+            harness_config: fabric_client::api::HarnessConfig::default(),
             home: dir.path().join("the-nodes"),
         };
         let Err(error) = launch(
             &state,
             &mine,
+            &client(&state),
             &plan,
             Mode::Interactive(None),
             &unasked(dir.path()),
@@ -1879,12 +1954,13 @@ mod tests {
             session: None,
             known_writer: None,
             goal: "goal".to_owned(),
-            harness_config: fabricd::harnesses::HarnessConfig::default(),
+            harness_config: fabric_client::api::HarnessConfig::default(),
             home: home.clone(),
         };
         let Err(error) = launch(
             &state,
             &home,
+            &client(&state),
             &plan,
             Mode::Interactive(None),
             &unasked(dir.path()),
@@ -1895,8 +1971,8 @@ mod tests {
         };
         assert!(
             matches!(
-                error.downcast_ref::<ControlError>(),
-                Some(ControlError::NoDaemon { .. })
+                error.downcast_ref::<ClientError>(),
+                Some(ClientError::NoDaemon { .. })
             ),
             "{error:#}"
         );
@@ -1925,7 +2001,8 @@ mod tests {
         let plan = codex_plan(dir.path());
         let pid = std::num::NonZeroU32::new(std::process::id()).unwrap();
         let status = std::process::ExitStatus::from_raw(0);
-        let told = exited(&socket, &plan, pid, status, &mut interrupts);
+        let client = Client::new(&socket);
+        let told = exited(&client, &plan, pid, status, &mut interrupts);
         let code = tokio::time::timeout(Duration::from_secs(10), told)
             .await
             .expect("the signal did not end the wait")

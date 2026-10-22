@@ -14,7 +14,7 @@
 //! job's harness on the target is older than the source's, or than the
 //! newest known to have written the job's session (`Context::floor`, the
 //! known writer the guard refuses below), the note says so, read through
-//! `fabric_harness::HarnessVersion`, the parse and the order the resume
+//! `fabric_core::version::HarnessVersion`, the parse and the order the resume
 //! guard uses. Both sides are the versions each daemon finds from its own
 //! directory; a version manager's pin in the workspace can pick another,
 //! and the rollout's own `cli_version` is not read here, so the note is a
@@ -25,11 +25,11 @@
 //! resume, before it can touch the session, whatever the move was told
 //! (gate finding F10).
 
-use std::fmt;
 use std::path::Path;
 
+use fabric_client::api::{Outcome as WireOutcome, PreflightRow};
 use fabric_core::harness::HarnessKind;
-use fabric_harness::HarnessVersion;
+use fabric_core::version::HarnessVersion;
 
 use crate::facts::{NodeFacts, major, name};
 use crate::paths::{SyncedFolders, check_root};
@@ -60,17 +60,6 @@ pub enum Waiver {
     Never,
 }
 
-impl fmt::Display for Outcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad(match self {
-            Outcome::Equal => "ok",
-            Outcome::Fallback => "rebuild",
-            Outcome::Warn => "warn",
-            Outcome::Refuse(_) => "refuse",
-        })
-    }
-}
-
 /// One line of the preflight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
@@ -86,21 +75,23 @@ pub struct Row {
     pub note: String,
 }
 
-impl fmt::Display for Row {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "absent".to_owned());
-        write!(
-            f,
-            "{:<7} {:<16} here: {}  peer: {}",
-            self.outcome,
-            self.fact,
-            show(&self.here).replace('\n', " / "),
-            show(&self.peer).replace('\n', " / ")
-        )?;
-        if !self.note.is_empty() {
-            write!(f, "  ({})", self.note)?;
+impl Row {
+    /// The row as the client API carries it (ADR 0018).
+    #[must_use]
+    pub fn to_wire(&self) -> PreflightRow {
+        PreflightRow {
+            fact: self.fact.to_owned(),
+            here: self.here.clone(),
+            peer: self.peer.clone(),
+            outcome: match self.outcome {
+                Outcome::Equal => WireOutcome::Equal,
+                Outcome::Fallback => WireOutcome::Fallback,
+                Outcome::Warn => WireOutcome::Warn,
+                Outcome::Refuse(Waiver::Force) => WireOutcome::Refuse,
+                Outcome::Refuse(Waiver::Never) => WireOutcome::RefuseAlways,
+            },
+            note: self.note.clone(),
         }
-        Ok(())
     }
 }
 

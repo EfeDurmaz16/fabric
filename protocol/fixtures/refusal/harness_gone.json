@@ -1,0 +1,8 @@
+{
+  "kind": "job_state",
+  "reason": {
+    "code": "harness_gone",
+    "pid": 4242
+  },
+  "message": "pid 4242 is not running"
+}

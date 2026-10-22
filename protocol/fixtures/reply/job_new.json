@@ -1,0 +1,10 @@
+{
+  "kind": "job_new",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "root": "/Users/me/fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/work",
+  "repo": "/Users/me/oss/some-repo",
+  "harness": {
+    "kind": "claude_code"
+  },
+  "epoch": 1
+}
