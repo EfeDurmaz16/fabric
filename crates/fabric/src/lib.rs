@@ -603,7 +603,10 @@ async fn launch(
             notes,
             read_line,
         };
-        let (report, status) = turn.run(&mut running, &mut interrupts).await?;
+        let (report, status) = match turn.run(&mut running, &mut interrupts).await? {
+            TurnEnd::Reaped { report, status } => (report, status),
+            TurnEnd::Interrupted(signal) => return Ok(signal_exit(signal.as_raw())),
+        };
         // The node hears of the exit before anything prints the turn, so a
         // script that reads the session line finds the harness no longer
         // recorded, and hears of it even when the answer cannot be printed,
@@ -795,6 +798,19 @@ fn signal_exit(number: i32) -> ExitCode {
     ExitCode::from(u8::try_from(128 + number).unwrap_or(u8::MAX))
 }
 
+/// How the reading of a headless turn ended.
+#[derive(Debug)]
+enum TurnEnd {
+    /// The harness was reaped, and the node answered for every session it named.
+    Reaped {
+        report: TurnReport,
+        status: std::process::ExitStatus,
+    },
+    /// The harness was reaped, and this signal came while the node
+    /// recorded a session it named; the command ends with it.
+    Interrupted(rustix::process::Signal),
+}
+
 /// A headless turn being read: where to tell the node about a session,
 /// and how to read the harness's output.
 struct Turn<'a> {
@@ -812,12 +828,9 @@ impl Turn<'_> {
     /// while this loop keeps reaping the harness, which a suspend waits
     /// for. A signal `fabric` gets is passed on to the harness's group
     /// until the harness is reaped, and one that comes while the node
-    /// records the last session gives up waiting for it.
-    async fn run(
-        &self,
-        running: &mut Running,
-        interrupts: &mut Interrupts,
-    ) -> Result<(TurnReport, std::process::ExitStatus)> {
+    /// records the last session gives up waiting for it and ends the turn
+    /// with it, so the command exits as interrupted.
+    async fn run(&self, running: &mut Running, interrupts: &mut Interrupts) -> Result<TurnEnd> {
         let pid = running.pid();
         let child = running.child_mut();
         let Some(stdout) = child.stdout.take() else {
@@ -897,16 +910,18 @@ impl Turn<'_> {
                     tracing::warn!(error = %e, "the session recorder ended early");
                 }
             }
-            _ = interrupts.next() => {
+            signal = interrupts.next() => {
                 recorder.abort();
                 writeln!(
                     std::io::stderr(),
-                    "warning: interrupted while the node recorded the session; `fabric job status {}` shows what it holds",
+                    "interrupted by signal {} while the node recorded the session; `fabric job status {}` shows what it holds",
+                    signal.as_raw(),
                     self.plan.job
                 )?;
+                return Ok(TurnEnd::Interrupted(signal));
             }
         }
-        Ok((report, status))
+        Ok(TurnEnd::Reaped { report, status })
     }
 }
 /// Sends `signal` to the process group `pgid`, which is gone if it has exited.
@@ -1283,6 +1298,146 @@ fn pid_of(running: &Running) -> Option<rustix::process::Pid> {
 mod tests {
     use super::*;
 
+    /// The signal tests send a signal to this whole process, which every
+    /// handler installed in it gets, so they run one at a time.
+    static SIGNALS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A private directory with a short path under `/tmp`, where a control
+    /// socket's path fits.
+    fn socket_dir() -> tempfile::TempDir {
+        let dir = tempfile::Builder::new()
+            .prefix("fsig")
+            .tempdir_in("/tmp")
+            .unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// A node at `socket` that takes every request and never answers one.
+    fn silent_node(socket: &Path) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        })
+    }
+
+    /// A plan for a Codex job rooted in `dir`, with no session to continue.
+    fn codex_plan(dir: &Path) -> RunPlan {
+        RunPlan {
+            job: "01M5EBB2BWY97N3YEKD6CDN2EM".parse().unwrap(),
+            epoch: fabric_core::id::Epoch::FIRST,
+            head: fabric_core::id::RecordHash::of(b"a head"),
+            root: dir.join("work"),
+            harness: HarnessKind::Codex,
+            session: None,
+            goal: "goal".to_owned(),
+            harness_config: fabricd::harnesses::HarnessConfig::default(),
+            home: dir.to_owned(),
+        }
+    }
+
+    /// Launches a fake `codex` headless for `plan`; under `exec` it runs
+    /// `script`. It is written by a short `sh`, so this process never holds
+    /// it open for writing while another test forks.
+    async fn headless_codex(plan: &RunPlan, script: &str) -> Running {
+        let bin = plan.home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&plan.root).unwrap();
+        let fake = format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex-cli 0.155.1'; exit 0; fi\n{script}"
+        );
+        let mut writer = std::process::Command::new("/bin/sh")
+            .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+            .arg(bin.join("codex"))
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        writer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(fake.as_bytes())
+            .unwrap();
+        assert!(writer.wait().unwrap().success());
+        let harness_env = HarnessEnv::new(
+            &plan.home,
+            bin.into_os_string(),
+            plan.harness_config.clone(),
+        )
+        .unwrap();
+        let env = [(
+            EnvVarName::parse("PATH").unwrap(),
+            "/usr/bin:/bin".to_owned(),
+        )];
+        let launch = Launch::Headless {
+            resume: None,
+            prompt: "a turn".to_owned(),
+        };
+        Codex::new(harness_env.home, harness_env.path_var)
+            .launch(&plan.root, launch, &env)
+            .await
+            .unwrap()
+    }
+
+    /// A headless turn names its session, which goes to the node, and the
+    /// harness exits. A signal while the node has not answered yet, as
+    /// while a suspend holds the job, must end the command with that signal:
+    /// the user asked it to stop, and a turn that went on to print and exit
+    /// 0 would hide that (Codex review, 2026-10-22).
+    #[tokio::test]
+    async fn a_signal_while_the_node_records_the_session_ends_the_turn_with_it() {
+        use std::time::Duration;
+
+        let _one = SIGNALS.lock().await;
+        let dir = socket_dir();
+        let socket = dir.path().join("fabric.sock");
+        let _node = silent_node(&socket);
+        let plan = codex_plan(dir.path());
+        let gone = dir.path().join("gone");
+        let mut running = headless_codex(
+            &plan,
+            &format!(
+                "echo '{{\"type\":\"thread.started\",\"thread_id\":\"019f233e-bb33-7342-85fa-f2d33b14368a\"}}'\ntouch '{}'\n",
+                gone.display()
+            ),
+        )
+        .await;
+        let mut interrupts = Interrupts::new().unwrap();
+        tokio::spawn(async move {
+            while !gone.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // The harness exits right after; the turn is then waiting on the node.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::HUP)
+                .unwrap();
+        });
+        let turn = Turn {
+            socket: &socket,
+            plan: &plan,
+            notes: Notes::Stderr,
+            read_line: Codex::read_headless_line,
+        };
+        let ended = tokio::time::timeout(
+            Duration::from_secs(10),
+            turn.run(&mut running, &mut interrupts),
+        )
+        .await
+        .expect("the signal did not end the wait for the node")
+        .unwrap();
+        assert!(
+            matches!(ended, TurnEnd::Interrupted(signal) if signal == rustix::process::Signal::HUP),
+            "{ended:?}"
+        );
+    }
+
     /// An approval for a launch that must not get as far as asking.
     fn unasked(dir: &Path) -> Approval<'static> {
         Approval {
@@ -1538,41 +1693,17 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
         use std::time::Duration;
 
-        let dir = tempfile::Builder::new()
-            .prefix("fsig")
-            .tempdir_in("/tmp")
-            .unwrap();
-        std::fs::set_permissions(
-            dir.path(),
-            std::os::unix::fs::PermissionsExt::from_mode(0o700),
-        )
-        .unwrap();
+        let _one = SIGNALS.lock().await;
+        let dir = socket_dir();
         let socket = dir.path().join("fabric.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        // A node that takes the request and never answers it.
-        let _node = tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((stream, _)) = listener.accept().await {
-                held.push(stream);
-            }
-        });
+        let _node = silent_node(&socket);
         let mut interrupts = Interrupts::new().unwrap();
         tokio::spawn(async {
             tokio::time::sleep(Duration::from_millis(200)).await;
             rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::HUP)
                 .unwrap();
         });
-        let plan = RunPlan {
-            job: "01M5EBB2BWY97N3YEKD6CDN2EM".parse().unwrap(),
-            epoch: fabric_core::id::Epoch::FIRST,
-            head: fabric_core::id::RecordHash::of(b"a head"),
-            root: dir.path().join("work"),
-            harness: HarnessKind::Codex,
-            session: None,
-            goal: "goal".to_owned(),
-            harness_config: fabricd::harnesses::HarnessConfig::default(),
-            home: dir.path().to_owned(),
-        };
+        let plan = codex_plan(dir.path());
         let pid = std::num::NonZeroU32::new(std::process::id()).unwrap();
         let status = std::process::ExitStatus::from_raw(0);
         let told = exited(&socket, &plan, pid, status, &mut interrupts);
