@@ -1,0 +1,527 @@
+//! The generic Agent Client Protocol adapter.
+//!
+//! Invariant: any agent that speaks ACP and advertises `session/load` or
+//! `session/resume` can be continued in a new workspace by its session id
+//! alone; Fabric carries, from the agent's declared state directory, only
+//! the files whose path has a component that is the session id or the id
+//! plus an extension, as opaque bytes it never
+//! parses, and refuses a file that holds a secret-shaped string. An agent
+//! whose state directory is not declared cannot be captured or restored,
+//! and the adapter says so instead of guessing. Restore accepts only the
+//! workspace path and home of the capture (ADR 0011) and only files under
+//! the declared state directory whose path names the session. The adapter
+//! cannot tell whether a generic agent is writing a session while it
+//! restores one; the caller owns that guard, through the handle
+//! `launch_acp` returned. A launch whose handshake fails kills the agent's
+//! process group before it returns, so no agent runs without a handle.
+
+pub mod client;
+
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+use fabric_core::BoxFuture;
+use fabric_core::env::EnvVarName;
+use fabric_core::harness::{HarnessKind, ProgramName};
+use fabric_core::path::AbsPath;
+use tokio::task::JoinHandle;
+use tracing::{info, warn};
+
+use crate::departure::{FABRIC_DIR, Records};
+use crate::error::HarnessError;
+use crate::harness::{Harness, Installed, Launch, Restored, Running};
+use crate::manifest::{Content, HOME_PREFIX, Mutability, StateManifest, under_home};
+use crate::pipeline::{self, Capturer, Destination};
+use crate::process::{self, Wiring};
+use crate::redact::{RedactionCounts, Redactor};
+use crate::session::SessionId;
+use crate::stage::{Carry, Source};
+
+use self::client::{AcpClient, AcpError, PermissionPolicy, StopReason};
+
+/// True when a path component is the session's own: the id itself (a
+/// directory) or the id followed by an extension (`<sid>.json`). Session
+/// `s1` does not own `s10.json` or `xs1y`.
+fn names_session(part: &str, session: &SessionId) -> bool {
+    part.strip_prefix(session.as_str())
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
+/// Refuses launch arguments that hold a secret shape, one by one and
+/// joined, so `--api-key sk-...` is caught either way: the arguments are
+/// part of the harness kind that the job's ledger and the manifest record,
+/// and neither is ever redacted. A caller that records a kind checks it
+/// here before it writes anything.
+pub fn refuse_secret_args(program: &ProgramName, args: &[String]) -> Result<(), HarnessError> {
+    let redactor = Redactor::standard()?;
+    let joined = args.join(" ");
+    if redactor.matches(&joined) || args.iter().any(|arg| redactor.matches(arg)) {
+        return Err(HarnessError::SecretInArguments {
+            program: program.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// An ACP agent started as `program args...`.
+#[derive(Debug, Clone)]
+pub struct AcpHarness {
+    program: ProgramName,
+    args: Vec<String>,
+    home: AbsPath,
+    state_dir: Option<PathBuf>,
+    policy: PermissionPolicy,
+    path_var: OsString,
+}
+
+/// An ACP agent this node started, with the client that owns its pipes.
+/// Dropping the client closes the agent's stdin.
+pub struct AcpRunning {
+    /// The process handle the supervisor records.
+    pub running: Running,
+    /// The protocol connection.
+    pub client: AcpClient,
+    /// The first prompt turn, when `launch_acp` was given a prompt; its
+    /// result says how the turn ended.
+    pub turn: Option<JoinHandle<Result<StopReason, AcpError>>>,
+}
+
+impl std::fmt::Debug for AcpRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcpRunning")
+            .field("running", &self.running)
+            .field("turn_pending", &self.turn.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AcpHarness {
+    /// An adapter for `program args...` under `home`, finding the program
+    /// on the `PATH` value `path_var`, with no state directory declared and
+    /// the deny permission policy.
+    #[must_use]
+    pub fn new(program: ProgramName, args: Vec<String>, home: AbsPath, path_var: OsString) -> Self {
+        AcpHarness {
+            program,
+            args,
+            home,
+            state_dir: None,
+            policy: PermissionPolicy::Deny,
+            path_var,
+        }
+    }
+
+    /// Declares where the agent keeps its sessions; refused when `dir` is
+    /// not under the home, or when it is the home or lies under
+    /// `~/.fabric`, in any letter case: either way capture would walk
+    /// Fabric's own departure records, which never travel.
+    pub fn with_state_dir(mut self, dir: &AbsPath) -> Result<Self, HarnessError> {
+        let dir = pipeline::fs_path(dir).to_path_buf();
+        let Ok(rel) = dir.strip_prefix(self.home_dir()) else {
+            return Err(HarnessError::NotUnderHome {
+                path: dir,
+                home: self.home_dir().to_path_buf(),
+            });
+        };
+        let holds_fabric = rel
+            .components()
+            .next()
+            .is_none_or(|first| first.as_os_str().eq_ignore_ascii_case(FABRIC_DIR));
+        if holds_fabric {
+            return Err(HarnessError::StateDirHoldsFabric {
+                path: dir,
+                fabric: self.home_dir().join(FABRIC_DIR),
+            });
+        }
+        self.state_dir = Some(dir);
+        Ok(self)
+    }
+
+    fn home_dir(&self) -> &Path {
+        pipeline::fs_path(&self.home)
+    }
+
+    /// Refuses, before any session is placed or taken, a state directory
+    /// that capture and restore would refuse: none declared, or one reached
+    /// through a link below the home. A target checks this before it takes
+    /// a job it would then be unable to resume.
+    pub fn check_state_dir(&self) -> Result<(), HarnessError> {
+        let (dir, _) = self.state_rel()?;
+        pipeline::refuse_symlinks(self.home_dir(), &dir)
+    }
+
+    /// Sets how `session/request_permission` is answered.
+    #[must_use]
+    pub fn with_policy(mut self, policy: PermissionPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    fn binary(&self) -> Result<PathBuf, HarnessError> {
+        process::find_on_path(self.program.as_str(), &self.path_var).ok_or_else(|| {
+            HarnessError::NotInstalled {
+                program: self.program.to_string(),
+            }
+        })
+    }
+
+    fn state_rel(&self) -> Result<(PathBuf, Vec<String>), HarnessError> {
+        let dir = self
+            .state_dir
+            .clone()
+            .ok_or_else(|| HarnessError::StateDirNotDeclared {
+                program: self.program.to_string(),
+            })?;
+        let rel = dir
+            .strip_prefix(self.home_dir())
+            .map_err(|_| HarnessError::NotUnderHome {
+                path: dir.clone(),
+                home: self.home_dir().to_path_buf(),
+            })?;
+        Ok((dir.clone(), pipeline::rel_components(rel)?))
+    }
+
+    /// Where this node records the session's files at capture. An ACP
+    /// agent's state is opaque, so every file is treated as rewritable.
+    /// The records are keyed by the whole harness kind, program and
+    /// arguments, so two agents started through one program, such as
+    /// `node`, never share a record for a session id they both use.
+    fn departure(&self, session: &SessionId) -> Records {
+        let mut kind = blake3::Hasher::new();
+        for part in
+            std::iter::once(self.program.as_str()).chain(self.args.iter().map(String::as_str))
+        {
+            kind.update(&(part.len() as u64).to_le_bytes());
+            kind.update(part.as_bytes());
+        }
+        let kind = kind.finalize().to_hex();
+        let label = format!("acp-{}-{}", self.program, &kind[..16]);
+        Records::of(self.home_dir(), &label, session)
+    }
+
+    fn refuse_secret_args(&self) -> Result<(), HarnessError> {
+        refuse_secret_args(&self.program, &self.args)
+    }
+
+    fn capture_sync(
+        &self,
+        root: &AbsPath,
+        session: &SessionId,
+        out: &Path,
+        version: Option<String>,
+    ) -> Result<StateManifest, HarnessError> {
+        self.refuse_secret_args()?;
+        let (dir, rel_parts) = self.state_rel()?;
+        // The walk refuses symlinks below the directory but follows the
+        // directory itself, so a linked state root or a linked directory
+        // above it would carry files from outside the home.
+        pipeline::refuse_symlinks(self.home_dir(), &dir)?;
+        let sources = Self::session_sources(&dir, &rel_parts, session)?;
+        if sources.is_empty() {
+            return Err(HarnessError::SessionNotFound {
+                kind: self.kind(),
+                session: session.clone(),
+                searched: dir,
+            });
+        }
+        let records = self.departure(session);
+        let capturer = Capturer {
+            kind: self.kind(),
+            session,
+            root,
+            home: &self.home,
+            version,
+            departure: Some(&records),
+        };
+        let manifest = pipeline::capture(capturer, &sources, RedactionCounts::new(), out)?;
+        info!(%session, agent = %self.program, files = manifest.files().len(), "acp: captured");
+        Ok(manifest)
+    }
+
+    /// Every file under the state directory `dir` that is named for
+    /// `session`, as capture takes it; `rel_parts` is `dir` under the home.
+    fn session_sources(
+        dir: &Path,
+        rel_parts: &[String],
+        session: &SessionId,
+    ) -> Result<Vec<Source>, HarnessError> {
+        let mut sources = Vec::new();
+        for file in pipeline::walk(dir)? {
+            let file_parts = pipeline::rel_components(&file)?;
+            if !file_parts.iter().any(|part| names_session(part, session)) {
+                continue;
+            }
+            let mut parts: Vec<&str> = vec![HOME_PREFIX];
+            parts.extend(rel_parts.iter().map(String::as_str));
+            parts.extend(file_parts.iter().map(String::as_str));
+            sources.push(Source {
+                abs: dir.join(&file),
+                rel: pipeline::rel_path(&parts)?,
+                carry: Carry::OpaqueRefuseSecrets,
+                mutability: Mutability::Replaceable,
+            });
+        }
+        Ok(sources)
+    }
+
+    async fn capture_impl(
+        &self,
+        workspace: &Path,
+        session: &SessionId,
+        out: &Path,
+    ) -> Result<StateManifest, HarnessError> {
+        let root = pipeline::physical_workspace(workspace)?;
+        let version =
+            process::installed_version(self.binary().ok(), &self.path_var, self.program.as_str())
+                .await;
+        let adapter = self.clone();
+        let session = session.clone();
+        let out = out.to_path_buf();
+        pipeline::blocking(move || adapter.capture_sync(&root, &session, &out, version)).await
+    }
+
+    /// True when a tree path lies under the declared state directory and
+    /// one of its components below it names the session, which is the rule
+    /// capture selects files by.
+    fn restorable(rel: &str, state_parts: &[String], session: &SessionId) -> bool {
+        let Some(rest) = under_home(rel) else {
+            return false;
+        };
+        let mut parts = rest.split('/');
+        for expected in state_parts {
+            if parts.next() != Some(expected.as_str()) {
+                return false;
+            }
+        }
+        parts.any(|part| names_session(part, session))
+    }
+
+    fn restore_sync(
+        &self,
+        state: &Path,
+        manifest: StateManifest,
+    ) -> Result<Restored, HarnessError> {
+        let (dir, state_parts) = self.state_rel()?;
+        let session = manifest.session().clone();
+        let records = self.departure(&session);
+        pipeline::refuse_symlinks(self.home_dir(), &dir)?;
+        let held = if dir.exists() {
+            Self::session_sources(&dir, &state_parts, &session)?
+        } else {
+            Vec::new()
+        };
+        let restored = pipeline::restore(manifest, state, Some(&records), &held, |rel, _| {
+            let rest = under_home(rel).filter(|_| Self::restorable(rel, &state_parts, &session));
+            Ok(rest.map(|rest| Destination {
+                path: self.home_dir().join(rest),
+                content: Content::Opaque,
+                mutability: Mutability::Replaceable,
+            }))
+        })?;
+        info!(%session, agent = %self.program, files = restored.placed.len(), "acp: restored");
+        Ok(restored)
+    }
+
+    async fn restore_impl(&self, workspace: &Path, state: &Path) -> Result<Restored, HarnessError> {
+        let root = pipeline::physical_workspace(workspace)?;
+        let manifest = pipeline::open(state, &self.kind(), &root, &self.home)?;
+        let adapter = self.clone();
+        let state = state.to_path_buf();
+        pipeline::blocking(move || adapter.restore_sync(&state, manifest)).await
+    }
+
+    async fn detect_impl(&self) -> Result<Option<Installed>, HarnessError> {
+        process::detect(self.binary().ok(), &self.path_var).await
+    }
+
+    /// Starts the agent, completes the handshake, continues `resume` or
+    /// creates a session, and returns the process with its protocol client.
+    /// A prompt is sent on a task of its own, whose handle is on the result.
+    pub async fn launch_acp(
+        &self,
+        workspace: &Path,
+        resume: Option<SessionId>,
+        prompt: Option<String>,
+        env: &[(EnvVarName, String)],
+    ) -> Result<AcpRunning, HarnessError> {
+        let root = pipeline::physical_workspace(workspace)?;
+        let binary = self.binary()?;
+        let (mut child, pid) = process::spawn(
+            &binary,
+            &self.args,
+            pipeline::fs_path(&root),
+            env,
+            Wiring::Rpc,
+        )?;
+        // Until the session is open, an error or a dropped future kills the
+        // agent's group, so no agent is left running without a handle.
+        let guard = process::GroupGuard::new(pid);
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            return Err(HarnessError::Spawn {
+                program: self.program.to_string(),
+                source: std::io::Error::other("agent started without stdio pipes"),
+            });
+        };
+        let client = AcpClient::attach(stdin, stdout, self.policy);
+        let session = self.open_session(&client, &root, resume).await?;
+        guard.disarm();
+        let turn = prompt.map(|prompt| {
+            let client = client.clone();
+            let session = session.clone();
+            tokio::spawn(async move { client.prompt(&session, &prompt).await })
+        });
+        Ok(AcpRunning {
+            running: Running::new(pid, Some(session), child),
+            client,
+            turn,
+        })
+    }
+
+    /// Runs the handshake and continues `resume`, or opens a new session
+    /// when there is none; returns the session.
+    async fn open_session(
+        &self,
+        client: &AcpClient,
+        cwd: &AbsPath,
+        resume: Option<SessionId>,
+    ) -> Result<SessionId, HarnessError> {
+        let capabilities = client.initialize().await?;
+        match resume {
+            None => {
+                let session = client.new_session(cwd).await?;
+                info!(%session, agent = %self.program, "acp: new session");
+                Ok(session)
+            }
+            Some(session) => {
+                if capabilities.resume {
+                    client.resume_session(&session, cwd).await?;
+                } else if capabilities.load_session {
+                    client.load_session(&session, cwd).await?;
+                } else {
+                    return Err(HarnessError::LoadNotSupported {
+                        program: self.program.to_string(),
+                    });
+                }
+                info!(%session, agent = %self.program, "acp: session continued");
+                Ok(session)
+            }
+        }
+    }
+
+    /// The trait's launch, headless only: an ACP agent has no terminal
+    /// mode, so `Launch::Interactive` is refused (`NeedsClient`). The
+    /// prompt turn runs on a task that owns the client and closes the
+    /// agent's stdin when the turn ends; updates the turn streams are
+    /// dropped once `client::UPDATE_BUFFER` wait unread.
+    async fn launch_impl(
+        &self,
+        workspace: &Path,
+        launch: Launch,
+        env: &[(EnvVarName, String)],
+    ) -> Result<Running, HarnessError> {
+        let Launch::Headless { resume, prompt } = launch else {
+            return Err(HarnessError::NeedsClient {
+                program: self.program.to_string(),
+            });
+        };
+        let AcpRunning {
+            running,
+            client,
+            turn,
+        } = self
+            .launch_acp(workspace, resume, Some(prompt), env)
+            .await?;
+        let program = self.program.to_string();
+        tokio::spawn(async move {
+            let outcome = match turn {
+                Some(turn) => turn.await,
+                None => return,
+            };
+            match outcome {
+                Ok(Ok(reason)) => info!(agent = %program, ?reason, "acp: turn ended"),
+                Ok(Err(e)) => warn!(agent = %program, error = %e, "acp: turn failed"),
+                Err(e) => warn!(agent = %program, error = %e, "acp: turn task ended early"),
+            }
+            drop(client);
+        });
+        Ok(running)
+    }
+}
+
+impl Harness for AcpHarness {
+    fn kind(&self) -> HarnessKind {
+        HarnessKind::Acp {
+            program: self.program.clone(),
+            args: self.args.clone(),
+        }
+    }
+
+    fn detect(&self) -> BoxFuture<'_, Result<Option<Installed>, HarnessError>> {
+        Box::pin(self.detect_impl())
+    }
+
+    fn capture<'a>(
+        &'a self,
+        workspace: &'a Path,
+        session: &'a SessionId,
+        out: &'a Path,
+    ) -> BoxFuture<'a, Result<StateManifest, HarnessError>> {
+        Box::pin(self.capture_impl(workspace, session, out))
+    }
+
+    fn confirm_departure<'a>(
+        &'a self,
+        manifest: &'a StateManifest,
+    ) -> BoxFuture<'a, Result<(), HarnessError>> {
+        let records = self.departure(manifest.session());
+        let manifest = manifest.clone();
+        let kind = self.kind();
+        Box::pin(pipeline::blocking(move || {
+            pipeline::confirm_departure(&manifest, &kind, Some(&records))
+        }))
+    }
+
+    fn restore<'a>(
+        &'a self,
+        workspace: &'a Path,
+        state: &'a Path,
+    ) -> BoxFuture<'a, Result<Restored, HarnessError>> {
+        Box::pin(self.restore_impl(workspace, state))
+    }
+
+    fn launch<'a>(
+        &'a self,
+        workspace: &'a Path,
+        launch: Launch,
+        env: &'a [(EnvVarName, String)],
+    ) -> BoxFuture<'a, Result<Running, HarnessError>> {
+        Box::pin(self.launch_impl(workspace, launch, env))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn adapter(args: &[&str]) -> AcpHarness {
+        AcpHarness::new(
+            ProgramName::parse("node").unwrap(),
+            args.iter().map(|a| (*a).to_owned()).collect(),
+            AbsPath::parse("/h").unwrap(),
+            OsString::new(),
+        )
+    }
+
+    #[test]
+    fn departure_records_are_keyed_by_program_and_arguments() {
+        let session = SessionId::parse("s1").unwrap();
+        let a = adapter(&["agent-a.js"]).departure(&session);
+        assert_eq!(a, adapter(&["agent-a.js"]).departure(&session));
+        assert_ne!(a, adapter(&["agent-b.js"]).departure(&session));
+        assert_ne!(
+            adapter(&["a", "b"]).departure(&session),
+            adapter(&["ab"]).departure(&session),
+            "argument boundaries count"
+        );
+    }
+}

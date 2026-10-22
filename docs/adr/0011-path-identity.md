@@ -2,6 +2,8 @@
 
 Status: accepted, 2026-10-19
 
+2026-10-20: [ADR 0016](0016-node-and-cli-as-built.md) records that `fabric job new` makes the root of rule 2, and that rule 4's refusal of `/tmp` is not enforced.
+
 Written 2026-10-19 after step 1 research (`2026-10-19-step1-design-input.md`, section 4.1 and D1; `step1/H5-workspace-mobility.md`, section 2; `step1/H1-claude-code.md`, sections 1 and 11.1; `step1/preflight-2026-10-19.md`). It takes over the root rule that ADR 0008 held and gives it the evidence it rested on.
 
 ## Context
@@ -13,7 +15,7 @@ Every tool a job depends on keys something to the absolute path of the workspace
 - pnpm writes the store path as an absolute string into `node_modules/.modules.yaml` and compares it for equality on the next install; pnpm 11 bin shims bake an absolute `NODE_PATH`. Cargo's dep-info is absolute by default and its fingerprints rest on paths and mtimes; moving `CARGO_HOME` rebuilds everything. Every sampled Python venv has an absolute shebang and an absolute `home`.
 - Six of the eight secondary harnesses key their session store by a hash or encoding of the working directory.
 
-The preflight of 2026-10-19 measured the two gate machines: both have user `efebarandurmaz` and `HOME=/Users/efebarandurmaz`. Everything else differs (ADR 0008, Context), but the one string that decides this ADR is equal.
+The preflight of 2026-10-19 measured the two gate machines: both have the same user name and the same `HOME`, `/Users/<user>`. Everything else differs (ADR 0008, Context), but the one string that decides this ADR is equal.
 
 ## Decision
 

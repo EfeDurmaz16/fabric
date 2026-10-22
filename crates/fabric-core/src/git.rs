@@ -212,18 +212,43 @@ impl GitConfigValue {
         Ok(Self(text.to_owned()))
     }
 
-    /// Returns true when the value is a `scheme://` URL whose authority holds
-    /// userinfo, which is where a token lives in a remote URL.
-    ///
-    /// The scp-like form `git@host:path` has no scheme and no password slot,
-    /// so it is not userinfo by this rule.
+    /// Returns true when the value is a `scheme://` URL that can carry a
+    /// credential: its authority holds one by the rule of `credential_range`,
+    /// or it has a query or a fragment, where a token such as
+    /// `?access_token=` travels. No part of a query is known to be safe, so
+    /// the whole value is treated as secret.
     #[must_use]
-    pub fn has_userinfo(&self) -> bool {
-        let Some((_, rest)) = self.0.split_once("://") else {
-            return false;
-        };
-        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        rest[..end].contains('@')
+    pub fn has_credential(&self) -> bool {
+        credential_range(&self.0).is_some()
+            || self
+                .0
+                .split_once("://")
+                .is_some_and(|(_, rest)| rest.contains(['?', '#']))
+    }
+}
+
+/// Returns the bytes of a remote URL that can hold a credential, for removal.
+///
+/// For `http`, `https` and every other scheme that is the whole `user[:password]@`
+/// of the authority, because a token can sit in either slot. For `ssh`,
+/// `git+ssh` and `ssh+git` it is only the `:password` part: the user name is
+/// how the server picks the account (`ssh://git@github.com/...`), not a
+/// secret, and dropping it makes push fail on the target. The scp-like form
+/// `git@host:path` has no scheme and no password slot, so it has none.
+#[must_use]
+pub fn credential_range(url: &str) -> Option<std::ops::Range<usize>> {
+    let (scheme, rest) = url.split_once("://")?;
+    let start = scheme.len() + 3;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let at = rest[..end].rfind('@')?;
+    let ssh = ["ssh", "git+ssh", "ssh+git"]
+        .iter()
+        .any(|s| scheme.eq_ignore_ascii_case(s));
+    if ssh {
+        let colon = rest[..at].find(':')?;
+        Some(start + colon..start + at)
+    } else {
+        Some(start..start + at + 1)
     }
 }
 
@@ -233,13 +258,13 @@ impl GitConfigValue {
 /// key fails to decode.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GitConfigKey {
-    /// `remote.<name>.url`; userinfo is stripped at capture and refused on decode.
+    /// `remote.<name>.url`; a credential in it is stripped at capture and refused on decode.
     RemoteUrl(RemoteName),
-    /// `remote.<name>.pushurl`; userinfo is stripped at capture and refused on decode.
+    /// `remote.<name>.pushurl`; a credential in it is stripped at capture and refused on decode.
     RemotePushUrl(RemoteName),
     /// `remote.<name>.fetch`.
     RemoteFetch(RemoteName),
-    /// `branch.<name>.remote`.
+    /// `branch.<name>.remote`; it may hold a URL, and a credential in one is stripped at capture and refused on decode.
     BranchRemote(BranchName),
     /// `branch.<name>.merge`.
     BranchMerge(BranchName),
@@ -256,12 +281,17 @@ pub enum GitConfigKey {
 }
 
 impl GitConfigKey {
-    /// Returns true for the keys whose value is a remote URL, which must carry no userinfo.
+    /// Returns true for the keys whose value is or may be a remote URL, which must carry no credential.
+    ///
+    /// `branch.<name>.remote` usually names a remote, but git also takes a
+    /// URL there as the repository to fetch from and push to.
     #[must_use]
     pub const fn is_remote_url(&self) -> bool {
         matches!(
             self,
-            GitConfigKey::RemoteUrl(_) | GitConfigKey::RemotePushUrl(_)
+            GitConfigKey::RemoteUrl(_)
+                | GitConfigKey::RemotePushUrl(_)
+                | GitConfigKey::BranchRemote(_)
         )
     }
 
@@ -431,13 +461,17 @@ mod tests {
     }
 
     #[test]
-    fn a_url_value_knows_when_it_carries_userinfo() {
-        let with = |v: &str| GitConfigValue::parse(v).unwrap().has_userinfo();
+    fn a_url_value_knows_when_it_carries_a_credential() {
+        let with = |v: &str| GitConfigValue::parse(v).unwrap().has_credential();
         assert!(with("https://efe:ghp_secret123@github.com/x/y.git"));
         assert!(with("https://token@github.com/x/y.git"));
-        assert!(with("ssh://git@github.com/x/y.git"));
+        assert!(!with("ssh://git@github.com/x/y.git"));
+        assert!(with("ssh://git:hunter2@github.com/x/y.git"));
+        assert!(with("git+ssh://git:hunter2@github.com/x/y.git"));
         assert!(!with("https://github.com/x/y.git"));
-        assert!(!with("https://github.com/x/y.git?u=a@b"));
+        assert!(with("https://github.com/x/y.git?u=a@b"));
+        assert!(with("https://example.com/x.git?access_token=sekrit"));
+        assert!(with("https://example.com/x.git#sekrit"));
         assert!(!with("git@github.com:x/y.git"));
         assert!(!with("/srv/git/y.git"));
         assert!(
@@ -447,6 +481,11 @@ mod tests {
         );
         assert!(
             GitConfigKey::parse("remote.origin.pushurl")
+                .unwrap()
+                .is_remote_url()
+        );
+        assert!(
+            GitConfigKey::parse("branch.main.remote")
                 .unwrap()
                 .is_remote_url()
         );

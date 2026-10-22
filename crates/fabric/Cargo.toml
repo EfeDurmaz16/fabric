@@ -1,0 +1,60 @@
+[package]
+name = "fabric"
+version = "0.1.0"
+description = "The fabric command: run the node, pair nodes, and make, run, suspend, move and resume jobs"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# Named fault points in the node, for the end-to-end test only.
+faults = ["fabricd/faults"]
+# The fake ACP agent the end-to-end test launches as a harness.
+fixtures = ["dep:serde_json"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+fabric-core = { path = "../fabric-core" }
+fabric-env = { path = "../fabric-env" }
+fabric-harness = { path = "../fabric-harness" }
+fabric-net = { path = "../fabric-net" }
+fabricd = { path = "../fabricd" }
+rustix = { version = "1.1", features = ["process", "termios"] }
+serde_json = { version = "1.0", optional = true }
+tokio = { version = "1.54", features = ["macros", "process", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+
+[dev-dependencies]
+# The end-to-end test runs this package's binaries with the fault points
+# and the fake agent built in; this turns both on for test builds only.
+fabric = { path = ".", features = ["faults", "fixtures"] }
+tempfile = "3.27"
+# The signal test runs a control socket that never answers, under a deadline.
+tokio = { version = "1.54", features = ["net", "time"] }
+
+# The fake ACP agent of fabric-harness's own tests, built here under its own
+# name so the end-to-end test can launch it as a harness.
+[[bin]]
+name = "fabric-fake-agent"
+path = "fixtures/fake_agent.rs"
+test = false
+doc = false
+bench = false
+required-features = ["fixtures"]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "fabric"
+path = "src/main.rs"
+
+[[test]]
+name = "e2e"
+path = "tests/e2e/main.rs"
+
+[lints]
+workspace = true

@@ -2,6 +2,8 @@
 
 Status: accepted, 2026-10-19
 
+2026-10-20: [ADR 0016](0016-node-and-cli-as-built.md) records the node as built. It answers the last open question below: a departed copy that matches a published snapshot is renamed out of the root and kept. The CLI is never the supervisor; a node must run. `fabric job move --abort`, the fork rule and `fabric orphan export` are not built.
+
 Amended 2026-10-19 after step 1 research. The first version of this ADR used a time-based lease: a 60 second expiry, a renewal every 20 seconds, a 30 second skew margin, an arbiter that granted claims, and `fabric resume --force-expired` as the way past a holder that stopped renewing. The research removed the ground under it: there is no always-on node today (two laptops, `2026-10-19-step1-design-input.md`, section 10, A22), a sleeping laptop looks exactly like a dead one, and a lease that expires on a clock is only safe when the store rejects stale writers, which is the fencing this ADR already had. So the expiry is gone. What remains is the cooperative move protocol the research recommends (same file, section 4.8, options L1 and L1a; section 9, D11 and D30; `step1/H5-workspace-mobility.md`, sections 9.1 to 9.4), a manual steal with an epoch bump behind `--force`, and the epoch fence. An always-on witness that could bring expiry back is a later ADR (Open questions). Sections marked "unchanged" kept their text apart from renamed terms.
 
 Amended 2026-10-19 while writing `fabric-core` (PR `feat/core`): `Stolen` names the thief as `by` next to `from`, so the owner after a steal is in the record and not only in the transport (ADR 0002, amendment of the same date). The lease table and the steal section below use the new shape. Nothing else changed.
@@ -103,7 +105,7 @@ Replication never changes who may append. A replica is a copy; the acceptance ru
 
 Fencing covers the writes Fabric performs: ledger appends, blob pushes, manifest updates. The harness writes to its workspace directly, and Fabric performs no write on its behalf. The only control over the harness is the kill: a harness launched at epoch N is killed by its supervisor (below) when the supervisor learns of epoch N+1, and until it learns it (which, for a sleeping node, is when it wakes) the harness keeps editing. Everything it wrote after the last published snapshot is preserved by the orphan path below, never by fencing.
 
-Fencing does not reach a writer that never asks Fabric: the harness's own picker, desktop app, remote control or background supervisor can reopen the native session on the departed machine. ADR 0006 therefore writes the harness's native tombstone during capture (Claude's `continued-in` record, Codex `thread/archive`) and refuses to capture a session that a harness supervisor would restart.
+Fencing does not reach a writer that never asks Fabric: the harness's own picker, desktop app, remote control or background supervisor can reopen the native session on the departed machine. ADR 0006 therefore writes the harness's native tombstone (Claude's `continued-in` record, Codex `thread/archive`) and refuses to capture a session that a harness supervisor would restart. Amended 2026-10-22 after review: the tombstone is written once `MoveStarted` is durable and taken back on `MoveAborted` and before any launch by an owner, never during capture, which a standalone suspend also runs (ADR 0006, Tombstones).
 
 ### Who supervises the harness
 

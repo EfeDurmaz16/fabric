@@ -1,0 +1,427 @@
+//! The one error type of this crate.
+//!
+//! Invariant: every variant names a failure the caller can act on, with the
+//! path, program or session it concerns, so the CLI can print what to do
+//! next without parsing a message.
+
+use std::path::PathBuf;
+
+use fabric_core::harness::HarnessKind;
+use fabric_core::path::AbsPath;
+
+use crate::session::SessionId;
+
+/// Why an adapter operation failed.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum HarnessError {
+    /// The harness binary is not on `PATH` and no path was configured.
+    #[error("{program} is not installed (not found on PATH)")]
+    NotInstalled {
+        /// The program name that was looked up.
+        program: String,
+    },
+    /// The workspace path is not absolute or does not exist as a directory.
+    #[error("workspace {path} is not an existing absolute directory")]
+    BadWorkspace {
+        /// The path that was given.
+        path: PathBuf,
+    },
+    /// A path this crate must record or compare as text is not UTF-8.
+    #[error("{path} is not UTF-8")]
+    NotUtf8 {
+        /// The path concerned.
+        path: PathBuf,
+    },
+    /// A directory an adapter was configured with is not under the home it serves.
+    #[error("{path} is not under home {home}")]
+    NotUnderHome {
+        /// The directory that was given.
+        path: PathBuf,
+        /// The home directory of the adapter.
+        home: PathBuf,
+    },
+    /// A manifest captured under one workspace path is restored under another (ADR 0011).
+    #[error(
+        "state was captured for workspace {from}, not {to}; the root must be the same path on every node"
+    )]
+    RootMismatch {
+        /// The workspace path at capture.
+        from: AbsPath,
+        /// The workspace path given to restore.
+        to: AbsPath,
+    },
+    /// A manifest captured under one home directory is restored under another (ADR 0011).
+    #[error(
+        "state was captured under home {from}, not {to}; the home must be the same path on every node"
+    )]
+    HomeMismatch {
+        /// The home at capture.
+        from: AbsPath,
+        /// The home of the restoring adapter.
+        to: AbsPath,
+    },
+    /// The workspace path is so long that Claude's project key would carry an undocumented hash.
+    #[error(
+        "the Claude project key of {path} would be {len} characters; keys over 200 are not supported"
+    )]
+    ProjectKeyTooLong {
+        /// The workspace path.
+        path: PathBuf,
+        /// The key length.
+        len: usize,
+    },
+    /// A manifest lists a file outside the places the adapter captures from.
+    #[error("refusing to restore {path}: the {kind} adapter never captures a file there")]
+    UnexpectedFile {
+        /// The harness restoring.
+        kind: HarnessKind,
+        /// The tree path from the manifest.
+        path: String,
+    },
+    /// A manifest entry has another content kind or mutability than the
+    /// adapter's own rule for its path.
+    #[error(
+        "refusing to restore {path}: the manifest treats it otherwise than the {kind} adapter does"
+    )]
+    EntryMismatch {
+        /// The harness restoring.
+        kind: HarnessKind,
+        /// The tree path from the manifest.
+        path: String,
+    },
+    /// A departure was confirmed for a capture this node did not make, or
+    /// one a later capture of the same session replaced.
+    #[error(
+        "no capture of session {session} with this manifest waits on this node; nothing was confirmed"
+    )]
+    DepartureNotPending {
+        /// The session concerned.
+        session: SessionId,
+    },
+    /// A file operation failed.
+    #[error("{op} {path}: {source}")]
+    Io {
+        /// What was being done.
+        op: IoOp,
+        /// The path concerned.
+        path: PathBuf,
+        /// The underlying error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Starting a process failed.
+    #[error("spawn {program}: {source}")]
+    Spawn {
+        /// The program that was started.
+        program: String,
+        /// The underlying error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// `ps`, `pgrep` or `kill` gave an answer this crate cannot read as
+    /// yes or no, so a question about running processes is not answered.
+    #[error("{program}: {reason}")]
+    ProcessQuery {
+        /// The tool that was asked.
+        program: &'static str,
+        /// What it answered.
+        reason: String,
+    },
+    /// The thread that ran a capture or restore ended without an answer.
+    #[error("the task running the operation was cancelled or panicked: {source}")]
+    BlockingTask {
+        /// The underlying error.
+        #[source]
+        source: tokio::task::JoinError,
+    },
+    /// A file an adapter wanted to carry is on the credential and host-state denylist.
+    #[error("refusing to carry {path}: {rule}")]
+    Denied {
+        /// The path, relative to the state root it lives under.
+        path: String,
+        /// The denylist rule it matched.
+        rule: crate::denylist::DenyRule,
+    },
+    /// Two files of one capture or restore map to the same path.
+    #[error("two files would be written as {path}")]
+    DuplicateTreePath {
+        /// The tree path.
+        path: String,
+    },
+    /// A symlink sits inside harness state, where none belongs.
+    #[error("{path} is a symlink; harness state is carried as regular files only")]
+    SymlinkInState {
+        /// The symlink.
+        path: PathBuf,
+    },
+    /// A file carried byte for byte holds a secret-shaped string.
+    #[error("{path} line {line} holds a secret; it cannot be carried byte for byte")]
+    SecretInState {
+        /// The file concerned.
+        path: PathBuf,
+        /// One-based line number.
+        line: usize,
+    },
+    /// State already on disk is neither equal to nor a prefix of the incoming file.
+    #[error("harness state at {path} has diverged from the incoming copy; nothing was restored")]
+    StateDiverged {
+        /// The file on this node that would have been overwritten.
+        path: PathBuf,
+    },
+    /// A destination changed after restore checked it and before restore
+    /// replaced it, as a harness that started and wrote to it would change it.
+    #[error(
+        "harness state at {path} changed while it was being restored; stop the harness that writes it and restore again"
+    )]
+    StateChanged {
+        /// The file on this node that changed.
+        path: PathBuf,
+    },
+    /// A staged file does not match the length and digest its manifest records.
+    #[error("staged file {path} is corrupt: {reason}")]
+    StateCorrupt {
+        /// The staged file.
+        path: PathBuf,
+        /// What did not match.
+        reason: String,
+    },
+    /// The named session has no state on this node.
+    #[error("{kind} session {session} not found under {searched}")]
+    SessionNotFound {
+        /// The harness that was asked.
+        kind: HarnessKind,
+        /// The session that was looked for.
+        session: SessionId,
+        /// The directory that was searched.
+        searched: PathBuf,
+    },
+    /// A paginated Codex thread refers to a prefix rollout that is missing.
+    #[error("rollout lineage of {session} is broken: prefix rollout {missing} is missing")]
+    LineageBroken {
+        /// The thread whose lineage was followed.
+        session: SessionId,
+        /// The rollout id that could not be found.
+        missing: SessionId,
+    },
+    /// Two rollout files share one rollout id and neither is a prefix of the other.
+    #[error("rollout {rollout} of {session} exists as two different files: {paths:?}")]
+    LineageAmbiguous {
+        /// The thread whose lineage was followed.
+        session: SessionId,
+        /// The rollout id that appears twice.
+        rollout: SessionId,
+        /// The files that disagree.
+        paths: Vec<PathBuf>,
+    },
+    /// Another process holds the harness's own writer lock for the session.
+    #[error("{kind} session {session} has an active writer on this node; stop it first")]
+    ActiveWriter {
+        /// The harness.
+        kind: HarnessKind,
+        /// The session.
+        session: SessionId,
+    },
+    /// A harness process is running, so its files must not be edited now.
+    #[error("{program} is running (pids {pids:?}); retry when it has exited")]
+    HarnessRunning {
+        /// The program seen running.
+        program: String,
+        /// Its process ids.
+        pids: Vec<u32>,
+    },
+    /// A captured manifest, a record of this crate or a vendor file did not parse.
+    #[error("{what} at {path} does not parse: {reason}")]
+    Malformed {
+        /// What was being parsed.
+        what: Input,
+        /// The file concerned.
+        path: PathBuf,
+        /// The parser's message.
+        reason: String,
+    },
+    /// The manifest was captured by another kind of harness than the one restoring it.
+    #[error("manifest was captured by {captured}, not {restoring}")]
+    WrongHarness {
+        /// The harness that captured the state.
+        captured: HarnessKind,
+        /// The harness asked to restore it.
+        restoring: HarnessKind,
+    },
+    /// A secret matched inside a signed block that is not an array element, so it cannot be dropped.
+    #[error("{path} line {line}: a secret sits inside a signed block that cannot be dropped")]
+    SecretInSignedBlock {
+        /// The file concerned.
+        path: PathBuf,
+        /// One-based line number.
+        line: usize,
+    },
+    /// A protocol agent was asked to run in a terminal, which it cannot do.
+    #[error("{program} speaks a protocol on its stdio; it has no terminal mode, attach a client")]
+    NeedsClient {
+        /// The agent program.
+        program: String,
+    },
+    /// The ACP agent does not advertise `session/load` or `session/resume`.
+    #[error(
+        "{program} advertises neither session/load nor session/resume; it cannot continue a session"
+    )]
+    LoadNotSupported {
+        /// The agent program.
+        program: String,
+    },
+    /// An ACP agent has no declared state directory, so its sessions cannot be captured.
+    #[error("no state directory is declared for {program}; its sessions cannot be captured")]
+    StateDirNotDeclared {
+        /// The agent program.
+        program: String,
+    },
+    /// An ACP state directory is Fabric's own state directory, lies inside
+    /// it, or holds it.
+    #[error("{path} overlaps Fabric's own state at {fabric}; an agent's state directory must not")]
+    StateDirHoldsFabric {
+        /// The declared state directory.
+        path: PathBuf,
+        /// Fabric's state directory under the home.
+        fabric: PathBuf,
+    },
+    /// The launch environment sets a variable that makes the harness keep
+    /// its state or login somewhere other than the adapter reads and writes.
+    #[error(
+        "the launch environment sets {var}, which moves {moves} of {program} away from where Fabric reads them; unset {var}"
+    )]
+    ConfigMoved {
+        /// The harness program.
+        program: String,
+        /// The variable the launch environment sets.
+        var: &'static str,
+        /// What the variable moves, in words.
+        moves: &'static str,
+    },
+    /// The launch environment makes Codex keep its sessions and login in
+    /// another directory than the store the adapter reads.
+    #[error(
+        "the launch environment makes codex keep its sessions and login under {dir}, but Fabric reads {store}; launch with CODEX_HOME set to {store}"
+    )]
+    CodexHomeMismatch {
+        /// The directory Codex would use.
+        dir: PathBuf,
+        /// The store the adapter reads.
+        store: PathBuf,
+    },
+    /// An ACP agent's launch arguments hold a secret shape; they travel in
+    /// the manifest as part of the harness kind, outside any redaction.
+    #[error("the launch arguments of {program} hold a secret; pass it through the environment")]
+    SecretInArguments {
+        /// The agent program.
+        program: String,
+    },
+    /// A settings or MCP overlay holds a literal secret instead of a reference.
+    #[error("{path} holds a literal secret; use a ${{VAR}} reference in an overlay")]
+    SecretInOverlay {
+        /// The overlay file.
+        path: PathBuf,
+    },
+    /// A manifest breaks the rules of `manifest`.
+    #[error("manifest: {0}")]
+    BadManifest(#[from] crate::manifest::ManifestError),
+    /// A standard redaction rule does not compile, so nothing is captured.
+    #[error(transparent)]
+    BadRedactionRule(#[from] BadRule),
+    /// The Agent Client Protocol exchange failed.
+    #[cfg(feature = "acp")]
+    #[error("acp: {0}")]
+    Acp(#[from] crate::acp::client::AcpError),
+}
+
+/// The file operation that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IoOp {
+    /// Reading a file or its metadata.
+    Read,
+    /// Writing a file or setting its mode.
+    Write,
+    /// Creating a directory.
+    CreateDir,
+    /// Listing a directory.
+    Walk,
+    /// Renaming a file into place.
+    Rename,
+    /// Flushing a file or directory to disk.
+    Fsync,
+    /// Taking a file lock.
+    Lock,
+    /// Resolving a path to its physical form.
+    Canonicalize,
+    /// Removing a file.
+    Remove,
+}
+
+impl std::fmt::Display for IoOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            IoOp::Read => "read",
+            IoOp::Write => "write",
+            IoOp::CreateDir => "create dir",
+            IoOp::Walk => "walk",
+            IoOp::Rename => "rename",
+            IoOp::Fsync => "fsync",
+            IoOp::Lock => "lock",
+            IoOp::Canonicalize => "canonicalize",
+            IoOp::Remove => "remove",
+        })
+    }
+}
+
+/// The kind of input that did not parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Input {
+    /// A state manifest.
+    Manifest,
+    /// A departure record under `~/.fabric/harness/departed/`.
+    DepartureRecord,
+    /// The first line of a Codex rollout.
+    RolloutLine,
+    /// Claude's `~/.claude.json`.
+    ConfigJson,
+    /// A path inside a state tree.
+    StatePath,
+    /// A workspace path that a manifest or a harness setting cannot hold.
+    WorkspacePath,
+}
+
+impl std::fmt::Display for Input {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Input::Manifest => "manifest",
+            Input::DepartureRecord => "departure record",
+            Input::RolloutLine => "rollout line",
+            Input::ConfigJson => "config json",
+            Input::StatePath => "state path",
+            Input::WorkspacePath => "workspace path",
+        })
+    }
+}
+
+impl HarnessError {
+    /// Wraps an IO error with the operation and the path it concerned.
+    pub(crate) fn io(op: IoOp, path: impl Into<PathBuf>, source: std::io::Error) -> Self {
+        HarnessError::Io {
+            op,
+            path: path.into(),
+            source,
+        }
+    }
+}
+
+/// A standard rule whose pattern does not compile.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("redaction rule {rule} does not compile: {reason}")]
+pub struct BadRule {
+    /// The rule's name.
+    pub rule: &'static str,
+    /// What the regex compiler said.
+    pub reason: String,
+}

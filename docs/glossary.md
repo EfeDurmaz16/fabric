@@ -18,7 +18,7 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Doctor.** `fabric doctor`: the preflight that compares exact strings (user, home, tool versions, logins as yes or no, clock offset, synced folders) between two nodes and refuses a move on a mismatch the table marks as refuse.
 
-**EnvSpec.** The environment specification of a job: tool versions, setup steps, env var names and cache paths. It describes how to make a node able to run the job. It never contains secret values.
+**EnvSpec.** The environment specification of a job: tool pins, setup steps, env var names, cache paths and the secret patterns the job added. It describes how to make a node able to run the job. It never contains secret values.
 
 **Event.** One append-only record in a job's ledger. Events are never edited or deleted.
 
@@ -34,7 +34,13 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Job.** The unit of development work. A goal plus a ledger plus snapshots plus an EnvSpec plus a lease.
 
-**Job init.** `fabric job init`: adopting the current directory, in place, as a job's workspace, or creating a fresh one with `--new`. The only way a job starts.
+**Job init.** `fabric job init`: adopting the current directory, in place, as a job's workspace. Planned; not built (ADR 0016).
+
+**Job new.** `fabric job new --repo <path>`: making a job whose root is a clone of the repository at `~/fabric/jobs/<job-id>/work`. How a job starts in this phase.
+
+**Departed copy.** The workspace a node held for a job that has since moved to another node. It never runs again; when it holds nothing the job lacks, it is renamed out of the root to `departed/<epoch>` beside it and kept (ADR 0016).
+
+**Node.** One `fabric serve` process and its state directory: the store, the ledgers, the peer book and the control socket the CLI talks to.
 
 **Job record.** The ledger and the manifest together.
 

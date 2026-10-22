@@ -2,6 +2,8 @@
 
 Status: accepted, 2026-10-19
 
+2026-10-20: [ADR 0016](0016-node-and-cli-as-built.md) records `fabric doctor` as built, with the rows that warn where this table refuses and why.
+
 Amended 2026-10-19 after step 1 research. The root rule moved to ADR 0011. This ADR now states the one placement command of this phase, `fabric job move <job> --to <node>`, the pull form of it, the rule that every automatic choice prints its reason, and the preflight `fabric doctor` runs before any move (`2026-10-19-step1-design-input.md`, sections 8.0 and 9, D18 and D19; `step1/preflight-2026-10-19.md`). Triggers stay out of this phase.
 
 ## Context
@@ -23,7 +25,7 @@ There is no placement policy. There are two commands and both name the node:
 
 Nothing picks a node. A warm-cache rule was considered (prefer the node that already holds most of the latest snapshot's chunks) and dropped, because right after a move the warmest node is always the one the user just left. The warm-cache measure survives as information: `fabric status` shows, per paired node, the fraction of the latest snapshot's chunks that node holds, and the owner of every job, so the user can see where a move would be cheap and who holds what before typing anything.
 
-Where Fabric does choose, it prints the reason in the command's output, one line per choice. In this phase the choices are: the workspace root ("same path as the source, `/Users/efebarandurmaz/oss/x`", ADR 0011), the transport ("TCP+TLS: QUIC to `fab1...` timed out after 2 s", ADR 0005), each cache carried or rebuilt ("`node_modules` rebuilt: pnpm 11.23.0 on the source, none here", ADR 0012), and each setup step run ("`pnpm install --frozen-lockfile`: `node_modules` missing", ADR 0007). A choice the user cannot see is a choice the user cannot correct, and the research's one documented placement failure is a silent one (T3 #15814, cited in the design input, D19).
+Where Fabric does choose, it prints the reason in the command's output, one line per choice. In this phase the choices are: the workspace root ("same path as the source, `/Users/me/oss/x`", ADR 0011), the transport ("TCP+TLS: QUIC to `fab1...` timed out after 2 s", ADR 0005), each cache carried or rebuilt ("`node_modules` rebuilt: pnpm 11.23.0 on the source, none here", ADR 0012), and each setup step run ("`pnpm install --frozen-lockfile`: `node_modules` missing", ADR 0007). A choice the user cannot see is a choice the user cannot correct, and the research's one documented placement failure is a silent one (T3 #15814, cited in the design input, D19).
 
 The two-Mac gate is a push from the Pro to the Air (the Pro dials, the Air cannot) followed by `fabric resume` on the Air, and a pull from the Pro to bring the job back (ADR 0005, Pairing).
 

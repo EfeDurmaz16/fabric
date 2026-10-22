@@ -1,6 +1,6 @@
 # Fabric architecture
 
-Status: design only. No code behind this page yet. See the [README](../README.md) for what exists.
+Status: built through the first gate's commands, not yet run on the two Macs. See the [README](../README.md) for what exists. Where the code departs from this page, [ADR 0016](adr/0016-node-and-cli-as-built.md) says so: a job starts with `fabric job new` (a clone under `~/fabric/jobs/<id>/work`) because `job init` is not built, the node runs as `fabric serve`, and a departed copy leaves the root.
 
 Amended 2026-10-19 after step 1 research. The lease lost its clock and gained a move protocol (ADR 0003), the root is the same absolute path on every node (ADR 0011), caches carry under per-ecosystem keys (ADR 0012), and the move onto the second machine is an explicit push (ADR 0008). The research files are listed under Evidence paths.
 
@@ -16,25 +16,25 @@ A job is a goal plus the state needed to keep working on it. Where that state is
 |---|---|---|---|
 | Job record | Goal, append-only event ledger, versioned manifest, pending decisions, an opaque state directory per harness | `fabric-core` | [0001](adr/0001-job-as-unit-of-work.md), [0002](adr/0002-job-ledger-and-record.md) |
 | Storage | Content-addressed snapshots of the workspace: git objects and refs in a bundle, the index and the working tree as two snapshot commits, ignored files by class (deps, build, tool caches and precious files carried, secrets never), harness state | `fabric-store` | [0004](adr/0004-content-addressed-snapshots.md), [0011](adr/0011-path-identity.md) |
-| Compute | The node that owns the job and runs the harness right now. Replaceable by an explicit move. Exactly one live copy. | `fabric-node`, `fabric-net` | [0003](adr/0003-exactly-one-live-copy.md), [0005](adr/0005-transport-and-node-identity.md), [0008](adr/0008-placement-and-triggers.md) |
-| Environment | `EnvSpec`: detected tool versions, setup commands, env var names, cache paths. Caches arrive when their carry key matches; otherwise the node materializes. | `fabric-env` | [0007](adr/0007-environment-spec.md), [0012](adr/0012-dependency-carry.md) |
+| Compute | The node that owns the job and runs the harness right now. Replaceable by an explicit move. Exactly one live copy. | `fabricd`, `fabric-net` | [0003](adr/0003-exactly-one-live-copy.md), [0005](adr/0005-transport-and-node-identity.md), [0008](adr/0008-placement-and-triggers.md), [0013](adr/0013-network-protocol-as-built.md), [0016](adr/0016-node-and-cli-as-built.md) |
+| Environment | `EnvSpec`: tool pins as the workspace files write them, setup commands, env var names, cache paths, the job's added secret patterns. Caches arrive when their carry key matches; otherwise the node materializes. | `fabric-env` | [0007](adr/0007-environment-spec.md), [0012](adr/0012-dependency-carry.md) |
 
 Harnesses (Claude Code, Codex, anything that speaks the Agent Client Protocol) are adapters on top of these four. The core never reads a harness's files; it moves them as opaque bytes. See [0006](adr/0006-harness-adapters.md).
 
-## Crate layout (planned)
+## Crate layout
 
 ```text
 crates/
-  fabric-core      job, ledger, manifest, lease and move state machine, trait definitions
+  fabric-core      job, ledger, manifest, lease and move state machine, the secret policy, trait definitions
   fabric-store     objects, blob store, SQLite catalog, snapshot publish and restore, ignored-file classes
-  fabric-net       node identity, Transport trait, QUIC and TCP+TLS, blob transfer, pairing
+  fabric-net       node identity, Endpoint and the per-wire Transport trait, QUIC and TCP+TLS, blob transfer, pairing
   fabric-harness   Harness trait, ACP adapter, Claude Code adapter, Codex adapter
-  fabric-env       EnvSpec detection, carry keys, materialization, doctor facts
-  fabric-node      the long-running node process: owner of the store lock, blob server, move target
-  fabric-cli       the `fabric` binary: job init, suspend, resume, job move, job steal, status, doctor, orphan export, node pair, node serve
+  fabric-env       EnvSpec detection, the .fabric/env.toml override file, materialization
+  fabricd          the node: state directory lock, ledger files, store owner, peer service, move protocol, doctor facts and carry keys, control socket
+  fabric           the `fabric` binary: serve, node, job new, run, suspend, resume, move, steal, status, log, approve, reject, doctor
 ```
 
-Only `fabric-core` exists today, and it holds a placeholder. Dependency direction is strictly downward: `fabric-cli` depends on everything, `fabric-core` depends on nothing in the workspace. `fabric-core` defines the `Store`, `Transport` and `Harness` traits; the other crates implement them. Nothing in the core knows about QUIC, SQLite or any agent vendor.
+Every crate above exists. Carry keys and doctor facts live in `fabricd`, which measures them, rather than in `fabric-env` (ADR 0016). Dependency direction is strictly downward: `fabric` depends on everything, `fabric-core` depends on nothing in the workspace. Today `fabric-core` defines one trait, `LedgerStore`, and `BoxFuture`, the return type of every dynamically dispatched trait, defined once. `fabric-net` defines `Transport`, the interface of one wire, because its byte streams are tokio types the core does not depend on; `fabricd` holds an `Endpoint`, which binds both wires on one port and is the place an iroh endpoint would replace (ADR 0013). The `Harness` trait lives in `fabric-harness` for now, because its launch handle owns a child process and the core stays pure (ADR 0015). Nothing in the core knows about QUIC, SQLite or any agent vendor.
 
 ## Data structures first
 
@@ -70,7 +70,7 @@ Marker       = { root, job_id, base: Option<SnapshotId>,
 Entry        = { rel_path: RelPath, kind: File { size, chunks: [ChunkId] } | Dir | Symlink { target }, mode, mtime_ns }
 
 EnvSpec      = { tools: [{ name, version, source }], setup: [{ program, args, cwd, when }],
-                 env_var_names: [String], cache_paths: [RelPath] }
+                 env_var_names: [EnvVarName], cache_paths: [RelPath], secret_patterns: [SecretPattern] }
 ```
 
 Every list in a manifest is strictly sorted by its key, and every manifest's bytes start with the format version. Every id is either content-derived (hashes) or time-sortable and collision-free (ULIDs), and the core makes none of them: the edge draws ULIDs from its clock and hands the core the bytes. The one host path is `SnapshotManifest.root`, the directory the job was captured in, which is also where every node restores it (ADR 0011). Nothing is a vendor session id. There is no clock in any state transition: the lease has an epoch and no expiry (ADR 0003).
@@ -107,13 +107,13 @@ Step by step, with the failure each step must survive:
 
 0. `fabric job init` on A, inside the checkout where Claude Code is already running. It records the directory as the job's root in the node-local marker, finds the Claude session with the adapter's `detect`, appends `Created`, which makes A the owner at epoch 1, and writes the first `EnvSpec`. Nothing is moved and nothing is stopped (ADR 0001). A crash here leaves at most a job directory with no `Created` record, which the next `init` replaces.
 1. `fabric job move <job> --to air` on A runs `fabric doctor --against air` first (ADR 0008). A refused row stops the move before anything changes; a fallback row is printed and carried into the snapshot's cache entries (ADR 0012).
-2. A stops the harness and publishes a snapshot in the order ADR 0004 fixes: the marker `Suspending` with the ledger head; new objects to `tmp/`, `fsync`, rename into `chunks/`; chunk rows; the manifest by the same temp and rename; the snapshot rows; directory `fsync`; and only then the `SnapshotPublished` ledger event, which is the single commit point. Then `Suspended`, then the marker `Clean`. A `kill -9` between any two of these steps is not a special case: the next command on the job reads the marker and the head and finishes the sequence without a second capture (ADR 0004, Suspend). If the harness will not stop, nothing is written and the job stays live on A.
+2. A stops the harness and publishes a snapshot in the order ADR 0004 fixes: the marker `Suspending` with the ledger head; every new object written to `tmp/`, flushed and linked into `objects/`, the manifest's bytes stored as objects by the same rule; the touched shard directories flushed; one catalog transaction for the snapshot and its rows (ADR 0014); and only then the `SnapshotPublished` ledger event, which is the single commit point. Then `Suspended`, then the marker `Clean`. A `kill -9` between any two of these steps is not a special case: the next command on the job reads the marker and the head and finishes the sequence without a second capture (ADR 0004, Suspend). If the harness will not stop, nothing is written and the job stays live on A.
 3. A pushes the ledger suffix and every object B lacks. B asks per object id; a dropped connection restarts at the next missing object. Nothing about ownership has changed, so this step can fail or be killed any number of times and A is still the owner (ADR 0003, step 2).
 4. Once B reports the snapshot complete, A appends `MoveStarted { move_id, target: B }`, `fsync`s, and sends `MoveOffer`. From this append on A is not runnable. This is the one ambiguous window, and it is one round trip long.
 5. B checks that its replica head is that `MoveStarted` and the snapshot is complete, appends `MoveImported { move_id, from: A }` at epoch 2, `fsync`s, and replies with the record. If the reply is lost, A asks `MoveStatus { move_id }` and gets the same record back; B never writes a second decision for the same `move_id`. If A crashed after step 4, the next command on A asks the same question. If B is unreachable, A stays frozen: not runnable, not lost, and `fabric status` names B and the two commands that resolve it, `fabric job move` again or `fabric job steal --force` (ADR 0003). This is the T3 Code bug made impossible: no path leads A back to runnable without a record B wrote.
-6. A appends B's record. The chain now says B owns epoch 2. A refuses any write, blob push or ledger append carrying epoch 1, and A's workspace stays on disk, marker `Clean`, as a departed copy that makes the next move back cheap.
-7. `fabric resume <job>` on B. The ledger says B owns the job, so no network step is needed. B restores at `SnapshotManifest.root`, the same absolute path as on A (ADR 0011). If that path already holds a workspace, its marker decides: the same snapshot means skip, a cleanly suspended older snapshot means update in place, anything else means refuse and point at `fabric orphan export`. A fresh restore writes into a temp directory and renames at the end, so a crash leaves no half workspace. Nothing inside harness state is rewritten; Claude Code's signed thinking blocks would not survive it (ADR 0006).
-8. B compares each cache entry's carry key with its own measurement (ADR 0012). A matching `node_modules` is written and nothing runs. A mismatched one is skipped, printed with the field that differed, and `fabric-env` runs the `EnvSpec` setup step for it (ADR 0007). On the two Macs as measured, Node 22 against Node 26 means the install path.
+6. A appends B's record. The chain now says B owns epoch 2. A refuses any write, blob push or ledger append carrying epoch 1. A's workspace, clean at the snapshot B imported and unchanged since, is renamed to `departed/<epoch>` beside the root and kept, never run; a workspace with changes after its last snapshot stays at the root as an orphan (ADR 0016, Job roots and departed copies).
+7. `fabric resume <job>` on B. The ledger says B owns the job, so no network step is needed. B restores at `SnapshotManifest.root`, the same absolute path as on A (ADR 0011). If that path already holds a workspace, its marker decides: a workspace of the current tenure, or one clean and unchanged at the latest snapshot, is used as it is, and anything else is renamed to `orphan/<epoch>` beside the root before a fresh restore (ADR 0016; the in-place update is not built). A fresh restore writes into a temp directory and renames at the end, so a crash leaves no half workspace. Nothing inside harness state is rewritten; Claude Code's signed thinking blocks would not survive it (ADR 0006).
+8. B compares each cache entry's carry key with its own measurement (ADR 0012). A matching `node_modules` is written; `fabric-env` detects again over the restored tree, and nothing runs when the tree holds the sentinel a finished install left for the lockfile the workspace has now (a tree installed by hand on A, or from another lockfile, installs once more). A mismatched one is skipped, printed with the field that differed, and `fabric-env` runs the `EnvSpec` setup step for it (ADR 0007). On the two Macs as measured, Node 22 against Node 26 means the install path.
 9. The `fabric resume` process pre-seeds trust for the root, launches the agent in the user's terminal with the job's overlay flags, in its own process group, registers its pid and start time with the supervisor, and appends `Resumed`. The supervisor is the node process when one runs and otherwise the `resume` command itself, which stays in the foreground until the agent exits and kills the process group if it learns a higher epoch (ADR 0003). `resume` never launches an agent and exits.
 
 If B dies between steps 7 and 9, B owns epoch 2 and the job is not lost: the snapshot is on both nodes and the ledger says B imported. Running `fabric resume` again on B finishes the restore if it did not complete, skips it when the workspace marker already names the snapshot, and relaunches (ADR 0004). Nothing bumps the epoch by itself: bringing the job back to A is `fabric resume` on A, which pulls from B's node process by the same protocol, or, if B is gone, `fabric job steal <job> --force` on A, which prints what B may have left behind. Once epoch 3 exists, the epoch 2 owner can never write again.
@@ -140,7 +140,7 @@ If B dies between steps 7 and 9, B owns epoch 2 and the job is not lost: the sna
 
 ## How to read the ADRs
 
-Read them in number order. 0001 and 0002 define the data. 0003 is the one that protects the user's work and is worth the most review time. 0004 and 0005 are the storage and network mechanics. 0006 and 0007 are the adapters. 0008 is the explicit move and the preflight. 0009 is how we work. 0010 is what Fabric is not. 0011 and 0012 are the two decisions the preflight measurements forced: the root path and which caches travel.
+Read them in number order. 0001 and 0002 define the data. 0003 is the one that protects the user's work and is worth the most review time. 0004 and 0005 are the storage and network mechanics. 0006 and 0007 are the adapters. 0008 is the explicit move and the preflight. 0009 is how we work. 0010 is what Fabric is not. 0011 and 0012 are the two decisions the preflight measurements forced: the root path and which caches travel. 0013 records the network protocol as the code built it and supersedes parts of 0005. 0014 records the store as built and supersedes the parts of 0004 it names. 0015 records the harness trait as built and supersedes the trait section of 0006. 0016 records the node and the CLI as built and says where they depart from 0001, 0003, 0004, 0008 and 0011.
 
 ### Evidence paths
 

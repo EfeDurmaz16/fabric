@@ -1,5 +1,5 @@
 //! Core types of Fabric: ids, the job ledger and its lease, the move
-//! protocol, snapshot manifests and the environment spec.
+//! protocol, snapshot manifests, the environment spec and the secret policy.
 //!
 //! This crate is pure. It does no IO, holds no clock and opens no socket.
 //! It depends on nothing else in the workspace and knows nothing about QUIC,
@@ -81,6 +81,7 @@
 //! ```
 
 pub mod codec;
+pub mod credential;
 pub mod env;
 pub mod git;
 pub mod harness;
@@ -89,4 +90,13 @@ pub mod lease;
 pub mod ledger;
 pub mod moves;
 pub mod path;
+pub mod secret;
 pub mod snapshot;
+
+/// A boxed, `Send` future: the return type of every trait the core
+/// dispatches through `Box<dyn Trait>` (ADR 0005).
+///
+/// Native `async fn` in a trait is not dyn compatible on the pinned
+/// toolchain and cannot require `Send`, so dynamically dispatched traits
+/// return this alias instead.
+pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;

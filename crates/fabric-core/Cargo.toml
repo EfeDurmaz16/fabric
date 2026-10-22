@@ -1,7 +1,7 @@
 [package]
 name = "fabric-core"
 version = "0.1.0"
-description = "Core types of Fabric: ids, the job ledger, the lease, snapshot manifests and the environment spec"
+description = "Core types of Fabric: ids, the job ledger, the lease, snapshot manifests, the environment spec and the secret policy"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -17,6 +17,7 @@ unicode-normalization = "0.1"
 
 [dev-dependencies]
 proptest = { version = "1.12", default-features = false, features = ["std"] }
+tempfile = "3.27"
 
 [lints]
 workspace = true

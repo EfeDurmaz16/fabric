@@ -1,0 +1,24 @@
+[package]
+name = "fabric-store"
+version = "0.1.0"
+description = "Content-addressed object store, SQLite catalog, workspace capture and restore for Fabric"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+fabric-core = { path = "../fabric-core" }
+fastcdc = "5.0"
+rusqlite = { version = "0.40", features = ["bundled"] }
+rustix = { version = "1.1", features = ["fs"] }
+thiserror = "2.0"
+tracing = "0.1"
+zstd = "0.14"
+
+[dev-dependencies]
+proptest = { version = "1.12", default-features = false, features = ["std"] }
+tempfile = "3.27"
+
+[lints]
+workspace = true

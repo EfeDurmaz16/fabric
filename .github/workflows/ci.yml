@@ -77,8 +77,23 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # Each adapter is a cargo feature; each one alone and none at all
+      # must build clean, not only the default set.
+      - name: Clippy per feature
+        run: |
+          for features in "" acp claude codex; do
+            cargo clippy -p fabric-harness --all-targets --locked --no-default-features --features "$features" -- -D warnings
+          done
+
+      # The end-to-end test runs in the next step, so its time and its
+      # failures show on their own line.
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked -- --skip e2e_
+
+      # Two fabric daemons over loopback on QUIC and on TCP+TLS: a job moved
+      # and resumed, then the move broken at every named fault point.
+      - name: End-to-end
+        run: cargo test -p fabric --test e2e --locked
 
       - name: Docs
         run: cargo doc --workspace --no-deps --locked
