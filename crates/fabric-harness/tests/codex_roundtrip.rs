@@ -325,6 +325,59 @@ async fn a_running_codex_too_old_for_the_writer_lock_blocks_capture_and_restore(
     assert_eq!(std::fs::read(&src.head).unwrap(), before);
 }
 
+/// A Codex that was running before the binary on disk was upgraded to
+/// one that takes the writer lock may itself take none. It still holds the
+/// rollout of its thread open, and that must block capture and restore
+/// even though the installed version trusts the lock.
+#[tokio::test]
+async fn a_live_writer_that_takes_no_lock_blocks_capture_and_restore() {
+    let src = build_source();
+    let home = src.home.path().canonicalize().unwrap();
+    let adapter = node(&home);
+    let out = tempfile::tempdir().unwrap();
+    adapter
+        .capture(&src.work, &thread(), out.path())
+        .await
+        .unwrap();
+    let ready = home.join("holder-ready");
+    let mut holder = std::process::Command::new("/bin/sh")
+        .args(["-c", r#"exec 3>>"$1" && : > "$2" && exec sleep 60"#, "sh"])
+        .arg(&src.head)
+        .arg(&ready)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the holder never opened the rollout"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let pid = holder.id();
+    let again = tempfile::tempdir().unwrap();
+    let captured = adapter.capture(&src.work, &thread(), again.path()).await;
+    let before = std::fs::read(&src.head).unwrap();
+    let restored = adapter.restore(&src.work, out.path()).await;
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", "--", &format!("-{pid}")])
+        .status();
+    let _ = holder.wait();
+    let err = captured.unwrap_err();
+    assert!(
+        matches!(err, HarnessError::HarnessRunning { ref pids, .. } if pids.contains(&pid)),
+        "{err}"
+    );
+    assert!(!again.path().join("manifest.json").exists());
+    let err = restored.unwrap_err();
+    assert!(
+        matches!(err, HarnessError::HarnessRunning { ref pids, .. } if pids.contains(&pid)),
+        "{err}"
+    );
+    assert_eq!(std::fs::read(&src.head).unwrap(), before);
+}
+
 #[tokio::test]
 async fn a_rollout_with_a_secret_is_refused_not_carried() {
     let src = build_source();

@@ -33,7 +33,15 @@
 //! trusted only when the installed Codex is at least the version it was
 //! checked on; with an older or unknown version, any running `codex`
 //! refuses the capture or restore, because a Codex that takes no lock
-//! would keep appending to a rollout that restore renamed away.
+//! would keep appending to a rollout that restore renamed away. The
+//! installed version says nothing about a `codex` started before the
+//! binary on disk was upgraded, so capture and restore also refuse, under
+//! the lock, while any process holds one of the thread's rollout files
+//! open: Codex's rollout writer keeps the file open while the thread is
+//! loaded (`RolloutWriterState::writer` in
+//! `codex-rs/rollout/src/recorder.rs` at `e4568a3`). A writer that has the
+//! file closed at that moment, as Codex's has after a failed write until
+//! it retries, is not seen this way.
 //!
 //! Surfaces used, checked against `codex --help`, `codex resume --help`
 //! and `codex exec resume --help` of 0.155.1 on 2026-10-19: `codex resume
@@ -454,6 +462,21 @@ impl Codex {
         }
     }
 
+    /// Refuses while any process holds one of `files` open: a Codex that
+    /// takes no writer lock, whatever the binary on disk says, still holds
+    /// the rollout of a thread it has loaded.
+    fn refuse_open(files: &[PathBuf]) -> Result<(), HarnessError> {
+        let pids = process::holding(files)?;
+        if pids.is_empty() {
+            Ok(())
+        } else {
+            Err(HarnessError::HarnessRunning {
+                program: PROGRAM.to_owned(),
+                pids,
+            })
+        }
+    }
+
     fn capture_sync(
         &self,
         root: &AbsPath,
@@ -467,6 +490,8 @@ impl Codex {
         pipeline::refuse_symlinks(self.home_dir(), &self.store)?;
         let lock = self.hold_writer_lock(session)?;
         let chain = self.lineage(session)?;
+        let files: Vec<PathBuf> = chain.iter().map(|file| file.path.clone()).collect();
+        Self::refuse_open(&files)?;
         let mut sources = Vec::with_capacity(chain.len());
         for file in &chain {
             rollout::refuse_secrets(file)?;
@@ -592,6 +617,16 @@ impl Codex {
         pipeline::refuse_symlinks(self.home_dir(), &self.store)?;
         let lock = self.hold_writer_lock(&session)?;
         let existing = self.all_rollouts()?;
+        let lineage: Vec<PathBuf> = existing
+            .iter()
+            .filter(|file| {
+                chain
+                    .iter()
+                    .any(|staged| staged.name.rollout_id == file.name.rollout_id)
+            })
+            .map(|file| file.path.clone())
+            .collect();
+        Self::refuse_open(&lineage)?;
         let fallback_dir = self
             .store
             .join("sessions")
