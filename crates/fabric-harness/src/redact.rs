@@ -116,12 +116,29 @@ const PATTERNS: &[Pattern] = &[
     Pattern {
         name: "secret-assignment",
         regex: r#"(?-u:\b)(?P<keep>[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|ACCESS_KEY|CREDENTIALS|DATABASE_URL|DSN)[A-Z0-9_]*=['"]?)[^\s'"$\[][^\s'"]*"#,
-        accept: any,
+        accept: assigned_value_is_secret,
     },
 ];
 
 fn any(_: &[u8]) -> bool {
     true
+}
+
+/// True unless the value after the first `=` is a number of three digits
+/// or fewer: `MAX_TOKENS=512`, `TOKEN_TTL=60` and `PASSWORD_MIN_LENGTH=8`
+/// name a count, a time or a length, and a secret that short protects
+/// nothing. A longer number still counts, as it did before any value
+/// length was accepted.
+fn assigned_value_is_secret(matched: &[u8]) -> bool {
+    let value = matched
+        .iter()
+        .position(|b| *b == b'=')
+        .map_or(matched, |at| &matched[at + 1..]);
+    let value = value
+        .strip_prefix(b"'")
+        .or_else(|| value.strip_prefix(b"\""))
+        .unwrap_or(value);
+    value.len() > 3 || !value.iter().all(u8::is_ascii_digit)
 }
 
 /// True for a random-looking key: it has an upper-case letter and a lower-case
@@ -393,6 +410,26 @@ mod tests {
             "DB_PASSWORD=[REDACTED:secret-assignment] TOKEN='[REDACTED:secret-assignment]' API_KEY= PORT=1"
         );
         assert_eq!(counts.get("secret-assignment"), Some(&2));
+    }
+
+    /// A count, a length or a time to live is a small number, and a secret
+    /// of three digits or fewer protects nothing; for Codex a match refuses
+    /// every later capture of the thread, so these are not secrets.
+    #[test]
+    fn a_short_number_under_a_secret_word_is_not_a_secret() {
+        let r = Redactor::standard().unwrap();
+        for text in [
+            "OPENAI_MAX_TOKENS=512",
+            "TOKEN_TTL=60",
+            "PASSWORD_MIN_LENGTH=8",
+            "MAX_TOKENS='512'",
+        ] {
+            assert!(!r.matches(text), "{text} must not match");
+            assert!(!r.matches_bytes(text.as_bytes()), "{text} as bytes");
+        }
+        for text in ["DB_PASSWORD=ab1", "PIN_SECRET=1234", "TOKEN=x"] {
+            assert!(r.matches(text), "{text} must match");
+        }
     }
 
     #[test]
