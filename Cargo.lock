@@ -374,6 +374,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "fabric-core",
+ "rustix",
  "serde_json",
  "tempfile",
  "thiserror",

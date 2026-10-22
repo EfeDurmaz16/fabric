@@ -64,18 +64,22 @@
 //! anything in the tree, and a lock they can unlink guards nothing. The
 //! caller takes it before restore writes the tree and holds it through
 //! `plan` and `execute`, which take it by reference, so neither can run
-//! without it. `execute` hands that same open file to every step as its
-//! standard input, an empty file that reads as end of input. The lock
-//! belongs to the open file, which the installer and the processes that
-//! inherit its input share, so it outlives a killed resume and ends when
-//! the last of them exits; until then `TreeLock::acquire` refuses, so a
-//! second resume neither restores over nor starts a second installer on a
-//! tree the first one is still writing. A process a step leaves behind
-//! with that input still open, such as a daemon that did not redirect it,
-//! holds the lock too, and resumes refuse until it exits.
+//! without it. `execute` hands that same open file to every step twice:
+//! as its standard input, an empty file that reads as end of input, and
+//! under a descriptor number above the standard three, so a step that
+//! replaces its input, as `sh -c 'exec </dev/null; ...'` does, still holds
+//! it. The lock belongs to the open file, which the installer and the
+//! processes that inherit either descriptor share, so it outlives a killed
+//! resume and ends when the last of them exits; until then
+//! `TreeLock::acquire` refuses, so a second resume neither restores over
+//! nor starts a second installer on a tree the first one is still
+//! writing. A process a step leaves behind with either descriptor still
+//! open, such as a daemon that did not close them, holds the lock too, and
+//! resumes refuse until it exits.
 //!
-//! The reverse gap is open: a process the step starts with its own
-//! standard input does not hold the lock. npm runs dependency install
+//! The reverse gap is open: a process the step starts holds the lock only
+//! when it inherits one of those descriptors, and Node and Python pass on
+//! only the ones they name. npm runs dependency install
 //! scripts, such as a `node-gyp` build, with piped input, so if the
 //! installer alone is killed (the OOM killer, a force quit) while such a
 //! build still writes, the lock is released and the next resume can start
@@ -89,6 +93,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, TryLockError};
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -497,7 +502,8 @@ impl NodeEnv {
 /// The lock that keeps one installer per workspace tree, held in this node's Fabric state.
 ///
 /// Dropping it releases the lock, unless a setup step still holds the
-/// same open file as its standard input.
+/// same open file, which it gets as its standard input and under a
+/// descriptor number of its own.
 #[derive(Debug)]
 pub struct TreeLock {
     root: PathBuf,
@@ -591,7 +597,8 @@ impl Ready {
     /// Takes the value: what the plan read from the disk is stale once a
     /// step has run, so a second run needs a new plan. `lock` must be the
     /// tree's lock the plan was made under; each step gets its open file
-    /// as standard input, so the lock lasts as long as the step does.
+    /// as standard input and under a descriptor number of its own, so the
+    /// lock lasts as long as the step does.
     pub fn execute(self, lock: &TreeLock) -> Result<(), MaterializeError> {
         lock.covers(&self.root)?;
         for step in &self.steps {
@@ -925,7 +932,11 @@ fn run_step(planned: &ReadyStep, lock: &fs::File) -> Result<(), MaterializeError
     };
     // The step inherits the locked file itself, not a copy of the lock, so
     // the lock lasts as long as the step does, whatever happens to resume.
+    // It gets it twice: as its standard input, and under a number of its
+    // own that a step replacing its input, as `exec </dev/null` does,
+    // leaves open.
     let stdin = lock.try_clone().map_err(spawn_err)?;
+    let held = inheritable(lock).map_err(spawn_err)?;
     tracing::info!(
         target: SETUP_LOG_TARGET,
         step = index,
@@ -938,14 +949,17 @@ fn run_step(planned: &ReadyStep, lock: &fs::File) -> Result<(), MaterializeError
     for name in planned.cleared {
         command.env_remove(name);
     }
-    let mut child = command
+    let spawned = command
         .args(planned.step.args.iter().map(SetupArg::as_str))
         .current_dir(&planned.dir)
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .map_err(spawn_err)?;
+        .spawn();
+    // The step has its copy now; this one would pass to whatever else this
+    // process started.
+    drop(held);
+    let mut child = spawned.map_err(spawn_err)?;
     // Lines are logged from reader threads, which do not inherit the
     // caller's scoped subscriber; hand it to them.
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
@@ -992,6 +1006,19 @@ fn run_step(planned: &ReadyStep, lock: &fs::File) -> Result<(), MaterializeError
     }
     tracing::info!(target: SETUP_LOG_TARGET, step = index, program = %name, "setup step finished");
     Ok(())
+}
+
+/// Returns a copy of the descriptor of `file`, numbered 3 or above, that a program this process starts inherits.
+///
+/// Numbers 0 to 2 are the ones `Command` points at a step's input and
+/// output, which would replace the copy in the step. Without close-on-exec
+/// the copy also passes to any other program this process starts while it
+/// is open, so `run_step` closes it as soon as the step has started; resume
+/// starts nothing else meanwhile.
+fn inheritable(file: &fs::File) -> io::Result<OwnedFd> {
+    let fd = rustix::io::fcntl_dupfd_cloexec(file, 3)?;
+    rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty())?;
+    Ok(fd)
 }
 
 /// Starts a thread that forwards `pipe` to the log and reports on `done` at EOF; returns how many threads started.
