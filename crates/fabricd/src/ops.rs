@@ -3342,6 +3342,60 @@ pub(crate) mod tests {
         );
     }
 
+    /// A fresh headless Codex names its thread only once it runs, and the
+    /// CLI sends it to the node then. A suspend that takes the job first
+    /// stops the harness and drops its record, so the late session is
+    /// refused; the suspend must still carry the thread, which it finds in
+    /// the job's workspace as for any fresh Codex (Codex review of PR #10,
+    /// 2026-10-22).
+    #[tokio::test]
+    async fn a_suspend_before_a_late_session_record_still_carries_the_thread() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = locking_codex(dir.path());
+        let out = &mut Out::default();
+        node.suspend(id, &path, out).await.unwrap();
+        node.job_run(id, out).await.unwrap();
+        let harness = sleeper();
+        let harness_pid = pid(&harness);
+        register(&node, id, harness_pid).await.unwrap();
+        let thread = codex_thread_in(&node, id);
+
+        // The suspend stops the harness, which is reaped as the CLI would.
+        let reaper = std::thread::spawn(move || {
+            let mut harness = harness;
+            harness.wait()
+        });
+        node.suspend(id, &path, out).await.unwrap();
+        reaper.join().unwrap().unwrap();
+        let late = node
+            .harness_session(
+                NamedSession {
+                    job: id,
+                    epoch: Epoch::FIRST,
+                    pid: harness_pid,
+                    harness: HarnessKind::Codex,
+                    session: thread.clone(),
+                },
+                &mut Out::default(),
+            )
+            .await;
+        assert!(
+            matches!(late, Err(NodeError::HarnessNotRecorded { .. })),
+            "{late:?}"
+        );
+        let record = SessionRecord {
+            harness: HarnessKind::Codex,
+            session: thread.clone(),
+        };
+        assert_eq!(
+            recorded_and_captured(&node, id).await,
+            (Some(record), thread),
+            "{:?}",
+            out.lines
+        );
+    }
+
     /// A job that ran Codex, then Claude, then a fresh Codex that made no
     /// thread, as one not logged in on this node, still holds its Claude
     /// session: the thread of the first Codex run is older than the launch
