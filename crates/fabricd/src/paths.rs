@@ -177,6 +177,14 @@ impl JobDir {
         self.dir.join("session.pending")
     }
 
+    /// The Codex threads the job's workspace held when a Codex with no
+    /// thread to resume was planned here, until a capture or a plan takes
+    /// the thread that launch made, the oldest one not among them.
+    #[must_use]
+    pub fn fresh_codex(&self) -> PathBuf {
+        self.dir.join("fresh-codex")
+    }
+
     /// The id of the environment spec whose setup steps the user last let
     /// this node run for the job (ADR 0007); the CLI writes it.
     #[must_use]

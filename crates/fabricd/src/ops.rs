@@ -2344,20 +2344,25 @@ fn state_names(state_dir: &Path, kind: &HarnessKind, session: &SessionId) -> boo
 
 /// The job's session for `harness`, the one a capture takes or a plan
 /// launches: the one recorded for it, else, when both `harness` and the
-/// harness the job ran last are Codex, the thread the job's workspace
-/// holds, else the record of the harness it ran before, if any.
+/// harness the job ran last are Codex, the thread a fresh Codex launched
+/// here made, else the record of the harness it ran before, if any.
 ///
 /// A Codex launched without a thread to resume makes one only once it
 /// runs, after its launch was recorded, so no launch can name it. Its
 /// rollout records the workspace it started in as its `cwd`, and the
-/// workspace is the job's own (`paths::job_root`), so the newest thread
-/// with that `cwd` is the job's; it is recorded here, as a launch that
-/// named it would have been. Without it, a suspend would carry the
-/// workspace and leave the conversation behind, or carry the state of the
-/// harness the job ran before it switched to Codex. A plan for another
-/// harness leaves the record alone: after a fresh Codex the record still
-/// names the session of the harness before it, which a resume under that
-/// harness continues.
+/// workspace is the job's own (`paths::job_root`). The plan of such a
+/// launch notes the threads the workspace held then (`JobDir::fresh_codex`),
+/// so the launch's thread is the oldest one outside that note: an older
+/// thread is the job's from before, as one a Codex run here made before
+/// the job switched to Claude, and a newer one was made by something the
+/// launch ran, a `codex exec`, a sub-agent or a review. It is recorded
+/// here, as a launch that named it would have been. Without it, a suspend
+/// would carry the workspace and leave the conversation behind, or carry
+/// the state of the harness the job ran before it switched to Codex. With
+/// no such plan since the job last arrived, or no thread from it, the
+/// record stands. A plan for another harness leaves the record alone:
+/// after a fresh Codex the record still names the session of the harness
+/// before it, which a resume under that harness continues.
 fn job_session(
     job: &Job,
     root: &Path,
@@ -2373,8 +2378,13 @@ fn job_session(
     {
         return Ok(recorded);
     }
-    let env = HarnessEnv::new(home, OsString::new(), HarnessConfig::default())?;
-    let Some(thread) = Codex::new(env.home, env.path_var).latest_session(root)? else {
+    let Some(before) = local::read::<Vec<SessionId>>(&job.dir().fresh_codex())? else {
+        return Ok(recorded);
+    };
+    let Some(thread) = codex_threads(root, home)?
+        .into_iter()
+        .find(|thread| !before.contains(thread))
+    else {
         return Ok(recorded);
     };
     let record = SessionRecord {
@@ -2382,7 +2392,14 @@ fn job_session(
         session: thread,
     };
     local::write(&job.dir().session(), &record)?;
+    local::remove(&job.dir().fresh_codex())?;
     Ok(Some(record))
+}
+
+/// The Codex threads whose rollouts under `home` record `root` as their `cwd`, oldest first.
+fn codex_threads(root: &Path, home: &Path) -> Result<Vec<SessionId>, NodeError> {
+    let env = HarnessEnv::new(home, OsString::new(), HarnessConfig::default())?;
+    Ok(Codex::new(env.home, env.path_var).threads_in(root)?)
 }
 
 /// What to launch for `job` on its owner.
@@ -2426,6 +2443,9 @@ fn plan(
             None
         }
     };
+    if harness == HarnessKind::Codex && session.is_none() {
+        local::write(&job.dir().fresh_codex(), &codex_threads(&root, home)?)?;
+    }
     Ok(RunPlan {
         job: job.id(),
         epoch,
@@ -2882,19 +2902,49 @@ pub(crate) mod tests {
     /// Writes the rollout a Codex started in the job's workspace makes, and
     /// returns its thread.
     fn codex_thread_in(node: &Node, id: JobId) -> SessionId {
+        codex_rollout_in(node, id, "019f233e-bb33-7342-85fa-f2d33b14368a", "10:00")
+    }
+
+    /// Writes the rollout of `thread`, started in the job's workspace at
+    /// `time` (`HH:MM`) on 2026-10-22, and returns the thread.
+    fn codex_rollout_in(node: &Node, id: JobId, thread: &str, time: &str) -> SessionId {
         let root = std::fs::canonicalize(paths::job_root(&node.cfg.home, id)).unwrap();
-        let thread = "019f233e-bb33-7342-85fa-f2d33b14368a";
         let day = node.cfg.home.join(".codex/sessions/2026/10/22");
         std::fs::create_dir_all(&day).unwrap();
+        let name_time = time.replace(':', "-");
         std::fs::write(
-            day.join(format!("rollout-2026-10-22T10-00-00-{thread}.jsonl")),
+            day.join(format!("rollout-2026-10-22T{name_time}-00-{thread}.jsonl")),
             format!(
-                "{{\"timestamp\":\"2026-10-22T10:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread}\",\"timestamp\":\"2026-10-22T10:00:00.000Z\",\"cwd\":\"{}\",\"originator\":\"codex_cli_rs\",\"cli_version\":\"0.155.1\"}}}}\n",
+                "{{\"timestamp\":\"2026-10-22T{time}:00.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread}\",\"timestamp\":\"2026-10-22T{time}:00.000Z\",\"cwd\":\"{}\",\"originator\":\"codex_cli_rs\",\"cli_version\":\"0.155.1\"}}}}\n",
                 root.display()
             ),
         )
         .unwrap();
         SessionId::parse(thread).unwrap()
+    }
+
+    /// Plans a Codex launch with no thread to resume, records it and lets
+    /// its harness exit; `made` runs while it runs, as the threads that
+    /// launch makes are written then.
+    async fn fresh_codex_run(node: &Arc<Node>, id: JobId, made: impl FnOnce()) {
+        let out = &mut Out::default();
+        let plan = node.job_run(id, out).await.unwrap();
+        assert_eq!(plan.session, None, "{:?}", out.lines);
+        let mut harness = sleeper();
+        register(node, id, pid(&harness)).await.unwrap();
+        made();
+        harness.kill().unwrap();
+        harness.wait().unwrap();
+        node.harness_exited(id, pid(&harness)).await.unwrap();
+    }
+
+    /// The session a capture of the job would take now.
+    async fn session_to_capture(node: &Node, id: JobId) -> Option<SessionRecord> {
+        let job = node.job(id).await.unwrap();
+        let job = job.lock().await;
+        assert_eq!(*job.harness(), HarnessKind::Codex);
+        let root = paths::job_root(&node.cfg.home, id);
+        job_session(&job, &root, &node.cfg.home, job.harness()).unwrap()
     }
 
     /// The session the job records and the one its last capture holds.
@@ -2959,7 +3009,10 @@ pub(crate) mod tests {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
         let path = locking_codex(dir.path());
-        let thread = codex_thread_in(&node, id);
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let mut thread = None;
+        fresh_codex_run(&node, id, || thread = Some(codex_thread_in(&node, id))).await;
+        let thread = thread.unwrap();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         ran_briefly(&node, id, &thread).await;
         std::fs::remove_dir_all(node.cfg.home.join(".codex/sessions")).unwrap();
@@ -3010,6 +3063,69 @@ pub(crate) mod tests {
         );
     }
 
+    /// A job that ran Codex, then Claude, then a fresh Codex that made no
+    /// thread, as one not logged in on this node, still holds its Claude
+    /// session: the thread of the first Codex run is older than the launch
+    /// and is not taken in its place, so a capture carries the Claude
+    /// session and a resume does not continue the stale thread.
+    #[tokio::test]
+    async fn a_fresh_codex_that_made_no_thread_takes_no_older_one() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        node.suspend(id, &locking_codex(dir.path()), &mut Out::default())
+            .await
+            .unwrap();
+        codex_thread_in(&node, id);
+        let claude = SessionRecord {
+            harness: HarnessKind::ClaudeCode,
+            session: SessionId::parse("9c9796f0-2682-4546-a963-d314b3ad543f").unwrap(),
+        };
+        local::write(&node.cfg.state.job(id).session(), &claude).unwrap();
+
+        fresh_codex_run(&node, id, || {}).await;
+        assert_eq!(session_to_capture(&node, id).await, Some(claude));
+    }
+
+    /// A fresh Codex's thread is the first the workspace gains after its
+    /// plan; a thread something it ran made later, as a `codex exec` the
+    /// agent ran in the workspace or a sub-agent, is not the job's.
+    #[tokio::test]
+    async fn a_fresh_codex_takes_its_own_thread_not_a_later_one() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        node.suspend(id, &locking_codex(dir.path()), &mut Out::default())
+            .await
+            .unwrap();
+        let mut own = None;
+        fresh_codex_run(&node, id, || {
+            own = Some(codex_thread_in(&node, id));
+            codex_rollout_in(&node, id, "019f2340-0000-7000-8000-000000000001", "10:05");
+        })
+        .await;
+        let own = SessionRecord {
+            harness: HarnessKind::Codex,
+            session: own.unwrap(),
+        };
+        assert_eq!(session_to_capture(&node, id).await, Some(own));
+    }
+
+    /// A run planned after a fresh Codex exited, with no suspend in
+    /// between, continues the thread that Codex made rather than start
+    /// another one beside it.
+    #[tokio::test]
+    async fn a_run_after_a_fresh_codex_continues_its_thread() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        node.suspend(id, &locking_codex(dir.path()), &mut Out::default())
+            .await
+            .unwrap();
+        let mut thread = None;
+        fresh_codex_run(&node, id, || thread = Some(codex_thread_in(&node, id))).await;
+
+        let plan = node.job_run(id, &mut Out::default()).await.unwrap();
+        assert_eq!(plan.session, thread);
+    }
+
     /// A job that switched from Claude to Codex still records the Claude
     /// session; the suspend carries the Codex thread, the conversation the
     /// job's harness now holds, not the other harness's state.
@@ -3018,6 +3134,7 @@ pub(crate) mod tests {
         let (dir, node) = node();
         let id = job(dir.path(), &node).await;
         let path = locking_codex(dir.path());
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
         local::write(
             &node.cfg.state.job(id).session(),
             &SessionRecord {
@@ -3026,7 +3143,9 @@ pub(crate) mod tests {
             },
         )
         .unwrap();
-        let thread = codex_thread_in(&node, id);
+        let mut thread = None;
+        fresh_codex_run(&node, id, || thread = Some(codex_thread_in(&node, id))).await;
+        let thread = thread.unwrap();
 
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         let record = SessionRecord {

@@ -285,15 +285,18 @@ impl Job {
         Ok(())
     }
 
-    /// Records the session a restore placed, over any a registration left pending.
+    /// Records the session a restore placed, over any a registration left
+    /// pending and any fresh Codex launch planned here before.
     pub fn set_session(&self, record: &SessionRecord) -> Result<(), NodeError> {
         local::remove(&self.dir.session_pending())?;
+        local::remove(&self.dir.fresh_codex())?;
         Ok(local::write(&self.dir.session(), record)?)
     }
 
-    /// Forgets the session, a pending one included.
+    /// Forgets the session, a pending one and any fresh Codex launch planned here included.
     pub fn forget_session(&self) -> Result<(), NodeError> {
         local::remove(&self.dir.session_pending())?;
+        local::remove(&self.dir.fresh_codex())?;
         Ok(local::remove(&self.dir.session())?)
     }
 

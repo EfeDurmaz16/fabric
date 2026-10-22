@@ -423,6 +423,37 @@ impl Codex {
         process::system_tool("lsof", process::LSOF).ok()
     }
 
+    /// Every thread whose rollout records the workspace as its `cwd`, each
+    /// once, oldest first by the time in its rollout's name and then by
+    /// rollout id, which Codex mints in time order.
+    ///
+    /// A Codex launched without a thread to resume makes its thread when it
+    /// starts, before anything it runs can make another: a `codex exec` the
+    /// agent runs, a sub-agent or a review thread. So of the threads that
+    /// appeared after such a launch was planned, the oldest is the
+    /// launch's own.
+    pub fn threads_in(&self, workspace: &Path) -> Result<Vec<SessionId>, HarnessError> {
+        let root = pipeline::physical_workspace(workspace)?;
+        let mut threads: Vec<SessionId> = Vec::new();
+        for file in rollout::list(&self.store.join("sessions"))?
+            .into_iter()
+            .rev()
+        {
+            let meta = match rollout::read_meta(&file) {
+                Ok(meta) => meta,
+                Err(e) => {
+                    warn!(error = %e, "codex: rollout skipped");
+                    continue;
+                }
+            };
+            if meta.cwd.as_deref() == Some(root.as_str()) && !threads.contains(&file.name.thread_id)
+            {
+                threads.push(file.name.thread_id);
+            }
+        }
+        Ok(threads)
+    }
+
     /// The newest thread whose rollout records the workspace as its `cwd`.
     pub fn latest_session(&self, workspace: &Path) -> Result<Option<SessionId>, HarnessError> {
         let root = pipeline::physical_workspace(workspace)?;
