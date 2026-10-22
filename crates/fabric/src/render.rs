@@ -368,3 +368,51 @@ fn ledger_event(event: &LedgerEvent) -> String {
         LedgerEvent::Unrecognized => "a record of a kind this fabric does not know".to_owned(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use fabric_client::api::Outcome;
+
+    use super::*;
+
+    fn row(fact: &str, outcome: Outcome) -> PreflightRow {
+        PreflightRow {
+            fact: fact.to_owned(),
+            here: None,
+            peer: None,
+            outcome,
+            note: String::new(),
+        }
+    }
+
+    /// `doctor --peer --job` fails as the move it previews would, with the
+    /// sentence the move's own refusal has: a node reports the paths a
+    /// peer can neither use nor make again, and before the client API it
+    /// refused with them itself, exit 84. A row that stops the move comes
+    /// first, as in a move.
+    #[test]
+    fn doctor_fails_on_a_refused_path_as_the_move_would() {
+        let carry = CarryReport {
+            refused: vec!["node_modules".to_owned(), "a/node_modules".to_owned()],
+            refused_more: 3,
+            ..CarryReport::default()
+        };
+        let waived =
+            "; `fabric job move` and `fabric job resume` take --force to waive what can be waived";
+        assert_eq!(
+            refused_move(&[row("os", Outcome::Warn)], Some(&carry)),
+            Some(format!(
+                "the preflight refused the move: the target can neither use nor rebuild node_modules, a/node_modules and 3 more{waived}"
+            ))
+        );
+        assert_eq!(
+            refused_move(&[row("claude", Outcome::Refuse)], Some(&carry)),
+            Some(format!("the preflight refused the move: claude{waived}"))
+        );
+        assert_eq!(
+            refused_move(&[row("os", Outcome::Warn)], Some(&CarryReport::default())),
+            None
+        );
+        assert_eq!(refused_move(&[row("os", Outcome::Warn)], None), None);
+    }
+}
