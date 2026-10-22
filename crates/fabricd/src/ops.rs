@@ -64,9 +64,9 @@ pub const MOVE_DEADLINE: Duration = Duration::from_mins(10);
 /// How long a status question or a ping may take.
 pub const SHORT_DEADLINE: Duration = Duration::from_secs(15);
 
-/// The bytes of record lines `job log` answers with at most: half the
+/// The bytes of lines `job log` and `job ls` answer with at most: half the
 /// control message cap, which leaves room for the encoding around them.
-const LOG_BUDGET: usize = crate::control::MAX_CONTROL_MESSAGE / 2;
+const LINES_BUDGET: usize = crate::control::MAX_CONTROL_MESSAGE / 2;
 
 /// How many times a move asks again after a lost answer before it reports the move frozen.
 const MOVE_TRIES: usize = 5;
@@ -336,8 +336,16 @@ impl Node {
     }
 
     async fn job_list(&self, out: &mut Out) {
+        self.job_list_within(LINES_BUDGET, out).await;
+    }
+
+    /// Lists every job in one row each, oldest first, keeping the latest
+    /// rows that fit in `budget` bytes: each row is bounded, and a node
+    /// that made tens of thousands of jobs would otherwise answer past the
+    /// control message cap.
+    async fn job_list_within(&self, budget: usize, out: &mut Out) {
         let jobs: Vec<_> = self.jobs.lock().await.values().cloned().collect();
-        let jobs_listed = jobs.len() + self.broken_jobs().len();
+        let mut lines = Vec::new();
         for job in jobs {
             let job = job.lock().await;
             let manifest = job.ledger().manifest();
@@ -346,7 +354,7 @@ impl Node {
                 Ok(None) => view_word(&job.view(self.id)),
                 Err(_) => "unreadable",
             };
-            out.say(format!(
+            lines.push(format!(
                 "{} {word} epoch {} {}",
                 job.id(),
                 manifest.lease.epoch(),
@@ -354,11 +362,20 @@ impl Node {
             ));
         }
         for (id, error) in self.broken_jobs() {
-            out.say(format!("{id} closed: {error}"));
+            lines.push(format!("{id} closed: {error}"));
         }
-        if jobs_listed == 0 {
+        if lines.is_empty() {
             out.say("no jobs; make one with `fabric job new --repo <path> --goal <text>`");
+            return;
         }
+        let (left_out, kept) = latest_within(lines, budget);
+        if left_out > 0 {
+            out.say(format!(
+                "the {left_out} oldest jobs are left out; the latest {} fill one answer, and `fabric job status <job>` shows any job",
+                kept.len()
+            ));
+        }
+        out.lines.extend(kept);
     }
 
     fn broken_jobs(&self) -> Vec<(JobId, String)> {
@@ -453,22 +470,14 @@ impl Node {
             })
             .collect();
         // A record is at most 1 MiB, so the latest one always fits.
-        let mut start = lines.len();
-        let mut bytes = 0;
-        while let Some(line) = start.checked_sub(1).map(|i| &lines[i]) {
-            if bytes + line.len() > LOG_BUDGET {
-                break;
-            }
-            bytes += line.len();
-            start -= 1;
-        }
+        let (start, kept) = latest_within(lines, LINES_BUDGET);
         if start > 0 {
             out.say(format!(
                 "the first {start} records are left out; the latest {} fill one answer",
-                lines.len() - start
+                kept.len()
             ));
         }
-        out.lines.extend(lines.into_iter().skip(start));
+        out.lines.extend(kept);
         Ok(())
     }
 
@@ -2359,6 +2368,22 @@ const SUMMARY_CHARS: usize = 72;
 
 /// A goal's first line, cut to `SUMMARY_CHARS`, so that a list of goals
 /// up to the record bound each still fits in one control answer.
+/// The last of `lines` that fit in `budget` bytes together, in order, and
+/// how many before them were left out.
+fn latest_within(mut lines: Vec<String>, budget: usize) -> (usize, Vec<String>) {
+    let mut start = lines.len();
+    let mut bytes = 0;
+    while let Some(line) = start.checked_sub(1).map(|i| &lines[i]) {
+        if bytes + line.len() > budget {
+            break;
+        }
+        bytes += line.len();
+        start -= 1;
+    }
+    let kept = lines.split_off(start);
+    (start, kept)
+}
+
 fn summary(goal: &str) -> String {
     let first = goal.lines().next().unwrap_or_default();
     match first.char_indices().nth(SUMMARY_CHARS) {
@@ -4053,6 +4078,39 @@ pub(crate) mod tests {
             "{:?}",
             out.lines
         );
+    }
+
+    /// Each row of `job ls` is bounded, and enough jobs still add up past
+    /// the control message cap. The answer keeps the latest rows that fit
+    /// its budget and says how many older ones it left out.
+    #[tokio::test]
+    async fn a_job_list_past_its_budget_keeps_the_latest_rows() {
+        let (dir, node) = node();
+        let repo = repo(dir.path());
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let mut out = Out::default();
+            node.job_new(&repo, "goal".to_owned(), HarnessKind::Codex, &mut out)
+                .await
+                .unwrap();
+            ids.push(out.lines[0].clone());
+        }
+        // Rows are in id order, and an id begins with its time.
+        ids.sort();
+        let mut all = Out::default();
+        node.job_list(&mut all).await;
+        assert_eq!(all.lines.len(), 3, "{:?}", all.lines);
+        let row = all.lines[2].len();
+        let mut out = Out::default();
+        node.job_list_within(2 * row, &mut out).await;
+        assert_eq!(out.lines.len(), 3, "{:?}", out.lines);
+        assert!(
+            out.lines[0].starts_with("the 1 oldest jobs are left out"),
+            "{:?}",
+            out.lines
+        );
+        assert!(out.lines[1].starts_with(&ids[1]), "{:?}", out.lines);
+        assert!(out.lines[2].starts_with(&ids[2]), "{:?}", out.lines);
     }
 
     /// Two runs can both get a plan before either launches. Once the first
