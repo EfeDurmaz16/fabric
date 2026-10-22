@@ -105,7 +105,7 @@ Replication never changes who may append. A replica is a copy; the acceptance ru
 
 Fencing covers the writes Fabric performs: ledger appends, blob pushes, manifest updates. The harness writes to its workspace directly, and Fabric performs no write on its behalf. The only control over the harness is the kill: a harness launched at epoch N is killed by its supervisor (below) when the supervisor learns of epoch N+1, and until it learns it (which, for a sleeping node, is when it wakes) the harness keeps editing. Everything it wrote after the last published snapshot is preserved by the orphan path below, never by fencing.
 
-Fencing does not reach a writer that never asks Fabric: the harness's own picker, desktop app, remote control or background supervisor can reopen the native session on the departed machine. ADR 0006 therefore writes the harness's native tombstone during capture (Claude's `continued-in` record, Codex `thread/archive`) and refuses to capture a session that a harness supervisor would restart.
+Fencing does not reach a writer that never asks Fabric: the harness's own picker, desktop app, remote control or background supervisor can reopen the native session on the departed machine. ADR 0006 therefore writes the harness's native tombstone (Claude's `continued-in` record, Codex `thread/archive`) and refuses to capture a session that a harness supervisor would restart. Amended 2026-10-22 after review: the tombstone is written once `MoveStarted` is durable and taken back on `MoveAborted` and before any launch by an owner, never during capture, which a standalone suspend also runs (ADR 0006, Tombstones).
 
 ### Who supervises the harness
 
