@@ -278,6 +278,28 @@ fn e2e_a_headless_run_tells_the_node_before_it_prints_the_turn() -> Fallible {
     Ok(())
 }
 
+/// What a headless harness writes to standard error reaches the user
+/// whole, even when a process it started writes it after the turn ended:
+/// `fabric` copies it to its end before it exits (Codex review, 2026-10-22).
+#[test]
+fn e2e_a_headless_run_forwards_standard_error_to_its_end() -> Fallible {
+    let env = Env::new()?;
+    env.install_fake_codex()?;
+    let (node, job) = job_under(&env, "codex")?;
+    let running = node.spawn_with(
+        &["job", "run", &job, "--headless", "--prompt", "one"],
+        &[("FAKE_CODEX_LATE_STDERR", Path::new("1"))],
+    )?;
+    let output = finish(running, Duration::from_mins(3))?;
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("codex: late diagnostics"),
+        "the harness's last diagnostics were dropped:\n{}",
+        text(&output)
+    );
+    Ok(())
+}
+
 /// A headless run needs the prompt it starts its turn with.
 #[test]
 fn e2e_a_headless_run_needs_a_prompt() -> Fallible {

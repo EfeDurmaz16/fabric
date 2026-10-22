@@ -822,7 +822,8 @@ struct Turn<'a> {
 
 impl Turn<'_> {
     /// Reads the turn to its end. The harness's standard error goes to this
-    /// command's; its standard output is read line by line into a report.
+    /// command's, copied to its end before this returns; its standard
+    /// output is read line by line into a report.
     /// A session it names that the node does not hold yet goes to a
     /// recorder task at once, so a suspend during the turn captures it,
     /// while this loop keeps reaping the harness, which a suspend waits
@@ -837,11 +838,11 @@ impl Turn<'_> {
             kill_group(running);
             bail!("the headless harness has no standard output, so it was stopped");
         };
-        if let Some(mut stderr) = child.stderr.take() {
+        let copied = child.stderr.take().map(|mut stderr| {
             tokio::spawn(async move {
                 let _ = tokio::io::copy(&mut stderr, &mut tokio::io::stderr()).await;
-            });
-        }
+            })
+        });
         let (sessions, named) = tokio::sync::mpsc::unbounded_channel();
         let recorder = tokio::spawn(record_sessions(
             self.socket.to_path_buf(),
@@ -903,6 +904,18 @@ impl Turn<'_> {
                 }
             },
         };
+        // The harness's diagnostics are copied to their end before the
+        // command can exit, which would drop the copy with what it had not
+        // written yet; a process it started that holds its standard error
+        // open is waited for as long as one that holds its output.
+        let drained_by = drained_by.unwrap_or_else(|| tokio::time::Instant::now() + DRAIN);
+        if let Some(mut copied) = copied
+            && tokio::time::timeout_at(drained_by, &mut copied)
+                .await
+                .is_err()
+        {
+            copied.abort();
+        }
         let mut recorder = recorder;
         tokio::select! {
             ended = &mut recorder => {

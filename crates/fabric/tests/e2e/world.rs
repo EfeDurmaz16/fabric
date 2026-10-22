@@ -121,7 +121,10 @@ impl Env {
     /// or `no` to `codex-saw-session`, so a test can tell the thread was
     /// recorded while the turn ran. With `FAKE_CODEX_WAIT` set it then
     /// touches `codex-waiting` and runs until a `SIGINT`, which it writes
-    /// to `codex-signal` before it exits with 130.
+    /// to `codex-signal` before it exits with 130. With
+    /// `FAKE_CODEX_LATE_STDERR` set it leaves a process behind that writes
+    /// `codex: late diagnostics` to its standard error half a second after
+    /// the turn ends, with its standard output already closed.
     pub fn install_fake_codex(&self) -> Fallible {
         self.install(
             "codex",
@@ -149,6 +152,9 @@ impl Env {
                    trap 'echo interrupted > \"$HOME/codex-signal\"; exit 130' INT\n\
                    touch \"$HOME/codex-waiting\"\n\
                    while :; do sleep 0.1; done\n\
+                 fi\n\
+                 if [ -n \"$FAKE_CODEX_LATE_STDERR\" ]; then\n\
+                   ( exec >/dev/null; sleep 0.5; echo 'codex: late diagnostics' >&2 ) &\n\
                  fi\n\
                  echo '{{\"type\":\"turn.started\"}}'\n\
                  printf '{{\"type\":\"item.completed\",\"item\":{{\"id\":\"item_0\",\"type\":\"agent_message\",\"text\":\"codex did: %s\"}}}}\\n' \"$prompt\"\n\
