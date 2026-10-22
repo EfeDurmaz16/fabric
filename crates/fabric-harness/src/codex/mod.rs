@@ -33,7 +33,10 @@
 //! trusted only when the installed Codex is at least the version it was
 //! checked on; with an older or unknown version, any running `codex`
 //! refuses the capture or restore, because a Codex that takes no lock
-//! would keep appending to a rollout that restore renamed away.
+//! would keep appending to a rollout that restore renamed away. Both ask
+//! the installed Codex from the daemon's directory, since a running one
+//! may have started anywhere; a workspace pin this node lacks, whose
+//! shim answers no version in the workspace, does not block them.
 //!
 //! Surfaces used, checked against `codex --help`, `codex resume --help`
 //! and `codex exec resume --help` of 0.155.1 on 2026-10-19: `codex resume
@@ -579,8 +582,18 @@ impl Codex {
         out: &Path,
     ) -> Result<StateManifest, HarnessError> {
         let root = pipeline::physical_workspace(workspace)?;
-        // Asked in the workspace, where a version manager's shim picks the
-        // Codex a launch there runs, not the one it picks for the daemon.
+        // A running `codex` may have started in any directory, so it is
+        // judged by the Codex the daemon's directory picks, as restore
+        // judges it. A workspace pin this node lacks runs no Codex there,
+        // and taking its shim's failure for a writer of unknown version
+        // would make any `codex` on the node, such as a desktop app's,
+        // block every capture of the job.
+        let anywhere =
+            process::installed_version(self.binary().ok(), &self.path_var, PROGRAM).await;
+        self.refuse_lockless_writers(anywhere.as_deref()).await?;
+        // The version recorded is asked in the workspace, where a version
+        // manager's shim picks the Codex a launch there runs, not the one
+        // it picks for the daemon.
         let installed = process::installed_version_in(
             self.binary().ok(),
             Some(pipeline::fs_path(&root)),
@@ -588,7 +601,6 @@ impl Codex {
             PROGRAM,
         )
         .await;
-        self.refuse_lockless_writers(installed.as_deref()).await?;
         let version = self.captured_version(installed);
         let adapter = self.clone();
         let session = session.clone();
@@ -1019,9 +1031,7 @@ mod tests {
     /// A capture whose own version check cannot read the installed Codex,
     /// such as a version manager's shim with no version set outside the
     /// workspace, or a `--version` line that is not a version, records the
-    /// known writer, so the next node's guard keeps the floor. (A capture
-    /// test cannot reach this branch on a node where any `codex` runs: an
-    /// unreadable version makes the capture wait for every one to exit.)
+    /// known writer, so the next node's guard keeps the floor.
     #[test]
     fn a_capture_that_cannot_read_the_installed_codex_records_the_known_writer() {
         let adapter = Codex::new(AbsPath::parse("/h").unwrap(), OsString::new())

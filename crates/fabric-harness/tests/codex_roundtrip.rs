@@ -114,13 +114,19 @@ const LOCKING_VERSION: &str = "0.155.1";
 /// set, the names of its environment there; returns the script and a
 /// `PATH` value that finds it.
 fn fake_codex_reporting(dir: &Path, version: &str) -> (PathBuf, OsString) {
+    fake_codex_answering(dir, &format!("echo \"codex-cli {version}\"; exit 0"))
+}
+
+/// `fake_codex_reporting`, answering `--version` by running the shell text
+/// `answer`.
+fn fake_codex_answering(dir: &Path, answer: &str) -> (PathBuf, OsString) {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let script = bin.join("codex");
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"codex-cli {version}\"; exit 0 ;;\n  hold) sleep 60; exit 0 ;;\nesac\n{{ echo \"cwd=$(pwd -P)\"; for a in \"$@\"; do echo \"arg=$a\"; done; }} > \"$FAKE_LOG\"\n[ -z \"$FAKE_ENV_LOG\" ] || /usr/bin/env | cut -d= -f1 > \"$FAKE_ENV_LOG\"\n"
+            "#!/bin/sh\ncase \"$1\" in\n  --version) {answer} ;;\n  hold) sleep 60; exit 0 ;;\nesac\n{{ echo \"cwd=$(pwd -P)\"; for a in \"$@\"; do echo \"arg=$a\"; done; }} > \"$FAKE_LOG\"\n[ -z \"$FAKE_ENV_LOG\" ] || /usr/bin/env | cut -d= -f1 > \"$FAKE_ENV_LOG\"\n"
         ),
     )
     .unwrap();
@@ -235,6 +241,34 @@ async fn a_capture_asks_the_installed_codex_in_the_workspace() {
         .await
         .unwrap();
     assert_eq!(manifest.harness_version(), Some("0.155.1"));
+}
+
+/// A running `codex` is judged by the Codex the daemon's directory picks,
+/// as restore judges it, not by the one a workspace pin picks: a pin this
+/// node lacks runs no Codex in the workspace, and its shim answers no
+/// version there. A capture that took that for a writer of unknown version
+/// refused while any `codex` ran, such as a desktop app's, so a job whose
+/// resume the guard refused for that pin could not be moved off the node.
+/// The capture still records the known writer.
+#[tokio::test]
+async fn a_workspace_pin_this_node_lacks_does_not_block_capture_on_a_running_codex() {
+    let src = build_source();
+    let home = src.home.path().canonicalize().unwrap();
+    std::fs::write(src.work.join(".tool-versions"), "codex 0.160.0\n").unwrap();
+    let (script, path_var) = fake_codex_answering(
+        &home,
+        &format!(
+            "if [ -f .tool-versions ]; then echo 'No preset version installed for command codex' >&2; exit 126; fi; echo \"codex-cli {LOCKING_VERSION}\"; exit 0"
+        ),
+    );
+    let _held = Held::start(&script);
+    let out = tempfile::tempdir().unwrap();
+    let manifest = Codex::new(abs(&home), path_var)
+        .with_known_writer(Some(HarnessVersion::parse("0.160.0").unwrap()))
+        .capture(&src.work, &thread(), out.path())
+        .await
+        .unwrap();
+    assert_eq!(manifest.harness_version(), Some("0.160.0"));
 }
 
 #[tokio::test]
