@@ -66,6 +66,7 @@ fn manifest(files: Vec<Entry>, created_at: u64) -> Fallible<SnapshotManifest> {
         harness_state: HarnessState::default(),
         env_spec: None,
         caches: Vec::new(),
+        left_behind: Vec::new(),
     })
 }
 
@@ -232,6 +233,48 @@ fn publish_refuses_a_bundle_base_the_store_does_not_have() {
         Err(StoreError::MissingBundleBase { base }) if base == ghost
     ));
     assert!(store.snapshots().unwrap().is_empty());
+}
+
+/// Git state that names no objects, with ids `width` hex digits wide.
+fn empty_git(width: usize, bundle_base: Option<SnapshotId>) -> Fallible<GitState> {
+    let oid = GitOid::parse(&"0".repeat(width))?;
+    Ok(GitState {
+        bundle: Vec::new(),
+        bundle_base,
+        refs: Vec::new(),
+        head: GitHead::Branch("main".parse()?),
+        index_commit: oid.clone(),
+        worktree_commit: oid,
+        worktree_mtimes: Vec::new(),
+        config: Vec::new(),
+        exclude: None,
+    })
+}
+
+#[test]
+fn publish_refuses_a_bundle_base_without_git_state_in_the_same_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::create(dir.path(), params().unwrap()).unwrap();
+    let plain = store
+        .publish(&manifest(vec![file_entry(&store, "a", b"a").unwrap()], 1).unwrap())
+        .unwrap();
+    let mut sha1 = manifest(Vec::new(), 2).unwrap();
+    sha1.git = Some(empty_git(40, None).unwrap());
+    let sha1 = store.publish(&sha1).unwrap();
+
+    for (base, width) in [(plain, 40), (sha1, 64)] {
+        let mut child = manifest(Vec::new(), 3).unwrap();
+        child.git = Some(empty_git(width, Some(base)).unwrap());
+        let err = store.publish(&child).unwrap_err();
+        assert!(
+            matches!(err, StoreError::IncompatibleBundleBase { base: b } if b == base),
+            "{err}"
+        );
+    }
+    let mut child = manifest(Vec::new(), 3).unwrap();
+    child.git = Some(empty_git(40, Some(sha1)).unwrap());
+    assert!(store.publish(&child).is_ok());
+    assert_eq!(store.snapshots().unwrap().len(), 3);
 }
 
 #[test]
@@ -427,6 +470,39 @@ fn check_at_hash_depth_sees_a_manifest_that_does_not_assemble() {
     assert_eq!(report.bad_manifests, vec![id]);
     assert!(report.missing.is_empty() && report.corrupt.is_empty());
     assert!(!report.is_clean());
+}
+
+/// A row past the recorded length is a mismatch found before its object is read.
+#[test]
+fn manifest_assembly_stops_at_the_recorded_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::create(dir.path(), params().unwrap()).unwrap();
+    let entry = file_entry(&store, "f", b"listed").unwrap();
+    let id = store.publish(&manifest(vec![entry], 1).unwrap()).unwrap();
+    drop(store);
+
+    // The extra row names an object with a catalog row and no file, so
+    // reading it would fail with `Missing` instead of the mismatch.
+    let ghost = ChunkId::of(b"never stored");
+    let conn = rusqlite::Connection::open(dir.path().join("catalog.sqlite")).unwrap();
+    conn.execute(
+        "INSERT INTO chunks (id, stored_len, refcount) VALUES (?1, 1, 1)",
+        [ghost.to_bytes()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO snapshot_chunks (snapshot_id, role, ordinal, chunk_id) VALUES (?1, 0, 1000, ?2)",
+        rusqlite::params![id.to_bytes(), ghost.to_bytes()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = Store::open(dir.path()).unwrap();
+    let err = store.manifest(id).unwrap_err();
+    assert!(
+        matches!(err, StoreError::ManifestMismatch(m) if m == id),
+        "{err}"
+    );
 }
 
 #[test]

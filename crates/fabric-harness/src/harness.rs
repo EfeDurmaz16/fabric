@@ -124,6 +124,134 @@ impl Launch {
     }
 }
 
+/// A setting a launch can pass to a harness so that a session continues
+/// as it ran: what the session needs, not what the node happens to have
+/// configured (gate finding F10a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingName {
+    /// The model.
+    Model,
+    /// The provider that serves the model, such as Codex's `openai`.
+    Provider,
+    /// The reasoning effort.
+    Effort,
+    /// The sandbox commands run in.
+    Sandbox,
+    /// When the harness asks before it runs a command.
+    Approval,
+    /// Who answers what the harness asks: the user, or a reviewer model.
+    Reviewer,
+}
+
+impl std::fmt::Display for SettingName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SettingName::Model => "model",
+            SettingName::Provider => "model provider",
+            SettingName::Effort => "effort",
+            SettingName::Sandbox => "sandbox",
+            SettingName::Approval => "approval",
+            SettingName::Reviewer => "approvals reviewer",
+        })
+    }
+}
+
+/// Where a setting a launch passed came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// The session records it: the last turn ran with it.
+    Session,
+    /// The adapter was configured with it; it wins over the session.
+    Pinned,
+}
+
+/// A setting a launch passed to the harness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassedSetting {
+    /// Which setting.
+    pub name: SettingName,
+    /// Its value, as the harness spells it.
+    pub value: String,
+    /// Where it came from.
+    pub origin: Origin,
+}
+
+/// The most characters of a recorded value a report shows.
+#[cfg(any(feature = "claude", feature = "codex"))]
+const SHOWN_VALUE_LEN: usize = 64;
+
+/// A setting the session records, or the adapter was configured with
+/// (`Origin::Pinned`), that a launch did not pass, so the harness falls
+/// back to this node's own configuration for it. A pinned approval policy
+/// on a headless Codex launch is one: `codex exec` sets its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotCarried {
+    /// Which setting.
+    pub name: SettingName,
+    /// The recorded value, cut to 64 characters with control characters
+    /// replaced, because it comes from a file and is printed to a terminal.
+    pub value: String,
+    /// Why it was not passed.
+    pub reason: String,
+}
+
+/// `text` as a terminal may show it: cut to 64 characters, with `...`
+/// after a cut, and every control character replaced by `?`. Text that
+/// comes from a file that travelled goes through this before an error or
+/// a note prints it.
+#[cfg(any(feature = "claude", feature = "codex"))]
+pub(crate) fn shown(text: &str) -> String {
+    let mut shown: String = text
+        .chars()
+        .take(SHOWN_VALUE_LEN)
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    if text.chars().count() > SHOWN_VALUE_LEN {
+        shown.push_str("...");
+    }
+    shown
+}
+
+impl NotCarried {
+    /// A setting left out, with its recorded value made safe to print.
+    #[cfg(any(feature = "claude", feature = "codex"))]
+    pub(crate) fn new(name: SettingName, value: &str, reason: impl Into<String>) -> Self {
+        NotCarried {
+            name,
+            value: shown(value),
+            reason: reason.into(),
+        }
+    }
+}
+
+/// One setting as a session records it, read by an adapter before a resume.
+#[cfg(any(feature = "claude", feature = "codex"))]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum Recorded<T> {
+    /// Recorded with a value Fabric carries.
+    Carried(T),
+    /// Recorded with a value Fabric does not carry.
+    NotCarried {
+        /// The value as recorded, or its JSON when it is not a string.
+        value: String,
+        /// Why it is not carried.
+        reason: String,
+    },
+    /// Not recorded: no turn ran yet, or the record leaves the field out.
+    #[default]
+    Absent,
+}
+
+/// What a launch passed to the harness beyond the session, and what the
+/// session records that it left out, so the caller can say both.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaunchSettings {
+    /// The settings passed, in the order the harness got them.
+    pub passed: Vec<PassedSetting>,
+    /// The recorded settings left out, each with why.
+    pub not_carried: Vec<NotCarried>,
+}
+
 /// A harness process this node started, in a process group of its own.
 /// Only this crate builds one, from a child it spawned, so the pid is
 /// real and is also the process group id.
@@ -137,6 +265,8 @@ pub struct Running {
     session: Option<SessionId>,
     child: Child,
     held: bool,
+    settings: LaunchSettings,
+    version: Option<crate::version::HarnessVersion>,
 }
 
 impl std::fmt::Debug for Running {
@@ -145,6 +275,8 @@ impl std::fmt::Debug for Running {
             .field("pid", &self.pid)
             .field("session", &self.session)
             .field("held", &self.held)
+            .field("settings", &self.settings)
+            .field("version", &self.version)
             .finish_non_exhaustive()
     }
 }
@@ -158,7 +290,41 @@ impl Running {
             session,
             child: spawned.child,
             held: spawned.held,
+            settings: LaunchSettings::default(),
+            version: None,
         }
+    }
+
+    /// Records the version the launch asked of the binary it started.
+    #[cfg(feature = "codex")]
+    pub(crate) fn with_version(mut self, version: Option<crate::version::HarnessVersion>) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// The version the binary reported when the launch asked it, in the
+    /// directory and environment it then started it in, before it
+    /// started: the version that now runs the session. `None` when the
+    /// launch did not ask, as on a new session. A Codex resume writes no
+    /// version into the rollout, so the node keeps this one as the
+    /// session's known writer (`Codex::with_known_writer`).
+    #[must_use]
+    pub fn version(&self) -> Option<&crate::version::HarnessVersion> {
+        self.version.as_ref()
+    }
+
+    /// Records what the launch passed and left out.
+    #[cfg(any(feature = "claude", feature = "codex"))]
+    pub(crate) fn with_settings(mut self, settings: LaunchSettings) -> Self {
+        self.settings = settings;
+        self
+    }
+
+    /// What the launch passed to the harness beyond the session, and what
+    /// the session records that it left out.
+    #[must_use]
+    pub fn settings(&self) -> &LaunchSettings {
+        &self.settings
     }
 
     /// True while the harness waits, stopped before its exec, for its
@@ -319,5 +485,18 @@ mod tests {
         for bad in ["", "-p", "a b", "a\"b", "a\\b", "a=b", "x\n"] {
             assert!(ModelName::parse(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// A recorded value is printed to the user's terminal, and it comes
+    /// from a file that travelled, so an escape sequence in it must not
+    /// reach the terminal and a long one is cut.
+    #[cfg(any(feature = "claude", feature = "codex"))]
+    #[test]
+    fn a_value_left_out_is_shown_without_control_characters_and_cut() {
+        let left = NotCarried::new(SettingName::Model, "a\u{1b}[2Jb\nc", "why");
+        assert_eq!(left.value, "a?[2Jb?c");
+        let long = "m".repeat(SHOWN_VALUE_LEN + 1);
+        let left = NotCarried::new(SettingName::Model, &long, "why");
+        assert_eq!(left.value, format!("{}...", "m".repeat(SHOWN_VALUE_LEN)));
     }
 }

@@ -12,17 +12,20 @@
 )]
 use std::ffi::OsString;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 use fabric_core::env::EnvVarName;
 use fabric_core::path::AbsPath;
 use fabric_core::session::SessionId;
+use fabric_core::version::HarnessVersion;
 use fabric_harness::codex::Codex;
 use fabric_harness::codex::overrides::{ApprovalPolicy, CodexOverrides, SandboxMode};
 use fabric_harness::manifest::StateManifest;
 use fabric_harness::{Harness, HarnessError, Launch};
+
+mod executable;
+use executable::write_executable;
 
 const THREAD: &str = "019f233e-bb33-7342-85fa-f2d33b14368a";
 const PREFIX: &str = "019f1111-bb33-7342-85fa-f2d33b14368b";
@@ -115,17 +118,22 @@ const LOCKING_VERSION: &str = "0.155.1";
 /// set, the names of its environment there; returns the script and a
 /// `PATH` value that finds it.
 fn fake_codex_reporting(dir: &Path, version: &str) -> (PathBuf, OsString) {
+    fake_codex_answering(dir, &format!("echo \"codex-cli {version}\"; exit 0"))
+}
+
+/// `fake_codex_reporting`, answering `--version` by running the shell text
+/// `answer`.
+fn fake_codex_answering(dir: &Path, answer: &str) -> (PathBuf, OsString) {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let script = bin.join("codex");
-    std::fs::write(
+    write_executable(
         &script,
         format!(
-            "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"codex-cli {version}\"; exit 0 ;;\n  hold) sleep 60; exit 0 ;;\nesac\n{{ echo \"cwd=$(pwd -P)\"; for a in \"$@\"; do echo \"arg=$a\"; done; }} > \"$FAKE_LOG\"\n[ -z \"$FAKE_ENV_LOG\" ] || /usr/bin/env | cut -d= -f1 > \"$FAKE_ENV_LOG\"\n"
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            "#!/bin/sh\ncase \"$1\" in\n  --version) {answer} ;;\n  hold) sleep 60; exit 0 ;;\nesac\n{{ echo \"cwd=$(pwd -P)\"; for a in \"$@\"; do echo \"arg=$a\"; done; }} > \"$FAKE_LOG\"\n[ -z \"$FAKE_ENV_LOG\" ] || /usr/bin/env | cut -d= -f1 > \"$FAKE_ENV_LOG\"\n"
+        )
+        .as_bytes(),
+    );
     (script, bin.into_os_string())
 }
 
@@ -190,6 +198,80 @@ async fn capture_follows_the_lineage_and_carries_nothing_else() {
         "the thread lock file is removed on release, as Codex does"
     );
     assert!(!home.join(".codex/.coordination.lock").exists());
+}
+
+/// A capture records the newest Codex known to have run the thread: the
+/// installed one, or the known writer the job arrived with when that is
+/// newer, so a node that never ran the thread cannot lower it for the
+/// next node's resume guard.
+#[tokio::test]
+async fn a_capture_records_the_newest_known_writer() {
+    let src = build_source();
+    let home = src.home.path().canonicalize().unwrap();
+    for (known, recorded) in [
+        (None, LOCKING_VERSION),
+        (Some("0.142.4"), LOCKING_VERSION),
+        (Some("0.160.0"), "0.160.0"),
+    ] {
+        let out = tempfile::tempdir().unwrap();
+        let manifest = node(&home)
+            .with_known_writer(known.map(|v| HarnessVersion::parse(v).unwrap()))
+            .capture(&src.work, &thread(), out.path())
+            .await
+            .unwrap();
+        assert_eq!(manifest.harness_version(), Some(recorded), "{known:?}");
+    }
+}
+
+/// A capture asks the installed Codex in the workspace, as the resume
+/// guard does: where a version manager's shim pins an older Codex in the
+/// workspace than it picks anywhere else, the capture records the one a
+/// launch there runs, not a newer one that never ran the thread, which
+/// as the known writer would refuse every later resume in that
+/// workspace.
+#[tokio::test]
+async fn a_capture_asks_the_installed_codex_in_the_workspace() {
+    let src = build_source();
+    let home = src.home.path().canonicalize().unwrap();
+    std::fs::write(src.work.join(".tool-versions"), "codex 0.155.1\n").unwrap();
+    let (_, path_var) = fake_codex_reporting(
+        &home,
+        "$(if [ -f .tool-versions ]; then echo 0.155.1; else echo 0.160.0; fi)",
+    );
+    let out = tempfile::tempdir().unwrap();
+    let manifest = Codex::new(abs(&home), path_var)
+        .capture(&src.work, &thread(), out.path())
+        .await
+        .unwrap();
+    assert_eq!(manifest.harness_version(), Some("0.155.1"));
+}
+
+/// A running `codex` is judged by the Codex the daemon's directory picks,
+/// as restore judges it, not by the one a workspace pin picks: a pin this
+/// node lacks runs no Codex in the workspace, and its shim answers no
+/// version there. A capture that took that for a writer of unknown version
+/// refused while any `codex` ran, such as a desktop app's, so a job whose
+/// resume the guard refused for that pin could not be moved off the node.
+/// The capture still records the known writer.
+#[tokio::test]
+async fn a_workspace_pin_this_node_lacks_does_not_block_capture_on_a_running_codex() {
+    let src = build_source();
+    let home = src.home.path().canonicalize().unwrap();
+    std::fs::write(src.work.join(".tool-versions"), "codex 0.160.0\n").unwrap();
+    let (script, path_var) = fake_codex_answering(
+        &home,
+        &format!(
+            "if [ -f .tool-versions ]; then echo 'No preset version installed for command codex' >&2; exit 126; fi; echo \"codex-cli {LOCKING_VERSION}\"; exit 0"
+        ),
+    );
+    let _held = Held::start(&script);
+    let out = tempfile::tempdir().unwrap();
+    let manifest = Codex::new(abs(&home), path_var)
+        .with_known_writer(Some(HarnessVersion::parse("0.160.0").unwrap()))
+        .capture(&src.work, &thread(), out.path())
+        .await
+        .unwrap();
+    assert_eq!(manifest.harness_version(), Some("0.160.0"));
 }
 
 #[tokio::test]
@@ -318,6 +400,59 @@ async fn a_running_codex_too_old_for_the_writer_lock_blocks_capture_and_restore(
     assert!(!again.path().join("manifest.json").exists());
     let before = std::fs::read(&src.head).unwrap();
     let err = adapter.restore(&src.work, out.path()).await.unwrap_err();
+    assert!(
+        matches!(err, HarnessError::HarnessRunning { ref pids, .. } if pids.contains(&pid)),
+        "{err}"
+    );
+    assert_eq!(std::fs::read(&src.head).unwrap(), before);
+}
+
+/// A Codex that was running before the binary on disk was upgraded to
+/// one that takes the writer lock may itself take none. It still holds the
+/// rollout of its thread open, and that must block capture and restore
+/// even though the installed version trusts the lock.
+#[tokio::test]
+async fn a_live_writer_that_takes_no_lock_blocks_capture_and_restore() {
+    let src = build_source();
+    let home = src.home.path().canonicalize().unwrap();
+    let adapter = node(&home);
+    let out = tempfile::tempdir().unwrap();
+    adapter
+        .capture(&src.work, &thread(), out.path())
+        .await
+        .unwrap();
+    let ready = home.join("holder-ready");
+    let mut holder = std::process::Command::new("/bin/sh")
+        .args(["-c", r#"exec 3>>"$1" && : > "$2" && exec sleep 60"#, "sh"])
+        .arg(&src.head)
+        .arg(&ready)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the holder never opened the rollout"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let pid = holder.id();
+    let again = tempfile::tempdir().unwrap();
+    let captured = adapter.capture(&src.work, &thread(), again.path()).await;
+    let before = std::fs::read(&src.head).unwrap();
+    let restored = adapter.restore(&src.work, out.path()).await;
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", "--", &format!("-{pid}")])
+        .status();
+    let _ = holder.wait();
+    let err = captured.unwrap_err();
+    assert!(
+        matches!(err, HarnessError::HarnessRunning { ref pids, .. } if pids.contains(&pid)),
+        "{err}"
+    );
+    assert!(!again.path().join("manifest.json").exists());
+    let err = restored.unwrap_err();
     assert!(
         matches!(err, HarnessError::HarnessRunning { ref pids, .. } if pids.contains(&pid)),
         "{err}"
@@ -493,8 +628,9 @@ async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_the
 
     let bin = fake_codex(&home);
     let adapter = Codex::new(abs(&home), bin.clone()).with_overrides(CodexOverrides {
-        sandbox: SandboxMode::WorkspaceWrite,
-        approval: ApprovalPolicy::Never,
+        sandbox: Some(SandboxMode::WorkspaceWrite),
+        approval: Some(ApprovalPolicy::Never),
+        reviewer: None,
         model: None,
         effort: None,
     });
@@ -574,10 +710,11 @@ async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_the
         .unwrap();
     assert!(running.child_mut().wait().await.unwrap().success());
     let seen = std::fs::read_to_string(&log).unwrap();
+    // `codex exec` sets its own approval policy, so the pinned one is not passed.
     assert_eq!(
         seen,
         format!(
-            "cwd={}\narg=exec\narg=resume\narg={THREAD}\narg=--json\narg=-c\narg=projects.\"{}\".trust_level=trusted\narg=-c\narg=sandbox_mode=\"workspace-write\"\narg=-c\narg=approval_policy=\"never\"\narg=--\narg=reply with the secret word\n",
+            "cwd={}\narg=exec\narg=resume\narg={THREAD}\narg=--json\narg=-c\narg=projects.\"{}\".trust_level=trusted\narg=-c\narg=sandbox_mode=\"workspace-write\"\narg=--\narg=reply with the secret word\n",
             src.work.display(),
             src.work.display()
         )
@@ -630,6 +767,45 @@ async fn a_thread_that_comes_back_lands_over_its_original_file() {
         std::fs::read_to_string(&src.head)
             .unwrap()
             .ends_with(&turn("done on the air"))
+    );
+}
+
+/// A rollout of the thread that this node's codex wrote after the job
+/// left, which the incoming lineage does not hold, is divergence. Left in
+/// place, it would be the newest rollout of the thread here, and the
+/// resumed thread would continue this node's history, not the job's.
+#[tokio::test]
+async fn a_rollout_made_here_after_the_job_left_is_divergence() {
+    const LATER: &str = "019f233e-bb33-7342-85fa-f2d33b14368c";
+    let src = build_source();
+    let home = src.home.path().canonicalize().unwrap();
+    let adapter = node(&home);
+    let out_1 = tempfile::tempdir().unwrap();
+    adapter
+        .capture(&src.work, &thread(), out_1.path())
+        .await
+        .unwrap();
+    let pro = set_aside(&home, ".codex-pro");
+    adapter.restore(&src.work, out_1.path()).await.unwrap();
+    let out_2 = tempfile::tempdir().unwrap();
+    adapter
+        .capture(&src.work, &thread(), out_2.path())
+        .await
+        .unwrap();
+    set_aside(&home, ".codex-air");
+    std::fs::rename(&pro, home.join(".codex")).unwrap();
+    let later = src.head.with_file_name(format!(
+        "rollout-2026-10-20T09-00-00-{THREAD}_{LATER}.jsonl"
+    ));
+    std::fs::write(
+        &later,
+        session_meta(THREAD, &src.work.to_string_lossy(), Some(THREAD)),
+    )
+    .unwrap();
+    let err = adapter.restore(&src.work, out_2.path()).await.unwrap_err();
+    assert!(
+        matches!(err, HarnessError::StateDiverged { ref path } if path == &later),
+        "{err}"
     );
 }
 

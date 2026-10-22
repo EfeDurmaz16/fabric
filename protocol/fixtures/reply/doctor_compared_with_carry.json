@@ -1,0 +1,63 @@
+{
+  "kind": "doctor",
+  "report": {
+    "kind": "compared",
+    "peer": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba",
+    "rows": [
+      {
+        "fact": "user",
+        "here": "me",
+        "peer": "me",
+        "outcome": "equal",
+        "note": ""
+      },
+      {
+        "fact": "os",
+        "here": "macos",
+        "peer": "linux",
+        "outcome": "warn",
+        "note": "only a path nothing on the target can make again crosses; the carry lines say what happens to each path, ADR 0012"
+      }
+    ],
+    "carry": {
+      "snapshot": "abababababababababababababababababababababababababababababababab",
+      "paths": [
+        {
+          "path": "node_modules",
+          "verdict": "refuse",
+          "why": "pnpm is not installed on the target"
+        },
+        {
+          "path": "target",
+          "verdict": "rebuild",
+          "why": "the next build on the target makes it: CARGO_HOME /Users/me/.cargo on the source, /opt/cargo on the target"
+        },
+        {
+          "path": "vendor/data",
+          "verdict": "carry",
+          "why": "nothing on the target can make it again, so it travels as it is"
+        },
+        {
+          "path": ".env.local",
+          "verdict": "leave",
+          "why": "it matches a secret pattern and never leaves the source; set it up on the target by hand"
+        }
+      ],
+      "more": [
+        {
+          "verdict": "rebuild",
+          "paths": 3
+        },
+        {
+          "verdict": "leave",
+          "paths": 1
+        }
+      ],
+      "refused": [
+        "node_modules"
+      ],
+      "refused_more": 0,
+      "session_captured": false
+    }
+  }
+}

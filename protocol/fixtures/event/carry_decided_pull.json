@@ -1,0 +1,20 @@
+{
+  "kind": "carry_decided",
+  "context": {
+    "kind": "pull"
+  },
+  "snapshot": "abababababababababababababababababababababababababababababababab",
+  "paths": [
+    {
+      "path": "node_modules",
+      "verdict": "refuse",
+      "why": "pnpm is not installed on the target"
+    }
+  ],
+  "more": [
+    {
+      "verdict": "carry",
+      "paths": 2
+    }
+  ]
+}

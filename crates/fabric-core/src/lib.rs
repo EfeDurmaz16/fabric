@@ -93,6 +93,7 @@ pub mod path;
 pub mod secret;
 pub mod session;
 pub mod snapshot;
+pub mod version;
 
 /// A boxed, `Send` future: the return type of every trait the core
 /// dispatches through `Box<dyn Trait>` (ADR 0005).

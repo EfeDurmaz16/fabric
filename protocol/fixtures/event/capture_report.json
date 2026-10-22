@@ -1,0 +1,103 @@
+{
+  "kind": "capture_report",
+  "groups": [
+    {
+      "note": "secret",
+      "items": [
+        ".env"
+      ],
+      "more": 0
+    },
+    {
+      "note": "excluded",
+      "items": [
+        "scratch/notes.md"
+      ],
+      "more": 0
+    },
+    {
+      "note": "secret_harness",
+      "items": [
+        "auth.json"
+      ],
+      "more": 0
+    },
+    {
+      "note": "tracked_secret",
+      "items": [
+        ".env.example"
+      ],
+      "more": 0
+    },
+    {
+      "note": "stashed_secret",
+      "items": [
+        "config/secrets.yml"
+      ],
+      "more": 0
+    },
+    {
+      "note": "filtered",
+      "items": [
+        "assets/logo.png"
+      ],
+      "more": 0
+    },
+    {
+      "note": "special",
+      "items": [
+        "run/app.sock"
+      ],
+      "more": 0
+    },
+    {
+      "note": "special_harness",
+      "items": [
+        "ipc.sock"
+      ],
+      "more": 0
+    },
+    {
+      "note": "unreadable",
+      "items": [
+        "private"
+      ],
+      "more": 0
+    },
+    {
+      "note": "nested_repository",
+      "items": [
+        "vendored"
+      ],
+      "more": 0
+    },
+    {
+      "note": "nested_git",
+      "items": [
+        "tools/lib"
+      ],
+      "more": 0
+    },
+    {
+      "note": "nested_git_harness",
+      "items": [
+        "plugins/x"
+      ],
+      "more": 0
+    },
+    {
+      "note": "stripped_userinfo",
+      "items": [
+        "remote.origin.url"
+      ],
+      "more": 0
+    },
+    {
+      "note": "dropped_config",
+      "items": [
+        "remote.backup.url"
+      ],
+      "more": 0
+    }
+  ]
+}

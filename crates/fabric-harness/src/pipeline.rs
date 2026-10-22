@@ -10,9 +10,12 @@
 //! or mutability other than the adapter's own rule for that path, and a
 //! destination that is a symlink or lies below one under the home, since a
 //! rename or a new directory there would write through it; then any staged
-//! file whose digest does not match. Only after all of that does it place
-//! files, all or nothing. An adapter supplies only what differs: its
-//! sources, and where a tree path lands on this node.
+//! file whose digest does not match; then a file of the session on this
+//! node that the incoming state lacks, unless it is a rewritable file this
+//! node left untouched since the job left, which goes once the rest is
+//! placed. Only after all of that does it place files, all or nothing. An
+//! adapter supplies only what differs: its sources, and where a tree path
+//! lands on this node.
 
 #![cfg_attr(
     not(all(feature = "acp", feature = "claude", feature = "codex")),
@@ -22,6 +25,7 @@
     )
 )]
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use fabric_core::path::RelPath;
@@ -34,6 +38,7 @@ use fabric_core::session::SessionId;
 use crate::crashpoint::crashpoint;
 use crate::denylist;
 use crate::departure::{Departure, Records};
+use crate::durable;
 use crate::error::{HarnessError, Input, IoOp};
 use crate::harness::Restored;
 use crate::manifest::{Carried, Content, Mutability, StateManifest};
@@ -278,13 +283,15 @@ pub(crate) struct Destination {
 
 /// Places the files of `manifest`, staged under `state`, where
 /// `destination` says. `destination` answers `None` for a path the adapter
-/// never captures. Nothing is written until every entry has passed every
+/// never captures. `held` is what a capture of the session would take on
+/// this node now. Nothing is written until every entry has passed every
 /// check; `departure` holds the confirmed record that says which
 /// rewritable files this node left untouched.
 pub(crate) fn restore<F>(
     manifest: StateManifest,
     state: &Path,
     departure: Option<&Records>,
+    held: &[Source],
     mut destination: F,
 ) -> Result<Restored, HarnessError>
 where
@@ -325,8 +332,45 @@ where
         Some(records) => records.active()?,
         None => Departure::default(),
     };
+    let dropped = dropped_files(&placements, held, &departure)?;
     let placed = place::place_all(&placements, &|dest| departure.unchanged(dest))?;
+    for path in &dropped {
+        durable::remove_durable(path)?;
+    }
     Ok(Restored { manifest, placed })
+}
+
+/// The files of the session on this node that the incoming state does not
+/// place, each one a file the job dropped while it was away.
+///
+/// Such a file is either this node's own copy of a rewritable file, still
+/// holding the bytes recorded when the job last left, which the job removed
+/// since and which therefore goes; or work done here after the job left,
+/// such as a new memory file or rollout a fenced holder wrote, which is
+/// `StateDiverged` like an edited file (ADR 0006). Left in place, the
+/// resumed harness would read both histories. Paths are compared in one
+/// letter case, since APFS opens both spellings as one file.
+fn dropped_files(
+    placements: &[Placement],
+    held: &[Source],
+    departure: &Departure,
+) -> Result<Vec<PathBuf>, HarnessError> {
+    let folded = |path: &Path| path.to_string_lossy().to_lowercase();
+    let placed: HashSet<String> = placements.iter().map(|p| folded(&p.dest)).collect();
+    let mut dropped = Vec::new();
+    for source in held {
+        if placed.contains(&folded(&source.abs)) || denylist::check(source.rel.as_str()).is_some() {
+            continue;
+        }
+        if source.mutability == Mutability::Replaceable && departure.unchanged(&source.abs)? {
+            dropped.push(source.abs.clone());
+        } else {
+            return Err(HarnessError::StateDiverged {
+                path: source.abs.clone(),
+            });
+        }
+    }
+    Ok(dropped)
 }
 
 #[cfg(test)]

@@ -15,7 +15,7 @@ Every tool a job depends on keys something to the absolute path of the workspace
 - pnpm writes the store path as an absolute string into `node_modules/.modules.yaml` and compares it for equality on the next install; pnpm 11 bin shims bake an absolute `NODE_PATH`. Cargo's dep-info is absolute by default and its fingerprints rest on paths and mtimes; moving `CARGO_HOME` rebuilds everything. Every sampled Python venv has an absolute shebang and an absolute `home`.
 - Six of the eight secondary harnesses key their session store by a hash or encoding of the working directory.
 
-The preflight of 2026-10-19 measured the two gate machines: both have user `efebarandurmaz` and `HOME=/Users/efebarandurmaz`. Everything else differs (ADR 0008, Context), but the one string that decides this ADR is equal.
+The preflight of 2026-10-19 measured the two gate machines: both have the same user name and the same `HOME`, `/Users/<user>`. Everything else differs (ADR 0008, Context), but the one string that decides this ADR is equal.
 
 ## Decision
 

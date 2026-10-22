@@ -40,7 +40,8 @@ struct Pattern {
 }
 
 /// A pattern with a capture group named `keep` keeps that part and
-/// replaces only the rest: `DB_PASSWORD=` stays, its value does not.
+/// replaces only the rest: `DB_PASSWORD=` stays, its value does not, at
+/// any length; only a `${VAR}` reference or an earlier marker is left.
 ///
 /// `(?-u:\b)` is an ASCII word boundary. Every key shape starts on one, so
 /// a prefix such as `sk-` inside an ordinary word (`disk-usage`,
@@ -114,14 +115,49 @@ const PATTERNS: &[Pattern] = &[
     },
     Pattern {
         name: "secret-assignment",
-        regex: r#"(?-u:\b)(?P<keep>[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|ACCESS_KEY|CREDENTIALS|DATABASE_URL|DSN)[A-Z0-9_]*=['"]?)[^\s'"$\[][^\s'"]{3,}"#,
-        accept: any,
+        regex: r#"(?-u:\b)(?P<keep>[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|ACCESS_KEY|CREDENTIALS|DATABASE_URL|DSN)[A-Z0-9_]*=['"]?)[^\s'"$\[][^\s'"]*"#,
+        accept: assigned_value_is_secret,
     },
 ];
 
 fn any(_: &[u8]) -> bool {
     true
 }
+
+/// True unless the value after the first `=` is a number of three digits
+/// or fewer under a name whose secret word is qualified: `MAX_TOKENS=512`,
+/// `TOKEN_TTL=60` and `PASSWORD_MIN_LENGTH=8` name a count, a time or a
+/// length. A name that ends in its secret word names the secret itself, so
+/// `CVV_SECRET=123` and `OTP_TOKEN=42` still count, and so does a longer
+/// number under any name, as before any value length was accepted.
+fn assigned_value_is_secret(matched: &[u8]) -> bool {
+    let (name, value) = matched
+        .iter()
+        .position(|b| *b == b'=')
+        .map_or((&[][..], matched), |at| {
+            (&matched[..at], &matched[at + 1..])
+        });
+    let value = value
+        .strip_prefix(b"'")
+        .or_else(|| value.strip_prefix(b"\""))
+        .unwrap_or(value);
+    value.len() > 3
+        || !value.iter().all(u8::is_ascii_digit)
+        || SECRET_ENDINGS.iter().any(|end| name.ends_with(end))
+}
+
+/// The words that, at the end of a variable's name, make it the name of a
+/// secret rather than of a setting about one.
+const SECRET_ENDINGS: &[&[u8]] = &[
+    b"SECRET",
+    b"TOKEN",
+    b"PASSWORD",
+    b"PASSWD",
+    b"KEY",
+    b"CREDENTIALS",
+    b"DATABASE_URL",
+    b"DSN",
+];
 
 /// True for a random-looking key: it has an upper-case letter and a lower-case
 /// letter or a digit. A kebab-case name has no upper-case letter.
@@ -350,7 +386,7 @@ mod tests {
     fn ordinary_words_and_paths_are_not_secrets() {
         let r = Redactor::standard().unwrap();
         for text in [
-            "/Users/efe/oss/disk-usage-analyzer-service/src/main.rs",
+            "/Users/me/oss/disk-usage-analyzer-service/src/main.rs",
             "task-list-item-checkbox-wrapper-component-with-a-long-name",
             "risk-assessment-framework-v2-with-many-more-words-after-it",
             "flask-authentication-demo-app-and-another-long-suffix-here",
@@ -378,6 +414,55 @@ mod tests {
             "secret whsec_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345",
             "curl -H 'Authorization: Bearer 4f9c2a7e1b3d5f6a8c0e2b4d6f8a0c2e'",
         ] {
+            assert!(r.matches(text), "{text} must match");
+        }
+    }
+
+    #[test]
+    fn a_short_value_of_a_secret_named_variable_is_redacted() {
+        let r = Redactor::standard().unwrap();
+        let mut counts = RedactionCounts::new();
+        assert_eq!(
+            r.apply("DB_PASSWORD=abc TOKEN='x' API_KEY= PORT=1", &mut counts)
+                .unwrap(),
+            "DB_PASSWORD=[REDACTED:secret-assignment] TOKEN='[REDACTED:secret-assignment]' API_KEY= PORT=1"
+        );
+        assert_eq!(counts.get("secret-assignment"), Some(&2));
+    }
+
+    /// A short number under a name that ends in its secret word is that
+    /// secret, such as a card's code or a one-time code, and must not be
+    /// carried in a transcript.
+    #[test]
+    fn a_short_number_under_a_name_that_ends_in_a_secret_word_is_a_secret() {
+        let r = Redactor::standard().unwrap();
+        for text in [
+            "CVV_SECRET=123",
+            "OTP_TOKEN=42",
+            "DB_PASSWORD='7'",
+            "STRIPE_API_KEY=1",
+        ] {
+            assert!(r.matches(text), "{text} must match");
+            assert!(r.matches_bytes(text.as_bytes()), "{text} as bytes");
+        }
+    }
+
+    /// A count, a length or a time to live is a small number under a name
+    /// that goes on past its secret word; for Codex a match refuses every
+    /// later capture of the thread, so these are not secrets.
+    #[test]
+    fn a_short_number_under_a_secret_word_is_not_a_secret() {
+        let r = Redactor::standard().unwrap();
+        for text in [
+            "OPENAI_MAX_TOKENS=512",
+            "TOKEN_TTL=60",
+            "PASSWORD_MIN_LENGTH=8",
+            "MAX_TOKENS='512'",
+        ] {
+            assert!(!r.matches(text), "{text} must not match");
+            assert!(!r.matches_bytes(text.as_bytes()), "{text} as bytes");
+        }
+        for text in ["DB_PASSWORD=ab1", "PIN_SECRET=1234", "TOKEN=x"] {
             assert!(r.matches(text), "{text} must match");
         }
     }

@@ -1,0 +1,9 @@
+{
+  "kind": "job_state",
+  "reason": {
+    "code": "root_not_a_directory",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "root": "/Users/me/fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/work"
+  },
+  "message": "the root is not a directory but a link or a file"
+}

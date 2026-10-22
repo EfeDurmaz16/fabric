@@ -2,8 +2,9 @@
 //! built in ADR 0014, Capture).
 //!
 //! Invariant: capture reads the workspace and writes only objects into the
-//! store, two private commits and one ref under `refs/fabric/` into the
-//! repository, and deletes the job's older refs under `refs/fabric/`. Its
+//! store, and into the repository two private commits, one snapshot ref
+//! under `refs/fabric/` and one ref there per stash entry older than
+//! `refs/stash`, and deletes the job's older refs under `refs/fabric/`. Its
 //! scratch files (index copies, the bundle) live in the store's `tmp/`,
 //! which open and gc clear, never in the user's `.git`. It never touches
 //! the real index, the working tree or the user's refs. A path or state
@@ -11,7 +12,7 @@
 //! act. An untracked secret never becomes an object; a tracked or stashed
 //! one, already in the user's object store, is named in the report.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io;
@@ -27,7 +28,7 @@ use fabric_core::id::{ChunkId, EnvSpecId, JobId, NodeId, SnapshotId};
 use fabric_core::path::{AbsPath, PathError, RelPath};
 use fabric_core::snapshot::{
     CacheClass, CacheEntry, CarryKey, CarryState, Entry, EntryKind, GitHead, GitState,
-    HarnessState, ManifestError, Mode, Platform, SnapshotManifest,
+    HarnessState, LeaveReason, LeftBehind, ManifestError, Mode, Platform, Remake, SnapshotManifest,
 };
 
 use crate::durable::TempFile;
@@ -42,13 +43,20 @@ pub const LARGE_UNTRACKED_LIMIT: u64 = 64 << 20;
 /// How many incremental bundles may chain before the next one is full.
 pub const MAX_BUNDLE_CHAIN: u32 = 16;
 
-/// Measures the strings a cache depends on (ADR 0012), per cache path.
+/// What the capturing node knows about each cache path that a target
+/// decides it by (ADR 0012): the strings it depends on and what makes it again.
 pub trait CarryKeys {
     /// Returns the key for the cache at `path`.
     fn key(&self, class: CacheClass, path: &RelPath) -> CarryKey;
+
+    /// Returns what makes the cache at `path` again on a node that does not write its bytes.
+    fn remake(&self, class: CacheClass, path: &RelPath) -> Remake;
 }
 
-/// Carry keys for a node that measured nothing: every key is `CarryKey::Unmeasured`, which `CarryKey::matches` never accepts.
+/// Carry keys for a node that measured nothing: every key is
+/// `CarryKey::Unmeasured`, which `CarryKey::matches` never accepts, and
+/// nothing is known to make any cache again, so every one is the user's
+/// own files.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UnmeasuredKeys;
 
@@ -56,6 +64,20 @@ impl CarryKeys for UnmeasuredKeys {
     fn key(&self, _class: CacheClass, _path: &RelPath) -> CarryKey {
         CarryKey::Unmeasured
     }
+
+    fn remake(&self, _class: CacheClass, _path: &RelPath) -> Remake {
+        Remake::Nothing
+    }
+}
+
+/// True when `path` names a native Node addon, which loads only under the
+/// ABI it was built for, whether the path is the file or a link to it.
+fn is_native_addon(path: &RelPath) -> bool {
+    let name = path.as_str().rsplit('/').next().unwrap_or_default();
+    name.len() > ".node".len()
+        && name
+            .get(name.len() - ".node".len()..)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(".node"))
 }
 
 /// What to capture and under which policy.
@@ -188,12 +210,22 @@ pub struct CaptureReport {
     pub tracked_secrets: Vec<RelPath>,
     /// Paths in the stash's work tree, index or untracked commit that match a secret pattern; they travel in the bundle.
     pub stashed_secrets: Vec<RelPath>,
+    /// Paths of `W` under a `filter` attribute whose blob differs from the
+    /// file's own bytes; they travel as git's check-in output, so bytes a
+    /// filter hides never enter `W`. A filter the repository configures with
+    /// a clean step is refused first (`GitFilterUnsupported`), so this names
+    /// a path another check-in conversion changed, or one whose filter was
+    /// configured while capture ran.
+    pub filtered: Vec<RelPath>,
     /// Symlinks whose target is absolute or climbs above the root.
     pub escaping_symlinks: Vec<RelPath>,
     /// FIFOs, sockets and devices in the workspace, left behind.
     pub special_files: Vec<RelPath>,
     /// FIFOs, sockets and devices in the harness state directory, left behind.
     pub special_harness: Vec<RelPath>,
+    /// Directories of a repository capture could not open, left behind
+    /// with everything under them, as git's listings leave them.
+    pub unreadable: Vec<RelPath>,
     /// Nested repositories, tracked submodules aside: in a repository the
     /// whole nested tree stays behind, in a plain directory its files are
     /// carried and only its `.git` stays behind.
@@ -202,8 +234,6 @@ pub struct CaptureReport {
     pub nested_harness: Vec<RelPath>,
     /// Config keys whose remote URL lost its userinfo.
     pub stripped_userinfo: Vec<GitConfigKey>,
-    /// Repeated config keys where only the last value travels.
-    pub repeated_config: Vec<GitConfigKey>,
     /// Allowlisted config keys left behind because `GitConfigValue` refuses the value, or because it is a remote URL with a query or fragment, where a token can travel.
     pub dropped_config: Vec<GitConfigKey>,
     /// The bundle shape; none when the root is not a repository.
@@ -311,6 +341,18 @@ pub enum CaptureError {
     GitLfsUnsupported {
         /// The first path git says the filter applies to.
         path: RelPath,
+    },
+    /// A path has a clean filter the repository config sets up, such as
+    /// git-crypt's; `W` would hold the cleaned bytes and restore writes
+    /// them as they are, with no smudge.
+    #[error(
+        "{path} has filter={filter}, which this repository configures; capture would carry the filtered bytes, not the file"
+    )]
+    GitFilterUnsupported {
+        /// The first path git says the filter applies to.
+        path: RelPath,
+        /// The filter driver's name.
+        filter: String,
     },
     /// Untracked files above the limit would enter the user's object store.
     #[error(
@@ -622,12 +664,248 @@ fn list_tree(base: &Path) -> Result<Listing, CaptureError> {
     Ok(out)
 }
 
+/// What the walk for empty directories found.
+#[derive(Default)]
+struct EmptyDirs {
+    /// Every empty directory.
+    found: Vec<Found>,
+    /// Every directory below the root it could not open.
+    unreadable: Vec<RelPath>,
+}
+
+/// Lists every empty directory under `root`, without following links, for the git half, whose listings name only files.
+///
+/// A directory that holds `.git` in any letter case is a repository, a
+/// nested one or a submodule checkout, and is not walked. `skip` names an
+/// empty directory that travels another way, such as a submodule that was
+/// never initialized, whose path `W` holds. A directory below the root that
+/// cannot be opened for lack of permission, as a container's volume owned
+/// by another user, is listed in `unreadable` and not walked: git's own
+/// listings skip it with a warning, so nothing under it travels either way.
+/// An entry removed after its directory was listed, as a watcher's
+/// temporary file under an excluded `tmp/`, is skipped: nothing of it is
+/// left to carry, and the walk covers paths the snapshot never carries.
+fn empty_dirs(root: &Path, skip: &dyn Fn(&RelPath) -> bool) -> Result<EmptyDirs, CaptureError> {
+    empty_dirs_with(root, skip, &|path| fs::symlink_metadata(path))
+}
+
+/// The lstat `empty_dirs_with` calls on each entry.
+type Lstat<'a> = dyn Fn(&Path) -> io::Result<fs::Metadata> + 'a;
+
+/// `empty_dirs` with the lstat it calls on each entry, so a test can remove one in between.
+fn empty_dirs_with(
+    root: &Path,
+    skip: &dyn Fn(&RelPath) -> bool,
+    lstat: &Lstat<'_>,
+) -> Result<EmptyDirs, CaptureError> {
+    fn walk(
+        root: &Path,
+        prefix: &str,
+        (skip, lstat): (&dyn Fn(&RelPath) -> bool, &Lstat<'_>),
+        out: &mut EmptyDirs,
+    ) -> Result<(), CaptureError> {
+        let dir = root.join(prefix);
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied && !prefix.is_empty() => {
+                out.unreadable.push(rel_path(prefix)?);
+                return Ok(());
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound && !prefix.is_empty() => return Ok(()),
+            Err(e) => return Err(io_err(&dir, e)),
+        };
+        let mut names: Vec<_> = entries
+            .map(|e| e.map(|e| e.file_name()))
+            .collect::<Result<_, _>>()
+            .map_err(|e| io_err(&dir, e))?;
+        names.sort();
+        let is_git = |name: &std::ffi::OsString| name.eq_ignore_ascii_case(".git");
+        if !prefix.is_empty() && names.iter().any(is_git) {
+            return Ok(());
+        }
+        if !prefix.is_empty() && names.is_empty() {
+            let rel = rel_path(prefix)?;
+            if !skip(&rel) {
+                match lstat(&dir) {
+                    Ok(meta) => out.found.push(Found {
+                        rel,
+                        kind: FoundKind::Dir,
+                        meta,
+                    }),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(io_err(&dir, e)),
+                }
+            }
+            return Ok(());
+        }
+        for name in names.iter().filter(|name| !is_git(name)) {
+            let Some(name) = name.to_str() else {
+                return Err(CaptureError::NotUtf8 {
+                    path: dir.join(name).to_string_lossy().into_owned(),
+                });
+            };
+            let text = if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let full = root.join(&text);
+            let meta = match lstat(&full) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(io_err(&full, e)),
+            };
+            if meta.is_dir() {
+                walk(root, &text, (skip, lstat), out)?;
+            }
+        }
+        Ok(())
+    }
+    let mut out = EmptyDirs::default();
+    walk(root, "", (skip, lstat), &mut out)?;
+    Ok(out)
+}
+
+/// Every path a listing saw, with the stamp of each, to tell whether the tree changed after it was listed.
+///
+/// A FIFO, socket or device has no stamp; only its name counts.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Census(BTreeMap<RelPath, Option<Stamp>>);
+
+/// Whether the snapshot carries a listed path; a census leaves out every path it refuses.
+type Carried<'a> = dyn FnMut(&RelPath) -> bool + 'a;
+
+/// Answers whether the snapshot carries a workspace path under `policy`:
+/// one a secret pattern denies or `.fabricignore` excludes never travels.
+fn carried_by<'a>(policy: &'a IgnorePolicy, root: &'a Path) -> impl FnMut(&RelPath) -> bool + 'a {
+    let mut markers = DirMarkers {
+        root,
+        seen: HashMap::new(),
+    };
+    move |rel| policy.classify(rel, &mut markers).carried()
+}
+
+/// Every directory that holds a tracked path, ASCII case folded, as the
+/// policy compares names.
+fn tracked_dirs(tracked: &BTreeSet<RelPath>) -> HashSet<String> {
+    let mut dirs = HashSet::new();
+    for rel in tracked {
+        let text = rel.as_str().to_ascii_lowercase();
+        let mut end = text.len();
+        // A directory already listed came with every directory above it.
+        while let Some(at) = text[..end].rfind('/') {
+            if !dirs.insert(text[..at].to_owned()) {
+                break;
+            }
+            end = at;
+        }
+    }
+    dirs
+}
+
+/// Answers whether `W` carries an untracked path under `policy`.
+///
+/// Below a cache it is judged as an ignored path is, by the cache's
+/// narrower list, so a `node_modules` git does not ignore travels whole.
+/// A directory with a cache's name that holds a tracked path is the
+/// project's own, not a cache, such as a `build` beside `package.json`
+/// that holds an app's tracked entitlements: a key dropped there gets the
+/// full list, as anywhere outside a cache.
+fn untracked_carried_by<'a>(
+    policy: &'a IgnorePolicy,
+    root: &'a Path,
+    tracked_dirs: &'a HashSet<String>,
+) -> impl FnMut(&RelPath) -> bool + 'a {
+    let mut markers = DirMarkers {
+        root,
+        seen: HashMap::new(),
+    };
+    move |rel| {
+        let class = policy.classify(rel, &mut markers);
+        match class.cache_root() {
+            Some(cache) if tracked_dirs.contains(&cache.path.as_str().to_ascii_lowercase()) => {
+                !policy.denies_anywhere(rel)
+            }
+            _ => class.carried(),
+        }
+    }
+}
+
+impl Census {
+    /// Stamps every found path that `carried` keeps and records the bare `names` beside them.
+    ///
+    /// A path the snapshot does not carry is not in it whatever it holds,
+    /// so it may change while capture runs, as a dev server's log does. A
+    /// directory is stamped by its identity alone: its mtime moves whenever
+    /// an entry is added to it or removed, carried or not, and every carried
+    /// entry is compared on its own.
+    fn of<'a>(
+        found: &[Found],
+        names: impl Iterator<Item = &'a RelPath>,
+        carried: &mut Carried<'_>,
+    ) -> Census {
+        let mut paths: BTreeMap<RelPath, Option<Stamp>> = found
+            .iter()
+            .filter(|item| carried(&item.rel))
+            .map(|item| {
+                let stamp = match item.kind {
+                    FoundKind::Dir => (item.meta.dev(), item.meta.ino(), 0, 0, 0),
+                    FoundKind::File | FoundKind::Symlink => stamp(&item.meta),
+                };
+                (item.rel.clone(), Some(stamp))
+            })
+            .collect();
+        paths.extend(names.map(|rel| (rel.clone(), None)));
+        Census(paths)
+    }
+
+    /// Fails with `WorkspaceChanged` on the first path, by name, that only one of the two lists, or else that `later` lists with another stamp.
+    ///
+    /// An added file also changes its directory's stamp; the file is the
+    /// one worth naming.
+    fn unchanged_in(&self, later: &Census) -> Result<(), CaptureError> {
+        let names: BTreeSet<&RelPath> = self.0.keys().chain(later.0.keys()).collect();
+        let changed = names
+            .iter()
+            .find(|rel| self.0.contains_key(**rel) != later.0.contains_key(**rel))
+            .or_else(|| {
+                names
+                    .iter()
+                    .find(|rel| self.0.get(**rel) != later.0.get(**rel))
+            });
+        match changed {
+            Some(rel) => Err(CaptureError::WorkspaceChanged {
+                path: (*rel).clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Walks `base` again and fails with `WorkspaceChanged` when a path `carried` keeps was added, removed, replaced or written since this census.
+    fn unchanged_under(&self, base: &Path, carried: &mut Carried<'_>) -> Result<(), CaptureError> {
+        let later = list_tree(base)?;
+        self.unchanged_in(&Census::of(&later.found, later.special.iter(), carried))
+    }
+}
+
+/// Adds every directory above `rel` to `dirs`.
+fn add_parents(rel: &RelPath, dirs: &mut BTreeSet<RelPath>) {
+    let mut parent = rel.as_str();
+    while let Some((dir, _)) = parent.rsplit_once('/') {
+        if let Ok(dir) = RelPath::parse(dir) {
+            dirs.insert(dir);
+        }
+        parent = dir;
+    }
+}
+
 /// Counts of what the policy did under one cache root.
 struct CacheSeen {
     class: CacheClass,
     carried: u64,
     denied: u64,
     excluded: u64,
+    native: u64,
 }
 
 struct Capturer<'a> {
@@ -695,6 +973,7 @@ impl Capturer<'_> {
                     carried: 0,
                     denied: 0,
                     excluded: 0,
+                    native: 0,
                 });
             }
             if item.kind == FoundKind::Dir {
@@ -702,6 +981,7 @@ impl Capturer<'_> {
                 // and nothing denies it, so an empty directory is not lost.
                 if class.carried() {
                     emitted_dirs.insert(item.rel.clone());
+                    add_parents(&item.rel, &mut carried_dirs);
                     entries.push(self.entry_for(base, &item)?);
                 }
                 continue;
@@ -712,6 +992,7 @@ impl Capturer<'_> {
                     carried: 0,
                     denied: 0,
                     excluded: 0,
+                    native: 0,
                 })
             });
             match class {
@@ -732,16 +1013,17 @@ impl Capturer<'_> {
                 Class::Cache(_) | Class::Precious => {
                     if let Some(seen) = seen {
                         seen.carried += 1;
+                        // Node loads an addon through a link as it loads the
+                        // file, so a link named `*.node` counts too.
+                        if matches!(item.kind, FoundKind::File | FoundKind::Symlink)
+                            && is_native_addon(&item.rel)
+                        {
+                            seen.native += 1;
+                        }
                     }
                 }
             }
-            let mut parent = item.rel.as_str();
-            while let Some((dir, _)) = parent.rsplit_once('/') {
-                if let Ok(dir) = RelPath::parse(dir) {
-                    carried_dirs.insert(dir);
-                }
-                parent = dir;
-            }
+            add_parents(&item.rel, &mut carried_dirs);
             entries.push(self.entry_for(base, &item)?);
         }
         for dir in carried_dirs.difference(&emitted_dirs) {
@@ -766,9 +1048,11 @@ impl Capturer<'_> {
             };
             cache_entries.push(CacheEntry {
                 key: self.req.carry_keys.key(seen.class, &path),
+                remake: self.req.carry_keys.remake(seen.class, &path),
                 path,
                 class: seen.class,
                 carry,
+                native_files: seen.native,
             });
         }
         Ok((entries, cache_entries))
@@ -808,6 +1092,7 @@ impl Capturer<'_> {
     /// Claude Code keeps `.credentials.json` in its state directory on Linux.
     fn harness_entries(&mut self, base: &Path) -> Result<Vec<Entry>, CaptureError> {
         let listing = list_tree(base)?;
+        let census = Census::of(&listing.found, listing.special.iter(), &mut |_| true);
         self.report.nested_harness.extend(listing.nested);
         self.report.special_harness.extend(listing.special);
         let mut entries = Vec::with_capacity(listing.found.len());
@@ -818,6 +1103,9 @@ impl Capturer<'_> {
             }
             entries.push(self.entry_for(base, item)?);
         }
+        // A file the adapter wrote after its directory was listed would
+        // otherwise be missing from the snapshot, and lost with the move.
+        census.unchanged_under(base, &mut |_| true)?;
         // The walk lists a directory's children before its siblings, which
         // puts `abc/tool.txt` before `abc.jsonl`; the manifest sorts by bytes.
         entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
@@ -930,6 +1218,8 @@ enum BuiltBundle {
 struct GitCapture<'a> {
     git: Git,
     root: &'a Path,
+    /// The job's ignored-file policy, which judges what the snapshot carries.
+    policy: &'a IgnorePolicy,
     job_id: JobId,
     scratch: PathBuf,
     /// The user's own exclude rules, which every listing and `W` start from.
@@ -976,7 +1266,98 @@ fn user_excludes(git: &Git, root: &Path) -> Result<String, CaptureError> {
     }
 }
 
+/// A regular file in an index, as `ls-files -s` lists it.
+struct IndexBlob {
+    /// `100644` or `100755`.
+    mode: String,
+    /// The blob id the index holds.
+    oid: String,
+    /// The path, relative to the root.
+    path: String,
+    /// True when a `filter` attribute applies to the path.
+    filtered: bool,
+}
+
+/// What the git half saw of the work tree, checked again once every file is stored.
+struct GitSeen {
+    /// Every tracked and untracked path, existing or not.
+    paths: Vec<RelPath>,
+    /// The stamps of those that existed just before `W` was built.
+    stamps: HashMap<RelPath, Stamp>,
+    /// The untracked listing: paths, then nested repositories.
+    untracked: (Vec<RelPath>, Vec<RelPath>),
+    /// The untracked paths `W` leaves out, which a secret pattern denies or `.fabricignore` excludes.
+    left_out: BTreeSet<RelPath>,
+    /// The directories that hold a tracked path, which judge an untracked one (`untracked_carried_by`).
+    tracked_dirs: HashSet<String>,
+    /// The directories of `W` with their mode and mtime, which travel in `files`.
+    dirs: Vec<Entry>,
+}
+
+/// What `capture` checks after every file is stored, by the kind of root.
+enum Settle<'a> {
+    /// A repository: its paths, untracked listing and ignored files.
+    Git(Box<(GitCapture<'a>, GitSeen, Census)>),
+    /// A plain directory: its walk.
+    Plain(Census),
+}
+
 impl GitCapture<'_> {
+    /// Fails with `WorkspaceChanged` when a path of the work tree was added, removed or written after capture listed it.
+    ///
+    /// `W` holds the tracked and untracked paths as their stamps were just
+    /// before it was built, and `files` the ignored ones as they were
+    /// listed; a path that appeared or changed after that would be missing
+    /// from the snapshot, or older in it, and lost with the move. A path
+    /// the snapshot does not carry is in neither, so it may change: an
+    /// untracked one `W` left out or that appears and the policy refuses
+    /// (`untracked_carried_by`), or an ignored one `carried` refuses.
+    fn unchanged_since(
+        &self,
+        seen: &GitSeen,
+        ignored: &Census,
+        carried: &mut Carried<'_>,
+    ) -> Result<(), CaptureError> {
+        let in_w = seen
+            .paths
+            .iter()
+            .filter(|rel| !seen.left_out.contains(*rel));
+        let now = stamps(self.root, in_w.clone())?;
+        let changed = in_w
+            .filter(|rel| now.get(*rel) != seen.stamps.get(*rel))
+            .min();
+        if let Some(rel) = changed {
+            return Err(CaptureError::WorkspaceChanged { path: rel.clone() });
+        }
+        let (paths, nested) = self.untracked()?;
+        let before: BTreeSet<&RelPath> = seen
+            .untracked
+            .0
+            .iter()
+            .filter(|rel| !seen.left_out.contains(*rel))
+            .chain(&seen.untracked.1)
+            .collect();
+        let mut untracked_carried =
+            untracked_carried_by(self.policy, self.root, &seen.tracked_dirs);
+        let after: BTreeSet<&RelPath> = paths
+            .iter()
+            .filter(|rel| untracked_carried(rel))
+            .chain(&nested)
+            .collect();
+        if let Some(rel) = before.symmetric_difference(&after).min() {
+            return Err(CaptureError::WorkspaceChanged {
+                path: (*rel).clone(),
+            });
+        }
+        let mut report = CaptureReport::default();
+        let found = self.ignored(&mut report)?;
+        let names = report
+            .special_files
+            .iter()
+            .chain(&report.nested_repositories);
+        ignored.unchanged_in(&Census::of(&found, names, carried))
+    }
+
     /// The `-c` value that makes a listing read the same user exclude rules as `W`.
     fn excludes_flag(&self) -> String {
         format!(
@@ -1021,22 +1402,7 @@ impl GitCapture<'_> {
                 reason: BusyReason::Conflicts,
             });
         }
-        // `ls-files -v` tags a skip-worktree entry `S` and an
-        // assume-unchanged one in lower case.
-        let entries = self.git.run(&["ls-files", "-v", "-z"])?;
-        for record in Git::records(&entries) {
-            let text = Git::text("index entry", record)?;
-            let (tag, path) = text.split_once(' ').unwrap_or((text, ""));
-            let flag = match tag {
-                "S" | "s" => IndexFlag::SkipWorktree,
-                "h" => IndexFlag::AssumeUnchanged,
-                _ => continue,
-            };
-            return Err(CaptureError::GitIndexFlag {
-                path: rel_path(path)?,
-                flag,
-            });
-        }
+        self.refuse_flagged_entries(&[])?;
         // `--ignore-submodules=none` overrides a `submodule.<name>.ignore`
         // in the config or in .gitmodules, which would hide the local work.
         let status = self.git.run(&[
@@ -1073,6 +1439,12 @@ impl GitCapture<'_> {
                 return Err(CaptureError::GitSubmoduleDirty { path: path()? });
             }
         }
+        self.refuse_filters()
+    }
+
+    /// Refuses a path whose bytes `git add -A` would change: one under the
+    /// LFS filter, or under a clean filter the repository configures.
+    fn refuse_filters(&self) -> Result<(), CaptureError> {
         // git resolves the attributes itself, from every .gitattributes,
         // tracked or not, and from .git/info/attributes.
         let paths = self.git.run(&[
@@ -1087,6 +1459,7 @@ impl GitCapture<'_> {
         let attrs =
             self.git
                 .run_stdin_env(&["check-attr", "-z", "--stdin", "filter"], &[], &paths)?;
+        let drivers = self.clean_filters()?;
         let fields: Vec<&[u8]> = attrs.split(|b| *b == 0).collect();
         for triple in fields.chunks_exact(3) {
             if triple[2] == b"lfs" {
@@ -1095,8 +1468,84 @@ impl GitCapture<'_> {
                     path: rel_path(text)?,
                 });
             }
+            // `git add -A` runs the driver's clean step into `W`, and
+            // restore writes blobs with no smudge step, so the target would
+            // hold the filtered bytes (git-crypt's ciphertext).
+            if drivers.iter().any(|name| name.as_bytes() == triple[2]) {
+                let text = Git::text("filtered path", triple[0])?;
+                return Err(CaptureError::GitFilterUnsupported {
+                    path: rel_path(text)?,
+                    filter: Git::text("filter name", triple[2])?.to_owned(),
+                });
+            }
         }
         Ok(())
+    }
+
+    /// Refuses a skip-worktree or assume-unchanged entry in the index `env` names, and returns every path in it.
+    fn refuse_flagged_entries(
+        &self,
+        env: &[(&str, &OsStr)],
+    ) -> Result<BTreeSet<String>, CaptureError> {
+        // `ls-files -v` tags a skip-worktree entry `S` and an
+        // assume-unchanged one in lower case.
+        let entries = self.git.run_env(&["ls-files", "-v", "-z"], env)?;
+        let mut paths = BTreeSet::new();
+        for record in Git::records(&entries) {
+            let text = Git::text("index entry", record)?;
+            let (tag, path) = text.split_once(' ').unwrap_or((text, ""));
+            let flag = match tag {
+                "S" | "s" => IndexFlag::SkipWorktree,
+                "h" => IndexFlag::AssumeUnchanged,
+                _ => {
+                    paths.insert(path.to_owned());
+                    continue;
+                }
+            };
+            return Err(CaptureError::GitIndexFlag {
+                path: rel_path(path)?,
+                flag,
+            });
+        }
+        Ok(paths)
+    }
+
+    /// Names every filter driver whose clean step `git add` runs here: one
+    /// with a non-empty `clean` or `process` command in the config git reads
+    /// for this repository, includes too. An attribute that names any other
+    /// driver leaves the bytes as they are.
+    fn clean_filters(&self) -> Result<Vec<String>, CaptureError> {
+        let args = [
+            "config",
+            "-z",
+            "--get-regexp",
+            r"^filter\..*\.(clean|process)$",
+        ];
+        let out = self.git.output(&args, &[])?;
+        // `--get-regexp` exits 1 when no key matches.
+        if out.status.code() == Some(1) && out.stdout.is_empty() {
+            return Ok(Vec::new());
+        }
+        let out = Git::checked(&args, out)?;
+        let mut names = Vec::new();
+        for record in Git::records(&out) {
+            let text = Git::text("config record", record)?;
+            let (key, value) = text.split_once('\n').unwrap_or((text, "true"));
+            if value.is_empty() {
+                continue;
+            }
+            let name = key
+                .strip_prefix("filter.")
+                .and_then(|rest| {
+                    rest.strip_suffix(".clean")
+                        .or_else(|| rest.strip_suffix(".process"))
+                })
+                .unwrap_or("");
+            if !name.is_empty() {
+                names.push(name.to_owned());
+            }
+        }
+        Ok(names)
     }
 
     /// Lists untracked, not ignored paths, and apart from them the untracked nested repositories.
@@ -1170,6 +1619,11 @@ impl GitCapture<'_> {
     }
 
     /// Copies the real index and builds commit `I` from the copy.
+    ///
+    /// The flags `refuse_bad_states` refused on the real index are checked
+    /// again on the copy `I` is built from, since another git process can
+    /// set one between that probe and the copy. An intent-to-add entry is
+    /// one the copy holds and its written tree leaves out.
     fn index_commit(&self, head: Option<&GitOid>) -> Result<(GitOid, String), CaptureError> {
         let index = self.git.git_path("index")?;
         let lock = index.with_extension("lock");
@@ -1211,7 +1665,20 @@ impl GitCapture<'_> {
             thread::sleep(Duration::from_millis(200));
         }
         let env: [(&str, &OsStr); 1] = [("GIT_INDEX_FILE", copy.path().as_os_str())];
+        let indexed = self.refuse_flagged_entries(&env)?;
         let tree = self.git.run_text_env(&["write-tree"], &env)?;
+        let written = self
+            .git
+            .run(&["ls-tree", "-r", "-z", "--name-only", &tree])?;
+        let mut written: BTreeSet<&[u8]> = Git::records(&written).collect();
+        for path in &indexed {
+            if !written.remove(path.as_bytes()) {
+                return Err(CaptureError::GitIndexFlag {
+                    path: rel_path(path)?,
+                    flag: IndexFlag::IntentToAdd,
+                });
+            }
+        }
         let commit = self.commit_tree(&tree, head, None, "fabric index")?;
         Ok((commit, tree))
     }
@@ -1243,16 +1710,20 @@ impl GitCapture<'_> {
     /// is never in `W`. A negation in the repository's own ignore files can
     /// override that, so the private index is then listed and every path
     /// that is not tracked and that `leave_out` names is removed before the
-    /// tree is written. The removed paths are returned.
+    /// tree is written. Every untracked path in `carried` that `add -A`
+    /// skipped is then added: one under a cache that only the full secret
+    /// list names. Then `keep_worktree_bytes` puts back the bytes git's own
+    /// conversions changed. The removed paths are returned, and the paths a
+    /// clean filter changed.
     fn worktree_commit(
         &self,
         index_tree: &str,
         head: Option<&GitOid>,
         index_commit: &GitOid,
         excludes: &str,
-        tracked: &BTreeSet<RelPath>,
+        (tracked, carried): (&BTreeSet<RelPath>, &BTreeSet<&RelPath>),
         leave_out: &dyn Fn(&RelPath) -> bool,
-    ) -> Result<(GitOid, Vec<RelPath>), CaptureError> {
+    ) -> Result<(GitOid, Vec<RelPath>, Vec<RelPath>), CaptureError> {
         let index = TempFile::in_dir(&self.scratch);
         let exclude_file = TempFile::in_dir(&self.scratch);
         let all = format!("{}{excludes}", self.user_excludes);
@@ -1263,12 +1734,31 @@ impl GitCapture<'_> {
         self.git
             .run_env(&["-c", &excludes_flag, "add", "-A", "--"], &env)?;
         let mut removed = Vec::new();
+        let mut added = HashSet::new();
         let listing = self.git.run_env(&["ls-files", "-z"], &env)?;
         for record in Git::records(&listing) {
             let rel = rel_path(Git::text("index path", record)?)?;
             if !tracked.contains(&rel) && leave_out(&rel) {
                 removed.push(rel);
+            } else {
+                added.insert(rel);
             }
+        }
+        // The excludes hold the full secret list, so `add -A` skipped a
+        // path under a cache that only that list names; `carried` keeps it.
+        // `--remove` drops a path that vanished since the listing, which
+        // the check after the capture then names.
+        let mut input = Vec::new();
+        for rel in carried.iter().filter(|rel| !added.contains(**rel)) {
+            input.extend_from_slice(rel.as_str().as_bytes());
+            input.push(0);
+        }
+        if !input.is_empty() {
+            self.git.run_stdin_env(
+                &["update-index", "--add", "--remove", "-z", "--stdin"],
+                &env,
+                &input,
+            )?;
         }
         if !removed.is_empty() {
             let mut input = Vec::new();
@@ -1282,9 +1772,153 @@ impl GitCapture<'_> {
                 &input,
             )?;
         }
+        let filtered = self.keep_worktree_bytes(&env)?;
         let tree = self.git.run_text_env(&["write-tree"], &env)?;
         let commit = self.commit_tree(&tree, head, Some(index_commit), "fabric worktree")?;
-        Ok((commit, removed))
+        Ok((commit, removed, filtered))
+    }
+
+    /// Makes every regular file in the index `env` names hold the bytes in the work tree, except under a clean filter, and returns the paths a clean filter changed.
+    ///
+    /// `git add -A` stores what check-in makes of a file: line endings
+    /// converted by `text`, `eol` or `core.autocrlf`, `$Id$` collapsed by
+    /// `ident`, the text re-encoded by `working-tree-encoding`, the output
+    /// of a `filter` driver. Restore writes the blob as it is, so such a
+    /// file would come back with other bytes than it had. A path whose
+    /// blob differs from the file hashed with no filters gets the file's
+    /// own bytes instead, unless a `filter` attribute applies: the bytes a
+    /// clean filter hides, as git-crypt's plaintext, never enter `W`, and
+    /// the path is named for the report. `refuse_filters` has already
+    /// refused a configured clean filter, so this guard holds only if one
+    /// appears while capture runs.
+    fn keep_worktree_bytes(&self, env: &[(&str, &OsStr)]) -> Result<Vec<RelPath>, CaptureError> {
+        let files = self.convertible_files(env)?;
+        let mut changed: Vec<&IndexBlob> = Vec::new();
+        let mut named = Vec::new();
+        for batch in arg_batches(&files, |file| file.path.len()) {
+            let paths = batch.iter().map(|file| file.path.as_str());
+            let hashes = self.hash_files(&["hash-object", "--no-filters"], paths, env)?;
+            for (file, hash) in batch.iter().zip(hashes) {
+                if hash != file.oid && file.filtered {
+                    named.push(rel_path(&file.path)?);
+                } else if hash != file.oid {
+                    changed.push(file);
+                }
+            }
+        }
+        let mut index_info = Vec::new();
+        for batch in arg_batches(&changed, |file| file.path.len()) {
+            let paths = batch.iter().map(|file| file.path.as_str());
+            let hashes = self.hash_files(&["hash-object", "-w", "--no-filters"], paths, env)?;
+            for (file, raw) in batch.iter().zip(hashes) {
+                index_info
+                    .extend_from_slice(format!("{} {raw}\t{}", file.mode, file.path).as_bytes());
+                index_info.push(0);
+            }
+        }
+        if !index_info.is_empty() {
+            self.git
+                .run_stdin_env(&["update-index", "-z", "--index-info"], env, &index_info)?;
+        }
+        Ok(named)
+    }
+
+    /// Lists the regular files of the index `env` names that git can convert on check-in.
+    ///
+    /// Git converts nothing on check-in unless `core.autocrlf` is on or one
+    /// of `ATTRS` applies to the path, so only those paths are worth hashing.
+    fn convertible_files(&self, env: &[(&str, &OsStr)]) -> Result<Vec<IndexBlob>, CaptureError> {
+        const ATTRS: [&str; 6] = [
+            "filter",
+            "ident",
+            "working-tree-encoding",
+            "text",
+            "eol",
+            "crlf",
+        ];
+        let listing = self.git.run_env(&["ls-files", "-s", "-z"], env)?;
+        let mut files = Vec::new();
+        for record in Git::records(&listing) {
+            let text = Git::text("index entry", record)?;
+            let bad = || GitError::Parse {
+                what: "index entry",
+                text: text.to_owned(),
+            };
+            let (meta, path) = text.split_once('\t').ok_or_else(bad)?;
+            let mut fields = meta.split(' ');
+            let (Some(mode), Some(oid)) = (fields.next(), fields.next()) else {
+                return Err(bad().into());
+            };
+            if mode == "100644" || mode == "100755" {
+                files.push(IndexBlob {
+                    mode: mode.to_owned(),
+                    oid: oid.to_owned(),
+                    path: path.to_owned(),
+                    filtered: false,
+                });
+            }
+        }
+        if files.is_empty() {
+            return Ok(files);
+        }
+        let autocrlf = self
+            .git
+            .output(&["config", "--get", "core.autocrlf"], env)?;
+        let autocrlf = autocrlf.status.success()
+            && !matches!(
+                String::from_utf8_lossy(&autocrlf.stdout).trim(),
+                "false" | "no" | "off" | "0" | ""
+            );
+        let mut input = Vec::new();
+        for file in &files {
+            input.extend_from_slice(file.path.as_bytes());
+            input.push(0);
+        }
+        let mut args = vec!["check-attr", "-z", "--stdin"];
+        args.extend(ATTRS);
+        let attrs = self.git.run_stdin_env(&args, env, &input)?;
+        // Each path's attributes come as (path, name, value) triples.
+        let mut converting: BTreeSet<&[u8]> = BTreeSet::new();
+        let mut filtered: BTreeSet<&[u8]> = BTreeSet::new();
+        let fields: Vec<&[u8]> = attrs.split(|b| *b == 0).collect();
+        for triple in fields.chunks_exact(3) {
+            if triple[2] == b"unspecified" || triple[2] == b"unset" {
+                continue;
+            }
+            converting.insert(triple[0]);
+            if triple[1] == b"filter" {
+                filtered.insert(triple[0]);
+            }
+        }
+        files.retain(|file| autocrlf || converting.contains(file.path.as_bytes()));
+        for file in &mut files {
+            file.filtered = filtered.contains(file.path.as_bytes());
+        }
+        Ok(files)
+    }
+
+    /// Runs a `hash-object` command line on `paths` and returns one id per path, in order.
+    fn hash_files<'p>(
+        &self,
+        command: &[&'p str],
+        paths: impl Iterator<Item = &'p str>,
+        env: &[(&str, &OsStr)],
+    ) -> Result<Vec<String>, CaptureError> {
+        let mut args = command.to_vec();
+        args.push("--");
+        args.extend(paths);
+        let wanted = args.len() - command.len() - 1;
+        let out = self.git.run_env(&args, env)?;
+        let text = Git::text("blob ids", &out)?;
+        let hashes: Vec<String> = text.lines().map(str::to_owned).collect();
+        if hashes.len() != wanted {
+            return Err(GitError::Parse {
+                what: "blob ids",
+                text: text.to_owned(),
+            }
+            .into());
+        }
+        Ok(hashes)
     }
 
     fn snap_prefix(&self) -> String {
@@ -1373,6 +2007,25 @@ impl GitCapture<'_> {
         self.git.run(&["bundle", "create", &path_text, "--all"])?;
         self.git.run(&["bundle", "verify", &path_text])?;
         Ok(BuiltBundle::Full(path))
+    }
+
+    /// Pins the stash entries, makes the bundle, and returns it with the refs and `HEAD` it is proven to hold and the stash entries.
+    ///
+    /// A stash pushed or dropped after the pin would leave refs that no
+    /// longer match the stash list, and restore would rebuild another one.
+    fn bundle_with_stash(
+        &self,
+        plan: &BundlePlan,
+    ) -> Result<(BuiltBundle, RefView, Vec<GitOid>), CaptureError> {
+        let stashes = self.pin_stash()?;
+        let (built, view) = self.bundle_with_refs(plan)?;
+        if self.stash_entries()? != stashes {
+            let stash = RefName::parse("refs/stash").map_err(GitError::from)?;
+            return Err(CaptureError::RefsMoved {
+                moved: MovedRef::Ref(stash),
+            });
+        }
+        Ok((built, view, stashes))
     }
 
     /// Makes the bundle and returns it with the refs and `HEAD` it is proven to hold.
@@ -1472,6 +2125,61 @@ impl GitCapture<'_> {
         Ok(!out.trim_ascii().is_empty())
     }
 
+    /// The prefix of the refs that hold this job's older stash entries, `stash@{1}` at `<prefix>1`.
+    fn stash_prefix(&self) -> String {
+        stash_prefix(self.job_id)
+    }
+
+    /// Lists the stash entries, newest first, so `stash@{n}` is at index `n`.
+    fn stash_entries(&self) -> Result<Vec<GitOid>, CaptureError> {
+        if !self
+            .git
+            .succeeds(&["rev-parse", "--verify", "-q", "refs/stash"])?
+        {
+            return Ok(Vec::new());
+        }
+        let out = self.git.run_text(&[
+            "log",
+            "--walk-reflogs",
+            "--no-show-signature",
+            "--format=%H",
+            "refs/stash",
+            "--",
+        ])?;
+        let mut entries = Vec::new();
+        for line in out.lines() {
+            entries.push(GitOid::parse(line).map_err(GitError::from)?);
+        }
+        if entries.is_empty() {
+            // A stash ref without a reflog is one entry.
+            let tip = self.git.run_text(&["rev-parse", "refs/stash"])?;
+            entries.push(GitOid::parse(&tip).map_err(GitError::from)?);
+        }
+        Ok(entries)
+    }
+
+    /// Points a ref under `stash_prefix` at every stash entry older than `refs/stash` and returns every entry.
+    ///
+    /// A bundle carries refs, not reflogs, so without these refs only
+    /// `stash@{0}` would travel and every older entry would be lost on
+    /// restore, which rebuilds the stash list from them. The job's earlier
+    /// stash refs are deleted first.
+    fn pin_stash(&self) -> Result<Vec<GitOid>, CaptureError> {
+        let prefix = self.stash_prefix();
+        let out = self
+            .git
+            .run_text(&["for-each-ref", "--format=%(refname)", &prefix])?;
+        for name in out.lines() {
+            self.git.run(&["update-ref", "-d", name])?;
+        }
+        let entries = self.stash_entries()?;
+        for (n, oid) in entries.iter().enumerate().skip(1) {
+            let name = format!("{prefix}{n}");
+            self.git.run(&["update-ref", &name, oid.as_str()])?;
+        }
+        Ok(entries)
+    }
+
     fn delete_older_snap_refs(&self, current: &GitOid) -> Result<(), CaptureError> {
         let prefix = self.snap_prefix();
         let out = self
@@ -1528,17 +2236,60 @@ impl GitCapture<'_> {
         Ok(mtimes)
     }
 
-    /// Lists the paths of the stash commit `stash` and of its index and untracked parents that `denies` names.
+    /// Reads the mode and mtime of every directory of `W`.
     ///
-    /// The bundle carries `refs/stash` with its parents, so a `.env` saved
-    /// by `git stash -u` travels with it although it was never tracked.
+    /// A tree holds no metadata of its own directories, so restore would
+    /// make each with the default mode and a fresh mtime, and a directory
+    /// the user kept at 0700 would open up; these entries carry the
+    /// source's, as the walk of a plain directory does.
+    fn worktree_dirs(&self, worktree: &GitOid) -> Result<Vec<Entry>, CaptureError> {
+        let out = self
+            .git
+            .run(&["ls-tree", "-r", "-t", "-z", worktree.as_str()])?;
+        let mut dirs = Vec::new();
+        for record in Git::records(&out) {
+            let text = Git::text("tree entry", record)?;
+            let (meta, path) = text.split_once('\t').ok_or_else(|| GitError::Parse {
+                what: "tree entry",
+                text: text.to_owned(),
+            })?;
+            if meta.split(' ').nth(1) != Some("tree") {
+                continue;
+            }
+            let rel = rel_path(path)?;
+            let full = self.root.join(path);
+            let meta = match fs::symlink_metadata(&full) {
+                Ok(meta) if meta.is_dir() => meta,
+                Ok(_) => return Err(CaptureError::WorkspaceChanged { path: rel }),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    return Err(CaptureError::WorkspaceChanged { path: rel });
+                }
+                Err(e) => return Err(io_err(&full, e)),
+            };
+            dirs.push(Entry {
+                mode: Mode::from_masked(meta.mode()),
+                mtime_ns: mtime_ns(&meta, &rel)?,
+                rel_path: rel,
+                kind: EntryKind::Dir,
+            });
+        }
+        Ok(dirs)
+    }
+
+    /// Lists the paths of every stash entry in `stashes` and of their index and untracked parents that `denies` names.
+    ///
+    /// The bundle carries every stash entry with its parents, so a `.env`
+    /// saved by `git stash -u` travels with it although it was never tracked.
     fn stashed_secrets(
         &self,
-        stash: &GitOid,
+        stashes: &[GitOid],
         denies: &dyn Fn(&RelPath) -> bool,
     ) -> Result<Vec<RelPath>, CaptureError> {
         let mut found = BTreeSet::new();
-        for suffix in ["", "^2", "^3"] {
+        for (stash, suffix) in stashes
+            .iter()
+            .flat_map(|stash| ["", "^2", "^3"].map(|suffix| (stash, suffix)))
+        {
             let rev = format!("{}{suffix}", stash.as_str());
             let commit = format!("{rev}^{{commit}}");
             if !self
@@ -1561,12 +2312,16 @@ impl GitCapture<'_> {
     }
 
     /// Reads the allowlisted projection of the local config.
+    ///
+    /// A key git holds more than once, such as two `remote.origin.fetch`
+    /// refspecs, keeps every value, in the order git lists them: the sort
+    /// by key is stable.
     fn config(
         &self,
         report: &mut CaptureReport,
     ) -> Result<Vec<(GitConfigKey, GitConfigValue)>, CaptureError> {
         let out = self.git.run(&["config", "--list", "--local", "-z"])?;
-        let mut config: BTreeMap<GitConfigKey, GitConfigValue> = BTreeMap::new();
+        let mut config: Vec<(GitConfigKey, GitConfigValue)> = Vec::new();
         for record in Git::records(&out) {
             let text = Git::text("config record", record)?;
             let (key, value) = text.split_once('\n').unwrap_or((text, ""));
@@ -1590,18 +2345,61 @@ impl GitCapture<'_> {
                 report.dropped_config.push(key);
                 continue;
             }
-            if config.insert(key.clone(), value).is_some() {
-                report.repeated_config.push(key.clone());
-            }
+            config.push((key, value));
         }
-        Ok(config.into_iter().collect())
+        config.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(config)
     }
+}
+
+/// The most path bytes one git command line carries, well under every `ARG_MAX`.
+const ARG_BYTES: usize = 128 << 10;
+
+/// Splits `items` into runs whose lengths by `len`, one byte more each, stay under `ARG_BYTES`.
+fn arg_batches<T>(items: &[T], len: impl Fn(&T) -> usize) -> Vec<&[T]> {
+    let mut batches = Vec::new();
+    let (mut start, mut bytes) = (0, 0);
+    for (index, item) in items.iter().enumerate() {
+        let size = len(item) + 1;
+        if index > start && bytes + size > ARG_BYTES {
+            batches.push(&items[start..index]);
+            (start, bytes) = (index, 0);
+        }
+        bytes += size;
+    }
+    if start < items.len() {
+        batches.push(&items[start..]);
+    }
+    batches
+}
+
+/// The prefix of the refs that hold a job's stash entries older than `refs/stash`; restore rebuilds the stash list from them.
+pub(crate) fn stash_prefix(job_id: JobId) -> String {
+    format!("refs/fabric/{job_id}/stash/")
 }
 
 /// Removes the part of a remote URL that can hold a credential (`fabric_core::git::credential_range`).
 fn strip_userinfo(url: &str) -> Option<String> {
     let range = credential_range(url)?;
     Some(format!("{}{}", &url[..range.start], &url[range.end..]))
+}
+
+/// The manifest of the snapshot `req` follows, refused when it belongs to another job.
+fn parent_manifest(
+    store: &Store,
+    req: &CaptureRequest<'_>,
+) -> Result<Option<(SnapshotId, SnapshotManifest)>, CaptureError> {
+    let Some(parent) = req.parent else {
+        return Ok(None);
+    };
+    let manifest = store.manifest(parent)?;
+    if manifest.job_id != req.job_id {
+        return Err(CaptureError::ParentJobMismatch {
+            parent,
+            job: manifest.job_id,
+        });
+    }
+    Ok(Some((parent, manifest)))
 }
 
 /// Captures the workspace described by `req` into `store` and returns the manifest.
@@ -1611,49 +2409,67 @@ fn strip_userinfo(url: &str) -> Option<String> {
 /// runs no `Store::gc` in between, since gc may remove an object the
 /// manifest reuses.
 pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, CaptureError> {
-    let root_text = req.root.to_str().ok_or_else(|| CaptureError::BadRoot {
+    let bad_root = || CaptureError::BadRoot {
         path: req.root.to_owned(),
-    })?;
-    let root = AbsPath::parse(root_text).map_err(|_| CaptureError::BadRoot {
-        path: req.root.to_owned(),
-    })?;
-    if !req.root.is_dir() {
-        return Err(CaptureError::BadRoot {
-            path: req.root.to_owned(),
-        });
-    }
-    let parent_manifest = match req.parent {
-        Some(parent) => {
-            let manifest = store.manifest(parent)?;
-            if manifest.job_id != req.job_id {
-                return Err(CaptureError::ParentJobMismatch {
-                    parent,
-                    job: manifest.job_id,
-                });
-            }
-            Some((parent, manifest))
-        }
-        None => None,
     };
+    let root = (req.root.to_str())
+        .and_then(|text| AbsPath::parse(text).ok())
+        .ok_or_else(bad_root)?;
+    if !req.root.is_dir() {
+        return Err(bad_root());
+    }
+    let parent_manifest = parent_manifest(store, req)?;
     let mut capturer = Capturer {
         store,
         req,
         report: CaptureReport::default(),
     };
-    let (git_state, found) = if let Some(repo) = detect_git(req, store.objects().tmp_dir())? {
+    let mut worktree_dirs = Vec::new();
+    let mut carried = carried_by(req.policy, req.root);
+    let (git_state, found, settle) = if let Some(repo) = detect_git(req, store.objects().tmp_dir())?
+    {
         repo.refuse_bad_states()?;
         let parent = parent_manifest
             .as_ref()
             .map(|(id, manifest)| (*id, manifest));
-        let state = capture_git(&mut capturer, &repo, parent)?;
-        (Some(state), repo.ignored(&mut capturer.report)?)
+        let (state, mut seen) = capture_git(&mut capturer, &repo, parent)?;
+        worktree_dirs = std::mem::take(&mut seen.dirs);
+        let report = &mut capturer.report;
+        let (special, nested) = (report.special_files.len(), report.nested_repositories.len());
+        let mut found = repo.ignored(report)?;
+        let names = report.special_files[special..]
+            .iter()
+            .chain(&report.nested_repositories[nested..]);
+        let ignored = Census::of(&found, names, &mut carried);
+        // git lists files only, so an empty directory, untracked or
+        // ignored, comes from a walk; one `W` holds as a submodule stays out.
+        let in_w: HashSet<&RelPath> = seen.paths.iter().collect();
+        let empty = empty_dirs(req.root, &|rel| in_w.contains(rel))?;
+        found.extend(empty.found);
+        capturer.report.unreadable = empty.unreadable;
+        (
+            Some(state),
+            found,
+            Settle::Git(Box::new((repo, seen, ignored))),
+        )
     } else {
         let listing = list_tree(req.root)?;
+        let census = Census::of(&listing.found, listing.special.iter(), &mut carried);
         capturer.report.nested_repositories.extend(listing.nested);
         capturer.report.special_files.extend(listing.special);
-        (None, listing.found)
+        (None, listing.found, Settle::Plain(census))
     };
-    let (files, caches) = capturer.classify_and_store(req.root, found)?;
+    let (mut files, caches) = capturer.classify_and_store(req.root, found)?;
+    // A directory of `W` that also holds a carried ignored file has its entry already.
+    for dir in worktree_dirs {
+        if let Err(at) = files.binary_search_by(|e| e.rel_path.cmp(&dir.rel_path)) {
+            files.insert(at, dir);
+        }
+    }
+    match &settle {
+        Settle::Git(git) => git.0.unchanged_since(&git.1, &git.2, &mut carried)?,
+        Settle::Plain(census) => census.unchanged_under(req.root, &mut carried)?,
+    }
     let harness_state = match req.harness_state {
         Some(dir) => HarnessState {
             entries: capturer.harness_entries(dir)?,
@@ -1675,6 +2491,7 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
         harness_state,
         env_spec: req.env_spec,
         caches,
+        left_behind: left_behind(&capturer.report, req.policy),
     };
     if let Some(state) = &manifest.git {
         refuse_overlap(&manifest.files, &state.worktree_mtimes)?;
@@ -1684,6 +2501,37 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
         manifest,
         report: capturer.report,
     })
+}
+
+/// Every ignored or untracked workspace path a secret pattern or `.fabricignore` keeps on this node, with that reason, sorted by path.
+///
+/// An untracked path removed from the working-tree commit is a secret when
+/// the secret list names it and an exclusion otherwise, since those are the
+/// only two lists that remove one. The harness state's own denials are not
+/// workspace paths and are not listed, and neither is what capture leaves
+/// out for another reason (`special_files`, `unreadable`,
+/// `nested_repositories`), which the report names.
+fn left_behind(report: &CaptureReport, policy: &IgnorePolicy) -> Vec<LeftBehind> {
+    let secret = |path: &RelPath| LeftBehind {
+        path: path.clone(),
+        reason: LeaveReason::Secret,
+    };
+    let mut left: Vec<LeftBehind> = report.denied.iter().map(secret).collect();
+    left.extend(report.excluded.iter().map(|path| LeftBehind {
+        path: path.clone(),
+        reason: LeaveReason::Excluded,
+    }));
+    left.extend(report.denied_untracked.iter().map(|path| LeftBehind {
+        path: path.clone(),
+        reason: if policy.is_secret(path) {
+            LeaveReason::Secret
+        } else {
+            LeaveReason::Excluded
+        },
+    }));
+    left.sort_by(|a, b| a.path.cmp(&b.path));
+    left.dedup_by(|a, b| a.path == b.path);
+    left
 }
 
 /// Refuses a capture whose ignored files and working-tree commit share a path.
@@ -1745,6 +2593,7 @@ fn detect_git<'a>(
     Ok(Some(GitCapture {
         git,
         root: req.root,
+        policy: req.policy,
         job_id: req.job_id,
         scratch: scratch.to_owned(),
         user_excludes,
@@ -1766,22 +2615,28 @@ fn chain_depth(store: &Store, manifest: &SnapshotManifest) -> Result<u32, Captur
     Ok(depth)
 }
 
-fn capture_git(
+/// Returns the untracked paths `W` leaves out, each named in the report,
+/// and refuses one above `LARGE_UNTRACKED_LIMIT` that `W` would hold, unless
+/// the request allows it.
+///
+/// An untracked path under a cache that holds no tracked path is judged
+/// as an ignored one is, by the cache's narrower list: a cache git does
+/// not ignore, such as a `node_modules` installed before a `.gitignore`
+/// was written, travels in `W` whole, or the target would hold it with
+/// holes its sentinel calls whole (`untracked_carried_by`).
+fn untracked_left_out(
     capturer: &mut Capturer<'_>,
-    repo: &GitCapture<'_>,
-    parent: Option<(SnapshotId, &SnapshotManifest)>,
-) -> Result<GitState, CaptureError> {
+    untracked: &[RelPath],
+    tracked_dirs: &HashSet<String>,
+) -> Result<BTreeSet<RelPath>, CaptureError> {
     let req = capturer.req;
-    let policy = req.policy;
-    let (untracked, nested) = repo.untracked()?;
-    capturer
-        .report
-        .nested_repositories
-        .extend(nested.iter().cloned());
+    let mut carried = untracked_carried_by(req.policy, req.root, tracked_dirs);
+    let mut left_out = BTreeSet::new();
     let mut too_large = Vec::new();
-    for rel in &untracked {
-        if policy.denies_anywhere(rel) {
+    for rel in untracked {
+        if !carried(rel) {
             capturer.report.denied_untracked.push(rel.clone());
+            left_out.insert(rel.clone());
             continue;
         }
         let full = req.root.join(rel.as_str());
@@ -1793,7 +2648,24 @@ fn capture_git(
     if !too_large.is_empty() && !req.allow_large_untracked {
         return Err(CaptureError::UntrackedTooLarge { paths: too_large });
     }
+    Ok(left_out)
+}
+
+fn capture_git(
+    capturer: &mut Capturer<'_>,
+    repo: &GitCapture<'_>,
+    parent: Option<(SnapshotId, &SnapshotManifest)>,
+) -> Result<(GitState, GitSeen), CaptureError> {
+    let req = capturer.req;
+    let policy = req.policy;
+    let (untracked, nested) = repo.untracked()?;
+    capturer
+        .report
+        .nested_repositories
+        .extend(nested.iter().cloned());
     let tracked: BTreeSet<RelPath> = repo.tracked()?.into_iter().collect();
+    let tracked_dirs = tracked_dirs(&tracked);
+    let left_out = untracked_left_out(capturer, &untracked, &tracked_dirs)?;
     for rel in &tracked {
         if policy.denies_anywhere(rel) {
             capturer.report.tracked_secrets.push(rel.clone());
@@ -1811,15 +2683,21 @@ fn capture_git(
         excludes.push_str(root.as_str());
         excludes.push_str("/\n");
     }
-    let before = stamps(req.root, tracked.iter().chain(untracked.iter()))?;
-    let (worktree_commit, removed) = repo.worktree_commit(
+    let stamped: Vec<RelPath> = tracked.iter().chain(untracked.iter()).cloned().collect();
+    let before = stamps(req.root, stamped.iter())?;
+    let in_w: BTreeSet<&RelPath> = untracked
+        .iter()
+        .filter(|rel| !left_out.contains(*rel))
+        .collect();
+    let (worktree_commit, removed, filtered) = repo.worktree_commit(
         &index_tree,
         head_commit.as_ref(),
         &index_commit,
         &excludes,
-        &tracked,
-        &|rel| policy.denies_anywhere(rel) || under_nested(rel),
+        (&tracked, &in_w),
+        &|rel| !in_w.contains(rel) || under_nested(rel),
     )?;
+    capturer.report.filtered = filtered;
     let denied = &mut capturer.report.denied_untracked;
     for rel in removed {
         if !under_nested(&rel) && !denied.contains(&rel) {
@@ -1833,13 +2711,11 @@ fn capture_git(
 
     let plan = BundlePlan::after(capturer.store, parent)?;
     repo.delete_older_snap_refs(&worktree_commit)?;
-    let (built, view) = repo.bundle_with_refs(&plan)?;
+    let (built, view, stashes) = repo.bundle_with_stash(&plan)?;
     let (bundle, bundle_base) = capturer.store_bundle(built)?;
     let RefView { refs, head } = view;
-    if let Some((_, stash)) = refs.iter().find(|(name, _)| name.as_str() == "refs/stash") {
-        capturer.report.stashed_secrets =
-            repo.stashed_secrets(stash, &|rel| policy.denies_anywhere(rel))?;
-    }
+    capturer.report.stashed_secrets =
+        repo.stashed_secrets(&stashes, &|rel| policy.denies_anywhere(rel))?;
     let worktree_mtimes = repo.worktree_mtimes(&worktree_commit, &before, &mut capturer.report)?;
     let config = repo.config(&mut capturer.report)?;
     let exclude_path = repo.git.git_path("info/exclude")?;
@@ -1854,7 +2730,7 @@ fn capture_git(
     } else {
         None
     };
-    Ok(GitState {
+    let state = GitState {
         bundle,
         bundle_base,
         refs,
@@ -1864,7 +2740,16 @@ fn capture_git(
         worktree_mtimes,
         config,
         exclude,
-    })
+    };
+    let seen = GitSeen {
+        paths: stamped,
+        stamps: before,
+        untracked: (untracked, nested),
+        left_out,
+        tracked_dirs,
+        dirs: repo.worktree_dirs(&state.worktree_commit)?,
+    };
+    Ok((state, seen))
 }
 
 #[cfg(test)]
@@ -1877,6 +2762,15 @@ mod tests {
     }
 
     #[test]
+    fn a_native_addon_is_a_file_named_dot_node() {
+        assert!(is_native_addon(&rel("node_modules/x/build/Release/x.node")));
+        assert!(is_native_addon(&rel("node_modules/x/X.NODE")));
+        assert!(!is_native_addon(&rel("node_modules/x/.node")));
+        assert!(!is_native_addon(&rel("node_modules/x/index.js")));
+        assert!(!is_native_addon(&rel("node_modules/x.node.js")));
+    }
+
+    #[test]
     fn symlink_escape_rule() {
         assert!(symlink_escapes(&rel("a"), "/etc/passwd"));
         assert!(symlink_escapes(&rel("a"), "../x"));
@@ -1884,6 +2778,42 @@ mod tests {
         assert!(symlink_escapes(&rel("d/a"), "../../x"));
         assert!(!symlink_escapes(&rel("d/a"), "b/../c"));
         assert!(!symlink_escapes(&rel("a"), "./b"));
+    }
+
+    /// An entry removed after its directory was listed, as a watcher's
+    /// temporary file or directory under an excluded `tmp/`, is skipped:
+    /// nothing of it is left to carry, and failing the walk would fail
+    /// every capture while the watcher runs.
+    #[test]
+    fn an_entry_that_vanishes_during_the_empty_directory_walk_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("tmp/gone-dir/inner")).unwrap();
+        fs::create_dir_all(root.join("tmp/gone-empty")).unwrap();
+        fs::write(root.join("tmp/gone.txt"), "x").unwrap();
+        fs::create_dir(root.join("empty")).unwrap();
+        // An lstat of a doomed entry is where a watcher removes it: the
+        // file before its lstat, the full directory right after, and the
+        // empty one between its listing and the lstat that records it.
+        let empty_seen = std::cell::Cell::new(false);
+        let lstat = |path: &Path| {
+            if path.ends_with("tmp/gone.txt")
+                || path.ends_with("tmp/gone-empty") && empty_seen.get()
+            {
+                fs::remove_dir(path)
+                    .or_else(|_| fs::remove_file(path))
+                    .unwrap();
+            }
+            empty_seen.set(empty_seen.get() || path.ends_with("tmp/gone-empty"));
+            let meta = fs::symlink_metadata(path);
+            if path.ends_with("tmp/gone-dir") {
+                fs::remove_dir_all(path).unwrap();
+            }
+            meta
+        };
+        let found = empty_dirs_with(root, &|_| false, &lstat).unwrap();
+        let found: Vec<&str> = found.found.iter().map(|item| item.rel.as_str()).collect();
+        assert_eq!(found, ["empty"]);
     }
 
     #[test]
@@ -1955,6 +2885,7 @@ mod tests {
         let repo = GitCapture {
             git: Git::new(&root).with_date(1_760_000_000_000),
             root: &root,
+            policy: &IgnorePolicy::default(),
             job_id: JobId::from_bytes([1; 16]),
             scratch: dir.path().to_owned(),
             user_excludes: String::new(),
@@ -1976,6 +2907,46 @@ mod tests {
         ));
     }
 
+    /// A flag set after `refuse_bad_states` probed the real index is refused on the copy `I` is built from.
+    #[test]
+    fn a_flag_set_after_the_probe_is_refused_on_the_index_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        fs::create_dir(&root).unwrap();
+        let repo = GitCapture {
+            git: Git::new(&root).with_date(1_760_000_000_000),
+            root: &root,
+            policy: &IgnorePolicy::default(),
+            job_id: JobId::from_bytes([1; 16]),
+            scratch: dir.path().to_owned(),
+            user_excludes: String::new(),
+            listing_excludes: TempFile::in_dir(dir.path()),
+        };
+        repo.git.run(&["init", "-q", "-b", "main"]).unwrap();
+        fs::write(root.join("a.txt"), "a\n").unwrap();
+        repo.git.run(&["add", "a.txt"]).unwrap();
+        repo.git.run(&["commit", "-q", "-m", "one"]).unwrap();
+        let head = repo.head_commit().unwrap();
+        assert!(repo.index_commit(head.as_ref()).is_ok());
+
+        repo.git
+            .run(&["update-index", "--assume-unchanged", "a.txt"])
+            .unwrap();
+        assert!(matches!(
+            repo.index_commit(head.as_ref()),
+            Err(CaptureError::GitIndexFlag { flag: IndexFlag::AssumeUnchanged, path }) if path.as_str() == "a.txt"
+        ));
+        repo.git
+            .run(&["update-index", "--no-assume-unchanged", "a.txt"])
+            .unwrap();
+        fs::write(root.join("b.txt"), "b\n").unwrap();
+        repo.git.run(&["add", "-N", "b.txt"]).unwrap();
+        assert!(matches!(
+            repo.index_commit(head.as_ref()),
+            Err(CaptureError::GitIndexFlag { flag: IndexFlag::IntentToAdd, path }) if path.as_str() == "b.txt"
+        ));
+    }
+
     /// A ref that moves after the bundle is made is refused, full or incremental.
     #[test]
     fn a_ref_the_bundle_does_not_hold_is_refused() {
@@ -1985,6 +2956,7 @@ mod tests {
         let repo = GitCapture {
             git: Git::new(&root).with_date(1_760_000_000_000),
             root: &root,
+            policy: &IgnorePolicy::default(),
             job_id: JobId::from_bytes([1; 16]),
             scratch: dir.path().to_owned(),
             user_excludes: String::new(),

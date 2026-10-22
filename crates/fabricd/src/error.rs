@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 
 use fabric_client::api::{Reason, Refusal, StealWarning, Step};
+use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, JobId, MoveId, NodeId, SnapshotId};
 use fabric_core::lease::FenceError;
 use fabric_core::ledger::{LedgerError, StoreError as LedgerStoreError};
@@ -29,6 +30,14 @@ pub enum NodeError {
         /// The underlying error.
         #[source]
         source: std::io::Error,
+    },
+    /// The state directory, or an entry in it, is not this user's alone to take.
+    #[error("{path}: {reason}")]
+    UnsafeStateDir {
+        /// The directory.
+        path: PathBuf,
+        /// What is wrong with it.
+        reason: String,
     },
     /// Another daemon holds this state directory.
     #[error("another fabric daemon holds {0}")]
@@ -111,6 +120,34 @@ pub enum NodeError {
         /// The target of the move.
         target: NodeId,
     },
+    /// A resume under another harness ran while the move's preflight checked the target for the old one.
+    #[error(
+        "job {job} was resumed under {now} while the preflight checked {target} for {checked}, so nothing moved; run `fabric job move {job} --to {target}` again, which checks {now}"
+    )]
+    HarnessChangedDuringMove {
+        /// The job.
+        job: JobId,
+        /// The harness the preflight checked.
+        checked: Box<HarnessKind>,
+        /// The harness the job runs under now.
+        now: Box<HarnessKind>,
+        /// The target of the move.
+        target: NodeId,
+    },
+    /// The holder resumed under another harness after a pull's preflight checked this node for the old one.
+    #[error(
+        "job {job} was resumed under {now} on {holder} after the preflight checked this node for {checked}, so the move was aborted and {holder} keeps the job; run `fabric job resume {job}` again, which checks {now}"
+    )]
+    HarnessChangedDuringPull {
+        /// The job.
+        job: JobId,
+        /// The node that held the job.
+        holder: NodeId,
+        /// The harness the preflight checked.
+        checked: Box<HarnessKind>,
+        /// The harness the job runs under now.
+        now: Box<HarnessKind>,
+    },
     /// The workspace changed after the snapshot a move copied, by hand or by a harness Fabric did not start.
     #[error(
         "the workspace of job {job} at {root} changed after the snapshot {target} copied, so nothing moved; run `fabric job move {job} --to {target}` again, which captures the change"
@@ -163,6 +200,33 @@ pub enum NodeError {
         /// The epoch its marker was written at.
         epoch: Epoch,
     },
+    /// The workspace root is a link or a file, put there in place of the directory Fabric wrote.
+    #[error(
+        "job {job}: {root} is not a directory but a link or a file, so nothing runs or is captured there; move it aside, then run `fabric job resume {job}`, which restores the latest snapshot when the workspace was clean"
+    )]
+    RootNotADirectory {
+        /// The job.
+        job: JobId,
+        /// The root.
+        root: PathBuf,
+    },
+    /// The job's ledger moved past the head a run plan was made at, so the plan is stale.
+    #[error(
+        "job {job} changed after this launch was planned, by another run or resume, a suspend or a record from a peer, so nothing was launched; run the command again"
+    )]
+    PlanOvertaken {
+        /// The job.
+        job: JobId,
+    },
+    /// The job's session moved after a run plan was made, so the plan
+    /// would continue an older one.
+    #[error(
+        "job {job} recorded a session after this launch was planned, as a headless turn does when it names its session late, so the launch would continue an older one; run the command again"
+    )]
+    SessionMoved {
+        /// The job.
+        job: JobId,
+    },
     /// The job has no workspace on this node.
     #[error("job {0} has no workspace on this node; run `fabric job resume {0}`")]
     NoWorkspace(JobId),
@@ -177,6 +241,20 @@ pub enum NodeError {
         job: JobId,
         /// Which step did not finish.
         step: Step,
+    },
+    /// A process holds the workspace's tree lock: a run or a resume while
+    /// it runs setup steps or launches, or a process a setup step left
+    /// running with the lock as its input.
+    #[error(
+        "job {job}: nothing was captured, since a process holds {lock}, the lock over {root}: a `fabric job run` or `resume` running setup steps or launching, or a process a setup step left running, which holds it until it exits. `lsof {lock}` names it; try again once it is gone"
+    )]
+    SetupRunning {
+        /// The job.
+        job: JobId,
+        /// The root.
+        root: PathBuf,
+        /// The lock file its holder has open.
+        lock: PathBuf,
     },
     /// The job was never suspended, so there is no snapshot to restore or move.
     #[error("job {0} has no snapshot yet; suspend it on its owner first")]
@@ -244,6 +322,17 @@ pub enum NodeError {
         .0.join(", ")
     )]
     Preflight(Vec<String>),
+    /// The snapshot a move takes holds paths the target can neither use nor make again.
+    #[error(
+        "the preflight refused the move: the target can neither use nor rebuild {}; `fabric job move` and `fabric job resume` take --force to waive what can be waived",
+        fabric_client::sentences::named(.paths, *.more)
+    )]
+    CarryRefused {
+        /// The first of the paths.
+        paths: Vec<String>,
+        /// How many more there are.
+        more: u64,
+    },
     /// A steal without `--force`.
     #[error(
         "a steal would bump the epoch without {}'s consent: {described}. Pass --force to do it",
@@ -289,6 +378,9 @@ pub enum NodeError {
     /// The workspace's environment could not be detected, so no node could materialize it.
     #[error("environment detection: {0}")]
     Detect(#[from] fabric_env::detect::DetectError),
+    /// The workspace's tree lock could not be taken.
+    #[error(transparent)]
+    Materialize(#[from] fabric_env::materialize::MaterializeError),
     /// Capture failed.
     #[error(transparent)]
     Capture(#[from] fabric_store::capture::CaptureError),
@@ -391,6 +483,10 @@ impl NodeError {
             NodeError::Preflight(facts) => Reason::Preflight {
                 facts: facts.clone(),
             },
+            NodeError::CarryRefused { paths, more } => Reason::CarryRefused {
+                paths: paths.clone(),
+                more: *more,
+            },
             NodeError::StealNeedsForce { warning, .. } => {
                 Reason::StealNeedsForce { warning: *warning }
             }
@@ -413,6 +509,39 @@ impl NodeError {
                 root: root.clone(),
                 target: *target,
             },
+            NodeError::HarnessChangedDuringMove {
+                job,
+                checked,
+                now,
+                target,
+            } => Reason::HarnessChangedDuringMove {
+                job: *job,
+                checked: checked.clone(),
+                now: now.clone(),
+                target: *target,
+            },
+            NodeError::HarnessChangedDuringPull {
+                job,
+                holder,
+                checked,
+                now,
+            } => Reason::HarnessChangedDuringPull {
+                job: *job,
+                holder: *holder,
+                checked: checked.clone(),
+                now: now.clone(),
+            },
+            NodeError::SetupRunning { job, root, lock } => Reason::SetupRunning {
+                job: *job,
+                root: root.clone(),
+                lock: lock.clone(),
+            },
+            NodeError::RootNotADirectory { job, root } => Reason::RootNotADirectory {
+                job: *job,
+                root: root.clone(),
+            },
+            NodeError::PlanOvertaken { job } => Reason::PlanOvertaken { job: *job },
+            NodeError::SessionMoved { job } => Reason::SessionMoved { job: *job },
             NodeError::StaleWorkspace { job, root, epoch } => Reason::StaleWorkspace {
                 job: *job,
                 root: root.clone(),
@@ -447,6 +576,7 @@ impl NodeError {
                 peer: *peer,
             },
             NodeError::Io { .. }
+            | NodeError::UnsafeStateDir { .. }
             | NodeError::AlreadyRunning(_)
             | NodeError::SocketPathTooLong(_)
             | NodeError::Ledger(_)
@@ -456,6 +586,7 @@ impl NodeError {
             | NodeError::Store(_)
             | NodeError::Policy(_)
             | NodeError::Detect(_)
+            | NodeError::Materialize(_)
             | NodeError::Capture(_)
             | NodeError::Restore(_)
             | NodeError::Harness(_)

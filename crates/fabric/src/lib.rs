@@ -33,15 +33,15 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use fabric_client::api::{
     ClientEnv, Decision, DoctorReport, Event, RefusalKind, Reply, Request, RunPlan, SystemPath,
 };
-use fabric_client::{Client, ClientError, Launched};
+use fabric_client::{Client, ClientError, Launched, Started};
 use fabric_core::env::{EnvVarName, SetupArg};
 use fabric_core::harness::HarnessKind;
-use fabric_core::id::{JobId, NodeId};
+use fabric_core::id::{EnvSpecId, JobId, NodeId};
 use fabric_core::session::SessionId;
 use fabric_env::materialize::{CacheHealth, MaterializeError, NodeEnv, TreeLock};
 use fabric_harness::claude::{ClaudeCode, LeftReason, TrustOutcome};
 use fabric_harness::codex::Codex;
-use fabric_harness::{Harness, Launch, Running, TurnReport};
+use fabric_harness::{Harness, Launch, LaunchSettings, Origin, PassedSetting, Running, TurnReport};
 use fabric_net::endpoint::DialOrder;
 use fabricd::harnesses::{HarnessEnv, acp_adapter, parse_harness};
 use fabricd::node::{Node, NodeConfig};
@@ -114,7 +114,7 @@ enum NodeCommand {
     },
     /// List the paired nodes.
     Ls,
-    /// Dial a paired node and ping it.
+    /// Ping a paired node over its session, dialing it when none is open.
     Ping {
         /// The node.
         node: NodeId,
@@ -145,6 +145,9 @@ enum JobCommand {
         /// Run one turn without a terminal, print the answer and the session, and exit.
         #[arg(long, requires = "prompt")]
         headless: bool,
+        /// Run setup steps this node has not approved for the job, as the workspace now is, without asking.
+        #[arg(long)]
+        yes: bool,
     },
     /// Stop the harness, snapshot the workspace and record the suspend.
     Suspend {
@@ -170,6 +173,9 @@ enum JobCommand {
         /// Waive the preflight refusals that can be waived when pulling.
         #[arg(long)]
         force: bool,
+        /// Run setup steps this node has not approved for the job, as the workspace now is, without asking.
+        #[arg(long)]
+        yes: bool,
     },
     /// Move the job to a paired node by the cooperative move protocol.
     Move {
@@ -431,23 +437,18 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 env: Some(ClientEnv::current()?),
             };
             let reply = ask(&client, &request, Notes::Stdout).await?;
-            // The node reports; a row that would stop a move still fails
-            // the command, as a preflight does.
+            // The node reports; a row or a path that would stop a move
+            // still fails the command, as a preflight does.
             if let Reply::Doctor {
-                report: DoctorReport::Compared { rows, .. },
+                report: DoctorReport::Compared { rows, carry, .. },
             } = &reply
+                && let Some(message) = render::refused_move(rows, carry.as_ref())
             {
-                let blocking = render::blocking(rows);
-                if !blocking.is_empty() {
-                    return Err(Refused {
-                        refusal: RefusalKind::NeedsForce,
-                        message: format!(
-                            "the preflight refused the move: {}; `fabric job move` and `fabric job resume` take --force to waive what can be waived",
-                            blocking.join(", ")
-                        ),
-                    }
-                    .into());
+                return Err(Refused {
+                    refusal: RefusalKind::NeedsForce,
+                    message,
                 }
+                .into());
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -485,7 +486,25 @@ async fn serve(state: StateDir, home: PathBuf, args: ServeArgs) -> Result<ExitCo
 
 async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitCode> {
     let client = client(state);
-    let (request, mode) = match command {
+    let (request, mode, yes) = job_request(command)?;
+    let (Reply::JobRun(plan) | Reply::JobResume(plan)) =
+        ask(&client, &request, mode.notes()).await?
+    else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    let approval = Approval {
+        record: state.job(plan.job).env_spec_ran(),
+        yes,
+        ask: &ask_on_terminal,
+    };
+    launch(state, home, &client, &plan, mode, &approval).await
+}
+
+/// The request a job command sends, how a harness it launches runs, and
+/// whether `--yes` lets setup steps this node has not approved run without asking.
+fn job_request(command: JobCommand) -> Result<(Request, Mode, bool)> {
+    let env = || ClientEnv::current().map(Some);
+    Ok(match command {
         JobCommand::New {
             repo,
             goal,
@@ -497,24 +516,22 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
                 harness,
             },
             Mode::Interactive(None),
+            false,
         ),
         JobCommand::Run {
             job,
             prompt,
             headless,
+            yes,
         } => (
-            Request::JobRun {
-                job,
-                env: Some(ClientEnv::current()?),
-            },
+            Request::JobRun { job, env: env()? },
             Mode::new(prompt, headless)?,
+            yes,
         ),
         JobCommand::Suspend { job } => (
-            Request::JobSuspend {
-                job,
-                env: Some(ClientEnv::current()?),
-            },
+            Request::JobSuspend { job, env: env()? },
             Mode::Interactive(None),
+            false,
         ),
         JobCommand::Resume {
             job,
@@ -523,32 +540,36 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
             prompt,
             headless,
             force,
+            yes,
         } => (
             Request::JobResume {
                 job,
                 on,
                 harness,
                 force,
-                env: Some(ClientEnv::current()?),
+                env: env()?,
             },
             Mode::new(prompt, headless)?,
+            yes,
         ),
         JobCommand::Move { job, to, force } => (
             Request::JobMove {
                 job,
                 to,
                 force,
-                env: Some(ClientEnv::current()?),
+                env: env()?,
             },
             Mode::Interactive(None),
+            false,
         ),
         JobCommand::Steal { job, force, reason } => (
             Request::JobSteal { job, reason, force },
             Mode::Interactive(None),
+            false,
         ),
-        JobCommand::Status { job } => (Request::JobStatus { job }, Mode::Interactive(None)),
-        JobCommand::Ls => (Request::JobList, Mode::Interactive(None)),
-        JobCommand::Log { job } => (Request::JobLog { job }, Mode::Interactive(None)),
+        JobCommand::Status { job } => (Request::JobStatus { job }, Mode::Interactive(None), false),
+        JobCommand::Ls => (Request::JobList, Mode::Interactive(None), false),
+        JobCommand::Log { job } => (Request::JobLog { job }, Mode::Interactive(None), false),
         JobCommand::Approve { job, note } => (
             Request::JobDecide {
                 job,
@@ -556,6 +577,7 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
                 note,
             },
             Mode::Interactive(None),
+            false,
         ),
         JobCommand::Reject { job, note } => (
             Request::JobDecide {
@@ -564,14 +586,9 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
                 note,
             },
             Mode::Interactive(None),
+            false,
         ),
-    };
-    let (Reply::JobRun(plan) | Reply::JobResume(plan)) =
-        ask(&client, &request, mode.notes()).await?
-    else {
-        return Ok(ExitCode::SUCCESS);
-    };
-    launch(state, home, &client, &plan, mode).await
+    })
 }
 
 /// The repository `fabric job new` names, as the absolute path the client API carries.
@@ -630,6 +647,7 @@ async fn launch(
     client: &Client,
     plan: &RunPlan,
     mode: Mode,
+    approval: &Approval<'_>,
 ) -> Result<ExitCode> {
     let notes = mode.notes();
     let read_line: Option<ReadLine> = match (&mode, &plan.harness) {
@@ -638,76 +656,139 @@ async fn launch(
         // The protocol client holds an ACP agent's output.
         _ => None,
     };
-    let tree = materialize(state, &plan.root, notes)?;
+    let tree = prepare(state, home, client, plan, notes, approval).await?;
     let headless = matches!(mode, Mode::Headless(_));
-    // Caught from just before the harness starts, so none is lost in
-    // between; a signal during the setup steps still ends the command.
-    let forward = read_line.map(|_| Forward::new()).transpose()?;
-    let mut running = start(home, plan, mode, notes).await?;
+    let env = environment();
+    // Caught from before the harness starts: until the node records it, the
+    // harness runs in a group of its own that nothing else supervises, so
+    // a signal that ends this command must stop it first. A signal during
+    // the setup steps still ends the command.
+    let mut interrupts = Interrupts::new()?;
+    let (adapter, how) = adapter_for(home, plan, mode, notes, &env).await?;
+    // The resume guard runs inside the launch, before the harness exists,
+    // and can wait as long as a `--version` run; a signal then ends the
+    // command with nothing started. An adapter whose launch is dropped
+    // before it returns kills what it started, and a signal already caught
+    // wins over a launch that would finish in the same poll.
+    let mut running = tokio::select! {
+        biased;
+        signal = interrupts.next() => return Ok(interrupted_before_start(signal)),
+        running = adapter.launch(&plan.root, how, &env) => running?,
+    };
     let pid = running.pid();
-    let registered = register(client, plan, &running, notes).await;
+    let said = settings_lines(&plan.harness, plan.session.as_ref(), running.settings());
+    let registered = match notes.print(&said) {
+        Ok(()) => tokio::select! {
+            registered = register(client, plan, &running, notes) => registered,
+            signal = interrupts.next() => {
+                kill_group(&running);
+                return interrupted(signal, plan);
+            }
+        },
+        Err(e) => Err(e),
+    };
     drop(tree);
     if let Err(e) = registered {
         kill_group(&running);
         return Err(e);
     }
-    if let (Some(read_line), Some(forward)) = (read_line, forward) {
+    if let Some(read_line) = read_line {
         let turn = Turn {
             client,
             plan,
             notes,
             read_line,
         };
-        let (report, status, mut forward) = turn.run(&mut running, forward).await?;
-        // The node hears of the exit even when the answer cannot be printed,
-        // as after the hang-up of the terminal that would have shown it.
-        let printed = print_turn(plan, &report);
-        let code = tokio::select! {
-            code = exited(client, plan, pid, status, forward.passed > 0) => code?,
-            signal = forward.next() => {
-                writeln!(
-                    std::io::stderr(),
-                    "interrupted while the node recorded the end of the turn; `fabric job status {}` shows what it holds",
-                    plan.job
-                )?;
-                return Ok(signal_exit(signal.as_raw()));
-            }
+        let (report, status) = match turn.run(&mut running, &mut interrupts).await? {
+            TurnEnd::Reaped { report, status } => (report, status),
+            TurnEnd::Interrupted(signal) => return Ok(signal_exit(signal.as_raw())),
         };
-        printed?;
+        // The node hears of the exit before anything prints the turn, so a
+        // script that reads the session line finds the harness no longer
+        // recorded, and hears of it even when the answer cannot be printed,
+        // as after the hang-up of the terminal that would have shown it.
+        let code = exited(client, plan, pid, status, &mut interrupts).await?;
+        print_turn(plan, &report)?;
         return Ok(code);
     }
     // A held harness has not run yet: it gets the terminal first, then starts.
     let handed = if running.is_held() {
-        terminal::hand_over(pid)
+        match terminal::hand_over(pid) {
+            Ok(handed) => handed,
+            Err(e) => {
+                let error = anyhow!(
+                    "the terminal could not be given to the harness ({e}), so it was stopped before it ran"
+                );
+                return Err(abandon(client, plan, &mut running, &mut interrupts, error).await);
+            }
+        }
     } else {
         None
     };
     if let Err(e) = running.release() {
-        kill_group(&running);
-        return Err(e.into());
+        return Err(abandon(client, plan, &mut running, &mut interrupts, e.into()).await);
     }
-    let status = running.child_mut().wait().await?;
+    let status = if headless {
+        // An agent run headless gets no signal of a terminal either, so
+        // they are passed on to it until it is reaped and the node told.
+        reap(&mut running, &mut interrupts).await?
+    } else {
+        tokio::select! {
+            status = running.child_mut().wait() => status?,
+            // The node supervises the harness now, so a signal ends this
+            // command as it did before any was caught, and the harness runs on.
+            signal = interrupts.next() => return Ok(signal_exit(signal.as_raw())),
+        }
+    };
     drop(handed);
-    let printed = if headless {
+    let code = exited(client, plan, pid, status, &mut interrupts).await?;
+    if headless {
         print_turn(
             plan,
             &TurnReport {
                 session: running.session().cloned(),
                 ..TurnReport::default()
             },
-        )
-    } else {
-        Ok(())
-    };
-    let code = exited(client, plan, pid, status, false).await?;
-    printed?;
+        )?;
+    }
     Ok(code)
 }
 
-/// Launches the plan's harness in `mode`; held when it is interactive and
-/// standard input is a terminal.
-async fn start(home: &Path, plan: &RunPlan, mode: Mode, notes: Notes) -> Result<Running> {
-    let env = environment();
+/// Stops a recorded harness that cannot go on, reaps it and tells the node
+/// it exited, so the node drops its record at once; returns `error`. A
+/// signal stops the wait for the node, which finds the group gone at its
+/// next look.
+async fn abandon(
+    client: &Client,
+    plan: &RunPlan,
+    running: &mut Running,
+    interrupts: &mut Interrupts,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    kill_group(running);
+    if let Err(e) = running.child_mut().wait().await {
+        tracing::warn!(error = %e, "the stopped harness could not be reaped");
+    }
+    tokio::select! {
+        told = client.harness_exited(plan.job, running.pid(), |_| {}) => {
+            if let Err(e) = told {
+                tracing::warn!(error = %e, "the node did not record that the stopped harness exited");
+            }
+        }
+        _ = interrupts.next() => {}
+    }
+    error
+}
+
+/// The adapter for the plan's harness and how it launches it in `mode`:
+/// held when it is interactive and standard input is a terminal.
+async fn adapter_for(
+    home: &Path,
+    plan: &RunPlan,
+    mode: Mode,
+    notes: Notes,
+    env: &[(EnvVarName, String)],
+) -> Result<(Box<dyn Harness>, Launch)> {
     let resume = plan.session.clone();
     let harness_env = HarnessEnv::new(home, path_var(), plan.harness_config.clone().into())?;
     let launch = match mode {
@@ -720,13 +801,14 @@ async fn start(home: &Path, plan: &RunPlan, mode: Mode, notes: Notes) -> Result<
     Ok(match &plan.harness {
         HarnessKind::ClaudeCode => {
             let claude = ClaudeCode::new(harness_env.home.clone(), harness_env.path_var.clone());
-            let trust = claude.preseed_trust(&plan.root, &env).await?;
+            let trust = claude.preseed_trust(&plan.root, env).await?;
             report_trust(&plan.root, &trust, notes)?;
-            claude.launch(&plan.root, launch, &env).await?
+            (Box::new(claude), launch)
         }
         HarnessKind::Codex => {
-            let codex = Codex::new(harness_env.home.clone(), harness_env.path_var.clone());
-            codex.launch(&plan.root, launch, &env).await?
+            let codex = Codex::new(harness_env.home.clone(), harness_env.path_var.clone())
+                .with_known_writer(plan.known_writer.clone());
+            (Box::new(codex), launch)
         }
         HarnessKind::Acp { program, args } => {
             let agent = acp_adapter(program, args, &harness_env)?;
@@ -734,9 +816,69 @@ async fn start(home: &Path, plan: &RunPlan, mode: Mode, notes: Notes) -> Result<
                 resume: launch.resume().cloned(),
                 prompt: launch.prompt().unwrap_or("Continue.").to_owned(),
             };
-            agent.launch(&plan.root, launch, &env).await?
+            (Box::new(agent), launch)
         }
     })
+}
+
+/// What the CLI says once the harness has started: the session it
+/// continues and the settings the launch carried, and one line for each
+/// setting the session records that the launch left out, with why, so a
+/// job never runs on another model or sandbox without the user being told
+/// (gate finding F10).
+fn settings_lines(
+    harness: &HarnessKind,
+    session: Option<&SessionId>,
+    settings: &LaunchSettings,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    match (session, settings_words(&settings.passed)) {
+        (Some(session), Some(with)) => {
+            lines.push(format!(
+                "continuing {harness} session {session} with {with}"
+            ));
+        }
+        (Some(session), None) => lines.push(format!("continuing {harness} session {session}")),
+        (None, Some(with)) => lines.push(format!("{harness} runs with {with}")),
+        (None, None) => {}
+    }
+    for left in &settings.not_carried {
+        lines.push(format!(
+            "{} {} is not carried ({}); {harness} uses its own setting",
+            left.name, left.value, left.reason
+        ));
+    }
+    lines
+}
+
+/// `model gpt-6-sol, effort xhigh (recorded in the session)`, with the
+/// origin once when every setting shares it and after each one otherwise.
+fn settings_words(passed: &[PassedSetting]) -> Option<String> {
+    let first = passed.first()?;
+    let shared = passed.iter().all(|p| p.origin == first.origin);
+    let items: Vec<String> = passed
+        .iter()
+        .map(|p| {
+            if shared {
+                format!("{} {}", p.name, p.value)
+            } else {
+                format!("{} {} ({})", p.name, p.value, origin_words(p.origin))
+            }
+        })
+        .collect();
+    let words = items.join(", ");
+    Some(if shared {
+        format!("{words} ({})", origin_words(first.origin))
+    } else {
+        words
+    })
+}
+
+fn origin_words(origin: Origin) -> &'static str {
+    match origin {
+        Origin::Session => "recorded in the session",
+        Origin::Pinned => "pinned",
+    }
 }
 
 /// Tells the node the harness started, so it records it and appends
@@ -744,16 +886,29 @@ async fn start(home: &Path, plan: &RunPlan, mode: Mode, notes: Notes) -> Result<
 /// group on an error.
 async fn register(client: &Client, plan: &RunPlan, running: &Running, notes: Notes) -> Result<()> {
     let mut printer = Printer::new(notes);
+    let started = Started {
+        session: running.session().cloned(),
+        planned: plan.session.clone(),
+        version: running.version().cloned(),
+    };
     let registered = client
-        .harness_started(
-            launched(plan, running.pid()),
-            running.session().cloned(),
-            |event| printer.print(&event),
-        )
+        .harness_started(launched(plan, running.pid()), started, |event| {
+            printer.print(&event);
+        })
         .await;
-    printer.finish()?;
+    if let Err(e) = printer.finish() {
+        tracing::warn!(error = %e, "the node's events of the launch could not be printed");
+    }
     match registered {
-        Ok(registered) => notes.print(&[render::registered(&registered)]),
+        // The harness runs and is recorded, so nothing may end the
+        // supervision now: output that cannot be written, as when the
+        // reader of a pipe went away, is reported and the wait goes on.
+        Ok(registered) => {
+            if let Err(e) = notes.print(&[render::registered(&registered)]) {
+                tracing::warn!(error = %e, "the node's answer to the launch could not be printed");
+            }
+            Ok(())
+        }
         Err(ClientError::Refused(refusal)) => Err(Refused {
             refusal: refusal.kind(),
             message: format!(
@@ -776,37 +931,40 @@ fn launched(plan: &RunPlan, pid: std::num::NonZeroU32) -> Launched {
     }
 }
 
-/// The signals a headless run passes on to its harness, which runs in a
-/// process group of its own and would not get them: Ctrl-C, the hang-up
-/// of a closed terminal or SSH session, and a termination of `fabric`.
-/// Without this, `fabric` would die of them and leave the turn running
-/// with nobody to read its answer or record its end.
-struct Forward {
+/// The signals that end this command: Ctrl-C, the hang-up of a closed
+/// terminal or SSH session, and a termination.
+///
+/// The harness runs in a process group of its own and does not get them.
+/// Until the node records it, one of them stops the harness and ends the
+/// command. After that, a headless run passes them on to the harness until
+/// it is reaped, so the turn ends and its end is recorded; an interactive
+/// one ends the command and leaves the harness to the node.
+struct Interrupts {
     interrupt: tokio::signal::unix::Signal,
-    terminate: tokio::signal::unix::Signal,
     hangup: tokio::signal::unix::Signal,
-    /// How many signals were passed on.
+    terminate: tokio::signal::unix::Signal,
+    /// How many were passed on to the harness.
     passed: u32,
 }
 
-impl Forward {
-    fn new() -> Result<Self> {
+impl Interrupts {
+    fn new() -> std::io::Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
         Ok(Self {
             interrupt: signal(SignalKind::interrupt())?,
-            terminate: signal(SignalKind::terminate())?,
             hangup: signal(SignalKind::hangup())?,
+            terminate: signal(SignalKind::terminate())?,
             passed: 0,
         })
     }
 
-    /// Waits for the next of them and returns it, to send on.
+    /// The next one to arrive.
     async fn next(&mut self) -> rustix::process::Signal {
         use rustix::process::Signal;
         tokio::select! {
             Some(()) = self.interrupt.recv() => Signal::INT,
-            Some(()) = self.terminate.recv() => Signal::TERM,
             Some(()) = self.hangup.recv() => Signal::HUP,
+            Some(()) = self.terminate.recv() => Signal::TERM,
             else => std::future::pending().await,
         }
     }
@@ -824,9 +982,47 @@ impl Forward {
     }
 }
 
-/// The exit code of a command ended by the signal `number`.
+/// Ends a launch that `signal` cut before the node recorded its harness,
+/// which the caller stopped if it had started.
+fn interrupted(signal: rustix::process::Signal, plan: &RunPlan) -> Result<ExitCode> {
+    let number = signal.as_raw();
+    writeln!(
+        std::io::stderr(),
+        "interrupted by signal {number} before the node recorded the harness, so the harness was stopped; `fabric job status {}` shows what the node holds",
+        plan.job
+    )?;
+    Ok(signal_exit(number))
+}
+
+/// Ends a launch that `signal` cut before the harness started, as while
+/// the resume guard asks the harness its version: nothing was started, or
+/// what the launch had begun was stopped when it was dropped, before any
+/// turn. The terminal may be gone, as after a hang-up; the exit code still
+/// says what ended the command.
+fn interrupted_before_start(signal: rustix::process::Signal) -> ExitCode {
+    let _ = writeln!(
+        std::io::stderr(),
+        "interrupted before the harness started; no turn ran"
+    );
+    signal_exit(signal.as_raw())
+}
+
+/// The exit code of a command ended by the signal numbered `number`.
 fn signal_exit(number: i32) -> ExitCode {
     ExitCode::from(u8::try_from(128 + number).unwrap_or(u8::MAX))
+}
+
+/// How the reading of a headless turn ended.
+#[derive(Debug)]
+enum TurnEnd {
+    /// The harness was reaped, and the node answered for every session it named.
+    Reaped {
+        report: TurnReport,
+        status: std::process::ExitStatus,
+    },
+    /// The harness was reaped, and this signal came while the node
+    /// recorded a session it named; the command ends with it.
+    Interrupted(rustix::process::Signal),
 }
 
 /// A headless turn being read: where to tell the node about a session,
@@ -840,31 +1036,27 @@ struct Turn<'a> {
 
 impl Turn<'_> {
     /// Reads the turn to its end. The harness's standard error goes to this
-    /// command's; its standard output is read line by line into a report.
+    /// command's, copied to its end before this returns; its standard
+    /// output is read line by line into a report.
     /// A session it names that the node does not hold yet goes to a
     /// recorder task at once, so a suspend during the turn captures it,
     /// while this loop keeps reaping the harness, which a suspend waits
     /// for. A signal `fabric` gets is passed on to the harness's group
     /// until the harness is reaped, and one that comes while the node
-    /// records the last session gives up waiting for it. Returns the
-    /// signals, which the caller keeps watching while it tells the node
-    /// the harness exited.
-    async fn run(
-        &self,
-        running: &mut Running,
-        mut forward: Forward,
-    ) -> Result<(TurnReport, std::process::ExitStatus, Forward)> {
+    /// records the last session gives up waiting for it and ends the turn
+    /// with it, so the command exits as interrupted.
+    async fn run(&self, running: &mut Running, interrupts: &mut Interrupts) -> Result<TurnEnd> {
         let pid = running.pid();
         let child = running.child_mut();
         let Some(stdout) = child.stdout.take() else {
             kill_group(running);
             bail!("the headless harness has no standard output, so it was stopped");
         };
-        if let Some(mut stderr) = child.stderr.take() {
+        let copied = child.stderr.take().map(|mut stderr| {
             tokio::spawn(async move {
                 let _ = tokio::io::copy(&mut stderr, &mut tokio::io::stderr()).await;
-            });
-        }
+            })
+        });
         let (sessions, named) = tokio::sync::mpsc::unbounded_channel();
         let recorder = tokio::spawn(record_sessions(
             self.client.clone(),
@@ -894,8 +1086,8 @@ impl Turn<'_> {
                         drained_by = Some(tokio::time::Instant::now() + DRAIN);
                         continue;
                     }
-                    signal = forward.next() => {
-                        forward.pass_on(pid, signal);
+                    signal = interrupts.next() => {
+                        interrupts.pass_on(pid, signal);
                         continue;
                     }
                 }
@@ -919,13 +1111,20 @@ impl Turn<'_> {
         // The harness closed its output and may still run.
         let status = match status {
             Some(status) => status,
-            None => loop {
-                tokio::select! {
-                    exit = running.child_mut().wait() => break exit?,
-                    signal = forward.next() => forward.pass_on(pid, signal),
-                }
-            },
+            None => reap(running, interrupts).await?,
         };
+        // The harness's diagnostics are copied to their end before the
+        // command can exit, which would drop the copy with what it had not
+        // written yet; a process it started that holds its standard error
+        // open is waited for as long as one that holds its output.
+        let drained_by = drained_by.unwrap_or_else(|| tokio::time::Instant::now() + DRAIN);
+        if let Some(mut copied) = copied
+            && tokio::time::timeout_at(drained_by, &mut copied)
+                .await
+                .is_err()
+        {
+            copied.abort();
+        }
         let mut recorder = recorder;
         tokio::select! {
             ended = &mut recorder => {
@@ -933,16 +1132,32 @@ impl Turn<'_> {
                     tracing::warn!(error = %e, "the session recorder ended early");
                 }
             }
-            _ = forward.next() => {
+            signal = interrupts.next() => {
                 recorder.abort();
                 writeln!(
                     std::io::stderr(),
-                    "warning: interrupted while the node recorded the session; `fabric job status {}` shows what it holds",
+                    "interrupted by signal {} while the node recorded the session; `fabric job status {}` shows what it holds",
+                    signal.as_raw(),
                     self.plan.job
                 )?;
+                return Ok(TurnEnd::Interrupted(signal));
             }
         }
-        Ok((report, status, forward))
+        Ok(TurnEnd::Reaped { report, status })
+    }
+}
+/// Waits for a headless harness to exit, passing each signal this command
+/// gets on to its group, as `Interrupts::pass_on` does.
+async fn reap(
+    running: &mut Running,
+    interrupts: &mut Interrupts,
+) -> std::io::Result<std::process::ExitStatus> {
+    let pid = running.pid();
+    loop {
+        tokio::select! {
+            exit = running.child_mut().wait() => return exit,
+            signal = interrupts.next() => interrupts.pass_on(pid, signal),
+        }
     }
 }
 
@@ -985,7 +1200,7 @@ async fn record_sessions(
         };
         let _ = writeln!(
             std::io::stderr(),
-            "warning: the node did not record {} session {session} ({missed}); a suspend of job {} does not carry it",
+            "warning: the node did not record {} session {session} ({missed}); job {} keeps the session the node holds, or, for a new Codex thread, the one its next capture finds in the workspace",
             plan.harness,
             plan.job
         );
@@ -1019,17 +1234,66 @@ fn print_turn(plan: &RunPlan, report: &TurnReport) -> Result<()> {
     Ok(())
 }
 
+/// Takes the tree lock and runs the setup steps, once the plan is known
+/// to hold and the user approved them, and returns the lock.
+async fn prepare(
+    state: &StateDir,
+    home: &Path,
+    client: &Client,
+    plan: &RunPlan,
+    notes: Notes,
+    approval: &Approval<'_>,
+) -> Result<TreeLock> {
+    // The node captures and restores the harness's state under its home;
+    // a harness launched under another would keep its session elsewhere.
+    if plan.home != home {
+        bail!(
+            "the node runs with home {} and this command with home {}, so the harness would keep its session where the node never captures it; run the command with HOME={}",
+            plan.home.display(),
+            home.display(),
+            plan.home.display()
+        );
+    }
+    let tree = lock_tree(state, &plan.root)?;
+    // Another launch may have registered its harness and let the lock go
+    // since the plan was made; the node says so before any setup step
+    // writes to the tree.
+    let mut printer = Printer::new(notes);
+    let checked = client
+        .launch_check(plan, |event| printer.print(&event))
+        .await;
+    printer.finish()?;
+    checked.map_err(Refused::from_client)?;
+    materialize(&tree, &plan.root, notes, approval)?;
+    Ok(tree)
+}
+
 /// Tells the node the harness exited and picks the exit code: the harness's
-/// own, or 128 plus the signal that stopped it, with a line saying why;
-/// `passed_on` says fabric passed a signal of its own on to the harness.
+/// own, or 128 plus the signal that stopped it, with a line saying why,
+/// which names a signal `interrupts` passed on to the harness.
+///
+/// The node answers once it holds the job, which a suspend or a move of it
+/// can keep for minutes, so a signal ends the wait as it ends the command
+/// at any other point; the node finds the group gone at its next look.
 async fn exited(
     client: &Client,
     plan: &RunPlan,
     pid: std::num::NonZeroU32,
     status: std::process::ExitStatus,
-    passed_on: bool,
+    interrupts: &mut Interrupts,
 ) -> Result<ExitCode> {
-    let told = client.harness_exited(plan.job, pid, |_| {}).await;
+    let told = tokio::select! {
+        told = client.harness_exited(plan.job, pid, |_| {}) => told,
+        signal = interrupts.next() => {
+            let number = signal.as_raw();
+            writeln!(
+                std::io::stderr(),
+                "interrupted by signal {number} while telling the node the harness exited; `fabric job status {}` shows what it holds",
+                plan.job
+            )?;
+            return Ok(signal_exit(number));
+        }
+    };
     let missed = match told {
         Ok(()) => None,
         Err(ClientError::Refused(refusal)) => Some(refusal.message().to_owned()),
@@ -1043,7 +1307,7 @@ async fn exited(
         )?;
     }
     if let Some(signal) = status.signal() {
-        if passed_on {
+        if interrupts.passed > 0 {
             writeln!(
                 std::io::stderr(),
                 "the harness ended on signal {signal}, after fabric passed a signal on to it"
@@ -1064,15 +1328,14 @@ async fn exited(
     })
 }
 
-/// Runs the setup steps a restored workspace needs on this node (ADR 0007),
-/// printing each, and returns the tree lock it took.
+/// Takes the lock over the tree at `root` that setup steps and the launch run under.
 ///
 /// The caller holds the lock until the node has answered the harness's
 /// registration, so a second `run` or `resume` of the same workspace
 /// refuses with the lock's path from the setup steps until the first
 /// harness is recorded, and the node's own check refuses it after that.
-fn materialize(state: &StateDir, root: &Path, notes: Notes) -> Result<TreeLock> {
-    let lock = TreeLock::acquire(&state.tree_locks(), root).map_err(|e| match e {
+fn lock_tree(state: &StateDir, root: &Path) -> Result<TreeLock> {
+    TreeLock::acquire(&state.tree_locks(), root).map_err(|e| match e {
         // Another run or resume of this workspace is starting its harness:
         // the same state as a harness that runs, so the same exit code.
         MaterializeError::TreeBusy { .. } => anyhow::Error::new(Refused {
@@ -1080,14 +1343,19 @@ fn materialize(state: &StateDir, root: &Path, notes: Notes) -> Result<TreeLock> 
             message: e.to_string(),
         }),
         e => e.into(),
-    })?;
+    })
+}
+
+/// Runs the setup steps a restored workspace needs on this node (ADR 0007),
+/// printing each, under `lock`, once `approval` lets them run.
+fn materialize(lock: &TreeLock, root: &Path, notes: Notes, approval: &Approval<'_>) -> Result<()> {
     let detected = fabric_env::detect::detect(root, &[])?;
-    let plan = fabric_env::materialize::plan(&detected, &lock, &NodeEnv::current())?;
+    let plan = fabric_env::materialize::plan(&detected, lock, &NodeEnv::current())?;
     if plan.is_noop() {
         // A declared variable is required even when no step runs, so a
         // warm node refuses the launch a cold node would (ADR 0007).
         plan.ready()?;
-        return Ok(lock);
+        return Ok(());
     }
     let mut lines = Vec::new();
     for cache in plan.caches() {
@@ -1103,8 +1371,82 @@ fn materialize(state: &StateDir, root: &Path, notes: Notes) -> Result<TreeLock> 
         lines.push(format!("setup: {} {}", step.program, args.join(" ")));
     }
     notes.print(&lines)?;
-    plan.ready()?.execute(&lock)?;
-    Ok(lock)
+    // Programs and variables are checked first, so the user is never asked
+    // about steps that cannot run here.
+    let ready = plan.ready()?;
+    let inputs = detected.inputs_digest().to_hex();
+    approval.approve(detected.spec().id()?, &inputs)?;
+    ready.execute(lock)?;
+    Ok(())
+}
+
+/// Whether the setup steps of an environment spec may run (ADR 0007).
+///
+/// A restored workspace brings its spec, and with it the programs its
+/// steps run, from wherever it was last edited, an agent's edit of
+/// `.fabric/env.toml` included. It brings the files those programs read
+/// too: a lockfile, `package.json`'s scripts or `.pnpmfile.cjs` name code
+/// an install runs, and change without changing the spec's id. So before
+/// this node runs the steps of a spec, or of the same spec over other
+/// install inputs, than it last ran for the job, the user approves them,
+/// by answering at the terminal or with `--yes`. A spec this node only
+/// captured still asks: the agent may have written it during the run.
+/// The node removes the record when it restores a snapshot another node
+/// captured, since the steps also run files no digest covers, such as a
+/// script a declared step names, and the agent may have edited them there.
+struct Approval<'a> {
+    /// Where the spec id and install inputs this node last ran for the job are kept.
+    record: PathBuf,
+    /// `--yes`: run a new spec's steps without asking.
+    yes: bool,
+    /// Asks the user about the steps printed above; false when no one can answer.
+    ask: &'a dyn Fn() -> Result<bool>,
+}
+
+impl Approval<'_> {
+    /// Lets the steps of `spec` run over the install inputs whose digest is
+    /// `inputs`, in hex, or refuses, and records the pair once approved so
+    /// the next launch of the same does not ask again.
+    fn approve(&self, spec: EnvSpecId, inputs: &str) -> Result<()> {
+        let id = spec.to_string();
+        let approved = format!("{id} {inputs}");
+        let ran = std::fs::read_to_string(&self.record).ok();
+        if ran.as_deref().map(str::trim) == Some(approved.as_str()) {
+            return Ok(());
+        }
+        if !self.yes && !(self.ask)()? {
+            return Err(Refused {
+                refusal: RefusalKind::NeedsForce,
+                message: format!(
+                    "the setup steps above come from environment spec {id}, which this node has not run for the job over these lockfiles and install configuration, or not since the workspace came from another node, and were not approved; read them and what changed, then run the command again with --yes"
+                ),
+            }
+            .into());
+        }
+        let temp = self.record.with_extension("tmp");
+        std::fs::write(&temp, format!("{approved}\n"))
+            .and_then(|()| std::fs::rename(&temp, &self.record))
+            .with_context(|| format!("recording the approved spec in {}", self.record.display()))?;
+        Ok(())
+    }
+}
+
+/// Asks at the terminal whether to run the setup steps printed above; with
+/// no terminal on standard input, the answer is no.
+fn ask_on_terminal() -> Result<bool> {
+    let stdin = std::io::stdin();
+    if !rustix::termios::isatty(&stdin) {
+        return Ok(false);
+    }
+    let mut stderr = std::io::stderr();
+    write!(
+        stderr,
+        "this node has not approved these setup steps for the job as its workspace now is; run them? [y/N] "
+    )?;
+    stderr.flush()?;
+    let mut answer = String::new();
+    stdin.read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES"))
 }
 
 /// A cache's state before the setup steps run, in words.
@@ -1115,6 +1457,7 @@ fn health_words(health: &CacheHealth) -> &'static str {
         CacheHealth::NotADirectory => "not a directory",
         CacheHealth::Empty => "empty",
         CacheHealth::Incomplete => "left unfinished by an earlier install",
+        CacheHealth::Stale => "installed from other lockfiles than the workspace has now",
     }
 }
 
@@ -1178,7 +1521,281 @@ fn pid_of(running: &Running) -> Option<rustix::process::Pid> {
 
 #[cfg(test)]
 mod tests {
+    use fabric_harness::{NotCarried, SettingName};
+
     use super::*;
+
+    /// The signal tests send a signal to this whole process, which every
+    /// handler installed in it gets, so they run one at a time.
+    static SIGNALS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A private directory with a short path under `/tmp`, where a control
+    /// socket's path fits.
+    fn socket_dir() -> tempfile::TempDir {
+        let dir = tempfile::Builder::new()
+            .prefix("fsig")
+            .tempdir_in("/tmp")
+            .unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// A node at `socket` that takes every request and never answers one.
+    fn silent_node(socket: &Path) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        })
+    }
+
+    /// A plan for a Codex job rooted in `dir`, with no session to continue.
+    fn codex_plan(dir: &Path) -> RunPlan {
+        RunPlan {
+            job: "01M5EBB2BWY97N3YEKD6CDN2EM".parse().unwrap(),
+            epoch: fabric_core::id::Epoch::FIRST,
+            head: fabric_core::id::RecordHash::of(b"a head"),
+            root: dir.join("work"),
+            harness: HarnessKind::Codex,
+            session: None,
+            known_writer: None,
+            goal: "goal".to_owned(),
+            harness_config: fabric_client::api::HarnessConfig::default(),
+            home: dir.to_owned(),
+        }
+    }
+
+    /// Launches a fake `codex` headless for `plan`; under `exec` it runs
+    /// `script`. It is written by a short `sh`, so this process never holds
+    /// it open for writing while another test forks.
+    async fn headless_codex(plan: &RunPlan, script: &str) -> Running {
+        let bin = plan.home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&plan.root).unwrap();
+        let fake = format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex-cli 0.155.1'; exit 0; fi\n{script}"
+        );
+        let mut writer = std::process::Command::new("/bin/sh")
+            .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+            .arg(bin.join("codex"))
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        writer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(fake.as_bytes())
+            .unwrap();
+        assert!(writer.wait().unwrap().success());
+        let harness_env = HarnessEnv::new(
+            &plan.home,
+            bin.into_os_string(),
+            plan.harness_config.clone().into(),
+        )
+        .unwrap();
+        let env = [(
+            EnvVarName::parse("PATH").unwrap(),
+            "/usr/bin:/bin".to_owned(),
+        )];
+        let launch = Launch::Headless {
+            resume: None,
+            prompt: "a turn".to_owned(),
+        };
+        Codex::new(harness_env.home, harness_env.path_var)
+            .launch(&plan.root, launch, &env)
+            .await
+            .unwrap()
+    }
+
+    /// A headless turn names its session, which goes to the node, and the
+    /// harness exits. A signal while the node has not answered yet, as
+    /// while a suspend holds the job, must end the command with that signal:
+    /// the user asked it to stop, and a turn that went on to print and exit
+    /// 0 would hide that (Codex review, 2026-10-22).
+    #[tokio::test]
+    async fn a_signal_while_the_node_records_the_session_ends_the_turn_with_it() {
+        use std::time::Duration;
+
+        let _one = SIGNALS.lock().await;
+        let dir = socket_dir();
+        let socket = dir.path().join("fabric.sock");
+        let _node = silent_node(&socket);
+        let plan = codex_plan(dir.path());
+        let gone = dir.path().join("gone");
+        let mut running = headless_codex(
+            &plan,
+            &format!(
+                "echo '{{\"type\":\"thread.started\",\"thread_id\":\"019f233e-bb33-7342-85fa-f2d33b14368a\"}}'\ntouch '{}'\n",
+                gone.display()
+            ),
+        )
+        .await;
+        let mut interrupts = Interrupts::new().unwrap();
+        tokio::spawn(async move {
+            while !gone.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // The harness exits right after; the turn is then waiting on the node.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::HUP)
+                .unwrap();
+        });
+        let client = Client::new(&socket);
+        let turn = Turn {
+            client: &client,
+            plan: &plan,
+            notes: Notes::Stderr,
+            read_line: Codex::read_headless_line,
+        };
+        let ended = tokio::time::timeout(
+            Duration::from_secs(10),
+            turn.run(&mut running, &mut interrupts),
+        )
+        .await
+        .expect("the signal did not end the wait for the node")
+        .unwrap();
+        assert!(
+            matches!(ended, TurnEnd::Interrupted(signal) if signal == rustix::process::Signal::HUP),
+            "{ended:?}"
+        );
+    }
+
+    /// An approval for a launch that must not get as far as asking.
+    fn unasked(dir: &Path) -> Approval<'static> {
+        Approval {
+            record: dir.join("env-spec-ran"),
+            yes: false,
+            ask: &|| panic!("the launch asked to run setup steps"),
+        }
+    }
+
+    /// A workspace whose `.fabric/env.toml` declares one step, `mkdir`
+    /// with `args`, and no cache, so the step runs at every launch.
+    fn workspace_with_step(dir: &Path, args: &str) -> PathBuf {
+        let root = dir.join("work");
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(
+            root.join(".fabric/env.toml"),
+            format!("[[setup]]\nprogram = \"mkdir\"\nargs = [{args}]\n"),
+        )
+        .unwrap();
+        root
+    }
+
+    /// A restored workspace can bring setup steps this node has never
+    /// run, written into `.fabric/env.toml` on another node, by an agent
+    /// for one. They must not run before the user approves them; with no
+    /// one at a terminal to ask, the launch stops before any step runs.
+    #[test]
+    fn a_spec_this_node_has_not_run_does_not_run_unapproved() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = workspace_with_step(dir.path(), "\"-p\", \"ran\"");
+        let state =
+            StateDir::resolve(Some(dir.path().join("state").as_os_str()), dir.path()).unwrap();
+        let lock = lock_tree(&state, &root).unwrap();
+        let no = || Ok(false);
+        let approval = Approval {
+            record: dir.path().join("env-spec-ran"),
+            yes: false,
+            ask: &no,
+        };
+        let Err(error) = materialize(&lock, &root, Notes::Stdout, &approval) else {
+            panic!("the steps ran unapproved");
+        };
+        assert!(
+            matches!(
+                error.downcast_ref::<Refused>(),
+                Some(Refused {
+                    refusal: RefusalKind::NeedsForce,
+                    ..
+                })
+            ),
+            "{error:#}"
+        );
+        assert!(!root.join("ran").exists(), "a step ran");
+    }
+
+    /// An approval holds for the spec it was given for: the same steps run
+    /// again without asking, and steps that changed since ask again.
+    #[test]
+    fn an_approval_holds_for_its_spec_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = workspace_with_step(dir.path(), "\"-p\", \"ran\"");
+        let state =
+            StateDir::resolve(Some(dir.path().join("state").as_os_str()), dir.path()).unwrap();
+        let lock = lock_tree(&state, &root).unwrap();
+        let record = dir.path().join("env-spec-ran");
+        let yes = || Ok(true);
+        let approval = |ask| Approval {
+            record: record.clone(),
+            yes: false,
+            ask,
+        };
+        materialize(&lock, &root, Notes::Stdout, &approval(&yes)).unwrap();
+        assert!(root.join("ran").is_dir());
+        std::fs::remove_dir(root.join("ran")).unwrap();
+        materialize(&lock, &root, Notes::Stdout, &unasked(dir.path())).unwrap();
+        assert!(root.join("ran").is_dir());
+        std::fs::write(
+            root.join(".fabric/env.toml"),
+            "[[setup]]\nprogram = \"mkdir\"\nargs = [\"-p\", \"other\"]\n",
+        )
+        .unwrap();
+        let no = || Ok(false);
+        assert!(materialize(&lock, &root, Notes::Stdout, &approval(&no)).is_err());
+        assert!(
+            !root.join("other").exists(),
+            "a changed step ran unapproved"
+        );
+    }
+
+    /// An approval holds for the install inputs it was given with too. A
+    /// lockfile or a manager's configuration names code the install runs,
+    /// and can change while the spec, which holds only the commands, keeps
+    /// its id; once one changed and the step that reads it is due, the
+    /// launch asks again.
+    #[test]
+    fn a_changed_install_input_asks_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(root.join("go.mod"), "module example.com/m\n").unwrap();
+        std::fs::write(
+            root.join(".fabric/env.toml"),
+            "[[cache]]\npath = \"out\"\nclass = \"build\"\n\n[[setup]]\nprogram = \"sh\"\nargs = [\"-c\", \"echo ran >> ran.log; mkdir -p out; echo x > out/f\"]\n",
+        )
+        .unwrap();
+        let state =
+            StateDir::resolve(Some(dir.path().join("state").as_os_str()), dir.path()).unwrap();
+        let lock = lock_tree(&state, &root).unwrap();
+        let approval = |ask| Approval {
+            record: dir.path().join("env-spec-ran"),
+            yes: false,
+            ask,
+        };
+        let yes = || Ok(true);
+        materialize(&lock, &root, Notes::Stdout, &approval(&yes)).unwrap();
+        materialize(&lock, &root, Notes::Stdout, &unasked(dir.path())).unwrap();
+        std::fs::write(
+            root.join("go.mod"),
+            "module example.com/m\n\nrequire example.com/x v1.0.0\n",
+        )
+        .unwrap();
+        let no = || Ok(false);
+        assert!(materialize(&lock, &root, Notes::Stdout, &approval(&no)).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("ran.log")).unwrap(),
+            "ran\n",
+            "the step ran again unapproved"
+        );
+    }
 
     /// With every cache whole no step runs, and the declared variable must
     /// still stop the launch.
@@ -1194,7 +1811,8 @@ mod tests {
         .unwrap();
         let state =
             StateDir::resolve(Some(dir.path().join("state").as_os_str()), dir.path()).unwrap();
-        let Err(error) = materialize(&state, &root, Notes::Stdout) else {
+        let lock = lock_tree(&state, &root).unwrap();
+        let Err(error) = materialize(&lock, &root, Notes::Stdout, &unasked(dir.path())) else {
             panic!("the launch went ahead");
         };
         let error = error.to_string();
@@ -1202,5 +1820,193 @@ mod tests {
             error.contains("FABRIC_TEST_VARIABLE_NO_ONE_SETS"),
             "{error}"
         );
+    }
+
+    fn passed(name: SettingName, value: &str, origin: Origin) -> PassedSetting {
+        PassedSetting {
+            name,
+            value: value.to_owned(),
+            origin,
+        }
+    }
+
+    /// The continuing line names the carried settings and where they came
+    /// from, and each setting left out gets a line saying why. A resume
+    /// that carries nothing still says which session it continues, since
+    /// the node no longer prints a continuing line of its own.
+    #[test]
+    fn the_report_names_what_was_carried_and_what_was_not() {
+        let session = SessionId::parse("019f233e-bb33-7342-85fa-f2d33b14368a").unwrap();
+        let settings = LaunchSettings {
+            passed: vec![
+                passed(SettingName::Model, "gpt-6-sol", Origin::Session),
+                passed(SettingName::Effort, "xhigh", Origin::Session),
+            ],
+            not_carried: vec![NotCarried {
+                name: SettingName::Sandbox,
+                value: "danger-full-access".to_owned(),
+                reason: "Fabric never passes full access, ADR 0006".to_owned(),
+            }],
+        };
+        assert_eq!(
+            settings_lines(&HarnessKind::Codex, Some(&session), &settings),
+            [
+                "continuing codex session 019f233e-bb33-7342-85fa-f2d33b14368a with model gpt-6-sol, effort xhigh (recorded in the session)",
+                "sandbox danger-full-access is not carried (Fabric never passes full access, ADR 0006); codex uses its own setting",
+            ]
+        );
+        let mixed = LaunchSettings {
+            passed: vec![
+                passed(SettingName::Model, "o3", Origin::Pinned),
+                passed(SettingName::Effort, "xhigh", Origin::Session),
+            ],
+            not_carried: Vec::new(),
+        };
+        assert_eq!(
+            settings_lines(&HarnessKind::Codex, None, &mixed),
+            ["codex runs with model o3 (pinned), effort xhigh (recorded in the session)"]
+        );
+        assert!(settings_lines(&HarnessKind::Codex, None, &LaunchSettings::default()).is_empty());
+        let nothing_carried = LaunchSettings {
+            passed: Vec::new(),
+            not_carried: vec![NotCarried {
+                name: SettingName::Model,
+                value: "claude-fable-5 or claude-opus-4-8".to_owned(),
+                reason: "the session has transcripts under several project keys".to_owned(),
+            }],
+        };
+        assert_eq!(
+            settings_lines(&HarnessKind::ClaudeCode, Some(&session), &nothing_carried),
+            [
+                "continuing claude-code session 019f233e-bb33-7342-85fa-f2d33b14368a",
+                "model claude-fable-5 or claude-opus-4-8 is not carried (the session has transcripts under several project keys); claude-code uses its own setting",
+            ]
+        );
+    }
+
+    /// The node captures and restores harness state under its own home.
+    /// A CLI whose `HOME` resolves elsewhere, with the same `FABRIC_HOME`,
+    /// would launch the harness against its home, and the session would
+    /// sit where no suspend looks; the launch is refused before setup.
+    #[tokio::test]
+    async fn a_launch_under_another_home_than_the_nodes_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mine = dir.path().join("mine");
+        let state = StateDir::resolve(Some(dir.path().join("state").as_os_str()), &mine).unwrap();
+        let plan = RunPlan {
+            job: "01M5EBB2BWY97N3YEKD6CDN2EM".parse().unwrap(),
+            epoch: fabric_core::id::Epoch::FIRST,
+            head: fabric_core::id::RecordHash::of(b"a head"),
+            root: dir.path().join("work"),
+            harness: HarnessKind::Codex,
+            session: None,
+            known_writer: None,
+            goal: "goal".to_owned(),
+            harness_config: fabric_client::api::HarnessConfig::default(),
+            home: dir.path().join("the-nodes"),
+        };
+        let Err(error) = launch(
+            &state,
+            &mine,
+            &client(&state),
+            &plan,
+            Mode::Interactive(None),
+            &unasked(dir.path()),
+        )
+        .await
+        else {
+            panic!("the launch went ahead");
+        };
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("the-nodes") && error.contains("mine"),
+            "{error}"
+        );
+    }
+
+    /// A plan can be overtaken between the node's answer and the tree lock:
+    /// another launch can register its harness and let the lock go. The
+    /// launch must ask the node again under the lock, before any setup step
+    /// writes to the tree. With no node to ask, it stops there, before the
+    /// declared variable it lacks is even looked at.
+    #[tokio::test]
+    async fn a_launch_asks_the_node_again_before_any_setup_step() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let root = dir.path().join("work");
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(
+            root.join(".fabric/env.toml"),
+            "env = [\"FABRIC_TEST_VARIABLE_NO_ONE_SETS\"]\n",
+        )
+        .unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = StateDir::resolve(Some(state_dir.as_os_str()), &home).unwrap();
+        let plan = RunPlan {
+            job: "01M5EBB2BWY97N3YEKD6CDN2EM".parse().unwrap(),
+            epoch: fabric_core::id::Epoch::FIRST,
+            head: fabric_core::id::RecordHash::of(b"a head"),
+            root,
+            harness: HarnessKind::Codex,
+            session: None,
+            known_writer: None,
+            goal: "goal".to_owned(),
+            harness_config: fabric_client::api::HarnessConfig::default(),
+            home: home.clone(),
+        };
+        let Err(error) = launch(
+            &state,
+            &home,
+            &client(&state),
+            &plan,
+            Mode::Interactive(None),
+            &unasked(dir.path()),
+        )
+        .await
+        else {
+            panic!("the launch went ahead");
+        };
+        assert!(
+            matches!(
+                error.downcast_ref::<ClientError>(),
+                Some(ClientError::NoDaemon { .. })
+            ),
+            "{error:#}"
+        );
+    }
+
+    /// Once the harness exits, the command tells the node, which can wait
+    /// on the job through a suspend or a move for minutes, or not answer
+    /// at all. A signal must still end the command then: the handlers the
+    /// launch installed replaced the default action for the whole process,
+    /// so nothing else would.
+    #[tokio::test]
+    async fn a_signal_ends_the_wait_for_the_node_after_the_harness_exited() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::time::Duration;
+
+        let _one = SIGNALS.lock().await;
+        let dir = socket_dir();
+        let socket = dir.path().join("fabric.sock");
+        let _node = silent_node(&socket);
+        let mut interrupts = Interrupts::new().unwrap();
+        tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::HUP)
+                .unwrap();
+        });
+        let plan = codex_plan(dir.path());
+        let pid = std::num::NonZeroU32::new(std::process::id()).unwrap();
+        let status = std::process::ExitStatus::from_raw(0);
+        let client = Client::new(&socket);
+        let told = exited(&client, &plan, pid, status, &mut interrupts);
+        let code = tokio::time::timeout(Duration::from_secs(10), told)
+            .await
+            .expect("the signal did not end the wait")
+            .unwrap();
+        assert_eq!(code, signal_exit(rustix::process::Signal::HUP.as_raw()));
     }
 }

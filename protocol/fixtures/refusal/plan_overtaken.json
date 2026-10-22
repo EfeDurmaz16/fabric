@@ -1,0 +1,8 @@
+{
+  "kind": "job_state",
+  "reason": {
+    "code": "plan_overtaken",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0"
+  },
+  "message": "changed after this launch was planned, so nothing was launched"
+}

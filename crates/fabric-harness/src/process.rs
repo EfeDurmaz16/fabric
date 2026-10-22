@@ -51,6 +51,7 @@ use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fabric_core::env::EnvVarName;
+use fabric_core::version::version_token;
 use tokio::process::{Child, Command};
 
 use crate::error::HarnessError;
@@ -81,6 +82,8 @@ const PS: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 const PGREP: &[&str] = &["/usr/bin/pgrep", "/bin/pgrep"];
 /// Where macOS and Linux keep `kill`.
 const KILL: &[&str] = &["/bin/kill", "/usr/bin/kill"];
+/// Where macOS and Linux keep `lsof`.
+pub(crate) const LSOF: &[&str] = &["/usr/sbin/lsof", "/usr/bin/lsof", "/sbin/lsof", "/bin/lsof"];
 /// The `pgrep` flag that keeps the caller's ancestors in the answer.
 #[cfg(target_os = "macos")]
 const PGREP_WITH_ANCESTORS: &[&str] = &["-a"];
@@ -89,7 +92,7 @@ const PGREP_WITH_ANCESTORS: &[&str] = &["-a"];
 const PGREP_WITH_ANCESTORS: &[&str] = &[];
 
 /// The first of `candidates` that is an executable file.
-fn system_tool(
+pub(crate) fn system_tool(
     program: &'static str,
     candidates: &'static [&'static str],
 ) -> Result<&'static Path, HarnessError> {
@@ -138,7 +141,8 @@ fn probe_env(path_var: &OsStr) -> Vec<(EnvVarName, String)> {
     env
 }
 
-/// Runs `binary args...` with `env` minus its parent-session markers and
+/// Runs `binary args...` with `env` minus its parent-session markers, in
+/// `cwd` when one is given and else in this process's directory, and
 /// returns trimmed stdout, within `PROBE_TIMEOUT`. A run that exits with
 /// a failure is an error, whatever it printed: a wrapper that prints a
 /// version and then fails to start is not a working install, and its
@@ -146,10 +150,15 @@ fn probe_env(path_var: &OsStr) -> Vec<(EnvVarName, String)> {
 async fn probe(
     binary: &Path,
     args: &[&str],
+    cwd: Option<&Path>,
     env: &[(EnvVarName, String)],
 ) -> Result<String, HarnessError> {
     let program = binary.display().to_string();
-    let run = Command::new(binary)
+    let mut command = Command::new(binary);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let run = command
         .args(args)
         .env_clear()
         .envs(markers::child_env(env))
@@ -188,15 +197,39 @@ pub(crate) async fn detect(
     binary: Option<PathBuf>,
     path_var: &OsStr,
 ) -> Result<Option<Installed>, HarnessError> {
+    detect_in(binary, None, path_var).await
+}
+
+/// `detect`, run in `cwd` when one is given.
+async fn detect_in(
+    binary: Option<PathBuf>,
+    cwd: Option<&Path>,
+    path_var: &OsStr,
+) -> Result<Option<Installed>, HarnessError> {
     let Some(path) = binary else {
         return Ok(None);
     };
-    let raw = probe(&path, &["--version"], &probe_env(path_var)).await?;
+    let raw = probe(&path, &["--version"], cwd, &probe_env(path_var)).await?;
     Ok(Some(Installed {
         version: version_token(&raw).map(str::to_owned),
         raw,
         path,
     }))
+}
+
+/// What `binary --version` prints when run in `cwd` with `env` minus its
+/// parent-session markers, as a launch in `cwd` with `env` would run it;
+/// for the resume guard (`version::refuse_older`), which must ask the
+/// binary it is about to start. The directory counts: a version manager's
+/// shim (mise, asdf, Volta) picks the tool version by the directory it
+/// runs in, so a probe from anywhere else could ask another version than
+/// the one `spawn` starts in the workspace.
+pub(crate) async fn reported_version(
+    binary: &Path,
+    cwd: &Path,
+    env: &[(EnvVarName, String)],
+) -> Result<String, HarnessError> {
+    probe(binary, &["--version"], Some(cwd), env).await
 }
 
 /// The version `binary` reports, or `None` when there is no binary or the
@@ -206,27 +239,26 @@ pub(crate) async fn installed_version(
     path_var: &OsStr,
     program: &str,
 ) -> Option<String> {
-    match detect(binary, path_var).await {
+    installed_version_in(binary, None, path_var, program).await
+}
+
+/// `installed_version`, run in `cwd` when one is given: a capture asks in
+/// the workspace, where a version manager's shim picks the same Codex a
+/// launch there runs (`reported_version`), not the one it picks for the
+/// daemon's directory.
+pub(crate) async fn installed_version_in(
+    binary: Option<PathBuf>,
+    cwd: Option<&Path>,
+    path_var: &OsStr,
+    program: &str,
+) -> Option<String> {
+    match detect_in(binary, cwd, path_var).await {
         Ok(installed) => installed.and_then(|i| i.version),
         Err(e) => {
             tracing::warn!(program, error = %e, "version probe failed");
             None
         }
     }
-}
-
-/// Returns the first token of `output` that looks like `digits.digits...`.
-#[must_use]
-pub(crate) fn version_token(output: &str) -> Option<&str> {
-    output.split_whitespace().find(|token| {
-        let mut parts = token.split('.');
-        let first = parts.next().unwrap_or("");
-        !first.is_empty()
-            && first.bytes().all(|b| b.is_ascii_digit())
-            && parts
-                .next()
-                .is_some_and(|second| second.bytes().next().is_some_and(|b| b.is_ascii_digit()))
-    })
 }
 
 /// How a spawned process's stdio is wired.
@@ -545,35 +577,74 @@ pub(crate) async fn pid_alive(pid: u32) -> Result<bool, HarnessError> {
     }
 }
 
-/// True when the dotted version `version` is at least `floor`, compared
-/// part by part as numbers; a part that is not a number fails the check.
-#[must_use]
-pub(crate) fn version_at_least(version: &str, floor: &[u32]) -> bool {
-    let parts: Option<Vec<u32>> = version.split('.').map(|p| p.parse().ok()).collect();
-    parts.is_some_and(|parts| parts.as_slice() >= floor)
+/// Process ids, other than this one, that hold any of `files` open,
+/// asked of `lsof`. It lists them and exits 0 when every file is open, or
+/// 1 when some is not, and then says nothing on its error output; anything
+/// on that output, as for a file that vanished, or any other exit is an
+/// error, never "none". It runs from a blocking thread, under a lock the
+/// caller holds, so it is synchronous.
+pub(crate) fn holding(files: &[PathBuf]) -> Result<Vec<u32>, HarnessError> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let output = std::process::Command::new(system_tool("lsof", LSOF)?)
+        .arg("-t")
+        .arg("--")
+        .args(files)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|source| HarnessError::Spawn {
+            program: "lsof".to_owned(),
+            source,
+        })?;
+    let own = std::process::id();
+    let mut pids: Vec<u32> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .filter(|pid| *pid != own)
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    match output.status.code() {
+        Some(0 | 1) if output.stderr.trim_ascii().is_empty() => Ok(pids),
+        code => Err(HarnessError::ProcessQuery {
+            program: "lsof",
+            reason: format!(
+                "exited with {code:?}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        }),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn version_token_finds_the_number() {
-        assert_eq!(version_token("2.1.294 (Claude Code)"), Some("2.1.294"));
-        assert_eq!(version_token("codex-cli 0.155.1"), Some("0.155.1"));
-        assert_eq!(version_token("fake 1.2"), Some("1.2"));
-        assert_eq!(version_token("no version here"), None);
-        assert_eq!(version_token(""), None);
-    }
-
-    #[test]
-    fn version_at_least_compares_numbers_not_text() {
-        assert!(version_at_least("2.1.294", &[2, 1, 294]));
-        assert!(version_at_least("2.1.300", &[2, 1, 294]));
-        assert!(version_at_least("2.10.0", &[2, 9, 999]));
-        assert!(!version_at_least("2.1.199", &[2, 1, 294]));
-        assert!(!version_at_least("2.1", &[2, 1, 294]));
-        assert!(!version_at_least("2.1.x", &[2, 1, 294]));
+    /// Writes `contents` to `path` with mode `0755` through a short `sh`,
+    /// so this process never holds the file open for writing. Linux
+    /// refuses to run a file open for writing (`ETXTBSY`), and a child
+    /// another test forked while this process held it open would keep it
+    /// open until that child ran its own program. A temporary file renamed
+    /// into place would not help: the descriptor follows the file.
+    fn write_executable(path: &Path, contents: &[u8]) {
+        use std::io::Write;
+        let mut writer = std::process::Command::new("/bin/sh")
+            .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The pipe closes at the end of the statement, so `cat` sees the end.
+        writer.stdin.take().unwrap().write_all(contents).unwrap();
+        let status = writer.wait().unwrap();
+        assert!(
+            status.success(),
+            "writing {} failed: {status}",
+            path.display()
+        );
     }
 
     #[test]
@@ -628,7 +699,10 @@ mod tests {
             None => {
                 let dir = tempfile::tempdir().unwrap();
                 let claude = dir.path().join("claude");
-                std::fs::copy(std::env::current_exe().unwrap(), &claude).unwrap();
+                write_executable(
+                    &claude,
+                    &std::fs::read(std::env::current_exe().unwrap()).unwrap(),
+                );
                 run(&claude, "parent");
             }
             Some("parent") => run(&std::env::current_exe().unwrap(), "child"),
@@ -647,13 +721,12 @@ mod tests {
     async fn a_version_probe_does_not_pass_parent_session_markers() {
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("tool");
-        std::fs::write(&binary, "#!/bin/sh\n/usr/bin/env\n").unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&binary, b"#!/bin/sh\n/usr/bin/env\n");
         let env: Vec<(EnvVarName, String)> = [("CLAUDECODE", "1"), ("FABRIC_PROBE_KEPT", "1")]
             .into_iter()
             .map(|(name, value)| (EnvVarName::parse(name).unwrap(), value.to_owned()))
             .collect();
-        let seen = probe(&binary, &[], &env).await.unwrap();
+        let seen = probe(&binary, &[], None, &env).await.unwrap();
         assert!(seen.contains("FABRIC_PROBE_KEPT=1"), "{seen}");
         assert!(!seen.contains("CLAUDECODE"), "{seen}");
     }
@@ -662,8 +735,7 @@ mod tests {
     async fn a_version_probe_that_exits_with_a_failure_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("tool");
-        std::fs::write(&binary, "#!/bin/sh\necho 'tool 1.2.3'\nexit 1\n").unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&binary, b"#!/bin/sh\necho 'tool 1.2.3'\nexit 1\n");
         let err = detect(Some(binary.clone()), OsStr::new("/usr/bin:/bin"))
             .await
             .unwrap_err();
@@ -678,11 +750,9 @@ mod tests {
     async fn a_version_probe_finds_an_interpreter_on_the_configured_path() {
         let dir = tempfile::tempdir().unwrap();
         let interp = dir.path().join("fabric-test-interp");
-        std::fs::write(&interp, "#!/bin/sh\necho 'tool 4.5.6'\n").unwrap();
-        std::fs::set_permissions(&interp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&interp, b"#!/bin/sh\necho 'tool 4.5.6'\n");
         let binary = dir.path().join("tool");
-        std::fs::write(&binary, "#!/usr/bin/env fabric-test-interp\n").unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&binary, b"#!/usr/bin/env fabric-test-interp\n");
         let path_var =
             std::env::join_paths([dir.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
         let installed = detect(Some(binary), &path_var).await.unwrap().unwrap();

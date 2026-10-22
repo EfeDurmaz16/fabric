@@ -2,11 +2,14 @@
 //!
 //! Invariant: a manifest describes a workspace by relative paths and content
 //! hashes and holds no file bytes. Every list in it is strictly sorted by its
-//! key, so one tree has one manifest, and its postcard encoding is the thing
-//! that is hashed: two manifests with the same fields have the same
-//! `SnapshotId` on every node and in every version of this crate that writes
-//! format version 1. A tree never places an entry below a file or a symlink,
-//! and no mode bit above the low nine is representable.
+//! key, except that `config` repeats a key git holds more than once, one
+//! entry per value in git's order, so one tree has one manifest, and its
+//! postcard encoding is the thing that is hashed: two manifests with the
+//! same fields have the same `SnapshotId` on every node and in every version
+//! of this crate that writes format version 2. A tree never places an entry
+//! below a file or a symlink, `files` and the working-tree commit meet only
+//! at a directory of `files`, and no mode bit above the low nine is
+//! representable.
 
 use std::collections::HashSet;
 
@@ -15,12 +18,18 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::codec::{self, CodecError, VersionedError};
+use crate::env::SetupStep;
 use crate::git::{BranchName, GitConfigKey, GitConfigValue, GitOid, RefName};
 use crate::id::{ChunkId, EnvSpecId, JobId, NodeId, SnapshotId};
 use crate::path::{AbsPath, RelPath};
 
 /// The manifest format version this crate writes; the first varint of every encoded manifest.
-pub const MANIFEST_VERSION: u16 = 1;
+///
+/// Version 2 added what a target needs to decide each cache path on its
+/// own (`CacheEntry::remake` and `CacheEntry::native_files`) and the list
+/// of paths a secret pattern or `.fabricignore` kept on the capturing node
+/// (`left_behind`).
+pub const MANIFEST_VERSION: u16 = 2;
 
 /// The most bytes a reader decodes as a manifest; a memory bound against a
 /// hostile peer, not a cap on snapshots.
@@ -39,10 +48,12 @@ pub enum ManifestError {
         /// The byte length that was offered.
         len: usize,
     },
-    /// A list is not strictly sorted by its key, which also catches a repeated key.
-    #[error("{list} entry {index} is not strictly after the one before it")]
+    /// A list is not sorted by its key. Every list but `config` rises
+    /// strictly, which also catches a repeated key; `config` may repeat a
+    /// key and never goes down.
+    #[error("{list} entry {index} is out of order")]
     OutOfOrder {
-        /// Which list: `files`, `harness_state`, `caches`, `refs`, `worktree_mtimes` or `config`.
+        /// Which list: `files`, `harness_state`, `caches`, `left_behind`, `refs`, `worktree_mtimes` or `config`.
         list: &'static str,
         /// Zero-based index of the entry, within its list.
         index: usize,
@@ -53,11 +64,29 @@ pub enum ManifestError {
         /// Zero-based index of the entry, within its tree.
         index: usize,
     },
+    /// A cache row says setup steps make it again but names none.
+    #[error("caches entry {index} names an empty list of setup steps")]
+    EmptyRemake {
+        /// Zero-based index of the entry, within `caches`.
+        index: usize,
+    },
     /// A path is both in `files` and in the working-tree commit, which restore writes first, so the second write would collide.
     #[error("{path} is both in files and in the working-tree commit")]
     InBothTrees {
         /// The path.
         path: RelPath,
+    },
+    /// A path in `files` and a path in the working-tree commit lie one below the other, and the upper one is not a directory, so restore cannot write both.
+    ///
+    /// Every working-tree path is a leaf of its commit's tree (a file, a
+    /// symlink or a submodule), so nothing in `files` may lie below one, and
+    /// a `files` entry above one must be the directory the two trees share.
+    #[error("{files} in files and {worktree} in the working-tree commit lie one below the other")]
+    TreesNest {
+        /// The path in `files`.
+        files: RelPath,
+        /// The path in the working-tree commit.
+        worktree: RelPath,
     },
     /// The git state mixes SHA-1 and SHA-256 object ids, which no one repository can hold.
     #[error("git state mixes SHA-1 and SHA-256 object ids")]
@@ -107,6 +136,13 @@ pub struct SnapshotManifest {
     pub env_spec: Option<EnvSpecId>,
     /// One row per dependency, build or tool-cache path the policy saw; sorted by path.
     pub caches: Vec<CacheEntry>,
+    /// Every ignored or untracked path a secret pattern or `.fabricignore`
+    /// kept on the capturing node, with that reason; sorted by path. Names
+    /// only, never bytes, so a target can say what it will not find. What
+    /// capture leaves out for other reasons, such as a socket, a directory
+    /// it cannot read or a nested repository, is named by the suspend that
+    /// took the snapshot and not listed here.
+    pub left_behind: Vec<LeftBehind>,
 }
 
 /// The operating system and architecture of a node.
@@ -218,6 +254,56 @@ pub struct CacheEntry {
     pub carry: CarryState,
     /// The exact strings the source measured; the target compares before trusting the bytes.
     pub key: CarryKey,
+    /// What makes the path again on a node that does not write the bytes,
+    /// as the capturing node's detection saw it (ADR 0012).
+    pub remake: Remake,
+    /// How many native addon files (`*.node`) lie under the path. Such a
+    /// file loads only under the Node ABI it was built for, so a tree that
+    /// holds one is not pure JavaScript.
+    pub native_files: u64,
+}
+
+/// What makes a cache path again on a node that does not write its bytes (ADR 0012).
+///
+/// The capturing node records it, because only that node ran detection
+/// over the workspace the bytes came from; the target reads it to tell a
+/// path it can rebuild from one it would lose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Remake {
+    /// Setup steps of the job's spec fill the path from a lockfile.
+    Setup {
+        /// The steps, in the spec's order; never empty.
+        steps: Vec<SetupStep>,
+        /// Whether the path held, at capture, the record materialize
+        /// writes once these steps exit 0 for the files they read then
+        /// (`fabric_env::materialize::SENTINEL`). Without it a target that
+        /// writes the bytes runs the steps again before it resumes, so the
+        /// bytes alone do not stand in for them.
+        installed: bool,
+    },
+    /// The next build or tool run makes it again; no setup step does.
+    NextBuild,
+    /// Nothing does: a dependency tree with no lockfile, or a cache the
+    /// user declared that no setup step fills. It is the user's own files.
+    Nothing,
+}
+
+/// A path whose bytes stayed on the capturing node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeftBehind {
+    /// The path, relative to the root.
+    pub path: RelPath,
+    /// Why it stayed.
+    pub reason: LeaveReason,
+}
+
+/// Why a path's bytes stayed on the capturing node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LeaveReason {
+    /// It matches a secret pattern; secrets never travel (ADR 0004).
+    Secret,
+    /// It matches a pattern in `.fabricignore`.
+    Excluded,
 }
 
 /// How much of a cache path travels with the snapshot.
@@ -319,7 +405,11 @@ pub struct GitState {
     pub worktree_commit: GitOid,
     /// Modification time in nanoseconds for every path in `W`; sorted by path.
     pub worktree_mtimes: Vec<(RelPath, u64)>,
-    /// The allowlisted projection of the repository config, never the file; sorted by key.
+    /// The allowlisted projection of the repository config, never the file;
+    /// sorted by key. A key git holds more than once, such as two
+    /// `remote.origin.fetch` refspecs, has one entry per value, in the order
+    /// git lists them, since that order can matter (git fetches from the
+    /// first `remote.<n>.url`).
     pub config: Vec<(GitConfigKey, GitConfigValue)>,
     /// The objects of `.git/info/exclude`, if present.
     pub exclude: Option<Vec<ChunkId>>,
@@ -358,19 +448,67 @@ fn check_sorted<K: Ord>(
     }
 }
 
+/// Returns the proper ancestors of a relative path, shortest first: `a` and `a/b` for `a/b/c`.
+fn ancestors(path: &str) -> impl Iterator<Item = &str> {
+    path.match_indices('/').map(move |(i, _)| &path[..i])
+}
+
 fn check_tree(list: &'static str, entries: &[Entry]) -> Result<(), ManifestError> {
     check_sorted(list, entries.iter().map(|e| &e.rel_path))?;
     let mut non_dirs = HashSet::new();
     for (index, entry) in entries.iter().enumerate() {
         let path = entry.rel_path.as_str();
-        let under_non_dir = path
-            .match_indices('/')
-            .any(|(i, _)| non_dirs.contains(&path[..i]));
+        let under_non_dir = ancestors(path).any(|a| non_dirs.contains(a));
         if under_non_dir {
             return Err(ManifestError::UnderNonDir { index });
         }
         if !matches!(entry.kind, EntryKind::Dir) {
             non_dirs.insert(path);
+        }
+    }
+    Ok(())
+}
+
+/// Checks that restore can write `files` after the working-tree commit `W`.
+///
+/// Restore checks out `W`, whose paths `worktree_mtimes` lists, and then
+/// creates `files` exclusively. A shared path never restores, nor does a
+/// `files` entry below a `W` path, which is a file, a symlink or a
+/// submodule, nor a `files` file or symlink above a `W` path, where `W`
+/// already made a directory. Both lists are sorted by path, so each
+/// ancestor is one binary search.
+fn check_trees_apart(files: &[Entry], worktree: &[(RelPath, u64)]) -> Result<(), ManifestError> {
+    let in_worktree = |path: &str| {
+        worktree
+            .binary_search_by(|(p, _)| p.as_str().cmp(path))
+            .ok()
+    };
+    for entry in files {
+        let path = entry.rel_path.as_str();
+        if in_worktree(path).is_some() {
+            return Err(ManifestError::InBothTrees {
+                path: entry.rel_path.clone(),
+            });
+        }
+        if let Some(index) = ancestors(path).find_map(in_worktree) {
+            return Err(ManifestError::TreesNest {
+                files: entry.rel_path.clone(),
+                worktree: worktree[index].0.clone(),
+            });
+        }
+    }
+    for (path, _) in worktree {
+        let above = ancestors(path.as_str()).find_map(|a| {
+            files
+                .binary_search_by(|e| e.rel_path.as_str().cmp(a))
+                .ok()
+                .filter(|&i| !matches!(files[i].kind, EntryKind::Dir))
+        });
+        if let Some(index) = above {
+            return Err(ManifestError::TreesNest {
+                files: files[index].rel_path.clone(),
+                worktree: path.clone(),
+            });
         }
     }
     Ok(())
@@ -382,13 +520,24 @@ impl SnapshotManifest {
         check_tree("files", &self.files)?;
         check_tree("harness_state", &self.harness_state.entries)?;
         check_sorted("caches", self.caches.iter().map(|c| &c.path))?;
+        for (index, cache) in self.caches.iter().enumerate() {
+            if matches!(&cache.remake, Remake::Setup { steps, .. } if steps.is_empty()) {
+                return Err(ManifestError::EmptyRemake { index });
+            }
+        }
+        check_sorted("left_behind", self.left_behind.iter().map(|l| &l.path))?;
         if let Some(git) = &self.git {
             check_sorted("refs", git.refs.iter().map(|(name, _)| name))?;
             check_sorted(
                 "worktree_mtimes",
                 git.worktree_mtimes.iter().map(|(p, _)| p),
             )?;
-            check_sorted("config", git.config.iter().map(|(key, _)| key))?;
+            if let Some(index) = git.config.windows(2).position(|w| w[0].0 > w[1].0) {
+                return Err(ManifestError::OutOfOrder {
+                    list: "config",
+                    index: index + 1,
+                });
+            }
             // SHA-1 and SHA-256 repositories do not interoperate, so a state
             // that mixes the two widths cannot be restored into any one repository.
             let sha256 = git.index_commit.is_sha256();
@@ -403,19 +552,7 @@ impl SnapshotManifest {
             if mixed {
                 return Err(ManifestError::MixedObjectFormat);
             }
-            // Restore checks out W, whose paths `worktree_mtimes` lists, and
-            // then creates `files` exclusively; a shared path never restores.
-            for entry in &self.files {
-                if git
-                    .worktree_mtimes
-                    .binary_search_by(|(path, _)| path.cmp(&entry.rel_path))
-                    .is_ok()
-                {
-                    return Err(ManifestError::InBothTrees {
-                        path: entry.rel_path.clone(),
-                    });
-                }
-            }
+            check_trees_apart(&self.files, &git.worktree_mtimes)?;
             // ADR 0004 strips credentials at capture; the receiving node holds
             // the same line, or a token in remote.origin.url would be written
             // into every target's .git/config.

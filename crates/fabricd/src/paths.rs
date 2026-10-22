@@ -177,6 +177,44 @@ impl JobDir {
         self.dir.join("session")
     }
 
+    /// The session a registration recorded before its `Resumed`, until it
+    /// moves to `session`.
+    #[must_use]
+    pub fn session_pending(&self) -> PathBuf {
+        self.dir.join("session.pending")
+    }
+
+    /// The Codex threads the job's workspace held when a Codex with no
+    /// thread to resume was planned here and its launch was recorded, until
+    /// a capture or a plan takes the thread that launch made, the oldest one
+    /// not among them.
+    #[must_use]
+    pub fn fresh_codex(&self) -> PathBuf {
+        self.dir.join("fresh-codex")
+    }
+
+    /// The Codex threads the job's workspace held when a Codex with no
+    /// thread to resume was planned here, until the registration of that
+    /// launch makes it `fresh_codex`. A plan the CLI never launched leaves
+    /// it here, so no thread made later by hand is taken for the job's.
+    #[must_use]
+    pub fn fresh_codex_planned(&self) -> PathBuf {
+        self.dir.join("fresh-codex.planned")
+    }
+
+    /// The id of the environment spec whose setup steps the user last let
+    /// this node run for the job (ADR 0007); the CLI writes it.
+    #[must_use]
+    pub fn env_spec_ran(&self) -> PathBuf {
+        self.dir.join("env-spec-ran")
+    }
+
+    /// Every secret pattern the job's spec held at a capture on this node.
+    #[must_use]
+    pub fn secret_patterns(&self) -> PathBuf {
+        self.dir.join("secret-patterns")
+    }
+
     /// The fork record that freezes the job on this node.
     #[must_use]
     pub fn forked(&self) -> PathBuf {
@@ -187,6 +225,20 @@ impl JobDir {
     #[must_use]
     pub fn harness_state(&self) -> PathBuf {
         self.dir.join("harness-state")
+    }
+
+    /// Where a capture writes the harness state before it replaces
+    /// `harness_state`, so a capture that fails leaves the last one whole.
+    #[must_use]
+    pub fn harness_state_next(&self) -> PathBuf {
+        self.dir.join("harness-state.next")
+    }
+
+    /// Where `harness_state` waits while a capture puts the new one in its
+    /// place; one found here at the start of a capture was cut short.
+    #[must_use]
+    pub fn harness_state_old(&self) -> PathBuf {
+        self.dir.join("harness-state.old")
     }
 
     /// The root used when a snapshot was captured under another home.

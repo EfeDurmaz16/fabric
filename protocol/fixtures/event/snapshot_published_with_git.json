@@ -1,0 +1,8 @@
+{
+  "kind": "snapshot_published",
+  "snapshot": "abababababababababababababababababababababababababababababababab",
+  "files": 212,
+  "bytes": 52428800,
+  "new_objects": 41,
+  "git_bundle": true
+}

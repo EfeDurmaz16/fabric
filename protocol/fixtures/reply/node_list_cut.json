@@ -1,0 +1,13 @@
+{
+  "kind": "node_list",
+  "peers": [
+    {
+      "node": "fab1ambqgaydambqgaydambqgaydambqgaydambqgaydambqgaydambq",
+      "addrs": [
+        "10.0.0.3:7777"
+      ],
+      "connected": false
+    }
+  ],
+  "left_out": 2
+}

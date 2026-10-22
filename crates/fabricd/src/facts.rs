@@ -5,9 +5,11 @@
 //! whole, and a fact that could not be measured is absent, never empty or
 //! guessed. A login is measured by exit code alone and recorded as `yes` or
 //! `no`; no account name is ever read. A carry key is built only from
-//! measured facts, and a cache whose ecosystem or facts are unknown gets
-//! `CarryKey::Unmeasured`, which never matches, so it is rebuilt rather than
-//! trusted.
+//! measured facts, and a cache whose facts are unknown gets
+//! `CarryKey::Unmeasured`, which never matches. What makes a cache again is
+//! recorded beside its key, and a cache detection found no lockfile or step
+//! for is `Remake::Nothing`: the user's own files, which the carry decision
+//! never leaves out (`crate::carry`).
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -16,12 +18,16 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use fabric_client::api::Roots;
+use fabric_core::env::SetupStep;
+use fabric_core::harness::ProgramName;
 use fabric_core::path::{AbsPath, RelPath};
-use fabric_core::snapshot::{CacheClass, CarryKey};
-use fabric_env::detect::{Detection, Ecosystem, NodeManager};
+use fabric_core::snapshot::{CacheClass, CarryKey, Platform, Remake, SnapshotManifest};
+use fabric_env::detect::{CacheOrigin, Completion, Detection, Ecosystem, NodeManager};
+use fabric_env::materialize::CacheHealth;
 use fabric_net::wire::{FactName, FactValue, Facts, MAX_FACT_VALUE};
 use fabric_store::capture::CarryKeys;
 
+use crate::harnesses::HarnessEnv;
 use crate::tool_env::ToolEnv;
 
 /// How long one measuring command may run.
@@ -33,6 +39,11 @@ pub mod name {
     pub const USER: &str = "user";
     /// `$HOME`.
     pub const HOME: &str = "home";
+    /// `git --version`, found on the daemon's own `PATH`, where restore runs it.
+    pub const GIT: &str = "git.version";
+    /// Where Codex capture and restore find `lsof`, which they ask whether
+    /// a Codex process holds a thread's rollout open.
+    pub const LSOF: &str = "lsof";
     /// The operating system, as Rust names it.
     pub const OS: &str = "os";
     /// The CPU architecture, as Rust names it.
@@ -65,6 +76,8 @@ pub mod name {
     pub const PYTHON: &str = "python.version";
     /// `sys.base_prefix` of `python3`.
     pub const PYTHON_HOME: &str = "python.home";
+    /// `uv --version`, the installer a Python setup step runs.
+    pub const UV: &str = "uv.version";
     /// `claude --version`.
     pub const CLAUDE: &str = "claude.version";
     /// `claude auth status`, exit code only.
@@ -77,6 +90,12 @@ pub mod name {
     pub const ICLOUD_DESKTOP: &str = "icloud.desktop";
     /// Whether iCloud Drive syncs `~/Documents`.
     pub const ICLOUD_DOCUMENTS: &str = "icloud.documents";
+    /// Where the `PATH` of the pulling command finds the job's ACP agent;
+    /// measured by the target of a pull only, never sent to a peer.
+    pub const ACP_AGENT: &str = "acp.agent";
+    /// The `state_dir` the target's `harness.toml` gives the job's ACP
+    /// agent; measured by the target of a pull only, never sent to a peer.
+    pub const ACP_STATE_DIR: &str = "acp.state_dir";
 }
 
 /// One node's measured facts, by name.
@@ -106,6 +125,8 @@ impl NodeFacts {
     /// Measures this node with the tools `env` names: programs are looked
     /// up on its `PATH` and run with its roots, each set to its value or
     /// removed, never the daemon's own (ADR 0018, The client's environment).
+    /// git is measured on the daemon's own `PATH`, where restore runs it,
+    /// and `lsof` where Codex capture looks for it.
     pub async fn measure(home: &Path, env: &ToolEnv) -> Self {
         let inherited: Vec<(OsString, OsString)> = std::env::vars_os().collect();
         Self::measure_from(home, env, &inherited).await
@@ -113,14 +134,35 @@ impl NodeFacts {
 
     /// Measures as [`NodeFacts::measure`] does, with `inherited` as the
     /// daemon's own environment: each tool starts from it, and `env`'s
-    /// `PATH` and roots then replace or remove what they name.
+    /// `PATH` and roots then replace or remove what they name; git runs in
+    /// `inherited` alone.
     async fn measure_from(home: &Path, env: &ToolEnv, inherited: &[(OsString, OsString)]) -> Self {
-        // Each probe is boxed, so the joined future holds 19 pointers, not 19 child processes.
+        let own = ToolEnv::from_vars(|name| {
+            inherited
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        });
+        let (mut facts, git) = tokio::join!(
+            Box::pin(Self::measure_tools(home, env, inherited)),
+            probe_command("git", &["--version"], Probe::Output, &own, home, inherited),
+        );
+        if let Some(git) = git {
+            facts.0.insert(name::GIT.to_owned(), git);
+        }
+        if let Some(lsof) = fabric_harness::codex::Codex::lsof() {
+            facts
+                .0
+                .insert(name::LSOF.to_owned(), lsof.display().to_string());
+        }
+        facts
+    }
+
+    /// Measures everything but git with the tools `env` names.
+    async fn measure_tools(home: &Path, env: &ToolEnv, inherited: &[(OsString, OsString)]) -> Self {
+        // Each probe is boxed, so the joined future holds 20 pointers, not 20 child processes.
         let run = |program: &'static str, args: &'static [&'static str], probe: Probe| {
-            let (env, home) = (env.clone(), home.to_owned());
-            Box::pin(
-                async move { probe_command(program, args, probe, &env, &home, inherited).await },
-            )
+            Box::pin(probe_command(program, args, probe, env, home, inherited))
         };
         let (
             user,
@@ -136,6 +178,7 @@ impl NodeFacts {
             rustc,
             python,
             python_home,
+            uv,
             claude,
             claude_login,
             codex,
@@ -160,6 +203,7 @@ impl NodeFacts {
                 &["-c", "import sys; print(sys.base_prefix)"],
                 Probe::Output
             ),
+            run("uv", &["--version"], Probe::Output),
             run("claude", &["--version"], Probe::Output),
             run("claude", &["auth", "status"], Probe::ExitCode),
             run("codex", &["--version"], Probe::Output),
@@ -207,6 +251,7 @@ impl NodeFacts {
         );
         put(name::PYTHON, python);
         put(name::PYTHON_HOME, python_home);
+        put(name::UV, uv);
         put(name::CLAUDE, claude);
         put(name::CLAUDE_LOGIN, claude_login);
         put(name::CODEX, codex);
@@ -214,6 +259,27 @@ impl NodeFacts {
         put(name::ICLOUD_DESKTOP, desktop);
         put(name::ICLOUD_DOCUMENTS, documents);
         Self(facts)
+    }
+
+    /// Adds what this node has for the ACP agent `program`: where the
+    /// `PATH` of `env` finds it, and the `state_dir` its configuration gives
+    /// it. Either is absent when the node has none, and the state directory
+    /// is absent too when capture and restore would refuse it: outside the
+    /// home, the home itself or under `~/.fabric`, or reached through a link.
+    pub fn measure_acp(&mut self, program: &ProgramName, env: &HarnessEnv) {
+        if let Some(found) = find_on_path(program.as_str(), &env.path_var) {
+            self.0
+                .insert(name::ACP_AGENT.to_owned(), found.display().to_string());
+        }
+        if let Some(entry) = env.config.acp.get(program.as_str())
+            && crate::harnesses::acp_adapter(program, &[], env)
+                .is_ok_and(|adapter| adapter.check_state_dir().is_ok())
+        {
+            self.0.insert(
+                name::ACP_STATE_DIR.to_owned(),
+                entry.state_dir.display().to_string(),
+            );
+        }
     }
 
     /// The value of a fact, if it was measured.
@@ -298,12 +364,13 @@ async fn probe_command(
 
 /// The first executable named `program` on `path_var`, always an absolute path.
 ///
-/// A relative or empty entry is skipped, as the harness adapters skip it:
-/// it names a directory relative to the daemon's working directory, which
-/// is wherever `fabric serve` started, not one the client chose. A client
-/// with no `PATH` sends an empty list, whose `PATH` value is the empty
-/// string, which a shell reads as the working directory (review finding
-/// on PR #13).
+/// A relative or empty entry is skipped, as the harness's own lookup
+/// skips it: it names a directory relative to the daemon's working
+/// directory, which is wherever `fabric serve` started, not one the client
+/// chose, and relative to the workspace at launch, so the binary measured
+/// and the binary launched could differ. A client with no `PATH` sends an
+/// empty list, whose `PATH` value is the empty string, which a shell reads
+/// as the working directory (review finding on PR #13).
 pub fn find_on_path(program: &str, path_var: &OsStr) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     std::env::split_paths(path_var)
@@ -314,6 +381,23 @@ pub fn find_on_path(program: &str, path_var: &OsStr) -> Option<PathBuf> {
                 .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
         })
 }
+
+/// What a node knows about one program a setup step runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Program<'a> {
+    /// Not a program the node measures, such as a declared `make`.
+    Unmeasured,
+    /// Measured and not installed.
+    Missing,
+    /// Installed; the version it reports.
+    Installed(&'a str),
+}
+
+/// The `tool` of the `Other` key whose version is the node's `{os}-{arch}`.
+pub const PLATFORM_TOOL: &str = "platform";
+
+/// The `tool` of the `Other` key whose version is the node's native addon ABI.
+pub const NODE_ABI_TOOL: &str = "node.abi";
 
 /// The major version in a version string: `v22.23.2` gives `22`, `11.23.0` gives `11`.
 #[must_use]
@@ -365,9 +449,45 @@ impl NodeFacts {
 
     fn platform_key(&self) -> Option<CarryKey> {
         Some(CarryKey::Other {
-            tool: "platform".to_owned(),
+            tool: PLATFORM_TOOL.to_owned(),
             version: format!("{}-{}", self.get(name::OS)?, self.get(name::ARCH)?),
         })
+    }
+
+    /// The ABI native Node addons are built for here: the key of a
+    /// `node_modules` no lockfile describes, which no package manager names.
+    fn node_abi_key(&self) -> Option<CarryKey> {
+        Some(CarryKey::Other {
+            tool: NODE_ABI_TOOL.to_owned(),
+            version: self.get(name::NODE_ABI)?.to_owned(),
+        })
+    }
+
+    /// This node's operating system and architecture, named as a snapshot names them.
+    #[must_use]
+    pub fn platform(&self) -> Platform {
+        Platform {
+            os: self.get(name::OS).unwrap_or_default().to_owned(),
+            arch: self.get(name::ARCH).unwrap_or_default().to_owned(),
+        }
+    }
+
+    /// What this node knows about `program`.
+    #[must_use]
+    pub fn program(&self, program: &str) -> Program<'_> {
+        let fact = match program {
+            "node" => name::NODE,
+            "npm" => name::NPM,
+            "pnpm" => name::PNPM,
+            "yarn" => name::YARN,
+            "bun" => name::BUN,
+            // rustup installs cargo beside rustc.
+            "rustc" | "cargo" => name::RUSTC,
+            "python3" => name::PYTHON,
+            "uv" => name::UV,
+            _ => return Program::Unmeasured,
+        };
+        self.get(fact).map_or(Program::Missing, Program::Installed)
     }
 
     /// The key this node measures for the ecosystem `source` names (ADR 0012).
@@ -383,19 +503,20 @@ impl NodeFacts {
             } => self.node_key(package_manager),
             CarryKey::Rust { .. } => self.rust_key(),
             CarryKey::Python { .. } => self.python_key(),
-            CarryKey::Other { tool, .. } if tool == "platform" => self.platform_key(),
+            CarryKey::Other { tool, .. } if tool == PLATFORM_TOOL => self.platform_key(),
+            CarryKey::Other { tool, .. } if tool == NODE_ABI_TOOL => self.node_abi_key(),
             CarryKey::Other { .. } | CarryKey::Unmeasured => None,
         };
         key.unwrap_or(CarryKey::Unmeasured)
     }
 }
 
-/// Says which field of two carry keys differs, for the one line a skipped cache prints.
+/// Says which field of two carry keys differs, in the words a decision line prints.
 #[must_use]
 pub fn key_difference(source: &CarryKey, target: &CarryKey) -> String {
     match (source, target) {
         (CarryKey::Unmeasured, _) => "the source measured no key".to_owned(),
-        (_, CarryKey::Unmeasured) => "this node lacks a tool the key needs".to_owned(),
+        (_, CarryKey::Unmeasured) => "the target lacks a tool the key needs".to_owned(),
         (
             CarryKey::Node {
                 node_major: source_node,
@@ -411,57 +532,174 @@ pub fn key_difference(source: &CarryKey, target: &CarryKey) -> String {
             },
         ) => {
             if source_node != target_node {
-                format!("node major {source_node} on the source, {target_node} here")
+                format!("node major {source_node} on the source, {target_node} on the target")
             } else if source_pm != target_pm {
-                format!("{manager} major {source_pm} on the source, {target_pm} here")
+                format!("{manager} major {source_pm} on the source, {target_pm} on the target")
             } else if source_store != target_store {
-                format!("pnpm store {source_store:?} on the source, {target_store:?} here")
+                format!("pnpm store {source_store:?} on the source, {target_store:?} on the target")
             } else {
                 "keys are equal".to_owned()
             }
         }
         (CarryKey::Rust { cargo_home: a, .. }, CarryKey::Rust { cargo_home: b, .. }) if a != b => {
-            format!("CARGO_HOME {a} on the source, {b} here")
+            format!("CARGO_HOME {a} on the source, {b} on the target")
         }
-        (CarryKey::Rust { .. }, CarryKey::Rust { .. }) => "rustc -vV differs".to_owned(),
+        (CarryKey::Rust { .. }, CarryKey::Rust { .. }) if source != target => {
+            "rustc -vV differs".to_owned()
+        }
+        (
+            CarryKey::Python {
+                python_version: a,
+                python_home: home_a,
+            },
+            CarryKey::Python {
+                python_version: b,
+                python_home: home_b,
+            },
+        ) if source != target => {
+            format!("{a} at {home_a} on the source, {b} at {home_b} on the target")
+        }
+        (
+            CarryKey::Other { tool, version: a },
+            CarryKey::Other {
+                tool: target_tool,
+                version: b,
+            },
+        ) if tool == target_tool && a != b => {
+            let what = if tool == PLATFORM_TOOL {
+                String::new()
+            } else {
+                format!("{tool} ")
+            };
+            format!("{what}{a} on the source, {b} on the target")
+        }
         _ if source == target => "keys are equal".to_owned(),
         _ => "the keys differ".to_owned(),
     }
 }
 
-/// Carry keys for a capture: detection says each cache's ecosystem, the facts give the strings.
+/// What a capture records per cache: detection says each cache's
+/// ecosystem and what fills it, the facts give the strings.
 pub struct MeasuredKeys {
     facts: NodeFacts,
-    ecosystems: BTreeMap<RelPath, Ecosystem>,
+    detected: BTreeMap<RelPath, (Ecosystem, Remake)>,
 }
 
 impl MeasuredKeys {
     /// Keys for the workspace `detection` describes, measured as `facts`.
     #[must_use]
     pub fn new(facts: NodeFacts, detection: Option<&Detection>) -> Self {
-        let ecosystems = detection
+        let detected = detection
             .map(|d| {
                 d.caches()
                     .iter()
-                    .map(|cache| (cache.path.clone(), cache.ecosystem))
+                    .map(|cache| {
+                        let remake = match &cache.completion {
+                            Completion::Sentinel { filled_by } => {
+                                let steps: Vec<SetupStep> = filled_by
+                                    .iter()
+                                    .filter_map(|index| d.spec().setup.get(*index).cloned())
+                                    .collect();
+                                if steps.is_empty() {
+                                    Remake::Nothing
+                                } else {
+                                    // A cache whose health cannot be read
+                                    // proves no finished install.
+                                    let installed =
+                                        fabric_env::materialize::cache_health(d, &cache.path)
+                                            .is_ok_and(|health| {
+                                                health == Some(CacheHealth::Healthy)
+                                            });
+                                    Remake::Setup { steps, installed }
+                                }
+                            }
+                            // A declared cache no step fills holds whatever
+                            // the user put there (ADR 0012, 2026-10-20).
+                            Completion::Content => match cache.origin {
+                                CacheOrigin::Declared => Remake::Nothing,
+                                CacheOrigin::Detected => Remake::NextBuild,
+                            },
+                        };
+                        (cache.path.clone(), (cache.ecosystem, remake))
+                    })
                     .collect()
             })
             .unwrap_or_default();
-        Self { facts, ecosystems }
+        Self { facts, detected }
+    }
+
+    /// The key of a cache the store's classes found and detection did not:
+    /// a `node_modules` without a lockfile keys on the addon ABI, a `.venv`
+    /// on the interpreter, and anything else on the platform.
+    fn undetected_key(&self, class: CacheClass, path: &RelPath) -> Option<CarryKey> {
+        let name = path.as_str().rsplit('/').next().unwrap_or_default();
+        match class {
+            CacheClass::Deps if name.eq_ignore_ascii_case("node_modules") => {
+                self.facts.node_abi_key()
+            }
+            CacheClass::Deps if name.eq_ignore_ascii_case(".venv") => self.facts.python_key(),
+            CacheClass::Deps | CacheClass::Build | CacheClass::ToolCache => {
+                self.facts.platform_key()
+            }
+        }
     }
 }
 
 impl CarryKeys for MeasuredKeys {
-    fn key(&self, _class: CacheClass, path: &RelPath) -> CarryKey {
-        let key = match self.ecosystems.get(path) {
-            Some(Ecosystem::Node(manager)) => self.facts.node_key(manager_name(*manager)),
+    fn key(&self, class: CacheClass, path: &RelPath) -> CarryKey {
+        let key = match self.detected.get(path).map(|(ecosystem, _)| *ecosystem) {
+            Some(Ecosystem::Node(manager)) => self.facts.node_key(manager_name(manager)),
             Some(Ecosystem::Rust) => self.facts.rust_key(),
             Some(Ecosystem::Python) => self.facts.python_key(),
             Some(Ecosystem::Other) => self.facts.platform_key(),
-            None => None,
+            None => self.undetected_key(class, path),
         };
         key.unwrap_or(CarryKey::Unmeasured)
     }
+
+    /// A cache detection does not know is made again by nothing when it
+    /// is a dependency tree, which then has no lockfile, and by the next
+    /// build or tool run otherwise.
+    fn remake(&self, class: CacheClass, path: &RelPath) -> Remake {
+        match self.detected.get(path) {
+            Some((_, remake)) => remake.clone(),
+            None => match class {
+                CacheClass::Deps => Remake::Nothing,
+                CacheClass::Build | CacheClass::ToolCache => Remake::NextBuild,
+            },
+        }
+    }
+}
+
+/// Turns each cache row that setup steps remake into one nothing remakes
+/// when a file detection reads stayed on this node, and returns the paths
+/// it turned.
+///
+/// The target learns the steps from its own detection over the restored
+/// tree. With a lockfile, a package manifest, the manager's configuration
+/// or `.fabric/env.toml` left behind by `.fabricignore` or a secret
+/// pattern, that detection does not see what this node saw and may plan
+/// no step for the path, so a rebuild the row promised would never run
+/// and the bytes, left out for it, would be lost. Nothing on the target is
+/// then known to make the path again, and it travels as the user's files.
+pub fn forget_lost_remakes(manifest: &mut SnapshotManifest) -> Vec<RelPath> {
+    let lost = manifest.left_behind.iter().any(|left| {
+        fabric_env::detect::READ_FILES.iter().any(|file| {
+            RelPath::parse(file).is_ok_and(|file| file.starts_with_ignore_ascii_case(&left.path))
+        })
+    });
+    if !lost {
+        return Vec::new();
+    }
+    manifest
+        .caches
+        .iter_mut()
+        .filter(|cache| matches!(cache.remake, Remake::Setup { .. }))
+        .map(|cache| {
+            cache.remake = Remake::Nothing;
+            cache.path.clone()
+        })
+        .collect()
 }
 
 fn manager_name(manager: NodeManager) -> &'static str {
@@ -579,7 +817,7 @@ mod tests {
         assert!(!source.matches(&target));
         assert_eq!(
             key_difference(&source, &target),
-            "node major 22 on the source, 26 here"
+            "node major 22 on the source, 26 on the target"
         );
     }
 
@@ -591,11 +829,152 @@ mod tests {
         assert!(!source.matches(&air.key_like(&source)));
     }
 
+    /// A `node_modules` detection does not know has no lockfile, so
+    /// nothing makes it again: the key is the addon ABI, read only for a
+    /// warning, and the remake is `Nothing`, which the carry decision
+    /// always carries (gate finding F6).
     #[test]
-    fn a_cache_detection_does_not_know_is_never_carried() {
+    fn a_dependency_tree_detection_does_not_know_is_the_users_files() {
+        let facts = NodeFacts::from_pairs([(name::NODE_ABI, "127"), (name::OS, "macos")]);
+        let keys = MeasuredKeys::new(facts, None);
+        let node_modules = RelPath::parse("node_modules").unwrap();
+        assert_eq!(
+            keys.key(CacheClass::Deps, &node_modules),
+            CarryKey::Other {
+                tool: NODE_ABI_TOOL.to_owned(),
+                version: "127".to_owned()
+            }
+        );
+        assert_eq!(
+            keys.remake(CacheClass::Deps, &node_modules),
+            Remake::Nothing
+        );
+    }
+
+    /// Build output detection does not know, such as `dist`, keys on the
+    /// platform and the next build makes it again (gate finding F7).
+    #[test]
+    fn build_output_detection_does_not_know_keys_on_the_platform() {
         let keys = MeasuredKeys::new(pro(), None);
-        let key = keys.key(CacheClass::Deps, &RelPath::parse("node_modules").unwrap());
-        assert_eq!(key, CarryKey::Unmeasured);
+        let dist = RelPath::parse("dist").unwrap();
+        assert_eq!(
+            keys.key(CacheClass::Build, &dist),
+            CarryKey::Other {
+                tool: PLATFORM_TOOL.to_owned(),
+                version: "macos-aarch64".to_owned()
+            }
+        );
+        assert_eq!(keys.remake(CacheClass::Build, &dist), Remake::NextBuild);
+    }
+
+    /// A row setup steps remake keeps its steps while what detection
+    /// reads travels, and becomes the user's files once the lockfile, or
+    /// a directory that holds one of those files, stayed behind: the
+    /// target's detection would plan no step for it (review of PR #11).
+    #[test]
+    fn a_rebuild_whose_inputs_stayed_behind_becomes_the_users_files() {
+        use fabric_core::snapshot::{
+            CacheEntry, CarryState, HarnessState, LeaveReason, LeftBehind,
+        };
+        let manifest = |left: &[(&str, LeaveReason)]| SnapshotManifest {
+            job_id: fabric_core::id::JobId::from_bytes([1; 16]),
+            root: AbsPath::parse("/w").unwrap(),
+            parent: None,
+            created_at: 0,
+            created_by: fabric_core::id::NodeId::from_bytes([2; 32]),
+            platform: pro().platform(),
+            git: None,
+            files: Vec::new(),
+            harness_state: HarnessState::default(),
+            env_spec: None,
+            caches: vec![
+                CacheEntry {
+                    path: RelPath::parse("dist").unwrap(),
+                    class: CacheClass::Build,
+                    carry: CarryState::Carried,
+                    key: CarryKey::Unmeasured,
+                    remake: Remake::NextBuild,
+                    native_files: 0,
+                },
+                CacheEntry {
+                    path: RelPath::parse("node_modules").unwrap(),
+                    class: CacheClass::Deps,
+                    carry: CarryState::Carried,
+                    key: CarryKey::Unmeasured,
+                    remake: Remake::Setup {
+                        steps: vec![SetupStep {
+                            program: ProgramName::parse("npm").unwrap(),
+                            args: vec![fabric_core::env::SetupArg::parse("ci").unwrap()],
+                            cwd: None,
+                            when: fabric_core::env::RunWhen::CachesMissing,
+                        }],
+                        installed: true,
+                    },
+                    native_files: 0,
+                },
+            ],
+            left_behind: left
+                .iter()
+                .map(|(path, reason)| LeftBehind {
+                    path: RelPath::parse(path).unwrap(),
+                    reason: *reason,
+                })
+                .collect(),
+        };
+        let mut kept = manifest(&[(".env", LeaveReason::Secret)]);
+        assert!(forget_lost_remakes(&mut kept).is_empty());
+        assert!(matches!(kept.caches[1].remake, Remake::Setup { .. }));
+        for left in ["package-lock.json", ".fabric"] {
+            let mut lost = manifest(&[(left, LeaveReason::Excluded)]);
+            assert_eq!(
+                forget_lost_remakes(&mut lost),
+                [RelPath::parse("node_modules").unwrap()],
+                "{left}"
+            );
+            assert_eq!(lost.caches[1].remake, Remake::Nothing, "{left}");
+            assert_eq!(lost.caches[0].remake, Remake::NextBuild, "{left}");
+        }
+    }
+
+    /// A tree with a lockfile records the install step that fills it.
+    #[test]
+    fn a_detected_tree_records_the_step_that_fills_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("package-lock.json"), "{}").unwrap();
+        let detection = fabric_env::detect::detect(dir.path(), &[]).unwrap();
+        let keys = MeasuredKeys::new(pro(), Some(&detection));
+        let node_modules = RelPath::parse("node_modules").unwrap();
+        let Remake::Setup { steps, installed } = keys.remake(CacheClass::Deps, &node_modules)
+        else {
+            panic!("no setup step recorded");
+        };
+        assert!(!installed, "no install ran");
+        // The sentinel materialize writes after the install proves it.
+        std::fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(dir.path().join("node_modules/pkg/index.js"), "1;\n").unwrap();
+        let sentinel = fabric_env::materialize::sentinel_text(&detection, &node_modules).unwrap();
+        std::fs::write(
+            dir.path()
+                .join("node_modules")
+                .join(fabric_env::materialize::SENTINEL),
+            sentinel,
+        )
+        .unwrap();
+        let keys = MeasuredKeys::new(pro(), Some(&detection));
+        assert!(matches!(
+            keys.remake(CacheClass::Deps, &node_modules),
+            Remake::Setup {
+                installed: true,
+                ..
+            }
+        ));
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].program.to_string(), "npm");
+        assert!(matches!(
+            keys.key(CacheClass::Deps, &node_modules),
+            CarryKey::Node { .. }
+        ));
     }
 
     #[test]
@@ -603,5 +982,33 @@ mod tests {
         assert_eq!(major("v22.23.2").as_deref(), Some("22"));
         assert_eq!(major("11.23.0").as_deref(), Some("11"));
         assert_eq!(major("nightly"), None);
+    }
+
+    /// A relative `PATH` entry names a directory relative to the daemon's
+    /// working directory here, and to the workspace once the harness
+    /// starts, so the measured binary and the launched one could differ.
+    /// It is skipped, as the harness's own lookup skips it.
+    #[test]
+    fn a_relative_path_entry_is_never_searched() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("fabric-test-tool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let up = "../".repeat(cwd.components().count());
+        let relative = format!(
+            "{up}{}",
+            dir.path().display().to_string().trim_start_matches('/')
+        );
+        assert!(Path::new(&relative).join("fabric-test-tool").is_file());
+        assert_eq!(
+            find_on_path("fabric-test-tool", &OsString::from(&relative)),
+            None
+        );
+        assert_eq!(
+            find_on_path("fabric-test-tool", dir.path().as_os_str()),
+            Some(tool)
+        );
     }
 }

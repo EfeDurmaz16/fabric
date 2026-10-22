@@ -4,12 +4,15 @@
 //! the test names. The harness is the fake ACP agent, which keeps one JSON
 //! file per session under the home, so its state travels the way a real
 //! harness's does. The repository fixture needs git and nothing else: no
-//! pnpm and no native Node module, which the gate's second Mac lacks.
+//! pnpm and no native Node module, which the gate's second Mac lacks. Its
+//! `package.json` has no lockfile, as the gate fixture of 2026-10-21 had,
+//! and each node may put its own programs first on its `PATH`, so the two
+//! nodes can report different Node majors from one machine.
 
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
@@ -85,7 +88,8 @@ impl Env {
     /// Puts a fake `claude` first on the `PATH`: it answers `--version` as
     /// the gate's Claude does and otherwise writes its arguments, one per
     /// line, to `claude-args` and its environment to `claude-env` under the
-    /// home. With `-p` it also appends the prompt to the session's
+    /// home. With `-p` it also appends the prompt and an answer by
+    /// `claude-opus-5-5`, both stamped with its version, to the session's
     /// transcript under `~/.claude/projects/<slug>/`, as Claude does, and
     /// prints the one result object `claude -p --output-format json` prints.
     pub fn install_fake_claude(&self) -> Fallible {
@@ -107,7 +111,8 @@ impl Env {
              [ -n \"$headless\" ] || exit 0\n\
              dir=\"$HOME/.claude/projects/$(pwd -P | sed 's/[^A-Za-z0-9]/-/g')\"\n\
              mkdir -p \"$dir\"\n\
-             printf '{\"type\":\"user\",\"sessionId\":\"%s\",\"message\":{\"role\":\"user\",\"content\":\"%s\"}}\\n' \"$session\" \"$prompt\" >> \"$dir/$session.jsonl\"\n\
+             printf '{\"type\":\"user\",\"version\":\"2.1.294\",\"sessionId\":\"%s\",\"message\":{\"role\":\"user\",\"content\":\"%s\"}}\\n' \"$session\" \"$prompt\" >> \"$dir/$session.jsonl\"\n\
+             printf '{\"type\":\"assistant\",\"version\":\"2.1.294\",\"sessionId\":\"%s\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-opus-5-5\"}}\\n' \"$session\" >> \"$dir/$session.jsonl\"\n\
              printf '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"claude did: %s\",\"session_id\":\"%s\"}\\n' \"$prompt\" \"$session\"\n",
         )
     }
@@ -116,23 +121,39 @@ impl Env {
     pub const CODEX_THREAD: &str = "019f233e-bb33-7342-85fa-f2d33b14368a";
 
     /// Puts a fake `codex` first on the `PATH`: it answers `--version` as
-    /// the gate's Codex does and otherwise writes its arguments, one per
-    /// line, to `codex-args` and its environment to `codex-env` under the
-    /// home. Under `exec` it appends the prompt to the thread's rollout
-    /// under `~/.codex/sessions/`, starting `CODEX_THREAD`, or the thread
-    /// `exec resume` names, and prints the events `codex exec --json`
-    /// prints for one turn. After `thread.started` it waits up to five
+    /// the gate's Codex does, `0.155.1`, or with the version in the
+    /// node's `codex-version` file when there is one, or, as an asdf shim
+    /// does, with the `codex` line of a `.tool-versions` in the directory
+    /// it runs in, and otherwise
+    /// writes its arguments, one per line, to `codex-args` and its
+    /// environment to `codex-env` under the home. Under `exec` it appends the prompt and the turn's settings
+    /// (gpt-6-sol, xhigh, on-request, workspace-write) to the thread's
+    /// rollout under `~/.codex/sessions/`, whose first line records the
+    /// Codex that created it, as Codex records no version on a resume,
+    /// starting `CODEX_THREAD`, or the thread `exec resume`
+    /// names, and prints the events `codex exec --json` prints for one turn. After `thread.started` it waits up to five
     /// seconds for the node's session record of the job and writes `yes`
     /// or `no` to `codex-saw-session`, so a test can tell the thread was
     /// recorded while the turn ran. With `FAKE_CODEX_WAIT` set it then
     /// touches `codex-waiting` and runs until a `SIGINT`, which it writes
-    /// to `codex-signal` before it exits with 130.
+    /// to `codex-signal` before it exits with 130. With
+    /// `FAKE_CODEX_PROBE_WAIT` set, `--version` touches `codex-probing`
+    /// and answers three seconds later. With `FAKE_CODEX_LATE_STDERR` set
+    /// it leaves a process behind that writes `codex: late diagnostics` to
+    /// its standard error half a second after the turn ends, with its
+    /// standard output already closed.
     pub fn install_fake_codex(&self) -> Fallible {
         self.install(
             "codex",
             &format!(
                 "#!/bin/sh\n\
-                 if [ \"$1\" = --version ]; then echo 'codex-cli 0.155.1'; exit 0; fi\n\
+                 version=0.155.1\n\
+                 [ ! -f \"$FABRIC_HOME/codex-version\" ] || version=$(cat \"$FABRIC_HOME/codex-version\")\n\
+                 [ ! -f .tool-versions ] || version=$(sed -n 's/^codex //p' .tool-versions)\n\
+                 if [ \"$1\" = --version ]; then\n\
+                   if [ -n \"$FAKE_CODEX_PROBE_WAIT\" ]; then touch \"$HOME/codex-probing\"; sleep 3; fi\n\
+                   echo \"codex-cli $version\"; exit 0\n\
+                 fi\n\
                  printf '%s\\n' \"$@\" > \"$HOME/codex-args\"\n\
                  env > \"$HOME/codex-env\"\n\
                  [ \"$1\" = exec ] || exit 0\n\
@@ -143,7 +164,8 @@ impl Env {
                  dir=\"$HOME/.codex/sessions/2026/10/21\"\n\
                  mkdir -p \"$dir\"\n\
                  file=\"$dir/rollout-2026-10-21T10-00-00-$thread.jsonl\"\n\
-                 [ -f \"$file\" ] || printf '{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"%s\",\"cwd\":\"%s\"}}}}\\n' \"$thread\" \"$(pwd -P)\" > \"$file\"\n\
+                 [ -f \"$file\" ] || printf '{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"%s\",\"cwd\":\"%s\",\"cli_version\":\"%s\"}}}}\\n' \"$thread\" \"$(pwd -P)\" \"$version\" > \"$file\"\n\
+                 printf '{{\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-6-sol\",\"effort\":\"xhigh\",\"approval_policy\":\"on-request\",\"sandbox_policy\":{{\"type\":\"workspace-write\"}}}}}}\\n' >> \"$file\"\n\
                  printf '{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"%s\"}}]}}}}\\n' \"$prompt\" >> \"$file\"\n\
                  printf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$thread\"\n\
                  record=\"$FABRIC_HOME/jobs/$(basename \"$(dirname \"$(pwd -P)\")\")/session\"\n\
@@ -155,6 +177,9 @@ impl Env {
                    touch \"$HOME/codex-waiting\"\n\
                    while :; do sleep 0.1; done\n\
                  fi\n\
+                 if [ -n \"$FAKE_CODEX_LATE_STDERR\" ]; then\n\
+                   ( exec >/dev/null; sleep 0.5; echo 'codex: late diagnostics' >&2 ) &\n\
+                 fi\n\
                  echo '{{\"type\":\"turn.started\"}}'\n\
                  printf '{{\"type\":\"item.completed\",\"item\":{{\"id\":\"item_0\",\"type\":\"agent_message\",\"text\":\"codex did: %s\"}}}}\\n' \"$prompt\"\n\
                  echo '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"cached_input_tokens\":0,\"output_tokens\":1}}}}'\n",
@@ -165,10 +190,7 @@ impl Env {
 
     /// Writes an executable `name` into the test's `bin`, first on the `PATH`.
     fn install(&self, name: &str, script: &str) -> Fallible {
-        let path = self.root.join("bin").join(name);
-        fs::write(&path, script)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
-        Ok(())
+        write_executable(&self.root.join("bin").join(name), script.as_bytes())
     }
 
     /// What a fake harness wrote to `<name>-args`, one argument per line.
@@ -209,13 +231,19 @@ impl Env {
             .collect())
     }
 
-    /// A command for `program` with the environment every process of the test runs with.
+    /// A command for `program` with the environment every process of the
+    /// test runs with, for the node whose state directory is `state`: its
+    /// own programs come first on the `PATH` (`node_bin`), then the
+    /// programs both nodes share.
     pub fn command(&self, program: &str, state: &Path) -> Command {
+        let mut dirs = vec![node_bin(state)];
+        dirs.extend(std::env::split_paths(&self.path));
+        let path = std::env::join_paths(dirs).unwrap_or_else(|_| self.path.clone());
         let mut command = Command::new(program);
         command
             .env_clear()
             .env("HOME", &self.home)
-            .env("PATH", &self.path)
+            .env("PATH", path)
             .env("FABRIC_HOME", state)
             .env("FAKE_STATE_DIR", self.home.join(".fake-agent"))
             .stdin(Stdio::null());
@@ -223,6 +251,42 @@ impl Env {
             command.env("FABRIC_LOG", level);
         }
         command
+    }
+}
+
+/// The directory of the programs only the node whose state directory is
+/// `state` runs, such as its `fake_node`. It sits beside the state
+/// directory, not in it: a node refuses to start in a state directory of
+/// the umask's mode that holds anything Fabric did not write.
+fn node_bin(state: &Path) -> PathBuf {
+    let mut name = state.file_name().unwrap_or_default().to_owned();
+    name.push(".bin");
+    state.with_file_name(name)
+}
+
+/// Writes `contents` to `path` with mode `0755` through a short `sh`, so
+/// this process never holds the file open for writing. Linux refuses to
+/// run a file open for writing (`ETXTBSY`), and a child another test
+/// forked while this process held it open would keep it open until that
+/// child ran its own program. A temporary file renamed into place would
+/// not help: the descriptor follows the file.
+fn write_executable(path: &Path, contents: &[u8]) -> Fallible {
+    let mut writer = Command::new("/bin/sh")
+        .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()?;
+    // The pipe closes at the end of the statement, so `cat` sees the end.
+    writer
+        .stdin
+        .take()
+        .ok_or("no pipe to the writer")?
+        .write_all(contents)?;
+    let status = writer.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("writing {} failed: {status}", path.display()).into())
     }
 }
 
@@ -256,7 +320,16 @@ fn make_repo(repo: &Path) -> Fallible {
     fs::create_dir_all(repo.join("src"))?;
     fs::write(repo.join("README.md"), "hello\n")?;
     fs::write(repo.join("src/greet.txt"), "hello, world\n")?;
-    fs::write(repo.join(".gitignore"), "scratch/\n")?;
+    // No lockfile: nothing can install `node_modules` again, so it is the
+    // user's files (gate finding F6).
+    fs::write(
+        repo.join("package.json"),
+        "{\"name\": \"fixture\", \"version\": \"1.0.0\"}\n",
+    )?;
+    fs::write(
+        repo.join(".gitignore"),
+        "scratch/\nnode_modules/\ndist/\n.env\n",
+    )?;
     git(repo, &["init", "-q", "-b", "main"])?;
     git(repo, &["add", "-A"])?;
     git(repo, &["commit", "-q", "-m", "first"])
@@ -278,7 +351,7 @@ impl OtherClaude {
         let dir = env.root.join("other");
         fs::create_dir_all(&dir)?;
         let claude = dir.join("claude");
-        fs::copy(env!("CARGO_BIN_EXE_fabric-fake-agent"), &claude)?;
+        write_executable(&claude, &fs::read(env!("CARGO_BIN_EXE_fabric-fake-agent"))?)?;
         let other = Self(
             Command::new(&claude)
                 .env_clear()
@@ -400,7 +473,10 @@ impl Node {
     /// A node that has not started yet.
     pub fn new(env: &Arc<Env>, name: &'static str, wire: Wire) -> Fallible<Self> {
         let state = env.root.join(name);
+        // Made with the umask's mode, as a user makes it by hand to keep
+        // the daemon's log in it; the node narrows it at its first start.
         fs::create_dir_all(&state)?;
+        fs::create_dir_all(node_bin(&state))?;
         fs::write(
             state.join("harness.toml"),
             "[acp.fabric-fake-agent]\nstate_dir = \".fake-agent\"\n",
@@ -426,6 +502,22 @@ impl Node {
     /// Its state directory, the `FABRIC_HOME` its commands run with.
     pub fn state(&self) -> &Path {
         &self.state
+    }
+
+    /// Puts a fake `node` first on this node's `PATH`, reporting `version`
+    /// for `--version` and `abi` for `-p process.versions.modules`, as the
+    /// probes doctor and the carry keys run ask. It runs no JavaScript.
+    pub fn fake_node(&self, version: &str, abi: &str) -> Fallible {
+        write_executable(
+            &node_bin(&self.state).join("node"),
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = --version ]; then echo {version}; exit 0; fi\n\
+                 if [ \"$1\" = -p ]; then echo {abi}; exit 0; fi\n\
+                 exit 1\n"
+            )
+            .as_bytes(),
+        )
     }
 
     /// The address it listens on.
@@ -714,8 +806,9 @@ pub fn pair(a: &Node, b: &Node) -> Fallible {
 }
 
 /// The work a job holds after one turn: a staged file, an unstaged edit,
-/// an untracked file and an ignored precious file, each of which a move
-/// must carry exactly.
+/// an untracked file, an ignored precious file, a hand-made `node_modules`
+/// with no lockfile and a build output, each of which a move must carry
+/// exactly, and a `.env` it must never carry.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Work {
     /// `git status --porcelain=v1` in the root.
@@ -724,6 +817,10 @@ pub struct Work {
     pub readme: String,
     /// The ignored file that is nobody's cache.
     pub precious: String,
+    /// A file of the `node_modules` no lockfile describes.
+    pub deps: String,
+    /// A file of the ignored `dist/` beside `package.json`.
+    pub build: String,
 }
 
 /// Leaves work of every kind in the job's root.
@@ -735,6 +832,14 @@ pub fn edit(env: &Env, job: &str) -> Fallible<Work> {
     fs::write(work.join("notes.txt"), "untracked\n")?;
     fs::create_dir_all(work.join("scratch"))?;
     fs::write(work.join("scratch/plan.md"), "ignored but precious\n")?;
+    fs::create_dir_all(work.join("node_modules/leftpad"))?;
+    fs::write(
+        work.join("node_modules/leftpad/index.js"),
+        "module.exports = (s, n) => s.padStart(n);\n",
+    )?;
+    fs::create_dir_all(work.join("dist"))?;
+    fs::write(work.join("dist/out.js"), "console.log('built');\n")?;
+    fs::write(work.join(".env"), "TOKEN=never-moves\n")?;
     read_work(env, job)
 }
 
@@ -752,5 +857,7 @@ pub fn read_work(env: &Env, job: &str) -> Fallible<Work> {
         status: String::from_utf8(output.stdout)?,
         readme: fs::read_to_string(work.join("README.md"))?,
         precious: fs::read_to_string(work.join("scratch/plan.md"))?,
+        deps: fs::read_to_string(work.join("node_modules/leftpad/index.js"))?,
+        build: fs::read_to_string(work.join("dist/out.js"))?,
     })
 }

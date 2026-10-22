@@ -1,0 +1,15 @@
+{
+  "kind": "job_state",
+  "reason": {
+    "code": "harness_changed_during_move",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "checked": {
+      "kind": "codex"
+    },
+    "now": {
+      "kind": "claude_code"
+    },
+    "target": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba"
+  },
+  "message": "resumed under claude-code while the preflight checked codex, so nothing moved"
+}

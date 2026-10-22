@@ -28,4 +28,4 @@ pub mod frame;
 pub mod sentences;
 mod text;
 
-pub use client::{Client, ClientError, Launched, Resume};
+pub use client::{Client, ClientError, Launched, Resume, Started};

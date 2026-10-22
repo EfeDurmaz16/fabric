@@ -16,7 +16,6 @@
 )]
 use std::collections::BTreeMap;
 use std::fmt::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 
@@ -27,7 +26,9 @@ use fabric_harness::codex::Codex;
 use fabric_harness::manifest::StateManifest;
 
 mod common;
+mod executable;
 use common::{abs, fake_claude, project_key};
+use executable::write_executable;
 
 const SID: &str = "7a1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
 const THREAD: &str = "019f233e-bb33-7342-85fa-f2d33b14368a";
@@ -58,8 +59,7 @@ fn codex_node(home: &Path) -> Codex {
     let script = bin.join("codex");
     if !script.exists() {
         std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(&script, "#!/bin/sh\necho \"codex-cli 0.155.1\"\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&script, b"#!/bin/sh\necho \"codex-cli 0.155.1\"\n");
     }
     Codex::new(abs(home), bin.into_os_string())
 }

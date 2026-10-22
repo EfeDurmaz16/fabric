@@ -1,0 +1,13 @@
+{
+  "kind": "job_list",
+  "jobs": [
+    {
+      "job": "01JABCDEFGHJKMNPQRSTVWXYZ9",
+      "standing": "owner",
+      "epoch": 1,
+      "goal": "port the parser to the new grammar, keep the old error messages, and add a..."
+    }
+  ],
+  "closed": [],
+  "left_out": 4096
+}

@@ -14,10 +14,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use fabric_client::api::{
-    API_VERSION, Answer, Decision, DoctorReport, Event, Hello, HelloAnswer, JobCreated, JobStatus,
-    LedgerEvent, Marker, Op, Outcome, PreflightRow, Process, Reason, Refusal, RefusalKind,
-    Registered, Reply, Request, Roots, RunPlan, SessionRecorded, Standing, Step, SystemPath, View,
-    Wire, WorkspaceState,
+    API_VERSION, Answer, CaptureNote, CarryFor, CarryLine, Decision, DoctorReport, Event, Hello,
+    HelloAnswer, JobCreated, JobStatus, LedgerEvent, Marker, Op, Outcome, PreflightRow, Process,
+    Reason, Refusal, RefusalKind, Registered, Reply, Request, RunPlan, SessionRecorded,
+    SnapshotSession, Standing, Step, SystemPath, Verdict, VerdictCount, View, Wire, WorkspaceState,
 };
 use fabric_client::frame;
 use fabric_core::harness::HarnessKind;
@@ -91,18 +91,15 @@ fn the_hello_fixture_pins_the_api_version() {
 }
 
 /// The welcome a node sends lists every op of the api version, in order,
-/// then every root it applies. A new op or root is additive (ADR 0018,
-/// rule 2), and a fixture already on the base never changes within an api
-/// version, so the new list gets a welcome fixture of its own: one welcome
-/// fixture lists all of it, and every other lists part of it in the same
-/// order, as a node of an earlier release of the api did.
+/// then every optional request field and every root it applies. A new op,
+/// field or root is additive (ADR 0018, rule 2), and a fixture already on
+/// the base never changes within an api version, so the new list gets a
+/// welcome fixture of its own: one welcome fixture lists all of it, and
+/// every other lists part of it in the same order, as a node of an earlier
+/// release of the api did.
 #[test]
 fn the_welcome_fixtures_list_every_op_and_every_root() {
-    let names: Vec<&str> = Op::ALL
-        .iter()
-        .map(|op| op.name())
-        .chain(Roots::capabilities())
-        .collect();
+    let names = fabric_client::api::capabilities();
     let welcomes: Vec<Vec<String>> = round_trip::<HelloAnswer>("hello_answer")
         .unwrap()
         .into_iter()
@@ -217,6 +214,16 @@ fn event_variant(event: &Event) -> (Option<usize>, usize) {
             Event::LeftAsItWas { .. },
             Event::Frozen { .. },
             Event::WorkspaceGone { .. },
+            Event::SessionNeverStarted { .. },
+            Event::CaptureReport { .. },
+            Event::CarryDecided { .. },
+            Event::NoSessionCaptured { .. },
+            Event::CarriedByForce { .. },
+            Event::KnownWriterUnknown { .. },
+            Event::KnownWriterUnreadable { .. },
+            Event::AbortNotTold { .. },
+            Event::PeerNotAsked { .. },
+            Event::LiveWorkspaceGone { .. },
         ],
         Event::Unrecognized
     )
@@ -279,6 +286,13 @@ fn reason_variant(reason: &Reason) -> (Option<usize>, usize) {
             Reason::SyncedRoot { .. },
             Reason::BadRequest,
             Reason::Internal,
+            Reason::CarryRefused { .. },
+            Reason::SetupRunning { .. },
+            Reason::HarnessChangedDuringMove { .. },
+            Reason::HarnessChangedDuringPull { .. },
+            Reason::RootNotADirectory { .. },
+            Reason::PlanOvertaken { .. },
+            Reason::SessionMoved { .. },
         ],
         Reason::Unrecognized
     )
@@ -408,9 +422,36 @@ impl Seen {
             ]
         );
         self.tagged("RefusalKind", tag(&refusal.kind()), index);
-        if let Reason::Unfinished { step, .. } = refusal.reason() {
-            let index = variant!(step, [Step::Suspend, Step::Restore]);
-            self.tagged("Step", tag(step), index);
+        match refusal.reason() {
+            Reason::Unfinished { step, .. } => {
+                let index = variant!(step, [Step::Suspend, Step::Restore]);
+                self.tagged("Step", tag(step), index);
+            }
+            Reason::HarnessChangedDuringMove { checked, now, .. }
+            | Reason::HarnessChangedDuringPull { checked, now, .. } => {
+                self.harness(checked);
+                self.harness(now);
+            }
+            _ => {}
+        }
+    }
+
+    fn carry(&mut self, paths: &[CarryLine], more: &[VerdictCount]) {
+        let verdicts = paths
+            .iter()
+            .map(|line| line.verdict)
+            .chain(more.iter().map(|count| count.verdict));
+        for verdict in verdicts {
+            let index = variant!(
+                verdict,
+                [
+                    Verdict::Carry,
+                    Verdict::Rebuild,
+                    Verdict::Refuse,
+                    Verdict::Leave,
+                ]
+            );
+            self.tagged("Verdict", tag(&verdict), index);
         }
     }
 
@@ -447,7 +488,8 @@ impl Seen {
                 ..
             }
             | Request::HarnessStarted { harness, .. }
-            | Request::HarnessSession { harness, .. } => self.harness(harness),
+            | Request::HarnessSession { harness, .. }
+            | Request::LaunchCheck { harness, .. } => self.harness(harness),
             Request::JobDecide { decision, .. } => {
                 let index = variant!(decision, [Decision::Approve, Decision::Reject]);
                 self.tagged("Decision", tag(decision), index);
@@ -479,8 +521,11 @@ impl Seen {
                     [DoctorReport::Facts { .. }, DoctorReport::Compared { .. }]
                 );
                 self.tagged("DoctorReport", tag(report), index);
-                if let DoctorReport::Compared { rows, .. } = report {
+                if let DoctorReport::Compared { rows, carry, .. } = report {
                     self.rows(rows);
+                    if let Some(carry) = carry {
+                        self.carry(&carry.paths, &carry.more);
+                    }
                 }
             }
             Reply::JobNew(JobCreated { harness, .. })
@@ -537,10 +582,26 @@ impl Seen {
                 Process::NotRunning,
                 Process::Running { .. },
                 Process::GroupRemains { .. },
+                Process::Unconfirmed { .. },
                 Process::Unreadable { .. },
             ]
         );
         self.tagged("Process", tag(&status.process), index);
+        if let Some(session) = status
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.session.as_ref())
+        {
+            let index = variant!(
+                session,
+                [
+                    SnapshotSession::Captured,
+                    SnapshotSession::NotCaptured,
+                    SnapshotSession::Unreadable { .. },
+                ]
+            );
+            self.tagged("SnapshotSession", tag(session), index);
+        }
     }
 
     fn ledger(&mut self, event: &LedgerEvent) {
@@ -586,7 +647,53 @@ impl Seen {
             | Event::HolderNotTold { error, .. }
             | Event::OwnerNotTold { error, .. }
             | Event::NotCaughtUp { error, .. }
+            | Event::KnownWriterUnknown { error, .. }
+            | Event::AbortNotTold { error, .. }
             | Event::LeftAsItWas { error } => self.refusal(error),
+            Event::SessionNeverStarted { harness, kept, .. } => {
+                self.harness(harness);
+                if let Some(kept) = kept {
+                    self.harness(&kept.harness);
+                }
+            }
+            Event::CaptureReport { groups } => {
+                for group in groups {
+                    let index = variant!(
+                        group.note,
+                        [
+                            CaptureNote::Secret,
+                            CaptureNote::Excluded,
+                            CaptureNote::SecretHarness,
+                            CaptureNote::TrackedSecret,
+                            CaptureNote::StashedSecret,
+                            CaptureNote::Filtered,
+                            CaptureNote::Special,
+                            CaptureNote::SpecialHarness,
+                            CaptureNote::Unreadable,
+                            CaptureNote::NestedRepository,
+                            CaptureNote::NestedGit,
+                            CaptureNote::NestedGitHarness,
+                            CaptureNote::StrippedUserinfo,
+                            CaptureNote::DroppedConfig,
+                        ],
+                        CaptureNote::Unrecognized
+                    );
+                    self.mark("CaptureNote", index);
+                }
+            }
+            Event::CarryDecided {
+                context,
+                paths,
+                more,
+                ..
+            } => {
+                let index = variant!(
+                    context,
+                    [CarryFor::Move { .. }, CarryFor::Pull, CarryFor::Restore,]
+                );
+                self.tagged("CarryFor", tag(context), index);
+                self.carry(paths, more);
+            }
             _ => {}
         }
     }
@@ -618,10 +725,11 @@ fn seen() -> Fallible<Seen> {
 
 /// The enums whose set of variants is closed: a reader refuses a variant
 /// it does not know, so a new one breaks every reader of the api version
-/// (ADR 0018, Compatibility rule 3). Ops, event kinds, refusal reasons and
-/// ledger record kinds are open and are not here.
-const CLOSED: [(&str, &str); 14] = [
+/// (ADR 0018, Compatibility rule 3). Ops, event kinds, refusal reasons,
+/// ledger record kinds and capture notes are open and are not here.
+const CLOSED: [(&str, &str); 17] = [
     ("Answer", "answer"),
+    ("CarryFor", "carry_for"),
     ("Decision", "decision"),
     ("DoctorReport", "doctor_report"),
     ("Harness", "harness"),
@@ -630,8 +738,10 @@ const CLOSED: [(&str, &str); 14] = [
     ("Outcome", "outcome"),
     ("Process", "process"),
     ("RefusalKind", "refusal_kind"),
+    ("SnapshotSession", "snapshot_session"),
     ("Standing", "standing"),
     ("Step", "step"),
+    ("Verdict", "verdict"),
     ("View", "view"),
     ("Wire", "wire"),
     ("WorkspaceState", "workspace_state"),
@@ -758,6 +868,8 @@ fn every_variant_of_every_nested_enum_has_a_fixture() {
         names,
         [
             "Answer",
+            "CaptureNote",
+            "CarryFor",
             "Decision",
             "DoctorReport",
             "Harness",
@@ -767,8 +879,10 @@ fn every_variant_of_every_nested_enum_has_a_fixture() {
             "Outcome",
             "Process",
             "RefusalKind",
+            "SnapshotSession",
             "Standing",
             "Step",
+            "Verdict",
             "View",
             "Wire",
             "WorkspaceState",
@@ -842,18 +956,23 @@ fn objects(value: &Value, at: &str, into: &mut Vec<String>) {
 /// Whether the object at `pointer` in `message` is part of what a client
 /// launches, where a reader refuses a field it does not know (ADR 0018,
 /// Compatibility, rule 2): a run plan with all it holds, and a harness
-/// wherever it appears.
+/// wherever it appears, as `harness` or as the harness a refusal names.
 fn launched(message: &Value, pointer: &str) -> bool {
     let mut prefix = String::new();
     let mut in_plan = is_plan(message);
     for key in pointer.split('/').skip(1) {
-        if key == "harness" {
-            return true;
-        }
         prefix = format!("{prefix}/{key}");
         in_plan |= message.pointer(&prefix).is_some_and(is_plan);
     }
-    in_plan
+    in_plan || message.pointer(pointer).is_some_and(is_harness)
+}
+
+/// Whether `value` is a harness, by its kind.
+fn is_harness(value: &Value) -> bool {
+    matches!(
+        value.get("kind").and_then(Value::as_str),
+        Some("claude_code" | "codex" | "acp")
+    )
 }
 
 /// Whether `value` is a run plan, the reply to `job_run` or `job_resume`.

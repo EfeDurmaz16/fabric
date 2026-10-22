@@ -7,7 +7,14 @@
 //! the node printed before the client API existed. A program reads the
 //! event's fields instead; these words are for people.
 
-use crate::api::{Event, HarnessSession, Outcome, PreflightRow};
+use crate::api::{
+    CaptureGroup, CaptureNote, CarryFor, CarryLine, Event, HarnessSession, Outcome, PreflightRow,
+    RestoredClasses, Verdict, VerdictCount, Written,
+};
+
+/// What a snapshot without harness state means for the conversation (gate finding F9).
+pub const NO_SESSION: &str =
+    "no harness session captured; the conversation will not continue on the target";
 
 /// The lines an event reads as; none for a kind this client does not know.
 #[expect(
@@ -41,6 +48,16 @@ pub fn event(event: &Event) -> Vec<String> {
             files,
             bytes,
             new_objects,
+            git_bundle: true,
+        } => format!(
+            "snapshot {snapshot}: {files} ignored and harness files and a git bundle of the tracked and untracked work, {bytes} bytes, {new_objects} new objects"
+        ),
+        Event::SnapshotPublished {
+            snapshot,
+            files,
+            bytes,
+            new_objects,
+            git_bundle: false,
         } => format!(
             "snapshot {snapshot}: {files} files, {bytes} bytes, {new_objects} new objects"
         ),
@@ -130,7 +147,21 @@ pub fn event(event: &Event) -> Vec<String> {
             snapshot,
             files,
             bytes,
+            classes: None,
         } => format!("restored snapshot {snapshot}: {files} files, {bytes} bytes"),
+        Event::Restored {
+            snapshot,
+            files,
+            bytes,
+            classes: Some(classes),
+        } => format!(
+            "restored snapshot {snapshot}: {} ({})",
+            amount(Written {
+                files: *files,
+                bytes: *bytes
+            }),
+            restored_parts(classes)
+        ),
         Event::OrphanSetAside {
             root,
             left_at,
@@ -183,9 +214,173 @@ pub fn event(event: &Event) -> Vec<String> {
         Event::Frozen { peer, epoch } => {
             format!("frozen: {peer}'s ledger at epoch {epoch} does not continue this node's")
         }
+        Event::SessionNeverStarted {
+            harness,
+            session,
+            kept,
+        } => {
+            let kept = match kept {
+                Some(HarnessSession {
+                    harness: kept,
+                    session: before,
+                }) => format!("the snapshot keeps the {kept} session {before} it held before"),
+                None => "the snapshot carries no harness state and the next run starts a new session"
+                    .to_owned(),
+            };
+            format!(
+                "{harness} session {session} left no state on this node and no snapshot holds it, so it never started; {kept}"
+            )
+        }
+        Event::CaptureReport { groups } => return groups.iter().flat_map(capture_lines).collect(),
+        Event::CarryDecided {
+            context,
+            snapshot,
+            paths,
+            more,
+        } => {
+            let header = match context {
+                CarryFor::Move { target } => {
+                    format!("what {target} does with each ignored path of snapshot {snapshot}:")
+                }
+                CarryFor::Pull => format!(
+                    "what this node would do with each ignored path of snapshot {snapshot}:"
+                ),
+                CarryFor::Restore => {
+                    format!("what this node does with each ignored path of snapshot {snapshot}:")
+                }
+            };
+            let restore = matches!(context, CarryFor::Restore);
+            return std::iter::once(header)
+                .chain(carry_lines(paths, more, restore))
+                .collect();
+        }
+        Event::NoSessionCaptured { .. } => NO_SESSION.to_owned(),
+        Event::CarriedByForce { paths, more } => format!(
+            "--force: {} travels as it is, and the target writes it",
+            named(paths, *more)
+        ),
+        Event::KnownWriterUnknown { owner, error } => {
+            format!("{owner} did not say the job's known writer: {error}")
+        }
+        Event::KnownWriterUnreadable { owner, text, error } => format!(
+            "{owner} named {text} as the job's known writer, which is not a version: {error}"
+        ),
+        Event::AbortNotTold { holder, error } => format!(
+            "{holder} has not seen the abort yet ({error}); it will ask for the decision"
+        ),
+        Event::PeerNotAsked { peer } => format!(
+            "{peer} has no address here and no session open with this node, so a move or a steal there is not known here"
+        ),
+        Event::LiveWorkspaceGone { root } => format!(
+            "the workspace at {} is gone; restoring the latest snapshot, and work since it that no suspend captured is lost",
+            root.display()
+        ),
         Event::Unrecognized => return Vec::new(),
     };
     vec![line]
+}
+
+/// The lines of carry decisions: one per path, its verdict and path in
+/// columns and why after them, then one that counts the rest by verdict
+/// (ADR 0008). In a restore a refused path is written anyway, because it
+/// arrived through `--force`, or the job was already here, and leaving it
+/// out would lose it.
+pub fn carry_lines(paths: &[CarryLine], more: &[VerdictCount], restore: bool) -> Vec<String> {
+    let mut lines: Vec<String> = paths
+        .iter()
+        .map(|line| {
+            let mut text = format!("{:<7} {}  ({})", line.verdict.word(), line.path, line.why);
+            if restore && line.verdict == Verdict::Refuse {
+                text.push_str("; written anyway, since nothing here can make it again");
+            }
+            text
+        })
+        .collect();
+    if !more.is_empty() {
+        let total: u64 = more.iter().map(|count| count.paths).sum();
+        let counts: Vec<String> = more
+            .iter()
+            .map(|count| format!("{} {}", count.verdict.word(), count.paths))
+            .collect();
+        lines.push(format!("{total} more paths: {}", counts.join(", ")));
+    }
+    lines
+}
+
+/// `a, b and 3 more`: the paths a carry refusal names, then how many it does not.
+#[must_use]
+pub fn named(paths: &[String], more: u64) -> String {
+    let mut named = paths.join(", ");
+    if more > 0 {
+        named = format!("{named} and {more} more");
+    }
+    named
+}
+
+/// The lines of one group of a capture's report: one per item, then one
+/// that counts the rest; none for a note this client does not know.
+fn capture_lines(group: &CaptureGroup) -> Vec<String> {
+    let words = match group.note {
+        CaptureNote::Secret => "left behind (secret pattern)",
+        CaptureNote::Excluded => "left behind (.fabricignore)",
+        CaptureNote::SecretHarness => "left behind (secret pattern, harness state)",
+        CaptureNote::TrackedSecret => {
+            "travels in the snapshot though a secret pattern matches it (tracked)"
+        }
+        CaptureNote::StashedSecret => {
+            "travels in the snapshot though a secret pattern matches it (stashed)"
+        }
+        CaptureNote::Filtered => {
+            "travels as git's check-in output, not its own bytes (filter attribute)"
+        }
+        CaptureNote::Special => "left behind (not a file, link or directory)",
+        CaptureNote::SpecialHarness => "left behind (not a file, link or directory, harness state)",
+        CaptureNote::Unreadable => {
+            "left behind with everything under it (this user cannot read the directory)"
+        }
+        CaptureNote::NestedRepository => "left behind (nested repository)",
+        CaptureNote::NestedGit => "left behind (the .git of a nested repository)",
+        CaptureNote::NestedGitHarness => {
+            "left behind (the .git of a nested repository, harness state)"
+        }
+        CaptureNote::StrippedUserinfo => "travels without its user info (git config)",
+        CaptureNote::DroppedConfig => "left behind (git config)",
+        CaptureNote::Unrecognized => return Vec::new(),
+    };
+    let mut lines: Vec<String> = group
+        .items
+        .iter()
+        .map(|item| format!("{words}: {item}"))
+        .collect();
+    if group.more > 0 {
+        lines.push(format!("{words}: {} more", group.more));
+    }
+    lines
+}
+
+/// `3 files, 54 bytes`.
+fn amount(written: Written) -> String {
+    format!(
+        "{} {}, {} {}",
+        written.files,
+        if written.files == 1 { "file" } else { "files" },
+        written.bytes,
+        if written.bytes == 1 { "byte" } else { "bytes" }
+    )
+}
+
+/// What a restore wrote by class, as its line says it after the total.
+fn restored_parts(classes: &RestoredClasses) -> String {
+    let mut parts = Vec::new();
+    if classes.git {
+        parts.push(format!("tracked: {}", amount(classes.tracked)));
+        parts.push(format!("untracked: {}", amount(classes.untracked)));
+        parts.push(format!("ignored: {}", amount(classes.ignored)));
+    } else {
+        parts.push(format!("workspace: {}", amount(classes.ignored)));
+    }
+    parts.push(format!("harness state: {}", amount(classes.harness)));
+    parts.join("; ")
 }
 
 /// One preflight row, its outcome and fact in columns (ADR 0008).

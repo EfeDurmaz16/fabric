@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, JobId, NodeId};
 use fabric_core::session::SessionId;
+use fabric_core::version::HarnessVersion;
 use tokio::net::UnixStream;
 
 use crate::api::{
@@ -440,13 +441,35 @@ impl Client {
         }
     }
 
-    /// Tells the node the planned harness runs as `launch.pid`, continuing
-    /// or having created `session` when it is known, so the node records it
-    /// and appends `Resumed`.
+    /// Asks the node whether `plan` still holds: before any setup step,
+    /// under the tree lock, so a launch whose plan another launch, a
+    /// suspend or a peer's record overtook refuses before it writes to the
+    /// workspace.
+    pub async fn launch_check(
+        &self,
+        plan: &RunPlan,
+        on_event: impl FnMut(Event),
+    ) -> Result<(), ClientError> {
+        let request = Request::LaunchCheck {
+            job: plan.job,
+            epoch: plan.epoch,
+            head: plan.head,
+            harness: plan.harness.clone(),
+            session: plan.session.clone(),
+        };
+        match self.call(&request, on_event).await? {
+            Reply::LaunchCheck => Ok(()),
+            other => Err(unexpected(Op::LaunchCheck, &other)),
+        }
+    }
+
+    /// Tells the node the planned harness runs as `launch.pid`, with what
+    /// the launch knows of it in `started`, so the node records it and
+    /// appends `Resumed`.
     pub async fn harness_started(
         &self,
         launch: Launched,
-        session: Option<SessionId>,
+        started: Started,
         on_event: impl FnMut(Event),
     ) -> Result<Registered, ClientError> {
         let Launched {
@@ -455,12 +478,19 @@ impl Client {
             pid,
             harness,
         } = launch;
+        let Started {
+            session,
+            planned,
+            version,
+        } = started;
         let request = Request::HarnessStarted {
             job,
             epoch,
             pid,
             harness,
             session,
+            planned,
+            version,
         };
         match self.call(&request, on_event).await? {
             Reply::HarnessStarted(reply) => Ok(reply),
@@ -532,6 +562,19 @@ pub struct Launched {
     pub pid: std::num::NonZeroU32,
     /// The harness that runs.
     pub harness: HarnessKind,
+}
+
+/// What a launch knows of the harness it started, for [`Client::harness_started`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Started {
+    /// The session it continues or created, when known.
+    pub session: Option<SessionId>,
+    /// The session the plan continues; a new one when `None`. A node that
+    /// recorded another session since the plan refuses the launch.
+    pub planned: Option<SessionId>,
+    /// The version the launch asked of the harness, when it asked: the
+    /// newest known to have run the session.
+    pub version: Option<HarnessVersion>,
 }
 
 fn unexpected(op: Op, reply: &Reply) -> ClientError {

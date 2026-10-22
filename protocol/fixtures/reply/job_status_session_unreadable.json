@@ -1,0 +1,26 @@
+{
+  "kind": "job_status",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "node": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+  "goal": "fix the flaky test",
+  "harness": {
+    "kind": "codex"
+  },
+  "owner": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+  "epoch": 2,
+  "view": {
+    "kind": "owner"
+  },
+  "snapshot": {
+    "id": "abababababababababababababababababababababababababababababababab",
+    "suspended": true,
+    "session": {
+      "kind": "unreadable",
+      "error": "manifest abababab: not in the store"
+    }
+  },
+  "process": {
+    "kind": "not_running"
+  },
+  "records": 5
+}

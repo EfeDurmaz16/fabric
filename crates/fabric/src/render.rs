@@ -8,13 +8,21 @@
 //! printed before the client API existed.
 
 use fabric_client::api::{
-    DoctorReport, JobStatus, LedgerEvent, Marker, PreflightRow, Process, Registered, Reply,
-    SessionRecorded, View, WorkspaceState,
+    CarryReport, DoctorReport, Event, JobStatus, LedgerEvent, Marker, PreflightRow, Process,
+    Registered, Reply, SessionRecorded, SnapshotSession, View, WorkspaceState,
 };
-use fabric_client::sentences::row;
+use fabric_client::sentences::{NO_SESSION, carry_lines, named, row};
 
-/// The lines an event prints; none for a kind this CLI does not know.
-pub(crate) use fabric_client::sentences::event;
+/// The lines an event prints: none for a kind this CLI does not know, and
+/// none for the session a launch continues, which the CLI says itself once
+/// the harness has started, with the settings the launch carried from the
+/// session (gate finding F10).
+pub(crate) fn event(event: &Event) -> Vec<String> {
+    match event {
+        Event::ContinuingSession { .. } => Vec::new(),
+        _ => fabric_client::sentences::event(event),
+    }
+}
 
 /// The lines a reply prints; a run plan and a suspend's, move's or
 /// steal's lease print none, since their events said it all.
@@ -35,15 +43,21 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
                 paired.node
             ),
         }],
-        Reply::NodeList(list) if list.peers.is_empty() => {
+        Reply::NodeList(list) if list.peers.is_empty() && list.left_out == 0 => {
             vec![
                 "no paired nodes; pair one with `fabric node add <node-id> <host:port>`".to_owned(),
             ]
         }
-        Reply::NodeList(list) => list
-            .peers
-            .iter()
-            .map(|peer| {
+        Reply::NodeList(list) => (list.left_out > 0)
+            .then(|| {
+                format!(
+                    "the first {} paired nodes are left out; the other {} fill one answer",
+                    list.left_out,
+                    list.peers.len()
+                )
+            })
+            .into_iter()
+            .chain(list.peers.iter().map(|peer| {
                 format!(
                     "{} {} ({})",
                     peer.node,
@@ -58,7 +72,7 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
                         "not connected"
                     }
                 )
-            })
+            }))
             .collect(),
         Reply::NodePing(pong) => vec![format!(
             "{} answered in {} ms over {}; its clock is {} ms from this one",
@@ -76,18 +90,26 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
                 created.harness, created.epoch
             ),
         ],
-        Reply::JobList(list) if list.jobs.is_empty() && list.closed.is_empty() => {
+        Reply::JobList(list)
+            if list.jobs.is_empty() && list.closed.is_empty() && list.left_out == 0 =>
+        {
             vec!["no jobs; make one with `fabric job new --repo <path> --goal <text>`".to_owned()]
         }
-        Reply::JobList(list) => list
-            .jobs
-            .iter()
-            .map(|job| {
+        Reply::JobList(list) => (list.left_out > 0)
+            .then(|| {
+                format!(
+                    "the {} oldest jobs are left out; the latest {} fill one answer, and `fabric job status <job>` shows any job",
+                    list.left_out,
+                    list.jobs.len() + list.closed.len()
+                )
+            })
+            .into_iter()
+            .chain(list.jobs.iter().map(|job| {
                 format!(
                     "{} {} epoch {} {}",
                     job.job, job.standing, job.epoch, job.goal
                 )
-            })
+            }))
             .chain(
                 list.closed
                     .iter()
@@ -123,8 +145,12 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
             .map(|fact| format!("{}: {}", fact.name, fact.value.replace('\n', " / ")))
             .collect(),
         Reply::Doctor {
-            report: DoctorReport::Compared { rows, .. },
-        } => rows.iter().map(row).collect(),
+            report: DoctorReport::Compared { peer, rows, carry },
+        } => rows
+            .iter()
+            .map(row)
+            .chain(carry.iter().flat_map(|carry| carry_report(*peer, carry)))
+            .collect(),
         Reply::HarnessStarted(registered) => vec![self::registered(registered)],
         Reply::HarnessSession(recorded) => vec![session_recorded(recorded)],
         Reply::JobRun(_)
@@ -132,7 +158,8 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
         | Reply::JobSuspend(_)
         | Reply::JobMove(_)
         | Reply::JobSteal(_)
-        | Reply::HarnessExited => Vec::new(),
+        | Reply::HarnessExited
+        | Reply::LaunchCheck => Vec::new(),
     }
 }
 
@@ -149,8 +176,47 @@ pub(crate) fn session_recorded(recorded: &SessionRecorded) -> String {
     format!("recorded {} session {}", recorded.harness, recorded.session)
 }
 
+/// What `peer` would do with each ignored path of a job's latest snapshot.
+fn carry_report(peer: fabric_core::id::NodeId, carry: &CarryReport) -> Vec<String> {
+    let Some(snapshot) = carry.snapshot else {
+        return vec![
+            "no snapshot yet; a move decides each ignored path once it has suspended the job"
+                .to_owned(),
+        ];
+    };
+    let header = format!(
+        "what {peer} would do with each ignored path of snapshot {snapshot}; a move decides again on the snapshot it takes:"
+    );
+    let mut lines: Vec<String> = std::iter::once(header)
+        .chain(carry_lines(&carry.paths, &carry.more, false))
+        .collect();
+    if !carry.session_captured {
+        lines.push(NO_SESSION.to_owned());
+    }
+    lines
+}
+
+/// Why `doctor --peer` fails as a preflight would: the rows that stop a
+/// move made without `--force`, else the paths the peer can neither use
+/// nor make again; `None` when a move would go ahead.
+pub(crate) fn refused_move(rows: &[PreflightRow], carry: Option<&CarryReport>) -> Option<String> {
+    let blocking = blocking(rows);
+    let what = if blocking.is_empty() {
+        let carry = carry.filter(|carry| !carry.refused.is_empty())?;
+        format!(
+            "the target can neither use nor rebuild {}",
+            named(&carry.refused, carry.refused_more)
+        )
+    } else {
+        blocking.join(", ")
+    };
+    Some(format!(
+        "the preflight refused the move: {what}; `fabric job move` and `fabric job resume` take --force to waive what can be waived"
+    ))
+}
+
 /// The facts of the rows that stop a move made without `--force`.
-pub(crate) fn blocking(rows: &[PreflightRow]) -> Vec<&str> {
+fn blocking(rows: &[PreflightRow]) -> Vec<&str> {
     rows.iter()
         .filter(|row| row.outcome.blocks(false))
         .map(|row| row.fact.as_str())
@@ -214,6 +280,18 @@ fn job_status(status: &JobStatus) -> Vec<String> {
         }
         Some(snapshot) => format!("snapshot: {} (resumed since)", snapshot.id),
     });
+    if let Some(snapshot) = &status.snapshot
+        && let Some(session) = &snapshot.session
+    {
+        let id = snapshot.id;
+        lines.push(match session {
+            SnapshotSession::Captured => format!("session: captured in snapshot {id}"),
+            SnapshotSession::NotCaptured => format!("session: {NO_SESSION}"),
+            SnapshotSession::Unreadable { error } => {
+                format!("session: snapshot {id} could not be read: {error}")
+            }
+        });
+    }
     if status.workspace_unreadable.is_some() {
         return lines;
     }
@@ -247,6 +325,9 @@ fn job_status(status: &JobStatus) -> Vec<String> {
         }
         Process::GroupRemains { pid } => format!(
             "harness: pid {pid} exited and processes it started still run in its group; `fabric job suspend {id}` stops them"
+        ),
+        Process::Unconfirmed { pid } => format!(
+            "harness: pid {pid} leads a process group and its start time could not be read, so whether it is still the harness is not known"
         ),
         Process::NotRunning => "harness: not running".to_owned(),
     });

@@ -1,0 +1,15 @@
+{
+  "kind": "carry_decided",
+  "context": {
+    "kind": "restore"
+  },
+  "snapshot": "abababababababababababababababababababababababababababababababab",
+  "paths": [
+    {
+      "path": "data",
+      "verdict": "carry",
+      "why": "nothing on the target can make it again, so it travels as it is"
+    }
+  ],
+  "more": []
+}

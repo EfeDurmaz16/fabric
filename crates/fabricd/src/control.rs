@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fabric_client::api::{
-    API_VERSION, Answer, Event, Hello, HelloAnswer, Op, Reason, Refusal, Request, Roots, Welcome,
+    API_VERSION, Answer, Event, Hello, HelloAnswer, Reason, Refusal, Request, Welcome,
 };
 use fabric_client::frame::{self, FrameError};
 use tokio::net::UnixStream;
@@ -76,10 +76,8 @@ pub(crate) async fn serve(node: Arc<Node>, mut stream: UnixStream) {
         api: API_VERSION,
         node: node.id(),
         node_version: node.version.as_str().to_owned(),
-        capabilities: Op::ALL
-            .iter()
-            .map(|op| op.name())
-            .chain(Roots::capabilities())
+        capabilities: fabric_client::api::capabilities()
+            .into_iter()
             .map(str::to_owned)
             .collect(),
     });
@@ -176,6 +174,15 @@ fn lossy(reason: Reason) -> Reason {
             left_at,
         },
         Reason::WorkspaceOccupied { root } => Reason::WorkspaceOccupied { root: shown(root) },
+        Reason::SetupRunning { job, root, lock } => Reason::SetupRunning {
+            job,
+            root: shown(root),
+            lock: shown(lock),
+        },
+        Reason::RootNotADirectory { job, root } => Reason::RootNotADirectory {
+            job,
+            root: shown(root),
+        },
         Reason::SyncedRoot { root, folder } => Reason::SyncedRoot {
             root: shown(root),
             folder: shown(folder),
@@ -192,11 +199,16 @@ fn lossy(reason: Reason) -> Reason {
         | Reason::Unreachable { .. }
         | Reason::UnknownPeer { .. }
         | Reason::Preflight { .. }
+        | Reason::CarryRefused { .. }
         | Reason::StealNeedsForce { .. }
         | Reason::HarnessRunning { .. }
         | Reason::HarnessGone { .. }
         | Reason::HarnessNotRecorded { .. }
         | Reason::RanDuringMove { .. }
+        | Reason::HarnessChangedDuringMove { .. }
+        | Reason::HarnessChangedDuringPull { .. }
+        | Reason::PlanOvertaken { .. }
+        | Reason::SessionMoved { .. }
         | Reason::NoWorkspace { .. }
         | Reason::Unfinished { .. }
         | Reason::NoSnapshot { .. }

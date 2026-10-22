@@ -1,0 +1,35 @@
+{
+  "kind": "job_status",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "node": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+  "goal": "fix the flaky test",
+  "harness": {
+    "kind": "codex"
+  },
+  "owner": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+  "epoch": 2,
+  "view": {
+    "kind": "owner"
+  },
+  "snapshot": {
+    "id": "abababababababababababababababababababababababababababababababab",
+    "suspended": true,
+    "session": {
+      "kind": "not_captured"
+    }
+  },
+  "workspace": {
+    "root": "/Users/me/fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/work",
+    "state": {
+      "kind": "current",
+      "marker": {
+        "kind": "clean",
+        "snapshot": "abababababababababababababababababababababababababababababababab"
+      }
+    }
+  },
+  "process": {
+    "kind": "not_running"
+  },
+  "records": 5
+}

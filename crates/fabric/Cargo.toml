@@ -38,6 +38,8 @@ fabric = { path = ".", features = ["faults", "fixtures"] }
 # controlling terminal; rustix is already a dependency of this package.
 rustix = { version = "1.1", features = ["fs", "process", "pty", "termios"] }
 tempfile = "3.27"
+# The signal test runs a control socket that never answers, under a deadline.
+tokio = { version = "1.54", features = ["net", "time"] }
 
 # The fake ACP agent of fabric-harness's own tests, built here under its own
 # name so the end-to-end test can launch it as a harness.

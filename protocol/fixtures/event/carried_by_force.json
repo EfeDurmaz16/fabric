@@ -1,0 +1,8 @@
+{
+  "kind": "carried_by_force",
+  "paths": [
+    "node_modules",
+    "packages/a/node_modules"
+  ],
+  "more": 3
+}

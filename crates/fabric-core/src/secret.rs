@@ -274,11 +274,21 @@ impl SecretPolicy {
     /// would put the `I` version in `W` and restore would revert the user's
     /// edit or bring back a file the user deleted; it waits for consent
     /// instead. Every other path is staged.
+    ///
+    /// `scope` says where each path lies, as it does for an ignored path:
+    /// `Scope::Cache` under a cache path that detection found
+    /// (`CachePath::secret_scope` in `fabric-env`), `Scope::Work` anywhere
+    /// else. A cache git does not ignore is still a cache, and the full list
+    /// would leave holes in it that nothing reports as missing.
     #[must_use]
-    pub fn staging(&self, changes: impl IntoIterator<Item = (RelPath, Tracking)>) -> Staging {
+    pub fn staging(
+        &self,
+        changes: impl IntoIterator<Item = (RelPath, Tracking)>,
+        scope: impl Fn(&RelPath) -> Scope,
+    ) -> Staging {
         let mut staging = Staging::default();
         for (path, tracking) in changes {
-            match (self.denies(&path, Scope::Work), tracking) {
+            match (self.denies(&path, scope(&path)), tracking) {
                 (None, _) => staging.stage.push(path),
                 (Some(pattern), Tracking::Untracked) => staging.left_out.push(Denied {
                     pattern: pattern.to_owned(),
@@ -476,6 +486,52 @@ mod tests {
 
     fn path(text: &str) -> RelPath {
         RelPath::parse(text).unwrap()
+    }
+
+    /// A changed path under a cache that detection found gets the narrowed
+    /// list, as an ignored one does, so a dependency's fixture key stages
+    /// whether git tracks it or not. The exact names still deny there, and
+    /// the same kind of file outside the cache is left out.
+    #[test]
+    fn staging_applies_the_scope_the_caller_gives_each_path() {
+        let cache = path("node_modules");
+        let staged = SecretPolicy::default()
+            .staging(
+                [
+                    (path("node_modules/pkg/fixture.pem"), Tracking::Untracked),
+                    (path("node_modules/pkg/test/key.pem"), Tracking::Tracked),
+                    (path("node_modules/pkg/.env"), Tracking::Untracked),
+                    (path("certs/server.pem"), Tracking::Untracked),
+                ],
+                |p| {
+                    if p.starts_with(&cache) {
+                        Scope::Cache
+                    } else {
+                        Scope::Work
+                    }
+                },
+            )
+            .paths(TrackedSecrets::Refuse)
+            .unwrap();
+        assert_eq!(
+            staged.stage,
+            Stage::Paths {
+                first: path("node_modules/pkg/fixture.pem"),
+                rest: vec![path("node_modules/pkg/test/key.pem")],
+            }
+        );
+        let left_out: Vec<(&str, &str)> = staged
+            .left_out
+            .iter()
+            .map(|d| (d.path.as_str(), d.pattern.as_str()))
+            .collect();
+        assert_eq!(
+            left_out,
+            [
+                ("node_modules/pkg/.env", ".env"),
+                ("certs/server.pem", "*.pem")
+            ]
+        );
     }
 
     /// One sample per built-in pattern, each first matched by that pattern

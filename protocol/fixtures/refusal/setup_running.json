@@ -1,0 +1,10 @@
+{
+  "kind": "job_state",
+  "reason": {
+    "code": "setup_running",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "root": "/Users/me/fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/work",
+    "lock": "/Users/me/.fabric/locks/2f5d.lock"
+  },
+  "message": "nothing was captured, since a process holds the tree lock"
+}

@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{EnvSpecId, Epoch, EventId, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::session::SessionId;
+use fabric_core::version::HarnessVersion;
 use serde::{Deserialize, Serialize};
 
 use crate::text;
@@ -120,11 +121,13 @@ pub enum Op {
     HarnessSession,
     /// [`Request::HarnessExited`].
     HarnessExited,
+    /// [`Request::LaunchCheck`].
+    LaunchCheck,
 }
 
 impl Op {
     /// Every op of this api version.
-    pub const ALL: [Op; 18] = [
+    pub const ALL: [Op; 19] = [
         Op::NodeId,
         Op::NodeAdd,
         Op::NodeList,
@@ -143,6 +146,7 @@ impl Op {
         Op::HarnessStarted,
         Op::HarnessSession,
         Op::HarnessExited,
+        Op::LaunchCheck,
     ];
 
     /// The op's name on the wire: the request's `op` and the reply's `kind`.
@@ -167,6 +171,7 @@ impl Op {
             Op::HarnessStarted => "harness_started",
             Op::HarnessSession => "harness_session",
             Op::HarnessExited => "harness_exited",
+            Op::LaunchCheck => "launch_check",
         }
     }
 }
@@ -214,6 +219,15 @@ where
     Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
 }
 
+/// Whether a count is zero, for a count written only when it is not.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's `skip_serializing_if` passes the field by reference"
+)]
+fn is_zero(count: &u64) -> bool {
+    *count == 0
+}
+
 /// A harness kind in the client API's form, for an optional field.
 mod harness_option {
     use fabric_core::harness::HarnessKind;
@@ -240,6 +254,22 @@ mod harness_option {
         d: D,
     ) -> Result<Option<HarnessKind>, D::Error> {
         Ok(Option::<Wire>::deserialize(d)?.map(|wire| wire.0))
+    }
+}
+
+/// A harness in a refusal reason, boxed so the reason stays small.
+mod boxed_harness {
+    use fabric_core::harness::HarnessKind;
+    use serde::{Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(kind: &HarnessKind, s: S) -> Result<S::Ok, S::Error> {
+        super::HarnessDef::serialize(kind, s)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Box<HarnessKind>, D::Error> {
+        Ok(Box::new(super::HarnessDef::deserialize(d)?))
     }
 }
 
@@ -477,6 +507,19 @@ pub enum Request {
         /// The session it continues or created, when known.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<SessionId>,
+        /// The session the plan continues; a new one when absent. A
+        /// headless turn of an earlier launch can name its session while
+        /// this launch runs its setup steps, and the node then refuses this
+        /// one. Sent only to a node that lists `harness_started.planned`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        planned: Option<SessionId>,
+        /// The version the launch asked of the harness it started, in the
+        /// workspace and environment it started it in, when it asked: the
+        /// newest known to have run that session, which a later resume of
+        /// it must not go below. Sent only to a node that lists
+        /// `harness_started.version`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<HarnessVersion>,
     },
     /// The harness named the session it runs after it started, as `codex exec` does.
     HarnessSession {
@@ -501,9 +544,45 @@ pub enum Request {
         /// The process that exited.
         pid: NonZeroU32,
     },
+    /// Whether a launch plan still holds, asked before any setup step
+    /// under the tree lock, so a launch whose plan another launch overtook
+    /// refuses before it writes to the workspace.
+    LaunchCheck {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The epoch the plan was made under.
+        epoch: Epoch,
+        /// The ledger head the plan was made at.
+        #[serde(with = "text")]
+        head: RecordHash,
+        /// The harness the plan launches.
+        #[serde(with = "launchable")]
+        harness: HarnessKind,
+        /// The session the plan continues; a new one when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<SessionId>,
+    },
+}
+
+/// Every capability a node of this api version lists in its welcome, in
+/// order: its ops, then the optional request fields it applies
+/// ([`Request::FIELDS`]), then the roots of a client's environment.
+#[must_use]
+pub fn capabilities() -> Vec<&'static str> {
+    Op::ALL
+        .iter()
+        .map(|op| op.name())
+        .chain(Request::FIELDS)
+        .chain(Roots::capabilities())
+        .collect()
 }
 
 impl Request {
+    /// The optional fields of requests a node lists as `<op>.<field>` once
+    /// it applies them; a node that does not know one ignores it.
+    pub const FIELDS: [&'static str; 2] = ["harness_started.planned", "harness_started.version"];
+
     /// The capabilities, beyond its op, a node must list for this request
     /// to mean what it says: with an environment, one for every root this
     /// client knows, set or not. A root the client sets must reach the
@@ -514,11 +593,22 @@ impl Request {
     /// (review findings on PR #13).
     #[must_use]
     pub fn needs(&self) -> Vec<&'static str> {
+        let mut needs = Vec::new();
         if self.env().is_some() {
-            Roots::capabilities().to_vec()
-        } else {
-            Vec::new()
+            needs.extend(Roots::capabilities());
         }
+        if let Request::HarnessStarted {
+            planned, version, ..
+        } = self
+        {
+            if planned.is_some() {
+                needs.push(Self::FIELDS[0]);
+            }
+            if version.is_some() {
+                needs.push(Self::FIELDS[1]);
+            }
+        }
+        needs
     }
 
     /// The caller's environment, when the request carries one.
@@ -542,7 +632,8 @@ impl Request {
             | Request::JobDecide { .. }
             | Request::HarnessStarted { .. }
             | Request::HarnessSession { .. }
-            | Request::HarnessExited { .. } => None,
+            | Request::HarnessExited { .. }
+            | Request::LaunchCheck { .. } => None,
         }
     }
 
@@ -568,6 +659,7 @@ impl Request {
             Request::HarnessStarted { .. } => Op::HarnessStarted,
             Request::HarnessSession { .. } => Op::HarnessSession,
             Request::HarnessExited { .. } => Op::HarnessExited,
+            Request::LaunchCheck { .. } => Op::LaunchCheck,
         }
     }
 }
@@ -923,6 +1015,8 @@ pub enum Reply {
     HarnessSession(SessionRecorded),
     /// For [`Request::HarnessExited`].
     HarnessExited,
+    /// For [`Request::LaunchCheck`]: the plan still holds.
+    LaunchCheck,
 }
 
 impl Reply {
@@ -948,6 +1042,7 @@ impl Reply {
             Reply::HarnessStarted(_) => Op::HarnessStarted,
             Reply::HarnessSession(_) => Op::HarnessSession,
             Reply::HarnessExited => Op::HarnessExited,
+            Reply::LaunchCheck => Op::LaunchCheck,
         }
     }
 }
@@ -976,8 +1071,16 @@ pub struct Paired {
 /// The paired peers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerList {
-    /// One entry per peer, in the peer book's order.
+    /// One entry per peer, in the peer book's order, the last ones when all
+    /// of them would not fit in one answer.
     pub peers: Vec<Peer>,
+    /// How many of the first peers are left out; absent when none is.
+    #[serde(
+        default,
+        skip_serializing_if = "is_zero",
+        deserialize_with = "null_as_default"
+    )]
+    pub left_out: u64,
 }
 
 /// One paired peer.
@@ -1049,6 +1152,15 @@ pub struct JobList {
     pub jobs: Vec<JobSummary>,
     /// The jobs whose ledgers did not open, which the node leaves closed.
     pub closed: Vec<ClosedJob>,
+    /// How many of the oldest jobs are left out so the rest fit in one
+    /// answer, the closed ones listed after the others; absent when none
+    /// is. `job_status` answers for any job.
+    #[serde(
+        default,
+        skip_serializing_if = "is_zero",
+        deserialize_with = "null_as_default"
+    )]
+    pub left_out: u64,
 }
 
 /// One job in a list.
@@ -1061,7 +1173,8 @@ pub struct JobSummary {
     pub standing: Standing,
     /// The job's epoch.
     pub epoch: Epoch,
-    /// The goal.
+    /// The goal's first line, cut to 72 characters with `...` after a cut,
+    /// and with ` ...` when more lines follow; `job_status` has the whole goal.
     pub goal: String,
 }
 
@@ -1191,13 +1304,31 @@ pub enum View {
 }
 
 /// The latest published snapshot of a job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotState {
     /// The snapshot.
     #[serde(with = "text")]
     pub id: SnapshotId,
     /// Whether the job is suspended in it, or was resumed since.
     pub suspended: bool,
+    /// Whether it carries a harness session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SnapshotSession>,
+}
+
+/// Whether a snapshot carries a harness session (gate finding F9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SnapshotSession {
+    /// It holds the state of a harness session, which a resume continues.
+    Captured,
+    /// It holds none, so the conversation does not continue on another node.
+    NotCaptured,
+    /// The node could not read the snapshot's manifest.
+    Unreadable {
+        /// Why, in the node's words.
+        error: String,
+    },
 }
 
 /// The workspace a node holds for a job.
@@ -1272,6 +1403,12 @@ pub enum Process {
     },
     /// The harness exited and processes it started still run in its group.
     GroupRemains {
+        /// The group, named by the harness's pid.
+        pid: NonZeroU32,
+    },
+    /// A process leads the recorded harness's group, and its start time
+    /// could not be read, so whether it is still the harness is not known.
+    Unconfirmed {
         /// The group, named by the harness's pid.
         pid: NonZeroU32,
     },
@@ -1428,6 +1565,10 @@ pub struct RunPlan {
     pub job: JobId,
     /// The epoch the node owns the job at; the launch is fenced on it.
     pub epoch: Epoch,
+    /// The ledger head the plan was made at; a launch sends it back in
+    /// `launch_check`, which refuses once the job moved past it.
+    #[serde(with = "text")]
+    pub head: RecordHash,
     /// The workspace root.
     pub root: PathBuf,
     /// The harness to launch.
@@ -1436,12 +1577,21 @@ pub struct RunPlan {
     /// The session to continue; a new one when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionId>,
+    /// The newest harness version known to have written that session,
+    /// which the launch's resume guard refuses to go below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_writer: Option<HarnessVersion>,
     /// The job's goal, the first message of a new session.
     pub goal: String,
-    /// The node's harness configuration, which the launch must use, so a
-    /// harness runs under the settings the node captures and restores it with.
+    /// The node's harness configuration for the plan's harness, which the
+    /// launch must use, so a harness runs under the settings the node
+    /// captures and restores it with.
     #[serde(default, deserialize_with = "null_as_default")]
     pub harness_config: HarnessConfig,
+    /// The home the node captures and restores harness state under; a
+    /// launch under another home would keep the session where the node
+    /// never looks, so a client launches only under this one.
+    pub home: PathBuf,
 }
 
 /// A node's harness configuration, from its `harness.toml` (ADR 0016).
@@ -1502,7 +1652,177 @@ pub enum DoctorReport {
         peer: NodeId,
         /// The rows.
         rows: Vec<PreflightRow>,
+        /// What the peer would do with each ignored path of the named
+        /// job's latest snapshot; absent when no job was named.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        carry: Option<CarryReport>,
     },
+}
+
+/// What a peer would do with each ignored path of a job's latest
+/// snapshot, as `doctor` reports it before a move (ADR 0012). A move
+/// decides again on the snapshot it takes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CarryReport {
+    /// The snapshot decided on; absent when the job has none yet, and a
+    /// move decides each path once it has suspended the job.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "text::option"
+    )]
+    pub snapshot: Option<SnapshotId>,
+    /// The first paths, each with what the peer would do with it.
+    pub paths: Vec<CarryLine>,
+    /// The paths after those, counted by verdict.
+    pub more: Vec<VerdictCount>,
+    /// The first paths the peer can neither use nor make again, which stop
+    /// a move unless it is forced.
+    pub refused: Vec<String>,
+    /// How many refused paths there are after those.
+    pub refused_more: u64,
+    /// Whether the snapshot carries a harness session; without one the
+    /// conversation does not continue on the peer.
+    pub session_captured: bool,
+}
+
+/// One ignored path of a snapshot and what a target does with it (ADR 0012).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CarryLine {
+    /// The path, relative to the root.
+    pub path: String,
+    /// What the target does with it.
+    pub verdict: Verdict,
+    /// Why, in the node's words.
+    pub why: String,
+}
+
+/// What a target does with one ignored path of a snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// It writes the bytes.
+    Carry,
+    /// It leaves the bytes out, and setup steps or the next build make the path again.
+    Rebuild,
+    /// It can neither use the bytes nor make the path again: a move stops
+    /// unless forced, and a forced one, or a restore that meets it without
+    /// a move, writes the bytes, since leaving them out would lose them.
+    Refuse,
+    /// The bytes do not reach its workspace.
+    Leave,
+}
+
+impl Verdict {
+    /// The word a carry line starts with.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Verdict::Carry => "carry",
+            Verdict::Rebuild => "rebuild",
+            Verdict::Refuse => "refuse",
+            Verdict::Leave => "leave",
+        }
+    }
+}
+
+/// How many paths after the first ones got one verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerdictCount {
+    /// The verdict.
+    pub verdict: Verdict,
+    /// How many paths got it.
+    pub paths: u64,
+}
+
+/// Which decision a carry event reports: who decides, and what follows from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CarryFor {
+    /// A move this node pushes, decided with the target's facts before `MoveStarted`.
+    Move {
+        /// The target.
+        #[serde(with = "text")]
+        target: NodeId,
+    },
+    /// A pull this node stopped before it imported, decided with its own facts.
+    Pull,
+    /// A restore on this node, which writes a refused path anyway, since
+    /// nothing here can make it again.
+    Restore,
+}
+
+/// A group of paths or config keys a capture treated apart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureGroup {
+    /// What the capture did with them.
+    pub note: CaptureNote,
+    /// The first of them.
+    pub items: Vec<String>,
+    /// How many more there are.
+    pub more: u64,
+}
+
+/// What a capture did with a path or a config key it names in its report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureNote {
+    /// A workspace path a secret pattern matches, left behind.
+    Secret,
+    /// A workspace path `.fabricignore` names, left behind.
+    Excluded,
+    /// A harness state path a secret pattern matches, left behind.
+    SecretHarness,
+    /// A tracked path a secret pattern matches, which travels in the git bundle.
+    TrackedSecret,
+    /// A stashed path a secret pattern matches, which travels in the git bundle.
+    StashedSecret,
+    /// A path under a git `filter` attribute, which travels as git's check-in output.
+    Filtered,
+    /// A FIFO, socket or device in the workspace, left behind.
+    Special,
+    /// A FIFO, socket or device in the harness state, left behind.
+    SpecialHarness,
+    /// A directory this user cannot read, left behind with everything under it.
+    Unreadable,
+    /// A nested repository in a repository, left behind whole.
+    NestedRepository,
+    /// The `.git` of a nested repository in a plain directory, left behind.
+    NestedGit,
+    /// The `.git` of a nested repository in the harness state, left behind.
+    NestedGitHarness,
+    /// A git config key whose remote URL lost its user info.
+    StrippedUserinfo,
+    /// A git config key left behind.
+    DroppedConfig,
+    /// A note this client does not know; a newer node sent it.
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// What a restore wrote, by class (gate finding F8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoredClasses {
+    /// Whether the snapshot holds a git bundle; without one, `ignored`
+    /// counts every file of the workspace.
+    pub git: bool,
+    /// Working-tree files the index holds.
+    pub tracked: Written,
+    /// Working-tree files the index does not hold.
+    pub untracked: Written,
+    /// Ignored files: precious files and the caches the target writes.
+    pub ignored: Written,
+    /// Harness state files.
+    pub harness: Written,
+}
+
+/// Files and bytes written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Written {
+    /// Regular files and symlinks.
+    pub files: u64,
+    /// The bytes of the regular files among them.
+    pub bytes: u64,
 }
 
 /// One fact a node measured.
@@ -1679,8 +1999,15 @@ pub enum Event {
         bytes: u64,
         /// Objects the store did not hold before.
         new_objects: u64,
+        /// Whether the snapshot holds a git bundle of the tracked and
+        /// untracked work, so `files` counts only the ignored and harness
+        /// files beside it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        git_bundle: bool,
     },
     /// A file matched a secret pattern and was left out of the snapshot.
+    /// This node names such files in `capture_report`, beside the rest of
+    /// what a capture treats apart; a reader still reads this kind.
     LeftBehind {
         /// Its path in the workspace.
         path: String,
@@ -1870,11 +2197,15 @@ pub enum Event {
         recorded: Option<PathBuf>,
     },
     /// A cache's bytes are written here: its key matches this node's.
+    /// This node says what a restore does with each ignored path in
+    /// `carry_decided`; a reader still reads this kind.
     CacheCarried {
         /// The cache's path in the workspace.
         path: String,
     },
-    /// A cache is rebuilt here instead of carried.
+    /// A cache is rebuilt here instead of carried. This node says what a
+    /// restore does with each ignored path in `carry_decided`; a reader
+    /// still reads this kind.
     CacheRebuilt {
         /// The cache's path in the workspace.
         path: String,
@@ -1890,6 +2221,9 @@ pub enum Event {
         files: u64,
         /// Bytes written.
         bytes: u64,
+        /// The same, by class.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        classes: Option<RestoredClasses>,
     },
     /// A workspace an earlier tenure left was moved aside before a restore.
     OrphanSetAside {
@@ -1931,7 +2265,8 @@ pub enum Event {
         /// Why.
         error: Refusal,
     },
-    /// The launch continues this session.
+    /// The launch continues this session. The CLI says so once the harness
+    /// has started, with the settings the launch carried.
     ContinuingSession {
         /// The harness.
         #[serde(with = "HarnessDef")]
@@ -1976,6 +2311,98 @@ pub enum Event {
         peer: NodeId,
         /// The highest epoch in the peer's ledger.
         epoch: Epoch,
+    },
+    /// A harness session a launch recorded left no state on this node and
+    /// no snapshot holds it, so it never started; the capture goes on
+    /// without it.
+    SessionNeverStarted {
+        /// The harness.
+        #[serde(with = "HarnessDef")]
+        harness: HarnessKind,
+        /// The session.
+        session: SessionId,
+        /// The session the snapshot keeps instead, which it held before;
+        /// absent when it carries no harness state and the next run starts
+        /// a new session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kept: Option<HarnessSession>,
+    },
+    /// What a capture treated apart: paths it left behind and paths or
+    /// config keys that travel otherwise than as their own bytes, the first
+    /// of each group named and the rest counted.
+    CaptureReport {
+        /// One group per note, in the order a suspend prints them.
+        groups: Vec<CaptureGroup>,
+    },
+    /// What a target does with each ignored path of a snapshot (ADR 0012).
+    CarryDecided {
+        /// Who decides, and what follows from it.
+        context: CarryFor,
+        /// The snapshot.
+        #[serde(with = "text")]
+        snapshot: SnapshotId,
+        /// The first paths, each with what the target does with it.
+        paths: Vec<CarryLine>,
+        /// The paths after those, counted by verdict.
+        more: Vec<VerdictCount>,
+    },
+    /// The snapshot a move takes carries no harness session, so the
+    /// conversation does not continue on the target (gate finding F9).
+    NoSessionCaptured {
+        /// The snapshot.
+        #[serde(with = "text")]
+        snapshot: SnapshotId,
+    },
+    /// `--force` carries paths the target can neither use nor make again
+    /// as they are, and the target writes them.
+    CarriedByForce {
+        /// The first of them.
+        paths: Vec<String>,
+        /// How many more there are.
+        more: u64,
+    },
+    /// The job's owner did not say the newest harness version known to
+    /// have written the job's session, so the preflight judges the target
+    /// against the source alone.
+    KnownWriterUnknown {
+        /// The owner.
+        #[serde(with = "text")]
+        owner: NodeId,
+        /// Why.
+        error: Refusal,
+    },
+    /// The job's owner named as the session's known writer a text that is
+    /// not a version, which the preflight leaves out.
+    KnownWriterUnreadable {
+        /// The owner.
+        #[serde(with = "text")]
+        owner: NodeId,
+        /// What it named.
+        text: String,
+        /// Why it is not a version.
+        error: String,
+    },
+    /// The holder has not seen that this node aborted the move it started
+    /// toward it; it will ask for the decision.
+    AbortNotTold {
+        /// The holder.
+        #[serde(with = "text")]
+        holder: NodeId,
+        /// Why.
+        error: Refusal,
+    },
+    /// A paired peer this node cannot ask: it has no address here and no
+    /// session is open with it, so a move or a steal there is not known here.
+    PeerNotAsked {
+        /// The peer.
+        #[serde(with = "text")]
+        peer: NodeId,
+    },
+    /// The workspace at the root of this tenure is gone, so the latest
+    /// snapshot is restored, and work since it that no suspend captured is lost.
+    LiveWorkspaceGone {
+        /// The root.
+        root: PathBuf,
     },
     /// A kind of event this client does not know; a newer node sent it.
     #[serde(other)]
@@ -2118,6 +2545,14 @@ pub enum Reason {
         /// The facts of those rows.
         facts: Vec<String>,
     },
+    /// Paths of the snapshot a move takes that the target can neither use
+    /// nor make again; `--force` carries them as they are.
+    CarryRefused {
+        /// The first of them.
+        paths: Vec<String>,
+        /// How many more there are.
+        more: u64,
+    },
     /// A steal asked without `--force`.
     StealNeedsForce {
         /// What the steal would cost.
@@ -2200,6 +2635,74 @@ pub enum Reason {
     WorkspaceOccupied {
         /// The root.
         root: PathBuf,
+    },
+    /// A process holds the workspace's tree lock, so nothing was captured:
+    /// a run or a resume running setup steps or launching, or a process a
+    /// setup step left running.
+    SetupRunning {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The workspace root.
+        root: PathBuf,
+        /// The lock file its holder has open.
+        lock: PathBuf,
+    },
+    /// The job was resumed under another harness while a move's preflight
+    /// checked the target for the one it ran before, so nothing moved.
+    HarnessChangedDuringMove {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The harness the preflight checked.
+        #[serde(with = "boxed_harness")]
+        checked: Box<HarnessKind>,
+        /// The harness the job runs under now.
+        #[serde(with = "boxed_harness")]
+        now: Box<HarnessKind>,
+        /// The target of the move.
+        #[serde(with = "text")]
+        target: NodeId,
+    },
+    /// The holder resumed the job under another harness after a pull's
+    /// preflight checked this node for the one it ran before, so the move
+    /// was aborted and the holder keeps the job.
+    HarnessChangedDuringPull {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The node that holds the job.
+        #[serde(with = "text")]
+        holder: NodeId,
+        /// The harness the preflight checked.
+        #[serde(with = "boxed_harness")]
+        checked: Box<HarnessKind>,
+        /// The harness the job runs under now.
+        #[serde(with = "boxed_harness")]
+        now: Box<HarnessKind>,
+    },
+    /// The workspace root is a link or a file, put there in place of the
+    /// directory Fabric wrote, so nothing runs or is captured there.
+    RootNotADirectory {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The root.
+        root: PathBuf,
+    },
+    /// The job's ledger moved past the head a launch plan was made at, so
+    /// the plan is stale and nothing was launched.
+    PlanOvertaken {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+    },
+    /// The job recorded a session after a launch plan was made, so the
+    /// launch would continue an older one.
+    SessionMoved {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
     },
     /// A `host:port` the user typed does not parse.
     BadAddress {
@@ -2362,7 +2865,9 @@ impl Reason {
             | Reason::WrongJob { .. } => RefusalKind::NotOwner,
             Reason::Departing { .. } | Reason::Forked { .. } => RefusalKind::Frozen,
             Reason::Unreachable { .. } | Reason::UnknownPeer { .. } => RefusalKind::Unreachable,
-            Reason::Preflight { .. } | Reason::StealNeedsForce { .. } => RefusalKind::NeedsForce,
+            Reason::Preflight { .. }
+            | Reason::CarryRefused { .. }
+            | Reason::StealNeedsForce { .. } => RefusalKind::NeedsForce,
             Reason::HarnessRunning { .. }
             | Reason::HarnessGone { .. }
             | Reason::HarnessNotRecorded { .. }
@@ -2372,7 +2877,13 @@ impl Reason {
             | Reason::NoWorkspace { .. }
             | Reason::Unfinished { .. }
             | Reason::NoSnapshot { .. }
-            | Reason::WorkspaceOccupied { .. } => RefusalKind::JobState,
+            | Reason::WorkspaceOccupied { .. }
+            | Reason::SetupRunning { .. }
+            | Reason::HarnessChangedDuringMove { .. }
+            | Reason::HarnessChangedDuringPull { .. }
+            | Reason::RootNotADirectory { .. }
+            | Reason::PlanOvertaken { .. }
+            | Reason::SessionMoved { .. } => RefusalKind::JobState,
             Reason::ForkBehind { .. }
             | Reason::BadAddress { .. }
             | Reason::Peer { .. }

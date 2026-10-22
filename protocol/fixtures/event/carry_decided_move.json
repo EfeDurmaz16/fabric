@@ -1,0 +1,21 @@
+{
+  "kind": "carry_decided",
+  "context": {
+    "kind": "move",
+    "target": "fab1aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaiba"
+  },
+  "snapshot": "abababababababababababababababababababababababababababababababab",
+  "paths": [
+    {
+      "path": "node_modules",
+      "verdict": "rebuild",
+      "why": "`pnpm install --frozen-lockfile` runs on the target: node major 22 on the source, 24 on the target"
+    },
+    {
+      "path": "build",
+      "verdict": "leave",
+      "why": "made for macos-aarch64, and the target is linux-x86_64; the next build there makes it again"
+    }
+  ],
+  "more": []
+}
