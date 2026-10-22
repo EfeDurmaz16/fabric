@@ -23,7 +23,7 @@ use fabric_core::id::{JobId, NodeId};
 use fabric_net::endpoint::{DialOrder, Endpoint};
 use fabric_net::identity::NodeIdentity;
 use fabric_net::peers::Peers;
-use fabric_net::rpc::{RpcError, Service, Session};
+use fabric_net::rpc::{RpcError, ServeLimits, Service, Session};
 use fabric_net::tls::Trust;
 use fabric_net::transport::{Connection, TransportError};
 use fabric_net::wire::VersionText;
@@ -71,6 +71,8 @@ pub struct Node {
     pub(crate) broken: Mutex<BTreeMap<JobId, String>>,
     endpoint: Endpoint,
     sessions: Mutex<HashMap<NodeId, Arc<Session>>>,
+    /// The caps every session with one peer shares, so a peer that connects again gets no fresh ones.
+    serve_limits: ServeLimits,
     pub(crate) harness_config: HarnessConfig,
     control: Mutex<Option<UnixListener>>,
     pub(crate) recovered: tokio::sync::watch::Sender<bool>,
@@ -146,6 +148,7 @@ impl Node {
             broken: Mutex::new(broken),
             endpoint,
             sessions: Mutex::new(HashMap::new()),
+            serve_limits: ServeLimits::new(),
             harness_config,
             control: Mutex::new(Some(control)),
             recovered: tokio::sync::watch::Sender::new(false),
@@ -268,7 +271,7 @@ impl Node {
         tokio::spawn(async move {
             let service: Arc<dyn Service> = node.clone();
             let trust: Arc<dyn Trust> = node.peers.clone();
-            let ended = session.serve(service, trust).await;
+            let ended = session.serve(service, trust, &node.serve_limits).await;
             tracing::info!(%peer, reason = %ended, "session ended");
             let mut sessions = lock(&node.sessions);
             if sessions

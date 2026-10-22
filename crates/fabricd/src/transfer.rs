@@ -270,7 +270,7 @@ mod tests {
     use fabric_core::lease::FencingToken;
     use fabric_core::moves::MoveOffer;
     use fabric_net::identity::NodeIdentity;
-    use fabric_net::rpc::{JobFuture, Service};
+    use fabric_net::rpc::{JobFuture, ServeLimits, Service};
     use fabric_net::tcp::TcpTlsTransport;
     use fabric_net::tls::Trust;
     use fabric_net::transport::{Connection, Transport};
@@ -392,7 +392,9 @@ mod tests {
             )
             .await
             .unwrap();
-            session.serve(service, Arc::new(Anyone)).await
+            session
+                .serve(service, Arc::new(Anyone), &ServeLimits::new())
+                .await
         });
         let dialing = TcpTlsTransport::bind(&asker, Arc::new(Anyone), loopback).unwrap();
         let connection = Arc::from(dialing.connect(liar_id, addr).await.unwrap());
