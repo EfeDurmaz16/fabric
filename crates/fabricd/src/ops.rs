@@ -984,9 +984,7 @@ impl Node {
                     session,
                     manifest.files().len()
                 ));
-                // A Codex capture records at least the known writer it was
-                // given, so this keeps it or raises it.
-                let known_writer = known_writer(&manifest);
+                let known_writer = writer_after(record.known_writer.clone(), &manifest);
                 local::write(
                     &job.dir().session(),
                     &SessionRecord {
@@ -2292,10 +2290,14 @@ impl Node {
         let state = StateManifest::read(&state_dir)?;
         let harness = adapter(state.kind(), &self.harness_env(path_var)?, None)?;
         harness.restore(root, &state_dir).await?;
+        let previous = job
+            .session()?
+            .filter(|record| record.harness == *state.kind() && record.session == *state.session())
+            .and_then(|record| record.known_writer);
         job.set_session(&SessionRecord {
             harness: state.kind().clone(),
             session: state.session().clone(),
-            known_writer: known_writer(&state),
+            known_writer: writer_after(previous, &state),
         })?;
         out.say(format!(
             "restored {} session {}",
@@ -2627,8 +2629,8 @@ pub(crate) fn session_floor(job: &Job) -> Result<Option<HarnessVersion>, NodeErr
 
 /// The newest harness version known to have written the session a
 /// capture holds, read from its manifest, for a Codex session only; `None`,
-/// logged, when a Codex manifest records none that parses, and the resume
-/// guard then has only what the session's own files record. A Codex
+/// logged, when a Codex manifest records none that parses, and the session
+/// record then keeps the known writer it held (`writer_after`). A Codex
 /// resume writes no version into the rollout, so the job carries this
 /// one. A Claude transcript records the version of every Claude that
 /// wrote a line, and an ACP agent's state is opaque, so for them the
@@ -2646,6 +2648,26 @@ fn known_writer(manifest: &StateManifest) -> Option<HarnessVersion> {
             None
         }
     }
+}
+
+/// The known writer the session record keeps after a capture or a
+/// restore of `manifest`: the version the manifest records, or, when it
+/// records none that parses, `previous`, the one the record held for the
+/// same session; `None` for any harness but Codex. A version that does not
+/// parse is ignored and the job's previous known writer stays the floor:
+/// it cannot be ordered, so it cannot raise one, and failing the capture
+/// would keep the job from being suspended or moved off the node for the
+/// Codex installed there (decided 2026-10-22 by the owner, ADR 0006). A
+/// Codex capture records at least the known writer it was given, so after
+/// a capture this keeps it or raises it.
+fn writer_after(
+    previous: Option<HarnessVersion>,
+    manifest: &StateManifest,
+) -> Option<HarnessVersion> {
+    if *manifest.kind() != HarnessKind::Codex {
+        return None;
+    }
+    known_writer(manifest).or(previous)
 }
 
 /// Refuses a launch planned to continue `planned` when the session a plan
@@ -3681,6 +3703,48 @@ pub(crate) mod tests {
                 .unwrap()
                 .and_then(|record| record.known_writer),
             Some(HarnessVersion::parse("0.160.0").unwrap())
+        );
+    }
+
+    /// A Codex snapshot whose recorded version does not parse, as one a
+    /// capture wrote before the known writer, which recorded the installed
+    /// `--version` token as it was, gives no floor of its own. The restore
+    /// neither fails nor drops the floor: the known writer this node held
+    /// for the session stays (decided 2026-10-22 by the owner, ADR 0006).
+    #[tokio::test]
+    async fn a_restore_of_a_version_that_does_not_parse_keeps_the_known_writer() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = locking_codex(dir.path());
+        let thread = codex_thread_in(&node, id);
+        let known = HarnessVersion::parse("0.160.0").unwrap();
+        let job = node.job(id).await.unwrap();
+        job.lock()
+            .await
+            .set_session(&SessionRecord {
+                harness: HarnessKind::Codex,
+                session: thread,
+                known_writer: Some(known.clone()),
+            })
+            .unwrap();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let job = job.lock().await;
+        let manifest = job.dir().harness_state().join(MANIFEST_FILE);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        assert_eq!(value["harness_version"], "0.160.0");
+        value["harness_version"] = "0.155".into();
+        std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let root = paths::job_root(&node.cfg.home, id);
+        node.restore_harness(&job, &root, &path, &mut Out::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            job.session()
+                .unwrap()
+                .and_then(|record| record.known_writer),
+            Some(known)
         );
     }
 
