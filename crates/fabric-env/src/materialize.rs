@@ -336,6 +336,7 @@ pub struct PlannedStep {
     step: SetupStep,
     dir: PathBuf,
     program: Option<PathBuf>,
+    cleared: &'static [&'static str],
     sentinels: Sentinels,
 }
 
@@ -416,6 +417,7 @@ impl Plan {
                     step: planned.step,
                     dir: planned.dir,
                     program,
+                    cleared: planned.cleared,
                     sentinels: planned.sentinels,
                 }),
                 None => missing.push((planned.index, planned.step.program)),
@@ -441,13 +443,16 @@ struct ReadyStep {
     step: SetupStep,
     dir: PathBuf,
     program: PathBuf,
+    cleared: &'static [&'static str],
     sentinels: Sentinels,
 }
 
 /// What `plan` reads from this node's environment: `PATH`, and whether each declared variable is set.
 ///
 /// It decides only what `plan` checks. A step runs with the environment
-/// of the process that calls `execute`, as ADR 0007 says.
+/// of the process that calls `execute`, as ADR 0007 says, less the
+/// variables that would move a detected `uv` step out of the workspace,
+/// such as `UV_PROJECT_ENVIRONMENT`.
 #[derive(Debug, Clone)]
 pub struct NodeEnv {
     path: Option<OsString>,
@@ -662,6 +667,7 @@ pub fn plan(
             step: step.clone(),
             dir: step_dir(&root, index, step)?,
             program: find_on_path(node.path.as_deref(), &root, &step.program),
+            cleared: detected.cleared(index),
             sentinels: Sentinels::default(),
         });
     }
@@ -928,7 +934,11 @@ fn run_step(planned: &ReadyStep, lock: &fs::File) -> Result<(), MaterializeError
         dir = %planned.dir.display(),
         "running setup step"
     );
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    for name in planned.cleared {
+        command.env_remove(name);
+    }
+    let mut child = command
         .args(planned.step.args.iter().map(SetupArg::as_str))
         .current_dir(&planned.dir)
         .stdin(Stdio::from(stdin))

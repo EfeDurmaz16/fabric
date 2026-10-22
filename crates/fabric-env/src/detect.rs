@@ -519,6 +519,35 @@ impl StepScope {
     }
 }
 
+/// Variables that move where uv works: its directory, the project it reads and the environment it writes.
+///
+/// A detected `uv` step runs without them. Inherited from the shell that
+/// runs resume, `UV_PROJECT_ENVIRONMENT` would make `uv sync` fill another
+/// environment than `.venv`, `UV_PROJECT` would sync another project and
+/// `UV_WORKING_DIR` would resolve `.venv` and `requirements.txt` somewhere
+/// else: the step would succeed, change something outside the workspace
+/// and leave the cache missing for every later resume. A declared step is
+/// the user's and keeps the environment it inherits.
+const UV_REDIRECTS: &[&str] = &["UV_PROJECT_ENVIRONMENT", "UV_PROJECT", "UV_WORKING_DIR"];
+
+/// A setup step as detection builds it: the step, what it fills, and the variables it runs without.
+struct FoundStep {
+    step: SetupStep,
+    scope: StepScope,
+    cleared: &'static [&'static str],
+}
+
+impl FoundStep {
+    /// A step that runs with every variable it inherits.
+    fn new(step: SetupStep, scope: StepScope) -> Self {
+        Self {
+            step,
+            scope,
+            cleared: &[],
+        }
+    }
+}
+
 /// A cache path before the setup steps are final: what `CachePath` holds but its completion.
 #[derive(Debug, Clone)]
 struct FoundCache {
@@ -655,6 +684,8 @@ pub struct Detection {
     spec: EnvSpec,
     /// One gate per step of `spec.setup`, in the same order; built with it in `detect` and never changed.
     step_gates: Vec<StepGate>,
+    /// Per step of `spec.setup`, in the same order: the variables it runs without (`UV_REDIRECTS`).
+    step_cleared: Vec<&'static [&'static str]>,
     caches: Vec<CachePath>,
     /// One digest per cache, in the same order: the files the steps of its ecosystem read (`Inputs`).
     inputs: Vec<blake3::Hash>,
@@ -677,6 +708,11 @@ impl Detection {
     /// Returns each setup step of the spec, in order, with the caches that decide whether it runs.
     pub fn steps(&self) -> impl Iterator<Item = (&SetupStep, &StepGate)> {
         self.spec.setup.iter().zip(&self.step_gates)
+    }
+
+    /// Returns the variables of the node's environment that the step at `index` runs without; empty for a step the user declared.
+    pub(crate) fn cleared(&self, index: usize) -> &'static [&'static str] {
+        self.step_cleared.get(index).copied().unwrap_or_default()
     }
 
     /// Returns the spec's cache paths with their class, ecosystem and completion, sorted by path.
@@ -744,7 +780,7 @@ pub fn detect(root: &Path, recorded: &[SecretPattern]) -> Result<Detection, Dete
             .chain(choice.manager.inputs().iter().copied())
             .collect();
         let node_modules = rel("node_modules")?;
-        setup.push((
+        setup.push(FoundStep::new(
             choice.manager.install_step()?,
             StepScope::Fills(node_modules.clone()),
         ));
@@ -759,7 +795,10 @@ pub fn detect(root: &Path, recorded: &[SecretPattern]) -> Result<Detection, Dete
     inputs.python = detect_python(&reader, &mut setup, &mut caches)?;
     if reader.exists("go.mod")? {
         inputs.go = &["go.mod", "go.sum"];
-        setup.push((step("go", &["mod", "download"])?, StepScope::Outside));
+        setup.push(FoundStep::new(
+            step("go", &["mod", "download"])?,
+            StepScope::Outside,
+        ));
     }
 
     merge_declared_caches(&mut caches, &overrides.caches, node_manager)?;
@@ -769,10 +808,14 @@ pub fn detect(root: &Path, recorded: &[SecretPattern]) -> Result<Detection, Dete
     if let Some(declared) = &overrides.setup {
         setup = declared
             .iter()
-            .map(|step| (step.clone(), StepScope::Declared))
+            .map(|step| FoundStep::new(step.clone(), StepScope::Declared))
             .collect();
     }
-    let (setup, step_scopes): (Vec<SetupStep>, Vec<StepScope>) = setup.into_iter().unzip();
+    let step_cleared = setup.iter().map(|found| found.cleared).collect();
+    let (setup, step_scopes): (Vec<SetupStep>, Vec<StepScope>) = setup
+        .into_iter()
+        .map(|found| (found.step, found.scope))
+        .unzip();
     let caches: Vec<CachePath> = caches
         .into_iter()
         .map(|cache| cache.finish(&step_scopes))
@@ -796,6 +839,7 @@ pub fn detect(root: &Path, recorded: &[SecretPattern]) -> Result<Detection, Dete
         root: root.to_owned(),
         spec,
         step_gates,
+        step_cleared,
         caches,
         inputs: cache_inputs,
         pins,
@@ -989,7 +1033,7 @@ fn pin(tool: &str, version: &str, file: &'static str, at: PinAt) -> Option<Pin> 
 /// Adds Cargo's step and cache, and returns the files they read.
 fn detect_rust(
     reader: &Reader<'_>,
-    setup: &mut Vec<(SetupStep, StepScope)>,
+    setup: &mut Vec<FoundStep>,
     caches: &mut Vec<FoundCache>,
 ) -> Result<&'static [&'static str], DetectError> {
     if !reader.exists("Cargo.toml")? {
@@ -1006,7 +1050,10 @@ fn detect_rust(
     // `cargo fetch` fills ~/.cargo, not `target`, but `target` is what a
     // build makes from it: while `target` is whole the fetch has nothing
     // to add, and a resume on a warm workspace runs no command.
-    setup.push((step("cargo", args)?, StepScope::Warms(target.clone())));
+    setup.push(FoundStep::new(
+        step("cargo", args)?,
+        StepScope::Warms(target.clone()),
+    ));
     caches.push(FoundCache {
         path: target,
         class: CacheClass::Build,
@@ -1019,13 +1066,19 @@ fn detect_rust(
 /// Adds uv's steps and `.venv`, and returns the files the steps read.
 fn detect_python(
     reader: &Reader<'_>,
-    setup: &mut Vec<(SetupStep, StepScope)>,
+    setup: &mut Vec<FoundStep>,
     caches: &mut Vec<FoundCache>,
 ) -> Result<&'static [&'static str], DetectError> {
     let venv = rel(".venv")?;
-    let fills = || StepScope::Fills(venv.clone());
+    let uv = |args| -> Result<FoundStep, DetectError> {
+        Ok(FoundStep {
+            step: step("uv", args)?,
+            scope: StepScope::Fills(venv.clone()),
+            cleared: UV_REDIRECTS,
+        })
+    };
     let inputs: &'static [&'static str] = if reader.exists("uv.lock")? {
-        setup.push((step("uv", &["sync", "--frozen"])?, fills()));
+        setup.push(uv(&["sync", "--frozen"])?);
         &["pyproject.toml", "uv.lock"]
     } else if reader.exists("requirements.txt")? {
         // A bare `pip install` would write into whichever Python is first
@@ -1033,21 +1086,15 @@ fn detect_python(
         // install` prefers an activated `VIRTUAL_ENV` or `CONDA_PREFIX`
         // inherited from the shell that runs resume over the workspace's
         // own `.venv`, and would fill that one instead.
-        setup.push((step("uv", &["venv", "--allow-existing", ".venv"])?, fills()));
-        setup.push((
-            step(
-                "uv",
-                &[
-                    "pip",
-                    "install",
-                    "--python",
-                    ".venv",
-                    "-r",
-                    "requirements.txt",
-                ],
-            )?,
-            fills(),
-        ));
+        setup.push(uv(&["venv", "--allow-existing", ".venv"])?);
+        setup.push(uv(&[
+            "pip",
+            "install",
+            "--python",
+            ".venv",
+            "-r",
+            "requirements.txt",
+        ])?);
         &["requirements.txt"]
     } else {
         return Ok(&[]);
