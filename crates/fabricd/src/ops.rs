@@ -851,7 +851,7 @@ impl Node {
     ) -> Result<SnapshotId, NodeError> {
         let state_dir = job.dir().harness_state();
         let mut harness_state = None;
-        if let Some(record) = job_session(job, root, &self.cfg.home)? {
+        if let Some(record) = job_session(job, root, &self.cfg.home, job.harness())? {
             let session = record.session;
             let harness = adapter(&record.harness, &self.harness_env(path_var)?)?;
             job.clear_harness_state()?;
@@ -2296,9 +2296,10 @@ fn owner_token(job: &Job, me: NodeId) -> Result<FencingToken, NodeError> {
     }
 }
 
-/// The job's session: the one recorded for the harness the job runs,
-/// else, when that harness is Codex, the thread the job's workspace holds,
-/// else the record of the harness it ran before, if any.
+/// The job's session for `harness`, the one a capture takes or a plan
+/// launches: the one recorded for it, else, when both `harness` and the
+/// harness the job ran last are Codex, the thread the job's workspace
+/// holds, else the record of the harness it ran before, if any.
 ///
 /// A Codex launched without a thread to resume makes one only once it
 /// runs, after its launch was recorded, so no launch can name it. Its
@@ -2307,11 +2308,19 @@ fn owner_token(job: &Job, me: NodeId) -> Result<FencingToken, NodeError> {
 /// with that `cwd` is the job's; it is recorded here, as a launch that
 /// named it would have been. Without it, a suspend would carry the
 /// workspace and leave the conversation behind, or carry the state of the
-/// harness the job ran before it switched to Codex.
-fn job_session(job: &Job, root: &Path, home: &Path) -> Result<Option<SessionRecord>, NodeError> {
+/// harness the job ran before it switched to Codex. A plan for another
+/// harness leaves the record alone: after a fresh Codex the record still
+/// names the session of the harness before it, which a resume under that
+/// harness continues.
+fn job_session(
+    job: &Job,
+    root: &Path,
+    home: &Path,
+    harness: &HarnessKind,
+) -> Result<Option<SessionRecord>, NodeError> {
     let recorded = job.session()?;
-    let harness = job.harness();
     if *harness != HarnessKind::Codex
+        || *job.harness() != HarnessKind::Codex
         || recorded
             .as_ref()
             .is_some_and(|record| record.harness == *harness)
@@ -2354,7 +2363,7 @@ fn plan(
         epoch,
     })?;
     let harness = harness.unwrap_or_else(|| job.harness().clone());
-    let session = match job_session(job, &root, home)? {
+    let session = match job_session(job, &root, home, &harness)? {
         Some(record) if record.harness == harness => {
             out.say(format!("continuing {harness} session {}", record.session));
             Some(record.session)
@@ -2907,6 +2916,69 @@ pub(crate) mod tests {
             recorded_and_captured(&node, id).await,
             (Some(record), thread)
         );
+    }
+
+    /// A job ran Claude, then a fresh Codex, which recorded no session, so
+    /// the Claude one is still the job's. A resume under Claude continues
+    /// that session; the Codex thread the workspace holds neither replaces
+    /// the record nor is continued, since the plan launches Claude.
+    #[tokio::test]
+    async fn a_resume_under_claude_after_a_fresh_codex_continues_the_claude_session() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let claude = SessionRecord {
+            harness: HarnessKind::ClaudeCode,
+            session: SessionId::parse("9c9796f0-2682-4546-a963-d314b3ad543f").unwrap(),
+        };
+        local::write(&node.cfg.state.job(id).session(), &claude).unwrap();
+        codex_thread_in(&node, id);
+
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let plan = node
+            .job_resume(
+                id,
+                None,
+                Some(HarnessKind::ClaudeCode),
+                false,
+                &path,
+                &mut Out::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan.session.as_ref(), Some(&claude.session));
+        let job = node.job(id).await.unwrap();
+        assert_eq!(job.lock().await.session().unwrap(), Some(claude));
+    }
+
+    /// A job that ran Codex, then Claude, keeps its Claude session when a
+    /// resume switches it back to Codex: the older Codex thread in the
+    /// workspace does not take the record's place. The Codex launch may
+    /// never be recorded, and the next capture would then carry that old
+    /// thread for the job's Claude run.
+    #[tokio::test]
+    async fn a_resume_under_codex_after_claude_leaves_the_claude_record() {
+        let (dir, node) = node();
+        let repo = repo(dir.path());
+        let mut out = Out::default();
+        node.job_new(&repo, "goal".to_owned(), HarnessKind::ClaudeCode, &mut out)
+            .await
+            .unwrap();
+        let id: JobId = out.lines[0].parse().unwrap();
+        let claude = SessionRecord {
+            harness: HarnessKind::ClaudeCode,
+            session: SessionId::parse("9c9796f0-2682-4546-a963-d314b3ad543f").unwrap(),
+        };
+        local::write(&node.cfg.state.job(id).session(), &claude).unwrap();
+        codex_thread_in(&node, id);
+
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let plan = node
+            .job_resume(id, None, Some(HarnessKind::Codex), false, &path, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(plan.session, None);
+        let job = node.job(id).await.unwrap();
+        assert_eq!(job.lock().await.session().unwrap(), Some(claude));
     }
 
     /// Serves `a` and `b` and pairs them, each with the other's address.
