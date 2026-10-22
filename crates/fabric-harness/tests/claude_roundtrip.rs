@@ -466,6 +466,64 @@ async fn restore_on_a_fresh_node_places_the_staged_bytes_and_protects_what_is_th
     );
 }
 
+/// Claude keeps a session's plan under `~/.claude/plans/`, named by the
+/// slug its transcript records, and reads it back on `--resume`. The plans
+/// of the session travel; another session's plan does not.
+#[tokio::test]
+async fn the_plans_a_transcript_names_travel_with_the_session() {
+    let src = build_source("fabric/jobs/j1/work");
+    let home = src.home.path().canonicalize().unwrap();
+    let transcript = transcript_under(&home, &src.work);
+    let text = std::fs::read_to_string(&transcript).unwrap();
+    std::fs::write(
+        &transcript,
+        format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{SID}\",\"slug\":\"dreamy-popping-cerf\"}}\n{text}"
+        ),
+    )
+    .unwrap();
+    let plans = home.join(".claude/plans");
+    std::fs::create_dir_all(&plans).unwrap();
+    let ours = [
+        "dreamy-popping-cerf-agent-a97a8637863f59591.md",
+        "dreamy-popping-cerf.md",
+    ];
+    for name in ours {
+        std::fs::write(plans.join(name), format!("# {name}\n1. fix the test\n")).unwrap();
+    }
+    std::fs::write(
+        plans.join("toasty-kindling-flame.md"),
+        "# another session\n",
+    )
+    .unwrap();
+    let adapter = node(&home);
+    let out = tempfile::tempdir().unwrap();
+    let manifest = adapter
+        .capture(&src.work, &session(), out.path())
+        .await
+        .unwrap();
+    let carried: Vec<&str> = manifest
+        .files()
+        .iter()
+        .map(|f| f.rel_path.as_str())
+        .filter(|p| p.starts_with("home/.claude/plans/"))
+        .collect();
+    assert_eq!(
+        carried,
+        ours.map(|name| format!("home/.claude/plans/{name}"))
+    );
+
+    set_aside(&home, ".claude-pro");
+    adapter.restore(&src.work, out.path()).await.unwrap();
+    for name in ours {
+        assert_eq!(
+            std::fs::read_to_string(home.join(".claude/plans").join(name)).unwrap(),
+            format!("# {name}\n1. fix the test\n")
+        );
+    }
+    assert!(!home.join(".claude/plans/toasty-kindling-flame.md").exists());
+}
+
 /// Writes `manifest` under `out` with one more entry, for `body` at `rel`,
 /// as someone who forged the tree would.
 fn forge(out: &Path, manifest: &StateManifest, rel: &str, body: &[u8]) {
