@@ -1298,10 +1298,12 @@ impl CarryKeys for WritesAside<'_> {
 /// A file the snapshot never carries, here one `.fabricignore` excludes,
 /// may change or appear while capture runs, as a running dev server's log
 /// does, in the root or beside carried files: it is not in the snapshot
-/// either way, so the capture goes on.
+/// either way, so the capture goes on. In a repository the log is listed
+/// as untracked, or, when git ignores it too as most repositories ignore
+/// `*.log`, with the ignored files.
 #[test]
 fn a_file_the_snapshot_leaves_out_may_change_while_capture_runs() {
-    for repository in [false, true] {
+    for (repository, gitignored) in [(false, false), (true, false), (true, true)] {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("work");
         fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
@@ -1310,7 +1312,12 @@ fn a_file_the_snapshot_leaves_out_may_change_while_capture_runs() {
         fs::write(root.join("logs/README"), "logs\n").unwrap();
         fs::write(root.join(".fabricignore"), "*.log\n").unwrap();
         if repository {
-            fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+            let ignore = if gitignored {
+                "node_modules/\n*.log\n"
+            } else {
+                "node_modules/\n"
+            };
+            fs::write(root.join(".gitignore"), ignore).unwrap();
             let g = git(&root);
             g.run(&["init", "-q", "-b", "main"]).unwrap();
             g.run(&["add", "-A"]).unwrap();
@@ -1330,16 +1337,16 @@ fn a_file_the_snapshot_leaves_out_may_change_while_capture_runs() {
         let captured = capture(&store, &req);
         assert!(
             appears.exists(),
-            "repository {repository}: nothing was written"
+            "repository {repository}, gitignored {gitignored}: nothing was written"
         );
-        let Captured { manifest, .. } =
-            captured.unwrap_or_else(|e| panic!("repository {repository}: {e}"));
+        let Captured { manifest, .. } = captured
+            .unwrap_or_else(|e| panic!("repository {repository}, gitignored {gitignored}: {e}"));
         assert!(
             !manifest
                 .files
                 .iter()
                 .any(|e| matches!(e.rel_path.as_str(), "dev.log" | "logs/dev.1.log")),
-            "repository {repository}"
+            "repository {repository}, gitignored {gitignored}"
         );
     }
 }
