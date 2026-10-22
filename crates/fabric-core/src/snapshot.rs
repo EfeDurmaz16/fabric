@@ -2,12 +2,14 @@
 //!
 //! Invariant: a manifest describes a workspace by relative paths and content
 //! hashes and holds no file bytes. Every list in it is strictly sorted by its
-//! key, so one tree has one manifest, and its postcard encoding is the thing
-//! that is hashed: two manifests with the same fields have the same
-//! `SnapshotId` on every node and in every version of this crate that writes
-//! format version 1. A tree never places an entry below a file or a symlink,
-//! `files` and the working-tree commit meet only at a directory of
-//! `files`, and no mode bit above the low nine is representable.
+//! key, except that `config` repeats a key git holds more than once, one
+//! entry per value in git's order, so one tree has one manifest, and its
+//! postcard encoding is the thing that is hashed: two manifests with the
+//! same fields have the same `SnapshotId` on every node and in every version
+//! of this crate that writes format version 1. A tree never places an entry
+//! below a file or a symlink, `files` and the working-tree commit meet only
+//! at a directory of `files`, and no mode bit above the low nine is
+//! representable.
 
 use std::collections::HashSet;
 
@@ -40,8 +42,10 @@ pub enum ManifestError {
         /// The byte length that was offered.
         len: usize,
     },
-    /// A list is not strictly sorted by its key, which also catches a repeated key.
-    #[error("{list} entry {index} is not strictly after the one before it")]
+    /// A list is not sorted by its key. Every list but `config` rises
+    /// strictly, which also catches a repeated key; `config` may repeat a
+    /// key and never goes down.
+    #[error("{list} entry {index} is out of order")]
     OutOfOrder {
         /// Which list: `files`, `harness_state`, `caches`, `refs`, `worktree_mtimes` or `config`.
         list: &'static str,
@@ -332,7 +336,11 @@ pub struct GitState {
     pub worktree_commit: GitOid,
     /// Modification time in nanoseconds for every path in `W`; sorted by path.
     pub worktree_mtimes: Vec<(RelPath, u64)>,
-    /// The allowlisted projection of the repository config, never the file; sorted by key.
+    /// The allowlisted projection of the repository config, never the file;
+    /// sorted by key. A key git holds more than once, such as two
+    /// `remote.origin.fetch` refspecs, has one entry per value, in the order
+    /// git lists them, since that order can matter (git fetches from the
+    /// first `remote.<n>.url`).
     pub config: Vec<(GitConfigKey, GitConfigValue)>,
     /// The objects of `.git/info/exclude`, if present.
     pub exclude: Option<Vec<ChunkId>>,
@@ -449,7 +457,12 @@ impl SnapshotManifest {
                 "worktree_mtimes",
                 git.worktree_mtimes.iter().map(|(p, _)| p),
             )?;
-            check_sorted("config", git.config.iter().map(|(key, _)| key))?;
+            if let Some(index) = git.config.windows(2).position(|w| w[0].0 > w[1].0) {
+                return Err(ManifestError::OutOfOrder {
+                    list: "config",
+                    index: index + 1,
+                });
+            }
             // SHA-1 and SHA-256 repositories do not interoperate, so a state
             // that mixes the two widths cannot be restored into any one repository.
             let sha256 = git.index_commit.is_sha256();

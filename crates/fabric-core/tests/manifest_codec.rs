@@ -128,6 +128,12 @@ fn cache_entry() -> impl Strategy<Value = CacheEntry> {
         })
 }
 
+/// Sorts `items` by `key` and keeps a repeated key's items in their order, as capture does for config.
+fn sorted<T, K: Ord>(mut items: Vec<T>, key: impl Fn(&T) -> K) -> Vec<T> {
+    items.sort_by_key(|a| key(a));
+    items
+}
+
 /// Sorts `items` by `key` and drops a repeated key, as capture does.
 fn sorted_unique<T, K: Ord>(mut items: Vec<T>, key: impl Fn(&T) -> K) -> Vec<T> {
     items.sort_by_key(|a| key(a));
@@ -199,7 +205,7 @@ fn git_state() -> impl Strategy<Value = GitState> {
                 index_commit,
                 worktree_commit,
                 worktree_mtimes: sorted_unique(worktree_mtimes, |(path, _)| path.clone()),
-                config: sorted_unique(config, |(key, _)| key.clone()),
+                config: sorted(config, |(key, _)| key.clone()),
                 exclude,
             },
         )
@@ -428,9 +434,35 @@ fn a_repeated_or_unsorted_path_is_refused() {
             index: 1
         })
     ));
+}
+
+/// `config` is sorted by key, but a key git holds more than once keeps one
+/// entry per value in git's order, such as a second fetch refspec; a key
+/// below the one before it is still refused.
+#[test]
+fn a_repeated_config_key_keeps_its_values_and_an_unsorted_one_is_refused() {
     let mut m = fixed_manifest().unwrap();
+    let fetch = GitConfigKey::parse("remote.origin.fetch").unwrap();
+    m.git.as_mut().unwrap().config = vec![
+        (
+            fetch.clone(),
+            GitConfigValue::parse("+refs/heads/*:refs/remotes/origin/*").unwrap(),
+        ),
+        (
+            fetch,
+            GitConfigValue::parse("+refs/pull/*/head:refs/remotes/origin/pr/*").unwrap(),
+        ),
+    ];
+    let bytes = m.encode().unwrap();
+    assert_eq!(SnapshotManifest::decode(&bytes).unwrap(), m);
     let git = m.git.as_mut().unwrap();
-    git.config.push(git.config[0].clone());
+    git.config.insert(
+        0,
+        (
+            GitConfigKey::parse("push.default").unwrap(),
+            GitConfigValue::parse("simple").unwrap(),
+        ),
+    );
     assert!(matches!(
         m.encode(),
         Err(ManifestError::OutOfOrder {
