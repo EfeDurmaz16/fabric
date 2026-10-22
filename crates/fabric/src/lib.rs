@@ -28,7 +28,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use fabric_core::env::{EnvVarName, SetupArg};
 use fabric_core::harness::HarnessKind;
-use fabric_core::id::{JobId, NodeId};
+use fabric_core::id::{EnvSpecId, JobId, NodeId};
 use fabric_env::materialize::{CacheHealth, MaterializeError, NodeEnv, TreeLock};
 use fabric_harness::claude::{ClaudeCode, LeftReason, TrustOutcome};
 use fabric_harness::codex::Codex;
@@ -131,6 +131,9 @@ enum JobCommand {
         /// The first message to send; the goal for a new session.
         #[arg(long)]
         prompt: Option<String>,
+        /// Run the setup steps of an environment spec this node has not run for the job without asking.
+        #[arg(long)]
+        yes: bool,
     },
     /// Stop the harness, snapshot the workspace and record the suspend.
     Suspend {
@@ -153,6 +156,9 @@ enum JobCommand {
         /// Waive the preflight refusals that can be waived when pulling.
         #[arg(long)]
         force: bool,
+        /// Run the setup steps of an environment spec this node has not run for the job without asking.
+        #[arg(long)]
+        yes: bool,
     },
     /// Move the job to a paired node by the cooperative move protocol.
     Move {
@@ -383,6 +389,7 @@ async fn serve(state: StateDir, home: PathBuf, args: ServeArgs) -> Result<ExitCo
 
 async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitCode> {
     let socket = state.socket();
+    let mut yes = false;
     let (request, prompt) = match command {
         JobCommand::New {
             repo,
@@ -400,7 +407,14 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
                 None,
             )
         }
-        JobCommand::Run { job, prompt } => (Request::JobRun { job }, prompt),
+        JobCommand::Run {
+            job,
+            prompt,
+            yes: given,
+        } => {
+            yes = given;
+            (Request::JobRun { job }, prompt)
+        }
         JobCommand::Suspend { job } => (
             Request::JobSuspend {
                 job,
@@ -414,16 +428,20 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
             harness,
             prompt,
             force,
-        } => (
-            Request::JobResume {
-                job,
-                on,
-                harness,
-                force,
-                path_var: path_var(),
-            },
-            prompt,
-        ),
+            yes: given,
+        } => {
+            yes = given;
+            (
+                Request::JobResume {
+                    job,
+                    on,
+                    harness,
+                    force,
+                    path_var: path_var(),
+                },
+                prompt,
+            )
+        }
         JobCommand::Move { job, to, force } => (
             Request::JobMove {
                 job,
@@ -459,7 +477,12 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
     let Some(plan) = ask(&socket, request).await? else {
         return Ok(ExitCode::SUCCESS);
     };
-    launch(state, home, &plan, prompt).await
+    let approval = Approval {
+        record: state.job(plan.job).env_spec_ran(),
+        yes,
+        ask: &ask_on_terminal,
+    };
+    launch(state, home, &plan, prompt, &approval).await
 }
 
 /// Runs the plan's setup steps, launches the harness, registers it, and waits for it.
@@ -468,8 +491,9 @@ async fn launch(
     home: &Path,
     plan: &RunPlan,
     prompt: Option<String>,
+    approval: &Approval<'_>,
 ) -> Result<ExitCode> {
-    let tree = prepare(state, home, plan).await?;
+    let tree = prepare(state, home, plan, approval).await?;
     let socket = state.socket();
     let env = environment();
     let resume = plan.session.clone();
@@ -619,8 +643,13 @@ fn signal_exit(signal: i32) -> ExitCode {
 }
 
 /// Takes the tree lock and runs the setup steps, once the plan is known
-/// to hold, and returns the lock.
-async fn prepare(state: &StateDir, home: &Path, plan: &RunPlan) -> Result<TreeLock> {
+/// to hold and the user approved them, and returns the lock.
+async fn prepare(
+    state: &StateDir,
+    home: &Path,
+    plan: &RunPlan,
+    approval: &Approval<'_>,
+) -> Result<TreeLock> {
     // The node captures and restores the harness's state under its home;
     // a harness launched under another would keep its session elsewhere.
     if plan.home != home {
@@ -644,7 +673,7 @@ async fn prepare(state: &StateDir, home: &Path, plan: &RunPlan) -> Result<TreeLo
         },
     )
     .await?;
-    materialize(&tree, &plan.root)?;
+    materialize(&tree, &plan.root, approval)?;
     Ok(tree)
 }
 
@@ -704,8 +733,8 @@ fn lock_tree(state: &StateDir, root: &Path) -> Result<TreeLock> {
 }
 
 /// Runs the setup steps a restored workspace needs on this node (ADR 0007),
-/// printing each, under `lock`.
-fn materialize(lock: &TreeLock, root: &Path) -> Result<()> {
+/// printing each, under `lock`, once `approval` lets them run.
+fn materialize(lock: &TreeLock, root: &Path, approval: &Approval<'_>) -> Result<()> {
     let detected = fabric_env::detect::detect(root, &[])?;
     let plan = fabric_env::materialize::plan(&detected, lock, &NodeEnv::current())?;
     if plan.is_noop() {
@@ -729,8 +758,73 @@ fn materialize(lock: &TreeLock, root: &Path) -> Result<()> {
         writeln!(stdout, "setup: {} {}", step.program, args.join(" "))?;
     }
     drop(stdout);
-    plan.ready()?.execute(lock)?;
+    // Programs and variables are checked first, so the user is never asked
+    // about steps that cannot run here.
+    let ready = plan.ready()?;
+    approval.approve(detected.spec().id()?)?;
+    ready.execute(lock)?;
     Ok(())
+}
+
+/// Whether the setup steps of an environment spec may run (ADR 0007).
+///
+/// A restored workspace brings its spec, and with it the programs its
+/// steps run, from wherever it was last edited, an agent's edit of
+/// `.fabric/env.toml` included. So before this node runs the steps of a
+/// spec other than the one it last ran for the job, the user approves
+/// them, by answering at the terminal or with `--yes`. A spec this node
+/// only captured still asks: the agent may have written it during the run.
+struct Approval<'a> {
+    /// Where the id of the spec this node last ran for the job is kept.
+    record: PathBuf,
+    /// `--yes`: run a new spec's steps without asking.
+    yes: bool,
+    /// Asks the user about the steps printed above; false when no one can answer.
+    ask: &'a dyn Fn() -> Result<bool>,
+}
+
+impl Approval<'_> {
+    /// Lets the steps of `spec` run, or refuses, and records the spec once
+    /// approved so the next launch of it does not ask again.
+    fn approve(&self, spec: EnvSpecId) -> Result<()> {
+        let id = spec.to_string();
+        let ran = std::fs::read_to_string(&self.record).ok();
+        if ran.as_deref().map(str::trim) == Some(id.as_str()) {
+            return Ok(());
+        }
+        if !self.yes && !(self.ask)()? {
+            return Err(Refused {
+                refusal: Refusal::NeedsForce,
+                message: format!(
+                    "the setup steps above come from environment spec {id}, which this node has not run for the job, and were not approved; read them, then run the command again with --yes"
+                ),
+            }
+            .into());
+        }
+        let temp = self.record.with_extension("tmp");
+        std::fs::write(&temp, format!("{id}\n"))
+            .and_then(|()| std::fs::rename(&temp, &self.record))
+            .with_context(|| format!("recording the approved spec in {}", self.record.display()))?;
+        Ok(())
+    }
+}
+
+/// Asks at the terminal whether to run the setup steps printed above; with
+/// no terminal on standard input, the answer is no.
+fn ask_on_terminal() -> Result<bool> {
+    let stdin = std::io::stdin();
+    if !rustix::termios::isatty(&stdin) {
+        return Ok(false);
+    }
+    let mut stderr = std::io::stderr();
+    write!(
+        stderr,
+        "this node has not run these setup steps for the job; run them? [y/N] "
+    )?;
+    stderr.flush()?;
+    let mut answer = String::new();
+    stdin.read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES"))
 }
 
 /// A cache's state before the setup steps run, in words.
@@ -828,6 +922,95 @@ fn pid_of(running: &Running) -> Option<rustix::process::Pid> {
 mod tests {
     use super::*;
 
+    /// An approval for a launch that must not get as far as asking.
+    fn unasked(dir: &Path) -> Approval<'static> {
+        Approval {
+            record: dir.join("env-spec-ran"),
+            yes: false,
+            ask: &|| panic!("the launch asked to run setup steps"),
+        }
+    }
+
+    /// A workspace whose `.fabric/env.toml` declares one step, `mkdir`
+    /// with `args`, and no cache, so the step runs at every launch.
+    fn workspace_with_step(dir: &Path, args: &str) -> PathBuf {
+        let root = dir.join("work");
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(
+            root.join(".fabric/env.toml"),
+            format!("[[setup]]\nprogram = \"mkdir\"\nargs = [{args}]\n"),
+        )
+        .unwrap();
+        root
+    }
+
+    /// A restored workspace can bring setup steps this node has never
+    /// run, written into `.fabric/env.toml` on another node, by an agent
+    /// for one. They must not run before the user approves them; with no
+    /// one at a terminal to ask, the launch stops before any step runs.
+    #[test]
+    fn a_spec_this_node_has_not_run_does_not_run_unapproved() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = workspace_with_step(dir.path(), "\"-p\", \"ran\"");
+        let state =
+            StateDir::resolve(Some(dir.path().join("state").as_os_str()), dir.path()).unwrap();
+        let lock = lock_tree(&state, &root).unwrap();
+        let no = || Ok(false);
+        let approval = Approval {
+            record: dir.path().join("env-spec-ran"),
+            yes: false,
+            ask: &no,
+        };
+        let Err(error) = materialize(&lock, &root, &approval) else {
+            panic!("the steps ran unapproved");
+        };
+        assert!(
+            matches!(
+                error.downcast_ref::<Refused>(),
+                Some(Refused {
+                    refusal: Refusal::NeedsForce,
+                    ..
+                })
+            ),
+            "{error:#}"
+        );
+        assert!(!root.join("ran").exists(), "a step ran");
+    }
+
+    /// An approval holds for the spec it was given for: the same steps run
+    /// again without asking, and steps that changed since ask again.
+    #[test]
+    fn an_approval_holds_for_its_spec_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = workspace_with_step(dir.path(), "\"-p\", \"ran\"");
+        let state =
+            StateDir::resolve(Some(dir.path().join("state").as_os_str()), dir.path()).unwrap();
+        let lock = lock_tree(&state, &root).unwrap();
+        let record = dir.path().join("env-spec-ran");
+        let yes = || Ok(true);
+        let approval = |ask| Approval {
+            record: record.clone(),
+            yes: false,
+            ask,
+        };
+        materialize(&lock, &root, &approval(&yes)).unwrap();
+        assert!(root.join("ran").is_dir());
+        std::fs::remove_dir(root.join("ran")).unwrap();
+        materialize(&lock, &root, &unasked(dir.path())).unwrap();
+        assert!(root.join("ran").is_dir());
+        std::fs::write(
+            root.join(".fabric/env.toml"),
+            "[[setup]]\nprogram = \"mkdir\"\nargs = [\"-p\", \"other\"]\n",
+        )
+        .unwrap();
+        let no = || Ok(false);
+        assert!(materialize(&lock, &root, &approval(&no)).is_err());
+        assert!(
+            !root.join("other").exists(),
+            "a changed step ran unapproved"
+        );
+    }
+
     /// With every cache whole no step runs, and the declared variable must
     /// still stop the launch.
     #[test]
@@ -843,7 +1026,7 @@ mod tests {
         let state =
             StateDir::resolve(Some(dir.path().join("state").as_os_str()), dir.path()).unwrap();
         let lock = lock_tree(&state, &root).unwrap();
-        let Err(error) = materialize(&lock, &root) else {
+        let Err(error) = materialize(&lock, &root, &unasked(dir.path())) else {
             panic!("the launch went ahead");
         };
         let error = error.to_string();
@@ -873,7 +1056,7 @@ mod tests {
             harness_config: fabricd::harnesses::HarnessConfig::default(),
             home: dir.path().join("the-nodes"),
         };
-        let Err(error) = launch(&state, &mine, &plan, None).await else {
+        let Err(error) = launch(&state, &mine, &plan, None, &unasked(dir.path())).await else {
             panic!("the launch went ahead");
         };
         let error = format!("{error:#}");
@@ -915,7 +1098,7 @@ mod tests {
             harness_config: fabricd::harnesses::HarnessConfig::default(),
             home: home.clone(),
         };
-        let Err(error) = launch(&state, &home, &plan, None).await else {
+        let Err(error) = launch(&state, &home, &plan, None, &unasked(dir.path())).await else {
             panic!("the launch went ahead");
         };
         assert!(

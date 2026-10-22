@@ -177,6 +177,13 @@ impl JobDir {
         self.dir.join("session.pending")
     }
 
+    /// The id of the environment spec whose setup steps the user last let
+    /// this node run for the job (ADR 0007); the CLI writes it.
+    #[must_use]
+    pub fn env_spec_ran(&self) -> PathBuf {
+        self.dir.join("env-spec-ran")
+    }
+
     /// Every secret pattern the job's spec held at a capture on this node.
     #[must_use]
     pub fn secret_patterns(&self) -> PathBuf {
