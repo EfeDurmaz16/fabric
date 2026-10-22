@@ -22,6 +22,7 @@ use fabric_core::harness::ProgramName;
 use fabric_core::path::{AbsPath, RelPath};
 use fabric_core::snapshot::{CacheClass, CarryKey, Platform, Remake, SnapshotManifest};
 use fabric_env::detect::{CacheOrigin, Completion, Detection, Ecosystem, NodeManager};
+use fabric_env::materialize::CacheHealth;
 use fabric_net::wire::{FactName, FactValue, Facts, MAX_FACT_VALUE};
 use fabric_store::capture::CarryKeys;
 
@@ -564,7 +565,14 @@ impl MeasuredKeys {
                                 if steps.is_empty() {
                                     Remake::Nothing
                                 } else {
-                                    Remake::Setup(steps)
+                                    // A cache whose health cannot be read
+                                    // proves no finished install.
+                                    let installed =
+                                        fabric_env::materialize::cache_health(d, &cache.path)
+                                            .is_ok_and(|health| {
+                                                health == Some(CacheHealth::Healthy)
+                                            });
+                                    Remake::Setup { steps, installed }
                                 }
                             }
                             // A declared cache no step fills holds whatever
@@ -648,7 +656,7 @@ pub fn forget_lost_remakes(manifest: &mut SnapshotManifest) -> Vec<RelPath> {
     manifest
         .caches
         .iter_mut()
-        .filter(|cache| matches!(cache.remake, Remake::Setup(_)))
+        .filter(|cache| matches!(cache.remake, Remake::Setup { .. }))
         .map(|cache| {
             cache.remake = Remake::Nothing;
             cache.path.clone()
@@ -773,12 +781,15 @@ mod tests {
                     class: CacheClass::Deps,
                     carry: CarryState::Carried,
                     key: CarryKey::Unmeasured,
-                    remake: Remake::Setup(vec![SetupStep {
-                        program: ProgramName::parse("npm").unwrap(),
-                        args: vec![fabric_core::env::SetupArg::parse("ci").unwrap()],
-                        cwd: None,
-                        when: fabric_core::env::RunWhen::CachesMissing,
-                    }]),
+                    remake: Remake::Setup {
+                        steps: vec![SetupStep {
+                            program: ProgramName::parse("npm").unwrap(),
+                            args: vec![fabric_core::env::SetupArg::parse("ci").unwrap()],
+                            cwd: None,
+                            when: fabric_core::env::RunWhen::CachesMissing,
+                        }],
+                        installed: true,
+                    },
                     native_files: 0,
                 },
             ],
@@ -792,7 +803,7 @@ mod tests {
         };
         let mut kept = manifest(&[(".env", LeaveReason::Secret)]);
         assert!(forget_lost_remakes(&mut kept).is_empty());
-        assert!(matches!(kept.caches[1].remake, Remake::Setup(_)));
+        assert!(matches!(kept.caches[1].remake, Remake::Setup { .. }));
         for left in ["package-lock.json", ".fabric"] {
             let mut lost = manifest(&[(left, LeaveReason::Excluded)]);
             assert_eq!(
@@ -814,9 +825,30 @@ mod tests {
         let detection = fabric_env::detect::detect(dir.path(), &[]).unwrap();
         let keys = MeasuredKeys::new(pro(), Some(&detection));
         let node_modules = RelPath::parse("node_modules").unwrap();
-        let Remake::Setup(steps) = keys.remake(CacheClass::Deps, &node_modules) else {
+        let Remake::Setup { steps, installed } = keys.remake(CacheClass::Deps, &node_modules)
+        else {
             panic!("no setup step recorded");
         };
+        assert!(!installed, "no install ran");
+        // The sentinel materialize writes after the install proves it.
+        std::fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(dir.path().join("node_modules/pkg/index.js"), "1;\n").unwrap();
+        let sentinel = fabric_env::materialize::sentinel_text(&detection, &node_modules).unwrap();
+        std::fs::write(
+            dir.path()
+                .join("node_modules")
+                .join(fabric_env::materialize::SENTINEL),
+            sentinel,
+        )
+        .unwrap();
+        let keys = MeasuredKeys::new(pro(), Some(&detection));
+        assert!(matches!(
+            keys.remake(CacheClass::Deps, &node_modules),
+            Remake::Setup {
+                installed: true,
+                ..
+            }
+        ));
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].program.to_string(), "npm");
         assert!(matches!(

@@ -266,8 +266,17 @@ pub struct CacheEntry {
 /// path it can rebuild from one it would lose.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Remake {
-    /// These setup steps of the job's spec fill the path from a lockfile; never empty.
-    Setup(Vec<SetupStep>),
+    /// Setup steps of the job's spec fill the path from a lockfile.
+    Setup {
+        /// The steps, in the spec's order; never empty.
+        steps: Vec<SetupStep>,
+        /// Whether the path held, at capture, the record materialize
+        /// writes once these steps exit 0 for the files they read then
+        /// (`fabric_env::materialize::SENTINEL`). Without it a target that
+        /// writes the bytes runs the steps again before it resumes, so the
+        /// bytes alone do not stand in for them.
+        installed: bool,
+    },
     /// The next build or tool run makes it again; no setup step does.
     NextBuild,
     /// Nothing does: a dependency tree with no lockfile, or a cache the
@@ -508,7 +517,7 @@ impl SnapshotManifest {
         check_tree("harness_state", &self.harness_state.entries)?;
         check_sorted("caches", self.caches.iter().map(|c| &c.path))?;
         for (index, cache) in self.caches.iter().enumerate() {
-            if matches!(&cache.remake, Remake::Setup(steps) if steps.is_empty()) {
+            if matches!(&cache.remake, Remake::Setup { steps, .. } if steps.is_empty()) {
                 return Err(ManifestError::EmptyRemake { index });
             }
         }

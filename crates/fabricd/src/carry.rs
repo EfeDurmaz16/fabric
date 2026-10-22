@@ -275,8 +275,9 @@ fn cannot_run(steps: &[SetupStep], key: &CarryKey, target: &NodeFacts) -> Option
 ///   another ABI, or when it may hold binaries for another platform.
 /// - Setup steps make it from a lockfile: carry when the keys match; else
 ///   rebuild when the target can run those steps as the source would; else
-///   carry when the platform matches and nothing inside is native; else
-///   refuse.
+///   carry when the platform matches, nothing inside is native and a
+///   finished install vouches for the bytes, since without one resume
+///   would run the steps there anyway; else refuse.
 /// - The next build makes it: carry when the keys match, or when the
 ///   platform matches and the target lacks the toolchain the key names;
 ///   leave it behind on another platform; else rebuild.
@@ -317,7 +318,9 @@ pub fn decide(entry: &CacheEntry, source: &Platform, target: &NodeFacts) -> Carr
                 warnings,
             }
         }
-        Remake::Setup(steps) => decide_setup(entry, steps, seen, source, target),
+        Remake::Setup { steps, installed } => {
+            decide_setup(entry, (steps, *installed), seen, source, target)
+        }
         Remake::NextBuild => decide_next_build(entry, seen, source),
     }
 }
@@ -374,10 +377,11 @@ impl Seen {
     }
 }
 
-/// A path setup steps make from a lockfile.
+/// A path setup steps make from a lockfile; `installed` says a finished
+/// install of those steps vouches for its bytes.
 fn decide_setup(
     entry: &CacheEntry,
-    steps: &[SetupStep],
+    (steps, installed): (&[SetupStep], bool),
     seen: Seen,
     source: &Platform,
     target: &NodeFacts,
@@ -398,11 +402,18 @@ fn decide_setup(
     let steps_text = steps_text.join(", then ");
     let advice = "install the tool on the target, or pass --force to carry it as it is";
     match (seen.same_platform, seen.native) {
-        (true, None) => CarryDecision::Carry {
+        (true, None) if installed => CarryDecision::Carry {
             why: format!(
-                "{missing}, so {steps_text} cannot rebuild it there; it holds no native addon and the os and arch match, so it travels as it is"
+                "{missing}, so {steps_text} cannot rebuild it there; it holds no native addon, the os and arch match and a finished install vouches for it, so it travels as it is"
             ),
             warnings: seen.warnings,
+        },
+        // Materialize runs the steps over a tree no finished install
+        // vouches for, so the bytes alone would not let the job resume.
+        (true, None) => CarryDecision::Refuse {
+            reason: format!(
+                "{missing}, so {steps_text} cannot rebuild it there, and no install Fabric finished on the source vouches for it, so resume there would run {steps_text} first; install the tool on the target, or pass --force to carry it and install the tool before resuming"
+            ),
         },
         (true, Some(native)) => CarryDecision::Refuse {
             reason: format!(
@@ -571,6 +582,7 @@ mod tests {
         )
     }
 
+    /// A tree a finished install filled from a lockfile, as the sentinel says.
     fn locked_tree(manager: &str, pm_major: &str, install: SetupStep) -> CacheEntry {
         entry(
             "node_modules",
@@ -582,7 +594,10 @@ mod tests {
                 pnpm_store_path: (manager == "pnpm")
                     .then(|| "/Users/x/Library/pnpm/store/v11".to_owned()),
             },
-            Remake::Setup(vec![install]),
+            Remake::Setup {
+                steps: vec![install],
+                installed: true,
+            },
         )
     }
 
@@ -683,7 +698,10 @@ mod tests {
                 python_version: "Python 3.12.1".to_owned(),
                 python_home: fabric_core::path::AbsPath::parse("/opt/py312").unwrap(),
             },
-            Remake::Setup(vec![step("uv", &["sync", "--frozen"])]),
+            Remake::Setup {
+                steps: vec![step("uv", &["sync", "--frozen"])],
+                installed: true,
+            },
         );
         for tree in [npm_tree(), venv] {
             assert!(tree.key.matches(&target.key_like(&tree.key)), "{tree:?}");
@@ -817,6 +835,39 @@ mod tests {
         );
     }
 
+    /// A locked tree installed outside Fabric holds no sentinel, so after
+    /// a restore materialize runs the lockfile install over it, and a
+    /// target without the package manager could not resume the job. Such
+    /// a tree is refused where a finished install would have travelled
+    /// (review of PR #11).
+    #[test]
+    fn a_locked_tree_no_finished_install_vouches_for_is_refused_where_it_cannot_be_rebuilt() {
+        let mut tree = pnpm_tree();
+        tree.remake = Remake::Setup {
+            steps: vec![step("pnpm", &["install", "--frozen-lockfile"])],
+            installed: false,
+        };
+        let decision = decide(&tree, &macos(), &air());
+        let CarryDecision::Refuse { reason } = &decision else {
+            panic!("{decision:?}");
+        };
+        assert_eq!(
+            reason,
+            "pnpm is not installed on the target, so `pnpm install --frozen-lockfile` cannot rebuild it there, and no install Fabric finished on the source vouches for it, so resume there would run `pnpm install --frozen-lockfile` first; install the tool on the target, or pass --force to carry it and install the tool before resuming"
+        );
+        assert!(decision.writes(), "a forced move must not lose the tree");
+        let mut npm = npm_tree();
+        npm.remake = Remake::Setup {
+            steps: vec![step("npm", &["ci"])],
+            installed: false,
+        };
+        assert!(decide(&npm, &macos(), &air()).refuses());
+        assert!(matches!(
+            decide(&npm, &macos(), &pro()),
+            CarryDecision::Carry { .. }
+        ));
+    }
+
     #[test]
     fn a_locked_tree_whose_manager_major_differs_is_not_rebuilt() {
         let decision = decide(&npm_tree(), &macos(), &air());
@@ -943,7 +994,10 @@ mod tests {
                 python_version: String::new(),
                 python_home: fabric_core::path::AbsPath::parse("/x").unwrap(),
             }),
-            Remake::Setup(vec![step("uv", &["sync", "--frozen"])]),
+            Remake::Setup {
+                steps: vec![step("uv", &["sync", "--frozen"])],
+                installed: true,
+            },
         );
         let with_uv = NodeFacts::from_pairs([
             (name::OS, "macos"),
@@ -1007,7 +1061,10 @@ mod tests {
             "web/node_modules",
             CacheClass::Deps,
             CarryKey::Unmeasured,
-            Remake::Setup(vec![step("make", &["deps"])]),
+            Remake::Setup {
+                steps: vec![step("make", &["deps"])],
+                installed: true,
+            },
         );
         assert!(matches!(
             decide(&tree, &macos(), &air()),

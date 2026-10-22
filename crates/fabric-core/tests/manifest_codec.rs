@@ -131,7 +131,8 @@ fn setup_step() -> impl Strategy<Value = SetupStep> {
 
 fn remake() -> impl Strategy<Value = Remake> {
     prop_oneof![
-        proptest::collection::vec(setup_step(), 1..3).prop_map(Remake::Setup),
+        (proptest::collection::vec(setup_step(), 1..3), any::<bool>())
+            .prop_map(|(steps, installed)| Remake::Setup { steps, installed }),
         Just(Remake::NextBuild),
         Just(Remake::Nothing),
     ]
@@ -434,12 +435,15 @@ fn fixed_manifest() -> Result<SnapshotManifest, Box<dyn Error>> {
                 pm_major: "10".into(),
                 pnpm_store_path: None,
             },
-            remake: Remake::Setup(vec![SetupStep {
-                program: ProgramName::parse("npm")?,
-                args: vec![SetupArg::parse("ci")?],
-                cwd: None,
-                when: RunWhen::CachesMissing,
-            }]),
+            remake: Remake::Setup {
+                steps: vec![SetupStep {
+                    program: ProgramName::parse("npm")?,
+                    args: vec![SetupArg::parse("ci")?],
+                    cwd: None,
+                    when: RunWhen::CachesMissing,
+                }],
+                installed: true,
+            },
             native_files: 0,
         }],
         left_behind: vec![LeftBehind {
@@ -451,13 +455,15 @@ fn fixed_manifest() -> Result<SnapshotManifest, Box<dyn Error>> {
 
 /// Pins format version 2. A field added, removed or reordered changes this
 /// hash and must come with a version bump, as version 2 did when the cache
-/// rows gained what a target decides them by (2026-10-21).
+/// rows gained what a target decides them by (2026-10-21). `installed`
+/// joined `Remake::Setup` on 2026-10-22, before version 2 was merged or
+/// written by any released build, so it is part of version 2.
 #[test]
 fn format_version_two_hash_is_pinned() {
     let id = fixed_manifest().unwrap().id().unwrap().to_string();
     assert_eq!(
         id,
-        "df1362a91097145632c25dfc13974ba609569af6cb850ca8e613c5931c6d9fb2"
+        "67d16a515a83e7bec72705376208b8f039045c5428e7f95bc862df7724b5c765"
     );
 }
 
@@ -551,7 +557,10 @@ fn a_repeated_config_key_keeps_its_values_and_an_unsorted_one_is_refused() {
 #[test]
 fn a_remake_with_no_setup_step_is_refused() {
     let mut m = fixed_manifest().unwrap();
-    m.caches[0].remake = Remake::Setup(Vec::new());
+    m.caches[0].remake = Remake::Setup {
+        steps: Vec::new(),
+        installed: true,
+    };
     assert!(matches!(
         m.encode(),
         Err(ManifestError::EmptyRemake { index: 0 })
