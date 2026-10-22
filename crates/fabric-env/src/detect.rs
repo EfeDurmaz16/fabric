@@ -4,8 +4,10 @@
 //! and nothing else. It reads regular files only: a symbolic link in that
 //! list is refused, because a link can point at a file the secret policy
 //! denies or at one outside the workspace, and either would break the next
-//! rule. That holds for a file it only checks for, such as a lockfile, as
-//! well, since the step that file selects reads it. It never opens a file
+//! rule. A file it only checks for and hashes, such as a lockfile, may be
+//! a link to a regular file inside the workspace that the policy does not
+//! deny, since that resolves the same on every node; any other link there
+//! is refused, since the step that file selects reads it. It never opens a file
 //! the job's secret policy denies, and counts a denied file it only checks
 //! for as absent, since capture leaves it behind and the next node will
 //! not have it. It never reads an environment variable and never runs a
@@ -1402,26 +1404,47 @@ fn rel(path: &'static str) -> Result<RelPath, DetectError> {
     RelPath::parse(path).map_err(|_| DetectError::BuiltIn { name: path })
 }
 
-/// Returns whether the regular file `file` is under `root`; a link or another file that is not regular is refused, and an error other than "not found" is an error.
+/// Opens the regular file the link at `full` names, for `file`, a file
+/// detection checks for or hashes, when it lies inside `root` and
+/// `secrets` does not deny it; any other link is refused.
 ///
-/// A file detection only checks for still selects the step that reads it:
-/// with `package-lock.json -> ../lock.json` the spec says `npm ci` and the
-/// installer reads a file outside the workspace, which can differ from
-/// node to node, and a directory at a lockfile's name would select an
-/// install that cannot run. Both are refused, as `read_text` refuses a
-/// linked pin file. A directory on the way that is a link, such as
-/// `.devcontainer -> ..`, means `file` is not in the workspace, so it
-/// counts as absent.
-fn exists(root: &Path, file: &'static str) -> Result<bool, DetectError> {
-    let Some(full) = inside(root, file)? else {
-        return Ok(false);
-    };
-    match fs::symlink_metadata(full) {
-        Ok(meta) if meta.is_file() => Ok(true),
-        Ok(_) => Err(DetectError::NotARegularFile { file }),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(source) => Err(DetectError::Read { file, source }),
+/// Such a link travels as a link and resolves the same on every node, as
+/// Django's `requirements.txt -> requirements/base.txt`. One that leaves
+/// the workspace, as `package-lock.json -> ../lock.json`, names a file
+/// that can differ from node to node; one to a denied file names a file
+/// capture leaves behind; one that names nothing or a directory selects
+/// an install that cannot run. The file is checked on the open handle to
+/// be the one the resolved path named, by device and inode.
+fn linked_file(
+    root: &Path,
+    secrets: &SecretPolicy,
+    file: &'static str,
+    full: &Path,
+) -> Result<fs::File, DetectError> {
+    let not_regular = || DetectError::NotARegularFile { file };
+    let read_err = |source| DetectError::Read { file, source };
+    let root = fs::canonicalize(root).map_err(read_err)?;
+    let target = fs::canonicalize(full).map_err(|_| not_regular())?;
+    let rel = target
+        .strip_prefix(&root)
+        .ok()
+        .and_then(Path::to_str)
+        .and_then(|text| RelPath::parse(text).ok())
+        .ok_or_else(not_regular)?;
+    if secrets.denies(&rel, Scope::Work).is_some() {
+        return Err(not_regular());
     }
+    let seen = fs::metadata(&target).map_err(read_err)?;
+    let handle = fs::File::open(&target).map_err(read_err)?;
+    let opened = handle.metadata().map_err(read_err)?;
+    if !seen.is_file()
+        || !opened.is_file()
+        || opened.dev() != seen.dev()
+        || opened.ino() != seen.ino()
+    {
+        return Err(not_regular());
+    }
+    Ok(handle)
 }
 
 /// Returns `root/file` when every directory on the way is a real directory, or `None` when one is missing or a link.
@@ -1512,7 +1535,7 @@ struct Reader<'a> {
 }
 
 impl Reader<'_> {
-    /// Returns whether `file` is present for detection: absent when the secret policy denies it, else as `exists` says.
+    /// Returns whether `file` is present for detection: absent when the secret policy denies it, else as `open_checked` finds it.
     ///
     /// Capture leaves a denied file out of the snapshot, so on the next
     /// node it is not there. Counting it here would give the source a spec
@@ -1522,7 +1545,32 @@ impl Reader<'_> {
         if self.denied(file)? {
             return Ok(false);
         }
-        exists(self.root, file)
+        Ok(self.open_checked(file)?.is_some())
+    }
+
+    /// Opens `file`, which detection checks for or hashes: the regular file
+    /// at its name, or the one a link there names inside the workspace
+    /// (`linked_file`). `None` when nothing is there, or when a directory
+    /// on the way is a link, as `.devcontainer -> ..`, since then `file` is
+    /// not in the workspace. A file whose text detection reads still
+    /// refuses a link (`open_regular`).
+    ///
+    /// A file detection only checks for still selects the step that reads
+    /// it, so a directory at a lockfile's name, which selects an install
+    /// that cannot run, is refused.
+    fn open_checked(&self, file: &'static str) -> Result<Option<fs::File>, DetectError> {
+        let Some(full) = inside(self.root, file)? else {
+            return Ok(None);
+        };
+        match fs::symlink_metadata(&full) {
+            Ok(meta) if meta.is_symlink() => {
+                linked_file(self.root, self.secrets, file, &full).map(Some)
+            }
+            Ok(meta) if meta.is_file() => open_regular(self.root, file),
+            Ok(_) => Err(DetectError::NotARegularFile { file }),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(DetectError::Read { file, source }),
+        }
     }
 
     /// Returns true when the secret policy denies `file`, and logs which pattern did.
@@ -1563,7 +1611,7 @@ impl Reader<'_> {
         if self.denied(file)? {
             return Ok(None);
         }
-        let Some(handle) = open_regular(self.root, file)? else {
+        let Some(handle) = self.open_checked(file)? else {
             return Ok(None);
         };
         let mut hasher = blake3::Hasher::new();
