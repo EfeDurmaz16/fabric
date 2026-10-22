@@ -326,6 +326,35 @@ fn a_tracked_directory_keeps_its_mode_and_mtime() {
     assert_eq!(git_difference(&root, &target).unwrap(), None);
 }
 
+/// An empty directory in a repository, untracked or ignored, travels like one in a plain directory.
+#[test]
+fn an_empty_directory_in_a_repository_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    fs::write(root.join(".gitignore"), "build/\n").unwrap();
+    for empty in ["logs", "build/cache", "deep/er/est"] {
+        fs::create_dir_all(root.join(empty)).unwrap();
+    }
+    set_mtime(&root.join("logs"), 1_500_000_000, 3).unwrap();
+
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    for empty in ["logs", "build/cache", "deep/er/est"] {
+        assert!(target.join(empty).is_dir(), "{empty}");
+        assert_eq!(
+            fs::read_dir(target.join(empty)).unwrap().count(),
+            0,
+            "{empty}"
+        );
+    }
+    assert_eq!(mtime_of(&target.join("logs")).unwrap(), (1_500_000_000, 3));
+}
+
 #[test]
 fn a_sha256_repository_round_trips() {
     let dir = tempfile::tempdir().unwrap();

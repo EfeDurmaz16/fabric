@@ -12,7 +12,7 @@
 //! act. An untracked secret never becomes an object; a tracked or stashed
 //! one, already in the user's object store, is named in the report.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io;
@@ -625,6 +625,66 @@ fn list_tree(base: &Path) -> Result<Listing, CaptureError> {
     Ok(out)
 }
 
+/// Lists every empty directory under `root`, without following links, for the git half, whose listings name only files.
+///
+/// A directory that holds `.git` in any letter case is a repository, a
+/// nested one or a submodule checkout, and is not walked. `skip` names an
+/// empty directory that travels another way, such as a submodule that was
+/// never initialized, whose path `W` holds.
+fn empty_dirs(root: &Path, skip: &dyn Fn(&RelPath) -> bool) -> Result<Vec<Found>, CaptureError> {
+    fn walk(
+        root: &Path,
+        prefix: &str,
+        skip: &dyn Fn(&RelPath) -> bool,
+        out: &mut Vec<Found>,
+    ) -> Result<(), CaptureError> {
+        let dir = root.join(prefix);
+        let mut names: Vec<_> = fs::read_dir(&dir)
+            .map_err(|e| io_err(&dir, e))?
+            .map(|e| e.map(|e| e.file_name()))
+            .collect::<Result<_, _>>()
+            .map_err(|e| io_err(&dir, e))?;
+        names.sort();
+        let is_git = |name: &std::ffi::OsString| name.eq_ignore_ascii_case(".git");
+        if !prefix.is_empty() && names.iter().any(is_git) {
+            return Ok(());
+        }
+        if !prefix.is_empty() && names.is_empty() {
+            let rel = rel_path(prefix)?;
+            if !skip(&rel) {
+                let meta = fs::symlink_metadata(&dir).map_err(|e| io_err(&dir, e))?;
+                out.push(Found {
+                    rel,
+                    kind: FoundKind::Dir,
+                    meta,
+                });
+            }
+            return Ok(());
+        }
+        for name in names.iter().filter(|name| !is_git(name)) {
+            let Some(name) = name.to_str() else {
+                return Err(CaptureError::NotUtf8 {
+                    path: dir.join(name).to_string_lossy().into_owned(),
+                });
+            };
+            let text = if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let full = root.join(&text);
+            let meta = fs::symlink_metadata(&full).map_err(|e| io_err(&full, e))?;
+            if meta.is_dir() {
+                walk(root, &text, skip, out)?;
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(root, "", skip, &mut out)?;
+    Ok(out)
+}
+
 /// Every path a listing saw, with the stamp of each, to tell whether the tree changed after it was listed.
 ///
 /// A FIFO, socket or device has no stamp; only its name counts.
@@ -668,6 +728,17 @@ impl Census {
     fn unchanged_under(&self, base: &Path) -> Result<(), CaptureError> {
         let later = list_tree(base)?;
         self.unchanged_in(&Census::of(&later.found, later.special.iter()))
+    }
+}
+
+/// Adds every directory above `rel` to `dirs`.
+fn add_parents(rel: &RelPath, dirs: &mut BTreeSet<RelPath>) {
+    let mut parent = rel.as_str();
+    while let Some((dir, _)) = parent.rsplit_once('/') {
+        if let Ok(dir) = RelPath::parse(dir) {
+            dirs.insert(dir);
+        }
+        parent = dir;
     }
 }
 
@@ -751,6 +822,7 @@ impl Capturer<'_> {
                 // and nothing denies it, so an empty directory is not lost.
                 if class.carried() {
                     emitted_dirs.insert(item.rel.clone());
+                    add_parents(&item.rel, &mut carried_dirs);
                     entries.push(self.entry_for(base, &item)?);
                 }
                 continue;
@@ -784,13 +856,7 @@ impl Capturer<'_> {
                     }
                 }
             }
-            let mut parent = item.rel.as_str();
-            while let Some((dir, _)) = parent.rsplit_once('/') {
-                if let Ok(dir) = RelPath::parse(dir) {
-                    carried_dirs.insert(dir);
-                }
-                parent = dir;
-            }
+            add_parents(&item.rel, &mut carried_dirs);
             entries.push(self.entry_for(base, &item)?);
         }
         for dir in carried_dirs.difference(&emitted_dirs) {
@@ -2090,11 +2156,15 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
         worktree_dirs = std::mem::take(&mut seen.dirs);
         let report = &mut capturer.report;
         let (special, nested) = (report.special_files.len(), report.nested_repositories.len());
-        let found = repo.ignored(report)?;
+        let mut found = repo.ignored(report)?;
         let names = report.special_files[special..]
             .iter()
             .chain(&report.nested_repositories[nested..]);
         let ignored = Census::of(&found, names);
+        // git lists files only, so an empty directory, untracked or
+        // ignored, comes from a walk; one `W` holds as a submodule stays out.
+        let in_w: HashSet<&RelPath> = seen.paths.iter().collect();
+        found.extend(empty_dirs(req.root, &|rel| in_w.contains(rel))?);
         (
             Some(state),
             found,
