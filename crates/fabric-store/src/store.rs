@@ -83,6 +83,12 @@ pub enum StoreError {
         /// The base the manifest names.
         base: SnapshotId,
     },
+    /// A manifest's bundle base has no git state, or one in another object format, so its bundle cannot come first in the chain.
+    #[error("bundle base {base} has no git state in the object format of the snapshot")]
+    IncompatibleBundleBase {
+        /// The base the manifest names.
+        base: SnapshotId,
+    },
     /// A file entry's objects do not add up to the size it records, so no restore could write it.
     #[error("{path}: the objects hold {held} bytes but the entry records {size}")]
     SizeMismatch {
@@ -291,17 +297,29 @@ impl Store {
     /// flushed, and only then does the catalog get the rows. Publishing a
     /// manifest the store already has returns its id and changes nothing. A
     /// manifest above `MAX_MANIFEST_LEN` is refused, since it could never be
-    /// read back.
+    /// read back. A bundle base must be in the store and hold git state in
+    /// the manifest's object format: restore unpacks the base's bundles into
+    /// a repository of that format before this one's.
     pub fn publish(&mut self, manifest: &SnapshotManifest) -> Result<SnapshotId, StoreError> {
         let bytes = encode_manifest(manifest)?;
         let id = SnapshotId::of(&bytes);
         if self.catalog.snapshot(id)?.is_some() {
             return Ok(id);
         }
-        if let Some(base) = manifest.git.as_ref().and_then(|g| g.bundle_base)
-            && self.catalog.snapshot(base)?.is_none()
+        if let Some(git) = &manifest.git
+            && let Some(base) = git.bundle_base
         {
-            return Err(StoreError::MissingBundleBase { base });
+            if self.catalog.snapshot(base)?.is_none() {
+                return Err(StoreError::MissingBundleBase { base });
+            }
+            let sha256 = git.index_commit.is_sha256();
+            let compatible = self
+                .manifest(base)?
+                .git
+                .is_some_and(|b| b.index_commit.is_sha256() == sha256);
+            if !compatible {
+                return Err(StoreError::IncompatibleBundleBase { base });
+            }
         }
         let mut data = Vec::new();
         for chunk in Self::data_chunks(manifest) {

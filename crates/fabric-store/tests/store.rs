@@ -234,6 +234,48 @@ fn publish_refuses_a_bundle_base_the_store_does_not_have() {
     assert!(store.snapshots().unwrap().is_empty());
 }
 
+/// Git state that names no objects, with ids `width` hex digits wide.
+fn empty_git(width: usize, bundle_base: Option<SnapshotId>) -> Fallible<GitState> {
+    let oid = GitOid::parse(&"0".repeat(width))?;
+    Ok(GitState {
+        bundle: Vec::new(),
+        bundle_base,
+        refs: Vec::new(),
+        head: GitHead::Branch("main".parse()?),
+        index_commit: oid.clone(),
+        worktree_commit: oid,
+        worktree_mtimes: Vec::new(),
+        config: Vec::new(),
+        exclude: None,
+    })
+}
+
+#[test]
+fn publish_refuses_a_bundle_base_without_git_state_in_the_same_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::create(dir.path(), params().unwrap()).unwrap();
+    let plain = store
+        .publish(&manifest(vec![file_entry(&store, "a", b"a").unwrap()], 1).unwrap())
+        .unwrap();
+    let mut sha1 = manifest(Vec::new(), 2).unwrap();
+    sha1.git = Some(empty_git(40, None).unwrap());
+    let sha1 = store.publish(&sha1).unwrap();
+
+    for (base, width) in [(plain, 40), (sha1, 64)] {
+        let mut child = manifest(Vec::new(), 3).unwrap();
+        child.git = Some(empty_git(width, Some(base)).unwrap());
+        let err = store.publish(&child).unwrap_err();
+        assert!(
+            matches!(err, StoreError::IncompatibleBundleBase { base: b } if b == base),
+            "{err}"
+        );
+    }
+    let mut child = manifest(Vec::new(), 3).unwrap();
+    child.git = Some(empty_git(40, Some(sha1)).unwrap());
+    assert!(store.publish(&child).is_ok());
+    assert_eq!(store.snapshots().unwrap().len(), 3);
+}
+
 #[test]
 fn a_second_open_of_a_held_store_is_refused() {
     let dir = tempfile::tempdir().unwrap();
