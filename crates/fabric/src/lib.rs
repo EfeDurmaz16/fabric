@@ -103,7 +103,7 @@ enum NodeCommand {
     },
     /// List the paired nodes.
     Ls,
-    /// Dial a paired node and ping it.
+    /// Ping a paired node over its session, dialing it when none is open.
     Ping {
         /// The node.
         node: NodeId,

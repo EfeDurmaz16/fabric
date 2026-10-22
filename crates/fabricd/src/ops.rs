@@ -236,21 +236,24 @@ impl Node {
         }
     }
 
+    /// Pings `node` over its live session, or a new dial when there is
+    /// none or the live one fails: a second dial while a session is live
+    /// would replace it and cut the calls other commands make on it.
     async fn node_ping(self: &Arc<Self>, node: NodeId, out: &mut Out) -> Result<(), NodeError> {
-        let session = self.dial(node).await?;
-        let started = tokio::time::Instant::now();
-        session
-            .ping(SHORT_DEADLINE)
-            .await
-            .map_err(|e| NodeError::Unreachable {
-                peer: node,
-                reason: e.to_string(),
-            })?;
+        let (took, wire, skew) = self
+            .call(node, |session| async move {
+                let started = tokio::time::Instant::now();
+                session.ping(SHORT_DEADLINE).await?;
+                Ok((
+                    started.elapsed(),
+                    session.kind().to_string(),
+                    session.clock_skew_ms(),
+                ))
+            })
+            .await?;
         out.say(format!(
-            "{node} answered in {} ms over {}; its clock is {} ms from this one",
-            started.elapsed().as_millis(),
-            session.kind(),
-            session.clock_skew_ms()
+            "{node} answered in {} ms over {wire}; its clock is {skew} ms from this one",
+            took.as_millis(),
         ));
         Ok(())
     }
@@ -1010,7 +1013,7 @@ impl Node {
             Ok(value) => Ok(value),
             Err(e) if is_transport(&e) => {
                 self.forget(peer, &session);
-                let session = self.dial(peer).await?;
+                let session = self.session(peer).await?;
                 f(session).await.map_err(|e| NodeError::Unreachable {
                     peer,
                     reason: e.to_string(),
@@ -1779,7 +1782,7 @@ impl Node {
             Ok(()) => Ok(()),
             Err(first) => {
                 self.forget(peer, &session);
-                let session = self.dial(peer).await.map_err(|_| first)?;
+                let session = self.session(peer).await.map_err(|_| first)?;
                 fetch_snapshot(&self.store, &session, snapshot).await
             }
         }

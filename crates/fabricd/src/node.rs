@@ -8,7 +8,11 @@
 //! are the same process (ADR 0003, Who supervises the harness). A session
 //! with a peer exists only after the pinned TLS handshake and the hello
 //! (ADR 0013), and every session both calls and serves, so either node can
-//! ask the other for chunks over the connection one of them dialed.
+//! ask the other for chunks over the connection one of them dialed. A peer
+//! holds at most one live session per direction: a new connection dialed
+//! the same way as a live one closes the older, so the per-session work
+//! caps bound what a paired peer can run here, and dials to one peer are
+//! made one at a time, so this node never displaces a session it is using.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
@@ -73,6 +77,10 @@ pub struct Node {
     sessions: Mutex<HashMap<NodeId, Arc<Session>>>,
     /// The caps every session with one peer shares, so a peer that connects again gets no fresh ones.
     serve_limits: ServeLimits,
+    /// The live session per peer and direction; a newer one closes the older.
+    opened: Mutex<HashMap<(NodeId, Side), Arc<Session>>>,
+    /// One gate per peer that a dial to it holds.
+    dialing: Mutex<HashMap<NodeId, Arc<tokio::sync::Mutex<()>>>>,
     pub(crate) harness_config: HarnessConfig,
     control: Mutex<Option<UnixListener>>,
     pub(crate) recovered: tokio::sync::watch::Sender<bool>,
@@ -149,6 +157,8 @@ impl Node {
             endpoint,
             sessions: Mutex::new(HashMap::new()),
             serve_limits: ServeLimits::new(),
+            opened: Mutex::new(HashMap::new()),
+            dialing: Mutex::new(HashMap::new()),
             harness_config,
             control: Mutex::new(Some(control)),
             recovered: tokio::sync::watch::Sender::new(false),
@@ -254,7 +264,7 @@ impl Node {
         .await
         {
             Ok(session) => {
-                self.register(Arc::new(session));
+                self.register(Arc::new(session), Side::Accepted);
             }
             Err(e) => tracing::info!(error = %e, "an incoming session failed its hello"),
         }
@@ -263,9 +273,20 @@ impl Node {
     /// Keeps `session` for calls to its peer, serves the peer's requests on
     /// it until it ends, and catches up with the peer, which may have
     /// written records while the two were apart.
-    fn register(self: &Arc<Self>, session: Arc<Session>) {
+    ///
+    /// A live session the same side dialed is closed: its serving task
+    /// would otherwise run on with semaphores of its own, so a peer that
+    /// keeps connecting could run any number of requests here at once. A
+    /// session the other side dialed stays, so two nodes that dial each
+    /// other at once keep one session each way and neither closes both.
+    fn register(self: &Arc<Self>, session: Arc<Session>, side: Side) {
         let peer = session.peer();
+        let displaced = lock(&self.opened).insert((peer, side), Arc::clone(&session));
         lock(&self.sessions).insert(peer, Arc::clone(&session));
+        if let Some(old) = displaced {
+            tracing::info!(%peer, ?side, "a newer session replaced a live one; closing the older");
+            old.close();
+        }
         self.spawn_catch_up(peer);
         let node = Arc::clone(self);
         tokio::spawn(async move {
@@ -273,6 +294,14 @@ impl Node {
             let trust: Arc<dyn Trust> = node.peers.clone();
             let ended = session.serve(service, trust, &node.serve_limits).await;
             tracing::info!(%peer, reason = %ended, "session ended");
+            let mut opened = lock(&node.opened);
+            if opened
+                .get(&(peer, side))
+                .is_some_and(|kept| Arc::ptr_eq(kept, &session))
+            {
+                opened.remove(&(peer, side));
+            }
+            drop(opened);
             let mut sessions = lock(&node.sessions);
             if sessions
                 .get(&peer)
@@ -284,8 +313,17 @@ impl Node {
     }
 
     /// A live session with `peer`: the one already open, or a new dial.
+    ///
+    /// Dials to one peer wait for each other, and each looks for a session
+    /// again once it may go: a second dial would replace the first one's
+    /// session, and with it close a call another task is making on it.
     pub(crate) async fn session(self: &Arc<Self>, peer: NodeId) -> Result<Arc<Session>, NodeError> {
-        if let Some(session) = lock(&self.sessions).get(&peer).cloned() {
+        if let Some(session) = self.open_session(peer) {
+            return Ok(session);
+        }
+        let gate = Arc::clone(lock(&self.dialing).entry(peer).or_default());
+        let _dialing = gate.lock().await;
+        if let Some(session) = self.open_session(peer) {
             return Ok(session);
         }
         self.dial(peer).await
@@ -340,7 +378,7 @@ impl Node {
         // accepted connection came from may sit behind a NAT (ADR 0013).
         let _ =
             tokio::task::spawn_blocking(move || peers.update(|book| book.seen(peer, now))).await;
-        self.register(Arc::clone(&session));
+        self.register(Arc::clone(&session), Side::Dialed);
         Ok(session)
     }
 
@@ -370,6 +408,15 @@ impl Node {
         let mut done = self.recovered.subscribe();
         let _ = done.wait_for(|done| *done).await;
     }
+}
+
+/// Which side opened a session's connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Side {
+    /// This node dialed it.
+    Dialed,
+    /// The peer dialed it.
+    Accepted,
 }
 
 /// Treats a transport failure as a reason to drop the kept session and dial again.
@@ -611,6 +658,43 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    /// A paired peer can connect again while its first session lives. If
+    /// the node kept serving both, each with work caps of its own, a peer
+    /// that kept connecting could run any number of requests at once.
+    /// The node closes the older session once the newer one is up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_session_the_peer_dials_closes_its_first() {
+        let (_dir_a, a) = crate::ops::tests::node();
+        let (_dir_b, b) = crate::ops::tests::node();
+        crate::ops::tests::paired(&a, &b).await;
+        let addr: fabric_net::peers::HostPort =
+            a.local_addr().unwrap().to_string().parse().unwrap();
+        // Sessions b opens without keeping them, so only a can close them.
+        let open = || async {
+            let dialed = b
+                .endpoint
+                .dial_any(a.id, std::slice::from_ref(&addr))
+                .await
+                .unwrap();
+            Session::connect(
+                Arc::from(dialed.into_connection()),
+                b.id,
+                b.version.clone(),
+                HELLO_DEADLINE,
+            )
+            .await
+            .unwrap()
+        };
+        let deadline = Duration::from_secs(5);
+        let first = open().await;
+        first.ping(deadline).await.unwrap();
+        let second = open().await;
+        // a answers on a session only after it registered it.
+        second.ping(deadline).await.unwrap();
+        let pinged = first.ping(deadline).await;
+        assert!(pinged.is_err(), "the first session still serves");
+    }
 
     fn mode(path: &std::path::Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
