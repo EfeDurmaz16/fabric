@@ -20,6 +20,7 @@ use fabric_core::id::{Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::{FenceError, FencingToken};
 use fabric_core::ledger::{Author, EventKind, Ledger};
 use fabric_core::moves::{AbortAnswer, CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
+use fabric_core::snapshot::Platform;
 use fabric_env::materialize::{MaterializeError, TreeLock};
 use fabric_harness::codex::Codex;
 use fabric_harness::manifest::{MANIFEST_FILE, StateManifest};
@@ -2013,7 +2014,7 @@ impl Node {
             let harness_dir = has_harness_state.then(|| state_dir.clone());
             self.write_snapshot(
                 snapshot,
-                &manifest.caches,
+                (&manifest.caches, &manifest.platform),
                 &root,
                 harness_dir,
                 path_var,
@@ -2114,22 +2115,25 @@ impl Node {
         })
     }
 
-    /// Writes `snapshot` into the empty `root`, carrying each cache whose key matches this node's.
+    /// Writes `snapshot` into the empty `root`, carrying each cache whose
+    /// key matches this node's when it was built on this node's platform.
     async fn write_snapshot(
         &self,
         snapshot: SnapshotId,
-        caches: &[fabric_core::snapshot::CacheEntry],
+        (caches, built_on): (&[fabric_core::snapshot::CacheEntry], &Platform),
         root: &Path,
         harness_dir: Option<PathBuf>,
         path_var: &OsString,
         out: &mut Out,
     ) -> Result<(), NodeError> {
         let facts = NodeFacts::measure(&self.cfg.home, path_var, self.cfg.cargo_home.clone()).await;
-        report_caches(caches, &facts, out);
+        let here = this_platform();
+        report_caches(caches, (built_on, &here), &facts, out);
         let target = root.to_owned();
+        let built_on = built_on.clone();
         let report = with_store(&self.store, move |store| {
             let carry = |entry: &fabric_core::snapshot::CacheEntry| {
-                entry.key.matches(&facts.key_like(&entry.key))
+                carries(entry, (&built_on, &here), &facts)
             };
             Ok(restore(
                 store,
@@ -2557,10 +2561,47 @@ fn plan(
 /// Says, one line per cache, whether its bytes are written here or rebuilt,
 /// and why (ADR 0008); past `REPORT_PATHS` caches it counts the rest, so a
 /// resume's answer stays within one control message.
-fn report_caches(caches: &[fabric_core::snapshot::CacheEntry], facts: &NodeFacts, out: &mut Out) {
+/// The operating system and architecture of this node, as a capture here
+/// records them in its snapshot.
+fn this_platform() -> Platform {
+    Platform {
+        os: std::env::consts::OS.to_owned(),
+        arch: std::env::consts::ARCH.to_owned(),
+    }
+}
+
+/// Whether a restore here writes the cache `entry` of a snapshot captured
+/// on `built_on` rather than leaving it to its install step.
+///
+/// The keys must match, and the platforms must be one: a Node key names
+/// the Node and package manager majors, not the platform, and a Python key
+/// may match across platforms too, while a `node_modules` or a venv holds
+/// native addons and binaries built for the platform it was installed on
+/// (ADR 0004, Restore, step 6).
+fn carries(
+    entry: &fabric_core::snapshot::CacheEntry,
+    (built_on, here): (&Platform, &Platform),
+    facts: &NodeFacts,
+) -> bool {
+    built_on == here && entry.key.matches(&facts.key_like(&entry.key))
+}
+
+fn report_caches(
+    caches: &[fabric_core::snapshot::CacheEntry],
+    (built_on, here): (&Platform, &Platform),
+    facts: &NodeFacts,
+    out: &mut Out,
+) {
     for cache in caches.iter().take(REPORT_PATHS) {
         let mine = facts.key_like(&cache.key);
-        if cache.key.matches(&mine) && cache.carry == fabric_core::snapshot::CarryState::Carried {
+        if built_on != here {
+            out.say(format!(
+                "{}: rebuilt here, it was built on {} {} and this node is {} {}",
+                cache.path, built_on.os, built_on.arch, here.os, here.arch
+            ));
+        } else if carries(cache, (built_on, here), facts)
+            && cache.carry == fabric_core::snapshot::CarryState::Carried
+        {
             out.say(format!("{}: carried, the keys match", cache.path));
         } else {
             out.say(format!(
@@ -5259,6 +5300,39 @@ pub(crate) mod tests {
         );
     }
 
+    /// A Node key names the Node and package manager majors and not the
+    /// platform, so a `node_modules` built on another operating system or
+    /// architecture can match it. Its native addons would run here under a
+    /// valid install sentinel, so a cache crosses no platform.
+    #[test]
+    fn a_cache_built_on_another_platform_is_not_carried() {
+        let facts = NodeFacts::from_pairs([
+            (crate::facts::name::NODE, "v22.23.2"),
+            (crate::facts::name::NPM, "10.9.2"),
+        ]);
+        let entry = fabric_core::snapshot::CacheEntry {
+            path: fabric_core::path::RelPath::parse("node_modules").unwrap(),
+            class: fabric_core::snapshot::CacheClass::Deps,
+            carry: fabric_core::snapshot::CarryState::Carried,
+            key: fabric_core::snapshot::CarryKey::Node {
+                node_major: "22".to_owned(),
+                package_manager: "npm".to_owned(),
+                pm_major: "10".to_owned(),
+                pnpm_store_path: None,
+            },
+        };
+        let here = Platform {
+            os: "macos".to_owned(),
+            arch: "aarch64".to_owned(),
+        };
+        let elsewhere = Platform {
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+        };
+        assert!(carries(&entry, (&here, &here), &facts));
+        assert!(!carries(&entry, (&elsewhere, &here), &facts));
+    }
+
     /// A snapshot may name any number of cache paths, and a resume's answer
     /// must stay within one control message, so the cache report names
     /// the first of them and counts the rest.
@@ -5273,7 +5347,8 @@ pub(crate) mod tests {
             })
             .collect();
         let mut out = Out::default();
-        report_caches(&caches, &NodeFacts::default(), &mut out);
+        let here = this_platform();
+        report_caches(&caches, (&here, &here), &NodeFacts::default(), &mut out);
         assert_eq!(out.lines.len(), REPORT_PATHS + 1, "{:?}", out.lines.last());
         assert_eq!(
             out.lines.last().map(String::as_str),
