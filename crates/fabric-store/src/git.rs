@@ -1,6 +1,9 @@
 //! How Fabric runs git (ADR 0004, How Fabric runs git).
 //!
-//! Invariant: every git process this crate starts runs with no prompt, no
+//! Invariant: every git process this crate starts is a `git` found in an
+//! absolute `PATH` directory outside the repository it runs in, so neither a
+//! relative entry such as `.` nor an entry inside the workspace can make
+//! capture or restore run a `git` the workspace holds. It runs with no prompt, no
 //! network, no hooks, no fsmonitor and a fixed author, with the user's
 //! global and system config unread, with no `GIT_*` variable inherited from
 //! whoever started Fabric, and in the C locale so its messages can be
@@ -71,6 +74,30 @@ pub enum GitError {
     Name(#[from] GitNameError),
 }
 
+/// The first executable `git` on the `PATH` value `path_var` that lies
+/// outside `repo`.
+///
+/// A relative or empty entry names a directory relative to the current
+/// one, which is the repository for every command here, and an entry under
+/// the repository, such as a `node_modules/.bin` a shell hook added, is
+/// the workspace's too; both are skipped, as is a candidate that resolves
+/// into the repository through a link. The setup steps look their
+/// programs up the same way (`fabric-env`, `find_on_path`).
+fn program(path_var: Option<&OsStr>, repo: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_owned());
+    let inside =
+        |path: &Path| std::fs::canonicalize(path).is_ok_and(|real| real.starts_with(&repo));
+    std::env::split_paths(path_var?)
+        .filter(|dir| dir.is_absolute() && !dir.starts_with(&repo) && !inside(dir))
+        .map(|dir| dir.join("git"))
+        .find(|candidate| {
+            !inside(candidate)
+                && std::fs::metadata(candidate)
+                    .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
+}
+
 /// The `-c` settings that make git flush every file it writes to the device.
 const FSYNC_FLAGS: &[&str] = &["core.fsync=all", "core.fsyncMethod=fsync"];
 
@@ -107,8 +134,17 @@ impl Git {
         self
     }
 
-    fn command(&self) -> Command {
-        let mut cmd = Command::new("git");
+    fn command(&self) -> Result<Command, GitError> {
+        let program =
+            program(std::env::var_os("PATH").as_deref(), &self.repo).ok_or_else(|| {
+                GitError::Spawn {
+                    source: io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "no git in an absolute PATH directory outside the repository",
+                    ),
+                }
+            })?;
+        let mut cmd = Command::new(program);
         for flag in CONFIG_FLAGS {
             cmd.arg("-c").arg(flag);
         }
@@ -138,12 +174,12 @@ impl Git {
             cmd.env("GIT_AUTHOR_DATE", date)
                 .env("GIT_COMMITTER_DATE", date);
         }
-        cmd
+        Ok(cmd)
     }
 
     /// Runs git and returns its output whatever the status.
     pub fn output(&self, args: &[&str], env: &[(&str, &OsStr)]) -> Result<Output, GitError> {
-        let mut cmd = self.command();
+        let mut cmd = self.command()?;
         cmd.args(args);
         for (key, value) in env {
             cmd.env(key, value);
@@ -200,7 +236,7 @@ impl Git {
         env: &[(&str, &OsStr)],
         input: &[u8],
     ) -> Result<Vec<u8>, GitError> {
-        let mut cmd = self.command();
+        let mut cmd = self.command()?;
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -227,7 +263,7 @@ impl Git {
 
     /// Starts git with stdin and stdout piped, for streaming commands such as `cat-file --batch`.
     pub fn spawn_piped(&self, args: &[&str]) -> Result<Child, GitError> {
-        let mut cmd = self.command();
+        let mut cmd = self.command()?;
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -308,6 +344,54 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stdout)
         );
+    }
+
+    /// The child half: git must run from outside the repository whatever `PATH` says.
+    #[test]
+    fn a_git_in_the_workspace_child() {
+        let Ok(dir) = std::env::var("FABRIC_GIT_PATH_CHILD") else {
+            return;
+        };
+        let git = Git::new(Path::new(&dir));
+        assert_eq!(
+            git.run_text(&["rev-parse", "--is-inside-work-tree"])
+                .unwrap(),
+            "true"
+        );
+    }
+
+    /// A daemon whose `PATH` holds `.`, or a directory inside a workspace,
+    /// must not run a `git` the workspace holds when it captures or
+    /// restores there: that file is the agent's to write.
+    #[test]
+    fn a_git_in_the_workspace_is_never_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        Git::new(repo).run(&["init", "-q"]).unwrap();
+        let real = program(std::env::var_os("PATH").as_deref(), repo).unwrap();
+        let planted = "#!/bin/sh\ntouch \"$(dirname \"$0\")/ran\"\nexit 1\n";
+        fs::create_dir(repo.join("bin")).unwrap();
+        for at in [repo.join("git"), repo.join("bin/git")] {
+            fs::write(&at, planted).unwrap();
+            fs::set_permissions(&at, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path =
+            std::env::join_paths([Path::new("."), &repo.join("bin"), real.parent().unwrap()])
+                .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "git::tests::a_git_in_the_workspace_child"])
+            .env("FABRIC_GIT_PATH_CHILD", repo)
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(!repo.join("ran").exists(), "the workspace's git ran");
+        assert!(!repo.join("bin/ran").exists(), "the workspace's git ran");
     }
 
     #[test]
