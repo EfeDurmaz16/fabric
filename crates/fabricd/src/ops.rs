@@ -2272,7 +2272,7 @@ impl Node {
         // The agent of an ACP job is named per job, so only the target of a
         // pull, this node, can look for it.
         if let (Target::Here, Some((HarnessKind::Acp { program, .. }, _))) = (target, job) {
-            here.measure_acp(program.as_str(), path_var, &self.harness_config);
+            here.measure_acp(program, &self.harness_env(path_var)?);
         }
         // A session the peer opened is used too: a peer behind a NAT has
         // no address here and is reachable only over the session it dialed.
@@ -3724,6 +3724,66 @@ pub(crate) mod tests {
             job.lock().await.view(a.id),
             LeaseView::Owner(token) if token.epoch == Epoch::FIRST
         ));
+    }
+
+    /// A `state_dir` that harness.toml names but capture and restore refuse,
+    /// under `~/.fabric` or reached through a link, is no `state_dir`: a
+    /// pull must refuse it before ownership moves, or the job would be
+    /// owned by a node that cannot restore or capture its session.
+    #[tokio::test]
+    async fn a_pull_refuses_an_acp_state_dir_capture_would_refuse() {
+        let (dir_a, a) = node();
+        let dir_b = tempfile::Builder::new()
+            .prefix("fops")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = std::fs::canonicalize(dir_b.path()).unwrap();
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(&root, home.join("linked")).unwrap();
+        let state = StateDir::resolve(Some(root.join("state").as_os_str()), &home).unwrap();
+        std::fs::create_dir_all(state.harness_config().parent().unwrap()).unwrap();
+        std::fs::write(
+            state.harness_config(),
+            "[acp.sh]\nstate_dir = \".fabric/sh\"\n\n[acp.cat]\nstate_dir = \"linked/sessions\"\n\n[acp.true]\nstate_dir = \"sessions\"\n",
+        )
+        .unwrap();
+        let b = Node::start(NodeConfig {
+            state,
+            home,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            dial: DialOrder::TcpOnly,
+            path_var: std::env::var_os("PATH").unwrap_or_default(),
+            cargo_home: None,
+        })
+        .unwrap();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        a.suspend(id, &path, &mut Out::default()).await.unwrap();
+        // The two test nodes have different homes, which refuses every pull.
+        for (agent, usable) in [("acp:sh", false), ("acp:cat", false), ("acp:true", true)] {
+            let harness = crate::harnesses::parse_harness(agent).unwrap();
+            let refused = b
+                .job_resume(
+                    id,
+                    Some(a.id),
+                    Some(harness),
+                    true,
+                    &path,
+                    &mut Out::default(),
+                )
+                .await;
+            let Err(NodeError::Preflight(facts)) = &refused else {
+                panic!("{agent}: {refused:?}");
+            };
+            let facts: Vec<&str> = facts.split(", ").collect();
+            assert_eq!(
+                facts.contains(&"acp.state_dir"),
+                !usable,
+                "{agent}: {facts:?}"
+            );
+        }
     }
 
     /// A registration appends `Resumed` and then writes the session the

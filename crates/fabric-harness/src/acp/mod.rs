@@ -141,6 +141,15 @@ impl AcpHarness {
         pipeline::fs_path(&self.home)
     }
 
+    /// Refuses, before any session is placed or taken, a state directory
+    /// that capture and restore would refuse: none declared, or one reached
+    /// through a link below the home. A target checks this before it takes
+    /// a job it would then be unable to resume.
+    pub fn check_state_dir(&self) -> Result<(), HarnessError> {
+        let (dir, _) = self.state_rel()?;
+        pipeline::refuse_symlinks(self.home_dir(), &dir)
+    }
+
     /// Sets how `session/request_permission` is answered.
     #[must_use]
     pub fn with_policy(mut self, policy: PermissionPolicy) -> Self {

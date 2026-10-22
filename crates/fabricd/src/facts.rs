@@ -15,13 +15,14 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use fabric_core::harness::ProgramName;
 use fabric_core::path::{AbsPath, RelPath};
 use fabric_core::snapshot::{CacheClass, CarryKey};
 use fabric_env::detect::{Detection, Ecosystem, NodeManager};
 use fabric_net::wire::{FactName, FactValue, Facts, MAX_FACT_VALUE};
 use fabric_store::capture::CarryKeys;
 
-use crate::harnesses::HarnessConfig;
+use crate::harnesses::HarnessEnv;
 
 /// How long one measuring command may run.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -235,15 +236,20 @@ impl NodeFacts {
         Self(facts)
     }
 
-    /// Adds what this node has for the ACP agent `program`: where `path_var`
-    /// finds it, and the `state_dir` `config` gives it. Either is absent
-    /// when the node has none.
-    pub fn measure_acp(&mut self, program: &str, path_var: &OsString, config: &HarnessConfig) {
-        if let Some(found) = find_on_path(program, path_var) {
+    /// Adds what this node has for the ACP agent `program`: where the
+    /// `PATH` of `env` finds it, and the `state_dir` its configuration gives
+    /// it. Either is absent when the node has none, and the state directory
+    /// is absent too when capture and restore would refuse it: outside the
+    /// home, the home itself or under `~/.fabric`, or reached through a link.
+    pub fn measure_acp(&mut self, program: &ProgramName, env: &HarnessEnv) {
+        if let Some(found) = find_on_path(program.as_str(), &env.path_var) {
             self.0
                 .insert(name::ACP_AGENT.to_owned(), found.display().to_string());
         }
-        if let Some(entry) = config.acp.get(program) {
+        if let Some(entry) = env.config.acp.get(program.as_str())
+            && crate::harnesses::acp_adapter(program, &[], env)
+                .is_ok_and(|adapter| adapter.check_state_dir().is_ok())
+        {
             self.0.insert(
                 name::ACP_STATE_DIR.to_owned(),
                 entry.state_dir.display().to_string(),

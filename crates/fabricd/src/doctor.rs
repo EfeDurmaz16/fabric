@@ -313,7 +313,7 @@ fn acp_rows(program: &str, here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>
         (
             name::ACP_STATE_DIR,
             format!(
-                "harness.toml here gives {program} no state_dir, so its session could not be restored or captured here"
+                "harness.toml here gives {program} no state_dir capture and restore accept (none, one outside the home or under ~/.fabric, or one reached through a link), so its session could not be restored or captured here"
             ),
         ),
     ];
