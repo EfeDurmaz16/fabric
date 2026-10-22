@@ -275,9 +275,10 @@ fn cannot_run(steps: &[SetupStep], key: &CarryKey, target: &NodeFacts) -> Option
 ///   another ABI, or when it may hold binaries for another platform.
 /// - Setup steps make it from a lockfile: carry when the keys match; else
 ///   rebuild when the target can run those steps as the source would; else
-///   carry when the platform matches, nothing inside is native and a
-///   finished install vouches for the bytes, since without one resume
-///   would run the steps there anyway; else refuse.
+///   carry when the platform matches, nothing inside is native, nothing
+///   under it stayed behind and a finished install vouches for the bytes,
+///   since without one resume would run the steps there anyway, and with
+///   holes its record would call a broken tree whole; else refuse.
 /// - The next build makes it: carry when the keys match, or when the
 ///   platform matches and the target lacks the toolchain the key names;
 ///   leave it behind on another platform; else rebuild.
@@ -401,12 +402,20 @@ fn decide_setup(
     let steps_text: Vec<String> = steps.iter().map(command).collect();
     let steps_text = steps_text.join(", then ");
     let advice = "install the tool on the target, or pass --force to carry it as it is";
+    let partial = entry.carry == CarryState::Partial;
     match (seen.same_platform, seen.native) {
-        (true, None) if installed => CarryDecision::Carry {
+        (true, None) if installed && !partial => CarryDecision::Carry {
             why: format!(
                 "{missing}, so {steps_text} cannot rebuild it there; it holds no native addon, the os and arch match and a finished install vouches for it, so it travels as it is"
             ),
             warnings: seen.warnings,
+        },
+        // The install record travels with the tree and calls it whole, so
+        // materialize would never fill the holes the secret policy left.
+        (true, None) if partial => CarryDecision::Refuse {
+            reason: format!(
+                "{missing}, so {steps_text} cannot rebuild it there, and files under it that match a secret pattern or .fabricignore stayed on the source while its install record calls it whole; install the tool on the target, or pass --force to carry it with the holes"
+            ),
         },
         // Materialize runs the steps over a tree no finished install
         // vouches for, so the bytes alone would not let the job resume.
@@ -900,6 +909,27 @@ mod tests {
     fn a_locked_tree_the_target_cannot_rebuild_on_another_platform_is_refused() {
         let decision = decide(&pnpm_tree(), &macos(), &linux());
         assert!(decision.refuses(), "{decision:?}");
+    }
+
+    /// A tree with holes and an install record that calls it whole is
+    /// refused where it cannot be rebuilt: written, materialize would trust
+    /// the record and never fill the holes (review of PR #11).
+    #[test]
+    fn a_partial_locked_tree_the_target_cannot_rebuild_is_refused() {
+        let mut tree = pnpm_tree();
+        tree.carry = CarryState::Partial;
+        let decision = decide(&tree, &macos(), &air());
+        let CarryDecision::Refuse { reason } = &decision else {
+            panic!("{decision:?}");
+        };
+        assert_eq!(
+            reason,
+            "pnpm is not installed on the target, so `pnpm install --frozen-lockfile` cannot rebuild it there, and files under it that match a secret pattern or .fabricignore stayed on the source while its install record calls it whole; install the tool on the target, or pass --force to carry it with the holes"
+        );
+        assert!(matches!(
+            decide(&pnpm_tree(), &macos(), &air()),
+            CarryDecision::Carry { .. }
+        ));
     }
 
     /// A tree the secret policy punched a hole in is never trusted as warm
