@@ -2,8 +2,9 @@
 //! built in ADR 0014, Capture).
 //!
 //! Invariant: capture reads the workspace and writes only objects into the
-//! store, two private commits and one ref under `refs/fabric/` into the
-//! repository, and deletes the job's older refs under `refs/fabric/`. Its
+//! store, and into the repository two private commits, one snapshot ref
+//! under `refs/fabric/` and one ref there per stash entry older than
+//! `refs/stash`, and deletes the job's older refs under `refs/fabric/`. Its
 //! scratch files (index copies, the bundle) live in the store's `tmp/`,
 //! which open and gc clear, never in the user's `.git`. It never touches
 //! the real index, the working tree or the user's refs. A path or state
@@ -1505,6 +1506,25 @@ impl GitCapture<'_> {
         Ok(BuiltBundle::Full(path))
     }
 
+    /// Pins the stash entries, makes the bundle, and returns it with the refs and `HEAD` it is proven to hold and the stash entries.
+    ///
+    /// A stash pushed or dropped after the pin would leave refs that no
+    /// longer match the stash list, and restore would rebuild another one.
+    fn bundle_with_stash(
+        &self,
+        plan: &BundlePlan,
+    ) -> Result<(BuiltBundle, RefView, Vec<GitOid>), CaptureError> {
+        let stashes = self.pin_stash()?;
+        let (built, view) = self.bundle_with_refs(plan)?;
+        if self.stash_entries()? != stashes {
+            let stash = RefName::parse("refs/stash").map_err(GitError::from)?;
+            return Err(CaptureError::RefsMoved {
+                moved: MovedRef::Ref(stash),
+            });
+        }
+        Ok((built, view, stashes))
+    }
+
     /// Makes the bundle and returns it with the refs and `HEAD` it is proven to hold.
     fn bundle_with_refs(&self, plan: &BundlePlan) -> Result<(BuiltBundle, RefView), CaptureError> {
         let view = self.ref_view()?;
@@ -1602,6 +1622,61 @@ impl GitCapture<'_> {
         Ok(!out.trim_ascii().is_empty())
     }
 
+    /// The prefix of the refs that hold this job's older stash entries, `stash@{1}` at `<prefix>1`.
+    fn stash_prefix(&self) -> String {
+        stash_prefix(self.job_id)
+    }
+
+    /// Lists the stash entries, newest first, so `stash@{n}` is at index `n`.
+    fn stash_entries(&self) -> Result<Vec<GitOid>, CaptureError> {
+        if !self
+            .git
+            .succeeds(&["rev-parse", "--verify", "-q", "refs/stash"])?
+        {
+            return Ok(Vec::new());
+        }
+        let out = self.git.run_text(&[
+            "log",
+            "--walk-reflogs",
+            "--no-show-signature",
+            "--format=%H",
+            "refs/stash",
+            "--",
+        ])?;
+        let mut entries = Vec::new();
+        for line in out.lines() {
+            entries.push(GitOid::parse(line).map_err(GitError::from)?);
+        }
+        if entries.is_empty() {
+            // A stash ref without a reflog is one entry.
+            let tip = self.git.run_text(&["rev-parse", "refs/stash"])?;
+            entries.push(GitOid::parse(&tip).map_err(GitError::from)?);
+        }
+        Ok(entries)
+    }
+
+    /// Points a ref under `stash_prefix` at every stash entry older than `refs/stash` and returns every entry.
+    ///
+    /// A bundle carries refs, not reflogs, so without these refs only
+    /// `stash@{0}` would travel and every older entry would be lost on
+    /// restore, which rebuilds the stash list from them. The job's earlier
+    /// stash refs are deleted first.
+    fn pin_stash(&self) -> Result<Vec<GitOid>, CaptureError> {
+        let prefix = self.stash_prefix();
+        let out = self
+            .git
+            .run_text(&["for-each-ref", "--format=%(refname)", &prefix])?;
+        for name in out.lines() {
+            self.git.run(&["update-ref", "-d", name])?;
+        }
+        let entries = self.stash_entries()?;
+        for (n, oid) in entries.iter().enumerate().skip(1) {
+            let name = format!("{prefix}{n}");
+            self.git.run(&["update-ref", &name, oid.as_str()])?;
+        }
+        Ok(entries)
+    }
+
     fn delete_older_snap_refs(&self, current: &GitOid) -> Result<(), CaptureError> {
         let prefix = self.snap_prefix();
         let out = self
@@ -1658,17 +1733,20 @@ impl GitCapture<'_> {
         Ok(mtimes)
     }
 
-    /// Lists the paths of the stash commit `stash` and of its index and untracked parents that `denies` names.
+    /// Lists the paths of every stash entry in `stashes` and of their index and untracked parents that `denies` names.
     ///
-    /// The bundle carries `refs/stash` with its parents, so a `.env` saved
-    /// by `git stash -u` travels with it although it was never tracked.
+    /// The bundle carries every stash entry with its parents, so a `.env`
+    /// saved by `git stash -u` travels with it although it was never tracked.
     fn stashed_secrets(
         &self,
-        stash: &GitOid,
+        stashes: &[GitOid],
         denies: &dyn Fn(&RelPath) -> bool,
     ) -> Result<Vec<RelPath>, CaptureError> {
         let mut found = BTreeSet::new();
-        for suffix in ["", "^2", "^3"] {
+        for (stash, suffix) in stashes
+            .iter()
+            .flat_map(|stash| ["", "^2", "^3"].map(|suffix| (stash, suffix)))
+        {
             let rev = format!("{}{suffix}", stash.as_str());
             let commit = format!("{rev}^{{commit}}");
             if !self
@@ -1729,6 +1807,11 @@ impl GitCapture<'_> {
         config.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(config)
     }
+}
+
+/// The prefix of the refs that hold a job's stash entries older than `refs/stash`; restore rebuilds the stash list from them.
+pub(crate) fn stash_prefix(job_id: JobId) -> String {
+    format!("refs/fabric/{job_id}/stash/")
 }
 
 /// Removes the part of a remote URL that can hold a credential (`fabric_core::git::credential_range`).
@@ -1984,13 +2067,11 @@ fn capture_git(
 
     let plan = BundlePlan::after(capturer.store, parent)?;
     repo.delete_older_snap_refs(&worktree_commit)?;
-    let (built, view) = repo.bundle_with_refs(&plan)?;
+    let (built, view, stashes) = repo.bundle_with_stash(&plan)?;
     let (bundle, bundle_base) = capturer.store_bundle(built)?;
     let RefView { refs, head } = view;
-    if let Some((_, stash)) = refs.iter().find(|(name, _)| name.as_str() == "refs/stash") {
-        capturer.report.stashed_secrets =
-            repo.stashed_secrets(stash, &|rel| policy.denies_anywhere(rel))?;
-    }
+    capturer.report.stashed_secrets =
+        repo.stashed_secrets(&stashes, &|rel| policy.denies_anywhere(rel))?;
     let worktree_mtimes = repo.worktree_mtimes(&worktree_commit, &before, &mut capturer.report)?;
     let config = repo.config(&mut capturer.report)?;
     let exclude_path = repo.git.git_path("info/exclude")?;

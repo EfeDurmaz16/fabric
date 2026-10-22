@@ -1773,6 +1773,44 @@ fn a_secret_saved_in_the_stash_is_named() {
     );
 }
 
+/// Every stash entry comes back at its index, and a secret in an older one is named.
+#[test]
+fn every_stash_entry_survives_capture_and_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    let g = git(&root);
+    fs::write(root.join(".env"), "AWS_SECRET=hunter2\n").unwrap();
+    g.run(&["stash", "push", "-q", "--include-untracked", "-m", "oldest"])
+        .unwrap();
+    for message in ["middle", "newest"] {
+        fs::write(root.join("a"), format!("{message}\n")).unwrap();
+        g.run(&["stash", "push", "-q", "-m", message]).unwrap();
+    }
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, report } = capture(&store, &request(&root, &policy, None)).unwrap();
+    assert_eq!(
+        report.stashed_secrets,
+        vec![RelPath::parse(".env").unwrap()]
+    );
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+
+    let list = git_text(&target, &["stash", "list"]).unwrap();
+    assert_eq!(list, git_text(&root, &["stash", "list"]).unwrap());
+    assert_eq!(list.lines().count(), 3, "{list}");
+    for n in 0..3 {
+        let entry = format!("stash@{{{n}}}");
+        assert_eq!(
+            git_text(&target, &["rev-parse", &entry]).unwrap(),
+            git_text(&root, &["rev-parse", &entry]).unwrap(),
+            "{entry}"
+        );
+    }
+}
+
 /// Captures a branch named `before`, replaces it with `after` and restores the incremental snapshot.
 fn rename_branch_across_an_incremental_link(before: &str, after: &str) -> Fallible {
     let dir = tempfile::tempdir()?;

@@ -18,13 +18,13 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use fabric_core::git::{GitConfigKey, GitConfigValue, GitOid};
-use fabric_core::id::SnapshotId;
+use fabric_core::id::{JobId, SnapshotId};
 use fabric_core::path::{PathError, RelPath};
 use fabric_core::snapshot::{
     CacheEntry, CarryState, Entry, EntryKind, GitHead, GitState, Mode, SnapshotManifest,
 };
 
-use crate::capture::symlink_escapes;
+use crate::capture::{stash_prefix, symlink_escapes};
 use crate::checkpoint;
 use crate::durable::{self, TempFile};
 use crate::git::{Git, GitError};
@@ -844,21 +844,44 @@ fn unbundle_chain(
     Ok(())
 }
 
+/// Adds `oid` as the newest stash entry.
+fn push_stash_entry(git: &Git, oid: &GitOid) -> Result<(), RestoreError> {
+    // `git stash list` prints the reflog message, so the entry gets the
+    // stash commit's own subject back.
+    let subject = git.run_text(&["log", "-1", "--format=%s", oid.as_str()])?;
+    git.run(&[
+        "update-ref",
+        "--create-reflog",
+        "-m",
+        &subject,
+        "refs/stash",
+        oid.as_str(),
+    ])?;
+    Ok(())
+}
+
 /// Sets every ref and `HEAD` exactly as `git_state` records them.
-fn set_refs(git: &Git, git_state: &GitState) -> Result<(), RestoreError> {
+///
+/// The stash list is rebuilt oldest first from the refs capture pinned
+/// under the job's stash prefix, then `refs/stash` itself, so every entry
+/// comes back at its index.
+fn set_refs(git: &Git, git_state: &GitState, job_id: JobId) -> Result<(), RestoreError> {
+    let prefix = stash_prefix(job_id);
+    let mut older: Vec<(u64, &GitOid)> = git_state
+        .refs
+        .iter()
+        .filter_map(|(name, oid)| {
+            let n = name.as_str().strip_prefix(&prefix)?.parse().ok()?;
+            Some((n, oid))
+        })
+        .collect();
+    older.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
     for (name, oid) in &git_state.refs {
         if name.as_str() == "refs/stash" {
-            // `git stash list` prints the reflog message, so the entry gets
-            // the stash commit's own subject back.
-            let subject = git.run_text(&["log", "-1", "--format=%s", oid.as_str()])?;
-            git.run(&[
-                "update-ref",
-                "--create-reflog",
-                "-m",
-                &subject,
-                "refs/stash",
-                oid.as_str(),
-            ])?;
+            for (_, entry) in &older {
+                push_stash_entry(git, entry)?;
+            }
+            push_stash_entry(git, oid)?;
         } else {
             git.run(&["update-ref", name.as_str(), oid.as_str()])?;
         }
@@ -929,7 +952,7 @@ fn restore_git(
     init_repo(store, &git, git_state, power_loss)?;
 
     unbundle_chain(store, snapshot, manifest, &git, report)?;
-    set_refs(&git, git_state)?;
+    set_refs(&git, git_state, manifest.job_id)?;
     git.run(&["read-tree", git_state.index_commit.as_str()])?;
 
     let listing = git.run(&["ls-tree", "-r", "-z", git_state.worktree_commit.as_str()])?;
