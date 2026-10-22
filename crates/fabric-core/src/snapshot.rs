@@ -27,7 +27,8 @@ use crate::path::{AbsPath, RelPath};
 ///
 /// Version 2 added what a target needs to decide each cache path on its
 /// own (`CacheEntry::remake` and `CacheEntry::native_files`) and the list
-/// of paths that stayed on the capturing node (`left_behind`).
+/// of paths a secret pattern or `.fabricignore` kept on the capturing node
+/// (`left_behind`).
 pub const MANIFEST_VERSION: u16 = 2;
 
 /// The most bytes a reader decodes as a manifest; a memory bound against a
@@ -135,9 +136,12 @@ pub struct SnapshotManifest {
     pub env_spec: Option<EnvSpecId>,
     /// One row per dependency, build or tool-cache path the policy saw; sorted by path.
     pub caches: Vec<CacheEntry>,
-    /// Every ignored or untracked path whose bytes stayed on the capturing
-    /// node, with the reason; sorted by path. Names only, never bytes, so a
-    /// target can say what it will not find.
+    /// Every ignored or untracked path a secret pattern or `.fabricignore`
+    /// kept on the capturing node, with that reason; sorted by path. Names
+    /// only, never bytes, so a target can say what it will not find. What
+    /// capture leaves out for other reasons, such as a socket, a directory
+    /// it cannot read or a nested repository, is named by the suspend that
+    /// took the snapshot and not listed here.
     pub left_behind: Vec<LeftBehind>,
 }
 

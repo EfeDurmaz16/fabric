@@ -2503,12 +2503,14 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
     })
 }
 
-/// Every ignored or untracked workspace path whose bytes stay on this node, with the reason, sorted by path.
+/// Every ignored or untracked workspace path a secret pattern or `.fabricignore` keeps on this node, with that reason, sorted by path.
 ///
 /// An untracked path removed from the working-tree commit is a secret when
 /// the secret list names it and an exclusion otherwise, since those are the
 /// only two lists that remove one. The harness state's own denials are not
-/// workspace paths and are not listed.
+/// workspace paths and are not listed, and neither is what capture leaves
+/// out for another reason (`special_files`, `unreadable`,
+/// `nested_repositories`), which the report names.
 fn left_behind(report: &CaptureReport, policy: &IgnorePolicy) -> Vec<LeftBehind> {
     let secret = |path: &RelPath| LeftBehind {
         path: path.clone(),
