@@ -14,7 +14,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 
-use fabric_core::git::{GitConfigKey, GitOid};
+use fabric_core::git::{GitConfigKey, GitConfigValue, GitOid};
 use fabric_core::id::SnapshotId;
 use fabric_core::path::{PathError, RelPath};
 use fabric_core::snapshot::{
@@ -1185,16 +1185,7 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
     }
 
     if let (Some(git), Some(state)) = (&git, &manifest.git) {
-        for (key, value) in &state.config {
-            // These describe the source's filesystem; `git init` probed the target's.
-            if matches!(
-                key,
-                GitConfigKey::CoreIgnoreCase | GitConfigKey::CoreSymlinks
-            ) {
-                continue;
-            }
-            git.run(&["config", "--local", &key.to_string(), value.as_str()])?;
-        }
+        write_config(git, &state.config)?;
     }
     if req.durability == Durability::PowerLoss {
         sync_tree(&staging, false)?;
@@ -1204,6 +1195,31 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
     checkpoint::reached("restore.after_rename");
     tracing::info!(snapshot = %req.snapshot, target = %req.target.display(), files = report.files, "restored");
     Ok(report)
+}
+
+/// Writes the carried config projection, the last step of a git restore (ADR 0004).
+///
+/// A repeated key's values sit together in the source's order: the first
+/// replaces whatever `git init` wrote, and the rest follow it.
+fn write_config(git: &Git, config: &[(GitConfigKey, GitConfigValue)]) -> Result<(), RestoreError> {
+    let mut previous = None;
+    for (key, value) in config {
+        // These describe the source's filesystem; `git init` probed the target's.
+        if matches!(
+            key,
+            GitConfigKey::CoreIgnoreCase | GitConfigKey::CoreSymlinks
+        ) {
+            continue;
+        }
+        let mode = if previous == Some(key) {
+            "--add"
+        } else {
+            "--replace-all"
+        };
+        git.run(&["config", "--local", mode, &key.to_string(), value.as_str()])?;
+        previous = Some(key);
+    }
+    Ok(())
 }
 
 /// Re-reads the `files` and the working tree of a snapshot under `root` and returns how many matched.

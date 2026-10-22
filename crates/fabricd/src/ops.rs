@@ -2389,11 +2389,6 @@ fn report_capture(report: &fabric_store::capture::CaptureReport, out: &mut Out) 
         "travels without its user info (git config)",
         &report.stripped_userinfo,
     );
-    say_each(
-        out,
-        "travels with its last value only (git config)",
-        &report.repeated_config,
-    );
     say_each(out, "left behind (git config)", &report.dropped_config);
 }
 
@@ -4049,8 +4044,8 @@ pub(crate) mod tests {
     }
 
     /// A suspend must say what of the repository's config it changed or
-    /// left out: a remote URL loses its user info, a URL with a query is
-    /// left behind, and of a repeated key only the last value travels.
+    /// left out: a remote URL loses its user info, and a URL with a query
+    /// is left behind.
     #[tokio::test]
     async fn a_suspend_names_the_git_config_it_changed_or_left_out() {
         let (dir, node) = node();
@@ -4069,12 +4064,6 @@ pub(crate) mod tests {
                 "tokened",
                 "https://example.com/r.git?token=x",
             ],
-            &[
-                "config",
-                "--add",
-                "remote.origin.fetch",
-                "+refs/tags/*:refs/tags/*",
-            ],
         ] {
             let status = std::process::Command::new("git")
                 .current_dir(&root)
@@ -4090,7 +4079,6 @@ pub(crate) mod tests {
         for wanted in [
             "travels without its user info (git config): remote.origin.url",
             "left behind (git config): remote.tokened.url",
-            "travels with its last value only (git config): remote.origin.fetch",
         ] {
             assert!(
                 out.lines.iter().any(|line| line == wanted),

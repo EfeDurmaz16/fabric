@@ -1814,6 +1814,43 @@ fn a_credential_in_a_branch_remote_url_is_stripped() {
     );
 }
 
+/// git holds a key more than once after `git config --add`, as for a
+/// second fetch refspec that maps pull requests or a second remote URL for
+/// a mirror. Every value travels in git's order, which decides the URL git
+/// fetches from.
+#[test]
+fn every_value_of_a_repeated_config_key_travels_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    let g = git(&root);
+    g.run(&["remote", "add", "origin", "https://example.com/a.git"])
+        .unwrap();
+    for (key, value) in [
+        (
+            "remote.origin.fetch",
+            "+refs/pull/*/head:refs/remotes/origin/pr/*",
+        ),
+        ("remote.origin.url", "https://example.com/b.git"),
+    ] {
+        g.run(&["config", "--add", key, value]).unwrap();
+    }
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    assert_eq!(
+        git_text(&target, &["config", "--get-all", "remote.origin.fetch"]).unwrap(),
+        "+refs/heads/*:refs/remotes/origin/*\n+refs/pull/*/head:refs/remotes/origin/pr/*"
+    );
+    assert_eq!(
+        git_text(&target, &["config", "--get-all", "remote.origin.url"]).unwrap(),
+        "https://example.com/a.git\nhttps://example.com/b.git"
+    );
+}
+
 #[test]
 fn a_config_value_the_projection_refuses_is_named() {
     let dir = tempfile::tempdir().unwrap();

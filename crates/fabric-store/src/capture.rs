@@ -202,8 +202,6 @@ pub struct CaptureReport {
     pub nested_harness: Vec<RelPath>,
     /// Config keys whose remote URL lost its userinfo.
     pub stripped_userinfo: Vec<GitConfigKey>,
-    /// Repeated config keys where only the last value travels.
-    pub repeated_config: Vec<GitConfigKey>,
     /// Allowlisted config keys left behind because `GitConfigValue` refuses the value, or because it is a remote URL with a query or fragment, where a token can travel.
     pub dropped_config: Vec<GitConfigKey>,
     /// The bundle shape; none when the root is not a repository.
@@ -1561,12 +1559,16 @@ impl GitCapture<'_> {
     }
 
     /// Reads the allowlisted projection of the local config.
+    ///
+    /// A key git holds more than once, such as two `remote.origin.fetch`
+    /// refspecs, keeps every value, in the order git lists them: the sort
+    /// by key is stable.
     fn config(
         &self,
         report: &mut CaptureReport,
     ) -> Result<Vec<(GitConfigKey, GitConfigValue)>, CaptureError> {
         let out = self.git.run(&["config", "--list", "--local", "-z"])?;
-        let mut config: BTreeMap<GitConfigKey, GitConfigValue> = BTreeMap::new();
+        let mut config: Vec<(GitConfigKey, GitConfigValue)> = Vec::new();
         for record in Git::records(&out) {
             let text = Git::text("config record", record)?;
             let (key, value) = text.split_once('\n').unwrap_or((text, ""));
@@ -1590,11 +1592,10 @@ impl GitCapture<'_> {
                 report.dropped_config.push(key);
                 continue;
             }
-            if config.insert(key.clone(), value).is_some() {
-                report.repeated_config.push(key.clone());
-            }
+            config.push((key, value));
         }
-        Ok(config.into_iter().collect())
+        config.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(config)
     }
 }
 
