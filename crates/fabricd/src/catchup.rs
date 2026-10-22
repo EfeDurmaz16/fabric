@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use fabric_core::id::{Epoch, JobId, NodeId, RecordHash};
 use fabric_core::lease::FencingToken;
-use fabric_core::ledger::{LedgerError, Record};
+use fabric_core::ledger::{Ledger, LedgerError, Record};
 use fabric_core::moves::LeaseView;
 use fabric_net::wire::{Fenced, Pulled};
 
@@ -345,7 +345,7 @@ impl Node {
             epoch: Epoch::FIRST,
         };
         let mut after = None;
-        let mut epoch = Epoch::FIRST;
+        let mut records = Vec::new();
         loop {
             let answer = self
                 .call(peer, |session| async move {
@@ -353,7 +353,7 @@ impl Node {
                 })
                 .await?;
             let (page, more) = match answer {
-                Fenced::Answer(Pulled::UpToDate) => return Ok(epoch),
+                Fenced::Answer(Pulled::UpToDate) => break,
                 Fenced::Answer(Pulled::Last(page)) => (page, false),
                 Fenced::Answer(Pulled::More(page)) => (page, true),
                 _ => {
@@ -365,14 +365,37 @@ impl Node {
             };
             for bytes in page.records() {
                 let record = Record::decode(bytes.as_bytes()).map_err(LedgerError::from)?;
-                epoch = epoch.max(record.event().epoch);
                 after = Some(record.hash());
+                records.push(record);
             }
             if !more {
-                return Ok(epoch);
+                break;
             }
         }
+        if records.is_empty() {
+            return Ok(Epoch::FIRST);
+        }
+        chain_epoch(id, records).map_err(|e| NodeError::Peer {
+            peer,
+            reason: format!("its ledger for job {id} does not replay: {e}"),
+        })
     }
+}
+
+/// The highest epoch in `records`, a peer's whole ledger for job `id`,
+/// once they replay as one ledger: the first a `Created` for this job, and
+/// each record after it linked to the one before and allowed by the
+/// ledger's rules. Each record alone only proves its own framing, so a
+/// record of another job, or a chain with a gap, would otherwise let a
+/// faulty peer freeze a valid job here with any epoch it wrote.
+fn chain_epoch(id: JobId, records: Vec<Record>) -> Result<Epoch, LedgerError> {
+    let ledger = Ledger::replay(id, records)?;
+    Ok(ledger
+        .records()
+        .iter()
+        .map(|record| record.event().epoch)
+        .max()
+        .unwrap_or(Epoch::FIRST))
 }
 
 #[cfg(test)]
@@ -380,6 +403,33 @@ mod tests {
     use crate::node::Out;
     use crate::ops::tests::{job, node, paired};
     use crate::transfer::is_complete;
+
+    /// A peer's ledger is trusted for its epoch only as a whole chain of
+    /// this job: a record of another job, framed well on its own, must not
+    /// count, or a faulty peer could freeze this job with any epoch.
+    #[test]
+    fn a_peer_ledger_that_does_not_replay_for_the_job_gives_no_epoch() {
+        use fabric_core::harness::HarnessKind;
+        use fabric_core::id::{EventId, JobId, NodeId};
+        use fabric_core::ledger::Ledger;
+        let created = |job: u8| {
+            Ledger::created(
+                JobId::from_bytes([job; 16]),
+                "goal".into(),
+                HarnessKind::Codex,
+                NodeId::from_bytes([3; 32]),
+                EventId::from_bytes([4; 16]),
+                1,
+            )
+            .unwrap()
+        };
+        let id = JobId::from_bytes([1; 16]);
+        assert!(super::chain_epoch(id, vec![created(2)]).is_err());
+        assert_eq!(
+            super::chain_epoch(id, vec![created(1)]).unwrap(),
+            fabric_core::id::Epoch::FIRST
+        );
+    }
 
     /// A peer paired with no address, and with no session open, cannot be
     /// asked before a launch whether it stole the job while this node was
