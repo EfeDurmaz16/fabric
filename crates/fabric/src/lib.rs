@@ -625,11 +625,17 @@ async fn launch(
         kill_group(&running);
         return Err(e.into());
     }
-    let status = tokio::select! {
-        status = running.child_mut().wait() => status?,
-        // The node supervises the harness now, so a signal ends this
-        // command as it did before any was caught, and the harness runs on.
-        signal = interrupts.next() => return Ok(signal_exit(signal.as_raw())),
+    let status = if headless {
+        // An agent run headless gets no signal of a terminal either, so
+        // they are passed on to it until it is reaped and the node told.
+        reap(&mut running, &mut interrupts).await?
+    } else {
+        tokio::select! {
+            status = running.child_mut().wait() => status?,
+            // The node supervises the harness now, so a signal ends this
+            // command as it did before any was caught, and the harness runs on.
+            signal = interrupts.next() => return Ok(signal_exit(signal.as_raw())),
+        }
     };
     drop(handed);
     let code = exited(&socket, plan, pid, status, &mut interrupts).await?;
@@ -897,12 +903,7 @@ impl Turn<'_> {
         // The harness closed its output and may still run.
         let status = match status {
             Some(status) => status,
-            None => loop {
-                tokio::select! {
-                    exit = running.child_mut().wait() => break exit?,
-                    signal = interrupts.next() => interrupts.pass_on(pid, signal),
-                }
-            },
+            None => reap(running, interrupts).await?,
         };
         // The harness's diagnostics are copied to their end before the
         // command can exit, which would drop the copy with what it had not
@@ -937,6 +938,21 @@ impl Turn<'_> {
         Ok(TurnEnd::Reaped { report, status })
     }
 }
+/// Waits for a headless harness to exit, passing each signal this command
+/// gets on to its group, as `Interrupts::pass_on` does.
+async fn reap(
+    running: &mut Running,
+    interrupts: &mut Interrupts,
+) -> std::io::Result<std::process::ExitStatus> {
+    let pid = running.pid();
+    loop {
+        tokio::select! {
+            exit = running.child_mut().wait() => return exit,
+            signal = interrupts.next() => interrupts.pass_on(pid, signal),
+        }
+    }
+}
+
 /// Sends `signal` to the process group `pgid`, which is gone if it has exited.
 fn send_to_group(pgid: std::num::NonZeroU32, signal: rustix::process::Signal) {
     let group = i32::try_from(pgid.get())

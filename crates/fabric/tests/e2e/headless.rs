@@ -300,6 +300,86 @@ fn e2e_a_headless_run_forwards_standard_error_to_its_end() -> Fallible {
     Ok(())
 }
 
+/// Ctrl-C on a headless ACP run reaches the agent too, which runs in a
+/// process group of its own: here the agent stays alive after its turn,
+/// the signal ends it, and `fabric` tells the node before it exits, so no
+/// agent runs on that nobody watches (Codex review, 2026-10-22).
+#[test]
+fn e2e_ctrl_c_on_a_headless_acp_run_reaches_the_agent() -> Fallible {
+    let env = Env::new()?;
+    let (node, job) = job_under(&env, crate::AGENT)?;
+    let pid_file = node.state().join("agent.pid");
+    let running = node.spawn_with(
+        &["job", "run", &job, "--headless", "--prompt", "two"],
+        &[
+            ("FAKE_LINGER", Path::new("1")),
+            ("FAKE_PID_FILE", &pid_file),
+        ],
+    )?;
+    let started = std::time::Instant::now();
+    while !node
+        .ok(&["job", "status", &job])?
+        .contains("harness: running as pid")
+    {
+        if started.elapsed() > Duration::from_mins(1) {
+            return Err("the agent never registered".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let agent: i32 = fs::read_to_string(&pid_file)?.trim().parse()?;
+    // The agent writes to the run's standard error too, so the run's end is
+    // its exit, not the end of its output, which an agent left running
+    // would keep open.
+    let mut running = running;
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_string(&mut text);
+            }
+            text
+        })
+    };
+    let stdout = drain(running.stdout.take().map(|pipe| Box::new(pipe) as _));
+    let stderr = drain(running.stderr.take().map(|pipe| Box::new(pipe) as _));
+    let fabric =
+        rustix::process::Pid::from_raw(i32::try_from(running.id())?).ok_or("fabric has no pid")?;
+    rustix::process::kill_process(fabric, rustix::process::Signal::INT)?;
+    let started = std::time::Instant::now();
+    let exited = loop {
+        if let Some(status) = running.try_wait()? {
+            break Some(status);
+        }
+        if started.elapsed() > Duration::from_mins(1) {
+            let _ = running.kill();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let left = crate::world::alive(agent);
+    if left && let Some(agent) = rustix::process::Pid::from_raw(agent) {
+        let _ = rustix::process::kill_process_group(agent, rustix::process::Signal::KILL);
+    }
+    let printed = format!(
+        "{}{}",
+        stdout
+            .join()
+            .map_err(|_| "the reader of standard output panicked")?,
+        stderr
+            .join()
+            .map_err(|_| "the reader of standard error panicked")?
+    );
+    let exited = exited.ok_or_else(|| format!("fabric did not exit:\n{printed}"))?;
+    assert!(!left, "the agent ran on after fabric exited:\n{printed}");
+    assert_eq!(exited.code(), Some(130), "{printed}");
+    let status = node.ok(&["job", "status", &job])?;
+    assert!(
+        !status.contains("harness: running"),
+        "the node still records the agent:\n{status}"
+    );
+    Ok(())
+}
+
 /// A headless run needs the prompt it starts its turn with.
 #[test]
 fn e2e_a_headless_run_needs_a_prompt() -> Fallible {
