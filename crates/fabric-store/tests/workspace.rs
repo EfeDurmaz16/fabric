@@ -1202,6 +1202,78 @@ fn a_file_added_after_the_listing_fails_the_capture() {
     }
 }
 
+/// Carry keys that append a line to `file` the first time capture asks, after `W` was built.
+struct AppendsLate<'a> {
+    file: &'a Path,
+    done: std::cell::Cell<bool>,
+}
+
+impl CarryKeys for AppendsLate<'_> {
+    fn key(&self, _class: CacheClass, _path: &RelPath) -> CarryKey {
+        if !self.done.replace(true) {
+            // A failed write leaves the file as it was, and the test's assertion fails.
+            let _ = fs::OpenOptions::new()
+                .append(true)
+                .open(self.file)
+                .and_then(|mut file| std::io::Write::write_all(&mut file, b"written late\n"));
+        }
+        CarryKey::Unmeasured
+    }
+}
+
+/// A tracked file written after `W` was built and its mtimes were read
+/// fails the capture, instead of travelling with the bytes it had before.
+#[test]
+fn a_tracked_file_written_after_w_was_built_fails_the_capture() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+    fs::write(root.join("node_modules/pkg/index.js"), "1;\n").unwrap();
+    fs::write(root.join("a.txt"), "a\n").unwrap();
+    fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+    let g = git(&root);
+    g.run(&["init", "-q", "-b", "main"]).unwrap();
+    g.run(&["add", "-A"]).unwrap();
+    g.run(&["commit", "-q", "-m", "one"]).unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let file = root.join("a.txt");
+    let keys = AppendsLate {
+        file: &file,
+        done: std::cell::Cell::new(false),
+    };
+    let mut req = request(&root, &policy, None);
+    req.carry_keys = &keys;
+    let err = capture(&store, &req).unwrap_err();
+    assert!(
+        matches!(&err, CaptureError::WorkspaceChanged { path } if path.as_str() == "a.txt"),
+        "{err}"
+    );
+}
+
+/// A harness state directory that gains a file while capture stores it
+/// fails the capture, as a workspace does: a file the adapter wrote after
+/// the directory was listed would be missing from the snapshot. The
+/// directory here is the store's own `objects/`, which capture writes into
+/// as it stores each file it listed there.
+#[test]
+fn a_harness_file_added_after_the_listing_fails_the_capture() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("plain");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("a.txt"), "a\n").unwrap();
+    let store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let objects = dir.path().join("store/objects");
+    let mut req = request(&root, &policy, None);
+    req.harness_state = Some(&objects);
+    let err = capture(&store, &req).unwrap_err();
+    assert!(
+        matches!(&err, CaptureError::WorkspaceChanged { .. }),
+        "{err}"
+    );
+}
+
 /// Carry keys that, the first time capture asks, append to `grows` and
 /// write `appears`, as a dev server writes and rotates its log.
 struct WritesAside<'a> {
