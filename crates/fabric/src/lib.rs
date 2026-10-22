@@ -617,13 +617,20 @@ async fn launch(
     }
     // A held harness has not run yet: it gets the terminal first, then starts.
     let handed = if running.is_held() {
-        terminal::hand_over(pid)
+        match terminal::hand_over(pid) {
+            Ok(handed) => handed,
+            Err(e) => {
+                let error = anyhow!(
+                    "the terminal could not be given to the harness ({e}), so it was stopped before it ran"
+                );
+                return Err(abandon(&socket, plan, &mut running, &mut interrupts, error).await);
+            }
+        }
     } else {
         None
     };
     if let Err(e) = running.release() {
-        kill_group(&running);
-        return Err(e.into());
+        return Err(abandon(&socket, plan, &mut running, &mut interrupts, e.into()).await);
     }
     let status = if headless {
         // An agent run headless gets no signal of a terminal either, so
@@ -649,6 +656,36 @@ async fn launch(
         )?;
     }
     Ok(code)
+}
+
+/// Stops a recorded harness that cannot go on, reaps it and tells the node
+/// it exited, so the node drops its record at once; returns `error`. A
+/// signal stops the wait for the node, which finds the group gone at its
+/// next look.
+async fn abandon(
+    socket: &Path,
+    plan: &RunPlan,
+    running: &mut Running,
+    interrupts: &mut Interrupts,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    kill_group(running);
+    if let Err(e) = running.child_mut().wait().await {
+        tracing::warn!(error = %e, "the stopped harness could not be reaped");
+    }
+    let request = Request::HarnessExited {
+        job: plan.job,
+        pid: running.pid(),
+    };
+    tokio::select! {
+        told = control::call(socket, &request) => {
+            if !matches!(told, Ok(Response::Done { .. })) {
+                tracing::warn!(?told, "the node did not record that the stopped harness exited");
+            }
+        }
+        _ = interrupts.next() => {}
+    }
+    error
 }
 
 /// The adapter for the plan's harness and how it launches it in `mode`:
