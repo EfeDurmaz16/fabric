@@ -220,6 +220,20 @@ impl JobDir {
         self.dir.join("harness-state")
     }
 
+    /// Where a capture writes the harness state before it replaces
+    /// `harness_state`, so a capture that fails leaves the last one whole.
+    #[must_use]
+    pub fn harness_state_next(&self) -> PathBuf {
+        self.dir.join("harness-state.next")
+    }
+
+    /// Where `harness_state` waits while a capture puts the new one in its
+    /// place; one found here at the start of a capture was cut short.
+    #[must_use]
+    pub fn harness_state_old(&self) -> PathBuf {
+        self.dir.join("harness-state.old")
+    }
+
     /// The root used when a snapshot was captured under another home.
     #[must_use]
     pub fn fallback_root(&self) -> PathBuf {

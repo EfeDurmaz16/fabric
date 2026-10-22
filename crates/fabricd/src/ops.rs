@@ -873,6 +873,10 @@ impl Node {
     /// Captures the session of the harness the job ran last into its harness
     /// state directory, and returns that directory, or `None` when there is
     /// no session to carry.
+    ///
+    /// The capture is written beside the last one and replaces it only once
+    /// it succeeds, so a capture that fails leaves the state the job's last
+    /// snapshot carries where it was.
     async fn capture_harness(
         &self,
         job: &Job,
@@ -881,16 +885,27 @@ impl Node {
         out: &mut Out,
     ) -> Result<Option<PathBuf>, NodeError> {
         let state_dir = job.dir().harness_state();
+        let next = job.dir().harness_state_next();
+        let old = job.dir().harness_state_old();
+        finish_state_swap(&state_dir, &next, &old)?;
         let Some(record) = job_session(job, root, &self.cfg.home, job.harness())? else {
             return Ok(None);
         };
         let session = record.session;
         let harness = adapter(&record.harness, &self.harness_env(path_var)?)?;
         let carried = state_names(&state_dir, &record.harness, &session);
-        job.clear_harness_state()?;
-        std::fs::create_dir_all(&state_dir).map_err(|e| NodeError::io(&state_dir, e))?;
-        match harness.capture(root, &session, &state_dir).await {
+        std::fs::create_dir_all(&next).map_err(|e| NodeError::io(&next, e))?;
+        let captured = harness.capture(root, &session, &next).await;
+        if captured.is_err() {
+            remove_dir_if_any(&next)?;
+        }
+        match captured {
             Ok(manifest) => {
+                if std::fs::symlink_metadata(&state_dir).is_ok() {
+                    std::fs::rename(&state_dir, &old).map_err(|e| NodeError::io(&state_dir, e))?;
+                }
+                std::fs::rename(&next, &state_dir).map_err(|e| NodeError::io(&next, e))?;
+                remove_dir_if_any(&old)?;
                 out.say(format!(
                     "captured {} session {} ({} files)",
                     record.harness,
@@ -904,15 +919,32 @@ impl Node {
             // ended the run while the node recorded it, never does. Nothing
             // of it exists to carry, and no snapshot carries it, since this
             // node never captured or restored it, so the record goes and
-            // the capture goes on.
+            // the capture goes on. The state this node last captured or
+            // restored, of the session the job held before, stays in the
+            // snapshot and stays the job's session.
             Err(HarnessError::SessionNotFound { .. }) if !carried => {
-                job.forget_session()?;
-                job.clear_harness_state()?;
+                let before = StateManifest::read(&state_dir).ok();
+                let kept = if let Some(state) = &before {
+                    job.set_session(&SessionRecord {
+                        harness: state.kind().clone(),
+                        session: state.session().clone(),
+                    })?;
+                    format!(
+                        "the snapshot keeps the {} session {} it held before",
+                        state.kind(),
+                        state.session()
+                    )
+                } else {
+                    job.forget_session()?;
+                    job.clear_harness_state()?;
+                    "the snapshot carries no harness state and the next run starts a new session"
+                        .to_owned()
+                };
                 out.say(format!(
-                    "{} session {} left no state on this node and no snapshot holds it, so it never started; the snapshot carries no harness state and the next run starts a new session",
+                    "{} session {} left no state on this node and no snapshot holds it, so it never started; {kept}",
                     record.harness, session
                 ));
-                Ok(None)
+                Ok(before.map(|_| state_dir))
             }
             Err(e) => Err(e.into()),
         }
@@ -2670,6 +2702,26 @@ fn refuse_replaced_root(job: JobId, root: &Path) -> Result<(), NodeError> {
 }
 
 /// Whether nothing, not even a dangling link, is at `path`.
+/// Finishes or undoes a swap of the harness state a capture killed midway
+/// left: a new state not yet in place goes, and the last state set aside
+/// comes back when nothing took its place.
+fn finish_state_swap(state_dir: &Path, next: &Path, old: &Path) -> Result<(), NodeError> {
+    remove_dir_if_any(next)?;
+    if is_missing(state_dir)? && !is_missing(old)? {
+        std::fs::rename(old, state_dir).map_err(|e| NodeError::io(old, e))
+    } else {
+        remove_dir_if_any(old)
+    }
+}
+
+fn remove_dir_if_any(dir: &Path) -> Result<(), NodeError> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(NodeError::io(dir, e)),
+    }
+}
+
 fn is_missing(path: &Path) -> Result<bool, NodeError> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(false),
@@ -3062,6 +3114,34 @@ pub(crate) mod tests {
             "{:?}",
             out.lines
         );
+    }
+
+    /// A launch of a new session that never started, after the job's
+    /// last session was captured, must not drop that session: the snapshot
+    /// keeps the state the job held before, and the job continues it.
+    #[tokio::test]
+    async fn a_session_that_never_started_leaves_the_one_before_in_the_snapshot() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = locking_codex(dir.path());
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let mut thread = None;
+        fresh_codex_run(&node, id, || thread = Some(codex_thread_in(&node, id))).await;
+        let thread = thread.unwrap();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        let never = SessionId::parse("019f2340-0000-7000-8000-0000000000ff").unwrap();
+        assert_ne!(never, thread);
+        ran_briefly(&node, id, &never).await;
+
+        let out = &mut Out::default();
+        node.suspend(id, &path, out).await.unwrap();
+        let before = SessionRecord {
+            harness: HarnessKind::Codex,
+            session: thread.clone(),
+        };
+        let (recorded, captured) = recorded_and_captured(&node, id).await;
+        assert_eq!(recorded, Some(before), "{:?}", out.lines);
+        assert_eq!(captured, thread);
     }
 
     /// A session this node captured, whose files are gone when it is to be
