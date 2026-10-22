@@ -673,6 +673,36 @@ fn a_report_without_caches_runs_its_steps_on_every_resume() {
     assert!(dir.path().join("ran").exists());
 }
 
+/// Go's module cache is per node and lies outside the workspace, so it is
+/// never carried, and a healthy `node_modules` beside it says nothing about
+/// it: on a node that never downloaded the modules, `go mod download` runs
+/// while the carried install does not.
+#[test]
+fn a_step_that_fills_a_cache_outside_the_workspace_runs_beside_a_warm_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = take_lock(dir.path()).unwrap();
+    write(
+        dir.path(),
+        &[
+            ("package.json", PACKAGE_JSON),
+            ("package-lock.json", ""),
+            ("node_modules/a/package.json", "{}"),
+            ("go.mod", "module example.com/x\n\ngo 1.22.0\n"),
+        ],
+    )
+    .unwrap();
+    let detected = detect(dir.path(), &[]).unwrap();
+    seal(&detected, "node_modules").unwrap();
+    let planned = plan(&detected, &lock, &NodeEnv::current()).unwrap();
+    assert_eq!(planned.caches()[0].health, CacheHealth::Healthy);
+    let programs: Vec<&str> = planned
+        .steps()
+        .iter()
+        .map(|s| s.step().program.as_str())
+        .collect();
+    assert_eq!(programs, ["go"]);
+}
+
 /// A missing `target` is a build away and says nothing about
 /// `node_modules`; reinstalling a whole carried tree because of it would
 /// throw away the carry on every resume. Only the fetch it gates runs.

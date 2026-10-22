@@ -457,6 +457,10 @@ pub enum StepGate {
     Caches(Vec<RelPath>),
     /// Runs when any cache is not whole, or when the report has none.
     AnyCache,
+    /// Runs on every resume: the step fills a per-node cache outside the
+    /// workspace, such as Go's module cache, which is never carried and
+    /// which no cache in the workspace proves warm.
+    EveryResume,
 }
 
 /// What a setup step fills, as detection knows it before the caches are final.
@@ -492,11 +496,15 @@ impl StepScope {
     ///
     /// The caches the step fills, so a declared `npm ci` never runs because
     /// a `target` is missing; for `cargo fetch`, the `target` a build makes
-    /// from what it fetches. A step that fills no cache in the workspace,
-    /// such as `go mod download`, waits on every cache.
+    /// from what it fetches. A step that fills only a cache outside the
+    /// workspace, such as `go mod download`, runs on every resume: a healthy
+    /// `node_modules` beside it says nothing about this node's module cache.
+    /// A declared step that fills no cache waits on every cache.
     fn gate(&self, index: usize, caches: &[CachePath]) -> StepGate {
-        if let StepScope::Warms(path) = self {
-            return StepGate::Caches(vec![path.clone()]);
+        match self {
+            StepScope::Warms(path) => return StepGate::Caches(vec![path.clone()]),
+            StepScope::Outside => return StepGate::EveryResume,
+            StepScope::Fills(_) | StepScope::Declared => {}
         }
         let filled: Vec<RelPath> = caches
             .iter()

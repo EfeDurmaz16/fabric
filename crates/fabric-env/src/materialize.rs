@@ -14,8 +14,11 @@
 //! install runs when its own cache is not, and a declared step when one of
 //! the caches it fills is not, so a missing `target` never reinstalls a
 //! whole `node_modules`; `cargo fetch` runs when `target`, which a build
-//! makes from what it fetches, is not; and a step that fills no cache in
-//! the workspace runs when any cache is not whole or the report has none.
+//! makes from what it fetches, is not; `go mod download`, which fills
+//! only this node's module cache outside the workspace, runs on every
+//! resume, since nothing carried proves that cache warm; and a declared
+//! step that fills no cache runs when any cache is not whole or the report
+//! has none.
 //!
 //! A cache is healthy when it is a non-empty directory that holds proof
 //! that whatever filled it finished. For a cache a setup step fills, the
@@ -649,6 +652,7 @@ pub fn plan(
         let needed = match gate {
             StepGate::Caches(paths) => paths.iter().any(unhealthy),
             StepGate::AnyCache => any_unhealthy,
+            StepGate::EveryResume => true,
         };
         if step.when == RunWhen::CachesMissing && !needed {
             continue;
