@@ -594,7 +594,7 @@ async fn launch(
         // command as it did before any was caught, and the harness runs on.
         signal = interrupts.next() => return Ok(signal_exit(signal)),
     };
-    exited(&socket, plan, pid, status).await
+    exited(&socket, plan, pid, status, &mut interrupts).await
 }
 
 /// The signals that end this command: Ctrl-C, the hang-up of a closed
@@ -679,13 +679,29 @@ async fn prepare(
 
 /// Tells the node the harness exited and picks the exit code: the harness's
 /// own, or 128 plus the signal that stopped it, with a line saying why.
+///
+/// The node answers once it holds the job, which a suspend or a move of it
+/// can keep for minutes, so a signal ends the wait as it ends the command
+/// at any other point; the node finds the group gone at its next look.
 async fn exited(
     socket: &Path,
     plan: &RunPlan,
     pid: std::num::NonZeroU32,
     status: std::process::ExitStatus,
+    interrupts: &mut Interrupts,
 ) -> Result<ExitCode> {
-    let told = control::call(socket, &Request::HarnessExited { job: plan.job, pid }).await;
+    let request = Request::HarnessExited { job: plan.job, pid };
+    let told = tokio::select! {
+        told = control::call(socket, &request) => told,
+        signal = interrupts.next() => {
+            writeln!(
+                std::io::stderr(),
+                "interrupted by signal {signal} while telling the node the harness exited; `fabric job status {}` shows what it holds",
+                plan.job
+            )?;
+            return Ok(signal_exit(signal));
+        }
+    };
     let missed = match told {
         Ok(Response::Done { .. }) => None,
         Ok(Response::Failed { error, .. }) => Some(error),
@@ -1108,5 +1124,60 @@ mod tests {
             ),
             "{error:#}"
         );
+    }
+
+    /// Once the harness exits, the command tells the node, which can wait
+    /// on the job through a suspend or a move for minutes, or not answer
+    /// at all. A signal must still end the command then: the handlers the
+    /// launch installed replaced the default action for the whole process,
+    /// so nothing else would.
+    #[tokio::test]
+    async fn a_signal_ends_the_wait_for_the_node_after_the_harness_exited() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::time::Duration;
+
+        let dir = tempfile::Builder::new()
+            .prefix("fsig")
+            .tempdir_in("/tmp")
+            .unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let socket = dir.path().join("fabric.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        // A node that takes the request and never answers it.
+        let _node = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let mut interrupts = Interrupts::new().unwrap();
+        tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::HUP)
+                .unwrap();
+        });
+        let plan = RunPlan {
+            job: "01M5EBB2BWY97N3YEKD6CDN2EM".parse().unwrap(),
+            epoch: fabric_core::id::Epoch::FIRST,
+            head: fabric_core::id::RecordHash::of(b"a head"),
+            root: dir.path().join("work"),
+            harness: HarnessKind::Codex,
+            session: None,
+            goal: "goal".to_owned(),
+            harness_config: fabricd::harnesses::HarnessConfig::default(),
+            home: dir.path().to_owned(),
+        };
+        let pid = std::num::NonZeroU32::new(std::process::id()).unwrap();
+        let status = std::process::ExitStatus::from_raw(0);
+        let told = exited(&socket, &plan, pid, status, &mut interrupts);
+        let code = tokio::time::timeout(Duration::from_secs(10), told)
+            .await
+            .expect("the signal did not end the wait")
+            .unwrap();
+        assert_eq!(code, signal_exit(rustix::process::Signal::HUP.as_raw()));
     }
 }

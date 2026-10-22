@@ -32,6 +32,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # and the fake agent built in; this turns both on for test builds only.
 fabric = { path = ".", features = ["faults", "fixtures"] }
 tempfile = "3.27"
+# The signal test runs a control socket that never answers, under a deadline.
+tokio = { version = "1.54", features = ["net", "time"] }
 
 # The fake ACP agent of fabric-harness's own tests, built here under its own
 # name so the end-to-end test can launch it as a harness.
