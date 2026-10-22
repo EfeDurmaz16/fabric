@@ -118,7 +118,7 @@ const REGISTRY_READ_ON: &str = "2.1.294";
 
 /// Why a model is not carried when the transcript Claude resumes cannot
 /// be told from the others.
-const KEY_UNKNOWN: &str = "the session has transcripts under several project keys, and Claude resumes from this workspace's key, which it cuts and hashes, so Fabric cannot tell which one";
+const KEY_UNKNOWN: &str = "the session's transcripts under several project keys do not all end on one model, and Claude resumes from this workspace's key, which it cuts and hashes, so Fabric cannot tell which one";
 
 /// What the session registry says about a session.
 enum Registry {
@@ -723,7 +723,8 @@ impl ClaudeCode {
     /// every key is still read and guarded. The flag is true when such a
     /// workspace's session has transcripts under more than one key: Claude
     /// resumes from the hashed key, which cannot be told apart from the
-    /// others, so the order says nothing about which model it restores.
+    /// others, so the order says nothing about which transcript it
+    /// continues.
     fn transcripts(
         &self,
         root: &AbsPath,
@@ -749,9 +750,11 @@ impl ClaudeCode {
     /// refused when the binary that would run it is older than its newest
     /// writer or does not say its version, so nothing starts. When the
     /// workspace's own key cannot be named and the session has transcripts
-    /// under several keys, the model is left out, with that reason and
-    /// every model the keys end on, rather than taken from whichever key
-    /// sorts last; the writer of every key still guards the resume.
+    /// under several keys that do not all end on one model, the model is
+    /// left out, with that reason and every model the keys end on, rather
+    /// than taken from whichever key sorts last. When each ends on the
+    /// same model, the key Claude resumes from ends on it too, so it is
+    /// carried. The writer of every key still guards the resume.
     async fn read_session(
         &self,
         root: &AbsPath,
@@ -761,7 +764,8 @@ impl ClaudeCode {
     ) -> Result<recorded::RecordedClaude, HarnessError> {
         let (transcripts, ambiguous) = self.transcripts(root, session)?;
         let mut recorded = pipeline::blocking(move || recorded::read(&transcripts)).await?;
-        if ambiguous && !recorded.models.is_empty() {
+        let one_model = recorded.models.len() == 1 && !recorded.without_model;
+        if ambiguous && !one_model && !recorded.models.is_empty() {
             recorded.model = Recorded::NotCarried {
                 value: recorded.models.join(" or "),
                 reason: KEY_UNKNOWN.to_owned(),
@@ -1807,6 +1811,84 @@ mod tests {
             [NotCarried::new(
                 SettingName::Model,
                 "claude-fable-5 or claude-opus-4-8",
+                KEY_UNKNOWN
+            )]
+        );
+    }
+
+    /// A cut key leaves the model out only when the keys' transcripts do
+    /// not all end on one model: when each ends on the same model, the key
+    /// Claude resumes from ends on it whichever that is, so it is carried;
+    /// when one records no model, Claude may resume that one on its own
+    /// setting, so none is.
+    #[tokio::test]
+    async fn a_cut_key_carries_the_model_every_key_ends_on() {
+        let fixture = Resume::new("2.1.294 (Claude Code)");
+        let long = fixture
+            .home
+            .join("work")
+            .join("a".repeat(80))
+            .join("b".repeat(80))
+            .join("c".repeat(80));
+        std::fs::create_dir_all(&long).unwrap();
+        std::fs::remove_file(&fixture.transcript).unwrap();
+        let projects = fixture.home.join(".claude/projects");
+        let cut = projects.join("-cut-key-1a2b3c");
+        let stale = projects.join("-zz-stale-key");
+        for dir in [&cut, &stale] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(
+                dir.join(format!("{SID}.jsonl")),
+                "{\"type\":\"assistant\",\"version\":\"2.1.294\",\"isSidechain\":false,\"message\":{\"model\":\"claude-opus-5-5\"}}\n",
+            )
+            .unwrap();
+        }
+        let launch = || Launch::Headless {
+            resume: Some(SessionId::parse(SID).unwrap()),
+            prompt: "next".to_owned(),
+        };
+        let mut running = fixture
+            .adapter
+            .launch(&long, launch(), &fixture.env)
+            .await
+            .unwrap();
+        running.child_mut().wait().await.unwrap();
+        assert_eq!(
+            fixture.ran().unwrap(),
+            [
+                "-p",
+                "--output-format",
+                "json",
+                "--resume",
+                SID,
+                "--model",
+                "claude-opus-5-5",
+                "--",
+                "next"
+            ]
+        );
+        assert_eq!(running.settings().not_carried, []);
+
+        // The fake appended a line to the workspace's own transcript.
+        std::fs::remove_file(&fixture.transcript).unwrap();
+        std::fs::write(
+            stale.join(format!("{SID}.jsonl")),
+            "{\"type\":\"user\",\"version\":\"2.1.294\",\"isSidechain\":false}\n",
+        )
+        .unwrap();
+        let mut running = fixture
+            .adapter
+            .launch(&long, launch(), &fixture.env)
+            .await
+            .unwrap();
+        running.child_mut().wait().await.unwrap();
+        let ran = fixture.ran().unwrap();
+        assert!(!ran.iter().any(|a| a == "--model"), "{ran:?}");
+        assert_eq!(
+            running.settings().not_carried,
+            [NotCarried::new(
+                SettingName::Model,
+                "claude-opus-5-5",
                 KEY_UNKNOWN
             )]
         );

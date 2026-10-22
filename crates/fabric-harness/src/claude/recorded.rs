@@ -60,6 +60,9 @@ pub(crate) struct RecordedClaude {
     /// and each once; what a resume can name when it cannot tell which
     /// transcript Claude continues.
     pub(crate) models: Vec<String>,
+    /// True when some transcript records no model, so the one Claude
+    /// continues may end on none.
+    pub(crate) without_model: bool,
 }
 
 #[derive(Deserialize)]
@@ -106,7 +109,10 @@ pub(crate) fn read(transcripts: &[PathBuf]) -> Result<RecordedClaude, HarnessErr
         let ends_on = match &one.model {
             Recorded::Carried(model) => model.as_str(),
             Recorded::NotCarried { value, .. } => value.as_str(),
-            Recorded::Absent => continue,
+            Recorded::Absent => {
+                recorded.without_model = true;
+                continue;
+            }
         };
         if !recorded.models.iter().any(|seen| seen == ends_on) {
             recorded.models.push(ends_on.to_owned());
