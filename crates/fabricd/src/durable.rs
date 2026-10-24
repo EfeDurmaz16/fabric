@@ -1,4 +1,5 @@
-//! Durable writes for the files a node keeps beside its store.
+//! Durable writes for the files a node keeps beside its store, and for
+//! the one the CLI keeps there: the approval of a job's setup steps.
 //!
 //! Invariant: a file this module reports written survives a power loss
 //! with all of its bytes, and so does its name. Every write ends with a full
@@ -35,8 +36,10 @@ pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
 /// process planted, is removed and never written through. A link there
 /// would otherwise have this write overwrite the file it names, and for a
 /// ledger the link itself renamed into place would take every later append.
-/// Callers write one path from one task at a time, under the job's lock.
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// Within the node, callers write one path from one task at a time, under
+/// the job's lock; another process, such as the CLI recording an approval,
+/// writes through a temporary of its own, since the name holds its pid.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::other("a file to replace needs a parent directory"))?;

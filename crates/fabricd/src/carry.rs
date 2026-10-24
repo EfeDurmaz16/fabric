@@ -172,7 +172,7 @@ impl fmt::Display for PathDecision {
 }
 
 /// `program args...`, in backticks, as a setup step runs.
-fn command(step: &SetupStep) -> String {
+pub(crate) fn command(step: &SetupStep) -> String {
     let mut text = format!("`{}", step.program);
     for arg in &step.args {
         text.push(' ');
@@ -273,13 +273,16 @@ fn cannot_run(steps: &[SetupStep], key: &CarryKey, target: &NodeFacts) -> Option
 /// - Nothing makes the path again (a dependency tree with no lockfile, a
 ///   declared cache no step fills): carry, whatever the versions and the
 ///   platform, with a warning when native addons inside were built for
-///   another ABI, or when it may hold binaries for another platform.
+///   another ABI, or when it may hold binaries for another platform. A
+///   restore writes it as it left, the record of a finished install
+///   included even when it has holes, since no step was checked here.
 /// - Setup steps make it from a lockfile: carry when the keys match; else
 ///   rebuild when the target can run those steps as the source would; else
 ///   carry when the platform matches, nothing inside is native, nothing
 ///   under it stayed behind and a finished install vouches for the bytes,
-///   since without one resume would run the steps there anyway, and with
-///   holes its record would call a broken tree whole; else refuse.
+///   since without one resume would run the steps there anyway, and a
+///   restore drops the record of a tree with holes, so resume would run
+///   them over it too; else refuse.
 /// - The next build makes it: carry when the keys match, or when the
 ///   platform matches and the target lacks the toolchain the key names;
 ///   leave it behind on another platform; else rebuild.
@@ -411,11 +414,12 @@ fn decide_setup(
             ),
             warnings: seen.warnings,
         },
-        // The install record travels with the tree and calls it whole, so
-        // materialize would never fill the holes the secret policy left.
+        // A restore drops the install record of a tree with holes, which
+        // would call it whole, so materialize runs the steps over it before
+        // the job can resume.
         (true, None) if partial => CarryDecision::Refuse {
             reason: format!(
-                "{missing}, so {steps_text} cannot rebuild it there, and files under it that match a secret pattern or .fabricignore stayed on the source while its install record calls it whole; install the tool on the target, or pass --force to carry it with the holes"
+                "{missing}, so {steps_text} cannot rebuild it there, and files under it that match a secret pattern or .fabricignore stayed on the source, so resume there would run {steps_text} first to fill them; install the tool on the target, or pass --force to carry it and install the tool before resuming"
             ),
         },
         // Materialize runs the steps over a tree no finished install
@@ -912,9 +916,10 @@ mod tests {
         assert!(decision.refuses(), "{decision:?}");
     }
 
-    /// A tree with holes and an install record that calls it whole is
-    /// refused where it cannot be rebuilt: written, materialize would trust
-    /// the record and never fill the holes (review of PR #11).
+    /// A tree with holes is refused where it cannot be rebuilt: a restore
+    /// writes it without the install record that would call it whole, so
+    /// resume there would run the install first, and the target has no
+    /// installer (review of PR #11, issue #24).
     #[test]
     fn a_partial_locked_tree_the_target_cannot_rebuild_is_refused() {
         let mut tree = pnpm_tree();
@@ -925,7 +930,7 @@ mod tests {
         };
         assert_eq!(
             reason,
-            "pnpm is not installed on the target, so `pnpm install --frozen-lockfile` cannot rebuild it there, and files under it that match a secret pattern or .fabricignore stayed on the source while its install record calls it whole; install the tool on the target, or pass --force to carry it with the holes"
+            "pnpm is not installed on the target, so `pnpm install --frozen-lockfile` cannot rebuild it there, and files under it that match a secret pattern or .fabricignore stayed on the source, so resume there would run `pnpm install --frozen-lockfile` first to fill them; install the tool on the target, or pass --force to carry it and install the tool before resuming"
         );
         assert!(matches!(
             decide(&pnpm_tree(), &macos(), &air()),
@@ -1007,6 +1012,52 @@ mod tests {
         assert!(
             matches!(decision, CarryDecision::Carry { .. }),
             "{decision:?}"
+        );
+    }
+
+    /// rustup installs cargo and rustc as separate components, so a
+    /// target can have rustc and no cargo. A declared cargo step is judged
+    /// by the target's cargo: read through rustc, it was a rebuild that
+    /// left the bytes out, and materialize then refused the missing cargo
+    /// after the job had moved (issue #24).
+    #[test]
+    fn a_cargo_step_is_not_a_rebuild_where_only_rustc_is_installed() {
+        let vendor = entry(
+            "vendor",
+            CacheClass::Deps,
+            pro().key_like(&CarryKey::Rust {
+                rustc_vv: String::new(),
+                cargo_home: fabric_core::path::AbsPath::parse("/x").unwrap(),
+            }),
+            Remake::Setup {
+                steps: vec![step("cargo", &["vendor", "--locked"])],
+                installed: false,
+            },
+        );
+        let rustc_only = [
+            (name::OS, "macos"),
+            (name::ARCH, "aarch64"),
+            (name::RUSTC, "rustc 1.96.0"),
+            (name::CARGO_HOME, "/Users/x/.cargo"),
+        ];
+        let decision = decide(&vendor, &macos(), &NodeFacts::from_pairs(rustc_only));
+        assert_eq!(
+            decision,
+            CarryDecision::Refuse {
+                reason: "cargo is not installed on the target, so `cargo vendor --locked` cannot rebuild it there, and no install Fabric finished on the source vouches for it, so resume there would run `cargo vendor --locked` first; install the tool on the target, or pass --force to carry it and install the tool before resuming".to_owned()
+            }
+        );
+        let with_cargo = NodeFacts::from_pairs(
+            rustc_only
+                .into_iter()
+                .chain([(name::CARGO, "cargo 1.96.0 (a1b2c3d4e 2026-09-01)")]),
+        );
+        assert!(
+            matches!(
+                decide(&vendor, &macos(), &with_cargo),
+                CarryDecision::Rebuild { .. }
+            ),
+            "a target with cargo rebuilds it"
         );
     }
 

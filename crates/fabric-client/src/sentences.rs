@@ -6,6 +6,16 @@
 //! script that greps the CLI's output or the daemon's log finds the line
 //! the node printed before the client API existed. A program reads the
 //! event's fields instead; these words are for people.
+//!
+//! Every event line leaves here with its control characters escaped
+//! (`printable`). An event names paths from a snapshot, the job's harness
+//! with the arguments its ledger holds, and words a peer sent. A job
+//! learned from a paired node, or a tree an agent wrote, holds whatever
+//! they chose there, and an ANSI or OSC sequence among it would otherwise
+//! act on the terminal of whoever reads the CLI's output or the node's
+//! log, and a line break would forge a line.
+
+use std::borrow::Cow;
 
 use crate::api::{
     CaptureGroup, CaptureNote, CarryFor, CarryLine, Event, HarnessSession, Outcome, PreflightRow,
@@ -16,13 +26,49 @@ use crate::api::{
 pub const NO_SESSION: &str =
     "no harness session captured; the conversation will not continue on the target";
 
-/// The lines an event reads as; none for a kind this client does not know.
+/// The lines an event reads as, each with its control characters escaped;
+/// none for a kind this client does not know.
+#[must_use]
+pub fn event(event: &Event) -> Vec<String> {
+    lines(event)
+        .into_iter()
+        .map(|line| {
+            if line.chars().any(char::is_control) {
+                printable(&line).into_owned()
+            } else {
+                line
+            }
+        })
+        .collect()
+}
+
+/// `text` with each control character written as its escape, such as
+/// `\u{1b}` for ESC, `\u{9b}` for a C1 CSI and `\n` for a line break, so
+/// it prints as visible characters on the one line it belongs to. A
+/// backslash the text holds prints as it is: the line is for people, and a
+/// program reads the field from the client API instead.
+#[must_use]
+pub fn printable(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(char::is_control) {
+        return Cow::Borrowed(text);
+    }
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            escaped.extend(c.escape_debug());
+        } else {
+            escaped.push(c);
+        }
+    }
+    Cow::Owned(escaped)
+}
+
+/// The lines of an event as its fields make them, before `event` escapes them.
 #[expect(
     clippy::too_many_lines,
     reason = "one arm per event kind, so every line an event reads as is in one place"
 )]
-#[must_use]
-pub fn event(event: &Event) -> Vec<String> {
+fn lines(event: &Event) -> Vec<String> {
     let line = match event {
         Event::CatchingUp => "this node is still catching up with its peers after a restart; what follows may not show what they wrote".to_owned(),
         Event::Preflight { rows, .. } => return rows.iter().map(row).collect(),
@@ -275,6 +321,14 @@ pub fn event(event: &Event) -> Vec<String> {
             "the workspace at {} is gone; restoring the latest snapshot, and work since it that no suspend captured is lost",
             root.display()
         ),
+        Event::SubmodulesLeftEmpty { paths, more } => format!(
+            "warning: submodules left empty, since a snapshot carries a submodule's commit and not its files: {}; run `git submodule update --init` in the workspace before the harness needs them",
+            named(paths, *more)
+        ),
+        Event::EscapingLinksRestored { paths, more } => format!(
+            "warning: links restored that point outside the tree they were restored into: {}; a harness that follows one reads or writes outside it",
+            named(paths, *more)
+        ),
         Event::Unrecognized => return Vec::new(),
     };
     vec![line]
@@ -409,7 +463,45 @@ pub fn row(row: &PreflightRow) -> String {
 
 #[cfg(test)]
 mod tests {
+    use fabric_core::harness::{HarnessKind, ProgramName};
+
     use super::*;
+
+    /// A restore names links and submodules from the snapshot, and a run
+    /// plan names the job's harness with the arguments its ledger holds. A
+    /// pulled job's snapshot and ledger hold what a peer, or an agent in its
+    /// tree, wrote there, and a `RelPath` takes control characters. Each
+    /// event line prints them as visible escapes, so a link named with an
+    /// OSC 52 clipboard write or a clear screen never acts on the terminal
+    /// (review of PR #27).
+    #[test]
+    fn event_lines_print_with_their_control_characters_escaped() {
+        let hostile = "x\u{1b}]52;c;aGk=\u{7}\u{1b}[2J\u{9b}31m\r\nforged";
+        let escaped = r"x\u{1b}]52;c;aGk=\u{7}\u{1b}[2J\u{9b}31m\r\nforged";
+        let paths = vec![hostile.to_owned()];
+        let harness = HarnessKind::Acp {
+            program: ProgramName::parse("agent").unwrap(),
+            args: vec![hostile.to_owned()],
+        };
+        for hostile_event in [
+            Event::EscapingLinksRestored {
+                paths: paths.clone(),
+                more: 0,
+            },
+            Event::SubmodulesLeftEmpty { paths, more: 0 },
+            Event::NewSession {
+                harness,
+                previous: None,
+            },
+        ] {
+            let lines = event(&hostile_event);
+            assert!(
+                lines.iter().all(|line| !line.chars().any(char::is_control)),
+                "{lines:?}"
+            );
+            assert!(lines.iter().any(|line| line.contains(escaped)), "{lines:?}");
+        }
+    }
 
     /// Scripts read the preflight by columns: the outcome padded to 7, the
     /// fact to 16, an absent value as `absent`, a value's lines joined.

@@ -69,10 +69,10 @@ use fabric_core::secret::{Scope, SecretPattern, SecretPolicy};
 /// that no built-in secret pattern denies it. The lockfiles, manifests and
 /// manager configuration a setup step reads are hashed whole, and most of
 /// them are never parsed: their digest goes into the sentinel of the cache
-/// the step fills (`Inputs`). A node that captures a workspace reads this
-/// list too: a snapshot that leaves one of these files behind is detected
-/// otherwise on its target, so no setup step there is known to make a
-/// cache again.
+/// the step fills (`Inputs`). A node that captures a workspace reads each
+/// cache's share of this list (`Detection::input_files`) and the override
+/// file: a snapshot that leaves one of them behind is detected otherwise on
+/// its target, so no setup step there is known to make that cache again.
 pub const READ_FILES: &[&str] = &[
     OVERRIDE_FILE,
     "package.json",
@@ -468,6 +468,29 @@ pub enum StepGate {
     EveryResume,
 }
 
+/// Returns the steps of `spec` that materialize runs on every resume, whatever the workspace's caches hold.
+///
+/// Those are the steps declared `when = "always"`, detection's `go mod
+/// download` (`StepGate::EveryResume`), and every step of a spec that names
+/// no cache, since nothing then proves the workspace warm
+/// (`StepGate::AnyCache`). It reads the spec alone, as a node that holds a
+/// snapshot and not its workspace can: the target of a move asks it which
+/// programs it needs whatever the carry decision does with each cache. A
+/// step the user declares as `go mod download` counts too, though its own
+/// gate may let it skip; a node that refuses a move for it is asked for a
+/// program it may not need, never left without one it does.
+pub fn every_resume(spec: &EnvSpec) -> Vec<&SetupStep> {
+    let go = go_download().ok();
+    spec.setup
+        .iter()
+        .filter(|step| {
+            step.when == RunWhen::Always
+                || spec.cache_paths.is_empty()
+                || go.as_ref() == Some(*step)
+        })
+        .collect()
+}
+
 /// What a setup step fills, as detection knows it before the caches are final.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StepScope {
@@ -694,6 +717,8 @@ pub struct Detection {
     caches: Vec<CachePath>,
     /// One digest per cache, in the same order: the files the steps of its ecosystem read (`Inputs`).
     inputs: Vec<blake3::Hash>,
+    /// One list per cache, in the same order: the names of the files its digest covers (`Inputs::of`).
+    input_files: Vec<Vec<&'static str>>,
     pins: Vec<Pin>,
     node_manager: Option<ManagerChoice>,
     devcontainer: Option<RelPath>,
@@ -728,6 +753,23 @@ impl Detection {
     /// Returns each cache with the digest of the files its setup steps read, which its sentinel records.
     pub(crate) fn caches_with_inputs(&self) -> impl Iterator<Item = (&CachePath, &blake3::Hash)> {
         self.caches.iter().zip(&self.inputs)
+    }
+
+    /// Returns the names of the files at the root whose digest proves the
+    /// cache at `path` current, sorted: the files the steps of its
+    /// ecosystem read, every input file for an `other` cache, and none for
+    /// a path the report does not name.
+    ///
+    /// These and the override file are what decide the steps that fill the
+    /// cache, so a node that captures the workspace without one of them
+    /// cannot count on its target to plan those steps, while a cache of
+    /// another ecosystem keeps its own.
+    pub fn input_files(&self, path: &RelPath) -> &[&'static str] {
+        self.caches
+            .iter()
+            .position(|cache| &cache.path == path)
+            .and_then(|index| self.input_files.get(index))
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Returns one digest of every cache's path and the digest of the files
@@ -818,15 +860,16 @@ pub fn detect(root: &Path, recorded: &[SecretPattern]) -> Result<Detection, Dete
     inputs.python = detect_python(&reader, &mut setup, &mut caches)?;
     if reader.exists("go.mod")? {
         inputs.go = &["go.mod", "go.sum"];
-        setup.push(FoundStep::new(
-            step("go", &["mod", "download"])?,
-            StepScope::Outside,
-        ));
+        setup.push(FoundStep::new(go_download()?, StepScope::Outside));
     }
 
     merge_declared_caches(&mut caches, &overrides.caches, node_manager)?;
     caches.sort_by(|a, b| a.path.cmp(&b.path));
     let cache_inputs = inputs.digests(&reader, &caches)?;
+    let input_files = caches
+        .iter()
+        .map(|cache| inputs.of(cache.ecosystem))
+        .collect();
 
     if let Some(declared) = &overrides.setup {
         setup = declared
@@ -865,6 +908,7 @@ pub fn detect(root: &Path, recorded: &[SecretPattern]) -> Result<Detection, Dete
         step_cleared,
         caches,
         inputs: cache_inputs,
+        input_files,
         pins,
         node_manager,
         devcontainer: find_devcontainer(&reader)?,
@@ -1386,6 +1430,11 @@ fn go_mod_pin(reader: &Reader<'_>) -> Result<Option<Pin>, DetectError> {
             },
         )
         .and_then(|version| pin("go", version, "go.mod", PinAt::Key("go"))))
+}
+
+/// Returns detection's `go mod download`, which fills only this node's module cache outside the workspace.
+fn go_download() -> Result<SetupStep, DetectError> {
+    step("go", &["mod", "download"])
 }
 
 fn step(program: &'static str, args: &[&'static str]) -> Result<SetupStep, DetectError> {

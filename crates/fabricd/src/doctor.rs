@@ -28,9 +28,12 @@
 use std::path::Path;
 
 use fabric_client::api::{Outcome as WireOutcome, PreflightRow};
+use fabric_core::env::EnvSpec;
 use fabric_core::harness::HarnessKind;
 use fabric_core::version::HarnessVersion;
+use fabric_env::detect::every_resume;
 
+use crate::carry::command;
 use crate::facts::{NodeFacts, major, name};
 use crate::paths::{SyncedFolders, check_root};
 
@@ -494,6 +497,56 @@ fn clock_row(ctx: &Context<'_>) -> Row {
             String::new()
         },
     }
+}
+
+/// The rows for the setup steps of the job's spec that run on every
+/// resume (`fabric_env::detect::every_resume`), one per program this node
+/// measures.
+///
+/// Materialize on the target runs those steps whatever the carry decision
+/// did with each cache, and refuses before anything runs when a program
+/// is missing, so a target without one would own a job it cannot resume.
+/// The row refuses that move, for a push and a pull alike, and `--force`
+/// waives it: the user may install the program there before resuming. A
+/// program no node measures, such as a declared `make`, gets no row;
+/// resume names it when it is missing (ADR 0007). A step that runs only
+/// when its cache is not whole is the carry decision's, per path
+/// (`crate::carry`).
+#[must_use]
+pub fn setup_rows(spec: &EnvSpec, here: &NodeFacts, peer: &NodeFacts, target: Target) -> Vec<Row> {
+    let on_target = match target {
+        Target::Peer => peer,
+        Target::Here => here,
+    };
+    let mut rows: Vec<Row> = Vec::new();
+    for step in every_resume(spec) {
+        let program = step.program.as_str();
+        let Some(fact) = NodeFacts::program_fact(program) else {
+            continue;
+        };
+        if rows.iter().any(|row| row.fact == fact) {
+            continue;
+        }
+        let runs = format!("{} runs on every resume", command(step));
+        let (outcome, note) = if on_target.get(fact).is_some() {
+            (Outcome::Equal, runs)
+        } else {
+            (
+                Outcome::Refuse(Waiver::Force),
+                format!(
+                    "{runs}, and the target has no {program}; install it there, or pass --force and install it before resuming"
+                ),
+            )
+        };
+        rows.push(Row {
+            fact,
+            here: value(here, fact),
+            peer: value(peer, fact),
+            outcome,
+            note,
+        });
+    }
+    rows
 }
 
 /// The rows that stop a move: refusals, minus those `--force` waives.

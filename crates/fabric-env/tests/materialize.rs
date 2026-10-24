@@ -17,9 +17,10 @@ use std::time::{Duration, Instant};
 
 use fabric_core::env::{EnvVarName, RunWhen};
 use fabric_core::path::RelPath;
-use fabric_env::detect::{Detection, detect};
+use fabric_env::detect::{Detection, detect, every_resume};
 use fabric_env::materialize::{
-    CacheHealth, MaterializeError, NodeEnv, Plan, SENTINEL, TreeLock, plan, sentinel_text,
+    CacheHealth, MaterializeError, NodeEnv, Plan, PlannedStep, SENTINEL, TreeLock, plan,
+    sentinel_text,
 };
 use tempfile::TempDir;
 
@@ -701,6 +702,56 @@ fn a_step_that_fills_a_cache_outside_the_workspace_runs_beside_a_warm_one() {
         .map(|s| s.step().program.as_str())
         .collect();
     assert_eq!(programs, ["go"]);
+}
+
+/// The target of a move reads from the spec alone the steps it must be
+/// able to run whatever the carry decision does with each cache
+/// (`every_resume`): they are the steps a warm workspace still plans.
+/// Here that is detection's `go mod download` beside a sealed
+/// `node_modules`, an `always` step beside a whole `target`, and a step
+/// that no cache can let skip (issue #24).
+#[test]
+fn every_resume_names_the_steps_a_warm_workspace_still_plans() {
+    let go_mod = ("go.mod", "module example.com/x\n\ngo 1.22.0\n");
+    let cases: [(Files, Option<&str>, &[&str]); 3] = [
+        (
+            &[
+                ("package.json", PACKAGE_JSON),
+                ("package-lock.json", ""),
+                ("node_modules/a/package.json", "{}"),
+                go_mod,
+            ],
+            None,
+            &["node_modules"],
+        ),
+        (
+            &[("Cargo.toml", ""), ("target/debug/x", "")],
+            Some(
+                "[[setup]]\nprogram = \"cargo\"\nargs = [\"fetch\"]\n\n[[setup]]\nprogram = \"true\"\nwhen = \"always\"\n",
+            ),
+            &[],
+        ),
+        (
+            &[],
+            Some("[[setup]]\nprogram = \"touch\"\nargs = [\"ran\"]\n"),
+            &[],
+        ),
+    ];
+    for (files, override_toml, sealed) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), files).unwrap();
+        let detected = match override_toml {
+            Some(text) => declared(dir.path(), text).unwrap(),
+            None => detect(dir.path(), &[]).unwrap(),
+        };
+        for cache in sealed {
+            seal(&detected, cache).unwrap();
+        }
+        let planned = dry_run(&detected).unwrap();
+        let warm: Vec<_> = planned.steps().iter().map(PlannedStep::step).collect();
+        assert!(!warm.is_empty(), "{files:?}");
+        assert_eq!(every_resume(detected.spec()), warm, "{files:?}");
+    }
 }
 
 /// A missing `target` is a build away and says nothing about

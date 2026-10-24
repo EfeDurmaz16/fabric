@@ -130,6 +130,9 @@ event/decision_left.json /standing
 event/declined.json /epoch
 event/declined.json /kind
 event/declined.json /target
+event/escaping_links_restored.json /kind
+event/escaping_links_restored.json /more
+event/escaping_links_restored.json /paths
 event/fenced.json /epoch
 event/fenced.json /kind
 event/fenced.json /pid
@@ -357,6 +360,9 @@ event/stole.json /job
 event/stole.json /kind
 event/stopping_harness.json /kind
 event/stopping_harness.json /pid
+event/submodules_left_empty.json /kind
+event/submodules_left_empty.json /more
+event/submodules_left_empty.json /paths
 event/suspended.json /epoch
 event/suspended.json /kind
 event/suspended.json /snapshot

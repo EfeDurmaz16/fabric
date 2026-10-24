@@ -6,6 +6,12 @@
 //! line comes from `fabric_client::sentences`, which the node's log uses
 //! too; a reply's lines are made here. Each line is the one the node
 //! printed before the client API existed.
+//!
+//! The lines hold text as the node sent it: a goal, a reason, a decision,
+//! a note, an ACP harness's arguments, a peer's facts and paths from a
+//! snapshot are in the words of whoever wrote them. They print through
+//! `write_lines`, which escapes their control characters, so this module
+//! never escapes a field itself.
 
 use fabric_client::api::{
     CarryReport, DoctorReport, Event, JobStatus, LedgerEvent, Marker, PreflightRow, Process,
@@ -374,6 +380,105 @@ mod tests {
     use fabric_client::api::Outcome;
 
     use super::*;
+
+    /// A goal, a reason, a decision, a note or an ACP harness's arguments
+    /// are in the words of the node that wrote the record, a paired peer
+    /// included, and `job status`, `job ls` and `job log` print them. An
+    /// ANSI or OSC sequence, a C1 control or a line break among them must
+    /// print as visible escapes, never reach the terminal (Codex review of
+    /// #8, issue #23). The lines escape where they are written
+    /// (`write_lines`), as every line the CLI prints does (review of PR
+    /// #27).
+    #[test]
+    fn ledger_text_prints_with_its_control_characters_escaped() {
+        use fabric_client::api::{JobList, JobLog, JobSummary, LogRecord, Standing};
+        use fabric_core::harness::{HarnessKind, ProgramName};
+        use fabric_core::id::{Epoch, EventId, JobId, NodeId};
+
+        let hostile = "fix\u{1b}]0;owned\u{7}\u{1b}[2J\u{9b}31m\r\nowner: forged";
+        let escaped = r"fix\u{1b}]0;owned\u{7}\u{1b}[2J\u{9b}31m\r\nowner: forged";
+        let job = JobId::from_bytes([1; 16]);
+        let node = NodeId::from_bytes([2; 32]);
+        let harness = HarnessKind::Acp {
+            program: ProgramName::parse("agent").unwrap(),
+            args: vec![hostile.to_owned()],
+        };
+        let status = JobStatus {
+            job,
+            node,
+            goal: hostile.to_owned(),
+            harness: harness.clone(),
+            owner: node,
+            epoch: Epoch::FIRST,
+            view: View::Owner,
+            snapshot: None,
+            workspace: None,
+            workspace_unreadable: None,
+            process: Process::NotRunning,
+            records: 5,
+        };
+        let list = JobList {
+            jobs: vec![JobSummary {
+                job,
+                standing: Standing::Owner,
+                epoch: Epoch::FIRST,
+                goal: hostile.to_owned(),
+            }],
+            closed: Vec::new(),
+            left_out: 0,
+        };
+        let record = |event| LogRecord {
+            id: EventId::from_bytes([3; 16]),
+            epoch: Epoch::FIRST,
+            at: 0,
+            event,
+        };
+        let log = JobLog {
+            left_out: 0,
+            records: vec![
+                record(LedgerEvent::Created {
+                    created_by: node,
+                    harness: harness.clone(),
+                    goal: hostile.to_owned(),
+                }),
+                record(LedgerEvent::Resumed {
+                    node,
+                    snapshot: None,
+                    harness,
+                }),
+                record(LedgerEvent::Stolen {
+                    by: node,
+                    from: node,
+                    reason: hostile.to_owned(),
+                }),
+                record(LedgerEvent::DecisionRecorded {
+                    text: hostile.to_owned(),
+                }),
+                record(LedgerEvent::Note {
+                    text: hostile.to_owned(),
+                }),
+            ],
+        };
+        for (answer, holding) in [
+            (Reply::JobStatus(Box::new(status)), 2),
+            (Reply::JobList(list), 1),
+            (Reply::JobLog(log), 5),
+        ] {
+            let mut printed = Vec::new();
+            crate::write_lines(&mut printed, &reply(&answer)).unwrap();
+            let printed = String::from_utf8(printed).unwrap();
+            let lines: Vec<&str> = printed.lines().collect();
+            assert!(
+                lines.iter().all(|line| !line.chars().any(char::is_control)),
+                "{lines:?}"
+            );
+            assert_eq!(
+                lines.iter().filter(|line| line.contains(escaped)).count(),
+                holding,
+                "{lines:?}"
+            );
+        }
+    }
 
     fn row(fact: &str, outcome: Outcome) -> PreflightRow {
         PreflightRow {

@@ -2404,6 +2404,25 @@ pub enum Event {
         /// The root.
         root: PathBuf,
     },
+    /// A restore left these submodules as empty directories: a snapshot
+    /// carries a submodule's commit, not its files, so the source a
+    /// harness finds there is missing until the user fetches it.
+    SubmodulesLeftEmpty {
+        /// The first of them.
+        paths: Vec<String>,
+        /// How many more there are.
+        more: u64,
+    },
+    /// A restore wrote these links, whose target is absolute or climbs
+    /// above the root of the tree they were restored into, the workspace or
+    /// the harness state, so a harness that follows one reads or writes
+    /// outside that tree.
+    EscapingLinksRestored {
+        /// The first of them.
+        paths: Vec<String>,
+        /// How many more there are.
+        more: u64,
+    },
     /// A kind of event this client does not know; a newer node sent it.
     #[serde(other)]
     Unrecognized,

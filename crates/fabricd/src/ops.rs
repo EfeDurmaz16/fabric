@@ -22,13 +22,14 @@ use fabric_client::api::{
     SnapshotSession, SnapshotState, Standing, StealWarning, Step, Suspended, Verdict, VerdictCount,
     View, Wire, Workspace, WorkspaceState,
 };
+use fabric_core::env::{EnvSpec, OVERRIDE_FILE};
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::{FenceError, FencingToken};
 use fabric_core::ledger::{Author, EventKind, Ledger, LedgerError};
 use fabric_core::moves::{AbortAnswer, CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
 use fabric_core::session::SessionId;
-use fabric_core::snapshot::LeaveReason;
+use fabric_core::snapshot::{LeaveReason, SnapshotManifest};
 use fabric_core::version::HarnessVersion;
 use fabric_env::materialize::{MaterializeError, TreeLock};
 use fabric_harness::HarnessError;
@@ -51,7 +52,7 @@ use crate::carry::{self, PathDecision};
 use crate::clock;
 use crate::doctor::{self, Context, Target};
 use crate::error::NodeError;
-use crate::facts::{MeasuredKeys, NodeFacts};
+use crate::facts::{MeasuredKeys, NodeFacts, stayed_behind};
 use crate::faults::{self, Action, Point};
 use crate::harnesses::{HarnessConfig, HarnessEnv, adapter, refuse_secret_kind};
 use crate::job::Job;
@@ -888,7 +889,7 @@ impl Node {
         // the capture reads. A link at the root would lock, capture and
         // replicate whatever it names, so it is refused first.
         refuse_replaced_root(id, &marker.root)?;
-        let _tree = self.lock_tree(id, &marker.root)?;
+        let _tree = self.lock_tree(id, &marker.root).await?;
         if let Some(record) = job.harness_record()? {
             if record.liveness().await != Liveness::Gone {
                 out.emit(Event::StoppingHarness { pid: record.pid });
@@ -950,11 +951,19 @@ impl Node {
     /// Takes the lock `fabric job run` and `resume` hold over the tree at
     /// `root` while they run setup steps and launch; `None` when the root is
     /// gone, since nothing can run setup in it.
-    fn lock_tree(&self, job: JobId, root: &Path) -> Result<Option<TreeLock>, NodeError> {
+    ///
+    /// A busy lock is retried for a second before it counts as held (ADR
+    /// 0007), so it is taken on a blocking thread.
+    async fn lock_tree(&self, job: JobId, root: &Path) -> Result<Option<TreeLock>, NodeError> {
         if !root.exists() {
             return Ok(None);
         }
-        match TreeLock::acquire(&self.cfg.state.tree_locks(), root) {
+        let locks = self.cfg.state.tree_locks();
+        let tree = root.to_owned();
+        let taken = tokio::task::spawn_blocking(move || TreeLock::acquire(&locks, &tree))
+            .await
+            .map_err(|e| NodeError::Task(e.to_string()))?;
+        match taken {
             Ok(lock) => Ok(Some(lock)),
             Err(MaterializeError::TreeBusy { lock }) => Err(NodeError::SetupRunning {
                 job,
@@ -1181,7 +1190,7 @@ impl Node {
                     allow_large_untracked: false,
                 },
             )?;
-            crate::facts::forget_lost_remakes(&mut captured.manifest);
+            keys.forget_lost_remakes(&mut captured.manifest);
             let snapshot = store.publish(&captured.manifest)?;
             let has_git = captured.manifest.git.is_some();
             Ok((
@@ -1396,7 +1405,7 @@ impl Node {
                 });
             }
         }
-        let theirs = self
+        let (here, theirs) = self
             .preflight(
                 to,
                 Some((&harness, &root, floor.as_ref())),
@@ -1420,7 +1429,7 @@ impl Node {
         if let Some(snapshot) = snapshot {
             // Once MoveStarted is written, a refusal could only freeze the
             // job here; a move asked again after it goes on.
-            self.carry_for_move(to, snapshot, &theirs, owner.then_some(force), out)
+            self.carry_for_move(to, snapshot, (&here, &theirs), owner.then_some(force), out)
                 .await?;
         }
         self.push_records(id, to).await?;
@@ -1440,17 +1449,20 @@ impl Node {
     }
 
     /// Reports what `to`, which measured `theirs`, does with each ignored
-    /// path of `snapshot`, and stops on a path it can neither use nor make
-    /// again unless `force` says so. With `force` absent nothing stops.
+    /// path of `snapshot`, and whether it has the programs of the steps the
+    /// snapshot's spec runs on every resume, as this node, which measured
+    /// `here`, sees them. Stops on a path it can neither use nor make again,
+    /// and on such a program it lacks, unless `force` says so. With `force`
+    /// absent nothing stops.
     async fn carry_for_move(
         &self,
         to: NodeId,
         snapshot: SnapshotId,
-        theirs: &NodeFacts,
+        (here, theirs): (&NodeFacts, &NodeFacts),
         force: Option<bool>,
         out: &mut Out,
     ) -> Result<(), NodeError> {
-        let manifest = with_store(&self.store, move |store| Ok(store.manifest(snapshot)?)).await?;
+        let (manifest, spec) = self.manifest_and_spec(snapshot).await?;
         let decisions = carry::decide_all(&manifest, theirs);
         if !decisions.is_empty() {
             out.emit(carry_decided(
@@ -1459,13 +1471,40 @@ impl Node {
                 &decisions,
             ));
         }
+        let rows = setup_rows((&manifest, spec.as_ref()), here, theirs, Target::Peer);
+        if !rows.is_empty() {
+            out.emit(Event::Preflight {
+                peer: to,
+                rows: rows.iter().map(doctor::Row::to_wire).collect(),
+            });
+        }
         if manifest.harness_state.entries.is_empty() {
             out.emit(Event::NoSessionCaptured { snapshot });
         }
         match force {
-            Some(force) => refuse_carry(&decisions, force, out),
+            Some(force) => {
+                refuse_rows(&rows, force)?;
+                refuse_carry(&decisions, force, out)
+            }
             None => Ok(()),
         }
+    }
+
+    /// The manifest of `snapshot` and the spec it names, which the store
+    /// holds with it.
+    async fn manifest_and_spec(
+        &self,
+        snapshot: SnapshotId,
+    ) -> Result<(fabric_core::snapshot::SnapshotManifest, Option<EnvSpec>), NodeError> {
+        with_store(&self.store, move |store| {
+            let manifest = store.manifest(snapshot)?;
+            let spec = manifest
+                .env_spec
+                .map(|spec| store.env_spec(spec))
+                .transpose()?;
+            Ok((manifest, spec))
+        })
+        .await
     }
 
     /// Commits the source to the move with `MoveStarted` and returns the offer to send.
@@ -1848,19 +1887,21 @@ impl Node {
                 None
             };
             let root = paths::job_root(&self.cfg.home, id);
-            self.preflight(
-                holder,
-                Some((&kind, root.as_path(), floor.as_ref())),
-                Target::Here,
-                env,
-                force,
-                out,
-            )
-            .await?;
+            let (_, theirs) = self
+                .preflight(
+                    holder,
+                    Some((&kind, root.as_path(), floor.as_ref())),
+                    Target::Here,
+                    env,
+                    force,
+                    out,
+                )
+                .await?;
             // With no harness named, the job's own launches, and the pull
             // must still find the one the preflight checked.
             let checked = harness.is_none().then_some(&kind);
-            self.pull(id, holder, (checked, force), env, out).await?;
+            self.pull(id, holder, (checked, force, &theirs), env, out)
+                .await?;
         }
         let job = self.job(id).await?;
         let mut job = job.lock().await;
@@ -1891,12 +1932,13 @@ impl Node {
     /// `checked` is the harness the preflight checked this node for, when
     /// the job's own harness will launch. The holder may have resumed under
     /// another one after that check and before it suspended for the move;
-    /// the move is then aborted, and the holder keeps the job.
+    /// the move is then aborted, and the holder keeps the job. `theirs` are
+    /// the facts the holder gave the preflight.
     async fn pull(
         self: &Arc<Self>,
         id: JobId,
         holder: NodeId,
-        (checked, force): (Option<&HarnessKind>, bool),
+        (checked, force, theirs): (Option<&HarnessKind>, bool, &NodeFacts),
         env: &ToolEnv,
         out: &mut Out,
     ) -> Result<(), NodeError> {
@@ -1918,12 +1960,14 @@ impl Node {
         out.emit(Event::HolderStartedMove { holder, move_id });
         self.pull_records(id, holder).await?;
         self.ensure_latest(id, holder).await?;
-        // A path this node can neither use nor make again stops the pull
+        // A path this node can neither use nor make again, or a program
+        // of a step that runs on every resume it lacks, stops the pull
         // before it imports, as it stops a push before `MoveStarted`.
         let refused = if force {
             None
         } else {
-            self.carry_refusal_here(id, env, out).await?
+            self.carry_refusal_here(id, (holder, theirs), env, out)
+                .await?
         };
         faults::hit(Point::BeforeImport).await;
         let stopped = {
@@ -1979,11 +2023,14 @@ impl Node {
     }
 
     /// Decides here, with this node's facts, each ignored path of the job's
-    /// latest snapshot, and returns the refusal to stop a pull with when
-    /// one of them is refused, after reporting the decisions.
+    /// latest snapshot, checks this node has the programs of the steps its
+    /// spec runs on every resume, and returns the refusal to stop a pull
+    /// with when a path or a program is refused, after reporting them.
+    /// `theirs`, the holder's facts, fill the holder's side of the rows.
     async fn carry_refusal_here(
         &self,
         id: JobId,
+        (holder, theirs): (NodeId, &NodeFacts),
         env: &ToolEnv,
         out: &mut Out,
     ) -> Result<Option<NodeError>, NodeError> {
@@ -1995,14 +2042,21 @@ impl Node {
         let Some(snapshot) = latest else {
             return Ok(None);
         };
-        let manifest = with_store(&self.store, move |store| Ok(store.manifest(snapshot)?)).await?;
+        let (manifest, spec) = self.manifest_and_spec(snapshot).await?;
         let facts = NodeFacts::measure(&self.cfg.home, env).await;
+        let rows = setup_rows((&manifest, spec.as_ref()), &facts, theirs, Target::Here);
+        if !rows.is_empty() {
+            out.emit(Event::Preflight {
+                peer: holder,
+                rows: rows.iter().map(doctor::Row::to_wire).collect(),
+            });
+        }
         let decisions = carry::decide_all(&manifest, &facts);
         let refusal = refuse_carry(&decisions, false, &mut Out::default()).err();
         if refusal.is_some() {
             out.emit(carry_decided(CarryFor::Pull, snapshot, &decisions));
         }
-        Ok(refusal)
+        Ok(refuse_rows(&rows, false).err().or(refusal))
     }
 
     /// Imports the open move `move_id` from `holder` into `job`, whose lock
@@ -2302,6 +2356,23 @@ impl Node {
             self.write_snapshot(snapshot, &manifest, &root, harness_dir, env, out)
                 .await?;
         }
+        // A cache written with holes that setup steps fill keeps no
+        // sentinel: it would call the tree whole, and materialize would
+        // trust it and never fill them. Without it those steps run first,
+        // and the carry decision refused a move here unless this node can
+        // run them (issue #24). A tree nothing is known to make again is
+        // the user's files, carried whatever this node can run, so it stays
+        // as it left, holes and sentinel both: without the sentinel
+        // materialize would run a step no decision checked, and a job moved
+        // here could not resume. This runs after a restore a kill cut short
+        // too, before the marker says the tree is clean.
+        for cache in &manifest.caches {
+            if cache.carry == fabric_core::snapshot::CarryState::Partial
+                && matches!(cache.remake, fabric_core::snapshot::Remake::Setup { .. })
+            {
+                fabric_env::materialize::clear_sentinel(&root, &cache.path)?;
+            }
+        }
         if has_harness_state {
             self.restore_harness(job, &root, env, out).await?;
         }
@@ -2428,6 +2499,7 @@ impl Node {
         })
         .await?;
         out.emit(restored(snapshot, &report, has_git));
+        report_restore(&report, out);
         Ok(())
     }
 
@@ -2628,7 +2700,7 @@ impl Node {
             }
             None => (None, None, None, None),
         };
-        let (rows, theirs) = self
+        let (mut rows, here, theirs) = self
             .compare(
                 peer,
                 harness
@@ -2641,8 +2713,13 @@ impl Node {
             .await?;
         let carry = match (job, latest) {
             (Some(_), Some(snapshot)) => {
-                let manifest =
-                    with_store(&self.store, move |store| Ok(store.manifest(snapshot)?)).await?;
+                let (manifest, spec) = self.manifest_and_spec(snapshot).await?;
+                rows.extend(setup_rows(
+                    (&manifest, spec.as_ref()),
+                    &here,
+                    &theirs,
+                    Target::Peer,
+                ));
                 let decisions = carry::decide_all(&manifest, &theirs);
                 Some(carry_report(Some(&manifest), snapshot, &decisions))
             }
@@ -2722,7 +2799,8 @@ impl Node {
     }
 
     /// Compares this node's facts with `peer`'s, reports the rows, stops
-    /// on a refusal `force` does not waive, and returns the peer's facts.
+    /// on a refusal `force` does not waive, and returns this node's facts
+    /// and the peer's.
     /// A named job brings its harness, the root the target restores into,
     /// and the newest version of its harness known to have written its
     /// session.
@@ -2734,24 +2812,25 @@ impl Node {
         env: &ToolEnv,
         force: bool,
         out: &mut Out,
-    ) -> Result<NodeFacts, NodeError> {
-        let (rows, theirs) = self.compare(peer, job, target, env).await?;
+    ) -> Result<(NodeFacts, NodeFacts), NodeError> {
+        let (rows, here, theirs) = self.compare(peer, job, target, env).await?;
         out.emit(Event::Preflight {
             peer,
             rows: rows.iter().map(doctor::Row::to_wire).collect(),
         });
         refuse_rows(&rows, force)?;
-        Ok(theirs)
+        Ok((here, theirs))
     }
 
-    /// Measures this node, asks `peer` for its facts, and compares them row by row (ADR 0008).
+    /// Measures this node, asks `peer` for its facts, compares them row by
+    /// row (ADR 0008), and returns the rows, this node's facts and the peer's.
     async fn compare(
         self: &Arc<Self>,
         peer: NodeId,
         job: Option<(&HarnessKind, &Path, Option<&HarnessVersion>)>,
         target: Target,
         env: &ToolEnv,
-    ) -> Result<(Vec<doctor::Row>, NodeFacts), NodeError> {
+    ) -> Result<(Vec<doctor::Row>, NodeFacts, NodeFacts), NodeError> {
         let mut here = NodeFacts::measure(&self.cfg.home, env).await;
         // The agent of an ACP job is named per job, so only the target of a
         // pull, this node, can look for it.
@@ -2779,7 +2858,7 @@ impl Node {
                 floor: job.and_then(|(_, _, floor)| floor),
             },
         );
-        Ok((rows, theirs))
+        Ok((rows, here, theirs))
     }
 }
 
@@ -2814,6 +2893,34 @@ fn started_move(
             },
         )),
     }
+}
+
+/// The rows for the programs of the steps `spec`, the spec of the
+/// snapshot `manifest` describes, runs on every resume
+/// (`doctor::setup_rows`); none for a snapshot that names no spec, and
+/// none when `.fabric/env.toml` stayed on the capturing node.
+///
+/// The target plans its steps from its own detection over the restored
+/// tree (ADR 0007), not from this spec. The override file's declared
+/// steps replace the detected ones, and without the file that detection
+/// never sees them, so a program they name is not one the target needs,
+/// and refusing a move for it would stop one that resumes. A file the
+/// target already holds at that path, which a restore leaves alone, is
+/// the target's own, and resume names a program it lacks. The detected
+/// steps whose program a node measures each run only when a cache of the
+/// workspace is not whole, which the carry decision judges per path
+/// (review of PR #27).
+fn setup_rows(
+    (manifest, spec): (&SnapshotManifest, Option<&EnvSpec>),
+    here: &NodeFacts,
+    peer: &NodeFacts,
+    target: Target,
+) -> Vec<doctor::Row> {
+    if stayed_behind(&manifest.left_behind, OVERRIDE_FILE) {
+        return Vec::new();
+    }
+    spec.map(|spec| doctor::setup_rows(spec, here, peer, target))
+        .unwrap_or_default()
 }
 
 /// Stops on a row `force` does not waive.
@@ -3408,6 +3515,30 @@ fn is_missing(path: &Path) -> Result<bool, NodeError> {
         Ok(_) => Ok(false),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(e) => Err(NodeError::io(path, e)),
+    }
+}
+
+/// Warns of what a restore wrote that a harness cannot take as it is: the
+/// submodules it left as empty directories and the links that point
+/// outside the tree they were restored into, the first `REPORT_PATHS` of
+/// each named and the rest counted, so the run plan that follows never
+/// stands for a clean restore that was not one.
+fn report_restore(report: &RestoreReport, out: &mut Out) {
+    let named = |paths: &[fabric_core::path::RelPath]| {
+        let first = paths
+            .iter()
+            .take(REPORT_PATHS)
+            .map(ToString::to_string)
+            .collect();
+        (first, count(paths.len().saturating_sub(REPORT_PATHS)))
+    };
+    if !report.submodules.is_empty() {
+        let (paths, more) = named(&report.submodules);
+        out.emit(Event::SubmodulesLeftEmpty { paths, more });
+    }
+    if !report.escaping_symlinks.is_empty() {
+        let (paths, more) = named(&report.escaping_symlinks);
+        out.emit(Event::EscapingLinksRestored { paths, more });
     }
 }
 
@@ -4434,7 +4565,9 @@ pub(crate) mod tests {
         std::fs::write(thief_root.join("thief.txt"), "b's work\n").unwrap();
         b.suspend(id, &path, out).await.unwrap();
 
-        a.pull(id, b.id, (None, false), &env(), out).await.unwrap();
+        a.pull(id, b.id, (None, false, &NodeFacts::default()), &env(), out)
+            .await
+            .unwrap();
         let job = a.job(id).await.unwrap();
         let mut job = job.lock().await;
         let epoch = owner_token(&job, a.id).unwrap().epoch;
@@ -4571,7 +4704,9 @@ pub(crate) mod tests {
         let out = &mut Out::default();
         let id = job(dir_a.path(), &a).await;
         a.suspend(id, &path, out).await.unwrap();
-        b.pull(id, a.id, (None, false), &env(), out).await.unwrap();
+        b.pull(id, a.id, (None, false, &NodeFacts::default()), &env(), out)
+            .await
+            .unwrap();
         let approved = b.cfg.state.job(id).env_spec_ran();
         std::fs::write(&approved, "spec inputs\n").unwrap();
 
@@ -5305,20 +5440,33 @@ pub(crate) mod tests {
         assert!(said.contains(&lock.display().to_string()), "{said}");
         assert_eq!(node.job(id).await.unwrap().lock().await.latest(), None);
         drop(setup);
-        // A child another test forked while the lock was held keeps a copy
-        // of its descriptor, and so the lock, until that child execs.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            match node.suspend(id, &path, &mut Out::default()).await {
-                Err(NodeError::SetupRunning { .. }) if tokio::time::Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                done => {
-                    done.unwrap();
-                    break;
-                }
-            }
-        }
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+    }
+
+    /// A busy tree lock is retried for a second before the suspend refuses
+    /// (ADR 0007); the node's other work must go on meanwhile, here a timer
+    /// on the same single-threaded runtime.
+    #[tokio::test]
+    async fn a_suspend_waiting_on_a_held_tree_does_not_stall_the_node() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        let _setup = TreeLock::acquire(&node.cfg.state.tree_locks(), &root).unwrap();
+        let path = env();
+        let mut out = Out::default();
+        let started = std::time::Instant::now();
+        let (refused, ticked) = tokio::join!(node.suspend(id, &path, &mut out), async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            started.elapsed()
+        });
+        assert!(
+            matches!(refused, Err(NodeError::SetupRunning { .. })),
+            "{refused:?}"
+        );
+        assert!(
+            ticked < Duration::from_millis(500),
+            "a 20 ms timer fired after {ticked:?} while the suspend waited on the tree"
+        );
     }
 
     /// A suspend holds the tree lock from before it stops the harness
@@ -5386,6 +5534,90 @@ pub(crate) mod tests {
             std::fs::read_to_string(root.join("README.md")).unwrap(),
             "hello\n"
         );
+    }
+
+    /// A restore leaves a submodule as an empty directory and writes a
+    /// link whose target leaves the workspace as it was captured. Both
+    /// must be named before the run plan returns, the first
+    /// `REPORT_PATHS` of each and the rest counted, or the harness starts
+    /// in a workspace that reads as cleanly restored with source missing
+    /// or a way out of it (Codex review of #8, issue #23).
+    #[tokio::test]
+    async fn a_restore_names_the_submodules_it_left_empty_and_the_links_that_escape() {
+        let (dir, node) = node();
+        let repo = repo(dir.path());
+        let head = git_out(&repo, &["rev-parse", "HEAD"]);
+        git_out(
+            &repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{head},sub"),
+            ],
+        );
+        git_out(
+            &repo,
+            &[
+                "-c",
+                "user.name=f",
+                "-c",
+                "user.email=f@x",
+                "commit",
+                "-qm",
+                "2",
+            ],
+        );
+        let id = node
+            .job_new(&repo, "goal".to_owned(), HarnessKind::Codex)
+            .await
+            .unwrap()
+            .job;
+        let root = paths::job_root(&node.cfg.home, id);
+        let links = REPORT_PATHS + 2;
+        for n in 0..links {
+            std::os::unix::fs::symlink("../outside", root.join(format!("out{n:02}"))).unwrap();
+        }
+        let path = ToolEnv::current();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        let mut out = Out::default();
+        node.job_resume(id, None, None, false, &path, &mut out)
+            .await
+            .unwrap();
+        assert!(root.join("sub").is_dir());
+        let said = out.said();
+        let restored = said
+            .iter()
+            .position(|line| line.starts_with("restored snapshot"))
+            .unwrap_or_else(|| panic!("no restore: {said:#?}"));
+        let warned = |start: &str| {
+            said.iter()
+                .skip(restored)
+                .find(|line| line.starts_with(start))
+                .unwrap_or_else(|| panic!("no line {start:?} after the restore: {said:#?}"))
+        };
+        let submodules = warned("warning: submodules left empty");
+        assert!(
+            submodules.contains(": sub; run `git submodule update --init`"),
+            "{submodules}"
+        );
+        let escaping = warned("warning: links restored that point outside");
+        assert!(escaping.contains("out00, out01,"), "{escaping}");
+        assert!(escaping.contains("out19 and 2 more;"), "{escaping}");
+        assert!(!escaping.contains("out20"), "{escaping}");
+    }
+
+    /// Runs git in `repo` and returns what it printed, trimmed.
+    fn git_out(repo: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
     }
 
     /// The CLI launches with the configuration the daemon captures and
@@ -5644,7 +5876,7 @@ pub(crate) mod tests {
         b.pull(
             id,
             a.id,
-            (None, false),
+            (None, false, &NodeFacts::default()),
             &ToolEnv::current(),
             &mut Out::default(),
         )
@@ -5811,7 +6043,7 @@ pub(crate) mod tests {
             .pull(
                 id,
                 a.id,
-                (None, false),
+                (None, false, &NodeFacts::default()),
                 &ToolEnv::current(),
                 &mut Out::default(),
             )
@@ -6175,7 +6407,9 @@ pub(crate) mod tests {
         std::fs::write(root.join(".fabric/env.toml"), "").unwrap();
         a.suspend(id, &path, out).await.unwrap();
 
-        b.pull(id, a.id, (None, false), &env(), out).await.unwrap();
+        b.pull(id, a.id, (None, false, &NodeFacts::default()), &env(), out)
+            .await
+            .unwrap();
         let root = {
             let job = b.job(id).await.unwrap();
             let mut job = job.lock().await;
@@ -6722,7 +6956,7 @@ pub(crate) mod tests {
             .pull(
                 id,
                 a.id,
-                (Some(&HarnessKind::Codex), false),
+                (Some(&HarnessKind::Codex), false, &NodeFacts::default()),
                 &env(),
                 &mut Out::default(),
             )
@@ -6769,7 +7003,15 @@ pub(crate) mod tests {
         a.suspend(id, &env(), &mut Out::default()).await.unwrap();
         let no_pnpm = on_path(std::ffi::OsStr::new("/usr/bin:/bin"));
         let mut out = Out::default();
-        let pulled = b.pull(id, a.id, (None, false), &no_pnpm, &mut out).await;
+        let pulled = b
+            .pull(
+                id,
+                a.id,
+                (None, false, &NodeFacts::default()),
+                &no_pnpm,
+                &mut out,
+            )
+            .await;
         assert!(
             matches!(&pulled, Err(NodeError::CarryRefused { paths, .. }) if paths == &["node_modules"]),
             "{pulled:?} {:?}",
@@ -6792,6 +7034,232 @@ pub(crate) mod tests {
             pulled.lock().await.view(b.id),
             LeaseView::Owner(_)
         ));
+    }
+
+    /// A step declared `when = "always"` runs after every restore, whatever
+    /// the carry decision did with each cache, and materialize refuses one
+    /// whose program is missing before anything runs. A move to a node
+    /// without that program stops before the job changes hands, pushed
+    /// (after its suspend, before `MoveStarted`) or pulled (before the
+    /// import); it stopped only for a path (issue #24).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_stops_where_a_step_run_on_every_resume_cannot_run() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let root = paths::job_root(&a.cfg.home, id);
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(
+            root.join(".fabric/env.toml"),
+            "[[setup]]\nprogram = \"uv\"\nargs = [\"run\", \"codegen.py\"]\nwhen = \"always\"\n",
+        )
+        .unwrap();
+        a.suspend(id, &env(), &mut Out::default()).await.unwrap();
+        let snapshot = a.job(id).await.unwrap().lock().await.latest().unwrap();
+        let uv = |version: Option<&'static str>| {
+            NodeFacts::from_pairs(version.map(|v| (crate::facts::name::UV, v)))
+        };
+        let mut out = Out::default();
+        let pushed = a
+            .carry_for_move(
+                b.id,
+                snapshot,
+                (&uv(Some("uv 0.9.5")), &uv(None)),
+                Some(false),
+                &mut out,
+            )
+            .await;
+        assert!(
+            matches!(&pushed, Err(NodeError::Preflight(facts)) if facts == &["uv.version"]),
+            "{pushed:?}"
+        );
+        assert!(
+            out.said()
+                .iter()
+                .any(|line| line.starts_with("refuse  uv.version")),
+            "{:?}",
+            out.said()
+        );
+        a.carry_for_move(
+            b.id,
+            snapshot,
+            (&uv(Some("uv 0.9.5")), &uv(Some("uv 0.9.5"))),
+            Some(false),
+            &mut Out::default(),
+        )
+        .await
+        .unwrap();
+        let no_uv = on_path(std::ffi::OsStr::new("/usr/bin:/bin"));
+        let pulled = b
+            .pull(
+                id,
+                a.id,
+                (None, false, &uv(Some("uv 0.9.5"))),
+                &no_uv,
+                &mut Out::default(),
+            )
+            .await;
+        assert!(
+            matches!(&pulled, Err(NodeError::Preflight(facts)) if facts == &["uv.version"]),
+            "{pulled:?}"
+        );
+        let held = a.job(id).await.unwrap();
+        assert!(
+            matches!(held.lock().await.view(a.id), LeaseView::Owner(_)),
+            "the holder did not get the job back"
+        );
+        let pulled = b.job(id).await.unwrap();
+        assert!(!matches!(
+            pulled.lock().await.view(b.id),
+            LeaseView::Owner(_)
+        ));
+    }
+
+    /// The target plans its steps from its own detection over the restored
+    /// tree. With `.fabric/env.toml` kept on the source by `.fabricignore`,
+    /// the `always` step it declares never runs there, so a move to a node
+    /// without that step's program goes ahead; it was refused for a step
+    /// the target would not run (review of PR #27).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_ignores_the_steps_of_an_override_file_left_behind() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let root = paths::job_root(&a.cfg.home, id);
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(
+            root.join(".fabric/env.toml"),
+            "[[setup]]\nprogram = \"uv\"\nargs = [\"run\", \"codegen.py\"]\nwhen = \"always\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join(".fabricignore"), ".fabric/env.toml\n").unwrap();
+        a.suspend(id, &env(), &mut Out::default()).await.unwrap();
+        let snapshot = a.job(id).await.unwrap().lock().await.latest().unwrap();
+        let uv = |version: Option<&'static str>| {
+            NodeFacts::from_pairs(version.map(|v| (crate::facts::name::UV, v)))
+        };
+        let mut out = Out::default();
+        let pushed = a
+            .carry_for_move(
+                b.id,
+                snapshot,
+                (&uv(Some("uv 0.9.5")), &uv(None)),
+                Some(false),
+                &mut out,
+            )
+            .await;
+        assert!(pushed.is_ok(), "{pushed:?} {:?}", out.said());
+    }
+
+    /// A cache written with holes arrives without its sentinel. Here a
+    /// pnpm tree, one file of which `.fabricignore` kept on the source, is
+    /// written on a node with no pnpm, as a refusal is without a move. With
+    /// the sentinel, the lockfile and `package.json` that travelled proved
+    /// it whole, and materialize would never fill the hole (issue #24).
+    #[tokio::test]
+    async fn a_cache_restored_with_holes_is_not_called_whole() {
+        use fabric_env::materialize::{CacheHealth, SENTINEL, cache_health, sentinel_text};
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        std::fs::write(root.join("package.json"), "{\"name\": \"x\"}\n").unwrap();
+        std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::write(root.join(".fabricignore"), "node_modules/pkg/notes.txt\n").unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), "1;\n").unwrap();
+        std::fs::write(root.join("node_modules/pkg/notes.txt"), "kept here\n").unwrap();
+        let node_modules = fabric_core::path::RelPath::parse("node_modules").unwrap();
+        let health = |root: &Path| {
+            let detection = fabric_env::detect::detect(root, &[]).unwrap();
+            cache_health(&detection, &node_modules).unwrap()
+        };
+        let detection = fabric_env::detect::detect(&root, &[]).unwrap();
+        std::fs::write(
+            root.join("node_modules").join(SENTINEL),
+            sentinel_text(&detection, &node_modules).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(health(&root), Some(CacheHealth::Healthy));
+        node.suspend(id, &env(), &mut Out::default()).await.unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        let no_pnpm = on_path(std::ffi::OsStr::new("/usr/bin:/bin"));
+        let mut out = Out::default();
+        node.job_resume(id, None, None, false, &no_pnpm, &mut out)
+            .await
+            .unwrap();
+        assert!(
+            root.join("node_modules/pkg/index.js").is_file(),
+            "the tree was not written: {:?}",
+            out.said()
+        );
+        assert!(!root.join("node_modules/pkg/notes.txt").exists());
+        assert_eq!(health(&root), Some(CacheHealth::Incomplete));
+    }
+
+    /// A tree with holes that travels as the user's files arrives as it
+    /// left, sentinel included. Here `.fabric/env.toml` stayed behind
+    /// beside a pnpm tree with a hole, so the capture forgot the tree's
+    /// rebuild, and the carry decision carries it to a node without pnpm
+    /// and checks no step. Without the sentinel, the lockfile that
+    /// travelled would make materialize there run `pnpm install` and
+    /// refuse it, after a move had handed the job over (review of PR #27).
+    #[tokio::test]
+    async fn a_tree_carried_as_the_users_files_keeps_its_sentinel() {
+        use fabric_core::snapshot::{CarryState, Remake};
+        use fabric_env::materialize::{CacheHealth, SENTINEL, cache_health, sentinel_text};
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        std::fs::write(root.join("package.json"), "{\"name\": \"x\"}\n").unwrap();
+        std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(root.join(".fabric/env.toml"), "").unwrap();
+        std::fs::write(
+            root.join(".fabricignore"),
+            ".fabric/env.toml\nnode_modules/pkg/notes.txt\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), "1;\n").unwrap();
+        std::fs::write(root.join("node_modules/pkg/notes.txt"), "kept here\n").unwrap();
+        let node_modules = fabric_core::path::RelPath::parse("node_modules").unwrap();
+        let health = |root: &Path| {
+            let detection = fabric_env::detect::detect(root, &[]).unwrap();
+            cache_health(&detection, &node_modules).unwrap()
+        };
+        let detection = fabric_env::detect::detect(&root, &[]).unwrap();
+        std::fs::write(
+            root.join("node_modules").join(SENTINEL),
+            sentinel_text(&detection, &node_modules).unwrap(),
+        )
+        .unwrap();
+        let snapshot = node.suspend(id, &env(), &mut Out::default()).await.unwrap();
+        let (manifest, _) = node.manifest_and_spec(snapshot).await.unwrap();
+        let row = manifest
+            .caches
+            .iter()
+            .find(|cache| cache.path == node_modules)
+            .unwrap();
+        assert_eq!(
+            (row.carry, &row.remake),
+            (CarryState::Partial, &Remake::Nothing)
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        let no_pnpm = on_path(std::ffi::OsStr::new("/usr/bin:/bin"));
+        let mut out = Out::default();
+        node.job_resume(id, None, None, false, &no_pnpm, &mut out)
+            .await
+            .unwrap();
+        assert!(
+            root.join("node_modules/pkg/index.js").is_file(),
+            "the tree was not written: {:?}",
+            out.said()
+        );
+        assert_eq!(health(&root), Some(CacheHealth::Healthy));
     }
 
     /// A workspace root replaced with a link to another directory must not
