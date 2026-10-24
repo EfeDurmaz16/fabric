@@ -1181,7 +1181,7 @@ impl Node {
                     allow_large_untracked: false,
                 },
             )?;
-            crate::facts::forget_lost_remakes(&mut captured.manifest);
+            keys.forget_lost_remakes(&mut captured.manifest);
             let snapshot = store.publish(&captured.manifest)?;
             let has_git = captured.manifest.git.is_some();
             Ok((

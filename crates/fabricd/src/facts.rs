@@ -18,7 +18,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use fabric_client::api::Roots;
-use fabric_core::env::SetupStep;
+use fabric_core::env::{OVERRIDE_FILE, SetupStep};
 use fabric_core::harness::ProgramName;
 use fabric_core::path::{AbsPath, RelPath};
 use fabric_core::snapshot::{CacheClass, CarryKey, Platform, Remake, SnapshotManifest};
@@ -582,7 +582,15 @@ pub fn key_difference(source: &CarryKey, target: &CarryKey) -> String {
 /// ecosystem and what fills it, the facts give the strings.
 pub struct MeasuredKeys {
     facts: NodeFacts,
-    detected: BTreeMap<RelPath, (Ecosystem, Remake)>,
+    detected: BTreeMap<RelPath, DetectedCache>,
+}
+
+/// What detection says about one cache.
+struct DetectedCache {
+    ecosystem: Ecosystem,
+    remake: Remake,
+    /// The files at the root its steps read (`Detection::input_files`).
+    inputs: Vec<&'static str>,
 }
 
 impl MeasuredKeys {
@@ -620,12 +628,61 @@ impl MeasuredKeys {
                                 CacheOrigin::Detected => Remake::NextBuild,
                             },
                         };
-                        (cache.path.clone(), (cache.ecosystem, remake))
+                        let detected = DetectedCache {
+                            ecosystem: cache.ecosystem,
+                            remake,
+                            inputs: d.input_files(&cache.path).to_vec(),
+                        };
+                        (cache.path.clone(), detected)
                     })
                     .collect()
             })
             .unwrap_or_default();
         Self { facts, detected }
+    }
+
+    /// Turns each cache row that setup steps remake into one nothing
+    /// remakes when `.fabric/env.toml`, or a file that cache's steps read
+    /// (`Detection::input_files`), stayed on this node, and returns the
+    /// paths it turned.
+    ///
+    /// The target learns the steps from its own detection over the
+    /// restored tree. With the lockfile, the package manifest or the
+    /// manager's configuration of a cache, or the override file, left
+    /// behind by `.fabricignore` or a secret pattern, that detection does
+    /// not see what this node saw and may plan no step for the path, so a
+    /// rebuild the row promised would never run and the bytes, left out for
+    /// it, would be lost. Nothing on the target is then known to make the
+    /// path again, and it travels as the user's files. A file only another
+    /// cache's steps read changes nothing here: a `requirements.txt` left
+    /// behind turns `.venv` and leaves `node_modules` to its install, which
+    /// alone fills the holes of a partial tree (issue #24). A row detection
+    /// did not report counts every file detection reads.
+    pub fn forget_lost_remakes(&self, manifest: &mut SnapshotManifest) -> Vec<RelPath> {
+        let left = &manifest.left_behind;
+        let stayed = |file: &str| {
+            RelPath::parse(file).is_ok_and(|file| {
+                left.iter()
+                    .any(|left| file.starts_with_ignore_ascii_case(&left.path))
+            })
+        };
+        let mut turned = Vec::new();
+        for cache in &mut manifest.caches {
+            if !matches!(cache.remake, Remake::Setup { .. }) {
+                continue;
+            }
+            let inputs = self
+                .detected
+                .get(&cache.path)
+                .map_or(fabric_env::detect::READ_FILES, |detected| {
+                    detected.inputs.as_slice()
+                });
+            if stayed(OVERRIDE_FILE) || inputs.iter().any(|file| stayed(file)) {
+                cache.remake = Remake::Nothing;
+                turned.push(cache.path.clone());
+            }
+        }
+        turned
     }
 
     /// The key of a cache the store's classes found and detection did not:
@@ -647,7 +704,7 @@ impl MeasuredKeys {
 
 impl CarryKeys for MeasuredKeys {
     fn key(&self, class: CacheClass, path: &RelPath) -> CarryKey {
-        let key = match self.detected.get(path).map(|(ecosystem, _)| *ecosystem) {
+        let key = match self.detected.get(path).map(|detected| detected.ecosystem) {
             Some(Ecosystem::Node(manager)) => self.facts.node_key(manager_name(manager)),
             Some(Ecosystem::Rust) => self.facts.rust_key(),
             Some(Ecosystem::Python) => self.facts.python_key(),
@@ -662,44 +719,13 @@ impl CarryKeys for MeasuredKeys {
     /// build or tool run otherwise.
     fn remake(&self, class: CacheClass, path: &RelPath) -> Remake {
         match self.detected.get(path) {
-            Some((_, remake)) => remake.clone(),
+            Some(detected) => detected.remake.clone(),
             None => match class {
                 CacheClass::Deps => Remake::Nothing,
                 CacheClass::Build | CacheClass::ToolCache => Remake::NextBuild,
             },
         }
     }
-}
-
-/// Turns each cache row that setup steps remake into one nothing remakes
-/// when a file detection reads stayed on this node, and returns the paths
-/// it turned.
-///
-/// The target learns the steps from its own detection over the restored
-/// tree. With a lockfile, a package manifest, the manager's configuration
-/// or `.fabric/env.toml` left behind by `.fabricignore` or a secret
-/// pattern, that detection does not see what this node saw and may plan
-/// no step for the path, so a rebuild the row promised would never run
-/// and the bytes, left out for it, would be lost. Nothing on the target is
-/// then known to make the path again, and it travels as the user's files.
-pub fn forget_lost_remakes(manifest: &mut SnapshotManifest) -> Vec<RelPath> {
-    let lost = manifest.left_behind.iter().any(|left| {
-        fabric_env::detect::READ_FILES.iter().any(|file| {
-            RelPath::parse(file).is_ok_and(|file| file.starts_with_ignore_ascii_case(&left.path))
-        })
-    });
-    if !lost {
-        return Vec::new();
-    }
-    manifest
-        .caches
-        .iter_mut()
-        .filter(|cache| matches!(cache.remake, Remake::Setup { .. }))
-        .map(|cache| {
-            cache.remake = Remake::Nothing;
-            cache.path.clone()
-        })
-        .collect()
 }
 
 fn manager_name(manager: NodeManager) -> &'static str {
@@ -867,16 +893,32 @@ mod tests {
         assert_eq!(keys.remake(CacheClass::Build, &dist), Remake::NextBuild);
     }
 
-    /// A row setup steps remake keeps its steps while what detection
-    /// reads travels, and becomes the user's files once the lockfile, or
-    /// a directory that holds one of those files, stayed behind: the
-    /// target's detection would plan no step for it (review of PR #11).
-    #[test]
-    fn a_rebuild_whose_inputs_stayed_behind_becomes_the_users_files() {
-        use fabric_core::snapshot::{
-            CacheEntry, CarryState, HarnessState, LeaveReason, LeftBehind,
+    /// The keys detection gives a workspace with an npm lockfile beside a
+    /// `requirements.txt`, and a snapshot of it whose rows are `.venv` and
+    /// `node_modules`, each filled by its own steps, and a `dist` the next
+    /// build makes, with `left` stayed behind.
+    fn two_ecosystems(
+        left: &[(&str, fabric_core::snapshot::LeaveReason)],
+    ) -> (MeasuredKeys, SnapshotManifest) {
+        use fabric_core::snapshot::{CacheEntry, CarryState, HarnessState, LeftBehind};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("package-lock.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("requirements.txt"), "six\n").unwrap();
+        let detection = fabric_env::detect::detect(dir.path(), &[]).unwrap();
+        let keys = MeasuredKeys::new(pro(), Some(&detection));
+        let row = |path: &str, class| {
+            let path = RelPath::parse(path).unwrap();
+            CacheEntry {
+                class,
+                carry: CarryState::Carried,
+                key: keys.key(class, &path),
+                remake: keys.remake(class, &path),
+                path,
+                native_files: 0,
+            }
         };
-        let manifest = |left: &[(&str, LeaveReason)]| SnapshotManifest {
+        let manifest = SnapshotManifest {
             job_id: fabric_core::id::JobId::from_bytes([1; 16]),
             root: AbsPath::parse("/w").unwrap(),
             parent: None,
@@ -888,30 +930,9 @@ mod tests {
             harness_state: HarnessState::default(),
             env_spec: None,
             caches: vec![
-                CacheEntry {
-                    path: RelPath::parse("dist").unwrap(),
-                    class: CacheClass::Build,
-                    carry: CarryState::Carried,
-                    key: CarryKey::Unmeasured,
-                    remake: Remake::NextBuild,
-                    native_files: 0,
-                },
-                CacheEntry {
-                    path: RelPath::parse("node_modules").unwrap(),
-                    class: CacheClass::Deps,
-                    carry: CarryState::Carried,
-                    key: CarryKey::Unmeasured,
-                    remake: Remake::Setup {
-                        steps: vec![SetupStep {
-                            program: ProgramName::parse("npm").unwrap(),
-                            args: vec![fabric_core::env::SetupArg::parse("ci").unwrap()],
-                            cwd: None,
-                            when: fabric_core::env::RunWhen::CachesMissing,
-                        }],
-                        installed: true,
-                    },
-                    native_files: 0,
-                },
+                row(".venv", CacheClass::Deps),
+                row("dist", CacheClass::Build),
+                row("node_modules", CacheClass::Deps),
             ],
             left_behind: left
                 .iter()
@@ -921,19 +942,66 @@ mod tests {
                 })
                 .collect(),
         };
-        let mut kept = manifest(&[(".env", LeaveReason::Secret)]);
-        assert!(forget_lost_remakes(&mut kept).is_empty());
-        assert!(matches!(kept.caches[1].remake, Remake::Setup { .. }));
-        for left in ["package-lock.json", ".fabric"] {
-            let mut lost = manifest(&[(left, LeaveReason::Excluded)]);
-            assert_eq!(
-                forget_lost_remakes(&mut lost),
-                [RelPath::parse("node_modules").unwrap()],
-                "{left}"
+        for cache in [0, 2] {
+            assert!(
+                matches!(manifest.caches[cache].remake, Remake::Setup { .. }),
+                "{:?}",
+                manifest.caches[cache]
             );
-            assert_eq!(lost.caches[1].remake, Remake::Nothing, "{left}");
-            assert_eq!(lost.caches[0].remake, Remake::NextBuild, "{left}");
         }
+        (keys, manifest)
+    }
+
+    /// A row setup steps remake keeps its steps while what its steps read
+    /// travels, and becomes the user's files once its lockfile, the
+    /// override file, or a directory that holds one of those files, stayed
+    /// behind: the target's detection would plan no step for it (review of
+    /// PR #11).
+    #[test]
+    fn a_rebuild_whose_inputs_stayed_behind_becomes_the_users_files() {
+        use fabric_core::snapshot::LeaveReason;
+        let (keys, mut kept) = two_ecosystems(&[(".env", LeaveReason::Secret)]);
+        assert!(keys.forget_lost_remakes(&mut kept).is_empty());
+        for (left, turned) in [
+            ("package-lock.json", &["node_modules"][..]),
+            (".fabric", &[".venv", "node_modules"][..]),
+        ] {
+            let (keys, mut lost) = two_ecosystems(&[(left, LeaveReason::Excluded)]);
+            let turned: Vec<RelPath> = turned.iter().map(|p| RelPath::parse(p).unwrap()).collect();
+            assert_eq!(keys.forget_lost_remakes(&mut lost), turned, "{left}");
+            for cache in &lost.caches {
+                if turned.contains(&cache.path) {
+                    assert_eq!(cache.remake, Remake::Nothing, "{left}");
+                }
+            }
+            assert_eq!(lost.caches[1].remake, Remake::NextBuild, "{left}");
+        }
+    }
+
+    /// A file only one cache's steps read forgets only that cache's
+    /// rebuild. With every rebuild forgotten, a `requirements.txt` left
+    /// behind turned a partial `node_modules`, which holds its sentinel,
+    /// into the user's files: it was written with its holes, and the
+    /// target's detection, which still saw the lockfile, trusted the
+    /// sentinel and never filled them (issue #24).
+    #[test]
+    fn a_file_of_another_ecosystem_left_behind_keeps_the_rebuild() {
+        use fabric_core::snapshot::{CarryState, LeaveReason};
+        let (keys, mut manifest) = two_ecosystems(&[("requirements.txt", LeaveReason::Excluded)]);
+        let node_modules = &mut manifest.caches[2];
+        node_modules.carry = CarryState::Partial;
+        if let Remake::Setup { installed, .. } = &mut node_modules.remake {
+            *installed = true;
+        }
+        assert_eq!(
+            keys.forget_lost_remakes(&mut manifest),
+            [RelPath::parse(".venv").unwrap()]
+        );
+        let decision = crate::carry::decide(&manifest.caches[2], &manifest.platform, &pro());
+        assert!(
+            matches!(decision, crate::carry::CarryDecision::Rebuild { .. }),
+            "{decision:?}"
+        );
     }
 
     /// A tree with a lockfile records the install step that fills it.
