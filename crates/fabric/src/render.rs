@@ -7,14 +7,11 @@
 //! too; a reply's lines are made here. Each line is the one the node
 //! printed before the client API existed.
 //!
-//! Text a ledger holds in the user's or a peer's words, a goal, a reason,
-//! a decision, a note or an ACP harness's arguments, prints with its
-//! control characters escaped
-//! (`printable`): a job learned from a paired node carries the words that
-//! node wrote, and an ANSI or OSC sequence among them would otherwise act
-//! on the user's terminal, and a line break would forge a line.
-
-use std::borrow::Cow;
+//! The lines hold text as the node sent it: a goal, a reason, a decision,
+//! a note, an ACP harness's arguments, a peer's facts and paths from a
+//! snapshot are in the words of whoever wrote them. They print through
+//! `write_lines`, which escapes their control characters, so this module
+//! never escapes a field itself.
 
 use fabric_client::api::{
     CarryReport, DoctorReport, Event, JobStatus, LedgerEvent, Marker, PreflightRow, Process,
@@ -116,10 +113,7 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
             .chain(list.jobs.iter().map(|job| {
                 format!(
                     "{} {} epoch {} {}",
-                    job.job,
-                    job.standing,
-                    job.epoch,
-                    printable(&job.goal)
+                    job.job, job.standing, job.epoch, job.goal
                 )
             }))
             .chain(
@@ -149,7 +143,7 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
                 }))
                 .collect()
         }
-        Reply::JobDecide(decided) => vec![format!("recorded: {}", printable(&decided.text))],
+        Reply::JobDecide(decided) => vec![format!("recorded: {}", decided.text)],
         Reply::Doctor {
             report: DoctorReport::Facts { facts },
         } => facts
@@ -256,8 +250,8 @@ fn job_status(status: &JobStatus) -> Vec<String> {
     let id = status.job;
     let mut lines = vec![
         format!("job {id}"),
-        format!("goal: {}", printable(&status.goal)),
-        format!("harness: {}", printable(&status.harness.to_string())),
+        format!("goal: {}", status.goal),
+        format!("harness: {}", status.harness),
         format!(
             "owner: {}{} at epoch {}",
             status.owner,
@@ -362,11 +356,7 @@ fn ledger_event(event: &LedgerEvent) -> String {
             created_by,
             harness,
             goal,
-        } => format!(
-            "Created by {created_by} under {}: {}",
-            printable(&harness.to_string()),
-            printable(goal)
-        ),
+        } => format!("Created by {created_by} under {harness}: {goal}"),
         LedgerEvent::MoveStarted { move_id, target } => {
             format!("MoveStarted {move_id} toward {target}")
         }
@@ -374,44 +364,15 @@ fn ledger_event(event: &LedgerEvent) -> String {
             format!("MoveImported {move_id} from {from}")
         }
         LedgerEvent::MoveAborted { move_id } => format!("MoveAborted {move_id}"),
-        LedgerEvent::Stolen { by, from, reason } => {
-            format!("Stolen by {by} from {from}: {}", printable(reason))
-        }
+        LedgerEvent::Stolen { by, from, reason } => format!("Stolen by {by} from {from}: {reason}"),
         LedgerEvent::SnapshotPublished { snapshot, .. } => format!("SnapshotPublished {snapshot}"),
         LedgerEvent::Suspended { snapshot } => format!("Suspended in {snapshot}"),
-        LedgerEvent::Resumed { node, harness, .. } => {
-            format!(
-                "Resumed on {node} under {}",
-                printable(&harness.to_string())
-            )
-        }
+        LedgerEvent::Resumed { node, harness, .. } => format!("Resumed on {node} under {harness}"),
         LedgerEvent::EnvSpecChanged { env_spec } => format!("EnvSpecChanged {env_spec}"),
-        LedgerEvent::DecisionRecorded { text } => {
-            format!("DecisionRecorded: {}", printable(text))
-        }
-        LedgerEvent::Note { text } => format!("Note: {}", printable(text)),
+        LedgerEvent::DecisionRecorded { text } => format!("DecisionRecorded: {text}"),
+        LedgerEvent::Note { text } => format!("Note: {text}"),
         LedgerEvent::Unrecognized => "a record of a kind this fabric does not know".to_owned(),
     }
-}
-
-/// `text` with each control character written as its escape, such as
-/// `\u{1b}` for ESC, `\u{9b}` for a C1 CSI and `\n` for a line break, so
-/// it prints as visible characters on the one line it belongs to. A
-/// backslash the text holds prints as it is: the line is for people, and a
-/// program reads the field from the client API instead.
-fn printable(text: &str) -> Cow<'_, str> {
-    if !text.chars().any(char::is_control) {
-        return Cow::Borrowed(text);
-    }
-    let mut escaped = String::with_capacity(text.len());
-    for c in text.chars() {
-        if c.is_control() {
-            escaped.extend(c.escape_debug());
-        } else {
-            escaped.push(c);
-        }
-    }
-    Cow::Owned(escaped)
 }
 
 #[cfg(test)]
@@ -425,7 +386,9 @@ mod tests {
     /// included, and `job status`, `job ls` and `job log` print them. An
     /// ANSI or OSC sequence, a C1 control or a line break among them must
     /// print as visible escapes, never reach the terminal (Codex review of
-    /// #8, issue #23).
+    /// #8, issue #23). The lines escape where they are written
+    /// (`write_lines`), as every line the CLI prints does (review of PR
+    /// #27).
     #[test]
     fn ledger_text_prints_with_its_control_characters_escaped() {
         use fabric_client::api::{JobList, JobLog, JobSummary, LogRecord, Standing};
@@ -501,7 +464,10 @@ mod tests {
             (Reply::JobList(list), 1),
             (Reply::JobLog(log), 5),
         ] {
-            let lines = reply(&answer);
+            let mut printed = Vec::new();
+            crate::write_lines(&mut printed, &reply(&answer)).unwrap();
+            let printed = String::from_utf8(printed).unwrap();
+            let lines: Vec<&str> = printed.lines().collect();
             assert!(
                 lines.iter().all(|line| !line.chars().any(char::is_control)),
                 "{lines:?}"

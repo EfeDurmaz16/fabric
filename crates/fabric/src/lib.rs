@@ -267,17 +267,30 @@ enum Notes {
 impl Notes {
     fn print<T: fmt::Display>(self, lines: &[T]) -> Result<()> {
         match self {
-            Notes::Stdout => {
-                let mut out = std::io::stdout().lock();
-                lines.iter().try_for_each(|line| writeln!(out, "{line}"))?;
-            }
-            Notes::Stderr => {
-                let mut out = std::io::stderr().lock();
-                lines.iter().try_for_each(|line| writeln!(out, "{line}"))?;
-            }
+            Notes::Stdout => write_lines(&mut std::io::stdout().lock(), lines)?,
+            Notes::Stderr => write_lines(&mut std::io::stderr().lock(), lines)?,
         }
         Ok(())
     }
+}
+
+/// Writes each of `lines` on a line of its own, with its control
+/// characters escaped (`fabric_client::sentences::printable`).
+///
+/// Every line `fabric` prints that holds text it did not make goes through
+/// here: the lines of each event and reply, its notes and warnings, and
+/// its error. A goal, a steal's reason, a peer's facts, a path from a
+/// snapshot and an ACP harness's arguments are in the words of whoever
+/// wrote them, a paired node or an agent in the workspace among them, and
+/// an ANSI or OSC sequence there would otherwise act on the user's
+/// terminal, and a line break would forge a line. Only a headless turn's
+/// answer, which is the harness's own output, prints as it came.
+fn write_lines<T: fmt::Display>(out: &mut impl Write, lines: &[T]) -> std::io::Result<()> {
+    for line in lines {
+        let line = line.to_string();
+        writeln!(out, "{}", fabric_client::sentences::printable(&line))?;
+    }
+    Ok(())
 }
 
 /// A refusal, kept typed so `main` can pick the exit code.
@@ -408,7 +421,7 @@ pub fn main() -> ExitCode {
     match runtime.block_on(run(cli)) {
         Ok(code) => code,
         Err(e) => {
-            let _ = writeln!(std::io::stderr(), "error: {e:#}");
+            let _ = Notes::Stderr.print(&[format!("error: {e:#}")]);
             exit_code(&e)
         }
     }
@@ -1198,38 +1211,35 @@ async fn record_sessions(
             Err(ClientError::Refused(refusal)) => refusal.message().to_owned(),
             Err(e) => e.to_string(),
         };
-        let _ = writeln!(
-            std::io::stderr(),
+        let _ = Notes::Stderr.print(&[format!(
             "warning: the node did not record {} session {session} ({missed}); job {} keeps the session the node holds, or, for a new Codex thread, the one its next capture finds in the workspace",
-            plan.harness,
-            plan.job
-        );
+            plan.harness, plan.job
+        )]);
     }
 }
 
 /// Prints what a headless turn reported: the answer on standard output,
-/// then a line naming the session; a failure, a missing answer and a
-/// missing session on standard error.
+/// as the harness wrote it, then a line naming the session; a failure, a
+/// missing answer and a missing session on standard error.
 fn print_turn(plan: &RunPlan, report: &TurnReport) -> Result<()> {
     let harness = &plan.harness;
     if let Some(failure) = &report.failure {
-        writeln!(std::io::stderr(), "the turn failed: {failure}")?;
+        Notes::Stderr.print(&[format!("the turn failed: {failure}")])?;
     }
     if let Some(answer) = &report.answer {
         writeln!(std::io::stdout(), "{answer}")?;
     } else if report.failure.is_none() && !matches!(harness, HarnessKind::Acp { .. }) {
-        writeln!(std::io::stderr(), "warning: {harness} printed no answer")?;
+        Notes::Stderr.print(&[format!("warning: {harness} printed no answer")])?;
     }
     match (&report.session, &plan.session) {
-        (Some(session), Some(planned)) if session != planned => writeln!(
-            std::io::stderr(),
+        (Some(session), Some(planned)) if session != planned => Notes::Stderr.print(&[format!(
             "warning: {harness} continued in session {session}, not in {planned}"
-        )?,
-        (None, _) => writeln!(std::io::stderr(), "warning: {harness} named no session")?,
+        )])?,
+        (None, _) => Notes::Stderr.print(&[format!("warning: {harness} named no session")])?,
         _ => {}
     }
     if let Some(session) = &report.session {
-        writeln!(std::io::stdout(), "{harness} session {session}")?;
+        Notes::Stdout.print(&[format!("{harness} session {session}")])?;
     }
     Ok(())
 }
@@ -1300,11 +1310,10 @@ async fn exited(
         Err(e) => Some(e.to_string()),
     };
     if let Some(reason) = missed {
-        writeln!(
-            std::io::stderr(),
+        Notes::Stderr.print(&[format!(
             "warning: the node did not record that the harness exited ({reason}); `fabric job status {}` shows what it holds",
             plan.job
-        )?;
+        )])?;
     }
     if let Some(signal) = status.signal() {
         if interrupts.passed > 0 {
@@ -1472,19 +1481,17 @@ fn report_trust(root: &Path, outcome: &TrustOutcome, notes: Notes) -> Result<()>
         TrustOutcome::Written { key } => {
             notes.print(&[format!("trusted {}", key.display())])?;
         }
-        TrustOutcome::Inherited { by, reason } => writeln!(
-            std::io::stderr(),
+        TrustOutcome::Inherited { by, reason } => Notes::Stderr.print(&[format!(
             "warning: Fabric did not trust {} ({}); Claude trusts it through {}, so it skips its trust dialog and ignores the workspace's project settings",
             root.display(),
             left_reason(reason),
             by.display()
-        )?,
-        TrustOutcome::LeftToClaude { reason } => writeln!(
-            std::io::stderr(),
+        )])?,
+        TrustOutcome::LeftToClaude { reason } => Notes::Stderr.print(&[format!(
             "warning: Fabric did not trust {} ({}); Claude asks in its own trust dialog",
             root.display(),
             left_reason(reason)
-        )?,
+        )])?,
     }
     Ok(())
 }
