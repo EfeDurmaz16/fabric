@@ -6,6 +6,15 @@
 //! line comes from `fabric_client::sentences`, which the node's log uses
 //! too; a reply's lines are made here. Each line is the one the node
 //! printed before the client API existed.
+//!
+//! Text a ledger holds in the user's or a peer's words, a goal, a reason,
+//! a decision, a note or an ACP harness's arguments, prints with its
+//! control characters escaped
+//! (`printable`): a job learned from a paired node carries the words that
+//! node wrote, and an ANSI or OSC sequence among them would otherwise act
+//! on the user's terminal, and a line break would forge a line.
+
+use std::borrow::Cow;
 
 use fabric_client::api::{
     CarryReport, DoctorReport, Event, JobStatus, LedgerEvent, Marker, PreflightRow, Process,
@@ -107,7 +116,10 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
             .chain(list.jobs.iter().map(|job| {
                 format!(
                     "{} {} epoch {} {}",
-                    job.job, job.standing, job.epoch, job.goal
+                    job.job,
+                    job.standing,
+                    job.epoch,
+                    printable(&job.goal)
                 )
             }))
             .chain(
@@ -137,7 +149,7 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
                 }))
                 .collect()
         }
-        Reply::JobDecide(decided) => vec![format!("recorded: {}", decided.text)],
+        Reply::JobDecide(decided) => vec![format!("recorded: {}", printable(&decided.text))],
         Reply::Doctor {
             report: DoctorReport::Facts { facts },
         } => facts
@@ -244,8 +256,8 @@ fn job_status(status: &JobStatus) -> Vec<String> {
     let id = status.job;
     let mut lines = vec![
         format!("job {id}"),
-        format!("goal: {}", status.goal),
-        format!("harness: {}", status.harness),
+        format!("goal: {}", printable(&status.goal)),
+        format!("harness: {}", printable(&status.harness.to_string())),
         format!(
             "owner: {}{} at epoch {}",
             status.owner,
@@ -350,7 +362,11 @@ fn ledger_event(event: &LedgerEvent) -> String {
             created_by,
             harness,
             goal,
-        } => format!("Created by {created_by} under {harness}: {goal}"),
+        } => format!(
+            "Created by {created_by} under {}: {}",
+            printable(&harness.to_string()),
+            printable(goal)
+        ),
         LedgerEvent::MoveStarted { move_id, target } => {
             format!("MoveStarted {move_id} toward {target}")
         }
@@ -358,15 +374,44 @@ fn ledger_event(event: &LedgerEvent) -> String {
             format!("MoveImported {move_id} from {from}")
         }
         LedgerEvent::MoveAborted { move_id } => format!("MoveAborted {move_id}"),
-        LedgerEvent::Stolen { by, from, reason } => format!("Stolen by {by} from {from}: {reason}"),
+        LedgerEvent::Stolen { by, from, reason } => {
+            format!("Stolen by {by} from {from}: {}", printable(reason))
+        }
         LedgerEvent::SnapshotPublished { snapshot, .. } => format!("SnapshotPublished {snapshot}"),
         LedgerEvent::Suspended { snapshot } => format!("Suspended in {snapshot}"),
-        LedgerEvent::Resumed { node, harness, .. } => format!("Resumed on {node} under {harness}"),
+        LedgerEvent::Resumed { node, harness, .. } => {
+            format!(
+                "Resumed on {node} under {}",
+                printable(&harness.to_string())
+            )
+        }
         LedgerEvent::EnvSpecChanged { env_spec } => format!("EnvSpecChanged {env_spec}"),
-        LedgerEvent::DecisionRecorded { text } => format!("DecisionRecorded: {text}"),
-        LedgerEvent::Note { text } => format!("Note: {text}"),
+        LedgerEvent::DecisionRecorded { text } => {
+            format!("DecisionRecorded: {}", printable(text))
+        }
+        LedgerEvent::Note { text } => format!("Note: {}", printable(text)),
         LedgerEvent::Unrecognized => "a record of a kind this fabric does not know".to_owned(),
     }
+}
+
+/// `text` with each control character written as its escape, such as
+/// `\u{1b}` for ESC, `\u{9b}` for a C1 CSI and `\n` for a line break, so
+/// it prints as visible characters on the one line it belongs to. A
+/// backslash the text holds prints as it is: the line is for people, and a
+/// program reads the field from the client API instead.
+fn printable(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(char::is_control) {
+        return Cow::Borrowed(text);
+    }
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            escaped.extend(c.escape_debug());
+        } else {
+            escaped.push(c);
+        }
+    }
+    Cow::Owned(escaped)
 }
 
 #[cfg(test)]
@@ -374,6 +419,100 @@ mod tests {
     use fabric_client::api::Outcome;
 
     use super::*;
+
+    /// A goal, a reason, a decision, a note or an ACP harness's arguments
+    /// are in the words of the node that wrote the record, a paired peer
+    /// included, and `job status`, `job ls` and `job log` print them. An
+    /// ANSI or OSC sequence, a C1 control or a line break among them must
+    /// print as visible escapes, never reach the terminal (Codex review of
+    /// #8, issue #23).
+    #[test]
+    fn ledger_text_prints_with_its_control_characters_escaped() {
+        use fabric_client::api::{JobList, JobLog, JobSummary, LogRecord, Standing};
+        use fabric_core::harness::{HarnessKind, ProgramName};
+        use fabric_core::id::{Epoch, EventId, JobId, NodeId};
+
+        let hostile = "fix\u{1b}]0;owned\u{7}\u{1b}[2J\u{9b}31m\r\nowner: forged";
+        let escaped = r"fix\u{1b}]0;owned\u{7}\u{1b}[2J\u{9b}31m\r\nowner: forged";
+        let job = JobId::from_bytes([1; 16]);
+        let node = NodeId::from_bytes([2; 32]);
+        let harness = HarnessKind::Acp {
+            program: ProgramName::parse("agent").unwrap(),
+            args: vec![hostile.to_owned()],
+        };
+        let status = JobStatus {
+            job,
+            node,
+            goal: hostile.to_owned(),
+            harness: harness.clone(),
+            owner: node,
+            epoch: Epoch::FIRST,
+            view: View::Owner,
+            snapshot: None,
+            workspace: None,
+            workspace_unreadable: None,
+            process: Process::NotRunning,
+            records: 5,
+        };
+        let list = JobList {
+            jobs: vec![JobSummary {
+                job,
+                standing: Standing::Owner,
+                epoch: Epoch::FIRST,
+                goal: hostile.to_owned(),
+            }],
+            closed: Vec::new(),
+            left_out: 0,
+        };
+        let record = |event| LogRecord {
+            id: EventId::from_bytes([3; 16]),
+            epoch: Epoch::FIRST,
+            at: 0,
+            event,
+        };
+        let log = JobLog {
+            left_out: 0,
+            records: vec![
+                record(LedgerEvent::Created {
+                    created_by: node,
+                    harness: harness.clone(),
+                    goal: hostile.to_owned(),
+                }),
+                record(LedgerEvent::Resumed {
+                    node,
+                    snapshot: None,
+                    harness,
+                }),
+                record(LedgerEvent::Stolen {
+                    by: node,
+                    from: node,
+                    reason: hostile.to_owned(),
+                }),
+                record(LedgerEvent::DecisionRecorded {
+                    text: hostile.to_owned(),
+                }),
+                record(LedgerEvent::Note {
+                    text: hostile.to_owned(),
+                }),
+            ],
+        };
+        for (answer, holding) in [
+            (Reply::JobStatus(Box::new(status)), 2),
+            (Reply::JobList(list), 1),
+            (Reply::JobLog(log), 5),
+        ] {
+            let lines = reply(&answer);
+            assert!(
+                lines.iter().all(|line| !line.chars().any(char::is_control)),
+                "{lines:?}"
+            );
+            assert_eq!(
+                lines.iter().filter(|line| line.contains(escaped)).count(),
+                holding,
+                "{lines:?}"
+            );
+        }
+    }
 
     fn row(fact: &str, outcome: Outcome) -> PreflightRow {
         PreflightRow {
