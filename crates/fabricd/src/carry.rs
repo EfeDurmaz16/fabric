@@ -1010,6 +1010,52 @@ mod tests {
         );
     }
 
+    /// rustup installs cargo and rustc as separate components, so a
+    /// target can have rustc and no cargo. A declared cargo step is judged
+    /// by the target's cargo: read through rustc, it was a rebuild that
+    /// left the bytes out, and materialize then refused the missing cargo
+    /// after the job had moved (issue #24).
+    #[test]
+    fn a_cargo_step_is_not_a_rebuild_where_only_rustc_is_installed() {
+        let vendor = entry(
+            "vendor",
+            CacheClass::Deps,
+            pro().key_like(&CarryKey::Rust {
+                rustc_vv: String::new(),
+                cargo_home: fabric_core::path::AbsPath::parse("/x").unwrap(),
+            }),
+            Remake::Setup {
+                steps: vec![step("cargo", &["vendor", "--locked"])],
+                installed: false,
+            },
+        );
+        let rustc_only = [
+            (name::OS, "macos"),
+            (name::ARCH, "aarch64"),
+            (name::RUSTC, "rustc 1.96.0"),
+            (name::CARGO_HOME, "/Users/x/.cargo"),
+        ];
+        let decision = decide(&vendor, &macos(), &NodeFacts::from_pairs(rustc_only));
+        assert_eq!(
+            decision,
+            CarryDecision::Refuse {
+                reason: "cargo is not installed on the target, so `cargo vendor --locked` cannot rebuild it there, and no install Fabric finished on the source vouches for it, so resume there would run `cargo vendor --locked` first; install the tool on the target, or pass --force to carry it and install the tool before resuming".to_owned()
+            }
+        );
+        let with_cargo = NodeFacts::from_pairs(
+            rustc_only
+                .into_iter()
+                .chain([(name::CARGO, "cargo 1.96.0 (a1b2c3d4e 2026-09-01)")]),
+        );
+        assert!(
+            matches!(
+                decide(&vendor, &macos(), &with_cargo),
+                CarryDecision::Rebuild { .. }
+            ),
+            "a target with cargo rebuilds it"
+        );
+    }
+
     #[test]
     fn a_venv_with_a_lockfile_is_rebuilt_where_uv_runs_and_travels_where_it_does_not() {
         let source = NodeFacts::from_pairs([

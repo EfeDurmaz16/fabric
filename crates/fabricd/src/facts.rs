@@ -70,6 +70,9 @@ pub mod name {
     pub const BUN: &str = "bun.version";
     /// `rustc -vV`, whole.
     pub const RUSTC: &str = "rustc";
+    /// `cargo --version`: rustup installs cargo and rustc as separate
+    /// components, so a node can have one without the other.
+    pub const CARGO: &str = "cargo.version";
     /// `${CARGO_HOME:-$HOME/.cargo}`.
     pub const CARGO_HOME: &str = "cargo.home";
     /// `python3 --version`.
@@ -160,7 +163,7 @@ impl NodeFacts {
 
     /// Measures everything but git with the tools `env` names.
     async fn measure_tools(home: &Path, env: &ToolEnv, inherited: &[(OsString, OsString)]) -> Self {
-        // Each probe is boxed, so the joined future holds 20 pointers, not 20 child processes.
+        // Each probe is boxed, so the joined future holds 21 pointers, not 21 child processes.
         let run = |program: &'static str, args: &'static [&'static str], probe: Probe| {
             Box::pin(probe_command(program, args, probe, env, home, inherited))
         };
@@ -176,6 +179,7 @@ impl NodeFacts {
             yarn,
             bun,
             rustc,
+            cargo,
             python,
             python_home,
             uv,
@@ -197,6 +201,7 @@ impl NodeFacts {
             run("yarn", &["--version"], Probe::Output),
             run("bun", &["--version"], Probe::Output),
             run("rustc", &["-vV"], Probe::Output),
+            run("cargo", &["--version"], Probe::Output),
             run("python3", &["--version"], Probe::Output),
             run(
                 "python3",
@@ -240,15 +245,10 @@ impl NodeFacts {
         put(name::YARN, yarn);
         put(name::BUN, bun);
         put(name::RUSTC, rustc);
-        put(
-            name::CARGO_HOME,
-            Some(
-                env.root(Roots::CARGO_HOME)
-                    .map_or_else(|| home.join(".cargo"), PathBuf::from)
-                    .display()
-                    .to_string(),
-            ),
-        );
+        put(name::CARGO, cargo);
+        let cargo_home = env.root(Roots::CARGO_HOME);
+        let cargo_home = cargo_home.map_or_else(|| home.join(".cargo"), PathBuf::from);
+        put(name::CARGO_HOME, Some(cargo_home.display().to_string()));
         put(name::PYTHON, python);
         put(name::PYTHON_HOME, python_home);
         put(name::UV, uv);
@@ -481,8 +481,8 @@ impl NodeFacts {
             "pnpm" => name::PNPM,
             "yarn" => name::YARN,
             "bun" => name::BUN,
-            // rustup installs cargo beside rustc.
-            "rustc" | "cargo" => name::RUSTC,
+            "rustc" => name::RUSTC,
+            "cargo" => name::CARGO,
             "python3" => name::PYTHON,
             "uv" => name::UV,
             _ => return Program::Unmeasured,
