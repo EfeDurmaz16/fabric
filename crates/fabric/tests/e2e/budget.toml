@@ -16,6 +16,20 @@ percentile = 25
 # Each op's baseline in ms, the time at `percentile` on that platform. A
 # platform with no baselines only reports its times.
 [baseline.macos-aarch64]
+"acp suspend" = 930
+"acp move" = 205
+"acp resume" = 911
+"acp pull" = 2116
+"claude suspend" = 933
+"claude move" = 205
+"claude resume" = 943
+"claude pull" = 2183
+"codex suspend" = 1262
+"codex move" = 220
+"codex resume" = 1168
+"codex pull" = 2650
+"cold start" = 55
+"restart" = 88
 
 # Report only until CI produces numbers.
 [baseline.linux-x86_64]
@@ -45,3 +59,7 @@ percentile = 25
 [[change]]
 date = "2026-10-24"
 why = "First budget (issue #26): the process counts of main dbd3b9e, the same on every platform; no baselines yet, so times only report"
+
+[[change]]
+date = "2026-10-25"
+why = "macos-aarch64 baselines from main dbd3b9e: the median of five runs' 25th percentile, test profile, on an 18-core Apple silicon Mac under a load average of 10 to 20 from other work"
