@@ -273,7 +273,9 @@ fn cannot_run(steps: &[SetupStep], key: &CarryKey, target: &NodeFacts) -> Option
 /// - Nothing makes the path again (a dependency tree with no lockfile, a
 ///   declared cache no step fills): carry, whatever the versions and the
 ///   platform, with a warning when native addons inside were built for
-///   another ABI, or when it may hold binaries for another platform.
+///   another ABI, or when it may hold binaries for another platform. A
+///   restore writes it as it left, the record of a finished install
+///   included even when it has holes, since no step was checked here.
 /// - Setup steps make it from a lockfile: carry when the keys match; else
 ///   rebuild when the target can run those steps as the source would; else
 ///   carry when the platform matches, nothing inside is native, nothing

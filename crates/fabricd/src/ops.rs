@@ -2356,13 +2356,20 @@ impl Node {
             self.write_snapshot(snapshot, &manifest, &root, harness_dir, env, out)
                 .await?;
         }
-        // A cache written with holes keeps no sentinel: it would call the
-        // tree whole, and materialize would trust it and never fill them.
-        // Without it the steps that fill the cache run first (issue #24).
-        // This runs after a restore a kill cut short too, before the
-        // marker says the tree is clean.
+        // A cache written with holes that setup steps fill keeps no
+        // sentinel: it would call the tree whole, and materialize would
+        // trust it and never fill them. Without it those steps run first,
+        // and the carry decision refused a move here unless this node can
+        // run them (issue #24). A tree nothing is known to make again is
+        // the user's files, carried whatever this node can run, so it stays
+        // as it left, holes and sentinel both: without the sentinel
+        // materialize would run a step no decision checked, and a job moved
+        // here could not resume. This runs after a restore a kill cut short
+        // too, before the marker says the tree is clean.
         for cache in &manifest.caches {
-            if cache.carry == fabric_core::snapshot::CarryState::Partial {
+            if cache.carry == fabric_core::snapshot::CarryState::Partial
+                && matches!(cache.remake, fabric_core::snapshot::Remake::Setup { .. })
+            {
                 fabric_env::materialize::clear_sentinel(&root, &cache.path)?;
             }
         }
@@ -7132,6 +7139,69 @@ pub(crate) mod tests {
         );
         assert!(!root.join("node_modules/pkg/notes.txt").exists());
         assert_eq!(health(&root), Some(CacheHealth::Incomplete));
+    }
+
+    /// A tree with holes that travels as the user's files arrives as it
+    /// left, sentinel included. Here `.fabric/env.toml` stayed behind
+    /// beside a pnpm tree with a hole, so the capture forgot the tree's
+    /// rebuild, and the carry decision carries it to a node without pnpm
+    /// and checks no step. Without the sentinel, the lockfile that
+    /// travelled would make materialize there run `pnpm install` and
+    /// refuse it, after a move had handed the job over (review of PR #27).
+    #[tokio::test]
+    async fn a_tree_carried_as_the_users_files_keeps_its_sentinel() {
+        use fabric_core::snapshot::{CarryState, Remake};
+        use fabric_env::materialize::{CacheHealth, SENTINEL, cache_health, sentinel_text};
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        std::fs::write(root.join("package.json"), "{\"name\": \"x\"}\n").unwrap();
+        std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(root.join(".fabric/env.toml"), "").unwrap();
+        std::fs::write(
+            root.join(".fabricignore"),
+            ".fabric/env.toml\nnode_modules/pkg/notes.txt\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), "1;\n").unwrap();
+        std::fs::write(root.join("node_modules/pkg/notes.txt"), "kept here\n").unwrap();
+        let node_modules = fabric_core::path::RelPath::parse("node_modules").unwrap();
+        let health = |root: &Path| {
+            let detection = fabric_env::detect::detect(root, &[]).unwrap();
+            cache_health(&detection, &node_modules).unwrap()
+        };
+        let detection = fabric_env::detect::detect(&root, &[]).unwrap();
+        std::fs::write(
+            root.join("node_modules").join(SENTINEL),
+            sentinel_text(&detection, &node_modules).unwrap(),
+        )
+        .unwrap();
+        let snapshot = node.suspend(id, &env(), &mut Out::default()).await.unwrap();
+        let (manifest, _) = node.manifest_and_spec(snapshot).await.unwrap();
+        let row = manifest
+            .caches
+            .iter()
+            .find(|cache| cache.path == node_modules)
+            .unwrap();
+        assert_eq!(
+            (row.carry, &row.remake),
+            (CarryState::Partial, &Remake::Nothing)
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        let no_pnpm = on_path(std::ffi::OsStr::new("/usr/bin:/bin"));
+        let mut out = Out::default();
+        node.job_resume(id, None, None, false, &no_pnpm, &mut out)
+            .await
+            .unwrap();
+        assert!(
+            root.join("node_modules/pkg/index.js").is_file(),
+            "the tree was not written: {:?}",
+            out.said()
+        );
+        assert_eq!(health(&root), Some(CacheHealth::Healthy));
     }
 
     /// A workspace root replaced with a link to another directory must not
