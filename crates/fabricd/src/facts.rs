@@ -387,7 +387,8 @@ pub enum Reuse {
 /// same: found at the same path on the same `PATH`, resolving to the same
 /// file, with the same modification time. A login that answered `no` is
 /// never kept, so a user who logs in after a refusal is seen at once, and
-/// neither is a tool with a command that did not answer in time.
+/// neither is a tool with a command that did not answer in time; either
+/// drops the answer kept for that tool before it.
 #[derive(Debug)]
 pub struct FactCache {
     state: Mutex<CacheState>,
@@ -538,6 +539,10 @@ impl FactCache {
         }
         let answers = run_all(&misses, (env, &own), home, inherited).await;
         let mut keep = Vec::new();
+        // A tool measured again whose answer is not kept drops the older
+        // one too: a fresh `no` must not leave an earlier `yes` to serve
+        // the next measure.
+        let mut forget = Vec::new();
         for (miss, answers) in misses.into_iter().zip(answers) {
             let mut measured = Vec::new();
             let mut whole = true;
@@ -550,27 +555,25 @@ impl FactCache {
             }
             let refused_login = matches!(miss.tool, Tool::ClaudeLogin | Tool::CodexLogin)
                 && measured.iter().any(|(_, value)| value != "yes");
-            if whole
-                && !refused_login
-                && let Some(binary) = miss.binary
-            {
-                keep.push((
+            match miss.binary {
+                Some(binary) if whole && !refused_login => keep.push((
                     miss.key,
                     Kept {
                         binary,
                         at: now,
                         facts: measured.clone(),
                     },
-                ));
+                )),
+                _ => forget.push(miss.key),
             }
             facts.put(measured);
         }
-        if !keep.is_empty() {
+        if !keep.is_empty() || !forget.is_empty() {
             let mut state = crate::node::lock(&self.state);
             let ttl = state.ttl;
-            state
-                .entries
-                .retain(|_, kept| now.saturating_duration_since(kept.at) < ttl);
+            state.entries.retain(|key, kept| {
+                now.saturating_duration_since(kept.at) < ttl && !forget.contains(key)
+            });
             state.entries.extend(keep);
         }
         facts
@@ -1401,7 +1404,7 @@ pub(crate) mod tests {
 
     /// A login that answered no is asked again at the next measure, so a
     /// user who logs in after a refused move is seen at once, while a yes
-    /// is kept as any answer is.
+    /// is kept as any answer is, until a fresh measure hears no.
     #[tokio::test]
     async fn a_refused_login_is_asked_again_and_a_login_is_kept() {
         let dir = tempfile::tempdir().unwrap();
@@ -1424,6 +1427,17 @@ pub(crate) mod tests {
                 .await;
             assert_eq!(facts.get(name::CODEX_LOGIN), Some("yes"));
             assert_eq!(tools.ran(), ran);
+        }
+        // Logged out again and seen by a fresh measure, as `fabric doctor`
+        // takes it: the kept yes goes with it, so the next measure that
+        // may reuse an answer asks again (Codex review of PR #29).
+        tools.log_out();
+        for reuse in [Reuse::Fresh, Reuse::Cached] {
+            let facts = cache
+                .measure_from(&home, &tools.env, &[], (login.0, reuse), start())
+                .await;
+            assert_eq!(facts.get(name::CODEX_LOGIN), Some("no"), "{reuse:?}");
+            assert_eq!(tools.ran(), ["codex login status"], "{reuse:?}");
         }
     }
 
