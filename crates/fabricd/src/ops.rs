@@ -2428,6 +2428,7 @@ impl Node {
         })
         .await?;
         out.emit(restored(snapshot, &report, has_git));
+        report_restore(&report, out);
         Ok(())
     }
 
@@ -3408,6 +3409,30 @@ fn is_missing(path: &Path) -> Result<bool, NodeError> {
         Ok(_) => Ok(false),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(e) => Err(NodeError::io(path, e)),
+    }
+}
+
+/// Warns of what a restore wrote that a harness cannot take as it is: the
+/// submodules it left as empty directories and the links that point
+/// outside the tree they were restored into, the first `REPORT_PATHS` of
+/// each named and the rest counted, so the run plan that follows never
+/// stands for a clean restore that was not one.
+fn report_restore(report: &RestoreReport, out: &mut Out) {
+    let named = |paths: &[fabric_core::path::RelPath]| {
+        let first = paths
+            .iter()
+            .take(REPORT_PATHS)
+            .map(ToString::to_string)
+            .collect();
+        (first, count(paths.len().saturating_sub(REPORT_PATHS)))
+    };
+    if !report.submodules.is_empty() {
+        let (paths, more) = named(&report.submodules);
+        out.emit(Event::SubmodulesLeftEmpty { paths, more });
+    }
+    if !report.escaping_symlinks.is_empty() {
+        let (paths, more) = named(&report.escaping_symlinks);
+        out.emit(Event::EscapingLinksRestored { paths, more });
     }
 }
 
@@ -5386,6 +5411,90 @@ pub(crate) mod tests {
             std::fs::read_to_string(root.join("README.md")).unwrap(),
             "hello\n"
         );
+    }
+
+    /// A restore leaves a submodule as an empty directory and writes a
+    /// link whose target leaves the workspace as it was captured. Both
+    /// must be named before the run plan returns, the first
+    /// `REPORT_PATHS` of each and the rest counted, or the harness starts
+    /// in a workspace that reads as cleanly restored with source missing
+    /// or a way out of it (Codex review of #8, issue #23).
+    #[tokio::test]
+    async fn a_restore_names_the_submodules_it_left_empty_and_the_links_that_escape() {
+        let (dir, node) = node();
+        let repo = repo(dir.path());
+        let head = git_out(&repo, &["rev-parse", "HEAD"]);
+        git_out(
+            &repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{head},sub"),
+            ],
+        );
+        git_out(
+            &repo,
+            &[
+                "-c",
+                "user.name=f",
+                "-c",
+                "user.email=f@x",
+                "commit",
+                "-qm",
+                "2",
+            ],
+        );
+        let id = node
+            .job_new(&repo, "goal".to_owned(), HarnessKind::Codex)
+            .await
+            .unwrap()
+            .job;
+        let root = paths::job_root(&node.cfg.home, id);
+        let links = REPORT_PATHS + 2;
+        for n in 0..links {
+            std::os::unix::fs::symlink("../outside", root.join(format!("out{n:02}"))).unwrap();
+        }
+        let path = ToolEnv::current();
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        let mut out = Out::default();
+        node.job_resume(id, None, None, false, &path, &mut out)
+            .await
+            .unwrap();
+        assert!(root.join("sub").is_dir());
+        let said = out.said();
+        let restored = said
+            .iter()
+            .position(|line| line.starts_with("restored snapshot"))
+            .unwrap_or_else(|| panic!("no restore: {said:#?}"));
+        let warned = |start: &str| {
+            said.iter()
+                .skip(restored)
+                .find(|line| line.starts_with(start))
+                .unwrap_or_else(|| panic!("no line {start:?} after the restore: {said:#?}"))
+        };
+        let submodules = warned("warning: submodules left empty");
+        assert!(
+            submodules.contains(": sub; run `git submodule update --init`"),
+            "{submodules}"
+        );
+        let escaping = warned("warning: links restored that point outside");
+        assert!(escaping.contains("out00, out01,"), "{escaping}");
+        assert!(escaping.contains("out19 and 2 more;"), "{escaping}");
+        assert!(!escaping.contains("out20"), "{escaping}");
+    }
+
+    /// Runs git in `repo` and returns what it printed, trimmed.
+    fn git_out(repo: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
     }
 
     /// The CLI launches with the configuration the daemon captures and
