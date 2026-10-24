@@ -22,6 +22,7 @@ use fabric_client::api::{
     SnapshotSession, SnapshotState, Standing, StealWarning, Step, Suspended, Verdict, VerdictCount,
     View, Wire, Workspace, WorkspaceState,
 };
+use fabric_core::env::EnvSpec;
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::{FenceError, FencingToken};
@@ -1396,7 +1397,7 @@ impl Node {
                 });
             }
         }
-        let theirs = self
+        let (here, theirs) = self
             .preflight(
                 to,
                 Some((&harness, &root, floor.as_ref())),
@@ -1420,7 +1421,7 @@ impl Node {
         if let Some(snapshot) = snapshot {
             // Once MoveStarted is written, a refusal could only freeze the
             // job here; a move asked again after it goes on.
-            self.carry_for_move(to, snapshot, &theirs, owner.then_some(force), out)
+            self.carry_for_move(to, snapshot, (&here, &theirs), owner.then_some(force), out)
                 .await?;
         }
         self.push_records(id, to).await?;
@@ -1440,17 +1441,20 @@ impl Node {
     }
 
     /// Reports what `to`, which measured `theirs`, does with each ignored
-    /// path of `snapshot`, and stops on a path it can neither use nor make
-    /// again unless `force` says so. With `force` absent nothing stops.
+    /// path of `snapshot`, and whether it has the programs of the steps the
+    /// snapshot's spec runs on every resume, as this node, which measured
+    /// `here`, sees them. Stops on a path it can neither use nor make again,
+    /// and on such a program it lacks, unless `force` says so. With `force`
+    /// absent nothing stops.
     async fn carry_for_move(
         &self,
         to: NodeId,
         snapshot: SnapshotId,
-        theirs: &NodeFacts,
+        (here, theirs): (&NodeFacts, &NodeFacts),
         force: Option<bool>,
         out: &mut Out,
     ) -> Result<(), NodeError> {
-        let manifest = with_store(&self.store, move |store| Ok(store.manifest(snapshot)?)).await?;
+        let (manifest, spec) = self.manifest_and_spec(snapshot).await?;
         let decisions = carry::decide_all(&manifest, theirs);
         if !decisions.is_empty() {
             out.emit(carry_decided(
@@ -1459,13 +1463,40 @@ impl Node {
                 &decisions,
             ));
         }
+        let rows = setup_rows(spec.as_ref(), here, theirs, Target::Peer);
+        if !rows.is_empty() {
+            out.emit(Event::Preflight {
+                peer: to,
+                rows: rows.iter().map(doctor::Row::to_wire).collect(),
+            });
+        }
         if manifest.harness_state.entries.is_empty() {
             out.emit(Event::NoSessionCaptured { snapshot });
         }
         match force {
-            Some(force) => refuse_carry(&decisions, force, out),
+            Some(force) => {
+                refuse_rows(&rows, force)?;
+                refuse_carry(&decisions, force, out)
+            }
             None => Ok(()),
         }
+    }
+
+    /// The manifest of `snapshot` and the spec it names, which the store
+    /// holds with it.
+    async fn manifest_and_spec(
+        &self,
+        snapshot: SnapshotId,
+    ) -> Result<(fabric_core::snapshot::SnapshotManifest, Option<EnvSpec>), NodeError> {
+        with_store(&self.store, move |store| {
+            let manifest = store.manifest(snapshot)?;
+            let spec = manifest
+                .env_spec
+                .map(|spec| store.env_spec(spec))
+                .transpose()?;
+            Ok((manifest, spec))
+        })
+        .await
     }
 
     /// Commits the source to the move with `MoveStarted` and returns the offer to send.
@@ -1848,19 +1879,21 @@ impl Node {
                 None
             };
             let root = paths::job_root(&self.cfg.home, id);
-            self.preflight(
-                holder,
-                Some((&kind, root.as_path(), floor.as_ref())),
-                Target::Here,
-                env,
-                force,
-                out,
-            )
-            .await?;
+            let (_, theirs) = self
+                .preflight(
+                    holder,
+                    Some((&kind, root.as_path(), floor.as_ref())),
+                    Target::Here,
+                    env,
+                    force,
+                    out,
+                )
+                .await?;
             // With no harness named, the job's own launches, and the pull
             // must still find the one the preflight checked.
             let checked = harness.is_none().then_some(&kind);
-            self.pull(id, holder, (checked, force), env, out).await?;
+            self.pull(id, holder, (checked, force, &theirs), env, out)
+                .await?;
         }
         let job = self.job(id).await?;
         let mut job = job.lock().await;
@@ -1891,12 +1924,13 @@ impl Node {
     /// `checked` is the harness the preflight checked this node for, when
     /// the job's own harness will launch. The holder may have resumed under
     /// another one after that check and before it suspended for the move;
-    /// the move is then aborted, and the holder keeps the job.
+    /// the move is then aborted, and the holder keeps the job. `theirs` are
+    /// the facts the holder gave the preflight.
     async fn pull(
         self: &Arc<Self>,
         id: JobId,
         holder: NodeId,
-        (checked, force): (Option<&HarnessKind>, bool),
+        (checked, force, theirs): (Option<&HarnessKind>, bool, &NodeFacts),
         env: &ToolEnv,
         out: &mut Out,
     ) -> Result<(), NodeError> {
@@ -1918,12 +1952,14 @@ impl Node {
         out.emit(Event::HolderStartedMove { holder, move_id });
         self.pull_records(id, holder).await?;
         self.ensure_latest(id, holder).await?;
-        // A path this node can neither use nor make again stops the pull
+        // A path this node can neither use nor make again, or a program
+        // of a step that runs on every resume it lacks, stops the pull
         // before it imports, as it stops a push before `MoveStarted`.
         let refused = if force {
             None
         } else {
-            self.carry_refusal_here(id, env, out).await?
+            self.carry_refusal_here(id, (holder, theirs), env, out)
+                .await?
         };
         faults::hit(Point::BeforeImport).await;
         let stopped = {
@@ -1979,11 +2015,14 @@ impl Node {
     }
 
     /// Decides here, with this node's facts, each ignored path of the job's
-    /// latest snapshot, and returns the refusal to stop a pull with when
-    /// one of them is refused, after reporting the decisions.
+    /// latest snapshot, checks this node has the programs of the steps its
+    /// spec runs on every resume, and returns the refusal to stop a pull
+    /// with when a path or a program is refused, after reporting them.
+    /// `theirs`, the holder's facts, fill the holder's side of the rows.
     async fn carry_refusal_here(
         &self,
         id: JobId,
+        (holder, theirs): (NodeId, &NodeFacts),
         env: &ToolEnv,
         out: &mut Out,
     ) -> Result<Option<NodeError>, NodeError> {
@@ -1995,14 +2034,21 @@ impl Node {
         let Some(snapshot) = latest else {
             return Ok(None);
         };
-        let manifest = with_store(&self.store, move |store| Ok(store.manifest(snapshot)?)).await?;
+        let (manifest, spec) = self.manifest_and_spec(snapshot).await?;
         let facts = NodeFacts::measure(&self.cfg.home, env).await;
+        let rows = setup_rows(spec.as_ref(), &facts, theirs, Target::Here);
+        if !rows.is_empty() {
+            out.emit(Event::Preflight {
+                peer: holder,
+                rows: rows.iter().map(doctor::Row::to_wire).collect(),
+            });
+        }
         let decisions = carry::decide_all(&manifest, &facts);
         let refusal = refuse_carry(&decisions, false, &mut Out::default()).err();
         if refusal.is_some() {
             out.emit(carry_decided(CarryFor::Pull, snapshot, &decisions));
         }
-        Ok(refusal)
+        Ok(refuse_rows(&rows, false).err().or(refusal))
     }
 
     /// Imports the open move `move_id` from `holder` into `job`, whose lock
@@ -2639,7 +2685,7 @@ impl Node {
             }
             None => (None, None, None, None),
         };
-        let (rows, theirs) = self
+        let (mut rows, here, theirs) = self
             .compare(
                 peer,
                 harness
@@ -2652,8 +2698,8 @@ impl Node {
             .await?;
         let carry = match (job, latest) {
             (Some(_), Some(snapshot)) => {
-                let manifest =
-                    with_store(&self.store, move |store| Ok(store.manifest(snapshot)?)).await?;
+                let (manifest, spec) = self.manifest_and_spec(snapshot).await?;
+                rows.extend(setup_rows(spec.as_ref(), &here, &theirs, Target::Peer));
                 let decisions = carry::decide_all(&manifest, &theirs);
                 Some(carry_report(Some(&manifest), snapshot, &decisions))
             }
@@ -2733,7 +2779,8 @@ impl Node {
     }
 
     /// Compares this node's facts with `peer`'s, reports the rows, stops
-    /// on a refusal `force` does not waive, and returns the peer's facts.
+    /// on a refusal `force` does not waive, and returns this node's facts
+    /// and the peer's.
     /// A named job brings its harness, the root the target restores into,
     /// and the newest version of its harness known to have written its
     /// session.
@@ -2745,24 +2792,25 @@ impl Node {
         env: &ToolEnv,
         force: bool,
         out: &mut Out,
-    ) -> Result<NodeFacts, NodeError> {
-        let (rows, theirs) = self.compare(peer, job, target, env).await?;
+    ) -> Result<(NodeFacts, NodeFacts), NodeError> {
+        let (rows, here, theirs) = self.compare(peer, job, target, env).await?;
         out.emit(Event::Preflight {
             peer,
             rows: rows.iter().map(doctor::Row::to_wire).collect(),
         });
         refuse_rows(&rows, force)?;
-        Ok(theirs)
+        Ok((here, theirs))
     }
 
-    /// Measures this node, asks `peer` for its facts, and compares them row by row (ADR 0008).
+    /// Measures this node, asks `peer` for its facts, compares them row by
+    /// row (ADR 0008), and returns the rows, this node's facts and the peer's.
     async fn compare(
         self: &Arc<Self>,
         peer: NodeId,
         job: Option<(&HarnessKind, &Path, Option<&HarnessVersion>)>,
         target: Target,
         env: &ToolEnv,
-    ) -> Result<(Vec<doctor::Row>, NodeFacts), NodeError> {
+    ) -> Result<(Vec<doctor::Row>, NodeFacts, NodeFacts), NodeError> {
         let mut here = NodeFacts::measure(&self.cfg.home, env).await;
         // The agent of an ACP job is named per job, so only the target of a
         // pull, this node, can look for it.
@@ -2790,7 +2838,7 @@ impl Node {
                 floor: job.and_then(|(_, _, floor)| floor),
             },
         );
-        Ok((rows, theirs))
+        Ok((rows, here, theirs))
     }
 }
 
@@ -2825,6 +2873,18 @@ fn started_move(
             },
         )),
     }
+}
+
+/// The rows for the programs of the steps `spec` runs on every resume
+/// (`doctor::setup_rows`); none for a snapshot that names no spec.
+fn setup_rows(
+    spec: Option<&EnvSpec>,
+    here: &NodeFacts,
+    peer: &NodeFacts,
+    target: Target,
+) -> Vec<doctor::Row> {
+    spec.map(|spec| doctor::setup_rows(spec, here, peer, target))
+        .unwrap_or_default()
 }
 
 /// Stops on a row `force` does not waive.
@@ -4469,7 +4529,9 @@ pub(crate) mod tests {
         std::fs::write(thief_root.join("thief.txt"), "b's work\n").unwrap();
         b.suspend(id, &path, out).await.unwrap();
 
-        a.pull(id, b.id, (None, false), &env(), out).await.unwrap();
+        a.pull(id, b.id, (None, false, &NodeFacts::default()), &env(), out)
+            .await
+            .unwrap();
         let job = a.job(id).await.unwrap();
         let mut job = job.lock().await;
         let epoch = owner_token(&job, a.id).unwrap().epoch;
@@ -4606,7 +4668,9 @@ pub(crate) mod tests {
         let out = &mut Out::default();
         let id = job(dir_a.path(), &a).await;
         a.suspend(id, &path, out).await.unwrap();
-        b.pull(id, a.id, (None, false), &env(), out).await.unwrap();
+        b.pull(id, a.id, (None, false, &NodeFacts::default()), &env(), out)
+            .await
+            .unwrap();
         let approved = b.cfg.state.job(id).env_spec_ran();
         std::fs::write(&approved, "spec inputs\n").unwrap();
 
@@ -5763,7 +5827,7 @@ pub(crate) mod tests {
         b.pull(
             id,
             a.id,
-            (None, false),
+            (None, false, &NodeFacts::default()),
             &ToolEnv::current(),
             &mut Out::default(),
         )
@@ -5930,7 +5994,7 @@ pub(crate) mod tests {
             .pull(
                 id,
                 a.id,
-                (None, false),
+                (None, false, &NodeFacts::default()),
                 &ToolEnv::current(),
                 &mut Out::default(),
             )
@@ -6294,7 +6358,9 @@ pub(crate) mod tests {
         std::fs::write(root.join(".fabric/env.toml"), "").unwrap();
         a.suspend(id, &path, out).await.unwrap();
 
-        b.pull(id, a.id, (None, false), &env(), out).await.unwrap();
+        b.pull(id, a.id, (None, false, &NodeFacts::default()), &env(), out)
+            .await
+            .unwrap();
         let root = {
             let job = b.job(id).await.unwrap();
             let mut job = job.lock().await;
@@ -6841,7 +6907,7 @@ pub(crate) mod tests {
             .pull(
                 id,
                 a.id,
-                (Some(&HarnessKind::Codex), false),
+                (Some(&HarnessKind::Codex), false, &NodeFacts::default()),
                 &env(),
                 &mut Out::default(),
             )
@@ -6888,7 +6954,15 @@ pub(crate) mod tests {
         a.suspend(id, &env(), &mut Out::default()).await.unwrap();
         let no_pnpm = on_path(std::ffi::OsStr::new("/usr/bin:/bin"));
         let mut out = Out::default();
-        let pulled = b.pull(id, a.id, (None, false), &no_pnpm, &mut out).await;
+        let pulled = b
+            .pull(
+                id,
+                a.id,
+                (None, false, &NodeFacts::default()),
+                &no_pnpm,
+                &mut out,
+            )
+            .await;
         assert!(
             matches!(&pulled, Err(NodeError::CarryRefused { paths, .. }) if paths == &["node_modules"]),
             "{pulled:?} {:?}",
@@ -6900,6 +6974,86 @@ pub(crate) mod tests {
                 .any(|line| line.starts_with("refuse  node_modules")),
             "{:?}",
             out.said()
+        );
+        let held = a.job(id).await.unwrap();
+        assert!(
+            matches!(held.lock().await.view(a.id), LeaseView::Owner(_)),
+            "the holder did not get the job back"
+        );
+        let pulled = b.job(id).await.unwrap();
+        assert!(!matches!(
+            pulled.lock().await.view(b.id),
+            LeaseView::Owner(_)
+        ));
+    }
+
+    /// A step declared `when = "always"` runs after every restore, whatever
+    /// the carry decision did with each cache, and materialize refuses one
+    /// whose program is missing before anything runs. A move to a node
+    /// without that program stops before the job changes hands, pushed
+    /// (after its suspend, before `MoveStarted`) or pulled (before the
+    /// import); it stopped only for a path (issue #24).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_stops_where_a_step_run_on_every_resume_cannot_run() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let root = paths::job_root(&a.cfg.home, id);
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(
+            root.join(".fabric/env.toml"),
+            "[[setup]]\nprogram = \"uv\"\nargs = [\"run\", \"codegen.py\"]\nwhen = \"always\"\n",
+        )
+        .unwrap();
+        a.suspend(id, &env(), &mut Out::default()).await.unwrap();
+        let snapshot = a.job(id).await.unwrap().lock().await.latest().unwrap();
+        let uv = |version: Option<&'static str>| {
+            NodeFacts::from_pairs(version.map(|v| (crate::facts::name::UV, v)))
+        };
+        let mut out = Out::default();
+        let pushed = a
+            .carry_for_move(
+                b.id,
+                snapshot,
+                (&uv(Some("uv 0.9.5")), &uv(None)),
+                Some(false),
+                &mut out,
+            )
+            .await;
+        assert!(
+            matches!(&pushed, Err(NodeError::Preflight(facts)) if facts == &["uv.version"]),
+            "{pushed:?}"
+        );
+        assert!(
+            out.said()
+                .iter()
+                .any(|line| line.starts_with("refuse  uv.version")),
+            "{:?}",
+            out.said()
+        );
+        a.carry_for_move(
+            b.id,
+            snapshot,
+            (&uv(Some("uv 0.9.5")), &uv(Some("uv 0.9.5"))),
+            Some(false),
+            &mut Out::default(),
+        )
+        .await
+        .unwrap();
+        let no_uv = on_path(std::ffi::OsStr::new("/usr/bin:/bin"));
+        let pulled = b
+            .pull(
+                id,
+                a.id,
+                (None, false, &uv(Some("uv 0.9.5"))),
+                &no_uv,
+                &mut Out::default(),
+            )
+            .await;
+        assert!(
+            matches!(&pulled, Err(NodeError::Preflight(facts)) if facts == &["uv.version"]),
+            "{pulled:?}"
         );
         let held = a.job(id).await.unwrap();
         assert!(

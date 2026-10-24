@@ -172,7 +172,7 @@ impl fmt::Display for PathDecision {
 }
 
 /// `program args...`, in backticks, as a setup step runs.
-fn command(step: &SetupStep) -> String {
+pub(crate) fn command(step: &SetupStep) -> String {
     let mut text = format!("`{}", step.program);
     for arg in &step.args {
         text.push(' ');

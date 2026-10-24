@@ -468,6 +468,29 @@ pub enum StepGate {
     EveryResume,
 }
 
+/// Returns the steps of `spec` that materialize runs on every resume, whatever the workspace's caches hold.
+///
+/// Those are the steps declared `when = "always"`, detection's `go mod
+/// download` (`StepGate::EveryResume`), and every step of a spec that names
+/// no cache, since nothing then proves the workspace warm
+/// (`StepGate::AnyCache`). It reads the spec alone, as a node that holds a
+/// snapshot and not its workspace can: the target of a move asks it which
+/// programs it needs whatever the carry decision does with each cache. A
+/// step the user declares as `go mod download` counts too, though its own
+/// gate may let it skip; a node that refuses a move for it is asked for a
+/// program it may not need, never left without one it does.
+pub fn every_resume(spec: &EnvSpec) -> Vec<&SetupStep> {
+    let go = go_download().ok();
+    spec.setup
+        .iter()
+        .filter(|step| {
+            step.when == RunWhen::Always
+                || spec.cache_paths.is_empty()
+                || go.as_ref() == Some(*step)
+        })
+        .collect()
+}
+
 /// What a setup step fills, as detection knows it before the caches are final.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StepScope {
@@ -837,10 +860,7 @@ pub fn detect(root: &Path, recorded: &[SecretPattern]) -> Result<Detection, Dete
     inputs.python = detect_python(&reader, &mut setup, &mut caches)?;
     if reader.exists("go.mod")? {
         inputs.go = &["go.mod", "go.sum"];
-        setup.push(FoundStep::new(
-            step("go", &["mod", "download"])?,
-            StepScope::Outside,
-        ));
+        setup.push(FoundStep::new(go_download()?, StepScope::Outside));
     }
 
     merge_declared_caches(&mut caches, &overrides.caches, node_manager)?;
@@ -1410,6 +1430,11 @@ fn go_mod_pin(reader: &Reader<'_>) -> Result<Option<Pin>, DetectError> {
             },
         )
         .and_then(|version| pin("go", version, "go.mod", PinAt::Key("go"))))
+}
+
+/// Returns detection's `go mod download`, which fills only this node's module cache outside the workspace.
+fn go_download() -> Result<SetupStep, DetectError> {
+    step("go", &["mod", "download"])
 }
 
 fn step(program: &'static str, args: &[&'static str]) -> Result<SetupStep, DetectError> {

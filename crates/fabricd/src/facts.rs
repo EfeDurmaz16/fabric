@@ -472,10 +472,11 @@ impl NodeFacts {
         }
     }
 
-    /// What this node knows about `program`.
+    /// The fact a node measures `program` by, for a program setup steps run;
+    /// `None` for one no node measures, such as a declared `make`.
     #[must_use]
-    pub fn program(&self, program: &str) -> Program<'_> {
-        let fact = match program {
+    pub fn program_fact(program: &str) -> Option<&'static str> {
+        Some(match program {
             "node" => name::NODE,
             "npm" => name::NPM,
             "pnpm" => name::PNPM,
@@ -485,9 +486,17 @@ impl NodeFacts {
             "cargo" => name::CARGO,
             "python3" => name::PYTHON,
             "uv" => name::UV,
-            _ => return Program::Unmeasured,
-        };
-        self.get(fact).map_or(Program::Missing, Program::Installed)
+            _ => return None,
+        })
+    }
+
+    /// What this node knows about `program`.
+    #[must_use]
+    pub fn program(&self, program: &str) -> Program<'_> {
+        match Self::program_fact(program) {
+            Some(fact) => self.get(fact).map_or(Program::Missing, Program::Installed),
+            None => Program::Unmeasured,
+        }
     }
 
     /// The key this node measures for the ecosystem `source` names (ADR 0012).
