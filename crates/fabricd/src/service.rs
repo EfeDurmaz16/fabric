@@ -31,7 +31,7 @@ use fabric_store::store::StoreError;
 
 use crate::clock;
 use crate::error::NodeError;
-use crate::facts::NodeFacts;
+use crate::facts::{NodeFacts, Probes};
 use crate::faults::{self, Action, Point};
 use crate::job::Job;
 use crate::local::ForkRecord;
@@ -154,9 +154,13 @@ impl Service for Node {
 
     fn facts(&self, _peer: NodeId) -> BoxFuture<'_, Result<Facts, Fault>> {
         Box::pin(async move {
-            Ok(NodeFacts::measure(&self.cfg.home, &self.node_env())
-                .await
-                .to_wire())
+            // The question names no job, so the answer holds every fact,
+            // logins included: this node may be the target of a move.
+            Ok(
+                NodeFacts::measure(&self.cfg.home, &self.node_env(), Probes::ALL)
+                    .await
+                    .to_wire(),
+            )
         })
     }
 }

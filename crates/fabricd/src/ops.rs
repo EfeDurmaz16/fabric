@@ -52,7 +52,7 @@ use crate::carry::{self, PathDecision};
 use crate::clock;
 use crate::doctor::{self, Context, Target};
 use crate::error::NodeError;
-use crate::facts::{MeasuredKeys, NodeFacts, stayed_behind};
+use crate::facts::{MeasuredKeys, NodeFacts, Probes, stayed_behind};
 use crate::faults::{self, Action, Point};
 use crate::harnesses::{HarnessConfig, HarnessEnv, adapter, refuse_secret_kind};
 use crate::job::Job;
@@ -1107,7 +1107,6 @@ impl Node {
         out: &mut Out,
     ) -> Result<SnapshotId, NodeError> {
         let harness_state = self.capture_harness(job, root, env, out).await?;
-        let facts = NodeFacts::measure(&self.cfg.home, env).await;
         // A workspace whose environment does not detect here would not
         // materialize on the target either, so the snapshot is refused
         // before it is published or moved.
@@ -1134,6 +1133,10 @@ impl Node {
             }
         }
         let detection = fabric_env::detect::detect(root, &recorded)?;
+        // Only what the keys read is measured: no login, and no tool of an
+        // ecosystem the workspace does not use (issue #26).
+        let probes = MeasuredKeys::probes(&detection);
+        let facts = NodeFacts::measure(&self.cfg.home, env, probes).await;
         local::write(
             &job.dir().secret_patterns(),
             &detection.spec().secret_patterns,
@@ -1408,7 +1411,7 @@ impl Node {
         let (here, theirs) = self
             .preflight(
                 to,
-                Some((&harness, &root, floor.as_ref())),
+                (&harness, &root, floor.as_ref()),
                 Target::Peer,
                 env,
                 force,
@@ -1890,7 +1893,7 @@ impl Node {
             let (_, theirs) = self
                 .preflight(
                     holder,
-                    Some((&kind, root.as_path(), floor.as_ref())),
+                    (&kind, root.as_path(), floor.as_ref()),
                     Target::Here,
                     env,
                     force,
@@ -2043,7 +2046,9 @@ impl Node {
             return Ok(None);
         };
         let (manifest, spec) = self.manifest_and_spec(snapshot).await?;
-        let facts = NodeFacts::measure(&self.cfg.home, env).await;
+        let probes = spec.as_ref().map_or(Probes::NONE, doctor::setup_probes);
+        let probes = probes.union(carry::probes(&manifest));
+        let facts = NodeFacts::measure(&self.cfg.home, env, probes).await;
         let rows = setup_rows((&manifest, spec.as_ref()), &facts, theirs, Target::Here);
         if !rows.is_empty() {
             out.emit(Event::Preflight {
@@ -2471,7 +2476,7 @@ impl Node {
         env: &ToolEnv,
         out: &mut Out,
     ) -> Result<(), NodeError> {
-        let facts = NodeFacts::measure(&self.cfg.home, env).await;
+        let facts = NodeFacts::measure(&self.cfg.home, env, carry::probes(manifest)).await;
         let decisions = carry::decide_all(manifest, &facts);
         if !decisions.is_empty() {
             out.emit(carry_decided(CarryFor::Restore, snapshot, &decisions));
@@ -2663,7 +2668,7 @@ impl Node {
         out: &mut Out,
     ) -> Result<DoctorReport, NodeError> {
         let Some(peer) = peer else {
-            let facts = NodeFacts::measure(&self.cfg.home, env).await;
+            let facts = NodeFacts::measure(&self.cfg.home, env, Probes::ALL).await;
             return Ok(DoctorReport::Facts {
                 facts: facts
                     .iter()
@@ -2709,6 +2714,7 @@ impl Node {
                     .map(|(harness, root)| (harness, root, floor.as_ref())),
                 Target::Peer,
                 env,
+                Probes::ALL,
             )
             .await?;
         let carry = match (job, latest) {
@@ -2803,17 +2809,19 @@ impl Node {
     /// and the peer's.
     /// A named job brings its harness, the root the target restores into,
     /// and the newest version of its harness known to have written its
-    /// session.
+    /// session; this node then measures only what the rows of that job
+    /// read (`doctor::probes`).
     async fn preflight(
         self: &Arc<Self>,
         peer: NodeId,
-        job: Option<(&HarnessKind, &Path, Option<&HarnessVersion>)>,
+        job: (&HarnessKind, &Path, Option<&HarnessVersion>),
         target: Target,
         env: &ToolEnv,
         force: bool,
         out: &mut Out,
     ) -> Result<(NodeFacts, NodeFacts), NodeError> {
-        let (rows, here, theirs) = self.compare(peer, job, target, env).await?;
+        let probes = doctor::probes(job.0, target);
+        let (rows, here, theirs) = self.compare(peer, Some(job), target, env, probes).await?;
         out.emit(Event::Preflight {
             peer,
             rows: rows.iter().map(doctor::Row::to_wire).collect(),
@@ -2822,16 +2830,18 @@ impl Node {
         Ok((here, theirs))
     }
 
-    /// Measures this node, asks `peer` for its facts, compares them row by
-    /// row (ADR 0008), and returns the rows, this node's facts and the peer's.
+    /// Measures this node's `probes`, asks `peer` for its facts, compares
+    /// them row by row (ADR 0008), and returns the rows, this node's facts
+    /// and the peer's.
     async fn compare(
         self: &Arc<Self>,
         peer: NodeId,
         job: Option<(&HarnessKind, &Path, Option<&HarnessVersion>)>,
         target: Target,
         env: &ToolEnv,
+        probes: Probes,
     ) -> Result<(Vec<doctor::Row>, NodeFacts, NodeFacts), NodeError> {
-        let mut here = NodeFacts::measure(&self.cfg.home, env).await;
+        let mut here = NodeFacts::measure(&self.cfg.home, env, probes).await;
         // The agent of an ACP job is named per job, so only the target of a
         // pull, this node, can look for it.
         if let (Target::Here, Some((HarnessKind::Acp { program, .. }, _, _))) = (target, job) {
@@ -7623,5 +7633,48 @@ pub(crate) mod tests {
             let carried: Vec<&str> = plan.harness_config.acp.keys().map(String::as_str).collect();
             assert_eq!(carried, wanted, "{harness}");
         }
+    }
+
+    /// A job on `node` whose workspace holds a `node_modules` an npm
+    /// lockfile describes, and the workspace.
+    async fn npm_job(dir: &Path, node: &Arc<Node>) -> (JobId, PathBuf) {
+        let id = job(dir, node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        std::fs::write(root.join("package.json"), "{\"name\": \"x\"}\n").unwrap();
+        std::fs::write(root.join("package-lock.json"), "{}\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), "1;\n").unwrap();
+        (id, root)
+    }
+
+    /// A suspend measures only what its carry keys read: no login and no
+    /// tool of an ecosystem the workspace does not use. For an npm tree
+    /// that is node and npm, and python3, whose facts key a `.venv`
+    /// detection does not know (issue #26).
+    #[tokio::test]
+    async fn a_suspend_probes_only_what_its_keys_read() {
+        let (dir, node) = node();
+        let tools = crate::facts::tests::CountingTools::new(dir.path());
+        let (id, _) = npm_job(dir.path(), &node).await;
+        node.suspend(id, &tools.env, &mut Out::default())
+            .await
+            .unwrap();
+        let ran = tools.ran();
+        assert!(
+            !ran.iter()
+                .any(|probe| probe.contains("auth") || probe.contains("login")),
+            "a suspend asked for a login: {ran:?}"
+        );
+        assert_eq!(
+            ran,
+            [
+                "node --version",
+                "node -p process.versions.modules",
+                "npm --version",
+                "python3 --version",
+                "python3 -c import sys; print(sys.base_prefix)",
+            ]
+        );
     }
 }
