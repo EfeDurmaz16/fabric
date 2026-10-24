@@ -113,6 +113,16 @@ jobs:
       - name: End-to-end
         run: cargo test -p fabric --test e2e --locked
 
+      # The hot paths against crates/fabric/tests/e2e/budget.toml, with a
+      # table in the step summary. A process count that differs from the
+      # budget fails; times only report until the baselines settle, then
+      # FABRIC_BUDGET becomes enforce.
+      - name: Time budget
+        timeout-minutes: 20
+        env:
+          FABRIC_BUDGET: report
+        run: cargo test -p fabric --test e2e --locked -- --ignored --exact budget::hot_paths --nocapture
+
       - name: Docs
         run: cargo doc --workspace --no-deps --locked
         env:
