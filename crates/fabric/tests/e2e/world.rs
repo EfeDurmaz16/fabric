@@ -7,7 +7,9 @@
 //! pnpm and no native Node module, which the gate's second Mac lacks. Its
 //! `package.json` has no lockfile, as the gate fixture of 2026-10-21 had,
 //! and each node may put its own programs first on its `PATH`, so the two
-//! nodes can report different Node majors from one machine.
+//! nodes can report different Node majors from one machine. git is linked
+//! into the test's own `bin`, not found through its directory, so the
+//! other programs there, such as a Homebrew `node`, stay off the `PATH`.
 
 use std::error::Error;
 use std::ffi::OsString;
@@ -58,12 +60,9 @@ impl Env {
             env!("CARGO_BIN_EXE_fabric-fake-agent"),
             bin.join("fabric-fake-agent"),
         )?;
-        let mut dirs = vec![bin];
-        if let Some(dir) = find("git").as_deref().and_then(Path::parent) {
-            dirs.push(dir.to_owned());
-        }
-        dirs.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
-        let path = std::env::join_paths(dirs)?;
+        let git = find("git").ok_or("no git on the PATH")?;
+        std::os::unix::fs::symlink(&git, bin.join("git"))?;
+        let path = std::env::join_paths([bin, PathBuf::from("/usr/bin"), PathBuf::from("/bin")])?;
         let repo = root.join("repo");
         make_repo(&repo)?;
         Ok(Arc::new(Self {
