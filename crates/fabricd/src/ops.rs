@@ -889,7 +889,7 @@ impl Node {
         // the capture reads. A link at the root would lock, capture and
         // replicate whatever it names, so it is refused first.
         refuse_replaced_root(id, &marker.root)?;
-        let _tree = self.lock_tree(id, &marker.root)?;
+        let _tree = self.lock_tree(id, &marker.root).await?;
         if let Some(record) = job.harness_record()? {
             if record.liveness().await != Liveness::Gone {
                 out.emit(Event::StoppingHarness { pid: record.pid });
@@ -951,11 +951,19 @@ impl Node {
     /// Takes the lock `fabric job run` and `resume` hold over the tree at
     /// `root` while they run setup steps and launch; `None` when the root is
     /// gone, since nothing can run setup in it.
-    fn lock_tree(&self, job: JobId, root: &Path) -> Result<Option<TreeLock>, NodeError> {
+    ///
+    /// A busy lock is retried for a second before it counts as held (ADR
+    /// 0007), so it is taken on a blocking thread.
+    async fn lock_tree(&self, job: JobId, root: &Path) -> Result<Option<TreeLock>, NodeError> {
         if !root.exists() {
             return Ok(None);
         }
-        match TreeLock::acquire(&self.cfg.state.tree_locks(), root) {
+        let locks = self.cfg.state.tree_locks();
+        let tree = root.to_owned();
+        let taken = tokio::task::spawn_blocking(move || TreeLock::acquire(&locks, &tree))
+            .await
+            .map_err(|e| NodeError::Task(e.to_string()))?;
+        match taken {
             Ok(lock) => Ok(Some(lock)),
             Err(MaterializeError::TreeBusy { lock }) => Err(NodeError::SetupRunning {
                 job,
@@ -5418,6 +5426,32 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    /// A busy tree lock is retried for a second before the suspend refuses
+    /// (ADR 0007); the node's other work must go on meanwhile, here a timer
+    /// on the same single-threaded runtime.
+    #[tokio::test]
+    async fn a_suspend_waiting_on_a_held_tree_does_not_stall_the_node() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        let _setup = TreeLock::acquire(&node.cfg.state.tree_locks(), &root).unwrap();
+        let path = env();
+        let mut out = Out::default();
+        let started = std::time::Instant::now();
+        let (refused, ticked) = tokio::join!(node.suspend(id, &path, &mut out), async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            started.elapsed()
+        });
+        assert!(
+            matches!(refused, Err(NodeError::SetupRunning { .. })),
+            "{refused:?}"
+        );
+        assert!(
+            ticked < Duration::from_millis(500),
+            "a 20 ms timer fired after {ticked:?} while the suspend waited on the tree"
+        );
     }
 
     /// A suspend holds the tree lock from before it stops the harness
