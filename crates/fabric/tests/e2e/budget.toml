@@ -1,0 +1,69 @@
+# The time budget of the hot paths, which `budget::hot_paths` in budget.rs
+# measures (issue #26): suspend, move, resume and pull of a job under each
+# harness, and a daemon's cold start and restart. CONTRIBUTING.md says how
+# to run it and how to accept a slowdown. scripts/check-budget.sh fails a
+# change to this file that adds no [[change]] entry at its end.
+
+# A time is over its limit when it is above both ratio x baseline and
+# baseline + grace_ms; it fails when it is over again in a second batch.
+ratio = 1.3
+grace_ms = 50
+# Timed runs per batch, after the warm-up runs.
+reps = 7
+# The time that stands for a batch, as a percentile of its runs.
+percentile = 25
+
+# Each op's baseline in ms, the time at `percentile` on that platform. A
+# platform with no baselines only reports its times.
+[baseline.macos-aarch64]
+"acp suspend" = 480
+"acp move" = 138
+"acp resume" = 531
+"acp pull" = 956
+"claude suspend" = 472
+"claude move" = 59
+"claude resume" = 663
+"claude pull" = 1239
+"codex suspend" = 627
+"codex move" = 59
+"codex resume" = 810
+"codex pull" = 1577
+"cold start" = 55
+"restart" = 71
+
+# Report only until CI produces numbers.
+[baseline.linux-x86_64]
+
+# The git and ps processes each op starts in each warm-up run: exact, and
+# the same on every platform. The first run moves each job for the first
+# time; a count that grows from the first run to the second grows with the
+# job's history.
+[processes]
+"acp suspend" = { git = [28, 30], ps = [0, 0] }
+"acp move" = { git = [2, 2], ps = [0, 0] }
+"acp resume" = { git = [16, 20], ps = [3, 3] }
+"acp pull" = { git = [48, 52], ps = [3, 3] }
+"claude suspend" = { git = [28, 30], ps = [0, 0] }
+"claude move" = { git = [0, 0], ps = [0, 0] }
+"claude resume" = { git = [16, 20], ps = [3, 3] }
+"claude pull" = { git = [48, 52], ps = [3, 3] }
+"codex suspend" = { git = [28, 30], ps = [0, 0] }
+"codex move" = { git = [0, 0], ps = [0, 0] }
+"codex resume" = { git = [16, 20], ps = [3, 3] }
+"codex pull" = { git = [48, 52], ps = [3, 3] }
+"cold start" = { git = [0, 0], ps = [0, 0] }
+"restart" = { git = [0, 0], ps = [0, 0] }
+
+# Every change to this file adds an entry here, below the others, that
+# says when and why. Entries are never edited or removed.
+[[change]]
+date = "2026-10-24"
+why = "First budget (issue #26): the process counts of main dbd3b9e, the same on every platform; no baselines yet, so times only report"
+
+[[change]]
+date = "2026-10-25"
+why = "macos-aarch64 baselines from main dbd3b9e: the median of five runs' 25th percentile, test profile, on an 18-core Apple silicon Mac under a load average of 10 to 20 from other work"
+
+[[change]]
+date = "2026-10-25"
+why = "Hot paths sped up (issue #26): each operation measures only the facts it reads and keeps them a minute, a capture and a restore batch their git calls, and both nodes restart after each run. Process counts of that branch; the acp move is the first of each run, so only it measures git, here and on the peer. macos-aarch64 baselines from it: the median of five runs' 25th percentile, test profile, on an 18-core Apple silicon Mac under a load average of 3 to 5"

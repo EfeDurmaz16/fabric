@@ -14,7 +14,7 @@ use fabric_client::api::{ClientEnv, Roots};
 /// entry or a root that is not UTF-8 as the system gave it, and a daemon
 /// whose environment holds one starts as it always did (review finding on
 /// PR #13): only what a client sends must be UTF-8.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ToolEnv {
     path: OsString,
     roots: [(&'static str, Option<OsString>); 4],

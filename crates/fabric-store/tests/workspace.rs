@@ -2465,3 +2465,159 @@ fn a_config_value_the_projection_refuses_is_named() {
             .any(|(carried, _)| *carried == key)
     );
 }
+
+/// Capture reads the config once, as one listing of every file git reads
+/// (issue #26). A file the repository's config includes counts as git
+/// counts it, for the exclude file and for `core.autocrlf`, but only the
+/// repository's own config file travels, as `git config --local` reads it.
+#[test]
+fn a_config_file_the_repository_includes_counts_but_does_not_travel() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    let g = git(&root);
+    g.run(&["config", "include.path", "extra.cfg"]).unwrap();
+    fs::write(
+        g.git_path("extra.cfg").unwrap(),
+        "[core]\n\texcludesFile = only-here.ignore\n\tautocrlf = true\n\
+         [remote \"upstream\"]\n\turl = https://example.com/u.git\n",
+    )
+    .unwrap();
+    fs::write(root.join("only-here.ignore"), "notes.local\n").unwrap();
+    fs::write(root.join("notes.local"), "ignored by the included file\n").unwrap();
+    fs::write(root.join("crlf.txt"), "one\r\ntwo\r\n").unwrap();
+
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let in_w = worktree_paths(&root, &manifest).unwrap();
+    assert_eq!(in_w, ["a", "crlf.txt", "only-here.ignore"]);
+    assert!(
+        manifest
+            .files
+            .iter()
+            .any(|entry| entry.rel_path.as_str() == "notes.local")
+    );
+    let carried: Vec<String> = (manifest.git.as_ref().unwrap().config.iter())
+        .map(|(key, _)| key.to_string())
+        .collect();
+    assert!(
+        !carried.iter().any(|key| key.starts_with("remote.")),
+        "{carried:?}"
+    );
+
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    assert_eq!(
+        fs::read(target.join("crlf.txt")).unwrap(),
+        b"one\r\ntwo\r\n",
+        "core.autocrlf from the included file was not read"
+    );
+}
+
+/// The git processes a capture and a restore start. Each costs about 3 ms,
+/// and about 9 ms through the macOS `/usr/bin/git` stub; on 2026-10-24 a
+/// suspend ran 58 of them (issue #26). A change that adds one changes these.
+const GIT_RUNS: [(&str, usize); 3] = [
+    ("first capture", 33),
+    ("second capture", 35),
+    ("restore", 19),
+];
+
+/// Writes `contents` to `path` with mode `0755` through `sh`, so this
+/// process never holds an executable open for writing, which Linux would
+/// refuse to run (`ETXTBSY`) in a child forked meanwhile.
+fn write_executable(path: &Path, contents: &str) -> Fallible {
+    let mut writer = std::process::Command::new("/bin/sh")
+        .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    std::io::Write::write_all(
+        &mut writer.stdin.take().ok_or("no pipe to the writer")?,
+        contents.as_bytes(),
+    )?;
+    if !writer.wait()?.success() {
+        return Err(format!("writing {} failed", path.display()).into());
+    }
+    Ok(())
+}
+
+/// The child half: runs with a `git` first on the `PATH` that appends each call to `FABRIC_GIT_LOG`.
+#[test]
+fn git_processes_child() {
+    let (Ok(dir), Ok(log)) = (
+        std::env::var("FABRIC_GIT_COUNT_DIR"),
+        std::env::var("FABRIC_GIT_LOG"),
+    ) else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let calls = || -> Vec<String> {
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    let root = dir.join("work");
+    make_repo(&root).unwrap();
+    let mut store = store_in(&dir).unwrap();
+    let policy = IgnorePolicy::default();
+    let mut runs = Vec::new();
+
+    let start = calls().len();
+    let first = capture(&store, &request(&root, &policy, None)).unwrap();
+    runs.push(calls().split_off(start));
+    let s1 = store.publish(&first.manifest).unwrap();
+    fs::write(root.join("second.txt"), "second commit\n").unwrap();
+    git(&root).run(&["add", "second.txt"]).unwrap();
+    git(&root).run(&["commit", "-q", "-m", "two"]).unwrap();
+
+    let start = calls().len();
+    let second = capture(&store, &request(&root, &policy, Some(s1))).unwrap();
+    runs.push(calls().split_off(start));
+    assert_eq!(second.report.bundle, Some(BundleKind::Incremental));
+    let s2 = store.publish(&second.manifest).unwrap();
+
+    let start = calls().len();
+    restore_into(&store, s2, &dir.join("restored")).unwrap();
+    runs.push(calls().split_off(start));
+
+    for ((name, expected), ran) in GIT_RUNS.iter().zip(&runs) {
+        assert_eq!(ran.len(), *expected, "{name}:\n{}", ran.join("\n"));
+    }
+}
+
+#[test]
+fn a_capture_and_a_restore_start_a_known_number_of_git_processes() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let path = std::env::var_os("PATH").unwrap();
+    let real = std::env::split_paths(&path)
+        .map(|dir| dir.join("git"))
+        .find(|candidate| candidate.is_file())
+        .unwrap();
+    write_executable(
+        &bin.join("git"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FABRIC_GIT_LOG\"\nexec '{}' \"$@\"\n",
+            real.display()
+        ),
+    )
+    .unwrap();
+    let path =
+        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path))).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "git_processes_child"])
+        .env("FABRIC_GIT_COUNT_DIR", dir.path())
+        .env("FABRIC_GIT_LOG", dir.path().join("git.log"))
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("1 passed"), "{stdout}");
+}

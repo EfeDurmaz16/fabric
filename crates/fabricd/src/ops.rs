@@ -52,7 +52,7 @@ use crate::carry::{self, PathDecision};
 use crate::clock;
 use crate::doctor::{self, Context, Target};
 use crate::error::NodeError;
-use crate::facts::{MeasuredKeys, NodeFacts, stayed_behind};
+use crate::facts::{MeasuredKeys, NodeFacts, Probes, Reuse, Tool, stayed_behind};
 use crate::faults::{self, Action, Point};
 use crate::harnesses::{HarnessConfig, HarnessEnv, adapter, refuse_secret_kind};
 use crate::job::Job;
@@ -335,7 +335,7 @@ impl Node {
         refuse_secret_kind(&harness)?;
         let id = clock::job_id();
         let root = paths::job_root(&self.cfg.home, id);
-        let synced = synced_folders(&self.cfg.home, &self.node_env()).await;
+        let synced = self.synced_folders(&self.node_env()).await;
         check_root(&root, &self.cfg.home, synced)?;
         // Built before the clone: a goal past the record bound refuses
         // here, not after a clone that no job and no printed id names.
@@ -1107,7 +1107,6 @@ impl Node {
         out: &mut Out,
     ) -> Result<SnapshotId, NodeError> {
         let harness_state = self.capture_harness(job, root, env, out).await?;
-        let facts = NodeFacts::measure(&self.cfg.home, env).await;
         // A workspace whose environment does not detect here would not
         // materialize on the target either, so the snapshot is refused
         // before it is published or moved.
@@ -1134,6 +1133,13 @@ impl Node {
             }
         }
         let detection = fabric_env::detect::detect(root, &recorded)?;
+        // Only what the keys read is measured: no login, and no tool of an
+        // ecosystem the workspace does not use (issue #26).
+        let probes = MeasuredKeys::probes(&detection);
+        let facts = self
+            .facts
+            .measure(&self.cfg.home, env, probes, Reuse::Cached)
+            .await;
         local::write(
             &job.dir().secret_patterns(),
             &detection.spec().secret_patterns,
@@ -1408,7 +1414,7 @@ impl Node {
         let (here, theirs) = self
             .preflight(
                 to,
-                Some((&harness, &root, floor.as_ref())),
+                (&harness, &root, floor.as_ref()),
                 Target::Peer,
                 env,
                 force,
@@ -1887,10 +1893,10 @@ impl Node {
                 None
             };
             let root = paths::job_root(&self.cfg.home, id);
-            let (_, theirs) = self
+            let (here, theirs) = self
                 .preflight(
                     holder,
-                    Some((&kind, root.as_path(), floor.as_ref())),
+                    (&kind, root.as_path(), floor.as_ref()),
                     Target::Here,
                     env,
                     force,
@@ -1900,7 +1906,7 @@ impl Node {
             // With no harness named, the job's own launches, and the pull
             // must still find the one the preflight checked.
             let checked = harness.is_none().then_some(&kind);
-            self.pull(id, holder, (checked, force, &theirs), env, out)
+            self.pull(id, holder, (checked, force), (&here, &theirs), out)
                 .await?;
         }
         let job = self.job(id).await?;
@@ -1932,14 +1938,15 @@ impl Node {
     /// `checked` is the harness the preflight checked this node for, when
     /// the job's own harness will launch. The holder may have resumed under
     /// another one after that check and before it suspended for the move;
-    /// the move is then aborted, and the holder keeps the job. `theirs` are
-    /// the facts the holder gave the preflight.
+    /// the move is then aborted, and the holder keeps the job. `here` is
+    /// what the preflight measured on this node, which decides the paths,
+    /// and `theirs` the facts the holder gave it.
     async fn pull(
         self: &Arc<Self>,
         id: JobId,
         holder: NodeId,
-        (checked, force, theirs): (Option<&HarnessKind>, bool, &NodeFacts),
-        env: &ToolEnv,
+        (checked, force): (Option<&HarnessKind>, bool),
+        (here, theirs): (&NodeFacts, &NodeFacts),
         out: &mut Out,
     ) -> Result<(), NodeError> {
         out.emit(Event::Pulling { job: id, holder });
@@ -1966,7 +1973,7 @@ impl Node {
         let refused = if force {
             None
         } else {
-            self.carry_refusal_here(id, (holder, theirs), env, out)
+            self.carry_refusal_here(id, (holder, here, theirs), out)
                 .await?
         };
         faults::hit(Point::BeforeImport).await;
@@ -2022,16 +2029,16 @@ impl Node {
         Ok(())
     }
 
-    /// Decides here, with this node's facts, each ignored path of the job's
-    /// latest snapshot, checks this node has the programs of the steps its
-    /// spec runs on every resume, and returns the refusal to stop a pull
-    /// with when a path or a program is refused, after reporting them.
-    /// `theirs`, the holder's facts, fill the holder's side of the rows.
+    /// Decides here, with `here`, the facts the pull's preflight measured
+    /// on this node, each ignored path of the job's latest snapshot, checks
+    /// this node has the programs of the steps its spec runs on every
+    /// resume, and returns the refusal to stop a pull with when a path or a
+    /// program is refused, after reporting them. `theirs`, the holder's
+    /// facts, fill the holder's side of the rows.
     async fn carry_refusal_here(
         &self,
         id: JobId,
-        (holder, theirs): (NodeId, &NodeFacts),
-        env: &ToolEnv,
+        (holder, here, theirs): (NodeId, &NodeFacts, &NodeFacts),
         out: &mut Out,
     ) -> Result<Option<NodeError>, NodeError> {
         let latest = {
@@ -2043,15 +2050,14 @@ impl Node {
             return Ok(None);
         };
         let (manifest, spec) = self.manifest_and_spec(snapshot).await?;
-        let facts = NodeFacts::measure(&self.cfg.home, env).await;
-        let rows = setup_rows((&manifest, spec.as_ref()), &facts, theirs, Target::Here);
+        let rows = setup_rows((&manifest, spec.as_ref()), here, theirs, Target::Here);
         if !rows.is_empty() {
             out.emit(Event::Preflight {
                 peer: holder,
                 rows: rows.iter().map(doctor::Row::to_wire).collect(),
             });
         }
-        let decisions = carry::decide_all(&manifest, &facts);
+        let decisions = carry::decide_all(&manifest, here);
         let refusal = refuse_carry(&decisions, false, &mut Out::default()).err();
         if refusal.is_some() {
             out.emit(carry_decided(CarryFor::Pull, snapshot, &decisions));
@@ -2309,11 +2315,7 @@ impl Node {
             },
         });
         let root = choice.root().to_owned();
-        check_root(
-            &root,
-            &self.cfg.home,
-            synced_folders(&self.cfg.home, env).await,
-        )?;
+        check_root(&root, &self.cfg.home, self.synced_folders(env).await)?;
         let resuming = matches!(
             &marker,
             Some(Marker { state: MarkerState::Restoring { snapshot: s }, .. }) if *s == snapshot
@@ -2471,7 +2473,10 @@ impl Node {
         env: &ToolEnv,
         out: &mut Out,
     ) -> Result<(), NodeError> {
-        let facts = NodeFacts::measure(&self.cfg.home, env).await;
+        let facts = self
+            .facts
+            .measure(&self.cfg.home, env, carry::probes(manifest), Reuse::Cached)
+            .await;
         let decisions = carry::decide_all(manifest, &facts);
         if !decisions.is_empty() {
             out.emit(carry_decided(CarryFor::Restore, snapshot, &decisions));
@@ -2501,6 +2506,24 @@ impl Node {
         out.emit(restored(snapshot, &report, has_git));
         report_restore(&report, out);
         Ok(())
+    }
+
+    /// Reads which folders iCloud Drive syncs on this node, as the
+    /// `defaults` of `env` answers; off everywhere it does not exist.
+    async fn synced_folders(&self, env: &ToolEnv) -> SyncedFolders {
+        let facts = self
+            .facts
+            .measure(
+                &self.cfg.home,
+                env,
+                Probes::NONE.with(Tool::ICloud),
+                Reuse::Cached,
+            )
+            .await;
+        SyncedFolders {
+            desktop: facts.syncs(crate::facts::name::ICLOUD_DESKTOP),
+            documents: facts.syncs(crate::facts::name::ICLOUD_DOCUMENTS),
+        }
     }
 
     /// Moves a workspace an earlier tenure left out of the root, next to it
@@ -2663,7 +2686,10 @@ impl Node {
         out: &mut Out,
     ) -> Result<DoctorReport, NodeError> {
         let Some(peer) = peer else {
-            let facts = NodeFacts::measure(&self.cfg.home, env).await;
+            let facts = self
+                .facts
+                .measure(&self.cfg.home, env, Probes::ALL, Reuse::Fresh)
+                .await;
             return Ok(DoctorReport::Facts {
                 facts: facts
                     .iter()
@@ -2700,6 +2726,7 @@ impl Node {
             }
             None => (None, None, None, None),
         };
+        // The doctor shows every fact as each tool answers now.
         let (mut rows, here, theirs) = self
             .compare(
                 peer,
@@ -2709,6 +2736,7 @@ impl Node {
                     .map(|(harness, root)| (harness, root, floor.as_ref())),
                 Target::Peer,
                 env,
+                (Probes::ALL, Reuse::Fresh),
             )
             .await?;
         let carry = match (job, latest) {
@@ -2800,20 +2828,21 @@ impl Node {
 
     /// Compares this node's facts with `peer`'s, reports the rows, stops
     /// on a refusal `force` does not waive, and returns this node's facts
-    /// and the peer's.
-    /// A named job brings its harness, the root the target restores into,
-    /// and the newest version of its harness known to have written its
-    /// session.
+    /// and the peer's. A named job brings its harness, the root the target
+    /// restores into, and the newest version of its harness known to have
+    /// written its session; this node then measures only what the rows of
+    /// that job and the carry decision read (`doctor::probes`).
     async fn preflight(
         self: &Arc<Self>,
         peer: NodeId,
-        job: Option<(&HarnessKind, &Path, Option<&HarnessVersion>)>,
+        job: (&HarnessKind, &Path, Option<&HarnessVersion>),
         target: Target,
         env: &ToolEnv,
         force: bool,
         out: &mut Out,
     ) -> Result<(NodeFacts, NodeFacts), NodeError> {
-        let (rows, here, theirs) = self.compare(peer, job, target, env).await?;
+        let probes = (doctor::probes(job.0, target), Reuse::Cached);
+        let (rows, here, theirs) = self.compare(peer, Some(job), target, env, probes).await?;
         out.emit(Event::Preflight {
             peer,
             rows: rows.iter().map(doctor::Row::to_wire).collect(),
@@ -2822,29 +2851,33 @@ impl Node {
         Ok((here, theirs))
     }
 
-    /// Measures this node, asks `peer` for its facts, compares them row by
-    /// row (ADR 0008), and returns the rows, this node's facts and the peer's.
+    /// Measures this node's `probes` while `peer` measures its own,
+    /// compares them row by row (ADR 0008), and returns the rows, this
+    /// node's facts and the peer's.
     async fn compare(
         self: &Arc<Self>,
         peer: NodeId,
         job: Option<(&HarnessKind, &Path, Option<&HarnessVersion>)>,
         target: Target,
         env: &ToolEnv,
+        (probes, reuse): (Probes, Reuse),
     ) -> Result<(Vec<doctor::Row>, NodeFacts, NodeFacts), NodeError> {
-        let mut here = NodeFacts::measure(&self.cfg.home, env).await;
+        // Both nodes measure at once (issue #26). A session the peer
+        // opened is used too: a peer behind a NAT has no address here and
+        // is reachable only over the session it dialed.
+        let (mut here, theirs) = tokio::join!(
+            self.facts.measure(&self.cfg.home, env, probes, reuse),
+            self.call(peer, |session| async move {
+                let facts = session.facts(SHORT_DEADLINE * 4).await?;
+                Ok((facts, session.clock_skew_ms(), session.kind().to_string()))
+            }),
+        );
+        let (theirs, clock_skew_ms, wire) = theirs?;
         // The agent of an ACP job is named per job, so only the target of a
         // pull, this node, can look for it.
         if let (Target::Here, Some((HarnessKind::Acp { program, .. }, _, _))) = (target, job) {
             here.measure_acp(program, &self.harness_env(env)?);
         }
-        // A session the peer opened is used too: a peer behind a NAT has
-        // no address here and is reachable only over the session it dialed.
-        let (theirs, clock_skew_ms, wire) = self
-            .call(peer, |session| async move {
-                let facts = session.facts(SHORT_DEADLINE * 4).await?;
-                Ok((facts, session.clock_skew_ms(), session.kind().to_string()))
-            })
-            .await?;
         let theirs = NodeFacts::from_wire(&theirs);
         let rows = doctor::compare(
             &here,
@@ -3598,31 +3631,6 @@ fn move_aside(root: &Path, dest: &Path) -> Result<bool, NodeError> {
     Ok(true)
 }
 
-/// Reads which folders iCloud Drive syncs on this node; off everywhere `defaults` does not exist.
-async fn synced_folders(home: &Path, env: &ToolEnv) -> SyncedFolders {
-    let path_var = env.path_var().to_owned();
-    let read = |key: &'static str| {
-        let path_var = path_var.clone();
-        let home = home.to_owned();
-        async move {
-            let Some(binary) = crate::facts::find_on_path("defaults", &path_var) else {
-                return false;
-            };
-            tokio::process::Command::new(binary)
-                .args(["read", "com.apple.finder", key])
-                .env("HOME", home)
-                .output()
-                .await
-                .is_ok_and(|o| {
-                    o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "1"
-                })
-        }
-    };
-    let (desktop, documents) =
-        tokio::join!(read("FXICloudDriveDesktop"), read("FXICloudDriveDocuments"));
-    SyncedFolders { desktop, documents }
-}
-
 /// A fenced answer that is not an answer, in words.
 fn fenced_words<T>(answer: &Fenced<T>) -> String {
     match answer {
@@ -3757,22 +3765,36 @@ pub(crate) mod tests {
             .tempdir_in("/tmp")
             .unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
-        let home = root.join("home");
-        std::fs::create_dir_all(&home).unwrap();
-        let node = Node::start(NodeConfig {
-            state: StateDir::resolve(Some(root.join("state").as_os_str()), &home).unwrap(),
-            home,
+        let node = node_at(&root.join("home"), &root.join("state"), ToolEnv::current());
+        (dir, node)
+    }
+
+    /// A node with its state in `state` and the home `home`, which other
+    /// nodes of a test may share as the gate Macs share one home path,
+    /// started in `env`.
+    fn node_at(home: &Path, state: &Path, env: ToolEnv) -> Arc<Node> {
+        std::fs::create_dir_all(home).unwrap();
+        Node::start(NodeConfig {
+            state: StateDir::resolve(Some(state.as_os_str()), home).unwrap(),
+            home: home.to_owned(),
             listen: "127.0.0.1:0".parse().unwrap(),
             dial: DialOrder::TcpOnly,
-            env: ToolEnv::current(),
+            env,
         })
-        .unwrap();
-        (dir, node)
+        .unwrap()
     }
 
     /// This process's environment, as the CLI sends its own.
     fn env() -> ToolEnv {
         ToolEnv::current()
+    }
+
+    /// Every fact `node` measures in `env` now, as a pull's preflight
+    /// hands them on.
+    async fn facts_in(node: &Node, env: &ToolEnv) -> NodeFacts {
+        node.facts
+            .measure(&node.cfg.home, env, Probes::ALL, Reuse::Fresh)
+            .await
     }
 
     /// A job made from a one-commit repository, owned by `node` at epoch 1.
@@ -4565,9 +4587,15 @@ pub(crate) mod tests {
         std::fs::write(thief_root.join("thief.txt"), "b's work\n").unwrap();
         b.suspend(id, &path, out).await.unwrap();
 
-        a.pull(id, b.id, (None, false, &NodeFacts::default()), &env(), out)
-            .await
-            .unwrap();
+        a.pull(
+            id,
+            b.id,
+            (None, false),
+            (&facts_in(&a, &env()).await, &NodeFacts::default()),
+            out,
+        )
+        .await
+        .unwrap();
         let job = a.job(id).await.unwrap();
         let mut job = job.lock().await;
         let epoch = owner_token(&job, a.id).unwrap().epoch;
@@ -4704,9 +4732,15 @@ pub(crate) mod tests {
         let out = &mut Out::default();
         let id = job(dir_a.path(), &a).await;
         a.suspend(id, &path, out).await.unwrap();
-        b.pull(id, a.id, (None, false, &NodeFacts::default()), &env(), out)
-            .await
-            .unwrap();
+        b.pull(
+            id,
+            a.id,
+            (None, false),
+            (&facts_in(&b, &env()).await, &NodeFacts::default()),
+            out,
+        )
+        .await
+        .unwrap();
         let approved = b.cfg.state.job(id).env_spec_ran();
         std::fs::write(&approved, "spec inputs\n").unwrap();
 
@@ -5876,8 +5910,11 @@ pub(crate) mod tests {
         b.pull(
             id,
             a.id,
-            (None, false, &NodeFacts::default()),
-            &ToolEnv::current(),
+            (None, false),
+            (
+                &facts_in(&b, &ToolEnv::current()).await,
+                &NodeFacts::default(),
+            ),
             &mut Out::default(),
         )
         .await
@@ -6043,8 +6080,11 @@ pub(crate) mod tests {
             .pull(
                 id,
                 a.id,
-                (None, false, &NodeFacts::default()),
-                &ToolEnv::current(),
+                (None, false),
+                (
+                    &facts_in(&b, &ToolEnv::current()).await,
+                    &NodeFacts::default(),
+                ),
                 &mut Out::default(),
             )
             .await
@@ -6407,9 +6447,15 @@ pub(crate) mod tests {
         std::fs::write(root.join(".fabric/env.toml"), "").unwrap();
         a.suspend(id, &path, out).await.unwrap();
 
-        b.pull(id, a.id, (None, false, &NodeFacts::default()), &env(), out)
-            .await
-            .unwrap();
+        b.pull(
+            id,
+            a.id,
+            (None, false),
+            (&facts_in(&b, &env()).await, &NodeFacts::default()),
+            out,
+        )
+        .await
+        .unwrap();
         let root = {
             let job = b.job(id).await.unwrap();
             let mut job = job.lock().await;
@@ -6956,8 +7002,8 @@ pub(crate) mod tests {
             .pull(
                 id,
                 a.id,
-                (Some(&HarnessKind::Codex), false, &NodeFacts::default()),
-                &env(),
+                (Some(&HarnessKind::Codex), false),
+                (&facts_in(&b, &env()).await, &NodeFacts::default()),
                 &mut Out::default(),
             )
             .await;
@@ -7007,8 +7053,8 @@ pub(crate) mod tests {
             .pull(
                 id,
                 a.id,
-                (None, false, &NodeFacts::default()),
-                &no_pnpm,
+                (None, false),
+                (&facts_in(&b, &no_pnpm).await, &NodeFacts::default()),
                 &mut out,
             )
             .await;
@@ -7095,8 +7141,8 @@ pub(crate) mod tests {
             .pull(
                 id,
                 a.id,
-                (None, false, &uv(Some("uv 0.9.5"))),
-                &no_uv,
+                (None, false),
+                (&facts_in(&b, &no_uv).await, &uv(Some("uv 0.9.5"))),
                 &mut Out::default(),
             )
             .await;
@@ -7623,5 +7669,191 @@ pub(crate) mod tests {
             let carried: Vec<&str> = plan.harness_config.acp.keys().map(String::as_str).collect();
             assert_eq!(carried, wanted, "{harness}");
         }
+    }
+
+    /// A job on `node` whose workspace holds a `node_modules` an npm
+    /// lockfile describes, and the workspace.
+    async fn npm_job(dir: &Path, node: &Arc<Node>) -> (JobId, PathBuf) {
+        let id = job(dir, node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        std::fs::write(root.join("package.json"), "{\"name\": \"x\"}\n").unwrap();
+        std::fs::write(root.join("package-lock.json"), "{}\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), "1;\n").unwrap();
+        (id, root)
+    }
+
+    /// A suspend measures only what its carry keys read: no login and no
+    /// tool of an ecosystem the workspace does not use. For an npm tree
+    /// that is node and npm, and python3, whose facts key a `.venv`
+    /// detection does not know (issue #26).
+    #[tokio::test]
+    async fn a_suspend_probes_only_what_its_keys_read() {
+        let (dir, node) = node();
+        let tools = crate::facts::tests::CountingTools::new(dir.path());
+        let (id, _) = npm_job(dir.path(), &node).await;
+        node.suspend(id, &tools.env, &mut Out::default())
+            .await
+            .unwrap();
+        let ran = tools.ran();
+        assert!(
+            !ran.iter()
+                .any(|probe| probe.contains("auth") || probe.contains("login")),
+            "a suspend asked for a login: {ran:?}"
+        );
+        assert_eq!(
+            ran,
+            [
+                "node --version",
+                "node -p process.versions.modules",
+                "npm --version",
+                "python3 --version",
+                "python3 -c import sys; print(sys.base_prefix)",
+            ]
+        );
+    }
+
+    /// A second suspend reuses the answers of the first and starts no
+    /// probe, until a tool is written again; that tool alone is then
+    /// probed (issue #26).
+    #[tokio::test]
+    async fn a_second_suspend_probes_only_a_tool_written_since() {
+        let (dir, node) = node();
+        let tools =
+            crate::facts::tests::CountingTools::only(dir.path(), &["node", "npm", "python3"]);
+        let (id, root) = npm_job(dir.path(), &node).await;
+        node.suspend(id, &tools.env, &mut Out::default())
+            .await
+            .unwrap();
+        assert_eq!(tools.ran().len(), 5, "the first suspend");
+        std::fs::write(root.join("README.md"), "edited\n").unwrap();
+        node.suspend(id, &tools.env, &mut Out::default())
+            .await
+            .unwrap();
+        assert_eq!(tools.ran(), Vec::<String>::new(), "the second suspend");
+        tools.touch("npm");
+        std::fs::write(root.join("README.md"), "edited again\n").unwrap();
+        node.suspend(id, &tools.env, &mut Out::default())
+            .await
+            .unwrap();
+        assert_eq!(tools.ran(), ["npm --version"], "after npm changed");
+    }
+
+    /// The preflight of a move and of a pull measures this node while the
+    /// peer measures itself (issue #26). Each node's `sw_vers` waits up to
+    /// five seconds for the other's to start and says whether it did, so a
+    /// node that measured only after the other finished reads `alone`.
+    /// Both moves are refused, as the two test nodes have different homes,
+    /// after the rows are reported.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_preflight_measures_here_and_on_the_peer_at_once() {
+        let dir = tempfile::Builder::new()
+            .prefix("fops")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let meet = root.join("meet");
+        std::fs::create_dir(&meet).unwrap();
+        let tools = |me: &str, other: &str| {
+            let tools = crate::facts::tests::CountingTools::only(&root.join(me), &[]);
+            let (mine, theirs) = (meet.join(me), meet.join(other));
+            tools.install(
+                "sw_vers",
+                &format!(
+                    "touch '{mine}'\ni=0\nwhile [ ! -f '{theirs}' ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i + 1)); done\nif [ -f '{theirs}' ]; then echo together; else echo alone; fi",
+                    mine = mine.display(),
+                    theirs = theirs.display()
+                ),
+            );
+            tools
+        };
+        let (tools_a, tools_b) = (tools("a", "b"), tools("b", "a"));
+        let a = node_at(
+            &root.join("a/home"),
+            &root.join("a/state"),
+            tools_a.env.clone(),
+        );
+        let b = node_at(
+            &root.join("b/home"),
+            &root.join("b/state"),
+            tools_b.env.clone(),
+        );
+        // Every measure probes, so each preflight shows its own.
+        a.facts.set_ttl(Duration::ZERO);
+        b.facts.set_ttl(Duration::ZERO);
+        paired(&a, &b).await;
+        let id = job(&root, &a).await;
+        let macos_row = |out: &Out| {
+            out.events
+                .iter()
+                .find_map(|event| match event {
+                    Event::Preflight { rows, .. } => {
+                        rows.iter().find(|row| row.fact == "macos.version").cloned()
+                    }
+                    _ => None,
+                })
+                .map(|row| (row.here, row.peer))
+        };
+        let together = Some((Some("together".to_owned()), Some("together".to_owned())));
+
+        let mut out = Out::default();
+        let pushed = a.job_move(id, b.id, false, &tools_a.env, &mut out).await;
+        assert!(matches!(pushed, Err(NodeError::Preflight(_))), "{pushed:?}");
+        assert_eq!(macos_row(&out), together, "the move");
+
+        for marker in ["a", "b"] {
+            std::fs::remove_file(meet.join(marker)).unwrap();
+        }
+        let mut out = Out::default();
+        let pulled = b
+            .job_resume(id, Some(a.id), None, false, &tools_b.env, &mut out)
+            .await;
+        assert!(matches!(pulled, Err(NodeError::Preflight(_))), "{pulled:?}");
+        assert_eq!(macos_row(&out), together, "the pull");
+    }
+
+    /// A pull decides the snapshot's paths with what its preflight measured
+    /// here and measures again only for the restore (issue #26): with no
+    /// answer reused, `node --version` runs once for each, and the login
+    /// of the job's harness, which only the preflight reads, once. The two
+    /// nodes share one home, as the gate Macs do, so the preflight lets the
+    /// pull through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pull_measures_this_node_once_before_it_restores() {
+        let dir = tempfile::Builder::new()
+            .prefix("fops")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let home = root.join("home");
+        let read = ["node", "npm", "codex"];
+        let tools_a = crate::facts::tests::CountingTools::only(&root.join("a"), &read);
+        let tools_b = crate::facts::tests::CountingTools::only(&root.join("b"), &read);
+        let a = node_at(&home, &root.join("a/state"), tools_a.env.clone());
+        let b = node_at(&home, &root.join("b/state"), tools_b.env.clone());
+        paired(&a, &b).await;
+        let (id, _) = npm_job(&root, &a).await;
+        a.suspend(id, &tools_a.env, &mut Out::default())
+            .await
+            .unwrap();
+        b.facts.set_ttl(Duration::ZERO);
+        tools_b.ran();
+        let mut out = Out::default();
+        let pulled = b
+            .job_resume(id, Some(a.id), None, false, &tools_b.env, &mut out)
+            .await;
+        assert!(pulled.is_ok(), "{pulled:?} {:?}", out.said());
+        assert!(
+            out.said()
+                .iter()
+                .any(|line| line.starts_with("carry   node_modules")),
+            "{:?}",
+            out.said()
+        );
+        let ran = tools_b.ran();
+        let count = |probe: &str| ran.iter().filter(|line| *line == probe).count();
+        assert_eq!(count("node --version"), 2, "{ran:?}");
+        assert_eq!(count("codex login status"), 1, "{ran:?}");
     }
 }

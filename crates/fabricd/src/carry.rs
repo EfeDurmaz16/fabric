@@ -17,7 +17,9 @@ use fabric_core::snapshot::{
     CacheEntry, CarryKey, CarryState, LeaveReason, Platform, Remake, SnapshotManifest,
 };
 
-use crate::facts::{NODE_ABI_TOOL, NodeFacts, PLATFORM_TOOL, Program, key_difference, major, name};
+use crate::facts::{
+    NODE_ABI_TOOL, NodeFacts, PLATFORM_TOOL, Probes, Program, key_difference, major, name,
+};
 
 /// What a target does with one ignored path of a snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -480,6 +482,28 @@ fn decide_next_build(entry: &CacheEntry, seen: Seen, source: &Platform) -> Carry
             because: seen.difference,
         }
     }
+}
+
+/// The tools whose facts `decide_all` reads for `manifest` (issue #26):
+/// for each row it carries, what the target's key of the same shape needs
+/// and the programs its setup steps run. The platform needs no tool.
+#[must_use]
+pub fn probes(manifest: &SnapshotManifest) -> Probes {
+    manifest
+        .caches
+        .iter()
+        .filter(|entry| entry.carry != CarryState::NotCarried)
+        .fold(Probes::NONE, |probes, entry| {
+            let steps = match &entry.remake {
+                Remake::Setup { steps, .. } => steps.as_slice(),
+                Remake::Nothing | Remake::NextBuild => &[],
+            };
+            steps
+                .iter()
+                .fold(probes.union(Probes::for_key(&entry.key)), |probes, step| {
+                    probes.union(Probes::for_program(step.program.as_str()))
+                })
+        })
 }
 
 /// Decides every cache row of `manifest` for a node that measured `target`,
@@ -1194,5 +1218,118 @@ mod tests {
                 "leave   scratch/big.bin  (.fabricignore excludes it; it never leaves the source)",
             ]
         );
+    }
+
+    /// A snapshot captured on the Pro holding `caches`.
+    fn snapshot_of(caches: Vec<CacheEntry>) -> SnapshotManifest {
+        SnapshotManifest {
+            job_id: fabric_core::id::JobId::from_bytes([1; 16]),
+            root: fabric_core::path::AbsPath::parse("/w").unwrap(),
+            parent: None,
+            created_at: 0,
+            created_by: fabric_core::id::NodeId::from_bytes([2; 32]),
+            platform: macos(),
+            git: None,
+            files: Vec::new(),
+            harness_state: fabric_core::snapshot::HarnessState::default(),
+            env_spec: None,
+            caches,
+            left_behind: Vec::new(),
+        }
+    }
+
+    /// A restore measures only what the carry decision reads (issue #26):
+    /// each decision taken with only those facts is the one every fact
+    /// gives, for rows whose keys match, which reads the key's tools, and
+    /// for rows whose keys differ, which reads the programs their setup
+    /// steps run, cargo by its own fact. Build output keyed on the platform
+    /// needs no process.
+    #[test]
+    fn a_restore_measures_what_the_carry_decision_reads() {
+        use crate::facts::Tool;
+        let everything = NodeFacts::from_pairs([
+            (name::USER, "me"),
+            (name::OS, "macos"),
+            (name::ARCH, "aarch64"),
+            (name::NODE, "v22.23.2"),
+            (name::NODE_ABI, "127"),
+            (name::NPM, "10.9.2"),
+            (name::PNPM, "11.23.0"),
+            (name::PNPM_STORE, "/Users/x/Library/pnpm/store/v11"),
+            (name::YARN, "1.22.22"),
+            (name::BUN, "1.3.14"),
+            (name::RUSTC, "rustc 1.97.1"),
+            (name::CARGO, "cargo 1.97.1 (a1b2c3d4e 2026-09-01)"),
+            (name::CARGO_HOME, "/Users/x/.cargo"),
+            (name::PYTHON, "Python 3.12.1"),
+            (name::PYTHON_HOME, "/opt/py312"),
+            (name::UV, "uv 0.9.5"),
+            (name::CLAUDE, "2.1.294 (Claude Code)"),
+            (name::CLAUDE_LOGIN, "yes"),
+            (name::CODEX, "codex-cli 0.155.1"),
+            (name::CODEX_LOGIN, "yes"),
+        ]);
+        let mut caches = Vec::new();
+        for (manager, pm_major) in [("npm", "10"), ("pnpm", "11"), ("yarn", "1"), ("bun", "1")] {
+            for node_major in ["22", "20"] {
+                let mut tree = locked_tree(manager, pm_major, step(manager, &["install"]));
+                tree.path = RelPath::parse(&format!("{manager}{node_major}/node_modules")).unwrap();
+                if let CarryKey::Node {
+                    node_major: major, ..
+                } = &mut tree.key
+                {
+                    node_major.clone_into(major);
+                }
+                caches.push(tree);
+            }
+        }
+        let python = |version: &str, path: &str, remake: Remake| {
+            let key = CarryKey::Python {
+                python_version: version.to_owned(),
+                python_home: fabric_core::path::AbsPath::parse("/opt/py312").unwrap(),
+            };
+            entry(path, CacheClass::Deps, key, remake)
+        };
+        let setup = |program: &str| Remake::Setup {
+            steps: vec![step(program, &["sync"])],
+            installed: true,
+        };
+        let vendor = CarryKey::Rust {
+            rustc_vv: "rustc 1.96.0".to_owned(),
+            cargo_home: fabric_core::path::AbsPath::parse("/Users/x/.cargo").unwrap(),
+        };
+        caches.extend([
+            rust_target(),
+            entry("vendor", CacheClass::Deps, vendor, setup("cargo")),
+            python("Python 3.12.1", ".venv", Remake::Nothing),
+            python("Python 3.11.0", "uv/.venv", setup("uv")),
+            python("Python 3.11.0", "pip/.venv", setup("python3")),
+            CacheEntry {
+                native_files: 2,
+                ..hand_made_tree()
+            },
+            dist(),
+        ]);
+        let manifest = snapshot_of(caches);
+        let probes = probes(&manifest);
+        assert_eq!(
+            probes,
+            Probes::of(&[
+                Tool::Node,
+                Tool::Npm,
+                Tool::Pnpm,
+                Tool::Yarn,
+                Tool::Bun,
+                Tool::Rustc,
+                Tool::Cargo,
+                Tool::Python,
+                Tool::Uv,
+            ])
+        );
+        assert_eq!(
+            decide_all(&manifest, &everything.only(probes)),
+            decide_all(&manifest, &everything)
+        );
+        assert_eq!(super::probes(&snapshot_of(vec![dist()])), Probes::NONE);
     }
 }

@@ -696,20 +696,20 @@ impl Codex {
         // judges it. A workspace pin this node lacks runs no Codex there,
         // and taking its shim's failure for a writer of unknown version
         // would make any `codex` on the node, such as a desktop app's,
-        // block every capture of the job.
-        let anywhere =
-            process::installed_version(self.binary().ok(), &self.path_var, PROGRAM).await;
+        // block every capture of the job. The version recorded is asked in
+        // the workspace, where a version manager's shim picks the Codex a
+        // launch there runs, not the one it picks for the daemon. The two
+        // questions are asked at once (issue #26).
+        let (anywhere, installed) = tokio::join!(
+            process::installed_version(self.binary().ok(), &self.path_var, PROGRAM),
+            process::installed_version_in(
+                self.binary().ok(),
+                Some(pipeline::fs_path(&root)),
+                &self.path_var,
+                PROGRAM,
+            ),
+        );
         self.refuse_lockless_writers(anywhere.as_deref()).await?;
-        // The version recorded is asked in the workspace, where a version
-        // manager's shim picks the Codex a launch there runs, not the one
-        // it picks for the daemon.
-        let installed = process::installed_version_in(
-            self.binary().ok(),
-            Some(pipeline::fs_path(&root)),
-            &self.path_var,
-            PROGRAM,
-        )
-        .await;
         let version = self.captured_version(installed);
         let adapter = self.clone();
         let session = session.clone();

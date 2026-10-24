@@ -8,8 +8,10 @@
 //! One more test runs a Claude job on one node beside a running `claude`,
 //! `terminal` runs a Codex job under a pseudo-terminal, `headless`
 //! runs Claude and Codex turns without one, and `client` drives a node
-//! through `fabric-client` instead of the CLI.
+//! through `fabric-client` instead of the CLI. `budget` times the hot
+//! paths against `budget.toml`.
 
+mod budget;
 mod client;
 mod headless;
 mod terminal;
