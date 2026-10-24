@@ -1,0 +1,8 @@
+{
+  "kind": "submodules_left_empty",
+  "paths": [
+    "vendor/lib",
+    "tools/gen"
+  ],
+  "more": 1
+}

@@ -576,6 +576,8 @@ const eventOptions = [
   z.object({ kind: z.literal("abort_not_told"), holder: NodeId, error: Refusal }),
   z.object({ kind: z.literal("peer_not_asked"), peer: NodeId }),
   z.object({ kind: z.literal("live_workspace_gone"), root: Path }),
+  z.object({ kind: z.literal("submodules_left_empty"), paths: z.array(UnicodeText), more: count }),
+  z.object({ kind: z.literal("escaping_links_restored"), paths: z.array(UnicodeText), more: count }),
 ] as const;
 
 /** Every event kind this client knows, read from the schema. */

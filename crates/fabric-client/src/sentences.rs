@@ -275,6 +275,14 @@ pub fn event(event: &Event) -> Vec<String> {
             "the workspace at {} is gone; restoring the latest snapshot, and work since it that no suspend captured is lost",
             root.display()
         ),
+        Event::SubmodulesLeftEmpty { paths, more } => format!(
+            "warning: submodules left empty, since a snapshot carries a submodule's commit and not its files: {}; run `git submodule update --init` in the workspace before the harness needs them",
+            named(paths, *more)
+        ),
+        Event::EscapingLinksRestored { paths, more } => format!(
+            "warning: links restored that point outside the tree they were restored into: {}; a harness that follows one reads or writes outside it",
+            named(paths, *more)
+        ),
         Event::Unrecognized => return Vec::new(),
     };
     vec![line]

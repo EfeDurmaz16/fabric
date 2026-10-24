@@ -224,6 +224,8 @@ fn event_variant(event: &Event) -> (Option<usize>, usize) {
             Event::AbortNotTold { .. },
             Event::PeerNotAsked { .. },
             Event::LiveWorkspaceGone { .. },
+            Event::SubmodulesLeftEmpty { .. },
+            Event::EscapingLinksRestored { .. },
         ],
         Event::Unrecognized
     )
