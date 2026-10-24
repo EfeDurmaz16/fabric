@@ -467,6 +467,12 @@ impl FactCache {
         }
     }
 
+    /// Changes how long answers live, for a test that counts every probe.
+    #[cfg(test)]
+    pub(crate) fn set_ttl(&self, ttl: Duration) {
+        crate::node::lock(&self.state).ttl = ttl;
+    }
+
     /// Measures `probes` with the tools `env` names: programs are looked
     /// up on its `PATH` and run with its roots, each set to its value or
     /// removed, never the daemon's own (ADR 0018, The client's environment).

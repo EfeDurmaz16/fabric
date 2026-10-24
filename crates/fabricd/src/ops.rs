@@ -2857,9 +2857,9 @@ impl Node {
         Ok((here, theirs))
     }
 
-    /// Measures this node's `probes`, asks `peer` for its facts, compares
-    /// them row by row (ADR 0008), and returns the rows, this node's facts
-    /// and the peer's.
+    /// Measures this node's `probes` while `peer` measures its own,
+    /// compares them row by row (ADR 0008), and returns the rows, this
+    /// node's facts and the peer's.
     async fn compare(
         self: &Arc<Self>,
         peer: NodeId,
@@ -2868,20 +2868,22 @@ impl Node {
         env: &ToolEnv,
         (probes, reuse): (Probes, Reuse),
     ) -> Result<(Vec<doctor::Row>, NodeFacts, NodeFacts), NodeError> {
-        let mut here = self.facts.measure(&self.cfg.home, env, probes, reuse).await;
+        // Both nodes measure at once (issue #26). A session the peer
+        // opened is used too: a peer behind a NAT has no address here and
+        // is reachable only over the session it dialed.
+        let (mut here, theirs) = tokio::join!(
+            self.facts.measure(&self.cfg.home, env, probes, reuse),
+            self.call(peer, |session| async move {
+                let facts = session.facts(SHORT_DEADLINE * 4).await?;
+                Ok((facts, session.clock_skew_ms(), session.kind().to_string()))
+            }),
+        );
+        let (theirs, clock_skew_ms, wire) = theirs?;
         // The agent of an ACP job is named per job, so only the target of a
         // pull, this node, can look for it.
         if let (Target::Here, Some((HarnessKind::Acp { program, .. }, _, _))) = (target, job) {
             here.measure_acp(program, &self.harness_env(env)?);
         }
-        // A session the peer opened is used too: a peer behind a NAT has
-        // no address here and is reachable only over the session it dialed.
-        let (theirs, clock_skew_ms, wire) = self
-            .call(peer, |session| async move {
-                let facts = session.facts(SHORT_DEADLINE * 4).await?;
-                Ok((facts, session.clock_skew_ms(), session.kind().to_string()))
-            })
-            .await?;
         let theirs = NodeFacts::from_wire(&theirs);
         let rows = doctor::compare(
             &here,
@@ -3769,17 +3771,23 @@ pub(crate) mod tests {
             .tempdir_in("/tmp")
             .unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
-        let home = root.join("home");
-        std::fs::create_dir_all(&home).unwrap();
-        let node = Node::start(NodeConfig {
-            state: StateDir::resolve(Some(root.join("state").as_os_str()), &home).unwrap(),
-            home,
+        let node = node_at(&root.join("home"), &root.join("state"), ToolEnv::current());
+        (dir, node)
+    }
+
+    /// A node with its state in `state` and the home `home`, which other
+    /// nodes of a test may share as the gate Macs share one home path,
+    /// started in `env`.
+    fn node_at(home: &Path, state: &Path, env: ToolEnv) -> Arc<Node> {
+        std::fs::create_dir_all(home).unwrap();
+        Node::start(NodeConfig {
+            state: StateDir::resolve(Some(state.as_os_str()), home).unwrap(),
+            home: home.to_owned(),
             listen: "127.0.0.1:0".parse().unwrap(),
             dial: DialOrder::TcpOnly,
-            env: ToolEnv::current(),
+            env,
         })
-        .unwrap();
-        (dir, node)
+        .unwrap()
     }
 
     /// This process's environment, as the CLI sends its own.
@@ -7704,5 +7712,78 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(tools.ran(), ["npm --version"], "after npm changed");
+    }
+
+    /// The preflight of a move and of a pull measures this node while the
+    /// peer measures itself (issue #26). Each node's `sw_vers` waits up to
+    /// five seconds for the other's to start and says whether it did, so a
+    /// node that measured only after the other finished reads `alone`.
+    /// Both moves are refused, as the two test nodes have different homes,
+    /// after the rows are reported.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_preflight_measures_here_and_on_the_peer_at_once() {
+        let dir = tempfile::Builder::new()
+            .prefix("fops")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let meet = root.join("meet");
+        std::fs::create_dir(&meet).unwrap();
+        let tools = |me: &str, other: &str| {
+            let tools = crate::facts::tests::CountingTools::only(&root.join(me), &[]);
+            let (mine, theirs) = (meet.join(me), meet.join(other));
+            tools.install(
+                "sw_vers",
+                &format!(
+                    "touch '{mine}'\ni=0\nwhile [ ! -f '{theirs}' ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i + 1)); done\nif [ -f '{theirs}' ]; then echo together; else echo alone; fi",
+                    mine = mine.display(),
+                    theirs = theirs.display()
+                ),
+            );
+            tools
+        };
+        let (tools_a, tools_b) = (tools("a", "b"), tools("b", "a"));
+        let a = node_at(
+            &root.join("a/home"),
+            &root.join("a/state"),
+            tools_a.env.clone(),
+        );
+        let b = node_at(
+            &root.join("b/home"),
+            &root.join("b/state"),
+            tools_b.env.clone(),
+        );
+        // Every measure probes, so each preflight shows its own.
+        a.facts.set_ttl(Duration::ZERO);
+        b.facts.set_ttl(Duration::ZERO);
+        paired(&a, &b).await;
+        let id = job(&root, &a).await;
+        let macos_row = |out: &Out| {
+            out.events
+                .iter()
+                .find_map(|event| match event {
+                    Event::Preflight { rows, .. } => {
+                        rows.iter().find(|row| row.fact == "macos.version").cloned()
+                    }
+                    _ => None,
+                })
+                .map(|row| (row.here, row.peer))
+        };
+        let together = Some((Some("together".to_owned()), Some("together".to_owned())));
+
+        let mut out = Out::default();
+        let pushed = a.job_move(id, b.id, false, &tools_a.env, &mut out).await;
+        assert!(matches!(pushed, Err(NodeError::Preflight(_))), "{pushed:?}");
+        assert_eq!(macos_row(&out), together, "the move");
+
+        for marker in ["a", "b"] {
+            std::fs::remove_file(meet.join(marker)).unwrap();
+        }
+        let mut out = Out::default();
+        let pulled = b
+            .job_resume(id, Some(a.id), None, false, &tools_b.env, &mut out)
+            .await;
+        assert!(matches!(pulled, Err(NodeError::Preflight(_))), "{pulled:?}");
+        assert_eq!(macos_row(&out), together, "the pull");
     }
 }
