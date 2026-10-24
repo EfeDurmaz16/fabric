@@ -278,8 +278,9 @@ fn cannot_run(steps: &[SetupStep], key: &CarryKey, target: &NodeFacts) -> Option
 ///   rebuild when the target can run those steps as the source would; else
 ///   carry when the platform matches, nothing inside is native, nothing
 ///   under it stayed behind and a finished install vouches for the bytes,
-///   since without one resume would run the steps there anyway, and with
-///   holes its record would call a broken tree whole; else refuse.
+///   since without one resume would run the steps there anyway, and a
+///   restore drops the record of a tree with holes, so resume would run
+///   them over it too; else refuse.
 /// - The next build makes it: carry when the keys match, or when the
 ///   platform matches and the target lacks the toolchain the key names;
 ///   leave it behind on another platform; else rebuild.
@@ -411,11 +412,12 @@ fn decide_setup(
             ),
             warnings: seen.warnings,
         },
-        // The install record travels with the tree and calls it whole, so
-        // materialize would never fill the holes the secret policy left.
+        // A restore drops the install record of a tree with holes, which
+        // would call it whole, so materialize runs the steps over it before
+        // the job can resume.
         (true, None) if partial => CarryDecision::Refuse {
             reason: format!(
-                "{missing}, so {steps_text} cannot rebuild it there, and files under it that match a secret pattern or .fabricignore stayed on the source while its install record calls it whole; install the tool on the target, or pass --force to carry it with the holes"
+                "{missing}, so {steps_text} cannot rebuild it there, and files under it that match a secret pattern or .fabricignore stayed on the source, so resume there would run {steps_text} first to fill them; install the tool on the target, or pass --force to carry it and install the tool before resuming"
             ),
         },
         // Materialize runs the steps over a tree no finished install
@@ -912,9 +914,10 @@ mod tests {
         assert!(decision.refuses(), "{decision:?}");
     }
 
-    /// A tree with holes and an install record that calls it whole is
-    /// refused where it cannot be rebuilt: written, materialize would trust
-    /// the record and never fill the holes (review of PR #11).
+    /// A tree with holes is refused where it cannot be rebuilt: a restore
+    /// writes it without the install record that would call it whole, so
+    /// resume there would run the install first, and the target has no
+    /// installer (review of PR #11, issue #24).
     #[test]
     fn a_partial_locked_tree_the_target_cannot_rebuild_is_refused() {
         let mut tree = pnpm_tree();
@@ -925,7 +928,7 @@ mod tests {
         };
         assert_eq!(
             reason,
-            "pnpm is not installed on the target, so `pnpm install --frozen-lockfile` cannot rebuild it there, and files under it that match a secret pattern or .fabricignore stayed on the source while its install record calls it whole; install the tool on the target, or pass --force to carry it with the holes"
+            "pnpm is not installed on the target, so `pnpm install --frozen-lockfile` cannot rebuild it there, and files under it that match a secret pattern or .fabricignore stayed on the source, so resume there would run `pnpm install --frozen-lockfile` first to fill them; install the tool on the target, or pass --force to carry it and install the tool before resuming"
         );
         assert!(matches!(
             decide(&pnpm_tree(), &macos(), &air()),

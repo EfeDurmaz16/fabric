@@ -830,8 +830,10 @@ fn read_sentinel(path: &Path) -> Option<Vec<u8>> {
 /// Removes the sentinel of the cache at `path`; nothing there, or a cache reached through a link, is left alone.
 ///
 /// A linked cache is never judged healthy, so a sentinel beyond the link
-/// proves nothing here and is not this workspace's to remove.
-fn clear_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
+/// proves nothing here and is not this workspace's to remove. Besides the
+/// first step that fills the cache, a restore calls it on a cache it wrote
+/// with holes, whose sentinel would call it whole.
+pub fn clear_sentinel(root: &Path, path: &RelPath) -> Result<(), MaterializeError> {
     let sentinel_err = |source| MaterializeError::Sentinel {
         path: path.clone(),
         source,

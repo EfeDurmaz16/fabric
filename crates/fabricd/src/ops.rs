@@ -2302,6 +2302,16 @@ impl Node {
             self.write_snapshot(snapshot, &manifest, &root, harness_dir, env, out)
                 .await?;
         }
+        // A cache written with holes keeps no sentinel: it would call the
+        // tree whole, and materialize would trust it and never fill them.
+        // Without it the steps that fill the cache run first (issue #24).
+        // This runs after a restore a kill cut short too, before the
+        // marker says the tree is clean.
+        for cache in &manifest.caches {
+            if cache.carry == fabric_core::snapshot::CarryState::Partial {
+                fabric_env::materialize::clear_sentinel(&root, &cache.path)?;
+            }
+        }
         if has_harness_state {
             self.restore_harness(job, &root, env, out).await?;
         }
@@ -6901,6 +6911,52 @@ pub(crate) mod tests {
             pulled.lock().await.view(b.id),
             LeaseView::Owner(_)
         ));
+    }
+
+    /// A cache written with holes arrives without its sentinel. Here a
+    /// pnpm tree, one file of which `.fabricignore` kept on the source, is
+    /// written on a node with no pnpm, as a refusal is without a move. With
+    /// the sentinel, the lockfile and `package.json` that travelled proved
+    /// it whole, and materialize would never fill the hole (issue #24).
+    #[tokio::test]
+    async fn a_cache_restored_with_holes_is_not_called_whole() {
+        use fabric_env::materialize::{CacheHealth, SENTINEL, cache_health, sentinel_text};
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let root = paths::job_root(&node.cfg.home, id);
+        std::fs::write(root.join("package.json"), "{\"name\": \"x\"}\n").unwrap();
+        std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::write(root.join(".fabricignore"), "node_modules/pkg/notes.txt\n").unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), "1;\n").unwrap();
+        std::fs::write(root.join("node_modules/pkg/notes.txt"), "kept here\n").unwrap();
+        let node_modules = fabric_core::path::RelPath::parse("node_modules").unwrap();
+        let health = |root: &Path| {
+            let detection = fabric_env::detect::detect(root, &[]).unwrap();
+            cache_health(&detection, &node_modules).unwrap()
+        };
+        let detection = fabric_env::detect::detect(&root, &[]).unwrap();
+        std::fs::write(
+            root.join("node_modules").join(SENTINEL),
+            sentinel_text(&detection, &node_modules).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(health(&root), Some(CacheHealth::Healthy));
+        node.suspend(id, &env(), &mut Out::default()).await.unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        let no_pnpm = on_path(std::ffi::OsStr::new("/usr/bin:/bin"));
+        let mut out = Out::default();
+        node.job_resume(id, None, None, false, &no_pnpm, &mut out)
+            .await
+            .unwrap();
+        assert!(
+            root.join("node_modules/pkg/index.js").is_file(),
+            "the tree was not written: {:?}",
+            out.said()
+        );
+        assert!(!root.join("node_modules/pkg/notes.txt").exists());
+        assert_eq!(health(&root), Some(CacheHealth::Incomplete));
     }
 
     /// A workspace root replaced with a link to another directory must not
