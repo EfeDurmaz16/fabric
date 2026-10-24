@@ -117,7 +117,7 @@ impl Node {
         let root = cfg.state.root();
         prepare_state_dir(root)?;
         let lock_path = cfg.state.lock();
-        let lock_file = File::create(&lock_path).map_err(|e| NodeError::io(&lock_path, e))?;
+        let lock_file = open_lock(&lock_path)?;
         match lock_file.try_lock() {
             Ok(()) => {}
             Err(fs::TryLockError::WouldBlock) => {
@@ -463,6 +463,37 @@ enum Side {
 /// Treats a transport failure as a reason to drop the kept session and dial again.
 pub(crate) fn is_transport(err: &RpcError) -> bool {
     matches!(err, RpcError::Transport(_) | RpcError::Frame(_))
+}
+
+/// Opens the daemon's lock file at `path`, made with mode 0600 when it is missing.
+///
+/// A link at the name is refused, never followed, and so is anything there
+/// but a regular file. A harness or any other process of this user can
+/// replace the file with a link before a restart, and the state
+/// directory's check passes a link this user made; opening through it
+/// would act on the file it names. The file is opened without truncating
+/// and never written, since the lock on it is all it is for, and the open
+/// does not wait on a FIFO.
+fn open_lock(path: &std::path::Path) -> Result<File, NodeError> {
+    use rustix::fs::{FileType, Mode, OFlags};
+    let refuse = |what: &str| NodeError::UnsafeStateDir {
+        path: path.to_owned(),
+        reason: format!(
+            "is {what}, not the lock file Fabric writes; remove it once you have checked what it is"
+        ),
+    };
+    let flags =
+        OFlags::RDONLY | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = match rustix::fs::open(path, flags, Mode::RUSR | Mode::WUSR) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::LOOP) => return Err(refuse("a symlink")),
+        Err(e) => return Err(NodeError::io(path, e.into())),
+    };
+    let stat = rustix::fs::fstat(&fd).map_err(|e| NodeError::io(path, e.into()))?;
+    if !FileType::from_raw_mode(stat.st_mode).is_file() {
+        return Err(refuse("not a regular file"));
+    }
+    Ok(File::from(fd))
 }
 
 fn open_store(dir: &std::path::Path) -> Result<Store, NodeError> {
@@ -951,6 +982,44 @@ mod tests {
             );
             assert_eq!(mode(&target), 0o755, "{spelled}");
         }
+    }
+
+    /// A harness or another process of this user can replace `daemon.lock`
+    /// with a link before a restart. Taking the lock must not follow it:
+    /// creating the lock file through the link truncated the file it names
+    /// (Codex review of #8, issue #23).
+    #[test]
+    fn a_lock_file_that_is_a_link_is_refused_and_its_target_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "keep").unwrap();
+        let lock = dir.path().join("daemon.lock");
+        std::os::unix::fs::symlink(&victim, &lock).unwrap();
+        let refused = open_lock(&lock);
+        assert!(
+            matches!(&refused, Err(NodeError::UnsafeStateDir { reason, .. }) if reason.contains("is a symlink")),
+            "{refused:?}"
+        );
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+    }
+
+    /// Anything else at the lock's name, a FIFO here, is not the file
+    /// Fabric writes either: it is refused, and the start does not wait on
+    /// it for a writer.
+    #[test]
+    fn a_lock_file_that_is_not_a_regular_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("daemon.lock");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&lock)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let refused = open_lock(&lock);
+        assert!(
+            matches!(&refused, Err(NodeError::UnsafeStateDir { reason, .. }) if reason.contains("not a regular file")),
+            "{refused:?}"
+        );
     }
 
     /// A link that takes a missing state directory's name after the start
