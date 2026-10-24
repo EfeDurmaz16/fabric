@@ -36,6 +36,7 @@ use fabric_store::store::{Store, StoreError};
 use tokio::net::UnixListener;
 
 use crate::error::NodeError;
+use crate::facts::{FACTS_TTL, FactCache};
 use crate::harnesses::{HarnessConfig, HarnessEnv};
 use crate::job::Job;
 use crate::paths::StateDir;
@@ -93,6 +94,8 @@ pub struct Node {
     /// The environment the last local client sent, which the node uses
     /// for work no client asks for (ADR 0018, The client's environment).
     client_env: Mutex<Option<ClientEnv>>,
+    /// The facts this node measured lately (issue #26).
+    pub(crate) facts: FactCache,
     _lock: File,
 }
 
@@ -172,6 +175,7 @@ impl Node {
             catching_up: Mutex::new(BTreeMap::new()),
             waiting_catch_up: Mutex::new(BTreeSet::new()),
             client_env: Mutex::new(client_env),
+            facts: FactCache::new(FACTS_TTL),
             _lock: lock_file,
         });
         tracing::info!(node = %node.id, addr = ?node.local_addr().ok(), "node started");

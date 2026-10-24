@@ -52,7 +52,7 @@ use crate::carry::{self, PathDecision};
 use crate::clock;
 use crate::doctor::{self, Context, Target};
 use crate::error::NodeError;
-use crate::facts::{MeasuredKeys, NodeFacts, Probes, stayed_behind};
+use crate::facts::{MeasuredKeys, NodeFacts, Probes, Reuse, Tool, stayed_behind};
 use crate::faults::{self, Action, Point};
 use crate::harnesses::{HarnessConfig, HarnessEnv, adapter, refuse_secret_kind};
 use crate::job::Job;
@@ -335,7 +335,7 @@ impl Node {
         refuse_secret_kind(&harness)?;
         let id = clock::job_id();
         let root = paths::job_root(&self.cfg.home, id);
-        let synced = synced_folders(&self.cfg.home, &self.node_env()).await;
+        let synced = self.synced_folders(&self.node_env()).await;
         check_root(&root, &self.cfg.home, synced)?;
         // Built before the clone: a goal past the record bound refuses
         // here, not after a clone that no job and no printed id names.
@@ -1136,7 +1136,10 @@ impl Node {
         // Only what the keys read is measured: no login, and no tool of an
         // ecosystem the workspace does not use (issue #26).
         let probes = MeasuredKeys::probes(&detection);
-        let facts = NodeFacts::measure(&self.cfg.home, env, probes).await;
+        let facts = self
+            .facts
+            .measure(&self.cfg.home, env, probes, Reuse::Cached)
+            .await;
         local::write(
             &job.dir().secret_patterns(),
             &detection.spec().secret_patterns,
@@ -2048,7 +2051,10 @@ impl Node {
         let (manifest, spec) = self.manifest_and_spec(snapshot).await?;
         let probes = spec.as_ref().map_or(Probes::NONE, doctor::setup_probes);
         let probes = probes.union(carry::probes(&manifest));
-        let facts = NodeFacts::measure(&self.cfg.home, env, probes).await;
+        let facts = self
+            .facts
+            .measure(&self.cfg.home, env, probes, Reuse::Cached)
+            .await;
         let rows = setup_rows((&manifest, spec.as_ref()), &facts, theirs, Target::Here);
         if !rows.is_empty() {
             out.emit(Event::Preflight {
@@ -2314,11 +2320,7 @@ impl Node {
             },
         });
         let root = choice.root().to_owned();
-        check_root(
-            &root,
-            &self.cfg.home,
-            synced_folders(&self.cfg.home, env).await,
-        )?;
+        check_root(&root, &self.cfg.home, self.synced_folders(env).await)?;
         let resuming = matches!(
             &marker,
             Some(Marker { state: MarkerState::Restoring { snapshot: s }, .. }) if *s == snapshot
@@ -2476,7 +2478,10 @@ impl Node {
         env: &ToolEnv,
         out: &mut Out,
     ) -> Result<(), NodeError> {
-        let facts = NodeFacts::measure(&self.cfg.home, env, carry::probes(manifest)).await;
+        let facts = self
+            .facts
+            .measure(&self.cfg.home, env, carry::probes(manifest), Reuse::Cached)
+            .await;
         let decisions = carry::decide_all(manifest, &facts);
         if !decisions.is_empty() {
             out.emit(carry_decided(CarryFor::Restore, snapshot, &decisions));
@@ -2506,6 +2511,24 @@ impl Node {
         out.emit(restored(snapshot, &report, has_git));
         report_restore(&report, out);
         Ok(())
+    }
+
+    /// Reads which folders iCloud Drive syncs on this node, as the
+    /// `defaults` of `env` answers; off everywhere it does not exist.
+    async fn synced_folders(&self, env: &ToolEnv) -> SyncedFolders {
+        let facts = self
+            .facts
+            .measure(
+                &self.cfg.home,
+                env,
+                Probes::NONE.with(Tool::ICloud),
+                Reuse::Cached,
+            )
+            .await;
+        SyncedFolders {
+            desktop: facts.syncs(crate::facts::name::ICLOUD_DESKTOP),
+            documents: facts.syncs(crate::facts::name::ICLOUD_DOCUMENTS),
+        }
     }
 
     /// Moves a workspace an earlier tenure left out of the root, next to it
@@ -2668,7 +2691,10 @@ impl Node {
         out: &mut Out,
     ) -> Result<DoctorReport, NodeError> {
         let Some(peer) = peer else {
-            let facts = NodeFacts::measure(&self.cfg.home, env, Probes::ALL).await;
+            let facts = self
+                .facts
+                .measure(&self.cfg.home, env, Probes::ALL, Reuse::Fresh)
+                .await;
             return Ok(DoctorReport::Facts {
                 facts: facts
                     .iter()
@@ -2705,6 +2731,7 @@ impl Node {
             }
             None => (None, None, None, None),
         };
+        // The doctor shows every fact as each tool answers now.
         let (mut rows, here, theirs) = self
             .compare(
                 peer,
@@ -2714,7 +2741,7 @@ impl Node {
                     .map(|(harness, root)| (harness, root, floor.as_ref())),
                 Target::Peer,
                 env,
-                Probes::ALL,
+                (Probes::ALL, Reuse::Fresh),
             )
             .await?;
         let carry = match (job, latest) {
@@ -2820,7 +2847,7 @@ impl Node {
         force: bool,
         out: &mut Out,
     ) -> Result<(NodeFacts, NodeFacts), NodeError> {
-        let probes = doctor::probes(job.0, target);
+        let probes = (doctor::probes(job.0, target), Reuse::Cached);
         let (rows, here, theirs) = self.compare(peer, Some(job), target, env, probes).await?;
         out.emit(Event::Preflight {
             peer,
@@ -2839,9 +2866,9 @@ impl Node {
         job: Option<(&HarnessKind, &Path, Option<&HarnessVersion>)>,
         target: Target,
         env: &ToolEnv,
-        probes: Probes,
+        (probes, reuse): (Probes, Reuse),
     ) -> Result<(Vec<doctor::Row>, NodeFacts, NodeFacts), NodeError> {
-        let mut here = NodeFacts::measure(&self.cfg.home, env, probes).await;
+        let mut here = self.facts.measure(&self.cfg.home, env, probes, reuse).await;
         // The agent of an ACP job is named per job, so only the target of a
         // pull, this node, can look for it.
         if let (Target::Here, Some((HarnessKind::Acp { program, .. }, _, _))) = (target, job) {
@@ -3606,31 +3633,6 @@ fn move_aside(root: &Path, dest: &Path) -> Result<bool, NodeError> {
         crate::durable::sync_dir(root_parent).map_err(|e| NodeError::io(root_parent, e))?;
     }
     Ok(true)
-}
-
-/// Reads which folders iCloud Drive syncs on this node; off everywhere `defaults` does not exist.
-async fn synced_folders(home: &Path, env: &ToolEnv) -> SyncedFolders {
-    let path_var = env.path_var().to_owned();
-    let read = |key: &'static str| {
-        let path_var = path_var.clone();
-        let home = home.to_owned();
-        async move {
-            let Some(binary) = crate::facts::find_on_path("defaults", &path_var) else {
-                return false;
-            };
-            tokio::process::Command::new(binary)
-                .args(["read", "com.apple.finder", key])
-                .env("HOME", home)
-                .output()
-                .await
-                .is_ok_and(|o| {
-                    o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "1"
-                })
-        }
-    };
-    let (desktop, documents) =
-        tokio::join!(read("FXICloudDriveDesktop"), read("FXICloudDriveDocuments"));
-    SyncedFolders { desktop, documents }
 }
 
 /// A fenced answer that is not an answer, in words.
@@ -7676,5 +7678,31 @@ pub(crate) mod tests {
                 "python3 -c import sys; print(sys.base_prefix)",
             ]
         );
+    }
+
+    /// A second suspend reuses the answers of the first and starts no
+    /// probe, until a tool is written again; that tool alone is then
+    /// probed (issue #26).
+    #[tokio::test]
+    async fn a_second_suspend_probes_only_a_tool_written_since() {
+        let (dir, node) = node();
+        let tools =
+            crate::facts::tests::CountingTools::only(dir.path(), &["node", "npm", "python3"]);
+        let (id, root) = npm_job(dir.path(), &node).await;
+        node.suspend(id, &tools.env, &mut Out::default())
+            .await
+            .unwrap();
+        assert_eq!(tools.ran().len(), 5, "the first suspend");
+        std::fs::write(root.join("README.md"), "edited\n").unwrap();
+        node.suspend(id, &tools.env, &mut Out::default())
+            .await
+            .unwrap();
+        assert_eq!(tools.ran(), Vec::<String>::new(), "the second suspend");
+        tools.touch("npm");
+        std::fs::write(root.join("README.md"), "edited again\n").unwrap();
+        node.suspend(id, &tools.env, &mut Out::default())
+            .await
+            .unwrap();
+        assert_eq!(tools.ran(), ["npm --version"], "after npm changed");
     }
 }
