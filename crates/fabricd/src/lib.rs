@@ -16,7 +16,7 @@ mod catchup;
 mod clock;
 mod control;
 mod doctor;
-mod durable;
+pub mod durable;
 pub mod error;
 mod facts;
 mod faults;

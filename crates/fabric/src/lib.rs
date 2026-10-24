@@ -1423,9 +1423,10 @@ impl Approval<'_> {
             }
             .into());
         }
-        let temp = self.record.with_extension("tmp");
-        std::fs::write(&temp, format!("{approved}\n"))
-            .and_then(|()| std::fs::rename(&temp, &self.record))
+        // The record sits in the job's directory, where a harness running
+        // as this user can plant a link at a temporary's name; the durable
+        // write never writes through one.
+        fabricd::durable::write_atomic(&self.record, format!("{approved}\n").as_bytes())
             .with_context(|| format!("recording the approved spec in {}", self.record.display()))?;
         Ok(())
     }
@@ -1753,6 +1754,46 @@ mod tests {
         assert!(
             !root.join("other").exists(),
             "a changed step ran unapproved"
+        );
+    }
+
+    /// The record of an approval sits in the job's directory, where a
+    /// harness running as this user can plant a link at the name a
+    /// temporary takes. Recording the approval must not write through the
+    /// link to the file it names, nor rename the link into the record's
+    /// place (Codex review of #8, issue #23).
+    #[test]
+    fn an_approval_is_not_written_through_a_link_at_a_temporary_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        // The name the record was once written through, and the one the
+        // durable write takes now.
+        for temp in [
+            "env-spec-ran.tmp".to_owned(),
+            format!("env-spec-ran.{}.tmp", std::process::id()),
+        ] {
+            std::os::unix::fs::symlink(&victim, dir.path().join(temp)).unwrap();
+        }
+        let record = dir.path().join("env-spec-ran");
+        let approval = Approval {
+            record: record.clone(),
+            yes: true,
+            ask: &|| panic!("an approval with --yes asked"),
+        };
+        let spec = EnvSpecId::from_bytes([7; 32]);
+        approval.approve(spec, "inputs").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert!(
+            !std::fs::symlink_metadata(&record)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link took the record's place"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            format!("{spec} inputs\n")
         );
     }
 
