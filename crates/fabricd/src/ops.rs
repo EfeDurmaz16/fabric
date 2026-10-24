@@ -5412,20 +5412,7 @@ pub(crate) mod tests {
         assert!(said.contains(&lock.display().to_string()), "{said}");
         assert_eq!(node.job(id).await.unwrap().lock().await.latest(), None);
         drop(setup);
-        // A child another test forked while the lock was held keeps a copy
-        // of its descriptor, and so the lock, until that child execs.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            match node.suspend(id, &path, &mut Out::default()).await {
-                Err(NodeError::SetupRunning { .. }) if tokio::time::Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                done => {
-                    done.unwrap();
-                    break;
-                }
-            }
-        }
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
     }
 
     /// A busy tree lock is retried for a second before the suspend refuses
