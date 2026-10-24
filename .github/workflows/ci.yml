@@ -68,6 +68,23 @@ jobs:
             scripts/check-fixtures.sh "$BEFORE"
           fi
 
+      - name: Prove the budget check fires
+        run: scripts/test-check-budget.sh
+
+      # The time budget changes only with a new [[change]] entry that says
+      # why. The base is the one the hygiene step uses; a push that created
+      # main has none, and nothing is checked.
+      - name: The time budget changes only with a reason
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ -n "$BASE_REF" ]; then
+            scripts/check-budget.sh "origin/$BASE_REF"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ]; then
+            scripts/check-budget.sh "$BEFORE"
+          fi
+
   check:
     name: check (${{ matrix.os }})
     strategy:
