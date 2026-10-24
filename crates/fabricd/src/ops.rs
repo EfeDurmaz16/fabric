@@ -22,14 +22,14 @@ use fabric_client::api::{
     SnapshotSession, SnapshotState, Standing, StealWarning, Step, Suspended, Verdict, VerdictCount,
     View, Wire, Workspace, WorkspaceState,
 };
-use fabric_core::env::EnvSpec;
+use fabric_core::env::{EnvSpec, OVERRIDE_FILE};
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::{FenceError, FencingToken};
 use fabric_core::ledger::{Author, EventKind, Ledger, LedgerError};
 use fabric_core::moves::{AbortAnswer, CompleteSnapshot, LeaseView, MoveOffer, OfferAnswer};
 use fabric_core::session::SessionId;
-use fabric_core::snapshot::LeaveReason;
+use fabric_core::snapshot::{LeaveReason, SnapshotManifest};
 use fabric_core::version::HarnessVersion;
 use fabric_env::materialize::{MaterializeError, TreeLock};
 use fabric_harness::HarnessError;
@@ -52,7 +52,7 @@ use crate::carry::{self, PathDecision};
 use crate::clock;
 use crate::doctor::{self, Context, Target};
 use crate::error::NodeError;
-use crate::facts::{MeasuredKeys, NodeFacts};
+use crate::facts::{MeasuredKeys, NodeFacts, stayed_behind};
 use crate::faults::{self, Action, Point};
 use crate::harnesses::{HarnessConfig, HarnessEnv, adapter, refuse_secret_kind};
 use crate::job::Job;
@@ -1471,7 +1471,7 @@ impl Node {
                 &decisions,
             ));
         }
-        let rows = setup_rows(spec.as_ref(), here, theirs, Target::Peer);
+        let rows = setup_rows((&manifest, spec.as_ref()), here, theirs, Target::Peer);
         if !rows.is_empty() {
             out.emit(Event::Preflight {
                 peer: to,
@@ -2044,7 +2044,7 @@ impl Node {
         };
         let (manifest, spec) = self.manifest_and_spec(snapshot).await?;
         let facts = NodeFacts::measure(&self.cfg.home, env).await;
-        let rows = setup_rows(spec.as_ref(), &facts, theirs, Target::Here);
+        let rows = setup_rows((&manifest, spec.as_ref()), &facts, theirs, Target::Here);
         if !rows.is_empty() {
             out.emit(Event::Preflight {
                 peer: holder,
@@ -2714,7 +2714,12 @@ impl Node {
         let carry = match (job, latest) {
             (Some(_), Some(snapshot)) => {
                 let (manifest, spec) = self.manifest_and_spec(snapshot).await?;
-                rows.extend(setup_rows(spec.as_ref(), &here, &theirs, Target::Peer));
+                rows.extend(setup_rows(
+                    (&manifest, spec.as_ref()),
+                    &here,
+                    &theirs,
+                    Target::Peer,
+                ));
                 let decisions = carry::decide_all(&manifest, &theirs);
                 Some(carry_report(Some(&manifest), snapshot, &decisions))
             }
@@ -2890,14 +2895,30 @@ fn started_move(
     }
 }
 
-/// The rows for the programs of the steps `spec` runs on every resume
-/// (`doctor::setup_rows`); none for a snapshot that names no spec.
+/// The rows for the programs of the steps `spec`, the spec of the
+/// snapshot `manifest` describes, runs on every resume
+/// (`doctor::setup_rows`); none for a snapshot that names no spec, and
+/// none when `.fabric/env.toml` stayed on the capturing node.
+///
+/// The target plans its steps from its own detection over the restored
+/// tree (ADR 0007), not from this spec. The override file's declared
+/// steps replace the detected ones, and without the file that detection
+/// never sees them, so a program they name is not one the target needs,
+/// and refusing a move for it would stop one that resumes. A file the
+/// target already holds at that path, which a restore leaves alone, is
+/// the target's own, and resume names a program it lacks. The detected
+/// steps whose program a node measures each run only when a cache of the
+/// workspace is not whole, which the carry decision judges per path
+/// (review of PR #27).
 fn setup_rows(
-    spec: Option<&EnvSpec>,
+    (manifest, spec): (&SnapshotManifest, Option<&EnvSpec>),
     here: &NodeFacts,
     peer: &NodeFacts,
     target: Target,
 ) -> Vec<doctor::Row> {
+    if stayed_behind(&manifest.left_behind, OVERRIDE_FILE) {
+        return Vec::new();
+    }
     spec.map(|spec| doctor::setup_rows(spec, here, peer, target))
         .unwrap_or_default()
 }
@@ -7093,6 +7114,43 @@ pub(crate) mod tests {
             pulled.lock().await.view(b.id),
             LeaseView::Owner(_)
         ));
+    }
+
+    /// The target plans its steps from its own detection over the restored
+    /// tree. With `.fabric/env.toml` kept on the source by `.fabricignore`,
+    /// the `always` step it declares never runs there, so a move to a node
+    /// without that step's program goes ahead; it was refused for a step
+    /// the target would not run (review of PR #27).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_ignores_the_steps_of_an_override_file_left_behind() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let root = paths::job_root(&a.cfg.home, id);
+        std::fs::create_dir_all(root.join(".fabric")).unwrap();
+        std::fs::write(
+            root.join(".fabric/env.toml"),
+            "[[setup]]\nprogram = \"uv\"\nargs = [\"run\", \"codegen.py\"]\nwhen = \"always\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join(".fabricignore"), ".fabric/env.toml\n").unwrap();
+        a.suspend(id, &env(), &mut Out::default()).await.unwrap();
+        let snapshot = a.job(id).await.unwrap().lock().await.latest().unwrap();
+        let uv = |version: Option<&'static str>| {
+            NodeFacts::from_pairs(version.map(|v| (crate::facts::name::UV, v)))
+        };
+        let mut out = Out::default();
+        let pushed = a
+            .carry_for_move(
+                b.id,
+                snapshot,
+                (&uv(Some("uv 0.9.5")), &uv(None)),
+                Some(false),
+                &mut out,
+            )
+            .await;
+        assert!(pushed.is_ok(), "{pushed:?} {:?}", out.said());
     }
 
     /// A cache written with holes arrives without its sentinel. Here a
