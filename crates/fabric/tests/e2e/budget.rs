@@ -464,6 +464,15 @@ impl Fixture {
                 self.b
                     .ok(&["job", "resume", job, "--headless", "--prompt", "next"])
             })?;
+            // New work on b too, before the pull suspends it there. A capture
+            // dates its commits to the second, so one of the same tree in
+            // the same second as the last makes the same commits and an
+            // empty bundle, which every later restore skips: the git counts
+            // would then depend on how fast the ops before it ran.
+            fs::write(
+                self.env.work(job).join("notes.txt"),
+                format!("untracked, run {}, after the turn on b\n", self.runs),
+            )?;
             batch.time(&op("pull"), counter, || {
                 self.a
                     .ok(&["job", "resume", job, "--headless", "--prompt", "back"])
