@@ -2465,3 +2465,53 @@ fn a_config_value_the_projection_refuses_is_named() {
             .any(|(carried, _)| *carried == key)
     );
 }
+
+/// Capture reads the config once, as one listing of every file git reads
+/// (issue #26). A file the repository's config includes counts as git
+/// counts it, for the exclude file and for `core.autocrlf`, but only the
+/// repository's own config file travels, as `git config --local` reads it.
+#[test]
+fn a_config_file_the_repository_includes_counts_but_does_not_travel() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    let g = git(&root);
+    g.run(&["config", "include.path", "extra.cfg"]).unwrap();
+    fs::write(
+        g.git_path("extra.cfg").unwrap(),
+        "[core]\n\texcludesFile = only-here.ignore\n\tautocrlf = true\n\
+         [remote \"upstream\"]\n\turl = https://example.com/u.git\n",
+    )
+    .unwrap();
+    fs::write(root.join("only-here.ignore"), "notes.local\n").unwrap();
+    fs::write(root.join("notes.local"), "ignored by the included file\n").unwrap();
+    fs::write(root.join("crlf.txt"), "one\r\ntwo\r\n").unwrap();
+
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let in_w = worktree_paths(&root, &manifest).unwrap();
+    assert_eq!(in_w, ["a", "crlf.txt", "only-here.ignore"]);
+    assert!(
+        manifest
+            .files
+            .iter()
+            .any(|entry| entry.rel_path.as_str() == "notes.local")
+    );
+    let carried: Vec<String> = (manifest.git.as_ref().unwrap().config.iter())
+        .map(|(key, _)| key.to_string())
+        .collect();
+    assert!(
+        !carried.iter().any(|key| key.starts_with("remote.")),
+        "{carried:?}"
+    );
+
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    assert_eq!(
+        fs::read(target.join("crlf.txt")).unwrap(),
+        b"one\r\ntwo\r\n",
+        "core.autocrlf from the included file was not read"
+    );
+}

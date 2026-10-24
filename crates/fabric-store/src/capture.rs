@@ -1222,10 +1222,223 @@ struct GitCapture<'a> {
     policy: &'a IgnorePolicy,
     job_id: JobId,
     scratch: PathBuf,
+    /// Where git keeps the repository's parts.
+    layout: Layout,
+    /// The config git reads for the repository.
+    config: RepoConfig,
     /// The user's own exclude rules, which every listing and `W` start from.
     user_excludes: String,
     /// A file holding `user_excludes`, passed to every listing as `core.excludesFile`.
     listing_excludes: TempFile,
+}
+
+/// The files in the git directory that mark an operation in progress, with the reason each gives.
+const BUSY_MARKERS: [(&str, BusyReason); 6] = [
+    ("rebase-merge", BusyReason::Rebase),
+    ("rebase-apply", BusyReason::Rebase),
+    ("MERGE_HEAD", BusyReason::Merge),
+    ("CHERRY_PICK_HEAD", BusyReason::CherryPick),
+    ("REVERT_HEAD", BusyReason::Revert),
+    ("BISECT_LOG", BusyReason::Bisect),
+];
+
+/// Where git keeps the parts of a repository capture reads, from one `rev-parse`.
+#[derive(Debug)]
+struct Layout {
+    /// The top level of the work tree.
+    toplevel: PathBuf,
+    /// The git directory of this work tree.
+    git_dir: PathBuf,
+    /// The git directory every work tree of the repository shares.
+    common_dir: PathBuf,
+    /// True when the repository is a shallow clone.
+    shallow: bool,
+    /// The path of each of `BUSY_MARKERS`, in that order.
+    busy: Vec<PathBuf>,
+    /// The index.
+    index: PathBuf,
+    /// The repository's `info/exclude`.
+    info_exclude: PathBuf,
+    /// The repository's own config file.
+    config: PathBuf,
+}
+
+impl Layout {
+    /// The `rev-parse` arguments whose answers, one per line in this order, `Layout::parse` reads.
+    ///
+    /// `--show-toplevel` comes last: it is the one answer that is not a
+    /// path inside the git directory, and a newline in the root's name
+    /// would otherwise shift every answer after it.
+    fn args() -> Vec<&'static str> {
+        let mut args = vec![
+            "rev-parse",
+            "--git-path",
+            ".",
+            "--git-common-dir",
+            "--is-shallow-repository",
+        ];
+        for (marker, _) in BUSY_MARKERS {
+            args.extend(["--git-path", marker]);
+        }
+        args.extend([
+            "--git-path",
+            "index",
+            "--git-path",
+            "info/exclude",
+            "--git-path",
+            "config",
+            "--show-toplevel",
+        ]);
+        args
+    }
+
+    /// Reads the answers to `Layout::args`, resolving a relative path against `root`, where git ran.
+    fn parse(root: &Path, out: &[u8]) -> Result<Layout, CaptureError> {
+        let text = Git::text("rev-parse answers", out)?;
+        let text = text.strip_suffix('\n').unwrap_or(text);
+        let bad = || GitError::Parse {
+            what: "rev-parse answers",
+            text: text.to_owned(),
+        };
+        let mut lines = text.splitn(BUSY_MARKERS.len() + 7, '\n');
+        let mut next = || lines.next().ok_or_else(bad);
+        let git_dir = root.join(next()?);
+        let common_dir = root.join(next()?);
+        let shallow = next()? == "true";
+        let mut busy = Vec::with_capacity(BUSY_MARKERS.len());
+        for _ in BUSY_MARKERS {
+            busy.push(root.join(next()?));
+        }
+        let index = root.join(next()?);
+        let info_exclude = root.join(next()?);
+        let config = root.join(next()?);
+        let toplevel = PathBuf::from(next()?);
+        Ok(Layout {
+            toplevel,
+            git_dir,
+            common_dir,
+            shallow,
+            busy,
+            index,
+            info_exclude,
+            config,
+        })
+    }
+}
+
+/// One entry of the config git reads for a repository.
+#[derive(Debug)]
+struct ConfigEntry {
+    /// `local`, `worktree` or `command`; the global and system files are not read.
+    scope: String,
+    /// Where git read it, such as `file:.git/config`.
+    origin: String,
+    /// The key as git lists it: section and name in lower case.
+    key: String,
+    /// The value; `None` for a key written without `=`.
+    value: Option<String>,
+}
+
+/// Every entry of the config git reads for a repository, includes too, in
+/// the order git reads them, from one `git config --list`.
+#[derive(Debug, Default)]
+struct RepoConfig(Vec<ConfigEntry>);
+
+impl RepoConfig {
+    /// The arguments that list the config with each entry's scope and origin.
+    const ARGS: [&str; 5] = ["config", "-z", "--list", "--show-scope", "--show-origin"];
+
+    /// Reads the NUL-separated scope, origin and `key\nvalue` of each entry.
+    fn parse(out: &[u8]) -> Result<RepoConfig, CaptureError> {
+        let fields: Vec<&[u8]> = out.split(|b| *b == 0).collect();
+        let mut entries = Vec::new();
+        // The output ends with a NUL, so the last field is empty.
+        for triple in fields.chunks(3).filter(|chunk| chunk != &[&b""[..]]) {
+            let [scope, origin, item] = triple else {
+                return Err(GitError::Parse {
+                    what: "config entry",
+                    text: String::from_utf8_lossy(out).into_owned(),
+                }
+                .into());
+            };
+            let item = Git::text("config entry", item)?;
+            let (key, value) = match item.split_once('\n') {
+                Some((key, value)) => (key, Some(value.to_owned())),
+                None => (item, None),
+            };
+            entries.push(ConfigEntry {
+                scope: Git::text("config scope", scope)?.to_owned(),
+                // Only compared with the repository's own config file,
+                // whose path capture has already read as UTF-8.
+                origin: String::from_utf8_lossy(origin).into_owned(),
+                key: key.to_owned(),
+                value,
+            });
+        }
+        Ok(RepoConfig(entries))
+    }
+
+    /// The last entry of `key`, lower case, which is the one git uses.
+    fn last(&self, key: &str) -> Option<&ConfigEntry> {
+        self.0.iter().rev().find(|entry| entry.key == key)
+    }
+
+    /// True when `core.autocrlf` is on, as `git config --get` reads it.
+    fn autocrlf(&self) -> bool {
+        self.last("core.autocrlf").is_some_and(|entry| {
+            !matches!(
+                entry.value.as_deref().unwrap_or("").trim(),
+                "false" | "no" | "off" | "0" | ""
+            )
+        })
+    }
+
+    /// Names every filter driver whose clean step `git add` runs here: one
+    /// with a non-empty `clean` or `process` command, includes too. An
+    /// attribute that names any other driver leaves the bytes as they are.
+    fn clean_filters(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for entry in &self.0 {
+            // A key written without `=` is true, which is not empty.
+            if entry.value.as_deref() == Some("") {
+                continue;
+            }
+            let name = entry
+                .key
+                .strip_prefix("filter.")
+                .and_then(|rest| {
+                    rest.strip_suffix(".clean")
+                        .or_else(|| rest.strip_suffix(".process"))
+                })
+                .unwrap_or("");
+            if !name.is_empty() {
+                names.push(name.to_owned());
+            }
+        }
+        names
+    }
+
+    /// The entries of the repository's own config file, `file`, without
+    /// what its includes add, as `git config --list --local` lists them.
+    fn local<'c>(
+        &'c self,
+        root: &Path,
+        file: &Path,
+    ) -> impl Iterator<Item = &'c ConfigEntry> + use<'c> {
+        let real = fs::canonicalize(file).ok();
+        let file = file.to_owned();
+        let root = root.to_owned();
+        let mut seen: HashMap<&'c str, bool> = HashMap::new();
+        self.0.iter().filter(move |entry| {
+            entry.scope == "local"
+                && *seen.entry(entry.origin.as_str()).or_insert_with(|| {
+                    entry.origin.strip_prefix("file:").is_some_and(|path| {
+                        let path = root.join(path);
+                        path == file || (real.is_some() && fs::canonicalize(&path).ok() == real)
+                    })
+                })
+        })
+    }
 }
 
 /// Reads the exclude file git would use for this repository under the sandbox of `crate::git`.
@@ -1233,13 +1446,23 @@ struct GitCapture<'a> {
 /// That is `core.excludesFile` from the repository's own config, or else
 /// `$XDG_CONFIG_HOME/git/ignore`, or else `$HOME/.config/git/ignore`; git
 /// reads the default even when the global config is not read. A missing
-/// file is no rules.
-fn user_excludes(git: &Git, root: &Path) -> Result<String, CaptureError> {
-    let configured = git.output(&["config", "--path", "--get", "core.excludesFile"], &[])?;
-    let path = if configured.status.success() {
-        let text = String::from_utf8_lossy(&configured.stdout)
-            .trim()
-            .to_owned();
+/// file is no rules. A configured value git expands as a path, one that
+/// starts with `~` or `%(`, or one with no value, is read through git's
+/// own `--path`.
+fn user_excludes(git: &Git, root: &Path, config: &RepoConfig) -> Result<String, CaptureError> {
+    let configured = match config.last("core.excludesfile").map(|e| e.value.as_deref()) {
+        Some(Some(value)) if !value.starts_with('~') && !value.starts_with("%(") => {
+            Some(value.trim().to_owned())
+        }
+        Some(_) => {
+            let out = git.output(&["config", "--path", "--get", "core.excludesFile"], &[])?;
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        }
+        None => None,
+    };
+    let path = if let Some(text) = configured {
         Some(root.join(text))
     } else {
         let xdg = std::env::var_os("XDG_CONFIG_HOME")
@@ -1266,17 +1489,84 @@ fn user_excludes(git: &Git, root: &Path) -> Result<String, CaptureError> {
     }
 }
 
-/// A regular file in an index, as `ls-files -s` lists it.
+/// The records of an `ls-files -v` listing, each its tag and its path, in git's order.
+///
+/// An index entry is tagged `H`, `S` when skip-worktree is set and `M`
+/// when it is unmerged, in lower case when assume-unchanged is set too; an
+/// untracked path is tagged `?`, and an untracked nested repository is
+/// listed as its directory with a trailing slash.
+struct PathListing(Vec<(String, String)>);
+
+impl PathListing {
+    fn parse(out: &[u8]) -> Result<PathListing, CaptureError> {
+        let mut records = Vec::new();
+        for record in Git::records(out) {
+            let text = Git::text("index entry", record)?;
+            let (tag, path) = text.split_once(' ').unwrap_or((text, ""));
+            records.push((tag.to_owned(), path.to_owned()));
+        }
+        Ok(PathListing(records))
+    }
+
+    /// Every record, untracked ones too.
+    fn records(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0
+            .iter()
+            .map(|(tag, path)| (tag.as_str(), path.as_str()))
+    }
+
+    /// The index's entries.
+    fn index(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.records().filter(|(tag, _)| *tag != "?")
+    }
+
+    /// The untracked paths and nested repositories.
+    fn untracked(&self) -> impl Iterator<Item = &str> {
+        self.records()
+            .filter(|(tag, _)| *tag == "?")
+            .map(|(_, path)| path)
+    }
+}
+
+/// The flag an `ls-files -v` tag marks that commits `I` and `W` cannot record.
+fn index_flag(tag: &str) -> Option<IndexFlag> {
+    match tag {
+        "S" | "s" => Some(IndexFlag::SkipWorktree),
+        "h" => Some(IndexFlag::AssumeUnchanged),
+        _ => None,
+    }
+}
+
+/// Splits untracked records into paths and, apart from them, nested repositories, which git lists with a trailing slash.
+fn split_untracked<'r>(
+    records: impl Iterator<Item = Result<&'r str, GitError>>,
+) -> Result<(Vec<RelPath>, Vec<RelPath>), CaptureError> {
+    let mut paths = Vec::new();
+    let mut nested = Vec::new();
+    for text in records {
+        let text = text?;
+        match text.strip_suffix('/') {
+            Some(dir) => nested.push(rel_path(dir)?),
+            None => paths.push(rel_path(text)?),
+        }
+    }
+    Ok((paths, nested))
+}
+
+/// An entry of an index, as `ls-files -s` lists it.
 struct IndexBlob {
-    /// `100644` or `100755`.
+    /// `100644` or `100755` for a regular file.
     mode: String,
-    /// The blob id the index holds.
+    /// The object id the index holds.
     oid: String,
     /// The path, relative to the root.
     path: String,
     /// True when a `filter` attribute applies to the path.
     filtered: bool,
 }
+
+/// The mtime of every path of `W`, sorted by path, and an entry for every directory of `W`.
+type WorktreeMeta = (Vec<(RelPath, u64)>, Vec<Entry>);
 
 /// What the git half saw of the work tree, checked again once every file is stored.
 struct GitSeen {
@@ -1366,43 +1656,45 @@ impl GitCapture<'_> {
         )
     }
 
-    fn refuse_bad_states(&self) -> Result<(), CaptureError> {
-        let git_dir = fs::canonicalize(self.git.git_path(".")?).ok();
-        let common = self.git.run_text(&["rev-parse", "--git-common-dir"])?;
-        let common_dir = fs::canonicalize(self.root.join(common)).ok();
+    /// Refuses a repository whose state a snapshot cannot hold, and returns its tracked and untracked paths.
+    fn refuse_bad_states(&self) -> Result<PathListing, CaptureError> {
+        let layout = &self.layout;
+        let git_dir = fs::canonicalize(&layout.git_dir).ok();
+        let common_dir = fs::canonicalize(&layout.common_dir).ok();
         if git_dir != common_dir {
             return Err(CaptureError::GitLinkedWorktree {
                 root: self.root.to_owned(),
                 common_dir: common_dir.unwrap_or_default(),
             });
         }
-        for (marker, reason) in [
-            ("rebase-merge", BusyReason::Rebase),
-            ("rebase-apply", BusyReason::Rebase),
-            ("MERGE_HEAD", BusyReason::Merge),
-            ("CHERRY_PICK_HEAD", BusyReason::CherryPick),
-            ("REVERT_HEAD", BusyReason::Revert),
-            ("BISECT_LOG", BusyReason::Bisect),
-        ] {
-            if self.git.git_path(marker)?.exists() {
+        for (marker, (_, reason)) in layout.busy.iter().zip(BUSY_MARKERS) {
+            if marker.exists() {
                 return Err(CaptureError::GitBusy { reason });
             }
         }
         // A shallow clone's boundary commits name parents it does not
         // have; restored without `.git/shallow`, the repository fails fsck.
-        if self
-            .git
-            .run_text(&["rev-parse", "--is-shallow-repository"])?
-            == "true"
-        {
+        if layout.shallow {
             return Err(CaptureError::GitShallow);
         }
-        if !self.git.run(&["ls-files", "-u", "-z"])?.is_empty() {
+        let listing = self.paths()?;
+        if listing
+            .index()
+            .any(|(tag, _)| tag.eq_ignore_ascii_case("M"))
+        {
             return Err(CaptureError::GitBusy {
                 reason: BusyReason::Conflicts,
             });
         }
-        self.refuse_flagged_entries(&[])?;
+        if let Some((path, flag)) = listing
+            .index()
+            .find_map(|(tag, path)| index_flag(tag).map(|flag| (path, flag)))
+        {
+            return Err(CaptureError::GitIndexFlag {
+                path: rel_path(path)?,
+                flag,
+            });
+        }
         // `--ignore-submodules=none` overrides a `submodule.<name>.ignore`
         // in the config or in .gitmodules, which would hide the local work.
         let status = self.git.run(&[
@@ -1439,27 +1731,38 @@ impl GitCapture<'_> {
                 return Err(CaptureError::GitSubmoduleDirty { path: path()? });
             }
         }
-        self.refuse_filters()
+        self.refuse_filters(&listing)?;
+        Ok(listing)
     }
 
-    /// Refuses a path whose bytes `git add -A` would change: one under the
-    /// LFS filter, or under a clean filter the repository configures.
-    fn refuse_filters(&self) -> Result<(), CaptureError> {
-        // git resolves the attributes itself, from every .gitattributes,
-        // tracked or not, and from .git/info/attributes.
-        let paths = self.git.run(&[
+    /// Lists the index's entries and the untracked, not ignored paths, each with its `ls-files -v` tag.
+    fn paths(&self) -> Result<PathListing, CaptureError> {
+        PathListing::parse(&self.git.run(&[
             "-c",
             &self.excludes_flag(),
             "ls-files",
             "-z",
+            "-v",
             "--cached",
             "--others",
             "--exclude-standard",
-        ])?;
+        ])?)
+    }
+
+    /// Refuses a path whose bytes `git add -A` would change: one under the
+    /// LFS filter, or under a clean filter the repository configures.
+    fn refuse_filters(&self, listing: &PathListing) -> Result<(), CaptureError> {
+        // git resolves the attributes itself, from every .gitattributes,
+        // tracked or not, and from .git/info/attributes.
+        let mut paths = Vec::new();
+        for (_, path) in listing.records() {
+            paths.extend_from_slice(path.as_bytes());
+            paths.push(0);
+        }
         let attrs =
             self.git
                 .run_stdin_env(&["check-attr", "-z", "--stdin", "filter"], &[], &paths)?;
-        let drivers = self.clean_filters()?;
+        let drivers = self.config.clean_filters();
         let fields: Vec<&[u8]> = attrs.split(|b| *b == 0).collect();
         for triple in fields.chunks_exact(3) {
             if triple[2] == b"lfs" {
@@ -1487,65 +1790,18 @@ impl GitCapture<'_> {
         &self,
         env: &[(&str, &OsStr)],
     ) -> Result<BTreeSet<String>, CaptureError> {
-        // `ls-files -v` tags a skip-worktree entry `S` and an
-        // assume-unchanged one in lower case.
         let entries = self.git.run_env(&["ls-files", "-v", "-z"], env)?;
         let mut paths = BTreeSet::new();
-        for record in Git::records(&entries) {
-            let text = Git::text("index entry", record)?;
-            let (tag, path) = text.split_once(' ').unwrap_or((text, ""));
-            let flag = match tag {
-                "S" | "s" => IndexFlag::SkipWorktree,
-                "h" => IndexFlag::AssumeUnchanged,
-                _ => {
-                    paths.insert(path.to_owned());
-                    continue;
-                }
-            };
-            return Err(CaptureError::GitIndexFlag {
-                path: rel_path(path)?,
-                flag,
-            });
+        for (tag, path) in PathListing::parse(&entries)?.records() {
+            if let Some(flag) = index_flag(tag) {
+                return Err(CaptureError::GitIndexFlag {
+                    path: rel_path(path)?,
+                    flag,
+                });
+            }
+            paths.insert(path.to_owned());
         }
         Ok(paths)
-    }
-
-    /// Names every filter driver whose clean step `git add` runs here: one
-    /// with a non-empty `clean` or `process` command in the config git reads
-    /// for this repository, includes too. An attribute that names any other
-    /// driver leaves the bytes as they are.
-    fn clean_filters(&self) -> Result<Vec<String>, CaptureError> {
-        let args = [
-            "config",
-            "-z",
-            "--get-regexp",
-            r"^filter\..*\.(clean|process)$",
-        ];
-        let out = self.git.output(&args, &[])?;
-        // `--get-regexp` exits 1 when no key matches.
-        if out.status.code() == Some(1) && out.stdout.is_empty() {
-            return Ok(Vec::new());
-        }
-        let out = Git::checked(&args, out)?;
-        let mut names = Vec::new();
-        for record in Git::records(&out) {
-            let text = Git::text("config record", record)?;
-            let (key, value) = text.split_once('\n').unwrap_or((text, "true"));
-            if value.is_empty() {
-                continue;
-            }
-            let name = key
-                .strip_prefix("filter.")
-                .and_then(|rest| {
-                    rest.strip_suffix(".clean")
-                        .or_else(|| rest.strip_suffix(".process"))
-                })
-                .unwrap_or("");
-            if !name.is_empty() {
-                names.push(name.to_owned());
-            }
-        }
-        Ok(names)
     }
 
     /// Lists untracked, not ignored paths, and apart from them the untracked nested repositories.
@@ -1558,24 +1814,7 @@ impl GitCapture<'_> {
             "--exclude-standard",
             "-z",
         ])?;
-        let mut paths = Vec::new();
-        let mut nested = Vec::new();
-        for record in Git::records(&out) {
-            let text = Git::text("untracked path", record)?;
-            match text.strip_suffix('/') {
-                Some(dir) => nested.push(rel_path(dir)?),
-                None => paths.push(rel_path(text)?),
-            }
-        }
-        Ok((paths, nested))
-    }
-
-    /// Lists tracked paths.
-    fn tracked(&self) -> Result<Vec<RelPath>, CaptureError> {
-        let out = self.git.run(&["ls-files", "-z"])?;
-        Git::records(&out)
-            .map(|r| rel_path(Git::text("tracked path", r)?))
-            .collect()
+        split_untracked(Git::records(&out).map(|r| Git::text("untracked path", r)))
     }
 
     /// Lists ignored paths with their metadata; a nested repository is reported, not listed.
@@ -1625,7 +1864,7 @@ impl GitCapture<'_> {
     /// set one between that probe and the copy. An intent-to-add entry is
     /// one the copy holds and its written tree leaves out.
     fn index_commit(&self, head: Option<&GitOid>) -> Result<(GitOid, String), CaptureError> {
-        let index = self.git.git_path("index")?;
+        let index = &self.layout.index;
         let lock = index.with_extension("lock");
         let copy = TempFile::in_dir(&self.scratch);
         // The copy counts only if no lock appeared and the index was not
@@ -1645,14 +1884,14 @@ impl GitCapture<'_> {
         let mut tries = 0;
         loop {
             if !lock.exists() {
-                let before = stamp(&index)?;
-                match fs::copy(&index, copy.path()) {
+                let before = stamp(index)?;
+                match fs::copy(index, copy.path()) {
                     Ok(_) => {}
                     // No index yet: write-tree on a missing index file writes the empty tree.
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(io_err(&index, e)),
+                    Err(e) => return Err(io_err(index, e)),
                 }
-                if !lock.exists() && stamp(&index)? == before {
+                if !lock.exists() && stamp(index)? == before {
                     break;
                 }
             }
@@ -1735,9 +1974,9 @@ impl GitCapture<'_> {
             .run_env(&["-c", &excludes_flag, "add", "-A", "--"], &env)?;
         let mut removed = Vec::new();
         let mut added = HashSet::new();
-        let listing = self.git.run_env(&["ls-files", "-z"], &env)?;
-        for record in Git::records(&listing) {
-            let rel = rel_path(Git::text("index path", record)?)?;
+        let mut entries = self.staged(&env)?;
+        for entry in &entries {
+            let rel = rel_path(&entry.path)?;
             if !tracked.contains(&rel) && leave_out(&rel) {
                 removed.push(rel);
             } else {
@@ -1753,6 +1992,8 @@ impl GitCapture<'_> {
             input.extend_from_slice(rel.as_str().as_bytes());
             input.push(0);
         }
+        // The listing above still describes the index unless one of these ran.
+        let relist = !input.is_empty() || !removed.is_empty();
         if !input.is_empty() {
             self.git.run_stdin_env(
                 &["update-index", "--add", "--remove", "-z", "--stdin"],
@@ -1772,7 +2013,10 @@ impl GitCapture<'_> {
                 &input,
             )?;
         }
-        let filtered = self.keep_worktree_bytes(&env)?;
+        if relist {
+            entries = self.staged(&env)?;
+        }
+        let filtered = self.keep_worktree_bytes(&env, entries)?;
         let tree = self.git.run_text_env(&["write-tree"], &env)?;
         let commit = self.commit_tree(&tree, head, Some(index_commit), "fabric worktree")?;
         Ok((commit, removed, filtered))
@@ -1791,8 +2035,12 @@ impl GitCapture<'_> {
     /// the path is named for the report. `refuse_filters` has already
     /// refused a configured clean filter, so this guard holds only if one
     /// appears while capture runs.
-    fn keep_worktree_bytes(&self, env: &[(&str, &OsStr)]) -> Result<Vec<RelPath>, CaptureError> {
-        let files = self.convertible_files(env)?;
+    fn keep_worktree_bytes(
+        &self,
+        env: &[(&str, &OsStr)],
+        entries: Vec<IndexBlob>,
+    ) -> Result<Vec<RelPath>, CaptureError> {
+        let files = self.convertible_files(env, entries)?;
         let mut changed: Vec<&IndexBlob> = Vec::new();
         let mut named = Vec::new();
         for batch in arg_batches(&files, |file| file.path.len()) {
@@ -1823,21 +2071,10 @@ impl GitCapture<'_> {
         Ok(named)
     }
 
-    /// Lists the regular files of the index `env` names that git can convert on check-in.
-    ///
-    /// Git converts nothing on check-in unless `core.autocrlf` is on or one
-    /// of `ATTRS` applies to the path, so only those paths are worth hashing.
-    fn convertible_files(&self, env: &[(&str, &OsStr)]) -> Result<Vec<IndexBlob>, CaptureError> {
-        const ATTRS: [&str; 6] = [
-            "filter",
-            "ident",
-            "working-tree-encoding",
-            "text",
-            "eol",
-            "crlf",
-        ];
+    /// Lists the entries of the index `env` names, as `ls-files -s` does.
+    fn staged(&self, env: &[(&str, &OsStr)]) -> Result<Vec<IndexBlob>, CaptureError> {
         let listing = self.git.run_env(&["ls-files", "-s", "-z"], env)?;
-        let mut files = Vec::new();
+        let mut entries = Vec::new();
         for record in Git::records(&listing) {
             let text = Git::text("index entry", record)?;
             let bad = || GitError::Parse {
@@ -1849,26 +2086,41 @@ impl GitCapture<'_> {
             let (Some(mode), Some(oid)) = (fields.next(), fields.next()) else {
                 return Err(bad().into());
             };
-            if mode == "100644" || mode == "100755" {
-                files.push(IndexBlob {
-                    mode: mode.to_owned(),
-                    oid: oid.to_owned(),
-                    path: path.to_owned(),
-                    filtered: false,
-                });
-            }
+            entries.push(IndexBlob {
+                mode: mode.to_owned(),
+                oid: oid.to_owned(),
+                path: path.to_owned(),
+                filtered: false,
+            });
         }
+        Ok(entries)
+    }
+
+    /// Picks the regular files of `entries`, the index `env` names, that git can convert on check-in.
+    ///
+    /// Git converts nothing on check-in unless `core.autocrlf` is on or one
+    /// of `ATTRS` applies to the path, so only those paths are worth hashing.
+    fn convertible_files(
+        &self,
+        env: &[(&str, &OsStr)],
+        entries: Vec<IndexBlob>,
+    ) -> Result<Vec<IndexBlob>, CaptureError> {
+        const ATTRS: [&str; 6] = [
+            "filter",
+            "ident",
+            "working-tree-encoding",
+            "text",
+            "eol",
+            "crlf",
+        ];
+        let mut files: Vec<IndexBlob> = entries
+            .into_iter()
+            .filter(|entry| entry.mode == "100644" || entry.mode == "100755")
+            .collect();
         if files.is_empty() {
             return Ok(files);
         }
-        let autocrlf = self
-            .git
-            .output(&["config", "--get", "core.autocrlf"], env)?;
-        let autocrlf = autocrlf.status.success()
-            && !matches!(
-                String::from_utf8_lossy(&autocrlf.stdout).trim(),
-                "false" | "no" | "off" | "0" | ""
-            );
+        let autocrlf = self.config.autocrlf();
         let mut input = Vec::new();
         for file in &files {
             input.extend_from_slice(file.path.as_bytes());
@@ -1979,20 +2231,16 @@ impl GitCapture<'_> {
         let path_text = path.path().to_string_lossy().into_owned();
         if let BundlePlan::Incremental { base, tips } = plan {
             let base = *base;
-            let mut args = vec!["bundle", "create", &path_text, "--all", "--not"];
-            let mut existing = Vec::new();
-            for tip in tips {
-                let peeled = format!("{}^{{commit}}", tip.as_str());
-                if self
-                    .git
-                    .succeeds(&["rev-parse", "--verify", "-q", &peeled])?
-                {
-                    existing.push(tip.as_str());
-                }
-            }
-            let all_exist = existing.len() == tips.len();
-            if all_exist {
-                args.extend(existing);
+            let tips: BTreeSet<&str> = tips.iter().map(GitOid::as_str).collect();
+            // One `rev-parse` peels every tip, and fails when one is gone
+            // from the repository or is not a commit.
+            let peeled: Vec<String> = tips.iter().map(|tip| format!("{tip}^{{commit}}")).collect();
+            let mut peel = vec!["rev-parse"];
+            peel.extend(peeled.iter().map(String::as_str));
+            peel.push("--");
+            if self.git.succeeds(&peel)? {
+                let mut args = vec!["bundle", "create", &path_text, "--all", "--not"];
+                args.extend(tips);
                 let out = self.git.output(&args, &[])?;
                 if out.status.success() && self.git.succeeds(&["bundle", "verify", &path_text])? {
                     return Ok(BuiltBundle::Incremental { file: path, base });
@@ -2009,34 +2257,36 @@ impl GitCapture<'_> {
         Ok(BuiltBundle::Full(path))
     }
 
-    /// Pins the stash entries, makes the bundle, and returns it with the refs and `HEAD` it is proven to hold and the stash entries.
+    /// Points the job's refs at `worktree` and at the stash entries, makes
+    /// the bundle, and returns it with the refs and `HEAD` it is proven to
+    /// hold and the stash entries.
     ///
-    /// A stash pushed or dropped after the pin would leave refs that no
-    /// longer match the stash list, and restore would rebuild another one.
+    /// The refs and `HEAD` are read once, before the job's refs change, and
+    /// the view the bundle is checked against is that reading with the
+    /// changes `pin_refs` made. A stash pushed or dropped after the pin
+    /// would leave refs that no longer match the stash list, and restore
+    /// would rebuild another one.
     fn bundle_with_stash(
         &self,
         plan: &BundlePlan,
+        worktree: &GitOid,
     ) -> Result<(BuiltBundle, RefView, Vec<GitOid>), CaptureError> {
-        let stashes = self.pin_stash()?;
-        let (built, view) = self.bundle_with_refs(plan)?;
-        if self.stash_entries()? != stashes {
+        let read = self.ref_view()?;
+        let stashes = self.stash_entries(&read)?;
+        let view = self.pin_refs(read, worktree, &stashes)?;
+        let built = self.bundle(plan)?;
+        let later = self.ref_view()?;
+        if let Some(moved) = view.moved_in(&later) {
+            return Err(CaptureError::RefsMoved { moved });
+        }
+        self.confirm_bundle(&built, &view, plan.tips())?;
+        if self.stash_entries(&later)? != stashes {
             let stash = RefName::parse("refs/stash").map_err(GitError::from)?;
             return Err(CaptureError::RefsMoved {
                 moved: MovedRef::Ref(stash),
             });
         }
         Ok((built, view, stashes))
-    }
-
-    /// Makes the bundle and returns it with the refs and `HEAD` it is proven to hold.
-    fn bundle_with_refs(&self, plan: &BundlePlan) -> Result<(BuiltBundle, RefView), CaptureError> {
-        let view = self.ref_view()?;
-        let built = self.bundle(plan)?;
-        if let Some(moved) = view.moved_in(&self.ref_view()?) {
-            return Err(CaptureError::RefsMoved { moved });
-        }
-        self.confirm_bundle(&built, &view, plan.tips())?;
-        Ok((built, view))
     }
 
     /// Proves that the bundle chain holds every object `view` names.
@@ -2130,24 +2380,36 @@ impl GitCapture<'_> {
         stash_prefix(self.job_id)
     }
 
-    /// Lists the stash entries, newest first, so `stash@{n}` is at index `n`.
-    fn stash_entries(&self) -> Result<Vec<GitOid>, CaptureError> {
-        if !self
-            .git
-            .succeeds(&["rev-parse", "--verify", "-q", "refs/stash"])?
+    /// Lists the stash entries, newest first, so `stash@{n}` is at index
+    /// `n`; none when `view` holds no `refs/stash`.
+    fn stash_entries(&self, view: &RefView) -> Result<Vec<GitOid>, CaptureError> {
+        if !view
+            .refs
+            .iter()
+            .any(|(name, _)| name.as_str() == "refs/stash")
         {
             return Ok(Vec::new());
         }
-        let out = self.git.run_text(&[
+        let args = [
             "log",
             "--walk-reflogs",
             "--no-show-signature",
             "--format=%H",
             "refs/stash",
             "--",
-        ])?;
+        ];
+        let out = self.git.output(&args, &[])?;
+        // The stash may have been dropped since `view` was read.
+        if !out.status.success()
+            && !self
+                .git
+                .succeeds(&["rev-parse", "--verify", "-q", "refs/stash"])?
+        {
+            return Ok(Vec::new());
+        }
+        let out = Git::checked(&args, out)?;
         let mut entries = Vec::new();
-        for line in out.lines() {
+        for line in Git::text("stash entries", &out)?.lines() {
             entries.push(GitOid::parse(line).map_err(GitError::from)?);
         }
         if entries.is_empty() {
@@ -2158,60 +2420,96 @@ impl GitCapture<'_> {
         Ok(entries)
     }
 
-    /// Points a ref under `stash_prefix` at every stash entry older than `refs/stash` and returns every entry.
+    /// Points the snapshot ref at `worktree` and a ref under `stash_prefix`
+    /// at every stash entry older than `refs/stash`, deletes the job's
+    /// other refs under both prefixes, and returns `read` as those changes
+    /// leave it.
     ///
-    /// A bundle carries refs, not reflogs, so without these refs only
+    /// One `update-ref --stdin` transaction makes every change, so the
+    /// refs it names end exactly as the returned view says. A bundle
+    /// carries refs, not reflogs, so without the stash refs only
     /// `stash@{0}` would travel and every older entry would be lost on
-    /// restore, which rebuilds the stash list from them. The job's earlier
-    /// stash refs are deleted first.
-    fn pin_stash(&self) -> Result<Vec<GitOid>, CaptureError> {
-        let prefix = self.stash_prefix();
-        let out = self
-            .git
-            .run_text(&["for-each-ref", "--format=%(refname)", &prefix])?;
-        for name in out.lines() {
-            self.git.run(&["update-ref", "-d", name])?;
+    /// restore, which rebuilds the stash list from them. The job's older
+    /// snapshot refs go, so they never enter `GitState.refs`.
+    fn pin_refs(
+        &self,
+        read: RefView,
+        worktree: &GitOid,
+        stashes: &[GitOid],
+    ) -> Result<RefView, CaptureError> {
+        let (snap, stash) = (self.snap_prefix(), self.stash_prefix());
+        let ours =
+            |name: &RefName| name.as_str().starts_with(&snap) || name.as_str().starts_with(&stash);
+        let mut pins = BTreeMap::new();
+        pins.insert(format!("{snap}{}", worktree.as_str()), worktree.clone());
+        for (n, oid) in stashes.iter().enumerate().skip(1) {
+            pins.insert(format!("{stash}{n}"), oid.clone());
         }
-        let entries = self.stash_entries()?;
-        for (n, oid) in entries.iter().enumerate().skip(1) {
-            let name = format!("{prefix}{n}");
-            self.git.run(&["update-ref", &name, oid.as_str()])?;
-        }
-        Ok(entries)
-    }
-
-    fn delete_older_snap_refs(&self, current: &GitOid) -> Result<(), CaptureError> {
-        let prefix = self.snap_prefix();
-        let out = self
-            .git
-            .run_text(&["for-each-ref", "--format=%(refname)", &prefix])?;
-        for name in out.lines() {
-            if name.strip_prefix(&prefix) != Some(current.as_str()) {
-                self.git.run(&["update-ref", "-d", name])?;
+        let mut commands = String::new();
+        for (name, _) in &read.refs {
+            if ours(name) && !pins.contains_key(name.as_str()) {
+                commands.extend(["delete ", name.as_str(), "\n"]);
             }
         }
-        Ok(())
+        for (name, oid) in &pins {
+            commands.extend(["update ", name, " ", oid.as_str(), "\n"]);
+        }
+        self.git
+            .run_stdin_env(&["update-ref", "--stdin"], &[], commands.as_bytes())?;
+        let mut refs: BTreeMap<RefName, GitOid> = read
+            .refs
+            .into_iter()
+            .filter(|(name, _)| !ours(name))
+            .collect();
+        for (name, oid) in pins {
+            refs.insert(RefName::parse(&name).map_err(GitError::from)?, oid);
+        }
+        Ok(RefView {
+            refs: refs.into_iter().collect(),
+            head: read.head,
+        })
     }
 
-    /// Reads the mtime of every path in `W` and reports the links among them that escape the root.
+    /// Reads the mtime of every path in `W`, reporting the links among
+    /// them that escape the root, and the mode and mtime of every
+    /// directory of `W`, from one listing of its tree.
     ///
     /// `before` holds the stamps taken just before `git add -A` built `W`.
     /// A path whose stamp differs now, or that had none, was written while
     /// or after `W` was built, so `W` may hold older bytes than the mtime
     /// recorded here; that fails with `WorkspaceChanged` instead of
     /// publishing a snapshot that loses the edit.
-    fn worktree_mtimes(
+    ///
+    /// A tree holds no metadata of its own directories, so restore would
+    /// make each with the default mode and a fresh mtime, and a directory
+    /// the user kept at 0700 would open up; the directory entries carry
+    /// the source's, as the walk of a plain directory does.
+    fn worktree_meta(
         &self,
         worktree: &GitOid,
         before: &HashMap<RelPath, Stamp>,
         report: &mut CaptureReport,
-    ) -> Result<Vec<(RelPath, u64)>, CaptureError> {
+    ) -> Result<WorktreeMeta, CaptureError> {
         let out = self
             .git
-            .run(&["ls-tree", "-r", "-z", "--name-only", worktree.as_str()])?;
-        let mut mtimes = Vec::new();
+            .run(&["ls-tree", "-r", "-t", "-z", worktree.as_str()])?;
+        let mut paths = Vec::new();
+        let mut trees = Vec::new();
         for record in Git::records(&out) {
-            let rel = rel_path(Git::text("tree path", record)?)?;
+            let text = Git::text("tree entry", record)?;
+            let (meta, path) = text.split_once('\t').ok_or_else(|| GitError::Parse {
+                what: "tree entry",
+                text: text.to_owned(),
+            })?;
+            let rel = rel_path(path)?;
+            if meta.split(' ').nth(1) == Some("tree") {
+                trees.push(rel);
+            } else {
+                paths.push(rel);
+            }
+        }
+        let mut mtimes = Vec::with_capacity(paths.len());
+        for rel in paths {
             let full = self.root.join(rel.as_str());
             let meta = match fs::symlink_metadata(&full) {
                 Ok(meta) => meta,
@@ -2233,31 +2531,9 @@ impl GitCapture<'_> {
             mtimes.push((rel, mtime));
         }
         mtimes.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(mtimes)
-    }
-
-    /// Reads the mode and mtime of every directory of `W`.
-    ///
-    /// A tree holds no metadata of its own directories, so restore would
-    /// make each with the default mode and a fresh mtime, and a directory
-    /// the user kept at 0700 would open up; these entries carry the
-    /// source's, as the walk of a plain directory does.
-    fn worktree_dirs(&self, worktree: &GitOid) -> Result<Vec<Entry>, CaptureError> {
-        let out = self
-            .git
-            .run(&["ls-tree", "-r", "-t", "-z", worktree.as_str()])?;
-        let mut dirs = Vec::new();
-        for record in Git::records(&out) {
-            let text = Git::text("tree entry", record)?;
-            let (meta, path) = text.split_once('\t').ok_or_else(|| GitError::Parse {
-                what: "tree entry",
-                text: text.to_owned(),
-            })?;
-            if meta.split(' ').nth(1) != Some("tree") {
-                continue;
-            }
-            let rel = rel_path(path)?;
-            let full = self.root.join(path);
+        let mut dirs = Vec::with_capacity(trees.len());
+        for rel in trees {
+            let full = self.root.join(rel.as_str());
             let meta = match fs::symlink_metadata(&full) {
                 Ok(meta) if meta.is_dir() => meta,
                 Ok(_) => return Err(CaptureError::WorkspaceChanged { path: rel }),
@@ -2273,7 +2549,7 @@ impl GitCapture<'_> {
                 kind: EntryKind::Dir,
             });
         }
-        Ok(dirs)
+        Ok((mtimes, dirs))
     }
 
     /// Lists the paths of every stash entry in `stashes` and of their index and untracked parents that `denies` names.
@@ -2285,22 +2561,38 @@ impl GitCapture<'_> {
         stashes: &[GitOid],
         denies: &dyn Fn(&RelPath) -> bool,
     ) -> Result<Vec<RelPath>, CaptureError> {
-        let mut found = BTreeSet::new();
-        for (stash, suffix) in stashes
+        if stashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let revs: Vec<String> = stashes
             .iter()
-            .flat_map(|stash| ["", "^2", "^3"].map(|suffix| (stash, suffix)))
-        {
-            let rev = format!("{}{suffix}", stash.as_str());
-            let commit = format!("{rev}^{{commit}}");
-            if !self
-                .git
-                .succeeds(&["rev-parse", "--verify", "-q", &commit])?
-            {
+            .flat_map(|stash| ["", "^2", "^3"].map(|suffix| format!("{}{suffix}", stash.as_str())))
+            .collect();
+        // One `cat-file` answers which of them is a commit: a line per
+        // revision, its id, or the revision and `missing`.
+        let mut input = String::new();
+        for rev in &revs {
+            input.extend([rev.as_str(), "^{commit}\n"]);
+        }
+        let out = self.git.run_stdin_env(
+            &["cat-file", "--batch-check=%(objectname)"],
+            &[],
+            input.as_bytes(),
+        )?;
+        let answers = Git::text("cat-file answers", &out)?;
+        if answers.lines().count() != revs.len() {
+            return Err(GitError::Parse {
+                what: "cat-file answers",
+                text: answers.to_owned(),
+            }
+            .into());
+        }
+        let mut found = BTreeSet::new();
+        for (rev, answer) in revs.iter().zip(answers.lines()) {
+            if answer.ends_with(" missing") {
                 continue;
             }
-            let out = self
-                .git
-                .run(&["ls-tree", "-r", "-z", "--name-only", &rev])?;
+            let out = self.git.run(&["ls-tree", "-r", "-z", "--name-only", rev])?;
             for record in Git::records(&out) {
                 let rel = rel_path(Git::text("stash path", record)?)?;
                 if denies(&rel) {
@@ -2316,19 +2608,13 @@ impl GitCapture<'_> {
     /// A key git holds more than once, such as two `remote.origin.fetch`
     /// refspecs, keeps every value, in the order git lists them: the sort
     /// by key is stable.
-    fn config(
-        &self,
-        report: &mut CaptureReport,
-    ) -> Result<Vec<(GitConfigKey, GitConfigValue)>, CaptureError> {
-        let out = self.git.run(&["config", "--list", "--local", "-z"])?;
+    fn config(&self, report: &mut CaptureReport) -> Vec<(GitConfigKey, GitConfigValue)> {
         let mut config: Vec<(GitConfigKey, GitConfigValue)> = Vec::new();
-        for record in Git::records(&out) {
-            let text = Git::text("config record", record)?;
-            let (key, value) = text.split_once('\n').unwrap_or((text, ""));
-            let Ok(key) = GitConfigKey::parse(key) else {
+        for entry in self.config.local(self.root, &self.layout.config) {
+            let Ok(key) = GitConfigKey::parse(&entry.key) else {
                 continue;
             };
-            let mut value = value.to_owned();
+            let mut value = entry.value.clone().unwrap_or_default();
             if key.is_remote_url()
                 && let Some(stripped) = strip_userinfo(&value)
             {
@@ -2348,7 +2634,7 @@ impl GitCapture<'_> {
             config.push((key, value));
         }
         config.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(config)
+        config
     }
 }
 
@@ -2428,11 +2714,11 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
     let mut carried = carried_by(req.policy, req.root);
     let (git_state, found, settle) = if let Some(repo) = detect_git(req, store.objects().tmp_dir())?
     {
-        repo.refuse_bad_states()?;
+        let listing = repo.refuse_bad_states()?;
         let parent = parent_manifest
             .as_ref()
             .map(|(id, manifest)| (*id, manifest));
-        let (state, mut seen) = capture_git(&mut capturer, &repo, parent)?;
+        let (state, mut seen) = capture_git(&mut capturer, &repo, &listing, parent)?;
         worktree_dirs = std::mem::take(&mut seen.dirs);
         let report = &mut capturer.report;
         let (special, nested) = (report.special_files.len(), report.nested_repositories.len());
@@ -2558,47 +2844,65 @@ fn detect_git<'a>(
     scratch: &Path,
 ) -> Result<Option<GitCapture<'a>>, CaptureError> {
     let git = Git::new(req.root).with_date(req.created_at);
-    let out = git.output(&["rev-parse", "--show-toplevel"], &[])?;
-    if !out.status.success() {
-        // Only "not a repository" makes the root a plain directory. Any
-        // other failure, such as `safe.directory` refusing a repository
-        // another user owns or a config git cannot parse, is surfaced:
-        // capturing the root as plain files would drop its git state.
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-        if stderr.contains("not a git repository") {
-            return Ok(None);
+    GitCapture::open(git, req.root, req.policy, req.job_id, scratch)
+}
+
+impl<'a> GitCapture<'a> {
+    /// Reads where git keeps the repository's parts and its config, and
+    /// returns the capture, or `None` when `root` is not in a repository.
+    fn open(
+        git: Git,
+        root: &'a Path,
+        policy: &'a IgnorePolicy,
+        job_id: JobId,
+        scratch: &Path,
+    ) -> Result<Option<GitCapture<'a>>, CaptureError> {
+        let args = Layout::args();
+        let out = git.output(&args, &[])?;
+        if !out.status.success() {
+            // Only "not a repository" makes the root a plain directory. Any
+            // other failure, such as `safe.directory` refusing a repository
+            // another user owns or a config git cannot parse, is surfaced:
+            // capturing the root as plain files would drop its git state.
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+            if stderr.contains("not a git repository") {
+                return Ok(None);
+            }
+            return Err(GitError::Failed {
+                command: args.join(" "),
+                code: out.status.code(),
+                stderr,
+            }
+            .into());
         }
-        return Err(GitError::Failed {
-            command: "rev-parse --show-toplevel".to_owned(),
-            code: out.status.code(),
-            stderr,
+        let layout = Layout::parse(root, &out.stdout)?;
+        let same = match (fs::canonicalize(&layout.toplevel), fs::canonicalize(root)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        if !same {
+            return Err(CaptureError::NotRepositoryRoot {
+                root: root.to_owned(),
+                toplevel: layout.toplevel,
+            });
         }
-        .into());
+        let config = RepoConfig::parse(&git.run(&RepoConfig::ARGS)?)?;
+        let user_excludes = user_excludes(&git, root, &config)?;
+        let listing_excludes = TempFile::in_dir(scratch);
+        fs::write(listing_excludes.path(), &user_excludes)
+            .map_err(|e| io_err(listing_excludes.path(), e))?;
+        Ok(Some(GitCapture {
+            git,
+            root,
+            policy,
+            job_id,
+            scratch: scratch.to_owned(),
+            layout,
+            config,
+            user_excludes,
+            listing_excludes,
+        }))
     }
-    let toplevel = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-    let same = match (fs::canonicalize(&toplevel), fs::canonicalize(req.root)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    };
-    if !same {
-        return Err(CaptureError::NotRepositoryRoot {
-            root: req.root.to_owned(),
-            toplevel,
-        });
-    }
-    let user_excludes = user_excludes(&git, req.root)?;
-    let listing_excludes = TempFile::in_dir(scratch);
-    fs::write(listing_excludes.path(), &user_excludes)
-        .map_err(|e| io_err(listing_excludes.path(), e))?;
-    Ok(Some(GitCapture {
-        git,
-        root: req.root,
-        policy: req.policy,
-        job_id: req.job_id,
-        scratch: scratch.to_owned(),
-        user_excludes,
-        listing_excludes,
-    }))
 }
 
 /// How many incremental bundles sit between `manifest` and the last full one.
@@ -2651,19 +2955,24 @@ fn untracked_left_out(
     Ok(left_out)
 }
 
+/// Captures the git half from `listing`, the tracked and untracked paths `refuse_bad_states` listed.
 fn capture_git(
     capturer: &mut Capturer<'_>,
     repo: &GitCapture<'_>,
+    listing: &PathListing,
     parent: Option<(SnapshotId, &SnapshotManifest)>,
 ) -> Result<(GitState, GitSeen), CaptureError> {
     let req = capturer.req;
     let policy = req.policy;
-    let (untracked, nested) = repo.untracked()?;
+    let (untracked, nested) = split_untracked(listing.untracked().map(Ok))?;
     capturer
         .report
         .nested_repositories
         .extend(nested.iter().cloned());
-    let tracked: BTreeSet<RelPath> = repo.tracked()?.into_iter().collect();
+    let tracked: BTreeSet<RelPath> = listing
+        .index()
+        .map(|(_, path)| rel_path(path))
+        .collect::<Result<_, _>>()?;
     let tracked_dirs = tracked_dirs(&tracked);
     let left_out = untracked_left_out(capturer, &untracked, &tracked_dirs)?;
     for rel in &tracked {
@@ -2705,24 +3014,20 @@ fn capture_git(
         }
     }
     denied.sort();
-    let snap_ref = format!("{}{}", repo.snap_prefix(), worktree_commit.as_str());
-    repo.git
-        .run(&["update-ref", &snap_ref, worktree_commit.as_str()])?;
-
     let plan = BundlePlan::after(capturer.store, parent)?;
-    repo.delete_older_snap_refs(&worktree_commit)?;
-    let (built, view, stashes) = repo.bundle_with_stash(&plan)?;
+    let (built, view, stashes) = repo.bundle_with_stash(&plan, &worktree_commit)?;
     let (bundle, bundle_base) = capturer.store_bundle(built)?;
     let RefView { refs, head } = view;
     capturer.report.stashed_secrets =
         repo.stashed_secrets(&stashes, &|rel| policy.denies_anywhere(rel))?;
-    let worktree_mtimes = repo.worktree_mtimes(&worktree_commit, &before, &mut capturer.report)?;
-    let config = repo.config(&mut capturer.report)?;
-    let exclude_path = repo.git.git_path("info/exclude")?;
+    let (worktree_mtimes, dirs) =
+        repo.worktree_meta(&worktree_commit, &before, &mut capturer.report)?;
+    let config = repo.config(&mut capturer.report);
+    let exclude_path = &repo.layout.info_exclude;
     // `info/exclude` is git's own file, not workspace content, so a link to
     // a shared exclude file is followed as git follows it.
     let exclude = if exclude_path.is_file() {
-        let bytes = fs::read(&exclude_path).map_err(|e| io_err(&exclude_path, e))?;
+        let bytes = fs::read(exclude_path).map_err(|e| io_err(exclude_path, e))?;
         let stored = capturer.store.objects().put_bytes(&bytes)?;
         capturer.report.new_objects += stored.new_objects;
         capturer.report.new_bytes += stored.new_bytes;
@@ -2747,7 +3052,7 @@ fn capture_git(
         untracked: (untracked, nested),
         left_out,
         tracked_dirs,
-        dirs: repo.worktree_dirs(&state.worktree_commit)?,
+        dirs,
     };
     Ok((state, seen))
 }
@@ -2759,6 +3064,15 @@ mod tests {
 
     fn rel(s: &str) -> RelPath {
         RelPath::parse(s).unwrap()
+    }
+
+    /// The git half of a capture of a repository made at `root`, with its scratch files in `scratch`.
+    fn new_repo<'a>(root: &'a Path, scratch: &Path, policy: &'a IgnorePolicy) -> GitCapture<'a> {
+        let git = Git::new(root).with_date(1_760_000_000_000);
+        git.run(&["init", "-q", "-b", "main"]).unwrap();
+        GitCapture::open(git, root, policy, JobId::from_bytes([1; 16]), scratch)
+            .unwrap()
+            .unwrap()
     }
 
     #[test]
@@ -2882,16 +3196,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("work");
         fs::create_dir(&root).unwrap();
-        let repo = GitCapture {
-            git: Git::new(&root).with_date(1_760_000_000_000),
-            root: &root,
-            policy: &IgnorePolicy::default(),
-            job_id: JobId::from_bytes([1; 16]),
-            scratch: dir.path().to_owned(),
-            user_excludes: String::new(),
-            listing_excludes: TempFile::in_dir(dir.path()),
-        };
-        repo.git.run(&["init", "-q", "-b", "main"]).unwrap();
+        let policy = IgnorePolicy::default();
+        let repo = new_repo(&root, dir.path(), &policy);
         fs::write(root.join("a.txt"), "before\n").unwrap();
         repo.git.run(&["add", "a.txt"]).unwrap();
         repo.git.run(&["commit", "-q", "-m", "one"]).unwrap();
@@ -2899,10 +3205,10 @@ mod tests {
         let paths = [rel("a.txt")];
         let before = stamps(&root, paths.iter()).unwrap();
         let mut report = CaptureReport::default();
-        assert!(repo.worktree_mtimes(&w, &before, &mut report).is_ok());
+        assert!(repo.worktree_meta(&w, &before, &mut report).is_ok());
         fs::write(root.join("a.txt"), "written after W\n").unwrap();
         assert!(matches!(
-            repo.worktree_mtimes(&w, &before, &mut report),
+            repo.worktree_meta(&w, &before, &mut report),
             Err(CaptureError::WorkspaceChanged { path }) if path.as_str() == "a.txt"
         ));
     }
@@ -2913,16 +3219,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("work");
         fs::create_dir(&root).unwrap();
-        let repo = GitCapture {
-            git: Git::new(&root).with_date(1_760_000_000_000),
-            root: &root,
-            policy: &IgnorePolicy::default(),
-            job_id: JobId::from_bytes([1; 16]),
-            scratch: dir.path().to_owned(),
-            user_excludes: String::new(),
-            listing_excludes: TempFile::in_dir(dir.path()),
-        };
-        repo.git.run(&["init", "-q", "-b", "main"]).unwrap();
+        let policy = IgnorePolicy::default();
+        let repo = new_repo(&root, dir.path(), &policy);
         fs::write(root.join("a.txt"), "a\n").unwrap();
         repo.git.run(&["add", "a.txt"]).unwrap();
         repo.git.run(&["commit", "-q", "-m", "one"]).unwrap();
@@ -2953,21 +3251,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("work");
         fs::create_dir(&root).unwrap();
-        let repo = GitCapture {
-            git: Git::new(&root).with_date(1_760_000_000_000),
-            root: &root,
-            policy: &IgnorePolicy::default(),
-            job_id: JobId::from_bytes([1; 16]),
-            scratch: dir.path().to_owned(),
-            user_excludes: String::new(),
-            listing_excludes: TempFile::in_dir(dir.path()),
-        };
+        let policy = IgnorePolicy::default();
+        let repo = new_repo(&root, dir.path(), &policy);
         let commit = |message: &str| {
             repo.git
                 .run(&["commit", "-q", "--allow-empty", "-m", message])
                 .unwrap();
         };
-        repo.git.run(&["init", "-q", "-b", "main"]).unwrap();
         commit("one");
         let view = repo.ref_view().unwrap();
         let full = repo.bundle(&BundlePlan::Full).unwrap();
