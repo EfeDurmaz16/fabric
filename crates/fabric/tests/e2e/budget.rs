@@ -50,8 +50,10 @@ const COUNTED_RUNS: usize = 2;
 /// Where macOS and Linux keep `ps`.
 const PS: [&str; 2] = ["/bin/ps", "/usr/bin/ps"];
 
-/// Each program the node's facts probe, but git and the harnesses, with
-/// the shell its fake runs after the delay. `defaults` finds no setting,
+/// Each program the node's facts probe (`NodeFacts::measure` in
+/// `crates/fabricd/src/facts.rs`), but git and the harnesses, with the
+/// shell its fake runs after the delay. A probe added there needs its fake
+/// here, or it runs whatever the machine has. `defaults` finds no setting,
 /// as on a Mac that never turned iCloud Drive on.
 const PROBED: [(&str, &str); 12] = [
     ("id", "echo fabric"),
