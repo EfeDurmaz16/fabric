@@ -1,0 +1,47 @@
+# The time budget of the hot paths, which `budget::hot_paths` in budget.rs
+# measures (issue #26): suspend, move, resume and pull of a job under each
+# harness, and a daemon's cold start and restart. CONTRIBUTING.md says how
+# to run it and how to accept a slowdown. scripts/check-budget.sh fails a
+# change to this file that adds no [[change]] entry at its end.
+
+# A time is over its limit when it is above both ratio x baseline and
+# baseline + grace_ms; it fails when it is over again in a second batch.
+ratio = 1.3
+grace_ms = 50
+# Timed runs per batch, after the warm-up runs.
+reps = 7
+# The time that stands for a batch, as a percentile of its runs.
+percentile = 25
+
+# Each op's baseline in ms, the time at `percentile` on that platform. A
+# platform with no baselines only reports its times.
+[baseline.macos-aarch64]
+
+# Report only until CI produces numbers.
+[baseline.linux-x86_64]
+
+# The git and ps processes each op starts in each warm-up run: exact, and
+# the same on every platform. The first run moves each job for the first
+# time; a count that grows from the first run to the second grows with the
+# job's history.
+[processes]
+"acp suspend" = { git = [53, 59], ps = [0, 0] }
+"acp move" = { git = [2, 2], ps = [0, 0] }
+"acp resume" = { git = [21, 25], ps = [3, 3] }
+"acp pull" = { git = [85, 89], ps = [3, 3] }
+"claude suspend" = { git = [53, 59], ps = [0, 0] }
+"claude move" = { git = [2, 2], ps = [0, 0] }
+"claude resume" = { git = [21, 25], ps = [3, 3] }
+"claude pull" = { git = [85, 89], ps = [3, 3] }
+"codex suspend" = { git = [53, 59], ps = [0, 0] }
+"codex move" = { git = [2, 2], ps = [0, 0] }
+"codex resume" = { git = [21, 25], ps = [3, 3] }
+"codex pull" = { git = [85, 89], ps = [3, 3] }
+"cold start" = { git = [0, 0], ps = [0, 0] }
+"restart" = { git = [0, 0], ps = [0, 0] }
+
+# Every change to this file adds an entry here, below the others, that
+# says when and why. Entries are never edited or removed.
+[[change]]
+date = "2026-10-24"
+why = "First budget (issue #26): the process counts of main dbd3b9e, the same on every platform; no baselines yet, so times only report"

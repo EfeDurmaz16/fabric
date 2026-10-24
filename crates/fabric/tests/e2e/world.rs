@@ -32,6 +32,10 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a fault point may take to be reached.
 const FAULT_TIMEOUT: Duration = Duration::from_mins(2);
 
+/// How often a starting daemon is asked whether it answers: short, so the
+/// time budget measures a start to within a few milliseconds.
+const START_POLL: Duration = Duration::from_millis(10);
+
 /// What every process the test starts shares.
 pub struct Env {
     _dir: tempfile::TempDir,
@@ -187,9 +191,14 @@ impl Env {
         )
     }
 
+    /// The test's own programs, first on the `PATH` after a node's own.
+    pub fn bin(&self) -> PathBuf {
+        self.root.join("bin")
+    }
+
     /// Writes an executable `name` into the test's `bin`, first on the `PATH`.
-    fn install(&self, name: &str, script: &str) -> Fallible {
-        write_executable(&self.root.join("bin").join(name), script.as_bytes())
+    pub fn install(&self, name: &str, script: &str) -> Fallible {
+        write_executable(&self.bin().join(name), script.as_bytes())
     }
 
     /// What a fake harness wrote to `<name>-args`, one argument per line.
@@ -269,7 +278,7 @@ fn node_bin(state: &Path) -> PathBuf {
 /// forked while this process held it open would keep it open until that
 /// child ran its own program. A temporary file renamed into place would
 /// not help: the descriptor follows the file.
-fn write_executable(path: &Path, contents: &[u8]) -> Fallible {
+pub fn write_executable(path: &Path, contents: &[u8]) -> Fallible {
     let mut writer = Command::new("/bin/sh")
         .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
         .arg(path)
@@ -597,13 +606,13 @@ impl Node {
             if started.elapsed() > START_TIMEOUT {
                 return Err(format!("{} did not start:\n{}", self.name, self.log()).into());
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(START_POLL);
         }
         while self.ok(&["job", "ls"])?.contains("still catching up") {
             if started.elapsed() > START_TIMEOUT {
                 return Err(format!("{} did not recover:\n{}", self.name, self.log()).into());
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(START_POLL);
         }
         Ok(Started::Up)
     }

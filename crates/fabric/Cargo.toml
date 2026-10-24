@@ -38,6 +38,9 @@ fabric = { path = ".", features = ["faults", "fixtures"] }
 # controlling terminal; rustix is already a dependency of this package.
 rustix = { version = "1.1", features = ["fs", "process", "pty", "termios"] }
 tempfile = "3.27"
+# The time budget reads its limits from budget.toml; fabricd and fabric-env
+# already build this crate.
+toml = { version = "1.1", default-features = false, features = ["std", "parse"] }
 # The signal test runs a control socket that never answers, under a deadline.
 tokio = { version = "1.54", features = ["net", "time"] }
 
