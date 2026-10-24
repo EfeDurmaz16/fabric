@@ -566,17 +566,6 @@ pub fn setup_rows(spec: &EnvSpec, here: &NodeFacts, peer: &NodeFacts, target: Ta
     rows
 }
 
-/// The tools whose facts `setup_rows` reads for `spec` on the target
-/// (issue #26): the programs of the steps it runs on every resume.
-#[must_use]
-pub fn setup_probes(spec: &EnvSpec) -> Probes {
-    every_resume(spec)
-        .into_iter()
-        .fold(Probes::NONE, |probes, step| {
-            probes.union(Probes::for_program(step.program.as_str()))
-        })
-}
-
 /// The rows that stop a move: refusals, minus those `--force` waives.
 #[must_use]
 pub fn blocking(rows: &[Row], force: bool) -> Vec<&Row> {
@@ -1053,6 +1042,62 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A pull checks the programs of the steps its job runs on every
+    /// resume with the facts its preflight measured here, so those facts
+    /// must hold every program a setup step can name, cargo by its own
+    /// fact. A program left out would read as missing and refuse a pull
+    /// to a node that has it (issue #26).
+    #[test]
+    fn a_pull_preflight_measures_every_program_a_setup_row_reads() {
+        use fabric_core::env::{RunWhen, SetupStep};
+        use fabric_core::harness::ProgramName;
+        let programs = [
+            "node", "npm", "pnpm", "yarn", "bun", "rustc", "cargo", "python3", "uv",
+        ];
+        let spec = EnvSpec {
+            tools: Vec::new(),
+            setup: programs
+                .iter()
+                .map(|program| SetupStep {
+                    program: ProgramName::parse(program).unwrap(),
+                    args: Vec::new(),
+                    cwd: None,
+                    when: RunWhen::Always,
+                })
+                .collect(),
+            env_var_names: Vec::new(),
+            cache_paths: Vec::new(),
+            secret_patterns: Vec::new(),
+        };
+        let here = with(
+            &pro(),
+            &[
+                (name::NPM, Some("10.9.2")),
+                (name::YARN, Some("1.22.22")),
+                (name::BUN, Some("1.3.14")),
+                (name::CARGO, Some("cargo 1.97.1 (a1b2c3d4e 2026-09-01)")),
+                (name::PYTHON, Some("Python 3.12.1")),
+                (name::UV, Some("uv 0.9.5")),
+            ],
+        );
+        let outcomes = |here: &NodeFacts| -> Vec<(&str, Outcome)> {
+            setup_rows(&spec, here, &NodeFacts::default(), Target::Here)
+                .iter()
+                .map(|row| (row.fact, row.outcome))
+                .collect()
+        };
+        let all = outcomes(&here);
+        assert_eq!(all.len(), programs.len(), "{all:?}");
+        assert!(
+            all.iter().all(|(_, outcome)| *outcome == Outcome::Equal),
+            "{all:?}"
+        );
+        for harness in [HarnessKind::ClaudeCode, HarnessKind::Codex] {
+            let probes = probes(&harness, Target::Here);
+            assert_eq!(outcomes(&here.only(probes)), all, "{harness}");
         }
     }
 }

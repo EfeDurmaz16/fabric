@@ -1893,7 +1893,7 @@ impl Node {
                 None
             };
             let root = paths::job_root(&self.cfg.home, id);
-            let (_, theirs) = self
+            let (here, theirs) = self
                 .preflight(
                     holder,
                     (&kind, root.as_path(), floor.as_ref()),
@@ -1906,7 +1906,7 @@ impl Node {
             // With no harness named, the job's own launches, and the pull
             // must still find the one the preflight checked.
             let checked = harness.is_none().then_some(&kind);
-            self.pull(id, holder, (checked, force, &theirs), env, out)
+            self.pull(id, holder, (checked, force), (&here, &theirs), out)
                 .await?;
         }
         let job = self.job(id).await?;
@@ -1938,14 +1938,15 @@ impl Node {
     /// `checked` is the harness the preflight checked this node for, when
     /// the job's own harness will launch. The holder may have resumed under
     /// another one after that check and before it suspended for the move;
-    /// the move is then aborted, and the holder keeps the job. `theirs` are
-    /// the facts the holder gave the preflight.
+    /// the move is then aborted, and the holder keeps the job. `here` is
+    /// what the preflight measured on this node, which decides the paths,
+    /// and `theirs` the facts the holder gave it.
     async fn pull(
         self: &Arc<Self>,
         id: JobId,
         holder: NodeId,
-        (checked, force, theirs): (Option<&HarnessKind>, bool, &NodeFacts),
-        env: &ToolEnv,
+        (checked, force): (Option<&HarnessKind>, bool),
+        (here, theirs): (&NodeFacts, &NodeFacts),
         out: &mut Out,
     ) -> Result<(), NodeError> {
         out.emit(Event::Pulling { job: id, holder });
@@ -1972,7 +1973,7 @@ impl Node {
         let refused = if force {
             None
         } else {
-            self.carry_refusal_here(id, (holder, theirs), env, out)
+            self.carry_refusal_here(id, (holder, here, theirs), out)
                 .await?
         };
         faults::hit(Point::BeforeImport).await;
@@ -2028,16 +2029,16 @@ impl Node {
         Ok(())
     }
 
-    /// Decides here, with this node's facts, each ignored path of the job's
-    /// latest snapshot, checks this node has the programs of the steps its
-    /// spec runs on every resume, and returns the refusal to stop a pull
-    /// with when a path or a program is refused, after reporting them.
-    /// `theirs`, the holder's facts, fill the holder's side of the rows.
+    /// Decides here, with `here`, the facts the pull's preflight measured
+    /// on this node, each ignored path of the job's latest snapshot, checks
+    /// this node has the programs of the steps its spec runs on every
+    /// resume, and returns the refusal to stop a pull with when a path or a
+    /// program is refused, after reporting them. `theirs`, the holder's
+    /// facts, fill the holder's side of the rows.
     async fn carry_refusal_here(
         &self,
         id: JobId,
-        (holder, theirs): (NodeId, &NodeFacts),
-        env: &ToolEnv,
+        (holder, here, theirs): (NodeId, &NodeFacts, &NodeFacts),
         out: &mut Out,
     ) -> Result<Option<NodeError>, NodeError> {
         let latest = {
@@ -2049,20 +2050,14 @@ impl Node {
             return Ok(None);
         };
         let (manifest, spec) = self.manifest_and_spec(snapshot).await?;
-        let probes = spec.as_ref().map_or(Probes::NONE, doctor::setup_probes);
-        let probes = probes.union(carry::probes(&manifest));
-        let facts = self
-            .facts
-            .measure(&self.cfg.home, env, probes, Reuse::Cached)
-            .await;
-        let rows = setup_rows((&manifest, spec.as_ref()), &facts, theirs, Target::Here);
+        let rows = setup_rows((&manifest, spec.as_ref()), here, theirs, Target::Here);
         if !rows.is_empty() {
             out.emit(Event::Preflight {
                 peer: holder,
                 rows: rows.iter().map(doctor::Row::to_wire).collect(),
             });
         }
-        let decisions = carry::decide_all(&manifest, &facts);
+        let decisions = carry::decide_all(&manifest, here);
         let refusal = refuse_carry(&decisions, false, &mut Out::default()).err();
         if refusal.is_some() {
             out.emit(carry_decided(CarryFor::Pull, snapshot, &decisions));
@@ -2833,11 +2828,10 @@ impl Node {
 
     /// Compares this node's facts with `peer`'s, reports the rows, stops
     /// on a refusal `force` does not waive, and returns this node's facts
-    /// and the peer's.
-    /// A named job brings its harness, the root the target restores into,
-    /// and the newest version of its harness known to have written its
-    /// session; this node then measures only what the rows of that job
-    /// read (`doctor::probes`).
+    /// and the peer's. A named job brings its harness, the root the target
+    /// restores into, and the newest version of its harness known to have
+    /// written its session; this node then measures only what the rows of
+    /// that job and the carry decision read (`doctor::probes`).
     async fn preflight(
         self: &Arc<Self>,
         peer: NodeId,
@@ -3795,6 +3789,14 @@ pub(crate) mod tests {
         ToolEnv::current()
     }
 
+    /// Every fact `node` measures in `env` now, as a pull's preflight
+    /// hands them on.
+    async fn facts_in(node: &Node, env: &ToolEnv) -> NodeFacts {
+        node.facts
+            .measure(&node.cfg.home, env, Probes::ALL, Reuse::Fresh)
+            .await
+    }
+
     /// A job made from a one-commit repository, owned by `node` at epoch 1.
     pub(crate) async fn job(dir: &Path, node: &Arc<Node>) -> JobId {
         let repo = repo(dir);
@@ -4585,9 +4587,15 @@ pub(crate) mod tests {
         std::fs::write(thief_root.join("thief.txt"), "b's work\n").unwrap();
         b.suspend(id, &path, out).await.unwrap();
 
-        a.pull(id, b.id, (None, false, &NodeFacts::default()), &env(), out)
-            .await
-            .unwrap();
+        a.pull(
+            id,
+            b.id,
+            (None, false),
+            (&facts_in(&a, &env()).await, &NodeFacts::default()),
+            out,
+        )
+        .await
+        .unwrap();
         let job = a.job(id).await.unwrap();
         let mut job = job.lock().await;
         let epoch = owner_token(&job, a.id).unwrap().epoch;
@@ -4724,9 +4732,15 @@ pub(crate) mod tests {
         let out = &mut Out::default();
         let id = job(dir_a.path(), &a).await;
         a.suspend(id, &path, out).await.unwrap();
-        b.pull(id, a.id, (None, false, &NodeFacts::default()), &env(), out)
-            .await
-            .unwrap();
+        b.pull(
+            id,
+            a.id,
+            (None, false),
+            (&facts_in(&b, &env()).await, &NodeFacts::default()),
+            out,
+        )
+        .await
+        .unwrap();
         let approved = b.cfg.state.job(id).env_spec_ran();
         std::fs::write(&approved, "spec inputs\n").unwrap();
 
@@ -5896,8 +5910,11 @@ pub(crate) mod tests {
         b.pull(
             id,
             a.id,
-            (None, false, &NodeFacts::default()),
-            &ToolEnv::current(),
+            (None, false),
+            (
+                &facts_in(&b, &ToolEnv::current()).await,
+                &NodeFacts::default(),
+            ),
             &mut Out::default(),
         )
         .await
@@ -6063,8 +6080,11 @@ pub(crate) mod tests {
             .pull(
                 id,
                 a.id,
-                (None, false, &NodeFacts::default()),
-                &ToolEnv::current(),
+                (None, false),
+                (
+                    &facts_in(&b, &ToolEnv::current()).await,
+                    &NodeFacts::default(),
+                ),
                 &mut Out::default(),
             )
             .await
@@ -6427,9 +6447,15 @@ pub(crate) mod tests {
         std::fs::write(root.join(".fabric/env.toml"), "").unwrap();
         a.suspend(id, &path, out).await.unwrap();
 
-        b.pull(id, a.id, (None, false, &NodeFacts::default()), &env(), out)
-            .await
-            .unwrap();
+        b.pull(
+            id,
+            a.id,
+            (None, false),
+            (&facts_in(&b, &env()).await, &NodeFacts::default()),
+            out,
+        )
+        .await
+        .unwrap();
         let root = {
             let job = b.job(id).await.unwrap();
             let mut job = job.lock().await;
@@ -6976,8 +7002,8 @@ pub(crate) mod tests {
             .pull(
                 id,
                 a.id,
-                (Some(&HarnessKind::Codex), false, &NodeFacts::default()),
-                &env(),
+                (Some(&HarnessKind::Codex), false),
+                (&facts_in(&b, &env()).await, &NodeFacts::default()),
                 &mut Out::default(),
             )
             .await;
@@ -7027,8 +7053,8 @@ pub(crate) mod tests {
             .pull(
                 id,
                 a.id,
-                (None, false, &NodeFacts::default()),
-                &no_pnpm,
+                (None, false),
+                (&facts_in(&b, &no_pnpm).await, &NodeFacts::default()),
                 &mut out,
             )
             .await;
@@ -7115,8 +7141,8 @@ pub(crate) mod tests {
             .pull(
                 id,
                 a.id,
-                (None, false, &uv(Some("uv 0.9.5"))),
-                &no_uv,
+                (None, false),
+                (&facts_in(&b, &no_uv).await, &uv(Some("uv 0.9.5"))),
                 &mut Out::default(),
             )
             .await;
@@ -7785,5 +7811,49 @@ pub(crate) mod tests {
             .await;
         assert!(matches!(pulled, Err(NodeError::Preflight(_))), "{pulled:?}");
         assert_eq!(macos_row(&out), together, "the pull");
+    }
+
+    /// A pull decides the snapshot's paths with what its preflight measured
+    /// here and measures again only for the restore (issue #26): with no
+    /// answer reused, `node --version` runs once for each, and the login
+    /// of the job's harness, which only the preflight reads, once. The two
+    /// nodes share one home, as the gate Macs do, so the preflight lets the
+    /// pull through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pull_measures_this_node_once_before_it_restores() {
+        let dir = tempfile::Builder::new()
+            .prefix("fops")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let home = root.join("home");
+        let read = ["node", "npm", "codex"];
+        let tools_a = crate::facts::tests::CountingTools::only(&root.join("a"), &read);
+        let tools_b = crate::facts::tests::CountingTools::only(&root.join("b"), &read);
+        let a = node_at(&home, &root.join("a/state"), tools_a.env.clone());
+        let b = node_at(&home, &root.join("b/state"), tools_b.env.clone());
+        paired(&a, &b).await;
+        let (id, _) = npm_job(&root, &a).await;
+        a.suspend(id, &tools_a.env, &mut Out::default())
+            .await
+            .unwrap();
+        b.facts.set_ttl(Duration::ZERO);
+        tools_b.ran();
+        let mut out = Out::default();
+        let pulled = b
+            .job_resume(id, Some(a.id), None, false, &tools_b.env, &mut out)
+            .await;
+        assert!(pulled.is_ok(), "{pulled:?} {:?}", out.said());
+        assert!(
+            out.said()
+                .iter()
+                .any(|line| line.starts_with("carry   node_modules")),
+            "{:?}",
+            out.said()
+        );
+        let ran = tools_b.ran();
+        let count = |probe: &str| ran.iter().filter(|line| *line == probe).count();
+        assert_eq!(count("node --version"), 2, "{ran:?}");
+        assert_eq!(count("codex login status"), 1, "{ran:?}");
     }
 }
