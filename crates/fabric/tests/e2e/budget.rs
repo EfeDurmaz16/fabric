@@ -475,6 +475,12 @@ impl Fixture {
         batch.time("cold start", counter, || cold.start(None))?;
         cold.kill()?;
         self.a.kill()?;
+        // A daemon keeps the facts it measured for a minute (issue #26), so
+        // b restarts too, untimed: each run then starts with no facts kept
+        // on either node, and a count does not depend on how long the runs
+        // before it took. b starts before a, which then dials it afresh.
+        self.b.kill()?;
+        self.b.start(None)?;
         batch.time("restart", counter, || self.a.start(None))?;
         Ok(())
     }
