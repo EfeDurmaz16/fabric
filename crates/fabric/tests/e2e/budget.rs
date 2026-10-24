@@ -55,7 +55,7 @@ const PS: [&str; 2] = ["/bin/ps", "/usr/bin/ps"];
 /// shell its fake runs after the delay. A probe added there needs its fake
 /// here, or it runs whatever the machine has. `defaults` finds no setting,
 /// as on a Mac that never turned iCloud Drive on.
-const PROBED: [(&str, &str); 12] = [
+const PROBED: [(&str, &str); 13] = [
     ("id", "echo fabric"),
     ("sw_vers", "echo 26.0"),
     ("xcrun", "echo 26.0"),
@@ -71,6 +71,7 @@ const PROBED: [(&str, &str); 12] = [
     ("yarn", "echo 1.22.22"),
     ("bun", "echo 1.3.14"),
     ("rustc", "echo 'rustc 1.97.0'"),
+    ("cargo", "echo 'cargo 1.97.0'"),
     (
         "python3",
         "if [ \"$1\" = -c ]; then echo /usr; else echo 'Python 3.13.5'; fi",
