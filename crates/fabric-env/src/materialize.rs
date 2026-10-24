@@ -75,7 +75,10 @@
 //! nor starts a second installer on a tree the first one is still
 //! writing. A process a step leaves behind with either descriptor still
 //! open, such as a daemon that did not close them, holds the lock too, and
-//! resumes refuse until it exits.
+//! resumes refuse until it exits. Sharing the open file is also how a
+//! child that another thread forks holds the lock for the instant before
+//! it execs, so `acquire` retries a busy lock for a second before it
+//! refuses; ADR 0007 says why the lock stays an `flock`.
 //!
 //! The reverse gap is open: a process the step starts holds the lock only
 //! when it inherits one of those descriptors, and Node and Python pass on
@@ -154,6 +157,17 @@ const MAX_LINE: u64 = 64 << 10;
 
 /// How long a step's output may stay open after the step exits before `execute` moves on.
 const OUTPUT_GRACE: Duration = Duration::from_secs(1);
+
+/// How long `TreeLock::acquire` retries a busy lock before it counts as held.
+///
+/// A child that any thread of a process forks shares that process's open
+/// files until it execs, the lock's included, so a lock its holder has
+/// just released can look held for that instant (issue #25). A step, or a
+/// process one left behind, holds the lock for longer than this.
+const LOCK_PATIENCE: Duration = Duration::from_secs(1);
+
+/// How long `TreeLock::acquire` sleeps between two tries of a busy lock.
+const LOCK_RETRY: Duration = Duration::from_millis(20);
 
 /// Why materialize could not plan or finish.
 #[derive(Debug, thiserror::Error)]
@@ -516,7 +530,9 @@ impl TreeLock {
     /// The root must exist: the caller creates it, takes the lock, and only
     /// then restores into it. Refuses with `TreeBusy` while another resume
     /// holds the tree, or a step one started still runs in it, whatever has
-    /// happened to the files in the tree since.
+    /// happened to the files in the tree since. A busy lock is retried for
+    /// a second first, so a refusal takes that long and the call belongs
+    /// on a thread that may block.
     pub fn acquire(locks: &Path, root: &Path) -> Result<Self, MaterializeError> {
         let root_err = |source| MaterializeError::Root {
             path: root.to_owned(),
@@ -564,10 +580,20 @@ impl TreeLock {
         if !entry.is_file() || entry.dev() != opened.dev() || entry.ino() != opened.ino() {
             return Err(not_regular());
         }
-        match file.try_lock() {
-            Ok(()) => Ok(Self { root, file }),
-            Err(TryLockError::WouldBlock) => Err(MaterializeError::TreeBusy { lock: path }),
-            Err(TryLockError::Error(source)) => Err(MaterializeError::Lock { lock: path, source }),
+        let started = Instant::now();
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { root, file }),
+                Err(TryLockError::WouldBlock) if started.elapsed() < LOCK_PATIENCE => {
+                    thread::sleep(LOCK_RETRY);
+                }
+                Err(TryLockError::WouldBlock) => {
+                    return Err(MaterializeError::TreeBusy { lock: path });
+                }
+                Err(TryLockError::Error(source)) => {
+                    return Err(MaterializeError::Lock { lock: path, source });
+                }
+            }
         }
     }
 
@@ -1151,5 +1177,27 @@ mod tests {
         let cargo = ProgramName::parse("cargo").unwrap();
         assert_eq!(find_on_path(Some(&both), &root, &cargo), None);
         assert_eq!(find_on_path(None, &root, &pnpm), None);
+    }
+
+    /// Issue #25: a child that another thread forks while the lock is held
+    /// shares its open file until the child execs, so the holder's release
+    /// leaves the lock held for that instant and the next acquire refused
+    /// with `TreeBusy`. Stopping a child between its fork and its exec
+    /// takes `unsafe`, which this crate forbids, so a child that keeps the
+    /// same open file for a moment stands in for it.
+    #[test]
+    fn a_lock_released_while_a_child_shares_its_file_is_taken_once_the_child_lets_go() {
+        let locks = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let held = TreeLock::acquire(locks.path(), root.path()).unwrap();
+        let mut child = Command::new("sleep")
+            .arg("0.2")
+            .stdin(Stdio::from(held.file.try_clone().unwrap()))
+            .spawn()
+            .unwrap();
+        drop(held);
+        let again = TreeLock::acquire(locks.path(), root.path());
+        child.wait().unwrap();
+        assert!(again.is_ok(), "{again:?}");
     }
 }
