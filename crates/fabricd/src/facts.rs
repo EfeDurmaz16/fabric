@@ -21,7 +21,7 @@ use fabric_client::api::Roots;
 use fabric_core::env::{OVERRIDE_FILE, SetupStep};
 use fabric_core::harness::ProgramName;
 use fabric_core::path::{AbsPath, RelPath};
-use fabric_core::snapshot::{CacheClass, CarryKey, Platform, Remake, SnapshotManifest};
+use fabric_core::snapshot::{CacheClass, CarryKey, LeftBehind, Platform, Remake, SnapshotManifest};
 use fabric_env::detect::{CacheOrigin, Completion, Detection, Ecosystem, NodeManager};
 use fabric_env::materialize::CacheHealth;
 use fabric_net::wire::{FactName, FactValue, Facts, MAX_FACT_VALUE};
@@ -669,12 +669,7 @@ impl MeasuredKeys {
     /// did not report counts every file detection reads.
     pub fn forget_lost_remakes(&self, manifest: &mut SnapshotManifest) -> Vec<RelPath> {
         let left = &manifest.left_behind;
-        let stayed = |file: &str| {
-            RelPath::parse(file).is_ok_and(|file| {
-                left.iter()
-                    .any(|left| file.starts_with_ignore_ascii_case(&left.path))
-            })
-        };
+        let stayed = |file: &str| stayed_behind(left, file);
         let mut turned = Vec::new();
         for cache in &mut manifest.caches {
             if !matches!(cache.remake, Remake::Setup { .. }) {
@@ -709,6 +704,16 @@ impl MeasuredKeys {
             }
         }
     }
+}
+
+/// Whether `file`, a path from the workspace root, stayed on the
+/// capturing node: it, or a directory above it, is among the snapshot's
+/// `left` paths, which `.fabricignore` or a secret pattern kept there.
+pub(crate) fn stayed_behind(left: &[LeftBehind], file: &str) -> bool {
+    RelPath::parse(file).is_ok_and(|file| {
+        left.iter()
+            .any(|left| file.starts_with_ignore_ascii_case(&left.path))
+    })
 }
 
 impl CarryKeys for MeasuredKeys {
