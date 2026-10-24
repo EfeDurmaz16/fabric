@@ -1,9 +1,10 @@
 //! How Fabric runs git (ADR 0004, How Fabric runs git).
 //!
 //! Invariant: every git process this crate starts is a `git` found in an
-//! absolute `PATH` directory outside the repository it runs in, so neither a
-//! relative entry such as `.` nor an entry inside the workspace can make
-//! capture or restore run a `git` the workspace holds. It runs with no prompt, no
+//! absolute `PATH` directory outside the repository it runs in, or the git
+//! the macOS `/usr/bin/git` stub runs when that stub is the one found, so
+//! neither a relative entry such as `.` nor an entry inside the workspace
+//! can make capture or restore run a `git` the workspace holds. It runs with no prompt, no
 //! network, no hooks, no fsmonitor and a fixed author, with the user's
 //! global and system config unread, with no `GIT_*` variable inherited from
 //! whoever started Fabric, and in the C locale so its messages can be
@@ -21,6 +22,7 @@ use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::OnceLock;
 use std::thread;
 
 use fabric_core::git::GitNameError;
@@ -83,19 +85,64 @@ pub enum GitError {
 /// the workspace's too; both are skipped, as is a candidate that resolves
 /// into the repository through a link. The setup steps look their
 /// programs up the same way (`fabric-env`, `find_on_path`).
+///
+/// On macOS `/usr/bin/git` is a stub that asks `xcrun` for the developer
+/// tools' git on every call, which costs more than the git command it
+/// runs. When the stub is the one found, the git it would run is run
+/// directly, provided that one is outside `repo` too (`shim_target`).
 fn program(path_var: Option<&OsStr>, repo: &Path) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
     let repo = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_owned());
     let inside =
         |path: &Path| std::fs::canonicalize(path).is_ok_and(|real| real.starts_with(&repo));
-    std::env::split_paths(path_var?)
+    let found = std::env::split_paths(path_var?)
         .filter(|dir| dir.is_absolute() && !dir.starts_with(&repo) && !inside(dir))
         .map(|dir| dir.join("git"))
-        .find(|candidate| {
-            !inside(candidate)
-                && std::fs::metadata(candidate)
-                    .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .find(|candidate| !inside(candidate) && executable(candidate))?;
+    if cfg!(target_os = "macos")
+        && found == Path::new(XCRUN_SHIM)
+        && let Some(real) = shim_target()
+        && !real.starts_with(&repo)
+        && !inside(real)
+    {
+        return Some(real.to_owned());
+    }
+    Some(found)
+}
+
+/// True when `path` is a regular file someone may execute.
+fn executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+/// The stub macOS installs at `/usr/bin/git`.
+const XCRUN_SHIM: &str = "/usr/bin/git";
+
+/// The git the macOS stub at `/usr/bin/git` runs, asked of `xcrun` once
+/// per process; `None` when `xcrun` names none, and the stub then runs.
+///
+/// `xcrun` runs with this process's environment, which every git command
+/// here inherits apart from the `GIT_*` variables, so it picks the
+/// developer directory the stub would pick. The stub also sets `SDKROOT`,
+/// `CPATH`, `LIBRARY_PATH` and `MANPATH` for the git it runs; nothing git
+/// does here reads them, as hooks are off.
+fn shim_target() -> Option<&'static Path> {
+    static TARGET: OnceLock<Option<PathBuf>> = OnceLock::new();
+    TARGET
+        .get_or_init(|| {
+            let out = Command::new("/usr/bin/xcrun")
+                .args(["--find", "git"])
+                .current_dir("/")
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .ok()?;
+            let text = String::from_utf8(out.stdout).ok()?;
+            let path = PathBuf::from(text.trim_end_matches('\n'));
+            (out.status.success() && path.is_absolute() && executable(&path)).then_some(path)
         })
+        .as_deref()
 }
 
 /// The `-c` settings that make git flush every file it writes to the device.
@@ -392,6 +439,27 @@ mod tests {
         );
         assert!(!repo.join("ran").exists(), "the workspace's git ran");
         assert!(!repo.join("bin/ran").exists(), "the workspace's git ran");
+    }
+
+    /// The macOS stub at `/usr/bin/git` asks `xcrun` for the developer
+    /// tools' git on every call, which cost a suspend about 6 ms per git
+    /// command (issue #26); the git `xcrun` names runs instead.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_git_behind_the_macos_stub_runs_in_its_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let found = program(Some(OsStr::new("/usr/bin:/bin")), dir.path()).unwrap();
+        let named = Command::new("/usr/bin/xcrun")
+            .args(["--find", "git"])
+            .output()
+            .unwrap();
+        if named.status.success() {
+            let named = String::from_utf8(named.stdout).unwrap();
+            assert_eq!(found, Path::new(named.trim_end()));
+        } else {
+            // Without developer tools only the stub can say so.
+            assert_eq!(found, Path::new(XCRUN_SHIM));
+        }
     }
 
     #[test]
