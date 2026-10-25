@@ -11,7 +11,9 @@
 //! when `pgrep` or `ps` cannot answer, the caller is told so, never "none".
 //! `ps`, `pgrep` and `kill` are run from their system paths, never looked
 //! up on this process's `PATH`, so a planted `ps` cannot report a live
-//! writer as gone. A question about running processes includes the
+//! writer as gone; only a build with the `counted-tools` feature, which
+//! the end-to-end time budget makes, takes them from the directory
+//! `FABRIC_SYSTEM_TOOLS` names. A question about running processes includes the
 //! processes this one runs under: BSD `pgrep` on macOS leaves out its own
 //! ancestors unless given `-a` (pgrep(1)), and when Fabric runs from a
 //! Claude Code session the host `claude` is one of them. procps `pgrep` on
@@ -92,10 +94,18 @@ const PGREP_WITH_ANCESTORS: &[&str] = &["-a"];
 const PGREP_WITH_ANCESTORS: &[&str] = &[];
 
 /// The first of `candidates` that is an executable file.
+///
+/// With the `counted-tools` feature, `program` in the directory
+/// `FABRIC_SYSTEM_TOOLS` names comes first when it is there, so the
+/// end-to-end time budget can count each start (issue #26).
 pub(crate) fn system_tool(
     program: &'static str,
     candidates: &'static [&'static str],
 ) -> Result<&'static Path, HarnessError> {
+    #[cfg(feature = "counted-tools")]
+    if let Some(counted) = counted_tool(program) {
+        return Ok(counted);
+    }
     candidates
         .iter()
         .map(|candidate| Path::new(*candidate))
@@ -104,6 +114,26 @@ pub(crate) fn system_tool(
             program,
             reason: format!("not found at {}", candidates.join(" or ")),
         })
+}
+
+/// `program` in the directory `FABRIC_SYSTEM_TOOLS` names, read once,
+/// when it is an executable file there.
+#[cfg(feature = "counted-tools")]
+fn counted_tool(program: &str) -> Option<&'static Path> {
+    static TOOLS: std::sync::OnceLock<Vec<(&'static str, PathBuf)>> = std::sync::OnceLock::new();
+    TOOLS
+        .get_or_init(|| {
+            let Some(dir) = std::env::var_os("FABRIC_SYSTEM_TOOLS") else {
+                return Vec::new();
+            };
+            ["kill", "lsof", "pgrep", "ps"]
+                .into_iter()
+                .map(|name| (name, Path::new(&dir).join(name)))
+                .collect()
+        })
+        .iter()
+        .find(|(name, path)| *name == program && is_executable(path))
+        .map(|(_, path)| path.as_path())
 }
 
 /// Looks `name` up on the given `PATH` value, as a shell would, except

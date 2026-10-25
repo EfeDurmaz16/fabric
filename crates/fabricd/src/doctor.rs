@@ -34,7 +34,7 @@ use fabric_core::version::HarnessVersion;
 use fabric_env::detect::every_resume;
 
 use crate::carry::command;
-use crate::facts::{NodeFacts, major, name};
+use crate::facts::{NodeFacts, Probes, Tool, major, name};
 use crate::paths::{SyncedFolders, check_root};
 
 /// The clock difference above which mtime-keyed caches are suspect (ADR 0008).
@@ -160,6 +160,23 @@ fn row(
 /// make again does not cross a platform, and a path nothing can make
 /// again does, since leaving it out would lose it (`crate::carry`).
 const PLATFORM_NOTE: &str = "only a path nothing on the target can make again crosses; the carry lines say what happens to each path, ADR 0012";
+
+/// The tools a move or resume preflight measures on this node for a job
+/// under `harness` (issue #26): every row's, but a login only where it
+/// gates the move, which is the target's login for the job's harness. On a
+/// push the target is the peer, which measures its own; `fabric doctor`
+/// measures them all.
+#[must_use]
+pub fn probes(harness: &HarnessKind, target: Target) -> Probes {
+    let rows = Probes::ALL
+        .without(Tool::ClaudeLogin)
+        .without(Tool::CodexLogin);
+    match (target, harness) {
+        (Target::Here, HarnessKind::ClaudeCode) => rows.with(Tool::ClaudeLogin),
+        (Target::Here, HarnessKind::Codex) => rows.with(Tool::CodexLogin),
+        (Target::Here, HarnessKind::Acp { .. }) | (Target::Peer, _) => rows,
+    }
+}
 
 /// Compares this node's facts with a peer's, row by row (ADR 0008, the table).
 #[must_use]
@@ -969,6 +986,118 @@ mod tests {
                 ),
                 "{fact}"
             );
+        }
+    }
+
+    /// A preflight measures here every fact its rows read but a login,
+    /// which it measures only where the login gates the move: on this
+    /// node as the target, for the job's harness (issue #26). Every row
+    /// then has the outcome it has with every fact measured, a target's
+    /// missing login included.
+    #[test]
+    fn a_preflight_measures_a_login_only_where_it_gates_the_move() {
+        use crate::facts::Tool;
+        let acp = HarnessKind::Acp {
+            program: fabric_core::harness::ProgramName::parse("agent").unwrap(),
+            args: Vec::new(),
+        };
+        let logins = [
+            (
+                HarnessKind::ClaudeCode,
+                Tool::ClaudeLogin,
+                name::CLAUDE_LOGIN,
+            ),
+            (HarnessKind::Codex, Tool::CodexLogin, name::CODEX_LOGIN),
+            (acp, Tool::ClaudeLogin, name::CLAUDE_LOGIN),
+        ];
+        for (harness, login, fact) in &logins {
+            for target in [Target::Peer, Target::Here] {
+                let probes = probes(harness, target);
+                let measured: Vec<Tool> = [Tool::ClaudeLogin, Tool::CodexLogin]
+                    .into_iter()
+                    .filter(|tool| probes.contains(*tool))
+                    .collect();
+                let gates = target == Target::Here && !matches!(harness, HarnessKind::Acp { .. });
+                assert_eq!(
+                    measured,
+                    if gates { vec![*login] } else { vec![] },
+                    "{harness} {target:?}"
+                );
+                for here_login in ["yes", "no"] {
+                    let here = with(&pro(), &[(fact, Some(here_login))]);
+                    let ctx = Context {
+                        target,
+                        ..ctx(Some(harness))
+                    };
+                    let outcomes = |here: &NodeFacts| -> Vec<(&str, Outcome)> {
+                        compare(here, &pro(), &ctx)
+                            .iter()
+                            .map(|row| (row.fact, row.outcome))
+                            .collect()
+                    };
+                    assert_eq!(
+                        outcomes(&here.only(probes)),
+                        outcomes(&here),
+                        "{harness} {target:?} {here_login}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A pull checks the programs of the steps its job runs on every
+    /// resume with the facts its preflight measured here, so those facts
+    /// must hold every program a setup step can name, cargo by its own
+    /// fact. A program left out would read as missing and refuse a pull
+    /// to a node that has it (issue #26).
+    #[test]
+    fn a_pull_preflight_measures_every_program_a_setup_row_reads() {
+        use fabric_core::env::{RunWhen, SetupStep};
+        use fabric_core::harness::ProgramName;
+        let programs = [
+            "node", "npm", "pnpm", "yarn", "bun", "rustc", "cargo", "python3", "uv",
+        ];
+        let spec = EnvSpec {
+            tools: Vec::new(),
+            setup: programs
+                .iter()
+                .map(|program| SetupStep {
+                    program: ProgramName::parse(program).unwrap(),
+                    args: Vec::new(),
+                    cwd: None,
+                    when: RunWhen::Always,
+                })
+                .collect(),
+            env_var_names: Vec::new(),
+            cache_paths: Vec::new(),
+            secret_patterns: Vec::new(),
+        };
+        let here = with(
+            &pro(),
+            &[
+                (name::NPM, Some("10.9.2")),
+                (name::YARN, Some("1.22.22")),
+                (name::BUN, Some("1.3.14")),
+                (name::CARGO, Some("cargo 1.97.1 (a1b2c3d4e 2026-09-01)")),
+                (name::PYTHON, Some("Python 3.12.1")),
+                (name::UV, Some("uv 0.9.5")),
+            ],
+        );
+        let outcomes = |here: &NodeFacts| -> Vec<(&str, Outcome)> {
+            setup_rows(&spec, here, &NodeFacts::default(), Target::Here)
+                .iter()
+                .map(|row| (row.fact, row.outcome))
+                .collect()
+        };
+        let all = outcomes(&here);
+        assert_eq!(all.len(), programs.len(), "{all:?}");
+        assert!(
+            all.iter().all(|(_, outcome)| *outcome == Outcome::Equal),
+            "{all:?}"
+        );
+        for harness in [HarnessKind::ClaudeCode, HarnessKind::Codex] {
+            let probes = probes(&harness, Target::Here);
+            assert_eq!(outcomes(&here.only(probes)), all, "{harness}");
         }
     }
 }

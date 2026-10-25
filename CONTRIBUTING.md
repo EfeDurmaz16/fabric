@@ -27,6 +27,7 @@ cargo test --workspace
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo deny check
 scripts/check-hygiene.sh origin/main
+scripts/check-budget.sh origin/main
 ```
 
 The TypeScript SDK in `sdk/typescript` needs Bun, and Node 22 with npm on
@@ -46,12 +47,64 @@ FABRIC_BIN="$PWD/../../target/debug/fabric" bun test
 tracked file or in any commit message on the branch, from any directory in the
 repository. `scripts/test-check-hygiene.sh` proves it fires; CI runs it first.
 
+`scripts/check-budget.sh` fails when the time budget changed without a new
+`[[change]]` entry (see Time budget); `scripts/test-check-budget.sh` proves it
+fires.
+
 `cargo deny check` needs `cargo install cargo-deny --locked`. CI also runs it
 once a week, so a new advisory against an unchanged `Cargo.lock` still shows
 up. `deny.toml` holds the license, advisory, and source policy. A new
 dependency must pass it, and the PR lists the crate, version, last release
 date, and license. Dependabot opens a weekly PR for a stale action pin or
 crate; it goes through the same gates.
+
+## Time budget
+
+A hot path that gets about 1.5 times slower is a bug (issue #26). The
+ignored test `budget::hot_paths` in `crates/fabric/tests/e2e/budget.rs`
+times the hot paths on the end-to-end fixture of two nodes over QUIC:
+suspend, move, resume and pull of a job under each harness (ACP, Claude,
+Codex), and a daemon's cold start and restart. Every program the node's
+facts probe, but git, is a fake that answers after 50 ms; git is the
+machine's own. It also counts the git, kill, lsof, pgrep and ps processes
+each op starts, the harness's own too: the end-to-end build turns on the
+`counted-tools` feature, which runs the harness's system tools from the
+test's `bin` (`FABRIC_SYSTEM_TOOLS`), where the budget counts them.
+`crates/fabric/tests/e2e/budget.toml` holds the limits: the ratio, the
+grace, the runs per batch, each platform's baselines, the exact process
+counts, and the `[[change]]` entries that record why the budget changed.
+CI runs it after the end-to-end step on both runners and writes its table
+to the step summary.
+
+Run it on a quiet machine, since it measures wall time. It takes a few
+minutes:
+
+```sh
+cargo test -p fabric --test e2e --locked -- --ignored --exact budget::hot_paths --nocapture
+FABRIC_BUDGET=enforce cargo test -p fabric --test e2e --locked -- --ignored --exact budget::hot_paths --nocapture
+```
+
+The first command only reports times; the second fails on them. An op is
+over its limit when its 25th percentile of 7 runs is above both 1.3 times
+its baseline and its baseline plus 50 ms, and it fails when it is over
+again in a second batch of 7. A process count fails in both modes when it
+differs from the budget, higher or lower: fewer starts can mean a check was
+dropped. A platform with no baselines, as `linux-x86_64` until CI produces
+numbers, only reports its times.
+
+To accept a slowdown, or a new process count:
+
+1. Say in the PR why the op must cost more, with the table before and after.
+2. Set the op's baseline in `budget.toml` to the new 25th percentile from the
+   table, or set its counts.
+3. Add a `[[change]]` entry at the end of `budget.toml`, with
+   `date = "YYYY-MM-DD"` and a `why` that names the PR. Entries are never
+   edited or removed. `scripts/check-budget.sh` fails a change to the
+   budget without a new one.
+
+To give a platform its baselines, copy the 25th percentile column of a CI
+run on main from the step summary, with a `[[change]]` entry that names the
+run.
 
 ## Workspace rules
 

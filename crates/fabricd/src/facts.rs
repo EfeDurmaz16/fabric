@@ -10,11 +10,19 @@
 //! recorded beside its key, and a cache detection found no lockfile or step
 //! for is `Remake::Nothing`: the user's own files, which the carry decision
 //! never leaves out (`crate::carry`).
+//!
+//! Each operation measures only the tools whose facts it reads
+//! ([`Probes`]), so a fact it did not ask for is absent too; each set of
+//! tools is tested against the function that reads the facts. A login is
+//! measured only where it gates a move or a resume target, never by a
+//! suspend. Every measure runs its probes anew and keeps no answer for the
+//! next ([`NodeFacts::measure`]).
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use fabric_client::api::Roots;
@@ -106,11 +114,337 @@ pub mod name {
 pub struct NodeFacts(BTreeMap<String, String>);
 
 /// What one measuring command reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Probe {
     /// The trimmed standard output of a command that exited 0.
     Output,
     /// `yes` when the command exited 0, `no` when it ran and failed.
     ExitCode,
+}
+
+/// One measuring command: the fact it gives, its arguments, and how its answer reads.
+type Command = (&'static str, &'static [&'static str], Probe);
+
+/// A program a node measures, with the commands it runs for its facts.
+///
+/// Facts that need no process, the home, the platform, this build's
+/// version, `CARGO_HOME` and where `lsof` is, belong to no tool and are
+/// in every measure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Tool {
+    /// `id -un`.
+    User,
+    /// `git --version`, on the daemon's own `PATH`.
+    Git,
+    /// `sw_vers -productVersion`.
+    Macos,
+    /// `xcrun --show-sdk-version`.
+    MacosSdk,
+    /// `node --version` and the ABI of its native addons.
+    Node,
+    /// `npm --version`.
+    Npm,
+    /// `pnpm --version` and `pnpm store path`.
+    Pnpm,
+    /// `yarn --version`.
+    Yarn,
+    /// `bun --version`.
+    Bun,
+    /// `rustc -vV`.
+    Rustc,
+    /// `cargo --version`: rustup installs cargo and rustc as separate
+    /// components, so a node can have one without the other.
+    Cargo,
+    /// `python3 --version` and its `sys.base_prefix`.
+    Python,
+    /// `uv --version`.
+    Uv,
+    /// `claude --version`.
+    Claude,
+    /// `claude auth status`, which only a move or resume target needs.
+    ClaudeLogin,
+    /// `codex --version`.
+    Codex,
+    /// `codex login status`, which only a move or resume target needs.
+    CodexLogin,
+    /// Whether iCloud Drive syncs `~/Desktop` and `~/Documents`.
+    ICloud,
+}
+
+impl Tool {
+    /// Every tool.
+    pub const ALL: [Tool; 18] = [
+        Tool::User,
+        Tool::Git,
+        Tool::Macos,
+        Tool::MacosSdk,
+        Tool::Node,
+        Tool::Npm,
+        Tool::Pnpm,
+        Tool::Yarn,
+        Tool::Bun,
+        Tool::Rustc,
+        Tool::Cargo,
+        Tool::Python,
+        Tool::Uv,
+        Tool::Claude,
+        Tool::ClaudeLogin,
+        Tool::Codex,
+        Tool::CodexLogin,
+        Tool::ICloud,
+    ];
+
+    const fn bit(self) -> u32 {
+        1 << self as u32
+    }
+
+    /// The program its commands run.
+    fn program(self) -> &'static str {
+        match self {
+            Tool::User => "id",
+            Tool::Git => "git",
+            Tool::Macos => "sw_vers",
+            Tool::MacosSdk => "xcrun",
+            Tool::Node => "node",
+            Tool::Npm => "npm",
+            Tool::Pnpm => "pnpm",
+            Tool::Yarn => "yarn",
+            Tool::Bun => "bun",
+            Tool::Rustc => "rustc",
+            Tool::Cargo => "cargo",
+            Tool::Python => "python3",
+            Tool::Uv => "uv",
+            Tool::Claude | Tool::ClaudeLogin => "claude",
+            Tool::Codex | Tool::CodexLogin => "codex",
+            Tool::ICloud => "defaults",
+        }
+    }
+
+    /// The commands it runs, each giving one fact.
+    fn commands(self) -> &'static [Command] {
+        use Probe::{ExitCode, Output};
+        match self {
+            Tool::User => &[(name::USER, &["-un"], Output)],
+            Tool::Git => &[(name::GIT, &["--version"], Output)],
+            Tool::Macos => &[(name::MACOS, &["-productVersion"], Output)],
+            Tool::MacosSdk => &[(name::MACOS_SDK, &["--show-sdk-version"], Output)],
+            Tool::Node => &[
+                (name::NODE, &["--version"], Output),
+                (name::NODE_ABI, &["-p", "process.versions.modules"], Output),
+            ],
+            Tool::Npm => &[(name::NPM, &["--version"], Output)],
+            Tool::Pnpm => &[
+                (name::PNPM, &["--version"], Output),
+                (name::PNPM_STORE, &["store", "path"], Output),
+            ],
+            Tool::Yarn => &[(name::YARN, &["--version"], Output)],
+            Tool::Bun => &[(name::BUN, &["--version"], Output)],
+            Tool::Rustc => &[(name::RUSTC, &["-vV"], Output)],
+            Tool::Cargo => &[(name::CARGO, &["--version"], Output)],
+            Tool::Python => &[
+                (name::PYTHON, &["--version"], Output),
+                (
+                    name::PYTHON_HOME,
+                    &["-c", "import sys; print(sys.base_prefix)"],
+                    Output,
+                ),
+            ],
+            Tool::Uv => &[(name::UV, &["--version"], Output)],
+            Tool::Claude => &[(name::CLAUDE, &["--version"], Output)],
+            Tool::ClaudeLogin => &[(name::CLAUDE_LOGIN, &["auth", "status"], ExitCode)],
+            Tool::Codex => &[(name::CODEX, &["--version"], Output)],
+            Tool::CodexLogin => &[(name::CODEX_LOGIN, &["login", "status"], ExitCode)],
+            Tool::ICloud => &[
+                (
+                    name::ICLOUD_DESKTOP,
+                    &["read", "com.apple.finder", "FXICloudDriveDesktop"],
+                    Output,
+                ),
+                (
+                    name::ICLOUD_DOCUMENTS,
+                    &["read", "com.apple.finder", "FXICloudDriveDocuments"],
+                    Output,
+                ),
+            ],
+        }
+    }
+}
+
+/// The tools one measure runs (issue #26): each operation asks for the
+/// facts it reads, and `fabric doctor` for all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Probes(u32);
+
+impl Probes {
+    /// No tool: only the facts that need no process.
+    pub const NONE: Probes = Probes(0);
+
+    /// Every tool, as `fabric doctor` and a peer's facts question measure.
+    pub const ALL: Probes = Probes::of(&Tool::ALL);
+
+    /// The tools in `tools`.
+    #[must_use]
+    pub const fn of(tools: &[Tool]) -> Probes {
+        let mut bits = 0;
+        let mut i = 0;
+        while i < tools.len() {
+            bits |= tools[i].bit();
+            i += 1;
+        }
+        Probes(bits)
+    }
+
+    /// These and `tool`.
+    #[must_use]
+    pub const fn with(self, tool: Tool) -> Probes {
+        Probes(self.0 | tool.bit())
+    }
+
+    /// These without `tool`.
+    #[must_use]
+    pub const fn without(self, tool: Tool) -> Probes {
+        Probes(self.0 & !tool.bit())
+    }
+
+    /// These and `other`'s.
+    #[must_use]
+    pub const fn union(self, other: Probes) -> Probes {
+        Probes(self.0 | other.0)
+    }
+
+    /// Whether `tool` is one of these.
+    #[must_use]
+    pub const fn contains(self, tool: Tool) -> bool {
+        self.0 & tool.bit() != 0
+    }
+
+    /// Each of these tools.
+    pub fn tools(self) -> impl Iterator<Item = Tool> {
+        Tool::ALL
+            .into_iter()
+            .filter(move |tool| self.contains(*tool))
+    }
+
+    /// What `NodeFacts::program` reads for `program`, as a setup step names it.
+    #[must_use]
+    pub fn for_program(program: &str) -> Probes {
+        program_tool(program).map_or(Probes::NONE, |(tool, _)| Probes::NONE.with(tool))
+    }
+
+    /// What `NodeFacts::key_like` reads for a key shaped as `key`.
+    #[must_use]
+    pub fn for_key(key: &CarryKey) -> Probes {
+        let node = Probes::NONE.with(Tool::Node);
+        match key {
+            CarryKey::Node {
+                package_manager, ..
+            } => node.union(Probes::for_program(package_manager)),
+            CarryKey::Rust { .. } => Probes::NONE.with(Tool::Rustc),
+            CarryKey::Python { .. } => Probes::NONE.with(Tool::Python),
+            CarryKey::Other { tool, .. } if tool == NODE_ABI_TOOL => node,
+            CarryKey::Other { .. } | CarryKey::Unmeasured => Probes::NONE,
+        }
+    }
+}
+
+/// The tool that measures `program`, as a setup step names it, and the
+/// fact that holds its version.
+fn program_tool(program: &str) -> Option<(Tool, &'static str)> {
+    Some(match program {
+        "node" => (Tool::Node, name::NODE),
+        "npm" => (Tool::Npm, name::NPM),
+        "pnpm" => (Tool::Pnpm, name::PNPM),
+        "yarn" => (Tool::Yarn, name::YARN),
+        "bun" => (Tool::Bun, name::BUN),
+        "rustc" => (Tool::Rustc, name::RUSTC),
+        "cargo" => (Tool::Cargo, name::CARGO),
+        "python3" => (Tool::Python, name::PYTHON),
+        "uv" => (Tool::Uv, name::UV),
+        _ => return None,
+    })
+}
+
+impl NodeFacts {
+    /// Measures `probes` with the tools `env` names: programs are looked
+    /// up on its `PATH` and run with its roots, each set to its value or
+    /// removed, never the daemon's own (ADR 0018, The client's environment).
+    /// git is measured on the daemon's own `PATH`, where restore runs it,
+    /// and `lsof` where Codex capture looks for it. A tool `probes` leaves
+    /// out gives no fact.
+    ///
+    /// Every probe runs on every call, and no answer is kept for the next
+    /// one: a login can end and a version manager's shim can switch the
+    /// version behind the same binary at any moment, and an answer kept
+    /// from an earlier operation once let a move through to a target that
+    /// had logged out since, and carried a tree built for another Node
+    /// (review of PR #29).
+    pub async fn measure(home: &Path, env: &ToolEnv, probes: Probes) -> NodeFacts {
+        let inherited: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        Self::measure_from(home, env, &inherited, probes).await
+    }
+
+    /// Measures as [`NodeFacts::measure`] does, with `inherited` as the
+    /// daemon's own environment: each tool starts from it, and `env`'s
+    /// `PATH` and roots then replace or remove what they name; git runs in
+    /// `inherited` alone.
+    async fn measure_from(
+        home: &Path,
+        env: &ToolEnv,
+        inherited: &[(OsString, OsString)],
+        probes: Probes,
+    ) -> NodeFacts {
+        let own = ToolEnv::from_vars(|name| {
+            inherited
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        });
+        let found: Vec<(Tool, PathBuf)> = probes
+            .tools()
+            .filter_map(|tool| {
+                let path_var = if tool == Tool::Git { &own } else { env }.path_var();
+                find_on_path(tool.program(), path_var).map(|binary| (tool, binary))
+            })
+            .collect();
+        let mut facts = NodeFacts::without_tools(home, env);
+        facts.put(run_all(&found, (env, &own), home, inherited).await);
+        facts
+    }
+}
+
+/// Runs every command of every tool in `found` at once, each with the
+/// binary found for it, and returns the facts they gave. git runs in
+/// `own`, every other tool in `env`.
+async fn run_all(
+    found: &[(Tool, PathBuf)],
+    (env, own): (&ToolEnv, &ToolEnv),
+    home: &Path,
+    inherited: &[(OsString, OsString)],
+) -> Vec<(&'static str, String)> {
+    let env = Arc::new(env.clone());
+    let own = Arc::new(own.clone());
+    let inherited: Arc<[(OsString, OsString)]> = inherited.into();
+    let mut set = tokio::task::JoinSet::new();
+    for (tool, binary) in found {
+        for &(fact, args, probe) in tool.commands() {
+            let env = Arc::clone(if *tool == Tool::Git { &own } else { &env });
+            let (binary, home, inherited) =
+                (binary.clone(), home.to_owned(), Arc::clone(&inherited));
+            set.spawn(async move {
+                probe_command(&binary, args, probe, &env, &home, &inherited)
+                    .await
+                    .map(|value| (fact, value))
+            });
+        }
+    }
+    let mut facts = Vec::new();
+    while let Some(done) = set.join_next().await {
+        // A task that panicked answered nothing, so its fact is absent.
+        if let Ok(Some(fact)) = done {
+            facts.push(fact);
+        }
+    }
+    facts
 }
 
 impl NodeFacts {
@@ -125,140 +459,35 @@ impl NodeFacts {
         )
     }
 
-    /// Measures this node with the tools `env` names: programs are looked
-    /// up on its `PATH` and run with its roots, each set to its value or
-    /// removed, never the daemon's own (ADR 0018, The client's environment).
-    /// git is measured on the daemon's own `PATH`, where restore runs it,
-    /// and `lsof` where Codex capture looks for it.
-    pub async fn measure(home: &Path, env: &ToolEnv) -> Self {
-        let inherited: Vec<(OsString, OsString)> = std::env::vars_os().collect();
-        Self::measure_from(home, env, &inherited).await
-    }
-
-    /// Measures as [`NodeFacts::measure`] does, with `inherited` as the
-    /// daemon's own environment: each tool starts from it, and `env`'s
-    /// `PATH` and roots then replace or remove what they name; git runs in
-    /// `inherited` alone.
-    async fn measure_from(home: &Path, env: &ToolEnv, inherited: &[(OsString, OsString)]) -> Self {
-        let own = ToolEnv::from_vars(|name| {
-            inherited
-                .iter()
-                .find(|(key, _)| key == name)
-                .map(|(_, value)| value.clone())
-        });
-        let (mut facts, git) = tokio::join!(
-            Box::pin(Self::measure_tools(home, env, inherited)),
-            probe_command("git", &["--version"], Probe::Output, &own, home, inherited),
-        );
-        if let Some(git) = git {
-            facts.0.insert(name::GIT.to_owned(), git);
-        }
-        if let Some(lsof) = fabric_harness::codex::Codex::lsof() {
-            facts
-                .0
-                .insert(name::LSOF.to_owned(), lsof.display().to_string());
-        }
-        facts
-    }
-
-    /// Measures everything but git with the tools `env` names.
-    async fn measure_tools(home: &Path, env: &ToolEnv, inherited: &[(OsString, OsString)]) -> Self {
-        // Each probe is boxed, so the joined future holds 21 pointers, not 21 child processes.
-        let run = |program: &'static str, args: &'static [&'static str], probe: Probe| {
-            Box::pin(probe_command(program, args, probe, env, home, inherited))
-        };
-        let (
-            user,
-            macos,
-            sdk,
-            node,
-            node_abi,
-            npm,
-            pnpm,
-            pnpm_store,
-            yarn,
-            bun,
-            rustc,
-            cargo,
-            python,
-            python_home,
-            uv,
-            claude,
-            claude_login,
-            codex,
-            codex_login,
-            desktop,
-            documents,
-        ) = tokio::join!(
-            run("id", &["-un"], Probe::Output),
-            run("sw_vers", &["-productVersion"], Probe::Output),
-            run("xcrun", &["--show-sdk-version"], Probe::Output),
-            run("node", &["--version"], Probe::Output),
-            run("node", &["-p", "process.versions.modules"], Probe::Output),
-            run("npm", &["--version"], Probe::Output),
-            run("pnpm", &["--version"], Probe::Output),
-            run("pnpm", &["store", "path"], Probe::Output),
-            run("yarn", &["--version"], Probe::Output),
-            run("bun", &["--version"], Probe::Output),
-            run("rustc", &["-vV"], Probe::Output),
-            run("cargo", &["--version"], Probe::Output),
-            run("python3", &["--version"], Probe::Output),
-            run(
-                "python3",
-                &["-c", "import sys; print(sys.base_prefix)"],
-                Probe::Output
-            ),
-            run("uv", &["--version"], Probe::Output),
-            run("claude", &["--version"], Probe::Output),
-            run("claude", &["auth", "status"], Probe::ExitCode),
-            run("codex", &["--version"], Probe::Output),
-            run("codex", &["login", "status"], Probe::ExitCode),
-            run(
-                "defaults",
-                &["read", "com.apple.finder", "FXICloudDriveDesktop"],
-                Probe::Output
-            ),
-            run(
-                "defaults",
-                &["read", "com.apple.finder", "FXICloudDriveDocuments"],
-                Probe::Output
-            ),
-        );
+    /// The facts that need no process: the home, the platform, this
+    /// build's version, `CARGO_HOME` as `env` sets it or its default, and
+    /// where Codex capture finds `lsof`.
+    fn without_tools(home: &Path, env: &ToolEnv) -> Self {
         let mut facts = BTreeMap::new();
-        let mut put = |name: &str, value: Option<String>| {
-            if let Some(value) = value {
-                facts.insert(name.to_owned(), value);
-            }
-        };
-        put(name::USER, user);
-        put(name::HOME, Some(home.display().to_string()));
-        put(name::OS, Some(std::env::consts::OS.to_owned()));
-        put(name::ARCH, Some(std::env::consts::ARCH.to_owned()));
-        put(name::FABRIC, Some(env!("CARGO_PKG_VERSION").to_owned()));
-        put(name::MACOS, macos);
-        put(name::MACOS_SDK, sdk);
-        put(name::NODE, node);
-        put(name::NODE_ABI, node_abi);
-        put(name::NPM, npm);
-        put(name::PNPM, pnpm);
-        put(name::PNPM_STORE, pnpm_store);
-        put(name::YARN, yarn);
-        put(name::BUN, bun);
-        put(name::RUSTC, rustc);
-        put(name::CARGO, cargo);
-        let cargo_home = env.root(Roots::CARGO_HOME);
-        let cargo_home = cargo_home.map_or_else(|| home.join(".cargo"), PathBuf::from);
-        put(name::CARGO_HOME, Some(cargo_home.display().to_string()));
-        put(name::PYTHON, python);
-        put(name::PYTHON_HOME, python_home);
-        put(name::UV, uv);
-        put(name::CLAUDE, claude);
-        put(name::CLAUDE_LOGIN, claude_login);
-        put(name::CODEX, codex);
-        put(name::CODEX_LOGIN, codex_login);
-        put(name::ICLOUD_DESKTOP, desktop);
-        put(name::ICLOUD_DOCUMENTS, documents);
+        facts.insert(name::HOME.to_owned(), home.display().to_string());
+        facts.insert(name::OS.to_owned(), std::env::consts::OS.to_owned());
+        facts.insert(name::ARCH.to_owned(), std::env::consts::ARCH.to_owned());
+        facts.insert(
+            name::FABRIC.to_owned(),
+            env!("CARGO_PKG_VERSION").to_owned(),
+        );
+        facts.insert(
+            name::CARGO_HOME.to_owned(),
+            env.root(Roots::CARGO_HOME)
+                .map_or_else(|| home.join(".cargo"), PathBuf::from)
+                .display()
+                .to_string(),
+        );
+        if let Some(lsof) = fabric_harness::codex::Codex::lsof() {
+            facts.insert(name::LSOF.to_owned(), lsof.display().to_string());
+        }
         Self(facts)
+    }
+
+    fn put(&mut self, facts: Vec<(&'static str, String)>) {
+        for (name, value) in facts {
+            self.0.insert(name.to_owned(), value);
+        }
     }
 
     /// Adds what this node has for the ACP agent `program`: where the
@@ -315,10 +544,28 @@ impl NodeFacts {
     pub fn from_wire(facts: &Facts) -> Self {
         Self::from_pairs(facts.iter())
     }
+
+    /// Only the facts `probes` measures, and those no tool gives: what a
+    /// measure of `probes` would have found on the node these describe.
+    #[cfg(test)]
+    pub(crate) fn only(&self, probes: Probes) -> Self {
+        let dropped: Vec<&str> = Tool::ALL
+            .into_iter()
+            .filter(|tool| !probes.contains(*tool))
+            .flat_map(|tool| tool.commands().iter().map(|(fact, _, _)| *fact))
+            .collect();
+        Self(
+            self.0
+                .iter()
+                .filter(|(name, _)| !dropped.contains(&name.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        )
+    }
 }
 
 async fn probe_command(
-    program: &str,
+    binary: &Path,
     args: &[&str],
     probe: Probe,
     env: &ToolEnv,
@@ -326,7 +573,6 @@ async fn probe_command(
     inherited: &[(OsString, OsString)],
 ) -> Option<String> {
     let path_var = env.path_var();
-    let binary = find_on_path(program, path_var)?;
     let mut command = tokio::process::Command::new(binary);
     command
         .env_clear()
@@ -347,14 +593,16 @@ async fn probe_command(
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .output();
-    tracing::debug!(program, ?args, "measuring");
+    tracing::debug!(?binary, ?args, "measuring");
     let output = tokio::time::timeout(COMMAND_TIMEOUT, child).await;
-    tracing::debug!(program, ?args, done = output.is_ok(), "measured");
-    let output = output.ok()?.ok()?;
+    tracing::debug!(?binary, ?args, done = output.is_ok(), "measured");
+    let Ok(Ok(output)) = output else {
+        return None;
+    };
     match probe {
         Probe::ExitCode => Some(if output.status.success() { "yes" } else { "no" }.to_owned()),
         Probe::Output => {
-            let text = String::from_utf8(output.stdout).ok()?;
+            let text = String::from_utf8(output.stdout).unwrap_or_default();
             let text = text.trim();
             (output.status.success() && !text.is_empty() && text.len() <= MAX_FACT_VALUE)
                 .then(|| text.to_owned())
@@ -476,18 +724,7 @@ impl NodeFacts {
     /// `None` for one no node measures, such as a declared `make`.
     #[must_use]
     pub fn program_fact(program: &str) -> Option<&'static str> {
-        Some(match program {
-            "node" => name::NODE,
-            "npm" => name::NPM,
-            "pnpm" => name::PNPM,
-            "yarn" => name::YARN,
-            "bun" => name::BUN,
-            "rustc" => name::RUSTC,
-            "cargo" => name::CARGO,
-            "python3" => name::PYTHON,
-            "uv" => name::UV,
-            _ => return None,
-        })
+        program_tool(program).map(|(_, fact)| fact)
     }
 
     /// What this node knows about `program`.
@@ -689,6 +926,26 @@ impl MeasuredKeys {
         turned
     }
 
+    /// The tools a capture of the workspace `detection` describes measures
+    /// for its keys: the ecosystem of each cache detection found, and node
+    /// and python3, whose facts key a `node_modules` or a `.venv` the
+    /// store's rules find where detection found none (`undetected_key`).
+    /// The platform key needs no tool, and no login is among them.
+    #[must_use]
+    pub fn probes(detection: &Detection) -> Probes {
+        detection
+            .caches()
+            .iter()
+            .fold(Probes::of(&[Tool::Node, Tool::Python]), |probes, cache| {
+                probes.union(match cache.ecosystem {
+                    Ecosystem::Node(manager) => Probes::for_program(manager_name(manager)),
+                    Ecosystem::Rust => Probes::of(&[Tool::Rustc]),
+                    Ecosystem::Python => Probes::of(&[Tool::Python]),
+                    Ecosystem::Other => Probes::NONE,
+                })
+            })
+    }
+
     /// The key of a cache the store's classes found and detection did not:
     /// a `node_modules` without a lockfile keys on the addon ABI, a `.venv`
     /// on the interpreter, and anything else on the platform.
@@ -752,12 +1009,140 @@ fn manager_name(manager: NodeManager) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
     use fabric_client::api::{ClientEnv, PathDir, SystemPath};
 
     use super::*;
+
+    /// Fake tools for the programs a measure runs, git aside, in one
+    /// directory, each appending its name and arguments to a log before it
+    /// answers as the tool would: the log counts the probe processes a
+    /// measure starts. Both logins answer yes until `log_out`.
+    ///
+    /// macOS checks a new executable the first time it runs, which takes
+    /// a tenth of a second or more here, so a test installs the tools it
+    /// reads unless it must see a tool it does not expect run.
+    pub(crate) struct CountingTools {
+        dir: PathBuf,
+        /// `PATH` of the tools, `/usr/bin` and `/bin`, with no tool root.
+        pub(crate) env: ToolEnv,
+    }
+
+    impl CountingTools {
+        /// Every tool a measure runs but git.
+        pub(crate) fn new(dir: &Path) -> Self {
+            Self::only(
+                dir,
+                &[
+                    "id", "sw_vers", "xcrun", "node", "npm", "pnpm", "yarn", "bun", "rustc",
+                    "cargo", "python3", "uv", "claude", "codex", "defaults",
+                ],
+            )
+        }
+
+        /// The tools named `programs`.
+        pub(crate) fn only(dir: &Path, programs: &[&str]) -> Self {
+            let dir = dir.join("counting");
+            std::fs::create_dir_all(dir.join("bin")).unwrap();
+            let path = std::env::join_paths([
+                dir.join("bin").as_path(),
+                Path::new("/usr/bin"),
+                Path::new("/bin"),
+            ])
+            .unwrap();
+            let tools = Self {
+                env: ToolEnv::from_vars(|name| (name == "PATH").then(|| path.clone())),
+                dir,
+            };
+            let login = format!("[ ! -f '{}' ]", tools.dir.join("logged-out").display());
+            for (program, answer) in [
+                ("id", "echo tester".to_owned()),
+                ("sw_vers", "echo 15.6".to_owned()),
+                ("xcrun", "echo 15.5".to_owned()),
+                (
+                    "node",
+                    "case \"$1\" in --version) echo v22.23.2 ;; -p) echo 127 ;; esac".to_owned(),
+                ),
+                ("npm", "echo 10.9.2".to_owned()),
+                (
+                    "pnpm",
+                    "case \"$1\" in --version) echo 9.9.9 ;; store) echo /pnpm/store ;; esac"
+                        .to_owned(),
+                ),
+                ("yarn", "echo 1.22.22".to_owned()),
+                ("bun", "echo 1.3.14".to_owned()),
+                ("rustc", "echo 'rustc 1.97.0'".to_owned()),
+                ("cargo", "echo 'cargo 1.97.0'".to_owned()),
+                (
+                    "python3",
+                    "case \"$1\" in --version) echo 'Python 3.12.1' ;; -c) echo /opt/python ;; esac"
+                        .to_owned(),
+                ),
+                ("uv", "echo 'uv 0.9.5'".to_owned()),
+                (
+                    "claude",
+                    format!(
+                        "case \"$1\" in --version) echo '2.1.294 (Claude Code)' ;; auth) {login} ;; esac"
+                    ),
+                ),
+                (
+                    "codex",
+                    format!(
+                        "case \"$1\" in --version) echo 'codex-cli 0.155.1' ;; login) {login} ;; esac"
+                    ),
+                ),
+                ("defaults", "echo 0".to_owned()),
+            ] {
+                if programs.contains(&program) {
+                    tools.install(program, &answer);
+                }
+            }
+            tools
+        }
+
+        /// Writes `program`, which logs its run and then runs `answer`,
+        /// through a short `sh`, so this process never holds it open for
+        /// writing: Linux refuses to run a file another test's child
+        /// inherited open for writing (`ETXTBSY`).
+        pub(crate) fn install(&self, program: &str, answer: &str) {
+            let log = self.dir.join("probes.log");
+            let script = format!(
+                "#!/bin/sh\necho \"{program} $*\" >> '{}'\n{answer}\n",
+                log.display()
+            );
+            let mut writer = std::process::Command::new("/bin/sh")
+                .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+                .arg(self.dir.join("bin").join(program))
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            writer
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(script.as_bytes())
+                .unwrap();
+            assert!(writer.wait().unwrap().success());
+        }
+
+        /// Makes both logins answer no.
+        pub(crate) fn log_out(&self) {
+            std::fs::write(self.dir.join("logged-out"), "").unwrap();
+        }
+
+        /// The probes run since the last call, sorted, as `program args...`.
+        pub(crate) fn ran(&self) -> Vec<String> {
+            let log = self.dir.join("probes.log");
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            std::fs::write(&log, "").unwrap();
+            let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+            lines.sort();
+            lines
+        }
+    }
 
     /// A tool in a directory the client's `PATH` names only relatively is
     /// not found, and an empty entry, which an empty client `PATH` gives,
@@ -822,7 +1207,8 @@ mod tests {
                 ..Roots::default()
             },
         };
-        let facts = NodeFacts::measure_from(&home, &ToolEnv::from(&client), &daemon).await;
+        let facts =
+            NodeFacts::measure_from(&home, &ToolEnv::from(&client), &daemon, Probes::ALL).await;
         assert_eq!(facts.get(name::CARGO_HOME), Some("/client/cargo"));
         assert_eq!(facts.get(name::PNPM), Some("9.9.9"));
         assert_eq!(facts.get(name::PNPM_STORE), Some("/client/pnpm/store"));
@@ -831,10 +1217,96 @@ mod tests {
             path,
             roots: Roots::default(),
         };
-        let facts = NodeFacts::measure_from(&home, &ToolEnv::from(&bare), &daemon).await;
+        let facts =
+            NodeFacts::measure_from(&home, &ToolEnv::from(&bare), &daemon, Probes::ALL).await;
         let default_cargo = home.join(".cargo");
         assert_eq!(facts.get(name::CARGO_HOME), default_cargo.to_str());
         assert_eq!(facts.get(name::PNPM_STORE), Some("unset/store"));
+    }
+
+    /// Every fact a node can measure, as a rich node would answer.
+    fn everything() -> NodeFacts {
+        NodeFacts::from_pairs([
+            (name::USER, "me"),
+            (name::HOME, "/Users/me"),
+            (name::OS, "macos"),
+            (name::ARCH, "aarch64"),
+            (name::NODE, "v22.23.2"),
+            (name::NODE_ABI, "127"),
+            (name::NPM, "10.9.2"),
+            (name::PNPM, "11.23.0"),
+            (name::PNPM_STORE, "/Users/me/Library/pnpm/store/v11"),
+            (name::YARN, "1.22.22"),
+            (name::BUN, "1.3.14"),
+            (name::RUSTC, "rustc 1.97.1"),
+            (name::CARGO_HOME, "/Users/me/.cargo"),
+            (name::PYTHON, "Python 3.12.1"),
+            (name::PYTHON_HOME, "/opt/py312"),
+            (name::UV, "uv 0.9.5"),
+            (name::CLAUDE, "2.1.294 (Claude Code)"),
+            (name::CLAUDE_LOGIN, "yes"),
+            (name::CODEX, "codex-cli 0.155.1"),
+            (name::CODEX_LOGIN, "yes"),
+        ])
+    }
+
+    /// A capture measures only what its keys read: for every cache
+    /// detection finds, and for a `node_modules`, a `.venv` and build
+    /// output the store's rules find without it, the key recorded from
+    /// those facts is the key every fact gives, and no login is measured
+    /// (issue #26).
+    #[test]
+    fn a_capture_measures_what_its_keys_read_and_no_login() {
+        let workspaces: [&[(&str, &str)]; 7] = [
+            &[],
+            &[("package.json", "{}"), ("package-lock.json", "{}")],
+            &[
+                ("package.json", "{}"),
+                ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+            ],
+            &[("package.json", "{}"), ("yarn.lock", "")],
+            &[("package.json", "{}"), ("bun.lock", "{}")],
+            &[(
+                "Cargo.toml",
+                "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+            )],
+            &[("requirements.txt", "")],
+        ];
+        let undetected = [
+            (CacheClass::Deps, "node_modules"),
+            (CacheClass::Deps, "web/node_modules"),
+            (CacheClass::Deps, ".venv"),
+            (CacheClass::Build, "dist"),
+            (CacheClass::ToolCache, ".cache"),
+        ];
+        for files in workspaces {
+            let dir = tempfile::tempdir().unwrap();
+            for (file, text) in files {
+                std::fs::write(dir.path().join(file), text).unwrap();
+            }
+            let detection = fabric_env::detect::detect(dir.path(), &[]).unwrap();
+            let probes = MeasuredKeys::probes(&detection);
+            assert!(
+                !probes.contains(Tool::ClaudeLogin) && !probes.contains(Tool::CodexLogin),
+                "{files:?}"
+            );
+            let narrow = MeasuredKeys::new(everything().only(probes), Some(&detection));
+            let full = MeasuredKeys::new(everything(), Some(&detection));
+            let caches = detection
+                .caches()
+                .iter()
+                .map(|cache| (cache.class, cache.path.clone()))
+                .chain(
+                    undetected
+                        .iter()
+                        .map(|(class, path)| (*class, RelPath::parse(path).unwrap())),
+                );
+            for (class, path) in caches {
+                let key = full.key(class, &path);
+                assert_ne!(key, CarryKey::Unmeasured, "{files:?} {path}");
+                assert_eq!(narrow.key(class, &path), key, "{files:?} {path}");
+            }
+        }
     }
 
     fn pro() -> NodeFacts {

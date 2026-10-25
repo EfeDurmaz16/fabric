@@ -901,9 +901,10 @@ fn push_stash_entry(git: &Git, oid: &GitOid) -> Result<(), RestoreError> {
 
 /// Sets every ref and `HEAD` exactly as `git_state` records them.
 ///
-/// The stash list is rebuilt oldest first from the refs capture pinned
-/// under the job's stash prefix, then `refs/stash` itself, so every entry
-/// comes back at its index.
+/// Every ref but `refs/stash` is set by one `update-ref --stdin`
+/// transaction. The stash list is rebuilt oldest first from the refs
+/// capture pinned under the job's stash prefix, then `refs/stash` itself,
+/// so every entry comes back at its index.
 fn set_refs(git: &Git, git_state: &GitState, job_id: JobId) -> Result<(), RestoreError> {
     let prefix = stash_prefix(job_id);
     let mut older: Vec<(u64, &GitOid)> = git_state
@@ -915,15 +916,23 @@ fn set_refs(git: &Git, git_state: &GitState, job_id: JobId) -> Result<(), Restor
         })
         .collect();
     older.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
+    let mut commands = String::new();
+    let mut stash = None;
     for (name, oid) in &git_state.refs {
         if name.as_str() == "refs/stash" {
-            for (_, entry) in &older {
-                push_stash_entry(git, entry)?;
-            }
-            push_stash_entry(git, oid)?;
+            stash = Some(oid);
         } else {
-            git.run(&["update-ref", name.as_str(), oid.as_str()])?;
+            commands.extend(["update ", name.as_str(), " ", oid.as_str(), "\n"]);
         }
+    }
+    if !commands.is_empty() {
+        git.run_stdin_env(&["update-ref", "--stdin"], &[], commands.as_bytes())?;
+    }
+    if let Some(oid) = stash {
+        for (_, entry) in &older {
+            push_stash_entry(git, entry)?;
+        }
+        push_stash_entry(git, oid)?;
     }
     match &git_state.head {
         GitHead::Branch(branch) => {
@@ -1007,7 +1016,7 @@ fn restore_git(
     git_state: &GitState,
     target: &StagingTarget<'_>,
     report: &mut RestoreReport,
-) -> Result<Git, RestoreError> {
+) -> Result<(Git, Vec<TreeItem>), RestoreError> {
     let StagingTarget {
         staging,
         writer,
@@ -1100,7 +1109,7 @@ fn restore_git(
     report.untracked = counted.untracked;
     // Nonzero whenever a file differs from the index, which is expected here.
     let _ = git.output(&["update-index", "--refresh"], &[])?;
-    Ok(git)
+    Ok((git, items))
 }
 
 /// Picks about `n` of `items`, spread over the list, or all or none.
@@ -1142,18 +1151,16 @@ fn path_batches<'a, 'b>(items: &'b [&'a TreeItem]) -> Vec<&'b [&'a TreeItem]> {
     batches
 }
 
-/// Re-reads the working tree against commit `W` and returns how many entries matched.
+/// Re-reads the working tree against `items`, the entries of commit `W`, and returns how many matched.
 ///
 /// Files are hashed by `git hash-object --no-filters` and compared with the
 /// tree's blob ids; links are compared with their blobs' bytes.
 fn verify_worktree(
     git: &Git,
-    worktree: &GitOid,
+    items: &[TreeItem],
     writer: &TreeWriter,
     mode: Verify,
 ) -> Result<u64, RestoreError> {
-    let listing = git.run(&["ls-tree", "-r", "-z", worktree.as_str()])?;
-    let items = parse_tree(&listing)?;
     let blobs: Vec<&TreeItem> = items
         .iter()
         .filter(|item| item.mode != TreeMode::Gitlink)
@@ -1331,7 +1338,7 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
     let writer = TreeWriter::open(&staging)?;
     let mut report = RestoreReport::default();
 
-    let git = match &manifest.git {
+    let restored = match &manifest.git {
         Some(state) => Some(restore_git(
             store,
             req.snapshot,
@@ -1364,8 +1371,8 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
     report.skipped_caches.clone_from(&skipped);
     checkpoint::reached("restore.after_files");
     report.verified += verify_entries(store, &writer, &manifest.files, &skip, req.verify)?;
-    if let (Some(git), Some(state)) = (&git, &manifest.git) {
-        report.verified += verify_worktree(git, &state.worktree_commit, &writer, req.verify)?;
+    if let Some((git, items)) = &restored {
+        report.verified += verify_worktree(git, items, &writer, req.verify)?;
     }
 
     match (req.harness_state, harness_done) {
@@ -1407,7 +1414,7 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
         (None, _) => {}
     }
 
-    if let (Some(git), Some(state)) = (&git, &manifest.git) {
+    if let (Some((git, _)), Some(state)) = (&restored, &manifest.git) {
         write_config(git, &state.config)?;
     }
     if req.durability == Durability::PowerLoss {
@@ -1464,7 +1471,8 @@ pub fn verify(
     let mut verified = verify_entries(store, &writer, &manifest.files, &skip, mode)?;
     if let Some(state) = &manifest.git {
         let git = Git::new(root);
-        verified += verify_worktree(&git, &state.worktree_commit, &writer, mode)?;
+        let listing = git.run(&["ls-tree", "-r", "-z", state.worktree_commit.as_str()])?;
+        verified += verify_worktree(&git, &parse_tree(&listing)?, &writer, mode)?;
     }
     Ok(verified)
 }

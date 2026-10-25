@@ -7,7 +7,9 @@
 //! pnpm and no native Node module, which the gate's second Mac lacks. Its
 //! `package.json` has no lockfile, as the gate fixture of 2026-10-21 had,
 //! and each node may put its own programs first on its `PATH`, so the two
-//! nodes can report different Node majors from one machine.
+//! nodes can report different Node majors from one machine. git is linked
+//! into the test's own `bin`, not found through its directory, so the
+//! other programs there, such as a Homebrew `node`, stay off the `PATH`.
 
 use std::error::Error;
 use std::ffi::OsString;
@@ -29,6 +31,10 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a fault point may take to be reached.
 const FAULT_TIMEOUT: Duration = Duration::from_mins(2);
+
+/// How often a starting daemon is asked whether it answers: short, so the
+/// time budget measures a start to within a few milliseconds.
+const START_POLL: Duration = Duration::from_millis(10);
 
 /// What every process the test starts shares.
 pub struct Env {
@@ -58,12 +64,9 @@ impl Env {
             env!("CARGO_BIN_EXE_fabric-fake-agent"),
             bin.join("fabric-fake-agent"),
         )?;
-        let mut dirs = vec![bin];
-        if let Some(dir) = find("git").as_deref().and_then(Path::parent) {
-            dirs.push(dir.to_owned());
-        }
-        dirs.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
-        let path = std::env::join_paths(dirs)?;
+        let git = find("git").ok_or("no git on the PATH")?;
+        std::os::unix::fs::symlink(&git, bin.join("git"))?;
+        let path = std::env::join_paths([bin, PathBuf::from("/usr/bin"), PathBuf::from("/bin")])?;
         let repo = root.join("repo");
         make_repo(&repo)?;
         Ok(Arc::new(Self {
@@ -188,9 +191,14 @@ impl Env {
         )
     }
 
+    /// The test's own programs, first on the `PATH` after a node's own.
+    pub fn bin(&self) -> PathBuf {
+        self.root.join("bin")
+    }
+
     /// Writes an executable `name` into the test's `bin`, first on the `PATH`.
-    fn install(&self, name: &str, script: &str) -> Fallible {
-        write_executable(&self.root.join("bin").join(name), script.as_bytes())
+    pub fn install(&self, name: &str, script: &str) -> Fallible {
+        write_executable(&self.bin().join(name), script.as_bytes())
     }
 
     /// What a fake harness wrote to `<name>-args`, one argument per line.
@@ -246,6 +254,10 @@ impl Env {
             .env("PATH", path)
             .env("FABRIC_HOME", state)
             .env("FAKE_STATE_DIR", self.home.join(".fake-agent"))
+            // The harness runs a kill, lsof, pgrep or ps it finds in the
+            // test's `bin` in place of the system's; only the time budget
+            // puts them there, to count them.
+            .env("FABRIC_SYSTEM_TOOLS", self.bin())
             .stdin(Stdio::null());
         if let Some(level) = std::env::var_os("FABRIC_LOG") {
             command.env("FABRIC_LOG", level);
@@ -270,7 +282,7 @@ fn node_bin(state: &Path) -> PathBuf {
 /// forked while this process held it open would keep it open until that
 /// child ran its own program. A temporary file renamed into place would
 /// not help: the descriptor follows the file.
-fn write_executable(path: &Path, contents: &[u8]) -> Fallible {
+pub fn write_executable(path: &Path, contents: &[u8]) -> Fallible {
     let mut writer = Command::new("/bin/sh")
         .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
         .arg(path)
@@ -598,13 +610,13 @@ impl Node {
             if started.elapsed() > START_TIMEOUT {
                 return Err(format!("{} did not start:\n{}", self.name, self.log()).into());
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(START_POLL);
         }
         while self.ok(&["job", "ls"])?.contains("still catching up") {
             if started.elapsed() > START_TIMEOUT {
                 return Err(format!("{} did not recover:\n{}", self.name, self.log()).into());
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(START_POLL);
         }
         Ok(Started::Up)
     }
