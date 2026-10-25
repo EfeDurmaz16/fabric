@@ -15,15 +15,15 @@
 //! ([`Probes`]), so a fact it did not ask for is absent too; each set of
 //! tools is tested against the function that reads the facts. A login is
 //! measured only where it gates a move or a resume target, never by a
-//! suspend. An answer is reused for a minute while the tool's binary stays
-//! the same ([`FactCache`]); `fabric doctor` always measures anew.
+//! suspend. Every measure runs its probes anew and keeps no answer for the
+//! next ([`NodeFacts::measure`]).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::Arc;
+use std::time::Duration;
 
 use fabric_client::api::Roots;
 use fabric_core::env::{OVERRIDE_FILE, SetupStep};
@@ -364,145 +364,34 @@ fn program_tool(program: &str) -> Option<(Tool, &'static str)> {
     })
 }
 
-/// How long measured facts are reused while each tool that gave them is
-/// the same binary (issue #26): a tool updated in place, or one a `PATH`
-/// change now finds elsewhere, is measured again at once.
-pub const FACTS_TTL: Duration = Duration::from_mins(1);
-
-/// Whether a measure may answer from what was measured lately.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reuse {
-    /// Facts measured within the time to live, for the same environment,
-    /// home and binary.
-    Cached,
-    /// Only what each tool answers now, as `fabric doctor` shows; the
-    /// answers still replace what the cache held.
-    Fresh,
-}
-
-/// The facts this node measured lately, kept per environment, home and
-/// tool for [`FACTS_TTL`] (issue #26).
-///
-/// Invariant: a kept answer is reused only while the tool's binary is the
-/// same: found at the same path on the same `PATH`, resolving to the same
-/// file, with the same modification time. A login that answered `no` is
-/// never kept, so a user who logs in after a refusal is seen at once, and
-/// neither is a tool with a command that did not answer in time; either
-/// drops the answer kept for that tool before it.
-#[derive(Debug)]
-pub struct FactCache {
-    state: Mutex<CacheState>,
-}
-
-#[derive(Debug)]
-struct CacheState {
-    ttl: Duration,
-    entries: HashMap<CacheKey, Kept>,
-}
-
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct CacheKey {
-    env: ToolEnv,
-    home: PathBuf,
-    tool: Tool,
-}
-
-#[derive(Debug)]
-struct Kept {
-    binary: Binary,
-    at: Instant,
-    facts: Vec<(&'static str, String)>,
-}
-
-/// A tool's binary as a measure found it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Binary {
-    /// Where the `PATH` finds it.
-    found: PathBuf,
-    /// The file that resolves to, links followed.
-    resolved: PathBuf,
-    /// When that file was last written.
-    modified: SystemTime,
-}
-
-impl Binary {
-    fn of(found: &Path) -> Option<Binary> {
-        let resolved = std::fs::canonicalize(found).ok()?;
-        let modified = std::fs::metadata(&resolved).ok()?.modified().ok()?;
-        Some(Binary {
-            found: found.to_owned(),
-            resolved,
-            modified,
-        })
-    }
-}
-
-/// What one command answered.
-#[derive(Debug)]
-enum Answer {
-    /// The fact.
-    Fact(String),
-    /// It ran to its end and gave no fact, which is an answer too.
-    Nothing,
-    /// It did not start, or did not end within [`COMMAND_TIMEOUT`].
-    Silent,
-}
-
-/// One tool a measure runs.
-struct Miss {
-    tool: Tool,
-    found: PathBuf,
-    binary: Option<Binary>,
-    key: CacheKey,
-}
-
-impl FactCache {
-    /// An empty cache whose answers live for `ttl`.
-    #[must_use]
-    pub fn new(ttl: Duration) -> FactCache {
-        FactCache {
-            state: Mutex::new(CacheState {
-                ttl,
-                entries: HashMap::new(),
-            }),
-        }
-    }
-
-    /// Changes how long answers live, for a test that counts every probe.
-    #[cfg(test)]
-    pub(crate) fn set_ttl(&self, ttl: Duration) {
-        crate::node::lock(&self.state).ttl = ttl;
-    }
-
+impl NodeFacts {
     /// Measures `probes` with the tools `env` names: programs are looked
     /// up on its `PATH` and run with its roots, each set to its value or
     /// removed, never the daemon's own (ADR 0018, The client's environment).
     /// git is measured on the daemon's own `PATH`, where restore runs it,
     /// and `lsof` where Codex capture looks for it. A tool `probes` leaves
     /// out gives no fact.
-    pub async fn measure(
-        &self,
-        home: &Path,
-        env: &ToolEnv,
-        probes: Probes,
-        reuse: Reuse,
-    ) -> NodeFacts {
+    ///
+    /// Every probe runs on every call, and no answer is kept for the next
+    /// one: a login can end and a version manager's shim can switch the
+    /// version behind the same binary at any moment, and an answer kept
+    /// from an earlier operation once let a move through to a target that
+    /// had logged out since, and carried a tree built for another Node
+    /// (review of PR #29).
+    pub async fn measure(home: &Path, env: &ToolEnv, probes: Probes) -> NodeFacts {
         let inherited: Vec<(OsString, OsString)> = std::env::vars_os().collect();
-        self.measure_from(home, env, &inherited, (probes, reuse), Instant::now())
-            .await
+        Self::measure_from(home, env, &inherited, probes).await
     }
 
-    /// Measures as [`FactCache::measure`] does at `now`, with `inherited`
-    /// as the daemon's own environment: each tool starts from it, and
-    /// `env`'s `PATH` and roots then replace or remove what they name; git
-    /// runs in `inherited` alone.
+    /// Measures as [`NodeFacts::measure`] does, with `inherited` as the
+    /// daemon's own environment: each tool starts from it, and `env`'s
+    /// `PATH` and roots then replace or remove what they name; git runs in
+    /// `inherited` alone.
     async fn measure_from(
-        &self,
         home: &Path,
         env: &ToolEnv,
         inherited: &[(OsString, OsString)],
-        (probes, reuse): (Probes, Reuse),
-        now: Instant,
+        probes: Probes,
     ) -> NodeFacts {
         let own = ToolEnv::from_vars(|name| {
             inherited
@@ -510,135 +399,52 @@ impl FactCache {
                 .find(|(key, _)| key == name)
                 .map(|(_, value)| value.clone())
         });
+        let found: Vec<(Tool, PathBuf)> = probes
+            .tools()
+            .filter_map(|tool| {
+                let path_var = if tool == Tool::Git { &own } else { env }.path_var();
+                find_on_path(tool.program(), path_var).map(|binary| (tool, binary))
+            })
+            .collect();
         let mut facts = NodeFacts::without_tools(home, env);
-        let mut misses = Vec::new();
-        for tool in probes.tools() {
-            let path_var = if tool == Tool::Git { &own } else { env }.path_var();
-            let Some(found) = find_on_path(tool.program(), path_var) else {
-                continue;
-            };
-            let binary = Binary::of(&found);
-            let key = CacheKey {
-                env: env.clone(),
-                home: home.to_owned(),
-                tool,
-            };
-            let kept = match (reuse, &binary) {
-                (Reuse::Cached, Some(binary)) => self.lookup(&key, binary, now),
-                _ => None,
-            };
-            match kept {
-                Some(kept) => facts.put(kept),
-                None => misses.push(Miss {
-                    tool,
-                    found,
-                    binary,
-                    key,
-                }),
-            }
-        }
-        let answers = run_all(&misses, (env, &own), home, inherited).await;
-        let mut keep = Vec::new();
-        // A tool measured again whose answer is not kept drops the older
-        // one too: a fresh `no` must not leave an earlier `yes` to serve
-        // the next measure.
-        let mut forget = Vec::new();
-        for (miss, answers) in misses.into_iter().zip(answers) {
-            let mut measured = Vec::new();
-            let mut whole = true;
-            for ((fact, _, _), answer) in miss.tool.commands().iter().zip(answers) {
-                match answer {
-                    Answer::Fact(value) => measured.push((*fact, value)),
-                    Answer::Nothing => {}
-                    Answer::Silent => whole = false,
-                }
-            }
-            let refused_login = matches!(miss.tool, Tool::ClaudeLogin | Tool::CodexLogin)
-                && measured.iter().any(|(_, value)| value != "yes");
-            match miss.binary {
-                Some(binary) if whole && !refused_login => keep.push((
-                    miss.key,
-                    Kept {
-                        binary,
-                        at: now,
-                        facts: measured.clone(),
-                    },
-                )),
-                _ => forget.push(miss.key),
-            }
-            facts.put(measured);
-        }
-        if !keep.is_empty() || !forget.is_empty() {
-            let mut state = crate::node::lock(&self.state);
-            let ttl = state.ttl;
-            state.entries.retain(|key, kept| {
-                now.saturating_duration_since(kept.at) < ttl && !forget.contains(key)
-            });
-            state.entries.extend(keep);
-        }
+        facts.put(run_all(&found, (env, &own), home, inherited).await);
         facts
-    }
-
-    /// The facts kept for `key`, while `binary` is the one that gave them
-    /// and they are younger than the time to live.
-    fn lookup(
-        &self,
-        key: &CacheKey,
-        binary: &Binary,
-        now: Instant,
-    ) -> Option<Vec<(&'static str, String)>> {
-        let state = crate::node::lock(&self.state);
-        let kept = state.entries.get(key)?;
-        (kept.binary == *binary && now.saturating_duration_since(kept.at) < state.ttl)
-            .then(|| kept.facts.clone())
     }
 }
 
-/// Runs every command of every tool in `misses` at once, and returns each
-/// tool's answers in the order of its commands. git runs in `own`, every
-/// other tool in `env`.
+/// Runs every command of every tool in `found` at once, each with the
+/// binary found for it, and returns the facts they gave. git runs in
+/// `own`, every other tool in `env`.
 async fn run_all(
-    misses: &[Miss],
+    found: &[(Tool, PathBuf)],
     (env, own): (&ToolEnv, &ToolEnv),
     home: &Path,
     inherited: &[(OsString, OsString)],
-) -> Vec<Vec<Answer>> {
+) -> Vec<(&'static str, String)> {
     let env = Arc::new(env.clone());
     let own = Arc::new(own.clone());
     let inherited: Arc<[(OsString, OsString)]> = inherited.into();
     let mut set = tokio::task::JoinSet::new();
-    for (index, miss) in misses.iter().enumerate() {
-        for (command, &(_, args, probe)) in miss.tool.commands().iter().enumerate() {
-            let env = Arc::clone(if miss.tool == Tool::Git { &own } else { &env });
+    for (tool, binary) in found {
+        for &(fact, args, probe) in tool.commands() {
+            let env = Arc::clone(if *tool == Tool::Git { &own } else { &env });
             let (binary, home, inherited) =
-                (miss.found.clone(), home.to_owned(), Arc::clone(&inherited));
+                (binary.clone(), home.to_owned(), Arc::clone(&inherited));
             set.spawn(async move {
-                let answer = probe_command(&binary, args, probe, &env, &home, &inherited).await;
-                (index, command, answer)
+                probe_command(&binary, args, probe, &env, &home, &inherited)
+                    .await
+                    .map(|value| (fact, value))
             });
         }
     }
-    let mut answers: Vec<Vec<Answer>> = misses
-        .iter()
-        .map(|miss| {
-            miss.tool
-                .commands()
-                .iter()
-                .map(|_| Answer::Silent)
-                .collect()
-        })
-        .collect();
+    let mut facts = Vec::new();
     while let Some(done) = set.join_next().await {
-        // A task that panicked answered nothing; its slot stays silent.
-        if let Ok((index, command, answer)) = done
-            && let Some(slot) = answers
-                .get_mut(index)
-                .and_then(|tool| tool.get_mut(command))
-        {
-            *slot = answer;
+        // A task that panicked answered nothing, so its fact is absent.
+        if let Ok(Some(fact)) = done {
+            facts.push(fact);
         }
     }
-    answers
+    facts
 }
 
 impl NodeFacts {
@@ -765,7 +571,7 @@ async fn probe_command(
     env: &ToolEnv,
     home: &Path,
     inherited: &[(OsString, OsString)],
-) -> Answer {
+) -> Option<String> {
     let path_var = env.path_var();
     let mut command = tokio::process::Command::new(binary);
     command
@@ -791,20 +597,15 @@ async fn probe_command(
     let output = tokio::time::timeout(COMMAND_TIMEOUT, child).await;
     tracing::debug!(?binary, ?args, done = output.is_ok(), "measured");
     let Ok(Ok(output)) = output else {
-        return Answer::Silent;
+        return None;
     };
     match probe {
-        Probe::ExitCode => {
-            Answer::Fact(if output.status.success() { "yes" } else { "no" }.to_owned())
-        }
+        Probe::ExitCode => Some(if output.status.success() { "yes" } else { "no" }.to_owned()),
         Probe::Output => {
             let text = String::from_utf8(output.stdout).unwrap_or_default();
             let text = text.trim();
-            if output.status.success() && !text.is_empty() && text.len() <= MAX_FACT_VALUE {
-                Answer::Fact(text.to_owned())
-            } else {
-                Answer::Nothing
-            }
+            (output.status.success() && !text.is_empty() && text.len() <= MAX_FACT_VALUE)
+                .then(|| text.to_owned())
         }
     }
 }
@@ -1327,16 +1128,6 @@ pub(crate) mod tests {
             assert!(writer.wait().unwrap().success());
         }
 
-        /// Gives `program` another modification time, as an update in place does.
-        pub(crate) fn touch(&self, program: &str) {
-            let status = std::process::Command::new("touch")
-                .args(["-m", "-t", "202001011200"])
-                .arg(self.dir.join("bin").join(program))
-                .status()
-                .unwrap();
-            assert!(status.success());
-        }
-
         /// Makes both logins answer no.
         pub(crate) fn log_out(&self) {
             std::fs::write(self.dir.join("logged-out"), "").unwrap();
@@ -1351,137 +1142,6 @@ pub(crate) mod tests {
             lines.sort();
             lines
         }
-    }
-
-    const NODE_PROBES: [&str; 2] = ["node --version", "node -p process.versions.modules"];
-    const PNPM_PROBES: [&str; 2] = ["pnpm --version", "pnpm store path"];
-
-    /// An answer is reused while the tool's binary is the same and younger
-    /// than the time to live: a second measure starts no process, a tool
-    /// written since is probed again alone, another home probes again, and
-    /// every tool is probed again once its answer is too old (issue #26).
-    #[tokio::test]
-    async fn a_tool_is_probed_again_only_once_it_changed_or_its_answer_is_old() {
-        let dir = tempfile::tempdir().unwrap();
-        let tools = CountingTools::only(dir.path(), &["node", "pnpm"]);
-        let home = dir.path().join("home");
-        let cache = FactCache::new(FACTS_TTL);
-        let probes = (Probes::of(&[Tool::Node, Tool::Pnpm]), Reuse::Cached);
-        let measure = |home: PathBuf, at: Duration| {
-            let (cache, env) = (&cache, &tools.env);
-            let now = start() + at;
-            async move { cache.measure_from(&home, env, &[], probes, now).await }
-        };
-        let first = measure(home.clone(), Duration::ZERO).await;
-        assert_eq!(first.get(name::PNPM_STORE), Some("/pnpm/store"));
-        assert_eq!(tools.ran(), [NODE_PROBES, PNPM_PROBES].concat());
-
-        let half = FACTS_TTL / 2;
-        assert_eq!(measure(home.clone(), half).await, first);
-        assert!(tools.ran().is_empty(), "a kept answer was probed again");
-
-        tools.touch("pnpm");
-        assert_eq!(measure(home.clone(), half).await, first);
-        assert_eq!(tools.ran(), PNPM_PROBES, "only the changed tool");
-
-        measure(dir.path().join("other"), half).await;
-        assert_eq!(
-            tools.ran(),
-            [NODE_PROBES, PNPM_PROBES].concat(),
-            "another home"
-        );
-
-        measure(home, half + FACTS_TTL).await;
-        assert_eq!(tools.ran(), [NODE_PROBES, PNPM_PROBES].concat(), "too old");
-    }
-
-    /// One instant every test measures from, so `start() + at` is the
-    /// same clock for every measure of a test.
-    fn start() -> Instant {
-        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-        *START.get_or_init(Instant::now)
-    }
-
-    /// A login that answered no is asked again at the next measure, so a
-    /// user who logs in after a refused move is seen at once, while a yes
-    /// is kept as any answer is, until a fresh measure hears no.
-    #[tokio::test]
-    async fn a_refused_login_is_asked_again_and_a_login_is_kept() {
-        let dir = tempfile::tempdir().unwrap();
-        let tools = CountingTools::only(dir.path(), &["codex"]);
-        let home = dir.path().join("home");
-        let cache = FactCache::new(FACTS_TTL);
-        let login = (Probes::of(&[Tool::CodexLogin]), Reuse::Cached);
-        tools.log_out();
-        for _ in 0..2 {
-            let facts = cache
-                .measure_from(&home, &tools.env, &[], login, start())
-                .await;
-            assert_eq!(facts.get(name::CODEX_LOGIN), Some("no"));
-            assert_eq!(tools.ran(), ["codex login status"]);
-        }
-        std::fs::remove_file(dir.path().join("counting/logged-out")).unwrap();
-        for ran in [&["codex login status"][..], &[]] {
-            let facts = cache
-                .measure_from(&home, &tools.env, &[], login, start())
-                .await;
-            assert_eq!(facts.get(name::CODEX_LOGIN), Some("yes"));
-            assert_eq!(tools.ran(), ran);
-        }
-        // Logged out again and seen by a fresh measure, as `fabric doctor`
-        // takes it: the kept yes goes with it, so the next measure that
-        // may reuse an answer asks again (Codex review of PR #29).
-        tools.log_out();
-        for reuse in [Reuse::Fresh, Reuse::Cached] {
-            let facts = cache
-                .measure_from(&home, &tools.env, &[], (login.0, reuse), start())
-                .await;
-            assert_eq!(facts.get(name::CODEX_LOGIN), Some("no"), "{reuse:?}");
-            assert_eq!(tools.ran(), ["codex login status"], "{reuse:?}");
-        }
-    }
-
-    /// `fabric doctor` shows what each tool answers now: a fresh measure
-    /// runs every probe again, and its answer, not the older one, serves
-    /// the next measure that may reuse one.
-    #[tokio::test]
-    async fn a_fresh_measure_probes_again_and_its_answer_is_kept() {
-        let dir = tempfile::tempdir().unwrap();
-        let tools = CountingTools::only(dir.path(), &[]);
-        let home = dir.path().join("home");
-        let cache = FactCache::new(FACTS_TTL);
-        let node = Probes::of(&[Tool::Node]);
-        let version = dir.path().join("node-version");
-        std::fs::write(&version, "v22.23.2\n").unwrap();
-        tools.install(
-            "node",
-            &format!(
-                "case \"$1\" in --version) cat '{}' ;; -p) echo 127 ;; esac",
-                version.display()
-            ),
-        );
-        let measure = |reuse| {
-            let (cache, env, home) = (&cache, &tools.env, &home);
-            async move {
-                cache
-                    .measure_from(home, env, &[], (node, reuse), start())
-                    .await
-            }
-        };
-        assert_eq!(
-            measure(Reuse::Cached).await.get(name::NODE),
-            Some("v22.23.2")
-        );
-        assert_eq!(tools.ran(), NODE_PROBES);
-        // A version manager switched the version behind the same binary.
-        std::fs::write(&version, "v24.1.0\n").unwrap();
-        assert_eq!(measure(Reuse::Fresh).await.get(name::NODE), Some("v24.1.0"));
-        assert_eq!(tools.ran(), NODE_PROBES);
-        assert_eq!(
-            measure(Reuse::Cached).await.get(name::NODE),
-            Some("v24.1.0")
-        );
-        assert!(tools.ran().is_empty());
     }
 
     /// A tool in a directory the client's `PATH` names only relatively is
@@ -1515,9 +1175,7 @@ pub(crate) mod tests {
     /// not taken from the daemon. The daemon here sets every root itself,
     /// whatever the environment the test runs in, so a root taken from it
     /// shows (review finding on PR #13: the check of removal passed only
-    /// when the test process had no `PNPM_HOME`). Both measures share one
-    /// cache, so an answer kept for one environment must not serve the
-    /// other (issue #26).
+    /// when the test process had no `PNPM_HOME`).
     #[tokio::test]
     async fn facts_are_measured_in_the_environment_the_request_names() {
         let dir = tempfile::tempdir().unwrap();
@@ -1549,12 +1207,8 @@ pub(crate) mod tests {
                 ..Roots::default()
             },
         };
-        let cache = FactCache::new(FACTS_TTL);
-        let all = (Probes::ALL, Reuse::Cached);
-        let now = Instant::now();
-        let facts = cache
-            .measure_from(&home, &ToolEnv::from(&client), &daemon, all, now)
-            .await;
+        let facts =
+            NodeFacts::measure_from(&home, &ToolEnv::from(&client), &daemon, Probes::ALL).await;
         assert_eq!(facts.get(name::CARGO_HOME), Some("/client/cargo"));
         assert_eq!(facts.get(name::PNPM), Some("9.9.9"));
         assert_eq!(facts.get(name::PNPM_STORE), Some("/client/pnpm/store"));
@@ -1563,9 +1217,8 @@ pub(crate) mod tests {
             path,
             roots: Roots::default(),
         };
-        let facts = cache
-            .measure_from(&home, &ToolEnv::from(&bare), &daemon, all, now)
-            .await;
+        let facts =
+            NodeFacts::measure_from(&home, &ToolEnv::from(&bare), &daemon, Probes::ALL).await;
         let default_cargo = home.join(".cargo");
         assert_eq!(facts.get(name::CARGO_HOME), default_cargo.to_str());
         assert_eq!(facts.get(name::PNPM_STORE), Some("unset/store"));

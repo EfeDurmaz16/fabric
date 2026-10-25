@@ -52,7 +52,7 @@ use crate::carry::{self, PathDecision};
 use crate::clock;
 use crate::doctor::{self, Context, Target};
 use crate::error::NodeError;
-use crate::facts::{MeasuredKeys, NodeFacts, Probes, Reuse, Tool, stayed_behind};
+use crate::facts::{MeasuredKeys, NodeFacts, Probes, Tool, stayed_behind};
 use crate::faults::{self, Action, Point};
 use crate::harnesses::{HarnessConfig, HarnessEnv, adapter, refuse_secret_kind};
 use crate::job::Job;
@@ -1136,10 +1136,7 @@ impl Node {
         // Only what the keys read is measured: no login, and no tool of an
         // ecosystem the workspace does not use (issue #26).
         let probes = MeasuredKeys::probes(&detection);
-        let facts = self
-            .facts
-            .measure(&self.cfg.home, env, probes, Reuse::Cached)
-            .await;
+        let facts = NodeFacts::measure(&self.cfg.home, env, probes).await;
         local::write(
             &job.dir().secret_patterns(),
             &detection.spec().secret_patterns,
@@ -2473,10 +2470,7 @@ impl Node {
         env: &ToolEnv,
         out: &mut Out,
     ) -> Result<(), NodeError> {
-        let facts = self
-            .facts
-            .measure(&self.cfg.home, env, carry::probes(manifest), Reuse::Cached)
-            .await;
+        let facts = NodeFacts::measure(&self.cfg.home, env, carry::probes(manifest)).await;
         let decisions = carry::decide_all(manifest, &facts);
         if !decisions.is_empty() {
             out.emit(carry_decided(CarryFor::Restore, snapshot, &decisions));
@@ -2511,15 +2505,7 @@ impl Node {
     /// Reads which folders iCloud Drive syncs on this node, as the
     /// `defaults` of `env` answers; off everywhere it does not exist.
     async fn synced_folders(&self, env: &ToolEnv) -> SyncedFolders {
-        let facts = self
-            .facts
-            .measure(
-                &self.cfg.home,
-                env,
-                Probes::NONE.with(Tool::ICloud),
-                Reuse::Cached,
-            )
-            .await;
+        let facts = NodeFacts::measure(&self.cfg.home, env, Probes::NONE.with(Tool::ICloud)).await;
         SyncedFolders {
             desktop: facts.syncs(crate::facts::name::ICLOUD_DESKTOP),
             documents: facts.syncs(crate::facts::name::ICLOUD_DOCUMENTS),
@@ -2686,10 +2672,7 @@ impl Node {
         out: &mut Out,
     ) -> Result<DoctorReport, NodeError> {
         let Some(peer) = peer else {
-            let facts = self
-                .facts
-                .measure(&self.cfg.home, env, Probes::ALL, Reuse::Fresh)
-                .await;
+            let facts = NodeFacts::measure(&self.cfg.home, env, Probes::ALL).await;
             return Ok(DoctorReport::Facts {
                 facts: facts
                     .iter()
@@ -2736,7 +2719,7 @@ impl Node {
                     .map(|(harness, root)| (harness, root, floor.as_ref())),
                 Target::Peer,
                 env,
-                (Probes::ALL, Reuse::Fresh),
+                Probes::ALL,
             )
             .await?;
         let carry = match (job, latest) {
@@ -2841,7 +2824,7 @@ impl Node {
         force: bool,
         out: &mut Out,
     ) -> Result<(NodeFacts, NodeFacts), NodeError> {
-        let probes = (doctor::probes(job.0, target), Reuse::Cached);
+        let probes = doctor::probes(job.0, target);
         let (rows, here, theirs) = self.compare(peer, Some(job), target, env, probes).await?;
         out.emit(Event::Preflight {
             peer,
@@ -2860,13 +2843,13 @@ impl Node {
         job: Option<(&HarnessKind, &Path, Option<&HarnessVersion>)>,
         target: Target,
         env: &ToolEnv,
-        (probes, reuse): (Probes, Reuse),
+        probes: Probes,
     ) -> Result<(Vec<doctor::Row>, NodeFacts, NodeFacts), NodeError> {
         // Both nodes measure at once (issue #26). A session the peer
         // opened is used too: a peer behind a NAT has no address here and
         // is reachable only over the session it dialed.
         let (mut here, theirs) = tokio::join!(
-            self.facts.measure(&self.cfg.home, env, probes, reuse),
+            NodeFacts::measure(&self.cfg.home, env, probes),
             self.call(peer, |session| async move {
                 let facts = session.facts(SHORT_DEADLINE * 4).await?;
                 Ok((facts, session.clock_skew_ms(), session.kind().to_string()))
@@ -3792,9 +3775,7 @@ pub(crate) mod tests {
     /// Every fact `node` measures in `env` now, as a pull's preflight
     /// hands them on.
     async fn facts_in(node: &Node, env: &ToolEnv) -> NodeFacts {
-        node.facts
-            .measure(&node.cfg.home, env, Probes::ALL, Reuse::Fresh)
-            .await
+        NodeFacts::measure(&node.cfg.home, env, Probes::ALL).await
     }
 
     /// A job made from a one-commit repository, owned by `node` at epoch 1.
@@ -7714,32 +7695,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// A second suspend reuses the answers of the first and starts no
-    /// probe, until a tool is written again; that tool alone is then
-    /// probed (issue #26).
-    #[tokio::test]
-    async fn a_second_suspend_probes_only_a_tool_written_since() {
-        let (dir, node) = node();
-        let tools =
-            crate::facts::tests::CountingTools::only(dir.path(), &["node", "npm", "python3"]);
-        let (id, root) = npm_job(dir.path(), &node).await;
-        node.suspend(id, &tools.env, &mut Out::default())
-            .await
-            .unwrap();
-        assert_eq!(tools.ran().len(), 5, "the first suspend");
-        std::fs::write(root.join("README.md"), "edited\n").unwrap();
-        node.suspend(id, &tools.env, &mut Out::default())
-            .await
-            .unwrap();
-        assert_eq!(tools.ran(), Vec::<String>::new(), "the second suspend");
-        tools.touch("npm");
-        std::fs::write(root.join("README.md"), "edited again\n").unwrap();
-        node.suspend(id, &tools.env, &mut Out::default())
-            .await
-            .unwrap();
-        assert_eq!(tools.ran(), ["npm --version"], "after npm changed");
-    }
-
     /// The preflight of a move and of a pull measures this node while the
     /// peer measures itself (issue #26). Each node's `sw_vers` waits up to
     /// five seconds for the other's to start and says whether it did, so a
@@ -7779,9 +7734,6 @@ pub(crate) mod tests {
             &root.join("b/state"),
             tools_b.env.clone(),
         );
-        // Every measure probes, so each preflight shows its own.
-        a.facts.set_ttl(Duration::ZERO);
-        b.facts.set_ttl(Duration::ZERO);
         paired(&a, &b).await;
         let id = job(&root, &a).await;
         let macos_row = |out: &Out| {
@@ -7814,8 +7766,8 @@ pub(crate) mod tests {
     }
 
     /// A pull decides the snapshot's paths with what its preflight measured
-    /// here and measures again only for the restore (issue #26): with no
-    /// answer reused, `node --version` runs once for each, and the login
+    /// here and measures again only for the restore (issue #26):
+    /// `node --version` runs once for each, and the login
     /// of the job's harness, which only the preflight reads, once. The two
     /// nodes share one home, as the gate Macs do, so the preflight lets the
     /// pull through.
@@ -7837,7 +7789,6 @@ pub(crate) mod tests {
         a.suspend(id, &tools_a.env, &mut Out::default())
             .await
             .unwrap();
-        b.facts.set_ttl(Duration::ZERO);
         tools_b.ran();
         let mut out = Out::default();
         let pulled = b
@@ -7855,5 +7806,95 @@ pub(crate) mod tests {
         let count = |probe: &str| ran.iter().filter(|line| *line == probe).count();
         assert_eq!(count("node --version"), 2, "{ran:?}");
         assert_eq!(count("codex login status"), 1, "{ran:?}");
+    }
+
+    /// A move asks the target for its login every time (review of PR #29).
+    /// A login answer kept from the first move, made before the target
+    /// logged out, let the second through to a node where Codex cannot
+    /// start; the move must be refused, as the login row allows no waiver.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_to_a_target_that_logged_out_since_the_last_move_is_refused() {
+        let dir = tempfile::Builder::new()
+            .prefix("fops")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let home = root.join("home");
+        let tools_a = crate::facts::tests::CountingTools::only(&root.join("a"), &["codex"]);
+        let tools_b = crate::facts::tests::CountingTools::only(&root.join("b"), &["codex"]);
+        let a = node_at(&home, &root.join("a/state"), tools_a.env.clone());
+        let b = node_at(&home, &root.join("b/state"), tools_b.env.clone());
+        paired(&a, &b).await;
+        let first = job(&root.join("first"), &a).await;
+        let second = job(&root.join("second"), &a).await;
+        let mut out = Out::default();
+        let moved = a.job_move(first, b.id, false, &tools_a.env, &mut out).await;
+        assert!(moved.is_ok(), "{moved:?} {:?}", out.said());
+
+        tools_b.log_out();
+        let mut out = Out::default();
+        let refused = a
+            .job_move(second, b.id, false, &tools_a.env, &mut out)
+            .await;
+        assert!(
+            matches!(&refused, Err(NodeError::Preflight(facts)) if facts == &["codex.login"]),
+            "{refused:?} {:?}",
+            out.said()
+        );
+    }
+
+    /// A pull decides the carry of a tree with what this node's Node is
+    /// now (review of PR #29). A version manager's shim switches the
+    /// version behind the same binary; an answer kept from a measure made
+    /// before the switch carried a tree built for Node 22 to a node now on
+    /// Node 24, whose native addons would not load. The keys then differ,
+    /// so the tree is installed again from its lockfile.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pull_after_a_node_switch_behind_the_same_binary_rebuilds_the_tree() {
+        let dir = tempfile::Builder::new()
+            .prefix("fops")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let home = root.join("home");
+        let tools_a =
+            crate::facts::tests::CountingTools::only(&root.join("a"), &["node", "npm", "codex"]);
+        let tools_b = crate::facts::tests::CountingTools::only(&root.join("b"), &["npm", "codex"]);
+        let (version, abi) = (root.join("b/node-version"), root.join("b/node-abi"));
+        tools_b.install(
+            "node",
+            &format!(
+                "case \"$1\" in --version) cat '{}' ;; -p) cat '{}' ;; esac",
+                version.display(),
+                abi.display()
+            ),
+        );
+        std::fs::write(&version, "v22.23.2\n").unwrap();
+        std::fs::write(&abi, "127\n").unwrap();
+        let a = node_at(&home, &root.join("a/state"), tools_a.env.clone());
+        let b = node_at(&home, &root.join("b/state"), tools_b.env.clone());
+        paired(&a, &b).await;
+        let (id, _) = npm_job(&root, &a).await;
+        a.suspend(id, &tools_a.env, &mut Out::default())
+            .await
+            .unwrap();
+        // b answers a's doctor on Node 22, then its shim moves to Node 24.
+        a.doctor(Some(b.id), None, &tools_a.env, &mut Out::default())
+            .await
+            .unwrap();
+        std::fs::write(&version, "v24.1.0\n").unwrap();
+        std::fs::write(&abi, "137\n").unwrap();
+
+        let mut out = Out::default();
+        let pulled = b
+            .job_resume(id, Some(a.id), None, false, &tools_b.env, &mut out)
+            .await;
+        let said = out.said();
+        let decided = |word: &str| {
+            said.iter()
+                .any(|line| line.starts_with(&format!("{word} node_modules")))
+        };
+        assert!(decided("rebuild"), "{pulled:?} {said:?}");
+        assert!(!decided("carry  "), "{pulled:?} {said:?}");
     }
 }

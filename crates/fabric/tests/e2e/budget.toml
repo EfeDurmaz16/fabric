@@ -42,15 +42,15 @@ percentile = 25
 "acp suspend" = { git = [28, 30], ps = [0, 0] }
 "acp move" = { git = [2, 2], ps = [0, 0] }
 "acp resume" = { git = [16, 20], ps = [3, 3] }
-"acp pull" = { git = [48, 52], ps = [3, 3] }
+"acp pull" = { git = [50, 54], ps = [3, 3] }
 "claude suspend" = { git = [28, 30], ps = [0, 0] }
-"claude move" = { git = [0, 0], ps = [0, 0] }
+"claude move" = { git = [2, 2], ps = [0, 0] }
 "claude resume" = { git = [16, 20], ps = [3, 3] }
-"claude pull" = { git = [48, 52], ps = [3, 3] }
+"claude pull" = { git = [50, 54], ps = [3, 3] }
 "codex suspend" = { git = [28, 30], ps = [0, 0] }
-"codex move" = { git = [0, 0], ps = [0, 0] }
+"codex move" = { git = [2, 2], ps = [0, 0] }
 "codex resume" = { git = [16, 20], ps = [3, 3] }
-"codex pull" = { git = [48, 52], ps = [3, 3] }
+"codex pull" = { git = [50, 54], ps = [3, 3] }
 "cold start" = { git = [0, 0], ps = [0, 0] }
 "restart" = { git = [0, 0], ps = [0, 0] }
 
@@ -67,3 +67,7 @@ why = "macos-aarch64 baselines from main dbd3b9e: the median of five runs' 25th 
 [[change]]
 date = "2026-10-25"
 why = "Hot paths sped up (issue #26): each operation measures only the facts it reads and keeps them a minute, a capture and a restore batch their git calls, and both nodes restart after each run. Process counts of that branch; the acp move is the first of each run, so only it measures git, here and on the peer. macos-aarch64 baselines from it: the median of five runs' 25th percentile, test profile, on an 18-core Apple silicon Mac under a load average of 3 to 5"
+
+[[change]]
+date = "2026-10-25"
+why = "Review of PR #29: no fact is kept from one measure to the next, since a kept login let a move through to a target that had logged out and a kept Node version carried a tree a shim had switched away from. Every move and pull measures git here and on the peer again: moves 2/2 and pulls 50/54. b no longer restarts after each run, which only the kept facts needed. Baselines stay until the end of this review"
