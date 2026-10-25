@@ -16,20 +16,20 @@ percentile = 25
 # Each op's baseline in ms, the time at `percentile` on that platform. A
 # platform with no baselines only reports its times.
 [baseline.macos-aarch64]
-"acp suspend" = 480
-"acp move" = 138
-"acp resume" = 531
-"acp pull" = 956
-"claude suspend" = 472
-"claude move" = 59
-"claude resume" = 663
-"claude pull" = 1239
-"codex suspend" = 627
-"codex move" = 59
-"codex resume" = 810
-"codex pull" = 1577
-"cold start" = 55
-"restart" = 71
+"acp suspend" = 342
+"acp move" = 144
+"acp resume" = 545
+"acp pull" = 995
+"claude suspend" = 407
+"claude move" = 145
+"claude resume" = 684
+"claude pull" = 1221
+"codex suspend" = 550
+"codex move" = 144
+"codex resume" = 836
+"codex pull" = 1486
+"cold start" = 57
+"restart" = 78
 
 # Report only until CI produces numbers.
 [baseline.linux-x86_64]
@@ -75,3 +75,7 @@ why = "Review of PR #29: no fact is kept from one measure to the next, since a k
 [[change]]
 date = "2026-10-25"
 why = "Review of PR #29: the budget also counts the kill, lsof, pgrep and ps the harness runs from their system paths, which the counted-tools build takes from the test's bin, so a second open-file check of a Codex rollout shows. A Codex capture and a Codex restore each run lsof once; nothing here runs kill, pgrep or the harness's ps"
+
+[[change]]
+date = "2026-10-25"
+why = "Review of PR #29: macos-aarch64 baselines from this branch with no fact kept and the git behind the macOS stub run through the fixture's link: the median of five runs' 25th percentile, test profile, on an 18-core Apple silicon Mac under a load average of 3 to 6. Suspends fell by 65 to 140 ms, since the fixture no longer pays the stub; the Claude and Codex moves rose by about 85 ms, since every move measures both nodes again"
