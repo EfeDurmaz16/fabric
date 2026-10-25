@@ -254,6 +254,10 @@ impl Env {
             .env("PATH", path)
             .env("FABRIC_HOME", state)
             .env("FAKE_STATE_DIR", self.home.join(".fake-agent"))
+            // The harness runs a kill, lsof, pgrep or ps it finds in the
+            // test's `bin` in place of the system's; only the time budget
+            // puts them there, to count them.
+            .env("FABRIC_SYSTEM_TOOLS", self.bin())
             .stdin(Stdio::null());
         if let Some(level) = std::env::var_os("FABRIC_LOG") {
             command.env("FABRIC_LOG", level);

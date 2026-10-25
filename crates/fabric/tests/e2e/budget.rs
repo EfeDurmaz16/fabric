@@ -3,17 +3,20 @@
 //! suspended, moved, resumed on the target and pulled back, run after
 //! run, and a daemon is started on an empty state directory and restarted
 //! on a full one. Each op's time is held to the baseline `budget.toml`
-//! records for this platform, and the git and ps processes it starts to
-//! the exact counts recorded there.
+//! records for this platform, and the git, kill, lsof, pgrep and ps
+//! processes it starts to the exact counts recorded there: those the
+//! daemon finds on its `PATH`, and those the harness runs from their
+//! system paths, which the `counted-tools` build takes from the test's
+//! `bin` (`FABRIC_SYSTEM_TOOLS`).
 //!
 //! Every program the node's facts probe, but git, is a fake that answers
 //! after a fixed 50 ms, so a probe costs about the same on every machine
 //! and a probe run once more than before shows. git is the machine's own,
 //! linked into the test's `bin`.
 //!
-//! Two warm-up runs come first, and they count processes: git and ps are
-//! then wrappers that note each start, and plain links again for the
-//! timed runs, so the counting costs them nothing. The first run is each
+//! Two warm-up runs come first, and they count processes: the counted
+//! programs are then wrappers that note each start, and plain links again
+//! for the timed runs, so the counting costs them nothing. The first run is each
 //! job's first move, which differs from the later ones; a count that
 //! grows from the first run to the second grows with the job's history.
 //! Then `reps` runs are timed, and an op whose time at `percentile` is
@@ -42,13 +45,22 @@ const BUDGET: &str = include_str!("budget.toml");
 const PROBE_DELAY: &str = "0.05";
 
 /// The programs counted: each is a wrapper while the warm-up runs.
-const COUNTED: [&str; 2] = ["git", "ps"];
+const COUNTED: [&str; 5] = ["git", "kill", "lsof", "pgrep", "ps"];
 
 /// How many warm-up runs count processes.
 const COUNTED_RUNS: usize = 2;
 
-/// Where macOS and Linux keep `ps`.
-const PS: [&str; 2] = ["/bin/ps", "/usr/bin/ps"];
+/// Where macOS and Linux keep each counted program but git, as the
+/// harness looks for it.
+const SYSTEM: [(&str, &[&str]); 4] = [
+    ("kill", &["/bin/kill", "/usr/bin/kill"]),
+    (
+        "lsof",
+        &["/usr/sbin/lsof", "/usr/bin/lsof", "/sbin/lsof", "/bin/lsof"],
+    ),
+    ("pgrep", &["/usr/bin/pgrep", "/bin/pgrep"]),
+    ("ps", &["/bin/ps", "/usr/bin/ps"]),
+];
 
 /// Each program the node's facts probe (`NodeFacts::measure` in
 /// `crates/fabricd/src/facts.rs`), but git and the harnesses, with the
@@ -289,23 +301,26 @@ fn percentile(samples: &[Duration], percentile: usize) -> Option<Duration> {
 struct Counter {
     bin: PathBuf,
     dir: PathBuf,
-    real: [(&'static str, PathBuf); 2],
+    real: Vec<(&'static str, PathBuf)>,
 }
 
 impl Counter {
     fn new(env: &Env) -> Fallible<Self> {
-        let git = fs::read_link(env.bin().join("git"))?;
-        let ps = PS
-            .iter()
-            .map(PathBuf::from)
-            .find(|path| path.is_file())
-            .ok_or("no ps")?;
+        let mut real = vec![("git", fs::read_link(env.bin().join("git"))?)];
+        for (name, candidates) in SYSTEM {
+            let found = candidates
+                .iter()
+                .map(PathBuf::from)
+                .find(|path| path.is_file())
+                .ok_or_else(|| format!("no {name}"))?;
+            real.push((name, found));
+        }
         let dir = env.root.join("counts");
         fs::create_dir_all(&dir)?;
         let counter = Self {
             bin: env.bin(),
             dir,
-            real: [("git", git), ("ps", ps)],
+            real,
         };
         counter.off()?;
         Ok(counter)
@@ -621,7 +636,7 @@ fn report(budget: &Budget, mode: Mode, rows: &[Row]) -> String {
          Times in ms: the {}th percentile of {} timed runs, the median, and the {}th \
          percentile of a second batch when the first was over the limit in enforce mode. \
          The limit is the larger of {} x baseline and baseline + {} ms. Processes are the \
-         starts of git and ps in each of the {COUNTED_RUNS} warm-up runs.\n\n",
+         starts of each counted program in each of the {COUNTED_RUNS} warm-up runs.\n\n",
         mode.name(),
         budget.percentile,
         budget.reps,

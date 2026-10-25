@@ -10,6 +10,9 @@ publish.workspace = true
 [features]
 # Named fault points in the node, for the end-to-end test only.
 faults = ["fabricd/faults"]
+# The harness's kill, lsof, pgrep and ps from FABRIC_SYSTEM_TOOLS, so the
+# end-to-end time budget can count them.
+counted-tools = ["fabric-harness/counted-tools"]
 # The fake harnesses the end-to-end test launches: the ACP agent and a
 # full-screen harness for the terminal tests.
 fixtures = ["dep:serde_json"]
@@ -31,9 +34,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
 [dev-dependencies]
-# The end-to-end test runs this package's binaries with the fault points
-# and the fake agent built in; this turns both on for test builds only.
-fabric = { path = ".", features = ["faults", "fixtures"] }
+# The end-to-end test runs this package's binaries with the fault points,
+# the fake agent and the counted system tools built in; this turns them on
+# for test builds only.
+fabric = { path = ".", features = ["counted-tools", "faults", "fixtures"] }
 # The terminal tests open a pseudo-terminal and make it a session's
 # controlling terminal; rustix is already a dependency of this package.
 rustix = { version = "1.1", features = ["fs", "process", "pty", "termios"] }

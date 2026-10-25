@@ -34,25 +34,25 @@ percentile = 25
 # Report only until CI produces numbers.
 [baseline.linux-x86_64]
 
-# The git and ps processes each op starts in each warm-up run: exact, and
-# the same on every platform. The first run moves each job for the first
-# time; a count that grows from the first run to the second grows with the
-# job's history.
+# The git, kill, lsof, pgrep and ps processes each op starts in each
+# warm-up run, the harness's own included: exact, and the same on every
+# platform. The first run moves each job for the first time; a count that
+# grows from the first run to the second grows with the job's history.
 [processes]
-"acp suspend" = { git = [28, 30], ps = [0, 0] }
-"acp move" = { git = [2, 2], ps = [0, 0] }
-"acp resume" = { git = [16, 20], ps = [3, 3] }
-"acp pull" = { git = [50, 54], ps = [3, 3] }
-"claude suspend" = { git = [28, 30], ps = [0, 0] }
-"claude move" = { git = [2, 2], ps = [0, 0] }
-"claude resume" = { git = [16, 20], ps = [3, 3] }
-"claude pull" = { git = [50, 54], ps = [3, 3] }
-"codex suspend" = { git = [28, 30], ps = [0, 0] }
-"codex move" = { git = [2, 2], ps = [0, 0] }
-"codex resume" = { git = [16, 20], ps = [3, 3] }
-"codex pull" = { git = [50, 54], ps = [3, 3] }
-"cold start" = { git = [0, 0], ps = [0, 0] }
-"restart" = { git = [0, 0], ps = [0, 0] }
+"acp suspend" = { git = [28, 30], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
+"acp move" = { git = [2, 2], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
+"acp resume" = { git = [16, 20], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [3, 3] }
+"acp pull" = { git = [50, 54], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [3, 3] }
+"claude suspend" = { git = [28, 30], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
+"claude move" = { git = [2, 2], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
+"claude resume" = { git = [16, 20], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [3, 3] }
+"claude pull" = { git = [50, 54], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [3, 3] }
+"codex suspend" = { git = [28, 30], kill = [0, 0], lsof = [1, 1], pgrep = [0, 0], ps = [0, 0] }
+"codex move" = { git = [2, 2], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
+"codex resume" = { git = [16, 20], kill = [0, 0], lsof = [1, 1], pgrep = [0, 0], ps = [3, 3] }
+"codex pull" = { git = [50, 54], kill = [0, 0], lsof = [2, 2], pgrep = [0, 0], ps = [3, 3] }
+"cold start" = { git = [0, 0], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
+"restart" = { git = [0, 0], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
 
 # Every change to this file adds an entry here, below the others, that
 # says when and why. Entries are never edited or removed.
@@ -71,3 +71,7 @@ why = "Hot paths sped up (issue #26): each operation measures only the facts it 
 [[change]]
 date = "2026-10-25"
 why = "Review of PR #29: no fact is kept from one measure to the next, since a kept login let a move through to a target that had logged out and a kept Node version carried a tree a shim had switched away from. Every move and pull measures git here and on the peer again: moves 2/2 and pulls 50/54. b no longer restarts after each run, which only the kept facts needed. Baselines stay until the end of this review"
+
+[[change]]
+date = "2026-10-25"
+why = "Review of PR #29: the budget also counts the kill, lsof, pgrep and ps the harness runs from their system paths, which the counted-tools build takes from the test's bin, so a second open-file check of a Codex rollout shows. A Codex capture and a Codex restore each run lsof once; nothing here runs kill, pgrep or the harness's ps"

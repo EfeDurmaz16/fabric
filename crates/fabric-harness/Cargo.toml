@@ -17,6 +17,10 @@ claude = ["dep:uuid"]
 codex = ["dep:zstd"]
 # Named crash points in capture and restore, for the crash tests only.
 crashpoints = []
+# For the end-to-end time budget only: the kill, lsof, pgrep and ps in the
+# directory FABRIC_SYSTEM_TOOLS names run in place of the system's, so the
+# budget can count them.
+counted-tools = []
 
 [dependencies]
 blake3 = "1.8"
