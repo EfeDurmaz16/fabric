@@ -88,8 +88,9 @@ pub enum GitError {
 ///
 /// On macOS `/usr/bin/git` is a stub that asks `xcrun` for the developer
 /// tools' git on every call, which costs more than the git command it
-/// runs. When the stub is the one found, the git it would run is run
-/// directly, provided that one is outside `repo` too (`shim_target`).
+/// runs. When the one found is the stub, or a link that resolves to it,
+/// the git it would run is run directly, provided that one is outside
+/// `repo` too (`shim_target`).
 fn program(path_var: Option<&OsStr>, repo: &Path) -> Option<PathBuf> {
     let repo = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_owned());
     let inside =
@@ -99,7 +100,7 @@ fn program(path_var: Option<&OsStr>, repo: &Path) -> Option<PathBuf> {
         .map(|dir| dir.join("git"))
         .find(|candidate| !inside(candidate) && executable(candidate))?;
     if cfg!(target_os = "macos")
-        && found == Path::new(XCRUN_SHIM)
+        && std::fs::canonicalize(&found).is_ok_and(|real| real == Path::new(XCRUN_SHIM))
         && let Some(real) = shim_target()
         && !real.starts_with(&repo)
         && !inside(real)
@@ -443,22 +444,37 @@ mod tests {
 
     /// The macOS stub at `/usr/bin/git` asks `xcrun` for the developer
     /// tools' git on every call, which cost a suspend about 6 ms per git
-    /// command (issue #26); the git `xcrun` names runs instead.
+    /// command (issue #26); the git `xcrun` names runs instead, also when
+    /// the `PATH` finds the stub through a link, as in the end-to-end
+    /// fixture's `bin` (review of PR #29).
     #[cfg(target_os = "macos")]
     #[test]
     fn the_git_behind_the_macos_stub_runs_in_its_place() {
         let dir = tempfile::tempdir().unwrap();
-        let found = program(Some(OsStr::new("/usr/bin:/bin")), dir.path()).unwrap();
+        let repo = dir.path().join("repo");
+        let linked = dir.path().join("bin");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir(&linked).unwrap();
+        std::os::unix::fs::symlink(XCRUN_SHIM, linked.join("git")).unwrap();
         let named = Command::new("/usr/bin/xcrun")
             .args(["--find", "git"])
             .output()
             .unwrap();
-        if named.status.success() {
-            let named = String::from_utf8(named.stdout).unwrap();
-            assert_eq!(found, Path::new(named.trim_end()));
+        // Without developer tools only the stub can say so.
+        let expected = if named.status.success() {
+            PathBuf::from(String::from_utf8(named.stdout).unwrap().trim_end())
         } else {
-            // Without developer tools only the stub can say so.
-            assert_eq!(found, Path::new(XCRUN_SHIM));
+            PathBuf::from(XCRUN_SHIM)
+        };
+        for path in [
+            std::ffi::OsString::from("/usr/bin:/bin"),
+            std::env::join_paths([linked.as_path(), Path::new("/usr/bin")]).unwrap(),
+        ] {
+            assert_eq!(
+                program(Some(&path), &repo),
+                Some(expected.clone()),
+                "{path:?}"
+            );
         }
     }
 
