@@ -15,10 +15,11 @@
 //! command made. When a journal exists, the thread opens it, runs
 //! `verify` and restart recovery before it answers any call, off the
 //! daemon's start path: a dispatched operation becomes unknown and
-//! nothing is replayed or granted. A journal that fails `verify` stops the authority, never the
-//! daemon: every managed call is refused with the reason and standalone
-//! jobs run as before. A managed job never takes an id a standalone job
-//! has, and a managed command never acts on a standalone job.
+//! nothing is replayed or granted. A journal that fails `verify` stops
+//! the authority, never the daemon: every managed call is refused with
+//! the reason and standalone jobs run as before. A managed job never
+//! takes an id a standalone job has, and a managed command never acts on
+//! a standalone job.
 //!
 //! The ids the journal holds are also published outside the queue, read
 //! once the file opens and before `verify` and recovery run, so a
