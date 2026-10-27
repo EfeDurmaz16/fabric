@@ -284,7 +284,9 @@ fn cannot_run(steps: &[SetupStep], key: &CarryKey, target: &NodeFacts) -> Option
 ///   under it stayed behind and a finished install vouches for the bytes,
 ///   since without one resume would run the steps there anyway, and a
 ///   restore drops the record of a tree with holes, so resume would run
-///   them over it too; else refuse.
+///   them over it too; else refuse. A venv is never carried that way: it
+///   runs only under the interpreter its key names, which the target is
+///   known to have only when the keys match (M2-20).
 /// - The next build makes it: carry when the keys match, or when the
 ///   platform matches and the target lacks the toolchain the key names;
 ///   leave it behind on another platform; else rebuild.
@@ -409,8 +411,18 @@ fn decide_setup(
     let steps_text = steps_text.join(", then ");
     let advice = "install the tool on the target, or pass --force to carry it as it is";
     let partial = entry.carry == CarryState::Partial;
+    // A venv runs only under the interpreter it was made with, which its
+    // `python` links to and its key names; the keys did not match, so the
+    // target is not known to have that interpreter (M2-20).
+    let interpreter = match &entry.key {
+        CarryKey::Python {
+            python_version,
+            python_home,
+        } => Some(format!("{python_version} at {python_home}")),
+        _ => None,
+    };
     match (seen.same_platform, seen.native) {
-        (true, None) if installed && !partial => CarryDecision::Carry {
+        (true, None) if installed && !partial && interpreter.is_none() => CarryDecision::Carry {
             why: format!(
                 "{missing}, so {steps_text} cannot rebuild it there; it holds no native addon, the os and arch match and a finished install vouches for it, so it travels as it is"
             ),
@@ -424,6 +436,20 @@ fn decide_setup(
                 "{missing}, so {steps_text} cannot rebuild it there, and files under it that match a secret pattern or .fabricignore stayed on the source, so resume there would run {steps_text} first to fill them; install the tool on the target, or pass --force to carry it and install the tool before resuming"
             ),
         },
+        (true, None) if let Some(interpreter) = interpreter => {
+            let theirs = match &seen.theirs {
+                CarryKey::Python {
+                    python_version,
+                    python_home,
+                } => format!("{python_version} at {python_home}"),
+                _ => "none".to_owned(),
+            };
+            CarryDecision::Refuse {
+                reason: format!(
+                    "{missing}, so {steps_text} cannot rebuild it there, and a venv runs only under the interpreter it was made with, {interpreter}, where the target's python3 is {theirs}; {advice}"
+                ),
+            }
+        }
         // Materialize runs the steps over a tree no finished install
         // vouches for, so the bytes alone would not let the job resume.
         (true, None) => CarryDecision::Refuse {
@@ -1086,7 +1112,7 @@ mod tests {
     }
 
     #[test]
-    fn a_venv_with_a_lockfile_is_rebuilt_where_uv_runs_and_travels_where_it_does_not() {
+    fn a_venv_with_a_lockfile_is_rebuilt_where_uv_runs_and_refused_where_nothing_runs_it() {
         let source = NodeFacts::from_pairs([
             (name::OS, "macos"),
             (name::ARCH, "aarch64"),
@@ -1124,7 +1150,78 @@ mod tests {
         ]);
         let decision = decide(&venv, &macos(), &without_uv);
         assert!(
-            matches!(&decision, CarryDecision::Carry { why, .. } if why.starts_with("uv is not installed")),
+            matches!(&decision, CarryDecision::Refuse { reason } if reason.starts_with("uv is not installed")),
+            "{decision:?}"
+        );
+    }
+
+    /// M2-20: a finished venv carried to a target without uv was called
+    /// runnable whatever interpreter the target had, but a venv runs only
+    /// under the interpreter it was made with, which its `python` links
+    /// to and its key names (version and `sys.base_prefix`). It travels as
+    /// it is only to a target with that interpreter, whose key then
+    /// matches; to any other the move is refused, naming both
+    /// interpreters, and a forced one carries it. The same holds for a
+    /// venv `python3 -m pip` fills, on a target with no `python3`.
+    #[test]
+    fn a_finished_venv_without_its_installer_travels_only_to_its_interpreter() {
+        let key = CarryKey::Python {
+            python_version: "Python 3.12.1".to_owned(),
+            python_home: fabric_core::path::AbsPath::parse("/opt/py312").unwrap(),
+        };
+        let filled_by = |program: &str, args: &[&str]| {
+            entry(
+                ".venv",
+                CacheClass::Deps,
+                key.clone(),
+                Remake::Setup {
+                    steps: vec![step(program, args)],
+                    installed: true,
+                },
+            )
+        };
+        let on = |facts: &[(&'static str, &'static str)]| {
+            NodeFacts::from_pairs(
+                [(name::OS, "macos"), (name::ARCH, "aarch64")]
+                    .into_iter()
+                    .chain(facts.iter().copied()),
+            )
+        };
+        let uv = filled_by("uv", &["sync", "--frozen"]);
+        let same = on(&[
+            (name::PYTHON, "Python 3.12.1"),
+            (name::PYTHON_HOME, "/opt/py312"),
+        ]);
+        assert!(
+            matches!(decide(&uv, &macos(), &same), CarryDecision::Carry { why, .. } if why == "the keys match")
+        );
+        let others: [&[(&str, &str)]; 3] = [
+            &[
+                (name::PYTHON, "Python 3.13.0"),
+                (name::PYTHON_HOME, "/opt/py313"),
+            ],
+            &[
+                (name::PYTHON, "Python 3.12.1"),
+                (name::PYTHON_HOME, "/usr/local"),
+            ],
+            &[],
+        ];
+        for other in others {
+            let decision = decide(&uv, &macos(), &on(other));
+            assert!(
+                matches!(&decision, CarryDecision::Refuse { reason }
+                    if reason.starts_with("uv is not installed") && reason.contains("Python 3.12.1 at /opt/py312")),
+                "{other:?}: {decision:?}"
+            );
+            assert!(decision.writes(), "a forced move still carries it");
+        }
+        let pip = filled_by(
+            "python3",
+            &["-m", "pip", "install", "-r", "requirements.txt"],
+        );
+        let decision = decide(&pip, &macos(), &on(&[]));
+        assert!(
+            matches!(&decision, CarryDecision::Refuse { reason } if reason.starts_with("python3 is not installed")),
             "{decision:?}"
         );
     }
