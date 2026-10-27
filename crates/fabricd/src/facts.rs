@@ -35,7 +35,7 @@ use fabric_core::path::{AbsPath, RelPath};
 use fabric_core::snapshot::{CacheClass, CarryKey, LeftBehind, Platform, Remake, SnapshotManifest};
 use fabric_env::detect::{CacheOrigin, Completion, Detection, Ecosystem, NodeManager};
 use fabric_env::materialize::CacheHealth;
-use fabric_net::wire::{FactName, FactValue, Facts, MAX_FACT_VALUE};
+use fabric_net::wire::{FactName, FactValue, Facts, MAX_FACT_NAME, MAX_FACT_VALUE, MAX_FACTS};
 use fabric_store::capture::CarryKeys;
 
 use crate::harnesses::HarnessEnv;
@@ -119,6 +119,53 @@ pub mod name {
     /// agent; measured by the target of a pull, and by a push target for a
     /// question that names the job's harness.
     pub const ACP_STATE_DIR: &str = "acp.state_dir";
+    /// Only in an answer to a peer that had no room for every fact: the
+    /// facts it left out, by name, separated by a space, and `+N` at the
+    /// end when N more did not fit this value either (M2-26). An answer
+    /// holds at most `MAX_FACTS` facts, and a fact whose name or value is
+    /// longer than a fact holds is left out, never cut.
+    pub const LEFT_OUT: &str = "facts.left_out";
+
+    /// Every fact a measure can give, which an answer to a peer keeps
+    /// before any other: they always fit it, with room for `LEFT_OUT`.
+    pub const MEASURED: [&str; 31] = [
+        USER,
+        HOME,
+        GIT,
+        LSOF,
+        OS,
+        ARCH,
+        FABRIC,
+        MACOS,
+        MACOS_SDK,
+        NODE,
+        NODE_ABI,
+        NPM,
+        PNPM,
+        PNPM_STORE,
+        YARN,
+        BUN,
+        RUSTC,
+        CARGO,
+        CARGO_HOME,
+        PYTHON,
+        PYTHON_HOME,
+        UV,
+        CLAUDE,
+        CLAUDE_LOGIN,
+        CLAUDE_KEYCHAIN,
+        CODEX,
+        CODEX_LOGIN,
+        ICLOUD_DESKTOP,
+        ICLOUD_DOCUMENTS,
+        ACP_AGENT,
+        ACP_STATE_DIR,
+    ];
+
+    const _: () = assert!(
+        MEASURED.len() < fabric_net::wire::MAX_FACTS,
+        "the measured facts and LEFT_OUT fit one answer"
+    );
 }
 
 /// One node's measured facts, by name.
@@ -608,15 +655,62 @@ impl NodeFacts {
         self.get(name) == Some("1")
     }
 
-    /// The facts as the wire carries them; a value too long for a fact is cut.
+    /// The facts as one answer to a peer carries them (M2-26).
+    ///
+    /// An answer holds at most `MAX_FACTS` facts. A fact whose name or
+    /// value is longer than a fact holds is left out whole, since a cut
+    /// value is a wrong one. With no room for every fact, the answer keeps
+    /// those a measure gives ([`name::MEASURED`]) first, then the others
+    /// by name, and names what it left out in [`name::LEFT_OUT`], so the
+    /// peer knows a fact it does not find may only have had no room.
     #[must_use]
     pub fn to_wire(&self) -> Facts {
-        let pairs = self
+        let fits = |(name, value): &(&String, &String)| {
+            name.len() <= MAX_FACT_NAME
+                && value.len() <= MAX_FACT_VALUE
+                && name.as_str() != name::LEFT_OUT
+        };
+        let wire = |(name, value): (&String, &String)| {
+            (FactName::truncated(name), FactValue::truncated(value))
+        };
+        if self.0.len() <= MAX_FACTS && self.0.iter().all(|pair| fits(&pair)) {
+            return Facts::clamped(self.0.iter().map(wire).collect());
+        }
+        let (measured, other): (Vec<_>, Vec<_>) = self
             .0
             .iter()
-            .map(|(k, v)| (FactName::truncated(k), FactValue::truncated(v)))
-            .collect();
-        Facts::new(pairs).unwrap_or_default()
+            .filter(|(name, _)| name.as_str() != name::LEFT_OUT)
+            .partition(|(name, _)| name::MEASURED.contains(&name.as_str()));
+        let room = MAX_FACTS - 1;
+        let mut kept = Vec::with_capacity(MAX_FACTS);
+        let mut left_out = Vec::new();
+        for pair in measured.into_iter().chain(other) {
+            if kept.len() < room && fits(&pair) {
+                kept.push(wire(pair));
+            } else {
+                left_out.push(pair.0.as_str());
+            }
+        }
+        if !left_out.is_empty() {
+            kept.push((
+                FactName::truncated(name::LEFT_OUT),
+                FactValue::truncated(&left_out_value(&left_out)),
+            ));
+        }
+        Facts::clamped(kept)
+    }
+
+    /// Whether `fact`, absent here, was left out of the answer these facts
+    /// came from, or may have been: named in its `LEFT_OUT`, or among the
+    /// more it had no room to name (M2-26).
+    #[must_use]
+    pub fn left_out(&self, fact: &str) -> bool {
+        self.get(fact).is_none()
+            && self.get(name::LEFT_OUT).is_some_and(|names| {
+                names
+                    .split(' ')
+                    .any(|left| left == fact || left.starts_with('+'))
+            })
     }
 
     /// Reads a peer's facts from the wire.
@@ -644,6 +738,33 @@ impl NodeFacts {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         )
+    }
+}
+
+/// The value of `LEFT_OUT` for the facts `names`: each name, separated by
+/// a space, as long as the value has room for it and `+N` after it, then
+/// `+N` for the N it had no room for. A name with a space in it, or too
+/// long for a fact, is counted in N and never written.
+fn left_out_value(names: &[&str]) -> String {
+    // A space, a plus and the digits of any count.
+    const COUNT: usize = 2 + 20;
+    let mut value = String::new();
+    let mut more = 0usize;
+    for name in names {
+        let room = value.len() + 1 + name.len() + COUNT <= MAX_FACT_VALUE;
+        if room && name.len() <= MAX_FACT_NAME && !name.contains(' ') {
+            if !value.is_empty() {
+                value.push(' ');
+            }
+            value.push_str(name);
+        } else {
+            more += 1;
+        }
+    }
+    match more {
+        0 => value,
+        _ if value.is_empty() => format!("+{more}"),
+        _ => format!("{value} +{more}"),
     }
 }
 
@@ -1606,6 +1727,93 @@ pub(crate) mod tests {
         let mut endless = Endless(0);
         assert_eq!(read_fact(&mut endless).await, None);
         assert!(endless.0 <= 2 * MAX_FACT_VALUE, "read {} bytes", endless.0);
+    }
+
+    /// M2-26: a node whose facts did not fit one answer sent none at all,
+    /// so its peer judged a move as if the node had nothing installed. The
+    /// answer keeps every fact a measure gives, fills the rest of its room
+    /// with other facts by name, and names in `facts.left_out` what it
+    /// left out. A value too long for a fact is left out whole, never cut,
+    /// since a cut value is a wrong one.
+    #[test]
+    fn an_answer_with_no_room_for_every_fact_keeps_the_measured_ones_and_names_the_rest() {
+        use fabric_net::wire::MAX_FACTS;
+
+        let mut pairs: Vec<(String, String)> = name::MEASURED
+            .iter()
+            .map(|name| ((*name).to_owned(), format!("{name} value")))
+            .collect();
+        pairs.extend((0..MAX_FACTS).map(|n| (format!("extra.{n:02}"), "x".to_owned())));
+        let facts = NodeFacts::from_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        let wire = facts.to_wire();
+        assert_eq!(wire.iter().count(), MAX_FACTS);
+        for name in name::MEASURED {
+            assert_eq!(wire.get(name), facts.get(name), "{name}");
+        }
+        let room = MAX_FACTS - 1 - name::MEASURED.len();
+        let left: Vec<String> = (room..MAX_FACTS).map(|n| format!("extra.{n:02}")).collect();
+        assert_eq!(wire.get("facts.left_out"), Some(left.join(" ").as_str()));
+
+        let long = "/".repeat(MAX_FACT_VALUE + 1);
+        let facts = NodeFacts::from_pairs([(name::USER, "me"), (name::HOME, long.as_str())]);
+        let wire = facts.to_wire();
+        assert_eq!(wire.get(name::USER), Some("me"));
+        assert_eq!(wire.get(name::HOME), None, "a cut value is a wrong value");
+        assert_eq!(wire.get("facts.left_out"), Some(name::HOME));
+    }
+
+    /// `name::MEASURED`, which an answer keeps first, is every fact a
+    /// measure can give, once: each tool's, those that need no tool, the
+    /// Keychain's and an ACP agent's.
+    #[test]
+    fn the_measured_facts_are_every_fact_a_measure_gives() {
+        let mut given: Vec<&str> = Tool::ALL
+            .iter()
+            .flat_map(|tool| tool.commands().iter().map(|(fact, _, _)| *fact))
+            .collect();
+        let home = Path::new("/nowhere");
+        let without = NodeFacts::without_tools(home, &ToolEnv::from_vars(|_| None));
+        given.extend(without.iter().map(|(fact, _)| {
+            name::MEASURED
+                .iter()
+                .find(|known| **known == fact)
+                .copied()
+                .unwrap_or("not in MEASURED")
+        }));
+        given.extend([
+            name::LSOF,
+            name::CLAUDE_KEYCHAIN,
+            name::ACP_AGENT,
+            name::ACP_STATE_DIR,
+        ]);
+        given.sort_unstable();
+        given.dedup();
+        let mut measured = name::MEASURED.to_vec();
+        measured.sort_unstable();
+        let before = measured.len();
+        measured.dedup();
+        assert_eq!(measured.len(), before, "a name twice");
+        assert_eq!(given, measured);
+    }
+
+    /// The names of what an answer left out stop where the value has no
+    /// more room, and a count says how many more there were.
+    #[test]
+    fn left_out_names_end_in_a_count_of_those_with_no_room() {
+        assert_eq!(left_out_value(&["a.b", "c"]), "a.b c");
+        let long = "n".repeat(MAX_FACT_NAME);
+        let names: Vec<&str> = std::iter::repeat_n(long.as_str(), 100).collect();
+        let value = left_out_value(&names);
+        assert!(value.len() <= MAX_FACT_VALUE);
+        let listed = value.split(' ').filter(|n| *n == long).count();
+        assert!(value.ends_with(&format!(" +{}", 100 - listed)), "{value}");
+        assert_eq!(left_out_value(&["has space", "x"]), "x +1");
+        let facts = NodeFacts::from_pairs([(name::LEFT_OUT, "x +1")]);
+        assert!(facts.left_out("x") && facts.left_out("anything"));
+        let facts = NodeFacts::from_pairs([(name::LEFT_OUT, "x"), ("y", "1")]);
+        assert!(facts.left_out("x"));
+        assert!(!facts.left_out("y") && !facts.left_out("z"));
+        assert!(!NodeFacts::default().left_out("x"));
     }
 
     /// Every fact a node can measure, as a rich node would answer.

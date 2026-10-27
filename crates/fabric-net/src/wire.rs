@@ -220,6 +220,18 @@ impl Facts {
         Ok(Self(facts))
     }
 
+    /// Sorts `facts` by name, keeps the first value of a name given twice
+    /// and the first `MAX_FACTS` names, so it cannot fail. A caller with
+    /// more facts than an answer holds chooses what to leave out before,
+    /// and says so in a fact of its own, as a node's facts do (M2-26).
+    #[must_use]
+    pub fn clamped(mut facts: Vec<(FactName, FactValue)>) -> Self {
+        facts.sort_by(|a, b| a.0.cmp(&b.0));
+        facts.dedup_by(|later, first| later.0 == first.0);
+        facts.truncate(MAX_FACTS);
+        Self(facts)
+    }
+
     /// Returns the value of `name`, if the node measured it.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&str> {
@@ -1383,6 +1395,33 @@ mod tests {
         let facts = decode::<Facts>(&encode(&ok).unwrap()).unwrap();
         assert_eq!(facts.get("node.version"), Some("v22"));
         assert_eq!(facts.get("pnpm.version"), None);
+    }
+
+    /// A list clamped to an answer is one `Facts::new` accepts: sorted, one
+    /// value per name, the first given, and at most `MAX_FACTS` names, the
+    /// first in order.
+    #[test]
+    fn a_clamped_fact_list_is_sorted_unique_and_bounded() {
+        let pair =
+            |name: &str, value: &str| (FactName::truncated(name), FactValue::truncated(value));
+        let facts = Facts::clamped(vec![
+            pair("node.version", "v22"),
+            pair("home", "/Users/x"),
+            pair("home", "/Users/y"),
+        ]);
+        assert_eq!(
+            facts.iter().collect::<Vec<_>>(),
+            [("home", "/Users/x"), ("node.version", "v22")]
+        );
+        let many: Vec<_> = (0..=MAX_FACTS)
+            .rev()
+            .map(|i| pair(&format!("f{i:03}"), "v"))
+            .collect();
+        let facts = Facts::clamped(many);
+        assert_eq!(facts.iter().count(), MAX_FACTS);
+        assert_eq!(facts.get("f000"), Some("v"));
+        assert_eq!(facts.get(&format!("f{MAX_FACTS:03}")), None);
+        assert_eq!(decode::<Facts>(&encode(&facts).unwrap()).unwrap(), facts);
     }
 
     /// The longest chunk list a manifest may have fits the control frame in

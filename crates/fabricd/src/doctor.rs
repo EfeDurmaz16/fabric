@@ -39,6 +39,7 @@ use fabric_env::detect::every_resume;
 use crate::carry::command;
 use crate::facts::{NodeFacts, Probes, Tool, major, name};
 use crate::paths::{SyncedFolders, check_root};
+use fabric_net::wire::{MAX_FACT_VALUE, MAX_FACTS};
 
 /// The clock difference above which mtime-keyed caches are suspect (ADR 0008).
 pub const CLOCK_SKEW_LIMIT_MS: i64 = 5_000;
@@ -266,7 +267,77 @@ pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row
         outcome: Outcome::Equal,
         note: "the wire this session runs on".to_owned(),
     });
+    left_out_rows(&mut rows, peer, ctx.target);
     rows
+}
+
+/// Judges the rows of `compare` that read a fact the peer's answer left
+/// out (`judge_left_out`), and adds a row that says what it left out.
+fn left_out_rows(rows: &mut Vec<Row>, peer: &NodeFacts, target: Target) {
+    judge_left_out(rows, peer, target, |fact| {
+        matches!(
+            fact,
+            name::GIT
+                | name::LSOF
+                | name::CLAUDE_LOGIN
+                | name::CODEX_LOGIN
+                | name::ACP_AGENT
+                | name::ACP_STATE_DIR
+                | SYNCED
+        )
+    });
+    if let Some(left) = peer.get(name::LEFT_OUT) {
+        rows.push(Row {
+            fact: name::LEFT_OUT,
+            here: None,
+            peer: Some(left.to_owned()),
+            outcome: Outcome::Warn,
+            note: format!(
+                "the peer measured more than one answer holds, at most {MAX_FACTS} facts of at most {MAX_FACT_VALUE} bytes each, and left these out; a row that reads one cannot be judged and refuses"
+            ),
+        });
+    }
+}
+
+/// The fact of the row that says whether the target's iCloud Drive syncs the root.
+const SYNCED: &str = "icloud";
+
+/// Turns each row that reads a fact the peer's answer left out into a
+/// refusal that names that cause (M2-26): the row cannot be judged, and
+/// it would otherwise read the fact as one the peer does not have.
+/// `--force` waives it unless the row refuses without a waiver anyway. A
+/// row `judges_target` names reads the target's facts alone, so none of
+/// the peer's when this node is the target.
+fn judge_left_out(
+    rows: &mut [Row],
+    peer: &NodeFacts,
+    target: Target,
+    judges_target: impl Fn(&str) -> bool,
+) {
+    const ICLOUD: &[&str] = &[name::ICLOUD_DESKTOP, name::ICLOUD_DOCUMENTS, name::HOME];
+    if peer.get(name::LEFT_OUT).is_none() {
+        return;
+    }
+    for row in rows {
+        if target == Target::Here && judges_target(row.fact) {
+            continue;
+        }
+        let reads: &[&str] = match row.fact {
+            SYNCED => ICLOUD,
+            "clock" | "network" => &[],
+            _ => std::slice::from_ref(&row.fact),
+        };
+        let Some(fact) = reads.iter().copied().find(|fact| peer.left_out(fact)) else {
+            continue;
+        };
+        if row.outcome != Outcome::Refuse(Waiver::Never) {
+            row.outcome = Outcome::Refuse(Waiver::Force);
+        }
+        row.note = format!(
+            "{fact} is not in the peer's answer, which left out facts it had no room for, at most {MAX_FACTS} facts of at most {MAX_FACT_VALUE} bytes each, so this row cannot be judged; `{}` names what it left out",
+            name::LEFT_OUT
+        );
+    }
 }
 
 /// The login row's note when the target's daemon reported no Claude login
@@ -532,7 +603,7 @@ fn synced_row(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Row {
         _ => None,
     };
     Row {
-        fact: "icloud",
+        fact: SYNCED,
         here: show(here),
         peer: show(peer),
         outcome: if refusal.is_some() {
@@ -608,6 +679,7 @@ pub fn setup_rows(spec: &EnvSpec, here: &NodeFacts, peer: &NodeFacts, target: Ta
             note,
         });
     }
+    judge_left_out(&mut rows, peer, target, |_| true);
     rows
 }
 
@@ -789,6 +861,60 @@ mod tests {
                 "{fact}: only that row moves, got {others:?}"
             );
         }
+    }
+
+    /// M2-26: a peer whose facts did not fit one answer sent none, so a
+    /// move refused as if the peer had no user, no git and no login. Its
+    /// answer now keeps what the rows read and names what it left out: a
+    /// row that would read a fact left out refuses for that reason, with
+    /// the waiver it has (none for the home), and a row that reads only
+    /// this node, as the target of a pull, is judged as before. A row
+    /// says what the answer left out.
+    #[test]
+    fn a_peer_answer_that_left_facts_out_names_that_cause() {
+        use fabric_net::wire::{MAX_FACT_VALUE, MAX_FACTS};
+
+        let claude = HarnessKind::ClaudeCode;
+        let extra: Vec<(String, String)> = (0..MAX_FACTS)
+            .map(|n| (format!("extra.{n:02}"), "x".to_owned()))
+            .collect();
+        let mut many: BTreeMapPairs = pro()
+            .iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        many.extend(extra);
+        let many = NodeFacts::from_pairs(many.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        let theirs = NodeFacts::from_wire(&many.to_wire());
+        let rows = compare(&pro(), &theirs, &ctx(Some(&claude)));
+        assert!(
+            blocking(&rows, false).is_empty(),
+            "{:?}",
+            blocking(&rows, false)
+        );
+        assert_eq!(outcome_of(&rows, "facts.left_out"), Outcome::Warn);
+
+        let long = "/h".repeat(MAX_FACT_VALUE);
+        let peer = with(
+            &pro(),
+            &[(name::HOME, Some(&long)), (name::GIT, Some(&long))],
+        );
+        let theirs = NodeFacts::from_wire(&peer.to_wire());
+        let rows = compare(&pro(), &theirs, &ctx(Some(&claude)));
+        let home = rows.iter().find(|r| r.fact == name::HOME).unwrap();
+        assert_eq!(home.outcome, Outcome::Refuse(Waiver::Never));
+        assert!(home.note.contains("left out"), "{}", home.note);
+        let git = rows.iter().find(|r| r.fact == name::GIT).unwrap();
+        assert!(git.note.contains("left out"), "{}", git.note);
+        let pull = Context {
+            target: Target::Here,
+            ..ctx(Some(&claude))
+        };
+        let rows = compare(&pro(), &theirs, &pull);
+        assert_eq!(outcome_of(&rows, name::GIT), Outcome::Equal);
+        assert_eq!(
+            outcome_of(&rows, name::HOME),
+            Outcome::Refuse(Waiver::Never)
+        );
     }
 
     #[test]
