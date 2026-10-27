@@ -6,7 +6,10 @@
 //! buffer only as its bytes arrive, never past the declared length. A peer
 //! cannot make this node hold more than one frame per stream, and a header
 //! alone, four bytes that declare 8 MiB, costs this node no more than
-//! `INITIAL_CAPACITY`. A frame is `u32 length | u8 version | payload`,
+//! `INITIAL_CAPACITY`. The one exception is a reader that already counts
+//! the whole payload against a cap of its own (`Room::Held`), as a served
+//! request does against its peer's request bytes (`rpc`): it takes the
+//! whole buffer at once. A frame is `u32 length | u8 version | payload`,
 //! little endian, with `length` counting the version byte and the payload.
 
 use std::io;
@@ -98,7 +101,7 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin + ?Sized>(
     max: usize,
 ) -> Result<Vec<u8>, FrameError> {
     let len = read_header(reader, max).await?;
-    read_payload(reader, len).await
+    read_payload(reader, len, Room::Grow).await
 }
 
 /// Reads one frame's length and version byte, refusing a declared length
@@ -145,14 +148,29 @@ pub(crate) async fn read_header<R: AsyncRead + Unpin + ?Sized>(
     Ok(len - 1)
 }
 
+/// How a payload's buffer is allocated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Room {
+    /// At its whole length at once: the caller already counts that length
+    /// against a cap of its own, as a served request does (`rpc`).
+    Held,
+    /// As its bytes arrive, from `INITIAL_CAPACITY` and doubling, never
+    /// past the declared length, so a header alone costs no more than
+    /// `INITIAL_CAPACITY`.
+    Grow,
+}
+
 /// Reads a payload of `len` bytes, the length `read_header` returned,
-/// into a buffer that grows as the bytes arrive, from `INITIAL_CAPACITY`
-/// and doubling, but never past `len`.
+/// into a buffer that never holds more room than the payload needs.
 pub(crate) async fn read_payload<R: AsyncRead + Unpin + ?Sized>(
     reader: &mut R,
     len: usize,
+    room: Room,
 ) -> Result<Vec<u8>, FrameError> {
-    let mut body = Vec::with_capacity(len.min(INITIAL_CAPACITY));
+    let mut body = Vec::with_capacity(match room {
+        Room::Held => len,
+        Room::Grow => len.min(INITIAL_CAPACITY),
+    });
     let declared = u64::try_from(len).map_err(|_| FrameError::TooLarge {
         len,
         max: usize::MAX,
@@ -237,8 +255,9 @@ mod tests {
 
     /// A payload's buffer never has more room than the payload: grown as
     /// the bytes arrive, it stops at the declared length instead of
-    /// doubling past it. The payload is read after its version byte, so it
-    /// never moves in its buffer.
+    /// doubling past it, and room the caller holds is taken at once. The
+    /// payload is read after its version byte, so it never moves in its
+    /// buffer.
     #[tokio::test]
     async fn a_payload_buffer_is_never_larger_than_the_payload() {
         for len in [
@@ -261,7 +280,15 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(body, payload);
-            assert_eq!(body.capacity(), len);
+            assert_eq!(body.capacity(), len, "grown");
+            let mut cursor = wire.as_slice();
+            let declared = read_header(&mut cursor, MAX_CONTROL_FRAME).await.unwrap();
+            assert_eq!(declared, len);
+            let held = read_payload(&mut cursor, declared, Room::Held)
+                .await
+                .unwrap();
+            assert_eq!(held, payload);
+            assert_eq!(held.capacity(), len, "held");
         }
     }
 

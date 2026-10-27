@@ -79,6 +79,12 @@ A host that opens sockets and stays silent, or a spoofed source, cannot
 hold up a paired peer: handshakes run in the background with a time limit,
 a cap in all and a cap per source.
 
+A paired peer is bounded too, over all its connections at once: a node runs
+at most 16 of its per-job requests and sends it at most 4 chunk batches at
+a time, and holds at most about 16 MiB of its requests, read or being read.
+A request with no room waits, unread, for at most 30 s (ADR 0013, amended
+2026-10-27).
+
 ## On the gate network
 
 Measured 2026-10-19: the Air has a public address with the firewall off; the
