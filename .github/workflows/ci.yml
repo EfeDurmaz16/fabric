@@ -200,3 +200,53 @@ jobs:
         env:
           FABRIC_BIN: ${{ github.workspace }}/target/debug/fabric
         run: bun test
+
+  # Fabric's bridge client against the real Capsule worker
+  # (crates/fabric-bridge/tests/capsule_worker.rs): every shared scenario
+  # over the worker's stdio, then the client and a real journal through
+  # create, exec, observe, destroy, refusals and a killed worker. The worker
+  # is built from a pinned Capsule commit; bump the pin when Capsule's
+  # worker changes. The Docker test skips here: no image is on the runner,
+  # and nothing pulls one.
+  bridge-interop:
+    name: bridge interop (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: EfeDurmaz16/capsule
+          # The worker of Capsule's m3/bridge-worker that the evidence in
+          # docs/evidence/m3-interop measured.
+          ref: 9f5d65eb23fccdac668e7358ad0513ca994c011c
+          path: capsule
+          persist-credentials: false
+
+      # Node 22 is the floor the worker's package.json names.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      # The pnpm version is the one Capsule's packageManager field pins.
+      - name: Build the Capsule worker
+        working-directory: capsule
+        run: |
+          npm install --global "$(node -p 'require("./package.json").packageManager')"
+          pnpm install --frozen-lockfile
+          pnpm --filter "@capsule-sdk/bridge-worker..." run build
+
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install --no-self-update
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Bridge against the Capsule worker
+        env:
+          CAPSULE_BRIDGE_WORKER: ${{ github.workspace }}/capsule/packages/bridge-worker/dist/bin.js
+        run: cargo test -p fabric-bridge --test capsule_worker --locked -- --ignored --nocapture
