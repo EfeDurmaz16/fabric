@@ -8110,6 +8110,76 @@ pub(crate) mod tests {
         );
     }
 
+    /// M2-18's benchmark, run by hand before and after the change: a job
+    /// whose ledger holds `FABRIC_BENCH_RECORDS` records (1000 by default)
+    /// is pushed to a peer that holds it, once per new record, and the
+    /// median time of a push and the records it sends are printed.
+    ///
+    /// ```sh
+    /// cargo test -p fabricd --lib --release -- --ignored --nocapture bench_replicating_a_long_ledger
+    /// ```
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "M2-18 benchmark; run by hand"]
+    async fn bench_replicating_a_long_ledger() {
+        let records: usize = std::env::var("FABRIC_BENCH_RECORDS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(1000);
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let note = |n: usize| EventKind::Note {
+            text: format!("note {n}: {}", "x".repeat(64)),
+        };
+        {
+            let job = a.job(id).await.unwrap();
+            let mut job = job.lock().await;
+            for n in 1..records {
+                job.append(a.id, note(n)).unwrap();
+            }
+        }
+        a.push_records(id, b.id).await.unwrap();
+        let mut times = Vec::new();
+        for n in 0..15 {
+            {
+                let job = a.job(id).await.unwrap();
+                let mut job = job.lock().await;
+                job.append(a.id, note(records + n)).unwrap();
+            }
+            let started = std::time::Instant::now();
+            a.push_records(id, b.id).await.unwrap();
+            times.push(started.elapsed());
+        }
+        times.sort();
+        let held = b
+            .job(id)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .ledger()
+            .records()
+            .len();
+        let bytes: usize = a
+            .job(id)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .ledger()
+            .records()
+            .iter()
+            .map(|record| record.bytes().len())
+            .sum();
+        eprintln!(
+            "bench_replicating_a_long_ledger: {held} records, {bytes} bytes; push of one new record: median {:?}, min {:?}, max {:?}",
+            times[times.len() / 2],
+            times[0],
+            times[times.len() - 1]
+        );
+    }
+
     /// The tools a move or a pull leaves out, those of a harness other
     /// than the job's, change no outcome of its preflight on either node:
     /// with every fact of both harnesses differing between the nodes, the
