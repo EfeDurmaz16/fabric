@@ -10,9 +10,11 @@
 //! neither (ADR 0003, Who supervises the harness): it materializes the
 //! environment, launches the harness in its own process group, tells the
 //! daemon, which records `Resumed` under the planned epoch or refuses, and
-//! waits for the harness to exit. An interactive harness launched from a
-//! terminal is held before its exec until the daemon has recorded it and
-//! its group owns the terminal (`terminal`).
+//! waits for the harness to exit. Every harness is held before its exec
+//! until the daemon has recorded it, so a CLI killed before then, even by
+//! `SIGKILL`, leaves nothing of it running (issue #17), and an interactive
+//! one launched from a terminal until its group owns the terminal too
+//! (`terminal`).
 //!
 //! The exit code says what happened without parsing text (ADR 0016, Exit
 //! codes): 0 for success, the harness's own code when it exits, 128 plus
@@ -39,6 +41,7 @@ use fabric_core::harness::HarnessKind;
 use fabric_core::id::{EnvSpecId, JobId, NodeId};
 use fabric_core::session::SessionId;
 use fabric_env::materialize::{CacheHealth, MaterializeError, NodeEnv, TreeLock};
+use fabric_harness::acp::{TurnEvent, TurnFeed};
 use fabric_harness::claude::{ClaudeCode, LeftReason, TrustOutcome};
 use fabric_harness::codex::Codex;
 use fabric_harness::{Harness, Launch, LaunchSettings, Origin, PassedSetting, Running, TurnReport};
@@ -705,6 +708,33 @@ async fn launch(
         kill_group(&running);
         return Err(e);
     }
+    // The node records the harness, which has not run yet: it gets the
+    // terminal first when it is wired to it, then starts.
+    let handed = if running.takes_terminal() {
+        match terminal::hand_over(pid) {
+            Ok(handed) => handed,
+            Err(e) => {
+                let error = anyhow!(
+                    "the terminal could not be given to the harness ({e}), so it was stopped before it ran"
+                );
+                return Err(abandon(client, plan, &mut running, &mut interrupts, error).await);
+            }
+        }
+    } else {
+        None
+    };
+    if let Err(e) = running.release() {
+        return Err(abandon(client, plan, &mut running, &mut interrupts, e.into()).await);
+    }
+    if let Some(feed) = running.take_turn() {
+        let turn = AgentTurn {
+            client,
+            plan,
+            notes,
+            headless,
+        };
+        return turn.finish(&mut running, feed, &mut interrupts).await;
+    }
     if let Some(read_line) = read_line {
         let turn = Turn {
             client,
@@ -723,23 +753,6 @@ async fn launch(
         let code = exited(client, plan, pid, status, &mut interrupts).await?;
         print_turn(plan, &report)?;
         return Ok(code);
-    }
-    // A held harness has not run yet: it gets the terminal first, then starts.
-    let handed = if running.is_held() {
-        match terminal::hand_over(pid) {
-            Ok(handed) => handed,
-            Err(e) => {
-                let error = anyhow!(
-                    "the terminal could not be given to the harness ({e}), so it was stopped before it ran"
-                );
-                return Err(abandon(client, plan, &mut running, &mut interrupts, error).await);
-            }
-        }
-    } else {
-        None
-    };
-    if let Err(e) = running.release() {
-        return Err(abandon(client, plan, &mut running, &mut interrupts, e.into()).await);
     }
     let status = if headless {
         // An agent run headless gets no signal of a terminal either, so
@@ -793,8 +806,7 @@ async fn abandon(
     error
 }
 
-/// The adapter for the plan's harness and how it launches it in `mode`:
-/// held when it is interactive and standard input is a terminal.
+/// The adapter for the plan's harness and how it launches it in `mode`.
 async fn adapter_for(
     home: &Path,
     plan: &RunPlan,
@@ -1138,27 +1150,155 @@ impl Turn<'_> {
         {
             copied.abort();
         }
-        let mut recorder = recorder;
-        tokio::select! {
-            ended = &mut recorder => {
-                if let Err(e) = ended {
-                    tracing::warn!(error = %e, "the session recorder ended early");
-                }
-            }
-            signal = interrupts.next() => {
-                recorder.abort();
-                writeln!(
-                    std::io::stderr(),
-                    "interrupted by signal {} while the node recorded the session; `fabric job status {}` shows what it holds",
-                    signal.as_raw(),
-                    self.plan.job
-                )?;
-                return Ok(TurnEnd::Interrupted(signal));
-            }
+        if let Some(signal) = recorded(recorder, self.plan, interrupts).await? {
+            return Ok(TurnEnd::Interrupted(signal));
         }
         Ok(TurnEnd::Reaped { report, status })
     }
 }
+
+/// Waits for the recorder of the sessions a harness named; a signal stops
+/// the wait, says so, and is returned, so the command ends with it.
+async fn recorded(
+    mut recorder: tokio::task::JoinHandle<()>,
+    plan: &RunPlan,
+    interrupts: &mut Interrupts,
+) -> Result<Option<rustix::process::Signal>> {
+    tokio::select! {
+        ended = &mut recorder => {
+            if let Err(e) = ended {
+                tracing::warn!(error = %e, "the session recorder ended early");
+            }
+            Ok(None)
+        }
+        signal = interrupts.next() => {
+            recorder.abort();
+            writeln!(
+                std::io::stderr(),
+                "interrupted by signal {} while the node recorded the session; `fabric job status {}` shows what it holds",
+                signal.as_raw(),
+                plan.job
+            )?;
+            Ok(Some(signal))
+        }
+    }
+}
+
+/// The turn of an ACP agent being read: its standard output is the
+/// protocol, so the adapter's driver says what the turn did on the
+/// handle's feed (`Running::take_turn`) instead.
+struct AgentTurn<'a> {
+    client: &'a Client,
+    plan: &'a RunPlan,
+    notes: Notes,
+    /// True for `--headless`: a signal is passed on to the agent until it
+    /// is reaped. Otherwise a signal ends the command and leaves the agent
+    /// to the node, as for an interactive harness.
+    headless: bool,
+}
+
+impl AgentTurn<'_> {
+    /// Reads the turn and reaps the agent (`run`), tells the node it
+    /// exited, prints the turn when it ran headless, and returns the
+    /// command's exit code.
+    async fn finish(
+        &self,
+        running: &mut Running,
+        feed: TurnFeed,
+        interrupts: &mut Interrupts,
+    ) -> Result<ExitCode> {
+        let (report, status) = match self.run(running, feed, interrupts).await? {
+            TurnEnd::Reaped { report, status } => (report, status),
+            TurnEnd::Interrupted(signal) => return Ok(signal_exit(signal.as_raw())),
+        };
+        let code = exited(self.client, self.plan, running.pid(), status, interrupts).await?;
+        if self.headless {
+            print_turn(self.plan, &report)?;
+        }
+        Ok(code)
+    }
+
+    /// Reads the feed and reaps the agent, both to their end. A new
+    /// session the agent opens once it runs goes to a recorder task at
+    /// once, so a suspend during the turn captures it. The feed is read for at most
+    /// `DRAIN` after the agent exited, as a headless harness's output is.
+    async fn run(
+        &self,
+        running: &mut Running,
+        mut feed: TurnFeed,
+        interrupts: &mut Interrupts,
+    ) -> Result<TurnEnd> {
+        let pid = running.pid();
+        let (sessions, named) = tokio::sync::mpsc::unbounded_channel();
+        let recorder = tokio::spawn(record_sessions(
+            self.client.clone(),
+            self.plan.clone(),
+            pid,
+            named,
+            self.notes,
+        ));
+        let mut report = TurnReport {
+            session: running.session().cloned(),
+            ..TurnReport::default()
+        };
+        let mut status = None;
+        let mut reading = true;
+        let mut drained_by = None;
+        while reading || status.is_none() {
+            tokio::select! {
+                event = feed.next(), if reading => match event {
+                    Some(TurnEvent::Session(session)) => {
+                        if report.session.as_ref() != Some(&session) {
+                            report.session = Some(session.clone());
+                            // The receiver lives until this loop ends.
+                            let _ = sessions.send(session);
+                        }
+                    }
+                    Some(TurnEvent::Ended(ended)) => {
+                        report.answer = ended.answer;
+                        report.failure = ended.failure;
+                    }
+                    None => reading = false,
+                },
+                exit = running.child_mut().wait(), if status.is_none() => {
+                    status = Some(exit?);
+                    drained_by = Some(tokio::time::Instant::now() + DRAIN);
+                }
+                () = sleep_until(drained_by), if reading && drained_by.is_some() => {
+                    tracing::warn!("the agent's turn did not end within {DRAIN:?} of its exit");
+                    reading = false;
+                }
+                signal = interrupts.next() => {
+                    if self.headless {
+                        interrupts.pass_on(pid, signal);
+                    } else {
+                        recorder.abort();
+                        return Ok(TurnEnd::Interrupted(signal));
+                    }
+                }
+            }
+        }
+        drop(sessions);
+        // The loop ends only once the agent was reaped.
+        let status = match status {
+            Some(status) => status,
+            None => reap(running, interrupts).await?,
+        };
+        if let Some(signal) = recorded(recorder, self.plan, interrupts).await? {
+            return Ok(TurnEnd::Interrupted(signal));
+        }
+        Ok(TurnEnd::Reaped { report, status })
+    }
+}
+
+/// Sleeps until `deadline`, or for ever when there is none.
+async fn sleep_until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Waits for a headless harness to exit, passing each signal this command
 /// gets on to its group, as `Interrupts::pass_on` does.
 async fn reap(
@@ -1579,9 +1719,9 @@ mod tests {
         }
     }
 
-    /// Launches a fake `codex` headless for `plan`; under `exec` it runs
-    /// `script`. It is written by a short `sh`, so this process never holds
-    /// it open for writing while another test forks.
+    /// Launches a fake `codex` headless for `plan` and releases it; under
+    /// `exec` it runs `script`. It is written by a short `sh`, so this
+    /// process never holds it open for writing while another test forks.
     async fn headless_codex(plan: &RunPlan, script: &str) -> Running {
         let bin = plan.home.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -1616,10 +1756,12 @@ mod tests {
             resume: None,
             prompt: "a turn".to_owned(),
         };
-        Codex::new(harness_env.home, harness_env.path_var)
+        let mut running = Codex::new(harness_env.home, harness_env.path_var)
             .launch(&plan.root, launch, &env)
             .await
-            .unwrap()
+            .unwrap();
+        running.release().unwrap();
+        running
     }
 
     /// A headless turn names its session, which goes to the node, and the

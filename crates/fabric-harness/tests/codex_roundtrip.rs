@@ -708,6 +708,7 @@ async fn restore_places_the_lineage_under_sessions_fabric_and_launch_resumes_the
         )
         .await
         .unwrap();
+    running.release().unwrap();
     assert!(running.child_mut().wait().await.unwrap().success());
     let seen = std::fs::read_to_string(&log).unwrap();
     // `codex exec` sets its own approval policy, so the pinned one is not passed.
@@ -873,6 +874,7 @@ async fn a_launch_from_inside_a_codex_tool_call_leaves_the_parent_markers_out() 
         )
         .await
         .unwrap();
+    running.release().unwrap();
     assert!(running.child_mut().wait().await.unwrap().success());
     let seen = std::fs::read_to_string(&env_log).unwrap();
     let names: Vec<&str> = seen.lines().collect();
@@ -930,7 +932,6 @@ async fn a_launch_env_whose_codex_home_is_not_the_store_is_refused() {
 /// before any of its code runs and a CLI killed in between leaves nothing
 /// that ran unrecorded.
 #[tokio::test]
-#[ignore = "R2: expected failure until fixed"]
 async fn a_headless_launch_runs_nothing_until_it_is_released() {
     let home = tempfile::tempdir().unwrap();
     let home = home.path().canonicalize().unwrap();

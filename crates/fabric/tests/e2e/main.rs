@@ -773,7 +773,7 @@ fn e2e_a_run_whose_output_closes_still_supervises_its_harness() -> Fallible {
         running.try_wait()?.is_none(),
         "the CLI stopped supervising once its output closed"
     );
-    let pid: i32 = fs::read_to_string(&pid_file)?.trim().parse()?;
+    let pid = world::read_pid(&pid_file)?;
     let pid = rustix::process::Pid::from_raw(pid).ok_or("no pid")?;
     rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
     let output = finish(running, GIVE_UP)?;
@@ -783,47 +783,172 @@ fn e2e_a_run_whose_output_closes_still_supervises_its_harness() -> Fallible {
     Ok(())
 }
 
+/// What a `job run` cut by a signal before the node recorded its harness
+/// left behind.
+struct Cut {
+    /// What the CLI printed, and how it ended.
+    output: std::process::Output,
+    /// The harness's process group was still there 10 s after the signal;
+    /// the test then killed it.
+    outlived: bool,
+    /// The harness ran: the file it writes as it starts exists.
+    ran: bool,
+}
+
+/// The one child of the CLI `cli`: the process it launched for the
+/// harness, which leads the harness's process group.
+fn launched_by(cli: u32) -> Fallible<i32> {
+    let found = std::process::Command::new("pgrep")
+        .arg("-P")
+        .arg(cli.to_string())
+        .output()?;
+    let children: Vec<i32> = String::from_utf8(found.stdout)?
+        .lines()
+        .map(str::parse)
+        .collect::<Result<_, _>>()?;
+    match children[..] {
+        [child] => Ok(child),
+        _ => Err(format!("the CLI runs {children:?}, not one harness").into()),
+    }
+}
+
+/// Runs `fabric job run <args...>` on `p.a`, whose node holds the
+/// registration of the first harness launched on it, sends the CLI
+/// `signal` while the node holds it, and reports what was left: whether
+/// the harness's group outlived the CLI and whether the harness ran,
+/// which `ran` exists for. The node then goes on with the registration.
+fn cut_before_record(
+    p: &Pair,
+    args: &[&str],
+    vars: &[(&str, &std::path::Path)],
+    ran: &std::path::Path,
+    signal: rustix::process::Signal,
+) -> Fallible<Cut> {
+    use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
+
+    let running = p.a.spawn_with(args, vars)?;
+    wait_for(&p.a.signal(), "the registration")?;
+    let group = Pid::from_raw(launched_by(running.id())?).ok_or("no group")?;
+    let cli = Pid::from_raw(i32::try_from(running.id())?).ok_or("no pid")?;
+    rustix::process::kill_process(cli, signal)?;
+    let started = std::time::Instant::now();
+    while test_kill_process_group(group).is_ok() && started.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // A harness left running can hold the CLI's output open, so it is
+    // stopped here before the output is read.
+    let outlived = test_kill_process_group(group).is_ok();
+    if outlived {
+        let _ = kill_process_group(group, Signal::KILL);
+    }
+    // The node may go on to record the harness it was asked about.
+    fs::remove_file(p.a.signal())?;
+    let output = finish(running, GIVE_UP)?;
+    Ok(Cut {
+        output,
+        outlived,
+        ran: ran.exists(),
+    })
+}
+
 /// A `job run` ended by a signal after it launched the harness and before
 /// the node recorded it, as by Ctrl-C or a `kill` while the node is slow to
 /// answer, must stop the harness. It runs in a group of its own, so the
 /// signal does not reach it, no node supervises it yet, and once the tree
 /// lock goes with the command a second run could start another agent in
-/// the workspace.
+/// the workspace. The harness is held before its exec until the node
+/// records it (issue #17), so it never ran, and the CLI kills the held
+/// group.
 #[test]
 fn e2e_a_run_ended_before_its_harness_is_recorded_stops_it() -> Fallible {
     let p = setup(Wire::TcpTls, Some("before_harness_record:hold"), None)?;
     let job = new_job(&p.env, &p.a, AGENT)?;
     let pid_file = p.a.state().join("harness.pid");
-    let running = p.a.spawn_with(
+    let cut = cut_before_record(
+        &p,
         &["job", "run", &job, "--prompt", "one"],
         &[
             ("FAKE_LINGER", std::path::Path::new("1")),
             ("FAKE_PID_FILE", &pid_file),
         ],
+        &pid_file,
+        rustix::process::Signal::TERM,
     )?;
-    wait_for(&p.a.signal(), "the registration")?;
-    wait_for(&pid_file, "the harness launch")?;
-    let harness: i32 = fs::read_to_string(&pid_file)?.trim().parse()?;
-    let cli = rustix::process::Pid::from_raw(i32::try_from(running.id())?).ok_or("no pid")?;
-    rustix::process::kill_process(cli, rustix::process::Signal::TERM)?;
-    let started = std::time::Instant::now();
-    while alive(harness) && started.elapsed() < Duration::from_secs(10) {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    // A harness left running holds the CLI's output open, so it is
-    // stopped here before the output is read.
-    let outlived = alive(harness);
-    if outlived && let Some(pid) = rustix::process::Pid::from_raw(harness) {
-        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-    }
-    // The node may go on to record the harness it was asked about.
-    fs::remove_file(p.a.signal())?;
-    let output = finish(running, GIVE_UP)?;
+    let said = text(&cut.output);
+    assert!(!cut.outlived, "the harness outlived the ended run: {said}");
     assert!(
-        !outlived,
-        "the harness outlived the ended run: {}",
-        text(&output)
+        !cut.ran,
+        "the harness ran before the node recorded it: {said}"
     );
-    assert_eq!(output.status.code(), Some(128 + 15), "{}", text(&output));
+    assert_eq!(cut.output.status.code(), Some(128 + 15), "{said}");
     Ok(())
+}
+
+/// Issue #17: a CLI killed by `SIGKILL` once the node holds its harness's
+/// registration cannot stop the harness, so only the hold keeps it from
+/// running. The CLI's death orphans the stopped group, which the kernel
+/// then ends with `SIGHUP`, so the harness never ran, nothing of its group
+/// outlives the CLI, and the next suspend finds no harness to stop.
+fn assert_killed_before_record_leaves_nothing(
+    p: &Pair,
+    job: &str,
+    run: &[&str],
+    vars: &[(&str, &std::path::Path)],
+    ran: &std::path::Path,
+) -> Fallible {
+    use std::os::unix::process::ExitStatusExt;
+
+    let cut = cut_before_record(p, run, vars, ran, rustix::process::Signal::KILL)?;
+    let said = text(&cut.output);
+    assert!(!cut.outlived, "the harness outlived the killed run: {said}");
+    assert!(
+        !cut.ran,
+        "the harness ran before the node recorded it: {said}"
+    );
+    assert_eq!(cut.output.status.signal(), Some(9), "{said}");
+    let suspended = p.a.ok(&["job", "suspend", job])?;
+    assert!(
+        !suspended.contains("stopping the harness"),
+        "the node recorded a harness: {suspended}"
+    );
+    let status = p.a.ok(&["job", "status", job])?;
+    assert!(status.contains("harness: not running"), "{status}");
+    Ok(())
+}
+
+/// A headless Codex run killed before the node records its harness.
+#[test]
+fn e2e_a_headless_run_killed_before_its_harness_is_recorded_leaves_nothing_running() -> Fallible {
+    let p = setup(Wire::TcpTls, Some("before_harness_record:hold"), None)?;
+    p.env.install_fake_codex()?;
+    let job = new_job(&p.env, &p.a, "codex")?;
+    // The fake codex writes its arguments as it starts, and with
+    // FAKE_CODEX_WAIT then runs until a SIGINT.
+    let ran = p.env.home.join("codex-args");
+    assert_killed_before_record_leaves_nothing(
+        &p,
+        &job,
+        &["job", "run", &job, "--headless", "--prompt", "one"],
+        &[("FAKE_CODEX_WAIT", std::path::Path::new("1"))],
+        &ran,
+    )
+}
+
+/// An ACP run killed before the node records its agent: the agent gets no
+/// message, and does not even start, before the node records it.
+#[test]
+fn e2e_an_acp_run_killed_before_its_agent_is_recorded_leaves_nothing_running() -> Fallible {
+    let p = setup(Wire::TcpTls, Some("before_harness_record:hold"), None)?;
+    let job = new_job(&p.env, &p.a, AGENT)?;
+    let pid_file = p.a.state().join("harness.pid");
+    assert_killed_before_record_leaves_nothing(
+        &p,
+        &job,
+        &["job", "run", &job, "--prompt", "one"],
+        &[
+            ("FAKE_LINGER", std::path::Path::new("1")),
+            ("FAKE_PID_FILE", &pid_file),
+        ],
+        &pid_file,
+    )
 }

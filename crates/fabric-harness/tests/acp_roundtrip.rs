@@ -18,8 +18,8 @@ use fabric_core::env::EnvVarName;
 use fabric_core::harness::ProgramName;
 use fabric_core::path::AbsPath;
 use fabric_core::session::SessionId;
-use fabric_harness::acp::AcpHarness;
 use fabric_harness::acp::client::{PermissionPolicy, StopReason};
+use fabric_harness::acp::{AcpHarness, TurnEvent};
 use fabric_harness::{Harness, HarnessError, Launch};
 use serde_json::Value;
 
@@ -236,8 +236,19 @@ async fn the_trait_launch_is_headless_and_owns_the_turn() {
         )
         .await
         .unwrap();
-    let session = running.session().cloned().unwrap();
-    // The turn task closes the agent's stdin when the turn ends, so the
+    // A new session is opened only once the agent runs.
+    assert_eq!(running.session(), None);
+    let mut feed = running.take_turn().unwrap();
+    running.release().unwrap();
+    let Some(TurnEvent::Session(session)) = feed.next().await else {
+        panic!("the feed named no session first");
+    };
+    let Some(TurnEvent::Ended(report)) = feed.next().await else {
+        panic!("the feed did not end the turn");
+    };
+    assert_eq!(report.session.as_ref(), Some(&session));
+    assert!(feed.next().await.is_none());
+    // The driver closes the agent's stdin when the turn ends, so the
     // agent exits on its own and the prompt is on record.
     let status = tokio::time::timeout(TIMEOUT, running.child_mut().wait())
         .await
@@ -287,6 +298,7 @@ async fn a_launched_agent_does_not_inherit_parent_session_markers() {
         )
         .await
         .unwrap();
+    running.release().unwrap();
     let status = tokio::time::timeout(TIMEOUT, running.child_mut().wait())
         .await
         .unwrap()
@@ -669,7 +681,6 @@ fn a_state_dir_that_overlaps_fabric_state_is_refused() {
 /// its first message: when `launch` returns, the agent has not been sent
 /// the prompt.
 #[tokio::test]
-#[ignore = "R2: expected failure until fixed"]
 async fn the_trait_launch_holds_the_agent_until_it_is_released() {
     let home = tempfile::tempdir().unwrap();
     let work = home.path().join("work");

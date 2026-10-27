@@ -999,7 +999,7 @@ impl ClaudeCode {
         let (session, args) = self.args_for(launch, Self::fresh_session, model.as_ref());
         let spawned =
             process::spawn(&binary, &args, pipeline::fs_path(&root), env, launch.into()).await?;
-        info!(%session, pid = %spawned.pid, held = spawned.held, "claude: launched");
+        info!(%session, pid = %spawned.pid, "claude: launched, held until released");
         Ok(Running::new(Some(session), spawned).with_settings(settings))
     }
 }
@@ -1767,6 +1767,7 @@ mod tests {
         )
         .unwrap();
         let mut running = fixture.launch().await.unwrap();
+        running.release().unwrap();
         running.child_mut().wait().await.unwrap();
         let ran = fixture.ran().unwrap();
         let model = ran.iter().position(|a| a == "--model").map(|i| &ran[i + 1]);
@@ -1841,6 +1842,7 @@ mod tests {
         )
         .unwrap();
         let mut running = fixture.launch().await.unwrap();
+        running.release().unwrap();
         running.child_mut().wait().await.unwrap();
         let ran = fixture.ran().unwrap();
         let model = ran.iter().position(|a| a == "--model").map(|i| &ran[i + 1]);
@@ -1918,6 +1920,7 @@ mod tests {
             .launch(&long, launch(), &fixture.env)
             .await
             .unwrap();
+        running.release().unwrap();
         running.child_mut().wait().await.unwrap();
         let ran = fixture.ran().unwrap();
         assert!(!ran.iter().any(|a| a == "--model"), "{ran:?}");
@@ -1967,6 +1970,7 @@ mod tests {
             .launch(&long, launch(), &fixture.env)
             .await
             .unwrap();
+        running.release().unwrap();
         running.child_mut().wait().await.unwrap();
         assert_eq!(
             fixture.ran().unwrap(),
@@ -1996,6 +2000,7 @@ mod tests {
             .launch(&long, launch(), &fixture.env)
             .await
             .unwrap();
+        running.release().unwrap();
         running.child_mut().wait().await.unwrap();
         let ran = fixture.ran().unwrap();
         assert!(!ran.iter().any(|a| a == "--model"), "{ran:?}");
@@ -2064,6 +2069,7 @@ mod tests {
             .launch(&long, launch(), &fixture.env)
             .await
             .unwrap();
+        running.release().unwrap();
         running.child_mut().wait().await.unwrap();
         let ran = fixture.ran().unwrap();
         let model = ran.iter().position(|a| a == "--model").map(|i| &ran[i + 1]);
@@ -2095,6 +2101,7 @@ mod tests {
     async fn a_resume_passes_the_model_the_session_ran_with() {
         let fixture = Resume::new("2.1.294 (Claude Code)");
         let mut running = fixture.launch().await.unwrap();
+        running.release().unwrap();
         running.child_mut().wait().await.unwrap();
         assert_eq!(
             fixture.ran().unwrap(),

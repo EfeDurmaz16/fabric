@@ -676,7 +676,9 @@ impl Node {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let pid = fs::read_to_string(&pid_file)?.trim().parse()?;
+        // The harness is released only once the node recorded it, so it
+        // may write its pid after the status says it runs.
+        let pid = read_pid(&pid_file)?;
         Ok((running, pid))
     }
 
@@ -794,6 +796,23 @@ pub fn finish(child: Child, timeout: Duration) -> Fallible<Output> {
 pub fn alive(pid: i32) -> bool {
     rustix::process::Pid::from_raw(pid)
         .is_some_and(|pid| rustix::process::test_kill_process(pid).is_ok())
+}
+
+/// Waits until `path` holds a pid, as a harness writes it once it runs,
+/// and returns it.
+pub fn read_pid(path: &Path) -> Fallible<i32> {
+    let started = Instant::now();
+    loop {
+        if let Ok(text) = fs::read_to_string(path)
+            && let Ok(pid) = text.trim().parse()
+        {
+            return Ok(pid);
+        }
+        if started.elapsed() > FAULT_TIMEOUT {
+            return Err(format!("{} never held a pid", path.display()).into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Waits until `path` exists.

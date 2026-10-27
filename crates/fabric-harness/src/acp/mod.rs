@@ -11,13 +11,21 @@
 //! workspace path and home of the capture (ADR 0011) and only files under
 //! the declared state directory whose path names the session. The adapter
 //! cannot tell whether a generic agent is writing a session while it
-//! restores one; the caller owns that guard, through the handle
-//! `launch_acp` returned. A launch whose handshake fails kills the agent's
-//! process group before it returns, so no agent runs without a handle.
+//! restores one; the caller owns that guard, through the handle the
+//! launch returned. The trait's launch returns the agent held, before its
+//! exec, and its driver sends the first message only once the caller
+//! releases it, so the node records the agent before it can act (issue
+//! #17). A handshake that fails kills the agent's process group, so no
+//! agent runs on without a session.
 
 pub mod client;
 
+/// The turn feed the trait's launch of an agent carries
+/// (`Running::take_turn`).
+pub use crate::harness::{TurnEvent, TurnFeed};
+
 use std::ffi::OsString;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use fabric_core::BoxFuture;
@@ -25,12 +33,13 @@ use fabric_core::env::EnvVarName;
 use fabric_core::harness::{HarnessKind, ProgramName};
 use fabric_core::path::AbsPath;
 use fabric_core::session::SessionId;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::departure::{FABRIC_DIR, Records};
 use crate::error::HarnessError;
-use crate::harness::{Harness, Installed, Launch, Restored, Running};
+use crate::harness::{Harness, Installed, Launch, Restored, Running, TurnReport};
 use crate::manifest::{Content, HOME_PREFIX, Mutability, StateManifest, under_home};
 use crate::pipeline::{self, Capturer, Destination};
 use crate::process::{self, Wiring};
@@ -334,9 +343,42 @@ impl AcpHarness {
         process::detect(self.binary().ok(), &self.path_var).await
     }
 
+    /// Starts the agent held, before its exec, and attaches the protocol
+    /// client to its pipes. The client sends nothing until it is asked
+    /// to, and the agent reads nothing while it is held.
+    async fn spawn_attached(
+        &self,
+        root: &AbsPath,
+        env: &[(EnvVarName, String)],
+    ) -> Result<(Running, AcpClient), HarnessError> {
+        let binary = self.binary()?;
+        let mut spawned = process::spawn(
+            &binary,
+            &self.args,
+            pipeline::fs_path(root),
+            env,
+            Wiring::Rpc,
+        )
+        .await?;
+        let (Some(stdin), Some(stdout)) = (spawned.child.stdin.take(), spawned.child.stdout.take())
+        else {
+            // Dropping the held handle kills its group.
+            drop(Running::new(None, spawned));
+            return Err(HarnessError::Spawn {
+                program: self.program.to_string(),
+                source: std::io::Error::other("agent started without stdio pipes"),
+            });
+        };
+        let client = AcpClient::attach(stdin, stdout, self.policy);
+        Ok((Running::new(None, spawned), client))
+    }
+
     /// Starts the agent, completes the handshake, continues `resume` or
-    /// creates a session, and returns the process with its protocol client.
-    /// A prompt is sent on a task of its own, whose handle is on the result.
+    /// creates a session, and returns the process with its protocol client,
+    /// for a caller that drives the session itself. The agent is released
+    /// at once, since no node records it first: a launch a node supervises
+    /// goes through `Harness::launch`, which returns the agent held. A
+    /// prompt is sent on a task of its own, whose handle is on the result.
     pub async fn launch_acp(
         &self,
         workspace: &Path,
@@ -345,26 +387,11 @@ impl AcpHarness {
         env: &[(EnvVarName, String)],
     ) -> Result<AcpRunning, HarnessError> {
         let root = pipeline::physical_workspace(workspace)?;
-        let binary = self.binary()?;
-        let mut spawned = process::spawn(
-            &binary,
-            &self.args,
-            pipeline::fs_path(&root),
-            env,
-            Wiring::Rpc,
-        )
-        .await?;
+        let (mut running, client) = self.spawn_attached(&root, env).await?;
+        running.release()?;
         // Until the session is open, an error or a dropped future kills the
-        // agent's group, so no agent is left running without a handle.
-        let guard = process::GroupGuard::new(spawned.pid);
-        let (Some(stdin), Some(stdout)) = (spawned.child.stdin.take(), spawned.child.stdout.take())
-        else {
-            return Err(HarnessError::Spawn {
-                program: self.program.to_string(),
-                source: std::io::Error::other("agent started without stdio pipes"),
-            });
-        };
-        let client = AcpClient::attach(stdin, stdout, self.policy);
+        // agent's group, so no agent is left running without a session.
+        let guard = process::GroupGuard::new(running.pid());
         let session = self.open_session(&client, &root, resume).await?;
         guard.disarm();
         let turn = prompt.map(|prompt| {
@@ -372,8 +399,9 @@ impl AcpHarness {
             let session = session.clone();
             tokio::spawn(async move { client.prompt(&session, &prompt).await })
         });
+        running.set_session(session);
         Ok(AcpRunning {
-            running: Running::new(Some(session), spawned),
+            running,
             client,
             turn,
         })
@@ -411,10 +439,14 @@ impl AcpHarness {
     }
 
     /// The trait's launch, headless only: an ACP agent has no terminal
-    /// mode, so `Launch::Interactive` is refused (`NeedsClient`). The
-    /// prompt turn runs on a task that owns the client and closes the
-    /// agent's stdin when the turn ends; updates the turn streams are
-    /// dropped once `client::UPDATE_BUFFER` wait unread.
+    /// mode, so `Launch::Interactive` is refused (`NeedsClient`). The agent
+    /// comes back held, with the session it continues, or none for a new
+    /// one, and its driver sends nothing before `Running::release` lets it
+    /// run, so a node records it before it can act (issue #17). The driver
+    /// then runs the handshake, opens or continues the session, sends the
+    /// prompt, closes the agent's stdin when the turn ends, and says each
+    /// step on the handle's turn feed (`Running::take_turn`). Updates the
+    /// turn streams are dropped once `client::UPDATE_BUFFER` wait unread.
     async fn launch_impl(
         &self,
         workspace: &Path,
@@ -426,27 +458,91 @@ impl AcpHarness {
                 program: self.program.to_string(),
             });
         };
-        let AcpRunning {
-            running,
+        let root = pipeline::physical_workspace(workspace)?;
+        let (running, client) = self.spawn_attached(&root, env).await?;
+        let (gate, released) = oneshot::channel();
+        let (events, feed) = TurnFeed::channel();
+        let driver = Driver {
+            adapter: self.clone(),
+            pid: running.pid(),
             client,
-            turn,
-        } = self
-            .launch_acp(workspace, resume, Some(prompt), env)
-            .await?;
-        let program = self.program.to_string();
-        tokio::spawn(async move {
-            let outcome = match turn {
-                Some(turn) => turn.await,
-                None => return,
-            };
-            match outcome {
-                Ok(Ok(reason)) => info!(agent = %program, ?reason, "acp: turn ended"),
-                Ok(Err(e)) => warn!(agent = %program, error = %e, "acp: turn failed"),
-                Err(e) => warn!(agent = %program, error = %e, "acp: turn task ended early"),
-            }
-            drop(client);
-        });
+            root,
+            resume: resume.clone(),
+            prompt,
+            events,
+        };
+        tokio::spawn(driver.run(released));
+        let mut running = running.with_driver(gate, feed);
+        if let Some(session) = resume {
+            running.set_session(session);
+        }
         Ok(running)
+    }
+}
+
+/// The turn the trait's launch of an ACP agent runs once the agent is
+/// released.
+struct Driver {
+    adapter: AcpHarness,
+    pid: NonZeroU32,
+    client: AcpClient,
+    root: AbsPath,
+    resume: Option<SessionId>,
+    prompt: String,
+    events: mpsc::Sender<TurnEvent>,
+}
+
+impl Driver {
+    /// Waits for `released`, then runs the turn. A handle dropped while
+    /// held killed the agent's group and drops the gate, so the driver
+    /// ends with nothing sent. A handshake that fails kills the group.
+    async fn run(self, released: oneshot::Receiver<()>) {
+        if released.await.is_err() {
+            return;
+        }
+        let Driver {
+            adapter,
+            pid,
+            client,
+            root,
+            resume,
+            prompt,
+            events,
+        } = self;
+        let program = adapter.program.to_string();
+        let mut report = TurnReport {
+            session: resume.clone(),
+            ..TurnReport::default()
+        };
+        // Until the session is open, an error, or the runtime dropping
+        // this task, kills the agent's group.
+        let guard = process::GroupGuard::new(pid);
+        let session = match adapter.open_session(&client, &root, resume).await {
+            Ok(session) => {
+                guard.disarm();
+                session
+            }
+            Err(e) => {
+                drop(guard);
+                warn!(agent = %program, error = %e, "acp: the session could not be opened, so the agent was stopped");
+                report.failure = Some(format!(
+                    "{program} could not open the session, so it was stopped: {e}"
+                ));
+                let _ = events.send(TurnEvent::Ended(report)).await;
+                return;
+            }
+        };
+        report.session = Some(session.clone());
+        // The receiver may be gone, as when the caller never asked; the turn runs on.
+        let _ = events.send(TurnEvent::Session(session.clone())).await;
+        match client.prompt(&session, &prompt).await {
+            Ok(reason) => info!(agent = %program, ?reason, "acp: turn ended"),
+            Err(e) => warn!(agent = %program, error = %e, "acp: turn failed"),
+        }
+        let _ = events.send(TurnEvent::Ended(report)).await;
+        // The last handle on the client: dropping it closes the agent's
+        // stdin, so it exits.
+        drop(client);
     }
 }
 

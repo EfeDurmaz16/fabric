@@ -573,7 +573,8 @@ fn e2e_ctrl_c_on_a_headless_acp_run_reaches_the_agent() -> Fallible {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    let agent: i32 = fs::read_to_string(&pid_file)?.trim().parse()?;
+    // The agent is released only once the node recorded it.
+    let agent = crate::world::read_pid(&pid_file)?;
     // The agent writes to the run's standard error too, so the run's end is
     // its exit, not the end of its output, which an agent left running
     // would keep open.

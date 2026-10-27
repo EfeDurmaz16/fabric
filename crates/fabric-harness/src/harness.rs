@@ -252,19 +252,63 @@ pub struct LaunchSettings {
     pub not_carried: Vec<NotCarried>,
 }
 
+/// What an adapter that speaks to its harness over a protocol on its
+/// stdio says about the turn a launch started, as the turn goes on
+/// (`Running::take_turn`). An ACP agent is one: its standard output is
+/// the protocol, so the caller cannot read the turn from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnEvent {
+    /// The session the turn runs in, once the harness has opened or
+    /// continued it. A new session is known only then, after `release`.
+    Session(SessionId),
+    /// The turn ended, in its session. Nothing follows it.
+    Ended(TurnReport),
+}
+
+/// The events of the turn a launch started, in order (`TurnEvent`).
+#[derive(Debug)]
+pub struct TurnFeed {
+    events: tokio::sync::mpsc::Receiver<TurnEvent>,
+}
+
+impl TurnFeed {
+    /// A feed and the sender its adapter's driver writes to.
+    #[cfg(feature = "acp")]
+    pub(crate) fn channel() -> (tokio::sync::mpsc::Sender<TurnEvent>, Self) {
+        // A turn sends a session and an end, so the driver never waits here.
+        let (sender, events) = tokio::sync::mpsc::channel(4);
+        (sender, TurnFeed { events })
+    }
+
+    /// The next event; `None` once the driver is gone, after `Ended` or
+    /// when the handle was dropped before `release`.
+    pub async fn next(&mut self) -> Option<TurnEvent> {
+        self.events.recv().await
+    }
+}
+
 /// A harness process this node started, in a process group of its own.
 /// Only this crate builds one, from a child it spawned, so the pid is
 /// real and is also the process group id.
 ///
-/// A `Launch::Interactive` run whose standard input is a terminal starts
-/// held: a trampoline, stopped before it execs the harness, so the harness
-/// never touches the terminal before its group owns it. The caller makes
-/// the group the terminal's foreground group, then calls `release`.
+/// Every launch starts held: a trampoline, stopped before it execs the
+/// harness, so nothing of the harness runs before the caller has recorded
+/// it with the node (issue #17), and a harness wired to the user's
+/// terminal never touches it before its group owns it. The caller records
+/// the pid, makes the group the terminal's foreground group when
+/// `takes_terminal` says so, then calls `release`. Dropping a handle that
+/// is still held kills its group: nothing of the harness ran, and nothing
+/// else could let it go on.
 pub struct Running {
     pid: NonZeroU32,
     session: Option<SessionId>,
     child: Child,
     held: bool,
+    terminal: bool,
+    /// Opened by `release`, for a driver that must not speak to the
+    /// harness before it runs.
+    gate: Option<tokio::sync::oneshot::Sender<()>>,
+    turn: Option<TurnFeed>,
     settings: LaunchSettings,
     version: Option<crate::version::HarnessVersion>,
 }
@@ -275,24 +319,67 @@ impl std::fmt::Debug for Running {
             .field("pid", &self.pid)
             .field("session", &self.session)
             .field("held", &self.held)
+            .field("terminal", &self.terminal)
+            .field("turn", &self.turn.is_some())
             .field("settings", &self.settings)
             .field("version", &self.version)
             .finish_non_exhaustive()
     }
 }
 
+impl Drop for Running {
+    fn drop(&mut self) {
+        if !self.held {
+            return;
+        }
+        let group = i32::try_from(self.pid.get())
+            .ok()
+            .and_then(rustix::process::Pid::from_raw);
+        if let Some(group) = group
+            && let Err(e) =
+                rustix::process::kill_process_group(group, rustix::process::Signal::KILL)
+            && e != rustix::io::Errno::SRCH
+        {
+            tracing::warn!(pid = %self.pid, error = %e, "could not kill the group of a held harness nobody released");
+        }
+    }
+}
+
 impl Running {
-    /// Wraps a child that `process::spawn` started in a new process group.
+    /// Wraps a child that `process::spawn` started held in a new process
+    /// group.
     #[cfg(any(feature = "acp", feature = "claude", feature = "codex"))]
     pub(crate) fn new(session: Option<SessionId>, spawned: crate::process::Spawned) -> Self {
         Running {
             pid: spawned.pid,
             session,
             child: spawned.child,
-            held: spawned.held,
+            held: true,
+            terminal: spawned.wiring == crate::process::Wiring::Terminal,
+            gate: None,
+            turn: None,
             settings: LaunchSettings::default(),
             version: None,
         }
+    }
+
+    /// Has `release` open `gate` once the harness runs, and hands `turn`
+    /// to the caller (`take_turn`).
+    #[cfg(feature = "acp")]
+    pub(crate) fn with_driver(
+        mut self,
+        gate: tokio::sync::oneshot::Sender<()>,
+        turn: TurnFeed,
+    ) -> Self {
+        self.gate = Some(gate);
+        self.turn = Some(turn);
+        self
+    }
+
+    /// Names the session the process continues, once it is known.
+    #[cfg(feature = "acp")]
+    pub(crate) fn set_session(&mut self, session: SessionId) {
+        self.session = Some(session);
     }
 
     /// Records the version the launch asked of the binary it started.
@@ -327,22 +414,49 @@ impl Running {
         &self.settings
     }
 
-    /// True while the harness waits, stopped before its exec, for its
-    /// process group to be given the terminal.
+    /// True while the harness waits, stopped before its exec, for
+    /// `release`.
     #[must_use]
     pub fn is_held(&self) -> bool {
         self.held
     }
 
-    /// Lets a held harness start by continuing its process group; the
-    /// trampoline then execs the harness. Call it once the group is the
-    /// terminal's foreground group. A harness that is not held is left alone.
+    /// True when the harness is wired to the user's terminal
+    /// (`Launch::Interactive`), so the caller makes its group the
+    /// terminal's foreground group before `release`.
+    #[must_use]
+    pub fn takes_terminal(&self) -> bool {
+        self.terminal
+    }
+
+    /// Lets the harness start by continuing its process group; the
+    /// trampoline then execs the harness. Call it once the node has
+    /// recorded the pid and, when `takes_terminal`, the group is the
+    /// terminal's foreground group. A harness released already is left
+    /// alone.
+    ///
+    /// An ACP agent gets its first message only now: the adapter's driver
+    /// waits for this before the handshake, then opens or continues the
+    /// session and sends the prompt, and tells the caller through
+    /// `take_turn`.
     pub fn release(&mut self) -> Result<(), HarnessError> {
         if self.held {
             crate::process::continue_group(self.pid)?;
             self.held = false;
         }
+        if let Some(gate) = self.gate.take() {
+            // A driver that is gone has nothing left to say to the harness.
+            let _ = gate.send(());
+        }
         Ok(())
+    }
+
+    /// The events of the turn the launch started, for an adapter that
+    /// drives its harness over a protocol (an ACP agent); `None` for one
+    /// whose turn its caller reads from the harness's own output, and
+    /// once taken.
+    pub fn take_turn(&mut self) -> Option<TurnFeed> {
+        self.turn.take()
     }
 
     /// The process id, which is also the id of the process group the
@@ -352,7 +466,8 @@ impl Running {
         self.pid
     }
 
-    /// The session the process continues, when known at launch.
+    /// The session the process continues: known at launch, except for a
+    /// new ACP session, which the turn's feed names once the agent runs.
     #[must_use]
     pub fn session(&self) -> Option<&SessionId> {
         self.session.as_ref()

@@ -977,7 +977,7 @@ impl Codex {
         let session = launch.resume().cloned();
         let spawned =
             process::spawn(&binary, &args, pipeline::fs_path(&root), env, launch.into()).await?;
-        info!(?session, pid = %spawned.pid, held = spawned.held, "codex: launched");
+        info!(?session, pid = %spawned.pid, "codex: launched, held until released");
         Ok(Running::new(session, spawned)
             .with_settings(settings)
             .with_version(runs))
@@ -1342,12 +1342,14 @@ mod tests {
         );
         std::fs::write(fixture.home.join("work/.tool-versions"), "codex 0.160.0\n").unwrap();
         let mut running = fixture.launch(true).await.unwrap();
+        running.release().unwrap();
         running.child_mut().wait().await.unwrap();
         assert_eq!(
             running.version().map(HarnessVersion::as_str),
             Some("0.160.0")
         );
         let mut running = fixture.launch(false).await.unwrap();
+        running.release().unwrap();
         running.child_mut().wait().await.unwrap();
         assert_eq!(running.version(), None);
     }
@@ -1479,6 +1481,7 @@ mod tests {
         assert_ne!(on_azure, rollout);
         std::fs::write(&fixture.rollout, &on_azure).unwrap();
         let mut running = fixture.launch(true).await.unwrap();
+        running.release().unwrap();
         running.child_mut().wait().await.unwrap();
         let ran = fixture.ran().unwrap();
         let at = ran.iter().position(|a| a == "model=\"gpt-6-sol\"").unwrap();
@@ -1584,6 +1587,7 @@ mod tests {
                 .launch(&fixture.home.join("work"), launch, &fixture.env)
                 .await
                 .unwrap();
+            running.release().unwrap();
             running.child_mut().wait().await.unwrap();
             let settings = running.settings();
             let passed: Vec<String> = settings
@@ -1653,6 +1657,7 @@ mod tests {
                 .launch(&fixture.home.join("work"), launch, &fixture.env)
                 .await
                 .unwrap();
+            running.release().unwrap();
             running.child_mut().wait().await.unwrap();
             let ran = fixture.ran().unwrap();
             let pairs: Vec<&str> = ran
@@ -1674,6 +1679,7 @@ mod tests {
     async fn a_resume_passes_the_settings_the_session_ran_with() {
         let fixture = Resume::new("codex-cli 0.155.1");
         let mut running = fixture.launch(true).await.unwrap();
+        running.release().unwrap();
         running.child_mut().wait().await.unwrap();
         let trust = format!(
             "projects.\"{}\".trust_level=trusted",
@@ -1719,6 +1725,7 @@ mod tests {
         assert_eq!(left, ["approval on-request"]);
 
         let mut running = fixture.launch(false).await.unwrap();
+        running.release().unwrap();
         running.child_mut().wait().await.unwrap();
         assert_eq!(
             fixture.ran().unwrap(),
