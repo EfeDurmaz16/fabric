@@ -342,7 +342,7 @@ impl Node {
         refuse_secret_kind(&harness)?;
         let id = clock::job_id();
         let root = paths::job_root(&self.cfg.home, id);
-        let synced = self.synced_folders(&self.node_env()).await;
+        let synced = self.synced_folders(&root, &self.node_env()).await;
         check_root(&root, &self.cfg.home, synced)?;
         // Built before the clone: a goal past the record bound refuses
         // here, not after a clone that no job and no printed id names.
@@ -2366,7 +2366,7 @@ impl Node {
             },
         });
         let root = choice.root().to_owned();
-        check_root(&root, &self.cfg.home, self.synced_folders(env).await)?;
+        check_root(&root, &self.cfg.home, self.synced_folders(&root, env).await)?;
         let resuming = matches!(
             &marker,
             Some(Marker { state: MarkerState::Restoring { snapshot: s }, .. }) if *s == snapshot
@@ -2557,8 +2557,13 @@ impl Node {
     }
 
     /// Reads which folders iCloud Drive syncs on this node, as the
-    /// `defaults` of `env` answers; off everywhere it does not exist.
-    async fn synced_folders(&self, env: &ToolEnv) -> SyncedFolders {
+    /// `defaults` of `env` answers; off everywhere it does not exist. A
+    /// `root` that `check_root` judges without them reads none: the
+    /// `defaults` reads run only for a root under a folder iCloud may sync.
+    async fn synced_folders(&self, root: &Path, env: &ToolEnv) -> SyncedFolders {
+        if !paths::reads_synced_folders(root, &self.cfg.home) {
+            return SyncedFolders::default();
+        }
         let facts = NodeFacts::measure(&self.cfg.home, env, Probes::NONE.with(Tool::ICloud)).await;
         SyncedFolders {
             desktop: facts.syncs(crate::facts::name::ICLOUD_DESKTOP),

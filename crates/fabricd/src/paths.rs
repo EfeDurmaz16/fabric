@@ -346,6 +346,9 @@ pub struct SyncedFolders {
     pub documents: bool,
 }
 
+/// The folders of the home iCloud Drive may sync, as `SyncedFolders` names them.
+const SYNCABLE: [&str; 2] = ["Desktop", "Documents"];
+
 /// Refuses a root inside a synced folder (ADR 0011, rule 4).
 ///
 /// `~/Library/Mobile Documents` is iCloud Drive itself and is refused on
@@ -360,13 +363,24 @@ pub fn check_root(root: &Path, home: &Path, synced: SyncedFolders) -> Result<(),
     if root.starts_with(&icloud) {
         return Err(refuse(icloud, "is iCloud Drive"));
     }
-    for (synced, name) in [(synced.desktop, "Desktop"), (synced.documents, "Documents")] {
+    for (synced, name) in [synced.desktop, synced.documents].into_iter().zip(SYNCABLE) {
         let folder = home.join(name);
         if synced && root.starts_with(&folder) {
             return Err(refuse(folder, "iCloud Drive syncs on this node"));
         }
     }
     Ok(())
+}
+
+/// Whether `check_root` reads `SyncedFolders` for `root`: only a root
+/// under a folder of `home` iCloud Drive may sync is judged by them, so
+/// for any other root the `defaults` reads that answer them are left out
+/// and `check_root` decides the same with `SyncedFolders::default()`.
+#[must_use]
+pub fn reads_synced_folders(root: &Path, home: &Path) -> bool {
+    SYNCABLE
+        .iter()
+        .any(|name| root.starts_with(home.join(name)))
 }
 
 #[cfg(test)]
@@ -438,5 +452,43 @@ mod tests {
             .is_err()
         );
         assert!(check_root(&job_root(home, JOB), home, synced).is_ok());
+    }
+
+    /// A root `reads_synced_folders` says is not judged by the synced
+    /// folders gets the same answer from `check_root` whatever they are,
+    /// so the reads that answer them can be left out for it.
+    #[test]
+    fn a_root_outside_the_syncable_folders_is_judged_without_them() {
+        let home = Path::new("/Users/x");
+        let every = [false, true].into_iter().flat_map(|desktop| {
+            [false, true].map(|documents| SyncedFolders { desktop, documents })
+        });
+        let every: Vec<SyncedFolders> = every.collect();
+        for root in [
+            job_root(home, JOB),
+            home.join("Desktop/w"),
+            home.join("Documents/w"),
+            home.join("Desktopper/w"),
+            home.join("Library/Mobile Documents/w"),
+            home.join("code/Desktop/w"),
+            PathBuf::from("/Volumes/x/Desktop/w"),
+        ] {
+            let answers: Vec<bool> = every
+                .iter()
+                .map(|synced| check_root(&root, home, *synced).is_ok())
+                .collect();
+            let unread = check_root(&root, home, SyncedFolders::default()).is_ok();
+            if !reads_synced_folders(&root, home) {
+                assert!(
+                    answers.iter().all(|ok| *ok == unread),
+                    "{}: {answers:?}",
+                    root.display()
+                );
+            }
+        }
+        assert!(reads_synced_folders(&home.join("Desktop/w"), home));
+        assert!(reads_synced_folders(&home.join("Documents"), home));
+        assert!(!reads_synced_folders(&job_root(home, JOB), home));
+        assert!(!reads_synced_folders(&home.join("Desktopper/w"), home));
     }
 }
