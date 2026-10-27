@@ -6,7 +6,8 @@
 //! object whose `type` is `thinking` and that has a `signature` key, or an
 //! object whose `type` is `redacted_thinking`. Any other object with a
 //! `signature` key (a webhook payload, a JWS in a tool result) is ordinary
-//! JSON. A signed block nested in another is covered by the outer one.
+//! JSON. Keys are compared decoded, so `ty\u0070e` is `type`. A signed
+//! block nested in another is covered by the outer one.
 //! Every other string value is decoded, redacted and re-encoded, and the
 //! result is valid JSON whenever the input was. The scanner reads one JSON
 //! text once and never builds a tree; a transcript is fed to it one line at
@@ -139,6 +140,24 @@ fn scan_scalar(text: &str, start: usize) -> Result<usize, TransformError> {
     }
 }
 
+/// The name a key string decodes to, `raw` being the key with its quotes.
+///
+/// JSON lets a key be spelled with escapes, and `ty\u0070e` is the key
+/// `type` to every reader, the API that checks a signature among them, so
+/// a key with a backslash is decoded before it is compared. A key without
+/// one is its own name, and the common case allocates nothing. `None` for
+/// a key that does not decode, which then names no signed-block field.
+fn key_name(raw: &str) -> Option<std::borrow::Cow<'_, str>> {
+    let inner = raw.strip_prefix('"')?.strip_suffix('"')?;
+    if inner.contains('\\') {
+        serde_json::from_str::<String>(raw)
+            .ok()
+            .map(std::borrow::Cow::Owned)
+    } else {
+        Some(std::borrow::Cow::Borrowed(inner))
+    }
+}
+
 /// The scanner state: the open containers plus whether the top-level value
 /// has been seen.
 struct Scanner<'a> {
@@ -226,8 +245,9 @@ impl Scanner<'_> {
         match self.stack.last_mut() {
             Some(frame) if matches!(frame.expect, Expect::FirstKey | Expect::Key) => {
                 frame.expect = Expect::Colon;
-                frame.awaiting_type = raw == "\"type\"";
-                if raw == "\"signature\"" {
+                let key = key_name(raw);
+                frame.awaiting_type = key.as_deref() == Some("type");
+                if key.as_deref() == Some("signature") {
                     frame.has_signature = true;
                 }
             }
@@ -682,7 +702,6 @@ mod tests {
     /// signed block that holds a secret is dropped whole whatever the
     /// spelling of its keys, never edited with its signature kept.
     #[test]
-    #[ignore = "H1: expected failure until fixed"]
     fn a_signed_block_with_escaped_key_names_is_dropped_whole() {
         for line in [
             format!(
