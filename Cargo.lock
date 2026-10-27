@@ -476,6 +476,7 @@ dependencies = [
  "fabric-journal",
  "fabric-net",
  "fabric-store",
+ "nix",
  "rustix",
  "serde",
  "serde_json",
