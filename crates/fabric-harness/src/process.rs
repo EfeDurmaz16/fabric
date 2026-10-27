@@ -90,8 +90,13 @@ use crate::markers;
 /// How long a version probe may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// The shell that holds a harness before its exec.
-const TRAMPOLINE: &str = "/bin/sh";
+/// The shells that can hold a harness before its exec, in order: dash,
+/// where the system has it, starts in 1.9 ms on the bench Mac where
+/// `/bin/sh`, a shim there that starts bash, takes 3.4 ms (median of 40
+/// starts of `-c exit`, 2026-10-28; Debian's `/bin/sh` is dash already).
+/// Both run the trampoline's script alike. Every macOS and Linux node has
+/// `/bin/sh`.
+const TRAMPOLINES: [&str; 2] = ["/bin/dash", "/bin/sh"];
 /// What a trampoline held by a stop runs: stop, and once continued, become
 /// the harness. The harness's path and arguments are its positional
 /// parameters. bash, which is `/bin/sh` on macOS, imports exported
@@ -130,7 +135,7 @@ const STOP_SETTLE: Duration = Duration::ZERO;
 
 /// How a harness is held before its exec: the shell, and how long one held
 /// by a stop may take to stop itself. Every launch uses
-/// `Trampoline::STANDARD`; a test can hold a harness behind a slower or
+/// `Trampoline::standard`; a test can hold a harness behind a slower or
 /// failing script.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Trampoline {
@@ -143,12 +148,22 @@ pub(crate) struct Trampoline {
 }
 
 impl Trampoline {
-    /// The trampoline every launch uses.
-    pub(crate) const STANDARD: Trampoline = Trampoline {
-        shell: TRAMPOLINE,
-        script: None,
-        timeout: HOLD_TIMEOUT,
-    };
+    /// The trampoline every launch uses, in the first of `TRAMPOLINES`
+    /// this system has, looked up once.
+    pub(crate) fn standard() -> Trampoline {
+        static SHELL: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+        let shell = SHELL.get_or_init(|| {
+            TRAMPOLINES
+                .into_iter()
+                .find(|shell| is_executable(Path::new(shell)))
+                .unwrap_or(TRAMPOLINES[TRAMPOLINES.len() - 1])
+        });
+        Trampoline {
+            shell,
+            script: None,
+            timeout: HOLD_TIMEOUT,
+        }
+    }
 
     /// What the shell runs for a harness wired as `wiring`: a harness that
     /// owns no pipe on its standard input waits for a line on one, and one
@@ -440,7 +455,7 @@ pub(crate) async fn spawn(
     env: &[(EnvVarName, String)],
     wiring: Wiring,
 ) -> Result<Spawned, HarnessError> {
-    spawn_held(Trampoline::STANDARD, binary, args, cwd, env, wiring)
+    spawn_held(Trampoline::standard(), binary, args, cwd, env, wiring)
 }
 
 /// `spawn`, held behind `trampoline`. It must run inside a Tokio runtime,
@@ -1377,12 +1392,31 @@ mod tests {
             }
         }
 
+        /// Item 4 of the A/B lab: the trampoline runs in dash where the
+        /// system has it, which starts in 1.9 ms here where `/bin/sh`, on
+        /// macOS a shim that starts bash, takes 3.4 ms.
+        #[tokio::test]
+        async fn the_trampoline_runs_in_dash_where_the_system_has_it() {
+            if !Path::new("/bin/dash").exists() {
+                return;
+            }
+            let (_dir, _ran, mut running) = hold_marker(Trampoline::standard(), Wiring::Piped);
+            let ps = std::process::Command::new("/bin/ps")
+                .args(["-o", "comm=", "-p", &running.pid().to_string()])
+                .output()
+                .unwrap();
+            let comm = String::from_utf8_lossy(&ps.stdout).trim().to_owned();
+            kill_held_group(running.pid());
+            ends(&mut running).await;
+            assert!(comm.ends_with("dash"), "the trampoline ran in {comm:?}");
+        }
+
         /// A release once the trampoline is ready lets the harness run, and
         /// nothing runs before it.
         #[tokio::test]
         async fn a_release_after_the_trampoline_is_ready_runs_the_harness() {
             for wiring in [Wiring::Piped, Wiring::Terminal] {
-                let (_dir, ran, mut running) = hold_marker(Trampoline::STANDARD, wiring);
+                let (_dir, ran, mut running) = hold_marker(Trampoline::standard(), wiring);
                 running.hold_settled().await;
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 assert!(
@@ -1403,7 +1437,8 @@ mod tests {
         #[tokio::test]
         async fn a_line_hold_whose_caller_is_gone_exits_without_running_the_harness() {
             let dir = tempfile::tempdir().unwrap();
-            let (ran, mut spawned) = spawn_marker(Trampoline::STANDARD, Wiring::Piped, dir.path());
+            let (ran, mut spawned) =
+                spawn_marker(Trampoline::standard(), Wiring::Piped, dir.path());
             let HoldKind::Line(pipe) = &mut spawned.hold.kind else {
                 panic!("a headless trampoline is held by a line");
             };
@@ -1505,7 +1540,7 @@ mod tests {
                         let at = dir.join(format!("r{round}"));
                         std::fs::create_dir_all(&at).unwrap();
                         let (ran, spawned) =
-                            spawn_marker(Trampoline::STANDARD, Wiring::Terminal, &at);
+                            spawn_marker(Trampoline::standard(), Wiring::Terminal, &at);
                         let mut running = crate::harness::Running::new(None, spawned);
                         running.release().unwrap();
                         let waited = tokio::time::timeout(
