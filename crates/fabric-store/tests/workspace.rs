@@ -2240,6 +2240,47 @@ fn a_restore_writes_its_exclude_file_and_config_without_git() {
     common::run_with_logged_git("restore_config_child", LoggedGit::Plain).unwrap();
 }
 
+/// The child half of `a_capture_reads_the_bundle_heads_without_git`.
+#[test]
+fn capture_heads_child() {
+    let Some(dir) = common::logged_git_dir() else {
+        return;
+    };
+    let root = dir.join("work");
+    make_repo(&root).unwrap();
+    let mut store = store_in(&dir).unwrap();
+    let policy = IgnorePolicy::default();
+    let start = common::logged_git_calls().len();
+    let first = capture(&store, &request(&root, &policy, None)).unwrap();
+    let s1 = store.publish(&first.manifest).unwrap();
+    fs::write(root.join("second.txt"), "second commit\n").unwrap();
+    git(&root).run(&["add", "second.txt"]).unwrap();
+    git(&root).run(&["commit", "-q", "-m", "two"]).unwrap();
+    let second = capture(&store, &request(&root, &policy, Some(s1))).unwrap();
+    assert_eq!(first.report.bundle, Some(BundleKind::Full));
+    assert_eq!(second.report.bundle, Some(BundleKind::Incremental));
+    let ran = common::git_commands(&common::logged_git_calls(), start);
+    let bundle: Vec<&str> = (ran.iter())
+        .filter_map(|call| call.strip_prefix("bundle "))
+        .filter_map(|call| call.split(' ').next())
+        .collect();
+    assert_eq!(
+        bundle,
+        ["create", "verify", "create", "verify"],
+        "{}",
+        ran.join("\n")
+    );
+}
+
+/// A capture checks the refs a bundle lists against the refs it read
+/// (`confirm_bundle`). It reads them from the bundle's header, the text
+/// `git bundle list-heads` prints, so no `list-heads` runs: one git
+/// process fewer per suspend.
+#[test]
+fn a_capture_reads_the_bundle_heads_without_git() {
+    common::run_with_logged_git("capture_heads_child", LoggedGit::Plain).unwrap();
+}
+
 /// The child half of `a_restore_runs_bundle_unbundle_alone`.
 #[test]
 fn restore_unbundle_child() {
@@ -2639,8 +2680,8 @@ fn a_config_file_the_repository_includes_counts_but_does_not_travel() {
 /// `symbolic-ref` more, and the first restore of a process one refused
 /// transaction more (`a_git_without_symref_update_sets_them_one_by_one_and_is_not_asked_again`).
 const GIT_RUNS: [(&str, usize); 3] = [
-    ("first capture", 33),
-    ("second capture", 35),
+    ("first capture", 32),
+    ("second capture", 34),
     ("restore", 13),
 ];
 
