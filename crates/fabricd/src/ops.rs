@@ -1118,6 +1118,12 @@ impl Node {
     }
 
     /// Captures the harness state and the workspace and publishes them as one snapshot.
+    ///
+    /// The harness's capture, which asks the harness its `--version` and
+    /// copies its state, and the workspace's detection with the node facts
+    /// it reads depend on nothing of each other, so they run at once; a
+    /// failure of the harness's capture is reported first, as when they
+    /// ran one after the other.
     async fn capture(
         &self,
         job: &Job,
@@ -1125,37 +1131,13 @@ impl Node {
         env: &ToolEnv,
         out: &mut Out,
     ) -> Result<SnapshotId, NodeError> {
-        let harness_state = self.capture_harness(job, root, env, out).await?;
-        // A workspace whose environment does not detect here would not
-        // materialize on the target either, so the snapshot is refused
-        // before it is published or moved.
-        // A pattern the job ever added stays: removing its line from
-        // `.fabric/env.toml` does not remove it (ADR 0007, Secrets). The
-        // node that recorded it may be another one; the spec of the job's
-        // latest snapshot travels with the job and holds what it recorded.
         let parent = job.latest();
-        let mut recorded: Vec<fabric_core::secret::SecretPattern> =
-            local::read(&job.dir().secret_patterns())?.unwrap_or_default();
-        if let Some(parent) = parent {
-            let travelled = with_store(&self.store, move |store| {
-                let manifest = store.manifest(parent)?;
-                Ok(manifest
-                    .env_spec
-                    .map(|spec| store.env_spec(spec))
-                    .transpose()?)
-            })
-            .await?;
-            if let Some(spec) = travelled {
-                recorded.extend(spec.secret_patterns);
-                recorded.sort();
-                recorded.dedup();
-            }
-        }
-        let detection = fabric_env::detect::detect(root, &recorded)?;
-        // Only what the keys read is measured: no login, and no tool of an
-        // ecosystem the workspace does not use (issue #26).
-        let probes = MeasuredKeys::probes(&detection);
-        let facts = NodeFacts::measure(&self.cfg.home, env, probes).await;
+        let (harness_state, detected) = tokio::join!(
+            self.capture_harness(job, root, env, out),
+            self.detect_for_capture(job, root, parent, env),
+        );
+        let harness_state = harness_state?;
+        let (detection, facts) = detected?;
         local::write(
             &job.dir().secret_patterns(),
             &detection.spec().secret_patterns,
@@ -1235,6 +1217,48 @@ impl Node {
         });
         report_capture(&report, &left_behind, out);
         Ok(snapshot)
+    }
+
+    /// Detects the workspace's environment at `root` for a capture whose
+    /// parent is `parent`, and measures the node facts its keys read.
+    ///
+    /// A workspace whose environment does not detect here would not
+    /// materialize on the target either, so the snapshot is refused
+    /// before it is published or moved. A pattern the job ever added
+    /// stays: removing its line from `.fabric/env.toml` does not remove it
+    /// (ADR 0007, Secrets). The node that recorded it may be another one;
+    /// the spec of the job's latest snapshot travels with the job and
+    /// holds what it recorded.
+    async fn detect_for_capture(
+        &self,
+        job: &Job,
+        root: &Path,
+        parent: Option<SnapshotId>,
+        env: &ToolEnv,
+    ) -> Result<(fabric_env::detect::Detection, NodeFacts), NodeError> {
+        let mut recorded: Vec<fabric_core::secret::SecretPattern> =
+            local::read(&job.dir().secret_patterns())?.unwrap_or_default();
+        if let Some(parent) = parent {
+            let travelled = with_store(&self.store, move |store| {
+                let manifest = store.manifest(parent)?;
+                Ok(manifest
+                    .env_spec
+                    .map(|spec| store.env_spec(spec))
+                    .transpose()?)
+            })
+            .await?;
+            if let Some(spec) = travelled {
+                recorded.extend(spec.secret_patterns);
+                recorded.sort();
+                recorded.dedup();
+            }
+        }
+        let detection = fabric_env::detect::detect(root, &recorded)?;
+        // Only what the keys read is measured: no login, and no tool of an
+        // ecosystem the workspace does not use (issue #26).
+        let probes = MeasuredKeys::probes(&detection);
+        let facts = NodeFacts::measure(&self.cfg.home, env, probes).await;
+        Ok((detection, facts))
     }
 
     /// Pushes the ledger, and through it the latest snapshot, to every paired peer it can reach.
@@ -7887,6 +7911,61 @@ pub(crate) mod tests {
                 "python3 -c import sys; print(sys.base_prefix)",
             ]
         );
+    }
+
+    /// A suspend asks the harness its `--version`, inside the harness's
+    /// capture, while it detects the workspace and measures the node facts
+    /// the keys read, which depend on nothing of it (item 13 of
+    /// docs/evidence/perf-ab/README.md). The fake `codex --version` and
+    /// `node --version` each wait up to five seconds for the other to
+    /// start and log whether it did, so one that ran only after the other
+    /// finished logs `alone`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_suspend_asks_the_harness_its_version_while_it_measures_the_node() {
+        let (dir, node) = node();
+        let tools = crate::facts::tests::CountingTools::new(dir.path());
+        let meet = dir.path().join("meet");
+        std::fs::create_dir_all(&meet).unwrap();
+        let waits = |me: &str, other: &str, answer: &str| {
+            format!(
+                "touch '{mine}'\ni=0\nwhile [ ! -f '{theirs}' ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i + 1)); done\nif [ -f '{theirs}' ]; then echo '{me} together' >> '{log}'; else echo '{me} alone' >> '{log}'; fi\n{answer}",
+                mine = meet.join(me).display(),
+                theirs = meet.join(other).display(),
+                log = meet.join("log").display(),
+            )
+        };
+        tools.install(
+            "node",
+            &format!(
+                "case \"$1\" in --version) {} ;; -p) echo 127 ;; esac",
+                waits("node", "codex", "echo v22.23.2")
+            ),
+        );
+        tools.install(
+            "codex",
+            &format!(
+                "case \"$1\" in --version) {} ;; esac",
+                waits("codex", "node", "echo 'codex-cli 0.155.1'")
+            ),
+        );
+        let (id, _) = npm_job(dir.path(), &node).await;
+        let thread = codex_thread_in(&node, id);
+        {
+            let job = node.job(id).await.unwrap();
+            let job = job.lock().await;
+            job.set_session(&SessionRecord {
+                harness: HarnessKind::Codex,
+                session: thread,
+                known_writer: None,
+            })
+            .unwrap();
+        }
+        node.suspend(id, &tools.env, &mut Out::default())
+            .await
+            .unwrap();
+        let log = std::fs::read_to_string(meet.join("log")).unwrap();
+        assert!(log.contains("codex together"), "{log}");
+        assert!(!log.contains("alone"), "{log}");
     }
 
     /// The preflight of a move and of a pull measures this node while the
