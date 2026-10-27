@@ -354,7 +354,7 @@ Bridge protocol v1 is independent of the client API version (ADR 0018). Within v
 | Check | When it fails | Journal |
 | --- | --- | --- |
 | Worker gone, bridge shutting down, `max_in_flight` reached | `Lost`, `ShuttingDown`, `Busy` | nothing; the operation may be sent later |
-| Action not in the negotiated profile, a limit over the profile's (deadline, argv, stdin, output), a target that does not fit the profile, a frame over `max_request_bytes` | `RefusedLocally` with the code and reason the worker would answer | `rejected`, nothing written |
+| Anything the worker would refuse on reading it, checked with the worker-side parser under the negotiated profile: an action not in the profile, a limit over the profile's (deadline, argv, stdin, output), a target that does not fit the profile, any encoding fault such as a NUL in an argument; and a frame over `max_request_bytes` | `RefusedLocally` with the code and reason the worker would answer | `rejected`, nothing written |
 | The journal already holds the key or the id | `Log(Used)` | unchanged; nothing is ever sent twice |
 | The attempt is not the job's current live grant at its generation, or the job is closed | `Log(Fenced)` | nothing |
 | Otherwise | the operation is committed `dispatched`, then the frame is written | `dispatched` |
