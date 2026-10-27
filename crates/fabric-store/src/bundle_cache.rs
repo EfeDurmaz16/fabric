@@ -138,6 +138,7 @@ impl BundleCache {
         let record = self.dir.join(RECORD);
         if self.links.is_empty() {
             fs::write(&record, RECORD_HEADER)?;
+            self.prune();
         }
         let mut files = Vec::with_capacity(written.len());
         for from in written {
@@ -201,13 +202,28 @@ impl BundleCache {
         })
     }
 
-    /// Drops the links from `keep` on, their files and their lines.
-    fn truncate(&mut self, keep: usize) {
-        for link in self.links.drain(keep..) {
-            for file in link.files {
-                let _ = fs::remove_file(self.dir.join(&file.name));
+    /// Removes every file but the record that no recorded link names:
+    /// what a dropped link, or an `add` a kill cut short, left behind.
+    fn prune(&self) {
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let named = name == RECORD
+                || self.links.iter().any(|link| {
+                    (link.files.iter()).any(|file| name.to_str() == Some(file.name.as_str()))
+                });
+            if !named {
+                let _ = fs::remove_file(entry.path());
             }
         }
+    }
+
+    /// Drops the links from `keep` on, their files and their lines.
+    fn truncate(&mut self, keep: usize) {
+        self.links.truncate(keep);
+        self.prune();
         let mut text = RECORD_HEADER.to_owned();
         for link in &self.links {
             text.push_str(&record_line(link));
@@ -466,6 +482,30 @@ mod tests {
         assert!(!cache.dir.join("pack-1.pack").exists());
         assert_eq!(cache.reuse(&[snapshot(5)]), 0);
         assert!(cache.links.is_empty());
+    }
+
+    #[test]
+    fn files_no_link_names_are_removed_when_the_cache_starts_over_or_drops_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = cache_with(dir.path(), 2);
+        let stray = cache.dir.join("pack-stray.pack");
+        fs::write(&stray, "left by a kill").unwrap();
+        assert_eq!(cache.reuse(&[snapshot(0), snapshot(7)]), 1);
+        assert!(!stray.exists());
+        assert!(!cache.dir.join("pack-1.pack").exists());
+        assert!(cache.dir.join("pack-0.pack").exists());
+        fs::write(&stray, "left by a kill").unwrap();
+        let mut fresh = BundleCache::open(dir.path(), JobId::from_bytes([7; 16]));
+        assert_eq!(fresh.reuse(&[snapshot(5)]), 0);
+        let file = dir.path().join("staged/pack-5.pack");
+        fs::write(&file, "link 5").unwrap();
+        fresh.add(snapshot(5), true, &[file]).unwrap();
+        let mut left: Vec<String> = fs::read_dir(&fresh.dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["links", "pack-5.pack"]);
     }
 
     #[test]
