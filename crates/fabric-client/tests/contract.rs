@@ -226,6 +226,7 @@ fn event_variant(event: &Event) -> (Option<usize>, usize) {
             Event::LiveWorkspaceGone { .. },
             Event::SubmodulesLeftEmpty { .. },
             Event::EscapingLinksRestored { .. },
+            Event::HarnessRecorded { .. },
         ],
         Event::Unrecognized
     )

@@ -628,6 +628,8 @@ const eventOptions = [
   z.object({ kind: z.literal("live_workspace_gone"), root: Path }),
   z.object({ kind: z.literal("submodules_left_empty"), paths: z.array(UnicodeText), more: count }),
   z.object({ kind: z.literal("escaping_links_restored"), paths: z.array(UnicodeText), more: count }),
+  /** The node recorded the launched harness durably; the answer still decides the registration. */
+  z.object({ kind: z.literal("harness_recorded"), pid: Pid }),
 ] as const;
 
 /** Every event kind this client knows, read from the schema. */

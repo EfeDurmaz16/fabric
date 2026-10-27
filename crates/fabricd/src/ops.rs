@@ -151,15 +151,18 @@ impl Node {
                 planned,
                 version,
             } => Reply::HarnessStarted(
-                self.harness_started(StartedHarness {
-                    job,
-                    epoch,
-                    pid,
-                    harness,
-                    session,
-                    planned,
-                    version,
-                })
+                self.harness_started(
+                    StartedHarness {
+                        job,
+                        epoch,
+                        pid,
+                        harness,
+                        session,
+                        planned,
+                        version,
+                    },
+                    out,
+                )
                 .await?,
             ),
             request @ (Request::ManagedCreate { .. }
@@ -675,9 +678,17 @@ impl Node {
     /// leaves no version in it, and the capture's own version check runs
     /// from the daemon, where a version manager's shim can pick another
     /// Codex than the one the workspace pins.
+    ///
+    /// Once the record is durable it says so with `harness_recorded`, so a
+    /// CLI that holds a harness not wired to a terminal can let it start
+    /// while the rest of the registration is written. The job's lock is
+    /// held until the end, so no suspend or move sees the job in between,
+    /// and a registration that fails after the event still fails: the CLI
+    /// then kills the group, which ran only while it was recorded.
     pub(crate) async fn harness_started(
         &self,
         started: StartedHarness,
+        out: &mut Out,
     ) -> Result<Registered, NodeError> {
         let StartedHarness {
             job: id,
@@ -726,6 +737,11 @@ impl Node {
                 started,
             },
         )?;
+        out.emit(Event::HarnessRecorded { pid });
+        // The writes below are synchronous, and the task that relays the
+        // event to the client was woken on this worker, where no other
+        // worker can take it: without a yield it would wait for them all.
+        tokio::task::yield_now().await;
         // The session is recorded as pending before `Resumed` and moved into
         // place after it, so a crash between the two does not leave a
         // `Resumed` whose session a later capture would miss.
@@ -3853,15 +3869,18 @@ pub(crate) mod tests {
     }
 
     async fn register(node: &Arc<Node>, id: JobId, pid: NonZeroU32) -> Result<(), NodeError> {
-        node.harness_started(StartedHarness {
-            job: id,
-            epoch: Epoch::FIRST,
-            pid,
-            harness: HarnessKind::Codex,
-            session: None,
-            planned: None,
-            version: None,
-        })
+        node.harness_started(
+            StartedHarness {
+                job: id,
+                epoch: Epoch::FIRST,
+                pid,
+                harness: HarnessKind::Codex,
+                session: None,
+                planned: None,
+                version: None,
+            },
+            &mut Out::default(),
+        )
         .await
         .map(drop)
     }
@@ -3953,15 +3972,18 @@ pub(crate) mod tests {
         let out = &mut Out::default();
         let plan = node.job_run(id, out).await.unwrap();
         let mut harness = sleeper();
-        node.harness_started(StartedHarness {
-            job: id,
-            epoch: Epoch::FIRST,
-            pid: pid(&harness),
-            harness: HarnessKind::Codex,
-            session: Some(session.clone()),
-            planned: plan.session,
-            version: None,
-        })
+        node.harness_started(
+            StartedHarness {
+                job: id,
+                epoch: Epoch::FIRST,
+                pid: pid(&harness),
+                harness: HarnessKind::Codex,
+                session: Some(session.clone()),
+                planned: plan.session,
+                version: None,
+            },
+            &mut Out::default(),
+        )
         .await
         .unwrap();
         harness.kill().unwrap();
@@ -4057,6 +4079,45 @@ pub(crate) mod tests {
         let job = node.job(id).await.unwrap();
         let record = job.lock().await.session().unwrap();
         assert_eq!(record.map(|record| record.session), Some(thread));
+    }
+
+    /// A registration says the harness is recorded once its record is
+    /// durable, before it answers, so a CLI may let a held harness start
+    /// then. The event comes once, names the pid, and the record it
+    /// announces is on disk when the answer arrives.
+    #[tokio::test]
+    async fn a_registration_says_the_harness_is_recorded_before_it_answers() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let path = locking_codex(dir.path());
+        node.suspend(id, &path, &mut Out::default()).await.unwrap();
+        node.job_run(id, &mut Out::default()).await.unwrap();
+        let mut harness = sleeper();
+        let out = &mut Out::default();
+        node.harness_started(
+            StartedHarness {
+                job: id,
+                epoch: Epoch::FIRST,
+                pid: pid(&harness),
+                harness: HarnessKind::Codex,
+                session: None,
+                planned: None,
+                version: None,
+            },
+            out,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&out.events[..], [Event::HarnessRecorded { pid: p }] if *p == pid(&harness)),
+            "{:?}",
+            out.events
+        );
+        let job = node.job(id).await.unwrap();
+        let recorded = job.lock().await.harness_record().unwrap();
+        assert_eq!(recorded.map(|r| r.pid), Some(pid(&harness)));
+        harness.kill().unwrap();
+        harness.wait().unwrap();
     }
 
     /// A Codex started with no thread to resume makes its thread only once
@@ -4177,7 +4238,7 @@ pub(crate) mod tests {
                     planned,
                     version,
                 };
-                let result = node.harness_started(started).await;
+                let result = node.harness_started(started, &mut Out::default()).await;
                 harness.kill().unwrap();
                 harness.wait().unwrap();
                 node.harness_exited(id, pid(&harness)).await.unwrap();
@@ -5299,15 +5360,18 @@ pub(crate) mod tests {
         let mut harness = sleeper();
         let session = SessionId::parse("new-session").unwrap();
         let failed = node
-            .harness_started(StartedHarness {
-                job: id,
-                epoch: Epoch::FIRST,
-                pid: pid(&harness),
-                harness: HarnessKind::Codex,
-                session: Some(session.clone()),
-                planned: None,
-                version: None,
-            })
+            .harness_started(
+                StartedHarness {
+                    job: id,
+                    epoch: Epoch::FIRST,
+                    pid: pid(&harness),
+                    harness: HarnessKind::Codex,
+                    session: Some(session.clone()),
+                    planned: None,
+                    version: None,
+                },
+                &mut Out::default(),
+            )
             .await;
         harness.kill().unwrap();
         harness.wait().unwrap();
@@ -5807,15 +5871,18 @@ pub(crate) mod tests {
         );
         let mut sleeper = sleeper();
         let refused = node
-            .harness_started(StartedHarness {
-                job: id,
-                epoch: Epoch::FIRST,
-                pid: pid(&sleeper),
-                harness: secret,
-                session: None,
-                planned: None,
-                version: None,
-            })
+            .harness_started(
+                StartedHarness {
+                    job: id,
+                    epoch: Epoch::FIRST,
+                    pid: pid(&sleeper),
+                    harness: secret,
+                    session: None,
+                    planned: None,
+                    version: None,
+                },
+                &mut Out::default(),
+            )
             .await;
         sleeper.kill().unwrap();
         sleeper.wait().unwrap();
@@ -6664,15 +6731,18 @@ pub(crate) mod tests {
         let path = env();
         node.suspend(id, &path, &mut Out::default()).await.unwrap();
         let harness = sleeper();
-        node.harness_started(StartedHarness {
-            job: id,
-            epoch: Epoch::FIRST,
-            pid: pid(&harness),
-            harness: HarnessKind::ClaudeCode,
-            session: None,
-            planned: None,
-            version: None,
-        })
+        node.harness_started(
+            StartedHarness {
+                job: id,
+                epoch: Epoch::FIRST,
+                pid: pid(&harness),
+                harness: HarnessKind::ClaudeCode,
+                session: None,
+                planned: None,
+                version: None,
+            },
+            &mut Out::default(),
+        )
         .await
         .unwrap();
         let reaper = std::thread::spawn(move || {
@@ -6975,15 +7045,18 @@ pub(crate) mod tests {
         let id = job(dir_a.path(), &a).await;
         a.suspend(id, &path, &mut Out::default()).await.unwrap();
         let harness = sleeper();
-        a.harness_started(StartedHarness {
-            job: id,
-            epoch: Epoch::FIRST,
-            pid: pid(&harness),
-            harness: HarnessKind::ClaudeCode,
-            session: None,
-            planned: None,
-            version: None,
-        })
+        a.harness_started(
+            StartedHarness {
+                job: id,
+                epoch: Epoch::FIRST,
+                pid: pid(&harness),
+                harness: HarnessKind::ClaudeCode,
+                session: None,
+                planned: None,
+                version: None,
+            },
+            &mut Out::default(),
+        )
         .await
         .unwrap();
         let reaper = std::thread::spawn(move || {
@@ -7490,15 +7563,18 @@ pub(crate) mod tests {
         );
         let mut launched = sleeper();
         let refused = node
-            .harness_started(StartedHarness {
-                job: id,
-                epoch: next.epoch,
-                pid: pid(&launched),
-                harness: next.harness.clone(),
-                session: None,
-                planned: next.session.clone(),
-                version: None,
-            })
+            .harness_started(
+                StartedHarness {
+                    job: id,
+                    epoch: next.epoch,
+                    pid: pid(&launched),
+                    harness: next.harness.clone(),
+                    session: None,
+                    planned: next.session.clone(),
+                    version: None,
+                },
+                &mut Out::default(),
+            )
             .await;
         launched.kill().unwrap();
         launched.wait().unwrap();

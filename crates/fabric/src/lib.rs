@@ -698,9 +698,9 @@ async fn launch(
     let said = settings_lines(&plan.harness, plan.session.as_ref(), running.settings());
     let registered = match notes.print(&said) {
         Ok(()) => tokio::select! {
-            registered = register(client, plan, &running, notes) => registered,
+            registered = register(client, plan, &mut running, notes) => registered,
             signal = interrupts.next() => {
-                kill_group(&running);
+                kill_pid_group(pid);
                 return interrupted(signal, plan);
             }
         },
@@ -912,15 +912,39 @@ fn origin_words(origin: Origin) -> &'static str {
 /// Tells the node the harness started, so it records it and appends
 /// `Resumed`, and prints what it answered. The caller kills the harness's
 /// group on an error.
-async fn register(client: &Client, plan: &RunPlan, running: &Running, notes: Notes) -> Result<()> {
+///
+/// A harness not wired to the terminal starts as soon as the node says it
+/// recorded it (`harness_recorded`), while the node writes the rest of the
+/// registration: its start no longer waits for the whole answer, which
+/// costs a few durable writes. One wired to the terminal waits for the
+/// answer, since the terminal is handed to it only after that. A node that
+/// does not send the event leaves the release to the caller, after the
+/// answer, as before.
+async fn register(
+    client: &Client,
+    plan: &RunPlan,
+    running: &mut Running,
+    notes: Notes,
+) -> Result<()> {
     let mut printer = Printer::new(notes);
     let started = Started {
         session: running.session().cloned(),
         planned: plan.session.clone(),
         version: running.version().cloned(),
     };
+    let pid = running.pid();
+    let early = !running.takes_terminal();
     let registered = client
-        .harness_started(launched(plan, running.pid()), started, |event| {
+        .harness_started(launched(plan, pid), started, |event| {
+            if early
+                && let Event::HarnessRecorded { pid: recorded } = &event
+                && *recorded == pid
+                && let Err(e) = running.release()
+            {
+                // The release after the answer tries again and stops the
+                // harness if it fails there too.
+                tracing::warn!(error = %e, "the recorded harness could not be released at once");
+            }
             printer.print(&event);
         })
         .await;
@@ -1010,13 +1034,14 @@ impl Interrupts {
     }
 }
 
-/// Ends a launch that `signal` cut before the node recorded its harness,
-/// which the caller stopped if it had started.
+/// Ends a launch that `signal` cut before the node answered its harness's
+/// registration; the caller stopped the harness, which ran, if at all,
+/// only after the node recorded it.
 fn interrupted(signal: rustix::process::Signal, plan: &RunPlan) -> Result<ExitCode> {
     let number = signal.as_raw();
     writeln!(
         std::io::stderr(),
-        "interrupted by signal {number} before the node recorded the harness, so the harness was stopped; `fabric job status {}` shows what the node holds",
+        "interrupted by signal {number} before the node answered the harness's registration, so the harness was stopped; `fabric job status {}` shows what the node holds",
         plan.job
     )?;
     Ok(signal_exit(number))
@@ -1673,13 +1698,17 @@ fn environment() -> Vec<(EnvVarName, String)> {
 }
 
 fn kill_group(running: &Running) {
-    if let Some(group) = pid_of(running) {
-        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
-    }
+    kill_pid_group(running.pid());
 }
 
-fn pid_of(running: &Running) -> Option<rustix::process::Pid> {
-    rustix::process::Pid::from_raw(i32::try_from(running.pid().get()).ok()?)
+/// Kills the process group `pid` leads, as `kill_group` does for a handle.
+fn kill_pid_group(pid: std::num::NonZeroU32) {
+    if let Some(group) = i32::try_from(pid.get())
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    }
 }
 
 #[cfg(test)]

@@ -141,6 +141,8 @@ event/finishing_suspend.json /snapshot
 event/frozen.json /epoch
 event/frozen.json /kind
 event/frozen.json /peer
+event/harness_recorded.json /kind
+event/harness_recorded.json /pid
 event/holder_not_told.json /error
 event/holder_not_told.json /error/kind
 event/holder_not_told.json /error/message

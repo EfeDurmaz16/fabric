@@ -329,7 +329,8 @@ fn lines(event: &Event) -> Vec<String> {
             "warning: links restored that point outside the tree they were restored into: {}; a harness that follows one reads or writes outside it",
             named(paths, *more)
         ),
-        Event::Unrecognized => return Vec::new(),
+        // The CLI acts on it and says nothing: the registered line follows.
+        Event::HarnessRecorded { .. } | Event::Unrecognized => return Vec::new(),
     };
     vec![line]
 }

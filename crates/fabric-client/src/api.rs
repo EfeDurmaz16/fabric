@@ -2675,6 +2675,16 @@ pub enum Event {
         /// How many more there are.
         more: u64,
     },
+    /// The node has durably recorded the harness `harness_started`
+    /// reports, so it may run; the node goes on with the rest of the
+    /// registration, and the answer still says whether it was accepted. A
+    /// client that launched the harness held and does not wire it to a
+    /// terminal may release it now instead of after the answer. A client
+    /// that skips this event releases it after the answer, as before.
+    HarnessRecorded {
+        /// Its pid.
+        pid: NonZeroU32,
+    },
     /// A kind of event this client does not know; a newer node sent it.
     #[serde(other)]
     Unrecognized,
