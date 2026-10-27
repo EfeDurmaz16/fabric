@@ -33,6 +33,7 @@ use fabric_core::snapshot::{LeaveReason, SnapshotManifest};
 use fabric_core::version::HarnessVersion;
 use fabric_env::materialize::{MaterializeError, TreeLock};
 use fabric_harness::HarnessError;
+use fabric_harness::claude::VersionAhead;
 use fabric_harness::codex::Codex;
 use fabric_harness::manifest::{MANIFEST_FILE, StateManifest};
 use fabric_net::peers::HostPort;
@@ -54,7 +55,10 @@ use crate::doctor::{self, Context, Target};
 use crate::error::NodeError;
 use crate::facts::{MeasuredKeys, NodeFacts, Probes, Tool, stayed_behind};
 use crate::faults::{self, Action, Point};
-use crate::harnesses::{HarnessConfig, HarnessEnv, adapter, refuse_secret_kind};
+use crate::harnesses::{
+    HarnessConfig, HarnessEnv, adapter, adapter_with_installed, ask_installed_ahead,
+    refuse_secret_kind,
+};
 use crate::job::Job;
 use crate::local::{self, HarnessRecord, Liveness, Marker, MarkerState, SessionRecord};
 use crate::node::{Node, Out, is_transport};
@@ -2355,23 +2359,22 @@ impl Node {
             id,
             job.dir(),
         );
-        out.emit(match &choice {
-            RootChoice::Same(root) => Event::RootChosen {
-                root: root.clone(),
-                recorded: None,
-            },
-            RootChoice::Fallback { root, captured } => Event::RootChosen {
-                root: root.clone(),
-                recorded: Some(captured.clone()),
-            },
-        });
+        out.emit(root_chosen(&choice));
         let root = choice.root().to_owned();
-        check_root(&root, &self.cfg.home, self.synced_folders(&root, env).await)?;
         let resuming = matches!(
             &marker,
             Some(Marker { state: MarkerState::Restoring { snapshot: s }, .. }) if *s == snapshot
         );
-        let state = restore_state(&root)?;
+        let has_harness_state = !manifest.harness_state.entries.is_empty();
+        let ahead = has_harness_state
+            .then(|| self.installed_ahead(job.harness(), env))
+            .flatten();
+        let state = restore_state(&root);
+        let writes = !(resuming && matches!(state, Ok(RestoreState::Present)));
+        let facts = self
+            .check_root_measuring(&root, &manifest, writes, env)
+            .await?;
+        let state = state?;
         if !resuming {
             if state == RestoreState::Present {
                 return Err(NodeError::WorkspaceOccupied { root });
@@ -2402,11 +2405,10 @@ impl Node {
         if let Some(parent) = root.parent() {
             crate::durable::create_private_dir(parent).map_err(|e| NodeError::io(parent, e))?;
         }
-        let has_harness_state = !manifest.harness_state.entries.is_empty();
         let state_dir = job.dir().harness_state();
-        if !(resuming && state == RestoreState::Present) {
+        if let Some(facts) = facts {
             let harness_dir = has_harness_state.then(|| state_dir.clone());
-            self.write_snapshot(snapshot, &manifest, &root, harness_dir, env, out)
+            self.write_snapshot(snapshot, &manifest, &root, harness_dir, &facts, out)
                 .await?;
         }
         // A cache written with holes that setup steps fill keeps no
@@ -2427,7 +2429,7 @@ impl Node {
             }
         }
         if has_harness_state {
-            self.restore_harness(job, &root, env, out).await?;
+            self.restore_harness(job, &root, env, ahead, out).await?;
         }
         let tree = TreeStamp::measure(&root).await;
         job.set_marker(&Marker {
@@ -2436,6 +2438,38 @@ impl Node {
             epoch,
         })?;
         Ok(root)
+    }
+
+    /// Starts asking the installed harness of `kind` its version, which a
+    /// restore of its state asks from the daemon's directory: the
+    /// workspace a restore writes first does not change the answer, so
+    /// asked as the restore begins, it runs beside it. `None` when the
+    /// harness's environment does not build, which the harness restore
+    /// then reports, or for an ACP agent, whose restore asks nothing.
+    fn installed_ahead(&self, kind: &HarnessKind, env: &ToolEnv) -> Option<VersionAhead> {
+        ask_installed_ahead(kind, &self.harness_env(env).ok()?)
+    }
+
+    /// Refuses a restore root in a folder a sync service rewrites, and,
+    /// when the restore `writes` the snapshot, returns the facts its carry
+    /// decisions read. The two are measured at once; the check still
+    /// decides before anything is written.
+    async fn check_root_measuring(
+        &self,
+        root: &Path,
+        manifest: &SnapshotManifest,
+        writes: bool,
+        env: &ToolEnv,
+    ) -> Result<Option<NodeFacts>, NodeError> {
+        let (synced, facts) = tokio::join!(self.synced_folders(root, env), async {
+            if writes {
+                Some(NodeFacts::measure(&self.cfg.home, env, carry::probes(manifest)).await)
+            } else {
+                None
+            }
+        });
+        check_root(root, &self.cfg.home, synced)?;
+        Ok(facts)
     }
 
     /// Whether the tree at `root` holds every file of `snapshot` outside
@@ -2521,11 +2555,10 @@ impl Node {
         manifest: &fabric_core::snapshot::SnapshotManifest,
         root: &Path,
         harness_dir: Option<PathBuf>,
-        env: &ToolEnv,
+        facts: &NodeFacts,
         out: &mut Out,
     ) -> Result<(), NodeError> {
-        let facts = NodeFacts::measure(&self.cfg.home, env, carry::probes(manifest)).await;
-        let decisions = carry::decide_all(manifest, &facts);
+        let decisions = carry::decide_all(manifest, facts);
         if !decisions.is_empty() {
             out.emit(carry_decided(CarryFor::Restore, snapshot, &decisions));
         }
@@ -2600,16 +2633,21 @@ impl Node {
     }
 
     /// Places the captured harness state where its harness expects it and records the session.
+    ///
+    /// `ahead` is the installed version the restore asks, when it was
+    /// asked ahead (`ask_installed_ahead`); the adapter takes it only when
+    /// it asked what the adapter would ask.
     async fn restore_harness(
         &self,
         job: &Job,
         root: &Path,
         env: &ToolEnv,
+        ahead: Option<VersionAhead>,
         out: &mut Out,
     ) -> Result<(), NodeError> {
         let state_dir = job.dir().harness_state();
         let state = StateManifest::read(&state_dir)?;
-        let harness = adapter(state.kind(), &self.harness_env(env)?, None)?;
+        let harness = adapter_with_installed(state.kind(), &self.harness_env(env)?, None, ahead)?;
         harness.restore(root, &state_dir).await?;
         let previous = job
             .session()?
@@ -3645,6 +3683,20 @@ fn restored(snapshot: SnapshotId, report: &RestoreReport, git: bool) -> Event {
     }
 }
 
+/// The event that says where a restore writes the workspace.
+fn root_chosen(choice: &RootChoice) -> Event {
+    match choice {
+        RootChoice::Same(root) => Event::RootChosen {
+            root: root.clone(),
+            recorded: None,
+        },
+        RootChoice::Fallback { root, captured } => Event::RootChosen {
+            root: root.clone(),
+            recorded: Some(captured.clone()),
+        },
+    }
+}
+
 fn no_parent(root: &Path) -> NodeError {
     NodeError::io(root, std::io::Error::other("a root needs a parent"))
 }
@@ -4392,7 +4444,7 @@ pub(crate) mod tests {
         std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
 
         let root = paths::job_root(&node.cfg.home, id);
-        node.restore_harness(&job, &root, &path, &mut Out::default())
+        node.restore_harness(&job, &root, &path, None, &mut Out::default())
             .await
             .unwrap();
         assert_eq!(
@@ -7930,7 +7982,22 @@ pub(crate) mod tests {
         let (dir, node) = node();
         let tools = crate::facts::tests::CountingTools::new(dir.path());
         let meet = dir.path().join("meet");
-        std::fs::create_dir_all(&meet).unwrap();
+        meeting_codex_and_node(&tools, &meet);
+        let (id, _) = npm_codex_job(dir.path(), &node).await;
+        node.suspend(id, &tools.env, &mut Out::default())
+            .await
+            .unwrap();
+        let log = std::fs::read_to_string(meet.join("log")).unwrap();
+        assert!(log.contains("codex together"), "{log}");
+        assert!(!log.contains("alone"), "{log}");
+    }
+
+    /// Writes fake `codex --version` and `node --version` into `tools`
+    /// that each wait up to five seconds for the other to start and log
+    /// to `meet/log` whether it did, so one that ran only after the other
+    /// finished logs `alone`.
+    fn meeting_codex_and_node(tools: &crate::facts::tests::CountingTools, meet: &Path) {
+        std::fs::create_dir_all(meet).unwrap();
         let waits = |me: &str, other: &str, answer: &str| {
             format!(
                 "touch '{mine}'\ni=0\nwhile [ ! -f '{theirs}' ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i + 1)); done\nif [ -f '{theirs}' ]; then echo '{me} together' >> '{log}'; else echo '{me} alone' >> '{log}'; fi\n{answer}",
@@ -7953,24 +8020,72 @@ pub(crate) mod tests {
                 waits("codex", "node", "echo 'codex-cli 0.155.1'")
             ),
         );
-        let (id, _) = npm_job(dir.path(), &node).await;
-        let thread = codex_thread_in(&node, id);
-        {
-            let job = node.job(id).await.unwrap();
-            let job = job.lock().await;
-            job.set_session(&SessionRecord {
-                harness: HarnessKind::Codex,
-                session: thread,
-                known_writer: None,
-            })
-            .unwrap();
-        }
+    }
+
+    /// An npm job whose Codex session the job records.
+    async fn npm_codex_job(dir: &Path, node: &Arc<Node>) -> (JobId, PathBuf) {
+        let (id, root) = npm_job(dir, node).await;
+        let thread = codex_thread_in(node, id);
+        let job = node.job(id).await.unwrap();
+        let job = job.lock().await;
+        job.set_session(&SessionRecord {
+            harness: HarnessKind::Codex,
+            session: thread,
+            known_writer: None,
+        })
+        .unwrap();
+        (id, root)
+    }
+
+    /// A restore asks the installed harness its version as it begins, so
+    /// the probe runs while the node measures the facts its carry
+    /// decisions read and writes the workspace, and reads which folders
+    /// iCloud syncs only for a root under one of them, which a job's root
+    /// never is (item 14 of docs/evidence/perf-ab/README.md). A new job's
+    /// root is not under one either.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restore_asks_the_harness_its_version_while_it_measures_the_node() {
+        let (dir, node) = node();
+        let tools = crate::facts::tests::CountingTools::new(dir.path());
+        let meet = dir.path().join("meet");
+        meeting_codex_and_node(&tools, &meet);
+        let (id, root) = npm_codex_job(dir.path(), &node).await;
         node.suspend(id, &tools.env, &mut Out::default())
             .await
             .unwrap();
+        std::fs::remove_dir_all(&meet).unwrap();
+        std::fs::create_dir_all(&meet).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        tools.ran();
+        let mut out = Out::default();
+        let resumed = node
+            .job_resume(id, None, None, false, &tools.env, &mut out)
+            .await;
+        assert!(resumed.is_ok(), "{resumed:?} {:?}", out.said());
+        assert!(
+            out.events
+                .iter()
+                .any(|event| matches!(event, Event::SessionRestored { .. })),
+            "{:?}",
+            out.said()
+        );
         let log = std::fs::read_to_string(meet.join("log")).unwrap();
         assert!(log.contains("codex together"), "{log}");
         assert!(!log.contains("alone"), "{log}");
+        let ran = tools.ran();
+        assert!(
+            !ran.iter().any(|probe| probe.starts_with("defaults")),
+            "the restore read the iCloud defaults: {ran:?}"
+        );
+
+        let second = dir.path().join("second");
+        std::fs::create_dir_all(&second).unwrap();
+        job(&second, &node).await;
+        let ran = tools.ran();
+        assert!(
+            !ran.iter().any(|probe| probe.starts_with("defaults")),
+            "a new job read the iCloud defaults: {ran:?}"
+        );
     }
 
     /// The preflight of a move and of a pull measures this node while the
