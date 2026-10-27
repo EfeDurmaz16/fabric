@@ -345,7 +345,7 @@ Attempt status follows the same rule: `granted` (recorded, not started), `runnin
 ## Replay rules
 
 1. On open the authority runs `verify`. A broken chain, an event that does not decode or a projection that disagrees stops the authority with an error naming the job; it does not repair or drop rows.
-2. An operation left `accepted` at restart is still accepted: the command was durable, and its dispatch is the next step, done once.
+2. An operation left `accepted` at restart is still accepted: the command was durable, and its dispatch is the next step, done once. A grant is offered for dispatch, and may be marked `dispatched`, only while its attempt is still `granted` at the job's current generation. A grant whose attempt recovery found `lost` or `running`, or that a newer generation replaced, is never dispatched.
 3. An operation left `dispatched` at restart becomes `unknown` in a new event. It is not dispatched again.
 4. An attempt left `granted` or `running` at restart stays as it is until the executor reports or a stop is verified. The authority checks the recorded process group (as `local.rs` does for standalone harnesses): a group that is gone is `lost`; a group that still runs is `running`. Neither grants a new attempt. As built, `Journal::recover` takes the check as a probe; no attempt records a process group until an executor reports one (M3), so the daemon's probe answers "cannot tell" and attempts stay as they are.
 5. A worker loss is `lost` for the attempt, never `cancelled` for the task. The task stays open.

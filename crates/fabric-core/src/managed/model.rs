@@ -758,6 +758,22 @@ impl ManagedState {
     pub fn live_attempt(&self) -> Option<&Attempt> {
         self.attempts.iter().find(|a| a.status.may_run())
     }
+
+    /// Whether `operation` is an accepted grant that may still be
+    /// dispatched: its attempt has not been seen running or ending, was
+    /// not lost, and is the job's current generation. A lost or running
+    /// attempt is never launched again, and an older grant never runs
+    /// next to a newer one.
+    #[must_use]
+    pub fn grant_may_dispatch(&self, operation: OperationId) -> bool {
+        self.operation(operation).is_some_and(|op| {
+            op.status == OperationStatus::Accepted && op.kind == CommandKind::StartAttempt
+        }) && self.attempts.iter().any(|a| {
+            a.granted_by == operation
+                && a.status == AttemptStatus::Granted
+                && a.generation == self.job.generation
+        })
+    }
 }
 
 /// The changes one command or observation makes: the job's next revision

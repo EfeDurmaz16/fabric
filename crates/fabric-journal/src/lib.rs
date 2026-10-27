@@ -32,8 +32,8 @@ use std::path::{Path, PathBuf};
 use fabric_core::id::{JobId, NodeId};
 use fabric_core::managed::Command;
 use fabric_core::managed::{
-    AcceptedOperation, Attempt, AttemptId, AttemptStatus, CommandKind, DomainError, Envelope,
-    EventFrame, EventSeq, ManagedState, NewIds, Observation, Operation, OperationId, OperationKey,
+    AcceptedOperation, Attempt, AttemptId, AttemptStatus, DomainError, Envelope, EventFrame,
+    EventSeq, ManagedState, NewIds, Observation, Operation, OperationId, OperationKey,
     OperationMark, OperationStatus, RequestDigest, StoredResult, Transition, WorkRevision,
     accept_command, apply_observation, mark_operation, replay, request_digest,
 };
@@ -177,7 +177,8 @@ pub struct Recovery {
     pub lost: Vec<(JobId, AttemptId)>,
     /// Attempts now `running` because their group runs.
     pub running: Vec<(JobId, AttemptId)>,
-    /// Operations still `accepted`, whose one dispatch is the caller's next step (rule 2).
+    /// Grants still `accepted` whose attempt is still `granted` at the
+    /// job's current generation: one dispatch each is the caller's next step (rule 2).
     pub to_dispatch: Vec<(JobId, OperationId)>,
 }
 
@@ -719,8 +720,10 @@ impl Journal {
     /// dispatched again. An attempt left `granted` or `running` becomes
     /// `lost` only when `probe` verifies its group is gone, and `running`
     /// only when `probe` verifies it runs; `CannotTell` leaves it as it
-    /// is. Nothing is granted. Operations still `accepted` are returned
-    /// for the caller to dispatch once, each after `mark(Dispatched)`.
+    /// is. Nothing is granted. Grants still `accepted` whose attempt is
+    /// still `granted` at the job's current generation, read after the
+    /// probes, are returned for the caller to dispatch once, each after
+    /// `mark(Dispatched)`; a lost or running attempt is never offered.
     pub fn recover(
         &mut self,
         at_ms: u64,
@@ -737,6 +740,7 @@ impl Journal {
                     out.unknown.push((job, op.id));
                 }
             }
+            let mut observed = false;
             for attempt in state
                 .attempts
                 .iter()
@@ -755,14 +759,23 @@ impl Journal {
                 };
                 let lost = matches!(report, Observation::Lost { .. });
                 self.observe(job, &report, at_ms)?;
+                observed = true;
                 if lost {
                     out.lost.push((job, attempt.id));
                 } else {
                     out.running.push((job, attempt.id));
                 }
             }
-            for op in &state.operations {
-                if op.status == OperationStatus::Accepted && op.kind == CommandKind::StartAttempt {
+            let now = if observed {
+                match self.job(job)? {
+                    Some(now) => now,
+                    None => continue,
+                }
+            } else {
+                state
+            };
+            for op in &now.operations {
+                if now.grant_may_dispatch(op.id) {
                     out.to_dispatch.push((job, op.id));
                 }
             }

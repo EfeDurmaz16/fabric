@@ -345,6 +345,55 @@ fn a_running_probe_marks_a_granted_attempt_running() {
 }
 
 #[test]
+fn recovery_never_offers_a_lost_grant_and_it_cannot_run_next_to_its_replacement() {
+    let mut f = Fixture::new();
+    let job = accepted(&f.submit("create", None, create())).job;
+    let primary = f.journal.job(job).unwrap().unwrap().job.primary;
+    let first = accepted(&f.submit("start-1", Some(job), start(primary))).operation;
+
+    // Crash before dispatch; the probe verifies nothing runs.
+    f.reopen();
+    let recovery = f.journal.recover(2_000, |_| Liveness::Gone).unwrap();
+    assert_eq!(recovery.lost.len(), 1);
+    assert!(
+        recovery.to_dispatch.is_empty(),
+        "the grant of a lost attempt was offered"
+    );
+
+    let second = accepted(&f.submit("start-2", Some(job), start(primary))).operation;
+    f.reopen();
+    let recovery = f.journal.recover(3_000, |_| Liveness::CannotTell).unwrap();
+    assert_eq!(recovery.to_dispatch, vec![(job, second)]);
+    assert!(matches!(
+        f.journal.mark(job, first, OperationMark::Dispatched, 3_001),
+        Err(CommitError::Domain(DomainError::OperationState { .. }))
+    ));
+    f.journal
+        .mark(job, second, OperationMark::Dispatched, 3_002)
+        .unwrap();
+    f.journal.verify().unwrap();
+}
+
+#[test]
+fn recovery_never_offers_the_grant_of_an_attempt_it_saw_running() {
+    let mut f = Fixture::new();
+    let job = accepted(&f.submit("create", None, create())).job;
+    let primary = f.journal.job(job).unwrap().unwrap().job.primary;
+    let grant = accepted(&f.submit("start-1", Some(job), start(primary))).operation;
+    let recovery = f.journal.recover(2_000, |_| Liveness::Running).unwrap();
+    assert_eq!(recovery.running.len(), 1);
+    assert!(
+        recovery.to_dispatch.is_empty(),
+        "a running attempt was offered for a second launch"
+    );
+    assert!(matches!(
+        f.journal.mark(job, grant, OperationMark::Dispatched, 2_001),
+        Err(CommitError::Domain(DomainError::OperationState { .. }))
+    ));
+    f.journal.verify().unwrap();
+}
+
+#[test]
 fn events_and_evidence_are_append_only_and_tampering_is_found() {
     let mut f = Fixture::new();
     let job = accepted(&f.submit("create", None, create())).job;

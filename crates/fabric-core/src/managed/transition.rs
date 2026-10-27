@@ -333,6 +333,19 @@ pub fn mark_operation(
     let op = job
         .operation(operation)
         .ok_or(DomainError::UnknownOperation { operation })?;
+    // A grant is dispatched only while its attempt is the current,
+    // untouched grant; replay keeps the plain status rule, so stored
+    // histories are read as before.
+    if mark == OperationMark::Dispatched
+        && op.kind == CommandKind::StartAttempt
+        && op.status == OperationStatus::Accepted
+        && !job.grant_may_dispatch(operation)
+    {
+        return Err(DomainError::OperationState {
+            operation,
+            to: mark,
+        });
+    }
     match mark_allowed(&op.status, mark) {
         Ok(false) => Ok(unchanged(job)),
         Ok(true) => Ok(Transition {
