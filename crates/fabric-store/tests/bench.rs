@@ -214,3 +214,98 @@ fn capture_and_restore_timings() {
     let second = snapshot(&mut store, &root, Some(first.id)).unwrap();
     report("second", &second, &store);
 }
+
+/// Commits one change to `root` and captures it after `parent`.
+fn commit_step(
+    store: &mut Store,
+    root: &Path,
+    step: u32,
+    parent: Option<SnapshotId>,
+) -> Fallible<SnapshotId> {
+    fs::write(
+        root.join("src/step.rs"),
+        format!("pub const STEP: u32 = {step};\n"),
+    )?;
+    let git = TestGit::new(root, 1_760_000_000_000 + u64::from(step) * 1000);
+    git.run(&["add", "-A"])?;
+    git.run(&["commit", "-q", "-m", &format!("step {step}")])?;
+    Ok(snapshot(store, root, parent)?.id)
+}
+
+/// Restores `id` into `target` as a node does, flushed for a power loss,
+/// and returns the time and how many links it unpacked with git.
+fn restore_as_node(store: &Store, id: SnapshotId, target: &Path) -> Fallible<(Duration, u32)> {
+    let started = Instant::now();
+    let report = restore(
+        store,
+        &RestoreRequest {
+            snapshot: id,
+            target,
+            harness_state: None,
+            verify: Verify::Sample(32),
+            durability: Durability::PowerLoss,
+            carry: &|_| true,
+        },
+    )?;
+    Ok((started.elapsed(), report.bundles_unpacked))
+}
+
+/// A restore at each length of a bundle chain, first with the node's
+/// bundle cache empty, which unpacks every link as every restore did
+/// before the cache, then right after a restore of the link below, as a
+/// resume after the job's last suspend on another node finds it. Each is
+/// the fastest of `REPEATS`, taken in turns, so a burst of load elsewhere
+/// on the machine reaches both alike and is left out.
+#[test]
+#[ignore = "benchmark; run on demand with --ignored --nocapture"]
+fn restore_time_by_chain_length() {
+    const REPEATS: usize = 5;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    fs::create_dir_all(root.join("src")).unwrap();
+    for i in 0..TRACKED_FILES {
+        fs::write(
+            root.join(format!("src/mod{i}.rs")),
+            format!("pub fn f{i}() -> u64 {{ {i} }}\n").repeat(40),
+        )
+        .unwrap();
+    }
+    TestGit::new(&root, 1_760_000_000_000)
+        .run(&["init", "-q", "-b", "main"])
+        .unwrap();
+    let store_dir = dir.path().join("store");
+    let mut store = Store::create(&store_dir, ChunkParams::DEFAULT).unwrap();
+    let mut chain = Vec::new();
+    for step in 0..17 {
+        let parent = chain.last().copied();
+        chain.push(commit_step(&mut store, &root, step, parent).unwrap());
+    }
+    let cache = store_dir.join("bundle-cache");
+    let mut target = 0;
+    let mut next = || {
+        target += 1;
+        dir.path().join(format!("restore-{target}"))
+    };
+    println!("| links | cache empty: ms (unpacked) | after the link below: ms (unpacked) |");
+    println!("|---:|---:|---:|");
+    for (index, id) in chain.iter().enumerate() {
+        let (mut cold, mut warm) = ((Duration::MAX, 0), (Duration::MAX, 0));
+        for _ in 0..REPEATS {
+            let _ = fs::remove_dir_all(&cache);
+            if index > 0 {
+                restore_as_node(&store, chain[index - 1], &next()).unwrap();
+            }
+            warm = warm.min(restore_as_node(&store, *id, &next()).unwrap());
+            let _ = fs::remove_dir_all(&cache);
+            cold = cold.min(restore_as_node(&store, *id, &next()).unwrap());
+        }
+        println!(
+            "| {} | {:.1} ({}) | {:.1} ({}) |",
+            index + 1,
+            cold.0.as_secs_f64() * 1000.0,
+            cold.1,
+            warm.0.as_secs_f64() * 1000.0,
+            warm.1
+        );
+    }
+}
