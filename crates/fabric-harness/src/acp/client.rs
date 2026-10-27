@@ -7,10 +7,12 @@
 //! when the policy the caller chose says so, never more than it says. Deny
 //! is the default. Once a turn is cancelled, every permission request for
 //! its session is answered `cancelled` until the next prompt, as the
-//! schema asks of `session/cancel`, so no tool runs after a cancel. At most `UPDATE_BUFFER` `session/update` notifications
-//! wait for `next_update`; newer ones are dropped and counted in
+//! schema asks of `session/cancel`, so no tool runs after a cancel. At
+//! most `UPDATE_BUFFER` `session/update` notifications, and at most
+//! `UPDATE_BUFFER_BYTES` of the lines they came in, wait for
+//! `next_update`; newer ones are dropped and counted in
 //! `dropped_updates`, so the reader never waits on a caller who is not
-//! draining updates. A handshake request has a
+//! draining updates, and an undrained client never holds more. A handshake request has a
 //! deadline, so a hung agent cannot hang `launch`. Every message reaches
 //! the agent as one whole line written by a single writer task, so a
 //! caller that drops a request mid-way cannot leave half a line on the
@@ -24,7 +26,7 @@
 //! (2026-10-16), read on 2026-10-19.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -54,6 +56,14 @@ pub const OUTGOING_BUFFER: usize = 1024;
 /// How many `session/update` notifications wait for `next_update` before
 /// newer ones are dropped and counted.
 pub const UPDATE_BUFFER: usize = 1024;
+
+/// How many bytes of `session/update` lines, as the agent sent them, wait
+/// for `next_update` before newer ones are dropped and counted. With
+/// `UPDATE_BUFFER` alone, 1024 lines of up to `MAX_LINE` each could wait,
+/// 16 GiB. It equals `MAX_LINE`, so one update of the longest line still
+/// fits a queue that waits on nothing. A parsed update takes a small
+/// multiple of its line in memory, which this bounds as well.
+pub const UPDATE_BUFFER_BYTES: usize = MAX_LINE;
 
 /// Why an ACP exchange failed.
 #[derive(Debug, thiserror::Error)]
@@ -185,7 +195,9 @@ struct Inner {
     pending: Pending,
     cancelled: Cancelled,
     next_id: AtomicU64,
-    updates: tokio::sync::Mutex<mpsc::Receiver<SessionUpdate>>,
+    updates: tokio::sync::Mutex<mpsc::Receiver<Queued>>,
+    /// The bytes of the lines of the updates that wait.
+    queued_bytes: Arc<AtomicUsize>,
     dropped_updates: Arc<AtomicU64>,
     reader: JoinHandle<()>,
 }
@@ -322,40 +334,81 @@ fn parse_update(params: &Value) -> Option<SessionUpdate> {
     Some(SessionUpdate { session, update })
 }
 
+/// An update waiting for `next_update`, with the bytes of the line it
+/// came in.
+struct Queued {
+    update: SessionUpdate,
+    bytes: usize,
+}
+
 /// Where the reader puts `session/update` notifications. The queue is
-/// bounded and a full queue drops the newest update and counts it, rather
-/// than making the reader wait: a reader that waited on a caller who is
-/// not draining updates would never deliver the response that caller is
+/// bounded by count and by the bytes of the lines the updates came in,
+/// and a full queue drops the newest update and counts it, rather than
+/// making the reader wait: a reader that waited on a caller who is not
+/// draining updates would never deliver the response that caller is
 /// waiting for. `session/load` replays a whole history as updates, so the
 /// bound is what keeps an undrained client from growing without limit.
 struct UpdateSink {
-    tx: mpsc::Sender<SessionUpdate>,
+    tx: mpsc::Sender<Queued>,
+    /// The bytes waiting, which `next_update` lowers as it takes them.
+    queued_bytes: Arc<AtomicUsize>,
+    budget: usize,
     dropped: Arc<AtomicU64>,
 }
 
+/// The receiving half of an `UpdateSink`: the queue, the bytes it holds
+/// and the count of updates dropped.
+type UpdateQueue = (mpsc::Receiver<Queued>, Arc<AtomicUsize>, Arc<AtomicU64>);
+
 impl UpdateSink {
-    fn new(capacity: usize) -> (Self, mpsc::Receiver<SessionUpdate>, Arc<AtomicU64>) {
+    fn new(capacity: usize, budget: usize) -> (Self, UpdateQueue) {
         let (tx, rx) = mpsc::channel(capacity);
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
         let dropped = Arc::new(AtomicU64::new(0));
         let sink = UpdateSink {
             tx,
+            queued_bytes: Arc::clone(&queued_bytes),
+            budget,
             dropped: Arc::clone(&dropped),
         };
-        (sink, rx, dropped)
+        (sink, (rx, queued_bytes, dropped))
     }
 
-    fn offer(&self, update: SessionUpdate) {
-        match self.tx.try_send(update) {
+    /// Queues `update`, which came in a line of `bytes`, or drops it when
+    /// the queue holds `capacity` updates or `budget` bytes would be
+    /// passed. The reader is the only one that adds, so a check and then
+    /// an add never let two updates past the budget together.
+    fn offer(&self, update: SessionUpdate, bytes: usize) {
+        if self
+            .queued_bytes
+            .load(Ordering::Acquire)
+            .saturating_add(bytes)
+            > self.budget
+        {
+            self.drop_newest();
+            return;
+        }
+        self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
+        match self.tx.try_send(Queued { update, bytes }) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
-                if self.dropped.fetch_add(1, Ordering::Relaxed) == 0 {
-                    warn!(
-                        buffer = UPDATE_BUFFER,
-                        "acp: session updates are not being read; dropping the newest"
-                    );
-                }
+                self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                self.drop_newest();
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => debug!("acp: update receiver dropped"),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                debug!("acp: update receiver dropped");
+            }
+        }
+    }
+
+    fn drop_newest(&self) {
+        if self.dropped.fetch_add(1, Ordering::Relaxed) == 0 {
+            warn!(
+                buffer = UPDATE_BUFFER,
+                bytes = self.budget,
+                "acp: session updates are not being read; dropping the newest"
+            );
         }
     }
 }
@@ -459,7 +512,7 @@ async fn read_loop(
             (None, Some(method)) => {
                 if method == "session/update" {
                     if let Some(update) = parse_update(&message.params) {
-                        updates.offer(update);
+                        updates.offer(update, line.len());
                     }
                 } else {
                     debug!(%method, "acp: notification ignored");
@@ -500,7 +553,8 @@ impl AcpClient {
         let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
         let cancelled: Cancelled = Arc::new(Mutex::new(HashSet::new()));
         tokio::spawn(write_loop(stdin, lines, Arc::clone(&pending), go));
-        let (sink, rx, dropped_updates) = UpdateSink::new(UPDATE_BUFFER);
+        let (sink, (rx, queued_bytes, dropped_updates)) =
+            UpdateSink::new(UPDATE_BUFFER, UPDATE_BUFFER_BYTES);
         let reader = tokio::spawn(read_loop(
             stdout,
             outgoing.clone(),
@@ -516,6 +570,7 @@ impl AcpClient {
                 cancelled,
                 next_id: AtomicU64::new(1),
                 updates: tokio::sync::Mutex::new(rx),
+                queued_bytes,
                 dropped_updates,
                 reader,
             }),
@@ -672,13 +727,18 @@ impl AcpClient {
     }
 
     /// Waits for the next `session/update`; `None` once the agent has closed.
-    /// At most `UPDATE_BUFFER` updates wait here; see `dropped_updates`.
+    /// At most `UPDATE_BUFFER` updates, and `UPDATE_BUFFER_BYTES` of their
+    /// lines, wait here; see `dropped_updates`.
     pub async fn next_update(&self) -> Option<SessionUpdate> {
-        self.inner.updates.lock().await.recv().await
+        let queued = self.inner.updates.lock().await.recv().await?;
+        self.inner
+            .queued_bytes
+            .fetch_sub(queued.bytes, Ordering::AcqRel);
+        Some(queued.update)
     }
 
-    /// How many updates were dropped because `UPDATE_BUFFER` were already
-    /// waiting unread.
+    /// How many updates were dropped because `UPDATE_BUFFER` updates, or
+    /// `UPDATE_BUFFER_BYTES` of their lines, were already waiting unread.
     #[must_use]
     pub fn dropped_updates(&self) -> u64 {
         self.inner.dropped_updates.load(Ordering::Relaxed)
@@ -763,20 +823,46 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_full_update_queue_drops_the_newest_and_counts_it() {
-        let (sink, mut rx, dropped) = UpdateSink::new(2);
-        let update = |n: u64| SessionUpdate {
+    fn update(n: u64) -> SessionUpdate {
+        SessionUpdate {
             session: SessionId::parse("s1").unwrap(),
             update: json!(n),
-        };
+        }
+    }
+
+    #[test]
+    fn a_full_update_queue_drops_the_newest_and_counts_it() {
+        let (sink, (mut rx, bytes, dropped)) = UpdateSink::new(2, 1000);
         for n in 0..5 {
-            sink.offer(update(n));
+            sink.offer(update(n), 10);
         }
         assert_eq!(dropped.load(Ordering::Relaxed), 3);
-        assert_eq!(rx.try_recv().unwrap().update, json!(0));
-        assert_eq!(rx.try_recv().unwrap().update, json!(1));
+        assert_eq!(bytes.load(Ordering::Relaxed), 20);
+        assert_eq!(rx.try_recv().unwrap().update.update, json!(0));
+        assert_eq!(rx.try_recv().unwrap().update.update, json!(1));
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A queue whose bytes would pass the budget drops the newest update
+    /// and counts it; a smaller one that still fits is queued, and the
+    /// longest line fits a queue that holds nothing.
+    #[test]
+    fn a_queue_full_of_bytes_drops_the_newest_and_counts_it() {
+        let (sink, (mut rx, bytes, dropped)) = UpdateSink::new(100, 100);
+        sink.offer(update(0), 60);
+        sink.offer(update(1), 50);
+        sink.offer(update(2), 40);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(bytes.load(Ordering::Relaxed), 100);
+        let first = rx.try_recv().unwrap();
+        assert_eq!((first.update.update, first.bytes), (json!(0), 60));
+        assert_eq!(rx.try_recv().unwrap().update.update, json!(2));
+        assert!(rx.try_recv().is_err());
+
+        let (sink, (mut rx, _, dropped)) = UpdateSink::new(100, 100);
+        sink.offer(update(3), 100);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(rx.try_recv().unwrap().update.update, json!(3));
     }
 
     #[tokio::test]
@@ -823,6 +909,69 @@ mod tests {
             .expect("the prompt must fail once the queue is full");
         assert!(answer.is_err());
         child.kill().await.unwrap();
+    }
+
+    /// M2-23: updates were bounded by count alone, 1024 of lines up to
+    /// 16 MiB each, so an agent no one drained could make the client hold
+    /// 16 GiB. Forty updates of 1 MiB each, none read, must leave at most
+    /// `UPDATE_BUFFER_BYTES` of them queued and count the rest as dropped.
+    #[tokio::test]
+    async fn updates_are_bounded_by_bytes_as_well_as_by_count() {
+        const UPDATES: usize = 40;
+        let dir = tempfile::tempdir().unwrap();
+        let text = "a".repeat(1024 * 1024);
+        let mut line = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": text }
+                }
+            }
+        }))
+        .unwrap();
+        line.push('\n');
+        let update = dir.path().join("update.jsonl");
+        std::fs::write(&update, &line).unwrap();
+        // After the updates, a request: the agent reads the client's
+        // answer, so every update before it has been offered by then.
+        let request = r#"{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{"sessionId":"s1","options":[]}}"#;
+        let script = format!(
+            "i=0; while [ $i -lt {UPDATES} ]; do cat \"$0\"; i=$((i+1)); done; echo '{request}'; read -r answer"
+        );
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .arg(&update)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let client = AcpClient::attach(stdin, stdout, PermissionPolicy::Deny);
+        let status = tokio::time::timeout(Duration::from_mins(1), child.wait())
+            .await
+            .expect("the agent got no answer to its request")
+            .unwrap();
+        assert!(status.success(), "{status}");
+        let dropped = usize::try_from(client.dropped_updates()).unwrap();
+        let mut queued = 0;
+        while let Ok(Some(_)) =
+            tokio::time::timeout(Duration::from_secs(5), client.next_update()).await
+        {
+            queued += 1;
+        }
+        assert_eq!(queued + dropped, UPDATES);
+        assert!(
+            queued * line.len() <= UPDATE_BUFFER_BYTES,
+            "{queued} updates of {} bytes waited unread",
+            line.len()
+        );
+        assert!(queued > 0, "an update that fits was dropped");
     }
 
     #[test]

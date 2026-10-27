@@ -450,8 +450,9 @@ impl AcpHarness {
     /// prompt, gathers the agent's answer from the turn's updates, closes
     /// the agent's stdin when the turn ends, and says each step on the
     /// handle's turn feed (`Running::take_turn`). Updates past
-    /// `client::UPDATE_BUFFER` unread are dropped, and the driver reads
-    /// them as they come.
+    /// `client::UPDATE_BUFFER`, or past `client::UPDATE_BUFFER_BYTES` of
+    /// their lines, unread are dropped, and the driver reads them as they
+    /// come.
     async fn launch_impl(
         &self,
         workspace: &Path,
