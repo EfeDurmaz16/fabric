@@ -373,31 +373,32 @@ fn older_target(
 
 /// The rows for an ACP job: the target must find the agent and give it a
 /// `state_dir`, or the job would be owned by a node that cannot launch it,
-/// restore its session or capture it. Only the target of a pull measures
-/// them; a peer does not report its agents, so a push can only warn.
+/// restore its session or capture it. The target measures them: this
+/// node for a pull, and the peer for a push, whose question for its facts
+/// names the job's harness (issue #16). A fact the target did not report
+/// refuses as one it does not have.
 fn acp_rows(program: &str, here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> [Row; 2] {
+    let (target, whose, there) = match ctx.target {
+        Target::Peer => (peer, "the target's", "there"),
+        Target::Here => (here, "this node's", "here"),
+    };
     let missing = [
         (
             name::ACP_AGENT,
-            format!("this node's PATH has no {program}, so the job could not launch here"),
+            format!("{whose} PATH has no {program}, so the job could not launch {there}"),
         ),
         (
             name::ACP_STATE_DIR,
             format!(
-                "harness.toml here gives {program} no state_dir capture and restore accept (none, one outside the home or under ~/.fabric, or one reached through a link), so its session could not be restored or captured here"
+                "harness.toml {there} gives {program} no state_dir capture and restore accept (none, one outside the home or under ~/.fabric, or one reached through a link), so its session could not be restored or captured {there}"
             ),
         ),
     ];
     missing.map(|(fact, absent)| {
-        let (outcome, note) = match ctx.target {
-            Target::Here if here.get(fact).is_some() => (Outcome::Equal, String::new()),
-            Target::Here => (Outcome::Refuse(Waiver::Never), absent),
-            Target::Peer => (
-                Outcome::Warn,
-                format!(
-                    "a peer does not report its ACP agents, so whether it has {program} and a state_dir for it is not checked"
-                ),
-            ),
+        let (outcome, note) = if target.get(fact).is_some() {
+            (Outcome::Equal, String::new())
+        } else {
+            (Outcome::Refuse(Waiver::Never), absent)
         };
         Row {
             fact,
@@ -985,6 +986,62 @@ mod tests {
                     CarryDecision::Carry { .. }
                 ),
                 "{fact}"
+            );
+        }
+    }
+
+    /// Issue #16: a push judges the target, the peer, by the ACP facts it
+    /// measured for the job's agent, as a pull judges this node, and
+    /// `--force` waives neither. A fact the peer did not report, as one
+    /// that kept the default `facts_for` leaves out, refuses.
+    #[test]
+    fn a_push_refuses_a_target_without_the_acp_agent_or_its_state_dir() {
+        let acp = HarnessKind::Acp {
+            program: fabric_core::harness::ProgramName::parse("agent").unwrap(),
+            args: Vec::new(),
+        };
+        let agent = [
+            (name::ACP_AGENT, Some("/usr/local/bin/agent")),
+            (name::ACP_STATE_DIR, Some(".agent")),
+        ];
+        let has = with(&pro(), &agent);
+        for target in [Target::Peer, Target::Here] {
+            let context = Context {
+                target,
+                ..ctx(Some(&acp))
+            };
+            // `onto` is the target of the move, `from` the node it leaves.
+            let outcomes = |onto: &NodeFacts, from: &NodeFacts| -> Vec<(&str, Outcome)> {
+                let rows = match target {
+                    Target::Peer => compare(from, onto, &context),
+                    Target::Here => compare(onto, from, &context),
+                };
+                rows.iter()
+                    .filter(|row| row.fact.starts_with("acp."))
+                    .map(|row| (row.fact, row.outcome))
+                    .collect()
+            };
+            assert_eq!(
+                outcomes(&has, &pro()),
+                [
+                    (name::ACP_AGENT, Outcome::Equal),
+                    (name::ACP_STATE_DIR, Outcome::Equal)
+                ],
+                "{target:?}"
+            );
+            assert_eq!(
+                outcomes(&pro(), &has),
+                [
+                    (name::ACP_AGENT, Outcome::Refuse(Waiver::Never)),
+                    (name::ACP_STATE_DIR, Outcome::Refuse(Waiver::Never))
+                ],
+                "{target:?}"
+            );
+            let no_dir = with(&has, &[(name::ACP_STATE_DIR, None)]);
+            assert_eq!(
+                outcomes(&no_dir, &has)[1],
+                (name::ACP_STATE_DIR, Outcome::Refuse(Waiver::Never)),
+                "{target:?}"
             );
         }
     }

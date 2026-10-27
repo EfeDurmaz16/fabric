@@ -2851,18 +2851,25 @@ impl Node {
     ) -> Result<(Vec<doctor::Row>, NodeFacts, NodeFacts), NodeError> {
         // Both nodes measure at once (issue #26). A session the peer
         // opened is used too: a peer behind a NAT has no address here and
-        // is reachable only over the session it dialed.
+        // is reachable only over the session it dialed. A named job's
+        // harness goes with the question, so the peer also looks for an
+        // ACP job's agent, by which a push judges it (issue #16).
+        let harness = job.map(|(harness, _, _)| harness);
         let (mut here, theirs) = tokio::join!(
             NodeFacts::measure(&self.cfg.home, env, probes),
             self.call(peer, |session| async move {
-                let facts = session.facts(SHORT_DEADLINE * 4).await?;
+                let deadline = SHORT_DEADLINE * 4;
+                let facts = match harness {
+                    Some(harness) => session.facts_for(harness, deadline).await?,
+                    None => session.facts(deadline).await?,
+                };
                 Ok((facts, session.clock_skew_ms(), session.kind().to_string()))
             }),
         );
         let (theirs, clock_skew_ms, wire) = theirs?;
-        // The agent of an ACP job is named per job, so only the target of a
-        // pull, this node, can look for it.
-        if let (Target::Here, Some((HarnessKind::Acp { program, .. }, _, _))) = (target, job) {
+        // The agent of an ACP job is named per job: the target of a pull,
+        // this node, looks for it here, and the peer looked on its side.
+        if let (Target::Here, Some(HarnessKind::Acp { program, .. })) = (target, harness) {
             here.measure_acp(program, &self.harness_env(env)?);
         }
         let theirs = NodeFacts::from_wire(&theirs);
@@ -2870,7 +2877,7 @@ impl Node {
             &here,
             &theirs,
             &Context {
-                harness: job.map(|(h, _, _)| h),
+                harness,
                 root: job.map(|(_, r, _)| r),
                 target,
                 clock_skew_ms: Some(clock_skew_ms),

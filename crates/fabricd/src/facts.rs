@@ -101,11 +101,14 @@ pub mod name {
     pub const ICLOUD_DESKTOP: &str = "icloud.desktop";
     /// Whether iCloud Drive syncs `~/Documents`.
     pub const ICLOUD_DOCUMENTS: &str = "icloud.documents";
-    /// Where the `PATH` of the pulling command finds the job's ACP agent;
-    /// measured by the target of a pull only, never sent to a peer.
+    /// Where the target of a move finds the job's ACP agent: on the `PATH`
+    /// of the pulling command, or for a push on the `PATH` the target
+    /// measures its facts with, sent only to a question that names the
+    /// job's harness (`FactsFor`, issue #16).
     pub const ACP_AGENT: &str = "acp.agent";
     /// The `state_dir` the target's `harness.toml` gives the job's ACP
-    /// agent; measured by the target of a pull only, never sent to a peer.
+    /// agent; measured by the target of a pull, and by a push target for a
+    /// question that names the job's harness.
     pub const ACP_STATE_DIR: &str = "acp.state_dir";
 }
 

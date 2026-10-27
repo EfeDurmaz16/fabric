@@ -1,5 +1,5 @@
 //! M2-02 (issue #16): a push of an ACP job checks the target for the job's
-//! agent before the job changes hands, as a pull does. Ignored until fixed.
+//! agent before the job changes hands, as a pull does.
 
 use std::fs;
 use std::io::Write as _;
@@ -38,7 +38,6 @@ fn state_dir_for(node: &Node, program: &str) -> Fallible {
 /// on its `PATH`. The push is refused, `--force` does not waive it, and the
 /// source stays the owner at epoch 1.
 #[test]
-#[ignore = "M2-02: expected failure until fixed"]
 fn e2e_a_push_refuses_a_target_without_the_jobs_acp_agent() -> Fallible {
     const ONLY_ON_A: &str = "fabric-agent-on-a";
     let env = Env::new()?;
@@ -55,6 +54,10 @@ fn e2e_a_push_refuses_a_target_without_the_jobs_acp_agent() -> Fallible {
     let refused = a.run(&["job", "move", &job, "--to", &b.id, "--force"])?;
     let said = text(&refused);
     assert!(!refused.status.success(), "{said}");
+    assert!(
+        said.contains(&format!("the target's PATH has no {ONLY_ON_A}")),
+        "{said}"
+    );
     let lease = a.lease(&job)?;
     assert_eq!(lease.owner, a.id, "{said}");
     assert_eq!((lease.epoch, lease.view.as_str()), (1, "owner"), "{said}");

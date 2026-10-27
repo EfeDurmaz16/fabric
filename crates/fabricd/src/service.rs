@@ -17,6 +17,7 @@
 //! chunks are named by their hashes and served to any paired peer.
 
 use fabric_core::BoxFuture;
+use fabric_core::harness::HarnessKind;
 use fabric_core::id::{ChunkId, Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::FencingToken;
 use fabric_core::ledger::{Author, LedgerError};
@@ -161,6 +162,28 @@ impl Service for Node {
                     .await
                     .to_wire(),
             )
+        })
+    }
+
+    fn facts_for(
+        &self,
+        _peer: NodeId,
+        harness: HarnessKind,
+    ) -> BoxFuture<'_, Result<Facts, Fault>> {
+        Box::pin(async move {
+            // This node is the target of a push of a job under `harness`.
+            // The answer holds every fact, as `facts` does, and for an ACP
+            // job where this node finds the agent and the `state_dir` it
+            // gives it, on the PATH the rest were measured with, so the
+            // pushing node refuses a target that could not launch the job
+            // (issue #16). A pull measures the same on the pulling node.
+            let env = self.node_env();
+            let mut facts = NodeFacts::measure(&self.cfg.home, &env, Probes::ALL).await;
+            if let HarnessKind::Acp { program, .. } = &harness {
+                let harness_env = self.harness_env(&env).map_err(|e| internal(&e))?;
+                facts.measure_acp(program, &harness_env);
+            }
+            Ok(facts.to_wire())
         })
     }
 }
