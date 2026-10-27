@@ -79,7 +79,7 @@ mod ids;
 mod model;
 mod transition;
 
-pub use frame::{EventFrame, FrameError, MANAGED_FORMAT, request_digest};
+pub use frame::{EventFrame, FrameError, MANAGED_FORMAT, StoredPart, request_digest};
 pub use ids::{
     AttemptId, EventDigest, EventSeq, Generation, MAX_OPERATION_KEY, OperationId, OperationKey,
     OperationKeyError, ParseCounterError, RequestDigest, TaskId, WorkRevision,

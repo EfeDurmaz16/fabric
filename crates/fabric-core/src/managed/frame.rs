@@ -10,7 +10,10 @@
 use serde::{Deserialize, Serialize};
 
 use super::ids::{EventDigest, OperationId, RequestDigest, WorkRevision};
-use super::model::{Command, Envelope, ManagedEvent, StoredResult};
+use super::model::{
+    AttemptStatus, Command, Envelope, Intent, JobPolicy, ManagedEvent, ResourceRef, SourceBinding,
+    StoredResult, TaskKind,
+};
 use crate::codec::{self, CodecError};
 use crate::id::JobId;
 
@@ -107,3 +110,37 @@ impl StoredResult {
         decode_framed(bytes)
     }
 }
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// A part of a managed job the journal keeps in a column of its own, in
+/// the same framed canonical form as an event.
+pub trait StoredPart: Serialize + serde::de::DeserializeOwned + sealed::Sealed {
+    /// The part's stored bytes.
+    fn to_stored(&self) -> Result<Vec<u8>, CodecError> {
+        encode_framed(self)
+    }
+
+    /// Reads stored bytes back, refusing any but the canonical form.
+    fn from_stored(bytes: &[u8]) -> Result<Self, FrameError> {
+        decode_framed(bytes)
+    }
+}
+
+macro_rules! stored_part {
+    ($($t:ty),*) => {$(
+        impl sealed::Sealed for $t {}
+        impl StoredPart for $t {}
+    )*};
+}
+
+stored_part!(
+    Intent,
+    SourceBinding,
+    JobPolicy,
+    TaskKind,
+    ResourceRef,
+    AttemptStatus
+);
