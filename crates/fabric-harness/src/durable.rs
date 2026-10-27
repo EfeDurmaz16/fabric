@@ -26,7 +26,11 @@
 //! the same device, the state manifest, whose barrier orders every write of
 //! the batch before its rename and whose full flush makes them all durable.
 //! This is the method `fabric-store` uses for objects (ADR 0014): a plain
-//! `fsync` per file, one full flush at the commit point.
+//! `fsync` per file, one full flush at the commit point. A restore places
+//! files the user may already hold, so each keeps its barrier, and the
+//! directory flushes are shared (`write_ordered_checked`, `Renamed`): when
+//! the restore ends each directory it renamed into is flushed once, and one
+//! of them per device through the drive's cache.
 
 #![cfg_attr(
     not(all(feature = "acp", feature = "claude", feature = "codex")),
@@ -38,7 +42,7 @@
 
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, BufWriter, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -227,6 +231,9 @@ enum Mode {
     /// Durable at return: a barrier on the temporary before the rename and
     /// a full flush of the parent after it.
     Durable,
+    /// Atomic across a power loss, durable once the caller flushes its
+    /// `Renamed`: a barrier on the temporary, the parent left to it.
+    Ordered,
     /// One write of a batch: every flush plain; ordered and made durable by
     /// the atomic write that ends the batch on the same device.
     Batched,
@@ -247,6 +254,7 @@ fn commit(tmp: &Path, dest: &Path, mode: Mode) -> Result<(), HarnessError> {
     let parent = dest.parent().unwrap_or(Path::new("."));
     match mode {
         Mode::Durable => fsync_dir(parent),
+        Mode::Ordered => Ok(()),
         Mode::Batched => flush_dir(parent, Flush::Plain),
     }
 }
@@ -360,7 +368,7 @@ where
             .map_err(|e| HarnessError::io(IoOp::Write, &tmp, e.into_error()))?;
         let (file, written) = hashing.finish();
         let how = match mode {
-            Mode::Durable => Flush::Barrier,
+            Mode::Durable | Mode::Ordered => Flush::Barrier,
             Mode::Batched => Flush::Plain,
         };
         flush(&file, how).map_err(|e| HarnessError::io(IoOp::Write, &tmp, e))?;
@@ -372,6 +380,66 @@ where
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// The directories a run of ordered writes renamed names into, each with
+/// its device, to flush once when the run ends: every one but the last of
+/// its device with a plain `fsync`, then that last one through the drive's
+/// cache. `F_FULLFSYNC` drains the device's whole cache, so it makes
+/// durable every write flushed to that device before it (fcntl(2)). A run
+/// that renamed into one directory flushes it once, as `write_atomic` does.
+#[derive(Debug, Default)]
+pub(crate) struct Renamed(Vec<(Option<u64>, PathBuf)>);
+
+impl Renamed {
+    /// Notes `dir`; a directory whose device cannot be read is flushed
+    /// through the drive's cache on its own.
+    fn note(&mut self, dir: &Path) {
+        if self.0.iter().any(|(_, seen)| seen == dir) {
+            return;
+        }
+        let device = fs::metadata(dir).ok().map(|meta| meta.dev());
+        self.0.push((device, dir.to_path_buf()));
+    }
+
+    /// Flushes every directory noted, so every ordered write noted here is
+    /// durable when this returns.
+    pub(crate) fn flush(self) -> Result<(), HarnessError> {
+        let last_of_device = |index: usize| {
+            let device = self.0[index].0;
+            device.is_none() || self.0[index + 1..].iter().all(|(d, _)| *d != device)
+        };
+        for (index, (_, dir)) in self.0.iter().enumerate() {
+            if !last_of_device(index) {
+                flush_dir(dir, Flush::Plain)?;
+            }
+        }
+        for (index, (_, dir)) in self.0.iter().enumerate() {
+            if last_of_device(index) {
+                fsync_dir(dir)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `write_atomic_checked` without the directory flush: the file is atomic
+/// across a power loss, its barrier ordering its bytes and the directories
+/// created on the way before the rename, and it is durable once `renamed`,
+/// which notes its directory, is flushed.
+pub(crate) fn write_ordered_checked<F, C>(
+    path: &Path,
+    produce: F,
+    check: C,
+    renamed: &mut Renamed,
+) -> Result<Written, HarnessError>
+where
+    F: FnOnce(&mut dyn Write) -> Result<(), HarnessError>,
+    C: FnOnce() -> Result<(), HarnessError>,
+{
+    let written = write_flushed(path, produce, check, Mode::Ordered)?;
+    renamed.note(path.parent().unwrap_or(Path::new(".")));
+    Ok(written)
 }
 
 /// Writes `bytes` to `path` through a temporary sibling and a rename.
