@@ -319,17 +319,6 @@ impl Git {
         cmd.spawn().map_err(|source| GitError::Spawn { source })
     }
 
-    /// Resolves a path inside the git directory, absolute, through `rev-parse --git-path`.
-    pub fn git_path(&self, name: &str) -> Result<PathBuf, GitError> {
-        let text = self.run_text(&["rev-parse", "--git-path", name])?;
-        let path = PathBuf::from(text);
-        Ok(if path.is_absolute() {
-            path
-        } else {
-            self.repo.join(path)
-        })
-    }
-
     /// Splits NUL-terminated output into records.
     pub(crate) fn records(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
         bytes.split(|b| *b == 0).filter(|r| !r.is_empty())

@@ -1007,10 +1007,20 @@ fn set_direct_refs(git: &Git, git_state: &GitState, job_id: JobId) -> Result<(),
     Ok(())
 }
 
+/// The git directory `git init` makes in `root`: no `GIT_*` variable
+/// reaches git (`crate::git`), and the global and system config, where
+/// `init.templateDir` could be set, are unread, so it is `root/.git`.
+fn git_dir(root: &Path) -> PathBuf {
+    root.join(".git")
+}
+
 /// Creates the empty repository in the object format of `git_state` and writes its exclude file.
+///
+/// The exclude file's place is known from `git_dir`, so no `git rev-parse
+/// --git-path` asks for it.
 fn init_repo(
     store: &Store,
-    git: &Git,
+    (git, root): (&Git, &Path),
     git_state: &GitState,
     power_loss: bool,
 ) -> Result<(), RestoreError> {
@@ -1023,7 +1033,7 @@ fn init_repo(
     };
     git.run(&["init", "-q", format])?;
     if let Some(chunks) = &git_state.exclude {
-        let path = git.git_path("info/exclude")?;
+        let path = git_dir(root).join("info").join("exclude");
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
         }
@@ -1121,7 +1131,7 @@ fn restore_git(
     if power_loss {
         git = git.with_full_fsync();
     }
-    init_repo(store, &git, git_state, power_loss)?;
+    init_repo(store, (&git, staging), git_state, power_loss)?;
 
     unbundle_chain(store, snapshot, manifest, &git, report)?;
     set_refs(&git, git_state, manifest.job_id)?;
@@ -1519,7 +1529,7 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
     }
 
     if let (Some((git, _)), Some(state)) = (&restored, &manifest.git) {
-        write_config(git, &state.config)?;
+        write_config(git, &staging, &state.config, req.durability)?;
     }
     put_in_place(
         &writer,
@@ -1536,26 +1546,153 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
 /// Writes the carried config projection, the last step of a git restore (ADR 0004).
 ///
 /// A repeated key's values sit together in the source's order: the first
-/// replaces whatever `git init` wrote, and the rest follow it.
-fn write_config(git: &Git, config: &[(GitConfigKey, GitConfigValue)]) -> Result<(), RestoreError> {
-    let mut previous = None;
-    for (key, value) in config {
-        // These describe the source's filesystem; `git init` probed the target's.
-        if matches!(
+/// replaces whatever `git init` wrote, and the rest follow it, as `git
+/// config --replace-all` and `--add` would leave them.
+///
+/// `git init` writes a config of `[core]` and, for a SHA-256 repository,
+/// `[extensions]`, so every carried key outside `core` belongs to a
+/// section the file does not hold yet. Those sections are appended to the
+/// file byte for byte as `git config` appends them (`ConfigSection`),
+/// without a git process. A `core` key, or a section the file already
+/// holds, goes through `git config` as before.
+fn write_config(
+    git: &Git,
+    root: &Path,
+    config: &[(GitConfigKey, GitConfigValue)],
+    durability: Durability,
+) -> Result<(), RestoreError> {
+    // These describe the source's filesystem; `git init` probed the target's.
+    let carried = config.iter().filter(|(key, _)| {
+        !matches!(
             key,
             GitConfigKey::CoreIgnoreCase | GitConfigKey::CoreSymlinks
-        ) {
-            continue;
+        )
+    });
+    let mut sections: Vec<ConfigSection> = Vec::new();
+    for (key, value) in carried {
+        let name = key.to_string();
+        let (header, variable) = ConfigSection::split(&name);
+        match sections.iter_mut().find(|s| s.header == header) {
+            Some(section) => section
+                .lines
+                .push((name, variable, value.as_str().to_owned())),
+            None => sections.push(ConfigSection {
+                header,
+                lines: vec![(name, variable, value.as_str().to_owned())],
+            }),
         }
-        let mode = if previous == Some(key) {
-            "--add"
-        } else {
-            "--replace-all"
-        };
-        git.run(&["config", "--local", mode, &key.to_string(), value.as_str()])?;
-        previous = Some(key);
+    }
+    if sections.is_empty() {
+        return Ok(());
+    }
+    let path = &git_dir(root).join("config");
+    let existing = fs::read_to_string(path).map_err(|e| io_err(path, e))?;
+    let held: BTreeSet<&str> = existing
+        .lines()
+        .filter(|line| line.starts_with('['))
+        .collect();
+    let (through_git, appended): (Vec<&ConfigSection>, Vec<&ConfigSection>) = (sections.iter())
+        .partition(|s| s.header == "[core]\n" || held.contains(s.header.trim_end()));
+    if !appended.is_empty() {
+        let mut text = String::new();
+        if !existing.is_empty() && !existing.ends_with('\n') {
+            text.push('\n');
+        }
+        for section in appended {
+            section.write(&mut text);
+        }
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .map_err(|e| io_err(path, e))?;
+        file.write_all(text.as_bytes())
+            .map_err(|e| io_err(path, e))?;
+        if durability == Durability::PowerLoss {
+            rustix::fs::fsync(&file).map_err(|e| io_err(path, e.into()))?;
+        }
+    }
+    for section in through_git {
+        let mut previous = None;
+        for (name, _, value) in &section.lines {
+            let mode = if previous == Some(name) {
+                "--add"
+            } else {
+                "--replace-all"
+            };
+            git.run(&["config", "--local", mode, name, value])?;
+            previous = Some(name);
+        }
     }
     Ok(())
+}
+
+/// One section of the carried config, with its keys in the projection's order.
+struct ConfigSection {
+    /// The header line, newline included, as `git config` writes it.
+    header: String,
+    /// Each key's full name, its variable name and its value.
+    lines: Vec<(String, String, String)>,
+}
+
+impl ConfigSection {
+    /// Splits a key's full name into the header of its section, as git's
+    /// `store_create_section` writes it, and its variable name: the
+    /// subsection is what lies between the first and the last dot, with
+    /// `"` and `\\` escaped.
+    fn split(name: &str) -> (String, String) {
+        let (section, rest) = name.split_once('.').unwrap_or((name, ""));
+        match rest.rsplit_once('.') {
+            Some((subsection, variable)) => {
+                let mut header = format!("[{section} \"");
+                for c in subsection.chars() {
+                    if matches!(c, '"' | '\\') {
+                        header.push('\\');
+                    }
+                    header.push(c);
+                }
+                header.push_str("\"]\n");
+                (header, variable.to_owned())
+            }
+            None => (format!("[{section}]\n"), rest.to_owned()),
+        }
+    }
+
+    /// Appends the section to `out` as `git config` writes a new section:
+    /// the header, then a tab, the variable, ` = ` and the value per line,
+    /// the value in double quotes when it starts or ends with a space or
+    /// holds `;`, `#` or a carriage return, with `\\`, `"` and a tab
+    /// escaped (git's `write_pair`). git quotes a carriage return since
+    /// the fix of CVE-2025-48384 (2.50.1, and 2.43.7 on the oldest line it
+    /// patched); before, a value that ended in one lost it when read back.
+    /// This writer quotes it whatever git the node runs.
+    fn write(&self, out: &mut String) {
+        out.push_str(&self.header);
+        for (_, variable, value) in &self.lines {
+            let quote =
+                value.starts_with(' ') || value.ends_with(' ') || value.contains([';', '#', '\r']);
+            out.push('\t');
+            out.push_str(variable);
+            out.push_str(" = ");
+            if quote {
+                out.push('"');
+            }
+            for c in value.chars() {
+                match c {
+                    '\n' => out.push_str("\\n"),
+                    '\t' => out.push_str("\\t"),
+                    '"' | '\\' => {
+                        out.push('\\');
+                        out.push(c);
+                    }
+                    _ => out.push(c),
+                }
+            }
+            if quote {
+                out.push('"');
+            }
+            out.push('\n');
+        }
+    }
 }
 
 /// Re-reads the `files` and the working tree of a snapshot under `root` and returns how many matched.
@@ -1594,6 +1731,158 @@ mod tests {
 
     /// Blobs enough to fill both pipes between this process and git.
     const BLOBS: usize = 300;
+
+    /// Writes `config` with one `git config` per key, as restore did before
+    /// `write_config` appended the sections itself.
+    fn config_through_git(git: &Git, config: &[(GitConfigKey, GitConfigValue)]) {
+        let mut previous = None;
+        for (key, value) in config {
+            if matches!(
+                key,
+                GitConfigKey::CoreIgnoreCase | GitConfigKey::CoreSymlinks
+            ) {
+                continue;
+            }
+            let mode = if previous == Some(key) {
+                "--add"
+            } else {
+                "--replace-all"
+            };
+            git.run(&["config", "--local", mode, &key.to_string(), value.as_str()])
+                .unwrap();
+            previous = Some(key);
+        }
+    }
+
+    /// Restores `config` into two fresh repositories, one through `git
+    /// config` and one through `write_config`, and returns both files.
+    fn both_configs(config: &[(GitConfigKey, GitConfigValue)]) -> (String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let (by_git, written) = (dir.path().join("git"), dir.path().join("written"));
+        for root in [&by_git, &written] {
+            fs::create_dir(root).unwrap();
+            Git::new(root).run(&["init", "-q"]).unwrap();
+        }
+        config_through_git(&Git::new(&by_git), config);
+        write_config(
+            &Git::new(&written),
+            &written,
+            config,
+            Durability::ProcessCrash,
+        )
+        .unwrap();
+        (
+            fs::read_to_string(git_dir(&by_git).join("config")).unwrap(),
+            fs::read_to_string(git_dir(&written).join("config")).unwrap(),
+        )
+    }
+
+    fn key(text: &str) -> GitConfigKey {
+        GitConfigKey::parse(text).unwrap()
+    }
+
+    fn value(text: &str) -> GitConfigValue {
+        GitConfigValue::parse(text).unwrap()
+    }
+
+    /// Every character git's `write_pair` quotes or escapes, a subsection
+    /// it escapes, a repeated key, a key of `core` and two the restore
+    /// leaves to `git init`.
+    #[test]
+    fn write_config_leaves_the_bytes_git_config_leaves() {
+        let mut config = vec![
+            (key("remote.origin.url"), value(" lead and trail ")),
+            (
+                key("remote.origin.fetch"),
+                value("+refs/heads/*:refs/remotes/origin/*"),
+            ),
+            (
+                key("remote.origin.fetch"),
+                value("a;b#c \"q\" \\ tab\there"),
+            ),
+            (key("remote.we\"ird.url"), value("")),
+            (key("remote.a.b.pushurl"), value("é = [x]")),
+            (key("branch.feat/x.merge"), value("refs/heads/feat/x")),
+            (key("branch.main.remote"), value("origin")),
+            (key("push.default"), value("simple")),
+            (key("core.autocrlf"), value("input")),
+            (key("core.ignorecase"), value("false")),
+            (key("core.symlinks"), value("false")),
+        ];
+        config.sort_by(|a, b| a.0.cmp(&b.0));
+        let (by_git, written) = both_configs(&config);
+        assert_eq!(written, by_git);
+    }
+
+    /// A value that holds or ends in a carriage return reads back whole,
+    /// whichever git reads it (CVE-2025-48384).
+    #[test]
+    fn a_carriage_return_in_a_config_value_comes_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = Git::new(dir.path());
+        git.run(&["init", "-q"]).unwrap();
+        let values = ["ends\r", "\rstarts", "in\rside"];
+        let config: Vec<_> = (values.iter())
+            .map(|v| (key("remote.origin.fetch"), value(v)))
+            .collect();
+        write_config(&git, dir.path(), &config, Durability::ProcessCrash).unwrap();
+        let read = git
+            .run(&["config", "--get-all", "-z", "remote.origin.fetch"])
+            .unwrap();
+        let read: Vec<&[u8]> = Git::records(&read).collect();
+        assert_eq!(read, values.map(str::as_bytes));
+    }
+
+    #[test]
+    fn write_config_leaves_the_bytes_git_config_leaves_for_any_projection() {
+        use proptest::prelude::*;
+        use proptest::test_runner::{Config, TestRunner};
+
+        let remotes = ["origin", "up", "a.b", "we\"ird", "x#y;z", "ü"];
+        let branches = ["main", "feat/x", "q\"b", "dot.ted"];
+        // No carriage return: git before the fix of CVE-2025-48384 wrote one
+        // unquoted (`a_carriage_return_in_a_config_value_comes_back`).
+        let chars = [
+            ' ', '\t', ';', '#', '"', '\\', 'a', 'b', '/', ':', 'é', '=', '[', ']', '*', '\u{b}',
+        ];
+        let name = (0usize..10, 0usize..6, 0usize..4).prop_map(move |(kind, r, b)| {
+            let (remote, branch) = (remotes[r], branches[b]);
+            match kind {
+                0 => format!("remote.{remote}.url"),
+                1 => format!("remote.{remote}.pushurl"),
+                2 => format!("remote.{remote}.fetch"),
+                3 => format!("branch.{branch}.remote"),
+                4 => format!("branch.{branch}.merge"),
+                5 => format!("branch.{branch}.rebase"),
+                6 => "push.default".to_owned(),
+                7 => "core.autocrlf".to_owned(),
+                8 => "core.ignorecase".to_owned(),
+                _ => "core.symlinks".to_owned(),
+            }
+        });
+        let text = prop::collection::vec(prop::sample::select(chars.to_vec()), 0..8)
+            .prop_map(|chars| chars.into_iter().collect::<String>());
+        let strategy = prop::collection::vec((name, text), 0..8);
+        let mut runner = TestRunner::new(Config {
+            cases: 32,
+            ..Config::default()
+        });
+        runner
+            .run(&strategy, |pairs| {
+                let mut config: Vec<(GitConfigKey, GitConfigValue)> = pairs
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        Some((GitConfigKey::parse(k).ok()?, GitConfigValue::parse(v).ok()?))
+                    })
+                    .collect();
+                // The order capture writes: by key, a repeated key's values in git's order.
+                config.sort_by(|a, b| a.0.cmp(&b.0));
+                let (by_git, written) = both_configs(&config);
+                prop_assert_eq!(written, by_git);
+                Ok(())
+            })
+            .unwrap();
+    }
 
     #[test]
     fn a_tree_name_that_is_not_utf8_is_refused_not_rewritten() {

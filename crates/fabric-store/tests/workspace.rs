@@ -2180,6 +2180,66 @@ fn a_restore_whose_bundle_base_is_gone_names_it() {
     );
 }
 
+/// The child half of `a_restore_writes_its_exclude_file_and_config_without_git`.
+#[test]
+fn restore_config_child() {
+    let Some(dir) = common::logged_git_dir() else {
+        return;
+    };
+    let root = dir.join("work");
+    make_repo(&root).unwrap();
+    let g = git(&root);
+    for (key, value) in [
+        ("branch.main.remote", "origin"),
+        ("branch.main.merge", "refs/heads/main"),
+        ("push.default", "simple"),
+    ] {
+        g.run(&["config", key, value]).unwrap();
+    }
+    let mut store = store_in(&dir).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.join("restored");
+    let start = common::logged_git_calls().len();
+    restore_into(&store, snapshot, &target).unwrap();
+    let ran = common::git_commands(&common::logged_git_calls(), start);
+    assert!(
+        !ran.iter()
+            .any(|call| call.starts_with("rev-parse ") || call.starts_with("config ")),
+        "{}",
+        ran.join("\n")
+    );
+    assert_eq!(
+        fs::read_to_string(target.join(".git/info/exclude")).unwrap(),
+        "scratch/\n"
+    );
+    let carried = [
+        "config",
+        "--local",
+        "--get-regexp",
+        "^(remote|branch|push)[.]",
+    ];
+    assert_eq!(
+        git_text(&target, &carried).unwrap(),
+        "remote.origin.url https://example.com/x.git\n\
+         remote.origin.fetch +refs/heads/*:refs/remotes/origin/*\n\
+         branch.main.remote origin\n\
+         branch.main.merge refs/heads/main\n\
+         push.default simple"
+    );
+}
+
+/// A restore knows where the `git init` it ran keeps `info/exclude`, so it
+/// asks git for no path, and it appends the carried config's sections to
+/// the file `git init` wrote as `git config` would, so it runs no `git
+/// config` for them (`write_config`): one to five git processes fewer per
+/// resume and pull.
+#[test]
+fn a_restore_writes_its_exclude_file_and_config_without_git() {
+    common::run_with_logged_git("restore_config_child", LoggedGit::Plain).unwrap();
+}
+
 /// The child half of `a_restore_runs_bundle_unbundle_alone`.
 #[test]
 fn restore_unbundle_child() {
@@ -2578,7 +2638,7 @@ fn a_config_file_the_repository_includes_counts_but_does_not_travel() {
 const GIT_RUNS: [(&str, usize); 3] = [
     ("first capture", 33),
     ("second capture", 35),
-    ("restore", 17),
+    ("restore", 14),
 ];
 
 /// The child half: runs with a `git` first on the `PATH` that logs each call.
