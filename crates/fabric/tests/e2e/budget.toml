@@ -41,16 +41,16 @@ percentile = 25
 [processes]
 "acp suspend" = { git = [28, 30], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
 "acp move" = { git = [2, 2], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
-"acp resume" = { git = [16, 20], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [3, 3] }
-"acp pull" = { git = [50, 54], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [3, 3] }
+"acp resume" = { git = [17, 21], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [3, 3] }
+"acp pull" = { git = [51, 55], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [3, 3] }
 "claude suspend" = { git = [28, 30], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
 "claude move" = { git = [2, 2], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
-"claude resume" = { git = [16, 20], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [3, 3] }
-"claude pull" = { git = [50, 54], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [3, 3] }
+"claude resume" = { git = [17, 21], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [3, 3] }
+"claude pull" = { git = [51, 55], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [3, 3] }
 "codex suspend" = { git = [28, 30], kill = [0, 0], lsof = [1, 1], pgrep = [0, 0], ps = [0, 0] }
 "codex move" = { git = [2, 2], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
-"codex resume" = { git = [16, 20], kill = [0, 0], lsof = [1, 1], pgrep = [0, 0], ps = [3, 3] }
-"codex pull" = { git = [50, 54], kill = [0, 0], lsof = [2, 2], pgrep = [0, 0], ps = [3, 3] }
+"codex resume" = { git = [17, 21], kill = [0, 0], lsof = [1, 1], pgrep = [0, 0], ps = [3, 3] }
+"codex pull" = { git = [51, 55], kill = [0, 0], lsof = [2, 2], pgrep = [0, 0], ps = [3, 3] }
 "cold start" = { git = [0, 0], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
 "restart" = { git = [0, 0], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
 
@@ -79,3 +79,7 @@ why = "Review of PR #29: the budget also counts the kill, lsof, pgrep and ps the
 [[change]]
 date = "2026-10-25"
 why = "Review of PR #29: macos-aarch64 baselines from this branch with no fact kept and the git behind the macOS stub run through the fixture's link: the median of five runs' 25th percentile, test profile, on an 18-core Apple silicon Mac under a load average of 3 to 6. Suspends fell by 65 to 140 ms, since the fixture no longer pays the stub; the Claude and Codex moves rose by about 85 ms, since every move measures both nodes again"
+
+[[change]]
+date = "2026-10-27"
+why = "M2-06 (issue #22): a restore sets each symbolic ref with one git symbolic-ref, after the direct refs, so refs/remotes/origin/HEAD follows the remote's default branch again instead of naming a frozen commit. The job's workspace is a git clone, so it has that one symbolic ref, and every resume and pull runs one more git: resumes 17/21 and pulls 51/55. Suspends and moves are unchanged. git 2.46 and later could set it in the existing update-ref --stdin transaction; that is not built. Baselines unchanged"
