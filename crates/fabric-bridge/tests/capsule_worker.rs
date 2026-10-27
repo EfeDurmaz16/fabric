@@ -192,8 +192,20 @@ impl Raw {
     }
 
     async fn send(&mut self, message: &Value) {
-        let frame = frames::encode(message, 1 << 20).unwrap();
-        frames::write(self.stdin.as_mut().unwrap(), &frame)
+        self.send_all(std::slice::from_ref(message)).await;
+    }
+
+    /// Writes the frames of `messages` in one write, the way back-to-back
+    /// frames reach the worker on a pipe. Capsule's own scenario runner
+    /// sends consecutive `send` steps as one chunk too; on the fixture's
+    /// virtual clock, a split write can let an `observe` advance before a
+    /// following `shutdown` arrives.
+    async fn send_all(&mut self, messages: &[Value]) {
+        let mut chunk = Vec::new();
+        for message in messages {
+            chunk.extend(frames::encode(message, 1 << 20).unwrap());
+        }
+        frames::write(self.stdin.as_mut().unwrap(), &chunk)
             .await
             .unwrap();
     }
@@ -204,6 +216,29 @@ impl Raw {
             .unwrap_or_else(|_| panic!("{what}: no frame within 20 s"))
             .unwrap_or_else(|fault| panic!("{what}: frame refused: {fault}"))
             .unwrap_or_else(|| panic!("{what}: the worker closed its output"))
+    }
+
+    /// Reads the next answer, checks Fabric's parser accepts it under the
+    /// last `hello` or the session profile, and compares it with `expected`
+    /// bar `message` strings.
+    async fn expect(&mut self, expected: &Value, hello: &Value, session: &Profile, what: &str) {
+        let handshake = matches!(
+            expected["type"].as_str(),
+            Some("hello_ack" | "hello_refused")
+        );
+        let cap = if handshake { 1 << 20 } else { 16 << 20 };
+        let actual = self.receive(cap, what).await;
+        let ToWorker::Hello(sent) = ToWorker::from_value(hello).unwrap() else {
+            panic!("{what}: the last hello is not a hello")
+        };
+        let expect = if handshake {
+            Expect::Handshake(&sent)
+        } else {
+            Expect::Session(session)
+        };
+        ToFabric::parse(&actual, expect)
+            .unwrap_or_else(|r| panic!("{what}: Fabric refuses the worker's answer: {r}"));
+        assert_eq!(comparable(&actual), comparable(expected), "{what}");
     }
 
     /// Waits for the worker to exit and checks it wrote nothing more.
@@ -277,36 +312,27 @@ async fn replay(name: &str, dir: &Path) -> Tally {
         assert_eq!(ack, case("hello_ack_valid"), "{name}: hello_ack");
     }
     let mut alive = true;
+    // Consecutive `send` steps go out as one write, as Capsule's runner
+    // sends them; any other step writes what is queued first.
+    let mut outbox: Vec<Value> = Vec::new();
     for (index, step) in steps.iter().enumerate() {
         let what = format!("{name} step {index}");
         let form = step.as_object().unwrap().keys().next().unwrap().as_str();
-        match form {
-            "send" => {
-                if step["send"]["type"] == "hello" {
-                    hello = step["send"].clone();
-                }
-                raw.send(&step["send"]).await;
-                tally.wire += 1;
+        if form == "send" {
+            if step["send"]["type"] == "hello" {
+                hello = step["send"].clone();
             }
+            outbox.push(step["send"].clone());
+            tally.wire += 1;
+            continue;
+        }
+        if !outbox.is_empty() {
+            raw.send_all(&outbox).await;
+            outbox.clear();
+        }
+        match form {
             "receive" => {
-                let expected = &step["receive"];
-                let handshake = matches!(
-                    expected["type"].as_str(),
-                    Some("hello_ack" | "hello_refused")
-                );
-                let cap = if handshake { 1 << 20 } else { 16 << 20 };
-                let actual = raw.receive(cap, &what).await;
-                let ToWorker::Hello(sent) = ToWorker::from_value(&hello).unwrap() else {
-                    panic!("{what}: the last hello is not a hello")
-                };
-                let expect = if handshake {
-                    Expect::Handshake(&sent)
-                } else {
-                    Expect::Session(&session)
-                };
-                ToFabric::parse(&actual, expect)
-                    .unwrap_or_else(|r| panic!("{what}: Fabric refuses the worker's answer: {r}"));
-                assert_eq!(comparable(&actual), comparable(expected), "{what}");
+                raw.expect(&step["receive"], &hello, &session, &what).await;
                 tally.wire += 1;
             }
             "kill_worker" => {
@@ -341,6 +367,9 @@ async fn replay(name: &str, dir: &Path) -> Tally {
             "provider_calls" | "sandbox" | "journal" => tally.elsewhere += 1,
             other => panic!("{what}: unknown step form {other}"),
         }
+    }
+    if !outbox.is_empty() {
+        raw.send_all(&outbox).await;
     }
     if alive {
         if tally.after_advance > 0 {
