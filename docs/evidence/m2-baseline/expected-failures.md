@@ -21,3 +21,7 @@ Each intended-behavior test of `defects.md` was run alone with `--ignored` on 20
 | M2-11 | `cargo test -p fabric-client --test null_fields -- --ignored` | `invalid type: null, expected a boolean` |
 
 All commands take `--locked`. With every one of them still ignored, the gates of `gates.md` pass unchanged on this branch.
+
+## Status on `m2/durable-job-foundations` (2026-10-27)
+
+Every ID above is fixed. Each test's `ignore` was removed in the commit that fixed it, and each passes in the full workspace run of `docs/evidence/m2-integration/gates/test.log`. No expected-failure marker is left in the workspace: the six ignored tests that remain are the two fixture generators, two benchmarks, the time budget (run by its own CI step) and the child process of a ledger crash test. The disposition of every register ID is in `defects.md`, section Disposition after M2.
