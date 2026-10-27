@@ -88,6 +88,7 @@ pub mod harness;
 pub mod id;
 pub mod lease;
 pub mod ledger;
+pub mod managed;
 pub mod moves;
 pub mod path;
 pub mod secret;
