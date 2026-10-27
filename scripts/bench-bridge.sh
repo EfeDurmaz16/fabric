@@ -1,8 +1,12 @@
 #!/bin/sh
 # Records the provider bridge's own latencies (ADR 0021): a worker spawned
 # and its handshake answered, and one request round trip to it, with the
-# in-memory log and with the journal's two committed writes. The worker is
-# the Rust test double, so the numbers are Fabric's side of the bridge.
+# in-memory log and with the journal's two committed writes. Against the
+# Rust test double the numbers are Fabric's side of the bridge. With
+# CAPSULE_BRIDGE_WORKER naming the built Capsule worker, the same paths run
+# against it too, 15 samples each (FABRIC_BRIDGE_BENCH_CAPSULE_REPS), and
+# with CAPSULE_BRIDGE_DOCKER_IMAGE naming an image the local engine already
+# holds, on its Docker profile as well. Nothing pulls an image.
 #
 # Every sample is kept, one per line in microseconds, with the commit, the
 # machine and its load before and after, under the test profile (the one
@@ -38,6 +42,14 @@ cd "$toplevel"
   fi
   echo "rustc: $(rustc --version)"
   echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if [ -n "${CAPSULE_BRIDGE_WORKER:-}" ]; then
+    echo "capsule worker: $CAPSULE_BRIDGE_WORKER"
+    echo "capsule commit: $(git -C "$(dirname "$CAPSULE_BRIDGE_WORKER")" rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "node: $(${CAPSULE_BRIDGE_NODE:-node} --version)"
+  fi
+  if [ -n "${CAPSULE_BRIDGE_DOCKER_IMAGE:-}" ]; then
+    echo "docker image: $CAPSULE_BRIDGE_DOCKER_IMAGE"
+  fi
   echo "load before: $(uptime)"
 } >"$out/machine.txt"
 
@@ -46,9 +58,16 @@ for profile in test release; do
   # Build first, so no sample pays for the build.
   cargo test -p fabric-bridge --test bench --locked $flag --no-run >"$out/build-$profile.log" 2>&1
   FABRIC_BRIDGE_BENCH_OUT="$out/$profile" \
-    cargo test -p fabric-bridge --test bench --locked $flag -- --ignored --exact bridge_latencies \
+    cargo test -p fabric-bridge --test bench --locked $flag -- --ignored --exact --test-threads=1 \
+    bridge_latencies capsule_worker_latencies \
     >"$out/run-$profile.log" 2>&1
 done
 
 echo "load after: $(uptime)" >>"$out/machine.txt"
 cat "$out/test/summary.txt" "$out/release/summary.txt"
+for profile in test release; do
+  if [ -f "$out/$profile/capsule/summary.txt" ]; then
+    echo "capsule worker, $profile profile:"
+    cat "$out/$profile/capsule/summary.txt"
+  fi
+done
