@@ -71,8 +71,10 @@ impl ProviderStatus {
         !matches!(self, ProviderStatus::Dispatched | ProviderStatus::Unknown)
     }
 
-    /// Whether an operation may move from `self` to `to`.
-    fn may_become(self, to: ProviderStatus) -> bool {
+    /// Whether an operation may move from `self` to `to`: `dispatched`
+    /// to any other status, `unknown` only to an observed terminal one.
+    #[must_use]
+    pub fn may_become(self, to: ProviderStatus) -> bool {
         match self {
             ProviderStatus::Dispatched => to != ProviderStatus::Dispatched,
             ProviderStatus::Unknown => matches!(
@@ -328,6 +330,28 @@ impl Journal {
             ],
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Stores the locator the worker reported for a provider operation
+    /// that is still `dispatched` or `unknown`, as `progress` reports it
+    /// before the answer (ADR 0020, record the observed locator early).
+    /// The status and the answer stay as they are; a terminal operation
+    /// keeps the locator its answer gave.
+    pub fn provider_locate(
+        &mut self,
+        operation: OperationId,
+        locator: &str,
+        at_ms: u64,
+    ) -> Result<(), CommitError> {
+        let changed = self.conn.execute(
+            "UPDATE provider_operations SET locator = ?2, updated_ms = ?3
+             WHERE operation_id = ?1 AND status IN ('dispatched', 'unknown')",
+            params![operation.to_bytes(), locator, sql_u64(at_ms)?],
+        )?;
+        if changed == 0 && self.provider_operation(operation)?.is_none() {
+            return Err(ProviderError::UnknownOperation { operation }.into());
+        }
         Ok(())
     }
 
