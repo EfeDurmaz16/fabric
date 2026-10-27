@@ -434,7 +434,16 @@ impl HarnessRecord {
     }
 
     async fn liveness_with(&self, ps: &str) -> Liveness {
-        match probe_started(ps, self.pid).await {
+        // No process holds the pid, not even an unreaped one, so `ps`
+        // would find none either: the answer is its `Absent` branch,
+        // without starting it, as at a harness's exit, which the CLI
+        // reports after it reaped the harness.
+        let started = if self.is_absent() {
+            Started::Absent
+        } else {
+            probe_started(ps, self.pid).await
+        };
+        match started {
             Started::At(started) if started == self.started => Liveness::Leader,
             Started::Absent if self.group_exists() => Liveness::Group,
             // A failed probe cannot tell this group from one another
@@ -442,6 +451,14 @@ impl HarnessRecord {
             Started::Unknown if self.group_exists() => Liveness::Unknown,
             Started::At(_) | Started::Absent | Started::Unknown => Liveness::Gone,
         }
+    }
+
+    /// True when no process has the recorded pid: `kill(pid, 0)` finds
+    /// none. A zombie still has it, on Linux and on macOS alike.
+    fn is_absent(&self) -> bool {
+        self.group().is_some_and(|pid| {
+            rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH)
+        })
     }
 
     /// The group to signal; never group 1, because `kill(-1)` signals every process.
@@ -674,6 +691,42 @@ mod tests {
         let child = Pid::from_raw(child).unwrap();
         assert!(
             rustix::process::test_kill_process(child).is_err(),
+            "the background process outlived the stop"
+        );
+    }
+
+    /// A harness the CLI reaped holds no pid any more, so its liveness is
+    /// read without `ps`: the record stands for the group while a process
+    /// it started runs, even where `ps` cannot be run at all.
+    #[tokio::test]
+    async fn a_reaped_leader_is_read_without_ps() {
+        let no_ps = "/nonexistent/fabric-test-ps";
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("child");
+        let mut leader = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("sleep 30 & echo $! > {}", pid_file.display()))
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let started = process_started(NonZeroU32::new(leader.id().unwrap()).unwrap())
+            .await
+            .unwrap();
+        let record = record_of(&leader, started);
+        leader.wait().await.unwrap();
+        assert_eq!(record.liveness_with(no_ps).await, Liveness::Group);
+        record
+            .stop_with(Duration::from_secs(5), no_ps)
+            .await
+            .unwrap();
+        assert_eq!(record.liveness_with(no_ps).await, Liveness::Gone);
+        let child: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            rustix::process::test_kill_process(Pid::from_raw(child).unwrap()).is_err(),
             "the background process outlived the stop"
         );
     }
