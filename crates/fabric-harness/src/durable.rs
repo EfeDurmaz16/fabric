@@ -19,6 +19,14 @@
 //! included; the directory's `F_FULLFSYNC` drains the whole cache, so one
 //! full flush makes the write durable (fcntl(2); ADR 0002). Elsewhere every
 //! flush is `fsync`.
+//!
+//! A batch of writes, the files a capture stages, can skip the barrier and
+//! the full flush of each (`write_batched_with`): each file and directory
+//! is flushed to the drive only, and the batch ends with one atomic write on
+//! the same device, the state manifest, whose barrier orders every write of
+//! the batch before its rename and whose full flush makes them all durable.
+//! This is the method `fabric-store` uses for objects (ADR 0014): a plain
+//! `fsync` per file, one full flush at the commit point.
 
 #![cfg_attr(
     not(all(feature = "acp", feature = "claude", feature = "codex")),
@@ -213,9 +221,20 @@ pub(crate) fn fsync_dir(dir: &Path) -> Result<(), HarnessError> {
     flush_dir(dir, Flush::Full)
 }
 
+/// How an atomic write flushes what it wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Durable at return: a barrier on the temporary before the rename and
+    /// a full flush of the parent after it.
+    Durable,
+    /// One write of a batch: every flush plain; ordered and made durable by
+    /// the atomic write that ends the batch on the same device.
+    Batched,
+}
+
 /// Moves `tmp` over `dest`, giving it the mode of the file it replaces, and
-/// makes the rename durable.
-fn commit(tmp: &Path, dest: &Path) -> Result<(), HarnessError> {
+/// flushes the parent as `mode` says.
+fn commit(tmp: &Path, dest: &Path, mode: Mode) -> Result<(), HarnessError> {
     match fs::metadata(dest) {
         Ok(meta) => {
             fs::set_permissions(tmp, meta.permissions())
@@ -225,14 +244,18 @@ fn commit(tmp: &Path, dest: &Path) -> Result<(), HarnessError> {
         Err(e) => return Err(HarnessError::io(IoOp::Read, dest, e)),
     }
     fs::rename(tmp, dest).map_err(|e| HarnessError::io(IoOp::Rename, dest, e))?;
-    fsync_dir(dest.parent().unwrap_or(Path::new(".")))
+    let parent = dest.parent().unwrap_or(Path::new("."));
+    match mode {
+        Mode::Durable => fsync_dir(parent),
+        Mode::Batched => flush_dir(parent, Flush::Plain),
+    }
 }
 
 /// Creates `dir` and every missing ancestor one at a time, flushing the
 /// parent of each new directory to the drive, so a file renamed into it
 /// later is not lost with its directory entry on a power cut: the barrier
-/// before that rename orders these names before it, and the full flush
-/// after it makes them durable.
+/// before that rename, or the one that ends its batch, orders these names
+/// before it, and the full flush after it makes them durable.
 fn create_dirs_durable(dir: &Path) -> Result<(), HarnessError> {
     let mut missing = Vec::new();
     let mut at = dir;
@@ -300,6 +323,33 @@ where
     F: FnOnce(&mut dyn Write) -> Result<(), HarnessError>,
     C: FnOnce() -> Result<(), HarnessError>,
 {
+    write_flushed(path, produce, check, Mode::Durable)
+}
+
+/// Writes a file as `write_atomic_with` does, as one write of a batch: the
+/// temporary, the new directories and the parent are flushed to the drive
+/// only. After a power loss before the batch ends, the file may be missing
+/// or torn under its final name; it is ordered and durable once the atomic
+/// write that ends the batch, on the same device, returns. A capture ends
+/// its batch with the state manifest, which names every staged file by its
+/// digest.
+pub(crate) fn write_batched_with<F>(path: &Path, produce: F) -> Result<Written, HarnessError>
+where
+    F: FnOnce(&mut dyn Write) -> Result<(), HarnessError>,
+{
+    write_flushed(path, produce, || Ok(()), Mode::Batched)
+}
+
+fn write_flushed<F, C>(
+    path: &Path,
+    produce: F,
+    check: C,
+    mode: Mode,
+) -> Result<Written, HarnessError>
+where
+    F: FnOnce(&mut dyn Write) -> Result<(), HarnessError>,
+    C: FnOnce() -> Result<(), HarnessError>,
+{
     create_dirs_durable(path.parent().unwrap_or(Path::new(".")))?;
     let (tmp, file) = create_temp(path)?;
     let result = (|| {
@@ -309,9 +359,13 @@ where
             .into_inner()
             .map_err(|e| HarnessError::io(IoOp::Write, &tmp, e.into_error()))?;
         let (file, written) = hashing.finish();
-        flush(&file, Flush::Barrier).map_err(|e| HarnessError::io(IoOp::Write, &tmp, e))?;
+        let how = match mode {
+            Mode::Durable => Flush::Barrier,
+            Mode::Batched => Flush::Plain,
+        };
+        flush(&file, how).map_err(|e| HarnessError::io(IoOp::Write, &tmp, e))?;
         check()?;
-        commit(&tmp, path)?;
+        commit(&tmp, path, mode)?;
         Ok(written)
     })();
     if result.is_err() {

@@ -1,12 +1,16 @@
 //! Staging files into a state tree.
 //!
 //! Invariant: every file that enters a state tree passes the denylist, is
-//! redacted or refused as its `Carry` says, and is written durably, with
-//! its length and `BLAKE3` digest recorded for the manifest. A staged tree
-//! holds exactly the files its manifest lists: a file an earlier or failed
-//! capture left in a reused directory is removed before the manifest is
-//! written. A staged tree is checked against those digests before restore
-//! places a byte of it.
+//! redacted or refused as its `Carry` says, and is written through a
+//! temporary and a rename, with its length and `BLAKE3` digest recorded for
+//! the manifest. The staged files are one batch, flushed to the drive only;
+//! the manifest the caller writes last ends it, and its barrier and full
+//! flush order every staged file before the manifest's name and make the
+//! tree durable, so a tree with a manifest is whole after a power loss
+//! too. A staged tree holds exactly the files its manifest lists: a file an
+//! earlier or failed capture left in a reused directory is removed before
+//! the manifest is written. A staged tree is checked against those digests
+//! before restore places a byte of it.
 
 #![cfg_attr(
     not(all(feature = "acp", feature = "claude", feature = "codex")),
@@ -26,7 +30,7 @@ use tracing::warn;
 
 use crate::crashpoint::crashpoint;
 use crate::denylist;
-use crate::durable::{self, Hashing, Written};
+use crate::durable::{self, Flush, Hashing, Written};
 use crate::error::{HarnessError, IoOp};
 use crate::jsontext::{self, TransformError};
 use crate::manifest::{Carried, Content, Digest, MANIFEST_FILE, Mutability};
@@ -336,13 +340,14 @@ fn fold_counts(counts: &mut RedactionCounts, outcome: &jsontext::Outcome) {
     }
 }
 
-/// Removes an earlier capture's manifest from `out` and makes the removal
-/// durable, so a capture killed part way through a directory it reuses
-/// never leaves an old manifest naming files it has partly overwritten.
+/// Removes an earlier capture's manifest from `out` and orders the removal
+/// with a barrier before every write after it, so a capture killed or cut
+/// by a power loss part way through a directory it reuses never leaves an
+/// old manifest naming files it has partly overwritten.
 fn clear_manifest(out: &Path) -> Result<(), HarnessError> {
     let path = out.join(MANIFEST_FILE);
     match fs::remove_file(&path) {
-        Ok(()) => durable::fsync_dir(out),
+        Ok(()) => durable::flush_dir(out, Flush::Barrier),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(HarnessError::io(IoOp::Remove, &path, e)),
     }
@@ -362,7 +367,9 @@ pub(crate) struct Staged {
 /// each file's `Carry` says. Returns the carried entries sorted by path,
 /// with the digests of the rewritable sources as read, and adds to the
 /// redaction counts. An earlier manifest in `out` is removed first; the
-/// caller writes the new one last.
+/// caller writes the new one last (`StateManifest::write`), which ends the
+/// batch of staged files: until it returns they are flushed to the drive
+/// only, about 0.3 ms a file on APFS against 5.5 ms for a full flush.
 pub(crate) fn stage(
     sources: &[Source],
     out: &Path,
@@ -397,7 +404,7 @@ pub(crate) fn stage(
     for (index, source) in sorted.into_iter().enumerate() {
         let dst = out.join(source.rel.as_str());
         let mut read = None;
-        let written = durable::write_atomic_with(&dst, |w| {
+        let written = durable::write_batched_with(&dst, |w| {
             read = Some(transfer(&source.abs, w, source.carry, redactor, counts)?);
             Ok(())
         })?;
@@ -463,10 +470,14 @@ fn sweep(out: &Path, dir: &Path, keep: &BTreeSet<&str>) -> Result<bool, HarnessE
             removed = true;
         }
     }
-    if removed {
-        durable::fsync_dir(dir)?;
+    // The manifest's barrier orders the removals before its name. A
+    // directory the caller removes next needs no flush of its own: the
+    // flush of its parent covers its removal and everything in it.
+    let gone = empty && dir != out;
+    if removed && !gone {
+        durable::flush_dir(dir, Flush::Plain)?;
     }
-    Ok(empty && dir != out)
+    Ok(gone)
 }
 
 /// The length and digest of the file at `path`.

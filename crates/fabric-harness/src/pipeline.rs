@@ -171,7 +171,12 @@ pub(crate) struct Capturer<'a> {
 
 /// Stages `sources` into `out`, records the rewritable ones as a pending
 /// departure and writes the manifest last, so a tree with a manifest is
-/// whole and its pending record exists.
+/// whole and its pending record exists. That holds after a power loss too:
+/// the staged files are flushed to the drive only, and the manifest's write
+/// is the commit point, whose barrier orders them and the pending record
+/// before its name and whose full flush makes all of them durable. A
+/// capture flushes the drive's cache once there, and once for the pending
+/// record, instead of twice per file and once per new directory.
 pub(crate) fn capture(
     capturer: Capturer<'_>,
     sources: &[Source],
@@ -407,6 +412,101 @@ fn dropped_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::durable::{Flush, record};
+    use crate::stage::Carry;
+
+    /// A capture of `files` under `home`, with no departure records, into `out`.
+    fn capture_files(home: &Path, out: &Path, files: &[&str]) -> StateManifest {
+        let session = SessionId::parse("7a1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d").unwrap();
+        let abs = AbsPath::parse(home.to_str().unwrap()).unwrap();
+        let sources: Vec<Source> = files
+            .iter()
+            .map(|name| {
+                let src = home.join(name);
+                std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+                std::fs::write(&src, format!("{name}\n")).unwrap();
+                Source {
+                    abs: src,
+                    rel: RelPath::parse(&format!("home/{name}")).unwrap(),
+                    carry: Carry::Text,
+                    mutability: Mutability::AppendOnly,
+                }
+            })
+            .collect();
+        capture(
+            Capturer {
+                kind: HarnessKind::ClaudeCode,
+                session: &session,
+                root: &abs,
+                home: &abs,
+                version: None,
+                departure: None,
+            },
+            &sources,
+            RedactionCounts::new(),
+            out,
+        )
+        .unwrap()
+    }
+
+    /// ADR 0014's method for a capture: each staged file and directory is
+    /// flushed to the drive only, and the manifest's write is the one
+    /// commit point, a barrier on its temporary that orders the tree before
+    /// its name and one full flush after its rename. Before, every staged
+    /// file was two full flushes and every new directory one.
+    #[test]
+    fn a_capture_flushes_the_drive_once_at_its_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("h");
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let (manifest, log) =
+            record::flushes(|| capture_files(&home, &out, &["x/a.txt", "y/b.txt"]));
+        assert_eq!(manifest.files().len(), 2);
+        let plain = |at: &str| (Flush::Plain, at.to_owned());
+        assert_eq!(
+            record::shape(&log, dir.path()),
+            vec![
+                plain("out"),
+                plain("out/home"),
+                plain("tmp:out/home/x"),
+                plain("out/home/x"),
+                plain("out/home"),
+                plain("tmp:out/home/y"),
+                plain("out/home/y"),
+                (Flush::Barrier, "tmp:out".to_owned()),
+                (Flush::Full, "out".to_owned()),
+            ]
+        );
+    }
+
+    /// A capture into a directory an earlier one used orders the removal of
+    /// the old manifest with a barrier before it writes a staged file, so a
+    /// power loss never leaves the old manifest over new bytes, and the
+    /// sweep of what the new capture does not carry is ordered by the new
+    /// manifest's barrier.
+    #[test]
+    fn a_capture_into_a_used_directory_orders_the_old_manifest_away_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("h");
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        capture_files(&home, &out, &["x/a.txt", "y/b.txt"]);
+        let (_, log) = record::flushes(|| capture_files(&home, &out, &["x/a.txt"]));
+        let plain = |at: &str| (Flush::Plain, at.to_owned());
+        assert_eq!(
+            record::shape(&log, dir.path()),
+            vec![
+                (Flush::Barrier, "out".to_owned()),
+                plain("tmp:out/home/x"),
+                plain("out/home/x"),
+                plain("out/home"),
+                (Flush::Barrier, "tmp:out".to_owned()),
+                (Flush::Full, "out".to_owned()),
+            ]
+        );
+        assert!(!out.join("home/y").exists());
+    }
 
     /// M2-07: a dropped file edited after it was found unchanged, while the
     /// rest was placed, stays with the edit and stops the restore; one that
