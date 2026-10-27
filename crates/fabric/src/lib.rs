@@ -52,6 +52,8 @@ use fabricd::harnesses::{HarnessEnv, acp_adapter, parse_harness};
 use fabricd::node::{Node, NodeConfig};
 use fabricd::paths::{STATE_DIR_ENV, StateDir};
 use fabricd::tool_env::ToolEnv;
+use std::sync::Arc;
+
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 mod render;
@@ -1133,30 +1135,30 @@ impl Turn<'_> {
                 let _ = tokio::io::copy(&mut stderr, &mut tokio::io::stderr()).await;
             })
         });
-        let (sessions, named) = tokio::sync::mpsc::unbounded_channel();
+        let sessions = Arc::new(NamedSessions::default());
         let recorder = tokio::spawn(record_sessions(
             self.client.clone(),
             self.plan.clone(),
             pid,
-            named,
+            Arc::clone(&sessions),
             self.notes,
         ));
         let mut report = TurnReport {
             session: running.session().cloned(),
             ..TurnReport::default()
         };
-        let mut lines = BufReader::new(stdout).split(b'\n');
+        let mut lines = Lines::new(stdout, MAX_LINE);
         let mut status = None;
         let mut drained_by = None;
         loop {
             let read = if let Some(deadline) = drained_by {
-                match tokio::time::timeout_at(deadline, lines.next_segment()).await {
+                match tokio::time::timeout_at(deadline, lines.next()).await {
                     Ok(read) => read,
                     Err(_) => break,
                 }
             } else {
                 tokio::select! {
-                    read = lines.next_segment() => read,
+                    read = lines.next() => read,
                     exit = running.child_mut().wait() => {
                         status = Some(exit?);
                         drained_by = Some(tokio::time::Instant::now() + DRAIN);
@@ -1169,7 +1171,13 @@ impl Turn<'_> {
                 }
             };
             let line = match read {
-                Ok(Some(line)) => line,
+                Ok(Some(Line::Whole(line))) => line,
+                Ok(Some(Line::TooLong)) => {
+                    tracing::warn!(
+                        "the harness printed a line longer than {MAX_LINE} bytes; it was not read"
+                    );
+                    continue;
+                }
                 Ok(None) => break,
                 Err(e) => {
                     tracing::warn!(error = %e, "the harness's output could not be read to its end");
@@ -1179,11 +1187,10 @@ impl Turn<'_> {
             if (self.read_line)(&mut report, &String::from_utf8_lossy(&line))
                 && let Some(session) = report.session.clone()
             {
-                // The receiver lives until this loop ends.
-                let _ = sessions.send(session);
+                sessions.push(session);
             }
         }
-        drop(sessions);
+        sessions.close();
         // The harness closed its output and may still run.
         let status = match status {
             Some(status) => status,
@@ -1292,12 +1299,12 @@ impl AgentTurn<'_> {
         interrupts: &mut Interrupts,
     ) -> Result<TurnEnd> {
         let pid = running.pid();
-        let (sessions, named) = tokio::sync::mpsc::unbounded_channel();
+        let sessions = Arc::new(NamedSessions::default());
         let recorder = tokio::spawn(record_sessions(
             self.client.clone(),
             self.plan.clone(),
             pid,
-            named,
+            Arc::clone(&sessions),
             self.notes,
         ));
         let mut report = TurnReport {
@@ -1313,8 +1320,7 @@ impl AgentTurn<'_> {
                     Some(TurnEvent::Session(session)) => {
                         if report.session.as_ref() != Some(&session) {
                             report.session = Some(session.clone());
-                            // The receiver lives until this loop ends.
-                            let _ = sessions.send(session);
+                            sessions.push(session);
                         }
                     }
                     Some(TurnEvent::Ended(ended)) => {
@@ -1341,7 +1347,7 @@ impl AgentTurn<'_> {
                 }
             }
         }
-        drop(sessions);
+        sessions.close();
         // The loop ends only once the agent was reaped.
         let status = match status {
             Some(status) => status,
@@ -1396,10 +1402,10 @@ async fn record_sessions(
     client: Client,
     plan: RunPlan,
     pid: std::num::NonZeroU32,
-    mut named: tokio::sync::mpsc::UnboundedReceiver<SessionId>,
+    named: Arc<NamedSessions>,
     notes: Notes,
 ) {
-    while let Some(session) = named.recv().await {
+    while let Some(session) = named.next().await {
         let mut printer = Printer::new(notes);
         let recorded = client
             .harness_session(launched(&plan, pid), session.clone(), |event| {
@@ -1418,6 +1424,146 @@ async fn record_sessions(
             "warning: the node did not record {} session {session} ({missed}); job {} keeps the session the node holds, or, for a new Codex thread, the one its next capture finds in the workspace",
             plan.harness, plan.job
         )]);
+    }
+}
+
+/// How many sessions a turn may have named and the node not yet been
+/// asked to record. A harness names one or two in a turn; past this many,
+/// the oldest waiting one is dropped, since the node keeps only the newest
+/// session a harness named, so memory stays bounded whatever the harness
+/// prints.
+const SESSION_QUEUE: usize = 16;
+
+/// The sessions a harness named, in order, for the task that asks the node
+/// to record them: at most `SESSION_QUEUE` wait, the newest kept.
+#[derive(Debug, Default)]
+struct NamedSessions {
+    waiting: std::sync::Mutex<NamedQueue>,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Debug, Default)]
+struct NamedQueue {
+    sessions: std::collections::VecDeque<SessionId>,
+    closed: bool,
+}
+
+impl NamedSessions {
+    fn queue(&self) -> std::sync::MutexGuard<'_, NamedQueue> {
+        self.waiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Queues `session`, dropping the oldest waiting one when the queue is full.
+    fn push(&self, session: SessionId) {
+        {
+            let mut queue = self.queue();
+            if queue.sessions.len() == SESSION_QUEUE
+                && let Some(dropped) = queue.sessions.pop_front()
+            {
+                tracing::warn!(%dropped, "a named session was dropped for a newer one");
+            }
+            queue.sessions.push_back(session);
+        }
+        self.changed.notify_one();
+    }
+
+    /// Says no session follows; the reader still gets those that wait.
+    fn close(&self) {
+        self.queue().closed = true;
+        self.changed.notify_one();
+    }
+
+    /// The next waiting session, or `None` once closed and empty.
+    async fn next(&self) -> Option<SessionId> {
+        loop {
+            {
+                let mut queue = self.queue();
+                if let Some(session) = queue.sessions.pop_front() {
+                    return Some(session);
+                }
+                if queue.closed {
+                    return None;
+                }
+            }
+            self.changed.notified().await;
+        }
+    }
+}
+
+/// The longest line of a headless harness's output that is read, in
+/// bytes: a line holds the turn's answer, and one longer is skipped, so a
+/// harness that prints without a line break cannot grow the command's
+/// memory without bound. The ACP client reads lines of the same length.
+const MAX_LINE: usize = 16 * 1024 * 1024;
+
+/// One line of a headless harness's output.
+#[derive(Debug, PartialEq, Eq)]
+enum Line {
+    /// The line, without its line break.
+    Whole(Vec<u8>),
+    /// A line longer than the bound, read past and dropped.
+    TooLong,
+}
+
+/// Reads a harness's output line by line, holding at most `max` bytes of
+/// one line. Cancel safe: a `next` dropped before it returns loses nothing,
+/// since a line read so far is kept here.
+struct Lines<R> {
+    reader: BufReader<R>,
+    line: Vec<u8>,
+    too_long: bool,
+    max: usize,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> Lines<R> {
+    fn new(reader: R, max: usize) -> Self {
+        Self {
+            reader: BufReader::new(reader),
+            line: Vec::new(),
+            too_long: false,
+            max,
+        }
+    }
+
+    /// The next line, the last one without a line break included, or
+    /// `None` at the end of the output.
+    async fn next(&mut self) -> std::io::Result<Option<Line>> {
+        loop {
+            let chunk = self.reader.fill_buf().await?;
+            if chunk.is_empty() {
+                return Ok(if self.too_long {
+                    self.too_long = false;
+                    Some(Line::TooLong)
+                } else if self.line.is_empty() {
+                    None
+                } else {
+                    Some(Line::Whole(std::mem::take(&mut self.line)))
+                });
+            }
+            let (part, ends) = match chunk.iter().position(|&b| b == b'\n') {
+                Some(at) => (&chunk[..at], Some(at + 1)),
+                None => (chunk, None),
+            };
+            if !self.too_long {
+                if self.line.len() + part.len() > self.max {
+                    self.too_long = true;
+                    self.line = Vec::new();
+                } else {
+                    self.line.extend_from_slice(part);
+                }
+            }
+            let used = ends.unwrap_or(chunk.len());
+            self.reader.consume(used);
+            if ends.is_some() {
+                return Ok(Some(if std::mem::take(&mut self.too_long) {
+                    Line::TooLong
+                } else {
+                    Line::Whole(std::mem::take(&mut self.line))
+                }));
+            }
+        }
     }
 }
 
@@ -1739,6 +1885,97 @@ mod tests {
     use fabric_harness::{NotCarried, SettingName};
 
     use super::*;
+
+    /// A headless harness's output is read a line at a time with at most
+    /// `max` bytes of one line held: a line past it is read through and
+    /// dropped, the lines after it still read, and the last line without
+    /// a line break comes out whole (M2-22). A read cut short, as the turn's
+    /// loop cuts one when the harness exits, keeps what it read.
+    #[tokio::test]
+    async fn a_line_past_the_bound_is_dropped_without_holding_it() {
+        use tokio::io::AsyncWriteExt;
+        let (mut harness, output) = tokio::io::duplex(1 << 16);
+        let mut lines = Lines::new(output, 64);
+        let writer = tokio::spawn(async move {
+            harness.write_all(b"first\n").await.unwrap();
+            harness.write_all(&vec![b'x'; 1 << 20]).await.unwrap();
+            harness
+        });
+        assert_eq!(
+            lines.next().await.unwrap(),
+            Some(Line::Whole(b"first".to_vec()))
+        );
+        // A megabyte with no line break yet: the read waits, holding none
+        // of it, until the writer is done and the pipe drained.
+        let mut drained = false;
+        while !drained {
+            drained = writer.is_finished();
+            let waited = tokio::time::timeout(Duration::from_millis(50), lines.next()).await;
+            assert!(waited.is_err(), "{waited:?}");
+        }
+        let mut harness = writer.await.unwrap();
+        assert!(lines.too_long);
+        assert!(
+            lines.line.capacity() <= 64,
+            "{} bytes held",
+            lines.line.capacity()
+        );
+        harness.write_all(b"\nsecond\n\nlast").await.unwrap();
+        drop(harness);
+        let mut read = Vec::new();
+        while let Some(line) = lines.next().await.unwrap() {
+            read.push(line);
+        }
+        assert_eq!(
+            read,
+            vec![
+                Line::TooLong,
+                Line::Whole(b"second".to_vec()),
+                Line::Whole(Vec::new()),
+                Line::Whole(b"last".to_vec()),
+            ]
+        );
+        let mut endless = Lines::new(&[b'y'; 4096][..], 64);
+        assert_eq!(endless.next().await.unwrap(), Some(Line::TooLong));
+        assert_eq!(endless.next().await.unwrap(), None);
+    }
+
+    /// The sessions a harness names wait for the recorder in order, at most
+    /// `SESSION_QUEUE` of them, the newest kept; a closed queue still hands
+    /// out what waits, then ends (M2-22).
+    #[tokio::test]
+    async fn named_sessions_wait_in_order_and_in_bounds() {
+        let named = NamedSessions::default();
+        let session = |n: usize| SessionId::parse(&format!("session-{n}")).unwrap();
+        for n in 0..1000 {
+            named.push(session(n));
+        }
+        assert_eq!(named.queue().sessions.len(), SESSION_QUEUE);
+        named.close();
+        let mut out = Vec::new();
+        while let Some(next) = named.next().await {
+            out.push(next);
+        }
+        let newest: Vec<SessionId> = (1000 - SESSION_QUEUE..1000).map(session).collect();
+        assert_eq!(out, newest);
+
+        let named = Arc::new(NamedSessions::default());
+        let reader = tokio::spawn({
+            let named = Arc::clone(&named);
+            async move {
+                let mut out = Vec::new();
+                while let Some(next) = named.next().await {
+                    out.push(next);
+                }
+                out
+            }
+        });
+        named.push(session(1));
+        tokio::task::yield_now().await;
+        named.push(session(2));
+        named.close();
+        assert_eq!(reader.await.unwrap(), vec![session(1), session(2)]);
+    }
 
     /// A client command runs on `CLIENT_WORKERS` workers, whatever the
     /// cores; `serve` keeps Tokio's default, a worker per core.
