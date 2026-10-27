@@ -54,6 +54,7 @@ fn manifest(files: Vec<Entry>, created_at: u64) -> Fallible<SnapshotManifest> {
     Ok(SnapshotManifest {
         job_id: JOB,
         root: AbsPath::parse("/w")?,
+        root_meta: None,
         parent: None,
         created_at,
         created_by: NodeId::from_bytes([9; 32]),
@@ -221,10 +222,12 @@ fn publish_refuses_a_bundle_base_the_store_does_not_have() {
         bundle: Vec::new(),
         bundle_base: Some(ghost),
         refs: Vec::new(),
+        symbolic_refs: Vec::new(),
         head: GitHead::Branch("main".parse().unwrap()),
         index_commit: oid.clone(),
         worktree_commit: oid,
         worktree_mtimes: Vec::new(),
+        worktree_modes: Vec::new(),
         config: Vec::new(),
         exclude: None,
     });
@@ -242,10 +245,12 @@ fn empty_git(width: usize, bundle_base: Option<SnapshotId>) -> Fallible<GitState
         bundle: Vec::new(),
         bundle_base,
         refs: Vec::new(),
+        symbolic_refs: Vec::new(),
         head: GitHead::Branch("main".parse()?),
         index_commit: oid.clone(),
         worktree_commit: oid,
         worktree_mtimes: Vec::new(),
+        worktree_modes: Vec::new(),
         config: Vec::new(),
         exclude: None,
     })

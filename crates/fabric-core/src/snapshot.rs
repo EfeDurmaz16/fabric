@@ -6,7 +6,11 @@
 //! entry per value in git's order, so one tree has one manifest, and its
 //! postcard encoding is the thing that is hashed: two manifests with the
 //! same fields have the same `SnapshotId` on every node and in every version
-//! of this crate that writes format version 2. A tree never places an entry
+//! of this crate that writes their format version. A manifest is written
+//! in version 3 when it records its root's mode and mtime, which every new
+//! capture does, and in version 2 when it does not, as one a version 2
+//! writer made; a version 2 manifest decodes and encodes to its own bytes,
+//! so its `SnapshotId` never changes. A tree never places an entry
 //! below a file or a symlink, `files` and the working-tree commit meet only
 //! at a directory of `files`, and no mode bit above the low nine is
 //! representable.
@@ -28,8 +32,17 @@ use crate::path::{AbsPath, RelPath};
 /// Version 2 added what a target needs to decide each cache path on its
 /// own (`CacheEntry::remake` and `CacheEntry::native_files`) and the list
 /// of paths a secret pattern or `.fabricignore` kept on the capturing node
-/// (`left_behind`).
-pub const MANIFEST_VERSION: u16 = 2;
+/// (`left_behind`). Version 3 added the mode and mtime of the workspace
+/// root and of the harness-state root (`SnapshotManifest::root_meta`,
+/// `HarnessState::root`), the permission bits of each file of the
+/// working-tree commit (`GitState::worktree_modes`) and the symbolic refs
+/// (`GitState::symbolic_refs`). A reader decodes version 2 too: it is a
+/// manifest with no `root_meta`, and holds none of the other three.
+pub const MANIFEST_VERSION: u16 = 3;
+
+/// The older format version a reader still decodes, so a snapshot taken
+/// before version 3 restores and keeps its id.
+pub const LEGACY_MANIFEST_VERSION: u16 = 2;
 
 /// The most bytes a reader decodes as a manifest; a memory bound against a
 /// hostile peer, not a cap on snapshots.
@@ -53,7 +66,7 @@ pub enum ManifestError {
     /// key and never goes down.
     #[error("{list} entry {index} is out of order")]
     OutOfOrder {
-        /// Which list: `files`, `harness_state`, `caches`, `left_behind`, `refs`, `worktree_mtimes` or `config`.
+        /// Which list: `files`, `harness_state`, `caches`, `left_behind`, `refs`, `symbolic_refs`, `worktree_mtimes`, `worktree_modes` or `config`.
         list: &'static str,
         /// Zero-based index of the entry, within its list.
         index: usize,
@@ -88,6 +101,37 @@ pub enum ManifestError {
         /// The path in the working-tree commit.
         worktree: RelPath,
     },
+    /// A symbolic ref has the name of a ref `refs` sets, so restore would set the name twice.
+    #[error("{name} is both a ref and a symbolic ref")]
+    SymbolicRefIsRef {
+        /// The name.
+        name: RefName,
+    },
+    /// A symbolic ref points at a name `refs` does not set, so the bundle
+    /// need not hold what it reaches and restore would leave it dangling.
+    #[error("symbolic ref {name} points at {target}, which is not in refs")]
+    SymbolicRefTargetMissing {
+        /// The symbolic ref.
+        name: RefName,
+        /// The name it points at.
+        target: RefName,
+    },
+    /// A mode is recorded for a path the working-tree commit does not hold.
+    #[error("{path} has a mode but is not in the working-tree commit")]
+    ModeOutsideWorktree {
+        /// The path.
+        path: RelPath,
+    },
+    /// A manifest with no `root_meta` is format version 2, which has no
+    /// field for what version 3 added; it holds one of them.
+    #[error("a manifest without root_meta cannot hold {field}")]
+    NotInVersion2 {
+        /// The version 3 field that is set.
+        field: &'static str,
+    },
+    /// Version 3 bytes with no `root_meta`, which only version 2 writes.
+    #[error("a version 3 manifest must record root_meta")]
+    MissingRootMeta,
     /// The git state mixes SHA-1 and SHA-256 object ids, which no one repository can hold.
     #[error("git state mixes SHA-1 and SHA-256 object ids")]
     MixedObjectFormat,
@@ -118,6 +162,11 @@ pub struct SnapshotManifest {
     pub job_id: JobId,
     /// The absolute workspace path the capture ran in; the target root on every node.
     pub root: AbsPath,
+    /// The mode and mtime of the root directory itself, which no entry
+    /// records, since a relative path cannot be empty. `None` only in a
+    /// manifest format version 2 wrote; such a root restores with the
+    /// umask's mode and the time of the restore, as it did then.
+    pub root_meta: Option<PathMeta>,
     /// The snapshot this one follows, if any.
     pub parent: Option<SnapshotId>,
     /// Unix milliseconds at capture; informational.
@@ -167,6 +216,15 @@ pub struct Entry {
     pub mtime_ns: u64,
 }
 
+/// The permission bits and modification time of one path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathMeta {
+    /// Permission bits; only the low nine exist.
+    pub mode: Mode,
+    /// Modification time in nanoseconds since the Unix epoch.
+    pub mtime_ns: u64,
+}
+
 /// The permission bits of a tree entry: the low nine and nothing else.
 ///
 /// setuid, setgid and sticky never travel (ADR 0004). Capture masks them
@@ -198,6 +256,13 @@ impl Mode {
     pub const fn bits(self) -> u16 {
         self.0
     }
+
+    /// True when the owner may execute: the one permission bit a git tree
+    /// records, as mode `100755` in place of `100644`.
+    #[must_use]
+    pub const fn owner_executable(self) -> bool {
+        self.0 & 0o100 != 0
+    }
 }
 
 impl fmt::Debug for Mode {
@@ -222,6 +287,9 @@ impl<'de> Deserialize<'de> for Mode {
 pub struct HarnessState {
     /// The captured files, directories and links.
     pub entries: Vec<Entry>,
+    /// The mode and mtime of the state root itself; `None` when no
+    /// directory was captured, and in a format version 2 manifest.
+    pub root: Option<PathMeta>,
 }
 
 /// The kind of a tree entry.
@@ -395,8 +463,14 @@ pub struct GitState {
     pub bundle: Vec<ChunkId>,
     /// The snapshot whose refs this bundle excludes; `None` means full.
     pub bundle_base: Option<SnapshotId>,
-    /// Every ref name and object id at capture time; sorted by name.
+    /// Every ref name and object id at capture time but the symbolic
+    /// refs; sorted by name.
     pub refs: Vec<(RefName, GitOid)>,
+    /// Every symbolic ref, such as `refs/remotes/origin/HEAD`, with the ref
+    /// it points at, which `refs` sets; sorted by name. A symbolic ref
+    /// whose target is not a ref of `refs` is in `refs` by its id instead.
+    /// Empty in a format version 2 manifest, which recorded each by its id.
+    pub symbolic_refs: Vec<(RefName, RefName)>,
     /// What `HEAD` pointed at.
     pub head: GitHead,
     /// Commit `I`: its tree is the index at capture time.
@@ -405,6 +479,13 @@ pub struct GitState {
     pub worktree_commit: GitOid,
     /// Modification time in nanoseconds for every path in `W`; sorted by path.
     pub worktree_mtimes: Vec<(RelPath, u64)>,
+    /// The permission bits of every regular file in `W`, each a path of
+    /// `worktree_mtimes`; sorted by path. A tree records only `100644` or
+    /// `100755`, so without these a file kept at 0600 would come back
+    /// readable by others. The owner execute bit agrees with the tree.
+    /// Empty in a format version 2 manifest, whose files restore with
+    /// 0644 or 0755 as the tree says.
+    pub worktree_modes: Vec<(RelPath, Mode)>,
     /// The allowlisted projection of the repository config, never the file;
     /// sorted by key. A key git holds more than once, such as two
     /// `remote.origin.fetch` refspecs, has one entry per value, in the order
@@ -514,9 +595,54 @@ fn check_trees_apart(files: &[Entry], worktree: &[(RelPath, u64)]) -> Result<(),
     Ok(())
 }
 
+/// Checks that each symbolic ref of `git` points at a ref `refs` sets and
+/// has a name of its own. Restore writes `refs` first and then points each
+/// symbolic ref at its target, so the bundle holds what every one reaches.
+/// Both lists are sorted by name, so each check is one binary search.
+fn check_symbolic_refs(git: &GitState) -> Result<(), ManifestError> {
+    let in_refs = |name: &RefName| git.refs.binary_search_by(|(n, _)| n.cmp(name)).is_ok();
+    for (name, target) in &git.symbolic_refs {
+        if in_refs(name) {
+            return Err(ManifestError::SymbolicRefIsRef { name: name.clone() });
+        }
+        if !in_refs(target) {
+            return Err(ManifestError::SymbolicRefTargetMissing {
+                name: name.clone(),
+                target: target.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Checks that a manifest with no `root_meta`, which encodes as format
+/// version 2, holds nothing that version has no field for.
+fn check_version2(manifest: &SnapshotManifest) -> Result<(), ManifestError> {
+    let field = if manifest.harness_state.root.is_some() {
+        Some("harness_state.root")
+    } else {
+        manifest.git.as_ref().and_then(|git| {
+            if !git.symbolic_refs.is_empty() {
+                Some("symbolic_refs")
+            } else if !git.worktree_modes.is_empty() {
+                Some("worktree_modes")
+            } else {
+                None
+            }
+        })
+    };
+    match field {
+        Some(field) => Err(ManifestError::NotInVersion2 { field }),
+        None => Ok(()),
+    }
+}
+
 impl SnapshotManifest {
     /// Checks the manifest's own rules.
     pub fn validate(&self) -> Result<(), ManifestError> {
+        if self.root_meta.is_none() {
+            check_version2(self)?;
+        }
         check_tree("files", &self.files)?;
         check_tree("harness_state", &self.harness_state.entries)?;
         check_sorted("caches", self.caches.iter().map(|c| &c.path))?;
@@ -528,10 +654,22 @@ impl SnapshotManifest {
         check_sorted("left_behind", self.left_behind.iter().map(|l| &l.path))?;
         if let Some(git) = &self.git {
             check_sorted("refs", git.refs.iter().map(|(name, _)| name))?;
+            check_sorted("symbolic_refs", git.symbolic_refs.iter().map(|(n, _)| n))?;
+            check_symbolic_refs(git)?;
             check_sorted(
                 "worktree_mtimes",
                 git.worktree_mtimes.iter().map(|(p, _)| p),
             )?;
+            check_sorted("worktree_modes", git.worktree_modes.iter().map(|(p, _)| p))?;
+            for (path, _) in &git.worktree_modes {
+                if git
+                    .worktree_mtimes
+                    .binary_search_by(|(p, _)| p.cmp(path))
+                    .is_err()
+                {
+                    return Err(ManifestError::ModeOutsideWorktree { path: path.clone() });
+                }
+            }
             if let Some(index) = git.config.windows(2).position(|w| w[0].0 > w[1].0) {
                 return Err(ManifestError::OutOfOrder {
                     list: "config",
@@ -565,18 +703,46 @@ impl SnapshotManifest {
         Ok(())
     }
 
-    /// Returns the canonical bytes of a valid manifest: the version, then the fields.
-    pub fn encode(&self) -> Result<Vec<u8>, ManifestError> {
-        self.validate()?;
-        Ok(codec::encode_versioned(MANIFEST_VERSION, self)?)
+    /// The format version `encode` writes: `MANIFEST_VERSION`, or
+    /// `LEGACY_MANIFEST_VERSION` for a manifest with no `root_meta`.
+    #[must_use]
+    pub const fn version(&self) -> u16 {
+        if self.root_meta.is_some() {
+            MANIFEST_VERSION
+        } else {
+            LEGACY_MANIFEST_VERSION
+        }
     }
 
-    /// Decodes bytes under the size bound, refusing other versions, and checks the result.
+    /// Returns the canonical bytes of a valid manifest: the version, then the fields.
+    ///
+    /// A manifest with no `root_meta` is written as format version 2, so
+    /// one decoded from version 2 bytes encodes to those bytes again.
+    pub fn encode(&self) -> Result<Vec<u8>, ManifestError> {
+        self.validate()?;
+        if self.root_meta.is_some() {
+            Ok(codec::encode_versioned(MANIFEST_VERSION, self)?)
+        } else {
+            let legacy = v2::Manifest::from(self.clone());
+            Ok(codec::encode_versioned(LEGACY_MANIFEST_VERSION, &legacy)?)
+        }
+    }
+
+    /// Decodes bytes under the size bound, refusing versions but 3 and 2, and checks the result.
     pub fn decode(bytes: &[u8]) -> Result<Self, ManifestError> {
         if bytes.len() > MAX_MANIFEST_LEN {
             return Err(ManifestError::TooLarge { len: bytes.len() });
         }
-        let manifest: SnapshotManifest = codec::decode_versioned(bytes, MANIFEST_VERSION)?;
+        let manifest = match codec::decode_versioned::<SnapshotManifest>(bytes, MANIFEST_VERSION) {
+            Ok(manifest) if manifest.root_meta.is_none() => {
+                return Err(ManifestError::MissingRootMeta);
+            }
+            Ok(manifest) => manifest,
+            Err(VersionedError::UnknownVersion(LEGACY_MANIFEST_VERSION)) => {
+                codec::decode_versioned::<v2::Manifest>(bytes, LEGACY_MANIFEST_VERSION)?.into()
+            }
+            Err(e) => return Err(e.into()),
+        };
         manifest.validate()?;
         Ok(manifest)
     }
@@ -584,6 +750,121 @@ impl SnapshotManifest {
     /// Returns the snapshot's identity: blake3 of its canonical bytes.
     pub fn id(&self) -> Result<SnapshotId, ManifestError> {
         Ok(SnapshotId::of(&self.encode()?))
+    }
+}
+
+/// The wire form of format version 2: the version 3 types without the
+/// fields version 3 added, in the same order. Version 2 bytes decode into
+/// it and convert to a `SnapshotManifest` with no `root_meta`, and a
+/// manifest with no `root_meta` converts back, so the bytes, and the id,
+/// come back the same.
+mod v2 {
+    use serde::{Deserialize, Serialize};
+
+    use super::{CacheEntry, Entry, GitHead, LeftBehind, Platform};
+    use crate::git::{GitConfigKey, GitConfigValue, GitOid, RefName};
+    use crate::id::{ChunkId, EnvSpecId, JobId, NodeId, SnapshotId};
+    use crate::path::{AbsPath, RelPath};
+
+    #[derive(Serialize, Deserialize)]
+    pub(super) struct Manifest {
+        job_id: JobId,
+        root: AbsPath,
+        parent: Option<SnapshotId>,
+        created_at: u64,
+        created_by: NodeId,
+        platform: Platform,
+        git: Option<GitState>,
+        files: Vec<Entry>,
+        harness_state: HarnessState,
+        env_spec: Option<EnvSpecId>,
+        caches: Vec<CacheEntry>,
+        left_behind: Vec<LeftBehind>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct HarnessState {
+        entries: Vec<Entry>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct GitState {
+        bundle: Vec<ChunkId>,
+        bundle_base: Option<SnapshotId>,
+        refs: Vec<(RefName, GitOid)>,
+        head: GitHead,
+        index_commit: GitOid,
+        worktree_commit: GitOid,
+        worktree_mtimes: Vec<(RelPath, u64)>,
+        config: Vec<(GitConfigKey, GitConfigValue)>,
+        exclude: Option<Vec<ChunkId>>,
+    }
+
+    impl From<Manifest> for super::SnapshotManifest {
+        fn from(m: Manifest) -> Self {
+            super::SnapshotManifest {
+                job_id: m.job_id,
+                root: m.root,
+                root_meta: None,
+                parent: m.parent,
+                created_at: m.created_at,
+                created_by: m.created_by,
+                platform: m.platform,
+                git: m.git.map(|g| super::GitState {
+                    bundle: g.bundle,
+                    bundle_base: g.bundle_base,
+                    refs: g.refs,
+                    symbolic_refs: Vec::new(),
+                    head: g.head,
+                    index_commit: g.index_commit,
+                    worktree_commit: g.worktree_commit,
+                    worktree_mtimes: g.worktree_mtimes,
+                    worktree_modes: Vec::new(),
+                    config: g.config,
+                    exclude: g.exclude,
+                }),
+                files: m.files,
+                harness_state: super::HarnessState {
+                    entries: m.harness_state.entries,
+                    root: None,
+                },
+                env_spec: m.env_spec,
+                caches: m.caches,
+                left_behind: m.left_behind,
+            }
+        }
+    }
+
+    /// Drops the version 3 fields; `check_version2` has seen they are empty.
+    impl From<super::SnapshotManifest> for Manifest {
+        fn from(m: super::SnapshotManifest) -> Self {
+            Manifest {
+                job_id: m.job_id,
+                root: m.root,
+                parent: m.parent,
+                created_at: m.created_at,
+                created_by: m.created_by,
+                platform: m.platform,
+                git: m.git.map(|g| GitState {
+                    bundle: g.bundle,
+                    bundle_base: g.bundle_base,
+                    refs: g.refs,
+                    head: g.head,
+                    index_commit: g.index_commit,
+                    worktree_commit: g.worktree_commit,
+                    worktree_mtimes: g.worktree_mtimes,
+                    config: g.config,
+                    exclude: g.exclude,
+                }),
+                files: m.files,
+                harness_state: HarnessState {
+                    entries: m.harness_state.entries,
+                },
+                env_spec: m.env_spec,
+                caches: m.caches,
+                left_behind: m.left_behind,
+            }
+        }
     }
 }
 

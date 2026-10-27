@@ -2759,12 +2759,14 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
     let harness_state = match req.harness_state {
         Some(dir) => HarnessState {
             entries: capturer.harness_entries(dir)?,
+            root: None,
         },
         None => HarnessState::default(),
     };
     let manifest = SnapshotManifest {
         job_id: req.job_id,
         root,
+        root_meta: None,
         parent: req.parent,
         created_at: req.created_at,
         created_by: req.created_by,
@@ -3039,10 +3041,12 @@ fn capture_git(
         bundle,
         bundle_base,
         refs,
+        symbolic_refs: Vec::new(),
         head,
         index_commit,
         worktree_commit,
         worktree_mtimes,
+        worktree_modes: Vec::new(),
         config,
         exclude,
     };

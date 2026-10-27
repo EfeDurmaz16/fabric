@@ -1548,6 +1548,7 @@ pub(crate) mod tests {
         let manifest = SnapshotManifest {
             job_id: fabric_core::id::JobId::from_bytes([1; 16]),
             root: AbsPath::parse("/w").unwrap(),
+            root_meta: None,
             parent: None,
             created_at: 0,
             created_by: fabric_core::id::NodeId::from_bytes([2; 32]),
