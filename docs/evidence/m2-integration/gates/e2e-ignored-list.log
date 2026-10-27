@@ -1,4 +1,4 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.25s
      Running unittests src/lib.rs (target/debug/deps/fabric-8f749fe0e2608da4)
 0 tests, 0 benchmarks
      Running unittests src/main.rs (target/debug/deps/fabric-8c8382a9cbf8ba9d)
@@ -89,10 +89,10 @@ ledger_file::tests::child_appends_until_killed: test
 0 tests, 0 benchmarks
    Doc-tests fabric_client
 0 tests, 0 benchmarks
-all doctests ran in 0.54s; merged doctests compilation took 0.26s
+all doctests ran in 0.64s; merged doctests compilation took 0.36s
    Doc-tests fabric_core
 0 tests, 0 benchmarks
-all doctests ran in 0.57s; merged doctests compilation took 0.28s
+all doctests ran in 0.64s; merged doctests compilation took 0.36s
    Doc-tests fabric_env
 0 tests, 0 benchmarks
    Doc-tests fabric_harness

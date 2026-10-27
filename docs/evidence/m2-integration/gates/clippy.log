@@ -1,10 +1,1 @@
-    Checking fabric-core v0.1.0 (/private/tmp/fabric-wt/m2/crates/fabric-core)
-    Checking fabric-env v0.1.0 (/private/tmp/fabric-wt/m2/crates/fabric-env)
-    Checking fabric-harness v0.1.0 (/private/tmp/fabric-wt/m2/crates/fabric-harness)
-    Checking fabric-store v0.1.0 (/private/tmp/fabric-wt/m2/crates/fabric-store)
-    Checking fabric-client v0.1.0 (/private/tmp/fabric-wt/m2/crates/fabric-client)
-    Checking fabric-journal v0.1.0 (/private/tmp/fabric-wt/m2/crates/fabric-journal)
-    Checking fabric-net v0.1.0 (/private/tmp/fabric-wt/m2/crates/fabric-net)
-    Checking fabricd v0.1.0 (/private/tmp/fabric-wt/m2/crates/fabricd)
-    Checking fabric v0.1.0 (/private/tmp/fabric-wt/m2/crates/fabric)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.15s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.24s

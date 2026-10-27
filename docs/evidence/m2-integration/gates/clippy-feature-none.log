@@ -1,3 +1,1 @@
-    Checking fabric-core v0.1.0 (/private/tmp/fabric-wt/m2/crates/fabric-core)
-    Checking fabric-harness v0.1.0 (/private/tmp/fabric-wt/m2/crates/fabric-harness)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.30s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
