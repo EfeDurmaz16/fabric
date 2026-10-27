@@ -589,3 +589,227 @@ fn a_corrupt_object_left_without_a_row_is_removed_not_published() {
     let id = store.publish(&m).unwrap();
     assert_eq!(store.manifest(id).unwrap(), m);
 }
+
+/// The store as the node's tasks reach it, for the concurrency bench.
+mod shared_bench {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Barrier, Mutex, PoisonError};
+    use std::time::{Duration, Instant};
+
+    use fabric_core::id::{ChunkId, JobId, NodeId, SnapshotId};
+    use fabric_store::capture::{CaptureRequest, UnmeasuredKeys, capture};
+    use fabric_store::objects::ChunkParams;
+    use fabric_store::policy::IgnorePolicy;
+    use fabric_store::restore::{Durability, RestoreRequest, Verify, restore};
+    use fabric_store::store::Store;
+
+    use super::{Fallible, common};
+
+    /// Files of each workspace, and their size.
+    const FILES: usize = 300;
+    const FILE_BYTES: usize = 32 << 10;
+    /// One file above the whole-file limit, cut into chunks.
+    const LARGE_BYTES: usize = 12 << 20;
+
+    /// How the bench's threads reach the store.
+    pub(super) trait Access: Sync {
+        /// Runs `work` on the store, as `with_store` runs a closure.
+        fn with<T>(&self, work: impl FnOnce(&mut Store) -> T) -> T;
+    }
+
+    /// The node at the anchor: one mutex held for each whole closure.
+    pub(super) struct OneMutex(pub(super) Mutex<Store>);
+
+    impl Access for OneMutex {
+        fn with<T>(&self, work: impl FnOnce(&mut Store) -> T) -> T {
+            work(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
+        }
+    }
+
+    /// Writes a workspace of `FILES` files and one large file, all its own bytes.
+    pub(super) fn workspace(root: &Path, seed: u64) -> Fallible {
+        std::fs::create_dir_all(root.join("src"))?;
+        for i in 0..FILES {
+            let seed = seed * 10_000 + i as u64;
+            std::fs::write(
+                root.join(format!("src/f{i}.bin")),
+                common::pseudo_random(FILE_BYTES, seed),
+            )?;
+        }
+        std::fs::write(
+            root.join("large.bin"),
+            common::pseudo_random(LARGE_BYTES, seed * 10_000 + 9_999),
+        )?;
+        Ok(())
+    }
+
+    /// Captures `root` and publishes it, in one closure as a suspend does.
+    pub(super) fn capture_publish(store: &mut Store, root: &Path, at: u64) -> Fallible<SnapshotId> {
+        let policy = IgnorePolicy::default();
+        let captured = capture(
+            store,
+            &CaptureRequest {
+                root,
+                job_id: JobId::from_bytes([4; 16]),
+                created_by: NodeId::from_bytes([4; 32]),
+                created_at: at,
+                parent: None,
+                policy: &policy,
+                carry_keys: &UnmeasuredKeys,
+                harness_state: None,
+                env_spec: None,
+                allow_large_untracked: false,
+            },
+        )?;
+        Ok(store.publish(&captured.manifest)?)
+    }
+
+    /// Restores `snapshot` into `target`, as a resume does.
+    pub(super) fn restore_into(store: &Store, snapshot: SnapshotId, target: &Path) -> Fallible {
+        restore(
+            store,
+            &RestoreRequest {
+                snapshot,
+                target,
+                harness_state: None,
+                verify: Verify::Sample(32),
+                durability: Durability::PowerLoss,
+                carry: &|_| true,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// One round's numbers.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct Round {
+        /// From the start until both captures and the restore ended.
+        pub(super) makespan: Duration,
+        /// The longest and the 99th percentile wait of a reader's short call.
+        pub(super) read_max: Duration,
+        pub(super) read_p99: Duration,
+        pub(super) reads: usize,
+    }
+
+    /// A store in `dir` holding the snapshot of `source`, and one of its chunks.
+    pub(super) fn seeded(dir: &Path, source: &Path) -> Fallible<(Store, SnapshotId, ChunkId)> {
+        let mut store = Store::create(&dir.join("store"), ChunkParams::DEFAULT)?;
+        let snapshot = capture_publish(&mut store, source, 1)?;
+        let chunk = *Store::data_chunks(&store.manifest(snapshot)?)
+            .first()
+            .ok_or("no chunk")?;
+        Ok((store, snapshot, chunk))
+    }
+
+    /// Two captures, one restore and a reader of short calls, at once, on `access`.
+    pub(super) fn round<A: Access>(
+        access: &A,
+        work: &[PathBuf; 2],
+        restored: SnapshotId,
+        chunk: ChunkId,
+        target: &Path,
+    ) -> Fallible<Round> {
+        let start = Barrier::new(4);
+        let heavy_done = std::sync::atomic::AtomicUsize::new(0);
+        let started = Instant::now();
+        let (makespan, mut waits) =
+            std::thread::scope(|scope| -> Fallible<(Duration, Vec<Duration>)> {
+                let mut heavy = Vec::new();
+                for (i, root) in work.iter().enumerate() {
+                    let (start, done) = (&start, &heavy_done);
+                    heavy.push(scope.spawn(move || -> Result<(), String> {
+                        start.wait();
+                        let made = access
+                            .with(|store| capture_publish(store, root, 10 + i as u64))
+                            .map(|_| ())
+                            .map_err(|e| e.to_string());
+                        done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        made
+                    }));
+                }
+                let (start2, done2) = (&start, &heavy_done);
+                heavy.push(scope.spawn(move || -> Result<(), String> {
+                    start2.wait();
+                    let made = access
+                        .with(|store| restore_into(store, restored, target))
+                        .map_err(|e| e.to_string());
+                    done2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    made
+                }));
+                let reader = scope.spawn(|| -> Result<Vec<Duration>, String> {
+                    start.wait();
+                    let mut waits = Vec::new();
+                    while heavy_done.load(std::sync::atomic::Ordering::SeqCst) < 3 {
+                        let asked = Instant::now();
+                        access
+                            .with(|store| -> Fallible {
+                                store.snapshot(restored)?;
+                                store.objects().read_stored(chunk)?;
+                                Ok(())
+                            })
+                            .map_err(|e| e.to_string())?;
+                        waits.push(asked.elapsed());
+                        std::thread::sleep(Duration::from_micros(500));
+                    }
+                    Ok(waits)
+                });
+                for thread in heavy {
+                    thread.join().map_err(|_| "a thread panicked")??;
+                }
+                let makespan = started.elapsed();
+                let waits = reader.join().map_err(|_| "the reader panicked")??;
+                Ok((makespan, waits))
+            })?;
+        waits.sort();
+        Ok(Round {
+            makespan,
+            read_max: *waits.last().ok_or("no read")?,
+            read_p99: waits[(waits.len() - 1) * 99 / 100],
+            reads: waits.len(),
+        })
+    }
+}
+
+/// M2-19, measured before the store lock is narrowed: two captures, a
+/// restore and a reader of short calls (a snapshot's row and one stored
+/// chunk, as a peer's fetch asks) share one store, each through one
+/// mutex held for its whole closure, as the node at the anchor holds it.
+/// Prints each round. Ignored; run it with `cargo test -p fabric-store
+/// --release --test store -- --ignored --exact shared_store_bench
+/// --nocapture`, with `FABRIC_BENCH_ROUNDS` rounds (default 15).
+#[test]
+#[ignore = "benchmark; run on demand with --ignored --nocapture"]
+fn shared_store_bench() {
+    use shared_bench::{OneMutex, round, seeded, workspace};
+    let rounds: usize = std::env::var("FABRIC_BENCH_ROUNDS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(15);
+    let fixture = tempfile::tempdir().unwrap();
+    let work = [fixture.path().join("w1"), fixture.path().join("w2")];
+    let source = fixture.path().join("source");
+    workspace(&work[0], 1).unwrap();
+    workspace(&work[1], 2).unwrap();
+    workspace(&source, 3).unwrap();
+    println!("round\tarm\tmakespan_ms\tread_p99_ms\tread_max_ms\treads");
+    for n in 0..rounds {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, restored, chunk) = seeded(dir.path(), &source).unwrap();
+        let access = OneMutex(std::sync::Mutex::new(store));
+        let r = round(
+            &access,
+            &work,
+            restored,
+            chunk,
+            &dir.path().join("restored"),
+        )
+        .unwrap();
+        println!(
+            "{n}\tone_mutex\t{:.1}\t{:.1}\t{:.1}\t{}",
+            r.makespan.as_secs_f64() * 1e3,
+            r.read_p99.as_secs_f64() * 1e3,
+            r.read_max.as_secs_f64() * 1e3,
+            r.reads
+        );
+    }
+}
