@@ -93,6 +93,12 @@ pub struct Node {
     /// The environment the last local client sent, which the node uses
     /// for work no client asks for (ADR 0018, The client's environment).
     client_env: Mutex<Option<ClientEnv>>,
+    /// The managed authority, the one writer of the managed journal (ADR 0020).
+    #[expect(
+        dead_code,
+        reason = "the managed ops of the client API read it from the next commit"
+    )]
+    pub(crate) authority: crate::authority::Authority,
     _lock: File,
 }
 
@@ -153,6 +159,10 @@ impl Node {
             tracing::warn!(error = %e, "the environment a client last sent does not read; the node uses its own until a client sends one");
             None
         });
+        // One stat on the start path: the authority's thread opens and
+        // recovers an existing journal on its own, and makes none.
+        let authority = crate::authority::Authority::start(&cfg.state, identity.node_id())
+            .map_err(|e| NodeError::io(crate::authority::managed_dir(&cfg.state), e))?;
         let node = Arc::new(Self {
             id: identity.node_id(),
             cfg,
@@ -172,6 +182,7 @@ impl Node {
             catching_up: Mutex::new(BTreeMap::new()),
             waiting_catch_up: Mutex::new(BTreeSet::new()),
             client_env: Mutex::new(client_env),
+            authority,
             _lock: lock_file,
         });
         tracing::info!(node = %node.id, addr = ?node.local_addr().ok(), "node started");
@@ -508,7 +519,7 @@ fn open_store(dir: &std::path::Path) -> Result<Store, NodeError> {
 /// where the adapters keep departure records and the Claude config lock
 /// under `~/.fabric`, which is the state directory unless `FABRIC_HOME`
 /// names another.
-const STATE_ENTRIES: [&str; 11] = [
+const STATE_ENTRIES: [&str; 12] = [
     "client-env",
     "daemon.lock",
     "fabric.sock",
@@ -516,6 +527,7 @@ const STATE_ENTRIES: [&str; 11] = [
     "harness.toml",
     "jobs",
     "locks",
+    "managed",
     "node.key",
     "peers",
     "peers.lock",

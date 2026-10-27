@@ -18,6 +18,7 @@ fabric-client = { path = "../fabric-client" }
 fabric-core = { path = "../fabric-core" }
 fabric-env = { path = "../fabric-env" }
 fabric-harness = { path = "../fabric-harness" }
+fabric-journal = { path = "../fabric-journal" }
 fabric-net = { path = "../fabric-net" }
 fabric-store = { path = "../fabric-store" }
 rustix = { version = "1.1", features = ["fs", "process"] }

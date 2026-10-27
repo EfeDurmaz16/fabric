@@ -11,6 +11,7 @@
 //! anything acts on it, so a `kill -9` at any point leaves state the next
 //! command finishes or refuses with the command that resolves it.
 
+mod authority;
 mod carry;
 mod catchup;
 mod clock;

@@ -473,6 +473,7 @@ dependencies = [
  "fabric-core",
  "fabric-env",
  "fabric-harness",
+ "fabric-journal",
  "fabric-net",
  "fabric-store",
  "rustix",
