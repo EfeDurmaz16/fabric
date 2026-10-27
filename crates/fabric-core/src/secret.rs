@@ -46,7 +46,9 @@ pub enum SecretPatternError {
     /// A `**` component; a pattern already matches at any depth.
     #[error("secret pattern has a `**` component; a pattern already matches at any depth")]
     DoubleStar,
-    /// A character with a meaning in gitignore that the matcher does not share.
+    /// A character with a meaning in gitignore that the matcher does not
+    /// share, or a control character, which no path name needs and which a
+    /// terminal would act on when the pattern is printed.
     #[error("secret pattern has an unsupported character at index {index}")]
     BadChar {
         /// Zero-based byte index of the character.
@@ -75,8 +77,10 @@ pub enum SecretPatternError {
 
 /// A secret pattern a job adds to the built-in list: path components separated by `/`, where `*` matches any run of characters.
 ///
-/// Refused: `\`, `[`, `]`, `?`, `!`, `#`, whitespace and NUL, because
-/// gitignore gives them meanings the matcher does not; empty, `.`, `..`
+/// Refused: `\`, `[`, `]`, `?`, `!`, `#` and whitespace, because
+/// gitignore gives them meanings the matcher does not; control
+/// characters, NUL among them, because a pattern is printed in reports
+/// and refusals where an escape would drive the terminal; empty, `.`, `..`
 /// and `**` components; any pattern that denies `OVERRIDE_FILE`; and
 /// any pattern shaped like a credential, since patterns travel in the spec.
 /// Checked once, at the boundary, including inside `Deserialize`.
@@ -96,7 +100,7 @@ impl SecretPattern {
             return Err(SecretPatternError::Empty);
         }
         let bad = text.char_indices().find(|&(_, c)| {
-            matches!(c, '\\' | '[' | ']' | '?' | '!' | '#' | '\0') || c.is_whitespace()
+            matches!(c, '\\' | '[' | ']' | '?' | '!' | '#') || c.is_whitespace() || c.is_control()
         });
         if let Some((index, _)) = bad {
             return Err(SecretPatternError::BadChar { index });
@@ -818,7 +822,6 @@ mod tests {
     /// character, such as the escape that starts a terminal sequence, is
     /// refused as `SetupArg` and `ProgramName` refuse it.
     #[test]
-    #[ignore = "CORE-L2: expected failure until fixed"]
     fn a_secret_pattern_with_a_control_character_is_refused() {
         for text in ["x\u{1b}c", "a\u{7}b", "c\u{7f}d"] {
             assert!(SecretPattern::parse(text).is_err(), "{text:?}");
