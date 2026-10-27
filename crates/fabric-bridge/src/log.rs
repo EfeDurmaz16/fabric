@@ -31,9 +31,13 @@ pub enum LogError {
     Storage(String),
 }
 
-/// A provider operation's status and last locator.
+/// A provider operation's action, target, status and last locator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
+    /// The bridge action it was dispatched as.
+    pub action: String,
+    /// The locator it was sent to, as JSON text; `None` for a create.
+    pub target: Option<String>,
     /// Where it is.
     pub status: ProviderStatus,
     /// The last locator the worker reported, as JSON text.
@@ -110,6 +114,8 @@ impl OperationLog for Journal {
 
     fn entry(&self, operation: OperationId) -> Result<Option<Entry>, LogError> {
         Ok(self.provider_operation(operation)?.map(|op| Entry {
+            action: op.dispatch.action,
+            target: op.dispatch.target,
             status: op.status,
             locator: op.locator,
         }))
@@ -148,6 +154,8 @@ impl OperationLog for MemoryLog {
         self.entries.insert(
             dispatch.operation,
             Entry {
+                action: dispatch.action.clone(),
+                target: dispatch.target.clone(),
                 status: if refusal.is_some() {
                     ProviderStatus::Rejected
                 } else {

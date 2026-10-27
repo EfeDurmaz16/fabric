@@ -14,7 +14,10 @@
 //!   `double/running` it answers a running result, which a terminal-only
 //!   action never may; with
 //!   `double/other-operation` it answers under another operation id.
-//! - `sandbox.exec` echoes its argv; `sandbox.destroy` needs an approval.
+//! - `sandbox.exec` echoes its argv; `sandbox.destroy` needs an approval,
+//!   and of `fx-stopping` it stays stopping: `pending` with its target.
+//! - `observe` answers `completed` for whatever resource it names, as a
+//!   destroy observe of a resource that is not there would.
 //! - A repeated key with the same digest replays the first answer; with
 //!   another digest it is an idempotency conflict.
 //!
@@ -90,6 +93,26 @@ fn error(request_id: &str, operation: OperationId, code: ErrorCode, reason: &str
             effect: EffectState::None,
             resource: None,
             state: None,
+            observations: None,
+            deadline_ms: None,
+            cleanup: None,
+        },
+    })
+}
+
+/// A terminal-only action not terminal by its deadline: `pending` with
+/// the resource it acts on.
+fn pending(request: &Request, resource: &Locator) -> ToFabric {
+    ToFabric::Error(ErrorMessage {
+        request_id: request.request_id.clone(),
+        operation_id: request.operation.id,
+        error: ErrorBody {
+            code: ErrorCode::Pending,
+            reason: "observation_deadline".to_owned(),
+            message: "pending: observation_deadline".to_owned(),
+            effect: EffectState::Pending,
+            resource: Some(resource.clone()),
+            state: Some("stopping".to_owned()),
             observations: None,
             deadline_ms: None,
             cleanup: None,
@@ -211,6 +234,8 @@ fn script(request: &Request) -> Step {
                     ErrorCode::Denied,
                     "approval_required",
                 ))
+            } else if target.native_id == "fx-stopping" {
+                Step::Answer(pending(request, target))
             } else {
                 Step::Answer(completed(
                     request,

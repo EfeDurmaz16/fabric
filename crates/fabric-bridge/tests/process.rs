@@ -629,3 +629,142 @@ async fn a_dispatched_destroy_names_its_target_before_any_answer_and_after_a_res
     assert_eq!(row.dispatch.action, "sandbox.destroy");
     assert_eq!(row.dispatch.target, target);
 }
+
+fn locator(journal: &Journal, n: u8) -> Option<String> {
+    journal
+        .provider_operation(OperationId::from_bytes([n; 16]))
+        .unwrap()
+        .unwrap()
+        .locator
+}
+
+/// Observe settles an operation only from its own resource: the target a
+/// destroy was sent to, or the locator a create's worker reported. A
+/// locator that is not the target, another action, another job's sandbox,
+/// or a create whose row names no locator are refused before any frame,
+/// and the operation keeps its status; the double, like a worker reading
+/// a resource that is not there, would have answered each `completed`.
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one journal walked through every refusal and then both settlements"
+)]
+async fn observe_reads_only_the_operations_own_action_and_resource() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let bridge = spawn().await;
+    // A destroy whose target is still stopping at its deadline: pending.
+    let destroy = Effect {
+        operation: operation(70),
+        scope: scope(),
+        action: Action::Destroy {
+            target: fx("stopping"),
+        },
+        approval: Some("apr-destroy-70".into()),
+        policy: None,
+        deadline_ms: 5000,
+    };
+    let pending = bridge
+        .request(&mut journal, destroy)
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(pending.status, ProviderStatus::Dispatched);
+    let destroy_op = OperationId::from_bytes([70; 16]);
+    for (action, resource) in [
+        ("sandbox.destroy", fx("ghost")),
+        ("sandbox.create", fx("stopping")),
+        ("sandbox.create", fx("seed")),
+    ] {
+        let refused = bridge
+            .observe(&mut journal, destroy_op, action, resource, 1000)
+            .await;
+        assert!(
+            matches!(refused, Err(BridgeError::ObserveMismatch { .. })),
+            "{action}: {refused:?}"
+        );
+        assert_eq!(status(&journal, 70), Some(ProviderStatus::Dispatched));
+    }
+
+    // A create that reported nothing before its deadline has nothing to
+    // be observed by, whatever locator the caller names.
+    let mut silent = create(72, "double/silent");
+    silent.deadline_ms = 100;
+    let timed_out = bridge
+        .request(&mut journal, silent)
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(timed_out.status, ProviderStatus::Unknown);
+    assert_eq!(locator(&journal, 72), None);
+    let refused = bridge
+        .observe(
+            &mut journal,
+            OperationId::from_bytes([72; 16]),
+            "sandbox.create",
+            fx("key-72"),
+            1000,
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(BridgeError::ObserveMismatch { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(status(&journal, 72), Some(ProviderStatus::Unknown));
+
+    // A create that reported its sandbox and was lost: another job's
+    // sandbox is not it.
+    let lost = bridge
+        .request(&mut journal, create(71, "double/progress-crash"))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(lost.status, ProviderStatus::Unknown);
+    let own = Some(fx("key-71").to_value().to_string());
+    assert_eq!(locator(&journal, 71), own);
+    let bridge = spawn().await;
+    let create_op = OperationId::from_bytes([71; 16]);
+    let refused = bridge
+        .observe(
+            &mut journal,
+            create_op,
+            "sandbox.create",
+            fx("other-job"),
+            1000,
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(BridgeError::ObserveMismatch { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(status(&journal, 71), Some(ProviderStatus::Unknown));
+    assert_eq!(locator(&journal, 71), own);
+
+    // Their own action and resource settle both.
+    for (op, action, resource) in [
+        (destroy_op, "sandbox.destroy", fx("stopping")),
+        (create_op, "sandbox.create", fx("key-71")),
+    ] {
+        let outcome = bridge
+            .observe(&mut journal, op, action, resource.clone(), 1000)
+            .await
+            .unwrap()
+            .finish(&mut journal)
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ProviderStatus::Succeeded, "{action}");
+        let row = journal.provider_operation(op).unwrap().unwrap();
+        assert_eq!(row.locator, Some(resource.to_value().to_string()));
+    }
+    assert_eq!(
+        bridge.late_answers(),
+        0,
+        "a refused observe reached the worker"
+    );
+}

@@ -29,7 +29,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::frames::{self, FrameFault};
-use crate::log::{LogError, OperationLog};
+use crate::log::{Entry, LogError, OperationLog};
 use crate::wire::{
     Action, Cancel, CancelState, ErrorCode, ErrorMessage, Expect, Hello, Limits, Locator, Observe,
     OperationRef, Phase, Profile, Refusal, Request, RequestPolicy, ResultMessage, ResultState,
@@ -125,6 +125,16 @@ pub enum BridgeError {
     /// The operation is not one the log holds as `dispatched` or `unknown`.
     #[error("operation {0} has nothing to observe")]
     NotObservable(OperationId),
+    /// The observe names another action or another resource than the
+    /// operation's own in the log, or the log holds no locator to observe
+    /// it by. Nothing was sent and the log is unchanged.
+    #[error("operation {operation} is not observed so: {why}")]
+    ObserveMismatch {
+        /// The operation.
+        operation: OperationId,
+        /// What does not match.
+        why: String,
+    },
 }
 
 /// What happened to a provider operation, and the status the log now holds.
@@ -629,6 +639,13 @@ impl Bridge {
     /// or `unknown`, by its original id, waiting at most `wait_ms`. An
     /// action the profile does not observe, or a wait over its limit, is
     /// refused before sending and changes nothing in the log.
+    ///
+    /// `action` and `resource` must be the operation's own as the log
+    /// holds them: its action, and the target it was sent to or, for an
+    /// action without one such as a create, the locator its worker
+    /// reported. Anything else is `ObserveMismatch` before sending, since
+    /// the answer would settle this operation from another resource's
+    /// state: a destroy recorded done while its target still runs.
     pub async fn observe<L: OperationLog>(
         &self,
         log: &mut L,
@@ -646,15 +663,17 @@ impl Bridge {
         };
         self.as_worker_reads(&ToWorker::Observe(observe.clone()))
             .map_err(BridgeError::RefusedLocally)?;
-        let observable = log.entry(operation)?.is_some_and(|e| {
+        let entry = log.entry(operation)?.filter(|e| {
             matches!(
                 e.status,
                 ProviderStatus::Dispatched | ProviderStatus::Unknown
             )
         });
-        if !observable {
+        let Some(entry) = entry else {
             return Err(BridgeError::NotObservable(operation));
-        }
+        };
+        own_resource(&entry, &observe.action, &observe.resource)
+            .map_err(|why| BridgeError::ObserveMismatch { operation, why })?;
         let frame = frames::encode(
             &ToWorker::Observe(observe.clone()).to_value(),
             cap_of(self.limits.max_request_bytes),
@@ -1020,6 +1039,29 @@ impl InFlight {
 
 fn locator_text(locator: &Locator) -> String {
     locator.to_value().to_string()
+}
+
+/// Whether `action` on `resource` is the operation's own as `entry` holds
+/// it: its action, and its target, or for an action without one the
+/// locator its worker reported. A row that names no locator has nothing
+/// to be observed by.
+fn own_resource(entry: &Entry, action: &str, resource: &Locator) -> Result<(), String> {
+    if entry.action != action {
+        return Err(format!(
+            "it was dispatched as {}, not {action}",
+            entry.action
+        ));
+    }
+    let Some(text) = entry.target.as_deref().or(entry.locator.as_deref()) else {
+        return Err("the log holds no locator for it".into());
+    };
+    let own = serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| Locator::from_value(&value).ok());
+    if own.as_ref() != Some(resource) {
+        return Err(format!("{text} is its resource, not the one named"));
+    }
+    Ok(())
 }
 
 fn cap_of(bytes: u64) -> usize {
