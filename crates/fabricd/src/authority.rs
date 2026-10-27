@@ -117,6 +117,9 @@ enum Ids {
 pub(crate) struct Authority {
     calls: mpsc::Sender<Call>,
     ids: watch::Receiver<Ids>,
+    /// How many threads this authority started, for the tests.
+    #[cfg(test)]
+    spawned: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Authority {
@@ -133,7 +136,18 @@ impl Authority {
         std::thread::Builder::new()
             .name("fabric-authority".into())
             .spawn(move || serve(&place, queue, &publish))?;
-        Ok(Authority { calls, ids })
+        Ok(Authority {
+            calls,
+            ids,
+            #[cfg(test)]
+            spawned: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        })
+    }
+
+    /// How many threads this authority started.
+    #[cfg(test)]
+    pub(crate) fn threads(&self) -> usize {
+        self.spawned.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Whether the journal holds `job`, without waiting behind the queue:

@@ -289,3 +289,47 @@ async fn legacy_state_from_main_is_untouched_by_a_managed_job_beside_it() {
         "files outside managed/: {added:?}"
     );
 }
+
+/// Perf A/B item 6 (docs/evidence/perf-ab/README.md): every daemon
+/// started the authority's thread, journal or not, which cost each one a
+/// thread and about 80 KiB against main. The thread starts with the
+/// daemon only for an existing journal, which it recovers before any
+/// call, and otherwise with the first managed command; a read before
+/// that answers from the start's look, which found no journal.
+#[tokio::test]
+#[ignore = "perf-ab 6: expected failure until fixed"]
+async fn the_thread_starts_with_a_journal_or_with_the_first_managed_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let other = JobId::from_bytes([1; 16]);
+    let authority = Authority::start(&state, NODE).unwrap();
+    assert_eq!(
+        authority.threads(),
+        0,
+        "a start without a journal started the thread"
+    );
+    assert!(authority.list().await.unwrap().is_empty());
+    assert!(authority.job(other).await.unwrap().is_none());
+    assert!(!authority.holds(other).await.unwrap());
+    assert_eq!(authority.threads(), 0, "a read started the thread");
+
+    let job = job_of(&authority.submit(create("create-1")).await.unwrap());
+    assert_eq!(authority.threads(), 1);
+    assert!(authority.holds(job).await.unwrap());
+    assert_eq!(authority.list().await.unwrap()[0].job.id, job);
+    let second = authority.clone();
+    second.submit(create("create-2")).await.unwrap();
+    assert_eq!(authority.list().await.unwrap().len(), 2);
+    assert_eq!(
+        authority.threads(),
+        1,
+        "a second command started another thread"
+    );
+    drop((authority, second));
+
+    // With a journal, the thread starts with the daemon and recovers it.
+    let authority = Authority::start(&state, NODE).unwrap();
+    assert_eq!(authority.threads(), 1);
+    assert!(authority.holds(job).await.unwrap());
+    assert_eq!(authority.list().await.unwrap().len(), 2);
+}
