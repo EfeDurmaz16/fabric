@@ -461,8 +461,10 @@ fn utf8_link(base: &Path, rel: &RelPath) -> Result<String, CaptureError> {
 }
 
 /// What identifies one state of a path: device, inode, size and mtime.
-type Stamp = (u64, u64, u64, i64, i64);
+type Stamp = (u64, u64, u64, i64, i64, u32);
 
+/// Device, inode, size, mtime and mode, so a `chmod` counts as a change as
+/// a write does: the mode travels (M2-04).
 fn stamp(meta: &fs::Metadata) -> Stamp {
     (
         meta.dev(),
@@ -470,6 +472,7 @@ fn stamp(meta: &fs::Metadata) -> Stamp {
         meta.len(),
         meta.mtime(),
         meta.mtime_nsec(),
+        meta.mode(),
     )
 }
 
@@ -518,6 +521,23 @@ fn root_meta(root: &Path) -> Result<PathMeta, CaptureError> {
             path: root.to_owned(),
         })?,
     })
+}
+
+/// The mode a file of `W` travels with: its own bits, with the execute
+/// bits made to agree with the tree, which records only whether the owner
+/// may execute (`100755`). They disagree only where git does not trust the
+/// execute bit (`core.fileMode=false`), and the target's git compares the
+/// file with the tree. A file the tree calls executable gets an execute
+/// bit wherever it has a read bit, as `chmod +x` gives it; one the tree
+/// calls plain loses them all.
+fn blob_mode(raw: u32, executable: bool) -> Mode {
+    let mode = Mode::from_masked(raw);
+    let bits = match (executable, mode.owner_executable()) {
+        (true, false) => mode.bits() | ((mode.bits() & 0o444) >> 2) | 0o100,
+        (false, true) => mode.bits() & !0o111,
+        _ => mode.bits(),
+    };
+    Mode::from_masked(u32::from(bits))
 }
 
 /// True when a link at `rel` with `target` points outside the tree root.
@@ -873,7 +893,7 @@ impl Census {
             .filter(|item| carried(&item.rel))
             .map(|item| {
                 let stamp = match item.kind {
-                    FoundKind::Dir => (item.meta.dev(), item.meta.ino(), 0, 0, 0),
+                    FoundKind::Dir => (item.meta.dev(), item.meta.ino(), 0, 0, 0, 0),
                     FoundKind::File | FoundKind::Symlink => stamp(&item.meta),
                 };
                 (item.rel.clone(), Some(stamp))
@@ -1589,8 +1609,9 @@ struct IndexBlob {
     filtered: bool,
 }
 
-/// The mtime of every path of `W`, sorted by path, and an entry for every directory of `W`.
-type WorktreeMeta = (Vec<(RelPath, u64)>, Vec<Entry>);
+/// The mtime of every path of `W` and the mode of every file of `W`, both
+/// sorted by path, and an entry for every directory of `W`.
+type WorktreeMeta = (Vec<(RelPath, u64)>, Vec<(RelPath, Mode)>, Vec<Entry>);
 
 /// What the git half saw of the work tree, checked again once every file is stored.
 struct GitSeen {
@@ -2494,15 +2515,21 @@ impl GitCapture<'_> {
         })
     }
 
-    /// Reads the mtime of every path in `W`, reporting the links among
-    /// them that escape the root, and the mode and mtime of every
-    /// directory of `W`, from one listing of its tree.
+    /// Reads the mtime of every path in `W` and the mode of every file in
+    /// it, reporting the links among them that escape the root, and the
+    /// mode and mtime of every directory of `W`, from one listing of its
+    /// tree.
     ///
     /// `before` holds the stamps taken just before `git add -A` built `W`.
-    /// A path whose stamp differs now, or that had none, was written while
-    /// or after `W` was built, so `W` may hold older bytes than the mtime
-    /// recorded here; that fails with `WorkspaceChanged` instead of
-    /// publishing a snapshot that loses the edit.
+    /// A path whose stamp differs now, or that had none, was written or
+    /// changed mode while or after `W` was built, so `W` may hold older
+    /// bytes or another execute bit than recorded here; that fails with
+    /// `WorkspaceChanged` instead of publishing a snapshot that loses the
+    /// edit.
+    ///
+    /// A tree records only `100644` or `100755`, so a file kept at 0600,
+    /// such as a key committed by mistake, would come back readable by
+    /// others; each file's own bits travel (`blob_mode`, M2-04).
     ///
     /// A tree holds no metadata of its own directories, so restore would
     /// make each with the default mode and a fresh mtime, and a directory
@@ -2526,14 +2553,17 @@ impl GitCapture<'_> {
                 text: text.to_owned(),
             })?;
             let rel = rel_path(path)?;
-            if meta.split(' ').nth(1) == Some("tree") {
+            let mut fields = meta.split(' ');
+            let tree_mode = fields.next().unwrap_or_default();
+            if fields.next() == Some("tree") {
                 trees.push(rel);
             } else {
-                paths.push(rel);
+                paths.push((rel, tree_mode));
             }
         }
         let mut mtimes = Vec::with_capacity(paths.len());
-        for rel in paths {
+        let mut modes = Vec::with_capacity(paths.len());
+        for (rel, tree_mode) in paths {
             let full = self.root.join(rel.as_str());
             let meta = match fs::symlink_metadata(&full) {
                 Ok(meta) => meta,
@@ -2551,10 +2581,17 @@ impl GitCapture<'_> {
                     report.escaping_symlinks.push(rel.clone());
                 }
             }
+            // A link's and a submodule's bits are never applied.
+            match tree_mode {
+                "100644" => modes.push((rel.clone(), blob_mode(meta.mode(), false))),
+                "100755" => modes.push((rel.clone(), blob_mode(meta.mode(), true))),
+                _ => {}
+            }
             let mtime = mtime_ns(&meta, &rel)?;
             mtimes.push((rel, mtime));
         }
         mtimes.sort_by(|a, b| a.0.cmp(&b.0));
+        modes.sort_by(|a, b| a.0.cmp(&b.0));
         let mut dirs = Vec::with_capacity(trees.len());
         for rel in trees {
             let full = self.root.join(rel.as_str());
@@ -2573,7 +2610,7 @@ impl GitCapture<'_> {
                 kind: EntryKind::Dir,
             });
         }
-        Ok((mtimes, dirs))
+        Ok((mtimes, modes, dirs))
     }
 
     /// Lists the paths of every stash entry in `stashes` and of their index and untracked parents that `denies` names.
@@ -3046,7 +3083,7 @@ fn capture_git(
     let RefView { refs, head } = view;
     capturer.report.stashed_secrets =
         repo.stashed_secrets(&stashes, &|rel| policy.denies_anywhere(rel))?;
-    let (worktree_mtimes, dirs) =
+    let (worktree_mtimes, worktree_modes, dirs) =
         repo.worktree_meta(&worktree_commit, &before, &mut capturer.report)?;
     let config = repo.config(&mut capturer.report);
     let exclude_path = &repo.layout.info_exclude;
@@ -3070,7 +3107,7 @@ fn capture_git(
         index_commit,
         worktree_commit,
         worktree_mtimes,
-        worktree_modes: Vec::new(),
+        worktree_modes,
         config,
         exclude,
     };
@@ -3239,6 +3276,45 @@ mod tests {
             repo.worktree_meta(&w, &before, &mut report),
             Err(CaptureError::WorkspaceChanged { path }) if path.as_str() == "a.txt"
         ));
+    }
+
+    /// A chmod after `W` was built changes the mode the snapshot records,
+    /// which may no longer be the execute bit `W` holds (M2-04).
+    #[test]
+    fn a_file_chmodded_after_w_was_built_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        fs::create_dir(&root).unwrap();
+        let policy = IgnorePolicy::default();
+        let repo = new_repo(&root, dir.path(), &policy);
+        fs::write(root.join("a.txt"), "before\n").unwrap();
+        fs::set_permissions(root.join("a.txt"), fs::Permissions::from_mode(0o600)).unwrap();
+        repo.git.run(&["add", "a.txt"]).unwrap();
+        repo.git.run(&["commit", "-q", "-m", "one"]).unwrap();
+        let w = repo.head_commit().unwrap().unwrap();
+        let paths = [rel("a.txt")];
+        let before = stamps(&root, paths.iter()).unwrap();
+        let mut report = CaptureReport::default();
+        let (_, modes, _) = repo.worktree_meta(&w, &before, &mut report).unwrap();
+        assert_eq!(modes, vec![(rel("a.txt"), Mode::from_masked(0o600))]);
+        fs::set_permissions(root.join("a.txt"), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(
+            repo.worktree_meta(&w, &before, &mut report),
+            Err(CaptureError::WorkspaceChanged { path }) if path.as_str() == "a.txt"
+        ));
+    }
+
+    /// The execute bits of a file of `W` follow the tree, which records
+    /// only the owner's; the other bits are the file's own.
+    #[test]
+    fn a_blob_mode_agrees_with_the_tree() {
+        assert_eq!(blob_mode(0o100_600, false).bits(), 0o600);
+        assert_eq!(blob_mode(0o100_750, true).bits(), 0o750);
+        assert_eq!(blob_mode(0o100_644, true).bits(), 0o755);
+        assert_eq!(blob_mode(0o100_640, true).bits(), 0o750);
+        assert_eq!(blob_mode(0o100_755, false).bits(), 0o644);
+        assert_eq!(blob_mode(0o100_4755, true).bits(), 0o755);
     }
 
     /// A flag set after `refuse_bad_states` probed the real index is refused on the copy `I` is built from.

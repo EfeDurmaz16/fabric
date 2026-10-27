@@ -2661,7 +2661,6 @@ fn untracked_work_the_core_carries_comes_back() {
 /// untracked file loses its group write. Each file of `W` keeps its own
 /// permission bits.
 #[test]
-#[ignore = "M2-04: expected failure until fixed"]
 fn a_file_of_the_working_tree_keeps_its_permission_bits() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("work");
@@ -2690,6 +2689,33 @@ fn a_file_of_the_working_tree_keeps_its_permission_bits() {
         let restored = fs::metadata(target.join(name)).unwrap().mode() & 0o777;
         assert_eq!(restored, mode, "{name}: {restored:o}");
     }
+}
+
+/// M2-04: a recorded mode whose owner execute bit is not the tree's would
+/// leave the file changed against the index on the target, so a manifest
+/// that holds one, which no capture writes, is refused before restore
+/// writes the working tree.
+#[test]
+fn a_mode_that_disagrees_with_the_tree_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    fs::set_permissions(root.join("a"), fs::Permissions::from_mode(0o644)).unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { mut manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let git = manifest.git.as_mut().unwrap();
+    assert_eq!(
+        git.worktree_modes,
+        vec![(RelPath::parse("a").unwrap(), Mode::new(0o644).unwrap())]
+    );
+    git.worktree_modes[0].1 = Mode::new(0o744).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    assert!(matches!(
+        restore_into(&store, snapshot, &target),
+        Err(RestoreError::ModeDisagreesWithTree { path, .. }) if path.as_str() == "a"
+    ));
 }
 
 /// M2-05 (issue #21): no entry records the workspace root itself, so a

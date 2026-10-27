@@ -231,6 +231,18 @@ pub enum RestoreError {
         /// Bytes the entry records.
         size: u64,
     },
+    /// A file of the working-tree commit has a recorded mode whose owner
+    /// execute bit is not the one its tree entry records (`100755` or
+    /// `100644`). Capture makes the two agree, so only a manifest no
+    /// capture wrote holds this; written, the file would differ from the
+    /// index on the target.
+    #[error("{path}: the recorded mode {mode:?} and the tree disagree on the execute bit")]
+    ModeDisagreesWithTree {
+        /// The path.
+        path: RelPath,
+        /// The mode the manifest records.
+        mode: Mode,
+    },
     /// A symlink in the working-tree commit has a target longer than any filesystem allows.
     #[error("{path}: symlink target is {size} bytes")]
     SymlinkTooLong {
@@ -1039,6 +1051,39 @@ impl WorkCounter {
     }
 }
 
+/// The mode each file of `W` is written with: the one `worktree_modes`
+/// records (M2-04), or for a path it does not name, as in a format version
+/// 2 manifest, 0644 or 0755 as the tree entry says.
+///
+/// A recorded mode is written as it is, so its owner execute bit must be
+/// the one the tree records; capture makes them agree, and a manifest
+/// where they differ is refused here, before any file is written.
+fn file_modes<'i>(
+    items: &'i [TreeItem],
+    recorded: &[(RelPath, Mode)],
+) -> Result<HashMap<&'i RelPath, Mode>, RestoreError> {
+    let mut modes = HashMap::with_capacity(items.len());
+    for item in items {
+        let executable = match item.mode {
+            TreeMode::File => false,
+            TreeMode::Exec => true,
+            TreeMode::Symlink | TreeMode::Gitlink => continue,
+        };
+        let mode = match recorded.binary_search_by(|(p, _)| p.cmp(&item.rel)) {
+            Ok(index) => recorded[index].1,
+            Err(_) => Mode::from_masked(if executable { 0o755 } else { 0o644 }),
+        };
+        if mode.owner_executable() != executable {
+            return Err(RestoreError::ModeDisagreesWithTree {
+                path: item.rel.clone(),
+                mode,
+            });
+        }
+        modes.insert(&item.rel, mode);
+    }
+    Ok(modes)
+}
+
 /// Restores the repository: objects, refs, `HEAD`, the index and the working tree.
 fn restore_git(
     store: &Store,
@@ -1072,6 +1117,7 @@ fn restore_git(
         .iter()
         .map(|(p, t)| (p, *t))
         .collect();
+    let modes = file_modes(&items, &git_state.worktree_modes)?;
     let mut blobs: Vec<&TreeItem> = Vec::with_capacity(items.len());
     for item in &items {
         if item.mode == TreeMode::Gitlink {
@@ -1100,12 +1146,11 @@ fn restore_git(
                 symlinks.push((item, target));
             }
             TreeMode::File | TreeMode::Exec | TreeMode::Gitlink => {
-                let bits = if item.mode == TreeMode::Exec {
-                    0o755
-                } else {
-                    0o644
-                };
-                let mut file = writer.create_file(&item.rel, Mode::from_masked(bits))?;
+                let mode = modes
+                    .get(&item.rel)
+                    .copied()
+                    .unwrap_or(Mode::from_masked(0o644));
+                let mut file = writer.create_file(&item.rel, mode)?;
                 let written = io::copy(body, &mut file).map_err(|e| io_err(path, e))?;
                 if written != size {
                     return Err(RestoreError::SizeMismatch {
