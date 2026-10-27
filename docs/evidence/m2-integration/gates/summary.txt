@@ -1,0 +1,43 @@
+== fmt: cargo fmt --all --check
+   rc=0 secs=0
+== clippy: cargo clippy --workspace --all-targets --locked -- -D warnings
+   rc=0 secs=8
+== clippy-feature-none: cargo clippy -p fabric-harness --all-targets --locked --no-default-features --features  -- -D warnings
+   rc=0 secs=3
+== clippy-feature-acp: cargo clippy -p fabric-harness --all-targets --locked --no-default-features --features acp -- -D warnings
+   rc=0 secs=1
+== clippy-feature-claude: cargo clippy -p fabric-harness --all-targets --locked --no-default-features --features claude -- -D warnings
+   rc=0 secs=2
+== clippy-feature-codex: cargo clippy -p fabric-harness --all-targets --locked --no-default-features --features codex -- -D warnings
+   rc=0 secs=1
+== test: cargo test --workspace --locked
+   rc=0 secs=206
+== e2e-ignored-list: cargo test --workspace --locked -- --list --ignored
+   rc=0 secs=4
+== doc: env RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --locked
+   rc=0 secs=5
+== deny: cargo deny check
+   rc=0 secs=1
+== hygiene: scripts/check-hygiene.sh origin/main
+   rc=0 secs=0
+== budgetcheck: scripts/check-budget.sh origin/main
+   rc=0 secs=0
+== test-hygiene: scripts/test-check-hygiene.sh
+   rc=0 secs=2
+== test-budget-script: scripts/test-check-budget.sh
+   rc=0 secs=3
+== test-fixtures-script: scripts/test-check-fixtures.sh
+   rc=0 secs=8
+== fixtures: scripts/check-fixtures.sh origin/main
+   rc=0 secs=2
+== build-fabric: cargo build -p fabric --locked
+   rc=0 secs=8
+== sdk-install: bun install --frozen-lockfile
+   rc=0 secs=0
+== sdk-typecheck: bun run typecheck
+   rc=0 secs=0
+== sdk-build: bun run build
+   rc=0 secs=1
+== sdk-test: env FABRIC_BIN=/tmp/fabric-wt/m2/sdk/typescript/../../target/debug/fabric bun test
+   rc=0 secs=4
+DONE
