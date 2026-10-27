@@ -86,6 +86,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Placement.** Choosing which node runs a job. In this phase the user names it: `fabric job move --to` on the owner, or `fabric resume` on the node that wants it. The root is the recorded root.
 
+**Provider operation.** One effect a managed attempt asks a provider worker for over the bridge, such as creating a sandbox. The journal records it `dispatched` before the request is written, fenced on the job's current live attempt, and never sends its id or key twice (schema version 2, `provider_operations`).
+
 **Restore.** Writing a snapshot into a fresh workspace on a node, or in place into a workspace whose marker says it holds only published bytes. No path rewrites, because the root is the same on every node.
 
 **Root.** The absolute path of a job's workspace. Recorded in every snapshot manifest and used as the target path on every node, so nothing inside the workspace or the harness state needs rewriting. `~/fabric/jobs/<job-id>/work` for a job made with `--new`; the adopted checkout's own path otherwise.

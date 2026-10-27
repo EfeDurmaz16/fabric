@@ -31,6 +31,8 @@ crates/
   fabric-harness   Harness trait, ACP adapter, Claude Code adapter, Codex adapter
   fabric-env       EnvSpec detection, the .fabric/env.toml override file, materialization
   fabric-client    the client API: typed requests, replies, events and refusals as JSON on the control socket, and a Rust client
+  fabric-journal   the managed authority's journal: jobs, operations, events, and the provider operations of the bridge
+  fabric-bridge    the provider bridge (ADR 0021): protocol v1 messages and frames, a client that runs a worker over stdio and records each effect in the journal first, and a Rust test double worker
   fabricd          the node: state directory lock, ledger files, store owner, peer service, move protocol, doctor facts and carry keys, control socket
   fabric           the `fabric` binary: serve, node, job new, run, suspend, resume, move, steal, status, log, approve, reject, doctor
 sdk/

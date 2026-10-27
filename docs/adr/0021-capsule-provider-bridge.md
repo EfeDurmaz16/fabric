@@ -56,6 +56,14 @@ The first provider proof is a capability-profile contract. A deterministic, stat
 
 - Fabric gains a provider seam without a new runtime dependency; the worker is optional and a node without it runs managed jobs on itself as in M2.
 - Two implementations must agree on one byte-exact fixture set, and a protocol change is a linked pair of pull requests.
-- `ResourceRef` gains a provider form in the implementation step, an open tagged object an older reader refuses (docs/managed-jobs.md).
+- `ResourceRef` gains a provider form when placement can choose a provider for an attempt, an open tagged object an older reader refuses (docs/managed-jobs.md). The M3 client does not need it: a provider operation names the attempt it acts for, and the attempt keeps its own resource.
 - The worker artifact must be proven outside the repository without Node, Bun or pnpm on `PATH` (draft P10 acceptance); that proof and the round-trip and spawn latency measurements belong to the implementation commits of M3, not to this ADR.
 - Reconciliation, cleanup authorization after cancellation and attach (draft P11) stay later work. v1 carries the identities and answers they need.
+
+## Implementation notes (M3 client)
+
+- The client is the crate `fabric-bridge`; its behavior per answer is in docs/bridge-protocol.md, "Fabric's client as built".
+- A bridge effect is a provider operation in its own journal table, `provider_operations` (schema version 2), not a new command kind. Version 1's `operations` table checks its `kind` and `status` against fixed lists, which SQLite changes only by rebuilding a table that `attempts` and `events` reference, and it ties `rejected` to an operation that was never accepted, while the bridge records `rejected` after dispatch when the worker refuses before effect. The new table shares the key and id space of `operations`, names the job, task, attempt and generation it was fenced on, and is recovered like an operation: `dispatched` becomes `unknown` on restart.
+- The journal stores the worker's locator as the JSON text it came in and never parses it. Fabric reads only the capability profile.
+- The Rust test double (`src/bin/double.rs`) parses with the crate's worker-side parser, so it refuses as the protocol says; it is test infrastructure, not a provider.
+- Measured on the double, with raw samples in docs/evidence/m3-bridge: a worker spawned with its handshake answered, one request round trip with an in-memory log, and with the journal's two committed writes. The worker artifact proof outside the repository, the Linux artifact on CI and the Docker smoke belong to the Capsule worker and stay open for P10 acceptance.

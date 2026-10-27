@@ -345,6 +345,47 @@ Then update the pinned manifest digest in `crates/fabric-client/tests/bridge_fix
 
 Bridge protocol v1 is independent of the client API version (ADR 0018). Within v1, fixtures only grow: a new action, a new profile or a new optional field arrives with new fixtures and keeps every existing fixture byte-identical. A changed or removed fixture, a new `reject` case for a value v1 accepted, a new error code, or a raised limit is v2. `hello_refused` and its fixtures never change. A profile's own `version` moves when its action table changes meaning.
 
+## Fabric's client as built (M3)
+
+`crates/fabric-bridge` is Fabric's side: `wire` (every message, its parser and its encoder), `frames` (the framing above), and `Bridge`, the client. It records into the managed journal through `OperationLog`; schema version 2 adds `provider_operations` for this (docs/managed-jobs.md). The failure rules above become these behaviors, each pinned by a test in `crates/fabric-bridge/tests`.
+
+### Before anything is written
+
+| Check | When it fails | Journal |
+| --- | --- | --- |
+| Worker gone, bridge shutting down, `max_in_flight` reached | `Lost`, `ShuttingDown`, `Busy` | nothing; the operation may be sent later |
+| Action not in the negotiated profile, a limit over the profile's (deadline, argv, stdin, output), a target that does not fit the profile, a frame over `max_request_bytes` | `RefusedLocally` with the code and reason the worker would answer | `rejected`, nothing written |
+| The journal already holds the key or the id | `Log(Used)` | unchanged; nothing is ever sent twice |
+| The attempt is not the job's current live grant at its generation, or the job is closed | `Log(Fenced)` | nothing |
+| Otherwise | the operation is committed `dispatched`, then the frame is written | `dispatched` |
+
+`operation.digest` is the caller's: a node computes it with `wire::request_digest`, blake3 under the domain `fabric.bridge.request.v1` over the canonical JSON (keys sorted) of the request without `type`, `request_id`, `operation` and `deadline_ms`. The client sends what it is given and the journal keeps it.
+
+### Answers
+
+| Answer to a `request` | Journal |
+| --- | --- |
+| `result` `completed` / `cancelled` | `succeeded` / `cancelled`, with the locator |
+| `result` `accepted` / `running` (not terminal-only) | stays `dispatched`, with the locator |
+| `result` not terminal on a terminal-only action, an answer under another operation id, any `protocol_violation`, `protocol_error`, a refused frame, end of stdout | the worker is lost and terminated (stdin closed, SIGTERM, SIGKILL after the grace); every outstanding operation is `unknown` |
+| `error` `invalid`, `unsupported`, `denied`, `unavailable` | `rejected` |
+| `error` `provider_failed` | `failed`, with the locator when `applied` |
+| `error` `pending` | stays `dispatched`, with the answer and the locator |
+| `error` `unknown` | `unknown`, with the best known locator |
+| `progress` | the locator is stored; the status stays |
+| no answer within `deadline_ms` plus the grace (2 s by default) | `unknown`; a later answer is dropped unread |
+
+`observe` is sent only for an operation the journal holds as `dispatched` or `unknown`, by its original id, and only for an action the profile observes within its `max_observe_wait_ms`; otherwise it is refused before sending and the journal is unchanged. Its `result` moves the operation to `succeeded` or `cancelled`, `unknown` moves a `dispatched` one to `unknown`, `pending` stores the locator, and a refused or failed observe changes nothing: it says nothing new about the operation it read. `cancel` of a request that is not outstanding is `not_found`, and of an action the profile does not cancel `unsupported`, both without a frame. A `cancel_ack` changes nothing in the journal. After `shutdown` new requests are refused before the journal is touched.
+
+### The fixtures from Fabric's side
+
+The scenario test runs every scenario against a scripted in-process worker and a real journal holding the fixtures' job, task and attempt. Each `send` is made through the client's API and the frame it writes must equal the fixture after Fabric's own request ids are mapped onto the fixture's. A `send` Fabric refuses itself must refuse with the code and reason, or the cancel state, of the `receive` the worker answers it with. Three kinds of `send` are never written by Fabric, and the worker's answer to them is only parsed; the Capsule run of the same fixtures still exercises them:
+
+- `duplicate_idempotency_key` r-2 and r-3, `secrets_deny_all_and_intersection` r-3 and `fresh_approval_required` r-2 repeat an operation id the journal already holds (r-3 and r-2 of the last two with a new key). Fabric never sends an operation twice; a worker must still answer a repeat as the fixture says.
+- `scope_retained` r-2 names job `...J2` with the task and attempt ids of job `...J1`. A journal cannot hold that scope, so Fabric fences it before any effect; the worker refuses it before any effect too (`owner_mismatch`).
+
+These are observations about the fixtures, not changes: v1's fixtures stay byte for byte as they are.
+
 ## Forward compatibility with reconciliation (draft P11)
 
 v1 already carries what M4 needs and promises nothing more: the journal's operation id and key on every request, the locator on every effect, `pending` and `unknown` as distinct answers, `observe` by original identity, labels on created resources and a per-profile `dedupe` statement. Automatic reconciliation, cleanup authorization after job cancellation and attach to a running execution are not v1 behaviors; a worker that does not support them says so through its profile.
