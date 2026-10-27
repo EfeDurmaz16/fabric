@@ -1,6 +1,6 @@
 # Managed jobs: identity, journal v1, operation states and replay
 
-Status: proposed with ADR 0019 and ADR 0020, 2026-10-27. This page is the M2 specification. It gives types and signatures only; bodies come with the implementation.
+Status: proposed with ADR 0019 and ADR 0020, 2026-10-27; implemented on the M2 branch the same day. This page is the M2 specification and records where the implementation differs from the first draft ("As built" notes below). The code is the authority on signatures: `crates/fabric-core/src/managed/`, `crates/fabric-journal/` and `crates/fabricd/src/authority.rs`.
 
 ## Identity
 
@@ -11,7 +11,7 @@ Status: proposed with ADR 0019 and ADR 0020, 2026-10-27. This page is the M2 spe
 | `AttemptId` | ULID | authority, when it grants | One execution of one task on one resource under one generation. |
 | `OperationId` | ULID | authority, at commit | One accepted command. |
 | `OperationKey` | 1 to 128 bytes of `[A-Za-z0-9._:-]` | caller | The caller's name for one command; the dedupe key. A ULID is a good key. |
-| `RequestDigest` | 32 bytes | authority | blake3 of `"fabric.managed.command.v1\0"` followed by the command's canonical bytes. |
+| `RequestDigest` | 32 bytes | authority | blake3 of `"fabric.managed.command.v1\0"` followed by the canonical bytes of the envelope's job, expected revision and command (not the key). |
 | `WorkRevision` | u64, at least 1 | authority | Accepted changes to one job. Creation is revision 1. |
 | `Generation` | u64, at least 1 | authority | The fencing generation of the job's canonical execution domain. |
 | `EventSeq` | u64, at least 1 | journal | The global order of events in one journal. |
@@ -143,6 +143,17 @@ pub struct ManagedState { pub job: ManagedJob, pub tasks: Vec<Task>, pub attempt
 
 Codec: every `ManagedEvent` and `Command` encodes with the existing canonical postcard codec of ADR 0002 (`fabric_core::codec`, exact decode, re-encode compare), prefixed by a format byte `1`. An event's digest is blake3 of its frame.
 
+As built (fabric-core `managed`), where the code differs from the sketch above:
+
+- The digest covers the envelope's `job` and `expected` revision as well as the command, so the same key with another expected revision is a conflict, not a replay.
+- `ManagedEvent` has two more kinds. `CommandAccepted { operation, key, digest, kind }` opens every batch a command makes, so the history says which operation made which events and the operations' progress replays from events. `OperationMarked { operation, status }` records `dispatched`, an outcome or `unknown`.
+- `Attempt` records `granted_by: OperationId`; `ManagedState` also holds `operations: Vec<OperationProgress>`. A command without an effect (every one but `StartAttempt`) is `succeeded` once committed; a grant is `accepted` until it is dispatched.
+- `OperationStatus::Rejected` holds the `DomainError` itself, and `StoredResult` is `Accepted(AcceptedOperation) | Rejected(DomainError)`. `dedupe` returns `New`, `Replay` or `Conflict`; the journal reads the stored bytes.
+- The stored frame is `EventFrame { job, revision, operation, prev, at_ms, event }`: `prev` is inside the hashed bytes, so the chain covers every field.
+- `replay(job, &[(WorkRevision, ManagedEvent)])` takes each event with its revision; `apply_batch(state, revision, events)` folds one committed batch and is what both the journal and `replay` use. `mark_operation(state, operation, mark)` is the third rule function beside `accept_command` and `apply_observation`.
+- Every committed change, a command, an observation that changes something or an operation mark, takes the next revision. A report that repeats what the job holds changes nothing and writes nothing.
+- First grant is generation 1; each later grant is the latest plus one. `StartAttempt`, `FinishTask` and `CancelJob` wait while any attempt is `granted`, `running` or `unknown`. `DomainError` gained `UnknownJob`, `UnknownOperation`, `AttemptEnded`, `JobClosed`, `BadEnvelope`, `OperationState`, `Exhausted` and `Broken`.
+
 ## Journal adapter (`fabric-journal` crate, new, no new external dependency)
 
 ```rust
@@ -167,6 +178,8 @@ impl Journal {
 ```
 
 `fabricd` owns one `Journal` in an authority task and feeds it through a bounded channel; the control socket's managed ops send to that channel and wait for its answer. Nothing else opens the file.
+
+As built (fabric-journal): `Journal::create(path, authority, at_ms)`, `open(path)`, `schema_version()`, `authority()`, `submit(&envelope, ids) -> Answer { result, bytes, replayed }`, `observe(job, &observation, at_ms)`, `mark(job, operation, mark, at_ms)`, `job(job)`, `contains(job)`, `jobs()`, `operation(&key)`, `events(job, after, limit) -> Vec<StoredEvent>`, `verify() -> VerifyReport`, `recover(at_ms, probe) -> Recovery` and `backup_to(target)` (`VACUUM INTO`). `OpenError` is `NotAJournal`, `NewerSchema`, `Exists`, `Sqlite`, `Io`; `CommitError` is `Domain`, `Sqlite`, `Encode`, `Overflow`, `Corrupt`, `ProjectionMismatch`. The `SQLite` error stays opaque, as the store's does. `fabricd`'s authority is one OS thread fed by a bounded queue of 64 calls.
 
 ## Journal schema, version 1
 
@@ -271,12 +284,22 @@ CREATE TRIGGER evidence_append_only_delete BEFORE DELETE ON evidence
   BEGIN SELECT RAISE(ABORT, 'evidence is append-only'); END;
 ```
 
+As built, version 1 differs from the DDL above in these columns, and `crates/fabric-journal/src/schema.rs` is the text that ships:
+
+- `jobs.primary_task` checks `length = 16`.
+- `operations.kind` is checked against the five command kinds, gains `accepted_rev` (the revision the command was accepted at, NULL exactly when the operation is rejected) and an index on `(job_id, first_seq)`.
+- `tasks.kind` is `primary` or `child`, and `tasks.kind_body` holds the framed `TaskKind` with its label; an index on `(job_id, created_rev)`.
+- `attempts.resource` is the framed `ResourceRef` (a BLOB), `attempts.granted_by` references the granting operation, and `attempts.status_body` holds the framed `AttemptStatus`; `last_checkpoint` checks `length = 32`.
+- `events.revision` checks `>= 1`.
+- `evidence_id` is the first 16 bytes of the event's digest; an evidence row is written for a checkpoint (`ref` is the snapshot id) and for an attempt that exits (`ref` is the status).
+
 Rules the adapter keeps:
 
 - `events` is the history; `jobs`, `tasks`, `attempts` and the `status` of `operations` are projections, written in the same transaction as the events that change them. `verify` replays every job's events and compares the result with the projection.
 - An event's `prev_digest` is the `digest` of the job's previous event; the first event of a job has none. `verify` checks the chain.
 - `operations.result` holds the canonical bytes of the answer the caller got, so a replayed key gets the same bytes.
 - `UNIQUE (job_id, generation)` on `attempts` makes two grants at one generation impossible at the storage level, not only in the domain.
+- A projection row is written only by `write_transition`, which folds the events with the core's `apply_batch` in the same transaction.
 
 ### Versioning and migration
 
@@ -287,8 +310,8 @@ Rules the adapter keeps:
 
 ### Idempotency keys from command ids
 
-- The CLI makes a fresh ULID per invocation and passes it as the key; `--operation-key <key>` lets a script choose its own so a retry after a lost answer is the same command.
-- The client API takes `operation_key` as a required field on every managed op; the SDKs generate one when the caller gives none and expose it, so the caller can retry with it.
+- The CLI makes a fresh ULID per invocation and passes it as the key; `--operation-key <key>` lets a script choose its own so a retry after a lost answer is the same command. (Not wired yet: the CLI dispatch line in `crates/fabric/src/lib.rs` waits for group A's launch change, as the owner groups below say. The client API and both SDKs carry the key now.)
+- The client API takes `operation_key` as a required field on every managed op; the SDKs generate one when the caller gives none and expose it, so the caller can retry with it. As built the Rust client takes the key as an argument, and the TypeScript SDK takes `operationKey` and exports `newOperationKey()`; without one it makes a fresh key and the reply names it.
 - Keys are global to one journal in M2, since the only principal is the local owner. When remote principals arrive (draft P07) the key's scope becomes `(principal, key)` in a migration.
 - A key is kept as long as its job's events are kept. M2 deletes nothing.
 
@@ -324,7 +347,7 @@ Attempt status follows the same rule: `granted` (recorded, not started), `runnin
 1. On open the authority runs `verify`. A broken chain, an event that does not decode or a projection that disagrees stops the authority with an error naming the job; it does not repair or drop rows.
 2. An operation left `accepted` at restart is still accepted: the command was durable, and its dispatch is the next step, done once.
 3. An operation left `dispatched` at restart becomes `unknown` in a new event. It is not dispatched again.
-4. An attempt left `granted` or `running` at restart stays as it is until the executor reports or a stop is verified. The authority checks the recorded process group (as `local.rs` does for standalone harnesses): a group that is gone is `lost`; a group that still runs is `running`. Neither grants a new attempt.
+4. An attempt left `granted` or `running` at restart stays as it is until the executor reports or a stop is verified. The authority checks the recorded process group (as `local.rs` does for standalone harnesses): a group that is gone is `lost`; a group that still runs is `running`. Neither grants a new attempt. As built, `Journal::recover` takes the check as a probe; no attempt records a process group until an executor reports one (M3), so the daemon's probe answers "cannot tell" and attempts stay as they are.
 5. A worker loss is `lost` for the attempt, never `cancelled` for the task. The task stays open.
 6. A timeout is never permission to replay an operation or grant a replacement. A replacement attempt is a new `StartAttempt` command from the caller, accepted only when no attempt of the task may still run, and it gets the next generation.
 7. An observation at an older generation is recorded as `StaleObservationRefused` and changes nothing else.
@@ -337,16 +360,19 @@ Attempt status follows the same rule: `granted` (recorded, not started), `runnin
 - A state directory without `managed/journal.sqlite` behaves exactly as today; the journal is created by the first managed command, not by `fabric serve`.
 - M2 proves this with frozen fixtures: a state directory with standalone ledgers and snapshots made by the main branch before M2 (commit 176622e) opens, lists, suspends, moves and resumes under the M2 binary, and its files are byte-identical before and after a managed job is created beside it.
 
+As built: `fabric job ls` still lists standalone jobs only; managed jobs are listed by the client API's `managed_list` (the `job_list` reply belongs to `ops.rs`, group B, and the CLI subcommands wait for the dispatch line). A standalone op that names a managed job is refused as `managed_job`, and a managed op that names a standalone job as `standalone_job`. The fixture is `crates/fabricd/tests/fixtures/legacy-176622e`, made by the e2e generator with production code byte-identical to 176622e. It leaves out `node.key`, since a private key is not committed, so the node that opens it is a new node: the test opens, lists, reads the lease and the log, steals the job and restores its frozen snapshot whole, rather than suspending and moving it as its owner. Suspend and move of standalone jobs are covered unchanged by the existing e2e suite.
+
 ## M2 acceptance mapped to tests
 
 | Acceptance (roadmap M2) | Test |
 |---|---|
-| Authority restart preserves identity and progress | Create a managed job, grant an attempt, kill the daemon with `SIGKILL` at each journal fault point, restart: same `JobId`, same revision, attempt not re-granted, `dispatched` operations `unknown`. |
-| Duplicate command preserves identity | Submit the same key twice, before and after a restart: one operation, one event set, byte-identical answers. Same key, other body: `OperationConflict`. |
-| Launch before registration closed | R2 tests (`a_headless_launch_runs_nothing_until_it_is_released`, `the_trait_launch_holds_the_agent_until_it_is_released`) pass, plus a CLI `SIGKILL` between spawn and registration leaves no harness process. |
-| Fresh managed identity and replay | `replay(events) == projection` for every job after every test; property test over random command and observation sequences. |
-| Legacy compatibility | The frozen standalone fixture state directory above. |
-| Promotion separately gated | No command converts a standalone job; a test asserts a managed create of an id with a ledger is refused. |
+| Authority restart preserves identity and progress | Create a managed job, grant an attempt, kill the daemon with `SIGKILL` at each journal fault point, restart: same `JobId`, same revision, attempt not re-granted, `dispatched` operations `unknown`. As built: `fabric-journal` `crash_tests` (a child killed at `create.before_rename`, `submit.before_commit`, `submit.after_commit`, `dispatch.after_commit`), `tests::a_restart_keeps_identity_and_progress_and_makes_a_dispatch_unknown`, `fabricd` `authority::tests::a_restart_keeps_identity_progress_and_the_answer_to_a_key`, e2e `managed::e2e_a_managed_job_keeps_identity_and_progress_across_a_daemon_kill`. |
+| Duplicate command preserves identity | Submit the same key twice, before and after a restart: one operation, one event set, byte-identical answers. Same key, other body: `OperationConflict`. As built: `fabric-journal` `tests::a_duplicate_command_gets_the_same_identity_and_bytes_before_and_after_a_restart`, `tests::a_refusal_is_stored_under_its_key_and_changes_no_job`, e2e `managed::e2e_managed_refusals_are_kept_and_modes_stay_apart`, the TypeScript e2e `managed_create answers the same operation for the same key`. |
+| Crash between journal write and effect | As built: `crash_tests::a_dispatch_killed_between_its_commit_and_its_effect_is_never_replayed` and `a_grant_killed_between_its_commit_and_its_dispatch_is_dispatched_once`. |
+| Launch before registration closed (group A, not this core change) | R2 tests (`a_headless_launch_runs_nothing_until_it_is_released`, `the_trait_launch_holds_the_agent_until_it_is_released`) pass, plus a CLI `SIGKILL` between spawn and registration leaves no harness process. |
+| Fresh managed identity and replay | `replay(events) == projection` for every job after every test; property test over random command and observation sequences. As built: `fabric-core/tests/managed_rules.rs` (`replay_equals_projection` and the rule tests); `Journal::verify` replays every job in every journal test. |
+| Legacy compatibility | The frozen standalone fixture state directory above. As built: e2e `legacy::e2e_a_state_directory_from_main_loads_lists_and_resumes`, `fabricd` `authority::tests::legacy_state_from_main_is_untouched_by_a_managed_job_beside_it`; journal schema fixture `crates/fabric-journal/tests/fixtures/v1.sqlite` with `tests/fixtures.rs`. |
+| Promotion separately gated | No command converts a standalone job; a test asserts a managed create of an id with a ledger is refused. As built: the authority draws job ids until one has no standalone directory, and refuses any managed command naming a standalone job (`legacy_state_from_main_is_untouched...`, `e2e_managed_refusals_are_kept_and_modes_stay_apart`). No conversion command exists. |
 | No hot-path regression above 1.5x | `scripts/bench-m2.sh` before and after, same machine, raw runs kept; `budget::hot_paths` process counts unchanged. |
 
 ## Implementation owner groups
@@ -358,3 +384,5 @@ Disjoint files, so the groups can work in parallel; the defect register in `docs
 | G1 managed domain | `crates/fabric-core/src/managed/*`, `crates/fabric-core/src/lib.rs` (module line), `crates/fabric-core/tests/managed_*.rs` |
 | G2 journal | `crates/fabric-journal/*` (new crate, depends on `fabric-core` and the workspace `rusqlite`) |
 | G3 authority wiring | `crates/fabricd/src/authority.rs` (new), `crates/fabricd/src/control.rs`, `crates/fabricd/src/node.rs`, `crates/fabric-client/src/api.rs`, `protocol/*`, `sdk/typescript/src/*`, `crates/fabric/src/managed.rs` (new). The one dispatch line for the managed subcommands in `crates/fabric/src/lib.rs` lands after group A's launch change, which owns that file. |
+
+As built, the core change also touched, each in one place: `crates/fabricd/src/ops.rs` (one dispatch arm sending the four managed ops to `crates/fabricd/src/managed.rs`), `crates/fabricd/src/error.rs` (the `NodeError::Managed` variant and its reason), `crates/fabric/src/render.rs` (the reply lines of the four ops), and `crates/fabric/tests/e2e/main.rs` (two module lines). The owners of those files keep them; the lines above are the only ones this change added.

@@ -2,6 +2,8 @@
 
 Status: accepted, 2026-10-21
 
+Amended 2026-10-27 by the M2 core change: api 1 gains the managed ops of ADR 0019, additively (see "Managed ops" under Consequences).
+
 Amended 2026-10-22 when main was merged into `feat/client-api`, before api 1 shipped: the client API took in what main added to the control socket, the launch check, the plan's ledger head, home and known writer, the carry decisions, the capture report and the refusals that came with them. See "Folded into api 1 before it shipped" under Compatibility.
 
 Supersedes the paragraph of ADR 0016 on the control socket's encoding (one request and one response, each a `u32` length and postcard bytes) and its Alternative 3, which rejected a JSON control protocol. Everything else in ADR 0016 stands: the socket's place and its owner-only trust, the exit codes, and the split of work between the node and the CLI.
@@ -191,6 +193,7 @@ C2 adds a live event stream and approvals from a phone. It builds on two things 
 - The CLI prints each step as it happens.
 - A change to the API shows up as a fixture change in review, and a client that does not follow fails its contract tests.
 - ADR 0016's paragraph on postcard frames and its Alternative 3 are history.
+- Managed ops (2026-10-27, ADR 0019 and ADR 0020): `managed_create { operation_key, repo, goal, harness }`, `managed_cancel { operation_key, job, expected_revision?, reason }`, `managed_status { job }` and `managed_list {}`, listed as capabilities after `launch_check`. Replies are `managed_create` and `managed_cancel` with `{ operation, operation_key, replayed, job }`, `managed_status` with the job's fields, and `managed_list { jobs, left_out? }`. Revisions and generations are decimal strings. New reasons: `managed_refused` (`job_state`), `operation_conflict`, `managed_unavailable`, `standalone_job` and `managed_job` (all `failed`). No existing fixture changed and `protocol/required.txt` only grew, so api 1 stays api 1; the ops are owner-only and local like every other op, and a remote API waits for draft P07.
 
 ## Open questions
 
