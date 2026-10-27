@@ -164,6 +164,26 @@ pub enum ProviderError {
     },
 }
 
+/// Keys are one space: a command whose key a provider operation holds is
+/// refused as `OperationConflict`, as one whose key another command holds.
+pub(crate) fn refuse_provider_key(
+    conn: &rusqlite::Connection,
+    key: &OperationKey,
+) -> Result<(), CommitError> {
+    let used = conn
+        .query_row(
+            "SELECT 1 FROM provider_operations WHERE op_key = ?1",
+            [key.as_str()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if used {
+        return Err(DomainError::OperationConflict { key: key.clone() }.into());
+    }
+    Ok(())
+}
+
 impl Journal {
     /// Records a provider operation as `dispatched`, or as `rejected` with
     /// `refusal` when Fabric refused it before sending. Returns after
@@ -513,6 +533,25 @@ mod tests {
         assert!(matches!(
             f.journal.provider_begin(&command_id, None, 5),
             Err(CommitError::Provider(ProviderError::OperationUsed { .. }))
+        ));
+    }
+
+    /// Keys are one space: a command cannot take a provider operation's key.
+    #[test]
+    fn a_command_cannot_take_a_provider_key() {
+        let mut f = granted();
+        f.journal.provider_begin(&dispatch(1), None, 1).unwrap();
+        let envelope = crate::tests::envelope(
+            "p-1",
+            Some(JOB),
+            fabric_core::managed::Command::CancelJob {
+                reason: "late".into(),
+            },
+        );
+        let ids = f.ids();
+        assert!(matches!(
+            f.journal.submit(&envelope, ids),
+            Err(CommitError::Domain(DomainError::OperationConflict { .. }))
         ));
     }
 

@@ -378,6 +378,7 @@ impl Journal {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        provider::refuse_provider_key(&tx, &envelope.key)?;
         if let Some((stored_digest, bytes)) = tx
             .query_row(
                 "SELECT request_digest, result FROM operations WHERE op_key = ?1",
