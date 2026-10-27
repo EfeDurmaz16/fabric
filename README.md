@@ -74,6 +74,8 @@ Start a node on each Mac and leave it running (a terminal tab is enough):
 fabric serve            # listens on 0.0.0.0:7777; --wire tcp-tls if UDP is blocked
 ```
 
+Start `fabric serve` from the Mac's desktop session: a Terminal window there, or a launchd user agent. A daemon started over SSH cannot read the Claude Code login in the Keychain, so it reports no login, and `fabric doctor` says so.
+
 Pair them. Each prints its id with `fabric node id`.
 
 ```sh
