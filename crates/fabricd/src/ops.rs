@@ -5895,6 +5895,37 @@ pub(crate) mod tests {
         assert_eq!(job.lock().await.ledger().records().len(), 1);
     }
 
+    #[tokio::test]
+    async fn a_managed_create_whose_harness_arguments_hold_a_secret_is_never_recorded() {
+        let (dir, node) = node();
+        let token = format!("sk-ant-{}", "a".repeat(24));
+        let request = Request::ManagedCreate {
+            operation_key: fabric_core::managed::OperationKey::parse("create-secret").unwrap(),
+            repo: fabric_client::api::SystemPath::parse(
+                dir.path().canonicalize().unwrap().to_str().unwrap(),
+            )
+            .unwrap(),
+            goal: "goal".to_owned(),
+            harness: HarnessKind::Acp {
+                program: fabric_core::harness::ProgramName::parse("opencode").unwrap(),
+                args: vec!["--api-key".to_owned(), token.clone()],
+            },
+        };
+        let refused = node.managed(request).await;
+        assert!(
+            matches!(refused, Err(NodeError::HarnessConfig(_))),
+            "{refused:?}"
+        );
+        let managed = crate::authority::managed_dir(&node.cfg.state);
+        for entry in std::fs::read_dir(&managed).into_iter().flatten() {
+            let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+            assert!(
+                !bytes.windows(token.len()).any(|w| w == token.as_bytes()),
+                "the secret reached the journal"
+            );
+        }
+    }
+
     /// A log longer than one control answer can carry still answers, with
     /// the latest records and how many were left out.
     #[tokio::test]

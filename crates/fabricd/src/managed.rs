@@ -23,6 +23,7 @@ use fabric_journal::{Answer, CommitError};
 
 use crate::authority::AuthorityError;
 use crate::error::NodeError;
+use crate::harnesses::refuse_secret_kind;
 use crate::node::Node;
 
 /// The JSON bytes a list answer may use, half a frame as `job_list` uses.
@@ -113,6 +114,9 @@ impl Node {
                 goal,
                 harness,
             } => {
+                // As for a standalone job: a secret in an ACP argument is
+                // refused before the append-only journal records it.
+                refuse_secret_kind(&harness)?;
                 let envelope = Envelope {
                     key: operation_key,
                     job: None,
