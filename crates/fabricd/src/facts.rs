@@ -647,6 +647,14 @@ impl NodeFacts {
     }
 }
 
+/// Runs one measuring command and reads its answer, within `COMMAND_TIMEOUT`.
+///
+/// Only the standard output of an `Output` probe is a pipe, and it is
+/// read as it arrives ([`read_fact`]): the moment the value can no longer
+/// be a fact, the command is killed and gives none, so no tool can make
+/// this node hold more than one fact of its output (M2-13). An `ExitCode`
+/// probe's output and every probe's error output go to `/dev/null`, as
+/// nothing reads them.
 async fn probe_command(
     binary: &Path,
     args: &[&str],
@@ -666,30 +674,147 @@ async fn probe_command(
             None => command.env_remove(name),
         };
     }
-    let child = command
+    command
         .args(args)
         .env("PATH", path_var)
         .env("HOME", home)
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdout(match probe {
+            Probe::Output => Stdio::piped(),
+            Probe::ExitCode => Stdio::null(),
+        })
         .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .output();
+        .kill_on_drop(true);
     tracing::debug!(?binary, ?args, "measuring");
-    let output = tokio::time::timeout(COMMAND_TIMEOUT, child).await;
-    tracing::debug!(?binary, ?args, done = output.is_ok(), "measured");
-    let Ok(Ok(output)) = output else {
-        return None;
-    };
+    let answer = tokio::time::timeout(COMMAND_TIMEOUT, answer(command, probe)).await;
+    tracing::debug!(?binary, ?args, done = answer.is_ok(), "measured");
+    answer.ok().flatten()
+}
+
+/// Starts `command` and reads its answer as `probe` says. A command that
+/// could not start, or whose output cannot be a fact, gives none; the
+/// child is killed when it is dropped.
+async fn answer(mut command: tokio::process::Command, probe: Probe) -> Option<String> {
+    let mut child = command.spawn().ok()?;
     match probe {
-        Probe::ExitCode => Some(if output.status.success() { "yes" } else { "no" }.to_owned()),
-        Probe::Output => {
-            let text = String::from_utf8(output.stdout).unwrap_or_default();
-            let text = text.trim();
-            (output.status.success() && !text.is_empty() && text.len() <= MAX_FACT_VALUE)
-                .then(|| text.to_owned())
+        Probe::ExitCode => {
+            let status = child.wait().await.ok()?;
+            Some(if status.success() { "yes" } else { "no" }.to_owned())
         }
+        Probe::Output => {
+            let text = read_fact(child.stdout.take()?).await?;
+            child.wait().await.ok()?.success().then_some(text)
+        }
+    }
+}
+
+/// Reads a probe's standard output to its end and returns it trimmed, or
+/// `None` once it cannot be a fact: not UTF-8, nothing but whitespace, or
+/// longer than `MAX_FACT_VALUE` bytes once trimmed (`str::trim`, kept
+/// whole otherwise). It stops at the first byte that makes the value too
+/// long, and keeps at most `MAX_FACT_VALUE` bytes of it meanwhile.
+async fn read_fact(mut out: impl tokio::io::AsyncRead + Unpin) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut fact = Trimmed::default();
+    let mut buf = [0u8; 4096];
+    loop {
+        match out.read(&mut buf).await.ok()? {
+            0 => return fact.finish(),
+            n => fact.feed(&buf[..n])?,
+        }
+    }
+}
+
+/// A fact's text as its bytes arrive: from the first character that is
+/// not whitespace on, with the whitespace after the last such character
+/// kept only while it could still end up inside the value.
+#[derive(Debug, Default)]
+struct Trimmed {
+    /// The value so far and, while they fit, the whitespace after it.
+    text: String,
+    /// The value's length: up to its last character that is not whitespace.
+    end: usize,
+    /// `end` plus every byte of whitespace after it, kept or not.
+    len: usize,
+    /// The first bytes of a character the previous read split.
+    split: [u8; 4],
+    /// How many of them.
+    split_len: usize,
+}
+
+impl Trimmed {
+    /// Takes the next bytes read; `None` once the value cannot be a fact.
+    fn feed(&mut self, mut bytes: &[u8]) -> Option<()> {
+        while self.split_len > 0 {
+            let Some((&byte, rest)) = bytes.split_first() else {
+                return Some(());
+            };
+            bytes = rest;
+            let mut split = self.split;
+            split[self.split_len] = byte;
+            match std::str::from_utf8(&split[..=self.split_len]) {
+                Ok(whole) => {
+                    self.split_len = 0;
+                    self.take(whole)?;
+                }
+                Err(e) if e.error_len().is_none() => {
+                    self.split = split;
+                    self.split_len += 1;
+                }
+                Err(_) => return None,
+            }
+        }
+        let (text, tail) = match std::str::from_utf8(bytes) {
+            Ok(text) => (text, &[][..]),
+            Err(e) if e.error_len().is_none() => {
+                let (text, tail) = bytes.split_at(e.valid_up_to());
+                (std::str::from_utf8(text).ok()?, tail)
+            }
+            Err(_) => return None,
+        };
+        self.take(text)?;
+        self.split[..tail.len()].copy_from_slice(tail);
+        self.split_len = tail.len();
+        Some(())
+    }
+
+    /// Takes whole characters.
+    fn take(&mut self, text: &str) -> Option<()> {
+        let text = if self.end == 0 {
+            text.trim_start()
+        } else {
+            text
+        };
+        let core = text.trim_end().len();
+        if core > 0 {
+            // Whitespace that was not kept put `len` past the cap already.
+            if self.len + core > MAX_FACT_VALUE {
+                return None;
+            }
+            if self.text.capacity() == 0 {
+                // One allocation for a value that arrives in one read.
+                self.text.reserve(text.len().min(MAX_FACT_VALUE));
+            }
+            self.text.push_str(&text[..core]);
+            self.end = self.text.len();
+            self.len = self.end;
+        }
+        let gap = &text[core..];
+        self.len += gap.len();
+        if self.end > 0 && self.len <= MAX_FACT_VALUE {
+            self.text.push_str(gap);
+        }
+        Some(())
+    }
+
+    /// The value, once the output ended.
+    fn finish(mut self) -> Option<String> {
+        (self.split_len == 0 && self.end > 0).then(|| {
+            self.text.truncate(self.end);
+            self.text
+        })
     }
 }
 
@@ -1363,6 +1488,124 @@ pub(crate) mod tests {
         std::fs::write(&session, "Background\n").unwrap();
         std::fs::remove_file(&keychain).unwrap();
         assert_eq!(measured().await, (None, vec![]), "no login keychain");
+    }
+
+    /// M2-13: a probe reads its output as it arrives and stops once the
+    /// value passes what a fact holds, instead of buffering all of it
+    /// first, so a tool that prints far more than `MAX_FACT_VALUE` costs
+    /// this node no more memory than a fact: it is stopped before it gets
+    /// to write the rest, and gives no fact. The tool's other command
+    /// still gives its own.
+    #[tokio::test]
+    async fn a_probe_stops_reading_once_its_output_passes_what_a_fact_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = CountingTools::only(dir.path(), &[]);
+        let finished = dir.path().join("finished");
+        tools.install(
+            "node",
+            &format!(
+                "case \"$1\" in --version) head -c 16777216 /dev/zero | tr '\\0' 7; touch '{}' ;; -p) echo 127 ;; esac",
+                finished.display()
+            ),
+        );
+        let started = std::time::Instant::now();
+        let facts = NodeFacts::measure(dir.path(), &tools.env, Probes::NONE.with(Tool::Node)).await;
+        assert_eq!(facts.get(name::NODE), None);
+        assert_eq!(facts.get(name::NODE_ABI), Some("127"));
+        assert!(
+            !finished.exists(),
+            "the probe read all 16 MiB the tool printed"
+        );
+        assert!(started.elapsed() < COMMAND_TIMEOUT / 2);
+    }
+
+    /// What a probe's whole output gave before M2-13, when it was read to
+    /// its end first: the text trimmed, if UTF-8, not empty and short enough.
+    fn whole_output(bytes: &[u8]) -> Option<String> {
+        let text = std::str::from_utf8(bytes).ok()?.trim();
+        (!text.is_empty() && text.len() <= MAX_FACT_VALUE).then(|| text.to_owned())
+    }
+
+    fn fed(pieces: &[&[u8]]) -> Option<String> {
+        let mut fact = Trimmed::default();
+        for piece in pieces {
+            fact.feed(piece)?;
+        }
+        fact.finish()
+    }
+
+    /// Read as it arrives, an output gives the value it gave read whole,
+    /// however the reads split it: inside a character, inside the
+    /// whitespace around the value, or one byte at a time. Whitespace is
+    /// Unicode's, as `str::trim` reads it, and only the value counts
+    /// against `MAX_FACT_VALUE`, not the whitespace around it.
+    #[test]
+    fn a_fact_read_as_it_arrives_is_the_fact_read_whole() {
+        let max = MAX_FACT_VALUE;
+        let x = |n: usize| "x".repeat(n);
+        let cases: Vec<Vec<u8>> = [
+            "v22.23.2\n".to_owned(),
+            String::new(),
+            " \t\n".to_owned(),
+            " a b \n".to_owned(),
+            "\u{3000}x\u{a0}y\u{3000}\n".to_owned(),
+            "é 日本 𝔘\n".to_owned(),
+            format!("{}\n", x(max)),
+            format!("\n{}", x(max)),
+            x(max + 1),
+            format!("{} y", x(max - 2)),
+            format!("{} y", x(max - 3)),
+            format!("{}{}", x(max), " ".repeat(10_000)),
+            format!("{}x", " ".repeat(10_000)),
+            format!("x{}y", " ".repeat(max)),
+            format!("{}é", x(max - 1)),
+        ]
+        .into_iter()
+        .map(String::into_bytes)
+        .chain([
+            b"\xff".to_vec(),
+            b"ok\xe6\x97".to_vec(),
+            b"\xe6\x97\xa5 \xe6".to_vec(),
+            b"x\x80y".to_vec(),
+        ])
+        .collect();
+        for case in &cases {
+            let expected = whole_output(case);
+            assert_eq!(fed(&[case]), expected, "{case:?} in one read");
+            let bytes: Vec<&[u8]> = case.chunks(1).collect();
+            assert_eq!(fed(&bytes), expected, "{case:?} a byte at a time");
+            if case.len() <= 64 {
+                for at in 0..=case.len() {
+                    let (a, b) = case.split_at(at);
+                    assert_eq!(fed(&[a, b]), expected, "{case:?} split at {at}");
+                }
+            }
+        }
+    }
+
+    /// A reader that counts the bytes it hands out of an endless stream.
+    struct Endless(usize);
+
+    impl tokio::io::AsyncRead for Endless {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let n = buf.remaining();
+            buf.put_slice(&vec![b'7'; n]);
+            self.0 += n;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// An output that never ends is read only until it passes what a fact
+    /// holds: one read past `MAX_FACT_VALUE` at most.
+    #[tokio::test]
+    async fn an_endless_output_is_read_only_until_it_cannot_be_a_fact() {
+        let mut endless = Endless(0);
+        assert_eq!(read_fact(&mut endless).await, None);
+        assert!(endless.0 <= 2 * MAX_FACT_VALUE, "read {} bytes", endless.0);
     }
 
     /// Every fact a node can measure, as a rich node would answer.
