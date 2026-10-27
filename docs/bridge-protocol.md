@@ -386,6 +386,33 @@ The scenario test runs every scenario against a scripted in-process worker and a
 
 These are observations about the fixtures, not changes: v1's fixtures stay byte for byte as they are.
 
+### Against the Capsule worker
+
+`crates/fabric-bridge/tests/capsule_worker.rs` runs Fabric's side against the real worker built from Capsule's `packages/bridge-worker`, over the worker's own stdio. Its tests are ignored by default, because the worker is built from another repository:
+
+```sh
+# in a Capsule checkout
+pnpm install --frozen-lockfile
+pnpm --filter "@capsule-sdk/bridge-worker..." run build
+# here
+CAPSULE_BRIDGE_WORKER=<capsule>/packages/bridge-worker/dist/bin.js \
+  cargo test -p fabric-bridge --test capsule_worker -- --ignored
+```
+
+| Test | What it proves |
+| --- | --- |
+| every shared scenario over the worker's stdio | each scenario's `send` written with Fabric's framing, each answer read under Fabric's caps, parsed by Fabric's parser and equal to the fixture except `message` strings; kills, restarts and exit statuses are real. `provider_calls`, `sandbox` and `journal` steps belong to the other two runs, and `pending_destroy_with_locator` stops at its `advance`, because settling is the in-process provider's |
+| handshake | the worker sends the v1 fixture profile whole and lowers `max_in_flight` to 4; a hello for versions 2 to 3 is refused with `unsupported_version` |
+| create, exec, observe, destroy | each recorded `dispatched` before it is sent and `succeeded` after; a nonzero exit is a completed result; output is capped while captured; a create whose reply is lost is `unknown` until observed by its original id; destroy needs its own grant; every journal row keeps the full scoped locator |
+| refusals | policy, missing, out-of-scope and expired grants, another project, another job's sandbox and secrets (deny-all and intersection) each recorded `rejected` with effect `none` and no locator; an exec probe shows the refused create left nothing behind; an action outside the profile and an observe the profile does not serve are refused before anything is written |
+| a repeated key | refused by the journal before a frame is written, with the same operation id or another |
+| a killed worker | an exec in flight when the worker is killed stays `unknown` with the locator its progress reported; the job, attempt and generation do not change; the restarted worker is never sent the operation again; a create whose reply was lost is reconciled by `observe`, not created twice |
+| the Docker profile | with `CAPSULE_BRIDGE_DOCKER_IMAGE` naming an image the engine already holds: refusals leave no container, a missing image is a definite failure and is not pulled, the container carries the four `fabric.*` labels and the engine scope, an artifact is written and read back within `max_output_bytes`, a worker killed mid-exec leaves the container running and the exec running once after a restart, and destroy needs its own grant and is observed gone |
+
+CI builds the worker from a pinned Capsule commit and runs these tests on Linux (job `bridge-interop`). The Docker test skips there: no image is on the runner and nothing pulls one. `scripts/bench-bridge.sh` measures the same worker when `CAPSULE_BRIDGE_WORKER` is set.
+
+Two behaviors are not ruled by this text yet. The worker refuses `timeout_ms` and `max_output_bytes` of 0 as `invalid`/`limit`, while Fabric's parser accepts them, so Fabric sends such a request and records the worker's refusal as `rejected`; both are refusals before effect. Until the text rules on 0, Fabric does not refuse it locally.
+
 ## Forward compatibility with reconciliation (draft P11)
 
 v1 already carries what M4 needs and promises nothing more: the journal's operation id and key on every request, the locator on every effect, `pending` and `unknown` as distinct answers, `observe` by original identity, labels on created resources and a per-profile `dedupe` statement. Automatic reconciliation, cleanup authorization after job cancellation and attach to a running execution are not v1 behaviors; a worker that does not support them says so through its profile.
