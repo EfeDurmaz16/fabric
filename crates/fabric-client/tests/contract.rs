@@ -295,6 +295,11 @@ fn reason_variant(reason: &Reason) -> (Option<usize>, usize) {
             Reason::RootNotADirectory { .. },
             Reason::PlanOvertaken { .. },
             Reason::SessionMoved { .. },
+            Reason::ManagedRefused { .. },
+            Reason::OperationConflict { .. },
+            Reason::ManagedUnavailable,
+            Reason::StandaloneJob { .. },
+            Reason::ManagedJob { .. },
         ],
         Reason::Unrecognized
     )

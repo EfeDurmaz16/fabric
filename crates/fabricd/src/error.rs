@@ -45,6 +45,15 @@ pub enum NodeError {
     /// The control socket's path is longer than a Unix socket path may be.
     #[error("the control socket {0} is too long for a Unix socket; use a shorter FABRIC_HOME")]
     SocketPathTooLong(PathBuf),
+    /// The managed authority refused or failed a managed command, or a
+    /// standalone command named a managed job (ADR 0019).
+    #[error("{message}")]
+    Managed {
+        /// The typed reason.
+        reason: Box<Reason>,
+        /// What the CLI prints.
+        message: String,
+    },
     /// No job with this id is known on this node.
     #[error(
         "job {0} is not known on this node; run `fabric job resume {0} --on <node>` to pull it from the node that holds it"
@@ -437,6 +446,7 @@ impl NodeError {
     fn reason(&self) -> Reason {
         match self {
             NodeError::UnknownJob(job) => Reason::UnknownJob { job: *job },
+            NodeError::Managed { reason, .. } => (**reason).clone(),
             NodeError::NotOwner { job, owner, epoch } => Reason::NotOwner {
                 job: *job,
                 owner: *owner,

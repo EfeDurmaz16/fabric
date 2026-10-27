@@ -94,10 +94,6 @@ pub struct Node {
     /// for work no client asks for (ADR 0018, The client's environment).
     client_env: Mutex<Option<ClientEnv>>,
     /// The managed authority, the one writer of the managed journal (ADR 0020).
-    #[expect(
-        dead_code,
-        reason = "the managed ops of the client API read it from the next commit"
-    )]
     pub(crate) authority: crate::authority::Authority,
     _lock: File,
 }
@@ -393,13 +389,19 @@ impl Node {
     }
 
     /// The job's lock, if this node knows the job.
+    ///
+    /// A job only the managed authority holds is refused as a managed job,
+    /// so a standalone command never reads it as unknown and never acts on
+    /// it (ADR 0020); the authority is asked only on that path.
     pub(crate) async fn job(&self, id: JobId) -> Result<Arc<tokio::sync::Mutex<Job>>, NodeError> {
-        self.jobs
-            .lock()
-            .await
-            .get(&id)
-            .cloned()
-            .ok_or(NodeError::UnknownJob(id))
+        let found = self.jobs.lock().await.get(&id).cloned();
+        match found {
+            Some(job) => Ok(job),
+            None => Err(self
+                .managed_only(id)
+                .await
+                .unwrap_or(NodeError::UnknownJob(id))),
+        }
     }
 
     /// The node's environment, for work no client asked for, such as a

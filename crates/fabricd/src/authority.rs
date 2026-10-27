@@ -14,14 +14,6 @@
 //! jobs run as before. A managed job never takes an id a standalone job
 //! has, and a managed command never acts on a standalone job.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the managed ops of the client API call it from the next commit"
-    )
-)]
-
 use std::fs;
 use std::path::PathBuf;
 

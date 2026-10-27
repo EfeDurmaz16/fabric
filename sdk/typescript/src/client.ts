@@ -9,6 +9,7 @@
 
 import type { Stats } from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { createConnection, type Socket } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
 import type { z } from "zod";
@@ -49,7 +50,12 @@ import {
   type JobStatus,
   type KnownEvent,
   type Lease,
+  type ManagedJobs,
+  type ManagedOperation,
+  type ManagedStatus,
+  type Counter,
   type NodeId,
+  OperationKey,
   type NodeIdentity,
   type Paired,
   type PeerList,
@@ -306,6 +312,46 @@ export class FabricClient {
   async launchCheck(plan: RunPlan, options?: CallOptions): Promise<void> {
     const { job, epoch, head, harness, session } = plan;
     await this.call({ op: "launch_check", job, epoch, head, harness, session }, options);
+  }
+
+  /**
+   * Makes a managed job (ADR 0019). To retry safely after a lost answer,
+   * make a key with `newOperationKey()`, pass it as `operationKey` and
+   * pass it again on the retry: the node answers with the same job, never
+   * a second one. Without one, a fresh key is made and the reply names it.
+   */
+  managedCreate(
+    repo: SystemPath,
+    goal: string,
+    harness: Harness,
+    options: CallOptions & { readonly operationKey?: OperationKey } = {},
+  ): Promise<ManagedOperation> {
+    const operation_key = options.operationKey ?? newOperationKey();
+    return this.call({ op: "managed_create", operation_key, repo, goal, harness }, options);
+  }
+
+  /**
+   * Cancels a managed job none of whose attempts may still run, checking
+   * its revision when `expectedRevision` is given; the key as for `managedCreate`.
+   */
+  managedCancel(
+    job: JobId,
+    reason: string,
+    options: CallOptions & { readonly operationKey?: OperationKey; readonly expectedRevision?: Counter } = {},
+  ): Promise<ManagedOperation> {
+    const operation_key = options.operationKey ?? newOperationKey();
+    const expected_revision = options.expectedRevision;
+    return this.call({ op: "managed_cancel", operation_key, job, expected_revision, reason }, options);
+  }
+
+  /** One managed job. */
+  managedStatus(job: JobId, options?: CallOptions): Promise<ManagedStatus> {
+    return this.call({ op: "managed_status", job }, options);
+  }
+
+  /** Every managed job. */
+  managedList(options?: CallOptions): Promise<ManagedJobs> {
+    return this.call({ op: "managed_list" }, options);
   }
 
   /**
@@ -571,4 +617,9 @@ function notFound(error: unknown, socket: string): FabricError {
 
 function errorCode(error: unknown): string | undefined {
   return error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : undefined;
+}
+
+/** A fresh operation key: a random UUID, which the key alphabet holds. */
+export function newOperationKey(): OperationKey {
+  return OperationKey.parse(randomUUID());
 }

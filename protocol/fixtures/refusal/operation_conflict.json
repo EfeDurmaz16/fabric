@@ -1,0 +1,8 @@
+{
+  "kind": "failed",
+  "reason": {
+    "code": "operation_conflict",
+    "operation_key": "cancel-1"
+  },
+  "message": "operation key cancel-1 was used for another command"
+}

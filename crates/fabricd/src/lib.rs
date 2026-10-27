@@ -25,6 +25,7 @@ pub mod harnesses;
 mod job;
 mod ledger_file;
 mod local;
+mod managed;
 pub mod node;
 mod ops;
 pub mod paths;

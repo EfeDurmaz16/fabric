@@ -38,6 +38,10 @@ export const OPS = [
   "harness_session",
   "harness_exited",
   "launch_check",
+  "managed_create",
+  "managed_cancel",
+  "managed_status",
+  "managed_list",
 ] as const;
 
 /** The name of a request, which is also the kind of its reply. */
@@ -104,6 +108,36 @@ export type EnvSpecId = z.infer<typeof EnvSpecId>;
 /** The hash of one ledger record, which the next record links to. */
 export const RecordHash = z.string().regex(HEX_32, "not 64 lowercase hex digits").brand<"RecordHash">();
 export type RecordHash = z.infer<typeof RecordHash>;
+
+/** A task of a managed job (ADR 0019). */
+export const TaskId = z.string().regex(ULID, "not a ULID in its text form").brand<"TaskId">();
+export type TaskId = z.infer<typeof TaskId>;
+
+/** An attempt of a managed job's task. */
+export const AttemptId = z.string().regex(ULID, "not a ULID in its text form").brand<"AttemptId">();
+export type AttemptId = z.infer<typeof AttemptId>;
+
+/** One accepted managed command. */
+export const OperationId = z.string().regex(ULID, "not a ULID in its text form").brand<"OperationId">();
+export type OperationId = z.infer<typeof OperationId>;
+
+const OPERATION_KEY = /^[A-Za-z0-9._:-]{1,128}$/;
+
+/** The caller's name for one managed command, the key a node deduplicates on: a retry sends it again. */
+export const OperationKey = z.string().regex(OPERATION_KEY, "not an operation key").brand<"OperationKey">();
+export type OperationKey = z.infer<typeof OperationKey>;
+
+const COUNTER = /^[1-9][0-9]{0,19}$/;
+
+/**
+ * A revision or generation of a managed job: a canonical decimal string of
+ * at least 1 that fits a u64, so a reader never rounds it as a number.
+ */
+export const Counter = z
+  .string()
+  .refine((text) => COUNTER.test(text) && BigInt(text) <= 18_446_744_073_709_551_615n, "not a decimal counter")
+  .brand<"Counter">();
+export type Counter = z.infer<typeof Counter>;
 
 /** A session id a harness minted: safe in a file name and on a command line. */
 export const SessionId = z.string().regex(SESSION_ID, "not a session id").brand<"SessionId">();
@@ -412,6 +446,17 @@ const reasonOptions = [
   z.object({ code: z.literal("root_not_a_directory"), job: JobId, root: Path }),
   z.object({ code: z.literal("plan_overtaken"), job: JobId }),
   z.object({ code: z.literal("session_moved"), job: JobId }),
+  z.object({
+    code: z.literal("managed_refused"),
+    refusal: UnicodeText,
+    job: optional(JobId),
+    operation_key: OperationKey,
+    replayed: z.boolean(),
+  }),
+  z.object({ code: z.literal("operation_conflict"), operation_key: OperationKey }),
+  z.object({ code: z.literal("managed_unavailable") }),
+  z.object({ code: z.literal("standalone_job"), job: JobId }),
+  z.object({ code: z.literal("managed_job"), job: JobId }),
 ] as const;
 
 /** Every refusal reason this client knows, read from the schema. */
@@ -456,6 +501,7 @@ export const REASON_KIND: Readonly<Record<KnownReason["code"], RefusalKind>> = {
   root_not_a_directory: "job_state",
   plan_overtaken: "job_state",
   session_moved: "job_state",
+  managed_refused: "job_state",
   fork_behind: "failed",
   bad_address: "failed",
   peer: "failed",
@@ -474,6 +520,10 @@ export const REASON_KIND: Readonly<Record<KnownReason["code"], RefusalKind>> = {
   synced_root: "failed",
   bad_request: "failed",
   internal: "failed",
+  operation_conflict: "failed",
+  managed_unavailable: "failed",
+  standalone_job: "failed",
+  managed_job: "failed",
 };
 
 /**
@@ -880,6 +930,22 @@ export const Request = z.discriminatedUnion("op", [
     harness: RequestHarness,
     session: optional(SessionId),
   }),
+  z.object({
+    op: z.literal("managed_create"),
+    operation_key: OperationKey,
+    repo: SystemPath,
+    goal: Goal,
+    harness: RequestHarness,
+  }),
+  z.object({
+    op: z.literal("managed_cancel"),
+    operation_key: OperationKey,
+    job: JobId,
+    expected_revision: optional(Counter),
+    reason: UnicodeText,
+  }),
+  z.object({ op: z.literal("managed_status"), job: JobId }),
+  z.object({ op: z.literal("managed_list") }),
 ]);
 export type Request = z.infer<typeof Request>;
 export type RequestOf<K extends Op> = Extract<Request, { op: K }>;
@@ -916,6 +982,54 @@ const runPlan = {
   home: Path,
 };
 const lease = { owner: NodeId, epoch: Epoch };
+
+/** One task of a managed job; `state` is `open`, `succeeded`, `failed` or `cancelled`, and a newer node may send another. */
+export const ManagedTask = z.object({
+  task: TaskId,
+  parent: optional(TaskId),
+  label: optional(UnicodeText),
+  state: UnicodeText,
+});
+export type ManagedTask = z.infer<typeof ManagedTask>;
+
+/**
+ * One attempt of a managed job: `status` is `granted`, `running`,
+ * `succeeded`, `failed`, `cancelled`, `checkpointed`, `lost` or `unknown`,
+ * and a newer node may send another.
+ */
+export const ManagedAttempt = z.object({
+  attempt: AttemptId,
+  task: TaskId,
+  generation: Counter,
+  status: UnicodeText,
+  snapshot: optional(SnapshotId),
+});
+export type ManagedAttempt = z.infer<typeof ManagedAttempt>;
+
+/** The fields of a managed job (ADR 0019); `state` is `active`, `finished` or `cancelled`. */
+const managedJob = {
+  job: JobId,
+  revision: Counter,
+  generation: Counter,
+  state: UnicodeText,
+  goal: UnicodeText,
+  harness: Harness,
+  primary_task: TaskId,
+  tasks: z.array(ManagedTask),
+  attempts: z.array(ManagedAttempt),
+};
+
+/** A managed job as the client API shows it. */
+export const ManagedJob = z.object(managedJob);
+export type ManagedJob = z.infer<typeof ManagedJob>;
+
+/** The answer to a managed command: the same operation for every call with its key. */
+const managedOperation = {
+  operation: OperationId,
+  operation_key: OperationKey,
+  replayed: z.boolean(),
+  job: ManagedJob,
+};
 
 /** The result of a request; its kind is the request's op, and an unknown kind is an error. */
 export const Reply = z.discriminatedUnion("kind", [
@@ -960,6 +1074,11 @@ export const Reply = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("harness_session"), harness: Harness, session: SessionId }),
   z.object({ kind: z.literal("harness_exited") }),
   z.object({ kind: z.literal("launch_check") }),
+  z.object({ kind: z.literal("managed_create"), ...managedOperation }),
+  z.object({ kind: z.literal("managed_cancel"), ...managedOperation }),
+  z.object({ kind: z.literal("managed_status"), ...managedJob }),
+  /** `left_out` counts the oldest jobs left out so the rest fit in one answer; absent when none is. */
+  z.object({ kind: z.literal("managed_list"), jobs: z.array(ManagedJob), left_out: optional(count) }),
 ]);
 export type Reply = z.infer<typeof Reply>;
 export type ReplyTo<K extends Op> = Extract<Reply, { kind: K }>;
@@ -977,6 +1096,9 @@ export type Suspended = ReplyTo<"job_suspend">;
 export type Lease = ReplyTo<"job_move" | "job_steal">;
 export type Registered = ReplyTo<"harness_started">;
 export type SessionRecorded = ReplyTo<"harness_session">;
+export type ManagedOperation = ReplyTo<"managed_create" | "managed_cancel">;
+export type ManagedStatus = ReplyTo<"managed_status">;
+export type ManagedJobs = ReplyTo<"managed_list">;
 
 // The exchange.
 

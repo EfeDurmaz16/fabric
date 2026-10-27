@@ -159,6 +159,22 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
             .collect(),
         Reply::HarnessStarted(registered) => vec![self::registered(registered)],
         Reply::HarnessSession(recorded) => vec![session_recorded(recorded)],
+        Reply::ManagedCreate(operation) | Reply::ManagedCancel(operation) => {
+            let mut lines = fabric_client::sentences::managed_job(&operation.job);
+            if operation.replayed {
+                lines.push(format!(
+                    "operation {} answered again for key {}",
+                    operation.operation, operation.operation_key
+                ));
+            }
+            lines
+        }
+        Reply::ManagedStatus(job) => fabric_client::sentences::managed_job(job),
+        Reply::ManagedList(list) => list
+            .jobs
+            .iter()
+            .flat_map(fabric_client::sentences::managed_job)
+            .collect(),
         Reply::JobRun(_)
         | Reply::JobResume(_)
         | Reply::JobSuspend(_)

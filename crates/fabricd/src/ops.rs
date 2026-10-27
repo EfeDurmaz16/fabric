@@ -162,6 +162,10 @@ impl Node {
                 })
                 .await?,
             ),
+            request @ (Request::ManagedCreate { .. }
+            | Request::ManagedCancel { .. }
+            | Request::ManagedStatus { .. }
+            | Request::ManagedList) => self.managed(request).await?,
             Request::LaunchCheck {
                 job,
                 epoch,

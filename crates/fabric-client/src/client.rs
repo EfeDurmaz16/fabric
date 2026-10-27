@@ -13,14 +13,16 @@ use std::path::{Path, PathBuf};
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, JobId, NodeId};
+use fabric_core::managed::{OperationKey, WorkRevision};
 use fabric_core::session::SessionId;
 use fabric_core::version::HarnessVersion;
 use tokio::net::UnixStream;
 
 use crate::api::{
     API_VERSION, Answer, ClientEnv, Decision, DoctorReport, Event, Hello, HelloAnswer, JobCreated,
-    JobList, JobLog, JobStatus, Lease, NodeIdentity, Op, Paired, PeerList, Pong, Refusal,
-    Registered, Reply, Request, RunPlan, SessionRecorded, Suspended, SystemPath, Welcome,
+    JobList, JobLog, JobStatus, Lease, ManagedJob, ManagedJobs, ManagedOperation, NodeIdentity, Op,
+    Paired, PeerList, Pong, Refusal, Registered, Reply, Request, RunPlan, SessionRecorded,
+    Suspended, SystemPath, Welcome,
 };
 use crate::frame::{self, FrameError};
 
@@ -457,6 +459,74 @@ impl Client {
         match self.call(&request, on_event).await? {
             Reply::LaunchCheck => Ok(()),
             other => Err(unexpected(Op::LaunchCheck, &other)),
+        }
+    }
+
+    /// Makes a managed job (ADR 0019). `key` names the command: after a
+    /// lost answer, call again with the same key and the same arguments
+    /// and the node answers with the same job, never a second one.
+    pub async fn managed_create(
+        &self,
+        key: OperationKey,
+        repo: SystemPath,
+        goal: String,
+        harness: HarnessKind,
+        on_event: impl FnMut(Event),
+    ) -> Result<ManagedOperation, ClientError> {
+        let request = Request::ManagedCreate {
+            operation_key: key,
+            repo,
+            goal,
+            harness,
+        };
+        match self.call(&request, on_event).await? {
+            Reply::ManagedCreate(reply) => Ok(*reply),
+            other => Err(unexpected(Op::ManagedCreate, &other)),
+        }
+    }
+
+    /// Cancels a managed job none of whose attempts may still run; `key`
+    /// as for [`Client::managed_create`].
+    pub async fn managed_cancel(
+        &self,
+        key: OperationKey,
+        job: JobId,
+        expected_revision: Option<WorkRevision>,
+        reason: String,
+        on_event: impl FnMut(Event),
+    ) -> Result<ManagedOperation, ClientError> {
+        let request = Request::ManagedCancel {
+            operation_key: key,
+            job,
+            expected_revision,
+            reason,
+        };
+        match self.call(&request, on_event).await? {
+            Reply::ManagedCancel(reply) => Ok(*reply),
+            other => Err(unexpected(Op::ManagedCancel, &other)),
+        }
+    }
+
+    /// One managed job.
+    pub async fn managed_status(
+        &self,
+        job: JobId,
+        on_event: impl FnMut(Event),
+    ) -> Result<ManagedJob, ClientError> {
+        match self.call(&Request::ManagedStatus { job }, on_event).await? {
+            Reply::ManagedStatus(reply) => Ok(*reply),
+            other => Err(unexpected(Op::ManagedStatus, &other)),
+        }
+    }
+
+    /// Every managed job.
+    pub async fn managed_list(
+        &self,
+        on_event: impl FnMut(Event),
+    ) -> Result<ManagedJobs, ClientError> {
+        match self.call(&Request::ManagedList, on_event).await? {
+            Reply::ManagedList(reply) => Ok(reply),
+            other => Err(unexpected(Op::ManagedList, &other)),
         }
     }
 

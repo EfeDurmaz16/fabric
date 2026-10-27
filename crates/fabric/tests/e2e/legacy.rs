@@ -3,7 +3,8 @@
 //! at commit 176622e, opens under this binary, lists its job with its
 //! lease and its ledger, and the job can still be taken and resumed. The
 //! ledger's bytes from before are a prefix of the ledger after, so nothing
-//! old was rewritten, and its frozen snapshot restores whole.
+//! old was rewritten, and its frozen snapshot restores whole. A managed job
+//! made beside it changes none of its files.
 //!
 //! The fixture is frozen under `crates/fabricd/tests/fixtures/legacy-176622e`.
 //! `e2e_make_legacy_fixture` made it, and is kept to show how; it runs only
@@ -101,6 +102,29 @@ fn e2e_a_state_directory_from_main_loads_lists_and_resumes() -> Fallible {
     }
     assert_eq!(fs::read(&ledger)?, before, "reading rewrote the ledger");
 
+    // A managed job made beside the old one leaves every old file as it
+    // was, and the old job keeps its mode.
+    let jobs = node.state().join("jobs");
+    let objects = node.state().join("store/objects");
+    let old_files = (tree(&jobs)?, tree(&objects)?);
+    let client = fabric_client::Client::new(node.state().join("fabric.sock"));
+    let runtime = tokio::runtime::Runtime::new()?;
+    let made = runtime.block_on(client.managed_create(
+        fabric_core::managed::OperationKey::parse("legacy-neighbour")?,
+        fabric_client::api::SystemPath::parse(env.repo.to_str().ok_or("repo path")?)?,
+        "a managed neighbour".into(),
+        fabric_core::harness::HarnessKind::Codex,
+        |_| {},
+    ))?;
+    assert_ne!(made.job.job.to_string(), job);
+    assert_eq!((tree(&jobs)?, tree(&objects)?), old_files);
+    let refused = runtime.block_on(client.managed_status(job.parse()?, |_| {}));
+    assert!(
+        matches!(&refused, Err(fabric_client::ClientError::Refused(r))
+            if matches!(r.reason(), fabric_client::api::Reason::StandaloneJob { .. })),
+        "{refused:?}"
+    );
+
     // The owner of record is gone, so a steal takes the job. A resume
     // restores the frozen snapshot whole. The fixture's home is not this
     // test's home, so the job lands in the state directory and the fake
@@ -135,6 +159,23 @@ fn e2e_a_state_directory_from_main_loads_lists_and_resumes() -> Fallible {
     assert_eq!(fs::read_to_string(root.join("staged.txt"))?, "staged\n");
     assert!(!root.join(".env").exists(), "a secret file travelled");
     Ok(())
+}
+
+/// Every file under `root`, by path, with its bytes.
+fn tree(root: &Path) -> Fallible<std::collections::BTreeMap<PathBuf, Vec<u8>>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![root.to_owned()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.insert(path.strip_prefix(root)?.to_owned(), fs::read(&path)?);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Copies `from` into `to`, leaving out the top-level names in `skip`.

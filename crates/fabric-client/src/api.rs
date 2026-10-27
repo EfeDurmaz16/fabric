@@ -19,6 +19,10 @@ use std::path::{Path, PathBuf};
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{EnvSpecId, Epoch, EventId, JobId, MoveId, NodeId, RecordHash, SnapshotId};
+use fabric_core::managed::{
+    AttemptId, AttemptStatus, Generation, JobState, ManagedState, OperationId, OperationKey,
+    TaskId, TaskKind, TaskState, WorkRevision,
+};
 use fabric_core::session::SessionId;
 use fabric_core::version::HarnessVersion;
 use serde::{Deserialize, Serialize};
@@ -123,11 +127,19 @@ pub enum Op {
     HarnessExited,
     /// [`Request::LaunchCheck`].
     LaunchCheck,
+    /// [`Request::ManagedCreate`].
+    ManagedCreate,
+    /// [`Request::ManagedCancel`].
+    ManagedCancel,
+    /// [`Request::ManagedStatus`].
+    ManagedStatus,
+    /// [`Request::ManagedList`].
+    ManagedList,
 }
 
 impl Op {
     /// Every op of this api version.
-    pub const ALL: [Op; 19] = [
+    pub const ALL: [Op; 23] = [
         Op::NodeId,
         Op::NodeAdd,
         Op::NodeList,
@@ -147,6 +159,10 @@ impl Op {
         Op::HarnessSession,
         Op::HarnessExited,
         Op::LaunchCheck,
+        Op::ManagedCreate,
+        Op::ManagedCancel,
+        Op::ManagedStatus,
+        Op::ManagedList,
     ];
 
     /// The op's name on the wire: the request's `op` and the reply's `kind`.
@@ -172,6 +188,10 @@ impl Op {
             Op::HarnessSession => "harness_session",
             Op::HarnessExited => "harness_exited",
             Op::LaunchCheck => "launch_check",
+            Op::ManagedCreate => "managed_create",
+            Op::ManagedCancel => "managed_cancel",
+            Op::ManagedStatus => "managed_status",
+            Op::ManagedList => "managed_list",
         }
     }
 }
@@ -563,6 +583,47 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<SessionId>,
     },
+    /// Makes a managed job from a repository (ADR 0019). The same
+    /// operation key with the same request gets the same answer, before
+    /// and after a node restart; with another request it is refused.
+    ManagedCreate {
+        /// The caller's name for this command; a retry after a lost answer sends it again.
+        operation_key: OperationKey,
+        /// The repository, an absolute path on the node.
+        repo: SystemPath,
+        /// The goal in the user's words.
+        #[serde(deserialize_with = "launchable::argument")]
+        goal: String,
+        /// The harness the primary task runs under.
+        #[serde(with = "launchable")]
+        harness: HarnessKind,
+    },
+    /// Cancels a managed job none of whose attempts may still run.
+    ManagedCancel {
+        /// The caller's name for this command.
+        operation_key: OperationKey,
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// The revision the caller expects the job to be at, as a decimal
+        /// string; checked when given.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "text::option"
+        )]
+        expected_revision: Option<WorkRevision>,
+        /// Why, for the job's history.
+        reason: String,
+    },
+    /// One managed job.
+    ManagedStatus {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+    },
+    /// Every managed job.
+    ManagedList,
 }
 
 /// Every capability a node of this api version lists in its welcome, in
@@ -633,7 +694,11 @@ impl Request {
             | Request::HarnessStarted { .. }
             | Request::HarnessSession { .. }
             | Request::HarnessExited { .. }
-            | Request::LaunchCheck { .. } => None,
+            | Request::LaunchCheck { .. }
+            | Request::ManagedCreate { .. }
+            | Request::ManagedCancel { .. }
+            | Request::ManagedStatus { .. }
+            | Request::ManagedList => None,
         }
     }
 
@@ -660,6 +725,10 @@ impl Request {
             Request::HarnessSession { .. } => Op::HarnessSession,
             Request::HarnessExited { .. } => Op::HarnessExited,
             Request::LaunchCheck { .. } => Op::LaunchCheck,
+            Request::ManagedCreate { .. } => Op::ManagedCreate,
+            Request::ManagedCancel { .. } => Op::ManagedCancel,
+            Request::ManagedStatus { .. } => Op::ManagedStatus,
+            Request::ManagedList => Op::ManagedList,
         }
     }
 }
@@ -1017,6 +1086,14 @@ pub enum Reply {
     HarnessExited,
     /// For [`Request::LaunchCheck`]: the plan still holds.
     LaunchCheck,
+    /// For [`Request::ManagedCreate`].
+    ManagedCreate(Box<ManagedOperation>),
+    /// For [`Request::ManagedCancel`].
+    ManagedCancel(Box<ManagedOperation>),
+    /// For [`Request::ManagedStatus`].
+    ManagedStatus(Box<ManagedJob>),
+    /// For [`Request::ManagedList`].
+    ManagedList(ManagedJobs),
 }
 
 impl Reply {
@@ -1043,6 +1120,177 @@ impl Reply {
             Reply::HarnessSession(_) => Op::HarnessSession,
             Reply::HarnessExited => Op::HarnessExited,
             Reply::LaunchCheck => Op::LaunchCheck,
+            Reply::ManagedCreate(_) => Op::ManagedCreate,
+            Reply::ManagedCancel(_) => Op::ManagedCancel,
+            Reply::ManagedStatus(_) => Op::ManagedStatus,
+            Reply::ManagedList(_) => Op::ManagedList,
+        }
+    }
+}
+
+/// A managed job as the client API shows it (ADR 0019).
+///
+/// Counters travel as canonical decimal strings, so a JavaScript reader
+/// never rounds one. A state or status this client does not know is kept
+/// as its text: the set grows with the campaigns that add executors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedJob {
+    /// The job.
+    #[serde(with = "text")]
+    pub job: JobId,
+    /// Its revision: one per committed change.
+    #[serde(with = "text")]
+    pub revision: WorkRevision,
+    /// The generation of its latest grant, or `1` before any.
+    #[serde(with = "text")]
+    pub generation: Generation,
+    /// `active`, `finished` or `cancelled`.
+    pub state: String,
+    /// The goal in the user's words.
+    pub goal: String,
+    /// The harness its primary task runs under.
+    #[serde(with = "HarnessDef")]
+    pub harness: HarnessKind,
+    /// Its primary task.
+    #[serde(with = "text")]
+    pub primary_task: TaskId,
+    /// Its tasks, in the order they were registered.
+    pub tasks: Vec<ManagedTask>,
+    /// Its attempts, in the order they were granted.
+    pub attempts: Vec<ManagedAttempt>,
+}
+
+/// One task of a managed job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedTask {
+    /// The task.
+    #[serde(with = "text")]
+    pub task: TaskId,
+    /// The task that registered it; absent for the primary task.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "text::option"
+    )]
+    pub parent: Option<TaskId>,
+    /// A child task's label; absent for the primary task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// `open`, `succeeded`, `failed` or `cancelled`.
+    pub state: String,
+}
+
+/// One attempt of a managed job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedAttempt {
+    /// The attempt.
+    #[serde(with = "text")]
+    pub attempt: AttemptId,
+    /// The task it runs.
+    #[serde(with = "text")]
+    pub task: TaskId,
+    /// The generation of its grant.
+    #[serde(with = "text")]
+    pub generation: Generation,
+    /// `granted`, `running`, `succeeded`, `failed`, `cancelled`,
+    /// `checkpointed`, `lost` or `unknown`.
+    pub status: String,
+    /// The snapshot a checkpointed attempt left.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "text::option"
+    )]
+    pub snapshot: Option<SnapshotId>,
+}
+
+/// The answer to a managed command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedOperation {
+    /// The operation the command became.
+    #[serde(with = "text")]
+    pub operation: OperationId,
+    /// The caller's key for it.
+    pub operation_key: OperationKey,
+    /// Whether the key was seen before and this is its first answer again.
+    pub replayed: bool,
+    /// The job as it is now.
+    pub job: ManagedJob,
+}
+
+/// Every managed job a node's authority holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedJobs {
+    /// The jobs, oldest first.
+    pub jobs: Vec<ManagedJob>,
+    /// How many of the oldest jobs are left out so the rest fit in one
+    /// answer; absent when none is. `managed_status` answers for any job.
+    #[serde(
+        default,
+        skip_serializing_if = "is_zero",
+        deserialize_with = "null_as_default"
+    )]
+    pub left_out: u64,
+}
+
+impl From<&ManagedState> for ManagedJob {
+    fn from(state: &ManagedState) -> Self {
+        ManagedJob {
+            job: state.job.id,
+            revision: state.job.revision,
+            generation: state.job.generation,
+            state: match state.job.state {
+                JobState::Active => "active",
+                JobState::Finished => "finished",
+                JobState::Cancelled => "cancelled",
+            }
+            .to_owned(),
+            goal: state.job.intent.goal.clone(),
+            harness: state.job.intent.harness.clone(),
+            primary_task: state.job.primary,
+            tasks: state
+                .tasks
+                .iter()
+                .map(|task| ManagedTask {
+                    task: task.id,
+                    parent: task.parent,
+                    label: match &task.kind {
+                        TaskKind::Primary => None,
+                        TaskKind::Child { label } => Some(label.clone()),
+                    },
+                    state: match task.state {
+                        TaskState::Open => "open",
+                        TaskState::Succeeded => "succeeded",
+                        TaskState::Failed => "failed",
+                        TaskState::Cancelled => "cancelled",
+                    }
+                    .to_owned(),
+                })
+                .collect(),
+            attempts: state
+                .attempts
+                .iter()
+                .map(|attempt| ManagedAttempt {
+                    attempt: attempt.id,
+                    task: attempt.task,
+                    generation: attempt.generation,
+                    status: match attempt.status {
+                        AttemptStatus::Granted => "granted",
+                        AttemptStatus::Running => "running",
+                        AttemptStatus::Succeeded => "succeeded",
+                        AttemptStatus::Failed => "failed",
+                        AttemptStatus::Cancelled => "cancelled",
+                        AttemptStatus::Checkpointed { .. } => "checkpointed",
+                        AttemptStatus::Lost => "lost",
+                        AttemptStatus::Unknown => "unknown",
+                    }
+                    .to_owned(),
+                    snapshot: match attempt.status {
+                        AttemptStatus::Checkpointed { snapshot } => Some(snapshot),
+                        _ => None,
+                    },
+                })
+                .collect(),
         }
     }
 }
@@ -2866,6 +3114,45 @@ pub enum Reason {
     BadRequest,
     /// A failure with no structure worth typing: a file, the store, a harness adapter.
     Internal,
+    /// The managed authority refused the command before any effect and
+    /// keeps the refusal under its key, so a retry with the key gets it
+    /// again (ADR 0019).
+    ManagedRefused {
+        /// What the authority refused it for, in snake case, such as
+        /// `revision_mismatch`, `attempt_still_live` or `job_closed`.
+        refusal: String,
+        /// The job, when the command named one.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "text::option"
+        )]
+        job: Option<JobId>,
+        /// The key the refusal is kept under.
+        operation_key: OperationKey,
+        /// Whether this answers a key seen before.
+        replayed: bool,
+    },
+    /// The operation key was used for another command; nothing was written.
+    OperationConflict {
+        /// The key.
+        operation_key: OperationKey,
+    },
+    /// The managed authority stopped on a journal it could not trust;
+    /// standalone jobs are not affected.
+    ManagedUnavailable,
+    /// The job is a standalone job, which a managed command does not act on.
+    StandaloneJob {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+    },
+    /// The job is a managed job, which a standalone command does not act on.
+    ManagedJob {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+    },
     /// A reason this client does not know; a newer node sent it.
     #[serde(other)]
     Unrecognized,
@@ -2902,7 +3189,8 @@ impl Reason {
             | Reason::HarnessChangedDuringPull { .. }
             | Reason::RootNotADirectory { .. }
             | Reason::PlanOvertaken { .. }
-            | Reason::SessionMoved { .. } => RefusalKind::JobState,
+            | Reason::SessionMoved { .. }
+            | Reason::ManagedRefused { .. } => RefusalKind::JobState,
             Reason::ForkBehind { .. }
             | Reason::BadAddress { .. }
             | Reason::Peer { .. }
@@ -2920,7 +3208,11 @@ impl Reason {
             | Reason::SecretInArguments { .. }
             | Reason::SyncedRoot { .. }
             | Reason::BadRequest
-            | Reason::Internal => RefusalKind::Failed,
+            | Reason::Internal
+            | Reason::OperationConflict { .. }
+            | Reason::ManagedUnavailable
+            | Reason::StandaloneJob { .. }
+            | Reason::ManagedJob { .. } => RefusalKind::Failed,
             Reason::Unrecognized => return None,
         })
     }

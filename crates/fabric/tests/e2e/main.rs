@@ -19,6 +19,7 @@ mod budget;
 mod client;
 mod headless;
 mod legacy;
+mod managed;
 mod preflight;
 mod terminal;
 mod world;

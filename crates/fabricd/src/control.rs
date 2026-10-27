@@ -228,6 +228,11 @@ fn lossy(reason: Reason) -> Reason {
         | Reason::SecretInArguments { .. }
         | Reason::BadRequest
         | Reason::Internal
+        | Reason::ManagedRefused { .. }
+        | Reason::OperationConflict { .. }
+        | Reason::ManagedUnavailable
+        | Reason::StandaloneJob { .. }
+        | Reason::ManagedJob { .. }
         | Reason::Unrecognized => reason,
     }
 }
