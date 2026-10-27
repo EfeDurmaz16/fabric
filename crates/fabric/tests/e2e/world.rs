@@ -50,6 +50,10 @@ pub struct Env {
     /// The repository the job is made from.
     pub repo: PathBuf,
     path: OsString,
+    /// The `fabric` every node and CLI command of the test runs.
+    fabric: PathBuf,
+    /// Variables added to the environment of every process the test starts.
+    vars: Vec<(OsString, OsString)>,
 }
 
 impl Env {
@@ -58,6 +62,14 @@ impl Env {
     /// The directory sits under `/tmp` so the control socket's path stays
     /// within the 103 bytes a Unix socket path may have on macOS.
     pub fn new() -> Fallible<Arc<Self>> {
+        Self::with_fabric(PathBuf::from(env!("CARGO_BIN_EXE_fabric")), Vec::new())
+    }
+
+    /// As `new`, with the nodes and CLI commands running `fabric`, another
+    /// build of the program, and with `vars` added to the environment of
+    /// every process the test starts. The A/B bench compares two builds
+    /// this way on the same fixture.
+    pub fn with_fabric(fabric: PathBuf, vars: Vec<(OsString, OsString)>) -> Fallible<Arc<Self>> {
         let dir = tempfile::Builder::new().prefix("fe2e").tempdir_in("/tmp")?;
         let root = fs::canonicalize(dir.path())?;
         let home = root.join("home");
@@ -79,7 +91,14 @@ impl Env {
             home,
             repo,
             path,
+            fabric,
+            vars,
         }))
+    }
+
+    /// The `fabric` the test's nodes and CLI commands run.
+    pub fn fabric(&self) -> &Path {
+        &self.fabric
     }
 
     /// The `PATH` every process of the test runs with.
@@ -247,7 +266,7 @@ impl Env {
     /// test runs with, for the node whose state directory is `state`: its
     /// own programs come first on the `PATH` (`node_bin`), then the
     /// programs both nodes share.
-    pub fn command(&self, program: &str, state: &Path) -> Command {
+    pub fn command(&self, program: impl AsRef<std::ffi::OsStr>, state: &Path) -> Command {
         let mut dirs = vec![node_bin(state)];
         dirs.extend(std::env::split_paths(&self.path));
         let path = std::env::join_paths(dirs).unwrap_or_else(|_| self.path.clone());
@@ -266,6 +285,7 @@ impl Env {
         if let Some(level) = std::env::var_os("FABRIC_LOG") {
             command.env("FABRIC_LOG", level);
         }
+        command.envs(self.vars.iter().map(|(name, value)| (name, value)));
         command
     }
 }
@@ -573,7 +593,7 @@ impl Node {
             _ => {}
         }
         let log = fs::File::create(self.state.join("daemon.log"))?;
-        let mut command = self.env.command(env!("CARGO_BIN_EXE_fabric"), &self.state);
+        let mut command = self.env.command(self.env.fabric(), &self.state);
         command
             .args([
                 "serve",
@@ -645,6 +665,11 @@ impl Node {
         Ok(daemon)
     }
 
+    /// The process id of the daemon while it runs.
+    pub fn daemon_pid(&self) -> Option<u32> {
+        self.daemon.as_ref().map(Child::id)
+    }
+
     /// The daemon's log so far.
     pub fn log(&self) -> String {
         fs::read_to_string(self.state.join("daemon.log")).unwrap_or_default()
@@ -659,7 +684,7 @@ impl Node {
     pub fn spawn_with(&self, args: &[&str], vars: &[(&str, &Path)]) -> Fallible<Child> {
         Ok(self
             .env
-            .command(env!("CARGO_BIN_EXE_fabric"), &self.state)
+            .command(self.env.fabric(), &self.state)
             .args(args)
             .envs(vars.iter().copied())
             .stdout(Stdio::piped())
