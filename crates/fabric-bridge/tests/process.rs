@@ -768,3 +768,53 @@ async fn observe_reads_only_the_operations_own_action_and_resource() {
         "a refused observe reached the worker"
     );
 }
+
+/// What waits for a caller is bounded: sixteen `progress` frames in
+/// order are each recorded and then the answer, while a `progress` out of
+/// order (here `seq` 1 again, which a worker could repeat without end)
+/// breaks the protocol, ends the worker and leaves the operation unknown
+/// with the locator the first one reported.
+#[tokio::test]
+async fn progress_is_bounded_to_sixteen_frames_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let bridge = spawn().await;
+    let mut flight = bridge
+        .request(&mut journal, create(80, "double/progress-16"))
+        .await
+        .unwrap();
+    let mut progressed = 0;
+    let outcome = loop {
+        match flight.next(&mut journal).await.unwrap() {
+            Event::Progress(resource) => {
+                assert_eq!(resource, fx("key-80"));
+                progressed += 1;
+            }
+            Event::Done(outcome) => break outcome,
+        }
+    };
+    assert_eq!(progressed, 16);
+    assert_eq!(outcome.status, ProviderStatus::Succeeded);
+    assert!(bridge.lost().is_none());
+
+    let mut flight = bridge
+        .request(&mut journal, create(81, "double/progress-repeat"))
+        .await
+        .unwrap();
+    assert_eq!(
+        flight.next(&mut journal).await.unwrap(),
+        Event::Progress(fx("key-81"))
+    );
+    let Event::Done(outcome) = flight.next(&mut journal).await.unwrap() else {
+        panic!("a repeated progress was handed back")
+    };
+    assert!(matches!(outcome.answer, Answer::Lost(_)), "{outcome:?}");
+    assert_eq!(outcome.status, ProviderStatus::Unknown);
+    assert_eq!(
+        locator(&journal, 81),
+        Some(fx("key-81").to_value().to_string())
+    );
+    assert!(bridge.lost().unwrap().contains("after progress 1"));
+    let exit = bridge.close().await.unwrap();
+    assert!(exit.code().is_some() || exit.signal().is_some());
+}

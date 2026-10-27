@@ -13,6 +13,9 @@
 //!   original operation moves it on.
 //! - Every frame the worker sends is read under the negotiated cap,
 //!   checked before the body is read; the handshake answer under 1 MiB.
+//! - What waits for a caller is bounded: at most 16 `progress` frames per
+//!   request, `seq` from 1 rising by 1, then its one answer. Any other
+//!   `progress` breaks the protocol and ends the worker.
 
 use std::collections::HashMap;
 use std::process::{ExitStatus, Stdio};
@@ -31,9 +34,9 @@ use tokio::time::Instant;
 use crate::frames::{self, FrameFault};
 use crate::log::{Entry, LogError, OperationLog};
 use crate::wire::{
-    Action, Cancel, CancelState, ErrorCode, ErrorMessage, Expect, Hello, Limits, Locator, Observe,
-    OperationRef, Phase, Profile, Refusal, Request, RequestPolicy, ResultMessage, ResultState,
-    Scope, ToFabric, ToWorker, Unresolved, Versions,
+    Action, Cancel, CancelState, ErrorCode, ErrorMessage, Expect, Hello, Limits, Locator,
+    MAX_PROGRESS, Observe, OperationRef, Phase, Profile, Refusal, Request, RequestPolicy,
+    ResultMessage, ResultState, Scope, ToFabric, ToWorker, Unresolved, Versions,
 };
 
 /// How Fabric runs a worker.
@@ -192,8 +195,15 @@ struct Waiter {
     action: Option<String>,
     terminal_only: bool,
     kind: Kind,
-    tx: mpsc::UnboundedSender<Incoming>,
+    /// The `seq` of the last `progress` it got; 0 before the first.
+    progress: u64,
+    tx: mpsc::Sender<Incoming>,
 }
+
+/// Room for every frame one waiter can get: its `progress` frames, then
+/// its answer or the worker's loss.
+const QUEUE: usize = 17;
+const _: () = assert!(QUEUE as u64 == MAX_PROGRESS + 1);
 
 #[derive(Debug, Default)]
 struct State {
@@ -220,7 +230,7 @@ impl Shared {
             state.lost = Some(why.to_owned());
         }
         for (_, waiter) in state.waiters.drain() {
-            let _ = waiter.tx.send(Incoming::Lost(why.to_owned()));
+            let _ = waiter.tx.try_send(Incoming::Lost(why.to_owned()));
         }
     }
 }
@@ -491,7 +501,7 @@ impl Bridge {
         operation: Option<OperationId>,
         action: Option<&str>,
         kind: Kind,
-    ) -> Result<mpsc::UnboundedReceiver<Incoming>, BridgeError> {
+    ) -> Result<mpsc::Receiver<Incoming>, BridgeError> {
         let mut state = self.shared.lock();
         if let Some(why) = &state.lost {
             return Err(BridgeError::Lost(why.clone()));
@@ -510,7 +520,7 @@ impl Bridge {
                 return Err(BridgeError::Busy(outstanding));
             }
         }
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(QUEUE);
         state.waiters.insert(
             id.to_owned(),
             Waiter {
@@ -521,6 +531,7 @@ impl Bridge {
                         .and_then(|a| self.profile.action(a))
                         .is_some_and(|spec| spec.terminal_only),
                 kind,
+                progress: 0,
                 tx,
             },
         );
@@ -837,7 +848,7 @@ pub enum Control<T> {
 #[derive(Debug)]
 pub struct Pending<T> {
     request_id: String,
-    rx: mpsc::UnboundedReceiver<Incoming>,
+    rx: mpsc::Receiver<Incoming>,
     deadline: Instant,
     shared: Arc<Shared>,
     _answer: std::marker::PhantomData<T>,
@@ -902,7 +913,7 @@ pub struct InFlight {
     request_id: String,
     operation: OperationId,
     kind: Kind,
-    rx: mpsc::UnboundedReceiver<Incoming>,
+    rx: mpsc::Receiver<Incoming>,
     deadline: Instant,
     shared: Arc<Shared>,
     done: bool,
@@ -1127,7 +1138,7 @@ fn route(shared: &Shared, message: ToFabric) -> Result<(), String> {
         other => return Err(format!("a {other:?} in the session")),
     };
     let mut state = shared.lock();
-    let Some(waiter) = state.waiters.get(&id) else {
+    let Some(waiter) = state.waiters.get_mut(&id) else {
         state.late += 1;
         return Ok(());
     };
@@ -1153,10 +1164,22 @@ fn route(shared: &Shared, message: ToFabric) -> Result<(), String> {
         ));
     }
     let incoming = match message {
-        ToFabric::Progress { resource, .. } => Incoming::Progress(resource),
+        ToFabric::Progress { seq, resource, .. } => {
+            // At most 16 per request, in order: what waits is bounded.
+            if seq != waiter.progress + 1 {
+                return Err(format!(
+                    "progress {seq} for {id} after progress {}",
+                    waiter.progress
+                ));
+            }
+            waiter.progress = seq;
+            Incoming::Progress(resource)
+        }
         other => Incoming::Answer(Box::new(other)),
     };
-    let _ = waiter.tx.send(incoming);
+    if let Err(mpsc::error::TrySendError::Full(_)) = waiter.tx.try_send(incoming) {
+        return Err(format!("{id} got more frames than it can wait for"));
+    }
     if last {
         state.waiters.remove(&id);
     }

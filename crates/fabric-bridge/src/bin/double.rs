@@ -9,7 +9,9 @@
 //! - `sandbox.create` with image `fixture/ok` makes `fx-<key>`; with
 //!   `fixture/forbidden` it is denied before any effect; with
 //!   `double/crash` it exits mid-request; with `double/progress-crash` it
-//!   reports progress, then exits; with `double/silent` it never answers;
+//!   reports progress, then exits; with `double/progress-16` it reports
+//!   progress 1 to 16, then answers; with `double/progress-repeat` it
+//!   reports progress 1 twice, then answers; with `double/silent` it never answers;
 //!   with `double/oversize` it declares a frame above the cap; with
 //!   `double/running` it answers a running result, which a terminal-only
 //!   action never may; with
@@ -168,6 +170,8 @@ fn stream(text: &str) -> Value {
 /// What one request does: an answer, no answer, or the worker's end.
 enum Step {
     Answer(ToFabric),
+    /// `progress` frames with these `seq` values, then the answer.
+    Progressing(Vec<u64>, ToFabric),
     Silent(Locator),
     Exit(u8),
     Oversize,
@@ -198,6 +202,13 @@ fn script(request: &Request) -> Step {
                 },
                 3,
             ),
+            "double/progress-16" => Step::Progressing(
+                (1..=16).collect(),
+                completed(request, locator(key), ready()),
+            ),
+            "double/progress-repeat" => {
+                Step::Progressing(vec![1, 1], completed(request, locator(key), ready()))
+            }
             "double/running" => Step::Answer(result(
                 request.request_id.clone(),
                 request.operation.id,
@@ -318,6 +329,22 @@ impl Worker {
         }
         match script(request) {
             Step::Answer(message) => {
+                self.answered.insert(key, (digest, message.clone()));
+                (!send(&mut self.stdout, &message).await).then_some(1)
+            }
+            Step::Progressing(seqs, message) => {
+                for seq in seqs {
+                    let progress = ToFabric::Progress {
+                        request_id: request.request_id.clone(),
+                        operation_id: request.operation.id,
+                        seq,
+                        state: "starting".into(),
+                        resource: locator(&key),
+                    };
+                    if !send(&mut self.stdout, &progress).await {
+                        return Some(1);
+                    }
+                }
                 self.answered.insert(key, (digest, message.clone()));
                 (!send(&mut self.stdout, &message).await).then_some(1)
             }

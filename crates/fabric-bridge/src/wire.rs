@@ -35,6 +35,8 @@ pub const MAX_STDERR_BYTES: u64 = 1 << 20;
 pub const MAX_MESSAGE_CHARS: usize = 1024;
 /// The longest shutdown drain.
 pub const MAX_DRAIN_MS: u64 = 30_000;
+/// The most `progress` frames one request or observe may get, `seq` 1 to this.
+pub const MAX_PROGRESS: u64 = 16;
 
 /// Why a message was refused: the protocol's `code` and `reason`, and a
 /// diagnostic that names the field.
@@ -2031,7 +2033,7 @@ fn parse_to_fabric(value: &Value, expect: Expect<'_>) -> Walk<ToFabric> {
             let resource = Locator::parse(o.req("resource")?, "resource")?;
             resource.fits(profile)?;
             let seq = int(o.req("seq")?, "seq")?;
-            if !(1..=16).contains(&seq) {
+            if !(1..=MAX_PROGRESS).contains(&seq) {
                 return Err(bad("limit", "progress seq is not 1 to 16"));
             }
             ToFabric::Progress {
