@@ -630,6 +630,12 @@ const eventOptions = [
   z.object({ kind: z.literal("escaping_links_restored"), paths: z.array(UnicodeText), more: count }),
   /** The node recorded the launched harness durably; the answer still decides the registration. */
   z.object({ kind: z.literal("harness_recorded"), pid: Pid }),
+  /**
+   * The launch the plan about to be answered describes continues this
+   * session in the workspace at `root`, which is in place; a client may
+   * start what it checks before that launch now.
+   */
+  z.object({ kind: z.literal("session_to_continue"), harness: Harness, session: SessionId, root: Path }),
 ] as const;
 
 /** Every event kind this client knows, read from the schema. */

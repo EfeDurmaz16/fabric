@@ -2685,6 +2685,23 @@ pub enum Event {
         /// Its pid.
         pid: NonZeroU32,
     },
+    /// The workspace a launch of the plan this node is about to answer
+    /// runs in is in place at `root`, and the launch continues `session`
+    /// of `harness`. A client that checks the harness before it launches
+    /// it, as the CLI's resume guard asks it `--version` in the workspace,
+    /// may start that check now, beside the rest of the node's work and
+    /// its own setup; the plan in the answer still decides what launches.
+    /// Sent during `job_run` and `job_resume` (added 2026-10-28). A client
+    /// that skips it checks after the answer, as before.
+    SessionToContinue {
+        /// The harness.
+        #[serde(with = "HarnessDef")]
+        harness: HarnessKind,
+        /// The session.
+        session: SessionId,
+        /// The workspace root the launch runs in.
+        root: PathBuf,
+    },
     /// A kind of event this client does not know; a newer node sent it.
     #[serde(other)]
     Unrecognized,

@@ -227,6 +227,7 @@ fn event_variant(event: &Event) -> (Option<usize>, usize) {
             Event::SubmodulesLeftEmpty { .. },
             Event::EscapingLinksRestored { .. },
             Event::HarnessRecorded { .. },
+            Event::SessionToContinue { .. },
         ],
         Event::Unrecognized
     )
@@ -641,7 +642,8 @@ impl Seen {
             Event::Preflight { rows, .. } => self.rows(rows),
             Event::SessionCaptured { harness, .. }
             | Event::SessionRestored { harness, .. }
-            | Event::ContinuingSession { harness, .. } => self.harness(harness),
+            | Event::ContinuingSession { harness, .. }
+            | Event::SessionToContinue { harness, .. } => self.harness(harness),
             Event::NewSession { harness, previous } => {
                 self.harness(harness);
                 if let Some(previous) = previous {

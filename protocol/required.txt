@@ -336,6 +336,11 @@ event/session_restored.json /harness
 event/session_restored.json /harness/kind
 event/session_restored.json /kind
 event/session_restored.json /session
+event/session_to_continue.json /harness
+event/session_to_continue.json /harness/kind
+event/session_to_continue.json /kind
+event/session_to_continue.json /root
+event/session_to_continue.json /session
 event/snapshot_published.json /bytes
 event/snapshot_published.json /files
 event/snapshot_published.json /kind
