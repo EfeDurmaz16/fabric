@@ -13,17 +13,25 @@
 //! daemon: every managed call is refused with the reason and standalone
 //! jobs run as before. A managed job never takes an id a standalone job
 //! has, and a managed command never acts on a standalone job.
+//!
+//! The ids the journal holds are also published outside the queue, read
+//! once the file opens and before `verify` and recovery run, so a
+//! standalone lookup of an id this node does not know (a peer's first
+//! push of a job, for one) never waits behind recovery or a list. The
+//! ids stay published when `verify` then fails; only a journal that does
+//! not open leaves them unknown, and a lookup then fails closed.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
 use fabric_core::id::{JobId, NodeId};
 use fabric_core::managed::{
     AttemptId, Command, DomainError, Envelope, ManagedState, NewIds, Observation, OperationId,
-    OperationMark, TaskId, Transition,
+    OperationMark, StoredResult, TaskId, Transition,
 };
 use fabric_journal::{Answer, CommitError, FILE_NAME, Journal, Liveness, OpenError};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use ulid::Ulid;
 
 use crate::clock::now_ms;
@@ -93,10 +101,22 @@ enum Call {
     List(Reply<Vec<ManagedState>>),
 }
 
+/// The managed ids as the standalone paths read them, without the queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Ids {
+    /// The thread has not read the journal's ids yet.
+    Loading,
+    /// Every id the journal holds; empty when there is no journal.
+    Known(HashSet<JobId>),
+    /// The journal did not open, so its ids are unknown.
+    Unreadable(String),
+}
+
 /// The handle the daemon's tasks call the authority through.
 #[derive(Debug, Clone)]
 pub(crate) struct Authority {
     calls: mpsc::Sender<Call>,
+    ids: watch::Receiver<Ids>,
 }
 
 impl Authority {
@@ -104,6 +124,7 @@ impl Authority {
     /// at once; recovery of an existing journal runs on the thread.
     pub(crate) fn start(state: &StateDir, node: NodeId) -> std::io::Result<Authority> {
         let (calls, queue) = mpsc::channel(QUEUE);
+        let (publish, ids) = watch::channel(Ids::Loading);
         let place = Place {
             dir: managed_dir(state),
             jobs: state.jobs(),
@@ -111,8 +132,26 @@ impl Authority {
         };
         std::thread::Builder::new()
             .name("fabric-authority".into())
-            .spawn(move || serve(&place, queue))?;
-        Ok(Authority { calls })
+            .spawn(move || serve(&place, queue, &publish))?;
+        Ok(Authority { calls, ids })
+    }
+
+    /// Whether the journal holds `job`, without waiting behind the queue:
+    /// only the open of the journal's file is waited for. An error when
+    /// the journal did not open, so the caller fails closed.
+    pub(crate) async fn holds(&self, job: JobId) -> Result<bool, AuthorityError> {
+        let mut ids = self.ids.clone();
+        let ids = ids
+            .wait_for(|ids| !matches!(ids, Ids::Loading))
+            .await
+            .map_err(|_| AuthorityError::Unavailable("its thread ended".into()))?;
+        match &*ids {
+            Ids::Known(set) => Ok(set.contains(&job)),
+            Ids::Unreadable(reason) => Err(AuthorityError::Unavailable(reason.clone())),
+            Ids::Loading => Err(AuthorityError::Unavailable(
+                "the journal's ids are not read yet".into(),
+            )),
+        }
     }
 
     async fn call<T>(&self, make: impl FnOnce(Reply<T>) -> Call) -> Result<T, AuthorityError> {
@@ -201,15 +240,29 @@ enum Holder {
 }
 
 /// Opens and recovers an existing journal; nothing when there is none.
-fn open_existing(place: &Place) -> Holder {
+/// The journal's ids are published once it opens, before `verify`.
+fn open_existing(place: &Place, ids: &watch::Sender<Ids>) -> Holder {
     let path = place.journal();
     if !path.exists() {
+        ids.send_replace(Ids::Known(HashSet::new()));
         return Holder::Absent;
     }
     let started = std::time::Instant::now();
-    let mut journal = match Journal::open(&path) {
-        Ok(journal) => journal,
-        Err(e) => return stopped(&e),
+    let opened = Journal::open(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|journal| match journal.jobs() {
+            Ok(jobs) => Ok((journal, jobs)),
+            Err(e) => Err(e.to_string()),
+        });
+    let mut journal = match opened {
+        Ok((journal, jobs)) => {
+            ids.send_replace(Ids::Known(jobs.into_iter().collect()));
+            journal
+        }
+        Err(e) => {
+            ids.send_replace(Ids::Unreadable(e.clone()));
+            return stopped(&e);
+        }
     };
     match journal.verify() {
         Ok(report) => tracing::info!(
@@ -246,12 +299,26 @@ fn stopped(e: &dyn std::fmt::Display) -> Holder {
 }
 
 /// The authority's thread: recovery first, then one call at a time.
-fn serve(place: &Place, mut queue: mpsc::Receiver<Call>) {
-    let mut holder = open_existing(place);
+fn serve(place: &Place, mut queue: mpsc::Receiver<Call>, ids: &watch::Sender<Ids>) {
+    let mut holder = open_existing(place, ids);
     while let Some(call) = queue.blocking_recv() {
         match call {
             Call::Submit(envelope, reply) => {
-                let _ = reply.send(submit(place, &mut holder, &envelope));
+                let answer = submit(place, &mut holder, &envelope);
+                // Published before the answer, so no caller that saw the
+                // job made can look its id up and miss it.
+                if let Ok(Answer {
+                    result: StoredResult::Accepted(accepted),
+                    ..
+                }) = &answer
+                {
+                    ids.send_modify(|ids| {
+                        if let Ids::Known(set) = ids {
+                            set.insert(accepted.job);
+                        }
+                    });
+                }
+                let _ = reply.send(answer);
             }
             Call::Observe(job, observation, reply) => {
                 let _ = reply.send(

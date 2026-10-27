@@ -219,16 +219,19 @@ impl Node {
         }
     }
 
-    /// Refuses a standalone op on a job only the authority holds; `None` when it holds none.
+    /// Refuses a standalone op on a job only the authority holds; `None`
+    /// when it holds none. A journal whose ids cannot be read refuses
+    /// every id, so a standalone job is never made under a managed one's.
     pub(crate) async fn managed_only(&self, job: JobId) -> Option<NodeError> {
-        match self.authority.job(job).await {
-            Ok(Some(_)) => Some(refused(
+        match self.authority.holds(job).await {
+            Ok(true) => Some(refused(
                 Reason::ManagedJob { job },
                 format!(
                     "job {job} is a managed job; `managed_status` shows it, and standalone commands do not act on it"
                 ),
             )),
-            Ok(None) | Err(_) => None,
+            Ok(false) => None,
+            Err(e) => Some(e.into()),
         }
     }
 }

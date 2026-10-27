@@ -193,6 +193,36 @@ async fn a_restart_keeps_identity_progress_and_the_answer_to_a_key() {
 }
 
 #[tokio::test]
+async fn the_managed_ids_are_published_outside_the_queue_and_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let other = JobId::from_bytes([9; 16]);
+    let authority = Authority::start(&state, NODE).unwrap();
+    assert!(!authority.holds(other).await.unwrap());
+    let job = job_of(&authority.submit(create("create-1")).await.unwrap());
+    assert!(authority.holds(job).await.unwrap());
+    assert!(!authority.holds(other).await.unwrap());
+    drop(authority);
+
+    let authority = Authority::start(&state, NODE).unwrap();
+    assert!(authority.holds(job).await.unwrap());
+    assert!(!authority.holds(other).await.unwrap());
+}
+
+#[tokio::test]
+async fn a_journal_that_does_not_open_leaves_every_id_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    std::fs::create_dir_all(managed_dir(&state)).unwrap();
+    std::fs::write(journal_path(&state), b"not a journal").unwrap();
+    let authority = Authority::start(&state, NODE).unwrap();
+    assert!(matches!(
+        authority.holds(JobId::from_bytes([9; 16])).await,
+        Err(AuthorityError::Unavailable(_))
+    ));
+}
+
+#[tokio::test]
 async fn a_journal_that_does_not_verify_stops_the_authority_not_the_caller() {
     let dir = tempfile::tempdir().unwrap();
     let state = state(dir.path());
