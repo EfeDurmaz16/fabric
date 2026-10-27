@@ -46,20 +46,30 @@ pub struct Job {
     /// Per peer, the last record of this ledger the peer accepted in a
     /// push from this node, so the next push sends only what follows it
     /// (M2-18). In memory only: a restart sends the whole ledger again.
-    acked: std::collections::BTreeMap<NodeId, RecordHash>,
+    acked: Vec<(NodeId, RecordHash)>,
 }
 
 /// A node-local file kept in memory after its first read.
 #[derive(Debug)]
 struct Kept<T>(Mutex<Slot<T>>);
 
-/// What `Kept` holds of its file.
+/// What `Kept` holds of its file: two words, and a heap copy only of a
+/// file that is there, since most jobs have no harness record and no
+/// fork record.
 #[derive(Debug)]
 enum Slot<T> {
     /// Not read yet, or a write failed and the file must be read again.
     Unread,
-    /// What the file holds, `None` when it is absent.
-    Read(Option<T>),
+    /// The file is absent.
+    Absent,
+    /// What the file holds.
+    Read(Box<T>),
+}
+
+impl<T: Clone> Slot<T> {
+    fn of(value: Option<&T>) -> Self {
+        value.map_or(Slot::Absent, |value| Slot::Read(Box::new(value.clone())))
+    }
 }
 
 impl<T> Default for Kept<T> {
@@ -76,24 +86,27 @@ impl<T: Clone + Serialize + DeserializeOwned> Kept<T> {
     /// What the file at `path` holds, read once.
     fn read(&self, path: &Path) -> Result<Option<T>, local::LocalError> {
         let mut slot = self.slot();
-        if let Slot::Read(kept) = &*slot {
-            return Ok(kept.clone());
+        match &*slot {
+            Slot::Absent => return Ok(None),
+            Slot::Read(kept) => return Ok(Some(T::clone(kept))),
+            Slot::Unread => {}
         }
         let read = local::read(path)?;
-        *slot = Slot::Read(read.clone());
+        *slot = Slot::of(read.as_ref());
         Ok(read)
     }
 
     /// Whether the file at `path` holds a value, read once.
     fn is_some(&self, path: &Path) -> Result<bool, local::LocalError> {
         let mut slot = self.slot();
-        if let Slot::Read(kept) = &*slot {
-            return Ok(kept.is_some());
+        match &*slot {
+            Slot::Absent => return Ok(false),
+            Slot::Read(_) => return Ok(true),
+            Slot::Unread => {}
         }
         let read: Option<T> = local::read(path)?;
-        let present = read.is_some();
-        *slot = Slot::Read(read);
-        Ok(present)
+        *slot = Slot::of(read.as_ref());
+        Ok(read.is_some())
     }
 
     /// Replaces the file at `path` with `value`, then the copy.
@@ -101,7 +114,7 @@ impl<T: Clone + Serialize + DeserializeOwned> Kept<T> {
         let mut slot = self.slot();
         *slot = Slot::Unread;
         local::write(path, value)?;
-        *slot = Slot::Read(Some(value.clone()));
+        *slot = Slot::of(Some(value));
         Ok(())
     }
 
@@ -114,7 +127,7 @@ impl<T: Clone + Serialize + DeserializeOwned> Kept<T> {
         } else {
             local::remove_unflushed(path)?;
         }
-        *slot = Slot::Read(None);
+        *slot = Slot::Absent;
         Ok(())
     }
 }
@@ -158,7 +171,7 @@ impl Job {
             marker: Kept::default(),
             harness: Kept::default(),
             forked: Kept::default(),
-            acked: std::collections::BTreeMap::new(),
+            acked: Vec::new(),
         })
     }
 
@@ -218,7 +231,7 @@ impl Job {
             marker: Kept::default(),
             harness: Kept::default(),
             forked: Kept::default(),
-            acked: std::collections::BTreeMap::new(),
+            acked: Vec::new(),
         })
     }
 
@@ -289,8 +302,9 @@ impl Job {
         let records = self.ledger.records();
         match self
             .acked
-            .get(&peer)
-            .and_then(|head| self.ledger.position(*head))
+            .iter()
+            .find(|(node, _)| *node == peer)
+            .and_then(|(_, head)| self.ledger.position(*head))
         {
             Some(at) => &records[(at + 1).min(records.len() - 1)..],
             None => records,
@@ -299,13 +313,20 @@ impl Job {
 
     /// Notes that `peer` accepted a push whose last record was `head`.
     pub fn acked_by(&mut self, peer: NodeId, head: RecordHash) {
-        self.acked.insert(peer, head);
+        if let Some((_, kept)) = self.acked.iter_mut().find(|(node, _)| *node == peer) {
+            *kept = head;
+            return;
+        }
+        // A node pairs with one or two peers: room for one more entry,
+        // not a doubling.
+        self.acked.reserve_exact(1);
+        self.acked.push((peer, head));
     }
 
     /// Forgets what `peer` accepted, after a push it refused or did not
     /// answer, so the next push sends the whole ledger.
     pub fn forget_acked(&mut self, peer: NodeId) {
-        self.acked.remove(&peer);
+        self.acked.retain(|(node, _)| *node != peer);
     }
 
     /// How this node relates to the lease.
