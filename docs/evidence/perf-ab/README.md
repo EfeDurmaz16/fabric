@@ -22,6 +22,16 @@ Each directory has `machine.txt` (commits, sizes, load), `run.log`,
 the fixture's directory as `<root>`) and `report.md`, which
 `scripts/bench-ab.sh --analyze <dir>` writes again from the samples.
 
+## Gates
+
+Every gate of CONTRIBUTING passed on `491b931`, the commit that adds these
+runs (`gates/summary.txt`): fmt, clippy (workspace and each harness
+feature), `cargo test --workspace --locked` with 1072 passed, 0 failed and
+8 ignored (the A/B bench and its re-analysis are the two new ignored ones;
+its three unit tests run), doc, deny, hygiene, the budget file, the
+fixtures and their script tests, shellcheck of `scripts/bench-ab.sh`, and
+the TypeScript SDK.
+
 ## Method
 
 `ab::paired` (`crates/fabric/tests/e2e/ab.rs`) starts one fixture per
