@@ -32,8 +32,8 @@ use crate::frames::{self, FrameFault};
 use crate::log::{LogError, OperationLog};
 use crate::wire::{
     Action, Cancel, CancelState, ErrorCode, ErrorMessage, Expect, Hello, Limits, Locator, Observe,
-    OperationRef, Profile, Refusal, Request, RequestPolicy, ResultMessage, ResultState, Scope,
-    ToFabric, ToWorker, Unresolved, Versions, fits_observe, fits_request,
+    OperationRef, Phase, Profile, Refusal, Request, RequestPolicy, ResultMessage, ResultState,
+    Scope, ToFabric, ToWorker, Unresolved, Versions,
 };
 
 /// How Fabric runs a worker.
@@ -452,6 +452,22 @@ impl Bridge {
         self.shared.lock().lost.clone()
     }
 
+    /// Refuses `message` as the worker would on reading it under the
+    /// negotiated profile: an action it does not offer, a limit over its
+    /// own, a target of another shape, and every encoding rule, from a NUL
+    /// in an argument to a zero deadline. What the worker would refuse
+    /// before effect, Fabric refuses before sending.
+    fn as_worker_reads(&self, message: &ToWorker) -> Result<(), Refusal> {
+        ToWorker::parse_as_worker(
+            &message.to_value(),
+            Phase::Session,
+            Versions::V1,
+            std::slice::from_ref(&self.profile),
+            &self.profile,
+        )
+        .map(|_| ())
+    }
+
     fn request_id(&self) -> String {
         format!("r-{}", self.next_id.fetch_add(1, Ordering::Relaxed))
     }
@@ -559,7 +575,7 @@ impl Bridge {
                 Err(e) => BridgeError::Log(e),
             }
         };
-        if let Err(refusal) = fits_request(&request, &self.profile) {
+        if let Err(refusal) = self.as_worker_reads(&ToWorker::Request(Box::new(request.clone()))) {
             return Err(refuse(log, refusal));
         }
         let frame = match frames::encode(&request.to_value(), cap_of(self.limits.max_request_bytes))
@@ -627,7 +643,8 @@ impl Bridge {
             resource,
             wait_ms,
         };
-        fits_observe(&observe, &self.profile).map_err(BridgeError::RefusedLocally)?;
+        self.as_worker_reads(&ToWorker::Observe(observe.clone()))
+            .map_err(BridgeError::RefusedLocally)?;
         let observable = log.entry(operation)?.is_some_and(|e| {
             matches!(
                 e.status,

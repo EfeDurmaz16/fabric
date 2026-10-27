@@ -279,7 +279,8 @@ async fn an_answer_under_another_operation_breaks_the_protocol() {
 
 /// Refusals before effect that Fabric can make itself: an action the
 /// profile does not offer, a deadline over its limit, a frame over the
-/// request cap. Each is recorded rejected and nothing is written.
+/// request cap, an argument the encoding rules refuse. Each is recorded
+/// rejected and nothing is written.
 #[tokio::test]
 async fn fabric_refuses_before_sending_what_the_profile_or_the_cap_refuses() {
     let dir = tempfile::tempdir().unwrap();
@@ -301,10 +302,23 @@ async fn fabric_refuses_before_sending_what_the_profile_or_the_cap_refuses() {
             .collect(),
         ..CreateParams::default()
     });
+    let mut nul = create(17, "fixture/ok");
+    nul.action = Action::Exec {
+        target: fx("key-1"),
+        params: fabric_bridge::wire::ExecParams {
+            argv: vec!["echo".into(), "a\0b".into()],
+            stdin: None,
+            cwd: None,
+            timeout_ms: 1000,
+            max_output_bytes: 1024,
+            secret_names: Vec::new(),
+        },
+    };
     for (n, effect, reason) in [
         (10, other, ("unsupported", "action")),
         (11, late, ("invalid", "limit")),
         (12, huge, ("invalid", "limit")),
+        (17, nul, ("invalid", "bad_string")),
     ] {
         match bridge.request(&mut journal, effect).await {
             Err(BridgeError::RefusedLocally(r)) => assert_eq!((r.code, r.reason), reason),
