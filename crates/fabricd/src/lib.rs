@@ -14,7 +14,7 @@
 mod authority;
 mod carry;
 mod catchup;
-mod clock;
+pub mod clock;
 mod control;
 mod doctor;
 pub mod durable;

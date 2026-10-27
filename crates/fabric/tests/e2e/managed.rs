@@ -180,3 +180,97 @@ async fn e2e_managed_refusals_are_kept_and_modes_stay_apart() -> Fallible {
     assert_eq!(client.managed_list(|_| {}).await?.jobs.len(), 1);
     Ok(())
 }
+
+/// `fabric managed` makes, reads, lists and cancels managed jobs through
+/// the same calls: a command run again with its `--operation-key` is the
+/// same command, one run without a key gets a fresh one it prints, and
+/// the same key with another command, or a stale revision, is refused.
+#[test]
+fn e2e_the_cli_makes_reads_and_cancels_managed_jobs_under_their_keys() -> Fallible {
+    let env = Env::new()?;
+    let mut node = Node::new(&env, "a", Wire::TcpTls)?;
+    node.start(None)?;
+    let repo = env.repo.to_str().ok_or("the repository is not UTF-8")?;
+    let create = |key: Option<&str>, goal: &str| {
+        let mut args = vec![
+            "managed",
+            "create",
+            "--repo",
+            repo,
+            "--goal",
+            goal,
+            "--harness",
+            "codex",
+        ];
+        if let Some(key) = key {
+            args.extend(["--operation-key", key]);
+        }
+        node.run(&args)
+    };
+    let job_of = |printed: &str| -> Fallible<String> {
+        let line = printed.lines().next().ok_or("nothing printed")?;
+        let _: JobId = line.parse()?;
+        Ok(line.to_owned())
+    };
+
+    let made = create(Some("make-1"), "make the greeting louder")?;
+    assert!(made.status.success(), "{}", crate::world::text(&made));
+    let job = job_of(&String::from_utf8(made.stdout)?)?;
+    let again = node.ok(&[
+        "managed",
+        "create",
+        "--repo",
+        repo,
+        "--goal",
+        "make the greeting louder",
+        "--harness",
+        "codex",
+        "--operation-key",
+        "make-1",
+    ])?;
+    assert_eq!(job_of(&again)?, job, "{again}");
+    assert!(again.contains("answered again for key make-1"), "{again}");
+
+    let fresh = create(None, "another goal")?;
+    let (stdout, stderr) = (
+        String::from_utf8(fresh.stdout.clone())?,
+        String::from_utf8(fresh.stderr.clone())?,
+    );
+    assert!(fresh.status.success(), "{stdout}{stderr}");
+    assert!(stderr.starts_with("operation key "), "{stderr}");
+    assert_ne!(job_of(&stdout)?, job);
+
+    let conflict = create(Some("make-1"), "something else")?;
+    let said = crate::world::text(&conflict);
+    assert_eq!(conflict.status.code(), Some(1), "{said}");
+    assert!(said.contains("was used for another command"), "{said}");
+
+    let status = node.ok(&["managed", "status", &job])?;
+    assert!(status.contains("managed job at revision 1"), "{status}");
+    let listed = node.ok(&["managed", "ls"])?;
+    assert!(listed.contains(&job), "{listed}");
+
+    let stale = node.fails(&[
+        "managed",
+        "cancel",
+        &job,
+        "--expected-revision",
+        "7",
+        "--operation-key",
+        "cancel-stale",
+    ])?;
+    assert!(stale.contains("revision"), "{stale}");
+    let cancelled = node.ok(&[
+        "managed",
+        "cancel",
+        &job,
+        "--expected-revision",
+        "1",
+        "--reason",
+        "done",
+        "--operation-key",
+        "cancel-1",
+    ])?;
+    assert!(cancelled.contains("cancelled"), "{cancelled}");
+    Ok(())
+}

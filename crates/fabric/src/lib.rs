@@ -56,6 +56,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+mod managed;
 mod render;
 mod terminal;
 
@@ -77,6 +78,9 @@ enum Command {
     /// Make, run, suspend, move and resume jobs.
     #[command(subcommand)]
     Job(JobCommand),
+    /// Make, cancel and read managed jobs (ADR 0019).
+    #[command(subcommand)]
+    Managed(managed::ManagedCommand),
     /// Print this node's facts, or compare them with a paired node's before a move.
     Doctor {
         /// The node to compare with.
@@ -511,6 +515,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Job(command) => job(&state, &home, command).await,
+        Command::Managed(command) => managed::run(&client, command)
+            .await
+            .map(|_| ExitCode::SUCCESS),
     }
 }
 

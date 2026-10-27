@@ -8,6 +8,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fabric_core::id::{EventId, JobId, MoveId};
+use fabric_core::managed::{OperationKey, OperationKeyError};
 use ulid::Ulid;
 
 /// Milliseconds since the Unix epoch; zero before 1970.
@@ -30,4 +31,11 @@ pub(crate) fn event_id() -> EventId {
 /// A new move id, durable in the `MoveStarted` record that carries it.
 pub(crate) fn move_id() -> MoveId {
     MoveId::from_bytes(Ulid::generate().to_bytes())
+}
+
+/// A fresh operation key for a managed command whose caller named none:
+/// a ULID, whose 26 Crockford base32 characters the key alphabet takes as
+/// they are (docs/managed-jobs.md, Idempotency keys from command ids).
+pub fn operation_key() -> Result<OperationKey, OperationKeyError> {
+    OperationKey::parse(&Ulid::generate().to_string())
 }
