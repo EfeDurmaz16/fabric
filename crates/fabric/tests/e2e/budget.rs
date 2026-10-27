@@ -42,7 +42,7 @@ use crate::world::{Env, Fallible, Node, Wire, edit, pair, write_executable};
 const BUDGET: &str = include_str!("budget.toml");
 
 /// How long every fake probed program waits before it answers, in seconds.
-const PROBE_DELAY: &str = "0.05";
+pub(crate) const PROBE_DELAY: &str = "0.05";
 
 /// The programs counted: each is a wrapper while the warm-up runs.
 const COUNTED: [&str; 5] = ["git", "kill", "lsof", "pgrep", "ps"];
@@ -67,7 +67,7 @@ const SYSTEM: [(&str, &[&str]); 4] = [
 /// shell its fake runs after the delay. A probe added there needs its fake
 /// here, or it runs whatever the machine has. `defaults` finds no setting,
 /// as on a Mac that never turned iCloud Drive on.
-const PROBED: [(&str, &str); 13] = [
+pub(crate) const PROBED: [(&str, &str); 13] = [
     ("id", "echo fabric"),
     ("sw_vers", "echo 26.0"),
     ("xcrun", "echo 26.0"),
