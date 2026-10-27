@@ -493,10 +493,11 @@ async fn serve(state: StateDir, home: PathBuf, args: ServeArgs) -> Result<ExitCo
     }
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
-        ended = node.run() => ended?,
+        ended = node.clone().run() => ended?,
         _ = tokio::signal::ctrl_c() => {}
         _ = terminate.recv() => {}
     }
+    node.stopping().await;
     Ok(ExitCode::SUCCESS)
 }
 

@@ -47,6 +47,14 @@ pub const MAX_SOCKET_PATH: usize = 104;
 /// How long the hello may take on a new connection.
 pub const HELLO_DEADLINE: Duration = Duration::from_secs(10);
 
+/// How long a start waits for a daemon that holds the state directory to
+/// let it go: one that was just stopped holds it until it has shut down
+/// (issue #28, gate finding F14).
+pub const STOPPING_DAEMON_WAIT: Duration = Duration::from_secs(5);
+
+/// How often a start that waits tries the lock again.
+const LOCK_POLL: Duration = Duration::from_millis(50);
+
 /// What a node is started with.
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -118,15 +126,7 @@ impl Node {
     pub fn start(cfg: NodeConfig) -> Result<Arc<Self>, NodeError> {
         let root = cfg.state.root();
         prepare_state_dir(root)?;
-        let lock_path = cfg.state.lock();
-        let lock_file = open_lock(&lock_path)?;
-        match lock_file.try_lock() {
-            Ok(()) => {}
-            Err(fs::TryLockError::WouldBlock) => {
-                return Err(NodeError::AlreadyRunning(root.to_owned()));
-            }
-            Err(fs::TryLockError::Error(e)) => return Err(NodeError::io(&lock_path, e)),
-        }
+        let lock_file = take_lock(root, &cfg.state.lock(), STOPPING_DAEMON_WAIT)?;
 
         crate::faults::arm()?;
         let identity = NodeIdentity::load_or_generate(&cfg.state.node_key())?;
@@ -194,6 +194,14 @@ impl Node {
     /// The address both transports listen on.
     pub fn local_addr(&self) -> Result<SocketAddr, NodeError> {
         Ok(self.endpoint.local_addr()?)
+    }
+
+    /// Called by `fabric serve` once it was told to stop, while it still
+    /// holds the node and so the state directory. It does nothing outside
+    /// the end-to-end test, which can arm the `while_stopping` fault point
+    /// here to make the stop slow.
+    pub async fn stopping(&self) {
+        crate::faults::hit(crate::faults::Point::WhileStopping).await;
     }
 
     /// Serves peers and the control socket until the endpoint closes.
@@ -476,6 +484,39 @@ enum Side {
 /// Treats a transport failure as a reason to drop the kept session and dial again.
 pub(crate) fn is_transport(err: &RpcError) -> bool {
     matches!(err, RpcError::Transport(_) | RpcError::Frame(_))
+}
+
+/// Opens the lock at `path` in the state directory `root` and takes it,
+/// waiting up to `wait` for another daemon to let it go. A daemon told to
+/// stop holds the lock until it has shut down, so a start typed right
+/// after a stop waits for it instead of refusing. A daemon that keeps the
+/// lock is refused once `wait` has passed, so one process still serves the
+/// directory (issue #28, gate finding F14). A start with no other daemon
+/// takes the lock at the first try and never sleeps.
+fn take_lock(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    wait: Duration,
+) -> Result<File, NodeError> {
+    let file = open_lock(path)?;
+    let deadline = std::time::Instant::now() + wait;
+    let mut waiting = false;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                if !waiting {
+                    waiting = true;
+                    tracing::info!(state = ?root, ?wait, "another daemon holds the state directory; waiting for it to stop");
+                }
+                std::thread::sleep(LOCK_POLL);
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(NodeError::AlreadyRunning(root.to_owned()));
+            }
+            Err(fs::TryLockError::Error(e)) => return Err(NodeError::io(path, e)),
+        }
+    }
 }
 
 /// Opens the daemon's lock file at `path`, made with mode 0600 when it is missing.
@@ -859,6 +900,45 @@ mod tests {
         }
         let kept = a.open_session(b.id).expect("no session kept");
         assert!(Arc::ptr_eq(&kept, &dialed));
+    }
+
+    /// M2-10, gate finding F14: `fabric serve` typed right after a stop
+    /// failed with "another fabric daemon holds", because the daemon told
+    /// to stop still held the lock while it shut down. A start waits for
+    /// the lock to be let go, and still refuses a daemon that keeps it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_start_waits_for_a_stopping_daemon_to_let_the_state_directory_go() {
+        let dir = tempfile::Builder::new()
+            .prefix("fnode")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let home = root.join("home");
+        fs::create_dir(&home).unwrap();
+        let state = StateDir::resolve(Some(root.join("state").as_os_str()), &home).unwrap();
+        prepare_state_dir(state.root()).unwrap();
+        let stopping = open_lock(&state.lock()).unwrap();
+        stopping.lock().unwrap();
+        let stopped = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(stopping);
+        });
+        let started = Node::start(NodeConfig {
+            state: state.clone(),
+            home,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            dial: DialOrder::TcpOnly,
+            env: ToolEnv::current(),
+        });
+        stopped.join().unwrap();
+        assert!(started.is_ok(), "{started:?}");
+
+        // The started node keeps the lock, so a second start is refused.
+        let refused = take_lock(state.root(), &state.lock(), Duration::from_millis(100));
+        assert!(
+            matches!(refused, Err(NodeError::AlreadyRunning(_))),
+            "{refused:?}"
+        );
     }
 
     fn mode(path: &std::path::Path) -> u32 {

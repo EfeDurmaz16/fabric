@@ -630,6 +630,17 @@ impl Node {
         Ok(())
     }
 
+    /// Stops the daemon with `SIGTERM`, as `fabric serve` is stopped by
+    /// hand, and returns it unreaped: it may still be shutting down, and
+    /// still hold the state directory, when this returns.
+    pub fn stop(&mut self) -> Fallible<Child> {
+        let daemon = self.daemon.take().ok_or("the daemon does not run")?;
+        let pid = rustix::process::Pid::from_raw(i32::try_from(daemon.id())?)
+            .ok_or("the daemon has no pid")?;
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
+        Ok(daemon)
+    }
+
     /// The daemon's log so far.
     pub fn log(&self) -> String {
         fs::read_to_string(self.state.join("daemon.log")).unwrap_or_default()

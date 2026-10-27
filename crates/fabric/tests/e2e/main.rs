@@ -952,3 +952,25 @@ fn e2e_an_acp_run_killed_before_its_agent_is_recorded_leaves_nothing_running() -
         &pid_file,
     )
 }
+
+/// M2-10, gate finding F14: `fabric serve` started right after a stop
+/// waits for the stopping daemon to let the state directory go, instead
+/// of refusing because it still holds the lock. The stopping daemon is
+/// made to hold it for two seconds after `SIGTERM`. Then the new daemon
+/// serves the same node with its jobs.
+#[test]
+fn e2e_a_daemon_started_right_after_a_stop_serves() -> Fallible {
+    let mut p = setup(Wire::TcpTls, None, None)?;
+    let job = new_job(&p.env, &p.a, AGENT)?;
+    let id = p.a.id.clone();
+    p.a.kill()?;
+    p.a.start(Some("while_stopping:stall"))?;
+    let stopping = p.a.stop()?;
+    wait_for(&p.a.signal(), "the stopping daemon holding its state")?;
+    p.a.start(None)?;
+    let stopped = finish(stopping, Duration::from_secs(30))?;
+    assert!(stopped.status.success(), "{}", text(&stopped));
+    assert_eq!(p.a.id, id);
+    assert!(p.a.ok(&["job", "ls"])?.contains(&job));
+    Ok(())
+}
