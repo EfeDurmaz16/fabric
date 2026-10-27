@@ -10,12 +10,15 @@
 //! runs Claude and Codex turns without one, and `client` drives a node
 //! through `fabric-client` instead of the CLI. `budget` times the hot
 //! paths against `budget.toml`, and `bench` times the paths the durable
-//! job work touches, with no budget.
+//! job work touches, with no budget. `acp_cli` and `preflight` hold
+//! expected failures of the M2 defect register, ignored until fixed.
 
+mod acp_cli;
 mod bench;
 mod budget;
 mod client;
 mod headless;
+mod preflight;
 mod terminal;
 mod world;
 

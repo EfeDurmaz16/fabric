@@ -498,4 +498,27 @@ mod tests {
             "a marker is never redacted again"
         );
     }
+
+    /// H2: only a whole `${VAR}` reference or an earlier marker is
+    /// exempt from the secret-assignment rule (the comment above
+    /// `PATTERNS` says so); a literal value that starts with `$` or `[`
+    /// is redacted like any other.
+    #[test]
+    #[ignore = "H2: expected failure until fixed"]
+    fn a_literal_assignment_starting_with_a_dollar_or_a_bracket_is_redacted() {
+        let redactor = Redactor::standard().unwrap();
+        for line in [
+            "DB_PASSWORD=$literal-password",
+            "DB_PASSWORD=[literal-password]",
+            "DB_PASSWORD='$literal-password'",
+        ] {
+            assert!(redactor.matches(line), "{line}");
+        }
+        for line in [
+            "DB_PASSWORD=${DB_PASSWORD}",
+            "DB_PASSWORD=[REDACTED:secret-assignment]",
+        ] {
+            assert!(!redactor.matches(line), "{line}");
+        }
+    }
 }

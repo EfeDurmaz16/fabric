@@ -813,4 +813,15 @@ mod tests {
             );
         }
     }
+
+    /// CORE-L2: a pattern is printed in reports and refusals, so a control
+    /// character, such as the escape that starts a terminal sequence, is
+    /// refused as `SetupArg` and `ProgramName` refuse it.
+    #[test]
+    #[ignore = "CORE-L2: expected failure until fixed"]
+    fn a_secret_pattern_with_a_control_character_is_refused() {
+        for text in ["x\u{1b}c", "a\u{7}b", "c\u{7f}d"] {
+            assert!(SecretPattern::parse(text).is_err(), "{text:?}");
+        }
+    }
 }

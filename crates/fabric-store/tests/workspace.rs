@@ -2621,3 +2621,90 @@ fn a_capture_and_a_restore_start_a_known_number_of_git_processes() {
     assert!(output.status.success(), "{stdout}");
     assert!(stdout.contains("1 passed"), "{stdout}");
 }
+
+/// M2-04 (issue #20): a git tree records only `100644` or `100755`, so a
+/// key committed by mistake at 0600 comes back readable by others and an
+/// untracked file loses its group write. Each file of `W` keeps its own
+/// permission bits.
+#[test]
+#[ignore = "M2-04: expected failure until fixed"]
+fn a_file_of_the_working_tree_keeps_its_permission_bits() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    fs::write(root.join("deploy_key"), "key\n").unwrap();
+    fs::write(root.join("tool.sh"), "#!/bin/sh\n").unwrap();
+    let g = git(&root);
+    g.run(&["add", "-A"]).unwrap();
+    g.run(&["commit", "-q", "-m", "two"]).unwrap();
+    fs::write(root.join("shared.txt"), "untracked\n").unwrap();
+    let modes = [
+        ("deploy_key", 0o600),
+        ("tool.sh", 0o750),
+        ("shared.txt", 0o664),
+    ];
+    for (name, mode) in modes {
+        fs::set_permissions(root.join(name), fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    for (name, mode) in modes {
+        let restored = fs::metadata(target.join(name)).unwrap().mode() & 0o777;
+        assert_eq!(restored, mode, "{name}: {restored:o}");
+    }
+}
+
+/// M2-05 (issue #21): no entry records the workspace root itself, so a
+/// root kept at 0700 comes back with the umask's mode and the time of
+/// the restore. It keeps its mode and mtime.
+#[test]
+#[ignore = "M2-05: expected failure until fixed"]
+fn the_workspace_root_keeps_its_mode_and_mtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    set_mtime(&root, 1_500_000_000, 7).unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    let meta = fs::metadata(&target).unwrap();
+    assert_eq!(meta.mode() & 0o777, 0o700);
+    assert_eq!((meta.mtime(), meta.mtime_nsec()), (1_500_000_000, 7));
+}
+
+/// M2-06 (issue #22): a clone's `refs/remotes/origin/HEAD` is a symbolic
+/// ref; it comes back as one, not as a frozen commit.
+#[test]
+#[ignore = "M2-06: expected failure until fixed"]
+fn a_symbolic_ref_comes_back_symbolic() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = dir.path().join("upstream");
+    one_commit_repo(&upstream).unwrap();
+    let root = dir.path().join("work");
+    git(dir.path())
+        .run(&["clone", "-q", "upstream", "work"])
+        .unwrap();
+    let origin_head = ["symbolic-ref", "refs/remotes/origin/HEAD"];
+    assert_eq!(
+        git_text(&root, &origin_head).unwrap().trim(),
+        "refs/remotes/origin/main"
+    );
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    assert_eq!(
+        git_text(&target, &origin_head).unwrap().trim(),
+        "refs/remotes/origin/main"
+    );
+}

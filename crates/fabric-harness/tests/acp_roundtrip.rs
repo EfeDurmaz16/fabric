@@ -663,3 +663,37 @@ fn a_state_dir_that_overlaps_fabric_state_is_refused() {
     .with_state_dir(&abs(&home.path().join(".fabric-agent/sessions")))
     .unwrap();
 }
+
+/// R2 (issue #17): the trait's headless launch of an ACP agent is
+/// held, as every launch is, so the node records the agent before it gets
+/// its first message: when `launch` returns, the agent has not been sent
+/// the prompt.
+#[tokio::test]
+#[ignore = "R2: expected failure until fixed"]
+async fn the_trait_launch_holds_the_agent_until_it_is_released() {
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let state_dir = home.path().join(".fake-agent/sessions");
+    let adapter = adapter(home.path(), PermissionPolicy::Deny);
+    let env = env(&state_dir, &[]);
+    let mut running = adapter
+        .launch(
+            &work,
+            Launch::Headless {
+                resume: None,
+                prompt: "held".to_owned(),
+            },
+            &env,
+        )
+        .await
+        .unwrap();
+    assert!(running.is_held());
+    assert!(!state_dir.exists(), "the agent ran before it was released");
+    running.release().unwrap();
+    let status = tokio::time::timeout(TIMEOUT, running.child_mut().wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success());
+}

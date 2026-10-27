@@ -924,3 +924,50 @@ async fn a_launch_env_whose_codex_home_is_not_the_store_is_refused() {
     );
     assert!(!log.exists(), "codex must not start");
 }
+
+/// R2 (issue #17): a headless launch is held until the caller releases
+/// it, as a launch on a terminal is, so the node records the harness
+/// before any of its code runs and a CLI killed in between leaves nothing
+/// that ran unrecorded.
+#[tokio::test]
+#[ignore = "R2: expected failure until fixed"]
+async fn a_headless_launch_runs_nothing_until_it_is_released() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path().canonicalize().unwrap();
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let (_, bin) = fake_codex_reporting(&home, LOCKING_VERSION);
+    let adapter = Codex::new(abs(&home), bin.clone());
+    let log = home.join("log.txt");
+    let env = vec![
+        (
+            EnvVarName::parse("HOME").unwrap(),
+            home.to_string_lossy().into_owned(),
+        ),
+        (
+            EnvVarName::parse("PATH").unwrap(),
+            format!("{}:/usr/bin:/bin", bin.to_string_lossy()),
+        ),
+        (
+            EnvVarName::parse("FAKE_LOG").unwrap(),
+            log.to_string_lossy().into_owned(),
+        ),
+    ];
+    let mut running = adapter
+        .launch(
+            &work,
+            Launch::Headless {
+                resume: None,
+                prompt: "one".to_owned(),
+            },
+            &env,
+        )
+        .await
+        .unwrap();
+    assert!(running.is_held());
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!log.exists(), "the harness ran before it was released");
+    running.release().unwrap();
+    assert!(running.child_mut().wait().await.unwrap().success());
+    assert!(log.exists());
+}

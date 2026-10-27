@@ -676,4 +676,26 @@ mod tests {
             r#"{"content":[{"type":"text","text":"a"}]}"#
         );
     }
+
+    /// H1: JSON lets a key be spelled with escapes, so `ty\u0070e` and
+    /// `sign\u0061ture` name the same fields as `type` and `signature`. A
+    /// signed block that holds a secret is dropped whole whatever the
+    /// spelling of its keys, never edited with its signature kept.
+    #[test]
+    #[ignore = "H1: expected failure until fixed"]
+    fn a_signed_block_with_escaped_key_names_is_dropped_whole() {
+        for line in [
+            format!(
+                r#"{{"message":{{"content":[{{"ty\u0070e":"thinking","thinking":"{GITHUB}","signature":"SIGVALUE"}}]}}}}"#
+            ),
+            format!(
+                r#"{{"message":{{"content":[{{"type":"thinking","thinking":"{GITHUB}","sign\u0061ture":"SIGVALUE"}}]}}}}"#
+            ),
+        ] {
+            let outcome = redact(&line).unwrap();
+            assert_eq!(outcome.dropped_signed_blocks, 1, "{line}");
+            let text = outcome.text.unwrap();
+            assert!(!text.contains("SIGVALUE"), "{text}");
+        }
+    }
 }

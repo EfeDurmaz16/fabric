@@ -7,7 +7,8 @@
 //! `FAKE_LOAD=0` drops `loadSession`, `FAKE_RESUME=1` advertises
 //! `session/resume`, `FAKE_ASK_PERMISSION=1` asks for permission on every
 //! prompt, `FAKE_PID_FILE` names a file it writes its pid to,
-//! `FAKE_ENV_FILE` names a file it writes the names of its environment to, and
+//! `FAKE_ENV_FILE` names a file it writes the names of its environment to,
+//! `FAKE_PROMPT_ERROR=1` answers every prompt with a JSON-RPC error, and
 //! `FAKE_LINGER=1` keeps it alive after its stdin closes, as a hung agent
 //! would.
 
@@ -161,6 +162,9 @@ impl Agent {
         let Some(mut state) = self.load_state(&session) else {
             return Ok(Err((-32602, "unknown session".to_owned())));
         };
+        if env_flag("FAKE_PROMPT_ERROR", false) {
+            return Ok(Err((-32603, "fake turn failed".to_owned())));
+        }
         let permission = if env_flag("FAKE_ASK_PERMISSION", false) {
             self.ask_permission(&session, lines)?
         } else {

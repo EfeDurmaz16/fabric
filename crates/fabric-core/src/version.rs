@@ -322,4 +322,14 @@ mod tests {
             assert!(!shown.contains('\u{1b}') && shown.len() < 200, "{shown:?}");
         }
     }
+
+    /// CORE-L1: a numeric prerelease identifier too long for a `u64` is
+    /// still a number and orders by its value (semver 11.4.1), and a core
+    /// component with a leading zero is not a version.
+    #[test]
+    #[ignore = "CORE-L1: expected failure until fixed"]
+    fn long_numeric_prerelease_identifiers_order_as_numbers() {
+        assert!(v("1.0.0-alpha.99999999999999999999") < v("1.0.0-alpha.100000000000000000000"));
+        assert!(HarnessVersion::parse("01.0.0").is_err());
+    }
 }
