@@ -301,9 +301,17 @@ Rules the adapter keeps:
 - `UNIQUE (job_id, generation)` on `attempts` makes two grants at one generation impossible at the storage level, not only in the domain.
 - A projection row is written only by `write_transition`, which folds the events with the core's `apply_batch` in the same transaction.
 
+### Version 2: provider operations
+
+Version 2 (M3, ADR 0021) adds one table, `provider_operations`, and changes nothing in version 1's tables. A provider operation is an effect an attempt asks a provider worker for over the bridge (docs/bridge-protocol.md): its own `operation_id` and `op_key`, never one `operations` holds or the other way round, the request digest, the job, task and attempt it acts for and the attempt's generation, the bridge action, a `status` of `dispatched`, `succeeded`, `failed`, `cancelled`, `rejected` or `unknown`, the last answer's `code`, `reason` and `effect`, and the last `locator` the worker reported as its JSON text, which the journal never parses.
+
+- `provider_begin` commits the row `dispatched` before the request frame is written, or `rejected` when Fabric refused the request before sending it. It refuses a key or id the journal holds, a job that is not active, and an attempt that is not the job's current grant, `granted` or `running` at the job's generation.
+- `provider_record` moves `dispatched` to any answer, `unknown` only to `succeeded`, `failed` or `cancelled`, and never moves a terminal status. Recording the status a row has stores the answer and the locator alone, as a `pending` answer does.
+- `recover` makes every provider operation left `dispatched` `unknown` and lists it in `Recovery::provider_unknown`; nothing is sent again.
+
 ### Versioning and migration
 
-- `create` builds the file as `journal.sqlite.tmp`, sets the pragmas, runs the version 1 DDL and the `meta` rows in one transaction, closes it, renames it into place and syncs the directory, as `Catalog::create` does.
+- `create` builds the file as `journal.sqlite.tmp`, sets the pragmas, runs the version 1 DDL, every migration and the `meta` rows in one transaction, closes it, renames it into place and syncs the directory, as `Catalog::create` does.
 - `open` checks `application_id` (else `NotAJournal`), then `user_version`: equal to the binary's version opens; lower runs each migration `n -> n + 1` in its own `BEGIN IMMEDIATE` transaction that ends by setting `user_version = n + 1`; higher is `NewerSchema` and nothing is written.
 - Every released version keeps a fixture database under `crates/fabric-journal/tests/fixtures/v<n>.sqlite`; the tests open each with the current binary and run `verify`.
 - A migration never rewrites an event's `body` or `digest`. A new event shape is a new `kind`, or a new codec format byte read beside the old one.

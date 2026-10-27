@@ -10,7 +10,7 @@
 pub const APPLICATION_ID: i32 = 0x4642_524A;
 
 /// The schema version this crate writes and reads.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The pragmas every connection runs before anything else.
 pub(crate) const CONNECTION_PRAGMAS: &str = "
@@ -122,10 +122,37 @@ CREATE TRIGGER evidence_append_only_delete BEFORE DELETE ON evidence
   BEGIN SELECT RAISE(ABORT, 'evidence is append-only'); END;
 ";
 
-/// `MIGRATIONS[n - 1]` takes a journal from version `n` to `n + 1`. Version
-/// 1 is the first, so there is none yet; each new version adds one here
-/// and a fixture under `tests/fixtures/v<n>.sqlite` for the one before.
-pub(crate) const MIGRATIONS: &[&str] = &[];
+/// Version 2: provider operations, the effects an attempt asks a provider
+/// worker for over the bridge (ADR 0021). A provider operation shares the
+/// key and id space of `operations` (checked on insert) and names the
+/// attempt whose generation fenced it. `status` holds the bridge's journal
+/// statuses, `rejected` included, which an accepted command can never be;
+/// `locator` is the worker's JSON text, which the journal never parses.
+const V2: &str = "
+CREATE TABLE provider_operations (
+  operation_id   BLOB PRIMARY KEY CHECK (length(operation_id) = 16),
+  op_key         TEXT NOT NULL UNIQUE,
+  request_digest BLOB NOT NULL CHECK (length(request_digest) = 32),
+  job_id         BLOB NOT NULL REFERENCES jobs(job_id),
+  task_id        BLOB NOT NULL REFERENCES tasks(task_id),
+  attempt_id     BLOB NOT NULL REFERENCES attempts(attempt_id),
+  generation     INTEGER NOT NULL CHECK (generation >= 1),
+  action         TEXT NOT NULL,
+  status         TEXT NOT NULL CHECK (status IN ('dispatched','succeeded','failed','cancelled','rejected','unknown')),
+  code           TEXT,
+  reason         TEXT,
+  effect         TEXT CHECK (effect IS NULL OR effect IN ('none','applied','pending','unknown')),
+  locator        TEXT,
+  dispatched_ms  INTEGER NOT NULL,
+  updated_ms     INTEGER NOT NULL
+) STRICT;
+CREATE INDEX provider_operations_by_status ON provider_operations (status, dispatched_ms);
+";
+
+/// `MIGRATIONS[n - 1]` takes a journal from version `n` to `n + 1`; a new
+/// journal is `V1` and then every migration. Each new version adds one
+/// here and a fixture under `tests/fixtures/v<n>.sqlite`.
+pub(crate) const MIGRATIONS: &[&str] = &[V2];
 
 #[cfg(test)]
 mod tests {

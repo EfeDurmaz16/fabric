@@ -20,6 +20,7 @@
 
 mod crashpoint;
 mod project;
+mod provider;
 mod schema;
 
 #[cfg(test)]
@@ -39,6 +40,9 @@ use fabric_core::managed::{
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
+pub use provider::{
+    ProviderAnswer, ProviderDispatch, ProviderError, ProviderOperation, ProviderStatus,
+};
 pub use schema::{APPLICATION_ID, SCHEMA_VERSION};
 
 use project::{NewOperation, get_u64, load_state, sql_u64, write_transition};
@@ -111,6 +115,9 @@ pub enum CommitError {
         /// What is wrong.
         reason: String,
     },
+    /// A provider operation could not be recorded.
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
     /// The stored projection of a job is not the replay of its events.
     #[error("the projection of job {job} is not the replay of its events")]
     ProjectionMismatch {
@@ -173,6 +180,10 @@ pub enum Liveness {
 pub struct Recovery {
     /// Operations that were `dispatched` and are now `unknown` (rule 3).
     pub unknown: Vec<(JobId, OperationId)>,
+    /// Provider operations that were `dispatched` and are now `unknown`:
+    /// their request may have reached the worker, and nothing sends it
+    /// again (ADR 0021).
+    pub provider_unknown: Vec<(JobId, OperationId)>,
     /// Attempts now `lost` because their group is gone (rule 4).
     pub lost: Vec<(JobId, AttemptId)>,
     /// Attempts now `running` because their group runs.
@@ -241,6 +252,9 @@ impl Journal {
             let mut conn = connect(&tmp)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(schema::V1)?;
+            for step in schema::MIGRATIONS {
+                tx.execute_batch(step)?;
+            }
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             for (key, value) in [
@@ -717,7 +731,8 @@ impl Journal {
     /// committed change per operation or attempt it touches.
     ///
     /// An operation left `dispatched` becomes `unknown` and is never
-    /// dispatched again. An attempt left `granted` or `running` becomes
+    /// dispatched again, and so does a provider operation (ADR 0021),
+    /// listed in `provider_unknown`. An attempt left `granted` or `running` becomes
     /// `lost` only when `probe` verifies its group is gone, and `running`
     /// only when `probe` verifies it runs; `CannotTell` leaves it as it
     /// is. Nothing is granted. Grants still `accepted` whose attempt is
@@ -730,6 +745,16 @@ impl Journal {
         mut probe: impl FnMut(&Attempt) -> Liveness,
     ) -> Result<Recovery, CommitError> {
         let mut out = Recovery::default();
+        for (job, operation) in self.provider_dispatched()? {
+            self.provider_record(
+                operation,
+                ProviderStatus::Unknown,
+                &ProviderAnswer::default(),
+                None,
+                at_ms,
+            )?;
+            out.provider_unknown.push((job, operation));
+        }
         for job in self.jobs()? {
             let Some(state) = self.job(job)? else {
                 continue;

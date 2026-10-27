@@ -1,7 +1,8 @@
 //! Every released schema version keeps a fixture journal, and the current
 //! binary opens each one, migrates it when it is older and verifies it.
 //! `tests/fixtures/v1.sqlite` was made by `make_v1_fixture` with schema
-//! version 1; the test below pins what it holds.
+//! version 1, and `tests/fixtures/v2.sqlite` by `make_v2_fixture` from it;
+//! the tests below pin what each holds.
 
 #![allow(
     clippy::unwrap_used,
@@ -19,8 +20,11 @@ use fabric_core::managed::{
     RestartPolicy, SourceBinding, StoredResult, TaskId, TaskKind, TaskOutcome, TaskState,
     WorkRevision,
 };
+use fabric_core::managed::{Generation, RequestDigest};
 use fabric_core::path::AbsPath;
-use fabric_journal::{FILE_NAME, Journal, SCHEMA_VERSION};
+use fabric_journal::{
+    FILE_NAME, Journal, ProviderAnswer, ProviderDispatch, ProviderStatus, SCHEMA_VERSION,
+};
 
 const NODE: NodeId = NodeId::from_bytes([4; 32]);
 const FIRST: JobId = JobId::from_bytes([0x01; 16]);
@@ -235,6 +239,128 @@ fn make_v1_fixture() {
         },
         ids(SECOND, 8),
     );
+    journal.verify().unwrap();
+}
+
+/// The provider operations the v2 fixture adds to the v1 one, on the
+/// first job's live third attempt: one of each status a worker's answer
+/// leaves, two with the locator the worker reported.
+fn provider_dispatch(n: u8, action: &str) -> ProviderDispatch {
+    ProviderDispatch {
+        operation: OperationId::from_bytes([0x40 + n; 16]),
+        key: OperationKey::parse(&format!("provider-{n}")).unwrap(),
+        digest: RequestDigest::from_bytes([n; 32]),
+        job: FIRST,
+        task: TaskId::from_bytes([1; 16]),
+        attempt: AttemptId::from_bytes([5; 16]),
+        generation: Generation::new(3).unwrap(),
+        action: action.into(),
+    }
+}
+
+const LOCATOR: &str = r#"{"provider":"fixture","scope":{"account":"acct-a","project":"proj-1"},"kind":"sandbox","native_id":"fx-provider-1"}"#;
+
+fn answer(code: &str, reason: &str, effect: &str) -> ProviderAnswer {
+    ProviderAnswer {
+        code: Some(code.into()),
+        reason: Some(reason.into()),
+        effect: Some(effect.into()),
+    }
+}
+
+/// Writes the v1 fixture migrated to version 2 with provider operations.
+#[test]
+#[ignore = "makes the v2 fixture; run by hand with FABRIC_JOURNAL_FIXTURE_OUT set"]
+fn make_v2_fixture() {
+    let Some(out) = std::env::var_os("FABRIC_JOURNAL_FIXTURE_OUT") else {
+        return;
+    };
+    let path = PathBuf::from(out).join("v2.sqlite");
+    std::fs::copy(fixture(1), &path).unwrap();
+    let mut journal = Journal::open(&path).unwrap();
+    let at = 1_760_000_001_000;
+    journal
+        .provider_begin(&provider_dispatch(1, "sandbox.create"), None, at)
+        .unwrap();
+    journal
+        .provider_record(
+            OperationId::from_bytes([0x41; 16]),
+            ProviderStatus::Succeeded,
+            &ProviderAnswer::default(),
+            Some(LOCATOR),
+            at + 1,
+        )
+        .unwrap();
+    journal
+        .provider_begin(
+            &provider_dispatch(2, "sandbox.snapshot"),
+            Some(&answer("unsupported", "action", "none")),
+            at + 2,
+        )
+        .unwrap();
+    journal
+        .provider_begin(&provider_dispatch(3, "sandbox.exec"), None, at + 3)
+        .unwrap();
+    journal
+        .provider_record(
+            OperationId::from_bytes([0x43; 16]),
+            ProviderStatus::Unknown,
+            &ProviderAnswer::default(),
+            None,
+            at + 4,
+        )
+        .unwrap();
+    journal
+        .provider_begin(&provider_dispatch(4, "sandbox.destroy"), None, at + 5)
+        .unwrap();
+    journal
+        .provider_record(
+            OperationId::from_bytes([0x44; 16]),
+            ProviderStatus::Dispatched,
+            &answer("pending", "observation_deadline", "pending"),
+            Some(LOCATOR),
+            at + 6,
+        )
+        .unwrap();
+    journal.verify().unwrap();
+}
+
+#[test]
+fn the_v2_fixture_holds_what_it_was_made_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(FILE_NAME);
+    std::fs::copy(fixture(2), &path).unwrap();
+    let mut journal = Journal::open(&path).unwrap();
+    let statuses: Vec<_> = (1..=4)
+        .map(|n| {
+            journal
+                .provider_operation(OperationId::from_bytes([0x40 + n; 16]))
+                .unwrap()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(statuses[0].dispatch, provider_dispatch(1, "sandbox.create"));
+    assert_eq!(statuses[0].status, ProviderStatus::Succeeded);
+    assert_eq!(statuses[0].locator.as_deref(), Some(LOCATOR));
+    assert_eq!(statuses[1].status, ProviderStatus::Rejected);
+    assert_eq!(statuses[1].answer, answer("unsupported", "action", "none"));
+    assert_eq!(statuses[2].status, ProviderStatus::Unknown);
+    assert_eq!(statuses[3].status, ProviderStatus::Dispatched);
+    assert_eq!(statuses[3].locator.as_deref(), Some(LOCATOR));
+    // Restart recovery makes the dispatched one unknown and sends nothing.
+    let recovery = journal
+        .recover(1_760_000_002_000, |_| fabric_journal::Liveness::CannotTell)
+        .unwrap();
+    assert_eq!(
+        recovery.provider_unknown,
+        vec![(FIRST, OperationId::from_bytes([0x44; 16]))]
+    );
+    let pending = journal
+        .provider_operation(OperationId::from_bytes([0x44; 16]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.status, ProviderStatus::Unknown);
+    assert_eq!(pending.locator.as_deref(), Some(LOCATOR));
     journal.verify().unwrap();
 }
 
