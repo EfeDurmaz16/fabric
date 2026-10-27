@@ -16,6 +16,7 @@
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fabric_core::harness::HarnessKind;
 use fabric_core::id::{ChunkId, Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::FencingToken;
 use fabric_core::ledger::MAX_RECORD_LEN;
@@ -25,7 +26,11 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// The protocol version both sides must speak; a mismatch ends the session at `Hello`.
-pub const PROTOCOL_VERSION: u16 = 3;
+///
+/// 4 added `RequestBody::FactsFor` (issue #16): a node of version 3 would
+/// not know it, so the two refuse each other at `Hello` instead of one
+/// failing a push's preflight midway.
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// The most chunk ids one `WantChunks` request may name.
 pub const MAX_CHUNK_BATCH: usize = 256;
@@ -479,6 +484,15 @@ pub enum RequestBody {
     WantChunks(ChunkBatch),
     /// Asks what the peer measured about itself; answered with `Facts`.
     Facts,
+    /// Asks what the peer measured about itself as the target of a job
+    /// under `harness`; answered with `Facts`. For an ACP job they also
+    /// hold where the peer finds the agent and the `state_dir` its
+    /// `harness.toml` gives it (`acp.agent`, `acp.state_dir`), which no
+    /// fixed list can, since each job names its own agent (issue #16).
+    FactsFor {
+        /// The harness the job runs under.
+        harness: HarnessKind,
+    },
 }
 
 /// A per-job message (ADR 0003 and ADR 0005).
@@ -1095,6 +1109,21 @@ mod tests {
                     .ok())
                 .prop_map(RequestBody::WantChunks),
             Just(RequestBody::Facts),
+            harness().prop_map(|harness| RequestBody::FactsFor { harness }),
+        ]
+    }
+
+    fn harness() -> impl Strategy<Value = HarnessKind> {
+        prop_oneof![
+            Just(HarnessKind::ClaudeCode),
+            Just(HarnessKind::Codex),
+            ("[a-z][a-z0-9._-]{0,15}", vec("[ -~]{0,16}", 0..3)).prop_map(|(program, args)| {
+                HarnessKind::Acp {
+                    program: fabric_core::harness::ProgramName::parse(&program)
+                        .expect("the pattern makes a valid program name"),
+                    args,
+                }
+            }),
         ]
     }
 

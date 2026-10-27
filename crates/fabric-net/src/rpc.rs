@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use fabric_core::BoxFuture;
+use fabric_core::harness::HarnessKind;
 use fabric_core::id::{ChunkId, Epoch, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::FencingToken;
 use fabric_core::moves::MoveOffer;
@@ -245,6 +246,18 @@ pub trait Service: Send + Sync {
     fn chunk(&self, peer: NodeId, id: ChunkId) -> BoxFuture<'_, Result<Vec<u8>, Fault>>;
     /// Returns what this node measured about itself, for `peer`'s `fabric doctor` (ADR 0008).
     fn facts(&self, peer: NodeId) -> BoxFuture<'_, Result<Facts, Fault>>;
+    /// Returns what this node measured about itself as the target of a
+    /// job under `harness`, for `peer`'s preflight of a push (issue #16):
+    /// `facts`, and for an ACP job also where this node finds the agent and
+    /// the `state_dir` it gives it.
+    ///
+    /// The default answers `facts` alone. A service that keeps it answers
+    /// without the ACP facts, and the asking node then refuses the push,
+    /// since a missing fact never reads as a present one.
+    fn facts_for(&self, peer: NodeId, harness: HarnessKind) -> BoxFuture<'_, Result<Facts, Fault>> {
+        let _ = harness;
+        self.facts(peer)
+    }
 }
 
 /// An authenticated connection after the `Hello` exchange.
@@ -577,7 +590,24 @@ impl Session {
 
     /// Asks what the peer measured about itself, waiting at most `deadline`.
     pub async fn facts(&self, deadline: Duration) -> Result<Facts, RpcError> {
-        match self.call(RequestBody::Facts, deadline).await? {
+        self.ask_facts(RequestBody::Facts, deadline).await
+    }
+
+    /// Asks what the peer measured about itself as the target of a job
+    /// under `harness`, waiting at most `deadline` (`FactsFor`).
+    pub async fn facts_for(
+        &self,
+        harness: &HarnessKind,
+        deadline: Duration,
+    ) -> Result<Facts, RpcError> {
+        let body = RequestBody::FactsFor {
+            harness: harness.clone(),
+        };
+        self.ask_facts(body, deadline).await
+    }
+
+    async fn ask_facts(&self, body: RequestBody, deadline: Duration) -> Result<Facts, RpcError> {
+        match self.call(body, deadline).await? {
             ResponseBody::Facts(facts) => Ok(facts),
             other => Err(unexpected("facts", &other)),
         }
@@ -1058,6 +1088,10 @@ async fn handle(
             .await
             .unwrap_or(Err(Fault::Deadline))
             .map_or_else(ResponseBody::Fault, ResponseBody::Facts),
+        RequestBody::FactsFor { harness } => timeout(budget, service.facts_for(peer, harness))
+            .await
+            .unwrap_or(Err(Fault::Deadline))
+            .map_or_else(ResponseBody::Fault, ResponseBody::Facts),
         RequestBody::WantChunks(batch) => {
             let Ok(Ok(_run)) = timeout(budget, limits.chunk_runs.acquire()).await else {
                 reply(
@@ -1476,6 +1510,35 @@ mod tests {
         fn facts(&self, _peer: NodeId) -> BoxFuture<'_, Result<Facts, Fault>> {
             Box::pin(async { Ok(Facts::default()) })
         }
+
+        fn facts_for(
+            &self,
+            _peer: NodeId,
+            harness: HarnessKind,
+        ) -> BoxFuture<'_, Result<Facts, Fault>> {
+            Box::pin(async move {
+                Facts::new(vec![(
+                    crate::wire::FactName::truncated("harness"),
+                    crate::wire::FactValue::truncated(&harness.to_string()),
+                )])
+                .map_err(|e| Fault::Internal(crate::wire::FaultText::truncated(&e.to_string())))
+            })
+        }
+    }
+
+    /// Issue #16: a question for the facts of a job's target carries the
+    /// job's harness to the peer's service, which a question with none
+    /// does not reach.
+    #[tokio::test]
+    async fn a_question_for_a_jobs_facts_names_its_harness() {
+        let (session, _serving) = serving_pair(paired(), Arc::default()).await;
+        let acp = HarnessKind::Acp {
+            program: fabric_core::harness::ProgramName::parse("some-agent").unwrap(),
+            args: vec!["--acp".to_owned()],
+        };
+        let facts = session.facts_for(&acp, IDLE * 10).await.unwrap();
+        assert_eq!(facts.get("harness"), Some("acp:some-agent --acp"));
+        assert_eq!(session.facts(IDLE * 10).await.unwrap().get("harness"), None);
     }
 
     fn paired() -> Arc<Revocable> {
