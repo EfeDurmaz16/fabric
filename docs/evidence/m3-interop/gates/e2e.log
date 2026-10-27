@@ -1,0 +1,68 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running tests/e2e/main.rs (target/debug/deps/e2e-5884a725b54d94a6)
+
+running 59 tests
+test bench::m2_paths ... ignored, benchmark; scripts/bench-m2.sh runs it
+test budget::hot_paths ... ignored, takes minutes; CI runs it in a step of its own
+test budget::the_budget_file_holds_every_op ... ok
+test budget::the_verdicts_follow_the_rules ... ok
+test client::e2e_a_node_turns_away_another_api_version_and_a_request_it_cannot_read ... ok
+test client::e2e_a_daemon_whose_own_environment_is_not_utf8_starts ... ok
+test client::e2e_a_refusal_from_a_node_arrives_with_its_reason ... ok
+test client::e2e_doctor_measures_in_the_clis_environment_not_the_nodes ... ok
+test client::e2e_a_record_that_does_not_read_leaves_the_rest_of_the_status ... ok
+test e2e_a_claude_job_launches_and_warns_while_another_claude_runs ... ok
+test acp_cli::e2e_a_headless_acp_run_prints_the_answer ... ok
+test acp_cli::e2e_a_failed_acp_turn_fails_the_run ... ok
+test client::e2e_a_client_makes_reads_decides_and_suspends_a_job_with_typed_answers ... ok
+test e2e_a_run_ended_before_its_harness_is_recorded_stops_it ... ok
+test e2e_a_daemon_started_right_after_a_stop_serves ... ok
+test e2e_a_job_with_no_session_says_so_before_it_moves ... ok
+test e2e_a_headless_run_killed_before_its_harness_is_recorded_leaves_nothing_running ... ok
+test e2e_a_run_whose_output_closes_still_supervises_its_harness ... ok
+test e2e_a_steal_after_a_resume_freezes_the_owner_and_stops_its_harness ... ok
+test e2e_a_hand_edit_after_a_suspend_moves_with_the_job ... ok
+test e2e_an_acp_run_killed_before_its_agent_is_recorded_leaves_nothing_running ... ok
+test e2e_a_job_moves_and_resumes_over_tcp_tls ... ok
+test e2e_a_run_during_the_transfer_stops_the_move ... ok
+test e2e_an_owner_that_stayed_up_through_a_steal_refuses_to_run ... ok
+test e2e_a_job_moves_and_resumes_over_quic ... ok
+test e2e_a_steal_needs_force_and_fences_the_sleeping_owner ... ok
+test headless::e2e_a_headless_run_needs_a_prompt ... ok
+test e2e_a_move_stops_the_harness_running_on_its_source ... ok
+test e2e_holder_killed_after_departing_write_in_a_pull ... ok
+test e2e_refusals_exit_with_their_documented_codes ... ok
+test e2e_puller_killed_before_import ... ok
+test headless::e2e_a_headless_claude_turn_prints_its_answer_and_is_captured ... ok
+test headless::e2e_a_headless_run_forwards_standard_error_to_its_end ... ok
+test headless::e2e_a_headless_codex_turn_records_its_thread_for_the_next_capture ... ok
+test headless::e2e_a_codex_the_workspace_pinned_is_remembered_after_it_ran ... ok
+test legacy::e2e_make_legacy_fixture ... ignored, makes the legacy fixture; run by hand on the commit the fixture names
+test headless::e2e_a_headless_run_tells_the_node_before_it_prints_the_turn ... ok
+test e2e_a_duplicated_import_answer_changes_nothing ... ok
+test e2e_a_dropped_import_answer_converges_on_the_same_record ... ok
+test headless::e2e_a_signal_before_the_harness_starts_ends_a_headless_run ... ok
+test headless::e2e_a_headless_run_whose_output_is_gone_still_records_the_exit ... ok
+test managed::e2e_a_managed_job_keeps_identity_and_progress_across_a_daemon_kill ... ok
+test headless::e2e_ctrl_c_on_a_headless_acp_run_reaches_the_agent ... ok
+test headless::e2e_ctrl_c_on_a_headless_run_reaches_the_harness ... ok
+test managed::e2e_managed_refusals_are_kept_and_modes_stay_apart ... ok
+test legacy::e2e_a_state_directory_from_main_loads_lists_and_resumes ... ok
+test terminal::e2e_a_harness_without_a_terminal_starts_without_a_hand_over ... ok
+test terminal::e2e_a_terminal_harness_owns_the_terminal_before_it_starts ... ok
+test preflight::e2e_a_push_refuses_a_target_without_the_jobs_acp_agent ... ok
+test headless::e2e_the_preflight_names_the_codex_a_pinned_workspace_ran_when_the_target_is_older ... ok
+test e2e_source_killed_after_departing_write ... ok
+test e2e_source_killed_after_quiesce ... ok
+test e2e_source_killed_mid_transfer ... ok
+test e2e_source_killed_after_snapshot_publish ... ok
+test headless::e2e_an_older_codex_is_refused_a_thread_a_newer_one_continued ... ok
+test world::a_killed_command_whose_child_keeps_its_pipes_fails_in_time ... ok
+test client::e2e_a_node_measures_for_its_peers_in_the_environment_its_cli_sent ... ok
+test e2e_target_killed_mid_transfer ... ok
+test e2e_target_killed_after_import_receipt has been running for over 60 seconds
+test e2e_target_killed_after_import_receipt ... ok
+
+test result: ok. 56 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 99.97s
+
+exit 0 (101 s)

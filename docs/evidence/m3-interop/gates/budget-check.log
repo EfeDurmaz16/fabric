@@ -1,0 +1,20 @@
+ok   the budget unchanged
+ok   a baseline raised with a new entry
+ok   a baseline raised without an entry
+ok   a baseline raised without an entry, run from a subdirectory
+ok   an old entry edited
+ok   an old entry removed and a new one added
+ok   a new entry above the old ones
+ok   a new entry with no why
+ok   a new entry with an empty why
+ok   a new entry whose date is not a date
+ok   two new entries, the second with no why
+ok   two new entries, the first with no why
+ok   a table after a new entry
+ok   the budget removed
+ok   a budget change the base made after the fork
+ok   the budget added with its first entry
+ok   the budget added with no entry
+ok   no base given
+ok   outside a git repository
+exit 0 (5 s)

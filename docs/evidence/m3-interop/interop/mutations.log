@@ -1,0 +1,25 @@
+# Mutation checks: each line of the built worker below is replaced, the tests run, and the line restored.
+## 1. owner check removed (dist/chunk-5353GLGG.js line 1228)
+    if (state.owner?.job !== request.scope.job) throw new Refusal("denied", "owner_mismatch", "the target was not created by this job");
+thread 'denied_and_unsupported_requests_fail_before_any_effect' (253526045) panicked at crates/fabric-bridge/tests/capsule_worker.rs:640:9:
+  left: Succeeded
+ right: Rejected
+thread 'every_shared_scenario_over_the_workers_stdio' (253526083) panicked at crates/fabric-bridge/tests/capsule_worker.rs:309:17:
+  left: Object {"operation_id": String("01K8W3A0000000000000000P13"), "output": Object {"exit_code": Number(0), "stderr": Object {"captured_bytes": Number(0), "lossy": Bool(false), "text": String(""), "truncated": Bool(false)}, "stdout": Object {"captured_bytes": Number(3), "lossy": Bool(false), "text": String("hi\n"), "truncated": Bool(false)}}, "receipts": Array [], "replayed": Bool(false), "request_id": String("r-2"), "resource": Object {"kind": String("sandbox"), "native_id": String("fx-key-create-1"), "provider": String("fixture"), "scope": Object {"account": String("acct-a"), "project": String("proj-1")}}, "state": String("completed"), "type": String("result")}
+ right: Object {"error": Object {"code": String("denied"), "effect": String("none"), "reason": String("owner_mismatch")}, "operation_id": String("01K8W3A0000000000000000P13"), "request_id": String("r-2"), "type": String("error")}
+test result: FAILED. 5 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.96s
+## 2. image policy check removed (dist/chunk-5353GLGG.js line 1231)
+    throw new Refusal("denied", "policy_denied", "the image is not allowed by policy");
+thread 'denied_and_unsupported_requests_fail_before_any_effect' (253527945) panicked at crates/fabric-bridge/tests/capsule_worker.rs:640:9:
+  left: Succeeded
+ right: Rejected
+thread 'every_shared_scenario_over_the_workers_stdio' (253528157) panicked at crates/fabric-bridge/tests/capsule_worker.rs:309:17:
+  left: Object {"operation_id": String("01K8W3A00000000000000000P4"), "output": Object {"status": String("ready")}, "receipts": Array [], "replayed": Bool(false), "request_id": String("r-1"), "resource": Object {"kind": String("sandbox"), "native_id": String("fx-key-denied-1"), "provider": String("fixture"), "scope": Object {"account": String("acct-a"), "project": String("proj-1")}}, "state": String("completed"), "type": String("result")}
+ right: Object {"error": Object {"code": String("denied"), "effect": String("none"), "reason": String("policy_denied")}, "operation_id": String("01K8W3A00000000000000000P4"), "request_id": String("r-1"), "type": String("error")}
+thread 'the_docker_profile_on_the_local_engine' (253528424) panicked at crates/fabric-bridge/tests/capsule_worker.rs:1133:5:
+  left: Failed
+ right: Rejected
+test result: FAILED. 4 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.17s
+## restored
+chunk identical to the build
+containers left with a fabric.job label: 0

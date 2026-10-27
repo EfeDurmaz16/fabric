@@ -1,0 +1,29 @@
+ok   a new fixture
+ok   an existing fixture edited
+ok   an existing fixture edited, run from a subdirectory
+ok   an existing fixture removed
+ok   an existing fixture renamed
+ok   an existing fixture edited with an api bump
+ok   the hello pinned to a new api version
+ok   the incompatible answer edited with an api bump
+ok   the incompatible answer removed with an api bump
+ok   a hello answer type added with an api bump
+ok   the framed hello edited with an api bump
+ok   a field of the incompatible answer made optional with an api bump
+ok   the pins of the incompatible answer removed with an api bump
+ok   the incompatible answer added with its pins
+ok   a fixture the base added after the branch left it
+ok   a closed enum gains a variant
+ok   a new closed enum
+ok   a required field made optional
+ok   a field of an existing fixture made required
+ok   the required keys of a new fixture
+ok   the required keys removed
+ok   a required field made optional with an api bump
+ok   a new invalid fixture
+ok   a new invalid fixture with an api bump
+ok   the invalid fixtures that come with the api
+ok   a base that does not exist
+ok   no API_VERSION to compare
+ok   outside a git repository
+exit 0 (9 s)
