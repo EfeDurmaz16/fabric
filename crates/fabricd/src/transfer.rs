@@ -11,7 +11,6 @@
 //! still lacks, so a dropped connection costs the chunks in flight and
 //! nothing more.
 
-use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use fabric_core::id::{ChunkId, SnapshotId};
@@ -36,26 +35,26 @@ const RETRIES: usize = 3;
 /// The longest bundle chain followed: ADR 0014's sixteen links and the full bundle under them.
 const MAX_CHAIN: usize = 17;
 
-/// Runs `work` on the store off the async runtime.
-pub(crate) async fn with_store<T, F>(store: &Arc<Mutex<Store>>, work: F) -> Result<T, NodeError>
+/// Runs `work` on the store off the async runtime, on a handle of its own.
+///
+/// Works on other handles run beside it: a capture or a restore no
+/// longer holds a peer's chunk request or another job's suspend for as
+/// long as it runs. Publishes still run one at a time inside the store,
+/// and gc, which needs the store alone, is refused while a handle lives
+/// (M2-19).
+pub(crate) async fn with_store<T, F>(store: &Store, work: F) -> Result<T, NodeError>
 where
     T: Send + 'static,
     F: FnOnce(&mut Store) -> Result<T, NodeError> + Send + 'static,
 {
-    let store = Arc::clone(store);
-    tokio::task::spawn_blocking(move || {
-        let mut guard = store.lock().unwrap_or_else(PoisonError::into_inner);
-        work(&mut guard)
-    })
-    .await
-    .map_err(|e| NodeError::Task(e.to_string()))?
+    let mut store = store.handle();
+    tokio::task::spawn_blocking(move || work(&mut store))
+        .await
+        .map_err(|e| NodeError::Task(e.to_string()))?
 }
 
 /// True when the store holds `snapshot` whole: publish wrote its row only after every object.
-pub(crate) async fn is_complete(
-    store: &Arc<Mutex<Store>>,
-    snapshot: SnapshotId,
-) -> Result<bool, NodeError> {
+pub(crate) async fn is_complete(store: &Store, snapshot: SnapshotId) -> Result<bool, NodeError> {
     with_store(store, move |store| match store.snapshot(snapshot) {
         Ok(_) => Ok(true),
         Err(StoreError::UnknownSnapshot(_)) => Ok(false),
@@ -66,7 +65,7 @@ pub(crate) async fn is_complete(
 
 /// Fetches `snapshot`, and the bundle bases it needs, from the peer behind `session`.
 pub async fn fetch_snapshot(
-    store: &Arc<Mutex<Store>>,
+    store: &Store,
     session: &Session,
     snapshot: SnapshotId,
 ) -> Result<(), NodeError> {
@@ -104,7 +103,7 @@ pub async fn fetch_snapshot(
 }
 
 async fn fetch_manifest(
-    store: &Arc<Mutex<Store>>,
+    store: &Store,
     session: &Session,
     snapshot: SnapshotId,
 ) -> Result<SnapshotManifest, NodeError> {
@@ -152,7 +151,7 @@ async fn fetch_manifest(
 /// `mid_transfer` fault point sits. With `limit`, the fetch stops before
 /// it stores a chunk that takes the bytes fetched past it.
 async fn fetch_chunks(
-    store: &Arc<Mutex<Store>>,
+    store: &Store,
     session: &Session,
     ids: Vec<ChunkId>,
     data: bool,
@@ -223,7 +222,7 @@ enum BatchError {
 /// Fetches one batch, storing no chunk that does not fit in `room`, which
 /// each stored chunk shrinks.
 async fn fetch_batch(
-    store: &Arc<Mutex<Store>>,
+    store: &Store,
     session: &Session,
     ids: Vec<ChunkId>,
     first: &mut bool,
@@ -275,6 +274,7 @@ async fn fetch_batch(
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
+    use std::sync::Arc;
 
     use fabric_core::BoxFuture;
     use fabric_core::id::{MoveId, NodeId, RecordHash};
@@ -307,7 +307,7 @@ mod tests {
     /// A peer whose manifest says it is 16 bytes long and lists chunks of
     /// 1 MiB each.
     struct Lying {
-        store: Mutex<Store>,
+        store: Store,
         ids: Vec<ChunkId>,
     }
 
@@ -357,8 +357,6 @@ mod tests {
         fn chunk(&self, _: NodeId, id: ChunkId) -> BoxFuture<'_, Result<Vec<u8>, Fault>> {
             let stored = self
                 .store
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
                 .objects()
                 .read_stored(id)
                 .map_err(|e| Fault::Internal(FaultText::truncated(&e.to_string())));
@@ -382,10 +380,7 @@ mod tests {
         let serving: Arc<dyn Transport> =
             Arc::new(TcpTlsTransport::bind(&liar, Arc::new(Anyone), loopback).unwrap());
         let addr = serving.local_addr().unwrap();
-        let service = Arc::new(Lying {
-            store: Mutex::new(source),
-            ids,
-        });
+        let service = Arc::new(Lying { store: source, ids });
         tokio::spawn(async move {
             let connection: Arc<dyn Connection> = Arc::from(serving.accept().await.unwrap());
             let session = Session::accept(
@@ -418,7 +413,6 @@ mod tests {
     /// check of a snapshot a move needs, another job's suspend. A short
     /// call now runs beside a long one.
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "M2-19: expected failure until fixed"]
     async fn a_short_store_call_runs_beside_a_long_one() {
         let (_dir, node) = crate::ops::tests::node();
         let (entered, inside) = std::sync::mpsc::channel();
@@ -458,14 +452,11 @@ mod tests {
         let ids: Vec<ChunkId> = (0..3_u8)
             .map(|n| source.objects().put(&vec![n; 1 << 20]).unwrap().id)
             .collect();
-        let here = Arc::new(Mutex::new(
-            Store::create(&dir.path().join("here"), ChunkParams::DEFAULT).unwrap(),
-        ));
+        let here = Store::create(&dir.path().join("here"), ChunkParams::DEFAULT).unwrap();
         let session = ask_liar(source, ids.clone()).await;
 
         let fetched = fetch_snapshot(&here, &session, SnapshotId::of(b"a snapshot")).await;
         assert!(fetched.is_err(), "{fetched:?}");
-        let here = here.lock().unwrap_or_else(PoisonError::into_inner);
         let stored: Vec<&ChunkId> = ids
             .iter()
             .filter(|id| here.objects().stored_len(**id).is_ok())
@@ -488,7 +479,6 @@ mod tests {
         let held = source.objects().put(&vec![7; 1 << 20]).unwrap().id;
         let here = Store::create(&dir.path().join("here"), ChunkParams::DEFAULT).unwrap();
         here.objects().put(&vec![7; 1 << 20]).unwrap();
-        let here = Arc::new(Mutex::new(here));
         let session = ask_liar(source, vec![held; 16]).await;
 
         let fetched = fetch_snapshot(&here, &session, SnapshotId::of(b"a snapshot")).await;

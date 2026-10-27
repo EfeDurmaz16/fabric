@@ -78,7 +78,8 @@ pub struct Node {
     pub(crate) id: NodeId,
     pub(crate) version: VersionText,
     pub(crate) peers: Arc<Peers>,
-    pub(crate) store: Arc<Mutex<Store>>,
+    /// The store; each task works on a handle of its own (`with_store`).
+    pub(crate) store: Store,
     pub(crate) jobs: tokio::sync::Mutex<BTreeMap<JobId, Arc<tokio::sync::Mutex<Job>>>>,
     pub(crate) broken: Mutex<BTreeMap<JobId, String>>,
     endpoint: Endpoint,
@@ -165,7 +166,7 @@ impl Node {
             cfg,
             version,
             peers,
-            store: Arc::new(Mutex::new(store)),
+            store,
             jobs: tokio::sync::Mutex::new(jobs),
             broken: Mutex::new(broken),
             endpoint,
