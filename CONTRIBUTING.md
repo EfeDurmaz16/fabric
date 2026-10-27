@@ -48,8 +48,8 @@ tracked file or in any commit message on the branch, from any directory in the
 repository. `scripts/test-check-hygiene.sh` proves it fires; CI runs it first.
 
 `scripts/check-budget.sh` fails when the time budget changed without a new
-`[[change]]` entry (see Time budget); `scripts/test-check-budget.sh` proves it
-fires.
+`[[change]]` entry, or when it loosens a limit (see Time budget);
+`scripts/test-check-budget.sh` proves it fires.
 
 `cargo deny check` needs `cargo install cargo-deny --locked`. CI also runs it
 once a week, so a new advisory against an unchanged `Cargo.lock` still shows
@@ -126,15 +126,26 @@ differs from the budget, higher or lower: fewer starts can mean a check was
 dropped. A platform with no baselines, as `linux-x86_64` until CI produces
 numbers, only reports its times.
 
-To accept a slowdown, or a new process count:
+A baseline is the anchor's time, so it never goes up: a slower op is a bug
+to fix (Performance rule), and a baseline raised once per pull request
+would compound. `scripts/check-budget.sh` fails a change that raises or
+removes a baseline, raises the ratio or the grace, or lowers the
+percentile or the runs per batch. To change the budget otherwise, as for a
+faster op or a new process count:
 
-1. Say in the PR why the op must cost more, with the table before and after.
-2. Set the op's baseline in `budget.toml` to the new 25th percentile from the
-   table, or set its counts.
+1. Say in the PR why, with the table before and after; for a new process
+   count, with the A/B run that shows the op is not slower than the anchor.
+2. Lower the op's baseline in `budget.toml`, or set its counts.
 3. Add a `[[change]]` entry at the end of `budget.toml`, with
    `date = "YYYY-MM-DD"` and a `why` that names the PR. Entries are never
    edited or removed. `scripts/check-budget.sh` fails a change to the
    budget without a new one.
+
+The one time a baseline may rise is when the anchor itself was timed
+again, as when CI moves to another runner: build `176622e`, time it, set
+the baselines from those runs, and say so in the new entry with
+`anchor = "176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5"` beside its date and
+why.
 
 To give a platform its baselines, copy the 25th percentile column of a CI
 run on main from the step summary, with a `[[change]]` entry that names the
