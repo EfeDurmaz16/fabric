@@ -10,8 +10,9 @@
 //! runs Claude and Codex turns without one, and `client` drives a node
 //! through `fabric-client` instead of the CLI. `budget` times the hot
 //! paths against `budget.toml`, and `bench` times the paths the durable
-//! job work touches, with no budget. `acp_cli` and `preflight` hold
-//! expected failures of the M2 defect register, ignored until fixed.
+//! job work touches, with no budget. `acp_cli` and `preflight` hold the
+//! tests of M2 defects M2-01 and M2-02, `managed` the managed job
+//! acceptance tests, and `legacy` loads a state directory frozen from main.
 
 mod acp_cli;
 mod bench;
