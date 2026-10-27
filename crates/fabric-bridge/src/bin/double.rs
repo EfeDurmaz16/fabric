@@ -11,11 +11,12 @@
 //!   `double/crash` it exits mid-request; with `double/progress-crash` it
 //!   reports progress, then exits; with `double/progress-16` it reports
 //!   progress 1 to 16, then answers; with `double/progress-repeat` it
-//!   reports progress 1 twice, then answers; with `double/silent` it never answers;
-//!   with `double/oversize` it declares a frame above the cap; with
-//!   `double/running` it answers a running result, which a terminal-only
-//!   action never may; with
-//!   `double/other-operation` it answers under another operation id.
+//!   reports progress 1 twice, then answers; with `double/late` it answers
+//!   after 400 ms, reading nothing meanwhile; with `double/silent` it
+//!   never answers; with `double/oversize` it declares a frame above the
+//!   cap; with `double/running` it answers a running result, which a
+//!   terminal-only action never may; with `double/other-operation` it
+//!   answers under another operation id.
 //! - `sandbox.exec` echoes its argv; `sandbox.destroy` needs an approval,
 //!   and of `fx-stopping` it stays stopping: `pending` with its target.
 //! - `observe` answers `completed` for whatever resource it names, as a
@@ -173,6 +174,8 @@ enum Step {
     Answer(ToFabric),
     /// `progress` frames with these `seq` values, then the answer.
     Progressing(Vec<u64>, ToFabric),
+    /// The answer, this many milliseconds late.
+    Late(u64, ToFabric),
     Silent(Locator),
     Exit(u8),
     Oversize,
@@ -210,6 +213,7 @@ fn script(request: &Request) -> Step {
             "double/progress-repeat" => {
                 Step::Progressing(vec![1, 1], completed(request, locator(key), ready()))
             }
+            "double/late" => Step::Late(400, completed(request, locator(key), ready())),
             "double/running" => Step::Answer(result(
                 request.request_id.clone(),
                 request.operation.id,
@@ -346,6 +350,11 @@ impl Worker {
                         return Some(1);
                     }
                 }
+                self.answered.insert(key, (digest, message.clone()));
+                (!send(&mut self.stdout, &message).await).then_some(1)
+            }
+            Step::Late(ms, message) => {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 self.answered.insert(key, (digest, message.clone()));
                 (!send(&mut self.stdout, &message).await).then_some(1)
             }

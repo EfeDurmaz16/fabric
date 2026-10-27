@@ -373,7 +373,7 @@ Bridge protocol v1 is independent of the client API version (ADR 0018). Within v
 | `error` `pending` | stays `dispatched`, with the answer and the locator |
 | `error` `unknown` | `unknown`, with the best known locator |
 | `progress`, at most 16 per request with `seq` 1, 2, 3 and so on | the locator is stored; the status stays. Any other `progress` breaks the protocol like the row above, so a worker cannot queue frames without bound or hold a request past its deadline with them |
-| no answer within `deadline_ms` plus the grace (2 s by default) | `unknown`; a later answer is dropped unread |
+| no answer within `deadline_ms` plus the grace (2 s by default) | `unknown`. A later answer does not change the status, but the locator it names is recorded, by `record_late` or the next `request`, `observe` or step the journal is handed to, so the operation can be observed by it; the same holds for a request whose caller dropped it |
 | the request's own frame not read by the worker within `deadline_ms` plus the grace | the worker is lost and terminated, as for a framing error, since part of the frame may be on its input; every outstanding operation is `unknown` |
 
 Fabric writes frames from one task, whole and in the order they were recorded, each by its request's deadline; `request`, `observe`, `cancel` and `shutdown` record and queue, and never wait on the worker. A caller that stops waiting on one therefore leaves either nothing recorded or the operation recorded and its frame queued whole, never part of a frame, and a worker that stops reading holds nothing past the deadline: not the next request, not `close`, which closes the worker's input once the queued frames are written and stops waiting at the kill grace.

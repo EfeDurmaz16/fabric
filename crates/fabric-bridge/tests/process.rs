@@ -869,3 +869,74 @@ async fn a_worker_that_stops_reading_is_lost_and_terminated_at_the_deadline() {
         .unwrap();
     assert_eq!(exit.signal(), Some(15), "SIGTERM: {exit:?}");
 }
+
+/// An answer that comes after Fabric stopped waiting is not dropped
+/// unread: the status stays as the deadline left it, and the locator of
+/// what the worker made is recorded, so observe by it can settle the
+/// operation. The same holds for a request whose caller dropped it.
+#[tokio::test]
+async fn a_late_answer_records_the_locator_it_names_and_not_its_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let bridge = spawn().await;
+    let mut late = create(100, "double/late");
+    late.deadline_ms = 1;
+    let outcome = bridge
+        .request(&mut journal, late)
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(outcome.answer, Answer::TimedOut);
+    assert_eq!(locator(&journal, 100), None);
+    let started = Instant::now();
+    while bridge.late_answers() == 0 {
+        assert!(started.elapsed() < Duration::from_secs(5), "no late answer");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    bridge.record_late(&mut journal).unwrap();
+    let own = fx("key-100");
+    assert_eq!(status(&journal, 100), Some(ProviderStatus::Unknown));
+    assert_eq!(locator(&journal, 100), Some(own.to_value().to_string()));
+    let observed = bridge
+        .observe(
+            &mut journal,
+            OperationId::from_bytes([100; 16]),
+            "sandbox.create",
+            own,
+            1000,
+        )
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(observed.status, ProviderStatus::Succeeded);
+
+    // A caller drops its request; the next request records the locator
+    // the answer named, and the operation stays dispatched.
+    let dropped = bridge
+        .request(&mut journal, create(101, "double/late"))
+        .await
+        .unwrap();
+    drop(dropped);
+    while bridge.late_answers() < 2 {
+        assert!(started.elapsed() < Duration::from_secs(5), "no late answer");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let next = bridge
+        .request(&mut journal, create(102, "fixture/ok"))
+        .await
+        .unwrap();
+    assert_eq!(status(&journal, 101), Some(ProviderStatus::Dispatched));
+    assert_eq!(
+        locator(&journal, 101),
+        Some(fx("key-101").to_value().to_string())
+    );
+    assert_eq!(
+        next.finish(&mut journal).await.unwrap().status,
+        ProviderStatus::Succeeded
+    );
+    assert!(bridge.lost().is_none());
+}

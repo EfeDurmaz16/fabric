@@ -21,7 +21,7 @@
 //!   behind, and a worker that stops reading its input is lost and
 //!   terminated at the deadline instead of holding the bridge forever.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -212,10 +212,27 @@ const _: () = assert!(QUEUE as u64 == MAX_PROGRESS + 1);
 #[derive(Debug, Default)]
 struct State {
     waiters: HashMap<String, Waiter>,
+    /// Requests Fabric stopped waiting on, oldest first, at most
+    /// `EXPIRED`: a late answer to one still names its resource.
+    expired: VecDeque<Expired>,
+    /// The locators late answers named, by operation, not yet in the log.
+    found: HashMap<OperationId, Locator>,
     lost: Option<String>,
     shutting_down: bool,
     late: u64,
 }
+
+/// A request whose deadline passed, or whose caller dropped it, unanswered.
+#[derive(Debug)]
+struct Expired {
+    request_id: String,
+    operation: OperationId,
+    /// The `seq` of the last `progress` it got.
+    progress: u64,
+}
+
+/// How many unanswered requests Fabric remembers past their deadline.
+const EXPIRED: usize = 1024;
 
 #[derive(Debug, Default)]
 struct Shared {
@@ -225,6 +242,47 @@ struct Shared {
 impl Shared {
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Stops waiting on `id`. A request is remembered, so that the
+    /// locator its late answer names is still recorded.
+    fn expire(&self, id: &str) {
+        let mut state = self.lock();
+        let Some(waiter) = state.waiters.remove(id) else {
+            return;
+        };
+        let (Kind::Request, Some(operation)) = (waiter.kind, waiter.operation) else {
+            return;
+        };
+        if state.expired.len() == EXPIRED {
+            state.expired.pop_front();
+        }
+        state.expired.push_back(Expired {
+            request_id: id.to_owned(),
+            operation,
+            progress: waiter.progress,
+        });
+    }
+
+    /// Records in `log` each locator a late answer named. One for an
+    /// operation `log` does not hold is dropped; when the log fails, what
+    /// is left is kept for the next call.
+    fn record_found<L: OperationLog>(&self, log: &mut L) -> Result<(), LogError> {
+        let found = std::mem::take(&mut self.lock().found);
+        let mut rest = found.into_iter();
+        while let Some((operation, locator)) = rest.next() {
+            match log.locate(operation, &locator_text(&locator)) {
+                Ok(()) | Err(LogError::Transition(_)) => {}
+                Err(e) => {
+                    let mut state = self.lock();
+                    for (operation, locator) in std::iter::once((operation, locator)).chain(rest) {
+                        state.found.entry(operation).or_insert(locator);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Marks the worker gone and tells every waiter, once.
@@ -487,10 +545,20 @@ impl Bridge {
             .clone()
     }
 
-    /// Answers that came after Fabric stopped waiting for them, dropped unread.
+    /// Answers that came after Fabric stopped waiting for them. Their
+    /// status is not recorded; the locator a late answer to a request
+    /// names is, by `record_late` or the next call that is handed the log.
     #[must_use]
     pub fn late_answers(&self) -> u64 {
         self.shared.lock().late
+    }
+
+    /// Records in `log` the locators that answers to requests Fabric
+    /// stopped waiting on named since the last call; the status each
+    /// operation holds stays. `request`, `observe` and `InFlight::next` do
+    /// this first, so a caller only needs it while it makes none of those.
+    pub fn record_late<L: OperationLog>(&self, log: &mut L) -> Result<(), BridgeError> {
+        Ok(self.shared.record_found(log)?)
     }
 
     /// Why the worker is gone, if it is.
@@ -628,6 +696,7 @@ impl Bridge {
         log: &mut L,
         effect: Effect,
     ) -> Result<InFlight, BridgeError> {
+        self.shared.record_found(log)?;
         let request = Request {
             request_id: self.request_id(),
             operation: effect.operation,
@@ -723,6 +792,8 @@ impl Bridge {
         resource: Locator,
         wait_ms: u64,
     ) -> Result<InFlight, BridgeError> {
+        // A late answer may have named the resource this observe reads.
+        self.shared.record_found(log)?;
         let observe = Observe {
             request_id: self.request_id(),
             operation_id: operation,
@@ -989,7 +1060,7 @@ pub struct InFlight {
 impl Drop for InFlight {
     fn drop(&mut self) {
         if !self.done {
-            self.shared.lock().waiters.remove(&self.request_id);
+            self.shared.expire(&self.request_id);
         }
     }
 }
@@ -1009,15 +1080,17 @@ impl InFlight {
 
     /// The next step: a locator reported early, or the answer. Past
     /// Fabric's deadline the answer is `TimedOut` and the operation
-    /// `unknown`; a later answer is dropped unread.
+    /// `unknown`; a later answer leaves the status as it is and only the
+    /// locator it names is recorded (`Bridge::record_late`).
     pub async fn next<L: OperationLog>(&mut self, log: &mut L) -> Result<Event, BridgeError> {
         if self.done {
             return Err(BridgeError::Lost("the request was already answered".into()));
         }
+        self.shared.record_found(log)?;
         let incoming = tokio::time::timeout_at(self.deadline, self.rx.recv()).await;
         let answer = match incoming {
             Err(_) => {
-                self.shared.lock().waiters.remove(&self.request_id);
+                self.shared.expire(&self.request_id);
                 Answer::TimedOut
             }
             Ok(None) => Answer::Lost("the bridge reader stopped".into()),
@@ -1238,7 +1311,7 @@ fn route(shared: &Shared, message: ToFabric) -> Result<(), String> {
     let mut state = shared.lock();
     let Some(waiter) = state.waiters.get_mut(&id) else {
         state.late += 1;
-        return Ok(());
+        return late(&mut state, &id, &message);
     };
     if operation.is_some() && waiter.kind != Kind::Control && operation != waiter.operation {
         return Err(format!("an answer to {id} names another operation"));
@@ -1280,6 +1353,56 @@ fn route(shared: &Shared, message: ToFabric) -> Result<(), String> {
     }
     if last {
         state.waiters.remove(&id);
+    }
+    Ok(())
+}
+
+/// An answer or a `progress` for a request Fabric stopped waiting on.
+/// The operation keeps the status its deadline left; the locator it
+/// names is kept for the log, since the bridge contract records a locator
+/// as soon as it is observed and only observe by it moves the operation
+/// on. One naming another operation, or a `progress` out of order, breaks
+/// the protocol as it would in time. One for a request id never sent, or
+/// forgotten past `EXPIRED`, is only counted.
+fn late(state: &mut State, id: &str, message: &ToFabric) -> Result<(), String> {
+    let Some(at) = state.expired.iter().position(|e| e.request_id == id) else {
+        return Ok(());
+    };
+    let (operation, resource, seq) = match message {
+        ToFabric::Result(r) => (r.operation_id, Some(&r.resource), None),
+        ToFabric::Error(e) => (e.operation_id, e.error.resource.as_ref(), None),
+        ToFabric::Progress {
+            operation_id,
+            seq,
+            resource,
+            ..
+        } => (*operation_id, Some(resource), Some(*seq)),
+        other => {
+            return Err(format!(
+                "{id} was answered with a message that does not answer it: {other:?}"
+            ));
+        }
+    };
+    let expired = &mut state.expired[at];
+    if operation != expired.operation {
+        return Err(format!("an answer to {id} names another operation"));
+    }
+    match seq {
+        Some(seq) if seq != expired.progress + 1 => {
+            return Err(format!(
+                "progress {seq} for {id} after progress {}",
+                expired.progress
+            ));
+        }
+        Some(seq) => expired.progress = seq,
+        None => {
+            state.expired.remove(at);
+        }
+    }
+    if let Some(resource) = resource
+        && (state.found.len() < EXPIRED || state.found.contains_key(&operation))
+    {
+        state.found.insert(operation, resource.clone());
     }
     Ok(())
 }
