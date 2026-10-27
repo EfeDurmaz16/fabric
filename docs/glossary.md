@@ -72,7 +72,9 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Operation key.** The name a caller gives one command on a managed job. The authority keeps the first answer under it, so the same key and command sent again get the same answer and no second effect.
 
-**Orphan snapshot.** A snapshot that is not on its job's chain, made by `fabric orphan export` from an orphan workspace and pinned in the store so gc keeps it.
+**Orphan snapshot.** A snapshot that is not on its job's chain, made by `fabric job export` from an orphan workspace, or published by a chain a fork repair set aside, and pinned with its bundle chain in the job's `pins` file so no pass that forgets snapshots drops it.
+
+**Fork rule.** How two chains of one job that a steal forked are settled (ADR 0003, Forks): the higher epoch-bumping record wins, at equal epoch a `MoveImported` beats a `Stolen`, and between two steals the lower thief's node id. `fabric job repair` applies it on a frozen job.
 
 **Orphan workspace.** A workspace left on a node that lost the lease before it suspended. Kept in place forever until the user exports or removes it.
 
