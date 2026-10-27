@@ -412,6 +412,41 @@ mod tests {
         .unwrap()
     }
 
+    /// M2-19: one mutex covered the node's whole store, so a capture or a
+    /// restore, which runs for as long as git and the files take, held
+    /// every other store call for that long: a peer's chunk request, the
+    /// check of a snapshot a move needs, another job's suspend. A short
+    /// call now runs beside a long one.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "M2-19: expected failure until fixed"]
+    async fn a_short_store_call_runs_beside_a_long_one() {
+        let (_dir, node) = crate::ops::tests::node();
+        let (entered, inside) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let long = tokio::spawn({
+            let node = Arc::clone(&node);
+            async move {
+                with_store(&node.store, move |_| {
+                    entered.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(())
+                })
+                .await
+            }
+        });
+        tokio::task::spawn_blocking(move || inside.recv().unwrap())
+            .await
+            .unwrap();
+        let unknown = SnapshotId::from_bytes([7; 32]);
+        let short = tokio::time::timeout(DEADLINE, is_complete(&node.store, unknown)).await;
+        release.send(()).unwrap();
+        long.await.unwrap().unwrap();
+        assert!(
+            matches!(short, Ok(Ok(false))),
+            "the short call waited for the long one: {short:?}"
+        );
+    }
+
     /// A paired peer that declares a manifest of 16 bytes and lists
     /// chunks of 1 MiB each must not get them stored: the fetch stops at
     /// the first byte past the declared length, before the store and the
