@@ -20,10 +20,6 @@
 
 pub mod client;
 
-/// The turn feed the trait's launch of an agent carries
-/// (`Running::take_turn`).
-pub use crate::harness::{TurnEvent, TurnFeed};
-
 use std::ffi::OsString;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -41,7 +37,9 @@ use tracing::{info, warn};
 
 use crate::departure::{FABRIC_DIR, Records};
 use crate::error::HarnessError;
-use crate::harness::{Harness, Installed, Launch, Restored, Running, TurnReport};
+use crate::harness::{
+    Harness, Installed, Launch, Restored, Running, TurnEvent, TurnFeed, TurnReport,
+};
 use crate::manifest::{Content, HOME_PREFIX, Mutability, StateManifest, under_home};
 use crate::pipeline::{self, Capturer, Destination};
 use crate::process::{self, Wiring};

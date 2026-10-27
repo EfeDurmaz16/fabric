@@ -41,10 +41,12 @@ use fabric_core::harness::HarnessKind;
 use fabric_core::id::{EnvSpecId, JobId, NodeId};
 use fabric_core::session::SessionId;
 use fabric_env::materialize::{CacheHealth, MaterializeError, NodeEnv, TreeLock};
-use fabric_harness::acp::{TurnEvent, TurnFeed};
 use fabric_harness::claude::{ClaudeCode, LeftReason, TrustOutcome};
 use fabric_harness::codex::Codex;
-use fabric_harness::{Harness, Launch, LaunchSettings, Origin, PassedSetting, Running, TurnReport};
+use fabric_harness::{
+    Harness, Launch, LaunchSettings, Origin, PassedSetting, Running, TurnEvent, TurnFeed,
+    TurnReport,
+};
 use fabric_net::endpoint::DialOrder;
 use fabricd::harnesses::{HarnessEnv, acp_adapter, parse_harness};
 use fabricd::node::{Node, NodeConfig};
