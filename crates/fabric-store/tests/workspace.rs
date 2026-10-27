@@ -2635,10 +2635,13 @@ fn a_config_file_the_repository_includes_counts_but_does_not_travel() {
 /// The git processes a capture and a restore start. Each costs about 3 ms,
 /// and about 9 ms through the macOS `/usr/bin/git` stub; on 2026-10-24 a
 /// suspend ran 58 of them (issue #26). A change that adds one changes these.
+/// The restore's count is for git 2.46 and later; before, `HEAD` takes one
+/// `symbolic-ref` more, and the first restore of a process one refused
+/// transaction more (`a_git_without_symref_update_sets_them_one_by_one_and_is_not_asked_again`).
 const GIT_RUNS: [(&str, usize); 3] = [
     ("first capture", 33),
     ("second capture", 35),
-    ("restore", 14),
+    ("restore", 13),
 ];
 
 /// The child half: runs with a `git` first on the `PATH` that logs each call.
@@ -2671,8 +2674,14 @@ fn git_processes_child() {
     restore_into(&store, s2, &dir.join("restored")).unwrap();
     runs.push(common::git_commands(&common::logged_git_calls(), start));
 
+    let before_2_46 = if git_takes_symref_update(&dir).unwrap() {
+        0
+    } else {
+        2
+    };
     for ((name, expected), ran) in GIT_RUNS.iter().zip(&runs) {
-        assert_eq!(ran.len(), *expected, "{name}:\n{}", ran.join("\n"));
+        let expected = expected + if *name == "restore" { before_2_46 } else { 0 };
+        assert_eq!(ran.len(), expected, "{name}:\n{}", ran.join("\n"));
     }
 }
 
@@ -2841,6 +2850,127 @@ fn the_harness_state_root_and_a_read_only_root_keep_their_mode_and_mtime() {
     let meta = fs::metadata(&to).unwrap();
     assert_eq!(meta.mode() & 0o777, 0o750);
     assert_eq!((meta.mtime(), meta.mtime_nsec()), (1_400_000_000, 9));
+}
+
+/// A clone of a one-commit repository, whose `refs/remotes/origin/HEAD`
+/// is symbolic, captured and published; the store and the snapshot.
+fn clone_snapshot(dir: &Path) -> Fallible<(Store, SnapshotId)> {
+    one_commit_repo(&dir.join("upstream"))?;
+    git(dir).run(&["clone", "-q", "upstream", "work"])?;
+    let mut store = store_in(dir)?;
+    let policy = IgnorePolicy::default();
+    let captured = capture(&store, &request(&dir.join("work"), &policy, None))?;
+    let snapshot = store.publish(&captured.manifest)?;
+    Ok((store, snapshot))
+}
+
+/// Restores `snapshot` into `dir/<name>`, checks that both symbolic refs
+/// of `clone_snapshot` came back, and returns the `update-ref` and
+/// `symbolic-ref` calls the restore made.
+fn restore_symbolic(
+    store: &Store,
+    snapshot: SnapshotId,
+    dir: &Path,
+    name: &str,
+) -> Fallible<Vec<String>> {
+    let start = common::logged_git_calls().len();
+    let target = dir.join(name);
+    restore_into(store, snapshot, &target)?;
+    let ran = common::git_commands(&common::logged_git_calls(), start);
+    for (name, target_ref) in [
+        ("HEAD", "refs/heads/main"),
+        ("refs/remotes/origin/HEAD", "refs/remotes/origin/main"),
+    ] {
+        let found = git_text(&target, &["symbolic-ref", name])?;
+        if found != target_ref {
+            return Err(format!("{name} points at {found}").into());
+        }
+    }
+    Ok(ran
+        .into_iter()
+        .filter(|call| call.starts_with("update-ref ") || call.starts_with("symbolic-ref "))
+        .collect())
+}
+
+/// True when the git on the `PATH` takes `symref-update` in `update-ref --stdin` (2.46 and later).
+fn git_takes_symref_update(dir: &Path) -> Fallible<bool> {
+    let probe = dir.join("symref-probe");
+    fs::create_dir(&probe)?;
+    git(&probe).run(&["init", "-q"])?;
+    let mut child = std::process::Command::new("git")
+        .args(["update-ref", "--no-deref", "--stdin"])
+        .current_dir(&probe)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    std::io::Write::write_all(
+        &mut child.stdin.take().ok_or("no pipe to git")?,
+        b"symref-update HEAD refs/heads/probe\n",
+    )?;
+    Ok(child.wait()?.success())
+}
+
+/// The `update-ref` and `symbolic-ref` calls of a restore of `clone_snapshot` on git before 2.46.
+const SYMREFS_ONE_BY_ONE: [&str; 3] = [
+    "update-ref --stdin",
+    "symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main",
+    "symbolic-ref HEAD refs/heads/main",
+];
+
+/// The child half of `a_restore_sets_symbolic_refs_and_head_in_its_ref_transaction`.
+#[test]
+fn symref_transaction_child() {
+    let Some(dir) = common::logged_git_dir() else {
+        return;
+    };
+    let (store, snapshot) = clone_snapshot(&dir).unwrap();
+    let ran = restore_symbolic(&store, snapshot, &dir, "restored").unwrap();
+    if git_takes_symref_update(&dir).unwrap() {
+        assert_eq!(ran, ["update-ref --no-deref --stdin"]);
+    } else {
+        let mut expected = vec!["update-ref --no-deref --stdin"];
+        expected.extend(SYMREFS_ONE_BY_ONE);
+        assert_eq!(ran, expected);
+    }
+}
+
+/// On git 2.46 and later, a restore sets the symbolic refs and `HEAD` with
+/// `symref-update` in the one `update-ref --stdin` transaction of the
+/// direct refs, instead of one `git symbolic-ref` each: two git processes
+/// fewer per resume and pull of a clone.
+#[test]
+fn a_restore_sets_symbolic_refs_and_head_in_its_ref_transaction() {
+    common::run_with_logged_git("symref_transaction_child", LoggedGit::Plain).unwrap();
+}
+
+/// The child half of `a_git_without_symref_update_sets_them_one_by_one_and_is_not_asked_again`.
+#[test]
+fn symref_fallback_child() {
+    let Some(dir) = common::logged_git_dir() else {
+        return;
+    };
+    let (store, snapshot) = clone_snapshot(&dir).unwrap();
+    let mut first = vec!["update-ref --no-deref --stdin"];
+    first.extend(SYMREFS_ONE_BY_ONE);
+    assert_eq!(
+        restore_symbolic(&store, snapshot, &dir, "first").unwrap(),
+        first
+    );
+    assert_eq!(
+        restore_symbolic(&store, snapshot, &dir, "second").unwrap(),
+        SYMREFS_ONE_BY_ONE
+    );
+}
+
+/// git before 2.46 refuses the transaction at `symref-update` before it
+/// changes a ref; the restore then sets the refs as before, one
+/// `symbolic-ref` per symbolic ref and `HEAD`, and this process does not
+/// ask that git again.
+#[test]
+fn a_git_without_symref_update_sets_them_one_by_one_and_is_not_asked_again() {
+    common::run_with_logged_git("symref_fallback_child", LoggedGit::WithoutSymrefUpdate).unwrap();
 }
 
 /// M2-06 (issue #22): a clone's `refs/remotes/origin/HEAD` is a symbolic

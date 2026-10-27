@@ -947,18 +947,66 @@ fn push_stash_entry(git: &Git, oid: &GitOid) -> Result<(), RestoreError> {
 
 /// Sets every ref, every symbolic ref and `HEAD` exactly as `git_state` records them.
 ///
-/// Every ref but `refs/stash` is set by one `update-ref --stdin`
-/// transaction. The stash list is rebuilt oldest first from the refs
-/// capture pinned under the job's stash prefix, then `refs/stash` itself,
-/// so every entry comes back at its index. Each symbolic ref then points
-/// at its target, so `refs/remotes/origin/HEAD` follows the remote's
-/// default branch again instead of naming a frozen commit (M2-06).
+/// One `update-ref --no-deref --stdin` transaction sets every ref but
+/// `refs/stash`, points each symbolic ref at its target with
+/// `symref-update`, so `refs/remotes/origin/HEAD` follows the remote's
+/// default branch again instead of naming a frozen commit (M2-06), and
+/// sets `HEAD`. Without `--no-deref`, `symref-update HEAD` would follow the
+/// `HEAD` that `git init` wrote and turn its branch into a symbolic ref.
+/// git before 2.46 has no `symref-update`; there each symbolic ref and a
+/// branch `HEAD` take one `git symbolic-ref` after the transaction of the
+/// direct refs, as before. The stash list is then rebuilt oldest first
+/// from the refs capture pinned under the job's stash prefix, then
+/// `refs/stash` itself, so every entry comes back at its index.
 fn set_refs(git: &Git, git_state: &GitState, job_id: JobId) -> Result<(), RestoreError> {
-    set_direct_refs(git, git_state, job_id)?;
-    // `validate` holds each target in `refs`, which are set by now. git has
-    // no batch form for these before 2.46, so each is one process; a clone
-    // has one, `refs/remotes/origin/HEAD`, and a repository made with
-    // `git init` none.
+    let mut direct = String::new();
+    let mut stash = None;
+    for (name, oid) in &git_state.refs {
+        if name.as_str() == "refs/stash" {
+            stash = Some(oid);
+        } else {
+            direct.extend(["update ", name.as_str(), " ", oid.as_str(), "\n"]);
+        }
+    }
+    let mut commands = direct.clone();
+    // `validate` holds each target in `refs`, which the same transaction sets.
+    for (name, target) in &git_state.symbolic_refs {
+        commands.extend(["symref-update ", name.as_str(), " ", target.as_str(), "\n"]);
+    }
+    let head = match &git_state.head {
+        GitHead::Branch(branch) => ["symref-update HEAD refs/heads/", branch.as_str(), "\n"],
+        GitHead::Detached(oid) => ["update HEAD ", oid.as_str(), "\n"],
+    };
+    commands.extend(head);
+    if !git.update_refs_with_symrefs(commands.as_bytes())? {
+        set_refs_one_by_one(git, git_state, &direct)?;
+    }
+    if let Some(oid) = stash {
+        let prefix = stash_prefix(job_id);
+        let mut older: Vec<(u64, &GitOid)> = git_state
+            .refs
+            .iter()
+            .filter_map(|(name, oid)| {
+                let n = name.as_str().strip_prefix(&prefix)?.parse().ok()?;
+                Some((n, oid))
+            })
+            .collect();
+        older.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
+        for (_, entry) in &older {
+            push_stash_entry(git, entry)?;
+        }
+        push_stash_entry(git, oid)?;
+    }
+    Ok(())
+}
+
+/// Sets the refs of `set_refs` on git before 2.46: the direct ones in one
+/// transaction of `direct`, then one `symbolic-ref` per symbolic ref, then
+/// `HEAD`.
+fn set_refs_one_by_one(git: &Git, git_state: &GitState, direct: &str) -> Result<(), RestoreError> {
+    if !direct.is_empty() {
+        git.run_stdin_env(&["update-ref", "--stdin"], &[], direct.as_bytes())?;
+    }
     for (name, target) in &git_state.symbolic_refs {
         git.run(&["symbolic-ref", name.as_str(), target.as_str()])?;
     }
@@ -970,39 +1018,6 @@ fn set_refs(git: &Git, git_state: &GitState, job_id: JobId) -> Result<(), Restor
         GitHead::Detached(oid) => {
             git.run(&["update-ref", "--no-deref", "HEAD", oid.as_str()])?;
         }
-    }
-    Ok(())
-}
-
-/// Sets every ref of `git_state.refs`, the stash list included.
-fn set_direct_refs(git: &Git, git_state: &GitState, job_id: JobId) -> Result<(), RestoreError> {
-    let prefix = stash_prefix(job_id);
-    let mut older: Vec<(u64, &GitOid)> = git_state
-        .refs
-        .iter()
-        .filter_map(|(name, oid)| {
-            let n = name.as_str().strip_prefix(&prefix)?.parse().ok()?;
-            Some((n, oid))
-        })
-        .collect();
-    older.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
-    let mut commands = String::new();
-    let mut stash = None;
-    for (name, oid) in &git_state.refs {
-        if name.as_str() == "refs/stash" {
-            stash = Some(oid);
-        } else {
-            commands.extend(["update ", name.as_str(), " ", oid.as_str(), "\n"]);
-        }
-    }
-    if !commands.is_empty() {
-        git.run_stdin_env(&["update-ref", "--stdin"], &[], commands.as_bytes())?;
-    }
-    if let Some(oid) = stash {
-        for (_, entry) in &older {
-            push_stash_entry(git, entry)?;
-        }
-        push_stash_entry(git, oid)?;
     }
     Ok(())
 }
