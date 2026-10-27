@@ -5,11 +5,17 @@
 //! from a bounded queue, so commands are serialized without a lock and no
 //! other code in the daemon opens the file. The journal is made by the
 //! first `CreateJob`, never by a start; a state directory without one
-//! behaves as before managed jobs existed and the start pays one `stat`.
-//! When a journal exists, the thread opens it, runs `verify` and restart
-//! recovery before it answers any call, off the daemon's start path: a
-//! dispatched operation becomes unknown and nothing is replayed or
-//! granted. A journal that fails `verify` stops the authority, never the
+//! behaves as before managed jobs existed: the start pays one `stat` and
+//! starts no thread. The thread starts with the daemon when a journal
+//! exists, and otherwise with the first managed command, so a daemon that
+//! never runs a managed job has neither the thread nor its queue. Until
+//! then a read (a job, the list, whether an id is managed) answers from
+//! the start's look, which found no journal, and a command that starts
+//! the thread does so under the same lock, so no read misses a job a
+//! command made. When a journal exists, the thread opens it, runs
+//! `verify` and restart recovery before it answers any call, off the
+//! daemon's start path: a dispatched operation becomes unknown and
+//! nothing is replayed or granted. A journal that fails `verify` stops the authority, never the
 //! daemon: every managed call is refused with the reason and standalone
 //! jobs run as before. A managed job never takes an id a standalone job
 //! has, and a managed command never acts on a standalone job.
@@ -24,6 +30,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use fabric_core::id::{JobId, NodeId};
 use fabric_core::managed::{
@@ -115,39 +122,89 @@ enum Ids {
 /// The handle the daemon's tasks call the authority through.
 #[derive(Debug, Clone)]
 pub(crate) struct Authority {
-    calls: mpsc::Sender<Call>,
+    writer: Arc<Mutex<Writer>>,
     ids: watch::Receiver<Ids>,
     /// How many threads this authority started, for the tests.
     #[cfg(test)]
-    spawned: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    spawned: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// The authority's thread, or what it needs to start.
+#[derive(Debug)]
+enum Writer {
+    /// No journal at start and no managed command since, so no thread runs.
+    Idle {
+        place: Arc<Place>,
+        /// Shared with a thread that is being started, so a start that
+        /// fails keeps it; the thread holds the only one once it runs.
+        publish: Arc<watch::Sender<Ids>>,
+    },
+    /// The thread runs and takes calls on this queue.
+    Running(mpsc::Sender<Call>),
 }
 
 impl Authority {
-    /// Starts the authority's thread for `state`, on node `node`. Returns
-    /// at once; recovery of an existing journal runs on the thread.
+    /// The authority for `state`, on node `node`. Returns at once: with a
+    /// journal, its thread starts now and recovers it before any call;
+    /// without one, no thread starts until a managed command.
     pub(crate) fn start(state: &StateDir, node: NodeId) -> std::io::Result<Authority> {
-        let (calls, queue) = mpsc::channel(QUEUE);
-        let (publish, ids) = watch::channel(Ids::Loading);
-        let place = Place {
+        let place = Arc::new(Place {
             dir: managed_dir(state),
             jobs: state.jobs(),
             node,
-        };
-        std::thread::Builder::new()
-            .name("fabric-authority".into())
-            .spawn(move || serve(&place, queue, &publish))?;
-        Ok(Authority {
-            calls,
+        });
+        // A journal whose presence cannot be read is left to the thread,
+        // which fails closed on it.
+        let journal = !matches!(place.journal().try_exists(), Ok(false));
+        let (publish, ids) = watch::channel(if journal {
+            Ids::Loading
+        } else {
+            Ids::Known(HashSet::new())
+        });
+        let authority = Authority {
+            writer: Arc::new(Mutex::new(Writer::Idle {
+                place,
+                publish: Arc::new(publish),
+            })),
             ids,
             #[cfg(test)]
-            spawned: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
-        })
+            spawned: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        if journal {
+            authority.queue()?;
+        }
+        Ok(authority)
     }
 
     /// How many threads this authority started.
     #[cfg(test)]
     pub(crate) fn threads(&self) -> usize {
         self.spawned.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The thread's queue, starting the thread when none runs.
+    fn queue(&self) -> std::io::Result<mpsc::Sender<Call>> {
+        let mut writer = crate::node::lock(&self.writer);
+        let (place, publish) = match &*writer {
+            Writer::Running(calls) => return Ok(calls.clone()),
+            Writer::Idle { place, publish } => (Arc::clone(place), Arc::clone(publish)),
+        };
+        let (calls, queue) = mpsc::channel(QUEUE);
+        std::thread::Builder::new()
+            .name("fabric-authority".into())
+            .spawn(move || serve(&place, queue, &publish))?;
+        #[cfg(test)]
+        self.spawned
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *writer = Writer::Running(calls.clone());
+        Ok(calls)
+    }
+
+    /// Whether no thread runs: no journal at start and no command since,
+    /// so the authority holds no job. Read under the lock a command
+    /// starts the thread under.
+    fn idle(&self) -> bool {
+        matches!(*crate::node::lock(&self.writer), Writer::Idle { .. })
     }
 
     /// Whether the journal holds `job`, without waiting behind the queue:
@@ -169,8 +226,11 @@ impl Authority {
     }
 
     async fn call<T>(&self, make: impl FnOnce(Reply<T>) -> Call) -> Result<T, AuthorityError> {
+        let calls = self
+            .queue()
+            .map_err(|e| AuthorityError::Unavailable(format!("its thread did not start: {e}")))?;
         let (reply, answer) = oneshot::channel();
-        self.calls
+        calls
             .send(make(reply))
             .await
             .map_err(|_| AuthorityError::Unavailable("its thread ended".into()))?;
@@ -219,16 +279,23 @@ impl Authority {
 
     /// A managed job, or `None` when the authority has no such job.
     pub(crate) async fn job(&self, job: JobId) -> Result<Option<ManagedState>, AuthorityError> {
+        if self.idle() {
+            return Ok(None);
+        }
         self.call(|reply| Call::Job(job, reply)).await
     }
 
     /// Every managed job, oldest first.
     pub(crate) async fn list(&self) -> Result<Vec<ManagedState>, AuthorityError> {
+        if self.idle() {
+            return Ok(Vec::new());
+        }
         self.call(Call::List).await
     }
 }
 
 /// Where the authority keeps its journal and where standalone jobs live.
+#[derive(Debug)]
 struct Place {
     dir: PathBuf,
     jobs: PathBuf,
@@ -257,9 +324,17 @@ enum Holder {
 /// The journal's ids are published once it opens, before `verify`.
 fn open_existing(place: &Place, ids: &watch::Sender<Ids>) -> Holder {
     let path = place.journal();
-    if !path.exists() {
-        ids.send_replace(Ids::Known(HashSet::new()));
-        return Holder::Absent;
+    match path.try_exists() {
+        Ok(true) => {}
+        Ok(false) => {
+            ids.send_replace(Ids::Known(HashSet::new()));
+            return Holder::Absent;
+        }
+        Err(e) => {
+            let e = format!("{}: {e}", path.display());
+            ids.send_replace(Ids::Unreadable(e.clone()));
+            return stopped(&e);
+        }
     }
     let started = std::time::Instant::now();
     let opened = Journal::open(&path)

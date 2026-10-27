@@ -297,7 +297,6 @@ async fn legacy_state_from_main_is_untouched_by_a_managed_job_beside_it() {
 /// call, and otherwise with the first managed command; a read before
 /// that answers from the start's look, which found no journal.
 #[tokio::test]
-#[ignore = "perf-ab 6: expected failure until fixed"]
 async fn the_thread_starts_with_a_journal_or_with_the_first_managed_command() {
     let dir = tempfile::tempdir().unwrap();
     let state = state(dir.path());
@@ -332,4 +331,30 @@ async fn the_thread_starts_with_a_journal_or_with_the_first_managed_command() {
     assert_eq!(authority.threads(), 1);
     assert!(authority.holds(job).await.unwrap());
     assert_eq!(authority.list().await.unwrap().len(), 2);
+}
+
+/// A journal whose presence cannot be read, here under a managed
+/// directory this user cannot search, is not taken for no journal: the
+/// start leaves it to the thread, which refuses every id as it does for a
+/// journal that does not open, so a standalone job is never made under a
+/// managed one's id.
+#[tokio::test]
+async fn a_journal_that_cannot_be_looked_at_refuses_every_id() {
+    // Root searches any directory, so the look cannot fail.
+    if rustix::process::geteuid().as_raw() == 0 {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let managed = managed_dir(&state);
+    std::fs::create_dir_all(&managed).unwrap();
+    std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let authority = Authority::start(&state, NODE).unwrap();
+    let held = authority.holds(JobId::from_bytes([9; 16])).await;
+    std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        matches!(held, Err(AuthorityError::Unavailable(_))),
+        "{held:?}"
+    );
+    assert_eq!(authority.threads(), 1);
 }

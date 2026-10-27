@@ -155,8 +155,9 @@ impl Node {
             tracing::warn!(error = %e, "the environment a client last sent does not read; the node uses its own until a client sends one");
             None
         });
-        // One stat on the start path: the authority's thread opens and
-        // recovers an existing journal on its own, and makes none.
+        // One stat on the start path. The authority's thread starts only
+        // for an existing journal, which it opens and recovers on its own,
+        // or with the first managed command; it makes no journal.
         let authority = crate::authority::Authority::start(&cfg.state, identity.node_id())
             .map_err(|e| NodeError::io(crate::authority::managed_dir(&cfg.state), e))?;
         let node = Arc::new(Self {
