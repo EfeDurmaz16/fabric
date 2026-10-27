@@ -510,13 +510,13 @@ async fn keychain(
     }
     let keychain = keychain.to_str()?;
     let launchctl = find_on_path("launchctl", env.path_var())?;
+    let null = Null::open();
     let session = probe_command(
         &launchctl,
         &["managername"],
         Probe::Output,
-        env,
-        home,
-        inherited,
+        (env, home, inherited),
+        &null,
     )
     .await?;
     if session == "Aqua" {
@@ -527,9 +527,8 @@ async fn keychain(
         &security,
         &["show-keychain-info", keychain],
         Probe::ExitCode,
-        env,
-        home,
-        inherited,
+        (env, home, inherited),
+        &null,
     )
     .await?;
     Some(if readable == "yes" {
@@ -548,17 +547,25 @@ async fn run_all(
     home: &Path,
     inherited: &[(OsString, OsString)],
 ) -> Vec<(&'static str, String)> {
+    if found.is_empty() {
+        return Vec::new();
+    }
     let env = Arc::new(env.clone());
     let own = Arc::new(own.clone());
     let inherited: Arc<[(OsString, OsString)]> = inherited.into();
+    let null = Null::open();
     let mut set = tokio::task::JoinSet::new();
     for (tool, binary) in found {
         for &(fact, args, probe) in tool.commands() {
             let env = Arc::clone(if *tool == Tool::Git { &own } else { &env });
-            let (binary, home, inherited) =
-                (binary.clone(), home.to_owned(), Arc::clone(&inherited));
+            let (binary, home, inherited, null) = (
+                binary.clone(),
+                home.to_owned(),
+                Arc::clone(&inherited),
+                null.clone(),
+            );
             set.spawn(async move {
-                probe_command(&binary, args, probe, &env, &home, &inherited)
+                probe_command(&binary, args, probe, (&env, &home, &inherited), &null)
                     .await
                     .map(|value| (fact, value))
             });
@@ -768,21 +775,47 @@ fn left_out_value(names: &[&str]) -> String {
     }
 }
 
+/// `/dev/null`, opened once for the probes of one measure and lent to each
+/// through a duplicate of its descriptor, so a probe's input and unread
+/// output cost a `dup` each instead of an `open`. `None` when it could
+/// not be opened: each probe then opens its own (`Stdio::null`).
+#[derive(Debug, Clone)]
+struct Null(Option<Arc<std::fs::File>>);
+
+impl Null {
+    fn open() -> Self {
+        Self(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/null")
+                .ok()
+                .map(Arc::new),
+        )
+    }
+
+    fn stdio(&self) -> Stdio {
+        self.0
+            .as_ref()
+            .and_then(|null| null.try_clone().ok())
+            .map_or_else(Stdio::null, Stdio::from)
+    }
+}
+
 /// Runs one measuring command and reads its answer, within `COMMAND_TIMEOUT`.
 ///
 /// Only the standard output of an `Output` probe is a pipe, and it is
 /// read as it arrives ([`read_fact`]): the moment the value can no longer
 /// be a fact, the command is killed and gives none, so no tool can make
-/// this node hold more than one fact of its output (M2-13). An `ExitCode`
-/// probe's output and every probe's error output go to `/dev/null`, as
+/// this node hold more than one fact of its output (M2-13). Its input, an
+/// `ExitCode` probe's output and every probe's error output are `null`, as
 /// nothing reads them.
 async fn probe_command(
     binary: &Path,
     args: &[&str],
     probe: Probe,
-    env: &ToolEnv,
-    home: &Path,
-    inherited: &[(OsString, OsString)],
+    (env, home, inherited): (&ToolEnv, &Path, &[(OsString, OsString)]),
+    null: &Null,
 ) -> Option<String> {
     let path_var = env.path_var();
     let mut command = tokio::process::Command::new(binary);
@@ -800,12 +833,12 @@ async fn probe_command(
         .env("PATH", path_var)
         .env("HOME", home)
         .env("LC_ALL", "C")
-        .stdin(Stdio::null())
+        .stdin(null.stdio())
         .stdout(match probe {
             Probe::Output => Stdio::piped(),
-            Probe::ExitCode => Stdio::null(),
+            Probe::ExitCode => null.stdio(),
         })
-        .stderr(Stdio::null())
+        .stderr(null.stdio())
         .kill_on_drop(true);
     tracing::debug!(?binary, ?args, "measuring");
     let answer = tokio::time::timeout(COMMAND_TIMEOUT, answer(command, probe)).await;
@@ -839,7 +872,9 @@ async fn read_fact(mut out: impl tokio::io::AsyncRead + Unpin) -> Option<String>
     use tokio::io::AsyncReadExt;
 
     let mut fact = Trimmed::default();
-    let mut buf = [0u8; 4096];
+    // Enough for a version or a path in one read, `rustc -vV` in one or
+    // two; the buffer lives in each probe's task.
+    let mut buf = [0u8; 512];
     loop {
         match out.read(&mut buf).await.ok()? {
             0 => return fact.finish(),
