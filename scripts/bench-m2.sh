@@ -45,7 +45,7 @@ machine() {
 {
   echo "commit: $(git rev-parse HEAD)"
   echo "dirty: $(git status --porcelain | wc -l | tr -d ' ') paths"
-  echo "uname: $(uname -a)"
+  echo "uname: $(uname -srvm)"
   if command -v sysctl >/dev/null 2>&1; then
     echo "cpu: $(sysctl -n machdep.cpu.brand_string 2>/dev/null || true) $(sysctl -n hw.ncpu 2>/dev/null || true) cores"
   fi
