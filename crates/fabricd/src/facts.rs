@@ -4,7 +4,10 @@
 //! Invariant: every fact is a tool's own output, trimmed and otherwise kept
 //! whole, and a fact that could not be measured is absent, never empty or
 //! guessed. A login is measured by exit code alone and recorded as `yes` or
-//! `no`; no account name is ever read. A carry key is built only from
+//! `no`; no account name is ever read. Where Claude Code reports no login,
+//! whether the daemon can read the login Keychain Claude Code keeps it in
+//! is measured by exit code too (`claude.keychain`), and nothing the
+//! Keychain holds is read. A carry key is built only from
 //! measured facts, and a cache whose facts are unknown gets
 //! `CarryKey::Unmeasured`, which never matches. What makes a cache again is
 //! recorded beside its key, and a cache detection found no lockfile or step
@@ -93,6 +96,12 @@ pub mod name {
     pub const CLAUDE: &str = "claude.version";
     /// `claude auth status`, exit code only.
     pub const CLAUDE_LOGIN: &str = "claude.login";
+    /// Whether this daemon can read the login Keychain, where Claude Code
+    /// on macOS keeps its login: `readable` or `locked`. Measured only
+    /// when `claude auth status` reports no login, the home holds a login
+    /// keychain and the daemon runs outside the desktop session
+    /// (`keychain`, issue #28 F12).
+    pub const CLAUDE_KEYCHAIN: &str = "claude.keychain";
     /// `codex --version`.
     pub const CODEX: &str = "codex.version";
     /// `codex login status`, exit code only.
@@ -164,7 +173,8 @@ pub enum Tool {
     Uv,
     /// `claude --version`.
     Claude,
-    /// `claude auth status`, which only a move or resume target needs.
+    /// `claude auth status`, which only a move or resume target needs,
+    /// and when it reports no login, whether the login Keychain reads.
     ClaudeLogin,
     /// `codex --version`.
     Codex,
@@ -411,8 +421,75 @@ impl NodeFacts {
             .collect();
         let mut facts = NodeFacts::without_tools(home, env);
         facts.put(run_all(&found, (env, &own), home, inherited).await);
+        if facts.get(name::CLAUDE_LOGIN) == Some("no")
+            && let Some(keychain) = keychain(home, env, inherited).await
+        {
+            facts.put(vec![(name::CLAUDE_KEYCHAIN, keychain.to_owned())]);
+        }
         facts
     }
+}
+
+/// The login keychain under the home, where Claude Code on macOS keeps its
+/// login.
+const LOGIN_KEYCHAIN: &str = "Library/Keychains/login.keychain-db";
+
+/// What `claude.keychain` says when this daemon cannot read the login
+/// keychain.
+pub const KEYCHAIN_LOCKED: &str = "locked";
+
+/// Whether this daemon can read the login keychain, asked only once
+/// `claude auth status` reported no login, to tell a login the daemon
+/// cannot see from no login at all (issue #28, gate finding F12).
+///
+/// A process in the desktop session reads the keychain as any app there
+/// does. One started over SSH, or as a system daemon, finds it locked
+/// whatever the desktop unlocked, and Claude Code then reports no login.
+/// `launchctl managername` says which session this process is in, and
+/// only outside the desktop's (`Aqua`), where `security` has no screen to
+/// ask for a password on, `security show-keychain-info` on the keychain
+/// answers by its exit code. Neither reads anything the keychain holds.
+/// `None` when the home holds no login keychain, as on Linux, where Claude
+/// Code keeps its login in a file; in the desktop session; or when either
+/// tool is missing or does not answer.
+async fn keychain(
+    home: &Path,
+    env: &ToolEnv,
+    inherited: &[(OsString, OsString)],
+) -> Option<&'static str> {
+    let keychain = home.join(LOGIN_KEYCHAIN);
+    if !keychain.is_file() {
+        return None;
+    }
+    let keychain = keychain.to_str()?;
+    let launchctl = find_on_path("launchctl", env.path_var())?;
+    let session = probe_command(
+        &launchctl,
+        &["managername"],
+        Probe::Output,
+        env,
+        home,
+        inherited,
+    )
+    .await?;
+    if session == "Aqua" {
+        return None;
+    }
+    let security = find_on_path("security", env.path_var())?;
+    let readable = probe_command(
+        &security,
+        &["show-keychain-info", keychain],
+        Probe::ExitCode,
+        env,
+        home,
+        inherited,
+    )
+    .await?;
+    Some(if readable == "yes" {
+        "readable"
+    } else {
+        KEYCHAIN_LOCKED
+    })
 }
 
 /// Runs every command of every tool in `found` at once, each with the
@@ -552,11 +629,14 @@ impl NodeFacts {
     /// measure of `probes` would have found on the node these describe.
     #[cfg(test)]
     pub(crate) fn only(&self, probes: Probes) -> Self {
-        let dropped: Vec<&str> = Tool::ALL
+        let mut dropped: Vec<&str> = Tool::ALL
             .into_iter()
             .filter(|tool| !probes.contains(*tool))
             .flat_map(|tool| tool.commands().iter().map(|(fact, _, _)| *fact))
             .collect();
+        if !probes.contains(Tool::ClaudeLogin) {
+            dropped.push(name::CLAUDE_KEYCHAIN);
+        }
         Self(
             self.0
                 .iter()
@@ -1225,6 +1305,64 @@ pub(crate) mod tests {
         let default_cargo = home.join(".cargo");
         assert_eq!(facts.get(name::CARGO_HOME), default_cargo.to_str());
         assert_eq!(facts.get(name::PNPM_STORE), Some("unset/store"));
+    }
+
+    /// Gate finding F12: Claude Code keeps its login in the login
+    /// Keychain, which a daemon started over SSH cannot read, so such a
+    /// daemon measured no login and said nothing more. Once `claude auth
+    /// status` reports no login, a daemon outside the desktop session asks
+    /// `security` whether the login keychain reads; one in the desktop
+    /// session, a home with no login keychain and a login that answers yes
+    /// run nothing more, so no hot path starts another process.
+    #[tokio::test]
+    async fn the_keychain_is_asked_only_when_claude_reports_no_login_outside_the_desktop() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = CountingTools::only(dir.path(), &["claude"]);
+        let session = dir.path().join("session");
+        let locked = dir.path().join("locked");
+        tools.install("launchctl", &format!("cat '{}'", session.display()));
+        tools.install("security", &format!("[ ! -f '{}' ]", locked.display()));
+        let home = dir.path().join("home");
+        let keychain = home.join(LOGIN_KEYCHAIN);
+        std::fs::create_dir_all(keychain.parent().unwrap()).unwrap();
+        std::fs::write(&keychain, "").unwrap();
+        let login = Probes::NONE.with(Tool::ClaudeLogin);
+        let measured = || async {
+            let facts = NodeFacts::measure(&home, &tools.env, login).await;
+            let ran: Vec<String> = tools
+                .ran()
+                .into_iter()
+                .filter(|line| !line.starts_with("claude "))
+                .collect();
+            (facts.get(name::CLAUDE_KEYCHAIN).map(str::to_owned), ran)
+        };
+        let asked = vec![
+            "launchctl managername".to_owned(),
+            format!("security show-keychain-info {}", keychain.display()),
+        ];
+
+        std::fs::write(&session, "Background\n").unwrap();
+        assert_eq!(measured().await, (None, vec![]), "logged in");
+        tools.log_out();
+        std::fs::write(&locked, "").unwrap();
+        assert_eq!(
+            measured().await,
+            (Some(KEYCHAIN_LOCKED.to_owned()), asked.clone())
+        );
+        std::fs::remove_file(&locked).unwrap();
+        assert_eq!(
+            measured().await,
+            (Some("readable".to_owned()), asked.clone())
+        );
+        std::fs::write(&session, "Aqua\n").unwrap();
+        assert_eq!(
+            measured().await,
+            (None, vec!["launchctl managername".to_owned()]),
+            "desktop session"
+        );
+        std::fs::write(&session, "Background\n").unwrap();
+        std::fs::remove_file(&keychain).unwrap();
+        assert_eq!(measured().await, (None, vec![]), "no login keychain");
     }
 
     /// Every fact a node can measure, as a rich node would answer.

@@ -269,6 +269,11 @@ pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row
     rows
 }
 
+/// The login row's note when the target's daemon reported no Claude login
+/// and could not read the login Keychain Claude Code keeps it in (issue
+/// #28, gate finding F12): logging in again would not help.
+const LOCKED_KEYCHAIN: &str = "the target's daemon cannot read the login Keychain, where Claude Code keeps its login, so it sees none; a daemon started over SSH cannot read it, so start `fabric serve` on the target from its desktop session, in Terminal or as a launchd user agent";
+
 fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row> {
     let mut rows = Vec::new();
     let pairs = [
@@ -302,6 +307,10 @@ fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Ro
             Target::Here => here.get(login),
         };
         let refused = used && target_login != Some("yes");
+        let target_keychain = match ctx.target {
+            Target::Peer => peer.get(name::CLAUDE_KEYCHAIN),
+            Target::Here => here.get(name::CLAUDE_KEYCHAIN),
+        };
         rows.push(Row {
             fact: login,
             here: value(here, login),
@@ -311,10 +320,14 @@ fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Ro
             } else {
                 Outcome::Equal
             },
-            note: if refused {
-                "the target has no login for the job's harness; log in there first".to_owned()
-            } else {
+            note: if !refused {
                 String::new()
+            } else if login == name::CLAUDE_LOGIN
+                && target_keychain == Some(crate::facts::KEYCHAIN_LOCKED)
+            {
+                LOCKED_KEYCHAIN.to_owned()
+            } else {
+                "the target has no login for the job's harness; log in there first".to_owned()
             },
         });
     }
@@ -1087,6 +1100,51 @@ mod tests {
                 ),
                 "{fact}"
             );
+        }
+    }
+
+    /// Gate finding F12: Claude Code keeps its login in the login
+    /// Keychain, which a daemon started over SSH cannot read, so the
+    /// target reported no login and the row said to log in there, which
+    /// would not help. When the target measured its Keychain locked, the
+    /// row still refuses with no waiver, and says why and what to do, for
+    /// a push as for a pull.
+    #[test]
+    fn a_target_whose_daemon_cannot_read_the_keychain_says_so() {
+        let claude = HarnessKind::ClaudeCode;
+        for target in [Target::Peer, Target::Here] {
+            let note = |keychain: Option<&str>| {
+                let onto = with(
+                    &pro(),
+                    &[
+                        (name::CLAUDE_LOGIN, Some("no")),
+                        (name::CLAUDE_KEYCHAIN, keychain),
+                    ],
+                );
+                let context = Context {
+                    target,
+                    ..ctx(Some(&claude))
+                };
+                let rows = match target {
+                    Target::Peer => compare(&pro(), &onto, &context),
+                    Target::Here => compare(&onto, &pro(), &context),
+                };
+                let row = rows.iter().find(|r| r.fact == name::CLAUDE_LOGIN).unwrap();
+                assert_eq!(
+                    row.outcome,
+                    Outcome::Refuse(Waiver::Never),
+                    "{target:?} {keychain:?}"
+                );
+                row.note.clone()
+            };
+            assert_eq!(note(Some("locked")), LOCKED_KEYCHAIN, "{target:?}");
+            for keychain in [None, Some("readable")] {
+                assert_eq!(
+                    note(keychain),
+                    "the target has no login for the job's harness; log in there first",
+                    "{target:?} {keychain:?}"
+                );
+            }
         }
     }
 
