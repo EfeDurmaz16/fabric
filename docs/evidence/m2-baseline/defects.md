@@ -69,7 +69,7 @@ Recorded on 2026-10-27 on `m2/durable-job-foundations` after the owner branches 
 
 | ID | Status | Fix and proof |
 |---|---|---|
-| R2 (#17) | fixed | `381230a`: every launch starts held behind the `/bin/sh` trampoline, and the CLI releases it after the node records it; the trait ACP launch handshakes only after release. Tests: `codex_roundtrip::a_headless_launch_runs_nothing_until_it_is_released`, `acp_roundtrip::the_trait_launch_holds_the_agent_until_it_is_released`, e2e `e2e_a_headless_run_killed_before_its_harness_is_recorded_leaves_nothing_running`, `e2e_an_acp_run_killed_before_its_agent_is_recorded_leaves_nothing_running`, `e2e_a_run_ended_before_its_harness_is_recorded_stops_it` |
+| R2 (#17) | fixed | `381230a`: every launch starts held behind the `/bin/sh` trampoline, and the CLI releases it after the node records it; the trait ACP launch handshakes only after release. Tests: `codex_roundtrip::a_headless_launch_runs_nothing_until_it_is_released`, `acp_roundtrip::the_trait_launch_holds_the_agent_until_it_is_released`, e2e `e2e_a_headless_run_killed_before_its_harness_is_recorded_leaves_nothing_running`, `e2e_an_acp_run_killed_before_its_agent_is_recorded_leaves_nothing_running`, `e2e_a_run_ended_before_its_harness_is_recorded_stops_it`. `2b05583` releases a harness not wired to the terminal on the node's `harness_recorded` event, once its record is durable, which brought headless launch back from 1.58 to 1.23 times the baseline (`docs/evidence/m2-integration/perf.md`) |
 | M2-01 | fixed | `95895ef`: the CLI prints an ACP turn's answer and exits 1 on a failed turn. Tests: `acp_cli::e2e_a_headless_acp_run_prints_the_answer`, `acp_cli::e2e_a_failed_acp_turn_fails_the_run` |
 | M2-02 (#16) | fixed | `0e478e4`, `2e747cd`: `RequestBody::FactsFor`, protocol version 4, a push refused when the target lacks the job's agent. Test: `preflight::e2e_a_push_refuses_a_target_without_the_jobs_acp_agent` |
 | H2 | fixed | `a6f9d17`: only a whole `${NAME}`, bare `$NAME` outside single quotes, or marker is exempt. Test: `redact::tests::a_literal_assignment_starting_with_a_dollar_or_a_bracket_is_redacted` |
@@ -78,7 +78,7 @@ Recorded on 2026-10-27 on `m2/durable-job-foundations` after the owner branches 
 | M2-03 | fixed | `cc336a2`, `3f4346f`: the store asks the core's `SecretPolicy`. Tests: `policy::the_store_classifies_secrets_as_the_core_does`, `workspace::untracked_work_the_core_carries_comes_back` |
 | M2-04 (#20) | fixed | `e8d1834`, `a458b96`: manifest format 3 keeps each file's mode. Test: `workspace::a_file_of_the_working_tree_keeps_its_permission_bits` |
 | M2-05 (#21) | fixed | `2ef2542`: root mode and mtime of the workspace and harness state. Tests: `workspace::the_workspace_root_keeps_its_mode_and_mtime`, `the_harness_state_root_and_a_read_only_root_keep_their_mode_and_mtime` |
-| M2-06 (#22) | fixed | `bf51d26`. Test: `workspace::a_symbolic_ref_comes_back_symbolic` |
+| M2-06 (#22) | fixed | `bf51d26`. Test: `workspace::a_symbolic_ref_comes_back_symbolic`. A restore of a cloned workspace runs one more `git` for `refs/remotes/origin/HEAD`; `budget.toml` records it (`84167d5`) |
 | M2-07 | fixed | `dd632aa`: a dropped file is checked again before its unlink. Test: `pipeline::tests::a_dropped_file_edited_before_its_removal_is_kept` |
 | ENV-1 | fixed | `449c306`: the sentinel holds a steps digest. Test: `freshness::a_changed_setup_recipe_fills_its_cache_again` |
 | ENV-2 | fixed | `3bb0dac`: `-r` and `-c` includes are `.venv` inputs. Test: `freshness::an_edited_included_requirements_file_makes_the_venv_stale` |
