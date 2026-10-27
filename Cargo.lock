@@ -420,6 +420,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fabric-journal"
+version = "0.1.0"
+dependencies = [
+ "fabric-core",
+ "rusqlite",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "fabric-net"
 version = "0.1.0"
 dependencies = [
