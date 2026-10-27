@@ -994,6 +994,160 @@ async fn a_killed_worker_leaves_unknown_and_a_restart_sends_nothing_twice() {
     assert_eq!(bridge.close().await.unwrap().code(), Some(0));
 }
 
+/// Observe settles an operation only from its own resource, against a
+/// worker that answers `completed` for a destroy of a resource that is
+/// not there. A pending destroy observed by another locator or as another
+/// action, and a lost create observed on another job's sandbox, are
+/// refused before any frame; the destroy stays dispatched while its
+/// target is still stopping. A destroy whose answer Fabric never read
+/// keeps its target through a restart, and is observed by it.
+#[tokio::test]
+#[ignore = "needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one journal through the refusals, a restart and the settlements"
+)]
+async fn observe_reads_only_the_operations_own_resource() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let mut worker = fixture_config(&["fx-a", "fx-b"]);
+    for native_id in ["fx-a", "fx-b"] {
+        worker["approvals"].as_array_mut().unwrap().push(json!({
+            "ref": format!("apr-destroy-{native_id}"),
+            "action": "sandbox.destroy",
+            "native_id": native_id,
+            "expired": false,
+        }));
+    }
+    worker["script"].as_array_mut().unwrap().push(json!({
+        "action": "sandbox.destroy",
+        "native_id": "fx-a",
+        "behavior": "stay_stopping_until_settle",
+    }));
+    let path = write_config(dir.path(), "observe.json", &worker);
+    let bridge = spawn("fixture", &path).await;
+
+    let pending = bridge
+        .request(
+            &mut journal,
+            destroy(60, &fx("fx-a"), Some("apr-destroy-fx-a")),
+        )
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(pending.status, ProviderStatus::Dispatched);
+    assert_eq!(refusal(&pending).0, ErrorCode::Pending);
+    for (action, resource) in [
+        ("sandbox.destroy", fx("fx-ghost")),
+        ("sandbox.create", fx("fx-seed")),
+    ] {
+        let refused = bridge
+            .observe(&mut journal, id(60), action, resource, 1_000)
+            .await;
+        assert!(
+            matches!(refused, Err(BridgeError::ObserveMismatch { .. })),
+            "{action}: {refused:?}"
+        );
+    }
+    let own = bridge
+        .observe(&mut journal, id(60), "sandbox.destroy", fx("fx-a"), 1_000)
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    // Read by its own target, the sandbox is still stopping: not gone.
+    assert_eq!(own.status, ProviderStatus::Dispatched);
+    assert_eq!(refusal(&own).0, ErrorCode::Pending);
+
+    let lost = bridge
+        .request(&mut journal, create(11, "fixture/ok"))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(lost.status, ProviderStatus::Unknown);
+    let refused = bridge
+        .observe(
+            &mut journal,
+            id(11),
+            "sandbox.create",
+            fx("fx-other-job"),
+            1_000,
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(BridgeError::ObserveMismatch { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(entry(&journal, id(11)).status, ProviderStatus::Unknown);
+    let settled = bridge
+        .observe(
+            &mut journal,
+            id(11),
+            "sandbox.create",
+            fx("fx-key-11"),
+            1_000,
+        )
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(settled.status, ProviderStatus::Succeeded);
+
+    // A destroy is sent and Fabric stops before reading its answer.
+    let unread = bridge
+        .request(
+            &mut journal,
+            destroy(62, &fx("fx-b"), Some("apr-destroy-fx-b")),
+        )
+        .await
+        .unwrap();
+    drop(unread);
+    bridge.kill().await;
+    drop(bridge);
+    drop(journal);
+    let mut journal = Journal::open(&dir.path().join(fabric_journal::FILE_NAME)).unwrap();
+    let recovery = journal
+        .recover(1_770_000_000_000, |_| fabric_journal::Liveness::CannotTell)
+        .unwrap();
+    assert!(recovery.provider_unknown.contains(&(scope().job, id(62))));
+    let row = entry(&journal, id(62));
+    assert_eq!(row.status, ProviderStatus::Unknown);
+    assert_eq!(row.dispatch.target, Some(stored(&fx("fx-b"))));
+
+    let bridge = spawn("fixture", &path).await;
+    let refused = bridge
+        .observe(
+            &mut journal,
+            id(62),
+            "sandbox.destroy",
+            fx("fx-ghost"),
+            1_000,
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(BridgeError::ObserveMismatch { .. })),
+        "{refused:?}"
+    );
+    // The restarted fixture provider holds fx-b again, so it is not gone:
+    // still unknown, never settled from another resource.
+    let observed = bridge
+        .observe(&mut journal, id(62), "sandbox.destroy", fx("fx-b"), 1_000)
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(observed.status, ProviderStatus::Unknown);
+    assert_eq!(refusal(&observed).0, ErrorCode::Pending);
+    assert_eq!(bridge.close().await.unwrap().code(), Some(0));
+}
+
 // ---------------------------------------------------------------------------
 // The Docker profile against the local engine.
 // ---------------------------------------------------------------------------
