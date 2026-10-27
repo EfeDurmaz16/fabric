@@ -13,7 +13,8 @@
 //! file whose digest does not match; then a file of the session on this
 //! node that the incoming state lacks, unless it is a rewritable file this
 //! node left untouched since the job left, which goes once the rest is
-//! placed. Only after all of that does it place files, all or nothing. An
+//! placed and only while it is still what was checked (M2-07). Only after
+//! all of that does it place files, all or nothing. An
 //! adapter supplies only what differs: its sources, and where a tree path
 //! lands on this node.
 
@@ -42,7 +43,7 @@ use crate::durable;
 use crate::error::{HarnessError, Input, IoOp};
 use crate::harness::Restored;
 use crate::manifest::{Carried, Content, Mutability, StateManifest};
-use crate::place::{self, Placement};
+use crate::place::{self, Placement, Seen};
 use crate::redact::RedactionCounts;
 use crate::stage::{self, Source};
 
@@ -334,10 +335,34 @@ where
     };
     let dropped = dropped_files(&placements, held, &departure)?;
     let placed = place::place_all(&placements, &|dest| departure.unchanged(dest))?;
-    for path in &dropped {
-        durable::remove_durable(path)?;
-    }
+    remove_dropped(&dropped)?;
     Ok(Restored { manifest, placed })
+}
+
+/// A file of the session the job dropped, and what it was when restore
+/// found it still holding the bytes this node recorded at departure.
+#[derive(Debug)]
+struct Dropped {
+    path: PathBuf,
+    seen: Seen,
+}
+
+/// Removes each dropped file, checking first that it is still what was
+/// seen when it was found unchanged (M2-07).
+///
+/// Placement runs between that check and the removal, so a harness that
+/// started after the running-harness guard could edit the file there; the
+/// edit would be lost with the unlink. A file whose length, times or inode
+/// moved stops the restore with `StateChanged`, as a moved destination does
+/// in `place_all`, and stays with the edit. A write that lands between this
+/// check and the unlink is not caught; only a lock the harness itself
+/// honours could close that window.
+fn remove_dropped(dropped: &[Dropped]) -> Result<(), HarnessError> {
+    for file in dropped {
+        file.seen.still(&file.path)?;
+        durable::remove_durable(&file.path)?;
+    }
+    Ok(())
 }
 
 /// The files of the session on this node that the incoming state does not
@@ -354,7 +379,7 @@ fn dropped_files(
     placements: &[Placement],
     held: &[Source],
     departure: &Departure,
-) -> Result<Vec<PathBuf>, HarnessError> {
+) -> Result<Vec<Dropped>, HarnessError> {
     let folded = |path: &Path| path.to_string_lossy().to_lowercase();
     let placed: HashSet<String> = placements.iter().map(|p| folded(&p.dest)).collect();
     let mut dropped = Vec::new();
@@ -362,8 +387,14 @@ fn dropped_files(
         if placed.contains(&folded(&source.abs)) || denylist::check(source.rel.as_str()).is_some() {
             continue;
         }
+        // Read before the digest, so a write during the compare shows when
+        // the file is checked again just before its removal.
+        let seen = Seen::of(&source.abs)?;
         if source.mutability == Mutability::Replaceable && departure.unchanged(&source.abs)? {
-            dropped.push(source.abs.clone());
+            dropped.push(Dropped {
+                path: source.abs.clone(),
+                seen,
+            });
         } else {
             return Err(HarnessError::StateDiverged {
                 path: source.abs.clone(),
@@ -376,6 +407,36 @@ fn dropped_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M2-07: a dropped file edited after it was found unchanged, while the
+    /// rest was placed, stays with the edit and stops the restore; one that
+    /// did not change goes.
+    #[test]
+    fn a_dropped_file_edited_before_its_removal_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let kept = dir.path().join("MEMORY.md");
+        let gone = dir.path().join("notes.md");
+        std::fs::write(&kept, b"recorded\n").unwrap();
+        std::fs::write(&gone, b"recorded\n").unwrap();
+        let dropped = [&gone, &kept].map(|path| Dropped {
+            path: path.clone(),
+            seen: Seen::of(path).unwrap(),
+        });
+        // Placement runs here; a harness appends to one of the files.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&kept)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"edited\n").unwrap();
+        drop(file);
+        let err = remove_dropped(&dropped).unwrap_err();
+        assert!(
+            matches!(err, HarnessError::StateChanged { ref path } if path == &kept),
+            "{err}"
+        );
+        assert!(!gone.exists());
+        assert_eq!(std::fs::read(&kept).unwrap(), b"recorded\nedited\n");
+    }
 
     #[test]
     fn walk_skips_temp_files_and_refuses_symlinks() {

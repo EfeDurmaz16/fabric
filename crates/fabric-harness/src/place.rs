@@ -180,10 +180,11 @@ enum Step {
 /// What a destination was when restore planned it: its device, inode,
 /// length, modification and change times, or `None` when it was missing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Seen(Option<[i64; 7]>);
+pub(crate) struct Seen(Option<[i64; 7]>);
 
 impl Seen {
-    fn of(path: &Path) -> Result<Self, HarnessError> {
+    /// Reads what `path` is now, without following a link.
+    pub(crate) fn of(path: &Path) -> Result<Self, HarnessError> {
         let meta = match fs::symlink_metadata(path) {
             Ok(meta) => meta,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Seen(None)),
@@ -202,7 +203,7 @@ impl Seen {
     }
 
     /// Refuses `path` when it is no longer what was seen.
-    fn still(self, path: &Path) -> Result<(), HarnessError> {
+    pub(crate) fn still(self, path: &Path) -> Result<(), HarnessError> {
         if Seen::of(path)? == self {
             Ok(())
         } else {
