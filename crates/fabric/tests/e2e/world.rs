@@ -36,6 +36,10 @@ const FAULT_TIMEOUT: Duration = Duration::from_mins(2);
 /// time budget measures a start to within a few milliseconds.
 const START_POLL: Duration = Duration::from_millis(10);
 
+/// How long `finish` waits for the output of a command it killed: a
+/// process the command started may still hold its pipes.
+const KILLED_OUTPUT_WAIT: Duration = Duration::from_secs(10);
+
 /// What every process the test starts shares.
 pub struct Env {
     _dir: tempfile::TempDir,
@@ -799,8 +803,17 @@ pub fn finish(child: Child, timeout: Duration) -> Fallible<Output> {
         return Ok(output?);
     }
     let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-    let output = waited.recv()??;
-    Err(format!("a command ran past {timeout:?}:\n{}", text(&output)).into())
+    // The kill ends the command, but its output ends only when every
+    // process holding its pipes is gone: a harness it left running would
+    // keep the wait, and the test, open for good (M2-24).
+    match waited.recv_timeout(KILLED_OUTPUT_WAIT) {
+        Ok(output) => Err(format!("a command ran past {timeout:?}:\n{}", text(&output?)).into()),
+        Err(_) => Err(format!(
+            "a command ran past {timeout:?}, and its output did not end \
+             {KILLED_OUTPUT_WAIT:?} after it was killed"
+        )
+        .into()),
+    }
 }
 
 /// True while a process with `pid` exists.
@@ -902,4 +915,24 @@ pub fn read_work(env: &Env, job: &str) -> Fallible<Work> {
         deps: fs::read_to_string(work.join("node_modules/leftpad/index.js"))?,
         build: fs::read_to_string(work.join("dist/out.js"))?,
     })
+}
+
+/// M2-24: a command killed past its timeout whose child keeps its pipes
+/// open makes `finish` fail within its bound, not hang until the child ends.
+#[test]
+fn a_killed_command_whose_child_keeps_its_pipes_fails_in_time() {
+    let child = Command::new("/bin/sh")
+        .args(["-c", "sleep 40 & sleep 40"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    let finished = finish(child, Duration::from_millis(200));
+    assert!(finished.is_err());
+    assert!(
+        started.elapsed() < KILLED_OUTPUT_WAIT + Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
 }
