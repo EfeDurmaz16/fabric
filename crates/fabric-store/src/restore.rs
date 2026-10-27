@@ -18,13 +18,14 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use fabric_core::git::{GitConfigKey, GitConfigValue, GitOid};
-use fabric_core::id::{JobId, SnapshotId};
+use fabric_core::id::{ChunkId, JobId, SnapshotId};
 use fabric_core::path::{PathError, RelPath};
 use fabric_core::snapshot::{
     CacheEntry, CarryState, Entry, EntryKind, GitHead, GitState, HarnessState, Mode, PathMeta,
     SnapshotManifest,
 };
 
+use crate::bundle_cache::{self, BundleCache};
 use crate::capture::{stash_prefix, symlink_escapes};
 use crate::checkpoint;
 use crate::durable::{self, TempFile};
@@ -127,8 +128,12 @@ pub struct RestoreReport {
     pub submodules: Vec<RelPath>,
     /// Symlinks written whose target is absolute or climbs above the root.
     pub escaping_symlinks: Vec<RelPath>,
-    /// Bundles unpacked into the repository.
+    /// Bundles of the chain whose objects the repository got: from the
+    /// node's bundle cache or unpacked.
     pub bundles_fetched: u32,
+    /// The bundles among them this restore unpacked with git; the rest came
+    /// from the node's bundle cache.
+    pub bundles_unpacked: u32,
 }
 
 impl RestoreReport {
@@ -876,56 +881,132 @@ struct StagingTarget<'a> {
     durability: Durability,
 }
 
-/// Unpacks every bundle of the chain that ends at `manifest`, oldest first, into `git`'s repository.
-///
-/// Unbundling indexes each pack and writes no refs, so the refs an older
-/// link lists can never collide with the ones `set_refs` writes. `git
-/// bundle unbundle` checks the bundle's prerequisites with the same
-/// `verify_bundle` that `git bundle verify` runs, before it indexes the
-/// pack (git's `bundle.c`, since 2.20), so a link whose prerequisites the
-/// links below it lack fails here, and no separate verify runs.
-fn unbundle_chain(
+/// The snapshots of the bundle chain that ends at `snapshot`, whose
+/// manifest is `manifest`, oldest first, from the catalog's `bundle_base`
+/// of each, so no other manifest is read.
+fn chain_ids(
     store: &Store,
     snapshot: SnapshotId,
     manifest: &SnapshotManifest,
-    git: &Git,
-    report: &mut RestoreReport,
-) -> Result<(), RestoreError> {
-    // The chain of bundles, oldest first.
-    let mut chain = vec![manifest.clone()];
-    loop {
-        let base = chain
-            .last()
-            .and_then(|m| m.git.as_ref())
-            .and_then(|g| g.bundle_base);
-        let Some(base) = base else { break };
-        match store.manifest(base) {
-            Ok(m) => chain.push(m),
+) -> Result<Vec<SnapshotId>, RestoreError> {
+    let mut ids = vec![snapshot];
+    let mut base = manifest.git.as_ref().and_then(|g| g.bundle_base);
+    while let Some(id) = base {
+        // Manifest ids are hashes, so only a damaged catalog holds a cycle.
+        if ids.contains(&id) {
+            return Err(StoreError::ManifestMismatch(id).into());
+        }
+        match store.snapshot(id) {
+            Ok(row) => base = row.bundle_base,
             Err(StoreError::UnknownSnapshot(_)) => {
-                return Err(RestoreError::BundleChainBroken { snapshot, base });
+                return Err(RestoreError::BundleChainBroken { snapshot, base: id });
             }
             Err(e) => return Err(e.into()),
         }
+        ids.push(id);
     }
-    chain.reverse();
-    for link in &chain {
-        let Some(state) = &link.git else { continue };
-        if state.bundle.is_empty() {
-            continue;
-        }
-        let bundle = TempFile::in_dir(store.objects().tmp_dir());
-        let path = bundle.path();
-        {
-            let mut file = fs::File::create(path).map_err(|e| io_err(path, e))?;
-            for chunk in &state.bundle {
-                file.write_all(&store.objects().read(*chunk)?)
-                    .map_err(|e| io_err(path, e))?;
+    ids.reverse();
+    Ok(ids)
+}
+
+/// Puts the objects of every bundle of the chain that ends at `manifest`,
+/// oldest first, into the repository `git` runs in at `root`.
+///
+/// The node's bundle cache (`crate::bundle_cache`) gives the pack files of
+/// the links it holds, each checked against its recorded digest, and only
+/// the links after them are unpacked, so a resume no longer grows with the
+/// chain. Unbundling indexes each pack and writes no refs, so the refs an
+/// older link lists can never collide with the ones `set_refs` writes.
+/// `git bundle unbundle` checks the bundle's prerequisites with the same
+/// `verify_bundle` that `git bundle verify` runs, before it indexes the
+/// pack (git's `bundle.c`, since 2.20), and the repository holds exactly
+/// the links below, from the cache or unpacked, so a link whose
+/// prerequisites they lack fails here, and no separate verify runs.
+fn unbundle_chain(
+    store: &Store,
+    (snapshot, manifest): (SnapshotId, &SnapshotManifest),
+    (git, root): (&Git, &Path),
+    durability: Durability,
+    report: &mut RestoreReport,
+) -> Result<(), RestoreError> {
+    let ids = chain_ids(store, snapshot, manifest)?;
+    let tmp = store.objects().tmp_dir();
+    let store_root = tmp.parent().unwrap_or(tmp);
+    let mut cache = BundleCache::open(store_root, manifest.job_id);
+    let held = cache.reuse(&ids);
+    let pack_dir = git_dir(root).join("objects").join("pack");
+    for index in 0..held {
+        for (name, from) in cache.files(index) {
+            let to = pack_dir.join(name);
+            bundle_cache::place(&from, &to).map_err(|e| io_err(&to, e))?;
+            if durability == Durability::PowerLoss {
+                let file = fs::File::open(&to).map_err(|e| io_err(&to, e))?;
+                rustix::fs::fsync(&file).map_err(|e| io_err(&to, e.into()))?;
             }
         }
-        let path_text = path.to_string_lossy().into_owned();
-        git.run(&["bundle", "unbundle", &path_text])?;
-        report.bundles_fetched += 1;
+        report.bundles_fetched += u32::from(cache.has_bundle(index));
     }
+    let mut caching = true;
+    for (index, id) in ids.iter().enumerate().skip(held) {
+        let decoded;
+        let link = if *id == snapshot {
+            manifest
+        } else {
+            decoded = store.manifest(*id)?;
+            &decoded
+        };
+        let state = link.git.as_ref();
+        // The catalog's chain must be the manifests' own.
+        if state.and_then(|g| g.bundle_base) != index.checked_sub(1).map(|below| ids[below]) {
+            return Err(StoreError::ManifestMismatch(*id).into());
+        }
+        let bundle = state.map_or(&[][..], |g| g.bundle.as_slice());
+        let mut written = Vec::new();
+        if !bundle.is_empty() {
+            let before = pack_files(&pack_dir)?;
+            unbundle(store, bundle, git)?;
+            written = pack_files(&pack_dir)?
+                .into_iter()
+                .filter(|name| !before.contains(name))
+                .map(|name| pack_dir.join(name))
+                .collect();
+            report.bundles_fetched += 1;
+            report.bundles_unpacked += 1;
+        }
+        if caching && let Err(e) = cache.add(*id, !bundle.is_empty(), &written) {
+            tracing::warn!(error = %e, "could not add a link to the bundle cache");
+            caching = false;
+        }
+    }
+    cache.touch_and_evict();
+    Ok(())
+}
+
+/// The names of the files in a repository's `objects/pack`.
+fn pack_files(dir: &Path) -> Result<BTreeSet<String>, RestoreError> {
+    let mut names = BTreeSet::new();
+    for entry in fs::read_dir(dir).map_err(|e| io_err(dir, e))? {
+        let entry = entry.map_err(|e| io_err(dir, e))?;
+        if let Ok(name) = entry.file_name().into_string() {
+            names.insert(name);
+        }
+    }
+    Ok(names)
+}
+
+/// Writes the bundle of `chunks` to a scratch file and unpacks it with `git bundle unbundle`.
+fn unbundle(store: &Store, chunks: &[ChunkId], git: &Git) -> Result<(), RestoreError> {
+    let bundle = TempFile::in_dir(store.objects().tmp_dir());
+    let path = bundle.path();
+    {
+        let mut file = fs::File::create(path).map_err(|e| io_err(path, e))?;
+        for chunk in chunks {
+            file.write_all(&store.objects().read(*chunk)?)
+                .map_err(|e| io_err(path, e))?;
+        }
+    }
+    let path_text = path.to_string_lossy().into_owned();
+    git.run(&["bundle", "unbundle", &path_text])?;
     Ok(())
 }
 
@@ -1148,7 +1229,13 @@ fn restore_git(
     }
     init_repo(store, (&git, staging), git_state, power_loss)?;
 
-    unbundle_chain(store, snapshot, manifest, &git, report)?;
+    unbundle_chain(
+        store,
+        (snapshot, manifest),
+        (&git, staging),
+        durability,
+        report,
+    )?;
     set_refs(&git, git_state, manifest.job_id)?;
     git.run(&["read-tree", git_state.index_commit.as_str()])?;
 

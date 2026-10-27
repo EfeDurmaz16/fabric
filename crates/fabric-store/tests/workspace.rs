@@ -2281,6 +2281,185 @@ fn a_capture_reads_the_bundle_heads_without_git() {
     common::run_with_logged_git("capture_heads_child", LoggedGit::Plain).unwrap();
 }
 
+/// A chain of `links` snapshots of a one-commit repository at `root`, a
+/// full bundle and then incremental ones, each after one more commit; the
+/// snapshots and the commit each one added, oldest first.
+fn chain_of(store: &mut Store, root: &Path, links: u32) -> Fallible<Vec<(SnapshotId, String)>> {
+    one_commit_repo(root)?;
+    let mut chain: Vec<(SnapshotId, String)> = Vec::new();
+    for step in 0..links {
+        let parent = chain.last().map(|(id, _)| *id);
+        let (id, _) = commit_and_capture(store, root, step, parent)?;
+        chain.push((id, git_text(root, &["rev-parse", "HEAD"])?));
+    }
+    Ok(chain)
+}
+
+/// True when the repository at `root` holds the object `oid`.
+fn has_object(root: &Path, oid: &str) -> Fallible<bool> {
+    git(root).succeeds(&["cat-file", "-e", oid])
+}
+
+/// Restores `snapshot` into `target` as the node does, flushed for a power loss.
+fn restore_flushed(store: &Store, snapshot: SnapshotId, target: &Path) -> Fallible<RestoreReport> {
+    Ok(restore(
+        store,
+        &RestoreRequest {
+            snapshot,
+            target,
+            harness_state: None,
+            verify: Verify::All,
+            durability: Durability::PowerLoss,
+            carry: &|_| true,
+        },
+    )?)
+}
+
+/// The child half of `a_resume_unpacks_only_the_links_the_node_lacks`.
+#[test]
+fn resume_cache_child() {
+    let Some(dir) = common::logged_git_dir() else {
+        return;
+    };
+    let root = dir.join("work");
+    let mut store = store_in(&dir).unwrap();
+    let chain = chain_of(&mut store, &root, 4).unwrap();
+    let unbundles = |name: &str, snapshot: SnapshotId, durable: bool| -> usize {
+        let start = common::logged_git_calls().len();
+        let target = dir.join(name);
+        if durable {
+            restore_flushed(&store, snapshot, &target).unwrap();
+        } else {
+            restore_into(&store, snapshot, &target).unwrap();
+        }
+        (common::git_commands(&common::logged_git_calls(), start).iter())
+            .filter(|call| call.starts_with("bundle unbundle "))
+            .count()
+    };
+    // Three links the node never unpacked, then the one it lacks, then none.
+    assert_eq!(unbundles("third", chain[2].0, false), 3);
+    assert_eq!(unbundles("fourth", chain[3].0, true), 1);
+    assert_eq!(git_difference(&root, &dir.join("fourth")).unwrap(), None);
+    assert_eq!(unbundles("fourth-again", chain[3].0, false), 0);
+    assert_eq!(
+        git_difference(&root, &dir.join("fourth-again")).unwrap(),
+        None
+    );
+    // An older snapshot of the chain gets only its own links' objects.
+    assert_eq!(unbundles("second", chain[1].0, false), 0);
+    let second = dir.join("second");
+    assert!(has_object(&second, &chain[1].1).unwrap());
+    assert!(!has_object(&second, &chain[2].1).unwrap());
+    assert!(git(&second).succeeds(&["fsck", "--no-dangling"]).unwrap());
+}
+
+/// A restore replayed every link of the chain, so a resume grew with the
+/// job's history, about 30 ms a link in the end-to-end fixture. The node's
+/// bundle cache keeps the pack files of the links it unpacked, and a
+/// restore unpacks only the links the cache lacks.
+#[test]
+fn a_resume_unpacks_only_the_links_the_node_lacks() {
+    common::run_with_logged_git("resume_cache_child", LoggedGit::Plain).unwrap();
+}
+
+/// A cached pack file that changed on disk, or is gone, is not used: the
+/// restore unpacks that link and the ones after it again, and the cache
+/// holds them whole afterwards.
+#[test]
+fn a_cached_pack_that_changed_is_not_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    let mut store = store_in(dir.path()).unwrap();
+    let chain = chain_of(&mut store, &root, 3).unwrap();
+    let last = chain[2].0;
+    let report = restore_into(&store, last, &dir.path().join("first")).unwrap();
+    assert_eq!((report.bundles_fetched, report.bundles_unpacked), (3, 3));
+    let cache = dir.path().join("store/bundle-cache").join(JOB.to_string());
+    let mut packs: Vec<PathBuf> = fs::read_dir(&cache)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|e| e == "pack"))
+        .collect();
+    packs.sort();
+    assert_eq!(packs.len(), 3);
+    for (n, damage) in ["changed", "removed"].into_iter().enumerate() {
+        let pack = fs::read_dir(&cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|e| e == "pack"))
+            .unwrap();
+        if damage == "changed" {
+            fs::set_permissions(&pack, fs::Permissions::from_mode(0o644)).unwrap();
+            let mut bytes = fs::read(&pack).unwrap();
+            let middle = bytes.len() / 2;
+            bytes[middle] ^= 0xff;
+            fs::write(&pack, bytes).unwrap();
+        } else {
+            fs::remove_file(&pack).unwrap();
+        }
+        let target = dir.path().join(format!("after-{damage}"));
+        let report = restore_into(&store, last, &target).unwrap();
+        assert!(report.bundles_unpacked >= 1, "{damage}");
+        assert_eq!(report.bundles_fetched, 3);
+        assert_eq!(git_difference(&root, &target).unwrap(), None, "{damage}");
+        assert!(git(&target).succeeds(&["fsck", "--no-dangling"]).unwrap());
+        let again = restore_into(&store, last, &dir.path().join(format!("again-{n}"))).unwrap();
+        assert_eq!(again.bundles_unpacked, 0, "{damage}");
+    }
+}
+
+/// A chain that parts from the cached one at a link drops the cached
+/// links from there: the restore holds only its own chain's objects, and
+/// the other chain's newer link is unpacked again when it comes back.
+#[test]
+fn a_chain_that_parts_from_the_cached_one_gets_only_its_own_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    let mut store = store_in(dir.path()).unwrap();
+    let chain = chain_of(&mut store, &root, 3).unwrap();
+    restore_into(&store, chain[2].0, &dir.path().join("main")).unwrap();
+
+    git(&root)
+        .run(&["reset", "-q", "--hard", &chain[1].1])
+        .unwrap();
+    let (fork, _) = commit_and_capture(&mut store, &root, 9, Some(chain[1].0)).unwrap();
+    let forked = git_text(&root, &["rev-parse", "HEAD"]).unwrap();
+    let target = dir.path().join("fork");
+    let report = restore_into(&store, fork, &target).unwrap();
+    assert_eq!((report.bundles_fetched, report.bundles_unpacked), (3, 1));
+    assert_eq!(git_difference(&root, &target).unwrap(), None);
+    assert!(!has_object(&target, &chain[2].1).unwrap());
+
+    let target = dir.path().join("main-again");
+    let report = restore_into(&store, chain[2].0, &target).unwrap();
+    assert_eq!(report.bundles_unpacked, 1);
+    assert!(has_object(&target, &chain[2].1).unwrap());
+    assert!(!has_object(&target, &forked).unwrap());
+}
+
+/// The cache holds the second link, but a chain that skips it still fails
+/// on the third: the repository gets only the links of its own chain
+/// before a link is unpacked.
+#[test]
+fn a_link_whose_prerequisites_only_the_cache_holds_fails_the_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    let mut store = store_in(dir.path()).unwrap();
+    let chain = chain_of(&mut store, &root, 3).unwrap();
+    restore_into(&store, chain[2].0, &dir.path().join("warm")).unwrap();
+    let mut skipped = store.manifest(chain[2].0).unwrap();
+    skipped.git.as_mut().unwrap().bundle_base = Some(chain[0].0);
+    let skipped = store.publish(&skipped).unwrap();
+    let target = dir.path().join("restored");
+    let err = restore_into(&store, skipped, &target).unwrap_err();
+    assert!(
+        matches!(&err, RestoreError::Git(GitError::Failed { command, stderr, .. })
+            if command.starts_with("bundle unbundle") && stderr.contains("prerequisite")),
+        "{err}"
+    );
+    assert!(!target.exists());
+}
+
 /// The child half of `a_restore_runs_bundle_unbundle_alone`.
 #[test]
 fn restore_unbundle_child() {
