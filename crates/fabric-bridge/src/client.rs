@@ -1232,9 +1232,7 @@ async fn write_loop(
     grace: Duration,
 ) {
     while let Some(write) = queue.recv().await {
-        let written =
-            tokio::time::timeout_at(write.deadline, frames::write(&mut writer, &write.frame)).await;
-        let why = match written {
+        let why = match write_by(&mut writer, &write.frame, write.deadline).await {
             Ok(Ok(())) => continue,
             Ok(Err(e)) => format!("writing to the worker: {e}"),
             Err(_) => "the worker did not read a frame by its deadline".to_owned(),
@@ -1246,6 +1244,21 @@ async fn write_loop(
             process.terminate(grace).await;
         }
         return;
+    }
+}
+
+/// Writes `frame` by `deadline`. The deadline's timer is armed only when
+/// the write does not finish at once, so a worker that keeps reading costs
+/// the write alone: each timer takes the runtime's timer lock when dropped.
+async fn write_by(
+    writer: &mut Writer,
+    frame: &[u8],
+    deadline: Instant,
+) -> Result<std::io::Result<()>, tokio::time::error::Elapsed> {
+    let mut write = std::pin::pin!(frames::write(writer, frame));
+    match std::future::poll_fn(|cx| std::task::Poll::Ready(write.as_mut().poll(cx))).await {
+        std::task::Poll::Ready(written) => Ok(written),
+        std::task::Poll::Pending => tokio::time::timeout_at(deadline, write).await,
     }
 }
 
