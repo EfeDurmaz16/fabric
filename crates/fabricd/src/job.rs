@@ -190,11 +190,21 @@ impl Job {
     }
 
     /// Opens a job this node held before.
+    ///
+    /// The derived manifest is rewritten only when it is missing or behind
+    /// the ledger, the crash window between an append and its manifest
+    /// write. One that holds exactly the bytes the ledger derives is
+    /// current: it remembers nothing the ledger lacks, so the check that
+    /// a manifest is not ahead passes, and a rewrite would change nothing
+    /// but cost two full flushes per job at every start.
     pub fn open(id: JobId, dir: JobDir) -> Result<Self, NodeError> {
         let file = LedgerFile::open(&dir.ledger())?;
         let ledger = Ledger::open(id, &file)?;
-        ledger_file::check_manifest(&dir.manifest(), &ledger)?;
-        ledger_file::write_manifest(&dir.manifest(), &ledger)?;
+        let path = dir.manifest();
+        if !manifest_is_current(&path, &ledger) {
+            ledger_file::check_manifest(&path, &ledger)?;
+            ledger_file::write_manifest(&path, &ledger)?;
+        }
         Ok(Self {
             id,
             dir,
@@ -478,6 +488,22 @@ impl Job {
     }
 }
 
+/// True when the manifest at `path` holds exactly the bytes `ledger`
+/// derives; false when it is missing or differs.
+fn manifest_is_current(path: &Path, ledger: &Ledger) -> bool {
+    // A manifest that does not read is left to `check_manifest`, which
+    // fails closed on it with the manifest's path, as it always did.
+    let Ok(on_disk) = fs::read(path) else {
+        return false;
+    };
+    // A ledger whose manifest does not encode is left to `write_manifest`,
+    // which reports it.
+    ledger
+        .manifest()
+        .encode()
+        .is_ok_and(|derived| derived == on_disk)
+}
+
 #[cfg(test)]
 mod tests {
     use fabric_core::harness::HarnessKind;
@@ -511,6 +537,55 @@ mod tests {
         assert!(!state.job(asked).dir().exists());
         Job::create(other, state.job(other), &created).unwrap();
         Job::open(other, state.job(other)).unwrap();
+    }
+
+    /// A start rewrites a job's derived manifest only when it is missing
+    /// or behind the ledger: one that is current is left as it is, since
+    /// its rewrite costs two full flushes per job at every start.
+    #[test]
+    fn an_open_rewrites_the_manifest_only_when_it_is_missing_or_behind() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::resolve(Some(dir.path().as_os_str()), dir.path()).unwrap();
+        let id = JobId::from_bytes([1; 16]);
+        let me = NodeId::from_bytes([3; 32]);
+        let created = Ledger::created(
+            id,
+            "goal".into(),
+            HarnessKind::Codex,
+            me,
+            EventId::from_bytes([4; 16]),
+            1,
+        )
+        .unwrap();
+        let mut job = Job::create(id, state.job(id), &created).unwrap();
+        let path = state.job(id).manifest();
+        let behind = fs::read(&path).unwrap();
+        job.append(me, EventKind::Note { text: "one".into() })
+            .unwrap();
+        let current = fs::read(&path).unwrap();
+        drop(job);
+        let inode = |path: &std::path::Path| fs::metadata(path).unwrap().ino();
+
+        let before = inode(&path);
+        Job::open(id, state.job(id)).unwrap();
+        assert_eq!(inode(&path), before, "a current manifest was rewritten");
+
+        fs::write(&path, &behind).unwrap();
+        Job::open(id, state.job(id)).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            current,
+            "a manifest behind was kept"
+        );
+
+        fs::remove_file(&path).unwrap();
+        Job::open(id, state.job(id)).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            current,
+            "a missing manifest was not written"
+        );
     }
 
     /// The marker, the harness record and the fork record are read from
