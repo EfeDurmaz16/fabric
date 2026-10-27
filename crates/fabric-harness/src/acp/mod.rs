@@ -344,8 +344,8 @@ impl AcpHarness {
     }
 
     /// Starts the agent held, before its exec, and attaches the protocol
-    /// client to its pipes. The client sends nothing until it is asked
-    /// to, and the agent reads nothing while it is held.
+    /// client to its pipes. The client writes nothing until the handle is
+    /// released, and then first the line the agent's trampoline waits for.
     async fn spawn_attached(
         &self,
         root: &AbsPath,
@@ -369,7 +369,10 @@ impl AcpHarness {
                 source: std::io::Error::other("agent started without stdio pipes"),
             });
         };
-        let client = AcpClient::attach(stdin, stdout, self.policy);
+        let client = match spawned.go.take() {
+            Some(go) => AcpClient::attach_held(stdin, stdout, self.policy, go),
+            None => AcpClient::attach(stdin, stdout, self.policy),
+        };
         Ok((Running::new(None, spawned), client))
     }
 

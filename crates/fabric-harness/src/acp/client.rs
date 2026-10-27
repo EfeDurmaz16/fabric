@@ -241,7 +241,31 @@ fn write_line(outgoing: &Outgoing, value: &Value) -> Result<(), AcpError> {
 /// waiting request: its line, or a later one, never reached the agent, and
 /// an agent that keeps its stdout open would otherwise leave a request
 /// with no deadline, such as a prompt, waiting forever.
-async fn write_loop(mut stdin: ChildStdin, mut lines: mpsc::Receiver<String>, pending: Pending) {
+///
+/// With `go`, nothing is written before it fires; then the empty line the
+/// agent's held trampoline waits for goes first (`process::spawn`). A
+/// `go` dropped unfired closes the agent's stdin unwritten, so the
+/// trampoline exits without its exec.
+async fn write_loop(
+    mut stdin: ChildStdin,
+    mut lines: mpsc::Receiver<String>,
+    pending: Pending,
+    go: Option<oneshot::Receiver<()>>,
+) {
+    if let Some(go) = go {
+        let released = async {
+            go.await
+                .map_err(|_| std::io::Error::other("the hold was dropped unreleased"))?;
+            stdin.write_all(b"\n").await?;
+            stdin.flush().await
+        };
+        if let Err(e) = released.await {
+            debug!(error = %e, "acp: the agent was never released");
+            lines.close();
+            fail_pending(&pending);
+            return;
+        }
+    }
     while let Some(line) = lines.recv().await {
         let written = async {
             stdin.write_all(line.as_bytes()).await?;
@@ -451,10 +475,31 @@ impl AcpClient {
     /// Takes over the agent's pipes and starts reading.
     #[must_use]
     pub fn attach(stdin: ChildStdin, stdout: ChildStdout, policy: PermissionPolicy) -> Self {
+        Self::attach_with(stdin, stdout, policy, None)
+    }
+
+    /// `attach` for an agent `process::spawn` holds: nothing reaches its
+    /// stdin before `go` fires, and then the line its trampoline waits
+    /// for comes first.
+    pub(crate) fn attach_held(
+        stdin: ChildStdin,
+        stdout: ChildStdout,
+        policy: PermissionPolicy,
+        go: oneshot::Receiver<()>,
+    ) -> Self {
+        Self::attach_with(stdin, stdout, policy, Some(go))
+    }
+
+    fn attach_with(
+        stdin: ChildStdin,
+        stdout: ChildStdout,
+        policy: PermissionPolicy,
+        go: Option<oneshot::Receiver<()>>,
+    ) -> Self {
         let (outgoing, lines) = mpsc::channel(OUTGOING_BUFFER);
         let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
         let cancelled: Cancelled = Arc::new(Mutex::new(HashSet::new()));
-        tokio::spawn(write_loop(stdin, lines, Arc::clone(&pending)));
+        tokio::spawn(write_loop(stdin, lines, Arc::clone(&pending), go));
         let (sink, rx, dropped_updates) = UpdateSink::new(UPDATE_BUFFER);
         let reader = tokio::spawn(read_loop(
             stdout,

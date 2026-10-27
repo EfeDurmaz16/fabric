@@ -292,23 +292,25 @@ impl TurnFeed {
 /// Only this crate builds one, from a child it spawned, so the pid is
 /// real and is also the process group id.
 ///
-/// Every launch starts held: a trampoline, stopped before it execs the
-/// harness, so nothing of the harness runs before the caller has recorded
-/// it with the node (issue #17), and a harness wired to the user's
-/// terminal never touches it before its group owns it. The caller records
-/// the pid, makes the group the terminal's foreground group when
-/// `takes_terminal` says so, then calls `release`. Dropping a handle that
-/// is still held kills its group: nothing of the harness ran, and nothing
-/// else could let it go on.
+/// Every launch starts held: a trampoline, which waits before it execs
+/// the harness, so nothing of the harness runs before the caller has
+/// recorded it with the node (issue #17), and a harness wired to the
+/// user's terminal never touches it before its group owns it. The handle
+/// comes back while the trampoline still starts, so the caller records the
+/// pid meanwhile, makes the group the terminal's foreground group when
+/// `takes_terminal` says so, then calls `release`, which lets the harness
+/// start as soon as the trampoline is ready (`process::spawn`). Dropping a
+/// handle that is still held kills its group: nothing of the harness ran,
+/// and nothing else could let it go on.
 pub struct Running {
     pid: NonZeroU32,
     session: Option<SessionId>,
     child: Child,
     held: bool,
     terminal: bool,
-    /// Opened by `release`, for a driver that must not speak to the
-    /// harness before it runs.
-    gate: Option<tokio::sync::oneshot::Sender<()>>,
+    /// The trampoline's hold, which `release` ends and which opens a
+    /// driver's gate once the harness may run.
+    hold: crate::process::Hold,
     turn: Option<TurnFeed>,
     settings: LaunchSettings,
     version: Option<crate::version::HarnessVersion>,
@@ -330,18 +332,8 @@ impl std::fmt::Debug for Running {
 
 impl Drop for Running {
     fn drop(&mut self) {
-        if !self.held {
-            return;
-        }
-        let group = i32::try_from(self.pid.get())
-            .ok()
-            .and_then(rustix::process::Pid::from_raw);
-        if let Some(group) = group
-            && let Err(e) =
-                rustix::process::kill_process_group(group, rustix::process::Signal::KILL)
-            && e != rustix::io::Errno::SRCH
-        {
-            tracing::warn!(pid = %self.pid, error = %e, "could not kill the group of a held harness nobody released");
+        if self.held {
+            crate::process::kill_held_group(self.pid);
         }
     }
 }
@@ -357,24 +349,32 @@ impl Running {
             child: spawned.child,
             held: true,
             terminal: spawned.wiring == crate::process::Wiring::Terminal,
-            gate: None,
+            hold: spawned.hold,
             turn: None,
             settings: LaunchSettings::default(),
             version: None,
         }
     }
 
-    /// Has `release` open `gate` once the harness runs, and hands `turn`
-    /// to the caller (`take_turn`).
+    /// Opens `gate` once `release` lets the harness run, and hands `turn`
+    /// to the caller (`take_turn`). A hold that fails closes the gate
+    /// unopened.
     #[cfg(feature = "acp")]
     pub(crate) fn with_driver(
         mut self,
         gate: tokio::sync::oneshot::Sender<()>,
         turn: TurnFeed,
     ) -> Self {
-        self.gate = Some(gate);
+        self.hold.open_on_release(gate);
         self.turn = Some(turn);
         self
+    }
+
+    /// Waits until a trampoline held by a stop has stopped or its hold
+    /// failed; at once for any other.
+    #[cfg(all(test, any(feature = "acp", feature = "claude", feature = "codex")))]
+    pub(crate) async fn hold_settled(&self) {
+        self.hold.settled().await;
     }
 
     /// Names the session the process continues, once it is known.
@@ -415,8 +415,7 @@ impl Running {
         &self.settings
     }
 
-    /// True while the harness waits, stopped before its exec, for
-    /// `release`.
+    /// True until `release`: the harness waits before its exec.
     #[must_use]
     pub fn is_held(&self) -> bool {
         self.held
@@ -430,25 +429,27 @@ impl Running {
         self.terminal
     }
 
-    /// Lets the harness start by continuing its process group; the
-    /// trampoline then execs the harness. Call it once the node has
-    /// recorded the pid and, when `takes_terminal`, the group is the
-    /// terminal's foreground group. A harness released already is left
-    /// alone.
+    /// Lets the harness start; the trampoline then execs it. Call it once
+    /// the node has recorded the pid and, when `takes_terminal`, the group
+    /// is the terminal's foreground group. It may come before the
+    /// trampoline is ready: a headless or ACP harness's trampoline reads
+    /// the line this writes whenever its shell gets to it, and a terminal
+    /// harness's group is continued once its trampoline has stopped. A
+    /// harness released already is left alone.
+    ///
+    /// It fails when the trampoline is gone, ended before its stop, did not
+    /// stop within its deadline, or could not be continued; its group is
+    /// then killed and the harness never ran. A hold that fails after a
+    /// release that was kept kills the group the same way, and the caller
+    /// sees the trampoline's end where it would have seen the harness's.
     ///
     /// An ACP agent gets its first message only now: the adapter's driver
     /// waits for this before the handshake, then opens or continues the
     /// session and sends the prompt, and tells the caller through
     /// `take_turn`.
     pub fn release(&mut self) -> Result<(), HarnessError> {
-        if self.held {
-            crate::process::continue_group(self.pid)?;
-            self.held = false;
-        }
-        if let Some(gate) = self.gate.take() {
-            // A driver that is gone has nothing left to say to the harness.
-            let _ = gate.send(());
-        }
+        self.hold.release()?;
+        self.held = false;
         Ok(())
     }
 
