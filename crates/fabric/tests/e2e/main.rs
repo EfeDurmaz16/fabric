@@ -18,6 +18,7 @@ mod bench;
 mod budget;
 mod client;
 mod headless;
+mod legacy;
 mod preflight;
 mod terminal;
 mod world;
