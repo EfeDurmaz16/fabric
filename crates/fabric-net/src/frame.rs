@@ -1,12 +1,13 @@
 //! Length-prefixed frames (ADR 0005).
 //!
 //! Invariant: a reader accepts a frame only if its declared length passed
-//! the cap the reader chose, and grows the frame's buffer only as its bytes
-//! arrive. A peer cannot make this node hold more than one frame per stream,
-//! and a header alone, four bytes that declare 8 MiB, costs this node no
-//! more than `INITIAL_CAPACITY`. A frame is
-//! `u32 length | u8 version | payload`, little endian, with `length`
-//! counting the version byte and the payload.
+//! the cap the reader chose and its version byte is one this crate reads,
+//! both checked before any of the payload is read, and grows the frame's
+//! buffer only as its bytes arrive, never past the declared length. A peer
+//! cannot make this node hold more than one frame per stream, and a header
+//! alone, four bytes that declare 8 MiB, costs this node no more than
+//! `INITIAL_CAPACITY`. A frame is `u32 length | u8 version | payload`,
+//! little endian, with `length` counting the version byte and the payload.
 
 use std::io;
 
@@ -96,6 +97,17 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin + ?Sized>(
     reader: &mut R,
     max: usize,
 ) -> Result<Vec<u8>, FrameError> {
+    let len = read_header(reader, max).await?;
+    read_payload(reader, len).await
+}
+
+/// Reads one frame's length and version byte, refusing a declared length
+/// above `max` or a version this crate does not read before any of the
+/// payload is read, and returns the payload's length.
+pub(crate) async fn read_header<R: AsyncRead + Unpin + ?Sized>(
+    reader: &mut R,
+    max: usize,
+) -> Result<usize, FrameError> {
     let mut header = [0u8; LENGTH_LEN];
     let mut filled = 0;
     while filled < LENGTH_LEN {
@@ -123,21 +135,37 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin + ?Sized>(
     if len == 0 {
         return Err(FrameError::TooShort(length));
     }
-    let mut body = Vec::with_capacity(len.min(INITIAL_CAPACITY));
-    let declared = u64::from(length);
-    let read = reader
-        .take(declared)
-        .read_to_end(&mut body)
-        .await
-        .map_err(FrameError::Io)?;
-    if read < len {
+    let mut version = [0u8; 1];
+    if reader.read(&mut version).await.map_err(FrameError::Io)? == 0 {
         return Err(FrameError::Truncated);
     }
-    let version = body[0];
-    if version != FRAME_VERSION {
-        return Err(FrameError::BadVersion(version));
+    if version[0] != FRAME_VERSION {
+        return Err(FrameError::BadVersion(version[0]));
     }
-    body.drain(..1);
+    Ok(len - 1)
+}
+
+/// Reads a payload of `len` bytes, the length `read_header` returned,
+/// into a buffer that grows as the bytes arrive, from `INITIAL_CAPACITY`
+/// and doubling, but never past `len`.
+pub(crate) async fn read_payload<R: AsyncRead + Unpin + ?Sized>(
+    reader: &mut R,
+    len: usize,
+) -> Result<Vec<u8>, FrameError> {
+    let mut body = Vec::with_capacity(len.min(INITIAL_CAPACITY));
+    let declared = u64::try_from(len).map_err(|_| FrameError::TooLarge {
+        len,
+        max: usize::MAX,
+    })?;
+    let mut payload = reader.take(declared);
+    while body.len() < len {
+        if body.len() == body.capacity() {
+            body.reserve_exact(body.capacity().clamp(1, len - body.len()));
+        }
+        if payload.read_buf(&mut body).await.map_err(FrameError::Io)? == 0 {
+            return Err(FrameError::Truncated);
+        }
+    }
     Ok(body)
 }
 
@@ -190,6 +218,51 @@ mod tests {
             read_frame(&mut other, 16).await,
             Err(FrameError::BadVersion(9))
         ));
+    }
+
+    /// A frame of a version this crate does not read is refused as soon as
+    /// its version byte arrives, before any of its payload.
+    #[tokio::test]
+    async fn a_frame_of_another_version_is_refused_before_its_payload_arrives() {
+        let (mut peer, mut here) = tokio::io::duplex(64);
+        peer.write_all(&[200, 0, 0, 0, 9]).await.unwrap();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_frame(&mut here, 1024),
+        )
+        .await
+        .expect("the reader waited for a payload it refuses");
+        assert!(matches!(read, Err(FrameError::BadVersion(9))));
+    }
+
+    /// A payload's buffer never has more room than the payload: grown as
+    /// the bytes arrive, it stops at the declared length instead of
+    /// doubling past it. The payload is read after its version byte, so it
+    /// never moves in its buffer.
+    #[tokio::test]
+    async fn a_payload_buffer_is_never_larger_than_the_payload() {
+        for len in [
+            0,
+            1,
+            31,
+            32,
+            33,
+            INITIAL_CAPACITY - 1,
+            INITIAL_CAPACITY,
+            INITIAL_CAPACITY + 1,
+            (1 << 20) + 70,
+        ] {
+            let payload: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect();
+            let mut wire = Vec::new();
+            write_frame(&mut wire, &payload, MAX_CONTROL_FRAME)
+                .await
+                .unwrap();
+            let body = read_frame(&mut wire.as_slice(), MAX_CONTROL_FRAME)
+                .await
+                .unwrap();
+            assert_eq!(body, payload);
+            assert_eq!(body.capacity(), len);
+        }
     }
 
     /// A chunk that does not compress still fits a bulk frame as zstd stores it.
