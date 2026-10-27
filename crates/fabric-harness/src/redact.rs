@@ -41,7 +41,10 @@ struct Pattern {
 
 /// A pattern with a capture group named `keep` keeps that part and
 /// replaces only the rest: `DB_PASSWORD=` stays, its value does not, at
-/// any length; only a `${VAR}` reference or an earlier marker is left.
+/// any length. Only a value that is wholly a reference to another
+/// variable, `${VAR}` or `$VAR` outside single quotes, or wholly an
+/// earlier `[REDACTED:<rule>]` marker is left; a literal that merely
+/// starts with `$` or `[` is redacted.
 ///
 /// `(?-u:\b)` is an ASCII word boundary. Every key shape starts on one, so
 /// a prefix such as `sk-` inside an ordinary word (`disk-usage`,
@@ -115,7 +118,7 @@ const PATTERNS: &[Pattern] = &[
     },
     Pattern {
         name: "secret-assignment",
-        regex: r#"(?-u:\b)(?P<keep>[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|ACCESS_KEY|CREDENTIALS|DATABASE_URL|DSN)[A-Z0-9_]*=['"]?)[^\s'"$\[][^\s'"]*"#,
+        regex: r#"(?-u:\b)(?P<keep>[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|ACCESS_KEY|CREDENTIALS|DATABASE_URL|DSN)[A-Z0-9_]*=['"]?)[^\s'"]+"#,
         accept: assigned_value_is_secret,
     },
 ];
@@ -130,6 +133,9 @@ fn any(_: &[u8]) -> bool {
 /// length. A name that ends in its secret word names the secret itself, so
 /// `CVV_SECRET=123` and `OTP_TOKEN=42` still count, and so does a longer
 /// number under any name, as before any value length was accepted.
+///
+/// False as well for a value that is wholly a reference or a marker, as
+/// `reference_or_marker` reads them.
 fn assigned_value_is_secret(matched: &[u8]) -> bool {
     let (name, value) = matched
         .iter()
@@ -137,13 +143,49 @@ fn assigned_value_is_secret(matched: &[u8]) -> bool {
         .map_or((&[][..], matched), |at| {
             (&matched[..at], &matched[at + 1..])
         });
-    let value = value
-        .strip_prefix(b"'")
-        .or_else(|| value.strip_prefix(b"\""))
-        .unwrap_or(value);
+    let (quote, value) = match value.split_first() {
+        Some((&q @ (b'\'' | b'"'), rest)) => (Some(q), rest),
+        _ => (None, value),
+    };
+    if reference_or_marker(value, quote) {
+        return false;
+    }
     value.len() > 3
         || !value.iter().all(u8::is_ascii_digit)
         || SECRET_ENDINGS.iter().any(|end| name.ends_with(end))
+}
+
+/// True when `value` is, as a whole, an earlier `[REDACTED:<rule>]`
+/// marker, or a reference to another variable: `${NAME}` or `$NAME` with
+/// `NAME` a shell identifier. Inside single quotes a shell expands
+/// nothing, so there `$NAME` is a literal and only a marker is exempt.
+fn reference_or_marker(value: &[u8], quote: Option<u8>) -> bool {
+    if let Some(rule) = value
+        .strip_prefix(b"[REDACTED:")
+        .and_then(|v| v.strip_suffix(b"]"))
+    {
+        return !rule.is_empty()
+            && rule
+                .iter()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-');
+    }
+    if quote == Some(b'\'') {
+        return false;
+    }
+    let Some(reference) = value.strip_prefix(b"$") else {
+        return false;
+    };
+    let name = reference
+        .strip_prefix(b"{")
+        .and_then(|r| r.strip_suffix(b"}"))
+        .unwrap_or(reference);
+    match name.split_first() {
+        Some((first, rest)) => {
+            (first.is_ascii_alphabetic() || *first == b'_')
+                && rest.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        }
+        None => false,
+    }
 }
 
 /// The words that, at the end of a variable's name, make it the name of a
@@ -504,21 +546,42 @@ mod tests {
     /// `PATTERNS` says so); a literal value that starts with `$` or `[`
     /// is redacted like any other.
     #[test]
-    #[ignore = "H2: expected failure until fixed"]
     fn a_literal_assignment_starting_with_a_dollar_or_a_bracket_is_redacted() {
         let redactor = Redactor::standard().unwrap();
         for line in [
             "DB_PASSWORD=$literal-password",
             "DB_PASSWORD=[literal-password]",
             "DB_PASSWORD='$literal-password'",
+            "DB_PASSWORD=\"$literal-password\"",
+            "DB_PASSWORD='$PASSWORD'",
+            "DB_PASSWORD=${DB_PASSWORD}tail",
+            "DB_PASSWORD=$",
+            "DB_PASSWORD=${}",
+            "DB_PASSWORD=${9X}",
+            "DB_PASSWORD=[REDACTED:secret-assignment]tail",
+            "DB_PASSWORD=[REDACTED:]",
+            "DB_PASSWORD=[literal]",
         ] {
             assert!(redactor.matches(line), "{line}");
+            assert!(redactor.matches_bytes(line.as_bytes()), "{line} as bytes");
         }
         for line in [
             "DB_PASSWORD=${DB_PASSWORD}",
+            "DB_PASSWORD=$DB_PASSWORD",
+            "DB_PASSWORD=\"$DB_PASSWORD\"",
+            "DB_PASSWORD=\"${_DB_2}\"",
             "DB_PASSWORD=[REDACTED:secret-assignment]",
+            "DB_PASSWORD='[REDACTED:github-token]'",
         ] {
             assert!(!redactor.matches(line), "{line}");
+            assert!(!redactor.matches_bytes(line.as_bytes()), "{line} as bytes");
         }
+        let mut counts = RedactionCounts::new();
+        assert_eq!(
+            redactor
+                .apply("DB_PASSWORD=$literal-password", &mut counts)
+                .unwrap(),
+            "DB_PASSWORD=[REDACTED:secret-assignment]"
+        );
     }
 }
