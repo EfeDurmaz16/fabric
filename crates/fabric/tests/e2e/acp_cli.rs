@@ -1,7 +1,6 @@
 //! M2-01: a headless ACP run through the CLI prints the agent's answer, as
 //! a Claude or Codex run does, and a turn the agent fails ends the run with
-//! a failure exit even when the agent itself exits 0. Ignored until the
-//! CLI reads the ACP turn's updates and outcome.
+//! a failure exit even when the agent itself exits 0.
 
 use std::path::Path;
 
@@ -21,7 +20,6 @@ fn acp_job(env: &std::sync::Arc<Env>) -> Fallible<(Node, String)> {
 /// The agent answers `echo: <prompt>` in an `agent_message_chunk`; the
 /// CLI prints it on standard output.
 #[test]
-#[ignore = "M2-01: expected failure until fixed"]
 fn e2e_a_headless_acp_run_prints_the_answer() -> Fallible {
     let env = Env::new()?;
     let (node, job) = acp_job(&env)?;
@@ -33,7 +31,6 @@ fn e2e_a_headless_acp_run_prints_the_answer() -> Fallible {
 /// The agent answers the prompt with a JSON-RPC error and then exits 0
 /// when its stdin closes; the run fails and says why.
 #[test]
-#[ignore = "M2-01: expected failure until fixed"]
 fn e2e_a_failed_acp_turn_fails_the_run() -> Fallible {
     let env = Env::new()?;
     let (node, job) = acp_job(&env)?;

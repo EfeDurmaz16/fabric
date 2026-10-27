@@ -1199,8 +1199,7 @@ struct AgentTurn<'a> {
 
 impl AgentTurn<'_> {
     /// Reads the turn and reaps the agent (`run`), tells the node it
-    /// exited, prints the turn when it ran headless, and returns the
-    /// command's exit code.
+    /// exited, prints the turn, and returns the command's exit code.
     async fn finish(
         &self,
         running: &mut Running,
@@ -1212,15 +1211,28 @@ impl AgentTurn<'_> {
             TurnEnd::Interrupted(signal) => return Ok(signal_exit(signal.as_raw())),
         };
         let code = exited(self.client, self.plan, running.pid(), status, interrupts).await?;
-        if self.headless {
-            print_turn(self.plan, &report)?;
+        // The agent serves the protocol and exits 0 when its stdin
+        // closes, whatever became of the turn, so the turn says whether
+        // the run failed, and so does an answer that could not be printed,
+        // as after its reader went away. An agent stopped by a signal
+        // keeps the signal's code.
+        let printed = print_turn(self.plan, &report);
+        if let Err(e) = &printed {
+            tracing::warn!(error = %e, "the agent's turn could not be printed");
         }
-        Ok(code)
+        Ok(
+            if status.success() && (report.failure.is_some() || printed.is_err()) {
+                ExitCode::FAILURE
+            } else {
+                code
+            },
+        )
     }
 
     /// Reads the feed and reaps the agent, both to their end. A new
     /// session the agent opens once it runs goes to a recorder task at
-    /// once, so a suspend during the turn captures it. The feed is read for at most
+    /// once, so a suspend during the turn captures it; the feed's end
+    /// gives the answer and any failure. The feed is read for at most
     /// `DRAIN` after the agent exited, as a headless harness's output is.
     async fn run(
         &self,
@@ -1368,7 +1380,7 @@ fn print_turn(plan: &RunPlan, report: &TurnReport) -> Result<()> {
     }
     if let Some(answer) = &report.answer {
         writeln!(std::io::stdout(), "{answer}")?;
-    } else if report.failure.is_none() && !matches!(harness, HarnessKind::Acp { .. }) {
+    } else if report.failure.is_none() {
         Notes::Stderr.print(&[format!("warning: {harness} printed no answer")])?;
     }
     match (&report.session, &plan.session) {

@@ -247,6 +247,8 @@ async fn the_trait_launch_is_headless_and_owns_the_turn() {
         panic!("the feed did not end the turn");
     };
     assert_eq!(report.session.as_ref(), Some(&session));
+    assert_eq!(report.answer.as_deref(), Some("echo: headless"));
+    assert_eq!(report.failure, None);
     assert!(feed.next().await.is_none());
     // The driver closes the agent's stdin when the turn ends, so the
     // agent exits on its own and the prompt is on record.

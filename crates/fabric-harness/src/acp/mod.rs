@@ -27,12 +27,14 @@ pub use crate::harness::{TurnEvent, TurnFeed};
 use std::ffi::OsString;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use fabric_core::BoxFuture;
 use fabric_core::env::EnvVarName;
 use fabric_core::harness::{HarnessKind, ProgramName};
 use fabric_core::path::AbsPath;
 use fabric_core::session::SessionId;
+use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -444,9 +446,11 @@ impl AcpHarness {
     /// one, and its driver sends nothing before `Running::release` lets it
     /// run, so a node records it before it can act (issue #17). The driver
     /// then runs the handshake, opens or continues the session, sends the
-    /// prompt, closes the agent's stdin when the turn ends, and says each
-    /// step on the handle's turn feed (`Running::take_turn`). Updates the
-    /// turn streams are dropped once `client::UPDATE_BUFFER` wait unread.
+    /// prompt, gathers the agent's answer from the turn's updates, closes
+    /// the agent's stdin when the turn ends, and says each step on the
+    /// handle's turn feed (`Running::take_turn`). Updates past
+    /// `client::UPDATE_BUFFER` unread are dropped, and the driver reads
+    /// them as they come.
     async fn launch_impl(
         &self,
         workspace: &Path,
@@ -535,14 +539,92 @@ impl Driver {
         report.session = Some(session.clone());
         // The receiver may be gone, as when the caller never asked; the turn runs on.
         let _ = events.send(TurnEvent::Session(session.clone())).await;
-        match client.prompt(&session, &prompt).await {
-            Ok(reason) => info!(agent = %program, ?reason, "acp: turn ended"),
-            Err(e) => warn!(agent = %program, error = %e, "acp: turn failed"),
+        let (answer, outcome) = turn(&client, &session, &prompt).await;
+        report.answer = (!answer.is_empty()).then_some(answer);
+        report.failure = match outcome {
+            Ok(StopReason::EndTurn) => {
+                info!(agent = %program, "acp: turn ended");
+                None
+            }
+            Ok(reason) => {
+                warn!(agent = %program, ?reason, "acp: turn stopped early");
+                Some(format!(
+                    "{program} stopped the turn: {}",
+                    stop_words(&reason)
+                ))
+            }
+            Err(e) => {
+                warn!(agent = %program, error = %e, "acp: turn failed");
+                Some(format!("{program} failed the turn: {e}"))
+            }
+        };
+        let dropped = client.dropped_updates();
+        if dropped > 0 {
+            warn!(agent = %program, dropped, "acp: updates were dropped, so the answer may be short");
         }
         let _ = events.send(TurnEvent::Ended(report)).await;
         // The last handle on the client: dropping it closes the agent's
         // stdin, so it exits.
         drop(client);
+    }
+}
+
+/// Sends `prompt` in `session` and gathers the text of the agent's
+/// message chunks for that session until the turn ends; returns the text
+/// and how the turn ended.
+async fn turn(
+    client: &AcpClient,
+    session: &SessionId,
+    prompt: &str,
+) -> (String, Result<StopReason, AcpError>) {
+    let mut answer = String::new();
+    let asked = client.prompt(session, prompt);
+    tokio::pin!(asked);
+    let outcome = loop {
+        tokio::select! {
+            // Updates first: the agent sends them before its answer to the
+            // prompt, and the client queues them in that order.
+            biased;
+            update = client.next_update() => match update {
+                Some(update) if &update.session == session => note_chunk(&mut answer, &update.update),
+                Some(_) => {}
+                None => break (&mut asked).await,
+            },
+            outcome = &mut asked => break outcome,
+        }
+    };
+    // Updates queued before the answer, read while it was being taken.
+    while let Ok(Some(update)) = tokio::time::timeout(Duration::ZERO, client.next_update()).await {
+        if &update.session == session {
+            note_chunk(&mut answer, &update.update);
+        }
+    }
+    (answer, outcome)
+}
+
+/// Appends the text of an `agent_message_chunk` update to `answer`;
+/// leaves out every other update and content that is not text.
+fn note_chunk(answer: &mut String, update: &Value) {
+    if update.get("sessionUpdate").and_then(Value::as_str) != Some("agent_message_chunk") {
+        return;
+    }
+    let content = update.get("content");
+    if content.and_then(|c| c.get("type")).and_then(Value::as_str) == Some("text")
+        && let Some(text) = content.and_then(|c| c.get("text")).and_then(Value::as_str)
+    {
+        answer.push_str(text);
+    }
+}
+
+/// A stop reason as the protocol names it.
+fn stop_words(reason: &StopReason) -> &str {
+    match reason {
+        StopReason::EndTurn => "end_turn",
+        StopReason::MaxTokens => "max_tokens",
+        StopReason::MaxTurnRequests => "max_turn_requests",
+        StopReason::Refusal => "refusal",
+        StopReason::Cancelled => "cancelled",
+        StopReason::Other(other) => other,
     }
 }
 

@@ -261,7 +261,8 @@ pub enum TurnEvent {
     /// The session the turn runs in, once the harness has opened or
     /// continued it. A new session is known only then, after `release`.
     Session(SessionId),
-    /// The turn ended, in its session. Nothing follows it.
+    /// The turn ended: its session, its answer, and why it failed when it
+    /// did. Nothing follows it.
     Ended(TurnReport),
 }
 
