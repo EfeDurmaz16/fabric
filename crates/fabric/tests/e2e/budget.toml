@@ -1,8 +1,9 @@
 # The time budget of the hot paths, which `budget::hot_paths` in budget.rs
 # measures (issue #26): suspend, move, resume and pull of a job under each
 # harness, and a daemon's cold start and restart. CONTRIBUTING.md says how
-# to run it and how to accept a slowdown. scripts/check-budget.sh fails a
-# change to this file that adds no [[change]] entry at its end.
+# to run it and how to change it. scripts/check-budget.sh fails a change to
+# this file that adds no [[change]] entry at its end, or that loosens a
+# limit: a baseline is the anchor's time and only goes down.
 
 # A time is over its limit when it is above both ratio x baseline and
 # baseline + grace_ms; it fails when it is over again in a second batch.
@@ -13,8 +14,9 @@ reps = 7
 # The time that stands for a batch, as a percentile of its runs.
 percentile = 25
 
-# Each op's baseline in ms, the time at `percentile` on that platform. A
-# platform with no baselines only reports its times.
+# Each op's baseline in ms: the anchor's time at `percentile` on that
+# platform, which only goes down. A platform with no baselines only
+# reports its times. macOS: the Mac of the [[change]] entries below.
 [baseline.macos-aarch64]
 "acp suspend" = 342
 "acp move" = 144
@@ -31,8 +33,22 @@ percentile = 25
 "cold start" = 57
 "restart" = 78
 
-# Report only until CI produces numbers.
+# Linux: CI's ubuntu-latest runner, from scripts/budget-baselines.sh.
 [baseline.linux-x86_64]
+"acp suspend" = 142
+"acp move" = 76
+"acp resume" = 219
+"acp pull" = 430
+"claude suspend" = 177
+"claude move" = 77
+"claude resume" = 375
+"claude pull" = 625
+"codex suspend" = 230
+"codex move" = 77
+"codex resume" = 446
+"codex pull" = 728
+"cold start" = 32
+"restart" = 36
 
 # The git, kill, lsof, pgrep and ps processes each op starts in each
 # warm-up run, the harness's own included: exact, and the same on every
@@ -83,3 +99,8 @@ why = "Review of PR #29: macos-aarch64 baselines from this branch with no fact k
 [[change]]
 date = "2026-10-27"
 why = "M2-06 (issue #22): a restore sets each symbolic ref with one git symbolic-ref, after the direct refs, so refs/remotes/origin/HEAD follows the remote's default branch again instead of naming a frozen commit. The job's workspace is a git clone, so it has that one symbolic ref, and every resume and pull runs one more git: resumes 17/21 and pulls 51/55. Suspends and moves are unchanged. git 2.46 and later could set it in the existing update-ref --stdin transaction; that is not built. Baselines unchanged"
+
+[[change]]
+date = "2026-10-27"
+why = "M2-25: linux-x86_64 baselines, the anchor's times on CI's ubuntu-latest runner: per op the median of the 25th percentiles of CI runs 40148467445, 40149293377 and 40270077851, whose Rust code is 176622e's (scripts/budget-baselines.sh). No one of the three is above these baselines by more than 1.07 times, inside the 1.3 ratio, so CI can enforce them"
+anchor = "176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5"

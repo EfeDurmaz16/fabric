@@ -734,6 +734,26 @@ fn the_budget_file_holds_every_op() -> Fallible {
     Ok(())
 }
 
+/// Every op has a baseline on both platforms the budget holds times on:
+/// CI's Linux runner, where CI enforces them, and the Mac of the macOS
+/// baselines. An op with none there is only reported, so a slower one
+/// would pass (M2-25).
+#[test]
+fn every_op_has_a_baseline_on_linux_and_macos() -> Fallible {
+    for platform in ["linux-x86_64", "macos-aarch64"] {
+        let budget = Budget::parse(BUDGET, platform)?;
+        let missing: Vec<String> = ops()
+            .into_iter()
+            .filter(|op| !budget.baseline.contains_key(op))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{platform} has no baseline for {missing:?}"
+        );
+    }
+    Ok(())
+}
+
 /// The rules on a made-up budget: the limit is the larger of the ratio and
 /// the grace; a time over it fails in enforce mode only when a second
 /// batch is over too, and never in report mode; a process count that

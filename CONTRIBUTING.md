@@ -123,8 +123,9 @@ over its limit when its 25th percentile of 7 runs is above both 1.3 times
 its baseline and its baseline plus 50 ms, and it fails when it is over
 again in a second batch of 7. A process count fails in both modes when it
 differs from the budget, higher or lower: fewer starts can mean a check was
-dropped. A platform with no baselines, as `linux-x86_64` until CI produces
-numbers, only reports its times.
+dropped. A platform with no baselines only reports its times.
+`macos-aarch64` holds the times of an 18-core Apple silicon Mac and
+`linux-x86_64` those of CI's `ubuntu-latest` runner.
 
 A baseline is the anchor's time, so it never goes up: a slower op is a bug
 to fix (Performance rule), and a baseline raised once per pull request
@@ -147,9 +148,17 @@ the baselines from those runs, and say so in the new entry with
 `anchor = "176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5"` beside its date and
 why.
 
-To give a platform its baselines, copy the 25th percentile column of a CI
-run on main from the step summary, with a `[[change]]` entry that names the
-run.
+To give a platform its baselines, run the anchor's code on it at least
+three times and take each op's median 25th percentile. For a CI runner,
+`scripts/budget-baselines.sh` does that from the runs' logs:
+
+```sh
+gh run view <run-id> --log > run-<run-id>.log   # once per run of the anchor's code
+scripts/budget-baselines.sh linux-x86_64 run-*.log
+```
+
+It prints the `[baseline.<platform>]` table; the `[[change]]` entry names
+the runs.
 
 ## Workspace rules
 
