@@ -580,3 +580,52 @@ async fn exec_and_destroy_round_trip_with_their_targets() {
         .unwrap();
     assert_eq!(done.status, ProviderStatus::Succeeded);
 }
+
+/// Resource scope is kept from dispatch: a destroy is in the journal with
+/// its target before any answer is read, and after the worker and Fabric
+/// both stop before reading one, the restarted journal holds the destroy
+/// `unknown` and still names the resource it was sent to.
+#[tokio::test]
+async fn a_dispatched_destroy_names_its_target_before_any_answer_and_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let bridge = spawn().await;
+    let destroy = Effect {
+        operation: operation(60),
+        scope: scope(),
+        action: Action::Destroy {
+            target: fx("key-a"),
+        },
+        approval: Some("apr-destroy-a".into()),
+        policy: None,
+        deadline_ms: 5000,
+    };
+    let flight = bridge.request(&mut journal, destroy).await.unwrap();
+    let target = Some(fx("key-a").to_value().to_string());
+    let row = journal
+        .provider_operation(OperationId::from_bytes([60; 16]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, ProviderStatus::Dispatched);
+    assert_eq!(row.dispatch.target, target);
+    // Nothing reads the answer: Fabric stops here.
+    drop(flight);
+    bridge.kill().await;
+    drop(bridge);
+    drop(journal);
+    let mut journal = Journal::open(&dir.path().join(fabric_journal::FILE_NAME)).unwrap();
+    let recovery = journal
+        .recover(1_770_000_000_000, |_| fabric_journal::Liveness::CannotTell)
+        .unwrap();
+    assert_eq!(
+        recovery.provider_unknown,
+        vec![(scope().job, OperationId::from_bytes([60; 16]))]
+    );
+    let row = journal
+        .provider_operation(OperationId::from_bytes([60; 16]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, ProviderStatus::Unknown);
+    assert_eq!(row.dispatch.action, "sandbox.destroy");
+    assert_eq!(row.dispatch.target, target);
+}

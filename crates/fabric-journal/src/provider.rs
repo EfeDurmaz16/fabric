@@ -8,9 +8,12 @@
 //! none. Its key and id are never used twice, so nothing the journal holds
 //! is ever sent again. It leaves `dispatched` only for what the worker
 //! answered or for `unknown`; it leaves `unknown` only for an observed
-//! terminal state. The locator the worker reported is stored as the JSON
-//! text it came in and is never parsed here: Fabric reads only the
-//! capability profile, never a provider's names.
+//! terminal state. The target Fabric sent the action to is stored with the
+//! dispatch and never changes, so an operation lost before any answer
+//! still names the resource it acted on. That target and the locator the
+//! worker reported are stored as the JSON text they came in and are never
+//! parsed here: Fabric reads only the capability profile, never a
+//! provider's names.
 
 use fabric_core::id::JobId;
 use fabric_core::managed::{
@@ -105,6 +108,10 @@ pub struct ProviderDispatch {
     pub generation: Generation,
     /// The bridge action, such as `sandbox.create`.
     pub action: String,
+    /// The locator of the resource the action acts on, as the JSON text
+    /// Fabric sends; `None` for an action without one, such as
+    /// `sandbox.create`.
+    pub target: Option<String>,
 }
 
 /// Why the worker or Fabric answered as it did, kept with the status.
@@ -275,8 +282,8 @@ impl Journal {
         tx.execute(
             "INSERT INTO provider_operations
                (operation_id, op_key, request_digest, job_id, task_id, attempt_id, generation,
-                action, status, code, reason, effect, locator, dispatched_ms, updated_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13, ?13)",
+                action, target, status, code, reason, effect, locator, dispatched_ms, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14, ?14)",
             params![
                 id,
                 dispatch.key.as_str(),
@@ -286,6 +293,7 @@ impl Journal {
                 dispatch.attempt.to_bytes(),
                 sql_u64(dispatch.generation.get())?,
                 dispatch.action,
+                dispatch.target,
                 status.name(),
                 answer.code,
                 answer.reason,
@@ -384,7 +392,7 @@ impl Journal {
             .conn
             .query_row(
                 "SELECT op_key, request_digest, job_id, task_id, attempt_id, generation, action,
-                        status, code, reason, effect, locator
+                        target, status, code, reason, effect, locator
                  FROM provider_operations WHERE operation_id = ?1",
                 [operation.to_bytes()],
                 |r| {
@@ -396,11 +404,12 @@ impl Journal {
                         r.get::<_, [u8; 16]>(4)?,
                         get_u64(r, 5)?,
                         r.get::<_, String>(6)?,
-                        r.get::<_, String>(7)?,
-                        r.get::<_, Option<String>>(8)?,
+                        r.get::<_, Option<String>>(7)?,
+                        r.get::<_, String>(8)?,
                         r.get::<_, Option<String>>(9)?,
                         r.get::<_, Option<String>>(10)?,
                         r.get::<_, Option<String>>(11)?,
+                        r.get::<_, Option<String>>(12)?,
                     ))
                 },
             )
@@ -413,6 +422,7 @@ impl Journal {
             attempt,
             generation,
             action,
+            target,
             status,
             code,
             reason,
@@ -439,6 +449,7 @@ impl Journal {
                     corrupt(format!("provider operation {operation} generation 0"))
                 })?,
                 action,
+                target,
             },
             status: ProviderStatus::parse(&status)
                 .ok_or_else(|| corrupt(format!("provider operation status {status}")))?,
@@ -494,6 +505,7 @@ mod tests {
             attempt: AttemptId::from_bytes([2; 16]),
             generation: Generation::FIRST,
             action: "sandbox.create".into(),
+            target: None,
         }
     }
 
@@ -601,6 +613,38 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// A destroy whose worker never answered, then a restart: the
+    /// operation is unknown and still names the resource it acted on, so
+    /// it can be observed by its original target. No answer changes it.
+    #[test]
+    fn the_target_is_kept_from_dispatch_through_recovery() {
+        let mut f = granted();
+        let target = r#"{"provider":"fixture","scope":{},"kind":"sandbox","native_id":"fx-a"}"#;
+        let mut destroy = dispatch(1);
+        destroy.action = "sandbox.destroy".into();
+        destroy.target = Some(target.into());
+        f.journal.provider_begin(&destroy, None, 1).unwrap();
+        let op = OperationId::from_bytes([0x81; 16]);
+        let recovery = f
+            .journal
+            .recover(2, |_| crate::Liveness::CannotTell)
+            .unwrap();
+        assert_eq!(recovery.provider_unknown, vec![(JOB, op)]);
+        let other = r#"{"provider":"fixture","scope":{},"kind":"sandbox","native_id":"fx-b"}"#;
+        f.journal
+            .provider_record(
+                op,
+                ProviderStatus::Succeeded,
+                &ProviderAnswer::default(),
+                Some(other),
+                3,
+            )
+            .unwrap();
+        let row = f.journal.provider_operation(op).unwrap().unwrap();
+        assert_eq!(row.dispatch, destroy, "the target is the dispatch's");
+        assert_eq!(row.locator.as_deref(), Some(other));
     }
 
     /// Dispatched moves to any answer; unknown only to an observed

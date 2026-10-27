@@ -563,6 +563,7 @@ impl Bridge {
             attempt: request.scope.attempt,
             generation: request.scope.generation,
             action: request.action.name().to_owned(),
+            target: request.action.target().map(locator_text),
         };
         let refuse = |log: &mut L, refusal: Refusal| -> BridgeError {
             let answer = ProviderAnswer {

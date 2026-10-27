@@ -244,7 +244,8 @@ fn make_v1_fixture() {
 
 /// The provider operations the v2 fixture adds to the v1 one, on the
 /// first job's live third attempt: one of each status a worker's answer
-/// leaves, two with the locator the worker reported.
+/// leaves, two with the locator the worker reported, and the exec and the
+/// destroy with the target Fabric sent them to.
 fn provider_dispatch(n: u8, action: &str) -> ProviderDispatch {
     ProviderDispatch {
         operation: OperationId::from_bytes([0x40 + n; 16]),
@@ -255,6 +256,7 @@ fn provider_dispatch(n: u8, action: &str) -> ProviderDispatch {
         attempt: AttemptId::from_bytes([5; 16]),
         generation: Generation::new(3).unwrap(),
         action: action.into(),
+        target: matches!(action, "sandbox.exec" | "sandbox.destroy").then(|| LOCATOR.to_owned()),
     }
 }
 
@@ -344,7 +346,14 @@ fn the_v2_fixture_holds_what_it_was_made_with() {
     assert_eq!(statuses[0].locator.as_deref(), Some(LOCATOR));
     assert_eq!(statuses[1].status, ProviderStatus::Rejected);
     assert_eq!(statuses[1].answer, answer("unsupported", "action", "none"));
+    assert_eq!(statuses[2].dispatch, provider_dispatch(3, "sandbox.exec"));
     assert_eq!(statuses[2].status, ProviderStatus::Unknown);
+    assert_eq!(statuses[2].locator, None, "the exec reported no locator");
+    assert_eq!(statuses[2].dispatch.target.as_deref(), Some(LOCATOR));
+    assert_eq!(
+        statuses[3].dispatch,
+        provider_dispatch(4, "sandbox.destroy")
+    );
     assert_eq!(statuses[3].status, ProviderStatus::Dispatched);
     assert_eq!(statuses[3].locator.as_deref(), Some(LOCATOR));
     // Restart recovery makes the dispatched one unknown and sends nothing.

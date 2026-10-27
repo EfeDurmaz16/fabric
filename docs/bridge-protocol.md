@@ -357,7 +357,7 @@ Bridge protocol v1 is independent of the client API version (ADR 0018). Within v
 | Anything the worker would refuse on reading it, checked with the worker-side parser under the negotiated profile: an action not in the profile, a limit over the profile's (deadline, argv, stdin, output), a target that does not fit the profile, any encoding fault such as a NUL in an argument; and a frame over `max_request_bytes` | `RefusedLocally` with the code and reason the worker would answer | `rejected`, nothing written |
 | The journal already holds the key or the id | `Log(Used)` | unchanged; nothing is ever sent twice |
 | The attempt is not the job's current live grant at its generation, or the job is closed | `Log(Fenced)` | nothing |
-| Otherwise | the operation is committed `dispatched`, then the frame is written | `dispatched` |
+| Otherwise | the operation is committed `dispatched` with its action and its `target` locator, then the frame is written | `dispatched`, naming its target from the start |
 
 `operation.digest` is the caller's: a node computes it with `wire::request_digest`, blake3 under the domain `fabric.bridge.request.v1` over the canonical JSON (keys sorted) of the request without `type`, `request_id`, `operation` and `deadline_ms`. The client sends what it is given and the journal keeps it.
 

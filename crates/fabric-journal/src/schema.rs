@@ -127,7 +127,9 @@ CREATE TRIGGER evidence_append_only_delete BEFORE DELETE ON evidence
 /// key and id space of `operations` (checked on insert) and names the
 /// attempt whose generation fenced it. `status` holds the bridge's journal
 /// statuses, `rejected` included, which an accepted command can never be;
-/// `locator` is the worker's JSON text, which the journal never parses.
+/// `target` is the locator Fabric sent the action to, written once at
+/// dispatch, and `locator` the last one the worker reported; both are JSON
+/// text, which the journal never parses.
 const V2: &str = "
 CREATE TABLE provider_operations (
   operation_id   BLOB PRIMARY KEY CHECK (length(operation_id) = 16),
@@ -138,6 +140,7 @@ CREATE TABLE provider_operations (
   attempt_id     BLOB NOT NULL REFERENCES attempts(attempt_id),
   generation     INTEGER NOT NULL CHECK (generation >= 1),
   action         TEXT NOT NULL,
+  target         TEXT,
   status         TEXT NOT NULL CHECK (status IN ('dispatched','succeeded','failed','cancelled','rejected','unknown')),
   code           TEXT,
   reason         TEXT,
