@@ -309,17 +309,21 @@ impl Node {
         let id = token.job_id;
         let mut out = Out::default();
         // A job new here is made from the page's first record, which must be its `Created`.
-        let known = if let Ok(job) = self.job(id).await {
-            job
-        } else {
-            let first = records
-                .records()
-                .first()
-                .ok_or_else(|| bad(&"an empty page"))?;
-            self.accept_record(id, peer, first.as_bytes())
-                .await
-                .map_err(|e| bad(&e))?;
-            self.job(id).await.map_err(|_| Fault::UnknownJob)?
+        // A managed id, or any id while the managed ids cannot be read, is
+        // refused here and never made a standalone job (ADR 0019).
+        let known = match self.job(id).await {
+            Ok(job) => job,
+            Err(e @ NodeError::Managed { .. }) => return Err(bad(&e)),
+            Err(_) => {
+                let first = records
+                    .records()
+                    .first()
+                    .ok_or_else(|| bad(&"an empty page"))?;
+                self.accept_record(id, peer, first.as_bytes())
+                    .await
+                    .map_err(|e| bad(&e))?;
+                self.job(id).await.map_err(|_| Fault::UnknownJob)?
+            }
         };
         {
             let mut job = known.lock().await;

@@ -2237,6 +2237,17 @@ impl Node {
         peer: NodeId,
         bytes: &[u8],
     ) -> Result<bool, NodeError> {
+        let known = self.jobs.lock().await.get(&id).cloned();
+        if let Some(job) = known {
+            let mut job = job.lock().await;
+            return job.accept(bytes, peer, self.id);
+        }
+        // A peer never makes a standalone job under an id the managed
+        // authority holds, or under any id when its ids cannot be read
+        // (ADR 0019: one id, one mode).
+        if let Some(refusal) = self.managed_only(id).await {
+            return Err(refusal);
+        }
         let mut jobs = self.jobs.lock().await;
         if let Some(job) = jobs.get(&id).cloned() {
             drop(jobs);
@@ -5893,6 +5904,72 @@ pub(crate) mod tests {
         assert_eq!(node.jobs.lock().await.len(), 1);
         let job = node.job(id).await.unwrap();
         assert_eq!(job.lock().await.ledger().records().len(), 1);
+    }
+
+    /// A managed job, made through the node.
+    async fn managed_job(dir: &Path, node: &Arc<Node>) -> JobId {
+        let request = Request::ManagedCreate {
+            operation_key: fabric_core::managed::OperationKey::parse("create-1").unwrap(),
+            repo: fabric_client::api::SystemPath::parse(
+                dir.canonicalize().unwrap().to_str().unwrap(),
+            )
+            .unwrap(),
+            goal: "goal".to_owned(),
+            harness: HarnessKind::Codex,
+        };
+        match node.managed(request).await.unwrap() {
+            Reply::ManagedCreate(made) => made.job.job,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peer_record_never_makes_a_standalone_job_under_a_managed_id() {
+        let (dir, node) = node();
+        let id = managed_job(dir.path(), &node).await;
+        let created = Ledger::created(
+            id,
+            "goal".to_owned(),
+            HarnessKind::Codex,
+            NodeId::from_bytes([7; 32]),
+            clock::event_id(),
+            clock::now_ms(),
+        )
+        .unwrap();
+        let refused = node
+            .accept_record(id, NodeId::from_bytes([7; 32]), created.bytes())
+            .await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(!node.cfg.state.job(id).ledger().exists());
+        assert!(matches!(node.job(id).await, Err(NodeError::Managed { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_peer_record_makes_no_job_while_the_managed_ids_cannot_be_read() {
+        let dir = tempfile::Builder::new()
+            .prefix("fops")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let managed = root.join("state/managed");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::write(managed.join("journal.sqlite"), b"not a journal").unwrap();
+        let node = node_at(&root.join("home"), &root.join("state"), ToolEnv::current());
+        let id = JobId::from_bytes([3; 16]);
+        let created = Ledger::created(
+            id,
+            "goal".to_owned(),
+            HarnessKind::Codex,
+            NodeId::from_bytes([7; 32]),
+            clock::event_id(),
+            clock::now_ms(),
+        )
+        .unwrap();
+        let refused = node
+            .accept_record(id, NodeId::from_bytes([7; 32]), created.bytes())
+            .await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(!node.cfg.state.job(id).ledger().exists());
     }
 
     #[tokio::test]
