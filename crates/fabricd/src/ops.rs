@@ -423,9 +423,9 @@ impl Node {
         for job in jobs {
             let job = job.lock().await;
             let manifest = job.ledger().manifest();
-            let standing = match job.forked() {
-                Ok(Some(_)) => Standing::Frozen,
-                Ok(None) => standing(&job.view(self.id)),
+            let standing = match job.is_frozen() {
+                Ok(true) => Standing::Frozen,
+                Ok(false) => standing(&job.view(self.id)),
                 Err(_) => Standing::Unreadable,
             };
             listed.push(Listed::Job(JobSummary {
@@ -729,14 +729,11 @@ impl Node {
         let started = local::process_started(pid)
             .await
             .ok_or(NodeError::HarnessGone { pid })?;
-        local::write(
-            &job.dir().harness(),
-            &HarnessRecord {
-                epoch,
-                pid,
-                started,
-            },
-        )?;
+        job.set_harness_record(&HarnessRecord {
+            epoch,
+            pid,
+            started,
+        })?;
         out.emit(Event::HarnessRecorded { pid });
         // The writes below are synchronous, and the task that relays the
         // event to the client was woken on this worker, where no other
@@ -838,7 +835,7 @@ impl Node {
             // The record stands for the group: a background process the
             // harness started keeps it, so a suspend still stops it.
             if record.liveness().await == Liveness::Gone {
-                local::remove(&job.dir().harness())?;
+                job.clear_harness_record()?;
             } else {
                 tracing::info!(job = %id, pid, "the harness exited and its group still runs");
             }
@@ -915,7 +912,7 @@ impl Node {
                 out.emit(Event::StoppingHarness { pid: record.pid });
                 record.stop(STOP_GRACE).await?;
             }
-            local::remove(&job.dir().harness())?;
+            job.clear_harness_record()?;
         }
         faults::hit(Point::AfterQuiesce).await;
 
@@ -1810,7 +1807,7 @@ impl Node {
     /// workspace stays where it is, since it may hold work the job lacks.
     pub(crate) async fn settle(&self, job: &mut Job, out: &mut Out) -> Result<(), NodeError> {
         let view = job.view(self.id);
-        let forked = job.forked()?.is_some();
+        let forked = job.is_frozen()?;
         if let Some(record) = job.harness_record()? {
             let owned =
                 !forked && matches!(view, LeaseView::Owner(token) if token.epoch == record.epoch);
@@ -1822,7 +1819,7 @@ impl Node {
                     });
                     record.stop(FENCE_GRACE).await?;
                 }
-                local::remove(&job.dir().harness())?;
+                job.clear_harness_record()?;
             }
         }
         if forked {

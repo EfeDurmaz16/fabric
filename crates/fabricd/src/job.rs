@@ -5,8 +5,20 @@
 //! goes through `Ledger::commit`, which writes and flushes before it shows
 //! the record, and the derived manifest is rewritten after each append. A
 //! job whose files fail to open is reported, never repaired or dropped.
+//!
+//! The workspace marker, the harness record and the fork record are kept in
+//! memory once read, and every write and removal of them goes through this
+//! type, which writes the file first and the copy after, so the copy is
+//! never ahead of the file and never stale while the daemon, their one
+//! writer, runs. A write that fails forgets the copy, so the next read asks
+//! the file again; a read that fails keeps nothing.
 
 use std::fs;
+use std::path::Path;
+use std::sync::{Mutex, PoisonError};
+
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, JobId, NodeId, RecordHash, SnapshotId};
@@ -28,6 +40,75 @@ pub struct Job {
     dir: JobDir,
     ledger: Ledger,
     file: LedgerFile,
+    marker: Kept<Marker>,
+    harness: Kept<HarnessRecord>,
+    forked: Kept<ForkRecord>,
+}
+
+/// A node-local file kept in memory after its first read.
+#[derive(Debug)]
+struct Kept<T>(Mutex<Slot<T>>);
+
+/// What `Kept` holds of its file.
+#[derive(Debug)]
+enum Slot<T> {
+    /// Not read yet, or a write failed and the file must be read again.
+    Unread,
+    /// What the file holds, `None` when it is absent.
+    Read(Option<T>),
+}
+
+impl<T> Default for Kept<T> {
+    fn default() -> Self {
+        Self(Mutex::new(Slot::Unread))
+    }
+}
+
+impl<T: Clone + Serialize + DeserializeOwned> Kept<T> {
+    fn slot(&self) -> std::sync::MutexGuard<'_, Slot<T>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// What the file at `path` holds, read once.
+    fn read(&self, path: &Path) -> Result<Option<T>, local::LocalError> {
+        let mut slot = self.slot();
+        if let Slot::Read(kept) = &*slot {
+            return Ok(kept.clone());
+        }
+        let read = local::read(path)?;
+        *slot = Slot::Read(read.clone());
+        Ok(read)
+    }
+
+    /// Whether the file at `path` holds a value, read once.
+    fn is_some(&self, path: &Path) -> Result<bool, local::LocalError> {
+        let mut slot = self.slot();
+        if let Slot::Read(kept) = &*slot {
+            return Ok(kept.is_some());
+        }
+        let read: Option<T> = local::read(path)?;
+        let present = read.is_some();
+        *slot = Slot::Read(read);
+        Ok(present)
+    }
+
+    /// Replaces the file at `path` with `value`, then the copy.
+    fn write(&self, path: &Path, value: &T) -> Result<(), local::LocalError> {
+        let mut slot = self.slot();
+        *slot = Slot::Unread;
+        local::write(path, value)?;
+        *slot = Slot::Read(Some(value.clone()));
+        Ok(())
+    }
+
+    /// Removes the file at `path`, then the copy.
+    fn remove(&self, path: &Path) -> Result<(), local::LocalError> {
+        let mut slot = self.slot();
+        *slot = Slot::Unread;
+        local::remove(path)?;
+        *slot = Slot::Read(None);
+        Ok(())
+    }
 }
 
 impl Job {
@@ -66,6 +147,9 @@ impl Job {
             dir,
             ledger,
             file,
+            marker: Kept::default(),
+            harness: Kept::default(),
+            forked: Kept::default(),
         })
     }
 
@@ -112,6 +196,9 @@ impl Job {
             dir,
             ledger,
             file,
+            marker: Kept::default(),
+            harness: Kept::default(),
+            forked: Kept::default(),
         })
     }
 
@@ -226,22 +313,32 @@ impl Job {
 
     /// The workspace marker, if this node has a workspace for the job.
     pub fn marker(&self) -> Result<Option<Marker>, NodeError> {
-        Ok(local::read(&self.dir.marker())?)
+        Ok(self.marker.read(&self.dir.marker())?)
     }
 
     /// Replaces the workspace marker.
     pub fn set_marker(&self, marker: &Marker) -> Result<(), NodeError> {
-        Ok(local::write(&self.dir.marker(), marker)?)
+        Ok(self.marker.write(&self.dir.marker(), marker)?)
     }
 
     /// Removes the workspace marker.
     pub fn clear_marker(&self) -> Result<(), NodeError> {
-        Ok(local::remove(&self.dir.marker())?)
+        Ok(self.marker.remove(&self.dir.marker())?)
     }
 
     /// The harness this node launched, if one is recorded.
     pub fn harness_record(&self) -> Result<Option<HarnessRecord>, NodeError> {
-        Ok(local::read(&self.dir.harness())?)
+        Ok(self.harness.read(&self.dir.harness())?)
+    }
+
+    /// Records the harness this node launched.
+    pub fn set_harness_record(&self, record: &HarnessRecord) -> Result<(), NodeError> {
+        Ok(self.harness.write(&self.dir.harness(), record)?)
+    }
+
+    /// Removes the harness record.
+    pub fn clear_harness_record(&self) -> Result<(), NodeError> {
+        Ok(self.harness.remove(&self.dir.harness())?)
     }
 
     /// The session the job continues on this node, if known.
@@ -314,15 +411,20 @@ impl Job {
 
     /// The fork record that freezes the job here, if a peer's ledger forked from this one.
     pub fn forked(&self) -> Result<Option<ForkRecord>, NodeError> {
-        Ok(local::read(&self.dir.forked())?)
+        Ok(self.forked.read(&self.dir.forked())?)
+    }
+
+    /// Whether the job is frozen here, without copying the fork record.
+    pub fn is_frozen(&self) -> Result<bool, NodeError> {
+        Ok(self.forked.is_some(&self.dir.forked())?)
     }
 
     /// Freezes the job here; a job already frozen keeps the first record.
     pub fn freeze(&self, fork: &ForkRecord) -> Result<bool, NodeError> {
-        if self.forked()?.is_some() {
+        if self.is_frozen()? {
             return Ok(false);
         }
-        local::write(&self.dir.forked(), fork)?;
+        self.forked.write(&self.dir.forked(), fork)?;
         Ok(true)
     }
 
@@ -397,6 +499,71 @@ mod tests {
         assert!(!state.job(asked).dir().exists());
         Job::create(other, state.job(other), &created).unwrap();
         Job::open(other, state.job(other)).unwrap();
+    }
+
+    /// The marker, the harness record and the fork record are read from
+    /// disk once and then answered from memory, since the daemon is their
+    /// one writer; every write goes to the file before the copy, and a
+    /// write that fails leaves the next read to the file.
+    #[test]
+    fn a_jobs_local_records_are_read_once_and_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::resolve(Some(dir.path().as_os_str()), dir.path()).unwrap();
+        let id = JobId::from_bytes([1; 16]);
+        let me = NodeId::from_bytes([3; 32]);
+        let created = Ledger::created(
+            id,
+            "goal".into(),
+            HarnessKind::Codex,
+            me,
+            EventId::from_bytes([4; 16]),
+            1,
+        )
+        .unwrap();
+        let marker = Marker {
+            root: dir.path().join("work"),
+            state: MarkerState::Live,
+            epoch: Epoch::FIRST,
+        };
+        let job = Job::create_owned(id, state.job(id), &created, &marker).unwrap();
+        let paths = state.job(id);
+        assert_eq!(job.marker().unwrap(), Some(marker.clone()));
+        assert_eq!(job.harness_record().unwrap(), None);
+        assert!(!job.is_frozen().unwrap());
+        // Read once: files changed behind the job's back are not read again.
+        fs::remove_file(paths.marker()).unwrap();
+        fs::write(paths.harness(), "not a record").unwrap();
+        assert_eq!(job.marker().unwrap(), Some(marker.clone()));
+        assert_eq!(job.harness_record().unwrap(), None);
+
+        // Written through: the file holds what the copy holds.
+        let record = HarnessRecord {
+            epoch: Epoch::FIRST,
+            pid: std::num::NonZeroU32::new(4242).unwrap(),
+            started: "then".into(),
+        };
+        job.set_harness_record(&record).unwrap();
+        assert_eq!(local::read(&paths.harness()).unwrap(), Some(record.clone()));
+        assert_eq!(job.harness_record().unwrap(), Some(record));
+        job.clear_harness_record().unwrap();
+        assert!(!paths.harness().exists());
+        assert_eq!(job.harness_record().unwrap(), None);
+        let fork = ForkRecord {
+            peer: NodeId::from_bytes([7; 32]),
+            epoch: Epoch::FIRST,
+            head: job.ledger().head(),
+        };
+        assert!(job.freeze(&fork).unwrap());
+        assert_eq!(local::read(&paths.forked()).unwrap(), Some(fork.clone()));
+        assert!(
+            !job.freeze(&fork).unwrap(),
+            "a second freeze replaced the first"
+        );
+
+        // A write that fails forgets the copy, so the next read asks the file.
+        fs::create_dir_all(paths.marker()).unwrap();
+        assert!(job.set_marker(&marker).is_err());
+        assert!(job.marker().is_err(), "the copy outlived a failed write");
     }
 
     /// An owned job whose marker could not be written must leave no
