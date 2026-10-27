@@ -1,0 +1,116 @@
+# every_shared_scenario_over_the_workers_stdio, repeated
+
+worker: the Capsule worker built in the Capsule worktree at 6f5a8d0 (merge of M1), dist identical to a fresh build of c5ff306 except test-only .d.ts files
+node: 22.23.2; host: Apple M5 Pro, macOS arm64, load average 13 to 17
+binary: the capsule_worker test binary, run with --ignored --exact every_shared_scenario_over_the_workers_stdio
+
+old replay (b6b2535, one write per send step): 39 of 40 pass
+new replay (0b6b3a3, consecutive sends in one write): 100 of 100 pass
+
+## the failing old run (old 2)
+thread 'every_shared_scenario_over_the_workers_stdio' panicked at crates/fabric-bridge/tests/capsule_worker.rs:309:17:
+assertion `left == right` failed: shutdown_reports_unresolved step 5
+  left: Object {"error": Object {"code": String("pending"), "deadline_ms": Number(30000), "effect": String("pending"), "observations": Number(4), "reason": String("shutting_down"), "resource": Object {"kind": String("sandbox"), "native_id": String("fx-key-create-1"), "provider": String("fixture"), "scope": Object {"account": String("acct-a"), "project": String("proj-1")}}, "state": String("stopping")}, "operation_id": String("01K8W3A00000000000000000P6"), "request_id": String("r-4"), "type": String("error")}
+ right: Object {"error": Object {"code": String("pending"), "deadline_ms": Number(30000), "effect": String("pending"), "observations": Number(2), "reason": String("shutting_down"), "resource": Object {"kind": String("sandbox"), "native_id": String("fx-key-create-1"), "provider": String("fixture"), "scope": Object {"account": String("acct-a"), "project": String("proj-1")}}, "state": String("stopping")}, "operation_id": String("01K8W3A00000000000000000P6"), "request_id": String("r-4"), "type": String("error")}
+
+## per run
+old 1 pass new 1 pass
+old 2 FAIL new 2 pass
+old 3 pass new 3 pass
+old 4 pass new 4 pass
+old 5 pass new 5 pass
+old 6 pass new 6 pass
+old 7 pass new 7 pass
+old 8 pass new 8 pass
+old 9 pass new 9 pass
+old 10 pass new 10 pass
+old 11 pass new 11 pass
+old 12 pass new 12 pass
+old 13 pass new 13 pass
+old 14 pass new 14 pass
+old 15 pass new 15 pass
+old 16 pass new 16 pass
+old 17 pass new 17 pass
+old 18 pass new 18 pass
+old 19 pass new 19 pass
+old 20 pass new 20 pass
+old 21 pass new 21 pass
+old 22 pass new 22 pass
+old 23 pass new 23 pass
+old 24 pass new 24 pass
+old 25 pass new 25 pass
+old 26 pass new 26 pass
+old 27 pass new 27 pass
+old 28 pass new 28 pass
+old 29 pass new 29 pass
+old 30 pass new 30 pass
+old 31 pass new 31 pass
+old 32 pass new 32 pass
+old 33 pass new 33 pass
+old 34 pass new 34 pass
+old 35 pass new 35 pass
+old 36 pass new 36 pass
+old 37 pass new 37 pass
+old 38 pass new 38 pass
+old 39 pass new 39 pass
+old 40 pass new 40 pass
+           new 41 pass
+           new 42 pass
+           new 43 pass
+           new 44 pass
+           new 45 pass
+           new 46 pass
+           new 47 pass
+           new 48 pass
+           new 49 pass
+           new 50 pass
+           new 51 pass
+           new 52 pass
+           new 53 pass
+           new 54 pass
+           new 55 pass
+           new 56 pass
+           new 57 pass
+           new 58 pass
+           new 59 pass
+           new 60 pass
+           new 61 pass
+           new 62 pass
+           new 63 pass
+           new 64 pass
+           new 65 pass
+           new 66 pass
+           new 67 pass
+           new 68 pass
+           new 69 pass
+           new 70 pass
+           new 71 pass
+           new 72 pass
+           new 73 pass
+           new 74 pass
+           new 75 pass
+           new 76 pass
+           new 77 pass
+           new 78 pass
+           new 79 pass
+           new 80 pass
+           new 81 pass
+           new 82 pass
+           new 83 pass
+           new 84 pass
+           new 85 pass
+           new 86 pass
+           new 87 pass
+           new 88 pass
+           new 89 pass
+           new 90 pass
+           new 91 pass
+           new 92 pass
+           new 93 pass
+           new 94 pass
+           new 95 pass
+           new 96 pass
+           new 97 pass
+           new 98 pass
+           new 99 pass
+           new 100 pass
