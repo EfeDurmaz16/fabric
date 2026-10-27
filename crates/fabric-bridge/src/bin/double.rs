@@ -24,7 +24,8 @@
 //!   another digest it is an idempotency conflict.
 //!
 //! `FABRIC_BRIDGE_DOUBLE_HELLO` scripts the handshake: `ok` (the default),
-//! `raise_limit`, `wrong_profile`, `oversize`, `silent` or `exit`.
+//! `raise_limit`, `wrong_profile`, `oversize`, `silent` or `exit`; with
+//! `stall` it answers hello and never reads its input again, alive.
 
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -527,6 +528,9 @@ async fn run() -> u8 {
     };
     if !send(&mut stdout, &ack).await {
         return 1;
+    }
+    if script == "stall" {
+        std::future::pending::<()>().await;
     }
     let mut worker = Worker {
         stdin,

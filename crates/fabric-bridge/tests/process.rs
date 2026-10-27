@@ -818,3 +818,54 @@ async fn progress_is_bounded_to_sixteen_frames_in_order() {
     let exit = bridge.close().await.unwrap();
     assert!(exit.code().is_some() || exit.signal().is_some());
 }
+
+/// A worker that answers hello and then stops reading its input while it
+/// stays alive. A request whose frame does not fit the pipe returns at
+/// once, is unknown by its deadline, and the worker is lost and
+/// terminated; a second request is refused at once and `close` returns,
+/// where before each waited on the write without end.
+#[tokio::test]
+async fn a_worker_that_stops_reading_is_lost_and_terminated_at_the_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let mut command = double();
+    command.env("FABRIC_BRIDGE_DOUBLE_HELLO", "stall");
+    let bridge = Bridge::spawn(command, config()).await.unwrap();
+    let mut big = create(90, "fixture/ok");
+    big.deadline_ms = 100;
+    big.action = Action::Create(CreateParams {
+        image: "fixture/ok".into(),
+        labels: (0..200)
+            .map(|i| (format!("l{i}"), "x".repeat(4000)))
+            .collect(),
+        ..CreateParams::default()
+    });
+    let started = Instant::now();
+    let flight = tokio::time::timeout(Duration::from_secs(2), bridge.request(&mut journal, big))
+        .await
+        .expect("request waited on a worker that does not read")
+        .unwrap();
+    assert_eq!(status(&journal, 90), Some(ProviderStatus::Dispatched));
+    let outcome = flight.finish(&mut journal).await.unwrap();
+    assert_eq!(outcome.status, ProviderStatus::Unknown);
+    while bridge.lost().is_none() {
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the worker was never lost"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let next = tokio::time::timeout(
+        Duration::from_millis(500),
+        bridge.request(&mut journal, create(91, "fixture/ok")),
+    )
+    .await
+    .expect("a second request waited on the stuck one");
+    assert!(matches!(next, Err(BridgeError::Lost(_))), "{next:?}");
+    assert_eq!(status(&journal, 91), None);
+    let exit = tokio::time::timeout(Duration::from_secs(3), bridge.close())
+        .await
+        .expect("close waited on the stuck write")
+        .unwrap();
+    assert_eq!(exit.signal(), Some(15), "SIGTERM: {exit:?}");
+}

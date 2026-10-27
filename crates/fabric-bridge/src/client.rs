@@ -16,6 +16,10 @@
 //! - What waits for a caller is bounded: at most 16 `progress` frames per
 //!   request, `seq` from 1 rising by 1, then its one answer. Any other
 //!   `progress` breaks the protocol and ends the worker.
+//! - Frames are written whole by one writer task, in order, each by its
+//!   deadline. A caller that stops waiting cannot leave part of a frame
+//!   behind, and a worker that stops reading its input is lost and
+//!   terminated at the deadline instead of holding the bridge forever.
 
 use std::collections::HashMap;
 use std::process::{ExitStatus, Stdio};
@@ -28,7 +32,7 @@ use fabric_journal::{ProviderAnswer, ProviderDispatch, ProviderStatus};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::Instant;
 
 use crate::frames::{self, FrameFault};
@@ -237,6 +241,13 @@ impl Shared {
 
 type Writer = Box<dyn AsyncWrite + Send + Unpin>;
 
+/// One frame for the writer task, and the instant by which the worker
+/// must have read it.
+struct Write {
+    frame: Vec<u8>,
+    deadline: Instant,
+}
+
 /// The worker process, when the bridge runs one.
 struct Process {
     child: tokio::sync::Mutex<Child>,
@@ -262,7 +273,9 @@ impl Process {
 
 /// A connected bridge to one worker.
 pub struct Bridge {
-    writer: Arc<tokio::sync::Mutex<Option<Writer>>>,
+    /// The writer task's queue; `None` once `close` closed it.
+    writes: Option<mpsc::Sender<Write>>,
+    writer: JoinHandle<()>,
     shared: Arc<Shared>,
     reader: JoinHandle<()>,
     process: Option<Arc<Process>>,
@@ -288,6 +301,7 @@ impl std::fmt::Debug for Bridge {
 impl Drop for Bridge {
     fn drop(&mut self) {
         self.reader.abort();
+        self.writer.abort();
     }
 }
 
@@ -401,18 +415,31 @@ impl Bridge {
                 }
             };
         let shared = Arc::new(Shared::default());
-        let writer = Arc::new(tokio::sync::Mutex::new(Some(writer)));
+        // One frame per outstanding request or observe, one cancel for
+        // each, and a shutdown.
+        let room = cap_of(limits.max_in_flight)
+            .saturating_mul(2)
+            .saturating_add(1);
+        let (outbox, queue) = mpsc::channel(room);
+        let writer = tokio::spawn(write_loop(
+            writer,
+            queue,
+            Arc::clone(&shared),
+            process.clone(),
+            config.kill_grace,
+        ));
         let profile = Arc::new(profile);
         let reader = tokio::spawn(read_loop(
             reader,
             Arc::clone(&shared),
             Arc::clone(&profile),
             cap_of(limits.max_frame_bytes),
-            Arc::clone(&writer),
+            writer.abort_handle(),
             process.clone(),
             config.kill_grace,
         ));
         Ok(Bridge {
+            writes: Some(outbox),
             writer,
             shared,
             reader,
@@ -542,14 +569,40 @@ impl Bridge {
         self.shared.lock().waiters.remove(id);
     }
 
-    async fn send(&self, frame: &[u8]) -> Result<(), String> {
-        let mut writer = self.writer.lock().await;
-        let Some(writer) = writer.as_mut() else {
-            return Err("the worker's input is closed".into());
+    /// A place in the writer's queue, taken before anything is recorded,
+    /// so a frame that is recorded is always queued.
+    fn reserve(&self) -> Result<mpsc::Permit<'_, Write>, BridgeError> {
+        let Some(writes) = &self.writes else {
+            return Err(BridgeError::ShuttingDown);
         };
-        frames::write(writer, frame)
-            .await
-            .map_err(|e| format!("writing to the worker: {e}"))
+        writes.try_reserve().map_err(|e| match e {
+            mpsc::error::TrySendError::Full(()) => {
+                BridgeError::Busy(u64::try_from(writes.max_capacity()).unwrap_or(u64::MAX))
+            }
+            mpsc::error::TrySendError::Closed(()) => BridgeError::Lost(
+                self.lost()
+                    .unwrap_or_else(|| "the worker's input is closed".into()),
+            ),
+        })
+    }
+
+    /// `register` and `reserve` together; nothing is left registered when
+    /// the queue refuses.
+    fn enlist(
+        &self,
+        id: &str,
+        operation: Option<OperationId>,
+        action: Option<&str>,
+        kind: Kind,
+    ) -> Result<(mpsc::Receiver<Incoming>, mpsc::Permit<'_, Write>), BridgeError> {
+        let rx = self.register(id, operation, action, kind)?;
+        match self.reserve() {
+            Ok(permit) => Ok((rx, permit)),
+            Err(e) => {
+                self.unregister(id);
+                Err(e)
+            }
+        }
     }
 
     /// Sends one effect for a journal operation.
@@ -559,8 +612,17 @@ impl Bridge {
     /// cap, is recorded `rejected` and refused as `RefusedLocally`. Then
     /// the operation is recorded `dispatched`; a key or id the log holds
     /// refuses with `Log(Used)` and nothing is sent. Then the frame is
-    /// written. A worker that is gone, busy or shutting down refuses
+    /// queued for the writer, which writes it whole by the request's
+    /// deadline. A worker that is gone, busy or shutting down refuses
     /// before the log is touched.
+    ///
+    /// It never waits on the worker, so a caller that stops waiting on it
+    /// leaves either nothing recorded or the operation recorded and its
+    /// frame queued whole.
+    #[allow(
+        clippy::unused_async,
+        reason = "async like the rest of the client; it records and queues, so it completes without waiting"
+    )]
     pub async fn request<L: OperationLog>(
         &self,
         log: &mut L,
@@ -614,7 +676,7 @@ impl Bridge {
                 ));
             }
         };
-        let rx = self.register(
+        let (rx, permit) = self.enlist(
             &request.request_id,
             Some(dispatch.operation),
             Some(&dispatch.action),
@@ -626,24 +688,16 @@ impl Bridge {
         }
         let deadline =
             Instant::now() + Duration::from_millis(request.deadline_ms) + self.config.grace;
-        let mut flight = InFlight {
-            request_id: request.request_id.clone(),
+        permit.send(Write { frame, deadline });
+        Ok(InFlight {
+            request_id: request.request_id,
             operation: dispatch.operation,
             kind: Kind::Request,
             rx,
             deadline,
             shared: Arc::clone(&self.shared),
             done: false,
-        };
-        if let Err(why) = self.send(&frame).await {
-            // Part of the frame may have reached the worker: unknown.
-            self.shared.lose(&why);
-            let outcome = flight.settle(log, Answer::Lost(why.clone()))?;
-            flight.done = true;
-            debug_assert_eq!(outcome.status, ProviderStatus::Unknown);
-            return Err(BridgeError::Lost(why));
-        }
-        Ok(flight)
+        })
     }
 
     /// Reads the resource of an operation the log holds as `dispatched`
@@ -657,6 +711,10 @@ impl Bridge {
     /// reported. Anything else is `ObserveMismatch` before sending, since
     /// the answer would settle this operation from another resource's
     /// state: a destroy recorded done while its target still runs.
+    #[allow(
+        clippy::unused_async,
+        reason = "async like the rest of the client; it queues its frame, so it completes without waiting"
+    )]
     pub async fn observe<L: OperationLog>(
         &self,
         log: &mut L,
@@ -696,28 +754,23 @@ impl Bridge {
                 detail: fault.to_string(),
             })
         })?;
-        let rx = self.register(
+        let (rx, permit) = self.enlist(
             &observe.request_id,
             Some(operation),
             Some(&observe.action),
             Kind::Observe,
         )?;
-        let mut flight = InFlight {
+        let deadline = Instant::now() + Duration::from_millis(wait_ms) + self.config.grace;
+        permit.send(Write { frame, deadline });
+        Ok(InFlight {
             request_id: observe.request_id,
             operation,
             kind: Kind::Observe,
             rx,
-            deadline: Instant::now() + Duration::from_millis(wait_ms) + self.config.grace,
+            deadline,
             shared: Arc::clone(&self.shared),
             done: false,
-        };
-        if let Err(why) = self.send(&frame).await {
-            self.shared.lose(&why);
-            flight.settle(log, Answer::Lost(why.clone()))?;
-            flight.done = true;
-            return Err(BridgeError::Lost(why));
-        }
-        Ok(flight)
+        })
     }
 
     /// Asks the worker to stop waiting on the outstanding request
@@ -725,6 +778,10 @@ impl Bridge {
     /// without a frame; an action the profile does not cancel is
     /// `Unsupported` without a frame. The request still answers on its
     /// own: a cancel acknowledgement is not termination.
+    #[allow(
+        clippy::unused_async,
+        reason = "async like the rest of the client; it queues its frame, so it completes without waiting"
+    )]
     pub async fn cancel(&self, request_id: &str) -> Result<Control<CancelState>, BridgeError> {
         let found = {
             let state = self.shared.lock();
@@ -751,15 +808,13 @@ impl Bridge {
             cap_of(self.limits.max_request_bytes),
         )
         .map_err(BridgeError::Frame)?;
-        let rx = self.register(&cancel.request_id, Some(operation), None, Kind::Control)?;
-        if let Err(why) = self.send(&frame).await {
-            self.shared.lose(&why);
-            return Err(BridgeError::Lost(why));
-        }
+        let (rx, permit) = self.enlist(&cancel.request_id, Some(operation), None, Kind::Control)?;
+        let deadline = Instant::now() + self.config.grace;
+        permit.send(Write { frame, deadline });
         Ok(Control::Sent(Pending {
             request_id: cancel.request_id,
             rx,
-            deadline: Instant::now() + self.config.grace,
+            deadline,
             shared: Arc::clone(&self.shared),
             _answer: std::marker::PhantomData,
         }))
@@ -768,6 +823,10 @@ impl Bridge {
     /// Asks the worker to drain for at most `drain_ms` and exit. New
     /// requests are refused from now on, before the log is touched. The
     /// outstanding requests still answer on their own.
+    #[allow(
+        clippy::unused_async,
+        reason = "async like the rest of the client; it queues its frame, so it completes without waiting"
+    )]
     pub async fn shutdown(&self, drain_ms: u64) -> Result<Pending<Vec<Unresolved>>, BridgeError> {
         self.shared.lock().shutting_down = true;
         let request_id = self.request_id();
@@ -780,25 +839,33 @@ impl Bridge {
             cap_of(self.limits.max_request_bytes),
         )
         .map_err(BridgeError::Frame)?;
-        let rx = self.register(&request_id, None, None, Kind::Control)?;
-        if let Err(why) = self.send(&frame).await {
-            self.shared.lose(&why);
-            return Err(BridgeError::Lost(why));
-        }
+        let (rx, permit) = self.enlist(&request_id, None, None, Kind::Control)?;
+        let deadline = Instant::now() + Duration::from_millis(drain_ms) + self.config.grace;
+        permit.send(Write { frame, deadline });
         Ok(Pending {
             request_id,
             rx,
-            deadline: Instant::now() + Duration::from_millis(drain_ms) + self.config.grace,
+            deadline,
             shared: Arc::clone(&self.shared),
             _answer: std::marker::PhantomData,
         })
     }
 
-    /// Closes the worker's input, which the protocol reads as a shutdown
-    /// with no drain, and waits up to the kill grace for it to exit before
-    /// killing it. `None` when the bridge runs no process.
-    pub async fn close(self) -> Option<ExitStatus> {
-        self.writer.lock().await.take();
+    /// Closes the worker's input once the frames already queued are
+    /// written, which the protocol reads as a shutdown with no drain, and
+    /// waits up to the kill grace for it to exit before killing it. A
+    /// writer held up by a worker that does not read is stopped at the
+    /// kill grace, which closes the input as well. `None` when the bridge
+    /// runs no process.
+    pub async fn close(mut self) -> Option<ExitStatus> {
+        self.writes.take();
+        if tokio::time::timeout(self.config.kill_grace, &mut self.writer)
+            .await
+            .is_err()
+        {
+            self.writer.abort();
+            let _ = (&mut self.writer).await;
+        }
         let process = self.process.clone()?;
         let mut child = process.child.lock().await;
         if let Ok(Ok(status)) = tokio::time::timeout(self.config.kill_grace, child.wait()).await {
@@ -1079,6 +1146,36 @@ fn cap_of(bytes: u64) -> usize {
     usize::try_from(bytes).unwrap_or(usize::MAX)
 }
 
+/// Writes each queued frame whole, in order, by its deadline. A write
+/// that fails or misses its deadline may have left part of a frame on the
+/// worker's input, which cannot be resynchronized: the worker is lost and
+/// terminated, as for a framing error from it. When the queue closes, the
+/// worker's input is closed.
+async fn write_loop(
+    mut writer: Writer,
+    mut queue: mpsc::Receiver<Write>,
+    shared: Arc<Shared>,
+    process: Option<Arc<Process>>,
+    grace: Duration,
+) {
+    while let Some(write) = queue.recv().await {
+        let written =
+            tokio::time::timeout_at(write.deadline, frames::write(&mut writer, &write.frame)).await;
+        let why = match written {
+            Ok(Ok(())) => continue,
+            Ok(Err(e)) => format!("writing to the worker: {e}"),
+            Err(_) => "the worker did not read a frame by its deadline".to_owned(),
+        };
+        shared.lose(&why);
+        drop(writer);
+        drop(queue);
+        if let Some(process) = process {
+            process.terminate(grace).await;
+        }
+        return;
+    }
+}
+
 /// Reads the worker's frames until it is gone, routing each answer to its
 /// waiter. A frame or a message that breaks the protocol, a
 /// `protocol_error`, or the end of the stream makes the worker lost; on a
@@ -1088,7 +1185,7 @@ async fn read_loop<R: AsyncRead + Unpin>(
     shared: Arc<Shared>,
     profile: Arc<Profile>,
     cap: usize,
-    writer: Arc<tokio::sync::Mutex<Option<Writer>>>,
+    writer: AbortHandle,
     process: Option<Arc<Process>>,
     grace: Duration,
 ) {
@@ -1113,7 +1210,8 @@ async fn read_loop<R: AsyncRead + Unpin>(
         None => shared.lose("the worker closed its output"),
         Some(why) => {
             shared.lose(&why);
-            writer.lock().await.take();
+            // Stopping the writer drops the worker's input, even mid-frame.
+            writer.abort();
             if let Some(process) = process {
                 process.terminate(grace).await;
             }
