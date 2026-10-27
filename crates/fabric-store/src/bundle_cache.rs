@@ -43,8 +43,8 @@ const MAX_JOBS: usize = 32;
 /// How long a cache no restore used is kept.
 const MAX_IDLE: Duration = Duration::from_hours(14 * 24);
 
-/// The block of `digest`.
-const BLOCK: usize = 1 << 20;
+/// The block of `digest`, and the one buffer it reads into.
+const BLOCK: usize = 64 << 10;
 
 /// One file a link's unpacking wrote into `objects/pack`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,10 +96,11 @@ impl BundleCache {
     /// of an older snapshot of the same chain keeps the newer links.
     pub(crate) fn reuse(&mut self, chain: &[SnapshotId]) -> usize {
         let mut held = 0;
+        let mut buf = Vec::new();
         while held < chain.len()
             && held < self.links.len()
             && self.links[held].snapshot == chain[held]
-            && self.intact(held)
+            && self.intact(held, &mut buf)
         {
             held += 1;
         }
@@ -141,6 +142,7 @@ impl BundleCache {
             self.prune();
         }
         let mut files = Vec::with_capacity(written.len());
+        let mut buf = Vec::new();
         for from in written {
             let name = from
                 .file_name()
@@ -150,12 +152,12 @@ impl BundleCache {
                     io::Error::other(format!("{} is not a pack file", from.display()))
                 })?;
             let to = self.dir.join(name);
-            match fs::remove_file(&to) {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-                _ => {}
+            // Only a kill during an earlier `add` of this link leaves one.
+            if fs::symlink_metadata(&to).is_ok() {
+                fs::remove_file(&to)?;
             }
             place(from, &to)?;
-            let (len, digest) = digest(&mut File::open(&to)?)?;
+            let (len, digest) = digest(&mut File::open(&to)?, &mut buf)?;
             files.push(CachedFile {
                 name: name.to_owned(),
                 len,
@@ -193,11 +195,12 @@ impl BundleCache {
         }
     }
 
-    /// True when every file of the `index`th link has its recorded length and digest.
-    fn intact(&self, index: usize) -> bool {
+    /// True when every file of the `index`th link has its recorded length
+    /// and digest; `buf` is the read buffer, kept from one call to the next.
+    fn intact(&self, index: usize, buf: &mut Vec<u8>) -> bool {
         self.links[index].files.iter().all(|file| {
             File::open(self.dir.join(&file.name))
-                .and_then(|mut opened| digest(&mut opened))
+                .and_then(|mut opened| digest(&mut opened, buf))
                 .is_ok_and(|found| found == (file.len, file.digest))
         })
     }
@@ -266,11 +269,13 @@ fn pack_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
 }
 
-/// The length of `file` and the blake3 digest of the blake3 digests of its
-/// 1 MiB blocks, read with one block in memory.
-fn digest(file: &mut File) -> io::Result<(u64, ChunkId)> {
-    let mut buf = vec![0u8; BLOCK];
-    let mut blocks = Vec::new();
+/// The length of `file` and a digest of its bytes: blake3 over each
+/// 64 KiB block, chained, each link the blake3 of the one before and the
+/// block's, and the length last. It holds one block in `buf`, however
+/// large the file, and `buf` keeps its allocation for the next call.
+fn digest(file: &mut File, buf: &mut Vec<u8>) -> io::Result<(u64, ChunkId)> {
+    buf.resize(BLOCK, 0);
+    let mut chained = [0u8; 64];
     let mut len = 0u64;
     loop {
         let mut filled = 0;
@@ -286,12 +291,15 @@ fn digest(file: &mut File) -> io::Result<(u64, ChunkId)> {
             break;
         }
         len += filled as u64;
-        blocks.extend_from_slice(&ChunkId::of(&buf[..filled]).to_bytes());
+        chained[32..].copy_from_slice(&ChunkId::of(&buf[..filled]).to_bytes());
+        let link = ChunkId::of(&chained).to_bytes();
+        chained[..32].copy_from_slice(&link);
         if filled < BLOCK {
             break;
         }
     }
-    Ok((len, ChunkId::of(&blocks)))
+    chained[32..40].copy_from_slice(&len.to_le_bytes());
+    Ok((len, ChunkId::of(&chained[..40])))
 }
 
 /// One line of the record: the snapshot, `bundle` or `empty`, then `name:len:digest` per file.
@@ -535,10 +543,22 @@ mod tests {
         let path = dir.path().join("f");
         let mut bytes = vec![0u8; BLOCK * 2 + 3];
         fs::write(&path, &bytes).unwrap();
-        let first = digest(&mut File::open(&path).unwrap()).unwrap();
+        let mut buf = Vec::new();
+        let first = digest(&mut File::open(&path).unwrap(), &mut buf).unwrap();
         assert_eq!(first.0, bytes.len() as u64);
         bytes[BLOCK + 1] = 1;
         fs::write(&path, &bytes).unwrap();
-        assert_ne!(digest(&mut File::open(&path).unwrap()).unwrap(), first);
+        assert_ne!(
+            digest(&mut File::open(&path).unwrap(), &mut buf).unwrap(),
+            first
+        );
+        // A file that only grows by zeros past a block is another file too.
+        bytes[BLOCK + 1] = 0;
+        bytes.extend_from_slice(&[0; 5]);
+        fs::write(&path, &bytes).unwrap();
+        assert_ne!(
+            digest(&mut File::open(&path).unwrap(), &mut buf).unwrap(),
+            first
+        );
     }
 }
