@@ -1,0 +1,5 @@
+
+running 1 test
+test ab::paired ... ab: counted run 0 of 3, anchor first
+ab: counted run 1 of 3, candidate first
+ab: counted run 2 of 3, anchor first
