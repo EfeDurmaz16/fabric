@@ -497,6 +497,78 @@ mod tests {
         relayed.await.unwrap();
     }
 
+    /// A sink that streams to a client, and the end the relay reads.
+    fn streaming() -> (Out, mpsc::UnboundedReceiver<Event>) {
+        let (live, made) = mpsc::unbounded_channel();
+        (Out::streaming(live), made)
+    }
+
+    /// M2-14: a client that stays connected but stops reading made the
+    /// node keep every event of its command in memory, however many, so
+    /// one stopped CLI could hold any amount of the node's memory. The
+    /// events that wait for a client are bounded by bytes: past the
+    /// bound, a new event is dropped while the client does not read. The
+    /// command still never waits, and the final answer always follows the
+    /// events kept, in order.
+    #[tokio::test]
+    #[ignore = "M2-14: expected failure until fixed"]
+    async fn a_client_that_stops_reading_holds_a_bounded_backlog_and_gets_the_answer() {
+        // About 8 MiB of events, eight times the bound and far more than
+        // a socket buffer holds on macOS or Linux.
+        const EVENTS: usize = 8 * 1024;
+        let (node_side, mut client) = UnixStream::pair().unwrap();
+        let (out, made) = streaming();
+        let (ended, command_ended) = oneshot::channel();
+        let command = async move {
+            let mut out = out;
+            for i in 0..EVENTS {
+                out.emit(Event::LeftBehind {
+                    path: format!("{i:05}/{}", "x".repeat(1_000)),
+                });
+                if i % 64 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            let _ = ended.send(());
+            Answer::Done {
+                reply: Reply::HarnessExited,
+            }
+        };
+        let relayed = tokio::spawn(relay(command, made, node_side));
+
+        tokio::time::timeout(Duration::from_secs(30), command_ended)
+            .await
+            .expect("the command waited for a client that stopped reading")
+            .unwrap();
+        let mut kept = 0;
+        let mut bytes = 0;
+        loop {
+            let answer: Answer = frame::read(&mut client).await.unwrap().unwrap();
+            match answer {
+                Answer::Event {
+                    event: Event::LeftBehind { path },
+                } => {
+                    let prefix = format!("{kept:05}/");
+                    assert!(path.starts_with(&prefix), "event {kept} is {path:.5}");
+                    kept += 1;
+                    bytes += path.len();
+                }
+                Answer::Done {
+                    reply: Reply::HarnessExited,
+                } => break,
+                other => panic!("{other:?}"),
+            }
+        }
+        relayed.await.unwrap();
+        assert!(kept > 0, "no event was kept");
+        // The bound, 1 MiB of frames, and what the socket's buffers took
+        // before the client stopped reading.
+        assert!(
+            bytes < 2 << 20,
+            "{kept} of {EVENTS} events, {bytes} bytes, waited for a client that did not read"
+        );
+    }
+
     /// One frame of exactly `len` bytes of JSON: a `node_id` request, or a
     /// hello, padded with a field the node does not know.
     fn padded(head: &str, len: usize) -> Vec<u8> {
