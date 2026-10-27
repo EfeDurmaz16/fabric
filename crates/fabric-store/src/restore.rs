@@ -942,13 +942,37 @@ fn push_stash_entry(git: &Git, oid: &GitOid) -> Result<(), RestoreError> {
     Ok(())
 }
 
-/// Sets every ref and `HEAD` exactly as `git_state` records them.
+/// Sets every ref, every symbolic ref and `HEAD` exactly as `git_state` records them.
 ///
 /// Every ref but `refs/stash` is set by one `update-ref --stdin`
 /// transaction. The stash list is rebuilt oldest first from the refs
 /// capture pinned under the job's stash prefix, then `refs/stash` itself,
-/// so every entry comes back at its index.
+/// so every entry comes back at its index. Each symbolic ref then points
+/// at its target, so `refs/remotes/origin/HEAD` follows the remote's
+/// default branch again instead of naming a frozen commit (M2-06).
 fn set_refs(git: &Git, git_state: &GitState, job_id: JobId) -> Result<(), RestoreError> {
+    set_direct_refs(git, git_state, job_id)?;
+    // `validate` holds each target in `refs`, which are set by now. git has
+    // no batch form for these before 2.46, so each is one process; a clone
+    // has one, `refs/remotes/origin/HEAD`, and a repository made with
+    // `git init` none.
+    for (name, target) in &git_state.symbolic_refs {
+        git.run(&["symbolic-ref", name.as_str(), target.as_str()])?;
+    }
+    match &git_state.head {
+        GitHead::Branch(branch) => {
+            let full = format!("refs/heads/{branch}");
+            git.run(&["symbolic-ref", "HEAD", &full])?;
+        }
+        GitHead::Detached(oid) => {
+            git.run(&["update-ref", "--no-deref", "HEAD", oid.as_str()])?;
+        }
+    }
+    Ok(())
+}
+
+/// Sets every ref of `git_state.refs`, the stash list included.
+fn set_direct_refs(git: &Git, git_state: &GitState, job_id: JobId) -> Result<(), RestoreError> {
     let prefix = stash_prefix(job_id);
     let mut older: Vec<(u64, &GitOid)> = git_state
         .refs
@@ -976,15 +1000,6 @@ fn set_refs(git: &Git, git_state: &GitState, job_id: JobId) -> Result<(), Restor
             push_stash_entry(git, entry)?;
         }
         push_stash_entry(git, oid)?;
-    }
-    match &git_state.head {
-        GitHead::Branch(branch) => {
-            let full = format!("refs/heads/{branch}");
-            git.run(&["symbolic-ref", "HEAD", &full])?;
-        }
-        GitHead::Detached(oid) => {
-            git.run(&["update-ref", "--no-deref", "HEAD", oid.as_str()])?;
-        }
     }
     Ok(())
 }

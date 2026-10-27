@@ -10,7 +10,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
-use fabric_core::git::GitConfigKey;
+use fabric_core::git::{GitConfigKey, RefName};
 use fabric_core::id::{JobId, NodeId, SnapshotId};
 use fabric_core::path::RelPath;
 use fabric_core::snapshot::{
@@ -2787,7 +2787,6 @@ fn the_harness_state_root_and_a_read_only_root_keep_their_mode_and_mtime() {
 /// M2-06 (issue #22): a clone's `refs/remotes/origin/HEAD` is a symbolic
 /// ref; it comes back as one, not as a frozen commit.
 #[test]
-#[ignore = "M2-06: expected failure until fixed"]
 fn a_symbolic_ref_comes_back_symbolic() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = dir.path().join("upstream");
@@ -2804,11 +2803,40 @@ fn a_symbolic_ref_comes_back_symbolic() {
     let mut store = store_in(dir.path()).unwrap();
     let policy = IgnorePolicy::default();
     let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
-    let snapshot = store.publish(&manifest).unwrap();
+    assert_eq!(
+        manifest.git.as_ref().unwrap().symbolic_refs,
+        vec![(
+            RefName::parse("refs/remotes/origin/HEAD").unwrap(),
+            RefName::parse("refs/remotes/origin/main").unwrap()
+        )]
+    );
+    let first = store.publish(&manifest).unwrap();
     let target = dir.path().join("restored");
-    restore_into(&store, snapshot, &target).unwrap();
+    restore_into(&store, first, &target).unwrap();
     assert_eq!(
         git_text(&target, &origin_head).unwrap().trim(),
         "refs/remotes/origin/main"
+    );
+    // The next snapshot's bundle is incremental, and the ref still travels
+    // as one when its target moved.
+    git(&root)
+        .run(&["commit", "-q", "--allow-empty", "-m", "two"])
+        .unwrap();
+    git(&root)
+        .run(&["update-ref", "refs/remotes/origin/main", "HEAD"])
+        .unwrap();
+    let Captured { manifest, report } =
+        capture(&store, &request(&root, &policy, Some(first))).unwrap();
+    assert_eq!(report.bundle, Some(BundleKind::Incremental));
+    let second = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored-2");
+    restore_into(&store, second, &target).unwrap();
+    assert_eq!(
+        git_text(&target, &origin_head).unwrap().trim(),
+        "refs/remotes/origin/main"
+    );
+    assert_eq!(
+        git_text(&target, &["rev-parse", "refs/remotes/origin/HEAD"]).unwrap(),
+        git_text(&root, &["rev-parse", "HEAD"]).unwrap()
     );
 }

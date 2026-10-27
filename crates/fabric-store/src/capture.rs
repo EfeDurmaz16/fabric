@@ -1176,25 +1176,33 @@ impl Markers for DirMarkers<'_> {
 /// The refs and `HEAD` of a repository at one moment.
 #[derive(Debug, PartialEq, Eq)]
 struct RefView {
+    /// Every ref but the symbolic ones, with its id; sorted by name.
     refs: Vec<(RefName, GitOid)>,
+    /// Every symbolic ref whose target is in `refs`, with that target; sorted by name.
+    symbolic: Vec<(RefName, RefName)>,
     head: GitHead,
 }
 
 impl RefView {
-    /// Names what differs in `later`: `HEAD` first, then the first ref by name.
+    /// Names what differs in `later`: `HEAD` first, then the first ref or symbolic ref by name.
     fn moved_in(&self, later: &RefView) -> Option<MovedRef> {
         if self.head != later.head {
             return Some(MovedRef::Head);
         }
-        self.refs
-            .iter()
-            .chain(&later.refs)
+        let refs = (self.refs.iter().chain(&later.refs))
             .filter(|r| !self.refs.contains(r) || !later.refs.contains(r))
-            .map(|(name, _)| name)
+            .map(|(name, _)| name);
+        let symbolic = (self.symbolic.iter().chain(&later.symbolic))
+            .filter(|r| !self.symbolic.contains(r) || !later.symbolic.contains(r))
+            .map(|(name, _)| name);
+        refs.chain(symbolic)
             .min()
             .map(|name| MovedRef::Ref(name.clone()))
     }
 }
+
+/// The refs with their ids, and the symbolic refs with their targets, both sorted by name.
+type ListedRefs = (Vec<(RefName, GitOid)>, Vec<(RefName, RefName)>);
 
 /// The bundle capture tries to make.
 enum BundlePlan {
@@ -2222,30 +2230,63 @@ impl GitCapture<'_> {
         format!("refs/fabric/{}/snap/", self.job_id)
     }
 
-    /// Lists refs with their ids; older snapshot refs of this job are already deleted.
-    fn refs(&self) -> Result<Vec<(RefName, GitOid)>, CaptureError> {
-        let out = self
-            .git
-            .run_text(&["for-each-ref", "--format=%(refname) %(objectname)"])?;
-        let mut refs = Vec::new();
+    /// Lists the refs with their ids, and apart from them the symbolic
+    /// refs with their targets, from one `for-each-ref` (M2-06).
+    ///
+    /// A symbolic ref, such as the `refs/remotes/origin/HEAD` of a clone,
+    /// travels as one, so the target's `git remote show` and the next fetch
+    /// still follow the remote's default branch. One whose target is not
+    /// itself a ref of the listing, as a symbolic ref to another symbolic
+    /// ref, keeps its id instead, as every ref did before format version 3.
+    /// Older snapshot refs of this job are already deleted.
+    fn refs(&self) -> Result<ListedRefs, CaptureError> {
+        let out = self.git.run_text(&[
+            "for-each-ref",
+            "--format=%(refname) %(symref) %(objectname)",
+        ])?;
+        let mut listed = Vec::new();
         for line in out.lines() {
-            let (name, oid) = line.split_once(' ').ok_or_else(|| GitError::Parse {
+            let bad = || GitError::Parse {
                 what: "ref line",
                 text: line.to_owned(),
-            })?;
-            refs.push((
+            };
+            let mut fields = line.splitn(3, ' ');
+            let (Some(name), Some(target), Some(oid)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                return Err(bad().into());
+            };
+            listed.push((
                 RefName::parse(name).map_err(GitError::from)?,
+                target,
                 GitOid::parse(oid).map_err(GitError::from)?,
             ));
         }
+        let direct: BTreeSet<&str> = (listed.iter())
+            .filter(|(_, target, _)| target.is_empty())
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        let mut refs = Vec::new();
+        let mut symbolic = Vec::new();
+        for (name, target, oid) in &listed {
+            match RefName::parse(target) {
+                Ok(target) if direct.contains(target.as_str()) => {
+                    symbolic.push((name.clone(), target));
+                }
+                _ => refs.push((name.clone(), oid.clone())),
+            }
+        }
         refs.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(refs)
+        symbolic.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok((refs, symbolic))
     }
 
     /// Reads the refs and `HEAD` together.
     fn ref_view(&self) -> Result<RefView, CaptureError> {
+        let (refs, symbolic) = self.refs()?;
         Ok(RefView {
-            refs: self.refs()?,
+            refs,
+            symbolic,
             head: self.head()?,
         })
     }
@@ -2339,8 +2380,10 @@ impl GitCapture<'_> {
     /// A ref the bundle lists must have the id `view` gives it. A full
     /// bundle must list every ref. A ref an incremental or empty bundle
     /// leaves out must be reachable from the parent's tips, which the
-    /// earlier bundles of the chain carry. Anything else means a ref moved
-    /// while the bundle was made, and the snapshot would not restore.
+    /// earlier bundles of the chain carry. A symbolic ref the bundle lists,
+    /// as git lists `refs/remotes/origin/HEAD`, must have its target's id.
+    /// Anything else means a ref moved while the bundle was made, and the
+    /// snapshot would not restore.
     fn confirm_bundle(
         &self,
         built: &BuiltBundle,
@@ -2378,8 +2421,16 @@ impl GitCapture<'_> {
                 None => left_out.push((name, *oid)),
             }
         }
-        for name in listed.keys() {
-            if name != "HEAD" && !wanted.iter().any(|(n, _)| n.to_string() == *name) {
+        let target_id = |name: &str| {
+            let (_, target) = view.symbolic.iter().find(|(n, _)| n.as_str() == name)?;
+            let (_, oid) = view.refs.iter().find(|(n, _)| n == target)?;
+            Some(oid.as_str())
+        };
+        for (name, oid) in &listed {
+            let known = name == "HEAD"
+                || wanted.iter().any(|(n, _)| n.to_string() == *name)
+                || target_id(name) == Some(oid.as_str());
+            if !known {
                 let name = RefName::parse(name).map_err(GitError::from)?;
                 return Err(moved(&MovedRef::Ref(name)));
             }
@@ -2511,6 +2562,7 @@ impl GitCapture<'_> {
         }
         Ok(RefView {
             refs: refs.into_iter().collect(),
+            symbolic: read.symbolic,
             head: read.head,
         })
     }
@@ -3080,7 +3132,11 @@ fn capture_git(
     let plan = BundlePlan::after(capturer.store, parent)?;
     let (built, view, stashes) = repo.bundle_with_stash(&plan, &worktree_commit)?;
     let (bundle, bundle_base) = capturer.store_bundle(built)?;
-    let RefView { refs, head } = view;
+    let RefView {
+        refs,
+        symbolic,
+        head,
+    } = view;
     capturer.report.stashed_secrets =
         repo.stashed_secrets(&stashes, &|rel| policy.denies_anywhere(rel))?;
     let (worktree_mtimes, worktree_modes, dirs) =
@@ -3102,7 +3158,7 @@ fn capture_git(
         bundle,
         bundle_base,
         refs,
-        symbolic_refs: Vec::new(),
+        symbolic_refs: symbolic,
         head,
         index_commit,
         worktree_commit,
@@ -3302,6 +3358,42 @@ mod tests {
         assert!(matches!(
             repo.worktree_meta(&w, &before, &mut report),
             Err(CaptureError::WorkspaceChanged { path }) if path.as_str() == "a.txt"
+        ));
+    }
+
+    /// A symbolic ref pointed elsewhere while capture ran, as by `git
+    /// remote set-head`, is a moved ref like any other (M2-06).
+    #[test]
+    fn a_symbolic_ref_pointed_elsewhere_counts_as_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        fs::create_dir(&root).unwrap();
+        let policy = IgnorePolicy::default();
+        let repo = new_repo(&root, dir.path(), &policy);
+        repo.git
+            .run(&["commit", "-q", "--allow-empty", "-m", "one"])
+            .unwrap();
+        for name in ["refs/remotes/origin/main", "refs/remotes/origin/next"] {
+            repo.git.run(&["update-ref", name, "HEAD"]).unwrap();
+        }
+        let set_head = |target: &str| {
+            repo.git
+                .run(&["symbolic-ref", "refs/remotes/origin/HEAD", target])
+                .unwrap();
+        };
+        set_head("refs/remotes/origin/main");
+        let view = repo.ref_view().unwrap();
+        assert_eq!(view.symbolic.len(), 1);
+        assert!(
+            view.refs
+                .iter()
+                .all(|(n, _)| n.as_str() != "refs/remotes/origin/HEAD")
+        );
+        assert_eq!(view.moved_in(&repo.ref_view().unwrap()), None);
+        set_head("refs/remotes/origin/next");
+        assert!(matches!(
+            view.moved_in(&repo.ref_view().unwrap()),
+            Some(MovedRef::Ref(name)) if name.as_str() == "refs/remotes/origin/HEAD"
         ));
     }
 
