@@ -1672,7 +1672,13 @@ impl GitCapture<'_> {
         if let Some(rel) = changed {
             return Err(CaptureError::WorkspaceChanged { path: rel.clone() });
         }
-        let (paths, nested) = self.untracked()?;
+        // The two listings are independent; the ignored one runs beside
+        // the untracked one, and is judged after it, as before.
+        let (untracked, ignored_now) = thread::scope(|scope| {
+            let ignored_now = scope.spawn(|| self.ignored_alone());
+            (self.untracked(), joined(ignored_now))
+        });
+        let (paths, nested) = untracked?;
         let before: BTreeSet<&RelPath> = seen
             .untracked
             .0
@@ -1692,13 +1698,19 @@ impl GitCapture<'_> {
                 path: (*rel).clone(),
             });
         }
-        let mut report = CaptureReport::default();
-        let found = self.ignored(&mut report)?;
+        let (found, report) = ignored_now?;
         let names = report
             .special_files
             .iter()
             .chain(&report.nested_repositories);
         ignored.unchanged_in(&Census::of(&found, names, carried))
+    }
+
+    /// `ignored` into a report of its own, for a listing that runs on another thread.
+    fn ignored_alone(&self) -> Result<(Vec<Found>, CaptureReport), CaptureError> {
+        let mut report = CaptureReport::default();
+        let found = self.ignored(&mut report)?;
+        Ok((found, report))
     }
 
     /// The `-c` value that makes a listing read the same user exclude rules as `W`.
@@ -2746,6 +2758,13 @@ impl GitCapture<'_> {
     }
 }
 
+/// The result of a scoped thread, its panic carried on to the caller.
+fn joined<T>(handle: thread::ScopedJoinHandle<'_, T>) -> T {
+    handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
 /// Reads the refs a bundle lists, by name, with their ids: the reference
 /// lines of its header, which `git bundle list-heads` prints as they are.
 ///
@@ -2875,15 +2894,26 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
         let parent = parent_manifest
             .as_ref()
             .map(|(id, manifest)| (*id, manifest));
-        let (state, mut seen) = capture_git(&mut capturer, &repo, &listing, parent)?;
+        // The ignored listing needs nothing the git half makes, and only
+        // has to come before the files are stored, so it runs beside it.
+        let (git_half, ignored_listing) = thread::scope(|scope| {
+            let ignored_listing = scope.spawn(|| repo.ignored_alone());
+            let git_half = capture_git(&mut capturer, &repo, &listing, parent);
+            (git_half, joined(ignored_listing))
+        });
+        let (state, mut seen) = git_half?;
+        let (mut found, listed) = ignored_listing?;
         worktree_dirs = std::mem::take(&mut seen.dirs);
-        let report = &mut capturer.report;
-        let (special, nested) = (report.special_files.len(), report.nested_repositories.len());
-        let mut found = repo.ignored(report)?;
-        let names = report.special_files[special..]
+        let names = listed
+            .special_files
             .iter()
-            .chain(&report.nested_repositories[nested..]);
+            .chain(&listed.nested_repositories);
         let ignored = Census::of(&found, names, &mut carried);
+        let report = &mut capturer.report;
+        report.special_files.extend(listed.special_files);
+        report
+            .nested_repositories
+            .extend(listed.nested_repositories);
         // git lists files only, so an empty directory, untracked or
         // ignored, comes from a walk; one `W` holds as a submodule stays out.
         let in_w: HashSet<&RelPath> = seen.paths.iter().collect();
