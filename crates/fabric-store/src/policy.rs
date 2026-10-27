@@ -385,17 +385,18 @@ impl IgnorePolicy {
         Ok(())
     }
 
-    /// True when the core's policy denies `path`. Under a cache directory
-    /// the policy finds by its name, the full list applies to the path up
-    /// to that directory and the narrow list to the whole path, so a
-    /// dependency's `credentials.js` travels and its `.env` does not.
-    fn denies_secret(&self, path: &RelPath, comps: &[&str], narrow_from: Option<usize>) -> bool {
-        let Some(at) = narrow_from else {
-            return self.secrets.denies(path, Scope::Work).is_some();
-        };
-        let above = RelPath::parse(&comps[..=at].join("/"));
-        above.is_ok_and(|above| self.secrets.denies(&above, Scope::Work).is_some())
-            || self.secrets.denies(path, Scope::Cache).is_some()
+    /// True when the core's policy denies `path`. Under `cache`, a cache
+    /// directory the policy found by its name, the full list applies to the
+    /// path up to that directory and the narrow list to the whole path, so
+    /// a dependency's `credentials.js` travels and its `.env` does not.
+    fn denies_secret(&self, path: &RelPath, cache: Option<&RelPath>) -> bool {
+        match cache {
+            None => self.secrets.denies(path, Scope::Work).is_some(),
+            Some(cache) => {
+                self.secrets.denies(cache, Scope::Work).is_some()
+                    || self.secrets.denies(path, Scope::Cache).is_some()
+            }
+        }
     }
 
     /// Adds a pattern whose matches are not carried for this job.
@@ -466,8 +467,11 @@ impl IgnorePolicy {
                 .map(|path| CacheRoot { path, class })
         });
         // A declared cache keeps the full list (`add_declared_cache`).
-        let narrow_from = cache.filter(|_| declared.is_none()).map(|(i, _)| i);
-        let secret = self.denies_secret(path, &comps, narrow_from);
+        let narrow = cache_root
+            .as_ref()
+            .filter(|_| declared.is_none())
+            .map(|root| &root.path);
+        let secret = self.denies_secret(path, narrow);
         if secret {
             Class::Secret { under: cache_root }
         } else if (0..comps.len()).any(|j| self.excludes.iter().any(|p| p.matches_at(&comps, j))) {
