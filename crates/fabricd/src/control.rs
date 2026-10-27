@@ -89,7 +89,7 @@ impl Live {
     /// queued when none waits, so a client that reads gets every event
     /// that frames. Never waits.
     pub(crate) fn send(&self, event: Event) {
-        let frame = match frame_answer(&Answer::Event { event }) {
+        let frame = match frame::encode(&Answer::Event { event }) {
             Ok(frame) => frame,
             // One event that cannot be framed, too large or holding a
             // path that is not UTF-8, is dropped; the client still gets
@@ -185,7 +185,7 @@ pub(crate) async fn serve(node: Arc<Node>, mut stream: UnixStream) {
         Ok(request) => request,
         Err(message) => {
             let refusal = Refusal::new(Reason::BadRequest, message);
-            let _ = write_answer(&mut stream, &Answer::Refused { refusal }).await;
+            let _ = send(&mut stream, &Answer::Refused { refusal }).await;
             return;
         }
     };
@@ -239,7 +239,7 @@ where
             format!("the command stopped before it answered: {e}"),
         ),
     });
-    let refusal = match (write_answer(&mut stream, &answer).await, answer) {
+    let refusal = match (send(&mut stream, &answer).await, answer) {
         (Ok(()) | Err(FrameError::Io(_)), _) => return,
         // A refusal's kind sets the exit code and its message names the
         // command that resolves it, so it keeps both, and its reason: only
@@ -253,7 +253,7 @@ where
             Refusal::new(Reason::Internal, unwritable(&e))
         }
     };
-    let _ = write_answer(&mut stream, &Answer::Refused { refusal }).await;
+    let _ = send(&mut stream, &Answer::Refused { refusal }).await;
 }
 
 /// `reason` with each path written as `Path::display` shows it, U+FFFD in
@@ -357,44 +357,20 @@ fn unwritable(error: &FrameError) -> String {
     }
 }
 
-/// Frames an answer, an event's included. Every answer is framed here, in
-/// one function that is not generic, so the daemon carries one copy of
-/// the code that serializes them.
-fn frame_answer(answer: &Answer) -> Result<Vec<u8>, FrameError> {
-    frame::encode(answer)
-}
-
-/// Writes one frame's bytes.
-async fn write_frame(stream: &mut UnixStream, frame: &[u8]) -> std::io::Result<()> {
-    stream.write_all(frame).await?;
-    stream.flush().await
-}
-
 /// Writes one framed event; false when the client left.
 async fn deliver(stream: &mut UnixStream, frame: &[u8]) -> bool {
-    match write_frame(stream, frame).await {
+    match async {
+        stream.write_all(frame).await?;
+        stream.flush().await
+    }
+    .await
+    {
         Ok(()) => true,
         Err(e) => {
             tracing::info!(error = %e, "a control client left before the answer; the command runs to its end");
             false
         }
     }
-}
-
-/// Writes one answer, logging why it could not be, as [`send`] does.
-async fn write_answer(stream: &mut UnixStream, answer: &Answer) -> Result<(), FrameError> {
-    let sent = match frame_answer(answer) {
-        Ok(frame) => write_frame(stream, &frame).await.map_err(FrameError::from),
-        Err(e) => Err(e),
-    };
-    match &sent {
-        Ok(()) => {}
-        Err(FrameError::Io(e)) => {
-            tracing::info!(error = %e, "a control client left before the answer; the command ran to its end");
-        }
-        Err(e) => tracing::warn!(error = %e, "a control answer could not be written"),
-    }
-    sent
 }
 
 /// Reads one frame within `CLIENT_DEADLINE`; `None`, logged, when the client sent none.
