@@ -2250,7 +2250,11 @@ pub enum Event {
         /// Whether the snapshot holds a git bundle of the tracked and
         /// untracked work, so `files` counts only the ignored and harness
         /// files beside it.
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        #[serde(
+            default,
+            deserialize_with = "null_as_default",
+            skip_serializing_if = "std::ops::Not::not"
+        )]
         git_bundle: bool,
     },
     /// A file matched a secret pattern and was left out of the snapshot.
