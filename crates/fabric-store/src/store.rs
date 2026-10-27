@@ -123,10 +123,8 @@ pub enum StoreError {
         base: SnapshotId,
     },
     /// Another handle on the store exists, and the call needs the store alone.
-    #[error("the store at {path} has other handles open; {call} needs it alone")]
+    #[error("the store has other handles open; {call} needs it alone")]
     Shared {
-        /// The store root.
-        path: PathBuf,
         /// The call that was refused.
         call: &'static str,
     },
@@ -222,7 +220,6 @@ pub struct Store {
 /// What every handle on one store shares.
 #[derive(Debug)]
 struct Shared {
-    root: PathBuf,
     objects: ObjectStore,
     /// Held for one query or one transaction, never across object IO.
     catalog: Mutex<Catalog>,
@@ -277,13 +274,12 @@ impl Store {
         let objects = ObjectStore::new(root, params);
         objects.create_dirs()?;
         let catalog = Catalog::create(&catalog_path, &params)?;
-        Ok(Store::new(root, objects, catalog, lock))
+        Ok(Store::new(objects, catalog, lock))
     }
 
-    fn new(root: &Path, objects: ObjectStore, catalog: Catalog, lock: File) -> Store {
+    fn new(objects: ObjectStore, catalog: Catalog, lock: File) -> Store {
         Store {
             shared: Arc::new(Shared {
-                root: root.to_owned(),
                 objects,
                 catalog: Mutex::new(catalog),
                 publishing: Mutex::new(()),
@@ -307,8 +303,7 @@ impl Store {
 
     /// The store's parts when this is its only handle, for a call that needs it alone.
     fn alone(&mut self, call: &'static str) -> Result<&mut Shared, StoreError> {
-        let path = self.shared.root.clone();
-        Arc::get_mut(&mut self.shared).ok_or(StoreError::Shared { path, call })
+        Arc::get_mut(&mut self.shared).ok_or(StoreError::Shared { call })
     }
 
     /// Opens an existing store and clears its staging directory.
@@ -327,7 +322,7 @@ impl Store {
         if removed > 0 {
             tracing::info!(removed, "cleared staged files left by an earlier process");
         }
-        Ok(Store::new(root, objects, catalog, lock))
+        Ok(Store::new(objects, catalog, lock))
     }
 
     /// Returns the object files, for writing and reading content.
