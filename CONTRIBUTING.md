@@ -58,10 +58,44 @@ dependency must pass it, and the PR lists the crate, version, last release
 date, and license. Dependabot opens a weekly PR for a stale action pin or
 crate; it goes through the same gates.
 
+## Performance rule
+
+No hot path may be slower, or use more memory, than the anchor: `main`
+before the durable job campaign, commit `176622e`. A tolerance per pull
+request compounds (1.5 times per PR is 5 times after four), so every
+change is compared with the same fixed anchor, and the aim is to be faster
+and smaller than it, not only within a budget. A slowdown the A/B bench
+measures on a hot path is a bug to fix, never a trade-off to document, and
+the machine's load is not an explanation: the bench gives both builds of a
+pair the same load. A correctness check is never removed or weakened to
+win time; find a cheaper way to do the same check.
+
+`scripts/bench-ab.sh` is the evidence. It builds the anchor once into a
+cache, builds this working tree (or `--candidate <commit>`), and runs the
+ignored test `ab::paired` in `crates/fabric/tests/e2e/ab.rs`, which drives
+both builds through the same fixture and ops, taking turns op by op:
+
+```sh
+scripts/bench-ab.sh docs/evidence/perf-ab/<name>            # test profile, 15 pairs
+scripts/bench-ab.sh --release --pairs 20 docs/evidence/perf-ab/<name>
+scripts/bench-ab.sh --analyze docs/evidence/perf-ab/<name>  # the report again
+```
+
+Its `report.md` gives each op's median ratio, candidate over anchor, with
+a 95% bootstrap interval from at least 15 pairs, and each daemon's
+resident size. On macOS a counted phase also loads
+`scripts/perf-ab/counters.c` into every `fabric` process and reports what
+does not depend on load: processes started by command, file flushes by
+kind and file, bytes read and written, allocations, and each CLI's peak
+resident size and CPU time. A pull request that touches a hot path keeps
+its run under `docs/evidence/perf-ab/`. An interval above 1 is a
+regression; a median above 1 whose interval holds 1 is profiled before
+merge.
+
 ## Time budget
 
-A hot path that gets about 1.5 times slower is a bug (issue #26). The
-ignored test `budget::hot_paths` in `crates/fabric/tests/e2e/budget.rs`
+The time budget is CI's coarse guard; the performance rule above is the bar.
+The ignored test `budget::hot_paths` in `crates/fabric/tests/e2e/budget.rs`
 times the hot paths on the end-to-end fixture of two nodes over QUIC:
 suspend, move, resume and pull of a job under each harness (ACP, Claude,
 Codex), and a daemon's cold start and restart. Every program the node's
@@ -72,9 +106,9 @@ each op starts, the harness's own too: the end-to-end build turns on the
 test's `bin` (`FABRIC_SYSTEM_TOOLS`), where the budget counts them.
 `crates/fabric/tests/e2e/budget.toml` holds the limits: the ratio, the
 grace, the runs per batch, each platform's baselines, the exact process
-counts, and the `[[change]]` entries that record why the budget changed.
-CI runs it after the end-to-end step on both runners and writes its table
-to the step summary.
+counts, and the `[[change]]` entries that record why the budget changed. CI
+runs it after the end-to-end step on both runners and writes its table to
+the step summary.
 
 Run it on a quiet machine, since it measures wall time. It takes a few
 minutes:
