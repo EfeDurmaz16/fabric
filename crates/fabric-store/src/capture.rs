@@ -28,7 +28,8 @@ use fabric_core::id::{ChunkId, EnvSpecId, JobId, NodeId, SnapshotId};
 use fabric_core::path::{AbsPath, PathError, RelPath};
 use fabric_core::snapshot::{
     CacheClass, CacheEntry, CarryKey, CarryState, Entry, EntryKind, GitHead, GitState,
-    HarnessState, LeaveReason, LeftBehind, ManifestError, Mode, Platform, Remake, SnapshotManifest,
+    HarnessState, LeaveReason, LeftBehind, ManifestError, Mode, PathMeta, Platform, Remake,
+    SnapshotManifest,
 };
 
 use crate::durable::TempFile;
@@ -291,6 +292,12 @@ pub enum CaptureError {
         /// The path.
         path: RelPath,
     },
+    /// The mtime of the workspace root or the harness-state root is before 1970; touch it.
+    #[error("{path}: the mtime is before 1970")]
+    RootMtimeBeforeEpoch {
+        /// The root.
+        path: PathBuf,
+    },
     /// A file name or a symlink target is not UTF-8, which a manifest cannot hold; rename or relink it.
     #[error("{path:?}: the name or the link target is not UTF-8")]
     NotUtf8 {
@@ -490,10 +497,27 @@ fn stamps<'a>(
 /// A manifest records an unsigned time, so an mtime before 1970 is refused
 /// instead of being read as a different time.
 fn mtime_ns(meta: &fs::Metadata, rel: &RelPath) -> Result<u64, CaptureError> {
-    let before = || CaptureError::MtimeBeforeEpoch { path: rel.clone() };
-    let secs = u64::try_from(meta.mtime()).map_err(|_| before())?;
-    let nanos = u64::try_from(meta.mtime_nsec()).map_err(|_| before())?;
-    Ok(secs.saturating_mul(1_000_000_000).saturating_add(nanos))
+    unsigned_mtime(meta).ok_or_else(|| CaptureError::MtimeBeforeEpoch { path: rel.clone() })
+}
+
+/// The mtime of `meta` in nanoseconds since the epoch, or `None` before 1970.
+fn unsigned_mtime(meta: &fs::Metadata) -> Option<u64> {
+    let secs = u64::try_from(meta.mtime()).ok()?;
+    let nanos = u64::try_from(meta.mtime_nsec()).ok()?;
+    Some(secs.saturating_mul(1_000_000_000).saturating_add(nanos))
+}
+
+/// Reads the mode and mtime of a root directory, which no entry records
+/// (M2-05), following a link to it as the walk below it does, since
+/// restore makes a directory there.
+fn root_meta(root: &Path) -> Result<PathMeta, CaptureError> {
+    let meta = fs::metadata(root).map_err(|e| io_err(root, e))?;
+    Ok(PathMeta {
+        mode: Mode::from_masked(meta.mode()),
+        mtime_ns: unsigned_mtime(&meta).ok_or_else(|| CaptureError::RootMtimeBeforeEpoch {
+            path: root.to_owned(),
+        })?,
+    })
 }
 
 /// True when a link at `rel` with `target` points outside the tree root.
@@ -2759,14 +2783,14 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
     let harness_state = match req.harness_state {
         Some(dir) => HarnessState {
             entries: capturer.harness_entries(dir)?,
-            root: None,
+            root: Some(root_meta(dir)?),
         },
         None => HarnessState::default(),
     };
     let manifest = SnapshotManifest {
         job_id: req.job_id,
         root,
-        root_meta: None,
+        root_meta: Some(root_meta(req.root)?),
         parent: req.parent,
         created_at: req.created_at,
         created_by: req.created_by,

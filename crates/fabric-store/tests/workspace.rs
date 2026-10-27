@@ -2696,7 +2696,6 @@ fn a_file_of_the_working_tree_keeps_its_permission_bits() {
 /// root kept at 0700 comes back with the umask's mode and the time of
 /// the restore. It keeps its mode and mtime.
 #[test]
-#[ignore = "M2-05: expected failure until fixed"]
 fn the_workspace_root_keeps_its_mode_and_mtime() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("work");
@@ -2712,6 +2711,51 @@ fn the_workspace_root_keeps_its_mode_and_mtime() {
     let meta = fs::metadata(&target).unwrap();
     assert_eq!(meta.mode() & 0o777, 0o700);
     assert_eq!((meta.mtime(), meta.mtime_nsec()), (1_500_000_000, 7));
+}
+
+/// M2-05: the harness-state root keeps its mode and mtime too, and a
+/// workspace root without owner write, which the rename into place needs,
+/// gets its exact mode once it is there.
+#[test]
+fn the_harness_state_root_and_a_read_only_root_keep_their_mode_and_mtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    let state = dir.path().join("hstate");
+    fs::create_dir(&state).unwrap();
+    fs::write(state.join("session.jsonl"), "{}\n").unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o750)).unwrap();
+    set_mtime(&state, 1_400_000_000, 9).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
+    set_mtime(&root, 1_500_000_000, 7).unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let mut req = request(&root, &policy, None);
+    req.harness_state = Some(&state);
+    let captured = capture(&store, &req);
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let snapshot = store.publish(&captured.unwrap().manifest).unwrap();
+    let target = dir.path().join("restored");
+    let to = dir.path().join("hrestored");
+    let restored = restore(
+        &store,
+        &RestoreRequest {
+            snapshot,
+            target: &target,
+            harness_state: Some(&to),
+            verify: Verify::All,
+            durability: Durability::PowerLoss,
+            carry: &|_| true,
+        },
+    );
+    let meta = fs::metadata(&target).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+    restored.unwrap();
+    assert_eq!(meta.mode() & 0o777, 0o500);
+    assert_eq!((meta.mtime(), meta.mtime_nsec()), (1_500_000_000, 7));
+    let meta = fs::metadata(&to).unwrap();
+    assert_eq!(meta.mode() & 0o777, 0o750);
+    assert_eq!((meta.mtime(), meta.mtime_nsec()), (1_400_000_000, 9));
 }
 
 /// M2-06 (issue #22): a clone's `refs/remotes/origin/HEAD` is a symbolic

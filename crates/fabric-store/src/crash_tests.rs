@@ -76,7 +76,17 @@ fn make_workspace(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     for dir in [root.join("node_modules/pkg"), state.join("sessions/abc")] {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o555))?;
     }
+    // The roots get their own mode just before each rename (M2-05); the
+    // harness root has no owner write, which a rename needs until then.
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o550))?;
     Ok(())
+}
+
+/// The permission bits of the directory at `path`.
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).unwrap().mode() & 0o777
 }
 
 fn capture_and_publish(
@@ -269,6 +279,7 @@ fn restore_killed_at_any_checkpoint_is_detectable_and_finishes_on_rerun() {
             );
             let verified = verify(&store, snapshot, &target, Verify::All, &carry).unwrap();
             assert!(verified > 0, "{checkpoint}");
+            assert_eq!((mode_of(&target), mode_of(&state)), (0o700, 0o550));
             continue;
         }
         assert!(
@@ -296,6 +307,11 @@ fn restore_killed_at_any_checkpoint_is_detectable_and_finishes_on_rerun() {
         assert_eq!(
             restore_state(&target).unwrap(),
             RestoreState::Present,
+            "{checkpoint}"
+        );
+        assert_eq!(
+            (mode_of(&target), mode_of(&state)),
+            (0o700, 0o550),
             "{checkpoint}"
         );
         assert_eq!(

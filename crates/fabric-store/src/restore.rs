@@ -21,7 +21,8 @@ use fabric_core::git::{GitConfigKey, GitConfigValue, GitOid};
 use fabric_core::id::{JobId, SnapshotId};
 use fabric_core::path::{PathError, RelPath};
 use fabric_core::snapshot::{
-    CacheEntry, CarryState, Entry, EntryKind, GitHead, GitState, Mode, SnapshotManifest,
+    CacheEntry, CarryState, Entry, EntryKind, GitHead, GitState, HarnessState, Mode, PathMeta,
+    SnapshotManifest,
 };
 
 use crate::capture::{stash_prefix, symlink_escapes};
@@ -496,6 +497,36 @@ fn move_into_place(tree: &Path, target: &Path) -> Result<(), RestoreError> {
         if let Err(e) = removed {
             tracing::warn!(path = %staging.display(), error = %e, "could not remove a finished staging directory");
         }
+    }
+    Ok(())
+}
+
+/// Gives the staging tree `writer` writes the recorded mode and mtime of
+/// its root, flushes it under `PowerLoss`, renames it onto `target`, and
+/// settles the root's exact mode and mtime there (M2-05).
+///
+/// Nothing writes into the root after `finish_root`, so its mtime stays.
+/// A root with no recorded meta, from a format version 2 manifest, keeps
+/// the mode and mtime the staging directory got, as before version 3.
+fn put_in_place(
+    writer: &TreeWriter,
+    (tree, target): (&Path, &Path),
+    root: Option<PathMeta>,
+    durability: Durability,
+    before_rename: Option<&str>,
+) -> Result<(), RestoreError> {
+    if let Some(meta) = root {
+        writer.finish_root(meta)?;
+    }
+    if durability == Durability::PowerLoss {
+        sync_tree(tree, false)?;
+    }
+    if let Some(name) = before_rename {
+        checkpoint::reached(name);
+    }
+    move_into_place(tree, target)?;
+    if let Some(meta) = root {
+        writer.settle_root(meta, durability == Durability::PowerLoss)?;
     }
     Ok(())
 }
@@ -1251,12 +1282,15 @@ fn paths_under(base: &Path, prefix: &str, out: &mut BTreeSet<String>) -> Result<
 /// to a half-restored workspace. The rerun checks that the directory holds
 /// exactly the manifest's paths, re-reads every file against the store and
 /// checks every directory and link; a directory that holds anything else
-/// is foreign and is refused.
+/// is foreign and is refused. The directory itself then gets the recorded
+/// mode and mtime, which a kill just after the rename may have left with
+/// the owner bits `TreeWriter::finish_root` added.
 fn harness_state_complete(
     store: &Store,
-    entries: &[Entry],
+    state: &HarnessState,
     dir: &Path,
 ) -> Result<Option<u64>, RestoreError> {
+    let entries = &state.entries;
     let occupied = RestoreError::TargetNotEmpty {
         path: dir.to_owned(),
     };
@@ -1290,11 +1324,15 @@ fn harness_state_complete(
         }
     }
     let writer = TreeWriter::open(dir)?;
-    match verify_entries(store, &writer, entries, &|_| false, Verify::All) {
-        Ok(verified) => Ok(Some(verified)),
-        Err(RestoreError::VerifyFailed { .. }) => Err(occupied),
-        Err(e) => Err(e),
+    let verified = match verify_entries(store, &writer, entries, &|_| false, Verify::All) {
+        Ok(verified) => verified,
+        Err(RestoreError::VerifyFailed { .. }) => return Err(occupied),
+        Err(e) => return Err(e),
+    };
+    if let Some(root) = state.root {
+        writer.settle_root(root, false)?;
     }
+    Ok(Some(verified))
 }
 
 /// The cache paths whose bytes are not written: rows nothing of which was captured, and rows `carry` turns down.
@@ -1331,7 +1369,7 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
     }
     check_target_empty(req.target)?;
     let harness_done = match req.harness_state {
-        Some(dir) => harness_state_complete(store, &manifest.harness_state.entries, dir)?,
+        Some(dir) => harness_state_complete(store, &manifest.harness_state, dir)?,
         None => None,
     };
     let staging = fresh_staging(req.target, req.durability)?;
@@ -1405,10 +1443,13 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
                 &keep_all,
                 req.verify,
             )?;
-            if req.durability == Durability::PowerLoss {
-                sync_tree(&hs_staging, false)?;
-            }
-            move_into_place(&hs_staging, dir)?;
+            put_in_place(
+                &hs_writer,
+                (&hs_staging, dir),
+                manifest.harness_state.root,
+                req.durability,
+                None,
+            )?;
             checkpoint::reached("restore.after_harness_rename");
         }
         (None, _) => {}
@@ -1417,11 +1458,13 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
     if let (Some((git, _)), Some(state)) = (&restored, &manifest.git) {
         write_config(git, &state.config)?;
     }
-    if req.durability == Durability::PowerLoss {
-        sync_tree(&staging, false)?;
-    }
-    checkpoint::reached("restore.before_rename");
-    move_into_place(&staging, req.target)?;
+    put_in_place(
+        &writer,
+        (&staging, req.target),
+        manifest.root_meta,
+        req.durability,
+        Some("restore.before_rename"),
+    )?;
     checkpoint::reached("restore.after_rename");
     tracing::info!(snapshot = %req.snapshot, target = %req.target.display(), files = report.total().files, "restored");
     Ok(report)

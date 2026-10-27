@@ -13,7 +13,7 @@ use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
 use fabric_core::path::RelPath;
-use fabric_core::snapshot::Mode as EntryMode;
+use fabric_core::snapshot::{Mode as EntryMode, PathMeta};
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawMode, Timespec, Timestamps};
 use rustix::io::Errno;
 
@@ -182,6 +182,55 @@ impl TreeWriter {
         fs::futimens(&dir, &timestamps(mtime_ns)).map_err(|e| map(e, path))?;
         if sync {
             fs::fsync(&dir).map_err(|e| map(e, path))?;
+        }
+        Ok(())
+    }
+
+    /// Gives the root its recorded mtime, and its recorded mode with the
+    /// owner's read, write and search bits, to keep until `settle_root`.
+    ///
+    /// The root is then renamed into another parent, which rewrites its
+    /// `..` entry and needs write permission on it, and the flush of the
+    /// staging tree opens it; a root captured without an owner bit would
+    /// fail both (M2-05).
+    pub fn finish_root(&self, meta: PathMeta) -> Result<(), WriteError> {
+        let root = Path::new(".");
+        let open = EntryMode::from_masked(u32::from(meta.mode.bits() | 0o700));
+        fs::fchmod(&self.root, mode(open)).map_err(|e| map(e, root))?;
+        fs::futimens(&self.root, &timestamps(meta.mtime_ns)).map_err(|e| map(e, root))
+    }
+
+    /// Once the root is in place, gives it exactly the recorded mode and
+    /// mtime where they differ, and flushes that change when `sync` is set.
+    ///
+    /// They differ when `finish_root` had to add an owner bit, or on a
+    /// filesystem whose rename of a directory touched its mtime. In the
+    /// usual case, a root with every owner bit on APFS or ext4, this is one
+    /// `fstat` and changes nothing.
+    pub fn settle_root(&self, meta: PathMeta, sync: bool) -> Result<(), WriteError> {
+        use std::os::unix::fs::MetadataExt;
+        let root = Path::new(".");
+        let io = |source| WriteError::Io {
+            path: root.to_owned(),
+            source,
+        };
+        let file = File::from(self.root.try_clone().map_err(io)?);
+        let stat = file.metadata().map_err(io)?;
+        let mut changed = false;
+        if stat.mode() & 0o777 != u32::from(meta.mode.bits()) {
+            fs::fchmod(&self.root, mode(meta.mode)).map_err(|e| map(e, root))?;
+            changed = true;
+        }
+        let have = u64::try_from(stat.mtime())
+            .ok()
+            .zip(u64::try_from(stat.mtime_nsec()).ok())
+            .map(|(secs, nanos)| secs.saturating_mul(1_000_000_000).saturating_add(nanos));
+        if have != Some(meta.mtime_ns) {
+            fs::futimens(&self.root, &timestamps(meta.mtime_ns)).map_err(|e| map(e, root))?;
+            changed = true;
+        }
+        if changed && sync {
+            crate::durable::full_fsync(&file).map_err(io)?;
         }
         Ok(())
     }
