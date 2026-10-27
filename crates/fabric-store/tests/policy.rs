@@ -1,6 +1,6 @@
 //! The store's capture policy against the core's `SecretPolicy` (M2-03):
-//! a path the core carries, the store carries too. Ignored until the store
-//! uses the core's policy.
+//! a path the core carries, the store carries too, and the core's exact
+//! key and credential names stay secrets.
 
 use fabric_core::path::RelPath;
 use fabric_store::policy::IgnorePolicy;
@@ -10,7 +10,6 @@ use fabric_store::policy::IgnorePolicy;
 /// work, as `fabric_core::secret` says; the exact key and credential names
 /// stay secrets.
 #[test]
-#[ignore = "M2-03: expected failure until fixed"]
 fn the_store_classifies_secrets_as_the_core_does() {
     let policy = IgnorePolicy::default();
     for path in [

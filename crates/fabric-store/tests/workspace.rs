@@ -2622,6 +2622,40 @@ fn a_capture_and_a_restore_start_a_known_number_of_git_processes() {
     assert!(stdout.contains("1 passed"), "{stdout}");
 }
 
+/// M2-03: untracked work whose name the store's old list denied, an env
+/// template and source files named like keys, travels in `W` and comes
+/// back; a `.env` beside them stays behind and is named.
+#[test]
+fn untracked_work_the_core_carries_comes_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    fs::create_dir(root.join("src")).unwrap();
+    let work = [".env.example", "src/id_test.go", "src/credentials.ts"];
+    for name in work {
+        fs::write(root.join(name), "work\n").unwrap();
+    }
+    fs::write(root.join(".env"), "TOKEN=x\n").unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let policy = IgnorePolicy::default();
+    let Captured { manifest, report } = capture(&store, &request(&root, &policy, None)).unwrap();
+    assert_eq!(
+        report.denied_untracked,
+        vec![RelPath::parse(".env").unwrap()]
+    );
+    let snapshot = store.publish(&manifest).unwrap();
+    let target = dir.path().join("restored");
+    restore_into(&store, snapshot, &target).unwrap();
+    for name in work {
+        assert_eq!(
+            fs::read_to_string(target.join(name)).unwrap(),
+            "work\n",
+            "{name}"
+        );
+    }
+    assert!(!target.join(".env").exists());
+}
+
 /// M2-04 (issue #20): a git tree records only `100644` or `100755`, so a
 /// key committed by mistake at 0600 comes back readable by others and an
 /// untracked file loses its group write. Each file of `W` keeps its own
