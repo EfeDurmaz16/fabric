@@ -389,26 +389,39 @@ fn leader_pid(pid: NonZeroU32) -> Option<Pid> {
 /// True when `pid` leads its own process group, as a launched harness does.
 ///
 /// A harness that already exited and that the CLI, its parent, has not
-/// reaped yet counts: a headless harness can finish its turn before the
-/// CLI registers it, and its group may still hold what it started.
-/// `getpgid` does not answer for such a process; `ps` does.
-pub async fn leads_group(pid: NonZeroU32) -> bool {
+/// reaped yet counts: a launch can end before the CLI registers it, as a
+/// held harness stopped by a signal does, and its group may still hold
+/// what it started. Linux's `getpgid` answers for such a process. macOS's
+/// does not, and refuses it as absent, so there a process that `kill(pid,
+/// 0)` still finds (macOS answers it for a zombie) leads its group when a
+/// group with its id exists: a group takes its leader's pid as its id, and
+/// that pid is not given out again while the group exists. `kill(-pid,
+/// 0)` says the group exists by succeeding, or by `EPERM` when the group
+/// holds only processes that cannot be signalled, a zombie among them.
+/// Nothing is started to answer, as `ps -o pgid=` was.
+pub fn leads_group(pid: NonZeroU32) -> bool {
     let Some(leader) = leader_pid(pid) else {
         return false;
     };
-    let Ok(output) = tokio::process::Command::new("ps")
-        .args(["-o", "pgid=", "-p", &pid.to_string()])
-        .env("LC_ALL", "C")
-        .output()
-        .await
-    else {
-        return false;
-    };
-    output.status.success()
-        && String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse::<i32>()
-            == Ok(leader.as_raw_nonzero().get())
+    match rustix::process::getpgid(Some(leader)) {
+        Ok(group) => group == leader,
+        Err(rustix::io::Errno::SRCH) => {
+            rustix::process::test_kill_process(leader).is_ok() && group_id_taken(leader)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Whether a process group with id `group` exists, zombies counted:
+/// `kill(-group, 0)` succeeds, or is refused with `EPERM`, which says the
+/// group exists and holds nothing this process may signal. Liveness asks
+/// a narrower question (`HarnessRecord::group_exists`): whether anything
+/// of the group still runs.
+fn group_id_taken(group: Pid) -> bool {
+    matches!(
+        rustix::process::test_kill_process_group(group),
+        Ok(()) | Err(rustix::io::Errno::PERM)
+    )
 }
 
 impl HarnessRecord {
@@ -619,14 +632,14 @@ mod tests {
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(leads_group(pid).await);
+        assert!(leads_group(pid));
         leader.wait().unwrap();
         let mut member = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
             .unwrap();
         assert!(
-            !leads_group(NonZeroU32::new(member.id()).unwrap()).await,
+            !leads_group(NonZeroU32::new(member.id()).unwrap()),
             "a process in the test's group leads no group"
         );
         member.kill().unwrap();

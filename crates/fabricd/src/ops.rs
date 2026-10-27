@@ -723,7 +723,7 @@ impl Node {
         // The setup steps ran after the CLI's check, and an earlier
         // headless turn may have named its session meanwhile.
         refuse_moved_session(&job, &harness, planned.as_ref())?;
-        if !local::leads_group(pid).await {
+        if !local::leads_group(pid) {
             return Err(NodeError::HarnessGone { pid });
         }
         let started = local::process_started(pid)
