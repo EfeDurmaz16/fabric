@@ -1,0 +1,156 @@
+
+running 1 test
+test ab::paired ... ab: counted run 0 of 1, anchor first
+ab: counted run 1 of 1, candidate first
+ab: timed run 0 of 101, anchor first
+ab: timed run 1 of 101, candidate first
+ab: timed run 2 of 101, anchor first
+ab: timed run 3 of 101, candidate first
+ab: timed run 4 of 101, anchor first
+ab: timed run 5 of 101, candidate first
+ab: timed run 6 of 101, anchor first
+ab: timed run 7 of 101, candidate first
+ab: timed run 8 of 101, anchor first
+ab: timed run 9 of 101, candidate first
+ab: timed run 10 of 101, anchor first
+ab: timed run 11 of 101, candidate first
+ab: timed run 12 of 101, anchor first
+ab: timed run 13 of 101, candidate first
+ab: timed run 14 of 101, anchor first
+ab: timed run 15 of 101, candidate first
+ab: timed run 16 of 101, anchor first
+ab: timed run 17 of 101, candidate first
+ab: timed run 18 of 101, anchor first
+ab: timed run 19 of 101, candidate first
+ab: timed run 20 of 101, anchor first
+ab: timed run 21 of 101, candidate first
+ab: timed run 22 of 101, anchor first
+ab: timed run 23 of 101, candidate first
+ab: timed run 24 of 101, anchor first
+ab: timed run 25 of 101, candidate first
+ab: timed run 26 of 101, anchor first
+ab: timed run 27 of 101, candidate first
+ab: timed run 28 of 101, anchor first
+ab: timed run 29 of 101, candidate first
+ab: timed run 30 of 101, anchor first
+ab: timed run 31 of 101, candidate first
+ab: timed run 32 of 101, anchor first
+ab: timed run 33 of 101, candidate first
+ab: timed run 34 of 101, anchor first
+ab: timed run 35 of 101, candidate first
+ab: timed run 36 of 101, anchor first
+ab: timed run 37 of 101, candidate first
+ab: timed run 38 of 101, anchor first
+ab: timed run 39 of 101, candidate first
+ab: timed run 40 of 101, anchor first
+ab: timed run 41 of 101, candidate first
+ab: timed run 42 of 101, anchor first
+ab: timed run 43 of 101, candidate first
+ab: timed run 44 of 101, anchor first
+ab: timed run 45 of 101, candidate first
+ab: timed run 46 of 101, anchor first
+ab: timed run 47 of 101, candidate first
+ab: timed run 48 of 101, anchor first
+ab: timed run 49 of 101, candidate first
+ab: timed run 50 of 101, anchor first
+ab: timed run 51 of 101, candidate first
+ab: timed run 52 of 101, anchor first
+ab: timed run 53 of 101, candidate first
+ab: timed run 54 of 101, anchor first
+ab: timed run 55 of 101, candidate first
+ab: timed run 56 of 101, anchor first
+ab: timed run 57 of 101, candidate first
+ab: timed run 58 of 101, anchor first
+ab: timed run 59 of 101, candidate first
+ab: timed run 60 of 101, anchor first
+ab: timed run 61 of 101, candidate first
+ab: timed run 62 of 101, anchor first
+ab: timed run 63 of 101, candidate first
+ab: timed run 64 of 101, anchor first
+ab: timed run 65 of 101, candidate first
+ab: timed run 66 of 101, anchor first
+ab: timed run 67 of 101, candidate first
+ab: timed run 68 of 101, anchor first
+ab: timed run 69 of 101, candidate first
+ab: timed run 70 of 101, anchor first
+ab: timed run 71 of 101, candidate first
+ab: timed run 72 of 101, anchor first
+ab: timed run 73 of 101, candidate first
+ab: timed run 74 of 101, anchor first
+ab: timed run 75 of 101, candidate first
+ab: timed run 76 of 101, anchor first
+ab: timed run 77 of 101, candidate first
+ab: timed run 78 of 101, anchor first
+ab: timed run 79 of 101, candidate first
+ab: timed run 80 of 101, anchor first
+ab: timed run 81 of 101, candidate first
+ab: timed run 82 of 101, anchor first
+ab: timed run 83 of 101, candidate first
+ab: timed run 84 of 101, anchor first
+ab: timed run 85 of 101, candidate first
+ab: timed run 86 of 101, anchor first
+ab: timed run 87 of 101, candidate first
+ab: timed run 88 of 101, anchor first
+ab: timed run 89 of 101, candidate first
+ab: timed run 90 of 101, anchor first
+ab: timed run 91 of 101, candidate first
+ab: timed run 92 of 101, anchor first
+ab: timed run 93 of 101, candidate first
+ab: timed run 94 of 101, anchor first
+ab: timed run 95 of 101, candidate first
+ab: timed run 96 of 101, anchor first
+ab: timed run 97 of 101, candidate first
+ab: timed run 98 of 101, anchor first
+ab: timed run 99 of 101, candidate first
+ab: timed run 100 of 101, anchor first
+ab: timed run 101 of 101, candidate first
+### Timed pairs
+
+Medians in ms; ratio is the median of the pairs' candidate/anchor ratios, with its 95% bootstrap interval. Slower or faster only when the interval excludes 1.
+
+| op | pairs | anchor | candidate | ratio | 95% interval | verdict |
+|---|---:|---:|---:|---:|---|---|
+| acp new | 100 | 416.6 | 367.9 | 0.870 | 0.765 to 1.058 | not shown |
+| acp launch | 100 | 173.3 | 141.6 | 0.800 | 0.738 to 0.846 | faster |
+| claude new | 100 | 389.6 | 399.8 | 1.080 | 0.994 to 1.259 | not shown, median above 1 |
+| claude launch | 100 | 172.1 | 177.5 | 1.029 | 0.994 to 1.077 | not shown, median above 1 |
+| codex new | 100 | 433.7 | 347.2 | 0.839 | 0.744 to 0.937 | faster |
+| codex launch | 100 | 223.9 | 257.0 | 1.103 | 1.052 to 1.155 | slower |
+
+### Counted ops
+
+Medians over the counted runs, anchor -> candidate, of all `fabric` processes of the side while the op ran.
+
+| op | spawns | full flushes | fsyncs | journal+ledger bytes written | state bytes read | allocations | CLI peak RSS KiB | CLI CPU ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| acp new | 3 -> 3 | 8 -> 8 | 0 -> 0 | 143 -> 143 | 143 -> 143 | 20710 -> 20101 | 14528 -> 14912 | 19.9 -> 20.0 |
+| acp launch | 4 -> 4 | 15 -> 12 | 0 -> 0 | 135 -> 135 | 1185 -> 683 | 3728 -> 4530 | 14416 -> 15568 | 13.8 -> 14.3 |
+| claude new | 3 -> 3 | 8 -> 8 | 0 -> 0 | 124 -> 124 | 272 -> 124 | 1674 -> 1686 | 10816 -> 11040 | 10.5 -> 11.7 |
+| claude launch | 4 -> 4 | 15 -> 15 | 0 -> 0 | 116 -> 116 | 1103 -> 1108 | 3522 -> 3610 | 14272 -> 14752 | 13.8 -> 13.4 |
+| codex new | 3 -> 3 | 8 -> 8 | 0 -> 0 | 124 -> 124 | 124 -> 124 | 1668 -> 1683 | 10736 -> 11040 | 9.7 -> 10.0 |
+| codex launch | 4 -> 4 | 17 -> 17 | 0 -> 0 | 116 -> 116 | 685 -> 685 | 3838 -> 3984 | 14144 -> 14688 | 16.0 -> 13.5 |
+
+### Counters that differ
+
+Every counter whose median differs between the builds, per op, anchor -> candidate. `spawn:<program>` counts the starts of one program; `<counter>.<class>` splits reads, writes and flushes (`syncs`) by the file they touch.
+
+- acp new: cli_cpu_us 19870 -> 19957, cli_maxrss_kib 14528 -> 14912, frees 14809 -> 14613, malloc_bytes 7068747 -> 6912576, mallocs 20710 -> 20101
+- acp launch: cli_cpu_us 13751 -> 14323, cli_maxrss_kib 14416 -> 15568, cmd:dash holding fabric-fake-agent 0 -> 1, cmd:fabric-fake-agent 1 -> 0, frees 3324 -> 3742, fullfsync 15 -> 12, malloc_bytes 615089 -> 775233, mallocs 3728 -> 4530, opens 40 -> 37, read_bytes.jobs 1011 -> 509, read_calls.jobs 12 -> 10, renames 6 -> 5, spawn:dash 0 -> 1, spawn:fabric-fake-agent 1 -> 0, syncs.jobs 14 -> 11, write_bytes.ipc 969 -> 1026, write_bytes.jobs 1033 -> 577, write_calls.ipc 11 -> 15, write_calls.jobs 6 -> 5
+- claude new: cli_cpu_us 10479 -> 11693, cli_maxrss_kib 10816 -> 11040, frees 1411 -> 1423, malloc_bytes 391418 -> 392741, mallocs 1674 -> 1686, opens 13 -> 11, read_bytes.state 148 -> 0, read_calls.state 4 -> 0
+- claude launch: cli_cpu_us 13793 -> 13369, cli_maxrss_kib 14272 -> 14752, cmd:claude 1 -> 0, cmd:dash holding claude 0 -> 1, frees 3119 -> 3215, malloc_bytes 604089 -> 613784, mallocs 3522 -> 3610, opens 43 -> 42, read_bytes.jobs 929 -> 934, spawn:claude 1 -> 0, spawn:dash 0 -> 1, write_bytes.ipc 692 -> 693, write_bytes.jobs 932 -> 937, write_calls.ipc 11 -> 12
+- codex new: cli_cpu_us 9737 -> 10047, cli_maxrss_kib 10736 -> 11040, frees 1408 -> 1423, malloc_bytes 391022 -> 392493, mallocs 1668 -> 1683
+- codex launch: cli_cpu_us 15979 -> 13487, cli_maxrss_kib 14144 -> 14688, cmd:codex 1 -> 0, cmd:dash holding codex 0 -> 1, frees 3421 -> 3562, malloc_bytes 702580 -> 723115, mallocs 3838 -> 3984, opens 46 -> 45, read_calls.ipc 13 -> 12, spawn:codex 1 -> 0, spawn:dash 0 -> 1, write_bytes.ipc 530 -> 531, write_calls.ipc 11 -> 12
+
+### Daemon resident size
+
+KiB after each timed run: median and largest per build, and the median of the pairs' ratios with its 95% bootstrap interval.
+
+| daemon | anchor median | anchor max | candidate median | candidate max | ratio | 95% interval |
+|---|---:|---:|---:|---:|---:|---|
+| daemon a | 21696 | 21840 | 22672 | 24032 | 1.045 | 1.045 to 1.046 |
+| daemon b | 16784 | 16912 | 17264 | 18336 | 1.029 | 1.029 to 1.030 |
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 63 filtered out; finished in 528.82s
+
