@@ -19,10 +19,10 @@ use fabric_core::version::HarnessVersion;
 use tokio::net::UnixStream;
 
 use crate::api::{
-    API_VERSION, Answer, ClientEnv, Decision, DoctorReport, Event, Hello, HelloAnswer, JobCreated,
-    JobList, JobLog, JobStatus, Lease, ManagedJob, ManagedJobs, ManagedOperation, NodeIdentity, Op,
-    Paired, PeerList, Pong, Refusal, Registered, Reply, Request, RunPlan, SessionRecorded,
-    Suspended, SystemPath, Welcome,
+    API_VERSION, Answer, ClientEnv, Decision, DoctorReport, Event, Exported, Hello, HelloAnswer,
+    JobCreated, JobList, JobLog, JobStatus, Lease, ManagedJob, ManagedJobs, ManagedOperation,
+    NodeIdentity, Op, Paired, PeerList, Pong, Refusal, Registered, Repaired, Reply, Request,
+    RunPlan, SessionRecorded, Suspended, SystemPath, Welcome,
 };
 use crate::frame::{self, FrameError};
 
@@ -386,6 +386,38 @@ impl Client {
         match self.call(&request, on_event).await? {
             Reply::JobMove(reply) => Ok(reply),
             other => Err(unexpected(Op::JobMove, &other)),
+        }
+    }
+
+    /// Applies the fork rule to a job frozen after a fork (ADR 0003, Forks).
+    pub async fn job_repair(
+        &self,
+        job: JobId,
+        on_event: impl FnMut(Event),
+    ) -> Result<Repaired, ClientError> {
+        match self.call(&Request::JobRepair { job }, on_event).await? {
+            Reply::JobRepair(reply) => Ok(reply),
+            other => Err(unexpected(Op::JobRepair, &other)),
+        }
+    }
+
+    /// Captures an orphan workspace of the job, the one at its root or the
+    /// set-aside one at `path`, into a pinned snapshot that is not the
+    /// job's head, measuring with `env`, the caller's environment, or the
+    /// node's own.
+    pub async fn job_export(
+        &self,
+        job: JobId,
+        path: Option<SystemPath>,
+        env: Option<ClientEnv>,
+        on_event: impl FnMut(Event),
+    ) -> Result<Exported, ClientError> {
+        match self
+            .call(&Request::JobExport { job, path, env }, on_event)
+            .await?
+        {
+            Reply::JobExport(reply) => Ok(reply),
+            other => Err(unexpected(Op::JobExport, &other)),
         }
     }
 

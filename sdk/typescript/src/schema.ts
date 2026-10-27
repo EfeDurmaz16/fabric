@@ -42,6 +42,8 @@ export const OPS = [
   "managed_cancel",
   "managed_status",
   "managed_list",
+  "job_repair",
+  "job_export",
 ] as const;
 
 /** The name of a request, which is also the kind of its reply. */
@@ -954,6 +956,8 @@ export const Request = z.discriminatedUnion("op", [
   }),
   z.object({ op: z.literal("managed_status"), job: JobId }),
   z.object({ op: z.literal("managed_list") }),
+  z.object({ op: z.literal("job_repair"), job: JobId }),
+  z.object({ op: z.literal("job_export"), job: JobId, path: optional(SystemPath), env }),
 ]);
 export type Request = z.infer<typeof Request>;
 export type RequestOf<K extends Op> = Extract<Request, { op: K }>;
@@ -1039,6 +1043,23 @@ const managedOperation = {
   job: ManagedJob,
 };
 
+const repairOutcomeOptions = [
+  /** The chains no longer fork; the freeze is lifted. */
+  z.object({ kind: z.literal("unforked") }),
+  /** The peer's chain won by the fork rule; this node took it and kept its own ledger at `kept`. */
+  z.object({ kind: z.literal("adopted"), epoch: Epoch, kept: Path, orphans: z.array(SnapshotId) }),
+] as const;
+
+/** Every repair outcome this client knows, read from the schema. */
+export const REPAIR_OUTCOME_KINDS = tagsOf("kind", repairOutcomeOptions);
+
+/** What a fork repair did; a kind a newer node sends reads as `unrecognized`. */
+export const RepairOutcome = z.preprocess(
+  unknownTagAsUnrecognized("kind", REPAIR_OUTCOME_KINDS),
+  z.discriminatedUnion("kind", [...repairOutcomeOptions, z.object({ kind: z.literal("unrecognized") })]),
+);
+export type RepairOutcome = z.infer<typeof RepairOutcome>;
+
 /** The result of a request; its kind is the request's op, and an unknown kind is an error. */
 export const Reply = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("node_id"), node: NodeId, listen: SocketAddr }),
@@ -1087,6 +1108,8 @@ export const Reply = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("managed_status"), ...managedJob }),
   /** `left_out` counts the oldest jobs left out so the rest fit in one answer; absent when none is. */
   z.object({ kind: z.literal("managed_list"), jobs: z.array(ManagedJob), left_out: optional(count) }),
+  z.object({ kind: z.literal("job_repair"), peer: NodeId, outcome: RepairOutcome }),
+  z.object({ kind: z.literal("job_export"), snapshot: SnapshotId, root: Path, chain: z.array(SnapshotId) }),
 ]);
 export type Reply = z.infer<typeof Reply>;
 export type ReplyTo<K extends Op> = Extract<Reply, { kind: K }>;
@@ -1107,6 +1130,8 @@ export type SessionRecorded = ReplyTo<"harness_session">;
 export type ManagedOperation = ReplyTo<"managed_create" | "managed_cancel">;
 export type ManagedStatus = ReplyTo<"managed_status">;
 export type ManagedJobs = ReplyTo<"managed_list">;
+export type Repaired = ReplyTo<"job_repair">;
+export type Exported = ReplyTo<"job_export">;
 
 // The exchange.
 

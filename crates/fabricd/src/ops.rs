@@ -238,6 +238,12 @@ impl Node {
                     report: self.doctor(peer, job, &env, out).await?,
                 }
             }
+            Request::JobRepair { job } => Reply::JobRepair(self.job_repair(job, out).await?),
+            Request::JobExport { job, path, env } => {
+                let env = self.client_env(env.as_ref());
+                let path = path.map(|path| PathBuf::from(path.as_str()));
+                Reply::JobExport(self.job_export(job, path, &env, out).await?)
+            }
         })
     }
 
@@ -1144,11 +1150,31 @@ impl Node {
         env: &ToolEnv,
         out: &mut Out,
     ) -> Result<SnapshotId, NodeError> {
-        let parent = job.latest();
-        let (harness_state, detected) = tokio::join!(
-            self.capture_harness(job, root, env, out),
-            self.detect_for_capture(job, root, parent, env),
-        );
+        self.capture_from(job, root, (job.latest(), true), env, out)
+            .await
+    }
+
+    /// `capture` from `parent`, with the harness state of the job's session
+    /// when `with_session` says so: an export of a workspace a restore set
+    /// aside carries none, since the session record then names another
+    /// tenure's session.
+    async fn capture_from(
+        &self,
+        job: &Job,
+        root: &Path,
+        (parent, with_session): (Option<SnapshotId>, bool),
+        env: &ToolEnv,
+        out: &mut Out,
+    ) -> Result<SnapshotId, NodeError> {
+        let harness = async {
+            if with_session {
+                self.capture_harness(job, root, env, out).await
+            } else {
+                Ok(None)
+            }
+        };
+        let (harness_state, detected) =
+            tokio::join!(harness, self.detect_for_capture(job, root, parent, env),);
         let harness_state = harness_state?;
         let (detection, facts) = detected?;
         local::write(
@@ -1230,6 +1256,89 @@ impl Node {
         });
         report_capture(&report, &left_behind, out);
         Ok(snapshot)
+    }
+
+    /// Captures an orphan workspace of job `id` into a snapshot the job's
+    /// ledger does not name, and pins it with its whole bundle chain
+    /// (`fabric job export`; ADR 0003, Orphans; ADR 0014).
+    ///
+    /// The workspace at the job's root is an orphan when the job is frozen
+    /// here, or when this node does not own the job at the tenure its
+    /// marker was written in: its harness state goes with it, as the
+    /// session record names its session. One a restore set aside under
+    /// `orphan/` beside the root is named by `path`, and goes without,
+    /// since the session record then names a later tenure's session.
+    /// Nothing is moved or deleted, and no ledger record is written.
+    async fn job_export(
+        &self,
+        id: JobId,
+        path: Option<PathBuf>,
+        env: &ToolEnv,
+        out: &mut Out,
+    ) -> Result<fabric_client::api::Exported, NodeError> {
+        let job = self.job(id).await?;
+        let job = job.lock().await;
+        let marker = job.marker()?;
+        let (root, with_session) = if let Some(dir) = path {
+            let roots = [
+                marker.as_ref().map(|m| m.root.clone()),
+                Some(paths::job_root(&self.cfg.home, id)),
+                Some(job.dir().fallback_root()),
+            ];
+            if !roots
+                .iter()
+                .flatten()
+                .any(|root| paths::is_orphan_copy(root, &dir))
+                || !dir.is_dir()
+            {
+                return Err(NodeError::NotAnOrphan { job: id, root: dir });
+            }
+            (dir, false)
+        } else {
+            let marker = marker.ok_or(NodeError::NoWorkspace(id))?;
+            let owns_it = match job.view(self.id) {
+                LeaseView::Owner(token) => marker.is_current(token.epoch, job.latest()).await,
+                _ => false,
+            };
+            if owns_it && !job.is_frozen()? {
+                return Err(NodeError::NotAnOrphan {
+                    job: id,
+                    root: marker.root,
+                });
+            }
+            (marker.root, true)
+        };
+        refuse_replaced_root(id, &root)?;
+        let _tree = self.lock_tree(id, &root).await?;
+        if with_session
+            && let Some(record) = job.harness_record()?
+            && record.liveness().await != Liveness::Gone
+        {
+            return Err(NodeError::AlreadyRunningHarness {
+                job: id,
+                pid: record.pid,
+            });
+        }
+        // The job's latest snapshot is the base an incremental bundle
+        // needs; without it here whole, the export bundles everything.
+        let parent = match job.latest() {
+            Some(latest) if is_complete(&self.store, latest).await? => Some(latest),
+            _ => None,
+        };
+        let snapshot = self
+            .capture_from(&job, &root, (parent, with_session), env, out)
+            .await?;
+        let chain = self.bundle_chain(snapshot).await?;
+        job.pin(vec![local::Pin {
+            snapshot,
+            chain: chain.clone(),
+            why: local::PinWhy::Exported { root: root.clone() },
+        }])?;
+        Ok(fabric_client::api::Exported {
+            snapshot,
+            root,
+            chain,
+        })
     }
 
     /// Detects the workspace's environment at `root` for a capture whose
@@ -8456,6 +8565,239 @@ pub(crate) mod tests {
             "{:?}",
             out.said()
         );
+    }
+
+    /// Three nodes paired with each other, a job on `a` suspended and
+    /// copied to `b` and `c` whole.
+    async fn three_with_a_job() -> ([tempfile::TempDir; 3], [Arc<Node>; 3], JobId) {
+        let (dir_a, a) = node();
+        let (dir_b, b) = node();
+        let (dir_c, c) = node();
+        for node in [&a, &b, &c] {
+            tokio::spawn(Arc::clone(node).run());
+        }
+        for (node, peer) in [(&a, &b), (&a, &c), (&b, &a), (&b, &c), (&c, &a), (&c, &b)] {
+            let addr = peer.local_addr().unwrap().to_string();
+            node.node_add(peer.id, Some(&addr)).await.unwrap();
+        }
+        let id = job(dir_a.path(), &a).await;
+        a.suspend(id, &ToolEnv::current(), &mut Out::default())
+            .await
+            .unwrap();
+        for node in [&b, &c] {
+            node.pull_records(id, a.id).await.unwrap();
+            node.ensure_latest(id, a.id).await.unwrap();
+        }
+        ([dir_a, dir_b, dir_c], [a, b, c], id)
+    }
+
+    fn head(job: &Job) -> RecordHash {
+        job.ledger().head()
+    }
+
+    /// R3: a node frozen after a fork exports its orphan workspace into a
+    /// pinned snapshot the ledger does not name, and repairs by the fork
+    /// rule: the owner that kept working at epoch one after `c` stole the
+    /// job at epoch two, out of its reach, freezes when `b` brings it the
+    /// steal, takes that chain, keeps its own ledger whole beside it and
+    /// pins the snapshot only its chain published; `b`, which never froze,
+    /// has nothing to repair.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_frozen_owner_exports_its_orphan_and_takes_the_chain_the_fork_rule_picks() {
+        let (_dirs, a, b, _c, id) = stolen_without_a().await;
+        let env = ToolEnv::current();
+        let root = a
+            .job(id)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .marker()
+            .unwrap()
+            .unwrap()
+            .root;
+        let owned = a.job_export(id, None, &env, &mut Out::default()).await;
+        assert!(
+            matches!(owned, Err(NodeError::NotAnOrphan { .. })),
+            "{owned:?}"
+        );
+
+        // a, not knowing of the steal, keeps working and suspends at epoch one.
+        std::fs::write(root.join("after-the-steal.txt"), "a's work\n").unwrap();
+        let lost = a.suspend(id, &env, &mut Out::default()).await.unwrap();
+        b.push_records(id, a.id).await.unwrap_err();
+        assert!(a.job(id).await.unwrap().lock().await.is_frozen().unwrap());
+
+        // The orphan exports into a pinned snapshot; the ledger stays as it was.
+        let before = head(&*a.job(id).await.unwrap().lock().await);
+        let exported = a
+            .job_export(id, None, &env, &mut Out::default())
+            .await
+            .unwrap();
+        assert_eq!(exported.root, root);
+        assert_eq!(exported.chain.first(), Some(&exported.snapshot));
+        {
+            let job = a.job(id).await.unwrap();
+            let job = job.lock().await;
+            assert_eq!(head(&job), before);
+            assert!(job.ledger().records().iter().all(|r| !matches!(
+                r.event().kind,
+                EventKind::SnapshotPublished { snapshot, .. } if snapshot == exported.snapshot
+            )));
+            let pins = job.pins().unwrap();
+            assert!(
+                pins.iter()
+                    .any(|pin| pin.snapshot == exported.snapshot && pin.chain == exported.chain)
+            );
+        }
+        for held in &exported.chain {
+            assert!(is_complete(&a.store, *held).await.unwrap());
+        }
+
+        let old = std::fs::read(a.job(id).await.unwrap().lock().await.dir().ledger()).unwrap();
+        let repaired = a.job_repair(id, &mut Out::default()).await.unwrap();
+        let fabric_client::api::RepairOutcome::Adopted {
+            epoch,
+            kept,
+            orphans,
+        } = repaired.outcome
+        else {
+            panic!("{repaired:?}");
+        };
+        assert_eq!((repaired.peer, epoch), (b.id, Epoch::new(2).unwrap()));
+        assert_eq!(orphans, vec![lost]);
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            old,
+            "the old ledger was not kept whole"
+        );
+        let dir = {
+            let job = a.job(id).await.unwrap();
+            let job = job.lock().await;
+            assert!(!job.is_frozen().unwrap());
+            assert_eq!(head(&job), head(&*b.job(id).await.unwrap().lock().await));
+            assert!(job.pins().unwrap().iter().any(|pin| pin.snapshot == lost));
+            job.dir().clone()
+        };
+        // The chain taken opens again as a start opens it, with its manifest.
+        Job::open(id, dir).unwrap();
+
+        let none = b.job_repair(id, &mut Out::default()).await;
+        assert!(matches!(none, Err(NodeError::NotFrozen { .. })), "{none:?}");
+    }
+
+    /// R3: a workspace a restore set aside under `orphan/` beside the
+    /// job's root exports by its path, without the session the job holds
+    /// now, which belongs to a later tenure; any other directory is
+    /// refused.
+    #[tokio::test]
+    async fn a_set_aside_orphan_exports_by_its_path_and_no_other_directory_does() {
+        let (dir, node) = node();
+        let id = job(dir.path(), &node).await;
+        let env = ToolEnv::current();
+        let root = node
+            .job(id)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .marker()
+            .unwrap()
+            .unwrap()
+            .root;
+        let aside = paths::orphan_copy(&root, Epoch::FIRST).unwrap();
+        std::fs::create_dir_all(aside.parent().unwrap()).unwrap();
+        let copied = std::process::Command::new("cp")
+            .arg("-R")
+            .arg(&root)
+            .arg(&aside)
+            .status()
+            .unwrap();
+        assert!(copied.success());
+        std::fs::write(aside.join("left-behind.txt"), "orphan work\n").unwrap();
+        let mut out = Out::default();
+        let exported = node
+            .job_export(id, Some(aside.clone()), &env, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(exported.root, aside);
+        assert!(
+            !out.events
+                .iter()
+                .any(|event| matches!(event, Event::SessionCaptured { .. })),
+            "{:?}",
+            out.said()
+        );
+        for elsewhere in [root.clone(), dir.path().join("repo")] {
+            let refused = node
+                .job_export(id, Some(elsewhere), &env, &mut Out::default())
+                .await;
+            assert!(
+                matches!(refused, Err(NodeError::NotAnOrphan { .. })),
+                "{refused:?}"
+            );
+        }
+    }
+
+    /// R3: two steals at one epoch freeze both thieves. The fork rule
+    /// picks the lower thief's chain; a repair there refuses and keeps the
+    /// freeze until the other takes it, and then lifts it, the chains no
+    /// longer forking.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_winner_of_a_fork_repairs_after_the_loser_took_its_chain() {
+        let (_dirs, [_a, b, c], id) = three_with_a_job().await;
+        let out = &mut Out::default();
+        b.job_steal(id, "a sleeps".to_owned(), true, out)
+            .await
+            .unwrap();
+        c.job_steal(id, "a sleeps".to_owned(), true, out)
+            .await
+            .unwrap();
+        b.push_records(id, c.id).await.unwrap_err();
+        c.push_records(id, b.id).await.unwrap_err();
+        for node in [&b, &c] {
+            assert!(
+                node.job(id)
+                    .await
+                    .unwrap()
+                    .lock()
+                    .await
+                    .is_frozen()
+                    .unwrap()
+            );
+        }
+        let (winner, loser) = if b.id.to_bytes() < c.id.to_bytes() {
+            (&b, &c)
+        } else {
+            (&c, &b)
+        };
+        let early = winner.job_repair(id, out).await;
+        assert!(
+            matches!(&early, Err(NodeError::ForkWon { peer, .. }) if peer == &loser.id),
+            "{early:?}"
+        );
+        assert!(
+            winner
+                .job(id)
+                .await
+                .unwrap()
+                .lock()
+                .await
+                .is_frozen()
+                .unwrap()
+        );
+        let taken = loser.job_repair(id, out).await.unwrap();
+        assert!(matches!(
+            taken.outcome,
+            fabric_client::api::RepairOutcome::Adopted { .. }
+        ));
+        let lifted = winner.job_repair(id, out).await.unwrap();
+        assert_eq!(lifted.outcome, fabric_client::api::RepairOutcome::Unforked);
+        assert_eq!(
+            head(&*winner.job(id).await.unwrap().lock().await),
+            head(&*loser.job(id).await.unwrap().lock().await)
+        );
+        assert_eq!(winner.lease(id).await.unwrap().owner, winner.id);
     }
 
     /// The tools a move or a pull leaves out, those of a harness other

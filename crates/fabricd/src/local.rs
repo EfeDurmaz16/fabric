@@ -232,6 +232,39 @@ pub struct PendingSession {
     pub record: SessionRecord,
 }
 
+/// A snapshot this node keeps for a job although the job's ledger does not
+/// name it, with every snapshot its bundle needs (ADR 0003, Orphans).
+///
+/// The store keeps every snapshot it holds until one is forgotten, and
+/// refuses to forget a bundle base a later snapshot needs; a pin says
+/// that no pass that forgets snapshots the ledger no longer names may
+/// forget these. Nothing forgets snapshots yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pin {
+    /// The snapshot.
+    pub snapshot: SnapshotId,
+    /// It and each bundle base it needs, in order, to its full bundle.
+    pub chain: Vec<SnapshotId>,
+    /// Why it is kept.
+    pub why: PinWhy,
+}
+
+/// Why a snapshot is pinned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PinWhy {
+    /// `fabric job export` captured an orphan workspace at this root.
+    Exported {
+        /// The workspace.
+        root: PathBuf,
+    },
+    /// A record of this node's chain published it, and a fork repair took
+    /// another chain; the old ledger is kept at `kept`.
+    ForkLost {
+        /// The old ledger.
+        kept: PathBuf,
+    },
+}
+
 /// Reads a node-local file, or `None` when it does not exist.
 pub fn read<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, LocalError> {
     let bytes = match std::fs::read(path) {

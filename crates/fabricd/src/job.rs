@@ -485,6 +485,52 @@ impl Job {
         Ok(true)
     }
 
+    /// Lifts the freeze: removes the fork record, durably. Only a fork
+    /// repair calls it, once the chains no longer fork here (ADR 0003, Forks).
+    pub fn unfreeze(&self) -> Result<(), NodeError> {
+        Ok(self.forked.remove(&self.dir.forked(), true)?)
+    }
+
+    /// The snapshots this node keeps for the job outside its ledger.
+    pub fn pins(&self) -> Result<Vec<local::Pin>, NodeError> {
+        Ok(local::read(&self.dir.pins())?.unwrap_or_default())
+    }
+
+    /// Adds `pins` to those kept; a snapshot already pinned keeps its first pin.
+    pub fn pin(&self, pins: Vec<local::Pin>) -> Result<(), NodeError> {
+        let mut kept = self.pins()?;
+        for pin in pins {
+            if !kept.iter().any(|held| held.snapshot == pin.snapshot) {
+                kept.push(pin);
+            }
+        }
+        Ok(local::write(&self.dir.pins(), &kept)?)
+    }
+
+    /// Replaces this job's ledger with `chain`, the whole chain of the job
+    /// a fork repair took over this node's own, and lifts the freeze.
+    ///
+    /// Nothing is cut: the old ledger is first copied whole to `kept`.
+    /// The derived manifest is removed before the new ledger is renamed
+    /// into place, so a crash at any step leaves the old ledger with no
+    /// manifest, which a start rewrites, or the new one, and a repair run
+    /// again converges: the chains then no longer fork. The fork record
+    /// goes last, so a crash before it leaves the job frozen.
+    pub fn adopt(&mut self, chain: &Ledger, kept: &Path) -> Result<(), NodeError> {
+        let old = fs::read(self.dir.ledger()).map_err(|e| NodeError::io(self.dir.ledger(), e))?;
+        crate::durable::write_atomic(kept, &old).map_err(|e| NodeError::io(kept, e))?;
+        local::remove(&self.dir.manifest())?;
+        let bytes: Vec<u8> = chain
+            .records()
+            .iter()
+            .flat_map(|record| record.bytes().iter().copied())
+            .collect();
+        crate::durable::write_atomic(&self.dir.ledger(), &bytes)
+            .map_err(|e| NodeError::io(self.dir.ledger(), e))?;
+        *self = Job::open(self.id, self.dir.clone())?;
+        self.unfreeze()
+    }
+
     /// Settles a marker a crash left behind once the ledger says how the
     /// step ended: a suspend whose `Suspended` is durable is clean.
     ///

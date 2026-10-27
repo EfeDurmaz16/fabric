@@ -246,6 +246,36 @@ impl JobDir {
     pub fn fallback_root(&self) -> PathBuf {
         self.dir.join("work")
     }
+
+    /// The snapshots this node keeps for the job although its ledger does
+    /// not name them: orphans an export or a fork repair published, each
+    /// with its whole bundle chain (ADR 0003, Orphans; ADR 0014).
+    #[must_use]
+    pub fn pins(&self) -> PathBuf {
+        self.dir.join("pins")
+    }
+
+    /// Where a fork repair keeps the ledger this node held before it took
+    /// the chain the fork rule picked, named by the last record the two
+    /// chains share (ADR 0003, Forks): the whole file, nothing cut.
+    #[must_use]
+    pub fn forked_ledger(&self, fork_point: fabric_core::id::RecordHash) -> PathBuf {
+        self.dir.join(format!("ledger.forked-{fork_point}"))
+    }
+}
+
+/// Whether `dir` is a workspace a restore set aside for the job whose root
+/// is `root`: a directory directly under `<root parent>/orphan/`
+/// (`orphan_copy`), which an export may capture.
+#[must_use]
+pub fn is_orphan_copy(root: &Path, dir: &Path) -> bool {
+    let Some(orphans) = root.parent().map(|parent| parent.join("orphan")) else {
+        return false;
+    };
+    dir.parent() == Some(orphans.as_path())
+        && dir
+            .file_name()
+            .is_some_and(|name| name != "." && name != "..")
 }
 
 /// The directory under `home` that holds every job's root and the copies

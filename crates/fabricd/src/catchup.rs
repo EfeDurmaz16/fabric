@@ -344,8 +344,158 @@ impl Node {
         self.settle(job, out).await
     }
 
+    /// Applies the fork rule of ADR 0003 to a job frozen here after a fork
+    /// (`fabric job repair`): reads the peer's whole chain, and when the
+    /// peer's chain wins, takes it, keeping this node's ledger whole beside
+    /// it and pinning the snapshots only that ledger published, then lifts
+    /// the freeze and settles the job, so a clean workspace moves aside as
+    /// a departed copy and one with changes stays, an orphan to export.
+    /// When the chains no longer fork the freeze is lifted. When this
+    /// node's chain wins the job stays frozen and the refusal says to
+    /// repair on the peer first, which takes this chain; then the chains
+    /// no longer fork here.
+    ///
+    /// The lock is let go while the peer is read, and the repair stops if
+    /// the ledger moved meanwhile.
+    pub(crate) async fn job_repair(
+        self: &Arc<Self>,
+        id: JobId,
+        out: &mut Out,
+    ) -> Result<fabric_client::api::Repaired, NodeError> {
+        use fabric_client::api::{RepairOutcome, Repaired};
+        let (fork, ours) = {
+            let job = self.job(id).await?;
+            let job = job.lock().await;
+            let fork = job.forked()?.ok_or(NodeError::NotFrozen { job: id })?;
+            (fork, job.ledger().records().to_vec())
+        };
+        let peer = fork.peer;
+        let theirs = self
+            .peer_chain(id, peer)
+            .await?
+            .ok_or_else(|| NodeError::Peer {
+                peer,
+                reason: format!("it holds no record of job {id}"),
+            })?;
+        let decided = fork_rule(&ours, theirs.records()).map_err(|e| NodeError::Peer {
+            peer,
+            reason: e.to_string(),
+        })?;
+        let job = self.job(id).await?;
+        let mut job = job.lock().await;
+        if ours.last().map(Record::hash) != Some(job.ledger().head()) {
+            return Err(NodeError::ChangedDuringRepair { job: id });
+        }
+        let outcome = match decided {
+            Fork::None => {
+                job.unfreeze()?;
+                RepairOutcome::Unforked
+            }
+            Fork::After { ours: true, .. } => {
+                return Err(NodeError::ForkWon {
+                    job: id,
+                    peer,
+                    epoch: chain_top(&theirs),
+                });
+            }
+            Fork::After { at, ours: false } => {
+                if let Some(record) = job.harness_record()?
+                    && record.liveness().await != crate::local::Liveness::Gone
+                {
+                    return Err(NodeError::AlreadyRunningHarness {
+                        job: id,
+                        pid: record.pid,
+                    });
+                }
+                let orphans: Vec<fabric_core::id::SnapshotId> = ours[at + 1..]
+                    .iter()
+                    .filter_map(|record| match record.event().kind {
+                        fabric_core::ledger::EventKind::SnapshotPublished { snapshot, .. } => {
+                            Some(snapshot)
+                        }
+                        _ => None,
+                    })
+                    .filter(|snapshot| !theirs.records().iter().any(|r| {
+                        matches!(r.event().kind, fabric_core::ledger::EventKind::SnapshotPublished { snapshot: s, .. } if s == *snapshot)
+                    }))
+                    .collect();
+                let kept = job.dir().forked_ledger(ours[at].hash());
+                let mut pins = Vec::with_capacity(orphans.len());
+                for snapshot in &orphans {
+                    pins.push(crate::local::Pin {
+                        snapshot: *snapshot,
+                        chain: self.bundle_chain(*snapshot).await?,
+                        why: crate::local::PinWhy::ForkLost { kept: kept.clone() },
+                    });
+                }
+                job.pin(pins)?;
+                job.adopt(&theirs, &kept)?;
+                job.reconcile_marker()?;
+                self.settle(&mut job, out).await?;
+                RepairOutcome::Adopted {
+                    epoch: job.ledger().lease().epoch(),
+                    kept,
+                    orphans,
+                }
+            }
+        };
+        drop(job);
+        // The chain taken names the peer's latest snapshot, which a restore
+        // or a steal here needs; a failure leaves it to the next catch-up.
+        if matches!(outcome, RepairOutcome::Adopted { .. })
+            && let Err(e) = self.ensure_latest(id, peer).await
+        {
+            out.emit(Event::NotCaughtUp {
+                peer,
+                error: e.to_refusal(),
+            });
+        }
+        Ok(Repaired { peer, outcome })
+    }
+
+    /// `snapshot` and each bundle base it needs, in order, to its full
+    /// bundle, as this node's store holds them; a snapshot the store lacks
+    /// ends the chain.
+    pub(crate) async fn bundle_chain(
+        &self,
+        snapshot: fabric_core::id::SnapshotId,
+    ) -> Result<Vec<fabric_core::id::SnapshotId>, NodeError> {
+        crate::transfer::with_store(&self.store, move |store| {
+            let mut chain = vec![snapshot];
+            let mut at = snapshot;
+            loop {
+                let base = match store.manifest(at) {
+                    Ok(manifest) => manifest.git.and_then(|git| git.bundle_base),
+                    Err(fabric_store::store::StoreError::UnknownSnapshot(_)) => None,
+                    Err(e) => return Err(e.into()),
+                };
+                match base {
+                    Some(base) if !chain.contains(&base) => {
+                        chain.push(base);
+                        at = base;
+                    }
+                    _ => return Ok(chain),
+                }
+            }
+        })
+        .await
+    }
+
     /// The highest epoch in `peer`'s ledger for the job, read from its whole chain.
     async fn peer_epoch(self: &Arc<Self>, id: JobId, peer: NodeId) -> Result<Epoch, NodeError> {
+        Ok(self
+            .peer_chain(id, peer)
+            .await?
+            .map_or(Epoch::FIRST, |ledger| chain_top(&ledger)))
+    }
+
+    /// `peer`'s whole ledger for the job, replayed as one chain of it, or
+    /// `None` when it holds no record of the job.
+    pub(crate) async fn peer_chain(
+        self: &Arc<Self>,
+        id: JobId,
+        peer: NodeId,
+    ) -> Result<Option<Ledger>, NodeError> {
         let token = FencingToken {
             job_id: id,
             epoch: Epoch::FIRST,
@@ -379,29 +529,316 @@ impl Node {
             }
         }
         if records.is_empty() {
-            return Ok(Epoch::FIRST);
+            return Ok(None);
         }
-        chain_epoch(id, records).map_err(|e| NodeError::Peer {
-            peer,
-            reason: format!("its ledger for job {id} does not replay: {e}"),
-        })
+        // Each record alone only proves its own framing, so a record of
+        // another job, or a chain with a gap, would otherwise let a faulty
+        // peer freeze a valid job here with any epoch it wrote, or give a
+        // repair a chain this node's rules refuse.
+        Ledger::replay(id, records)
+            .map(Some)
+            .map_err(|e| NodeError::Peer {
+                peer,
+                reason: format!("its ledger for job {id} does not replay: {e}"),
+            })
     }
+}
+
+/// The highest epoch in a chain.
+fn chain_top(ledger: &Ledger) -> Epoch {
+    ledger
+        .records()
+        .iter()
+        .map(|record| record.event().epoch)
+        .max()
+        .unwrap_or(Epoch::FIRST)
 }
 
 /// The highest epoch in `records`, a peer's whole ledger for job `id`,
 /// once they replay as one ledger: the first a `Created` for this job, and
 /// each record after it linked to the one before and allowed by the
-/// ledger's rules. Each record alone only proves its own framing, so a
-/// record of another job, or a chain with a gap, would otherwise let a
-/// faulty peer freeze a valid job here with any epoch it wrote.
+/// ledger's rules.
+#[cfg(test)]
 fn chain_epoch(id: JobId, records: Vec<Record>) -> Result<Epoch, LedgerError> {
-    let ledger = Ledger::replay(id, records)?;
-    Ok(ledger
-        .records()
+    Ok(chain_top(&Ledger::replay(id, records)?))
+}
+
+/// What the fork rule of ADR 0003 makes of two chains of one job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Fork {
+    /// One holds the other: they do not fork.
+    None,
+    /// They fork after the record at `at` (0 is `Created`); `ours` says
+    /// whether this node's suffix wins.
+    After {
+        /// The position of the last record the chains share.
+        at: usize,
+        /// True when this node's chain wins.
+        ours: bool,
+    },
+}
+
+/// Why the fork rule cannot pick a chain: two suffixes the ledger rules
+/// say cannot both exist, so one of the chains was not written by Fabric.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("the fork rule cannot pick between the chains: {0}")]
+pub(crate) struct Undecided(&'static str);
+
+/// How a suffix ranks under the fork rule: its highest epoch-bumping
+/// record, `MoveImported` or `Stolen` with its thief, or the fork point's
+/// epoch when it has none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rank {
+    /// No epoch bump since the fork point, whose epoch this is.
+    None(Epoch),
+    /// A steal by this node at this epoch.
+    Stolen(Epoch, NodeId),
+    /// A consented move at this epoch.
+    Imported(Epoch),
+}
+
+impl Rank {
+    fn of(suffix: &[Record], fork_epoch: Epoch) -> Rank {
+        // Epochs only rise along a chain, so the last bump is the highest.
+        suffix
+            .iter()
+            .rev()
+            .find_map(|record| match &record.event().kind {
+                fabric_core::ledger::EventKind::MoveImported { .. } => {
+                    Some(Rank::Imported(record.event().epoch))
+                }
+                fabric_core::ledger::EventKind::Stolen { by, .. } => {
+                    Some(Rank::Stolen(record.event().epoch, *by))
+                }
+                _ => None,
+            })
+            .unwrap_or(Rank::None(fork_epoch))
+    }
+
+    fn epoch(self) -> Epoch {
+        match self {
+            Rank::None(epoch) | Rank::Stolen(epoch, _) | Rank::Imported(epoch) => epoch,
+        }
+    }
+}
+
+/// The fork rule of ADR 0003 (Forks), from the two chains alone, so both
+/// nodes reach the same answer with no message and no clock: the higher
+/// epoch-bumping record wins; at equal epoch `MoveImported` beats
+/// `Stolen`; between two `Stolen` the lower thief's node id, compared as
+/// bytes, wins. A suffix with no bump counts at the fork point's epoch.
+pub(crate) fn fork_rule(ours: &[Record], theirs: &[Record]) -> Result<Fork, Undecided> {
+    let shared = ours
         .iter()
-        .map(|record| record.event().epoch)
-        .max()
-        .unwrap_or(Epoch::FIRST))
+        .zip(theirs)
+        .take_while(|(a, b)| a.hash() == b.hash())
+        .count();
+    if shared == 0 {
+        return Err(Undecided("the chains share no record, not even Created"));
+    }
+    if shared == ours.len() || shared == theirs.len() {
+        return Ok(Fork::None);
+    }
+    let at = shared - 1;
+    let fork_epoch = ours[at].event().epoch;
+    let (mine, other) = (
+        Rank::of(&ours[shared..], fork_epoch),
+        Rank::of(&theirs[shared..], fork_epoch),
+    );
+    let ours = match mine.epoch().cmp(&other.epoch()) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => match (mine, other) {
+            (Rank::Imported(_), Rank::Stolen(..) | Rank::None(_))
+            | (Rank::Stolen(..), Rank::None(_)) => true,
+            (Rank::Stolen(..) | Rank::None(_), Rank::Imported(_))
+            | (Rank::None(_), Rank::Stolen(..)) => false,
+            (Rank::Stolen(_, a), Rank::Stolen(_, b)) if a != b => a.to_bytes() < b.to_bytes(),
+            (Rank::Stolen(..), Rank::Stolen(..)) => {
+                return Err(Undecided("one node stole the job twice at one epoch"));
+            }
+            (Rank::Imported(_), Rank::Imported(_)) => {
+                return Err(Undecided("two moves were imported at one epoch"));
+            }
+            (Rank::None(_), Rank::None(_)) => {
+                return Err(Undecided("neither chain raised the epoch after the fork"));
+            }
+        },
+    };
+    Ok(Fork::After { at, ours })
+}
+
+#[cfg(test)]
+mod fork_tests {
+    use fabric_core::harness::HarnessKind;
+    use fabric_core::id::{EventId, JobId, MoveId, NodeId, SnapshotId};
+    use fabric_core::ledger::{Author, EventKind, Ledger, MemoryStore, Record};
+    use fabric_core::moves::{CompleteSnapshot, OfferAnswer};
+
+    use super::{Fork, fork_rule};
+
+    const JOB: JobId = JobId::from_bytes([3; 16]);
+    const A: NodeId = NodeId::from_bytes([1; 32]);
+    const B: NodeId = NodeId::from_bytes([2; 32]);
+    const C: NodeId = NodeId::from_bytes([3; 32]);
+
+    fn eid() -> EventId {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let mut bytes = [0; 16];
+        bytes[8..].copy_from_slice(&NEXT.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+        EventId::from_bytes(bytes)
+    }
+
+    const SNAPSHOT: [u8; 1] = [7];
+
+    /// A owns the job, suspended in a published snapshot.
+    fn suspended() -> Ledger {
+        let created = Ledger::created(JOB, "goal".into(), HarnessKind::Codex, A, eid(), 1).unwrap();
+        let mut ledger = Ledger::replay(JOB, [created]).unwrap();
+        let snapshot = SnapshotId::of(&SNAPSHOT);
+        for kind in [
+            EventKind::SnapshotPublished {
+                snapshot,
+                parent: None,
+            },
+            EventKind::Suspended { snapshot },
+        ] {
+            write(&mut ledger, A, kind);
+        }
+        ledger
+    }
+
+    fn write(ledger: &mut Ledger, author: NodeId, kind: EventKind) {
+        let record = ledger.propose(author, kind, eid(), 2).unwrap();
+        ledger
+            .commit(&mut MemoryStore::default(), record, Author::Node(author))
+            .unwrap();
+    }
+
+    fn steal(ledger: &mut Ledger, thief: NodeId) {
+        let complete = Some(CompleteSnapshot::new(SnapshotId::of(&SNAPSHOT)));
+        let proposal = ledger
+            .steal(thief, String::new(), complete, eid(), 3)
+            .unwrap();
+        ledger
+            .commit(
+                &mut MemoryStore::default(),
+                proposal.record,
+                Author::Node(thief),
+            )
+            .unwrap();
+    }
+
+    fn import(ledger: &mut Ledger, target: NodeId) {
+        let owner = ledger.lease().holder();
+        let started = ledger
+            .start_move(owner, target, MoveId::from_bytes([9; 16]), eid(), 3)
+            .unwrap();
+        ledger
+            .commit(&mut MemoryStore::default(), started, Author::Node(owner))
+            .unwrap();
+        let offer = ledger.offer(owner).unwrap();
+        let epoch = ledger.lease().epoch();
+        let complete = Some(CompleteSnapshot::new(offer.snapshot));
+        let OfferAnswer::Import(record) = ledger
+            .answer_offer(target, &offer, epoch, complete, eid(), 4)
+            .unwrap()
+        else {
+            panic!("the target did not import");
+        };
+        ledger
+            .commit(&mut MemoryStore::default(), record, Author::Node(target))
+            .unwrap();
+    }
+
+    fn note(ledger: &mut Ledger) {
+        let owner = ledger.lease().holder();
+        write(
+            ledger,
+            owner,
+            EventKind::Note {
+                text: "work".into(),
+            },
+        );
+    }
+
+    fn records(ledger: &Ledger) -> Vec<Record> {
+        ledger.records().to_vec()
+    }
+
+    fn winner(ours: &Ledger, theirs: &Ledger) -> Option<bool> {
+        match fork_rule(&records(ours), &records(theirs)).unwrap() {
+            Fork::None => None,
+            Fork::After { ours, .. } => Some(ours),
+        }
+    }
+
+    /// Rule 1: the higher epoch wins, and a suffix that never raised the
+    /// epoch counts at the fork point's: the old owner that kept noting at
+    /// epoch one loses to a steal at epoch two, from both sides.
+    #[test]
+    fn the_higher_epoch_wins() {
+        let base = suspended();
+        let (mut owner, mut thief) = (base.clone(), base);
+        note(&mut owner);
+        steal(&mut thief, B);
+        assert_eq!(winner(&owner, &thief), Some(false));
+        assert_eq!(winner(&thief, &owner), Some(true));
+        let mut again = thief.clone();
+        steal(&mut again, C);
+        let mut moved = owner.clone();
+        import(&mut moved, C);
+        // Epoch three by a second steal beats epoch two by a move.
+        assert_eq!(winner(&moved, &again), Some(false));
+    }
+
+    /// Rule 2: at equal epoch `MoveImported` beats `Stolen`, the move being
+    /// one the owner of record consented to.
+    #[test]
+    fn a_move_beats_a_steal_at_one_epoch() {
+        let base = suspended();
+        let (mut moved, mut stolen) = (base.clone(), base);
+        import(&mut moved, C);
+        steal(&mut stolen, B);
+        assert_eq!(winner(&moved, &stolen), Some(true));
+        assert_eq!(winner(&stolen, &moved), Some(false));
+    }
+
+    /// Rule 3: between two steals at one epoch, the thief with the lower
+    /// node id, compared as bytes, wins, from both sides.
+    #[test]
+    fn the_lower_thief_wins_two_steals_at_one_epoch() {
+        let base = suspended();
+        let (mut by_b, mut by_c) = (base.clone(), base);
+        steal(&mut by_b, B);
+        steal(&mut by_c, C);
+        note(&mut by_c);
+        assert_eq!(winner(&by_b, &by_c), Some(true));
+        assert_eq!(winner(&by_c, &by_b), Some(false));
+    }
+
+    /// Chains of which one holds the other do not fork, and two chains
+    /// that both never raised the epoch after the fork, which only a node
+    /// that does not follow the ledger rules writes, are not decided.
+    #[test]
+    fn chains_that_hold_each_other_do_not_fork_and_two_without_a_bump_are_not_decided() {
+        let base = suspended();
+        let mut longer = base.clone();
+        note(&mut longer);
+        assert_eq!(winner(&base, &longer), None);
+        assert_eq!(winner(&longer, &base), None);
+        assert_eq!(winner(&base, &base), None);
+        let mut other = base.clone();
+        write(
+            &mut other,
+            A,
+            EventKind::Note {
+                text: "other".into(),
+            },
+        );
+        assert!(fork_rule(&records(&longer), &records(&other)).is_err());
+    }
 }
 
 #[cfg(test)]

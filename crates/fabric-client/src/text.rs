@@ -61,3 +61,32 @@ pub(crate) mod option {
             .transpose()
     }
 }
+
+/// The same for a list of values, each as its text.
+pub(crate) mod list {
+    use super::{Deserialize, Deserializer, Display, Error, FromStr, Serializer};
+
+    /// Writes the text of each value.
+    pub(crate) fn serialize<T: Display, S: Serializer>(
+        values: &[T],
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        s.collect_seq(values.iter().map(ToString::to_string))
+    }
+
+    /// Reads a list of texts.
+    pub(crate) fn deserialize<'de, T, D>(d: D) -> Result<Vec<T>, D::Error>
+    where
+        T: FromStr,
+        T::Err: Display,
+        D: Deserializer<'de>,
+    {
+        Vec::<String>::deserialize(d)?
+            .into_iter()
+            .map(|text| {
+                text.parse()
+                    .map_err(|e| D::Error::custom(format!("{text:?}: {e}")))
+            })
+            .collect()
+    }
+}

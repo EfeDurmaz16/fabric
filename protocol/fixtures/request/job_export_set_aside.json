@@ -1,0 +1,12 @@
+{
+  "op": "job_export",
+  "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "path": "/Users/me/fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/orphan/1",
+  "env": {
+    "path": [
+      "/usr/bin",
+      "/bin"
+    ],
+    "roots": {}
+  }
+}
