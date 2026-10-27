@@ -238,6 +238,22 @@ enum JobCommand {
         #[arg(long, default_value = "")]
         note: String,
     },
+    /// Settle a job frozen after a fork by the fork rule: take the peer's
+    /// chain when it wins, keeping this node's ledger and its snapshots.
+    Repair {
+        /// The job.
+        job: JobId,
+    },
+    /// Snapshot an orphan workspace of the job without making it the job's
+    /// head, and keep the snapshot.
+    Export {
+        /// The job.
+        job: JobId,
+        /// A workspace a restore set aside under orphan/ beside the job's
+        /// root; the workspace at the root when left out.
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
 }
 
 fn harness_arg(text: &str) -> Result<HarnessKind, String> {
@@ -705,19 +721,33 @@ fn job_request(command: JobCommand) -> Result<(Request, Mode, bool)> {
             Mode::Interactive(None),
             false,
         ),
+        JobCommand::Repair { job } => (Request::JobRepair { job }, Mode::Interactive(None), false),
+        JobCommand::Export { job, path } => (
+            Request::JobExport {
+                job,
+                path: path.as_deref().map(system_path).transpose()?,
+                env: env()?,
+            },
+            Mode::Interactive(None),
+            false,
+        ),
     })
 }
 
 /// The repository `fabric job new` names, as the absolute path the client API carries.
 fn repository(repo: &Path) -> Result<SystemPath> {
-    let canonical =
-        std::fs::canonicalize(repo).with_context(|| format!("repository {}", repo.display()))?;
+    system_path(repo).with_context(|| format!("repository {}", repo.display()))
+}
+
+/// `path`, resolved to its physical path, as the client API carries it.
+fn system_path(path: &Path) -> Result<SystemPath> {
+    let canonical = std::fs::canonicalize(path)?;
     canonical
         .to_str()
         .and_then(|text| SystemPath::parse(text).ok())
         .ok_or_else(|| {
             anyhow!(
-                "repository {} is not a UTF-8 path, which the client API cannot carry",
+                "{} is not a UTF-8 path, which the client API cannot carry",
                 canonical.display()
             )
         })

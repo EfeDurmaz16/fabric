@@ -633,6 +633,61 @@ fn e2e_a_steal_after_a_resume_freezes_the_owner_and_stops_its_harness() -> Falli
     Ok(())
 }
 
+/// R3: the owner frozen by a steal after its harness ran exports the
+/// orphan workspace into a pinned snapshot the ledger does not name, then
+/// `fabric job repair` takes the thief's chain by the fork rule, keeping
+/// the old ledger whole, and lifts the freeze; the thief has nothing to
+/// repair.
+#[test]
+fn e2e_a_frozen_owner_exports_its_orphan_and_repairs_the_fork() -> Fallible {
+    let p = setup(Wire::TcpTls, None, None)?;
+    let (job, _) = job_with_work(&p)?;
+    p.a.ok(&["job", "suspend", &job])?;
+    let (running, _pid) = p.a.run_lingering(&job)?;
+    p.b.ok(&["job", "steal", &job, "--force"])?;
+    let _ = finish(running, GIVE_UP)?;
+    assert_eq!(p.a.lease(&job)?.view, "frozen");
+
+    let exported = p.a.ok(&["job", "export", &job])?;
+    assert!(
+        exported.contains("as snapshot") && exported.contains("the job's head is unchanged"),
+        "{exported}"
+    );
+    let pins = fs::read_to_string(p.a.state().join("jobs").join(&job).join("pins"))?;
+    assert!(pins.contains("Exported"), "{pins}");
+
+    let repaired = p.a.ok(&["job", "repair", &job])?;
+    assert!(
+        repaired.contains(&format!(
+            "the fork rule picked {}'s chain at epoch 2",
+            p.b.id
+        )),
+        "{repaired}"
+    );
+    let kept: Vec<_> = fs::read_dir(p.a.state().join("jobs").join(&job))?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("ledger.forked-")
+        })
+        .collect();
+    assert_eq!(kept.len(), 1, "the old ledger was not kept");
+    let after = p.a.lease(&job)?;
+    assert_ne!(after.view, "frozen");
+    assert_eq!((after.owner, after.epoch), (p.b.id.clone(), 2));
+
+    let refused = p.b.run(&["job", "repair", &job])?;
+    assert_eq!(refused.status.code(), Some(1), "{}", text(&refused));
+    assert!(
+        text(&refused).contains("is not frozen"),
+        "{}",
+        text(&refused)
+    );
+    Ok(())
+}
+
 /// As above, with the owner's daemon up but out of reach when the steal
 /// happens, as a laptop on another network: nothing tells it, so its
 /// harness keeps running until the next `run` catches up with the thief,
