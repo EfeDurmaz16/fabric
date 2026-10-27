@@ -879,7 +879,11 @@ struct StagingTarget<'a> {
 /// Unpacks every bundle of the chain that ends at `manifest`, oldest first, into `git`'s repository.
 ///
 /// Unbundling indexes each pack and writes no refs, so the refs an older
-/// link lists can never collide with the ones `set_refs` writes.
+/// link lists can never collide with the ones `set_refs` writes. `git
+/// bundle unbundle` checks the bundle's prerequisites with the same
+/// `verify_bundle` that `git bundle verify` runs, before it indexes the
+/// pack (git's `bundle.c`, since 2.20), so a link whose prerequisites the
+/// links below it lack fails here, and no separate verify runs.
 fn unbundle_chain(
     store: &Store,
     snapshot: SnapshotId,
@@ -919,7 +923,6 @@ fn unbundle_chain(
             }
         }
         let path_text = path.to_string_lossy().into_owned();
-        git.run(&["bundle", "verify", &path_text])?;
         git.run(&["bundle", "unbundle", &path_text])?;
         report.bundles_fetched += 1;
     }

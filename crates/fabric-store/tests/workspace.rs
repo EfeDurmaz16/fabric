@@ -21,6 +21,7 @@ use fabric_store::capture::{
     BundleKind, BusyReason, CaptureError, CaptureRequest, Captured, CarryKeys, IndexFlag,
     MAX_BUNDLE_CHAIN, UnmeasuredKeys, capture,
 };
+use fabric_store::git::GitError;
 use fabric_store::objects::ChunkParams;
 use fabric_store::policy::{IgnorePolicy, PolicyError, SECRET_PATTERNS};
 use fabric_store::restore::{
@@ -2179,6 +2180,61 @@ fn a_restore_whose_bundle_base_is_gone_names_it() {
     );
 }
 
+/// The child half of `a_restore_runs_bundle_unbundle_alone`.
+#[test]
+fn restore_unbundle_child() {
+    let Some(dir) = common::logged_git_dir() else {
+        return;
+    };
+    let root = dir.join("work");
+    one_commit_repo(&root).unwrap();
+    let mut store = store_in(&dir).unwrap();
+    let (first, _) = commit_and_capture(&mut store, &root, 0, None).unwrap();
+    let (second, _) = commit_and_capture(&mut store, &root, 1, Some(first)).unwrap();
+    let start = common::logged_git_calls().len();
+    let report = restore_into(&store, second, &dir.join("restored")).unwrap();
+    let ran = common::git_commands(&common::logged_git_calls(), start);
+    let bundle: Vec<&str> = (ran.iter())
+        .filter_map(|call| call.strip_prefix("bundle "))
+        .filter_map(|call| call.split(' ').next())
+        .collect();
+    assert_eq!(bundle, ["unbundle", "unbundle"], "{}", ran.join("\n"));
+    assert_eq!(report.bundles_fetched, 2);
+}
+
+/// `git bundle unbundle` checks a bundle's prerequisites, as `git bundle
+/// verify` does, before it indexes the pack (git's `bundle.c`), so a
+/// restore runs it alone: one git process fewer per link of the chain.
+#[test]
+fn a_restore_runs_bundle_unbundle_alone() {
+    common::run_with_logged_git("restore_unbundle_child", LoggedGit::Plain).unwrap();
+}
+
+/// A link whose prerequisites the links below it do not hold fails the
+/// restore before anything is in place, now in `git bundle unbundle`.
+#[test]
+fn a_link_whose_prerequisites_the_chain_lacks_fails_the_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    one_commit_repo(&root).unwrap();
+    let mut store = store_in(dir.path()).unwrap();
+    let (first, _) = commit_and_capture(&mut store, &root, 0, None).unwrap();
+    let (second, _) = commit_and_capture(&mut store, &root, 1, Some(first)).unwrap();
+    let (_, third) = commit_and_capture(&mut store, &root, 2, Some(second)).unwrap();
+    // The third link needs the second's commits; this chain skips them.
+    let mut skipped = third.manifest.clone();
+    skipped.git.as_mut().unwrap().bundle_base = Some(first);
+    let skipped = store.publish(&skipped).unwrap();
+    let target = dir.path().join("restored");
+    let err = restore_into(&store, skipped, &target).unwrap_err();
+    assert!(
+        matches!(&err, RestoreError::Git(GitError::Failed { command, stderr, .. })
+            if command.starts_with("bundle unbundle") && stderr.contains("prerequisite")),
+        "{err}"
+    );
+    assert!(!target.exists());
+}
+
 #[test]
 fn names_git_would_unquote_or_trim_verify_after_restore() {
     let dir = tempfile::tempdir().unwrap();
@@ -2522,7 +2578,7 @@ fn a_config_file_the_repository_includes_counts_but_does_not_travel() {
 const GIT_RUNS: [(&str, usize); 3] = [
     ("first capture", 33),
     ("second capture", 35),
-    ("restore", 19),
+    ("restore", 17),
 ];
 
 /// The child half: runs with a `git` first on the `PATH` that logs each call.
