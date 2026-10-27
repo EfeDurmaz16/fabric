@@ -52,12 +52,17 @@ struct Backlog {
     dropped: AtomicU64,
 }
 
+/// How an answer, an event's included, becomes a frame: `frame::encode`
+/// for [`Answer`].
+pub(crate) type Framer = fn(&Answer) -> Result<Vec<u8>, FrameError>;
+
 /// The command's end of a client's event stream: each event framed as the
 /// socket carries it, sent only while the backlog has room for it.
 #[derive(Debug)]
 pub(crate) struct Live {
     frames: mpsc::UnboundedSender<Vec<u8>>,
     backlog: Arc<Backlog>,
+    frame: Framer,
 }
 
 /// The relay's end of a client's event stream.
@@ -67,14 +72,21 @@ pub(crate) struct Made {
     backlog: Arc<Backlog>,
 }
 
-/// A new event stream for one client.
-pub(crate) fn events() -> (Live, Made) {
+/// A new event stream for one client, its events framed with `frame`.
+///
+/// The relay passes the `frame::encode` it frames the final answer with,
+/// so the serializers of every answer are compiled once, beside the relay
+/// that also uses them, and not a second time into `Live::send`: a
+/// generic function is compiled again in each crate that calls it, and
+/// the daemon kept both copies of its code resident (M2-14).
+pub(crate) fn events(frame: Framer) -> (Live, Made) {
     let (frames, made) = mpsc::unbounded_channel();
     let backlog = Arc::new(Backlog::default());
     (
         Live {
             frames,
             backlog: Arc::clone(&backlog),
+            frame,
         },
         Made {
             frames: made,
@@ -89,7 +101,7 @@ impl Live {
     /// queued when none waits, so a client that reads gets every event
     /// that frames. Never waits.
     pub(crate) fn send(&self, event: Event) {
-        let frame = match frame::encode(&Answer::Event { event }) {
+        let frame = match (self.frame)(&Answer::Event { event }) {
             Ok(frame) => frame,
             // One event that cannot be framed, too large or holding a
             // path that is not UTF-8, is dropped; the client still gets
@@ -195,7 +207,7 @@ pub(crate) async fn serve(node: Arc<Node>, mut stream: UnixStream) {
 
 /// Runs `request`, writing each event the moment the client takes it, then the final answer.
 async fn run(node: Arc<Node>, request: Request, stream: UnixStream) {
-    let (live, made) = events();
+    let (live, made) = events(frame::encode::<Answer>);
     let command = async move { node.handle(request, Out::streaming(live)).await };
     relay(command, made, stream).await;
 }
@@ -432,7 +444,7 @@ mod tests {
             b"/home/\xff/fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/work".to_vec(),
         ));
         let (node_side, mut client) = UnixStream::pair().unwrap();
-        let (live, made) = events();
+        let (live, made) = events(frame::encode::<Answer>);
         let command = async move {
             let mut out = Out::streaming(live);
             out.emit(Event::StaleWorkspaceKept {
@@ -536,7 +548,7 @@ mod tests {
         for (made, read) in cases {
             let message = format!("refused at {}; run fabric job resume", bad.display());
             let (node_side, mut client) = UnixStream::pair().unwrap();
-            let (live, made_events) = events();
+            let (live, made_events) = events(frame::encode::<Answer>);
             let refusal = Refusal::new(made, message.clone());
             let command = async move {
                 drop(Out::streaming(live));
@@ -565,7 +577,7 @@ mod tests {
         // socket buffer holds on macOS or Linux.
         const EVENTS: usize = EVENT_BACKLOG / 1_200;
         let (node_side, mut client) = UnixStream::pair().unwrap();
-        let (live, made) = events();
+        let (live, made) = events(frame::encode::<Answer>);
         let (ended, command_ended) = oneshot::channel();
         let command = async move {
             let mut out = Out::streaming(live);
@@ -607,7 +619,7 @@ mod tests {
 
     /// A sink that streams to a client, and the end the relay reads.
     fn streaming() -> (Out, Made) {
-        let (live, made) = events();
+        let (live, made) = events(frame::encode::<Answer>);
         (Out::streaming(live), made)
     }
 
