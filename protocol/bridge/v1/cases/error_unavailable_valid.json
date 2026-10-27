@@ -1,0 +1,19 @@
+{
+  "case": "error_unavailable_valid",
+  "direction": "worker_to_fabric",
+  "phase": "session",
+  "expect": {
+    "outcome": "accept"
+  },
+  "message": {
+    "type": "error",
+    "request_id": "r-1",
+    "operation_id": "01K8W3A00000000000000000P1",
+    "error": {
+      "code": "unavailable",
+      "reason": "busy",
+      "message": "unavailable: busy",
+      "effect": "none"
+    }
+  }
+}

@@ -1,0 +1,203 @@
+{
+  "scenario": "shutdown_reports_unresolved",
+  "summary": "Shutdown drains within its bound and lists every unresolved request with its locator; nothing is reported destroyed.",
+  "profile": "fixture",
+  "provider_state": {
+    "binding": {
+      "account": "acct-a",
+      "project": "proj-1"
+    },
+    "policy": {
+      "images": [
+        "fixture/ok"
+      ],
+      "secrets": {
+        "allowed": [
+          "API_TOKEN",
+          "DB_URL"
+        ]
+      }
+    },
+    "approvals": [
+      {
+        "ref": "apr-destroy-1",
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-create-1",
+        "expired": false
+      },
+      {
+        "ref": "apr-expired-1",
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-create-1",
+        "expired": true
+      },
+      {
+        "ref": "apr-create-only",
+        "action": "sandbox.create",
+        "native_id": null,
+        "expired": false
+      }
+    ],
+    "sandboxes": [
+      {
+        "native_id": "fx-key-create-1",
+        "project": "proj-1",
+        "owner_job": "01K8W3A00000000000000000J1",
+        "status": "ready"
+      }
+    ],
+    "script": [
+      {
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-create-1",
+        "behavior": "stay_stopping_until_settle"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "send": {
+        "type": "request",
+        "request_id": "r-3",
+        "operation": {
+          "id": "01K8W3A00000000000000000P6",
+          "key": "key-destroy-2",
+          "digest": "2323232323232323232323232323232323232323232323232323232323232323"
+        },
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.destroy",
+        "target": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-create-1"
+        },
+        "params": {},
+        "approval": {
+          "ref": "apr-destroy-1"
+        },
+        "deadline_ms": 3000
+      }
+    },
+    {
+      "receive": {
+        "type": "error",
+        "request_id": "r-3",
+        "operation_id": "01K8W3A00000000000000000P6",
+        "error": {
+          "code": "pending",
+          "reason": "observation_deadline",
+          "message": "pending: observation_deadline",
+          "effect": "pending",
+          "resource": {
+            "provider": "fixture",
+            "scope": {
+              "account": "acct-a",
+              "project": "proj-1"
+            },
+            "kind": "sandbox",
+            "native_id": "fx-key-create-1"
+          },
+          "state": "stopping",
+          "observations": 3,
+          "deadline_ms": 3000
+        }
+      }
+    },
+    {
+      "provider_calls": 1
+    },
+    {
+      "send": {
+        "type": "observe",
+        "request_id": "r-4",
+        "operation_id": "01K8W3A00000000000000000P6",
+        "action": "sandbox.destroy",
+        "resource": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-create-1"
+        },
+        "wait_ms": 30000
+      }
+    },
+    {
+      "send": {
+        "type": "shutdown",
+        "request_id": "r-99",
+        "drain_ms": 2000
+      }
+    },
+    {
+      "receive": {
+        "type": "error",
+        "request_id": "r-4",
+        "operation_id": "01K8W3A00000000000000000P6",
+        "error": {
+          "code": "pending",
+          "reason": "shutting_down",
+          "message": "pending: shutting_down",
+          "effect": "pending",
+          "resource": {
+            "provider": "fixture",
+            "scope": {
+              "account": "acct-a",
+              "project": "proj-1"
+            },
+            "kind": "sandbox",
+            "native_id": "fx-key-create-1"
+          },
+          "state": "stopping",
+          "observations": 2,
+          "deadline_ms": 30000
+        }
+      }
+    },
+    {
+      "receive": {
+        "type": "shutdown_ack",
+        "request_id": "r-99",
+        "unresolved": [
+          {
+            "request_id": "r-4",
+            "operation_id": "01K8W3A00000000000000000P6",
+            "state": "pending",
+            "resource": {
+              "provider": "fixture",
+              "scope": {
+                "account": "acct-a",
+                "project": "proj-1"
+              },
+              "kind": "sandbox",
+              "native_id": "fx-key-create-1"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "worker_exit": 0
+    },
+    {
+      "provider_calls": 1
+    },
+    {
+      "journal": {
+        "operation_id": "01K8W3A00000000000000000P6",
+        "status": "dispatched"
+      }
+    }
+  ]
+}

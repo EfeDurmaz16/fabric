@@ -1,0 +1,19 @@
+{
+  "case": "hello_refused_valid",
+  "direction": "worker_to_fabric",
+  "phase": "handshake",
+  "expect": {
+    "outcome": "accept"
+  },
+  "message": {
+    "type": "hello_refused",
+    "versions": {
+      "min": 1,
+      "max": 1
+    },
+    "reason": {
+      "code": "unsupported_version",
+      "message": "worker speaks bridge protocol 1 to 1"
+    }
+  }
+}

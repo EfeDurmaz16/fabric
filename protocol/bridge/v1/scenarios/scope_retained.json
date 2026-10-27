@@ -1,0 +1,165 @@
+{
+  "scenario": "scope_retained",
+  "summary": "The same native id under another project, or a resource another job created, is refused before any effect.",
+  "profile": "fixture",
+  "provider_state": {
+    "binding": {
+      "account": "acct-a",
+      "project": "proj-1"
+    },
+    "policy": {
+      "images": [
+        "fixture/ok"
+      ],
+      "secrets": {
+        "allowed": [
+          "API_TOKEN",
+          "DB_URL"
+        ]
+      }
+    },
+    "approvals": [
+      {
+        "ref": "apr-destroy-1",
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-create-1",
+        "expired": false
+      },
+      {
+        "ref": "apr-expired-1",
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-create-1",
+        "expired": true
+      },
+      {
+        "ref": "apr-create-only",
+        "action": "sandbox.create",
+        "native_id": null,
+        "expired": false
+      }
+    ],
+    "sandboxes": [
+      {
+        "native_id": "fx-key-create-1",
+        "project": "proj-1",
+        "owner_job": "01K8W3A00000000000000000J1",
+        "status": "ready"
+      }
+    ],
+    "script": []
+  },
+  "steps": [
+    {
+      "send": {
+        "type": "request",
+        "request_id": "r-1",
+        "operation": {
+          "id": "01K8W3A0000000000000000P12",
+          "key": "key-scope-1",
+          "digest": "2929292929292929292929292929292929292929292929292929292929292929"
+        },
+        "scope": {
+          "job": "01K8W3A00000000000000000J1",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.exec",
+        "target": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-2"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-create-1"
+        },
+        "params": {
+          "argv": [
+            "echo",
+            "hi"
+          ],
+          "stdin": null,
+          "cwd": null,
+          "timeout_ms": 10000,
+          "max_output_bytes": 65536,
+          "secret_names": []
+        },
+        "approval": null,
+        "deadline_ms": 30000
+      }
+    },
+    {
+      "receive": {
+        "type": "error",
+        "request_id": "r-1",
+        "operation_id": "01K8W3A0000000000000000P12",
+        "error": {
+          "code": "denied",
+          "reason": "scope_mismatch",
+          "message": "denied: scope_mismatch",
+          "effect": "none"
+        }
+      }
+    },
+    {
+      "provider_calls": 0
+    },
+    {
+      "send": {
+        "type": "request",
+        "request_id": "r-2",
+        "operation": {
+          "id": "01K8W3A0000000000000000P13",
+          "key": "key-owner-1",
+          "digest": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
+        },
+        "scope": {
+          "job": "01K8W3A00000000000000000J2",
+          "task": "01K8W3A00000000000000000T1",
+          "attempt": "01K8W3A00000000000000000A1",
+          "generation": "1"
+        },
+        "action": "sandbox.exec",
+        "target": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-create-1"
+        },
+        "params": {
+          "argv": [
+            "echo",
+            "hi"
+          ],
+          "stdin": null,
+          "cwd": null,
+          "timeout_ms": 10000,
+          "max_output_bytes": 65536,
+          "secret_names": []
+        },
+        "approval": null,
+        "deadline_ms": 30000
+      }
+    },
+    {
+      "receive": {
+        "type": "error",
+        "request_id": "r-2",
+        "operation_id": "01K8W3A0000000000000000P13",
+        "error": {
+          "code": "denied",
+          "reason": "owner_mismatch",
+          "message": "denied: owner_mismatch",
+          "effect": "none"
+        }
+      }
+    },
+    {
+      "provider_calls": 0
+    }
+  ]
+}

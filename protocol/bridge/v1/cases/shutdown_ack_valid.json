@@ -1,0 +1,28 @@
+{
+  "case": "shutdown_ack_valid",
+  "direction": "worker_to_fabric",
+  "phase": "session",
+  "expect": {
+    "outcome": "accept"
+  },
+  "message": {
+    "type": "shutdown_ack",
+    "request_id": "r-99",
+    "unresolved": [
+      {
+        "request_id": "r-3",
+        "operation_id": "01K8W3A00000000000000000P3",
+        "state": "pending",
+        "resource": {
+          "provider": "fixture",
+          "scope": {
+            "account": "acct-a",
+            "project": "proj-1"
+          },
+          "kind": "sandbox",
+          "native_id": "fx-key-create-1"
+        }
+      }
+    ]
+  }
+}

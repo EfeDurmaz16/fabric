@@ -1,0 +1,34 @@
+{
+  "case": "request_before_hello",
+  "direction": "fabric_to_worker",
+  "phase": "handshake",
+  "expect": {
+    "outcome": "reject",
+    "code": "protocol_error",
+    "reason": "unexpected"
+  },
+  "message": {
+    "type": "request",
+    "request_id": "r-1",
+    "operation": {
+      "id": "01K8W3A00000000000000000P1",
+      "key": "key-create-1",
+      "digest": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "scope": {
+      "job": "01K8W3A00000000000000000J1",
+      "task": "01K8W3A00000000000000000T1",
+      "attempt": "01K8W3A00000000000000000A1",
+      "generation": "1"
+    },
+    "action": "sandbox.create",
+    "params": {
+      "image": "fixture/ok",
+      "env": {},
+      "secret_names": [],
+      "labels": {}
+    },
+    "approval": null,
+    "deadline_ms": 30000
+  }
+}

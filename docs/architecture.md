@@ -37,6 +37,7 @@ sdk/
   typescript       the TypeScript client of the client API, tested against the same fixtures as fabric-client
 protocol/
   fixtures         one JSON example of every client API message, read by the Rust and TypeScript contract tests
+  bridge/v1        golden fixtures of the Capsule provider bridge, protocol v1 (ADR 0021, docs/bridge-protocol.md), copied byte for byte into Capsule
 ```
 
 Every crate above exists. Carry keys and doctor facts live in `fabricd`, which measures them, rather than in `fabric-env` (ADR 0016). Dependency direction is strictly downward: `fabric` depends on everything, `fabric-core` depends on nothing in the workspace. Today `fabric-core` defines one trait, `LedgerStore`, and `BoxFuture`, the return type of every dynamically dispatched trait, defined once. `fabric-net` defines `Transport`, the interface of one wire, because its byte streams are tokio types the core does not depend on; `fabricd` holds an `Endpoint`, which binds both wires on one port and is the place an iroh endpoint would replace (ADR 0013). `fabric-client` depends on `fabric-core` alone, so a program can speak to a node without the node's crates; `fabricd` serves its types and `fabric` calls through it (ADR 0018). The `Harness` trait lives in `fabric-harness` for now, because its launch handle owns a child process and the core stays pure (ADR 0015). Nothing in the core knows about QUIC, SQLite or any agent vendor.

@@ -1,0 +1,24 @@
+{
+  "case": "progress_valid",
+  "direction": "worker_to_fabric",
+  "phase": "session",
+  "expect": {
+    "outcome": "accept"
+  },
+  "message": {
+    "type": "progress",
+    "request_id": "r-2",
+    "operation_id": "01K8W3A00000000000000000P2",
+    "seq": 1,
+    "state": "running",
+    "resource": {
+      "provider": "fixture",
+      "scope": {
+        "account": "acct-a",
+        "project": "proj-1"
+      },
+      "kind": "sandbox",
+      "native_id": "fx-key-create-1"
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "case": "frame_at_cap_header",
+  "direction": "worker_to_fabric",
+  "phase": "session",
+  "hex": "00000001",
+  "expect": {
+    "outcome": "reject",
+    "code": "truncated",
+    "read_body": true
+  }
+}

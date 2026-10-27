@@ -1,0 +1,31 @@
+{
+  "case": "error_pending_valid",
+  "direction": "worker_to_fabric",
+  "phase": "session",
+  "expect": {
+    "outcome": "accept"
+  },
+  "message": {
+    "type": "error",
+    "request_id": "r-3",
+    "operation_id": "01K8W3A00000000000000000P6",
+    "error": {
+      "code": "pending",
+      "reason": "observation_deadline",
+      "message": "pending: observation_deadline",
+      "effect": "pending",
+      "resource": {
+        "provider": "fixture",
+        "scope": {
+          "account": "acct-a",
+          "project": "proj-1"
+        },
+        "kind": "sandbox",
+        "native_id": "fx-key-create-1"
+      },
+      "state": "stopping",
+      "observations": 3,
+      "deadline_ms": 3000
+    }
+  }
+}

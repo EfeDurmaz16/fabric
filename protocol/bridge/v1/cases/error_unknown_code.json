@@ -1,0 +1,21 @@
+{
+  "case": "error_unknown_code",
+  "direction": "worker_to_fabric",
+  "phase": "session",
+  "expect": {
+    "outcome": "reject",
+    "code": "protocol_violation",
+    "reason": "unknown_variant"
+  },
+  "message": {
+    "type": "error",
+    "request_id": "r-1",
+    "operation_id": "01K8W3A00000000000000000P1",
+    "error": {
+      "code": "retry_later",
+      "reason": "x",
+      "message": "retry_later: x",
+      "effect": "none"
+    }
+  }
+}
