@@ -107,8 +107,14 @@ test's `bin` (`FABRIC_SYSTEM_TOOLS`), where the budget counts them.
 `crates/fabric/tests/e2e/budget.toml` holds the limits: the ratio, the
 grace, the runs per batch, each platform's baselines, the exact process
 counts, and the `[[change]]` entries that record why the budget changed. CI
-runs it after the end-to-end step on both runners and writes its table to
-the step summary.
+runs it after the end-to-end step on both runners with
+`FABRIC_BUDGET=enforce` and writes its table to the step summary. The Linux
+runner is held to the `linux-x86_64` baselines. The macOS runner is not the
+Mac of the `macos-aarch64` baselines, and runs of one commit there differ by
+up to 1.34 times, more than the ratio, so it sets
+`FABRIC_BUDGET_PLATFORM=macos-aarch64-github`, a platform with no
+baselines: its times only report, and its process counts are held as
+everywhere.
 
 Run it on a quiet machine, since it measures wall time. It takes a few
 minutes:

@@ -187,9 +187,45 @@ impl Mode {
     }
 }
 
-/// This platform as `budget.toml` names it, such as `macos-aarch64`.
+/// This platform as `budget.toml` names it: `FABRIC_BUDGET_PLATFORM` when
+/// it is set and not empty, else the OS and architecture, such as
+/// `macos-aarch64`. CI names its macOS runner `macos-aarch64-github`,
+/// which has no baselines, since it is not the Mac that timed those of
+/// `macos-aarch64`.
 fn platform() -> String {
-    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+    platform_named(std::env::var("FABRIC_BUDGET_PLATFORM").ok())
+}
+
+/// The platform `named`, or this machine's OS and architecture when it is
+/// unnamed or empty.
+fn platform_named(named: Option<String>) -> String {
+    named
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH))
+}
+
+/// The CPU and its core count, for the report: a CI runner of another
+/// kind explains a time no change of the code made.
+fn machine() -> String {
+    let cores = std::thread::available_parallelism().map_or(0, std::num::NonZero::get);
+    let linux = fs::read_to_string("/proc/cpuinfo").ok().and_then(|info| {
+        info.lines().find_map(|line| {
+            let (key, name) = line.split_once(':')?;
+            (key.trim() == "model name").then(|| name.trim().to_owned())
+        })
+    });
+    let cpu = linux
+        .or_else(|| {
+            let out = std::process::Command::new("sysctl")
+                .args(["-n", "machdep.cpu.brand_string"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())?;
+            Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        })
+        .filter(|cpu| !cpu.is_empty())
+        .unwrap_or_else(|| "an unknown CPU".to_owned());
+    format!("{cpu}, {cores} cores")
 }
 
 /// What `budget.toml` holds for this platform.
@@ -642,11 +678,12 @@ fn report(budget: &Budget, mode: Mode, rows: &[Row]) -> String {
     let platform = platform();
     let mut out = format!(
         "### Time budget, {platform}, {}\n\n\
-         Times in ms: the {}th percentile of {} timed runs, the median, and the {}th \
+         On {}. Times in ms: the {}th percentile of {} timed runs, the median, and the {}th \
          percentile of a second batch when the first was over the limit in enforce mode. \
          The limit is the larger of {} x baseline and baseline + {} ms. Processes are the \
          starts of each counted program in each of the {COUNTED_RUNS} warm-up runs.\n\n",
         mode.name(),
+        machine(),
         budget.percentile,
         budget.reps,
         budget.percentile,
@@ -656,7 +693,7 @@ fn report(budget: &Budget, mode: Mode, rows: &[Row]) -> String {
     if budget.baseline.is_empty() {
         let _ = writeln!(
             out,
-            "budget.toml has no baselines for {platform} yet, so its times are only reported.\n"
+            "budget.toml has no baselines for {platform}, so its times are only reported.\n"
         );
     }
     let p = budget.percentile;
@@ -752,6 +789,37 @@ fn every_op_has_a_baseline_on_linux_and_macos() -> Fallible {
         );
     }
     Ok(())
+}
+
+/// CI holds every runner to the budget: the step that runs `hot_paths`
+/// enforces it, where it once only reported (M2-25). A runner with no
+/// baselines, as CI's macOS one, still only reports its times, and its
+/// process counts fail in both modes.
+#[test]
+fn ci_enforces_the_budget() -> Fallible {
+    let ci = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../.github/workflows/ci.yml"
+    ))?;
+    let modes: Vec<&str> = ci
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("FABRIC_BUDGET:"))
+        .map(str::trim)
+        .collect();
+    assert_eq!(modes, ["enforce"], "the FABRIC_BUDGET of ci.yml");
+    Ok(())
+}
+
+/// `FABRIC_BUDGET_PLATFORM` names the platform when it is set and not empty.
+#[test]
+fn a_named_platform_replaces_this_machines() {
+    let here = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    assert_eq!(platform_named(None), here);
+    assert_eq!(platform_named(Some(String::new())), here);
+    assert_eq!(
+        platform_named(Some("macos-aarch64-github".to_owned())),
+        "macos-aarch64-github"
+    );
 }
 
 /// The rules on a made-up budget: the limit is the larger of the ratio and
