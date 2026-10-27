@@ -257,6 +257,65 @@ fn a_lockfile_changed_since_the_install_installs_again() {
     assert_eq!(changed.steps().len(), 1);
 }
 
+/// ENV-1: the sentinel proves the recipe that filled the cache, not the
+/// whole spec, so a change that does not touch the steps filling a cache,
+/// such as a declared variable, leaves it warm, while an added argument
+/// makes it stale.
+#[test]
+fn only_a_change_to_the_steps_that_fill_a_cache_makes_it_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let recipe = "[[cache]]\npath = \"out\"\nclass = \"build\"\n\n[[setup]]\nprogram = \"sh\"\nargs = [\"-c\", \"mkdir -p out && echo 1 > out/v\"]\n";
+    let first = declared(dir.path(), recipe).unwrap();
+    write(dir.path(), &[("out/v", "1\n")]).unwrap();
+    seal(&first, "out").unwrap();
+    assert!(dry_run(&first).unwrap().is_noop());
+
+    let with_variable = declared(dir.path(), &format!("env = [\"HOME\"]\n{recipe}")).unwrap();
+    assert_ne!(
+        with_variable.spec().id().unwrap(),
+        first.spec().id().unwrap()
+    );
+    assert_eq!(
+        dry_run(&with_variable).unwrap().caches()[0].health,
+        CacheHealth::Healthy
+    );
+
+    let more_args = declared(dir.path(), &recipe.replace("echo 1", "echo 1 2")).unwrap();
+    let changed = dry_run(&more_args).unwrap();
+    assert_eq!(changed.caches()[0].health, CacheHealth::Stale);
+    assert_eq!(changed.steps().len(), 1);
+}
+
+/// A sentinel an older Fabric wrote holds the input digest alone, and
+/// proves nothing about the steps, so the cache is filled once more.
+#[test]
+fn a_sentinel_without_the_steps_digest_is_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        &[
+            ("package.json", PACKAGE_JSON),
+            ("package-lock.json", r#"{"lockfileVersion":3}"#),
+            ("node_modules/a/package.json", "{}"),
+        ],
+    )
+    .unwrap();
+    let detected = detect(dir.path(), &[]).unwrap();
+    let current = sentinel_text(&detected, &RelPath::parse("node_modules").unwrap()).unwrap();
+    let legacy: String = current
+        .split_inclusive('\n')
+        .filter(|line| !line.starts_with("steps "))
+        .collect();
+    assert_ne!(legacy, current);
+    fs::write(dir.path().join("node_modules").join(SENTINEL), legacy).unwrap();
+    assert_eq!(
+        dry_run(&detected).unwrap().caches()[0].health,
+        CacheHealth::Stale
+    );
+    seal(&detected, "node_modules").unwrap();
+    assert!(dry_run(&detected).unwrap().is_noop());
+}
+
 /// One row per rule: a cache a step fills needs the sentinel, whatever
 /// else its installer left there; a cache no step fills needs content.
 /// A row whose cache is sealed has the sentinel a finished install leaves.

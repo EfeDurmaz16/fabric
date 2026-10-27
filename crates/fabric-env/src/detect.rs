@@ -717,6 +717,8 @@ pub struct Detection {
     caches: Vec<CachePath>,
     /// One digest per cache, in the same order: the files the steps of its ecosystem read (`Inputs`).
     inputs: Vec<blake3::Hash>,
+    /// One digest per cache, in the same order: the steps that fill it (`recipe_digest`).
+    recipes: Vec<blake3::Hash>,
     /// One list per cache, in the same order: the names of the files its digest covers (`Inputs::of`).
     input_files: Vec<Vec<&'static str>>,
     pins: Vec<Pin>,
@@ -753,6 +755,18 @@ impl Detection {
     /// Returns each cache with the digest of the files its setup steps read, which its sentinel records.
     pub(crate) fn caches_with_inputs(&self) -> impl Iterator<Item = (&CachePath, &blake3::Hash)> {
         self.caches.iter().zip(&self.inputs)
+    }
+
+    /// Returns each cache with what its sentinel proves: the digest of
+    /// the files its steps read and the digest of the steps themselves.
+    pub(crate) fn caches_with_proof(
+        &self,
+    ) -> impl Iterator<Item = (&CachePath, &blake3::Hash, &blake3::Hash)> {
+        self.caches
+            .iter()
+            .zip(&self.inputs)
+            .zip(&self.recipes)
+            .map(|((cache, inputs), recipe)| (cache, inputs, recipe))
     }
 
     /// Returns the names of the files at the root whose digest proves the
@@ -877,7 +891,8 @@ pub fn detect(root: &Path, recorded: &[SecretPattern]) -> Result<Detection, Dete
             .map(|step| FoundStep::new(step.clone(), StepScope::Declared))
             .collect();
     }
-    let step_cleared = setup.iter().map(|found| found.cleared).collect();
+    let step_cleared: Vec<&'static [&'static str]> =
+        setup.iter().map(|found| found.cleared).collect();
     let (setup, step_scopes): (Vec<SetupStep>, Vec<StepScope>) = setup
         .into_iter()
         .map(|found| (found.step, found.scope))
@@ -890,6 +905,10 @@ pub fn detect(root: &Path, recorded: &[SecretPattern]) -> Result<Detection, Dete
         .iter()
         .enumerate()
         .map(|(index, scope)| scope.gate(index, &caches))
+        .collect();
+    let recipes = caches
+        .iter()
+        .map(|cache| recipe_digest(&setup, &step_cleared, cache.completion.filled_by()))
         .collect();
 
     let spec = EnvSpec {
@@ -908,11 +927,55 @@ pub fn detect(root: &Path, recorded: &[SecretPattern]) -> Result<Detection, Dete
         step_cleared,
         caches,
         inputs: cache_inputs,
+        recipes,
         input_files,
         pins,
         node_manager,
         devcontainer: find_devcontainer(&reader)?,
     })
+}
+
+/// Returns the digest of the steps at `filled_by`, in that order: what
+/// each runs, with which arguments, where, and without which variables.
+///
+/// A cache's sentinel records it, so a cache filled by one recipe is not
+/// proof for another: a changed argument, program or directory, or a step
+/// added to or removed from those that fill the cache, leaves it stale
+/// even when no file the steps read changed. When a step runs is not
+/// part of it, since that changes nothing the step writes. Every field is
+/// length-prefixed, so two different recipes never hash the same bytes.
+fn recipe_digest(
+    setup: &[SetupStep],
+    cleared: &[&'static [&'static str]],
+    filled_by: &[usize],
+) -> blake3::Hash {
+    fn field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    let mut hasher = blake3::Hasher::new();
+    field(&mut hasher, b"fabric setup recipe v1");
+    for &index in filled_by {
+        let Some(step) = setup.get(index) else {
+            continue;
+        };
+        field(&mut hasher, b"step");
+        field(&mut hasher, step.program.as_str().as_bytes());
+        hasher.update(&(step.args.len() as u64).to_le_bytes());
+        for arg in &step.args {
+            field(&mut hasher, arg.as_str().as_bytes());
+        }
+        field(
+            &mut hasher,
+            step.cwd.as_ref().map_or("", RelPath::as_str).as_bytes(),
+        );
+        let without = cleared.get(index).copied().unwrap_or_default();
+        hasher.update(&(without.len() as u64).to_le_bytes());
+        for name in without {
+            field(&mut hasher, name.as_bytes());
+        }
+    }
+    hasher.finalize()
 }
 
 /// Adds the declared caches to the detected ones, giving each the ecosystem that makes it.

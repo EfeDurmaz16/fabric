@@ -54,7 +54,6 @@ args = ["-c", "mkdir -p out && echo v1 > out/version"]
 /// ENV-1: a cache filled by the v1 recipe is not proof for the v2 recipe;
 /// the next plan runs the changed step and the cache holds its output.
 #[test]
-#[ignore = "ENV-1: expected failure until fixed"]
 fn a_changed_setup_recipe_fills_its_cache_again() {
     let dir = tempfile::tempdir().unwrap();
     let lock = take_lock(dir.path()).unwrap();
