@@ -90,6 +90,14 @@ const LIST_BUDGET: usize = fabric_client::frame::MAX_FRAME / 2;
 /// How many times a move asks again after a lost answer before it reports the move frozen.
 const MOVE_TRIES: usize = 5;
 
+/// What a push sent: the whole ledger, or the records after the last one
+/// the peer accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pushed {
+    Whole,
+    Suffix,
+}
+
 /// One answer in the offer loop: to the offer itself, or to a later `MoveStatus`.
 #[derive(Debug)]
 enum Asked {
@@ -1280,21 +1288,73 @@ impl Node {
         }
     }
 
-    /// Sends the whole ledger to `peer` page by page; the peer keeps what it lacks
+    /// Sends the ledger to `peer` page by page; the peer keeps what it lacks
     /// and fetches the latest snapshot before it answers the last page.
+    ///
+    /// Only the records after the last one `peer` accepted from this node
+    /// are sent, and at least the head (M2-18): the peer holds the rest,
+    /// since a record it accepted is durable there. A push that sent only
+    /// those and was not answered with an acceptance is sent again whole,
+    /// as one is the first time since this node started, so a peer that
+    /// lost the job converges as before.
     pub(crate) async fn push_records(
         self: &Arc<Self>,
         id: JobId,
         peer: NodeId,
     ) -> Result<(), NodeError> {
-        let (records, epoch) = {
-            let job = self.job(id).await?;
+        match self.push_unsent(id, peer).await {
+            Ok(_) => Ok(()),
+            Err((Pushed::Suffix, e)) if !matches!(e, NodeError::Unreachable { .. }) => {
+                tracing::info!(job = %id, %peer, error = %e, "a push of the new records failed; pushing the whole ledger");
+                match self.push_unsent(id, peer).await {
+                    Ok(_) => Ok(()),
+                    Err((_, e)) => Err(e),
+                }
+            }
+            Err((_, e)) => Err(e),
+        }
+    }
+
+    /// One push of what `peer` has not accepted; says whether it sent the
+    /// whole ledger, with or without its error. Any answer but an
+    /// acceptance forgets what the peer accepted, so the next push sends
+    /// the whole ledger.
+    async fn push_unsent(
+        self: &Arc<Self>,
+        id: JobId,
+        peer: NodeId,
+    ) -> Result<Pushed, (Pushed, NodeError)> {
+        let (records, epoch, pushed) = {
+            let job = self.job(id).await.map_err(|e| (Pushed::Whole, e))?;
             let job = job.lock().await;
-            (
-                job.ledger().records().to_vec(),
-                job.ledger().lease().epoch(),
-            )
+            let unsent = job.unsent(peer);
+            let pushed = if unsent.len() == job.ledger().records().len() {
+                Pushed::Whole
+            } else {
+                Pushed::Suffix
+            };
+            (unsent.to_vec(), job.ledger().lease().epoch(), pushed)
         };
+        let last = records.last().map(fabric_core::ledger::Record::hash);
+        let sent = self.send_pages(id, peer, epoch, records).await;
+        if let Ok(job) = self.job(id).await {
+            let mut job = job.lock().await;
+            match (&sent, last) {
+                (Ok(()), Some(last)) => job.acked_by(peer, last),
+                _ => job.forget_acked(peer),
+            }
+        }
+        sent.map(|()| pushed).map_err(|e| (pushed, e))
+    }
+
+    /// Sends `records` to `peer` in pages, at `epoch`.
+    async fn send_pages(
+        self: &Arc<Self>,
+        id: JobId,
+        peer: NodeId,
+        epoch: Epoch,
+        records: Vec<fabric_core::ledger::Record>,
+    ) -> Result<(), NodeError> {
         let token = FencingToken { job_id: id, epoch };
         let mut pages: Vec<RecordPage> = Vec::new();
         for record in records {
@@ -8152,6 +8212,17 @@ pub(crate) mod tests {
             times.push(started.elapsed());
         }
         times.sort();
+        let sent: usize = a
+            .job(id)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .unsent(b.id)
+            .iter()
+            .map(|record| record.bytes().len())
+            .sum();
+        eprintln!("bench_replicating_a_long_ledger: a push now sends {sent} bytes");
         let held = b
             .job(id)
             .await
@@ -8178,6 +8249,91 @@ pub(crate) mod tests {
             times[0],
             times[times.len() - 1]
         );
+    }
+
+    /// A push sends the records after the last one the peer accepted
+    /// from this node, and a peer that lost the job gets it whole again,
+    /// so replication converges as when every push sent the whole ledger
+    /// (M2-18).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_push_sends_what_the_peer_lacks_and_the_whole_ledger_to_a_peer_that_lost_it() {
+        let (dir_a, a) = node();
+        let (_dir_b, b) = node();
+        paired(&a, &b).await;
+        let id = job(dir_a.path(), &a).await;
+        let noted = |text: &str| EventKind::Note {
+            text: text.to_owned(),
+        };
+        let unsent = |a: &Arc<Node>| {
+            let a = Arc::clone(a);
+            let peer = b.id;
+            async move { a.job(id).await.unwrap().lock().await.unsent(peer).len() }
+        };
+        let held = a
+            .job(id)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .ledger()
+            .records()
+            .len();
+        assert_eq!(
+            unsent(&a).await,
+            held,
+            "a first push sends the whole ledger"
+        );
+        a.push_records(id, b.id).await.unwrap();
+        assert_eq!(
+            unsent(&a).await,
+            1,
+            "an accepted push leaves only the head to send"
+        );
+        for text in ["one", "two"] {
+            a.job(id)
+                .await
+                .unwrap()
+                .lock()
+                .await
+                .append(a.id, noted(text))
+                .unwrap();
+        }
+        assert_eq!(unsent(&a).await, 2);
+        a.push_records(id, b.id).await.unwrap();
+        let heads = |node: &Arc<Node>| {
+            let node = Arc::clone(node);
+            async move { node.job(id).await.unwrap().lock().await.ledger().head() }
+        };
+        assert_eq!(heads(&b).await, heads(&a).await);
+
+        // The peer loses the job: the push of the new record alone cannot
+        // make it there, so the whole ledger goes.
+        let dir = b.job(id).await.unwrap().lock().await.dir().dir().to_owned();
+        b.jobs.lock().await.remove(&id);
+        std::fs::remove_dir_all(&dir).unwrap();
+        a.job(id)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .append(a.id, noted("three"))
+            .unwrap();
+        a.push_records(id, b.id).await.unwrap();
+        assert_eq!(heads(&b).await, heads(&a).await);
+        let records = |node: &Arc<Node>| {
+            let node = Arc::clone(node);
+            async move {
+                node.job(id)
+                    .await
+                    .unwrap()
+                    .lock()
+                    .await
+                    .ledger()
+                    .records()
+                    .len()
+            }
+        };
+        assert_eq!(records(&b).await, records(&a).await);
     }
 
     /// The tools a move or a pull leaves out, those of a harness other

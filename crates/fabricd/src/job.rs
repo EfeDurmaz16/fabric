@@ -43,6 +43,10 @@ pub struct Job {
     marker: Kept<Marker>,
     harness: Kept<HarnessRecord>,
     forked: Kept<ForkRecord>,
+    /// Per peer, the last record of this ledger the peer accepted in a
+    /// push from this node, so the next push sends only what follows it
+    /// (M2-18). In memory only: a restart sends the whole ledger again.
+    acked: std::collections::BTreeMap<NodeId, RecordHash>,
 }
 
 /// A node-local file kept in memory after its first read.
@@ -154,6 +158,7 @@ impl Job {
             marker: Kept::default(),
             harness: Kept::default(),
             forked: Kept::default(),
+            acked: std::collections::BTreeMap::new(),
         })
     }
 
@@ -213,6 +218,7 @@ impl Job {
             marker: Kept::default(),
             harness: Kept::default(),
             forked: Kept::default(),
+            acked: std::collections::BTreeMap::new(),
         })
     }
 
@@ -271,6 +277,35 @@ impl Job {
             Err(e) => return Err(e.into()),
         }
         Ok(true)
+    }
+
+    /// The records a push to `peer` sends: those after the last one the
+    /// peer accepted from this node, and at least the head, so the peer
+    /// still checks it holds the latest snapshot and settles; the whole
+    /// ledger when no push to `peer` was accepted since this node started,
+    /// or when that record is no longer in the chain.
+    #[must_use]
+    pub fn unsent(&self, peer: NodeId) -> &[Record] {
+        let records = self.ledger.records();
+        match self
+            .acked
+            .get(&peer)
+            .and_then(|head| self.ledger.position(*head))
+        {
+            Some(at) => &records[(at + 1).min(records.len() - 1)..],
+            None => records,
+        }
+    }
+
+    /// Notes that `peer` accepted a push whose last record was `head`.
+    pub fn acked_by(&mut self, peer: NodeId, head: RecordHash) {
+        self.acked.insert(peer, head);
+    }
+
+    /// Forgets what `peer` accepted, after a push it refused or did not
+    /// answer, so the next push sends the whole ledger.
+    pub fn forget_acked(&mut self, peer: NodeId) {
+        self.acked.remove(&peer);
     }
 
     /// How this node relates to the lease.
