@@ -42,7 +42,7 @@ use crate::world::{Env, Fallible, Node, Wire, edit, pair, write_executable};
 const BUDGET: &str = include_str!("budget.toml");
 
 /// How long every fake probed program waits before it answers, in seconds.
-pub(crate) const PROBE_DELAY: &str = "0.05";
+const PROBE_DELAY: &str = "0.05";
 
 /// The programs counted: each is a wrapper while the warm-up runs.
 const COUNTED: [&str; 5] = ["git", "kill", "lsof", "pgrep", "ps"];
@@ -67,7 +67,7 @@ const SYSTEM: [(&str, &[&str]); 4] = [
 /// shell its fake runs after the delay. A probe added there needs its fake
 /// here, or it runs whatever the machine has. `defaults` finds no setting,
 /// as on a Mac that never turned iCloud Drive on.
-pub(crate) const PROBED: [(&str, &str); 13] = [
+const PROBED: [(&str, &str); 13] = [
     ("id", "echo fabric"),
     ("sw_vers", "echo 26.0"),
     ("xcrun", "echo 26.0"),
@@ -91,6 +91,33 @@ pub(crate) const PROBED: [(&str, &str); 13] = [
     ("uv", "echo 'uv 0.9.0'"),
     ("defaults", "exit 1"),
 ];
+
+/// Puts in the test's `bin` the fake Claude and Codex and a fake of every
+/// program the node's facts probe but git, each answering after
+/// `PROBE_DELAY`, as the fakes of the harnesses do too, and leaves Claude's
+/// session registry empty, so no claude writes the session. The budget,
+/// the bench and the A/B bench run on this.
+pub(crate) fn install_fakes(env: &Env) -> Fallible {
+    env.install_fake_claude()?;
+    env.install_fake_codex()?;
+    for (program, answer) in PROBED {
+        env.install(
+            program,
+            &format!("#!/bin/sh\nsleep {PROBE_DELAY}\n{answer}\n"),
+        )?;
+    }
+    for harness in ["claude", "codex"] {
+        let path = env.bin().join(harness);
+        let script = fs::read_to_string(&path)?;
+        let (shebang, rest) = script.split_once('\n').ok_or("an empty fake")?;
+        write_executable(
+            &path,
+            format!("{shebang}\nsleep {PROBE_DELAY}\n{rest}").as_bytes(),
+        )?;
+    }
+    fs::create_dir_all(env.home.join(".claude/sessions"))?;
+    Ok(())
+}
 
 /// A job shape: the harness its job runs under.
 struct Shape {
@@ -416,25 +443,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Fallible<Self> {
         let env = Env::new()?;
-        env.install_fake_claude()?;
-        env.install_fake_codex()?;
-        for (program, answer) in PROBED {
-            env.install(
-                program,
-                &format!("#!/bin/sh\nsleep {PROBE_DELAY}\n{answer}\n"),
-            )?;
-        }
-        for harness in ["claude", "codex"] {
-            let path = env.bin().join(harness);
-            let script = fs::read_to_string(&path)?;
-            let (shebang, rest) = script.split_once('\n').ok_or("an empty fake")?;
-            write_executable(
-                &path,
-                format!("{shebang}\nsleep {PROBE_DELAY}\n{rest}").as_bytes(),
-            )?;
-        }
-        // An empty session registry: no claude writes the session.
-        fs::create_dir_all(env.home.join(".claude/sessions"))?;
+        install_fakes(&env)?;
         let counter = Counter::new(&env)?;
         let mut a = Node::new(&env, "a", Wire::Quic)?;
         let mut b = Node::new(&env, "b", Wire::Quic)?;
