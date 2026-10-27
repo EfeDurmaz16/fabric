@@ -41,14 +41,14 @@ use fabric_core::harness::HarnessKind;
 use fabric_core::id::{EnvSpecId, JobId, NodeId};
 use fabric_core::session::SessionId;
 use fabric_env::materialize::{CacheHealth, MaterializeError, NodeEnv, TreeLock};
-use fabric_harness::claude::{ClaudeCode, LeftReason, TrustOutcome};
+use fabric_harness::claude::{ClaudeCode, LeftReason, TrustOutcome, VersionAhead};
 use fabric_harness::codex::Codex;
 use fabric_harness::{
     Harness, Launch, LaunchSettings, Origin, PassedSetting, Running, TurnEvent, TurnFeed,
     TurnReport,
 };
 use fabric_net::endpoint::DialOrder;
-use fabricd::harnesses::{HarnessEnv, acp_adapter, parse_harness};
+use fabricd::harnesses::{HarnessConfig, HarnessEnv, acp_adapter, parse_harness};
 use fabricd::node::{Node, NodeConfig};
 use fabricd::paths::{STATE_DIR_ENV, StateDir};
 use fabricd::tool_env::ToolEnv;
@@ -384,8 +384,23 @@ impl Printer {
 /// Sends a request, printing each event as it arrives and then the reply;
 /// a refusal becomes an error.
 async fn ask(client: &Client, request: &Request, notes: Notes) -> Result<Reply> {
+    ask_watching(client, request, notes, |_| {}).await
+}
+
+/// `ask`, handing each event to `watch` as well, before it is printed.
+async fn ask_watching(
+    client: &Client,
+    request: &Request,
+    notes: Notes,
+    mut watch: impl FnMut(&Event),
+) -> Result<Reply> {
     let mut printer = Printer::new(notes);
-    let answered = client.call(request, |event| printer.print(&event)).await;
+    let answered = client
+        .call(request, |event| {
+            watch(&event);
+            printer.print(&event);
+        })
+        .await;
     printer.finish()?;
     let reply = answered.map_err(Refused::from_client)?;
     notes.print(&render::reply(&reply))?;
@@ -531,9 +546,12 @@ async fn serve(state: StateDir, home: PathBuf, args: ServeArgs) -> Result<ExitCo
 async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitCode> {
     let client = client(state);
     let (request, mode, yes) = job_request(command)?;
-    let (Reply::JobRun(plan) | Reply::JobResume(plan)) =
-        ask(&client, &request, mode.notes()).await?
-    else {
+    let mut ahead = GuardAhead::default();
+    let reply = ask_watching(&client, &request, mode.notes(), |event| {
+        ahead.watch(home, event);
+    })
+    .await?;
+    let (Reply::JobRun(plan) | Reply::JobResume(plan)) = reply else {
         return Ok(ExitCode::SUCCESS);
     };
     let approval = Approval {
@@ -541,7 +559,55 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
         yes,
         ask: &ask_on_terminal,
     };
-    launch(state, home, &client, &plan, mode, &approval).await
+    launch(state, home, &client, &plan, (mode, ahead), &approval).await
+}
+
+/// The resume guard's `--version`, started as soon as the node names the
+/// session a launch continues (`session_to_continue`), so it runs while
+/// the node finishes the plan and this command takes the tree lock and
+/// checks the setup steps, instead of after (item 15 of
+/// docs/evidence/perf-ab/README.md). The launch's adapter takes the answer
+/// only when it asks the same binary in the same workspace with the same
+/// environment, and only when no setup step ran in between, since a step
+/// may install or switch the harness; otherwise the guard asks again.
+#[derive(Default)]
+struct GuardAhead(Option<(HarnessKind, VersionAhead)>);
+
+impl GuardAhead {
+    /// Starts the probe for the harness and root `event` names, once.
+    fn watch(&mut self, home: &Path, event: &Event) {
+        let Event::SessionToContinue { harness, root, .. } = event else {
+            return;
+        };
+        if self.0.is_some() {
+            return;
+        }
+        let Ok(env) = HarnessEnv::new(home, path_var(), HarnessConfig::default()) else {
+            return;
+        };
+        let launch_env = environment();
+        let started = match harness {
+            HarnessKind::ClaudeCode => {
+                ClaudeCode::new(env.home, env.path_var).ask_guard_ahead(root, &launch_env)
+            }
+            HarnessKind::Codex => {
+                Codex::new(env.home, env.path_var).ask_guard_ahead(root, &launch_env)
+            }
+            HarnessKind::Acp { .. } => return,
+        };
+        // A probe that cannot start, as without the binary, is left to
+        // the guard, which reports it in its own words.
+        if let Ok(ahead) = started {
+            self.0 = Some((harness.clone(), ahead));
+        }
+    }
+
+    /// The probe, for a launch of `harness`.
+    fn take_for(self, harness: &HarnessKind) -> Option<VersionAhead> {
+        self.0
+            .filter(|(asked, _)| asked == harness)
+            .map(|(_, ahead)| ahead)
+    }
 }
 
 /// The request a job command sends, how a harness it launches runs, and
@@ -690,7 +756,7 @@ async fn launch(
     home: &Path,
     client: &Client,
     plan: &RunPlan,
-    mode: Mode,
+    (mode, ahead): (Mode, GuardAhead),
     approval: &Approval<'_>,
 ) -> Result<ExitCode> {
     let notes = mode.notes();
@@ -700,7 +766,14 @@ async fn launch(
         // The protocol client holds an ACP agent's output.
         _ => None,
     };
-    let tree = prepare(state, home, client, plan, notes, approval).await?;
+    let (tree, setup_ran) = prepare(state, home, client, plan, notes, approval).await?;
+    // A setup step may have installed or switched the harness, so the
+    // guard asks it again rather than take an answer from before.
+    let ahead = if setup_ran {
+        None
+    } else {
+        ahead.take_for(&plan.harness)
+    };
     let headless = matches!(mode, Mode::Headless(_));
     let env = environment();
     // Caught from before the harness starts: until the node records it, the
@@ -708,7 +781,7 @@ async fn launch(
     // a signal that ends this command must stop it first. A signal during
     // the setup steps still ends the command.
     let mut interrupts = Interrupts::new()?;
-    let (adapter, how) = adapter_for(home, plan, mode, notes, &env).await?;
+    let (adapter, how) = adapter_for(home, plan, (mode, ahead), notes, &env).await?;
     // The resume guard runs inside the launch, before the harness exists,
     // and can wait as long as a `--version` run; a signal then ends the
     // command with nothing started. An adapter whose launch is dropped
@@ -838,7 +911,7 @@ async fn abandon(
 async fn adapter_for(
     home: &Path,
     plan: &RunPlan,
-    mode: Mode,
+    (mode, ahead): (Mode, Option<VersionAhead>),
     notes: Notes,
     env: &[(EnvVarName, String)],
 ) -> Result<(Box<dyn Harness>, Launch)> {
@@ -853,14 +926,21 @@ async fn adapter_for(
     };
     Ok(match &plan.harness {
         HarnessKind::ClaudeCode => {
-            let claude = ClaudeCode::new(harness_env.home.clone(), harness_env.path_var.clone());
+            let mut claude =
+                ClaudeCode::new(harness_env.home.clone(), harness_env.path_var.clone());
+            if let Some(ahead) = ahead {
+                claude = claude.with_guard_ahead(ahead);
+            }
             let trust = claude.preseed_trust(&plan.root, env).await?;
             report_trust(&plan.root, &trust, notes)?;
             (Box::new(claude), launch)
         }
         HarnessKind::Codex => {
-            let codex = Codex::new(harness_env.home.clone(), harness_env.path_var.clone())
+            let mut codex = Codex::new(harness_env.home.clone(), harness_env.path_var.clone())
                 .with_known_writer(plan.known_writer.clone());
+            if let Some(ahead) = ahead {
+                codex = codex.with_guard_ahead(ahead);
+            }
             (Box::new(codex), launch)
         }
         HarnessKind::Acp { program, args } => {
@@ -1594,7 +1674,8 @@ fn print_turn(plan: &RunPlan, report: &TurnReport) -> Result<()> {
 }
 
 /// Takes the tree lock and runs the setup steps, once the plan is known
-/// to hold and the user approved them, and returns the lock.
+/// to hold and the user approved them, and returns the lock and whether
+/// any step ran.
 async fn prepare(
     state: &StateDir,
     home: &Path,
@@ -1602,7 +1683,7 @@ async fn prepare(
     plan: &RunPlan,
     notes: Notes,
     approval: &Approval<'_>,
-) -> Result<TreeLock> {
+) -> Result<(TreeLock, bool)> {
     // The node captures and restores the harness's state under its home;
     // a harness launched under another would keep its session elsewhere.
     if plan.home != home {
@@ -1623,8 +1704,8 @@ async fn prepare(
         .await;
     printer.finish()?;
     checked.map_err(Refused::from_client)?;
-    materialize(&tree, &plan.root, notes, approval)?;
-    Ok(tree)
+    let ran = materialize(&tree, &plan.root, notes, approval)?;
+    Ok((tree, ran))
 }
 
 /// Tells the node the harness exited and picks the exit code: the harness's
@@ -1705,15 +1786,21 @@ fn lock_tree(state: &StateDir, root: &Path) -> Result<TreeLock> {
 }
 
 /// Runs the setup steps a restored workspace needs on this node (ADR 0007),
-/// printing each, under `lock`, once `approval` lets them run.
-fn materialize(lock: &TreeLock, root: &Path, notes: Notes, approval: &Approval<'_>) -> Result<()> {
+/// printing each, under `lock`, once `approval` lets them run; true when
+/// any ran.
+fn materialize(
+    lock: &TreeLock,
+    root: &Path,
+    notes: Notes,
+    approval: &Approval<'_>,
+) -> Result<bool> {
     let detected = fabric_env::detect::detect(root, &[])?;
     let plan = fabric_env::materialize::plan(&detected, lock, &NodeEnv::current())?;
     if plan.is_noop() {
         // A declared variable is required even when no step runs, so a
         // warm node refuses the launch a cold node would (ADR 0007).
         plan.ready()?;
-        return Ok(());
+        return Ok(false);
     }
     let mut lines = Vec::new();
     for cache in plan.caches() {
@@ -1735,7 +1822,7 @@ fn materialize(lock: &TreeLock, root: &Path, notes: Notes, approval: &Approval<'
     let inputs = detected.inputs_digest().to_hex();
     approval.approve(detected.spec().id()?, &inputs)?;
     ready.execute(lock)?;
-    Ok(())
+    Ok(true)
 }
 
 /// Whether the setup steps of an environment spec may run (ADR 0007).
@@ -2426,7 +2513,7 @@ mod tests {
             &mine,
             &client(&state),
             &plan,
-            Mode::Interactive(None),
+            (Mode::Interactive(None), GuardAhead::default()),
             &unasked(dir.path()),
         )
         .await
@@ -2478,7 +2565,7 @@ mod tests {
             &home,
             &client(&state),
             &plan,
-            Mode::Interactive(None),
+            (Mode::Interactive(None), GuardAhead::default()),
             &unasked(dir.path()),
         )
         .await

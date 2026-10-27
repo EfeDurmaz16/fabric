@@ -256,4 +256,99 @@ mod tests {
         assert!(!at_least("2.1", "2.1.294"));
         assert!(!at_least("2.1.x", "2.1.294"));
     }
+
+    /// A fake binary at `dir/tool` that logs each run, with its directory,
+    /// to `dir/runs` and prints `version`.
+    fn counted_tool(dir: &std::path::Path, version: &str) -> std::io::Result<std::path::PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        let tool = dir.join("tool");
+        let runs = dir.join("runs");
+        std::fs::write(
+            &tool,
+            format!("#!/bin/sh\npwd >> '{}'\necho '{version}'\n", runs.display()),
+        )?;
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))?;
+        Ok(tool)
+    }
+
+    fn runs(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("runs"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The resume guard takes the answer of a `--version` asked ahead
+    /// when it asks the same binary in the same directory with the same
+    /// environment, and runs the binary again for any other question, so
+    /// it never decides on another directory's or environment's answer.
+    #[tokio::test]
+    async fn the_guard_takes_an_answer_asked_ahead_only_for_the_same_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let (work, other) = (dir.join("work"), dir.join("other"));
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let tool = counted_tool(&dir, "tool 2.1.300").unwrap();
+        let session = fabric_core::session::SessionId::parse("s").unwrap();
+        let recorded = HarnessVersion::parse("2.1.294").unwrap();
+        let env: Vec<(fabric_core::env::EnvVarName, String)> = vec![(
+            fabric_core::env::EnvVarName::parse("PATH").unwrap(),
+            "/usr/bin:/bin".to_owned(),
+        )];
+        let ahead = VersionAhead::reported(tool.clone(), work.clone(), env.clone());
+        let guard = |cwd: std::path::PathBuf, env: Vec<(fabric_core::env::EnvVarName, String)>| {
+            let (tool, ahead, session, recorded) = (
+                tool.clone(),
+                ahead.clone(),
+                session.clone(),
+                recorded.clone(),
+            );
+            async move {
+                refuse_older(
+                    "tool",
+                    (&tool, &cwd, &env),
+                    Some(&ahead),
+                    &session,
+                    &recorded,
+                )
+                .await
+            }
+        };
+        let version = guard(work.clone(), env.clone()).await.unwrap();
+        assert_eq!(version.to_string(), "2.1.300");
+        assert_eq!(runs(&dir).len(), 1, "the guard ran the binary again");
+        guard(work.clone(), env.clone()).await.unwrap();
+        assert_eq!(runs(&dir).len(), 1);
+
+        guard(other.clone(), env.clone()).await.unwrap();
+        let mut more = env.clone();
+        more.push((
+            fabric_core::env::EnvVarName::parse("MISE_ENV").unwrap(),
+            "ci".to_owned(),
+        ));
+        guard(work.clone(), more).await.unwrap();
+        let ran = runs(&dir);
+        assert_eq!(ran.len(), 3, "{ran:?}");
+        assert!(ran[1].ends_with("other"), "{ran:?}");
+    }
+
+    /// A restore takes the installed version asked ahead only when it
+    /// asks the same binary on the same `PATH`.
+    #[tokio::test]
+    async fn a_restore_takes_an_installed_version_asked_ahead_only_for_the_same_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let tool = counted_tool(&dir, "tool 0.160.0").unwrap();
+        let path_var = std::ffi::OsString::from("/usr/bin:/bin");
+        let ahead = VersionAhead::installed(Some(tool.clone()), path_var.clone(), "tool");
+        let asked = installed_version(Some(&ahead), Some(tool.clone()), &path_var, "tool").await;
+        assert_eq!(asked.as_deref(), Some("0.160.0"));
+        assert_eq!(runs(&dir).len(), 1);
+        let other_path = std::ffi::OsString::from("/bin");
+        installed_version(Some(&ahead), Some(tool.clone()), &other_path, "tool").await;
+        installed_version(Some(&ahead), None, &path_var, "tool").await;
+        assert_eq!(runs(&dir).len(), 2, "{:?}", runs(&dir));
+    }
 }
