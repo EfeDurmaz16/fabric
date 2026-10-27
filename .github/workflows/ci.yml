@@ -220,9 +220,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: EfeDurmaz16/capsule
-          # The worker of Capsule's m3/bridge-worker that the evidence in
-          # docs/evidence/m3-interop measured.
-          ref: 9f5d65eb23fccdac668e7358ad0513ca994c011c
+          # The head of Capsule's m3/bridge-worker:
+          # the worker after its review fixes and the merge of M1, which
+          # docs/evidence/m3-pr ran against.
+          ref: 1fee151155b7f1c22fa0cc39eaf9b6b7345bd619
           path: capsule
           persist-credentials: false
 
