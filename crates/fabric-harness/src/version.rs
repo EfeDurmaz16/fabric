@@ -29,13 +29,17 @@ pub(crate) fn at_least(version: &str, floor: &str) -> bool {
 /// cannot be read, and otherwise returns that version, the one about to
 /// run the session. Runs `binary --version` in `cwd`, the directory the
 /// launch starts it in, with the launch environment minus the
-/// parent-session markers, as the launch itself would run.
+/// parent-session markers, as the launch itself would run, or takes the
+/// answer of `ahead` when it asked exactly that.
 #[cfg(any(feature = "claude", feature = "codex"))]
 pub(crate) async fn refuse_older(
     program: &str,
-    binary: &std::path::Path,
-    cwd: &std::path::Path,
-    env: &[(fabric_core::env::EnvVarName, String)],
+    (binary, cwd, env): (
+        &std::path::Path,
+        &std::path::Path,
+        &[(fabric_core::env::EnvVarName, String)],
+    ),
+    ahead: Option<&VersionAhead>,
     session: &fabric_core::session::SessionId,
     recorded: &HarnessVersion,
 ) -> Result<HarnessVersion, crate::error::HarnessError> {
@@ -46,9 +50,9 @@ pub(crate) async fn refuse_older(
         session: session.clone(),
         reason,
     };
-    let output = crate::process::reported_version(binary, cwd, env)
+    let output = reported_version(ahead, binary, cwd, env)
         .await
-        .map_err(|e| unknown(e.to_string()))?;
+        .map_err(unknown)?;
     let local = HarnessVersion::from_output(&output).map_err(|e| unknown(e.to_string()))?;
     if local < *recorded {
         return Err(HarnessError::HarnessOlderThanSession {
@@ -59,6 +63,178 @@ pub(crate) async fn refuse_older(
         });
     }
     Ok(local)
+}
+
+/// A `--version` started before the step that reads it, so the probe, a
+/// process start of tens of milliseconds, runs beside other work: the
+/// daemon starts the one a harness restore asks as the restore begins,
+/// and the CLI the one its resume guard asks as soon as the node names
+/// the session the launch continues (items 14 and 15 of
+/// docs/evidence/perf-ab/README.md).
+///
+/// The step takes the answer only when it would have asked the same
+/// question: the same binary, in the same directory, with the same
+/// environment, or the same `PATH` for a probe of the installed version.
+/// Otherwise it asks again, so nothing is decided on what another binary
+/// or another shim answered. A probe nobody takes is stopped when the
+/// last copy of this handle goes.
+#[cfg(any(feature = "claude", feature = "codex"))]
+#[derive(Debug, Clone)]
+pub struct VersionAhead(std::sync::Arc<Ahead>);
+
+#[cfg(any(feature = "claude", feature = "codex"))]
+#[derive(Debug)]
+pub(crate) struct Ahead {
+    question: Question,
+    answer: tokio::sync::Mutex<Answer>,
+}
+
+/// What a probe asked ahead was asked.
+#[cfg(any(feature = "claude", feature = "codex"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Question {
+    /// The installed version, as `process::installed_version` asks it:
+    /// `binary` found on `path_var`, run in this process's directory.
+    Installed {
+        binary: Option<std::path::PathBuf>,
+        path_var: std::ffi::OsString,
+    },
+    /// What `binary --version` prints in `cwd` with `env`, as
+    /// `process::reported_version` asks it for the resume guard.
+    Reported {
+        binary: std::path::PathBuf,
+        cwd: std::path::PathBuf,
+        env: Vec<(fabric_core::env::EnvVarName, String)>,
+    },
+}
+
+/// The probe's answer: its output, or why it failed, in words.
+#[cfg(any(feature = "claude", feature = "codex"))]
+type Reply = Result<Option<String>, String>;
+
+#[cfg(any(feature = "claude", feature = "codex"))]
+#[derive(Debug)]
+enum Answer {
+    Running(tokio::task::JoinHandle<Reply>),
+    Done(Reply),
+}
+
+#[cfg(any(feature = "claude", feature = "codex"))]
+impl Drop for Ahead {
+    fn drop(&mut self) {
+        if let Answer::Running(task) = self.answer.get_mut() {
+            task.abort();
+        }
+    }
+}
+
+#[cfg(any(feature = "claude", feature = "codex"))]
+impl VersionAhead {
+    fn start(question: Question, probe: impl Future<Output = Reply> + Send + 'static) -> Self {
+        Self(std::sync::Arc::new(Ahead {
+            question,
+            answer: tokio::sync::Mutex::new(Answer::Running(tokio::spawn(probe))),
+        }))
+    }
+
+    /// Starts `process::installed_version` of `binary`, found on `path_var`.
+    pub(crate) fn installed(
+        binary: Option<std::path::PathBuf>,
+        path_var: std::ffi::OsString,
+        program: &'static str,
+    ) -> Self {
+        let question = Question::Installed {
+            binary: binary.clone(),
+            path_var: path_var.clone(),
+        };
+        Self::start(question, async move {
+            Ok(crate::process::installed_version(binary, &path_var, program).await)
+        })
+    }
+
+    /// Starts `process::reported_version` of `binary` in `cwd` with `env`.
+    pub(crate) fn reported(
+        binary: std::path::PathBuf,
+        cwd: std::path::PathBuf,
+        env: Vec<(fabric_core::env::EnvVarName, String)>,
+    ) -> Self {
+        let question = Question::Reported {
+            binary: binary.clone(),
+            cwd: cwd.clone(),
+            env: env.clone(),
+        };
+        Self::start(question, async move {
+            crate::process::reported_version(&binary, &cwd, &env)
+                .await
+                .map(Some)
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// The answer to `question`, waited for, when it is the one asked
+    /// ahead; `None` otherwise.
+    async fn answer_to(&self, question: &Question) -> Option<Reply> {
+        if self.0.question != *question {
+            return None;
+        }
+        let mut answer = self.0.answer.lock().await;
+        if let Answer::Running(task) = &mut *answer {
+            let reply = match task.await {
+                Ok(reply) => reply,
+                Err(e) => Err(format!("the version probe did not finish: {e}")),
+            };
+            *answer = Answer::Done(reply);
+        }
+        match &*answer {
+            Answer::Done(reply) => Some(reply.clone()),
+            Answer::Running(_) => None,
+        }
+    }
+}
+
+/// `process::installed_version(binary, path_var, program)`, answered by
+/// `ahead` when it asked exactly that.
+#[cfg(any(feature = "claude", feature = "codex"))]
+pub(crate) async fn installed_version(
+    ahead: Option<&VersionAhead>,
+    binary: Option<std::path::PathBuf>,
+    path_var: &std::ffi::OsStr,
+    program: &str,
+) -> Option<String> {
+    let question = Question::Installed {
+        binary: binary.clone(),
+        path_var: path_var.to_owned(),
+    };
+    if let Some(ahead) = ahead
+        && let Some(Ok(version)) = ahead.answer_to(&question).await
+    {
+        return version;
+    }
+    crate::process::installed_version(binary, path_var, program).await
+}
+
+/// `process::reported_version(binary, cwd, env)`, answered by `ahead`
+/// when it asked exactly that.
+#[cfg(any(feature = "claude", feature = "codex"))]
+async fn reported_version(
+    ahead: Option<&VersionAhead>,
+    binary: &std::path::Path,
+    cwd: &std::path::Path,
+    env: &[(fabric_core::env::EnvVarName, String)],
+) -> Result<String, String> {
+    let question = Question::Reported {
+        binary: binary.to_owned(),
+        cwd: cwd.to_owned(),
+        env: env.to_vec(),
+    };
+    if let Some(ahead) = ahead
+        && let Some(reply) = ahead.answer_to(&question).await
+    {
+        return reply.map(Option::unwrap_or_default);
+    }
+    crate::process::reported_version(binary, cwd, env)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(all(test, any(feature = "claude", feature = "codex")))]
