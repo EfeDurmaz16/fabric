@@ -32,7 +32,7 @@ use fabric_store::writer::WriteError;
 
 mod common;
 
-use common::TestGit;
+use common::{LoggedGit, TestGit};
 
 type Fallible<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -2525,41 +2525,11 @@ const GIT_RUNS: [(&str, usize); 3] = [
     ("restore", 19),
 ];
 
-/// Writes `contents` to `path` with mode `0755` through `sh`, so this
-/// process never holds an executable open for writing, which Linux would
-/// refuse to run (`ETXTBSY`) in a child forked meanwhile.
-fn write_executable(path: &Path, contents: &str) -> Fallible {
-    let mut writer = std::process::Command::new("/bin/sh")
-        .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
-        .arg(path)
-        .stdin(std::process::Stdio::piped())
-        .spawn()?;
-    std::io::Write::write_all(
-        &mut writer.stdin.take().ok_or("no pipe to the writer")?,
-        contents.as_bytes(),
-    )?;
-    if !writer.wait()?.success() {
-        return Err(format!("writing {} failed", path.display()).into());
-    }
-    Ok(())
-}
-
-/// The child half: runs with a `git` first on the `PATH` that appends each call to `FABRIC_GIT_LOG`.
+/// The child half: runs with a `git` first on the `PATH` that logs each call.
 #[test]
 fn git_processes_child() {
-    let (Ok(dir), Ok(log)) = (
-        std::env::var("FABRIC_GIT_COUNT_DIR"),
-        std::env::var("FABRIC_GIT_LOG"),
-    ) else {
+    let Some(dir) = common::logged_git_dir() else {
         return;
-    };
-    let dir = PathBuf::from(dir);
-    let calls = || -> Vec<String> {
-        fs::read_to_string(&log)
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_owned)
-            .collect()
     };
     let root = dir.join("work");
     make_repo(&root).unwrap();
@@ -2567,23 +2537,23 @@ fn git_processes_child() {
     let policy = IgnorePolicy::default();
     let mut runs = Vec::new();
 
-    let start = calls().len();
+    let start = common::logged_git_calls().len();
     let first = capture(&store, &request(&root, &policy, None)).unwrap();
-    runs.push(calls().split_off(start));
+    runs.push(common::git_commands(&common::logged_git_calls(), start));
     let s1 = store.publish(&first.manifest).unwrap();
     fs::write(root.join("second.txt"), "second commit\n").unwrap();
     git(&root).run(&["add", "second.txt"]).unwrap();
     git(&root).run(&["commit", "-q", "-m", "two"]).unwrap();
 
-    let start = calls().len();
+    let start = common::logged_git_calls().len();
     let second = capture(&store, &request(&root, &policy, Some(s1))).unwrap();
-    runs.push(calls().split_off(start));
+    runs.push(common::git_commands(&common::logged_git_calls(), start));
     assert_eq!(second.report.bundle, Some(BundleKind::Incremental));
     let s2 = store.publish(&second.manifest).unwrap();
 
-    let start = calls().len();
+    let start = common::logged_git_calls().len();
     restore_into(&store, s2, &dir.join("restored")).unwrap();
-    runs.push(calls().split_off(start));
+    runs.push(common::git_commands(&common::logged_git_calls(), start));
 
     for ((name, expected), ran) in GIT_RUNS.iter().zip(&runs) {
         assert_eq!(ran.len(), *expected, "{name}:\n{}", ran.join("\n"));
@@ -2592,34 +2562,7 @@ fn git_processes_child() {
 
 #[test]
 fn a_capture_and_a_restore_start_a_known_number_of_git_processes() {
-    let dir = tempfile::tempdir().unwrap();
-    let bin = dir.path().join("bin");
-    fs::create_dir(&bin).unwrap();
-    let path = std::env::var_os("PATH").unwrap();
-    let real = std::env::split_paths(&path)
-        .map(|dir| dir.join("git"))
-        .find(|candidate| candidate.is_file())
-        .unwrap();
-    write_executable(
-        &bin.join("git"),
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FABRIC_GIT_LOG\"\nexec '{}' \"$@\"\n",
-            real.display()
-        ),
-    )
-    .unwrap();
-    let path =
-        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path))).unwrap();
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "git_processes_child"])
-        .env("FABRIC_GIT_COUNT_DIR", dir.path())
-        .env("FABRIC_GIT_LOG", dir.path().join("git.log"))
-        .env("PATH", path)
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "{stdout}");
-    assert!(stdout.contains("1 passed"), "{stdout}");
+    common::run_with_logged_git("git_processes_child", LoggedGit::Plain).unwrap();
 }
 
 /// M2-03: untracked work whose name the store's old list denied, an env
