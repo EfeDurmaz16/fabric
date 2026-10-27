@@ -833,9 +833,11 @@ impl Node {
             && record.pid == pid
         {
             // The record stands for the group: a background process the
-            // harness started keeps it, so a suspend still stops it.
+            // harness started keeps it, so a suspend still stops it. A
+            // record of a group that is gone needs no flushed removal: one a
+            // crash brings back names a process every reader finds gone.
             if record.liveness().await == Liveness::Gone {
-                job.clear_harness_record()?;
+                job.forget_gone_harness()?;
             } else {
                 tracing::info!(job = %id, pid, "the harness exited and its group still runs");
             }

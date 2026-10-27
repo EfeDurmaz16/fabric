@@ -101,11 +101,15 @@ impl<T: Clone + Serialize + DeserializeOwned> Kept<T> {
         Ok(())
     }
 
-    /// Removes the file at `path`, then the copy.
-    fn remove(&self, path: &Path) -> Result<(), local::LocalError> {
+    /// Removes the file at `path`, flushing its directory when `flushed`, then the copy.
+    fn remove(&self, path: &Path, flushed: bool) -> Result<(), local::LocalError> {
         let mut slot = self.slot();
         *slot = Slot::Unread;
-        local::remove(path)?;
+        if flushed {
+            local::remove(path)?;
+        } else {
+            local::remove_unflushed(path)?;
+        }
         *slot = Slot::Read(None);
         Ok(())
     }
@@ -323,7 +327,7 @@ impl Job {
 
     /// Removes the workspace marker.
     pub fn clear_marker(&self) -> Result<(), NodeError> {
-        Ok(self.marker.remove(&self.dir.marker())?)
+        Ok(self.marker.remove(&self.dir.marker(), true)?)
     }
 
     /// The harness this node launched, if one is recorded.
@@ -336,9 +340,17 @@ impl Job {
         Ok(self.harness.write(&self.dir.harness(), record)?)
     }
 
-    /// Removes the harness record.
+    /// Removes the harness record of a harness that was stopped, durably,
+    /// before what follows the stop acts on the workspace.
     pub fn clear_harness_record(&self) -> Result<(), NodeError> {
-        Ok(self.harness.remove(&self.dir.harness())?)
+        Ok(self.harness.remove(&self.dir.harness(), true)?)
+    }
+
+    /// Removes the harness record of a harness whose group is gone, without
+    /// flushing the directory: a record a crash brings back names a process
+    /// every reader finds gone (`local::remove_unflushed`).
+    pub fn forget_gone_harness(&self) -> Result<(), NodeError> {
+        Ok(self.harness.remove(&self.dir.harness(), false)?)
     }
 
     /// The session the job continues on this node, if known.
@@ -545,7 +557,7 @@ mod tests {
         job.set_harness_record(&record).unwrap();
         assert_eq!(local::read(&paths.harness()).unwrap(), Some(record.clone()));
         assert_eq!(job.harness_record().unwrap(), Some(record));
-        job.clear_harness_record().unwrap();
+        job.forget_gone_harness().unwrap();
         assert!(!paths.harness().exists());
         assert_eq!(job.harness_record().unwrap(), None);
         let fork = ForkRecord {

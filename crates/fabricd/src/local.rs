@@ -281,7 +281,26 @@ pub fn remove(path: &Path) -> Result<(), LocalError> {
     }
 }
 
-/// The program that reads a process's start time and group.
+/// Removes a node-local file without flushing its directory, so a crash
+/// can bring it back; an absent one is already removed.
+///
+/// Only for a file whose return after a crash is harmless because every
+/// reader checks it again: a harness record, whose process each reader
+/// asks for by pid and start time (`HarnessRecord::liveness`), so a record
+/// that comes back names a process that is gone. It saves a full flush of
+/// the directory at every harness's exit.
+pub fn remove_unflushed(path: &Path) -> Result<(), LocalError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(LocalError::Io {
+            path: path.to_owned(),
+            source,
+        }),
+    }
+}
+
+/// The program that reads a process's start time.
 const PS: &str = "ps";
 
 /// The kernel's start time of `pid` as `ps -o lstart=` prints it, and on
