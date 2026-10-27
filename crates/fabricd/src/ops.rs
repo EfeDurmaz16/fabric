@@ -625,6 +625,7 @@ impl Node {
                 pid: record.pid,
             });
         }
+        session_ahead(job.session()?, Some(job.harness()), &marker.root, out);
         plan(
             &job,
             token.epoch,
@@ -2016,8 +2017,9 @@ impl Node {
         let job = self.job(id).await?;
         let mut job = job.lock().await;
         let token = owner_token(&job, self.id)?;
+        let launching = harness.clone().unwrap_or_else(|| job.harness().clone());
         let root = self
-            .restore_if_needed(&mut job, token.epoch, env, out)
+            .restore_if_needed(&mut job, token.epoch, env, Some(&launching), out)
             .await?;
         if let Some(record) = job.harness_record()?
             && record.liveness().await != Liveness::Gone
@@ -2382,11 +2384,17 @@ impl Node {
     /// A workspace an earlier tenure left is set aside first, with the
     /// session record it continued, so the job never continues from a tree
     /// or a session older than its latest snapshot.
+    ///
+    /// `launching` is the harness the plan this restore serves launches:
+    /// once the workspace is in place and the session it continues is
+    /// known, `session_to_continue` names them, so a client can start the
+    /// checks it runs before that launch (`session_ahead`).
     async fn restore_if_needed(
         &self,
         job: &mut Job,
         epoch: Epoch,
         env: &ToolEnv,
+        launching: Option<&HarnessKind>,
         out: &mut Out,
     ) -> Result<PathBuf, NodeError> {
         let id = job.id();
@@ -2398,6 +2406,7 @@ impl Node {
                 ..
             }) => {
                 out.emit(Event::WorkspaceInPlace { root: root.clone() });
+                session_ahead(job.session()?, launching, root, out);
                 return Ok(root.clone());
             }
             Some(Marker {
@@ -2489,7 +2498,8 @@ impl Node {
             }
         }
         if has_harness_state {
-            self.restore_harness(job, &root, env, ahead, out).await?;
+            self.restore_harness(job, &root, env, (ahead, launching), out)
+                .await?;
         }
         let tree = TreeStamp::measure(&root).await;
         job.set_marker(&Marker {
@@ -2696,17 +2706,26 @@ impl Node {
     ///
     /// `ahead` is the installed version the restore asks, when it was
     /// asked ahead (`ask_installed_ahead`); the adapter takes it only when
-    /// it asked what the adapter would ask.
+    /// it asked what the adapter would ask. `launching` is the harness the
+    /// plan launches, for `session_to_continue`.
     async fn restore_harness(
         &self,
         job: &Job,
         root: &Path,
         env: &ToolEnv,
-        ahead: Option<VersionAhead>,
+        (ahead, launching): (Option<VersionAhead>, Option<&HarnessKind>),
         out: &mut Out,
     ) -> Result<(), NodeError> {
         let state_dir = job.dir().harness_state();
         let state = StateManifest::read(&state_dir)?;
+        // The workspace is written and the session to continue known, so
+        // a client may start its own checks while this restore places it.
+        let continued = SessionRecord {
+            harness: state.kind().clone(),
+            session: state.session().clone(),
+            known_writer: None,
+        };
+        session_ahead(Some(continued), launching, root, out);
         let harness = adapter_with_installed(state.kind(), &self.harness_env(env)?, None, ahead)?;
         harness.restore(root, &state_dir).await?;
         let previous = job
@@ -3765,6 +3784,29 @@ fn restored(snapshot: SnapshotId, report: &RestoreReport, git: bool) -> Event {
     }
 }
 
+/// Says that the launch of the plan about to be answered continues
+/// `continued`, when it is a session of `launching`, in the workspace at
+/// `root`, which is in place: a client starts the checks it runs before
+/// that launch then, the resume guard's `--version` among them (item 15
+/// of docs/evidence/perf-ab/README.md). Nothing is said for a launch that
+/// starts a new session, whose guard asks nothing.
+fn session_ahead(
+    continued: Option<SessionRecord>,
+    launching: Option<&HarnessKind>,
+    root: &Path,
+    out: &mut Out,
+) {
+    if let Some(record) = continued
+        && launching == Some(&record.harness)
+    {
+        out.emit(Event::SessionToContinue {
+            harness: record.harness,
+            session: record.session,
+            root: root.to_owned(),
+        });
+    }
+}
+
 /// The event that says where a restore writes the workspace.
 fn root_chosen(choice: &RootChoice) -> Event {
     match choice {
@@ -4526,7 +4568,7 @@ pub(crate) mod tests {
         std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
 
         let root = paths::job_root(&node.cfg.home, id);
-        node.restore_harness(&job, &root, &path, None, &mut Out::default())
+        node.restore_harness(&job, &root, &path, (None, None), &mut Out::default())
             .await
             .unwrap();
         assert_eq!(
@@ -4806,7 +4848,7 @@ pub(crate) mod tests {
         let thief_root = {
             let job = b.job(id).await.unwrap();
             let mut job = job.lock().await;
-            b.restore_if_needed(&mut job, Epoch::new(2).unwrap(), &path, out)
+            b.restore_if_needed(&mut job, Epoch::new(2).unwrap(), &path, None, out)
                 .await
                 .unwrap()
         };
@@ -4826,7 +4868,7 @@ pub(crate) mod tests {
         let mut job = job.lock().await;
         let epoch = owner_token(&job, a.id).unwrap().epoch;
         let root = a
-            .restore_if_needed(&mut job, epoch, &path, out)
+            .restore_if_needed(&mut job, epoch, &path, None, out)
             .await
             .unwrap();
         let read = |path: PathBuf| std::fs::read_to_string(path).unwrap();
@@ -4973,7 +5015,7 @@ pub(crate) mod tests {
         let job = b.job(id).await.unwrap();
         let mut job = job.lock().await;
         let epoch = owner_token(&job, b.id).unwrap().epoch;
-        b.restore_if_needed(&mut job, epoch, &path, out)
+        b.restore_if_needed(&mut job, epoch, &path, None, out)
             .await
             .unwrap();
         assert!(!approved.exists(), "{:?}", out.said());
@@ -6789,7 +6831,7 @@ pub(crate) mod tests {
             let job = b.job(id).await.unwrap();
             let mut job = job.lock().await;
             let epoch = owner_token(&job, b.id).unwrap().epoch;
-            b.restore_if_needed(&mut job, epoch, &path, out)
+            b.restore_if_needed(&mut job, epoch, &path, None, out)
                 .await
                 .unwrap()
         };
@@ -7101,7 +7143,7 @@ pub(crate) mod tests {
 
         job.set_marker(&restoring).unwrap();
         let restored = node
-            .restore_if_needed(&mut job, Epoch::FIRST, &path, &mut Out::default())
+            .restore_if_needed(&mut job, Epoch::FIRST, &path, None, &mut Out::default())
             .await;
         assert_eq!(
             restored.unwrap(),
@@ -7115,7 +7157,7 @@ pub(crate) mod tests {
         std::fs::write(root.join("README.md"), "not the job's\n").unwrap();
         job.set_marker(&restoring).unwrap();
         let refused = node
-            .restore_if_needed(&mut job, Epoch::FIRST, &path, &mut Out::default())
+            .restore_if_needed(&mut job, Epoch::FIRST, &path, None, &mut Out::default())
             .await;
         assert!(
             matches!(&refused, Err(NodeError::WorkspaceOccupied { root: r }) if *r == root),
@@ -8334,6 +8376,86 @@ pub(crate) mod tests {
             }
         };
         assert_eq!(records(&b).await, records(&a).await);
+    }
+
+    /// A run and a resume that continue a session say so, with the
+    /// workspace's root, as soon as both are known: a resume that restores
+    /// the session says it before the harness state is placed, one whose
+    /// workspace is in place at once, and a run before its plan, so the
+    /// CLI can start its resume guard's `--version` then (item 15). A
+    /// launch under another harness, which starts a new session, says
+    /// nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_launch_that_continues_a_session_names_it_before_it_answers() {
+        let (dir, node) = node();
+        let tools = crate::facts::tests::CountingTools::new(dir.path());
+        let (id, root) = npm_codex_job(dir.path(), &node).await;
+        let thread = node
+            .job(id)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .session()
+            .unwrap()
+            .unwrap()
+            .session;
+        node.suspend(id, &tools.env, &mut Out::default())
+            .await
+            .unwrap();
+        let continues = |out: &Out| {
+            out.events.iter().position(|event| {
+                matches!(
+                    event,
+                    Event::SessionToContinue { harness: HarnessKind::Codex, session, root: at }
+                        if *session == thread && *at == root
+                )
+            })
+        };
+        std::fs::remove_dir_all(&root).unwrap();
+        let mut out = Out::default();
+        node.job_resume(id, None, None, false, &tools.env, &mut out)
+            .await
+            .unwrap();
+        let restored = out
+            .events
+            .iter()
+            .position(|event| matches!(event, Event::SessionRestored { .. }));
+        let named = continues(&out);
+        assert!(
+            named.is_some() && named < restored,
+            "{named:?} {restored:?} {:?}",
+            out.said()
+        );
+
+        let mut out = Out::default();
+        node.job_resume(id, None, None, false, &tools.env, &mut out)
+            .await
+            .unwrap();
+        assert!(continues(&out).is_some(), "{:?}", out.said());
+
+        let mut out = Out::default();
+        node.job_run(id, &mut out).await.unwrap();
+        assert!(continues(&out).is_some(), "{:?}", out.said());
+
+        let mut out = Out::default();
+        node.job_resume(
+            id,
+            None,
+            Some(HarnessKind::ClaudeCode),
+            false,
+            &tools.env,
+            &mut out,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !out.events
+                .iter()
+                .any(|event| matches!(event, Event::SessionToContinue { .. })),
+            "{:?}",
+            out.said()
+        );
     }
 
     /// The tools a move or a pull leaves out, those of a harness other
