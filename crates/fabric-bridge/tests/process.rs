@@ -246,6 +246,23 @@ async fn a_worker_frame_over_the_cap_is_refused_unread_and_the_worker_terminated
     assert_eq!(exit.signal(), Some(15), "SIGTERM: {exit:?}");
 }
 
+/// Terminal-only stays terminal-only: a running result for a create
+/// breaks the protocol, so the worker is ended and the create is unknown.
+#[tokio::test]
+async fn a_terminal_only_action_answered_before_terminal_is_unknown_and_ends_the_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let bridge = spawn().await;
+    let flight = bridge
+        .request(&mut journal, create(16, "double/running"))
+        .await
+        .unwrap();
+    let outcome = flight.finish(&mut journal).await.unwrap();
+    assert_eq!(outcome.status, ProviderStatus::Unknown);
+    assert!(bridge.lost().unwrap().contains("does not answer it"));
+    assert!(bridge.close().await.is_some());
+}
+
 #[tokio::test]
 async fn an_answer_under_another_operation_breaks_the_protocol() {
     let dir = tempfile::tempdir().unwrap();

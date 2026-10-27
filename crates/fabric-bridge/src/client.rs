@@ -180,6 +180,7 @@ enum Kind {
 struct Waiter {
     operation: Option<OperationId>,
     action: Option<String>,
+    terminal_only: bool,
     kind: Kind,
     tx: mpsc::UnboundedSender<Incoming>,
 }
@@ -489,6 +490,10 @@ impl Bridge {
             Waiter {
                 operation,
                 action: action.map(str::to_owned),
+                terminal_only: kind == Kind::Request
+                    && action
+                        .and_then(|a| self.profile.action(a))
+                        .is_some_and(|spec| spec.terminal_only),
                 kind,
                 tx,
             },
@@ -586,15 +591,10 @@ impl Bridge {
         let mut flight = InFlight {
             request_id: request.request_id.clone(),
             operation: dispatch.operation,
-            action: dispatch.action,
             kind: Kind::Request,
             rx,
             deadline,
             shared: Arc::clone(&self.shared),
-            terminal_only: self
-                .profile
-                .action(request.action.name())
-                .is_some_and(|spec| spec.terminal_only),
             done: false,
         };
         if let Err(why) = self.send(&frame).await {
@@ -657,12 +657,10 @@ impl Bridge {
         let mut flight = InFlight {
             request_id: observe.request_id,
             operation,
-            action: observe.action,
             kind: Kind::Observe,
             rx,
             deadline: Instant::now() + Duration::from_millis(wait_ms) + self.config.grace,
             shared: Arc::clone(&self.shared),
-            terminal_only: false,
             done: false,
         };
         if let Err(why) = self.send(&frame).await {
@@ -866,12 +864,10 @@ fn unexpected(message: &ToFabric) -> BridgeError {
 pub struct InFlight {
     request_id: String,
     operation: OperationId,
-    action: String,
     kind: Kind,
     rx: mpsc::UnboundedReceiver<Incoming>,
     deadline: Instant,
     shared: Arc<Shared>,
-    terminal_only: bool,
     done: bool,
 }
 
@@ -916,22 +912,7 @@ impl InFlight {
                 return Ok(Event::Progress(locator));
             }
             Ok(Some(Incoming::Answer(message))) => match *message {
-                ToFabric::Result(r) => {
-                    if self.terminal_only
-                        && matches!(r.state, ResultState::Accepted | ResultState::Running)
-                    {
-                        // A terminal-only action answered before a terminal
-                        // state: the worker broke the protocol.
-                        let why = format!(
-                            "{} is terminal-only and the worker answered {:?}",
-                            self.action, r.state
-                        );
-                        self.shared.lose(&why);
-                        Answer::Lost(why)
-                    } else {
-                        Answer::Result(r)
-                    }
-                }
+                ToFabric::Result(r) => Answer::Result(r),
                 ToFabric::Error(e) => Answer::Error(e),
                 other => {
                     let why = format!("an unexpected answer: {other:?}");
@@ -1092,6 +1073,24 @@ fn route(shared: &Shared, message: ToFabric) -> Result<(), String> {
     };
     if operation.is_some() && waiter.kind != Kind::Control && operation != waiter.operation {
         return Err(format!("an answer to {id} names another operation"));
+    }
+    let fits = match (&message, waiter.kind) {
+        // A terminal-only action answers a result only once terminal.
+        (ToFabric::Result(r), Kind::Request) => {
+            !(waiter.terminal_only
+                && matches!(r.state, ResultState::Accepted | ResultState::Running))
+        }
+        (ToFabric::Result(_) | ToFabric::Error(_) | ToFabric::Progress { .. }, kind) => {
+            kind != Kind::Control
+        }
+        (ToFabric::CancelAck { .. }, Kind::Control) => waiter.operation.is_some(),
+        (ToFabric::ShutdownAck { .. }, Kind::Control) => waiter.operation.is_none(),
+        _ => false,
+    };
+    if !fits {
+        return Err(format!(
+            "{id} was answered with a message that does not answer it: {message:?}"
+        ));
     }
     let incoming = match message {
         ToFabric::Progress { resource, .. } => Incoming::Progress(resource),

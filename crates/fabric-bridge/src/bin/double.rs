@@ -11,6 +11,8 @@
 //!   `double/crash` it exits mid-request; with `double/progress-crash` it
 //!   reports progress, then exits; with `double/silent` it never answers;
 //!   with `double/oversize` it declares a frame above the cap; with
+//!   `double/running` it answers a running result, which a terminal-only
+//!   action never may; with
 //!   `double/other-operation` it answers under another operation id.
 //! - `sandbox.exec` echoes its argv; `sandbox.destroy` needs an approval.
 //! - A repeated key with the same digest replays the first answer; with
@@ -173,6 +175,13 @@ fn script(request: &Request) -> Step {
                 },
                 3,
             ),
+            "double/running" => Step::Answer(result(
+                request.request_id.clone(),
+                request.operation.id,
+                ResultState::Running,
+                locator(key),
+                ready(),
+            )),
             "double/other-operation" => Step::Answer(result(
                 request.request_id.clone(),
                 OperationId::from_bytes([0xee; 16]),
