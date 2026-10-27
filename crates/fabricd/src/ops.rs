@@ -2921,7 +2921,7 @@ impl Node {
         force: bool,
         out: &mut Out,
     ) -> Result<(NodeFacts, NodeFacts), NodeError> {
-        let probes = doctor::probes(job.0, target);
+        let probes = for_harness(doctor::probes(job.0, target), job.0);
         let (rows, here, theirs) = self.compare(peer, Some(job), target, env, probes).await?;
         out.emit(Event::Preflight {
             peer,
@@ -2980,6 +2980,28 @@ impl Node {
         );
         Ok((rows, here, theirs))
     }
+}
+
+/// `probes` without the tools of a harness other than `harness`, the
+/// job's: for a job that names its harness, the version and login rows of
+/// another harness compare equal whatever they hold (`doctor::compare`),
+/// so a move or a pull measures them on neither node (item 19 of
+/// docs/evidence/perf-ab/README.md). A Codex job no longer waits for
+/// `claude --version`, a Node start, nor a Claude job for Codex's login.
+pub(crate) fn for_harness(probes: Probes, harness: &HarnessKind) -> Probes {
+    let others: &[Tool] = match harness {
+        HarnessKind::ClaudeCode => &[Tool::Codex, Tool::CodexLogin],
+        HarnessKind::Codex => &[Tool::Claude, Tool::ClaudeLogin],
+        HarnessKind::Acp { .. } => &[
+            Tool::Claude,
+            Tool::ClaudeLogin,
+            Tool::Codex,
+            Tool::CodexLogin,
+        ],
+    };
+    others
+        .iter()
+        .fold(probes, |probes, tool| probes.without(*tool))
 }
 
 /// The move `holder` started toward this node at its request, or why it did not.
@@ -8085,6 +8107,102 @@ pub(crate) mod tests {
         assert!(
             !ran.iter().any(|probe| probe.starts_with("defaults")),
             "a new job read the iCloud defaults: {ran:?}"
+        );
+    }
+
+    /// The tools a move or a pull leaves out, those of a harness other
+    /// than the job's, change no outcome of its preflight on either node:
+    /// with every fact of both harnesses differing between the nodes, the
+    /// rows come out the same as with them measured (item 19).
+    #[test]
+    fn the_tools_of_another_harness_change_no_outcome_of_a_preflight() {
+        use crate::facts::name;
+        let facts = |claude: &str, codex: &str, login: &str| {
+            NodeFacts::from_pairs([
+                (name::USER, "tester"),
+                (name::HOME, "/Users/tester"),
+                (name::GIT, "git version 2.50.1"),
+                (name::NODE, "v22.23.2"),
+                (name::NODE_ABI, "127"),
+                (name::CLAUDE, claude),
+                (name::CLAUDE_LOGIN, login),
+                (name::CLAUDE_KEYCHAIN, "locked"),
+                (name::CODEX, codex),
+                (name::CODEX_LOGIN, login),
+                (name::ICLOUD_DESKTOP, "1"),
+                (name::ICLOUD_DOCUMENTS, "0"),
+            ])
+        };
+        let here = facts("2.1.300 (Claude Code)", "codex-cli 0.160.0", "yes");
+        let peer = facts("2.1.200 (Claude Code)", "codex-cli 0.150.0", "no");
+        let acp = HarnessKind::Acp {
+            program: fabric_core::harness::ProgramName::parse("opencode").unwrap(),
+            args: Vec::new(),
+        };
+        for harness in [HarnessKind::ClaudeCode, HarnessKind::Codex, acp] {
+            for target in [Target::Peer, Target::Here] {
+                let ctx = Context {
+                    harness: Some(&harness),
+                    root: Some(Path::new("/Users/tester/Desktop/work")),
+                    target,
+                    clock_skew_ms: Some(0),
+                    wire: None,
+                    floor: None,
+                };
+                let outcomes =
+                    |here: &NodeFacts, peer: &NodeFacts| -> Vec<(&str, doctor::Outcome)> {
+                        doctor::compare(here, peer, &ctx)
+                            .iter()
+                            .map(|row| (row.fact, row.outcome))
+                            .collect()
+                    };
+                let before = doctor::probes(&harness, target);
+                let (here_now, peer_now) = (
+                    for_harness(before, &harness),
+                    for_harness(Probes::ALL, &harness),
+                );
+                assert_eq!(
+                    outcomes(&here.only(here_now), &peer.only(peer_now)),
+                    outcomes(&here.only(before), &peer.only(Probes::ALL)),
+                    "{harness} {target:?}"
+                );
+                assert!(here_now != before && peer_now != Probes::ALL, "{harness}");
+            }
+        }
+    }
+
+    /// A move of a Codex job asks neither node for Claude's version or
+    /// login, and still asks the target for its Codex login, which gates
+    /// it (item 19).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_asks_neither_node_about_another_harness() {
+        let dir = tempfile::Builder::new()
+            .prefix("fops")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let home = root.join("home");
+        let tools_a = crate::facts::tests::CountingTools::new(&root.join("a"));
+        let tools_b = crate::facts::tests::CountingTools::new(&root.join("b"));
+        let a = node_at(&home, &root.join("a/state"), tools_a.env.clone());
+        let b = node_at(&home, &root.join("b/state"), tools_b.env.clone());
+        paired(&a, &b).await;
+        let id = job(&root, &a).await;
+        tools_a.ran();
+        tools_b.ran();
+        let mut out = Out::default();
+        let moved = a.job_move(id, b.id, false, &tools_a.env, &mut out).await;
+        assert!(moved.is_ok(), "{moved:?} {:?}", out.said());
+        let (ran_a, ran_b) = (tools_a.ran(), tools_b.ran());
+        for ran in [&ran_a, &ran_b] {
+            assert!(
+                !ran.iter().any(|probe| probe.starts_with("claude")),
+                "a Codex move asked about Claude: {ran:?}"
+            );
+        }
+        assert!(
+            ran_b.iter().any(|probe| probe == "codex login status"),
+            "{ran_b:?}"
         );
     }
 
