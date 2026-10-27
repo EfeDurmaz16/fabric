@@ -416,7 +416,7 @@ pub fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .with_max_level(level)
         .init();
-    let runtime = match tokio::runtime::Runtime::new() {
+    let runtime = match runtime_for(&cli.command) {
         Ok(runtime) => runtime,
         Err(e) => {
             tracing::error!(error = %e, "no async runtime");
@@ -430,6 +430,29 @@ pub fn main() -> ExitCode {
             exit_code(&e)
         }
     }
+}
+
+/// The worker threads of a client command's runtime.
+///
+/// A client sends one request and waits on its answer, a harness and a few
+/// tasks beside them, so a worker per core only costs memory and start-up:
+/// with two, a release `job ls` peaks at 4.20 MiB instead of 4.75 MiB and
+/// runs about 9% faster (docs/evidence/perf-ab/README.md, item 7). Two,
+/// not one, so a task that blocks its worker for a moment, as the setup
+/// steps of a launch do, never stalls the signal handling beside it.
+const CLIENT_WORKERS: usize = 2;
+
+/// The runtime a command runs on: `serve` gets a worker per core, since the
+/// node serves its peers and every client at once; any other command gets
+/// `CLIENT_WORKERS`.
+fn runtime_for(command: &Command) -> std::io::Result<tokio::runtime::Runtime> {
+    if matches!(command, Command::Serve(_)) {
+        return tokio::runtime::Runtime::new();
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(CLIENT_WORKERS)
+        .enable_all()
+        .build()
 }
 
 async fn run(cli: Cli) -> Result<ExitCode> {
@@ -1716,6 +1739,28 @@ mod tests {
     use fabric_harness::{NotCarried, SettingName};
 
     use super::*;
+
+    /// A client command runs on `CLIENT_WORKERS` workers, whatever the
+    /// cores; `serve` keeps Tokio's default, a worker per core.
+    #[test]
+    fn a_client_command_runs_on_two_workers_and_serve_on_every_core() {
+        let workers = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).unwrap();
+            runtime_for(&cli.command)
+                .unwrap()
+                .handle()
+                .metrics()
+                .num_workers()
+        };
+        assert_eq!(workers(&["fabric", "job", "ls"]), CLIENT_WORKERS);
+        assert_eq!(workers(&["fabric", "node", "id"]), CLIENT_WORKERS);
+        let default = tokio::runtime::Runtime::new()
+            .unwrap()
+            .handle()
+            .metrics()
+            .num_workers();
+        assert_eq!(workers(&["fabric", "serve"]), default);
+    }
 
     /// The signal tests send a signal to this whole process, which every
     /// handler installed in it gets, so they run one at a time.
