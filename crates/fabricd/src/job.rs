@@ -259,7 +259,7 @@ impl Job {
     /// ledger grew.
     pub fn accept(&mut self, bytes: &[u8], peer: NodeId, me: NodeId) -> Result<bool, NodeError> {
         let hash = fabric_core::id::RecordHash::of(bytes);
-        if self.ledger.records().iter().any(|r| r.hash() == hash) {
+        if self.ledger.holds(hash) {
             return Ok(false);
         }
         match self.ledger.verify(bytes, Author::Node(peer)) {
