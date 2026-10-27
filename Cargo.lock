@@ -406,6 +406,7 @@ dependencies = [
  "blake3",
  "fabric-core",
  "fabric-harness",
+ "nix",
  "proptest",
  "regex",
  "rustix",

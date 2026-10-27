@@ -1,14 +1,24 @@
 //! Durable writes.
 //!
 //! Invariant: a file written here is never seen half written under its
-//! final name. It is written to a temporary sibling, fsynced, given the
-//! mode of the file it replaces (0600 when there is none) and renamed into
-//! place, and the parent directory is fsynced after the rename, as is the
-//! parent of every directory created on the way. A temporary file is
-//! always a new file: it is created exclusively, which never follows a
-//! symlink, under a name that holds the pid, a counter and the clock, and
-//! a name already taken is skipped for the next one. A temporary file left
-//! by a killed run is recognised by its name and is never state.
+//! final name, before or after a power loss. It is written to a temporary
+//! sibling, flushed to the drive with a barrier, given the mode of the file
+//! it replaces (0600 when there is none) and renamed into place, and the
+//! parent directory is flushed through the drive's cache after the rename,
+//! so the file, its name and the name of every directory created on the
+//! way are durable when the write returns. A temporary file is always a
+//! new file: it is created exclusively, which never follows a symlink,
+//! under a name that holds the pid, a counter and the clock, and a name
+//! already taken is skipped for the next one. A temporary file left by a
+//! killed run is recognised by its name and is never state.
+//!
+//! On macOS a plain `fsync` leaves bytes in the drive's write cache, which
+//! the drive may write in any order. `F_BARRIERFSYNC` on the temporary
+//! makes every write flushed before it, the new directories' names and the
+//! file's bytes, reach the medium before any write after it, the rename
+//! included; the directory's `F_FULLFSYNC` drains the whole cache, so one
+//! full flush makes the write durable (fcntl(2); ADR 0002). Elsewhere every
+//! flush is `fsync`.
 
 #![cfg_attr(
     not(all(feature = "acp", feature = "claude", feature = "codex")),
@@ -134,10 +144,73 @@ fn open_temp(tmp: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-pub(crate) fn fsync_dir(dir: &Path) -> Result<(), HarnessError> {
+/// How far a flush takes the writes made through a descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Flush {
+    /// To the medium: `F_FULLFSYNC` on macOS, which drains the drive's
+    /// whole write cache, so every write it took before is durable too;
+    /// `fsync` elsewhere.
+    Full,
+    /// To the drive, then an I/O barrier, so no write issued after it
+    /// reaches the medium before the writes flushed before it, on any file
+    /// of the device: `F_BARRIERFSYNC` on macOS, or `F_FULLFSYNC` where the
+    /// file system has no barrier; `fsync` elsewhere.
+    Barrier,
+    /// To the drive only: `fsync`. On macOS the bytes may wait in the
+    /// drive's cache, unordered, until a later barrier or full flush on the
+    /// device.
+    Plain,
+}
+
+/// Flushes `file` as `how` says.
+pub(crate) fn flush(file: &File, how: Flush) -> io::Result<()> {
+    #[cfg(test)]
+    record::note(file, how);
+    #[cfg(target_vendor = "apple")]
+    {
+        match how {
+            Flush::Full => rustix::fs::fcntl_fullfsync(file).map_err(io::Error::from),
+            Flush::Barrier => barrier(file),
+            Flush::Plain => rustix::fs::fsync(file).map_err(io::Error::from),
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = how;
+        file.sync_all()
+    }
+}
+
+/// `F_BARRIERFSYNC`, retried when a signal interrupts it. A file system
+/// that has no barrier, which fcntl(2) says of all but HFS and APFS, gets
+/// `F_FULLFSYNC`, which orders as well.
+#[cfg(target_vendor = "apple")]
+fn barrier(file: &File) -> io::Result<()> {
+    use nix::errno::Errno;
+    use nix::fcntl::{FcntlArg, fcntl};
+    loop {
+        match fcntl(file, FcntlArg::F_BARRIERFSYNC) {
+            Ok(_) => return Ok(()),
+            Err(Errno::EINTR) => {}
+            Err(Errno::ENOTSUP | Errno::EOPNOTSUPP | Errno::ENOTTY | Errno::EINVAL) => {
+                return rustix::fs::fcntl_fullfsync(file).map_err(io::Error::from);
+            }
+            Err(e) => return Err(io::Error::from(e)),
+        }
+    }
+}
+
+/// Flushes the directory `dir` as `how` says.
+pub(crate) fn flush_dir(dir: &Path, how: Flush) -> Result<(), HarnessError> {
     File::open(dir)
-        .and_then(|d| d.sync_all())
+        .and_then(|d| flush(&d, how))
         .map_err(|e| HarnessError::io(IoOp::Fsync, dir, e))
+}
+
+/// Flushes the directory `dir` through the drive's cache, so the names
+/// created, renamed or removed in it are durable.
+pub(crate) fn fsync_dir(dir: &Path) -> Result<(), HarnessError> {
+    flush_dir(dir, Flush::Full)
 }
 
 /// Moves `tmp` over `dest`, giving it the mode of the file it replaces, and
@@ -155,9 +228,11 @@ fn commit(tmp: &Path, dest: &Path) -> Result<(), HarnessError> {
     fsync_dir(dest.parent().unwrap_or(Path::new(".")))
 }
 
-/// Creates `dir` and every missing ancestor one at a time, fsyncing the
-/// parent of each new directory, so a file renamed into it later is not
-/// lost with its directory entry on a power cut.
+/// Creates `dir` and every missing ancestor one at a time, flushing the
+/// parent of each new directory to the drive, so a file renamed into it
+/// later is not lost with its directory entry on a power cut: the barrier
+/// before that rename orders these names before it, and the full flush
+/// after it makes them durable.
 fn create_dirs_durable(dir: &Path) -> Result<(), HarnessError> {
     let mut missing = Vec::new();
     let mut at = dir;
@@ -180,7 +255,7 @@ fn create_dirs_durable(dir: &Path) -> Result<(), HarnessError> {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(HarnessError::io(IoOp::CreateDir, new, e)),
         }
-        fsync_dir(new.parent().unwrap_or(Path::new(".")))?;
+        flush_dir(new.parent().unwrap_or(Path::new(".")), Flush::Plain)?;
     }
     Ok(())
 }
@@ -202,9 +277,10 @@ pub(crate) fn rename_durable(from: &Path, to: &Path) -> Result<(), HarnessError>
 }
 
 /// Writes a file through a temporary sibling and a rename, letting
-/// `produce` write the bytes. The file gets mode 0600, or the mode of the file it
-/// replaces, and the parent directory is fsynced after the rename, as is the
-/// parent of every directory created on the way.
+/// `produce` write the bytes. The file gets mode 0600, or the mode of the
+/// file it replaces; the temporary is flushed with a barrier before the
+/// rename and the parent directory through the drive's cache after it, so
+/// the file and every directory created on the way are durable at return.
 pub(crate) fn write_atomic_with<F>(path: &Path, produce: F) -> Result<Written, HarnessError>
 where
     F: FnOnce(&mut dyn Write) -> Result<(), HarnessError>,
@@ -213,7 +289,7 @@ where
 }
 
 /// `write_atomic_with`, running `check` once the temporary file is
-/// written and synced and just before the rename; an error from it leaves
+/// written and flushed and just before the rename; an error from it leaves
 /// `path` as it was and removes the temporary file.
 pub(crate) fn write_atomic_checked<F, C>(
     path: &Path,
@@ -233,8 +309,7 @@ where
             .into_inner()
             .map_err(|e| HarnessError::io(IoOp::Write, &tmp, e.into_error()))?;
         let (file, written) = hashing.finish();
-        file.sync_all()
-            .map_err(|e| HarnessError::io(IoOp::Write, &tmp, e))?;
+        flush(&file, Flush::Barrier).map_err(|e| HarnessError::io(IoOp::Write, &tmp, e))?;
         check()?;
         commit(&tmp, path)?;
         Ok(written)
@@ -254,9 +329,103 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), HarnessError
     .map(|_| ())
 }
 
+/// The flushes a test asks for: which kind, on which file, in which order.
+#[cfg(test)]
+pub(crate) mod record {
+    use std::cell::RefCell;
+    use std::fs::File;
+    use std::path::PathBuf;
+
+    use super::Flush;
+
+    thread_local! {
+        static LOG: RefCell<Option<Vec<(Flush, PathBuf)>>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `body` and returns what it returned with the flushes it asked
+    /// for on this thread, each with the path its descriptor had then.
+    pub(crate) fn flushes<T>(body: impl FnOnce() -> T) -> (T, Vec<(Flush, PathBuf)>) {
+        LOG.with(|log| *log.borrow_mut() = Some(Vec::new()));
+        let out = body();
+        let log = LOG.with(|log| log.borrow_mut().take()).unwrap_or_default();
+        (out, log)
+    }
+
+    pub(super) fn note(file: &File, how: Flush) {
+        LOG.with(|log| {
+            if let Some(log) = log.borrow_mut().as_mut() {
+                log.push((how, path_of(file)));
+            }
+        });
+    }
+
+    /// Where the file open as `file` is named now.
+    fn path_of(file: &File) -> PathBuf {
+        #[cfg(target_vendor = "apple")]
+        {
+            let mut path = PathBuf::new();
+            nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_GETPATH(&mut path)).unwrap();
+            path
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            use std::os::fd::AsRawFd;
+            std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap()
+        }
+    }
+
+    /// Each flush as its kind and where it went: the directory flushed, or
+    /// `tmp:<dir>` for a temporary file of this module in `<dir>`, whose
+    /// name holds the clock. Paths are relative to `root`, which may sit
+    /// behind a link, as `/var` does on macOS.
+    pub(crate) fn shape(log: &[(Flush, PathBuf)], root: &std::path::Path) -> Vec<(Flush, String)> {
+        let root = root.canonicalize().unwrap();
+        log.iter()
+            .map(|(how, path)| {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let at = |p: &std::path::Path| {
+                    p.strip_prefix(&root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                let place = if super::is_temp_name(name) {
+                    format!("tmp:{}", at(path.parent().unwrap()))
+                } else {
+                    at(path)
+                };
+                (*how, place)
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two directories are new, so their names are flushed to the drive;
+    /// the barrier on the temporary orders them and the bytes before the
+    /// rename, and the one full flush, of the parent after the rename,
+    /// makes all of it durable. Before, each of the four was a full flush
+    /// of about 5.5 ms on APFS.
+    #[test]
+    fn an_atomic_write_orders_with_a_barrier_and_flushes_the_drive_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("a/b/dest");
+        let (written, log) = record::flushes(|| write_atomic(&dest, b"new"));
+        written.unwrap();
+        assert_eq!(
+            record::shape(&log, dir.path()),
+            vec![
+                (Flush::Plain, String::new()),
+                (Flush::Plain, "a".to_owned()),
+                (Flush::Barrier, "tmp:a/b".to_owned()),
+                (Flush::Full, "a/b".to_owned()),
+            ]
+        );
+        assert_eq!(fs::read(&dest).unwrap(), b"new");
+    }
 
     #[test]
     fn a_temporary_name_taken_by_a_symlink_is_never_written_through() {
