@@ -1,10 +1,11 @@
 //! The `-c` overrides a Codex launch passes.
 //!
-//! Invariant: only the settings ADR 0006 names (sandbox, approval
-//! policy and approvals reviewer, model, reasoning effort, and the model
-//! provider the session's model ran on) can be expressed, each from a
-//! closed set or a parsed name, so neither a job record nor a session
-//! record can set another project's trust or any other key. A provider
+//! Invariant: only the settings ADR 0006 names (sandbox, with what a
+//! session's `workspace-write` sandbox allowed beyond the workspace,
+//! approval policy and approvals reviewer, model, reasoning effort, and
+//! the model provider the session's model ran on) can be expressed, each
+//! from a closed set or a parsed name, so neither a job record nor a
+//! session record can set another project's trust or any other key. A provider
 //! id only names an entry of `model_providers` this node already
 //! defines, or a built-in one; it cannot define one. `danger-full-access` is left out on purpose: adding it is
 //! a decision, not a missing case. Values checked against `codex
@@ -72,6 +73,22 @@
 //! `codex-rs/core/src/config/mod.rs`), which says plainly what a model
 //! sent to the wrong provider would not. A provider cannot be pinned.
 //!
+//! A sandbox is more than its mode (M2-21). A `workspace-write` turn
+//! records what it allowed beyond the workspace in its `sandbox_policy`:
+//! `writable_roots`, `network_access`, `exclude_tmpdir_env_var` and
+//! `exclude_slash_tmp`, the fields of `[sandbox_workspace_write]`, which
+//! Codex 0.155.1 reads only with `sandbox_mode = "workspace-write"`
+//! (`derive_permission_profile` in `codex-rs/config/src/config_toml.rs`
+//! at `rust-v0.155.1`). They travel with the session's own mode and only
+//! with it, as `-c sandbox_workspace_write.*` right after it, so this
+//! node's own table neither widens nor narrows the session's sandbox; a
+//! record that omits the list of roots, as 0.155.1 does when it is empty,
+//! passes an empty one. Each root is an absolute path with no control
+//! character, passed as a quoted TOML string. A pinned mode takes this
+//! node's table, and the session's are reported as left out. A read-only
+//! sandbox's network access is reported, never passed: Codex takes none
+//! for read-only from its configuration.
+//!
 //! A resume takes these settings from the session (`rollout::recorded`),
 //! and any field the adapter was configured with wins over the session's
 //! (`effective`). A launch with no session passes only what was configured.
@@ -113,21 +130,25 @@ impl ProviderId {
 }
 
 /// The `sandbox_mode` a run uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxMode {
     /// `read-only`.
     ReadOnly,
-    /// `workspace-write`.
+    /// `workspace-write`, with what this node's own
+    /// `[sandbox_workspace_write]` allows beyond the workspace.
     WorkspaceWrite,
+    /// `workspace-write`, with what a session's own sandbox allowed beyond
+    /// the workspace, passed in place of this node's (M2-21).
+    WorkspaceWriteWith(SandboxAccess),
 }
 
 impl SandboxMode {
     /// The spelling Codex uses, in `-c` and in its records.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             SandboxMode::ReadOnly => "read-only",
-            SandboxMode::WorkspaceWrite => "workspace-write",
+            SandboxMode::WorkspaceWrite | SandboxMode::WorkspaceWriteWith(_) => "workspace-write",
         }
     }
 
@@ -138,6 +159,130 @@ impl SandboxMode {
             .into_iter()
             .find(|mode| mode.as_str() == text)
     }
+}
+
+/// A folder a `workspace-write` sandbox may write beyond the workspace: an
+/// absolute path with no control character, which travels inside a quoted
+/// TOML string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WritableRoot(String);
+
+impl WritableRoot {
+    /// Checks `text` and wraps it; says why when it is no such path.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        if !text.starts_with('/') {
+            return Err("not an absolute path".to_owned());
+        }
+        if text.chars().any(char::is_control) {
+            return Err("holds a control character".to_owned());
+        }
+        Ok(WritableRoot(text.to_owned()))
+    }
+
+    /// The path as given.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// What a `workspace-write` sandbox may write beyond the workspace, as
+/// Codex 0.155.1 reads it from `[sandbox_workspace_write]`
+/// (`SandboxWorkspaceWrite` in `codex-rs/config/src/types.rs` at
+/// `rust-v0.155.1`) and records it in a `turn_context`'s
+/// `sandbox_policy`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WritableRoots {
+    /// `writable_roots`: folders beyond the workspace. A record omits the
+    /// list when it is empty.
+    pub roots: Vec<WritableRoot>,
+    /// `exclude_tmpdir_env_var`: `$TMPDIR` is left out; `None` when not
+    /// recorded, so this node's own applies.
+    pub exclude_tmpdir_env_var: Option<bool>,
+    /// `exclude_slash_tmp`: `/tmp` is left out; `None` when not recorded.
+    pub exclude_slash_tmp: Option<bool>,
+}
+
+impl WritableRoots {
+    /// How the CLI says it: `[/a, /b]` or `none`, and what it leaves out.
+    #[must_use]
+    pub fn spelled(&self) -> String {
+        let mut text = if self.roots.is_empty() {
+            "none".to_owned()
+        } else {
+            let roots: Vec<&str> = self.roots.iter().map(WritableRoot::as_str).collect();
+            format!("[{}]", roots.join(", "))
+        };
+        match (
+            self.exclude_slash_tmp == Some(true),
+            self.exclude_tmpdir_env_var == Some(true),
+        ) {
+            (true, true) => text.push_str(" without /tmp or TMPDIR"),
+            (true, false) => text.push_str(" without /tmp"),
+            (false, true) => text.push_str(" without TMPDIR"),
+            (false, false) => {}
+        }
+        text
+    }
+}
+
+/// What a session's `workspace-write` sandbox allowed beyond the
+/// workspace: its writable roots and its network access, each `None`
+/// when the record does not hold it, so this node's own applies.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SandboxAccess {
+    /// The writable roots and the temporary folders left out.
+    pub writable: Option<WritableRoots>,
+    /// `network_access`: commands may reach the network.
+    pub network_access: Option<bool>,
+}
+
+impl SandboxAccess {
+    /// The `sandbox_workspace_write.*` pairs, each passed after a `-c`.
+    fn pairs(&self) -> Vec<String> {
+        const TABLE: &str = "sandbox_workspace_write";
+        let mut pairs = Vec::new();
+        if let Some(writable) = &self.writable {
+            let roots: Vec<String> = writable
+                .roots
+                .iter()
+                .map(|root| toml_string(root.as_str()))
+                .collect();
+            pairs.push(format!("{TABLE}.writable_roots=[{}]", roots.join(",")));
+        }
+        if let Some(network) = self.network_access {
+            pairs.push(format!("{TABLE}.network_access={network}"));
+        }
+        if let Some(writable) = &self.writable {
+            if let Some(exclude) = writable.exclude_tmpdir_env_var {
+                pairs.push(format!("{TABLE}.exclude_tmpdir_env_var={exclude}"));
+            }
+            if let Some(exclude) = writable.exclude_slash_tmp {
+                pairs.push(format!("{TABLE}.exclude_slash_tmp={exclude}"));
+            }
+        }
+        pairs
+    }
+}
+
+/// `text` as a TOML basic string. A `WritableRoot` holds no control
+/// character, so only the quote and the backslash need escaping.
+fn toml_string(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('"');
+    for c in text.chars() {
+        if matches!(c, '"' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// How a network access is said: `on` or `off`.
+fn network_spelled(on: bool) -> &'static str {
+    if on { "on" } else { "off" }
 }
 
 /// The `approval_policy` a run uses.
@@ -292,8 +437,11 @@ impl CodexOverrides {
         if let Some(effort) = self.effort {
             pairs.push(format!("model_reasoning_effort=\"{}\"", effort.as_str()));
         }
-        if let Some(sandbox) = self.sandbox {
+        if let Some(sandbox) = &self.sandbox {
             pairs.push(format!("sandbox_mode=\"{}\"", sandbox.as_str()));
+            if let SandboxMode::WorkspaceWriteWith(access) = sandbox {
+                pairs.extend(access.pairs());
+            }
         }
         if let Some(approval) = self.approval {
             pairs.push(format!("approval_policy=\"{}\"", approval.as_str()));
@@ -456,6 +604,98 @@ fn model_and_provider(
     (model, None)
 }
 
+/// Why a launch that does not pass the session's sandbox does not pass
+/// what it allowed beyond the workspace either.
+const ACCESS_GOES_WITH_SANDBOX: &str =
+    "it goes with the session's sandbox, which this launch does not pass";
+
+/// The sandbox a launch passes, the pin or else the session's, and what
+/// the session's `workspace-write` sandbox allowed beyond the workspace,
+/// its writable roots and network access, which travel with the session's
+/// own mode and only with it (M2-21): passed with it, this node's
+/// `[sandbox_workspace_write]` neither widens nor narrows the session's
+/// sandbox. When the mode passed is a pin, the session's are reported as
+/// left out, and a pin's own are passed.
+fn sandbox_and_access(
+    pinned: Option<&SandboxMode>,
+    recorded: Option<&RecordedSettings>,
+    report: &mut LaunchSettings,
+) -> Option<SandboxMode> {
+    let recorded_sandbox = recorded.map(|r| &r.sandbox);
+    let session_sandbox =
+        pinned.is_none() && matches!(recorded_sandbox, Some(Recorded::Carried(_)));
+    let sandbox = pick(
+        SettingName::Sandbox,
+        pinned,
+        recorded_sandbox,
+        |v| v.as_str().to_owned(),
+        report,
+    );
+    let writable = recorded.map(|r| &r.writable);
+    let network = recorded.map(|r| &r.network);
+    let spell_network = |v: &bool| network_spelled(*v).to_owned();
+    if session_sandbox && sandbox == Some(SandboxMode::WorkspaceWrite) {
+        let writable = pick(
+            SettingName::WritableRoots,
+            None,
+            writable,
+            WritableRoots::spelled,
+            report,
+        );
+        let network_access = pick(
+            SettingName::NetworkAccess,
+            None,
+            network,
+            spell_network,
+            report,
+        );
+        if writable.is_none() && network_access.is_none() {
+            return sandbox;
+        }
+        return Some(SandboxMode::WorkspaceWriteWith(SandboxAccess {
+            writable,
+            network_access,
+        }));
+    }
+    if let Some(SandboxMode::WorkspaceWriteWith(access)) = &sandbox {
+        if let Some(pin) = &access.writable {
+            pick(
+                SettingName::WritableRoots,
+                Some(pin),
+                None,
+                WritableRoots::spelled,
+                report,
+            );
+        }
+        if let Some(pin) = &access.network_access {
+            pick(
+                SettingName::NetworkAccess,
+                Some(pin),
+                None,
+                spell_network,
+                report,
+            );
+        }
+    }
+    leave_out(
+        SettingName::WritableRoots,
+        None,
+        writable,
+        WritableRoots::spelled,
+        ACCESS_GOES_WITH_SANDBOX,
+        report,
+    );
+    leave_out(
+        SettingName::NetworkAccess,
+        None,
+        network,
+        spell_network,
+        ACCESS_GOES_WITH_SANDBOX,
+        report,
+    );
+    sandbox
+}
+
 /// The overrides a launch passes, and what to say about them: each field
 /// the adapter was configured with, else the session's own when the
 /// launch resumes one and Fabric carries its value. A `headless` launch
@@ -480,11 +720,9 @@ pub(crate) fn effective(
         |v| v.as_str().to_owned(),
         &mut report,
     );
-    let sandbox = pick(
-        SettingName::Sandbox,
+    let sandbox = sandbox_and_access(
         pinned.and_then(|p| p.sandbox.as_ref()),
-        recorded.map(|r| &r.sandbox),
-        |v| v.as_str().to_owned(),
+        recorded,
         &mut report,
     );
     let pinned_approval = pinned.and_then(|p| p.approval.as_ref());
@@ -574,6 +812,8 @@ mod tests {
             approval: Recorded::Carried(ApprovalPolicy::OnRequest),
             reviewer: Recorded::Carried(ApprovalsReviewer::User),
             sandbox: Recorded::Carried(SandboxMode::WorkspaceWrite),
+            writable: Recorded::Absent,
+            network: Recorded::Absent,
             writer: None,
         }
     }
@@ -764,6 +1004,173 @@ mod tests {
                 .iter()
                 .all(|n| n.name != SettingName::Reviewer)
         );
+    }
+
+    /// The writable roots and network access of the session's own
+    /// sandbox.
+    fn access() -> (WritableRoots, bool) {
+        (
+            WritableRoots {
+                roots: vec![
+                    WritableRoot::parse("/w/extra").unwrap(),
+                    WritableRoot::parse("/tmp/a \"b\\c").unwrap(),
+                ],
+                exclude_tmpdir_env_var: Some(false),
+                exclude_slash_tmp: Some(true),
+            },
+            true,
+        )
+    }
+
+    fn with_access() -> RecordedSettings {
+        let (writable, network) = access();
+        RecordedSettings {
+            writable: Recorded::Carried(writable),
+            network: Recorded::Carried(network),
+            ..recorded()
+        }
+    }
+
+    /// M2-21: what the session's `workspace-write` sandbox allowed beyond
+    /// the workspace travels with the session's mode, right after it, as
+    /// `sandbox_workspace_write.*`, each root a quoted TOML string, and the
+    /// launch says so.
+    #[test]
+    fn the_session_s_sandbox_travels_whole() {
+        for headless in [true, false] {
+            let (overrides, report) = effective(None, Some(&with_access()), headless);
+            let pairs = overrides.pairs();
+            let at = pairs
+                .iter()
+                .position(|p| p == "sandbox_mode=\"workspace-write\"")
+                .unwrap();
+            assert_eq!(
+                pairs[at..at + 5],
+                [
+                    "sandbox_mode=\"workspace-write\"",
+                    r#"sandbox_workspace_write.writable_roots=["/w/extra","/tmp/a \"b\\c"]"#,
+                    "sandbox_workspace_write.network_access=true",
+                    "sandbox_workspace_write.exclude_tmpdir_env_var=false",
+                    "sandbox_workspace_write.exclude_slash_tmp=true",
+                ]
+            );
+            let passed: Vec<(SettingName, &str, Origin)> = report
+                .passed
+                .iter()
+                .map(|p| (p.name, p.value.as_str(), p.origin))
+                .filter(|(name, _, _)| {
+                    matches!(
+                        name,
+                        SettingName::Sandbox
+                            | SettingName::WritableRoots
+                            | SettingName::NetworkAccess
+                    )
+                })
+                .collect();
+            assert_eq!(
+                passed,
+                [
+                    (SettingName::Sandbox, "workspace-write", Origin::Session),
+                    (
+                        SettingName::WritableRoots,
+                        "[/w/extra, /tmp/a \"b\\c] without /tmp",
+                        Origin::Session
+                    ),
+                    (SettingName::NetworkAccess, "on", Origin::Session),
+                ]
+            );
+        }
+    }
+
+    /// A pinned sandbox is this node's choice: the session's writable
+    /// roots and network access do not go with it, and are said to be
+    /// left out; a pin that names its own are passed as pinned.
+    #[test]
+    fn a_pinned_sandbox_leaves_the_session_s_access_out() {
+        let left_out = [
+            NotCarried::new(
+                SettingName::WritableRoots,
+                "[/w/extra, /tmp/a \"b\\c] without /tmp",
+                ACCESS_GOES_WITH_SANDBOX,
+            ),
+            NotCarried::new(SettingName::NetworkAccess, "on", ACCESS_GOES_WITH_SANDBOX),
+        ];
+        for mode in [SandboxMode::ReadOnly, SandboxMode::WorkspaceWrite] {
+            let pinned = CodexOverrides {
+                sandbox: Some(mode.clone()),
+                ..CodexOverrides::default()
+            };
+            let (overrides, report) = effective(Some(&pinned), Some(&with_access()), false);
+            assert_eq!(overrides.settings.sandbox, Some(mode));
+            assert!(
+                overrides
+                    .pairs()
+                    .iter()
+                    .all(|p| !p.starts_with("sandbox_workspace_write.")),
+                "{overrides:?}"
+            );
+            for left in &left_out {
+                assert!(report.not_carried.contains(left), "{report:?}");
+            }
+        }
+
+        let (writable, _) = access();
+        let pinned = CodexOverrides {
+            sandbox: Some(SandboxMode::WorkspaceWriteWith(SandboxAccess {
+                writable: Some(WritableRoots {
+                    roots: writable.roots[..1].to_vec(),
+                    ..WritableRoots::default()
+                }),
+                network_access: Some(false),
+            })),
+            ..CodexOverrides::default()
+        };
+        let (overrides, report) = effective(Some(&pinned), Some(&with_access()), true);
+        let pairs = overrides.pairs();
+        assert!(
+            pairs.contains(&r#"sandbox_workspace_write.writable_roots=["/w/extra"]"#.to_owned())
+                && pairs.contains(&"sandbox_workspace_write.network_access=false".to_owned()),
+            "{pairs:?}"
+        );
+        assert!(report.passed.contains(&PassedSetting {
+            name: SettingName::NetworkAccess,
+            value: "off".to_owned(),
+            origin: Origin::Pinned,
+        }));
+        assert!(report.not_carried.contains(&left_out[1]), "{report:?}");
+    }
+
+    /// A read-only session that reached the network passes its mode and
+    /// says the network access was left out, with why.
+    #[test]
+    fn a_read_only_session_s_network_access_is_reported_not_passed() {
+        let session = RecordedSettings {
+            sandbox: Recorded::Carried(SandboxMode::ReadOnly),
+            network: Recorded::NotCarried {
+                value: "on".to_owned(),
+                reason: "codex takes none for read-only".to_owned(),
+            },
+            ..recorded()
+        };
+        let (overrides, report) = effective(None, Some(&session), false);
+        assert_eq!(overrides.settings.sandbox, Some(SandboxMode::ReadOnly));
+        assert!(
+            report.not_carried.contains(&NotCarried::new(
+                SettingName::NetworkAccess,
+                "on",
+                "codex takes none for read-only"
+            )),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn a_writable_root_is_an_absolute_path_without_control_characters() {
+        assert!(WritableRoot::parse("/a/b c").is_ok());
+        assert!(WritableRoot::parse("a/b").is_err());
+        assert!(WritableRoot::parse("").is_err());
+        assert!(WritableRoot::parse("/a\nb").is_err());
+        assert!(WritableRoot::parse("/a\u{7f}").is_err());
     }
 
     /// A model is served by a provider, and Codex sends this node's

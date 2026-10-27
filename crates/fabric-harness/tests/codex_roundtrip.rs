@@ -972,3 +972,94 @@ async fn a_headless_launch_runs_nothing_until_it_is_released() {
     assert!(running.child_mut().wait().await.unwrap().success());
     assert!(log.exists());
 }
+
+/// M2-21: a resume carries the session's whole sandbox, not only its
+/// mode. The writable roots, network access and temporary-directory rules
+/// the last turn recorded travel as `-c sandbox_workspace_write.*` right
+/// after `sandbox_mode`, so this node's own `[sandbox_workspace_write]`
+/// neither widens nor narrows them, and the CLI says what it passed.
+#[tokio::test]
+async fn a_resume_carries_the_session_s_writable_roots_and_network_access() {
+    let src = build_source();
+    let home = src.home.path().canonicalize().unwrap();
+    let extra = home.join("extra");
+    let record = format!(
+        "{{\"type\":\"turn_context\",\"payload\":{{\"cwd\":\"{}\",\"sandbox_policy\":{{\"type\":\"workspace-write\",\"writable_roots\":[\"{}\",\"/tmp/scratch\"],\"network_access\":true,\"exclude_tmpdir_env_var\":false,\"exclude_slash_tmp\":true}}}}}}\n",
+        src.work.display(),
+        extra.display()
+    );
+    let mut head = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&src.head)
+        .unwrap();
+    head.write_all(record.as_bytes()).unwrap();
+    drop(head);
+    let (_, bin) = fake_codex_reporting(&home, LOCKING_VERSION);
+    let adapter = Codex::new(abs(&home), bin.clone());
+    let log = home.join("log.txt");
+    let env = vec![
+        (
+            EnvVarName::parse("HOME").unwrap(),
+            home.to_string_lossy().into_owned(),
+        ),
+        (
+            EnvVarName::parse("PATH").unwrap(),
+            format!("{}:/usr/bin:/bin", bin.to_string_lossy()),
+        ),
+        (
+            EnvVarName::parse("FAKE_LOG").unwrap(),
+            log.to_string_lossy().into_owned(),
+        ),
+    ];
+    let mut running = adapter
+        .launch(
+            &src.work,
+            Launch::Headless {
+                resume: Some(thread()),
+                prompt: "next".to_owned(),
+            },
+            &env,
+        )
+        .await
+        .unwrap();
+    running.release().unwrap();
+    assert!(running.child_mut().wait().await.unwrap().success());
+    let seen = std::fs::read_to_string(&log).unwrap();
+    let pairs: Vec<&str> = seen
+        .lines()
+        .filter_map(|line| line.strip_prefix("arg="))
+        .filter(|arg| arg.starts_with("sandbox"))
+        .collect();
+    let roots = format!(
+        "sandbox_workspace_write.writable_roots=[\"{}\",\"/tmp/scratch\"]",
+        extra.display()
+    );
+    assert_eq!(
+        pairs,
+        [
+            "sandbox_mode=\"workspace-write\"",
+            roots.as_str(),
+            "sandbox_workspace_write.network_access=true",
+            "sandbox_workspace_write.exclude_tmpdir_env_var=false",
+            "sandbox_workspace_write.exclude_slash_tmp=true",
+        ],
+        "{seen}"
+    );
+    let passed: Vec<String> = running
+        .settings()
+        .passed
+        .iter()
+        .map(|p| format!("{} {}", p.name, p.value))
+        .collect();
+    assert_eq!(
+        passed,
+        [
+            "sandbox workspace-write".to_owned(),
+            format!(
+                "writable roots [{}, /tmp/scratch] without /tmp",
+                extra.display()
+            ),
+            "network access on".to_owned(),
+        ]
+    );
+}

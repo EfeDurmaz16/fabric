@@ -137,6 +137,10 @@ pub enum SettingName {
     Effort,
     /// The sandbox commands run in.
     Sandbox,
+    /// What a sandbox lets commands write beyond the workspace.
+    WritableRoots,
+    /// Whether a sandbox lets commands reach the network.
+    NetworkAccess,
     /// When the harness asks before it runs a command.
     Approval,
     /// Who answers what the harness asks: the user, or a reviewer model.
@@ -150,6 +154,8 @@ impl std::fmt::Display for SettingName {
             SettingName::Provider => "model provider",
             SettingName::Effort => "effort",
             SettingName::Sandbox => "sandbox",
+            SettingName::WritableRoots => "writable roots",
+            SettingName::NetworkAccess => "network access",
             SettingName::Approval => "approval",
             SettingName::Reviewer => "approvals reviewer",
         })
