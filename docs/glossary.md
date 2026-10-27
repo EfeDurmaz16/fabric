@@ -8,6 +8,10 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Blob.** Bytes stored by hash. Chunks and manifests are both blobs.
 
+**Bridge.** The framed stdio protocol between Fabric and a Capsule provider worker, version 1 (ADR 0021, docs/bridge-protocol.md). Fabric keeps job identity and the journal; the worker maps one governed action at a time onto a provider and reports what it observed.
+
+**Capability profile.** The document a bridge worker sends in its handshake and enforces: which actions it can invoke, which are terminal-only, which support observe, cancel and fresh approval, and how its resource locators are scoped. A missing capability blocks the workflow that needs it.
+
 **Carry key.** The exact strings a cache depends on (Node major and package manager, `rustc -vV` and `CARGO_HOME`, Python version and home). Recorded per cache in the snapshot; the target compares them with its own before trusting the bytes.
 
 **Catalog.** The SQLite database in a store that maps snapshot ids to manifests and chunk ids to on-disk files, and records which chunks each snapshot references.
