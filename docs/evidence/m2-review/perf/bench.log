@@ -1,0 +1,206 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running tests/e2e/main.rs (target/debug/deps/e2e-5884a725b54d94a6)
+
+running 1 test
+RAW	acp approve	0	13935
+RAW	acp approve	1	13899
+RAW	acp approve	2	14796
+RAW	acp approve	3	15922
+RAW	acp approve	4	14822
+RAW	acp approve	5	14972
+RAW	acp approve	6	14065
+RAW	acp approve	7	13824
+RAW	acp approve	8	15032
+RAW	acp approve	9	14764
+RAW	acp approve	10	15920
+RAW	acp approve	11	13770
+RAW	acp approve	12	14171
+RAW	acp approve	13	14927
+RAW	acp approve	14	13769
+RAW	acp launch	0	58900
+RAW	acp launch	1	55729
+RAW	acp launch	2	65781
+RAW	acp launch	3	61755
+RAW	acp launch	4	57632
+RAW	acp launch	5	54701
+RAW	acp launch	6	56111
+RAW	acp launch	7	64736
+RAW	acp launch	8	60538
+RAW	acp launch	9	57871
+RAW	acp launch	10	58869
+RAW	acp launch	11	58031
+RAW	acp launch	12	58750
+RAW	acp launch	13	57694
+RAW	acp launch	14	58933
+RAW	acp new	0	143379
+RAW	acp new	1	136227
+RAW	acp new	2	139766
+RAW	acp new	3	140705
+RAW	acp new	4	141657
+RAW	acp new	5	136255
+RAW	acp new	6	137838
+RAW	acp new	7	151146
+RAW	acp new	8	138536
+RAW	acp new	9	140958
+RAW	acp new	10	141153
+RAW	acp new	11	140967
+RAW	acp new	12	138825
+RAW	acp new	13	139307
+RAW	acp new	14	139306
+RAW	claude approve	0	13832
+RAW	claude approve	1	15779
+RAW	claude approve	2	15464
+RAW	claude approve	3	15910
+RAW	claude approve	4	15962
+RAW	claude approve	5	14026
+RAW	claude approve	6	14946
+RAW	claude approve	7	15627
+RAW	claude approve	8	15861
+RAW	claude approve	9	16793
+RAW	claude approve	10	13980
+RAW	claude approve	11	15146
+RAW	claude approve	12	13978
+RAW	claude approve	13	14829
+RAW	claude approve	14	13751
+RAW	claude launch	0	102900
+RAW	claude launch	1	100921
+RAW	claude launch	2	108181
+RAW	claude launch	3	105754
+RAW	claude launch	4	101784
+RAW	claude launch	5	100649
+RAW	claude launch	6	99784
+RAW	claude launch	7	105187
+RAW	claude launch	8	104884
+RAW	claude launch	9	107910
+RAW	claude launch	10	103755
+RAW	claude launch	11	101670
+RAW	claude launch	12	101882
+RAW	claude launch	13	97773
+RAW	claude launch	14	100009
+RAW	claude new	0	130161
+RAW	claude new	1	126241
+RAW	claude new	2	129460
+RAW	claude new	3	130312
+RAW	claude new	4	127127
+RAW	claude new	5	129256
+RAW	claude new	6	129750
+RAW	claude new	7	130245
+RAW	claude new	8	130268
+RAW	claude new	9	129157
+RAW	claude new	10	129095
+RAW	claude new	11	130204
+RAW	claude new	12	127989
+RAW	claude new	13	125222
+RAW	claude new	14	128278
+RAW	cli ls	0	4175
+RAW	cli ls	1	4610
+RAW	cli ls	2	4626
+RAW	cli ls	3	4905
+RAW	cli ls	4	4390
+RAW	cli ls	5	4535
+RAW	cli ls	6	5158
+RAW	cli ls	7	4853
+RAW	cli ls	8	5145
+RAW	cli ls	9	5020
+RAW	cli ls	10	5282
+RAW	cli ls	11	5338
+RAW	cli ls	12	5418
+RAW	cli ls	13	5013
+RAW	cli ls	14	5039
+RAW	cli version	0	2888
+RAW	cli version	1	3096
+RAW	cli version	2	3024
+RAW	cli version	3	3072
+RAW	cli version	4	2701
+RAW	cli version	5	2838
+RAW	cli version	6	3070
+RAW	cli version	7	3065
+RAW	cli version	8	3156
+RAW	cli version	9	3096
+RAW	cli version	10	2935
+RAW	cli version	11	3089
+RAW	cli version	12	3405
+RAW	cli version	13	2863
+RAW	cli version	14	2630
+RAW	codex approve	0	14850
+RAW	codex approve	1	16787
+RAW	codex approve	2	16754
+RAW	codex approve	3	15671
+RAW	codex approve	4	14738
+RAW	codex approve	5	15781
+RAW	codex approve	6	15674
+RAW	codex approve	7	14882
+RAW	codex approve	8	14970
+RAW	codex approve	9	15803
+RAW	codex approve	10	13848
+RAW	codex approve	11	14761
+RAW	codex approve	12	19085
+RAW	codex approve	13	14872
+RAW	codex approve	14	13741
+RAW	codex launch	0	110919
+RAW	codex launch	1	119002
+RAW	codex launch	2	118870
+RAW	codex launch	3	120116
+RAW	codex launch	4	109880
+RAW	codex launch	5	113873
+RAW	codex launch	6	115971
+RAW	codex launch	7	117923
+RAW	codex launch	8	116813
+RAW	codex launch	9	116004
+RAW	codex launch	10	113799
+RAW	codex launch	11	115784
+RAW	codex launch	12	119893
+RAW	codex launch	13	111812
+RAW	codex launch	14	113058
+RAW	codex new	0	128197
+RAW	codex new	1	129359
+RAW	codex new	2	131373
+RAW	codex new	3	139090
+RAW	codex new	4	124278
+RAW	codex new	5	129317
+RAW	codex new	6	128490
+RAW	codex new	7	129236
+RAW	codex new	8	129202
+RAW	codex new	9	129266
+RAW	codex new	10	131372
+RAW	codex new	11	130214
+RAW	codex new	12	130241
+RAW	codex new	13	129405
+RAW	codex new	14	127120
+RAW	ledger append	0	14097
+RAW	ledger append	1	13864
+RAW	ledger append	2	15100
+RAW	ledger append	3	13837
+RAW	ledger append	4	14081
+RAW	ledger append	5	14160
+RAW	ledger append	6	15095
+RAW	ledger append	7	13884
+RAW	ledger append	8	14054
+RAW	ledger append	9	15073
+RAW	ledger append	10	14079
+RAW	ledger append	11	17187
+RAW	ledger append	12	16882
+RAW	ledger append	13	13099
+RAW	ledger append	14	14032
+
+### M2 bench, 15 runs, times in ms
+
+| op | p25 | median | p95 |
+|---|---:|---:|---:|
+| acp approve | 13.9 | 14.8 | 15.9 |
+| acp launch | 57.6 | 58.8 | 65.8 |
+| acp new | 138.5 | 139.8 | 151.1 |
+| claude approve | 14.0 | 15.1 | 16.8 |
+| claude launch | 100.6 | 101.9 | 108.2 |
+| claude new | 128.0 | 129.3 | 130.3 |
+| cli ls | 4.6 | 5.0 | 5.4 |
+| cli version | 2.9 | 3.1 | 3.4 |
+| codex approve | 14.8 | 15.0 | 19.1 |
+| codex launch | 113.1 | 116.0 | 120.1 |
+| codex new | 128.5 | 129.3 | 139.1 |
+| ledger append | 13.9 | 14.1 | 17.2 |
+
+test bench::m2_paths ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 58 filtered out; finished in 15.19s
+

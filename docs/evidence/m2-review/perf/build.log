@@ -1,0 +1,6 @@
+   Compiling fabric-harness v0.1.0 (/private/tmp/fabric-wt/m2/crates/fabric-harness)
+   Compiling fabric-client v0.1.0 (/private/tmp/fabric-wt/m2/crates/fabric-client)
+   Compiling fabricd v0.1.0 (/private/tmp/fabric-wt/m2/crates/fabricd)
+   Compiling fabric v0.1.0 (/private/tmp/fabric-wt/m2/crates/fabric)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.84s
+  Executable tests/e2e/main.rs (target/debug/deps/e2e-5884a725b54d94a6)
