@@ -1,6 +1,6 @@
 # every_shared_scenario_over_the_workers_stdio, repeated
 
-worker: the Capsule worker built in the Capsule worktree at 6f5a8d0 (merge of M1), dist identical to a fresh build of c5ff306 except test-only .d.ts files
+worker: the Capsule worker built in the Capsule worktree at 6f5a8d0 (first merge of M1); 30 more runs of the new replay against a fresh build of 9e80135 (second merge) all pass
 node: 22.23.2; host: Apple M5 Pro, macOS arm64, load average 13 to 17
 binary: the capsule_worker test binary, run with --ignored --exact every_shared_scenario_over_the_workers_stdio
 

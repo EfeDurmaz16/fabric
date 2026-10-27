@@ -4,17 +4,17 @@ Recorded on 2026-10-28, when the two M3 PRs were opened. The host is an Apple M5
 
 ## What changed since docs/evidence/m3-review
 
-- Capsule's `m3/bridge-worker` merged the moved `m1/correctness-perf-ci` (Capsule `6f5a8d0`) and fixed a CI-only test failure that M1 brought (`c5ff306`). Its worker code did not change after the review fixes; the merge brought M1's core and Docker changes under it.
+- Capsule's `m3/bridge-worker` merged the moved `m1/correctness-perf-ci` twice (Capsule `6f5a8d0`, then `9e80135` after M1 moved to `ff0b42a`). Its worker code did not change after the review fixes; the merges brought M1's core and Docker changes under it. `1e2e1cf`, the branch head, adds only evidence files after `9e80135`.
 - `0b6b3a3`: the shared scenario replay in `crates/fabric-bridge/tests/capsule_worker.rs` writes consecutive `send` steps in one write, as Capsule's own runner does. Before, `shutdown_reports_unresolved` failed about one run in 40: on the fixture's virtual clock, an `observe` that reached the worker in its own pipe read advanced before the `shutdown` drain began, so step 5 saw 4 observations against the fixture's 2.
-- The `bridge-interop` CI job now builds the worker from Capsule `c5ff306`, the head of its branch, instead of `9f5d65e`, which predates the worker's review fixes.
+- The `bridge-interop` CI job now builds the worker from Capsule `1e2e1cf`, the head of its branch, instead of `9f5d65e`, which predates the worker's review fixes.
 
 ## Interop with the Capsule worker
 
 | Run | Worker | Result |
 |---|---|---|
-| `interop-pin.log` | Capsule `c5ff306` from a fresh clone, built with the CI job's steps (`pnpm install --frozen-lockfile`, `pnpm --filter "@capsule-sdk/bridge-worker..." run build`), Docker image unset as on the runner | 8 passed, 0 failed (the Docker test reports its skip) |
+| `interop-pin.log` | Capsule `9e80135` (the worker of `1e2e1cf`) from a fresh clone, built with the CI job's steps (`pnpm install --frozen-lockfile`, `pnpm --filter "@capsule-sdk/bridge-worker..." run build`), Docker image unset as on the runner | 8 passed, 0 failed (the Docker test reports its skip) |
 | `interop-full.log` | the same build, with `CAPSULE_BRIDGE_DOCKER_IMAGE=debian:bookworm-slim` on OrbStack, Docker 29.4.0; the image was already present and nothing was pulled | 8 passed, 0 failed; no container left with a `fabric.job` label |
-| `scenario-repeats.txt` | the worker built at Capsule `6f5a8d0` (its dist equals the fresh `c5ff306` build bar test-only `.d.ts` files) | old replay (`b6b2535`) 39 of 40 pass; new replay (`0b6b3a3`) 100 of 100 pass |
+| `scenario-repeats.txt` | the worker built at Capsule `6f5a8d0` | old replay (`b6b2535`) 39 of 40 pass; new replay (`0b6b3a3`) 100 of 100 pass; the new replay against the `9e80135` build, 30 of 30 more |
 
 ## Gates
 
