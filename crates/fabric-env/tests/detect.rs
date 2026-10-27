@@ -886,3 +886,109 @@ fn a_lockfile_the_job_denies_counts_as_absent() {
     assert_eq!(commands(&found), ["cargo fetch"]);
     assert_eq!(found.node_manager(), None);
 }
+
+/// Writes `text` at `path` under `root`.
+fn edit(root: &Path, path: &str, text: &str) -> io::Result<()> {
+    fs::write(root.join(path), text)
+}
+
+/// ENV-2: what `uv pip install -r requirements.txt` reads is what proves
+/// `.venv`: every form of `-r` and `-c` pip accepts, paths relative to the
+/// file that names them, and includes of includes.
+#[test]
+fn every_included_requirements_file_is_an_input_of_the_venv() {
+    let dir = workspace(&[
+        (
+            "requirements.txt",
+            "# pins\n-r requirements/base.txt\n--constraint=constraints.txt\nflask==3 \\\n  --hash=sha256:00 # -r ignored.txt\n",
+        ),
+        ("requirements/base.txt", "-rshared/common.txt\nrequests==2\n"),
+        ("requirements/shared/common.txt", "--requirement ../../extra.txt\n"),
+        ("extra.txt", "idna==3\n"),
+        ("constraints.txt", "urllib3<3\n"),
+        ("ignored.txt", "a==1\n"),
+    ])
+    .unwrap();
+    let before = detect(dir.path(), &[]).unwrap().inputs_digest();
+    for (path, text) in [
+        (
+            "requirements/base.txt",
+            "-rshared/common.txt\nrequests==3\n",
+        ),
+        (
+            "requirements/shared/common.txt",
+            "--requirement ../../extra.txt\n#\n",
+        ),
+        ("extra.txt", "idna==4\n"),
+        ("constraints.txt", "urllib3<2\n"),
+    ] {
+        let old = fs::read_to_string(dir.path().join(path)).unwrap();
+        edit(dir.path(), path, text).unwrap();
+        assert_ne!(
+            detect(dir.path(), &[]).unwrap().inputs_digest(),
+            before,
+            "{path}"
+        );
+        edit(dir.path(), path, &old).unwrap();
+        assert_eq!(detect(dir.path(), &[]).unwrap().inputs_digest(), before);
+    }
+    edit(dir.path(), "ignored.txt", "a==2\n").unwrap();
+    assert_eq!(detect(dir.path(), &[]).unwrap().inputs_digest(), before);
+    fs::remove_file(dir.path().join("extra.txt")).unwrap();
+    assert_ne!(detect(dir.path(), &[]).unwrap().inputs_digest(), before);
+}
+
+/// Includes that name each other end, and one that leaves the workspace,
+/// goes through a link or names a URL is not followed: detection still
+/// succeeds, and only the name is an input.
+#[test]
+fn requirements_includes_that_cycle_or_leave_the_workspace_still_detect() {
+    let outside = workspace(&[("outside.txt", "a==1\n")]).unwrap();
+    let dir = workspace(&[
+        (
+            "requirements.txt",
+            "-r a.txt\n-r ../outside.txt\n-r https://example.com/r.txt\n-r ${REQS}\n-r linked/b.txt\n",
+        ),
+        ("a.txt", "-r requirements.txt\n-r a.txt\n-r ./b.txt\n"),
+        ("b.txt", "-r a.txt\nb==1\n"),
+    ])
+    .unwrap();
+    symlink(outside.path(), dir.path().join("linked")).unwrap();
+    let before = detect(dir.path(), &[]).unwrap();
+    assert_eq!(
+        commands(&before),
+        [
+            "uv venv --allow-existing .venv",
+            "uv pip install --python .venv -r requirements.txt"
+        ]
+    );
+    edit(outside.path(), "outside.txt", "a==2\n").unwrap();
+    assert_eq!(
+        detect(dir.path(), &[]).unwrap().inputs_digest(),
+        before.inputs_digest()
+    );
+    edit(dir.path(), "b.txt", "-r a.txt\nb==2\n").unwrap();
+    assert_ne!(
+        detect(dir.path(), &[]).unwrap().inputs_digest(),
+        before.inputs_digest()
+    );
+}
+
+/// An included file the job's secret patterns deny is not read, and
+/// capture leaves it behind, so its contents are not an input on either
+/// node.
+#[test]
+fn a_denied_requirements_include_is_not_read() {
+    let dir = workspace(&[
+        ("requirements.txt", "-r private/reqs.txt\n"),
+        ("private/reqs.txt", "a==1\n"),
+    ])
+    .unwrap();
+    let patterns = [fabric_core::secret::SecretPattern::parse("private").unwrap()];
+    let before = detect(dir.path(), &patterns).unwrap().inputs_digest();
+    edit(dir.path(), "private/reqs.txt", "a==2\n").unwrap();
+    assert_eq!(
+        detect(dir.path(), &patterns).unwrap().inputs_digest(),
+        before
+    );
+}

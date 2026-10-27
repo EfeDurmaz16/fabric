@@ -38,9 +38,10 @@
 //! It also hashes, without keeping them, the files each ecosystem's steps
 //! read: `package.json` with the manager's lockfiles and configuration,
 //! `Cargo.toml` and `Cargo.lock`, `pyproject.toml` and `uv.lock` or
-//! `requirements.txt`, `go.mod` and `go.sum`. The report keeps one digest
-//! per cache, which materialize writes into the cache's sentinel, so a
-//! lockfile changed since the install makes the cache stale.
+//! `requirements.txt` with every file it includes through `-r` or `-c`,
+//! `go.mod` and `go.sum`. The report keeps one digest per cache, which
+//! materialize writes into the cache's sentinel, so a lockfile changed
+//! since the install makes the cache stale.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -622,6 +623,8 @@ struct Inputs {
     rust: &'static [&'static str],
     python: &'static [&'static str],
     go: &'static [&'static str],
+    /// The digest of the files `requirements.txt` includes, when it includes any (`requirement_includes`).
+    requirement_includes: Option<blake3::Hash>,
 }
 
 impl Inputs {
@@ -659,7 +662,10 @@ impl Inputs {
     ///
     /// Each present file adds its name, a zero byte and the blake3 of its
     /// bytes, in name order; an absent or denied file adds nothing, so
-    /// adding or removing a lockfile changes the digest too.
+    /// adding or removing a lockfile changes the digest too. A cache whose
+    /// files hold `requirements.txt` also gets the digest of the files it
+    /// includes, when it includes any, so a workspace without includes
+    /// keeps the digest it had.
     fn digests(
         &self,
         reader: &Reader<'_>,
@@ -675,12 +681,20 @@ impl Inputs {
             .iter()
             .map(|cache| {
                 let mut hasher = blake3::Hasher::new();
-                for file in self.of(cache.ecosystem) {
+                let of = self.of(cache.ecosystem);
+                for file in &of {
                     if let Some(hash) = files.get(file) {
                         hasher.update(file.as_bytes());
                         hasher.update(&[0]);
                         hasher.update(hash.as_bytes());
                     }
+                }
+                if let Some(includes) = &self.requirement_includes
+                    && of.contains(&"requirements.txt")
+                {
+                    hasher.update(b"requirements.txt includes");
+                    hasher.update(&[0]);
+                    hasher.update(includes.as_bytes());
                 }
                 hasher.finalize()
             })
@@ -872,6 +886,9 @@ pub fn detect(root: &Path, recorded: &[SecretPattern]) -> Result<Detection, Dete
     }
     inputs.rust = detect_rust(&reader, &mut setup, &mut caches)?;
     inputs.python = detect_python(&reader, &mut setup, &mut caches)?;
+    if inputs.python.contains(&"requirements.txt") {
+        inputs.requirement_includes = requirement_includes(&reader)?;
+    }
     if reader.exists("go.mod")? {
         inputs.go = &["go.mod", "go.sum"];
         setup.push(FoundStep::new(go_download()?, StepScope::Outside));
@@ -1236,6 +1253,252 @@ fn detect_python(
         origin: CacheOrigin::Detected,
     });
     Ok(inputs)
+}
+
+/// The most files `requirement_includes` follows from `requirements.txt`.
+const MAX_REQUIREMENT_INCLUDES: usize = 64;
+
+/// What `requirement_includes` found at one included path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Included {
+    /// A regular file in the workspace, with the blake3 of its bytes.
+    File(blake3::Hash),
+    /// Nothing at the path.
+    Missing,
+    /// The secret policy denies the path, so capture leaves it behind.
+    Denied,
+    /// A path detection cannot follow: outside the workspace, through a
+    /// link, a URL, a variable, unreadable, or past the limit. Only its
+    /// name is in the digest, so an edit to it does not make the cache
+    /// stale; detection says so in the log.
+    Unfollowed,
+}
+
+/// Returns the digest of every file `requirements.txt` includes with
+/// `-r` or `-c` (or their long forms), following includes of includes,
+/// or `None` when it includes nothing.
+///
+/// `uv pip install -r requirements.txt` reads those files too, so a
+/// change to a pin in `requirements/base.txt` must make `.venv` stale as
+/// a change in the root file does. Paths are taken relative to the file
+/// that names them, as pip does, and must stay inside the workspace; no
+/// link is followed, a path the secret policy denies is not read, a file
+/// is read once whatever names it, so a cycle ends, and at most
+/// `MAX_REQUIREMENT_INCLUDES` files are followed. A path that cannot be
+/// followed enters the digest by name alone and is logged. Each path adds
+/// its name, a zero byte, what was found and the blake3 of a file, in
+/// path order.
+fn requirement_includes(reader: &Reader<'_>) -> Result<Option<blake3::Hash>, DetectError> {
+    if reader.denied("requirements.txt")? {
+        return Ok(None);
+    }
+    let Some(handle) = reader.open_checked("requirements.txt")? else {
+        return Ok(None);
+    };
+    let Some(text) = read_requirements(handle) else {
+        return Ok(None);
+    };
+    let mut found: BTreeMap<String, Included> = BTreeMap::new();
+    let mut queue: Vec<(String, String)> = vec![(String::new(), text)];
+    while let Some((dir, text)) = queue.pop() {
+        for named in requirement_include_names(&text) {
+            let Some(path) = resolve_include(&dir, &named) else {
+                if found.insert(named.clone(), Included::Unfollowed).is_none() {
+                    tracing::warn!(
+                        include = %named,
+                        "requirements include not followed: outside the workspace, a URL or a variable; .venv freshness does not cover its contents"
+                    );
+                }
+                continue;
+            };
+            if path.as_str() == "requirements.txt" || found.contains_key(path.as_str()) {
+                continue;
+            }
+            if found.len() >= MAX_REQUIREMENT_INCLUDES {
+                found.insert(path.as_str().to_owned(), Included::Unfollowed);
+                tracing::warn!(
+                    include = %path,
+                    limit = MAX_REQUIREMENT_INCLUDES,
+                    "requirements include not followed: too many includes; .venv freshness does not cover its contents"
+                );
+                continue;
+            }
+            let (state, text) = read_include(reader, &path);
+            if state == Included::Unfollowed {
+                tracing::warn!(
+                    include = %path,
+                    "requirements include not followed: a link, not a regular file, or unreadable; .venv freshness does not cover its contents"
+                );
+            }
+            found.insert(path.as_str().to_owned(), state);
+            if let Some(text) = text {
+                let dir = path
+                    .as_str()
+                    .rsplit_once('/')
+                    .map_or("", |(dir, _)| dir)
+                    .to_owned();
+                queue.push((dir, text));
+            }
+        }
+    }
+    if found.is_empty() {
+        return Ok(None);
+    }
+    let mut hasher = blake3::Hasher::new();
+    for (path, state) in &found {
+        hasher.update(path.as_bytes());
+        hasher.update(&[0]);
+        match state {
+            Included::File(hash) => {
+                hasher.update(b"F");
+                hasher.update(hash.as_bytes());
+            }
+            Included::Missing => {
+                hasher.update(b"M");
+            }
+            Included::Denied => {
+                hasher.update(b"D");
+            }
+            Included::Unfollowed => {
+                hasher.update(b"U");
+            }
+        }
+    }
+    Ok(Some(hasher.finalize()))
+}
+
+/// Reads a requirements file as UTF-8 text no longer than `MAX_FILE_LEN`, or `None` when it is not one.
+fn read_requirements(handle: fs::File) -> Option<String> {
+    let mut bytes = Vec::new();
+    handle.take(MAX_FILE_LEN + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_FILE_LEN {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Returns the paths a requirements file includes, as written: the value
+/// of `-r`, `-c`, `--requirement` and `--constraint`, in any of the forms
+/// pip accepts (`-r x`, `-rx`, `--requirement x`, `--requirement=x`), on
+/// lines joined at a trailing backslash and with comments removed.
+fn requirement_include_names(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut logical = String::new();
+    for line in text.lines() {
+        if let Some(joined) = line.strip_suffix('\\') {
+            logical.push_str(joined);
+            continue;
+        }
+        logical.push_str(line);
+        let content = strip_requirement_comment(&logical);
+        let mut words = content.split_whitespace();
+        // An option starts the line; what follows a requirement is its own
+        // options, such as `--hash`, never an include.
+        if let Some(word) = words.next() {
+            let value = match word {
+                "-r" | "-c" | "--requirement" | "--constraint" => words.next(),
+                _ => word
+                    .strip_prefix("--requirement=")
+                    .or_else(|| word.strip_prefix("--constraint="))
+                    .or_else(|| {
+                        word.strip_prefix("-r")
+                            .or_else(|| word.strip_prefix("-c"))
+                            .filter(|rest| !rest.is_empty() && !rest.starts_with('-'))
+                    }),
+            };
+            if let Some(value) = value {
+                names.push(value.to_owned());
+            }
+        }
+        logical.clear();
+    }
+    names
+}
+
+/// Removes a comment: a `#` at the start of the line or after whitespace, as pip reads it.
+fn strip_requirement_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let at = bytes
+        .iter()
+        .enumerate()
+        .find(|&(i, &b)| b == b'#' && (i == 0 || bytes[i - 1].is_ascii_whitespace()))
+        .map_or(line.len(), |(i, _)| i);
+    &line[..at]
+}
+
+/// Resolves `named`, written in a file in `dir`, to a path inside the
+/// workspace, or `None` when it leaves the workspace or is not a plain
+/// path: absolute, a URL, or holding a variable pip would expand.
+fn resolve_include(dir: &str, named: &str) -> Option<RelPath> {
+    if named.starts_with('/') || named.contains("://") || named.contains('$') {
+        return None;
+    }
+    let mut parts: Vec<&str> = dir.split('/').filter(|part| !part.is_empty()).collect();
+    for part in named.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            part => parts.push(part),
+        }
+    }
+    RelPath::parse(&parts.join("/")).ok()
+}
+
+/// Reads the included file at `path`: what is there, and its text when
+/// it is a requirements file whose own includes are followed.
+///
+/// No component may be a link, and the file must be the regular file
+/// the check saw, by device and inode, as `open_regular` requires.
+fn read_include(reader: &Reader<'_>, path: &RelPath) -> (Included, Option<String>) {
+    if reader.secrets.denies(path, Scope::Work).is_some() {
+        return (Included::Denied, None);
+    }
+    let mut full = reader.root.to_path_buf();
+    let mut components = path.as_str().split('/').peekable();
+    let seen = loop {
+        let Some(component) = components.next() else {
+            return (Included::Unfollowed, None);
+        };
+        full.push(component);
+        match fs::symlink_metadata(&full) {
+            Ok(meta) if components.peek().is_none() && meta.is_file() => break meta,
+            Ok(meta) if components.peek().is_some() && meta.is_dir() => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return (Included::Missing, None);
+            }
+            Ok(_) | Err(_) => return (Included::Unfollowed, None),
+        }
+    };
+    let Ok(handle) = fs::File::open(&full) else {
+        return (Included::Unfollowed, None);
+    };
+    match handle.metadata() {
+        Ok(opened)
+            if opened.is_file() && opened.dev() == seen.dev() && opened.ino() == seen.ino() => {}
+        _ => return (Included::Unfollowed, None),
+    }
+    let mut bytes = Vec::new();
+    if (&handle)
+        .take(MAX_FILE_LEN + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return (Included::Unfollowed, None);
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&bytes);
+    let text = if bytes.len() as u64 > MAX_FILE_LEN {
+        // Hashed whole, but too long to read for its own includes.
+        if hasher.update_reader(&handle).is_err() {
+            return (Included::Unfollowed, None);
+        }
+        None
+    } else {
+        String::from_utf8(bytes).ok()
+    };
+    (Included::File(hasher.finalize()), text)
 }
 
 fn find_devcontainer(reader: &Reader<'_>) -> Result<Option<RelPath>, DetectError> {

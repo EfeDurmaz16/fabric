@@ -1,7 +1,6 @@
 //! A cache's proof of freshness covers what fills it (ENV-1, ENV-2): the
 //! steps that fill the cache and every dependency file they read, not only
-//! the ecosystem's files at the root. Ignored until the sentinel covers
-//! them.
+//! the ecosystem's files at the root.
 
 use std::error::Error;
 use std::fs;
@@ -92,7 +91,6 @@ fn a_changed_setup_recipe_fills_its_cache_again() {
 /// `-r` depends on both; an edit of the included file makes the `.venv`
 /// proof stale.
 #[test]
-#[ignore = "ENV-2: expected failure until fixed"]
 fn an_edited_included_requirements_file_makes_the_venv_stale() {
     let dir = tempfile::tempdir().unwrap();
     let lock = take_lock(dir.path()).unwrap();
