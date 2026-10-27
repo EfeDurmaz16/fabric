@@ -4,6 +4,8 @@ Status: accepted, 2026-10-19
 
 2026-10-20: [ADR 0016](0016-node-and-cli-as-built.md) records `fabric doctor` as built, with the rows that warn where this table refuses and why.
 
+Amended 2026-10-27 after gate finding F13 (issue #28, M2-08): the version row of the job's harness, Claude's as Codex's, orders the two versions with the parse and order of the resume guard (ADR 0006) instead of comparing strings. It refuses, and `--force` waives, only a target older than the source or than the newest version known to have written the session; a newer target warns, because the guard lets a newer harness resume the session. Two versions that differ where either does not parse still refuse, since they cannot be ordered. The row of a harness the job does not use is unchanged.
+
 Amended 2026-10-21 after gate finding F10: the harness version rows still compare strings and `--force` still waives them, and when the target's version is the older one the note says so, read through the same parse and order the resume guard of ADR 0006 uses. That guard, not this row, keeps an older harness off a session, and no flag waives it.
 
 Amended 2026-10-19 after step 1 research. The root rule moved to ADR 0011. This ADR now states the one placement command of this phase, `fabric job move <job> --to <node>`, the pull form of it, the rule that every automatic choice prints its reason, and the preflight `fabric doctor` runs before any move (`2026-10-19-step1-design-input.md`, sections 8.0 and 9, D18 and D19; `step1/preflight-2026-10-19.md`). Triggers stay out of this phase.
@@ -43,8 +45,8 @@ The two-Mac gate is a push from the Pro to the Air (the Pro dials, the Air canno
 | rustc | `rustc -vV`, whole output | Carry `target` off; rebuild (ADR 0012). |
 | `CARGO_HOME` | `${CARGO_HOME:-$HOME/.cargo}` | Carry `target` off. |
 | macOS version and SDK | `sw_vers -productVersion`, `xcrun --show-sdk-version` | Warn. Carry of native build output is already keyed on rustc and Node. |
-| Claude Code version | `claude --version` | Refuse when the job's harness is Claude and the versions differ; the floor for the gate is 2.1.300 on both (ADR 0006). |
-| Codex version | `codex --version` | Refuse when the job's harness is Codex and the versions differ. Amended 2026-10-21 (F10): both version rows name an older target in the note; `--force` still waives them, because the resume refuses a harness older than the session's newest writer before it starts (ADR 0006, Settings travel with the session). |
+| Claude Code version | `claude --version` | Refuse when the job's harness is Claude and the versions differ; the floor for the gate is 2.1.300 on both (ADR 0006). Amended 2026-10-27 (F13): refuse only an older target; warn for a newer one. |
+| Codex version | `codex --version` | Refuse when the job's harness is Codex and the versions differ. Amended 2026-10-21 (F10): both version rows name an older target in the note; `--force` still waives them, because the resume refuses a harness older than the session's newest writer before it starts (ADR 0006, Settings travel with the session). Amended 2026-10-27 (F13): refuse only an older target; warn for a newer one. |
 | Harness login | `claude auth status`, `codex login status`, exit code only | Refuse when the target has no login for the job's harness. Reported as yes or no; the account is never printed. |
 | Other logins the job record names | `gh auth status`, `npm whoami`, `vercel whoami`, each only when named | Warn before the harness starts a turn that would push or publish. |
 | Clock offset | `sntp -d time.apple.com` on each node, the difference | Refuse above 5 s when any mtime-keyed cache is carried (Cargo, `tsc --build`, turbo); warn otherwise. Measured on 2026-10-19: Pro +0.064 s, Air +0.055 s. |

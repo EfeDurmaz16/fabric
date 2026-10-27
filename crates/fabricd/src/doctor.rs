@@ -2,28 +2,31 @@
 //!
 //! Invariant: every row compares strings for equality and never parses a
 //! version into a range, because every coupling the research found was an
-//! exact-string one. A row that refuses stops a move unless the user passes
-//! `--force`, and some refuse even then: a different user or home, because
-//! the root would not exist on the target (ADR 0011), and a target with no
-//! login for the job's harness, or for an ACP job no agent or no
-//! `state_dir` for it, because the harness would fail inside with a worse
-//! message once the target owns the job. The comparison is pure; measuring
-//! is `facts`' job.
+//! exact-string one, except the version row of the job's harness, which
+//! orders versions as the resume guard does. A row that refuses stops a
+//! move unless the user passes `--force`, and some refuse even then: a
+//! different user or home, because the root would not exist on the target
+//! (ADR 0011), and a target with no login for the job's harness, or for an
+//! ACP job no agent or no `state_dir` for it, because the harness would
+//! fail inside with a worse message once the target owns the job. The
+//! comparison is pure; measuring is `facts`' job.
 //!
-//! One row orders versions, and only to word its note and warn: when the
-//! job's harness on the target is older than the source's, or than the
-//! newest known to have written the job's session (`Context::floor`, the
-//! known writer the guard refuses below), the note says so, read through
-//! `fabric_core::version::HarnessVersion`, the parse and the order the resume
-//! guard uses. Both sides are the versions each daemon finds from its own
-//! directory; a version manager's pin in the workspace can pick another,
-//! and the rollout's own `cli_version` is not read here, so the note is a
-//! warning ahead of the guard, not the guard. The outcome stays the
-//! equality refusal that `--force` waives, and a target whose version
-//! matches the source's but is older than the known writer only warns: a
-//! move only copies bytes, and the guard refuses the older harness at
-//! resume, before it can touch the session, whatever the move was told
-//! (gate finding F10).
+//! The version row of the job's harness, Claude's as Codex's, refuses,
+//! and `--force` waives, only a target whose harness is older than the
+//! source's, or than the newest known to have written the job's session
+//! (`Context::floor`, the known writer the guard refuses below), read
+//! through `fabric_core::version::HarnessVersion`, the parse and the order
+//! the resume guard uses (issue #28, gate finding F13). A newer target
+//! warns, since the guard lets a newer harness resume the session, and two
+//! versions that differ where either does not parse refuse as any
+//! difference did, because they cannot be ordered. Both sides are the
+//! versions each daemon finds from its own directory; a version manager's
+//! pin in the workspace can pick another, and the rollout's own
+//! `cli_version` is not read here, so the row is a warning ahead of the
+//! guard, not the guard. A target whose version matches the source's but
+//! is older than the known writer only warns: a move only copies bytes,
+//! and the guard refuses the older harness at resume, before it can touch
+//! the session, whatever the move was told (gate finding F10).
 
 use std::path::Path;
 
@@ -283,31 +286,16 @@ fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Ro
         ),
     ];
     for (program, version, login, used) in pairs {
-        let mut r = row(
-            version,
-            here,
-            peer,
-            if used {
-                Outcome::Refuse(Waiver::Force)
-            } else {
-                Outcome::Warn
-            },
-            if used {
-                "the job's harness must be the same version on both nodes (ADR 0008)"
-            } else {
-                "not the job's harness"
-            },
-        );
-        if !used && r.outcome == Outcome::Warn && ctx.harness.is_some() {
-            r.outcome = Outcome::Equal;
-            r.note.clear();
-        }
-        if used && let Some(note) = older_target(here, peer, version, program, ctx) {
-            if r.outcome == Outcome::Equal {
-                r.outcome = Outcome::Warn;
+        let r = if used {
+            version_row(version, program, here, peer, ctx)
+        } else {
+            let mut r = row(version, here, peer, Outcome::Warn, "not the job's harness");
+            if r.outcome == Outcome::Warn && ctx.harness.is_some() {
+                r.outcome = Outcome::Equal;
+                r.note.clear();
             }
-            r.note = note;
-        }
+            r
+        };
         rows.push(r);
         let target_login = match ctx.target {
             Target::Peer => peer.get(login),
@@ -336,38 +324,81 @@ fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Ro
     rows
 }
 
-/// The note for a target whose `fact`, read as `--version` output, is
-/// older than the newest known to have written the session
-/// (`Context::floor`) when that is above the source's, naming it, or else
-/// older than the source's; `None` when it is neither, or when the
-/// target's does not parse.
-fn older_target(
+/// The row of `fact`, the `--version` output of `program`, the job's
+/// harness, ordered as the resume guard orders versions (ADR 0006,
+/// issue #28 F13). It refuses, and `--force` waives, a target older than
+/// the source, or older than the newest version known to have written the
+/// session (`Context::floor`) when that is above the source's, naming it.
+/// It warns for a newer target, which the guard lets resume the session,
+/// and for a target on the source's own version below that floor, which
+/// the guard refuses at resume (F10). Two texts that differ and do not
+/// both parse cannot be ordered, so they refuse as any difference did.
+fn version_row(
+    fact: &'static str,
+    program: &str,
     here: &NodeFacts,
     peer: &NodeFacts,
-    fact: &str,
-    program: &str,
     ctx: &Context<'_>,
-) -> Option<String> {
+) -> Row {
     let read = |facts: &NodeFacts| {
         facts
             .get(fact)
             .and_then(|text| HarnessVersion::from_output(text).ok())
     };
     let (source, target) = match ctx.target {
-        Target::Peer => (read(here), read(peer)?),
-        Target::Here => (read(peer), read(here)?),
+        Target::Peer => (read(here), read(peer)),
+        Target::Here => (read(peer), read(here)),
     };
+    let same = here.get(fact) == peer.get(fact);
     let floor = ctx
         .floor
         .filter(|floor| source.as_ref().is_none_or(|source| *floor > source));
-    match floor {
-        Some(floor) if target < *floor => Some(format!(
-            "the target's {program} is older than {program} {floor}, the newest known to have written the session; a resume there refuses it, so update {program} there first (ADR 0006)"
-        )),
-        _ if source.is_some_and(|source| target < source) => Some(format!(
-            "the target's {program} is older; a resume there refuses a session a newer {program} wrote, so update {program} there first (ADR 0006)"
-        )),
-        _ => None,
+    let below_floor = target
+        .as_ref()
+        .and_then(|target| floor.filter(|floor| target < *floor));
+    let (outcome, note) = if let Some(floor) = below_floor {
+        (
+            if same {
+                Outcome::Warn
+            } else {
+                Outcome::Refuse(Waiver::Force)
+            },
+            format!(
+                "the target's {program} is older than {program} {floor}, the newest known to have written the session; a resume there refuses it, so update {program} there first (ADR 0006)"
+            ),
+        )
+    } else if same {
+        (Outcome::Equal, String::new())
+    } else if let (Some(source), Some(target)) = (source, target) {
+        match target.cmp(&source) {
+            std::cmp::Ordering::Less => (
+                Outcome::Refuse(Waiver::Force),
+                format!(
+                    "the target's {program} is older; a resume there refuses a session a newer {program} wrote, so update {program} there first (ADR 0006)"
+                ),
+            ),
+            std::cmp::Ordering::Equal => (Outcome::Equal, String::new()),
+            std::cmp::Ordering::Greater => (
+                Outcome::Warn,
+                format!(
+                    "the target's {program} is newer, which a resume there accepts; once it writes the session, a node with an older {program} refuses it until updated (ADR 0006)"
+                ),
+            ),
+        }
+    } else {
+        (
+            Outcome::Refuse(Waiver::Force),
+            format!(
+                "a side reports no {program} version the resume guard reads, so the row cannot tell which is older and wants the same version on both nodes (ADR 0008)"
+            ),
+        )
+    };
+    Row {
+        fact,
+        here: value(here, fact),
+        peer: value(peer, fact),
+        outcome,
+        note,
     }
 }
 
@@ -784,9 +815,11 @@ mod tests {
         let mut pull = ctx(Some(&codex));
         pull.target = Target::Here;
         let pulled = row_of(compare(&pro(), &older, &pull));
-        assert_eq!(
-            pulled.note,
-            "the job's harness must be the same version on both nodes (ADR 0008)"
+        assert_eq!(pulled.outcome, Outcome::Warn);
+        assert!(
+            pulled.note.starts_with("the target's codex is newer"),
+            "{}",
+            pulled.note
         );
         let pulled_onto_older = row_of(compare(&older, &pro(), &pull));
         assert_eq!(pulled_onto_older.outcome, Outcome::Refuse(Waiver::Force));
@@ -855,10 +888,77 @@ mod tests {
         assert_eq!(same.outcome, Outcome::Warn);
         assert!(same.note.starts_with(older_than_floor), "{}", same.note);
         let at_floor = row("codex-cli 0.160.0");
-        assert_eq!(
-            at_floor.note,
-            "the job's harness must be the same version on both nodes (ADR 0008)"
+        assert_eq!(at_floor.outcome, Outcome::Warn);
+        assert!(
+            at_floor.note.starts_with("the target's codex is newer"),
+            "{}",
+            at_floor.note
         );
+    }
+
+    /// Gate finding F13 (issue #28): the Claude row refused a target with
+    /// a newer Claude, which the resume guard lets resume the session,
+    /// while the two Macs of the gate ran different releases. The job's
+    /// harness row refuses only an older target, ordered as the guard
+    /// orders versions, for Claude as for Codex and for a push as for a
+    /// pull, and a newer target only warns, so no `--force` is needed.
+    /// Versions that differ and cannot be ordered still refuse.
+    #[test]
+    fn only_an_older_harness_on_the_target_is_refused() {
+        let cases = [
+            (
+                HarnessKind::ClaudeCode,
+                name::CLAUDE,
+                "2.1.294 (Claude Code)",
+                "2.1.300 (Claude Code)",
+            ),
+            (
+                HarnessKind::Codex,
+                name::CODEX,
+                "codex-cli 0.155.1",
+                "codex-cli 0.160.0",
+            ),
+        ];
+        for (harness, fact, older, newer) in &cases {
+            let older = with(&pro(), &[(fact, Some(older))]);
+            let newer = with(&pro(), &[(fact, Some(newer))]);
+            let unreadable = with(&pro(), &[(fact, Some("a build of today"))]);
+            for target in [Target::Peer, Target::Here] {
+                let context = Context {
+                    target,
+                    ..ctx(Some(harness))
+                };
+                // `onto` is the target of the move, `from` the node it leaves.
+                let compared = |onto: &NodeFacts, from: &NodeFacts| {
+                    let rows = match target {
+                        Target::Peer => compare(from, onto, &context),
+                        Target::Here => compare(onto, from, &context),
+                    };
+                    let row = rows.iter().find(|r| r.fact == *fact).unwrap().clone();
+                    (row.outcome, blocking(&rows, false).is_empty())
+                };
+                assert_eq!(
+                    compared(&newer, &older),
+                    (Outcome::Warn, true),
+                    "{harness} {target:?} onto a newer one"
+                );
+                assert_eq!(
+                    compared(&older, &newer),
+                    (Outcome::Refuse(Waiver::Force), false),
+                    "{harness} {target:?} onto an older one"
+                );
+                assert_eq!(
+                    compared(&newer, &newer),
+                    (Outcome::Equal, true),
+                    "{harness} {target:?} onto the same one"
+                );
+                assert_eq!(
+                    compared(&unreadable, &older),
+                    (Outcome::Refuse(Waiver::Force), false),
+                    "{harness} {target:?} onto one that does not parse"
+                );
+            }
+        }
     }
 
     #[test]
