@@ -57,16 +57,16 @@ percentile = 25
 [processes]
 "acp suspend" = { git = [27, 29], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
 "acp move" = { git = [2, 2], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
-"acp resume" = { git = [9, 10], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [3, 3] }
-"acp pull" = { git = [41, 41], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [3, 3] }
+"acp resume" = { git = [9, 10], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [1, 1] }
+"acp pull" = { git = [41, 41], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [1, 1] }
 "claude suspend" = { git = [27, 29], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
 "claude move" = { git = [2, 2], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
-"claude resume" = { git = [9, 10], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [3, 3] }
-"claude pull" = { git = [41, 41], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [3, 3] }
+"claude resume" = { git = [9, 10], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [1, 1] }
+"claude pull" = { git = [41, 41], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [1, 1] }
 "codex suspend" = { git = [27, 29], kill = [0, 0], lsof = [1, 1], pgrep = [0, 0], ps = [0, 0] }
 "codex move" = { git = [2, 2], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
-"codex resume" = { git = [9, 10], kill = [0, 0], lsof = [1, 1], pgrep = [0, 0], ps = [3, 3] }
-"codex pull" = { git = [41, 41], kill = [0, 0], lsof = [2, 2], pgrep = [0, 0], ps = [3, 3] }
+"codex resume" = { git = [9, 10], kill = [0, 0], lsof = [1, 1], pgrep = [0, 0], ps = [1, 1] }
+"codex pull" = { git = [41, 41], kill = [0, 0], lsof = [2, 2], pgrep = [0, 0], ps = [1, 1] }
 "cold start" = { git = [0, 0], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
 "restart" = { git = [0, 0], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
 
@@ -108,3 +108,7 @@ anchor = "176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5"
 [[change]]
 date = "2026-10-28"
 why = "Perf items 5, 8, 9, 10 and 18 of docs/evidence/perf-ab/README.md, in fabric-store: a restore runs git bundle unbundle without a git bundle verify before it, unbundles only the links of the chain the node's bundle cache lacks, writes the exclude file and the remote and branch config without asking git, and sets symbolic refs and HEAD in the update-ref transaction; a capture reads a bundle's heads from its header instead of running git bundle list-heads. Suspends 27/29 (one git fewer), resumes 9/10 and pulls 41/41 (8 to 14 fewer), and a resume no longer grows with the job's history. Counted on the store change alone and on the integration of every M2 deferred-work branch, which agree. Baselines unchanged"
+
+[[change]]
+date = "2026-10-28"
+why = "Perf items 2 and 17 of docs/evidence/perf-ab/README.md, in fabricd: the node tells whether a harness leads its process group with getpgid instead of ps -o pgid=, and finds a gone harness gone with kill(pid, 0) before it would ask ps -o lstart=. Every resume and pull starts ps once instead of three times; a check is not dropped, the same answers come without a process. Counted on that change alone and on the integration of every M2 deferred-work branch, which agree. Baselines unchanged"
