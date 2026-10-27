@@ -12,17 +12,25 @@
 //! does not stop the command, and a client that stops reading does not
 //! hold it: the command runs as its own task, so a move or a suspend never
 //! waits on a socket while it holds a job's lock, and one that stopped
-//! halfway would leave more to recover than one that finishes.
+//! halfway would leave more to recover than one that finishes. Such a
+//! client costs the node at most [`EVENT_BACKLOG`] bytes of framed events,
+//! or one event when a single one is larger: past that, an event is
+//! dropped while the client does not read, and its count is logged. The
+//! final answer is never dropped; it follows the events kept, in order,
+//! and a managed op's answer can be asked for again with its operation
+//! key.
 
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use fabric_client::api::{
     API_VERSION, Answer, Event, Hello, HelloAnswer, Reason, Refusal, Request, Welcome,
 };
 use fabric_client::frame::{self, FrameError};
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
@@ -30,6 +38,85 @@ use crate::node::{Node, Out};
 
 /// How long a client may take to send its hello, and then its request.
 pub const CLIENT_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The most bytes of framed events that wait for one client that does not
+/// read. A command's events are a few KiB, so only a client that stopped
+/// reading for a long stream reaches it.
+pub const EVENT_BACKLOG: usize = 1 << 20;
+
+/// The bytes of a client's events that wait for it, and how many were
+/// dropped because they would not fit.
+#[derive(Debug, Default)]
+struct Backlog {
+    waiting: AtomicUsize,
+    dropped: AtomicU64,
+}
+
+/// The command's end of a client's event stream: each event framed as the
+/// socket carries it, sent only while the backlog has room for it.
+#[derive(Debug)]
+pub(crate) struct Live {
+    frames: mpsc::UnboundedSender<Vec<u8>>,
+    backlog: Arc<Backlog>,
+}
+
+/// The relay's end of a client's event stream.
+#[derive(Debug)]
+pub(crate) struct Made {
+    frames: mpsc::UnboundedReceiver<Vec<u8>>,
+    backlog: Arc<Backlog>,
+}
+
+/// A new event stream for one client.
+pub(crate) fn events() -> (Live, Made) {
+    let (frames, made) = mpsc::unbounded_channel();
+    let backlog = Arc::new(Backlog::default());
+    (
+        Live {
+            frames,
+            backlog: Arc::clone(&backlog),
+        },
+        Made {
+            frames: made,
+            backlog,
+        },
+    )
+}
+
+impl Live {
+    /// Frames `event` and queues it for the client, unless the frames
+    /// that wait for it would pass [`EVENT_BACKLOG`]; an event is always
+    /// queued when none waits, so a client that reads gets every event
+    /// that frames. Never waits.
+    pub(crate) fn send(&self, event: Event) {
+        let frame = match frame::encode(&Answer::Event { event }) {
+            Ok(frame) => frame,
+            // One event that cannot be framed, too large or holding a
+            // path that is not UTF-8, is dropped; the client still gets
+            // the rest.
+            Err(e) => {
+                tracing::warn!(error = %e, "an event could not be framed for a control client");
+                return;
+            }
+        };
+        let len = frame.len();
+        let room =
+            self.backlog
+                .waiting
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |waiting| {
+                    (waiting == 0 || waiting.saturating_add(len) <= EVENT_BACKLOG)
+                        .then(|| waiting.saturating_add(len))
+                });
+        if room.is_err() {
+            self.backlog.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // A client that left closed the stream; the command runs on.
+        if self.frames.send(frame).is_err() {
+            self.backlog.waiting.fetch_sub(len, Ordering::AcqRel);
+        }
+    }
+}
 
 /// Serves one connection the node accepted on its control socket.
 pub(crate) async fn serve(node: Arc<Node>, mut stream: UnixStream) {
@@ -108,8 +195,8 @@ pub(crate) async fn serve(node: Arc<Node>, mut stream: UnixStream) {
 
 /// Runs `request`, writing each event the moment the client takes it, then the final answer.
 async fn run(node: Arc<Node>, request: Request, stream: UnixStream) {
-    let (events, made) = mpsc::unbounded_channel();
-    let command = async move { node.handle(request, Out::streaming(events)).await };
+    let (live, made) = events();
+    let command = async move { node.handle(request, Out::streaming(live)).await };
     relay(command, made, stream).await;
 }
 
@@ -117,21 +204,34 @@ async fn run(node: Arc<Node>, request: Request, stream: UnixStream) {
 /// `made` to `stream`, in order, then its answer.
 ///
 /// The command never waits on the client. A client that stops reading,
-/// such as a CLI stopped with Ctrl-Z or writing to a paused terminal, only
-/// lets the channel grow, while the command runs to its end and lets go
-/// of the job's lock; the client reads the rest when it reads again. The
-/// channel closes when the command ends, because its sender lives in the
-/// command's [`Out`], so every event the command made precedes its answer.
-async fn relay<C>(command: C, mut made: mpsc::UnboundedReceiver<Event>, mut stream: UnixStream)
+/// such as a CLI stopped with Ctrl-Z or writing to a paused terminal, lets
+/// the backlog grow to [`EVENT_BACKLOG`], and later events are dropped,
+/// while the command runs to its end and lets go of the job's lock; the
+/// client reads what was kept when it reads again. The stream closes when
+/// the command ends, because its sender lives in the command's [`Out`],
+/// so every event kept precedes the answer.
+async fn relay<C>(command: C, mut made: Made, mut stream: UnixStream)
 where
     C: Future<Output = Answer> + Send + 'static,
 {
     let command = tokio::spawn(command);
-    while let Some(event) = made.recv().await {
-        if !deliver(&mut stream, event).await {
+    while let Some(frame) = made.frames.recv().await {
+        let written = deliver(&mut stream, &frame).await;
+        made.backlog
+            .waiting
+            .fetch_sub(frame.len(), Ordering::AcqRel);
+        if !written {
             // The client left; the command runs on without it.
             return;
         }
+    }
+    let dropped = made.backlog.dropped.load(Ordering::Relaxed);
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            backlog = EVENT_BACKLOG,
+            "a control client stopped reading; the events past the backlog were dropped"
+        );
     }
     let answer = command.await.unwrap_or_else(|e| Answer::Refused {
         refusal: Refusal::new(
@@ -257,12 +357,19 @@ fn unwritable(error: &FrameError) -> String {
     }
 }
 
-async fn deliver(stream: &mut UnixStream, event: Event) -> bool {
-    match send(stream, &Answer::Event { event }).await {
-        Err(FrameError::Io(_)) => false,
-        // One event that cannot be framed, too large or holding a path
-        // that is not UTF-8, is dropped; the client still gets the rest.
-        Ok(()) | Err(_) => true,
+/// Writes one framed event; false when the client left.
+async fn deliver(stream: &mut UnixStream, frame: &[u8]) -> bool {
+    match async {
+        stream.write_all(frame).await?;
+        stream.flush().await
+    }
+    .await
+    {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::info!(error = %e, "a control client left before the answer; the command runs to its end");
+            false
+        }
     }
 }
 
@@ -325,7 +432,7 @@ mod tests {
             b"/home/\xff/fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/work".to_vec(),
         ));
         let (node_side, mut client) = UnixStream::pair().unwrap();
-        let (live, made) = mpsc::unbounded_channel();
+        let (live, made) = events();
         let command = async move {
             let mut out = Out::streaming(live);
             out.emit(Event::StaleWorkspaceKept {
@@ -429,7 +536,7 @@ mod tests {
         for (made, read) in cases {
             let message = format!("refused at {}; run fabric job resume", bad.display());
             let (node_side, mut client) = UnixStream::pair().unwrap();
-            let (live, made_events) = mpsc::unbounded_channel();
+            let (live, made_events) = events();
             let refusal = Refusal::new(made, message.clone());
             let command = async move {
                 drop(Out::streaming(live));
@@ -451,13 +558,14 @@ mod tests {
     /// stopped reading stalled a suspend between two events, with the
     /// job's lock held, until it read again. The command now ends on its
     /// own, and the client still gets every event in order, then the
-    /// answer, once it reads.
+    /// answer, once it reads, while the events fit the backlog.
     #[tokio::test]
     async fn a_client_that_stops_reading_does_not_stall_the_command() {
-        // About 2 MB of events, far more than a socket buffer holds on macOS or Linux.
-        const EVENTS: usize = 2_000;
+        // About 0.9 MB of events, within the backlog, and far more than a
+        // socket buffer holds on macOS or Linux.
+        const EVENTS: usize = EVENT_BACKLOG / 1_200;
         let (node_side, mut client) = UnixStream::pair().unwrap();
-        let (live, made) = mpsc::unbounded_channel();
+        let (live, made) = events();
         let (ended, command_ended) = oneshot::channel();
         let command = async move {
             let mut out = Out::streaming(live);
@@ -498,8 +606,8 @@ mod tests {
     }
 
     /// A sink that streams to a client, and the end the relay reads.
-    fn streaming() -> (Out, mpsc::UnboundedReceiver<Event>) {
-        let (live, made) = mpsc::unbounded_channel();
+    fn streaming() -> (Out, Made) {
+        let (live, made) = events();
         (Out::streaming(live), made)
     }
 
@@ -511,7 +619,6 @@ mod tests {
     /// command still never waits, and the final answer always follows the
     /// events kept, in order.
     #[tokio::test]
-    #[ignore = "M2-14: expected failure until fixed"]
     async fn a_client_that_stops_reading_holds_a_bounded_backlog_and_gets_the_answer() {
         // About 8 MiB of events, eight times the bound and far more than
         // a socket buffer holds on macOS or Linux.
@@ -561,10 +668,10 @@ mod tests {
         }
         relayed.await.unwrap();
         assert!(kept > 0, "no event was kept");
-        // The bound, 1 MiB of frames, and what the socket's buffers took
-        // before the client stopped reading.
+        // The backlog, and what the socket's buffers took before the
+        // client stopped reading.
         assert!(
-            bytes < 2 << 20,
+            bytes < 2 * EVENT_BACKLOG,
             "{kept} of {EVENTS} events, {bytes} bytes, waited for a client that did not read"
         );
     }
