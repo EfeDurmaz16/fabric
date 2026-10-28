@@ -1940,14 +1940,17 @@ mod tests {
         use proptest::prelude::*;
         use proptest::test_runner::{Config, TestRunner};
 
-        let remotes = ["origin", "up", "a.b", "we\"ird", "x#y;z", "ü"];
+        // `a` and `a.p` interleave in sorted order (`remote.a.fetch`,
+        // `remote.a.p.url`, `remote.a.url`): git puts the later key of `a`
+        // back into the section `a` already has, not after `a.p`.
+        let remotes = ["origin", "up", "a", "a.p", "a.b", "we\"ird", "x#y;z", "ü"];
         let branches = ["main", "feat/x", "q\"b", "dot.ted"];
         // No carriage return: git before the fix of CVE-2025-48384 wrote one
         // unquoted (`a_carriage_return_in_a_config_value_comes_back`).
         let chars = [
             ' ', '\t', ';', '#', '"', '\\', 'a', 'b', '/', ':', 'é', '=', '[', ']', '*', '\u{b}',
         ];
-        let name = (0usize..10, 0usize..6, 0usize..4).prop_map(move |(kind, r, b)| {
+        let name = (0usize..10, 0usize..8, 0usize..4).prop_map(move |(kind, r, b)| {
             let (remote, branch) = (remotes[r], branches[b]);
             match kind {
                 0 => format!("remote.{remote}.url"),
