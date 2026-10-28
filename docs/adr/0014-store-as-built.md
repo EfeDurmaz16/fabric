@@ -17,6 +17,7 @@ store/
   objects/ab/cdef...   one object per file, one zstd frame, named by blake3 of the uncompressed bytes
   catalog.sqlite       schema_version, settings, chunks, snapshots, snapshot_chunks
   tmp/                 scratch files of the lock holder; cleared at open and by gc
+  bundle-cache/<job>/  the packs a restore unpacked per link of a job's chain (Restore)
   lock                 flock target
 ```
 
@@ -54,7 +55,7 @@ What this survives: a kill at every step, which the crash test proves by killing
 
 ### gc
 
-gc has two passes. One pass stamps chunks whose refcount reached zero; a later pass deletes stamped chunks once the grace has passed, the row first and the file second. An object file with no row, which a publish that died before its transaction leaves behind, is removed once its mtime is older than the grace. `tmp/` is cleared at open and at every gc.
+gc has two passes. One pass stamps chunks whose refcount reached zero; a later pass deletes stamped chunks once the grace has passed, the row first and the file second. An object file with no row, which a publish that died before its transaction leaves behind, is removed once its mtime is older than the grace. `tmp/` is cleared at open and at every gc. Amended 2026-10-28: gc also removes the bundle cache (Restore) of every job the catalog holds no snapshot of, since no restore can take a chain from it, and its packs would otherwise wait for the cache's own eviction; an entry under `bundle-cache/` whose name is no job id is left alone (`gc_removes_the_bundle_cache_of_a_job_with_no_snapshot_left`).
 
 gc must not run between a capture and the publish of its manifest. Capture can reuse an object that is on disk without a row, and `put` does not refresh its mtime; a gc in between can remove it, and publish then fails with `MissingChunk`. That fails closed, and the capture must run again. The lock holder runs capture and publish as one step.
 

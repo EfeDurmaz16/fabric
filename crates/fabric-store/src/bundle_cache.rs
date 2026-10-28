@@ -358,6 +358,38 @@ fn parse_record(text: &str) -> Vec<CachedLink> {
 /// Removes, best effort, every cache under `root` but `keep` that no
 /// restore used for `max_idle`, and the ones beyond the `max_jobs` used
 /// last, `keep` counted among them.
+/// Removes the cache of every job `kept` does not name, under the store
+/// at `store_root`: gc's part, for the jobs the store holds no snapshot of
+/// any more, whose cache no restore can use. Returns how many it removed;
+/// an entry whose name is not a job id is left alone.
+pub(crate) fn remove_all_but(
+    store_root: &Path,
+    kept: &std::collections::HashSet<JobId>,
+) -> io::Result<u64> {
+    let root = store_root.join(CACHE_DIR);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        let Some(job) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<JobId>().ok())
+        else {
+            continue;
+        };
+        if !kept.contains(&job) {
+            fs::remove_dir_all(entry.path())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 fn evict(root: &Path, keep: &Path, now: SystemTime, max_jobs: usize, max_idle: Duration) {
     let Ok(entries) = fs::read_dir(root) else {
         return;

@@ -2408,6 +2408,44 @@ fn a_cached_pack_that_changed_is_not_used() {
     }
 }
 
+/// gc removes the bundle cache of a job the store holds no snapshot of
+/// any more, and keeps the cache of a job it still holds: no restore can
+/// take a chain from it, and its packs would otherwise wait for the
+/// cache's own eviction, 14 days idle. An entry whose name is no job id
+/// is not the cache's, and stays.
+#[test]
+fn gc_removes_the_bundle_cache_of_a_job_with_no_snapshot_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    let mut store = store_in(dir.path()).unwrap();
+    let chain = chain_of(&mut store, &root, 2).unwrap();
+    restore_into(&store, chain[1].0, &dir.path().join("restored")).unwrap();
+    let caches = dir.path().join("store/bundle-cache");
+    let cache = caches.join(JOB.to_string());
+    let stranger = caches.join("not-a-job");
+    fs::create_dir_all(&stranger).unwrap();
+    assert!(cache.join("links").is_file());
+
+    let kept = store
+        .gc(std::time::SystemTime::now(), Duration::from_hours(1))
+        .unwrap();
+    assert_eq!(kept.removed_caches, 0);
+    assert!(
+        cache.join("links").is_file(),
+        "a held job's cache was removed"
+    );
+
+    for (snapshot, _) in chain.iter().rev() {
+        store.forget(*snapshot).unwrap();
+    }
+    let report = store
+        .gc(std::time::SystemTime::now(), Duration::from_hours(1))
+        .unwrap();
+    assert_eq!(report.removed_caches, 1);
+    assert!(!cache.exists(), "a forgotten job's cache was kept");
+    assert!(stranger.is_dir());
+}
+
 /// Every file under `dir`, at any depth.
 fn files_below(dir: &Path) -> Fallible<Vec<PathBuf>> {
     let mut found = Vec::new();

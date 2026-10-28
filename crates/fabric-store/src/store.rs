@@ -165,6 +165,8 @@ pub struct GcReport {
     pub removed_orphans: u64,
     /// Files under `tmp/` removed.
     pub removed_tmp: u64,
+    /// Bundle caches of jobs the store holds no snapshot of any more, removed.
+    pub removed_caches: u64,
 }
 
 /// How deep `check` looks.
@@ -618,7 +620,10 @@ impl Store {
     /// one is cleared under it.
     pub fn gc(&mut self, now: SystemTime, grace: Duration) -> Result<GcReport, StoreError> {
         let Shared {
-            objects, catalog, ..
+            root,
+            objects,
+            catalog,
+            ..
         } = self.alone("gc")?;
         let catalog = catalog.get_mut().unwrap_or_else(PoisonError::into_inner);
         let mut report = GcReport {
@@ -646,6 +651,16 @@ impl Store {
                 report.removed_orphans += 1;
             }
         }
+        // A job with no snapshot left has no chain a restore could take
+        // from its bundle cache; its packs would wait for the cache's own
+        // eviction (bundle_cache::MAX_IDLE) otherwise.
+        let jobs = catalog
+            .snapshots()?
+            .into_iter()
+            .map(|row| row.job_id)
+            .collect();
+        report.removed_caches = crate::bundle_cache::remove_all_but(root, &jobs)
+            .map_err(|e| io_err(&root.join("bundle-cache"), e))?;
         tracing::info!(?report, "gc done");
         Ok(report)
     }
