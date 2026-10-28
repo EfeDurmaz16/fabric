@@ -1029,16 +1029,17 @@ fn push_stash_entry(git: &Git, oid: &GitOid) -> Result<(), RestoreError> {
 /// Sets every ref, every symbolic ref and `HEAD` exactly as `git_state` records them.
 ///
 /// One `update-ref --no-deref --stdin` transaction sets every ref but
-/// `refs/stash`, points each symbolic ref at its target with
+/// `refs/stash` and points each symbolic ref at its target with
 /// `symref-update`, so `refs/remotes/origin/HEAD` follows the remote's
-/// default branch again instead of naming a frozen commit (M2-06), and
-/// sets `HEAD`. Without `--no-deref`, `symref-update HEAD` would follow the
-/// `HEAD` that `git init` wrote and turn its branch into a symbolic ref.
-/// git before 2.46 has no `symref-update`; there each symbolic ref and a
-/// branch `HEAD` take one `git symbolic-ref` after the transaction of the
-/// direct refs, as before. The stash list is then rebuilt oldest first
-/// from the refs capture pinned under the job's stash prefix, then
-/// `refs/stash` itself, so every entry comes back at its index.
+/// default branch again instead of naming a frozen commit (M2-06). `HEAD`
+/// already points at the snapshot's branch, where `init_repo` put it, or
+/// for a detached `HEAD` the same transaction detaches it; `--no-deref`
+/// keeps that update on `HEAD` instead of the branch `git init` left it
+/// on. git before 2.46 has no `symref-update`; there each symbolic ref
+/// takes one `git symbolic-ref` after the transaction of the direct refs,
+/// as before. The stash list is then rebuilt oldest first from the refs
+/// capture pinned under the job's stash prefix, then `refs/stash` itself,
+/// so every entry comes back at its index.
 fn set_refs(git: &Git, git_state: &GitState, job_id: JobId) -> Result<(), RestoreError> {
     let mut direct = String::new();
     let mut stash = None;
@@ -1054,12 +1055,13 @@ fn set_refs(git: &Git, git_state: &GitState, job_id: JobId) -> Result<(), Restor
     for (name, target) in &git_state.symbolic_refs {
         commands.extend(["symref-update ", name.as_str(), " ", target.as_str(), "\n"]);
     }
-    let head = match &git_state.head {
-        GitHead::Branch(branch) => ["symref-update HEAD refs/heads/", branch.as_str(), "\n"],
-        GitHead::Detached(oid) => ["update HEAD ", oid.as_str(), "\n"],
-    };
-    commands.extend(head);
-    if !git.update_refs_with_symrefs(commands.as_bytes())? {
+    // git refuses a transaction that updates `HEAD` and also the branch
+    // `HEAD` points at, so `HEAD` joins it only when detached, from the
+    // branch of `initial_branch`, which no ref of the snapshot names.
+    if let GitHead::Detached(oid) = &git_state.head {
+        commands.extend(["update HEAD ", oid.as_str(), "\n"]);
+    }
+    if !commands.is_empty() && !git.update_refs_with_symrefs(commands.as_bytes())? {
         set_refs_one_by_one(git, git_state, &direct)?;
     }
     if let Some(oid) = stash {
@@ -1083,7 +1085,7 @@ fn set_refs(git: &Git, git_state: &GitState, job_id: JobId) -> Result<(), Restor
 
 /// Sets the refs of `set_refs` on git before 2.46: the direct ones in one
 /// transaction of `direct`, then one `symbolic-ref` per symbolic ref, then
-/// `HEAD`.
+/// a detached `HEAD`; a branch `HEAD` is where `init_repo` put it.
 fn set_refs_one_by_one(git: &Git, git_state: &GitState, direct: &str) -> Result<(), RestoreError> {
     if !direct.is_empty() {
         git.run_stdin_env(&["update-ref", "--stdin"], &[], direct.as_bytes())?;
@@ -1091,16 +1093,40 @@ fn set_refs_one_by_one(git: &Git, git_state: &GitState, direct: &str) -> Result<
     for (name, target) in &git_state.symbolic_refs {
         git.run(&["symbolic-ref", name.as_str(), target.as_str()])?;
     }
-    match &git_state.head {
-        GitHead::Branch(branch) => {
-            let full = format!("refs/heads/{branch}");
-            git.run(&["symbolic-ref", "HEAD", &full])?;
-        }
-        GitHead::Detached(oid) => {
-            git.run(&["update-ref", "--no-deref", "HEAD", oid.as_str()])?;
-        }
+    if let GitHead::Detached(oid) = &git_state.head {
+        git.run(&["update-ref", "--no-deref", "HEAD", oid.as_str()])?;
     }
     Ok(())
+}
+
+/// The branch `init_repo` has `git init` point `HEAD` at.
+///
+/// A branch `HEAD` gets its own branch, so `HEAD` is where the snapshot's
+/// is from the start and the ref transaction need not touch it. A detached
+/// `HEAD` gets a branch no ref of the snapshot names, so the transaction
+/// can detach `HEAD` without also moving the branch `HEAD` points at: git
+/// refuses that ("multiple updates for 'HEAD' (including one via its
+/// referent ...)"), and the `master` a plain `git init` points at is a
+/// branch of many repositories. That branch is never created.
+fn initial_branch(git_state: &GitState) -> String {
+    match &git_state.head {
+        GitHead::Branch(branch) => branch.as_str().to_owned(),
+        GitHead::Detached(_) => {
+            let taken = |name: &str| {
+                let full = format!("refs/heads/{name}");
+                (git_state.refs.iter().map(|(name, _)| name))
+                    .chain(git_state.symbolic_refs.iter().map(|(name, _)| name))
+                    .any(|name| name.as_str() == full)
+            };
+            let mut name = "fabric-detached".to_owned();
+            let mut n = 0u32;
+            while taken(&name) {
+                n += 1;
+                name = format!("fabric-detached-{n}");
+            }
+            name
+        }
+    }
 }
 
 /// The git directory `git init` makes in `root`: no `GIT_*` variable
@@ -1110,10 +1136,12 @@ fn git_dir(root: &Path) -> PathBuf {
     root.join(".git")
 }
 
-/// Creates the empty repository in the object format of `git_state` and writes its exclude file.
+/// Creates the empty repository in the object format of `git_state`, its
+/// `HEAD` on `initial_branch`, and writes its exclude file.
 ///
 /// The exclude file's place is known from `git_dir`, so no `git rev-parse
-/// --git-path` asks for it.
+/// --git-path` asks for it. `--initial-branch` is from git 2.28, older
+/// than the `--object-format` of 2.29 this already needs.
 fn init_repo(
     store: &Store,
     (git, root): (&Git, &Path),
@@ -1127,7 +1155,8 @@ fn init_repo(
     } else {
         "--object-format=sha1"
     };
-    git.run(&["init", "-q", format])?;
+    let initial = format!("--initial-branch={}", initial_branch(git_state));
+    git.run(&["init", "-q", format, &initial])?;
     if let Some(chunks) = &git_state.exclude {
         let path = git_dir(root).join("info").join("exclude");
         if let Some(parent) = path.parent() {

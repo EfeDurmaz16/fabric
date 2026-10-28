@@ -3198,14 +3198,14 @@ fn git_takes_symref_update(dir: &Path) -> Fallible<bool> {
     Ok(child.wait()?.success())
 }
 
-/// The `update-ref` and `symbolic-ref` calls of a restore of `clone_snapshot` on git before 2.46.
-const SYMREFS_ONE_BY_ONE: [&str; 3] = [
+/// The `update-ref` and `symbolic-ref` calls of a restore of `clone_snapshot`
+/// on git before 2.46; `HEAD` is on `main` from the restore's `git init`.
+const SYMREFS_ONE_BY_ONE: [&str; 2] = [
     "update-ref --stdin",
     "symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main",
-    "symbolic-ref HEAD refs/heads/main",
 ];
 
-/// The child half of `a_restore_sets_symbolic_refs_and_head_in_its_ref_transaction`.
+/// The child half of `a_restore_sets_head_and_symbolic_refs_without_a_process_each`.
 #[test]
 fn symref_transaction_child() {
     let Some(dir) = common::logged_git_dir() else {
@@ -3222,12 +3222,13 @@ fn symref_transaction_child() {
     }
 }
 
-/// On git 2.46 and later, a restore sets the symbolic refs and `HEAD` with
+/// On git 2.46 and later, a restore sets the symbolic refs with
 /// `symref-update` in the one `update-ref --stdin` transaction of the
-/// direct refs, instead of one `git symbolic-ref` each: two git processes
-/// fewer per resume and pull of a clone.
+/// direct refs, and its `git init` puts `HEAD` on the snapshot's branch,
+/// instead of one `git symbolic-ref` each: two git processes fewer per
+/// resume and pull of a clone.
 #[test]
-fn a_restore_sets_symbolic_refs_and_head_in_its_ref_transaction() {
+fn a_restore_sets_head_and_symbolic_refs_without_a_process_each() {
     common::run_with_logged_git("symref_transaction_child", LoggedGit::Plain).unwrap();
 }
 
@@ -3252,11 +3253,95 @@ fn symref_fallback_child() {
 
 /// git before 2.46 refuses the transaction at `symref-update` before it
 /// changes a ref; the restore then sets the refs as before, one
-/// `symbolic-ref` per symbolic ref and `HEAD`, and this process does not
-/// ask that git again.
+/// `symbolic-ref` per symbolic ref, and this process does not ask that git
+/// again.
 #[test]
 fn a_git_without_symref_update_sets_them_one_by_one_and_is_not_asked_again() {
     common::run_with_logged_git("symref_fallback_child", LoggedGit::WithoutSymrefUpdate).unwrap();
+}
+
+/// The branch `HEAD` points at in `root`, or `None` when it is detached.
+fn head_branch(root: &Path) -> Fallible<Option<String>> {
+    let g = git(root);
+    Ok(if g.succeeds(&["symbolic-ref", "-q", "HEAD"])? {
+        Some(g.run_text(&["symbolic-ref", "HEAD"])?)
+    } else {
+        None
+    })
+}
+
+/// git refuses one `update-ref --stdin` transaction that updates `HEAD`
+/// and also the branch `HEAD` points at ("multiple updates for 'HEAD'
+/// (including one via its referent ...)"). The `HEAD` of a fresh `git
+/// init` points at `master` (`main` on git 3), so a repository with that
+/// branch failed to restore once `HEAD` joined the transaction of the
+/// refs; and a detached `HEAD` must not pick, in the restore's own
+/// repository, a branch the snapshot holds.
+#[test]
+fn a_repository_with_the_branch_git_init_names_restores() {
+    let scenarios: [(&str, &[&str]); 7] = [
+        ("master", &["checkout -q master"]),
+        ("main", &["branch master", "checkout -q main"]),
+        ("master", &["branch main", "checkout -q master"]),
+        ("main", &["branch master", "checkout -q --detach"]),
+        (
+            "main",
+            &[
+                "branch master",
+                "branch fabric-detached",
+                "checkout -q --detach",
+            ],
+        ),
+        ("main", &["symbolic-ref refs/heads/master refs/heads/main"]),
+        (
+            "master",
+            &["symbolic-ref refs/heads/main refs/heads/master"],
+        ),
+    ];
+    for (n, (first, steps)) in scenarios.into_iter().enumerate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a"), "a\n").unwrap();
+        let g = git(&root);
+        g.run(&["init", "-q", "-b", first]).unwrap();
+        g.run(&["add", "-A"]).unwrap();
+        g.run(&["commit", "-q", "-m", "one"]).unwrap();
+        for step in steps {
+            g.run(&step.split(' ').collect::<Vec<_>>()).unwrap();
+        }
+        let mut store = store_in(dir.path()).unwrap();
+        let policy = IgnorePolicy::default();
+        let Captured { manifest, .. } = capture(&store, &request(&root, &policy, None)).unwrap();
+        let snapshot = store.publish(&manifest).unwrap();
+        let target = dir.path().join("restored");
+        let restored = restore_into(&store, snapshot, &target);
+        assert!(restored.is_ok(), "scenario {n} {steps:?}: {restored:?}");
+        assert_eq!(
+            git_difference(&root, &target).unwrap(),
+            None,
+            "scenario {n}"
+        );
+        assert_eq!(
+            head_branch(&target).unwrap(),
+            head_branch(&root).unwrap(),
+            "scenario {n}"
+        );
+        for name in ["HEAD", "refs/heads/master", "refs/heads/main"] {
+            assert_eq!(
+                git(&target).run_text(&["symbolic-ref", "-q", name]).ok(),
+                git(&root).run_text(&["symbolic-ref", "-q", name]).ok(),
+                "scenario {n} {name}"
+            );
+        }
+        assert!(
+            !git_text(&target, &["for-each-ref", "--format=%(refname)"])
+                .unwrap()
+                .contains("fabric-detached")
+                || steps.contains(&"branch fabric-detached"),
+            "scenario {n}"
+        );
+    }
 }
 
 /// M2-06 (issue #22): a clone's `refs/remotes/origin/HEAD` is a symbolic
