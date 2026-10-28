@@ -1576,7 +1576,7 @@ impl Node {
             ));
         }
         self.resolve_departing(id, out).await?;
-        let (harness, root, view, floor) = {
+        let (harness, root, view, floor, latest) = {
             let job = self.job(id).await?;
             let job = job.lock().await;
             let root = job
@@ -1587,6 +1587,7 @@ impl Node {
                 root,
                 job.view(self.id),
                 session_floor(&job)?,
+                job.latest(),
             )
         };
         match view {
@@ -1625,11 +1626,11 @@ impl Node {
                 });
             }
         }
-        let (here, theirs) = self
+        let mut measured = self
             .preflight(
                 to,
                 (&harness, &root, floor.as_ref()),
-                Target::Peer,
+                (Target::Peer, latest),
                 env,
                 force,
                 out,
@@ -1649,8 +1650,14 @@ impl Node {
         if let Some(snapshot) = snapshot {
             // Once MoveStarted is written, a refusal could only freeze the
             // job here; a move asked again after it goes on.
-            self.carry_for_move(to, snapshot, (&here, &theirs), owner.then_some(force), out)
-                .await?;
+            self.carry_for_move(
+                to,
+                snapshot,
+                &mut measured,
+                (owner.then_some(force), env),
+                out,
+            )
+            .await?;
         }
         self.push_records(id, to).await?;
         out.emit(Event::TargetHoldsCopy { target: to });
@@ -1675,14 +1682,19 @@ impl Node {
     /// and on such a program it lacks, unless `force` says so. With `force`
     /// absent nothing stops.
     async fn carry_for_move(
-        &self,
+        self: &Arc<Self>,
         to: NodeId,
         snapshot: SnapshotId,
-        (here, theirs): (&NodeFacts, &NodeFacts),
-        force: Option<bool>,
+        measured: &mut Measured,
+        (force, env): (Option<bool>, &ToolEnv),
         out: &mut Out,
     ) -> Result<(), NodeError> {
         let (manifest, spec) = self.manifest_and_spec(snapshot).await?;
+        // The capture may name keys the preflight did not measure: it
+        // read the snapshot before, and a run may have filled a cache since.
+        self.measure_more(to, measured, carry_probes(&manifest, spec.as_ref()), env)
+            .await?;
+        let (here, theirs) = (&measured.here, &measured.theirs);
         let decisions = carry::decide_all(&manifest, theirs);
         if !decisions.is_empty() {
             out.emit(carry_decided(
@@ -2092,12 +2104,12 @@ impl Node {
             if self.job(id).await.is_err() {
                 self.pull_records(id, holder).await?;
             }
-            let (kind, same) = {
+            let (kind, same, latest) = {
                 let job = self.job(id).await?;
                 let job = job.lock().await;
                 let kind = harness.clone().unwrap_or_else(|| job.harness().clone());
                 let same = &kind == job.harness();
-                (kind, same)
+                (kind, same, job.latest())
             };
             // The known writer is the holder's: a record this node kept
             // from an earlier tenure may be older than the holder's.
@@ -2107,11 +2119,11 @@ impl Node {
                 None
             };
             let root = paths::job_root(&self.cfg.home, id);
-            let (here, theirs) = self
+            let mut measured = self
                 .preflight(
                     holder,
                     (&kind, root.as_path(), floor.as_ref()),
-                    Target::Here,
+                    (Target::Here, latest),
                     env,
                     force,
                     out,
@@ -2120,7 +2132,7 @@ impl Node {
             // With no harness named, the job's own launches, and the pull
             // must still find the one the preflight checked.
             let checked = harness.is_none().then_some(&kind);
-            self.pull(id, holder, (checked, force), (&here, &theirs), out)
+            self.pull(id, holder, (checked, force), (&mut measured, env), out)
                 .await?;
         }
         let job = self.job(id).await?;
@@ -2161,7 +2173,7 @@ impl Node {
         id: JobId,
         holder: NodeId,
         (checked, force): (Option<&HarnessKind>, bool),
-        (here, theirs): (&NodeFacts, &NodeFacts),
+        (measured, env): (&mut Measured, &ToolEnv),
         out: &mut Out,
     ) -> Result<(), NodeError> {
         out.emit(Event::Pulling { job: id, holder });
@@ -2188,7 +2200,7 @@ impl Node {
         let refused = if force {
             None
         } else {
-            self.carry_refusal_here(id, (holder, here, theirs), out)
+            self.carry_refusal_here(id, (holder, measured, env), out)
                 .await?
         };
         faults::hit(Point::BeforeImport).await;
@@ -2251,9 +2263,9 @@ impl Node {
     /// program is refused, after reporting them. `theirs`, the holder's
     /// facts, fill the holder's side of the rows.
     async fn carry_refusal_here(
-        &self,
+        self: &Arc<Self>,
         id: JobId,
-        (holder, here, theirs): (NodeId, &NodeFacts, &NodeFacts),
+        (holder, measured, env): (NodeId, &mut Measured, &ToolEnv),
         out: &mut Out,
     ) -> Result<Option<NodeError>, NodeError> {
         let latest = {
@@ -2265,6 +2277,16 @@ impl Node {
             return Ok(None);
         };
         let (manifest, spec) = self.manifest_and_spec(snapshot).await?;
+        // The holder captured after the preflight, which read the snapshot
+        // this node knew before; the capture may name keys it did not.
+        self.measure_more(
+            holder,
+            measured,
+            carry_probes(&manifest, spec.as_ref()),
+            env,
+        )
+        .await?;
+        let (here, theirs) = (&measured.here, &measured.theirs);
         let rows = setup_rows((&manifest, spec.as_ref()), here, theirs, Target::Here);
         if !rows.is_empty() {
             out.emit(Event::Preflight {
@@ -2994,7 +3016,12 @@ impl Node {
             }
             None => (None, None, None, None),
         };
-        // The doctor shows every fact as each tool answers now.
+        // The doctor shows every fact as each tool answers now, but those
+        // of another harness than a named job's, whose rows compare equal
+        // whatever they hold.
+        let peer_probes = harness
+            .as_ref()
+            .map_or(Probes::ALL, |harness| for_harness(Probes::ALL, harness));
         let (mut rows, here, theirs) = self
             .compare(
                 peer,
@@ -3004,7 +3031,7 @@ impl Node {
                     .map(|(harness, root)| (harness, root, floor.as_ref())),
                 Target::Peer,
                 env,
-                Probes::ALL,
+                (Probes::ALL, peer_probes),
             )
             .await?;
         let carry = match (job, latest) {
@@ -3095,31 +3122,108 @@ impl Node {
     }
 
     /// Compares this node's facts with `peer`'s, reports the rows, stops
-    /// on a refusal `force` does not waive, and returns this node's facts
-    /// and the peer's. A named job brings its harness, the root the target
-    /// restores into, and the newest version of its harness known to have
-    /// written its session; this node then measures only what the rows of
-    /// that job and the carry decision read (`doctor::probes`).
+    /// on a refusal `force` does not waive, and returns what each node
+    /// measured. A job brings its harness, the root the target restores
+    /// into, and the newest version of its harness known to have written
+    /// its session; with `latest`, its latest snapshot this node knows,
+    /// each node measures only the tools of the rows that can stop it and
+    /// of what that snapshot reads (`preflight_probes`), and the report
+    /// leaves out the rows of tools neither measured.
     async fn preflight(
         self: &Arc<Self>,
         peer: NodeId,
         job: (&HarnessKind, &Path, Option<&HarnessVersion>),
-        target: Target,
+        (target, latest): (Target, Option<SnapshotId>),
         env: &ToolEnv,
         force: bool,
         out: &mut Out,
-    ) -> Result<(NodeFacts, NodeFacts), NodeError> {
-        let probes = for_harness(doctor::probes(job.0, target), job.0);
+    ) -> Result<Measured, NodeError> {
+        let carry = self.carry_probes_of(latest).await;
+        let synced = paths::reads_synced_folders(job.1, &self.cfg.home);
+        let probes = preflight_probes(job.0, target, synced, carry);
         let (rows, here, theirs) = self.compare(peer, Some(job), target, env, probes).await?;
+        let rows = doctor::measured_rows(rows, probes.0.union(probes.1));
         out.emit(Event::Preflight {
             peer,
             rows: rows.iter().map(doctor::Row::to_wire).collect(),
         });
         refuse_rows(&rows, force)?;
-        Ok((here, theirs))
+        Ok(Measured {
+            here,
+            theirs,
+            probes,
+            harness: job.0.clone(),
+        })
     }
 
-    /// Measures this node's `probes` while `peer` measures its own,
+    /// The tools of `snapshot`'s carry keys and setup steps
+    /// (`carry_probes`), which a preflight measures on both nodes. None
+    /// for a job with no snapshot, or one whose manifest this node cannot
+    /// read yet: the step that reads the snapshot measures what it lacks
+    /// then (`measure_more`).
+    async fn carry_probes_of(&self, snapshot: Option<SnapshotId>) -> Probes {
+        let Some(snapshot) = snapshot else {
+            return Probes::NONE;
+        };
+        match self.manifest_and_spec(snapshot).await {
+            Ok((manifest, spec)) => carry_probes(&manifest, spec.as_ref()),
+            Err(e) => {
+                tracing::debug!(%snapshot, error = %e, "the preflight measures no carry tool; the carry step will");
+                Probes::NONE
+            }
+        }
+    }
+
+    /// Measures on this node and asks `peer` for the tools of `need` the
+    /// preflight that made `measured` did not measure there, and adds what
+    /// they give. Nothing runs when it measured them all.
+    async fn measure_more(
+        self: &Arc<Self>,
+        peer: NodeId,
+        measured: &mut Measured,
+        need: Probes,
+        env: &ToolEnv,
+    ) -> Result<(), NodeError> {
+        let (here_more, peer_more) = (need.minus(measured.probes.0), need.minus(measured.probes.1));
+        if here_more.is_empty() && peer_more.is_empty() {
+            return Ok(());
+        }
+        let harness = &measured.harness;
+        let (here, theirs) = tokio::join!(
+            async {
+                if here_more.is_empty() {
+                    None
+                } else {
+                    Some(NodeFacts::measure(&self.cfg.home, env, here_more).await)
+                }
+            },
+            async {
+                if peer_more.is_empty() {
+                    return Ok(None);
+                }
+                self.call(peer, |session| async move {
+                    session
+                        .facts_for(harness, peer_more.to_wire(), SHORT_DEADLINE * 4)
+                        .await
+                })
+                .await
+                .map(Some)
+            },
+        );
+        if let Some(here) = here {
+            measured.here.absorb(here);
+        }
+        if let Some(theirs) = theirs? {
+            measured.theirs.absorb(NodeFacts::from_wire(&theirs));
+        }
+        measured.probes = (
+            measured.probes.0.union(here_more),
+            measured.probes.1.union(peer_more),
+        );
+        Ok(())
+    }
+
+    /// Measures this node's `probes.0` while `peer` measures `probes.1`,
     /// compares them row by row (ADR 0008), and returns the rows, this
     /// node's facts and the peer's.
     async fn compare(
@@ -3128,20 +3232,25 @@ impl Node {
         job: Option<(&HarnessKind, &Path, Option<&HarnessVersion>)>,
         target: Target,
         env: &ToolEnv,
-        probes: Probes,
+        probes: (Probes, Probes),
     ) -> Result<(Vec<doctor::Row>, NodeFacts, NodeFacts), NodeError> {
         // Both nodes measure at once (issue #26). A session the peer
         // opened is used too: a peer behind a NAT has no address here and
         // is reachable only over the session it dialed. A named job's
         // harness goes with the question, so the peer also looks for an
-        // ACP job's agent, by which a push judges it (issue #16).
+        // ACP job's agent, by which a push judges it (issue #16), and so
+        // do the tools it measures.
         let harness = job.map(|(harness, _, _)| harness);
         let (mut here, theirs) = tokio::join!(
-            NodeFacts::measure(&self.cfg.home, env, probes),
+            NodeFacts::measure(&self.cfg.home, env, probes.0),
             self.call(peer, |session| async move {
                 let deadline = SHORT_DEADLINE * 4;
                 let facts = match harness {
-                    Some(harness) => session.facts_for(harness, deadline).await?,
+                    Some(harness) => {
+                        session
+                            .facts_for(harness, probes.1.to_wire(), deadline)
+                            .await?
+                    }
                     None => session.facts(deadline).await?,
                 };
                 Ok((facts, session.clock_skew_ms(), session.kind().to_string()))
@@ -3190,6 +3299,68 @@ pub(crate) fn for_harness(probes: Probes, harness: &HarnessKind) -> Probes {
     others
         .iter()
         .fold(probes, |probes, tool| probes.without(*tool))
+}
+
+/// What a move's or a pull's preflight measured: this node's facts and
+/// the peer's, and the tools each measure ran, so a later step that reads
+/// more measures only what is missing (`Node::measure_more`).
+pub(crate) struct Measured {
+    /// This node's facts.
+    here: NodeFacts,
+    /// The peer's facts.
+    theirs: NodeFacts,
+    /// The tools measured here and on the peer.
+    probes: (Probes, Probes),
+    /// The job's harness, which every question to the peer names.
+    harness: HarnessKind,
+}
+
+/// The tools a move's or a pull's preflight of a job under `harness`
+/// measures on this node and on the peer (item 19 of
+/// docs/evidence/perf-ab/README.md): those of the rows that can stop it,
+/// `user` and `git` on both, the version of the job's harness on both and
+/// its login on the target alone, iCloud Drive's folders only when the
+/// root lies in one (`synced`, `paths::reads_synced_folders`), and
+/// `carry`, what the job's snapshot reads (`carry_probes`), on both. Every
+/// other tool's row only warns or says a path is made again, which the
+/// carry lines already say per path, so a tool the job does not read is
+/// measured on neither node. Before, every move measured every tool on
+/// both nodes and waited for the slowest, such as `pnpm store path`.
+pub(crate) fn preflight_probes(
+    harness: &HarnessKind,
+    target: Target,
+    synced: bool,
+    carry: Probes,
+) -> (Probes, Probes) {
+    let (version, login) = match harness {
+        HarnessKind::ClaudeCode => (Some(Tool::Claude), Some(Tool::ClaudeLogin)),
+        HarnessKind::Codex => (Some(Tool::Codex), Some(Tool::CodexLogin)),
+        HarnessKind::Acp { .. } => (None, None),
+    };
+    let mut both = Probes::of(&[Tool::User, Tool::Git]).union(carry);
+    if let Some(version) = version {
+        both = both.with(version);
+    }
+    if synced {
+        both = both.with(Tool::ICloud);
+    }
+    let on_target = login.map_or(both, |login| both.with(login));
+    match target {
+        Target::Peer => (both, on_target),
+        Target::Here => (on_target, both),
+    }
+}
+
+/// The tools the carry decision and the setup rows read for the snapshot
+/// `manifest` describes, whose spec is `spec`: its carry keys' and its
+/// cache steps' (`carry::probes`), and the programs of the steps its spec
+/// runs on every resume (`doctor::setup_probes`).
+fn carry_probes(manifest: &SnapshotManifest, spec: Option<&EnvSpec>) -> Probes {
+    let carry = carry::probes(manifest);
+    if stayed_behind(&manifest.left_behind, OVERRIDE_FILE) {
+        return carry;
+    }
+    spec.map_or(carry, |spec| carry.union(doctor::setup_probes(spec)))
 }
 
 /// The move `holder` started toward this node at its request, or why it did not.
@@ -4131,6 +4302,24 @@ pub(crate) mod tests {
         NodeFacts::measure(&node.cfg.home, env, Probes::ALL).await
     }
 
+    /// What a preflight of a Codex job that measured every tool on `node`
+    /// and nothing on the peer leaves: nothing is measured again.
+    async fn measured_all(node: &Node, env: &ToolEnv) -> Measured {
+        measured(facts_in(node, env).await, NodeFacts::default())
+    }
+
+    /// What a preflight of a Codex job that found `here` on this node and
+    /// `theirs` on the peer leaves, as if it measured every tool on both,
+    /// so nothing is measured again.
+    fn measured(here: NodeFacts, theirs: NodeFacts) -> Measured {
+        Measured {
+            here,
+            theirs,
+            probes: (Probes::ALL, Probes::ALL),
+            harness: HarnessKind::Codex,
+        }
+    }
+
     /// A job made from a one-commit repository, owned by `node` at epoch 1.
     pub(crate) async fn job(dir: &Path, node: &Arc<Node>) -> JobId {
         let repo = repo(dir);
@@ -4970,7 +5159,7 @@ pub(crate) mod tests {
             id,
             b.id,
             (None, false),
-            (&facts_in(&a, &env()).await, &NodeFacts::default()),
+            (&mut measured_all(&a, &env()).await, &env()),
             out,
         )
         .await
@@ -5115,7 +5304,7 @@ pub(crate) mod tests {
             id,
             a.id,
             (None, false),
-            (&facts_in(&b, &env()).await, &NodeFacts::default()),
+            (&mut measured_all(&b, &env()).await, &env()),
             out,
         )
         .await
@@ -6394,8 +6583,8 @@ pub(crate) mod tests {
             a.id,
             (None, false),
             (
-                &facts_in(&b, &ToolEnv::current()).await,
-                &NodeFacts::default(),
+                &mut measured_all(&b, &ToolEnv::current()).await,
+                &ToolEnv::current(),
             ),
             &mut Out::default(),
         )
@@ -6564,8 +6753,8 @@ pub(crate) mod tests {
                 a.id,
                 (None, false),
                 (
-                    &facts_in(&b, &ToolEnv::current()).await,
-                    &NodeFacts::default(),
+                    &mut measured_all(&b, &ToolEnv::current()).await,
+                    &ToolEnv::current(),
                 ),
                 &mut Out::default(),
             )
@@ -6933,7 +7122,7 @@ pub(crate) mod tests {
             id,
             a.id,
             (None, false),
-            (&facts_in(&b, &env()).await, &NodeFacts::default()),
+            (&mut measured_all(&b, &env()).await, &env()),
             out,
         )
         .await
@@ -7491,7 +7680,7 @@ pub(crate) mod tests {
                 id,
                 a.id,
                 (Some(&HarnessKind::Codex), false),
-                (&facts_in(&b, &env()).await, &NodeFacts::default()),
+                (&mut measured_all(&b, &env()).await, &env()),
                 &mut Out::default(),
             )
             .await;
@@ -7542,7 +7731,10 @@ pub(crate) mod tests {
                 id,
                 a.id,
                 (None, false),
-                (&facts_in(&b, &no_pnpm).await, &NodeFacts::default()),
+                (
+                    &mut measured(facts_in(&b, &no_pnpm).await, NodeFacts::default()),
+                    &no_pnpm,
+                ),
                 &mut out,
             )
             .await;
@@ -7599,8 +7791,8 @@ pub(crate) mod tests {
             .carry_for_move(
                 b.id,
                 snapshot,
-                (&uv(Some("uv 0.9.5")), &uv(None)),
-                Some(false),
+                &mut measured(uv(Some("uv 0.9.5")), uv(None)),
+                (Some(false), &env()),
                 &mut out,
             )
             .await;
@@ -7618,8 +7810,8 @@ pub(crate) mod tests {
         a.carry_for_move(
             b.id,
             snapshot,
-            (&uv(Some("uv 0.9.5")), &uv(Some("uv 0.9.5"))),
-            Some(false),
+            &mut measured(uv(Some("uv 0.9.5")), uv(Some("uv 0.9.5"))),
+            (Some(false), &env()),
             &mut Out::default(),
         )
         .await
@@ -7630,7 +7822,10 @@ pub(crate) mod tests {
                 id,
                 a.id,
                 (None, false),
-                (&facts_in(&b, &no_uv).await, &uv(Some("uv 0.9.5"))),
+                (
+                    &mut measured(facts_in(&b, &no_uv).await, uv(Some("uv 0.9.5"))),
+                    &no_uv,
+                ),
                 &mut Out::default(),
             )
             .await;
@@ -7679,8 +7874,8 @@ pub(crate) mod tests {
             .carry_for_move(
                 b.id,
                 snapshot,
-                (&uv(Some("uv 0.9.5")), &uv(None)),
-                Some(false),
+                &mut measured(uv(Some("uv 0.9.5")), uv(None)),
+                (Some(false), &env()),
                 &mut out,
             )
             .await;
@@ -8802,72 +8997,138 @@ pub(crate) mod tests {
         assert_eq!(winner.lease(id).await.unwrap().owner, winner.id);
     }
 
-    /// The tools a move or a pull leaves out, those of a harness other
-    /// than the job's, change no outcome of its preflight on either node:
-    /// with every fact of both harnesses differing between the nodes, the
-    /// rows come out the same as with them measured (item 19).
+    /// Item 19: a preflight that measures only `preflight_probes` stops a
+    /// move or a pull exactly where one that measured every tool on both
+    /// nodes stops it, and every row it reports reads as that one's. The
+    /// rows it leaves out are those of tools neither node measured, which
+    /// only warn or say a path is made again; the carry lines judge each
+    /// path themselves, with the tools the snapshot reads (`carry`), which
+    /// both nodes measure. Here every fact differs between the nodes, the
+    /// login of the target included.
     #[test]
-    fn the_tools_of_another_harness_change_no_outcome_of_a_preflight() {
-        use crate::facts::name;
-        let facts = |claude: &str, codex: &str, login: &str| {
-            NodeFacts::from_pairs([
-                (name::USER, "tester"),
-                (name::HOME, "/Users/tester"),
-                (name::GIT, "git version 2.50.1"),
-                (name::NODE, "v22.23.2"),
-                (name::NODE_ABI, "127"),
-                (name::CLAUDE, claude),
-                (name::CLAUDE_LOGIN, login),
-                (name::CLAUDE_KEYCHAIN, "locked"),
-                (name::CODEX, codex),
-                (name::CODEX_LOGIN, login),
-                (name::ICLOUD_DESKTOP, "1"),
-                (name::ICLOUD_DOCUMENTS, "0"),
-            ])
-        };
-        let here = facts("2.1.300 (Claude Code)", "codex-cli 0.160.0", "yes");
-        let peer = facts("2.1.200 (Claude Code)", "codex-cli 0.150.0", "no");
+    fn a_preflight_of_the_jobs_tools_stops_where_one_of_every_tool_does() {
         let acp = HarnessKind::Acp {
             program: fabric_core::harness::ProgramName::parse("opencode").unwrap(),
             args: Vec::new(),
         };
-        for harness in [HarnessKind::ClaudeCode, HarnessKind::Codex, acp] {
-            for target in [Target::Peer, Target::Here] {
-                let ctx = Context {
-                    harness: Some(&harness),
-                    root: Some(Path::new("/Users/tester/Desktop/work")),
-                    target,
-                    clock_skew_ms: Some(0),
-                    wire: None,
-                    floor: None,
-                };
-                let outcomes =
-                    |here: &NodeFacts, peer: &NodeFacts| -> Vec<(&str, doctor::Outcome)> {
-                        doctor::compare(here, peer, &ctx)
-                            .iter()
-                            .map(|row| (row.fact, row.outcome))
-                            .collect()
-                    };
-                let before = doctor::probes(&harness, target);
-                let (here_now, peer_now) = (
-                    for_harness(before, &harness),
-                    for_harness(Probes::ALL, &harness),
-                );
-                assert_eq!(
-                    outcomes(&here.only(here_now), &peer.only(peer_now)),
-                    outcomes(&here.only(before), &peer.only(Probes::ALL)),
-                    "{harness} {target:?}"
-                );
-                assert!(here_now != before && peer_now != Probes::ALL, "{harness}");
+        let node_tree = Probes::for_key(&fabric_core::snapshot::CarryKey::Node {
+            node_major: "22".to_owned(),
+            package_manager: "pnpm".to_owned(),
+            pm_major: "9".to_owned(),
+            pnpm_store_path: None,
+        });
+        let (one, two) = (differing_facts(true), differing_facts(false));
+        for (here, peer) in [(&one, &two), (&two, &one)] {
+            for harness in [HarnessKind::ClaudeCode, HarnessKind::Codex, acp.clone()] {
+                for target in [Target::Peer, Target::Here] {
+                    for root in [
+                        "/Users/tester/Desktop/work",
+                        "/Users/tester/fabric/jobs/j/work",
+                    ] {
+                        for carry in [Probes::NONE, node_tree] {
+                            preflight_case((here, peer), &harness, target, Path::new(root), carry);
+                        }
+                    }
+                }
             }
         }
     }
 
+    /// Facts of a node that differ from `differing_facts(!first)` in every
+    /// tool, the login included.
+    fn differing_facts(first: bool) -> NodeFacts {
+        use crate::facts::name;
+        let (version, other, login, synced) = if first {
+            (
+                "1",
+                "v22 2.1.300 (Claude Code) codex-cli 0.160.0",
+                "yes",
+                "0",
+            )
+        } else {
+            (
+                "2",
+                "v24 2.1.200 (Claude Code) codex-cli 0.150.0",
+                "no",
+                "1",
+            )
+        };
+        NodeFacts::from_pairs([
+            (name::USER, "tester"),
+            (name::HOME, "/Users/tester"),
+            (name::GIT, version),
+            (name::MACOS, version),
+            (name::MACOS_SDK, version),
+            (name::NODE, other),
+            (name::NODE_ABI, version),
+            (name::PNPM, version),
+            (name::PNPM_STORE, version),
+            (name::RUSTC, version),
+            (name::PYTHON, version),
+            (name::CLAUDE, other),
+            (name::CLAUDE_LOGIN, login),
+            (name::CLAUDE_KEYCHAIN, "locked"),
+            (name::CODEX, other),
+            (name::CODEX_LOGIN, login),
+            (name::ICLOUD_DESKTOP, synced),
+            (name::ICLOUD_DOCUMENTS, "0"),
+        ])
+    }
+
+    /// One case of `a_preflight_of_the_jobs_tools_stops_where_one_of_every_tool_does`.
+    fn preflight_case(
+        (here, peer): (&NodeFacts, &NodeFacts),
+        harness: &HarnessKind,
+        target: Target,
+        root: &Path,
+        carry: Probes,
+    ) {
+        let ctx = Context {
+            harness: Some(harness),
+            root: Some(root),
+            target,
+            clock_skew_ms: Some(0),
+            wire: None,
+            floor: None,
+        };
+        let blocking = |rows: &[doctor::Row]| -> Vec<&str> {
+            doctor::blocking(rows, false)
+                .iter()
+                .map(|row| row.fact)
+                .collect()
+        };
+        let every = doctor::compare(here, peer, &ctx);
+        let probes = preflight_probes(
+            harness,
+            target,
+            paths::reads_synced_folders(root, Path::new("/Users/tester")),
+            carry,
+        );
+        let measured = doctor::measured_rows(
+            doctor::compare(&here.only(probes.0), &peer.only(probes.1), &ctx),
+            probes.0.union(probes.1),
+        );
+        let case = format!("{harness} {target:?} {} {carry:?}", root.display());
+        assert_eq!(blocking(&measured), blocking(&every), "{case}");
+        for row in &measured {
+            let full = every.iter().find(|full| full.fact == row.fact).unwrap();
+            assert_eq!(row.outcome, full.outcome, "{case} {}", row.fact);
+        }
+        assert!(measured.len() < every.len(), "{case}");
+        for tool in [Tool::Pnpm, Tool::Rustc, Tool::Macos, Tool::MacosSdk] {
+            assert_eq!(
+                probes.0.contains(tool) || probes.1.contains(tool),
+                carry.contains(tool),
+                "{case} {tool:?}"
+            );
+        }
+    }
+
     /// A move of a Codex job asks neither node for Claude's version or
-    /// login, and still asks the target for its Codex login, which gates
-    /// it (item 19).
+    /// login, nor for a tool its snapshot does not read, and still asks the
+    /// target for its Codex login, which gates it (item 19).
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_move_asks_neither_node_about_another_harness() {
+    async fn a_move_measures_only_the_tools_its_job_reads() {
         let dir = tempfile::Builder::new()
             .prefix("fops")
             .tempdir_in("/tmp")
@@ -8886,22 +9147,95 @@ pub(crate) mod tests {
         let moved = a.job_move(id, b.id, false, &tools_a.env, &mut out).await;
         assert!(moved.is_ok(), "{moved:?} {:?}", out.said());
         let (ran_a, ran_b) = (tools_a.ran(), tools_b.ran());
+        // The source also measures what its capture detects; the target
+        // measures only for the preflight and the carry decision.
+        assert_eq!(
+            ran_b,
+            ["codex --version", "codex login status", "id -un"],
+            "the target measured a tool the job does not read"
+        );
         for ran in [&ran_a, &ran_b] {
             assert!(
                 !ran.iter().any(|probe| probe.starts_with("claude")),
                 "a Codex move asked about Claude: {ran:?}"
             );
+            for unread in [
+                "sw_vers", "xcrun", "pnpm", "yarn", "bun", "rustc", "cargo", "uv", "defaults",
+            ] {
+                assert!(
+                    !ran.iter()
+                        .any(|probe| probe.split(' ').next() == Some(unread)),
+                    "the move ran {unread}, which its job does not read: {ran:?}"
+                );
+            }
         }
         assert!(
             ran_b.iter().any(|probe| probe == "codex login status"),
             "{ran_b:?}"
         );
+        assert!(
+            !ran_a.iter().any(|probe| probe == "codex login status"),
+            "the source's login gates nothing: {ran_a:?}"
+        );
+    }
+
+    /// A move whose capture names a carry key its preflight did not
+    /// measure, a tree the job made after its last snapshot, measures the
+    /// key's tools on the target then, before it decides the tree's path
+    /// (item 19): the preflight read the earlier snapshot, which had none.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_capture_that_names_more_than_the_preflight_measured_is_measured_then() {
+        let dir = tempfile::Builder::new()
+            .prefix("fops")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let home = root.join("home");
+        let tools_a = crate::facts::tests::CountingTools::new(&root.join("a"));
+        let tools_b = crate::facts::tests::CountingTools::new(&root.join("b"));
+        let a = node_at(&home, &root.join("a/state"), tools_a.env.clone());
+        let b = node_at(&home, &root.join("b/state"), tools_b.env.clone());
+        paired(&a, &b).await;
+        let id = job(&root, &a).await;
+        a.suspend(id, &tools_a.env, &mut Out::default())
+            .await
+            .unwrap();
+        let work = paths::job_root(&a.cfg.home, id);
+        std::fs::write(work.join("package.json"), "{\"name\": \"x\"}\n").unwrap();
+        std::fs::write(work.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+        std::fs::write(work.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::create_dir_all(work.join("node_modules/pkg")).unwrap();
+        std::fs::write(work.join("node_modules/pkg/index.js"), "1;\n").unwrap();
+        tools_a.ran();
+        tools_b.ran();
+        let mut out = Out::default();
+        let moved = a.job_move(id, b.id, false, &tools_a.env, &mut out).await;
+        assert!(moved.is_ok(), "{moved:?} {:?}", out.said());
+        assert!(
+            out.said().iter().any(|line| line.contains("node_modules")),
+            "the tree's path was not decided: {:?}",
+            out.said()
+        );
+        let ran_b = tools_b.ran();
+        for probe in [
+            "node --version",
+            "node -p process.versions.modules",
+            "pnpm --version",
+            "pnpm store path",
+        ] {
+            assert_eq!(
+                ran_b.iter().filter(|ran| *ran == probe).count(),
+                1,
+                "{probe}: {ran_b:?}"
+            );
+        }
     }
 
     /// The preflight of a move and of a pull measures this node while the
-    /// peer measures itself (issue #26). Each node's `sw_vers` waits up to
-    /// five seconds for the other's to start and says whether it did, so a
-    /// node that measured only after the other finished reads `alone`.
+    /// peer measures itself (issue #26). Each node's `id`, which every
+    /// preflight runs, waits up to five seconds for the other's to start
+    /// and says whether it did, so a node that measured only after the
+    /// other finished reads `alone`.
     /// Both moves are refused, as the two test nodes have different homes,
     /// after the rows are reported.
     #[tokio::test(flavor = "multi_thread")]
@@ -8917,7 +9251,7 @@ pub(crate) mod tests {
             let tools = crate::facts::tests::CountingTools::only(&root.join(me), &[]);
             let (mine, theirs) = (meet.join(me), meet.join(other));
             tools.install(
-                "sw_vers",
+                "id",
                 &format!(
                     "touch '{mine}'\ni=0\nwhile [ ! -f '{theirs}' ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i + 1)); done\nif [ -f '{theirs}' ]; then echo together; else echo alone; fi",
                     mine = mine.display(),
@@ -8939,12 +9273,12 @@ pub(crate) mod tests {
         );
         paired(&a, &b).await;
         let id = job(&root, &a).await;
-        let macos_row = |out: &Out| {
+        let user_row = |out: &Out| {
             out.events
                 .iter()
                 .find_map(|event| match event {
                     Event::Preflight { rows, .. } => {
-                        rows.iter().find(|row| row.fact == "macos.version").cloned()
+                        rows.iter().find(|row| row.fact == "user").cloned()
                     }
                     _ => None,
                 })
@@ -8955,7 +9289,7 @@ pub(crate) mod tests {
         let mut out = Out::default();
         let pushed = a.job_move(id, b.id, false, &tools_a.env, &mut out).await;
         assert!(matches!(pushed, Err(NodeError::Preflight(_))), "{pushed:?}");
-        assert_eq!(macos_row(&out), together, "the move");
+        assert_eq!(user_row(&out), together, "the move");
 
         for marker in ["a", "b"] {
             std::fs::remove_file(meet.join(marker)).unwrap();
@@ -8965,7 +9299,7 @@ pub(crate) mod tests {
             .job_resume(id, Some(a.id), None, false, &tools_b.env, &mut out)
             .await;
         assert!(matches!(pulled, Err(NodeError::Preflight(_))), "{pulled:?}");
-        assert_eq!(macos_row(&out), together, "the pull");
+        assert_eq!(user_row(&out), together, "the pull");
     }
 
     /// A pull decides the snapshot's paths with what its preflight measured

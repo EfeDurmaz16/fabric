@@ -50,7 +50,7 @@ use crate::wire::{
     Appended, ChunkBatch, Facts, Fault, FaultText, Fenced, Hello, JobAnswer, JobRequest,
     JobResponse, KnownWriter, ManifestChunks, MoveRequested, MoveState, Offered, PROTOCOL_VERSION,
     Pulled, RecordBytes, RecordPage, Request, RequestBody, RequestId, Response, ResponseBody,
-    VersionText, WireError, decode, encode, wall_clock_ms,
+    Tools, VersionText, WireError, decode, encode, wall_clock_ms,
 };
 
 /// A clock difference between two nodes above this is logged at `Hello`.
@@ -264,16 +264,21 @@ pub trait Service: Send + Sync {
     fn chunk(&self, peer: NodeId, id: ChunkId) -> BoxFuture<'_, Result<Vec<u8>, Fault>>;
     /// Returns what this node measured about itself, for `peer`'s `fabric doctor` (ADR 0008).
     fn facts(&self, peer: NodeId) -> BoxFuture<'_, Result<Facts, Fault>>;
-    /// Returns what this node measured about itself as the target of a
-    /// job under `harness`, for `peer`'s preflight of a push (issue #16):
-    /// `facts`, and for an ACP job also where this node finds the agent and
-    /// the `state_dir` it gives it.
+    /// Returns what this node measured about itself for `peer`'s preflight
+    /// of a move or pull of a job under `harness` (issue #16): the facts of
+    /// `tools`, the ones the job reads, and for an ACP job also where this
+    /// node finds the agent and the `state_dir` it gives it.
     ///
     /// The default answers `facts` alone. A service that keeps it answers
     /// without the ACP facts, and the asking node then refuses the push,
     /// since a missing fact never reads as a present one.
-    fn facts_for(&self, peer: NodeId, harness: HarnessKind) -> BoxFuture<'_, Result<Facts, Fault>> {
-        let _ = harness;
+    fn facts_for(
+        &self,
+        peer: NodeId,
+        harness: HarnessKind,
+        tools: Tools,
+    ) -> BoxFuture<'_, Result<Facts, Fault>> {
+        let _ = (harness, tools);
         self.facts(peer)
     }
 }
@@ -611,15 +616,17 @@ impl Session {
         self.ask_facts(RequestBody::Facts, deadline).await
     }
 
-    /// Asks what the peer measured about itself as the target of a job
-    /// under `harness`, waiting at most `deadline` (`FactsFor`).
+    /// Asks the peer for the facts of `tools` for a job under `harness`,
+    /// waiting at most `deadline` (`FactsFor`).
     pub async fn facts_for(
         &self,
         harness: &HarnessKind,
+        tools: Tools,
         deadline: Duration,
     ) -> Result<Facts, RpcError> {
         let body = RequestBody::FactsFor {
             harness: harness.clone(),
+            tools,
         };
         self.ask_facts(body, deadline).await
     }
@@ -1113,10 +1120,12 @@ async fn handle(
             .await
             .unwrap_or(Err(Fault::Deadline))
             .map_or_else(ResponseBody::Fault, ResponseBody::Facts),
-        RequestBody::FactsFor { harness } => timeout(budget, service.facts_for(peer, harness))
-            .await
-            .unwrap_or(Err(Fault::Deadline))
-            .map_or_else(ResponseBody::Fault, ResponseBody::Facts),
+        RequestBody::FactsFor { harness, tools } => {
+            timeout(budget, service.facts_for(peer, harness, tools))
+                .await
+                .unwrap_or(Err(Fault::Deadline))
+                .map_or_else(ResponseBody::Fault, ResponseBody::Facts)
+        }
         RequestBody::WantChunks(batch) => {
             let Ok(Ok(_run)) = timeout(budget, limits.chunk_runs.acquire()).await else {
                 reply(
@@ -1562,12 +1571,20 @@ mod tests {
             &self,
             _peer: NodeId,
             harness: HarnessKind,
+            tools: Tools,
         ) -> BoxFuture<'_, Result<Facts, Fault>> {
             Box::pin(async move {
-                Facts::new(vec![(
-                    crate::wire::FactName::truncated("harness"),
-                    crate::wire::FactValue::truncated(&harness.to_string()),
-                )])
+                let tools: Vec<&str> = tools.iter().collect();
+                Facts::new(vec![
+                    (
+                        crate::wire::FactName::truncated("harness"),
+                        crate::wire::FactValue::truncated(&harness.to_string()),
+                    ),
+                    (
+                        crate::wire::FactName::truncated("tools"),
+                        crate::wire::FactValue::truncated(&tools.join(",")),
+                    ),
+                ])
                 .map_err(|e| Fault::Internal(crate::wire::FaultText::truncated(&e.to_string())))
             })
         }
@@ -1575,16 +1592,23 @@ mod tests {
 
     /// Issue #16: a question for the facts of a job's target carries the
     /// job's harness to the peer's service, which a question with none
-    /// does not reach.
+    /// does not reach; item 19 of the A/B lab: and the tools the asking
+    /// node reads for the job.
     #[tokio::test]
-    async fn a_question_for_a_jobs_facts_names_its_harness() {
+    async fn a_question_for_a_jobs_facts_names_its_harness_and_its_tools() {
         let (session, _serving) = serving_pair(paired(), Arc::default()).await;
         let acp = HarnessKind::Acp {
             program: fabric_core::harness::ProgramName::parse("some-agent").unwrap(),
             args: vec!["--acp".to_owned()],
         };
-        let facts = session.facts_for(&acp, IDLE * 10).await.unwrap();
+        let tools = crate::wire::Tools::new(vec![
+            crate::wire::ToolName::truncated("git"),
+            crate::wire::ToolName::truncated("node"),
+        ])
+        .unwrap();
+        let facts = session.facts_for(&acp, tools, IDLE * 10).await.unwrap();
         assert_eq!(facts.get("harness"), Some("acp:some-agent --acp"));
+        assert_eq!(facts.get("tools"), Some("git,node"));
         assert_eq!(session.facts(IDLE * 10).await.unwrap().get("harness"), None);
     }
 

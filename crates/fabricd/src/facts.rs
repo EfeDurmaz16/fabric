@@ -35,7 +35,9 @@ use fabric_core::path::{AbsPath, RelPath};
 use fabric_core::snapshot::{CacheClass, CarryKey, LeftBehind, Platform, Remake, SnapshotManifest};
 use fabric_env::detect::{CacheOrigin, Completion, Detection, Ecosystem, NodeManager};
 use fabric_env::materialize::CacheHealth;
-use fabric_net::wire::{FactName, FactValue, Facts, MAX_FACT_NAME, MAX_FACT_VALUE, MAX_FACTS};
+use fabric_net::wire::{
+    FactName, FactValue, Facts, MAX_FACT_NAME, MAX_FACT_VALUE, MAX_FACTS, ToolName, Tools,
+};
 use fabric_store::capture::CarryKeys;
 
 use crate::harnesses::HarnessEnv;
@@ -280,6 +282,41 @@ impl Tool {
         }
     }
 
+    /// Its name in a peer's question (`Tools` of `FactsFor`): fixed, since
+    /// both nodes of a protocol version read it.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Tool::User => "user",
+            Tool::Git => "git",
+            Tool::Macos => "macos",
+            Tool::MacosSdk => "macos.sdk",
+            Tool::Node => "node",
+            Tool::Npm => "npm",
+            Tool::Pnpm => "pnpm",
+            Tool::Yarn => "yarn",
+            Tool::Bun => "bun",
+            Tool::Rustc => "rustc",
+            Tool::Cargo => "cargo",
+            Tool::Python => "python",
+            Tool::Uv => "uv",
+            Tool::Claude => "claude",
+            Tool::ClaudeLogin => "claude.login",
+            Tool::Codex => "codex",
+            Tool::CodexLogin => "codex.login",
+            Tool::ICloud => "icloud",
+        }
+    }
+
+    /// The tool whose commands give `fact`; `None` for a fact no process
+    /// gives, such as the home or the platform.
+    #[must_use]
+    pub fn of_fact(fact: &str) -> Option<Tool> {
+        Tool::ALL.into_iter().find(|tool| {
+            tool.commands().iter().any(|(name, _, _)| *name == fact)
+                || (*tool == Tool::ClaudeLogin && fact == name::CLAUDE_KEYCHAIN)
+        })
+    }
+
     /// The commands it runs, each giving one fact.
     fn commands(self) -> &'static [Command] {
         use Probe::{ExitCode, Output};
@@ -376,6 +413,46 @@ impl Probes {
     #[must_use]
     pub const fn contains(self, tool: Tool) -> bool {
         self.0 & tool.bit() != 0
+    }
+
+    /// These without `other`'s.
+    #[must_use]
+    pub const fn minus(self, other: Probes) -> Probes {
+        Probes(self.0 & !other.0)
+    }
+
+    /// True when there is no tool.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// These, as a peer's question names them.
+    #[must_use]
+    pub fn to_wire(self) -> Tools {
+        let mut names: Vec<ToolName> = self
+            .tools()
+            .map(|tool| ToolName::truncated(tool.wire_name()))
+            .collect();
+        names.sort();
+        // At most every tool, each named once: always a valid list.
+        Tools::new(names).unwrap_or_default()
+    }
+
+    /// The tools a peer's question names. A name this node does not know,
+    /// from a build that measures a tool this one lacks, makes it every
+    /// tool: more than was asked, never less.
+    #[must_use]
+    pub fn from_wire(tools: &Tools) -> Probes {
+        tools.iter().fold(Probes::NONE, |probes, wanted| {
+            match Tool::ALL
+                .into_iter()
+                .find(|tool| tool.wire_name() == wanted)
+            {
+                Some(tool) => probes.with(tool),
+                None => Probes::ALL,
+            }
+        })
     }
 
     /// Each of these tools.
@@ -724,6 +801,13 @@ impl NodeFacts {
     #[must_use]
     pub fn from_wire(facts: &Facts) -> Self {
         Self::from_pairs(facts.iter())
+    }
+
+    /// Adds the facts of `more`, a later measure of the same node, over
+    /// these: a measure of tools these lacked, which a preflight asks for
+    /// once a capture names more than it measured.
+    pub fn absorb(&mut self, more: NodeFacts) {
+        self.0.extend(more.0);
     }
 
     /// Only the facts `probes` measures, and those no tool gives: what a
@@ -1538,6 +1622,38 @@ pub(crate) mod tests {
             lines.sort();
             lines
         }
+    }
+
+    /// The tools a peer's question names read back as the same tools, and
+    /// a name this node does not know makes it every tool: an answer may
+    /// hold more than was asked, never less (item 19).
+    #[test]
+    fn the_tools_a_question_names_read_back_and_an_unknown_one_is_every_tool() {
+        for tool in Tool::ALL {
+            let one = Probes::NONE.with(tool);
+            assert_eq!(Probes::from_wire(&one.to_wire()), one, "{tool:?}");
+            assert_eq!(
+                Tool::ALL
+                    .iter()
+                    .filter(|t| t.wire_name() == tool.wire_name())
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(Probes::from_wire(&Probes::ALL.to_wire()), Probes::ALL);
+        assert_eq!(Probes::from_wire(&Probes::NONE.to_wire()), Probes::NONE);
+        let unknown = fabric_net::wire::Tools::new(vec![
+            ToolName::truncated("git"),
+            ToolName::truncated("zig"),
+        ])
+        .unwrap();
+        assert_eq!(Probes::from_wire(&unknown), Probes::ALL);
+        assert_eq!(Tool::of_fact(name::PNPM_STORE), Some(Tool::Pnpm));
+        assert_eq!(
+            Tool::of_fact(name::CLAUDE_KEYCHAIN),
+            Some(Tool::ClaudeLogin)
+        );
+        assert_eq!(Tool::of_fact(name::HOME), None);
     }
 
     /// An installed counting tool has run once, unlogged, before any
