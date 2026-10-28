@@ -307,7 +307,8 @@ impl TurnFeed {
 /// `takes_terminal` says so, then calls `release`, which lets the harness
 /// start as soon as the trampoline is ready (`process::spawn`). Dropping a
 /// handle that is still held kills its group: nothing of the harness ran,
-/// and nothing else could let it go on.
+/// and nothing else could let it go on. A handle whose trampoline the
+/// caller has reaped already signals nothing.
 pub struct Running {
     pid: NonZeroU32,
     session: Option<SessionId>,
@@ -338,7 +339,11 @@ impl std::fmt::Debug for Running {
 
 impl Drop for Running {
     fn drop(&mut self) {
-        if self.held {
+        // A trampoline its caller has reaped already led its group alone,
+        // since nothing of the harness ran, so the group went with it, and
+        // its id may name another process's group by now. `id` is `None`
+        // once the child has been waited for.
+        if self.held && self.child.id().is_some() {
             crate::process::kill_held_group(self.pid);
         }
     }

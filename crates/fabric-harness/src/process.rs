@@ -889,6 +889,8 @@ impl StopShared {
 /// Sends `SIGKILL` to the group of a held harness; a group already gone
 /// is no error.
 pub(crate) fn kill_held_group(pgid: NonZeroU32) {
+    #[cfg(test)]
+    killed::note(pgid);
     let group = i32::try_from(pgid.get())
         .ok()
         .and_then(rustix::process::Pid::from_raw);
@@ -897,6 +899,34 @@ pub(crate) fn kill_held_group(pgid: NonZeroU32) {
         && e != rustix::io::Errno::SRCH
     {
         tracing::warn!(%pgid, error = %e, "could not kill the group of a held harness");
+    }
+}
+
+/// The groups a test saw `kill_held_group` signal on its thread.
+#[cfg(test)]
+pub(crate) mod killed {
+    use std::cell::RefCell;
+    use std::num::NonZeroU32;
+
+    thread_local! {
+        static LOG: RefCell<Option<Vec<NonZeroU32>>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `body` and returns what it returned with the groups it killed
+    /// on this thread.
+    pub(crate) fn during<T>(body: impl FnOnce() -> T) -> (T, Vec<NonZeroU32>) {
+        LOG.with(|log| *log.borrow_mut() = Some(Vec::new()));
+        let out = body();
+        let log = LOG.with(|log| log.borrow_mut().take()).unwrap_or_default();
+        (out, log)
+    }
+
+    pub(super) fn note(pgid: NonZeroU32) {
+        LOG.with(|log| {
+            if let Some(log) = log.borrow_mut().as_mut() {
+                log.push(pgid);
+            }
+        });
     }
 }
 
@@ -1519,6 +1549,31 @@ mod tests {
                     "{wiring:?}: the dropped hold's group was left running"
                 );
                 tokio::time::sleep(HOLD_SLEEP + Duration::from_millis(500)).await;
+                assert!(!ran.exists(), "{wiring:?}");
+            }
+        }
+
+        /// A handle whose trampoline its caller has reaped already, as the
+        /// CLI does when it abandons a launch, signals no group when it is
+        /// dropped: the trampoline led the group alone, since nothing of the
+        /// harness ran, so the group is gone with it, and its id may name
+        /// another process's group by then.
+        #[tokio::test]
+        async fn dropping_a_handle_whose_trampoline_was_reaped_signals_no_group() {
+            for (trampoline, wiring) in [(SLOW_LINE, Wiring::Piped), (SLOW_STOP, Wiring::Terminal)]
+            {
+                let (_dir, ran, mut running) = hold_marker(trampoline, wiring);
+                let pid = running.pid();
+                let leader =
+                    rustix::process::Pid::from_raw(i32::try_from(pid.get()).unwrap()).unwrap();
+                rustix::process::kill_process(leader, rustix::process::Signal::KILL).unwrap();
+                ends(&mut running).await;
+                let ((), killed) = killed::during(|| drop(running));
+                assert_eq!(
+                    killed,
+                    Vec::<NonZeroU32>::new(),
+                    "{wiring:?}: a reaped trampoline's group id was signalled"
+                );
                 assert!(!ran.exists(), "{wiring:?}");
             }
         }
