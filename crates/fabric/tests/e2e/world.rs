@@ -70,6 +70,22 @@ impl Env {
     /// every process the test starts. The A/B bench compares two builds
     /// this way on the same fixture.
     pub fn with_fabric(fabric: PathBuf, vars: Vec<(OsString, OsString)>) -> Fallible<Arc<Self>> {
+        Self::make(fabric, vars, "main")
+    }
+
+    /// As `new`, with the repository's branch named `branch` instead of
+    /// `main`: git's own default before 2.28 and still where no
+    /// `init.defaultBranch` is set, which a restore must handle as well
+    /// (store-git: a restore's `git init` names that branch too).
+    pub fn on_branch(branch: &str) -> Fallible<Arc<Self>> {
+        Self::make(
+            PathBuf::from(env!("CARGO_BIN_EXE_fabric")),
+            Vec::new(),
+            branch,
+        )
+    }
+
+    fn make(fabric: PathBuf, vars: Vec<(OsString, OsString)>, branch: &str) -> Fallible<Arc<Self>> {
         let dir = tempfile::Builder::new().prefix("fe2e").tempdir_in("/tmp")?;
         let root = fs::canonicalize(dir.path())?;
         let home = root.join("home");
@@ -84,7 +100,7 @@ impl Env {
         std::os::unix::fs::symlink(&git, bin.join("git"))?;
         let path = std::env::join_paths([bin, PathBuf::from("/usr/bin"), PathBuf::from("/bin")])?;
         let repo = root.join("repo");
-        make_repo(&repo)?;
+        make_repo(&repo, branch)?;
         Ok(Arc::new(Self {
             _dir: dir,
             root,
@@ -352,7 +368,7 @@ fn git(dir: &Path, args: &[&str]) -> Fallible {
     }
 }
 
-fn make_repo(repo: &Path) -> Fallible {
+fn make_repo(repo: &Path, branch: &str) -> Fallible {
     fs::create_dir_all(repo.join("src"))?;
     fs::write(repo.join("README.md"), "hello\n")?;
     fs::write(repo.join("src/greet.txt"), "hello, world\n")?;
@@ -366,7 +382,7 @@ fn make_repo(repo: &Path) -> Fallible {
         repo.join(".gitignore"),
         "scratch/\nnode_modules/\ndist/\n.env\n",
     )?;
-    git(repo, &["init", "-q", "-b", "main"])?;
+    git(repo, &["init", "-q", "-b", branch])?;
     git(repo, &["add", "-A"])?;
     git(repo, &["commit", "-q", "-m", "first"])
 }

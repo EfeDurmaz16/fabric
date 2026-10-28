@@ -54,7 +54,16 @@ struct Pair {
 /// the second. They report the Node versions the gate Macs had, 22 on the
 /// first and 26 on the second, so every move crosses Node majors.
 fn setup(wire: Wire, fault_a: Option<&str>, fault_b: Option<&str>) -> Fallible<Pair> {
-    let env = Env::new()?;
+    setup_in(Env::new()?, wire, fault_a, fault_b)
+}
+
+/// `setup` on the fixture `env`.
+fn setup_in(
+    env: std::sync::Arc<Env>,
+    wire: Wire,
+    fault_a: Option<&str>,
+    fault_b: Option<&str>,
+) -> Fallible<Pair> {
     let mut a = Node::new(&env, "a", wire)?;
     let mut b = Node::new(&env, "b", wire)?;
     a.fake_node("v22.23.2", "127")?;
@@ -178,8 +187,11 @@ const DECISIONS: [&str; 3] = [
 ];
 
 fn move_and_resume(wire: Wire) -> Fallible {
-    let p = setup(wire, None, None)?;
-    let (job, work) = job_with_work(&p)?;
+    move_and_resume_in(&setup(wire, None, None)?)
+}
+
+fn move_and_resume_in(p: &Pair) -> Fallible {
+    let (job, work) = job_with_work(p)?;
     let doctor = p.a.ok(&["doctor", "--peer", &p.b.id, "--job", &job])?;
     assert!(doctor.contains("ok      home"), "{doctor}");
     assert!(doctor.contains("no snapshot yet"), "{doctor}");
@@ -210,7 +222,7 @@ fn move_and_resume(wire: Wire) -> Fallible {
     }
     assert!(!moved.contains("no harness session captured"), "{moved}");
     assert_one_owner(&p.b, &p.a, &job, 2, "departed")?;
-    let resumed = assert_continues(&p, &p.b, &job, &work, &["one"])?;
+    let resumed = assert_continues(p, &p.b, &job, &work, &["one"])?;
     for decision in DECISIONS {
         assert!(resumed.contains(decision), "resume: {decision}:\n{resumed}");
     }
@@ -272,6 +284,22 @@ fn e2e_a_job_moves_and_resumes_over_quic() -> Fallible {
 #[test]
 fn e2e_a_job_moves_and_resumes_over_tcp_tls() -> Fallible {
     move_and_resume(Wire::TcpTls)
+}
+
+/// The same move and way back with the repository on `master`, git's own
+/// default branch name. A restore's `git init` names the snapshot's branch,
+/// and one that set HEAD and its referent in one ref transaction failed on
+/// every repository whose branch was the one `git init` names (store-git,
+/// `a_repository_with_the_branch_git_init_names_restores`); every other
+/// fixture is on `main`.
+#[test]
+fn e2e_a_job_on_master_moves_and_resumes() -> Fallible {
+    move_and_resume_in(&setup_in(
+        Env::on_branch("master")?,
+        Wire::Quic,
+        None,
+        None,
+    )?)
 }
 
 /// Which node a step acts on.
