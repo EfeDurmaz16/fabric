@@ -26,7 +26,7 @@
 //! count that differs from the budget fails in both.
 //!
 //! It is ignored by default, since it takes minutes. CONTRIBUTING.md says
-//! how to run it and how to accept a slowdown.
+//! how to run it and when the budget may change.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -624,8 +624,8 @@ fn judge(
                 Some(again) if again > limit => {
                     failures.push(format!(
                         "{op}: {} ms, then {} ms in a second batch, over its limit of {} ms \
-                         (baseline {} ms). If the slowdown is intended, raise the baseline in \
-                         budget.toml and say why in a new [[change]] entry",
+                         (baseline {} ms, the anchor's time). A slower op is a bug to fix, and \
+                         its baseline never rises (CONTRIBUTING.md, Performance rule)",
                         at.as_millis(),
                         again.as_millis(),
                         limit.as_millis(),
@@ -885,6 +885,12 @@ fn the_verdicts_follow_the_rules() -> Fallible {
     assert_eq!(failures.len(), 1, "{failures:?}");
     assert!(
         failures[0].starts_with("acp suspend: 1400 ms"),
+        "{failures:?}"
+    );
+    // A baseline is the anchor's time and never rises, so the failure
+    // asks for the op to be made fast again, not for a higher baseline.
+    assert!(
+        failures[0].contains("Performance rule") && !failures[0].contains("raise the baseline"),
         "{failures:?}"
     );
 
