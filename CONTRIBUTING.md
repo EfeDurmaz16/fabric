@@ -78,6 +78,7 @@ both builds through the same fixture and ops, taking turns op by op:
 ```sh
 scripts/bench-ab.sh docs/evidence/perf-ab/<name>            # test profile, 15 pairs
 scripts/bench-ab.sh --release --pairs 20 docs/evidence/perf-ab/<name>
+scripts/bench-ab.sh --pairs 0 docs/evidence/perf-ab/<name>  # counted phase only
 scripts/bench-ab.sh --analyze docs/evidence/perf-ab/<name>  # the report again
 ```
 
@@ -87,7 +88,10 @@ resident size. On macOS a counted phase also loads
 `scripts/perf-ab/counters.c` into every `fabric` process and reports what
 does not depend on load: processes started by command, file flushes by
 kind and file, bytes read and written, allocations, and each CLI's peak
-resident size and CPU time. A pull request that touches a hot path keeps
+resident size and CPU time, and each daemon's resident size after every
+op. With `--pairs 0` only that counted phase runs: its numbers do not
+depend on load, so it is the run to make on a busy machine, and a timed
+run waits for a quiet one. A pull request that touches a hot path keeps
 its run under `docs/evidence/perf-ab/`. An interval above 1 is a
 regression; a median above 1 whose interval holds 1 is profiled before
 merge.

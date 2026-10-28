@@ -30,7 +30,10 @@
 # Options:
 #   --anchor <commit>     the anchor (default 176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5)
 #   --candidate <commit>  a commit instead of the working tree
-#   --pairs <n>           timed pairs (default 15, the fewest the rule accepts)
+#   --pairs <n>           timed pairs (default 15, the fewest the rule accepts);
+#                         0 runs only the counted phase, whose counters do not
+#                         depend on load, so it is the one to run on a busy
+#                         machine
 #   --counted <n>         counted runs (default 3)
 #   --release             build both in the release profile instead of test
 # The output directory must not exist yet, so an earlier record is never
@@ -95,7 +98,18 @@ if [ -e "$out" ]; then
 fi
 case $pairs in '' | *[!0-9]*) usage ;; esac
 case $counted in '' | *[!0-9]*) usage ;; esac
-if [ "$pairs" -lt 15 ]; then
+# The counted phase needs macOS, for DYLD_INSERT_LIBRARIES, and a C compiler.
+can_count=
+if [ "$(uname -s)" = Darwin ] && command -v cc >/dev/null 2>&1; then
+  can_count=1
+fi
+if [ "$pairs" -eq 0 ]; then
+  if [ -z "$can_count" ]; then
+    echo "bench-ab: the counters need macOS and cc, and with no timed pairs there is nothing to run" >&2
+    exit 2
+  fi
+  echo "bench-ab: no timed pairs; only the counted phase runs, and the report has no times" >&2
+elif [ "$pairs" -lt 15 ]; then
   echo "bench-ab: $pairs pairs is fewer than the 15 the rule accepts; the report is not evidence" >&2
 fi
 
@@ -154,7 +168,7 @@ cp "$candidate_bin" "$scratch/candidate/fabric"
 "$scratch/candidate/fabric" --version >/dev/null
 
 counters=
-if [ "$(uname -s)" = Darwin ] && command -v cc >/dev/null 2>&1; then
+if [ -n "$can_count" ]; then
   cc -dynamiclib -O2 -Wall -Wextra -Werror -o "$scratch/libcounters.dylib" scripts/perf-ab/counters.c
   counters=$scratch/libcounters.dylib
 else

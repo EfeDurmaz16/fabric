@@ -40,7 +40,9 @@
 //! Every sample goes to `samples.tsv` in `FABRIC_AB_OUT`, and the report to
 //! `report.md` there: per op, both medians and the median of the pairs'
 //! ratios, candidate over anchor, with a 95% bootstrap interval, then the
-//! counts. `ab::analyze` writes the report again from `samples.tsv`.
+//! counts and each daemon's resident size, after the counted ops and after
+//! the timed runs. With `FABRIC_AB_PAIRS=0` only the counted phase runs.
+//! `ab::analyze` writes the report again from `samples.tsv`.
 //! `FABRIC_AB_ANCHOR` and `FABRIC_AB_CANDIDATE` name the two builds.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1071,8 +1073,10 @@ fn counted_report(samples: &[Sample], out: &mut String) {
     }
 }
 
-/// Each daemon's resident size after the timed runs.
+/// Each daemon's resident size after the counted ops and after the timed
+/// runs.
 fn rss_report(samples: &[Sample], out: &mut String) -> Fallible {
+    counted_rss_report(samples, out)?;
     let daemons: BTreeSet<&str> = samples
         .iter()
         .filter(|sample| sample.phase == "timed" && sample.metric == "rss_kib")
@@ -1100,6 +1104,63 @@ fn rss_report(samples: &[Sample], out: &mut String) -> Fallible {
         let _ = writeln!(
             out,
             "| {daemon} | {:.0} | {:.0} | {:.0} | {:.0} | {:.3} | {:.3} to {:.3} |",
+            judged.anchor,
+            max(0),
+            judged.candidate,
+            max(1),
+            judged.ratio,
+            judged.low,
+            judged.high
+        );
+    }
+    Ok(())
+}
+
+/// Each daemon's resident size after every counted op, paired by run and
+/// op. Both builds load the counter library then, so the sizes hold its
+/// page and calls alike; they do not depend on load, as the times do.
+fn counted_rss_report(samples: &[Sample], out: &mut String) -> Fallible {
+    /// A daemon's size after one op of one run, per build.
+    type ByOp<'a> = BTreeMap<(usize, &'a str), [Option<f64>; 2]>;
+    let mut daemons: BTreeMap<&str, ByOp<'_>> = BTreeMap::new();
+    for sample in samples {
+        if sample.phase == "counted"
+            && let Some(daemon) = sample.metric.strip_prefix("daemon_rss_kib.")
+        {
+            daemons
+                .entry(daemon)
+                .or_default()
+                .entry((sample.run, sample.op.as_str()))
+                .or_default()[sample.side] = Some(sample.value);
+        }
+    }
+    if daemons.is_empty() {
+        return Ok(());
+    }
+    out.push_str(
+        "\n### Daemon resident size, counted runs\n\n\
+         KiB after each counted op, both builds with the counter library loaded: the \
+         number of ops, median and largest per build, and the median of the ops' ratios \
+         with its 95% bootstrap interval.\n\n\
+         | daemon | ops | anchor median | anchor max | candidate median | candidate max | ratio | 95% interval |\n\
+         |---|---:|---:|---:|---:|---:|---:|---|\n",
+    );
+    for (daemon, by_op) in daemons {
+        let found: Vec<(f64, f64)> = by_op
+            .values()
+            .filter_map(|pair| Some((pair[0]?, pair[1]?)))
+            .collect();
+        let judged = judge(&found)?;
+        let max = |side: usize| {
+            found
+                .iter()
+                .map(|pair| if side == 0 { pair.0 } else { pair.1 })
+                .fold(0.0, f64::max)
+        };
+        let _ = writeln!(
+            out,
+            "| {daemon} | {} | {:.0} | {:.0} | {:.0} | {:.0} | {:.3} | {:.3} to {:.3} |",
+            judged.pairs,
             judged.anchor,
             max(0),
             judged.candidate,
@@ -1163,6 +1224,35 @@ fn a_counter_page_reads_back() -> Fallible {
     assert_eq!(changed["cli_processes"], 1);
     assert_eq!(changed["cli_maxrss_kib"], 8192);
     assert_eq!(Page::parse(&[0_u8; 4096])?, None);
+    Ok(())
+}
+
+/// A run that only counts still reports each daemon's resident size,
+/// from the counted runs: memory is held to the anchor as time is, and a
+/// counted run is the one an owner may take on a busy machine.
+#[test]
+fn a_counted_run_reports_the_daemons_resident_size() -> Fallible {
+    let mut text = String::from("phase\trun\top\tside\tfirst\tmetric\tvalue\n");
+    for run in 1..=3 {
+        for op in ["acp suspend", "cli ls"] {
+            for (side, kib) in [("anchor", 20_000), ("candidate", 19_000)] {
+                let _ = writeln!(
+                    text,
+                    "counted\t{run}\t{op}\t{side}\tanchor\tdaemon_rss_kib.a\t{}",
+                    kib + run * 10
+                );
+            }
+        }
+    }
+    let report = report(&text)?;
+    assert!(
+        report.contains("### Daemon resident size, counted runs"),
+        "{report}"
+    );
+    assert!(
+        report.contains("| a | 6 | 20020 | 20030 | 19020 | 19030 | 0.950 |"),
+        "{report}"
+    );
     Ok(())
 }
 
