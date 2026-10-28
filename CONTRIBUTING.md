@@ -100,10 +100,12 @@ times the hot paths on the end-to-end fixture of two nodes over QUIC:
 suspend, move, resume and pull of a job under each harness (ACP, Claude,
 Codex), and a daemon's cold start and restart. Every program the node's
 facts probe, but git, is a fake that answers after 50 ms; git is the
-machine's own. It also counts the git, kill, lsof, pgrep and ps processes
-each op starts, the harness's own too: the end-to-end build turns on the
-`counted-tools` feature, which runs the harness's system tools from the
-test's `bin` (`FABRIC_SYSTEM_TOOLS`), where the budget counts them.
+machine's own. It also counts the processes each op starts, by program:
+git, every probed fake and every harness, and the kill, lsof, pgrep and ps
+the harness runs, which the end-to-end build's `counted-tools` feature
+takes from the test's `bin` (`FABRIC_SYSTEM_TOOLS`), where the budget
+counts them. Probes run in parallel, so a probe started once more hides
+in the time; its count shows it.
 `crates/fabric/tests/e2e/budget.toml` holds the limits: the ratio, the
 grace, the runs per batch, each platform's baselines, the exact process
 counts, and the `[[change]]` entries that record why the budget changed. CI

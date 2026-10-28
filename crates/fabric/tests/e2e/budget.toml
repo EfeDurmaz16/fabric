@@ -50,26 +50,27 @@ percentile = 25
 "cold start" = 32
 "restart" = 36
 
-# The git, kill, lsof, pgrep and ps processes each op starts in each
-# warm-up run, the harness's own included: exact, and the same on every
-# platform. The first run moves each job for the first time; a count that
-# grows from the first run to the second grows with the job's history.
+# The processes each op starts in each warm-up run, by program: git, the
+# kill, lsof, pgrep and ps the harness runs, every probed fake and every
+# harness, the harness's own starts included. A program an op does not
+# name starts in no run. Exact, and the same on every platform. The first
+# run moves each job for the first time; a count that grows from the first
+# run to the second grows with the job's history.
 [processes]
-"acp suspend" = { git = [27, 29], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
-"acp move" = { git = [2, 2], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
-"acp resume" = { git = [9, 10], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [1, 1] }
-"acp pull" = { git = [41, 41], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [1, 1] }
-"claude suspend" = { git = [27, 29], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
-"claude move" = { git = [2, 2], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
-"claude resume" = { git = [9, 10], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [1, 1] }
-"claude pull" = { git = [41, 41], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [1, 1] }
-"codex suspend" = { git = [27, 29], kill = [0, 0], lsof = [1, 1], pgrep = [0, 0], ps = [0, 0] }
-"codex move" = { git = [2, 2], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
-"codex resume" = { git = [9, 10], kill = [0, 0], lsof = [1, 1], pgrep = [0, 0], ps = [1, 1] }
-"codex pull" = { git = [41, 41], kill = [0, 0], lsof = [2, 2], pgrep = [0, 0], ps = [1, 1] }
-"cold start" = { git = [0, 0], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
-"restart" = { git = [0, 0], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
-
+"acp suspend" = { git = [27, 29], node = [2, 2], python3 = [2, 2], fabric-fake-agent = [1, 1] }
+"acp move" = { git = [2, 2], id = [2, 2], sw_vers = [2, 2], xcrun = [2, 2], node = [4, 4], npm = [2, 2], pnpm = [4, 4], yarn = [2, 2], bun = [2, 2], rustc = [2, 2], cargo = [2, 2], python3 = [4, 4], uv = [2, 2], defaults = [4, 4] }
+"acp resume" = { git = [9, 10], ps = [1, 1], node = [2, 2], fabric-fake-agent = [1, 1] }
+"acp pull" = { git = [41, 41], ps = [1, 1], id = [2, 2], sw_vers = [2, 2], xcrun = [2, 2], node = [8, 8], npm = [2, 2], pnpm = [4, 4], yarn = [2, 2], bun = [2, 2], rustc = [2, 2], cargo = [2, 2], python3 = [6, 6], uv = [2, 2], defaults = [4, 4], fabric-fake-agent = [2, 2] }
+"claude suspend" = { git = [27, 29], node = [2, 2], python3 = [2, 2], claude = [1, 1] }
+"claude move" = { git = [2, 2], id = [2, 2], sw_vers = [2, 2], xcrun = [2, 2], node = [4, 4], npm = [2, 2], pnpm = [4, 4], yarn = [2, 2], bun = [2, 2], rustc = [2, 2], cargo = [2, 2], python3 = [4, 4], uv = [2, 2], defaults = [4, 4], claude = [3, 3] }
+"claude resume" = { git = [9, 10], ps = [1, 1], node = [2, 2], claude = [3, 3] }
+"claude pull" = { git = [41, 41], ps = [1, 1], id = [2, 2], sw_vers = [2, 2], xcrun = [2, 2], node = [8, 8], npm = [2, 2], pnpm = [4, 4], yarn = [2, 2], bun = [2, 2], rustc = [2, 2], cargo = [2, 2], python3 = [6, 6], uv = [2, 2], defaults = [4, 4], claude = [8, 8] }
+"codex suspend" = { git = [27, 29], lsof = [1, 1], node = [2, 2], python3 = [2, 2], codex = [2, 2] }
+"codex move" = { git = [2, 2], id = [2, 2], sw_vers = [2, 2], xcrun = [2, 2], node = [4, 4], npm = [2, 2], pnpm = [4, 4], yarn = [2, 2], bun = [2, 2], rustc = [2, 2], cargo = [2, 2], python3 = [4, 4], uv = [2, 2], defaults = [4, 4], codex = [3, 3] }
+"codex resume" = { git = [9, 10], lsof = [1, 1], ps = [1, 1], node = [2, 2], codex = [3, 3] }
+"codex pull" = { git = [41, 41], lsof = [2, 2], ps = [1, 1], id = [2, 2], sw_vers = [2, 2], xcrun = [2, 2], node = [8, 8], npm = [2, 2], pnpm = [4, 4], yarn = [2, 2], bun = [2, 2], rustc = [2, 2], cargo = [2, 2], python3 = [6, 6], uv = [2, 2], defaults = [4, 4], codex = [9, 9] }
+"cold start" = {}
+"restart" = {}
 # Every change to this file adds an entry here, below the others, that
 # says when and why. Entries are never edited or removed.
 [[change]]
@@ -112,3 +113,7 @@ why = "Perf items 5, 8, 9, 10 and 18 of docs/evidence/perf-ab/README.md, in fabr
 [[change]]
 date = "2026-10-28"
 why = "Perf items 2 and 17 of docs/evidence/perf-ab/README.md, in fabricd: the node tells whether a harness leads its process group with getpgid instead of ps -o pgid=, and finds a gone harness gone with kill(pid, 0) before it would ask ps -o lstart=. Every resume and pull starts ps once instead of three times; a check is not dropped, the same answers come without a process. Counted on that change alone and on the integration of every M2 deferred-work branch, which agree. Baselines unchanged"
+
+[[change]]
+date = "2026-10-28"
+why = "The budget counts every fake in the test's bin too, each program the node's facts probe and each harness, not only git and the harness's system tools: probes run in parallel, so a probe started again or for another harness hides in the time, and only its count shows it. A program an op does not start is left out of its entry instead of written as [0, 0]. Counts of the integration of every M2 deferred-work branch (budget-ci-evidence, cli-protocol-ops bf14115, durability 3904a60, facts-net-carry b0f25c0, launch-hold 6586ef9, node-runtime 922522c, store-git 02b7dc4), whose git, lsof and ps counts equal the entries above. Baselines unchanged"
