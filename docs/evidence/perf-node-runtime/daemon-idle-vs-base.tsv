@@ -1,0 +1,46 @@
+pair	arm	rss_kib	footprint_kib	code_kib	heap_kib	threads
+0	anchor	8032	3136	5280	298	20
+0	candidate	7808	3120	5296	289	19
+1	candidate	7808	3136	5296	289	19
+1	anchor	8080	3136	5280	298	20
+2	anchor	8112	3200	5280	298	20
+2	candidate	7872	3136	5296	289	19
+3	candidate	7808	3168	5296	289	19
+3	anchor	8688	3024	5280	298	20
+4	anchor	8080	3152	5280	298	20
+4	candidate	8784	3120	5296	289	19
+5	candidate	8800	3136	5296	289	19
+5	anchor	8704	3056	5280	298	20
+6	anchor	8672	3024	5280	298	20
+6	candidate	8736	3072	5296	289	19
+7	candidate	8784	3120	5296	289	19
+7	anchor	8048	3088	5280	298	20
+8	anchor	8800	3152	5280	298	20
+8	candidate	8720	3056	5296	289	19
+9	candidate	8704	3024	5296	289	19
+9	anchor	8672	3008	5280	298	20
+10	anchor	8640	2976	5280	298	20
+10	candidate	8784	3104	5296	289	19
+11	candidate	8816	3152	5296	289	19
+11	anchor	8816	3168	5280	298	20
+12	anchor	8800	3168	5280	298	20
+12	candidate	8768	3104	5296	289	19
+13	candidate	8832	3168	5296	289	19
+13	anchor	8784	3136	5280	298	20
+14	anchor	8832	3184	5280	298	20
+14	candidate	7792	3120	5296	289	19
+15	candidate	7728	3056	5296	289	19
+15	anchor	8176	3152	5280	298	20
+16	anchor	8752	3104	5280	298	20
+16	candidate	8720	3056	5296	289	19
+17	candidate	8848	3184	5296	289	19
+17	anchor	8752	3104	5280	298	20
+18	anchor	8784	3152	5280	298	20
+18	candidate	8800	3152	5296	289	19
+19	candidate	8848	3184	5296	289	19
+19	anchor	8880	3248	5280	298	20
+resident KiB (medians): anchor 8696, candidate 8752; candidate/anchor median 0.998198 [0.98151-1.00642] over 20 pairs
+footprint KiB (medians): anchor 3136, candidate 3120; candidate/anchor median 0.997475 [0.982416-1.01028] over 20 pairs
+code KiB (medians): anchor 5280, candidate 5296; candidate/anchor median 1.00303 [1.00303-1.00303] over 20 pairs
+heap KiB (medians): anchor 298, candidate 289; candidate/anchor median 0.969799 [0.969799-0.969799] over 20 pairs
+threads (medians): anchor 20, candidate 19; candidate/anchor median 0.95 [0.95-0.95] over 20 pairs

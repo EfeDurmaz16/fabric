@@ -1,0 +1,46 @@
+pair	arm	rss_kib	footprint_kib	code_kib	heap_kib	threads
+0	anchor	10720	4416	6816	344	20
+0	candidate	13440	4208	6976	343	20
+1	candidate	14528	7072	6976	344	20
+1	anchor	13872	4288	6848	343	20
+2	anchor	13136	6640	6816	343	20
+2	candidate	14384	7024	6976	343	20
+3	candidate	13840	6480	6976	343	20
+3	anchor	13008	4176	6848	343	20
+4	anchor	13264	6640	6816	343	20
+4	candidate	12176	5856	6976	343	20
+5	candidate	11376	4784	6976	344	20
+5	anchor	13008	6464	6816	343	20
+6	anchor	13760	6512	6848	343	20
+6	candidate	11568	4928	6976	343	20
+7	candidate	13280	6688	6976	344	20
+7	anchor	13776	6544	6848	343	20
+8	anchor	13712	6480	6848	344	20
+8	candidate	14048	6608	6976	343	20
+9	candidate	13328	5936	6976	343	20
+9	anchor	12928	4224	6848	343	20
+10	anchor	11584	4528	6816	344	20
+10	candidate	13328	5072	6976	343	20
+11	candidate	13728	4800	6976	344	20
+11	anchor	13104	4336	6848	343	20
+12	anchor	13584	6992	6848	343	20
+12	candidate	13344	6032	6976	343	20
+13	candidate	14048	6672	6976	343	20
+13	anchor	13056	4240	6848	344	20
+14	anchor	12912	4848	6816	343	20
+14	candidate	11088	4640	6976	343	20
+15	candidate	11520	4912	6992	344	20
+15	anchor	11232	4752	6848	343	20
+16	anchor	11632	4704	6816	343	20
+16	candidate	11328	7056	6976	344	20
+17	candidate	13776	4704	6976	343	20
+17	anchor	11232	7040	6816	344	20
+18	anchor	11216	4352	6816	343	20
+18	candidate	11408	4368	6976	343	20
+19	candidate	11344	5040	6976	343	20
+19	anchor	11088	4720	6816	344	20
+resident KiB (medians): anchor 13008, candidate 13328; candidate/anchor median 1.02507 [0.978098-1.05579] over 20 pairs
+footprint KiB (medians): anchor 4736, candidate 5464; candidate/anchor median 1.02784 [0.954997-1.11357] over 20 pairs
+code KiB (medians): anchor 6832, candidate 6976; candidate/anchor median 1.02225 [1.01869-1.02347] over 20 pairs
+heap KiB (medians): anchor 343, candidate 343; candidate/anchor median 1 [0.998547-1.00146] over 20 pairs
+threads (medians): anchor 20, candidate 20; candidate/anchor median 1 [1-1] over 20 pairs
