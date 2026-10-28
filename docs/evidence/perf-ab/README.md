@@ -270,3 +270,116 @@ Beyond the anchor:
     them five to six times, a restart three to six times per job, and `job
     ls` once per job. `crates/fabricd/src/job.rs`. `job ls` and restart
     lose a file open per job.
+
+## Integration against the anchor, counted
+
+On 2026-10-28 the budget and CI group merged every M2 deferred-work branch
+into one scratch tree, `d12d410` (`pd/wip-budget-ci-evidence` at
+`c8e25d6`, `pd/wip-cli-protocol-ops` at `bf14115`, `pd/wip-durability` at
+`7d8f2b9`, `pd/wip-facts-net-carry` at `b0f25c0`, `pd/wip-launch-hold` at
+`6586ef9`, `pd/wip-node-runtime` at `50df18c`, `pd/wip-store-git` at
+`f345556`; no conflict), and ran `scripts/bench-ab.sh --pairs 0` against
+the anchor in both profiles: one warm-up and three counted runs each, and
+no timed pair. Other workflows kept the load average at 11 to 21, so no
+time was taken; nothing below depends on load.
+
+| Directory | Profile | Counted runs |
+|---|---|---:|
+| `integration-counted/` | test | 3 |
+| `integration-counted-release/` | release | 3 |
+
+Release, medians over the counted runs, anchor -> integration:
+
+| op | processes | full flushes | barrier flushes | plain fsyncs | allocations | CLI peak KiB |
+|---|---:|---:|---:|---:|---:|---:|
+| acp launch | 4 -> 2 | 15 -> 5 | 0 -> 5 | 0 -> 0 | 4092 -> 4442 | 6912 -> 7248 |
+| acp approve | 0 -> 0 | 3 -> 1 | 0 -> 1 | 0 -> 0 | 1186 -> 784 | 5104 -> 4736 |
+| cli ls | 0 -> 0 | 0 -> 0 | 0 -> 0 | 0 -> 0 | 1507 -> 1131 | 5280 -> 4832 |
+| acp suspend | 36 -> 35 | 39 -> 21 | 0 -> 10 | 9 -> 13 | 14958 -> 12293 | 5296 -> 4992 |
+| acp move | 42 -> 36 | 15 -> 7 | 0 -> 4 | 0 -> 0 | 8303 -> 7005 | 5696 -> 5408 |
+| acp resume | 32 -> 14 | 24 -> 13 | 0 -> 9 | 51 -> 61 | 11134 -> 8207 | 7056 -> 7328 |
+| acp pull | 111 -> 84 | 81 -> 42 | 0 -> 24 | 59 -> 76 | 30353 -> 23868 | 7184 -> 7392 |
+| restart | 0 -> 0 | 38 -> 6 | 0 -> 3 | 0 -> 0 | 17720 -> 9297 | 5296 -> 4928 |
+
+`report.md` in each directory has every op and every counter that differs.
+A resume's git starts stay at 10 in every run where the anchor's grow with
+the bundle chain (20, 24, 28), and a pull's at 41 (anchor 54, 58, 62).
+`budget::hot_paths` in count mode gives the same process counts on its own
+fixture, now for every probe and harness too (`budget.toml`).
+
+### What the counters show against the rule
+
+Two regressions, both of memory, for the owners of the code before merge:
+
+1. **Daemon resident size**, after every counted op: release a 13976 ->
+   14568 KiB, ratio 1.046 [1.039 to 1.051], b 14672 -> 15480 KiB, 1.059
+   [1.057 to 1.061]; test profile 1.048 and 1.063. Right after a restart
+   a daemon is only 160 to 176 KiB larger, about the larger binary's code
+   (release 19.8 to 21.4 MB); after a suspend, move, resume or pull it is
+   600 to 1400 KiB larger. The M2 head was at 0.997 and
+   1.013 in release (`m2-head-release/`). Of the daemon sizes in the
+   groups' own A/B runs (a size does not depend on load as a time does),
+   `pd/wip-cli-protocol-ops` is at 1.029 and 1.054 against the anchor in
+   release (`perf-cli-protocol-ops/run2-release` on that branch), and
+   launch-hold and facts-net-carry are near 1 against the M2 head or base.
+   That points at a cache that branch
+   adds (job records kept in memory, `80cde73`; the ledger hash index,
+   `e56c6bf`; per-peer heads, `1ecc017`), but it is not isolated: the next
+   step is the counted run of each branch head alone against the anchor,
+   and `vmmap` of both daemons after a suspend.
+2. **CLI peak resident size of an op that runs a headless turn**: release
+   launch +336 KiB (ACP), resume +96 to +272 KiB, pull +16 to +208 KiB,
+   and `cli version` +96 KiB, which is code alone. Every other op's CLI is
+   smaller than the anchor's (two-worker runtime, `3e1ebba`): approve 5104
+   -> 4736 KiB, `cli ls` 5280 -> 4832 KiB.
+
+Not regressions by themselves, for the timed run to judge: plain fsyncs
+rose where full flushes fell (the barrier design of ADR 0002), and a
+store's bytes read rose by about 1 KB per suspend and 5 KB per resume and
+pull (the node bundle cache's pack checks, `da5844a`, `02b7dc4`), against
+14 fewer processes per resume.
+
+### The work items, by counter
+
+| Item | Commits | In the integration |
+|---|---|---|
+| 1 register while the trampoline starts | `376148b` | order only; for the timed run |
+| 2 `getpgid` for `ps -o pgid=` | `150ee4d` | `ps -o pgid=` 1 -> 0 per launch, resume and pull |
+| 3 barrier, then one full flush | `41526fc`, `923aac7`, ADR `6d57d63` | full flushes per launch 15 -> 5, per suspend 39 -> 21 |
+| 4 trampoline in `dash` | `84828df` | the held shell is `dash` |
+| 5 symbolic refs in the ref transaction | `a4a72e4` | `git symbolic-ref` 1 -> 0 per resume |
+| 6 authority thread only with work | `0392968`, `440d56e` | not counted here; `perf-node-runtime/daemon-idle-vs-anchor.tsv`: 19 threads, as the anchor |
+| 7 two-worker client runtime | `3e1ebba` | CLI peak lower on every op that does not run a turn |
+| 8 unbundle without `bundle verify` | `26a9475` | `git bundle` 10 -> 2 per resume |
+| 9 node bundle cache | `da5844a`, `3a03e01`, `7939faa` | resume git flat at 10 (anchor 20 to 28) |
+| 10 heads from the bundle header, one ignored listing | `6aa154f`, `b961153` | `git bundle` 3 -> 2 per suspend |
+| 11 restart rewrites only a stale manifest | `af041ba` | restart full flushes 38 -> 6, opens 258 -> 87 |
+| 12 ledger append without its own full flushes | `9f47c43` | approve and ledger append 3 -> 1 full flush |
+| 13 suspend's version probe beside detection | `ecb5b99` | overlap only; for the timed run |
+| 14 resume's iCloud check beside the probes | `9cc0ab4`, `1dd8dbc`, `55de9a9` | `defaults` 2 -> 0 per resume; overlap for the timed run |
+| 15 resume guard's version early | `7bae3d0`, `df27512`, `5f076b2` | overlap only: the daemon and the CLI still each start the harness's `--version` once per resume; for the timed run |
+| 16 capture with plain fsyncs | `3771de8`, `90d79de` | suspend full flushes 39 -> 21 with item 3 |
+| 17 liveness without `ps` | `b83c221`, `d448c2c` | `ps -o lstart=` 2 -> 1 per launch |
+| 18 restore without `rev-parse` and `config` | `26ec80b` | `git config` 4 -> 0, `git rev-parse` 1 -> 0 per resume |
+| 19 a move measures only what it needs | `f05b03f` | partly: the other harnesses' probes are gone (42 -> 36 processes per ACP move), but every node probe still runs on both nodes, 34 processes, where the item expected about 12 |
+| 20 job files in memory | `80cde73` | job file reads per move 4099 -> 119 bytes, per launch 1010 -> 121; opens per `cli ls` 13 -> 0 |
+
+Items 3, 12 and 17 change how ADR 0002 reaches "durable before visible"
+and asked for Efe's agreement; the durability branch amended ADR 0002
+(`6d57d63`), and that agreement is not recorded among the decisions of 27
+Oct 2026.
+
+### For the integrator: the timed run
+
+The timed half of this comparison waits for a quiet machine and for the
+integrated head. Alone on the machine, with nothing else building:
+
+```sh
+scripts/bench-ab.sh --candidate <integrated head> --pairs 20 docs/evidence/perf-ab/final-test
+scripts/bench-ab.sh --release --candidate <integrated head> --pairs 20 docs/evidence/perf-ab/final-release
+FABRIC_BUDGET=enforce cargo test -p fabric --test e2e --locked -- --ignored --exact budget::hot_paths --nocapture
+```
+
+The first two give every op's ratio to the anchor with its interval and
+the daemons' sizes after timed runs; the third holds the times to the
+`macos-aarch64` baselines and the process counts to `budget.toml`.
