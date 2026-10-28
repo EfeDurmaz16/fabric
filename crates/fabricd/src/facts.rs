@@ -814,9 +814,31 @@ async fn probe_command(
     binary: &Path,
     args: &[&str],
     probe: Probe,
-    (env, home, inherited): (&ToolEnv, &Path, &[(OsString, OsString)]),
+    context: (&ToolEnv, &Path, &[(OsString, OsString)]),
     null: &Null,
 ) -> Option<String> {
+    tracing::debug!(?binary, ?args, "measuring");
+    let answer = match start(binary, args, probe, context, null) {
+        Some(child) => tokio::time::timeout(COMMAND_TIMEOUT, answer(child, probe)).await,
+        None => Ok(None),
+    };
+    tracing::debug!(?binary, ?args, done = answer.is_ok(), "measured");
+    answer.ok().flatten()
+}
+
+/// Starts one measuring command, or `None` if it could not start; the
+/// child is killed when it is dropped.
+///
+/// It is not async, so the command, which takes a few hundred bytes, is
+/// gone before the probe first waits: it never becomes part of the
+/// probe's task, which every worker that polls it carries on its stack.
+fn start(
+    binary: &Path,
+    args: &[&str],
+    probe: Probe,
+    (env, home, inherited): (&ToolEnv, &Path, &[(OsString, OsString)]),
+    null: &Null,
+) -> Option<tokio::process::Child> {
     let path_var = env.path_var();
     let mut command = tokio::process::Command::new(binary);
     command
@@ -839,18 +861,15 @@ async fn probe_command(
             Probe::ExitCode => null.stdio(),
         })
         .stderr(null.stdio())
-        .kill_on_drop(true);
-    tracing::debug!(?binary, ?args, "measuring");
-    let answer = tokio::time::timeout(COMMAND_TIMEOUT, answer(command, probe)).await;
-    tracing::debug!(?binary, ?args, done = answer.is_ok(), "measured");
-    answer.ok().flatten()
+        .kill_on_drop(true)
+        .spawn()
+        .ok()
 }
 
-/// Starts `command` and reads its answer as `probe` says. A command that
-/// could not start, or whose output cannot be a fact, gives none; the
-/// child is killed when it is dropped.
-async fn answer(mut command: tokio::process::Command, probe: Probe) -> Option<String> {
-    let mut child = command.spawn().ok()?;
+/// Reads a started command's answer as `probe` says. A command whose
+/// output cannot be a fact gives none, and is killed when `child` is
+/// dropped.
+async fn answer(mut child: tokio::process::Child, probe: Probe) -> Option<String> {
     match probe {
         Probe::ExitCode => {
             let status = child.wait().await.ok()?;
@@ -872,9 +891,10 @@ async fn read_fact(mut out: impl tokio::io::AsyncRead + Unpin) -> Option<String>
     use tokio::io::AsyncReadExt;
 
     let mut fact = Trimmed::default();
-    // Enough for a version or a path in one read, `rustc -vV` in one or
-    // two; the buffer lives in each probe's task.
-    let mut buf = [0u8; 512];
+    // Every probe's answer in one read, `rustc -vV`'s 192 bytes the
+    // longest. The buffer lives in each probe's task, which every worker
+    // that polls it carries on its stack, so it is no larger than that.
+    let mut buf = [0u8; 256];
     loop {
         match out.read(&mut buf).await.ok()? {
             0 => return fact.finish(),
