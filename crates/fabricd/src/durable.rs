@@ -150,14 +150,22 @@ fn create_new(path: &Path) -> io::Result<File> {
     }
 }
 
-/// Creates `dir` and its parents, then flushes the parent so the new name is durable.
-pub(crate) fn create_dir(dir: &Path) -> io::Result<()> {
+/// Creates `dir` and its parents, then orders the new name with a barrier
+/// on the parent: no write issued after it, to a file in `dir` or anywhere
+/// on the device, reaches the medium before the name does, and the name is
+/// durable once a later full flush on the device returns.
+///
+/// For a directory the caller writes a file into with `write_atomic`
+/// before it reports anything made: that write's full flush makes the name
+/// durable with the file, one full flush where a full flush of the parent
+/// would have been a second.
+pub(crate) fn create_dir_ordered(dir: &Path) -> io::Result<()> {
     if dir.is_dir() {
         return Ok(());
     }
     fs::create_dir_all(dir)?;
     match dir.parent() {
-        Some(parent) => sync_dir(parent),
+        Some(parent) => flush(&File::open(parent)?, Flush::Barrier),
         None => Ok(()),
     }
 }

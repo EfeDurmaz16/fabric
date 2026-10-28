@@ -154,7 +154,9 @@ impl Job {
             .into());
         }
         let ledger = Ledger::replay(job_id, [created.clone()])?;
-        crate::durable::create_dir(dir.dir()).map_err(|e| NodeError::io(dir.dir(), e))?;
+        // The ledger's own full flush below makes the directory's name
+        // durable with it; a barrier orders the name first.
+        crate::durable::create_dir_ordered(dir.dir()).map_err(|e| NodeError::io(dir.dir(), e))?;
         let file = LedgerFile::create(&dir.ledger(), created)?;
         if let Err(e) = ledger_file::write_manifest(&dir.manifest(), &ledger) {
             drop(file);
@@ -191,7 +193,9 @@ impl Job {
         marker: &Marker,
     ) -> Result<Self, NodeError> {
         let path = dir.dir().to_owned();
-        let made = crate::durable::create_dir(&path)
+        // The marker's full flush makes the directory's name durable with
+        // it; a barrier orders the name first.
+        let made = crate::durable::create_dir_ordered(&path)
             .map_err(|e| NodeError::io(&path, e))
             .and_then(|()| Ok(local::write(&dir.marker(), marker)?))
             .and_then(|()| Self::create(id, dir, created));
@@ -753,6 +757,60 @@ mod tests {
         fs::create_dir_all(paths.marker()).unwrap();
         assert!(job.set_marker(&marker).is_err());
         assert!(job.marker().is_err(), "the copy outlived a failed write");
+    }
+
+    /// A new job's directory is ordered with a barrier on `jobs/`, not
+    /// flushed through the drive on its own: the marker's and the ledger's
+    /// full flushes that follow make its name durable before the job is
+    /// reported made, so a job costs one full flush per file it writes and
+    /// none for its directory.
+    #[test]
+    fn a_new_jobs_directory_is_made_durable_by_the_flushes_of_its_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::resolve(Some(dir.path().as_os_str()), dir.path()).unwrap();
+        fs::create_dir_all(state.jobs()).unwrap();
+        let id = JobId::from_bytes([1; 16]);
+        let created = Ledger::created(
+            id,
+            "goal".into(),
+            HarnessKind::Codex,
+            NodeId::from_bytes([3; 32]),
+            EventId::from_bytes([4; 16]),
+            1,
+        )
+        .unwrap();
+        let marker = Marker {
+            root: dir.path().join("work"),
+            state: MarkerState::Live,
+            epoch: fabric_core::id::Epoch::FIRST,
+        };
+        let (made, log) = crate::durable::record::flushes(|| {
+            Job::create_owned(id, state.job(id), &created, &marker)
+        });
+        made.unwrap();
+        let jobs = crate::durable::record::real(&state.jobs());
+        let job_dir = crate::durable::record::real(state.job(id).dir());
+        assert_eq!(
+            log.first(),
+            Some(&(crate::durable::Flush::Barrier, jobs.clone())),
+            "{log:?}"
+        );
+        assert!(
+            !log.contains(&(crate::durable::Flush::Full, jobs)),
+            "jobs/ was flushed through the drive: {log:?}"
+        );
+        let full: Vec<_> = log
+            .iter()
+            .filter(|(how, _)| *how == crate::durable::Flush::Full)
+            .collect();
+        assert_eq!(
+            full,
+            vec![
+                &(crate::durable::Flush::Full, job_dir.clone()),
+                &(crate::durable::Flush::Full, job_dir)
+            ],
+            "the marker and the ledger each flush the job's directory once: {log:?}"
+        );
     }
 
     /// An owned job whose marker could not be written must leave no

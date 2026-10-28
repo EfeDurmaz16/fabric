@@ -3956,7 +3956,9 @@ fn move_aside(root: &Path, dest: &Path) -> Result<bool, NodeError> {
         return Ok(false);
     }
     let parent = dest.parent().ok_or_else(|| no_parent(dest))?;
-    crate::durable::create_dir(parent).map_err(|e| NodeError::io(parent, e))?;
+    // The full flush of `parent` after the rename makes its new name
+    // durable too; a barrier orders the name first.
+    crate::durable::create_dir_ordered(parent).map_err(|e| NodeError::io(parent, e))?;
     std::fs::rename(root, dest).map_err(|e| NodeError::io(root, e))?;
     crate::durable::sync_dir(parent).map_err(|e| NodeError::io(parent, e))?;
     if let Some(root_parent) = root.parent() {
