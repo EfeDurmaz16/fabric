@@ -972,9 +972,12 @@ fn e2e_a_run_ended_before_its_harness_is_recorded_stops_it() -> Fallible {
 
 /// Issue #17: a CLI killed by `SIGKILL` once the node holds its harness's
 /// registration cannot stop the harness, so only the hold keeps it from
-/// running. The CLI's death orphans the stopped group, which the kernel
-/// then ends with `SIGHUP`, so the harness never ran, nothing of its group
-/// outlives the CLI, and the next suspend finds no harness to stop.
+/// running. A headless or ACP trampoline waits for a line on a pipe whose
+/// write end only the CLI holds, so the CLI's death closes it and the shell
+/// reads end of file and exits without its exec; a terminal trampoline is
+/// stopped, and the kernel ends its orphaned group with `SIGHUP`. Either
+/// way the harness never ran, nothing of its group outlives the CLI, and
+/// the next suspend finds no harness to stop.
 fn assert_killed_before_record_leaves_nothing(
     p: &Pair,
     job: &str,
