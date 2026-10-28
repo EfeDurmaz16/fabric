@@ -309,7 +309,9 @@ fixture, now for every probe and harness too (`budget.toml`).
 
 ### What the counters show against the rule
 
-Two regressions, both of memory, for the owners of the code before merge:
+Two regressions, both of memory, for the owners of the code before merge
+(on the integrated head the release build has neither: "The integrated
+head, timed", below):
 
 1. **Daemon resident size**, after every counted op: release a 13976 ->
    14568 KiB, ratio 1.046 [1.039 to 1.051], b 14672 -> 15480 KiB, 1.059
@@ -361,7 +363,7 @@ pull (the node bundle cache's pack checks, `da5844a`, `02b7dc4`), against
 | 16 capture with plain fsyncs | `3771de8`, `90d79de` | suspend full flushes 39 -> 21 with item 3 |
 | 17 liveness without `ps` | `b83c221`, `d448c2c` | `ps -o lstart=` 2 -> 1 per launch |
 | 18 restore without `rev-parse` and `config` | `26ec80b` | `git config` 4 -> 0, `git rev-parse` 1 -> 0 per resume |
-| 19 a move measures only what it needs | `f05b03f` | partly: the other harnesses' probes are gone (42 -> 36 processes per ACP move), but every node probe still runs on both nodes, 34 processes, where the item expected about 12 |
+| 19 a move measures only what it needs | `f05b03f`, then `202a844` on the integrated branch | partly at first: the other harnesses' probes were gone (42 -> 36 processes per ACP move), but every node probe still ran on both nodes. Finished by `202a844` (`FactsFor` names the tools): 42 -> 8 processes per ACP move, 11 for Claude and Codex, a pull 28 or 29 fewer |
 | 20 job files in memory | `80cde73` | job file reads per move 4099 -> 119 bytes, per launch 1010 -> 121; opens per `cli ls` 13 -> 0 |
 
 Items 3, 12 and 17 change how ADR 0002 reaches "durable before visible"
@@ -383,3 +385,180 @@ FABRIC_BUDGET=enforce cargo test -p fabric --test e2e --locked -- --ignored --ex
 The first two give every op's ratio to the anchor with its interval and
 the daemons' sizes after timed runs; the third holds the times to the
 `macos-aarch64` baselines and the process counts to `budget.toml`.
+
+## The integrated head, timed
+
+On 2026-10-28 the integrator cherry-picked the seven deferred-work branches
+onto `m2/durable-job-foundations` (`docs/evidence/m2-deferred-integration/`),
+added the commits below, and ran `scripts/bench-ab.sh` alone on the machine:
+no other bench, build or test of these worktrees ran, each run started only
+once the 1-minute load average was at most 6 (4.5 to 5.7 at each start, at
+most 7.0 at an end; `machine.txt`), and the runs went one after another. The
+candidate is the working tree at `dc8b87c`, whose code is `202a844`'s.
+
+| Directory | Anchor | Profile | Pairs | Counted runs |
+|---|---|---|---:|---:|
+| `final-test/` | `176622e` | test | 20 | 3 |
+| `final-release/` | `176622e` | release | 20 | 3 |
+| `vs-m2-head-test/` | `f381d42`, the M2 head before the deferred work | test | 20 | 3 |
+| `vs-m2-head-release/` | `f381d42` | release | 20 | 3 |
+| `vs-m2-head-counted-test/`, `vs-m2-head-counted-release/` | `f381d42` | test, release | 0 | 1 |
+| `aa-test/` | `176622e` against itself, an A/A control | test | 15 | 3 |
+| `lto-before-counted-release/` | `176622e`; candidate `35b8929`, before the release profile | release | 0 | 3 |
+| `lto-after-counted-release/` | `176622e`; candidate `35b8929` with `9635ea0`'s release profile, then uncommitted | release | 0 | 3 |
+
+Commits of the integrator that change what runs, besides the merge:
+
+- `9635ea0` builds release with fat LTO and one codegen unit (below).
+- `7717d07` makes a new job's directory durable with the flushes of its
+  files: one full flush fewer per new job (`new` 4 -> 3 against the M2 head).
+- `e59c667` lets a capture's pending departure record join the capture's one
+  full flush when both are on one device.
+- `202a844` finishes item 19 (the table above).
+- `0f5b363`, `a60b0a5`, `725dcff` are correctness and tidiness fixes off the
+  hot paths: a reaped trampoline's group is not signalled, gc drops the
+  bundle cache of a job with no snapshot left, the store names its root.
+
+### Times
+
+The median of the pairs' ratios, head over the build it is compared with,
+and its 95% bootstrap interval; `faster` when the interval lies below 1.
+
+| op | test: before / head ms | ratio [95%] | release: before / head ms | ratio [95%] |
+|---|---:|---|---:|---|
+| acp new | 153.3 / 68.4 | 0.447 [0.442-0.454] faster | 135.1 / 51.5 | 0.379 [0.368-0.387] faster |
+| acp launch | 69.1 / 31.5 | 0.459 [0.448-0.465] faster | 64.3 / 27.4 | 0.426 [0.416-0.435] faster |
+| acp approve | 15.7 / 8.3 | 0.532 [0.514-0.556] faster | 15.0 / 7.4 | 0.494 [0.469-0.514] faster |
+| claude new | 138.3 / 51.6 | 0.374 [0.367-0.380] faster | 133.8 / 50.5 | 0.380 [0.361-0.392] faster |
+| claude launch | 93.6 / 91.0 | 0.978 [0.945-1.002] | 90.9 / 88.8 | 0.988 [0.918-1.010] |
+| claude approve | 16.9 / 9.2 | 0.535 [0.528-0.558] faster | 15.7 / 7.6 | 0.483 [0.466-0.509] faster |
+| codex new | 136.9 / 52.3 | 0.386 [0.373-0.395] faster | 135.0 / 50.9 | 0.384 [0.359-0.400] faster |
+| codex launch | 104.7 / 98.2 | 0.940 [0.917-0.960] faster | 103.1 / 94.3 | 0.939 [0.918-0.955] faster |
+| codex approve | 16.7 / 8.7 | 0.533 [0.519-0.555] faster | 15.7 / 8.3 | 0.509 [0.495-0.528] faster |
+| ledger append | 16.4 / 8.6 | 0.529 [0.522-0.553] faster | 15.5 / 7.7 | 0.499 [0.488-0.526] faster |
+| cli version | 3.0 / 3.1 | 1.015 [0.966-1.087] | 2.9 / 3.0 | 1.006 [0.953-1.080] |
+| cli ls | 5.1 / 4.7 | 0.888 [0.876-0.907] faster | 3.9 / 3.3 | 0.805 [0.764-0.883] faster |
+| acp suspend | 357.5 / 267.0 | 0.741 [0.734-0.749] faster | 351.1 / 260.0 | 0.743 [0.739-0.750] faster |
+| acp move | 166.4 / 108.6 | 0.651 [0.634-0.682] faster | 167.2 / 105.1 | 0.632 [0.613-0.656] faster |
+| acp resume | 607.5 / 263.3 | 0.436 [0.372-0.501] faster | 599.7 / 259.2 | 0.431 [0.370-0.492] faster |
+| acp pull | 1128.2 / 626.0 | 0.560 [0.521-0.595] faster | 1140.5 / 613.2 | 0.539 [0.503-0.582] faster |
+| claude suspend | 436.1 / 276.1 | 0.630 [0.623-0.639] faster | 423.6 / 264.1 | 0.625 [0.618-0.642] faster |
+| claude move | 166.3 / 112.0 | 0.665 [0.635-0.679] faster | 164.5 / 108.7 | 0.666 [0.644-0.678] faster |
+| claude resume | 779.1 / 373.8 | 0.486 [0.416-0.542] faster | 767.3 / 370.6 | 0.484 [0.414-0.548] faster |
+| claude pull | 1410.9 / 752.0 | 0.531 [0.507-0.578] faster | 1375.4 / 740.1 | 0.524 [0.509-0.572] faster |
+| codex suspend | 649.3 / 496.6 | 0.764 [0.752-0.773] faster | 637.0 / 482.4 | 0.758 [0.747-0.770] faster |
+| codex move | 171.1 / 111.7 | 0.656 [0.628-0.669] faster | 166.9 / 107.9 | 0.651 [0.640-0.676] faster |
+| codex resume | 998.7 / 536.2 | 0.554 [0.478-0.585] faster | 979.2 / 526.5 | 0.545 [0.491-0.594] faster |
+| codex pull | 1832.5 / 1124.8 | 0.621 [0.598-0.656] faster | 1822.8 / 1114.5 | 0.612 [0.586-0.652] faster |
+| cold start | 60.3 / 60.0 | 0.991 [0.960-1.038] | 56.0 / 42.2 | 0.934 [0.743-0.995] faster |
+| restart | 423.5 / 77.2 | 0.185 [0.151-0.204] faster | 414.4 / 55.4 | 0.129 [0.118-0.162] faster |
+
+No op is slower than the anchor in either profile: no interval lies above 1.
+Three ops are not faster, and their intervals hold 1: `claude launch`
+(0.978 and 0.988), `cold start` in the test profile (0.991; 0.934 faster in
+release), and `cli version` (1.015 and 1.006, medians above 1). `cli version`
+was profiled from the counters: it starts no process and touches no state
+file in either build; it makes 244 allocations against the anchor's 189, which
+are the larger command tree clap builds before it prints the version (the
+`managed`, `job repair` and `job export` commands), and in release its peak
+resident size is lower than the anchor's (3168 -> 3072 KiB). The A/A control
+puts it at 1.048 [0.879-1.123] against itself, so its time is noise at 3 ms.
+
+Against the M2 head every op but three is faster, those three holding 1 too
+(`cli version` 1.032 and 0.964, `cold start` 0.997 and 0.959):
+
+| op | test: before / head ms | ratio [95%] | release: before / head ms | ratio [95%] |
+|---|---:|---|---:|---|
+| acp new | 153.4 / 68.4 | 0.448 [0.442-0.457] faster | 135.5 / 52.3 | 0.382 [0.369-0.389] faster |
+| acp launch | 60.9 / 31.7 | 0.515 [0.503-0.528] faster | 56.4 / 27.8 | 0.493 [0.486-0.501] faster |
+| acp approve | 15.9 / 8.4 | 0.526 [0.511-0.541] faster | 14.4 / 7.1 | 0.495 [0.482-0.511] faster |
+| claude new | 136.4 / 52.3 | 0.388 [0.373-0.404] faster | 134.3 / 50.4 | 0.374 [0.368-0.391] faster |
+| claude launch | 110.5 / 92.1 | 0.831 [0.795-0.864] faster | 107.4 / 88.7 | 0.822 [0.781-0.852] faster |
+| claude approve | 17.3 / 9.5 | 0.553 [0.529-0.564] faster | 15.8 / 8.2 | 0.524 [0.499-0.535] faster |
+| codex new | 137.1 / 52.4 | 0.385 [0.373-0.397] faster | 134.0 / 51.3 | 0.383 [0.361-0.404] faster |
+| codex launch | 124.0 / 96.4 | 0.792 [0.763-0.809] faster | 120.8 / 94.3 | 0.767 [0.747-0.820] faster |
+| codex approve | 17.4 / 9.6 | 0.548 [0.531-0.559] faster | 16.0 / 8.4 | 0.521 [0.496-0.556] faster |
+| ledger append | 16.9 / 9.5 | 0.550 [0.523-0.575] faster | 16.1 / 8.4 | 0.517 [0.492-0.546] faster |
+| cli version | 3.1 / 3.2 | 1.032 [0.939-1.158] | 3.1 / 3.0 | 0.964 [0.928-1.045] |
+| cli ls | 5.2 / 4.9 | 0.947 [0.889-0.976] faster | 3.7 / 3.1 | 0.836 [0.790-0.916] faster |
+| acp suspend | 358.2 / 270.4 | 0.753 [0.745-0.764] faster | 352.0 / 259.7 | 0.738 [0.731-0.755] faster |
+| acp move | 169.6 / 108.6 | 0.631 [0.620-0.654] faster | 162.2 / 104.4 | 0.655 [0.631-0.669] faster |
+| acp resume | 608.5 / 264.5 | 0.431 [0.373-0.506] faster | 613.9 / 257.5 | 0.437 [0.381-0.487] faster |
+| acp pull | 1138.4 / 627.6 | 0.556 [0.494-0.602] faster | 1125.4 / 607.2 | 0.547 [0.490-0.575] faster |
+| claude suspend | 434.5 / 276.0 | 0.635 [0.628-0.657] faster | 425.8 / 265.1 | 0.626 [0.617-0.632] faster |
+| claude move | 169.0 / 112.5 | 0.653 [0.647-0.678] faster | 165.2 / 108.6 | 0.656 [0.641-0.691] faster |
+| claude resume | 794.5 / 367.7 | 0.485 [0.415-0.517] faster | 790.3 / 366.0 | 0.474 [0.399-0.518] faster |
+| claude pull | 1407.7 / 743.6 | 0.524 [0.496-0.562] faster | 1399.4 / 735.2 | 0.528 [0.501-0.566] faster |
+| codex suspend | 648.8 / 492.8 | 0.754 [0.747-0.759] faster | 635.3 / 484.2 | 0.755 [0.741-0.775] faster |
+| codex move | 169.4 / 112.8 | 0.658 [0.644-0.684] faster | 165.2 / 108.7 | 0.665 [0.639-0.681] faster |
+| codex resume | 997.0 / 537.0 | 0.536 [0.485-0.578] faster | 1016.5 / 529.9 | 0.521 [0.474-0.570] faster |
+| codex pull | 1831.3 / 1137.6 | 0.623 [0.599-0.645] faster | 1841.6 / 1110.9 | 0.613 [0.580-0.639] faster |
+| cold start | 61.0 / 58.9 | 0.997 [0.921-1.019] | 43.6 / 43.0 | 0.959 [0.922-1.016] |
+| restart | 430.6 / 74.6 | 0.173 [0.154-0.205] faster | 415.2 / 54.9 | 0.138 [0.106-0.175] faster |
+
+### Memory
+
+KiB, the anchor's median -> the head's, the median of the ratios and its
+95% interval. "Counted" is after every counted op, with the counter library
+in both builds; "timed" is after every timed run.
+
+| | test profile | release |
+|---|---|---|
+| resident size, counted, daemon a | 25816 -> 26760, 1.028 [1.022-1.042] | 14128 -> 12792, 0.891 [0.889-0.894] |
+| resident size, counted, daemon b | 27008 -> 27584, 1.015 [1.012-1.016] | 15064 -> 13248, 0.874 [0.867-0.882] |
+| physical footprint, counted, daemon a | 6856 -> 6992, 0.981 [0.945-0.999] | 5520 -> 5480, 0.969 [0.963-0.972] |
+| physical footprint, counted, daemon b | 9824 -> 8240, 0.833 [0.818-0.833] | 6784 -> 6304, 0.933 [0.917-0.933] |
+| resident size, timed, daemon a | 20048 -> 21008, 1.047 [1.043-1.051] | 11344 -> 9832, 0.867 [0.864-0.870] |
+| resident size, timed, daemon b | 28784 -> 28584, 0.985 [0.980-0.992] | 15968 -> 13808, 0.860 [0.855-0.871] |
+| physical footprint, timed, daemon a | 5080 -> 5056, 0.994 [0.980-1.007] | 4216 -> 3920, 0.930 [0.922-0.939] |
+| physical footprint, timed, daemon b | 12152 -> 9320, 0.772 [0.766-0.780] | 8296 -> 6904, 0.838 [0.821-0.851] |
+
+Against the M2 head (`vs-m2-head-*`) both daemons are smaller in release
+(resident size 0.885 and 0.858 counted, 0.874 and 0.847 timed; footprint
+0.963 and 0.915 counted, 0.933 and 0.846 timed), and in the test profile
+their footprint is smaller (0.948 and 0.803 counted, 0.948 and 0.746 timed)
+while daemon a's resident size is 1.010 [1.009-1.015] after the timed runs.
+
+In release, the build a node runs, both daemons are smaller than the
+anchor's by both measures, and so is every CLI: the counted CLI peak
+resident size is at or below the anchor's on every op. Before the release
+profile of `9635ea0` they were larger: the M2 work grew the code by 8.7%
+(`__text` 11147588 -> 12120480 bytes) and a process keeps the code pages it
+ran resident, so the daemons' resident size was 1.030 and 1.052 of the
+anchor's (`lto-before-counted-release/`) while their physical footprint
+was 1.005 and 1.024; `vmmap` after that run (`vmmap/` there) put the
+difference in resident `__TEXT` (15.0 -> 15.6 MB for daemon b) and not in
+the heap. With fat LTO and one codegen unit the binary is 15442464 bytes
+against the anchor's 19773920 (`lto-after-counted-release/`: resident size
+0.897 and 0.891, footprint 0.988 and 0.990).
+
+The test profile builds no release code, so its binary is still larger than
+the anchor's (79277336 against 73350296 bytes), and what that costs shows:
+daemon a's resident size is 1.047 [1.043-1.051] of the anchor's after the
+timed runs and 1.028 [1.022-1.042] after the counted ops, and the counted
+CLI peak resident size is higher on 15 ops, by 16 to 656 KiB (`acp resume`
++656, `acp launch` +624, `acp pull` +544, `claude resume` +496). The
+physical footprint, which leaves out clean code pages, is not larger: daemon
+a 0.994 [0.980-1.007] and 0.981 [0.945-0.999], daemon b 0.772 and 0.833.
+
+The A/A control (`aa-test/`) calibrates the memory intervals. With the same
+binary on both sides, daemon b's footprint after the counted ops is 1.058
+[1.043-1.061] and its resident size 1.018 [1.014-1.021]: each side's daemon
+is one process for the whole phase, so a ratio between two daemons carries
+that process's own variance, and an interval that excludes 1 by a few
+percent is not by itself a difference between builds. The test profile's
+1.047 for daemon a's resident size is beyond what the control shows; the
+release ratios are well beyond it on the other side. Of the 26 timed ops
+the control called one faster (`acp launch` 0.974 [0.953-0.999]) and none
+slower.
+
+### What is left against the rule
+
+- Time: nothing; no op of either profile is slower than the anchor.
+- Memory, release: nothing; both daemons and every CLI are smaller.
+- Memory, test profile only: daemon a's resident size (1.047) and the CLI
+  peak resident size of the ops that run a headless turn, from the clean
+  code pages of an unoptimized binary 8% larger than the anchor's; the
+  physical footprint is not larger. A test-profile build is not what a node
+  runs, but the rule as written does not say which profile it holds, so
+  this is left for Efe to rule on rather than called no regression.
