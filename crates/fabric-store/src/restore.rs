@@ -930,9 +930,7 @@ fn unbundle_chain(
     report: &mut RestoreReport,
 ) -> Result<(), RestoreError> {
     let ids = chain_ids(store, snapshot, manifest)?;
-    let tmp = store.objects().tmp_dir();
-    let store_root = tmp.parent().unwrap_or(tmp);
-    let mut cache = BundleCache::open(store_root, manifest.job_id);
+    let mut cache = BundleCache::open(store.root(), manifest.job_id);
     let held = cache.reuse(&ids);
     let pack_dir = git_dir(root).join("objects").join("pack");
     for index in 0..held {

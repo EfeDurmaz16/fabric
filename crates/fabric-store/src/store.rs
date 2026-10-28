@@ -220,6 +220,8 @@ pub struct Store {
 /// What every handle on one store shares.
 #[derive(Debug)]
 struct Shared {
+    /// The store's directory.
+    root: PathBuf,
     objects: ObjectStore,
     /// Held for one query or one transaction, never across object IO.
     catalog: Mutex<Catalog>,
@@ -274,12 +276,13 @@ impl Store {
         let objects = ObjectStore::new(root, params);
         objects.create_dirs()?;
         let catalog = Catalog::create(&catalog_path, &params)?;
-        Ok(Store::new(objects, catalog, lock))
+        Ok(Store::new(root, objects, catalog, lock))
     }
 
-    fn new(objects: ObjectStore, catalog: Catalog, lock: File) -> Store {
+    fn new(root: &Path, objects: ObjectStore, catalog: Catalog, lock: File) -> Store {
         Store {
             shared: Arc::new(Shared {
+                root: root.to_owned(),
                 objects,
                 catalog: Mutex::new(catalog),
                 publishing: Mutex::new(()),
@@ -322,7 +325,12 @@ impl Store {
         if removed > 0 {
             tracing::info!(removed, "cleared staged files left by an earlier process");
         }
-        Ok(Store::new(objects, catalog, lock))
+        Ok(Store::new(root, objects, catalog, lock))
+    }
+
+    /// The store's directory.
+    pub(crate) fn root(&self) -> &Path {
+        &self.shared.root
     }
 
     /// Returns the object files, for writing and reading content.
