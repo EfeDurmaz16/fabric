@@ -64,7 +64,25 @@ An experiment on git 2.54 first showed why the transaction needs
 `--no-deref`: without it, `symref-update HEAD refs/heads/main` followed the
 `HEAD` of `git init` and made `refs/heads/master` a symbolic ref. With it,
 the refs and every reflog came out byte for byte as with `symbolic-ref`,
-for a branch and for a detached `HEAD`.
+for a branch and for a detached `HEAD`; both cases used `main`.
+
+The first test above is `a_restore_sets_head_and_symbolic_refs_without_a_process_each`
+since `c0ece10`, which takes `HEAD` out of the transaction:
+`a_repository_with_the_branch_git_init_names_restores`, on `228a6cd`
+(the code of `a4a72e4`), failed at its first layout, a repository on
+`master`:
+
+```
+scenario 0 ["checkout -q master"]: Err(Git(Failed { command: "update-ref --no-deref --stdin", code: Some(128), stderr: "fatal: multiple updates for 'HEAD' (including one via its referent 'refs/heads/master') are not allowed" }))
+```
+
+git refuses one transaction that updates `HEAD` and the branch `HEAD`
+points at, and a restore's `git init` points `HEAD` at `master`, so every
+snapshot with a `master` branch failed to restore on git 2.46 and later,
+whatever its `HEAD` (checked on git 2.54 by hand for `master`, `main` with
+a `master` branch, and a detached `HEAD` with a `master` branch). On
+`c0ece10`, whose `git init` takes `--initial-branch`, all seven layouts of
+the test restore.
 
 ## Item 10: the bundle's heads without `list-heads`
 

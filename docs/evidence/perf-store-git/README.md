@@ -8,7 +8,7 @@ is `main` at `176622e`.
 |---|---|---|
 | 8 | a restore unpacks each link with `git bundle unbundle` alone; `unbundle` runs the same `verify_bundle` first | `26a9475` |
 | 18 | a restore writes `.git/info/exclude` of its own `git init` without `rev-parse --git-path`, and appends the carried config's sections without `git config` | `26ec80b` |
-| 5 | symbolic refs and `HEAD` set with `symref-update` in the ref transaction on git 2.46 and later, `symbolic-ref` before | `a4a72e4` |
+| 5 | symbolic refs set with `symref-update` in the ref transaction on git 2.46 and later, `symbolic-ref` before; `HEAD` put on its branch by `git init --initial-branch`, a detached one detached in the transaction | `a4a72e4`, `c0ece10` |
 | 10 | a capture reads the bundle's heads from its header instead of `git bundle list-heads`; the ignored listings run beside work that does not need them | `6aa154f`, `b961153` |
 | 9 | a node's bundle cache: a restore unpacks only the links of the chain the node has not unpacked before | `da5844a`, `3a03e01`, `02b7dc4`, `7939faa`; bench `1685654` |
 
@@ -32,9 +32,13 @@ integrator's to take, alone on a quiet machine.
 
 Each holds `report.md` (medians, anchor -> candidate), `counters.tsv`
 (every counted sample), `spawns.tsv` (every command line a counted run
-started) and `machine.txt`. `7939faa`, after these runs, changes the
-Linux build only: macOS copied the cache's files with a clone before it
-and after it.
+started) and `machine.txt`. Two fixes came after these runs and change
+no counter of the fixture: `7939faa` changes the Linux build only, since
+macOS copied the cache's files with a clone before it and after it, and
+`c0ece10` moves `HEAD` from the ref transaction to `git init`'s
+`--initial-branch` argument, the same one `update-ref` process on the
+fixture's `main` (on a repository with a `master` branch the transaction
+failed before it).
 
 ## Processes
 
