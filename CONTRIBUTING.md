@@ -122,12 +122,16 @@ minutes:
 ```sh
 cargo test -p fabric --test e2e --locked -- --ignored --exact budget::hot_paths --nocapture
 FABRIC_BUDGET=enforce cargo test -p fabric --test e2e --locked -- --ignored --exact budget::hot_paths --nocapture
+FABRIC_BUDGET=count cargo test -p fabric --test e2e --locked -- --ignored --exact budget::hot_paths --nocapture
 ```
 
-The first command only reports times; the second fails on them. An op is
+The first command only reports times; the second fails on them. A third,
+with `FABRIC_BUDGET=count`, runs only the two warm-up runs and times
+nothing: the process counts do not depend on load, so it is the one to run
+on a busy machine, or to set the counts after a change. An op is
 over its limit when its 25th percentile of 7 runs is above both 1.3 times
 its baseline and its baseline plus 50 ms, and it fails when it is over
-again in a second batch of 7. A process count fails in both modes when it
+again in a second batch of 7. A process count fails in every mode when it
 differs from the budget, higher or lower: fewer starts can mean a check was
 dropped. A platform with no baselines only reports its times.
 `macos-aarch64` holds the times of an 18-core Apple silicon Mac and

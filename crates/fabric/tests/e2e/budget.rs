@@ -22,8 +22,10 @@
 //! Then `reps` runs are timed, and an op whose time at `percentile` is
 //! over its limit is timed in `reps` more runs, and fails only when it is
 //! over again. `FABRIC_BUDGET=report`, the default, prints the times and
-//! fails on none of them; `FABRIC_BUDGET=enforce` fails on them. A process
-//! count that differs from the budget fails in both.
+//! fails on none of them; `FABRIC_BUDGET=enforce` fails on them;
+//! `FABRIC_BUDGET=count` runs only the warm-up runs and times nothing, so
+//! the counts can be checked on a machine too busy to time. A process
+//! count that differs from the budget fails in all three.
 //!
 //! It is ignored by default, since it takes minutes. CONTRIBUTING.md says
 //! how to run it and when the budget may change.
@@ -159,23 +161,38 @@ fn ops() -> Vec<String> {
     ops
 }
 
-/// What a time over its limit does.
+/// What a time over its limit does, or whether ops are timed at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     /// It is reported.
     Report,
     /// It fails the test.
     Enforce,
+    /// Nothing is timed: only the warm-up runs run, and their process
+    /// counts are checked.
+    Count,
 }
 
 impl Mode {
-    /// The mode `FABRIC_BUDGET` names: `report`, the default, or `enforce`.
+    /// The mode `FABRIC_BUDGET` names: `report`, the default, `enforce`
+    /// or `count`.
     fn from_env() -> Fallible<Self> {
         match std::env::var("FABRIC_BUDGET") {
             Err(std::env::VarError::NotPresent) => Ok(Mode::Report),
-            Ok(mode) if mode == "report" => Ok(Mode::Report),
-            Ok(mode) if mode == "enforce" => Ok(Mode::Enforce),
-            other => Err(format!("FABRIC_BUDGET must be report or enforce, not {other:?}").into()),
+            Ok(mode) => Self::named(&mode),
+            Err(e) => Err(format!("FABRIC_BUDGET: {e}").into()),
+        }
+    }
+
+    /// The mode called `name`.
+    fn named(name: &str) -> Fallible<Self> {
+        match name {
+            "report" => Ok(Mode::Report),
+            "enforce" => Ok(Mode::Enforce),
+            "count" => Ok(Mode::Count),
+            other => {
+                Err(format!("FABRIC_BUDGET must be report, enforce or count, not {other:?}").into())
+            }
         }
     }
 
@@ -183,6 +200,7 @@ impl Mode {
         match self {
             Mode::Report => "report",
             Mode::Enforce => "enforce",
+            Mode::Count => "count",
         }
     }
 }
@@ -613,6 +631,7 @@ fn judge(
         let limit = baseline.map(|base| budget.limit(base));
         let again = second.and_then(|batch| budget.at(batch, &op));
         let verdict = match (at, limit) {
+            (None, _) if mode == Mode::Count => "counted only",
             (None, _) => {
                 failures.push(format!("{op}: not timed"));
                 "not timed"
@@ -690,7 +709,12 @@ fn report(budget: &Budget, mode: Mode, rows: &[Row]) -> String {
         budget.ratio,
         budget.grace.as_millis(),
     );
-    if budget.baseline.is_empty() {
+    if mode == Mode::Count {
+        let _ = writeln!(
+            out,
+            "Count mode: only the warm-up runs ran, and no op was timed.\n"
+        );
+    } else if budget.baseline.is_empty() {
         let _ = writeln!(
             out,
             "budget.toml has no baselines for {platform}, so its times are only reported.\n"
@@ -740,7 +764,11 @@ fn hot_paths() -> Fallible {
     let mode = Mode::from_env()?;
     let mut fixture = Fixture::new()?;
     let warm = fixture.warm_up()?;
-    let first = fixture.batch(budget.reps)?;
+    let first = if mode == Mode::Count {
+        Batch::default()
+    } else {
+        fixture.batch(budget.reps)?
+    };
     let second = if mode == Mode::Enforce && budget.any_over(&first) {
         Some(fixture.batch(budget.reps)?)
     } else {
@@ -894,6 +922,12 @@ fn the_verdicts_follow_the_rules() -> Fallible {
         "{failures:?}"
     );
 
+    // A count run times nothing and fails on no time, only on counts.
+    assert_eq!(Mode::named("count")?, Mode::Count);
+    let (rows, failures) = judge(&budget, Mode::Count, &warm, &Batch::default(), None);
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(verdict(&rows, "acp suspend"), "counted only");
+
     for counts in [vec![1, 3], vec![1, 1]] {
         let mut changed = Batch::default();
         changed.counts.clone_from(&warm.counts);
@@ -902,12 +936,14 @@ fn the_verdicts_follow_the_rules() -> Fallible {
             .get_mut("codex resume")
             .unwrap()
             .insert("git", counts.clone());
-        let (_, failures) = judge(&budget, Mode::Report, &changed, &timed(&[]), None);
-        assert_eq!(failures.len(), 1, "{counts:?}: {failures:?}");
-        assert!(
-            failures[0].starts_with("codex resume: started git"),
-            "{failures:?}"
-        );
+        for (mode, times) in [(Mode::Report, timed(&[])), (Mode::Count, Batch::default())] {
+            let (_, failures) = judge(&budget, mode, &changed, &times, None);
+            assert_eq!(failures.len(), 1, "{mode:?} {counts:?}: {failures:?}");
+            assert!(
+                failures[0].starts_with("codex resume: started git"),
+                "{failures:?}"
+            );
+        }
     }
     Ok(())
 }
