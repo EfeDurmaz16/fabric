@@ -172,11 +172,12 @@ pub(crate) struct Capturer<'a> {
 /// Stages `sources` into `out`, records the rewritable ones as a pending
 /// departure and writes the manifest last, so a tree with a manifest is
 /// whole and its pending record exists. That holds after a power loss too:
-/// the staged files are flushed to the drive only, and the manifest's write
-/// is the commit point, whose barrier orders them and the pending record
-/// before its name and whose full flush makes all of them durable. A
-/// capture flushes the drive's cache once there, and once for the pending
-/// record, instead of twice per file and once per new directory.
+/// the staged files, and the pending record when it is on the same device,
+/// are flushed to the drive only, and the manifest's write is the commit
+/// point, whose barrier orders them before its name and whose full flush
+/// makes all of them durable. A capture flushes the drive's cache once
+/// there, instead of twice per file and once per new directory; a pending
+/// record on another device adds the one full flush its own write needs.
 pub(crate) fn capture(
     capturer: Capturer<'_>,
     sources: &[Source],
@@ -194,7 +195,7 @@ pub(crate) fn capture(
         &counts,
     )?;
     if let Some(records) = capturer.departure {
-        records.write_pending(&staged.replaceable, manifest.digest()?)?;
+        records.write_pending(&staged.replaceable, manifest.digest()?, out)?;
         crashpoint("capture-after-departure", 0);
     }
     manifest.write(out)?;
@@ -477,6 +478,69 @@ mod tests {
                 (Flush::Barrier, "tmp:out".to_owned()),
                 (Flush::Full, "out".to_owned()),
             ]
+        );
+    }
+
+    /// A capture that records a pending departure on the device of its
+    /// state tree flushes the drive's cache once, at the manifest: the
+    /// record keeps the barrier that keeps it whole and joins the batch,
+    /// so the manifest's barrier orders it before the manifest's name and
+    /// the manifest's full flush makes it durable. Before, the record's own
+    /// write flushed its directory through the drive's cache as well.
+    #[test]
+    fn a_pending_departure_on_the_trees_device_joins_its_one_full_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("h");
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let session = SessionId::parse("7a1f2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d").unwrap();
+        let abs = AbsPath::parse(home.to_str().unwrap()).unwrap();
+        let memory = home.join("MEMORY.md");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(&memory, "# memory\n").unwrap();
+        let sources = [Source {
+            abs: memory,
+            rel: RelPath::parse("home/MEMORY.md").unwrap(),
+            carry: Carry::Text,
+            mutability: Mutability::Replaceable,
+        }];
+        let records = Records::of(&home, "claude", &session);
+        let (captured, log) = record::flushes(|| {
+            capture(
+                Capturer {
+                    kind: HarnessKind::ClaudeCode,
+                    session: &session,
+                    root: &abs,
+                    home: &abs,
+                    version: None,
+                    departure: Some(&records),
+                },
+                &sources,
+                RedactionCounts::new(),
+                &out,
+            )
+        });
+        captured.unwrap();
+        let shape = record::shape(&log, dir.path());
+        let full: Vec<_> = shape
+            .iter()
+            .filter(|(how, _)| *how == Flush::Full)
+            .collect();
+        assert_eq!(full, vec![&(Flush::Full, "out".to_owned())], "{shape:?}");
+        assert_eq!(shape.last(), Some(&(Flush::Full, "out".to_owned())));
+        let departed = "h/.fabric/harness/departed/claude";
+        let record = shape
+            .iter()
+            .position(|entry| *entry == (Flush::Barrier, format!("tmp:{departed}")))
+            .unwrap_or_else(|| panic!("the record lost its barrier: {shape:?}"));
+        let manifest = shape
+            .iter()
+            .position(|entry| *entry == (Flush::Barrier, "tmp:out".to_owned()))
+            .unwrap();
+        assert!(record < manifest, "{shape:?}");
+        assert!(
+            shape[record..manifest].contains(&(Flush::Plain, departed.to_owned())),
+            "the record's directory was not flushed to the drive: {shape:?}"
         );
     }
 

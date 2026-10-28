@@ -237,6 +237,12 @@ enum Mode {
     /// One write of a batch: every flush plain; ordered and made durable by
     /// the atomic write that ends the batch on the same device.
     Batched,
+    /// One write of a batch that must stay whole across a power loss: a
+    /// barrier on the temporary before the rename, so its name holds the
+    /// old bytes or all of the new ones, and the parent flushed to the
+    /// drive only; made durable by the atomic write that ends the batch on
+    /// the same device.
+    Joined,
 }
 
 /// Moves `tmp` over `dest`, giving it the mode of the file it replaces, and
@@ -255,7 +261,7 @@ fn commit(tmp: &Path, dest: &Path, mode: Mode) -> Result<(), HarnessError> {
     match mode {
         Mode::Durable => fsync_dir(parent),
         Mode::Ordered => Ok(()),
-        Mode::Batched => flush_dir(parent, Flush::Plain),
+        Mode::Batched | Mode::Joined => flush_dir(parent, Flush::Plain),
     }
 }
 
@@ -264,7 +270,7 @@ fn commit(tmp: &Path, dest: &Path, mode: Mode) -> Result<(), HarnessError> {
 /// later is not lost with its directory entry on a power cut: the barrier
 /// before that rename, or the one that ends its batch, orders these names
 /// before it, and the full flush after it makes them durable.
-fn create_dirs_durable(dir: &Path) -> Result<(), HarnessError> {
+pub(crate) fn create_dirs_durable(dir: &Path) -> Result<(), HarnessError> {
     let mut missing = Vec::new();
     let mut at = dir;
     loop {
@@ -368,7 +374,7 @@ where
             .map_err(|e| HarnessError::io(IoOp::Write, &tmp, e.into_error()))?;
         let (file, written) = hashing.finish();
         let how = match mode {
-            Mode::Durable | Mode::Ordered => Flush::Barrier,
+            Mode::Durable | Mode::Ordered | Mode::Joined => Flush::Barrier,
             Mode::Batched => Flush::Plain,
         };
         flush(&file, how).map_err(|e| HarnessError::io(IoOp::Write, &tmp, e))?;
@@ -440,6 +446,36 @@ where
     let written = write_flushed(path, produce, check, Mode::Ordered)?;
     renamed.note(path.parent().unwrap_or(Path::new(".")));
     Ok(written)
+}
+
+/// Writes `bytes` to `path` as one write of a batch that must stay whole:
+/// after a power loss its name holds the old bytes or all of the new ones,
+/// as after `write_atomic`, and it is durable once the atomic write that
+/// ends the batch, on the same device, returns. The temporary gets a
+/// barrier before the rename and the parent is flushed to the drive only.
+pub(crate) fn write_joined(path: &Path, bytes: &[u8]) -> Result<(), HarnessError> {
+    write_flushed(
+        path,
+        |w| {
+            w.write_all(bytes)
+                .map_err(|e| HarnessError::io(IoOp::Write, path, e))
+        },
+        || Ok(()),
+        Mode::Joined,
+    )
+    .map(|_| ())
+}
+
+/// True when `path`, or the nearest of its ancestors that exists, is on the
+/// device of `dir`: a directory made on the way to `path` is on its
+/// parent's device. False when either cannot be looked at.
+pub(crate) fn same_device(path: &Path, dir: &Path) -> bool {
+    let Ok(target) = fs::metadata(dir) else {
+        return false;
+    };
+    path.ancestors()
+        .find_map(|at| fs::metadata(at).ok())
+        .is_some_and(|meta| meta.dev() == target.dev())
 }
 
 /// Writes `bytes` to `path` through a temporary sibling and a rename.
@@ -569,5 +605,24 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(fs::read(&victim).unwrap(), b"keep me");
+    }
+
+    /// A path not made yet is on the device of the nearest ancestor that
+    /// exists, as the directories made on the way to it will be; a path on
+    /// another file system, or a directory that cannot be looked at, is not
+    /// on the device, so a write there keeps a full flush of its own.
+    #[test]
+    fn a_path_is_on_the_device_of_its_nearest_existing_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("out");
+        fs::create_dir(&tree).unwrap();
+        assert!(same_device(&dir.path().join("h/.fabric/x.json"), &tree));
+        assert!(!same_device(
+            &dir.path().join("x"),
+            &dir.path().join("gone")
+        ));
+        if Path::new("/dev/null").exists() {
+            assert!(!same_device(Path::new("/dev/null"), &tree));
+        }
     }
 }
