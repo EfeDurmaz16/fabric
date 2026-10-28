@@ -1408,7 +1408,11 @@ pub(crate) mod tests {
     ///
     /// macOS checks a new executable the first time it runs, which takes
     /// a tenth of a second or more here, so a test installs the tools it
-    /// reads unless it must see a tool it does not expect run.
+    /// reads unless it must see a tool it does not expect run. `install`
+    /// runs each tool once, unlogged, so that check is paid there and not
+    /// inside a measure: on a machine loaded enough, a first run that waits
+    /// on the check outlasted `COMMAND_TIMEOUT` and the measure lost the
+    /// fact (a pull's `codex.login`).
     pub(crate) struct CountingTools {
         dir: PathBuf,
         /// `PATH` of the tools, `/usr/bin` and `/bin`, with no tool root.
@@ -1493,8 +1497,11 @@ pub(crate) mod tests {
         /// inherited open for writing (`ETXTBSY`).
         pub(crate) fn install(&self, program: &str, answer: &str) {
             let log = self.dir.join("probes.log");
+            let warm = self.dir.join("warm");
+            std::fs::create_dir_all(&warm).unwrap();
             let script = format!(
-                "#!/bin/sh\necho \"{program} $*\" >> '{}'\n{answer}\n",
+                "#!/bin/sh\n[ -z \"$FABRIC_TOOL_WARM\" ] || {{ : > '{}'; exit 0; }}\necho \"{program} $*\" >> '{}'\n{answer}\n",
+                warm.join(program).display(),
                 log.display()
             );
             let mut writer = std::process::Command::new("/bin/sh")
@@ -1510,6 +1517,11 @@ pub(crate) mod tests {
                 .write_all(script.as_bytes())
                 .unwrap();
             assert!(writer.wait().unwrap().success());
+            let warmed = std::process::Command::new(self.dir.join("bin").join(program))
+                .env("FABRIC_TOOL_WARM", "1")
+                .status()
+                .unwrap();
+            assert!(warmed.success(), "{program} did not run once at install");
         }
 
         /// Makes both logins answer no.
@@ -1526,6 +1538,23 @@ pub(crate) mod tests {
             lines.sort();
             lines
         }
+    }
+
+    /// An installed counting tool has run once, unlogged, before any
+    /// measure: macOS's check of a new executable is paid at install, not
+    /// inside a measure that a slow first run could push past
+    /// `COMMAND_TIMEOUT` on a loaded machine.
+    #[test]
+    fn a_counting_tool_has_run_once_before_a_measure_and_logged_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = CountingTools::only(dir.path(), &["codex", "node"]);
+        for program in ["codex", "node"] {
+            assert!(
+                dir.path().join("counting/warm").join(program).exists(),
+                "{program} first ran inside a measure"
+            );
+        }
+        assert_eq!(tools.ran(), Vec::<String>::new());
     }
 
     /// A tool in a directory the client's `PATH` names only relatively is
