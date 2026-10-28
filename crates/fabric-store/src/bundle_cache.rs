@@ -4,8 +4,8 @@
 //! job's history: about 30 ms a link in the end-to-end fixture, up to 16
 //! links. The cache keeps, per job, the pack files `git bundle unbundle`
 //! wrote for each link it unpacked on this node; the next restore of the
-//! same chain copies them in (a clone on APFS, a hard link elsewhere) and
-//! unpacks only the links the cache does not hold.
+//! same chain copies them in (a clone where the file system can, never a
+//! hard link) and unpacks only the links the cache does not hold.
 //!
 //! Invariant: a restore puts a cached file into a repository only when its
 //! bytes are the ones `git bundle unbundle` wrote when it unpacked that
@@ -243,20 +243,16 @@ impl BundleCache {
     }
 }
 
-/// Puts a copy of `from` at `to`, which must not exist: an APFS clone on
-/// macOS, which shares no later write, and elsewhere a hard link, or a copy
-/// where the two lie on different file systems. A cached file is checked
-/// before every use, so a write through a link only drops it.
+/// Puts a copy of `from` at `to`, which must not exist, and never a hard
+/// link: a link would share one inode between the cache and every
+/// repository a restore filled from it, so a tool that rewrote a pack in
+/// place in one workspace would rewrite it in the others, which no check
+/// reads again (ADR 0014, Objects). `std::fs::copy` clones on APFS with
+/// `fclonefileat`, and on Linux uses `copy_file_range`, which a file
+/// system with reflinks, such as Btrfs or XFS, serves with a clone; a
+/// clone shares no later write either.
 pub(crate) fn place(from: &Path, to: &Path) -> io::Result<()> {
-    #[cfg(target_vendor = "apple")]
-    {
-        // `std::fs::copy` clones with `fclonefileat` where the volume can.
-        fs::copy(from, to).map(|_| ())
-    }
-    #[cfg(not(target_vendor = "apple"))]
-    {
-        fs::hard_link(from, to).or_else(|_| fs::copy(from, to).map(|_| ()))
-    }
+    fs::copy(from, to).map(|_| ())
 }
 
 /// True for a file name `git index-pack` writes into `objects/pack`, and

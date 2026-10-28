@@ -2408,6 +2408,72 @@ fn a_cached_pack_that_changed_is_not_used() {
     }
 }
 
+/// Every file under `dir`, at any depth.
+fn files_below(dir: &Path) -> Fallible<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            found.extend(files_below(&path)?);
+        } else {
+            found.push(path);
+        }
+    }
+    Ok(found)
+}
+
+/// No hard links from the store into a workspace (ADR 0014, Objects):
+/// a tool that rewrites a pack file of one restored repository in place
+/// leaves the bundle cache and every other restored repository as they
+/// were. Each cached file is a copy of the one git wrote, and each file a
+/// restore takes from the cache is a copy of the cached one.
+#[test]
+fn a_pack_rewritten_in_place_in_one_restore_leaves_the_cache_and_the_others_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    let mut store = store_in(dir.path()).unwrap();
+    let chain = chain_of(&mut store, &root, 2).unwrap();
+    let last = chain[1].0;
+    let first = dir.path().join("first");
+    assert_eq!(
+        restore_into(&store, last, &first).unwrap().bundles_unpacked,
+        2
+    );
+    let second = dir.path().join("second");
+    assert_eq!(
+        restore_into(&store, last, &second)
+            .unwrap()
+            .bundles_unpacked,
+        0
+    );
+    let cache = dir.path().join("store/bundle-cache").join(JOB.to_string());
+    for repo in [&first, &second] {
+        let packs = files_below(&repo.join(".git/objects/pack")).unwrap();
+        let cached = files_below(&cache).unwrap();
+        assert_eq!(packs.len(), cached.len() - 1);
+        for file in packs.iter().chain(&cached) {
+            assert_eq!(fs::metadata(file).unwrap().nlink(), 1, "{}", file.display());
+        }
+    }
+
+    for pack in files_below(&second.join(".git/objects/pack")).unwrap() {
+        fs::set_permissions(&pack, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut bytes = fs::read(&pack).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xff;
+        // `fs::write` truncates and writes the same inode: an in-place edit.
+        fs::write(&pack, bytes).unwrap();
+    }
+    assert!(git(&first).succeeds(&["fsck", "--no-dangling"]).unwrap());
+    let third = dir.path().join("third");
+    assert_eq!(
+        restore_into(&store, last, &third).unwrap().bundles_unpacked,
+        0
+    );
+    assert_eq!(git_difference(&root, &third).unwrap(), None);
+    assert!(git(&third).succeeds(&["fsck", "--no-dangling"]).unwrap());
+}
+
 /// A chain that parts from the cached one at a link drops the cached
 /// links from there: the restore holds only its own chain's objects, and
 /// the other chain's newer link is unpacked again when it comes back.
