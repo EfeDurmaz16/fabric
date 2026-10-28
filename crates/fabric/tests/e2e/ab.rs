@@ -25,13 +25,13 @@
 //!   by class of file; opens, renames and unlinks; allocations; the bytes
 //!   and calls of every read and write, by class of file. Also the peak
 //!   resident size and CPU time of the CLI processes the op started, and
-//!   each daemon's resident size after it. None of this depends on how
-//!   loaded the machine is. One warm-up run, then `FABRIC_AB_COUNTED` runs,
+//!   each daemon's resident size and physical footprint after it. None of
+//!   this depends on how loaded the machine is. One warm-up run, then `FABRIC_AB_COUNTED` runs,
 //!   3 when unset.
 //! - Timed. Two warm-up runs, since a job's first move differs from the
 //!   later ones, then `FABRIC_AB_PAIRS` runs, 15 when unset: each op's time
-//!   under both builds in one run is a pair. Each daemon's resident size is
-//!   read after every run.
+//!   under both builds in one run is a pair. Each daemon's resident size
+//!   and physical footprint are read after every run.
 //!
 //! The counted phase also keeps every process a `fabric` process started,
 //! with its arguments, in `spawns.tsv`, and counts each op's commands as
@@ -40,8 +40,11 @@
 //! Every sample goes to `samples.tsv` in `FABRIC_AB_OUT`, and the report to
 //! `report.md` there: per op, both medians and the median of the pairs'
 //! ratios, candidate over anchor, with a 95% bootstrap interval, then the
-//! counts and each daemon's resident size, after the counted ops and after
-//! the timed runs. With `FABRIC_AB_PAIRS=0` only the counted phase runs.
+//! counts and each daemon's sizes, after the counted ops and after the
+//! timed runs. The resident size, from `ps`, also counts the clean pages of
+//! the binary, which a larger build and the machine's memory pressure move;
+//! the physical footprint, from macOS's `footprint(1)`, counts only the
+//! pages the daemon dirtied. The report gives both. With `FABRIC_AB_PAIRS=0` only the counted phase runs.
 //! `ab::analyze` writes the report again from `samples.tsv`.
 //! `FABRIC_AB_ANCHOR` and `FABRIC_AB_CANDIDATE` name the two builds.
 
@@ -333,16 +336,35 @@ impl Side {
         }
     }
 
-    /// The resident size of each daemon, in KiB, by node.
-    fn daemon_rss(&self) -> Fallible<Vec<(&'static str, u64)>> {
+    /// The size of each daemon, in KiB, by node: its resident size, then
+    /// its physical footprint where the system can tell it.
+    fn daemon_sizes(&self) -> Fallible<Vec<DaemonSize>> {
         let mut sizes = Vec::new();
         for node in [&self.a, &self.b] {
             if let Some(pid) = node.daemon_pid() {
-                sizes.push((node.name, rss_kib(pid)?));
+                sizes.push(DaemonSize {
+                    node: node.name,
+                    rss_kib: rss_kib(pid)?,
+                    footprint_kib: footprint_kib(pid)?,
+                });
             }
         }
         Ok(sizes)
     }
+}
+
+/// One daemon's size at one moment.
+struct DaemonSize {
+    /// The node it serves.
+    node: &'static str,
+    /// Its resident size in KiB, as `ps` reports it: every page in memory,
+    /// the clean pages of its binary too, so the machine's memory pressure
+    /// and the layout of the code move it.
+    rss_kib: u64,
+    /// Its physical footprint in KiB, as `footprint(1)` reports it: the
+    /// pages it dirtied, compressed ones included, and none of the clean
+    /// pages of its binary. `None` where the system has no `footprint`.
+    footprint_kib: Option<u64>,
 }
 
 /// The resident size of process `pid` in KiB, as `ps` reports it.
@@ -351,6 +373,38 @@ fn rss_kib(pid: u32) -> Fallible<u64> {
         .args(["-o", "rss=", "-p", &pid.to_string()])
         .output()?;
     Ok(String::from_utf8(output.stdout)?.trim().parse()?)
+}
+
+/// macOS's report of a process's memory, whose `phys_footprint` is the
+/// size the system charges the process with.
+const FOOTPRINT: &str = "/usr/bin/footprint";
+
+/// The physical footprint of process `pid` in KiB, as `footprint(1)`
+/// reports it; `None` where there is no `footprint`.
+fn footprint_kib(pid: u32) -> Fallible<Option<u64>> {
+    if !Path::new(FOOTPRINT).exists() {
+        return Ok(None);
+    }
+    let output = Command::new(FOOTPRINT)
+        .args(["-p", &pid.to_string(), "-f", "bytes", "--noCategories"])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("footprint -p {pid} failed: {}", output.status).into());
+    }
+    Ok(Some(phys_footprint_kib(&String::from_utf8(
+        output.stdout,
+    )?)?))
+}
+
+/// The `phys_footprint` line of a `footprint -f bytes` report, in KiB.
+fn phys_footprint_kib(report: &str) -> Fallible<u64> {
+    let line = report
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("phys_footprint:"))
+        .ok_or("no phys_footprint line in the footprint report")?;
+    let bytes: u64 = line.trim().trim_end_matches('B').trim().parse()?;
+    Ok(bytes / 1024)
 }
 
 /// One process's counter page.
@@ -691,9 +745,14 @@ fn counted_phase(
                         samples.push("counted", run, &name, label, first, &metric, value);
                     }
                 }
-                for (node, kib) in side.daemon_rss()? {
+                for size in side.daemon_sizes()? {
+                    let node = size.node;
                     let metric = format!("daemon_rss_kib.{node}");
-                    samples.push("counted", run, &name, label, first, &metric, kib);
+                    samples.push("counted", run, &name, label, first, &metric, size.rss_kib);
+                    if let Some(kib) = size.footprint_kib {
+                        let metric = format!("daemon_footprint_kib.{node}");
+                        samples.push("counted", run, &name, label, first, &metric, kib);
+                    }
                 }
                 for line in lines {
                     let _ = writeln!(spawns, "{run}\t{name}\t{label}\t{line}");
@@ -734,9 +793,20 @@ fn timed_phase(setup: &Setup, samples: &mut Samples) -> Fallible {
         }
         if run >= TIMED_WARM_UPS {
             for (index, side) in sides.iter().enumerate() {
-                for (node, kib) in side.daemon_rss()? {
-                    let op = format!("daemon {node}");
-                    samples.push("timed", run, &op, SIDES[index], first, "rss_kib", kib);
+                for size in side.daemon_sizes()? {
+                    let op = format!("daemon {}", size.node);
+                    samples.push(
+                        "timed",
+                        run,
+                        &op,
+                        SIDES[index],
+                        first,
+                        "rss_kib",
+                        size.rss_kib,
+                    );
+                    if let Some(kib) = size.footprint_kib {
+                        samples.push("timed", run, &op, SIDES[index], first, "footprint_kib", kib);
+                    }
                 }
             }
         }
@@ -1058,7 +1128,7 @@ fn counted_report(samples: &[Sample], out: &mut String) {
             .iter()
             .filter(|sample| sample.phase == "counted" && sample.op == *op)
             .map(|sample| sample.metric.as_str())
-            .filter(|metric| !metric.starts_with("daemon_rss") && *metric != "cpu_us")
+            .filter(|metric| !metric.starts_with("daemon_") && *metric != "cpu_us")
             .collect();
         let mut differs = Vec::new();
         for metric in metrics {
@@ -1073,27 +1143,61 @@ fn counted_report(samples: &[Sample], out: &mut String) {
     }
 }
 
-/// Each daemon's resident size after the counted ops and after the timed
-/// runs.
+/// The two sizes of a daemon the bench reads: the name of its timed
+/// metric, its counted metric's prefix, its title and what it holds.
+const DAEMON_SIZES: [(&str, &str, &str, &str); 2] = [
+    (
+        "rss_kib",
+        "daemon_rss_kib.",
+        "Daemon resident size",
+        "every page in memory, the clean pages of the binary too",
+    ),
+    (
+        "footprint_kib",
+        "daemon_footprint_kib.",
+        "Daemon physical footprint",
+        "the pages the daemon dirtied, compressed ones included, as `footprint(1)` \
+         reports them; the clean pages of the binary are not in it",
+    ),
+];
+
+/// Each daemon's sizes after the counted ops and after the timed runs.
 fn rss_report(samples: &[Sample], out: &mut String) -> Fallible {
-    counted_rss_report(samples, out)?;
+    for (_, prefix, title, holds) in DAEMON_SIZES {
+        counted_size_report(samples, prefix, title, holds, out)?;
+    }
+    for (metric, _, title, holds) in DAEMON_SIZES {
+        timed_size_report(samples, metric, title, holds, out)?;
+    }
+    Ok(())
+}
+
+/// Each daemon's `metric` after each timed run.
+fn timed_size_report(
+    samples: &[Sample],
+    metric: &str,
+    title: &str,
+    holds: &str,
+    out: &mut String,
+) -> Fallible {
     let daemons: BTreeSet<&str> = samples
         .iter()
-        .filter(|sample| sample.phase == "timed" && sample.metric == "rss_kib")
+        .filter(|sample| sample.phase == "timed" && sample.metric == metric)
         .map(|sample| sample.op.as_str())
         .collect();
     if daemons.is_empty() {
         return Ok(());
     }
-    out.push_str(
-        "\n### Daemon resident size\n\n\
-         KiB after each timed run: median and largest per build, and the median of the \
-         pairs' ratios with its 95% bootstrap interval.\n\n\
+    let _ = write!(
+        out,
+        "\n### {title}\n\n\
+         KiB after each timed run, {holds}: median and largest per build, and the median \
+         of the pairs' ratios with its 95% bootstrap interval.\n\n\
          | daemon | anchor median | anchor max | candidate median | candidate max | ratio | 95% interval |\n\
          |---|---:|---:|---:|---:|---:|---|\n",
     );
     for daemon in daemons {
-        let found = pairs(samples, "timed", daemon, "rss_kib");
+        let found = pairs(samples, "timed", daemon, metric);
         let judged = judge(&found)?;
         let max = |side: usize| {
             found
@@ -1116,16 +1220,23 @@ fn rss_report(samples: &[Sample], out: &mut String) -> Fallible {
     Ok(())
 }
 
-/// Each daemon's resident size after every counted op, paired by run and
-/// op. Both builds load the counter library then, so the sizes hold its
-/// page and calls alike; they do not depend on load, as the times do.
-fn counted_rss_report(samples: &[Sample], out: &mut String) -> Fallible {
+/// Each daemon's size, the counted metric that starts with `prefix`, after
+/// every counted op, paired by run and op. Both builds load the counter
+/// library then, so the sizes hold its page and calls alike; they do not
+/// depend on load, as the times do.
+fn counted_size_report(
+    samples: &[Sample],
+    prefix: &str,
+    title: &str,
+    holds: &str,
+    out: &mut String,
+) -> Fallible {
     /// A daemon's size after one op of one run, per build.
     type ByOp<'a> = BTreeMap<(usize, &'a str), [Option<f64>; 2]>;
     let mut daemons: BTreeMap<&str, ByOp<'_>> = BTreeMap::new();
     for sample in samples {
         if sample.phase == "counted"
-            && let Some(daemon) = sample.metric.strip_prefix("daemon_rss_kib.")
+            && let Some(daemon) = sample.metric.strip_prefix(prefix)
         {
             daemons
                 .entry(daemon)
@@ -1137,11 +1248,12 @@ fn counted_rss_report(samples: &[Sample], out: &mut String) -> Fallible {
     if daemons.is_empty() {
         return Ok(());
     }
-    out.push_str(
-        "\n### Daemon resident size, counted runs\n\n\
-         KiB after each counted op, both builds with the counter library loaded: the \
-         number of ops, median and largest per build, and the median of the ops' ratios \
-         with its 95% bootstrap interval.\n\n\
+    let _ = write!(
+        out,
+        "\n### {title}, counted runs\n\n\
+         KiB after each counted op, {holds}, both builds with the counter library loaded: \
+         the number of ops, median and largest per build, and the median of the ops' \
+         ratios with its 95% bootstrap interval.\n\n\
          | daemon | ops | anchor median | anchor max | candidate median | candidate max | ratio | 95% interval |\n\
          |---|---:|---:|---:|---:|---:|---:|---|\n",
     );
@@ -1252,6 +1364,64 @@ fn a_counted_run_reports_the_daemons_resident_size() -> Fallible {
     assert!(
         report.contains("| a | 6 | 20020 | 20030 | 19020 | 19030 | 0.950 |"),
         "{report}"
+    );
+    Ok(())
+}
+
+/// A daemon's physical footprint is the `phys_footprint` line of the
+/// report `footprint -f bytes` prints, and a run reports it beside the
+/// resident size: the resident size also counts the clean pages of the
+/// binary, which a larger build or the machine's memory pressure moves.
+#[test]
+fn a_run_reports_the_daemons_physical_footprint() -> Fallible {
+    let printed = "======\n\
+                   fabric [41148]: 64-bit    Footprint: 6767000 B (16384 bytes per page)\n\
+                   ======\n\n\
+                   Auxiliary data:\n    phys_footprint: 6783384 B\n    \
+                   phys_footprint_peak: 16482736 B\n";
+    assert_eq!(phys_footprint_kib(printed)?, 6624);
+    assert!(phys_footprint_kib("Footprint: 6767000 B\n").is_err());
+    let mut text = String::from("phase\trun\top\tside\tfirst\tmetric\tvalue\n");
+    for run in 1..=3 {
+        for (side, rss, footprint) in [("anchor", 20_000, 9_000), ("candidate", 21_000, 8_100)] {
+            let _ = writeln!(
+                text,
+                "counted\t{run}\tcli ls\t{side}\tanchor\tdaemon_rss_kib.b\t{rss}"
+            );
+            let _ = writeln!(
+                text,
+                "counted\t{run}\tcli ls\t{side}\tanchor\tdaemon_footprint_kib.b\t{footprint}"
+            );
+            let _ = writeln!(
+                text,
+                "timed\t{run}\tdaemon b\t{side}\tanchor\trss_kib\t{rss}"
+            );
+            let _ = writeln!(
+                text,
+                "timed\t{run}\tdaemon b\t{side}\tanchor\tfootprint_kib\t{footprint}"
+            );
+        }
+    }
+    let report = report(&text)?;
+    for section in [
+        "### Daemon resident size, counted runs",
+        "### Daemon physical footprint, counted runs",
+        "### Daemon resident size\n",
+        "### Daemon physical footprint\n",
+    ] {
+        assert!(report.contains(section), "no {section:?} in {report}");
+    }
+    assert!(
+        report.contains("| b | 3 | 9000 | 9000 | 8100 | 8100 | 0.900 |"),
+        "{report}"
+    );
+    assert!(
+        report.contains("| daemon b | 9000 | 9000 | 8100 | 8100 | 0.900 |"),
+        "{report}"
+    );
+    assert!(
+        !report.contains("daemon_footprint_kib.b 9000"),
+        "a size is not a counter: {report}"
     );
     Ok(())
 }
