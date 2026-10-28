@@ -105,6 +105,29 @@ Recorded on 2026-10-27 on `m2/durable-job-foundations` after the owner branches 
 | M2-25 | deferred (later) | needs CI baselines |
 | M2-26 | new, deferred (later) | Found while fixing M2-02: `NodeFacts::to_wire` in `crates/fabricd/src/facts.rs` answers no facts at all when a node has more than `MAX_FACTS` (64), through `unwrap_or_default`. About 43 fixed names exist today, and setup-step programs add one each, so a spec with many setup programs can reach it. A peer then sees every fact missing and refuses the move, so it fails closed, but with a misleading reason. Owner B |
 
+## Disposition after the deferred work
+
+Recorded on 2026-10-28 by the budget and CI group, after "later" stopped being a disposition: every finding deferred above was given to a group, which fixes it with a test that fails first. M2-25 is this group's and is on its branch. The others are on their groups' branches, not yet on `m2/durable-job-foundations`; this table says where each fix is so the integration can check it, and each group reports its own disposition. All of them merged without a conflict into one integration, on which the budget's count mode and the counted A/B runs of `docs/evidence/perf-ab/README.md` ran.
+
+| ID | Status | Fix and proof |
+|---|---|---|
+| M2-25 | fixed | `pd/wip-budget-ci-evidence`. `188fb32`: `linux-x86_64` baselines, the anchor's times on CI's `ubuntu-latest` runner (median of three CI runs of `176622e`'s code, `scripts/budget-baselines.sh` from `ef43373`). `3ba7b21`: CI runs the budget with `FABRIC_BUDGET=enforce`; the macOS runner, whose runs of one commit differ by up to 1.34 times, names a platform with no baselines and holds only process counts. `c5a12e4`: `scripts/check-budget.sh` refuses a raised or removed baseline and a looser ratio, grace, percentile or run count, so a baseline stays the anchor's. `6792db6`: a time over its limit no longer tells to raise the baseline. Tests: `budget::every_op_has_a_baseline_on_linux_and_macos` and `budget::ci_enforces_the_budget` (each failed before), 12 new cases of `scripts/test-check-budget.sh` that failed against the old script, and the message case of `budget::the_verdicts_follow_the_rules` |
+| M2-13 | fix on `pd/wip-facts-net-carry` | `32fe4bd`. Tests: `a_probe_stops_reading_once_its_output_passes_what_a_fact_holds`, `an_endless_output_is_read_only_until_it_cannot_be_a_fact`, `a_fact_read_as_it_arrives_is_the_fact_read_whole` |
+| M2-14 | fix on `pd/wip-node-runtime` | `28227da`, `266ce9b`, `922522c`, ADR note `a495cb6`. Test: `a_client_that_stops_reading_holds_a_bounded_backlog_and_gets_the_answer` (`8947330`, first) |
+| M2-15 | fix on `pd/wip-facts-net-carry` | `c20483f`. Test: `request_bytes_held_for_a_peer_are_bounded_over_its_sessions` |
+| M2-18 | fix on `pd/wip-cli-protocol-ops` | `e56c6bf`, `1ecc017`, after the benchmark `9fa6324`. Tests: `the_hash_index_finds_every_record_and_nothing_else`, `a_push_sends_what_the_peer_lacks_and_the_whole_ledger_to_a_peer_that_lost_it` |
+| M2-19 | fix on `pd/wip-node-runtime` | `8b6f90a`, `15e36b8`, after the benchmark `c344206`. Tests: `a_short_store_call_runs_beside_a_long_one` (`6007c13`, first), `captures_restores_and_reads_on_handles_at_once_leave_a_clean_store`, `gc_and_forget_are_refused_while_another_handle_lives` |
+| M2-20 | fix on `pd/wip-facts-net-carry` | `86fedc8`. Test: `a_finished_venv_without_its_installer_travels_only_to_its_interpreter` |
+| M2-21 | fix on `pd/wip-launch-hold` | `f2857db`. Tests: `the_session_s_sandbox_travels_whole`, `a_turn_s_writable_roots_and_network_access_are_read`, and four more in that commit |
+| M2-22 | fix on `pd/wip-cli-protocol-ops` | `c2aea4c`. Tests: `named_sessions_wait_in_order_and_in_bounds`, `a_line_past_the_bound_is_dropped_without_holding_it` |
+| M2-23 | fix on `pd/wip-launch-hold` | `cba3776`, ADR note `14c2d0f`. Tests: `updates_are_bounded_by_bytes_as_well_as_by_count`, `a_queue_full_of_bytes_drops_the_newest_and_counts_it` |
+| M2-26 | fix on `pd/wip-facts-net-carry` | `af473fe`. Tests: `an_answer_with_no_room_for_every_fact_keeps_the_measured_ones_and_names_the_rest`, `a_peer_answer_that_left_facts_out_names_that_cause` |
+| R3 | fix on `pd/wip-cli-protocol-ops` | `f733771`, `9f4fab6`. Tests: `a_frozen_owner_exports_its_orphan_and_takes_the_chain_the_fork_rule_picks`, e2e `e2e_a_frozen_owner_exports_its_orphan_and_repairs_the_fork` |
+
+The time budget now also counts every probe and harness each op starts (`c6840ca`), and `FABRIC_BUDGET=count` checks the counts without timing (`7989b66`). Its counts are those of the integration; two count runs agreed, and a third after `pd/wip-store-git` gained `7939faa`. On a branch alone the counts of the other branches' changes fail it: they hold only once every branch is in.
+
+The performance work items of `docs/evidence/perf-ab/README.md` and the counters of the integration against the anchor are in that README, section "Integration against the anchor, counted".
+
 ## Candidates the audit rejected, rechecked
 
 - Tracked edits silently reverted by the store's ignore globs: invalid. Git capture stages tracked changes with `git add -A` before policy filtering (`crates/fabric-store/src/capture.rs`), and the store tests restore tracked edits.
