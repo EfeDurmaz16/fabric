@@ -369,7 +369,7 @@ pub(crate) struct Staged {
 /// redaction counts. An earlier manifest in `out` is removed first; the
 /// caller writes the new one last (`StateManifest::write`), which ends the
 /// batch of staged files: until it returns they are flushed to the drive
-/// only, about 0.3 ms a file on APFS against 5.5 ms for a full flush.
+/// only, with a plain `fsync` each, and not through the drive's cache.
 pub(crate) fn stage(
     sources: &[Source],
     out: &Path,

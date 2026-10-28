@@ -529,8 +529,7 @@ mod tests {
     /// Two directories are new, so their names are flushed to the drive;
     /// the barrier on the temporary orders them and the bytes before the
     /// rename, and the one full flush, of the parent after the rename,
-    /// makes all of it durable. Before, each of the four was a full flush
-    /// of about 5.5 ms on APFS.
+    /// makes all of it durable. Before, each of the four was a full flush.
     #[test]
     fn an_atomic_write_orders_with_a_barrier_and_flushes_the_drive_once() {
         let dir = tempfile::tempdir().unwrap();

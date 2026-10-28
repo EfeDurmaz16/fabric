@@ -471,7 +471,7 @@ mod tests {
     /// Each placed file keeps its barrier before its rename, and the restore
     /// ends with one flush of each directory it wrote into, the last
     /// through the drive's cache. Before, each file was a barrier and a full
-    /// flush of about 5.5 ms on APFS.
+    /// flush of its directory.
     #[test]
     fn a_restore_orders_each_file_and_flushes_the_drive_once() {
         let dir = tempfile::tempdir().unwrap();

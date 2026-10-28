@@ -282,8 +282,7 @@ mod tests {
     /// ADR 0002: the bytes are ordered before the rename by a barrier on
     /// the temporary, while it still has its temporary name, and the one
     /// full flush, of the directory, comes after the rename and makes both
-    /// durable. A full flush costs about 5.5 ms on APFS and a barrier
-    /// about 2.8 ms, so this is one full flush fewer than flushing both.
+    /// durable: one full flush where flushing both made two.
     #[test]
     fn an_atomic_write_orders_with_a_barrier_and_flushes_the_drive_once() {
         let dir = tempfile::tempdir().unwrap();
