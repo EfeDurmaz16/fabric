@@ -45,3 +45,9 @@ On `eff52af`, once each:
 | `scripts/test-check-budget.sh`, `scripts/check-budget.sh` on the M3 head | pass |
 | `fabric-client` `bridge_fixtures` (manifest pin) | pass |
 | TypeScript SDK: `bun install --frozen-lockfile`, `typecheck`, `build`, `bun test` against the node built here | pass: 62 passed |
+
+## After the merge of `m3/capsule-bridge` at `52b29a8`
+
+`50d71b1` merges `m3/capsule-bridge` at `52b29a8`, which holds `m2/durable-job-foundations` at `3da4b4d`: the PR #31 review fixes, the power-loss recovery tests, the fake harness flake fix and the ADR approval dates. Git found no conflict. The only file both sides changed is `docs/managed-jobs.md`, in different rows. The fixes change `fabric-harness`, `fabric-net`, `fabric-store`, `fabricd` (`job.rs`, `ops.rs`, `catchup.rs`, `paths.rs`), the e2e budget and the CI scripts. M4 changes `fabric-journal`, `fabric-bridge`, `fabric-core` and one line of `fabricd/src/managed.rs`, so no fix lands on code M4 changed, and every test the fixes added runs on the merged code below.
+
+The whole gate list ran once on `50d71b1`, at a load average of 10 to 12, nothing timed: `cargo fmt --all --check`; clippy with `-D warnings` for the workspace and for `fabric-harness` with no features and each of `acp`, `claude`, `codex`; `cargo test --workspace --locked -- --skip e2e_` (1218 passed, 23 ignored); `cargo test -p fabric --test e2e --locked` (70 passed, 5 ignored); `FABRIC_BUDGET=count` `budget::hot_paths`; `cargo doc` with `-D warnings`; `cargo deny check`; the hygiene, fixture and budget scripts and their self-tests against `origin/m3/capsule-bridge`; the TypeScript SDK install, typecheck, build and `bun test` against the node built here (62 passed). All passed on the first run.
