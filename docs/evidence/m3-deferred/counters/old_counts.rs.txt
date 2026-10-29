@@ -1,0 +1,71 @@
+//! The steps of off_runtime.rs against the old client, which took the
+//! journal itself: the log calls each step makes, and where they run.
+#![allow(clippy::unwrap_used, reason = "test")]
+mod common;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use common::{create, journal_for, operation, scope};
+use fabric_bridge::wire::{Action, ExecParams, Locator};
+use fabric_bridge::{Bridge, BridgeError, Config, Effect, Entry, LogError, OperationLog};
+use fabric_core::managed::OperationId;
+use fabric_journal::{Journal, ProviderAnswer, ProviderDispatch, ProviderStatus};
+type Seen = Arc<Mutex<Vec<(&'static str, String)>>>;
+struct Watched { journal: Journal, seen: Seen }
+impl Watched {
+    fn note(&self, call: &'static str) {
+        let thread = std::thread::current().name().unwrap_or("").to_owned();
+        self.seen.lock().unwrap().push((call, thread));
+    }
+}
+impl OperationLog for Watched {
+    fn begin(&mut self, d: &ProviderDispatch, r: Option<&ProviderAnswer>) -> Result<(), LogError> { self.note("begin"); self.journal.begin(d, r) }
+    fn record(&mut self, o: OperationId, s: ProviderStatus, a: &ProviderAnswer, l: Option<&str>) -> Result<(), LogError> { self.note("record"); self.journal.record(o, s, a, l) }
+    fn locate(&mut self, o: OperationId, l: &str) -> Result<(), LogError> { self.note("locate"); self.journal.locate(o, l) }
+    fn entry(&self, o: OperationId) -> Result<Option<Entry>, LogError> { self.note("entry"); self.journal.entry(o) }
+}
+fn fx(key: &str) -> Locator {
+    Locator::from_value(&serde_json::json!({"provider": "fixture", "scope": {"account": "acct-a", "project": "proj-1"}, "kind": "sandbox", "native_id": format!("fx-{key}")})).unwrap()
+}
+fn exec(n: u8, target: &Locator, timeout_ms: u64) -> Effect {
+    Effect { operation: operation(n), scope: scope(), action: Action::Exec { target: target.clone(), params: ExecParams { argv: vec!["true".into()], stdin: None, cwd: None, timeout_ms, max_output_bytes: 1024, secret_names: Vec::new() } }, approval: None, policy: None, deadline_ms: 30_000 }
+}
+fn counts(seen: &Seen, from: usize) -> (usize, usize, Vec<String>) {
+    let seen = seen.lock().unwrap();
+    let new = &seen[from..];
+    let threads = new.iter().map(|(_, t)| t.clone()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    (new.iter().filter(|(c, _)| *c != "entry").count(), new.iter().filter(|(c, _)| *c == "entry").count(), threads)
+}
+#[tokio::test]
+async fn the_steps_of_off_runtime_on_the_old_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Seen::default();
+    let mut log = Watched { journal: journal_for(dir.path(), scope()), seen: Arc::clone(&seen) };
+    let mut config = Config::new("fixture");
+    config.grace = Duration::from_millis(200);
+    config.kill_grace = Duration::from_millis(500);
+    config.handshake_timeout = Duration::from_secs(5);
+    let bridge = Bridge::spawn(tokio::process::Command::new(env!("CARGO_BIN_EXE_fabric-bridge-double")), config).await.unwrap();
+    eprintln!("step | status | writes (fsyncs) | reads | threads");
+    let from = seen.lock().unwrap().len();
+    let o = bridge.request(&mut log, create(1, "fixture/ok")).await.unwrap().finish(&mut log).await.unwrap();
+    eprintln!("create | {} | {:?}", o.status.name(), counts(&seen, from));
+    let from = seen.lock().unwrap().len();
+    let o = bridge.request(&mut log, exec(2, &fx("key-1"), 1000)).await.unwrap().finish(&mut log).await.unwrap();
+    eprintln!("exec | {} | {:?}", o.status.name(), counts(&seen, from));
+    let from = seen.lock().unwrap().len();
+    let o = bridge.request(&mut log, create(3, "double/progress-16")).await.unwrap().finish(&mut log).await.unwrap();
+    eprintln!("create, 16 progress | {} | {:?}", o.status.name(), counts(&seen, from));
+    let from = seen.lock().unwrap().len();
+    let r = bridge.request(&mut log, exec(4, &fx("key-1"), 0)).await;
+    assert!(matches!(r, Err(BridgeError::RefusedLocally(_))), "{r:?}");
+    eprintln!("refused before sending | rejected | {:?}", counts(&seen, from));
+    let from = seen.lock().unwrap().len();
+    let mut silent = create(5, "double/silent");
+    silent.deadline_ms = 1;
+    let o = bridge.request(&mut log, silent).await.unwrap().finish(&mut log).await.unwrap();
+    eprintln!("timed out | {} | {:?}", o.status.name(), counts(&seen, from));
+    let from = seen.lock().unwrap().len();
+    let r = bridge.observe(&mut log, OperationId::from_bytes([3; 16]), "sandbox.create", fx("key-3"), 1000).await;
+    assert!(matches!(r, Err(BridgeError::NotObservable(_))), "{r:?}");
+    eprintln!("observe refused | succeeded | {:?}", counts(&seen, from));
+}

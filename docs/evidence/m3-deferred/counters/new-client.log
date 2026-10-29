@@ -1,0 +1,14 @@
+
+running 2 tests
+step | status | log thread calls | thread hops | writes (fsyncs) | reads
+create | succeeded | 2 | 4 | 2 | 1
+exec | succeeded | 2 | 4 | 2 | 1
+create, 16 progress | succeeded | 18 | 36 | 18 | 1
+refused before sending | rejected | 1 | 2 | 1 | 0
+timed out | unknown | 2 | 4 | 2 | 1
+observe refused | succeeded | 1 | 2 | 0 | 1
+test every_log_call_runs_on_the_log_thread_and_each_step_makes_its_pinned_calls ... ok
+test a_caller_that_stops_waiting_on_the_log_leaves_the_operation_recorded_and_sent ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.14s
+

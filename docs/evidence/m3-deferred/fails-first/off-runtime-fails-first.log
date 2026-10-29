@@ -1,0 +1,23 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.46s
+     Running tests/old_runtime.rs (target/debug/deps/old_runtime-77453df26f94c044)
+
+running 1 test
+test every_log_call_runs_on_the_log_thread ... FAILED
+
+failures:
+
+---- every_log_call_runs_on_the_log_thread stdout ----
+
+thread 'every_log_call_runs_on_the_log_thread' (278676708) panicked at crates/fabric-bridge/tests/old_runtime.rs:35:9:
+assertion `left == right` failed: begin ran on "every_log_call_runs_on_the_log_thread"
+  left: "every_log_call_runs_on_the_log_thread"
+ right: "fabric-bridge-log"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    every_log_call_runs_on_the_log_thread
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+
+error: test failed, to rerun pass `-p fabric-bridge --test old_runtime`
