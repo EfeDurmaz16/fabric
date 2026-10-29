@@ -1668,6 +1668,7 @@ mod tests {
             TurnReport {
                 session: Some(SessionId::parse(sid).unwrap()),
                 answer: Some("two lines\nof answer".to_owned()),
+                answer_left_out: 0,
                 failure: None,
             }
         );
@@ -1702,7 +1703,6 @@ mod tests {
         }
 
         fn answering(version: &str) -> Self {
-            use std::os::unix::fs::PermissionsExt;
             let dir = tempfile::tempdir().unwrap();
             let home = std::fs::canonicalize(dir.path()).unwrap();
             let work = home.join("work");
@@ -1718,18 +1718,19 @@ mod tests {
             )
             .unwrap();
             let binary = home.join("claude");
-            std::fs::write(
+            crate::fake_tool::write(
                 &binary,
                 format!(
                     "#!/bin/sh\n\
+                     {}\
                      if [ \"$1\" = --version ]; then {version}; exit 0; fi\n\
                      echo '{{\"type\":\"user\"}}' >> '{}'\n\
                      printf '%s\\n' \"$@\" > \"$HOME/ran\"\n",
+                    crate::fake_tool::WARM_GUARD,
                     transcript.display()
-                ),
-            )
-            .unwrap();
-            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+                )
+                .as_bytes(),
+            );
             let adapter = ClaudeCode::new(
                 AbsPath::parse(home.to_str().unwrap()).unwrap(),
                 OsString::new(),

@@ -186,7 +186,7 @@ Regressions against the anchor, to fix first:
    `crates/fabricd/src/durable.rs`, `crates/fabric-harness/src/durable.rs`.
    About -2.5 ms per atomic write: about -3 ms before a launch's release
    and -15 to -30 ms per launch, resume and suspend. Changes how ADR 0002
-   reaches "durable before visible"; needs Efe's agreement.
+   reaches "durable before visible"; approved by Efe on 2026-10-29.
 4. The trampoline through `/bin/dash` (or `/bin/bash`) where it exists,
    not the `/bin/sh` shim that starts one of them: `sh -c exit` 3.9 ms,
    `dash -c exit` 2.4 ms. `crates/fabric-harness/src/process.rs`. About
@@ -230,8 +230,8 @@ Beyond the anchor:
     ledger is already the tolerated crash window (`check_manifest`), and
     the ledger keeps its full flush. `crates/fabricd/src/ledger_file.rs`,
     `durable.rs`. Approve and ledger append from 3 full flushes to 1 (about
-    16 to 9 ms), and every append of the other ops. Needs Efe's agreement
-    with item 3.
+    16 to 9 ms), and every append of the other ops. Approved by Efe on
+    2026-10-29, with item 3.
 13. A suspend probes the harness's `--version` beside workspace detection
     and the node facts, which do not depend on it.
     `crates/fabricd/src/ops.rs` (`capture`). About -60 to -75 ms per
@@ -254,7 +254,7 @@ Beyond the anchor:
 17. At a harness's exit, liveness without `ps` when `kill(pid, 0)` finds no
     process, which is the branch `ps` would take; and the record's removal
     without a directory flush, since a stale record is always checked
-    again (needs Efe's agreement). `crates/fabricd/src/local.rs`,
+    again (approved by Efe on 2026-10-29). `crates/fabricd/src/local.rs`,
     `ops.rs`. One process and about -2 ms, then -4 ms, at every launch end.
 18. A restore skips `git rev-parse --git-path info/exclude` after its own
     `git init`, whose layout it knows, and sets the four remote and branch
@@ -368,8 +368,9 @@ pull (the node bundle cache's pack checks, `da5844a`, `02b7dc4`), against
 
 Items 3, 12 and 17 change how ADR 0002 reaches "durable before visible"
 and asked for Efe's agreement; the durability branch amended ADR 0002
-(`6d57d63`), and that agreement is not recorded among the decisions of 27
-Oct 2026.
+(`6d57d63`) before he had given it. Efe approved all three on 2026-10-29,
+and ADR 0002 and ADR 0016 now say so, with the test that proves the
+recovery from what each lets a power loss leave.
 
 ### For the integrator: the timed run
 
@@ -560,5 +561,8 @@ slower.
   peak resident size of the ops that run a headless turn, from the clean
   code pages of an unoptimized binary 8% larger than the anchor's; the
   physical footprint is not larger. A test-profile build is not what a node
-  runs, but the rule as written does not say which profile it holds, so
-  this is left for Efe to rule on rather than called no regression.
+  runs, but the rule as written did not say which profile it holds, so this
+  was left for Efe to rule on rather than called no regression. Efe ruled
+  on 2026-10-29: the performance rule gates the release build only, and the
+  test profile is tracked, not gated (CONTRIBUTING, ADR 0009). These
+  test-profile numbers stay in the record as tracked; they gate nothing.

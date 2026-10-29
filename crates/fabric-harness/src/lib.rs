@@ -26,6 +26,8 @@ pub mod denylist;
 pub(crate) mod departure;
 pub(crate) mod durable;
 mod error;
+#[cfg(test)]
+mod fake_tool;
 mod harness;
 pub(crate) mod jsontext;
 pub mod manifest;
@@ -47,7 +49,7 @@ pub mod codex;
 
 pub use error::{BadRule, HarnessError, Input, IoOp};
 pub use harness::{
-    Harness, Installed, Launch, LaunchSettings, MAX_MODEL_NAME_LEN, ModelName, ModelNameError,
-    NotCarried, Origin, PassedSetting, Restored, Running, SettingName, TurnEvent, TurnFeed,
-    TurnReport,
+    Harness, Installed, Launch, LaunchSettings, MAX_ANSWER, MAX_MODEL_NAME_LEN, ModelName,
+    ModelNameError, NotCarried, Origin, PassedSetting, Restored, Running, SettingName, TurnEvent,
+    TurnFeed, TurnReport,
 };

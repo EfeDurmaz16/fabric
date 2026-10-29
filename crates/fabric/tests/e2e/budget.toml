@@ -14,6 +14,12 @@ reps = 7
 # The time that stands for a batch, as a percentile of its runs.
 percentile = 25
 
+# The programs the warm-up runs count, in the order budget.rs counts them:
+# git, the kill, lsof, pgrep and ps the harness runs, every probed fake and
+# every harness. scripts/check-budget.sh holds a program on this list to
+# its counts at the base, as zero where an op did not name it.
+counted = ["git", "kill", "lsof", "pgrep", "ps", "id", "sw_vers", "xcrun", "node", "npm", "pnpm", "yarn", "bun", "rustc", "cargo", "python3", "uv", "defaults", "claude", "codex", "fabric-fake-agent"]
+
 # Each op's baseline in ms: the anchor's time at `percentile` on that
 # platform, which only goes down. A platform with no baselines only
 # reports its times. macOS: the Mac of the [[change]] entries below.
@@ -55,7 +61,8 @@ percentile = 25
 # harness, the harness's own starts included. A program an op does not
 # name starts in no run. Exact, and the same on every platform. The first
 # run moves each job for the first time; a count that grows from the first
-# run to the second grows with the job's history.
+# run to the second grows with the job's history. A count only goes down,
+# as a baseline does.
 [processes]
 "acp suspend" = { git = [27, 29], node = [2, 2], python3 = [2, 2], fabric-fake-agent = [1, 1] }
 "acp move" = { git = [2, 2], id = [2, 2], node = [4, 4] }
@@ -121,3 +128,7 @@ why = "The budget counts every fake in the test's bin too, each program the node
 [[change]]
 date = "2026-10-28"
 why = "Item 19 of docs/evidence/perf-ab/README.md, finished: a move's or a pull's preflight measures on each node only the tools of the rows that can stop it (id and git, the job's harness's version, its login on the target alone, iCloud Drive's folders only for a root in one) and the tools the job's snapshot reads for its carry keys and setup steps, which FactsFor now names to the peer; a capture that names more is measured then. Every move and pull drops sw_vers, xcrun, npm, pnpm, yarn, bun, rustc, cargo, uv and defaults and the preflight's python3 on both nodes, and a pull the holder's login: a move starts 8 processes (ACP) or 11 instead of 36 or 39, a pull 28 or 29 fewer. Baselines unchanged"
+
+[[change]]
+date = "2026-10-29"
+why = "Review of PR #31: scripts/check-budget.sh compared no process count, so a change could raise one with any entry. Counts now only go down, as baselines do, and the budget names the programs it counts (counted), so the check tells a program counted for the first time from one an op starts anew; budget.rs fails when the list is not the one it counts. No count or baseline changed"

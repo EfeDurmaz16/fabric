@@ -82,8 +82,11 @@ a cap in all and a cap per source.
 A paired peer is bounded too, over all its connections at once: a node runs
 at most 16 of its per-job requests and sends it at most 4 chunk batches at
 a time, and holds at most about 16 MiB of its requests, read or being read.
-A request with no room waits, unread, for at most 30 s (ADR 0013, amended
-2026-10-27).
+A request with no room waits for at most 30 s, unread at the peer past what
+the wire takes before anyone reads: its first 16 KiB on TCP, and on QUIC
+whatever fits the connection's receive window of about 6 MB, which bounds
+all of a peer's unread bytes on it (ADR 0013, amended 2026-10-27 and
+2026-10-29).
 
 ## On the gate network
 
