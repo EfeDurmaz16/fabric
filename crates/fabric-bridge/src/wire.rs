@@ -148,6 +148,17 @@ fn int(value: &Value, what: &str) -> Walk<u64> {
         })
 }
 
+/// An integer that bounds something and so cannot be 0: an exec's
+/// `timeout_ms` and `max_output_bytes`. A 0 asks for no time or no
+/// output, which no command can meet, so it is refused as `limit` before
+/// any effect rather than run with a guessed bound.
+fn bound(value: &Value, what: &str) -> Walk<u64> {
+    match int(value, what)? {
+        0 => Err(bad("limit", format!("{what} is 0"))),
+        n => Ok(n),
+    }
+}
+
 fn boolean(value: &Value, what: &str) -> Walk<bool> {
     value
         .as_bool()
@@ -870,9 +881,9 @@ pub struct ExecParams {
     pub stdin: Option<String>,
     /// The working directory, or the sandbox's.
     pub cwd: Option<String>,
-    /// The command's own timeout.
+    /// The command's own timeout in milliseconds, at least 1.
     pub timeout_ms: u64,
-    /// The most output bytes kept per stream.
+    /// The most output bytes kept per stream, at least 1.
     pub max_output_bytes: u64,
     /// The names of the secrets to give it.
     pub secret_names: Vec<String>,
@@ -1011,8 +1022,8 @@ impl Action {
                         argv,
                         stdin: nullable(o.req("stdin")?, "params.stdin", true)?,
                         cwd: nullable(o.req("cwd")?, "params.cwd", false)?,
-                        timeout_ms: int(o.req("timeout_ms")?, "params.timeout_ms")?,
-                        max_output_bytes: int(
+                        timeout_ms: bound(o.req("timeout_ms")?, "params.timeout_ms")?,
+                        max_output_bytes: bound(
                             o.req("max_output_bytes")?,
                             "params.max_output_bytes",
                         )?,
