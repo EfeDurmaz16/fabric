@@ -1,0 +1,10 @@
+Gates on f8742a2 (the last commit that changes code), run one after another in the worktree of m2/durable-job-foundations on 2026-10-29.
+
+cargo fmt --all --check, cargo clippy --workspace --all-targets --locked -- -D warnings: FMT_CLIPPY_OK
+cargo clippy -p fabric-harness per feature (none, acp, claude, codex), on 13f29d1, which f8742a2 changes only in fabric-net: FEAT_OK
+cargo test --workspace --locked -- --skip e2e_: TEST_OK, 1149 passed, 0 failed, 10 ignored
+cargo test -p fabric --test e2e --locked: E2E_OK, test result: ok. 70 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out
+RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --locked: DOC_OK
+scripts/test-check-hygiene.sh, check-hygiene.sh origin/main, test-check-fixtures.sh, check-fixtures.sh origin/main, test-check-budget.sh (60 cases, also under mawk in Debian bookworm), check-budget.sh origin/main, shellcheck scripts/*.sh, cargo deny check: SCRIPTS_OK
+FABRIC_BUDGET=count budget::hot_paths, on 13f29d1: COUNT_OK; every count equals budget.toml
+sdk/typescript: bun install --frozen-lockfile, typecheck, build, bun test with FABRIC_BIN set: SDK_OK, 62pass , 0fail

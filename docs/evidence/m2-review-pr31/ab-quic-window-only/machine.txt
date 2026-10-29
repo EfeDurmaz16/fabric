@@ -1,0 +1,10 @@
+anchor: 31577c464285c81a7145660d35993c051e0b2e69
+candidate: 0559e6acf05d2589c1546c776db31d964cceaa6c
+driver: e2e test of the working tree at f8742a21e7529da2a566459b3dff299bc3a0e798
+profile: debug, pairs: 20, counted runs: 1
+binary bytes: anchor 79616776, candidate 79618264
+uname: Darwin 25.6.0 arm64
+cpu: Apple M5 Pro 18 cores
+rustc: rustc 1.97.1 (8bab26f4f 2026-07-14)
+start: 2026-10-29T14:48:32Z, load: 11.19 10.44 10.29
+end: 2026-10-29T14:55:36Z, load: 7.73 10.00 10.11
