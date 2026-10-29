@@ -667,9 +667,9 @@ impl Bridge {
         format!("r-{}", self.next_id.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Registers a waiter under `id`, unless the worker is gone, the
-    /// bridge is shutting down, or (for a request or an observe) the
-    /// worker's in-flight limit is reached.
+    /// Registers a waiter under `id`, unless the bridge is shutting down
+    /// (for a request or an observe), the worker is gone, or (for a
+    /// request or an observe) the worker's in-flight limit is reached.
     fn register(
         &self,
         id: &str,
@@ -678,11 +678,14 @@ impl Bridge {
         kind: Kind,
     ) -> Result<mpsc::Receiver<Incoming>, BridgeError> {
         let mut state = self.shared.lock();
-        if let Some(why) = &state.lost {
-            return Err(BridgeError::Lost(why.clone()));
-        }
+        // A shutdown ends with the worker's exit, which the reader marks
+        // lost when it reads the end of the worker's output, so new work
+        // is refused as shutting down both before and after that read.
         if state.shutting_down && kind != Kind::Control {
             return Err(BridgeError::ShuttingDown);
+        }
+        if let Some(why) = &state.lost {
+            return Err(BridgeError::Lost(why.clone()));
         }
         if kind != Kind::Control {
             let outstanding = state
@@ -996,8 +999,10 @@ impl Bridge {
     }
 
     /// Asks the worker to drain for at most `drain_ms` and exit. New
-    /// requests are refused from now on, before the log is touched. The
-    /// outstanding requests still answer on their own.
+    /// requests are refused from now on with
+    /// [`BridgeError::ShuttingDown`], before the log is touched, and still
+    /// after the worker has exited. The outstanding requests still answer
+    /// on their own.
     #[allow(
         clippy::unused_async,
         reason = "async like the rest of the client; it queues its frame, so it completes without waiting"

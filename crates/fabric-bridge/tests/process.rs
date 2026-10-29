@@ -418,6 +418,17 @@ async fn the_in_flight_limit_refuses_before_the_journal_and_shutdown_lists_the_r
         let outcome = flight.finish(&mut journal).await.unwrap();
         assert_eq!(outcome.status, ProviderStatus::Unknown);
     }
+    // The flights settle only once the reader has read the end of the
+    // worker's output and marked it gone, which every shutdown ends with.
+    // A request is still refused as shutting down, not as a lost worker,
+    // whichever of the two the bridge saw first.
+    assert!(bridge.lost().is_some());
+    let refused = bridge.request(&mut journal, create(25, "fixture/ok")).await;
+    assert!(
+        matches!(refused, Err(BridgeError::ShuttingDown)),
+        "{refused:?}"
+    );
+    assert_eq!(status(&journal, 25), None);
     assert_eq!(bridge.close().await.unwrap().code(), Some(0));
 }
 
