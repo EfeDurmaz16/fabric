@@ -1,0 +1,30 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.39s
+     Running tests/e2e/main.rs (target/debug/deps/e2e-5884a725b54d94a6)
+
+running 1 test
+test budget::hot_paths has been running for over 60 seconds
+### Time budget, macos-aarch64, report
+
+Times in ms: the 25th percentile of 7 timed runs, the median, and the 25th percentile of a second batch when the first was over the limit in enforce mode. The limit is the larger of 1.3 x baseline and baseline + 50 ms. Processes are the starts of each counted program in each of the 2 warm-up runs.
+
+| op | p25 | median | baseline | limit | second p25 | processes | verdict |
+|---|---:|---:|---:|---:|---:|---|---|
+| acp suspend | 862 | 991 | 342 | 444 | - | git 28/30, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | over |
+| acp move | 264 | 311 | 144 | 194 | - | git 2/2, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | over |
+| acp resume | 1449 | 1906 | 545 | 708 | - | git 17/21, kill 0/0, lsof 0/0, pgrep 0/0, ps 3/3 | over |
+| acp pull | 2795 | 3027 | 995 | 1293 | - | git 51/55, kill 0/0, lsof 0/0, pgrep 0/0, ps 3/3 | over |
+| claude suspend | 1020 | 1038 | 407 | 529 | - | git 28/30, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | over |
+| claude move | 279 | 308 | 145 | 195 | - | git 2/2, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | over |
+| claude resume | 1722 | 2105 | 684 | 889 | - | git 17/21, kill 0/0, lsof 0/0, pgrep 0/0, ps 3/3 | over |
+| claude pull | 2907 | 3545 | 1221 | 1587 | - | git 51/55, kill 0/0, lsof 0/0, pgrep 0/0, ps 3/3 | over |
+| codex suspend | 1273 | 1357 | 550 | 715 | - | git 28/30, kill 0/0, lsof 1/1, pgrep 0/0, ps 0/0 | over |
+| codex move | 245 | 280 | 144 | 194 | - | git 2/2, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | over |
+| codex resume | 2227 | 2408 | 836 | 1086 | - | git 17/21, kill 0/0, lsof 1/1, pgrep 0/0, ps 3/3 | over |
+| codex pull | 3373 | 4126 | 1486 | 1931 | - | git 51/55, kill 0/0, lsof 2/2, pgrep 0/0, ps 3/3 | over |
+| cold start | 175 | 281 | 57 | 107 | - | git 0/0, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | over |
+| restart | 170 | 207 | 78 | 128 | - | git 0/0, kill 0/0, lsof 0/0, pgrep 0/0, ps 0/0 | over |
+
+test budget::hot_paths ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 58 filtered out; finished in 230.73s
+

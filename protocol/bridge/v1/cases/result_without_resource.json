@@ -1,0 +1,21 @@
+{
+  "case": "result_without_resource",
+  "direction": "worker_to_fabric",
+  "phase": "session",
+  "expect": {
+    "outcome": "reject",
+    "code": "protocol_violation",
+    "reason": "missing_field"
+  },
+  "message": {
+    "type": "result",
+    "request_id": "r-1",
+    "operation_id": "01K8W3A00000000000000000P1",
+    "state": "completed",
+    "output": {
+      "status": "ready"
+    },
+    "replayed": false,
+    "receipts": []
+  }
+}

@@ -1,0 +1,11 @@
+    Checking fabric-journal v0.1.0 (/private/tmp/fabric-wt/m3/crates/fabric-journal)
+    Checking fabric-client v0.1.0 (/private/tmp/fabric-wt/m3/crates/fabric-client)
+ Documenting fabric-journal v0.1.0 (/private/tmp/fabric-wt/m3/crates/fabric-journal)
+ Documenting fabric-client v0.1.0 (/private/tmp/fabric-wt/m3/crates/fabric-client)
+    Checking fabricd v0.1.0 (/private/tmp/fabric-wt/m3/crates/fabricd)
+ Documenting fabricd v0.1.0 (/private/tmp/fabric-wt/m3/crates/fabricd)
+ Documenting fabric-bridge v0.1.0 (/private/tmp/fabric-wt/m3/crates/fabric-bridge)
+ Documenting fabric v0.1.0 (/private/tmp/fabric-wt/m3/crates/fabric)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.80s
+   Generated /private/tmp/fabric-wt/m3/target/doc/fabric/index.html and 9 other files
+DOC_OK

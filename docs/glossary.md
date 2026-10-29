@@ -8,6 +8,10 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 
 **Blob.** Bytes stored by hash. Chunks and manifests are both blobs.
 
+**Bridge.** The framed stdio protocol between Fabric and a Capsule provider worker, version 1 (ADR 0021, docs/bridge-protocol.md). Fabric keeps job identity and the journal; the worker maps one governed action at a time onto a provider and reports what it observed.
+
+**Capability profile.** The document a bridge worker sends in its handshake and enforces: which actions it can invoke, which are terminal-only, which support observe, cancel and fresh approval, and how its resource locators are scoped. A missing capability blocks the workflow that needs it.
+
 **Carry key.** The exact strings a cache depends on (Node major and package manager, `rustc -vV` and `CARGO_HOME`, Python version and home). Recorded per cache in the snapshot; the target compares them with its own before trusting the bytes.
 
 **Catalog.** The SQLite database in a store that maps snapshot ids to manifests and chunk ids to on-disk files, and records which chunks each snapshot references.
@@ -83,6 +87,8 @@ Terms used in the architecture page and the ADRs. One meaning each. If a word is
 **Pairing.** Telling one node the id and address of another, out of band. Pairing is how trust is established. Discovery is never trust.
 
 **Placement.** Choosing which node runs a job. In this phase the user names it: `fabric job move --to` on the owner, or `fabric resume` on the node that wants it. The root is the recorded root.
+
+**Provider operation.** One effect a managed attempt asks a provider worker for over the bridge, such as creating a sandbox. The journal records it `dispatched` before the request is written, fenced on the job's current live attempt, and never sends its id or key twice (schema version 2, `provider_operations`).
 
 **Restore.** Writing a snapshot into a fresh workspace on a node, or in place into a workspace whose marker says it holds only published bytes. No path rewrites, because the root is the same on every node.
 

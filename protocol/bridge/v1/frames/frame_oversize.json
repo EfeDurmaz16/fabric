@@ -1,0 +1,11 @@
+{
+  "case": "frame_oversize",
+  "direction": "worker_to_fabric",
+  "phase": "session",
+  "hex": "01000001",
+  "expect": {
+    "outcome": "reject",
+    "code": "oversize",
+    "read_body": false
+  }
+}

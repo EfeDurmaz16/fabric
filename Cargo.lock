@@ -358,6 +358,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fabric-bridge"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "fabric-bridge",
+ "fabric-client",
+ "fabric-core",
+ "fabric-journal",
+ "rustix",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "fabric-client"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,26 @@
+{
+  "case": "observe_missing_scope",
+  "direction": "fabric_to_worker",
+  "phase": "session",
+  "expect": {
+    "outcome": "reject",
+    "code": "invalid",
+    "reason": "missing_field"
+  },
+  "message": {
+    "type": "observe",
+    "request_id": "r-10",
+    "operation_id": "01K8W3A00000000000000000P3",
+    "action": "sandbox.destroy",
+    "resource": {
+      "provider": "fixture",
+      "scope": {
+        "account": "acct-a",
+        "project": "proj-1"
+      },
+      "kind": "sandbox",
+      "native_id": "fx-key-create-1"
+    },
+    "wait_ms": 5000
+  }
+}

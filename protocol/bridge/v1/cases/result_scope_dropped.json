@@ -1,0 +1,26 @@
+{
+  "case": "result_scope_dropped",
+  "direction": "worker_to_fabric",
+  "phase": "session",
+  "expect": {
+    "outcome": "reject",
+    "code": "protocol_violation",
+    "reason": "missing_field"
+  },
+  "message": {
+    "type": "result",
+    "request_id": "r-1",
+    "operation_id": "01K8W3A00000000000000000P1",
+    "state": "completed",
+    "resource": {
+      "provider": "fixture",
+      "kind": "sandbox",
+      "native_id": "fx-key-create-1"
+    },
+    "output": {
+      "status": "ready"
+    },
+    "replayed": false,
+    "receipts": []
+  }
+}

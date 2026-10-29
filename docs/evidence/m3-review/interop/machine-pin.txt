@@ -1,0 +1,5 @@
+date: 2026-10-27T22:19:58Z
+fabric: 44d677aa9f742de5bf3d6288a5cf41d71ec08e68 plus the uncommitted interop test
+capsule: 9f5d65eb23fccdac668e7358ad0513ca994c011c (the CI pin), clean clone, pnpm install --frozen-lockfile --offline, pnpm --filter @capsule-sdk/bridge-worker... run build
+node: v22.23.2
+exit 0

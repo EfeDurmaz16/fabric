@@ -1,0 +1,44 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.80s
+     Running tests/process.rs (target/debug/deps/process-085600cdde734f48)
+
+running 4 tests
+test the_worker_leads_its_own_group_and_close_ends_what_it_left_there ... FAILED
+test a_crashed_worker_takes_its_group_and_not_what_runs_outside_it ... FAILED
+test a_worker_that_breaks_the_protocol_is_terminated_with_its_group ... FAILED
+test a_dropped_bridge_takes_the_workers_group ... FAILED
+
+failures:
+
+---- the_worker_leads_its_own_group_and_close_ends_what_it_left_there stdout ----
+
+thread 'the_worker_leads_its_own_group_and_close_ends_what_it_left_there' (279128654) panicked at crates/fabric-bridge/tests/process.rs:1033:5:
+assertion `left == right` failed: the worker leads
+  left: Pid(65267)
+ right: Pid(65904)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- a_crashed_worker_takes_its_group_and_not_what_runs_outside_it stdout ----
+
+thread 'a_crashed_worker_takes_its_group_and_not_what_runs_outside_it' (279128651) panicked at crates/fabric-bridge/tests/process.rs:1057:5:
+the client outlived the crash
+
+---- a_worker_that_breaks_the_protocol_is_terminated_with_its_group stdout ----
+
+thread 'a_worker_that_breaks_the_protocol_is_terminated_with_its_group' (279128653) panicked at crates/fabric-bridge/tests/process.rs:1076:5:
+the client outlived the worker
+
+---- a_dropped_bridge_takes_the_workers_group stdout ----
+
+thread 'a_dropped_bridge_takes_the_workers_group' (279128652) panicked at crates/fabric-bridge/tests/process.rs:1095:5:
+the client outlived the bridge
+
+
+failures:
+    a_crashed_worker_takes_its_group_and_not_what_runs_outside_it
+    a_dropped_bridge_takes_the_workers_group
+    a_worker_that_breaks_the_protocol_is_terminated_with_its_group
+    the_worker_leads_its_own_group_and_close_ends_what_it_left_there
+
+test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 23 filtered out; finished in 10.56s
+
+error: test failed, to rerun pass `-p fabric-bridge --test process`

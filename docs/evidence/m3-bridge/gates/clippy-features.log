@@ -1,0 +1,26 @@
+   Compiling libc v0.2.191
+    Checking getrandom v0.4.3
+    Checking hashbrown v0.17.1
+    Checking tokio v1.54.1
+    Checking rand v0.10.3
+    Checking tempfile v3.27.0
+    Checking indexmap v2.14.2
+    Checking proptest v1.12.0
+   Compiling jobserver v0.1.35
+   Compiling cc v1.9.0
+    Checking serde_json v1.0.154
+   Compiling zstd-sys v2.1.2+zstd.1.5.7
+   Compiling blake3 v1.8.7
+    Checking fabric-core v0.1.0 (/private/tmp/fabric-wt/m3/crates/fabric-core)
+   Compiling zstd-safe v8.2.0
+    Checking zstd v0.14.3
+    Checking fabric-harness v0.1.0 (/private/tmp/fabric-wt/m3/crates/fabric-harness)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.30s
+    Checking fabric-harness v0.1.0 (/private/tmp/fabric-wt/m3/crates/fabric-harness)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.64s
+    Checking uuid v1.28.0
+    Checking fabric-harness v0.1.0 (/private/tmp/fabric-wt/m3/crates/fabric-harness)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.22s
+    Checking fabric-harness v0.1.0 (/private/tmp/fabric-wt/m3/crates/fabric-harness)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.87s
+CLIPPY_FEATURES_OK

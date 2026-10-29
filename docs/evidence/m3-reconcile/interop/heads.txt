@@ -1,0 +1,3 @@
+capsule worker built at 16d97ed0cb9808b87e332432373162371182306c in its worktree; fabric at afac988e2668f0d53ff8b03a681542c6b0e0f9b0
+capsule worktree clean: yes; fabric worktree clean: yes
+sea: 97e2a11ed800bcce18645b904dc501c028ae8500f1e2f8ae25f8d88551e16a27 143820864 bytes; minimal PATH has none of node nodejs bun pnpm npm npx deno

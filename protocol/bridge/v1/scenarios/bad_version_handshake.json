@@ -1,0 +1,85 @@
+{
+  "scenario": "bad_version_handshake",
+  "summary": "A hello with no common version is answered by hello_refused and the worker exits before any effect.",
+  "profile": "fixture",
+  "provider_state": {
+    "binding": {
+      "account": "acct-a",
+      "project": "proj-1"
+    },
+    "policy": {
+      "images": [
+        "fixture/ok"
+      ],
+      "secrets": {
+        "allowed": [
+          "API_TOKEN",
+          "DB_URL"
+        ]
+      }
+    },
+    "approvals": [
+      {
+        "ref": "apr-destroy-1",
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-create-1",
+        "expired": false
+      },
+      {
+        "ref": "apr-expired-1",
+        "action": "sandbox.destroy",
+        "native_id": "fx-key-create-1",
+        "expired": true
+      },
+      {
+        "ref": "apr-create-only",
+        "action": "sandbox.create",
+        "native_id": null,
+        "expired": false
+      }
+    ],
+    "sandboxes": [],
+    "script": []
+  },
+  "steps": [
+    {
+      "handshake": false
+    },
+    {
+      "send": {
+        "type": "hello",
+        "versions": {
+          "min": 2,
+          "max": 3
+        },
+        "fabric": "fabric/0.1.0",
+        "profile": "fixture",
+        "limits": {
+          "max_request_bytes": 1048576,
+          "max_frame_bytes": 16777216,
+          "max_in_flight": 8,
+          "max_stderr_bytes": 65536
+        }
+      }
+    },
+    {
+      "receive": {
+        "type": "hello_refused",
+        "versions": {
+          "min": 1,
+          "max": 1
+        },
+        "reason": {
+          "code": "unsupported_version",
+          "message": "worker speaks bridge protocol 1 to 1"
+        }
+      }
+    },
+    {
+      "worker_exit": 2
+    },
+    {
+      "provider_calls": 0
+    }
+  ]
+}

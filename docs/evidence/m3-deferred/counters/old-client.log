@@ -1,0 +1,15 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.70s
+     Running tests/old_counts.rs (target/debug/deps/old_counts-e2b1e430ca5c453b)
+
+running 1 test
+step | status | writes (fsyncs) | reads | threads
+create | succeeded | (2, 1, ["the_steps_of_off_runtime_on_the_old_client"])
+exec | succeeded | (2, 1, ["the_steps_of_off_runtime_on_the_old_client"])
+create, 16 progress | succeeded | (18, 1, ["the_steps_of_off_runtime_on_the_old_client"])
+refused before sending | rejected | (1, 0, ["the_steps_of_off_runtime_on_the_old_client"])
+timed out | unknown | (2, 1, ["the_steps_of_off_runtime_on_the_old_client"])
+observe refused | succeeded | (0, 1, ["the_steps_of_off_runtime_on_the_old_client"])
+test the_steps_of_off_runtime_on_the_old_client ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.71s
+

@@ -1,0 +1,14 @@
+{
+  "case": "cancel_ack_valid",
+  "direction": "worker_to_fabric",
+  "phase": "session",
+  "expect": {
+    "outcome": "accept"
+  },
+  "message": {
+    "type": "cancel_ack",
+    "request_id": "r-9",
+    "cancels": "r-2",
+    "state": "requested"
+  }
+}
