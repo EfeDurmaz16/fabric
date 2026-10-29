@@ -15,7 +15,7 @@ mod common;
 use std::os::unix::process::ExitStatusExt;
 use std::time::{Duration, Instant};
 
-use common::{Logged, create, journal, operation, scope};
+use common::{Logged, create, double, journal, operation, scope};
 use fabric_bridge::wire::{
     Action, CancelState, CreateParams, ErrorCode, ExecParams, Locator, ResultState, Versions,
 };
@@ -23,11 +23,6 @@ use fabric_bridge::{Answer, Bridge, BridgeError, Config, Control, Effect, Event,
 use fabric_core::managed::OperationId;
 use fabric_journal::{AbandonApproval, Acknowledged, CleanupRefusal, Journal, ProviderStatus};
 use rustix::process::Pid;
-use tokio::process::Command;
-
-fn double() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_fabric-bridge-double"))
-}
 
 fn config() -> Config {
     let mut config = Config::new("fixture");
@@ -73,6 +68,15 @@ fn fx(key: &str) -> Locator {
         "native_id": format!("fx-{key}"),
     }))
     .unwrap()
+}
+
+/// The double has run to its exit once before a test gets a command that
+/// starts it, so no timed handshake waits on macOS's first check of it.
+#[test]
+fn the_double_has_run_to_its_exit_before_a_test_can_start_it() {
+    let _command = double();
+    let warmed = common::double_warmed();
+    assert!(warmed.is_some_and(|s| s.success()), "{warmed:?}");
 }
 
 #[tokio::test]
@@ -465,6 +469,17 @@ async fn the_in_flight_limit_refuses_before_the_journal_and_shutdown_lists_the_r
         let outcome = flight.finish(&mut journal).await.unwrap();
         assert_eq!(outcome.status, ProviderStatus::Unknown);
     }
+    // The flights settle only once the reader has read the end of the
+    // worker's output and marked it gone, which every shutdown ends with.
+    // A request is still refused as shutting down, not as a lost worker,
+    // whichever of the two the bridge saw first.
+    assert!(bridge.lost().is_some());
+    let refused = bridge.request(&mut journal, create(25, "fixture/ok")).await;
+    assert!(
+        matches!(refused, Err(BridgeError::ShuttingDown)),
+        "{refused:?}"
+    );
+    assert_eq!(status(&journal, 25), None);
     assert_eq!(bridge.close().await.unwrap().code(), Some(0));
 }
 

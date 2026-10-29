@@ -1,5 +1,6 @@
 //! What the bridge tests share: a journal holding the fixtures' job,
-//! effects on it, and the command that starts the Capsule worker.
+//! effects on it, and the commands that start the test double and the
+//! Capsule worker.
 
 #![allow(dead_code, reason = "each test file uses part of this module")]
 
@@ -270,4 +271,34 @@ pub fn docker_image() -> Result<String, String> {
         ));
     }
     Ok(image)
+}
+
+/// How the test double's run at first use ended.
+static DOUBLE_WARMED: std::sync::OnceLock<std::process::ExitStatus> = std::sync::OnceLock::new();
+
+/// The command that starts the test double, given only once the double
+/// has run to its exit once in this process.
+///
+/// macOS checks a new executable the first time it runs, before any of its
+/// code does, and checks one executable at a time: a double linked a
+/// moment before waited 6 s behind twenty other new executables, past a
+/// test's 5 s handshake. This run pays that wait outside every timed
+/// handshake. With its input empty the double reads no hello and exits 0.
+pub fn double() -> tokio::process::Command {
+    let path = env!("CARGO_BIN_EXE_fabric-bridge-double");
+    let warmed = DOUBLE_WARMED.get_or_init(|| {
+        std::process::Command::new(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+    });
+    assert!(warmed.success(), "the double's first run failed: {warmed}");
+    tokio::process::Command::new(path)
+}
+
+/// How the double's first run ended, once [`double`] has been called.
+pub fn double_warmed() -> Option<std::process::ExitStatus> {
+    DOUBLE_WARMED.get().copied()
 }
