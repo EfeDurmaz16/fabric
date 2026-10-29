@@ -12,9 +12,127 @@
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use fabric_core::id::ChunkId;
+
+/// Writes `contents` to `path` with mode `0755` through `sh`, so this
+/// process never holds an executable open for writing, which Linux would
+/// refuse to run (`ETXTBSY`) in a child forked meanwhile.
+pub fn write_executable(path: &Path, contents: &str) -> Result<(), Box<dyn Error>> {
+    let mut writer = Command::new("/bin/sh")
+        .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()?;
+    std::io::Write::write_all(
+        &mut writer.stdin.take().ok_or("no pipe to the writer")?,
+        contents.as_bytes(),
+    )?;
+    if !writer.wait()?.success() {
+        return Err(format!("writing {} failed", path.display()).into());
+    }
+    Ok(())
+}
+
+/// How the logged `git` of `run_with_logged_git` behaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoggedGit {
+    /// It runs the machine's git.
+    Plain,
+    /// It fails an `update-ref --stdin` whose input holds `symref-update`,
+    /// as git before 2.46 does, and runs the machine's git otherwise.
+    WithoutSymrefUpdate,
+}
+
+/// Runs the test `child` of this test binary in a new process whose `PATH`
+/// starts with a `git` that appends the arguments of each call, one line
+/// per call, to the file `FABRIC_GIT_LOG` names, and then runs the first
+/// other `git` on the `PATH`. The child finds a scratch directory in
+/// `FABRIC_GIT_COUNT_DIR` (`logged_git_dir`) and reads the calls with
+/// `logged_git_calls`; it does nothing when that variable is unset, as in
+/// an ordinary test run.
+pub fn run_with_logged_git(child: &str, kind: LoggedGit) -> Result<(), Box<dyn Error>> {
+    let dir = tempfile::tempdir()?;
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin)?;
+    let path = std::env::var_os("PATH").ok_or("no PATH")?;
+    let real = std::env::split_paths(&path)
+        .map(|dir| dir.join("git"))
+        .find(|candidate| candidate.is_file())
+        .ok_or("no git on the PATH")?;
+    let refuse = match kind {
+        LoggedGit::Plain => "",
+        LoggedGit::WithoutSymrefUpdate => {
+            r#"case " $* " in
+*" update-ref "*" --stdin "*)
+  input=$(cat)
+  case $input in
+  *symref-update*) echo "fatal: unknown command: symref-update" >&2; exit 128 ;;
+  esac
+  printf '%s\n' "$input" | exec "$real" "$@" ;;
+esac
+"#
+        }
+    };
+    write_executable(
+        &bin.join("git"),
+        &format!(
+            "#!/bin/sh\nreal='{}'\nprintf '%s\\n' \"$*\" >> \"$FABRIC_GIT_LOG\"\n{refuse}exec \"$real\" \"$@\"\n",
+            real.display()
+        ),
+    )?;
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path)))?;
+    let work = dir.path().join("work");
+    std::fs::create_dir(&work)?;
+    let output = Command::new(std::env::current_exe()?)
+        .args(["--exact", child, "--nocapture"])
+        .env("FABRIC_GIT_COUNT_DIR", &work)
+        .env("FABRIC_GIT_LOG", dir.path().join("git.log"))
+        .env("PATH", path)
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() || !stdout.contains("1 passed") {
+        return Err(format!("{child} failed:\n{stdout}\n{stderr}").into());
+    }
+    Ok(())
+}
+
+/// In a child of `run_with_logged_git`, its scratch directory; `None` in an ordinary run.
+pub fn logged_git_dir() -> Option<PathBuf> {
+    std::env::var_os("FABRIC_GIT_COUNT_DIR").map(PathBuf::from)
+}
+
+/// In a child of `run_with_logged_git`, the arguments of every git call so far, one entry per call.
+pub fn logged_git_calls() -> Vec<String> {
+    std::env::var_os("FABRIC_GIT_LOG")
+        .and_then(|log| std::fs::read_to_string(log).ok())
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The calls of `calls` from index `from` on, each without the `-c`
+/// settings in front of its git command, so it starts with the command.
+pub fn git_commands(calls: &[String], from: usize) -> Vec<String> {
+    calls[from..]
+        .iter()
+        .map(|call| {
+            let mut words = call.split(' ');
+            let mut kept: Vec<&str> = Vec::new();
+            while let Some(word) = words.next() {
+                if word == "-c" && kept.is_empty() {
+                    words.next();
+                } else {
+                    kept.push(word);
+                }
+            }
+            kept.join(" ")
+        })
+        .collect()
+}
 
 /// Returns where the store rooted at `store_root` keeps the object `id`: `objects/<first two hex digits>/<hex>`.
 pub fn object_path(store_root: &Path, id: ChunkId) -> PathBuf {

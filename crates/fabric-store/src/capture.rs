@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, BufRead, BufReader};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -1672,7 +1672,13 @@ impl GitCapture<'_> {
         if let Some(rel) = changed {
             return Err(CaptureError::WorkspaceChanged { path: rel.clone() });
         }
-        let (paths, nested) = self.untracked()?;
+        // The two listings are independent; the ignored one runs beside
+        // the untracked one, and is judged after it, as before.
+        let (untracked, ignored_now) = thread::scope(|scope| {
+            let ignored_now = scope.spawn(|| self.ignored_alone());
+            (self.untracked(), joined(ignored_now))
+        });
+        let (paths, nested) = untracked?;
         let before: BTreeSet<&RelPath> = seen
             .untracked
             .0
@@ -1692,13 +1698,19 @@ impl GitCapture<'_> {
                 path: (*rel).clone(),
             });
         }
-        let mut report = CaptureReport::default();
-        let found = self.ignored(&mut report)?;
+        let (found, report) = ignored_now?;
         let names = report
             .special_files
             .iter()
             .chain(&report.nested_repositories);
         ignored.unchanged_in(&Census::of(&found, names, carried))
+    }
+
+    /// `ignored` into a report of its own, for a listing that runs on another thread.
+    fn ignored_alone(&self) -> Result<(Vec<Found>, CaptureReport), CaptureError> {
+        let mut report = CaptureReport::default();
+        let found = self.ignored(&mut report)?;
+        Ok((found, report))
     }
 
     /// The `-c` value that makes a listing read the same user exclude rules as `W`.
@@ -2392,12 +2404,7 @@ impl GitCapture<'_> {
     ) -> Result<(), CaptureError> {
         let listed: BTreeMap<String, String> = match built {
             BuiltBundle::Full(file) | BuiltBundle::Incremental { file, .. } => {
-                let path = file.path().to_string_lossy().into_owned();
-                let out = self.git.run_text(&["bundle", "list-heads", &path])?;
-                out.lines()
-                    .filter_map(|line| line.split_once(' '))
-                    .map(|(oid, name)| (name.to_owned(), oid.to_owned()))
-                    .collect()
+                bundle_heads(file.path())?
             }
             BuiltBundle::Empty { .. } => BTreeMap::new(),
         };
@@ -2751,6 +2758,62 @@ impl GitCapture<'_> {
     }
 }
 
+/// The result of a scoped thread, its panic carried on to the caller.
+fn joined<T>(handle: thread::ScopedJoinHandle<'_, T>) -> T {
+    handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// Reads the refs a bundle lists, by name, with their ids: the reference
+/// lines of its header, which `git bundle list-heads` prints as they are.
+///
+/// The header is text up to the first empty line (gitformat-bundle(5)):
+/// the signature `# v2 git bundle` or `# v3 git bundle`, a line per
+/// capability that starts with `@`, a line per prerequisite that starts
+/// with `-`, then `<id> <refname>` per reference. Reading it costs no
+/// process; `bundle verify` has already checked the header with git's own
+/// parser, and a ref this reads wrongly fails `confirm_bundle`, never
+/// passes it.
+fn bundle_heads(path: &Path) -> Result<BTreeMap<String, String>, CaptureError> {
+    let bad = |text: &str| -> CaptureError {
+        GitError::Parse {
+            what: "bundle header",
+            text: text.to_owned(),
+        }
+        .into()
+    };
+    let mut reader = BufReader::new(File::open(path).map_err(|e| io_err(path, e))?);
+    let mut line = Vec::new();
+    let mut heads = BTreeMap::new();
+    let mut first = true;
+    loop {
+        line.clear();
+        reader
+            .read_until(b'\n', &mut line)
+            .map_err(|e| io_err(path, e))?;
+        let text = Git::text("bundle header", &line)?;
+        let Some(text) = text.strip_suffix('\n') else {
+            return Err(bad(text));
+        };
+        if first {
+            if !matches!(text, "# v2 git bundle" | "# v3 git bundle") {
+                return Err(bad(text));
+            }
+            first = false;
+            continue;
+        }
+        if text.is_empty() {
+            return Ok(heads);
+        }
+        if text.starts_with('@') || text.starts_with('-') {
+            continue;
+        }
+        let (oid, name) = text.split_once(' ').ok_or_else(|| bad(text))?;
+        heads.insert(name.to_owned(), oid.to_owned());
+    }
+}
+
 /// The most path bytes one git command line carries, well under every `ARG_MAX`.
 const ARG_BYTES: usize = 128 << 10;
 
@@ -2831,15 +2894,26 @@ pub fn capture(store: &Store, req: &CaptureRequest<'_>) -> Result<Captured, Capt
         let parent = parent_manifest
             .as_ref()
             .map(|(id, manifest)| (*id, manifest));
-        let (state, mut seen) = capture_git(&mut capturer, &repo, &listing, parent)?;
+        // The ignored listing needs nothing the git half makes, and only
+        // has to come before the files are stored, so it runs beside it.
+        let (git_half, ignored_listing) = thread::scope(|scope| {
+            let ignored_listing = scope.spawn(|| repo.ignored_alone());
+            let git_half = capture_git(&mut capturer, &repo, &listing, parent);
+            (git_half, joined(ignored_listing))
+        });
+        let (state, mut seen) = git_half?;
+        let (mut found, listed) = ignored_listing?;
         worktree_dirs = std::mem::take(&mut seen.dirs);
-        let report = &mut capturer.report;
-        let (special, nested) = (report.special_files.len(), report.nested_repositories.len());
-        let mut found = repo.ignored(report)?;
-        let names = report.special_files[special..]
+        let names = listed
+            .special_files
             .iter()
-            .chain(&report.nested_repositories[nested..]);
+            .chain(&listed.nested_repositories);
         let ignored = Census::of(&found, names, &mut carried);
+        let report = &mut capturer.report;
+        report.special_files.extend(listed.special_files);
+        report
+            .nested_repositories
+            .extend(listed.nested_repositories);
         // git lists files only, so an empty directory, untracked or
         // ignored, comes from a walk; one `W` holds as a submodule stays out.
         let in_w: HashSet<&RelPath> = seen.paths.iter().collect();
@@ -3194,6 +3268,100 @@ mod tests {
         GitCapture::open(git, root, policy, JobId::from_bytes([1; 16]), scratch)
             .unwrap()
             .unwrap()
+    }
+
+    /// The refs `git bundle list-heads` prints for the bundle at `path`, by name.
+    fn listed_heads(git: &Git, path: &Path) -> BTreeMap<String, String> {
+        let out = git
+            .run_text(&["bundle", "list-heads", &path.to_string_lossy()])
+            .unwrap();
+        out.lines()
+            .filter_map(|line| line.split_once(' '))
+            .map(|(oid, name)| (name.to_owned(), oid.to_owned()))
+            .collect()
+    }
+
+    /// The header of a full and of an incremental bundle, of a SHA-1 and
+    /// of a SHA-256 repository (a `v3` bundle with a capability line),
+    /// with prerequisites and a symbolic `HEAD`, reads as `list-heads`
+    /// prints it.
+    #[test]
+    fn the_bundle_header_lists_what_list_heads_prints() {
+        for format in ["sha1", "sha256"] {
+            let dir = tempfile::tempdir().unwrap();
+            let git = Git::new(dir.path()).with_date(1_760_000_000_000);
+            git.run(&[
+                "init",
+                "-q",
+                "-b",
+                "main",
+                &format!("--object-format={format}"),
+            ])
+            .unwrap();
+            git.run(&["commit", "-q", "--allow-empty", "-m", "one"])
+                .unwrap();
+            git.run(&["tag", "-a", "-m", "tagged", "v1"]).unwrap();
+            let first = git.run_text(&["rev-parse", "HEAD"]).unwrap();
+            git.run(&["commit", "-q", "--allow-empty", "-m", "two"])
+                .unwrap();
+            git.run(&["branch", "side"]).unwrap();
+            let (full, incremental) = (dir.path().join("full"), dir.path().join("incremental"));
+            git.run(&["bundle", "create", &full.to_string_lossy(), "--all"])
+                .unwrap();
+            let incremental_text = incremental.to_string_lossy();
+            git.run(&[
+                "bundle",
+                "create",
+                &incremental_text,
+                "--all",
+                "--not",
+                &first,
+            ])
+            .unwrap();
+            for path in [&full, &incremental] {
+                let heads = bundle_heads(path).unwrap();
+                assert_eq!(
+                    heads,
+                    listed_heads(&git, path),
+                    "{format} {}",
+                    path.display()
+                );
+                assert!(heads.contains_key("refs/heads/side"), "{heads:?}");
+            }
+            let header = fs::read(&incremental).unwrap();
+            assert!(
+                header.windows(2).any(|w| w == b"\n-"),
+                "no prerequisite line"
+            );
+            if format == "sha256" {
+                assert!(header.starts_with(b"# v3 git bundle\n@object-format=sha256\n"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_bundle_header_that_is_not_one_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bundle");
+        let oid = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+        for bytes in [
+            format!("# v9 git bundle\n{oid} refs/heads/main\n\n"),
+            format!("# v2 git bundle\n{oid} refs/heads/main\n"),
+            format!("# v2 git bundle\n{oid}\n\n"),
+            String::new(),
+        ] {
+            fs::write(&path, &bytes).unwrap();
+            assert!(bundle_heads(&path).is_err(), "{bytes:?}");
+        }
+        fs::write(
+            &path,
+            format!("# v2 git bundle\n-{oid} c\n{oid} refs/heads/main\n\nPACK"),
+        )
+        .unwrap();
+        assert_eq!(
+            bundle_heads(&path).unwrap(),
+            BTreeMap::from([("refs/heads/main".to_owned(), oid.to_owned())])
+        );
     }
 
     #[test]

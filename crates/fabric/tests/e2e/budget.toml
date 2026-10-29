@@ -1,8 +1,9 @@
 # The time budget of the hot paths, which `budget::hot_paths` in budget.rs
 # measures (issue #26): suspend, move, resume and pull of a job under each
 # harness, and a daemon's cold start and restart. CONTRIBUTING.md says how
-# to run it and how to accept a slowdown. scripts/check-budget.sh fails a
-# change to this file that adds no [[change]] entry at its end.
+# to run it and how to change it. scripts/check-budget.sh fails a change to
+# this file that adds no [[change]] entry at its end, or that loosens a
+# limit: a baseline is the anchor's time and only goes down.
 
 # A time is over its limit when it is above both ratio x baseline and
 # baseline + grace_ms; it fails when it is over again in a second batch.
@@ -13,8 +14,9 @@ reps = 7
 # The time that stands for a batch, as a percentile of its runs.
 percentile = 25
 
-# Each op's baseline in ms, the time at `percentile` on that platform. A
-# platform with no baselines only reports its times.
+# Each op's baseline in ms: the anchor's time at `percentile` on that
+# platform, which only goes down. A platform with no baselines only
+# reports its times. macOS: the Mac of the [[change]] entries below.
 [baseline.macos-aarch64]
 "acp suspend" = 342
 "acp move" = 144
@@ -31,29 +33,44 @@ percentile = 25
 "cold start" = 57
 "restart" = 78
 
-# Report only until CI produces numbers.
+# Linux: CI's ubuntu-latest runner, from scripts/budget-baselines.sh.
 [baseline.linux-x86_64]
+"acp suspend" = 142
+"acp move" = 76
+"acp resume" = 219
+"acp pull" = 430
+"claude suspend" = 177
+"claude move" = 77
+"claude resume" = 375
+"claude pull" = 625
+"codex suspend" = 230
+"codex move" = 77
+"codex resume" = 446
+"codex pull" = 728
+"cold start" = 32
+"restart" = 36
 
-# The git, kill, lsof, pgrep and ps processes each op starts in each
-# warm-up run, the harness's own included: exact, and the same on every
-# platform. The first run moves each job for the first time; a count that
-# grows from the first run to the second grows with the job's history.
+# The processes each op starts in each warm-up run, by program: git, the
+# kill, lsof, pgrep and ps the harness runs, every probed fake and every
+# harness, the harness's own starts included. A program an op does not
+# name starts in no run. Exact, and the same on every platform. The first
+# run moves each job for the first time; a count that grows from the first
+# run to the second grows with the job's history.
 [processes]
-"acp suspend" = { git = [28, 30], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
-"acp move" = { git = [2, 2], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
-"acp resume" = { git = [17, 21], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [3, 3] }
-"acp pull" = { git = [51, 55], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [3, 3] }
-"claude suspend" = { git = [28, 30], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
-"claude move" = { git = [2, 2], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
-"claude resume" = { git = [17, 21], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [3, 3] }
-"claude pull" = { git = [51, 55], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [3, 3] }
-"codex suspend" = { git = [28, 30], kill = [0, 0], lsof = [1, 1], pgrep = [0, 0], ps = [0, 0] }
-"codex move" = { git = [2, 2], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
-"codex resume" = { git = [17, 21], kill = [0, 0], lsof = [1, 1], pgrep = [0, 0], ps = [3, 3] }
-"codex pull" = { git = [51, 55], kill = [0, 0], lsof = [2, 2], pgrep = [0, 0], ps = [3, 3] }
-"cold start" = { git = [0, 0], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
-"restart" = { git = [0, 0], kill = [0, 0], lsof = [0, 0], pgrep = [0, 0], ps = [0, 0] }
-
+"acp suspend" = { git = [27, 29], node = [2, 2], python3 = [2, 2], fabric-fake-agent = [1, 1] }
+"acp move" = { git = [2, 2], id = [2, 2], node = [4, 4] }
+"acp resume" = { git = [9, 10], ps = [1, 1], node = [2, 2], fabric-fake-agent = [1, 1] }
+"acp pull" = { git = [41, 41], ps = [1, 1], id = [2, 2], node = [8, 8], python3 = [2, 2], fabric-fake-agent = [2, 2] }
+"claude suspend" = { git = [27, 29], node = [2, 2], python3 = [2, 2], claude = [1, 1] }
+"claude move" = { git = [2, 2], id = [2, 2], node = [4, 4], claude = [3, 3] }
+"claude resume" = { git = [9, 10], ps = [1, 1], node = [2, 2], claude = [3, 3] }
+"claude pull" = { git = [41, 41], ps = [1, 1], id = [2, 2], node = [8, 8], python3 = [2, 2], claude = [7, 7] }
+"codex suspend" = { git = [27, 29], lsof = [1, 1], node = [2, 2], python3 = [2, 2], codex = [2, 2] }
+"codex move" = { git = [2, 2], id = [2, 2], node = [4, 4], codex = [3, 3] }
+"codex resume" = { git = [9, 10], lsof = [1, 1], ps = [1, 1], node = [2, 2], codex = [3, 3] }
+"codex pull" = { git = [41, 41], lsof = [2, 2], ps = [1, 1], id = [2, 2], node = [8, 8], python3 = [2, 2], codex = [8, 8] }
+"cold start" = {}
+"restart" = {}
 # Every change to this file adds an entry here, below the others, that
 # says when and why. Entries are never edited or removed.
 [[change]]
@@ -83,3 +100,24 @@ why = "Review of PR #29: macos-aarch64 baselines from this branch with no fact k
 [[change]]
 date = "2026-10-27"
 why = "M2-06 (issue #22): a restore sets each symbolic ref with one git symbolic-ref, after the direct refs, so refs/remotes/origin/HEAD follows the remote's default branch again instead of naming a frozen commit. The job's workspace is a git clone, so it has that one symbolic ref, and every resume and pull runs one more git: resumes 17/21 and pulls 51/55. Suspends and moves are unchanged. git 2.46 and later could set it in the existing update-ref --stdin transaction; that is not built. Baselines unchanged"
+
+[[change]]
+date = "2026-10-27"
+why = "M2-25: linux-x86_64 baselines, the anchor's times on CI's ubuntu-latest runner: per op the median of the 25th percentiles of CI runs 40148467445, 40149293377 and 40270077851, whose Rust code is 176622e's (scripts/budget-baselines.sh). No one of the three is above these baselines by more than 1.07 times, inside the 1.3 ratio, so CI can enforce them"
+anchor = "176622eb4d4e5b5fdfaaae7241b678ce1c60b5d5"
+
+[[change]]
+date = "2026-10-28"
+why = "Perf items 5, 8, 9, 10 and 18 of docs/evidence/perf-ab/README.md, in fabric-store: a restore runs git bundle unbundle without a git bundle verify before it, unbundles only the links of the chain the node's bundle cache lacks, writes the exclude file and the remote and branch config without asking git, and sets symbolic refs and HEAD in the update-ref transaction; a capture reads a bundle's heads from its header instead of running git bundle list-heads. Suspends 27/29 (one git fewer), resumes 9/10 and pulls 41/41 (8 to 14 fewer), and a resume no longer grows with the job's history. Counted on the store change alone and on the integration of every M2 deferred-work branch, which agree. Baselines unchanged"
+
+[[change]]
+date = "2026-10-28"
+why = "Perf items 2 and 17 of docs/evidence/perf-ab/README.md, in fabricd: the node tells whether a harness leads its process group with getpgid instead of ps -o pgid=, and finds a gone harness gone with kill(pid, 0) before it would ask ps -o lstart=. Every resume and pull starts ps once instead of three times; a check is not dropped, the same answers come without a process. Counted on that change alone and on the integration of every M2 deferred-work branch, which agree. Baselines unchanged"
+
+[[change]]
+date = "2026-10-28"
+why = "The budget counts every fake in the test's bin too, each program the node's facts probe and each harness, not only git and the harness's system tools: probes run in parallel, so a probe started again or for another harness hides in the time, and only its count shows it. A program an op does not start is left out of its entry instead of written as [0, 0]. Counts of the integration of every M2 deferred-work branch (budget-ci-evidence, cli-protocol-ops bf14115, durability 3904a60, facts-net-carry b0f25c0, launch-hold 6586ef9, node-runtime 922522c, store-git 02b7dc4), whose git, lsof and ps counts equal the entries above. Baselines unchanged"
+
+[[change]]
+date = "2026-10-28"
+why = "Item 19 of docs/evidence/perf-ab/README.md, finished: a move's or a pull's preflight measures on each node only the tools of the rows that can stop it (id and git, the job's harness's version, its login on the target alone, iCloud Drive's folders only for a root in one) and the tools the job's snapshot reads for its carry keys and setup steps, which FactsFor now names to the peer; a capture that names more is measured then. Every move and pull drops sw_vers, xcrun, npm, pnpm, yarn, bun, rustc, cargo, uv and defaults and the preflight's python3 on both nodes, and a pull the holder's login: a move starts 8 processes (ACP) or 11 instead of 36 or 39, a pull 28 or 29 fewer. Baselines unchanged"

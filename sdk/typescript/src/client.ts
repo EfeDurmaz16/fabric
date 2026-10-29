@@ -53,6 +53,8 @@ import {
   type ManagedJobs,
   type ManagedOperation,
   type ManagedStatus,
+  type Repaired,
+  type Exported,
   type Counter,
   type NodeId,
   OperationKey,
@@ -352,6 +354,25 @@ export class FabricClient {
   /** Every managed job. */
   managedList(options?: CallOptions): Promise<ManagedJobs> {
     return this.call({ op: "managed_list" }, options);
+  }
+
+  /**
+   * Applies the fork rule of ADR 0003 to a job frozen after a fork: takes the
+   * peer's chain when it wins, or lifts the freeze when the chains no longer fork.
+   */
+  jobRepair(job: JobId, options?: CallOptions): Promise<Repaired> {
+    return this.call({ op: "job_repair", job }, options);
+  }
+
+  /**
+   * Captures an orphan workspace of the job, the one at its root or the
+   * set-aside one at `path`, into a pinned snapshot that is not the job's head.
+   */
+  jobExport(
+    job: JobId,
+    options: CallOptions & { readonly path?: SystemPath; readonly env?: ClientEnv } = {},
+  ): Promise<Exported> {
+    return this.call({ op: "job_export", job, path: options.path, env: options.env }, options);
   }
 
   /**

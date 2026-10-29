@@ -24,8 +24,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::budget::{PROBE_DELAY, PROBED};
-use crate::world::{Env, Fallible, Node, Wire, pair, write_executable};
+use crate::world::{Env, Fallible, Node, Wire, pair};
 
 /// The harness of each job shape, by its name in the report.
 const SHAPES: [(&str, &str); 3] = [
@@ -49,24 +48,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Fallible<Self> {
         let env = Env::new()?;
-        env.install_fake_claude()?;
-        env.install_fake_codex()?;
-        for (program, answer) in PROBED {
-            env.install(
-                program,
-                &format!("#!/bin/sh\nsleep {PROBE_DELAY}\n{answer}\n"),
-            )?;
-        }
-        for harness in ["claude", "codex"] {
-            let path = env.bin().join(harness);
-            let script = std::fs::read_to_string(&path)?;
-            let (shebang, rest) = script.split_once('\n').ok_or("an empty fake")?;
-            write_executable(
-                &path,
-                format!("{shebang}\nsleep {PROBE_DELAY}\n{rest}").as_bytes(),
-            )?;
-        }
-        std::fs::create_dir_all(env.home.join(".claude/sessions"))?;
+        crate::budget::install_fakes(&env)?;
         let mut a = Node::new(&env, "a", Wire::Quic)?;
         let mut b = Node::new(&env, "b", Wire::Quic)?;
         a.start(None)?;

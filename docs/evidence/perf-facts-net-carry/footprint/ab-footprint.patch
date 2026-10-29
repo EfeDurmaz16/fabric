@@ -1,0 +1,38 @@
+diff --git a/crates/fabric/tests/e2e/ab.rs b/crates/fabric/tests/e2e/ab.rs
+index b79b878..eaead66 100644
+--- a/crates/fabric/tests/e2e/ab.rs
++++ b/crates/fabric/tests/e2e/ab.rs
+@@ -336,13 +336,32 @@ impl Side {
+         let mut sizes = Vec::new();
+         for node in [&self.a, &self.b] {
+             if let Some(pid) = node.daemon_pid() {
+-                sizes.push((node.name, rss_kib(pid)?));
++                let (now, peak) = footprint_kib(pid)?;
++                sizes.push((node.name, now));
++                sizes.push((if node.name == "a" { "a peak" } else { "b peak" }, peak));
+             }
+         }
+         Ok(sizes)
+     }
+ }
+ 
++/// SCRATCH: the physical footprint of `pid` and its peak, in KiB, as `footprint` reports them.
++fn footprint_kib(pid: u32) -> Fallible<(u64, u64)> {
++    let output = Command::new("/usr/bin/footprint")
++        .args(["-p", &pid.to_string(), "-f", "bytes", "--noCategories"])
++        .output()?;
++    let text = String::from_utf8(output.stdout)?;
++    let field = |name: &str| -> Fallible<u64> {
++        let line = text
++            .lines()
++            .find(|line| line.trim_start().starts_with(name))
++            .ok_or("no footprint line")?;
++        let bytes: u64 = line.trim().trim_start_matches(name).trim().trim_end_matches('B').trim().parse()?;
++        Ok(bytes / 1024)
++    };
++    Ok((field("phys_footprint:")?, field("phys_footprint_peak:")?))
++}
++
+ /// The resident size of process `pid` in KiB, as `ps` reports it.
+ fn rss_kib(pid: u32) -> Fallible<u64> {
+     let output = Command::new("/bin/ps")

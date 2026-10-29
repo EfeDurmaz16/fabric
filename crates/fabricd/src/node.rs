@@ -78,7 +78,8 @@ pub struct Node {
     pub(crate) id: NodeId,
     pub(crate) version: VersionText,
     pub(crate) peers: Arc<Peers>,
-    pub(crate) store: Arc<Mutex<Store>>,
+    /// The store; each task works on a handle of its own (`with_store`).
+    pub(crate) store: Store,
     pub(crate) jobs: tokio::sync::Mutex<BTreeMap<JobId, Arc<tokio::sync::Mutex<Job>>>>,
     pub(crate) broken: Mutex<BTreeMap<JobId, String>>,
     endpoint: Endpoint,
@@ -155,8 +156,9 @@ impl Node {
             tracing::warn!(error = %e, "the environment a client last sent does not read; the node uses its own until a client sends one");
             None
         });
-        // One stat on the start path: the authority's thread opens and
-        // recovers an existing journal on its own, and makes none.
+        // One stat on the start path. The authority's thread starts only
+        // for an existing journal, which it opens and recovers on its own,
+        // or with the first managed command; it makes no journal.
         let authority = crate::authority::Authority::start(&cfg.state, identity.node_id())
             .map_err(|e| NodeError::io(crate::authority::managed_dir(&cfg.state), e))?;
         let node = Arc::new(Self {
@@ -164,7 +166,7 @@ impl Node {
             cfg,
             version,
             peers,
-            store: Arc::new(Mutex::new(store)),
+            store,
             jobs: tokio::sync::Mutex::new(jobs),
             broken: Mutex::new(broken),
             endpoint,
@@ -777,27 +779,27 @@ fn load_jobs(state: &StateDir) -> Result<(Jobs, BTreeMap<JobId, String>), NodeEr
 /// A live stream of every job's events (C2) is this sink made a broadcast.
 #[derive(Debug, Default)]
 pub(crate) struct Out {
-    live: Option<tokio::sync::mpsc::UnboundedSender<Event>>,
+    live: Option<crate::control::Live>,
     /// The events kept when no client streams them.
     pub(crate) events: Vec<Event>,
 }
 
 impl Out {
-    /// A sink that sends each event to a client's connection as it is made.
-    pub(crate) fn streaming(live: tokio::sync::mpsc::UnboundedSender<Event>) -> Self {
+    /// A sink that sends each event to a client's connection as it is
+    /// made, within the backlog a client that does not read may hold.
+    pub(crate) fn streaming(live: crate::control::Live) -> Self {
         Self {
             live: Some(live),
             events: Vec::new(),
         }
     }
 
-    /// Reports an event.
+    /// Reports an event. Never waits on a client: one that left gets no
+    /// more events, and one that stopped reading loses those past its
+    /// backlog; the command runs on.
     pub(crate) fn emit(&mut self, event: Event) {
         match &self.live {
-            // A client that left gets no more events; the command runs on.
-            Some(live) => {
-                let _ = live.send(event);
-            }
+            Some(live) => live.send(event),
             None => self.events.push(event),
         }
     }

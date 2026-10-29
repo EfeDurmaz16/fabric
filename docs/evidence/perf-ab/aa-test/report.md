@@ -1,0 +1,132 @@
+### Timed pairs
+
+Medians in ms; ratio is the median of the pairs' candidate/anchor ratios, with its 95% bootstrap interval. Slower or faster only when the interval excludes 1.
+
+| op | pairs | anchor | candidate | ratio | 95% interval | verdict |
+|---|---:|---:|---:|---:|---|---|
+| acp new | 15 | 154.0 | 157.0 | 1.031 | 0.995 to 1.061 | not shown, median above 1 |
+| acp launch | 15 | 70.5 | 69.4 | 0.974 | 0.953 to 0.999 | faster |
+| acp approve | 15 | 16.7 | 15.8 | 0.958 | 0.915 to 1.027 | not shown |
+| claude new | 15 | 140.1 | 138.4 | 0.979 | 0.972 to 1.002 | not shown |
+| claude launch | 15 | 95.0 | 95.2 | 1.004 | 0.963 to 1.035 | not shown, median above 1 |
+| claude approve | 15 | 16.8 | 16.8 | 1.005 | 0.986 to 1.045 | not shown, median above 1 |
+| codex new | 15 | 137.0 | 139.3 | 1.009 | 0.996 to 1.029 | not shown, median above 1 |
+| codex launch | 15 | 106.3 | 106.5 | 0.974 | 0.940 to 1.037 | not shown |
+| codex approve | 15 | 16.9 | 16.8 | 0.987 | 0.979 to 1.017 | not shown |
+| ledger append | 15 | 17.2 | 17.0 | 0.997 | 0.950 to 1.059 | not shown |
+| cli version | 15 | 3.4 | 3.9 | 1.048 | 0.879 to 1.123 | not shown, median above 1 |
+| cli ls | 15 | 5.5 | 5.4 | 0.998 | 0.902 to 1.133 | not shown |
+| acp suspend | 15 | 360.0 | 360.9 | 0.991 | 0.978 to 1.018 | not shown |
+| acp move | 15 | 164.8 | 168.9 | 0.980 | 0.958 to 1.050 | not shown |
+| acp resume | 15 | 655.1 | 665.9 | 1.002 | 0.995 to 1.011 | not shown, median above 1 |
+| acp pull | 15 | 1206.0 | 1208.5 | 1.002 | 0.993 to 1.007 | not shown, median above 1 |
+| claude suspend | 15 | 434.8 | 434.8 | 0.998 | 0.986 to 1.025 | not shown |
+| claude move | 15 | 163.1 | 159.0 | 0.976 | 0.951 to 1.027 | not shown |
+| claude resume | 15 | 805.8 | 829.3 | 1.007 | 0.989 to 1.028 | not shown, median above 1 |
+| claude pull | 15 | 1432.9 | 1473.2 | 1.006 | 0.982 to 1.029 | not shown, median above 1 |
+| codex suspend | 15 | 656.6 | 655.9 | 0.993 | 0.986 to 1.017 | not shown |
+| codex move | 15 | 172.3 | 164.8 | 0.975 | 0.922 to 1.038 | not shown |
+| codex resume | 15 | 1065.6 | 1079.4 | 1.000 | 0.995 to 1.024 | not shown, median above 1 |
+| codex pull | 15 | 1869.6 | 1865.7 | 1.006 | 0.989 to 1.018 | not shown, median above 1 |
+| cold start | 15 | 48.7 | 60.8 | 0.996 | 0.945 to 1.256 | not shown |
+| restart | 15 | 349.9 | 355.8 | 1.001 | 0.991 to 1.018 | not shown, median above 1 |
+
+### Counted ops
+
+Medians over the counted runs, anchor -> candidate, of all `fabric` processes of the side while the op ran.
+
+| op | spawns | full flushes | fsyncs | journal+ledger bytes written | state bytes read | allocations | CLI peak RSS KiB | CLI CPU ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| acp new | 3 -> 3 | 8 -> 8 | 0 -> 0 | 143 -> 143 | 143 -> 143 | 38971 -> 38962 | 14272 -> 14384 | 19.5 -> 20.0 |
+| acp launch | 4 -> 4 | 15 -> 15 | 0 -> 0 | 135 -> 135 | 1186 -> 1186 | 4135 -> 4134 | 14416 -> 14416 | 12.4 -> 12.3 |
+| acp approve | 0 -> 0 | 3 -> 3 | 0 -> 0 | 98 -> 98 | 0 -> 0 | 1195 -> 1192 | 10560 -> 10592 | 9.5 -> 9.5 |
+| claude new | 3 -> 3 | 8 -> 8 | 0 -> 0 | 124 -> 124 | 124 -> 124 | 1674 -> 1673 | 10816 -> 10816 | 9.6 -> 9.3 |
+| claude launch | 4 -> 4 | 15 -> 15 | 0 -> 0 | 116 -> 116 | 1100 -> 1100 | 3531 -> 3537 | 14192 -> 14224 | 11.9 -> 12.2 |
+| claude approve | 0 -> 0 | 3 -> 3 | 0 -> 0 | 98 -> 98 | 0 -> 0 | 1191 -> 1193 | 10560 -> 10576 | 9.6 -> 9.2 |
+| codex new | 3 -> 3 | 8 -> 8 | 0 -> 0 | 124 -> 124 | 124 -> 124 | 1671 -> 1674 | 10784 -> 10784 | 11.0 -> 9.4 |
+| codex launch | 4 -> 4 | 17 -> 17 | 0 -> 0 | 116 -> 116 | 685 -> 685 | 3847 -> 3846 | 14128 -> 14112 | 12.5 -> 12.4 |
+| codex approve | 0 -> 0 | 3 -> 3 | 0 -> 0 | 98 -> 98 | 0 -> 0 | 1192 -> 1194 | 10560 -> 10576 | 9.3 -> 9.1 |
+| ledger append | 0 -> 0 | 3 -> 3 | 0 -> 0 | 98 -> 98 | 0 -> 0 | 1201 -> 1204 | 10528 -> 10576 | 8.3 -> 8.4 |
+| cli version | 0 -> 0 | 0 -> 0 | 0 -> 0 | 0 -> 0 | 0 -> 0 | 201 -> 201 | 4928 -> 4928 | 5.2 -> 5.5 |
+| cli ls | 0 -> 0 | 0 -> 0 | 0 -> 0 | 0 -> 0 | 0 -> 0 | 1574 -> 1538 | 10768 -> 10800 | 9.1 -> 9.2 |
+| acp suspend | 36 -> 36 | 39 -> 39 | 9 -> 9 | 522 -> 522 | 39972 -> 40081 | 15001 -> 15003 | 11280 -> 11296 | 9.9 -> 10.0 |
+| acp move | 42 -> 42 | 15 -> 15 | 0 -> 0 | 520 -> 520 | 5246 -> 5246 | 8332 -> 8329 | 11904 -> 11904 | 10.6 -> 10.7 |
+| acp resume | 32 -> 32 | 24 -> 24 | 51 -> 51 | 167 -> 167 | 15993 -> 16088 | 11179 -> 11220 | 14624 -> 14576 | 12.3 -> 12.5 |
+| acp pull | 111 -> 111 | 81 -> 81 | 59 -> 59 | 1376 -> 1376 | 33119 -> 33349 | 30384 -> 31288 | 14800 -> 14768 | 13.7 -> 12.7 |
+| claude suspend | 35 -> 35 | 41 -> 41 | 8 -> 8 | 522 -> 522 | 13271 -> 13269 | 19226 -> 19250 | 11264 -> 11264 | 10.3 -> 10.2 |
+| claude move | 42 -> 42 | 15 -> 15 | 0 -> 0 | 520 -> 520 | 5411 -> 5294 | 8251 -> 8237 | 11856 -> 11888 | 10.6 -> 10.6 |
+| claude resume | 34 -> 34 | 24 -> 24 | 55 -> 55 | 148 -> 148 | 21652 -> 21671 | 11112 -> 11095 | 14736 -> 14768 | 15.0 -> 14.5 |
+| claude pull | 114 -> 114 | 83 -> 83 | 63 -> 63 | 1338 -> 1338 | 41598 -> 41737 | 36359 -> 36346 | 14960 -> 14896 | 16.7 -> 15.7 |
+| codex suspend | 37 -> 37 | 40 -> 40 | 8 -> 8 | 522 -> 522 | 14409 -> 14395 | 16371 -> 16246 | 11264 -> 11264 | 9.6 -> 9.7 |
+| codex move | 42 -> 42 | 15 -> 15 | 0 -> 0 | 520 -> 520 | 5334 -> 5324 | 8242 -> 8236 | 11920 -> 11856 | 10.4 -> 10.0 |
+| codex resume | 35 -> 35 | 24 -> 24 | 59 -> 59 | 148 -> 148 | 25782 -> 25897 | 11248 -> 11251 | 14736 -> 14800 | 14.2 -> 13.6 |
+| codex pull | 117 -> 117 | 82 -> 82 | 67 -> 67 | 1338 -> 1338 | 46864 -> 46903 | 32646 -> 32650 | 15056 -> 14992 | 14.6 -> 14.4 |
+| cold start | 0 -> 0 | 8 -> 8 | 5 -> 5 | 0 -> 0 | 45222 -> 45222 | 5932 -> 5905 | 10464 -> 10432 | 31.3 -> 36.3 |
+| restart | 0 -> 0 | 38 -> 38 | 0 -> 0 | 463 -> 463 | 505745 -> 476905 | 16467 -> 16473 | 11072 -> 10976 | 79.9 -> 78.3 |
+
+### Counters that differ
+
+Every counter whose median differs between the builds, per op, anchor -> candidate. `spawn:<program>` counts the starts of one program; `<counter>.<class>` splits reads, writes and flushes (`syncs`) by the file they touch.
+
+- acp new: cli_cpu_us 19524 -> 19971, cli_maxrss_kib 14272 -> 14384, frees 28142 -> 28134, malloc_bytes 13541176 -> 13540331, mallocs 38971 -> 38962
+- acp launch: cli_cpu_us 12389 -> 12259, malloc_bytes 719524 -> 719525, mallocs 4135 -> 4134
+- acp approve: cli_cpu_us 9530 -> 9542, cli_maxrss_kib 10560 -> 10592, frees 1036 -> 1033, malloc_bytes 323831 -> 323642, mallocs 1195 -> 1192
+- claude new: cli_cpu_us 9601 -> 9259, frees 1410 -> 1408, malloc_bytes 391465 -> 390956, mallocs 1674 -> 1673
+- claude launch: cli_cpu_us 11941 -> 12204, cli_maxrss_kib 14192 -> 14224, malloc_bytes 605087 -> 605589, mallocs 3531 -> 3537
+- claude approve: cli_cpu_us 9623 -> 9242, cli_maxrss_kib 10560 -> 10576, frees 1033 -> 1034, malloc_bytes 323383 -> 323962, mallocs 1191 -> 1193
+- codex new: cli_cpu_us 10979 -> 9370, frees 1407 -> 1410, malloc_bytes 390769 -> 391092, mallocs 1671 -> 1674
+- codex launch: cli_cpu_us 12458 -> 12430, cli_maxrss_kib 14128 -> 14112, frees 3423 -> 3422, malloc_bytes 696925 -> 696480, mallocs 3847 -> 3846
+- codex approve: cli_cpu_us 9313 -> 9127, cli_maxrss_kib 10560 -> 10576, frees 1034 -> 1036, malloc_bytes 323703 -> 323578, mallocs 1192 -> 1194
+- ledger append: cli_cpu_us 8341 -> 8444, cli_maxrss_kib 10528 -> 10576, frees 1041 -> 1043, malloc_bytes 324663 -> 325818, mallocs 1201 -> 1204
+- cli version: cli_cpu_us 5169 -> 5524, malloc_bytes 88361 -> 88364
+- cli ls: cli_cpu_us 9088 -> 9244, cli_maxrss_kib 10768 -> 10800, frees 1375 -> 1340, malloc_bytes 371786 -> 369037, mallocs 1574 -> 1538
+- acp suspend: cli_cpu_us 9935 -> 9976, cli_maxrss_kib 11280 -> 11296, frees 10351 -> 10350, malloc_bytes 3550102 -> 3549680, mallocs 15001 -> 15003, read_bytes.store 37583 -> 37692, write_bytes.jobs 3592 -> 3586, write_bytes.store 95692 -> 95738
+- acp move: cli_cpu_us 10638 -> 10744, malloc_bytes 2017024 -> 2017413, mallocs 8332 -> 8329, read_bytes.jobs 4135 -> 4115, read_bytes.store 1111 -> 1131, write_bytes.ipc 2697 -> 2698
+- acp resume: cli_cpu_us 12290 -> 12505, cli_maxrss_kib 14624 -> 14576, frees 8975 -> 9011, malloc_bytes 4355162 -> 4358168, mallocs 11179 -> 11220, read_bytes.jobs 3554 -> 3556, read_bytes.store 12317 -> 12410, read_calls.ipc 172 -> 173, write_bytes.jobs 3554 -> 3558, write_bytes.store 4531 -> 4532
+- acp pull: cli_cpu_us 13725 -> 12675, cli_maxrss_kib 14800 -> 14768, frees 23384 -> 23431, malloc_bytes 8814685 -> 9048920, mallocs 30384 -> 31288, read_bytes.ipc 11100 -> 11102, read_bytes.jobs 8549 -> 8544, read_bytes.store 24396 -> 24631, write_bytes.ipc 4624 -> 4625, write_bytes.jobs 8408 -> 8405, write_bytes.store 59964 -> 60000
+- claude suspend: cli_cpu_us 10284 -> 10156, frees 13992 -> 14017, malloc_bytes 3668535 -> 3670527, mallocs 19226 -> 19250, read_bytes.ipc 5237 -> 5236, read_bytes.store 9508 -> 9506, write_bytes.jobs 4758 -> 4753, write_bytes.store 79460 -> 54740, write_calls.store 45 -> 33
+- claude move: cli_cpu_us 10560 -> 10580, cli_maxrss_kib 11856 -> 11888, malloc_bytes 2009460 -> 2007513, mallocs 8251 -> 8237, opens 75 -> 73, read_bytes.jobs 4058 -> 4090, read_bytes.state 148 -> 0, read_bytes.store 1205 -> 1204, read_calls.state 4 -> 0, write_bytes.ipc 2361 -> 2362
+- claude resume: cli_cpu_us 14988 -> 14540, cli_maxrss_kib 14736 -> 14768, frees 9149 -> 9138, malloc_bytes 4373414 -> 4372179, mallocs 11112 -> 11095, read_bytes.jobs 8579 -> 8593, read_bytes.store 12951 -> 12956, read_calls.ipc 179 -> 178, write_bytes.jobs 4681 -> 4702, write_bytes.store 4531 -> 4530
+- claude pull: cli_cpu_us 16743 -> 15738, cli_maxrss_kib 14960 -> 14896, frees 27968 -> 27961, malloc_bytes 9187754 -> 9184985, mallocs 36359 -> 36346, opens 458 -> 460, read_bytes.ipc 10599 -> 10602, read_bytes.jobs 15724 -> 15723, read_bytes.state 174 -> 322, read_bytes.store 25700 -> 25692, read_calls.state 4 -> 8, write_bytes.ipc 4278 -> 4279, write_bytes.jobs 10891 -> 10885, write_bytes.store 93110 -> 60134, write_calls.store 55 -> 39
+- codex suspend: cli_cpu_us 9608 -> 9664, frees 11781 -> 11720, malloc_bytes 3837547 -> 3754028, mallocs 16371 -> 16246, read_bytes.store 9828 -> 9814, write_bytes.jobs 5651 -> 5652, write_bytes.store 71574 -> 63350, write_calls.store 41 -> 37
+- codex move: cli_cpu_us 10398 -> 9956, cli_maxrss_kib 11920 -> 11856, frees 6788 -> 6777, malloc_bytes 2007739 -> 2007337, mallocs 8242 -> 8236, read_bytes.jobs 4098 -> 4090, read_bytes.store 1236 -> 1234, write_bytes.ipc 2361 -> 2362
+- codex resume: cli_cpu_us 14234 -> 13553, cli_maxrss_kib 14736 -> 14800, frees 9310 -> 9313, malloc_bytes 4479004 -> 4479607, mallocs 11248 -> 11251, opens 292 -> 294, read_bytes.jobs 12199 -> 12201, read_bytes.state 122 -> 270, read_bytes.store 13461 -> 13426, read_calls.ipc 182 -> 181, read_calls.state 4 -> 8, write_bytes.jobs 5634 -> 5621, write_bytes.store 4533 -> 4535
+- codex pull: cli_cpu_us 14554 -> 14430, cli_maxrss_kib 15056 -> 14992, frees 25211 -> 25218, malloc_bytes 9332151 -> 9334844, mallocs 32646 -> 32650, opens 509 -> 511, read_bytes.ipc 10766 -> 10765, read_bytes.jobs 20093 -> 20119, read_bytes.state 174 -> 322, read_bytes.store 26597 -> 26462, read_calls.state 4 -> 8, write_bytes.ipc 4212 -> 4213, write_bytes.jobs 12659 -> 12689, write_bytes.store 93456 -> 85185, write_calls.store 55 -> 51
+- cold start: cli_cpu_us 31284 -> 36289, cli_maxrss_kib 10464 -> 10432, frees 4462 -> 4435, malloc_bytes 1661698 -> 1659345, mallocs 5932 -> 5905
+- restart: cli_cpu_us 79856 -> 78274, cli_maxrss_kib 11072 -> 10976, frees 12341 -> 12339, malloc_bytes 4074957 -> 4076237, mallocs 16467 -> 16473, read_bytes.store 482076 -> 453236, read_calls.store 119 -> 112, write_bytes.ipc 3695 -> 3458, write_calls.ipc 53 -> 49
+
+### Daemon resident size, counted runs
+
+KiB after each counted op, every page in memory, the clean pages of the binary too, both builds with the counter library loaded: the number of ops, median and largest per build, and the median of the ops' ratios with its 95% bootstrap interval.
+
+| daemon | ops | anchor median | anchor max | candidate median | candidate max | ratio | 95% interval |
+|---|---:|---:|---:|---:|---:|---:|---|
+| a | 78 | 24640 | 28608 | 24744 | 28576 | 1.000 | 0.999 to 1.001 |
+| b | 78 | 26416 | 27200 | 27000 | 27776 | 1.018 | 1.014 to 1.021 |
+
+### Daemon physical footprint, counted runs
+
+KiB after each counted op, the pages the daemon dirtied, compressed ones included, as `footprint(1)` reports them; the clean pages of the binary are not in it, both builds with the counter library loaded: the number of ops, median and largest per build, and the median of the ops' ratios with its 95% bootstrap interval.
+
+| daemon | ops | anchor median | anchor max | candidate median | candidate max | ratio | 95% interval |
+|---|---:|---:|---:|---:|---:|---:|---|
+| a | 78 | 6496 | 10336 | 6584 | 10368 | 1.012 | 1.006 to 1.016 |
+| b | 78 | 9632 | 10784 | 9952 | 11120 | 1.058 | 1.043 to 1.061 |
+
+### Daemon resident size
+
+KiB after each timed run, every page in memory, the clean pages of the binary too: median and largest per build, and the median of the pairs' ratios with its 95% bootstrap interval.
+
+| daemon | anchor median | anchor max | candidate median | candidate max | ratio | 95% interval |
+|---|---:|---:|---:|---:|---:|---|
+| daemon a | 19984 | 20368 | 19904 | 20352 | 0.997 | 0.994 to 0.999 |
+| daemon b | 27856 | 28608 | 28112 | 28816 | 1.008 | 1.002 to 1.011 |
+
+### Daemon physical footprint
+
+KiB after each timed run, the pages the daemon dirtied, compressed ones included, as `footprint(1)` reports them; the clean pages of the binary are not in it: median and largest per build, and the median of the pairs' ratios with its 95% bootstrap interval.
+
+| daemon | anchor median | anchor max | candidate median | candidate max | ratio | 95% interval |
+|---|---:|---:|---:|---:|---:|---|
+| daemon a | 4992 | 5392 | 4912 | 5376 | 0.984 | 0.974 to 0.994 |
+| daemon b | 11568 | 12576 | 11920 | 12992 | 1.027 | 0.991 to 1.032 |

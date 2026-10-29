@@ -31,6 +31,7 @@ import {
   HelloAnswer,
   LEDGER_EVENT_KINDS,
   LedgerEvent,
+  REPAIR_OUTCOME_KINDS,
   Marker,
   OPS,
   Outcome,
@@ -437,6 +438,9 @@ describe("the shared fixtures", () => {
         case "harness_session":
           harness(value.harness);
           break;
+        case "job_repair":
+          mark("RepairOutcome", value.outcome.kind);
+          break;
         default:
           break;
       }
@@ -478,7 +482,12 @@ describe("the shared fixtures", () => {
     roundTrip("event", Event).forEach(event);
     roundTrip("refusal", Refusal).forEach(refusal);
 
-    const variants = { ...CLOSED, CaptureNote: CAPTURE_NOTES, LedgerEvent: LEDGER_EVENT_KINDS };
+    const variants = {
+      ...CLOSED,
+      CaptureNote: CAPTURE_NOTES,
+      LedgerEvent: LEDGER_EVENT_KINDS,
+      RepairOutcome: REPAIR_OUTCOME_KINDS,
+    };
     expect([...seen.keys()].sort()).toStrictEqual(Object.keys(variants).sort());
     for (const [name, known] of Object.entries(variants)) {
       expect([...(seen.get(name) ?? [])].sort(), name).toStrictEqual([...known].sort());

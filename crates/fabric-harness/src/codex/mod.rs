@@ -152,7 +152,13 @@ pub struct Codex {
     path_var: OsString,
     overrides: Option<CodexOverrides>,
     known_writer: Option<HarnessVersion>,
+    /// The installed version, asked ahead for a restore (`with_installed_ahead`).
+    installed_ahead: Option<VersionAhead>,
+    /// The resume guard's `--version`, asked ahead (`with_guard_ahead`).
+    guard_ahead: Option<VersionAhead>,
 }
+
+pub use crate::version::VersionAhead;
 
 /// Holds Codex's writer lock for a thread; removes the lock file on drop
 /// under the coordination lock, as Codex does.
@@ -349,7 +355,52 @@ impl Codex {
             path_var,
             overrides: None,
             known_writer: None,
+            installed_ahead: None,
+            guard_ahead: None,
         }
+    }
+
+    /// Starts asking the installed `codex` its version, from this
+    /// process's directory, as a restore asks it before it places a
+    /// thread; hand the answer to the adapter that restores with
+    /// `with_installed_ahead`.
+    #[must_use]
+    pub fn ask_installed_ahead(&self) -> VersionAhead {
+        VersionAhead::installed(self.binary().ok(), self.path_var.clone(), PROGRAM)
+    }
+
+    /// Takes the installed version from `ahead` when it asked what this
+    /// adapter would ask, and asks again otherwise.
+    #[must_use]
+    pub fn with_installed_ahead(mut self, ahead: VersionAhead) -> Self {
+        self.installed_ahead = Some(ahead);
+        self
+    }
+
+    /// Starts the resume guard's `--version` of the `codex` a launch in
+    /// `workspace` with `env` would start, run there with that environment,
+    /// as the guard runs it; hand it to the launching adapter with
+    /// `with_guard_ahead`.
+    pub fn ask_guard_ahead(
+        &self,
+        workspace: &Path,
+        env: &[(EnvVarName, String)],
+    ) -> Result<VersionAhead, HarnessError> {
+        let root = pipeline::physical_workspace(workspace)?;
+        Ok(VersionAhead::reported(
+            self.binary()?,
+            pipeline::fs_path(&root).to_path_buf(),
+            env.to_vec(),
+        ))
+    }
+
+    /// Takes the resume guard's `--version` from `ahead` when it asked the
+    /// binary, directory and environment the launch uses, and asks again
+    /// otherwise.
+    #[must_use]
+    pub fn with_guard_ahead(mut self, ahead: VersionAhead) -> Self {
+        self.guard_ahead = Some(ahead);
+        self
     }
 
     /// Reads Codex's state from `dir` instead of `home/.codex`; refused
@@ -834,7 +885,13 @@ impl Codex {
     async fn restore_impl(&self, workspace: &Path, state: &Path) -> Result<Restored, HarnessError> {
         let root = pipeline::physical_workspace(workspace)?;
         let manifest = pipeline::open(state, &HarnessKind::Codex, &root, &self.home)?;
-        let version = process::installed_version(self.binary().ok(), &self.path_var, PROGRAM).await;
+        let version = crate::version::installed_version(
+            self.installed_ahead.as_ref(),
+            self.binary().ok(),
+            &self.path_var,
+            PROGRAM,
+        )
+        .await;
         self.refuse_lockless_writers(version.as_deref()).await?;
         let adapter = self.clone();
         let state = state.to_path_buf();
@@ -876,8 +933,14 @@ impl Codex {
             Some(writer) => {
                 let cwd = pipeline::fs_path(root);
                 Some(
-                    crate::version::refuse_older(PROGRAM, binary, cwd, env, session, writer)
-                        .await?,
+                    crate::version::refuse_older(
+                        PROGRAM,
+                        (binary, cwd, env),
+                        self.guard_ahead.as_ref(),
+                        session,
+                        writer,
+                    )
+                    .await?,
                 )
             }
             None => None,

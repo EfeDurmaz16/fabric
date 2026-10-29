@@ -232,6 +232,39 @@ pub struct PendingSession {
     pub record: SessionRecord,
 }
 
+/// A snapshot this node keeps for a job although the job's ledger does not
+/// name it, with every snapshot its bundle needs (ADR 0003, Orphans).
+///
+/// The store keeps every snapshot it holds until one is forgotten, and
+/// refuses to forget a bundle base a later snapshot needs; a pin says
+/// that no pass that forgets snapshots the ledger no longer names may
+/// forget these. Nothing forgets snapshots yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pin {
+    /// The snapshot.
+    pub snapshot: SnapshotId,
+    /// It and each bundle base it needs, in order, to its full bundle.
+    pub chain: Vec<SnapshotId>,
+    /// Why it is kept.
+    pub why: PinWhy,
+}
+
+/// Why a snapshot is pinned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PinWhy {
+    /// `fabric job export` captured an orphan workspace at this root.
+    Exported {
+        /// The workspace.
+        root: PathBuf,
+    },
+    /// A record of this node's chain published it, and a fork repair took
+    /// another chain; the old ledger is kept at `kept`.
+    ForkLost {
+        /// The old ledger.
+        kept: PathBuf,
+    },
+}
+
 /// Reads a node-local file, or `None` when it does not exist.
 pub fn read<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, LocalError> {
     let bytes = match std::fs::read(path) {
@@ -281,7 +314,26 @@ pub fn remove(path: &Path) -> Result<(), LocalError> {
     }
 }
 
-/// The program that reads a process's start time and group.
+/// Removes a node-local file without flushing its directory, so a crash
+/// can bring it back; an absent one is already removed.
+///
+/// Only for a file whose return after a crash is harmless because every
+/// reader checks it again: a harness record, whose process each reader
+/// asks for by pid and start time (`HarnessRecord::liveness`), so a record
+/// that comes back names a process that is gone. It saves a full flush of
+/// the directory at every harness's exit.
+pub fn remove_unflushed(path: &Path) -> Result<(), LocalError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(LocalError::Io {
+            path: path.to_owned(),
+            source,
+        }),
+    }
+}
+
+/// The program that reads a process's start time.
 const PS: &str = "ps";
 
 /// The kernel's start time of `pid` as `ps -o lstart=` prints it, and on
@@ -389,26 +441,39 @@ fn leader_pid(pid: NonZeroU32) -> Option<Pid> {
 /// True when `pid` leads its own process group, as a launched harness does.
 ///
 /// A harness that already exited and that the CLI, its parent, has not
-/// reaped yet counts: a headless harness can finish its turn before the
-/// CLI registers it, and its group may still hold what it started.
-/// `getpgid` does not answer for such a process; `ps` does.
-pub async fn leads_group(pid: NonZeroU32) -> bool {
+/// reaped yet counts: a launch can end before the CLI registers it, as a
+/// held harness stopped by a signal does, and its group may still hold
+/// what it started. Linux's `getpgid` answers for such a process. macOS's
+/// does not, and refuses it as absent, so there a process that `kill(pid,
+/// 0)` still finds (macOS answers it for a zombie) leads its group when a
+/// group with its id exists: a group takes its leader's pid as its id, and
+/// that pid is not given out again while the group exists. `kill(-pid,
+/// 0)` says the group exists by succeeding, or by `EPERM` when the group
+/// holds only processes that cannot be signalled, a zombie among them.
+/// Nothing is started to answer, as `ps -o pgid=` was.
+pub fn leads_group(pid: NonZeroU32) -> bool {
     let Some(leader) = leader_pid(pid) else {
         return false;
     };
-    let Ok(output) = tokio::process::Command::new("ps")
-        .args(["-o", "pgid=", "-p", &pid.to_string()])
-        .env("LC_ALL", "C")
-        .output()
-        .await
-    else {
-        return false;
-    };
-    output.status.success()
-        && String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse::<i32>()
-            == Ok(leader.as_raw_nonzero().get())
+    match rustix::process::getpgid(Some(leader)) {
+        Ok(group) => group == leader,
+        Err(rustix::io::Errno::SRCH) => {
+            rustix::process::test_kill_process(leader).is_ok() && group_id_taken(leader)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Whether a process group with id `group` exists, zombies counted:
+/// `kill(-group, 0)` succeeds, or is refused with `EPERM`, which says the
+/// group exists and holds nothing this process may signal. Liveness asks
+/// a narrower question (`HarnessRecord::group_exists`): whether anything
+/// of the group still runs.
+fn group_id_taken(group: Pid) -> bool {
+    matches!(
+        rustix::process::test_kill_process_group(group),
+        Ok(()) | Err(rustix::io::Errno::PERM)
+    )
 }
 
 impl HarnessRecord {
@@ -421,7 +486,16 @@ impl HarnessRecord {
     }
 
     async fn liveness_with(&self, ps: &str) -> Liveness {
-        match probe_started(ps, self.pid).await {
+        // No process holds the pid, not even an unreaped one, so `ps`
+        // would find none either: the answer is its `Absent` branch,
+        // without starting it, as at a harness's exit, which the CLI
+        // reports after it reaped the harness.
+        let started = if self.is_absent() {
+            Started::Absent
+        } else {
+            probe_started(ps, self.pid).await
+        };
+        match started {
             Started::At(started) if started == self.started => Liveness::Leader,
             Started::Absent if self.group_exists() => Liveness::Group,
             // A failed probe cannot tell this group from one another
@@ -429,6 +503,14 @@ impl HarnessRecord {
             Started::Unknown if self.group_exists() => Liveness::Unknown,
             Started::At(_) | Started::Absent | Started::Unknown => Liveness::Gone,
         }
+    }
+
+    /// True when no process has the recorded pid: `kill(pid, 0)` finds
+    /// none. A zombie still has it, on Linux and on macOS alike.
+    fn is_absent(&self) -> bool {
+        self.group().is_some_and(|pid| {
+            rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH)
+        })
     }
 
     /// The group to signal; never group 1, because `kill(-1)` signals every process.
@@ -619,14 +701,14 @@ mod tests {
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(leads_group(pid).await);
+        assert!(leads_group(pid));
         leader.wait().unwrap();
         let mut member = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
             .unwrap();
         assert!(
-            !leads_group(NonZeroU32::new(member.id()).unwrap()).await,
+            !leads_group(NonZeroU32::new(member.id()).unwrap()),
             "a process in the test's group leads no group"
         );
         member.kill().unwrap();
@@ -661,6 +743,42 @@ mod tests {
         let child = Pid::from_raw(child).unwrap();
         assert!(
             rustix::process::test_kill_process(child).is_err(),
+            "the background process outlived the stop"
+        );
+    }
+
+    /// A harness the CLI reaped holds no pid any more, so its liveness is
+    /// read without `ps`: the record stands for the group while a process
+    /// it started runs, even where `ps` cannot be run at all.
+    #[tokio::test]
+    async fn a_reaped_leader_is_read_without_ps() {
+        let no_ps = "/nonexistent/fabric-test-ps";
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("child");
+        let mut leader = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("sleep 30 & echo $! > {}", pid_file.display()))
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let started = process_started(NonZeroU32::new(leader.id().unwrap()).unwrap())
+            .await
+            .unwrap();
+        let record = record_of(&leader, started);
+        leader.wait().await.unwrap();
+        assert_eq!(record.liveness_with(no_ps).await, Liveness::Group);
+        record
+            .stop_with(Duration::from_secs(5), no_ps)
+            .await
+            .unwrap();
+        assert_eq!(record.liveness_with(no_ps).await, Liveness::Gone);
+        let child: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            rustix::process::test_kill_process(Pid::from_raw(child).unwrap()).is_err(),
             "the background process outlived the stop"
         );
     }

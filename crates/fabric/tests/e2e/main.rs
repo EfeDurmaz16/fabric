@@ -9,11 +9,13 @@
 //! `terminal` runs a Codex job under a pseudo-terminal, `headless`
 //! runs Claude and Codex turns without one, and `client` drives a node
 //! through `fabric-client` instead of the CLI. `budget` times the hot
-//! paths against `budget.toml`, and `bench` times the paths the durable
-//! job work touches, with no budget. `acp_cli` and `preflight` hold the
+//! paths against `budget.toml`, `bench` times the paths the durable
+//! job work touches, with no budget, and `ab` compares two builds of
+//! `fabric` op by op on the same fixture. `acp_cli` and `preflight` hold the
 //! tests of M2 defects M2-01 and M2-02, `managed` the managed job
 //! acceptance tests, and `legacy` loads a state directory frozen from main.
 
+mod ab;
 mod acp_cli;
 mod bench;
 mod budget;
@@ -52,7 +54,16 @@ struct Pair {
 /// the second. They report the Node versions the gate Macs had, 22 on the
 /// first and 26 on the second, so every move crosses Node majors.
 fn setup(wire: Wire, fault_a: Option<&str>, fault_b: Option<&str>) -> Fallible<Pair> {
-    let env = Env::new()?;
+    setup_in(Env::new()?, wire, fault_a, fault_b)
+}
+
+/// `setup` on the fixture `env`.
+fn setup_in(
+    env: std::sync::Arc<Env>,
+    wire: Wire,
+    fault_a: Option<&str>,
+    fault_b: Option<&str>,
+) -> Fallible<Pair> {
     let mut a = Node::new(&env, "a", wire)?;
     let mut b = Node::new(&env, "b", wire)?;
     a.fake_node("v22.23.2", "127")?;
@@ -176,8 +187,11 @@ const DECISIONS: [&str; 3] = [
 ];
 
 fn move_and_resume(wire: Wire) -> Fallible {
-    let p = setup(wire, None, None)?;
-    let (job, work) = job_with_work(&p)?;
+    move_and_resume_in(&setup(wire, None, None)?)
+}
+
+fn move_and_resume_in(p: &Pair) -> Fallible {
+    let (job, work) = job_with_work(p)?;
     let doctor = p.a.ok(&["doctor", "--peer", &p.b.id, "--job", &job])?;
     assert!(doctor.contains("ok      home"), "{doctor}");
     assert!(doctor.contains("no snapshot yet"), "{doctor}");
@@ -208,7 +222,7 @@ fn move_and_resume(wire: Wire) -> Fallible {
     }
     assert!(!moved.contains("no harness session captured"), "{moved}");
     assert_one_owner(&p.b, &p.a, &job, 2, "departed")?;
-    let resumed = assert_continues(&p, &p.b, &job, &work, &["one"])?;
+    let resumed = assert_continues(p, &p.b, &job, &work, &["one"])?;
     for decision in DECISIONS {
         assert!(resumed.contains(decision), "resume: {decision}:\n{resumed}");
     }
@@ -270,6 +284,22 @@ fn e2e_a_job_moves_and_resumes_over_quic() -> Fallible {
 #[test]
 fn e2e_a_job_moves_and_resumes_over_tcp_tls() -> Fallible {
     move_and_resume(Wire::TcpTls)
+}
+
+/// The same move and way back with the repository on `master`, git's own
+/// default branch name. A restore's `git init` names the snapshot's branch,
+/// and one that set HEAD and its referent in one ref transaction failed on
+/// every repository whose branch was the one `git init` names (store-git,
+/// `a_repository_with_the_branch_git_init_names_restores`); every other
+/// fixture is on `main`.
+#[test]
+fn e2e_a_job_on_master_moves_and_resumes() -> Fallible {
+    move_and_resume_in(&setup_in(
+        Env::on_branch("master")?,
+        Wire::Quic,
+        None,
+        None,
+    )?)
 }
 
 /// Which node a step acts on.
@@ -631,6 +661,61 @@ fn e2e_a_steal_after_a_resume_freezes_the_owner_and_stops_its_harness() -> Falli
     Ok(())
 }
 
+/// R3: the owner frozen by a steal after its harness ran exports the
+/// orphan workspace into a pinned snapshot the ledger does not name, then
+/// `fabric job repair` takes the thief's chain by the fork rule, keeping
+/// the old ledger whole, and lifts the freeze; the thief has nothing to
+/// repair.
+#[test]
+fn e2e_a_frozen_owner_exports_its_orphan_and_repairs_the_fork() -> Fallible {
+    let p = setup(Wire::TcpTls, None, None)?;
+    let (job, _) = job_with_work(&p)?;
+    p.a.ok(&["job", "suspend", &job])?;
+    let (running, _pid) = p.a.run_lingering(&job)?;
+    p.b.ok(&["job", "steal", &job, "--force"])?;
+    let _ = finish(running, GIVE_UP)?;
+    assert_eq!(p.a.lease(&job)?.view, "frozen");
+
+    let exported = p.a.ok(&["job", "export", &job])?;
+    assert!(
+        exported.contains("as snapshot") && exported.contains("the job's head is unchanged"),
+        "{exported}"
+    );
+    let pins = fs::read_to_string(p.a.state().join("jobs").join(&job).join("pins"))?;
+    assert!(pins.contains("Exported"), "{pins}");
+
+    let repaired = p.a.ok(&["job", "repair", &job])?;
+    assert!(
+        repaired.contains(&format!(
+            "the fork rule picked {}'s chain at epoch 2",
+            p.b.id
+        )),
+        "{repaired}"
+    );
+    let kept: Vec<_> = fs::read_dir(p.a.state().join("jobs").join(&job))?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("ledger.forked-")
+        })
+        .collect();
+    assert_eq!(kept.len(), 1, "the old ledger was not kept");
+    let after = p.a.lease(&job)?;
+    assert_ne!(after.view, "frozen");
+    assert_eq!((after.owner, after.epoch), (p.b.id.clone(), 2));
+
+    let refused = p.b.run(&["job", "repair", &job])?;
+    assert_eq!(refused.status.code(), Some(1), "{}", text(&refused));
+    assert!(
+        text(&refused).contains("is not frozen"),
+        "{}",
+        text(&refused)
+    );
+    Ok(())
+}
+
 /// As above, with the owner's daemon up but out of reach when the steal
 /// happens, as a laptop on another network: nothing tells it, so its
 /// harness keeps running until the next `run` catches up with the thief,
@@ -887,9 +972,12 @@ fn e2e_a_run_ended_before_its_harness_is_recorded_stops_it() -> Fallible {
 
 /// Issue #17: a CLI killed by `SIGKILL` once the node holds its harness's
 /// registration cannot stop the harness, so only the hold keeps it from
-/// running. The CLI's death orphans the stopped group, which the kernel
-/// then ends with `SIGHUP`, so the harness never ran, nothing of its group
-/// outlives the CLI, and the next suspend finds no harness to stop.
+/// running. A headless or ACP trampoline waits for a line on a pipe whose
+/// write end only the CLI holds, so the CLI's death closes it and the shell
+/// reads end of file and exits without its exec; a terminal trampoline is
+/// stopped, and the kernel ends its orphaned group with `SIGHUP`. Either
+/// way the harness never ran, nothing of its group outlives the CLI, and
+/// the next suspend finds no harness to stop.
 fn assert_killed_before_record_leaves_nothing(
     p: &Pair,
     job: &str,

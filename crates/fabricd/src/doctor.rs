@@ -39,6 +39,7 @@ use fabric_env::detect::every_resume;
 use crate::carry::command;
 use crate::facts::{NodeFacts, Probes, Tool, major, name};
 use crate::paths::{SyncedFolders, check_root};
+use fabric_net::wire::{MAX_FACT_VALUE, MAX_FACTS};
 
 /// The clock difference above which mtime-keyed caches are suspect (ADR 0008).
 pub const CLOCK_SKEW_LIMIT_MS: i64 = 5_000;
@@ -164,23 +165,6 @@ fn row(
 /// again does, since leaving it out would lose it (`crate::carry`).
 const PLATFORM_NOTE: &str = "only a path nothing on the target can make again crosses; the carry lines say what happens to each path, ADR 0012";
 
-/// The tools a move or resume preflight measures on this node for a job
-/// under `harness` (issue #26): every row's, but a login only where it
-/// gates the move, which is the target's login for the job's harness. On a
-/// push the target is the peer, which measures its own; `fabric doctor`
-/// measures them all.
-#[must_use]
-pub fn probes(harness: &HarnessKind, target: Target) -> Probes {
-    let rows = Probes::ALL
-        .without(Tool::ClaudeLogin)
-        .without(Tool::CodexLogin);
-    match (target, harness) {
-        (Target::Here, HarnessKind::ClaudeCode) => rows.with(Tool::ClaudeLogin),
-        (Target::Here, HarnessKind::Codex) => rows.with(Tool::CodexLogin),
-        (Target::Here, HarnessKind::Acp { .. }) | (Target::Peer, _) => rows,
-    }
-}
-
 /// Compares this node's facts with a peer's, row by row (ADR 0008, the table).
 #[must_use]
 pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row> {
@@ -266,7 +250,77 @@ pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row
         outcome: Outcome::Equal,
         note: "the wire this session runs on".to_owned(),
     });
+    left_out_rows(&mut rows, peer, ctx.target);
     rows
+}
+
+/// Judges the rows of `compare` that read a fact the peer's answer left
+/// out (`judge_left_out`), and adds a row that says what it left out.
+fn left_out_rows(rows: &mut Vec<Row>, peer: &NodeFacts, target: Target) {
+    judge_left_out(rows, peer, target, |fact| {
+        matches!(
+            fact,
+            name::GIT
+                | name::LSOF
+                | name::CLAUDE_LOGIN
+                | name::CODEX_LOGIN
+                | name::ACP_AGENT
+                | name::ACP_STATE_DIR
+                | SYNCED
+        )
+    });
+    if let Some(left) = peer.get(name::LEFT_OUT) {
+        rows.push(Row {
+            fact: name::LEFT_OUT,
+            here: None,
+            peer: Some(left.to_owned()),
+            outcome: Outcome::Warn,
+            note: format!(
+                "the peer measured more than one answer holds, at most {MAX_FACTS} facts of at most {MAX_FACT_VALUE} bytes each, and left these out; a row that reads one cannot be judged and refuses"
+            ),
+        });
+    }
+}
+
+/// The fact of the row that says whether the target's iCloud Drive syncs the root.
+const SYNCED: &str = "icloud";
+
+/// Turns each row that reads a fact the peer's answer left out into a
+/// refusal that names that cause (M2-26): the row cannot be judged, and
+/// it would otherwise read the fact as one the peer does not have.
+/// `--force` waives it unless the row refuses without a waiver anyway. A
+/// row `judges_target` names reads the target's facts alone, so none of
+/// the peer's when this node is the target.
+fn judge_left_out(
+    rows: &mut [Row],
+    peer: &NodeFacts,
+    target: Target,
+    judges_target: impl Fn(&str) -> bool,
+) {
+    const ICLOUD: &[&str] = &[name::ICLOUD_DESKTOP, name::ICLOUD_DOCUMENTS, name::HOME];
+    if peer.get(name::LEFT_OUT).is_none() {
+        return;
+    }
+    for row in rows {
+        if target == Target::Here && judges_target(row.fact) {
+            continue;
+        }
+        let reads: &[&str] = match row.fact {
+            SYNCED => ICLOUD,
+            "clock" | "network" => &[],
+            _ => std::slice::from_ref(&row.fact),
+        };
+        let Some(fact) = reads.iter().copied().find(|fact| peer.left_out(fact)) else {
+            continue;
+        };
+        if row.outcome != Outcome::Refuse(Waiver::Never) {
+            row.outcome = Outcome::Refuse(Waiver::Force);
+        }
+        row.note = format!(
+            "{fact} is not in the peer's answer, which left out facts it had no room for, at most {MAX_FACTS} facts of at most {MAX_FACT_VALUE} bytes each, so this row cannot be judged; `{}` names what it left out",
+            name::LEFT_OUT
+        );
+    }
 }
 
 /// The login row's note when the target's daemon reported no Claude login
@@ -532,7 +586,7 @@ fn synced_row(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Row {
         _ => None,
     };
     Row {
-        fact: "icloud",
+        fact: SYNCED,
         here: show(here),
         peer: show(peer),
         outcome: if refusal.is_some() {
@@ -559,6 +613,26 @@ fn clock_row(ctx: &Context<'_>) -> Row {
             String::new()
         },
     }
+}
+
+/// The tools whose facts `setup_rows` reads for `spec`: the program of
+/// each step it runs on every resume.
+#[must_use]
+pub fn setup_probes(spec: &EnvSpec) -> Probes {
+    every_resume(spec)
+        .into_iter()
+        .fold(Probes::NONE, |probes, step| {
+            probes.union(Probes::for_program(step.program.as_str()))
+        })
+}
+
+/// Keeps the rows whose fact a tool of `measured` gives, or no tool does:
+/// a preflight measures only the tools its job reads (`ops::preflight_probes`),
+/// and a row of a tool measured on neither node says nothing about the job.
+#[must_use]
+pub fn measured_rows(mut rows: Vec<Row>, measured: Probes) -> Vec<Row> {
+    rows.retain(|row| Tool::of_fact(row.fact).is_none_or(|tool| measured.contains(tool)));
+    rows
 }
 
 /// The rows for the setup steps of the job's spec that run on every
@@ -608,6 +682,7 @@ pub fn setup_rows(spec: &EnvSpec, here: &NodeFacts, peer: &NodeFacts, target: Ta
             note,
         });
     }
+    judge_left_out(&mut rows, peer, target, |_| true);
     rows
 }
 
@@ -789,6 +864,60 @@ mod tests {
                 "{fact}: only that row moves, got {others:?}"
             );
         }
+    }
+
+    /// M2-26: a peer whose facts did not fit one answer sent none, so a
+    /// move refused as if the peer had no user, no git and no login. Its
+    /// answer now keeps what the rows read and names what it left out: a
+    /// row that would read a fact left out refuses for that reason, with
+    /// the waiver it has (none for the home), and a row that reads only
+    /// this node, as the target of a pull, is judged as before. A row
+    /// says what the answer left out.
+    #[test]
+    fn a_peer_answer_that_left_facts_out_names_that_cause() {
+        use fabric_net::wire::{MAX_FACT_VALUE, MAX_FACTS};
+
+        let claude = HarnessKind::ClaudeCode;
+        let extra: Vec<(String, String)> = (0..MAX_FACTS)
+            .map(|n| (format!("extra.{n:02}"), "x".to_owned()))
+            .collect();
+        let mut many: BTreeMapPairs = pro()
+            .iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        many.extend(extra);
+        let many = NodeFacts::from_pairs(many.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        let theirs = NodeFacts::from_wire(&many.to_wire());
+        let rows = compare(&pro(), &theirs, &ctx(Some(&claude)));
+        assert!(
+            blocking(&rows, false).is_empty(),
+            "{:?}",
+            blocking(&rows, false)
+        );
+        assert_eq!(outcome_of(&rows, "facts.left_out"), Outcome::Warn);
+
+        let long = "/h".repeat(MAX_FACT_VALUE);
+        let peer = with(
+            &pro(),
+            &[(name::HOME, Some(&long)), (name::GIT, Some(&long))],
+        );
+        let theirs = NodeFacts::from_wire(&peer.to_wire());
+        let rows = compare(&pro(), &theirs, &ctx(Some(&claude)));
+        let home = rows.iter().find(|r| r.fact == name::HOME).unwrap();
+        assert_eq!(home.outcome, Outcome::Refuse(Waiver::Never));
+        assert!(home.note.contains("left out"), "{}", home.note);
+        let git = rows.iter().find(|r| r.fact == name::GIT).unwrap();
+        assert!(git.note.contains("left out"), "{}", git.note);
+        let pull = Context {
+            target: Target::Here,
+            ..ctx(Some(&claude))
+        };
+        let rows = compare(&pro(), &theirs, &pull);
+        assert_eq!(outcome_of(&rows, name::GIT), Outcome::Equal);
+        assert_eq!(
+            outcome_of(&rows, name::HOME),
+            Outcome::Refuse(Waiver::Never)
+        );
     }
 
     #[test]
@@ -1204,11 +1333,10 @@ mod tests {
         }
     }
 
-    /// A preflight measures here every fact its rows read but a login,
-    /// which it measures only where the login gates the move: on this
-    /// node as the target, for the job's harness (issue #26). Every row
-    /// then has the outcome it has with every fact measured, a target's
-    /// missing login included.
+    /// A preflight measures a login only where it gates the move: on the
+    /// target, for the job's harness, never for an ACP job (issue #26), and
+    /// the target's missing login still refuses it with the rows reduced
+    /// to the tools it measured (`measured_rows`).
     #[test]
     fn a_preflight_measures_a_login_only_where_it_gates_the_move() {
         use crate::facts::Tool;
@@ -1227,33 +1355,53 @@ mod tests {
         ];
         for (harness, login, fact) in &logins {
             for target in [Target::Peer, Target::Here] {
-                let probes = probes(harness, target);
-                let measured: Vec<Tool> = [Tool::ClaudeLogin, Tool::CodexLogin]
-                    .into_iter()
-                    .filter(|tool| probes.contains(*tool))
-                    .collect();
-                let gates = target == Target::Here && !matches!(harness, HarnessKind::Acp { .. });
+                let (here, peer) =
+                    crate::ops::preflight_probes(harness, target, false, Probes::NONE);
+                let logins_of = |probes: Probes| -> Vec<Tool> {
+                    [Tool::ClaudeLogin, Tool::CodexLogin]
+                        .into_iter()
+                        .filter(|tool| probes.contains(*tool))
+                        .collect()
+                };
+                let gates = !matches!(harness, HarnessKind::Acp { .. });
+                let expect = |on_target: bool| {
+                    if gates && on_target {
+                        vec![*login]
+                    } else {
+                        vec![]
+                    }
+                };
                 assert_eq!(
-                    measured,
-                    if gates { vec![*login] } else { vec![] },
+                    logins_of(here),
+                    expect(target == Target::Here),
                     "{harness} {target:?}"
                 );
-                for here_login in ["yes", "no"] {
-                    let here = with(&pro(), &[(fact, Some(here_login))]);
+                assert_eq!(
+                    logins_of(peer),
+                    expect(target == Target::Peer),
+                    "{harness} {target:?}"
+                );
+                for target_login in ["yes", "no"] {
+                    let (mine, theirs) = match target {
+                        Target::Here => (with(&pro(), &[(fact, Some(target_login))]), pro()),
+                        Target::Peer => (pro(), with(&pro(), &[(fact, Some(target_login))])),
+                    };
                     let ctx = Context {
                         target,
                         ..ctx(Some(harness))
                     };
-                    let outcomes = |here: &NodeFacts| -> Vec<(&str, Outcome)> {
-                        compare(here, &pro(), &ctx)
-                            .iter()
-                            .map(|row| (row.fact, row.outcome))
-                            .collect()
+                    let refused = |rows: &[Row]| -> Vec<&str> {
+                        blocking(rows, false).iter().map(|row| row.fact).collect()
                     };
+                    let every = compare(&mine, &theirs, &ctx);
+                    let measured = measured_rows(
+                        compare(&mine.only(here), &theirs.only(peer), &ctx),
+                        here.union(peer),
+                    );
                     assert_eq!(
-                        outcomes(&here.only(probes)),
-                        outcomes(&here),
-                        "{harness} {target:?} {here_login}"
+                        refused(&measured),
+                        refused(&every),
+                        "{harness} {target:?} {target_login}"
                     );
                 }
             }
@@ -1263,8 +1411,9 @@ mod tests {
     /// A pull checks the programs of the steps its job runs on every
     /// resume with the facts its preflight measured here, so those facts
     /// must hold every program a setup step can name, cargo by its own
-    /// fact. A program left out would read as missing and refuse a pull
-    /// to a node that has it (issue #26).
+    /// fact: the preflight measures `setup_probes` of the job's spec. A
+    /// program left out would read as missing and refuse a pull to a node
+    /// that has it (issue #26).
     #[test]
     fn a_pull_preflight_measures_every_program_a_setup_row_reads() {
         use fabric_core::env::{RunWhen, SetupStep};
@@ -1311,7 +1460,8 @@ mod tests {
             "{all:?}"
         );
         for harness in [HarnessKind::ClaudeCode, HarnessKind::Codex] {
-            let probes = probes(&harness, Target::Here);
+            let (probes, _) =
+                crate::ops::preflight_probes(&harness, Target::Here, false, setup_probes(&spec));
             assert_eq!(outcomes(&here.only(probes)), all, "{harness}");
         }
     }

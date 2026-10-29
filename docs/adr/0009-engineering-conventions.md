@@ -2,6 +2,8 @@
 
 Status: accepted, 2026-10-19
 
+Amended 2026-10-28: adds the performance rule Efe set on 2026-10-27 (no regression against a fixed anchor, replacing a tolerance per pull request), and lists the CI gates as CI runs them, where the body still said they were to be added. Found while closing M2-25, the time budget that only reported in CI.
+
 ## Context
 
 Fabric is small, Rust-only, and will be written fast by several people and agents in parallel. The failure mode of that setup is slop: placeholder modules, narrating comments, stubs that pretend, tests that test the compiler. These conventions exist so a reviewer can reject work on a stated rule rather than taste.
@@ -37,15 +39,28 @@ Fabric is small, Rust-only, and will be written fast by several people and agent
 - Stacked PRs: a branch bases on the branch it depends on, not on `main`, and the PR says so. Rebase the stack when the base merges.
 - Draft PR first. Body sections: What, Why, Design notes (link ADRs), How to review (file order), Verification (exact commands and results), Dependencies added. Mark ready only after review passes. Merge is the owner's.
 
-### CI gates (to be added with the first code PR)
+### CI gates
+
+CI runs on macOS and Ubuntu; `CONTRIBUTING.md` lists the commands to run before every push.
 
 - `cargo fmt --all --check`
-- `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`
-- `cargo deny check` for licenses and advisories
-- A grep that fails the build on an em dash character or an AI trailer in any tracked text file.
+- `cargo clippy --workspace --all-targets -- -D warnings`, and `fabric-harness` with each adapter feature alone and with none
+- `cargo test --workspace`, then the end-to-end test of two daemons on its own
+- the time budget (`budget::hot_paths`), enforced: see Performance
+- `cargo doc` with warnings as errors
+- `cargo deny check` for licenses, bans, sources and advisories, also weekly
+- `scripts/check-hygiene.sh`: no em dash character or AI trailer in any tracked file or commit message
+- `scripts/check-fixtures.sh` and `scripts/check-budget.sh`, each with a script test that proves it fires
+- the TypeScript SDK: typecheck, build, and its tests against a node built from the commit
 
-All four cargo commands must pass locally before every push, and their summary lines go in the PR body.
+The cargo commands must pass locally before every push, and their summary lines go in the PR body.
+
+### Performance
+
+- The bar is no regression against a fixed anchor: `main` at `176622e`, before the durable job campaign. A tolerance per pull request compounds (1.5 times per PR is 5 times after four), so every change is compared with the same anchor, on time and on memory, and the aim is to be faster and smaller than it.
+- A slowdown measured on a hot path is a bug to fix, not a trade-off to document, and machine load is not an explanation. A correctness check is never removed or weakened to win time; a cheaper way to make the same check is.
+- The evidence is `scripts/bench-ab.sh`: anchor and candidate built once each, run in the same session in alternating order, at least 15 pairs, the median ratio with a 95% bootstrap interval, and counters that do not depend on load (processes started, file flushes, bytes, allocations, resident size). A busy machine takes only counters (`--pairs 0`, `FABRIC_BUDGET=count`); times come from a quiet one.
+- CI's guard is the time budget in `crates/fabric/tests/e2e/budget.toml`: on Linux each op is held to the anchor's time on that runner, and on every runner each op's process starts are held to exact counts, by program. A baseline is the anchor's time and never rises; `scripts/check-budget.sh` refuses a change that raises one or loosens the ratio, the grace, the percentile or the runs.
 
 ### Decisions
 

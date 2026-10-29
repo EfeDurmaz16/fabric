@@ -82,7 +82,10 @@ impl Records {
     /// the lock goes with the process that held it, however it ends.
     fn hold(&self) -> Result<File, HarnessError> {
         let dir = self.lock.parent().unwrap_or(Path::new("."));
-        std::fs::create_dir_all(dir).map_err(|e| HarnessError::io(IoOp::CreateDir, dir, e))?;
+        // The records are renamed into this directory later; its name and
+        // its parents' are flushed to the drive, so the full flush that
+        // makes a record durable makes its directory durable too.
+        durable::create_dirs_durable(dir)?;
         let file = File::options()
             .create(true)
             .truncate(false)
@@ -100,10 +103,19 @@ impl Records {
     /// `read` holds each file and the digest of the bytes staging read from
     /// it. The file is never read again here: an edit made after staging
     /// must not be recorded as the bytes that left.
+    ///
+    /// The record joins the batch of the capture whose state tree is
+    /// `batch` when both are on one device: it keeps the barrier that keeps
+    /// it whole, its directory is flushed to the drive only, and the state
+    /// manifest's barrier orders it before the manifest's name and its full
+    /// flush makes it durable, as it does the staged files. On another
+    /// device nothing of the batch reaches it, so it is written durable on
+    /// its own, with a full flush of its own.
     pub(crate) fn write_pending(
         &self,
         read: &[(PathBuf, Digest)],
         capture: Digest,
+        batch: &Path,
     ) -> Result<(), HarnessError> {
         let mut files = BTreeMap::new();
         for (abs, digest) in read {
@@ -120,7 +132,11 @@ impl Records {
             reason: e.to_string(),
         })?;
         let _held = self.hold()?;
-        durable::write_atomic(&self.pending, &bytes)
+        if durable::same_device(&self.pending, batch) {
+            durable::write_joined(&self.pending, &bytes)
+        } else {
+            durable::write_atomic(&self.pending, &bytes)
+        }
     }
 
     /// Makes the pending record of the capture whose manifest has digest
@@ -198,7 +214,9 @@ mod tests {
     /// as pending from what staging read.
     fn capture(records: &Records, dir: &Path, sources: &[Source], capture: Digest) {
         let staged = stage::stage(sources, &dir.join("out"), &mut RedactionCounts::new()).unwrap();
-        records.write_pending(&staged.replaceable, capture).unwrap();
+        records
+            .write_pending(&staged.replaceable, capture, &dir.join("out"))
+            .unwrap();
     }
 
     fn digest(text: &str) -> Digest {
@@ -318,7 +336,10 @@ mod tests {
         let confirming = records.hold().unwrap();
         let later = {
             let records = records.clone();
-            std::thread::spawn(move || records.write_pending(&staged.replaceable, digest("m3")))
+            let out = dir.path().join("out3");
+            std::thread::spawn(move || {
+                records.write_pending(&staged.replaceable, digest("m3"), &out)
+            })
         };
         wait();
         assert_eq!(
@@ -352,7 +373,7 @@ edited after staging
         )
         .unwrap();
         records
-            .write_pending(&staged.replaceable, digest("m1"))
+            .write_pending(&staged.replaceable, digest("m1"), &dir.path().join("out"))
             .unwrap();
         records.confirm(&session, digest("m1")).unwrap();
         let active = records.active().unwrap();

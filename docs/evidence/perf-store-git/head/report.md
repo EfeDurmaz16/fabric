@@ -1,0 +1,64 @@
+### Counted ops
+
+Medians over the counted runs, anchor -> candidate, of all `fabric` processes of the side while the op ran.
+
+| op | spawns | full flushes | fsyncs | journal+ledger bytes written | state bytes read | allocations | CLI peak RSS KiB |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| acp new | 3 -> 3 | 8 -> 8 | 0 -> 0 | 143 -> 143 | 143 -> 143 | 38954 -> 38520 | 15184 -> 14768 |
+| acp launch | 4 -> 4 | 15 -> 12 | 0 -> 0 | 135 -> 135 | 1184 -> 683 | 4123 -> 4923 | 14416 -> 15664 |
+| acp approve | 0 -> 0 | 3 -> 3 | 0 -> 0 | 98 -> 98 | 0 -> 0 | 1192 -> 1214 | 10528 -> 10912 |
+| claude new | 3 -> 3 | 8 -> 8 | 0 -> 0 | 124 -> 124 | 272 -> 124 | 1676 -> 1692 | 10816 -> 11056 |
+| claude launch | 4 -> 4 | 15 -> 15 | 0 -> 0 | 116 -> 116 | 1100 -> 1103 | 3525 -> 3623 | 14224 -> 14816 |
+| claude approve | 0 -> 0 | 3 -> 3 | 0 -> 0 | 98 -> 98 | 0 -> 0 | 1192 -> 1207 | 10512 -> 10896 |
+| codex new | 3 -> 3 | 8 -> 8 | 0 -> 0 | 124 -> 124 | 124 -> 124 | 1673 -> 1687 | 10816 -> 11040 |
+| codex launch | 4 -> 4 | 17 -> 17 | 0 -> 0 | 116 -> 116 | 685 -> 685 | 3840 -> 3959 | 14112 -> 14720 |
+| codex approve | 0 -> 0 | 3 -> 3 | 0 -> 0 | 98 -> 98 | 0 -> 0 | 1192 -> 1210 | 10528 -> 10896 |
+| ledger append | 0 -> 0 | 3 -> 3 | 0 -> 0 | 98 -> 98 | 0 -> 0 | 1208 -> 1210 | 10576 -> 10928 |
+| cli version | 0 -> 0 | 0 -> 0 | 0 -> 0 | 0 -> 0 | 0 -> 0 | 201 -> 201 | 4944 -> 4880 |
+| cli ls | 0 -> 0 | 0 -> 0 | 0 -> 0 | 0 -> 0 | 0 -> 0 | 1540 -> 1553 | 10848 -> 11088 |
+| acp suspend | 36 -> 35 | 39 -> 39 | 9 -> 9 | 522 -> 522 | 40138 -> 41133 | 15013 -> 12731 | 11216 -> 11776 |
+| acp move | 42 -> 42 | 15 -> 15 | 0 -> 0 | 520 -> 520 | 5229 -> 5266 | 8338 -> 8422 | 11888 -> 12416 |
+| acp resume | 32 -> 18 | 24 -> 24 | 51 -> 61 | 167 -> 167 | 16137 -> 22060 | 11166 -> 8814 | 14560 -> 15840 |
+| acp pull | 111 -> 94 | 81 -> 81 | 59 -> 72 | 1376 -> 1376 | 33454 -> 40938 | 30396 -> 25376 | 13424 -> 15920 |
+| claude suspend | 35 -> 34 | 41 -> 41 | 8 -> 8 | 522 -> 522 | 13313 -> 14360 | 19224 -> 16259 | 11360 -> 11776 |
+| claude move | 42 -> 42 | 15 -> 15 | 0 -> 0 | 520 -> 520 | 5285 -> 5336 | 8230 -> 8280 | 11888 -> 12384 |
+| claude resume | 34 -> 20 | 24 -> 24 | 55 -> 65 | 148 -> 148 | 21825 -> 27256 | 11104 -> 8703 | 14800 -> 15504 |
+| claude pull | 114 -> 97 | 83 -> 83 | 63 -> 76 | 1338 -> 1338 | 41826 -> 48742 | 36338 -> 30500 | 14928 -> 15584 |
+| codex suspend | 37 -> 36 | 40 -> 40 | 8 -> 8 | 522 -> 522 | 14644 -> 15502 | 16259 -> 12502 | 11264 -> 11776 |
+| codex move | 42 -> 42 | 15 -> 15 | 0 -> 0 | 520 -> 520 | 5333 -> 5367 | 8236 -> 8266 | 11968 -> 12432 |
+| codex resume | 35 -> 21 | 24 -> 24 | 59 -> 69 | 148 -> 148 | 25991 -> 31273 | 11235 -> 8826 | 14720 -> 15552 |
+| codex pull | 117 -> 100 | 82 -> 82 | 67 -> 80 | 1338 -> 1338 | 47226 -> 54058 | 32662 -> 26253 | 15008 -> 15600 |
+| cold start | 0 -> 0 | 8 -> 8 | 5 -> 5 | 0 -> 0 | 45222 -> 45222 | 11231 -> 15817 | 10448 -> 10832 |
+| restart | 0 -> 0 | 38 -> 38 | 0 -> 0 | 463 -> 463 | 489265 -> 497505 | 25899 -> 23976 | 10976 -> 11360 |
+
+
+### Counters that differ
+
+Every counter whose median differs between the builds, per op, anchor -> candidate. `spawn:<program>` counts the starts of one program; `<counter>.<class>` splits reads, writes and flushes (`syncs`) by the file they touch.
+
+- acp new: cli_maxrss_kib 15184 -> 14768, frees 28127 -> 27788, malloc_bytes 13539880 -> 13432003, mallocs 38954 -> 38520
+- acp launch: cli_maxrss_kib 14416 -> 15664, cmd:fabric-fake-agent 1 -> 0, cmd:sh holding fabric-fake-agent 0 -> 1, frees 3356 -> 3769, fullfsync 15 -> 12, malloc_bytes 717989 -> 877416, mallocs 4123 -> 4923, opens 40 -> 37, read_bytes.jobs 1010 -> 509, read_calls.jobs 12 -> 10, renames 6 -> 5, spawn:fabric-fake-agent 1 -> 0, spawn:sh 0 -> 1, syncs.jobs 14 -> 11, write_bytes.ipc 969 -> 1025, write_bytes.jobs 1032 -> 577, write_calls.ipc 11 -> 14, write_calls.jobs 6 -> 5
+- acp approve: cli_maxrss_kib 10528 -> 10912, frees 1033 -> 1055, malloc_bytes 323639 -> 325934, mallocs 1192 -> 1214
+- claude new: cli_maxrss_kib 10816 -> 11056, frees 1411 -> 1429, malloc_bytes 392269 -> 393588, mallocs 1676 -> 1692, opens 13 -> 11, read_bytes.state 148 -> 0, read_calls.state 4 -> 0
+- claude launch: cli_maxrss_kib 14224 -> 14816, cmd:claude 1 -> 0, cmd:sh holding claude 0 -> 1, frees 3121 -> 3216, malloc_bytes 604228 -> 614080, mallocs 3525 -> 3623, read_bytes.jobs 926 -> 929, spawn:claude 1 -> 0, spawn:sh 0 -> 1, write_bytes.jobs 929 -> 932
+- claude approve: cli_maxrss_kib 10512 -> 10896, frees 1033 -> 1049, malloc_bytes 323895 -> 325294, mallocs 1192 -> 1207
+- codex new: cli_maxrss_kib 10816 -> 11040, frees 1410 -> 1424, malloc_bytes 390897 -> 392680, mallocs 1673 -> 1687
+- codex launch: cli_maxrss_kib 14112 -> 14720, cmd:codex 1 -> 0, cmd:sh holding codex 0 -> 1, frees 3423 -> 3532, malloc_bytes 696061 -> 708189, mallocs 3840 -> 3959, read_calls.ipc 12 -> 13, spawn:codex 1 -> 0, spawn:sh 0 -> 1
+- codex approve: cli_maxrss_kib 10528 -> 10896, frees 1035 -> 1052, malloc_bytes 323383 -> 325486, mallocs 1192 -> 1210
+- ledger append: cli_maxrss_kib 10576 -> 10928, malloc_bytes 325239 -> 326766, mallocs 1208 -> 1210
+- cli version: cli_maxrss_kib 4944 -> 4880, malloc_bytes 88361 -> 88364
+- cli ls: cli_maxrss_kib 10848 -> 11088, frees 1342 -> 1354, malloc_bytes 369162 -> 371329, mallocs 1540 -> 1553
+- acp suspend: cli_maxrss_kib 11216 -> 11776, cmd:git bundle 3 -> 2, frees 10361 -> 9664, malloc_bytes 3551466 -> 3518101, mallocs 15013 -> 12731, read_bytes.ipc 5269 -> 5199, read_bytes.store 37749 -> 38744, read_calls.ipc 186 -> 180, read_calls.store 74 -> 75, spawn:git 30 -> 29, spawns 36 -> 35, write_bytes.ipc 1111 -> 1028, write_bytes.jobs 3577 -> 3579, write_bytes.store 95748 -> 95931
+- acp move: cli_maxrss_kib 11888 -> 12416, frees 6841 -> 6923, malloc_bytes 2017088 -> 2025316, mallocs 8338 -> 8422, read_bytes.jobs 4091 -> 4095, read_bytes.store 1138 -> 1171, write_bytes.ipc 2698 -> 2510
+- acp resume: cli_maxrss_kib 14560 -> 15840, cmd:fabric-fake-agent 1 -> 0, cmd:git bundle 10 -> 2, cmd:git config 4 -> 0, cmd:git rev-parse 1 -> 0, cmd:git symbolic-ref 1 -> 0, cmd:sh holding fabric-fake-agent 0 -> 1, frees 8962 -> 7052, fsync 51 -> 61, malloc_bytes 4354428 -> 3689063, mallocs 11166 -> 8814, opens 212 -> 236, read_bytes.ipc 4938 -> 2412, read_bytes.jobs 3558 -> 3555, read_bytes.outside 554 -> 691, read_bytes.state 122 -> 270, read_bytes.store 12457 -> 18235, read_calls.ipc 172 -> 78, read_calls.outside 13 -> 15, read_calls.state 4 -> 8, read_calls.store 125 -> 111, spawn:fabric-fake-agent 1 -> 0, spawn:git 24 -> 10, spawn:sh 0 -> 1, spawns 32 -> 18, syncs.outside 43 -> 53, unlinks 23 -> 20, write_bytes.ipc 2046 -> 2175, write_bytes.jobs 3548 -> 3550, write_bytes.outside 483 -> 640, write_bytes.store 4530 -> 2478, write_calls.ipc 28 -> 29, write_calls.outside 11 -> 12, write_calls.store 5 -> 4
+- acp pull: cli_maxrss_kib 13424 -> 15920, cmd:fabric-fake-agent 2 -> 1, cmd:git bundle 15 -> 4, cmd:git config 5 -> 1, cmd:git rev-parse 4 -> 3, cmd:git symbolic-ref 3 -> 2, cmd:sh holding fabric-fake-agent 0 -> 1, frees 23395 -> 20484, fsync 59 -> 72, malloc_bytes 8816115 -> 7849933, mallocs 30396 -> 25376, opens 415 -> 443, read_bytes.ipc 11101 -> 8047, read_bytes.jobs 8541 -> 8537, read_bytes.outside 1632 -> 1769, read_bytes.state 174 -> 322, read_bytes.store 24739 -> 32079, read_calls.ipc 495 -> 378, read_calls.outside 31 -> 33, read_calls.state 4 -> 8, read_calls.store 217 -> 195, spawn:fabric-fake-agent 2 -> 1, spawn:git 58 -> 41, spawn:sh 0 -> 1, spawns 111 -> 94, syncs.outside 48 -> 61, unlinks 44 -> 40, write_bytes.ipc 4625 -> 4715, write_bytes.jobs 8392 -> 8394, write_bytes.outside 747 -> 904, write_bytes.store 60014 -> 57340, write_calls.ipc 84 -> 85, write_calls.outside 12 -> 13, write_calls.store 39 -> 37
+- claude suspend: cli_maxrss_kib 11360 -> 11776, cmd:git bundle 3 -> 2, frees 13984 -> 12963, malloc_bytes 3668508 -> 3584756, mallocs 19224 -> 16259, read_bytes.ipc 5237 -> 5165, read_bytes.store 9550 -> 10597, read_calls.ipc 185 -> 181, read_calls.store 67 -> 68, spawn:git 30 -> 29, spawns 35 -> 34, write_bytes.ipc 1131 -> 1048, write_bytes.jobs 4752 -> 4763, write_bytes.store 79468 -> 79679
+- claude move: cli_maxrss_kib 11888 -> 12384, frees 6766 -> 6820, malloc_bytes 2007430 -> 2013626, mallocs 8230 -> 8280, read_bytes.jobs 4074 -> 4082, read_bytes.store 1211 -> 1254
+- claude resume: cli_maxrss_kib 14800 -> 15504, cmd:claude 3 -> 2, cmd:git bundle 10 -> 2, cmd:git config 4 -> 0, cmd:git rev-parse 1 -> 0, cmd:git symbolic-ref 1 -> 0, cmd:sh holding claude 0 -> 1, frees 9141 -> 7185, fsync 55 -> 65, malloc_bytes 4373139 -> 3690763, mallocs 11104 -> 8703, opens 250 -> 270, read_bytes.ipc 4416 -> 1890, read_bytes.jobs 8582 -> 8586, read_bytes.outside 3026 -> 3163, read_bytes.state 270 -> 122, read_bytes.store 12973 -> 18548, read_calls.ipc 176 -> 83, read_calls.outside 16 -> 18, read_calls.state 8 -> 4, read_calls.store 125 -> 111, spawn:claude 3 -> 2, spawn:git 24 -> 10, spawn:sh 0 -> 1, spawns 34 -> 20, syncs.outside 43 -> 53, unlinks 25 -> 22, write_bytes.ipc 1852 -> 1878, write_bytes.jobs 4693 -> 4711, write_bytes.outside 483 -> 640, write_bytes.store 4527 -> 2479, write_calls.outside 11 -> 12, write_calls.store 5 -> 4
+- claude pull: cli_maxrss_kib 14928 -> 15584, cmd:claude 8 -> 7, cmd:git bundle 15 -> 4, cmd:git config 5 -> 1, cmd:git rev-parse 4 -> 3, cmd:git symbolic-ref 3 -> 2, cmd:sh holding claude 0 -> 1, frees 27958 -> 24592, fsync 63 -> 76, malloc_bytes 9184543 -> 8163230, mallocs 36338 -> 30500, opens 460 -> 486, read_bytes.ipc 10601 -> 7547, read_bytes.jobs 15737 -> 15735, read_bytes.outside 5735 -> 5872, read_bytes.state 322 -> 174, read_bytes.store 25767 -> 32833, read_calls.ipc 495 -> 387, read_calls.outside 33 -> 35, read_calls.state 8 -> 4, read_calls.store 217 -> 195, spawn:claude 8 -> 7, spawn:git 58 -> 41, spawn:sh 0 -> 1, spawns 114 -> 97, syncs.outside 48 -> 61, unlinks 48 -> 44, write_bytes.ipc 4279 -> 4222, write_bytes.jobs 10906 -> 10897, write_bytes.outside 617 -> 774, write_bytes.store 60147 -> 65727, write_calls.outside 12 -> 13, write_calls.store 39 -> 41
+- codex suspend: cli_maxrss_kib 11264 -> 11776, cmd:git bundle 3 -> 2, frees 11717 -> 10224, malloc_bytes 3756004 -> 3653240, mallocs 16259 -> 12502, opens 154 -> 152, read_bytes.ipc 5251 -> 5181, read_bytes.state 235 -> 87, read_bytes.store 9915 -> 10921, read_calls.ipc 190 -> 184, read_calls.state 6 -> 2, read_calls.store 67 -> 68, spawn:git 30 -> 29, spawns 37 -> 36, write_bytes.ipc 1125 -> 1042, write_bytes.store 63406 -> 55341, write_calls.store 37 -> 33
+- codex move: cli_maxrss_kib 11968 -> 12432, frees 6780 -> 6812, malloc_bytes 2007197 -> 2011829, mallocs 8236 -> 8266, read_bytes.jobs 4090 -> 4082, read_bytes.store 1243 -> 1285
+- codex resume: cli_maxrss_kib 14720 -> 15552, cmd:codex 3 -> 2, cmd:git bundle 10 -> 2, cmd:git config 4 -> 0, cmd:git rev-parse 1 -> 0, cmd:git symbolic-ref 1 -> 0, cmd:sh holding codex 0 -> 1, frees 9300 -> 7332, fsync 59 -> 69, malloc_bytes 4478437 -> 3796931, mallocs 11235 -> 8826, opens 294 -> 314, read_bytes.ipc 4566 -> 2040, read_bytes.outside 9297 -> 9434, read_bytes.state 270 -> 122, read_bytes.store 13523 -> 18953, read_calls.ipc 180 -> 84, read_calls.outside 15 -> 17, read_calls.state 8 -> 4, read_calls.store 127 -> 113, spawn:codex 3 -> 2, spawn:git 24 -> 10, spawn:sh 0 -> 1, spawns 35 -> 21, syncs.outside 43 -> 53, unlinks 28 -> 25, write_bytes.ipc 1786 -> 1812, write_bytes.jobs 5640 -> 5627, write_bytes.outside 483 -> 640, write_bytes.store 4529 -> 2479, write_calls.outside 11 -> 12, write_calls.store 5 -> 4
+- codex pull: cli_maxrss_kib 15008 -> 15600, cmd:codex 9 -> 8, cmd:git bundle 15 -> 4, cmd:git config 5 -> 1, cmd:git rev-parse 4 -> 3, cmd:git symbolic-ref 3 -> 2, cmd:sh holding codex 0 -> 1, frees 25218 -> 21337, fsync 67 -> 80, malloc_bytes 9337996 -> 8353670, mallocs 32662 -> 26253, opens 511 -> 537, read_bytes.ipc 10766 -> 7711, read_bytes.jobs 20114 -> 20107, read_bytes.outside 18389 -> 18526, read_bytes.store 26790 -> 33629, read_calls.ipc 514 -> 396, read_calls.outside 33 -> 35, read_calls.store 219 -> 197, spawn:codex 9 -> 8, spawn:git 58 -> 41, spawn:sh 0 -> 1, spawns 117 -> 100, syncs.outside 45 -> 58, unlinks 54 -> 50, write_bytes.ipc 4213 -> 4156, write_bytes.jobs 12686 -> 12671, write_bytes.outside 504 -> 661, write_bytes.store 93525 -> 82579, write_calls.outside 11 -> 12, write_calls.store 55 -> 49
+- cold start: cli_maxrss_kib 10448 -> 10832, cli_processes 10 -> 15, frees 8973 -> 12872, malloc_bytes 3401118 -> 4875013, mallocs 11231 -> 15817, write_bytes.ipc 1573 -> 2507, write_calls.ipc 19 -> 29
+- restart: cli_maxrss_kib 10976 -> 11360, cli_processes 18 -> 16, frees 20441 -> 18817, malloc_bytes 6857306 -> 6142349, mallocs 25899 -> 23976, opens 271 -> 284, read_bytes.store 465596 -> 473836, read_calls.store 115 -> 117, write_bytes.ipc 6776 -> 7079, write_calls.ipc 95 -> 101

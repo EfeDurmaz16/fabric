@@ -16,6 +16,8 @@ M2 does not build that service. It builds the contract and its first implementat
 
 A managed job is bound to exactly one authority. In M2 the authority runs inside the local `fabric serve` daemon, with one serialized writer: a single task owns the journal connection and applies commands one at a time. There is no cluster, no consensus and no second writer. Authority unavailability blocks new commands; it never lets an executor decide on its own.
 
+The writer's thread starts with the daemon only when a journal exists, and recovers it before it answers any call. Without a journal it starts with the first managed command, so a daemon that never runs a managed job pays one `stat` at start and neither the thread nor its queue; until then a read answers that there is no managed job, under the lock a command starts the thread under. A journal whose presence cannot be read counts as one that does not open: every managed command and every lookup of an id fails closed with `managed_unavailable`.
+
 The authority does not claim executor-loss durability in M2. Its journal lives on the same host as the executor, so losing the host loses both. The capability is advertised only once the journal and the checkpoint artifacts are stored somewhere that survives the executor (draft P02 handoff selection).
 
 ### A dedicated, versioned SQLite journal

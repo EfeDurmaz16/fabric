@@ -1,0 +1,14 @@
+01-fmt pass 1s
+02-clippy pass 5s
+03-clippy-features pass 4s
+04-test pass 129s
+05-e2e pass 97s
+06-doc pass 3s
+07-deny pass 1s
+08-hygiene pass 2s
+09-fixtures pass 10s
+10-budget-check pass 7s
+11-budget-count pass 21s
+12-sdk pass 13s
+13-shellcheck pass 0s
+done

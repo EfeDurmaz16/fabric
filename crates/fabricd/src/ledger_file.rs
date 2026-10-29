@@ -8,11 +8,15 @@
 //! dropped middle record may be the `MoveImported` or `Stolen` that fences a
 //! live copy. A derived job manifest that remembers more than the ledger
 //! holds also fails closed: a shorter ledger never wins over a manifest that
-//! saw a later epoch.
+//! saw a later epoch. The manifest is written after the full flush of the
+//! append it counts and ordered by a barrier, so a power loss can leave it
+//! behind the ledger and never ahead of it.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 use fabric_core::ledger::{JobManifest, Ledger, LedgerStore, Record, RecordError, scan};
 
@@ -73,12 +77,18 @@ pub enum LedgerFileError {
 }
 
 /// One job's ledger file, open for appends.
+///
+/// It holds no copy of the records once they are read: `Ledger::open`
+/// takes the ones `open` scanned and keeps its own, so a node holds each
+/// record of each job once, not twice, and an append copies nothing. A
+/// later `records` reads the acknowledged bytes from the file again.
 #[derive(Debug)]
 pub struct LedgerFile {
     path: PathBuf,
     file: File,
     len: u64,
-    records: Vec<Record>,
+    /// The records `open` scanned, until the first `records` takes them.
+    scanned: Mutex<Option<Vec<Record>>>,
     poisoned: bool,
 }
 
@@ -97,7 +107,10 @@ impl LedgerFile {
             Err(source) => return Err(io_err(path, source)),
         }
         durable::write_atomic(path, first.bytes()).map_err(|source| io_err(path, source))?;
-        Self::open(path)
+        let file = Self::open(path)?;
+        // The caller holds `first`; the record read back is not kept.
+        file.take_scanned();
+        Ok(file)
     }
 
     /// Opens the ledger at `path`, truncating a torn tail and refusing any other damage.
@@ -131,9 +144,47 @@ impl LedgerFile {
             path: path.to_owned(),
             file,
             len,
-            records: scanned.records,
+            scanned: Mutex::new(Some(scanned.records)),
             poisoned: false,
         })
+    }
+
+    fn take_scanned(&self) -> Option<Vec<Record>> {
+        self.scanned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// Reads and scans the acknowledged bytes again. They were whole when
+    /// they were acknowledged, so a torn tail among them is damage.
+    fn read_back(&self) -> Result<Vec<Record>, LedgerFileError> {
+        let too_long = || io_err(&self.path, io::Error::other("ledger longer than memory"));
+        let mut bytes = vec![0; usize::try_from(self.len).map_err(|_| too_long())?];
+        self.file
+            .read_exact_at(&mut bytes, 0)
+            .map_err(|source| io_err(&self.path, source))?;
+        let corrupt = |offset| LedgerFileError::Corrupt {
+            path: self.path.clone(),
+            offset,
+        };
+        let scanned = scan(&bytes).map_err(|source| match source {
+            RecordError::Corrupt { offset } => corrupt(offset),
+            source => LedgerFileError::Record {
+                path: self.path.clone(),
+                source,
+            },
+        })?;
+        match scanned.torn_tail {
+            Some(offset) => Err(corrupt(offset)),
+            None => Ok(scanned.records),
+        }
+    }
+
+    /// How many records this file holds in memory.
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        self.scanned.lock().unwrap().as_ref().map_or(0, Vec::len)
     }
 }
 
@@ -169,16 +220,34 @@ impl LedgerStore for LedgerFile {
             return Err(io_err(&self.path, source));
         }
         self.len += record.bytes().len() as u64;
-        self.records.push(record.clone());
+        // Records scanned and not yet taken grow with the file, so a
+        // `records` before the first take still sees this one.
+        if let Some(scanned) = self
+            .scanned
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            scanned.push(record.clone());
+        }
         Ok(())
     }
 
     fn records(&self) -> Result<Vec<Record>, LedgerFileError> {
-        Ok(self.records.clone())
+        match self.take_scanned() {
+            Some(records) => Ok(records),
+            None => self.read_back(),
+        }
     }
 }
 
 /// Writes the derived manifest of `ledger` beside it, after the append it summarizes.
+///
+/// The write is atomic and ordered, with no full flush of its own (ADR
+/// 0002): the append before it ended with one, so the manifest can never
+/// reach the medium ahead of a record it counts, and a power loss can only
+/// leave it behind the ledger, which `check_manifest` accepts and the next
+/// open writes again. The next full flush on the device, the next append's
+/// or any atomic write's, makes it durable.
 pub fn write_manifest(path: &Path, ledger: &Ledger) -> Result<(), LedgerFileError> {
     let bytes = ledger
         .manifest()
@@ -187,7 +256,9 @@ pub fn write_manifest(path: &Path, ledger: &Ledger) -> Result<(), LedgerFileErro
             path: path.to_owned(),
             reason: e.to_string(),
         })?;
-    durable::write_atomic(path, &bytes).map_err(|source| io_err(path, source))
+    durable::replace_ordered(path, &bytes)
+        .map(|_| ())
+        .map_err(|source| io_err(path, source))
 }
 
 /// Fails closed when the manifest at `path` remembers more than `ledger` holds.
@@ -319,6 +390,96 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A node keeps each record once: the ledger takes the records the file
+    /// scanned, and an append adds none to the file's memory; a later
+    /// `records` reads them back from the file, the append included.
+    #[test]
+    fn an_open_ledger_hands_its_records_over_and_keeps_no_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger");
+        let (file, _) = write_chain(&path, 2);
+        assert_eq!(file.held(), 0, "a created ledger keeps no copy");
+        drop(file);
+        let mut file = LedgerFile::open(&path).unwrap();
+        assert_eq!(file.held(), 3);
+        let mut ledger = Ledger::open(JOB, &file).unwrap();
+        assert_eq!(file.held(), 0, "the ledger took the records");
+        let note = ledger
+            .propose(NODE, EventKind::Note { text: "n".into() }, event(7), 7)
+            .unwrap();
+        ledger.commit(&mut file, note, Author::Node(NODE)).unwrap();
+        assert_eq!(file.held(), 0, "an append keeps no copy");
+        let again = file.records().unwrap();
+        assert_eq!(again.len(), 4);
+        assert_eq!(
+            again.iter().map(Record::hash).collect::<Vec<_>>(),
+            ledger
+                .records()
+                .iter()
+                .map(Record::hash)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A power loss between an append and its manifest's write, or before
+    /// the manifest's rename reached the medium, leaves the manifest a
+    /// record behind: the window `write_manifest` relies on, accepted and
+    /// written again.
+    #[test]
+    fn a_manifest_behind_the_ledger_is_accepted_and_written_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger");
+        let manifest = dir.path().join("manifest");
+        let (mut file, mut ledger) = write_chain(&path, 1);
+        write_manifest(&manifest, &ledger).unwrap();
+        let note = ledger
+            .propose(
+                NODE,
+                EventKind::Note {
+                    text: "late".into(),
+                },
+                event(9),
+                9,
+            )
+            .unwrap();
+        ledger.commit(&mut file, note, Author::Node(NODE)).unwrap();
+        check_manifest(&manifest, &ledger).unwrap();
+        write_manifest(&manifest, &ledger).unwrap();
+        let saved = JobManifest::decode(&fs::read(&manifest).unwrap()).unwrap();
+        assert_eq!(saved.event_count, 3);
+    }
+
+    /// ADR 0002: an append is one full flush of the ledger, and the
+    /// manifest after it is ordered by a barrier on its temporary, before
+    /// its rename, and adds no full flush: one full flush per commit
+    /// instead of three.
+    #[test]
+    fn a_commit_flushes_the_drive_once_and_orders_its_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger");
+        let manifest = dir.path().join("manifest");
+        let (mut file, mut ledger) = write_chain(&path, 0);
+        write_manifest(&manifest, &ledger).unwrap();
+        let note = ledger
+            .propose(NODE, EventKind::Note { text: "n".into() }, event(1), 1)
+            .unwrap();
+        let ((), log) = durable::record::flushes(|| {
+            ledger.commit(&mut file, note, Author::Node(NODE)).unwrap();
+            write_manifest(&manifest, &ledger).unwrap();
+        });
+        let temp = durable::record::real(
+            &dir.path()
+                .join(format!("manifest.{}.tmp", std::process::id())),
+        );
+        assert_eq!(
+            log,
+            vec![
+                (durable::Flush::Full, durable::record::real(&path)),
+                (durable::Flush::Barrier, temp),
+            ]
+        );
     }
 
     /// The child side of the kill test: appends notes forever and reports

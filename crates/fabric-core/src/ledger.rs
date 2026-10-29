@@ -614,6 +614,11 @@ pub enum StoreError<E: std::error::Error + 'static> {
 #[derive(Debug, Clone)]
 pub struct Ledger {
     records: Vec<Record>,
+    /// Every position in `records`, sorted by the hash of the record
+    /// there, so a record is found by its hash in `O(log n)` with four
+    /// bytes per record, where a scan of the chain compared every hash
+    /// (M2-18): a peer's push checks each record it sends against it.
+    by_hash: Vec<u32>,
     manifest: JobManifest,
     /// The snapshot the last `Suspended` named, until a `Resumed` follows it.
     suspended_at: Option<SnapshotId>,
@@ -658,9 +663,40 @@ impl Ledger {
         for record in records {
             ledger.check(record.event(), None)?;
             ledger.apply(&record);
-            ledger.records.push(record);
+            ledger.push(record);
         }
         Ok(ledger)
+    }
+
+    /// Appends a checked record to the chain and to the hash index.
+    fn push(&mut self, record: Record) {
+        let hash = record.hash();
+        let at = self
+            .by_hash
+            .partition_point(|&i| self.records[i as usize].hash() < hash);
+        // A ledger cannot reach 2^32 records: each is at least a header
+        // and a checksum long, and the file would pass 64 GiB first.
+        let position = u32::try_from(self.records.len()).unwrap_or(u32::MAX);
+        self.by_hash.insert(at, position);
+        self.records.push(record);
+    }
+
+    /// The position in the chain of the record whose hash is `hash`.
+    #[must_use]
+    pub fn position(&self, hash: RecordHash) -> Option<usize> {
+        let at = self
+            .by_hash
+            .partition_point(|&i| self.records[i as usize].hash() < hash);
+        self.by_hash
+            .get(at)
+            .map(|&i| i as usize)
+            .filter(|&i| self.records[i].hash() == hash)
+    }
+
+    /// Whether the chain holds the record whose hash is `hash`.
+    #[must_use]
+    pub fn holds(&self, hash: RecordHash) -> bool {
+        self.position(hash).is_some()
     }
 
     /// Loads a ledger from `store`.
@@ -706,6 +742,7 @@ impl Ledger {
         };
         Ok(Ledger {
             records: vec![record],
+            by_hash: vec![0],
             manifest,
             suspended_at: None,
         })
@@ -749,10 +786,7 @@ impl Ledger {
     /// Returns the records after the one whose hash is `after`, if it is in the chain.
     #[must_use]
     pub fn suffix_after(&self, after: RecordHash) -> Option<&[Record]> {
-        self.records
-            .iter()
-            .position(|r| r.hash() == after)
-            .map(|i| &self.records[i + 1..])
+        self.position(after).map(|i| &self.records[i + 1..])
     }
 
     /// Returns the token `node` must present to run the job, if it may run it.
@@ -819,7 +853,7 @@ impl Ledger {
     fn accept(&mut self, record: Record, author: Author) -> Result<&Record, LedgerError> {
         self.check(record.event(), author.sender())?;
         self.apply(&record);
-        self.records.push(record);
+        self.push(record);
         Ok(&self.records[self.records.len() - 1])
     }
 
@@ -1833,6 +1867,37 @@ mod tests {
         assert_eq!(ledger.suffix_after(first).unwrap().len(), 2);
         assert_eq!(ledger.suffix_after(ledger.head()).unwrap().len(), 0);
         assert!(ledger.suffix_after(RecordHash::of(b"elsewhere")).is_none());
+    }
+
+    /// The hash index finds every record of the chain at its position,
+    /// after commits and after a replay of the same records, and finds no
+    /// record the chain does not hold (M2-18).
+    #[test]
+    fn the_hash_index_finds_every_record_and_nothing_else() {
+        let mut ledger = new_ledger(node(1));
+        for n in 0..300 {
+            append(
+                &mut ledger,
+                node(1),
+                EventKind::Note {
+                    text: format!("{n}"),
+                },
+            )
+            .unwrap();
+        }
+        let replayed = Ledger::replay(job(), ledger.records().to_vec()).unwrap();
+        for chain in [&ledger, &replayed] {
+            for (i, record) in chain.records().iter().enumerate() {
+                assert_eq!(chain.position(record.hash()), Some(i));
+                assert!(chain.holds(record.hash()));
+                assert_eq!(chain.suffix_after(record.hash()).unwrap().len(), 300 - i);
+            }
+            for n in 0..300_u32 {
+                let other = RecordHash::of(&n.to_le_bytes());
+                assert!(!chain.holds(other));
+                assert_eq!(chain.position(other), None);
+            }
+        }
     }
 
     #[test]

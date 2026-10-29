@@ -242,6 +242,7 @@ fn publish_killed_at_any_checkpoint_never_leaves_a_dangling_row() {
 #[test]
 fn restore_killed_at_any_checkpoint_is_detectable_and_finishes_on_rerun() {
     for checkpoint in [
+        "restore.cache_files_placed",
         "restore.after_git",
         "restore.after_first_file",
         "restore.after_files",
@@ -327,5 +328,29 @@ fn restore_killed_at_any_checkpoint_is_detectable_and_finishes_on_rerun() {
             .run_text(&["status", "--porcelain=v2", "--untracked-files=all"])
             .unwrap();
         assert_eq!(status, source, "{checkpoint}");
+        assert_cache_whole(&store, snapshot, &dir.join("again"), checkpoint);
     }
+}
+
+/// Checks that a restore of `snapshot` into `target` takes its one bundle
+/// from the node's bundle cache: the rerun after the kill at `checkpoint`
+/// left the cache whole, files and record.
+fn assert_cache_whole(store: &Store, snapshot: SnapshotId, target: &Path, checkpoint: &str) {
+    let again = restore(
+        store,
+        &RestoreRequest {
+            snapshot,
+            target,
+            harness_state: None,
+            verify: Verify::All,
+            durability: Durability::ProcessCrash,
+            carry: &|_| true,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        (again.bundles_fetched, again.bundles_unpacked),
+        (1, 0),
+        "{checkpoint}"
+    );
 }

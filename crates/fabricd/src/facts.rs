@@ -35,7 +35,9 @@ use fabric_core::path::{AbsPath, RelPath};
 use fabric_core::snapshot::{CacheClass, CarryKey, LeftBehind, Platform, Remake, SnapshotManifest};
 use fabric_env::detect::{CacheOrigin, Completion, Detection, Ecosystem, NodeManager};
 use fabric_env::materialize::CacheHealth;
-use fabric_net::wire::{FactName, FactValue, Facts, MAX_FACT_VALUE};
+use fabric_net::wire::{
+    FactName, FactValue, Facts, MAX_FACT_NAME, MAX_FACT_VALUE, MAX_FACTS, ToolName, Tools,
+};
 use fabric_store::capture::CarryKeys;
 
 use crate::harnesses::HarnessEnv;
@@ -119,6 +121,53 @@ pub mod name {
     /// agent; measured by the target of a pull, and by a push target for a
     /// question that names the job's harness.
     pub const ACP_STATE_DIR: &str = "acp.state_dir";
+    /// Only in an answer to a peer that had no room for every fact: the
+    /// facts it left out, by name, separated by a space, and `+N` at the
+    /// end when N more did not fit this value either (M2-26). An answer
+    /// holds at most `MAX_FACTS` facts, and a fact whose name or value is
+    /// longer than a fact holds is left out, never cut.
+    pub const LEFT_OUT: &str = "facts.left_out";
+
+    /// Every fact a measure can give, which an answer to a peer keeps
+    /// before any other: they always fit it, with room for `LEFT_OUT`.
+    pub const MEASURED: [&str; 31] = [
+        USER,
+        HOME,
+        GIT,
+        LSOF,
+        OS,
+        ARCH,
+        FABRIC,
+        MACOS,
+        MACOS_SDK,
+        NODE,
+        NODE_ABI,
+        NPM,
+        PNPM,
+        PNPM_STORE,
+        YARN,
+        BUN,
+        RUSTC,
+        CARGO,
+        CARGO_HOME,
+        PYTHON,
+        PYTHON_HOME,
+        UV,
+        CLAUDE,
+        CLAUDE_LOGIN,
+        CLAUDE_KEYCHAIN,
+        CODEX,
+        CODEX_LOGIN,
+        ICLOUD_DESKTOP,
+        ICLOUD_DOCUMENTS,
+        ACP_AGENT,
+        ACP_STATE_DIR,
+    ];
+
+    const _: () = assert!(
+        MEASURED.len() < fabric_net::wire::MAX_FACTS,
+        "the measured facts and LEFT_OUT fit one answer"
+    );
 }
 
 /// One node's measured facts, by name.
@@ -233,6 +282,41 @@ impl Tool {
         }
     }
 
+    /// Its name in a peer's question (`Tools` of `FactsFor`): fixed, since
+    /// both nodes of a protocol version read it.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Tool::User => "user",
+            Tool::Git => "git",
+            Tool::Macos => "macos",
+            Tool::MacosSdk => "macos.sdk",
+            Tool::Node => "node",
+            Tool::Npm => "npm",
+            Tool::Pnpm => "pnpm",
+            Tool::Yarn => "yarn",
+            Tool::Bun => "bun",
+            Tool::Rustc => "rustc",
+            Tool::Cargo => "cargo",
+            Tool::Python => "python",
+            Tool::Uv => "uv",
+            Tool::Claude => "claude",
+            Tool::ClaudeLogin => "claude.login",
+            Tool::Codex => "codex",
+            Tool::CodexLogin => "codex.login",
+            Tool::ICloud => "icloud",
+        }
+    }
+
+    /// The tool whose commands give `fact`; `None` for a fact no process
+    /// gives, such as the home or the platform.
+    #[must_use]
+    pub fn of_fact(fact: &str) -> Option<Tool> {
+        Tool::ALL.into_iter().find(|tool| {
+            tool.commands().iter().any(|(name, _, _)| *name == fact)
+                || (*tool == Tool::ClaudeLogin && fact == name::CLAUDE_KEYCHAIN)
+        })
+    }
+
     /// The commands it runs, each giving one fact.
     fn commands(self) -> &'static [Command] {
         use Probe::{ExitCode, Output};
@@ -329,6 +413,46 @@ impl Probes {
     #[must_use]
     pub const fn contains(self, tool: Tool) -> bool {
         self.0 & tool.bit() != 0
+    }
+
+    /// These without `other`'s.
+    #[must_use]
+    pub const fn minus(self, other: Probes) -> Probes {
+        Probes(self.0 & !other.0)
+    }
+
+    /// True when there is no tool.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// These, as a peer's question names them.
+    #[must_use]
+    pub fn to_wire(self) -> Tools {
+        let mut names: Vec<ToolName> = self
+            .tools()
+            .map(|tool| ToolName::truncated(tool.wire_name()))
+            .collect();
+        names.sort();
+        // At most every tool, each named once: always a valid list.
+        Tools::new(names).unwrap_or_default()
+    }
+
+    /// The tools a peer's question names. A name this node does not know,
+    /// from a build that measures a tool this one lacks, makes it every
+    /// tool: more than was asked, never less.
+    #[must_use]
+    pub fn from_wire(tools: &Tools) -> Probes {
+        tools.iter().fold(Probes::NONE, |probes, wanted| {
+            match Tool::ALL
+                .into_iter()
+                .find(|tool| tool.wire_name() == wanted)
+            {
+                Some(tool) => probes.with(tool),
+                None => Probes::ALL,
+            }
+        })
     }
 
     /// Each of these tools.
@@ -463,13 +587,13 @@ async fn keychain(
     }
     let keychain = keychain.to_str()?;
     let launchctl = find_on_path("launchctl", env.path_var())?;
+    let null = Null::open();
     let session = probe_command(
         &launchctl,
         &["managername"],
         Probe::Output,
-        env,
-        home,
-        inherited,
+        (env, home, inherited),
+        &null,
     )
     .await?;
     if session == "Aqua" {
@@ -480,9 +604,8 @@ async fn keychain(
         &security,
         &["show-keychain-info", keychain],
         Probe::ExitCode,
-        env,
-        home,
-        inherited,
+        (env, home, inherited),
+        &null,
     )
     .await?;
     Some(if readable == "yes" {
@@ -501,17 +624,25 @@ async fn run_all(
     home: &Path,
     inherited: &[(OsString, OsString)],
 ) -> Vec<(&'static str, String)> {
+    if found.is_empty() {
+        return Vec::new();
+    }
     let env = Arc::new(env.clone());
     let own = Arc::new(own.clone());
     let inherited: Arc<[(OsString, OsString)]> = inherited.into();
+    let null = Null::open();
     let mut set = tokio::task::JoinSet::new();
     for (tool, binary) in found {
         for &(fact, args, probe) in tool.commands() {
             let env = Arc::clone(if *tool == Tool::Git { &own } else { &env });
-            let (binary, home, inherited) =
-                (binary.clone(), home.to_owned(), Arc::clone(&inherited));
+            let (binary, home, inherited, null) = (
+                binary.clone(),
+                home.to_owned(),
+                Arc::clone(&inherited),
+                null.clone(),
+            );
             set.spawn(async move {
-                probe_command(&binary, args, probe, &env, &home, &inherited)
+                probe_command(&binary, args, probe, (&env, &home, &inherited), &null)
                     .await
                     .map(|value| (fact, value))
             });
@@ -608,21 +739,75 @@ impl NodeFacts {
         self.get(name) == Some("1")
     }
 
-    /// The facts as the wire carries them; a value too long for a fact is cut.
+    /// The facts as one answer to a peer carries them (M2-26).
+    ///
+    /// An answer holds at most `MAX_FACTS` facts. A fact whose name or
+    /// value is longer than a fact holds is left out whole, since a cut
+    /// value is a wrong one. With no room for every fact, the answer keeps
+    /// those a measure gives ([`name::MEASURED`]) first, then the others
+    /// by name, and names what it left out in [`name::LEFT_OUT`], so the
+    /// peer knows a fact it does not find may only have had no room.
     #[must_use]
     pub fn to_wire(&self) -> Facts {
-        let pairs = self
+        let fits = |(name, value): &(&String, &String)| {
+            name.len() <= MAX_FACT_NAME
+                && value.len() <= MAX_FACT_VALUE
+                && name.as_str() != name::LEFT_OUT
+        };
+        let wire = |(name, value): (&String, &String)| {
+            (FactName::truncated(name), FactValue::truncated(value))
+        };
+        if self.0.len() <= MAX_FACTS && self.0.iter().all(|pair| fits(&pair)) {
+            return Facts::clamped(self.0.iter().map(wire).collect());
+        }
+        let (measured, other): (Vec<_>, Vec<_>) = self
             .0
             .iter()
-            .map(|(k, v)| (FactName::truncated(k), FactValue::truncated(v)))
-            .collect();
-        Facts::new(pairs).unwrap_or_default()
+            .filter(|(name, _)| name.as_str() != name::LEFT_OUT)
+            .partition(|(name, _)| name::MEASURED.contains(&name.as_str()));
+        let room = MAX_FACTS - 1;
+        let mut kept = Vec::with_capacity(MAX_FACTS);
+        let mut left_out = Vec::new();
+        for pair in measured.into_iter().chain(other) {
+            if kept.len() < room && fits(&pair) {
+                kept.push(wire(pair));
+            } else {
+                left_out.push(pair.0.as_str());
+            }
+        }
+        if !left_out.is_empty() {
+            kept.push((
+                FactName::truncated(name::LEFT_OUT),
+                FactValue::truncated(&left_out_value(&left_out)),
+            ));
+        }
+        Facts::clamped(kept)
+    }
+
+    /// Whether `fact`, absent here, was left out of the answer these facts
+    /// came from, or may have been: named in its `LEFT_OUT`, or among the
+    /// more it had no room to name (M2-26).
+    #[must_use]
+    pub fn left_out(&self, fact: &str) -> bool {
+        self.get(fact).is_none()
+            && self.get(name::LEFT_OUT).is_some_and(|names| {
+                names
+                    .split(' ')
+                    .any(|left| left == fact || left.starts_with('+'))
+            })
     }
 
     /// Reads a peer's facts from the wire.
     #[must_use]
     pub fn from_wire(facts: &Facts) -> Self {
         Self::from_pairs(facts.iter())
+    }
+
+    /// Adds the facts of `more`, a later measure of the same node, over
+    /// these: a measure of tools these lacked, which a preflight asks for
+    /// once a capture names more than it measured.
+    pub fn absorb(&mut self, more: NodeFacts) {
+        self.0.extend(more.0);
     }
 
     /// Only the facts `probes` measures, and those no tool gives: what a
@@ -647,14 +832,97 @@ impl NodeFacts {
     }
 }
 
+/// The value of `LEFT_OUT` for the facts `names`: each name, separated by
+/// a space, as long as the value has room for it and `+N` after it, then
+/// `+N` for the N it had no room for. A name with a space in it, or too
+/// long for a fact, is counted in N and never written.
+fn left_out_value(names: &[&str]) -> String {
+    // A space, a plus and the digits of any count.
+    const COUNT: usize = 2 + 20;
+    let mut value = String::new();
+    let mut more = 0usize;
+    for name in names {
+        let room = value.len() + 1 + name.len() + COUNT <= MAX_FACT_VALUE;
+        if room && name.len() <= MAX_FACT_NAME && !name.contains(' ') {
+            if !value.is_empty() {
+                value.push(' ');
+            }
+            value.push_str(name);
+        } else {
+            more += 1;
+        }
+    }
+    match more {
+        0 => value,
+        _ if value.is_empty() => format!("+{more}"),
+        _ => format!("{value} +{more}"),
+    }
+}
+
+/// `/dev/null`, opened once for the probes of one measure and lent to each
+/// through a duplicate of its descriptor, so a probe's input and unread
+/// output cost a `dup` each instead of an `open`. `None` when it could
+/// not be opened: each probe then opens its own (`Stdio::null`).
+#[derive(Debug, Clone)]
+struct Null(Option<Arc<std::fs::File>>);
+
+impl Null {
+    fn open() -> Self {
+        Self(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/null")
+                .ok()
+                .map(Arc::new),
+        )
+    }
+
+    fn stdio(&self) -> Stdio {
+        self.0
+            .as_ref()
+            .and_then(|null| null.try_clone().ok())
+            .map_or_else(Stdio::null, Stdio::from)
+    }
+}
+
+/// Runs one measuring command and reads its answer, within `COMMAND_TIMEOUT`.
+///
+/// Only the standard output of an `Output` probe is a pipe, and it is
+/// read as it arrives ([`read_fact`]): the moment the value can no longer
+/// be a fact, the command is killed and gives none, so no tool can make
+/// this node hold more than one fact of its output (M2-13). Its input, an
+/// `ExitCode` probe's output and every probe's error output are `null`, as
+/// nothing reads them.
 async fn probe_command(
     binary: &Path,
     args: &[&str],
     probe: Probe,
-    env: &ToolEnv,
-    home: &Path,
-    inherited: &[(OsString, OsString)],
+    context: (&ToolEnv, &Path, &[(OsString, OsString)]),
+    null: &Null,
 ) -> Option<String> {
+    tracing::debug!(?binary, ?args, "measuring");
+    let answer = match start(binary, args, probe, context, null) {
+        Some(child) => tokio::time::timeout(COMMAND_TIMEOUT, answer(child, probe)).await,
+        None => Ok(None),
+    };
+    tracing::debug!(?binary, ?args, done = answer.is_ok(), "measured");
+    answer.ok().flatten()
+}
+
+/// Starts one measuring command, or `None` if it could not start; the
+/// child is killed when it is dropped.
+///
+/// It is not async, so the command, which takes a few hundred bytes, is
+/// gone before the probe first waits: it never becomes part of the
+/// probe's task, which every worker that polls it carries on its stack.
+fn start(
+    binary: &Path,
+    args: &[&str],
+    probe: Probe,
+    (env, home, inherited): (&ToolEnv, &Path, &[(OsString, OsString)]),
+    null: &Null,
+) -> Option<tokio::process::Child> {
     let path_var = env.path_var();
     let mut command = tokio::process::Command::new(binary);
     command
@@ -666,30 +934,147 @@ async fn probe_command(
             None => command.env_remove(name),
         };
     }
-    let child = command
+    command
         .args(args)
         .env("PATH", path_var)
         .env("HOME", home)
         .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stdin(null.stdio())
+        .stdout(match probe {
+            Probe::Output => Stdio::piped(),
+            Probe::ExitCode => null.stdio(),
+        })
+        .stderr(null.stdio())
         .kill_on_drop(true)
-        .output();
-    tracing::debug!(?binary, ?args, "measuring");
-    let output = tokio::time::timeout(COMMAND_TIMEOUT, child).await;
-    tracing::debug!(?binary, ?args, done = output.is_ok(), "measured");
-    let Ok(Ok(output)) = output else {
-        return None;
-    };
+        .spawn()
+        .ok()
+}
+
+/// Reads a started command's answer as `probe` says. A command whose
+/// output cannot be a fact gives none, and is killed when `child` is
+/// dropped.
+async fn answer(mut child: tokio::process::Child, probe: Probe) -> Option<String> {
     match probe {
-        Probe::ExitCode => Some(if output.status.success() { "yes" } else { "no" }.to_owned()),
-        Probe::Output => {
-            let text = String::from_utf8(output.stdout).unwrap_or_default();
-            let text = text.trim();
-            (output.status.success() && !text.is_empty() && text.len() <= MAX_FACT_VALUE)
-                .then(|| text.to_owned())
+        Probe::ExitCode => {
+            let status = child.wait().await.ok()?;
+            Some(if status.success() { "yes" } else { "no" }.to_owned())
         }
+        Probe::Output => {
+            let text = read_fact(child.stdout.take()?).await?;
+            child.wait().await.ok()?.success().then_some(text)
+        }
+    }
+}
+
+/// Reads a probe's standard output to its end and returns it trimmed, or
+/// `None` once it cannot be a fact: not UTF-8, nothing but whitespace, or
+/// longer than `MAX_FACT_VALUE` bytes once trimmed (`str::trim`, kept
+/// whole otherwise). It stops at the first byte that makes the value too
+/// long, and keeps at most `MAX_FACT_VALUE` bytes of it meanwhile.
+async fn read_fact(mut out: impl tokio::io::AsyncRead + Unpin) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut fact = Trimmed::default();
+    // Every probe's answer in one read, `rustc -vV`'s 192 bytes the
+    // longest. The buffer lives in each probe's task, which every worker
+    // that polls it carries on its stack, so it is no larger than that.
+    let mut buf = [0u8; 256];
+    loop {
+        match out.read(&mut buf).await.ok()? {
+            0 => return fact.finish(),
+            n => fact.feed(&buf[..n])?,
+        }
+    }
+}
+
+/// A fact's text as its bytes arrive: from the first character that is
+/// not whitespace on, with the whitespace after the last such character
+/// kept only while it could still end up inside the value.
+#[derive(Debug, Default)]
+struct Trimmed {
+    /// The value so far and, while they fit, the whitespace after it.
+    text: String,
+    /// The value's length: up to its last character that is not whitespace.
+    end: usize,
+    /// `end` plus every byte of whitespace after it, kept or not.
+    len: usize,
+    /// The first bytes of a character the previous read split.
+    split: [u8; 4],
+    /// How many of them.
+    split_len: usize,
+}
+
+impl Trimmed {
+    /// Takes the next bytes read; `None` once the value cannot be a fact.
+    fn feed(&mut self, mut bytes: &[u8]) -> Option<()> {
+        while self.split_len > 0 {
+            let Some((&byte, rest)) = bytes.split_first() else {
+                return Some(());
+            };
+            bytes = rest;
+            let mut split = self.split;
+            split[self.split_len] = byte;
+            match std::str::from_utf8(&split[..=self.split_len]) {
+                Ok(whole) => {
+                    self.split_len = 0;
+                    self.take(whole)?;
+                }
+                Err(e) if e.error_len().is_none() => {
+                    self.split = split;
+                    self.split_len += 1;
+                }
+                Err(_) => return None,
+            }
+        }
+        let (text, tail) = match std::str::from_utf8(bytes) {
+            Ok(text) => (text, &[][..]),
+            Err(e) if e.error_len().is_none() => {
+                let (text, tail) = bytes.split_at(e.valid_up_to());
+                (std::str::from_utf8(text).ok()?, tail)
+            }
+            Err(_) => return None,
+        };
+        self.take(text)?;
+        self.split[..tail.len()].copy_from_slice(tail);
+        self.split_len = tail.len();
+        Some(())
+    }
+
+    /// Takes whole characters.
+    fn take(&mut self, text: &str) -> Option<()> {
+        let text = if self.end == 0 {
+            text.trim_start()
+        } else {
+            text
+        };
+        let core = text.trim_end().len();
+        if core > 0 {
+            // Whitespace that was not kept put `len` past the cap already.
+            if self.len + core > MAX_FACT_VALUE {
+                return None;
+            }
+            if self.text.capacity() == 0 {
+                // One allocation for a value that arrives in one read.
+                self.text.reserve(text.len().min(MAX_FACT_VALUE));
+            }
+            self.text.push_str(&text[..core]);
+            self.end = self.text.len();
+            self.len = self.end;
+        }
+        let gap = &text[core..];
+        self.len += gap.len();
+        if self.end > 0 && self.len <= MAX_FACT_VALUE {
+            self.text.push_str(gap);
+        }
+        Some(())
+    }
+
+    /// The value, once the output ended.
+    fn finish(mut self) -> Option<String> {
+        (self.split_len == 0 && self.end > 0).then(|| {
+            self.text.truncate(self.end);
+            self.text
+        })
     }
 }
 
@@ -1107,7 +1492,11 @@ pub(crate) mod tests {
     ///
     /// macOS checks a new executable the first time it runs, which takes
     /// a tenth of a second or more here, so a test installs the tools it
-    /// reads unless it must see a tool it does not expect run.
+    /// reads unless it must see a tool it does not expect run. `install`
+    /// runs each tool once, unlogged, so that check is paid there and not
+    /// inside a measure: on a machine loaded enough, a first run that waits
+    /// on the check outlasted `COMMAND_TIMEOUT` and the measure lost the
+    /// fact (a pull's `codex.login`).
     pub(crate) struct CountingTools {
         dir: PathBuf,
         /// `PATH` of the tools, `/usr/bin` and `/bin`, with no tool root.
@@ -1192,8 +1581,11 @@ pub(crate) mod tests {
         /// inherited open for writing (`ETXTBSY`).
         pub(crate) fn install(&self, program: &str, answer: &str) {
             let log = self.dir.join("probes.log");
+            let warm = self.dir.join("warm");
+            std::fs::create_dir_all(&warm).unwrap();
             let script = format!(
-                "#!/bin/sh\necho \"{program} $*\" >> '{}'\n{answer}\n",
+                "#!/bin/sh\n[ -z \"$FABRIC_TOOL_WARM\" ] || {{ : > '{}'; exit 0; }}\necho \"{program} $*\" >> '{}'\n{answer}\n",
+                warm.join(program).display(),
                 log.display()
             );
             let mut writer = std::process::Command::new("/bin/sh")
@@ -1209,6 +1601,11 @@ pub(crate) mod tests {
                 .write_all(script.as_bytes())
                 .unwrap();
             assert!(writer.wait().unwrap().success());
+            let warmed = std::process::Command::new(self.dir.join("bin").join(program))
+                .env("FABRIC_TOOL_WARM", "1")
+                .status()
+                .unwrap();
+            assert!(warmed.success(), "{program} did not run once at install");
         }
 
         /// Makes both logins answer no.
@@ -1225,6 +1622,55 @@ pub(crate) mod tests {
             lines.sort();
             lines
         }
+    }
+
+    /// The tools a peer's question names read back as the same tools, and
+    /// a name this node does not know makes it every tool: an answer may
+    /// hold more than was asked, never less (item 19).
+    #[test]
+    fn the_tools_a_question_names_read_back_and_an_unknown_one_is_every_tool() {
+        for tool in Tool::ALL {
+            let one = Probes::NONE.with(tool);
+            assert_eq!(Probes::from_wire(&one.to_wire()), one, "{tool:?}");
+            assert_eq!(
+                Tool::ALL
+                    .iter()
+                    .filter(|t| t.wire_name() == tool.wire_name())
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(Probes::from_wire(&Probes::ALL.to_wire()), Probes::ALL);
+        assert_eq!(Probes::from_wire(&Probes::NONE.to_wire()), Probes::NONE);
+        let unknown = fabric_net::wire::Tools::new(vec![
+            ToolName::truncated("git"),
+            ToolName::truncated("zig"),
+        ])
+        .unwrap();
+        assert_eq!(Probes::from_wire(&unknown), Probes::ALL);
+        assert_eq!(Tool::of_fact(name::PNPM_STORE), Some(Tool::Pnpm));
+        assert_eq!(
+            Tool::of_fact(name::CLAUDE_KEYCHAIN),
+            Some(Tool::ClaudeLogin)
+        );
+        assert_eq!(Tool::of_fact(name::HOME), None);
+    }
+
+    /// An installed counting tool has run once, unlogged, before any
+    /// measure: macOS's check of a new executable is paid at install, not
+    /// inside a measure that a slow first run could push past
+    /// `COMMAND_TIMEOUT` on a loaded machine.
+    #[test]
+    fn a_counting_tool_has_run_once_before_a_measure_and_logged_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = CountingTools::only(dir.path(), &["codex", "node"]);
+        for program in ["codex", "node"] {
+            assert!(
+                dir.path().join("counting/warm").join(program).exists(),
+                "{program} first ran inside a measure"
+            );
+        }
+        assert_eq!(tools.ran(), Vec::<String>::new());
     }
 
     /// A tool in a directory the client's `PATH` names only relatively is
@@ -1363,6 +1809,211 @@ pub(crate) mod tests {
         std::fs::write(&session, "Background\n").unwrap();
         std::fs::remove_file(&keychain).unwrap();
         assert_eq!(measured().await, (None, vec![]), "no login keychain");
+    }
+
+    /// M2-13: a probe reads its output as it arrives and stops once the
+    /// value passes what a fact holds, instead of buffering all of it
+    /// first, so a tool that prints far more than `MAX_FACT_VALUE` costs
+    /// this node no more memory than a fact: it is stopped before it gets
+    /// to write the rest, and gives no fact. The tool's other command
+    /// still gives its own.
+    #[tokio::test]
+    async fn a_probe_stops_reading_once_its_output_passes_what_a_fact_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = CountingTools::only(dir.path(), &[]);
+        let finished = dir.path().join("finished");
+        tools.install(
+            "node",
+            &format!(
+                "case \"$1\" in --version) head -c 16777216 /dev/zero | tr '\\0' 7; touch '{}' ;; -p) echo 127 ;; esac",
+                finished.display()
+            ),
+        );
+        let started = std::time::Instant::now();
+        let facts = NodeFacts::measure(dir.path(), &tools.env, Probes::NONE.with(Tool::Node)).await;
+        assert_eq!(facts.get(name::NODE), None);
+        assert_eq!(facts.get(name::NODE_ABI), Some("127"));
+        assert!(
+            !finished.exists(),
+            "the probe read all 16 MiB the tool printed"
+        );
+        assert!(started.elapsed() < COMMAND_TIMEOUT / 2);
+    }
+
+    /// What a probe's whole output gave before M2-13, when it was read to
+    /// its end first: the text trimmed, if UTF-8, not empty and short enough.
+    fn whole_output(bytes: &[u8]) -> Option<String> {
+        let text = std::str::from_utf8(bytes).ok()?.trim();
+        (!text.is_empty() && text.len() <= MAX_FACT_VALUE).then(|| text.to_owned())
+    }
+
+    fn fed(pieces: &[&[u8]]) -> Option<String> {
+        let mut fact = Trimmed::default();
+        for piece in pieces {
+            fact.feed(piece)?;
+        }
+        fact.finish()
+    }
+
+    /// Read as it arrives, an output gives the value it gave read whole,
+    /// however the reads split it: inside a character, inside the
+    /// whitespace around the value, or one byte at a time. Whitespace is
+    /// Unicode's, as `str::trim` reads it, and only the value counts
+    /// against `MAX_FACT_VALUE`, not the whitespace around it.
+    #[test]
+    fn a_fact_read_as_it_arrives_is_the_fact_read_whole() {
+        let max = MAX_FACT_VALUE;
+        let x = |n: usize| "x".repeat(n);
+        let cases: Vec<Vec<u8>> = [
+            "v22.23.2\n".to_owned(),
+            String::new(),
+            " \t\n".to_owned(),
+            " a b \n".to_owned(),
+            "\u{3000}x\u{a0}y\u{3000}\n".to_owned(),
+            "é 日本 𝔘\n".to_owned(),
+            format!("{}\n", x(max)),
+            format!("\n{}", x(max)),
+            x(max + 1),
+            format!("{} y", x(max - 2)),
+            format!("{} y", x(max - 3)),
+            format!("{}{}", x(max), " ".repeat(10_000)),
+            format!("{}x", " ".repeat(10_000)),
+            format!("x{}y", " ".repeat(max)),
+            format!("{}é", x(max - 1)),
+        ]
+        .into_iter()
+        .map(String::into_bytes)
+        .chain([
+            b"\xff".to_vec(),
+            b"ok\xe6\x97".to_vec(),
+            b"\xe6\x97\xa5 \xe6".to_vec(),
+            b"x\x80y".to_vec(),
+        ])
+        .collect();
+        for case in &cases {
+            let expected = whole_output(case);
+            assert_eq!(fed(&[case]), expected, "{case:?} in one read");
+            let bytes: Vec<&[u8]> = case.chunks(1).collect();
+            assert_eq!(fed(&bytes), expected, "{case:?} a byte at a time");
+            if case.len() <= 64 {
+                for at in 0..=case.len() {
+                    let (a, b) = case.split_at(at);
+                    assert_eq!(fed(&[a, b]), expected, "{case:?} split at {at}");
+                }
+            }
+        }
+    }
+
+    /// A reader that counts the bytes it hands out of an endless stream.
+    struct Endless(usize);
+
+    impl tokio::io::AsyncRead for Endless {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let n = buf.remaining();
+            buf.put_slice(&vec![b'7'; n]);
+            self.0 += n;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// An output that never ends is read only until it passes what a fact
+    /// holds: one read past `MAX_FACT_VALUE` at most.
+    #[tokio::test]
+    async fn an_endless_output_is_read_only_until_it_cannot_be_a_fact() {
+        let mut endless = Endless(0);
+        assert_eq!(read_fact(&mut endless).await, None);
+        assert!(endless.0 <= 2 * MAX_FACT_VALUE, "read {} bytes", endless.0);
+    }
+
+    /// M2-26: a node whose facts did not fit one answer sent none at all,
+    /// so its peer judged a move as if the node had nothing installed. The
+    /// answer keeps every fact a measure gives, fills the rest of its room
+    /// with other facts by name, and names in `facts.left_out` what it
+    /// left out. A value too long for a fact is left out whole, never cut,
+    /// since a cut value is a wrong one.
+    #[test]
+    fn an_answer_with_no_room_for_every_fact_keeps_the_measured_ones_and_names_the_rest() {
+        use fabric_net::wire::MAX_FACTS;
+
+        let mut pairs: Vec<(String, String)> = name::MEASURED
+            .iter()
+            .map(|name| ((*name).to_owned(), format!("{name} value")))
+            .collect();
+        pairs.extend((0..MAX_FACTS).map(|n| (format!("extra.{n:02}"), "x".to_owned())));
+        let facts = NodeFacts::from_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        let wire = facts.to_wire();
+        assert_eq!(wire.iter().count(), MAX_FACTS);
+        for name in name::MEASURED {
+            assert_eq!(wire.get(name), facts.get(name), "{name}");
+        }
+        let room = MAX_FACTS - 1 - name::MEASURED.len();
+        let left: Vec<String> = (room..MAX_FACTS).map(|n| format!("extra.{n:02}")).collect();
+        assert_eq!(wire.get("facts.left_out"), Some(left.join(" ").as_str()));
+
+        let long = "/".repeat(MAX_FACT_VALUE + 1);
+        let facts = NodeFacts::from_pairs([(name::USER, "me"), (name::HOME, long.as_str())]);
+        let wire = facts.to_wire();
+        assert_eq!(wire.get(name::USER), Some("me"));
+        assert_eq!(wire.get(name::HOME), None, "a cut value is a wrong value");
+        assert_eq!(wire.get("facts.left_out"), Some(name::HOME));
+    }
+
+    /// `name::MEASURED`, which an answer keeps first, is every fact a
+    /// measure can give, once: each tool's, those that need no tool, the
+    /// Keychain's and an ACP agent's.
+    #[test]
+    fn the_measured_facts_are_every_fact_a_measure_gives() {
+        let mut given: Vec<&str> = Tool::ALL
+            .iter()
+            .flat_map(|tool| tool.commands().iter().map(|(fact, _, _)| *fact))
+            .collect();
+        let home = Path::new("/nowhere");
+        let without = NodeFacts::without_tools(home, &ToolEnv::from_vars(|_| None));
+        given.extend(without.iter().map(|(fact, _)| {
+            name::MEASURED
+                .iter()
+                .find(|known| **known == fact)
+                .copied()
+                .unwrap_or("not in MEASURED")
+        }));
+        given.extend([
+            name::LSOF,
+            name::CLAUDE_KEYCHAIN,
+            name::ACP_AGENT,
+            name::ACP_STATE_DIR,
+        ]);
+        given.sort_unstable();
+        given.dedup();
+        let mut measured = name::MEASURED.to_vec();
+        measured.sort_unstable();
+        let before = measured.len();
+        measured.dedup();
+        assert_eq!(measured.len(), before, "a name twice");
+        assert_eq!(given, measured);
+    }
+
+    /// The names of what an answer left out stop where the value has no
+    /// more room, and a count says how many more there were.
+    #[test]
+    fn left_out_names_end_in_a_count_of_those_with_no_room() {
+        assert_eq!(left_out_value(&["a.b", "c"]), "a.b c");
+        let long = "n".repeat(MAX_FACT_NAME);
+        let names: Vec<&str> = std::iter::repeat_n(long.as_str(), 100).collect();
+        let value = left_out_value(&names);
+        assert!(value.len() <= MAX_FACT_VALUE);
+        let listed = value.split(' ').filter(|n| *n == long).count();
+        assert!(value.ends_with(&format!(" +{}", 100 - listed)), "{value}");
+        assert_eq!(left_out_value(&["has space", "x"]), "x +1");
+        let facts = NodeFacts::from_pairs([(name::LEFT_OUT, "x +1")]);
+        assert!(facts.left_out("x") && facts.left_out("anything"));
+        let facts = NodeFacts::from_pairs([(name::LEFT_OUT, "x"), ("y", "1")]);
+        assert!(facts.left_out("x"));
+        assert!(!facts.left_out("y") && !facts.left_out("z"));
+        assert!(!NodeFacts::default().left_out("x"));
     }
 
     /// Every fact a node can measure, as a rich node would answer.

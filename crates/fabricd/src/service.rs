@@ -25,7 +25,7 @@ use fabric_core::moves::{AbortAnswer, CompleteSnapshot, LeaseView, MoveOffer, Of
 use fabric_net::rpc::{JobFuture, Service};
 use fabric_net::wire::{
     Appended, Facts, Fault, FaultText, Fenced, KnownWriter, ManifestChunks, MoveRequested,
-    MoveState, Offered, Pulled, RecordBytes, RecordPage, VersionText,
+    MoveState, Offered, Pulled, RecordBytes, RecordPage, Tools, VersionText,
 };
 use fabric_store::objects::ObjectError;
 use fabric_store::store::StoreError;
@@ -169,16 +169,20 @@ impl Service for Node {
         &self,
         _peer: NodeId,
         harness: HarnessKind,
+        tools: Tools,
     ) -> BoxFuture<'_, Result<Facts, Fault>> {
         Box::pin(async move {
-            // This node is the target of a push of a job under `harness`.
-            // The answer holds every fact, as `facts` does, and for an ACP
-            // job where this node finds the agent and the `state_dir` it
-            // gives it, on the PATH the rest were measured with, so the
-            // pushing node refuses a target that could not launch the job
-            // (issue #16). A pull measures the same on the pulling node.
+            // This node is the target of a push of a job under `harness`,
+            // or the holder a pull asks. The answer holds the facts of the
+            // tools the asking node reads for that job (item 19 of the A/B
+            // lab: `ops::preflight_probes`), those no process gives, and
+            // for an ACP job where this node finds the agent and the
+            // `state_dir` it gives it, on the PATH the rest were measured
+            // with, so the pushing node refuses a target that could not
+            // launch the job (issue #16).
             let env = self.node_env();
-            let mut facts = NodeFacts::measure(&self.cfg.home, &env, Probes::ALL).await;
+            let probes = Probes::from_wire(&tools);
+            let mut facts = NodeFacts::measure(&self.cfg.home, &env, probes).await;
             if let HarnessKind::Acp { program, .. } = &harness {
                 let harness_env = self.harness_env(&env).map_err(|e| internal(&e))?;
                 facts.measure_acp(program, &harness_env);

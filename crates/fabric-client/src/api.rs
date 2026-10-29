@@ -135,11 +135,15 @@ pub enum Op {
     ManagedStatus,
     /// [`Request::ManagedList`].
     ManagedList,
+    /// [`Request::JobRepair`].
+    JobRepair,
+    /// [`Request::JobExport`].
+    JobExport,
 }
 
 impl Op {
     /// Every op of this api version.
-    pub const ALL: [Op; 23] = [
+    pub const ALL: [Op; 25] = [
         Op::NodeId,
         Op::NodeAdd,
         Op::NodeList,
@@ -163,6 +167,8 @@ impl Op {
         Op::ManagedCancel,
         Op::ManagedStatus,
         Op::ManagedList,
+        Op::JobRepair,
+        Op::JobExport,
     ];
 
     /// The op's name on the wire: the request's `op` and the reply's `kind`.
@@ -192,6 +198,8 @@ impl Op {
             Op::ManagedCancel => "managed_cancel",
             Op::ManagedStatus => "managed_status",
             Op::ManagedList => "managed_list",
+            Op::JobRepair => "job_repair",
+            Op::JobExport => "job_export",
         }
     }
 }
@@ -624,6 +632,32 @@ pub enum Request {
     },
     /// Every managed job.
     ManagedList,
+    /// Applies the fork rule of ADR 0003 to a job frozen after a fork:
+    /// takes the peer's chain when it wins, keeping this node's ledger
+    /// whole beside it and pinning the snapshots only that ledger names,
+    /// and lifts the freeze; or lifts it when the chains no longer fork.
+    /// When this node's chain wins, the job stays frozen until the peer
+    /// has taken it.
+    JobRepair {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+    },
+    /// Captures an orphan workspace of the job, one this node does not
+    /// own at the current tenure, into a snapshot that is not the job's
+    /// head, and pins it with its whole bundle chain (ADR 0003, Orphans).
+    JobExport {
+        /// The job.
+        #[serde(with = "text")]
+        job: JobId,
+        /// A workspace a restore set aside under `orphan/` beside the
+        /// job's root; the workspace at the job's root when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<SystemPath>,
+        /// The client's environment for the tools the capture measures.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<ClientEnv>,
+    },
 }
 
 /// Every capability a node of this api version lists in its welcome, in
@@ -680,6 +714,7 @@ impl Request {
             | Request::JobResume { env, .. }
             | Request::JobSuspend { env, .. }
             | Request::JobMove { env, .. }
+            | Request::JobExport { env, .. }
             | Request::Doctor { env, .. } => env.as_ref(),
             Request::NodeId
             | Request::NodeAdd { .. }
@@ -698,7 +733,8 @@ impl Request {
             | Request::ManagedCreate { .. }
             | Request::ManagedCancel { .. }
             | Request::ManagedStatus { .. }
-            | Request::ManagedList => None,
+            | Request::ManagedList
+            | Request::JobRepair { .. } => None,
         }
     }
 
@@ -729,6 +765,8 @@ impl Request {
             Request::ManagedCancel { .. } => Op::ManagedCancel,
             Request::ManagedStatus { .. } => Op::ManagedStatus,
             Request::ManagedList => Op::ManagedList,
+            Request::JobRepair { .. } => Op::JobRepair,
+            Request::JobExport { .. } => Op::JobExport,
         }
     }
 }
@@ -1094,6 +1132,10 @@ pub enum Reply {
     ManagedStatus(Box<ManagedJob>),
     /// For [`Request::ManagedList`].
     ManagedList(ManagedJobs),
+    /// For [`Request::JobRepair`].
+    JobRepair(Repaired),
+    /// For [`Request::JobExport`].
+    JobExport(Exported),
 }
 
 impl Reply {
@@ -1124,8 +1166,58 @@ impl Reply {
             Reply::ManagedCancel(_) => Op::ManagedCancel,
             Reply::ManagedStatus(_) => Op::ManagedStatus,
             Reply::ManagedList(_) => Op::ManagedList,
+            Reply::JobRepair(_) => Op::JobRepair,
+            Reply::JobExport(_) => Op::JobExport,
         }
     }
+}
+
+/// What a fork repair did (ADR 0003, Forks).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Repaired {
+    /// The peer whose chain the job had forked from.
+    #[serde(with = "text")]
+    pub peer: NodeId,
+    /// What became of the two chains.
+    pub outcome: RepairOutcome,
+}
+
+/// What became of two chains of a job a fork had frozen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RepairOutcome {
+    /// One chain holds the other, so they no longer fork, and the freeze
+    /// is lifted; records the peer holds beyond this node's come with the
+    /// next catch-up.
+    Unforked,
+    /// The peer's chain won by the fork rule: this node took it, kept its
+    /// own ledger whole at `kept`, pinned the snapshots only that ledger
+    /// published, and lifted the freeze.
+    Adopted {
+        /// The epoch of the chain taken.
+        epoch: Epoch,
+        /// Where the ledger this node held is kept.
+        kept: PathBuf,
+        /// The snapshots only the kept ledger named, now pinned.
+        #[serde(with = "text::list")]
+        orphans: Vec<SnapshotId>,
+    },
+    /// A kind of outcome this client does not know; a newer node sent it.
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// What an orphan export captured and pinned (ADR 0003, Orphans).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Exported {
+    /// The snapshot, which the job's ledger does not name.
+    #[serde(with = "text")]
+    pub snapshot: SnapshotId,
+    /// The workspace it was captured from.
+    pub root: PathBuf,
+    /// It and each bundle base it needs, all pinned.
+    #[serde(with = "text::list")]
+    pub chain: Vec<SnapshotId>,
 }
 
 /// A managed job as the client API shows it (ADR 0019).
@@ -2684,6 +2776,23 @@ pub enum Event {
     HarnessRecorded {
         /// Its pid.
         pid: NonZeroU32,
+    },
+    /// The workspace a launch of the plan this node is about to answer
+    /// runs in is in place at `root`, and the launch continues `session`
+    /// of `harness`. A client that checks the harness before it launches
+    /// it, as the CLI's resume guard asks it `--version` in the workspace,
+    /// may start that check now, beside the rest of the node's work and
+    /// its own setup; the plan in the answer still decides what launches.
+    /// Sent during `job_run` and `job_resume` (added 2026-10-28). A client
+    /// that skips it checks after the answer, as before.
+    SessionToContinue {
+        /// The harness.
+        #[serde(with = "HarnessDef")]
+        harness: HarnessKind,
+        /// The session.
+        session: SessionId,
+        /// The workspace root the launch runs in.
+        root: PathBuf,
     },
     /// A kind of event this client does not know; a newer node sent it.
     #[serde(other)]

@@ -37,7 +37,7 @@ Every mutating command on a managed job carries an `OperationKey` from the calle
 2. checks the expected revision; a mismatch is stored as a rejected operation under the key, so a retry gets the same refusal;
 3. appends the command's events, updates the projections, stores the operation and its result, and commits.
 
-The answer is sent only after the commit returns. A client that loses the answer sends the same key and command again and gets the same result, never a second effect.
+The answer is sent only after the commit returns. A client that loses the answer sends the same key and command again and gets the same result, never a second effect. On the control socket the answer itself is never dropped: a client that stops reading loses at most the events past the node's per-client backlog (1 MiB of frames, M2-14), and one that leaves before the answer asks again with its key.
 
 ### Outcomes stay distinguishable
 

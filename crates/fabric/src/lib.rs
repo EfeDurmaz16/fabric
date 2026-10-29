@@ -41,19 +41,22 @@ use fabric_core::harness::HarnessKind;
 use fabric_core::id::{EnvSpecId, JobId, NodeId};
 use fabric_core::session::SessionId;
 use fabric_env::materialize::{CacheHealth, MaterializeError, NodeEnv, TreeLock};
-use fabric_harness::claude::{ClaudeCode, LeftReason, TrustOutcome};
+use fabric_harness::claude::{ClaudeCode, LeftReason, TrustOutcome, VersionAhead};
 use fabric_harness::codex::Codex;
 use fabric_harness::{
     Harness, Launch, LaunchSettings, Origin, PassedSetting, Running, TurnEvent, TurnFeed,
     TurnReport,
 };
 use fabric_net::endpoint::DialOrder;
-use fabricd::harnesses::{HarnessEnv, acp_adapter, parse_harness};
+use fabricd::harnesses::{HarnessConfig, HarnessEnv, acp_adapter, parse_harness};
 use fabricd::node::{Node, NodeConfig};
 use fabricd::paths::{STATE_DIR_ENV, StateDir};
 use fabricd::tool_env::ToolEnv;
+use std::sync::Arc;
+
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+mod managed;
 mod render;
 mod terminal;
 
@@ -75,6 +78,9 @@ enum Command {
     /// Make, run, suspend, move and resume jobs.
     #[command(subcommand)]
     Job(JobCommand),
+    /// Make, cancel and read managed jobs (ADR 0019).
+    #[command(subcommand)]
+    Managed(managed::ManagedCommand),
     /// Print this node's facts, or compare them with a paired node's before a move.
     Doctor {
         /// The node to compare with.
@@ -232,6 +238,22 @@ enum JobCommand {
         #[arg(long, default_value = "")]
         note: String,
     },
+    /// Settle a job frozen after a fork by the fork rule: take the peer's
+    /// chain when it wins, keeping this node's ledger and its snapshots.
+    Repair {
+        /// The job.
+        job: JobId,
+    },
+    /// Snapshot an orphan workspace of the job without making it the job's
+    /// head, and keep the snapshot.
+    Export {
+        /// The job.
+        job: JobId,
+        /// A workspace a restore set aside under orphan/ beside the job's
+        /// root; the workspace at the root when left out.
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
 }
 
 fn harness_arg(text: &str) -> Result<HarnessKind, String> {
@@ -382,8 +404,23 @@ impl Printer {
 /// Sends a request, printing each event as it arrives and then the reply;
 /// a refusal becomes an error.
 async fn ask(client: &Client, request: &Request, notes: Notes) -> Result<Reply> {
+    ask_watching(client, request, notes, |_| {}).await
+}
+
+/// `ask`, handing each event to `watch` as well, before it is printed.
+async fn ask_watching(
+    client: &Client,
+    request: &Request,
+    notes: Notes,
+    mut watch: impl FnMut(&Event),
+) -> Result<Reply> {
     let mut printer = Printer::new(notes);
-    let answered = client.call(request, |event| printer.print(&event)).await;
+    let answered = client
+        .call(request, |event| {
+            watch(&event);
+            printer.print(&event);
+        })
+        .await;
     printer.finish()?;
     let reply = answered.map_err(Refused::from_client)?;
     notes.print(&render::reply(&reply))?;
@@ -416,7 +453,7 @@ pub fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .with_max_level(level)
         .init();
-    let runtime = match tokio::runtime::Runtime::new() {
+    let runtime = match runtime_for(&cli.command) {
         Ok(runtime) => runtime,
         Err(e) => {
             tracing::error!(error = %e, "no async runtime");
@@ -430,6 +467,29 @@ pub fn main() -> ExitCode {
             exit_code(&e)
         }
     }
+}
+
+/// The worker threads of a client command's runtime.
+///
+/// A client sends one request and waits on its answer, a harness and a few
+/// tasks beside them, so a worker per core only costs memory and start-up:
+/// with two, a release `job ls` peaks at 4.20 MiB instead of 4.75 MiB and
+/// runs about 9% faster (docs/evidence/perf-ab/README.md, item 7). Two,
+/// not one, so a task that blocks its worker for a moment, as the setup
+/// steps of a launch do, never stalls the signal handling beside it.
+const CLIENT_WORKERS: usize = 2;
+
+/// The runtime a command runs on: `serve` gets a worker per core, since the
+/// node serves its peers and every client at once; any other command gets
+/// `CLIENT_WORKERS`.
+fn runtime_for(command: &Command) -> std::io::Result<tokio::runtime::Runtime> {
+    if matches!(command, Command::Serve(_)) {
+        return tokio::runtime::Runtime::new();
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(CLIENT_WORKERS)
+        .enable_all()
+        .build()
 }
 
 async fn run(cli: Cli) -> Result<ExitCode> {
@@ -471,6 +531,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Job(command) => job(&state, &home, command).await,
+        Command::Managed(command) => managed::run(&client, command)
+            .await
+            .map(|_| ExitCode::SUCCESS),
     }
 }
 
@@ -506,9 +569,12 @@ async fn serve(state: StateDir, home: PathBuf, args: ServeArgs) -> Result<ExitCo
 async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitCode> {
     let client = client(state);
     let (request, mode, yes) = job_request(command)?;
-    let (Reply::JobRun(plan) | Reply::JobResume(plan)) =
-        ask(&client, &request, mode.notes()).await?
-    else {
+    let mut ahead = GuardAhead::default();
+    let reply = ask_watching(&client, &request, mode.notes(), |event| {
+        ahead.watch(home, event);
+    })
+    .await?;
+    let (Reply::JobRun(plan) | Reply::JobResume(plan)) = reply else {
         return Ok(ExitCode::SUCCESS);
     };
     let approval = Approval {
@@ -516,7 +582,55 @@ async fn job(state: &StateDir, home: &Path, command: JobCommand) -> Result<ExitC
         yes,
         ask: &ask_on_terminal,
     };
-    launch(state, home, &client, &plan, mode, &approval).await
+    launch(state, home, &client, &plan, (mode, ahead), &approval).await
+}
+
+/// The resume guard's `--version`, started as soon as the node names the
+/// session a launch continues (`session_to_continue`), so it runs while
+/// the node finishes the plan and this command takes the tree lock and
+/// checks the setup steps, instead of after (item 15 of
+/// docs/evidence/perf-ab/README.md). The launch's adapter takes the answer
+/// only when it asks the same binary in the same workspace with the same
+/// environment, and only when no setup step ran in between, since a step
+/// may install or switch the harness; otherwise the guard asks again.
+#[derive(Default)]
+struct GuardAhead(Option<(HarnessKind, VersionAhead)>);
+
+impl GuardAhead {
+    /// Starts the probe for the harness and root `event` names, once.
+    fn watch(&mut self, home: &Path, event: &Event) {
+        let Event::SessionToContinue { harness, root, .. } = event else {
+            return;
+        };
+        if self.0.is_some() {
+            return;
+        }
+        let Ok(env) = HarnessEnv::new(home, path_var(), HarnessConfig::default()) else {
+            return;
+        };
+        let launch_env = environment();
+        let started = match harness {
+            HarnessKind::ClaudeCode => {
+                ClaudeCode::new(env.home, env.path_var).ask_guard_ahead(root, &launch_env)
+            }
+            HarnessKind::Codex => {
+                Codex::new(env.home, env.path_var).ask_guard_ahead(root, &launch_env)
+            }
+            HarnessKind::Acp { .. } => return,
+        };
+        // A probe that cannot start, as without the binary, is left to
+        // the guard, which reports it in its own words.
+        if let Ok(ahead) = started {
+            self.0 = Some((harness.clone(), ahead));
+        }
+    }
+
+    /// The probe, for a launch of `harness`.
+    fn take_for(self, harness: &HarnessKind) -> Option<VersionAhead> {
+        self.0
+            .filter(|(asked, _)| asked == harness)
+            .map(|(_, ahead)| ahead)
+    }
 }
 
 /// The request a job command sends, how a harness it launches runs, and
@@ -607,19 +721,33 @@ fn job_request(command: JobCommand) -> Result<(Request, Mode, bool)> {
             Mode::Interactive(None),
             false,
         ),
+        JobCommand::Repair { job } => (Request::JobRepair { job }, Mode::Interactive(None), false),
+        JobCommand::Export { job, path } => (
+            Request::JobExport {
+                job,
+                path: path.as_deref().map(system_path).transpose()?,
+                env: env()?,
+            },
+            Mode::Interactive(None),
+            false,
+        ),
     })
 }
 
 /// The repository `fabric job new` names, as the absolute path the client API carries.
 fn repository(repo: &Path) -> Result<SystemPath> {
-    let canonical =
-        std::fs::canonicalize(repo).with_context(|| format!("repository {}", repo.display()))?;
+    system_path(repo).with_context(|| format!("repository {}", repo.display()))
+}
+
+/// `path`, resolved to its physical path, as the client API carries it.
+fn system_path(path: &Path) -> Result<SystemPath> {
+    let canonical = std::fs::canonicalize(path)?;
     canonical
         .to_str()
         .and_then(|text| SystemPath::parse(text).ok())
         .ok_or_else(|| {
             anyhow!(
-                "repository {} is not a UTF-8 path, which the client API cannot carry",
+                "{} is not a UTF-8 path, which the client API cannot carry",
                 canonical.display()
             )
         })
@@ -665,7 +793,7 @@ async fn launch(
     home: &Path,
     client: &Client,
     plan: &RunPlan,
-    mode: Mode,
+    (mode, ahead): (Mode, GuardAhead),
     approval: &Approval<'_>,
 ) -> Result<ExitCode> {
     let notes = mode.notes();
@@ -675,7 +803,14 @@ async fn launch(
         // The protocol client holds an ACP agent's output.
         _ => None,
     };
-    let tree = prepare(state, home, client, plan, notes, approval).await?;
+    let (tree, setup_ran) = prepare(state, home, client, plan, notes, approval).await?;
+    // A setup step may have installed or switched the harness, so the
+    // guard asks it again rather than take an answer from before.
+    let ahead = if setup_ran {
+        None
+    } else {
+        ahead.take_for(&plan.harness)
+    };
     let headless = matches!(mode, Mode::Headless(_));
     let env = environment();
     // Caught from before the harness starts: until the node records it, the
@@ -683,7 +818,7 @@ async fn launch(
     // a signal that ends this command must stop it first. A signal during
     // the setup steps still ends the command.
     let mut interrupts = Interrupts::new()?;
-    let (adapter, how) = adapter_for(home, plan, mode, notes, &env).await?;
+    let (adapter, how) = adapter_for(home, plan, (mode, ahead), notes, &env).await?;
     // The resume guard runs inside the launch, before the harness exists,
     // and can wait as long as a `--version` run; a signal then ends the
     // command with nothing started. An adapter whose launch is dropped
@@ -813,7 +948,7 @@ async fn abandon(
 async fn adapter_for(
     home: &Path,
     plan: &RunPlan,
-    mode: Mode,
+    (mode, ahead): (Mode, Option<VersionAhead>),
     notes: Notes,
     env: &[(EnvVarName, String)],
 ) -> Result<(Box<dyn Harness>, Launch)> {
@@ -828,14 +963,21 @@ async fn adapter_for(
     };
     Ok(match &plan.harness {
         HarnessKind::ClaudeCode => {
-            let claude = ClaudeCode::new(harness_env.home.clone(), harness_env.path_var.clone());
+            let mut claude =
+                ClaudeCode::new(harness_env.home.clone(), harness_env.path_var.clone());
+            if let Some(ahead) = ahead {
+                claude = claude.with_guard_ahead(ahead);
+            }
             let trust = claude.preseed_trust(&plan.root, env).await?;
             report_trust(&plan.root, &trust, notes)?;
             (Box::new(claude), launch)
         }
         HarnessKind::Codex => {
-            let codex = Codex::new(harness_env.home.clone(), harness_env.path_var.clone())
+            let mut codex = Codex::new(harness_env.home.clone(), harness_env.path_var.clone())
                 .with_known_writer(plan.known_writer.clone());
+            if let Some(ahead) = ahead {
+                codex = codex.with_guard_ahead(ahead);
+            }
             (Box::new(codex), launch)
         }
         HarnessKind::Acp { program, args } => {
@@ -1110,30 +1252,30 @@ impl Turn<'_> {
                 let _ = tokio::io::copy(&mut stderr, &mut tokio::io::stderr()).await;
             })
         });
-        let (sessions, named) = tokio::sync::mpsc::unbounded_channel();
+        let sessions = Arc::new(NamedSessions::default());
         let recorder = tokio::spawn(record_sessions(
             self.client.clone(),
             self.plan.clone(),
             pid,
-            named,
+            Arc::clone(&sessions),
             self.notes,
         ));
         let mut report = TurnReport {
             session: running.session().cloned(),
             ..TurnReport::default()
         };
-        let mut lines = BufReader::new(stdout).split(b'\n');
+        let mut lines = Lines::new(stdout, MAX_LINE);
         let mut status = None;
         let mut drained_by = None;
         loop {
             let read = if let Some(deadline) = drained_by {
-                match tokio::time::timeout_at(deadline, lines.next_segment()).await {
+                match tokio::time::timeout_at(deadline, lines.next()).await {
                     Ok(read) => read,
                     Err(_) => break,
                 }
             } else {
                 tokio::select! {
-                    read = lines.next_segment() => read,
+                    read = lines.next() => read,
                     exit = running.child_mut().wait() => {
                         status = Some(exit?);
                         drained_by = Some(tokio::time::Instant::now() + DRAIN);
@@ -1146,7 +1288,13 @@ impl Turn<'_> {
                 }
             };
             let line = match read {
-                Ok(Some(line)) => line,
+                Ok(Some(Line::Whole(line))) => line,
+                Ok(Some(Line::TooLong)) => {
+                    tracing::warn!(
+                        "the harness printed a line longer than {MAX_LINE} bytes; it was not read"
+                    );
+                    continue;
+                }
                 Ok(None) => break,
                 Err(e) => {
                     tracing::warn!(error = %e, "the harness's output could not be read to its end");
@@ -1156,11 +1304,10 @@ impl Turn<'_> {
             if (self.read_line)(&mut report, &String::from_utf8_lossy(&line))
                 && let Some(session) = report.session.clone()
             {
-                // The receiver lives until this loop ends.
-                let _ = sessions.send(session);
+                sessions.push(session);
             }
         }
-        drop(sessions);
+        sessions.close();
         // The harness closed its output and may still run.
         let status = match status {
             Some(status) => status,
@@ -1269,12 +1416,12 @@ impl AgentTurn<'_> {
         interrupts: &mut Interrupts,
     ) -> Result<TurnEnd> {
         let pid = running.pid();
-        let (sessions, named) = tokio::sync::mpsc::unbounded_channel();
+        let sessions = Arc::new(NamedSessions::default());
         let recorder = tokio::spawn(record_sessions(
             self.client.clone(),
             self.plan.clone(),
             pid,
-            named,
+            Arc::clone(&sessions),
             self.notes,
         ));
         let mut report = TurnReport {
@@ -1290,8 +1437,7 @@ impl AgentTurn<'_> {
                     Some(TurnEvent::Session(session)) => {
                         if report.session.as_ref() != Some(&session) {
                             report.session = Some(session.clone());
-                            // The receiver lives until this loop ends.
-                            let _ = sessions.send(session);
+                            sessions.push(session);
                         }
                     }
                     Some(TurnEvent::Ended(ended)) => {
@@ -1318,7 +1464,7 @@ impl AgentTurn<'_> {
                 }
             }
         }
-        drop(sessions);
+        sessions.close();
         // The loop ends only once the agent was reaped.
         let status = match status {
             Some(status) => status,
@@ -1373,10 +1519,10 @@ async fn record_sessions(
     client: Client,
     plan: RunPlan,
     pid: std::num::NonZeroU32,
-    mut named: tokio::sync::mpsc::UnboundedReceiver<SessionId>,
+    named: Arc<NamedSessions>,
     notes: Notes,
 ) {
-    while let Some(session) = named.recv().await {
+    while let Some(session) = named.next().await {
         let mut printer = Printer::new(notes);
         let recorded = client
             .harness_session(launched(&plan, pid), session.clone(), |event| {
@@ -1395,6 +1541,146 @@ async fn record_sessions(
             "warning: the node did not record {} session {session} ({missed}); job {} keeps the session the node holds, or, for a new Codex thread, the one its next capture finds in the workspace",
             plan.harness, plan.job
         )]);
+    }
+}
+
+/// How many sessions a turn may have named and the node not yet been
+/// asked to record. A harness names one or two in a turn; past this many,
+/// the oldest waiting one is dropped, since the node keeps only the newest
+/// session a harness named, so memory stays bounded whatever the harness
+/// prints.
+const SESSION_QUEUE: usize = 16;
+
+/// The sessions a harness named, in order, for the task that asks the node
+/// to record them: at most `SESSION_QUEUE` wait, the newest kept.
+#[derive(Debug, Default)]
+struct NamedSessions {
+    waiting: std::sync::Mutex<NamedQueue>,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Debug, Default)]
+struct NamedQueue {
+    sessions: std::collections::VecDeque<SessionId>,
+    closed: bool,
+}
+
+impl NamedSessions {
+    fn queue(&self) -> std::sync::MutexGuard<'_, NamedQueue> {
+        self.waiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Queues `session`, dropping the oldest waiting one when the queue is full.
+    fn push(&self, session: SessionId) {
+        {
+            let mut queue = self.queue();
+            if queue.sessions.len() == SESSION_QUEUE
+                && let Some(dropped) = queue.sessions.pop_front()
+            {
+                tracing::warn!(%dropped, "a named session was dropped for a newer one");
+            }
+            queue.sessions.push_back(session);
+        }
+        self.changed.notify_one();
+    }
+
+    /// Says no session follows; the reader still gets those that wait.
+    fn close(&self) {
+        self.queue().closed = true;
+        self.changed.notify_one();
+    }
+
+    /// The next waiting session, or `None` once closed and empty.
+    async fn next(&self) -> Option<SessionId> {
+        loop {
+            {
+                let mut queue = self.queue();
+                if let Some(session) = queue.sessions.pop_front() {
+                    return Some(session);
+                }
+                if queue.closed {
+                    return None;
+                }
+            }
+            self.changed.notified().await;
+        }
+    }
+}
+
+/// The longest line of a headless harness's output that is read, in
+/// bytes: a line holds the turn's answer, and one longer is skipped, so a
+/// harness that prints without a line break cannot grow the command's
+/// memory without bound. The ACP client reads lines of the same length.
+const MAX_LINE: usize = 16 * 1024 * 1024;
+
+/// One line of a headless harness's output.
+#[derive(Debug, PartialEq, Eq)]
+enum Line {
+    /// The line, without its line break.
+    Whole(Vec<u8>),
+    /// A line longer than the bound, read past and dropped.
+    TooLong,
+}
+
+/// Reads a harness's output line by line, holding at most `max` bytes of
+/// one line. Cancel safe: a `next` dropped before it returns loses nothing,
+/// since a line read so far is kept here.
+struct Lines<R> {
+    reader: BufReader<R>,
+    line: Vec<u8>,
+    too_long: bool,
+    max: usize,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> Lines<R> {
+    fn new(reader: R, max: usize) -> Self {
+        Self {
+            reader: BufReader::new(reader),
+            line: Vec::new(),
+            too_long: false,
+            max,
+        }
+    }
+
+    /// The next line, the last one without a line break included, or
+    /// `None` at the end of the output.
+    async fn next(&mut self) -> std::io::Result<Option<Line>> {
+        loop {
+            let chunk = self.reader.fill_buf().await?;
+            if chunk.is_empty() {
+                return Ok(if self.too_long {
+                    self.too_long = false;
+                    Some(Line::TooLong)
+                } else if self.line.is_empty() {
+                    None
+                } else {
+                    Some(Line::Whole(std::mem::take(&mut self.line)))
+                });
+            }
+            let (part, ends) = match chunk.iter().position(|&b| b == b'\n') {
+                Some(at) => (&chunk[..at], Some(at + 1)),
+                None => (chunk, None),
+            };
+            if !self.too_long {
+                if self.line.len() + part.len() > self.max {
+                    self.too_long = true;
+                    self.line = Vec::new();
+                } else {
+                    self.line.extend_from_slice(part);
+                }
+            }
+            let used = ends.unwrap_or(chunk.len());
+            self.reader.consume(used);
+            if ends.is_some() {
+                return Ok(Some(if std::mem::take(&mut self.too_long) {
+                    Line::TooLong
+                } else {
+                    Line::Whole(std::mem::take(&mut self.line))
+                }));
+            }
+        }
     }
 }
 
@@ -1425,7 +1711,8 @@ fn print_turn(plan: &RunPlan, report: &TurnReport) -> Result<()> {
 }
 
 /// Takes the tree lock and runs the setup steps, once the plan is known
-/// to hold and the user approved them, and returns the lock.
+/// to hold and the user approved them, and returns the lock and whether
+/// any step ran.
 async fn prepare(
     state: &StateDir,
     home: &Path,
@@ -1433,7 +1720,7 @@ async fn prepare(
     plan: &RunPlan,
     notes: Notes,
     approval: &Approval<'_>,
-) -> Result<TreeLock> {
+) -> Result<(TreeLock, bool)> {
     // The node captures and restores the harness's state under its home;
     // a harness launched under another would keep its session elsewhere.
     if plan.home != home {
@@ -1454,8 +1741,8 @@ async fn prepare(
         .await;
     printer.finish()?;
     checked.map_err(Refused::from_client)?;
-    materialize(&tree, &plan.root, notes, approval)?;
-    Ok(tree)
+    let ran = materialize(&tree, &plan.root, notes, approval)?;
+    Ok((tree, ran))
 }
 
 /// Tells the node the harness exited and picks the exit code: the harness's
@@ -1536,15 +1823,21 @@ fn lock_tree(state: &StateDir, root: &Path) -> Result<TreeLock> {
 }
 
 /// Runs the setup steps a restored workspace needs on this node (ADR 0007),
-/// printing each, under `lock`, once `approval` lets them run.
-fn materialize(lock: &TreeLock, root: &Path, notes: Notes, approval: &Approval<'_>) -> Result<()> {
+/// printing each, under `lock`, once `approval` lets them run; true when
+/// any ran.
+fn materialize(
+    lock: &TreeLock,
+    root: &Path,
+    notes: Notes,
+    approval: &Approval<'_>,
+) -> Result<bool> {
     let detected = fabric_env::detect::detect(root, &[])?;
     let plan = fabric_env::materialize::plan(&detected, lock, &NodeEnv::current())?;
     if plan.is_noop() {
         // A declared variable is required even when no step runs, so a
         // warm node refuses the launch a cold node would (ADR 0007).
         plan.ready()?;
-        return Ok(());
+        return Ok(false);
     }
     let mut lines = Vec::new();
     for cache in plan.caches() {
@@ -1566,7 +1859,7 @@ fn materialize(lock: &TreeLock, root: &Path, notes: Notes, approval: &Approval<'
     let inputs = detected.inputs_digest().to_hex();
     approval.approve(detected.spec().id()?, &inputs)?;
     ready.execute(lock)?;
-    Ok(())
+    Ok(true)
 }
 
 /// Whether the setup steps of an environment spec may run (ADR 0007).
@@ -1716,6 +2009,119 @@ mod tests {
     use fabric_harness::{NotCarried, SettingName};
 
     use super::*;
+
+    /// A headless harness's output is read a line at a time with at most
+    /// `max` bytes of one line held: a line past it is read through and
+    /// dropped, the lines after it still read, and the last line without
+    /// a line break comes out whole (M2-22). A read cut short, as the turn's
+    /// loop cuts one when the harness exits, keeps what it read.
+    #[tokio::test]
+    async fn a_line_past_the_bound_is_dropped_without_holding_it() {
+        use tokio::io::AsyncWriteExt;
+        let (mut harness, output) = tokio::io::duplex(1 << 16);
+        let mut lines = Lines::new(output, 64);
+        let writer = tokio::spawn(async move {
+            harness.write_all(b"first\n").await.unwrap();
+            harness.write_all(&vec![b'x'; 1 << 20]).await.unwrap();
+            harness
+        });
+        assert_eq!(
+            lines.next().await.unwrap(),
+            Some(Line::Whole(b"first".to_vec()))
+        );
+        // A megabyte with no line break yet: the read waits, holding none
+        // of it, until the writer is done and the pipe drained.
+        let mut drained = false;
+        while !drained {
+            drained = writer.is_finished();
+            let waited = tokio::time::timeout(Duration::from_millis(50), lines.next()).await;
+            assert!(waited.is_err(), "{waited:?}");
+        }
+        let mut harness = writer.await.unwrap();
+        assert!(lines.too_long);
+        assert!(
+            lines.line.capacity() <= 64,
+            "{} bytes held",
+            lines.line.capacity()
+        );
+        harness.write_all(b"\nsecond\n\nlast").await.unwrap();
+        drop(harness);
+        let mut read = Vec::new();
+        while let Some(line) = lines.next().await.unwrap() {
+            read.push(line);
+        }
+        assert_eq!(
+            read,
+            vec![
+                Line::TooLong,
+                Line::Whole(b"second".to_vec()),
+                Line::Whole(Vec::new()),
+                Line::Whole(b"last".to_vec()),
+            ]
+        );
+        let mut endless = Lines::new(&[b'y'; 4096][..], 64);
+        assert_eq!(endless.next().await.unwrap(), Some(Line::TooLong));
+        assert_eq!(endless.next().await.unwrap(), None);
+    }
+
+    /// The sessions a harness names wait for the recorder in order, at most
+    /// `SESSION_QUEUE` of them, the newest kept; a closed queue still hands
+    /// out what waits, then ends (M2-22).
+    #[tokio::test]
+    async fn named_sessions_wait_in_order_and_in_bounds() {
+        let named = NamedSessions::default();
+        let session = |n: usize| SessionId::parse(&format!("session-{n}")).unwrap();
+        for n in 0..1000 {
+            named.push(session(n));
+        }
+        assert_eq!(named.queue().sessions.len(), SESSION_QUEUE);
+        named.close();
+        let mut out = Vec::new();
+        while let Some(next) = named.next().await {
+            out.push(next);
+        }
+        let newest: Vec<SessionId> = (1000 - SESSION_QUEUE..1000).map(session).collect();
+        assert_eq!(out, newest);
+
+        let named = Arc::new(NamedSessions::default());
+        let reader = tokio::spawn({
+            let named = Arc::clone(&named);
+            async move {
+                let mut out = Vec::new();
+                while let Some(next) = named.next().await {
+                    out.push(next);
+                }
+                out
+            }
+        });
+        named.push(session(1));
+        tokio::task::yield_now().await;
+        named.push(session(2));
+        named.close();
+        assert_eq!(reader.await.unwrap(), vec![session(1), session(2)]);
+    }
+
+    /// A client command runs on `CLIENT_WORKERS` workers, whatever the
+    /// cores; `serve` keeps Tokio's default, a worker per core.
+    #[test]
+    fn a_client_command_runs_on_two_workers_and_serve_on_every_core() {
+        let workers = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).unwrap();
+            runtime_for(&cli.command)
+                .unwrap()
+                .handle()
+                .metrics()
+                .num_workers()
+        };
+        assert_eq!(workers(&["fabric", "job", "ls"]), CLIENT_WORKERS);
+        assert_eq!(workers(&["fabric", "node", "id"]), CLIENT_WORKERS);
+        let default = tokio::runtime::Runtime::new()
+            .unwrap()
+            .handle()
+            .metrics()
+            .num_workers();
+        assert_eq!(workers(&["fabric", "serve"]), default);
+    }
 
     /// The signal tests send a signal to this whole process, which every
     /// handler installed in it gets, so they run one at a time.
@@ -2144,7 +2550,7 @@ mod tests {
             &mine,
             &client(&state),
             &plan,
-            Mode::Interactive(None),
+            (Mode::Interactive(None), GuardAhead::default()),
             &unasked(dir.path()),
         )
         .await
@@ -2196,7 +2602,7 @@ mod tests {
             &home,
             &client(&state),
             &plan,
-            Mode::Interactive(None),
+            (Mode::Interactive(None), GuardAhead::default()),
             &unasked(dir.path()),
         )
         .await

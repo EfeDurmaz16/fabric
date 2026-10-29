@@ -5,8 +5,20 @@
 //! goes through `Ledger::commit`, which writes and flushes before it shows
 //! the record, and the derived manifest is rewritten after each append. A
 //! job whose files fail to open is reported, never repaired or dropped.
+//!
+//! The workspace marker, the harness record and the fork record are kept in
+//! memory once read, and every write and removal of them goes through this
+//! type, which writes the file first and the copy after, so the copy is
+//! never ahead of the file and never stale while the daemon, their one
+//! writer, runs. A write that fails forgets the copy, so the next read asks
+//! the file again; a read that fails keeps nothing.
 
 use std::fs;
+use std::path::Path;
+use std::sync::{Mutex, PoisonError};
+
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::{Epoch, JobId, NodeId, RecordHash, SnapshotId};
@@ -28,6 +40,96 @@ pub struct Job {
     dir: JobDir,
     ledger: Ledger,
     file: LedgerFile,
+    marker: Kept<Marker>,
+    harness: Kept<HarnessRecord>,
+    forked: Kept<ForkRecord>,
+    /// Per peer, the last record of this ledger the peer accepted in a
+    /// push from this node, so the next push sends only what follows it
+    /// (M2-18). In memory only: a restart sends the whole ledger again.
+    acked: Vec<(NodeId, RecordHash)>,
+}
+
+/// A node-local file kept in memory after its first read.
+#[derive(Debug)]
+struct Kept<T>(Mutex<Slot<T>>);
+
+/// What `Kept` holds of its file: two words, and a heap copy only of a
+/// file that is there, since most jobs have no harness record and no
+/// fork record.
+#[derive(Debug)]
+enum Slot<T> {
+    /// Not read yet, or a write failed and the file must be read again.
+    Unread,
+    /// The file is absent.
+    Absent,
+    /// What the file holds.
+    Read(Box<T>),
+}
+
+impl<T: Clone> Slot<T> {
+    fn of(value: Option<&T>) -> Self {
+        value.map_or(Slot::Absent, |value| Slot::Read(Box::new(value.clone())))
+    }
+}
+
+impl<T> Default for Kept<T> {
+    fn default() -> Self {
+        Self(Mutex::new(Slot::Unread))
+    }
+}
+
+impl<T: Clone + Serialize + DeserializeOwned> Kept<T> {
+    fn slot(&self) -> std::sync::MutexGuard<'_, Slot<T>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// What the file at `path` holds, read once.
+    fn read(&self, path: &Path) -> Result<Option<T>, local::LocalError> {
+        let mut slot = self.slot();
+        match &*slot {
+            Slot::Absent => return Ok(None),
+            Slot::Read(kept) => return Ok(Some(T::clone(kept))),
+            Slot::Unread => {}
+        }
+        let read = local::read(path)?;
+        *slot = Slot::of(read.as_ref());
+        Ok(read)
+    }
+
+    /// Whether the file at `path` holds a value, read once.
+    fn is_some(&self, path: &Path) -> Result<bool, local::LocalError> {
+        let mut slot = self.slot();
+        match &*slot {
+            Slot::Absent => return Ok(false),
+            Slot::Read(_) => return Ok(true),
+            Slot::Unread => {}
+        }
+        let read: Option<T> = local::read(path)?;
+        *slot = Slot::of(read.as_ref());
+        Ok(read.is_some())
+    }
+
+    /// Replaces the file at `path` with `value`, then the copy.
+    fn write(&self, path: &Path, value: &T) -> Result<(), local::LocalError> {
+        let mut slot = self.slot();
+        *slot = Slot::Unread;
+        local::write(path, value)?;
+        *slot = Slot::of(Some(value));
+        Ok(())
+    }
+
+    /// Removes the file at `path`, flushing its directory when `flushed`, then the copy.
+    fn remove(&self, path: &Path, flushed: bool) -> Result<(), local::LocalError> {
+        let mut slot = self.slot();
+        *slot = Slot::Unread;
+        if flushed {
+            local::remove(path)?;
+        } else {
+            local::remove_unflushed(path)?;
+        }
+        *slot = Slot::Absent;
+        Ok(())
+    }
 }
 
 impl Job {
@@ -52,7 +154,9 @@ impl Job {
             .into());
         }
         let ledger = Ledger::replay(job_id, [created.clone()])?;
-        crate::durable::create_dir(dir.dir()).map_err(|e| NodeError::io(dir.dir(), e))?;
+        // The ledger's own full flush below makes the directory's name
+        // durable with it; a barrier orders the name first.
+        crate::durable::create_dir_ordered(dir.dir()).map_err(|e| NodeError::io(dir.dir(), e))?;
         let file = LedgerFile::create(&dir.ledger(), created)?;
         if let Err(e) = ledger_file::write_manifest(&dir.manifest(), &ledger) {
             drop(file);
@@ -66,6 +170,10 @@ impl Job {
             dir,
             ledger,
             file,
+            marker: Kept::default(),
+            harness: Kept::default(),
+            forked: Kept::default(),
+            acked: Vec::new(),
         })
     }
 
@@ -85,7 +193,9 @@ impl Job {
         marker: &Marker,
     ) -> Result<Self, NodeError> {
         let path = dir.dir().to_owned();
-        let made = crate::durable::create_dir(&path)
+        // The marker's full flush makes the directory's name durable with
+        // it; a barrier orders the name first.
+        let made = crate::durable::create_dir_ordered(&path)
             .map_err(|e| NodeError::io(&path, e))
             .and_then(|()| Ok(local::write(&dir.marker(), marker)?))
             .and_then(|()| Self::create(id, dir, created));
@@ -102,16 +212,30 @@ impl Job {
     }
 
     /// Opens a job this node held before.
+    ///
+    /// The derived manifest is rewritten only when it is missing or behind
+    /// the ledger, the crash window between an append and its manifest
+    /// write. One that holds exactly the bytes the ledger derives is
+    /// current: it remembers nothing the ledger lacks, so the check that
+    /// a manifest is not ahead passes, and a rewrite would change nothing
+    /// but cost two full flushes per job at every start.
     pub fn open(id: JobId, dir: JobDir) -> Result<Self, NodeError> {
         let file = LedgerFile::open(&dir.ledger())?;
         let ledger = Ledger::open(id, &file)?;
-        ledger_file::check_manifest(&dir.manifest(), &ledger)?;
-        ledger_file::write_manifest(&dir.manifest(), &ledger)?;
+        let path = dir.manifest();
+        if !manifest_is_current(&path, &ledger) {
+            ledger_file::check_manifest(&path, &ledger)?;
+            ledger_file::write_manifest(&path, &ledger)?;
+        }
         Ok(Self {
             id,
             dir,
             ledger,
             file,
+            marker: Kept::default(),
+            harness: Kept::default(),
+            forked: Kept::default(),
+            acked: Vec::new(),
         })
     }
 
@@ -158,7 +282,7 @@ impl Job {
     /// ledger grew.
     pub fn accept(&mut self, bytes: &[u8], peer: NodeId, me: NodeId) -> Result<bool, NodeError> {
         let hash = fabric_core::id::RecordHash::of(bytes);
-        if self.ledger.records().iter().any(|r| r.hash() == hash) {
+        if self.ledger.holds(hash) {
             return Ok(false);
         }
         match self.ledger.verify(bytes, Author::Node(peer)) {
@@ -170,6 +294,43 @@ impl Job {
             Err(e) => return Err(e.into()),
         }
         Ok(true)
+    }
+
+    /// The records a push to `peer` sends: those after the last one the
+    /// peer accepted from this node, and at least the head, so the peer
+    /// still checks it holds the latest snapshot and settles; the whole
+    /// ledger when no push to `peer` was accepted since this node started,
+    /// or when that record is no longer in the chain.
+    #[must_use]
+    pub fn unsent(&self, peer: NodeId) -> &[Record] {
+        let records = self.ledger.records();
+        match self
+            .acked
+            .iter()
+            .find(|(node, _)| *node == peer)
+            .and_then(|(_, head)| self.ledger.position(*head))
+        {
+            Some(at) => &records[(at + 1).min(records.len() - 1)..],
+            None => records,
+        }
+    }
+
+    /// Notes that `peer` accepted a push whose last record was `head`.
+    pub fn acked_by(&mut self, peer: NodeId, head: RecordHash) {
+        if let Some((_, kept)) = self.acked.iter_mut().find(|(node, _)| *node == peer) {
+            *kept = head;
+            return;
+        }
+        // A node pairs with one or two peers: room for one more entry,
+        // not a doubling.
+        self.acked.reserve_exact(1);
+        self.acked.push((peer, head));
+    }
+
+    /// Forgets what `peer` accepted, after a push it refused or did not
+    /// answer, so the next push sends the whole ledger.
+    pub fn forget_acked(&mut self, peer: NodeId) {
+        self.acked.retain(|(node, _)| *node != peer);
     }
 
     /// How this node relates to the lease.
@@ -226,22 +387,40 @@ impl Job {
 
     /// The workspace marker, if this node has a workspace for the job.
     pub fn marker(&self) -> Result<Option<Marker>, NodeError> {
-        Ok(local::read(&self.dir.marker())?)
+        Ok(self.marker.read(&self.dir.marker())?)
     }
 
     /// Replaces the workspace marker.
     pub fn set_marker(&self, marker: &Marker) -> Result<(), NodeError> {
-        Ok(local::write(&self.dir.marker(), marker)?)
+        Ok(self.marker.write(&self.dir.marker(), marker)?)
     }
 
     /// Removes the workspace marker.
     pub fn clear_marker(&self) -> Result<(), NodeError> {
-        Ok(local::remove(&self.dir.marker())?)
+        Ok(self.marker.remove(&self.dir.marker(), true)?)
     }
 
     /// The harness this node launched, if one is recorded.
     pub fn harness_record(&self) -> Result<Option<HarnessRecord>, NodeError> {
-        Ok(local::read(&self.dir.harness())?)
+        Ok(self.harness.read(&self.dir.harness())?)
+    }
+
+    /// Records the harness this node launched.
+    pub fn set_harness_record(&self, record: &HarnessRecord) -> Result<(), NodeError> {
+        Ok(self.harness.write(&self.dir.harness(), record)?)
+    }
+
+    /// Removes the harness record of a harness that was stopped, durably,
+    /// before what follows the stop acts on the workspace.
+    pub fn clear_harness_record(&self) -> Result<(), NodeError> {
+        Ok(self.harness.remove(&self.dir.harness(), true)?)
+    }
+
+    /// Removes the harness record of a harness whose group is gone, without
+    /// flushing the directory: a record a crash brings back names a process
+    /// every reader finds gone (`local::remove_unflushed`).
+    pub fn forget_gone_harness(&self) -> Result<(), NodeError> {
+        Ok(self.harness.remove(&self.dir.harness(), false)?)
     }
 
     /// The session the job continues on this node, if known.
@@ -314,16 +493,67 @@ impl Job {
 
     /// The fork record that freezes the job here, if a peer's ledger forked from this one.
     pub fn forked(&self) -> Result<Option<ForkRecord>, NodeError> {
-        Ok(local::read(&self.dir.forked())?)
+        Ok(self.forked.read(&self.dir.forked())?)
+    }
+
+    /// Whether the job is frozen here, without copying the fork record.
+    pub fn is_frozen(&self) -> Result<bool, NodeError> {
+        Ok(self.forked.is_some(&self.dir.forked())?)
     }
 
     /// Freezes the job here; a job already frozen keeps the first record.
     pub fn freeze(&self, fork: &ForkRecord) -> Result<bool, NodeError> {
-        if self.forked()?.is_some() {
+        if self.is_frozen()? {
             return Ok(false);
         }
-        local::write(&self.dir.forked(), fork)?;
+        self.forked.write(&self.dir.forked(), fork)?;
         Ok(true)
+    }
+
+    /// Lifts the freeze: removes the fork record, durably. Only a fork
+    /// repair calls it, once the chains no longer fork here (ADR 0003, Forks).
+    pub fn unfreeze(&self) -> Result<(), NodeError> {
+        Ok(self.forked.remove(&self.dir.forked(), true)?)
+    }
+
+    /// The snapshots this node keeps for the job outside its ledger.
+    pub fn pins(&self) -> Result<Vec<local::Pin>, NodeError> {
+        Ok(local::read(&self.dir.pins())?.unwrap_or_default())
+    }
+
+    /// Adds `pins` to those kept; a snapshot already pinned keeps its first pin.
+    pub fn pin(&self, pins: Vec<local::Pin>) -> Result<(), NodeError> {
+        let mut kept = self.pins()?;
+        for pin in pins {
+            if !kept.iter().any(|held| held.snapshot == pin.snapshot) {
+                kept.push(pin);
+            }
+        }
+        Ok(local::write(&self.dir.pins(), &kept)?)
+    }
+
+    /// Replaces this job's ledger with `chain`, the whole chain of the job
+    /// a fork repair took over this node's own, and lifts the freeze.
+    ///
+    /// Nothing is cut: the old ledger is first copied whole to `kept`.
+    /// The derived manifest is removed before the new ledger is renamed
+    /// into place, so a crash at any step leaves the old ledger with no
+    /// manifest, which a start rewrites, or the new one, and a repair run
+    /// again converges: the chains then no longer fork. The fork record
+    /// goes last, so a crash before it leaves the job frozen.
+    pub fn adopt(&mut self, chain: &Ledger, kept: &Path) -> Result<(), NodeError> {
+        let old = fs::read(self.dir.ledger()).map_err(|e| NodeError::io(self.dir.ledger(), e))?;
+        crate::durable::write_atomic(kept, &old).map_err(|e| NodeError::io(kept, e))?;
+        local::remove(&self.dir.manifest())?;
+        let bytes: Vec<u8> = chain
+            .records()
+            .iter()
+            .flat_map(|record| record.bytes().iter().copied())
+            .collect();
+        crate::durable::write_atomic(&self.dir.ledger(), &bytes)
+            .map_err(|e| NodeError::io(self.dir.ledger(), e))?;
+        *self = Job::open(self.id, self.dir.clone())?;
+        self.unfreeze()
     }
 
     /// Settles a marker a crash left behind once the ledger says how the
@@ -364,6 +594,22 @@ impl Job {
     }
 }
 
+/// True when the manifest at `path` holds exactly the bytes `ledger`
+/// derives; false when it is missing or differs.
+fn manifest_is_current(path: &Path, ledger: &Ledger) -> bool {
+    // A manifest that does not read is left to `check_manifest`, which
+    // fails closed on it with the manifest's path, as it always did.
+    let Ok(on_disk) = fs::read(path) else {
+        return false;
+    };
+    // A ledger whose manifest does not encode is left to `write_manifest`,
+    // which reports it.
+    ledger
+        .manifest()
+        .encode()
+        .is_ok_and(|derived| derived == on_disk)
+}
+
 #[cfg(test)]
 mod tests {
     use fabric_core::harness::HarnessKind;
@@ -397,6 +643,174 @@ mod tests {
         assert!(!state.job(asked).dir().exists());
         Job::create(other, state.job(other), &created).unwrap();
         Job::open(other, state.job(other)).unwrap();
+    }
+
+    /// A start rewrites a job's derived manifest only when it is missing
+    /// or behind the ledger: one that is current is left as it is, since
+    /// its rewrite costs two full flushes per job at every start.
+    #[test]
+    fn an_open_rewrites_the_manifest_only_when_it_is_missing_or_behind() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::resolve(Some(dir.path().as_os_str()), dir.path()).unwrap();
+        let id = JobId::from_bytes([1; 16]);
+        let me = NodeId::from_bytes([3; 32]);
+        let created = Ledger::created(
+            id,
+            "goal".into(),
+            HarnessKind::Codex,
+            me,
+            EventId::from_bytes([4; 16]),
+            1,
+        )
+        .unwrap();
+        let mut job = Job::create(id, state.job(id), &created).unwrap();
+        let path = state.job(id).manifest();
+        let behind = fs::read(&path).unwrap();
+        job.append(me, EventKind::Note { text: "one".into() })
+            .unwrap();
+        let current = fs::read(&path).unwrap();
+        drop(job);
+        let inode = |path: &std::path::Path| fs::metadata(path).unwrap().ino();
+
+        let before = inode(&path);
+        Job::open(id, state.job(id)).unwrap();
+        assert_eq!(inode(&path), before, "a current manifest was rewritten");
+
+        fs::write(&path, &behind).unwrap();
+        Job::open(id, state.job(id)).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            current,
+            "a manifest behind was kept"
+        );
+
+        fs::remove_file(&path).unwrap();
+        Job::open(id, state.job(id)).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            current,
+            "a missing manifest was not written"
+        );
+    }
+
+    /// The marker, the harness record and the fork record are read from
+    /// disk once and then answered from memory, since the daemon is their
+    /// one writer; every write goes to the file before the copy, and a
+    /// write that fails leaves the next read to the file.
+    #[test]
+    fn a_jobs_local_records_are_read_once_and_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::resolve(Some(dir.path().as_os_str()), dir.path()).unwrap();
+        let id = JobId::from_bytes([1; 16]);
+        let me = NodeId::from_bytes([3; 32]);
+        let created = Ledger::created(
+            id,
+            "goal".into(),
+            HarnessKind::Codex,
+            me,
+            EventId::from_bytes([4; 16]),
+            1,
+        )
+        .unwrap();
+        let marker = Marker {
+            root: dir.path().join("work"),
+            state: MarkerState::Live,
+            epoch: Epoch::FIRST,
+        };
+        let job = Job::create_owned(id, state.job(id), &created, &marker).unwrap();
+        let paths = state.job(id);
+        assert_eq!(job.marker().unwrap(), Some(marker.clone()));
+        assert_eq!(job.harness_record().unwrap(), None);
+        assert!(!job.is_frozen().unwrap());
+        // Read once: files changed behind the job's back are not read again.
+        fs::remove_file(paths.marker()).unwrap();
+        fs::write(paths.harness(), "not a record").unwrap();
+        assert_eq!(job.marker().unwrap(), Some(marker.clone()));
+        assert_eq!(job.harness_record().unwrap(), None);
+
+        // Written through: the file holds what the copy holds.
+        let record = HarnessRecord {
+            epoch: Epoch::FIRST,
+            pid: std::num::NonZeroU32::new(4242).unwrap(),
+            started: "then".into(),
+        };
+        job.set_harness_record(&record).unwrap();
+        assert_eq!(local::read(&paths.harness()).unwrap(), Some(record.clone()));
+        assert_eq!(job.harness_record().unwrap(), Some(record));
+        job.forget_gone_harness().unwrap();
+        assert!(!paths.harness().exists());
+        assert_eq!(job.harness_record().unwrap(), None);
+        let fork = ForkRecord {
+            peer: NodeId::from_bytes([7; 32]),
+            epoch: Epoch::FIRST,
+            head: job.ledger().head(),
+        };
+        assert!(job.freeze(&fork).unwrap());
+        assert_eq!(local::read(&paths.forked()).unwrap(), Some(fork.clone()));
+        assert!(
+            !job.freeze(&fork).unwrap(),
+            "a second freeze replaced the first"
+        );
+
+        // A write that fails forgets the copy, so the next read asks the file.
+        fs::create_dir_all(paths.marker()).unwrap();
+        assert!(job.set_marker(&marker).is_err());
+        assert!(job.marker().is_err(), "the copy outlived a failed write");
+    }
+
+    /// A new job's directory is ordered with a barrier on `jobs/`, not
+    /// flushed through the drive on its own: the marker's and the ledger's
+    /// full flushes that follow make its name durable before the job is
+    /// reported made, so a job costs one full flush per file it writes and
+    /// none for its directory.
+    #[test]
+    fn a_new_jobs_directory_is_made_durable_by_the_flushes_of_its_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::resolve(Some(dir.path().as_os_str()), dir.path()).unwrap();
+        fs::create_dir_all(state.jobs()).unwrap();
+        let id = JobId::from_bytes([1; 16]);
+        let created = Ledger::created(
+            id,
+            "goal".into(),
+            HarnessKind::Codex,
+            NodeId::from_bytes([3; 32]),
+            EventId::from_bytes([4; 16]),
+            1,
+        )
+        .unwrap();
+        let marker = Marker {
+            root: dir.path().join("work"),
+            state: MarkerState::Live,
+            epoch: fabric_core::id::Epoch::FIRST,
+        };
+        let (made, log) = crate::durable::record::flushes(|| {
+            Job::create_owned(id, state.job(id), &created, &marker)
+        });
+        made.unwrap();
+        let jobs = crate::durable::record::real(&state.jobs());
+        let job_dir = crate::durable::record::real(state.job(id).dir());
+        assert_eq!(
+            log.first(),
+            Some(&(crate::durable::Flush::Barrier, jobs.clone())),
+            "{log:?}"
+        );
+        assert!(
+            !log.contains(&(crate::durable::Flush::Full, jobs)),
+            "jobs/ was flushed through the drive: {log:?}"
+        );
+        let full: Vec<_> = log
+            .iter()
+            .filter(|(how, _)| *how == crate::durable::Flush::Full)
+            .collect();
+        assert_eq!(
+            full,
+            vec![
+                &(crate::durable::Flush::Full, job_dir.clone()),
+                &(crate::durable::Flush::Full, job_dir)
+            ],
+            "the marker and the ledger each flush the job's directory once: {log:?}"
+        );
     }
 
     /// An owned job whose marker could not be written must leave no
