@@ -1,6 +1,6 @@
 # ADR 0021: Versioned provider bridge to a Capsule worker
 
-Status: proposed, 2026-10-27
+Status: proposed, 2026-10-27. The `provider_operations` journal table (schema version 2) was approved by Efe on 2026-10-29; the rest of this ADR stays proposed.
 
 Adopts external drafts P09 ("Scoped provider identity and truthful operation outcomes") and P10 ("Capsule worker protocol and standalone distribution"), both of 2026-10-27 and both Proposed, with the handoff selections of the same date, for the M3 campaign. Draft P12 ("Provider-neutral conformance and layered evidence") sets the test layers. Draft P11 ("Unknown outcomes, reconciliation and cleanup authorization") is read only so that v1 does not block it; nothing in this ADR implements reconciliation. The protocol itself, its message catalogue and its fixtures are in [docs/bridge-protocol.md](../bridge-protocol.md) and [protocol/bridge/v1](../../protocol/bridge/v1).
 
@@ -63,7 +63,7 @@ The first provider proof is a capability-profile contract. A deterministic, stat
 ## Implementation notes (M3 client)
 
 - The client is the crate `fabric-bridge`; its behavior per answer is in docs/bridge-protocol.md, "Fabric's client as built".
-- A bridge effect is a provider operation in its own journal table, `provider_operations` (schema version 2), not a new command kind. Version 1's `operations` table checks its `kind` and `status` against fixed lists, which SQLite changes only by rebuilding a table that `attempts` and `events` reference, and it ties `rejected` to an operation that was never accepted, while the bridge records `rejected` after dispatch when the worker refuses before effect. The new table shares the key and id space of `operations`, names the job, task, attempt and generation it was fenced on, and is recovered like an operation: `dispatched` becomes `unknown` on restart.
+- A bridge effect is a provider operation in its own journal table, `provider_operations` (schema version 2), not a new command kind. Version 1's `operations` table checks its `kind` and `status` against fixed lists, which SQLite changes only by rebuilding a table that `attempts` and `events` reference, and it ties `rejected` to an operation that was never accepted, while the bridge records `rejected` after dispatch when the worker refuses before effect. The new table shares the key and id space of `operations`, names the job, task, attempt and generation it was fenced on, and is recovered like an operation: `dispatched` becomes `unknown` on restart. Efe approved the table as schema version 2 on 2026-10-29. Version 2 has not shipped in any release.
 - The journal stores the request's target locator at dispatch and the worker's locator as the JSON text they came in, and never parses either. Fabric reads only the capability profile.
 - The Rust test double (`src/bin/double.rs`) parses with the crate's worker-side parser, so it refuses as the protocol says; it is test infrastructure, not a provider.
 - Measured on the double, with raw samples in docs/evidence/m3-bridge: a worker spawned with its handshake answered, one request round trip with an in-memory log, and with the journal's two committed writes.
