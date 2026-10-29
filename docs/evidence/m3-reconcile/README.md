@@ -30,4 +30,20 @@ Capsule's own proofs of the same worker are in Capsule `benchmarks/after/bridge/
 
 ## Gates
 
-`gates/run-gates.sh` (the M3 script, unchanged but for its output directory) on the head that adds this record before its gate logs (`gates/commit.txt`); `gates/summary.txt` holds each exit code, time and load.
+`gates/run-gates.sh` (the M3 script, unchanged) on `b605434` (`gates/commit.txt`), the commit that adds this record; the commit after it adds only the gate logs and this table. Every gate passed on its first run; `gates/summary.txt` holds each exit code, time and load.
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `-p fabric-harness` with no features and each of `acp`, `claude`, `codex` | pass |
+| `cargo test --workspace --locked -- --skip e2e_` | pass: 1187 passed, 0 failed, 21 ignored (the Capsule interop tests are among the ignored; they ran above) |
+| `cargo test -p fabric --test e2e --locked` | pass: 69 passed, 5 ignored |
+| `budget::hot_paths` with `FABRIC_BUDGET=count` | pass: every process count equals `budget.toml`; no op was timed |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked` | pass |
+| `cargo deny check` | pass; no dependency added, the lockfile is unchanged |
+| hygiene, budget file and client API fixture checks against `origin/m2/durable-job-foundations`, and their script tests | pass |
+| `actionlint` on both workflows | pass, with the new pin |
+| TypeScript SDK: install, typecheck, build, `bun test` against this build | pass: 62 passed |
+| `fabric-client` `bridge_fixtures`: every file against `manifest.sha256`, the manifest pinned | pass at `af9a31d70699b1e0fc1ffec8ede50eafbb3bd8fcb35d7b1dd99a9826098d7556`, byte-identical to Capsule's copy |
+
+Capsule's CI ran on `a4d597a` once it was pushed, and every job passed, among them `Bridge worker artifact (Linux x64, no Node on PATH)` and `Bridge worker Docker smoke` on the busybox 1.36.1 digest, the two proofs its branch could only leave to CI.
