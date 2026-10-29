@@ -225,11 +225,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: EfeDurmaz16/capsule
-          # The head of Capsule's m3/bridge-worker: the worker after its
-          # review fixes and the merges of M1, with the v1 fixtures that
-          # refuse an exec bound of 0, which docs/evidence/m3-decisions ran
-          # against.
-          ref: 95cbbcf3edfc9463d25f6d5123f5588d9b46f207
+          # Capsule's m3/bridge-worker at the worker that carries the v1
+          # corrections of 2026-10-29: an exec bound of 0 refused, observe
+          # with the operation's scope, exec observe and labelled seeds,
+          # which docs/evidence/m3-deferred ran against. Later commits there
+          # leave the worker and the fixtures as they are.
+          ref: 3faf05dee9739571946dde2268f8d09b5573e0b7
           path: capsule
           persist-credentials: false
 
@@ -281,7 +282,7 @@ jobs:
         with:
           repository: EfeDurmaz16/capsule
           # The same worker as bridge-interop; move both pins together.
-          ref: 95cbbcf3edfc9463d25f6d5123f5588d9b46f207
+          ref: 3faf05dee9739571946dde2268f8d09b5573e0b7
           path: capsule
           persist-credentials: false
 
