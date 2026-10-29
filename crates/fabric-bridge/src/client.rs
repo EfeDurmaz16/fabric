@@ -4,6 +4,9 @@
 //! Invariants, each pinned by a test:
 //! - An effect is recorded `dispatched` before its frame is written, and
 //!   a key or id the log holds is never sent again.
+//! - A request or observe made while the bridge is shutting down, the
+//!   worker is gone or at its in-flight limit is refused for that first,
+//!   whatever else would refuse it: nothing is recorded or sent.
 //! - A request Fabric can tell is outside the negotiated profile, over a
 //!   limit, or too large is recorded `rejected` and never sent: refusal
 //!   before effect.
@@ -670,28 +673,11 @@ impl Bridge {
         format!("r-{}", self.next_id.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Registers a waiter under `id`, unless the bridge is shutting down
-    /// (for a request or an observe), the worker is gone, or (for a
-    /// request or an observe) the worker's in-flight limit is reached.
-    fn register(
-        &self,
-        id: &str,
-        operation: Option<OperationId>,
-        action: Option<&str>,
-        kind: Kind,
-    ) -> Result<mpsc::Receiver<Incoming>, BridgeError> {
-        self.admit(&mut self.shared.lock(), id, operation, action, kind)
-    }
-
-    /// `register` under a lock the caller holds.
-    fn admit(
-        &self,
-        state: &mut State,
-        id: &str,
-        operation: Option<OperationId>,
-        action: Option<&str>,
-        kind: Kind,
-    ) -> Result<mpsc::Receiver<Incoming>, BridgeError> {
+    /// Refuses new work of `kind` before anything else is done for it: a
+    /// request or an observe once the bridge is shutting down, anything
+    /// once the worker is gone, and a request or an observe at the
+    /// worker's in-flight limit.
+    fn admissible(&self, state: &State, kind: Kind) -> Result<(), BridgeError> {
         // A shutdown ends with the worker's exit, which the reader marks
         // lost when it reads the end of the worker's output, so new work
         // is refused as shutting down both before and after that read.
@@ -712,6 +698,37 @@ impl Bridge {
                 return Err(BridgeError::Busy(outstanding));
             }
         }
+        Ok(())
+    }
+
+    /// `admissible` under the bridge's lock, taken and released: checked
+    /// before anything else is done for a request or an observe, and again
+    /// when it registers.
+    fn admission(&self, kind: Kind) -> Result<(), BridgeError> {
+        self.admissible(&self.shared.lock(), kind)
+    }
+
+    /// Registers a waiter under `id`, unless `admissible` refuses `kind`.
+    fn register(
+        &self,
+        id: &str,
+        operation: Option<OperationId>,
+        action: Option<&str>,
+        kind: Kind,
+    ) -> Result<mpsc::Receiver<Incoming>, BridgeError> {
+        self.admit(&mut self.shared.lock(), id, operation, action, kind)
+    }
+
+    /// `register` under a lock the caller holds.
+    fn admit(
+        &self,
+        state: &mut State,
+        id: &str,
+        operation: Option<OperationId>,
+        action: Option<&str>,
+        kind: Kind,
+    ) -> Result<mpsc::Receiver<Incoming>, BridgeError> {
+        self.admissible(state, kind)?;
         let (tx, rx) = mpsc::channel(QUEUE);
         state.waiters.insert(
             id.to_owned(),
@@ -797,16 +814,19 @@ impl Bridge {
 
     /// Sends one effect for a journal operation.
     ///
-    /// Before anything is written: a request outside the negotiated
-    /// profile or over one of its limits, or a frame over the request
-    /// cap, is recorded `rejected` and refused as `RefusedLocally`. Then
-    /// the operation is recorded `dispatched`; a key or id the log holds
-    /// refuses with `Log(Used)` and nothing is sent. Then the frame is
-    /// queued for the writer, which writes it whole by the request's
-    /// deadline. A worker that is gone, busy or shutting down refuses
-    /// before the log is touched. A request admitted before a `shutdown`
-    /// whose frame was not queued yet when the shutdown's was is never
-    /// written after it: it is recorded `rejected` (`unavailable`,
+    /// First a bridge that is shutting down, a worker that is gone and a
+    /// worker at its in-flight limit refuse it, as `ShuttingDown`, `Lost`
+    /// and `Busy`, whatever else would refuse it and before the log is
+    /// touched: nothing is recorded or sent. Then, before anything is
+    /// written: a request outside the negotiated profile or over one of
+    /// its limits, or a frame over the request cap, is recorded `rejected`
+    /// and refused as `RefusedLocally`. Then the operation is recorded
+    /// `dispatched`; a key or id the log holds refuses with `Log(Used)`, an
+    /// attempt it fences with `Log(Fenced)`, and nothing is sent. Then the
+    /// frame is queued for the writer, which writes it whole by the
+    /// request's deadline. A request admitted before a `shutdown` whose
+    /// frame was not queued yet when the shutdown's was is never written
+    /// after it: it is recorded `rejected` (`unavailable`,
     /// `shutting_down`), as a draining worker answers a request it reads
     /// after a shutdown, and refused as `RefusedLocally`.
     ///
@@ -819,6 +839,10 @@ impl Bridge {
         log: &mut L,
         effect: Effect,
     ) -> Result<InFlight, BridgeError> {
+        // Before the profile, the limits and the log: after a shutdown a
+        // request is refused as shutting down whatever else is wrong with
+        // it, and nothing is recorded for it.
+        self.admission(Kind::Request)?;
         record_found(&self.shared, log).await?;
         let request = Request {
             request_id: self.request_id(),
@@ -921,9 +945,11 @@ impl Bridge {
     }
 
     /// Reads the resource of an operation the log holds as `dispatched`
-    /// or `unknown`, by its original id, waiting at most `wait_ms`. An
-    /// action the profile does not observe, or a wait over its limit, is
-    /// refused before the log is read, and nothing is sent.
+    /// or `unknown`, by its original id, waiting at most `wait_ms`. A
+    /// bridge that is shutting down, a worker that is gone and a worker at
+    /// its in-flight limit refuse it first, as `request` does. An action
+    /// the profile does not observe, or a wait over its limit, is refused
+    /// before the log is read, and nothing is sent.
     ///
     /// `action` and `resource` must be the operation's own as the log
     /// holds them: its action, and the target it was sent to or, for an
@@ -942,6 +968,7 @@ impl Bridge {
         resource: Locator,
         wait_ms: u64,
     ) -> Result<InFlight, BridgeError> {
+        self.admission(Kind::Observe)?;
         // A late answer may have named the resource this observe reads.
         record_found(&self.shared, log).await?;
         crate::wire::observable(action, &resource, wait_ms, &self.profile)
@@ -1054,12 +1081,15 @@ impl Bridge {
         }))
     }
 
-    /// Asks the worker to drain for at most `drain_ms` and exit. New
-    /// requests are refused from now on with
-    /// [`BridgeError::ShuttingDown`], before the log is touched, and still
-    /// after the worker has exited. A request admitted before this whose
-    /// frame is not queued yet is never written after the shutdown's
-    /// (`request`). The outstanding requests still answer on their own.
+    /// Asks the worker to drain for at most `drain_ms` and exit. From now
+    /// on every new request and observe is refused with
+    /// [`BridgeError::ShuttingDown`] before anything else, whatever else
+    /// would refuse it (the profile, a limit, the log, the in-flight limit,
+    /// a worker that is gone): nothing is recorded or sent, while the
+    /// worker drains and after it has exited. A request admitted before
+    /// this whose frame is not queued yet is never written after the
+    /// shutdown's (`request`). The outstanding requests still answer on
+    /// their own.
     #[allow(
         clippy::unused_async,
         reason = "async like the rest of the client; it queues its frame, so it completes without waiting"

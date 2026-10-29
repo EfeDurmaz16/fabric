@@ -142,6 +142,18 @@ async fn a_worker_crash_mid_request_leaves_the_operation_unknown() {
         None,
         "nothing recorded for a lost worker"
     );
+    // Before the profile is checked: a request for an action the profile
+    // does not offer, which Fabric records `rejected` while the worker is
+    // up, is refused as lost and recorded nowhere.
+    let mut other = create(5, "fixture/ok");
+    other.action = Action::Other {
+        name: "sandbox.snapshot".into(),
+        target: None,
+        params: serde_json::Map::new(),
+    };
+    let next = bridge.request(&mut journal, other).await;
+    assert!(matches!(next, Err(BridgeError::Lost(_))), "{next:?}");
+    assert_eq!(status(&journal, 5), None);
     let state = journal.job(scope().job).unwrap().unwrap();
     assert_eq!(state.job.generation, scope().generation);
     let exit = bridge.close().await.unwrap();
