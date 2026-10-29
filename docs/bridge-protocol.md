@@ -36,6 +36,8 @@ These rules decide every case the fixtures cover. An implementation that gets th
 
 Fabric spawns the worker as a child process. Fabric writes frames to the worker's stdin; the worker writes frames to its stdout. Stdout carries frames and nothing else. Stderr is diagnostic text only; Fabric reads at most `max_stderr_bytes` of it per worker and drops the rest. The worker has no listener and opens no network port for the protocol.
 
+The worker leads a process group of its own, which Fabric creates when it starts it. When the worker is lost or closed (a framing or protocol error, its input not read, the end of its stdout, closing its stdin, or Fabric dropping it), Fabric ends that group: the worker has the kill grace to exit, what is left of its group has the rest of that grace, and then the group gets SIGKILL. So nothing the worker started in its group, such as an attached `docker exec` client, outlives it. Ending the group is not a cancel (rule 2), because a provider effect is never in it: a worker keeps out of its group every process whose end would end or abort an effect, by starting that process in a group of its own, and what the provider runs (a container, or the command the engine runs for `docker exec`) belongs to the provider. An operation in flight when the group ends is `unknown`, as for any lost worker.
+
 ### Framing
 
 Each frame is a `u32` little-endian length `N`, then exactly `N` bytes of UTF-8 holding one JSON object and nothing after it. This is the framing of `fabric-client/src/frame.rs` and `sdk/typescript/src/frame.ts` (ADR 0018), reused as is; the bridge has its own envelope and version.
@@ -51,7 +53,7 @@ Each frame is a `u32` little-endian length `N`, then exactly `N` bytes of UTF-8 
 
 A reader checks the declared length against its cap before it allocates or reads the body. A refused length is refused unread (fixtures with `"read_body": false`). The caps are inclusive: a frame of exactly the cap is accepted by length. A profile or `hello_ack` may lower a cap, never raise it.
 
-A framing error cannot be resynchronized. The worker answers it with one `protocol_error` frame, if it still can, and exits with status 2. Fabric answers a framing error from the worker by closing the worker's stdin, sending SIGTERM, and after a grace period SIGKILL; every dispatched operation of that worker becomes `unknown` (rule 2).
+A framing error cannot be resynchronized. The worker answers it with one `protocol_error` frame, if it still can, and exits with status 2. Fabric answers a framing error from the worker by closing the worker's stdin, sending it SIGTERM, and after a grace period SIGKILL to its process group; every dispatched operation of that worker becomes `unknown` (rule 2).
 
 ### Encoding
 
@@ -371,7 +373,7 @@ These rules bind from the first release of v1. Until then v1 exists only on draf
 | --- | --- |
 | `result` `completed` / `cancelled` | `succeeded` / `cancelled`, with the locator |
 | `result` `accepted` / `running` (not terminal-only) | stays `dispatched`, with the locator |
-| `result` not terminal on a terminal-only action, an answer under another operation id, any `protocol_violation`, `protocol_error`, a refused frame, end of stdout | the worker is lost and terminated (stdin closed, SIGTERM, SIGKILL after the grace); every outstanding operation is `unknown` |
+| `result` not terminal on a terminal-only action, an answer under another operation id, any `protocol_violation`, `protocol_error`, a refused frame, end of stdout | the worker is lost and terminated (stdin closed, SIGTERM to the worker, SIGKILL to its process group after the grace); every outstanding operation is `unknown`. At the end of stdout alone the worker gets the grace to exit and is not sent SIGTERM; what it left in its group is ended the same way |
 | `error` `invalid`, `unsupported`, `denied`, `unavailable` | `rejected` |
 | `error` `provider_failed` | `failed`, with the locator when `applied` |
 | `error` `pending` | stays `dispatched`, with the answer and the locator |

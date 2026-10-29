@@ -22,6 +22,7 @@ use fabric_bridge::wire::{
 use fabric_bridge::{Answer, Bridge, BridgeError, Config, Control, Effect, Event, LogError};
 use fabric_core::managed::OperationId;
 use fabric_journal::{Journal, ProviderStatus};
+use rustix::process::Pid;
 use tokio::process::Command;
 
 fn double() -> Command {
@@ -958,4 +959,142 @@ async fn a_late_answer_records_the_locator_it_names_and_not_its_status() {
         ProviderStatus::Succeeded
     );
     assert!(bridge.lost().is_none());
+}
+
+/// What `FABRIC_BRIDGE_DOUBLE_CHILDREN` started: the double, a process in
+/// its group (an attached client) and one in a group of its own (a
+/// provider effect that must outlive the worker).
+struct Children {
+    worker: Pid,
+    client: Pid,
+    effect: Pid,
+}
+
+impl Drop for Children {
+    fn drop(&mut self) {
+        let _ = rustix::process::kill_process(self.client, rustix::process::Signal::KILL);
+        let _ = rustix::process::kill_process(self.effect, rustix::process::Signal::KILL);
+    }
+}
+
+/// The double with its two children, and their pids.
+async fn spawn_with_children(dir: &std::path::Path) -> (Bridge, Children) {
+    let file = dir.join("children");
+    let mut command = double();
+    command.env("FABRIC_BRIDGE_DOUBLE_CHILDREN", &file);
+    let bridge = Bridge::spawn(command, config()).await.unwrap();
+    // The double writes the file before it reads hello.
+    let text = std::fs::read_to_string(&file).unwrap();
+    let pids: Vec<Pid> = text
+        .split_whitespace()
+        .map(|p| Pid::from_raw(p.parse().unwrap()).unwrap())
+        .collect();
+    let [worker, client, effect] = pids[..] else {
+        panic!("{text:?}")
+    };
+    (
+        bridge,
+        Children {
+            worker,
+            client,
+            effect,
+        },
+    )
+}
+
+/// Whether a process holds `pid`, a zombie included.
+fn alive(pid: Pid) -> bool {
+    rustix::process::test_kill_process(pid).is_ok()
+}
+
+/// Whether `pid` is gone within 10 s: a killed orphan is reaped by init,
+/// not at once.
+async fn gone(pid: Pid) -> bool {
+    let started = Instant::now();
+    while alive(pid) {
+        if started.elapsed() > Duration::from_secs(10) {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    true
+}
+
+/// The worker leads a process group of its own, so what it starts there
+/// is in reach and the test's own group is not. A clean close keeps the
+/// worker's exit status, ends what it left in its group, and leaves a
+/// process outside the group running: a provider effect is never ended
+/// by the bridge.
+#[tokio::test]
+async fn the_worker_leads_its_own_group_and_close_ends_what_it_left_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bridge, children) = spawn_with_children(dir.path()).await;
+    let group = |pid| rustix::process::getpgid(Some(pid)).unwrap();
+    assert_eq!(group(children.worker), children.worker, "the worker leads");
+    assert_eq!(group(children.client), children.worker);
+    assert_eq!(group(children.effect), children.effect);
+    assert_ne!(group(children.worker), rustix::process::getpgrp());
+    let exit = bridge.close().await.unwrap();
+    assert_eq!(exit.code(), Some(0), "a clean exit stays clean");
+    assert!(
+        gone(children.client).await,
+        "the client outlived the worker"
+    );
+    assert!(
+        alive(children.effect),
+        "the effect was ended with the worker"
+    );
+}
+
+/// A worker that crashes leaves its group to the bridge: once its output
+/// ends, what it started in its group is ended within the kill grace,
+/// and a process outside the group runs on.
+#[tokio::test]
+async fn a_crashed_worker_takes_its_group_and_not_what_runs_outside_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bridge, children) = spawn_with_children(dir.path()).await;
+    bridge.kill().await;
+    assert!(gone(children.client).await, "the client outlived the crash");
+    assert!(alive(children.effect));
+    assert!(bridge.lost().is_some());
+}
+
+/// A worker that breaks the protocol is terminated with its group.
+#[tokio::test]
+async fn a_worker_that_breaks_the_protocol_is_terminated_with_its_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let (bridge, children) = spawn_with_children(dir.path()).await;
+    let outcome = bridge
+        .request(&mut journal, create(110, "double/oversize"))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(outcome.status, ProviderStatus::Unknown);
+    assert!(
+        gone(children.client).await,
+        "the client outlived the worker"
+    );
+    assert!(alive(children.effect));
+    let exit = bridge.close().await.unwrap();
+    assert_eq!(exit.signal(), Some(15), "SIGTERM first: {exit:?}");
+}
+
+/// A bridge dropped without `close` takes the worker's group with it.
+#[tokio::test]
+async fn a_dropped_bridge_takes_the_workers_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bridge, children) = spawn_with_children(dir.path()).await;
+    drop(bridge);
+    assert!(
+        gone(children.worker).await,
+        "the worker outlived the bridge"
+    );
+    assert!(
+        gone(children.client).await,
+        "the client outlived the bridge"
+    );
+    assert!(alive(children.effect));
 }

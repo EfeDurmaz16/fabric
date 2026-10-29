@@ -27,6 +27,12 @@
 //! `FABRIC_BRIDGE_DOUBLE_HELLO` scripts the handshake: `ok` (the default),
 //! `raise_limit`, `wrong_profile`, `oversize`, `silent` or `exit`; with
 //! `stall` it answers hello and never reads its input again, alive.
+//!
+//! `FABRIC_BRIDGE_DOUBLE_CHILDREN` names a file: before the handshake the
+//! double starts two `sleep` processes and writes its own pid and theirs
+//! there. The first stays in the double's process group, as an attached
+//! `docker exec` client stays in a worker's; the second leads a group of
+//! its own, as a provider effect that must outlive the worker does.
 
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -476,10 +482,37 @@ impl Worker {
     }
 }
 
+/// Starts the two `sleep` processes `FABRIC_BRIDGE_DOUBLE_CHILDREN` asks
+/// for and writes `<double> <in group> <own group>` pids to its file.
+fn children() -> Result<(), std::io::Error> {
+    use std::os::unix::process::CommandExt;
+    let Some(path) = std::env::var_os("FABRIC_BRIDGE_DOUBLE_CHILDREN") else {
+        return Ok(());
+    };
+    let sleep = || {
+        let mut command = std::process::Command::new("sleep");
+        command
+            .arg("600")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command
+    };
+    let client = sleep().spawn()?;
+    let effect = sleep().process_group(0).spawn()?;
+    let pids = format!("{} {} {}\n", std::process::id(), client.id(), effect.id());
+    let partial = std::path::PathBuf::from(&path).with_extension("partial");
+    std::fs::write(&partial, pids)?;
+    std::fs::rename(partial, path)
+}
+
 async fn run() -> u8 {
     let Some(profiles) = profiles() else {
         return 70;
     };
+    if children().is_err() {
+        return 71;
+    }
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let script = std::env::var("FABRIC_BRIDGE_DOUBLE_HELLO").unwrap_or_default();

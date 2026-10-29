@@ -306,26 +306,108 @@ struct Write {
     deadline: Instant,
 }
 
-/// The worker process, when the bridge runs one.
+/// The worker process, when the bridge runs one. It leads its own process
+/// group, whose id is its pid, so whatever it starts in that group, such
+/// as an attached `docker exec` client, ends with it: a lost worker leaves
+/// nothing of its own running. What must outlive it, a provider effect,
+/// runs outside the group (in the engine, or in a group of its own), so
+/// ending the group is never a cancel of an effect.
 struct Process {
     child: tokio::sync::Mutex<Child>,
-    pid: Option<i32>,
+    pid: Option<rustix::process::Pid>,
+    /// The worker's group, never group 1: `kill(-1)` signals every process.
+    group: Option<rustix::process::Pid>,
+    /// Set once the group was found empty or sent `SIGKILL`; the group is
+    /// never signalled after that, since its id may be given out again.
+    ended: std::sync::atomic::AtomicBool,
 }
 
+/// How often a winding-down worker's group is looked at for what is left.
+const GROUP_POLL: Duration = Duration::from_millis(10);
+
 impl Process {
-    /// SIGTERM, then SIGKILL after `grace` unless it exited.
-    async fn terminate(&self, grace: Duration) {
-        let mut child = self.child.lock().await;
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            return;
+    fn new(child: Child) -> Process {
+        let pid = child
+            .id()
+            .and_then(|id| i32::try_from(id).ok())
+            .and_then(rustix::process::Pid::from_raw);
+        Process {
+            child: tokio::sync::Mutex::new(child),
+            pid,
+            group: pid.filter(|pid| !pid.is_init()),
+            ended: std::sync::atomic::AtomicBool::new(false),
         }
-        if let Some(pid) = self.pid.and_then(rustix::process::Pid::from_raw) {
+    }
+
+    /// SIGTERM to the worker, which drains as the protocol says, then the
+    /// group wound down by `grace` (`wind_down`).
+    async fn terminate(&self, grace: Duration) -> Option<ExitStatus> {
+        self.wind_down(true, grace).await
+    }
+
+    /// Ends the worker and its group by `grace` from now: with `term`, the
+    /// worker alone is sent SIGTERM first. The worker gets until `grace`
+    /// to exit, then the group is sent SIGKILL, the worker with it. Once
+    /// the worker exited, what is left of its group gets the rest of
+    /// `grace` to end, then SIGKILL. The worker is reaped before its group
+    /// is looked at, so a group of one ends at once; a pid is not given out
+    /// again while a group with that id has a member, so the group signalled
+    /// after the reap is still this worker's.
+    async fn wind_down(&self, term: bool, grace: Duration) -> Option<ExitStatus> {
+        let by = Instant::now() + grace;
+        let mut child = self.child.lock().await;
+        if term
+            && matches!(child.try_wait(), Ok(None))
+            && let Some(pid) = self.pid
+        {
             let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
         }
-        if tokio::time::timeout(grace, child.wait()).await.is_err() {
+        let status = if let Ok(status) = tokio::time::timeout_at(by, child.wait()).await {
+            status.ok()
+        } else {
+            self.kill_group();
             let _ = child.start_kill();
-            let _ = child.wait().await;
+            child.wait().await.ok()
+        };
+        drop(child);
+        self.end_group(by).await;
+        status
+    }
+
+    /// Waits until `by` for the worker's group to be empty, then sends
+    /// what is left SIGKILL.
+    async fn end_group(&self, by: Instant) {
+        let Some(group) = self.group else {
+            return;
+        };
+        while !self.ended.load(Ordering::Acquire) {
+            if rustix::process::test_kill_process_group(group) == Err(rustix::io::Errno::SRCH) {
+                self.ended.store(true, Ordering::Release);
+                return;
+            }
+            if Instant::now() >= by {
+                self.kill_group();
+                return;
+            }
+            tokio::time::sleep(GROUP_POLL).await;
         }
+    }
+
+    /// SIGKILL to the worker's group, once.
+    fn kill_group(&self) {
+        if let Some(group) = self.group
+            && !self.ended.swap(true, Ordering::AcqRel)
+        {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        }
+    }
+}
+
+impl Drop for Process {
+    /// A bridge dropped without `close` takes the worker's group with it;
+    /// the child's own kill on drop then kills the worker and reaps it.
+    fn drop(&mut self) {
+        self.kill_group();
     }
 }
 
@@ -364,14 +446,16 @@ impl Drop for Bridge {
 }
 
 impl Bridge {
-    /// Starts `command` as the worker, with piped stdio, killed when the
-    /// bridge is dropped, and runs the handshake. A worker that refuses,
-    /// breaks the handshake or does not answer in time is terminated.
+    /// Starts `command` as the worker, with piped stdio, as the leader of
+    /// a process group of its own, killed with that group when the bridge
+    /// is dropped, and runs the handshake. A worker that refuses, breaks
+    /// the handshake or does not answer in time is terminated.
     pub async fn spawn(mut command: Command, config: Config) -> Result<Bridge, BridgeError> {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .process_group(0)
             .kill_on_drop(true);
         let mut child = command.spawn().map_err(BridgeError::Spawn)?;
         let (Some(stdin), Some(stdout), Some(stderr)) =
@@ -381,11 +465,7 @@ impl Bridge {
                 "the worker's stdio is not piped",
             )));
         };
-        let pid = child.id().and_then(|id| i32::try_from(id).ok());
-        let process = Arc::new(Process {
-            child: tokio::sync::Mutex::new(child),
-            pid,
-        });
+        let process = Arc::new(Process::new(child));
         let captured = Arc::new(Mutex::new(Vec::new()));
         let cap = usize::try_from(config.limits.max_stderr_bytes).unwrap_or(usize::MAX);
         tokio::spawn(drain_stderr(stderr, Arc::clone(&captured), cap));
@@ -924,10 +1004,12 @@ impl Bridge {
 
     /// Closes the worker's input once the frames already queued are
     /// written, which the protocol reads as a shutdown with no drain, and
-    /// waits up to the kill grace for it to exit before killing it. A
-    /// writer held up by a worker that does not read is stopped at the
-    /// kill grace, which closes the input as well. `None` when the bridge
-    /// runs no process.
+    /// waits up to the kill grace for it to exit before killing it with
+    /// its process group. What is left of the group after the worker
+    /// exited, such as a client it did not stop, gets the rest of the kill
+    /// grace, then SIGKILL. A writer held up by a worker that does not read
+    /// is stopped at the kill grace, which closes the input as well. `None`
+    /// when the bridge runs no process.
     pub async fn close(mut self) -> Option<ExitStatus> {
         self.writes.take();
         if tokio::time::timeout(self.config.kill_grace, &mut self.writer)
@@ -938,15 +1020,12 @@ impl Bridge {
             let _ = (&mut self.writer).await;
         }
         let process = self.process.clone()?;
-        let mut child = process.child.lock().await;
-        if let Ok(Ok(status)) = tokio::time::timeout(self.config.kill_grace, child.wait()).await {
-            return Some(status);
-        }
-        let _ = child.start_kill();
-        child.wait().await.ok()
+        process.wind_down(false, self.config.kill_grace).await
     }
 
-    /// Kills the worker at once, as a crash would.
+    /// Kills the worker at once, as a crash would: the worker alone, so
+    /// what it started in its group is left to the bridge, which ends the
+    /// group once it reads the end of the worker's output.
     pub async fn kill(&self) {
         if let Some(process) = &self.process {
             let mut child = process.child.lock().await;
@@ -1293,7 +1372,15 @@ async fn read_loop<R: AsyncRead + Unpin>(
         }
     };
     match why {
-        None => shared.lose("the worker closed its output"),
+        None => {
+            shared.lose("the worker closed its output");
+            // A worker that closed its output is done, by exit or crash;
+            // whatever it left running in its group goes with it, after
+            // the grace a clean exit needs.
+            if let Some(process) = process {
+                process.wind_down(false, grace).await;
+            }
+        }
         Some(why) => {
             shared.lose(&why);
             // Stopping the writer drops the worker's input, even mid-frame.
