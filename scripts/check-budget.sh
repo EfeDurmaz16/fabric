@@ -308,6 +308,7 @@ fail() {
   exit 1
 }
 runs=$(sed -n 's/^runs = "\([0-9][0-9 ]*\)"$/\1/p' "$work/new" | tail -n 1)
+# shellcheck disable=SC2086 # one argument per run id
 set -- $runs
 if [ "$#" -lt 3 ]; then
   sed 's/^/raised: /' "$work/raised" >&2
@@ -338,7 +339,8 @@ for id in "$@"; do
   logs="$logs $work/run-$id.log"
 done
 tab=$(printf '\t')
-for platform in $(cut -f 1 "$work/raised" | sort -u); do
+cut -f 1 "$work/raised" | sort -u > "$work/platforms"
+while read -r platform <&3; do
   # shellcheck disable=SC2086 # one argument per log
   "$scripts/budget-baselines.sh" "$platform" $logs > "$work/derived" ||
     fail "the runs give no baselines for $platform"
@@ -348,4 +350,4 @@ for platform in $(cut -f 1 "$work/raised" | sort -u); do
     [ "$derived" = "$ms" ] ||
       fail "the baseline of $op on $platform rose to $ms ms, but the runs $* give ${derived:-none}"
   done < "$work/raised-here"
-done
+done 3< "$work/platforms"
