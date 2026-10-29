@@ -12,7 +12,7 @@ M3 made every provider effect safe to lose: the journal commits a provider opera
 - An `unknown` operation has no explicit exit. Fabric can neither say "the effect is known to exist but is not finished" nor let the owner give up on it in a recorded way.
 - Nothing ties a replacement attempt to the fate of the previous attempt's effects. `StartAttempt` checks only that no attempt is live, so a destroy that failed or never answered does not stop a second execution from starting beside a first one that may still run. And once an attempt has ended or the job is closed, the journal refuses every provider operation, so the resources the job made cannot be cleaned up at all.
 
-Draft P11 leaves five choices open. This ADR selects each one.
+Draft P11 leaves five choices open. This ADR selects each one, and records a sixth selection Efe made on 2026-10-29: where the control surfaces for provider operations go.
 
 ## Decision
 
@@ -52,6 +52,10 @@ A create that is `attached`, `observed`, settled or abandoned does not block: it
 
 A cleanup is a `sandbox.destroy` of a resource that a create of the same job made, recorded with purpose `cleanup` and the create it cleans. It differs from an ordinary effect in two ways. Its fencing: it is allowed after the attempt ended and after the job finished or was cancelled, and it carries the creating operation's own scope, so the worker's owner check still holds. Its approval: every cleanup call carries an approval reference the caller supplies for that call, which the worker resolves to a grant scoped to `sandbox.destroy` on that resource. Fabric stores no approval reference, so it cannot reuse one; a create grant never authorizes a destroy, and an expired grant authorizes nothing (both already refused by the worker in v1). Fabric never starts a cleanup by itself. When no authorized cleanup happens, `residuals` lists precisely what the job's creates may have left: each named resource, and each create whose resource no one can name, with the scope an absent attach searched.
 
+### Selection 6: the read surface for provider operations comes with M5
+
+Approved by Efe on 2026-10-29. In M4, attach, cleanup, abandonment, the replacement blockers and the residual list are library calls of `fabric-bridge` and `fabric-journal`: `fabricd` does not drive the bridge yet, so no node holds a provider operation a client could read. A read surface for provider operations (their `unknown`, `attached`, `observed` and `abandoned` statuses, the replacement blockers and the residuals) in the client API, the TypeScript SDK and the CLI belongs to M5, where `fabricd` starts driving the bridge. It is M5 scope by this decision, not a blocked M4 item. Its exact M5 acceptance row is in [docs/managed-jobs.md](../managed-jobs.md), section "Carried to M5: the read surface for provider operations": one read that writes nothing and sends nothing to a worker, showing each status, blocker and residual as the journal holds it, pinned by a node test, a TypeScript SDK test and a CLI test written first.
+
 ## Alternatives considered
 
 1. Retry a create whose answer was lost when the profile deduplicates on the key. Rejected: Fabric would trust a dedupe window and a parameter-conflict rule it has not verified per provider, and a retry is an effect where attach is a read.
@@ -68,7 +72,7 @@ A cleanup is a `sandbox.destroy` of a resource that a create of the same job mad
 - A failed or unanswered stop blocks a replacement, at the cost that a provider that cannot destroy keeps the task waiting until a destroy succeeds.
 - No new transaction or fsync per effect. A create's begin reads one more index inside its transaction; `StartAttempt` evaluates the barrier inside its transaction; attach is a new read path. The perf phase measures them against the anchor.
 - The worker gains one read-only message, the fixture provider a seed state (`starting`), and both scenario runners a header (`journal_state`) that seeds Fabric's journal.
-- Control surfaces are out of M4: `fabricd` does not drive the bridge yet, so attach, cleanup, abandonment and the residual list are library calls of `fabric-bridge` and `fabric-journal`, and the client API and the CLI gain them when placement puts attempts on providers (M5).
+- Control surfaces are out of M4 (selection 6): `fabricd` does not drive the bridge yet, so attach, cleanup, abandonment and the residual list are library calls of `fabric-bridge` and `fabric-journal`; the client API, the TypeScript SDK and the CLI gain their read surface in M5, under the acceptance row in docs/managed-jobs.md.
 
 ## Open questions
 
