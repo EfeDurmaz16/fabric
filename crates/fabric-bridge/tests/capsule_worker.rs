@@ -1637,3 +1637,231 @@ async fn the_docker_profile_on_the_local_engine() {
     assert_eq!(containers(), 0);
     assert_eq!(bridge.close().await.unwrap().code(), Some(0));
 }
+
+/// What a lost create leaves, once Fabric and the worker both restarted:
+/// a create `unknown` with no locator. Neither it nor a new create of the
+/// job is sent; an attach by its identity finds the one resource the
+/// provider made; a cleanup of it needs its own destroy grant.
+async fn attach_after_both_restart(
+    journal: Logged,
+    bridge: &Bridge,
+    create_again: Effect,
+    another_create: Effect,
+    lost: OperationId,
+) -> (Logged, Outcome) {
+    let mut restarted = journal.into_inner().await;
+    let recovery = restarted
+        .recover(1_770_000_000_000, |_| fabric_journal::Liveness::CannotTell)
+        .unwrap();
+    assert_eq!(recovery.provider_unknown.len(), 1, "{recovery:?}");
+    assert_eq!(recovery.provider_unknown[0].1, lost);
+    let mut journal = Logged::new(restarted);
+    assert_eq!(entry(&journal, lost).status, ProviderStatus::Unknown);
+    assert_eq!(entry(&journal, lost).locator, None, "no answer was read");
+    let again = bridge.request(&mut journal, create_again).await;
+    assert!(
+        matches!(again, Err(BridgeError::Log(LogError::Used(_)))),
+        "{again:?}"
+    );
+    let waits = bridge.request(&mut journal, another_create).await;
+    assert!(
+        matches!(waits, Err(BridgeError::Log(LogError::Fenced(_)))),
+        "{waits:?}"
+    );
+    let found = bridge
+        .attach(&mut journal, lost, 10_000)
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    (journal, found)
+}
+
+/// A create whose answer was never read, with the worker killed and
+/// Fabric restarted after the provider made the sandbox: the restarted
+/// worker (seeded with the sandbox, since the fixture provider lives in
+/// the worker and the real one outlives it) attaches it by the create's
+/// own identity, and Fabric never makes it twice. A cleanup under the
+/// create's grant is refused before any effect; under its own fresh
+/// destroy grant it removes the residual.
+#[tokio::test]
+#[ignore = "needs the Capsule worker: set CAPSULE_BRIDGE_WORKER, run with --ignored"]
+async fn a_create_lost_with_its_worker_is_attached_and_never_made_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = journal(dir.path());
+    let mut config = fixture_config(&[]);
+    config["approvals"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"ref": "apr-cleanup-60", "action": "sandbox.destroy", "native_id": "fx-key-60", "expired": false}));
+    let path = write_config(dir.path(), "worker.json", &config);
+    let bridge = spawn("fixture", &path).await;
+    let flight = bridge
+        .request(&mut journal, create(60, "fixture/ok"))
+        .await
+        .unwrap();
+    // Fabric stops before it reads the answer, and the worker is killed.
+    drop(flight);
+    bridge.kill().await;
+    drop(bridge);
+
+    config["sandboxes"].as_array_mut().unwrap().push(json!({
+        "native_id": "fx-key-60", "project": "proj-1", "owner_job": JOB,
+        "operation": id(60).to_string(), "status": "ready",
+    }));
+    let seeded = write_config(dir.path(), "restarted.json", &config);
+    let bridge = spawn("fixture", &seeded).await;
+    let (mut journal, found) = attach_after_both_restart(
+        journal,
+        &bridge,
+        create(60, "fixture/ok"),
+        create(61, "fixture/ok"),
+        id(60),
+    )
+    .await;
+    assert_eq!(
+        found.status,
+        ProviderStatus::Succeeded,
+        "{:?}",
+        found.answer
+    );
+    assert!(!result(&found).replayed);
+    assert_eq!(
+        entry(&journal, id(60)).locator,
+        Some(stored(&fx("fx-key-60")))
+    );
+
+    let cleanup = |n: u8, approval: &str| fabric_bridge::Cleanup {
+        creating: id(60),
+        id: id(n),
+        key: OperationKey::parse(&format!("key-{n}")).unwrap(),
+        approval: approval.into(),
+        deadline_ms: 30_000,
+    };
+    let refused = bridge
+        .cleanup(&mut journal, cleanup(62, "apr-create-only"))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(refused.status, ProviderStatus::Rejected);
+    assert_eq!(
+        refusal(&refused),
+        (ErrorCode::Denied, "approval_scope", EffectState::None)
+    );
+    assert_eq!(journal.residuals(scope().job).unwrap().len(), 1);
+    let destroyed = bridge
+        .cleanup(&mut journal, cleanup(63, "apr-cleanup-60"))
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(destroyed.status, ProviderStatus::Succeeded);
+    assert!(journal.residuals(scope().job).unwrap().is_empty());
+    assert_eq!(bridge.close().await.unwrap().code(), Some(0));
+}
+
+/// The same on the local Docker engine, whose containers outlive the
+/// worker: the attach finds the one container labelled with the create's
+/// operation, and the cleanup removes it.
+#[tokio::test]
+#[ignore = "needs the Capsule worker and a local Docker engine: set CAPSULE_BRIDGE_WORKER and CAPSULE_BRIDGE_DOCKER_IMAGE, run with --ignored"]
+async fn a_docker_create_lost_with_its_worker_is_attached_and_never_made_twice() {
+    let image = match docker_image() {
+        Ok(image) => image,
+        Err(why) if std::env::var_os(DOCKER_IMAGE_VAR).is_none() => {
+            eprintln!("skipped: {why}");
+            return;
+        }
+        Err(why) => panic!("{DOCKER_IMAGE_VAR} is set, but {why}"),
+    };
+    let scope = Scope {
+        job: JobId::from_bytes(fresh("attach-job")),
+        task: TaskId::from_bytes(fresh("attach-task")),
+        attempt: AttemptId::from_bytes(fresh("attach-attempt")),
+        generation: Generation::FIRST,
+    };
+    let label = format!("label=fabric.job={}", scope.job);
+    let _cleanup = Cleanup(label.clone());
+    let containers = |filter: &str| {
+        docker(&["ps", "-a", "-q", "--filter", filter])
+            .unwrap()
+            .split_whitespace()
+            .count()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Logged::new(journal_for(dir.path(), scope));
+    let path = write_config(
+        dir.path(),
+        "docker.json",
+        &json!({
+            "policy": {"images": [image]},
+            "approvals": [{"ref": "apr-destroy", "action": "sandbox.destroy", "native_id": null}]
+        }),
+    );
+    let make = |n: u8| {
+        docker_effect(
+            scope,
+            n,
+            Action::Create(CreateParams {
+                image: image.clone(),
+                env: BTreeMap::new(),
+                secret_names: Vec::new(),
+                labels: BTreeMap::new(),
+            }),
+            None,
+        )
+    };
+    let lost = make(1);
+    let lost_id = lost.operation.id;
+    let own = format!("label=fabric.operation={lost_id}");
+    let mut journal = journal;
+    let bridge = spawn("docker", &path).await;
+    let flight = bridge.request(&mut journal, lost.clone()).await.unwrap();
+    drop(flight);
+    let started = Instant::now();
+    while containers(&own) == 0 {
+        assert!(
+            started.elapsed() < Duration::from_mins(1),
+            "the engine never made the container"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    bridge.kill().await;
+    drop(bridge);
+
+    let bridge = spawn("docker", &path).await;
+    let (mut journal, found) =
+        attach_after_both_restart(journal, &bridge, lost, make(2), lost_id).await;
+    assert_eq!(
+        found.status,
+        ProviderStatus::Succeeded,
+        "{:?}",
+        found.answer
+    );
+    assert_eq!(containers(&own), 1, "made once");
+    assert_eq!(containers(&label), 1);
+    let destroyed = bridge
+        .cleanup(
+            &mut journal,
+            fabric_bridge::Cleanup {
+                creating: lost_id,
+                id: OperationId::from_bytes(fresh("cleanup")),
+                key: OperationKey::parse("docker-cleanup-1").unwrap(),
+                approval: "apr-destroy".into(),
+                deadline_ms: 60_000,
+            },
+        )
+        .await
+        .unwrap()
+        .finish(&mut journal)
+        .await
+        .unwrap();
+    assert_eq!(destroyed.status, ProviderStatus::Succeeded);
+    assert_eq!(containers(&label), 0);
+    assert!(journal.residuals(scope.job).unwrap().is_empty());
+    assert_eq!(bridge.close().await.unwrap().code(), Some(0));
+}
