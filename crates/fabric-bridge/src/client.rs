@@ -36,7 +36,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::Instant;
 
 use crate::frames::{self, FrameFault};
-use crate::log::{Entry, LogError, OperationLog};
+use crate::log::{Entry, LogError, OperationLog, Recorder};
 use crate::wire::{
     Action, Cancel, CancelState, ErrorCode, ErrorMessage, Expect, Hello, Limits, Locator,
     MAX_PROGRESS, Observe, OperationRef, Phase, Profile, Refusal, Request, RequestPolicy,
@@ -637,8 +637,8 @@ impl Bridge {
     /// stopped waiting on named since the last call; the status each
     /// operation holds stays. `request`, `observe` and `InFlight::next` do
     /// this first, so a caller only needs it while it makes none of those.
-    pub fn record_late<L: OperationLog>(&self, log: &mut L) -> Result<(), BridgeError> {
-        Ok(self.shared.record_found(log)?)
+    pub async fn record_late<L: Recorder>(&self, log: &mut L) -> Result<(), BridgeError> {
+        Ok(record_found(&self.shared, log).await?)
     }
 
     /// Why the worker is gone, if it is.
@@ -734,6 +734,22 @@ impl Bridge {
         })
     }
 
+    /// `reserve` for a frame the log's thread queues once its operation
+    /// is recorded: a place that does not borrow the bridge.
+    fn reserve_owned(&self) -> Result<mpsc::OwnedPermit<Write>, BridgeError> {
+        let Some(writes) = &self.writes else {
+            return Err(BridgeError::ShuttingDown);
+        };
+        let room = u64::try_from(writes.max_capacity()).unwrap_or(u64::MAX);
+        writes.clone().try_reserve_owned().map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => BridgeError::Busy(room),
+            mpsc::error::TrySendError::Closed(_) => BridgeError::Lost(
+                self.lost()
+                    .unwrap_or_else(|| "the worker's input is closed".into()),
+            ),
+        })
+    }
+
     /// `register` and `reserve` together; nothing is left registered when
     /// the queue refuses.
     fn enlist(
@@ -764,19 +780,16 @@ impl Bridge {
     /// deadline. A worker that is gone, busy or shutting down refuses
     /// before the log is touched.
     ///
-    /// It never waits on the worker, so a caller that stops waiting on it
-    /// leaves either nothing recorded or the operation recorded and its
-    /// frame queued whole.
-    #[allow(
-        clippy::unused_async,
-        reason = "async like the rest of the client; it records and queues, so it completes without waiting"
-    )]
-    pub async fn request<L: OperationLog>(
+    /// It waits on the log, never on the worker. Recording the operation
+    /// and queueing its frame are one call on the log's thread, queued
+    /// whole: a caller that stops waiting on it leaves either nothing
+    /// recorded or the operation recorded and its frame queued whole.
+    pub async fn request<L: Recorder>(
         &self,
         log: &mut L,
         effect: Effect,
     ) -> Result<InFlight, BridgeError> {
-        self.shared.record_found(log)?;
+        record_found(&self.shared, log).await?;
         let request = Request {
             request_id: self.request_id(),
             operation: effect.operation,
@@ -797,56 +810,60 @@ impl Bridge {
             action: request.action.name().to_owned(),
             target: request.action.target().map(locator_text),
         };
-        let refuse = |log: &mut L, refusal: Refusal| -> BridgeError {
-            let answer = ProviderAnswer {
-                code: Some(refusal.code.to_owned()),
-                reason: Some(refusal.reason.to_owned()),
-                effect: Some("none".to_owned()),
-            };
-            match log.begin(&dispatch, Some(&answer)) {
-                Ok(()) => BridgeError::RefusedLocally(refusal),
-                Err(e) => BridgeError::Log(e),
-            }
-        };
         if let Err(refusal) = self.as_worker_reads(&ToWorker::Request(Box::new(request.clone()))) {
-            return Err(refuse(log, refusal));
+            return Err(refuse(log, dispatch, refusal).await);
         }
         let frame = match frames::encode(&request.to_value(), cap_of(self.limits.max_request_bytes))
         {
             Ok(frame) => frame,
             Err(fault) => {
-                return Err(refuse(
-                    log,
-                    Refusal {
-                        code: "invalid",
-                        reason: "limit",
-                        detail: fault.to_string(),
-                    },
-                ));
+                let refusal = Refusal {
+                    code: "invalid",
+                    reason: "limit",
+                    detail: fault.to_string(),
+                };
+                return Err(refuse(log, dispatch, refusal).await);
             }
         };
-        let (rx, permit) = self.enlist(
+        let slot = log.reserve().await?;
+        let rx = self.register(
             &request.request_id,
             Some(dispatch.operation),
             Some(&dispatch.action),
             Kind::Request,
         )?;
-        if let Err(e) = log.begin(&dispatch, None) {
-            self.unregister(&request.request_id);
-            return Err(e.into());
-        }
-        let deadline =
-            Instant::now() + Duration::from_millis(request.deadline_ms) + self.config.grace;
-        permit.send(Write { frame, deadline });
-        Ok(InFlight {
+        let permit = match self.reserve_owned() {
+            Ok(permit) => permit,
+            Err(e) => {
+                self.unregister(&request.request_id);
+                return Err(e);
+            }
+        };
+        let wait = Duration::from_millis(request.deadline_ms) + self.config.grace;
+        let mut flight = InFlight {
             request_id: request.request_id,
             operation: dispatch.operation,
             kind: Kind::Request,
             rx,
-            deadline,
+            deadline: Instant::now() + wait,
             shared: Arc::clone(&self.shared),
             done: false,
-        })
+        };
+        let shared = Arc::clone(&self.shared);
+        let id = flight.request_id.clone();
+        // From here a caller that stops waiting drops `flight`, which
+        // expires the request: a late answer still names its resource.
+        let begun = slot.run(move |log| {
+            if let Err(e) = log.begin(&dispatch, None) {
+                shared.lock().waiters.remove(&id);
+                return Err(e);
+            }
+            let deadline = Instant::now() + wait;
+            permit.send(Write { frame, deadline });
+            Ok(deadline)
+        });
+        flight.deadline = begun.await??;
+        Ok(flight)
     }
 
     /// Reads the resource of an operation the log holds as `dispatched`
@@ -860,11 +877,7 @@ impl Bridge {
     /// reported. Anything else is `ObserveMismatch` before sending, since
     /// the answer would settle this operation from another resource's
     /// state: a destroy recorded done while its target still runs.
-    #[allow(
-        clippy::unused_async,
-        reason = "async like the rest of the client; it queues its frame, so it completes without waiting"
-    )]
-    pub async fn observe<L: OperationLog>(
+    pub async fn observe<L: Recorder>(
         &self,
         log: &mut L,
         operation: OperationId,
@@ -873,7 +886,7 @@ impl Bridge {
         wait_ms: u64,
     ) -> Result<InFlight, BridgeError> {
         // A late answer may have named the resource this observe reads.
-        self.shared.record_found(log)?;
+        record_found(&self.shared, log).await?;
         let observe = Observe {
             request_id: self.request_id(),
             operation_id: operation,
@@ -883,7 +896,12 @@ impl Bridge {
         };
         self.as_worker_reads(&ToWorker::Observe(observe.clone()))
             .map_err(BridgeError::RefusedLocally)?;
-        let entry = log.entry(operation)?.filter(|e| {
+        let entry = log
+            .reserve()
+            .await?
+            .run(move |log| log.entry(operation))
+            .await??;
+        let entry = entry.filter(|e| {
             matches!(
                 e.status,
                 ProviderStatus::Dispatched | ProviderStatus::Unknown
@@ -1161,12 +1179,18 @@ impl InFlight {
     /// Fabric's deadline the answer is `TimedOut` and the operation
     /// `unknown`; a later answer leaves the status as it is and only the
     /// locator it names is recorded (`Bridge::record_late`).
-    pub async fn next<L: OperationLog>(&mut self, log: &mut L) -> Result<Event, BridgeError> {
+    ///
+    /// Room on the log is taken before a frame is: a step taken from the
+    /// worker is then recorded, on the log's side, even when the caller
+    /// stops waiting on this call.
+    pub async fn next<L: Recorder>(&mut self, log: &mut L) -> Result<Event, BridgeError> {
         if self.done {
             return Err(BridgeError::Lost("the request was already answered".into()));
         }
-        self.shared.record_found(log)?;
+        record_found(&self.shared, log).await?;
+        let slot = log.reserve().await?;
         let incoming = tokio::time::timeout_at(self.deadline, self.rx.recv()).await;
+        let operation = self.operation;
         let answer = match incoming {
             Err(_) => {
                 self.shared.expire(&self.request_id);
@@ -1175,7 +1199,8 @@ impl InFlight {
             Ok(None) => Answer::Lost("the bridge reader stopped".into()),
             Ok(Some(Incoming::Lost(why))) => Answer::Lost(why),
             Ok(Some(Incoming::Progress(locator))) => {
-                log.locate(self.operation, &locator_text(&locator))?;
+                let text = locator_text(&locator);
+                slot.run(move |log| log.locate(operation, &text)).await??;
                 return Ok(Event::Progress(locator));
             }
             Ok(Some(Incoming::Answer(message))) => match *message {
@@ -1188,83 +1213,155 @@ impl InFlight {
                 }
             },
         };
-        let outcome = self.settle(log, answer)?;
+        let (kind, said) = (self.kind, Said::of(&answer));
+        let settled = slot.run(move |log| settle(log, operation, kind, said));
         self.done = true;
-        Ok(Event::Done(outcome))
+        let status = settled.await??;
+        Ok(Event::Done(Outcome { status, answer }))
     }
 
     /// Waits for the answer, recording any locator reported before it.
-    pub async fn finish<L: OperationLog>(mut self, log: &mut L) -> Result<Outcome, BridgeError> {
+    pub async fn finish<L: Recorder>(mut self, log: &mut L) -> Result<Outcome, BridgeError> {
         loop {
             if let Event::Done(outcome) = self.next(log).await? {
                 return Ok(outcome);
             }
         }
     }
+}
 
-    /// Records `answer` and returns the status the log holds after it.
-    fn settle<L: OperationLog>(&self, log: &mut L, answer: Answer) -> Result<Outcome, BridgeError> {
-        let before = log
-            .entry(self.operation)?
-            .map_or(ProviderStatus::Dispatched, |e| e.status);
-        let (status, record, locator) = match (&answer, self.kind) {
-            (Answer::Result(r), _) => match r.state {
-                ResultState::Completed => (
-                    ProviderStatus::Succeeded,
-                    ProviderAnswer::default(),
-                    Some(&r.resource),
-                ),
-                ResultState::Cancelled => (
-                    ProviderStatus::Cancelled,
-                    ProviderAnswer::default(),
-                    Some(&r.resource),
-                ),
-                ResultState::Accepted | ResultState::Running => {
-                    (before, ProviderAnswer::default(), Some(&r.resource))
-                }
-            },
-            (Answer::Error(e), kind) => {
+/// What an answer asks of the log, without its output, so the call that
+/// records it carries no more than it needs.
+#[derive(Debug)]
+enum Said {
+    /// A `result` in this state, naming this locator.
+    Result(ResultState, String),
+    /// An `error`: what the log keeps of it, and the locator it named.
+    Error {
+        code: ErrorCode,
+        record: ProviderAnswer,
+        locator: Option<String>,
+    },
+    /// No answer: Fabric's deadline passed, or the worker went away.
+    Nothing,
+}
+
+impl Said {
+    fn of(answer: &Answer) -> Said {
+        match answer {
+            Answer::Result(r) => Said::Result(r.state, locator_text(&r.resource)),
+            Answer::Error(e) => {
                 let body = &e.error;
-                let record = ProviderAnswer {
-                    code: Some(body.code.name().to_owned()),
-                    reason: Some(body.reason.clone()),
-                    effect: Some(body.effect.name().to_owned()),
-                };
-                let status = match (body.code, kind) {
-                    (ErrorCode::Pending, _) => before,
-                    (ErrorCode::Unknown, _) => ProviderStatus::Unknown,
-                    (code, Kind::Request) if code.is_refusal() => ProviderStatus::Rejected,
-                    (ErrorCode::ProviderFailed, Kind::Request) => ProviderStatus::Failed,
-                    // A refused or failed observe says nothing new about the
-                    // operation it read.
-                    _ => {
-                        return Ok(Outcome {
-                            status: before,
-                            answer,
-                        });
-                    }
-                };
-                (status, record, body.resource.as_ref())
+                Said::Error {
+                    code: body.code,
+                    record: ProviderAnswer {
+                        code: Some(body.code.name().to_owned()),
+                        reason: Some(body.reason.clone()),
+                        effect: Some(body.effect.name().to_owned()),
+                    },
+                    locator: body.resource.as_ref().map(locator_text),
+                }
             }
-            (Answer::TimedOut | Answer::Lost(_), _) => {
-                let status = if before == ProviderStatus::Dispatched {
-                    ProviderStatus::Unknown
-                } else {
-                    before
-                };
-                (status, ProviderAnswer::default(), None)
-            }
-        };
-        if before.is_terminal() {
-            return Ok(Outcome {
-                status: before,
-                answer,
-            });
+            Answer::TimedOut | Answer::Lost(_) => Said::Nothing,
         }
-        let locator = locator.map(locator_text);
-        log.record(self.operation, status, &record, locator.as_deref())?;
-        Ok(Outcome { status, answer })
     }
+}
+
+/// Records what `said` asks for `operation`, an answer to a `kind`, and
+/// returns the status the log holds after it.
+fn settle<L: OperationLog>(
+    log: &mut L,
+    operation: OperationId,
+    kind: Kind,
+    said: Said,
+) -> Result<ProviderStatus, LogError> {
+    let before = log
+        .entry(operation)?
+        .map_or(ProviderStatus::Dispatched, |e| e.status);
+    let (status, record, locator) = match said {
+        Said::Result(state, locator) => match state {
+            ResultState::Completed => (
+                ProviderStatus::Succeeded,
+                ProviderAnswer::default(),
+                Some(locator),
+            ),
+            ResultState::Cancelled => (
+                ProviderStatus::Cancelled,
+                ProviderAnswer::default(),
+                Some(locator),
+            ),
+            ResultState::Accepted | ResultState::Running => {
+                (before, ProviderAnswer::default(), Some(locator))
+            }
+        },
+        Said::Error {
+            code,
+            record,
+            locator,
+        } => {
+            let status = match (code, kind) {
+                (ErrorCode::Pending, _) => before,
+                (ErrorCode::Unknown, _) => ProviderStatus::Unknown,
+                (code, Kind::Request) if code.is_refusal() => ProviderStatus::Rejected,
+                (ErrorCode::ProviderFailed, Kind::Request) => ProviderStatus::Failed,
+                // A refused or failed observe says nothing new about the
+                // operation it read.
+                _ => return Ok(before),
+            };
+            (status, record, locator)
+        }
+        Said::Nothing => {
+            let status = if before == ProviderStatus::Dispatched {
+                ProviderStatus::Unknown
+            } else {
+                before
+            };
+            (status, ProviderAnswer::default(), None)
+        }
+    };
+    if before.is_terminal() {
+        return Ok(before);
+    }
+    log.record(operation, status, &record, locator.as_deref())?;
+    Ok(status)
+}
+
+/// Records `dispatch` `rejected` for `refusal`, which Fabric found before
+/// sending anything, and returns the caller's error.
+async fn refuse<L: Recorder>(
+    log: &mut L,
+    dispatch: ProviderDispatch,
+    refusal: Refusal,
+) -> BridgeError {
+    let answer = ProviderAnswer {
+        code: Some(refusal.code.to_owned()),
+        reason: Some(refusal.reason.to_owned()),
+        effect: Some("none".to_owned()),
+    };
+    let recorded = match log.reserve().await {
+        Ok(slot) => slot
+            .run(move |log| log.begin(&dispatch, Some(&answer)))
+            .await
+            .and_then(|begun| begun),
+        Err(e) => Err(e),
+    };
+    match recorded {
+        Ok(()) => BridgeError::RefusedLocally(refusal),
+        Err(e) => BridgeError::Log(e),
+    }
+}
+
+/// Records in `log` each locator a late answer named
+/// (`Shared::record_found`), on the log's side; with none, it makes no call.
+async fn record_found<L: Recorder>(shared: &Arc<Shared>, log: &mut L) -> Result<(), LogError> {
+    if shared.lock().found.is_empty() {
+        return Ok(());
+    }
+    let shared = Arc::clone(shared);
+    log.reserve()
+        .await?
+        .run(move |log| shared.record_found(log))
+        .await?
 }
 
 fn locator_text(locator: &Locator) -> String {

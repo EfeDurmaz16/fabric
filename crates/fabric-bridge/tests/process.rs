@@ -632,7 +632,7 @@ async fn a_dispatched_destroy_names_its_target_before_any_answer_and_after_a_res
     drop(flight);
     bridge.kill().await;
     drop(bridge);
-    drop(journal);
+    drop(journal.into_inner().await);
     let mut journal = Journal::open(&dir.path().join(fabric_journal::FILE_NAME)).unwrap();
     let recovery = journal
         .recover(1_770_000_000_000, |_| fabric_journal::Liveness::CannotTell)
@@ -915,7 +915,7 @@ async fn a_late_answer_records_the_locator_it_names_and_not_its_status() {
         assert!(started.elapsed() < Duration::from_secs(5), "no late answer");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    bridge.record_late(&mut journal).unwrap();
+    bridge.record_late(&mut journal).await.unwrap();
     let own = fx("key-100");
     assert_eq!(status(&journal, 100), Some(ProviderStatus::Unknown));
     assert_eq!(locator(&journal, 100), Some(own.to_value().to_string()));

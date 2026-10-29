@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use common::{Cleanup, WORKER_VAR, capsule_worker, docker, docker_image, fresh, journal, scope};
 use fabric_bridge::wire::{Action, CreateParams, Digest, ExecParams, Locator, OperationRef, Scope};
-use fabric_bridge::{Bridge, Config, Effect, MemoryLog, OperationLog};
+use fabric_bridge::{Bridge, Config, Effect, MemoryLog, Recorder};
 use fabric_core::id::JobId;
 use fabric_core::managed::{AttemptId, Generation, OperationId, OperationKey, TaskId};
 use fabric_journal::ProviderStatus;
@@ -92,12 +92,7 @@ fn keep(out: &Path, name: &str, samples: &[u64], summary: &mut String) {
     );
 }
 
-async fn round_trips<L: OperationLog>(
-    bridge: &Bridge,
-    log: &mut L,
-    from: u32,
-    n: usize,
-) -> Vec<u64> {
+async fn round_trips<L: Recorder>(bridge: &Bridge, log: &mut L, from: u32, n: usize) -> Vec<u64> {
     let mut samples = Vec::with_capacity(n);
     for i in 0..u32::try_from(n).unwrap() {
         let started = Instant::now();
@@ -203,7 +198,7 @@ fn echo(target: &Locator) -> Action {
 
 /// Times `n` requests made by `make`, each to its answer, which must be
 /// `succeeded`.
-async fn timed<L: OperationLog>(
+async fn timed<L: Recorder>(
     bridge: &Bridge,
     log: &mut L,
     n: usize,

@@ -5,14 +5,25 @@
 //! before it writes a request frame, so an effect the worker may perform
 //! is always in the log first; a key or id the log already holds is
 //! [`LogError::Used`] and nothing is sent, so nothing is ever sent twice.
+//!
+//! The client reaches its log through a [`Recorder`], never by calling a
+//! log from async code: [`LogThread`] runs a log that blocks, such as the
+//! journal with its `SQLite` transactions and fsyncs, on a thread of its
+//! own, and [`MemoryLog`], which only touches memory, records in place. A
+//! call is queued whole when it is made, after room for it was found, so
+//! a caller that stops waiting either queued nothing or queued a call
+//! that runs to its end.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fabric_core::managed::{OperationId, OperationKey};
 use fabric_journal::{
     CommitError, Journal, ProviderAnswer, ProviderDispatch, ProviderError, ProviderStatus,
 };
+use tokio::sync::{mpsc, oneshot};
 
 /// Why the log refused a change. Nothing was written.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -70,6 +81,159 @@ pub trait OperationLog {
     fn entry(&self, operation: OperationId) -> Result<Option<Entry>, LogError>;
 }
 
+/// How the bridge client reaches an [`OperationLog`] from async code
+/// without running it there: [`LogThread`] for a log that blocks, such as
+/// the journal, and [`MemoryLog`] for one in memory.
+pub trait Recorder: Send {
+    /// The log the calls run against.
+    type Log: OperationLog + Send + 'static;
+
+    /// Waits for room for one call. Nothing is queued yet, so a caller
+    /// that stops waiting here changes nothing.
+    fn reserve(&mut self) -> impl Future<Output = Result<Slot<'_, Self::Log>, LogError>> + Send;
+}
+
+/// Room for one call on a log, from [`Recorder::reserve`].
+#[derive(Debug)]
+pub struct Slot<'a, L>(Place<'a, L>);
+
+enum Place<'a, L> {
+    /// The log itself: the call runs in place.
+    Here(&'a mut L),
+    /// A place in a log thread's queue.
+    Queue(mpsc::Permit<'a, Message<L>>),
+}
+
+impl<L> std::fmt::Debug for Place<'_, L> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Place::Here(_) => "Here",
+            Place::Queue(_) => "Queue",
+        })
+    }
+}
+
+impl<L: OperationLog + Send + 'static> Slot<'_, L> {
+    /// Queues `call` now, whole, and returns what waits for its result. A
+    /// caller that drops the wait leaves the call queued: it runs to its
+    /// end. A log thread that stopped before it ran the call is
+    /// [`LogError::Storage`].
+    pub fn run<T, F>(self, call: F) -> impl Future<Output = Result<T, LogError>> + Send + 'static
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut L) -> T + Send + 'static,
+    {
+        let queued = match self.0 {
+            Place::Here(log) => Ok(call(log)),
+            Place::Queue(permit) => {
+                let (reply, result) = oneshot::channel();
+                permit.send(Message::Run(Box::new(move |log| {
+                    // A caller that stopped waiting has nothing to hear.
+                    let _ = reply.send(call(log));
+                })));
+                Err(result)
+            }
+        };
+        async move {
+            match queued {
+                Ok(value) => Ok(value),
+                Err(result) => result.await.map_err(|_| stopped()),
+            }
+        }
+    }
+}
+
+fn stopped() -> LogError {
+    LogError::Storage("the log thread stopped".into())
+}
+
+type Job<L> = Box<dyn FnOnce(&mut L) + Send>;
+
+/// What a log thread is asked.
+enum Message<L> {
+    Run(Job<L>),
+    Stop(oneshot::Sender<L>),
+}
+
+/// How many calls may wait for a log thread before a caller waits for
+/// room. One client has one call in flight at a time; the room is for
+/// calls whose callers stopped waiting, which still run.
+const QUEUE: usize = 16;
+
+/// An [`OperationLog`] on a thread of its own, so its blocking calls,
+/// the journal's `SQLite` transactions and fsyncs, never run on the async
+/// runtime. Calls run one at a time in the order they were queued; each
+/// is one hop to the thread and one back. The thread ends when the
+/// handle is dropped, closing the log there.
+#[derive(Debug)]
+pub struct LogThread<L> {
+    calls: mpsc::Sender<Message<L>>,
+    served: Arc<AtomicU64>,
+}
+
+impl<L: OperationLog + Send + 'static> LogThread<L> {
+    /// Starts the thread that owns `log`.
+    pub fn spawn(log: L) -> std::io::Result<LogThread<L>> {
+        let (calls, mut queue) = mpsc::channel::<Message<L>>(QUEUE);
+        let served = Arc::new(AtomicU64::new(0));
+        let count = Arc::clone(&served);
+        std::thread::Builder::new()
+            .name("fabric-bridge-log".into())
+            .spawn(move || {
+                let mut log = log;
+                while let Some(message) = queue.blocking_recv() {
+                    match message {
+                        Message::Run(job) => {
+                            job(&mut log);
+                            count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Message::Stop(back) => {
+                            let _ = back.send(log);
+                            return;
+                        }
+                    }
+                }
+            })?;
+        Ok(LogThread { calls, served })
+    }
+
+    /// Runs `call` on the log's thread and returns its result.
+    pub async fn call<T, F>(&self, call: F) -> Result<T, LogError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut L) -> T + Send + 'static,
+    {
+        let permit = self.calls.reserve().await.map_err(|_| stopped())?;
+        Slot(Place::Queue(permit)).run(call).await
+    }
+
+    /// How many calls the thread has run: each is two thread hops.
+    #[must_use]
+    pub fn calls(&self) -> u64 {
+        self.served.load(Ordering::Relaxed)
+    }
+
+    /// Stops the thread once the calls queued before this one ran, and
+    /// hands the log back.
+    pub async fn into_inner(self) -> Result<L, LogError> {
+        let (back, log) = oneshot::channel();
+        self.calls
+            .send(Message::Stop(back))
+            .await
+            .map_err(|_| stopped())?;
+        log.await.map_err(|_| stopped())
+    }
+}
+
+impl<L: OperationLog + Send + 'static> Recorder for LogThread<L> {
+    type Log = L;
+
+    async fn reserve(&mut self) -> Result<Slot<'_, L>, LogError> {
+        let permit = self.calls.reserve().await.map_err(|_| stopped())?;
+        Ok(Slot(Place::Queue(permit)))
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -89,6 +253,9 @@ impl From<CommitError> for LogError {
     }
 }
 
+/// The managed journal. Each call that writes is one `IMMEDIATE`
+/// transaction, committed (and synced) before it returns, so it blocks:
+/// hand the journal to a [`LogThread`], never to async code directly.
 impl OperationLog for Journal {
     fn begin(
         &mut self,
@@ -123,7 +290,8 @@ impl OperationLog for Journal {
 }
 
 /// An in-memory log with the journal's rules but no fencing and no
-/// durability: for tests and the bench, never for a node.
+/// durability: for tests and the bench, never for a node. It touches only
+/// memory, so it records in place.
 #[derive(Debug, Default)]
 pub struct MemoryLog {
     entries: HashMap<OperationId, Entry>,
@@ -135,6 +303,14 @@ impl MemoryLog {
     #[must_use]
     pub fn new() -> MemoryLog {
         MemoryLog::default()
+    }
+}
+
+impl Recorder for MemoryLog {
+    type Log = MemoryLog;
+
+    fn reserve(&mut self) -> impl Future<Output = Result<Slot<'_, MemoryLog>, LogError>> + Send {
+        std::future::ready(Ok(Slot(Place::Here(self))))
     }
 }
 

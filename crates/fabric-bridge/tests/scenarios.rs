@@ -39,14 +39,13 @@ use fabric_bridge::{
 };
 use fabric_core::id::JobId;
 use fabric_core::managed::{AttemptId, AttemptStatus, OperationId};
-use fabric_journal::Journal;
 use serde_json::Value;
 use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
 use tokio::task::JoinHandle;
 
 mod common;
 
-use common::journal;
+use common::{Logged, journal};
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../protocol/bridge/v1")
@@ -79,7 +78,7 @@ type Worker = (ReadHalf<DuplexStream>, WriteHalf<DuplexStream>);
 struct Run {
     name: String,
     profile: Profile,
-    journal: Journal,
+    journal: Logged,
     bridge: Option<Bridge>,
     worker: Option<Worker>,
     connecting: Option<JoinHandle<Result<Bridge, BridgeError>>>,

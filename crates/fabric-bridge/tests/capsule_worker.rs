@@ -40,8 +40,8 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use common::{
-    ATTEMPT, Cleanup, DOCKER_IMAGE_VAR, JOB, capsule_worker, create, docker, docker_image, fresh,
-    journal, journal_for, operation, scope,
+    ATTEMPT, Cleanup, DOCKER_IMAGE_VAR, JOB, Logged, capsule_worker, create, docker, docker_image,
+    fresh, journal, journal_for, operation, scope,
 };
 use fabric_bridge::frames;
 use fabric_bridge::wire::{
@@ -1139,7 +1139,7 @@ async fn observe_reads_only_the_operations_own_resource() {
     drop(unread);
     bridge.kill().await;
     drop(bridge);
-    drop(journal);
+    drop(journal.into_inner().await);
     let mut journal = Journal::open(&dir.path().join(fabric_journal::FILE_NAME)).unwrap();
     let recovery = journal
         .recover(1_770_000_000_000, |_| fabric_journal::Liveness::CannotTell)
@@ -1148,6 +1148,7 @@ async fn observe_reads_only_the_operations_own_resource() {
     let row = entry(&journal, id(62));
     assert_eq!(row.status, ProviderStatus::Unknown);
     assert_eq!(row.dispatch.target, Some(stored(&fx("fx-b"))));
+    let mut journal = Logged::new(journal);
 
     let bridge = spawn("fixture", &path).await;
     let refused = bridge
@@ -1278,7 +1279,7 @@ async fn the_docker_profile_on_the_local_engine() {
     assert!(docker(&["image", "inspect", &missing]).is_none());
 
     let dir = tempfile::tempdir().unwrap();
-    let mut journal = journal_for(dir.path(), scope);
+    let mut journal = Logged::new(journal_for(dir.path(), scope));
     let path = write_config(
         dir.path(),
         "docker.json",

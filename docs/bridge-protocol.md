@@ -355,6 +355,8 @@ These rules bind from the first release of v1. Until then v1 exists only on draf
 
 `crates/fabric-bridge` is Fabric's side: `wire` (every message, its parser and its encoder), `frames` (the framing above), and `Bridge`, the client. It records into the managed journal through `OperationLog`; schema version 2 adds `provider_operations` for this (docs/managed-jobs.md). The failure rules above become these behaviors, each pinned by a test in `crates/fabric-bridge/tests`.
 
+The client never calls the journal on the async runtime. It reaches its log through a `Recorder`: `LogThread` runs the journal on a thread of its own, so each SQLite transaction and its fsync block that thread and nothing else, and `MemoryLog` (tests and the bench) records in place. A call is queued whole once it was given room: recording a request `dispatched` and queueing its frame are one call, so the record still precedes the frame, and a caller that stops waiting leaves either nothing recorded or the operation recorded and its frame sent. Moving the calls changed none of them: a create, an exec or a timeout is one write to dispatch and one read and one write to settle, as before, each write one committed transaction; each call is now two thread hops (`tests/off_runtime.rs` pins the counts).
+
 ### Before anything is written
 
 | Check | When it fails | Journal |

@@ -9,13 +9,17 @@
 //! request, never sends an operation twice, and records `unknown`, never
 //! cancelled or failed, when a deadline passes or the worker is lost.
 //!
+//! The journal blocks on `SQLite` and fsync, so the client reaches it
+//! through a [`LogThread`], which runs it on a thread of its own:
+//!
 //! ```no_run
-//! use fabric_bridge::{Bridge, Config, Effect};
-//! # async fn example(effect: Effect, journal: &mut fabric_journal::Journal)
-//! # -> Result<(), fabric_bridge::BridgeError> {
+//! use fabric_bridge::{Bridge, Config, Effect, LogThread};
+//! # async fn example(effect: Effect, journal: fabric_journal::Journal)
+//! # -> Result<(), Box<dyn std::error::Error>> {
+//! let mut log = LogThread::spawn(journal)?;
 //! let worker = tokio::process::Command::new("capsule-worker");
 //! let bridge = Bridge::spawn(worker, Config::new("fixture")).await?;
-//! let outcome = bridge.request(journal, effect).await?.finish(journal).await?;
+//! let outcome = bridge.request(&mut log, effect).await?.finish(&mut log).await?;
 //! println!("{:?}", outcome.status);
 //! # Ok(())
 //! # }
@@ -29,4 +33,4 @@ pub mod wire;
 pub use client::{
     Answer, Bridge, BridgeError, Config, Control, Effect, Event, InFlight, Outcome, Pending,
 };
-pub use log::{Entry, LogError, MemoryLog, OperationLog};
+pub use log::{Entry, LogError, LogThread, MemoryLog, OperationLog, Recorder, Slot};

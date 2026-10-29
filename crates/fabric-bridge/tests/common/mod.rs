@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fabric_bridge::Effect;
 use fabric_bridge::wire::{Action, CreateParams, Digest, OperationRef, Scope};
+use fabric_bridge::{Effect, LogError, LogThread, Recorder, Slot};
 use fabric_core::harness::HarnessKind;
 use fabric_core::id::NodeId;
 use fabric_core::managed::{
@@ -26,9 +26,55 @@ pub const TASK: &str = "01K8W3A00000000000000000T1";
 /// The fixtures' attempt.
 pub const ATTEMPT: &str = "01K8W3A00000000000000000A1";
 
-/// A journal holding the fixtures' job with its attempt granted at generation 1.
-pub fn journal(dir: &Path) -> Journal {
-    journal_for(dir, scope())
+/// A journal holding the fixtures' job with its attempt granted at
+/// generation 1, on its log thread.
+pub fn journal(dir: &Path) -> Logged {
+    Logged::new(journal_for(dir, scope()))
+}
+
+/// A journal on its log thread, as a node hands it to the bridge, with a
+/// second connection the test reads through, which sees what the log
+/// thread committed. It derefs to that reader.
+pub struct Logged {
+    log: LogThread<Journal>,
+    read: Journal,
+}
+
+impl Logged {
+    /// Moves `journal` to a log thread and opens a reader beside it.
+    pub fn new(journal: Journal) -> Logged {
+        let read = Journal::open(journal.path()).unwrap();
+        Logged {
+            log: LogThread::spawn(journal).unwrap(),
+            read,
+        }
+    }
+
+    /// The log thread.
+    pub fn log(&self) -> &LogThread<Journal> {
+        &self.log
+    }
+
+    /// Stops the log thread and hands its journal back.
+    pub async fn into_inner(self) -> Journal {
+        self.log.into_inner().await.unwrap()
+    }
+}
+
+impl std::ops::Deref for Logged {
+    type Target = Journal;
+
+    fn deref(&self) -> &Journal {
+        &self.read
+    }
+}
+
+impl Recorder for Logged {
+    type Log = Journal;
+
+    fn reserve(&mut self) -> impl Future<Output = Result<Slot<'_, Journal>, LogError>> + Send {
+        self.log.reserve()
+    }
 }
 
 /// A journal holding `scope`'s job, task and attempt, the attempt granted
