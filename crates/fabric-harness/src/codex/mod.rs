@@ -1208,6 +1208,7 @@ mod tests {
             TurnReport {
                 session: Some(SessionId::parse(thread).unwrap()),
                 answer: Some("last".to_owned()),
+                answer_left_out: 0,
                 failure: None,
             }
         );

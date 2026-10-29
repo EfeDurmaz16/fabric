@@ -1668,6 +1668,7 @@ mod tests {
             TurnReport {
                 session: Some(SessionId::parse(sid).unwrap()),
                 answer: Some("two lines\nof answer".to_owned()),
+                answer_left_out: 0,
                 failure: None,
             }
         );

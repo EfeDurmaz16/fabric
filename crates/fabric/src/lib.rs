@@ -1442,6 +1442,7 @@ impl AgentTurn<'_> {
                     }
                     Some(TurnEvent::Ended(ended)) => {
                         report.answer = ended.answer;
+                        report.answer_left_out = ended.answer_left_out;
                         report.failure = ended.failure;
                     }
                     None => reading = false,
@@ -1686,7 +1687,8 @@ impl<R: tokio::io::AsyncRead + Unpin> Lines<R> {
 
 /// Prints what a headless turn reported: the answer on standard output,
 /// as the harness wrote it, then a line naming the session; a failure, a
-/// missing answer and a missing session on standard error.
+/// missing answer, an answer cut short and a missing session on standard
+/// error.
 fn print_turn(plan: &RunPlan, report: &TurnReport) -> Result<()> {
     let harness = &plan.harness;
     if let Some(failure) = &report.failure {
@@ -1696,6 +1698,13 @@ fn print_turn(plan: &RunPlan, report: &TurnReport) -> Result<()> {
         writeln!(std::io::stdout(), "{answer}")?;
     } else if report.failure.is_none() {
         Notes::Stderr.print(&[format!("warning: {harness} printed no answer")])?;
+    }
+    if report.answer_left_out > 0 {
+        Notes::Stderr.print(&[format!(
+            "warning: {harness}'s answer ran past {} bytes; the {} bytes after them were left out",
+            fabric_harness::MAX_ANSWER,
+            report.answer_left_out
+        )])?;
     }
     match (&report.session, &plan.session) {
         (Some(session), Some(planned)) if session != planned => Notes::Stderr.print(&[format!(
