@@ -5,14 +5,16 @@ how the layer is used on the networks Efe has and what it refuses. ADR 0013
 holds the mechanics: the message set, the bounds, the multiplexer and the
 timers.
 
-Today the layer is a library. The `fabric node pair` command and the node
-daemon arrive with `fabric-cli` and `fabric-node`; until then a program pairs
-through `Peers::update`, and the loopback tests run two `Endpoint`s in one
-process.
+The node daemon, `fabric serve` (`crates/fabricd`), holds one `Endpoint` and
+serves the requests of paired peers; the `fabric` CLI pairs nodes with
+`fabric node add` and checks a peer with `fabric node ping`. A program that
+embeds the layer pairs through `Peers::update` with `PeerBook::pair`, and the
+loopback tests run two `Endpoint`s in one process.
 
 ## What a node is
 
-A node is an ed25519 keypair in `<fabric-data>/node.key`, mode 0600, written
+A node is an ed25519 keypair in `~/.fabric/node.key` (or under
+`$FABRIC_HOME`), mode 0600, written
 once. The node id is the public key, printed as `fab1` plus 52 base32
 characters. Two machines never share a key; a new machine is a new node.
 
@@ -32,11 +34,14 @@ Trust is the peer book, one line per peer:
 fab1...  192.168.1.20:7777,100.101.102.103:7777  1760000000000
 ```
 
-Pairing v0 is out of band. On the Air, read the id off the screen of the Pro
-and pair `fab1<pro>@<pro-address>:7777`; on the Pro, the same with the Air's
-id. Once `fabric-cli` exists this is `fabric node pair`; today it is
-`Peers::update` with `PeerBook::pair`. A spec takes an IP address or a name; a name is resolved
-at dial time, and its first 4 distinct addresses are dialed. A node that is not in the book is refused inside the TLS
+Pairing v0 is out of band. Each node prints its id with `fabric node id`. On
+the side that can dial, pair the other with its id and an address it reaches
+today: `fabric node add fab1<air-id> <air-address>:7777`. On the side that
+cannot dial, such as a node behind a NAT, pair with the id alone:
+`fabric node add fab1<pro-id>`; that peer reaches it over the connection it
+opens. `fabric node ls` lists the book. An address takes an IP address or a
+name; a name is resolved at dial time, and its first 4 distinct addresses are
+dialed. A node that is not in the book is refused inside the TLS
 handshake and never reaches application code, listening or not.
 
 An `Endpoint` re-reads the book before each handshake, so a pairing written
@@ -53,6 +58,14 @@ A short pairing code, where one side shows a few words and the other types
 them to fetch and confirm the id over the connection, is a follow-up. It
 needs a key exchange that this phase does not have.
 
+## Versions
+
+Two nodes must run the same protocol version, which `Hello` carries; a node of
+another version is refused at the handshake of the session, with both versions
+named, instead of misreading a request. Version 4 added the question a push
+asks its target for the facts of the job's harness (ADR 0013, amended
+2026-10-27), so a node updated past it pairs only with nodes updated too.
+
 ## Wires
 
 Both transports listen on one port, and the node holds them as one
@@ -65,6 +78,15 @@ only moves the dial on to the next address.
 A host that opens sockets and stays silent, or a spoofed source, cannot
 hold up a paired peer: handshakes run in the background with a time limit,
 a cap in all and a cap per source.
+
+A paired peer is bounded too, over all its connections at once: a node runs
+at most 16 of its per-job requests and sends it at most 4 chunk batches at
+a time, and holds at most about 16 MiB of its requests, read or being read.
+A request with no room waits for at most 30 s, unread at the peer past what
+the wire takes before anyone reads: its first 16 KiB on TCP, and on QUIC
+whatever fits the connection's receive window of about 6 MB, which bounds
+all of a peer's unread bytes on it (ADR 0013, amended 2026-10-27 and
+2026-10-29).
 
 ## On the gate network
 

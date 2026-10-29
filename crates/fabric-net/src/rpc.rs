@@ -10,8 +10,9 @@
 //! request and asks it again every `TRUST_RECHECK`, and closes the
 //! connection once the peer is unpaired, however long the connection lives.
 //! The work a node runs for one peer is capped over all the peer's
-//! sessions, so a peer that connects again, or holds several connections,
-//! gets no more than one session's worth.
+//! sessions, and so are the bytes of the requests it holds for the peer,
+//! read or being read, so a peer that connects again, or holds several
+//! connections, gets no more than one session's worth.
 //!
 //! The wire types `RequestBody`, `ResponseBody` and `JobResponse` are built
 //! and matched here only. A caller asks through one typed method per
@@ -28,17 +29,19 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use fabric_core::BoxFuture;
+use fabric_core::harness::HarnessKind;
 use fabric_core::id::{ChunkId, Epoch, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::FencingToken;
 use fabric_core::moves::MoveOffer;
 use fabric_core::snapshot::MAX_CHUNK_LEN;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
 use crate::accept::refresh;
 use crate::frame::{
-    FrameError, MAX_BULK_FRAME, MAX_CONTROL_FRAME, MAX_STORED_CHUNK, read_frame, write_frame,
+    FrameError, MAX_BULK_FRAME, MAX_CONTROL_FRAME, MAX_STORED_CHUNK, Room, read_frame, read_header,
+    read_payload, write_frame,
 };
 use crate::idle::{IdleReader, StallWriter};
 use crate::tls::Trust;
@@ -47,7 +50,7 @@ use crate::wire::{
     Appended, ChunkBatch, Facts, Fault, FaultText, Fenced, Hello, JobAnswer, JobRequest,
     JobResponse, KnownWriter, ManifestChunks, MoveRequested, MoveState, Offered, PROTOCOL_VERSION,
     Pulled, RecordBytes, RecordPage, Request, RequestBody, RequestId, Response, ResponseBody,
-    VersionText, WireError, decode, encode, wall_clock_ms,
+    Tools, VersionText, WireError, decode, encode, wall_clock_ms,
 };
 
 /// A clock difference between two nodes above this is logged at `Hello`.
@@ -75,6 +78,27 @@ pub const MAX_JOB_WORK: usize = 16;
 
 /// The most chunk batches a node sends one peer at once, over all its sessions; each holds up to one chunk frame while it waits on flow control.
 pub const MAX_CHUNK_RUNS: usize = 4;
+
+/// The most request bytes a node holds for one peer at once, over all its
+/// sessions: a whole control frame for each per-job request it may run
+/// (M2-15).
+///
+/// A request takes its payload's length of this room once its header is
+/// read and before its payload is, and gives it back once it is answered,
+/// or, for per-job work that outlives its budget, once the work ends. A
+/// request with no room waits for it for at most `REQUEST_READ_TIMEOUT`,
+/// its payload unread at the peer past what the transport takes before
+/// anyone reads: on TCP the multiplexer gives a stream the peer opens its
+/// first 16 KiB of credit and more only as the request is read, and QUIC
+/// holds at most the connection's receive window, about 6 MB, of a peer's
+/// unread bytes. So a peer's requests cost this node this room, and at
+/// most that much more on each of its connections.
+pub const MAX_REQUEST_BYTES: usize = MAX_JOB_WORK * MAX_CONTROL_FRAME;
+
+const _: () = assert!(
+    MAX_CONTROL_FRAME <= MAX_REQUEST_BYTES && MAX_REQUEST_BYTES <= Semaphore::MAX_PERMITS,
+    "every request fits the room"
+);
 
 /// Why a call failed.
 #[derive(Debug, thiserror::Error)]
@@ -245,6 +269,23 @@ pub trait Service: Send + Sync {
     fn chunk(&self, peer: NodeId, id: ChunkId) -> BoxFuture<'_, Result<Vec<u8>, Fault>>;
     /// Returns what this node measured about itself, for `peer`'s `fabric doctor` (ADR 0008).
     fn facts(&self, peer: NodeId) -> BoxFuture<'_, Result<Facts, Fault>>;
+    /// Returns what this node measured about itself for `peer`'s preflight
+    /// of a move or pull of a job under `harness` (issue #16): the facts of
+    /// `tools`, the ones the job reads, and for an ACP job also where this
+    /// node finds the agent and the `state_dir` it gives it.
+    ///
+    /// The default answers `facts` alone. A service that keeps it answers
+    /// without the ACP facts, and the asking node then refuses the push,
+    /// since a missing fact never reads as a present one.
+    fn facts_for(
+        &self,
+        peer: NodeId,
+        harness: HarnessKind,
+        tools: Tools,
+    ) -> BoxFuture<'_, Result<Facts, Fault>> {
+        let _ = (harness, tools);
+        self.facts(peer)
+    }
 }
 
 /// An authenticated connection after the `Hello` exchange.
@@ -577,7 +618,26 @@ impl Session {
 
     /// Asks what the peer measured about itself, waiting at most `deadline`.
     pub async fn facts(&self, deadline: Duration) -> Result<Facts, RpcError> {
-        match self.call(RequestBody::Facts, deadline).await? {
+        self.ask_facts(RequestBody::Facts, deadline).await
+    }
+
+    /// Asks the peer for the facts of `tools` for a job under `harness`,
+    /// waiting at most `deadline` (`FactsFor`).
+    pub async fn facts_for(
+        &self,
+        harness: &HarnessKind,
+        tools: Tools,
+        deadline: Duration,
+    ) -> Result<Facts, RpcError> {
+        let body = RequestBody::FactsFor {
+            harness: harness.clone(),
+            tools,
+        };
+        self.ask_facts(body, deadline).await
+    }
+
+    async fn ask_facts(&self, body: RequestBody, deadline: Duration) -> Result<Facts, RpcError> {
+        match self.call(body, deadline).await? {
             ResponseBody::Facts(facts) => Ok(facts),
             other => Err(unexpected("facts", &other)),
         }
@@ -979,6 +1039,9 @@ struct Limits {
     job_work: Arc<Semaphore>,
     /// Held by each chunk batch while it is sent.
     chunk_runs: Arc<Semaphore>,
+    /// `MAX_REQUEST_BYTES`, a permit per byte, held by each request's
+    /// payload from before it is read until the request is done.
+    request_bytes: Arc<Semaphore>,
 }
 
 impl Limits {
@@ -986,17 +1049,21 @@ impl Limits {
         Self {
             job_work: Arc::new(Semaphore::new(MAX_JOB_WORK)),
             chunk_runs: Arc::new(Semaphore::new(MAX_CHUNK_RUNS)),
+            request_bytes: Arc::new(Semaphore::new(MAX_REQUEST_BYTES)),
         }
     }
 
     /// Whether a session or its work holds these caps besides the `ServeLimits` that keeps them.
     ///
     /// Each serving session and each request it runs holds a clone, and
-    /// work past its budget holds a `job_work` permit, so both counts drop
-    /// to one only when nothing but the map is left. Nothing can take a
-    /// new clone then except through the map, under its lock.
+    /// work past its budget holds a `job_work` and a `request_bytes`
+    /// permit, so the counts drop to one only when nothing but the map is
+    /// left. Nothing can take a new clone then except through the map,
+    /// under its lock.
     fn in_use(&self) -> bool {
-        Arc::strong_count(&self.job_work) > 1 || Arc::strong_count(&self.chunk_runs) > 1
+        Arc::strong_count(&self.job_work) > 1
+            || Arc::strong_count(&self.chunk_runs) > 1
+            || Arc::strong_count(&self.request_bytes) > 1
     }
 }
 
@@ -1008,13 +1075,13 @@ async fn handle(
 ) -> Result<(), RpcError> {
     let (send, mut recv) = stream.split();
     let mut send = StallWriter::new(send, REPLY_STALL_TIMEOUT);
-    let bytes = timeout(
+    // `held` keeps the request's bytes counted until the request is done.
+    let (request, held) = timeout(
         REQUEST_READ_TIMEOUT,
-        read_frame(&mut recv, MAX_CONTROL_FRAME),
+        read_request(&mut recv, &limits.request_bytes),
     )
     .await
     .map_err(|_| RpcError::Deadline(REQUEST_READ_TIMEOUT))??;
-    let request: Request = decode(&bytes)?;
     let budget = Duration::from_millis(u64::from(request.budget_ms));
     let id = request.id;
     let body = match request.body {
@@ -1035,7 +1102,7 @@ async fn handle(
                     )));
                 };
                 tokio::spawn(async move {
-                    let _permit = permit;
+                    let _held = (permit, held);
                     answer_job(service.as_ref(), peer, token, body).await
                 })
                 .await
@@ -1058,6 +1125,12 @@ async fn handle(
             .await
             .unwrap_or(Err(Fault::Deadline))
             .map_or_else(ResponseBody::Fault, ResponseBody::Facts),
+        RequestBody::FactsFor { harness, tools } => {
+            timeout(budget, service.facts_for(peer, harness, tools))
+                .await
+                .unwrap_or(Err(Fault::Deadline))
+                .map_or_else(ResponseBody::Fault, ResponseBody::Facts)
+        }
         RequestBody::WantChunks(batch) => {
             let Ok(Ok(_run)) = timeout(budget, limits.chunk_runs.acquire()).await else {
                 reply(
@@ -1078,6 +1151,28 @@ async fn handle(
     reply(&mut send, id, body, MAX_CONTROL_FRAME).await?;
     send.shutdown().await.map_err(FrameError::Io)?;
     Ok(())
+}
+
+/// Reads one request from a stream the peer opened, counting its payload's
+/// length against the peer's `room` from before the payload is read, and
+/// returns it with the permit that keeps it counted (M2-15). The frame's
+/// bytes are dropped once decoded, so a request held for its work holds
+/// its decoded form alone.
+async fn read_request(
+    recv: &mut (dyn AsyncRead + Send + Unpin),
+    room: &Arc<Semaphore>,
+) -> Result<(Request, OwnedSemaphorePermit), RpcError> {
+    let len = read_header(recv, MAX_CONTROL_FRAME).await?;
+    let permits = u32::try_from(len).map_err(|_| FrameError::TooLarge {
+        len,
+        max: MAX_CONTROL_FRAME,
+    })?;
+    let held = Arc::clone(room)
+        .acquire_many_owned(permits)
+        .await
+        .map_err(|_| FrameError::Io(io::Error::other("the peer's request room is closed")))?;
+    let payload = read_payload(recv, len, Room::Held).await?;
+    Ok((decode(&payload)?, held))
 }
 
 /// Hands one per-job message to the service method for its kind and puts the answer on the wire.
@@ -1435,7 +1530,7 @@ mod tests {
         }
 
         fn append(&self, _: NodeId, _: FencingToken, _: RecordPage) -> JobFuture<'_, Appended> {
-            no_job()
+            self.start(Err(Fault::UnknownJob))
         }
 
         fn move_request(&self, _: NodeId, _: FencingToken) -> JobFuture<'_, MoveRequested> {
@@ -1476,6 +1571,50 @@ mod tests {
         fn facts(&self, _peer: NodeId) -> BoxFuture<'_, Result<Facts, Fault>> {
             Box::pin(async { Ok(Facts::default()) })
         }
+
+        fn facts_for(
+            &self,
+            _peer: NodeId,
+            harness: HarnessKind,
+            tools: Tools,
+        ) -> BoxFuture<'_, Result<Facts, Fault>> {
+            Box::pin(async move {
+                let tools: Vec<&str> = tools.iter().collect();
+                Facts::new(vec![
+                    (
+                        crate::wire::FactName::truncated("harness"),
+                        crate::wire::FactValue::truncated(&harness.to_string()),
+                    ),
+                    (
+                        crate::wire::FactName::truncated("tools"),
+                        crate::wire::FactValue::truncated(&tools.join(",")),
+                    ),
+                ])
+                .map_err(|e| Fault::Internal(crate::wire::FaultText::truncated(&e.to_string())))
+            })
+        }
+    }
+
+    /// Issue #16: a question for the facts of a job's target carries the
+    /// job's harness to the peer's service, which a question with none
+    /// does not reach; item 19 of the A/B lab: and the tools the asking
+    /// node reads for the job.
+    #[tokio::test]
+    async fn a_question_for_a_jobs_facts_names_its_harness_and_its_tools() {
+        let (session, _serving) = serving_pair(paired(), Arc::default()).await;
+        let acp = HarnessKind::Acp {
+            program: fabric_core::harness::ProgramName::parse("some-agent").unwrap(),
+            args: vec!["--acp".to_owned()],
+        };
+        let tools = crate::wire::Tools::new(vec![
+            crate::wire::ToolName::truncated("git"),
+            crate::wire::ToolName::truncated("node"),
+        ])
+        .unwrap();
+        let facts = session.facts_for(&acp, tools, IDLE * 10).await.unwrap();
+        assert_eq!(facts.get("harness"), Some("acp:some-agent --acp"));
+        assert_eq!(facts.get("tools"), Some("git,node"));
+        assert_eq!(session.facts(IDLE * 10).await.unwrap().get("harness"), None);
     }
 
     fn paired() -> Arc<Revocable> {
@@ -1496,6 +1635,16 @@ mod tests {
         service: Arc<Nothing>,
         limits: Arc<ServeLimits>,
     ) -> (Session, tokio::task::JoinHandle<RpcError>) {
+        serving_pair_wrapped(trust, service, limits, |acceptor| acceptor).await
+    }
+
+    /// `serving_pair_under`, with the acceptor's connection passed through `wrap`.
+    async fn serving_pair_wrapped(
+        trust: Arc<Revocable>,
+        service: Arc<Nothing>,
+        limits: Arc<ServeLimits>,
+        wrap: impl FnOnce(Arc<dyn Connection>) -> Arc<dyn Connection>,
+    ) -> (Session, tokio::task::JoinHandle<RpcError>) {
         use crate::mux::{Mux, Side};
 
         let (dialer_id, acceptor_id) = (NodeId::from_bytes([1; 32]), NodeId::from_bytes([2; 32]));
@@ -1503,7 +1652,7 @@ mod tests {
         let (a, b) = tokio::io::duplex(1 << 16);
         let dialer: Arc<dyn Connection> = Arc::new(Mux::spawn(a, Side::Dialer, acceptor_id, addr));
         let acceptor: Arc<dyn Connection> =
-            Arc::new(Mux::spawn(b, Side::Acceptor, dialer_id, addr));
+            wrap(Arc::new(Mux::spawn(b, Side::Acceptor, dialer_id, addr)));
         let version = VersionText::truncated("test");
         let (dialer_session, acceptor_session) = tokio::join!(
             Session::connect(dialer, dialer_id, version.clone(), IDLE * 10),
@@ -1585,6 +1734,270 @@ mod tests {
         }
         tokio::time::sleep(IDLE).await;
         assert_eq!(service.started.load(Ordering::SeqCst), MAX_JOB_WORK);
+    }
+
+    /// A connection whose streams count the bytes this side reads from them.
+    struct Counted {
+        inner: Arc<dyn Connection>,
+        read: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// The read half of a stream of a `Counted` connection.
+    struct CountedRead {
+        inner: Box<dyn AsyncRead + Send + Unpin>,
+        read: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AsyncRead for CountedRead {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            let before = buf.filled().len();
+            let polled = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+            let n = buf.filled().len() - before;
+            self.read.fetch_add(n, Ordering::SeqCst);
+            polled
+        }
+    }
+
+    impl Connection for Counted {
+        fn peer(&self) -> NodeId {
+            self.inner.peer()
+        }
+
+        fn kind(&self) -> TransportKind {
+            self.inner.kind()
+        }
+
+        fn remote_addr(&self) -> std::net::SocketAddr {
+            self.inner.remote_addr()
+        }
+
+        fn open(&self) -> BoxFuture<'_, Result<Stream, TransportError>> {
+            self.inner.open()
+        }
+
+        fn next(&self) -> BoxFuture<'_, Result<Stream, TransportError>> {
+            Box::pin(async move {
+                let (send, recv) = self.inner.next().await?.split();
+                let read = Arc::clone(&self.read);
+                Ok(Stream::new(send, CountedRead { inner: recv, read }))
+            })
+        }
+
+        fn close(&self) {
+            self.inner.close();
+        }
+    }
+
+    /// M2-15: the work a node runs for one peer was capped over all its
+    /// sessions, but not the requests waiting for that work: each was read
+    /// whole and held, so a peer could pile up request frames by opening
+    /// streams on several connections. A node now reads a request's
+    /// payload only once the peer's requests in hand leave room for it,
+    /// over all the peer's sessions, so with the work full a peer's other
+    /// requests wait unread, past their headers, at the peer.
+    #[tokio::test(start_paused = true)]
+    async fn request_bytes_held_for_a_peer_are_bounded_over_its_sessions() {
+        use crate::frame::MAX_CONTROL_FRAME;
+        use crate::wire::{JobRequest, RecordBytes, RecordPage};
+
+        const REQUESTS: usize = 24;
+        let service = Nothing::hanging();
+        let limits = Arc::new(ServeLimits::new());
+        let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token = FencingToken {
+            job_id: fabric_core::id::JobId::from_bytes([1; 16]),
+            epoch: Epoch::FIRST,
+        };
+        let page = RecordPage::new(
+            RecordBytes::new(vec![7; fabric_core::ledger::MAX_RECORD_LEN]).unwrap(),
+        );
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let counted = Arc::clone(&read);
+            let (session, serving) = serving_pair_wrapped(
+                paired(),
+                Arc::clone(&service),
+                Arc::clone(&limits),
+                move |inner| {
+                    Arc::new(Counted {
+                        inner,
+                        read: counted,
+                    })
+                },
+            )
+            .await;
+            for n in 0..REQUESTS {
+                let request = Request {
+                    id: RequestId(u64::try_from(n).unwrap() + 1),
+                    budget_ms: 600_000,
+                    body: RequestBody::Job {
+                        token,
+                        body: JobRequest::Append {
+                            records: page.clone(),
+                        },
+                    },
+                };
+                let connection = Arc::clone(&session.connection);
+                held.push(tokio::spawn(async move {
+                    let _answer = send_request(connection.as_ref(), &request).await;
+                    std::future::pending::<()>().await;
+                }));
+            }
+            held.push(tokio::spawn(async move {
+                let _keep = (session, serving);
+                std::future::pending::<()>().await;
+            }));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let read = read.load(Ordering::SeqCst);
+        let headers = 2 * REQUESTS * 5;
+        assert!(
+            read <= MAX_JOB_WORK * MAX_CONTROL_FRAME + headers,
+            "{read} request bytes were read for one peer"
+        );
+        assert_eq!(service.started.load(Ordering::SeqCst), MAX_JOB_WORK);
+    }
+
+    /// A byte stream whose reads are counted: the bytes one side read off
+    /// the wire, before its multiplexer buffers them.
+    struct CountedWire<T> {
+        inner: T,
+        read: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<T: AsyncRead + Unpin> AsyncRead for CountedWire<T> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            let before = buf.filled().len();
+            let polled = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+            let n = buf.filled().len() - before;
+            self.read.fetch_add(n, Ordering::SeqCst);
+            polled
+        }
+    }
+
+    impl<T: AsyncWrite + Unpin> AsyncWrite for CountedWire<T> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// A serving pair over the TCP multiplexer whose serving side counts
+    /// every byte it reads off the wire into `read`.
+    async fn serving_pair_on_a_counted_wire(
+        service: Arc<Nothing>,
+        limits: Arc<ServeLimits>,
+        read: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (Session, tokio::task::JoinHandle<RpcError>) {
+        use crate::mux::{Mux, Side};
+
+        let (dialer_id, acceptor_id) = (NodeId::from_bytes([1; 32]), NodeId::from_bytes([2; 32]));
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let dialer: Arc<dyn Connection> = Arc::new(Mux::spawn(a, Side::Dialer, acceptor_id, addr));
+        let wire = CountedWire { inner: b, read };
+        let acceptor: Arc<dyn Connection> =
+            Arc::new(Mux::spawn(wire, Side::Acceptor, dialer_id, addr));
+        let version = VersionText::truncated("test");
+        let (dialer_session, acceptor_session) = tokio::join!(
+            Session::connect(dialer, dialer_id, version.clone(), IDLE * 10),
+            Session::accept(acceptor, acceptor_id, version, IDLE * 10),
+        );
+        let accepted = acceptor_session.unwrap();
+        let serving = tokio::spawn(async move { accepted.serve(service, paired(), &limits).await });
+        (dialer_session.unwrap(), serving)
+    }
+
+    /// Review of PR #31: M2-15 counted a request's bytes against the
+    /// peer's room before its payload was read, but on TCP the multiplexer
+    /// gave each stream a whole buffer of credit up front, so it read about
+    /// 1 MiB of every waiting request off the wire anyway: 50 MB for the
+    /// 48 requests of two sessions, where the room holds 16. A stream the
+    /// peer opens now starts with `OPEN_CREDIT`, and gets more only once
+    /// the request holds room and its reader asks, so a waiting request
+    /// costs this node at most that much.
+    #[tokio::test(start_paused = true)]
+    async fn request_bytes_read_off_the_wire_for_a_peer_are_bounded() {
+        use crate::mux::OPEN_CREDIT;
+        use crate::wire::{JobRequest, RecordBytes, RecordPage};
+
+        const REQUESTS: usize = 24;
+        let service = Nothing::hanging();
+        let limits = Arc::new(ServeLimits::new());
+        let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token = FencingToken {
+            job_id: fabric_core::id::JobId::from_bytes([1; 16]),
+            epoch: Epoch::FIRST,
+        };
+        let page = RecordPage::new(
+            RecordBytes::new(vec![7; fabric_core::ledger::MAX_RECORD_LEN]).unwrap(),
+        );
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let (session, serving) = serving_pair_on_a_counted_wire(
+                Arc::clone(&service),
+                Arc::clone(&limits),
+                Arc::clone(&read),
+            )
+            .await;
+            for n in 0..REQUESTS {
+                let request = Request {
+                    id: RequestId(u64::try_from(n).unwrap() + 1),
+                    budget_ms: 600_000,
+                    body: RequestBody::Job {
+                        token,
+                        body: JobRequest::Append {
+                            records: page.clone(),
+                        },
+                    },
+                };
+                let connection = Arc::clone(&session.connection);
+                held.push(tokio::spawn(async move {
+                    let _answer = send_request(connection.as_ref(), &request).await;
+                    std::future::pending::<()>().await;
+                }));
+            }
+            held.push(tokio::spawn(async move {
+                let _keep = (session, serving);
+                std::future::pending::<()>().await;
+            }));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(service.started.load(Ordering::SeqCst), MAX_JOB_WORK);
+        let read = read.load(Ordering::SeqCst);
+        let waiting = 2 * REQUESTS - MAX_JOB_WORK;
+        // The multiplexer's frame headers, the hellos and the credit frames.
+        let framing = 64 << 10;
+        assert!(
+            read <= MAX_REQUEST_BYTES + waiting * OPEN_CREDIT + framing,
+            "{read} bytes of one peer's requests were read off the wire and held, past \
+             MAX_REQUEST_BYTES {MAX_REQUEST_BYTES} and {waiting} waiting requests of {OPEN_CREDIT}"
+        );
     }
 
     /// A peer that asks for chunks and reads none holds at most

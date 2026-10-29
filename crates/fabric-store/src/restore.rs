@@ -18,12 +18,14 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use fabric_core::git::{GitConfigKey, GitConfigValue, GitOid};
-use fabric_core::id::{JobId, SnapshotId};
+use fabric_core::id::{ChunkId, JobId, SnapshotId};
 use fabric_core::path::{PathError, RelPath};
 use fabric_core::snapshot::{
-    CacheEntry, CarryState, Entry, EntryKind, GitHead, GitState, Mode, SnapshotManifest,
+    CacheEntry, CarryState, Entry, EntryKind, GitHead, GitState, HarnessState, Mode, PathMeta,
+    SnapshotManifest,
 };
 
+use crate::bundle_cache::{self, BundleCache};
 use crate::capture::{stash_prefix, symlink_escapes};
 use crate::checkpoint;
 use crate::durable::{self, TempFile};
@@ -126,8 +128,12 @@ pub struct RestoreReport {
     pub submodules: Vec<RelPath>,
     /// Symlinks written whose target is absolute or climbs above the root.
     pub escaping_symlinks: Vec<RelPath>,
-    /// Bundles unpacked into the repository.
+    /// Bundles of the chain whose objects the repository got: from the
+    /// node's bundle cache or unpacked.
     pub bundles_fetched: u32,
+    /// The bundles among them this restore unpacked with git; the rest came
+    /// from the node's bundle cache.
+    pub bundles_unpacked: u32,
 }
 
 impl RestoreReport {
@@ -229,6 +235,18 @@ pub enum RestoreError {
         written: u64,
         /// Bytes the entry records.
         size: u64,
+    },
+    /// A file of the working-tree commit has a recorded mode whose owner
+    /// execute bit is not the one its tree entry records (`100755` or
+    /// `100644`). Capture makes the two agree, so only a manifest no
+    /// capture wrote holds this; written, the file would differ from the
+    /// index on the target.
+    #[error("{path}: the recorded mode {mode:?} and the tree disagree on the execute bit")]
+    ModeDisagreesWithTree {
+        /// The path.
+        path: RelPath,
+        /// The mode the manifest records.
+        mode: Mode,
     },
     /// A symlink in the working-tree commit has a target longer than any filesystem allows.
     #[error("{path}: symlink target is {size} bytes")]
@@ -496,6 +514,36 @@ fn move_into_place(tree: &Path, target: &Path) -> Result<(), RestoreError> {
         if let Err(e) = removed {
             tracing::warn!(path = %staging.display(), error = %e, "could not remove a finished staging directory");
         }
+    }
+    Ok(())
+}
+
+/// Gives the staging tree `writer` writes the recorded mode and mtime of
+/// its root, flushes it under `PowerLoss`, renames it onto `target`, and
+/// settles the root's exact mode and mtime there (M2-05).
+///
+/// Nothing writes into the root after `finish_root`, so its mtime stays.
+/// A root with no recorded meta, from a format version 2 manifest, keeps
+/// the mode and mtime the staging directory got, as before version 3.
+fn put_in_place(
+    writer: &TreeWriter,
+    (tree, target): (&Path, &Path),
+    root: Option<PathMeta>,
+    durability: Durability,
+    before_rename: Option<&str>,
+) -> Result<(), RestoreError> {
+    if let Some(meta) = root {
+        writer.finish_root(meta)?;
+    }
+    if durability == Durability::PowerLoss {
+        sync_tree(tree, false)?;
+    }
+    if let Some(name) = before_rename {
+        checkpoint::reached(name);
+    }
+    move_into_place(tree, target)?;
+    if let Some(meta) = root {
+        writer.settle_root(meta, durability == Durability::PowerLoss)?;
     }
     Ok(())
 }
@@ -833,53 +881,175 @@ struct StagingTarget<'a> {
     durability: Durability,
 }
 
-/// Unpacks every bundle of the chain that ends at `manifest`, oldest first, into `git`'s repository.
-///
-/// Unbundling indexes each pack and writes no refs, so the refs an older
-/// link lists can never collide with the ones `set_refs` writes.
-fn unbundle_chain(
+/// The snapshots of the bundle chain that ends at `snapshot`, whose
+/// manifest is `manifest`, oldest first, from the catalog's `bundle_base`
+/// of each, so no other manifest is read.
+fn chain_ids(
     store: &Store,
     snapshot: SnapshotId,
     manifest: &SnapshotManifest,
-    git: &Git,
-    report: &mut RestoreReport,
-) -> Result<(), RestoreError> {
-    // The chain of bundles, oldest first.
-    let mut chain = vec![manifest.clone()];
-    loop {
-        let base = chain
-            .last()
-            .and_then(|m| m.git.as_ref())
-            .and_then(|g| g.bundle_base);
-        let Some(base) = base else { break };
-        match store.manifest(base) {
-            Ok(m) => chain.push(m),
+) -> Result<Vec<SnapshotId>, RestoreError> {
+    let mut ids = vec![snapshot];
+    let mut base = manifest.git.as_ref().and_then(|g| g.bundle_base);
+    while let Some(id) = base {
+        // Manifest ids are hashes, so only a damaged catalog holds a cycle.
+        if ids.contains(&id) {
+            return Err(StoreError::ManifestMismatch(id).into());
+        }
+        match store.snapshot(id) {
+            Ok(row) => base = row.bundle_base,
             Err(StoreError::UnknownSnapshot(_)) => {
-                return Err(RestoreError::BundleChainBroken { snapshot, base });
+                return Err(RestoreError::BundleChainBroken { snapshot, base: id });
             }
             Err(e) => return Err(e.into()),
         }
+        ids.push(id);
     }
-    chain.reverse();
-    for link in &chain {
-        let Some(state) = &link.git else { continue };
-        if state.bundle.is_empty() {
-            continue;
+    ids.reverse();
+    Ok(ids)
+}
+
+/// Puts the objects of every bundle of the chain that ends at `manifest`,
+/// oldest first, into the repository `git` runs in at `root`.
+///
+/// The node's bundle cache (`crate::bundle_cache`) gives the pack files of
+/// the links it holds, each checked against its recorded digest, and only
+/// the links after them are unpacked, so a resume no longer grows with the
+/// chain. Unbundling indexes each pack and writes no refs, so the refs an
+/// older link lists can never collide with the ones `set_refs` writes.
+/// `git bundle unbundle` checks the bundle's prerequisites with the same
+/// `verify_bundle` that `git bundle verify` runs, before it indexes the
+/// pack (git's `bundle.c`, since 2.20), and the repository holds exactly
+/// the links below, from the cache or unpacked, so a link whose
+/// prerequisites they lack fails here, and no separate verify runs.
+fn unbundle_chain(
+    store: &Store,
+    (snapshot, manifest): (SnapshotId, &SnapshotManifest),
+    (git, root): (&Git, &Path),
+    durability: Durability,
+    report: &mut RestoreReport,
+) -> Result<(), RestoreError> {
+    let ids = chain_ids(store, snapshot, manifest)?;
+    let mut cache = BundleCache::open(store.root(), manifest.job_id);
+    let held = cache.reuse(&ids);
+    let pack_dir = git_dir(root).join("objects").join("pack");
+    let placed = place_cached(&mut cache, held, &pack_dir, durability)?;
+    for index in 0..placed {
+        report.bundles_fetched += u32::from(cache.has_bundle(index));
+    }
+    // A cache evicted whole under this restore holds no links below the
+    // next one, so the links unpacked now do not go into it.
+    let mut caching = cache.len() == placed;
+    for (index, id) in ids.iter().enumerate().skip(placed) {
+        let decoded;
+        let link = if *id == snapshot {
+            manifest
+        } else {
+            decoded = store.manifest(*id)?;
+            &decoded
+        };
+        let state = link.git.as_ref();
+        // The catalog's chain must be the manifests' own.
+        if state.and_then(|g| g.bundle_base) != index.checked_sub(1).map(|below| ids[below]) {
+            return Err(StoreError::ManifestMismatch(*id).into());
         }
-        let bundle = TempFile::in_dir(store.objects().tmp_dir());
-        let path = bundle.path();
-        {
-            let mut file = fs::File::create(path).map_err(|e| io_err(path, e))?;
-            for chunk in &state.bundle {
-                file.write_all(&store.objects().read(*chunk)?)
-                    .map_err(|e| io_err(path, e))?;
+        let bundle = state.map_or(&[][..], |g| g.bundle.as_slice());
+        let mut written = Vec::new();
+        if !bundle.is_empty() {
+            let before = pack_files(&pack_dir)?;
+            unbundle(store, bundle, git)?;
+            written = pack_files(&pack_dir)?
+                .into_iter()
+                .filter(|name| !before.contains(name))
+                .map(|name| pack_dir.join(name))
+                .collect();
+            report.bundles_fetched += 1;
+            report.bundles_unpacked += 1;
+        }
+        if caching && let Err(e) = cache.add(*id, !bundle.is_empty(), &written) {
+            tracing::warn!(error = %e, "could not add a link to the bundle cache");
+            caching = false;
+        }
+    }
+    cache.touch_and_evict();
+    Ok(())
+}
+
+/// Copies the files of the first `held` links of `cache`, the ones its
+/// `reuse` checked, into `pack_dir`, and returns how many links it put
+/// there whole.
+///
+/// A restore of another job runs beside this one and may evict this
+/// job's cache after `reuse` (`bundle_cache`), one file at a time, so a
+/// cached file can be gone when it is copied. That is a miss like a file
+/// gone before `reuse`: the files of its link already copied are removed
+/// again, so git never sees an index without its pack, the cache drops
+/// that link and the ones after it, and the caller unpacks them from the
+/// store. Any other failure fails the restore.
+fn place_cached(
+    cache: &mut BundleCache,
+    held: usize,
+    pack_dir: &Path,
+    durability: Durability,
+) -> Result<usize, RestoreError> {
+    for index in 0..held {
+        let mut copied = 0;
+        let mut lost = false;
+        for (name, from) in cache.files(index) {
+            let to = pack_dir.join(name);
+            match bundle_cache::place(&from, &to) {
+                Ok(()) => copied += 1,
+                Err(e)
+                    if e.kind() == io::ErrorKind::NotFound
+                        && matches!(fs::symlink_metadata(&from), Err(gone) if gone.kind() == io::ErrorKind::NotFound) =>
+                {
+                    lost = true;
+                    break;
+                }
+                Err(e) => return Err(io_err(&to, e)),
+            }
+            if durability == Durability::PowerLoss {
+                let file = fs::File::open(&to).map_err(|e| io_err(&to, e))?;
+                rustix::fs::fsync(&file).map_err(|e| io_err(&to, e.into()))?;
             }
         }
-        let path_text = path.to_string_lossy().into_owned();
-        git.run(&["bundle", "verify", &path_text])?;
-        git.run(&["bundle", "unbundle", &path_text])?;
-        report.bundles_fetched += 1;
+        if lost {
+            for (name, _) in cache.files(index).take(copied) {
+                let to = pack_dir.join(name);
+                fs::remove_file(&to).map_err(|e| io_err(&to, e))?;
+            }
+            cache.lost_from(index);
+            return Ok(index);
+        }
     }
+    Ok(held)
+}
+
+/// The names of the files in a repository's `objects/pack`.
+fn pack_files(dir: &Path) -> Result<BTreeSet<String>, RestoreError> {
+    let mut names = BTreeSet::new();
+    for entry in fs::read_dir(dir).map_err(|e| io_err(dir, e))? {
+        let entry = entry.map_err(|e| io_err(dir, e))?;
+        if let Ok(name) = entry.file_name().into_string() {
+            names.insert(name);
+        }
+    }
+    Ok(names)
+}
+
+/// Writes the bundle of `chunks` to a scratch file and unpacks it with `git bundle unbundle`.
+fn unbundle(store: &Store, chunks: &[ChunkId], git: &Git) -> Result<(), RestoreError> {
+    let bundle = TempFile::in_dir(store.objects().tmp_dir());
+    let path = bundle.path();
+    {
+        let mut file = fs::File::create(path).map_err(|e| io_err(path, e))?;
+        for chunk in chunks {
+            file.write_all(&store.objects().read(*chunk)?)
+                .map_err(|e| io_err(path, e))?;
+        }
+    }
+    let path_text = path.to_string_lossy().into_owned();
+    git.run(&["bundle", "unbundle", &path_text])?;
     Ok(())
 }
 
@@ -899,57 +1069,125 @@ fn push_stash_entry(git: &Git, oid: &GitOid) -> Result<(), RestoreError> {
     Ok(())
 }
 
-/// Sets every ref and `HEAD` exactly as `git_state` records them.
+/// Sets every ref, every symbolic ref and `HEAD` exactly as `git_state` records them.
 ///
-/// Every ref but `refs/stash` is set by one `update-ref --stdin`
-/// transaction. The stash list is rebuilt oldest first from the refs
+/// One `update-ref --no-deref --stdin` transaction sets every ref but
+/// `refs/stash` and points each symbolic ref at its target with
+/// `symref-update`, so `refs/remotes/origin/HEAD` follows the remote's
+/// default branch again instead of naming a frozen commit (M2-06). `HEAD`
+/// already points at the snapshot's branch, where `init_repo` put it, or
+/// for a detached `HEAD` the same transaction detaches it; `--no-deref`
+/// keeps that update on `HEAD` instead of the branch `git init` left it
+/// on. git before 2.46 has no `symref-update`; there each symbolic ref
+/// takes one `git symbolic-ref` after the transaction of the direct refs,
+/// as before. The stash list is then rebuilt oldest first from the refs
 /// capture pinned under the job's stash prefix, then `refs/stash` itself,
 /// so every entry comes back at its index.
 fn set_refs(git: &Git, git_state: &GitState, job_id: JobId) -> Result<(), RestoreError> {
-    let prefix = stash_prefix(job_id);
-    let mut older: Vec<(u64, &GitOid)> = git_state
-        .refs
-        .iter()
-        .filter_map(|(name, oid)| {
-            let n = name.as_str().strip_prefix(&prefix)?.parse().ok()?;
-            Some((n, oid))
-        })
-        .collect();
-    older.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
-    let mut commands = String::new();
+    let mut direct = String::new();
     let mut stash = None;
     for (name, oid) in &git_state.refs {
         if name.as_str() == "refs/stash" {
             stash = Some(oid);
         } else {
-            commands.extend(["update ", name.as_str(), " ", oid.as_str(), "\n"]);
+            direct.extend(["update ", name.as_str(), " ", oid.as_str(), "\n"]);
         }
     }
-    if !commands.is_empty() {
-        git.run_stdin_env(&["update-ref", "--stdin"], &[], commands.as_bytes())?;
+    let mut commands = direct.clone();
+    // `validate` holds each target in `refs`, which the same transaction sets.
+    for (name, target) in &git_state.symbolic_refs {
+        commands.extend(["symref-update ", name.as_str(), " ", target.as_str(), "\n"]);
+    }
+    // git refuses a transaction that updates `HEAD` and also the branch
+    // `HEAD` points at, so `HEAD` joins it only when detached, from the
+    // branch of `initial_branch`, which no ref of the snapshot names.
+    if let GitHead::Detached(oid) = &git_state.head {
+        commands.extend(["update HEAD ", oid.as_str(), "\n"]);
+    }
+    if !commands.is_empty() && !git.update_refs_with_symrefs(commands.as_bytes())? {
+        set_refs_one_by_one(git, git_state, &direct)?;
     }
     if let Some(oid) = stash {
+        let prefix = stash_prefix(job_id);
+        let mut older: Vec<(u64, &GitOid)> = git_state
+            .refs
+            .iter()
+            .filter_map(|(name, oid)| {
+                let n = name.as_str().strip_prefix(&prefix)?.parse().ok()?;
+                Some((n, oid))
+            })
+            .collect();
+        older.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
         for (_, entry) in &older {
             push_stash_entry(git, entry)?;
         }
         push_stash_entry(git, oid)?;
     }
-    match &git_state.head {
-        GitHead::Branch(branch) => {
-            let full = format!("refs/heads/{branch}");
-            git.run(&["symbolic-ref", "HEAD", &full])?;
-        }
-        GitHead::Detached(oid) => {
-            git.run(&["update-ref", "--no-deref", "HEAD", oid.as_str()])?;
-        }
+    Ok(())
+}
+
+/// Sets the refs of `set_refs` on git before 2.46: the direct ones in one
+/// transaction of `direct`, then one `symbolic-ref` per symbolic ref, then
+/// a detached `HEAD`; a branch `HEAD` is where `init_repo` put it.
+fn set_refs_one_by_one(git: &Git, git_state: &GitState, direct: &str) -> Result<(), RestoreError> {
+    if !direct.is_empty() {
+        git.run_stdin_env(&["update-ref", "--stdin"], &[], direct.as_bytes())?;
+    }
+    for (name, target) in &git_state.symbolic_refs {
+        git.run(&["symbolic-ref", name.as_str(), target.as_str()])?;
+    }
+    if let GitHead::Detached(oid) = &git_state.head {
+        git.run(&["update-ref", "--no-deref", "HEAD", oid.as_str()])?;
     }
     Ok(())
 }
 
-/// Creates the empty repository in the object format of `git_state` and writes its exclude file.
+/// The branch `init_repo` has `git init` point `HEAD` at.
+///
+/// A branch `HEAD` gets its own branch, so `HEAD` is where the snapshot's
+/// is from the start and the ref transaction need not touch it. A detached
+/// `HEAD` gets a branch no ref of the snapshot names, so the transaction
+/// can detach `HEAD` without also moving the branch `HEAD` points at: git
+/// refuses that ("multiple updates for 'HEAD' (including one via its
+/// referent ...)"), and the `master` a plain `git init` points at is a
+/// branch of many repositories. That branch is never created.
+fn initial_branch(git_state: &GitState) -> String {
+    match &git_state.head {
+        GitHead::Branch(branch) => branch.as_str().to_owned(),
+        GitHead::Detached(_) => {
+            let taken = |name: &str| {
+                let full = format!("refs/heads/{name}");
+                (git_state.refs.iter().map(|(name, _)| name))
+                    .chain(git_state.symbolic_refs.iter().map(|(name, _)| name))
+                    .any(|name| name.as_str() == full)
+            };
+            let mut name = "fabric-detached".to_owned();
+            let mut n = 0u32;
+            while taken(&name) {
+                n += 1;
+                name = format!("fabric-detached-{n}");
+            }
+            name
+        }
+    }
+}
+
+/// The git directory `git init` makes in `root`: no `GIT_*` variable
+/// reaches git (`crate::git`), and the global and system config, where
+/// `init.templateDir` could be set, are unread, so it is `root/.git`.
+fn git_dir(root: &Path) -> PathBuf {
+    root.join(".git")
+}
+
+/// Creates the empty repository in the object format of `git_state`, its
+/// `HEAD` on `initial_branch`, and writes its exclude file.
+///
+/// The exclude file's place is known from `git_dir`, so no `git rev-parse
+/// --git-path` asks for it. `--initial-branch` is from git 2.28, older
+/// than the `--object-format` of 2.29 this already needs.
 fn init_repo(
     store: &Store,
-    git: &Git,
+    (git, root): (&Git, &Path),
     git_state: &GitState,
     power_loss: bool,
 ) -> Result<(), RestoreError> {
@@ -960,9 +1198,10 @@ fn init_repo(
     } else {
         "--object-format=sha1"
     };
-    git.run(&["init", "-q", format])?;
+    let initial = format!("--initial-branch={}", initial_branch(git_state));
+    git.run(&["init", "-q", format, &initial])?;
     if let Some(chunks) = &git_state.exclude {
-        let path = git.git_path("info/exclude")?;
+        let path = git_dir(root).join("info").join("exclude");
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
         }
@@ -1008,6 +1247,39 @@ impl WorkCounter {
     }
 }
 
+/// The mode each file of `W` is written with: the one `worktree_modes`
+/// records (M2-04), or for a path it does not name, as in a format version
+/// 2 manifest, 0644 or 0755 as the tree entry says.
+///
+/// A recorded mode is written as it is, so its owner execute bit must be
+/// the one the tree records; capture makes them agree, and a manifest
+/// where they differ is refused here, before any file is written.
+fn file_modes<'i>(
+    items: &'i [TreeItem],
+    recorded: &[(RelPath, Mode)],
+) -> Result<HashMap<&'i RelPath, Mode>, RestoreError> {
+    let mut modes = HashMap::with_capacity(items.len());
+    for item in items {
+        let executable = match item.mode {
+            TreeMode::File => false,
+            TreeMode::Exec => true,
+            TreeMode::Symlink | TreeMode::Gitlink => continue,
+        };
+        let mode = match recorded.binary_search_by(|(p, _)| p.cmp(&item.rel)) {
+            Ok(index) => recorded[index].1,
+            Err(_) => Mode::from_masked(if executable { 0o755 } else { 0o644 }),
+        };
+        if mode.owner_executable() != executable {
+            return Err(RestoreError::ModeDisagreesWithTree {
+                path: item.rel.clone(),
+                mode,
+            });
+        }
+        modes.insert(&item.rel, mode);
+    }
+    Ok(modes)
+}
+
 /// Restores the repository: objects, refs, `HEAD`, the index and the working tree.
 fn restore_git(
     store: &Store,
@@ -1027,9 +1299,15 @@ fn restore_git(
     if power_loss {
         git = git.with_full_fsync();
     }
-    init_repo(store, &git, git_state, power_loss)?;
+    init_repo(store, (&git, staging), git_state, power_loss)?;
 
-    unbundle_chain(store, snapshot, manifest, &git, report)?;
+    unbundle_chain(
+        store,
+        (snapshot, manifest),
+        (&git, staging),
+        durability,
+        report,
+    )?;
     set_refs(&git, git_state, manifest.job_id)?;
     git.run(&["read-tree", git_state.index_commit.as_str()])?;
 
@@ -1041,6 +1319,7 @@ fn restore_git(
         .iter()
         .map(|(p, t)| (p, *t))
         .collect();
+    let modes = file_modes(&items, &git_state.worktree_modes)?;
     let mut blobs: Vec<&TreeItem> = Vec::with_capacity(items.len());
     for item in &items {
         if item.mode == TreeMode::Gitlink {
@@ -1069,12 +1348,11 @@ fn restore_git(
                 symlinks.push((item, target));
             }
             TreeMode::File | TreeMode::Exec | TreeMode::Gitlink => {
-                let bits = if item.mode == TreeMode::Exec {
-                    0o755
-                } else {
-                    0o644
-                };
-                let mut file = writer.create_file(&item.rel, Mode::from_masked(bits))?;
+                let mode = modes
+                    .get(&item.rel)
+                    .copied()
+                    .unwrap_or(Mode::from_masked(0o644));
+                let mut file = writer.create_file(&item.rel, mode)?;
                 let written = io::copy(body, &mut file).map_err(|e| io_err(path, e))?;
                 if written != size {
                     return Err(RestoreError::SizeMismatch {
@@ -1251,12 +1529,15 @@ fn paths_under(base: &Path, prefix: &str, out: &mut BTreeSet<String>) -> Result<
 /// to a half-restored workspace. The rerun checks that the directory holds
 /// exactly the manifest's paths, re-reads every file against the store and
 /// checks every directory and link; a directory that holds anything else
-/// is foreign and is refused.
+/// is foreign and is refused. The directory itself then gets the recorded
+/// mode and mtime, which a kill just after the rename may have left with
+/// the owner bits `TreeWriter::finish_root` added.
 fn harness_state_complete(
     store: &Store,
-    entries: &[Entry],
+    state: &HarnessState,
     dir: &Path,
 ) -> Result<Option<u64>, RestoreError> {
+    let entries = &state.entries;
     let occupied = RestoreError::TargetNotEmpty {
         path: dir.to_owned(),
     };
@@ -1290,11 +1571,15 @@ fn harness_state_complete(
         }
     }
     let writer = TreeWriter::open(dir)?;
-    match verify_entries(store, &writer, entries, &|_| false, Verify::All) {
-        Ok(verified) => Ok(Some(verified)),
-        Err(RestoreError::VerifyFailed { .. }) => Err(occupied),
-        Err(e) => Err(e),
+    let verified = match verify_entries(store, &writer, entries, &|_| false, Verify::All) {
+        Ok(verified) => verified,
+        Err(RestoreError::VerifyFailed { .. }) => return Err(occupied),
+        Err(e) => return Err(e),
+    };
+    if let Some(root) = state.root {
+        writer.settle_root(root, false)?;
     }
+    Ok(Some(verified))
 }
 
 /// The cache paths whose bytes are not written: rows nothing of which was captured, and rows `carry` turns down.
@@ -1331,7 +1616,7 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
     }
     check_target_empty(req.target)?;
     let harness_done = match req.harness_state {
-        Some(dir) => harness_state_complete(store, &manifest.harness_state.entries, dir)?,
+        Some(dir) => harness_state_complete(store, &manifest.harness_state, dir)?,
         None => None,
     };
     let staging = fresh_staging(req.target, req.durability)?;
@@ -1405,23 +1690,28 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
                 &keep_all,
                 req.verify,
             )?;
-            if req.durability == Durability::PowerLoss {
-                sync_tree(&hs_staging, false)?;
-            }
-            move_into_place(&hs_staging, dir)?;
+            put_in_place(
+                &hs_writer,
+                (&hs_staging, dir),
+                manifest.harness_state.root,
+                req.durability,
+                None,
+            )?;
             checkpoint::reached("restore.after_harness_rename");
         }
         (None, _) => {}
     }
 
     if let (Some((git, _)), Some(state)) = (&restored, &manifest.git) {
-        write_config(git, &state.config)?;
+        write_config(git, &staging, &state.config, req.durability)?;
     }
-    if req.durability == Durability::PowerLoss {
-        sync_tree(&staging, false)?;
-    }
-    checkpoint::reached("restore.before_rename");
-    move_into_place(&staging, req.target)?;
+    put_in_place(
+        &writer,
+        (&staging, req.target),
+        manifest.root_meta,
+        req.durability,
+        Some("restore.before_rename"),
+    )?;
     checkpoint::reached("restore.after_rename");
     tracing::info!(snapshot = %req.snapshot, target = %req.target.display(), files = report.total().files, "restored");
     Ok(report)
@@ -1430,26 +1720,153 @@ pub fn restore(store: &Store, req: &RestoreRequest<'_>) -> Result<RestoreReport,
 /// Writes the carried config projection, the last step of a git restore (ADR 0004).
 ///
 /// A repeated key's values sit together in the source's order: the first
-/// replaces whatever `git init` wrote, and the rest follow it.
-fn write_config(git: &Git, config: &[(GitConfigKey, GitConfigValue)]) -> Result<(), RestoreError> {
-    let mut previous = None;
-    for (key, value) in config {
-        // These describe the source's filesystem; `git init` probed the target's.
-        if matches!(
+/// replaces whatever `git init` wrote, and the rest follow it, as `git
+/// config --replace-all` and `--add` would leave them.
+///
+/// `git init` writes a config of `[core]` and, for a SHA-256 repository,
+/// `[extensions]`, so every carried key outside `core` belongs to a
+/// section the file does not hold yet. Those sections are appended to the
+/// file byte for byte as `git config` appends them (`ConfigSection`),
+/// without a git process. A `core` key, or a section the file already
+/// holds, goes through `git config` as before.
+fn write_config(
+    git: &Git,
+    root: &Path,
+    config: &[(GitConfigKey, GitConfigValue)],
+    durability: Durability,
+) -> Result<(), RestoreError> {
+    // These describe the source's filesystem; `git init` probed the target's.
+    let carried = config.iter().filter(|(key, _)| {
+        !matches!(
             key,
             GitConfigKey::CoreIgnoreCase | GitConfigKey::CoreSymlinks
-        ) {
-            continue;
+        )
+    });
+    let mut sections: Vec<ConfigSection> = Vec::new();
+    for (key, value) in carried {
+        let name = key.to_string();
+        let (header, variable) = ConfigSection::split(&name);
+        match sections.iter_mut().find(|s| s.header == header) {
+            Some(section) => section
+                .lines
+                .push((name, variable, value.as_str().to_owned())),
+            None => sections.push(ConfigSection {
+                header,
+                lines: vec![(name, variable, value.as_str().to_owned())],
+            }),
         }
-        let mode = if previous == Some(key) {
-            "--add"
-        } else {
-            "--replace-all"
-        };
-        git.run(&["config", "--local", mode, &key.to_string(), value.as_str()])?;
-        previous = Some(key);
+    }
+    if sections.is_empty() {
+        return Ok(());
+    }
+    let path = &git_dir(root).join("config");
+    let existing = fs::read_to_string(path).map_err(|e| io_err(path, e))?;
+    let held: BTreeSet<&str> = existing
+        .lines()
+        .filter(|line| line.starts_with('['))
+        .collect();
+    let (through_git, appended): (Vec<&ConfigSection>, Vec<&ConfigSection>) = (sections.iter())
+        .partition(|s| s.header == "[core]\n" || held.contains(s.header.trim_end()));
+    if !appended.is_empty() {
+        let mut text = String::new();
+        if !existing.is_empty() && !existing.ends_with('\n') {
+            text.push('\n');
+        }
+        for section in appended {
+            section.write(&mut text);
+        }
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .map_err(|e| io_err(path, e))?;
+        file.write_all(text.as_bytes())
+            .map_err(|e| io_err(path, e))?;
+        if durability == Durability::PowerLoss {
+            rustix::fs::fsync(&file).map_err(|e| io_err(path, e.into()))?;
+        }
+    }
+    for section in through_git {
+        let mut previous = None;
+        for (name, _, value) in &section.lines {
+            let mode = if previous == Some(name) {
+                "--add"
+            } else {
+                "--replace-all"
+            };
+            git.run(&["config", "--local", mode, name, value])?;
+            previous = Some(name);
+        }
     }
     Ok(())
+}
+
+/// One section of the carried config, with its keys in the projection's order.
+struct ConfigSection {
+    /// The header line, newline included, as `git config` writes it.
+    header: String,
+    /// Each key's full name, its variable name and its value.
+    lines: Vec<(String, String, String)>,
+}
+
+impl ConfigSection {
+    /// Splits a key's full name into the header of its section, as git's
+    /// `store_create_section` writes it, and its variable name: the
+    /// subsection is what lies between the first and the last dot, with
+    /// `"` and `\\` escaped.
+    fn split(name: &str) -> (String, String) {
+        let (section, rest) = name.split_once('.').unwrap_or((name, ""));
+        match rest.rsplit_once('.') {
+            Some((subsection, variable)) => {
+                let mut header = format!("[{section} \"");
+                for c in subsection.chars() {
+                    if matches!(c, '"' | '\\') {
+                        header.push('\\');
+                    }
+                    header.push(c);
+                }
+                header.push_str("\"]\n");
+                (header, variable.to_owned())
+            }
+            None => (format!("[{section}]\n"), rest.to_owned()),
+        }
+    }
+
+    /// Appends the section to `out` as `git config` writes a new section:
+    /// the header, then a tab, the variable, ` = ` and the value per line,
+    /// the value in double quotes when it starts or ends with a space or
+    /// holds `;`, `#` or a carriage return, with `\\`, `"` and a tab
+    /// escaped (git's `write_pair`). git quotes a carriage return since
+    /// the fix of CVE-2025-48384 (2.50.1, and 2.43.7 on the oldest line it
+    /// patched); before, a value that ended in one lost it when read back.
+    /// This writer quotes it whatever git the node runs.
+    fn write(&self, out: &mut String) {
+        out.push_str(&self.header);
+        for (_, variable, value) in &self.lines {
+            let quote =
+                value.starts_with(' ') || value.ends_with(' ') || value.contains([';', '#', '\r']);
+            out.push('\t');
+            out.push_str(variable);
+            out.push_str(" = ");
+            if quote {
+                out.push('"');
+            }
+            for c in value.chars() {
+                match c {
+                    '\n' => out.push_str("\\n"),
+                    '\t' => out.push_str("\\t"),
+                    '"' | '\\' => {
+                        out.push('\\');
+                        out.push(c);
+                    }
+                    _ => out.push(c),
+                }
+            }
+            if quote {
+                out.push('"');
+            }
+            out.push('\n');
+        }
+    }
 }
 
 /// Re-reads the `files` and the working tree of a snapshot under `root` and returns how many matched.
@@ -1488,6 +1905,161 @@ mod tests {
 
     /// Blobs enough to fill both pipes between this process and git.
     const BLOBS: usize = 300;
+
+    /// Writes `config` with one `git config` per key, as restore did before
+    /// `write_config` appended the sections itself.
+    fn config_through_git(git: &Git, config: &[(GitConfigKey, GitConfigValue)]) {
+        let mut previous = None;
+        for (key, value) in config {
+            if matches!(
+                key,
+                GitConfigKey::CoreIgnoreCase | GitConfigKey::CoreSymlinks
+            ) {
+                continue;
+            }
+            let mode = if previous == Some(key) {
+                "--add"
+            } else {
+                "--replace-all"
+            };
+            git.run(&["config", "--local", mode, &key.to_string(), value.as_str()])
+                .unwrap();
+            previous = Some(key);
+        }
+    }
+
+    /// Restores `config` into two fresh repositories, one through `git
+    /// config` and one through `write_config`, and returns both files.
+    fn both_configs(config: &[(GitConfigKey, GitConfigValue)]) -> (String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let (by_git, written) = (dir.path().join("git"), dir.path().join("written"));
+        for root in [&by_git, &written] {
+            fs::create_dir(root).unwrap();
+            Git::new(root).run(&["init", "-q"]).unwrap();
+        }
+        config_through_git(&Git::new(&by_git), config);
+        write_config(
+            &Git::new(&written),
+            &written,
+            config,
+            Durability::ProcessCrash,
+        )
+        .unwrap();
+        (
+            fs::read_to_string(git_dir(&by_git).join("config")).unwrap(),
+            fs::read_to_string(git_dir(&written).join("config")).unwrap(),
+        )
+    }
+
+    fn key(text: &str) -> GitConfigKey {
+        GitConfigKey::parse(text).unwrap()
+    }
+
+    fn value(text: &str) -> GitConfigValue {
+        GitConfigValue::parse(text).unwrap()
+    }
+
+    /// Every character git's `write_pair` quotes or escapes, a subsection
+    /// it escapes, a repeated key, a key of `core` and two the restore
+    /// leaves to `git init`.
+    #[test]
+    fn write_config_leaves_the_bytes_git_config_leaves() {
+        let mut config = vec![
+            (key("remote.origin.url"), value(" lead and trail ")),
+            (
+                key("remote.origin.fetch"),
+                value("+refs/heads/*:refs/remotes/origin/*"),
+            ),
+            (
+                key("remote.origin.fetch"),
+                value("a;b#c \"q\" \\ tab\there"),
+            ),
+            (key("remote.we\"ird.url"), value("")),
+            (key("remote.a.b.pushurl"), value("é = [x]")),
+            (key("branch.feat/x.merge"), value("refs/heads/feat/x")),
+            (key("branch.main.remote"), value("origin")),
+            (key("push.default"), value("simple")),
+            (key("core.autocrlf"), value("input")),
+            (key("core.ignorecase"), value("false")),
+            (key("core.symlinks"), value("false")),
+        ];
+        config.sort_by(|a, b| a.0.cmp(&b.0));
+        let (by_git, written) = both_configs(&config);
+        assert_eq!(written, by_git);
+    }
+
+    /// A value that holds or ends in a carriage return reads back whole,
+    /// whichever git reads it (CVE-2025-48384).
+    #[test]
+    fn a_carriage_return_in_a_config_value_comes_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = Git::new(dir.path());
+        git.run(&["init", "-q"]).unwrap();
+        let values = ["ends\r", "\rstarts", "in\rside"];
+        let config: Vec<_> = (values.iter())
+            .map(|v| (key("remote.origin.fetch"), value(v)))
+            .collect();
+        write_config(&git, dir.path(), &config, Durability::ProcessCrash).unwrap();
+        let read = git
+            .run(&["config", "--get-all", "-z", "remote.origin.fetch"])
+            .unwrap();
+        let read: Vec<&[u8]> = Git::records(&read).collect();
+        assert_eq!(read, values.map(str::as_bytes));
+    }
+
+    #[test]
+    fn write_config_leaves_the_bytes_git_config_leaves_for_any_projection() {
+        use proptest::prelude::*;
+        use proptest::test_runner::{Config, TestRunner};
+
+        // `a` and `a.p` interleave in sorted order (`remote.a.fetch`,
+        // `remote.a.p.url`, `remote.a.url`): git puts the later key of `a`
+        // back into the section `a` already has, not after `a.p`.
+        let remotes = ["origin", "up", "a", "a.p", "a.b", "we\"ird", "x#y;z", "ü"];
+        let branches = ["main", "feat/x", "q\"b", "dot.ted"];
+        // No carriage return: git before the fix of CVE-2025-48384 wrote one
+        // unquoted (`a_carriage_return_in_a_config_value_comes_back`).
+        let chars = [
+            ' ', '\t', ';', '#', '"', '\\', 'a', 'b', '/', ':', 'é', '=', '[', ']', '*', '\u{b}',
+        ];
+        let name = (0usize..10, 0usize..8, 0usize..4).prop_map(move |(kind, r, b)| {
+            let (remote, branch) = (remotes[r], branches[b]);
+            match kind {
+                0 => format!("remote.{remote}.url"),
+                1 => format!("remote.{remote}.pushurl"),
+                2 => format!("remote.{remote}.fetch"),
+                3 => format!("branch.{branch}.remote"),
+                4 => format!("branch.{branch}.merge"),
+                5 => format!("branch.{branch}.rebase"),
+                6 => "push.default".to_owned(),
+                7 => "core.autocrlf".to_owned(),
+                8 => "core.ignorecase".to_owned(),
+                _ => "core.symlinks".to_owned(),
+            }
+        });
+        let text = prop::collection::vec(prop::sample::select(chars.to_vec()), 0..8)
+            .prop_map(|chars| chars.into_iter().collect::<String>());
+        let strategy = prop::collection::vec((name, text), 0..8);
+        let mut runner = TestRunner::new(Config {
+            cases: 32,
+            ..Config::default()
+        });
+        runner
+            .run(&strategy, |pairs| {
+                let mut config: Vec<(GitConfigKey, GitConfigValue)> = pairs
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        Some((GitConfigKey::parse(k).ok()?, GitConfigValue::parse(v).ok()?))
+                    })
+                    .collect();
+                // The order capture writes: by key, a repeated key's values in git's order.
+                config.sort_by(|a, b| a.0.cmp(&b.0));
+                let (by_git, written) = both_configs(&config);
+                prop_assert_eq!(written, by_git);
+                Ok(())
+            })
+            .unwrap();
+    }
 
     #[test]
     fn a_tree_name_that_is_not_utf8_is_refused_not_rewritten() {
@@ -1540,5 +2112,97 @@ mod tests {
             ),
             "{outcome:?}"
         );
+    }
+
+    /// The snapshot of the `n`th link of a test chain.
+    fn link(n: u8) -> SnapshotId {
+        SnapshotId::from_bytes([n; 32])
+    }
+
+    /// Gives `job` a cache in the store at `root` with `links` links, each
+    /// with an index and a pack file, and its record last used 15 days
+    /// ago, past the 14 days a cache no restore uses is kept.
+    fn idle_cache(root: &Path, job: JobId, links: u8) {
+        let staged = root.join("staged");
+        fs::create_dir_all(&staged).unwrap();
+        let mut cache = BundleCache::open(root, job);
+        for n in 0..links {
+            let files: Vec<PathBuf> = ["idx", "pack"]
+                .iter()
+                .map(|ext| {
+                    let file = staged.join(format!("pack-{n}.{ext}"));
+                    fs::write(&file, format!("link {n} {ext}")).unwrap();
+                    file
+                })
+                .collect();
+            cache.add(link(n), true, &files).unwrap();
+        }
+        let record = root
+            .join("bundle-cache")
+            .join(job.to_string())
+            .join("links");
+        let old = std::time::SystemTime::now() - Duration::from_hours(15 * 24);
+        fs::File::options()
+            .append(true)
+            .open(record)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+
+    /// The names in `dir`, sorted.
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Review of PR #31: restores of two jobs run at once since the store
+    /// lost its mutex, and a restore that ends evicts the caches of other
+    /// jobs, so a cache this restore's `reuse` checked can be gone before
+    /// its files are copied. A file gone then is a miss, as one gone
+    /// before `reuse` is: the restore takes the links from that one on
+    /// from the store, never fails on a cache path. The files of the link
+    /// it was copying come out of the repository again, so git never sees
+    /// an index without its pack, and the cache drops the links it lost.
+    #[test]
+    fn a_cache_another_restore_evicts_after_reuse_costs_a_replay_not_the_restore() {
+        let (b, a) = (JobId::from_bytes([7; 16]), JobId::from_bytes([8; 16]));
+        let chain = [link(0), link(1)];
+
+        // Job a's restore ends between b's reuse and b's copies, and evicts b's idle cache.
+        let dir = tempfile::tempdir().unwrap();
+        let (root, pack) = (dir.path(), dir.path().join("repo/objects/pack"));
+        fs::create_dir_all(&pack).unwrap();
+        idle_cache(root, b, 2);
+        let mut cache = BundleCache::open(root, b);
+        assert_eq!(cache.reuse(&chain), 2);
+        BundleCache::open(root, a).touch_and_evict();
+        let placed = place_cached(&mut cache, 2, &pack, Durability::PowerLoss).unwrap();
+        assert_eq!(placed, 0);
+        assert!(names_in(&pack).is_empty(), "{:?}", names_in(&pack));
+        assert_eq!(cache.len(), 0);
+
+        // The eviction removes files one at a time: link 1's pack is gone, its index is not.
+        let dir = tempfile::tempdir().unwrap();
+        let (root, pack) = (dir.path(), dir.path().join("repo/objects/pack"));
+        fs::create_dir_all(&pack).unwrap();
+        idle_cache(root, b, 2);
+        let mut cache = BundleCache::open(root, b);
+        assert_eq!(cache.reuse(&chain), 2);
+        fs::remove_file(
+            root.join("bundle-cache")
+                .join(b.to_string())
+                .join("pack-1.pack"),
+        )
+        .unwrap();
+        let placed = place_cached(&mut cache, 2, &pack, Durability::ProcessCrash).unwrap();
+        assert_eq!(placed, 1);
+        assert_eq!(names_in(&pack), ["pack-0.idx", "pack-0.pack"]);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(BundleCache::open(root, b).reuse(&chain), 1);
     }
 }

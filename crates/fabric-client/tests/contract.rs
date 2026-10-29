@@ -16,8 +16,9 @@ use std::path::{Path, PathBuf};
 use fabric_client::api::{
     API_VERSION, Answer, CaptureNote, CarryFor, CarryLine, Decision, DoctorReport, Event, Hello,
     HelloAnswer, JobCreated, JobStatus, LedgerEvent, Marker, Op, Outcome, PreflightRow, Process,
-    Reason, Refusal, RefusalKind, Registered, Reply, Request, RunPlan, SessionRecorded,
-    SnapshotSession, Standing, Step, SystemPath, Verdict, VerdictCount, View, Wire, WorkspaceState,
+    Reason, Refusal, RefusalKind, Registered, RepairOutcome, Reply, Request, RunPlan,
+    SessionRecorded, SnapshotSession, Standing, Step, SystemPath, Verdict, VerdictCount, View,
+    Wire, WorkspaceState,
 };
 use fabric_client::frame;
 use fabric_core::harness::HarnessKind;
@@ -226,6 +227,8 @@ fn event_variant(event: &Event) -> (Option<usize>, usize) {
             Event::LiveWorkspaceGone { .. },
             Event::SubmodulesLeftEmpty { .. },
             Event::EscapingLinksRestored { .. },
+            Event::HarnessRecorded { .. },
+            Event::SessionToContinue { .. },
         ],
         Event::Unrecognized
     )
@@ -295,6 +298,11 @@ fn reason_variant(reason: &Reason) -> (Option<usize>, usize) {
             Reason::RootNotADirectory { .. },
             Reason::PlanOvertaken { .. },
             Reason::SessionMoved { .. },
+            Reason::ManagedRefused { .. },
+            Reason::OperationConflict { .. },
+            Reason::ManagedUnavailable,
+            Reason::StandaloneJob { .. },
+            Reason::ManagedJob { .. },
         ],
         Reason::Unrecognized
     )
@@ -535,6 +543,14 @@ impl Seen {
             | Reply::JobResume(RunPlan { harness, .. })
             | Reply::HarnessStarted(Registered { harness, .. })
             | Reply::HarnessSession(SessionRecorded { harness, .. }) => self.harness(harness),
+            Reply::JobRepair(repaired) => {
+                let index = variant!(
+                    repaired.outcome,
+                    [RepairOutcome::Unforked, RepairOutcome::Adopted { .. }],
+                    RepairOutcome::Unrecognized
+                );
+                self.mark("RepairOutcome", index);
+            }
             _ => {}
         }
     }
@@ -635,7 +651,8 @@ impl Seen {
             Event::Preflight { rows, .. } => self.rows(rows),
             Event::SessionCaptured { harness, .. }
             | Event::SessionRestored { harness, .. }
-            | Event::ContinuingSession { harness, .. } => self.harness(harness),
+            | Event::ContinuingSession { harness, .. }
+            | Event::SessionToContinue { harness, .. } => self.harness(harness),
             Event::NewSession { harness, previous } => {
                 self.harness(harness);
                 if let Some(previous) = previous {
@@ -881,6 +898,7 @@ fn every_variant_of_every_nested_enum_has_a_fixture() {
             "Outcome",
             "Process",
             "RefusalKind",
+            "RepairOutcome",
             "SnapshotSession",
             "Standing",
             "Step",

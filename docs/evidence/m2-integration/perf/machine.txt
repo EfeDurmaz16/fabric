@@ -1,0 +1,16 @@
+commit: 069ecbfe36ec9c9382b9afcdb138148e968cd150
+dirty: 1 paths
+uname: Darwin 25.6.0 Darwin Kernel Version 25.6.0: Fri Jul 31 19:19:08 PDT 2026; root:xnu-12377.161.14~5/RELEASE_ARM64_T6050 arm64
+cpu: Apple M5 Pro 18 cores
+rustc: rustc 1.97.1 (8bab26f4f 2026-07-14)
+budget runs: 3, bench reps: 15, profile: test
+date: 2026-10-27T17:56:25Z
+load: 20:56  up 43 days, 21:21, 1 user, load averages: 6.27 7.52 6.92
+date: 2026-10-27T17:58:00Z
+load: 20:58  up 43 days, 21:22, 1 user, load averages: 6.80 7.20 6.85
+date: 2026-10-27T17:59:35Z
+load: 20:59  up 43 days, 21:24, 1 user, load averages: 7.03 7.23 6.90
+date: 2026-10-27T18:01:13Z
+load: 21:01  up 43 days, 21:26, 1 user, load averages: 5.76 6.69 6.72
+date: 2026-10-27T18:01:30Z
+load: 21:01  up 43 days, 21:26, 1 user, load averages: 5.32 6.53 6.66

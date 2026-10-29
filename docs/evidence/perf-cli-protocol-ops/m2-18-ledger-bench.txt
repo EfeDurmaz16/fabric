@@ -1,0 +1,17 @@
+bench_replicating_a_long_ledger (crates/fabricd/src/ops.rs), release build,
+cargo test -p fabricd --lib --release -- --ignored --nocapture bench_replicating_a_long_ledger
+Apple M5 Pro, load average 6 to 23 from other work. Not interleaved: the
+same test run at commit 9fa6324 (before) and at 1ecc017 (after).
+
+before (9fa6324, every push sends the whole ledger):
+bench_replicating_a_long_ledger: 1015 records, 159209 bytes; push of one new record: median 58.606ms, min 40.357334ms, max 85.125458ms
+
+after (1ecc017, a push sends what the peer has not accepted), two runs:
+bench_replicating_a_long_ledger: 1015 records, 159209 bytes; push of one new record: median 22.881291ms, min 14.799458ms, max 49.154167ms
+bench_replicating_a_long_ledger: a push now sends 158 bytes
+bench_replicating_a_long_ledger: 1015 records, 159209 bytes; push of one new record: median 26.091ms, min 12.062583ms, max 48.385917ms
+
+Load-insensitive: a push of one new record sends that record, 158 bytes,
+instead of all 159209 bytes, and the peer checks each received record
+by binary search over a sorted index of the chain (4 bytes a record)
+instead of a scan of every hash.

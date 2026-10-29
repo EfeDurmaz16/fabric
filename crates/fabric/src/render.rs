@@ -15,7 +15,7 @@
 
 use fabric_client::api::{
     CarryReport, DoctorReport, Event, JobStatus, LedgerEvent, Marker, PreflightRow, Process,
-    Registered, Reply, SessionRecorded, SnapshotSession, View, WorkspaceState,
+    Registered, RepairOutcome, Reply, SessionRecorded, SnapshotSession, View, WorkspaceState,
 };
 use fabric_client::sentences::{NO_SESSION, carry_lines, named, row};
 
@@ -159,6 +159,57 @@ pub(crate) fn reply(reply: &Reply) -> Vec<String> {
             .collect(),
         Reply::HarnessStarted(registered) => vec![self::registered(registered)],
         Reply::HarnessSession(recorded) => vec![session_recorded(recorded)],
+        Reply::ManagedCreate(operation) | Reply::ManagedCancel(operation) => {
+            let mut lines = fabric_client::sentences::managed_job(&operation.job);
+            if operation.replayed {
+                lines.push(format!(
+                    "operation {} answered again for key {}",
+                    operation.operation, operation.operation_key
+                ));
+            }
+            lines
+        }
+        Reply::ManagedStatus(job) => fabric_client::sentences::managed_job(job),
+        Reply::ManagedList(list) => list
+            .jobs
+            .iter()
+            .flat_map(fabric_client::sentences::managed_job)
+            .collect(),
+        Reply::JobRepair(repaired) => vec![match &repaired.outcome {
+            RepairOutcome::Unforked => format!(
+                "the chains no longer fork; the freeze is lifted, and {}'s later records come with the next catch-up",
+                repaired.peer
+            ),
+            RepairOutcome::Adopted {
+                epoch,
+                kept,
+                orphans,
+            } => {
+                let pinned = if orphans.is_empty() {
+                    "no snapshot only it named".to_owned()
+                } else {
+                    let ids: Vec<String> = orphans.iter().map(ToString::to_string).collect();
+                    format!("its snapshots {}, pinned", ids.join(", "))
+                };
+                format!(
+                    "the fork rule picked {}'s chain at epoch {epoch}; this node took it and kept its own ledger at {} with {pinned}",
+                    repaired.peer,
+                    kept.display()
+                )
+            }
+            RepairOutcome::Unrecognized => {
+                format!("the node repaired the fork with {} in a way this client does not know", repaired.peer)
+            }
+        }],
+        Reply::JobExport(exported) => {
+            let chain: Vec<String> = exported.chain.iter().map(ToString::to_string).collect();
+            vec![format!(
+                "exported {} as snapshot {}, pinned with its bundle chain {}; the job's head is unchanged",
+                exported.root.display(),
+                exported.snapshot,
+                chain.join(" <- ")
+            )]
+        }
         Reply::JobRun(_)
         | Reply::JobResume(_)
         | Reply::JobSuspend(_)

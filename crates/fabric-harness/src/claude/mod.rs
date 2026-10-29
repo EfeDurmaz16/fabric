@@ -116,7 +116,13 @@ pub struct ClaudeCode {
     binary: Option<PathBuf>,
     path_var: OsString,
     flags: LaunchFlags,
+    /// The installed version, asked ahead for a restore (`with_installed_ahead`).
+    installed_ahead: Option<VersionAhead>,
+    /// The resume guard's `--version`, asked ahead (`with_guard_ahead`).
+    guard_ahead: Option<VersionAhead>,
 }
+
+pub use crate::version::VersionAhead;
 
 /// The Claude version whose `~/.claude/sessions/<pid>.json` records this
 /// adapter was checked against.
@@ -155,7 +161,52 @@ impl ClaudeCode {
             binary: None,
             path_var,
             flags: LaunchFlags::default(),
+            installed_ahead: None,
+            guard_ahead: None,
         }
+    }
+
+    /// Starts asking the installed `claude` its version, from this
+    /// process's directory, as a restore asks it before it places a
+    /// session; hand the answer to the adapter that restores with
+    /// `with_installed_ahead`.
+    #[must_use]
+    pub fn ask_installed_ahead(&self) -> VersionAhead {
+        VersionAhead::installed(self.binary().ok(), self.path_var.clone(), PROGRAM)
+    }
+
+    /// Takes the installed version from `ahead` when it asked what this
+    /// adapter would ask, and asks again otherwise.
+    #[must_use]
+    pub fn with_installed_ahead(mut self, ahead: VersionAhead) -> Self {
+        self.installed_ahead = Some(ahead);
+        self
+    }
+
+    /// Starts the resume guard's `--version` of the `claude` a launch in
+    /// `workspace` with `env` would start, run there with that environment,
+    /// as the guard runs it; hand it to the launching adapter with
+    /// `with_guard_ahead`.
+    pub fn ask_guard_ahead(
+        &self,
+        workspace: &Path,
+        env: &[(EnvVarName, String)],
+    ) -> Result<VersionAhead, HarnessError> {
+        let root = pipeline::physical_workspace(workspace)?;
+        Ok(VersionAhead::reported(
+            self.binary()?,
+            pipeline::fs_path(&root).to_path_buf(),
+            env.to_vec(),
+        ))
+    }
+
+    /// Takes the resume guard's `--version` from `ahead` when it asked the
+    /// binary, directory and environment the launch uses, and asks again
+    /// otherwise.
+    #[must_use]
+    pub fn with_guard_ahead(mut self, ahead: VersionAhead) -> Self {
+        self.guard_ahead = Some(ahead);
+        self
     }
 
     /// Uses this binary instead of looking `claude` up on `PATH`. The
@@ -803,7 +854,13 @@ impl ClaudeCode {
     async fn restore_impl(&self, workspace: &Path, state: &Path) -> Result<Restored, HarnessError> {
         let root = pipeline::physical_workspace(workspace)?;
         let manifest = pipeline::open(state, &HarnessKind::ClaudeCode, &root, &self.home)?;
-        let version = self.installed_version().await;
+        let version = crate::version::installed_version(
+            self.installed_ahead.as_ref(),
+            self.binary().ok(),
+            &self.path_var,
+            PROGRAM,
+        )
+        .await;
         let pids = self
             .session_writers(manifest.session(), version.as_deref())
             .await?;
@@ -884,7 +941,14 @@ impl ClaudeCode {
         }
         if let Some(writer) = &recorded.writer {
             let cwd = pipeline::fs_path(root);
-            crate::version::refuse_older(PROGRAM, binary, cwd, env, session, writer).await?;
+            crate::version::refuse_older(
+                PROGRAM,
+                (binary, cwd, env),
+                self.guard_ahead.as_ref(),
+                session,
+                writer,
+            )
+            .await?;
         }
         Ok(recorded)
     }
@@ -999,7 +1063,7 @@ impl ClaudeCode {
         let (session, args) = self.args_for(launch, Self::fresh_session, model.as_ref());
         let spawned =
             process::spawn(&binary, &args, pipeline::fs_path(&root), env, launch.into()).await?;
-        info!(%session, pid = %spawned.pid, held = spawned.held, "claude: launched");
+        info!(%session, pid = %spawned.pid, "claude: launched, held until released");
         Ok(Running::new(Some(session), spawned).with_settings(settings))
     }
 }
@@ -1604,6 +1668,7 @@ mod tests {
             TurnReport {
                 session: Some(SessionId::parse(sid).unwrap()),
                 answer: Some("two lines\nof answer".to_owned()),
+                answer_left_out: 0,
                 failure: None,
             }
         );
@@ -1638,7 +1703,6 @@ mod tests {
         }
 
         fn answering(version: &str) -> Self {
-            use std::os::unix::fs::PermissionsExt;
             let dir = tempfile::tempdir().unwrap();
             let home = std::fs::canonicalize(dir.path()).unwrap();
             let work = home.join("work");
@@ -1654,18 +1718,19 @@ mod tests {
             )
             .unwrap();
             let binary = home.join("claude");
-            std::fs::write(
+            crate::fake_tool::write(
                 &binary,
                 format!(
                     "#!/bin/sh\n\
+                     {}\
                      if [ \"$1\" = --version ]; then {version}; exit 0; fi\n\
                      echo '{{\"type\":\"user\"}}' >> '{}'\n\
                      printf '%s\\n' \"$@\" > \"$HOME/ran\"\n",
+                    crate::fake_tool::WARM_GUARD,
                     transcript.display()
-                ),
-            )
-            .unwrap();
-            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+                )
+                .as_bytes(),
+            );
             let adapter = ClaudeCode::new(
                 AbsPath::parse(home.to_str().unwrap()).unwrap(),
                 OsString::new(),
@@ -1767,6 +1832,7 @@ mod tests {
         )
         .unwrap();
         let mut running = fixture.launch().await.unwrap();
+        running.release().unwrap();
         running.child_mut().wait().await.unwrap();
         let ran = fixture.ran().unwrap();
         let model = ran.iter().position(|a| a == "--model").map(|i| &ran[i + 1]);
@@ -1841,6 +1907,7 @@ mod tests {
         )
         .unwrap();
         let mut running = fixture.launch().await.unwrap();
+        running.release().unwrap();
         running.child_mut().wait().await.unwrap();
         let ran = fixture.ran().unwrap();
         let model = ran.iter().position(|a| a == "--model").map(|i| &ran[i + 1]);
@@ -1918,6 +1985,7 @@ mod tests {
             .launch(&long, launch(), &fixture.env)
             .await
             .unwrap();
+        running.release().unwrap();
         running.child_mut().wait().await.unwrap();
         let ran = fixture.ran().unwrap();
         assert!(!ran.iter().any(|a| a == "--model"), "{ran:?}");
@@ -1967,6 +2035,7 @@ mod tests {
             .launch(&long, launch(), &fixture.env)
             .await
             .unwrap();
+        running.release().unwrap();
         running.child_mut().wait().await.unwrap();
         assert_eq!(
             fixture.ran().unwrap(),
@@ -1996,6 +2065,7 @@ mod tests {
             .launch(&long, launch(), &fixture.env)
             .await
             .unwrap();
+        running.release().unwrap();
         running.child_mut().wait().await.unwrap();
         let ran = fixture.ran().unwrap();
         assert!(!ran.iter().any(|a| a == "--model"), "{ran:?}");
@@ -2064,6 +2134,7 @@ mod tests {
             .launch(&long, launch(), &fixture.env)
             .await
             .unwrap();
+        running.release().unwrap();
         running.child_mut().wait().await.unwrap();
         let ran = fixture.ran().unwrap();
         let model = ran.iter().position(|a| a == "--model").map(|i| &ran[i + 1]);
@@ -2095,6 +2166,7 @@ mod tests {
     async fn a_resume_passes_the_model_the_session_ran_with() {
         let fixture = Resume::new("2.1.294 (Claude Code)");
         let mut running = fixture.launch().await.unwrap();
+        running.release().unwrap();
         running.child_mut().wait().await.unwrap();
         assert_eq!(
             fixture.ran().unwrap(),

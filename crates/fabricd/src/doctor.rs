@@ -2,28 +2,31 @@
 //!
 //! Invariant: every row compares strings for equality and never parses a
 //! version into a range, because every coupling the research found was an
-//! exact-string one. A row that refuses stops a move unless the user passes
-//! `--force`, and some refuse even then: a different user or home, because
-//! the root would not exist on the target (ADR 0011), and a target with no
-//! login for the job's harness, or for an ACP job no agent or no
-//! `state_dir` for it, because the harness would fail inside with a worse
-//! message once the target owns the job. The comparison is pure; measuring
-//! is `facts`' job.
+//! exact-string one, except the version row of the job's harness, which
+//! orders versions as the resume guard does. A row that refuses stops a
+//! move unless the user passes `--force`, and some refuse even then: a
+//! different user or home, because the root would not exist on the target
+//! (ADR 0011), and a target with no login for the job's harness, or for an
+//! ACP job no agent or no `state_dir` for it, because the harness would
+//! fail inside with a worse message once the target owns the job. The
+//! comparison is pure; measuring is `facts`' job.
 //!
-//! One row orders versions, and only to word its note and warn: when the
-//! job's harness on the target is older than the source's, or than the
-//! newest known to have written the job's session (`Context::floor`, the
-//! known writer the guard refuses below), the note says so, read through
-//! `fabric_core::version::HarnessVersion`, the parse and the order the resume
-//! guard uses. Both sides are the versions each daemon finds from its own
-//! directory; a version manager's pin in the workspace can pick another,
-//! and the rollout's own `cli_version` is not read here, so the note is a
-//! warning ahead of the guard, not the guard. The outcome stays the
-//! equality refusal that `--force` waives, and a target whose version
-//! matches the source's but is older than the known writer only warns: a
-//! move only copies bytes, and the guard refuses the older harness at
-//! resume, before it can touch the session, whatever the move was told
-//! (gate finding F10).
+//! The version row of the job's harness, Claude's as Codex's, refuses,
+//! and `--force` waives, only a target whose harness is older than the
+//! source's, or than the newest known to have written the job's session
+//! (`Context::floor`, the known writer the guard refuses below), read
+//! through `fabric_core::version::HarnessVersion`, the parse and the order
+//! the resume guard uses (issue #28, gate finding F13). A newer target
+//! warns, since the guard lets a newer harness resume the session, and two
+//! versions that differ where either does not parse refuse as any
+//! difference did, because they cannot be ordered. Both sides are the
+//! versions each daemon finds from its own directory; a version manager's
+//! pin in the workspace can pick another, and the rollout's own
+//! `cli_version` is not read here, so the row is a warning ahead of the
+//! guard, not the guard. A target whose version matches the source's but
+//! is older than the known writer only warns: a move only copies bytes,
+//! and the guard refuses the older harness at resume, before it can touch
+//! the session, whatever the move was told (gate finding F10).
 
 use std::path::Path;
 
@@ -36,6 +39,7 @@ use fabric_env::detect::every_resume;
 use crate::carry::command;
 use crate::facts::{NodeFacts, Probes, Tool, major, name};
 use crate::paths::{SyncedFolders, check_root};
+use fabric_net::wire::{MAX_FACT_VALUE, MAX_FACTS};
 
 /// The clock difference above which mtime-keyed caches are suspect (ADR 0008).
 pub const CLOCK_SKEW_LIMIT_MS: i64 = 5_000;
@@ -161,23 +165,6 @@ fn row(
 /// again does, since leaving it out would lose it (`crate::carry`).
 const PLATFORM_NOTE: &str = "only a path nothing on the target can make again crosses; the carry lines say what happens to each path, ADR 0012";
 
-/// The tools a move or resume preflight measures on this node for a job
-/// under `harness` (issue #26): every row's, but a login only where it
-/// gates the move, which is the target's login for the job's harness. On a
-/// push the target is the peer, which measures its own; `fabric doctor`
-/// measures them all.
-#[must_use]
-pub fn probes(harness: &HarnessKind, target: Target) -> Probes {
-    let rows = Probes::ALL
-        .without(Tool::ClaudeLogin)
-        .without(Tool::CodexLogin);
-    match (target, harness) {
-        (Target::Here, HarnessKind::ClaudeCode) => rows.with(Tool::ClaudeLogin),
-        (Target::Here, HarnessKind::Codex) => rows.with(Tool::CodexLogin),
-        (Target::Here, HarnessKind::Acp { .. }) | (Target::Peer, _) => rows,
-    }
-}
-
 /// Compares this node's facts with a peer's, row by row (ADR 0008, the table).
 #[must_use]
 pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row> {
@@ -263,8 +250,83 @@ pub fn compare(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row
         outcome: Outcome::Equal,
         note: "the wire this session runs on".to_owned(),
     });
+    left_out_rows(&mut rows, peer, ctx.target);
     rows
 }
+
+/// Judges the rows of `compare` that read a fact the peer's answer left
+/// out (`judge_left_out`), and adds a row that says what it left out.
+fn left_out_rows(rows: &mut Vec<Row>, peer: &NodeFacts, target: Target) {
+    judge_left_out(rows, peer, target, |fact| {
+        matches!(
+            fact,
+            name::GIT
+                | name::LSOF
+                | name::CLAUDE_LOGIN
+                | name::CODEX_LOGIN
+                | name::ACP_AGENT
+                | name::ACP_STATE_DIR
+                | SYNCED
+        )
+    });
+    if let Some(left) = peer.get(name::LEFT_OUT) {
+        rows.push(Row {
+            fact: name::LEFT_OUT,
+            here: None,
+            peer: Some(left.to_owned()),
+            outcome: Outcome::Warn,
+            note: format!(
+                "the peer measured more than one answer holds, at most {MAX_FACTS} facts of at most {MAX_FACT_VALUE} bytes each, and left these out; a row that reads one cannot be judged and refuses"
+            ),
+        });
+    }
+}
+
+/// The fact of the row that says whether the target's iCloud Drive syncs the root.
+const SYNCED: &str = "icloud";
+
+/// Turns each row that reads a fact the peer's answer left out into a
+/// refusal that names that cause (M2-26): the row cannot be judged, and
+/// it would otherwise read the fact as one the peer does not have.
+/// `--force` waives it unless the row refuses without a waiver anyway. A
+/// row `judges_target` names reads the target's facts alone, so none of
+/// the peer's when this node is the target.
+fn judge_left_out(
+    rows: &mut [Row],
+    peer: &NodeFacts,
+    target: Target,
+    judges_target: impl Fn(&str) -> bool,
+) {
+    const ICLOUD: &[&str] = &[name::ICLOUD_DESKTOP, name::ICLOUD_DOCUMENTS, name::HOME];
+    if peer.get(name::LEFT_OUT).is_none() {
+        return;
+    }
+    for row in rows {
+        if target == Target::Here && judges_target(row.fact) {
+            continue;
+        }
+        let reads: &[&str] = match row.fact {
+            SYNCED => ICLOUD,
+            "clock" | "network" => &[],
+            _ => std::slice::from_ref(&row.fact),
+        };
+        let Some(fact) = reads.iter().copied().find(|fact| peer.left_out(fact)) else {
+            continue;
+        };
+        if row.outcome != Outcome::Refuse(Waiver::Never) {
+            row.outcome = Outcome::Refuse(Waiver::Force);
+        }
+        row.note = format!(
+            "{fact} is not in the peer's answer, which left out facts it had no room for, at most {MAX_FACTS} facts of at most {MAX_FACT_VALUE} bytes each, so this row cannot be judged; `{}` names what it left out",
+            name::LEFT_OUT
+        );
+    }
+}
+
+/// The login row's note when the target's daemon reported no Claude login
+/// and could not read the login Keychain Claude Code keeps it in (issue
+/// #28, gate finding F12): logging in again would not help.
+const LOCKED_KEYCHAIN: &str = "the target's daemon cannot read the login Keychain, where Claude Code keeps its login, so it sees none; a daemon started over SSH cannot read it, so start `fabric serve` on the target from its desktop session, in Terminal or as a launchd user agent";
 
 fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Row> {
     let mut rows = Vec::new();
@@ -283,37 +345,26 @@ fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Ro
         ),
     ];
     for (program, version, login, used) in pairs {
-        let mut r = row(
-            version,
-            here,
-            peer,
-            if used {
-                Outcome::Refuse(Waiver::Force)
-            } else {
-                Outcome::Warn
-            },
-            if used {
-                "the job's harness must be the same version on both nodes (ADR 0008)"
-            } else {
-                "not the job's harness"
-            },
-        );
-        if !used && r.outcome == Outcome::Warn && ctx.harness.is_some() {
-            r.outcome = Outcome::Equal;
-            r.note.clear();
-        }
-        if used && let Some(note) = older_target(here, peer, version, program, ctx) {
-            if r.outcome == Outcome::Equal {
-                r.outcome = Outcome::Warn;
+        let r = if used {
+            version_row(version, program, here, peer, ctx)
+        } else {
+            let mut r = row(version, here, peer, Outcome::Warn, "not the job's harness");
+            if r.outcome == Outcome::Warn && ctx.harness.is_some() {
+                r.outcome = Outcome::Equal;
+                r.note.clear();
             }
-            r.note = note;
-        }
+            r
+        };
         rows.push(r);
         let target_login = match ctx.target {
             Target::Peer => peer.get(login),
             Target::Here => here.get(login),
         };
         let refused = used && target_login != Some("yes");
+        let target_keychain = match ctx.target {
+            Target::Peer => peer.get(name::CLAUDE_KEYCHAIN),
+            Target::Here => here.get(name::CLAUDE_KEYCHAIN),
+        };
         rows.push(Row {
             fact: login,
             here: value(here, login),
@@ -323,10 +374,14 @@ fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Ro
             } else {
                 Outcome::Equal
             },
-            note: if refused {
-                "the target has no login for the job's harness; log in there first".to_owned()
-            } else {
+            note: if !refused {
                 String::new()
+            } else if login == name::CLAUDE_LOGIN
+                && target_keychain == Some(crate::facts::KEYCHAIN_LOCKED)
+            {
+                LOCKED_KEYCHAIN.to_owned()
+            } else {
+                "the target has no login for the job's harness; log in there first".to_owned()
             },
         });
     }
@@ -336,68 +391,112 @@ fn harness_rows(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Vec<Ro
     rows
 }
 
-/// The note for a target whose `fact`, read as `--version` output, is
-/// older than the newest known to have written the session
-/// (`Context::floor`) when that is above the source's, naming it, or else
-/// older than the source's; `None` when it is neither, or when the
-/// target's does not parse.
-fn older_target(
+/// The row of `fact`, the `--version` output of `program`, the job's
+/// harness, ordered as the resume guard orders versions (ADR 0006,
+/// issue #28 F13). It refuses, and `--force` waives, a target older than
+/// the source, or older than the newest version known to have written the
+/// session (`Context::floor`) when that is above the source's, naming it.
+/// It warns for a newer target, which the guard lets resume the session,
+/// and for a target on the source's own version below that floor, which
+/// the guard refuses at resume (F10). Two texts that differ and do not
+/// both parse cannot be ordered, so they refuse as any difference did.
+fn version_row(
+    fact: &'static str,
+    program: &str,
     here: &NodeFacts,
     peer: &NodeFacts,
-    fact: &str,
-    program: &str,
     ctx: &Context<'_>,
-) -> Option<String> {
+) -> Row {
     let read = |facts: &NodeFacts| {
         facts
             .get(fact)
             .and_then(|text| HarnessVersion::from_output(text).ok())
     };
     let (source, target) = match ctx.target {
-        Target::Peer => (read(here), read(peer)?),
-        Target::Here => (read(peer), read(here)?),
+        Target::Peer => (read(here), read(peer)),
+        Target::Here => (read(peer), read(here)),
     };
+    let same = here.get(fact) == peer.get(fact);
     let floor = ctx
         .floor
         .filter(|floor| source.as_ref().is_none_or(|source| *floor > source));
-    match floor {
-        Some(floor) if target < *floor => Some(format!(
-            "the target's {program} is older than {program} {floor}, the newest known to have written the session; a resume there refuses it, so update {program} there first (ADR 0006)"
-        )),
-        _ if source.is_some_and(|source| target < source) => Some(format!(
-            "the target's {program} is older; a resume there refuses a session a newer {program} wrote, so update {program} there first (ADR 0006)"
-        )),
-        _ => None,
+    let below_floor = target
+        .as_ref()
+        .and_then(|target| floor.filter(|floor| target < *floor));
+    let (outcome, note) = if let Some(floor) = below_floor {
+        (
+            if same {
+                Outcome::Warn
+            } else {
+                Outcome::Refuse(Waiver::Force)
+            },
+            format!(
+                "the target's {program} is older than {program} {floor}, the newest known to have written the session; a resume there refuses it, so update {program} there first (ADR 0006)"
+            ),
+        )
+    } else if same {
+        (Outcome::Equal, String::new())
+    } else if let (Some(source), Some(target)) = (source, target) {
+        match target.cmp(&source) {
+            std::cmp::Ordering::Less => (
+                Outcome::Refuse(Waiver::Force),
+                format!(
+                    "the target's {program} is older; a resume there refuses a session a newer {program} wrote, so update {program} there first (ADR 0006)"
+                ),
+            ),
+            std::cmp::Ordering::Equal => (Outcome::Equal, String::new()),
+            std::cmp::Ordering::Greater => (
+                Outcome::Warn,
+                format!(
+                    "the target's {program} is newer, which a resume there accepts; once it writes the session, a node with an older {program} refuses it until updated (ADR 0006)"
+                ),
+            ),
+        }
+    } else {
+        (
+            Outcome::Refuse(Waiver::Force),
+            format!(
+                "a side reports no {program} version the resume guard reads, so the row cannot tell which is older and wants the same version on both nodes (ADR 0008)"
+            ),
+        )
+    };
+    Row {
+        fact,
+        here: value(here, fact),
+        peer: value(peer, fact),
+        outcome,
+        note,
     }
 }
 
 /// The rows for an ACP job: the target must find the agent and give it a
 /// `state_dir`, or the job would be owned by a node that cannot launch it,
-/// restore its session or capture it. Only the target of a pull measures
-/// them; a peer does not report its agents, so a push can only warn.
+/// restore its session or capture it. The target measures them: this
+/// node for a pull, and the peer for a push, whose question for its facts
+/// names the job's harness (issue #16). A fact the target did not report
+/// refuses as one it does not have.
 fn acp_rows(program: &str, here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> [Row; 2] {
+    let (target, whose, there) = match ctx.target {
+        Target::Peer => (peer, "the target's", "there"),
+        Target::Here => (here, "this node's", "here"),
+    };
     let missing = [
         (
             name::ACP_AGENT,
-            format!("this node's PATH has no {program}, so the job could not launch here"),
+            format!("{whose} PATH has no {program}, so the job could not launch {there}"),
         ),
         (
             name::ACP_STATE_DIR,
             format!(
-                "harness.toml here gives {program} no state_dir capture and restore accept (none, one outside the home or under ~/.fabric, or one reached through a link), so its session could not be restored or captured here"
+                "harness.toml {there} gives {program} no state_dir capture and restore accept (none, one outside the home or under ~/.fabric, or one reached through a link), so its session could not be restored or captured {there}"
             ),
         ),
     ];
     missing.map(|(fact, absent)| {
-        let (outcome, note) = match ctx.target {
-            Target::Here if here.get(fact).is_some() => (Outcome::Equal, String::new()),
-            Target::Here => (Outcome::Refuse(Waiver::Never), absent),
-            Target::Peer => (
-                Outcome::Warn,
-                format!(
-                    "a peer does not report its ACP agents, so whether it has {program} and a state_dir for it is not checked"
-                ),
-            ),
+        let (outcome, note) = if target.get(fact).is_some() {
+            (Outcome::Equal, String::new())
+        } else {
+            (Outcome::Refuse(Waiver::Never), absent)
         };
         Row {
             fact,
@@ -487,7 +586,7 @@ fn synced_row(here: &NodeFacts, peer: &NodeFacts, ctx: &Context<'_>) -> Row {
         _ => None,
     };
     Row {
-        fact: "icloud",
+        fact: SYNCED,
         here: show(here),
         peer: show(peer),
         outcome: if refusal.is_some() {
@@ -514,6 +613,26 @@ fn clock_row(ctx: &Context<'_>) -> Row {
             String::new()
         },
     }
+}
+
+/// The tools whose facts `setup_rows` reads for `spec`: the program of
+/// each step it runs on every resume.
+#[must_use]
+pub fn setup_probes(spec: &EnvSpec) -> Probes {
+    every_resume(spec)
+        .into_iter()
+        .fold(Probes::NONE, |probes, step| {
+            probes.union(Probes::for_program(step.program.as_str()))
+        })
+}
+
+/// Keeps the rows whose fact a tool of `measured` gives, or no tool does:
+/// a preflight measures only the tools its job reads (`ops::preflight_probes`),
+/// and a row of a tool measured on neither node says nothing about the job.
+#[must_use]
+pub fn measured_rows(mut rows: Vec<Row>, measured: Probes) -> Vec<Row> {
+    rows.retain(|row| Tool::of_fact(row.fact).is_none_or(|tool| measured.contains(tool)));
+    rows
 }
 
 /// The rows for the setup steps of the job's spec that run on every
@@ -563,6 +682,7 @@ pub fn setup_rows(spec: &EnvSpec, here: &NodeFacts, peer: &NodeFacts, target: Ta
             note,
         });
     }
+    judge_left_out(&mut rows, peer, target, |_| true);
     rows
 }
 
@@ -746,6 +866,60 @@ mod tests {
         }
     }
 
+    /// M2-26: a peer whose facts did not fit one answer sent none, so a
+    /// move refused as if the peer had no user, no git and no login. Its
+    /// answer now keeps what the rows read and names what it left out: a
+    /// row that would read a fact left out refuses for that reason, with
+    /// the waiver it has (none for the home), and a row that reads only
+    /// this node, as the target of a pull, is judged as before. A row
+    /// says what the answer left out.
+    #[test]
+    fn a_peer_answer_that_left_facts_out_names_that_cause() {
+        use fabric_net::wire::{MAX_FACT_VALUE, MAX_FACTS};
+
+        let claude = HarnessKind::ClaudeCode;
+        let extra: Vec<(String, String)> = (0..MAX_FACTS)
+            .map(|n| (format!("extra.{n:02}"), "x".to_owned()))
+            .collect();
+        let mut many: BTreeMapPairs = pro()
+            .iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        many.extend(extra);
+        let many = NodeFacts::from_pairs(many.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        let theirs = NodeFacts::from_wire(&many.to_wire());
+        let rows = compare(&pro(), &theirs, &ctx(Some(&claude)));
+        assert!(
+            blocking(&rows, false).is_empty(),
+            "{:?}",
+            blocking(&rows, false)
+        );
+        assert_eq!(outcome_of(&rows, "facts.left_out"), Outcome::Warn);
+
+        let long = "/h".repeat(MAX_FACT_VALUE);
+        let peer = with(
+            &pro(),
+            &[(name::HOME, Some(&long)), (name::GIT, Some(&long))],
+        );
+        let theirs = NodeFacts::from_wire(&peer.to_wire());
+        let rows = compare(&pro(), &theirs, &ctx(Some(&claude)));
+        let home = rows.iter().find(|r| r.fact == name::HOME).unwrap();
+        assert_eq!(home.outcome, Outcome::Refuse(Waiver::Never));
+        assert!(home.note.contains("left out"), "{}", home.note);
+        let git = rows.iter().find(|r| r.fact == name::GIT).unwrap();
+        assert!(git.note.contains("left out"), "{}", git.note);
+        let pull = Context {
+            target: Target::Here,
+            ..ctx(Some(&claude))
+        };
+        let rows = compare(&pro(), &theirs, &pull);
+        assert_eq!(outcome_of(&rows, name::GIT), Outcome::Equal);
+        assert_eq!(
+            outcome_of(&rows, name::HOME),
+            Outcome::Refuse(Waiver::Never)
+        );
+    }
+
     #[test]
     fn force_waives_every_refusal_but_the_home_and_the_login() {
         let claude = HarnessKind::ClaudeCode;
@@ -783,9 +957,11 @@ mod tests {
         let mut pull = ctx(Some(&codex));
         pull.target = Target::Here;
         let pulled = row_of(compare(&pro(), &older, &pull));
-        assert_eq!(
-            pulled.note,
-            "the job's harness must be the same version on both nodes (ADR 0008)"
+        assert_eq!(pulled.outcome, Outcome::Warn);
+        assert!(
+            pulled.note.starts_with("the target's codex is newer"),
+            "{}",
+            pulled.note
         );
         let pulled_onto_older = row_of(compare(&older, &pro(), &pull));
         assert_eq!(pulled_onto_older.outcome, Outcome::Refuse(Waiver::Force));
@@ -854,10 +1030,77 @@ mod tests {
         assert_eq!(same.outcome, Outcome::Warn);
         assert!(same.note.starts_with(older_than_floor), "{}", same.note);
         let at_floor = row("codex-cli 0.160.0");
-        assert_eq!(
-            at_floor.note,
-            "the job's harness must be the same version on both nodes (ADR 0008)"
+        assert_eq!(at_floor.outcome, Outcome::Warn);
+        assert!(
+            at_floor.note.starts_with("the target's codex is newer"),
+            "{}",
+            at_floor.note
         );
+    }
+
+    /// Gate finding F13 (issue #28): the Claude row refused a target with
+    /// a newer Claude, which the resume guard lets resume the session,
+    /// while the two Macs of the gate ran different releases. The job's
+    /// harness row refuses only an older target, ordered as the guard
+    /// orders versions, for Claude as for Codex and for a push as for a
+    /// pull, and a newer target only warns, so no `--force` is needed.
+    /// Versions that differ and cannot be ordered still refuse.
+    #[test]
+    fn only_an_older_harness_on_the_target_is_refused() {
+        let cases = [
+            (
+                HarnessKind::ClaudeCode,
+                name::CLAUDE,
+                "2.1.294 (Claude Code)",
+                "2.1.300 (Claude Code)",
+            ),
+            (
+                HarnessKind::Codex,
+                name::CODEX,
+                "codex-cli 0.155.1",
+                "codex-cli 0.160.0",
+            ),
+        ];
+        for (harness, fact, older, newer) in &cases {
+            let older = with(&pro(), &[(fact, Some(older))]);
+            let newer = with(&pro(), &[(fact, Some(newer))]);
+            let unreadable = with(&pro(), &[(fact, Some("a build of today"))]);
+            for target in [Target::Peer, Target::Here] {
+                let context = Context {
+                    target,
+                    ..ctx(Some(harness))
+                };
+                // `onto` is the target of the move, `from` the node it leaves.
+                let compared = |onto: &NodeFacts, from: &NodeFacts| {
+                    let rows = match target {
+                        Target::Peer => compare(from, onto, &context),
+                        Target::Here => compare(onto, from, &context),
+                    };
+                    let row = rows.iter().find(|r| r.fact == *fact).unwrap().clone();
+                    (row.outcome, blocking(&rows, false).is_empty())
+                };
+                assert_eq!(
+                    compared(&newer, &older),
+                    (Outcome::Warn, true),
+                    "{harness} {target:?} onto a newer one"
+                );
+                assert_eq!(
+                    compared(&older, &newer),
+                    (Outcome::Refuse(Waiver::Force), false),
+                    "{harness} {target:?} onto an older one"
+                );
+                assert_eq!(
+                    compared(&newer, &newer),
+                    (Outcome::Equal, true),
+                    "{harness} {target:?} onto the same one"
+                );
+                assert_eq!(
+                    compared(&unreadable, &older),
+                    (Outcome::Refuse(Waiver::Force), false),
+                    "{harness} {target:?} onto one that does not parse"
+                );
+            }
+        }
     }
 
     #[test]
@@ -989,11 +1232,111 @@ mod tests {
         }
     }
 
-    /// A preflight measures here every fact its rows read but a login,
-    /// which it measures only where the login gates the move: on this
-    /// node as the target, for the job's harness (issue #26). Every row
-    /// then has the outcome it has with every fact measured, a target's
-    /// missing login included.
+    /// Gate finding F12: Claude Code keeps its login in the login
+    /// Keychain, which a daemon started over SSH cannot read, so the
+    /// target reported no login and the row said to log in there, which
+    /// would not help. When the target measured its Keychain locked, the
+    /// row still refuses with no waiver, and says why and what to do, for
+    /// a push as for a pull.
+    #[test]
+    fn a_target_whose_daemon_cannot_read_the_keychain_says_so() {
+        let claude = HarnessKind::ClaudeCode;
+        for target in [Target::Peer, Target::Here] {
+            let note = |keychain: Option<&str>| {
+                let onto = with(
+                    &pro(),
+                    &[
+                        (name::CLAUDE_LOGIN, Some("no")),
+                        (name::CLAUDE_KEYCHAIN, keychain),
+                    ],
+                );
+                let context = Context {
+                    target,
+                    ..ctx(Some(&claude))
+                };
+                let rows = match target {
+                    Target::Peer => compare(&pro(), &onto, &context),
+                    Target::Here => compare(&onto, &pro(), &context),
+                };
+                let row = rows.iter().find(|r| r.fact == name::CLAUDE_LOGIN).unwrap();
+                assert_eq!(
+                    row.outcome,
+                    Outcome::Refuse(Waiver::Never),
+                    "{target:?} {keychain:?}"
+                );
+                row.note.clone()
+            };
+            assert_eq!(note(Some("locked")), LOCKED_KEYCHAIN, "{target:?}");
+            for keychain in [None, Some("readable")] {
+                assert_eq!(
+                    note(keychain),
+                    "the target has no login for the job's harness; log in there first",
+                    "{target:?} {keychain:?}"
+                );
+            }
+        }
+    }
+
+    /// Issue #16: a push judges the target, the peer, by the ACP facts it
+    /// measured for the job's agent, as a pull judges this node, and
+    /// `--force` waives neither. A fact the peer did not report, as one
+    /// that kept the default `facts_for` leaves out, refuses.
+    #[test]
+    fn a_push_refuses_a_target_without_the_acp_agent_or_its_state_dir() {
+        let acp = HarnessKind::Acp {
+            program: fabric_core::harness::ProgramName::parse("agent").unwrap(),
+            args: Vec::new(),
+        };
+        let agent = [
+            (name::ACP_AGENT, Some("/usr/local/bin/agent")),
+            (name::ACP_STATE_DIR, Some(".agent")),
+        ];
+        let has = with(&pro(), &agent);
+        for target in [Target::Peer, Target::Here] {
+            let context = Context {
+                target,
+                ..ctx(Some(&acp))
+            };
+            // `onto` is the target of the move, `from` the node it leaves.
+            let outcomes = |onto: &NodeFacts, from: &NodeFacts| -> Vec<(&str, Outcome)> {
+                let rows = match target {
+                    Target::Peer => compare(from, onto, &context),
+                    Target::Here => compare(onto, from, &context),
+                };
+                rows.iter()
+                    .filter(|row| row.fact.starts_with("acp."))
+                    .map(|row| (row.fact, row.outcome))
+                    .collect()
+            };
+            assert_eq!(
+                outcomes(&has, &pro()),
+                [
+                    (name::ACP_AGENT, Outcome::Equal),
+                    (name::ACP_STATE_DIR, Outcome::Equal)
+                ],
+                "{target:?}"
+            );
+            assert_eq!(
+                outcomes(&pro(), &has),
+                [
+                    (name::ACP_AGENT, Outcome::Refuse(Waiver::Never)),
+                    (name::ACP_STATE_DIR, Outcome::Refuse(Waiver::Never))
+                ],
+                "{target:?}"
+            );
+            let no_dir = with(&has, &[(name::ACP_STATE_DIR, None)]);
+            assert_eq!(
+                outcomes(&no_dir, &has)[1],
+                (name::ACP_STATE_DIR, Outcome::Refuse(Waiver::Never)),
+                "{target:?}"
+            );
+        }
+    }
+
+    /// A preflight measures a login only where it gates the move: on the
+    /// target, for the job's harness, never for an ACP job (issue #26), and
+    /// the target's missing login still refuses it with the rows reduced
+    /// to the tools it measured (`measured_rows`).
     #[test]
     fn a_preflight_measures_a_login_only_where_it_gates_the_move() {
         use crate::facts::Tool;
@@ -1012,33 +1355,53 @@ mod tests {
         ];
         for (harness, login, fact) in &logins {
             for target in [Target::Peer, Target::Here] {
-                let probes = probes(harness, target);
-                let measured: Vec<Tool> = [Tool::ClaudeLogin, Tool::CodexLogin]
-                    .into_iter()
-                    .filter(|tool| probes.contains(*tool))
-                    .collect();
-                let gates = target == Target::Here && !matches!(harness, HarnessKind::Acp { .. });
+                let (here, peer) =
+                    crate::ops::preflight_probes(harness, target, false, Probes::NONE);
+                let logins_of = |probes: Probes| -> Vec<Tool> {
+                    [Tool::ClaudeLogin, Tool::CodexLogin]
+                        .into_iter()
+                        .filter(|tool| probes.contains(*tool))
+                        .collect()
+                };
+                let gates = !matches!(harness, HarnessKind::Acp { .. });
+                let expect = |on_target: bool| {
+                    if gates && on_target {
+                        vec![*login]
+                    } else {
+                        vec![]
+                    }
+                };
                 assert_eq!(
-                    measured,
-                    if gates { vec![*login] } else { vec![] },
+                    logins_of(here),
+                    expect(target == Target::Here),
                     "{harness} {target:?}"
                 );
-                for here_login in ["yes", "no"] {
-                    let here = with(&pro(), &[(fact, Some(here_login))]);
+                assert_eq!(
+                    logins_of(peer),
+                    expect(target == Target::Peer),
+                    "{harness} {target:?}"
+                );
+                for target_login in ["yes", "no"] {
+                    let (mine, theirs) = match target {
+                        Target::Here => (with(&pro(), &[(fact, Some(target_login))]), pro()),
+                        Target::Peer => (pro(), with(&pro(), &[(fact, Some(target_login))])),
+                    };
                     let ctx = Context {
                         target,
                         ..ctx(Some(harness))
                     };
-                    let outcomes = |here: &NodeFacts| -> Vec<(&str, Outcome)> {
-                        compare(here, &pro(), &ctx)
-                            .iter()
-                            .map(|row| (row.fact, row.outcome))
-                            .collect()
+                    let refused = |rows: &[Row]| -> Vec<&str> {
+                        blocking(rows, false).iter().map(|row| row.fact).collect()
                     };
+                    let every = compare(&mine, &theirs, &ctx);
+                    let measured = measured_rows(
+                        compare(&mine.only(here), &theirs.only(peer), &ctx),
+                        here.union(peer),
+                    );
                     assert_eq!(
-                        outcomes(&here.only(probes)),
-                        outcomes(&here),
-                        "{harness} {target:?} {here_login}"
+                        refused(&measured),
+                        refused(&every),
+                        "{harness} {target:?} {target_login}"
                     );
                 }
             }
@@ -1048,8 +1411,9 @@ mod tests {
     /// A pull checks the programs of the steps its job runs on every
     /// resume with the facts its preflight measured here, so those facts
     /// must hold every program a setup step can name, cargo by its own
-    /// fact. A program left out would read as missing and refuse a pull
-    /// to a node that has it (issue #26).
+    /// fact: the preflight measures `setup_probes` of the job's spec. A
+    /// program left out would read as missing and refuse a pull to a node
+    /// that has it (issue #26).
     #[test]
     fn a_pull_preflight_measures_every_program_a_setup_row_reads() {
         use fabric_core::env::{RunWhen, SetupStep};
@@ -1096,7 +1460,8 @@ mod tests {
             "{all:?}"
         );
         for harness in [HarnessKind::ClaudeCode, HarnessKind::Codex] {
-            let probes = probes(&harness, Target::Here);
+            let (probes, _) =
+                crate::ops::preflight_probes(&harness, Target::Here, false, setup_probes(&spec));
             assert_eq!(outcomes(&here.only(probes)), all, "{harness}");
         }
     }

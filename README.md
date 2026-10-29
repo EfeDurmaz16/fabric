@@ -1,6 +1,6 @@
 # Fabric
 
-Fabric moves a coding-agent job from one machine to another and lets you pick it up where it stopped. The workspace goes with it: staged and unstaged changes, untracked files, dependency caches and build output. So does the agent's session, so Claude Code or Codex continues the same conversation on the other machine. Secrets stay behind.
+Fabric moves a coding-agent job from one machine to another and lets you pick it up where it stopped. The workspace goes with it: staged and unstaged changes, untracked files, dependency caches and build output. So does the agent's session, so Claude Code or Codex continues the same conversation on the other machine. Untracked secret-shaped files such as `.env` stay behind. A secret that is tracked or stashed in git is already in the repository's history, so it travels with the git state, and suspend names it instead of refusing. The session is redacted by pattern, which removes common key shapes, not every secret.
 
 The idea underneath is that the job, not the machine, is the unit of development work. Where a job's state is stored, which machine runs it, which toolchain it needs and which agent drives it are separate questions, and Fabric keeps them separate, so a job started under Claude Code on one machine can be suspended, resumed on another machine with its dependencies, and continued by a different agent.
 
@@ -51,7 +51,7 @@ sequenceDiagram
 
 - **One live copy.** Every job has an append-only, hash-chained ledger. A move is a short protocol over that ledger, so at most one machine can run the job at a time, even when a machine is killed in the middle of a move.
 - **Content-addressed snapshots.** The workspace is stored as blake3 chunks in a local store with a SQLite catalog. A move sends only the chunks the other machine lacks. Git state goes as a bundle plus the index and the working tree.
-- **Carry or rebuild.** Dependency caches and build output travel when the other machine can use them, and are made again there by their setup step or the next build when it cannot. Secret-shaped files never leave the machine.
+- **Carry or rebuild.** Dependency caches and build output travel when the other machine can use them, and are made again there by their setup step or the next build when it cannot. Untracked secret-shaped files stay on the machine; tracked and stashed ones travel inside the git state and are named, not hidden (ADR 0014).
 - **Harness adapters.** Claude Code, Codex and any Agent Client Protocol agent. Each adapter captures the agent's session files and restores them on the other machine.
 - **Pinned peers.** Machines pair by ed25519 node id and talk over QUIC with TLS pinned to that id, or TCP with TLS when UDP is blocked. No central server.
 - **Client API.** A versioned JSON API on the node's local socket, with a Rust client crate and a TypeScript SDK checked against the same message fixtures.
@@ -73,6 +73,8 @@ Start a node on each Mac and leave it running (a terminal tab is enough):
 ```sh
 fabric serve            # listens on 0.0.0.0:7777; --wire tcp-tls if UDP is blocked
 ```
+
+Start `fabric serve` from the Mac's desktop session: a Terminal window there, or a launchd user agent. A daemon started over SSH cannot read the Claude Code login in the Keychain, so it reports no login, and `fabric doctor` says so.
 
 Pair them. Each prints its id with `fabric node id`.
 
@@ -131,7 +133,7 @@ A resume continues with the settings the session ran with, not the ones the othe
 - No phone or cloud client, and no third node.
 - Same user and home on both nodes; nothing rewrites paths (ADR 0011).
 - `fabric job init`, which adopts a checkout in place, is not built; `job new` clones the repository into `~/fabric/jobs/<id>/work`.
-- No `fabric orphan export` and no fork rule: an orphan workspace is reported and left in place, or moved to `orphan/<epoch>` beside the root when the job comes back and a restore needs the root, never deleted, and a node whose ledger forked after a steal freezes the job, stops its harness and says in `fabric job status` which node to continue on.
+- A node whose ledger forked after a steal freezes the job, stops its harness and says in `fabric job status` which node to continue on; `fabric job repair <job>` then applies the fork rule (ADR 0003): the losing node takes the winning chain and keeps its own ledger and snapshots, and the winning node repairs after it. An orphan workspace is reported and left in place, or moved to `orphan/<epoch>` beside the root when the job comes back and a restore needs the root, never deleted; `fabric job export <job> [--path <dir>]` keeps its work as a pinned snapshot that is not the job's head.
 - The node must run: every job command talks to it, and it supervises the harnesses it launched.
 - A network change can cut the two Macs apart (gate finding F3). The Pro moved from one subnet to another between two days of the gate and could no longer reach the Air's address. The side that dials must be the side that can reach the other: pair with an address it reaches today, and run `fabric node add` again with the new address when it changes. Nothing finds a peer that moved. Tailscale as an optional underlay, so the address stays the same across networks, is a follow-up.
 

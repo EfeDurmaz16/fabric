@@ -1,0 +1,108 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.25s
+     Running unittests src/lib.rs (target/debug/deps/fabric-8f749fe0e2608da4)
+0 tests, 0 benchmarks
+     Running unittests src/main.rs (target/debug/deps/fabric-8c8382a9cbf8ba9d)
+0 tests, 0 benchmarks
+     Running tests/e2e/main.rs (target/debug/deps/e2e-7c0e2420d7bfe833)
+bench::m2_paths: test
+budget::hot_paths: test
+legacy::e2e_make_legacy_fixture: test
+
+3 tests, 0 benchmarks
+     Running unittests src/lib.rs (target/debug/deps/fabric_client-fff4ce18e6caba51)
+0 tests, 0 benchmarks
+     Running tests/client.rs (target/debug/deps/client-d2bd4e556ee7794e)
+0 tests, 0 benchmarks
+     Running tests/contract.rs (target/debug/deps/contract-9df005e42abaab2d)
+0 tests, 0 benchmarks
+     Running tests/null_fields.rs (target/debug/deps/null_fields-8489f4b7373f534d)
+0 tests, 0 benchmarks
+     Running tests/relative_socket.rs (target/debug/deps/relative_socket-2db9e79e779707a4)
+0 tests, 0 benchmarks
+     Running unittests src/lib.rs (target/debug/deps/fabric_core-76553c5ae53c3a49)
+0 tests, 0 benchmarks
+     Running tests/env_codec.rs (target/debug/deps/env_codec-2f71227609f9c9d2)
+0 tests, 0 benchmarks
+     Running tests/managed_rules.rs (target/debug/deps/managed_rules-433403eb8b3dd5be)
+0 tests, 0 benchmarks
+     Running tests/manifest_codec.rs (target/debug/deps/manifest_codec-705e4b675aa3285a)
+0 tests, 0 benchmarks
+     Running tests/move_protocol.rs (target/debug/deps/move_protocol-18f7a82628be9772)
+0 tests, 0 benchmarks
+     Running tests/record_codec.rs (target/debug/deps/record_codec-bbac03664433ebbf)
+0 tests, 0 benchmarks
+     Running tests/secret_staging.rs (target/debug/deps/secret_staging-04589710c84a1ae7)
+0 tests, 0 benchmarks
+     Running unittests src/lib.rs (target/debug/deps/fabric_env-359739e3cae48e2c)
+0 tests, 0 benchmarks
+     Running tests/crash.rs (target/debug/deps/crash-e70b1566c8025ae0)
+0 tests, 0 benchmarks
+     Running tests/detect.rs (target/debug/deps/detect-d3452e288497e33b)
+0 tests, 0 benchmarks
+     Running tests/freshness.rs (target/debug/deps/freshness-d14c0afc94b2e996)
+0 tests, 0 benchmarks
+     Running tests/inherited_env.rs (target/debug/deps/inherited_env-01d72ce70beff74e)
+0 tests, 0 benchmarks
+     Running tests/materialize.rs (target/debug/deps/materialize-bd9af83ff5fa87ce)
+0 tests, 0 benchmarks
+     Running tests/step_output.rs (target/debug/deps/step_output-dc7757e7a8b5be27)
+0 tests, 0 benchmarks
+     Running unittests src/lib.rs (target/debug/deps/fabric_harness-bb7d715d4de0ec11)
+0 tests, 0 benchmarks
+     Running tests/acp_roundtrip.rs (target/debug/deps/acp_roundtrip-08188c5afc1b5523)
+0 tests, 0 benchmarks
+     Running tests/claude_roundtrip.rs (target/debug/deps/claude_roundtrip-53c29cc7fd546c12)
+0 tests, 0 benchmarks
+     Running tests/codex_roundtrip.rs (target/debug/deps/codex_roundtrip-bca1eada8ba67bea)
+0 tests, 0 benchmarks
+     Running tests/crash.rs (target/debug/deps/crash-43d3ed31e053392e)
+0 tests, 0 benchmarks
+     Running unittests src/lib.rs (target/debug/deps/fabric_journal-6d1b85b77dbad6bf)
+0 tests, 0 benchmarks
+     Running tests/fixtures.rs (target/debug/deps/fixtures-13c4a823ad9afa3a)
+make_v1_fixture: test
+
+1 test, 0 benchmarks
+     Running unittests src/lib.rs (target/debug/deps/fabric_net-3950533dc37d3081)
+0 tests, 0 benchmarks
+     Running tests/loopback.rs (target/debug/deps/loopback-38628f73fef9fd6e)
+0 tests, 0 benchmarks
+     Running unittests src/lib.rs (target/debug/deps/fabric_store-8acb7d58dcb7ffce)
+0 tests, 0 benchmarks
+     Running tests/bench.rs (target/debug/deps/bench-1665f34f7075fa87)
+capture_and_restore_timings: test
+
+1 test, 0 benchmarks
+     Running tests/objects.rs (target/debug/deps/objects-abbbfbfddace6d24)
+0 tests, 0 benchmarks
+     Running tests/policy.rs (target/debug/deps/policy-756e96bc401e975b)
+0 tests, 0 benchmarks
+     Running tests/store.rs (target/debug/deps/store-9e16d8b17a9502c1)
+0 tests, 0 benchmarks
+     Running tests/workspace.rs (target/debug/deps/workspace-6594dc037d191596)
+0 tests, 0 benchmarks
+     Running unittests src/lib.rs (target/debug/deps/fabricd-867c5f4b5bb48c4f)
+ledger_file::tests::child_appends_until_killed: test
+
+1 test, 0 benchmarks
+   Doc-tests fabric
+0 tests, 0 benchmarks
+   Doc-tests fabric_client
+0 tests, 0 benchmarks
+all doctests ran in 0.64s; merged doctests compilation took 0.36s
+   Doc-tests fabric_core
+0 tests, 0 benchmarks
+all doctests ran in 0.64s; merged doctests compilation took 0.36s
+   Doc-tests fabric_env
+0 tests, 0 benchmarks
+   Doc-tests fabric_harness
+0 tests, 0 benchmarks
+0 tests, 0 benchmarks
+   Doc-tests fabric_journal
+0 tests, 0 benchmarks
+   Doc-tests fabric_net
+0 tests, 0 benchmarks
+   Doc-tests fabric_store
+0 tests, 0 benchmarks
+   Doc-tests fabricd
+0 tests, 0 benchmarks

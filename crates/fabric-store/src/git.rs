@@ -22,7 +22,7 @@ use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::thread;
 
 use fabric_core::git::GitNameError;
@@ -182,17 +182,18 @@ impl Git {
         self
     }
 
+    /// The git this runner starts (`program`).
+    fn program(&self) -> Result<PathBuf, GitError> {
+        program(std::env::var_os("PATH").as_deref(), &self.repo).ok_or_else(|| GitError::Spawn {
+            source: io::Error::new(
+                io::ErrorKind::NotFound,
+                "no git in an absolute PATH directory outside the repository",
+            ),
+        })
+    }
+
     fn command(&self) -> Result<Command, GitError> {
-        let program =
-            program(std::env::var_os("PATH").as_deref(), &self.repo).ok_or_else(|| {
-                GitError::Spawn {
-                    source: io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "no git in an absolute PATH directory outside the repository",
-                    ),
-                }
-            })?;
-        let mut cmd = Command::new(program);
+        let mut cmd = Command::new(self.program()?);
         for flag in CONFIG_FLAGS {
             cmd.arg("-c").arg(flag);
         }
@@ -309,6 +310,34 @@ impl Git {
         Self::checked(args, output)
     }
 
+    /// Runs `commands` as one `update-ref --no-deref --stdin` transaction,
+    /// where they may hold `symref-update`, which git 2.46 added; returns
+    /// false, with no ref changed, when this git does not know that
+    /// command.
+    ///
+    /// git before 2.46 dies at the first line it does not know, before it
+    /// commits the transaction, so the caller can set the same refs another
+    /// way. Such a git is remembered by its path for the life of the
+    /// process and not asked again.
+    pub fn update_refs_with_symrefs(&self, commands: &[u8]) -> Result<bool, GitError> {
+        static REFUSED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+        let program = self.program()?;
+        let refused = || REFUSED.lock().unwrap_or_else(PoisonError::into_inner);
+        if refused().contains(&program) {
+            return Ok(false);
+        }
+        match self.run_stdin_env(&["update-ref", "--no-deref", "--stdin"], &[], commands) {
+            Ok(_) => Ok(true),
+            Err(GitError::Failed { stderr, .. })
+                if stderr.contains("unknown command: symref-update") =>
+            {
+                refused().push(program);
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Starts git with stdin and stdout piped, for streaming commands such as `cat-file --batch`.
     pub fn spawn_piped(&self, args: &[&str]) -> Result<Child, GitError> {
         let mut cmd = self.command()?;
@@ -317,17 +346,6 @@ impl Git {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         cmd.spawn().map_err(|source| GitError::Spawn { source })
-    }
-
-    /// Resolves a path inside the git directory, absolute, through `rev-parse --git-path`.
-    pub fn git_path(&self, name: &str) -> Result<PathBuf, GitError> {
-        let text = self.run_text(&["rev-parse", "--git-path", name])?;
-        let path = PathBuf::from(text);
-        Ok(if path.is_absolute() {
-            path
-        } else {
-            self.repo.join(path)
-        })
     }
 
     /// Splits NUL-terminated output into records.

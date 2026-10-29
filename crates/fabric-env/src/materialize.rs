@@ -29,10 +29,12 @@
 //! lifecycle scripts run, so a `postinstall` that fails or is interrupted
 //! leaves it over a tree that is not whole. The sentinel holds the digest
 //! of the files at the root that the steps read, such as `package.json`
-//! and the lockfile, and proves the cache only while they are unchanged:
-//! a lockfile edited since the install, or a cache carried from before
-//! the edit, is stale and filled again, though the spec, which holds the
-//! commands and not the files, is the same. A cache no step fills needs
+//! and the lockfile, and the digest of the steps that fill the cache, and
+//! proves the cache only while both are unchanged: a lockfile edited since
+//! the install, or a cache carried from before the edit, is stale and
+//! filled again, though the spec, which holds the commands and not the
+//! files, is the same; and so is a cache filled by other arguments or
+//! other steps than the ones that would fill it now. A cache no step fills needs
 //! only to be non-empty. An install that fails or is killed halfway
 //! leaves no proof, so the next plan fills the cache again. A report with
 //! no cache paths has nothing that proves warmth, so its `CachesMissing`
@@ -117,8 +119,9 @@ use crate::detect::{CachePath, Completion, Detection, StepGate};
 /// It is removed before the first of those steps starts and written after
 /// the last one succeeds, so a step that fails or is killed leaves the
 /// cache without it and the next plan fills the cache again. It holds the
-/// digest of the files the steps read (`sentinel_text`), so a lockfile
-/// changed since leaves the cache stale and the next plan fills it again.
+/// digest of the files the steps read and of the steps themselves
+/// (`sentinel_text`), so a lockfile or a setup recipe changed since leaves
+/// the cache stale and the next plan fills it again.
 pub const SENTINEL: &str = ".fabric-installed";
 
 /// The first line of the sentinel, for a reader who finds the file.
@@ -130,23 +133,30 @@ const MAX_SENTINEL: u64 = 4 << 10;
 
 /// Returns what the sentinel of the cache at `path` holds once the steps that fill it exit 0, or `None` when no step fills it.
 ///
-/// That is a header line and the digest of the files the steps of the
-/// cache's ecosystem read at the root, such as `package.json` and the
-/// lockfile for `node_modules`. A sentinel that holds anything else, one
-/// an older Fabric wrote included, leaves the cache `Stale`.
+/// That is a header line, the digest of the files the steps of the
+/// cache's ecosystem read, such as `package.json` and the lockfile for
+/// `node_modules`, and the digest of the steps that fill the cache: their
+/// programs, arguments, directories and cleared variables, in order. A
+/// sentinel that holds anything else, one an older Fabric wrote included,
+/// leaves the cache `Stale`, so the first plan after an upgrade fills it
+/// once more.
 pub fn sentinel_text(detected: &Detection, path: &RelPath) -> Option<String> {
     detected
-        .caches_with_inputs()
-        .find(|(cache, _)| &cache.path == path)
-        .and_then(|(cache, inputs)| match cache.completion {
-            Completion::Sentinel { .. } => Some(sentinel_for(inputs)),
+        .caches_with_proof()
+        .find(|(cache, _, _)| &cache.path == path)
+        .and_then(|(cache, inputs, recipe)| match cache.completion {
+            Completion::Sentinel { .. } => Some(sentinel_for(inputs, recipe)),
             Completion::Content => None,
         })
 }
 
-/// Formats the sentinel for a cache whose inputs have this digest.
-fn sentinel_for(inputs: &blake3::Hash) -> String {
-    format!("{SENTINEL_HEADER}inputs {}\n", inputs.to_hex())
+/// Formats the sentinel for a cache whose inputs and filling steps have these digests.
+fn sentinel_for(inputs: &blake3::Hash, recipe: &blake3::Hash) -> String {
+    format!(
+        "{SENTINEL_HEADER}inputs {}\nsteps {}\n",
+        inputs.to_hex(),
+        recipe.to_hex()
+    )
 }
 
 /// The `tracing` target that carries every line a setup step prints.
@@ -669,11 +679,11 @@ pub fn plan(
 
     let spec = detected.spec();
     let caches = detected
-        .caches_with_inputs()
-        .map(|(cache, inputs)| {
+        .caches_with_proof()
+        .map(|(cache, inputs, recipe)| {
             Ok(CacheReport {
                 path: cache.path.clone(),
-                health: inspect(&root, cache, inputs)?,
+                health: inspect(&root, cache, &sentinel_for(inputs, recipe))?,
             })
         })
         .collect::<Result<Vec<_>, MaterializeError>>()?;
@@ -724,7 +734,7 @@ pub fn plan(
 
 /// Gives each sentinel cache to the planned steps that fill it: the first clears it, the last writes it.
 fn assign_sentinels(detected: &Detection, steps: &mut [PlannedStep]) {
-    for (cache, inputs) in detected.caches_with_inputs() {
+    for (cache, inputs, recipe) in detected.caches_with_proof() {
         let Completion::Sentinel { filled_by } = &cache.completion else {
             continue;
         };
@@ -736,7 +746,7 @@ fn assign_sentinels(detected: &Detection, steps: &mut [PlannedStep]) {
             steps[last]
                 .sentinels
                 .write
-                .push((cache.path.clone(), sentinel_for(inputs)));
+                .push((cache.path.clone(), sentinel_for(inputs, recipe)));
         }
     }
 }
@@ -802,17 +812,16 @@ pub fn cache_health(
     path: &RelPath,
 ) -> Result<Option<CacheHealth>, MaterializeError> {
     detected
-        .caches_with_inputs()
-        .find(|(cache, _)| &cache.path == path)
-        .map(|(cache, inputs)| inspect(detected.root(), cache, inputs))
+        .caches_with_proof()
+        .find(|(cache, _, _)| &cache.path == path)
+        .map(|(cache, inputs, recipe)| {
+            inspect(detected.root(), cache, &sentinel_for(inputs, recipe))
+        })
         .transpose()
 }
 
-fn inspect(
-    root: &Path,
-    cache: &CachePath,
-    inputs: &blake3::Hash,
-) -> Result<CacheHealth, MaterializeError> {
+/// Returns the health of `cache`, whose sentinel, when a step fills it, must hold `proof`.
+fn inspect(root: &Path, cache: &CachePath, proof: &str) -> Result<CacheHealth, MaterializeError> {
     let inspect_err = |source| MaterializeError::Inspect {
         path: cache.path.clone(),
         source,
@@ -829,7 +838,7 @@ fn inspect(
         Completion::Content => Ok(CacheHealth::Healthy),
         Completion::Sentinel { .. } => Ok(match read_sentinel(&full.join(SENTINEL)) {
             None => CacheHealth::Incomplete,
-            Some(text) if text == sentinel_for(inputs).as_bytes() => CacheHealth::Healthy,
+            Some(text) if text == proof.as_bytes() => CacheHealth::Healthy,
             Some(_) => CacheHealth::Stale,
         }),
     }

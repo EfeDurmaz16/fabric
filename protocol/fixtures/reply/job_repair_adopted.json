@@ -1,0 +1,12 @@
+{
+  "kind": "job_repair",
+  "peer": "fab1aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq",
+  "outcome": {
+    "kind": "adopted",
+    "epoch": 2,
+    "kept": "/Users/me/.fabric/jobs/01JABCDEFGHJKMNPQRSTVWXYZ0/ledger.forked-cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd-efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+    "orphans": [
+      "abababababababababababababababababababababababababababababababab"
+    ]
+  }
+}

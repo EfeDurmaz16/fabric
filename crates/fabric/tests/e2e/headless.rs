@@ -219,6 +219,63 @@ fn e2e_an_older_codex_is_refused_a_thread_a_newer_one_continued() -> Fallible {
     Ok(())
 }
 
+/// A pull that restores a Codex thread names it as soon as the
+/// workspace is written (`session_to_continue`), and the CLI starts its
+/// resume guard's `codex --version` then, while the node still places the
+/// thread, instead of after the answer (item 15 of
+/// docs/evidence/perf-ab/README.md). The node's `lsof` of that placement
+/// waits up to five seconds for the guard's `--version`, run in the
+/// workspace, to start, and logs whether it did.
+#[test]
+fn e2e_a_pull_asks_the_guards_version_while_the_node_places_the_session() -> Fallible {
+    let p = crate::setup(Wire::TcpTls, None, None)?;
+    p.env.install_fake_codex()?;
+    let job = crate::new_job(&p.env, &p.a, "codex")?;
+    p.a.ok(&["job", "run", &job, "--headless", "--prompt", "one"])?;
+    p.a.ok(&["job", "suspend", &job])?;
+    let home = &p.env.home;
+    let (asked, log) = (home.join("guard-asked"), home.join("lsof-log"));
+    // The guard's probe is the one run in the workspace.
+    let codex = fs::read_to_string(p.env.bin().join("codex"))?.replacen(
+        "if [ \"$1\" = --version ]; then\n",
+        &format!(
+            "if [ \"$1\" = --version ]; then\n[ \"$(basename \"$(pwd -P)\")\" != work ] || touch '{}'\n",
+            asked.display()
+        ),
+        1,
+    );
+    p.env.install("codex", &codex)?;
+    p.env.install(
+        "lsof",
+        &format!(
+            "#!/bin/sh\n\
+             i=0\n\
+             while [ ! -f '{asked}' ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i + 1)); done\n\
+             if [ -f '{asked}' ]; then echo together >> '{log}'; else echo alone >> '{log}'; fi\n\
+             for real in /usr/sbin/lsof /usr/bin/lsof /sbin/lsof /bin/lsof; do\n\
+               [ ! -x \"$real\" ] || exec \"$real\" \"$@\"\n\
+             done\n\
+             exit 1\n",
+            asked = asked.display(),
+            log = log.display()
+        ),
+    )?;
+    p.b.ok(&[
+        "job",
+        "resume",
+        &job,
+        "--on",
+        &p.a.id,
+        "--force",
+        "--headless",
+        "--prompt",
+        "two",
+    ])?;
+    let logged = fs::read_to_string(&log)?;
+    assert!(logged.starts_with("together"), "{logged}");
+    Ok(())
+}
+
 /// A version manager pins a newer Codex in the workspace, and it runs the
 /// thread there, while the node's own version check, run from the
 /// daemon, finds the global one. That newer Codex writes no version into
@@ -573,7 +630,8 @@ fn e2e_ctrl_c_on_a_headless_acp_run_reaches_the_agent() -> Fallible {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    let agent: i32 = fs::read_to_string(&pid_file)?.trim().parse()?;
+    // The agent is released only once the node recorded it.
+    let agent = crate::world::read_pid(&pid_file)?;
     // The agent writes to the run's standard error too, so the run's end is
     // its exit, not the end of its output, which an agent left running
     // would keep open.

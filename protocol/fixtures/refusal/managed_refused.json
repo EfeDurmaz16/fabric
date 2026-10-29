@@ -1,0 +1,11 @@
+{
+  "kind": "job_state",
+  "reason": {
+    "code": "managed_refused",
+    "refusal": "revision_mismatch",
+    "job": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+    "operation_key": "cancel-1",
+    "replayed": false
+  },
+  "message": "the job is at revision 4, the command expected 3"
+}

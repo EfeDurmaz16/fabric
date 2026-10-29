@@ -18,6 +18,7 @@ fabric-client = { path = "../fabric-client" }
 fabric-core = { path = "../fabric-core" }
 fabric-env = { path = "../fabric-env" }
 fabric-harness = { path = "../fabric-harness" }
+fabric-journal = { path = "../fabric-journal" }
 fabric-net = { path = "../fabric-net" }
 fabric-store = { path = "../fabric-store" }
 rustix = { version = "1.1", features = ["fs", "process"] }
@@ -28,6 +29,13 @@ tokio = { version = "1.54", features = ["fs", "io-util", "macros", "net", "proce
 toml = { version = "1.1", default-features = false, features = ["std", "parse", "serde"] }
 tracing = "0.1"
 ulid = "3.0"
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+# F_BARRIERFSYNC, which rustix does not wrap, through nix's safe fcntl, so
+# an atomic write orders its bytes before its rename with a barrier and
+# flushes the drive once (ADR 0002). nix is already in the graph, for the
+# CLI's signals.
+nix = { version = "0.31", default-features = false, features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3.27"

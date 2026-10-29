@@ -16,6 +16,7 @@
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fabric_core::harness::HarnessKind;
 use fabric_core::id::{ChunkId, Epoch, JobId, MoveId, NodeId, RecordHash, SnapshotId};
 use fabric_core::lease::FencingToken;
 use fabric_core::ledger::MAX_RECORD_LEN;
@@ -25,7 +26,13 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// The protocol version both sides must speak; a mismatch ends the session at `Hello`.
-pub const PROTOCOL_VERSION: u16 = 3;
+///
+/// 4 added `RequestBody::FactsFor` (issue #16): a node of version 3 would
+/// not know it, so the two refuse each other at `Hello` instead of one
+/// failing a push's preflight midway. Before version 4 was released,
+/// `FactsFor` also came to name the tools to measure (item 19 of the A/B
+/// lab), so a preflight measures only what the job reads.
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// The most chunk ids one `WantChunks` request may name.
 pub const MAX_CHUNK_BATCH: usize = 256;
@@ -55,6 +62,9 @@ pub const MAX_FACT_NAME: usize = 64;
 
 /// The most bytes in a fact's value; `rustc -vV` is about 300.
 pub const MAX_FACT_VALUE: usize = 4096;
+
+/// The most tools one `FactsFor` names.
+pub const MAX_TOOLS: usize = 32;
 
 /// The most a page of records may cost, counting each record as its length
 /// plus `RECORD_PREFIX`: one record of the largest size, or many small ones.
@@ -101,6 +111,12 @@ pub enum WireError {
     /// A fact list is not strictly sorted by name.
     #[error("fact {0} is out of order or repeated")]
     FactOrder(String),
+    /// A tool list is longer than `MAX_TOOLS`.
+    #[error("a tool list holds at most {MAX_TOOLS} tools, not {0}")]
+    ToolCount(usize),
+    /// A tool list is not strictly sorted by name.
+    #[error("tool {0} is out of order or repeated")]
+    ToolOrder(String),
     /// A manifest lists more chunks than one control frame holds.
     #[error("a manifest lists at most {MAX_MANIFEST_CHUNKS} chunks, not {0}")]
     ManifestTooManyChunks(usize),
@@ -215,6 +231,18 @@ impl Facts {
         Ok(Self(facts))
     }
 
+    /// Sorts `facts` by name, keeps the first value of a name given twice
+    /// and the first `MAX_FACTS` names, so it cannot fail. A caller with
+    /// more facts than an answer holds chooses what to leave out before,
+    /// and says so in a fact of its own, as a node's facts do (M2-26).
+    #[must_use]
+    pub fn clamped(mut facts: Vec<(FactName, FactValue)>) -> Self {
+        facts.sort_by(|a, b| a.0.cmp(&b.0));
+        facts.dedup_by(|later, first| later.0 == first.0);
+        facts.truncate(MAX_FACTS);
+        Self(facts)
+    }
+
     /// Returns the value of `name`, if the node measured it.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&str> {
@@ -236,6 +264,42 @@ impl<'de> Deserialize<'de> for Facts {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let facts = Vec::<(FactName, FactValue)>::deserialize(deserializer)?;
         Self::new(facts).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The name of a tool whose facts a node measures, such as `node`.
+pub type ToolName = BoundedText<MAX_FACT_NAME>;
+
+/// The tools a `FactsFor` asks the peer to measure: at most `MAX_TOOLS`,
+/// strictly sorted by name, so one tool is named once. The names are the
+/// node's own (`fabricd::facts::Tool`); a node that does not know one
+/// measures every tool, more than was asked and never less.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct Tools(Vec<ToolName>);
+
+impl Tools {
+    /// Wraps `tools` if there are at most `MAX_TOOLS` and the names are strictly sorted.
+    pub fn new(tools: Vec<ToolName>) -> Result<Self, WireError> {
+        if tools.len() > MAX_TOOLS {
+            return Err(WireError::ToolCount(tools.len()));
+        }
+        if let Some(pair) = tools.windows(2).find(|pair| pair[0] >= pair[1]) {
+            return Err(WireError::ToolOrder(pair[1].as_str().to_owned()));
+        }
+        Ok(Self(tools))
+    }
+
+    /// Every tool named, sorted.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(BoundedText::as_str)
+    }
+}
+
+impl<'de> Deserialize<'de> for Tools {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let tools = Vec::<ToolName>::deserialize(deserializer)?;
+        Self::new(tools).map_err(serde::de::Error::custom)
     }
 }
 
@@ -479,6 +543,19 @@ pub enum RequestBody {
     WantChunks(ChunkBatch),
     /// Asks what the peer measured about itself; answered with `Facts`.
     Facts,
+    /// Asks what the peer measured about itself as the target of a job
+    /// under `harness`; answered with `Facts`. For an ACP job they also
+    /// hold where the peer finds the agent and the `state_dir` its
+    /// `harness.toml` gives it (`acp.agent`, `acp.state_dir`), which no
+    /// fixed list can, since each job names its own agent (issue #16).
+    FactsFor {
+        /// The harness the job runs under.
+        harness: HarnessKind,
+        /// The tools whose facts the asking node reads for this job; the
+        /// answer holds no fact of another tool, beside the facts that
+        /// need no process and the ACP ones.
+        tools: Tools,
+    },
 }
 
 /// A per-job message (ADR 0003 and ADR 0005).
@@ -1095,6 +1172,29 @@ mod tests {
                     .ok())
                 .prop_map(RequestBody::WantChunks),
             Just(RequestBody::Facts),
+            (
+                harness(),
+                proptest::collection::btree_set("[a-z][a-z.]{0,15}", 0..=MAX_TOOLS)
+            )
+                .prop_map(|(harness, names)| RequestBody::FactsFor {
+                    harness,
+                    tools: Tools::new(names.iter().map(|name| ToolName::truncated(name)).collect())
+                        .expect("a set is sorted and holds no name twice"),
+                }),
+        ]
+    }
+
+    fn harness() -> impl Strategy<Value = HarnessKind> {
+        prop_oneof![
+            Just(HarnessKind::ClaudeCode),
+            Just(HarnessKind::Codex),
+            ("[a-z][a-z0-9._-]{0,15}", vec("[ -~]{0,16}", 0..3)).prop_map(|(program, args)| {
+                HarnessKind::Acp {
+                    program: fabric_core::harness::ProgramName::parse(&program)
+                        .expect("the pattern makes a valid program name"),
+                    args,
+                }
+            }),
         ]
     }
 
@@ -1354,6 +1454,65 @@ mod tests {
         let facts = decode::<Facts>(&encode(&ok).unwrap()).unwrap();
         assert_eq!(facts.get("node.version"), Some("v22"));
         assert_eq!(facts.get("pnpm.version"), None);
+    }
+
+    /// A tool list is strictly sorted and holds at most `MAX_TOOLS`
+    /// names, on decode as on make, so a peer cannot ask for one tool
+    /// twice or for an unbounded list.
+    #[test]
+    fn a_tool_list_is_sorted_unique_and_bounded() {
+        let names = |list: &[&str]| list.iter().map(|name| ToolName::truncated(name)).collect();
+        let tools = Tools::new(names(&["git", "node", "user"])).unwrap();
+        assert_eq!(tools.iter().collect::<Vec<_>>(), ["git", "node", "user"]);
+        assert!(matches!(
+            Tools::new(names(&["node", "git"])),
+            Err(WireError::ToolOrder(name)) if name == "git"
+        ));
+        assert!(matches!(
+            Tools::new(names(&["git", "git"])),
+            Err(WireError::ToolOrder(_))
+        ));
+        let many: Vec<String> = (0..=MAX_TOOLS).map(|n| format!("t{n:03}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert!(matches!(
+            Tools::new(names(&many)),
+            Err(WireError::ToolCount(n)) if n == MAX_TOOLS + 1
+        ));
+        let unsorted = encode(&vec![
+            ToolName::truncated("node"),
+            ToolName::truncated("git"),
+        ])
+        .unwrap();
+        assert!(decode::<Tools>(&unsorted).is_err());
+        let sorted = encode(&tools).unwrap();
+        assert_eq!(decode::<Tools>(&sorted).unwrap(), tools);
+    }
+
+    /// A list clamped to an answer is one `Facts::new` accepts: sorted, one
+    /// value per name, the first given, and at most `MAX_FACTS` names, the
+    /// first in order.
+    #[test]
+    fn a_clamped_fact_list_is_sorted_unique_and_bounded() {
+        let pair =
+            |name: &str, value: &str| (FactName::truncated(name), FactValue::truncated(value));
+        let facts = Facts::clamped(vec![
+            pair("node.version", "v22"),
+            pair("home", "/Users/x"),
+            pair("home", "/Users/y"),
+        ]);
+        assert_eq!(
+            facts.iter().collect::<Vec<_>>(),
+            [("home", "/Users/x"), ("node.version", "v22")]
+        );
+        let many: Vec<_> = (0..=MAX_FACTS)
+            .rev()
+            .map(|i| pair(&format!("f{i:03}"), "v"))
+            .collect();
+        let facts = Facts::clamped(many);
+        assert_eq!(facts.iter().count(), MAX_FACTS);
+        assert_eq!(facts.get("f000"), Some("v"));
+        assert_eq!(facts.get(&format!("f{MAX_FACTS:03}")), None);
+        assert_eq!(decode::<Facts>(&encode(&facts).unwrap()).unwrap(), facts);
     }
 
     /// The longest chunk list a manifest may have fits the control frame in

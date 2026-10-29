@@ -1,0 +1,24 @@
+{
+  "format": 1,
+  "kind": {
+    "Acp": {
+      "program": "fabric-fake-agent",
+      "args": []
+    }
+  },
+  "session": "fake-1",
+  "root": "/private/tmp/fe2e5SdQX3/home/fabric/jobs/01M5Z0ETP0C47PHVNG27Q4MNS0/work",
+  "home": "/private/tmp/fe2e5SdQX3/home",
+  "harness_version": null,
+  "captured_at_ms": 1793115778379,
+  "files": [
+    {
+      "rel_path": "home/.fake-agent/fake-1.json",
+      "content": "Opaque",
+      "mutability": "Replaceable",
+      "size": 186,
+      "blake3": "f2d434b86c08484f3c11952294ba446bf28871677fe442c7d7e0a964fe7e5039"
+    }
+  ],
+  "redactions": []
+}

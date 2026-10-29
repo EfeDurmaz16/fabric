@@ -36,6 +36,10 @@ const FAULT_TIMEOUT: Duration = Duration::from_mins(2);
 /// time budget measures a start to within a few milliseconds.
 const START_POLL: Duration = Duration::from_millis(10);
 
+/// How long `finish` waits for the output of a command it killed: a
+/// process the command started may still hold its pipes.
+const KILLED_OUTPUT_WAIT: Duration = Duration::from_secs(10);
+
 /// What every process the test starts shares.
 pub struct Env {
     _dir: tempfile::TempDir,
@@ -46,6 +50,10 @@ pub struct Env {
     /// The repository the job is made from.
     pub repo: PathBuf,
     path: OsString,
+    /// The `fabric` every node and CLI command of the test runs.
+    fabric: PathBuf,
+    /// Variables added to the environment of every process the test starts.
+    vars: Vec<(OsString, OsString)>,
 }
 
 impl Env {
@@ -54,6 +62,30 @@ impl Env {
     /// The directory sits under `/tmp` so the control socket's path stays
     /// within the 103 bytes a Unix socket path may have on macOS.
     pub fn new() -> Fallible<Arc<Self>> {
+        Self::with_fabric(PathBuf::from(env!("CARGO_BIN_EXE_fabric")), Vec::new())
+    }
+
+    /// As `new`, with the nodes and CLI commands running `fabric`, another
+    /// build of the program, and with `vars` added to the environment of
+    /// every process the test starts. The A/B bench compares two builds
+    /// this way on the same fixture.
+    pub fn with_fabric(fabric: PathBuf, vars: Vec<(OsString, OsString)>) -> Fallible<Arc<Self>> {
+        Self::make(fabric, vars, "main")
+    }
+
+    /// As `new`, with the repository's branch named `branch` instead of
+    /// `main`: git's own default before 2.28 and still where no
+    /// `init.defaultBranch` is set, which a restore must handle as well
+    /// (store-git: a restore's `git init` names that branch too).
+    pub fn on_branch(branch: &str) -> Fallible<Arc<Self>> {
+        Self::make(
+            PathBuf::from(env!("CARGO_BIN_EXE_fabric")),
+            Vec::new(),
+            branch,
+        )
+    }
+
+    fn make(fabric: PathBuf, vars: Vec<(OsString, OsString)>, branch: &str) -> Fallible<Arc<Self>> {
         let dir = tempfile::Builder::new().prefix("fe2e").tempdir_in("/tmp")?;
         let root = fs::canonicalize(dir.path())?;
         let home = root.join("home");
@@ -68,14 +100,21 @@ impl Env {
         std::os::unix::fs::symlink(&git, bin.join("git"))?;
         let path = std::env::join_paths([bin, PathBuf::from("/usr/bin"), PathBuf::from("/bin")])?;
         let repo = root.join("repo");
-        make_repo(&repo)?;
+        make_repo(&repo, branch)?;
         Ok(Arc::new(Self {
             _dir: dir,
             root,
             home,
             repo,
             path,
+            fabric,
+            vars,
         }))
+    }
+
+    /// The `fabric` the test's nodes and CLI commands run.
+    pub fn fabric(&self) -> &Path {
+        &self.fabric
     }
 
     /// The `PATH` every process of the test runs with.
@@ -243,7 +282,7 @@ impl Env {
     /// test runs with, for the node whose state directory is `state`: its
     /// own programs come first on the `PATH` (`node_bin`), then the
     /// programs both nodes share.
-    pub fn command(&self, program: &str, state: &Path) -> Command {
+    pub fn command(&self, program: impl AsRef<std::ffi::OsStr>, state: &Path) -> Command {
         let mut dirs = vec![node_bin(state)];
         dirs.extend(std::env::split_paths(&self.path));
         let path = std::env::join_paths(dirs).unwrap_or_else(|_| self.path.clone());
@@ -262,6 +301,7 @@ impl Env {
         if let Some(level) = std::env::var_os("FABRIC_LOG") {
             command.env("FABRIC_LOG", level);
         }
+        command.envs(self.vars.iter().map(|(name, value)| (name, value)));
         command
     }
 }
@@ -328,7 +368,7 @@ fn git(dir: &Path, args: &[&str]) -> Fallible {
     }
 }
 
-fn make_repo(repo: &Path) -> Fallible {
+fn make_repo(repo: &Path, branch: &str) -> Fallible {
     fs::create_dir_all(repo.join("src"))?;
     fs::write(repo.join("README.md"), "hello\n")?;
     fs::write(repo.join("src/greet.txt"), "hello, world\n")?;
@@ -342,7 +382,7 @@ fn make_repo(repo: &Path) -> Fallible {
         repo.join(".gitignore"),
         "scratch/\nnode_modules/\ndist/\n.env\n",
     )?;
-    git(repo, &["init", "-q", "-b", "main"])?;
+    git(repo, &["init", "-q", "-b", branch])?;
     git(repo, &["add", "-A"])?;
     git(repo, &["commit", "-q", "-m", "first"])
 }
@@ -569,7 +609,7 @@ impl Node {
             _ => {}
         }
         let log = fs::File::create(self.state.join("daemon.log"))?;
-        let mut command = self.env.command(env!("CARGO_BIN_EXE_fabric"), &self.state);
+        let mut command = self.env.command(self.env.fabric(), &self.state);
         command
             .args([
                 "serve",
@@ -630,6 +670,22 @@ impl Node {
         Ok(())
     }
 
+    /// Stops the daemon with `SIGTERM`, as `fabric serve` is stopped by
+    /// hand, and returns it unreaped: it may still be shutting down, and
+    /// still hold the state directory, when this returns.
+    pub fn stop(&mut self) -> Fallible<Child> {
+        let daemon = self.daemon.take().ok_or("the daemon does not run")?;
+        let pid = rustix::process::Pid::from_raw(i32::try_from(daemon.id())?)
+            .ok_or("the daemon has no pid")?;
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
+        Ok(daemon)
+    }
+
+    /// The process id of the daemon while it runs.
+    pub fn daemon_pid(&self) -> Option<u32> {
+        self.daemon.as_ref().map(Child::id)
+    }
+
     /// The daemon's log so far.
     pub fn log(&self) -> String {
         fs::read_to_string(self.state.join("daemon.log")).unwrap_or_default()
@@ -644,7 +700,7 @@ impl Node {
     pub fn spawn_with(&self, args: &[&str], vars: &[(&str, &Path)]) -> Fallible<Child> {
         Ok(self
             .env
-            .command(env!("CARGO_BIN_EXE_fabric"), &self.state)
+            .command(self.env.fabric(), &self.state)
             .args(args)
             .envs(vars.iter().copied())
             .stdout(Stdio::piped())
@@ -676,7 +732,9 @@ impl Node {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let pid = fs::read_to_string(&pid_file)?.trim().parse()?;
+        // The harness is released only once the node recorded it, so it
+        // may write its pid after the status says it runs.
+        let pid = read_pid(&pid_file)?;
         Ok((running, pid))
     }
 
@@ -786,14 +844,40 @@ pub fn finish(child: Child, timeout: Duration) -> Fallible<Output> {
         return Ok(output?);
     }
     let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-    let output = waited.recv()??;
-    Err(format!("a command ran past {timeout:?}:\n{}", text(&output)).into())
+    // The kill ends the command, but its output ends only when every
+    // process holding its pipes is gone: a harness it left running would
+    // keep the wait, and the test, open for good (M2-24).
+    match waited.recv_timeout(KILLED_OUTPUT_WAIT) {
+        Ok(output) => Err(format!("a command ran past {timeout:?}:\n{}", text(&output?)).into()),
+        Err(_) => Err(format!(
+            "a command ran past {timeout:?}, and its output did not end \
+             {KILLED_OUTPUT_WAIT:?} after it was killed"
+        )
+        .into()),
+    }
 }
 
 /// True while a process with `pid` exists.
 pub fn alive(pid: i32) -> bool {
     rustix::process::Pid::from_raw(pid)
         .is_some_and(|pid| rustix::process::test_kill_process(pid).is_ok())
+}
+
+/// Waits until `path` holds a pid, as a harness writes it once it runs,
+/// and returns it.
+pub fn read_pid(path: &Path) -> Fallible<i32> {
+    let started = Instant::now();
+    loop {
+        if let Ok(text) = fs::read_to_string(path)
+            && let Ok(pid) = text.trim().parse()
+        {
+            return Ok(pid);
+        }
+        if started.elapsed() > FAULT_TIMEOUT {
+            return Err(format!("{} never held a pid", path.display()).into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Waits until `path` exists.
@@ -872,4 +956,24 @@ pub fn read_work(env: &Env, job: &str) -> Fallible<Work> {
         deps: fs::read_to_string(work.join("node_modules/leftpad/index.js"))?,
         build: fs::read_to_string(work.join("dist/out.js"))?,
     })
+}
+
+/// M2-24: a command killed past its timeout whose child keeps its pipes
+/// open makes `finish` fail within its bound, not hang until the child ends.
+#[test]
+fn a_killed_command_whose_child_keeps_its_pipes_fails_in_time() {
+    let child = Command::new("/bin/sh")
+        .args(["-c", "sleep 40 & sleep 40"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    let finished = finish(child, Duration::from_millis(200));
+    assert!(finished.is_err());
+    assert!(
+        started.elapsed() < KILLED_OUTPUT_WAIT + Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
 }

@@ -36,12 +36,14 @@ pub enum Point {
     /// A CLI asked to record the harness it launched, and the node has
     /// written nothing for it yet.
     BeforeHarnessRecord,
+    /// `fabric serve` was told to stop and still holds the state directory.
+    WhileStopping,
 }
 
 impl Point {
     /// Every point, for parsing.
     #[cfg(feature = "faults")]
-    const ALL: [Point; 7] = [
+    const ALL: [Point; 8] = [
         Point::AfterQuiesce,
         Point::AfterSnapshotPublish,
         Point::AfterDepartingWrite,
@@ -49,6 +51,7 @@ impl Point {
         Point::BeforeImport,
         Point::AfterImportReceipt,
         Point::BeforeHarnessRecord,
+        Point::WhileStopping,
     ];
 
     fn name(self) -> &'static str {
@@ -60,6 +63,7 @@ impl Point {
             Point::BeforeImport => "before_import",
             Point::AfterImportReceipt => "after_import_receipt",
             Point::BeforeHarnessRecord => "before_harness_record",
+            Point::WhileStopping => "while_stopping",
         }
     }
 }

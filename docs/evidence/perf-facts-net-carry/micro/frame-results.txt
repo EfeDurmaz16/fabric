@@ -1,0 +1,10 @@
+release, in-memory reader, old and new read_frame taking turns, the first alternating per pair
+31 pairs:
+len 100: median new/old 1.031 (min 0.552 max 1.848), capacity old 101 new 100
+len 8192: median new/old 0.845 (min 0.488 max 1.335), capacity old 8193 new 8192
+len 1048646: median new/old 0.268 (min 0.154 max 0.612), capacity old 2097152 new 1048646
+len 8388678: median new/old 0.558 (min 0.299 max 1.209), capacity old 16777216 new 8388678
+201 pairs:
+len 12: median new/old 0.581 (min 0.437 max 0.735), capacity old 64 new 12
+len 100: median new/old 0.960 (min 0.787 max 1.435), capacity old 101 new 100
+len 1000: median new/old 0.873 (min 0.677 max 1.190), capacity old 1001 new 1000

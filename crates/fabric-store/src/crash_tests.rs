@@ -76,7 +76,17 @@ fn make_workspace(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     for dir in [root.join("node_modules/pkg"), state.join("sessions/abc")] {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o555))?;
     }
+    // The roots get their own mode just before each rename (M2-05); the
+    // harness root has no owner write, which a rename needs until then.
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o550))?;
     Ok(())
+}
+
+/// The permission bits of the directory at `path`.
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).unwrap().mode() & 0o777
 }
 
 fn capture_and_publish(
@@ -232,6 +242,7 @@ fn publish_killed_at_any_checkpoint_never_leaves_a_dangling_row() {
 #[test]
 fn restore_killed_at_any_checkpoint_is_detectable_and_finishes_on_rerun() {
     for checkpoint in [
+        "restore.cache_files_placed",
         "restore.after_git",
         "restore.after_first_file",
         "restore.after_files",
@@ -269,6 +280,7 @@ fn restore_killed_at_any_checkpoint_is_detectable_and_finishes_on_rerun() {
             );
             let verified = verify(&store, snapshot, &target, Verify::All, &carry).unwrap();
             assert!(verified > 0, "{checkpoint}");
+            assert_eq!((mode_of(&target), mode_of(&state)), (0o700, 0o550));
             continue;
         }
         assert!(
@@ -299,6 +311,11 @@ fn restore_killed_at_any_checkpoint_is_detectable_and_finishes_on_rerun() {
             "{checkpoint}"
         );
         assert_eq!(
+            (mode_of(&target), mode_of(&state)),
+            (0o700, 0o550),
+            "{checkpoint}"
+        );
+        assert_eq!(
             fs::read_to_string(state.join("sessions/abc/tool.txt")).unwrap(),
             "tool output\n",
             "{checkpoint}"
@@ -311,5 +328,29 @@ fn restore_killed_at_any_checkpoint_is_detectable_and_finishes_on_rerun() {
             .run_text(&["status", "--porcelain=v2", "--untracked-files=all"])
             .unwrap();
         assert_eq!(status, source, "{checkpoint}");
+        assert_cache_whole(&store, snapshot, &dir.join("again"), checkpoint);
     }
+}
+
+/// Checks that a restore of `snapshot` into `target` takes its one bundle
+/// from the node's bundle cache: the rerun after the kill at `checkpoint`
+/// left the cache whole, files and record.
+fn assert_cache_whole(store: &Store, snapshot: SnapshotId, target: &Path, checkpoint: &str) {
+    let again = restore(
+        store,
+        &RestoreRequest {
+            snapshot,
+            target,
+            harness_state: None,
+            verify: Verify::All,
+            durability: Durability::ProcessCrash,
+            carry: &|_| true,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        (again.bundles_fetched, again.bundles_unpacked),
+        (1, 0),
+        "{checkpoint}"
+    );
 }

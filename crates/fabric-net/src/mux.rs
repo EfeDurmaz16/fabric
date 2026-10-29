@@ -19,7 +19,9 @@
 //! and a `Fin`, so both its directions end, and this side waits in `open`
 //! instead of going over the peer's limit. A frame payload above
 //! `MAX_MUX_PAYLOAD` ends the connection. So a peer can make this node hold
-//! at most `MAX_STREAMS` stream buffers and one frame.
+//! at most `OPEN_CREDIT` on each of `MAX_STREAMS` streams it opened past
+//! what this node's readers asked for, the buffers of the streams this node
+//! opened, and one frame.
 //!
 //! The connection's reader never waits on anything but the wire. The frames
 //! it sends itself, a `Reset` or a refusal, go through a control queue that
@@ -29,9 +31,15 @@
 //! whose writers both wait on a full wire still read, and both drain.
 //!
 //! Each direction of a stream has its own credit, as each QUIC stream has
-//! its own window. A sender starts with `STREAM_BUFFER` bytes of credit and
-//! spends it on `Data`; the receiver's buffer holds exactly that much, and a
-//! `Credit` frame hands back what its reader has taken. The reader of the
+//! its own window, and a sender spends it on `Data`, sending what credit it
+//! has and waiting for more. The side that accepted a stream starts with
+//! `STREAM_BUFFER` bytes of credit; the receiver's buffer holds exactly
+//! that much, and a `Credit` frame hands back what its reader has taken.
+//! The side that opened it, which sends a request on it, starts with
+//! `OPEN_CREDIT`, and gets more only for what the acceptor's reader asks
+//! for once its buffer is empty (`pipe::on_demand`): a request that waits
+//! for room to be read (`rpc`) holds at most `OPEN_CREDIT` of its bytes
+//! here, the rest unread at the peer, not a whole buffer. The reader of the
 //! connection therefore never waits on one stream: a stream nobody reads
 //! stops only its own sender, and a peer that sends past its credit, or
 //! grants more than a buffer holds, ends the connection.
@@ -59,7 +67,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::AbortHandle;
 
 use crate::idle::{IdleReader, StallWriter};
-use crate::pipe::{Drained, PipeReader, PipeWriter, Refused, Report, pipe};
+use crate::pipe::{Drained, PipeReader, PipeWriter, Refused, Report, on_demand, pipe};
 use crate::transport::{
     Connection, IDLE_TIMEOUT, KEEP_ALIVE, Stream, TransportError, TransportKind,
 };
@@ -67,8 +75,15 @@ use crate::transport::{
 /// The most payload bytes in one multiplexer frame.
 pub(crate) const MAX_MUX_PAYLOAD: usize = 64 << 10;
 
-/// The credit each direction of a stream starts with, and the bytes its receiver buffers.
+/// The bytes the receiver of each direction of a stream buffers, and the
+/// credit the side that accepted the stream starts with.
 pub(crate) const STREAM_BUFFER: usize = 1 << 20;
+
+/// The credit the side that opened a stream starts with: the whole frame
+/// of most requests, a chunk batch's included, so they cost no round trip
+/// for credit, and all a request that waits for room to be read holds on
+/// this node. More comes only for what the acceptor's reader asks for.
+pub(crate) const OPEN_CREDIT: usize = 16 << 10;
 
 /// The most streams either side may hold open on one connection, quinn's default.
 pub(crate) const MAX_STREAMS: usize = 100;
@@ -366,13 +381,13 @@ async fn pump_local(shared: Arc<Shared>, source: PipeReader, inbound: PipeWriter
     let inbound = Inbound::new(inbound, Arc::clone(&slot));
     let mut ended = shared.ended.subscribe();
     let first = tokio::select! {
-        first = poll_fn(|cx| source.poll_take(cx, MAX_MUX_PAYLOAD)) => first.unwrap_or_default(),
+        first = poll_fn(|cx| source.poll_take(cx, OPEN_CREDIT.min(MAX_MUX_PAYLOAD))) => first.unwrap_or_default(),
         // Dropping `inbound` fails the stream's reader.
         _ = ended.wait_for(|ended| *ended) => return,
     };
     let (stop_tx, stop_rx) = oneshot::channel();
     // The first frame spends its own length of the stream's credit.
-    let credit = Arc::new(Semaphore::new(STREAM_BUFFER - first.len()));
+    let credit = Arc::new(Semaphore::new(OPEN_CREDIT - first.len()));
     let id = {
         let mut next = shared.next_id.lock().await;
         let Some(id) = *next else {
@@ -424,11 +439,14 @@ async fn pump_local(shared: Arc<Shared>, source: PipeReader, inbound: PipeWriter
 
 /// Frames what the stream's writer writes, within the stream's credit, until it finishes, the peer resets it, or the connection ends.
 ///
-/// A writer that aborts, as one dropped in the middle of a write does,
-/// ends the stream at once, even while the pump waits for credit the peer
-/// may never send: the bytes not yet sent are dropped and the Fin goes
-/// out, so the stream's slot comes back and the peer reads a stream that
-/// stops short, which a framed reader sees as a cut-off frame.
+/// It sends as much of what it took as the credit allows and waits for
+/// more for the rest, so a peer that grants only what its reader asks for
+/// gets those bytes, never a wait for credit it will not give. A writer
+/// that aborts, as one dropped in the middle of a write does, ends the
+/// stream at once, even while the pump waits for credit the peer may never
+/// send: the bytes not yet sent are dropped and the Fin goes out, so the
+/// stream's slot comes back and the peer reads a stream that stops short,
+/// which a framed reader sees as a cut-off frame.
 async fn send_rest(
     shared: Arc<Shared>,
     id: u32,
@@ -437,7 +455,7 @@ async fn send_rest(
     credit: Arc<Semaphore>,
 ) {
     loop {
-        let taken = tokio::select! {
+        let mut taken = tokio::select! {
             biased;
             _ = &mut stop => return,
             taken = poll_fn(|cx| source.poll_take(cx, MAX_MUX_PAYLOAD)) => taken.unwrap_or_default(),
@@ -445,30 +463,40 @@ async fn send_rest(
         if taken.is_empty() {
             return end_outbound(&shared, id).await;
         }
-        // At most MAX_MUX_PAYLOAD, so it fits a u32.
-        let Ok(len) = u32::try_from(taken.len()) else {
-            return;
-        };
-        tokio::select! {
-            biased;
-            _ = &mut stop => return,
-            () = poll_fn(|cx| source.poll_aborted(cx)) => return end_outbound(&shared, id).await,
-            spent = credit.acquire_many(len) => match spent {
+        while !taken.is_empty() {
+            if credit.available_permits() == 0 {
+                tokio::select! {
+                    biased;
+                    _ = &mut stop => return,
+                    () = poll_fn(|cx| source.poll_aborted(cx)) => return end_outbound(&shared, id).await,
+                    some = credit.acquire() => if some.is_err() {
+                        return;
+                    },
+                }
+            }
+            // Only this pump takes the stream's credit, so what it saw stays.
+            let n = credit.available_permits().min(taken.len());
+            // At most MAX_MUX_PAYLOAD, so it fits a u32.
+            let Ok(len) = u32::try_from(n) else {
+                return;
+            };
+            match credit.try_acquire_many(len) {
                 Ok(spent) => spent.forget(),
                 Err(_) => return,
-            },
-        }
-        let frame = Outgoing {
-            id,
-            kind: FrameKind::Data,
-            payload: taken,
-        };
-        tokio::select! {
-            biased;
-            _ = &mut stop => return,
-            sent = shared.out.send(frame) => if sent.is_err() {
-                return;
-            },
+            }
+            let rest = taken.split_off(n);
+            let frame = Outgoing {
+                id,
+                kind: FrameKind::Data,
+                payload: std::mem::replace(&mut taken, rest),
+            };
+            tokio::select! {
+                biased;
+                _ = &mut stop => return,
+                sent = shared.out.send(frame) => if sent.is_err() {
+                    return;
+                },
+            }
         }
     }
 }
@@ -688,7 +716,9 @@ fn accept_stream(
         _permit: permit,
         _alive: alive,
     });
-    let (inbound_writer, inbound_reader) = pipe(STREAM_BUFFER);
+    // The peer opened it with `OPEN_CREDIT`, and gets more only for what
+    // the reader asks for.
+    let (inbound_writer, inbound_reader) = on_demand(STREAM_BUFFER, OPEN_CREDIT);
     let (outbound_writer, outbound_reader) = pipe(STREAM_BUFFER);
     let (stop_tx, stop_rx) = oneshot::channel();
     let credit = Arc::new(Semaphore::new(STREAM_BUFFER));
@@ -1104,13 +1134,11 @@ mod tests {
 
     /// A peer that sends more than the credit it was given ends the
     /// connection, instead of making this side buffer or wait on one stream.
+    /// A stream the peer opens starts with `OPEN_CREDIT`, not a buffer.
     #[tokio::test]
     async fn a_peer_that_sends_past_its_credit_ends_the_connection() {
         let (mux, mut raw) = acceptor_and_raw();
-        let frame = vec![0u8; MAX_MUX_PAYLOAD];
-        for _ in 0..STREAM_BUFFER / MAX_MUX_PAYLOAD {
-            raw.send(1, FrameKind::Data, &frame).await;
-        }
+        raw.send(1, FrameKind::Data, &vec![0u8; OPEN_CREDIT]).await;
         let mut unread = mux.next().await.unwrap();
         raw.send(1, FrameKind::Data, b"x").await;
         let ended = tokio::time::timeout(Duration::from_secs(1), mux.next()).await;
@@ -1144,6 +1172,13 @@ mod tests {
         let (ours, mut theirs) = tokio::io::duplex(64 << 10);
         let mux = Mux::spawn(ours, Side::Acceptor, node(), ADDR);
         let talking = tokio::spawn(async move {
+            // A request on a stream it opens, whose answer this side sends
+            // with a whole buffer of credit.
+            let mut ask = 1u32.to_le_bytes().to_vec();
+            ask.push(FrameKind::Data.byte());
+            ask.extend_from_slice(&3u32.to_le_bytes());
+            ask.extend_from_slice(b"ask");
+            theirs.write_all(&ask).await.unwrap();
             let mut keep_alive = 0u32.to_le_bytes().to_vec();
             keep_alive.push(FrameKind::KeepAlive.byte());
             keep_alive.extend_from_slice(&0u32.to_le_bytes());
@@ -1151,7 +1186,7 @@ mod tests {
                 tokio::time::sleep(KEEP_ALIVE).await;
             }
         });
-        let mut stream = mux.open().await.unwrap();
+        let mut stream = mux.next().await.unwrap();
         stream.write_all(&vec![0u8; STREAM_BUFFER]).await.unwrap();
         let started = tokio::time::Instant::now();
         let ended = tokio::time::timeout(IDLE_TIMEOUT * 3, mux.next()).await;
@@ -1233,5 +1268,70 @@ mod tests {
             got.push(bytes);
         }
         assert_eq!(got, [[0], [1]]);
+    }
+
+    /// Review of PR #31: a stream a peer opened started with a whole
+    /// buffer of credit, so each request waiting for room to be read held
+    /// up to 1 MiB here, on each of `MAX_STREAMS` streams. It starts with
+    /// `OPEN_CREDIT`, and the peer gets more only for what the reader asks
+    /// for once the buffer is empty: a reader that takes what came and
+    /// asks for nothing more grants nothing.
+    #[tokio::test]
+    async fn a_stream_the_peer_opened_gets_credit_only_for_what_its_reader_asks() {
+        let (mux, mut raw) = acceptor_and_raw();
+        raw.send(1, FrameKind::Data, &vec![1u8; OPEN_CREDIT]).await;
+        let mut stream = mux.next().await.unwrap();
+        let mut head = vec![0u8; OPEN_CREDIT];
+        stream.read_exact(&mut head).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), raw.recv())
+                .await
+                .is_err(),
+            "credit came for bytes no read asked for"
+        );
+
+        let reader = tokio::spawn(async move {
+            let mut rest = vec![0u8; 5000];
+            stream.read_exact(&mut rest).await.unwrap();
+            (stream, rest)
+        });
+        let granted = raw.recv().await;
+        assert_eq!(
+            granted,
+            (1, FrameKind::Credit, 5000u32.to_le_bytes().to_vec())
+        );
+        raw.send(1, FrameKind::Data, &[2u8; 5000]).await;
+        let (_stream, rest) = reader.await.unwrap();
+        assert_eq!(rest, [2u8; 5000]);
+    }
+
+    /// The side that opens a stream starts with `OPEN_CREDIT` and sends on
+    /// as the acceptor's reader asks, in pieces as small as the credit,
+    /// so a request longer than the opening credit arrives whole.
+    #[tokio::test]
+    async fn a_request_longer_than_the_opening_credit_arrives_whole() {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let dialer = Mux::spawn(a, Side::Dialer, node(), ADDR);
+        let acceptor = Mux::spawn(b, Side::Acceptor, node(), ADDR);
+        let request: Vec<u8> = (0..3 * STREAM_BUFFER + 7)
+            .map(|n| u8::try_from(n % 251).unwrap())
+            .collect();
+        let mut asking = dialer.open().await.unwrap();
+        let sent = request.clone();
+        let writer = tokio::spawn(async move {
+            asking.write_all(&sent).await.unwrap();
+            asking.shutdown().await.unwrap();
+            asking
+        });
+        let mut answering = acceptor.next().await.unwrap();
+        let mut got = Vec::new();
+        answering.read_to_end(&mut got).await.unwrap();
+        assert!(
+            got == request,
+            "{} of {} bytes, or other bytes",
+            got.len(),
+            request.len()
+        );
+        writer.await.unwrap();
     }
 }

@@ -9,11 +9,21 @@
 //! `terminal` runs a Codex job under a pseudo-terminal, `headless`
 //! runs Claude and Codex turns without one, and `client` drives a node
 //! through `fabric-client` instead of the CLI. `budget` times the hot
-//! paths against `budget.toml`.
+//! paths against `budget.toml`, `bench` times the paths the durable
+//! job work touches, with no budget, and `ab` compares two builds of
+//! `fabric` op by op on the same fixture. `acp_cli` and `preflight` hold the
+//! tests of M2 defects M2-01 and M2-02, `managed` the managed job
+//! acceptance tests, and `legacy` loads a state directory frozen from main.
 
+mod ab;
+mod acp_cli;
+mod bench;
 mod budget;
 mod client;
 mod headless;
+mod legacy;
+mod managed;
+mod preflight;
 mod terminal;
 mod world;
 
@@ -44,7 +54,16 @@ struct Pair {
 /// the second. They report the Node versions the gate Macs had, 22 on the
 /// first and 26 on the second, so every move crosses Node majors.
 fn setup(wire: Wire, fault_a: Option<&str>, fault_b: Option<&str>) -> Fallible<Pair> {
-    let env = Env::new()?;
+    setup_in(Env::new()?, wire, fault_a, fault_b)
+}
+
+/// `setup` on the fixture `env`.
+fn setup_in(
+    env: std::sync::Arc<Env>,
+    wire: Wire,
+    fault_a: Option<&str>,
+    fault_b: Option<&str>,
+) -> Fallible<Pair> {
     let mut a = Node::new(&env, "a", wire)?;
     let mut b = Node::new(&env, "b", wire)?;
     a.fake_node("v22.23.2", "127")?;
@@ -168,8 +187,11 @@ const DECISIONS: [&str; 3] = [
 ];
 
 fn move_and_resume(wire: Wire) -> Fallible {
-    let p = setup(wire, None, None)?;
-    let (job, work) = job_with_work(&p)?;
+    move_and_resume_in(&setup(wire, None, None)?)
+}
+
+fn move_and_resume_in(p: &Pair) -> Fallible {
+    let (job, work) = job_with_work(p)?;
     let doctor = p.a.ok(&["doctor", "--peer", &p.b.id, "--job", &job])?;
     assert!(doctor.contains("ok      home"), "{doctor}");
     assert!(doctor.contains("no snapshot yet"), "{doctor}");
@@ -200,7 +222,7 @@ fn move_and_resume(wire: Wire) -> Fallible {
     }
     assert!(!moved.contains("no harness session captured"), "{moved}");
     assert_one_owner(&p.b, &p.a, &job, 2, "departed")?;
-    let resumed = assert_continues(&p, &p.b, &job, &work, &["one"])?;
+    let resumed = assert_continues(p, &p.b, &job, &work, &["one"])?;
     for decision in DECISIONS {
         assert!(resumed.contains(decision), "resume: {decision}:\n{resumed}");
     }
@@ -262,6 +284,22 @@ fn e2e_a_job_moves_and_resumes_over_quic() -> Fallible {
 #[test]
 fn e2e_a_job_moves_and_resumes_over_tcp_tls() -> Fallible {
     move_and_resume(Wire::TcpTls)
+}
+
+/// The same move and way back with the repository on `master`, git's own
+/// default branch name. A restore's `git init` names the snapshot's branch,
+/// and one that set HEAD and its referent in one ref transaction failed on
+/// every repository whose branch was the one `git init` names (store-git,
+/// `a_repository_with_the_branch_git_init_names_restores`); every other
+/// fixture is on `main`.
+#[test]
+fn e2e_a_job_on_master_moves_and_resumes() -> Fallible {
+    move_and_resume_in(&setup_in(
+        Env::on_branch("master")?,
+        Wire::Quic,
+        None,
+        None,
+    )?)
 }
 
 /// Which node a step acts on.
@@ -623,6 +661,61 @@ fn e2e_a_steal_after_a_resume_freezes_the_owner_and_stops_its_harness() -> Falli
     Ok(())
 }
 
+/// R3: the owner frozen by a steal after its harness ran exports the
+/// orphan workspace into a pinned snapshot the ledger does not name, then
+/// `fabric job repair` takes the thief's chain by the fork rule, keeping
+/// the old ledger whole, and lifts the freeze; the thief has nothing to
+/// repair.
+#[test]
+fn e2e_a_frozen_owner_exports_its_orphan_and_repairs_the_fork() -> Fallible {
+    let p = setup(Wire::TcpTls, None, None)?;
+    let (job, _) = job_with_work(&p)?;
+    p.a.ok(&["job", "suspend", &job])?;
+    let (running, _pid) = p.a.run_lingering(&job)?;
+    p.b.ok(&["job", "steal", &job, "--force"])?;
+    let _ = finish(running, GIVE_UP)?;
+    assert_eq!(p.a.lease(&job)?.view, "frozen");
+
+    let exported = p.a.ok(&["job", "export", &job])?;
+    assert!(
+        exported.contains("as snapshot") && exported.contains("the job's head is unchanged"),
+        "{exported}"
+    );
+    let pins = fs::read_to_string(p.a.state().join("jobs").join(&job).join("pins"))?;
+    assert!(pins.contains("Exported"), "{pins}");
+
+    let repaired = p.a.ok(&["job", "repair", &job])?;
+    assert!(
+        repaired.contains(&format!(
+            "the fork rule picked {}'s chain at epoch 2",
+            p.b.id
+        )),
+        "{repaired}"
+    );
+    let kept: Vec<_> = fs::read_dir(p.a.state().join("jobs").join(&job))?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("ledger.forked-")
+        })
+        .collect();
+    assert_eq!(kept.len(), 1, "the old ledger was not kept");
+    let after = p.a.lease(&job)?;
+    assert_ne!(after.view, "frozen");
+    assert_eq!((after.owner, after.epoch), (p.b.id.clone(), 2));
+
+    let refused = p.b.run(&["job", "repair", &job])?;
+    assert_eq!(refused.status.code(), Some(1), "{}", text(&refused));
+    assert!(
+        text(&refused).contains("is not frozen"),
+        "{}",
+        text(&refused)
+    );
+    Ok(())
+}
+
 /// As above, with the owner's daemon up but out of reach when the steal
 /// happens, as a laptop on another network: nothing tells it, so its
 /// harness keeps running until the next `run` catches up with the thief,
@@ -766,7 +859,7 @@ fn e2e_a_run_whose_output_closes_still_supervises_its_harness() -> Fallible {
         running.try_wait()?.is_none(),
         "the CLI stopped supervising once its output closed"
     );
-    let pid: i32 = fs::read_to_string(&pid_file)?.trim().parse()?;
+    let pid = world::read_pid(&pid_file)?;
     let pid = rustix::process::Pid::from_raw(pid).ok_or("no pid")?;
     rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
     let output = finish(running, GIVE_UP)?;
@@ -776,47 +869,197 @@ fn e2e_a_run_whose_output_closes_still_supervises_its_harness() -> Fallible {
     Ok(())
 }
 
+/// What a `job run` cut by a signal before the node recorded its harness
+/// left behind.
+struct Cut {
+    /// What the CLI printed, and how it ended.
+    output: std::process::Output,
+    /// The harness's process group was still there 10 s after the signal;
+    /// the test then killed it.
+    outlived: bool,
+    /// The harness ran: the file it writes as it starts exists.
+    ran: bool,
+}
+
+/// The one child of the CLI `cli`: the process it launched for the
+/// harness, which leads the harness's process group.
+fn launched_by(cli: u32) -> Fallible<i32> {
+    let found = std::process::Command::new("pgrep")
+        .arg("-P")
+        .arg(cli.to_string())
+        .output()?;
+    let children: Vec<i32> = String::from_utf8(found.stdout)?
+        .lines()
+        .map(str::parse)
+        .collect::<Result<_, _>>()?;
+    match children[..] {
+        [child] => Ok(child),
+        _ => Err(format!("the CLI runs {children:?}, not one harness").into()),
+    }
+}
+
+/// Runs `fabric job run <args...>` on `p.a`, whose node holds the
+/// registration of the first harness launched on it, sends the CLI
+/// `signal` while the node holds it, and reports what was left: whether
+/// the harness's group outlived the CLI and whether the harness ran,
+/// which `ran` exists for. The node then goes on with the registration.
+fn cut_before_record(
+    p: &Pair,
+    args: &[&str],
+    vars: &[(&str, &std::path::Path)],
+    ran: &std::path::Path,
+    signal: rustix::process::Signal,
+) -> Fallible<Cut> {
+    use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
+
+    let running = p.a.spawn_with(args, vars)?;
+    wait_for(&p.a.signal(), "the registration")?;
+    let group = Pid::from_raw(launched_by(running.id())?).ok_or("no group")?;
+    let cli = Pid::from_raw(i32::try_from(running.id())?).ok_or("no pid")?;
+    rustix::process::kill_process(cli, signal)?;
+    let started = std::time::Instant::now();
+    while test_kill_process_group(group).is_ok() && started.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // A harness left running can hold the CLI's output open, so it is
+    // stopped here before the output is read.
+    let outlived = test_kill_process_group(group).is_ok();
+    if outlived {
+        let _ = kill_process_group(group, Signal::KILL);
+    }
+    // The node may go on to record the harness it was asked about.
+    fs::remove_file(p.a.signal())?;
+    let output = finish(running, GIVE_UP)?;
+    Ok(Cut {
+        output,
+        outlived,
+        ran: ran.exists(),
+    })
+}
+
 /// A `job run` ended by a signal after it launched the harness and before
 /// the node recorded it, as by Ctrl-C or a `kill` while the node is slow to
 /// answer, must stop the harness. It runs in a group of its own, so the
 /// signal does not reach it, no node supervises it yet, and once the tree
 /// lock goes with the command a second run could start another agent in
-/// the workspace.
+/// the workspace. The harness is held before its exec until the node
+/// records it (issue #17), so it never ran, and the CLI kills the held
+/// group.
 #[test]
 fn e2e_a_run_ended_before_its_harness_is_recorded_stops_it() -> Fallible {
     let p = setup(Wire::TcpTls, Some("before_harness_record:hold"), None)?;
     let job = new_job(&p.env, &p.a, AGENT)?;
     let pid_file = p.a.state().join("harness.pid");
-    let running = p.a.spawn_with(
+    let cut = cut_before_record(
+        &p,
         &["job", "run", &job, "--prompt", "one"],
         &[
             ("FAKE_LINGER", std::path::Path::new("1")),
             ("FAKE_PID_FILE", &pid_file),
         ],
+        &pid_file,
+        rustix::process::Signal::TERM,
     )?;
-    wait_for(&p.a.signal(), "the registration")?;
-    wait_for(&pid_file, "the harness launch")?;
-    let harness: i32 = fs::read_to_string(&pid_file)?.trim().parse()?;
-    let cli = rustix::process::Pid::from_raw(i32::try_from(running.id())?).ok_or("no pid")?;
-    rustix::process::kill_process(cli, rustix::process::Signal::TERM)?;
-    let started = std::time::Instant::now();
-    while alive(harness) && started.elapsed() < Duration::from_secs(10) {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    // A harness left running holds the CLI's output open, so it is
-    // stopped here before the output is read.
-    let outlived = alive(harness);
-    if outlived && let Some(pid) = rustix::process::Pid::from_raw(harness) {
-        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-    }
-    // The node may go on to record the harness it was asked about.
-    fs::remove_file(p.a.signal())?;
-    let output = finish(running, GIVE_UP)?;
+    let said = text(&cut.output);
+    assert!(!cut.outlived, "the harness outlived the ended run: {said}");
     assert!(
-        !outlived,
-        "the harness outlived the ended run: {}",
-        text(&output)
+        !cut.ran,
+        "the harness ran before the node recorded it: {said}"
     );
-    assert_eq!(output.status.code(), Some(128 + 15), "{}", text(&output));
+    assert_eq!(cut.output.status.code(), Some(128 + 15), "{said}");
+    Ok(())
+}
+
+/// Issue #17: a CLI killed by `SIGKILL` once the node holds its harness's
+/// registration cannot stop the harness, so only the hold keeps it from
+/// running. A headless or ACP trampoline waits for a line on a pipe whose
+/// write end only the CLI holds, so the CLI's death closes it and the shell
+/// reads end of file and exits without its exec; a terminal trampoline is
+/// stopped, and the kernel ends its orphaned group with `SIGHUP`. Either
+/// way the harness never ran, nothing of its group outlives the CLI, and
+/// the next suspend finds no harness to stop.
+fn assert_killed_before_record_leaves_nothing(
+    p: &Pair,
+    job: &str,
+    run: &[&str],
+    vars: &[(&str, &std::path::Path)],
+    ran: &std::path::Path,
+) -> Fallible {
+    use std::os::unix::process::ExitStatusExt;
+
+    let cut = cut_before_record(p, run, vars, ran, rustix::process::Signal::KILL)?;
+    let said = text(&cut.output);
+    assert!(!cut.outlived, "the harness outlived the killed run: {said}");
+    assert!(
+        !cut.ran,
+        "the harness ran before the node recorded it: {said}"
+    );
+    assert_eq!(cut.output.status.signal(), Some(9), "{said}");
+    let suspended = p.a.ok(&["job", "suspend", job])?;
+    assert!(
+        !suspended.contains("stopping the harness"),
+        "the node recorded a harness: {suspended}"
+    );
+    let status = p.a.ok(&["job", "status", job])?;
+    assert!(status.contains("harness: not running"), "{status}");
+    Ok(())
+}
+
+/// A headless Codex run killed before the node records its harness.
+#[test]
+fn e2e_a_headless_run_killed_before_its_harness_is_recorded_leaves_nothing_running() -> Fallible {
+    let p = setup(Wire::TcpTls, Some("before_harness_record:hold"), None)?;
+    p.env.install_fake_codex()?;
+    let job = new_job(&p.env, &p.a, "codex")?;
+    // The fake codex writes its arguments as it starts, and with
+    // FAKE_CODEX_WAIT then runs until a SIGINT.
+    let ran = p.env.home.join("codex-args");
+    assert_killed_before_record_leaves_nothing(
+        &p,
+        &job,
+        &["job", "run", &job, "--headless", "--prompt", "one"],
+        &[("FAKE_CODEX_WAIT", std::path::Path::new("1"))],
+        &ran,
+    )
+}
+
+/// An ACP run killed before the node records its agent: the agent gets no
+/// message, and does not even start, before the node records it.
+#[test]
+fn e2e_an_acp_run_killed_before_its_agent_is_recorded_leaves_nothing_running() -> Fallible {
+    let p = setup(Wire::TcpTls, Some("before_harness_record:hold"), None)?;
+    let job = new_job(&p.env, &p.a, AGENT)?;
+    let pid_file = p.a.state().join("harness.pid");
+    assert_killed_before_record_leaves_nothing(
+        &p,
+        &job,
+        &["job", "run", &job, "--prompt", "one"],
+        &[
+            ("FAKE_LINGER", std::path::Path::new("1")),
+            ("FAKE_PID_FILE", &pid_file),
+        ],
+        &pid_file,
+    )
+}
+
+/// M2-10, gate finding F14: `fabric serve` started right after a stop
+/// waits for the stopping daemon to let the state directory go, instead
+/// of refusing because it still holds the lock. The stopping daemon is
+/// made to hold it for two seconds after `SIGTERM`. Then the new daemon
+/// serves the same node with its jobs.
+#[test]
+fn e2e_a_daemon_started_right_after_a_stop_serves() -> Fallible {
+    let mut p = setup(Wire::TcpTls, None, None)?;
+    let job = new_job(&p.env, &p.a, AGENT)?;
+    let id = p.a.id.clone();
+    p.a.kill()?;
+    p.a.start(Some("while_stopping:stall"))?;
+    let stopping = p.a.stop()?;
+    wait_for(&p.a.signal(), "the stopping daemon holding its state")?;
+    p.a.start(None)?;
+    let stopped = finish(stopping, Duration::from_secs(30))?;
+    assert!(stopped.status.success(), "{}", text(&stopped));
+    assert_eq!(p.a.id, id);
+    assert!(p.a.ok(&["job", "ls"])?.contains(&job));
     Ok(())
 }

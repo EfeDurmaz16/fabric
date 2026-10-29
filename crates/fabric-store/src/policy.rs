@@ -18,14 +18,41 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use fabric_core::path::RelPath;
+use fabric_core::secret::{Scope, SecretPattern, SecretPolicy};
 use fabric_core::snapshot::CacheClass;
 
-/// Patterns that are never carried, matched against every path component.
+/// The built-in secret patterns of `fabric_core::secret`, as text, for the
+/// exclude file capture hands `git add -A` (`IgnorePolicy::gitignore_lines`).
+///
+/// Which path is a secret is decided by `fabric_core::secret::SecretPolicy`
+/// alone (M2-03): this list only keeps most secrets out of the user's
+/// object store before that decision, and a path it names that the core
+/// carries, such as `.env.example`, is added back. It must name at least
+/// what the core denies; a test pins it to the core's samples.
 pub const SECRET_PATTERNS: &[&str] = &[
     ".env",
-    ".env.*",
-    "*.env",
     ".envrc",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+    ".aws",
+    ".ssh",
+    ".gnupg",
+    ".env.*",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "id_ecdsa_sk",
+    "id_ed25519_sk",
+    "credentials",
+    "credentials.json",
+    "credentials.yml",
+    "credentials.yaml",
+    "credentials.toml",
+    ".credentials*",
+    "*.env",
     "*.pem",
     "*.key",
     "*.p12",
@@ -33,34 +60,7 @@ pub const SECRET_PATTERNS: &[&str] = &[
     "*.jks",
     "*.tfstate",
     "*.tfstate.*",
-    "id_*",
-    "credentials*",
-    ".credentials*",
-    ".netrc",
-    ".npmrc",
-    ".pypirc",
-    ".git-credentials",
-    ".aws",
-    ".ssh",
-    ".gnupg",
     ".docker/config.json",
-];
-
-/// The patterns that still apply below a dependency, build or tool-cache directory.
-pub const CACHE_SECRET_PATTERNS: &[&str] = &[
-    ".env",
-    ".env.*",
-    ".envrc",
-    "id_*",
-    "credentials*",
-    ".credentials*",
-    ".netrc",
-    ".npmrc",
-    ".pypirc",
-    ".git-credentials",
-    ".aws",
-    ".ssh",
-    ".gnupg",
 ];
 
 /// A directory name that holds a cache, and the files that make it one.
@@ -289,8 +289,10 @@ fn glob(pattern: &str, text: &str) -> bool {
 pub struct IgnorePolicy {
     cache_dirs: Vec<CacheRule>,
     declared: Vec<CacheRoot>,
-    secrets: Vec<Pattern>,
-    cache_secrets: Vec<Pattern>,
+    /// The one secret policy, the core's, widened by the job's patterns.
+    secrets: SecretPolicy,
+    /// The built-in list and the job's patterns as gitignore patterns, for the exclude file only.
+    secret_lines: Vec<Pattern>,
     excludes: Vec<Pattern>,
 }
 
@@ -318,8 +320,8 @@ impl Default for IgnorePolicy {
                 })
                 .collect(),
             declared: Vec::new(),
-            secrets: patterns(SECRET_PATTERNS),
-            cache_secrets: patterns(CACHE_SECRET_PATTERNS),
+            secrets: SecretPolicy::default(),
+            secret_lines: patterns(SECRET_PATTERNS),
             excludes: Vec::new(),
         }
     }
@@ -367,14 +369,34 @@ impl IgnorePolicy {
             .min_by_key(|(at, _)| *at)
     }
 
-    /// Widens the secret list, in both the full and the narrow form.
+    /// Widens the secret list with a job's pattern, which applies in every
+    /// scope, caches included.
+    ///
+    /// The text must be a `fabric_core::secret::SecretPattern`, as a job's
+    /// `secret_patterns` are, so the store and the core read it alike.
     pub fn add_secret_pattern(&mut self, text: &str) -> Result<(), PolicyError> {
-        let pattern = Pattern::parse(text).ok_or_else(|| PolicyError::BadPolicyPattern {
+        let bad = || PolicyError::BadPolicyPattern {
             text: text.to_owned(),
-        })?;
-        self.cache_secrets.push(pattern.clone());
-        self.secrets.push(pattern);
+        };
+        let pattern = SecretPattern::parse(text).map_err(|_| bad())?;
+        let line = Pattern::parse(pattern.as_str()).ok_or_else(bad)?;
+        self.secrets.widen(pattern);
+        self.secret_lines.push(line);
         Ok(())
+    }
+
+    /// True when the core's policy denies `path`. Under `cache`, a cache
+    /// directory the policy found by its name, the full list applies to the
+    /// path up to that directory and the narrow list to the whole path, so
+    /// a dependency's `credentials.js` travels and its `.env` does not.
+    fn denies_secret(&self, path: &RelPath, cache: Option<&RelPath>) -> bool {
+        match cache {
+            None => self.secrets.denies(path, Scope::Work).is_some(),
+            Some(cache) => {
+                self.secrets.denies(cache, Scope::Work).is_some()
+                    || self.secrets.denies(path, Scope::Cache).is_some()
+            }
+        }
     }
 
     /// Adds a pattern whose matches are not carried for this job.
@@ -444,15 +466,12 @@ impl IgnorePolicy {
                 .ok()
                 .map(|path| CacheRoot { path, class })
         });
-        let secret = (0..comps.len()).any(|j| {
-            let narrow = declared.is_none() && cache.is_some_and(|(i, _)| j > i);
-            let list = if narrow {
-                &self.cache_secrets
-            } else {
-                &self.secrets
-            };
-            list.iter().any(|p| p.matches_at(&comps, j))
-        });
+        // A declared cache keeps the full list (`add_declared_cache`).
+        let narrow = cache_root
+            .as_ref()
+            .filter(|_| declared.is_none())
+            .map(|root| &root.path);
+        let secret = self.denies_secret(path, narrow);
         if secret {
             Class::Secret { under: cache_root }
         } else if (0..comps.len()).any(|j| self.excludes.iter().any(|p| p.matches_at(&comps, j))) {
@@ -466,30 +485,28 @@ impl IgnorePolicy {
     #[must_use]
     pub fn gitignore_lines(&self) -> String {
         let mut text = String::new();
-        for pattern in self.secrets.iter().chain(&self.excludes) {
+        for pattern in self.secret_lines.iter().chain(&self.excludes) {
             text.push_str(&pattern.gitignore_line());
             text.push('\n');
         }
         text
     }
 
-    /// True when any component of a path matches the full secret list.
+    /// True when the full secret list denies the path, as the core's
+    /// `SecretPolicy::denies` does in `Scope::Work`.
     #[must_use]
     pub fn is_secret(&self, path: &RelPath) -> bool {
-        let comps: Vec<&str> = path.as_str().split('/').collect();
-        (0..comps.len()).any(|j| self.secrets.iter().any(|p| p.matches_at(&comps, j)))
+        self.secrets.denies(path, Scope::Work).is_some()
     }
 
     /// True when a path matches the full secret list or an exclude, whatever lies above it.
     #[must_use]
     pub fn denies_anywhere(&self, path: &RelPath) -> bool {
+        if self.is_secret(path) {
+            return true;
+        }
         let comps: Vec<&str> = path.as_str().split('/').collect();
-        (0..comps.len()).any(|j| {
-            self.secrets
-                .iter()
-                .chain(&self.excludes)
-                .any(|p| p.matches_at(&comps, j))
-        })
+        (0..comps.len()).any(|j| self.excludes.iter().any(|p| p.matches_at(&comps, j)))
     }
 }
 
@@ -558,6 +575,27 @@ mod tests {
             assert!(is_secret(&classify(&p, secret)), "{secret}");
         }
         assert_eq!(classify(&p, "web/.output/index.mjs"), Class::Precious);
+    }
+
+    /// Every line of the exclude file is a pattern the core denies, at the
+    /// top and nested, so the prefilter never keeps out a path the core
+    /// carries without capture adding it back by name.
+    #[test]
+    fn every_exclude_line_is_a_pattern_the_core_denies() {
+        let p = IgnorePolicy::default();
+        for pattern in SECRET_PATTERNS {
+            for base in ["", "precious/"] {
+                let sample = rel(&format!("{base}{}", pattern.replace('*', "x")));
+                assert!(p.is_secret(&sample), "{pattern}: {sample}");
+                let comps: Vec<&str> = sample.as_str().split('/').collect();
+                assert!(
+                    p.secret_lines
+                        .iter()
+                        .any(|line| (0..comps.len()).any(|j| line.matches_at(&comps, j))),
+                    "{pattern}: {sample}"
+                );
+            }
+        }
     }
 
     #[test]
