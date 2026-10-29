@@ -472,6 +472,33 @@ mod tests {
         }
     }
 
+    /// The client API's fixture of a repair that took the peer's chain
+    /// shows the ledger kept where a repair keeps it, under the state
+    /// directory's job and with the name this node gives it, so a client
+    /// reading the contract never sees a name the node no longer writes.
+    #[test]
+    fn the_repair_fixture_keeps_the_ledger_where_a_repair_does() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../protocol/fixtures/reply/job_repair_adopted.json");
+        let reply: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture).unwrap()).unwrap();
+        let kept = reply.pointer("/outcome/kept").unwrap().as_str().unwrap();
+        let kept = Path::new(kept);
+        let name = kept.file_name().and_then(OsStr::to_str).unwrap();
+        let (fork_point, head) = name
+            .strip_prefix("ledger.forked-")
+            .and_then(|hashes| hashes.split_once('-'))
+            .unwrap_or_else(|| panic!("{name} does not name a fork point and a head"));
+        let dir = kept.parent().unwrap();
+        let job: JobId = dir.file_name().unwrap().to_str().unwrap().parse().unwrap();
+        let state = dir.parent().and_then(Path::parent).unwrap();
+        let state = StateDir::resolve(Some(state.as_os_str()), Path::new("/")).unwrap();
+        let written = state
+            .job(job)
+            .forked_ledger(fork_point.parse().unwrap(), head.parse().unwrap());
+        assert_eq!(written, kept);
+    }
+
     #[test]
     fn a_root_in_a_synced_folder_is_refused_only_where_it_syncs() {
         let home = Path::new("/Users/x");
